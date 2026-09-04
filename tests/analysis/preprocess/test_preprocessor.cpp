@@ -1129,8 +1129,10 @@ TEST(Preprocessor, SpecialVariadicIdentifierFamilyHasNoSurvivingRefusals) {
         EXPECT_FALSE(hasPPCode(
             r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
             << "the operator-name refusal code must not be reached by any "
-               "variadic spelling -- it belongs to the conditional-inclusion "
-               "operators alone: " << c.why << "\nsrc: " << c.src;
+               "variadic spelling -- since P59 it belongs to `defined` ALONE "
+               "(the conditional-inclusion operators are now warn-and-apply, "
+               "[[D-PP-HAS-EXTENSION-BUILTIN-ABSENT]]): "
+            << c.why << "\nsrc: " << c.src;
     }
 }
 
@@ -10246,50 +10248,323 @@ TEST(Preprocessor, TFC86PortabilityShimDoesNotShadowTheOperatorEndToEnd) {
     fs::remove_all(inc, ec);
 }
 
-// The `#define` refusal, for EVERY declared operator. An UNGUARDED shadow is a
-// silent miscompile (the guard would answer 0 while `#include` still splices),
-// so it is refused loudly and the operator KEEPS working.
-TEST(Preprocessor, TFC86UnguardedDefineOfOperatorFailsLoudEveryOperator) {
+// ★★★ RENAMED AND REVERSED, NOT DELETED
+// ([[D-PP-HAS-EXTENSION-BUILTIN-ABSENT]], operator ruling 2026-09-03). This was
+// `TFC86UnguardedDefineOfOperatorFailsLoudEveryOperator` and it pinned TF-C86's
+// Error refusal of `#define __has_include(x) 0`. The operator RULED that DSS
+// must ACCEPT and APPLY it: *"we must accept too. best long term solution, no
+// workaround, first class implementation, 100% config driven. leave nothing to
+// be done."* A name is a claim, and leaving one that says `FailsLoud` over a
+// body that pins acceptance is the same defect class as a comment outliving its
+// code.
+//
+// ✔MEASURED 2026-09-04, each reference invoked SEPARATELY, WITH A CONTROL that
+// proves the untouched operator answers 1 for the same local header (without it
+// a 0 is equally consistent with the header not being found — which is exactly
+// what MSVC's answer looked like until the control was run): gcc 13.3.0, gcc
+// 13.2.0 (mingw) and clang 18.1.3 all WARN, cl 19.51.36252 is SILENT, and ALL
+// FOUR exit 0 and ALL FOUR APPLY the definition.
+//
+// ⚠ THE TF-C86 REASON THE REFUSAL GAVE IS NOT OVERRULED, IT IS RE-ASSIGNED. It
+// held that honouring the shadow makes `#include <h>` and `__has_include(<h>)`
+// disagree about one file. It does — but that disagreement is now the PROGRAM's,
+// deliberately written and diagnosed, exactly as it is on every reference,
+// rather than the implementation's silent one. What the refusal was really
+// protecting (the GUARDED shim must not shadow the operator) is protected by
+// `#ifndef` being false, which is pinned by
+// `TFC86PortabilityShimDoesNotShadowTheOperatorEndToEnd` above.
+TEST(Preprocessor, TFC86UnguardedDefineOfOperatorIsAcceptedAndAppliedEveryOperator) {
     for (std::string const& op : tfc86DeclaredOperators()) {
         PreprocessResult r;
         auto lexs = ppLexemes(
-            "#define " + op + "(x) 0\n"
-            "#ifdef " + op + "\nint yes;\n#else\nint no;\n#endif\n", r);
-        EXPECT_TRUE(hasPPCode(
+            "#define " + op + " 5\n"
+            "int v = " + op + ";\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "#define " << op
+            << " must be ACCEPTED — all four references accept it at their "
+               "default settings, so refusing put DSS above the union";
+        EXPECT_FALSE(hasPPCode(
             r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
-            << "#define " << op << " must fail LOUD";
-        ASSERT_EQ(lexs.size(), 3u) << op;
-        EXPECT_EQ(lexs[1], "yes")
-            << op << " must STILL be the operator after the refusal — a "
-                     "refusal that also dropped the name would leave the "
-                     "program in the shadowed state it was refused for";
+            << "the refusal code now belongs to `defined` ALONE";
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorPredefinedMacro),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "accepted, but NEVER in silence. ✔MEASURED: gcc emits `warning: "
+               "\"" << op << "\" redefined` and clang emits `warning: redefining "
+               "builtin macro [-Wbuiltin-macro-redefined]` — and both emit the "
+               "BYTE-IDENTICAL diagnostic for `#undef __STDC__`, which is why "
+               "DSS uses one code for both arms rather than drawing a "
+               "distinction only DSS draws.";
+        // ★ THE APPLICATION IS THE CLAIM, not the acceptance. An object-like
+        // `#define` is used here on purpose: it makes the definition's EFFECT
+        // observable as a lexeme, so an accept-and-ignore implementation (which
+        // is what cl does for the `#undef` half) cannot pass this arm.
+        ASSERT_EQ(lexs.size(), 5u) << op << " — expected: int v = 5 ;";
+        EXPECT_EQ(lexs[3], "5")
+            << op << ": the definition must be APPLIED. Accepting and ignoring "
+                     "is a silent wrong answer and fails the bar outright.";
     }
 }
 
-// The `#undef` half. Symmetric, and equally load-bearing: an `#undef` that
-// SUCCEEDED would turn the operator back into an ordinary identifier folding
-// to 0 — the same include-vs-guard disagreement by a different route.
-TEST(Preprocessor, TFC86UndefOfOperatorFailsLoudEveryOperator) {
+// The `#undef` half. ★★ AND IT IS THE HALF WHERE THE REFERENCES SPLIT ON
+// MEANING, WHICH REFUTES ONE HALF OF THE MEASUREMENT THIS ROW'S RULING WAS
+// ASKED ON (the row records "all four ... APPLY it"). ✔MEASURED 2026-09-04,
+// `#undef __has_include` then `#ifdef __has_include`:
+//   gcc 13.3.0 (WSL)    warns, rc 0, #ifdef FALSE  -> APPLIES
+//   gcc 13.2.0 (mingw)  warns, rc 0, #ifdef FALSE  -> APPLIES
+//   clang 18.1.3        warns, rc 0, #ifdef FALSE  -> APPLIES
+//   cl 19.51.36252      SILENT, rc 0, #ifdef TRUE  -> IGNORES IT
+// Acceptance is unanimous; MEANING is 3-1. DSS follows the three on the
+// tie-break [[D-PP-VA-SPECIAL-IDENTIFIER-NAME-POSITIONS-REFUSED-ABOVE-THE-UNION]]
+// already ruled in this same function: a reference that SILENTLY DISCARDS code
+// the author wrote does not get to be the model.
+TEST(Preprocessor, TFC86UndefOfOperatorIsAcceptedAndAppliedEveryOperator) {
     for (std::string const& op : tfc86DeclaredOperators()) {
         PreprocessResult r;
         auto lexs = ppLexemes(
             "#undef " + op + "\n"
             "#ifdef " + op + "\nint yes;\n#else\nint no;\n#endif\n", r);
-        EXPECT_TRUE(hasPPCode(
-            r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
-            << "#undef " << op << " must fail LOUD";
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << "#undef " << op;
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorPredefinedMacro),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "#undef " << op << " must diagnose, and only warn";
         ASSERT_EQ(lexs.size(), 3u) << op;
-        EXPECT_EQ(lexs[1], "yes")
-            << op << " must survive the refused #undef";
+        EXPECT_EQ(lexs[1], "no")
+            << op
+            << ": the `#undef` must TAKE EFFECT. An operator lives in the CONFIG,"
+               " not in the macro table, so `table_.erase` cannot reach it — this"
+               " arm is what proves the engine records the revocation instead of"
+               " emitting a warning that changes nothing, which would be worse"
+               " than the refusal it replaced.";
     }
 }
 
-// The refusal is UNSUPPRESSABLE: `--suppress` of it would restore exactly the
-// silent include-vs-guard disagreement it exists to prevent.
+// The refusal code SURVIVES, with exactly ONE client, and it is the one its
+// name is TRUE about. ✔MEASURED 2026-09-04: `#define defined 1` and `#undef
+// defined` are a hard ERROR (rc 1) on gcc 13.3.0, gcc 13.2.0 (mingw) and clang
+// 18.1.3; only cl 19.51 accepts, with C4117, and then IGNORES the directive —
+// the silently-drops-the-author's-code failure class this project refuses. 3-1
+// REFUSE, and it is different in KIND rather than in strictness: C23 6.10.2
+// makes `defined` an OPERATOR inside `#if`, so admitting it as a macro name
+// makes conditional inclusion unparseable.
+//
+// ⚠ AND THIS REFUSAL IS NEW, NOT PRESERVED. ✔MEASURED at this row's base commit
+// b1f31420 through the shipped CLI: `#define defined 1` compiled rc 0, in
+// SILENCE — `isConditionalInclusionOperator` deliberately excluded
+// `definedOperator`, so nothing refused it, while `preprocess_config.hpp`'s own
+// comment asserted "that refusal lives in the conditional-inclusion-operator
+// guard". A comment claiming a guard that does not exist.
+TEST(Preprocessor, DefineOrUndefOfTheDefinedOperatorIsRefused) {
+    auto schema = cSubset();
+    std::string const& definedKw = schema->preprocess().definedOperator;
+    ASSERT_FALSE(definedKw.empty())
+        << "the shipped c must declare `defined`; without it this test measures "
+           "nothing";
+    for (std::string const& src :
+         {"#define " + definedKw + " 1\nint v = 0;\n",
+          "#undef " + definedKw + "\nint v = 0;\n"}) {
+        PreprocessResult r;
+        (void)ppLexemes(src, r);
+        EXPECT_TRUE(hasPPCode(
+            r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+            << "must fail LOUD:\n" << src;
+        EXPECT_EQ(ppCodeSeverity(
+                      r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Error})
+            << "an Error, not a warning — unlike its operator siblings, and the "
+               "SEVERITY DIFFERENCE IS CONFIG DATA "
+               "(`preprocess.reservedIdentifiers.definedOperator`), not an `if` "
+               "in the engine:\n" << src;
+    }
+}
+
+// ★★★ THE ACCEPTANCE CRITERION OF [[D-PP-HAS-EXTENSION-BUILTIN-ABSENT]]'s
+// SECOND RULING, MACHINE-CHECKED: **THE `__STDC__` ARM AND THE OPERATOR ARM
+// READ THE SAME DECLARATION.**
+//
+// The defect the ruling is about was never the severity. It was that ONE
+// FUNCTION answered the identical error-vs-warning question TWO different ways —
+// `handleDefine`'s predefined-macro arm warned and applied, carrying the comment
+// "being stricter than every reference is not rigor", while its operator arm
+// three screens below refused at Error — and nothing tied them together, so they
+// could drift again. *"Leave nothing to be done"* is part of the ruling: a fix
+// that repaired the operator shape and left the two arms independent would have
+// recreated exactly the defect the ruling is about.
+//
+// ★★ SO THIS TEST PINS THE TIE ITSELF, NOT EITHER OUTCOME. For every posture
+// verb, the two shapes must produce the IDENTICAL diagnostic code, the IDENTICAL
+// severity, and the IDENTICAL apply-or-refuse decision. Prose in a comment
+// cannot hold that; this can. A cycle that gives either arm its own severity
+// ladder, its own code, or its own fall-through rule reds here even if every
+// other test in the file still passes.
+//
+// ⚠ THE `refuse` ROW IS THE ONE THAT MATTERS MOST, because it is the pairing
+// that did NOT exist before: the predefined arm had no refusal at all and the
+// operator arm had nothing but one. Under the shared applier, declaring either
+// side `refuse` now produces the same code and the same non-application.
+TEST(Preprocessor, TheStdcArmAndTheOperatorArmReadOneDeclaration) {
+    constexpr std::string_view kStdcRow =
+        "\"name\": \"__STDC__\",            \"kind\": \"constant\", "
+        "\"value\": \"1\", \"programRedefinition\": \"warn-iso-macro\"";
+    constexpr std::string_view kOpRow =
+        "\"conditionalInclusionOperators\": \"warn-iso-macro\"";
+
+    // The shipped document must declare BOTH sides with the SAME verb, or the
+    // comparison below is measuring two different questions.
+    {
+        auto schema = cSubset();
+        auto const& pp = schema->preprocess();
+        EXPECT_EQ(pp.reservedIdentifiers.conditionalInclusionOperators,
+                  PredefinedMacroRedefinition::WarnIsoMacro);
+        bool sawStdc = false;
+        for (auto const& m : pp.predefinedMacros) {
+            if (m.name == "__STDC__") {
+                sawStdc = true;
+                EXPECT_EQ(m.programRedefinition,
+                          PredefinedMacroRedefinition::WarnIsoMacro);
+            }
+        }
+        EXPECT_TRUE(sawStdc) << "the shipped c must predefine __STDC__";
+    }
+
+    struct Outcome {
+        std::optional<DiagnosticSeverity> predefinedCode;   // P_PreprocessorPredefinedMacro
+        std::optional<DiagnosticSeverity> refusalCode;      // ...OperatorNameNotDefinable
+        bool                              applied = false;  // #ifdef went FALSE
+    };
+
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    auto measure = [&](std::shared_ptr<GrammarSchema const> const& schema,
+                       std::string const& name) {
+        auto buf = SourceBuffer::fromString(
+            "#undef " + name + "\n#ifdef " + name
+                + "\nint still_here;\n#else\nint gone;\n#endif\n",
+            "main.c");
+        PreprocessResult r =
+            preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching,
+                       DiagnosticBudget::libraryDefault());
+        Outcome o;
+        o.predefinedCode =
+            ppCodeSeverity(r, DiagnosticCode::P_PreprocessorPredefinedMacro);
+        o.refusalCode = ppCodeSeverity(
+            r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable);
+        // ⚠ SCAN EVERY NON-TRIVIA TOKEN BY LEXEME, never by `CoreTokenKind::
+        // Identifier`. The preprocessor emits an alphanumeric run as `Word`
+        // (keyword-vs-identifier is resolved later, in the parser), so an
+        // Identifier-keyed scan matches NOTHING and `applied` is false for every
+        // arm — an instrument that answers an adjacent question and fails toward
+        // "not applied". It was caught only because the M3 red-on-disable
+        // RESTORE did not go green; the arm had never passed.
+        for (Token const& t : r.tokens) {
+            if (t.coreKind == CoreTokenKind::Eof) continue;
+            if (t.coreKind == CoreTokenKind::Whitespace) continue;
+            if (t.coreKind == CoreTokenKind::Newline) continue;
+            if (r.synthBuffer->slice(t.span) == "gone") o.applied = true;
+        }
+        return o;
+    };
+
+    // Every posture verb the two sides can both express, each applied to BOTH
+    // sides at once so the comparison is like-for-like.
+    for (char const* verb : {"warn-iso-macro", "ordinary", "refuse"}) {
+        std::string text = loadShippedCText();
+        ASSERT_FALSE(text.empty());
+        auto const sp = text.find(kStdcRow);
+        ASSERT_NE(sp, std::string::npos)
+            << "the shipped c config no longer carries the __STDC__ row in that "
+               "spelling; re-point this test rather than deleting it";
+        text.replace(sp, kStdcRow.size(),
+                     "\"name\": \"__STDC__\",            \"kind\": \"constant\", "
+                     "\"value\": \"1\", \"programRedefinition\": \""
+                         + std::string{verb} + "\"");
+        auto const op = text.find(kOpRow);
+        ASSERT_NE(op, std::string::npos)
+            << "the shipped c config no longer carries the "
+               "reservedIdentifiers.conditionalInclusionOperators row";
+        text.replace(op, kOpRow.size(),
+                     "\"conditionalInclusionOperators\": \"" + std::string{verb}
+                         + "\"");
+
+        auto loaded = GrammarSchema::loadFromText(
+            text, std::string{"<one-posture-"} + verb + "-c>");
+        ASSERT_TRUE(loaded.has_value())
+            << "the doubly-rebound config must LOAD for verb " << verb;
+        std::shared_ptr<GrammarSchema const> schema = *loaded;
+
+        Outcome const stdcArm = measure(schema, "__STDC__");
+        Outcome const opArm   = measure(schema, "__has_include");
+
+        EXPECT_EQ(stdcArm.predefinedCode, opArm.predefinedCode)
+            << "verb `" << verb
+            << "`: the two arms must draw the SAME advisory code at the SAME "
+               "severity. They differ, which means one of them grew its own "
+               "severity ladder — the drift the 2026-09-03 ruling exists to "
+               "close.";
+        EXPECT_EQ(stdcArm.refusalCode, opArm.refusalCode)
+            << "verb `" << verb << "`: same for the refusal code.";
+        EXPECT_EQ(stdcArm.applied, opArm.applied)
+            << "verb `" << verb
+            << "`: the two arms must make the SAME apply-or-refuse decision. A "
+               "diagnostic with no effect is the worst of both readings, and an "
+               "arm that applies while its twin refuses is the original defect.";
+
+        // ...and the pair is not vacuously equal: each verb must produce the
+        // outcome it names, or "identical" would be satisfied by both arms
+        // being broken the same way.
+        if (std::string_view{verb} == "refuse") {
+            EXPECT_EQ(opArm.refusalCode,
+                      std::optional<DiagnosticSeverity>{DiagnosticSeverity::Error});
+            EXPECT_FALSE(opArm.applied) << "a refusal must not take effect";
+        } else {
+            EXPECT_FALSE(opArm.refusalCode.has_value()) << verb;
+            EXPECT_TRUE(opArm.applied)
+                << verb << ": everything but `refuse` APPLIES";
+            EXPECT_EQ(opArm.predefinedCode.has_value(),
+                      std::string_view{verb} != "ordinary")
+                << verb << ": `ordinary` is the silent verb, the others warn";
+        }
+    }
+}
+
+// ★ THE POSTURE IS DATA, AND THIS IS THE ARM THAT PROVES IT. Rebinding the
+// declared posture for `defined` from `refuse` to the warn-and-apply verb must
+// move the BEHAVIOUR, with no engine edit. If a later cycle re-hardcodes the
+// severity, the rebound schema keeps refusing and this reds.
+//
+// ⚠ REMOVE-DIRECTION, deliberately: the mutant takes a refusal AWAY from a
+// config that has it. An ADD-direction fixture (declaring a posture a config
+// lacks) stays green when the real config loses the feature.
+TEST(Preprocessor, ReservedIdentifierPostureIsConfigDrivenNotHardcoded) {
+    auto schema = reboundC("\"definedOperator\":               \"refuse\"",
+                           "\"definedOperator\":               \"warn-iso-macro\"",
+                           "<rebound-defined-posture-c>");
+    ASSERT_NE(schema, nullptr);
+
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    auto buf = SourceBuffer::fromString(
+        std::string{"#define defined 1\nint v = 0;\n"}, "main.c");
+    PreprocessResult r = preprocess(buf, schema, noDirs,
+                                    dss::kDefaultHeaderNameMatching,
+                                    DiagnosticBudget::libraryDefault());
+    EXPECT_FALSE(hasPPCode(
+        r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+        << "with the posture rebound to the warn verb, the engine must stop "
+           "refusing — the severity comes from `.lang.json`, never from a "
+           "literal in the directive handler";
+    EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorPredefinedMacro),
+              std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+        << "and it must still diagnose: the rebound posture selects the "
+           "SEVERITY, not silence";
+}
+
+// The refusal is UNSUPPRESSABLE: `--suppress` of it would let a program take
+// over `defined` with nothing said, after which every `#if defined(X)` in the
+// translation unit means something else.
 TEST(Preprocessor, TFC86OperatorNameRefusalIsUnsuppressable) {
     EXPECT_TRUE(isUnsuppressable(
         DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
-        << "suppressing this code re-opens the silent miscompile channel";
+        << "suppressing this code lets a program silently take over `defined`";
 }
 
 // AGNOSTICISM (opt-OUT). With `hasIncludeOperator` stripped from config, DSS no
@@ -10394,17 +10669,28 @@ TEST(Preprocessor, TFC86PreScanDefinednessGatesTheAngleSourceSplice) {
     fs::remove_all(inc, ec);
 }
 
-// The pre-scan's SECOND guard, pinned on its own for the same reason. Here the
-// shadowing `#define` IS present but UNGUARDED, so `sbNameDefined` cannot be
-// what saves it (the operator is defined either way): what must hold is that
-// the pre-scan REFUSES to record the operator into `localMacros`. If it
-// recorded it, FIX-3 would see a function-like macro in the following
-// `#if __has_include(<...>)` guard, go conservative-uncertain, and skip the
-// splice — reproducing the F001A cascade with the definedness fix in place.
+// ★★★ RENAMED AND REVERSED ([[D-PP-HAS-EXTENSION-BUILTIN-ABSENT]]). This was
+// `TFC86PreScanRefusesToRecordAShadowingOperatorDefine`, and its whole premise
+// was that the AUTHORITATIVE pass refused the unguarded shadow — so a pre-scan
+// that recorded it would disagree with the pass that decides. The 2026-09-03
+// ruling inverted the premise: the authoritative pass now APPLIES the
+// definition, so a pre-scan that still filtered it out would produce EXACTLY
+// the two-verdicts-on-one-file disagreement the old filter existed to prevent,
+// pointing the other way.
 //
-// RED-ON-DISABLE: MEASURED — dropping the `isConditionalInclusionOperator`
-// filter from the pre-scan's `#define` arm reds this test.
-TEST(Preprocessor, TFC86PreScanRefusesToRecordAShadowingOperatorDefine) {
+// ★★ THE INVARIANT IS UNCHANGED AND IT IS THE ONLY THING THIS TEST EVER
+// PINNED: the pre-scan and the authoritative pass must reach the SAME macro
+// state on the same input. What changed is which state that is. Here the
+// program really does shadow the operator, so the guard answers 0, the include
+// is NOT taken, and `NOREC_MARKER` must NOT expand — which is what gcc 13.3.0,
+// gcc 13.2.0 (mingw) and clang 18.1.3 all do on this exact source (✔MEASURED:
+// the guarded `__has_include` answers 0 after the `#define` while an untouched
+// control answers 1 for the same header).
+//
+// RED-ON-DISABLE: MEASURED — restore the `isConditionalInclusionOperator`
+// filter on the pre-scan's `#define` arm and the pre-scan splices the header
+// the authoritative pass skipped, so `norec_sym` reappears and this reds.
+TEST(Preprocessor, TFC86PreScanAppliesAShadowingOperatorDefineLikeTheAuthoritativePass) {
     namespace fs = std::filesystem;
     auto inc = ppScratchRoot() / "dss_tfc86_prescan_norecord";
     std::error_code ec;
@@ -10413,28 +10699,54 @@ TEST(Preprocessor, TFC86PreScanRefusesToRecordAShadowingOperatorDefine) {
     { std::ofstream(inc / "norec.h", std::ios::binary)
         << "#define NOREC_MARKER 7373\nint norec_sym;\n"; }
 
+    auto has = [](std::vector<std::string> const& lexs, std::string_view s) {
+        for (auto const& l : lexs) if (l == s) return true;
+        return false;
+    };
+
+    // ★ THE CONTROL, and it is not optional: without it "the header was not
+    // spliced" is equally consistent with "the header was never findable".
+    {
+        PreprocessResult ctl;
+        auto ctlLexs = ppLexemesWithDirs(
+            "#if __has_include(<norec.h>)\n"
+            "#include <norec.h>\n"
+            "#endif\n"
+            "int u = NOREC_MARKER;\n",
+            ctl, {inc}, {});
+        ASSERT_FALSE(ctl.diagnostics->hasErrors());
+        ASSERT_TRUE(has(ctlLexs, "norec_sym"))
+            << "CONTROL: with the operator untouched the header IS found and "
+               "spliced — so a miss below is the #define taking effect, not a "
+               "missing header";
+        ASSERT_TRUE(has(ctlLexs, "7373"));
+    }
+
     PreprocessResult r;
     auto lexs = ppLexemesWithDirs(
-        "#define __has_include(x) 0\n"      // UNGUARDED — refused, and refused
-        "#if __has_include(<norec.h>)\n"    // loudly (asserted below)
+        "#define __has_include(x) 0\n"      // UNGUARDED — accepted, diagnosed,
+        "#if __has_include(<norec.h>)\n"    // and APPLIED
         "#include <norec.h>\n"
         "#endif\n"
         "int u = NOREC_MARKER;\n",
         r, {inc}, {});
 
-    EXPECT_TRUE(hasPPCode(
-        r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
-        << "the unguarded shadow must be refused LOUDLY";
-    auto has = [&](std::string_view s) {
-        for (auto const& l : lexs) if (l == s) return true;
-        return false;
-    };
-    EXPECT_TRUE(has("norec_sym"))
-        << "the refused #define must leave the operator INTACT in the pre-scan "
-           "too — a pre-scan that recorded it would go FIX-3-uncertain on the "
-           "next guard and skip this splice";
-    EXPECT_TRUE(has("7373"))
-        << "NOREC_MARKER must EXPAND — the splice really happened";
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "the unguarded shadow is ACCEPTED by every reference, so DSS accepts "
+           "it too";
+    EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorPredefinedMacro),
+              std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+        << "accepted, never in silence";
+    EXPECT_FALSE(has(lexs, "norec_sym"))
+        << "the program's own macro answered 0, so the include must NOT be "
+           "taken — in the PRE-SCAN as well as in the authoritative pass. A "
+           "pre-scan that filtered the #define out would splice a header the "
+           "deciding pass skipped: one program, two verdicts on one file.";
+    EXPECT_FALSE(has(lexs, "7373"))
+        << "and nothing from the un-taken header may reach the token stream";
+    EXPECT_TRUE(has(lexs, "NOREC_MARKER"))
+        << "the un-expanded macro NAME must survive — which is what gcc, mingw "
+           "gcc and clang leave here too";
     fs::remove_all(inc, ec);
 }
 
@@ -12233,8 +12545,8 @@ TEST(PreprocessorVaOpt, DefineOrUndefOfTheOperatorNameIsAcceptedAndHonoured) {
             << "all four references accept this at their default settings";
         EXPECT_FALSE(hasPPCode(
             r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
-            << "that code is ERROR + unsuppressable and belongs to the "
-               "conditional-inclusion operators alone";
+            << "that code is ERROR + unsuppressable and, since P59, belongs "
+               "to `defined` ALONE";
         EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
                   std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
             << "accepted, but never in silence";
@@ -14627,4 +14939,187 @@ TEST(Preprocessor, UndefInsideAHeaderReachesTheParentsLaterGuardInThePreScan) {
     EXPECT_FALSE(ppSplicedUnder("#ifndef __FNPROBE__", pms, dirs, r2));
     EXPECT_FALSE(hasPPCode(r2, DiagnosticCode::P_PreprocessorIncludeError));
     fs::remove_all(dir, ec);
+}
+
+// ── [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]] (the P0 arm) /
+//    [[D-CSUBSET-CHAR-HIGHBYTE-ICE-SIGNEDNESS]] ────────────────────────────────
+//
+// C 6.10.1p4 makes a character constant in a `#if` an `int`; C 6.4.4.4p10 says
+// WHICH int, and it is not the code unit: `'\xff'` is -1 where the target
+// declares plain `char` SIGNED and +255 where it declares it UNSIGNED. This
+// evaluator used to hand the raw code unit to the fold, so `#if '\xff' < 0`
+// took the `#else` arm on EVERY target. ✔MEASURED at b1f31420 through the
+// shipped CLI on `x86_64:elf64-x86_64-linux-exec`: rc 0, ZERO diagnostics, and a
+// different program compiled than the one gcc 13.3.0 and clang 18.1.3 compile
+// (both take the `#if` arm; each probed separately, and MSVC 19.51 agrees with a
+// non-vacuous control).
+//
+// ⚠ THE THREE ARMS BELOW ARE ONE TEST BECAUSE ANY ONE OF THEM ALONE PASSES FOR
+// THE WRONG REASON. The signed arm alone is satisfied by hard-coding signed; the
+// unsigned arm alone is satisfied by the ORIGINAL defect (the raw code unit IS
+// the unsigned answer); and the target-less arm is what pins that "no answer"
+// means REFUSE rather than "pick one". Only all three together say the value is
+// being read from the declaration.
+TEST(Preprocessor, HighByteCharConstantInIfTakesItsSignFromTheTarget) {
+    auto schema = cSubset();
+    std::vector<std::filesystem::path> noDirs;
+    auto const evalUnder = [&](std::optional<bool> charIsUnsigned) {
+        auto buf = SourceBuffer::fromString(
+            "#if '\xff' < 0\n"
+            "int NEGATIVE;\n"
+            "#else\n"
+            "int NONNEGATIVE;\n"
+            "#endif\n", "main.c");
+        PreprocessResult r = preprocess(
+            buf, schema, noDirs, dss::kDefaultHeaderNameMatching,
+            DiagnosticBudget::libraryDefault(), {}, std::nullopt, {}, {}, {},
+            charIsUnsigned);
+        std::vector<std::string> lexs;
+        for (Token const& t : r.tokens) {
+            if (t.coreKind == CoreTokenKind::Eof) continue;
+            if (t.coreKind == CoreTokenKind::Whitespace) continue;
+            if (t.coreKind == CoreTokenKind::Newline) continue;
+            lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+        }
+        struct Out { std::vector<std::string> lexemes; bool refused; };
+        return Out{std::move(lexs),
+                   hasPPCode(r, DiagnosticCode::P_PreprocessorDirective)};
+    };
+
+    // SIGNED target (x86_64 everywhere, arm64 x macho): `'\xff'` is -1 < 0.
+    auto const signedArm = evalUnder(false);
+    EXPECT_FALSE(signedArm.refused);
+    EXPECT_NE(std::find(signedArm.lexemes.begin(), signedArm.lexemes.end(),
+                        std::string{"NEGATIVE"}),
+              signedArm.lexemes.end())
+        << "on a signed-`char` target `#if '\xff' < 0` must take the `#if` arm "
+           "(C 6.4.4.4p10 — the constant's value is -1, not the code unit 255)";
+    EXPECT_EQ(std::find(signedArm.lexemes.begin(), signedArm.lexemes.end(),
+                        std::string{"NONNEGATIVE"}),
+              signedArm.lexemes.end());
+
+    // UNSIGNED target (arm64 x elf — the one DSS ships): `'\xff'` is +255.
+    auto const unsignedArm = evalUnder(true);
+    EXPECT_FALSE(unsignedArm.refused);
+    EXPECT_NE(std::find(unsignedArm.lexemes.begin(), unsignedArm.lexemes.end(),
+                        std::string{"NONNEGATIVE"}),
+              unsignedArm.lexemes.end())
+        << "on an unsigned-`char` target the SAME source must take the `#else` "
+           "arm — this is the leg where the defect and the fix agree, so it is "
+           "here to prove the answer is READ and not hard-coded";
+    EXPECT_EQ(std::find(unsignedArm.lexemes.begin(), unsignedArm.lexemes.end(),
+                        std::string{"NEGATIVE"}),
+              unsignedArm.lexemes.end());
+
+    // NO target supplied (the LSP / FFI header parser / direct-API callers):
+    // the answer is target-dependent and unknown, so REFUSE — never guess.
+    auto const noTargetArm = evalUnder(std::nullopt);
+    EXPECT_TRUE(noTargetArm.refused)
+        << "a character constant above 0x7F in `#if` has a target-dependent "
+           "value; with no target threaded the fold must fail LOUD rather than "
+           "silently pick a sign";
+}
+
+// The COMPANION that keeps the arm above from being over-broad: a 0-127 body is
+// the SAME integer under both readings, so it must fold with no target at all.
+// Without this, "refuse when the target is absent" could quietly have been
+// widened to every character constant — which would break the LSP, the FFI
+// header parser and ~180 direct-API call sites for a question that has only one
+// answer. It is also why the corpus (sqlite included) never saw this defect.
+TEST(Preprocessor, AsciiCharConstantInIfNeedsNoTargetBecauseItCannotDiffer) {
+    auto schema = cSubset();
+    std::vector<std::filesystem::path> noDirs;
+    auto buf = SourceBuffer::fromString(
+        "#if 'A' == 65\n"
+        "int ASCII_OK;\n"
+        "#endif\n", "main.c");
+    PreprocessResult r = preprocess(
+        buf, schema, noDirs, dss::kDefaultHeaderNameMatching,
+        DiagnosticBudget::libraryDefault(), {}, std::nullopt, {}, {}, {},
+        /*charIsUnsigned=*/std::nullopt);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective));
+    bool sawMarker = false;
+    for (Token const& t : r.tokens) {
+        if (r.synthBuffer->slice(t.span) == "ASCII_OK") sawMarker = true;
+    }
+    EXPECT_TRUE(sawMarker)
+        << "`'A'` is 65 under either signedness, so it must fold with no target "
+           "threaded — the refusal is scoped to code units above 0x7F";
+}
+
+// ── THE CORPUS ANCHOR, AND IT IS THE ROW'S OWN STATED TRIGGER ────────────────
+// [[D-CSUBSET-CHAR-HIGHBYTE-ICE-SIGNEDNESS]] said its trigger was "a runtime-vs-
+// fold probe confirms a disagreement, OR A REAL PROGRAM HITS THE BOUNDARY", and
+// recorded that "0–127 bodies (all real-world usage incl. sqlite) have ZERO
+// divergence". ✔MEASURED: the second half is FALSE. `sqlite3.c` ships
+//
+//     #if 'A' == '\301'
+//
+// as its EBCDIC detection (also in `src/sqliteInt.h` and `tsrc/sqliteInt.h` —
+// three occurrences in the staged tree, found by scanning every `*.c`/`*.h` in
+// it). `'\301'` is octal 301 = 0xC1, a HIGH-BYTE narrow character constant in a
+// `#if` controlling expression: exactly the boundary the row was waiting for, in
+// the project's own corpus, all along.
+//
+// ⚠ AND IT IS FALSE UNDER BOTH READINGS, WHICH IS WHY NOTHING EVER NOTICED. On an
+// ASCII host `'A'` is 65, and `'\301'` is either -63 (signed `char`) or +193
+// (unsigned) — 65 equals neither, so the `#else` arm is taken either way and the
+// corpus built green through the entire life of the defect. That coincidence is
+// the whole reason this pin exists: the construct is REACHED constantly, so the
+// fold must keep working and must not start refusing, while the divergence it
+// could have exposed never fired.
+//
+// ✔MEASURED through the shipped CLI on `x86_64:elf64-x86_64-linux-exec` and
+// `arm64:elf64-aarch64-linux-exec`, debug and release: exit 42 (the `#else`,
+// ASCII arm) on all four, matching gcc 13.3.0, clang 18.1.3 and
+// aarch64-linux-gnu-gcc 13.3.0, each probed separately.
+TEST(Preprocessor, SqlitesEbcdicGuardIsAHighByteCharConstantAndStillFolds) {
+    auto schema = cSubset();
+    std::vector<std::filesystem::path> noDirs;
+    auto const takesAsciiArm = [&](std::optional<bool> charIsUnsigned) {
+        auto buf = SourceBuffer::fromString(
+            "#if 'A' == '\301'\n"
+            "int EBCDIC_HOST;\n"
+            "#else\n"
+            "int ASCII_HOST;\n"
+            "#endif\n", "main.c");
+        PreprocessResult r = preprocess(
+            buf, schema, noDirs, dss::kDefaultHeaderNameMatching,
+            DiagnosticBudget::libraryDefault(), {}, std::nullopt, {}, {}, {},
+            charIsUnsigned);
+        struct Out { bool ascii; bool ebcdic; bool refused; };
+        Out o{false, false,
+              hasPPCode(r, DiagnosticCode::P_PreprocessorDirective)};
+        for (Token const& t : r.tokens) {
+            auto const s = r.synthBuffer->slice(t.span);
+            if (s == "ASCII_HOST")  o.ascii  = true;
+            if (s == "EBCDIC_HOST") o.ebcdic = true;
+        }
+        return o;
+    };
+
+    // Both readings must reach the ASCII arm — the values differ (-63 vs +193)
+    // but neither equals 65, so the ANSWER is the same and sqlite is unaffected.
+    for (bool cu : {false, true}) {
+        auto const o = takesAsciiArm(cu);
+        EXPECT_FALSE(o.refused) << "charIsUnsigned=" << cu;
+        EXPECT_TRUE(o.ascii)   << "charIsUnsigned=" << cu
+            << ": 'A' is 65 and '\301' is -63 or +193 — never 65, so the ASCII "
+               "arm is taken under either reading";
+        EXPECT_FALSE(o.ebcdic) << "charIsUnsigned=" << cu;
+    }
+
+    // ⚠ THE TARGET-LESS ARM REFUSES, AND THAT IS DELIBERATE EVEN THOUGH THE
+    // ANSWER WOULD HAVE BEEN THE SAME. The refusal is scoped to the OPERAND (a
+    // code unit above 0x7F), not to the expression's answer, because deciding
+    // "would it have mattered?" requires folding the whole expression under both
+    // readings and comparing — an instrument that answers an adjacent question
+    // and fails toward `clean`. Every real compile threads the target, so this
+    // costs the corpus nothing; what it buys is that no target-less consumer can
+    // ever quietly get a `#if` arm that a target would have flipped.
+    auto const noTarget = takesAsciiArm(std::nullopt);
+    EXPECT_TRUE(noTarget.refused)
+        << "with no target threaded, a high-byte character constant in `#if` "
+           "must fail loud — the refusal keys on the OPERAND, not on whether "
+           "this particular comparison happens to be sign-agnostic";
 }

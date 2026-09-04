@@ -74,8 +74,13 @@ $ErrorActionPreference = 'Stop'
 # no `-Guards`, and no `-LE repo-guard` anywhere in it, so every PowerShell-driven
 # macOS leg ran the full suite regardless of what was asked for.
 # ✔MEASURED at the P36 gate: macOS reported **1671** where WSL and the VPS reported
-# **1653**, the difference being exactly the 18 `repo-guard` entries -- ~170 s per leg
-# re-checking a source tree the root host had already checked.
+# **1653**, the difference being exactly the `repo-guard` entries of that day -- ~170 s per
+# leg re-checking a source tree the root host had already checked.
+# ⚠ THAT DIFFERENCE WAS 18 AT P36 AND IS NOT 18 NOW (26 at P59, and it moves whenever a guard
+# is added). Do not read the two totals above as a live identity: re-derive the subtrahend
+# from the configure line `repo-guard label applied to N test(s)`, or from
+# `ctest -N -L repo-guard`. The INVARIANT is that the root host runs N more than every
+# indirect leg; the NUMBER is a dated inventory.
 # ★ THE COST IS NOT ONLY THE TIME. Two legs both reporting "1671/1671" were not running
 # the same 1671, and a figure that silently means something different per host is worse
 # than a slower one. D-SCRIPT-MACOS-LEG-PS1-CANNOT-SKIP-THE-REPO-GUARDS

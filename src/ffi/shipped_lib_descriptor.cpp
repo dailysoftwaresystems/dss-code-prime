@@ -1164,7 +1164,18 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
         emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
             // The example names the MODERN pe C runtime deliberately: this text is
             // what an author copies, and `msvcrt.dll` is the legacy CRT the UCRT
-            // migration moved off (only `setjmp.json` still names it, on purpose).
+            // migration moved off. ⚠ THE PARENTHETICAL THAT USED TO STAND HERE —
+            // "only `setjmp.json` still names it, on purpose" — was ✔MEASURED
+            // FALSE (P59): ZERO shipped descriptors name `msvcrt.dll`, so the
+            // migration is complete on this side and the sentence described a
+            // configuration that no longer exists. It is replaced rather than
+            // repaired because the fact it recorded is now owned by a test —
+            // `RuntimeLibraryRoles.NoPeFormatNamesTheLegacyCrtInItsRoleTable`
+            // for the role tables, and
+            // `DescriptorLibraryRoleAgreement.EveryImageTheCorpusNamesCarriesAVerdict`
+            // for this corpus, which refuses any pe image with no stated verdict.
+            // A prose census in a diagnostic string is a copy nothing re-derives;
+            // that is exactly how this one went stale unnoticed.
             + "' must be a per-object-format object, e.g. "
               "{\"pe\":\"ucrtbase.dll\",\"elf\":\"libc.so.6\"}");
         return false;

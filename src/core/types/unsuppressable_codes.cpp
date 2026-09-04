@@ -546,10 +546,17 @@ constexpr MembershipReason kWhyAsmLabel{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, the intended symbol name is not restored: a C-mangled or "
     "synthetic name ships and the build stays green all the way to link"};
+// ⚠ THE STATED REASON WAS RESTATED IN P59 (2026-09-04) BECAUSE THIS CODE'S
+// SUBJECT NARROWED TO ONE NAME. It used to read "silenced, __has_include(<h>)
+// answers 0 while #include <h> still splices the header, so the guard and the
+// include disagree" — true of the conditional-inclusion operators, which this
+// code no longer refuses (an operator ruling made their posture DATA, at at
+// most a warning, matching all four references). MEMBERSHIP is still right, on
+// the same prong, for the name that remains.
 constexpr MembershipReason kWhyOperatorNameNotDefinable{
     MembershipProng::WrongArtifactShipsGreen,
-    "silenced, __has_include(<h>) answers 0 while #include <h> still "
-    "splices the header, so the guard and the include disagree"};
+    "silenced, a program may redefine `defined` and every #if in every header "
+    "it reaches then means something the author did not write"};
 
 // ★★★ THE TWO CODES D-DIAG-UNSUPPRESSABLE-FAMILY-UNDECIDED WAS FILED ABOUT.
 //

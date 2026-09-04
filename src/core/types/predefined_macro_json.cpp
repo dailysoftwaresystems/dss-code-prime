@@ -698,11 +698,16 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
                       std::format(
                           "a 'predefinedMacros' entry requires '{}' - accepted: "
                           "{}. It selects whether a program's '#define' or "
-                          "'#undef' of this name is DIAGNOSED (the change "
-                          "applies either way): '{}' for a name ISO C 6.10.10 "
-                          "itself lists, '{}' for one whose value the engine "
-                          "derives per use, '{}' for an implementation extension "
-                          "that is neither. There is no default, because "
+                          "'#undef' of this name is DIAGNOSED, and for the three "
+                          "diagnosing verbs the change still APPLIES: '{}' for a "
+                          "name ISO C 6.10.10 itself lists, '{}' for one whose "
+                          "value the engine derives per use, '{}' for an "
+                          "implementation extension that is neither. The fourth "
+                          "verb 'refuse' is the exception and is why this "
+                          "sentence no longer says 'either way': it REJECTS the "
+                          "directive at Error and the name keeps its meaning - "
+                          "reserved for a name no reference lets a program take "
+                          "over. There is no default, because "
                           "guessing a warn verb emits a diagnostic gcc and clang "
                           "do not, and guessing ordinary drops one they do",
                           kProgramRedefinitionKey,

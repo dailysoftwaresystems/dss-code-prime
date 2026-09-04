@@ -9,11 +9,25 @@
 // The Apple SDK's `sys/cdefs.h` ships that block for FIVE operators; glibc,
 // musl, Boost and zlib ship the same three lines. On a compiler that HAS the
 // operator the block is DEAD; on one that does not, it installs a fallback that
-// answers 0. DSS implements `__has_include` / `__has_embed` /
-// `__has_c_attribute` and NOT `__has_attribute` / `__has_builtin` /
-// `__has_feature` / `__has_extension`, so all four shims here are LIVE — and
-// this program proves the resulting build is a WORKING one, not merely a
-// non-erroring one.
+// answers 0.
+//
+// ⚠⚠ THE SENTENCE THAT STOOD HERE WENT FALSE ON 2026-09-04 AND THIS EXAMPLE
+// STAYED GREEN THROUGHOUT — which is exactly why it is worth reading. It said
+// DSS implements `__has_include` / `__has_embed` / `__has_c_attribute` and NOT
+// `__has_attribute` / `__has_builtin` / `__has_feature` / `__has_extension`,
+// "so all four shims here are LIVE". P59 shipped all four operators (operator
+// ruling 2026-09-03), so ALL FOUR SHIMS HERE ARE NOW DEAD — the `#ifndef` is
+// false and the fallback never installs.
+//
+// ★ THE ASSERTIONS DID NOT MOVE, BECAUSE THE ANSWERS DID NOT: every query below
+// takes a deliberately bogus argument, and 0 is the correct answer whether it
+// comes from a live shim or from the real operator. That is what makes this a
+// FALLBACK witness rather than a capability witness — and it is also why
+// nothing reddened when the world underneath it changed. A green example is not
+// evidence that its own header is still true.
+// ⇒ What it proves today: a build in which the shims are DEAD is still a
+// WORKING one, not merely a non-erroring one. The LIVE-shim path it was written
+// for is no longer reachable on DSS for these four names.
 //
 // ═══ WHY EVERY QUERY BELOW TAKES A DELIBERATELY BOGUS ARGUMENT ═══════════════
 //

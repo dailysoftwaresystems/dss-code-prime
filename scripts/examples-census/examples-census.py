@@ -91,6 +91,13 @@ def census(ms):
               "optimizedPipelines", "targets"):
         c["top." + k] = top(k)
 
+    # ⚠ DELIBERATELY NOT IN THE TUPLE ABOVE, whose stated invariant is the RUNNERS'
+    # key set: `$comment` is the repo-wide documentation convention and no runner
+    # reads it. It is censused anyway because `examples/README.md` states a figure
+    # for it, and a figure this script does not report is a figure nothing can
+    # check -- which is how the whole block rotted by 2026-09-04.
+    c["top.$comment"] = top("$comment")
+
     tgts = [t for _, m in ms for t in m.get("targets", [])]
     c["targets"] = len(tgts)
     for k in ("spec", "artifact", "runOn", "emulator", "exitCode",
@@ -151,6 +158,15 @@ def census(ms):
                                    if a.get("mustDifferFromBaseline") is True)
     c["arms.mustDifferFalse"] = sum(1 for a in arms
                                     if a.get("mustDifferFromBaseline") is False)
+
+    # The expect-error arms: a target that builds nothing and spawns nothing omits
+    # BOTH keys. `examples/README.md` states this as TWO figures -- N target entries
+    # across M manifests -- and says in its own words why they are not the same
+    # number (one such manifest declares two targets), so both halves are censused.
+    no_build = [(rel, t) for rel, m in ms for t in m.get("targets", [])
+                if "artifact" not in t and "runOn" not in t]
+    c["targets.noArtifactNoRunOn"] = len(no_build)
+    c["manifests.noArtifactNoRunOn"] = len({rel for rel, _ in no_build})
 
     c["targets.runOnEmpty"] = sum(1 for t in tgts if t.get("runOn") == [])
     c["manifests.allRunOnEmpty"] = sum(

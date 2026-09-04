@@ -46,10 +46,21 @@
  * of the f64 axis, so the SAME program is meaningful where `long double` IS
  * `double` (pe64 x86_64, Apple arm64).
  *
- * ⓘ NO LONG DOUBLE IS EVER COMPARED DIRECTLY. `FCmp` on F80/F128 is still walled
- * (the operand width gate: neither kind has an encoded scalar compare form), a
- * separate residual from this row. Every check here extracts an exact integer
- * with `(int)(v * 4)` — quarters — and compares ints.
+ * ⓘ NO LONG DOUBLE IS EVER COMPARED DIRECTLY, AND THAT IS NOW A CHOICE RATHER
+ * THAN A WALL. ⚠ THIS PARAGRAPH USED TO SAY `FCmp` ON F80/F128 WAS STILL WALLED
+ * BY THE OPERAND WIDTH GATE, AND THAT SENTENCE WENT FALSE ON 2026-09-03:
+ * [[D-TARGET-ENCODING-WIDTH-GUARD]]'s compare arm shipped that day (cycle P58 —
+ * an inline `fucomip` sequence on the x87-80 axis, a config'd `__lttf2`-family
+ * softcall on ieee128), so a long-double comparison compiles and runs on both
+ * axes today. The int-quarter extraction below is KEPT DELIBERATELY, and
+ * re-affirmed 2026-09-04 after re-measuring: rewriting this example onto the
+ * new compare would make a PHI witness depend on the COMPARE path, so one
+ * defect in `emitFloatCompare` could turn a MERGE failure green. Keeping the
+ * two subjects separate is what makes this an independent control. Every check
+ * here therefore still extracts an exact integer with `(int)(v * 4)` —
+ * quarters — and compares ints. ⓘ The comparison has its own witness
+ * (`examples/c/c_long_double_compare`), and the CONVERSIONS have theirs
+ * (`examples/c/c_long_double_convert`).
  *
  * exit = 42 on success; each arm returns its own number so a failure names itself.
  */

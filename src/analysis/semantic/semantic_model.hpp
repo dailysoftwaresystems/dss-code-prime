@@ -974,9 +974,14 @@ public:
                                                          suppressedShippedLibraries,
                   DataModel                              dataModel,
                   LongDoubleFormat                       longDoubleFormat,
-                  // Inline-asm P5: see `target()`. Last, and defaulted, because
+                  // Inline-asm P5: see `target()`. Defaulted, because
                   // every existing caller is target-less by construction.
-                  TargetSchema const*                    target = nullptr) noexcept
+                  TargetSchema const*                    target = nullptr,
+                  // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: see
+                  // `charIsUnsigned()`. Last, and defaulted, for the same
+                  // reason `target` is.
+                  std::optional<bool>                    charIsUnsigned =
+                      std::nullopt) noexcept
         : cu_(std::move(cu)),
           lattice_(std::move(lattice)),
           scopes_(std::move(scopes)),
@@ -994,7 +999,8 @@ public:
           suppressedShippedLibraries_(std::move(suppressedShippedLibraries)),
           dataModel_(dataModel),
           longDoubleFormat_(longDoubleFormat),
-          target_(target) {}
+          target_(target),
+          charIsUnsigned_(charIsUnsigned) {}
 
     SemanticModel(SemanticModel const&)            = delete;
     SemanticModel& operator=(SemanticModel const&) = delete;
@@ -1181,6 +1187,24 @@ public:
     // (which cannot function without resolving the letter) fails loud there.
     [[nodiscard]] TargetSchema const* target() const noexcept { return target_; }
 
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: plain `char`'s signedness for the
+    // (target × object format) this analysis ran under —
+    // `TargetSchema::charIsUnsigned(ObjectFormatKind)`, RESOLVED ONCE by
+    // `analyze()` from the two axes it already receives. C 6.2.5p15 leaves it
+    // implementation-defined and the same arm64 CPU answers differently under
+    // GNU/Linux (unsigned) and Darwin (signed), so it is neither derivable from
+    // the arch nor from the format alone.
+    //
+    // The HIR lowering reads THIS rather than taking a second parameter — the
+    // `dataModel()` / `longDoubleFormat()` discipline — so the const-expr fold in
+    // the semantic tier and the value fold in the lowering tier cannot disagree
+    // about what `'ÿ'` is. `nullopt` (LSP / FFI header parser / direct-API
+    // tests, which analyze with no target) makes a `char` const-fold REFUSE, not
+    // guess: only code units above 0x7F can even tell the difference.
+    [[nodiscard]] std::optional<bool> charIsUnsigned() const noexcept {
+        return charIsUnsigned_;
+    }
+
 private:
     std::shared_ptr<CompilationUnit const> cu_;
     TypeLattice                            lattice_;
@@ -1229,6 +1253,9 @@ private:
     // pointer — the schema is owned by the driver and outlives the model, the
     // same lifetime contract `analyze()`'s `aggregateLayout` already has.
     TargetSchema const*                                    target_ = nullptr;
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the analysis-time plain-`char`
+    // signedness (see `charIsUnsigned()`).
+    std::optional<bool>                                    charIsUnsigned_{};
 };
 
 // Pin move-only / non-copyable at compile time so a future refactor

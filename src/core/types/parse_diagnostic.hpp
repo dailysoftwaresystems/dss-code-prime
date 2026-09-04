@@ -209,35 +209,42 @@ enum class DiagnosticCode : std::uint16_t {
     P_PreprocessorPragma          = 0x0020,
 
     // P_PreprocessorOperatorNameNotDefinable: TF-C86
-    // (D-CSUBSET-STDARG-F001A). A `#define` or `#undef` named one of the
-    // language's CONDITIONAL-INCLUSION OPERATORS — the `#if`-only
-    // `__has_include` / `__has_embed` / `__has_c_attribute` spellings the
-    // grammar declares (`isConditionalInclusionOperator`). C23 6.10.1 reserves
-    // those identifiers to the implementation, and DSS IMPLEMENTS them, so a
+    // (D-CSUBSET-STDARG-F001A). A `#define` or `#undef` named an identifier the
+    // language declares NON-DEFINABLE.
+    //
+    // ⚠⚠ ITS SUBJECT NARROWED TO EXACTLY ONE NAME IN P59 (2026-09-04), AND THE
+    // PARAGRAPHS THAT USED TO STAND HERE DESCRIBED THE OLD ONE. Until then this
+    // code covered the CONDITIONAL-INCLUSION OPERATORS (`__has_include` /
+    // `__has_embed` / `__has_c_attribute`) and refused a `#define`/`#undef` of
+    // any of them at Error. An operator ruling of 2026-09-03 reversed that:
+    // ✔MEASURED, all four references ACCEPT such a `#define` at at most a
+    // WARNING and APPLY it, and being stricter than the entire union is not
+    // rigor. Their posture is now DATA (`preprocess.reservedIdentifiers`), the
+    // same declaration the `__STDC__` arm reads.
+    //
+    // ⇒ THE ONLY REMAINING CLIENT IS `defined`, and it is the one name this
+    // code's wording is true about. ✔MEASURED 2026-09-04, each reference
+    // probed separately: `#define defined 1` / `#undef defined` is a HARD ERROR
+    // in gcc 13.3.0, mingw-w64 gcc 13.2.0 and clang 18.1.3 (`cl` warns C4117
+    // and ignores it), so refusing it keeps DSS inside the union rather than
+    // above it. C23 6.10.1 reserves the identifier and DSS implements it, so a
     // program cannot take the name over.
     //
-    // Why an ERROR and not a silent accept: honoring the redefinition makes
-    // `#include <h>` and `__has_include(<h>)` answer DIFFERENTLY about the same
-    // header — the header gets textually spliced while the guard that decides
-    // whether to splice it reads 0. That is a silent miscompile, and it is
-    // exactly the shape that produced the TF-C86 `F001A` cascade before the
-    // operators became `defined`.
+    // ★ AND THE REFUSAL DID NOT EXIST FOR `defined` UNTIL P59. Before it,
+    // `#define defined 1` compiled rc 0 IN SILENCE — `isConditionalInclusionOperator`
+    // deliberately excluded `definedOperator` and nothing else covered it,
+    // while `preprocess_config.hpp` asserted in a comment that the refusal
+    // "lives in the conditional-inclusion-operator guard". A comment claiming a
+    // guard that did not exist.
     //
-    // ★ THIS ARM IS A BELT, NOT A BREAK. The ubiquitous portability shim
-    //       #ifndef __has_include
-    //       #define __has_include(x) 0
-    //       #endif
-    //   (Apple SDK `sys/cdefs.h`, glibc, musl, ...) is now DEAD code on DSS
-    //   — `#ifndef __has_include` is false because the operator IS defined — so
-    //   the `#define` inside it never executes and this code never fires for
-    //   it. MEASURED: zero occurrences of an UNGUARDED `#define`/`#undef` of
-    //   these three names across the 189-TU sqlite corpus. What remains for
-    //   this code to catch is a program that really does try to shadow the
-    //   operator outright.
+    // Why an ERROR and not a silent accept: `defined` is what every `#if` is
+    // written in terms of. A program that redefines it changes the meaning of
+    // every conditional in every header it reaches, and the references agree
+    // that is not a program.
     //
-    // Member of `kUnsuppressableCodes`: suppressing it would restore precisely
-    // the silent include/`__has_include` disagreement it exists to prevent.
-    // Remediation: guard the shim with `#ifndef`, or stop shadowing the name.
+    // Member of `kUnsuppressableCodes`: see `kWhyOperatorNameNotDefinable` in
+    // `unsuppressable_codes.cpp` for the membership reason, which was restated
+    // in the same pass. Remediation: stop shadowing `defined`.
     P_PreprocessorOperatorNameNotDefinable = 0x0021,
 
     // P_PreprocessorIncludeReentryRefused: TF-C87

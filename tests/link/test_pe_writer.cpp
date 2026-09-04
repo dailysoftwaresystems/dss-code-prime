@@ -3066,6 +3066,93 @@ TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
     EXPECT_EQ(img[u + 13], 0x32u) << "ALLOC_SMALL | (slots-1)=3";
 }
 
+TEST(PeExecWriter, VlaFramePointerCaptureEmitsSetFpregSoTheFrameIsDescribable) {
+    // D-CSUBSET-VLA-WIN64-UNWIND. A pe64 function with a variable-length array
+    // captures a FRAME POINTER after its fixed prologue and then moves RSP by a
+    // RUNTIME amount. Win64 has NO unwind opcode for a dynamic allocation — the
+    // FRAME REGISTER is the whole mechanism: `UWOP_SET_FPREG` tells the unwinder
+    // to recover RSP from that register instead of by summing the ALLOC codes, and
+    // after it the dynamic `sub rsp,<size>` needs no description at all.
+    //
+    // ✔THE ORACLE, probed on this machine: mingw-w64 gcc 13.2.0 emits, for a VLA
+    // function that calls, exactly `01 0b 04 45` + `0b 03` (SET_FPREG) + the fixed
+    // prologue's PUSH/ALLOC codes and NOTHING for its `sub %rax,%rsp`. DSS emits
+    // the same shape with FrameOffset 0 (its capture is `FP <- SP`, so the frame
+    // register holds the value the offsets were measured against).
+    //
+    // The producer side is `lir_callconv`'s `DefCfaRegister` op at the `sp_copy`
+    // that captures the frame pointer; this pin is the CONSUMER side — that the
+    // pe64 writer turns that rule into the two bytes the OS reads.
+    //
+    // ⚠ RED-ON-DISABLE, ✔MEASURED: suppress the `kUwopSetFpReg` push in
+    // `buildFunctionUnwindInfo`'s `DefCfaRegister` arm and this test fails on THREE
+    // independent bytes (CountOfCodes 4→3, FrameRegister 5→0, and the missing code
+    // pair). The same mutation makes a real Windows walk out of such a frame
+    // reconstruct RSP from the FAULTING rsp and hand back Rip 0 — the walk half of
+    // this row, exercised by `examples/c/c99_vla_win64_unwind_walk`.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    // sub rsp,0x20 (7 B) ; mov [rsp+0],rbp (8 B) ; mov rbp,rsp (3 B) ; ret
+    // — the fixed prologue, the frame-pointer save, the capture. Only the FIRST
+    // byte is inspected by the builder's prologue-shape guard; the rest is opaque.
+    fn.bytes = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00,
+                0x48, 0x89, 0xAC, 0x24, 0x00, 0x00, 0x00, 0x00,
+                0x48, 0x8B, 0xEC,
+                0xC3};
+    CfiFunction cfi;
+    cfi.codeLength    = 19;
+    cfi.initial       = CfiInitialState{/*cfaRegister=*/4, /*cfaOffset=*/8,
+                                        /*returnAddressAtCfaOffset=*/-8,
+                                        /*returnAddressRegister=*/std::nullopt};
+    cfi.prologueEndPc = 18;
+    cfi.ops = {
+        // CFA = RSP + 40 once `sub rsp,0x20` retires (8 pushed by the CALL + 32).
+        CfiOp{7,  CfiOpKind::DefCfaOffset,   CfiRegRef{},            CfiRegRef{},  40},
+        // rbp saved at [RSP+0] == CFA-40.
+        CfiOp{15, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(5), CfiRegRef{}, -40},
+        // THE SUBJECT: the CFA base becomes rbp, at the same offset — which is what
+        // lets everything after this point survive a runtime-moved RSP.
+        CfiOp{18, CfiOpKind::DefCfaRegister, CfiRegRef::physical(5), CfiRegRef{},   0},
+    };
+    fn.cfi = std::move(cfi);
+    mod.functions.push_back(std::move(fn));
+
+    DiagnosticReporter rep;
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(img.empty());
+
+    auto const [xdataRva, xdataPtr] =
+        findExecSection(img, {'.', 'x', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(xdataRva, 0u) << ".xdata section must exist";
+
+    std::size_t const u = xdataPtr;
+    EXPECT_EQ(img[u + 0], 0x01u) << "Version=1, Flags=0";
+    EXPECT_EQ(img[u + 1], 18u)   << "SizeOfProlog (past the FP capture)";
+    // SET_FPREG(1) + SAVE_NONVOL(2) + ALLOC_SMALL(1) = 4 nodes. Without the
+    // SET_FPREG this reads 3 — the first of the three bytes that go red.
+    EXPECT_EQ(img[u + 2], 4u)    << "CountOfCodes incl. UWOP_SET_FPREG";
+    // FrameRegister = rbp's HARDWARE encoding in the low nibble; FrameOffset = 0
+    // in the high nibble, because the capture is FP <- SP. Zero here means "no
+    // frame register at all", which is precisely the undescribable state.
+    EXPECT_EQ(img[u + 3], 0x05u) << "FrameRegister=rbp(5), FrameOffset=0";
+    // Codes DESCEND by CodeOffset: SET_FPREG(18), rbp SAVE_NONVOL(15), ALLOC(7).
+    EXPECT_EQ(img[u + 4], 18u)   << "SET_FPREG CodeOffset";
+    EXPECT_EQ(img[u + 5], 0x03u) << "UWOP_SET_FPREG, op-info 0";
+    EXPECT_EQ(img[u + 6], 15u)   << "rbp CodeOffset";
+    EXPECT_EQ(img[u + 7], 0x54u) << "rbp SAVE_NONVOL | reg=5";
+    EXPECT_EQ(readU16LE(img, u + 8), 0u) << "rbp at frame base + 0";
+    EXPECT_EQ(img[u + 10], 7u)    << "ALLOC CodeOffset";
+    EXPECT_EQ(img[u + 11], 0x32u) << "ALLOC_SMALL | (slots-1)=3";
+}
+
 TEST(PeExecWriter, FunctionUnwindInfoStackProbePrologueUsesFixedAllocLen) {
     // D-WIN64-PDATA-XDATA-UNWIND + D-WIN64-LARGE-FRAME-STACK-PROBE. A pe64
     // function whose frame exceeds one guard page emits the inline page-probe

@@ -387,7 +387,11 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
                                          headerNameMatching_, budget_, systemDirs_,
                                          activeFormat_, userDefines_,
                                          targetPredefinedMacros_,
-                                         formatPredefinedMacros_);
+                                         formatPredefinedMacros_,
+                                         // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]:
+                                         // the target's plain-`char` sign, for
+                                         // the `#if` ICE fold.
+                                         charIsUnsigned_);
         phase.reset();
         auto remap = pp.makeRemap();
         // [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: the DIAGNOSTIC-shaped
@@ -737,6 +741,13 @@ void UnitBuilder::setHeaderNameMatching(HeaderNameMatching matching) {
         cuFatal("UnitBuilder::setHeaderNameMatching called after finish()");
     }
     headerNameMatching_ = matching;
+}
+
+void UnitBuilder::setCharIsUnsigned(std::optional<bool> charIsUnsigned) {
+    if (finished_) {
+        cuFatal("UnitBuilder::setCharIsUnsigned called after finish()");
+    }
+    charIsUnsigned_ = charIsUnsigned;
 }
 
 void UnitBuilder::setUserDefines(std::vector<std::string> defines) {

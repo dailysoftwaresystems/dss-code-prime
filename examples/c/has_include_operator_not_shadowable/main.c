@@ -30,9 +30,19 @@
 #define __has_include(x) 0
 #endif
 
-/* An unguarded `#define __has_include(x) 0` would be REFUSED loudly
-   (P_PreprocessorOperatorNameNotDefinable, unsuppressable). The guarded form
-   above is the one the world actually writes, and it must stay silent. */
+/* ⚠ THIS COMMENT WAS FALSE FROM 2026-09-04 UNTIL IT WAS CORRECTED, AND THE
+   CORRECTION IS THE POINT: it used to say an unguarded
+   `#define __has_include(x) 0` "would be REFUSED loudly
+   (P_PreprocessorOperatorNameNotDefinable, unsuppressable)". It is now ACCEPTED
+   with a warning and APPLIED — an operator ruling of 2026-09-03, on the
+   measurement that all four references accept and apply it and that being
+   stricter than the entire union is not rigor. `defined` is the only name that
+   code still refuses.
+   ⇒ WHAT THIS EXAMPLE ASSERTS IS UNCHANGED AND IS THE GUARDED FORM: the shim
+   above must stay DEAD (`#ifndef __has_include` is false because the operator
+   IS provided) and therefore SILENT. That property does not depend on what an
+   UNGUARDED define would do, which is why this example stayed green across the
+   ruling while its comment went false. */
 
 #if __has_include("local_probe.h")
 #include "local_probe.h"

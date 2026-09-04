@@ -545,7 +545,25 @@ public:
     std::optional<ObjectFormatKind>      activeFormat = std::nullopt,
     std::span<std::string const>         userDefines  = {},
     std::span<PredefinedMacroDef const>  targetPredefinedMacros = {},
-    std::span<PredefinedMacroDef const>  formatPredefinedMacros = {});
+    std::span<PredefinedMacroDef const>  formatPredefinedMacros = {},
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the ACTIVE (target × object
+    // format)'s plain-`char` signedness —
+    // `TargetSchema::charIsUnsigned(ObjectFormatKind)`, the one accessor on the
+    // one owner. It reaches the `#if`/`#elif` ICE evaluator, because C 6.10.1p4
+    // makes a character constant there an `int` and C 6.4.4.4p10 makes THAT int
+    // negative for a high byte where plain `char` is signed: `#if '\xff' < 0`
+    // takes opposite arms on x86_64-linux and aarch64-linux, and this pass has
+    // no other way to know which. ✔MEASURED taking the WRONG arm on x86_64 at
+    // b1f31420 — rc 0, zero diagnostics.
+    //
+    // ⚠ DEFAULTED, UNLIKE `headerNameMatching` ABOVE, AND FOR A REASON THE
+    // DEFAULT DOES NOT HIDE. A `#if` fold is reachable from callers with no
+    // target at all (the LSP, the FFI header parser, ~180 direct-API test call
+    // sites), and `nullopt` here does NOT pick a sign: a code unit 0–127 is the
+    // same integer under both readings and folds exactly as before, while a
+    // high byte REFUSES with a positioned diagnostic. There is no silent choice
+    // to make greppable, because there is no choice.
+    std::optional<bool>                  charIsUnsigned = std::nullopt);
 
 // FC17.9(h) (`#embed`; the size-cap boundary of D-PP-EMBED): a PURE budget
 // check for the cycle-1 `#embed` splice. The splice materializes the resource as

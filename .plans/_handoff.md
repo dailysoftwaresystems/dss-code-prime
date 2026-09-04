@@ -9,7 +9,7 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-09-04 — cycles **P14 … P58**. ⚠ P52 rewrote no handoff at all, so a reader
+**Last updated:** 2026-09-04 — cycles **P14 … P59**. ⚠ P52 rewrote no handoff at all, so a reader
 who opened this file during P53 saw P51 described as current state; that entry in §5 was written
 retroactively by P53 and says so. P53's own §0 was relocated into §5 by P54 and is marked as
 history there.
@@ -17,6 +17,230 @@ history there.
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
+
+**Cycle P59 closed 2026-09-04.** **SEVEN lanes** plus the orchestrator, in three waves of at
+most four, on top of P58 (`b1f31420`).
+✔**REAL: 10 rows closed, 1 opened.** ✔**COUNTED by
+`check-anchor-balance --base b1f31420`: 9 closed, 0 opened, net −9.** The one row OPENED is
+[[D-CSUBSET-VLA-MULTIDECLARATOR-STATEMENT-TEARDOWN]] — a **P0 silent miscompile** found by a
+lane outside its own grant, minted and closed in the same cycle, and therefore invisible to
+the gate from BOTH bases (the born-closed shape). ★★ **THE P0 BAND ENDED THE CYCLE EMPTY**, and
+it did not start that way: two P0s were created during the cycle, both by re-banding or
+minting on a measurement, and both are closed.
+
+★★★ **THE THROUGH-LINE: P58 DOUBTED THE ROW. P59 DOUBTS THE GUARD.** P56 was *every record was
+right and nobody re-read it*; P57, *a green witness is not a true witness*; P58, *a row's
+account of its own defect is a hypothesis*. P59 is the next step out: **eight instruments this
+project relies on were GREEN, CORRECT, and structurally incapable of seeing the defect sitting
+next to them.** Not one of them was broken. Each answered a true question that was not the
+question being asked.
+
+1. ⚠⚠ **`examples/c/char_signedness` and `char_value` STAYED GREEN UNDER THE EXACT P0.**
+   ✔MEASURED by mutant A of lane `cs`: with the char-signedness fix removed, both pre-existing
+   corpus witnesses pass. They pin the RUNTIME path — the one consumer that already read the
+   declaration — so no amount of running them could ever have found a CONST-EVAL defect.
+2. ⚠⚠ **THE arm64-elf LEG IS STRUCTURALLY BLIND TO THAT P0.** Plain `char` is unsigned there,
+   so the buggy answer and the correct answer COINCIDE. Not "no test exists" — **none could**.
+3. ⚠⚠ **SQLITE CROSSED THE BOUNDARY ON EVERY BUILD AND GOT LUCKY.**
+   [[D-CSUBSET-CHAR-HIGHBYTE-ICE-SIGNEDNESS]] waited for *"a real program to hit the
+   boundary"*. ✔The amalgamated `sqlite3.c` and both copies of `sqliteInt.h` each ship
+   **`#if 'A' == '\301'`** — octal 301 = 0xC1, a high-byte char constant in a `#if`. It never
+   diverged only because 65 equals neither −63 nor +193. **A trigger that waits for a real
+   program cannot fire on one that hits it and gets lucky.**
+4. ⚠⚠ **TWO OF A ROW'S FOUR "MEASURED CORRECT" CONTROLS WERE THEMSELVES LIVE WRONG ANSWERS.**
+   [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]] listed `(char)200` in an array-size constant
+   expression and in an enum constant as correct. ✔Both fold to −56 on arm64-elf where
+   aarch64-gcc gives 200. **They were x86_64-only measurements written as unconditional** —
+   the same shape as the defect they were guarding.
+5. ⚠⚠ **THE FOUR-LEG GATE CANNOT FAIL ON THE DEEP-RECURSION DEFECT NO MATTER HOW BAD IT GETS.**
+   ✔Three observers measured three ctest entries SEGFAULTing under the **Visual Studio /
+   MSVC** generator at the base commit, each with a byte-exact revert control proving no P59
+   change is responsible. `build/dbg` is **Ninja + mingw-w64 g++**, so the toolchain that shows
+   it is not the toolchain that is measured. Recorded on
+   [[D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED]]: the operator's
+   ruling requires a counter that **fails loud**, and under MSVC it **crashes** instead.
+6. ⚠⚠ **AN UNWIND THAT SURVIVES IS NOT EVIDENCE THE UNWIND DATA IS RIGHT.**
+   `examples/c/c99_vla_win64_unwind_walk` throws through a VLA frame and resumes — **and it
+   still exits 42 with `UWOP_SET_FPREG` suppressed**, because the Windows dispatcher recovers
+   from a wrong RSP by leaf-walking the stack. Lane `vf` predicted a crash, measured otherwise,
+   and recorded the correction. The real discriminator is a byte-level `.xdata` pin plus a
+   direct `RtlVirtualUnwind` drive (Rip 0 instead of landing in `level1`).
+7. ⚠⚠ **THE CENSUS WORKED AND THE NUMBERS ROTTED ANYWAY.**
+   `scripts/examples-census/examples-census.py` was written on 2026-08-24 precisely to stop the
+   corpus figures being hand-counted; its own PURPOSE line says it re-derives *"every
+   corpus-manifest figure `examples/README.md` states"*. ✔The first time the new guard was
+   pointed at that file, **25 of 28 documented figures were wrong** (manifests 634 vs 788) and
+   one had **INVERTED** rather than drifted ("**0** declare it false" against six that do).
+   ⇒ **The missing half was never the DERIVATION. It was the COMPARISON.**
+8. ⚠ **AND THE GUARD BUILT TO FIX (7) BIT ITSELF WITHIN THE HOUR.** The registry row recording
+   its closure ILLUSTRATED the marker syntax, and the guard bound that illustration as a LIVE
+   claim inside the **archived audit trail** — so the next corpus change would have reddened it
+   on a closed row, and `--write` would have edited that row's text to "repair" it. Fixed with
+   a per-marker quotation escape that still validates the key, pinned in both directions.
+
+## §0.1 — The four gate legs, ✔MEASURED at the folded tree, every leg through `scripts/run-gate/`
+
+| leg | result | time |
+|---|---|---|
+| Windows x86_64 | **2054 / 2054** | 633.74 s |
+| Linux x86_64 (WSL2) | **2054 / 2054** | 419.82 s |
+| macOS arm64 (Apple Silicon) | **2028 / 2028** | 891.95 s |
+| Linux arm64 (native VPS) | **2028 / 2028** | 1132.99 s |
+
+✔`2028 = 2054 − 26` held on BOTH remote legs. Every leg ran through `scripts/run-gate/`, whose
+tool-emitted success witness is what makes a gate that never executed unable to report green;
+the WSL leg additionally printed its arm-ledger emulator witness, so the arm64 artifacts are
+known to have been SPAWNED rather than skipped.
+
+⚠ **THE CROSS-LEG IDENTITY CHANGED THIS CYCLE: it is now `N − 26 = M`, not `N − 24 = M`.**
+P59 registered two new repo guards (`doc_census_guard`, `doc_census_selftest_guard`), and the
+`repo-guard` label is applied automatically to every ctest entry whose name ends in `guard`.
+**Do not quote 24.** Re-derive the subtrahend from the configure line
+`repo-guard label applied to N test(s)`, or from `ctest -N -L repo-guard`; two comments that
+had hard-coded **18** were corrected in this cycle for exactly that reason.
+
+## §0.2 — What landed, by area
+
+- **PREPROCESSOR / CONFORMANCE (lane `hq`).** Both operator rulings of 2026-09-03 shipped:
+  `__has_attribute`, `__has_builtin`, `__has_feature`, `__has_extension` as CONFIG-DRIVEN
+  operators answering from the **already-declared** capability sets (no truth set duplicated),
+  and the reserved-identifier posture as DATA that **both** directive arms read through ONE
+  applier — so *"leave nothing to be done"* is machine-checked by a test that rebinds both
+  sides to each verb and requires identical behaviour. ⚠ **Half the measurement the ruling was
+  asked on is refuted:** `cl 19.51` ACCEPTS `#undef __has_include` and then **IGNORES** it, so
+  acceptance is unanimous but MEANING is 3–1. ⛔ **A second live defect found and fixed in the
+  same function:** `#define defined 1` compiled **rc 0 in silence** while three references make
+  it a hard error — and `preprocess_config.hpp` asserted in a comment that the refusal *"lives
+  in the conditional-inclusion-operator guard"*. **A comment claiming a guard that did not
+  exist.**
+- **CODEGEN, long double (lane `ew`).** **EIGHT** operations reached the encoding-width gate,
+  not the six the row enumerated — `(float)ld` and `(unsigned long long)ld` were unnamed.
+  Seven now compile on BOTH axes: inline x87 sequences from six byte-verified opcode rows, and
+  six config'd `wideFloatSoftcalls` rows on ieee128. ⚠ **An AAPCS64 result-width hazard was
+  already LIVE before this cycle** — LD-2's shipped `to_i32` capture was width-blind while its
+  own test comment CLAIMED width-32. ✔The witness was **EXECUTED on the operator's Mac for both
+  macho targets**, the first execution proof for the macOS half of the x87-80 axis.
+- **CODEGEN, VLA frames (lane `vf`).** The non-leaf VLA frame model shipped and the refusal is
+  DELETED: the outgoing-args area **travels with SP** and dynamic objects are lifted above it.
+  ✔The pe64 oracle agrees byte for byte with mingw-w64 gcc. ⚠ **Its sibling row's premise was
+  REFUTED**: the `.xdata` already carried `UWOP_SET_FPREG`, and **Win64 has no dynamic-alloca
+  unwind opcode at all** — the frame register IS the mechanism. ⇒ **The sequencing argument
+  that bound the two rows together was a documented inference the measurement did not
+  support.** Three examples shaped around the refusal were LIFTED.
+- **FRONT END, VLA `sizeof` (lanes `sz` + `cs`).** `sizeof(int[n])` lowers at CST→HIR to fresh
+  arithmetic — not merely the cheapest route but the FORCED one, since a `vlaArray` TypeId
+  carries no length operand. ★ **A defect the fix itself introduced was caught in the same
+  lane:** C 6.7.6.2p1's integer-bound constraint is enforced by a path an ABSTRACT type-name
+  never reaches, so `sizeof(int[x])` with a `double` bound briefly compiled rc 0 and answered
+  12. **Un-walling a construct can expose a constraint only ever enforced on the path being
+  replaced.** Part (2) turned out to be a **live silent wrong answer** (`sizeof(fb,fa)` = 28 vs
+  8, unanimous 3/3) rather than the refusal the row described, and the ternary half **did not
+  exist**.
+- **P0 — CONST-EVAL CHAR SIGNEDNESS (lane `cs`).** See items 1–4 above. One declaration, five
+  consumers, **three mutually contradictory readings**. Now: one accessor, one shared helper
+  for C 6.4.4.4p10's value, threaded to every tier including the MIR optimizer.
+- **P0 — VLA MULTI-DECLARATOR TEARDOWN (lane `md`), minted and closed in-cycle.** `R e, f;` —
+  two VLA objects in ONE declaration — freed BOTH at the end of the STATEMENT, so the next VLA
+  in the scope landed on the first: **rc 0, zero diagnostics, DSS 10 vs gcc and clang 42.**
+  ⚠ **The row's mechanism was wrong in the half that mattered**: the frames do NOT name the
+  enclosing block — `cst_to_hir`'s `lowerVarLike` wraps N declarators in a **synthetic Block**,
+  and it is that WRAPPER's teardown that fires early. Restore-to-shallowest was never the
+  defect, so the row's prescribed first fix ("push ONE frame") would have changed **nothing**.
+  ★★★ **AND A THIRD SHAPE, IN NEITHER ROW: a LABELLED declaration** — `L: int e[k], f[k];`
+  silently wrong, `L: int a[n];` a LOUD refusal of C23 6.8.1 that both references run. **A
+  label is the other non-scope wrapper**, and the pattern held for the third time in one
+  cycle. ⓘ The MIR fix is deliberately **conservative** in a statement position — a real
+  all-declaration block is matched too and freed at the ENCLOSING scope, which errs **LATE,
+  never EARLY**; the exact repair is a HIR one and is named in the row.
+- **CONFIG OWNERSHIP (lane `dl`) — BLOCKED, and the brief was refuted in three places.**
+  67 of 69 descriptor `library` entries restate a role's image. ⚠ `kernel32.dll` **IS** a role
+  image, so the row's own "keep it a literal" was wrong. ⚠⚠ **Only 7 of 24 format documents
+  declare a `cLibrary` row**, so a role resolved against the active document would break every
+  static-lib/DLL build the day the first descriptor migrates — a real keying fork the lane
+  declined to prejudge. The **fail-loud half landed**: a cross-tier agreement guard keyed on
+  `(kind, image) → role`, because the image alone is ambiguous.
+- **ORCHESTRATOR.** `scripts/check-doc-census/` (items 7–8), 11 P1 rows re-verdicted
+  ⏳ GATED → 🟠 OPEN after measuring that gcc and clang compile and RUN six of the constructs
+  their "wait for a consumer" gates were holding, one row closed as obsolete
+  ([[D-PP-TARGETCONDITIONALS-HAS-EXTENSION-DIVERGENCE]] — its symptom vanished when two shipped
+  descriptors began shadowing the SDK header ten days after it was filed), and thirteen
+  claim-rot sites repaired across examples, diagnostics and CMake comments.
+
+## §0.3 — What is OWED, stated so it is not mistaken for done
+
+- ⚠⚠ **`D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED` (P1) is now
+  known to CRASH, not merely to be uncapped**, and no leg can see it. Two things are owed that
+  the row did not previously require: a cap proven against the **fattest supported frame** (not
+  the one the gate happens to build with), and a proof that **runs somewhere the gate can
+  see**. ⛔ **Do not close it on a green Ninja run.**
+- **`D-CSUBSET-VLA-FOR-INIT-MULTIDECL`** and its P0 sibling share one producer; see §0.2.
+- **`D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE`** needs the keying
+  fork settled first (document vs format FAMILY — the suite's own
+  `RuntimeLibraryRoles.EveryFlavourOfAFormatKindNamesOneProviderPerRole` indicates the family,
+  **unverified**), then a `RuntimeLibraryTable const*` threaded through `analyze()`.
+- **`D-TARGET-ENCODING-WIDTH-GUARD` keeps P1**: `(unsigned long long)ld` is still walled on
+  both axes, deliberately and pinned — the x87 half needs a CONDITIONAL sequence this
+  straight-line lowerer cannot emit, and shipping the arm64 half alone would make the same cast
+  compile on one target and refuse on the other.
+- **Two divergences measured in passing and NOT fixed**: `sizeof(R)` where `typedef int R[n]`
+  (gcc/clang give 12, DSS refuses) and `_Alignof(int[n])` (gcc/clang give 4, DSS refuses).
+  Both LOUD, both below the union, both recorded on
+  [[D-CSUBSET-VLA-SIZEOF-TYPEFORM]] rather than filed.
+- **`MirLoweringConfig::charIsUnsigned` is still a plain `bool` defaulting to `false`** — the
+  one remaining place where "not supplied" silently means SIGNED. Every channel added in P59 is
+  an `optional` that refuses instead.
+- **`hasVla && usesVaStart` and `hasVla && isSehParent` still refuse.** The second's stated
+  REASON was replaced because it was measured false; neither was lifted, because neither
+  witness was built.
+
+## §0.4 — Traps this cycle paid for
+
+- ⛔ **`lane-fold` REFUSED a fold, and it was right.** Seven files had two lanes each; a
+  straight copy would have REVERTED `hq`'s operators and `sz`'s sizeof work **while reporting
+  success** — the P42 shape. The fix is a real three-way merge against the common ancestor
+  (every lane branches from the same commit, so `git merge-file` is doing the merge it was
+  designed for), then `--settled <path>` per reconciled file. **`--settled` is an assertion
+  that you have already merged, not a `--force`.** Three merged clean; four conflicted, each
+  resolved with a stated reason.
+- ⛔⛔ **AND A CLEAN THREE-WAY MERGE IS NOT A CORRECT MERGE.** `examples/c/c99_vla_typedef`
+  merged with **zero conflicts** and was still wrong: lanes `vf` and `md` each appended arms to
+  the same program from the same base and **both reached for `return 18` and `return 19`.** The
+  exit code is unaffected — every arm passes, so it is still 42 — but a FAILING run would
+  report 18 or 19 and nobody could say which arm produced it, in a corpus whose whole
+  convention is that every `return k` is a strict in-program pin. ⇒ **After a merge, check the
+  merged ARTEFACT for semantic collisions the text could not show.** Renumbered to 23/24, with
+  the reason written into the manifest so the next reader is not puzzled by the gap.
+- ⚠ **AN ARM ADDED AFTER A LANE'S MUTANTS INHERITS NONE OF THEIR EVIDENCE.** Arm 13 of
+  `c99_vla_multideclarator` was added by the orchestrator post-fold (it needed a row that
+  closed in the same cycle). Lane `md`'s mutant A had already reddened the whole example — but
+  measured **without** arm 13, so it says nothing about it. Arm 13 got its own REMOVE-direction
+  mutant, and two controls: the same call with SEPARATE declarations, and the same group read
+  **above** the call. The second control is the one that matters — it shows the read
+  **placement** does the work, not the presence of a call.
+- ⚠ **A witness that reads the array BEFORE the corrupting store is not a witness.** Lane `vf`
+  caught this in its own draft: passing the VLA's own elements as call arguments reads every
+  element before the outgoing-argument stores land, and stays green with the frame model
+  removed. The same trap is why the P0 witness must re-read the first two objects **after** the
+  third is written.
+- ⚠ **The cycle's own common brief carried a harness defect.** Its
+  `cmake -S . -B build/<lane> -DCMAKE_BUILD_TYPE=Debug` selects the **Visual Studio** generator
+  on this host — not the mingw/Ninja toolchain `build/dbg` uses — and `CMAKE_BUILD_TYPE` is
+  IGNORED by a multi-config generator. Two lanes independently reported three reds they did not
+  cause. The brief now pins `-G Ninja` and names the row.
+- ⚠ **An escape must be pinned in BOTH directions.** The new doc-census guard excludes
+  `.worktrees/` (in-flight lane copies would red it); arms 11 and 12 assert a drifted claim
+  there is IGNORED **and** that the same drift in the live tree is still CAUGHT, and a mutant
+  widening the exclusion turns both red. Same discipline for the quotation escape.
+- ⚠ **A brief's file grant can name a file that does not exist.** Mine granted lane `hq`
+  `src/core/types/lang_schema.hpp`; there is no such file. The lane treated the grant as
+  covering the real schema pair and said so. **Name files you have looked at.**
+
+---
+
+★★★ **P58 — RELOCATED HERE BY P59, AND IT IS HISTORY, NOT STATE.** It was §0 until P59 closed. Every figure below is P58's own and was true at P58's tip; **re-derive anything you intend to act on.** Its through-line — *a row's account of its own defect is a hypothesis* — is the direct ancestor of P59's, which turns the same doubt on the REGISTRY ITSELF: a row can be right about its defect and still be filed behind a gate that expired, or banded from a premise the tree stopped supporting.
+
+## ⏪ P58's former §0 (history)
+
 
 **Cycle P58 closed 2026-09-04.** Four lanes plus the orchestrator, on top of P57 (`01642ee3`).
 ✔**REAL: 5 rows closed, 0 opened.** ✔**COUNTED by `check-anchor-balance --base 01642ee3`: 4 closed,

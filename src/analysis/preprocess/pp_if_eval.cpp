@@ -250,7 +250,8 @@ public:
     IceParser(std::vector<Token> toks, GrammarSchema const& schema,
               SourceBuffer const& synth, SourceBuffer const& scratch,
               LiteralKinds const& lits, DiagnosticReporter& rep,
-              BufferId diagBufferId, std::string_view productTail)
+              BufferId diagBufferId, std::string_view productTail,
+              std::optional<bool> charIsUnsigned)
         : toks_(std::move(toks)),
           schema_(schema),
           synth_(synth),
@@ -273,7 +274,8 @@ public:
           // rather than an omission: at phase-4 widths every candidate is 64
           // bits, so a WIDTH model cannot reach the signedness answer. See
           // `preprocessorLiteralSignedness`.
-          intLadder_(schema.semantics().integerLiteralTyping) {
+          intLadder_(schema.semantics().integerLiteralTyping),
+          charIsUnsigned_(charIsUnsigned) {
         // The string-literal OPENER (C's `"`). A string literal lexes as an
         // opener token (`StringStart`) + a coalesced body; the body's schema
         // kind is in `lits_.string`, but the FIRST token the parser meets is the
@@ -383,6 +385,16 @@ private:
     SchemaTokenId                 charOpenKind_{};   // c12: `'` opener
     SchemaTokenId                 charBodyKind_{};   // c12: coalesced char body
     SchemaTokenId                 charCloseKind_{};  // the `'` closer's own token
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]] / [[D-CSUBSET-CHAR-HIGHBYTE-ICE-SIGNEDNESS]]:
+    // the ACTIVE (target × object format)'s plain-`char` signedness, from the ONE
+    // accessor `TargetSchema::charIsUnsigned(ObjectFormatKind)`. C 6.10.1p4 makes
+    // a char constant in `#if` an `int`, and 6.4.4.4p10 makes THAT int negative
+    // for a high byte on a signed-`char` target — so this evaluator needs the
+    // target fact even though it runs before any type checking. `nullopt` (a
+    // caller with no target: the LSP, the direct-API tests) is honest and the
+    // 0–127 bodies that are every real program still fold; only a high byte
+    // refuses, loud.
+    std::optional<bool>           charIsUnsigned_{};
     std::size_t                   pos_ = 0;
     bool                          failed_ = false;
 
@@ -583,6 +595,11 @@ private:
             EvalOptions opts;
             opts.refuseOnDivByZero       = true;
             opts.refuseOnShiftOutOfRange = true;
+            // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the char leaf already
+            // resolved its own value, but the shared core still reads
+            // `intKindInfo` for any Char-cored operand — carry the ONE answer so
+            // the `#if` fold and the const-expr fold cannot diverge.
+            opts.charIsUnsigned          = charIsUnsigned_;
             auto folded = applyBinaryInt(*opK, lhs, *rhsOpt, opts, why);
             if (!folded.has_value()) {
                 fail(DiagnosticCode::P_PreprocessorDirective,
@@ -819,11 +836,35 @@ private:
                 && peek().schemaKind == charCloseKind_) {
                 advance();
             }
-            // C 6.10.1p4: an `int`, which that same paragraph then evaluates as
-            // a SIGNED intmax_t (D-PP-IF-UNSIGNED-INTMAX -- the value is
-            // unchanged; only the domain it folds in widens from 32 to 64).
-            return intmaxOperand(static_cast<std::uint64_t>(*cp),
-                                 /*isSigned=*/true);
+            // ── [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]] (the P0 arm) ────────
+            // C 6.10.1p4 makes this an `int`; C 6.4.4.4p10 says WHICH int, and
+            // it is not the code unit. `decodeCharLiteralBody` answers 0..255;
+            // the constant's value is that unit read as a plain `char`, so
+            // `'\xff'` is −1 where the target declares `char` signed. This arm
+            // used to hand the raw unit straight to `intmaxOperand`, which made
+            // `#if '\xff' < 0` take the `#else` arm on x86_64 — rc 0, zero
+            // diagnostics — where gcc 13.3.0 and clang 18.1.3 both take the
+            // `#if` arm. ✔MEASURED at b1f31420. The turn is the SHARED helper,
+            // the same one `cst_const_eval` and `lowerCharLiteral` call, so the
+            // three tiers cannot answer differently.
+            //
+            // A 0–127 body is the same integer under either signedness, which is
+            // why a caller with no target still folds every real-world `#if 'a'`;
+            // a high byte with no answer FAILS LOUD rather than picking one.
+            if (narrowCharConstantSignednessMatters(*cp)
+                && !charIsUnsigned_.has_value()) {
+                fail(DiagnosticCode::P_PreprocessorDirective,
+                     "a character constant above 0x7F in #if has a "
+                     "target-dependent value (C 6.2.5p15 leaves plain `char`'s "
+                     "signedness implementation-defined) and no target was "
+                     "supplied to this preprocessor run: "
+                     + std::string{textOf(bodyTok)});
+                return std::nullopt;
+            }
+            return intmaxOperand(
+                static_cast<std::uint64_t>(narrowCharConstantValue(
+                    *cp, charIsUnsigned_.value_or(false))),
+                /*isSigned=*/true);
         }
 
         // Integer literal (real, or a synthetic `defined`-result).
@@ -923,6 +964,89 @@ private:
         }
     }
     return 0;
+}
+
+// ══ D-PP-HAS-EXTENSION-BUILTIN-ABSENT: THE FEATURE-QUERY ANSWER ══════════════
+//
+// ★★★ EVERY ARM READS AN ALREADY-DECLARED CAPABILITY SET. Nothing below is a
+// list of names; each branch is a LOOKUP into the table that already owns the
+// truth, chosen by the operator's own config-declared `answers` verb. That is
+// what keeps `__has_builtin` from becoming a second, drifting copy of
+// `semantics.builtinFunctions` — the defect the ruling names explicitly.
+//
+// ⚠ AN UNKNOWN CAPABILITY ANSWERS 0 AND IS NOT AN ERROR. ✔MEASURED on every
+// reference that implements these operators (gcc 13.3.0, gcc 13.2.0 mingw,
+// clang 18.1.3): a name nothing declares answers 0, silently. That is the
+// CONTROL half of the operator, and it is the half a portable header depends on
+// — the whole idiom is "ask about something you may not have".
+[[nodiscard]] bool languageDeclaresAttribute(GrammarSchema const& schema,
+                                             std::string_view     name) {
+    std::string_view const bare = stripDunder(name);
+    for (auto const& row : schema.semantics().attributeEffects) {
+        for (auto const& n : row.names) {
+            if (n == name || n == bare) return true;
+        }
+    }
+    // The C23 standard attributes the language declares a VERSION for are
+    // attributes it knows too; `__has_c_attribute` already answers from this
+    // set, and an attribute in exactly one of the two tables is still an
+    // attribute this implementation honours.
+    for (CAttributeDef const& ka : schema.preprocess().knownCAttributes) {
+        if (ka.name == name || ka.name == bare) return true;
+    }
+    return false;
+}
+
+[[nodiscard]] bool languageDeclaresBuiltin(GrammarSchema const& schema,
+                                           std::string_view     name) {
+    for (auto const& b : schema.semantics().builtinFunctions) {
+        if (b.name == name) return true;
+    }
+    // The GNU compile-time builtins are declared as grammar KEYWORDS rather
+    // than `builtinFunctions` rows (they are operators wearing a call's
+    // punctuation — their operands are type-names, not values). The config
+    // names their KINDS; the WORD is read back out of the language's own
+    // keyword table here, so no spelling is stored twice and rebinding a
+    // keyword moves this answer with it.
+    if (schema.preprocess().builtinQueryKeywordTokens.empty()) return false;
+    for (LexemeMeaning const& m : schema.lookupLexeme(name)) {
+        for (std::string const& kindName :
+             schema.preprocess().builtinQueryKeywordTokens) {
+            SchemaTokenId const want = schema.schemaTokens().find(kindName);
+            if (want.valid() && m.id == want) return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] std::int64_t featureQueryAnswer(GrammarSchema const&     schema,
+                                              FeatureQueryAnswerSource src,
+                                              std::string_view         arg) {
+    switch (src) {
+        case FeatureQueryAnswerSource::DeclaredAttributes:
+            return languageDeclaresAttribute(schema, arg) ? 1 : 0;
+        case FeatureQueryAnswerSource::DeclaredBuiltins:
+            return languageDeclaresBuiltin(schema, arg) ? 1 : 0;
+        case FeatureQueryAnswerSource::DeclaredLanguageFeatures:
+            for (LanguageFeatureDef const& f :
+                 schema.preprocess().languageFeatures) {
+                if (f.name == arg
+                    && f.availability
+                           == LanguageFeatureAvailability::Standard) {
+                    return 1;
+                }
+            }
+            return 0;
+        case FeatureQueryAnswerSource::DeclaredLanguageExtensions:
+            // The SUPERSET arm, ✔MEASURED as clang's own behaviour: every
+            // feature is also an extension, so this reads the whole table.
+            for (LanguageFeatureDef const& f :
+                 schema.preprocess().languageFeatures) {
+                if (f.name == arg) return 1;
+            }
+            return 0;
+    }
+    return 0;   // unreachable — every source handled above
 }
 
 // ── D-PP-DEFINED-VIA-MACRO-EXPANSION: the shared `#if`-operand barrier ───────
@@ -1031,8 +1155,20 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                      SourceBuffer const&    synth,
                      PpProductText const&   productText,
                      DiagnosticReporter&    rep,
-                     PpHasEmbed const&      hasEmbed) {
+                     PpHasEmbed const&      hasEmbed,
+                     PpOperatorRevoked const& operatorRevoked,
+                     std::optional<bool>    charIsUnsigned) {
     LiteralKinds const lits = gatherLiteralKinds(schema);
+    // D-PP-HAS-EXTENSION-BUILTIN-ABSENT: every operator arm below is gated on
+    // this. An operator the program has `#undef`'d is no longer an operator —
+    // it is an ordinary undefined identifier, which the ICE parser's primary
+    // folds to 0 (and which then fails LOUD in the function-like position,
+    // exactly as gcc 13.3.0, gcc 13.2.0 and clang 18.1.3 do: "missing binary
+    // operator before token '('" / "function-like macro '__has_include' is not
+    // defined", both rc 1). Null-callback tolerant.
+    auto operatorLive = [&](std::string_view word) {
+        return !operatorRevoked || !operatorRevoked(word);
+    };
 
     PreprocessConfig const& pp = schema.preprocess();
     SchemaTokenId const openParen =
@@ -1318,7 +1454,8 @@ evaluateIfExpression(std::span<Token const> operandTokens,
         // The operand is NOT macro-expanded (like `defined`); the angle
         // delimiters are matched by CONFIG token KIND, never the `<`/`>` bytes.
         // EVERY malformed shape fails loud with P_PreprocessorHasInclude. ──
-        if (isWordTok(t) && !hasIncludeKw.empty() && word == hasIncludeKw) {
+        if (isWordTok(t) && !hasIncludeKw.empty() && word == hasIncludeKw
+            && operatorLive(word)) {
             std::size_t j = skipFwd(i + 1);
             if (j >= toks.size() || !openParen.valid()
                 || toks[j].schemaKind != openParen) {
@@ -1426,7 +1563,8 @@ evaluateIfExpression(std::span<Token const> operandTokens,
         // IS the signal, so a guarded `#embed` correctly never runs;
         // D-PP-EMBED-PARAMS). Malformed shapes (no `(`, empty name, unterminated)
         // fail loud P_PreprocessorEmbed. ──
-        if (isWordTok(t) && !hasEmbedKw.empty() && word == hasEmbedKw) {
+        if (isWordTok(t) && !hasEmbedKw.empty() && word == hasEmbedKw
+            && operatorLive(word)) {
             std::size_t j = skipFwd(i + 1);
             if (j >= toks.size() || !openParen.valid()
                 || toks[j].schemaKind != openParen) {
@@ -1544,7 +1682,8 @@ evaluateIfExpression(std::span<Token const> operandTokens,
         // ── FC15c: `__has_c_attribute(attr)` (C23 6.10.1p4). Match the operator
         // by TEXT, extract the attr NAME (a Word), look it up in the config's
         // known-attribute set (raw + dunder-stripped), mint the version or 0. ──
-        if (isWordTok(t) && !hasCAttrKw.empty() && word == hasCAttrKw) {
+        if (isWordTok(t) && !hasCAttrKw.empty() && word == hasCAttrKw
+            && operatorLive(word)) {
             std::size_t j = skipFwd(i + 1);
             if (j >= toks.size() || !openParen.valid()
                 || toks[j].schemaKind != openParen) {
@@ -1579,6 +1718,60 @@ evaluateIfExpression(std::span<Token const> operandTokens,
             continue;
         }
 
+        // ── ★★★ D-PP-HAS-EXTENSION-BUILTIN-ABSENT: the FEATURE-QUERY family —
+        // `__has_attribute` / `__has_builtin` / `__has_feature` /
+        // `__has_extension` (operator ruling 2026-09-03).
+        //
+        // ONE arm for all four, because they differ only in WHICH declared
+        // capability set the answer is read from — which is `answers`, config
+        // DATA on the operator's own row. A per-operator arm here would be four
+        // copies of the same shape, and the fourth would be the one that drifts.
+        //
+        // The SHAPE is `__has_c_attribute`'s, deliberately: operator word, `(`,
+        // one identifier, `)`. ✔MEASURED, that is what all three implementing
+        // references accept, and a malformed shape fails LOUD on all three
+        // rather than folding to 0 — silence here would be a CLAIM ("I checked,
+        // and no") where an error is an admission ("I cannot read this").
+        if (isWordTok(t)) {
+            FeatureQueryOperatorDef const* fq =
+                findFeatureQueryOperator(word, pp);
+            if (fq != nullptr && operatorLive(word)) {
+                std::size_t j = skipFwd(i + 1);
+                if (j >= toks.size() || !openParen.valid()
+                    || toks[j].schemaKind != openParen) {
+                    emit(rep, DiagnosticCode::P_PreprocessorDirective,
+                         synth.id(), diagSpanFor(t),
+                         "operator '" + fq->name
+                             + "' requires a parenthesized name");
+                    rewriteFailed = true;
+                    break;
+                }
+                j = skipFwd(j + 1);
+                if (j >= toks.size() || !isWordTok(toks[j])) {
+                    emit(rep, DiagnosticCode::P_PreprocessorDirective,
+                         synth.id(), diagSpanFor(t),
+                         "operator '" + fq->name + "' requires a name");
+                    rewriteFailed = true;
+                    break;
+                }
+                std::string const queried{wordOf(toks[j])};
+                j = skipFwd(j + 1);
+                if (j >= toks.size() || !closeParen.valid()
+                    || toks[j].schemaKind != closeParen) {
+                    emit(rep, DiagnosticCode::P_PreprocessorDirective,
+                         synth.id(), diagSpanFor(t),
+                         "expected ')' to close '" + fq->name + "('");
+                    rewriteFailed = true;
+                    break;
+                }
+                ++j;
+                afterDefined.push_back(
+                    mintNumber(featureQueryAnswer(schema, fq->answers, queried)));
+                i = j;
+                continue;
+            }
+        }
+
         afterDefined.push_back(t);
         ++i;
     }
@@ -1602,7 +1795,7 @@ evaluateIfExpression(std::span<Token const> operandTokens,
     }
 
     IceParser parser{std::move(nonTrivia), schema, synth,    *scratchBuf, lits,
-                     rep,                  synth.id(), tail};
+                     rep,                  synth.id(), tail, charIsUnsigned};
     return parser.evaluate();
 }
 

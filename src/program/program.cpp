@@ -2395,6 +2395,16 @@ struct CuBuildKey {
     // the key's rule ("everything that changes the preprocessed source") true
     // by construction rather than by an argument a reader has to reconstruct.
     HeaderNameMatching              headerNameMatching = kDefaultHeaderNameMatching;
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the TARGET's declared plain-
+    // `char` signedness, resolved for THIS object format
+    // (`TargetSchema::charIsUnsigned(ObjectFormatKind)`). It belongs in the key
+    // on the same principle `headerNameMatching` above does — it changes the
+    // preprocessed token stream (`#if 'ÿ' < 0` takes the opposite arm under
+    // it), so a CU built under one value must never be reused under another.
+    // Like that member it is in practice a function of the target/format names
+    // already here and adds no extra builds; carrying it keeps the key's rule
+    // ("everything that changes the preprocessed source") true by construction.
+    std::optional<bool>             charIsUnsigned{};
     // ★★★ D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: the SOURCE LANGUAGE this
     // target's CU is parsed under. `--language asm-x86_64-att` for every
     // target when the caller named one; the TARGET's own
@@ -2442,6 +2452,9 @@ struct CuBuildKey {
         if (format != o.format) return format < o.format;
         if (headerNameMatching != o.headerNameMatching) {
             return headerNameMatching < o.headerNameMatching;
+        }
+        if (charIsUnsigned != o.charIsUnsigned) {
+            return charIsUnsigned < o.charIsUnsigned;
         }
         return languageName < o.languageName;
     }
@@ -4453,6 +4466,16 @@ int runCusToTargets(
             // the identity branch the agnosticism bar forbids).
             key.headerNameMatching =
                 formatByName.at(key.formatName)->headerNameMatching();
+            // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: ask the TARGET — the one
+            // owner — passing the active object-format KIND, which its accessor
+            // requires precisely so no caller can take the processor half alone
+            // (the same arm64 CPU is unsigned under GNU/Linux and signed under
+            // Darwin). No arch name is compared and no format schema
+            // contributes.
+            if (key.format.has_value()) {
+                key.charIsUnsigned =
+                    targetByName.at(key.targetName)->charIsUnsigned(*key.format);
+            }
         }
         keyPerTarget.push_back(key);
         if (cuByKey.find(key) == cuByKey.end()) {
@@ -4661,6 +4684,13 @@ int runCusToTargets(
         DiagnosticReporter scratch{scratchCfg};
         CompileOptions compileOpts{DiagnosticBudget{rep.config()}};
         compileOpts.config           = config;
+        // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: this target's plain-`char`
+        // sign, for the MIR optimizer's `ConstFold` (which carries no target
+        // and no format of its own). `keyPerTarget[i]` already holds the ONE
+        // reading made above, from `TargetSchema::charIsUnsigned(kind)`; taking
+        // it from there rather than re-asking is the whole point — a second
+        // derivation site is what this row exists to remove.
+        compileOpts.charIsUnsigned   = keyPerTarget[i].charIsUnsigned;
         compileOpts.pipelineOverride = pipelineOverride;
         compileOpts.ltoMode = ltoMode == LtoModeArg::Thin
                                   ? CompileOptions::LtoMode::Thin
@@ -5983,6 +6013,9 @@ int Program::compileFiles(
                 // D-PP-HEADER-CASE-INSENSITIVE-PE: the format FILE's own
                 // header-name case rule (NOT derived from the format kind).
                 builder.setHeaderNameMatching(key.headerNameMatching);
+                // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the target's
+                // plain-`char` sign, for the `#if` ICE fold.
+                builder.setCharIsUnsigned(key.charIsUnsigned);
                 // TF-C74: the active target's per-architecture identity macros.
                 builder.setTargetPredefinedMacros(
                     {targetPredefines.begin(), targetPredefines.end()});
@@ -6162,6 +6195,9 @@ int Program::compileUnits(
                     // D-PP-HEADER-CASE-INSENSITIVE-PE: the format FILE's own
                     // header-name case rule (NOT derived from the format kind).
                     builder.setHeaderNameMatching(key.headerNameMatching);
+                    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the target's
+                    // plain-`char` sign, for the `#if` ICE fold.
+                    builder.setCharIsUnsigned(key.charIsUnsigned);
                     // TF-C74: the active target's per-architecture identity macros.
                     builder.setTargetPredefinedMacros(
                         {targetPredefines.begin(), targetPredefines.end()});

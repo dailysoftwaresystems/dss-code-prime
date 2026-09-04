@@ -693,18 +693,41 @@ struct DSS_EXPORT TargetRegisterClassOps {
 // libgcc's three-way `__cmptf2`: its result is unspecified on NaN, and
 // `nm -D /usr/aarch64-linux-gnu/lib/libgcc_s.so.1` shows it is not even
 // EXPORTED, while all six of these are.
+// D-TARGET-ENCODING-WIDTH-GUARD (LD-5) added the SIX remaining rows: `neg`,
+// `to_u32`, `to_i64`, `to_f64`, `to_f32` and `from_f32`. Five of them are
+// conversions and follow the `to_i32`/`from_f64` shape exactly — one binary128
+// operand or result, the other end a native scalar. ⚠ `neg` is the one that
+// does NOT match what either reference EMITS, and that is a deliberate,
+// measured choice rather than an oversight: aarch64-linux-gnu-gcc 13.3.0 flips
+// the sign bit inline (`eor x1, x2, #0x8000000000000000` on the high word) and
+// clang 18.1.3 does the same on byte 15 (`ldrb w8,[sp,#15]; eor w8,w8,#0x80`),
+// so NEITHER calls `__negtf2`. Realizing it inline here would put the LOCATION
+// OF THE SIGN BIT — byte 15, bit 7, i.e. little-endian binary128 — inside the
+// target-agnostic lowerer, which is the slow agnosticism break this project
+// keeps paying for. ✔MEASURED instead that the libcall is bit-for-bit the same
+// function: under qemu-aarch64, `__negtf2` from libgcc_s.so.1 maps +0.0↔-0.0,
+// flips 1.0's sign exponent-word only, and PRESERVES both a qNaN payload and a
+// signalling NaN's quiet bit (0x7fff…a55a → 0xffff…a55a; 0x7fff…0033 →
+// 0xffff…0033) — a pure sign-bit flip, so the difference from the references is
+// a peephole, not a semantic one.
 enum class WideFloatOp : std::uint8_t {
     Add = 0, Sub = 1, Mul = 2, Div = 3, ToInt32 = 4, FromFloat64 = 5,
     CmpLt = 6, CmpLe = 7, CmpGt = 8, CmpGe = 9, CmpEq = 10, CmpNe = 11,
+    Neg = 12, ToUInt32 = 13, ToInt64 = 14, ToFloat64 = 15, ToFloat32 = 16,
+    FromFloat32 = 17,
 };
-inline constexpr std::size_t kWideFloatOpCount = 12;
-inline constexpr EnumNameTable<WideFloatOp, 12> kWideFloatOpTable{{{
+inline constexpr std::size_t kWideFloatOpCount = 18;
+inline constexpr EnumNameTable<WideFloatOp, 18> kWideFloatOpTable{{{
     { WideFloatOp::Add, "add" }, { WideFloatOp::Sub, "sub" },
     { WideFloatOp::Mul, "mul" }, { WideFloatOp::Div, "div" },
     { WideFloatOp::ToInt32, "to_i32" }, { WideFloatOp::FromFloat64, "from_f64" },
     { WideFloatOp::CmpLt, "cmp_lt" }, { WideFloatOp::CmpLe, "cmp_le" },
     { WideFloatOp::CmpGt, "cmp_gt" }, { WideFloatOp::CmpGe, "cmp_ge" },
     { WideFloatOp::CmpEq, "cmp_eq" }, { WideFloatOp::CmpNe, "cmp_ne" },
+    { WideFloatOp::Neg, "neg" }, { WideFloatOp::ToUInt32, "to_u32" },
+    { WideFloatOp::ToInt64, "to_i64" }, { WideFloatOp::ToFloat64, "to_f64" },
+    { WideFloatOp::ToFloat32, "to_f32" },
+    { WideFloatOp::FromFloat32, "from_f32" },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate

@@ -3932,6 +3932,129 @@
       }
     },
     {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-5): FCHS = D9 E0 (Intel SDM: \"Complements sign of ST(0)\"). A BARE 2-byte fixed opcode, ZERO operands, no ModR/M — the faddp shape. It is the whole realization of `-someLongDouble` on this axis, and it is a SIGN-BIT TOGGLE, not `0.0L - x`: FCHS gives -(+0.0)=-0.0, -(-0.0)=+0.0 and flips a NaN's sign while keeping its payload, where the subtraction gets the first two wrong. That is the SAME IEEE-exactness argument the F64/F32 `fneg_mask` row (XORPD against a sign mask) already makes one tier up, which is why the two widths agree on semantics while using different instructions. ✔MEASURED 2026-09-04 that both references emit exactly `fld m80; fchs; fstp m80`, probed separately (gcc 13.3.0 and clang 18.1.3), and ✔byte-verified `d9 e0` against GNU as 2.42. result:none + hasSideEffects (mutates the implicit x87 stack top; no vreg dep expresses that, so it must never be reordered or DCE'd).",
+      "mnemonic": "fchs", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 0, "maxOperands": 0,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          { "guard": { "operandKinds": [] }, "template": { "opcode": [217, 224] } }
+        ]
+      }
+    },
+    {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-5): FLD m32fp = D9 /0 — push a SINGLE-precision memory operand onto st0, WIDENING it to the stack's 80-bit working format on the way in. ★ THE WIDENING IS THE WHOLE POINT AND IT LIVES IN THE MEMORY OPERAND: the x87 stack has ONE working format and NO register-to-register conversion instruction, so `(long double)someFloat` is realized as `movss [slot],xmm ; fld_m32 [slot] ; fstp_m80 [home]` — exactly what gcc 13.3.0 and clang 18.1.3 both emit (✔MEASURED 2026-09-04, probed separately). Same base+disp memory operand shape as fld_m80 ([addr-reg, MemBase, MemOffset], modrm.rm.mem → mod=10 + disp32); modrmRegExt=0 = the /0 digit. ✔Byte-verified against GNU as 2.42: `fld DWORD PTR [rbx+0x11223344]` = d9 83 44 33 22 11. result:none + hasSideEffects (pushes the implicit x87 stack).",
+      "mnemonic": "fld_m32", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 3, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template": { "opcode": [217], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-5): FLD m64fp = DD /0 — the DOUBLE-precision sibling of fld_m32, and the widening half of `(long double)someDouble` (`movsd [slot],xmm ; fld_m64 [slot] ; fstp_m80 [home]`). ⚠ THE ONLY DIFFERENCE FROM fld_m32 IS THE FIRST OPCODE BYTE (DD vs D9) — the /0 digit and the whole operand shape are identical — so a row that got that byte wrong would still assemble, still run, and read four bytes where eight were meant. ✔Byte-verified against GNU as 2.42: `fld QWORD PTR [rbx+0x11223344]` = dd 83 44 33 22 11 versus `fld DWORD PTR [...]` = d9 83 …; the emitting verb picks between them from the SOURCE type's own width, never from a default. result:none + hasSideEffects.",
+      "mnemonic": "fld_m64", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 3, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template": { "opcode": [221], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-5): FSTP m32fp = D9 /3 — pop st0 and store it ROUNDED to single precision. The narrowing half of `(float)someLongDouble` (`fld_m80 [src] ; fstp_m32 [slot] ; movss xmm,[slot]`), and the rounding is the instruction's, not a separate step: x87 stores round the 80-bit working value to the destination format under the current control word. ✔MEASURED 2026-09-04 that gcc 13.3.0 and clang 18.1.3 both emit exactly this, probed separately. ✔Byte-verified against GNU as 2.42: `fstp DWORD PTR [rbx+0x11223344]` = d9 9b 44 33 22 11 (the /3 digit puts 011 in ModR/M.reg → 0x9b at mod=10, base=rbx). Same memory shape as fstp_m80; the STORED value is the implicit st0, so there is no value operand. result:none + hasSideEffects (writes memory + pops).",
+      "mnemonic": "fstp_m32", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 3, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template": { "opcode": [217], "modrmRegExt": 3 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-5): FSTP m64fp = DD /3 — the DOUBLE-precision sibling of fstp_m32, and the narrowing half of `(double)someLongDouble`. ⚠ SAME ONE-BYTE HAZARD AS THE fld PAIR: DD vs D9 with an identical /3 digit and operand shape, so the wrong byte writes four bytes where eight were meant with nothing to object. ✔Byte-verified against GNU as 2.42: `fstp QWORD PTR [rbx+0x11223344]` = dd 9b 44 33 22 11. ⓘ This is ALSO the instruction that makes `(double)ld` lossy in the way C requires — the value is rounded once, by the store, rather than reinterpreted. result:none + hasSideEffects.",
+      "mnemonic": "fstp_m64", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 3, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template": { "opcode": [221], "modrmRegExt": 3 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-5): FISTTP m64int = DD /1 — store st0 with TRUNCATION to a 64-bit integer and pop; the wider sibling of fisttp_m32 above, which explains why FISTTP (SSE3) rather than the fnstcw/fistp/fldcw bracketing BOTH references emit. It serves TWO C casts: `(long long)ld` directly, and `(unsigned)ld`, whose full range [0, 2^32) does NOT fit a signed m32int — a value above 2^31 would store the 0x80000000 integer-indefinite and read back as a wrong answer with no fault — but fits a signed m64int exactly, after which the pipeline's own `trunc` verb takes the low 32 bits in a REGISTER (never by reading half the slot, which would be a byte-order assumption). ✔Byte-verified against GNU as 2.42: `fisttp QWORD PTR [rbx+0x11223344]` = dd 8b 44 33 22 11, against the shipped m32 form's db 8b … — the /1 digit is shared and only the first byte differs. ⓘ `(unsigned long long)ld` is still NOT realized: above 2^63 there is no x87 store form at all, and both references branch on a 2^63 compare to bias the value — a branching sequence this straight-line lowerer cannot emit — so that cast stays fail-loud on BOTH long-double axes rather than shipping on one. result:none + hasSideEffects (writes m64 + pops st0).",
+      "mnemonic": "fisttp_m64", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 3, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template": { "opcode": [221], "modrmRegExt": 1 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "Float-to-float precision change (FPTrunc f64→f32, FPExt f32→f64). FC3.5 sweep-c2: encoded — CVTSD2SS xmm1, xmm2 = F2 0F 5A /r (double→single) and CVTSS2SD xmm1, xmm2 = F3 0F 5A /r (single→double), Intel SDM CVTSD2SS/CVTSS2SD: SAME opcode bytes, the mandatory prefix names the SOURCE width. The width axis therefore keys on the SOURCE: the MIR→LIR FPTrunc/FPExt arm threads a widthOverride from the source operand's type (the result-width default would select exactly the WRONG sibling — FPTrunc's F32 result would pick the F3 widen). ModR/M.reg = the xmm destination (resultSlot), ModR/M.rm = the xmm source.",
       "mnemonic": "fpcvt", "result": "value",
       "minOperands": 1, "maxOperands": 1,

@@ -271,7 +271,10 @@ bool optimizeModule(Mir&                  mir,
         }
     }
     auto const optResult = ::dss::opt::optimize(
-        mir, target, interner, *effectivePipeline, reporter, externImports);
+        mir, target, interner, *effectivePipeline, reporter, externImports,
+        // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the driver's ONE resolution
+        // of the target's plain-`char` sign, relayed to `ConstFold`.
+        opts.charIsUnsigned);
     return optResult.ok && tierClean(reporter, optEntry);
 }
 

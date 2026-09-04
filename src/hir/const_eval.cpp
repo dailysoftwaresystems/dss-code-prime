@@ -89,7 +89,7 @@ combineUnary(Hir const& hir, HirNodeId expr, EvalOptions const& options,
     // C4b (I2 go-live gate): a unary op on a `_BitInt` operand (`-5wb`, `~x`) folds
     // via the bignum — BEFORE the `asInt64`+`applyUnaryInt` path below, which would
     // negate a NARROW `_BitInt` via un-wrapped int64 arithmetic (a silent miscompile).
-    if (auto uf = detail::foldBitIntUnary(op, *inner.value); uf.applies) {
+    if (auto uf = detail::foldBitIntUnary(op, *inner.value, options.charIsUnsigned); uf.applies) {
         if (uf.ok) return ok(std::move(uf.value));
         return fail(uf.failure, expr);
     }
@@ -143,7 +143,7 @@ combineBinary(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     // The fold sets its OWN result core (BitInt for a bit-precise result, or the
     // standard kind for an int-outranked BitInt) and returns HERE — bypassing the
     // `interner.commonType` retag below, which returns InvalidType for a BitInt (I2).
-    if (auto bf = detail::foldBitIntBinary(op, *a.value, *b.value); bf.applies) {
+    if (auto bf = detail::foldBitIntBinary(op, *a.value, *b.value, options.charIsUnsigned); bf.applies) {
         if (bf.ok) return ok(std::move(bf.value));
         return fail(bf.failure, expr);
     }
@@ -287,7 +287,7 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
             v.value = *f->value;
             return ok(std::move(v));
         }
-        auto bv = detail::asBitIntValue(*inner.value);
+        auto bv = detail::asBitIntValue(*inner.value, options.charIsUnsigned);
         if (!bv.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
         bv->convertTo(bw, bs);
         HirLiteralValue v;
@@ -316,7 +316,7 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
             v.value = *f->value;
             return ok(std::move(v));
         }
-        auto bv = detail::asBitIntValue(*inner.value);
+        auto bv = detail::asBitIntValue(*inner.value, options.charIsUnsigned);
         if (!bv.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
         bv->convertTo(128u, i128Signed);
         HirLiteralValue v;
@@ -400,7 +400,7 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
         // so refused `(double)18446744073709551615ULL` — a conversion all four
         // references fold, to 2^64 (✔MEASURED separately). The shared verb is the
         // one the CST walker's float-target arm calls, so the two cannot disagree.
-        auto const widenedOpt = detail::integerConstantAsDouble(*inner.value);
+        auto const widenedOpt = detail::integerConstantAsDouble(*inner.value, options.charIsUnsigned);
         if (!widenedOpt.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
         double const widened = *widenedOpt;
         if (options.refuseOnLossyFloatConversion) {
@@ -426,7 +426,7 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     // the standard and the bit pattern isn't portable. The arithmetic is
     // `const_eval_arith.hpp`'s, shared with the CST walker's cast arm.
     if (sourceFloat) {
-        auto target = intKindInfo(toK);
+        auto target = intKindInfo(toK, options.charIsUnsigned);
         if (!target.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
         // LD-3: an F80/F128 source truncates via the kernel's toInt64 — the range
         // check is done AT THE OPERAND'S OWN PRECISION (never narrow-to-double
@@ -514,7 +514,7 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     }
 
     // Int → Int (and int → bool) — CE3's existing path.
-    auto target = intKindInfo(toK);
+    auto target = intKindInfo(toK, options.charIsUnsigned);
     if (!target.has_value()) {
         // Non-integer, non-float target (pointer / aggregate).
         return fail(ConstEvalFailure::UnsupportedTypeKind, expr);

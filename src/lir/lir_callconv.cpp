@@ -1074,6 +1074,14 @@ struct OpcodeHandles {
     // them 0 and no function is treated as having a VLA.
     std::uint16_t subSpReg;
     std::uint16_t spCopy;
+    // D-CSUBSET-VLA-NONLEAF-CALL-FRAME: `sp_restore SP, <watermark>` — the C5
+    // block-scope VLA teardown. The callconv pass needs a HANDLE for it (it used to
+    // fall through the default pass-through arm untouched) because the non-leaf VLA
+    // frame model makes a captured stack watermark mean `SP + outgoingArgAreaSize`
+    // rather than SP, so the restore has to undo that bias. Optional — a target
+    // without the dynamic-stack substrate leaves it 0 and `op == h.spRestore` never
+    // matches.
+    std::uint16_t spRestore;
     // ML7 cycle 2: virtual-op handles materialized by the callconv pass.
     std::uint16_t arg;
     // FC7 C1c: the caller-side struct-return piece read (mirror of `arg`).
@@ -2655,6 +2663,9 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // non-VLA target/module takes the SP-relative fixed-frame path unchanged.
         {&OpcodeHandles::subSpReg,          "sub_sp_reg",           true},
         {&OpcodeHandles::spCopy,            "sp_copy",              true},
+        // D-CSUBSET-VLA-NONLEAF-CALL-FRAME: same optionality argument as the two
+        // above — the C5 teardown op, needed here so the watermark bias can be undone.
+        {&OpcodeHandles::spRestore,         "sp_restore",           true},
     });
     for (auto const& [field, mnem, optional] : table) {
         auto const op = schema.opcodeByMnemonic(mnem);
@@ -2795,22 +2806,62 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     // The prologue/epilogue saved-reg stores/loads DELIBERATELY keep `sp` (SP == FB
     // at both points), so they are NOT switched — see emitPrologue/emitEpilogue.
     LirReg const frameBase = hasVla ? fp : sp;
-    // D-CSUBSET-VLA-NONLEAF-CALL-FRAME (C1b LEAF gate): after `sub sp,<vlaSize>` the
-    // outgoing-args area (call args) sits INSIDE the VLA and the `call` runs at the
-    // moved SP — no base addresses it correctly. C1b is LEAF-scope only; a VLA
-    // function that ALSO makes a call fails loud (the non-leaf frame model is a
-    // separate designed cycle). `usesVaStart` (the same structural incompatibility
-    // — SP-relative va-area leas) is gated below once it is computed.
-    if (hasVla && hasCalls) {
-        report(reporter, DiagnosticCode::L_VlaNonLeafFrameUnsupported,
-               DiagnosticSeverity::Error,
-               std::format("a variable-length-array function (calling convention "
-                           "'{}') ALSO makes a call — the non-leaf VLA frame model "
-                           "(outgoing-args placement under a runtime-moved stack "
-                           "pointer) is not built; C1b supports a LEAF VLA only "
-                           "(D-CSUBSET-VLA-NONLEAF-CALL-FRAME)", cc.name));
-        return false;
-    }
+    // ── D-CSUBSET-VLA-NONLEAF-CALL-FRAME: THE NON-LEAF VLA FRAME MODEL ─────────
+    //
+    // ★ THE ONE SENTENCE: in a function with a runtime-moved stack pointer, the
+    //   outgoing-args area TRAVELS WITH SP at [SP+0 .. SP+outgoingArgAreaSize) and
+    //   every dynamic object is placed ABOVE it. A captured stack "watermark" is
+    //   therefore `SP + outgoingArgAreaSize`, not SP.
+    //
+    // This used to be an unconditional refusal ("a VLA function that ALSO makes a
+    // call"), on the premise that a fixed outgoing-args area reserved at a
+    // compile-time `[SP+off]` is moved INTO by the VLA's `sub sp,<size>` with no
+    // correct base left. The premise is right about the COLLISION and wrong about
+    // there being no base: the ABI requires the args at [SP+0..) only AT THE CALL,
+    // and SP is exactly the register the runtime `sub` keeps up to date. What has
+    // to move is the VLA OBJECT, by the width of the area it would otherwise land
+    // on top of.
+    //
+    // ✔MEASURED, and this is the ORACLE for the placement: mingw-w64 gcc 13.2.0 on
+    // `x86_64-w64-mingw32` (the pe64 reference, probed on this machine) compiles a
+    // VLA function that calls a 10-argument callee to
+    //     sub $0x78,%rsp ; lea 0x70(%rsp),%rbp ; … ; sub %rax,%rsp ; lea 0x50(%rsp),%rax
+    // — the VLA base is `RSP + 0x50`, and 0x50 == 80 == 32 (Win64 shadow) + 6*8 (the
+    // six stack-passed args) == exactly this function's `outgoingArgAreaSize`. The
+    // dynamic `sub` gets NO unwind code and NO CFI: the frame register established
+    // before it is what makes the frame describable (see the `DefCfaRegister`
+    // capture below, and D-CSUBSET-VLA-WIN64-UNWIND).
+    //
+    // WHY THE BIAS IS APPLIED TO THE CAPTURE AND NOT TO THE `sub`. MIR→LIR lowers a
+    // VLA to `sub_sp_reg SP,<size>` + `sp_copy base,SP`, and lowers a C5 scope
+    // watermark (`StackSave`) to the SAME `sp_copy dst,SP` shape. The two are
+    // indistinguishable here — and they do not need to be distinguished, because
+    // under this model they MEAN THE SAME THING: both capture the allocation
+    // watermark `W = SP + outgoingArgAreaSize`. A VLA object is then `[W', W)` where
+    // `W' = W - size` (the `sub_sp_reg` moves both by the same amount, so the object
+    // is exactly the bytes it carved and sits immediately above the NEW outgoing
+    // area), and a `sp_restore SP,W` puts SP back with `SP = W - outgoingArgAreaSize`.
+    // Every biased site is `hasVla`-gated and the bias is ZERO for a leaf VLA
+    // (`outgoingArgAreaSize == 0` when `!hasCalls`), so every already-shipping VLA
+    // function is byte-identical.
+    //
+    // AGNOSTIC, AND WITHOUT A NEW CONFIG KEY: the bias IS `outgoingArgAreaSize`,
+    // which is already derived per calling convention from `cc.shadowSpaceBytes`
+    // plus this function's widest stack-arg overflow. So the ABI decision is made
+    // per calling convention (ms_x64's 32-byte shadow pushes the object 32 bytes
+    // higher; sysv_amd64 and aapcs64 with register-only calls bias by 0) without a
+    // single `if (cc.name == …)`, `if (arch == …)` or `if (format == …)`.
+    //
+    // ⚠ WHAT STILL REFUSES, and it is NARROWER, not re-worded: `hasVla &&
+    // usesVaStart` (below) — the va-area `lea`s are still SP-relative and the
+    // frame-base switch does not cover them — and `hasVla && isSehParent` (below).
+    // The frame-base VERIFIER at the end of `materializeCallingConvention` is the
+    // backstop for both: it fails loud on any SP-based frame reference outside the
+    // two zones that are legitimately SP-relative.
+    //
+    // (`vlaWatermarkBias`, the value of this paragraph, is bound immediately after
+    // `computeFrameLayout` below — it IS `outLayout.outgoingArgAreaSize`, which does
+    // not exist until the layout does.)
     // D-LK10-ENTRY-ARM64-NONLEAF-LINK-REGISTER (2026-06-08): a calling
     // convention that carries the return address in a LINK REGISTER
     // (AAPCS64 -> x30) instead of pushing it on the stack at the call
@@ -2922,21 +2973,49 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
         return false;
     }
     // D-CSUBSET-VLA-WIN64-UNWIND (C1b): a VLA function that ALSO guards a `__try`
-    // (SEH parent) emits `.pdata`/`.xdata` unwind info describing a STATIC frame — but
-    // a VLA frame's SP moved a runtime amount, so an exception unwinding through it
-    // would mis-walk the stack. hasCalls is NOT a sufficient proxy (a `__try` around a
-    // TRAPPING NON-CALL op — e.g. an integer div-by-zero #DE — has no call yet still
-    // dispatches through the OS unwinder). Fail loud (never mis-unwind). PE-only in
-    // practice (SEH is Windows-only ⇒ isSehParent is only ever true there), no format
-    // branch. The SEH-through-VLA frame model is a separate designed cycle.
+    // (SEH parent) still fails loud — but ⚠ NOT FOR THE REASON THIS GATE USED TO
+    // GIVE, AND THE OLD REASON WAS MEASURABLY FALSE.
+    //
+    // It read "its dynamic frame is not describable by the static .pdata/.xdata
+    // unwind info, so an exception would mis-unwind". ✔MEASURED on
+    // `x86_64:pe64-x86_64-windows-exec`: it IS describable, and by machinery already
+    // in the tree. The frame-pointer capture below records a `def_cfa_register` CFI
+    // op, `link/format/pe.cpp` translates that to `UWOP_SET_FPREG`, and the emitted
+    // UNWIND_INFO for a VLA function reads `01 4a 13 05` + `4a 03` — frame register
+    // rbp, frame offset 0 — which is byte-for-byte the shape mingw-w64 gcc 13.2.0
+    // emits for the same source. Win64 has no dynamic-allocation unwind opcode
+    // because the frame register IS the mechanism. An access violation thrown
+    // through such a frame with a handler ABOVE it unwinds correctly today
+    // (`examples/c/c99_vla_win64_unwind_walk`).
+    //
+    // WHAT IS ACTUALLY UNPROVEN, and is the narrower reason this still refuses: a
+    // SEH PARENT carries more than a frame description — UNW_FLAG_EHANDLER, the
+    // personality RVA and a SCOPE_TABLE, and filter FUNCLETS that reach parent slots
+    // through `recover_parent_frame_slot` against the ESTABLISHER FRAME. For a
+    // function with no frame register that establisher is the post-prologue RSP,
+    // which is what every shipped funclet's slot offsets are measured from; for a
+    // VLA parent it becomes `FrameRegister - FrameOffset*16`. Those two are the SAME
+    // VALUE under this frame model (the capture is `FP <- SP`, offset 0) — which is
+    // an argument, not a measurement, and no witness exercises it. Refusing on an
+    // unproven establisher-frame identity is the right side of the bar; claiming the
+    // frame is undescribable was not.
+    //
+    // hasCalls is NOT a sufficient proxy for this (a `__try` around a TRAPPING
+    // NON-CALL op — an integer div-by-zero #DE, say — has no call yet still
+    // dispatches through the OS unwinder). PE-only in practice (SEH is Windows-only
+    // ⇒ isSehParent is only ever true there), so no format branch.
     if (hasVla && isSehParent) {
         report(reporter, DiagnosticCode::L_VlaNonLeafFrameUnsupported,
                DiagnosticSeverity::Error,
                std::format("a variable-length-array function (calling convention "
-                           "'{}') ALSO guards a __try (SEH) — its dynamic frame is not "
-                           "describable by the static .pdata/.xdata unwind info, so an "
-                           "exception would mis-unwind; the SEH-through-VLA frame model "
-                           "is not built (D-CSUBSET-VLA-WIN64-UNWIND)", cc.name));
+                           "'{}') ALSO guards a __try (SEH) — its frame IS describable "
+                           "(the frame-pointer capture emits UWOP_SET_FPREG), but the "
+                           "SEH funclet path has not been witnessed for a parent that "
+                           "establishes a frame register: a filter funclet reaches "
+                           "parent slots through the ESTABLISHER FRAME, which becomes "
+                           "the frame register rather than the post-prologue stack "
+                           "pointer. Refusing rather than assuming the two coincide "
+                           "(D-CSUBSET-VLA-WIN64-UNWIND)", cc.name));
         return false;
     }
     // FC12b/c: a callee-local register-save-area zone is reserved by the strategies
@@ -2960,6 +3039,33 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                         reporter);
     if (!layoutOpt.has_value()) return false;
     outLayout = std::move(*layoutOpt);
+
+    // D-CSUBSET-VLA-NONLEAF-CALL-FRAME: the non-leaf VLA frame model's ONE number
+    // (see the design note above the LEAF-gate paragraph). `outgoingArgAreaSize` is
+    // this function's own reserved outgoing-args width, derived per calling
+    // convention; it is the distance a dynamic object must be lifted above SP so the
+    // area that travels with SP is never the object. ZERO for a non-VLA function AND
+    // for a leaf VLA (no calls ⇒ no outgoing area) — both keep byte-identical code.
+    std::uint32_t const vlaWatermarkBias =
+        hasVla ? outLayout.outgoingArgAreaSize : 0u;
+    // The bias is realized by a destructive `add <dst>, bias` after a watermark
+    // capture and a `sub SP, bias` after a watermark restore. Both mnemonics are
+    // REQUIRED opcodes for this pass (the prologue's own SP adjust uses them), so a
+    // nonzero bias with either handle missing is a config the pass cannot lower —
+    // fail loud rather than emit an unbiased capture, which would place the VLA
+    // object exactly on top of the outgoing-args area (a silent stack miscompile).
+    if (vlaWatermarkBias > 0 && (h.add == 0 || h.sub == 0)) {
+        report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+               DiagnosticSeverity::Error,
+               std::format("calling convention '{}' reserves {} bytes of outgoing-"
+                           "argument area in a variable-length-array function, but "
+                           "the target schema declares no '{}' opcode to bias the "
+                           "dynamic-allocation watermark past it "
+                           "(D-CSUBSET-VLA-NONLEAF-CALL-FRAME)",
+                           cc.name, vlaWatermarkBias,
+                           h.add == 0 ? "add" : "sub"));
+        return false;
+    }
 
     auto const& funcInfo = src.funcArena().at(fn);
     b.addFunction(SymbolId{funcInfo.symbol});
@@ -4789,6 +4895,61 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 continue;
             }
 
+            // ── D-CSUBSET-VLA-NONLEAF-CALL-FRAME: the watermark bias ────────────
+            //
+            // The two ops that move a stack WATERMARK between a register and SP.
+            // Under the non-leaf VLA frame model the watermark is `SP +
+            // outgoingArgAreaSize` (the design note lives above the frame-model
+            // paragraph in this function), so:
+            //
+            //   `sp_copy dst, SP`      → the op VERBATIM, then `add dst, bias`
+            //   `sp_restore SP, saved` → the op VERBATIM, then `sub SP, bias`
+            //
+            // ★ THE BIAS INSTRUCTION IS PINNED BY A DATA DEPENDENCE, not by
+            //   emission order: `add dst,bias` reads and writes the very register
+            //   `sp_copy` just defined, and `sp_copy`/`sub_sp_reg`/`sp_restore` are
+            //   all `hasSideEffects`, so the whole chain is unreorderable even if a
+            //   pass were ever inserted after this one. Rewriting the capture into a
+            //   single `lea dst,[SP+bias]` would have been one instruction shorter
+            //   and would have dropped that pin.
+            //
+            // A ZERO bias emits nothing (`emitSpAdjust` returns the invalid id for
+            // 0 bytes), so a leaf VLA — every VLA function that compiles today — is
+            // byte-identical. Non-VLA functions never reach here with a bias at all.
+            //
+            // ⚠ Gated on the SOURCE operand being the stack pointer. MIR→LIR only
+            // ever emits `sp_copy dst,SP`, but a capture of something ELSE is not a
+            // watermark and must not be biased; it falls through to the verbatim
+            // default arm below.
+            if (vlaWatermarkBias > 0 && h.spCopy != 0 && op == h.spCopy
+                && !ops.empty() && ops[0].kind == LirOperandKind::Reg
+                && ops[0].reg.isPhysical != 0 && ops[0].reg.id == sp.id
+                && result.isPhysical != 0 && result.id != sp.id) {
+                // Re-emitted with the SOURCE instruction's payload and width flags
+                // rather than through `emitSpCopy`, whose two defaults would have
+                // silently dropped them. MIR→LIR states 0 for both today, so this is
+                // byte-identical — but a re-emission that discards a field is the
+                // shape of a loss no downstream check can see.
+                std::array<LirOperand, 1> capOps{LirOperand::makeReg(sp)};
+                LirInstId const cap = b.addInst(op, result, capOps, payload,
+                                                src.instFlags(inst));
+                lir_pass_util::carryInstSideData(src, inst, b, cap);
+                emitSpAdjust(b, h.add, result, vlaWatermarkBias);
+                continue;
+            }
+            if (vlaWatermarkBias > 0 && h.spRestore != 0 && op == h.spRestore) {
+                std::vector<LirOperand> restoreOps;
+                restoreOps.reserve(ops.size());
+                for (auto const& o : ops) {
+                    restoreOps.push_back(lir_pass_util::remapBlockRef(o, srcToDst));
+                }
+                LirInstId const rst = b.addInst(op, result, restoreOps, payload,
+                                                src.instFlags(inst));
+                lir_pass_util::carryInstSideData(src, inst, b, rst);
+                emitSpAdjust(b, h.sub, sp, vlaWatermarkBias);
+                continue;
+            }
+
             std::vector<LirOperand> newOps;
             newOps.reserve(ops.size());
             for (auto const& o : ops) newOps.push_back(lir_pass_util::remapBlockRef(o, srcToDst));
@@ -5096,10 +5257,26 @@ materializeCallingConvention(Lir const&           src,
     // base-switch routes every fixed ref to `frameBase` (== FP); this post-pass is
     // the RED-ON-DISABLE guard that a FUTURE fixed-frame emit site did not forget the
     // switch. A memory op carries a `MemBase` operand preceded by its base register;
-    // a base == SP is a fixed-frame ref UNLESS its offset lands in the saved-reg area
-    // (the prologue/epilogue saved-reg stores/loads legitimately use SP, which == the
-    // fixed-frame base FB at those two points — the only sanctioned SP frame refs in
-    // a VLA function). Any OTHER SP-based frame ref is a missed switch — fail loud.
+    // a base == SP is a fixed-frame ref UNLESS its offset lands in one of exactly TWO
+    // zones:
+    //   * the saved-reg area — the prologue/epilogue saved-reg stores/loads
+    //     legitimately use SP, which == the fixed-frame base FB at those two points;
+    //   * D-CSUBSET-VLA-NONLEAF-CALL-FRAME: the OUTGOING-ARGS area
+    //     `[0, outgoingArgAreaSize)` — under the non-leaf VLA frame model that area
+    //     is DEFINED as travelling with SP (the ABI reads the callee's stack args at
+    //     [SP+0..) at the moment of the call), so an outgoing-arg store is SP-based
+    //     BY CONSTRUCTION and is the one thing here that must NOT be switched to FP.
+    // Any OTHER SP-based frame ref is a missed switch — fail loud.
+    //
+    // ⚠ THE SECOND ESCAPE IS DIRECTIONAL AND BOUNDED, WHICH IS THE ONLY REASON IT IS
+    // SAFE TO ADD ONE (an escape every reference triggers disarms the guard). Every
+    // FIXED-frame zone this verifier exists to catch — spills, local allocas, the
+    // va-save area, incoming stack args — begins at `spillAreaOffset()` or higher,
+    // i.e. at or above `outgoingArgAreaSize + savedRegAreaSize`. So the widened
+    // escape covers strictly less than the frame's bottom two zones and cannot
+    // swallow a single one of the references it is meant to see. ✔The mutation that
+    // proves it: reverting the frame-base switch on the spill store makes those refs
+    // land at `spillAreaOffset()+`, outside both escapes, and this still fires.
     if (opcodes->subSpReg != 0) {
         std::size_t const outFnCount = out.lir.moduleFuncCount();
         for (std::uint32_t i = 0;
@@ -5137,6 +5314,12 @@ materializeCallingConvention(Lir const&           src,
                             off = ops[oi + 1].offset;
                         }
                         if (off >= savedLo && off < savedHi) continue;  // saved-reg
+                        // D-CSUBSET-VLA-NONLEAF-CALL-FRAME: the outgoing-args area
+                        // travels with SP by design — see the two-zone note above.
+                        if (off >= 0 && off < static_cast<std::int64_t>(
+                                                   L.outgoingArgAreaSize)) {
+                            continue;
+                        }
                         report(reporter,
                                DiagnosticCode::L_VlaNonLeafFrameUnsupported,
                                DiagnosticSeverity::Error,

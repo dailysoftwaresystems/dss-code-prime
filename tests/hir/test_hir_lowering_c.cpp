@@ -112,8 +112,17 @@ namespace {
     // D-TEST-THE-HIR-LOWERING-FIXTURE-ANALYZES-WITH-NO-TARGET-IN-SCOPE: the target
     // + its va_list strategy, exactly as `compile_pipeline.cpp` and the sibling MIR
     // harness thread them. See `fixtureTarget` for why they are process-owned.
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the OBJECT FORMAT is threaded
+    // too, and it is not decoration here. Plain `char`'s signedness is a
+    // (processor x object format) fact — the same arm64 CPU is unsigned under
+    // GNU/Linux and signed under Darwin — and the accessor requires the format
+    // KIND precisely so no caller can take the processor half alone. Without it
+    // this fixture analyzed with a target but NO answer for `char`, so a
+    // high-byte character constant would refuse here while compiling cleanly
+    // through the real pipeline. ELF is what every fixture in this file was
+    // implicitly written against.
     return analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
-                   std::nullopt, fixtureVaListStrategy(), std::nullopt,
+                   std::nullopt, fixtureVaListStrategy(), ObjectFormatKind::Elf,
                    std::nullopt, LongDoubleFormat::None, fixtureTarget());
 }
 
@@ -4889,6 +4898,22 @@ TEST(HirLoweringC, PointerDerefAndAddressOfLower) {
     EXPECT_EQ(ti.kind(res->hir.typeId(deref)), TypeKind::I32);
 }
 
+// [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: THE PAYLOAD IS THE CONSTANT'S VALUE,
+// NOT THE CODE UNIT — and it now rides the SIGNED arm. This used to assert
+// `std::uint64_t`, which was the arm the old lowering used because it stored the
+// raw byte the decoder hands back. C 6.4.4.4p10 makes a narrow character
+// constant's value that byte read as a plain `char`, and this fixture's target
+// declares plain `char` SIGNED, so the value is a signed integer and belongs in
+// the signed arm. For `'a'` the NUMBER is 97 either way; the arm moved because
+// the literal is now honest about its own type, and a Char-cored payload outside
+// a signed `char`'s range was exactly the lie that let five consumers of one
+// declaration disagree.
+//
+// ⓘ Nothing downstream reads signedness off the ARM — `const_eval_arith.hpp` says
+// so in as many words ("THE SOURCE'S SIGNEDNESS IS CARRIED BY ITS CORE, NEVER BY
+// WHICH VARIANT ARM HOLDS IT") and `asInt64`/`asIntBits` bridge both arms — so
+// this is a representation change with one observable consequence: `'\xff'` is
+// finally -1 where the target says plain `char` is signed.
 TEST(HirLoweringC, CharLiteralLowersToCharValue) {
     // `'a'` — coalesced body token, decoded to a Char codepoint.
     SemanticModel model = analyzeC("char f() { return 'a'; }");
@@ -4899,8 +4924,31 @@ TEST(HirLoweringC, CharLiteralLowersToCharValue) {
     ASSERT_EQ(res->literalPool.size(), 1u);
     auto const& v = res->literalPool.at(0);
     EXPECT_EQ(v.core, TypeKind::Char);
-    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(v.value));
-    EXPECT_EQ(std::get<std::uint64_t>(v.value), static_cast<std::uint64_t>('a'));
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(v.value));
+    EXPECT_EQ(std::get<std::int64_t>(v.value), static_cast<std::int64_t>('a'));
+}
+
+// The half of the pair that is NOT sign-neutral, and the reason the arm moved.
+// `'\xff'` is -1 on this fixture's target (x86_64 declares plain `char` SIGNED)
+// and would be +255 on the one unsigned-`char` leg DSS ships. ✔MEASURED at
+// b1f31420 the lowering stored 255 on EVERY target, and the runtime path hid it:
+// MIR materializes the low byte and extends per target, so 255 and -1 produce
+// identical machine code — which is precisely why only the COMPILE-TIME consumers
+// ever saw the defect, and why a green runtime witness proved nothing about them.
+TEST(HirLoweringC, HighByteCharLiteralLowersToItsSignedValueOnASignedCharTarget) {
+    SemanticModel model = analyzeC("char f() { return '\\xff'; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::Char);
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(v.value));
+    EXPECT_EQ(std::get<std::int64_t>(v.value), -1)
+        << "C 6.4.4.4p10: the constant's value is the code unit read as a plain "
+           "`char`, and this target declares plain `char` SIGNED — 255 is the "
+           "code unit, not the value";
 }
 
 TEST(HirLoweringC, CharEscapeLowersToControlCodepoint) {
@@ -4910,7 +4958,8 @@ TEST(HirLoweringC, CharEscapeLowersToControlCodepoint) {
     auto res = lowerToHir(model, r);
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     ASSERT_EQ(res->literalPool.size(), 1u);
-    EXPECT_EQ(std::get<std::uint64_t>(res->literalPool.at(0).value), 10u);  // '\n'
+    // Signed arm — see `CharLiteralLowersToCharValue`. 10 is sign-neutral.
+    EXPECT_EQ(std::get<std::int64_t>(res->literalPool.at(0).value), 10);  // '\n'
 }
 
 TEST(HirLoweringC, EmptyCharLiteralFailsLoud) {
@@ -10982,4 +11031,219 @@ TEST(HirLoweringC, ExternOnATagOnlyDeclarationEmitsNoImport) {
     EXPECT_EQ(externGlobals, 0u)
         << "a tag-only declaration declares no object, so there is nothing to "
            "import";
+}
+
+// ── [[D-CSUBSET-VLA-SIZEOF-TYPEFORM]] part (1): `sizeof(int[n])` ────────────────
+//
+// C 6.5.3.4p2: *"If the type of the operand is a variable length array type, the
+// operand is evaluated"* — the ONE `sizeof` whose operand is evaluated, so the
+// bound is RE-READ at every `sizeof` and its side effects HAPPEN.
+// ✔MEASURED 2026-09-04, references probed SEPARATELY: gcc 13.3.0 and clang
+// 18.1.3 both compile and RUN it at `-std=c17` AND `-std=c2x`, both give two
+// DIFFERENT answers when `n` changes between two `sizeof(int[n])`, and both
+// execute a side effect in the bound; MSVC 19.44.35228 ABSTAINS (`C2057` + `C4034`).
+//
+// These two pins name the TIER and the MECHANISM. The corpus witness
+// (`examples/c/c99_vla_sizeof_type_name`) proves the VALUES end to end; what
+// cannot be seen from the values alone is that the lowering happens HERE, and
+// why it must: a `vlaArray` TypeId carries NO length operand (every VLA of one
+// element interns to a single TypeId), so a `SizeOf` node whose TypeRef is a VLA
+// has already lost `n` before MIR — there would be nothing left downstream to
+// re-evaluate. Pin 1 therefore asserts that NO VLA-typed `SizeOf` node is minted
+// at all and that a Mul over a live `Ref` to the bound stands in its place.
+
+// Pin 1 — THE SHAPE AND THE FRESHNESS. RED-ON-DISABLE: drop the
+// `lowerVlaTypeNameSizeof` dispatch in `lowerSizeof` and the single SizeOf here
+// carries the VLA array type again (the `isVlaArray` EXPECT flips) while the Mul
+// and the Ref disappear entirely.
+TEST(HirLoweringC, SizeofOfVlaTypeNameLowersToFreshBoundArithmeticNotAVlaSizeOf) {
+    SemanticModel model = analyzeC(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 3;\n"
+        "  unsigned long a = sizeof(int[n]);\n"
+        "  return (int)a;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+                                              : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    ASSERT_TRUE(fn.valid());
+    auto const& ti = model.lattice().interner();
+
+    std::vector<HirNodeId> sizeofs;
+    std::vector<HirNodeId> muls;
+    auto const collect = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::SizeOf) sizeofs.push_back(n);
+        if (res->hir.kind(n) == HirKind::BinaryOp
+            && isCoreOp(res->hir.payload(n))
+            && decodeCoreOp(res->hir.payload(n)) == HirOpKind::Mul)
+            muls.push_back(n);
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    collect(collect, res->hir.functionBody(fn));
+
+    // (1) EXACTLY ONE SizeOf, and it sizes the ELEMENT — never the VLA type. A
+    // VLA-typed SizeOf is precisely what HIR→MIR refuses (H_UnsupportedLowering-
+    // ForKind, "sizeof of an incomplete or un-sizeable type"), so its ABSENCE is
+    // the property, not an implementation detail.
+    ASSERT_EQ(sizeofs.size(), 1u)
+        << "the VLA type-name lowers to ONE static SizeOf (the element's), never "
+           "a SizeOf of the array itself";
+    auto const skids = res->hir.children(sizeofs[0]);
+    ASSERT_EQ(skids.size(), 1u) << "SizeOf carries exactly [TypeRef]";
+    TypeId const sizedT = res->hir.typeId(skids.front());
+    ASSERT_TRUE(sizedT.valid());
+    EXPECT_FALSE(ti.isVlaArray(sizedT))
+        << "no SizeOf node may carry a variable-length array type — its TypeId "
+           "has no length operand, so MIR could not size it and refuses";
+    EXPECT_FALSE(ti.typeContainsVla(sizedT));
+    EXPECT_EQ(ti.kind(sizedT), TypeKind::I32)
+        << "`int[n]`'s element is `int`, and its size is the static half of the "
+           "product";
+
+    // (2) A Mul typed size_t stands where the VLA SizeOf used to be.
+    ASSERT_GE(muls.size(), 1u)
+        << "`sizeof(int[n])` is `n * sizeof(int)` — a runtime Mul, not a fold";
+    HirNodeId chosen{};
+    for (HirNodeId m : muls)
+        if (res->hir.typeId(m).valid()
+            && ti.kind(res->hir.typeId(m)) == TypeKind::U64)
+            chosen = m;
+    ASSERT_TRUE(chosen.valid()) << "the product is typed size_t (C 6.5.3.4p5)";
+
+    // (3) FRESHNESS AT THIS TIER: the product's non-SizeOf operand subtree must
+    // reach a live `Ref` to the bound. A constant-folded implementation would put
+    // a Literal there and would pass every value test that only ever reads one
+    // `n` — which is why the Ref, not the number, is what this pins.
+    auto const kids = res->hir.children(chosen);
+    ASSERT_EQ(kids.size(), 2u);
+    HirNodeId const boundSide =
+        (res->hir.kind(kids[1]) == HirKind::SizeOf) ? kids[0] : kids[1];
+    bool sawRef = false;
+    auto const hunt = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::Ref) sawRef = true;
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    hunt(hunt, boundSide);
+    EXPECT_TRUE(sawRef)
+        << "the bound must be lowered as a live read of `n` (C 6.5.3.4p2 makes "
+           "the operand EVALUATED), never folded to a constant";
+}
+
+// Pin 2 — SUFFIX↔LEVEL PAIRING, the half a single-dimension test cannot see.
+// `typedef int Row[3]; sizeof(Row[n])` has ONE array suffix but TWO array levels,
+// and its value is `n * sizeof(int[3])` (✔MEASURED: gcc 13.3.0 and clang 18.1.3
+// both exit 42 on the 60-byte witness). An implementation that descended to the
+// FIRST NON-ARRAY element would multiply by `sizeof(int)` and under-report by 3×
+// — a plausible wrong number, never a refusal, which is the failure direction
+// this project ranks worst. RED-ON-DISABLE: change the element walk to descend
+// past every Array level and this EXPECT flips Array→I32.
+TEST(HirLoweringC, SizeofOfVlaTypeNamePairsOneSuffixPerArrayLevelNotToTheLeaf) {
+    SemanticModel model = analyzeC(
+        "typedef int Row[3];\n"
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 5;\n"
+        "  unsigned long a = sizeof(Row[n]);\n"
+        "  return (int)a;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+                                              : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    ASSERT_TRUE(fn.valid());
+    auto const& ti = model.lattice().interner();
+
+    std::vector<HirNodeId> sizeofs;
+    auto const collect = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::SizeOf) sizeofs.push_back(n);
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    collect(collect, res->hir.functionBody(fn));
+    ASSERT_EQ(sizeofs.size(), 1u);
+    auto const skids = res->hir.children(sizeofs[0]);
+    ASSERT_EQ(skids.size(), 1u);
+    TypeId const sizedT = res->hir.typeId(skids.front());
+    ASSERT_TRUE(sizedT.valid());
+    ASSERT_EQ(ti.kind(sizedT), TypeKind::Array)
+        << "ONE suffix consumes ONE array level, so `Row[n]`'s element is the "
+           "whole `int[3]` — descending to the leaf would size `int` and "
+           "under-report the answer by a factor of 3";
+    EXPECT_FALSE(ti.isVlaArray(sizedT))
+        << "…and that element is the FIXED `int[3]`, statically sizeable";
+}
+
+// Pin 3 — ★★ THE FAIL-LOUD ARM, AND THE REASON IT EXISTS IS A DEFECT THIS CHANGE
+// INTRODUCED AND THEN REMOVED. C 6.7.6.2p1 requires a variable-length array's size
+// expression to have INTEGER type. `validateVlaDeclarator` enforces that
+// (`S_VlaSizeNotInteger`) for a DECLARATOR, but an ABSTRACT type-name has no
+// declarator and never reaches that validator — an omission that was invisible
+// while the whole construct was refused at MIR.
+// ✔MEASURED 2026-09-04 on the first working build of part (1): with the type-name
+// form lowered but WITHOUT this guard, `double x; sizeof(int[x])` compiled rc=0
+// and answered 12 (the widening Cast silently truncated 3.5) and
+// `int *p; sizeof(int[p])` compiled and answered from the pointer's numeric value
+// — two SILENT WRONG ANSWERS where the base (b1f31420) had refused loudly.
+// ✔gcc 13.3.0 and clang 18.1.3, probed SEPARATELY, both REFUSE both shapes
+// ("size of array has non-integer type"). So this is not a defensive extra: it is
+// the difference between the feature being shippable and being a miscompile.
+// RED-ON-DISABLE: delete the integer arm in `lowerVlaTypeNameSizeof` and both
+// ASSERT_TRUEs below flip — the lowering succeeds and produces a number.
+TEST(HirLoweringC, SizeofOfVlaTypeNameWithNonIntegerBoundFailsLoud) {
+    auto const mustRefuse = [](char const* what, std::string src) {
+        SemanticModel model = analyzeC(std::move(src));
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        bool const refused = model.hasErrors() || !res->ok;
+        EXPECT_TRUE(refused)
+            << what
+            << " must be REFUSED (C 6.7.6.2p1 — the size expression of a "
+               "variable-length array must have integer type), never silently "
+               "converted into a size; gcc and clang both refuse it";
+    };
+    mustRefuse("a floating bound",
+               "int main(void) {\n"
+               "  double x;\n"
+               "  x = 3.5;\n"
+               "  unsigned long s = sizeof(int[x]);\n"
+               "  return (int)s;\n"
+               "}\n");
+    mustRefuse("a pointer bound",
+               "int main(void) {\n"
+               "  int v;\n"
+               "  v = 3;\n"
+               "  int *p = &v;\n"
+               "  unsigned long s = sizeof(int[p]);\n"
+               "  return (int)s;\n"
+               "}\n");
+    // CONTROL, and the reason the refusal above is not a blanket one: an
+    // ENUM-typed variable IS an integer type (C 6.7.6.2p1) and must still be
+    // ACCEPTED. ✔gcc 13.3.0 and clang 18.1.3 both compile and run it (20).
+    SemanticModel ok = analyzeC(
+        "enum E { A = 3, B = 5 };\n"
+        "int main(void) {\n"
+        "  enum E e;\n"
+        "  e = B;\n"
+        "  unsigned long s = sizeof(int[e]);\n"
+        "  return (int)s;\n"
+        "}\n");
+    ASSERT_FALSE(ok.hasErrors())
+        << (ok.diagnostics().all().empty() ? std::string{}
+                                           : ok.diagnostics().all()[0].actual);
+    DiagnosticReporter okr;
+    auto okres = lowerToHir(ok, okr);
+    EXPECT_TRUE(okres->ok)
+        << "an enum-typed bound is an INTEGER bound and must not be caught by the "
+           "non-integer refusal: "
+        << (okr.all().empty() ? "" : okr.all()[0].actual);
 }

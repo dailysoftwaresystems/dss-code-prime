@@ -382,6 +382,13 @@ struct Lowerer {
     // axis, read OFF THE MODEL for the same two-tier-agreement reason —
     // consumed by the float-literal ladder (typeFloatLiteral).
     LongDoubleFormat longDoubleFormat_ = LongDoubleFormat::None;
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: plain `char`'s signedness for the
+    // (target × object format) this CU was ANALYZED under, read off the model
+    // (`SemanticModel::charIsUnsigned()`) — the `dataModel_` two-tier discipline,
+    // so this tier and the semantic tier cannot answer differently. `nullopt` ⇒
+    // no target was in scope ⇒ a character constant above 0x7F fails loud rather
+    // than lowering as whichever sign this file happened to assume.
+    std::optional<bool> charIsUnsigned_{};
     // FC3 c1: the language's usual-arithmetic-conversion rules resolved
     // for `dataModel_`. nullopt (no `arithmeticConversions` block) keeps
     // every combine site on the legacy `TypeInterner::commonType` path
@@ -1469,6 +1476,8 @@ struct Lowerer {
         dataModel_ = m.dataModel();
         // FC17.9(e): the long-double axis rides the model the same way.
         longDoubleFormat_ = m.longDoubleFormat();
+        // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: so does plain `char`'s sign.
+        charIsUnsigned_ = m.charIsUnsigned();
         if (sem.arithmeticConversions.has_value()) {
             arith_ = resolveArithmeticRules(*sem.arithmeticConversions, dataModel_);
             // D-CSUBSET-BITINT: `_BitInt` participation in the usual arithmetic
@@ -4224,9 +4233,31 @@ struct Lowerer {
             }
             return {errorNode(node, type), type};
         }
+        // ── [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: STORE THE *VALUE*, NOT
+        // THE CODE UNIT. A `HirLiteralValue`'s payload is its value IN ITS OWN
+        // CORE, and this literal's core is `Char` — whose range C 6.2.5p15 makes
+        // target-declared. Storing the raw unit made `'ÿ'` a Char-cored +255,
+        // a number outside a signed `char`'s range, and every const-eval consumer
+        // that later asked `intKindInfo(Char)` got a true answer about a value
+        // that was already lying. The runtime path was unaffected either way (it
+        // materializes the low byte and extends per target), which is exactly why
+        // this survived: the tier that read the declaration could not see the
+        // tier that did not.
+        //
+        // 0–127 is the same number under both readings, so a target-less lowering
+        // (LSP, FFI header parse, direct-API tests) is unchanged for every real
+        // program; a high byte with no answer fails LOUD.
+        if (narrowCharConstantSignednessMatters(*cp) && !charIsUnsigned_.has_value()) {
+            unsupported(node, std::format(
+                "char literal '{}' has a code unit above 0x7F, whose value as an "
+                "`int` depends on whether the target declares plain `char` signed "
+                "(C 6.2.5p15 / 6.4.4.4p10), and no target was in scope for this "
+                "lowering", body));
+            return {errorNode(node, type), type};
+        }
         HirLiteralValue v;
         v.core  = TypeKind::Char;
-        v.value = static_cast<std::uint64_t>(*cp);
+        v.value = narrowCharConstantValue(*cp, charIsUnsigned_.value_or(false));
         return {track(builder.makeLiteral(type, literals.add(std::move(v))), node), type};
     }
 
@@ -5450,6 +5481,22 @@ struct Lowerer {
     // and the `lowerExpr` driver's Comma frame. Byte-identical to the prior inline
     // tail: `a, b` = SeqExpr([ExprStmt a], b) yielding b's value+type.
     E combineComma(NodeId node, HirNodeId effect, E rhsE) {
+        // ── C 6.5.17p2 [[D-CSUBSET-VLA-SIZEOF-TYPEFORM]] part (2) ────────────
+        // The comma's result has the type AND VALUE of the right operand, and
+        // taking a VALUE applies the lvalue conversions — so an ARRAY right
+        // operand decays to a pointer (6.3.2.1p3), exactly as the ternary's arms
+        // do (c64). Routing it through the SHARED `arrayToPointerDecay` and the
+        // existing `coerce` means the decay is the ONE the rest of the pipeline
+        // performs — `coerce`'s Array→Ptr arm emits the same decay Cast every
+        // other value context gets — rather than a relabelled aggregate.
+        //
+        // ⚠ THE SEMANTIC TIER'S `combineBinary` CARRIES THE MIRROR OF THIS AND
+        // THE TWO MUST NEVER MOVE APART: `subtreeType` exists to mirror this
+        // lowering exactly, and `lowerSizeof` reads the SEMANTIC stamp — so this
+        // half ALONE changes nothing a program can observe, and that half alone
+        // would stamp a type this tier does not build.
+        TypeId const decayed = arrayToPointerDecay(interner, rhsE.type);
+        if (decayed.valid() && decayed != rhsE.type) rhsE = coerce(rhsE, decayed);
         std::array<HirNodeId, 1> const stmts{effect};
         return {track(builder.makeSeqExpr(stmts, rhsE.id, rhsE.type, HirFlags::None), node),
                 rhsE.type};
@@ -8189,6 +8236,184 @@ struct Lowerer {
         return {track(agg, clNode), type};
     }
 
+    // [[D-CSUBSET-VLA-SIZEOF-TYPEFORM]] part (1): `sizeof ( int[n] )` — the VLA
+    // TYPE-NAME form, the ONE `sizeof` whose operand C says is EVALUATED.
+    //
+    // C 6.5.3.4p2: *"If the type of the operand is a variable length array type,
+    // the operand is evaluated"* — so this `sizeof` is a RUNTIME expression whose
+    // bound(s) are RE-EVALUATED at the `sizeof`, side effects and all, and is NOT
+    // a constant expression (C 6.6). ✔MEASURED 2026-09-04, each reference invoked
+    // SEPARATELY: gcc 13.3.0 and clang 18.1.3 both compile and RUN it at
+    // `-std=c17` AND `-std=c2x`; both give two DIFFERENT answers when `n` changes
+    // between two `sizeof(int[n])` (12 then 20); both EXECUTE a side effect in the
+    // bound (`sizeof(int[n++])` leaves n incremented); and both agree on the
+    // multidimensional form (`sizeof(int[n][m])` == n*m*sizeof(int)). MSVC 19.44
+    // ABSTAINS — `C2057: expected constant expression` plus `C4034: sizeof
+    // returns 0` — which is an abstention, not a vote against. Two references
+    // accept AND run ⇒ the disjunction requires it.
+    //
+    // ★ WHY THE LOWERING IS HERE AND NOT A MIR ARM, WHICH IS A CONSEQUENCE OF THE
+    // TYPE MODEL RATHER THAN A PREFERENCE. A `vlaArray` TypeId carries NO length
+    // operand at all — `TypeInterner::vlaArray` interns every VLA of one element
+    // to a SINGLE TypeId, deliberately (the runtime size lives out-of-band in a
+    // decl-keyed side-table). So a `SizeOf` node whose TypeRef is a VLA type has
+    // ALREADY LOST `n` before MIR sees it, and there is nothing at that tier left
+    // to re-evaluate: a MIR arm would need the bound handed to it through yet
+    // another side-table, i.e. this same lowering plus an indirection. The bound
+    // expression exists only in the CST, which is here. This therefore emits
+    // ORDINARY HIR ARITHMETIC over the pipeline's existing verbs — `lowerExpr` per
+    // bound, `coerce` to size_t, a core `Mul`, and a plain STATIC `SizeOf` for the
+    // element type — and mints no VLA-typed `SizeOf` node at all.
+    //
+    // ⚠ THE OBJECT FORM IS A DIFFERENT QUESTION AND KEEPS ITS OWN PATH. `sizeof a`
+    // for a VLA OBJECT `a` must Load the size FROZEN at a's declaration (C
+    // 6.7.6.2p2) and must NOT re-evaluate `n` — see `vlaObjectOperandSymbol` and
+    // the MIR `SizeOf` case. This helper is reached ONLY from the TYPE form, where
+    // there is no object and nothing has been frozen.
+    //
+    // ★ BOUND↔LEVEL PAIRING, and the reason it is not "descend to the first
+    // non-array". The suffixes are collected in SOURCE order (outer→inner) by the
+    // same pre-order work-stack `captureVlaSize` uses, and the ELEMENT type is
+    // found by descending EXACTLY as many Array levels as there are suffixes. A
+    // typedef'd element is why: `typedef int R[3]; sizeof(R[n])` has ONE suffix
+    // but TWO array levels, and its size is `n * sizeof(int[3])` — descending to
+    // the first non-array would multiply by `sizeof(int)` and under-report by 3×.
+    // A level that is not an Array (a shape whose suffixes do not sit on one
+    // spine, e.g. `int (*[n])[3]`) is an internal desync and FAILS LOUD; it fails
+    // loud today too, so nothing becomes silently wrong.
+    //
+    // Returns an INVALID id when the shape is not this one (no declarator config,
+    // or a VLA type-name carrying no suffix of its own — `typedef int R[n];
+    // sizeof(R)`, whose size is frozen at the TYPEDEF, C 6.7.7p2). The caller then
+    // falls through to the static path, which keeps refusing loudly at MIR.
+    [[nodiscard]] E lowerVlaTypeNameSizeof(NodeId node, NodeId scan, TypeId sized,
+                                           TypeId sizeType) {
+        if (!sem.declarators.has_value()) return {HirNodeId{}, InvalidType};
+        DeclaratorConfig const& dc = *sem.declarators;
+        // Ordered pre-order work-stack (children pushed REVERSED so they pop
+        // left-to-right); an array-suffix node is RECORDED, not descended into —
+        // its only children are `[`, the bound expression and `]`. Identical to
+        // `captureVlaSize`'s collector, so a shape capturable there is capturable
+        // here.
+        // ⚠ THE BUDGET IS CHECKED, not merely applied. A truncated walk would
+        // find FEWER suffixes than the type has dimensions, and the element
+        // descent below would then succeed at a shallower level and return a
+        // SMALLER product — a wrong number with no diagnostic. So exhausting the
+        // budget is reported, never absorbed.
+        std::vector<NodeId> suffixes;
+        bool walkComplete = false;
+        {
+            std::vector<NodeId> stack{scan};
+            for (int guard = 0; guard < 16384; ++guard) {
+                if (stack.empty()) { walkComplete = true; break; }
+                NodeId const c = stack.back(); stack.pop_back();
+                if (tree().kind(c) != NodeKind::Internal) continue;
+                if (tree().rule(c).v == dc.arraySuffixRule.v) {
+                    suffixes.push_back(c);
+                    continue;
+                }
+                auto const kids = visible(c);
+                for (std::size_t i = kids.size(); i-- > 0;) stack.push_back(kids[i]);
+            }
+        }
+        if (!walkComplete) {
+            return exprError(node,
+                "internal: a variable-length array type-name exceeded the "
+                "traversal budget for locating its array suffixes, so its "
+                "dimensions cannot be enumerated");
+        }
+        if (suffixes.empty()) return {HirNodeId{}, InvalidType};
+        // Descend ONE array level per suffix; whatever is left is the element.
+        TypeId elem = sized;
+        for (std::size_t i = 0; i < suffixes.size(); ++i) {
+            bool descended = false;
+            if (elem.valid() && interner.kind(elem) == TypeKind::Array) {
+                auto const ops = interner.operands(elem);
+                if (!ops.empty()) { elem = ops[0]; descended = true; }
+            }
+            if (!descended) {
+                return exprError(node,
+                    "internal: the array-suffix count of a variable-length array "
+                    "type-name does not match its type's array depth, so its "
+                    "bounds cannot be paired with its dimensions");
+            }
+        }
+        // Lower each bound to a FRESH evaluation, widen it to size_t, and multiply
+        // outer→inner. `lowerExpr` handles every expression form (a fixed bound
+        // `[5]` lowers to a Const, a runtime one `[n]` to its expression, and a
+        // side-effecting one `[n++]` to the increment C 6.5.3.4p2 requires to
+        // happen). EVERY suffix must yield a bound — a suffix with no lowerable
+        // bound is an internal desync, never a silently dropped dimension.
+        HirNodeId product{};
+        for (NodeId const suffix : suffixes) {
+            // VLA C4c: the bound sits BEHIND any array-parameter decoration
+            // (`[static n]`) — located through the shared skipper so a leading
+            // `static`/cv token is never lowered AS the bound.
+            NodeId const boundNode =
+                arraySuffixBoundNode(tree(), suffix, dc.arraySuffixModifierTokens)
+                    .value_or(NodeId{});
+            E const bound = boundNode.valid() ? lowerExpr(boundNode)
+                                              : E{HirNodeId{}, InvalidType};
+            if (!bound.id.valid()) {
+                return exprError(node,
+                    "internal: a dimension of a variable-length array type-name "
+                    "carries no lowerable bound expression");
+            }
+            // ⚠★ C 6.7.6.2p1 — THE BOUND MUST HAVE INTEGER TYPE, AND THIS CHECK IS
+            // WHAT KEEPS THIS WHOLE LOWERING FAIL-LOUD. `validateVlaDeclarator`
+            // owns this constraint for a DECLARATOR (`S_VlaSizeNotInteger`) but is
+            // reached only from a declaration; an ABSTRACT type-name has no
+            // declarator and no validator, and before this row the omission was
+            // invisible because the construct was refused wholesale at MIR.
+            // ✔MEASURED 2026-09-04 while building this: WITHOUT this arm,
+            // `double x; sizeof(int[x])` COMPILED rc=0 and answered 12 (the
+            // widening Cast silently truncated 3.5), and `int *p; sizeof(int[p])`
+            // compiled and answered from the pointer's numeric value — two SILENT
+            // WRONG ANSWERS where the base had refused loudly, and where gcc
+            // 13.3.0 and clang 18.1.3 (probed separately) BOTH refuse: *"size of
+            // array has non-integer type"*. So the guard is not defensive
+            // decoration; it is the difference between this change being
+            // shippable and being a miscompile.
+            // The integer set is EXPRESSED FROM THE PREDICATES THIS FILE ALREADY
+            // OWNS — arithmetic minus float — rather than re-listing the kinds, so
+            // it cannot drift from `coerce`'s view of what an arithmetic type is.
+            // `Enum` is admitted explicitly (an enum-typed VARIABLE is a legal
+            // bound; an enum CONSTANT folds and never reaches a VLA at all), which
+            // is exactly the semantic tier's `isVlaSizeIntegerType` set.
+            TypeKind const bk =
+                bound.type.valid() ? interner.kind(bound.type) : TypeKind::Void;
+            if (!((isArithmeticCore(bk) && !isFloatCore(bk))
+                  || bk == TypeKind::Enum)) {
+                emitH(DiagnosticCode::S_VlaSizeNotInteger, boundNode,
+                      "the size expression of a variable-length array type must "
+                      "have an integer type (C 6.7.6.2p1)");
+                return {errorNode(node), InvalidType};
+            }
+            HirNodeId const widened = coerce(bound, sizeType).id;
+            product = product.valid()
+                          ? track(builder.makeBinaryOp(HirOpKind::Mul, product,
+                                                       widened, sizeType,
+                                                       HirFlags::Synthetic),
+                                  node)
+                          : widened;
+        }
+        // × the element's STATIC size. A plain `SizeOf` over the element type-ref
+        // — the same verb and the same `type_layout` fold every other `sizeof(T)`
+        // takes, so an un-sizeable element still refuses loudly there rather than
+        // being guessed at here.
+        HirNodeId const elemSize = track(
+            builder.makeSizeOf(track(builder.makeTypeRef(elem), node), sizeType,
+                               HirFlags::Synthetic),
+            node);
+        HirNodeId const total =
+            product.valid()
+                ? track(builder.makeBinaryOp(HirOpKind::Mul, product, elemSize,
+                                             sizeType, HirFlags::Synthetic),
+                        node)
+                : elemSize;
+        return {total, sizeType};
+    }
+
     // FC6: `sizeof ( type-name )` | `sizeof unary-expression` → core
     // `HirKind::SizeOf`, result type size_t (U64). The grammar's speculative
     // `sizeofExpr` wraps the chosen form (`sizeofType` = `sizeof ( castTypeRef )`,
@@ -8196,7 +8421,9 @@ struct Lowerer {
     // semantic-stamped TYPE being sized, which `resolveStampedTypeBelow` recovers
     // by descending past the (unstamped) sizeof wrappers. The operand is
     // UNEVALUATED (C 6.5.3.4) — only its type reaches the node; the SizeOf folds to
-    // that type's byte size via the `type_layout` engine at MIR lowering.
+    // that type's byte size via the `type_layout` engine at MIR lowering. The ONE
+    // documented exception is a VLA TYPE-NAME operand (C 6.5.3.4p2), which
+    // `lowerVlaTypeNameSizeof` takes instead — see [[D-CSUBSET-VLA-SIZEOF-TYPEFORM]].
     [[nodiscard]] E lowerSizeof(NodeId node) {
         // The SIZED type lives on the OPERAND (the castTypeRef for `sizeof(T)`, the
         // unary-expr for `sizeof e`), which sits BELOW the form node that semantic
@@ -8241,11 +8468,25 @@ struct Lowerer {
                 return exprError(node, "sizeof operand did not resolve to a type");
             }
         }
-        HirNodeId const tref = track(builder.makeTypeRef(sized), node);
         // D-LANG-TYPE-IDENTITY-VOCABULARY: C's `size_t` — the NAMED entry the
         // language declares for this data model, matching the semantic tier's
         // stamp on the SAME node exactly.
         TypeId const u64 = synthesizedType(sem.sizeofResultType, TypeKind::U64);
+        // [[D-CSUBSET-VLA-SIZEOF-TYPEFORM]] part (1): a VLA TYPE-NAME operand
+        // (`sizeof(int[n])`) is the one `sizeof` whose operand C 6.5.3.4p2
+        // EVALUATES, so it lowers to fresh arithmetic over its bounds rather than
+        // to a `SizeOf` node whose VLA TypeRef has already lost `n` (see the
+        // helper). TYPE form only — the VALUE form's `sizeof a` on a VLA OBJECT is
+        // the frozen-at-decl question below, and must NOT be re-evaluated. A shape
+        // the helper declines (invalid id) falls through to the static path, which
+        // keeps refusing loudly.
+        if (!valueForm
+            && (interner.isVlaArray(sized) || interner.typeContainsVla(sized))) {
+            if (E const vlaSize = lowerVlaTypeNameSizeof(node, scan, sized, u64);
+                vlaSize.id.valid())
+                return vlaSize;
+        }
+        HirNodeId const tref = track(builder.makeTypeRef(sized), node);
         HirNodeId const so = track(builder.makeSizeOf(tref, u64), node);
         // VLA C2/C3 (D-CSUBSET-VLA): for a VLA-OBJECT operand, `sizeof a` (and the C3
         // ROW form `sizeof a[0]`) is a RUNTIME value (the size frozen at a's decl,
@@ -8833,10 +9074,13 @@ struct Lowerer {
             NodeId const typeRefN = ckids[crow->typeChild];
             if (!typeRefN.valid()) return std::nullopt;
             TypeId const ty = resolveStampedTypeBelow(typeRefN);
-            return classifyCstCastTarget(interner, ty);
+            return classifyCstCastTarget(interner, ty, charIsUnsigned_);
         };
         EvalOptions options;
         options.allowFloat = true;
+        // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the same answer the semantic
+        // tier folded with — one fact, both tiers.
+        options.charIsUnsigned = charIsUnsigned_;
         ConstEvalResult const r = evaluateConstantCst(exprNode, ctx, env, options);
         if (!r.value.has_value()) return std::nullopt;
         return asInt64Bridge(*r.value);

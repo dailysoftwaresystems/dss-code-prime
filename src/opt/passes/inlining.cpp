@@ -450,8 +450,16 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // presence triggers) into a caller that may not expect a shifting SP is
             // fragile, and its per-function scopeIds would collide on a twice-inlined
             // callee. Fail-SAFE (forgoes the optimization, never miscompiles) —
-            // exactly the SEH rationale above. VLA functions are leaves and rare, so
-            // the cost is ~nil.
+            // exactly the SEH rationale above.
+            // ⚠ THE COST SENTENCE HERE USED TO READ "VLA functions are leaves and rare,
+            // so the cost is ~nil", and P59 made its first clause FALSE: the non-leaf
+            // VLA frame model shipped on 2026-09-04 and a VLA function may now CALL
+            // (D-CSUBSET-VLA-NONLEAF-CALL-FRAME, CLOSED), so a VLA function is a
+            // perfectly ordinary inlining CANDIDATE and can also be a CALLER. The
+            // refusal itself is unaffected and still fail-SAFE — it forgoes the
+            // optimization and never miscompiles — but the cost is no longer
+            // self-evidently ~nil, and nobody has re-measured it. If this refusal is
+            // ever worth lifting, measure the cost first rather than quoting this line.
             if (op == MirOpcode::StackSave || op == MirOpcode::StackRestore) {
                 return std::nullopt;
             }

@@ -449,6 +449,26 @@ struct CompileOptions {
 
     DiagnosticBudget diagBudget;
 
+    // ── [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: PLAIN `char`'s SIGN, FOR
+    //    THIS (target x object format) ─────────────────────────────────────────
+    // `TargetSchema::charIsUnsigned(ObjectFormatKind)` -- the ONE accessor, on
+    // the ONE owner, with the format kind REQUIRED so no caller can take the
+    // processor half alone (the same arm64 CPU is unsigned under GNU/Linux and
+    // signed under Darwin). Resolved once by the driver, per target spec, and
+    // relayed from here; NEVER re-derived downstream.
+    //
+    // It rides `CompileOptions` rather than a parameter because its consumer is
+    // the MIR OPTIMIZER, which carries neither a target nor a format of its own
+    // -- the very reason the row this closes calls an `EvalOptions`-only fix a
+    // half-measure. `optimizeModule` reads it here and hands it to
+    // `opt::optimize` -> `ConstFold`, where `intKindInfo`'s `Char` row lives.
+    //
+    // ⚠ `nullopt` MEANS "NOT SUPPLIED" AND NOT "SIGNED": a `char`-typed fold
+    // then refuses (the instruction is copied verbatim -- a missed fold, never a
+    // wrong constant). A `false` default would have been right on three shipped
+    // legs and a silent wrong answer on the fourth.
+    std::optional<bool> charIsUnsigned{};
+
     // Selects the default optimizer pipeline when `pipelineOverride`
     // is null. Resolved via `resolvePipelineName` (a constexpr table
     // indexed by ordinal — NO `if (config == Release)` branches per

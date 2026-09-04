@@ -179,6 +179,21 @@ struct CstCastTarget {
     // wrap. See the `intBits == 128` arm in cst_const_eval.cpp's Cast fold.
     int    intBits   = 0;
     bool   intSigned = false;
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: TRUE when the target is plain
+    // `char` and no answer for its signedness was supplied, so `intSigned` above
+    // is a placeholder rather than a fact. C 6.2.5p15 leaves plain `char`'s sign
+    // implementation-defined; the TARGET declares it, and a caller with no target
+    // (the LSP, the FFI header parser, a direct-API test) genuinely does not know.
+    //
+    // ★ IT IS A FLAG AND NOT A REFUSAL BECAUSE THE QUESTION IS VALUE-SCOPED. A
+    // cast whose truncated byte has its high bit CLEAR — `(char)300` is 44 — is
+    // the SAME integer under both readings, so refusing it would deny an answer
+    // that is not in doubt (and would break every target-less const-expr that
+    // casts to `char`, which is most of them). The Cast fold therefore refuses
+    // exactly when the low byte's sign bit is set, which is the identical rule
+    // `narrowCharConstantSignednessMatters` applies to a character constant —
+    // one predicate, both sites.
+    bool   intSignednessUnknown = false;
     TypeId pointeeType{};       // a pointer target's pointee (retype / future stride)
     // C4b (D-CSUBSET-BITINT-CONSTFOLD-LARGE): a `(_BitInt(N))expr` cast target — the
     // engine folds it via the bignum `convertTo(bitWidth, bitSigned)` (mod-2^N wrap),
@@ -213,9 +228,21 @@ using CstCastTargetResolver = std::function<std::optional<CstCastTarget>(NodeId)
 //
 // nullopt for a target the const-expr surface has no fold for (an aggregate, a
 // function type, `void`) ⇒ the cast is non-foldable and the caller fails loud.
+//
+// ⚠ [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: `charIsUnsigned` is the ACTIVE
+// (target × object format)'s answer for plain `char`, from the one accessor
+// `TargetSchema::charIsUnsigned(ObjectFormatKind)`. It is REQUIRED and not
+// defaulted because this classifier is where a `(char)` cast target gets its
+// (width, signedness), and that row used to read `{8, SIGNED}` unconditionally —
+// ✔MEASURED silently wrong on `arm64:elf64-aarch64-linux-exec`, where
+// `int a[((char)200 == -56) ? 1 : 2]` built a ONE-element array in DSS (rc 0, no
+// diagnostics) against a two-element array on aarch64-linux-gnu-gcc 13.3.0.
+// `nullopt` ⇒ a `char`-targeted cast is NOT classifiable ⇒ non-foldable ⇒ the
+// caller fails loud, which is the only safe answer without the target.
 class TypeInterner;
 [[nodiscard]] DSS_EXPORT std::optional<CstCastTarget>
-classifyCstCastTarget(TypeInterner const& interner, TypeId ty);
+classifyCstCastTarget(TypeInterner const& interner, TypeId ty,
+                      std::optional<bool> charIsUnsigned);
 
 // c43: field-offset resolver — given a struct/union CONTAINER TypeId + a field-name
 // token, return the field's {byteOffset, fieldType}, or nullopt (unknown field /

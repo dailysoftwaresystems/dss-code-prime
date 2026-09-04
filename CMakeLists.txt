@@ -936,6 +936,45 @@ if(DSS_BUILD_TESTS)
                 "${CMAKE_SOURCE_DIR}/scripts/check-retyped-closed-sets/check-retyped-closed-sets.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+    # ── `check-doc-census` — registered 2026-09-04 (P59), and it closes
+    # D-DOCS-STATUS-CLAIMS-DRIFT-UNCHECKED, whose closing work asked for "the
+    # cheapest durable check" for prose that goes false while nobody re-reads it.
+    #
+    # ⚠⚠ THE INSTRUMENT IT COMPLETES ALREADY EXISTED, WHICH IS THE WHOLE POINT.
+    # `scripts/examples-census/examples-census.py` was written on 2026-08-24 to
+    # stop the corpus figures being hand-counted, and its PURPOSE line says it
+    # re-derives "every corpus-manifest figure examples/README.md states". It
+    # worked; the numbers rotted anyway. ✔MEASURED 2026-09-04 the first time this
+    # guard was pointed at that file: **25 of 28** documented figures were wrong
+    # (634 manifests stated against 788), and one had INVERTED rather than
+    # drifted ("0 declare it false" against six that do).
+    # ⇒ The missing half was never the DERIVATION, it was the COMPARISON. A
+    # census somebody must remember to run and then hand-transcribe is a document
+    # with extra steps.
+    #
+    # ★ The claims are declared BY THE DOCUMENT (`<!--census:examples:<key>-->`
+    # markers), never listed in the guard — a guard holding its own table of "the
+    # figures in the README" would be a third copy of the same fact and would rot
+    # exactly like the first two. Adding a checked figure needs no change here.
+    add_test(
+        NAME doc_census_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-doc-census/check-doc-census.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # ★ And its self-test, for the reason the three entries below carry: a
+    # self-test behind a flag nobody types is not a test
+    # (D-GATE-TWO-GUARDS-SELF-TEST-BEHIND-A-FLAG-NOBODY-PASSES). Every arm is a
+    # REFUSAL plus a CONTROL that must stay green, and each was proven able to
+    # fail by deleting the refusal it aims at — including both directions of the
+    # `.worktrees/` exclusion, which would otherwise be free to widen until it
+    # swallowed the live tree.
+    add_test(
+        NAME doc_census_selftest_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-doc-census/check-doc-census.py"
+                --selftest
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
     # ★ `check-anchor-balance` needs a BASE REF to compare against, so its
     # ordinary form cannot be a ctest entry — a cycle supplies that ref. Its
     # `--self-test` has no such obstacle: it runs its whole case set over the
@@ -1284,8 +1323,14 @@ endif()
 # OPERATOR RULING 2026-08-25: *"the root is whichever the host is using you (claude). every
 # indirect leg (wsl, vps, macos, whatever), do not need guards!"* A repo guard checks the
 # SOURCE TREE, and the tree is byte-identical on every leg, so a second host re-checking it
-# learns nothing while paying the most expensive entries in the suite -- ✔MEASURED 18
-# entries / 159.1 s on Windows, and on macOS the three biggest had not finished after 367 s.
+# learns nothing while paying the most expensive entries in the suite -- ✔MEASURED (P29-era,
+# at 18 entries) 159.1 s on Windows, and on macOS the three biggest had not finished after
+# 367 s. ⚠ THE COUNT IS NOT 18 ANY MORE AND IS NOT QUOTED HERE ON PURPOSE: the block below
+# PRINTS it at configure time (`repo-guard label applied to N test(s)`), which is the figure
+# to read, and `ctest -N -L repo-guard` is how to check it. A count typed into a comment is a
+# measurement with no instrument attached, and this one had already gone stale by eight
+# entries before anyone noticed -- the same rot `scripts/check-doc-census/` now refuses for
+# every corpus figure `examples/README.md` states.
 #
 # ⚠ THE SCAN IS OVER TESTS THAT ACTUALLY EXIST, not a hand-kept list. `set_tests_properties`
 # on a name some `if(WIN32)` branch did not define is a hard CMake error, so a hand-kept list

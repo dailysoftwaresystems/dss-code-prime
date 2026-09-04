@@ -88,6 +88,7 @@
 #include "core/types/semantic_config.hpp"
 #include "core/types/source_buffer.hpp"
 
+#include "test_support/repo_root.hpp"
 #include "test_support/scratch_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -124,6 +125,26 @@ namespace fs = std::filesystem;
         return *loaded;
     }();
     return schema;
+}
+
+// The shipped `c` document's TEXT, for the config-mutant arm below. Reached
+// through the ONE test-side resolver (`repo_root.hpp`), never a private cwd
+// walk — [[D-TEST-HELPERS-IGNORE-DSS-CONFIG-ROOT-OUT-OF-TREE]] cost 28 ctest
+// entries to the seventeen files that each had their own.
+[[nodiscard]] std::string shippedCText() {
+    auto const root = dss::test::findConfigRoot();
+    if (!root) {
+        ADD_FAILURE() << dss::test::configRootDiagnostic();
+        return {};
+    }
+    fs::path const cand = *root / "sources" / "c.lang.json";
+    std::ifstream in(cand, std::ios::binary);
+    if (!in) {
+        ADD_FAILURE() << "cannot read the shipped c config: " << cand.string();
+        return {};
+    }
+    return std::string(std::istreambuf_iterator<char>(in),
+                       std::istreambuf_iterator<char>());
 }
 
 [[nodiscard]] PreprocessResult pp(std::string text) {
@@ -190,8 +211,29 @@ constexpr std::string_view kExtensionFour[] = {
 // copy of the config ([[D-CONFIG-COMMENT-CLAIM-ROT]]): the day a cycle declares
 // `__has_attribute` in `c.lang.json`, the arms below keep asserting the
 // INVARIANT instead of going stale on a hardcoded expectation.
+//
+// ★★★ AND THAT DAY CAME — P59 shipped all four, and the predicate this reads
+// MOVED, which is precisely the event the paragraph above was written for.
+// `isImplementationProvidedOperator` is the VISIBILITY question alone;
+// `isConditionalInclusionOperator` (still used by arm 4 below) is the narrower
+// C23 6.10.10p2 RESERVED set. Bundling the two is the mistake this file's
+// header warns about at length, and separating them is what let the four ship
+// without breaking the portable `#ifndef` shim.
 [[nodiscard]] bool languageDeclaresOperator(std::string_view name) {
+    return isImplementationProvidedOperator(name, cSchema()->preprocess());
+}
+
+// The C23 6.10.10p2 RESERVED subset — the names whose `#define`/`#undef` the
+// standard makes implementation business. Distinct from the predicate above on
+// purpose; see arm 4.
+[[nodiscard]] bool languageReservesOperator(std::string_view name) {
     return isConditionalInclusionOperator(name, cSchema()->preprocess());
+}
+
+// The declared feature-query operator for `name`, or null.
+[[nodiscard]] FeatureQueryOperatorDef const* declaredFeatureQuery(
+    std::string_view name) {
+    return findFeatureQueryOperator(name, cSchema()->preprocess());
 }
 
 // Does the language declare a BUILTIN FUNCTION by this name? This is the truth
@@ -268,41 +310,63 @@ TEST(FeatureQueryOperators, NameIsIfdefVisibleExactlyWhenTheOperatorIsDeclared) 
     }
 }
 
-// ── 2. THE SHIM STILL INSTALLS FOR THE FOUR THIS ROW COVERS ──────────────────
+// ── 2. THE SHIM IS NOW DEAD CODE, AND THAT IS THE WHOLE IDIOM WORKING ────────
 //
-// ★★★ THE TRIPWIRE. Adding these four to `isConditionalInclusionOperator`
-// without implementing the operator makes `#ifndef` false, skips the `#define`,
-// and leaves `#if __has_attribute(x)` as `0(0)` — a preprocessor syntax error in
-// a header included by essentially every macOS TU. This arm goes red the moment
-// that happens, and the assertion text says what to do instead.
-TEST(FeatureQueryOperators, ThePortableShimStillInstallsForTheExtensionFour) {
+// ★★★ THE TRIPWIRE, AND ITS POLARITY IS THE POINT. When this arm was written the
+// four operators were absent, so the shim INSTALLED and answered 0. P59 shipped
+// them, so `#ifndef X` is now FALSE, the shim's `#define` never executes, and
+// the REAL operator answers — which is exactly what the `#ifndef` guard is for
+// and exactly what gcc 13.3.0 / gcc 13.2.0 (mingw) / clang 18.1.3 do.
+//
+// The invariant the arm pins did NOT change: the shim must never SHADOW an
+// operator the implementation provides. What changed is which mechanism
+// delivers it — the guard, instead of the operator's absence. Both readings end
+// at `took_fallback` for an argument nothing declares, so this arm was green
+// before AND after; the assertions below are what make it non-vacuous, by
+// pinning WHICH of the two produced the answer.
+TEST(FeatureQueryOperators, ThePortableShimIsDeadCodeForTheExtensionFour) {
     for (std::string_view op : kExtensionFour) {
+        ASSERT_NE(declaredFeatureQuery(op), nullptr)
+            << op
+            << " is no longer a declared feature-query operator. That is a real "
+               "capability change, not a test-maintenance chore: this arm now "
+               "asserts the shim is DEAD, which is only true of a compiler that "
+               "HAS the operator.";
+        // The shim's guard must be FALSE — measured by whether its `#define`
+        // executed, not by inspecting config.
+        PreprocessResult const guard = pp(
+            "#ifndef " + std::string{op} + "\nint shim_installed;\n"
+            "#else\nint shim_dead;\n#endif\n");
+        EXPECT_TRUE(sawLexeme(guard, "shim_dead"))
+            << op
+            << ": `#ifndef` must be FALSE. A compiler that implements the "
+               "operator but leaves the name invisible to `#ifdef` lets the "
+               "world's most common portability shim SHADOW its own operator "
+               "with a function-like macro answering 0 forever — the TF-C86 "
+               "F001A cascade, one operator over.";
+
         PreprocessResult const r = pp(
             shimFor(op) + "#if " + std::string{op} + "(anything_at_all)\n"
             "int took_query;\n#else\nint took_fallback;\n#endif\n");
         EXPECT_FALSE(r.diagnostics->hasErrors())
             << op
             << ": the `#ifndef X / #define X(x) 0 / #endif` shim is the idiom "
-               "every portable header ships, and a compiler that neither "
-               "implements the operator NOR lets the shim install cannot "
-               "preprocess those headers at all. ✔MEASURED: gcc 13.3.0, gcc "
-               "13.2.0 (mingw), clang 18.1.3 and cl 19.51.36252 all accept "
-               "this whole shape, rc 0.";
+               "every portable header ships, and it must preprocess cleanly "
+               "whether or not this implementation has the operator. "
+               "✔MEASURED: gcc 13.3.0, gcc 13.2.0 (mingw), clang 18.1.3 and "
+               "cl 19.51.36252 all accept this whole shape, rc 0.";
         EXPECT_FALSE(hasCode(
             r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
             << op
             << ": this name is NOT one C23 6.10.10p2 reserves — that clause "
                "names `defined`, `__has_c_attribute`, `__has_include` and "
-               "`__has_embed`, and no others. Refusing the shim's `#define` "
-               "here diverges from all four references AND breaks the header. "
-               "If a cycle is implementing the operator, give it its own "
-               "declaration; do NOT add it to isConditionalInclusionOperator, "
-               "whose second property (non-definability) does not apply.";
+               "`__has_embed`, and no others. The refusal code belongs to "
+               "`defined` alone; see arm 4.";
         EXPECT_TRUE(sawLexeme(r, "took_fallback"))
             << op
-            << ": with the operator unimplemented the shim answers 0, so the "
-               "FALLBACK arm is the taken one — which is exactly what gcc "
-               "13.3.0 and cl 19.51.36252 do on the same source.";
+            << ": `anything_at_all` is declared by nothing, so the REAL "
+               "operator answers 0 and the fallback arm is taken — the same "
+               "answer the shim used to give, now for the right reason.";
     }
 }
 
@@ -380,53 +444,122 @@ TEST(FeatureQueryOperators, AnUndeclaredCapabilityAnswersZeroNotOne) {
     }
 }
 
-// ── 4. THE #define REFUSAL COVERS EXACTLY THE IDENTIFIERS C23 RESERVES ───────
+// ── 4. NO NAME ON THE ROSTER IS REFUSED, AND A DIAGNOSED ONE IS APPLIED ──────
 //
-// The CONTROL half of arm 2, and it is what makes that arm non-vacuous: if the
-// refusal did not exist at all, "the shim installs" would pass for a reason that
-// has nothing to do with this row. Here the ISO trio must still be refused and
-// this row's four must not be.
-TEST(FeatureQueryOperators, TheDefineRefusalCoversExactlyTheIsoReservedNames) {
+// ★★★ REVERSED BY OPERATOR RULING 2026-09-03, and the reversal is the row. This
+// arm used to assert that the C23 6.10.10p2 trio was REFUSED at Error. The
+// ruling: *"we must accept too. best long term solution, no workaround, first
+// class implementation, 100% config driven. leave nothing to be done."*
+//
+// ✔MEASURED 2026-09-04, each reference invoked SEPARATELY, WITH A CONTROL that
+// proves the untouched operator answers 1 for the same local header (without it
+// a 0 is equally consistent with the header simply not being found — which is
+// exactly what MSVC's answer looked like until the control was run):
+//
+//   shape                          gcc 13.3.0  gcc 13.2.0  clang 18.1.3  cl 19.51
+//   `#define __has_include(x) 0`   warn, rc 0  warn, rc 0  warn, rc 0   silent, rc 0
+//     ...and APPLIED                  yes         yes         yes          yes
+//   `#undef __has_include`         warn, rc 0  warn, rc 0  warn, rc 0   silent, rc 0
+//     ...and APPLIED                  yes         yes         yes          NO
+//
+// So ACCEPTANCE is unanimous and the disjunction forbids refusing; on the
+// `#undef`'s MEANING the split is 3-1 and DSS follows the three, because MSVC's
+// alternative silently discards code the author wrote.
+//
+// ★★ TWO PROPERTIES, TWO PREDICATES, AND KEEPING THEM APART IS THE FIX. The
+// C23-RESERVED set (`languageReservesOperator`) still decides whether a
+// DIAGNOSTIC is owed; the PROVIDED set (`languageDeclaresOperator`) decides
+// `#ifdef` visibility. Neither decides refusal any more — that is config data,
+// and the only name it still refuses is `defined`, which is not on this roster.
+TEST(FeatureQueryOperators, NoRosterNameIsRefusedAndADiagnosedOneIsApplied) {
     for (std::string_view op : kRoster) {
-        bool const reserved = languageDeclaresOperator(op);
+        bool const reserved = languageReservesOperator(op);
+        bool const provided = languageDeclaresOperator(op);
         {
+            // An OBJECT-like definition, so the definition's EFFECT is
+            // observable as a lexeme. A function-like `(x) 0` would be applied
+            // just as truly but would leave nothing to read.
             PreprocessResult const r =
-                pp("#define " + std::string{op} + "(x) 0\nint v;\n");
-            EXPECT_EQ(hasCode(r,
-                          DiagnosticCode::P_PreprocessorOperatorNameNotDefinable),
-                      reserved)
+                pp("#define " + std::string{op} + " 5\nint v = "
+                   + std::string{op} + ";\n");
+            EXPECT_FALSE(hasCode(
+                r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
                 << "#define " << op
-                << ": the refusal belongs to the C23 6.10.10p2 identifiers "
-                   "alone — `defined`, `__has_c_attribute`, `__has_include`, "
-                   "`__has_embed` — which in this language are exactly the "
-                   "DECLARED conditional-inclusion operators. ✔MEASURED, all "
-                   "four references ACCEPT this #define for EVERY name on the "
-                   "roster (rc 0, at most a warning), so DSS's refusal is "
-                   "standard-backed for the reserved names and would be a bare "
-                   "divergence for any other.";
-            if (reserved) {
-                EXPECT_EQ(codeSeverity(
-                              r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable),
-                          std::optional<DiagnosticSeverity>{DiagnosticSeverity::Error})
-                    << op
-                    << ": refusing must stay an ERROR — honouring the "
-                       "redefinition would let `#include <h>` and "
-                       "`__has_include(<h>)` disagree inside one file.";
-            } else {
-                EXPECT_FALSE(r.diagnostics->hasErrors())
-                    << "#define " << op
-                    << " must be ACCEPTED: it is not a reserved identifier and "
-                       "every reference accepts it.";
-            }
+                << ": NOTHING on this roster is refused any more. All four "
+                   "references accept it, and the refusal code now has exactly "
+                   "one client — `defined` — which is the one its name is true "
+                   "about (C23 6.10.2 makes `defined` an operator inside `#if`, "
+                   "so admitting it as a macro name makes conditional inclusion "
+                   "unparseable).";
+            EXPECT_FALSE(r.diagnostics->hasErrors()) << "#define " << op;
+            EXPECT_EQ(codeSeverity(r,
+                                   DiagnosticCode::P_PreprocessorPredefinedMacro)
+                              .has_value(),
+                      reserved || provided)
+                << "#define " << op
+                << ": accepted, but NEVER in silence for a name this "
+                   "implementation OWNS. A name it does not own is an ordinary "
+                   "macro and draws nothing, which is what every reference does.";
+            auto const lexs = lexemesOf(r);
+            ASSERT_EQ(lexs.size(), 5u) << op << " — expected: int v = 5 ;";
+            EXPECT_EQ(lexs[3], "5")
+                << op
+                << ": the definition must be APPLIED. Accepting and IGNORING is "
+                   "a silent wrong answer — it is what cl does to the `#undef` "
+                   "half, and it is the one failure class this project refuses "
+                   "outright.";
         }
         {
             PreprocessResult const r =
-                pp("#undef " + std::string{op} + "\nint v;\n");
-            EXPECT_EQ(hasCode(r,
-                          DiagnosticCode::P_PreprocessorOperatorNameNotDefinable),
-                      reserved)
-                << "#undef " << op << ": same clause, same set.";
+                pp("#undef " + std::string{op} + "\n"
+                   "#ifdef " + std::string{op} + "\nint still_here;\n"
+                   "#else\nint gone;\n#endif\n");
+            EXPECT_FALSE(hasCode(
+                r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+                << "#undef " << op << ": same ruling, same set.";
+            EXPECT_FALSE(r.diagnostics->hasErrors()) << "#undef " << op;
+            EXPECT_TRUE(sawLexeme(r, "gone"))
+                << op
+                << ": the `#undef` must TAKE EFFECT. An operator lives in the "
+                   "CONFIG rather than the macro table, so nothing the ordinary "
+                   "`#undef` path does can reach it — this assertion is what "
+                   "proves the engine records the revocation instead of warning "
+                   "and changing nothing.";
         }
+    }
+}
+
+// ── 4b. THE ONE NAME STILL REFUSED, AND ITS SEVERITY IS CONFIG DATA ──────────
+//
+// The CONTROL half of arm 4: if no name were refused at all, "nothing on the
+// roster is refused" would pass for a reason that has nothing to do with this
+// row. `defined` is deliberately NOT on the roster (it is an operator SPELLING,
+// not a macro name — ✔MEASURED, `#ifdef defined` is not taken on any of the
+// four references), so it is the honest control.
+//
+// ⚠ AND THIS REFUSAL IS NEW, NOT PRESERVED. ✔MEASURED at this row's base commit
+// b1f31420 through the shipped CLI: `#define defined 1` compiled rc 0 in
+// SILENCE, while gcc 13.3.0, gcc 13.2.0 (mingw) and clang 18.1.3 all make it a
+// hard ERROR (rc 1). `isConditionalInclusionOperator` deliberately excluded
+// `definedOperator` and no other arm covered it — while `preprocess_config.hpp`
+// asserted in a comment that "that refusal lives in the conditional-inclusion-
+// operator guard". A comment claiming a guard that did not exist.
+TEST(FeatureQueryOperators, TheDefinedOperatorIsTheOnlyNameStillRefused) {
+    std::string const& definedKw = cSchema()->preprocess().definedOperator;
+    ASSERT_FALSE(definedKw.empty());
+    ASSERT_FALSE(languageDeclaresOperator(definedKw))
+        << "`defined` must NOT be `#ifdef`-visible — it is an operator "
+           "spelling, not a macro name, and all four references agree";
+    for (std::string const& src : {"#define " + definedKw + " 1\nint v;\n",
+                                   "#undef " + definedKw + "\nint v;\n"}) {
+        PreprocessResult const r = pp(src);
+        EXPECT_EQ(codeSeverity(
+                      r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Error})
+            << "3 of 4 references make this a hard error, and the fourth "
+               "accepts-then-ignores it (cl's C4117), which is the silent-drop "
+               "failure class that does not get to be the model:\n"
+            << src;
     }
 }
 
@@ -450,32 +583,152 @@ TEST(FeatureQueryOperators, TheDefineRefusalCoversExactlyTheIsoReservedNames) {
 // trailing tokens with C4067. That 3-1 accept-vs-refuse split is the subject of
 // [[D-PP-IF-OPERAND-PARSE-NO-SHORTCIRCUIT]], not of this row, and this arm pins
 // only that DSS does not go SILENT.
-TEST(FeatureQueryOperators, AnUnshimmedQueryFailsLoudRatherThanSilentlyZero) {
-    for (std::string_view op : kExtensionFour) {
+// ★★★ REVERSED BY THE 2026-09-03 RULING: the four ARE implemented now, so an
+// UNSHIMMED query must ANSWER rather than refuse. What the arm still forbids is
+// SILENCE OF THE OTHER KIND — an operator this implementation does NOT have,
+// invoked unshimmed, must still fail loud. Both halves are asserted here,
+// because "it answers" and "an unknown operator still refuses" are two claims
+// and a cycle can ship one while breaking the other.
+TEST(FeatureQueryOperators, AnUnshimmedQueryAnswersAndAnUnknownOperatorStillFailsLoud) {
+    // (a) THE FOUR ANSWER, UNSHIMMED, FROM THE DECLARED TRUTH SETS.
+    struct Arm { std::string_view op, arg; bool want; char const* why; };
+    const Arm arms[] = {
+        {"__has_attribute", "deprecated", true,
+         "`deprecated` is declared in semantics.attributeSemantics.effects AND "
+         "in preprocess.knownCAttributes. ✔MEASURED: gcc 13.3.0, gcc 13.2.0 "
+         "(mingw) and clang 18.1.3 all answer 1."},
+        {"__has_attribute", kAbsentAttribute, false,
+         "the CONTROL: an attribute nothing declares. All three implementing "
+         "references answer 0, silently."},
+        {"__has_builtin", "__builtin_popcount", true,
+         "declared in semantics.builtinFunctions — the truth set the answer is "
+         "READ FROM rather than a second copy of."},
+        {"__has_builtin", "__builtin_offsetof", true,
+         "declared as a grammar KEYWORD rather than a builtinFunctions row "
+         "(it is an operator wearing a call's punctuation), and reachable "
+         "through preprocess.builtinQueryKeywordTokens. ✔MEASURED: all three "
+         "implementing references answer 1, so a 0 here would be a WRONG answer "
+         "about a builtin DSS demonstrably has, not a conservative one."},
+        {"__has_builtin", kAbsentBuiltin, false,
+         "the CONTROL: a clang target-introspection builtin DSS does not have."},
+        {"__has_feature", "c_static_assert", true,
+         "declared in preprocess.languageFeatures, and the declaration is "
+         "backed by a compiled-and-run witness. ✔MEASURED: clang 18.1.3 answers "
+         "1 in c17/c2x; gcc has no such operator at all."},
+        {"__has_feature", kAbsentFeature, false,
+         "the CONTROL: arm64e pointer authentication. "
+         "src/dss-config/shippedLibs/malloc/malloc.json is the one real "
+         "Apple-SDK site in this tree and 0 is the RIGHT answer there — 1 would "
+         "be a false ABI."},
+        {"__has_extension", "c_static_assert", true,
+         "__has_extension is a strict SUPERSET of __has_feature. ✔MEASURED on "
+         "clang 18.1.3, the only reference that implements the pair: in c89 "
+         "__has_feature answers 0 for all six C features while __has_extension "
+         "still answers 1."},
+        {"__has_extension", "dss_no_such_extension_exists", false,
+         "the CONTROL: a name nothing declares."},
+    };
+    for (Arm const& a : arms) {
+        PreprocessResult const r = pp(
+            "#if " + std::string{a.op} + "(" + std::string{a.arg} + ")\n"
+            "int answered_nonzero;\n#else\nint answered_zero;\n#endif\n");
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << a.op << "(" << a.arg
+            << ") UNSHIMMED must be answerable — the operator is implemented, "
+               "and an unknown ARGUMENT is a 0, never an error, on every "
+               "reference that has the operator.";
+        EXPECT_EQ(sawLexeme(r, "answered_nonzero"), a.want)
+            << a.op << "(" << a.arg << "): " << a.why;
+        EXPECT_EQ(sawLexeme(r, "answered_zero"), !a.want) << a.op;
+    }
+
+    // (b) AN OPERATOR THIS IMPLEMENTATION DOES NOT HAVE STILL FAILS LOUD.
+    // ⚠ 0 is an ANSWER. Answering it for an operator DSS does not recognise is
+    // the same lie as answering 1 for a capability it does not have: it is a
+    // CLAIM ("I checked, and no") where an error is an admission ("I do not
+    // know this operator"). ✔MEASURED: gcc 13.3.0, gcc 13.2.0 (mingw) and clang
+    // 18.1.3 all REFUSE an unknown function-like query in `#if`; cl 19.51
+    // accepts it, folding to 0 and DROPPING the trailing tokens with C4067.
+    // That 3-1 accept-vs-refuse split is
+    // [[D-PP-IF-OPERAND-PARSE-NO-SHORTCIRCUIT]]'s subject, not this row's, and
+    // this half pins only that DSS does not go SILENT.
+    for (std::string_view op :
+         {"__has_warning", "__is_identifier", "__has_declspec_attribute"}) {
+        ASSERT_EQ(declaredFeatureQuery(op), nullptr)
+            << op << " became a declared operator; pick one that is still absent";
         PreprocessResult const r = pp(
             "#if " + std::string{op} + "(cold)\nint took_query;\n"
             "#else\nint took_fallback;\n#endif\n");
         EXPECT_TRUE(r.diagnostics->hasErrors())
             << op
-            << " UNSHIMMED went quiet. A query this implementation does not "
-               "recognise must never be answered silently: 0 is an ANSWER, and "
-               "answering it for an operator DSS does not have is the same lie "
-               "as answering 1 for a capability it does not have. Matching gcc "
-               "13.3.0, gcc 13.2.0 (mingw) and clang 18.1.3, which all refuse "
-               "an unknown function-like query in `#if`.";
+            << " UNSHIMMED went quiet. Whatever a later cycle does here, it "
+               "must not be an unannounced 0.";
         EXPECT_EQ(codeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
                   std::optional<DiagnosticSeverity>{DiagnosticSeverity::Error})
-            << op
-            << ": the refusal is the `#if` operand diagnostic, at Error.\n"
-               "⚠ IF YOU ARE HERE BECAUSE A CYCLE ADOPTED MSVC's ACCEPTANCE of "
-               "an unknown function-like query in `#if`, that is "
-               "[[D-PP-IF-OPERAND-PARSE-NO-SHORTCIRCUIT]]'s decision to make and "
-               "this arm is SUPPOSED to make you come and change it — but change "
-               "it to something that still forbids SILENCE. Whatever replaces "
-               "the error must not be an unannounced 0: a query this "
-               "implementation does not recognise, answered 0 with nothing "
-               "said, is indistinguishable from one it checked.";
+            << op << ": the refusal is the `#if` operand diagnostic, at Error.";
     }
+}
+
+// ── 5b. THE ANSWER SET IS THE CONFIG'S, NOT THE ENGINE'S ────────────────────
+//
+// ★★★ THE ARM THE ROW'S "100% CONFIG DRIVEN" CLAUSE RESTS ON, and it is
+// REMOVE-direction on purpose ([[feedback-a-fixture-must-synthesize-the-negative]]):
+// the mutant takes a capability AWAY from a config that has it. An
+// ADD-direction fixture — declaring something the shipped config lacks — stays
+// green precisely when the real config loses the feature.
+//
+// RED-ON-DISABLE by construction: if `__has_builtin`'s answer came from a list
+// in `src/` rather than from `semantics.builtinFunctions`, deleting the row
+// would not move the answer and this reds.
+TEST(FeatureQueryOperators, TheBuiltinAnswerFollowsTheDeclaredTruthSet) {
+    // The premise, asserted rather than assumed.
+    ASSERT_TRUE(languageDeclaresBuiltin("__builtin_popcount"))
+        << "the shipped c must declare this builtin; without it the mutant "
+           "below removes nothing and this arm is vacuous";
+
+    std::string text = shippedCText();
+    ASSERT_FALSE(text.empty());
+    constexpr std::string_view kRow =
+        "{ \"name\": \"__builtin_popcount\",";
+    auto const pos = text.find(kRow);
+    ASSERT_NE(pos, std::string::npos)
+        << "the shipped c config no longer carries a `__builtin_popcount` row "
+           "in that spelling; re-point this mutant rather than deleting it";
+    // Rename the ROW's name so the builtin is genuinely absent from the truth
+    // set while the document stays well formed.
+    text.replace(pos, kRow.size(),
+                 "{ \"name\": \"__builtin_popcount_removed_by_test\",");
+
+    auto loaded = GrammarSchema::loadFromText(text, "<no-popcount-c>");
+    ASSERT_TRUE(loaded.has_value()) << "the mutated config must still LOAD — a "
+                                       "load failure would make this arm pass "
+                                       "for the wrong reason";
+    std::shared_ptr<GrammarSchema const> mutant = *loaded;
+
+    std::vector<fs::path> const noDirs;
+    auto runOn = [&](std::shared_ptr<GrammarSchema const> const& s) {
+        auto buf = SourceBuffer::fromString(
+            std::string{"#if __has_builtin(__builtin_popcount)\n"
+                        "int yes;\n#else\nint no;\n#endif\n"},
+            "fq_cfg.c");
+        return preprocess(buf, s, noDirs, kDefaultHeaderNameMatching,
+                          DiagnosticBudget::libraryDefault());
+    };
+
+    PreprocessResult const control = runOn(cSchema());
+    EXPECT_TRUE(sawLexeme(control, "yes"))
+        << "CONTROL: the shipped config declares the builtin, so the operator "
+           "must answer 1. A control that does not stay green makes the mutant "
+           "arm below prove nothing.";
+
+    PreprocessResult const r = runOn(mutant);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_TRUE(sawLexeme(r, "no"))
+        << "with the builtin REMOVED from semantics.builtinFunctions the answer "
+           "must follow it to 0. If this says `yes`, the operator is answering "
+           "from a second list — which is the duplicated-truth-set defect the "
+           "ruling names explicitly, and it goes out of sync the first time a "
+           "builtin is added.";
 }
 
 // ── 6. THE SHIM SURVIVES THE INCLUDE PRE-SCAN ORACLE ────────────────────────

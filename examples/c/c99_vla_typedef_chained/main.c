@@ -28,11 +28,17 @@
 // DISTINCT shape with an intact fail-loud, not a silent wrong size, and admitting it here
 // would have traded that refusal for a guess.
 //
-// main is a LEAF (no calls) — the C1b VLA frame-model scope, exactly as c99_vla_typedef is.
+// ★ LIFTED in P59: main used to be kept a LEAF (no calls) because a VLA-object holder that
+// CALLS was refused (D-CSUBSET-VLA-NONLEAF-CALL-FRAME). It now CALLS `sink` with every
+// chained-alias object still live and re-reads all of them afterwards.
 // `volatile` defeats constant folding so the bound is genuinely runtime. Two witnesses
 // carry the weight: (A) FREEZE-ONCE through the chain, and (B) the multi-dim OFF-DIAGONAL,
 // where c[1][0] and c[0][1] are DISTINCT cells so a wrong runtime row stride would alias or
 // transpose them. Each `return k` is a strict in-program pin; only all-pass reaches 42.
+
+// A wide call target, so main is a NON-LEAF function that also holds VLA objects.
+int sink(int a, int b, int c, int d, int e, int f,
+         int g, int h, int i, int j) { return a+b+c+d+e+f+g+h+i+j; }
 
 int main(void) {
     volatile int vn = 3;
@@ -80,6 +86,15 @@ int main(void) {
     d[1][2] = 77;                  // the far corner
     if (d[1][2] != 77) return 14;
     if (d[1][0] != 55) return 15;  // ... and the far-corner write did not clobber it
+
+    // ★ THE LIFT: a wide CALL with every chained-alias object still live, then all of
+    // them re-read. Ten arguments so the call genuinely writes stack arguments into the
+    // outgoing-args area that travels with SP under the non-leaf VLA frame model.
+    if (sink(1, 2, 3, 4, 5, 6, 7, 8, 9, 10) != 55) return 16;
+    if (a[0] + a[1] + a[2] != 33) return 17;
+    if (b[0] + b[1] + b[2] != 63) return 18;
+    if (c[0] + c[1] + c[2] != 93) return 19;
+    if (d[1][0] != 55 || d[0][1] != 66 || d[1][2] != 77) return 20;
 
     return 42;
 }

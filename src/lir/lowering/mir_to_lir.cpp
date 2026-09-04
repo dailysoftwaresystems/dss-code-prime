@@ -446,7 +446,31 @@ enum class MnemonicSlot : std::uint8_t {
     //     ⚠ FSTP writes the x87 status word, NOT EFLAGS, so the flags FUCOMIP
     //     set survive it — which is why the cleanup may sit between the compare
     //     and the setcc/jcc that reads it (both references emit exactly that).
+    //   Fchs — D9 E0, the bare 0-operand SIGN FLIP added by LD-5
+    //     (D-TARGET-ENCODING-WIDTH-GUARD). ✔MEASURED: gcc 13.3.0 AND clang
+    //     18.1.3, probed separately, both realize `-someLongDouble` on this
+    //     axis as exactly `fld m80; fchs; fstp m80`. FCHS toggles ONLY the sign
+    //     bit — it is not `0.0L - x`, which gets -(+0.0) wrong and mishandles a
+    //     NaN sign — the same IEEE-exactness argument the F64 `fneg_mask`
+    //     sign-mask XOR already makes one tier up.
+    //   FldM32/FldM64 (D9 /0, DD /0) and FstpM32/FstpM64 (D9 /3, DD /3) — the
+    //     NARROWER memory forms of the same load/store pair, added by LD-5 for
+    //     the two float-to-float conversions. The x87 stack converts formats
+    //     BY MOVING THROUGH MEMORY: `fld m32/m64` widens an SSE-resident
+    //     float to the register stack's 80-bit working format, and
+    //     `fstp m32/m64` rounds it back down on the way out. There is no
+    //     register-to-register x87 conversion instruction at all, which is why
+    //     both references spill the xmm to a stack slot first.
+    //   FisttpM64 — DD /1, the 64-bit-integer sibling of FisttpM32. It serves
+    //     BOTH `(long long)ld` (a 64-bit signed result) and `(unsigned)ld`,
+    //     whose full range [0, 2^32) does not fit a signed m32int but fits a
+    //     signed m64int exactly — the low 32 bits of the stored quadword are
+    //     then the unsigned answer. ⓘ Both references reach the same two
+    //     results with `fnstcw`/`fldcw` round-toward-zero bracketing around a
+    //     plain `fistp`; DSS uses FISTTP (SSE3) for the reason the FisttpM32
+    //     row already states — it truncates without touching the control word.
     FldM80, FstpM80, FaddP, FsubP, FmulP, FdivP, FisttpM32, FucomiP, FstpSt0,
+    Fchs, FldM32, FldM64, FstpM32, FstpM64, FisttpM64,
     // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the arm64 GOT-address
     // macro `adrp Xd,:got:sym` + `ldr Xd,[Xd,:got_lo12:sym]` that
     // materializes an undefined-extern's address as a live code-form
@@ -583,6 +607,14 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     // D-TARGET-ENCODING-WIDTH-GUARD (LD-3): the x87 COMPARE pair (x86_64-only).
     {MnemonicSlot::FucomiP,            "fucomip"},
     {MnemonicSlot::FstpSt0,            "fstp_st0"},
+    // D-TARGET-ENCODING-WIDTH-GUARD (LD-5): the x87 NEGATE + the narrower
+    // load/store/truncating-store forms the conversions need (x86_64-only).
+    {MnemonicSlot::Fchs,               "fchs"},
+    {MnemonicSlot::FldM32,             "fld_m32"},
+    {MnemonicSlot::FldM64,             "fld_m64"},
+    {MnemonicSlot::FstpM32,            "fstp_m32"},
+    {MnemonicSlot::FstpM64,            "fstp_m64"},
+    {MnemonicSlot::FisttpM64,          "fisttp_m64"},
     {MnemonicSlot::LeaExternGot,       "lea_extern_got"},  // TF-C52: arm64 GOT-address macro
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
@@ -2780,20 +2812,52 @@ struct Lowerer {
                 // widthOverride. Gate BOTH ends: an F16/F128 source
                 // or result has no encoded conversion at any width.
                 auto const cvtOps = mir.instOperands(id);
-                // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): an FPExt whose
-                // RESULT is F128 from a single F64 source widens via the
-                // softfloat CALL (__extenddftf2) — intercept BEFORE the width
-                // gate below (which would wall the unencoded F128 result). An
-                // F128 FPTrunc (narrowing) has no __trunctfdf2 row this cycle
-                // and falls through to that gate (walls loud). Config-row-gated.
-                if (op == MirOpcode::FPExt
-                    && interner.kind(mir.instType(id)) == TypeKind::F128
-                    && cvtOps.size() == 1
-                    && interner.kind(mir.instType(cvtOps[0])) == TypeKind::F64) {
-                    if (auto const* cfg =
-                            target.wideFloatSoftcall(WideFloatOp::FromFloat64))
-                        return lowerWideFloatSoftcall(id, WideFloatOp::FromFloat64,
-                                                      *cfg);
+                // ── D-TARGET-ENCODING-WIDTH-GUARD (LD-5) + LD-2: the four
+                // long-double ⇄ narrower-float conversions. ALL FOUR intercept
+                // BEFORE the width gate below, which would otherwise wall the
+                // unencoded F80/F128 end of each of them.
+                //
+                // ★ ONE TABLE, TWO REALIZATIONS, AND THE ROW IS THE GATE. The
+                // wide end decides which realization applies — F80 → an inline
+                // x87 memory sequence, F128 → a CALL of the config'd
+                // `wideFloatSoftcalls[]` row — and BOTH are keyed on TypeKind
+                // plus, for F128, the PRESENCE of the row. A target that
+                // declares binary128 and omits the row falls through to the
+                // fail-loud gate; there is no target or format identity here.
+                TypeKind const cvtResK  = interner.kind(mir.instType(id));
+                TypeKind const cvtSrcK  = (cvtOps.size() == 1)
+                    ? interner.kind(mir.instType(cvtOps[0])) : TypeKind::Void;
+                if (cvtOps.size() == 1) {
+                    // (a) narrow: long double → double/float.
+                    if (op == MirOpcode::FPTrunc && cvtSrcK == TypeKind::F80)
+                        return lowerF80ToNarrowFloat(id);
+                    if (op == MirOpcode::FPTrunc && cvtSrcK == TypeKind::F128) {
+                        auto const narrowOp = (cvtResK == TypeKind::F64)
+                            ? std::optional<WideFloatOp>{WideFloatOp::ToFloat64}
+                            : (cvtResK == TypeKind::F32)
+                                ? std::optional<WideFloatOp>{WideFloatOp::ToFloat32}
+                                : std::nullopt;
+                        if (narrowOp.has_value()) {
+                            if (auto const* cfg =
+                                    target.wideFloatSoftcall(*narrowOp))
+                                return lowerWideFloatSoftcall(id, *narrowOp, *cfg);
+                        }
+                    }
+                    // (b) widen: double/float → long double.
+                    if (op == MirOpcode::FPExt && cvtResK == TypeKind::F80)
+                        return lowerF80FromNarrowFloat(id);
+                    if (op == MirOpcode::FPExt && cvtResK == TypeKind::F128) {
+                        auto const wideOp = (cvtSrcK == TypeKind::F64)
+                            ? std::optional<WideFloatOp>{WideFloatOp::FromFloat64}
+                            : (cvtSrcK == TypeKind::F32)
+                                ? std::optional<WideFloatOp>{WideFloatOp::FromFloat32}
+                                : std::nullopt;
+                        if (wideOp.has_value()) {
+                            if (auto const* cfg =
+                                    target.wideFloatSoftcall(*wideOp))
+                                return lowerWideFloatSoftcall(id, *wideOp, *cfg);
+                        }
+                    }
                 }
                 if (!requireEncodedFloatWidth(id, mir.instType(id),
                         op == MirOpcode::FPExt ? "MIR FPExt (result)"
@@ -2822,21 +2886,27 @@ struct Lowerer {
                 // (which still walls F80 at every non-x87 conversion site).
                 if (convOps.size() == 1
                     && interner.kind(mir.instType(convOps[0])) == TypeKind::F80)
-                    return lowerF80ToSI(id);
-                // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): an F128 SOURCE with
-                // a 32-bit result converts via the softfloat CALL (__fixtfsi) —
-                // the SAME 32-bit-only scope as lowerF80ToSI (a wider I64 result
-                // has no __fixtfdi row this cycle and falls through to the source
-                // width gate, which walls the F128 source loud). Config-row-gated.
+                    return lowerF80ToInt(id, /*isUnsigned=*/false);
+                // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2) + LD-5: an F128
+                // SOURCE converts via the softfloat CALL — `__fixtfsi` for a
+                // 32-bit result, `__fixtfdi` for a 64-bit one (the LD-5 row;
+                // BOTH aarch64 references were measured emitting exactly that
+                // pair). A result of any OTHER width has no row, so it falls
+                // through to the source width gate, which walls the F128 source
+                // loud. Config-row-gated, never a target check.
                 if (convOps.size() == 1
-                    && interner.kind(mir.instType(convOps[0])) == TypeKind::F128
-                    && lirInstWidthBits(
-                           memAccessWidthFlags(mir.instType(id),
-                                               LirRegClass::GPR)) == 32) {
-                    if (auto const* cfg =
-                            target.wideFloatSoftcall(WideFloatOp::ToInt32))
-                        return lowerWideFloatSoftcall(id, WideFloatOp::ToInt32,
-                                                      *cfg);
+                    && interner.kind(mir.instType(convOps[0])) == TypeKind::F128) {
+                    auto const bits = lirInstWidthBits(
+                        memAccessWidthFlags(mir.instType(id), LirRegClass::GPR));
+                    auto const fixOp = (bits == 32)
+                        ? std::optional<WideFloatOp>{WideFloatOp::ToInt32}
+                        : (bits == 64)
+                            ? std::optional<WideFloatOp>{WideFloatOp::ToInt64}
+                            : std::nullopt;
+                    if (fixOp.has_value()) {
+                        if (auto const* cfg = target.wideFloatSoftcall(*fixOp))
+                            return lowerWideFloatSoftcall(id, *fixOp, *cfg);
+                    }
                 }
                 // FC2 Part B / FC3.5 c2: fp_to_si carries the F64
                 // cvttsd2si + F32 cvttss2si encodings — the SOURCE
@@ -2872,6 +2942,27 @@ struct Lowerer {
                 // default would mis-key the axis, exactly as for FPToSI) and
                 // `lowerNAryOp` emits whatever the target declared.
                 auto const fuOps = mir.instOperands(id);
+                // ── D-TARGET-ENCODING-WIDTH-GUARD (LD-5): a `long double`
+                // SOURCE, the unsigned mirror of the FPToSI arm above and with
+                // the SAME two realizations. ⚠ IT IS DELIBERATELY 32-BIT-ONLY
+                // ON BOTH AXES. `(unsigned long long)ld` needs a compare against
+                // 2^63 and a conditional bias — a BRANCHING sequence — on the
+                // x87 axis, so declaring the binary128 half alone (libgcc does
+                // export `__fixunstfdi`) would make the same cast compile on one
+                // axis and fail on the other. Both stay walled, loudly.
+                if (fuOps.size() == 1) {
+                    auto const uiBits = lirInstWidthBits(
+                        memAccessWidthFlags(mir.instType(id), LirRegClass::GPR));
+                    TypeKind const uiSrcK = interner.kind(mir.instType(fuOps[0]));
+                    if (uiSrcK == TypeKind::F80 && uiBits == 32)
+                        return lowerF80ToInt(id, /*isUnsigned=*/true);
+                    if (uiSrcK == TypeKind::F128 && uiBits == 32) {
+                        if (auto const* cfg =
+                                target.wideFloatSoftcall(WideFloatOp::ToUInt32))
+                            return lowerWideFloatSoftcall(id, WideFloatOp::ToUInt32,
+                                                          *cfg);
+                    }
+                }
                 if (fuOps.size() == 1
                     && !requireEncodedFloatWidth(id, mir.instType(fuOps[0]),
                                                  "MIR FPToUI (source)")) {
@@ -6052,6 +6143,24 @@ struct Lowerer {
     // st1 OP st0 = a OP b — the correct C operand order for the non-commutative
     // fsubp (a−b) / fdivp (a/b). The result's fresh 16-byte stack home is
     // recorded in `allocaSlotIndex_`, so consumers rematerialize its address.
+    // Reserve the 16-byte stack home an F80-PRODUCING sequence writes its
+    // result into, and materialize its address. The four producers (arith,
+    // negate, the widen from a narrower float, and any future one) share this
+    // verb rather than each spelling the scratch-slot + lea pair, because the
+    // pairing is not incidental: the slot index must ALSO be recorded in
+    // `allocaSlotIndex_` by the caller once the value is defined, and two
+    // copies of "reserve, lea, remember" is two places for the second half to
+    // be forgotten. Returns (slotIndex, homeAddress); nullopt = already
+    // diagnosed (the caller still owes `poisonValue`).
+    [[nodiscard]] std::optional<std::pair<std::uint32_t, LirReg>>
+    emitF80ResultHome(std::string_view context) {
+        auto const slotIndex = emitF80ScratchSlot(kF80StorageBytes, context);
+        if (!slotIndex.has_value()) return std::nullopt;
+        std::optional<LirReg> const homeAddr = emitLeaFrameSlot(*slotIndex);
+        if (!homeAddr.has_value()) return std::nullopt;
+        return std::pair<std::uint32_t, LirReg>{*slotIndex, *homeAddr};
+    }
+
     void lowerF80Arith(MirInstId id, MnemonicSlot combineSlot) {
         auto const operands = mir.instOperands(id);
         if (operands.size() != 2) {
@@ -6062,23 +6171,193 @@ struct Lowerer {
         std::optional<LirReg> const aAddr = regForValue(operands[0]);
         std::optional<LirReg> const bAddr = regForValue(operands[1]);
         if (!aAddr.has_value() || !bAddr.has_value()) { poisonValue(id); return; }
-        auto const slotIndex =
-            emitF80ScratchSlot(kF80StorageBytes, "MIR F80 arithmetic result");
-        if (!slotIndex.has_value()) { poisonValue(id); return; }
-        std::optional<LirReg> const homeAddr = emitLeaFrameSlot(*slotIndex);
-        if (!homeAddr.has_value()) { poisonValue(id); return; }
+        auto const home = emitF80ResultHome("MIR F80 arithmetic result");
+        if (!home.has_value()) { poisonValue(id); return; }
+        auto const [slotIndex, homeAddr] = *home;
         if (!emitX87MemOp(MnemonicSlot::FldM80, *aAddr,
                           "MIR F80 arithmetic (push a)")) { poisonValue(id); return; }
         if (!emitX87MemOp(MnemonicSlot::FldM80, *bAddr,
                           "MIR F80 arithmetic (push b)")) { poisonValue(id); return; }
         if (!emitX87StackOp(combineSlot,
                             "MIR F80 arithmetic (combine)")) { poisonValue(id); return; }
-        if (!emitX87MemOp(MnemonicSlot::FstpM80, *homeAddr,
+        if (!emitX87MemOp(MnemonicSlot::FstpM80, homeAddr,
                           "MIR F80 arithmetic (store result)")) { poisonValue(id); return; }
         // The result value IS its stack home; consumers rematerialize the
         // address via regForValue (the alloca-index remat path) — NOT a long-
         // lived vreg.
-        allocaSlotIndex_.emplace(id.v, *slotIndex);
+        allocaSlotIndex_.emplace(id.v, slotIndex);
+    }
+
+    // ── D-TARGET-ENCODING-WIDTH-GUARD (LD-5): MIR FNeg over an F80 ───────────
+    //
+    //   fld_m80 [src] ; fchs ; fstp_m80 [home]
+    //
+    // The UNARY member of the LD-1 memory→memory family: one push, one bare
+    // stack op, one pop-store, so the sequence still starts and ends with an
+    // EMPTY x87 stack. ★ NO PUSH-ORDER HAZARD HERE, and saying so is the point
+    // — FCHS reads and writes ST(0) only, so unlike `emitF80Compare` (whose
+    // order is the REVERSE of `lowerF80Arith`'s) and unlike `fsubp`/`fdivp`
+    // (whose order decides which way round the subtraction goes), a one-operand
+    // sequence has no order to get wrong. ✔MEASURED that both references emit
+    // exactly this: gcc 13.3.0 `fld TBYTE; fchs; fstp TBYTE` and clang 18.1.3
+    // the same three instructions.
+    void lowerF80Neg(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(mir.instOpcode(id), id);
+            poisonValue(id);
+            return;
+        }
+        std::optional<LirReg> const srcAddr = regForValue(operands[0]);
+        if (!srcAddr.has_value()) { poisonValue(id); return; }
+        auto const home = emitF80ResultHome("MIR F80 negate result");
+        if (!home.has_value()) { poisonValue(id); return; }
+        auto const [slotIndex, homeAddr] = *home;
+        if (!emitX87MemOp(MnemonicSlot::FldM80, *srcAddr,
+                          "MIR F80 negate (push)")) { poisonValue(id); return; }
+        if (!emitX87StackOp(MnemonicSlot::Fchs,
+                            "MIR F80 negate (sign flip)")) { poisonValue(id); return; }
+        if (!emitX87MemOp(MnemonicSlot::FstpM80, homeAddr,
+                          "MIR F80 negate (store result)")) { poisonValue(id); return; }
+        allocaSlotIndex_.emplace(id.v, slotIndex);
+    }
+
+    // ── D-TARGET-ENCODING-WIDTH-GUARD (LD-5): F80 ⇄ a narrower scalar float ──
+    //
+    // The x87 register stack has ONE working format (80-bit extended) and NO
+    // register-to-register conversion instruction; every format change happens
+    // in the MEMORY operand of the load or the store. So both directions are
+    // the same three-step shape, and the ONLY thing that differs is which end
+    // is the SSE-resident value:
+    //
+    //   FPTrunc  (long double → double/float):
+    //       fld_m80 [src] ; fstp_m64|fstp_m32 [slot] ; movsd|movss xmm,[slot]
+    //   FPExt    (double/float → long double):
+    //       movsd|movss [slot],xmm ; fld_m64|fld_m32 [slot] ; fstp_m80 [home]
+    //
+    // ✔MEASURED that this is exactly what both references emit, probed
+    // separately (gcc 13.3.0 / clang 18.1.3): `fld TBYTE; fstp QWORD; movsd`
+    // for `(double)ld` and `movss DWORD,xmm0; fld DWORD` for `(long double)f`.
+    //
+    // ⚠ THE NARROW SLOT MUST BE THE NARROW TYPE'S OWN WIDTH AT BOTH ENDS. The
+    // x87 memory form and the SSE memory op have to agree byte for byte — an
+    // `fstp_m64` paired with a width-32 `movss` reload would round to double
+    // and then read four bytes of it, silently. The width is therefore derived
+    // ONCE, from the narrow type, and drives the slot size, the x87 mnemonic
+    // and the SSE op together.
+    //
+    // Returns the mnemonic pair for a narrow float of `kind`, or nullopt when
+    // the kind is not one of the two encoded scalar widths — the caller then
+    // falls through to `requireEncodedFloatWidth`, which fails loud. (F16 has
+    // no x87 memory form at all; the 8087 formats are m32/m64/m80 only.)
+    struct F80NarrowForms {
+        MnemonicSlot  fld;      // widen:  memory → the x87 stack
+        MnemonicSlot  fstp;     // narrow: the x87 stack → memory
+        std::uint32_t bytes;    // the scratch slot's size
+    };
+    [[nodiscard]] static std::optional<F80NarrowForms>
+    f80NarrowForms(TypeKind kind) noexcept {
+        switch (kind) {
+            case TypeKind::F64:
+                return F80NarrowForms{MnemonicSlot::FldM64,
+                                      MnemonicSlot::FstpM64, 8};
+            case TypeKind::F32:
+                return F80NarrowForms{MnemonicSlot::FldM32,
+                                      MnemonicSlot::FstpM32, 4};
+            default:
+                return std::nullopt;
+        }
+    }
+
+    // MIR FPTrunc with an F80 SOURCE and an F64/F32 result.
+    void lowerF80ToNarrowFloat(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(mir.instOpcode(id), id);
+            poisonValue(id);
+            return;
+        }
+        TypeId const narrowTy = mir.instType(id);
+        auto const forms = f80NarrowForms(interner.kind(narrowTy));
+        if (!forms.has_value()) {
+            // Not an encoded narrow width — let the shared gate name the anchor
+            // rather than inventing a second diagnostic for the same wall.
+            (void)requireEncodedFloatWidth(id, narrowTy, "MIR FPTrunc (result)");
+            return;
+        }
+        std::optional<LirReg> const srcAddr = regForValue(operands[0]);
+        if (!srcAddr.has_value()) { poisonValue(id); return; }
+        auto const slotIndex =
+            emitF80ScratchSlot(forms->bytes, "MIR F80→float slot");
+        if (!slotIndex.has_value()) { poisonValue(id); return; }
+        std::optional<LirReg> const slotAddr = emitLeaFrameSlot(*slotIndex);
+        if (!slotAddr.has_value()) { poisonValue(id); return; }
+        if (!emitX87MemOp(MnemonicSlot::FldM80, *srcAddr,
+                          "MIR F80→float (push)")) { poisonValue(id); return; }
+        if (!emitX87MemOp(forms->fstp, *slotAddr,
+                          "MIR F80→float (rounding store)")) { poisonValue(id); return; }
+        auto const loadOp = classOp(LirRegClass::FPR, RegClassOp::Load);
+        if (!loadOp.has_value()) {
+            reportMissingClassOp(LirRegClass::FPR, RegClassOp::Load,
+                                 "MIR F80→float (reload)");
+            poisonValue(id);
+            return;
+        }
+        LirReg const result = lir.newVReg(LirRegClass::FPR);
+        std::array<LirOperand, 3> ldOps{
+            LirOperand::makeReg(*slotAddr),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        emitInst(*loadOp, result, ldOps, /*payload=*/0,
+                 memAccessWidthFlags(narrowTy, LirRegClass::FPR));
+        defineValue(id, result);
+    }
+
+    // MIR FPExt with an F64/F32 source and an F80 RESULT.
+    void lowerF80FromNarrowFloat(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(mir.instOpcode(id), id);
+            poisonValue(id);
+            return;
+        }
+        TypeId const narrowTy = mir.instType(operands[0]);
+        auto const forms = f80NarrowForms(interner.kind(narrowTy));
+        if (!forms.has_value()) {
+            (void)requireEncodedFloatWidth(id, narrowTy, "MIR FPExt (source)");
+            return;
+        }
+        std::optional<LirReg> const src = regForValue(operands[0]);
+        if (!src.has_value()) { poisonValue(id); return; }
+        auto const slotIndex =
+            emitF80ScratchSlot(forms->bytes, "MIR float→F80 slot");
+        if (!slotIndex.has_value()) { poisonValue(id); return; }
+        std::optional<LirReg> const slotAddr = emitLeaFrameSlot(*slotIndex);
+        if (!slotAddr.has_value()) { poisonValue(id); return; }
+        auto const storeOp = classOp(LirRegClass::FPR, RegClassOp::Store);
+        if (!storeOp.has_value()) {
+            reportMissingClassOp(LirRegClass::FPR, RegClassOp::Store,
+                                 "MIR float→F80 (spill source)");
+            poisonValue(id);
+            return;
+        }
+        std::array<LirOperand, 4> stOps{
+            LirOperand::makeReg(*src),
+            LirOperand::makeReg(*slotAddr),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        emitInst(*storeOp, InvalidLirReg, stOps, /*payload=*/0,
+                 memAccessWidthFlags(narrowTy, LirRegClass::FPR));
+        auto const home = emitF80ResultHome("MIR float→F80 result");
+        if (!home.has_value()) { poisonValue(id); return; }
+        auto const [homeSlot, homeAddr] = *home;
+        if (!emitX87MemOp(forms->fld, *slotAddr,
+                          "MIR float→F80 (widening push)")) { poisonValue(id); return; }
+        if (!emitX87MemOp(MnemonicSlot::FstpM80, homeAddr,
+                          "MIR float→F80 (store result)")) { poisonValue(id); return; }
+        allocaSlotIndex_.emplace(id.v, homeSlot);
     }
 
     // MIR FPToSI from an F80 source → the x87 truncating-store sequence:
@@ -6087,29 +6366,73 @@ struct Lowerer {
     // cast's round-toward-zero for free. This slice ships the m32int form (the
     // `(int)ld` the LD-1 witness needs); a wider (I64) or sub-32 result has no
     // x87 truncating-store form here and fails loud rather than mis-sizing.
-    void lowerF80ToSI(MirInstId id) {
+    // ⚠ LD-5 GENERALIZED THIS VERB IN TWO DIRECTIONS AND THE SECOND ONE IS NOT
+    // OBVIOUS. It now also serves the 64-bit SIGNED result (`(long long)ld`,
+    // through FISTTP m64int — DD /1) and the 32-bit UNSIGNED one
+    // (`(unsigned)ld`). The unsigned arm stores through the SAME m64int form
+    // and then reloads only the LOW 32 BITS, because `unsigned int`'s range
+    // [0, 2^32) does not fit a signed m32int — a value above 2^31 would store
+    // the 0x80000000 integer-indefinite and read back as a wrong answer with no
+    // fault. In a signed 64-bit intermediate every `unsigned int` value is
+    // exact, and truncating it to 32 bits is C's own conversion rule.
+    //
+    // ⓘ WHAT IS STILL WALLED, and it is walled LOUD on both axes rather than
+    // half-shipped: a 64-bit UNSIGNED result (`(unsigned long long)ld`). There
+    // is no x87 store form for it at all — both references realize it by
+    // COMPARING against 2^63, subtracting when above, and flipping the result's
+    // top bit, which is a BRANCHING sequence this straight-line lowerer cannot
+    // emit. Shipping the binary128 half alone (libgcc does export
+    // `__fixunstfdi`) would leave the two axes disagreeing about whether the
+    // cast compiles, so neither is declared and both fail loud.
+    //
+    // Sub-32 results (`(unsigned char)ld`) also stay loud: `registerOpWidthFlags`
+    // would promote them to 32 for the reload, but the CONVERSION's own modulo
+    // is not the same conversion, and a wrong one here is silent.
+    void lowerF80ToInt(MirInstId id, bool isUnsigned) {
+        MirOpcode const op = isUnsigned ? MirOpcode::FPToUI : MirOpcode::FPToSI;
         auto const operands = mir.instOperands(id);
         if (operands.size() != 1) {
-            reportUnsupported(MirOpcode::FPToSI, id);
+            reportUnsupported(op, id);
             poisonValue(id);
             return;
         }
         std::uint8_t const resultWidth =
             memAccessWidthFlags(mir.instType(id), LirRegClass::GPR);
-        if (lirInstWidthBits(resultWidth) != 32) {
-            reportUnsupported(MirOpcode::FPToSI, id);
+        std::uint8_t const resultBits = lirInstWidthBits(resultWidth);
+        if (resultBits != 32 && !(resultBits == 64 && !isUnsigned)) {
+            reportUnsupported(op, id);
+            poisonValue(id);
+            return;
+        }
+        // The x87 truncating STORE width is 64 bits for everything except the
+        // signed-32 case, which has its own narrower form.
+        //
+        // ⚠ THE UNSIGNED-32 ARM NARROWS IN A REGISTER, NOT BY READING HALF THE
+        // SLOT. Reloading four of the eight stored bytes would take the low
+        // half only on a little-endian target, quietly importing a byte-order
+        // fact into the shared lowerer; a full 64-bit reload followed by the
+        // pipeline's OWN `trunc` verb (x86 `mov r32,r32`, which zero-extends —
+        // C's mod-2^32 conversion) says the same thing about registers, where
+        // there is no byte order to be wrong about.
+        bool const storeM64 = (resultBits == 64) || isUnsigned;
+        bool const narrowInRegister = storeM64 && (resultBits == 32);
+        MnemonicSlot const storeSlot =
+            storeM64 ? MnemonicSlot::FisttpM64 : MnemonicSlot::FisttpM32;
+        if (narrowInRegister && !opcode(MnemonicSlot::Trunc).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Trunc, "MIR F80→unsigned (narrow)");
             poisonValue(id);
             return;
         }
         std::optional<LirReg> const srcAddr = regForValue(operands[0]);
         if (!srcAddr.has_value()) { poisonValue(id); return; }
-        auto const slotIndex = emitF80ScratchSlot(4, "MIR F80→int slot");
+        auto const slotIndex =
+            emitF80ScratchSlot(storeM64 ? 8u : 4u, "MIR F80→int slot");
         if (!slotIndex.has_value()) { poisonValue(id); return; }
         std::optional<LirReg> const slotAddr = emitLeaFrameSlot(*slotIndex);
         if (!slotAddr.has_value()) { poisonValue(id); return; }
         if (!emitX87MemOp(MnemonicSlot::FldM80, *srcAddr,
                           "MIR F80→int (push)")) { poisonValue(id); return; }
-        if (!emitX87MemOp(MnemonicSlot::FisttpM32, *slotAddr,
+        if (!emitX87MemOp(storeSlot, *slotAddr,
                           "MIR F80→int (truncating store)")) { poisonValue(id); return; }
         auto const loadOp = classOp(LirRegClass::GPR, RegClassOp::Load);
         if (!loadOp.has_value()) {
@@ -6118,13 +6441,19 @@ struct Lowerer {
             poisonValue(id);
             return;
         }
-        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        LirReg const reloaded = lir.newVReg(LirRegClass::GPR);
         std::array<LirOperand, 3> ldOps{
             LirOperand::makeReg(*slotAddr),
             LirOperand::makeMemBase(1),
             LirOperand::makeMemOffset(0),
         };
-        emitInst(*loadOp, result, ldOps, /*payload=*/0, kLirInstFlagWidth32);
+        emitInst(*loadOp, reloaded, ldOps, /*payload=*/0,
+                 storeM64 ? std::uint8_t{0} : resultWidth);
+        if (!narrowInRegister) { defineValue(id, reloaded); return; }
+        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> trOps{LirOperand::makeReg(reloaded)};
+        emitInst(*opcode(MnemonicSlot::Trunc), result, trOps, /*payload=*/0,
+                 kLirInstFlagWidth32);
         defineValue(id, result);
     }
 
@@ -6328,11 +6657,17 @@ struct Lowerer {
                      kLirInstFlagWidth128);
             allocaSlotIndex_.emplace(id.v, *resultSlotIndex);
         } else {
-            // Non-F128 result (the `to_i32` int32): MOVE the physical result
-            // register into a fresh result vreg (the idiv implicit-RAX-capture
-            // precedent — width-default GPR copy, the low 32 bits are the int).
+            // Non-F128 result — an integer (`to_i32`/`to_u32`/`to_i64`) or a
+            // NARROWER FLOAT (`to_f64`/`to_f32`, the LD-5 rows): MOVE the
+            // physical result register into a fresh result vreg (the idiv
+            // implicit-RAX-capture precedent), AT THE RESULT TYPE'S OWN WIDTH.
+            // ⚠ That width used to be the 64-bit default and it is the one
+            // silent-miscompile risk on this path: AAPCS64 leaves the bits
+            // above a 32-bit return UNSPECIFIED, and `to_f32` would have moved
+            // a `float` with the D-form.
             auto const captured = captureWideFloatSoftcallResult(
-                *res, "MIR F128 softcall (capture result)");
+                *res, registerOpWidthFlags(mir.instType(id)),
+                "MIR F128 softcall (capture result)");
             if (!captured.has_value()) { poisonValue(id); return; }
             defineValue(id, *captured);
         }
@@ -6426,9 +6761,16 @@ struct Lowerer {
                 emitInst(*loadOp, argPhys, ldOps, /*payload=*/0,
                          kLirInstFlagWidth128);
             } else {
-                // Register-resident (an F64/F32 source of `from_f64`): MOVE the
-                // vreg into the physical arg register with the class's move op
-                // (fmov). Width-blind copy (the D-form fmov preserves the value).
+                // Register-resident (the F64 source of `from_f64`, the F32
+                // source of `from_f32`): MOVE the vreg into the physical arg
+                // register with the class's move op (fmov) AT THE OPERAND'S OWN
+                // WIDTH. ⚠ THIS USED TO BE A WIDTH-BLIND COPY, justified as
+                // "the D-form fmov preserves the value" — true while `from_f64`
+                // was the only consumer, false the moment `from_f32` joined it:
+                // `fmov` is declared at widths 32 AND 64 on this target and the
+                // 64-bit arm is not merely wasteful for a `float`, it names a
+                // register view the ABI does not use for one. The width comes
+                // off the operand type, so each row's own signature decides.
                 auto const moveOp = classOp(argCls, RegClassOp::Move);
                 if (!moveOp.has_value()) {
                     reportMissingClassOp(argCls, RegClassOp::Move,
@@ -6437,7 +6779,8 @@ struct Lowerer {
                     return std::nullopt;
                 }
                 std::array<LirOperand, 1> mvOps{LirOperand::makeReg(*src)};
-                emitInst(*moveOp, argPhys, mvOps);
+                emitInst(*moveOp, argPhys, mvOps, /*payload=*/0,
+                         registerOpWidthFlags(mir.instType(operands[i])));
             }
         }
         // 2. The CALL: resolve/mint the extern, emit the format-appropriate
@@ -6480,8 +6823,20 @@ struct Lowerer {
     // implicit-RAX-capture precedent. Every non-F128 result funnels through
     // here so the physical register stops being live one instruction after the
     // call, whatever the consumer then does with the value.
+    //
+    // ⚠⚠ `widthFlags` IS A REQUIRED ARGUMENT AND THE DEFAULT IT REPLACED WAS A
+    // SILENT-MISCOMPILE RISK — the same shape, and the same reasoning, as
+    // D-LIR-CALLEE-SAVED-AND-SPILL-STORES-DEFAULT-TO-WIDTH-64-BELOW-THE-SLOT.
+    // AAPCS64 §6.8.2 leaves the bits ABOVE a return type's own width
+    // UNSPECIFIED, so a width-blind (= 64-bit) copy of a helper that returns
+    // `int` or `unsigned int` propagates whatever the helper happened to leave
+    // in bits 63:32. Every caller therefore states the width the RESULT TYPE
+    // has, and the W-form move zeroes the rest. ✔The width-32 election is
+    // pinned at the byte level: `mov w_d, w0` = ORR Wd,WZR,Wm (0x2A0003E0 +
+    // fields), the sf=0 sibling of the 64-bit 0xAA0003E0.
     [[nodiscard]] std::optional<LirReg>
     captureWideFloatSoftcallResult(WideFloatSoftcallResult const& res,
+                                   std::uint8_t widthFlags,
                                    std::string_view context) {
         auto const moveOp = classOp(res.cls, RegClassOp::Move);
         if (!moveOp.has_value()) {
@@ -6490,7 +6845,7 @@ struct Lowerer {
         }
         LirReg const captured = lir.newVReg(res.cls);
         std::array<LirOperand, 1> mvOps{LirOperand::makeReg(res.reg)};
-        emitInst(*moveOp, captured, mvOps);
+        emitInst(*moveOp, captured, mvOps, /*payload=*/0, widthFlags);
         return captured;
     }
 
@@ -6530,8 +6885,11 @@ struct Lowerer {
         }
         auto const res = emitWideFloatSoftcallBody(id, cfg, operands);
         if (!res.has_value()) return false;   // already diagnosed + poisoned
-        auto const captured =
-            captureWideFloatSoftcallResult(*res, "MIR F128 FCmp (capture result)");
+        // The comparison helpers all return a C `int`, whatever the MIR result
+        // type is (a Bool) — so the capture width is stated as 32 HERE, not
+        // derived from `instType`, and the `cmp` below matches it.
+        auto const captured = captureWideFloatSoftcallResult(
+            *res, kLirInstFlagWidth32, "MIR F128 FCmp (capture result)");
         if (!captured.has_value()) { poisonValue(id); return false; }
         std::array<LirOperand, 2> cmpOps{
             LirOperand::makeReg(*captured), LirOperand::makeImmInt32(0)};
@@ -8944,6 +9302,33 @@ struct Lowerer {
             reportUnsupported(mir.instOpcode(id), id);
             return;
         }
+        // ── D-TARGET-ENCODING-WIDTH-GUARD (LD-5): the `long double` arms, both
+        // BEFORE the width gate below (which walls every unencoded float
+        // width, including these two). The memory-resident LD model applies:
+        // an F80 negate is the inline x87 `fld;fchs;fstp` sequence, an F128
+        // negate is a CALL of the config'd row. Rule 0, ahead of the
+        // capability rules, because neither realization is an SSE/NEON form
+        // and neither value ever lives in a register.
+        //
+        // ⚠ THE F128 ROW IS A DELIBERATE DIVERGENCE FROM WHAT THE REFERENCES
+        // EMIT, and it is the one place in this arc where DSS does NOT copy
+        // them. ✔MEASURED 2026-09-04: aarch64-linux-gnu-gcc 13.3.0 flips the
+        // sign inline (`eor x1, x2, #0x8000000000000000` on the high word) and
+        // clang 18.1.3 does the same on byte 15 — NEITHER calls `__negtf2`.
+        // Copying them would put "the sign bit of a binary128 is byte 15 bit 7"
+        // — a byte-ORDER fact — inside this target-agnostic lowerer. The
+        // libcall says the same thing in the target's own vocabulary, and it is
+        // bit-for-bit the same function: ✔MEASURED under qemu-aarch64 that
+        // `__negtf2` maps +0.0↔-0.0 and preserves both a quiet and a signalling
+        // NaN's payload AND its quiet bit, i.e. it is a pure sign flip. The
+        // difference is a peephole, not a semantic one.
+        if (interner.kind(mir.instType(id)) == TypeKind::F80)
+            return lowerF80Neg(id);
+        if (interner.kind(mir.instType(id)) == TypeKind::F128) {
+            if (auto const* cfg = target.wideFloatSoftcall(WideFloatOp::Neg))
+                return lowerWideFloatSoftcall(id, WideFloatOp::Neg, *cfg);
+        }
+
         // Width gate: only F64/F32 have scalar float encodings AND a
         // well-defined sign-mask pattern. F16/F128 → loud (poisons id).
         if (!requireEncodedFloatWidth(id, mir.instType(id), "MIR FNeg")) {

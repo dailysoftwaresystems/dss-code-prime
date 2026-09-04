@@ -116,6 +116,21 @@ using PpHasEmbed =
 // `evaluateIfExpression` for the measurement that removed it.
 using PpProductText = std::function<std::string_view()>;
 
+// D-PP-HAS-EXTENSION-BUILTIN-ABSENT: "has the program `#undef`'d this
+// implementation-provided operator away?" A conditional-inclusion or
+// feature-query operator lives in the CONFIG, not in the macro table, so the
+// evaluator cannot learn from `isDefined` alone that the name has been revoked —
+// and a fold that still fired after an `#undef` would be a diagnostic with no
+// effect, which is worse than the refusal the ruling replaced.
+//
+// ★ IT ANSWERS FOR THE OPERATOR WORD, NEVER FOR A MACRO NAME. `isDefined`
+// already covers the macro table; this asks only whether the CONFIG-declared
+// operator is still live. Null-callback tolerant: an unset `{}` means nothing
+// was ever revoked, which is the correct answer for every test caller and for
+// any language whose operators cannot be `#undef`'d (`reservedIdentifiers`
+// declaring `refuse`).
+using PpOperatorRevoked = std::function<bool(std::string_view)>;
+
 // ── D-PP-DEFINED-VIA-MACRO-EXPANSION ─────────────────────────────────────────
 // THE `#if`-OPERAND BARRIER: the ONE definition of "which tokens a
 // conditional-inclusion operator protects from macro expansion", shared by the
@@ -270,6 +285,19 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                      SourceBuffer const&    synth,
                      PpProductText const&   productText,
                      DiagnosticReporter&    rep,
-                     PpHasEmbed const&      hasEmbed = {});
+                     PpHasEmbed const&      hasEmbed = {},
+                     PpOperatorRevoked const& operatorRevoked = {},
+                     // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the ACTIVE
+                     // (target × object format)'s plain-`char` signedness,
+                     // `TargetSchema::charIsUnsigned(ObjectFormatKind)`. C
+                     // 6.4.4.4p10 makes `#if '\xff' < 0` answer differently on a
+                     // signed- and an unsigned-`char` target, and this evaluator
+                     // has no other way to know. DEFAULTED to `nullopt` because
+                     // a `#if` fold is reachable from callers with no target in
+                     // scope at all (the LSP, the direct-API tests) — but the
+                     // default is NOT "signed": with it absent, a character
+                     // constant above 0x7F REFUSES, loud, and every 0–127 body
+                     // (which is every real-world one) folds unchanged.
+                     std::optional<bool>    charIsUnsigned = std::nullopt);
 
 } // namespace dss

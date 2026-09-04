@@ -399,6 +399,15 @@ struct EngineState {
     // target. `nullopt` ⇒ no variant selection (back-compat: flat-`fields` structs
     // decode as before; a variants-only struct is not injected).
     std::optional<std::string> activeTarget;
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: plain `char`'s signedness for the
+    // ACTIVE (target × object format), RESOLVED ONCE in `analyzeImpl` from the
+    // ONE accessor `TargetSchema::charIsUnsigned(ObjectFormatKind)` — never
+    // re-derived, and never from the arch name. Both axes are required and both
+    // are already `analyze()` parameters, which is why no new one was added.
+    // `nullopt` ⇒ the caller supplied no target (LSP / FFI header parser /
+    // direct-API tests) ⇒ a `char` const-fold REFUSES rather than picking a sign;
+    // only code units above 0x7F can tell the two answers apart.
+    std::optional<bool> charIsUnsigned;
     // HR11: per-schema index bundles, keyed by SchemaId.v; `active_` is the
     // bundle for the tree currently being processed (set via `activate`).
     std::unordered_map<std::uint32_t, SchemaIndexes> schemaIndexes;
@@ -3523,7 +3532,8 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
             // index designator's `[(int)1.5]`. What stays here is the only part
             // that is genuinely this tier's: finding the cast's type node through
             // the DECLARED `casts` row and resolving it in THIS scope.
-            return classifyCstCastTarget(s.lattice.interner(), ty);
+            return classifyCstCastTarget(s.lattice.interner(), ty,
+                                        s.charIsUnsigned);
         };
         // c43: resolve a struct/union field's byte offset + type for `&((T*)0)->M`.
         // Looks the field name up in the container's MEMBER SCOPE (Pass-1 binds
@@ -3642,6 +3652,9 @@ constIntExpr(EngineState& s, Tree const& tree, NodeId node,
     CstEvalEnvironment env = buildConstEvalEnv(s, tree, fromScope, cfg);
     EvalOptions options;
     options.allowFloat = true;
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the target's answer for plain
+    // `char`, so `int a[('ÿ' < 0) ? 1 : 2]` sizes as the references do.
+    options.charIsUnsigned = s.charIsUnsigned;
     ConstEvalResult const r = evaluateConstantCst(node, ctx, env, options,
                                                  fromScope.v);
     if (!r.value.has_value()) return std::nullopt;
@@ -3975,6 +3988,10 @@ constExprValue(EngineState& s, Tree const& tree, NodeId node,
     CstEvalEnvironment env = buildConstEvalEnv(s, tree, fromScope, cfg);
     EvalOptions options;
     options.allowFloat = true;
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: as in `constIntExpr` — one fact,
+    // both const-expr entry points, so a constexpr initializer and an array
+    // dimension cannot read the same `'ÿ'` differently.
+    options.charIsUnsigned = s.charIsUnsigned;
     ConstEvalResult const r =
         evaluateConstantCst(node, ctx, env, options, fromScope.v);
     if (!r.value.has_value()) return std::nullopt;
@@ -17135,7 +17152,27 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         // design (D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE).
         if (e->target == "LogicalAnd" || e->target == "LogicalOr")
             return comparisonResultType();
-        if (e->target == "Comma")  return rt;                       // value of RHS
+        // ── C 6.5.17p2 [[D-CSUBSET-VLA-SIZEOF-TYPEFORM]] part (2) ────────────
+        // "the comma operator ... the result has the TYPE AND VALUE of the right
+        // operand", and p2's value-of-an-expression rule applies the lvalue
+        // conversions — so an ARRAY right operand decays (6.3.2.1p3). This used
+        // to return `rt` raw, which is right for every operand but an array and
+        // wrong for that one in the ONE context that can observe an un-decayed
+        // type: `sizeof(fb, fa)` on `int fa[7]` MEASURED 28 in DSS against 8 on
+        // gcc 13.3.0, clang 18.1.3 AND MSVC 19.51 (unanimous, each probed
+        // separately) -- rc 0, zero diagnostics. Every OTHER use site (`int *p =
+        // (fb,fa)`, `(fb,fa)+1`, `(fb,fa)[1]`, a deref, a call argument, a
+        // pointer comparison) was already correct because `coerce` rescued it at
+        // the use, which is exactly why the type itself was never fixed.
+        //
+        // ⚠ THIS MUST MOVE WITH `cst_to_hir`'s `combineComma`, AND NEITHER ALONE.
+        // `subtreeType`'s contract is that it mirrors the CST->HIR lowering
+        // exactly; `lowerSizeof` reads the SEMANTIC stamp, so a HIR-only change
+        // leaves the user-visible defect fully intact while reading as a fix.
+        // The decay verb is the SHARED `arrayToPointerDecay` for the same reason
+        // the ternary's is -- a second copy is how the two tiers start
+        // disagreeing about the type they are both describing.
+        if (e->target == "Comma")  return decayArray(rt);           // value of RHS
         if (e->target == "Assign" || !e->compoundBase.empty()) return lt;
         auto const op = coreOpFromNameSem(e->target);
         if (op.has_value()) {
@@ -18332,6 +18369,14 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     s.aggregateLayout = aggregateLayout;
     s.vaListStrategy = vaListStrategy;
     s.activeFormat = activeFormat;
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: ask the ONE owner, passing the
+    // active format KIND (a required argument of the accessor precisely so no
+    // caller can take the processor half alone — the same arm64 CPU is UNSIGNED
+    // under GNU/Linux and SIGNED under Darwin). Both axes present or the fact
+    // stays absent; a half-answer would be worse than none.
+    if (target != nullptr && activeFormat.has_value()) {
+        s.charIsUnsigned = target->charIsUnsigned(*activeFormat);
+    }
     // Plan 25: own the arch-name string (the caller's string_view may be
     // transient) so the shipped-struct variant selector reads a stable value.
     if (activeTarget.has_value()) s.activeTarget = std::string{*activeTarget};
@@ -20668,6 +20713,10 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         dataModel,
         longDoubleFormat,
         target,
+        // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the model CARRIES what
+        // analysis ran under so HIR lowering reads the SAME answer — the
+        // `dataModel()` / `longDoubleFormat()` discipline.
+        s.charIsUnsigned,
     };
 }
 

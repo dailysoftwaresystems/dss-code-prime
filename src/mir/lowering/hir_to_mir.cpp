@@ -358,16 +358,27 @@ struct Lowerer {
     std::vector<BranchFrame> branchStack;
 
     // VLA C5 (D-CSUBSET-VLA): the stack of currently-OPEN block-scope VLA
-    // watermarks, innermost on the back. One frame per dynamic-VLA VarDecl (the
-    // finer per-decl granularity that makes a backward `goto` between two VLAs
-    // correct). Pushed at the VarDecl (with `saveBefore` = the StackSave emitted
-    // just BEFORE the VLA's `sub sp`); popped when the declaring lexical block's
-    // lowering completes. Correlated with `branchStack` (break/continue) via
-    // `vlaDepthAtPush`, and walked for `goto` teardown via HIR ancestry. Reset per
-    // function. See the teardown helpers below.
+    // watermarks, innermost on the back. One frame per dynamic-VLA DECLARATION
+    // STATEMENT (the finer per-statement granularity that makes a backward `goto`
+    // between two VLAs correct). Pushed at the VarDecl (with `saveBefore` = the
+    // StackSave emitted just BEFORE the VLA's `sub sp`); popped when the declaring
+    // lexical SCOPE's lowering completes. Correlated with `branchStack`
+    // (break/continue) via `vlaDepthAtPush`, and walked for `goto` teardown via HIR
+    // ancestry. Reset per function. See the teardown helpers below.
+    //
+    // ★★ D-CSUBSET-VLA-MULTIDECLARATOR-STATEMENT-TEARDOWN: `anchorNode` is NOT
+    // always the VarDecl. It is the direct child of `scopeNode` the declaration sits
+    // under — the VarDecl itself for `int a[n];`, but the DECLARATOR-GROUP Block for
+    // `int a[n], b[n];` and the LabelStmt for `L: int a[n];`. Two invariants ride on
+    // that: `vlaFrameEnclosesLabel`'s textual-precedence test looks the anchor up in
+    // `scopeNode`'s CHILD LIST (a VarDecl nested inside a group wrapper is not there,
+    // and a missing anchor reads as "does not enclose" — a `goto` forward inside the
+    // same block would then free a still-live object), and the anchor is what tells
+    // the SECOND declarator of a group that the FIRST one already opened the
+    // watermark, so one declaration statement emits exactly ONE StackSave.
     struct VlaScopeFrame {
-        HirNodeId  declNode;    // the VLA VarDecl (textual-position anchor for goto)
-        HirNodeId  scopeNode;   // the enclosing lexical Block (== hir.parent(declNode))
+        HirNodeId  anchorNode;  // scopeNode's direct child holding the decl (goto anchor)
+        HirNodeId  scopeNode;   // the enclosing SCOPE: a lexical Block, or a ForStmt
         MirInstId  saveBefore;  // the StackSave value (SP captured before this VLA)
         std::uint32_t scopeId;  // the StackSave/StackRestore pairing payload
     };
@@ -908,8 +919,13 @@ struct Lowerer {
     // over-fencing is C11-legal and strictly more permissive, so this is CORRECT (not a
     // silent miscompile), NOT fail-loud (a runtime order value is legal C11).
     [[nodiscard]] std::uint32_t foldAtomicOrder(HirNodeId orderNode) {
+        EvalOptions orderOpts;
+        // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: a `memory_order_*` fold is
+        // integer-only, but the engine refuses any Char-cored operand without
+        // this — relay it so a hand-written `''` order still folds.
+        orderOpts.charIsUnsigned = config.charIsUnsigned;
         ConstEvalResult const r =
-            evaluateConstant(hir, interner, literals, orderNode);
+            evaluateConstant(hir, interner, literals, orderNode, {}, orderOpts);
         std::int64_t v = -1;
         if (r.value.has_value()) {
             if (std::holds_alternative<std::int64_t>(r.value->value))
@@ -9553,6 +9569,80 @@ struct Lowerer {
         return it == labelNodeByOrdinal_.end() ? HirNodeId{} : it->second;
     }
 
+    // ★★★ D-CSUBSET-VLA-MULTIDECLARATOR-STATEMENT-TEARDOWN /
+    // D-CSUBSET-VLA-FOR-INIT-MULTIDECL: is `b` a Block HIR minted purely to CARRY the
+    // N declarators of ONE declaration, rather than a C compound statement that opens
+    // a SCOPE?
+    //
+    // cst_to_hir's `lowerVarLike` mints exactly that: a statement position holds
+    // exactly one HIR node, so `int a[n], b[n];` — whose two objects C 6.2.4 gives the
+    // scope of the ENCLOSING block, not of the declaration — becomes a Block of two
+    // VarDecls. Read as a scope, that Block frees both objects at the end of the
+    // STATEMENT, while they are still live.
+    //
+    // ⚠ THE TEST IS EXACT IN THE `for`-INIT SLOT AND CONSERVATIVE ELSEWHERE, AND THE
+    // ERROR DIRECTION IS THE SAFE ONE — STATED, NOT ASSUMED. A `for`-init clause holds
+    // a declaration or an expression and never a compound statement, so a Block THERE
+    // is always the wrapper. In a statement position the two are INDISTINGUISHABLE at
+    // this tier: `lowerVarLike`'s wrapper and `lowerBlock`'s compound statement are
+    // byte-identical HIR nodes (same kind, same `HirFlags::None`, same payload) —
+    // ✔MEASURED by reading both constructors, and the reason the real repair is a HIR
+    // one (give the declarator group a node that is not a Block; see the rows). So a
+    // REAL `{ int a[n]; int b[n]; }` — a compound statement holding nothing but
+    // declarations, i.e. one whose objects nothing inside it can use — is also matched
+    // here, and its stack is reclaimed at the ENCLOSING scope's exit instead of its
+    // own. That is LATE, never EARLY: freeing late costs one scope's worth of stack
+    // and cannot corrupt, freeing early is the silent miscompile. The deferral is ONE
+    // level and terminates — a Block whose child is a Block is not all-VarDecl, so the
+    // widening never chains — and every enclosing Block still frees at ITS exit, so a
+    // loop cannot accumulate. A body-position block (`while (c) { int a[n]; int b[n]; }`
+    // — parent is the WhileStmt, not a Block) is deliberately NOT matched and keeps its
+    // per-iteration teardown; that is the shape a leak would actually overflow.
+    [[nodiscard]] bool isDeclaratorGroupBlock(HirNodeId b) const {
+        if (!b.valid() || hir.kind(b) != HirKind::Block) return false;
+        auto const kids = hir.children(b);
+        if (kids.empty()) return false;
+        for (HirNodeId k : kids)
+            if (hir.kind(k) != HirKind::VarDecl) return false;
+        HirNodeId const p = hir.parent(b);
+        if (!p.valid()) return false;
+        // EXACT: the `for`-init SLOT cannot hold a compound statement.
+        if (hir.kind(p) == HirKind::ForStmt) {
+            auto const initN = hir.forInit(p);
+            return initN.has_value() && *initN == b;
+        }
+        // Statement position. A single declarator never wraps (`lowerVarLike` returns
+        // the bare VarDecl), so a one-child Block there is a real compound statement.
+        bool const inStmtPosition =
+            hir.kind(p) == HirKind::Block
+            || (hir.kind(p) == HirKind::LabelStmt && hir.labelBody(p) == b);
+        return inStmtPosition && kids.size() >= 2u;
+    }
+
+    // Resolve the SCOPE a VLA declaration belongs to, and the ANCHOR — the direct
+    // child of that scope the declaration sits under. Walks OUT through the HIR nodes
+    // that hold a declaration WITHOUT opening a scope of their own:
+    //   * a DECLARATOR-GROUP Block (`int a[n], b[n];` — see above);
+    //   * a LabelStmt whose body IS the declaration (`L: int a[n];`, C23 6.8.1 — a
+    //     label may precede a declaration; gcc 13.3.0 and clang 18.1.3 both compile
+    //     and RUN it, and clang calls the C17 spelling a C23 extension rather than an
+    //     error, so the reference union requires it).
+    // The walk stops at the innermost real scope: a lexical Block, or the ForStmt
+    // whose INIT clause the anchor is.
+    struct VlaScopeSite { HirNodeId scope; HirNodeId anchor; };
+    [[nodiscard]] VlaScopeSite resolveVlaScopeSite(HirNodeId declNode) const {
+        HirNodeId anchor = declNode;
+        HirNodeId scope  = hir.parent(anchor);
+        while (scope.valid()
+               && (isDeclaratorGroupBlock(scope)
+                   || (hir.kind(scope) == HirKind::LabelStmt
+                       && hir.labelBody(scope) == anchor))) {
+            anchor = scope;
+            scope  = hir.parent(anchor);
+        }
+        return {scope, anchor};
+    }
+
     // Open a teardown watermark for a dynamic-VLA local: emit a StackSave (SP
     // captured just BEFORE the VLA's `sub sp`) and push a vlaScopeStack_ frame. The
     // caller (VarDecl lowering) invokes this IMMEDIATELY before `allocaForLocal`
@@ -9561,42 +9651,42 @@ struct Lowerer {
     // The scope node is EITHER a compound-statement Block (a body/nested-block VLA,
     // torn down at the block's exit) OR a ForStmt (a `for`-INIT VLA — declared once at
     // loop entry, persists across iterations, torn down at the loop's EXIT edges by
-    // the For driver, NEVER on the back-edge). A VLA in a MULTI-declarator for-init
-    // (`for (int a[n], b[m]; ...)`) is wrapped in a Block whose parent is the ForStmt;
-    // that Block's own teardown would free the VLA at the END OF THE INIT (before the
-    // body), so that narrow shape is deferred fail-loud (never a silent early-free).
+    // the For driver, NEVER on the back-edge).
+    //
+    // ★★★ ONE WATERMARK PER DECLARATION STATEMENT, NEVER ONE PER DECLARATOR
+    // (D-CSUBSET-VLA-MULTIDECLARATOR-STATEMENT-TEARDOWN). The scope exit restores to
+    // the SHALLOWEST frame it opened, so a second StackSave taken between `a` and `b`
+    // of `int a[n], b[n];` is a value nothing can ever restore to — dead code that
+    // READS like a watermark. The second and later declarators of one group therefore
+    // reuse the first's frame, whose save is the SP captured before the FIRST object —
+    // exactly what the scope exit must restore to.
     [[nodiscard]] bool emitStackSaveForVla(HirNodeId declNode) {
-        HirNodeId const scopeNode = hir.parent(declNode);
+        VlaScopeSite const site = resolveVlaScopeSite(declNode);
+        HirNodeId const scopeNode = site.scope;
         bool const scopeIsBlock =
             scopeNode.valid() && hir.kind(scopeNode) == HirKind::Block;
         bool const scopeIsForInit =
-            scopeNode.valid() && hir.kind(scopeNode) == HirKind::ForStmt;
+            scopeNode.valid() && hir.kind(scopeNode) == HirKind::ForStmt
+            && hir.forInit(scopeNode).has_value()
+            && *hir.forInit(scopeNode) == site.anchor;
         if (!scopeIsBlock && !scopeIsForInit) {
             unsupported(declNode,
                 "a variable-length array in this declaration position is not yet "
                 "torn down at scope exit (D-CSUBSET-VLA)");
             return false;
         }
-        // A multi-declarator for-init Block (parent == ForStmt, and it IS that for's
-        // init clause): defer — its Block teardown would free the VLA before the body.
-        if (scopeIsBlock) {
-            HirNodeId const gp = hir.parent(scopeNode);
-            if (gp.valid() && hir.kind(gp) == HirKind::ForStmt) {
-                auto const initN = hir.forInit(gp);
-                if (initN.has_value() && *initN == scopeNode) {
-                    unsupported(declNode,
-                        "a variable-length array in a MULTI-declarator `for`-init "
-                        "clause (`for (int a[n], b[m]; ...)`) is not yet torn down at "
-                        "loop exit — deferred (D-CSUBSET-VLA-FOR-INIT-MULTIDECL)");
-                    return false;
-                }
-            }
-        }
+        // A sibling declarator of the SAME declaration statement: the group's
+        // watermark is already open, and it is the one taken before the first object.
+        if (site.anchor != declNode
+            && !vlaScopeStack_.empty()
+            && vlaScopeStack_.back().anchorNode == site.anchor
+            && vlaScopeStack_.back().scopeNode  == scopeNode)
+            return true;
         std::uint32_t const scopeId = vlaScopeCounter_++;
         MirInstId const save =
             mir.addInst(MirOpcode::StackSave, {}, i64Ty(), scopeId);
         if (!save.valid()) return false;
-        vlaScopeStack_.push_back({declNode, scopeNode, save, scopeId});
+        vlaScopeStack_.push_back({site.anchor, scopeNode, save, scopeId});
         return true;
     }
 
@@ -9615,8 +9705,18 @@ struct Lowerer {
     // this block declared (index == baseDepth), then pop those frames. `emitRestore
     // = false` on the error-bail path (pop only; compilation is aborting). No-op —
     // emits NEITHER op — when the block declared no VLA (the byte-clean common case).
-    void closeVlaBlockScope(std::size_t baseDepth, bool emitRestore) {
+    //
+    // ★★★ `blockNode` IS LOAD-BEARING AND THIS IS THE SINGLE CHOKEPOINT
+    // (D-CSUBSET-VLA-MULTIDECLARATOR-STATEMENT-TEARDOWN). A DECLARATOR-GROUP Block is
+    // not a scope: its frames belong to the ENCLOSING one, so it must neither restore
+    // (that frees objects still live — the silent miscompile) NOR pop (that strands
+    // the frames, and the enclosing scope then leaks the stack). Both halves are
+    // refused HERE rather than at the four call sites, because a call site that
+    // forgets fails toward the WRONG ANSWER, not toward an error.
+    void closeVlaBlockScope(HirNodeId blockNode, std::size_t baseDepth,
+                            bool emitRestore) {
         if (vlaScopeStack_.size() <= baseDepth) return;   // no VLA opened here
+        if (isDeclaratorGroupBlock(blockNode)) return;    // not a scope — hands off
         if (emitRestore && !mir.openBlockHasTerminator())
             emitVlaRestore(baseDepth);
         vlaScopeStack_.resize(baseDepth);
@@ -9624,8 +9724,13 @@ struct Lowerer {
 
     // Is label `L` inside `fr`'s VLA scope? Drives which scopes a `goto` exits.
     //  * A BLOCK-scope VLA: true iff fr.scopeNode is a lexical ancestor of L AND
-    //    fr.declNode textually PRECEDES (in the block's child order) the child leading
-    //    to L — the VLA's scope runs from its decl to the end of its block (C99 6.2.4).
+    //    fr.anchorNode textually PRECEDES (in the block's child order) the child
+    //    leading to L — the VLA's scope runs from its decl to the end of its block
+    //    (C99 6.2.4). ⚠ The anchor is the scope's DIRECT CHILD, not necessarily the
+    //    VarDecl (see `VlaScopeFrame`): for `int a[n], b[n];` it is the declarator-
+    //    group Block, for `L: int a[n];` the LabelStmt. Looking the VarDecl up here
+    //    instead would miss (`dIdx == -1`) and report "does not enclose", which frees
+    //    a live object on a forward `goto` inside the same block.
     //  * A for-INIT VLA (scopeNode is the ForStmt): true iff the ForStmt is a lexical
     //    ancestor of L — a for-init object is in scope for the ENTIRE for statement
     //    (there is no position "before" the for-init inside the loop), so ANY label in
@@ -9640,8 +9745,8 @@ struct Lowerer {
                 auto kids = hir.children(cur);
                 int pIdx = -1, dIdx = -1;
                 for (std::size_t i = 0; i < kids.size(); ++i) {
-                    if (kids[i] == prev)        pIdx = static_cast<int>(i);
-                    if (kids[i] == fr.declNode) dIdx = static_cast<int>(i);
+                    if (kids[i] == prev)          pIdx = static_cast<int>(i);
+                    if (kids[i] == fr.anchorNode) dIdx = static_cast<int>(i);
                 }
                 return dIdx >= 0 && pIdx >= 0 && dIdx < pIdx;
             }
@@ -11448,8 +11553,14 @@ struct Lowerer {
             // optimizer strength rather than according to the language.
             if (asmOperandBindsImmediateForm(o)) {
                 EvalEnvironment env = asmImmediateEvalEnvironment();
+                EvalOptions asmOpts;
+                // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: an `"i"` asm operand
+                // may be a character constant; relay the target's answer so it
+                // folds rather than refusing.
+                asmOpts.charIsUnsigned = config.charIsUnsigned;
                 ConstEvalResult const r =
-                    evaluateConstant(hir, interner, literals, kids[i], env);
+                    evaluateConstant(hir, interner, literals, kids[i], env,
+                                     asmOpts);
                 std::optional<std::int64_t> value;
                 if (r.value.has_value()) {
                     if (auto const* iv =
@@ -11988,7 +12099,7 @@ struct Lowerer {
                     // Resuming after a child finished. Bail on failure (pop the VLA
                     // frames this block opened; no restore — we are aborting).
                     if (!ok) {
-                        closeVlaBlockScope(vlaBase, /*emitRestore=*/false);
+                        closeVlaBlockScope(node2, vlaBase, /*emitRestore=*/false);
                         blockCtxs.pop_back(); work.pop_back(); break;
                     }
                     auto kids = hir.children(node2);
@@ -12011,7 +12122,7 @@ struct Lowerer {
                     // VLA C5: the block ran to completion — on a fall-through exit
                     // restore SP to the shallowest VLA it declared (before the
                     // enclosing frame's back-edge / Br), then pop those frames.
-                    closeVlaBlockScope(vlaBase, /*emitRestore=*/true);
+                    closeVlaBlockScope(node2, vlaBase, /*emitRestore=*/true);
                     blockCtxs.pop_back();
                     work.pop_back();
                     ok = true;
@@ -12571,7 +12682,7 @@ struct Lowerer {
                 auto kids = hir.children(node);
                 for (std::size_t i = 0; i < kids.size(); ++i) {
                     if (!lowerStmt(kids[i])) {
-                        closeVlaBlockScope(vlaBase, /*emitRestore=*/false);
+                        closeVlaBlockScope(node, vlaBase, /*emitRestore=*/false);
                         return false;
                     }
                     // A child may unconditionally transfer control and seal the
@@ -12591,7 +12702,7 @@ struct Lowerer {
                         mir.beginBlock(dead);
                     }
                 }
-                closeVlaBlockScope(vlaBase, /*emitRestore=*/true);
+                closeVlaBlockScope(node, vlaBase, /*emitRestore=*/true);
                 return true;
             }
             case HirKind::ReturnStmt: {
@@ -15710,6 +15821,14 @@ struct Lowerer {
         // `hirLowering.globalsConstEval.allowFloat: false` and the
         // engine refuses to fold its float arithmetic at module-load.
         opts.allowFloat = config.globalsAllowFloat;
+        // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the SAME `charIsUnsigned`
+        // this tier's `isSignedIntKind` already uses for the runtime char->int
+        // SExt/ZExt decision. Without it a global's `static int g = (char)200;`
+        // folded through a Char row that claimed 32 bits and UNSIGNED — DSS
+        // installed 200 where gcc 13.3.0 and clang 18.1.3 install -56 (✔MEASURED
+        // at b1f31420, rc 0 and no diagnostic). Reading the one field means the
+        // load-time value and the runtime conversion cannot disagree.
+        opts.charIsUnsigned = config.charIsUnsigned;
         for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
             if (hir.kind(decl) != HirKind::Global) continue;
             // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the declaration

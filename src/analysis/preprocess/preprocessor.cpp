@@ -2543,34 +2543,37 @@ struct SynthBuilder {
             // function-like `#define` as a NAME WITH NO BODY, which is what made
             // every guard that invoked one undecidable.
             //
-            // TF-C86 (D-CSUBSET-STDARG-F001A): `sbFirstNameOnLine` reads the
-            // directive's SUBJECT so both arms can refuse a conditional-inclusion
-            // OPERATOR name — the pre-scan must reach the SAME macro state the
-            // authoritative pass will, and that pass REFUSES the define/undef
-            // (P_PreprocessorOperatorNameNotDefinable). Handing it over would put
-            // a function-like `__has_include` in the oracle's table, shadowing
-            // the operator in the pre-scan while the real pass still answers it —
-            // one program, two verdicts on one file. ⓘ The oracle's own
-            // `handleDefine` refuses it too, so this test is belt-and-braces
-            // rather than the sole defence; it stays because it is also what
-            // keeps the DIAGNOSTIC with the authoritative pass alone (this
-            // pre-scan re-walks the same lines, and a scratch-reported refusal
-            // costs a materialization for nothing).
+            // ★★★ D-PP-HAS-EXTENSION-BUILTIN-ABSENT — THE OPERATOR-NAME FILTER
+            // THAT USED TO SIT HERE IS GONE, AND ITS REMOVAL IS THE POINT.
+            //
+            // TF-C86 skipped a `#define`/`#undef` whose subject was a
+            // conditional-inclusion operator, because the authoritative pass
+            // REFUSED that directive: handing it to the oracle would have put a
+            // function-like `__has_include` in the pre-scan's table while the
+            // real pass still answered the operator — one program, two verdicts
+            // on one file. The 2026-09-03 ruling inverts the premise: the
+            // authoritative pass now APPLIES the directive, so a pre-scan that
+            // skipped it would produce exactly the two-verdict disagreement the
+            // filter existed to prevent, pointing the other way.
+            //
+            // ⓘ THE DIAGNOSTIC STILL BELONGS TO THE AUTHORITATIVE PASS ALONE —
+            // that half of the old comment was a separate concern and it still
+            // holds, but it was never this filter's doing: `ppOracleDefine` /
+            // `ppOracleUndef` wrap the call in `ppOracleBeginScratch` /
+            // `ppOracleEndScratch`, so the oracle's diagnostics go to a scratch
+            // reporter and are discarded. The pre-scan re-walks the same lines
+            // and would otherwise double-report every one of them.
             if (sbStackActive(sbCondStack) && dirWord == cfg().defineDirective) {
                 std::size_t const lineEndTok = sbLineEndTok(i);
-                auto const subject = sbFirstNameOnLine(toks, j + 1, lineEndTok);
-                if (!isConditionalInclusionOperator(subject, cfg())) {
-                    oracle.ppOracleDefine(
-                        sbDirectiveTailText(toks, j + 1, lineEndTok, *scanBuf));
-                }
+                oracle.ppOracleDefine(
+                    sbDirectiveTailText(toks, j + 1, lineEndTok, *scanBuf));
                 i = lineEndTok - 1;
                 continue;
             }
             if (sbStackActive(sbCondStack) && dirWord == cfg().undefDirective) {
                 std::size_t const lineEndTok = sbLineEndTok(i);
                 auto const subject = sbFirstNameOnLine(toks, j + 1, lineEndTok);
-                if (!subject.empty()
-                    && !isConditionalInclusionOperator(subject, cfg())) {
+                if (!subject.empty()) {
                     // ★ D-PP-SYNTHBUILDER-PREDEFINED-DEFINEDNESS COLLAPSES HERE.
                     // The old code had to do TWO things — erase from `localMacros`
                     // AND record the name in a separate `undefinedNames`
@@ -3499,13 +3502,23 @@ public:
                   // already format-resolved). Defaults to {} so the ~dozen
                   // test/helper constructions compile unchanged; `preprocess()`
                   // always passes the merged list.
-                  std::span<PredefinedMacroDef const> effectivePredefines = {})
+                  std::span<PredefinedMacroDef const> effectivePredefines = {},
+                  // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the ACTIVE
+                  // (target x object format)'s plain-`char` signedness, relayed
+                  // to the `#if` ICE evaluator. C 6.4.4.4p10 makes
+                  // `#if 'ÿ' < 0` answer differently per target and nothing
+                  // else in this pass can know it. Defaulted (like
+                  // `activeFormat` above) so every test/helper construction
+                  // compiles unchanged; absent is NOT "signed" -- a character
+                  // constant above 0x7F then refuses, loud.
+                  std::optional<bool> charIsUnsigned = std::nullopt)
         : synth_(std::move(synth)), schema_(std::move(schema)), rep_(rep),
           prefixLen_(prefixLen), lineMap_(lineMap),
           includeDirs_(includeDirs), systemDirs_(systemDirs),
           activeFormat_(activeFormat),
           headerNameMatching_(headerNameMatching),
-          includingDir_(std::move(includingDir)) {
+          includingDir_(std::move(includingDir)),
+          charIsUnsigned_(charIsUnsigned) {
         // FC15b (predefined macros; C 6.10.8): seed the predefined-macro map
         // (name -> def) from config. An identifier that is NOT a `#define`d
         // macro but IS a predefined name materializes its configured value (see
@@ -4202,6 +4215,87 @@ private:
     // ⚠ The message names no language and no standard clause: the spelling is
     // whatever the active language document declares, so a citation here would
     // be a source-language assumption baked into a language-agnostic pass.
+    // ══ D-PP-HAS-EXTENSION-BUILTIN-ABSENT ═══════════════════════════════════
+    // ★★★ THE ONE PLACE A PROGRAM'S `#define`/`#undef` OF AN IMPLEMENTATION-
+    // OWNED NAME IS ADJUDICATED. Both `handleDefine` and `handleUndef` route
+    // BOTH their arms — the predefined-macro arm (`__STDC__`) and the operator
+    // arm (`__has_include` & siblings) — through this function, and the posture
+    // both hand it comes from the SAME `PredefinedMacroRedefinition` vocabulary
+    // declared in `.lang.json`.
+    //
+    // ★★ THAT IS THE POINT OF THE ROW, NOT A TIDINESS. The operator ruling
+    // 2026-09-03 was about ONE FUNCTION answering the identical error-vs-warning
+    // question two different ways: the predefined arm warned and applied
+    // (carrying "being stricter than every reference is not rigor" — see
+    // `handleDefine`), while the operator arm refused at Error. Making the
+    // operator arm warn while leaving the two independent would have fixed the
+    // SHAPE and left the DEFECT — the ruling says so in as many words ("leave
+    // nothing to be done"). One declaration, one lookup
+    // (`reservedIdentifierPosture`), one applier.
+    //
+    // Returns TRUE when the directive must be REFUSED and the caller must
+    // return WITHOUT applying it; FALSE when it was diagnosed-or-silent and the
+    // caller must FALL THROUGH and apply it. ⚠ The fall-through is load-bearing,
+    // not cleanup: a diagnostic with no effect is the worst of both readings
+    // (the program is told it did something and then finds it did not).
+    [[nodiscard]] bool applyReservedNamePolicy(
+        Token const& nameTok, std::string const& name,
+        PredefinedMacroRedefinition policy, std::string_view what,
+        std::string_view effect) {
+        if (predefinedNameChangeIsRefused(policy)) {
+            emitPP(rep_,
+                   DiagnosticCode::P_PreprocessorOperatorNameNotDefinable,
+                   synth_->id(), nameTok.span,
+                   std::string{"'"} + name + "' is " + std::string{what}
+                       + " and may not be taken over by the program");
+            return true;
+        }
+        if (predefinedNameIsDiagnosedOnChange(policy)) {
+            // ⓘ ONE CODE FOR BOTH ARMS, AND THE REFERENCES CHOSE IT.
+            // ✔MEASURED 2026-09-04 on one fixture carrying `#undef __STDC__`
+            // and `#undef __has_include`: gcc 13.3.0 emits the byte-identical
+            // `warning: undefining "X"` for both, and clang 18.1.3 emits the
+            // same warning under the SAME flag (`-Wbuiltin-macro-redefined`)
+            // for both. The references do not distinguish these two situations,
+            // so a second DSS code would have been a distinction only DSS drew.
+            // Suppressible, matching clang's flag exactly — an unsuppressable
+            // warning here would be a fresh instance of the very
+            // stricter-than-the-union posture this row retired.
+            emitPP(rep_, DiagnosticCode::P_PreprocessorPredefinedMacro,
+                   synth_->id(), nameTok.span,
+                   std::string{"'"} + name + "' is " + std::string{what} + "; "
+                       + std::string{effect},
+                   DiagnosticSeverity::Warning);
+        }
+        return false;
+    }
+
+    // The operator-name half of the same adjudication, shared by the `#define`
+    // and `#undef` arms so the two cannot answer differently. `revoke` is true
+    // for `#undef`: an operator lives in the CONFIG, not in `table_`, so the
+    // only way an `#undef` can TAKE EFFECT is an explicit revocation set — the
+    // exact analogue of `predefined_.erase` one arm up, and without it the
+    // directive would be a diagnostic with no effect.
+    // Returns TRUE when the caller must refuse.
+    [[nodiscard]] bool applyOperatorNamePolicy(Token const&       nameTok,
+                                               std::string const& name,
+                                               bool               revoke) {
+        auto const posture = reservedIdentifierPosture(name, cfg());
+        if (!posture.has_value()) return false;   // not a reserved name
+        std::string_view const what =
+            (!cfg().definedOperator.empty() && name == cfg().definedOperator)
+                ? "this language's `#if` definedness operator"
+                : "an operator this implementation provides";
+        std::string_view const effect =
+            revoke ? "#undef'ing it removes the implementation's operator"
+                   : "#defining it replaces the implementation's operator";
+        if (applyReservedNamePolicy(nameTok, name, *posture, what, effect)) {
+            return true;
+        }
+        if (revoke) revokedOperators_.insert(name);
+        return false;
+    }
+
     void reportSpecialVariadicIdentifier(Token const&       t,
                                          std::string const& spelling) {
         emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
@@ -5083,9 +5177,37 @@ private:
         // is now THIS FUNCTION, reached through `ppOracleIsDefined`
         // ([[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]), so the two oracles cannot
         // drift because there is one.
+        // D-PP-HAS-EXTENSION-BUILTIN-ABSENT: + the FEATURE-QUERY operators, and
+        // − whatever the program has `#undef`'d away.
+        //
+        // ★★ THE PREDICATE IS `isImplementationProvidedOperator`, NOT
+        // `isConditionalInclusionOperator`, AND THE DIFFERENCE IS THE ROW. That
+        // second predicate bundles VISIBILITY with NON-DEFINABILITY; only
+        // visibility belongs to the four feature-query operators, because C23
+        // 6.10.10p2 does not reserve them. Adding them to the bundled predicate
+        // would have made `#ifndef __has_attribute` false AND refused the shim's
+        // `#define`, leaving `#if __has_attribute(x)` as `0(x)` — a preprocessor
+        // syntax error in a header essentially every macOS TU includes. The two
+        // properties are now two predicates and the refusal is config DATA.
+        //
+        // ⚠ `revokedOperators_` IS WHAT MAKES `#undef` MEAN SOMETHING. The
+        // operator is config, not a `table_` row, so nothing else could subtract
+        // it; ✔MEASURED, gcc 13.3.0, gcc 13.2.0 (mingw) and clang 18.1.3 all
+        // report `#ifdef __has_include` FALSE after an `#undef` of it.
         return table_.find(std::string{name}) != table_.end()
             || predefined_.find(std::string{name}) != predefined_.end()
-            || isConditionalInclusionOperator(name, cfg());
+            || (isImplementationProvidedOperator(name, cfg())
+                && !operatorRevoked(name));
+    }
+
+    // TRUE iff the program has `#undef`'d this implementation-provided operator
+    // away. One accessor rather than a bare set lookup because THREE readers ask
+    // it — `isDefined`, the `#if` fold (through a callback) and the include
+    // pre-scan's oracle — and a fourth reader that forgot is how the guard and
+    // the evaluator come to disagree about the same file.
+    [[nodiscard]] bool operatorRevoked(std::string_view name) const {
+        return revokedOperators_.find(std::string{name})
+            != revokedOperators_.end();
     }
 
     // The token-text accessor + the macro-state callbacks the shared `sbHandle*`
@@ -5243,9 +5365,17 @@ private:
             if (ec) return 0;                                   // stat failed
             return sz == 0 ? 2 /*EMPTY*/ : 1 /*FOUND*/;
         };
+        // D-PP-HAS-EXTENSION-BUILTIN-ABSENT: the revocation oracle. THIS
+        // expander's set, so the `#if` fold and `#ifdef` cannot disagree about
+        // whether an `#undef`'d operator is still an operator — the two-verdicts-
+        // on-one-file failure the TF-C86 refusal was originally protecting
+        // against, now protected against on the other side of the ruling.
+        auto revokedCb = [this](std::string_view n) {
+            return operatorRevoked(n);
+        };
         auto v = evaluateIfExpression(operand, *schema_, expandCb, definedCb,
                                       hasIncludeCb, *synth_, productCb, rep_,
-                                      embedCb);
+                                      embedCb, revokedCb, charIsUnsigned_);
         return v.has_value() && *v;
     }
 
@@ -5593,31 +5723,45 @@ private:
         // program action consume the name's diagnosed status — matching clang,
         // where a second `#undef`/`#define` cycle is silent.
         if (auto pit = predefined_.find(name); pit != predefined_.end()) {
-            if (predefinedNameIsDiagnosedOnChange(
-                    pit->second.programRedefinition)) {
-                emitPP(rep_, DiagnosticCode::P_PreprocessorPredefinedMacro,
-                       synth_->id(), in[nameIdx].span,
-                       std::string{"'"} + name
-                           + "' is a predefined macro of this implementation; "
-                             "#defining it replaces the implementation's value",
-                       DiagnosticSeverity::Warning);
+            if (applyReservedNamePolicy(
+                    in[nameIdx], name, pit->second.programRedefinition,
+                    "a predefined macro of this implementation",
+                    "#defining it replaces the implementation's value")) {
+                return;
             }
             predefined_.erase(pit);
         }
 
-        // TF-C86 (D-CSUBSET-STDARG-F001A): the sibling constraint for the
-        // CONDITIONAL-INCLUSION OPERATORS (C23 6.10.1). Same posture as the
-        // predefined arm above and the same reason at a different tier: honoring
-        // `#define __has_include(x) 0` would let the guard answer 0 while
-        // `#include <h>` still splices the header — one program, two verdicts on
-        // one file. Config-driven name set, no hard-coded spelling.
-        if (isConditionalInclusionOperator(name, cfg())) {
-            emitPP(rep_,
-                   DiagnosticCode::P_PreprocessorOperatorNameNotDefinable,
-                   synth_->id(), in[nameIdx].span,
-                   std::string{"'"} + name
-                       + "' is a conditional-inclusion operator this "
-                         "implementation provides and may not be #defined");
+        // ★★★ D-PP-HAS-EXTENSION-BUILTIN-ABSENT — THE OPERATOR ARM, AND IT NOW
+        // READS THE SAME DECLARATION AS THE PREDEFINED ARM DIRECTLY ABOVE.
+        //
+        // It used to refuse at Error with a hard-coded severity, on the reading
+        // that C23 6.10.10p2 reserves the four conditional-inclusion identifiers
+        // to the implementation. The standard's text really does say that — which
+        // is exactly why this needed an OPERATOR RULING rather than a fix: the
+        // union's ISO C vertex and its three implementation vertices disagreed,
+        // and DSS had picked the standard over every implementation.
+        //
+        // ✔MEASURED 2026-09-04, each reference invoked SEPARATELY, WITH A CONTROL
+        // proving the untouched operator answers 1 for the same local header
+        // (without the control a 0 is equally consistent with the header simply
+        // not being found — which is precisely what MSVC's answer looked like):
+        //   `#define __has_include(x) 0` — gcc 13.3.0 warns, gcc 13.2.0 (mingw)
+        //   warns, clang 18.1.3 warns (-Wbuiltin-macro-redefined), cl 19.51 is
+        //   silent; ALL FOUR exit 0 and ALL FOUR APPLY it.
+        // ⇒ OPERATOR RULING 2026-09-03: "we must accept too. best long term
+        // solution, no workaround, first class implementation, 100% config
+        // driven. leave nothing to be done."
+        //
+        // ⚠ THE `defined` OPERATOR IS A DIFFERENT CLASS AND IS STILL REFUSED —
+        // and that refusal is NEW here, not preserved: `isConditionalInclusion
+        // Operator` deliberately excluded `definedOperator`, so at this row's
+        // base `#define defined 1` created an ordinary macro in silence. ✔MEASURED
+        // 2026-09-04: gcc, mingw gcc and clang all make it a hard ERROR (rc 1),
+        // and only cl accepts-then-ignores it. The posture is now DATA
+        // (`reservedIdentifiers.definedOperator`), so which class draws which
+        // severity is a declaration rather than an `if` in this function.
+        if (applyOperatorNamePolicy(in[nameIdx], name, /*revoke=*/false)) {
             return;
         }
 
@@ -6420,28 +6564,42 @@ private:
         // answering true from `predefined_` and the `#undef` would be a
         // diagnostic with no effect, which is the worst of both readings.
         if (auto pit = predefined_.find(name); pit != predefined_.end()) {
-            if (predefinedNameIsDiagnosedOnChange(
-                    pit->second.programRedefinition)) {
-                emitPP(rep_, DiagnosticCode::P_PreprocessorPredefinedMacro,
-                       synth_->id(), in[p].span,
-                       std::string{"'"} + name
-                           + "' is a predefined macro of this implementation; "
-                             "#undef'ing it removes the implementation's value",
-                       DiagnosticSeverity::Warning);
+            if (applyReservedNamePolicy(
+                    in[p], name, pit->second.programRedefinition,
+                    "a predefined macro of this implementation",
+                    "#undef'ing it removes the implementation's value")) {
+                return;
             }
             predefined_.erase(pit);
         }
-        // TF-C86 (D-CSUBSET-STDARG-F001A): the `#undef` half. An `#undef
-        // __has_include` that SUCCEEDED would silently turn the operator back
-        // into an ordinary undefined identifier folding to 0 — the same
-        // include-vs-guard disagreement the `#define` arm refuses.
-        if (isConditionalInclusionOperator(name, cfg())) {
-            emitPP(rep_,
-                   DiagnosticCode::P_PreprocessorOperatorNameNotDefinable,
-                   synth_->id(), in[p].span,
-                   std::string{"'"} + name
-                       + "' is a conditional-inclusion operator this "
-                         "implementation provides and may not be #undef'd");
+        // ★★★ D-PP-HAS-EXTENSION-BUILTIN-ABSENT — the `#undef` half, through the
+        // SAME declaration and the SAME applier as the arm above it.
+        //
+        // ⚠ THIS IS THE HALF WHERE THE REFERENCES SPLIT ON MEANING, AND THE
+        // SPLIT REFUTES ONE HALF OF THE MEASUREMENT THIS ROW'S RULING WAS ASKED
+        // ON. ✔MEASURED 2026-09-04, each reference invoked SEPARATELY:
+        //   `#undef __has_include` then `#ifdef __has_include`
+        //     gcc 13.3.0 (WSL)    warns, rc 0, `#ifdef` FALSE   -> APPLIES
+        //     gcc 13.2.0 (mingw)  warns, rc 0, `#ifdef` FALSE   -> APPLIES
+        //     clang 18.1.3        warns, rc 0, `#ifdef` FALSE   -> APPLIES
+        //     cl 19.51.36252      SILENT, rc 0, `#ifdef` TRUE   -> IGNORES IT
+        // Acceptance is unanimous (so the disjunction forbids refusing) and
+        // MEANING is 3-1, not 4-0 as this row recorded. DSS follows the three,
+        // on the tie-break already ruled in this same function by
+        // [[D-PP-VA-SPECIAL-IDENTIFIER-NAME-POSITIONS-REFUSED-ABOVE-THE-UNION]]:
+        // a reference that SILENTLY DISCARDS code the author wrote does not get
+        // to be the model. A deliberate, recorded divergence from cl is born
+        // here.
+        //
+        // ⚠ AND "APPLIES" IS THE WHOLE CLAIM. An operator lives in the CONFIG,
+        // not in `table_`, so `table_.erase` below cannot reach it — the
+        // revocation set inside `applyOperatorNamePolicy` is what makes the
+        // directive take effect, and it is the exact analogue of the
+        // `predefined_.erase` in the arm above. Without it this would be a
+        // warning that changed nothing, which is worse than the refusal it
+        // replaced: the program would be told its `#undef` was noted and would
+        // then find the operator still answering.
+        if (applyOperatorNamePolicy(in[p], name, /*revoke=*/true)) {
             return;
         }
         // C23 6.10.5p5: the `#undef` half of the variadic catch-all name arm in
@@ -8548,6 +8706,14 @@ private:
     // identity pass), and the once-computed `__DATE__`/`__TIME__` INNER spellings
     // (without the surrounding quotes -- `materializePredefined` quotes them).
     std::unordered_map<std::string, PredefinedMacroDef> predefined_;
+    // D-PP-HAS-EXTENSION-BUILTIN-ABSENT: the implementation-provided OPERATOR
+    // names this program has `#undef`'d away. `predefined_.erase` is the model:
+    // an entry that lives in a MAP is removed by erasing it, and an operator
+    // that lives in CONFIG can only be removed by recording the subtraction.
+    // ⚠ Per TRANSLATION UNIT, like every other member here — an `#undef` in one
+    // TU must not reach the next, and a set on the expander is what guarantees
+    // that without anyone remembering to reset it.
+    std::unordered_set<std::string>      revokedOperators_;
     LineMap*                             lineMap_ = nullptr;
     std::string                          dateString_;   // "Mmm dd yyyy"
     std::string                          timeString_;   // "hh:mm:ss"
@@ -8565,6 +8731,9 @@ private:
     // rule, applied by every include search the AUTHORITATIVE pass performs.
     HeaderNameMatching                   headerNameMatching_;
     fs::path                             includingDir_;
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: relayed to
+    // `evaluateIfExpression`; see the constructor parameter.
+    std::optional<bool>                  charIsUnsigned_{};
     // FC14: the conditional-compilation frame stack (one frame per open
     // `#if`/`#ifdef`/`#ifndef`). See CondFrame + handleIf/Elif/Else/Endif.
     std::vector<CondFrame>               condStack_;
@@ -8976,7 +9145,8 @@ PreprocessResult preprocessRun(
     std::optional<ObjectFormatKind>      activeFormat,
     std::span<std::string const>         userDefines,
     std::span<PredefinedMacroDef const>  targetPredefinedMacros,
-    std::span<PredefinedMacroDef const>  formatPredefinedMacros) {
+    std::span<PredefinedMacroDef const>  formatPredefinedMacros,
+    std::optional<bool>                  charIsUnsigned) {
     PreprocessResult result;
     result.diagnostics = std::make_unique<DiagnosticReporter>(budget.asConfig());
 
@@ -9310,7 +9480,10 @@ PreprocessResult preprocessRun(
                            // give the SAME answer the `#include` above does, so
                            // it must derive its includer dir the same way.
                            includingDirectoryOf(mainSource->name()),
-                           merged.effective};
+                           merged.effective,
+                           // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the
+                           // target's plain-`char` sign, for the `#if` fold.
+                           charIsUnsigned};
     std::vector<Token> finalTokens;
     {
         // D-PERF-1 sub-timing: the macro pass (table build + stream expansion +
@@ -9572,7 +9745,8 @@ PreprocessResult preprocess(
     std::optional<ObjectFormatKind>      activeFormat,
     std::span<std::string const>         userDefines,
     std::span<PredefinedMacroDef const>  targetPredefinedMacros,
-    std::span<PredefinedMacroDef const>  formatPredefinedMacros) {
+    std::span<PredefinedMacroDef const>  formatPredefinedMacros,
+    std::optional<bool>                  charIsUnsigned) {
     if (!mainSource || !schema) ppFatal("preprocess: null source or schema");
     if (!schema->preprocess().enabled) {
         ppFatal("preprocess: called with a schema whose preprocess pass is "
@@ -9581,7 +9755,7 @@ PreprocessResult preprocess(
     PreprocessResult result = preprocessRun(
         mainSource, std::move(schema), includeDirs, headerNameMatching,
         budget, systemDirs, activeFormat, userDefines, targetPredefinedMacros,
-        formatPredefinedMacros);
+        formatPredefinedMacros, charIsUnsigned);
     // ★ THE SINGLE EXIT. Its value is that it is not optional: a `return` added
     // anywhere inside `preprocessRun` — for a config fault nobody has thought
     // of yet — cannot bypass it.

@@ -130,7 +130,7 @@ combineBinaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& opti
     // C4b (D-CSUBSET-BITINT-CONSTFOLD-LARGE): a `_BitInt`-involving binary op folds
     // via the shared wrap-aware bignum at the TRUE C23 UAC result width. A BitInt
     // operand is never float / address, so this is checked FIRST.
-    if (auto bf = detail::foldBitIntBinary(*opK, *a.value, *b.value); bf.applies) {
+    if (auto bf = detail::foldBitIntBinary(*opK, *a.value, *b.value, options.charIsUnsigned); bf.applies) {
         if (bf.ok) return ok(std::move(bf.value));
         return fail(bf.failure, expr);
     }
@@ -214,7 +214,7 @@ combineUnaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& optio
         return fail(ConstEvalFailure::UnsupportedOperator, expr);
     }
     // C4b: a unary op on a `_BitInt` operand (`-5wb`, `~x`) folds via the bignum.
-    if (auto uf = detail::foldBitIntUnary(*opK, *inner.value); uf.applies) {
+    if (auto uf = detail::foldBitIntUnary(*opK, *inner.value, options.charIsUnsigned); uf.applies) {
         if (uf.ok) return ok(std::move(uf.value));
         return fail(uf.failure, expr);
     }
@@ -592,7 +592,7 @@ evalNode(NodeId                              expr,
             // analog (`const char c=300; c` folds to 300 not 44) is tracked as
             // `D-CSUBSET-CONST-REF-DECLARED-NARROWING`, out of this arc's scope.
             if (resolved->declaredBitPrecise && inner.value.has_value()) {
-                if (auto bv = detail::asBitIntValue(*inner.value)) {
+                if (auto bv = detail::asBitIntValue(*inner.value, options.charIsUnsigned)) {
                     bv->convertTo(resolved->declaredBitPrecise->width,
                                   resolved->declaredBitPrecise->isSigned);
                     HirLiteralValue lv;
@@ -818,7 +818,7 @@ evalNode(NodeId                              expr,
                 // `(double)18446744073709551615ULL` to -1.0, while `asInt64`
                 // refuses the value outright — and all four references fold it to
                 // 2^64 (✔MEASURED).
-                auto const iv = detail::integerConstantAsDouble(*inner.value);
+                auto const iv = detail::integerConstantAsDouble(*inner.value, options.charIsUnsigned);
                 if (!iv.has_value()) {
                     return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
                 }
@@ -848,7 +848,7 @@ evalNode(NodeId                              expr,
                 v.value = *fv->value;
                 return ok(std::move(v));
             }
-            auto bv = detail::asBitIntValue(*inner.value);
+            auto bv = detail::asBitIntValue(*inner.value, options.charIsUnsigned);
             if (!bv.has_value()) {
                 return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
             }
@@ -920,7 +920,7 @@ evalNode(NodeId                              expr,
                 v.value = *fv->value;
                 return ok(std::move(v));
             }
-            auto bv = detail::asBitIntValue(*inner.value);
+            auto bv = detail::asBitIntValue(*inner.value, options.charIsUnsigned);
             if (!bv.has_value()) {
                 return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
             }
@@ -952,6 +952,21 @@ evalNode(NodeId                              expr,
                 return detail::intKindFromWidth(
                     static_cast<std::uint32_t>(tgt->intBits), tgt->intSigned);
             };
+            // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: a plain-`char` target
+            // whose signedness was never supplied is answerable ONLY while the
+            // two readings agree — i.e. while the truncated byte's high bit is
+            // clear. `(char)300` is 44 either way and folds; `(char)200` is -56
+            // or 200 depending on the target and must NOT be guessed. VALUE-
+            // scoped, not type-scoped, so a target-less const-expr (the LSP, the
+            // FFI header parser) keeps every answer that is not in doubt — the
+            // identical rule `narrowCharConstantSignednessMatters` applies to a
+            // character constant. Called from BOTH cast arms below; a guard on
+            // one arm only is the partial fix that reads as a complete one.
+            auto const charSignUnknownAndObservable =
+                [&](std::int64_t truncated) {
+                    return tgt->intSignednessUnknown
+                        && (static_cast<std::uint64_t>(truncated) & 0x80u) != 0u;
+                };
             // ── FLOAT → INTEGER, C 6.3.1.4p1 ────────────────────────────────────
             // [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]], and the
             // shape the row is named for. `(int)1.5` reached the `asIntBits`
@@ -982,6 +997,9 @@ evalNode(NodeId                              expr,
                     *inner.value, static_cast<std::uint32_t>(tgt->intBits),
                     tgt->intSigned, options)) {
                 if (!fv->value.has_value()) return fail(ConstEvalFailure::Overflow, expr);
+                if (charSignUnknownAndObservable(fv->value->asI64())) {
+                    return fail(ConstEvalFailure::NotAConstantExpression, expr);
+                }
                 HirLiteralValue v;
                 v.core = castCore();
                 // Width ≤ 64 here (the 128-bit target was handled above), so the
@@ -1049,7 +1067,7 @@ evalNode(NodeId                              expr,
                 // (D-CE-ASINT64-REJECTS-BY-WIDTH-NOT-MAGNITUDE), so
                 // `int a[(__uint128_t)1 << 100];` keeps failing loud rather than
                 // becoming a truncated bound.
-                auto wide = detail::asBitIntValue(*inner.value);
+                auto wide = detail::asBitIntValue(*inner.value, options.charIsUnsigned);
                 if (!wide.has_value()) {
                     return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
                 }
@@ -1060,6 +1078,16 @@ evalNode(NodeId                              expr,
                 // here is ≤ 64 (the 128-bit target was handled above).
                 wide->convertTo(64u, /*isSigned=*/false);
                 iv = static_cast<std::int64_t>(wide->low64());
+            }
+            // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: a plain-`char` target
+            // whose signedness was never supplied is answerable ONLY while the
+            // two readings agree — i.e. while the truncated byte's high bit is
+            // clear. `(char)300` is 44 either way and folds; `(char)200` is -56
+            // or 200 depending on the target and must NOT be guessed. Scoped to
+            // the VALUE rather than to the type so a target-less const-expr keeps
+            // every answer that is not actually in doubt.
+            if (charSignUnknownAndObservable(*iv)) {
+                return fail(ConstEvalFailure::NotAConstantExpression, expr);
             }
             HirLiteralValue v;
             v.core  = castCore();
@@ -1303,10 +1331,26 @@ evalNode(NodeId                              expr,
             if (!cp.has_value()) {
                 return fail(ConstEvalFailure::NotAConstantExpression, expr);
             }
+            // [[D-CSUBSET-CHAR-HIGHBYTE-ICE-SIGNEDNESS]] /
+            // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the decoder answers with
+            // the CODE UNIT (0..255); C 6.4.4.4p10's VALUE is that unit read as a
+            // plain `char` and converted to `int`, which is negative for a high
+            // byte on a signed-`char` target. This arm used to take the unit
+            // verbatim, so `int a[('\xff' < 0) ? 1 : 2]` sized 2 where gcc and
+            // clang size 1 — rc 0, no diagnostic. The turn is made by the ONE
+            // shared helper so the `#if` fold and value lowering cannot disagree.
+            // A 0–127 body is the same integer either way and folds with no
+            // target in hand; a high byte without one REFUSES rather than
+            // guessing (the caller's loud "not a constant expression").
+            if (narrowCharConstantSignednessMatters(*cp)
+                && !options.charIsUnsigned.has_value()) {
+                return fail(ConstEvalFailure::NotAConstantExpression, expr);
+            }
             HirLiteralValue lv;
             lv.core  = TypeKind::I32;  // C 6.4.4.4: a char constant has type
                                        // `int`; consumers read `.value`
-            lv.value = static_cast<std::int64_t>(*cp);
+            lv.value = narrowCharConstantValue(
+                *cp, options.charIsUnsigned.value_or(false));
             return ok(std::move(lv));
         }
     }
@@ -1502,7 +1546,8 @@ std::optional<bool> asBoolBridge(HirLiteralValue const& v,
 // I128/U128 were once absent from the ONE copy that existed, and the MEASURED
 // symptom was every 128-bit constant expression refusing.
 std::optional<CstCastTarget>
-classifyCstCastTarget(TypeInterner const& in, TypeId ty) {
+classifyCstCastTarget(TypeInterner const& in, TypeId ty,
+                      std::optional<bool> charIsUnsigned) {
     if (!ty.valid()) return std::nullopt;
     CstCastTarget t;
     TypeKind const k = in.kind(ty);
@@ -1531,7 +1576,16 @@ classifyCstCastTarget(TypeInterner const& in, TypeId ty) {
         // which a width-1 truncation gets wrong for every even value — see the
         // `isBool` note on the descriptor for the measured 41-vs-42 array bound.
         case TypeKind::Bool: t.isBool   = true;  break;
+        // ⚠ `Char` IS NOT `I8`. `signed char` (I8) is signed by the standard;
+        // plain `char` is whichever the TARGET declares (C 6.2.5p15), so it reads
+        // the threaded answer and REFUSES when there is none. Sharing I8's row was
+        // the defect: `(char)200` folded to -56 on the unsigned-`char` arm64 leg
+        // too, silently, in every array-dimension and enumerator const-expr.
         case TypeKind::Char:
+            t.isInteger=true; t.intBits=8;
+            t.intSigned = charIsUnsigned.has_value() ? !*charIsUnsigned : false;
+            t.intSignednessUnknown = !charIsUnsigned.has_value();
+            break;
         case TypeKind::I8:   t.isInteger=true; t.intBits=8;  t.intSigned=true;  break;
         case TypeKind::U8:   t.isInteger=true; t.intBits=8;  t.intSigned=false; break;
         case TypeKind::I16:  t.isInteger=true; t.intBits=16; t.intSigned=true;  break;

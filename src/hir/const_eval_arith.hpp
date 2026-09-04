@@ -364,7 +364,30 @@ struct IntKindInfo {
     int  bits;
     bool isSigned;
 };
-[[nodiscard]] inline std::optional<IntKindInfo> intKindInfo(TypeKind k) noexcept {
+// ── THE (width, signedness) OF A STANDARD INTEGER CORE ──────────────────────
+// [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]. Every row here is a property of C
+// and of the data model DSS ships — EXCEPT `Char`, whose sign C 6.2.5p15 leaves
+// implementation-defined and which the TARGET declares in its one
+// `charIsUnsigned` key (resolved per object format:
+// `TargetSchema::charIsUnsigned(ObjectFormatKind)`). That is why the fact is a
+// REQUIRED parameter and not a defaulted one: a default is a second place the
+// answer is decided, and it is decided in silence.
+//
+// ⚠ THE `Char` ROW USED TO READ `{32, false}` AND BOTH FIELDS WERE WRONG.
+// 32 bits made `(char)300` fold to 300 instead of 44 (✔MEASURED: DSS 45 vs
+// gcc 13.3.0 / clang 18.1.3 / aarch64-linux-gnu-gcc 13.3.0 all 42 on
+// `static int g = (char)300; g == 44`), and the WIDTH bug MASKED the sign bug
+// because a value that survives un-truncated is identical under both readings.
+// `char` is 8 bits in every data model DSS ships, so the width is unconditional;
+// only the sign asks the target.
+//
+// ★ ABSENT FACT ⇒ `nullopt` ⇒ REFUSE, and that costs no new failure channel:
+// every caller already treats `nullopt` as "not a foldable integer kind" and
+// fails loud. A tier that has not been handed the target's answer therefore
+// cannot fold a `char` at all, rather than folding it as whichever sign the
+// author of that tier happened to assume.
+[[nodiscard]] inline std::optional<IntKindInfo>
+intKindInfo(TypeKind k, std::optional<bool> charIsUnsigned) noexcept {
     switch (k) {
         case TypeKind::Bool: return IntKindInfo{1,   false};
         case TypeKind::I8:   return IntKindInfo{8,   true};
@@ -374,7 +397,9 @@ struct IntKindInfo {
         case TypeKind::U16:  return IntKindInfo{16,  false};
         case TypeKind::I32:  return IntKindInfo{32,  true};
         case TypeKind::U32:  return IntKindInfo{32,  false};
-        case TypeKind::Char: return IntKindInfo{32,  false};
+        case TypeKind::Char:
+            if (!charIsUnsigned.has_value()) return std::nullopt;
+            return IntKindInfo{8, !*charIsUnsigned};
         case TypeKind::I64:  return IntKindInfo{64,  true};
         case TypeKind::U64:  return IntKindInfo{64,  false};
         case TypeKind::I128: return IntKindInfo{128, true};
@@ -449,7 +474,8 @@ struct IntKindInfo {
 // has no 64-bit rendering at all (a wide `_BitInt` / `__int128`), which the
 // callers turn into a loud refusal rather than a rounded guess.
 [[nodiscard]] inline std::optional<double>
-integerConstantAsDouble(HirLiteralValue const& v) noexcept {
+integerConstantAsDouble(HirLiteralValue const& v,
+                        std::optional<bool> charIsUnsigned) noexcept {
     if (auto const* uv = std::get_if<std::uint64_t>(&v.value)) {
         return static_cast<double>(*uv);
     }
@@ -458,7 +484,7 @@ integerConstantAsDouble(HirLiteralValue const& v) noexcept {
     bool isUnsigned = false;
     if (auto const* bv = std::get_if<BitIntValue>(&v.value)) {
         isUnsigned = !bv->isSigned();
-    } else if (auto const si = intKindInfo(v.core); si.has_value()) {
+    } else if (auto const si = intKindInfo(v.core, charIsUnsigned); si.has_value()) {
         isUnsigned = !si->isSigned;
     }
     return isUnsigned ? static_cast<double>(static_cast<std::uint64_t>(*bits))
@@ -630,7 +656,8 @@ struct BitIntOperandType { std::uint32_t width; bool isSigned; bool isBitPrecise
 // (the modular reduction), `promoteBitIntOperand` (C 6.3.1.8) and
 // `intKindFromWidth`. Nothing here is a private `Int*` verb set.
 [[nodiscard]] inline std::optional<BitIntOperandType>
-bitIntOperandType(HirLiteralValue const& v) noexcept;
+bitIntOperandType(HirLiteralValue const& v,
+                  std::optional<bool> charIsUnsigned) noexcept;
 [[nodiscard]] inline BitIntOperandType
 promoteBitIntOperand(BitIntOperandType t) noexcept;
 [[nodiscard]] inline BitIntOperandType
@@ -652,14 +679,15 @@ intKindFromWidth(std::uint32_t width, bool isSigned) noexcept;
 // so a 128-bit domain cannot be expressed and MUST NOT be silently truncated
 // (D-CSUBSET-INT128-CONSTFOLD-WIDE routes those through the bignum instead).
 [[nodiscard]] inline std::optional<IntKindInfo>
-intOpDomain(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b) noexcept {
-    auto at = bitIntOperandType(a);
+intOpDomain(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b,
+            std::optional<bool> charIsUnsigned) noexcept {
+    auto at = bitIntOperandType(a, charIsUnsigned);
     if (!at.has_value() || at->isBitPrecise) return std::nullopt;
     BitIntOperandType rt{};
     if (isShiftOp(op)) {
         rt = promoteBitIntOperand(*at);          // C 6.5.7p3
     } else {
-        auto bt = bitIntOperandType(b);
+        auto bt = bitIntOperandType(b, charIsUnsigned);
         if (!bt.has_value() || bt->isBitPrecise) return std::nullopt;
         rt = bitIntUac(*at, *bt);                // C 6.3.1.8
     }
@@ -674,12 +702,25 @@ applyBinaryInt(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b,
     auto av64 = asIntBits(a);
     auto bv64 = asIntBits(b);
     if (!av64.has_value() || !bv64.has_value()) return std::nullopt;
+    // ── [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: A `char` OPERAND WITH NO
+    // TARGET ANSWER IS A REFUSAL, NOT A FALLTHROUGH. `intOpDomain` nullopts for
+    // it (via `intKindInfo`'s Char row), and the `dom.has_value()` fallthrough
+    // below would then evaluate the pair in the HOST's signed int64 domain —
+    // which is a perfectly plausible ANSWER and therefore the dangerous one.
+    // Named here rather than left to fall out, because the fallthrough is
+    // correct for every OTHER reason `dom` can be absent (`_BitInt`, 128-bit)
+    // and this one reason must not ride along with them.
+    if ((a.core == TypeKind::Char || b.core == TypeKind::Char)
+        && !opts.charIsUnsigned.has_value()) {
+        outFailure = ConstEvalFailure::UnsupportedTypeKind;
+        return std::nullopt;
+    }
     // ── CONVERT TO THE OPERATION'S TYPE (C 6.3.1.3p2 -- modular, ALWAYS
     // defined, never an overflow). `wrapToIntTarget` is identity at width 64,
     // where the int64 payload is already the right bit pattern; below 64 it
     // masks and re-extends. `dom` absent = a `_BitInt`/128-bit/non-integer pair
     // that this int64 path does not own, so the historical behaviour stands.
-    auto const dom = intOpDomain(op, a, b);
+    auto const dom = intOpDomain(op, a, b, opts.charIsUnsigned);
     std::int64_t const av = dom.has_value() ? wrapToIntTarget(*av64, *dom) : *av64;
     // The RHS of a shift keeps its own value: it is a COUNT, not an operand of
     // the result type (C 6.5.7p3), and the range check below reads it directly.
@@ -922,7 +963,8 @@ applyBinaryFloat(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& 
 
 
 [[nodiscard]] inline std::optional<BitIntOperandType>
-bitIntOperandType(HirLiteralValue const& v) noexcept {
+bitIntOperandType(HirLiteralValue const& v,
+                  std::optional<bool> charIsUnsigned) noexcept {
     // D-CSUBSET-INT128-CONSTFOLD (TF-C94): `core` is consulted BEFORE the variant
     // arm, because after this cycle the two no longer determine each other. A
     // folded 128-bit STANDARD value rides the `BitIntValue` payload (nothing
@@ -941,7 +983,7 @@ bitIntOperandType(HirLiteralValue const& v) noexcept {
     if (std::holds_alternative<std::int64_t>(v.value)
         || std::holds_alternative<std::uint64_t>(v.value)
         || std::holds_alternative<bool>(v.value)) {
-        if (auto ik = intKindInfo(v.core); ik.has_value()) {
+        if (auto ik = intKindInfo(v.core, charIsUnsigned); ik.has_value()) {
             return BitIntOperandType{static_cast<std::uint32_t>(ik->bits),
                                      ik->isSigned, false};
         }
@@ -952,9 +994,10 @@ bitIntOperandType(HirLiteralValue const& v) noexcept {
 // The operand as a `BitIntValue` at its OWN (width, signed) — a bignum arm passes
 // through; a standard arm converts at its `core` width. nullopt for a non-integer.
 [[nodiscard]] inline std::optional<BitIntValue>
-asBitIntValue(HirLiteralValue const& v) noexcept {
+asBitIntValue(HirLiteralValue const& v,
+              std::optional<bool> charIsUnsigned) noexcept {
     if (auto const* bv = std::get_if<BitIntValue>(&v.value)) return *bv;
-    auto ot = bitIntOperandType(v);
+    auto ot = bitIntOperandType(v, charIsUnsigned);
     if (!ot.has_value()) return std::nullopt;
     if (auto const* i = std::get_if<std::int64_t>(&v.value))
         return BitIntValue::fromI64(*i, ot->width, ot->isSigned);
@@ -1059,7 +1102,8 @@ struct BitIntBinaryFold {
     ConstEvalFailure failure = ConstEvalFailure::None;
 };
 [[nodiscard]] inline BitIntBinaryFold
-foldBitIntBinary(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b) {
+foldBitIntBinary(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b,
+                 std::optional<bool> charIsUnsigned) {
     // D-CSUBSET-INT128-CONSTFOLD (TF-C94): entry is by "does this fold need MORE
     // than 64 bits?", not by "is a `BitIntValue` variant present?". The old
     // variant-only predicate was the reason a PURE 128-bit fold silently wrapped
@@ -1078,10 +1122,10 @@ foldBitIntBinary(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& 
     BitIntBinaryFold r;
     if (!aBit && !bBit) return r;    // not a wide fold — caller's normal path
     r.applies = true;
-    auto at = bitIntOperandType(a);
-    auto bt = bitIntOperandType(b);
-    auto av = asBitIntValue(a);
-    auto bv = asBitIntValue(b);
+    auto at = bitIntOperandType(a, charIsUnsigned);
+    auto bt = bitIntOperandType(b, charIsUnsigned);
+    auto av = asBitIntValue(a, charIsUnsigned);
+    auto bv = asBitIntValue(b, charIsUnsigned);
     if (!at || !bt || !av || !bv) {
         r.failure = ConstEvalFailure::UnsupportedTypeKind;   // a non-integer operand
         return r;
@@ -1151,7 +1195,8 @@ struct BitIntUnaryFold {
     ConstEvalFailure failure = ConstEvalFailure::None;
 };
 [[nodiscard]] inline BitIntUnaryFold
-foldBitIntUnary(HirOpKind op, HirLiteralValue const& inner) {
+foldBitIntUnary(HirOpKind op, HirLiteralValue const& inner,
+                std::optional<bool> charIsUnsigned) {
     BitIntUnaryFold r;
     // D-CSUBSET-INT128-CONSTFOLD (TF-C94): the binary entry's twin — enter for a
     // 128-bit STANDARD operand too, not only for a `BitIntValue` variant, or
@@ -1165,8 +1210,8 @@ foldBitIntUnary(HirOpKind op, HirLiteralValue const& inner) {
         return r;                   // not a wide operand — caller's normal path
     }
     r.applies = true;
-    auto ot = bitIntOperandType(inner);
-    auto bv = asBitIntValue(inner);
+    auto ot = bitIntOperandType(inner, charIsUnsigned);
+    auto bv = asBitIntValue(inner, charIsUnsigned);
     if (!ot.has_value() || !bv.has_value()) {
         r.failure = ConstEvalFailure::UnsupportedTypeKind;   // a non-integer operand
         return r;

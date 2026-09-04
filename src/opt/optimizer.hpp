@@ -501,12 +501,24 @@ struct OptResult {
 // convenient: an omitted table leaves the module exactly as the pipeline left it.
 // The real front end always passes its table, so the only way to reach an
 // unstripped inline definition is to build one by hand and then not declare it.
+// [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: `charIsUnsigned` is the ACTIVE
+// (target x object format)'s answer for plain `char` -- resolved ONCE by the
+// compile pipeline through `TargetSchema::charIsUnsigned(ObjectFormatKind)` and
+// relayed, never re-derived here. It exists as a separate argument rather than
+// being read off `target` because the accessor REQUIRES the object format kind,
+// which the optimizer does not carry: the same arm64 processor is unsigned under
+// GNU/Linux and signed under Darwin, so a target-only reading would be a coin
+// flip. Reaches `ConstFold`, whose `intKindInfo`/`normalizeToType` need it.
+// `nullopt` (every hand-built MIR fixture) makes a `char` fold refuse rather
+// than pick a sign -- a missed fold, never a wrong constant.
 [[nodiscard]] DSS_EXPORT OptResult optimize(Mir& mir,
                                             TargetSchema const& target,
                                             TypeInterner const& interner,
                                             OptPipeline const& pipeline,
                                             DiagnosticReporter& reporter,
                                             std::span<ExternImport const>
-                                                externImports = {});
+                                                externImports = {},
+                                            std::optional<bool>
+                                                charIsUnsigned = std::nullopt);
 
 } // namespace dss::opt

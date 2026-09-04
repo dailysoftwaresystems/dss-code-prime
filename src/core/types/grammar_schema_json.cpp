@@ -8054,6 +8054,241 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── D-PP-HAS-EXTENSION-BUILTIN-ABSENT: the FEATURE-QUERY family ──
+            //
+            // `featureQueryOperators` — `[{name, answers}]`. `answers` NAMES the
+            // already-declared capability set the operator reads, so no truth
+            // set is ever restated here. OPTIONAL; every malformed shape is a
+            // LOAD error rather than a dropped row, because a dropped row is an
+            // operator that silently stops existing and folds to 0 — the
+            // answered-in-silence failure this row exists to prevent.
+            if (pp.contains("featureQueryOperators")) {
+                json const& fqs = pp.at("featureQueryOperators");
+                if (!fqs.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/featureQueryOperators",
+                              "'preprocess.featureQueryOperators' must be an "
+                              "array");
+                } else {
+                    for (std::size_t fi = 0; fi < fqs.size(); ++fi) {
+                        const auto fpath = std::format(
+                            "/preprocess/featureQueryOperators/{}", fi);
+                        json const& e = fqs[fi];
+                        if (!e.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess, fpath,
+                                      "a 'featureQueryOperators' entry must be "
+                                      "an object");
+                            continue;
+                        }
+                        FeatureQueryOperatorDef op;
+                        if (!e.contains("name") || !e.at("name").is_string()
+                            || e.at("name").get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      fpath + "/name",
+                                      "a 'featureQueryOperators' entry requires "
+                                      "a non-empty string 'name'");
+                            continue;
+                        }
+                        op.name = e.at("name").get<std::string>();
+                        if (!e.contains("answers")
+                            || !e.at("answers").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      fpath + "/answers",
+                                      "a 'featureQueryOperators' entry requires "
+                                      "a string 'answers' naming the declared "
+                                      "capability set its answer is read from");
+                            continue;
+                        }
+                        auto const src = featureQueryAnswerSourceFromName(
+                            e.at("answers").get<std::string>());
+                        if (!src.has_value()) {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidPreprocess,
+                                fpath + "/answers",
+                                "unknown 'answers' verb '"
+                                    + e.at("answers").get<std::string>()
+                                    + "' (declared-attributes / "
+                                      "declared-builtins / "
+                                      "declared-language-features / "
+                                      "declared-language-extensions)");
+                            continue;
+                        }
+                        op.answers = *src;
+                        // ⚠ THE COLLISION CHECK IS NOT HOUSEKEEPING. A name that
+                        // is BOTH a conditional-inclusion operator and a
+                        // feature-query operator would resolve to two different
+                        // redefinition postures through `reservedIdentifierPosture`
+                        // (whose first match wins) and two different fold arms —
+                        // i.e. one spelling with two meanings, decided by
+                        // source order. Refuse it at load instead.
+                        if (isConditionalInclusionOperator(op.name, cfg)
+                            || (!cfg.definedOperator.empty()
+                                && op.name == cfg.definedOperator)) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      fpath + "/name",
+                                      "'" + op.name
+                                          + "' is already declared as another "
+                                            "preprocessor operator word");
+                            continue;
+                        }
+                        if (findFeatureQueryOperator(op.name, cfg) != nullptr) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      fpath + "/name",
+                                      "duplicate 'featureQueryOperators.name' '"
+                                          + op.name + "'");
+                            continue;
+                        }
+                        cfg.featureQueryOperators.push_back(std::move(op));
+                    }
+                }
+            }
+            // `languageFeatures` — `[{name, availability}]`, the truth set
+            // `__has_feature`/`__has_extension` read. `availability` is
+            // MANDATORY per row: defaulting it would silently decide whether a
+            // feature is reported by `__has_feature` too, and that is exactly
+            // the claim a row is being asked to make.
+            if (pp.contains("languageFeatures")) {
+                json const& lfs = pp.at("languageFeatures");
+                if (!lfs.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/languageFeatures",
+                              "'preprocess.languageFeatures' must be an array");
+                } else {
+                    for (std::size_t li = 0; li < lfs.size(); ++li) {
+                        const auto lpath =
+                            std::format("/preprocess/languageFeatures/{}", li);
+                        json const& e = lfs[li];
+                        if (!e.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess, lpath,
+                                      "a 'languageFeatures' entry must be an "
+                                      "object");
+                            continue;
+                        }
+                        LanguageFeatureDef lf;
+                        if (!e.contains("name") || !e.at("name").is_string()
+                            || e.at("name").get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      lpath + "/name",
+                                      "a 'languageFeatures' entry requires a "
+                                      "non-empty string 'name'");
+                            continue;
+                        }
+                        lf.name = e.at("name").get<std::string>();
+                        if (!e.contains("availability")
+                            || !e.at("availability").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      lpath + "/availability",
+                                      "a 'languageFeatures' entry requires a "
+                                      "string 'availability' "
+                                      "(standard / extension)");
+                            continue;
+                        }
+                        auto const av = languageFeatureAvailabilityFromName(
+                            e.at("availability").get<std::string>());
+                        if (!av.has_value()) {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidPreprocess,
+                                lpath + "/availability",
+                                "unknown 'availability' '"
+                                    + e.at("availability").get<std::string>()
+                                    + "' (standard / extension)");
+                            continue;
+                        }
+                        lf.availability = *av;
+                        bool dup = false;
+                        for (LanguageFeatureDef const& prior :
+                             cfg.languageFeatures) {
+                            if (prior.name == lf.name) dup = true;
+                        }
+                        if (dup) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      lpath + "/name",
+                                      "duplicate 'languageFeatures.name' '"
+                                          + lf.name + "'");
+                            continue;
+                        }
+                        cfg.languageFeatures.push_back(std::move(lf));
+                    }
+                }
+            }
+            // `builtinQueryKeywordTokens` — token KIND names whose keyword WORDS
+            // count as builtins for `declared-builtins`. KINDS, not words: the
+            // word is read back out of the keyword table at query time, so a
+            // rebound spelling moves the answer with it.
+            if (pp.contains("builtinQueryKeywordTokens")) {
+                json const& bks = pp.at("builtinQueryKeywordTokens");
+                if (!bks.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/builtinQueryKeywordTokens",
+                              "'preprocess.builtinQueryKeywordTokens' must be "
+                              "an array");
+                } else {
+                    for (std::size_t bi = 0; bi < bks.size(); ++bi) {
+                        const auto bpath = std::format(
+                            "/preprocess/builtinQueryKeywordTokens/{}", bi);
+                        if (!bks[bi].is_string()
+                            || bks[bi].get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess, bpath,
+                                      "a 'builtinQueryKeywordTokens' entry must "
+                                      "be a non-empty token KIND name");
+                            continue;
+                        }
+                        std::string kind = bks[bi].get<std::string>();
+                        checkToken(kind, "builtinQueryKeywordTokens");
+                        cfg.builtinQueryKeywordTokens.push_back(std::move(kind));
+                    }
+                }
+            }
+            // ★★★ `reservedIdentifiers` — THE ONE POSTURE DECLARATION both the
+            // `__STDC__` arm and the operator arm read. Every member is optional
+            // and every default is the MEASURED reference behaviour, so a
+            // language that says nothing gets the union's posture rather than a
+            // silent invention.
+            if (pp.contains("reservedIdentifiers")) {
+                json const& ri = pp.at("reservedIdentifiers");
+                if (!ri.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/reservedIdentifiers",
+                              "'preprocess.reservedIdentifiers' must be an "
+                              "object");
+                } else {
+                    auto readPosture = [&](char const*                  key,
+                                           PredefinedMacroRedefinition& out) {
+                        if (!ri.contains(key)) return;
+                        if (!ri.at(key).is_string()) {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidPreprocess,
+                                std::string{"/preprocess/reservedIdentifiers/"}
+                                    + key,
+                                std::string{
+                                    "'preprocess.reservedIdentifiers."}
+                                    + key + "' must be a string");
+                            return;
+                        }
+                        std::string const verb = ri.at(key).get<std::string>();
+                        auto const p = predefinedMacroRedefinitionFromName(verb);
+                        if (!p.has_value()) {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidPreprocess,
+                                std::string{"/preprocess/reservedIdentifiers/"}
+                                    + key,
+                                "unknown redefinition posture '" + verb
+                                    + "' (warn-iso-macro / warn-derived-macro / "
+                                      "ordinary / refuse)");
+                            return;
+                        }
+                        out = *p;
+                    };
+                    readPosture("definedOperator",
+                                cfg.reservedIdentifiers.definedOperator);
+                    readPosture(
+                        "conditionalInclusionOperators",
+                        cfg.reservedIdentifiers.conditionalInclusionOperators);
+                    readPosture("featureQueryOperators",
+                                cfg.reservedIdentifiers.featureQueryOperators);
+                }
+            }
+
             // FC15 paste residuals (D-PP-VARIADIC-GNU-COMMA-ELISION): optional bool.
             // TRUE -> `sep ## __VA_ARGS__` with an empty variadic part drops the
             // separator (GNU extension); default FALSE -> standard placemarker.

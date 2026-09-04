@@ -326,4 +326,46 @@ decodeCharLiteralBody(std::string_view body, EscapeDecodeOutcome* outcome = null
     return static_cast<std::uint32_t>(static_cast<unsigned char>(out[0]));
 }
 
+// ── C 6.4.4.4p10: THE *VALUE* OF A NARROW CHARACTER CONSTANT ────────────────
+// [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]] / [[D-CSUBSET-CHAR-HIGHBYTE-ICE-SIGNEDNESS]]
+//
+// `decodeCharLiteralBody` above answers "which CODE UNIT did the source name?"
+// and stops there — 0..255, always non-negative, because a byte has no sign.
+// That is NOT the constant's value. 6.4.4.4p10 says a character constant
+// containing a single character is "the value of the representation of the
+// character interpreted as an INTEGER", and 6.2.5p15 makes plain `char` carry
+// the range of EITHER `signed char` OR `unsigned char` — implementation-defined,
+// declared per (processor × object format) in the target's ONE `charIsUnsigned`
+// key. So `'\xff'` is −1 where plain `char` is signed and +255 where it is not.
+//
+// ★ THIS IS THE ONE PLACE THAT TURN IS MADE. Three tiers ask the question —
+// the `#if` fold (`pp_if_eval`), the CST const-expr fold (`cst_const_eval`) and
+// value lowering (`cst_to_hir::lowerCharLiteral`) — and before this helper
+// existed all three took the code unit verbatim, which is the unsigned answer
+// spelled as if it were no answer at all. ✔MEASURED at b1f31420 on
+// `x86_64:elf64-x86_64-linux-exec`: `int a[('\xff' < 0) ? 1 : 2]` built a TWO-
+// element array and `#if '\xff' < 0` took the `#else` arm, both rc 0 with zero
+// diagnostics, where gcc 13.3.0 and clang 18.1.3 both build one element and take
+// the `#if` arm. The runtime tier was already right — it is the only one that
+// read the declaration.
+//
+// ⚠ AND THE ANSWER IS TARGET-KEYED, SO A CALLER THAT DOES NOT KNOW MUST REFUSE
+// RATHER THAN GUESS — but only when the answer actually differs. That is what
+// `narrowCharConstantSignednessMatters` is for: for a code unit 0..127 the two
+// readings are the SAME integer, which is why every 0–127 program in the corpus
+// (sqlite included) has zero divergence and why a tier with no target in hand
+// can still fold `'a'` correctly. Ask the predicate first; refuse loud only when
+// it says yes and the fact is absent. Never default the sign.
+[[nodiscard]] inline constexpr bool
+narrowCharConstantSignednessMatters(std::uint32_t codeUnit) noexcept {
+    return (codeUnit & 0x80u) != 0u;
+}
+
+[[nodiscard]] inline constexpr std::int64_t
+narrowCharConstantValue(std::uint32_t codeUnit, bool charIsUnsigned) noexcept {
+    auto const byte = static_cast<std::uint8_t>(codeUnit & 0xFFu);
+    if (charIsUnsigned) return static_cast<std::int64_t>(byte);
+    return static_cast<std::int64_t>(static_cast<std::int8_t>(byte));
+}
+
 } // namespace dss

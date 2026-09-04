@@ -1,0 +1,34 @@
+{
+  "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-5): the runtime witness for NEGATING a `long double` and for CONVERTING one to and from every narrower scalar, on every long-double axis. ✔MEASURED BEFORE THE CHANGE, through the shipped CLI at b1f31420 with one tiny program per operation compiled ALONE so no refusal could mask another, SEVEN of the operations below REFUSED with `L_UnsupportedLoweringForOpcode` naming this anchor: `-ld` (MIR FNeg, BOTH axes), `(unsigned)ld` (MIR FPToUI (source), BOTH), `(double)ld` and `(float)ld` (MIR FPTrunc (source), BOTH), `(long double)someFloat` (MIR FPExt (result), BOTH), `(long double)someDouble` (MIR FPExt (result), x87 only — arm64 already had the `from_f64` row), and `(long long)ld` (MIR FPToSI (source), arm64; on x87 it said `MIR opcode '<deferred>'` instead). The baseline was FAIL LOUD with no binary, never a wrong answer; the f64 axis (pe64 x86_64, Apple arm64), where `long double` IS `double`, already ran every arm, which is what makes one program meaningful on all three. TWO REALIZATIONS, dispatched on TypeKind alone: on the x87-80 axis an INLINE memory sequence built from six new byte-verified opcode rows (`fchs` D9 E0; `fld_m32` D9 /0; `fld_m64` DD /0; `fstp_m32` D9 /3; `fstp_m64` DD /3; `fisttp_m64` DD /1) — the x87 stack has ONE working format and no register-to-register conversion, so every format change happens in the memory operand; on the ieee128 axis a CALL to one of six new config'd libgcc helpers (`__negtf2`, `__fixunstfsi`, `__fixtfdi`, `__trunctfdf2`, `__trunctfsf2`, `__extendsftf2`), gated on the PRESENCE of the row and never on target identity. ★★ WHAT EACH ARM MEASURES, because a long-double program that compiles and returns 42 proves NO FAULT and nothing about whether the conversion was CORRECT — none of these operations faults when it is wrong, each returns a plausible number: arms 1-3 that the three ULPS the file discovers at runtime (of `float`, `double` and `long double`, each found by halving in that type's own arithmetic, since DSS ships no <float.h>) are non-zero, without which every width arm below would be vacuously true; arms 4-5 NEGATE DIRECTION (a no-op or an absolute value fails) and its agreement with `0 - x` on a non-zero value; arm 6 NEGATE AT FULL WIDTH — negate a value whose LAST mantissa bit is significant and add it back, so a negate that round-tripped through anything narrower leaves a residue, with a second half that stops the arm passing vacuously; arm 7 `(unsigned)` truncating TOWARD ZERO; arm 8 THE RANGE ARM — `(unsigned)3000000000.0L` is above 2^31, so a lowering that stored through the x87 32-bit truncating form would write the 0x80000000 integer-indefinite here with no fault at all; arm 9 `(long long)` truncating toward zero on the NEGATIVE side (-7.9 → -7, the direction a floor-based lowering gets wrong only for negatives); arm 10 `(long long)` WIDTH — 2^53 is built by doubling and 2^53+1 requested back, with the expected answer derived SELF-CALIBRATINGLY from the type's own comparison so the arm is exact on a 53-, 64- or 113-bit mantissa while still missing under any 32-bit or float-mediated conversion; arms 11-13 the NARROWINGS, with 12 and 13 placing the value THREE QUARTERS of the way between two representable neighbours so round-to-nearest and truncation give DIFFERENT answers (a halfway-point arm passes under both), and 13 additionally separating `fstp m32` from `fstp m64`, which differ in one opcode byte; arm 14 cross-checking that `(double)ld` loses exactly what it should, the predicate derived from the two discovered ulps rather than assumed; arms 15-16 the WIDENINGS with the LOW BIT INTACT — widen 1+ulp(1.0f) and 1+ulp(1.0) and recover that ulp by subtraction in long-double arithmetic, which is full width by construction, so a widen that read the wrong four bytes (`fld m32` on an 8-byte slot) misses; arms 17-19 exactness and both round trips. ⓘ ARM 20 IS THE x87 STACK-BALANCE ARM AND NO STRAIGHT-LINE ARM REPLACES IT: every sequence this cycle adds pushes onto the eight-deep x87 register stack and pops again, so leaking one entry overflows it by the eighth iteration and every later result is an indefinite NaN; arm 20 runs all six new sequences — negate twice, both narrowings, both widenings, both integer conversions — forty times round a loop and checks the value on every iteration, with arms 21-23 checking the accumulated sums afterwards. ⓘ THE SIGN OF ZERO IS THE ONE CORNER NOT ARMED, and that is stated rather than faked: C compares +0.0 and -0.0 EQUAL, and distinguishing them needs either <math.h>'s signbit (DSS ships no headers) or a byte view of an object whose padding the x87 axis leaves indeterminate — an arm there would pass either way. ANTI-FOLD: every operand and every loop bound is read from a MUTABLE GLOBAL, so release cannot constant-fold a conversion away and leave the lowering untested; the release arm measures the same conversions through Mem2Reg-promoted values (the long-double locals become real phis across the loops' back edges) rather than through memory traffic. ✔REFERENCE ORACLE, each probed SEPARATELY and every one returning 42: WSL gcc 13.3.0 (-O0/-O2), WSL clang 18.1.3 (-O0/-O2), mingw-w64 gcc 13.2.0 native (-O0/-O2), aarch64-linux-gnu-gcc 13.3.0 under qemu-aarch64 (-O0/-O2), and MSVC 19.51.36252 at /std:c17 /O2 — the last one BUILT AND RAN to 42, so it is a positive vote on the f64 axis and not merely a front-end abstention. Lowering is pinned in the unit suite by the MirToLir F80Neg*/F80Convert*/F128Convert* tests in tests/lir/test_mir_to_lir.cpp, including the config-row-absence fail-loud arm and the AAPCS64 width-32 capture arm. exit = 42; each arm returns its own number so a failure names itself.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

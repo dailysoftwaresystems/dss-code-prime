@@ -48,12 +48,14 @@ struct PassRunResult {
                                     TypeInterner const& interner,
                                     OptPipeline const& pipeline,
                                     DiagnosticReporter& reporter,
-                                    passes::InlineGrowthLedger& inlineLedger) {
+                                    passes::InlineGrowthLedger& inlineLedger,
+                                    std::optional<bool> charIsUnsigned) {
     switch (id) {
         case PassId::Identity:
             return {true, false};  // no-op; exercises the engine wiring.
         case PassId::ConstFold: {
-            auto const r = passes::runConstFold(mir, interner, reporter);
+            auto const r =
+                passes::runConstFold(mir, interner, reporter, charIsUnsigned);
             return {r.ok, r.instructionsFolded > 0};
         }
         case PassId::Dce: {
@@ -251,6 +253,10 @@ struct ScheduleInterpreter {
     bool const optTrace;
     // Threaded to the Inlining leaf; see runPass's doc comment.
     passes::InlineGrowthLedger& inlineLedger;
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: threaded to the ConstFold leaf;
+    // see `optimize`'s doc comment for why it is a relayed value and not read
+    // off `target` here.
+    std::optional<bool> charIsUnsigned;
 
     // Failure latch — once a pass or a verify fails, unwind without
     // running anything further (the pre-tree early `return result`).
@@ -405,7 +411,7 @@ struct ScheduleInterpreter {
         }
         auto const passResult =
             runPass(p, mir, target, interner, pipeline, reporter,
-                    inlineLedger);
+                    inlineLedger, charIsUnsigned);
         if (optTrace) {
             auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
@@ -522,7 +528,8 @@ OptResult optimize(Mir& mir,
                    TypeInterner const& interner,
                    OptPipeline const& pipeline,
                    DiagnosticReporter& reporter,
-                   std::span<ExternImport const> externImports) {
+                   std::span<ExternImport const> externImports,
+                   std::optional<bool> charIsUnsigned) {
     // D-OPT1-RETURN-FALSE-DIAGNOSTIC-CONTRACT: a false return MUST
     // be paired with a new error. Snapshot + belt-and-suspenders
     // emit below covers any future failure path that forgets to.
@@ -562,7 +569,7 @@ OptResult optimize(Mir& mir,
     ScheduleInterpreter interp{mir, target, interner, pipeline, reporter,
                                result, entryErrorCount,
                                std::getenv("DSS_OPT_TRACE") != nullptr,
-                               inlineLedger};
+                               inlineLedger, charIsUnsigned};
     interp.run(pipeline.schedule, std::string{});
     if (interp.stopped) {
         // A failed pass / failed verify unwinds WITHOUT the epilogues —

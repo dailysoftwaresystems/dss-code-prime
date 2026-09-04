@@ -315,6 +315,16 @@ dss_add_test(NAME link/test_runtime_library_roles
 target_link_libraries(dss_link_test_runtime_library_roles
                       PRIVATE nlohmann_json::nlohmann_json)
 
+# D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE — the
+# CROSS-TIER half of the role table: the `shippedLibs/*.json` descriptors spell
+# the SAME images as literals, and nothing forced the two tiers to agree. Lives
+# under tests/link rather than tests/ffi because it loads format documents
+# through `ObjectFormatSchema::loadShipped` (their own loader, never a raw read
+# of a key the link tier owns) — the layering split tests/ffi deliberately
+# keeps. Needs no json link: both sides are read through their real loaders.
+dss_add_test(NAME link/test_descriptor_library_role_agreement
+             SOURCES test_descriptor_library_role_agreement.cpp)
+
 # D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO (Mach-O half) — the
 # `__TEXT,__eh_frame` writer. The DWARF encoder (test_dwarf_cfi) was complete
 # and wired into NO writer, so a DSS Mach-O image carried no unwind table at
