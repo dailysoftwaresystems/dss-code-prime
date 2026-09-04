@@ -123,6 +123,16 @@ tmp_probe/
 # scripts) — working files, never committed. (Prefer the out-of-repo session
 # scratchpad; this catches anything that lands here anyway.)
 scratchpad/
+# SESSION HAND-OFF NOTES — operator ruling 2026-09-04: PUNCTUAL, NEVER COMMITTED.
+# A `.plans/_next-cycle-*.md` is written when a session ends mid-arc so the NEXT
+# session can read what was prepared and then delete it. It is a message between
+# sessions, not a project record — the durable account of a cycle belongs in
+# `_handoff.md` and in the anchor rows, which are versioned.
+# ⚠ IT LIVES IN `.plans/` ON PURPOSE, because a next session opens `.plans/` and
+# the out-of-repo scratchpad is keyed to a session id it will not have. Ignoring
+# it here is what keeps it out of `git status`, so an explicit-path stage cannot
+# sweep it into a cycle commit the way one already did once.
+.plans/_next-cycle-*.md
 # DSS CLI default output dir (target-spec-named subdirs of compiled binaries
 # from ad-hoc `dsscp <src>` runs; not a build-system dir).
 target/
