@@ -231,6 +231,8 @@ Three consequences, and each is a requirement rather than a hope:
 2. **The runtime is therefore not a permanent cost.** It is materialized only where proof is insufficient. ★ **If the compiler can prove enforcement unnecessary, removing it is mandatory, not optional** — a design principle, not an optimization preference, because a runtime cost that survives its own disproof is the cliff §2.3's property 4 promises does not exist.
 3. **The facts outlive the front end.** They are IR-level, so they reach MIR/LIR and the optimizer ([`plan-22`](./22-optimizer-plan%20-%20tbd.md)) — an ownership proof is an aliasing fact, and aliasing facts are what an optimizer is starved of. ★ **The memory model is a source of optimization power, not a tax on it.** (`D-AXIS-PROOF-IS-AN-OPTIMIZATION-FACT`.)
 
+★ **A DECLARED fact enters the same channel as a derived one** — §3.5a's `readonly` / `noescape` are not a second mechanism: they are facts the analysis could not derive, entering the identical IR attribute the analysis writes, consumed by the identical passes. ⚠ The difference is provenance, and it must survive into the artifact: a **derived** fact is proven, a **declared** one is asserted, and "how much of this program rests on assertion" is a number §3.5a makes measurable rather than a feeling.
+
 ★ **And it is visible.** Every value's tier is in the emitted tier-classification artifact ([`plan-09.5`](./09.5-dss-hir-plan.md) §4.5), assertable in tests, with **the reason inference failed** at every site that fell to TD. A hot loop sliding T1 → TD is a **test that goes red**, not a report someone might read. That is the mechanism that stops "enforce where unproven" from decaying into "enforce everywhere."
 
 ### 3.1e ⛔ No `unsafe` — and no equivalent, under any spelling
@@ -306,7 +308,80 @@ Can prove statically?
 - **Import** — consume C / C++ / OS-supplied libraries; language-side `import` / `extern` syntax here, machinery in [`plan-11`](./11-ffi-plan%20-%20tbd.md) (binary readers, header parser, ABI catalog, mangling). (`D-AXIS-FFI-IMPORT`.)
 - **Export** — DSS Axis libraries callable **natively from other languages** — the cross-language native-libs vision: a lib written in Axis consumed by a C, C#, or Python program, no VM, no marshalling VM boundary. (`D-AXIS-FFI-EXPORT`.)
 - Hermetic throughout — no external runtime dependency; extern decls + shipped descriptors, same machinery the shipped languages use.
-- ★ **This is where the memory model's proof ends, and it is the ONLY place** (§2.3 honesty clause). With `@manual` gone, FFI carries the whole boundary — so the vocabulary for *describing* foreign-owned storage is load-bearing, not a convenience, and the diagnostics must say so when a type reaches it ([`plan-09.5`](./09.5-dss-hir-plan.md) `D-DSSHIR-RECLAMATION-FFI-BOUNDARY`).
+- ★ **This is where the memory model's proof ends, and it is the ONLY place** (§2.3 honesty clause). With `@manual` gone, FFI carries the whole boundary — so the vocabulary for *describing* what happens across it is load-bearing, not a convenience, and the diagnostics must say so when a type reaches it ([`plan-09.5`](./09.5-dss-hir-plan.md) `D-DSSHIR-RECLAMATION-FFI-BOUNDARY`). ★★ **§3.5a is the first half of that vocabulary** — `readonly` / `noescape` describe what a foreign callee does with an Axis object handed OUT. Foreign storage coming **IN** is still unspecified (§5 Q12).
+
+### 3.5a ★★ FFI parameter contracts — `readonly` and `noescape`
+
+**Operator ruling 2026-09-04.** §3.5 says the FFI edge is where the memory model's proof ends. **These two reserved words are how a programmer moves that edge outward** — not by weakening the model, but by supplying the one class of fact the compiler can never derive: *what the foreign callee does with an object it was handed.*
+
+```
+Car a;  Bike b;  int c;
+
+ffi.call(a, readonly b, c);
+//       ^            ^  a scalar by value — the callee cannot touch it
+//       |            no contract: the compiler assumes the worst about `a`
+//       `b`: the callee rewrites nothing reachable from it
+```
+
+#### ★ Why this is LIFETIME control, not a peephole
+
+**An Axis object's fields are where the ownership edges live.** Foreign code that can write those fields rewrites the graph the memory model reasons about, invisibly:
+
+- it **overwrites a field holding a reference** → the old target may now be unreachable and nothing knows → **leak**;
+- it **stores a reference into a field** → an edge appears that was never in the graph → a region proved acyclic (§3.1f) may now be cyclic, or the compiler reclaims something it believes nothing points at → **use-after-free**;
+- it **keeps a reference to the object itself** → reclaiming at scope end leaves foreign code holding a dangling pointer.
+
+⇒ **an unannotated FFI call with an object parameter is a PROOF-DESTROYING EVENT for everything reachable from that parameter.** In §2.3's terms every static proof about that subgraph dies at the call, so the subgraph slides **T1/T2/T3 → TD** — or is **refused** where TD is unavailable, which is exactly the freestanding and `gpu` profiles (§3.1a). In an FFI-heavy compiler that is the difference between the static tiers being usable and being theoretical.
+
+#### The two words, and they are ORTHOGONAL
+
+| word | the claim | the graph edge it protects |
+|---|---|---|
+| `readonly` | the callee **modifies nothing reachable from** this object through Axis-owned edges | the edges **inside** the object |
+| `noescape` | the callee **keeps no reference** to this object past the call's return | the edges **into** the object |
+
+Either, both, or neither. A callee may legitimately mutate without retaining (`memset`-shaped) or retain without mutating (a registration callback). ⚠ **`readonly` does not imply `noescape` and must never be read as implying it** — they protect opposite directions, and conflating them is a use-after-free.
+
+★ **`readonly` is DEEP, not shallow, and this is not a detail.** If the callee receives `b` and writes `b.wheel.bolt`, it has **broken** the claim. A shallow reading — only `b`'s own fields — buys nothing, because the ownership graph extends past the first hop and it is the whole reachable subgraph whose proofs must survive. **DOCUMENTED**: LLVM's parameter `readonly` is the deep reading, so precedent agrees; it is written here because the cheap version is the one an implementer reaches for first.
+
+#### ★ The default is pessimistic — and it is already what the engine does
+
+Absent a word, the compiler assumes the callee **both** modifies and retains. So **forgetting a contract is slow, never wrong**; only *asserting* one carries risk. An optimistic default would make a missing word a silent miscompile, which inverts the whole safety posture.
+
+✔**MEASURED 2026-09-04**: this is not a new posture but a lift on an existing one. `src/opt/analysis/mir_escape.hpp`'s `mirPointerUseKind` classifies pointer uses through a whitelist **whose default arm is `Escapes`**, so a pointer handed to a call publishes its slot and every fact about it dies. **These two words are the first thing that could ever make that default not fire.** The consumers are already built and already measured: `mir_alias.hpp` (Rule 3b), `mir_memory_clobbers.hpp`, and through them CSE and LICM — the same pipeline whose clobber index took LICM **107s → 60.5s** on sqlite ([`plan-22`](./22-optimizer-plan%20-%20tbd.md), `D-OPT-MEMORYSSA-CLOBBER-WALK`). ★ **Unlike almost everything else in this plan, this feature has a shipped consumer waiting for it.**
+
+#### ⚠⚠ The verification asymmetry — the two words are NOT equally safe
+
+Neither claim can be checked statically: the callee's body is in an object file someone else compiled. By §3.1f's test that would make both escape hatches — **except that the claim is about foreign code nothing can ever see, so it adds information to a void rather than trading a proof for a promise** (§2.3's honesty clause). What keeps that from being a licence is that **both are checkable at RUN TIME, in a debug arm — but not equally well**, and the difference must be stated rather than discovered:
+
+| word | debug-arm check | strength |
+|---|---|---|
+| `readonly` | the compiler knows the object's layout and can compute its reachable set — **hash the subgraph before the call, compare after, fail loud on a move** | ★ **direct.** A violation is caught the first time it happens, deterministically |
+| `noescape` | foreign memory is unobservable, so the claim cannot be checked — only its **consequence**: quarantine the storage at reclamation behind an inaccessible guard page, so a later foreign access **faults loudly instead of corrupting silently** | ⚠ **by consequence only, and probabilistic** — it catches a violation that is *exercised*, never the claim itself |
+
+⇒ **`noescape` is the sharper knife and the plan says so plainly.** A wrong `readonly` is caught by construction in a debug build; a wrong `noescape` is caught only if the foreign code actually dereferences after reclamation, on a run that happens to do it. ⚠ That does not make it unusable — it makes it the one that needs the strongest evidence before it is written, and it is why the debug-arm quarantine is a **requirement of the feature, not an optional hardening**. (`D-AXIS-FFI-CONTRACT-VERIFICATION-ASYMMETRY`.)
+
+#### The rules, and two of them are this repo's rule reached a third time
+
+- **On a by-value scalar, either word is REFUSED as inert.** `int c` cannot be modified or retained by the callee, so the word declares nothing — and an inert declaration is a compile error here, exactly as a `weak` that breaks no SCC ([`plan-09.5`](./09.5-dss-hir-plan.md) `D-DSSHIR-WEAK-MUST-BREAK-AN-SCC`) and an `@ownsCycle` that owns none (§3.1f) are refused. **Same rule, third application.**
+- **Outside an FFI call the words do not exist.** They are not type qualifiers, not binding modifiers, and carry no meaning on a declaration — a claim about a *callee* has no referent where there is no callee.
+- **The contract may be DEFAULTED by the descriptor and REFINED at the call.** `strdup` retains nothing on every call, and that belongs once in the shipped-lib descriptor row ([`plan-11`](./11-ffi-plan%20-%20tbd.md), which already carries a per-symbol signature). But `ioctl(fd, cmd, arg)` writes `arg` or not **depending on `cmd`**, which is a call-site fact no declaration can hold. ⇒ the call site is the primary surface and the descriptor supplies a default under it. ★ Where headers already declare it — SAL `_In_`/`_Out_`/`_Inout_`, GCC `__attribute__((access(read_only, N)))` — **harvest it rather than retype it**; [`plan-11`](./11-ffi-plan%20-%20tbd.md) already parses C headers, and a hand-written set stays trustworthy only while it stays small.
+
+#### ★ Spelling — both names MEASURED against this tree
+
+✔**RE-MEASURED 2026-09-04**, occurrences as whole words in `.plans/` / `src/` / `src/dss-config/`:
+
+| candidate | count | verdict |
+|---|---|---|
+| **`readonly`** | **1 / 0 / 0** | ✅ the emptiest slot in the repo, and **DOCUMENTED** as LLVM's exact parameter attribute for exactly this claim |
+| **`noescape`** | **0 / 0 / 0** | ✅ unused entirely, and **DOCUMENTED** as Clang's `__attribute__((noescape))` / Swift's `@noescape` for exactly this claim |
+| `frozen` | 89 / 198 / 0 | ❌ taken in `src/` |
+| `pinned` | 1002 / 290 / 87 | ❌ the project's word for a test pin |
+| `borrowed` | 11 / 24 / 3 | ❌ ⚠ **the sharpest rejection**: T2 *borrow* is a **proven** non-owning reference; this is an **asserted** one. One word for both would make "is this checked or claimed?" unanswerable at the use site |
+| `scoped` / `retained` / `transient` | 298 / 95 / 21 in plans | ❌ ordinary prose, too noisy to reserve |
+| `final` / `volatile` | — | ❌ `final` names a property of the **binding**, which is not what is being claimed; `volatile` is a C keyword **this compiler implements** (✔996× in `src/`, including `c.lang.json` and `semantic_analyzer.cpp`) — redefining it inside the front end that implements the real one is the `@kernel` collision an order of magnitude worse |
+
+⚠ **One caveat that must be written down once:** C# and Java readers will read `readonly` as a **binding** modifier ("assignable only in the constructor"). It is not. It is a claim about **the callee's behaviour during this one call**, and says nothing about `b` anywhere else. (`D-AXIS-FFI-PARAMETER-CONTRACTS`.)
 
 ### 3.6 Targets — same-source everywhere
 - **Native** — 3 OS × 2+ arch via the engine backend ([`plan-12`](./12-mir-lir-plan%20-%20ok.md) / [`13`](./13-assembler-plan%20-%20tbd.md) / [`14`](./14-linker-plan%20-%20tbd.md)).
@@ -481,7 +556,7 @@ Guardrails the v2/engine work must honour so DSS Axis stays future-open (the [`p
 | 9 | Inside a `gpu` body: are **address spaces** (global / shared / local / constant) written by the programmer or inferred? "Easy as Node" argues inferred — but [`plan-17`](./17-shader-gpu-plan%20-%20tbd.md) warns a pointer that loses its space is a *wrong-memory access*, so inference must be total or the fallback is a refusal. |
 | 10 | Does `gpu` / `gpu?` compose with `async` (§3.1) — is `gpu async fn` a dispatch that awaits its own completion, and is that the natural spelling for a kernel launch? |
 | 11 | ★ **Does `isa.*` get a portable form?** `gpu?` exists because a CPU twin always exists; the analogue for `isa.*` would be "use this operation where the target has it, otherwise lower the equivalent Axis expression." Is that a real need or an invitation to write target-specific code that *looks* portable (§3.6b)? |
-| 12 | ★ **What does the programmer WRITE when they would have written `@manual`?** §2.3a's answer is "describe the object." **PARTLY ANSWERED 2026-09-04**: for a cycle, they write `@ownsCycle` (§3.1f) — a claim the compiler verifies or rejects, never one it believes. **Still open: foreign-owned storage.** That vocabulary is unspecified and load-bearing, because FFI now carries the whole boundary alone (§3.5). ★ `@ownsCycle` is the **shape** the answer should take — a checked description, refused when inert and refused when unverifiable — and the FFI case should be designed to match it rather than invented separately. |
+| 12 | ★ **What does the programmer WRITE when they would have written `@manual`?** §2.3a's answer is "describe the object." **TWO OF THREE ANSWERED 2026-09-04.** A cycle → `@ownsCycle` (§3.1f), verified or rejected. An Axis object handed OUT across FFI → `readonly` / `noescape` (§3.5a), debug-verified rather than statically checked. **STILL OPEN: foreign storage coming IN** — the DMA buffer whose lifetime the hardware owns, the allocation a foreign library will free itself. That vocabulary is unspecified and is now the *last* piece of the boundary, so it should copy §3.5a's shape (a claim, a pessimistic default, an inert-declaration refusal, and a debug arm that catches a false one) rather than be invented separately. |
 | 13 | ★ **What is TD's observable surface, if any?** The representation is [`plan-09.5`](./09.5-dss-hir-plan.md)'s implementation detail (§3.1c) — but can a program *ask* (how many participants, am I the last)? A query is useful for diagnostics and is also the crack through which programmer-visible lifetime management returns. Default lean: **no**, and the tier artifact (§3.1d) is the answer to every question a query would have served. |
 | 14 | ★ **Where does the destructor run for a TD-tier object?** The last participant releases — but *on which thread*, and what is legal in that body? A destructor running on an arbitrary thread is a well-known hazard, and it is a **language-contract** question rather than an analysis one, so it belongs here rather than in [`plan-09.5`](./09.5-dss-hir-plan.md). |
 
@@ -538,7 +613,7 @@ native code
 
 ## 7. Deferred anchors (owned by this plan; register when it opens)
 
-These **48** `D-AXIS-*` anchors are **reserved/future** — they live here until the plan opens, then move into [`_deferred-anchor-registry-production`](./_deferred-anchor-registry-production.md) as active rows. (Reserved-plan anchors are not yet in `src/`, so the CI anchor-guard does not require registry rows today.)
+These **50** `D-AXIS-*` anchors are **reserved/future** — they live here until the plan opens, then move into [`_deferred-anchor-registry-production`](./_deferred-anchor-registry-production.md) as active rows. (Reserved-plan anchors are not yet in `src/`, so the CI anchor-guard does not require registry rows today.)
 
 ⛔ **Retired 2026-09-04, recorded so it is not re-minted:** `D-AXIS-MANUAL-ANNOTATION` (the `@manual` escape hatch) — deleted with the design it named, §2.3a. [`plan-09.5`](./09.5-dss-hir-plan.md) retires its analysis counterpart on the same grounds.
 
@@ -582,6 +657,8 @@ These **48** `D-AXIS-*` anchors are **reserved/future** — they live here until
 | `D-AXIS-NATIVE-FLOOR-ADAPTIVE-CEILING` | base-service profiler + owned-compiler runtime recompiler |
 | `D-AXIS-FFI-IMPORT` | language-side `import`/`extern` (machinery → [`plan-11`](./11-ffi-plan%20-%20tbd.md)) |
 | `D-AXIS-FFI-EXPORT` | DSS Axis libs callable natively from other languages |
+| `D-AXIS-FFI-PARAMETER-CONTRACTS` | ★★ `readonly` / `noescape` at an FFI call — deep, orthogonal, pessimistic by default, inert on a scalar (§3.5a) |
+| `D-AXIS-FFI-CONTRACT-VERIFICATION-ASYMMETRY` | ⚠ `readonly` is debug-checkable directly; `noescape` only by consequence — the quarantine arm is required, not optional (§3.5a) |
 | `D-AXIS-EASY-AS-NODE-ERGONOMICS` | use/assign/construct/destruct fluency goal |
 | `D-AXIS-SELF-HOST-TRANSPILE` | C++ engine → DSS Axis via [`plan-10`](./10-source-translation-plan%20-%20tbd.md) under the HIR oracle |
 | `D-AXIS-PAR-DUAL-API` | every waiting primitive ships co-equal blocking + async (`Task<T>`) forms |
