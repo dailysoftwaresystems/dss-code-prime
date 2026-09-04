@@ -3906,6 +3906,32 @@
       }
     },
     {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-3): FUCOMIP ST(0),ST(1) = DF E9 (Intel SDM: \"Compare ST(0) with ST(1), set status flags accordingly, check for ordered values, and pop register stack\" — the DF E8+i family, i=1). A BARE 2-byte fixed opcode, ZERO operands, no ModR/M (st0/st1 are implicit), the faddp shape. ★★ THE POINT OF THIS ROW IS THAT IT WRITES **EFLAGS**, NOT the x87 status word: FUCOMIP is the x87 compare that reports into ZF/PF/CF, and the pattern it leaves is UCOMISD's BIT FOR BIT (unordered → ZF=PF=CF=1; greater → all 0; less → CF=1; equal → ZF=1). That identity is what lets `long double` reuse the ENTIRE FCmp realization — floatCmpPlan's derivation, its Olt/Ole swap canonicalization, its Foeq/Fune two-setcc compositions and the fused jcc — with nothing re-derived; see mir_to_lir's emitF80Compare. ⓘ QUIET, not signaling: `fcomip` (DF F1) is the signaling sibling and is what gcc/clang emit for `< <= > >=`, but the `fcmp` row above already selects the quiet UCOMISD for every F64/F32 predicate on the stated ground that DSS models no FP environment, so `long double` follows DSS's own rule and the comparison RESULTS are identical on every input. result:none + hasSideEffects (writes EFLAGS AND pops the implicit x87 stack — must never be reordered or DCE'd; no vreg dep expresses either).",
+      "mnemonic": "fucomip", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 0, "maxOperands": 0,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          { "guard": { "operandKinds": [] }, "template": { "opcode": [223, 233] } }
+        ]
+      }
+    },
+    {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-3): FSTP ST(0) = DD D8 (Intel SDM: \"Copy ST(0) to ST(0) and pop the register stack\" — the DD D8+i family, i=0; a REGISTER-form FSTP, distinct from the memory-form fstp_m80 above, which is why it is its own row rather than a variant). A BARE 2-byte fixed opcode, ZERO operands, the faddp shape. Its ONE job is the compare sequence's cleanup: FUCOMIP pops only ONE of the two pushed operands, so this pops the survivor and restores the LD-1 model's invariant that every x87 sequence starts and ends with an EMPTY stack — leak it and eight comparisons overflow the eight-deep stack and start returning NaN indefinites. ⚠ FSTP writes the x87 STATUS WORD, never EFLAGS, so the flags FUCOMIP just set survive it; that is why the cleanup may legally sit between the compare and the setcc/jcc reading it, and both reference compilers emit exactly that order. result:none + hasSideEffects (pops the implicit x87 stack).",
+      "mnemonic": "fstp_st0", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 0, "maxOperands": 0,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          { "guard": { "operandKinds": [] }, "template": { "opcode": [221, 216] } }
+        ]
+      }
+    },
+    {
       "$comment": "Float-to-float precision change (FPTrunc f64→f32, FPExt f32→f64). FC3.5 sweep-c2: encoded — CVTSD2SS xmm1, xmm2 = F2 0F 5A /r (double→single) and CVTSS2SD xmm1, xmm2 = F3 0F 5A /r (single→double), Intel SDM CVTSD2SS/CVTSS2SD: SAME opcode bytes, the mandatory prefix names the SOURCE width. The width axis therefore keys on the SOURCE: the MIR→LIR FPTrunc/FPExt arm threads a widthOverride from the source operand's type (the result-width default would select exactly the WRONG sibling — FPTrunc's F32 result would pick the F3 widen). ModR/M.reg = the xmm destination (resultSlot), ModR/M.rm = the xmm source.",
       "mnemonic": "fpcvt", "result": "value",
       "minOperands": 1, "maxOperands": 1,

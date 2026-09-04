@@ -13500,7 +13500,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // to learn the vocabulary, so it is derived from the
                         // vocabulary rather than restated alongside it.
                         static constexpr std::array<
-                            std::pair<std::string_view, AttributeEffect>, 10>
+                            std::pair<std::string_view, AttributeEffect>, 11>
                             kEffectVerbs{{
                                 {"suppressUnused", AttributeEffect::SuppressUnused},
                                 {"warnOnUse",      AttributeEffect::WarnOnUse},
@@ -13544,6 +13544,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 // all.
                                 {"runBeforeEntry", AttributeEffect::RunBeforeEntry},
                                 {"runAfterEntry",  AttributeEffect::RunAfterEntry},
+                                // D-CSUBSET-PER-MEMBER-PACKED: GNU `packed` written
+                                // on ONE struct/union member-declarator — that
+                                // member's baseline alignment becomes 1 and its
+                                // siblings, and the aggregate's own alignment, are
+                                // untouched. DECLARATION-ATTACHED like its
+                                // neighbours (it is written in a declaration, so the
+                                // Clause-B drift cross-check requires its name in
+                                // every strict-scan row's
+                                // `linkageSpecifierIgnoredNames` — `packed` is
+                                // already on that roster, which is why moving the
+                                // name out of the `none` row does not disturb it).
+                                // The sink is the composite's `fieldPacked` channel
+                                // in the type interner, read by `computeLayout`
+                                // through the same `clampedBaselineAlign` the
+                                // whole-composite `packed` uses.
+                                {"packField",      AttributeEffect::PackField},
                                 {"none",           AttributeEffect::None}}};
                         DSS_CHECK_KEY_VOCABULARY(kEffectVerbs);
 

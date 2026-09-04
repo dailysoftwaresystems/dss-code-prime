@@ -149,10 +149,23 @@ void CompositeIdentityIndex::localSignature_(TypeInterner const& src, TypeId id,
     mix(h, anonNameWithoutDeclSite(src.name(id)));
     mix(h, static_cast<std::uint64_t>(src.isPacked(id) ? 1 : 0));
     mix(h, static_cast<std::uint64_t>(src.explicitCompositeAlign(id)));
+    // ★★ TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack(N)` member-alignment CAP.
+    // ✔MEASURED at base `01642ee3`: this channel was ABSENT from both this signature
+    // and the composite arm's `completeComposite` call, which is precisely the omission
+    // the note above forbids — the same field list under caps 4 and 8 has different
+    // offsets AND a different size, so two capped composites were merging onto one host
+    // type and a capped composite was reinterning UNCAPPED. Adding it here and at the
+    // sink closes it; `PackCapSurvivesReintern` pins it.
+    mix(h, static_cast<std::uint64_t>(src.maxFieldAlign(id)));
     std::span<TypeId const>       fields = src.operands(id);
     std::span<std::int64_t const> widths = src.scalars(id);
     bool const hasOffsets = src.hasExplicitOffsets(id);
     bool const hasAligns  = src.hasExplicitAligns(id);
+    // D-CSUBSET-PER-MEMBER-PACKED: the per-FIELD packed flags. Omitting them merges a
+    // composite whose member is individually packed onto the undecorated one — and on
+    // the `{char; int; double}` shape those two agree on size AND alignment and differ
+    // only in one offset, so the merge would be invisible to every size-based check.
+    bool const hasFieldPk = src.hasFieldPacked(id);
     mix(h, static_cast<std::uint64_t>(fields.size()));
     for (std::size_t i = 0; i < fields.size(); ++i) {
         spine_(src, fields[i], h, refs);
@@ -160,6 +173,8 @@ void CompositeIdentityIndex::localSignature_(TypeInterner const& src, TypeId id,
         if (hasOffsets) mix(h, src.explicitFieldOffset(id, i).value_or(0));
         if (hasAligns)
             mix(h, static_cast<std::uint64_t>(src.explicitFieldAlign(id, i)));
+        if (hasFieldPk)
+            mix(h, static_cast<std::uint64_t>(src.isFieldPacked(id, i) ? 1 : 0));
     }
 }
 
@@ -547,8 +562,29 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
         // not apply and the guarantee is carried by the reintern round-trip pin
         // instead: `CompositeExplicitAlignSurvivesReintern` asserts the value AND the
         // resulting layout survive the hop.
+        //
+        // D-CSUBSET-PER-MEMBER-PACKED: carry the PER-FIELD packed flags for the same
+        // reason, and this is the channel whose loss is hardest to see: a struct
+        // whose one member is individually packed reinterns with the SAME size and
+        // the SAME alignment as the undecorated one and only that member's offset
+        // moves, so nothing downstream that compares sizes could tell them apart.
+        // Empty when no member is individually packed (every composite that predates
+        // the channel). Like `packed`, it never coexists with explicit offsets
+        // (completeComposite rejects the pair).
+        std::vector<std::uint8_t> fieldPacked;
+        if (src.hasFieldPacked(srcId)) {
+            fieldPacked.reserve(srcFields.size());
+            for (std::size_t i = 0; i < srcFields.size(); ++i)
+                fieldPacked.push_back(src.isFieldPacked(srcId, i) ? 1u : 0u);
+        }
+        // ★★ TF-C82: `maxFieldAlign` — the `#pragma pack(N)` cap — was NOT carried
+        // here at base `01642ee3`, so a capped composite reinterned UNCAPPED: a
+        // silent ABI change of exactly the class this call site's own note names.
+        // ✔MEASURED: `{char a; long long z;}` under cap 4 is sizeof 12 / _Alignof 4
+        // with z@4, uncapped 16 / 8 with z@8. Pinned by `PackCapSurvivesReintern`.
         dst.completeComposite(fwd, fields, src.isPacked(srcId), widths, offsets, aligns,
-                              src.explicitCompositeAlign(srcId));
+                              src.explicitCompositeAlign(srcId),
+                              src.maxFieldAlign(srcId), fieldPacked);
         return fwd;
     }
 

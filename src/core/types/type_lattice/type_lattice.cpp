@@ -489,7 +489,8 @@ contentDeclSiteKey(std::span<TypeId const> fields,
                    std::span<std::uint32_t const> fieldAligns = {},
                    bool packed = false,
                    std::uint32_t explicitAlign = 0,
-                   std::uint32_t maxFieldAlign = 0) {
+                   std::uint32_t maxFieldAlign = 0,
+                   std::span<std::uint8_t const> fieldPacked = {}) {
     std::uint64_t h = kFnvOffset;
     h = fnvMix(h, fields.size());
     for (TypeId f : fields) h = fnvMix(h, f.v);
@@ -537,6 +538,20 @@ contentDeclSiteKey(std::span<TypeId const> fields,
     // byte-identically to the pre-TF-C82 function: zero TypeId churn, goldens and
     // round-trips unaffected.
     if (maxFieldAlign != 0) h = fnvMix(h, static_cast<std::uint64_t>(maxFieldAlign));
+    // D-CSUBSET-PER-MEMBER-PACKED: the per-FIELD packed flags enter the content
+    // identity, and this is the channel where omitting them would be HARDEST to
+    // notice. `struct { char a; int z; double d; }` is sizeof 16 / _Alignof 8 BOTH
+    // with and without a per-member packed on `z` — only the OFFSET of `z` moves
+    // (4 → 1). So two distinct layouts would collide on one TypeId with matching
+    // sizes and matching alignments, and every size-based check downstream would
+    // agree with the wrong one. GUARDED on non-empty (mirrors the offsets/aligns
+    // guards) so a composite with no per-member packed hashes byte-identically to
+    // the pre-channel function: zero TypeId churn, goldens and round-trips
+    // unaffected.
+    if (!fieldPacked.empty()) {
+        h = fnvMix(h, fieldPacked.size());
+        for (std::uint8_t p : fieldPacked) h = fnvMix(h, static_cast<std::uint64_t>(p));
+    }
     return h | (std::uint64_t{1} << 63);
 }
 
@@ -610,7 +625,8 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
                                      std::span<std::uint64_t const> fieldOffsets,
                                      std::span<std::uint32_t const> fieldAligns,
                                      std::uint32_t explicitAlign,
-                                     std::uint32_t maxFieldAlign) {
+                                     std::uint32_t maxFieldAlign,
+                                     std::span<std::uint8_t const> fieldPacked) {
     TypeRecord const& rec = arena_.at(id);
     if (rec.kind != TypeKind::Struct && rec.kind != TypeKind::Union) {
         latticeFatal("completeComposite: TypeId is not a Struct/Union");
@@ -649,6 +665,22 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
         latticeFatal("completeComposite: a struct cannot be BOTH packed and carry "
                      "explicit field offsets (offsets place fields wholesale, "
                      "overriding padding)");
+    }
+    // D-CSUBSET-PER-MEMBER-PACKED: the per-field flags are ALL-fields-or-NONE, the
+    // same discipline `fieldOffsets` and `fieldAligns` are held to — a partial span
+    // is a caller bug, and one silently short by a field would leave the LAST members
+    // unpacked with nothing said.
+    if (!fieldPacked.empty() && fieldPacked.size() != fields.size()) {
+        latticeFatal("completeComposite: per-field packed flags must cover every "
+                     "field (all-or-none)");
+    }
+    // D-CSUBSET-PER-MEMBER-PACKED: explicit offsets place fields wholesale, so a
+    // per-field packed is as contradictory with them as the whole-composite flag is
+    // (guard above). Fail loud rather than let one channel silently win.
+    if (!fieldPacked.empty() && !fieldOffsets.empty()) {
+        latticeFatal("completeComposite: a struct cannot carry BOTH per-field packed "
+                     "flags and explicit field offsets (offsets place fields "
+                     "wholesale, overriding padding)");
     }
     // D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): the whole-composite alignment must be a
     // representable alignment (a power of two ≤ 256) or the 0 no-request sentinel.
@@ -692,7 +724,13 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
                  // CONFLICTING re-completion — the two definitions lay out to
                  // different sizes, so keeping whichever ran first would silently
                  // pick one layout for a type the source gives two.
-                 && it->second.maxFieldAlign == maxFieldAlign;
+                 && it->second.maxFieldAlign == maxFieldAlign
+                 // D-CSUBSET-PER-MEMBER-PACKED: a re-completion that CHANGES which
+                 // members are individually packed is a CONFLICTING re-completion —
+                 // the two definitions give the same type two different field
+                 // offsets, and (on the `{char; int; double}` shape) the same size,
+                 // so keeping whichever ran first would silently pick one ABI.
+                 && it->second.fieldPacked.size() == fieldPacked.size();
         for (std::size_t i = 0; same && i < fields.size(); ++i)
             if (it->second.fields[i].v != fields[i].v) same = false;
         for (std::size_t i = 0; same && i < sc.size(); ++i)
@@ -701,6 +739,8 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
             if (it->second.fieldOffsets[i] != fieldOffsets[i]) same = false;
         for (std::size_t i = 0; same && i < fieldAligns.size(); ++i)
             if (it->second.fieldAligns[i] != fieldAligns[i]) same = false;
+        for (std::size_t i = 0; same && i < fieldPacked.size(); ++i)
+            if (it->second.fieldPacked[i] != fieldPacked[i]) same = false;
         if (!same) {
             latticeFatal("completeComposite: composite re-completed with different "
                          "fields (double-complete / tag redecl)");
@@ -714,6 +754,7 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
     it->second.packed = packed;
     it->second.explicitAlign = explicitAlign;
     it->second.maxFieldAlign = maxFieldAlign;
+    it->second.fieldPacked.assign(fieldPacked.begin(), fieldPacked.end());
     it->second.complete = true;
     ++poolGen_;   // the field view changed — invalidate any pre-completion span
 }
@@ -824,6 +865,30 @@ TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> f
     return id;
 }
 
+TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> fields,
+                                std::span<std::int64_t const> fieldBitWidths,
+                                std::span<std::uint64_t const> fieldOffsets,
+                                std::span<std::uint32_t const> fieldAligns,
+                                std::uint32_t explicitAlign,
+                                std::uint32_t maxFieldAlign,
+                                std::span<std::uint8_t const> fieldPacked) {
+    // D-CSUBSET-PER-MEMBER-PACKED: the per-field packed flags enter the content
+    // identity, so `struct { char a; int z <packed>; double d; }` and the same field
+    // list undecorated are TWO interned types. They have the SAME size (16) and the
+    // SAME alignment (8) and differ only in `z`'s offset (1 vs 4) — which is exactly
+    // why the mix is required rather than merely tidy: nothing downstream that checks
+    // sizes could ever separate them. An EMPTY span routes exactly like the 7-arg
+    // overload (byte-identical declSiteKey).
+    auto const sc = encodeFieldBitWidths(fields.size(), fieldBitWidths);
+    TypeId const id = internComposite(
+        TypeKind::Struct, name,
+        contentDeclSiteKey(fields, sc, fieldOffsets, fieldAligns, /*packed=*/false,
+                           explicitAlign, maxFieldAlign, fieldPacked));
+    completeComposite(id, fields, /*packed=*/false, fieldBitWidths, fieldOffsets,
+                      fieldAligns, explicitAlign, maxFieldAlign, fieldPacked);
+    return id;
+}
+
 bool TypeInterner::hasExplicitOffsets(TypeId id) const {
     id = materialId_(id);
     TypeKind const k = arena_.at(id).kind;
@@ -865,6 +930,25 @@ bool TypeInterner::isPacked(TypeId id) const {
     if (k != TypeKind::Struct && k != TypeKind::Union) return false;
     auto it = compositeFields_.find(id.v);
     return it != compositeFields_.end() && it->second.packed;
+}
+
+bool TypeInterner::hasFieldPacked(TypeId id) const {
+    // Same skin-strip as `hasExplicitAligns`: a qualifier never changes layout, so a
+    // `volatile struct S` carries S's per-field packed flags.
+    id = materialId_(id);
+    TypeKind const k = arena_.at(id).kind;
+    if (k != TypeKind::Struct && k != TypeKind::Union) return false;
+    auto it = compositeFields_.find(id.v);
+    return it != compositeFields_.end() && !it->second.fieldPacked.empty();
+}
+
+bool TypeInterner::isFieldPacked(TypeId id, std::size_t i) const {
+    id = materialId_(id);
+    auto it = compositeFields_.find(id.v);
+    if (it == compositeFields_.end() || i >= it->second.fieldPacked.size()) {
+        return false;   // no per-field flag → the ordinary (padded) baseline
+    }
+    return it->second.fieldPacked[i] != 0;
 }
 
 std::uint32_t TypeInterner::explicitCompositeAlign(TypeId id) const {

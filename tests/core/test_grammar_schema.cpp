@@ -2400,6 +2400,15 @@ TEST(GrammarSchema, AttributeEffectUnknownVerbListsExactlyTheAcceptedSet) {
                                            "noInline", "alwaysInline",
                                            "noSanitizeThread",
                                            "runBeforeEntry", "runAfterEntry",
+                                           // P58 (D-CSUBSET-PER-MEMBER-PACKED):
+                                           // GNU `packed` on ONE struct/union
+                                           // member-declarator. ✔This roster CAUGHT
+                                           // the verb's arrival — the message is
+                                           // DERIVED from the loader's arms and went
+                                           // to 11 while this list said 10, which is
+                                           // exactly the drift the count guard below
+                                           // exists to find.
+                                           "packField",
                                            "none"};
     // The message under test.
     auto const bad = attrVocabSchema(

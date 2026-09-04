@@ -674,21 +674,37 @@ struct DSS_EXPORT TargetRegisterClassOps {
     }
 };
 
-// D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the six abstract wide-float
+// D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the abstract wide-float
 // (IEEE binary128 `long double`) operations a softfloat-libcall target
 // realizes by CALLING a runtime helper (`__addtf3`/`__fixtfsi`/…) instead of
 // an inline instruction sequence. The engine keys the softcall verb on
 // `TypeKind::F128` + the PRESENCE of a config row for the op (never a
 // target/format identity branch): a target that declares F128 but no softcall
 // rows falls straight through to the `requireEncodedFloatWidth` fail-loud gate.
+//
+// D-TARGET-ENCODING-WIDTH-GUARD (LD-3) added the SIX COMPARISON rows. They are
+// one row per C comparison operator rather than one shared three-way compare
+// because that is what the libgcc ABI publishes and what both aarch64
+// references emit — ✔MEASURED 2026-09-03, gcc 13.3.0 and clang 18.1.3 probed
+// separately and agreeing helper-for-helper. Each returns an `int` whose SIGN
+// answers the predicate, with a NaN operand returning the sign that makes the
+// ordered predicates false and `!=` true (C 6.5.9), so the lowering finishes
+// them on an INTEGER condition code. ⓘ There is deliberately no `cmp` row for
+// libgcc's three-way `__cmptf2`: its result is unspecified on NaN, and
+// `nm -D /usr/aarch64-linux-gnu/lib/libgcc_s.so.1` shows it is not even
+// EXPORTED, while all six of these are.
 enum class WideFloatOp : std::uint8_t {
     Add = 0, Sub = 1, Mul = 2, Div = 3, ToInt32 = 4, FromFloat64 = 5,
+    CmpLt = 6, CmpLe = 7, CmpGt = 8, CmpGe = 9, CmpEq = 10, CmpNe = 11,
 };
-inline constexpr std::size_t kWideFloatOpCount = 6;
-inline constexpr EnumNameTable<WideFloatOp, 6> kWideFloatOpTable{{{
+inline constexpr std::size_t kWideFloatOpCount = 12;
+inline constexpr EnumNameTable<WideFloatOp, 12> kWideFloatOpTable{{{
     { WideFloatOp::Add, "add" }, { WideFloatOp::Sub, "sub" },
     { WideFloatOp::Mul, "mul" }, { WideFloatOp::Div, "div" },
     { WideFloatOp::ToInt32, "to_i32" }, { WideFloatOp::FromFloat64, "from_f64" },
+    { WideFloatOp::CmpLt, "cmp_lt" }, { WideFloatOp::CmpLe, "cmp_le" },
+    { WideFloatOp::CmpGt, "cmp_gt" }, { WideFloatOp::CmpGe, "cmp_ge" },
+    { WideFloatOp::CmpEq, "cmp_eq" }, { WideFloatOp::CmpNe, "cmp_ne" },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate

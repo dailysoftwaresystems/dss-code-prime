@@ -2337,6 +2337,45 @@ enum class AttributeEffect : std::uint8_t {
     // entry true.
     RunBeforeEntry,
     RunAfterEntry,
+    // D-CSUBSET-PER-MEMBER-PACKED: the declared entity's BASELINE ALIGNMENT IS 1 —
+    // GNU `packed` written on ONE member-declarator of a struct/union
+    // (`struct S { char a; int z __attribute__((packed)); double d; };`), which packs
+    // `z` and nothing else. The fact folds onto the member's `SymbolRecord`, the
+    // composite's Pass-1 completion gathers one flag per field into the interner's
+    // `fieldPacked` channel, and `computeLayout` feeds it to the ONE shared
+    // `clampedBaselineAlign` the whole-composite `packed` and `#pragma pack(N)`
+    // already meet at.
+    //
+    // ★★ WHY IT IS THE EXACT INVERSE OF `Align`, AND WHY THAT MATTERS MORE HERE.
+    // `Align` RAISES an entity's alignment and folds with MAX; this LOWERS a
+    // member's baseline to 1 and is then subject to that same MAX-fold, which is
+    // what makes `__attribute__((packed, aligned(2)))` come out at 2 rather than at
+    // the type's natural 4 (✔MEASURED, gcc 13.3.0 and clang 18.1.3, x86_64 and
+    // aarch64). One channel, read in both directions — not two competing ones.
+    //
+    // ★★★ NOT `None`, AND THIS ROW IS THE COUNTEREXAMPLE TO THE ARGUMENT THAT PUT
+    // `packed` THERE. `None` asserts "KNOWN vocabulary, consumed elsewhere or
+    // deliberately inert", and for `packed` the "elsewhere" is the dedicated
+    // whole-composite scan. TF-C73 opened the MEMBER attribute position on the
+    // reasoning that "one attribute does not mean two things depending on which side
+    // of the declarator it is written" — `packed` is precisely that attribute, and
+    // for every cycle since, the member spelling has parsed and been DROPPED IN
+    // SILENCE. ✔MEASURED at base `01642ee3` through the shipped CLI:
+    // `struct { char a; int z __attribute__((packed)); double d; }` compiled rc 0
+    // with zero diagnostics and `z` at offset 4, where gcc and clang both put it at
+    // 1 — same sizeof, no warning, wrong bytes. A verb with a real sink is what
+    // makes the vocabulary entry true.
+    //
+    // ⚠ THE FACT IS INERT WHEREVER NO COMPOSITE GATHERS IT. `packed` on a file- or
+    // block-scope object, a function, or a typedef reaches this verb too; gcc warns
+    // `'packed' attribute ignored [-Wattributes]` there and clang is silent, and
+    // BOTH produce identical bytes (✔MEASURED, incl. `_Alignof` of a packed
+    // typedef's type = 4, unchanged). The four-kind `appliesTo` vocabulary cannot
+    // separate a struct MEMBER from an object — both are `variable` — so this row
+    // stays un-kinded and the member-only-ness lives in the SINK, which is the only
+    // place that can express it. That is the same posture the config's un-kinded
+    // `none` names already take, held for a measured reason rather than a shrug.
+    PackField,
     None,
 };
 struct DSS_EXPORT AttributeSemanticsRow {

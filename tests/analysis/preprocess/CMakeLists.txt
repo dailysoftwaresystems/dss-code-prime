@@ -121,3 +121,22 @@ dss_add_test(NAME analysis/preprocess/test_prescan_macro_oracle
 target_include_directories(
     dss_analysis_preprocess_test_prescan_macro_oracle
     PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# [[D-CSUBSET-COMPILER-FEATURE-QUERY-OPERATORS]]: the feature-query operator
+# family (`__has_attribute` / `__has_builtin` / `__has_feature` /
+# `__has_extension`, against the three C23 conditional-inclusion operators that
+# ARE implemented) pinned as ONE enumeration — visibility tracks implementation,
+# the portable `#ifndef` shim still installs, an UNDECLARED capability answers 0
+# rather than 1, the `#define` refusal covers exactly the C23 6.10.10p2 names,
+# and an unshimmed query fails LOUD instead of answering 0 in silence. A separate
+# binary rather than more cases in test_preprocessor.cpp because those five are
+# halves of a single invariant whose JOINT reading is the guard — split across a
+# 10k-line file, a later cycle can satisfy one and break another unnoticed — and
+# because the pre-scan arm needs a real header on disk reached through an
+# InsideRepo ScratchDir made the process cwd, which that file's in-memory
+# fixtures cannot express. Same split, same reason, as test_prescan_macro_oracle.
+dss_add_test(NAME analysis/preprocess/test_feature_query_operator_family
+             SOURCES test_feature_query_operator_family.cpp)
+target_include_directories(
+    dss_analysis_preprocess_test_feature_query_operator_family
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests)

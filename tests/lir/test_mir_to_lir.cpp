@@ -9019,3 +9019,485 @@ TEST(MirToLirPackedAtomic, ShippedPe64FormatRoutesTheUnderAlignedAccessToTheRunt
             << "and it must not call the runtime at all.";
     }
 }
+
+// ══ D-TARGET-ENCODING-WIDTH-GUARD (LD-3): `long double` COMPARISON ═════════
+//
+// The third consumer of the LD memory-resident model, after LD-1's x87
+// arithmetic and LD-2's binary128 softcalls. Until this landed, the ONE thing a
+// program could not do with a `long double` was compare two of them: every
+// FCmp whose operands were F80 or F128 hit `requireEncodedFloatWidth`'s
+// "MIR FCmp operand" arm and failed loud naming this anchor. The refusal was
+// reachable from ordinary C — `examples/c/c_long_double_control_merge` is bent
+// around it — and all four references compile and RUN the construct.
+//
+// TWO REALIZATIONS, ONE TAIL, and which applies is decided by TypeKind alone
+// (each width forms solely on its own longDoubleFormat axis):
+//
+//   * F80 (the x87-80 axis: elf/macho x86_64) — an INLINE four-instruction
+//     sequence `fld_m80 [rhs]; fld_m80 [lhs]; fucomip; fstp_st0`. FUCOMIP
+//     reports into EFLAGS with UCOMISD's exact ZF/PF/CF pattern, so the whole
+//     FC3.5 predicate machinery (floatCmpPlan, the Olt/Ole swap, the composed
+//     two-setcc shapes, the fused jcc) applies UNCHANGED.
+//   * F128 (the ieee128 axis: elf arm64) — a CALL to a config'd libgcc helper,
+//     one per C operator, then an INTEGER compare of its int32 result against
+//     zero. No float flags are involved at all.
+//
+// ★ WHY A "IT COMPILES AND RETURNS 42" ARM WOULD NOT BE ENOUGH. The failure
+// mode of a compare lowering is not a fault, it is an INVERTED ANSWER, and both
+// ways to get one are silent:
+//   (a) the x87 PUSH ORDER — FUCOMIP compares ST(0) against ST(1), so the LEFT
+//       side must be pushed LAST, the REVERSE of `lowerF80Arith`'s order. Get
+//       it backwards and every relational operator inverts, with no arity, type
+//       or width check able to see it. The two direction arms below pin it
+//       ABSOLUTELY (against the `arg` opcodes' own result registers), not
+//       merely relative to each other — a globally reversed push order would
+//       satisfy a relative pin.
+//   (b) the F128 compare WIDTH — the helper returns a C `int` and AAPCS64
+//       leaves the upper 32 bits of the result register unspecified, so a
+//       width-64 compare could take the sign from garbage.
+
+namespace {
+
+// `_Bool f(long double* pa, long double* pb) { return *pa OP *pb; }` for a
+// memory-resident wide float. Pointer params (so the two `arg` opcodes give
+// each operand's address an IDENTIFIABLE register) + F80/F128 Loads, which
+// address-propagate — so the compare's operand registers ARE the arg registers.
+[[nodiscard]] ::dss::Mir
+buildWideFloatCompare(::dss::TypeInterner& interner, ::dss::TypeKind kind,
+                      ::dss::MirOpcode pred) {
+    auto const wide  = interner.primitive(kind);
+    auto const ptrT  = interner.pointer(wide);
+    auto const boolT = interner.primitive(::dss::TypeKind::Bool);
+    std::array<::dss::TypeId, 2> params{ptrT, ptrT};
+    auto const sig = interner.fnSig(params, boolT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const pa = mb.addArg(0, ptrT);
+    ::dss::MirInstId const pb = mb.addArg(1, ptrT);
+    std::array<::dss::MirInstId, 1> laOps{pa};
+    ::dss::MirInstId const va = mb.addInst(::dss::MirOpcode::Load, laOps, wide);
+    std::array<::dss::MirInstId, 1> lbOps{pb};
+    ::dss::MirInstId const vb = mb.addInst(::dss::MirOpcode::Load, lbOps, wide);
+    std::array<::dss::MirInstId, 2> cmpOps{va, vb};
+    ::dss::MirInstId const c = mb.addInst(pred, cmpOps, boolT);
+    mb.addReturn(c);
+    return std::move(mb).finish();
+}
+
+// The same comparison CONSUMED BY A BRANCH — the path `lowerCondBr`'s fusion
+// arm takes, and the second place the width gate reaches an FCmp operand.
+[[nodiscard]] ::dss::Mir
+buildWideFloatCompareBranch(::dss::TypeInterner& interner, ::dss::TypeKind kind,
+                            ::dss::MirOpcode pred) {
+    auto const wide  = interner.primitive(kind);
+    auto const ptrT  = interner.pointer(wide);
+    auto const i32   = interner.primitive(::dss::TypeKind::I32);
+    auto const boolT = interner.primitive(::dss::TypeKind::Bool);
+    std::array<::dss::TypeId, 2> params{ptrT, ptrT};
+    auto const sig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const entry =
+        mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    ::dss::MirBlockId const thenB = mb.createBlock(::dss::StructCfMarker::IfThen);
+    ::dss::MirBlockId const elseB = mb.createBlock(::dss::StructCfMarker::IfElse);
+    mb.beginBlock(entry);
+    ::dss::MirInstId const pa = mb.addArg(0, ptrT);
+    ::dss::MirInstId const pb = mb.addArg(1, ptrT);
+    std::array<::dss::MirInstId, 1> laOps{pa};
+    ::dss::MirInstId const va = mb.addInst(::dss::MirOpcode::Load, laOps, wide);
+    std::array<::dss::MirInstId, 1> lbOps{pb};
+    ::dss::MirInstId const vb = mb.addInst(::dss::MirOpcode::Load, lbOps, wide);
+    std::array<::dss::MirInstId, 2> cmpOps{va, vb};
+    ::dss::MirInstId const c = mb.addInst(pred, cmpOps, boolT);
+    mb.addCondBr(c, thenB, elseB);
+    ::dss::MirLiteralValue lv42;
+    lv42.value = static_cast<std::int64_t>(42);
+    lv42.core  = ::dss::TypeKind::I32;
+    ::dss::MirLiteralValue lv7;
+    lv7.value = static_cast<std::int64_t>(7);
+    lv7.core  = ::dss::TypeKind::I32;
+    mb.beginBlock(thenB);
+    mb.addReturn(mb.addConst(lv42, i32));
+    mb.beginBlock(elseB);
+    mb.addReturn(mb.addConst(lv7, i32));
+    return std::move(mb).finish();
+}
+
+// The result register of the `arg` instruction carrying payload `index`.
+[[nodiscard]] ::dss::LirReg
+argRegister(::dss::Lir const& lir, ::dss::LirBlockId bb, std::uint16_t argOp,
+            std::uint32_t index) {
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const id = lir.blockInstAt(bb, i);
+        if (lir.instOpcode(id) == argOp && lir.instPayload(id) == index) {
+            return lir.instResult(id);
+        }
+    }
+    return ::dss::LirReg{};
+}
+
+// Index of the first instruction in `bb` with opcode `op`, else nullopt.
+[[nodiscard]] std::optional<std::uint32_t>
+firstIndexOfOpcode(::dss::Lir const& lir, ::dss::LirBlockId bb,
+                   std::uint16_t op) {
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        if (lir.instOpcode(lir.blockInstAt(bb, i)) == op) return i;
+    }
+    return std::nullopt;
+}
+
+// The x87 compare shape: the ADDRESSES of the two `fld_m80` pushes in EMITTED
+// order, plus the `fucomip`'s index. nullopt unless the four instructions are
+// exactly fld_m80; fld_m80; fucomip; fstp_st0 and contiguous.
+struct X87CompareShape {
+    ::dss::LirReg firstPush{};   // pushed FIRST  → ends up in ST(1)
+    ::dss::LirReg secondPush{};  // pushed SECOND → ends up in ST(0)
+    std::uint32_t fucomipIdx = 0;
+};
+// `at` names WHICH compare to describe. A fused branch block holds TWO — the
+// one `lowerFCmp` emitted to materialize the Bool, and the one `lowerCondBr`
+// re-emitted for the jcc to read — and the fused test must describe the second,
+// not merely the first one it trips over.
+[[nodiscard]] std::optional<X87CompareShape>
+x87CompareShape(::dss::Lir const& lir, ::dss::LirBlockId bb,
+                ::dss::TargetSchema const& sch,
+                std::optional<std::uint32_t> at = std::nullopt) {
+    auto const fldOp     = sch.opcodeByMnemonic("fld_m80");
+    auto const fucomipOp = sch.opcodeByMnemonic("fucomip");
+    auto const fstpSt0Op = sch.opcodeByMnemonic("fstp_st0");
+    if (!fldOp.has_value() || !fucomipOp.has_value()
+        || !fstpSt0Op.has_value()) {
+        return std::nullopt;
+    }
+    auto const idx = at.has_value() ? at
+                                    : firstIndexOfOpcode(lir, bb, *fucomipOp);
+    if (!idx.has_value() || *idx < 2) return std::nullopt;
+    if (lir.instOpcode(lir.blockInstAt(bb, *idx)) != *fucomipOp) {
+        return std::nullopt;
+    }
+    if (*idx + 1 >= lir.blockInstCount(bb)) return std::nullopt;
+    auto const push1 = lir.blockInstAt(bb, *idx - 2);
+    auto const push2 = lir.blockInstAt(bb, *idx - 1);
+    if (lir.instOpcode(push1) != *fldOp || lir.instOpcode(push2) != *fldOp) {
+        return std::nullopt;
+    }
+    if (lir.instOpcode(lir.blockInstAt(bb, *idx + 1)) != *fstpSt0Op) {
+        return std::nullopt;
+    }
+    auto const o1 = lir.instOperands(push1);
+    auto const o2 = lir.instOperands(push2);
+    if (o1.empty() || o2.empty()) return std::nullopt;
+    if (o1[0].kind != ::dss::LirOperandKind::Reg
+        || o2[0].kind != ::dss::LirOperandKind::Reg) {
+        return std::nullopt;
+    }
+    return X87CompareShape{o1[0].reg, o2[0].reg, *idx};
+}
+
+// Index of the LAST instruction in `bb` with opcode `op` at or before `limit`.
+[[nodiscard]] std::optional<std::uint32_t>
+lastIndexOfOpcodeBefore(::dss::Lir const& lir, ::dss::LirBlockId bb,
+                        std::uint16_t op, std::uint32_t limit) {
+    std::optional<std::uint32_t> found;
+    for (std::uint32_t i = 0; i < limit && i < lir.blockInstCount(bb); ++i) {
+        if (lir.instOpcode(lir.blockInstAt(bb, i)) == op) found = i;
+    }
+    return found;
+}
+
+// Every setcc payload emitted in `bb`, in order.
+[[nodiscard]] std::vector<std::uint32_t>
+setccPayloads(::dss::Lir const& lir, ::dss::LirBlockId bb,
+              std::uint16_t setccOp) {
+    std::vector<std::uint32_t> out;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const id = lir.blockInstAt(bb, i);
+        if (lir.instOpcode(id) == setccOp) out.push_back(lir.instPayload(id));
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(MirToLir, F80CompareLowersToX87SequenceAndPushesTheLeftOperandLast) {
+    // The POSITIVE half: an F80 FCmp no longer walls, and it lowers to the
+    // exact four-instruction x87 compare plus the setcc/zext tail every other
+    // compare in the compiler already uses.
+    //
+    // THE DIRECTION ARM IS THE LOAD-BEARING ONE. `FCmpOgt(*pa, *pb)` takes no
+    // operand swap, so the left side is `*pa` and FUCOMIP needs it in ST(0) —
+    // pushed SECOND. Pinned ABSOLUTELY against the `arg` opcodes' own result
+    // registers, so it distinguishes the right order from the reversed one.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatCompare(interner, ::dss::TypeKind::F80,
+                                         ::dss::MirOpcode::FCmpOgt);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "an F80 comparison must lower on the x87-80 axis: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        << "the FCmp-operand width wall must NOT fire for F80 any more "
+           "(red-on-disable: revert the emitFloatCompare F80 arm and it does)";
+
+    Lir const& lir = result.lir;
+    ASSERT_EQ(lir.moduleFuncCount(), 1u);
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    auto const shape = x87CompareShape(lir, bb, **target);
+    ASSERT_TRUE(shape.has_value())
+        << "the F80 compare must emit exactly fld_m80; fld_m80; fucomip; "
+           "fstp_st0, contiguously";
+    auto const argOp = (*target)->opcodeByMnemonic("arg");
+    ASSERT_TRUE(argOp.has_value());
+    LirReg const pa = argRegister(lir, bb, *argOp, 0);
+    LirReg const pb = argRegister(lir, bb, *argOp, 1);
+    ASSERT_TRUE(pa.valid() && pb.valid());
+    EXPECT_EQ(shape->firstPush, pb)
+        << "Ogt takes no swap, so the RIGHT operand is pushed first (into ST(1))";
+    EXPECT_EQ(shape->secondPush, pa)
+        << "and the LEFT operand is pushed LAST, into ST(0) — FUCOMIP compares "
+           "ST(0) against ST(1), so reversing this inverts the operator with no "
+           "diagnostic anywhere";
+    auto const setccOp = (*target)->opcodeByMnemonic("setcc");
+    ASSERT_TRUE(setccOp.has_value());
+    auto const payloads = setccPayloads(lir, bb, *setccOp);
+    ASSERT_EQ(payloads.size(), 1u) << "Ogt is a single-cc predicate on x86";
+    EXPECT_EQ(payloads[0],
+              static_cast<std::uint32_t>(::dss::TargetCondCode::Fogt))
+        << "the x87 flags ARE UCOMISD's, so the FLOAT condition code applies "
+           "unchanged — an integer nibble here would be a NaN miscompile";
+}
+
+TEST(MirToLir, F80CompareSwapCanonicalizationReversesThePushOrder) {
+    // The other half of the direction pin, and the one proving the swap
+    // survives the new realization: `FCmpOlt(a,b)` is canonicalized to
+    // `Fogt(b,a)`, so the emitted compare's left side is `*pb` and IT must be
+    // pushed last — the exact mirror of the Ogt arm. A lowering that ignored
+    // `plan.swapOperands` for F80 would pass the shape arm, pass the Ogt arm,
+    // and invert every `<` in the language.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatCompare(interner, ::dss::TypeKind::F80,
+                                         ::dss::MirOpcode::FCmpOlt);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& lir = result.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    auto const shape = x87CompareShape(lir, bb, **target);
+    ASSERT_TRUE(shape.has_value());
+    auto const argOp = (*target)->opcodeByMnemonic("arg");
+    ASSERT_TRUE(argOp.has_value());
+    LirReg const pa = argRegister(lir, bb, *argOp, 0);
+    LirReg const pb = argRegister(lir, bb, *argOp, 1);
+    ASSERT_TRUE(pa.valid() && pb.valid());
+    EXPECT_EQ(shape->firstPush, pa)
+        << "Olt swaps, so the source-LEFT operand is pushed FIRST";
+    EXPECT_EQ(shape->secondPush, pb)
+        << "and the swapped left side (*pb) is the one that lands in ST(0)";
+}
+
+TEST(MirToLir, F80CompareFusesIntoTheConditionalBranch) {
+    // An F80 compare CONSUMED BY A BRANCH takes the fused arm like any other
+    // single-cc float predicate: the x87 sequence is re-emitted at the branch
+    // and the jcc reads its flags directly. This is the SECOND reach of the
+    // width gate ("MIR FCmp operand (fused)"); un-walling only the
+    // materializing one would be a partial fix that reads as a complete one,
+    // and `if (a < b)` is the commonest shape in real code.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatCompareBranch(interner, ::dss::TypeKind::F80,
+                                               ::dss::MirOpcode::FCmpOgt);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "an F80 compare feeding a branch must lower: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        << "neither FCmp reach of the width gate may fire for F80";
+    Lir const& lir = result.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    auto const jccOp = (*target)->opcodeByMnemonic("jcc");
+    auto const fucomipOp = (*target)->opcodeByMnemonic("fucomip");
+    ASSERT_TRUE(jccOp.has_value() && fucomipOp.has_value());
+    auto const jccIdx = firstIndexOfOpcode(lir, bb, *jccOp);
+    ASSERT_TRUE(jccIdx.has_value()) << "the block must terminate in a jcc";
+    // THE compare the branch reads is the LAST one before the jcc, not the
+    // first one in the block: `lowerFCmp` already emitted its own (whose setcc
+    // this fused path leaves dead — D-LIR-SETCC-DEAD-AFTER-FUSION), and
+    // describing that one instead would leave the fused emit unpinned.
+    auto const fusedIdx =
+        lastIndexOfOpcodeBefore(lir, bb, *fucomipOp, *jccIdx);
+    ASSERT_TRUE(fusedIdx.has_value())
+        << "the fused branch must emit an x87 compare before its jcc";
+    auto const shape = x87CompareShape(lir, bb, **target, fusedIdx);
+    ASSERT_TRUE(shape.has_value())
+        << "the fused branch's compare must be the full fld_m80; fld_m80; "
+           "fucomip; fstp_st0 sequence";
+    EXPECT_GT(*jccIdx, shape->fucomipIdx)
+        << "the jcc must read the flags the fucomip set";
+    EXPECT_EQ(lir.instPayload(lir.blockInstAt(bb, *jccIdx)),
+              static_cast<std::uint32_t>(::dss::TargetCondCode::Fogt))
+        << "fused, so the jcc carries the FLOAT condition directly";
+    // ★ AND THE FUSED EMIT NEEDS ITS OWN DIRECTION ARM. ✔MEASURED: the M4
+    // red-on-disable mutant (transposing the two pushes in `emitF80Compare`)
+    // left this test GREEN while both materializing-path direction arms went
+    // red — it pinned the SHAPE of the fused compare and not its ORDER, so a
+    // fused-only inversion could have slipped through. Same absolute anchor as
+    // the other two arms: Ogt takes no swap, so the RIGHT operand is pushed
+    // first and the LEFT one lands in ST(0).
+    auto const argOp = (*target)->opcodeByMnemonic("arg");
+    ASSERT_TRUE(argOp.has_value());
+    LirReg const pa = argRegister(lir, bb, *argOp, 0);
+    LirReg const pb = argRegister(lir, bb, *argOp, 1);
+    ASSERT_TRUE(pa.valid() && pb.valid());
+    EXPECT_EQ(shape->firstPush, pb)
+        << "the fused compare pushes the RIGHT operand first";
+    EXPECT_EQ(shape->secondPush, pa)
+        << "and the LEFT operand last, into ST(0) — the same direction the "
+           "materializing path uses, pinned separately because the fused path "
+           "emits its own compare";
+}
+
+TEST(MirToLir, F128CompareLowersToSoftcallAndWidth32IntegerCompare) {
+    // The binary128 half, all six C comparison operators. Each names its OWN
+    // libgcc helper — the mapping both aarch64 references were measured
+    // emitting — and finishes on the SIGNED INTEGER nibble for that operator,
+    // because once the helper has returned there is no float left to compare.
+    //
+    // ⚠ THE WIDTH ARM IS THE SILENT-MISCOMPILE GUARD. The helper returns a C
+    // `int`; AAPCS64 leaves the upper 32 bits of the result register
+    // unspecified, so a width-64 compare could read a garbage sign bit and
+    // decide the predicate at random. Both references emit `cmp w0, 0`.
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const callOp  = (*target)->opcodeByMnemonic("call");
+    auto const cmpOp   = (*target)->opcodeByMnemonic("cmp");
+    auto const setccOp = (*target)->opcodeByMnemonic("setcc");
+    ASSERT_TRUE(callOp.has_value() && cmpOp.has_value()
+                && setccOp.has_value());
+    struct Case {
+        ::dss::MirOpcode      pred;
+        char const*           helper;
+        ::dss::TargetCondCode cc;
+    };
+    std::array<Case, 6> const cases{{
+        {::dss::MirOpcode::FCmpOlt, "__lttf2", ::dss::TargetCondCode::Slt},
+        {::dss::MirOpcode::FCmpOle, "__letf2", ::dss::TargetCondCode::Sle},
+        {::dss::MirOpcode::FCmpOgt, "__gttf2", ::dss::TargetCondCode::Sgt},
+        {::dss::MirOpcode::FCmpOge, "__getf2", ::dss::TargetCondCode::Sge},
+        {::dss::MirOpcode::FCmpOeq, "__eqtf2", ::dss::TargetCondCode::Eq},
+        {::dss::MirOpcode::FCmpUne, "__netf2", ::dss::TargetCondCode::Ne},
+    }};
+    for (auto const& c : cases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m =
+            buildWideFloatCompare(interner, ::dss::TypeKind::F128, c.pred);
+        ::dss::DiagnosticReporter rep;
+        auto result = lowerF128Arm64(m, **target, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << c.helper << ": an F128 comparison must lower to the softcall: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+            << c.helper << ": the FCmp-operand width wall must not fire";
+        // THIS predicate's helper, and no other one: a mapping that collapsed
+        // several operators onto one helper would still lower and still return
+        // a plausible answer, so the extern set is pinned exactly.
+        ASSERT_EQ(result.externImports.size(), 1u)
+            << c.helper << ": exactly one comparison helper may be imported";
+        EXPECT_EQ(result.externImports[0].mangledName, c.helper)
+            << c.helper << ": wrong helper for this predicate";
+        std::uint32_t const helperSym = result.externImports[0].symbol.v;
+
+        Lir const& lir = result.lir;
+        LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+        auto const callIdx = findCallToSymbol(lir, bb, *callOp, helperSym);
+        ASSERT_TRUE(callIdx.has_value())
+            << c.helper << ": call site not found";
+        // …followed by the integer compare of its result against zero.
+        std::optional<std::uint32_t> cmpIdx;
+        for (std::uint32_t i = *callIdx + 1; i < lir.blockInstCount(bb); ++i) {
+            if (lir.instOpcode(lir.blockInstAt(bb, i)) == *cmpOp) {
+                cmpIdx = i;
+                break;
+            }
+        }
+        ASSERT_TRUE(cmpIdx.has_value())
+            << c.helper << ": the helper's result must be compared to zero";
+        auto const cmpInst = lir.blockInstAt(bb, *cmpIdx);
+        auto const cmpOperands = lir.instOperands(cmpInst);
+        ASSERT_EQ(cmpOperands.size(), 2u) << c.helper;
+        EXPECT_EQ(cmpOperands[1].kind, ::dss::LirOperandKind::ImmInt)
+            << c.helper;
+        EXPECT_EQ(cmpOperands[1].immInt32, 0) << c.helper;
+        EXPECT_EQ(lirInstWidthBits(lir.instFlags(cmpInst)), 32u)
+            << c.helper
+            << ": the helper returns an `int` and AAPCS64 leaves the upper 32 "
+               "bits of the result register unspecified — a width-64 compare "
+               "could take the sign from garbage";
+        // …and the SIGNED integer condition this operator names.
+        auto const payloads = setccPayloads(lir, bb, *setccOp);
+        ASSERT_EQ(payloads.size(), 1u)
+            << c.helper
+            << ": one setcc — the helper already folded the unordered case, so "
+               "no Ford/Fuo composition is needed";
+        EXPECT_EQ(payloads[0], static_cast<std::uint32_t>(c.cc))
+            << c.helper << ": wrong condition code for this predicate";
+    }
+}
+
+TEST(MirToLir, F128CompareFailsLoudWithoutConfigRow) {
+    // RED-ON-DISABLE, the agnosticism condition: the SAME F128 comparison
+    // against x86_64 — which declares F128 but has NO wideFloatSoftcalls rows —
+    // must FAIL LOUD through the width gate, not lower. This is what proves the
+    // comparison path is gated on the PRESENCE of a config row rather than on
+    // the target's identity; delete the `if (wideFloatSoftcall(...))` guard in
+    // lowerFCmp and this reds.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    EXPECT_EQ((*target)->wideFloatSoftcall(::dss::WideFloatOp::CmpLt), nullptr)
+        << "x86_64 must declare NO F128 comparison row (the premise)";
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatCompare(interner, ::dss::TypeKind::F128,
+                                         ::dss::MirOpcode::FCmpOlt);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    EXPECT_FALSE(result.ok)
+        << "an F128 comparison on a target with no comparison row must fail "
+           "loud, not silently take the softcall path";
+    EXPECT_TRUE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        << "the fall-through must hit the encoded-width gate";
+    EXPECT_TRUE(sawAnchor(rep, "MIR FCmp operand"))
+        << "and it must be the FCmp-operand reach of it that fires";
+}
+
+TEST(MirToLir, F128CompareFeedingABranchCallsTheHelperExactlyOnce) {
+    // The DELIBERATE non-fusion, a cost pin rather than a capability gap.
+    // Fusion RE-EMITS the flag-producing compare at the branch; for F128 that
+    // compare is a CALL, so fusing would invoke the helper a SECOND time for
+    // one source-level comparison and drop a call between the block's code and
+    // its terminator. F128 therefore takes the non-fused arm — the same one a
+    // composed float predicate takes — branching on the Bool `lowerFCmp`
+    // already materialized.
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatCompareBranch(interner, ::dss::TypeKind::F128,
+                                               ::dss::MirOpcode::FCmpOlt);
+    ::dss::DiagnosticReporter rep;
+    auto result = lowerF128Arm64(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "an F128 compare feeding a branch must lower: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        << "neither FCmp reach of the width gate may fire for F128";
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "call"), 1)
+        << "the comparison helper must be called ONCE — a fused re-emit would "
+           "call it twice for one source-level comparison";
+}

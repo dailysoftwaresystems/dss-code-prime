@@ -327,12 +327,45 @@ public:
     // same three runtime/test checks: an unrepresentable value aborts loud here, a
     // re-completion that CHANGES it aborts as a conflicting re-completion, and it
     // is part of the content identity so it survives a reintern round-trip.
+    // D-CSUBSET-PER-MEMBER-PACKED: `fieldPacked` is the PER-FIELD packed channel —
+    // GNU `struct S { char a; int z __attribute__((packed)); };`, where the attribute
+    // sits on ONE member-declarator and lowers THAT field's baseline alignment to 1
+    // while leaving its siblings, and the aggregate's own alignment, alone.
+    // `fieldPacked[i]` is 1 iff field i is individually packed, 0 otherwise; the span
+    // is ALL-fields-or-EMPTY (a partial set is a caller bug, exactly like
+    // `fieldAligns`), and EMPTY is every composite that existed before this channel —
+    // it enters `contentDeclSiteKey` GUARDED on non-empty, so those keep their EXACT
+    // declSiteKey and there is zero TypeId churn.
+    //
+    // ★ IT IS A SEPARATE CHANNEL FROM ALL THREE OF ITS NEIGHBOURS, AND EACH REASON IS
+    // A MEASUREMENT, not a taxonomy:
+    //   • NOT `fieldAligns`, which is RAISE-only (`max(natural, override)`). Storing 1
+    //     there is a NO-OP on every field whose natural alignment exceeds 1 — i.e. on
+    //     every field this attribute is ever written on.
+    //   • NOT the whole-composite `packed`, because the two are DISTINGUISHABLE:
+    //     ✔MEASURED gcc 13.3.0 + clang 18.1.3, x86_64 AND aarch64,
+    //     `struct { char a; int z <packed>; double d; }` is sizeof 16 / _Alignof 8
+    //     with z@1, while the whole-composite spelling of the same fields is sizeof 13
+    //     / _Alignof 1 with z@1 d@5. A per-member packed does NOT lower the
+    //     AGGREGATE's alignment; it lowers one FIELD's, and the aggregate's alignment
+    //     is then the ordinary MAX-fold over the EFFECTIVE member alignments.
+    //   • NOT `maxFieldAlign` (`#pragma pack(N)`), which is per-COMPOSITE. It is that
+    //     channel's per-FIELD dual, and like the composite `packed` it WINS over a
+    //     surrounding cap: ✔MEASURED under `#pragma pack(4)`,
+    //     `struct { char a; long long z <packed>; }` is 9/1 z@1 where the undecorated
+    //     control is 12/4 z@4.
+    // Both `packed` spellings meet at the ONE clamp `clampedBaselineAlign`, so the
+    // layout engine gains a per-field INPUT rather than a second algorithm.
+    //
+    // packed + explicit offsets is contradictory for the same reason the composite
+    // flag is (offsets place fields wholesale) → fail loud at completion.
     void completeComposite(TypeId id, std::span<TypeId const> fields, bool packed,
                            std::span<std::int64_t const> fieldBitWidths = {},
                            std::span<std::uint64_t const> fieldOffsets = {},
                            std::span<std::uint32_t const> fieldAligns = {},
                            std::uint32_t explicitAlign = 0,
-                           std::uint32_t maxFieldAlign = 0);
+                           std::uint32_t maxFieldAlign = 0,
+                           std::span<std::uint8_t const> fieldPacked = {});
     // True iff `id` is a Struct/Union that was forward-minted but NOT yet completed.
     // An EXPLICIT flag, NOT "operands empty": `struct E {}` is a LEGAL COMPLETE
     // zero-field struct (size 0). A non-composite kind is never incomplete here.
@@ -416,6 +449,21 @@ public:
                       std::span<std::uint64_t const> fieldOffsets,
                       std::span<std::uint32_t const> fieldAligns,
                       std::uint32_t explicitAlign, std::uint32_t maxFieldAlign);
+    // D-CSUBSET-PER-MEMBER-PACKED: the complete-at-once path for a struct carrying
+    // PER-FIELD packed flags (GNU `int z __attribute__((packed));` on one member).
+    // `fieldPacked` is part of the struct's CONTENT identity for the same reason
+    // every other layout channel is: the same fields with and without a per-member
+    // packed lay out to different OFFSETS — and, on the shape that matters most,
+    // to the SAME SIZE (`{char a; int z; double d;}` is 16 bytes either way, with z
+    // at 1 or at 4), so aliasing them onto one TypeId would be a layout miscompile
+    // that no size check could ever notice. An EMPTY span routes exactly like the
+    // 7-arg overload (byte-identical declSiteKey, zero TypeId churn).
+    TypeId structType(std::string_view name, std::span<TypeId const> fields,
+                      std::span<std::int64_t const> fieldBitWidths,
+                      std::span<std::uint64_t const> fieldOffsets,
+                      std::span<std::uint32_t const> fieldAligns,
+                      std::uint32_t explicitAlign, std::uint32_t maxFieldAlign,
+                      std::span<std::uint8_t const> fieldPacked);
     // True iff `id` is a Struct carrying c107 explicit field offsets (non-empty
     // `fieldOffsets`). Struct/Union only; false for every naturally-laid-out composite.
     [[nodiscard]] bool hasExplicitOffsets(TypeId id) const;
@@ -436,6 +484,23 @@ public:
     // ordinary (padded) composite. Mirrors `hasExplicitAligns`. The layout engine
     // reads it to seed the per-field baseline alignment to 1.
     [[nodiscard]] bool isPacked(TypeId id) const;
+    // D-CSUBSET-PER-MEMBER-PACKED: true iff `id` is a Struct/Union carrying PER-FIELD
+    // packed flags (non-empty `fieldPacked`). The O(1) gate the layout engine tests
+    // before paying for a per-field query, exactly as `hasExplicitAligns` gates
+    // `explicitFieldAlign`. Struct/Union only; false for every composite that carries
+    // no per-member packed — which is every composite that predates this channel.
+    [[nodiscard]] bool hasFieldPacked(TypeId id) const;
+    // D-CSUBSET-PER-MEMBER-PACKED: true iff FIELD `i` of `id` is individually packed.
+    // False for every field of a composite interned with no per-field flags, and for
+    // an out-of-range `i` — the same absent-means-ordinary contract
+    // `explicitFieldAlign` has, so a caller that forgets the `hasFieldPacked` gate
+    // gets the UNPACKED (padded) answer rather than an abort. ⚠ This is deliberately
+    // the SAFE direction only for a READER: dropping the flag yields the layout the
+    // compiler produced before the channel existed, which is the layout every other
+    // consumer already agrees with. It is the WRITER — `completeComposite` — that
+    // must never lose it, which is why the span is part of the content identity and
+    // survives the reintern round trip.
+    [[nodiscard]] bool isFieldPacked(TypeId id, std::size_t i) const;
     // TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack(N)` member-alignment CAP
     // this composite was defined under, in bytes; 0 = no cap (every composite
     // before this cycle, and every one defined outside a pack region). The layout
@@ -734,6 +799,17 @@ private:
         // composite hashes byte-identically (it enters `contentDeclSiteKey`
         // GUARDED on non-zero, exactly like offsets/aligns/explicitAlign).
         std::uint32_t             maxFieldAlign = 0;
+        // D-CSUBSET-PER-MEMBER-PACKED: per-FIELD packed flags (1 = this field's
+        // baseline alignment is 1), for GNU `__attribute__((packed))` written on ONE
+        // member declarator. The per-FIELD dual of the per-COMPOSITE `packed` above
+        // and of `maxFieldAlign`; a SEPARATE channel from `fieldAligns`, which RAISES
+        // and so cannot express a lowering at all. `std::uint8_t` rather than `bool`
+        // because a `std::vector<bool>` has no contiguous storage and therefore no
+        // `std::span` — the interface every other per-field channel here uses.
+        // EMPTY = no member is individually packed (every composite before this
+        // channel → byte-identical TypeId; it enters `contentDeclSiteKey` GUARDED on
+        // non-empty, exactly like offsets/aligns).
+        std::vector<std::uint8_t> fieldPacked;
         std::uint64_t             declSiteKey = 0;   // the nominal-identity discriminator
         bool                      complete    = false;
     };

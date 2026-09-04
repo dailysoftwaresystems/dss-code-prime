@@ -193,6 +193,16 @@ dss_add_test(NAME core/test_bitfield_abi_conformance   SOURCES test_bitfield_abi
 # gcc/clang `__attribute__((packed))`) and asserts dss's computeLayout(packed) is
 # byte-identical (sizeof + per-field offsetof). Skips when no toolchain.
 dss_add_test(NAME core/test_packed_abi_conformance     SOURCES test_packed_abi_conformance.cpp)
+# D-CSUBSET-PER-MEMBER-PACKED: the PER-FIELD packed channel — GNU `packed` on ONE
+# member-declarator, which packs that member and leaves the aggregate's own size and
+# alignment alone. Every golden is transcribed from a four-arm measurement (gcc 13.3.0
+# and clang 18.1.3, each on x86_64 AND aarch64-under-qemu; mingw-w64 gcc 13.2.0 agrees
+# on the non-bit-field shapes; MSVC 19.51 implements no `__attribute__` and ABSTAINS).
+# ⚠ Several pins are SIZE-BLIND by construction — the headline shape has the same
+# sizeof AND the same _Alignof with and without the attribute, and only one field
+# offset moves — so they assert offsets, never sizes alone.
+dss_add_test(NAME core/test_per_member_packed_layout
+             SOURCES test_per_member_packed_layout.cpp)
 
 # D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET — the two sites of
 # the class that live OUTSIDE a config loader.

@@ -1038,13 +1038,28 @@ private:
                         out_ += std::format(" @{}", off ? *off : 0);
                         first = false;
                     }
-                } else if (in.hasExplicitAligns(t)) {
+                } else if (in.hasExplicitAligns(t) || in.hasFieldPacked(t)) {
+                    // D-CSUBSET-PER-MEMBER-PACKED: a PER-FIELD ` packed` marker — the
+                    // SAME keyword the whole-composite flag uses, one grammar position
+                    // further in, mirroring C's own spelling of the same attribute at
+                    // two grains. It shares this arm with `~<align>` rather than taking
+                    // its own because the two legitimately COMBINE (`int z
+                    // __attribute__((packed, aligned(2)))` is field-align 2, MEASURED),
+                    // and it is emitted ONLY on the fields that carry it, so the
+                    // all-or-none span is recovered on the parse side by "did ANY field
+                    // say packed". Without this the flag would reintern absent across
+                    // the text boundary — the silent ABI drop the composite marker
+                    // above exists to prevent, in the channel where it is HARDEST to
+                    // see (same size, same alignment, one moved offset).
+                    bool const hasA = in.hasExplicitAligns(t);
+                    bool const hasP = in.hasFieldPacked(t);
                     auto const ops = in.operands(t);
                     bool first = true;
                     for (std::size_t i = 0; i < ops.size(); ++i) {
                         if (!first) out_ += ", ";
                         appendType(ops[i]);
-                        out_ += std::format(" ~{}", in.explicitFieldAlign(t, i));
+                        if (hasA) out_ += std::format(" ~{}", in.explicitFieldAlign(t, i));
+                        if (hasP && in.isFieldPacked(t, i)) out_ += " packed";
                         first = false;
                     }
                 } else {
@@ -1055,7 +1070,25 @@ private:
             case TypeKind::Union: {
                 out_ += "union ";  out_ += quote(in.name(t));
                 if (in.isPacked(t)) out_ += " packed";   // D-CSUBSET-PACKED (see struct)
-                out_ += " {"; args(in.operands(t)); out_ += '}'; return;
+                out_ += " {";
+                // D-CSUBSET-PER-MEMBER-PACKED: the union half of the per-field marker.
+                // A union member can carry the attribute individually and it lowers the
+                // UNION's own alignment when that member was the max contributor
+                // (MEASURED: `union {char a; int z <pk>;}` is 4/_Alignof 1 vs the
+                // control's 4/4) — size-blind, so a dropped flag is invisible.
+                if (in.hasFieldPacked(t)) {
+                    auto const ops = in.operands(t);
+                    bool first = true;
+                    for (std::size_t i = 0; i < ops.size(); ++i) {
+                        if (!first) out_ += ", ";
+                        appendType(ops[i]);
+                        if (in.isFieldPacked(t, i)) out_ += " packed";
+                        first = false;
+                    }
+                } else {
+                    args(in.operands(t));
+                }
+                out_ += '}'; return;
             }
             // D5.5: enum is nominal-by-name; underlying TypeKind lives in
             // scalars[0]. Round-trip the underlying explicitly when it
@@ -3667,8 +3700,14 @@ private:
             std::vector<TypeId>        ts;
             std::vector<std::uint64_t> offs;
             std::vector<std::uint32_t> aligns;
-            std::size_t                nWithOff   = 0;
-            std::size_t                nWithAlign = 0;
+            // D-CSUBSET-PER-MEMBER-PACKED: the per-field flags, recovered from a
+            // trailing ` packed` keyword on each field that carries one. `nFieldPacked`
+            // counts them so an ALL-ZERO span is never built — that would fork the
+            // TypeId of every struct that has no per-member packed at all.
+            std::vector<std::uint8_t>  fieldPacked;
+            std::size_t                nWithOff     = 0;
+            std::size_t                nWithAlign   = 0;
+            std::size_t                nFieldPacked = 0;
             while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
                 ts.push_back(parseType());
                 if (accept(Tk::At)) {
@@ -3679,6 +3718,13 @@ private:
                 } else {
                     offs.push_back(0); aligns.push_back(0);
                 }
+                // The per-field marker comes AFTER any `~<align>`, matching the
+                // emitter, and is independent of it: a field may carry both.
+                if (acceptKeyword("packed")) {
+                    fieldPacked.push_back(1u); ++nFieldPacked;
+                } else {
+                    fieldPacked.push_back(0u);
+                }
                 if (!accept(Tk::Comma)) break;
             }
             expect(Tk::RBrace, "'}'");
@@ -3687,6 +3733,18 @@ private:
                           "member aligns (~)");
                 return InvalidType;
             }
+            // D-CSUBSET-PER-MEMBER-PACKED: explicit offsets place fields wholesale, so
+            // a per-field packed is as contradictory with them as the whole-composite
+            // flag is — `completeComposite` aborts on the pair, so refuse it HERE with
+            // a text-level diagnostic rather than letting malformed input abort.
+            if (nFieldPacked != 0 && nWithOff != 0) {
+                malformed("a struct field cannot be both packed and carry an explicit "
+                          "offset (@)");
+                return InvalidType;
+            }
+            std::span<std::uint8_t const> const fpSpan =
+                nFieldPacked == 0 ? std::span<std::uint8_t const>{}
+                                  : std::span<std::uint8_t const>{fieldPacked};
             std::span<std::int64_t const> const noWidths{};
             // D-CSUBSET-PACKED: a packed struct routes through forwardComposite +
             // completeComposite (structType doesn't carry packed). A content-derived
@@ -3706,16 +3764,46 @@ private:
                 // two same-name+fields packed structs differing ONLY in member aligns
                 // now get DISTINCT forward keys instead of colliding on the forward id.
                 for (std::uint32_t a : al) key = (key ^ a) * 1099511628211ull;
+                // D-CSUBSET-PER-MEMBER-PACKED: fold the per-field flags into the
+                // forward key too, for the reason the aligns fold exists — two
+                // same-name+fields composites differing ONLY in which member is packed
+                // must get DISTINCT forward ids instead of colliding. An empty span
+                // leaves the key BYTE-IDENTICAL (zero churn).
+                for (std::uint8_t p : fpSpan) key = (key ^ p) * 1099511628211ull;
                 key |= (std::uint64_t{1} << 62);
                 TypeId const fwd =
                     interner_.forwardComposite(TypeKind::Struct, name, key);
                 std::span<std::uint64_t const> const noOffs{};
                 interner_.completeComposite(fwd, ts, /*packed=*/true, noWidths,
-                                            noOffs, al);
+                                            noOffs, al, /*explicitAlign=*/0,
+                                            /*maxFieldAlign=*/0, fpSpan);
+                return fwd;
+            };
+            // D-CSUBSET-PER-MEMBER-PACKED: an UNPACKED composite carrying per-field
+            // flags needs the same forward+complete route the whole-composite flag
+            // needs, because no `structType` overload shorter than the 8-arg one
+            // carries them. Keyed like `internPacked` but in a DISTINCT key space
+            // (bit 61), so `struct "S" { i32 packed }` and `struct "S" packed { i32 }`
+            // — different layouts — can never collapse onto one forward id.
+            auto internFieldPacked = [&](std::span<std::uint32_t const> al) -> TypeId {
+                std::uint64_t key = 1469598103934665603ull;
+                for (char ch : name)
+                    key = (key ^ static_cast<std::uint8_t>(ch)) * 1099511628211ull;
+                for (TypeId f : ts) key = (key ^ f.v) * 1099511628211ull;
+                for (std::uint32_t a : al) key = (key ^ a) * 1099511628211ull;
+                for (std::uint8_t p : fpSpan) key = (key ^ p) * 1099511628211ull;
+                key |= (std::uint64_t{1} << 61);
+                TypeId const fwd =
+                    interner_.forwardComposite(TypeKind::Struct, name, key);
+                std::span<std::uint64_t const> const noOffs{};
+                interner_.completeComposite(fwd, ts, /*packed=*/false, noWidths,
+                                            noOffs, al, /*explicitAlign=*/0,
+                                            /*maxFieldAlign=*/0, fpSpan);
                 return fwd;
             };
             if (nWithOff == 0 && nWithAlign == 0) {
                 if (packed) return internPacked({});
+                if (nFieldPacked != 0) return internFieldPacked({});
                 return interner_.structType(name, ts);
             }
             if (nWithAlign != 0) {
@@ -3724,6 +3812,7 @@ private:
                     return InvalidType;
                 }
                 if (packed) return internPacked(aligns);
+                if (nFieldPacked != 0) return internFieldPacked(aligns);
                 std::span<std::uint64_t const> const noOffs{};
                 return interner_.structType(name, ts, noWidths, noOffs, aligns);
             }
@@ -3739,15 +3828,42 @@ private:
         if (kw == "union") { std::string name = takeStr();
             bool const packed = acceptKeyword("packed");   // D-CSUBSET-PACKED
             expect(Tk::LBrace, "'{'");
-            auto ts = parseTypeListUntil(Tk::RBrace); expect(Tk::RBrace, "'}'");
-            if (!packed) return interner_.unionType(name, ts);
+            // D-CSUBSET-PER-MEMBER-PACKED: a member-local loop rather than
+            // `parseTypeListUntil`, so a trailing ` packed` keyword on a member is
+            // consumed HERE — the struct arm's shape, for the same reason.
+            std::vector<TypeId>       ts;
+            std::vector<std::uint8_t> fieldPacked;
+            std::size_t               nFieldPacked = 0;
+            while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
+                ts.push_back(parseType());
+                if (acceptKeyword("packed")) {
+                    fieldPacked.push_back(1u); ++nFieldPacked;
+                } else {
+                    fieldPacked.push_back(0u);
+                }
+                if (!accept(Tk::Comma)) break;
+            }
+            expect(Tk::RBrace, "'}'");
+            std::span<std::uint8_t const> const fpSpan =
+                nFieldPacked == 0 ? std::span<std::uint8_t const>{}
+                                  : std::span<std::uint8_t const>{fieldPacked};
+            if (!packed && nFieldPacked == 0) return interner_.unionType(name, ts);
             std::uint64_t key = 1469598103934665603ull;
             for (char ch : name)
                 key = (key ^ static_cast<std::uint8_t>(ch)) * 1099511628211ull;
             for (TypeId f : ts) key = (key ^ f.v) * 1099511628211ull;
-            key |= (std::uint64_t{1} << 62);
+            for (std::uint8_t p : fpSpan) key = (key ^ p) * 1099511628211ull;
+            // Bit 62 is the whole-composite packed key space; bit 61 the per-field one
+            // — a union packed as a whole and a union with one packed member are
+            // different layouts and must never collapse onto one forward id.
+            key |= (std::uint64_t{1} << (packed ? 62 : 61));
             TypeId const fwd = interner_.forwardComposite(TypeKind::Union, name, key);
-            interner_.completeComposite(fwd, ts, /*packed=*/true);
+            std::span<std::int64_t const>  const noW{};
+            std::span<std::uint64_t const> const noO{};
+            std::span<std::uint32_t const> const noA{};
+            interner_.completeComposite(fwd, ts, packed, noW, noO, noA,
+                                        /*explicitAlign=*/0, /*maxFieldAlign=*/0,
+                                        fpSpan);
             return fwd; }
         // D5.5: `enum "Name"` with optional `: <underlyingOrdinal>`. Enumerator
         // names live in the SemanticModel symbol table, not the type record;

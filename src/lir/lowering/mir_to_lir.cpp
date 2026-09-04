@@ -438,7 +438,15 @@ enum class MnemonicSlot : std::uint8_t {
     //   FaddP/FsubP/FmulP/FdivP — DE C1/E9/C9/F9, the bare register-implicit
     //     st1←st1 OP st0 + pop (0 operands).
     //   FisttpM32 — DB /1 truncating store st0→m32int + pop (the FPToSI tail).
-    FldM80, FstpM80, FaddP, FsubP, FmulP, FdivP, FisttpM32,
+    //   FucomiP/FstpSt0 — DF E9 / DD D8, the COMPARE pair added by LD-3
+    //     (D-TARGET-ENCODING-WIDTH-GUARD). FUCOMIP ST(0),ST(1) compares the two
+    //     x87 stack entries, writes the result into EFLAGS (ZF/PF/CF) and pops
+    //     ONE of them; FSTP ST(0) pops the survivor so the sequence still
+    //     starts and ends with an empty stack, the LD-1 model's invariant.
+    //     ⚠ FSTP writes the x87 status word, NOT EFLAGS, so the flags FUCOMIP
+    //     set survive it — which is why the cleanup may sit between the compare
+    //     and the setcc/jcc that reads it (both references emit exactly that).
+    FldM80, FstpM80, FaddP, FsubP, FmulP, FdivP, FisttpM32, FucomiP, FstpSt0,
     // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the arm64 GOT-address
     // macro `adrp Xd,:got:sym` + `ldr Xd,[Xd,:got_lo12:sym]` that
     // materializes an undefined-extern's address as a live code-form
@@ -572,6 +580,9 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::FmulP,              "fmulp"},
     {MnemonicSlot::FdivP,              "fdivp"},
     {MnemonicSlot::FisttpM32,          "fisttp_m32"},
+    // D-TARGET-ENCODING-WIDTH-GUARD (LD-3): the x87 COMPARE pair (x86_64-only).
+    {MnemonicSlot::FucomiP,            "fucomip"},
+    {MnemonicSlot::FstpSt0,            "fstp_st0"},
     {MnemonicSlot::LeaExternGot,       "lea_extern_got"},  // TF-C52: arm64 GOT-address macro
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
@@ -677,6 +688,59 @@ struct FloatCmpPlan {
         default:
             return std::nullopt;   // Ueq/Ult/Ule/Ugt/Uge: no producer,
                                    // fail loud at the dispatch arm
+    }
+}
+
+// ── D-TARGET-ENCODING-WIDTH-GUARD (LD-3): the binary128 compare plan ──
+//
+// A binary128 `long double` has no compare INSTRUCTION on any shipped target —
+// it is memory-resident (the LD-2 model) and every operation on it is a CALL to
+// a config'd softfloat helper. A COMPARISON helper differs from the arithmetic
+// ones in what it hands back: an `int` whose SIGN carries the answer, so the
+// predicate is finished by an ordinary INTEGER compare against zero. That is
+// why this plan names an integer condition code where `floatCmpPlan` names a
+// float one — after the helper returns there is no float left to compare, and
+// the Ford/Fuo unordered machinery is unnecessary because the helper has
+// ALREADY folded NaN into a sign that makes every ordered predicate false.
+//
+// ✔MEASURED 2026-09-03, both aarch64 references probed SEPARATELY and agreeing
+// helper-for-helper (aarch64-linux-gnu-gcc 13.3.0 `bl __lttf2; cmp w0,0; blt`;
+// clang 18.1.3 --target=aarch64-linux-gnu `bl __lttf2; cset w0, lt`):
+//
+//   a <  b → __lttf2(a,b) <  0        a >  b → __gttf2(a,b) >  0
+//   a <= b → __letf2(a,b) <= 0        a >= b → __getf2(a,b) >= 0
+//   a == b → __eqtf2(a,b) == 0        a != b → __netf2(a,b) != 0
+//
+// The libgcc contract (GCC internals, "Routines for floating point emulation"):
+// each returns a value with the stated relation to zero IFF neither argument is
+// NaN and the comparison holds; a NaN operand returns a value with the OPPOSITE
+// relation, which makes the ordered predicates false and `!=` true — exactly C
+// 6.5.9's requirement, and the same outcome the F32/F64 path reaches through
+// Ford/Fuo. So the codes here are the SIGNED integer nibbles, never the float
+// ones (a helper's return is an ordinary signed int, not a flag pattern).
+//
+// ⚠ NO SWAP CANONICALIZATION. `floatCmpPlan` folds Olt/Ole onto Fogt/Foge
+// because x86 has no ordered-below setcc; here each predicate has its OWN
+// helper, so folding would name a helper the references do not name for that
+// operator and buy nothing.
+//
+// Ueq/Ult/Ule/Ugt/Uge and One have no C producer (`mapBinaryOp` emits Oeq for
+// `==` and Une for `!=`) — nullopt routes them to the width gate's fail-loud.
+struct WideFloatCmpPlan {
+    WideFloatOp    helper;   // the `wideFloatSoftcalls[]` row to call
+    TargetCondCode intCond;  // the SIGNED integer code applied to (result ? 0)
+};
+[[nodiscard]] std::optional<WideFloatCmpPlan>
+wideFloatCmpPlan(MirOpcode op) noexcept {
+    using CC = TargetCondCode;
+    switch (op) {
+        case MirOpcode::FCmpOlt: return WideFloatCmpPlan{WideFloatOp::CmpLt, CC::Slt};
+        case MirOpcode::FCmpOle: return WideFloatCmpPlan{WideFloatOp::CmpLe, CC::Sle};
+        case MirOpcode::FCmpOgt: return WideFloatCmpPlan{WideFloatOp::CmpGt, CC::Sgt};
+        case MirOpcode::FCmpOge: return WideFloatCmpPlan{WideFloatOp::CmpGe, CC::Sge};
+        case MirOpcode::FCmpOeq: return WideFloatCmpPlan{WideFloatOp::CmpEq, CC::Eq};
+        case MirOpcode::FCmpUne: return WideFloatCmpPlan{WideFloatOp::CmpNe, CC::Ne};
+        default:                 return std::nullopt;
     }
 }
 
@@ -5831,6 +5895,50 @@ struct Lowerer {
         return true;
     }
 
+    // ── D-TARGET-ENCODING-WIDTH-GUARD (LD-3): the x87 COMPARE sequence ───────
+    //
+    // Set the target's ordinary integer FLAGS from two memory-resident x87
+    // 80-bit values, so that everything downstream of a float compare — the
+    // setcc/zext materialization, the composed two-setcc shape, the fused
+    // jcc — works on `long double` UNCHANGED:
+    //
+    //   fld_m80 [rhs] ; fld_m80 [lhs] ; fucomip ; fstp_st0
+    //
+    // ★ THE PUSH ORDER IS THE WHOLE POINT AND IT IS THE REVERSE OF
+    // `lowerF80Arith`'s. FUCOMIP compares ST(0) against ST(1), so the LEFT side
+    // of the predicate must be pushed LAST. The arithmetic sequence pushes a
+    // then b because the register-implicit `fXXXp` computes st1 OP st0; a
+    // compare reads the same two slots in the opposite direction. Getting this
+    // backwards inverts every relational operator SILENTLY — it is a pure
+    // reordering that no arity, type or width check can see, which is why the
+    // corpus witness compares values whose order is asymmetric.
+    //
+    // ★★ AND THE FLAGS IT LEAVES ARE UCOMISD's, BIT FOR BIT. Intel SDM
+    // (FUCOMI/FUCOMIP, UCOMISD): both set ZF/PF/CF to the same four-outcome
+    // pattern — unordered → ZF=PF=CF=1, greater → all 0, less → CF=1, equal →
+    // ZF=1. So `floatCmpPlan`'s derivation, its swap canonicalization and its
+    // Foeq/Fune compositions carry over to F80 with NOTHING re-derived: this
+    // verb is a drop-in replacement for the `fcmp` emit, not a parallel path.
+    //
+    // The QUIET form (FUCOMIP, not FCOMIP) is the established DSS choice, not a
+    // new one: the `fcmp` opcode row already selects the quiet UCOMISD for
+    // EVERY F64/F32 predicate, on the stated ground that DSS models no FP
+    // environment, so only the unobservable FE_INVALID flag differs. ⓘ Both
+    // references emit the SIGNALING `fcomip` for `< <= > >=` and the quiet
+    // `fucomip` for `== !=`; following DSS's own F64 rule instead keeps
+    // `long double` and `double` behaving identically here, and the compare
+    // RESULTS are the same on every input.
+    //
+    // Leaves the x87 stack EMPTY, the LD-1 model's invariant: FUCOMIP pops one
+    // operand and the FSTP ST(0) pops the survivor.
+    [[nodiscard]] bool emitF80Compare(LirReg lhsAddr, LirReg rhsAddr,
+                                      std::string_view context) {
+        if (!emitX87MemOp(MnemonicSlot::FldM80, rhsAddr, context)) return false;
+        if (!emitX87MemOp(MnemonicSlot::FldM80, lhsAddr, context)) return false;
+        if (!emitX87StackOp(MnemonicSlot::FucomiP, context)) return false;
+        return emitX87StackOp(MnemonicSlot::FstpSt0, context);
+    }
+
     // MIR F80 Load → address propagation (the loaded value IS the source
     // pointer). Correct for the LD-1 slice: loads are consumed before the
     // source memory is mutated. (A value-copy variant into a fresh home — which
@@ -6166,8 +6274,7 @@ struct Lowerer {
     void lowerWideFloatSoftcall(MirInstId id, WideFloatOp /*op*/,
                                 WideFloatSoftcall const& cfg) {
         auto const operands = mir.instOperands(id);
-        if (operands.size() != cfg.argRegisterNames.size()
-            || operands.size() != cfg.argRegisterOrdinals.size()) {
+        if (!wideFloatSoftcallArityMatches(cfg, operands)) {
             reportUnsupported(mir.instOpcode(id), id);
             poisonValue(id);
             return;
@@ -6189,99 +6296,10 @@ struct Lowerer {
             resultHomeAddr = emitLeaFrameSlot(*resultSlotIndex);
             if (!resultHomeAddr.has_value()) { poisonValue(id); return; }
         }
-        // 1. Marshal each operand into its config'd physical arg register.
-        for (std::size_t i = 0; i < operands.size(); ++i) {
-            std::uint16_t const argOrd = cfg.argRegisterOrdinals[i];
-            auto const* argInfo = target.registerInfo(argOrd);
-            if (argInfo == nullptr) {
-                reportUnsupported(mir.instOpcode(id), id);
-                poisonValue(id);
-                return;
-            }
-            LirRegClass const argCls =
-                static_cast<LirRegClass>(argInfo->regClass);
-            LirReg const argPhys = makePhysicalReg(argOrd, argCls);
-            std::optional<LirReg> const src = regForValue(operands[i]);
-            if (!src.has_value()) { poisonValue(id); return; }
-            if (interner.kind(mir.instType(operands[i])) == TypeKind::F128) {
-                // Memory-resident: `src` is the 16-byte home ADDRESS — LOAD it
-                // into the physical arg register with the class's load op
-                // (`fldur` AT WIDTH 128, i.e. `LDUR Qt`), the same
-                // [base, MemBase, MemOffset] shape lowerLoad uses.
-                //
-                // ⚠⚠ THE WIDTH FLAG IS LOAD-BEARING HERE AND THIS SITE DID NOT
-                // USED TO CARRY ONE. `argCls` is read off the register table, so
-                // when `v0` was declared class `vr` this resolved to the
-                // 128-bit-only `fldur_q` and the width was implicit in the
-                // OPCODE. With the SIMD&FP file declared once
-                // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]])
-                // `v0` is class `fpr`, this resolves to `fldur`, and `fldur`'s
-                // width-DEFAULT is 64 — so leaving the flags at 0 would load 8
-                // of the binary128's 16 bytes into the helper's argument
-                // register at rc=0 with no diagnostic. The branch is gated on
-                // TypeKind::F128, so the datum is always the 16-byte home.
-                auto const loadOp = classOp(argCls, RegClassOp::Load);
-                if (!loadOp.has_value()) {
-                    reportMissingClassOp(argCls, RegClassOp::Load,
-                                         "MIR F128 softcall (marshal operand)");
-                    poisonValue(id);
-                    return;
-                }
-                std::array<LirOperand, 3> ldOps{
-                    LirOperand::makeReg(*src),
-                    LirOperand::makeMemBase(1),
-                    LirOperand::makeMemOffset(0),
-                };
-                emitInst(*loadOp, argPhys, ldOps, /*payload=*/0,
-                         kLirInstFlagWidth128);
-            } else {
-                // Register-resident (an F64/F32 source of `from_f64`): MOVE the
-                // vreg into the physical arg register with the class's move op
-                // (fmov). Width-blind copy (the D-form fmov preserves the value).
-                auto const moveOp = classOp(argCls, RegClassOp::Move);
-                if (!moveOp.has_value()) {
-                    reportMissingClassOp(argCls, RegClassOp::Move,
-                                         "MIR F128 softcall (marshal operand)");
-                    poisonValue(id);
-                    return;
-                }
-                std::array<LirOperand, 1> mvOps{LirOperand::makeReg(*src)};
-                emitInst(*moveOp, argPhys, mvOps);
-            }
-        }
-        // 2. The CALL: resolve/mint the extern, emit the format-appropriate
-        //    call opcode with a BARE [SymbolRef] operand list — DELIBERATELY
-        //    bypassing the callconv arg-classifier (the args are already pinned
-        //    in their physical registers; this internal controlled call must
-        //    NOT open the general F128-user-call path the LD-4 walls keep shut).
-        auto const sym =
-            resolveWideFloatSoftcallExtern(cfg.helperSymbol, "MIR F128 softcall");
-        if (!sym.has_value()) { poisonValue(id); return; }
-        // P55: the SAME per-symbol answer `lowerCall` reads, for the same
-        // reason — the linker mints a slot for exactly the imports this
-        // lowerer derefs, and a minted helper is an import like any other.
-        // `resolveWideFloatSoftcallExtern` put it in the set (or did not) at
-        // mint time from its own declared binding.
-        MnemonicSlot const callSlot = externRefUsesSlot(*sym)
-            ? MnemonicSlot::CallIndirectViaExtern
-            : MnemonicSlot::Call;
-        if (!opcode(callSlot).has_value()) {
-            reportMissingOpcode(callSlot, "MIR F128 softcall (call)");
-            poisonValue(id);
-            return;
-        }
-        std::array<LirOperand, 1> callOps{LirOperand::makeSymbolRef(sym->v)};
-        emitInst(*opcode(callSlot), InvalidLirReg, callOps);
-        // 3. Capture the config'd physical result register.
-        std::uint16_t const resOrd = cfg.resultRegisterOrdinal;
-        auto const* resInfo = target.registerInfo(resOrd);
-        if (resInfo == nullptr) {
-            reportUnsupported(mir.instOpcode(id), id);
-            poisonValue(id);
-            return;
-        }
-        LirRegClass const resCls = static_cast<LirRegClass>(resInfo->regClass);
-        LirReg const resPhys = makePhysicalReg(resOrd, resCls);
+        auto const res = emitWideFloatSoftcallBody(id, cfg, operands);
+        if (!res.has_value()) return;   // already diagnosed + poisoned
+        LirRegClass const resCls  = res->cls;
+        LirReg const      resPhys = res->reg;
         if (f128Result) {
             // F128 result: STORE the physical result register into the home
             // reserved above; the value IS its home address (recorded in
@@ -6313,18 +6331,213 @@ struct Lowerer {
             // Non-F128 result (the `to_i32` int32): MOVE the physical result
             // register into a fresh result vreg (the idiv implicit-RAX-capture
             // precedent — width-default GPR copy, the low 32 bits are the int).
-            auto const moveOp = classOp(resCls, RegClassOp::Move);
-            if (!moveOp.has_value()) {
-                reportMissingClassOp(resCls, RegClassOp::Move,
-                                     "MIR F128 softcall (capture result)");
-                poisonValue(id);
-                return;
-            }
-            LirReg const result = lir.newVReg(resCls);
-            std::array<LirOperand, 1> mvOps{LirOperand::makeReg(resPhys)};
-            emitInst(*moveOp, result, mvOps);
-            defineValue(id, result);
+            auto const captured = captureWideFloatSoftcallResult(
+                *res, "MIR F128 softcall (capture result)");
+            if (!captured.has_value()) { poisonValue(id); return; }
+            defineValue(id, *captured);
         }
+    }
+
+    // The config'd physical register a softcall's result arrives in, paired
+    // with the class it was resolved through (the class comes off the register
+    // TABLE, so re-deriving it at each use site is how two consumers drift).
+    struct WideFloatSoftcallResult {
+        LirReg      reg;
+        LirRegClass cls;
+    };
+
+    // Do a `wideFloatSoftcalls[]` row's ARGUMENTS and one MIR instruction's
+    // operands agree in count? Both arrays are checked because they are filled
+    // by separate parse steps (names at parse, ordinals at resolve) and a row
+    // that resolved only half its registers must not marshal a stale ordinal.
+    [[nodiscard]] static bool wideFloatSoftcallArityMatches(
+            WideFloatSoftcall const& cfg,
+            std::span<MirInstId const> operands) noexcept {
+        return operands.size() == cfg.argRegisterNames.size()
+            && operands.size() == cfg.argRegisterOrdinals.size();
+    }
+
+    // ── THE ONE SOFTCALL EMIT VERB ───────────────────────────────────────────
+    //
+    // Marshal `operands` into the row's physical argument registers, emit the
+    // CALL, and resolve the physical register the result arrives in. Everything
+    // a `wideFloatSoftcalls[]` row means is HERE; what differs between consumers
+    // is only what they do with the register handed back — an F128 result is
+    // STORED into a home reserved BEFORE this runs (so the address vreg is live
+    // across the call and regalloc parks it callee-saved), an integer result is
+    // MOVED to a fresh vreg, and a COMPARE's integer result is moved and then
+    // compared against zero.
+    //
+    // ⚠ IT IS ONE VERB ON PURPOSE. The marshal loop is where the binary128
+    // WIDTH lives (`kLirInstFlagWidth128` — see the flag's own warning below);
+    // a second copy of it written for the compare path would be a second place
+    // for eight of sixteen bytes to go missing with no diagnostic.
+    //
+    // Keys on NOTHING target/format-specific — the caller already proved
+    // `target.wideFloatSoftcall(op) != nullptr`, and every register, symbol and
+    // arity comes out of `cfg`. Reports + poisons `id` and returns nullopt on
+    // failure.
+    [[nodiscard]] std::optional<WideFloatSoftcallResult>
+    emitWideFloatSoftcallBody(MirInstId id, WideFloatSoftcall const& cfg,
+                              std::span<MirInstId const> operands) {
+        // 1. Marshal each operand into its config'd physical arg register.
+        for (std::size_t i = 0; i < operands.size(); ++i) {
+            std::uint16_t const argOrd = cfg.argRegisterOrdinals[i];
+            auto const* argInfo = target.registerInfo(argOrd);
+            if (argInfo == nullptr) {
+                reportUnsupported(mir.instOpcode(id), id);
+                poisonValue(id);
+                return std::nullopt;
+            }
+            LirRegClass const argCls =
+                static_cast<LirRegClass>(argInfo->regClass);
+            LirReg const argPhys = makePhysicalReg(argOrd, argCls);
+            std::optional<LirReg> const src = regForValue(operands[i]);
+            if (!src.has_value()) { poisonValue(id); return std::nullopt; }
+            if (interner.kind(mir.instType(operands[i])) == TypeKind::F128) {
+                // Memory-resident: `src` is the 16-byte home ADDRESS — LOAD it
+                // into the physical arg register with the class's load op
+                // (`fldur` AT WIDTH 128, i.e. `LDUR Qt`), the same
+                // [base, MemBase, MemOffset] shape lowerLoad uses.
+                //
+                // ⚠⚠ THE WIDTH FLAG IS LOAD-BEARING HERE AND THIS SITE DID NOT
+                // USED TO CARRY ONE. `argCls` is read off the register table, so
+                // when `v0` was declared class `vr` this resolved to the
+                // 128-bit-only `fldur_q` and the width was implicit in the
+                // OPCODE. With the SIMD&FP file declared once
+                // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]])
+                // `v0` is class `fpr`, this resolves to `fldur`, and `fldur`'s
+                // width-DEFAULT is 64 — so leaving the flags at 0 would load 8
+                // of the binary128's 16 bytes into the helper's argument
+                // register at rc=0 with no diagnostic. The branch is gated on
+                // TypeKind::F128, so the datum is always the 16-byte home.
+                auto const loadOp = classOp(argCls, RegClassOp::Load);
+                if (!loadOp.has_value()) {
+                    reportMissingClassOp(argCls, RegClassOp::Load,
+                                         "MIR F128 softcall (marshal operand)");
+                    poisonValue(id);
+                    return std::nullopt;
+                }
+                std::array<LirOperand, 3> ldOps{
+                    LirOperand::makeReg(*src),
+                    LirOperand::makeMemBase(1),
+                    LirOperand::makeMemOffset(0),
+                };
+                emitInst(*loadOp, argPhys, ldOps, /*payload=*/0,
+                         kLirInstFlagWidth128);
+            } else {
+                // Register-resident (an F64/F32 source of `from_f64`): MOVE the
+                // vreg into the physical arg register with the class's move op
+                // (fmov). Width-blind copy (the D-form fmov preserves the value).
+                auto const moveOp = classOp(argCls, RegClassOp::Move);
+                if (!moveOp.has_value()) {
+                    reportMissingClassOp(argCls, RegClassOp::Move,
+                                         "MIR F128 softcall (marshal operand)");
+                    poisonValue(id);
+                    return std::nullopt;
+                }
+                std::array<LirOperand, 1> mvOps{LirOperand::makeReg(*src)};
+                emitInst(*moveOp, argPhys, mvOps);
+            }
+        }
+        // 2. The CALL: resolve/mint the extern, emit the format-appropriate
+        //    call opcode with a BARE [SymbolRef] operand list — DELIBERATELY
+        //    bypassing the callconv arg-classifier (the args are already pinned
+        //    in their physical registers; this internal controlled call must
+        //    NOT open the general F128-user-call path the LD-4 walls keep shut).
+        auto const sym =
+            resolveWideFloatSoftcallExtern(cfg.helperSymbol, "MIR F128 softcall");
+        if (!sym.has_value()) { poisonValue(id); return std::nullopt; }
+        // P55: the SAME per-symbol answer `lowerCall` reads, for the same
+        // reason — the linker mints a slot for exactly the imports this
+        // lowerer derefs, and a minted helper is an import like any other.
+        // `resolveWideFloatSoftcallExtern` put it in the set (or did not) at
+        // mint time from its own declared binding.
+        MnemonicSlot const callSlot = externRefUsesSlot(*sym)
+            ? MnemonicSlot::CallIndirectViaExtern
+            : MnemonicSlot::Call;
+        if (!opcode(callSlot).has_value()) {
+            reportMissingOpcode(callSlot, "MIR F128 softcall (call)");
+            poisonValue(id);
+            return std::nullopt;
+        }
+        std::array<LirOperand, 1> callOps{LirOperand::makeSymbolRef(sym->v)};
+        emitInst(*opcode(callSlot), InvalidLirReg, callOps);
+        // 3. Capture the config'd physical result register.
+        std::uint16_t const resOrd = cfg.resultRegisterOrdinal;
+        auto const* resInfo = target.registerInfo(resOrd);
+        if (resInfo == nullptr) {
+            reportUnsupported(mir.instOpcode(id), id);
+            poisonValue(id);
+            return std::nullopt;
+        }
+        LirRegClass const resCls = static_cast<LirRegClass>(resInfo->regClass);
+        LirReg const resPhys = makePhysicalReg(resOrd, resCls);
+        return WideFloatSoftcallResult{resPhys, resCls};
+    }
+
+    // Copy a softcall's PHYSICAL result register into a fresh vreg — the idiv
+    // implicit-RAX-capture precedent. Every non-F128 result funnels through
+    // here so the physical register stops being live one instruction after the
+    // call, whatever the consumer then does with the value.
+    [[nodiscard]] std::optional<LirReg>
+    captureWideFloatSoftcallResult(WideFloatSoftcallResult const& res,
+                                   std::string_view context) {
+        auto const moveOp = classOp(res.cls, RegClassOp::Move);
+        if (!moveOp.has_value()) {
+            reportMissingClassOp(res.cls, RegClassOp::Move, context);
+            return std::nullopt;
+        }
+        LirReg const captured = lir.newVReg(res.cls);
+        std::array<LirOperand, 1> mvOps{LirOperand::makeReg(res.reg)};
+        emitInst(*moveOp, captured, mvOps);
+        return captured;
+    }
+
+    // ── D-TARGET-ENCODING-WIDTH-GUARD (LD-3): the binary128 COMPARE ──────────
+    //
+    // Set the target's integer FLAGS from two memory-resident binary128 values,
+    // the F128 counterpart of `emitF80Compare`: CALL the config'd comparison
+    // helper for the predicate, then compare its integer result against zero.
+    // Afterwards the predicate is finished by the SAME setcc/zext (or fused
+    // jcc) tail every INTEGER compare uses — see `wideFloatCmpPlan` for which
+    // helper and which signed condition code each MIR predicate names, and for
+    // the two references that were measured emitting exactly this shape.
+    //
+    // ⚠⚠ THE WIDTH-32 FLAG ON THE COMPARE IS LOAD-BEARING, AND IT IS THE ONE
+    // PLACE THIS PATH CAN GO SILENTLY WRONG. The helper returns a C `int`, and
+    // AAPCS64 §6.8.2 leaves the UPPER 32 BITS of the result register
+    // UNSPECIFIED for a 32-bit return — so a width-64 compare would read
+    // whatever the helper happened to leave above bit 31 and could take the
+    // SIGN from garbage, turning `a < b` into a coin flip with no diagnostic
+    // anywhere. Both references emit the 32-bit form (`cmp w0, 0`), and the
+    // arm64 target declares the width-32 reg+imm32 `cmp` variant this selects.
+    //
+    // Fail-loud (false, already reported + poisoned) if the target declares no
+    // `cmp`, or the row cannot be marshalled.
+    [[nodiscard]] bool emitWideFloatCompare(MirInstId id,
+                                            WideFloatSoftcall const& cfg,
+                                            std::span<MirInstId const> operands) {
+        if (!opcode(MnemonicSlot::Cmp).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Cmp, "MIR F128 FCmp");
+            poisonValue(id);
+            return false;
+        }
+        if (!wideFloatSoftcallArityMatches(cfg, operands)) {
+            reportUnsupported(mir.instOpcode(id), id);
+            poisonValue(id);
+            return false;
+        }
+        auto const res = emitWideFloatSoftcallBody(id, cfg, operands);
+        if (!res.has_value()) return false;   // already diagnosed + poisoned
+        auto const captured =
+            captureWideFloatSoftcallResult(*res, "MIR F128 FCmp (capture result)");
+        if (!captured.has_value()) { poisonValue(id); return false; }
+        std::array<LirOperand, 2> cmpOps{
+            LirOperand::makeReg(*captured), LirOperand::makeImmInt32(0)};
+        emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps,
+                 /*payload=*/0, kLirInstFlagWidth32);
+        return true;
     }
 
     // MIR F128 Store -> a memory->memory copy of the 16-byte datum as TWO
@@ -10811,20 +11024,27 @@ struct Lowerer {
     // Operand-swap canonicalization (Olt/Ole → swapped Fogt/Foge) is
     // part of the plan; the swap is exact under IEEE 754 including
     // the unordered outcome (both sides false).
+    // setcc(cc) + zext → a fresh 0/1 GPR: THE materialization of a condition
+    // code as a value, and the same two instructions whatever set the flags —
+    // an integer `cmp`, a scalar `fcmp`, the x87 compare sequence, or the
+    // integer compare that finishes a binary128 softcall. Clean SSA: setcc
+    // defines the byte, zext consumes it and defines the result.
+    // ⚠ The caller owns the `Setcc`/`ZExt` presence checks (every one of them
+    // already fails loud before reaching here, and re-checking per call would
+    // multiply one missing-opcode diagnostic across a composed predicate).
+    [[nodiscard]] LirReg emitCondCodeToGpr(TargetCondCode cc) {
+        LirReg const b8 = lir.newVReg(LirRegClass::GPR);
+        emitInst(*opcode(MnemonicSlot::Setcc), b8,
+                 std::span<LirOperand const>{},
+                 /*payload=*/static_cast<std::uint32_t>(cc));
+        LirReg const wide = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> zextOps{LirOperand::makeReg(b8)};
+        emitInst(*opcode(MnemonicSlot::ZExt), wide, zextOps);
+        return wide;
+    }
+
     void lowerFCmp(MirInstId id) {
         MirOpcode const op = mir.instOpcode(id);
-        auto const plan = floatCmpPlan(op);
-        if (!plan.has_value()) {
-            // Ueq/Ult/Ule/Ugt/Uge — no C producer, no realization.
-            reportUnsupported(op, id);
-            poisonValue(id);
-            return;
-        }
-        if (!opcode(MnemonicSlot::FCmp).has_value()) {
-            reportMissingOpcode(MnemonicSlot::FCmp, "MIR FCmp");
-            poisonValue(id);
-            return;
-        }
         if (!opcode(MnemonicSlot::Setcc).has_value()) {
             reportMissingOpcode(MnemonicSlot::Setcc, "MIR FCmp");
             poisonValue(id);
@@ -10841,12 +11061,46 @@ struct Lowerer {
             poisonValue(id);
             return;
         }
-        // Gate + width: the compare's encoded width follows the
-        // OPERANDS' float type (the result is Bool); post-UAC both
-        // operands carry the same type, so operand 0 is authoritative
-        // (the lowerICmp rule).
-        if (!requireEncodedFloatWidth(id, mir.instType(operands[0]),
-                                      "MIR FCmp operand")) {
+        // The compare's realization + encoded width follow the OPERANDS' float
+        // type (the result is Bool); post-UAC both operands carry the same
+        // type, so operand 0 is authoritative (the lowerICmp rule).
+        TypeKind const operandKind = interner.kind(mir.instType(operands[0]));
+        // D-TARGET-ENCODING-WIDTH-GUARD (LD-3): a binary128 pair has no compare
+        // INSTRUCTION anywhere — it compares through a config'd softfloat
+        // helper whose INTEGER result finishes on an INTEGER condition code, so
+        // it takes its own plan and never touches the float-flag machinery.
+        // Gated on the PRESENCE of the row, never a target/format check — the
+        // same load-bearing agnosticism condition the F128 arithmetic arms
+        // carry: a target that declares F128 and omits the comparison rows
+        // falls through to the width gate below and fails LOUD.
+        if (operandKind == TypeKind::F128) {
+            if (auto const wide = wideFloatCmpPlan(op); wide.has_value()) {
+                if (auto const* cfg = target.wideFloatSoftcall(wide->helper)) {
+                    if (!emitWideFloatCompare(id, *cfg, operands)) return;
+                    defineValue(id, emitCondCodeToGpr(wide->intCond));
+                    return;
+                }
+            }
+        }
+        auto const plan = floatCmpPlan(op);
+        if (!plan.has_value()) {
+            // Ueq/Ult/Ule/Ugt/Uge — no C producer, no realization.
+            reportUnsupported(op, id);
+            poisonValue(id);
+            return;
+        }
+        // The width gate, with the ONE exemption LD-3 earns. An x87 80-bit pair
+        // IS realized: `emitFloatCompare` routes it to the x87 sequence, which
+        // leaves UCOMISD-identical flags, so the plan and the whole
+        // materialization tail below apply to it UNCHANGED. The exemption is
+        // spelled here rather than as an interception (the shape the F80
+        // arithmetic arms use) precisely because the realization lives one
+        // level down in the shared flag-producing verb — which is what lets the
+        // FUSED branch path pick it up from the same place. Every other
+        // unencoded width still walls: F16, which still has no C producer.
+        if (operandKind != TypeKind::F80
+            && !requireEncodedFloatWidth(id, mir.instType(operands[0]),
+                                         "MIR FCmp operand")) {
             return;
         }
         if (!emitFloatCompare(id, *plan, operands)) {
@@ -10856,14 +11110,7 @@ struct Lowerer {
         // Materialize per the plan: single setcc when the target
         // declares the nibble; else the composed two-setcc shape.
         if (target.condCodeEncoding(plan->single).has_value()) {
-            LirReg const b8 = lir.newVReg(LirRegClass::GPR);
-            emitInst(*opcode(MnemonicSlot::Setcc), b8,
-                     std::span<LirOperand const>{},
-                     /*payload=*/static_cast<std::uint32_t>(plan->single));
-            LirReg const result = lir.newVReg(LirRegClass::GPR);
-            std::array<LirOperand, 1> zextOps{LirOperand::makeReg(b8)};
-            emitInst(*opcode(MnemonicSlot::ZExt), result, zextOps);
-            defineValue(id, result);
+            defineValue(id, emitCondCodeToGpr(plan->single));
             return;
         }
         if (!plan->composition.has_value()) {
@@ -10908,18 +11155,8 @@ struct Lowerer {
             poisonValue(id);
             return;
         }
-        auto const setccZext = [&](TargetCondCode cc) -> LirReg {
-            LirReg const b8 = lir.newVReg(LirRegClass::GPR);
-            emitInst(*opcode(MnemonicSlot::Setcc), b8,
-                     std::span<LirOperand const>{},
-                     /*payload=*/static_cast<std::uint32_t>(cc));
-            LirReg const wide = lir.newVReg(LirRegClass::GPR);
-            std::array<LirOperand, 1> ops{LirOperand::makeReg(b8)};
-            emitInst(*opcode(MnemonicSlot::ZExt), wide, ops);
-            return wide;
-        };
-        LirReg const a = setccZext(comp.partA);
-        LirReg const b = setccZext(comp.partB);
+        LirReg const a = emitCondCodeToGpr(comp.partA);
+        LirReg const b = emitCondCodeToGpr(comp.partB);
         LirReg const result = lir.newVReg(LirRegClass::GPR);
         std::array<LirOperand, 2> combineOps{
             LirOperand::makeReg(a), LirOperand::makeReg(b)};
@@ -10942,6 +11179,21 @@ struct Lowerer {
         }
         LirReg const lhs = plan.swapOperands ? *b : *a;
         LirReg const rhs = plan.swapOperands ? *a : *b;
+        // D-TARGET-ENCODING-WIDTH-GUARD (LD-3): an x87 80-bit pair has no
+        // scalar-SSE compare form, so it produces the SAME flags through the
+        // x87 sequence instead. Intercepted HERE, in the one shared
+        // flag-producing verb, precisely so both consumers — `lowerFCmp`'s
+        // materialization and `lowerCondBr`'s fused branch — pick it up
+        // together; un-walling only one of them is the partial fix that reads
+        // as a complete one. Keyed on TypeKind (F80 forms solely on the x87-80
+        // axis), never on the target's or format's identity.
+        if (interner.kind(mir.instType(operands[0])) == TypeKind::F80) {
+            return emitF80Compare(lhs, rhs, "MIR F80 FCmp");
+        }
+        if (!opcode(MnemonicSlot::FCmp).has_value()) {
+            reportMissingOpcode(MnemonicSlot::FCmp, "MIR FCmp");
+            return false;
+        }
         std::array<LirOperand, 2> cmpOps{
             LirOperand::makeReg(lhs), LirOperand::makeReg(rhs)};
         emitInst(*opcode(MnemonicSlot::FCmp), InvalidLirReg, cmpOps,
@@ -11629,10 +11881,34 @@ struct Lowerer {
         // path branches on it — correct, just not fused (a jcc-pair /
         // flag-forwarding fusion for composed float conditions is an
         // optimizer peephole, deliberately NOT done here).
+        //
+        // ★ D-TARGET-ENCODING-WIDTH-GUARD (LD-3) ADDS ONE MORE EXCLUSION, AND
+        // IT IS NOT A CAPABILITY GAP. Fusion RE-EMITS the flag-producing
+        // compare here, at the branch. For a binary128 that compare is a CALL
+        // to a softfloat helper, so fusing would call it a SECOND time — pure
+        // cost, and a call inserted between the block's code and its
+        // terminator. F128 therefore takes the non-fused arm on purpose,
+        // exactly as a composed predicate does: `lowerFCmp` already
+        // materialized the Bool and `cmp bool,0; jne` branches on it. An x87
+        // 80-bit pair fuses NORMALLY — its compare is an inline four-instruction
+        // sequence, and `emitFloatCompare` emits it from the same place the
+        // scalar `fcmp` comes from, which is the whole reason that verb owns
+        // the F80 arm rather than `lowerFCmp` doing it before the gate.
         auto const floatPlan = floatCmpPlan(condOp);
+        std::optional<TypeKind> fcmpOperandKind;
+        if (floatPlan.has_value()) {
+            auto const fcmpOps = mir.instOperands(condInst);
+            if (fcmpOps.size() == 2) {
+                fcmpOperandKind = interner.kind(mir.instType(fcmpOps[0]));
+            }
+        }
         bool const fuseFloat =
             floatPlan.has_value()
-            && opcode(MnemonicSlot::FCmp).has_value()
+            && fcmpOperandKind.has_value()
+            && *fcmpOperandKind != TypeKind::F128
+            && (*fcmpOperandKind == TypeKind::F80
+                    ? opcode(MnemonicSlot::FucomiP).has_value()
+                    : opcode(MnemonicSlot::FCmp).has_value())
             && target.condCodeEncoding(floatPlan->single).has_value();
         TargetCondCode jccCond;
         if (fuseFloat) {
@@ -11641,9 +11917,13 @@ struct Lowerer {
                 reportUnsupported(condOp, condInst);
                 return false;
             }
-            if (!requireEncodedFloatWidth(condInst,
-                                          mir.instType(fcmpOperands[0]),
-                                          "MIR FCmp operand (fused)")) {
+            // LD-3: the SAME F80 exemption `lowerFCmp` spells at its own gate —
+            // an x87 pair is realized by `emitFloatCompare`, everything else
+            // unencoded still walls.
+            if (*fcmpOperandKind != TypeKind::F80
+                && !requireEncodedFloatWidth(condInst,
+                                             mir.instType(fcmpOperands[0]),
+                                             "MIR FCmp operand (fused)")) {
                 return false;
             }
             if (!emitFloatCompare(condInst, *floatPlan, fcmpOperands)) {

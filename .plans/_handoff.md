@@ -9,7 +9,7 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-09-03 — cycles **P14 … P57**. ⚠ P52 rewrote no handoff at all, so a reader
+**Last updated:** 2026-09-04 — cycles **P14 … P58**. ⚠ P52 rewrote no handoff at all, so a reader
 who opened this file during P53 saw P51 described as current state; that entry in §5 was written
 retroactively by P53 and says so. P53's own §0 was relocated into §5 by P54 and is marked as
 history there.
@@ -17,6 +17,164 @@ history there.
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
+
+**Cycle P58 closed 2026-09-04.** Four lanes plus the orchestrator, on top of P57 (`01642ee3`).
+✔**REAL: 5 rows closed, 0 opened.** ✔**COUNTED by `check-anchor-balance --base 01642ee3`: 4 closed,
+0 opened, net −4.** The one the gate cannot see is
+`D-TEST-AN-EXPECT-ONLY-PARSE-GUARD-RAISES-AND-CANCELS-ITS-SUITES-CONTROLS`, born closed inside the
+cycle. **Two operator rulings landed** and are recorded in
+[[D-PP-HAS-EXTENSION-BUILTIN-ABSENT]], which is re-verdicted ⏳ GATED → 🟠 OPEN, P1.
+
+★★★ **THE THROUGH-LINE: EVERY LANE'S ROW WAS WRONG ABOUT ITS OWN SUBJECT — FOUR FOR FOUR.** P56:
+*every record was right and nobody re-read it.* P57: *a green witness is not a true witness.* P58 is
+the next step and the sharpest: **a row's account of its own defect is a HYPOTHESIS, and this cycle
+not one of the four survived contact with a measurement.** The failures were in every direction —
+too narrow, too wide, backwards, and misclassified — which is why no single heuristic would have
+caught them.
+
+1. ⚠⚠ **A "GATED FEATURE" WAS A LIVE SILENT MISCOMPILE, AND ITS TRIGGER COULD NEVER HAVE FIRED.**
+   `D-CSUBSET-PER-MEMBER-PACKED` was filed and banded as a deferred feature waiting on a consumer.
+   ✔MEASURED by lane `pk` at `01642ee3` through the shipped CLI:
+   `struct { char a; int z __attribute__((packed)); double d; }` compiles **rc 0 with ZERO
+   diagnostics** and puts `z` at offset **4**, where gcc and clang both put it at **1**. A runnable
+   witness exits **42** on six working reference arms (gcc and clang each on x86_64, aarch64 and
+   **s390x big-endian**, plus mingw-w64 on PE) and **45** on DSS across pe64-x86_64, elf64-x86_64
+   and elf64-aarch64, debug and release — **45 being exactly what the references produce with the
+   attribute DELETED**. Re-banded P1 → **P0** mid-cycle and closed the same cycle.
+   ★ **A gate that waits for a consumer cannot fire when the consumer already exists and is being
+   silently mis-served.** ⇒ **When a row says GATED FEATURE, check whether the construct is already
+   ACCEPTED before believing it** — acceptance plus a wrong answer is never a deferral, and a row
+   whose STATUS and BAND both describe a deferral is invisible to every queue that sorts by
+   severity. That is how this survived several cycles.
+   ⚠ **The row's own illustration was a layout NO-OP**: `{int a; int z <packed>;}` is 8 / align 4 /
+   z@4 with AND without the attribute. The discriminating shape has the **same sizeof and same
+   _Alignof** — only one offset moves — so every size-based check was blind to it. ⇒ **A layout
+   fixture is vacuous unless the packed member's natural alignment exceeds the cursor it would land
+   on**; three of that lane's own fixtures failed that test and were rebuilt.
+2. ⚠ **ONE ROW ASKED FOR A REGRESSION.** `D-CSUBSET-ALIGNAS-REGISTER-CONTEXT` wanted DSS to REJECT
+   `register alignas(16) int x;`. ✔MEASURED, each reference probed separately at every `-std`: all
+   three ACCEPT an alignment request on a `register` object in a spelling they implement — gcc and
+   clang via `__attribute__((aligned))` clean, MSVC via `_Alignas` with the alignment measurably
+   APPLIED (`&x % 16 == 0` at /Od and /O2, discriminating `__alignof` pairs against a control).
+   DSS already accepted and honoured it. Closed by pinning the CORRECT behaviour.
+   ⚠ Its sibling `D-CSUBSET-ALIGNAS-TYPEDEF-PARAM-PARSE` split: the typedef half was right (four
+   refusals), the **parameter half was BACKWARDS** — DSS was BELOW the union, refusing a program
+   MSVC compiles and honours. **The whole fix was two lines of `c.lang.json` and zero C++.**
+3. ⚠ **A ROW THAT WOULD HAVE BEEN RE-BANDED DOWN ON A FALSE PREMISE — CAUGHT BY THE LANE ITSELF.**
+   Lane `ew` drafted a P1 → P4 re-band of `D-TARGET-ENCODING-WIDTH-GUARD` on *"no long double
+   operation reaches this gate any more"*, then measured it FALSE. Still walled: `-ld` (FNeg),
+   `(unsigned)ld` (FPToUI), `(double)ld` (FPTrunc), `(long double)someFloat` (FPExt),
+   `(long double)someDouble` (FPExt, x87 only), `(long long)ld` (FPToSI, arm64) — six conformance
+   divergences all four references get right, every binary128 helper exported and `nm -D` verified.
+   **Status stays 🟠 OPEN at P1.** ⚠ Two more brief errors of mine it corrected: the gate has **TWO**
+   FCmp reaches (`MIR FCmp operand` *and* `… (fused)`, the latter being the arm `if (a < b)` takes,
+   which is why the F80 arm went into the shared `emitFloatCompare` verb); and `__letf2`/`__getf2`
+   is **two of SIX** helpers, so shipping the pair I named would have left `<`, `>`, `==`, `!=`
+   walled.
+4. ⚠ **A ROW'S COST PREMISE, REFUTED — AND THE CLOSURE IS NARROWER THAN THE ROW'S NAME.**
+   `D-CSUBSET-COMPILER-FEATURE-QUERY-OPERATORS` claimed DSS was *"silently taking the degraded path
+   on every macOS TU"*. ✔MEASURED: on the shimmed shape real headers ship, **gcc, mingw gcc and
+   MSVC take the same degraded path** — only clang differs, and only because it really has
+   `__is_target_arch`. Corpus cost **ZERO**: no `__has_*` operator appears anywhere in
+   `real-examples/c/sqlite`. Closed by the row's own step (A), which named *"do nothing"* as a good
+   outcome in advance, with step (D)'s guard shipped. ★ **The ✅ is narrower than the family it
+   names and says so**: the four operators remain unimplemented, which is what the rulings below
+   now schedule.
+
+## §0.1 — TWO OPERATOR RULINGS, 2026-09-03 — both recorded in [[D-PP-HAS-EXTENSION-BUILTIN-ABSENT]]
+
+★★★ **RULING 1 — SHIP ALL FOUR FEATURE-QUERY OPERATORS, CONFIG-DRIVEN**: `__has_attribute`,
+`__has_builtin`, `__has_feature`, `__has_extension`. The gate that row carried since 2026-07-29 is
+DISCHARGED and it is re-verdicted OPEN at P1. Its stated precondition — *read
+[[D-PP-IF-OPERAND-PARSE-NO-SHORTCIRCUIT]] first* — was MET, and that row's charter premise
+**REFUTED**: ✔gcc, mingw gcc and clang all REFUSE the shape it was filed on; only `cl` accepts, by
+DROPPING trailing tokens (C4067). A 3–1 accept-vs-refuse split with DSS on the majority side, not a
+general conformance defect. ⚠ **The counter-argument was put and rejected and is recorded so it is
+not re-litigated**: measured corpus cost is ZERO, but that is a PRIORITY argument, not a
+CONFORMANCE one — `__has_attribute`/`__has_builtin` have two working references and the other pair
+has one, and one working reference makes a construct REQUIRED.
+
+★★★★ **RULING 2 — WHERE EVERY REFERENCE ACCEPTS AND APPLIES A CONSTRUCT, DSS ACCEPTS IT TOO,
+DIAGNOSING AT MOST A WARNING.** Verbatim: *"we must accept too. best long term solution, no
+workaround, first class implementation, 100% config driven. leave nothing to be done."*
+✔MEASURED: all four references accept `#define __has_include(x) 0` / `#undef __has_include` at at
+most a warning and APPLY it; **DSS refuses at Error**. ⚠ C23 6.10.10p2 reserves exactly four
+identifiers and so BACKS the refusal on the standard's text — which is why this needed a ruling and
+not a fix: the union's ISO C vertex and its three implementation vertices disagreed, and DSS had
+picked the standard over every implementation. ★★ **THE INCONSISTENCY IS WHAT MAKES IT A POSTURE
+RULING**: the SAME function's `__STDC__` arm had already resolved the identical question the other
+way, carrying the comment *"being stricter than every reference is not rigor."* Two shapes, one
+function, opposite postures. ⇒ **CLOSING WORK**: the reserved-identifier posture becomes DATA in
+`.lang.json` — which names are reserved and what SEVERITY a `#define`/`#undef` of each draws — and
+**the `__STDC__` arm and this arm must end up reading the SAME declaration**. A fix that repairs
+this shape while leaving the two arms independent recreates the defect the ruling is about.
+
+## §0.2 — The four gate legs, ✔MEASURED at the folded tree, every leg through `scripts/run-gate/`
+
+| leg | result | time |
+|---|---|---|
+| Windows x86_64 | **2037 / 2037** | 514.03 s |
+| Linux x86_64 (WSL2) | **2037 / 2037** | 403.65 s |
+| macOS arm64 (Apple Silicon) | **2013 / 2013** | 3942.38 s |
+| Linux arm64 (native VPS) | **2013 / 2013** | 1105.00 s |
+
+★ `2013 = 2037 − 24` HELD ON BOTH REMOTE LEGS. Count rose 2025 → 2037.
+
+## §0.3 — What is OWED
+
+- **[[D-PP-HAS-EXTENSION-BUILTIN-ABSENT]] (P1, OPEN)** — both rulings above, one lane, because they
+  are the same function. The query vocabulary and the reserved-identifier posture are both
+  `.lang.json` data; `semantics.builtinFunctions` and `semantics.attributeEffects` already exist as
+  the truth set and lane `fq`'s arm 3 pins against them with its premise `ASSERT_FALSE`d out loud so
+  it stays live after the operators ship.
+- **[[D-TARGET-ENCODING-WIDTH-GUARD]] (P1, OPEN)** — the six operations in item 3 above. The
+  compare arm shipped; FNeg, FPToUI, FPTrunc, FPExt and FPToSI have not.
+- **[[D-CSUBSET-VLA-NONLEAF-CALL-FRAME]] (P1) with [[D-CSUBSET-VLA-WIN64-UNWIND]]** — must ship
+  TOGETHER; closing the first alone converts a loud refusal into a silent mis-unwind. Deferred from
+  P58 only because both are codegen and would have collided with lane `ew`.
+- **Named residue, measured and not filed as rows**: a packed bit-field that STRADDLES its unit is
+  refused rather than mislaid (the same guard `#pragma pack` hits, pinned AS a refusal), and
+  `[[gnu::packed]]` on a member is still a loud parse error; `alignas(16) typedef int T;` stays a
+  parse error though MSVC accepts and honours it — structural, because a typedef interns to its
+  aliasee's TypeId so DSS cannot represent an over-aligned alias and accepting would be a silent
+  drop.
+- ⚠ **Carried from P55, still unescalated**: gcc IGNORES a GNU `noreturn` on a function-type
+  typedef, clang HONOURS it. Per the 2026-08-28 ruling that is a MEANING fork and pauses.
+- **`examples/README.md` documents 634 manifests against a live census of 767+.**
+
+## §0.4 — Traps this cycle paid for
+
+- ★★ **A PREPARED PATCH IS WRONG UNTIL COMPILED — THIRD CYCLE RUNNING.** Lane `pk`'s prepared
+  front-end wiring had two errors invisible to reading: the config key is `"names"`, not
+  `"attributeNames"` (**a wrong key binds no name SILENTLY**), and its row insertion landed INSIDE
+  the neighbouring object. Both died on `json.loads`, neither on inspection. ⇒ A lane that hands
+  over a hunk for a file it does not own must SAY it has not compiled it — and the party that lands
+  it compiles it.
+- ★★ **AN INSTRUMENT THAT FAILS TOWARD *THOROUGH*.** Lane `al`'s guard classifier matched TEST
+  bodies by counting braces over raw text; these tests embed C source as string literals
+  (`"int main(void){ return 0; }"`), so bodies OVERLAPPED and it found **119 guards where the file
+  holds 103**. Caught only because 119 did not reconcile against an independent raw census. Its loop
+  heuristic disagreed with the code in BOTH directions and was discarded for hand-reading. Final:
+  **85 converted, 12 deliberately left, 6 already ASSERT**, with the rule stated and the diff
+  verified line by line.
+- ⚠ **AND THE BOUND STATED RATHER THAN MANUFACTURED**: that lane could NOT reproduce a raise from
+  any PRE-EXISTING test — six mutants, five clean `Failed`, one green, because those tests carry a
+  downstream `ASSERT_TRUE(node.valid())` that stops them first. So the sweep is a hardening against
+  a class proven real by exactly ONE execution, not a repair of a currently-red test. It also proved
+  behaviour-neutrality: the same three mutants against rebuilt pre- and post-sweep binaries gave
+  BYTE-IDENTICAL verdicts.
+- ⚠ **A CROSS-TARGET RUN THAT TAGGED OUTPUT BY ARCH ALONE** put pe64-x86_64 and elf64-x86_64 in one
+  directory, so the elf arm's `find *.exe` picked up the PE binary and printed *"RUN exit=42"* for a
+  target the host cannot run. Tag by arch AND format; read `file -b` on the artifact.
+- ⚠ **A heredoc collapsed doubled backslashes for the THIRD time this cycle**, turning JSON `\n`
+  escapes into real newlines.
+
+---
+
+★★★ **P57 — RELOCATED HERE BY P58, AND IT IS HISTORY, NOT STATE.** It was §0 until P58 closed. Every figure below is P57's own and was true at P57's tip; **re-derive anything you intend to act on.** Its through-line — *a green witness is not a true witness* — is the direct ancestor of P58's, which moves from the EVIDENCE to the ROW ITSELF: a row's account of its own defect is a hypothesis, and in P58 all four were wrong.
+
+## ⏪ P57's former §0 (history)
+
 
 **Cycle P57 closed 2026-09-03.** Four lanes plus the orchestrator, on top of P56 (`fcb3a9d7`).
 ✔**REAL: 9 rows closed, 0 opened.** ✔**COUNTED by `check-anchor-balance --base fcb3a9d7`: 6 closed,

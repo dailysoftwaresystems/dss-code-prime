@@ -2727,6 +2727,202 @@ TEST(SemanticAnalyzerC, AlignasOnBitFieldMemberFailsLoud) {
                         DiagnosticCode::S_AlignasInvalidContext), 1u);
 }
 
+// ─── P58 · [[D-CSUBSET-ALIGNAS-TYPEDEF-PARAM-PARSE]] + [[D-CSUBSET-ALIGNAS-REGISTER-CONTEXT]] ───
+//
+// THE TWO ROWS ASKED FOR `S_AlignasInvalidContext` IN THREE CONTEXTS. MEASURING THE
+// REFERENCES SPLIT THEM: exactly ONE of the three is a refusal the union supports.
+// Every claim below was ✔MEASURED 2026-09-03, each reference probed SEPARATELY, both
+// the `alignas` and the `_Alignas` spellings, at every -std each compiler accepts.
+//
+//   TYPEDEF   gcc 13.3.0 "alignment specified for typedef 'T'" · clang 18.1.3
+//             "'alignas' attribute only applies to variables, data members and tag
+//             types" · mingw-w64 gcc 13.2.0 as gcc · MSVC 19.51 "error C7704".
+//             UNANIMOUS refusal + ISO C 6.7.6p2 ⇒ DSS refuses. Pinned below.
+//   PARAMETER gcc REFUSES · clang refuses the ISO spelling but ACCEPTS AND HONORS the
+//             GNU one (`__attribute__((aligned(16)))` on a parameter →
+//             `__alignof__(x)==16`, the discriminating `==4` twin fails) · MSVC
+//             ACCEPTS `_Alignas(16)` on a parameter, silent at /W4, and HONORS it —
+//             an EXECUTED binary reports `((uintptr_t)&x)%16 == 0` at /Od and /O2.
+//   REGISTER  gcc/clang/mingw refuse the ISO spelling, but gcc AND clang both ACCEPT
+//             `register __attribute__((aligned(16))) int x;` clean at -Wall -Wextra,
+//             and MSVC ACCEPTS `register _Alignas(16) int x;` and applies it
+//             (`__alignof(x)` discriminates 16 from 4).
+//
+// A split on ACCEPT-vs-REFUSE is settled by the DISJUNCTION, not paused as a fork
+// (operator, 2026-08-28), so for PARAMETER and REGISTER the union REQUIRES DSS to
+// accept — and to honor, because MSVC's acceptance is a working one, not an
+// accept-then-drop. These two pins exist so that a later "conformance tidy-up" that
+// adds either arm to the context ladder goes RED with the reason attached, instead of
+// quietly putting DSS below the union on programs MSVC compiles.
+
+// C23 6.7.6p2 (C11 6.7.5p2): alignas on a TYPEDEF → S_AlignasInvalidContext.
+// Before P58 this shape did not reach the semantic tier at all — the grammar admitted
+// no `alignasSpec` after `typedef`, so it died as a generic parse error
+// (`P_NoAlternativeMatched`; both rows called it P0009, which was wrong). The
+// context ladder's `dk == DeclarationKind::Type` arm was already wired and fired the
+// moment `typedefDeclSpecifiers` admitted the specifier — no C++ change.
+// RED-ON-DISABLE: drop `alignasSpec` from `typedefDeclSpecifiers`' post-keyword alt in
+// c.lang.json and this test goes red on `assertNoBuilderErrors` (the fixture stops
+// parsing) AND on the count (0, not 1).
+TEST(SemanticAnalyzerC, AlignasOnTypedefFailsLoud) {
+    auto cu = buildShippedUnit("c", { "typedef alignas(16) int T;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 1u);
+}
+
+// The C11 `_Alignas` spelling of the same typedef constraint. MSVC refuses exactly
+// this spelling (C7704) — it has no C23 `alignas` keyword in C at all, so `_Alignas`
+// is the ONLY spelling on which its vote can be read.
+TEST(SemanticAnalyzerC, AlignasLegacySpellingOnTypedefFailsLoud) {
+    auto cu = buildShippedUnit("c", { "typedef _Alignas(16) int T;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 1u);
+}
+
+// A MULTI-DECLARATOR typedef carries ONE shared specifier prefix, so the constraint is
+// reported ONCE, not once per alias — the `alignasContextReported` gate, on the shape
+// that can expose it.
+TEST(SemanticAnalyzerC, AlignasOnMultiDeclaratorTypedefReportsOnce) {
+    auto cu = buildShippedUnit("c", { "typedef alignas(16) int A, B;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 1u)
+        << "one shared prefix is one constraint violation, not one per alias";
+}
+
+// ★ THE INVERTED HALF. A PARAMETER is an OBJECT for this ladder: no diagnostic, and
+// the validated override IS stored on the parameter's symbol — the same
+// `explicitAlignment` slot the GNU `aligned(N)` spelling has used on this position
+// since TF-C73, which is what carries it to the parameter's home frame slot.
+// RED-ON-DISABLE: drop `alignasSpec` from `paramDeclSpecifier`'s alt and the fixture
+// stops parsing (assertNoBuilderErrors fires) and `p` has no explicitAlignment.
+TEST(SemanticAnalyzerC, AlignasOnAParameterIsAcceptedAndStored) {
+    auto cu = buildShippedUnit("c", { "void f(alignas(16) int p) { (void)p; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 0u)
+        << "MSVC 19.51 compiles this silently and honors the alignment; refusing it "
+           "puts DSS below (gcc u clang u MSVC)";
+    SymbolRecord const* p = findSym(model, "p");
+    ASSERT_NE(p, nullptr);
+    ASSERT_TRUE(p->explicitAlignment.has_value())
+        << "admitted-but-unstored would be parse-and-silently-drop";
+    EXPECT_EQ(*p->explicitAlignment, 16u);
+}
+
+// The `_Alignas` spelling on a parameter — the spelling MSVC actually implements, so
+// the one its accepting vote was cast on.
+TEST(SemanticAnalyzerC, AlignasLegacySpellingOnAParameterIsAcceptedAndStored) {
+    auto cu = buildShippedUnit("c", { "void f(_Alignas(32) int p) { (void)p; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 0u);
+    SymbolRecord const* p = findSym(model, "p");
+    ASSERT_NE(p, nullptr);
+    ASSERT_TRUE(p->explicitAlignment.has_value());
+    EXPECT_EQ(*p->explicitAlignment, 32u);
+}
+
+// A NON-FIRST parameter, and a sibling that carries no request: the prefix belongs to
+// ONE parameter, never to the whole list. Without this, admitting the specifier could
+// have widened silently (every parameter after an aligned one inheriting its slot).
+TEST(SemanticAnalyzerC, AlignasOnASecondParameterDoesNotLeakToItsSiblings) {
+    auto cu = buildShippedUnit("c",
+                               { "void f(int a, alignas(16) int b) { (void)a; (void)b; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 0u);
+    SymbolRecord const* a = findSym(model, "a");
+    SymbolRecord const* b = findSym(model, "b");
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    EXPECT_FALSE(a->explicitAlignment.has_value())
+        << "the undecorated parameter must not inherit its neighbour's alignment";
+    ASSERT_TRUE(b->explicitAlignment.has_value());
+    EXPECT_EQ(*b->explicitAlignment, 16u);
+}
+
+// THE POSITION IS NOT A HOLE IN THE VALIDATION LADDER. Opening a new context for a
+// specifier is only safe if every check that guards the old contexts still runs in the
+// new one — otherwise `alignas(3)` on a parameter would be admitted and then quietly
+// produce a non-power-of-two frame demand. All four arms are exercised here because
+// they fail in DIFFERENT directions and only one of them is "already defended".
+TEST(SemanticAnalyzerC, AlignasOnAParameterInheritsTheWholeValidationLadder) {
+    {
+        auto cu = buildShippedUnit("c", { "void f(alignas(3) int p) { (void)p; }\n" });
+        assertNoBuilderErrors(*cu);
+        auto m = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+        EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_AlignasNotPowerOfTwo), 1u);
+    }
+    {
+        auto cu = buildShippedUnit("c", { "void f(alignas(512) int p) { (void)p; }\n" });
+        assertNoBuilderErrors(*cu);
+        auto m = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+        EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_AlignasExceedsMax), 1u);
+    }
+    {
+        auto cu = buildShippedUnit("c", { "void f(alignas(2) long long p) { (void)p; }\n" });
+        assertNoBuilderErrors(*cu);
+        auto m = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+        EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_AlignasWeakerThanNatural), 1u);
+    }
+    {
+        auto cu = buildShippedUnit("c",
+                                   { "int n;\nvoid f(alignas(n) int p) { (void)p; }\n" });
+        assertNoBuilderErrors(*cu);
+        auto m = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+        EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_AlignasNonConstant), 1u);
+    }
+}
+
+// ★ [[D-CSUBSET-ALIGNAS-REGISTER-CONTEXT]] — REFUTED, AND THIS IS THE PIN THAT KEEPS IT
+// REFUTED. The row asked for S_AlignasInvalidContext on `register alignas(16) int x;`.
+// `register` is an ignored storage kind in c.lang.json, so DSS applies the alignment —
+// and so does every reference in the spelling it implements (gcc AND clang accept the
+// GNU `aligned(16)` form on a register object clean at -Wall -Wextra; MSVC accepts and
+// applies the ISO `_Alignas` form). The row's requested diagnostic would have been a
+// regression, not a conformance win.
+TEST(SemanticAnalyzerC, RegisterAlignasIsAcceptedAndStored) {
+    auto cu = buildShippedUnit("c",
+                               { "int main(void) { register alignas(16) int x = 0;\n"
+                                 "                 int const *p = &x; return *p; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 0u)
+        << "MSVC compiles this and applies the alignment; gcc and clang both compile "
+           "the GNU spelling of the same request on a register object";
+    SymbolRecord const* x = findSym(model, "x");
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->explicitAlignment.has_value())
+        << "accepting without storing would be the silent drop this project refuses";
+    EXPECT_EQ(*x->explicitAlignment, 16u);
+}
+
+// The specifier may precede OR follow `register` — C declaration specifiers are
+// unordered, and both orderings are what the references were probed on.
+TEST(SemanticAnalyzerC, RegisterAlignasIsOrderIndependent) {
+    auto cu = buildShippedUnit("c",
+                               { "int main(void) { alignas(16) register int x = 0;\n"
+                                 "                 int const *p = &x; return *p; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 0u);
+    SymbolRecord const* x = findSym(model, "x");
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->explicitAlignment.has_value());
+    EXPECT_EQ(*x->explicitAlignment, 16u);
+}
+
 // The C11 spelling `_Alignas` works identically to the C23 `alignas`.
 TEST(SemanticAnalyzerC, AlignasC11SpellingStores) {
     auto cu = buildShippedUnit("c", { "_Alignas(64) int g;\n" });

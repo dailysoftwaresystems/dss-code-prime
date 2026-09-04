@@ -369,6 +369,24 @@ struct DSS_EXPORT SymbolRecord {
     // codegen is a SEPARATE deferred task (D-CSUBSET-ALIGNAS: this cycle stores it
     // unconsumed for variables — member alignas works end-to-end via the interner).
     std::optional<std::uint32_t> explicitAlignment;
+    // D-CSUBSET-PER-MEMBER-PACKED: this declarator carries GNU
+    // `__attribute__((packed))` — its baseline alignment is 1. The exact INVERSE of
+    // `explicitAlignment` above and its structural twin: for a struct/union MEMBER
+    // it is read at the composite's Pass-1 completion to build the `fieldPacked`
+    // span passed to `completeComposite`, and the interned TYPE then owns the
+    // lowered layout, exactly as it owns the raised one. The two COMBINE rather
+    // than compete — the layout engine takes `max(packed ? 1 : natural, override)`,
+    // which is why `__attribute__((packed, aligned(2)))` on an `int` lands at 2 and
+    // not at the type's natural 4 (✔MEASURED, gcc 13.3.0 + clang 18.1.3, x86_64 +
+    // aarch64 + big-endian s390x).
+    //
+    // ⚠ INERT ON A NON-MEMBER, DELIBERATELY. `packed` on a file-/block-scope
+    // object, a function or a typedef reaches this flag too and nothing reads it —
+    // which is the reference behaviour (gcc warns and ignores; clang is silent;
+    // both emit identical bytes). The four-kind `appliesTo` vocabulary cannot tell
+    // a member from an object, so the member-only-ness is expressed HERE, at the
+    // only consumer that can express it.
+    bool isPackedField = false;
     // VLA C4b (D-CSUBSET-VLA): for a VLA-TYPEDEF OBJECT (`typedef int R[n]; R a;`)
     // — the SymbolId of the typedef `R` whose (variable-length) array type this
     // object aliases; `InvalidSymbol` (default) for every other symbol. C99

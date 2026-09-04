@@ -116,7 +116,7 @@ TEST(ParserCSmoke, IntVarDeclWithLiteralInitializer) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_TRUE(hasInternalNodeWithRule(t, "topLevel"))
         << "tree must include a topLevel frame";
     // FC4 c1: the specifier/declarator split — the head carries the type,
@@ -137,7 +137,7 @@ TEST(ParserCSmoke, FunctionBodyExpressionIsPrecedenceCorrect) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{}) << "no expression node found in tree";
@@ -167,7 +167,7 @@ TEST(ParserCSmoke, TightLhsMulThenAddNestsMulOnLeft) {
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -196,7 +196,7 @@ TEST(ParserCSmoke, SamePrecSubAddChainNestsLeftward) {
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -223,7 +223,7 @@ TEST(ParserCSmoke, DivisionChainNestsLeftward) {
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -251,7 +251,7 @@ TEST(ParserCSmoke, AssignmentChainNestsRightward) {
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -278,7 +278,7 @@ TEST(ParserCSmoke, TernaryChainExactRightNestedShape) {
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -314,7 +314,7 @@ TEST(ParserCSmoke, CallPlusCallMixesPostfixAndInfix) {
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -357,7 +357,7 @@ TEST(ParserCSmoke, SpacedCallWrapsCalleeNotWhitespace) {
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -391,7 +391,7 @@ TEST(ParserCSmoke, CommentTriviaInChainKeepsLeafOrder) {
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_TRUE(hasInternalNodeWithRule(t, "binaryExpr"));
 
     std::string rebuilt;
@@ -411,7 +411,7 @@ TEST(ParserCSmoke, SpacedTernaryShapeMatchesCompactForm) {
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -436,7 +436,7 @@ TEST(ParserCSmoke, TernaryParsesAsMixfix) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -462,7 +462,7 @@ TEST(ParserCSmoke, TernaryIsRightAssociative) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
     // The OUTER ternary's else child (last visible) is itself a ternaryExpr.
@@ -486,7 +486,7 @@ TEST(ParserCSmoke, TernaryBindsLooserThanAssignmentRhs) {
     auto result = std::move(p).parse();
     auto const& t = result.tree;
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
     const NodeId assign = findFirstNodeWithRule(t, "binaryExpr");
     ASSERT_NE(assign, NodeId{});
     const std::string printed = prettyPrintSubtree(t, assign);
@@ -502,7 +502,7 @@ TEST(ParserCSmoke, TernaryAsCallArgument) {
     auto h = loadAndTokenize("int main() { f(a ? b : c); }");
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
-    EXPECT_FALSE(result.tree.diagnostics().hasErrors());
+    ASSERT_FALSE(result.tree.diagnostics().hasErrors());
     EXPECT_NE(findFirstNodeWithRule(result.tree, "ternaryExpr"), NodeId{});
 }
 
@@ -528,7 +528,7 @@ TEST(ParserCSmoke, FunctionCallParsesAsPostfix) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -557,7 +557,7 @@ TEST(ParserCSmoke, EmptyArgumentCallParsesAsPostfix) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "zero-arg calls must parse cleanly (argList nullable)";
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
@@ -580,7 +580,7 @@ TEST(ParserCSmoke, ArrayIndexParsesAsPostfix) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -609,7 +609,7 @@ TEST(ParserCSmoke, ArrayIndexBodyClimbsPrecedence) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -664,7 +664,7 @@ TEST(ParserCSmoke, PostfixIncParsesAsPostfix) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -686,7 +686,7 @@ TEST(ParserCSmoke, PrefixDerefParsesAsUnary) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -712,7 +712,7 @@ TEST(ParserCSmoke, CompoundAssignmentParsesAsBinaryExpr) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -738,7 +738,7 @@ TEST(ParserCSmoke, ShlCompoundAssignmentRespectsLongestMatch) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "longest-match must prefer <<= over << followed by =";
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
@@ -766,7 +766,7 @@ TEST(ParserCSmoke, CompoundAssignmentIsRightAssociative) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -813,7 +813,7 @@ TEST(ParserCSmoke, ExternFunctionPrototypeParses) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_TRUE(hasInternalNodeWithRule(t, "externDecl"));
 
     const NodeId ext = findFirstNodeWithRule(t, "externDecl");
@@ -873,7 +873,7 @@ TEST(ParserCSmoke, ExternFunctionDefinitionParses) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "`extern int f(void){ return 0; }` must parse as a function definition";
     // ★★ P53 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): this is the ONE
     // `extern` form that CANNOT move to block scope with its siblings above — a
@@ -926,7 +926,7 @@ TEST(ParserCSmoke, ExternAtFileScopeParsesThroughTheMergedRule) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
     const NodeId decl = findFirstNodeWithRule(t, "topLevelDecl");
     ASSERT_NE(decl, NodeId{});
     constexpr std::string_view kExpected =
@@ -974,7 +974,7 @@ TEST(ParserCSmoke, ReversedExternSpecifierOrdersRideOneSpecifierRun) {
                  DiagnosticBudget::libraryDefault()};
         auto result = std::move(p).parse();
         auto const& t = result.tree;
-        EXPECT_FALSE(t.diagnostics().hasErrors()) << src;
+        ASSERT_FALSE(t.diagnostics().hasErrors()) << src;
         EXPECT_TRUE(hasInternalNodeWithRule(t, "topLevelDecl")) << src;
         const NodeId run = findFirstNodeWithRule(t, "declSpecifiers");
         ASSERT_NE(run, NodeId{}) << src;
@@ -1009,7 +1009,7 @@ TEST(ParserCSmoke, ExternImportLibraryOverrideParses) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "the import-library override form must still parse";
     ASSERT_TRUE(hasInternalNodeWithRule(t, "externDecl"));
     // The stringLiteralExpr is a DIRECT child of externDecl (not nested in the
@@ -1038,7 +1038,7 @@ TEST(ParserCSmoke, ExternMultiDeclaratorParses) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "`extern int a, b;` must parse with no diagnostics";
     ASSERT_TRUE(hasInternalNodeWithRule(t, "externDecl"));
     const NodeId ext = findFirstNodeWithRule(t, "externDecl");
@@ -1076,7 +1076,7 @@ TEST(ParserCSmoke, ExternMultiDeclaratorPerDeclaratorPointerParses) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
     const NodeId list = findFirstNodeWithRule(t, "initDeclaratorList");
     ASSERT_NE(list, NodeId{});
     // Exactly ONE pointerLayer in the whole declaration (a's star), not two.
@@ -1101,7 +1101,7 @@ TEST(ParserCSmoke, ExternVariableDeclParses) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_TRUE(hasInternalNodeWithRule(t, "externDecl"));
 }
 
@@ -1134,7 +1134,7 @@ TEST(ParserCSmoke, ExternTypedefNameTrailingQualifierParses) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "`extern LONG volatile d;` (typedef-name + trailing qualifier) must parse";
     const NodeId ext = findFirstNodeWithRule(t, "externDecl");
     ASSERT_NE(ext, NodeId{});
@@ -1169,7 +1169,7 @@ TEST(ParserCSmoke, ExternBuiltinTrailingQualifierParses) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "`extern int volatile d;` (builtin base + trailing qualifier) must parse";
     const NodeId head = findFirstNodeWithRule(t, "typeRefAllowingStruct");
     ASSERT_NE(head, NodeId{});
@@ -1196,7 +1196,7 @@ TEST(ParserCSmoke, ExternTrailingQualifierRunParses) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "`extern LONG const volatile cv;` (trailing qualifier run) must parse";
     const NodeId head = findFirstNodeWithRule(t, "typeRefAllowingStruct");
     ASSERT_NE(head, NodeId{});
@@ -1222,7 +1222,7 @@ TEST(ParserCSmoke, StructMemberTrailingQualifierParses) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "`struct S { int volatile x; };` (member trailing qualifier) must parse";
     const NodeId head = findFirstNodeWithRule(t, "typeRefAllowingStruct");
     ASSERT_NE(head, NodeId{});
@@ -1274,7 +1274,7 @@ TEST(ParserCSmoke, TopLevelArrayDeclParses) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId tl = findFirstNodeWithRule(t, "topLevel");
     ASSERT_NE(tl, NodeId{});
@@ -1321,7 +1321,7 @@ TEST(ParserCSmoke, EmptyArrayDeclSuffixParses) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId suffix = findFirstNodeWithRule(t, "arrayDeclSuffix");
     ASSERT_NE(suffix, NodeId{});
@@ -1339,7 +1339,7 @@ TEST(ParserCSmoke, InnerArrayDeclParses) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId head = findFirstNodeWithRule(t, "varDecl");
     ASSERT_NE(head, NodeId{});
@@ -1386,7 +1386,7 @@ TEST(ParserCSmoke, ArrayDeclWithInitializerExpressionParses) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId suffix = findFirstNodeWithRule(t, "arrayDeclSuffix");
     ASSERT_NE(suffix, NodeId{});
@@ -1414,7 +1414,7 @@ TEST(ParserCSmoke, PostfixChainNestsLeftToRight) {
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -1452,7 +1452,7 @@ TEST(ParserCSmoke, PostfixCallThenInfixBindsCorrectly) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     // Pin the binaryExpr's full subtree shape. A regression where the
     // two postfix wraps end up as siblings of the binaryExpr (rather
@@ -1492,7 +1492,7 @@ TEST(ParserCSmoke, ThreeDeepArrayIndexChainNests) {
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -1529,7 +1529,7 @@ TEST(ParserCSmoke, FunctionCallChainNests) {
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -1562,7 +1562,7 @@ TEST(ParserCSmoke, ParenWrappedPostfixChainNests) {
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     // The outer `expression` contains an `operand` whose body is the
     // named `parenExpr` rule (extracted from the prior anonymous
@@ -1627,7 +1627,7 @@ TEST(ParserCSmoke, PrefixOverPostfixChainNests) {
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto result = std::move(p).parse();
     auto const& t = result.tree;
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     // Tree: expression → unaryExpr[*, postfixExpr[postfixExpr[p, [, i, ]], ++]]
     const NodeId expr = findFirstNodeWithRule(t, "expression");
@@ -1660,7 +1660,7 @@ TEST(ParserCSmoke, ParenGroupingForcesOuterPrecedence) {
     auto const& t = result.tree;
 
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
 
     const NodeId expr = findFirstNodeWithRule(t, "expression");
     ASSERT_NE(expr, NodeId{});
@@ -1701,7 +1701,7 @@ TEST(ParserCSmoke, CharLiteralParsesAsOperand) {
                   DiagnosticBudget::libraryDefault()};
     auto const result = std::move(parser).parse();
     auto const& tree = result.tree;
-    EXPECT_FALSE(tree.diagnostics().hasErrors())
+    ASSERT_FALSE(tree.diagnostics().hasErrors())
         << "c failed to parse CharLiteral cleanly";
     // The body-mode emits a CharLiteral schema-token inside the
     // `'a'` span; verify the token kind appears in the leaf stream.
@@ -1738,7 +1738,7 @@ TEST(ParserCSmoke, TypedefNameStarCommitsDeclarationStatement) {
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto const result = std::move(p).parse();
     auto const& t = result.tree;
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_TRUE(hasInternalNodeWithRule(t, "identVarDecl"))
         << "MyP * p; must parse as a DECLARATION statement";
 }
@@ -1751,7 +1751,7 @@ TEST(ParserCSmoke, ValueStarValueRollsBackToExpression) {
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto const result = std::move(p).parse();
     auto const& t = result.tree;
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_FALSE(hasInternalNodeWithRule(t, "identVarDecl"))
         << "a * b; with VALUE operands must stay an expression statement";
     EXPECT_TRUE(hasInternalNodeWithRule(t, "binaryExpr"))
@@ -1769,7 +1769,7 @@ TEST(ParserCSmoke, UnknownStarUnknownRollsBackToExpression) {
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto const result = std::move(p).parse();
     auto const& t = result.tree;
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_FALSE(hasInternalNodeWithRule(t, "identVarDecl"))
         << "unknown-led `u * v;` must stay an expression statement";
 }
@@ -1789,7 +1789,7 @@ TEST(ParserCSmoke, AutoInferenceFormParsesIntoInferenceRule) {
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto const result = std::move(p).parse();
     auto const& t = result.tree;
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "C23 `auto x = 1;` must parse (D-CSUBSET-AUTO-TYPE-INFERENCE)";
     EXPECT_TRUE(hasInternalNodeWithRule(t, "autoInferredVarDecl"))
         << "the statement must parse into the HEAD-LESS inference rule";
@@ -1807,7 +1807,7 @@ TEST(ParserCSmoke, AutoWithTypeHeadStaysVarDecl) {
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto const result = std::move(p).parse();
     auto const& t = result.tree;
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "C89 `auto int x;` must keep parsing";
     EXPECT_TRUE(hasInternalNodeWithRule(t, "varDecl"))
         << "the real-typed form must take the committed varDecl reading";
@@ -1840,7 +1840,7 @@ TEST(ParserCSmoke, LongInitializerRidesTheStatementProbeBudget) {
     Parser p{h.src, h.schema, std::move(h.stream), DiagnosticBudget::libraryDefault()};
     auto const result = std::move(p).parse();
     auto const& t = result.tree;
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "a 600-argument initializer (~1205 tokens, past the 1024-token "
            "operand budget) must parse clean under the 4096-token "
            "statement probe budget";
@@ -2253,7 +2253,7 @@ constexpr std::size_t kTokensPerStringPiece = 3;
 TEST(ParserCSmoke, SingleStringLiteralHasOneTokenTriple) {
     Tree t = parseC("int main() { \"x\"; }");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
     NodeId const sle = findFirstNodeWithRule(t, "stringLiteralExpr");
     ASSERT_TRUE(sle.valid()) << "a lone string must still form a stringLiteralExpr";
     EXPECT_EQ(visibleTokenChildCount(t, sle), 1 * kTokensPerStringPiece)
@@ -2269,7 +2269,7 @@ TEST(ParserCSmoke, SingleStringLiteralHasOneTokenTriple) {
 TEST(ParserCSmoke, TwoAdjacentStringsHaveTwoTokenTriples) {
     Tree t = parseC("int main() { \"a\" \"b\"; }");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
     NodeId const sle = findFirstNodeWithRule(t, "stringLiteralExpr");
     ASSERT_TRUE(sle.valid());
     EXPECT_EQ(visibleTokenChildCount(t, sle), 2 * kTokensPerStringPiece)
@@ -2296,7 +2296,7 @@ TEST(ParserCSmoke, TwoAdjacentStringsHaveTwoTokenTriples) {
 TEST(ParserCSmoke, ThreeAdjacentStringsHaveThreeTokenTriples) {
     Tree t = parseC("int main() { \"a\" \"b\" \"c\"; }");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
     NodeId const sle = findFirstNodeWithRule(t, "stringLiteralExpr");
     ASSERT_TRUE(sle.valid());
     EXPECT_EQ(visibleTokenChildCount(t, sle), 3 * kTokensPerStringPiece)
@@ -2314,7 +2314,7 @@ TEST(ParserCSmoke, ThreeAdjacentStringsHaveThreeTokenTriples) {
 TEST(ParserCSmoke, CharLiteralHasOpenerBodyCloserChildren) {
     Tree t = parseC("int main() { 'c'; }");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
     NodeId const cle = findFirstNodeWithRule(t, "charLiteralExpr");
     ASSERT_TRUE(cle.valid()) << "a char constant must form a charLiteralExpr";
     EXPECT_EQ(visibleTokenChildCount(t, cle), 3u)
@@ -2337,7 +2337,7 @@ TEST(ParserCSmoke, CharLiteralHasOpenerBodyCloserChildren) {
 TEST(ParserCSmoke, StatementVarDeclRidesTheDeclOrAttrStmtWrapper) {
     Tree t = parseC("int main() { int x; return x; }");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
     NodeId const wrapper = findFirstNodeWithRule(t, "declOrAttrStmt");
     ASSERT_TRUE(wrapper.valid())
         << "a local declaration statement must ride the declOrAttrStmt wrapper";
@@ -2360,7 +2360,7 @@ TEST(ParserCSmoke, FallthroughStatementParsesAsAttributeDeclaration) {
         "int main() { int x = 1; switch (x) { case 1: x = 2; [[fallthrough]]; "
         "case 2: x = 3; break; } return x; }");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "[[fallthrough]]; must parse as a statement";
     NodeId const attrStmt = findFirstNodeWithRule(t, "attributeDeclaration");
     ASSERT_TRUE(attrStmt.valid());
@@ -2377,7 +2377,7 @@ TEST(ParserCSmoke, FallthroughStatementParsesAsAttributeDeclaration) {
 TEST(ParserCSmoke, AttributedLocalDeclCommitsVarDeclBranch) {
     Tree t = parseC("int main() { [[maybe_unused]] int x = 5; return 0; }");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors());
+    ASSERT_FALSE(t.diagnostics().hasErrors());
     EXPECT_TRUE(hasInternalNodeWithRule(t, "varDecl"))
         << "the attributed declaration must commit the varDecl reading";
     EXPECT_FALSE(hasInternalNodeWithRule(t, "attributeDeclaration"))
@@ -2430,7 +2430,7 @@ TEST(ParserCSmoke, TypedefTrailingAttributeParsesIntoTheSecondAttrRun) {
         "typedef unsigned long long u_int64_t;\n"
         "typedef u_int64_t       au_asflgs_t __attribute__ ((aligned(8)));\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "bsm/audit.h must parse: " << firstErrorText(t);
 
     // The SECOND typedefDecl is the attributed one.
@@ -2468,7 +2468,7 @@ TEST(ParserCSmoke, TypedefMidAttributeParsesIntoTheFirstAttrRun) {
         "typedef long int64_t;\n"
         "typedef int64_t __attribute__((__aligned__(8))) _OSAtomic_int64_t;\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "libkern/OSAtomicDeprecated.h must parse: " << firstErrorText(t);
 
     NodeId attributed{};
@@ -2503,7 +2503,7 @@ TEST(ParserCSmoke, TypedefMidAttributeParsesIntoTheFirstAttrRun) {
 TEST(ParserCSmoke, TypedefPostKeywordAttributeRidesTheSpecifierPrefix) {
     Tree t = parseC("typedef __attribute__((aligned(16))) long T;\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+    ASSERT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
 
     NodeId const decl = findFirstNodeWithRule(t, "typedefDecl");
     ASSERT_TRUE(decl.valid());
@@ -2513,6 +2513,96 @@ TEST(ParserCSmoke, TypedefPostKeywordAttributeRidesTheSpecifierPrefix) {
     ASSERT_TRUE(prefix.valid());
     EXPECT_EQ(visibleChildRoles(t, prefix), "tok:TypedefKeyword/rule:attrSpec")
         << "the keyword + decoration form the stripped specifier prefix";
+}
+
+// P58 [[D-CSUBSET-ALIGNAS-TYPEDEF-PARAM-PARSE]] — the ISO alignment specifier now
+// rides the SAME post-keyword prefix, so the semantic context ladder reaches it and
+// answers `S_AlignasInvalidContext` instead of the tree dying as a parse error. The
+// STRUCTURAL half of that change is here: admitting a new specifier must not push the
+// role children around, because `typedefDecl`'s `head: 0` / `declarator: 2` are read
+// positionally after the prefix strip.
+// ⚠ `ASSERT_FALSE`, NOT `EXPECT_FALSE`, ON THE PARSE-ERROR GUARD — AND THAT IS A
+// MEASUREMENT, NOT A STYLE CHOICE. Written with `EXPECT_`, this test's own
+// red-on-disable arm (remove `alignasSpec` from `typedefDeclSpecifiers`) did not FAIL,
+// it RAISED: the recovery tree still carries a partial `typedefDecl`, so the next line
+// reached `visibleChildRoles` on a non-Token node and tripped the `Tree::tokenKind on
+// non-Token node` assertion — exit 0xc0000409, the whole binary dead, and every later
+// verdict in this suite lost, including the CONTROLS that prove the mutant was
+// targeted. A disable arm must FAIL, never RAISE.
+// ★ AND THE SAME LATENT HAZARD WAS THEN SWEPT OUT OF THIS WHOLE FILE — see
+// [[D-TEST-AN-EXPECT-ONLY-PARSE-GUARD-RAISES-AND-CANCELS-ITS-SUITES-CONTROLS]],
+// whose closest sibling is
+// [[D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT]] — the same
+// `0xC0000409`, the same lost reporter, the same root cause (a non-fatal assertion
+// where only a fatal one can stop the ONE test that needed stopping).
+// 85 sibling guards were
+// converted for exactly this reason and 12 were deliberately LEFT as `EXPECT_FALSE`,
+// under one stated rule: convert IF AND ONLY IF the guard is followed by TREE-STRUCTURE
+// access (a `findFirstNodeWithRule` / `hasInternalNodeWithRule` / `visibleChildRoles` /
+// `visibleTokenChildKinds` / `visibleTokenChildCount` / `prettyPrintSubtree` call, or a
+// `Tree` member that reads NODES). A guard whose remaining statements only touch
+// DIAGNOSTICS cannot raise, and there the weaker form is correct — every one of the 12
+// left is either the last statement in its scope or followed only by `countCode`, and
+// FIVE of them sit in a per-source `for` loop (verified by reading all twelve, not by a
+// heuristic — a first pass at detecting the loops disagreed with the code in BOTH
+// directions and was discarded) where `ASSERT_` would stop at the first failing source
+// and hide the rest. NONE of the 85 converted guards is inside a loop.
+TEST(ParserCSmoke, TypedefPostKeywordAlignasRidesTheSpecifierPrefix) {
+    Tree t = parseC("typedef alignas(16) long T;\n");
+    ASSERT_NE(t.root(), InvalidNode);
+    ASSERT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+
+    NodeId const decl = findFirstNodeWithRule(t, "typedefDecl");
+    ASSERT_TRUE(decl.valid());
+    EXPECT_EQ(visibleChildRoles(t, decl), kCanonicalTypedefRoles)
+        << "a post-keyword alignas must not shift head:0 / declarator:2";
+    NodeId const prefix = findFirstNodeWithRule(t, "typedefDeclSpecifiers");
+    ASSERT_TRUE(prefix.valid());
+    EXPECT_EQ(visibleChildRoles(t, prefix), "tok:TypedefKeyword/rule:alignasSpec")
+        << "the keyword + specifier form the stripped specifier prefix, so the "
+           "semantic tier sees the alignas at all";
+}
+
+// P58 — THE PARAMETER POSITION. `paramDeclSpecifier` gains `alignasSpec`, and the run
+// is the row's declared `specifierPrefix`, so the specifier is STRIPPED before
+// positional counting: `param` is read as head:0 / declarator:1 and a child in front
+// of the head would otherwise silently BECOME the head.
+TEST(ParserCSmoke, ParameterAlignasRidesTheParameterSpecifierPrefix) {
+    Tree t = parseC("void f(alignas(16) int p) { (void)p; }\n");
+    ASSERT_NE(t.root(), InvalidNode);
+    // ASSERT_, for the reason the typedef pin above records: a disable arm must FAIL,
+    // never RAISE.
+    ASSERT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+
+    // The alignas is the ONLY specifier this parameter carries, so a
+    // `paramDeclSpecifiers` node exists here IF AND ONLY IF the specifier landed in
+    // the prefix. Parsed as anything else — a stray child in front of the head, which
+    // is the failure mode that silently makes the decoration BECOME the head — and
+    // this node would not be in the tree at all.
+    NodeId const prefix = findFirstNodeWithRule(t, "paramDeclSpecifiers");
+    ASSERT_TRUE(prefix.valid())
+        << "the alignas must land in the parameter's specifier prefix, not loose in "
+           "the parameter's child list";
+    NodeId const spec = findFirstNodeWithRule(t, "alignasSpec");
+    ASSERT_TRUE(spec.valid());
+}
+
+// ⚠ NAMED LOUD RESIDUE, PINNED SO IT CANNOT DRIFT INTO SILENCE. The specifier is
+// admitted only AFTER the `typedef` keyword; the LEADING position stays a parse error.
+// ✔MEASURED 2026-09-03: gcc 13.3.0 and clang 18.1.3 refuse `alignas(16) typedef int
+// T;` too, but MSVC 19.51 ACCEPTS `_Alignas(16) typedef int T;` and HONORS it
+// (`__alignof(T)` discriminates 16 from 4) — its spelling of `__declspec(align(16))
+// typedef`. So DSS refuses something one reference compiles, deliberately: a typedef
+// interns to the SAME TypeId as its aliasee, so DSS cannot REPRESENT an over-aligned
+// alias, and admitting the form would be accept-and-silently-drop. That is the same
+// position `semantic_analyzer.cpp`'s GNU `aligned` sink already holds for an
+// over-aligned typedef. If a later cycle teaches the interner to carry an alias-local
+// alignment, THIS pin is the place that says the refusal was a choice, not a gap.
+TEST(ParserCSmoke, LeadingAlignasBeforeTypedefStaysALoudRefusal) {
+    Tree t = parseC("alignas(16) typedef int T;\n");
+    EXPECT_TRUE(t.diagnostics().hasErrors())
+        << "silently accepting this would drop the alignment the only accepting "
+           "reference (MSVC) actually applies";
 }
 
 // GAP 2 — `attrArgItem` accepts a `key = value` argument. Real SDK witness
@@ -2525,7 +2615,7 @@ TEST(ParserCSmoke, AttributeArgumentAcceptsKeyEqualsValue) {
         "int f(void) __attribute__((__availability__(swift, unavailable, "
         "message=\"unavailable in Swift\")));\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "sys/cdefs.h must parse: " << firstErrorText(t);
 
     // Exactly one of the three arg items carries the `=` tail, and its shape is
@@ -2653,7 +2743,7 @@ constexpr std::string_view kDecoratedMemberRoles =
 TEST(ParserCSmoke, UndecoratedStructMemberKeepsItsChildLayout) {
     Tree t = parseC("struct S { int x; };\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+    ASSERT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
     NodeId const field = findFirstNodeWithRule(t, "structField");
     ASSERT_TRUE(field.valid());
     EXPECT_EQ(visibleChildRoles(t, field), kUndecoratedMemberRoles)
@@ -2667,7 +2757,7 @@ TEST(ParserCSmoke, UndecoratedStructMemberKeepsItsChildLayout) {
 TEST(ParserCSmoke, StructMemberAttributeParsesIntoTheMemberAttrList) {
     Tree t = parseC("struct S { int x __attribute__((aligned(8))); };\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "a member decoration must parse: " << firstErrorText(t);
 
     NodeId const field = findFirstNodeWithRule(t, "structField");
@@ -2694,7 +2784,7 @@ TEST(ParserCSmoke, UnionMemberAttributeParsesIntoTheMemberAttrList) {
     Tree t = parseC(
         "union U { int x __attribute__((aligned(8))); char c; };\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "a union member decoration must parse: " << firstErrorText(t);
     NodeId const field = findFirstNodeWithRule(t, "unionField");
     ASSERT_TRUE(field.valid());
@@ -2709,7 +2799,7 @@ TEST(ParserCSmoke, UnionMemberAttributeParsesIntoTheMemberAttrList) {
 TEST(ParserCSmoke, MemberAttrListDoesNotDisturbBitfieldMembers) {
     Tree t = parseC("struct S { int a : 3, b : 5; int : 0; };\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+    ASSERT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
     EXPECT_FALSE(hasInternalNodeWithRule(t, "structMemberAttrList"))
         << "no decoration is present, so the optional run must emit NOTHING";
     EXPECT_TRUE(hasInternalNodeWithRule(t, "bitfieldDeclSuffix"));
@@ -2754,7 +2844,7 @@ TEST(ParserCSmoke, StructMemberLeadingGnuAttributeRidesTheSpecifierPrefix) {
     Tree t = parseC(
         "struct S { __attribute__((__noreturn__)) void (*p)(int); };\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "the Tcl 9 TclStubs member shape must parse: " << firstErrorText(t);
 
     NodeId const field = findFirstNodeWithRule(t, "structField");
@@ -2785,7 +2875,7 @@ TEST(ParserCSmoke, UnionMemberLeadingGnuAttributeMirrorsStruct) {
     Tree t = parseC(
         "union U { __attribute__((__noreturn__)) void (*p)(int); int x; };\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "unionField shares the member prefix rule: " << firstErrorText(t);
     NodeId const field = findFirstNodeWithRule(t, "unionField");
     ASSERT_TRUE(field.valid());
@@ -2801,7 +2891,7 @@ TEST(ParserCSmoke, UnionMemberLeadingGnuAttributeMirrorsStruct) {
 TEST(ParserCSmoke, StructMemberLeadingAlignasStillRidesTheSamePrefix) {
     Tree t = parseC("struct S { alignas(16) int a; };\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+    ASSERT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
     NodeId const prefix = findFirstNodeWithRule(t, "structMemberDeclSpecifiers");
     ASSERT_TRUE(prefix.valid());
     EXPECT_EQ(visibleChildRoles(t, prefix), "rule:structMemberDeclSpecifier");
@@ -2818,7 +2908,7 @@ TEST(ParserCSmoke, MemberLeadingAndTrailingAttributeSlotsCoexist) {
     Tree t = parseC(
         "struct S { __attribute__((aligned(8))) int x __attribute__((aligned(16))); };\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+    ASSERT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
     NodeId const field = findFirstNodeWithRule(t, "structField");
     ASSERT_TRUE(field.valid());
     EXPECT_EQ(visibleChildRoles(t, field),
@@ -2834,7 +2924,7 @@ TEST(ParserCSmoke, MemberLeadingAndTrailingAttributeSlotsCoexist) {
 TEST(ParserCSmoke, UndecoratedMemberEmitsNoLeadingSpecifierPrefix) {
     Tree t = parseC("struct S { int x; };\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+    ASSERT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
     EXPECT_FALSE(hasInternalNodeWithRule(t, "structMemberDeclSpecifiers"))
         << "no leading specifier is present, so the optional must emit NOTHING";
 }
@@ -2865,7 +2955,7 @@ TEST(ParserCSmoke, LeadingStdAttributeOnAMemberFailsLoud) {
 TEST(ParserCSmoke, StdAttributeAcceptsANonStringArgument) {
     Tree t = parseC("typedef long ALT [[gnu::aligned(8)]];\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "[[gnu::aligned(8)]] must parse: " << firstErrorText(t);
 
     NodeId const item = findFirstNodeWithRule(t, "stdAttrItem");
@@ -2892,7 +2982,7 @@ TEST(ParserCSmoke, StdAttributeAcceptsALeadingNonStringArgument) {
 TEST(ParserCSmoke, StdAttributeStringArgumentSurvivesTheAttrArgsReshape) {
     Tree t = parseC("[[deprecated(\"use g\")]] int old_g;\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+    ASSERT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
 
     NodeId const item = findFirstNodeWithRule(t, "stdAttrItem");
     ASSERT_TRUE(item.valid());
@@ -2923,7 +3013,7 @@ TEST(ParserCSmoke, StdAttributeStringArgumentSurvivesTheAttrArgsReshape) {
 TEST(ParserCSmoke, FileScopeGnuAlignedParsesCleanly) {
     Tree t = parseC("__attribute__((aligned(8))) int gv;\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+    ASSERT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
     EXPECT_TRUE(hasInternalNodeWithRule(t, "attrSpec"));
 }
 
@@ -2955,7 +3045,7 @@ constexpr std::string_view kTaggedStructRoles =
 TEST(ParserCSmoke, AfterKeywordCompositeAttributeParsesIntoTheLeadSlot) {
     Tree t = parseC("struct __attribute__((aligned(16))) T { int x; };\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "mach-o/dyld_images.h must parse: " << firstErrorText(t);
 
     NodeId const spec = findFirstNodeWithRule(t, "structSpec");
@@ -2981,7 +3071,7 @@ TEST(ParserCSmoke, AfterKeywordCompositeAttributeParsesIntoTheLeadSlot) {
 TEST(ParserCSmoke, UndecoratedStructEmitsTheSameLeadSlotNode) {
     Tree t = parseC("struct T { int x; };\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+    ASSERT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
     NodeId const spec = findFirstNodeWithRule(t, "structSpec");
     ASSERT_TRUE(spec.valid());
     EXPECT_EQ(visibleChildRoles(t, spec), kTaggedStructRoles)
@@ -3000,7 +3090,7 @@ TEST(ParserCSmoke, AnonymousStructWithLeadAttributeKeepsBodyAtNameIndex) {
     Tree t = parseC(
         "struct __attribute__((aligned(16))) { int x; } v;\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+    ASSERT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
     NodeId const spec = findFirstNodeWithRule(t, "structSpec");
     ASSERT_TRUE(spec.valid());
     EXPECT_EQ(visibleChildRoles(t, spec),
@@ -3011,7 +3101,7 @@ TEST(ParserCSmoke, AnonymousStructWithLeadAttributeKeepsBodyAtNameIndex) {
 TEST(ParserCSmoke, AfterKeywordUnionAttributeParsesIntoTheLeadSlot) {
     Tree t = parseC("union __attribute__((aligned(16))) U { int x; };\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors())
+    ASSERT_FALSE(t.diagnostics().hasErrors())
         << "unionSpec mirrors structSpec: " << firstErrorText(t);
     NodeId const spec = findFirstNodeWithRule(t, "unionSpec");
     ASSERT_TRUE(spec.valid());
@@ -3027,7 +3117,7 @@ TEST(ParserCSmoke, TrailingCompositeAlignedOnAnonymousStructTypedefParses) {
     Tree t = parseC(
         "typedef struct { int x; } __attribute__((aligned(16))) T2;\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+    ASSERT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
     NodeId const spec = findFirstNodeWithRule(t, "structSpec");
     ASSERT_TRUE(spec.valid());
     EXPECT_EQ(visibleChildRoles(t, spec),
@@ -3043,7 +3133,7 @@ TEST(ParserCSmoke, TrailingCompositeAlignedOnAnonymousStructTypedefParses) {
 TEST(ParserCSmoke, TagReferenceKeepsItsShapeWithTheLeadSlot) {
     Tree t = parseC("struct S; struct S *p;\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
+    ASSERT_FALSE(t.diagnostics().hasErrors()) << firstErrorText(t);
     NodeId const spec = findFirstNodeWithRule(t, "structSpec");
     ASSERT_TRUE(spec.valid());
     EXPECT_EQ(visibleChildRoles(t, spec),
@@ -3242,7 +3332,7 @@ TEST(ParserCSmoke, NoreturnKeywordInParameterSpecifiersParses) {
              "void g(_Noreturn __attribute__((unused)) int p);\n"}) {
         Tree t = parseC(src);
         ASSERT_NE(t.root(), InvalidNode) << src;
-        EXPECT_FALSE(t.diagnostics().hasErrors())
+        ASSERT_FALSE(t.diagnostics().hasErrors())
             << src << " must parse (gcc accepts it): " << firstErrorText(t);
     }
 
@@ -3287,7 +3377,7 @@ TEST(ParserCSmoke, NoreturnKeywordInTypedefHeadParses) {
              "typedef _Noreturn __attribute__((aligned(16))) long T;\n"}) {
         Tree t = parseC(src);
         ASSERT_NE(t.root(), InvalidNode) << src;
-        EXPECT_FALSE(t.diagnostics().hasErrors())
+        ASSERT_FALSE(t.diagnostics().hasErrors())
             << src << " must parse (gcc accepts it): " << firstErrorText(t);
     }
 

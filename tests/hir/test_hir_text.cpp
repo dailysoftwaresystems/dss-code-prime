@@ -905,6 +905,113 @@ TEST(HirText, PackedFlagRoundTrip) {
     expectRoundTrip(hir, ctx);   // emit→parse→emit byte-identical
 }
 
+// D-CSUBSET-PER-MEMBER-PACKED: the PER-FIELD packed marker round-trips. A struct with
+// ONE packed member emits ` packed` after THAT member's type and re-parses with the
+// flag on that member alone. ★ Without this the flag would cross the text boundary
+// ABSENT, and the loss is invisible to every size check: MEASURED (gcc 13.3.0 + clang
+// 18.1.3, x86_64 and aarch64), `{char a; int z <pk>; double d;}` and the undecorated
+// struct are BOTH sizeof 16 / _Alignof 8 — only z's offset differs, 1 vs 4.
+TEST(HirText, PerFieldPackedMarkerRoundTrips) {
+    TypeInterner in{CompilationUnitId{1}};
+    std::array<TypeId, 3> const fields{in.primitive(TypeKind::Char),
+                                       in.primitive(TypeKind::I32),
+                                       in.primitive(TypeKind::F64)};
+    std::array<std::int64_t, 0>  const noWidths{};
+    std::array<std::uint64_t, 0> const noOffs{};
+    std::array<std::uint32_t, 0> const noAligns{};
+    std::array<std::uint8_t, 3>  const flags{0, 1, 0};
+    TypeId const s = in.forwardComposite(TypeKind::Struct, "S", /*declSiteKey=*/77);
+    in.completeComposite(s, fields, /*packed=*/false, noWidths, noOffs, noAligns,
+                         /*explicitAlign=*/0, /*maxFieldAlign=*/0, flags);
+    TypeId const ptrS   = in.pointer(s);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::array<TypeId, 1> const params{ptrS};
+    TypeId const sig = in.fnSig(params, voidTy, CallConv::CcSysV);
+
+    HirBuilder b{"toy"};
+    HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{});
+    HirNodeId const fn   = b.makeFunction(sig, /*symbol=*/1, {}, body);
+    HirNodeId const root = b.makeModule(std::vector<HirNodeId>{fn});
+    Hir hir = std::move(b).finish(root);
+
+    std::vector<std::string> names{"", "main"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    DiagnosticReporter r;
+    std::string const text = emitHir(hir, ctx, r);
+    // The marker sits on the MEMBER, not after the struct name — a whole-composite
+    // packed would emit `struct "S" packed {`, which is a different layout.
+    EXPECT_EQ(text.find("struct \"S\" packed"), std::string::npos) << text;
+    EXPECT_NE(text.find("i32 packed"), std::string::npos) << text;
+    expectRoundTrip(hir, ctx);   // emit -> parse -> emit byte-identical
+}
+
+// D-CSUBSET-PER-MEMBER-PACKED: the codec's PARSE direction, plus the identity fork.
+// `struct "S" { i32 packed }` and `struct "S" packed { i32 }` are DIFFERENT layouts
+// and must never collapse onto one TypeId (they use distinct forward key spaces).
+TEST(ParseTypeFromText, PerFieldPackedParseAndForkIdentity) {
+    TypeInterner interner{CompilationUnitId{15}};
+    TypeRegistry reg;
+    DiagnosticReporter rep;
+
+    TypeId const perField = parseTypeFromText(
+        "struct \"S\" { i8, i32 packed }", interner, reg, rep);
+    ASSERT_TRUE(perField.valid());
+    EXPECT_EQ(interner.kind(perField), TypeKind::Struct);
+    EXPECT_FALSE(interner.isPacked(perField));
+    EXPECT_TRUE(interner.hasFieldPacked(perField));
+    EXPECT_FALSE(interner.isFieldPacked(perField, 0));
+    EXPECT_TRUE(interner.isFieldPacked(perField, 1));
+
+    // Canonical: the same text parses to the same TypeId.
+    TypeId const again = parseTypeFromText(
+        "struct \"S\" { i8, i32 packed }", interner, reg, rep);
+    EXPECT_EQ(perField, again);
+
+    // FORK: the whole-composite spelling of the same fields is a DISTINCT type.
+    TypeId const whole = parseTypeFromText(
+        "struct \"S\" packed { i8, i32 }", interner, reg, rep);
+    ASSERT_TRUE(whole.valid());
+    EXPECT_NE(perField, whole);
+    EXPECT_TRUE(interner.isPacked(whole));
+    EXPECT_FALSE(interner.hasFieldPacked(whole));
+
+    // FORK: the undecorated spelling is a THIRD distinct type.
+    TypeId const plain = parseTypeFromText(
+        "struct \"S\" { i8, i32 }", interner, reg, rep);
+    ASSERT_TRUE(plain.valid());
+    EXPECT_NE(perField, plain);
+    EXPECT_NE(whole, plain);
+    EXPECT_FALSE(interner.hasFieldPacked(plain));
+
+    // A per-field packed COMBINES with a member alignas marker, in that order.
+    TypeId const both = parseTypeFromText(
+        "struct \"P\" { i8 ~1, i32 ~2 packed }", interner, reg, rep);
+    ASSERT_TRUE(both.valid());
+    EXPECT_TRUE(interner.hasExplicitAligns(both));
+    EXPECT_TRUE(interner.hasFieldPacked(both));
+    EXPECT_EQ(interner.explicitFieldAlign(both, 1), 2u);
+    EXPECT_TRUE(interner.isFieldPacked(both, 1));
+
+    // A UNION member carries it too, and forks from the whole-composite spelling.
+    TypeId const uPerField = parseTypeFromText(
+        "union \"U\" { i8, i32 packed }", interner, reg, rep);
+    ASSERT_TRUE(uPerField.valid());
+    EXPECT_EQ(interner.kind(uPerField), TypeKind::Union);
+    EXPECT_FALSE(interner.isPacked(uPerField));
+    EXPECT_TRUE(interner.isFieldPacked(uPerField, 1));
+    TypeId const uWhole = parseTypeFromText(
+        "union \"U\" packed { i8, i32 }", interner, reg, rep);
+    EXPECT_NE(uPerField, uWhole);
+
+    // FAIL LOUD: a packed field cannot also carry an explicit offset — the interner
+    // ABORTS on that pair, so the text layer must refuse it with a diagnostic first.
+    DiagnosticReporter repBad;
+    TypeId const bad = parseTypeFromText(
+        "struct \"B\" { i8 @0, i32 @4 packed }", interner, reg, repBad);
+    EXPECT_FALSE(bad.valid());
+    EXPECT_GE(repBad.errorCount(), 1u);
+}
+
 // c107: the offset syntax ROUND-TRIPS through emit (a struct-returning fn signature
 // carries the struct text). emit → parse → emit is byte-identical, and the emitted
 // text spells `@4` — so a HIR text round-trip (verify-on-load / reintern) preserves

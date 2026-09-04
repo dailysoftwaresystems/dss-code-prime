@@ -5420,6 +5420,28 @@ struct AttributeSemanticsFacts {
     // node on the declaration by `mergeFrom`, so `((constructor(101),
     // destructor(102)))` and the two-clause spelling reach the same state.
     StaticInitSchedule staticInit{};
+    // D-CSUBSET-PER-MEMBER-PACKED: the PackField row matched — GNU `packed` written
+    // on ONE struct/union member-declarator, which lowers THAT member's baseline
+    // alignment to 1 and leaves its siblings, and the aggregate's own alignment,
+    // alone. A pure marker like `noInline`: no argument, no message, no fold.
+    //
+    // ★ IT IS THE EXACT INVERSE OF `alignment` BELOW, and they meet at the layout
+    // engine's ONE clamp rather than fighting: this sets the field's baseline to 1,
+    // `alignment` then RAISES from that baseline under MAX — which is why
+    // `__attribute__((packed, aligned(2)))` on an `int` comes out at 2 and not at
+    // the type's natural 4 (✔MEASURED, gcc 13.3.0 + clang 18.1.3, x86_64 AND
+    // aarch64 AND big-endian s390x).
+    //
+    // ⚠ INERT WHEREVER NO COMPOSITE GATHERS IT. The flag reaches this struct for a
+    // file- or block-scope object, a function and a typedef too; only the composite
+    // Pass-1 completion reads it, so those land nowhere. That is the reference
+    // behaviour: gcc warns `'packed' attribute ignored [-Wattributes]` there,
+    // clang is silent, and BOTH emit identical bytes (✔MEASURED, incl. `_Alignof`
+    // of a packed typedef's type unchanged at 4). The four-kind `appliesTo`
+    // vocabulary cannot separate a struct MEMBER from an object — both are
+    // `variable` — so the member-only-ness lives in the SINK, the only place that
+    // can express it.
+    bool packField = false;
     // TF-C73 (GNU `aligned(N)`): the Align row's requested alignment, MAX-folded
     // over every clause per C 6.7.5p6 ("the strictest — the largest — wins"),
     // exactly as `resolveAlignasOverride` folds several `alignas` specifiers.
@@ -6185,6 +6207,26 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                 out.staticInit.mergeFrom(one);
                 break;
             }
+            case AttributeEffect::PackField:
+                // D-CSUBSET-PER-MEMBER-PACKED: a pure marker — no argument, no
+                // message, no MAX-fold — exactly like the three arms above. Read
+                // by the composite Pass-1 completion, which gathers one flag per
+                // field into the interner's `fieldPacked` channel; `computeLayout`
+                // then feeds it to the SAME `clampedBaselineAlign` the
+                // whole-composite `packed` and `#pragma pack(N)` already meet at.
+                //
+                // ★ THIS ARM IS WHY THE NAME LEFT THE `none` ROW. `none` asserts
+                // "KNOWN vocabulary, consumed elsewhere or deliberately inert",
+                // and for `packed` the "elsewhere" is `scanCompositePacked` — TRUE
+                // at the composite position and FALSE at the member position,
+                // which has PARSED since TF-C73 and been dropped in SILENCE ever
+                // since. ✔MEASURED before this arm existed, through the shipped
+                // CLI: `struct { char a; int z __attribute__((packed)); double d; }`
+                // compiled rc 0 with ZERO diagnostics and put `z` at offset 4,
+                // where gcc 13.3.0 and clang 18.1.3 both put it at 1 — same
+                // sizeof, same _Alignof, wrong bytes.
+                out.packField = true;
+                break;
             case AttributeEffect::None:
                 break;   // known vocabulary, consumed elsewhere / inert
         }
@@ -11187,25 +11229,77 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 "function are contradictory directives";
                             s.reporter.report(std::move(d));
                         }
-                        // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): a VARIABLE's alignas.
+                        // C11/C23 6.7.6 (D-CSUBSET-ALIGNAS): a VARIABLE's alignas.
                         // Only for a NON-field declaration (`!bitfieldSuffix` — a
-                        // field is handled above); a PARAMETER never reaches here with
-                        // an alignas because the param grammar admits no `alignasSpec`
-                        // at all. ⚠ THE OTHER HALF OF THIS SENTENCE WAS RETIRED BY P32
-                        // ([[D-CSUBSET-ATTRIBUTE-PARAM-POSITION]]) AND IS CORRECTED
-                        // RATHER THAN LEFT TO ROT: it used to read "no specifierPrefix
-                        // + no alignasSpec", and the `param` row now DOES declare a
-                        // `specifierPrefix` (its attribute run). Only the alignasSpec
-                        // half was ever load-bearing; the prefix half was incidental
-                        // and is no longer true. 6.7.5p2: an alignas on a FUNCTION (a definition or a
+                        // field is handled above). ⚠ THIS COMMENT HAS NOW BEEN WRONG
+                        // TWICE IN THE SAME PLACE, AND BOTH CORRECTIONS ARE KEPT
+                        // RATHER THAN OVERWRITTEN, because the pattern is the point:
+                        // a sentence about what CANNOT reach a block outlives the
+                        // grammar that made it true, and nothing gates it.
+                        //   * P32 ([[D-CSUBSET-ATTRIBUTE-PARAM-POSITION]]) retired
+                        //     "no specifierPrefix": the `param` row DOES declare one.
+                        //   * P58 ([[D-CSUBSET-ALIGNAS-TYPEDEF-PARAM-PARSE]]) retires
+                        //     "a PARAMETER never reaches here with an alignas because
+                        //     the param grammar admits no `alignasSpec` at all".
+                        //     `paramDeclSpecifier` now admits `alignasSpec`, so a
+                        //     parameter DOES reach this block — deliberately, and it
+                        //     takes the STORE arm, not a diagnostic arm.
+                        // ★★ A PARAMETER IS AN OBJECT HERE, NOT A CONSTRAINT
+                        // VIOLATION, AND THAT IS MEASURED. C11 6.7.5p2 named
+                        // `parameter` in its prohibition list; C23 6.7.6p2 (the
+                        // renumbered clause — C23's 6.7.5 is Function specifiers)
+                        // dropped the word. More decisively, the references SPLIT:
+                        // ✔MEASURED 2026-09-03, each probed SEPARATELY, MSVC 19.51
+                        // ACCEPTS `_Alignas(16)` on a parameter at /std:c11, /std:c17
+                        // and /std:clatest, silent at /W4, and HONORS it — an
+                        // EXECUTED binary has `((uintptr_t)&x) % 16 == 0` at /Od and
+                        // /O2 — while clang 18.1.3 accepts and honors the GNU
+                        // `__attribute__((aligned(16)))` spelling of the same request
+                        // on the same position. gcc 13.3.0 refuses both spellings.
+                        // A split on ACCEPT-vs-REFUSE is governed by the disjunction
+                        // ([[feedback-the-disjunction-decides-acceptance-not-meaning]],
+                        // operator 2026-08-28), so DSS must accept AND honor. It does:
+                        // the parameter's effective DeclarationKind is neither
+                        // Function nor Type, so `badCtx` stays null and the value
+                        // lands in `explicitAlignment` — the SAME slot the GNU
+                        // spelling has used on this position since TF-C73.
+                        // ★★ NEITHER IS A `register` OBJECT
+                        // ([[D-CSUBSET-ALIGNAS-REGISTER-CONTEXT]], P58). ISO C names
+                        // `register` explicitly in 6.7.6p2 and gcc/clang/mingw all
+                        // refuse the ISO spelling — but ✔MEASURED 2026-09-03, MSVC
+                        // 19.51 ACCEPTS `register _Alignas(16) int x;` silently at /W4
+                        // and applies the alignment (`__alignof(x)` discriminates 16
+                        // from 4), AND gcc 13.3.0 and clang 18.1.3 BOTH accept
+                        // `register __attribute__((aligned(16))) int x;` clean at
+                        // -Wall -Wextra. So all three references accept an alignment
+                        // request on a register object in some spelling they
+                        // implement, the disjunction says ACCEPT, and DSS already
+                        // does — `register` is an ignored storage kind in c.lang.json,
+                        // so the object gets a real 16-aligned frame slot (✔MEASURED
+                        // by execution, debug AND release).
+                        // ⛔ DO NOT "TIGHTEN" THIS LADDER BY ADDING A PARAMETER ARM OR
+                        // A `register` ARM. That is the change these two paragraphs
+                        // exist to stop; either would put DSS below the union on a
+                        // program MSVC compiles.
+                        // `SemanticAnalyzerC.AlignasOnAParameterIsAcceptedAndStored`
+                        // and `SemanticAnalyzerC.RegisterAlignasIsAcceptedAndStored`
+                        // turn it red (spelled in full so a grep finds them).
+                        // 6.7.6p2: an alignas on a FUNCTION (a definition or a
                         // prototype — FnSig-typed / function-form declarator) or a
-                        // TYPEDEF (kind Type) is a constraint violation →
-                        // S_AlignasInvalidContext. Otherwise store the validated
+                        // TYPEDEF (kind Type) IS a constraint violation →
+                        // S_AlignasInvalidContext (there the references ARE unanimous:
+                        // gcc, clang, mingw-w64 gcc and MSVC all refuse a typedef's
+                        // alignas — MSVC with C7704). Otherwise store the validated
                         // override on the object's symbol. The validate-and-emit runs
                         // ONCE per declaration (the `alignasHandledForDecl` gate); the
                         // override is stored on THIS declarator's symbol AND every
-                        // following one. Threading the stored value to globals/locals
-                        // codegen is a SEPARATE deferred task (unconsumed for variables).
+                        // following one. ⚠ A THIRD STALE SENTENCE RETIRED HERE: this
+                        // block used to close "Threading the stored value to
+                        // globals/locals codegen is a SEPARATE deferred task
+                        // (unconsumed for variables)". [[D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN]]
+                        // CLOSED 2026-07-07 and the value IS consumed — ✔MEASURED by
+                        // execution, an `alignas(16)` local's address is 16-aligned in
+                        // debug and release alike.
                         if (!decl.bitfieldSuffix.has_value() && declAlignasSpec.valid()) {
                             // TF-C93: reads the ONE extracted predicate. `eff ==
                             // Function` is exactly the former `isFnSig ||
@@ -11252,6 +11346,41 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // into the `fieldAligns` span). One slot, one layout rule; the
                         // two spellings cannot disagree about what a field's alignment
                         // is, because they write the same field.
+                        // ★★ D-CSUBSET-PER-MEMBER-PACKED: the INVERSE spelling's sink,
+                        // deliberately placed beside `aligned`'s because the two write
+                        // the same field's layout from opposite directions and must not
+                        // drift apart. `attrFacts` is the PER-DECLARATOR copy, and that
+                        // is load-bearing rather than incidental — it is what makes BOTH
+                        // member-attribute positions come out right with no extra work:
+                        //   • the SPECIFIER-PREFIX run (`__attribute__((packed)) short
+                        //     p, *q;`) reaches `declAttrFacts`, which this copy starts
+                        //     from, so it packs EVERY declarator;
+                        //   • the AFTER-DECLARATOR run (`short p, *q
+                        //     __attribute__((packed));`) is folded into THIS copy alone
+                        //     by the P56 `declarator`-grain slot, so it packs the LAST
+                        //     declarator and no other.
+                        // ✔MEASURED on a shape built to DISCRIMINATE (the declarators
+                        // differ in pointer-ness, so the cursor before `q` is not
+                        // q-aligned), gcc 13.3.0 x86_64 + aarch64 and clang 18.1.3,
+                        // all identical: the suffix form gives 12/align 2/p@2 q@4 and
+                        // the prefix form 11/align 1/p@1 q@3, against the undecorated
+                        // control's 16/align 8/p@2 q@8.
+                        // ⚠ The obvious fixture for that question, `{char a; int p, q
+                        // <packed>;}`, is VACUOUS — `p` ends on a 4-aligned cursor so
+                        // `q` lands identically either way and `p` fixes the struct
+                        // alignment at 4 regardless; it agrees with the control under
+                        // every hypothesis. Do not re-derive the grain from it.
+                        //
+                        // NO kind gate here, and that is the measured choice: only the
+                        // composite Pass-1 completion READS this flag, so on a
+                        // function, a typedef or a plain object it is inert — which is
+                        // what gcc (warn + ignore) and clang (silent) both do, byte for
+                        // byte. A gate would have to invent a diagnostic no reference
+                        // gives, and `appliesTo`'s four-kind vocabulary cannot separate
+                        // a MEMBER from an OBJECT in any case (both are `variable`).
+                        if (attrFacts.packField) {
+                            s.symbols.at(sym).isPackedField = true;
+                        }
                         if (attrFacts.alignment.has_value()) {
                             std::uint32_t const want = *attrFacts.alignment;
                             // A DECLARATION-level `aligned` is one shared spelling
@@ -11955,6 +12084,39 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         fieldAligns.push_back(a.value_or(0u));
                                     }
                                 }
+                                // ★★ D-CSUBSET-PER-MEMBER-PACKED: the per-FIELD packed
+                                // flags, gathered exactly as `fieldAligns` is and for
+                                // the same reason — the interned TYPE, not the symbol
+                                // table, is what every later consumer reads. The
+                                // ALL-ZERO case builds an EMPTY span rather than a
+                                // vector of zeros: the span enters the composite's
+                                // content identity, so an all-zero one would fork the
+                                // TypeId of every struct in the program that has no
+                                // per-member packed at all.
+                                //
+                                // ⚠ THIS SPAN IS THE ONE THING THAT MAKES THE ROW A
+                                // FIX RATHER THAN A CHANNEL. Everything below it —
+                                // interner, layout clamp, reintern, HIR text — landed
+                                // first and was green with NO producer; this loop is
+                                // the producer. `completeComposite`'s parameter is
+                                // DEFAULTED, so a missed call site compiles clean and
+                                // silently drops the flag, which is why BOTH sites
+                                // below pass it and why the corpus example
+                                // `examples/c/per_member_packed` exists to prove it
+                                // end to end rather than by inspection.
+                                std::vector<std::uint8_t> fieldPacked;
+                                bool anyFieldPacked = false;
+                                for (auto const& fe : fields)
+                                    if (s.symbols.at(fe.sym).isPackedField) {
+                                        anyFieldPacked = true; break;
+                                    }
+                                if (anyFieldPacked) {
+                                    fieldPacked.reserve(fields.size());
+                                    for (auto const& fe : fields)
+                                        fieldPacked.push_back(
+                                            s.symbols.at(fe.sym).isPackedField ? 1u
+                                                                               : 0u);
+                                }
                                 // D5.4 / D5.5: struct vs union vs enum
                                 // dispatch is config-driven via
                                 // FieldChildrenDescriptor::compositeKind.
@@ -12317,7 +12479,13 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                             // which for a union (every member at
                                             // offset 0) lowers the union's own
                                             // alignment and therefore its size.
-                                            composedPackCap);
+                                            composedPackCap,
+                                            // D-CSUBSET-PER-MEMBER-PACKED: the
+                                            // per-FIELD packed flags (empty when no
+                                            // member carries the attribute — every
+                                            // composite that did before this cycle,
+                                            // so zero TypeId churn).
+                                            fieldPacked);
                                 } else if (ck == CompositeKind::Enum) {
                                     // D5.5: enum type carries no field-
                                     // operands — only its nominal name +
@@ -12567,7 +12735,13 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                             // `sys/fcntl.h`'s `struct log2phys` from
                                             // the 24/8 DSS used to compute into
                                             // clang's 20/4.
-                                            composedPackCap);
+                                            composedPackCap,
+                                            // D-CSUBSET-PER-MEMBER-PACKED: the
+                                            // per-FIELD packed flags (empty when no
+                                            // member carries the attribute — every
+                                            // composite that did before this cycle,
+                                            // so zero TypeId churn).
+                                            fieldPacked);
                                 }
                                 srec.type = compositeTy;
                                 s.nodeToType.set(resolved.node, compositeTy);
