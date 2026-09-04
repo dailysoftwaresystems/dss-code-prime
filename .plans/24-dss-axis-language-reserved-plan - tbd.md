@@ -76,7 +76,7 @@ Calling the dynamic tier "GC with extra steps" is the obvious objection, so it i
 A dynamic record can enforce *when* an object dies and *who* may touch it. It **cannot reclaim a cycle** — that requires tracing, and tracing is the thing this design does not have. So the residual split is not uniform, and pretending otherwise would be the design lying about itself:
 
 - **Lifetime, aliasing, mutation, escape and thread-boundary properties** — failure to prove them **never rejects the program**. The compiler materializes enforcement (§3.1c). This is the reversal recorded in §2.3b.
-- **Acyclicity** — stays a **static, type-level decision** (C0–C3), and **C4 remains a refusal**, naming the SCC members, the exact field that closes it, and both remedies ([`plan-09.5`](./09.5-dss-hir-plan.md) §4.3).
+- **Acyclicity** — stays a **static, type-level decision** (C0–C3), and **C4 remains a refusal**, naming the SCC members, the exact field that closes it, and now **three** remedies: borrow the back-edge, declare it weak, or **give the region an owner** (§3.1f) ([`plan-09.5`](./09.5-dss-hir-plan.md) §4.3). ⚠ **NARROWED 2026-09-04**: it fires only on an SCC whose **external in-edges cannot be enumerated** — through FFI, a raw pointer, or foreign-owned storage — which is the same boundary the next bullet names, reached from the other side.
 
 ★ **And the surviving refusal is STRUCTURAL, not epistemic** — which is what makes it acceptable in a design whose principle is "failure to prove is not rejection." It never says *"your program may well be fine and we could not prove it."* It says: **this type graph admits a shape that nothing short of a tracing collector can reclaim, and here are the two edits that remove it.** It is decided on the **type** graph, before any value exists, so it is reproducible, explainable, and fixable at the declaration site. (`D-AXIS-RESIDUAL-ENFORCES-NEVER-REFUSES`.)
 
@@ -248,6 +248,37 @@ Can prove statically?
 ```
 
 ⇒ the burden this places on the language is explicit and accepted: **Axis must give the compiler enough semantic vocabulary to describe both the statically provable and the dynamically determined case.** Where a programmer would reach for `unsafe`, the language owes them a way to *say what they mean* instead. That is a design obligation on every feature §1 eventually opens, and the FFI boundary (§3.5, §2.3) is where it ends — the one place the compiler is *told* it cannot see, rather than *failing* to see.
+
+### 3.1f ★★ `@ownsCycle` — declaring where a cycle ENDS
+
+**Operator ruling 2026-09-04.** §2.3's honesty clause leaves exactly one refusal standing: an owning-edge SCC that nothing breaks. This is the declaration that lets a programmer answer it **by describing the program** rather than by restructuring it — the first concrete answer to §5 Q12.
+
+```
+@ownsCycle class Scene { … }        // instances of Scene own their cyclic region
+@ownsCycle fn buildGraph() { … }    // the cycle built here dies with this call
+@ownsCycle { … }                    // …and as a bare block
+```
+
+**What it claims:** *the reference cycle reachable from this owner is reclaimed when this owner dies.* Nothing more. It does not suspend a tier, does not name a mechanism, and does not free anything by hand.
+
+**The rule is bidirectional, and both halves were already the house rule:**
+
+| | |
+|---|---|
+| an SCC survives with **no** owner declared and none inferable | ⛔ **compile error** — C4, unchanged in shape ([`plan-09.5`](./09.5-dss-hir-plan.md) §4.3) |
+| `@ownsCycle` on something that owns **no** SCC | ⛔ **compile error — inert config**, exactly as a `weak` that breaks no SCC is refused (`D-DSSHIR-WEAK-MUST-BREAK-AN-SCC`) |
+| `@ownsCycle` whose members **escape** the owner | ⛔ **compile error** — the claim is false, and freeing on it would be a use-after-free |
+| `@ownsCycle` the analysis **verifies** | ✅ the SCC becomes a reclamation unit ([`plan-09.5`](./09.5-dss-hir-plan.md) §4.3a) |
+
+★★ **Why this is NOT the escape hatch returning, and the test is §2.3a's own.** *An annotation may **describe** an object; none may **disable the compiler's responsibility** for it.* `@manual` said *"suspend T0–T4, I will call `free`"* — responsibility transferred, nothing checked. `@ownsCycle` says *"this cycle ends here"* — a **semantic claim the compiler verifies and may reject**. The programmer supplies a fact; the compiler still owns every decision that follows from it. That is the same species as `weak` (C3), which this design has carried from the start. ⇒ **it passes lock 10, and for a reason rather than by luck.**
+
+⚠⚠ **The one way this could become an escape hatch is if it were ever BELIEVED instead of checked.** A declaration trusted where the analysis is weak produces a **use-after-free** rather than a leak — strictly worse than the refusal it replaced. **Unverifiable therefore means refused, never assumed.** This is the constraint the whole feature stands on ([`plan-09.5`](./09.5-dss-hir-plan.md) §4.3a).
+
+★ **Spelling — and `@loopBoundary` was MEASURED and rejected, on this repo's own naming precedent.** ✔**MEASURED 2026-09-04**: *loop* appears **1,093× across `.plans/` and 1,635× in `src/`**, every one of them meaning **iteration** — [`plan-22`](./22-optimizer-plan%20-%20tbd.md) alone is built on loop invariants, loop unrolling and loop nests. *boundary* appears **382× / 403×**, meaning the **FFI boundary**, the **module boundary** and lane boundaries. A name colliding **two ways at four figures** is unreadable; the `@kernel` spelling was rejected over a collision of **18** (§2.3a). `@cycleRoot` was also considered and rejected: *root* is GC vocabulary (`GcRoot`, and a root set is where **tracing** starts), which §2.3 forbids this design from borrowing. **`@ownsCycle` reads as a predicate about the annotated thing, works unchanged on a type, a function and a block, and takes parameters if the design later needs `@ownsCycle(entry: …)`.** ⚠ *cycle* is itself overloaded repo-wide — 5,250 occurrences, nearly all meaning a **development** cycle — but it is the memory model's settled term (the C0–C3 *cycle lattice*, *cycle collector*), so this inherits an existing ambiguity rather than creating a new one. (`D-AXIS-OWNS-CYCLE-ANNOTATION`.)
+
+★ **What it buys, stated as three things rather than one.** (1) It **converts a refusal into a diagnosis** — *"you said the cycle ends here; `Node.parent` escapes via `register()`"* instead of *"I cannot prove this."* (2) It puts the intent **in the diff**, where an inferred region is invisible. (3) It is the only way to express a cycle whose termination is a **program fact** rather than a structural one — a graph built at startup and torn down at shutdown, where every edge is genuine ownership and no field is naturally `weak`.
+
+⚠ **It must stay RARE, and that is a requirement on inference, not on programmers.** Region membership is inferable in the common cases ([`plan-09.5`](./09.5-dss-hir-plan.md) §4.3 C1), and where it is inferred the annotation is **refused as inert** — so the surface cannot spread into ceremony. "Declare it wherever there is a cycle" would be the Rust-lifetime tax this language exists to avoid; **declare it only where inference cannot close it** is the contract. ★ And the reclamation-granularity cost — a member lives until its whole region dies — is **precision, never soundness**, reported per region in the tier artifact.
 
 ### 3.2 Ergonomics & syntax sugar ("easy as Node")
 - **Lambda operations** — closures, first-class functions, concise lambda syntax.
@@ -430,7 +461,7 @@ Guardrails the v2/engine work must honour so DSS Axis stays future-open (the [`p
 7. **`Task<T>` is the awaitable type.** The async lowering must target `Task<T>` / `Task` as a *real type* in the type system (C#-style TAP) — so async functions, constructors, and DI all share one awaitable currency that `await` and the scheduler compose around. The engine's async-attribute lowering must stay neutral enough to also model other languages' awaitables (JS `Promise`, Rust `Future`, C++ coroutine `task`), with `Task<T>` as DSS Axis's choice — not a hardcoded engine assumption. ★ The lowering now lands in [`plan-09.5`](./09.5-dss-hir-plan.md)'s `async` service rather than directly in HIR; lock 2a keeps the plain-HIR path open for languages that decline it. (`D-AXIS-ASYNC-TASK-SHAPE`.)
 8. **Parallelism lowers as a closed intrinsic vocabulary.** Atomic ops, memory-ordering fences, and safepoints must live in the HIR/MIR as a *closed intrinsic set* ([`plan-21`](./21-runtime-reserved-plan%20-%20tbd.md) §2.4 / [`plan-12`](./12-mir-lir-plan%20-%20ok.md) `GcSafepoint`), so the §3.8 toolkit lowers config-driven to ISA atomics — never per-language concurrency C++ (Decision #4).
 9. ★ **Ownership facts must survive lowering.** A proof discovered in the front end is worthless if it evaporates before the optimizer. Ownership / lifetime / aliasing / escape facts must be **representable in HIR and carried into MIR/LIR** as first-class attributes, not front-end-local state (§3.1d). This is not retrofittable: an IR that cannot say "these two pointers never alias, proven" forces every consumer to re-derive it or assume the worst. (`D-AXIS-PROOF-IS-AN-OPTIMIZATION-FACT`.)
-10. ★ **No memory escape hatch may be introduced by any later feature.** Not an annotation, not a keyword, not a pragma, not a config key at the *declaration* level. §3.1a's lattice narrowing is a **deployment profile**, which is the deliberate and only exception — it constrains what the compiler may use, and never who is responsible (§2.3a, §3.1e). (`D-AXIS-NO-MANUAL-ESCAPE-HATCH`, `D-AXIS-NO-UNSAFE-BLOCK`.)
+10. ★ **No memory escape hatch may be introduced by any later feature.** Not an annotation, not a keyword, not a pragma, not a config key at the *declaration* level. §3.1a's lattice narrowing is a **deployment profile**, which is the deliberate and only exception — it constrains what the compiler may use, and never who is responsible (§2.3a, §3.1e). ★ **The test any future proposal must pass is §3.1f's**: a declaration that the compiler **verifies, and refuses when it cannot** is a description and is allowed; one **taken on faith** is an escape hatch whatever it is called — and it fails *worse* than `@manual` did, because an unchecked lifetime claim yields a use-after-free rather than a leak. (`D-AXIS-NO-MANUAL-ESCAPE-HATCH`, `D-AXIS-NO-UNSAFE-BLOCK`.)
 11. ★ **HIR must be authorable as source.** The runtime migrates into HIR text (§3.9), so HIR's text format cannot remain an emit-only debugging artifact — and the `.dsshir` naming collision must be settled before the first runtime file exists ([`plan-09.5`](./09.5-dss-hir-plan.md) §8 Q1). (`D-AXIS-HIR-SOURCE-MUST-BE-HUMAN-AUTHORABLE`.)
 
 ---
@@ -450,7 +481,7 @@ Guardrails the v2/engine work must honour so DSS Axis stays future-open (the [`p
 | 9 | Inside a `gpu` body: are **address spaces** (global / shared / local / constant) written by the programmer or inferred? "Easy as Node" argues inferred — but [`plan-17`](./17-shader-gpu-plan%20-%20tbd.md) warns a pointer that loses its space is a *wrong-memory access*, so inference must be total or the fallback is a refusal. |
 | 10 | Does `gpu` / `gpu?` compose with `async` (§3.1) — is `gpu async fn` a dispatch that awaits its own completion, and is that the natural spelling for a kernel launch? |
 | 11 | ★ **Does `isa.*` get a portable form?** `gpu?` exists because a CPU twin always exists; the analogue for `isa.*` would be "use this operation where the target has it, otherwise lower the equivalent Axis expression." Is that a real need or an invitation to write target-specific code that *looks* portable (§3.6b)? |
-| 12 | ★ **What does the programmer WRITE when they would have written `@manual`?** §2.3a's answer is "describe the object" — foreign-owned storage becomes an FFI-boundary description. The **vocabulary for that description is unspecified** and it is now load-bearing, because FFI carries the whole boundary alone (§3.5). This is the first thing to design when the plan opens. |
+| 12 | ★ **What does the programmer WRITE when they would have written `@manual`?** §2.3a's answer is "describe the object." **PARTLY ANSWERED 2026-09-04**: for a cycle, they write `@ownsCycle` (§3.1f) — a claim the compiler verifies or rejects, never one it believes. **Still open: foreign-owned storage.** That vocabulary is unspecified and load-bearing, because FFI now carries the whole boundary alone (§3.5). ★ `@ownsCycle` is the **shape** the answer should take — a checked description, refused when inert and refused when unverifiable — and the FFI case should be designed to match it rather than invented separately. |
 | 13 | ★ **What is TD's observable surface, if any?** The representation is [`plan-09.5`](./09.5-dss-hir-plan.md)'s implementation detail (§3.1c) — but can a program *ask* (how many participants, am I the last)? A query is useful for diagnostics and is also the crack through which programmer-visible lifetime management returns. Default lean: **no**, and the tier artifact (§3.1d) is the answer to every question a query would have served. |
 | 14 | ★ **Where does the destructor run for a TD-tier object?** The last participant releases — but *on which thread*, and what is legal in that body? A destructor running on an arbitrary thread is a well-known hazard, and it is a **language-contract** question rather than an analysis one, so it belongs here rather than in [`plan-09.5`](./09.5-dss-hir-plan.md). |
 
@@ -507,7 +538,7 @@ native code
 
 ## 7. Deferred anchors (owned by this plan; register when it opens)
 
-These **47** `D-AXIS-*` anchors are **reserved/future** — they live here until the plan opens, then move into [`_deferred-anchor-registry-production`](./_deferred-anchor-registry-production.md) as active rows. (Reserved-plan anchors are not yet in `src/`, so the CI anchor-guard does not require registry rows today.)
+These **48** `D-AXIS-*` anchors are **reserved/future** — they live here until the plan opens, then move into [`_deferred-anchor-registry-production`](./_deferred-anchor-registry-production.md) as active rows. (Reserved-plan anchors are not yet in `src/`, so the CI anchor-guard does not require registry rows today.)
 
 ⛔ **Retired 2026-09-04, recorded so it is not re-minted:** `D-AXIS-MANUAL-ANNOTATION` (the `@manual` escape hatch) — deleted with the design it named, §2.3a. [`plan-09.5`](./09.5-dss-hir-plan.md) retires its analysis counterpart on the same grounds.
 
@@ -517,6 +548,7 @@ These **47** `D-AXIS-*` anchors are **reserved/future** — they live here until
 | `D-AXIS-NO-MANUAL-ESCAPE-HATCH` | ⛔ no `@manual` and no equivalent, under any spelling — the absence is a designed property (§2.3a) |
 | `D-AXIS-NO-UNSAFE-BLOCK` | ⛔ no `unsafe` mode; the model has no bypass (§3.1e) |
 | `D-AXIS-RESIDUAL-ENFORCES-NEVER-REFUSES` | ★ failure to prove generates enforcement, not rejection — the cycle refusal is the one survivor (§2.3) |
+| `D-AXIS-OWNS-CYCLE-ANNOTATION` | ★★ `@ownsCycle` — a CHECKED claim that a cycle ends here; inert or unverifiable = refused (§3.1f) |
 | `D-AXIS-NOT-GARBAGE-COLLECTION-VOCABULARY` | ★ five falsifiable properties; "GC"/"collector"/"managed" are wrong about this design (§2.3) |
 | `D-AXIS-STATIC-BORROW-ZERO-COST` | a proven single-context borrow emits **no** runtime machinery (§3.1c) |
 | `D-AXIS-CONCURRENT-BORROW-DYNAMIC-RECORD` | the cross-context residual materializes an ownership record; representation is 09.5's (§3.1c) |
