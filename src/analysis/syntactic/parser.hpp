@@ -62,10 +62,14 @@ enum class RecoveryStrategy : std::uint8_t {
 
 // Per-instance knobs for the parser.
 struct DSS_EXPORT ParserConfig {
-    // Per-AltChoice nesting cap for speculative backtracking. Every level
-    // costs one `trySpeculativeBranch` + `stepOnce` host frame (the
-    // speculation machinery is still recursion, not an explicit work-stack),
-    // so this is a real stack guard — and it survives as a COUNTER THAT FAILS
+    // Per-AltChoice nesting cap for speculative backtracking. ★ Since P60 a
+    // level costs one heap `SpeculationSite` on the driver's `specStack` and
+    // NO host frame: the speculation drive and the expression re-entry it used
+    // to nest inside were converted onto ONE loop (`Parser::Impl::driveParse_`)
+    // (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED).
+    // So this is NOT a stack guard any more — it bounds the MEMORY and TIME a
+    // nest of live probes may cost, each of which holds an O(depth) builder and
+    // schema-walker checkpoint. It survives as a COUNTER THAT FAILS
     // LOUD: over-cap the parser emits a positioned, self-naming
     // `P_MaxSpeculationDepth` and recovers, never a crash and never a
     // fabricated syntax error against the user's own token.
@@ -85,22 +89,24 @@ struct DSS_EXPORT ParserConfig {
     // far beyond — DSS was two orders of magnitude below the union
     // (D-PARSE-NINE-NESTED-CASTS-ARE-REFUSED-BY-THE-SPECULATION-CAP-WITH-A-FABRICATED-SYNTAX-ERROR).
     //
-    // WHY THE FALLBACK IS 64 WHILE c DECLARES 320. Two different questions.
-    // c's number is MEASURED against that language's own speculation shape and
-    // this host's stack (see the `$parserComment` in `c.lang.json`); this one
-    // has to be safe for a grammar whose author said nothing at all, so it is
-    // the ISO C23 5.2.4.1 floor of 63 nesting levels rounded to the next power
-    // of two — comfortably above any hand-written grammar's plausible
-    // disambiguation nesting, and ~104 KiB of host stack at the measured
-    // ~1.63 KiB per level, i.e. safe on any thread.
+    // WHY THE FALLBACK IS 64 WHILE c DECLARES 2048. Two different questions.
+    // c's number is MEASURED against that language's own speculation shape
+    // and the memory a live probe costs (see the `$parserComment` in
+    // `c.lang.json`); this one has to be safe for a grammar whose author said
+    // nothing at all, so it is the ISO C23 5.2.4.1 floor of 63 nesting levels
+    // rounded to the next power of two — comfortably above any hand-written
+    // grammar's plausible disambiguation nesting. ★ Since P60 a probe lives on
+    // the heap (`Parser::Impl::specStack`), not on a host frame, so this is a
+    // SEMANTIC limit on nesting, never a stack backstop
+    // (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED).
     //
     // ★ AND THE TWO MUST NOT BE EQUAL, WHICH IS A TESTABILITY PROPERTY, NOT A
     // TASTE. If the fallback matched c's value, deleting the `.lang.json` key
     // — or the `parserConfigFor` line that reads it — would change NOTHING
     // observable, and "config-driven" would be a claim no red-on-disable arm
-    // could ever refute. With 64 here and 320 there, removing either makes the
-    // corpus example's 65-cast chain fail loud, which is exactly the negative
-    // a REMOVE-direction mutant needs to produce.
+    // could ever refute. With 64 here and 2048 there, removing either makes
+    // the corpus example's 65-cast chain fail loud, which is exactly the
+    // negative a REMOVE-direction mutant needs to produce.
     //
     // A language that declares no speculative alt at all (toy, and every
     // shipped assembly dialect — ✔MEASURED: zero `"speculative": true` alts in
@@ -159,15 +165,17 @@ struct DSS_EXPORT ParserConfig {
     // CONFIG-DRIVEN (plan-24 Stage 7): this is the FALLBACK default. The CU
     // build OVERRIDES it from the language's `.lang.json`
     // (`parser.maxExpressionDepth`) via `parserConfigFor` in
-    // compilation_unit.cpp — c declares 1024; a language that omits the
-    // key keeps this 256 fallback. The value is BOUNDED, not unbounded,
-    // because ONE recursion remains: the parser's paren/postfix-body arm (the
-    // deferred plan-24 Stage 5b) still costs a host frame per nested `(` on the
-    // 64 MiB worker. The cap is the fail-loud SAFETY BACKSTOP for that arm — it
-    // must trip BEFORE the worker overflows on the worst supported build (the
-    // measured paren-crash floor is ~3000 on MSVC Debug; c's 1024 sits
-    // ~3x below it). A nest past the configured cap emits a positioned
-    // `P_ExpressionTooDeep` with graceful recovery — NEVER a raw stack overflow.
+    // compilation_unit.cpp — c declares 16384; a language that omits the
+    // key keeps this 256 fallback. ★ Since P60 the parser holds NO host frame
+    // per nesting level — the last residual recursion, the paren/postfix-body
+    // atom re-entry (the deferred plan-24 Stage 5b), is an `ExprFrame` parked
+    // on the heap work-stack while the schema dispatch closes the atom
+    // (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED)
+    // — so this value is BOUNDED for the reasons a semantic limit is (the
+    // work-stack's heap growth on adversarial input, the union of what the
+    // reference compilers WORK at), never as a stack backstop. A nest past
+    // the configured cap emits a positioned `P_ExpressionTooDeep` with
+    // graceful recovery — NEVER a raw stack overflow.
     std::size_t maxExpressionDepth = 256;
 
     // Recovery strategy for unrecognized tokens. Default scans to

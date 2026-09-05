@@ -3714,9 +3714,27 @@ TEST(ShippedLibDescriptor, ShippedStdioLibraryMapRoutesPerObjectFormat) {
     // `_setjmp`, and the descriptor now reaches it through `linkName`. The
     // GROUP-WIDE atomicity is pinned in tests/ffi/test_pe_crt_costate_binding.cpp;
     // this test keeps its original single-descriptor scope.
-    EXPECT_EQ(desc->library.at("pe"),    "ucrtbase.dll");
-    EXPECT_EQ(desc->library.at("elf"),   "libc.so.6");
-    EXPECT_EQ(desc->library.at("macho"), "/usr/lib/libSystem.B.dylib");
+    //
+    // ★ D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE
+    // RE-AIMED IT AGAIN, and this time the CLAIM moved tier. stdio.json no longer
+    // spells an image on any format: it names the runtime ROLE (`cLibrary`) whose
+    // image the object format's `runtimeLibraries` table owns, and the reader
+    // resolves it only through a caller-supplied resolver. So the descriptor's
+    // own claim — the thing THIS read can witness with no resolver in hand — is
+    // the role, per format, recorded on `libraryRoles`; the image identity
+    // (pe = ucrtbase.dll, never msvcrt.dll) is the format tier's row and is
+    // pinned there (`RuntimeLibraryRoles.NoPeFormatNamesTheLegacyCrtInItsRoleTable`)
+    // and end-to-end by `program/test_descriptor_role_follows_the_table`. A
+    // revert of any arm to a literal reds `link/test_descriptor_library_role_agreement`'s
+    // ratchet. Still one exact assertion per format, and `library` must be EMPTY:
+    // with no resolver a role entry yields no image, and stdio names no literal.
+    ASSERT_EQ(desc->libraryRoles.size(), 3u);
+    EXPECT_EQ(desc->libraryRoles.at("pe"),    RuntimeLibraryRole::CLibrary);
+    EXPECT_EQ(desc->libraryRoles.at("elf"),   RuntimeLibraryRole::CLibrary);
+    EXPECT_EQ(desc->libraryRoles.at("macho"), RuntimeLibraryRole::CLibrary);
+    EXPECT_TRUE(desc->library.empty())
+        << "stdio.json names only roles; a literal here is the duplication the "
+           "row ended";
 }
 
 // An UNKNOWN object-format key in the `library` map is a typo/garbage and fails
@@ -6642,12 +6660,17 @@ TEST(ShippedLibDescriptor, RealStdlibJsonSetlocaleUngatedAllFormats) {
     ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
     fs::path const path = root / "stdlib.json";
 
-    // The three (format, expected image) pairs the descriptor map must resolve.
-    struct Leg { ObjectFormatKind fmt; char const* image; char const* arch; };
+    // The three (format, expected ROLE) pairs the descriptor map must declare.
+    // D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: this
+    // used to be (format, expected IMAGE) — ucrtbase.dll / libc.so.6 / libSystem
+    // — read off the descriptor's literal. The image is now the format tier's
+    // `cLibrary` row, named here by ROLE, and its identity is pinned where it is
+    // owned (`RuntimeLibraryRoles.*`, `program/test_descriptor_role_follows_the_table`).
+    struct Leg { ObjectFormatKind fmt; RuntimeLibraryRole role; char const* arch; };
     std::array<Leg, 3> const legs{{
-        {ObjectFormatKind::Pe,    "ucrtbase.dll",                 "x86_64"},
-        {ObjectFormatKind::Elf,   "libc.so.6",                    "x86_64"},
-        {ObjectFormatKind::MachO, "/usr/lib/libSystem.B.dylib",   "arm64"},
+        {ObjectFormatKind::Pe,    RuntimeLibraryRole::CLibrary, "x86_64"},
+        {ObjectFormatKind::Elf,   RuntimeLibraryRole::CLibrary, "x86_64"},
+        {ObjectFormatKind::MachO, RuntimeLibraryRole::CLibrary, "arm64"},
     }};
 
     for (auto const& leg : legs) {
@@ -6695,21 +6718,26 @@ TEST(ShippedLibDescriptor, RealStdlibJsonSetlocaleUngatedAllFormats) {
         EXPECT_TRUE(objectFormatInAvailabilitySet(sym->availableObjectFormats, leg.fmt))
             << "the injector gate must admit setlocale on this format";
 
-        // (4) THE IMAGE comes from the DESCRIPTOR map, and pe is UCRT.
+        // (4) THE IMAGE is the C LIBRARY's, named by ROLE from the DESCRIPTOR map
+        // and resolved by the driver against the object format's own table — pe
+        // in particular reaches ucrtbase.dll (measured export) and never the
+        // legacy msvcrt.dll, because that is what the pe `cLibrary` row says and
+        // `RuntimeLibraryRoles.NoPeFormatNamesTheLegacyCrtInItsRoleTable` keeps it
+        // saying. With no resolver in hand this read sees the DECLARED role and
+        // no image at all — the image map must be EMPTY, never a guess.
         auto const it =
-            r.desc->library.find(std::string{objectFormatKindName(leg.fmt)});
-        ASSERT_NE(it, r.desc->library.end())
-            << "stdlib.json must declare a runtime image for this format";
-        EXPECT_EQ(it->second, leg.image)
-            << "setlocale is imported from this image by every program that CALLS "
-               "it (by every program that merely included <stdlib.h>, before "
-               "referenced-only import); pe in particular must be ucrtbase.dll "
-               "(measured export) and not the legacy msvcrt.dll this arc is "
-               "retiring";
-        EXPECT_TRUE(sym->library.empty())
-            << "NO per-symbol library override: the descriptor map already names exactly "
-               "the three images setlocale lives in, and a second owner of that fact "
-               "would drift from the first";
+            r.desc->libraryRoles.find(std::string{objectFormatKindName(leg.fmt)});
+        ASSERT_NE(it, r.desc->libraryRoles.end())
+            << "stdlib.json must name a runtime role for this format";
+        EXPECT_EQ(it->second, leg.role)
+            << "setlocale is imported from the C library's image by every program "
+               "that CALLS it, on every format";
+        EXPECT_EQ(r.desc->library.count(std::string{objectFormatKindName(leg.fmt)}), 0u)
+            << "no resolver was supplied, so no image may have been invented";
+        EXPECT_TRUE(sym->library.empty() && sym->libraryRoles.empty())
+            << "NO per-symbol library override: the descriptor map already names the "
+               "role setlocale lives under on all three formats, and a second owner "
+               "of that fact would drift from the first";
     }
 }
 

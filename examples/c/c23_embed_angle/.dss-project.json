@@ -1,0 +1,14 @@
+{
+  "$comment": "D-PP-EMBED-ANGLE (C23 6.10.4.1p8): the project manifest exists ONLY to declare `includes` -- the file-driven `-I` (docs/project-config-spec.md) -- because the angle form of `#embed` searches the angle `#include`'s places (the system directories, then the include directories) and never the including file's own directory. `res/blob.bin` is reachable through nothing else, so a build that resolved the angle form any other way could not produce this program. `includes` entries in a ROOT manifest resolve against the process working directory, which both examples runners make the staged example directory before a project build.",
+  "language": "c",
+  "artifactProfile": "cli",
+  "artifactName": "embed_angle",
+  "targets": [
+    "x86_64:pe64-x86_64-windows-exec",
+    "x86_64:elf64-x86_64-linux-exec",
+    "arm64:elf64-aarch64-linux-exec",
+    "arm64:macho64-arm64-darwin-exec"
+  ],
+  "sources": ["main.c"],
+  "includes": ["res"]
+}

@@ -13,6 +13,11 @@
 #include "core/types/type_lattice/type_layout.hpp"
 #include "analysis/semantic/inline_asm_facts.hpp"
 #include "analysis/semantic/semantic_test_fixture.hpp"
+// D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: the one
+// adapter from a format schema to the role seam a shipped-descriptor read asks
+// (`FormatRuntimeLibraryRoleResolver`) — see `analyzeRealStdio` for why the
+// TF-C112 pins carry one.
+#include "link/object_format_schema.hpp"
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
@@ -17709,7 +17714,31 @@ namespace {
     builder.addInMemory(std::move(mainSrc), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
-    return analyze(cu, DiagnosticBudget::libraryDefault(), dataModel, std::nullopt, std::nullopt, format, arch);
+    // ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ──
+    // stdio.json no longer restates the C runtime's image; it names the ROLE
+    // (`{"pe": {"role": "cLibrary"}}`) that the object format's
+    // `runtimeLibraries` table owns. A read with NO resolver RECORDS the role
+    // and binds no image — the same UNBOUND arm an omitted format key states —
+    // so these pins, which assert the IMAGE the row resolves to, must carry the
+    // resolver the driver always carries (`buildCuMir` builds one over the
+    // ACTIVE format). The pin's own format picks its exec flavour: an `-exec`
+    // document declares `cLibrary` itself, so the answer comes from the very row
+    // a repoint would move, with no family scan involved.
+    std::string_view const execFlavour =
+        format == ObjectFormatKind::Pe ? std::string_view{"pe64-x86_64-windows-exec"}
+                                       : std::string_view{"elf64-x86_64-linux-exec"};
+    auto const formatSchema = ObjectFormatSchema::loadShipped(execFlavour);
+    if (!formatSchema) {
+        // Throw rather than abort: an abort takes the whole test BINARY out and
+        // costs every sibling case its verdict (the `analyzeRealStdioAt` note).
+        throw std::runtime_error{"loadShipped(\"" + std::string{execFlavour}
+                                 + "\") failed; the TF-C112 pins cannot resolve "
+                                   "the descriptor's runtime role without it"};
+    }
+    FormatRuntimeLibraryRoleResolver const roles{**formatSchema};
+    return analyze(cu, DiagnosticBudget::libraryDefault(), dataModel, std::nullopt,
+                   std::nullopt, format, arch, LongDoubleFormat::None, nullptr, 0,
+                   &roles);
 }
 
 // The reproducer, verbatim: legal C that clang and GCC both accept, and the

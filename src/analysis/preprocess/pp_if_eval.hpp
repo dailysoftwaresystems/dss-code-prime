@@ -49,6 +49,7 @@
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/preprocess_config.hpp"   // EmbedParameterRole (D-PP-EMBED-PARAMS)
 #include "core/types/source_buffer.hpp"
 #include "core/types/token.hpp"
 
@@ -81,21 +82,159 @@ using PpIsDefined = std::function<bool(std::string_view)>;
 // holds the include search paths. Returns true iff the header exists.
 using PpHasInclude = std::function<bool(std::string_view filename, bool isAngle)>;
 
-// FC17.9(h) (`__has_embed`; C23 6.10.1): test whether the resource `filename`
-// that a `#embed` of the same form would read exists, returning the C23
-// trichotomy: 0 = `__STDC_EMBED_NOT_FOUND__`, 1 = `__STDC_EMBED_FOUND__`
-// (non-empty), 2 = `__STDC_EMBED_EMPTY__` (found but zero bytes). `isAngle`
-// selects the form (true = `<r>`, the deferred angle form -> the callback
-// answers 0 truthfully; false = `"r"`, the quote search). `opSpan` is the
+// FC17.9(h) (`__has_embed`; C23 6.10.2p7): locate the resource `filename` that
+// a `#embed` of the same form would read and return its IMPLEMENTATION RESOURCE
+// WIDTH in bytes (6.10.4.1p1), or nullopt when the search fails. `isAngle`
+// selects the form (true = `<r>`, the angle search; false = `"r"`, the quote
+// search with its 6.10.4.1p9 fallback to the angle search). `opSpan` is the
 // operator token's span, so the authoritative callback can derive the
 // per-origin resolution directory (the resource search is relative to the file
 // containing the `__has_embed`, exactly as `#embed` resolves) -- so
-// `__has_embed` answers precisely what `#embed` would do at that spot. Supplied
-// by the MacroExpander, which holds the resource search paths. An UNSET
-// callback (`{}`) is null-tolerant and mints 0 (NOT_FOUND) -- the same
+// `__has_embed` answers precisely what `#embed` would do at that spot.
+//
+// ★ THE CALLBACK ANSWERS ONLY "how many bytes are there"; the C23 TRICHOTOMY
+// (0 = `__STDC_EMBED_NOT_FOUND__`, 1 = `__STDC_EMBED_FOUND__`, 2 =
+// `__STDC_EMBED_EMPTY__`) is computed by the evaluator, because EMPTY depends on
+// the `limit` parameter (6.10.2 EXAMPLE 6: `limit(0)` makes a found resource
+// EMPTY "including in __has_embed expressions") and only the evaluator has
+// parsed the parameters. The directive computes its own width through the SAME
+// `embedResourceWidthBytes`, so the two cannot disagree about emptiness.
+// Supplied by the MacroExpander, which holds the resource search paths. An
+// UNSET callback (`{}`) is null-tolerant and reads as NOT FOUND -- the same
 // null-callback tolerance the `hasInclude && hasInclude(...)` site uses.
-using PpHasEmbed =
-    std::function<int(std::string_view filename, bool isAngle, SourceSpan opSpan)>;
+using PpHasEmbed = std::function<std::optional<std::uint64_t>(
+    std::string_view filename, bool isAngle, SourceSpan opSpan)>;
+
+// C23 6.10.4.1p1 + 6.10.4.2p4 (D-PP-EMBED-PARAMS): the resource WIDTH in bytes
+// -- the number of elements the directive expands to. Without `limit` it is the
+// implementation width; with `limit(N)` it is `N` elements unless the resource
+// is shorter (p4: "the implementation resource width if it is less than the
+// embed element width multiplied by the integer constant expression"), and
+// `limit(0)` makes it 0 = EMPTY (6.10.4.1p5). At the octet element width
+// (`kEmbedElementWidthBits`, preprocessor.hpp) an element IS a byte, so the
+// bit arithmetic of p4 reduces to this min. ONE formula for the directive and
+// for `__has_embed`, so a resource can never be EMPTY to one and FOUND to the
+// other.
+[[nodiscard]] constexpr std::uint64_t
+embedResourceWidthBytes(std::uint64_t implementationBytes,
+                        std::optional<std::uint64_t> limitElements) noexcept {
+    if (!limitElements.has_value()) return implementationBytes;
+    return *limitElements < implementationBytes ? *limitElements
+                                                : implementationBytes;
+}
+
+// ── C23 6.10.1p4–p9 / 6.10.4.1p2: ONE embed-parameter-sequence PARSER ─────────
+//
+// Shared by the `#embed` directive (preprocessor.cpp, `handleEmbed`) and the
+// `__has_embed` operator (the rewrite arm below): a parameter sequence must read
+// IDENTICALLY in both, or `__has_embed("r" limit(2))` could answer 1 for a
+// directive `#embed "r" limit(2)` that then refuses. The callers differ only in
+// HOW a token's bytes are read (the directive slices through
+// `MacroExpander::text`, the operator through `ppTokenText`) and in WHERE the
+// sequence ends (the directive's line end, the operator's depth-0 `)`), which is
+// exactly what the two callbacks and the `stopAtOperatorClose` flag carry.
+//
+// One parsed pp-parameter (6.10.1p4): `identifier` or `identifier :: identifier`
+// (the `::` matched by the CONFIG kind `embedParameters.prefixSeparatorToken`),
+// optionally followed by a pp-parameter-clause `( pp-balanced-token-sequence )`.
+struct PpEmbedParameter {
+    std::string spelling;            // as written: `limit`, `__limit__`, `vendor::name`
+    bool        prefixed = false;    // `identifier :: identifier` (implementation-defined)
+    // The standard verb this name is bound to (config, 6.10.1p5 dunder-folded),
+    // or nullopt = a parameter THIS implementation does not support (an unknown
+    // standard-shaped name, or any prefixed name -- DSS defines none).
+    std::optional<PreprocessConfig::EmbedParameterRole> role;
+    std::size_t nameIndex   = 0;     // the (first) name token, the diagnostic anchor
+    bool        hasClause   = false;
+    std::size_t clauseBegin = 0;     // first token INSIDE the clause's parens
+    std::size_t clauseEnd   = 0;     // the clause's `)` (one past the last inside token)
+};
+struct PpEmbedParameterSequence {
+    std::vector<PpEmbedParameter> parameters;
+    std::size_t next = 0;            // first token NOT consumed by the sequence
+    [[nodiscard]] PpEmbedParameter const*
+    find(PreprocessConfig::EmbedParameterRole role) const noexcept {
+        for (PpEmbedParameter const& p : parameters) {
+            if (p.role.has_value() && *p.role == role) return &p;
+        }
+        return nullptr;
+    }
+    // ★★ THE TWO UNSUPPORTED SHAPES ARE NOT THE SAME QUESTION, AND C23 SPLITS
+    // THEM BY SHAPE. 6.10.1p9 makes EVERY parameter that is neither a standard
+    // parameter nor an implementation-defined PREFIXED one a constraint
+    // violation, and footnote 196 carves out exactly one case: "An unrecognized
+    // preprocessor PREFIXED parameter is a constraint violation, except within
+    // has_embed expressions (6.10.2)". So:
+    //
+    //   * an unknown STANDARD-SHAPED name (a bare identifier that names no
+    //     standard parameter) is a 6.10.1p9 violation with NO carve-out —
+    //     LOUD on a `#embed` line AND inside `__has_embed`;
+    //   * an unrecognized PREFIXED name is LOUD on a `#embed` line (footnote
+    //     196's "is a constraint violation") and is the NOT_FOUND(0) answer
+    //     inside `__has_embed` (6.10.2p7 "not supported by the
+    //     implementation"; p8 NOTE 1 "instead cause the expression to be
+    //     evaluated to 0").
+    //
+    // ⚠ These are two accessors rather than one `anyUnsupported()` BECAUSE the
+    // operator must apply them in this order and only the second one
+    // short-circuits: minting 0 for a vendor probe is what C23 6.10.2 EXAMPLE 5
+    // is for, while an unknown standard-shaped name still owes a diagnostic.
+    [[nodiscard]] PpEmbedParameter const*
+    firstUnsupportedStandardShaped() const noexcept {
+        for (PpEmbedParameter const& p : parameters) {
+            if (!p.role.has_value() && !p.prefixed) return &p;
+        }
+        return nullptr;
+    }
+    [[nodiscard]] bool anyUnsupportedPrefixed() const noexcept {
+        for (PpEmbedParameter const& p : parameters) {
+            if (!p.role.has_value() && p.prefixed) return true;
+        }
+        return false;
+    }
+};
+// Read a token's spelling under the caller's ONE slicing rule.
+using PpTokenTextFn = std::function<std::string_view(Token const&)>;
+
+// D-PP-DEFINED-VIA-MACRO-EXPANSION: the RAW BYTES `[start, end)` of an operand
+// that spans several tokens (an angle header/resource name, whose spelling
+// includes whatever sat between its tokens). Refuses -- nullopt, and every
+// caller then fails loud -- a range that straddles the prefix buffer and the
+// product tail, runs backwards or past its buffer, or crosses a line: such a
+// range is the tell that macro expansion spliced two constructs together, and a
+// name read across it would be a PLAUSIBLE one made of unrelated bytes. The
+// full account is on the definition (pp_if_eval.cpp). Declared here because the
+// `#embed <resource>` directive (D-PP-EMBED-ANGLE) reads its angle name through
+// the SAME function `__has_include(<h>)` / `__has_embed(<r>)` use, so the three
+// cannot disagree about which bytes an angle operand names.
+[[nodiscard]] std::optional<std::string_view>
+ppRawRun(ByteOffset start, ByteOffset end, SourceBuffer const& prefix,
+         std::string_view tail);
+// Report a fail-loud condition anchored at a token (the caller picks the code
+// and the span derivation -- the operator routes a product-span token through
+// its expansion-site mapping, the directive uses the token's own span).
+using PpEmbedFail = std::function<void(Token const&, std::string)>;
+
+// Parse the embed-parameter-sequence starting at `toks[begin]`. Fail-loud (via
+// `fail`, then nullopt) on: a token that is not a pp-parameter, a `::` with no
+// identifier after it, a clause that is not balanced or not terminated, a
+// STANDARD parameter without its REQUIRED clause (6.10.4.2p1 / .3p1 / .4p1 /
+// .5p1 "shall be present"), or a standard parameter appearing twice (the same
+// clauses: "may appear zero times or one time"). An UNSUPPORTED name is NOT a
+// failure here -- it is recorded with `role == nullopt` for the caller to judge.
+// Balance is tracked on the language's function-like paren KINDS (the same
+// pair the macro-argument collector balances on); a mismatched bracket or
+// brace INSIDE a paren-balanced clause is spliced verbatim and refused by the
+// parser that receives it -- loud, never silent -- so no second bracket
+// vocabulary is declared for this one check. `stopAtOperatorClose` = the
+// sequence ends at a depth-0 `)` (the `__has_embed` operator's own), which is
+// left unconsumed in `next`; otherwise it ends at the end of `toks` (the
+// directive's line).
+[[nodiscard]] std::optional<PpEmbedParameterSequence>
+parseEmbedParameterSequence(std::span<Token const> toks, std::size_t begin,
+                            GrammarSchema const& schema,
+                            PpTokenTextFn const& textOf, PpEmbedFail const& fail,
+                            bool stopAtOperatorClose);
 
 // FC15b: the MacroExpander's accumulated `#`/`##`/predefined PRODUCT text, as it
 // stands AFTER `macroExpand` runs over an `#if` operand. A predefined macro
@@ -226,12 +365,21 @@ private:
     //                 DefKeyword -(Word)-> Idle                [no-paren form]
     // __has_include:  Idle -(kw)-> HdrKeyword -( `(` )-> HdrOpen
     //                 HdrOpen -( `<` )-> InAngle -(…)-> InAngle -( `>` )->
-    //                     HdrOperand -( `)` )-> Idle
-    //                 HdrOpen -( `"` )-> InQuote -(…)-> InQuote -( `)` )-> Idle
+    //                     HdrOperand -(…)-> HdrOperand -( depth-0 `)` )-> Idle
+    //                 HdrOpen -( `"` )-> InQuote -(…)-> InQuote -( depth-0 `)` )-> Idle
     //                 HdrOpen -(anything else)-> Idle, NOT protected  [the
     //                     "macro-expand and re-examine" arm]
     // Any other token in a slot returns to Idle WITHOUT protecting it, so a
     // malformed shape reaches the evaluator intact and fails loud there.
+    //
+    // ★ HdrOperand / InQuote run to the operator's OWN `)` -- depth-counted over
+    // the paren kinds -- and not merely to the first `)`. C23 6.10.2p7 holds the
+    // WHOLE `__has_embed ( header-name embed-parameter-sequence )` operand back
+    // from expansion ("no further macro expansion is performed"), and an embed
+    // parameter carries its own parenthesized clause (`limit(2)`), so the first
+    // `)` is usually the clause's, not the operator's. Only the `limit` clause
+    // is expanded, and the evaluator does that itself afterwards (6.10.4.2p3:
+    // "independently of any macro replacement done previously").
     enum class State {
         Idle, DefKeyword, DefOpen, DefOperand,
         HdrKeyword, HdrOpen, InAngle, HdrOperand, InQuote
@@ -246,6 +394,10 @@ private:
     SchemaTokenId angleClose_{};
     SchemaTokenId stringOpen_{};
     State         state_ = State::Idle;
+    // Nested-paren depth INSIDE a protected `__has_include`/`__has_embed`
+    // operand (HdrOperand / InQuote), so the depth-0 `)` that ends it is told
+    // apart from a parameter clause's `)`.
+    int           operandDepth_ = 0;
     bool          lastWasDefinedKeyword_ = false;
 };
 
@@ -299,5 +451,63 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                      // constant above 0x7F REFUSES, loud, and every 0–127 body
                      // (which is every real-world one) folds unchanged.
                      std::optional<bool>    charIsUnsigned = std::nullopt);
+
+// The phase-4 VALUE of a controlling expression (C 6.10.2p13: every operand
+// acts as `intmax_t` / `uintmax_t`): the 64 raw two's-complement bits plus which
+// of the two types the result has. `evaluateIfExpression` above is this value's
+// truthiness and nothing more; the value itself is what an embed `limit`
+// (6.10.4.2p3, "using the rules specified for conditional inclusion") needs,
+// because `limit(-1)` must be refused while `limit(0u - 1)` is a legal, merely
+// enormous, unsigned bound. Same pipeline, same diagnostics, same nullopt
+// contract as the truth-value entry point -- it IS that entry point's engine.
+struct PpIfValue {
+    std::uint64_t bits     = 0;
+    bool          isSigned = true;   // false = the `uintmax_t` reading
+};
+[[nodiscard]] std::optional<PpIfValue>
+evaluateIfExpressionValue(std::span<Token const> operandTokens,
+                          GrammarSchema const&   schema,
+                          PpMacroExpand const&   macroExpand,
+                          PpIsDefined const&     isDefined,
+                          PpHasInclude const&    hasInclude,
+                          SourceBuffer const&    synth,
+                          PpProductText const&   productText,
+                          DiagnosticReporter&    rep,
+                          PpHasEmbed const&      hasEmbed = {},
+                          PpOperatorRevoked const& operatorRevoked = {},
+                          std::optional<bool>    charIsUnsigned = std::nullopt);
+
+// C23 6.10.4.2 (D-PP-EMBED-PARAMS): evaluate a `limit` parameter's clause (the
+// tokens INSIDE its parens) to the element count it names. ONE implementation
+// for the directive and for `__has_embed`, since 6.10.2 EXAMPLE 6 requires the
+// two to agree that `limit(0)` empties a resource.
+//   p2: the token `defined` shall not appear -- refused in the clause as
+//       written AND in its expansion (a macro that produces `defined` is
+//       6.10.2p13 undefined behaviour, and this evaluator refuses rather than
+//       guesses);
+//   p3: the clause is macro-expanded "as in normal text" through `macroExpand`
+//       (the directive hands its ordinary expander, the operator its operand
+//       expander -- both are the ONE `MacroExpander::expand` engine), then
+//       evaluated with the `#if` rules by `evaluateIfExpressionValue` under an
+//       IDENTITY expander, so an already-expanded run is never expanded twice;
+//   p1: a negative value is refused; the value is returned as an element count
+//       for `embedResourceWidthBytes`.
+// Every refusal goes through `fail` (anchored at `anchor`, the parameter's name
+// token) and returns nullopt; the caller has nothing more to report.
+[[nodiscard]] std::optional<std::uint64_t>
+evaluateEmbedLimit(std::span<Token const>   clause,
+                   Token const&             anchor,
+                   GrammarSchema const&     schema,
+                   PpMacroExpand const&     macroExpand,
+                   PpIsDefined const&       isDefined,
+                   PpHasInclude const&      hasInclude,
+                   SourceBuffer const&      synth,
+                   PpProductText const&     productText,
+                   DiagnosticReporter&      rep,
+                   PpHasEmbed const&        hasEmbed,
+                   PpOperatorRevoked const& operatorRevoked,
+                   std::optional<bool>      charIsUnsigned,
+                   PpTokenTextFn const&     textOf,
+                   PpEmbedFail const&       fail);
 
 } // namespace dss

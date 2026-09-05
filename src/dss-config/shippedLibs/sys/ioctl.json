@@ -3,7 +3,7 @@
   "header": "sys/ioctl.h",
   "standard": "posix",
   "availableObjectFormats": ["elf", "macho"],
-  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "library": { "elf": { "role": "cLibrary" }, "macho": { "role": "cLibrary" } },
   "symbols": [
     { "name": "ioctl", "signature": "fn(i32, u64, ...) -> i32", "kind": "function", "linkage": "external" }
   ],

@@ -53,11 +53,14 @@
 #include "tokenizer/token_stream.hpp"
 #include "tokenizer/tokenizer.hpp"
 
+#include "../core/bounded_stack.hpp"   // runOnBoundedStack — the BOUND (see there)
+
 #include <gtest/gtest.h>
 
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <variant>
 #include <vector>
@@ -85,17 +88,31 @@ struct Lowered {
 // is held to the same budget as everything else in this file.
 constexpr std::size_t kOrdinaryThreadReserveBytes = std::size_t{1} * 1024 * 1024;
 
+// The shipped schemas, loaded ONCE and on the MAIN thread. Every bounded pin
+// below calls this before spawning its small-stack worker: the loader's cost is
+// large and input-INDEPENDENT (`bounded_stack.hpp` says why), so it must not
+// be what a bounded stage pays for.
+struct ShippedSchemas {
+    std::shared_ptr<GrammarSchema const> schema;
+    std::shared_ptr<TargetSchema const>  target;
+};
+[[nodiscard]] ShippedSchemas const& shipped() {
+    static ShippedSchemas const loadedOnce = [] {
+        auto loaded = GrammarSchema::loadShipped("c");
+        if (!loaded) throw std::runtime_error{"loadShipped(c) failed"};
+        auto t = TargetSchema::loadShipped("x86_64");
+        if (!t) throw std::runtime_error{"loadShipped(x86_64) failed"};
+        return ShippedSchemas{.schema = *loaded, .target = *t};
+    }();
+    return loadedOnce;
+}
+
 // ⚠ A THROW, NEVER `std::abort()` — an abort kills the process and every sibling
 // here loses its verdict, which is the exact signature these tests exist to tell
 // APART from a stack overflow. `no_abort_in_tests_guard` enforces the same rule.
 [[nodiscard]] Lowered lowerC(std::string src, std::size_t exprDepthCap) {
-    auto loaded = GrammarSchema::loadShipped("c");
-    if (!loaded) throw std::runtime_error{"loadShipped(c) failed"};
-    std::shared_ptr<GrammarSchema const> schema = *loaded;
-
-    auto t = TargetSchema::loadShipped("x86_64");
-    if (!t) throw std::runtime_error{"loadShipped(x86_64) failed"};
-    std::shared_ptr<TargetSchema const> target = *t;
+    std::shared_ptr<GrammarSchema const> schema = shipped().schema;
+    std::shared_ptr<TargetSchema const>  target = shipped().target;
 
     // Tokenize + parse on THIS thread. The parser's residual paren/postfix arm is
     // a separate, still-recursive site (plan-24 Stage 5b, capped by
@@ -312,18 +329,29 @@ TEST(MirTextDeepNesting, DeeplyNestedTypeRendersWholeOnAnOrdinaryThread) {
 //
 // kDepth is set ABOVE the pre-fix crash ceiling on purpose: restore any one of
 // those six walks to host recursion and this test does not merely fail, it dies.
-TEST(HirToMirDeepNesting, DeeplyNestedStatementsLowerOnAnOrdinaryThread) {
+// ★ ON THE BOUNDED STACK (`tests/core/bounded_stack.hpp`, 256 KiB) since P60:
+// the six pre-passes' recursion cost ~400 bytes per level on mingw-w64 g++
+// Debug (2560 levels ≈ 1 MiB), so 6000 levels need ≥ 2.3 MiB against 256 KiB
+// — and `pathTerminates`, which also walks this nest inside `lowerToHir`,
+// needed 780 KiB at its thinnest. Restore either and the process dies.
+TEST(HirToMirDeepNesting, DeeplyNestedStatementsLowerOnABoundedStack) {
     constexpr int kDepth = 6000;   // ~2.3x the MEASURED pre-fix ceiling of ~2560
+    (void)shipped();
     std::string src = "int main(void){ int x=0; ";
     for (int i = 0; i < kDepth; ++i) src += "if(x){ ";
     src += "return 1;";
     for (int i = 0; i < kDepth; ++i) src += " }";
     src += " return 0; }";
 
-    auto L = lowerC(std::move(src), /*exprDepthCap=*/kDepth + 1024);
-    // It lowered at all — the whole-body pre-passes walked 6000 HIR levels on a
-    // ~1 MiB thread. Assert the module is real, not just that nothing crashed.
-    EXPECT_GT(L.mir.mir.funcCount(), 0u);
+    std::size_t funcs = 0;
+    test::runOnBoundedStack([&] {
+        auto L = lowerC(std::move(src), /*exprDepthCap=*/kDepth + 1024);
+        funcs = L.mir.mir.funcCount();
+    });
+    // It lowered at all — the whole-body pre-passes walked 6000 HIR levels on
+    // a 256 KiB thread. Assert the module is real, not just that nothing
+    // crashed.
+    EXPECT_GT(funcs, 0u);
 }
 
 // ── D-MIR-NESTED-AGGREGATE-LITERAL-WALKS-RECURSE-PER-INITIALIZER-LEVEL ───────
@@ -422,11 +450,55 @@ TEST(MirLiteralWalk, HundredThousandLevelsCostHeapNotCallFrames) {
 
     std::size_t visited = 0;
     std::vector<std::int64_t> leaves;
-    forEachLiteralNode(std::as_const(cur), [&](MirLiteralValue const& n) {
-        ++visited;
-        if (auto const* iv = std::get_if<std::int64_t>(&n.value)) {
-            leaves.push_back(*iv);
+    int copiedLevels = 0;
+    // ★ THE WALK, THE COPY AND THE TEARDOWN ALL RUN ON THE BOUNDED STACK
+    // (`tests/core/bounded_stack.hpp`, 256 KiB): each of the three cost one
+    // host frame chain per level before its conversion, and at 100_000 levels
+    // any of them needs megabytes. Restore any one and the process dies.
+    test::runOnBoundedStack([&] {
+        forEachLiteralNode(std::as_const(cur), [&](MirLiteralValue const& n) {
+            ++visited;
+            if (auto const* iv = std::get_if<std::int64_t>(&n.value)) {
+                leaves.push_back(*iv);
+            }
+        });
+
+        // ★★ THE COPY IS A WALK TOO (P60). `MirAggregateValue`'s copy
+        // constructor was the compiler's own — `vector` copy → variant copy →
+        // nested aggregate copy, one host frame chain per level. ✔MEASURED
+        // 2026-09-04 (lane `rc`), gdb-attributed under MSVC 19.51 Debug:
+        // `emitGlobals_` copying a 1000-level pool literal died 13 848 frames
+        // deep in it, once the teardown had stopped being the first walk to
+        // overflow. Copy the whole value and walk the copy ITERATIVELY to prove
+        // it is complete — a copy that stopped short would be a silently
+        // different initializer.
+        MirLiteralValue const copy = cur;
+        MirLiteralValue const* node = &copy;
+        // kDepth single-field levels, then the two-leaf bottom aggregate.
+        while (auto const* agg = std::get_if<MirAggregateValue>(&node->value)) {
+            if (agg->fields.size() != 1) break;
+            node = &agg->fields[0];
+            ++copiedLevels;
         }
+        if (auto const* bottom = std::get_if<MirAggregateValue>(&node->value);
+            bottom != nullptr && bottom->fields.size() == 2) {
+            ++copiedLevels;   // the bottom `agg{ int 1, int 2 }` arrived too
+        }
+
+        // ★★ `cur` AND `copy` DIE HERE, AT FULL DEPTH, ON PURPOSE — THE
+        // TEARDOWN IS A THIRD PIN. A nested `MirLiteralValue`'s DESTRUCTOR is a
+        // walk the standard library generates (`~variant → ~MirAggregateValue
+        // → ~vector → ~MirLiteralValue`), and this case used to UNLINK the
+        // spine by hand before letting it die because that walk cost one host
+        // frame chain per level. Since P56
+        // (D-MIR-LITERAL-VALUE-TEARDOWN-RECURSES-PER-AGGREGATE-LEVEL)
+        // `mir_literal_pool.hpp` tears an aggregate down on an explicit heap
+        // work list, so the unlink was a workaround for a defect that no longer
+        // exists — and keeping it would have hidden a REGRESSION of that fix
+        // behind a green (✔the row records 2000 ok / 3000 SEGFAULT under
+        // mingw-w64 g++ Debug for the recursive form).
+        MirLiteralValue drop = std::move(cur);
+        (void)drop;
     });
 
     // kDepth+1 aggregates plus the two leaves.
@@ -436,29 +508,9 @@ TEST(MirLiteralWalk, HundredThousandLevelsCostHeapNotCallFrames) {
     EXPECT_EQ(leaves[1], 2)
         << "fields must be visited in declaration order — the merge assigns "
            "symbol numbers in this order and the summary records it";
-
-    // ⚠ TEAR IT DOWN ITERATIVELY, AND THE REASON IS THE SUBJECT OF THIS FILE.
-    // A nested `MirLiteralValue`'s DESTRUCTOR is itself one host frame per level
-    // — `~variant` → `~MirAggregateValue` → `~vector` → `~MirLiteralValue` — and
-    // it is GENERATED BY THE STANDARD LIBRARY, so nothing this project flattens
-    // can reach it. ✔MEASURED that it survives kDepth on THIS leg (the clean
-    // gate passes), but that is a one-leg measurement of somebody else's frame
-    // size; a pin that died in TEARDOWN would red for a reason with nothing to
-    // do with what it asserts. Unlink the spine so every node destroyed is
-    // shallow. INFERRED, not measured: that a deeper chain or a fatter Debug
-    // frame on another leg would overflow here.
-    {
-        std::vector<MirLiteralValue> shallow;
-        shallow.reserve(static_cast<std::size_t>(kDepth) + 2u);
-        while (true) {
-            auto* agg = std::get_if<MirAggregateValue>(&cur.value);
-            if (agg == nullptr || agg->fields.empty()) break;
-            MirLiteralValue child = std::move(agg->fields.front());
-            agg->fields.clear();
-            shallow.push_back(std::move(cur));
-            cur = std::move(child);
-        }
-    }
+    EXPECT_EQ(copiedLevels, kDepth + 1)
+        << "the copy must reproduce every aggregate level — a short copy is a "
+           "silently different initializer";
 }
 
 // ── D-MIR-PROVABLE-LVALUE-ALIGN-TRUNCATES-SILENTLY-TOWARD-ALIGNED ────────────
@@ -650,10 +702,24 @@ TEST(HirToMirAggregateInit, TwentyThousandBraceLevelsCostHeapNotCallFrames) {
 // the way entirely and a deeper kDepth here would red for somebody else's
 // reason.
 //
-// kDepth is 2000: 4x the MEASURED pre-fix ceiling of 500, and 4x below the
-// unrelated HIR-verifier ceiling of 8000 that would confuse the verdict.
+// ★★★ P60 (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED):
+// THE HIR-VERIFIER CEILING THIS PIN USED TO STAY BELOW IS GONE, AND THE PIN
+// MOVED ONTO THE BOUNDED STACK. ✔MEASURED 2026-09-04 (lane `rc`): at the OLD
+// kDepth of 2000 this case was green on the Ninja + mingw-w64 g++ gate and
+// SEGFAULTED under MSVC 19.51 Debug — gdb-attributed, frame by frame, to a
+// two-frame `pathTerminates` self-cycle (`src/hir/hir_verifier.hpp`) at 368
+// bytes a frame, 736 bytes per `__try` level, dead at ~1380 of the 2000. The
+// same site was the mingw wall at ~8000 (≈130 bytes per level). A green that
+// depends on which toolchain built it is a margin, not a proof; `pathTerminates`
+// is now an explicit heap frame stack and this case runs on 256 KiB
+// (`tests/core/bounded_stack.hpp`) at 4000 — where the recursive predicate at
+// its THINNEST measured cost (130 B/level → 520 KiB) already needs twice the
+// reserve, and the MIR arm's old recursion (500 levels ≈ 1 MiB → ~2 KiB/level)
+// sixteen times it. Restore either and the process dies, on every leg. The
+// schemas are loaded on the main thread first (`shipped()`).
 TEST(HirToMirSehDeepNesting, NestedTryExceptRegionsCostHeapNotCallFrames) {
-    constexpr int kDepth = 2000;   // 4x the MEASURED pre-fix ceiling (500)
+    constexpr int kDepth = 4000;   // 8x the MEASURED pre-fix MIR ceiling (500)
+    (void)shipped();               // load on the MAIN thread, never on the bounded one
 
     std::string src = "int main(void){ int rc = 0;\n";
     for (int i = 0; i < kDepth; ++i) src += "__try { ";
@@ -661,25 +727,29 @@ TEST(HirToMirSehDeepNesting, NestedTryExceptRegionsCostHeapNotCallFrames) {
     for (int i = 0; i < kDepth; ++i) src += " } __except(1) { rc = rc - 1; }";
     src += "\nreturn rc; }";
 
-    auto L = lowerC(std::move(src), /*exprDepthCap=*/kDepth + 4096);
-
-    // ASSERT THE MODULE IS REAL, not merely that nothing crashed: one
-    // `SehTryBegin` per source `__try`. A short walk would be a silently
-    // dropped guarded region — a miscompile, not a missing diagnostic.
-    ASSERT_GT(L.mir.mir.funcCount(), 0u);
+    std::size_t funcs = 0;
     std::size_t regions = 0;
-    for (std::uint32_t fi = 0; fi < L.mir.mir.moduleFuncCount(); ++fi) {
-        MirFuncId const f = L.mir.mir.funcAt(fi);
-        for (std::uint32_t bi = 0; bi < L.mir.mir.funcBlockCount(f); ++bi) {
-            MirBlockId const bb = L.mir.mir.funcBlockAt(f, bi);
-            for (std::uint32_t ii = 0; ii < L.mir.mir.blockInstCount(bb); ++ii) {
-                if (L.mir.mir.instOpcode(L.mir.mir.blockInstAt(bb, ii))
-                    == MirOpcode::SehTryBegin) {
-                    ++regions;
+    test::runOnBoundedStack([&] {
+        auto L = lowerC(std::move(src), /*exprDepthCap=*/kDepth + 4096);
+        funcs = L.mir.mir.funcCount();
+        // COUNT THE MODULE'S SEH REGIONS: one `SehTryBegin` per source
+        // `__try`. A short walk would be a silently dropped guarded region — a
+        // miscompile, not a missing diagnostic.
+        for (std::uint32_t fi = 0; fi < L.mir.mir.moduleFuncCount(); ++fi) {
+            MirFuncId const f = L.mir.mir.funcAt(fi);
+            for (std::uint32_t bi = 0; bi < L.mir.mir.funcBlockCount(f); ++bi) {
+                MirBlockId const bb = L.mir.mir.funcBlockAt(f, bi);
+                for (std::uint32_t ii = 0; ii < L.mir.mir.blockInstCount(bb); ++ii) {
+                    if (L.mir.mir.instOpcode(L.mir.mir.blockInstAt(bb, ii))
+                        == MirOpcode::SehTryBegin) {
+                        ++regions;
+                    }
                 }
             }
         }
-    }
+    });
+    // ASSERT THE MODULE IS REAL, not merely that nothing crashed.
+    ASSERT_GT(funcs, 0u);
     EXPECT_EQ(regions, static_cast<std::size_t>(kDepth))
         << "every source `__try` must mint exactly one SEH region — a short "
            "count is a guarded body that lost its handler";
@@ -788,6 +858,42 @@ TEST(MirTextDeepNesting, DeeplyNestedLiteralParsesBackOnAnOrdinaryThread) {
     EXPECT_EQ(*iv, 7);
 }
 
+// ── THE MEASUREMENT INSTRUMENT FOR THE ONE MIR SITE STILL RECURSIVE ─────────
+//
+// `runExprDriver`'s `SeqExpr` arm lowers a comma chain's side-effect statements
+// through `lowerStmt` — a separate machine on its own host frames — and each
+// of those statements' expressions re-enters the driver, so a LEFT-DEEP comma
+// chain (the shape `a=1, a=2, …` lowers to) costs a six-frame
+// `SeqExpr ⇄ ExprStmt ⇄ AssignStmt` cycle per element. Its axis is LIST
+// LENGTH, the one shape a real corpus reaches (fts5.c: 1765 elements in one
+// initializer). The row records 300 rc 0 / 400 SEGFAULT on the ordinary
+// thread; this case re-measures it without a rebuild:
+//   DSS_MIR_PROBE_COMMA=<N> ctest --test-dir build/<x> \
+//       -R mir/test_deep_nesting_costs_heap -V
+// Idle (skipped) unless the variable is set, so the gate is unaffected.
+TEST(HirToMirSeqExprProbe, WalksTheConfiguredCommaChainLength) {
+    char const* const e = std::getenv("DSS_MIR_PROBE_COMMA");
+    if (e == nullptr || *e == '\0') {
+        GTEST_SKIP() << "DSS_MIR_PROBE_COMMA unset — probe idle";
+    }
+    int const n = std::atoi(e);
+    (void)shipped();
+    // `x = 1, x = 2, …, x = n;` — every element is an assignment whose value is
+    // discarded, and `x` is a runtime variable so nothing folds.
+    std::string src = "int main(void){ int x = 0; ";
+    for (int i = 1; i <= n; ++i) {
+        if (i > 1) src += ", ";
+        src += "x = " + std::to_string(i);
+    }
+    src += "; return x; }";
+    std::fprintf(stdout, "PROBE-MARK BEGIN comma=%d\n", n);
+    std::fflush(stdout);
+    auto L = lowerC(std::move(src), /*exprDepthCap=*/static_cast<std::size_t>(n) + 4096);
+    std::fprintf(stdout, "PROBE-MARK MIR funcs=%u\n",
+                 static_cast<unsigned>(L.mir.mir.funcCount()));
+    std::fflush(stdout);
+}
+
 TEST(HirToMirAtomicAlign, DeepPackedChainStaysUnderAlignedPastTheOldDepthCap) {
     // 70 links: comfortably past the removed `depth > 64`, nowhere near the
     // MEASURED front-end ceilings for nested struct definitions.
@@ -860,8 +966,13 @@ TEST(HirToMirAtomicAlign, ShallowPackedChainIsUnderAlignedAndUnpackedIsNot) {
 // rather than a stack death — the remaining limit on this shape is TIME, not
 // host frames. kDepth is 2000: 20x the measured crash floor of 100, and chosen
 // low enough that the pin stays fast.
+// ★ ON THE BOUNDED STACK (`tests/core/bounded_stack.hpp`, 256 KiB) since P60:
+// the re-entry cost four host frames per `*&` pair — 100 pairs ≈ 1 MiB on
+// mingw-w64 g++ Debug, ~10 KiB per pair — so 2000 pairs need ~20 MiB against
+// 256 KiB. Restore it and the process dies.
 TEST(HirToMirAddressChain, LongAddressOfDerefChainCostsHeapNotCallFrames) {
     constexpr int kDepth = 2000;   // 20x the MEASURED pre-fix ceiling (100)
+    (void)shipped();
 
     // `*&` applied to an `int *` lvalue yields an `int *` lvalue again, so the
     // chain is well-typed at every length and its VALUE is just `p`.
@@ -869,27 +980,31 @@ TEST(HirToMirAddressChain, LongAddressOfDerefChainCostsHeapNotCallFrames) {
     for (int i = 0; i < kDepth; ++i) src += "*&";
     src += "p;\nreturn *r; }";
 
-    auto L = lowerC(std::move(src), /*exprDepthCap=*/kDepth * 4 + 4096);
+    std::size_t funcs = 0;
+    std::size_t loads = 0, stores = 0;
+    test::runOnBoundedStack([&] {
+        auto L = lowerC(std::move(src), /*exprDepthCap=*/kDepth * 4 + 4096);
+        funcs = L.mir.mir.funcCount();
+        for (std::uint32_t fi = 0; fi < L.mir.mir.moduleFuncCount(); ++fi) {
+            MirFuncId const f = L.mir.mir.funcAt(fi);
+            for (std::uint32_t bi = 0; bi < L.mir.mir.funcBlockCount(f); ++bi) {
+                MirBlockId const bb = L.mir.mir.funcBlockAt(f, bi);
+                for (std::uint32_t ii = 0; ii < L.mir.mir.blockInstCount(bb); ++ii) {
+                    MirOpcode const op =
+                        L.mir.mir.instOpcode(L.mir.mir.blockInstAt(bb, ii));
+                    if (op == MirOpcode::Load)  ++loads;
+                    if (op == MirOpcode::Store) ++stores;
+                }
+            }
+        }
+    });
 
     // Assert the module is REAL, and assert the SHAPE rather than just the
     // absence of a crash: `*&` is an identity on an lvalue, so the whole chain
     // must collapse to the same load-and-store `p` alone would produce. A
     // rewrite that dropped or duplicated a link would show up as extra memory
     // traffic here, not as a crash.
-    ASSERT_GT(L.mir.mir.funcCount(), 0u);
-    std::size_t loads = 0, stores = 0;
-    for (std::uint32_t fi = 0; fi < L.mir.mir.moduleFuncCount(); ++fi) {
-        MirFuncId const f = L.mir.mir.funcAt(fi);
-        for (std::uint32_t bi = 0; bi < L.mir.mir.funcBlockCount(f); ++bi) {
-            MirBlockId const bb = L.mir.mir.funcBlockAt(f, bi);
-            for (std::uint32_t ii = 0; ii < L.mir.mir.blockInstCount(bb); ++ii) {
-                MirOpcode const op =
-                    L.mir.mir.instOpcode(L.mir.mir.blockInstAt(bb, ii));
-                if (op == MirOpcode::Load)  ++loads;
-                if (op == MirOpcode::Store) ++stores;
-            }
-        }
-    }
+    ASSERT_GT(funcs, 0u);
     // `int *r = <chain>; return *r;` — the chain reads `p` once, `r` is stored
     // once and read once, and `*r` loads the int. A per-link Load/Store would
     // scale with kDepth; this asserts it does not.

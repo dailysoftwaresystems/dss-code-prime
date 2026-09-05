@@ -59,11 +59,14 @@
 #include "tokenizer/token_stream.hpp"
 #include "tokenizer/tokenizer.hpp"
 
+#include "../../core/bounded_stack.hpp"   // runOnBoundedStack — the BOUND (see there)
+
 #include <gtest/gtest.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -96,11 +99,12 @@ namespace {
     return s;
 }
 
-// Parse against the real shipped c schema ON THE CALLING (ordinary) THREAD.
-[[nodiscard]] Tree parseC(std::string source, ParserConfig cfg) {
-    auto loaded = GrammarSchema::loadShipped("c");
-    EXPECT_TRUE(loaded.has_value());
-    auto schema = *loaded;
+// Parse against an ALREADY-LOADED shipped c schema on the CALLING thread — the
+// split that lets the bounded-stack pins below load the schema on the main
+// thread (a large, input-independent cost) and run only the parse on the
+// small one.
+[[nodiscard]] Tree parseCWith(std::shared_ptr<GrammarSchema const> schema,
+                              std::string source, ParserConfig cfg) {
     auto src = SourceBuffer::fromString(std::move(source), "<spec-ceilings>");
     Tokenizer tk{src, schema, DiagnosticBudget::libraryDefault()};
     auto [stream, lexDiags] = std::move(tk).tokenize();
@@ -108,6 +112,13 @@ namespace {
              DiagnosticBudget::libraryDefault(), std::move(cfg),
              std::move(lexDiags)};
     return std::move(std::move(p).parse().tree);
+}
+
+// Parse against the real shipped c schema ON THE CALLING (ordinary) THREAD.
+[[nodiscard]] Tree parseC(std::string source, ParserConfig cfg) {
+    auto loaded = GrammarSchema::loadShipped("c");
+    EXPECT_TRUE(loaded.has_value());
+    return parseCWith(*loaded, std::move(source), std::move(cfg));
 }
 
 // The SHIPPED config, read from the language rather than restated here — the
@@ -205,7 +216,12 @@ TEST(ParserSpeculationCeilings, EveryCeilingIsConfigDriven) {
     auto spec = (*loaded)->maxSpeculationDepth();
     ASSERT_TRUE(spec.has_value())
         << "c `parser.maxSpeculationDepth` must reach the schema";
-    EXPECT_EQ(*spec, 320u) << "shipped c speculation-depth ceiling";
+    // 2048 since P60 (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED):
+    // the drive is heap-driven, so the value is bounded by the MEMORY a live
+    // probe's checkpoint costs (quadratic in depth — ✔MEASURED 332 MiB at 2048,
+    // 1.2 GiB at 4096), not by a host stack. The `$parserComment` in
+    // `c.lang.json` carries the whole derivation.
+    EXPECT_EQ(*spec, 2048u) << "shipped c speculation-depth ceiling";
     EXPECT_GT(*spec, 63u)
         << "ISO C23 5.2.4.1 requires 63 nesting levels of parenthesised "
            "expressions — the FLOOR, not the target";
@@ -216,8 +232,26 @@ TEST(ParserSpeculationCeilings, EveryCeilingIsConfigDriven) {
     auto factor = (*loaded)->speculationBudgetFactor();
     ASSERT_TRUE(factor.has_value())
         << "c `parser.speculationBudgetFactor` must reach the schema";
-    EXPECT_EQ(*factor, 64u) << "shipped c speculative token-budget factor";
+    // 128 since P60: the outermost probe of a cast chain holds the WHOLE chain
+    // (3 tokens per cast), so at the old 64 x 64 = 4096 tokens the budget would
+    // have silently taken over from the depth ceiling at ~1365 casts.
+    EXPECT_EQ(*factor, 128u) << "shipped c speculative token-budget factor";
     EXPECT_GT(*factor, 16u) << "the lift must raise it above the old hardcoded 16";
+    EXPECT_GE(*factor * 64u, 3u * *spec + 1u)
+        << "the operand alt's budget (factor x its lookahead of 64) must hold a "
+           "cast chain at the depth ceiling, or the budget — not the depth — is "
+           "what a deep cast chain meets";
+
+    auto expr = (*loaded)->maxExpressionDepth();
+    ASSERT_TRUE(expr.has_value())
+        << "c `parser.maxExpressionDepth` must reach the schema";
+    EXPECT_EQ(*expr, 16384u)
+        << "shipped c expression-depth ceiling (gcc's measured working paren "
+           "depth; pinned exactly in test_parser_c_smoke too)";
+    EXPECT_GT(*expr, *spec)
+        << "a cast costs one expression level AND one probe, so the "
+           "speculation ceiling must be the lower of the two or a deep cast "
+           "chain would be refused as an expression-depth overflow";
 }
 
 // ── (B) THE LIFT ────────────────────────────────────────────────────────────
@@ -433,27 +467,114 @@ TEST(ParserSpeculationCeilings, ShieldDoesNotSwallowALaterStatementsError) {
         << allCodes(t) << "]";
 }
 
-// ── (D) THE CEILING SITS BELOW THE ORDINARY-THREAD CRASH FLOOR ──────────────
+// ── (D) THE CEILING SITS BELOW THE CRASH FLOOR — ON A BOUNDED STACK ─────────
+//
 // The whole point of a fail-loud counter is that it trips BEFORE the host stack
-// does. This case runs a chain one level past the shipped ceiling on the
-// ORDINARY gtest thread (~1 MiB, no `callOnLargeStack`): reaching the assertions
-// at all is the proof that the ceiling — not a stack overflow — is what a
-// too-deep program meets. A regression that raises the shipped number past the
-// floor does not fail this case, it CRASHES it, which is a louder red than an
-// assertion and is the correct signal.
-TEST(ParserSpeculationCeilings, ShippedCeilingIsReachableOnAnOrdinaryThread) {
+// does. This case runs a chain one level past the shipped ceiling on a thread
+// whose stack is DELIBERATELY SMALL (`tests/core/bounded_stack.hpp`, 256 KiB —
+// a quarter of the ordinary thread and a fraction of what any leg's host hands
+// out): reaching the assertions at all is the proof that the ceiling — not a
+// stack overflow — is what a too-deep program meets, and that the proof holds
+// on EVERY toolchain, not on the one the gate happens to build with.
+//
+// ★★★ WHY THE BOUND, AND NOT THE ORDINARY THREAD THIS CASE USED TO RUN ON.
+// ✔MEASURED 2026-09-04 (P60, lane `rc`): with the speculation drive still host
+// recursion, this exact case was GREEN on the Ninja + mingw-w64 g++ gate and
+// SEGFAULTED under MSVC 19.51 Debug — gdb-attributed to an 8-frame cycle per
+// cast (`trySpeculativeBranch → stepOnce → walkExpression → … → stepOnce`) at
+// 1072 bytes a frame, 8.5 KiB per level, so the 1 MiB thread died at ~120
+// casts where `c.lang.json` promised a loud refusal at 320. On the ordinary
+// thread a pin that COMPLETES measures the margin of one toolchain's frames;
+// on 256 KiB, a recursion of even 64 bytes per level is dead by 4096 levels on
+// every toolchain, while the converted drive (one heap `SpeculationSite` per
+// probe, one heap `ExprFrame` per expression level) costs O(1) host stack per
+// level and completes. Restore the recursion and this case does not fail, the
+// process dies — on the Ninja gate too.
+//
+// The schema is loaded on the MAIN thread on purpose: the loader's cost is
+// large and input-INDEPENDENT (see `bounded_stack.hpp`), and it is not what
+// this case bounds.
+TEST(ParserSpeculationCeilings, ShippedCeilingIsReachableOnABoundedStack) {
     auto loaded = GrammarSchema::loadShipped("c");
     ASSERT_TRUE(loaded.has_value());
-    const std::size_t ceiling = (*loaded)->maxSpeculationDepth().value_or(8);
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    const std::size_t ceiling = schema->maxSpeculationDepth().value_or(8);
+    ParserConfig cfg = shippedCConfig();
 
-    Tree t = parseC(castChain(ceiling + 1), shippedCConfig());
-    ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_TRUE(t.diagnostics().hasErrors())
+    std::optional<Tree> t;
+    test::runOnBoundedStack([&] {
+        t.emplace(parseCWith(schema, castChain(ceiling + 1), std::move(cfg)));
+    });
+    ASSERT_TRUE(t.has_value());
+    ASSERT_NE(t->root(), InvalidNode);
+    EXPECT_TRUE(t->diagnostics().hasErrors())
         << "one past the ceiling must be refused, not silently accepted";
-    EXPECT_GE(countCode(t, DiagnosticCode::P_MaxSpeculationDepth), 1u)
+    EXPECT_GE(countCode(*t, DiagnosticCode::P_MaxSpeculationDepth), 1u)
         << "and the refusal is the SPECULATION ceiling, by name — no other "
-           "ceiling may be the one that binds first; codes=[" << allCodes(t)
+           "ceiling may be the one that binds first; codes=[" << allCodes(*t)
         << "]";
-    EXPECT_EQ(countCode(t, DiagnosticCode::P_NoAlternativeMatched), 0u)
-        << "codes=[" << allCodes(t) << "]";
+    EXPECT_EQ(countCode(*t, DiagnosticCode::P_NoAlternativeMatched), 0u)
+        << "codes=[" << allCodes(*t) << "]";
+}
+
+// ── (E) THE WHOLE SHIPPED RANGE PARSES ON THE BOUNDED STACK ─────────────────
+//
+// (D) proves the counter trips before the stack does; these two prove the
+// range BELOW the counter is real — a cast chain AT the shipped speculation
+// ceiling and a paren nest one below the shipped expression ceiling both parse
+// clean on 256 KiB. The discriminating arithmetic, per the ceilings measured
+// with the recursion in the tree: a cast cost ~1.63 KiB per level on the
+// THINNEST supported frames (mingw-w64 g++ Debug, 640 casts ≈ 1 MiB), so a
+// regression needs ceiling × 1.63 KiB — over 6 MiB at 4096 — against a 256 KiB
+// reserve; a paren cost ~800 bytes per level there (1318 levels ≈ 1 MiB), over
+// 12 MiB at 16383. Either would die dozens of times over.
+//
+// ⚠ These depths are the SHIPPED numbers read off the schema, deliberately —
+// the same values `c.lang.json`'s `$parserComment` justifies — so raising a
+// ceiling past what the parser can carry on 256 KiB is caught HERE, by the
+// process dying, rather than by an embedder.
+TEST(ParserSpeculationCeilings, DeepCastChainAtTheShippedCeilingParsesOnABoundedStack) {
+    auto loaded = GrammarSchema::loadShipped("c");
+    ASSERT_TRUE(loaded.has_value());
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    const std::size_t ceiling = schema->maxSpeculationDepth().value_or(8);
+    ParserConfig cfg = shippedCConfig();
+
+    std::optional<Tree> t;
+    test::runOnBoundedStack([&] {
+        t.emplace(parseCWith(schema, castChain(ceiling), std::move(cfg)));
+    });
+    ASSERT_TRUE(t.has_value());
+    EXPECT_FALSE(t->diagnostics().hasErrors())
+        << ceiling << " nested `(int)` casts is exactly the shipped ceiling and "
+           "must parse clean; codes=[" << allCodes(*t) << "]";
+}
+
+TEST(ParserSpeculationCeilings, DeepParenNestBelowTheShippedCeilingParsesOnABoundedStack) {
+    auto loaded = GrammarSchema::loadShipped("c");
+    ASSERT_TRUE(loaded.has_value());
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    const std::size_t exprCeiling = schema->maxExpressionDepth().value_or(256);
+    ASSERT_GT(exprCeiling, 1u);
+    ParserConfig cfg = shippedCConfig();
+
+    // `int main(void){ int x=0; return (((…x…))); }` — the paren / postfix-body
+    // re-entry, one atom frame per `(`; `x` is a runtime variable so nothing
+    // folds. One BELOW the expression ceiling: the outermost expression is a
+    // level of its own.
+    const std::size_t parens = exprCeiling - 1;
+    std::string src = "int main(void){ int x=0; return ";
+    src.append(parens, '(');
+    src += "x";
+    src.append(parens, ')');
+    src += "; }";
+
+    std::optional<Tree> t;
+    test::runOnBoundedStack([&] {
+        t.emplace(parseCWith(schema, std::move(src), std::move(cfg)));
+    });
+    ASSERT_TRUE(t.has_value());
+    EXPECT_FALSE(t->diagnostics().hasErrors())
+        << parens << " nested parentheses sit one below the shipped expression "
+           "ceiling and must parse clean; codes=[" << allCodes(*t) << "]";
 }

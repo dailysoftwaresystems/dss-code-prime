@@ -3,7 +3,7 @@
   "header": "dirent.h",
   "standard": "posix",
   "availableObjectFormats": ["elf", "macho", "pe"],
-  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "library": { "elf": { "role": "cLibrary" }, "macho": { "role": "cLibrary" } },
   "realization": { "pe": { "source": "runtime/platform/src/dirent.c" } },
   "includes": [
     { "header": "windows.h", "when": { "format": "pe" } }

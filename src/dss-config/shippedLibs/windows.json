@@ -3,7 +3,7 @@
   "header": "windows.h",
   "standard": "win32",
   "availableObjectFormats": ["pe"],
-  "library": { "pe": "kernel32.dll" },
+  "library": { "pe": { "role": "systemPrimitives" } },
   "includes": ["stdlib.h"],
   "typedefs": [
     { "name": "VOID",      "type": "void" },

@@ -1145,10 +1145,11 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
 // Decode a per-object-format `library` MAP node ({"pe":"msvcrt.dll",
 // "elf":"libc.so.6"}) into `out`. Each KEY must be a known object-format name
 // (the `objectFormatKindFromName` vocabulary — a typo like "pee" fails loud
-// HERE, not at a user's link); each VALUE must be a string. A NON-OBJECT node is
+// HERE, not at a user's link); each VALUE is a string naming an image, or — see
+// below — an object naming a runtime ROLE. A NON-OBJECT node is
 // a SHAPE error → emits + returns false (the caller ABORTS: the descriptor-level
 // map hard-returns nullopt, a per-symbol override skips that symbol). Per-KEY
-// errors (unknown format / non-string value) are collect-all (emitted + skipped;
+// errors (unknown format / malformed value) are collect-all (emitted + skipped;
 // the overall read still fails via the caller's errorCount delta). The SHARED
 // chokepoint for the descriptor-level `library` AND the per-symbol `library`
 // override — so the two validations can NEVER drift (the decodeShippedAvailability
@@ -1156,10 +1157,43 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
 // `if (key == "pe")` identity branch. `ctx` is the caller's already-quoted
 // diagnostic context (e.g. "'p'" for the root, "'p' symbols[3]" for a symbol);
 // `field` is the map's spelling ("library"). (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC)
+//
+// ── THE ROLE FORM (D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE)
+//
+// `{"pe": {"role": "cLibrary"}}` names the image by the runtime ROLE that owns
+// it in the object format's `runtimeLibraries` table, instead of restating the
+// image here. ✔MEASURED before this form existed: 67 of the 69 (descriptor,
+// format) entries in the shipped corpus restated a declared role's image, and a
+// repoint of the `cLibrary` row moved the format's own `exit` import while
+// leaving every descriptor's `puts` on the old image — rc=0 at every stage and a
+// load failure. The literal form STAYS: `libm.so.6` plays no role on elf, and an
+// image that plays no role has no other spelling.
+//
+// The value is EITHER a string (a literal image) OR an object whose one key is
+// `role` — never both, and an object carrying `image` beside `role` is refused
+// BY NAME rather than as "unknown key", because the author meant the other
+// spelling. The role spelling is the closed `RuntimeLibraryRole` vocabulary
+// minus the `none` sentinel; both refusals are format-independent so an arm no
+// current target selects cannot rot.
+//
+// RESOLUTION happens HERE, at decode, and only for the ONE key the caller's
+// `roleResolver` answers for (`formatKindName()`): that entry lands in `out` as
+// the role's image, a plain string, so every consumer of the map — `buildCuMir`'s
+// fold, the assembly binder, the archive-member binder, the semantic injector's
+// per-symbol merge — reads exactly what it read before and none learns a role was
+// involved. Every role entry, answered or not, is recorded as declared in
+// `outRoles`. With a resolver in hand, a role it cannot answer REFUSES: a role no
+// document of the family declares, a role the family REALIZES from a shipped
+// source (there is no image to import from — that is the `realization` map's
+// channel, not this one), or a family that cannot be assembled. With NO resolver
+// (a caller that binds no import — see the header) the entry is recorded and
+// yields nothing, which is the UNBOUND arm an omitted key already states.
 [[nodiscard]] bool decodeLibraryMap(json const& node, std::string const& ctx,
                                     std::string const& field,
                                     DiagnosticReporter& reporter,
-                                    std::unordered_map<std::string, std::string>& out) {
+                                    RuntimeLibraryRoleResolver const* roleResolver,
+                                    std::unordered_map<std::string, std::string>& out,
+                                    std::unordered_map<std::string, RuntimeLibraryRole>& outRoles) {
     if (!node.is_object()) {
         emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
             // The example names the MODERN pe C runtime deliberately: this text is
@@ -1176,8 +1210,11 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
             // for this corpus, which refuses any pe image with no stated verdict.
             // A prose census in a diagnostic string is a copy nothing re-derives;
             // that is exactly how this one went stale unnoticed.
+            // The example shows BOTH spellings: the role form is what an author
+            // should copy for an image that plays a runtime role, the literal is
+            // for one that plays none (`libm.so.6`).
             + "' must be a per-object-format object, e.g. "
-              "{\"pe\":\"ucrtbase.dll\",\"elf\":\"libc.so.6\"}");
+              "{\"pe\":{\"role\":\"cLibrary\"},\"elf\":\"libm.so.6\"}");
         return false;
     }
     for (auto const& kv : node.items()) {
@@ -1199,9 +1236,89 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
                 + std::string{kObjectFormatKindSentinelRejection});
             continue;
         }
+        if (kv.value().is_object()) {
+            json const&        entry = kv.value();
+            std::string const  at    = ctx + " " + field + "." + kv.key();
+            // The two spellings are ALTERNATIVES: an object exists to name a
+            // role, and an `image` beside it is the literal spelling smuggled
+            // into the role one — two owners of one fact inside one entry.
+            if (entry.contains("image")) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                    + " names BOTH a runtime role and an image; an entry is "
+                      "EITHER a string naming the image, OR {\"role\": ...} "
+                      "naming the runtime role whose image the object format's "
+                      "'runtimeLibraries' table owns — never both");
+                continue;
+            }
+            if (!rejectUnknownKeys(reporter, entry, ctx + " " + field + "." + kv.key(),
+                                   {"role"}))
+                continue;
+            if (!entry.contains("role") || !entry.at("role").is_string()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                    + " must declare a string 'role' naming a runtime-library "
+                      "role of the object format's 'runtimeLibraries' table "
+                      "(accepted: "
+                    + allowedList(kSelectableRuntimeLibraryRoleNames) + ")");
+                continue;
+            }
+            auto const roleText = entry.at("role").get<std::string>();
+            auto const role     = runtimeLibraryRoleFromName(roleText);
+            if (!role.has_value()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                    + " names unknown runtime-library role '" + roleText
+                    + "' (accepted: "
+                    + allowedList(kSelectableRuntimeLibraryRoleNames) + ")");
+                continue;
+            }
+            // `none` spells correctly, exactly as the `unknown` object-format
+            // sentinel does above: only an explicit selectability check stops
+            // a role that no table can ever declare.
+            if (!isSelectableRuntimeLibraryRole(*role)) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                    + " names the 'none' sentinel, which no 'runtimeLibraries' "
+                      "table may declare (accepted: "
+                    + allowedList(kSelectableRuntimeLibraryRoleNames) + ")");
+                continue;
+            }
+            outRoles.emplace(kv.key(), *role);
+            if (roleResolver == nullptr || roleResolver->formatKindName() != kv.key())
+                continue;   // declared and recorded; nothing here binds it
+            std::string        refusal;
+            auto const* const  row = roleResolver->rowForRole(*role, refusal);
+            if (!refusal.empty()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                    + " names runtime-library role '" + roleText
+                    + "', which cannot be answered for object-format family '"
+                    + kv.key() + "': " + refusal);
+                continue;
+            }
+            if (row == nullptr) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                    + " names runtime-library role '" + roleText
+                    + "', but no shipped '" + kv.key()
+                    + "' object-format document declares that role — a role that "
+                      "resolves to nothing would leave every symbol of this "
+                      "descriptor bound to no image. Declare the row on the "
+                      "format that needs it, or name the image");
+                continue;
+            }
+            if (row->image.empty()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                    + " names runtime-library role '" + roleText
+                    + "', which object-format family '" + kv.key()
+                    + "' REALIZES from the shipped source '" + row->source
+                    + "' rather than importing from an image; a 'library' entry "
+                      "names an image to IMPORT from, so a body DSS ships belongs "
+                      "under 'realization', never here");
+                continue;
+            }
+            out.emplace(kv.key(), row->image);
+            continue;
+        }
         if (!kv.value().is_string()) {
             emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
-                + "." + kv.key() + "' must be a string");
+                + "." + kv.key() + "' must be a string naming the image, or "
+                  "{\"role\": ...} naming the runtime-library role that owns it");
             continue;
         }
         std::string image = kv.value().get<std::string>();
@@ -2171,7 +2288,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                          DataModel                       dataModel,
                          std::optional<std::string_view> activeTarget,
                          std::optional<ObjectFormatKind> activeFormat,
-                         std::span<NamedTypeBinding const> namedTypes) {
+                         std::span<NamedTypeBinding const> namedTypes,
+                         RuntimeLibraryRoleResolver const* roleResolver) {
     std::size_t const errBefore = reporter.errorCount();
 
     // (0)+(1) Read + parse the file — via the thread-local parse cache (the same
@@ -2244,7 +2362,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // there is nothing left to bind); per-key errors ride the errorCount delta.
         if (!decodeLibraryMap(doc.at("library"),
                               std::string{"'"} + core::genericSpelling(path) + "'",
-                              "library", reporter, out.library))
+                              "library", reporter, roleResolver, out.library,
+                              out.libraryRoles))
             return std::nullopt;
     }
 
@@ -3171,9 +3290,11 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // (unknown format key / non-string value fail loud); a non-object node skips
         // this symbol (the symbol-loop collect-all pattern). AGNOSTIC: a generic
         // per-format map, no name/arch/format identity branch.
-        std::unordered_map<std::string, std::string> symLibrary;
+        std::unordered_map<std::string, std::string>       symLibrary;
+        std::unordered_map<std::string, RuntimeLibraryRole> symLibraryRoles;
         if (sym.contains("library")
-            && !decodeLibraryMap(sym.at("library"), at, "library", reporter, symLibrary))
+            && !decodeLibraryMap(sym.at("library"), at, "library", reporter,
+                                 roleResolver, symLibrary, symLibraryRoles))
             continue;
 
         // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the per-SYMBOL `realization`
@@ -3301,7 +3422,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                           kind, linkage, std::move(symAvail),
                           noreturn, returnsTwice, std::move(synthesize),
                           std::move(version), std::move(linkName),
-                          std::move(symLibrary), std::move(symRealization)});
+                          std::move(symLibrary), std::move(symRealization),
+                          std::move(symLibraryRoles)});
     }
 
     // ══ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF — R1 + R3, AT LOAD ==========
@@ -3312,28 +3434,64 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // format — 39 of the 40 descriptors declare no `realization` at all and pay
     // literally nothing.
     {
-        auto effective = [&](std::unordered_map<std::string, std::string> const& base,
-                             std::unordered_map<std::string, std::string> const& ov) {
+        // Generic over the mapped type: the `library` map holds images and the
+        // `libraryRoles` map holds roles, and BOTH are overridden per symbol by
+        // the same base-then-override rule.
+        auto effective = [](auto const& base, auto const& ov) {
             auto m = base;
             for (auto const& [k, v] : ov) m.insert_or_assign(k, v);
             return m;
         };
+        // ★★★ THE IMPORT R3 IS ABOUT IS DECLARED IN EITHER SPELLING, AND READING
+        // THE RESOLVED IMAGE MAP ALONE NARROWS THE RULE FROM FORMAT-INDEPENDENT
+        // TO RESOLVER-DEPENDENT
+        // (D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE).
+        // A role entry lands in `library` ONLY when a resolver answered for that
+        // exact object-format kind, so keying R3 on `library` alone would mean:
+        // with NO resolver (the LSP, the header parser, the corpus sweeps, every
+        // direct-API caller) R3 could never fire on a role entry at all, and WITH
+        // one it would fire only for the kind that build happens to select. A
+        // descriptor gaining `"library": {"macho": {"role": "cLibrary"}}` beside
+        // `"realization": {"macho": {"source": …}}` would then read clean on
+        // every pe and elf build and be caught only by a macOS one — while the
+        // uncaught state is precisely the one this rule exists to refuse. The
+        // union is the rule: a role entry is an import DECLARATION whether or not
+        // this particular read resolved it.
+        auto declaredImport =
+            [](std::unordered_map<std::string, std::string> const& lib,
+               std::unordered_map<std::string, RuntimeLibraryRole> const& roles,
+               std::string const& fmt) -> std::string {
+                if (auto const roleIt = roles.find(fmt); roleIt != roles.end()) {
+                    std::string spelling =
+                        "'library." + fmt + "' = {\"role\": \""
+                        + std::string{runtimeLibraryRoleName(roleIt->second)} + "\"}";
+                    // The resolved image when this read had a resolver — the
+                    // author's spelling first, the consequence second.
+                    if (auto const libIt = lib.find(fmt); libIt != lib.end())
+                        spelling += ", the image '" + libIt->second + "'";
+                    return spelling;
+                }
+                if (auto const libIt = lib.find(fmt); libIt != lib.end())
+                    return "'library." + fmt + "' = '" + libIt->second + "'";
+                return {};
+            };
         auto checkOwner =
             [&](std::unordered_map<std::string, std::string> const& lib,
+                std::unordered_map<std::string, RuntimeLibraryRole> const& roles,
                 std::unordered_map<std::string, std::string> const& real,
                 std::string const& ctx) {
                 for (auto const& [fmt, src] : real) {
-                    // R3 — an IMAGE and a SOURCE for one format. Two owners for one
+                    // R3 — an IMPORT and a SOURCE for one format. Two owners for one
                     // body is the defect, not a fallback: silently preferring
                     // either is how a program links against an image that does not
                     // export the symbol and then dies at LOAD, with no diagnostic
                     // at any compile stage.
-                    if (auto const libIt = lib.find(fmt); libIt != lib.end()) {
+                    if (std::string const declared = declaredImport(lib, roles, fmt);
+                        !declared.empty()) {
                         emitMalformed(reporter,
                             "shipped-lib descriptor '" + core::genericSpelling(path) + "' "
-                            + ctx + " declares BOTH an import ('library." + fmt
-                            + "' = '" + libIt->second
-                            + "') AND a shipped-source realization ('realization."
+                            + ctx + " declares BOTH an import (" + declared
+                            + ") AND a shipped-source realization ('realization."
                             + fmt + ".source' = '" + src + "') for the object format '"
                             + fmt + "' — two owners for one body "
                             "(D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R3)");
@@ -3355,11 +3513,12 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     }
                 }
             };
-        checkOwner(out.library, out.realization, "(root)");
+        checkOwner(out.library, out.libraryRoles, out.realization, "(root)");
         for (std::size_t i = 0; i < out.symbols.size(); ++i) {
             auto const& sym = out.symbols[i];
             if (sym.realization.empty() && out.realization.empty()) continue;
             checkOwner(effective(out.library, sym.library),
+                       effective(out.libraryRoles, sym.libraryRoles),
                        effective(out.realization, sym.realization),
                        "symbols[" + std::to_string(i) + "] ('" + sym.name + "')");
         }
@@ -4282,6 +4441,62 @@ collectShippedExternSymbolFormats() {
     return byName;
 }
 
+namespace {
+
+// ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ─────
+//
+// Did the descriptor at `path` fail to read because of THIS BUILD, or on its own
+// terms? The oracle below swallows a failed read on purpose — it is consulted
+// for names the user never `#include`d, so an unrelated malformed descriptor
+// must not become this program's build failure. A ROLE that the active format
+// family cannot answer is the opposite kind of fault, and it arrived with the
+// role channel: the descriptor is well-formed, the corpus and the format
+// documents simply do not agree, and the consequence is that the WHOLE
+// descriptor vanishes. Its names then route unbound and the link tier blames the
+// USER's program for an undefined `puts` — a diagnostic pointing at the wrong
+// file, which is the same failure `emitCorpusInvariant` and step (2b) exist to
+// avoid. (Reached, concretely, by a `.s` writing `call puts` through the
+// assembly binder, and by an archive member through the lazy pull.)
+//
+// ★ THE CLASSIFICATION IS A RE-READ, NOT A MESSAGE MATCH. Read the same
+// descriptor again with NO resolver: everything a resolver can refuse is by
+// construction the only difference between the two reads, so a second read that
+// SUCCEEDS proves the resolver is what refused, and one that fails again proves
+// the descriptor is malformed on its own terms and the skip is right. A string
+// or code test would be a second owner of "which refusals are resolver-dependent"
+// — a list that goes stale the first time an arm is added. The cost is one extra
+// decode on a path that is already failing, and the JSON parse behind it is the
+// thread-local cache's, not a second read of the file.
+//
+// ⓘ WHY ONLY THIS ENTRY POINT. `realizeShippedDescriptorSurfaceFor` swallows the
+// same way and is deliberately left alone, for the reason its own pin already
+// states about the agreement rule: the surface fetch is a CONSEQUENCE of a shim
+// claim `realizeShippedExternSymbols` already made from the SAME descriptor, in
+// the same candidate order, with the build's own reporter — so it can never be
+// the first reader of a descriptor, and a refusal it would meet has already been
+// reported here. On the `#include` path the first reader is
+// `readShippedLibDescriptor` itself, called with the build's reporter.
+[[nodiscard]] bool
+refusalBelongsToThisBuild(std::filesystem::path const&      path,
+                          TypeInterner&                     interner,
+                          TypeRegistry&                     typeReg,
+                          DataModel                         dataModel,
+                          std::optional<std::string_view>   activeTarget,
+                          std::optional<ObjectFormatKind>   activeFormat,
+                          std::span<NamedTypeBinding const> namedTypes,
+                          RuntimeLibraryRoleResolver const* roleResolver) {
+    // No resolver ⇒ nothing but the descriptor itself could have refused.
+    if (roleResolver == nullptr) return false;
+    DiagnosticReporter withoutResolver;
+    auto const again = readShippedLibDescriptor(path, interner, typeReg,
+                                                withoutResolver, dataModel,
+                                                activeTarget, activeFormat,
+                                                namedTypes, nullptr);
+    return again.has_value();
+}
+
+} // namespace
+
 std::optional<std::unordered_map<std::string, ShippedSymbolRealization>>
 realizeShippedExternSymbols(std::span<std::string const>      names,
                             TypeInterner&                     interner,
@@ -4290,7 +4505,8 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
                             DataModel                         dataModel,
                             std::optional<std::string_view>   activeTarget,
                             std::optional<ObjectFormatKind>   activeFormat,
-                            std::span<NamedTypeBinding const> namedTypes) {
+                            std::span<NamedTypeBinding const> namedTypes,
+                            RuntimeLibraryRoleResolver const* roleResolver) {
     CorpusIndex const* const idx = corpusIndex();
     if (idx == nullptr) return std::nullopt;   // discovery failed — route unbound
     std::unordered_map<std::string, ShippedSymbolRealization> out;
@@ -4359,13 +4575,24 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
     // malformedness must not become this program's build failure. Its names then
     // stay `Unknown` and route unbound, where the link tier judges the reference
     // LOUD. (The `shippedHeaderAvailableForFormat` precedent.)
+    //
+    // ★★ EXCEPT FOR THE ONE FAULT THAT IS ABOUT THIS BUILD RATHER THAN ABOUT AN
+    // UNRELATED FILE — see `refusalBelongsToThisBuild` for the whole rule and the
+    // reason the classification is a RE-READ rather than a message match.
     std::unordered_map<std::string, ShippedLibDescriptor> decoded;
     for (auto const& rel : wantedDescriptors) {
         DiagnosticReporter throwaway;
         auto desc = readShippedLibDescriptor(idx->root / rel, interner, typeReg,
                                              throwaway, dataModel, activeTarget,
-                                             activeFormat, namedTypes);
-        if (!desc) continue;
+                                             activeFormat, namedTypes, roleResolver);
+        if (!desc) {
+            if (refusalBelongsToThisBuild(idx->root / rel, interner, typeReg,
+                                          dataModel, activeTarget, activeFormat,
+                                          namedTypes, roleResolver)) {
+                for (auto const& d : throwaway.all()) reporter.report(d);
+            }
+            continue;
+        }
         decoded.emplace(rel, std::move(*desc));
     }
 
@@ -4566,7 +4793,8 @@ realizeShippedDescriptorSurfaceFor(std::string_view                  name,
                                    DataModel                         dataModel,
                                    std::optional<std::string_view>   activeTarget,
                                    std::optional<ObjectFormatKind>   activeFormat,
-                                   std::span<NamedTypeBinding const> namedTypes) {
+                                   std::span<NamedTypeBinding const> namedTypes,
+                                   RuntimeLibraryRoleResolver const* roleResolver) {
     CorpusIndex const* const idx = corpusIndex();
     if (idx == nullptr) return std::nullopt;
     std::unordered_map<std::string, ShippedSymbolRealization> out;
@@ -4580,10 +4808,16 @@ realizeShippedDescriptorSurfaceFor(std::string_view                  name,
     // descriptor `realizeShippedExternSymbols` chose for that name, never a
     // different one that happens to declare the name too.
     for (auto const& row : nameIt->second) {
-        DiagnosticReporter throwaway;   // see the skip rationale in the header
+        // See the skip rationale in the header — and `refusalBelongsToThisBuild`
+        // for why the role-refusal exception it makes does NOT need repeating
+        // here: this fetch is a consequence of a shim claim
+        // `realizeShippedExternSymbols` already made from the SAME descriptor, in
+        // the same candidate order, on the build's own reporter.
+        DiagnosticReporter throwaway;
         auto desc = readShippedLibDescriptor(idx->root / row.relPath, interner,
                                             typeReg, throwaway, dataModel,
-                                            activeTarget, activeFormat, namedTypes);
+                                            activeTarget, activeFormat, namedTypes,
+                                            roleResolver);
         if (!desc) continue;
         bool const docHere = objectFormatInAvailabilitySet(
             desc->availableObjectFormats, *activeFormat);

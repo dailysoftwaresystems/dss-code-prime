@@ -7955,6 +7955,175 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readOptWord("errorDirective",         cfg.errorDirective);
             readOptWord("warningDirective",       cfg.warningDirective);
             readOptWord("hasEmbedOperator",       cfg.hasEmbedOperator);
+            // ── C23 6.10.4.2–6.10.4.5 (D-PP-EMBED-PARAMS): `embedParameters` ──
+            //
+            // The standard `#embed` parameter VERBS bound to the names a program
+            // spells (`{ name, role }` rows, the `pragmaEffects` house pattern)
+            // plus the token KIND of a prefixed parameter's `::` (C23 6.10.1p4).
+            // OPTIONAL: absent leaves `cfg.embedParameters` empty, so every
+            // parameter on a `#embed` line is a loud constraint violation and
+            // `__has_embed` with any parameter clause answers NOT_FOUND(0) — an
+            // honest subset, and this block's REMOVE-direction pin.
+            if (pp.contains("embedParameters")) {
+                json const& ep = pp.at("embedParameters");
+                if (!ep.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/embedParameters",
+                              "'preprocess.embedParameters' must be an object "
+                              "{ prefixSeparatorToken, standard: [{ name, role }] }");
+                } else {
+                    static constexpr std::array<std::string_view, 2>
+                        kEmbedParamKeys{"prefixSeparatorToken", "standard"};
+                    DSS_CHECK_KEY_VOCABULARY(kEmbedParamKeys);
+                    (void)checkKeysAgainst(
+                        ep, kEmbedParamKeys, "/preprocess/embedParameters",
+                        "the 'embedParameters' block",
+                        DiagnosticCode::C_InvalidPreprocess, coll);
+                    // The CLOSED verb set — ONE table read by the lookup AND by
+                    // the rejection message (the `kPragmaVerbs` precedent), so
+                    // the message can never advertise a verb that no longer
+                    // exists.
+                    static constexpr std::array<
+                        std::pair<std::string_view,
+                                  PreprocessConfig::EmbedParameterRole>, 4>
+                        kEmbedParamRoles{{
+                            {"limit",   PreprocessConfig::EmbedParameterRole::Limit},
+                            {"prefix",  PreprocessConfig::EmbedParameterRole::Prefix},
+                            {"suffix",  PreprocessConfig::EmbedParameterRole::Suffix},
+                            {"ifEmpty", PreprocessConfig::EmbedParameterRole::IfEmpty}}};
+                    DSS_CHECK_KEY_VOCABULARY(kEmbedParamRoles);
+                    static constexpr std::array<std::string_view, 2>
+                        kEmbedParamRowKeys{"name", "role"};
+                    DSS_CHECK_KEY_VOCABULARY(kEmbedParamRowKeys);
+                    PreprocessConfig::EmbedParameterConfig out;
+                    bool ok = true;
+                    // REQUIRED inside the block: without the `::` kind the
+                    // prefixed form of 6.10.1 is unlexable, and `__has_embed`
+                    // could not give 6.10.2p8's answer (an unrecognised PREFIXED
+                    // parameter is not a violation, it is 0) truthfully.
+                    if (!ep.contains("prefixSeparatorToken")
+                        || !ep.at("prefixSeparatorToken").is_string()
+                        || ep.at("prefixSeparatorToken").get<std::string>().empty()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/preprocess/embedParameters/prefixSeparatorToken",
+                                  "'preprocess.embedParameters' requires a non-empty "
+                                  "'prefixSeparatorToken' — the token KIND of a "
+                                  "prefixed parameter's '::' (C23 6.10.1p4)");
+                        ok = false;
+                    } else {
+                        out.prefixSeparatorToken =
+                            ep.at("prefixSeparatorToken").get<std::string>();
+                        checkToken(out.prefixSeparatorToken,
+                                   "embedParameters/prefixSeparatorToken");
+                    }
+                    if (!ep.contains("standard") || !ep.at("standard").is_array()
+                        || ep.at("standard").empty()) {
+                        // A block binding no verb declares nothing and reads as a
+                        // surface that is not there — the dead-config shape this
+                        // loader refuses everywhere else. Omit the block instead.
+                        coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                  "/preprocess/embedParameters/standard",
+                                  "'preprocess.embedParameters.standard' must be a "
+                                  "NON-EMPTY array of { name, role } rows — a block "
+                                  "that binds no verb declares nothing; omit it");
+                        ok = false;
+                    } else {
+                        std::unordered_set<std::string> seenNames;   // dunder-normalised
+                        std::unordered_set<std::string> seenRoles;
+                        json const& rows = ep.at("standard");
+                        for (std::size_t ri = 0; ri < rows.size(); ++ri) {
+                            auto const rpath = std::format(
+                                "/preprocess/embedParameters/standard/{}", ri);
+                            json const& row = rows[ri];
+                            if (!row.is_object() || !row.contains("name")
+                                || !row.at("name").is_string()
+                                || !row.contains("role")
+                                || !row.at("role").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess, rpath,
+                                          "each 'embedParameters.standard' row must "
+                                          "be an object { name: string, role: string }");
+                                ok = false;
+                                continue;
+                            }
+                            (void)checkKeysAgainst(
+                                row, kEmbedParamRowKeys, rpath,
+                                "an 'embedParameters.standard' row",
+                                DiagnosticCode::C_InvalidPreprocess, coll);
+                            PreprocessConfig::EmbedParameterDef def;
+                            def.name = row.at("name").get<std::string>();
+                            if (def.name.empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          rpath + "/name",
+                                          "'embedParameters.standard.name' must be a "
+                                          "non-empty identifier");
+                                ok = false;
+                                continue;
+                            }
+                            auto const roleWord = row.at("role").get<std::string>();
+                            auto const roleIt = std::ranges::find_if(
+                                kEmbedParamRoles,
+                                [&](auto const& e) { return e.first == roleWord; });
+                            if (roleIt == kEmbedParamRoles.end()) {
+                                std::string verbs;
+                                for (auto const& e : kEmbedParamRoles) {
+                                    if (!verbs.empty()) verbs += ", ";
+                                    verbs += e.first;
+                                }
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          rpath + "/role",
+                                          std::format("unknown embed parameter role "
+                                                      "'{}' — must be one of: {}",
+                                                      roleWord, verbs));
+                                ok = false;
+                                continue;
+                            }
+                            def.role = roleIt->second;
+                            // Each of 6.10.4.2–6.10.4.5's parameters "may appear
+                            // zero times or one time"; that is only checkable
+                            // against a ONE-TO-ONE name<->verb binding.
+                            if (!seenRoles.insert(roleWord).second) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          rpath + "/role",
+                                          std::format("embed parameter role '{}' is "
+                                                      "bound to two names — 'at most "
+                                                      "once' (C23 6.10.4.2–6.10.4.5) "
+                                                      "needs one name per verb",
+                                                      roleWord));
+                                ok = false;
+                                continue;
+                            }
+                            // C23 6.10.1p5: `name` and `__name__` are the SAME
+                            // parameter, so two rows may not collide either way.
+                            std::string const bare{stripDunder(def.name)};
+                            if (!seenNames.insert(bare).second) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          rpath + "/name",
+                                          std::format("embed parameter name '{}' "
+                                                      "collides with an earlier row "
+                                                      "(directly or through its "
+                                                      "`__name__` spelling, C23 "
+                                                      "6.10.1p5)",
+                                                      def.name));
+                                ok = false;
+                                continue;
+                            }
+                            out.standard.push_back(std::move(def));
+                        }
+                    }
+                    if (ok) cfg.embedParameters = std::move(out);
+                }
+            }
+            // Parameters for a surface the language does not declare are dead
+            // config: nothing could ever read them.
+            if (cfg.embedParameters.has_value() && cfg.embedDirective.empty()
+                && cfg.hasEmbedOperator.empty()) {
+                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                          "/preprocess/embedParameters",
+                          "'preprocess.embedParameters' declares parameters for a "
+                          "`#embed` directive / `__has_embed` operator the language "
+                          "does not declare (neither 'embedDirective' nor "
+                          "'hasEmbedOperator' is present)");
+            }
             // FC15c (make-or-break agnosticism): the angle-delimiter token KINDS
             // for `__has_include(<h>)`. OPTIONAL token-name fields (validated like
             // `stringizeToken`). The make-or-break SELF-CONSISTENCY rule: a

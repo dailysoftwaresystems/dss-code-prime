@@ -27,8 +27,25 @@
 # a gate that simply refused everything, which is the vacuous-fixture class this project
 # closes repeatedly.
 #
-# Lane names carry $$ so a parallel `ctest -j` cannot collide with itself, and every arm
-# removes what it created on both the pass and the fail path.
+# Lane names carry a pid-derived suffix so a parallel `ctest -j` cannot collide with itself,
+# and every arm removes what it created on both the pass and the fail path.
+#
+# ⚠⚠ THE PROBE NAMES ARE SHORT ON PURPOSE, AND THE REASON IS MEASURED.
+# [[D-TEST-LANE-WORKTREE-SELFTEST-PROBE-NAME-OVERSPENDS-MAX-PATH-INSIDE-A-LANE-WORKTREE]]
+# ✔MEASURED 2026-09-04 (P60): this file named its probes `padtest$$a`, and under Git Bash
+# `$$` is a SIX-digit MSYS pid, so the name was 14 characters. Run from the MAIN tree that
+# fits; run from a LANE worktree (`<repo>/.worktrees/mo/`, where every lane's own gate runs
+# it) the probe root is 14 characters deeper, `lane-worktree.sh`'s MAX_PATH preflight
+# computed 19 spare against its required margin of 20 and REFUSED the `add` -- correctly,
+# that preflight is a regression guard for an anchored build defect -- and this self-test
+# reported `CANNOT RUN -- add failed` with the refusal's reason DISCARDED (`2>/dev/null`).
+# Every P60 lane's full gate carried that red, attributed to nobody. Two repairs, both here:
+# the probe names are now at most five characters (`t<pid mod 1000><letter>`), the length
+# class of a sanctioned lane name, so the self-test spends the same budget wherever it runs;
+# and a refused `add` now reports the refusal's own text, because an error that hides its
+# diagnosis is a defect in its own right. The uniqueness the pid gave is kept by the suffix
+# and by a sweep of same-named leftovers BEFORE the first add: isolation between concurrent
+# gates is by TREE (each worktree has its own `.worktrees/`), never by the name's length.
 #
 # Exit codes: 0 all arms passed - 1 an arm failed.
 set -uo pipefail
@@ -50,16 +67,24 @@ REPO="$(cd "$_here/../.." && pwd -P)"
 [ -r "$LW" ] || { echo "lane-worktree self-test: CANNOT RUN -- $LW exists but is not readable" >&2; exit 1; }
 
 TMP="$(mktemp -d)"
-L1="padtest$$a"; L2="padtest$$b"; L3="padtest$$c"; L4="padtest$$d"; L5="padtest$$e"
+# At most five characters each -- see the header for why the length is load-bearing.
+_sfx="$(( $$ % 1000 ))"
+L1="t${_sfx}a"; L2="t${_sfx}b"; L3="t${_sfx}c"; L4="t${_sfx}d"; L5="t${_sfx}e"
 fail=0
 
-_cleanup() {
+_sweep() {
   for l in "$L1" "$L2" "$L3" "$L4" "$L5"; do
     [ -e "$REPO/.worktrees/$l" ] && bash "$LW" remove "$l" --discard-scratchpad >/dev/null 2>&1
   done
+}
+_cleanup() {
+  _sweep
   rm -rf "$TMP"
 }
 trap _cleanup EXIT
+# A same-named leftover from a run that died before its trap could fire would make the first
+# `add` refuse for a reason that is not this test's subject; sweep it first.
+_sweep
 
 _arm() {  # <label> <expected-substring> <actual>
   case "$3" in
@@ -69,7 +94,12 @@ _arm() {  # <label> <expected-substring> <actual>
 }
 
 # ── (1) files present, no flag -> REFUSED, and the worktree SURVIVES ─────────
-bash "$LW" add "$L1" >/dev/null 2>&1 || { echo "lane-worktree self-test: CANNOT RUN -- add failed" >&2; exit 1; }
+# The refusal's own text travels with the CANNOT RUN, never `2>/dev/null` (header).
+if ! _add_out="$(bash "$LW" add "$L1" 2>&1)"; then
+  printf 'lane-worktree self-test: CANNOT RUN -- add of %s failed; lane-worktree.sh said:\n%s\n' \
+    "$L1" "$_add_out" >&2
+  exit 1
+fi
 mkdir -p "$REPO/.worktrees/$L1/scratchpad/p/lane"
 printf 'evidence\n' > "$REPO/.worktrees/$L1/scratchpad/p/lane/probe.log"
 out="$(bash "$LW" remove "$L1" 2>&1)"; rc=$?

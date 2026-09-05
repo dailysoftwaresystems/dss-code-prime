@@ -3,7 +3,7 @@
   "header": "malloc.h",
   "standard": "msvcrt",
   "availableObjectFormats": ["pe"],
-  "library": { "pe": "ucrtbase.dll" },
+  "library": { "pe": { "role": "cLibrary" } },
   "symbols": [
     { "name": "_msize", "signature": "fn(ptr<void>) -> u64", "kind": "function", "linkage": "external" }
   ]

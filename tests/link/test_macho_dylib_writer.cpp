@@ -2186,9 +2186,13 @@ TEST(MachoImageSymbolNames,
             << label
             << ": n_value must be the function's runtime VA — an alias pair "
                "agreeing at 0 would satisfy the equality while naming nothing";
-        // N_SECT|N_EXT on both: this format's image-tier binding question is
-        // owned by D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT, and an alias
-        // must not become a second, undeclared answer to it.
+        // N_SECT|N_EXT on both: canonical and alias are both GLOBAL rows, and
+        // the image tier now maps every defined symbol's binding through the
+        // same `definedNType` the object tier uses
+        // (D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT), so an externally
+        // visible alias of an externally visible canonical carries the same
+        // n_type — the LOCAL half of that mapping is pinned by
+        // tests/link/test_macho_image_symtab_bands.cpp.
         EXPECT_EQ(typeAt(*canonIdx), 0x0Fu) << label;
         EXPECT_EQ(typeAt(*aliasIdx), 0x0Fu)
             << label << ": the alias is a DEFINED symbol in this section, like "
@@ -2204,6 +2208,8 @@ TEST(MachoImageSymbolNames,
             return;
         }
         ASSERT_TRUE(dysymLc.has_value()) << label;
+        std::uint32_t const ilocalsym     = readU32LE(bytes, *dysymLc + 8);
+        std::uint32_t const nlocalsym     = readU32LE(bytes, *dysymLc + 12);
         std::uint32_t const iextdefsym    = readU32LE(bytes, *dysymLc + 16);
         std::uint32_t const nextdefsym    = readU32LE(bytes, *dysymLc + 20);
         std::uint32_t const iundefsym     = readU32LE(bytes, *dysymLc + 24);
@@ -2211,26 +2217,47 @@ TEST(MachoImageSymbolNames,
         std::uint32_t const indirectsymoff = readU32LE(bytes, *dysymLc + 56);
         std::uint32_t const nindirectsyms  = readU32LE(bytes, *dysymLc + 60);
 
-        // The bands must TILE the table: [0, nextdefsym) defined, then
-        // [iundefsym, +nundefsym) undefined, ending exactly at nsyms. An alias
-        // that grew the defined band without moving the boundary shows up here
-        // as a defined symbol sitting inside the undefined band.
-        EXPECT_EQ(iextdefsym, 0u) << label;
-        EXPECT_EQ(iundefsym, nextdefsym)
+        // The bands must TILE the table: [0, nlocalsym) local, then
+        // [iextdefsym, +nextdefsym) externally defined, then
+        // [iundefsym, +nundefsym) undefined, ending exactly at nsyms. fn #9
+        // carries no `ModuleSymbol` row, so `definedBinding` says Local and it
+        // is the ONE local record here, sorted FIRST
+        // (D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT). An alias that grew
+        // the defined band without moving the boundary shows up here as a
+        // defined symbol sitting inside the undefined band.
+        EXPECT_EQ(ilocalsym, 0u) << label;
+        EXPECT_EQ(nlocalsym, 1u)
+            << label << ": fn #9 (no declared name) is the one Local record";
+        EXPECT_EQ(iextdefsym, nlocalsym)
             << label
-            << ": the undefined band must start exactly where the defined band "
-               "ends";
-        EXPECT_EQ(nextdefsym + nundefsym, nsyms)
-            << label << ": the two bands must tile LC_SYMTAB.nsyms exactly";
-        EXPECT_LT(*aliasIdx, nextdefsym)
+            << ": the externally-defined band must start exactly where the "
+               "local band ends";
+        EXPECT_EQ(iundefsym, iextdefsym + nextdefsym)
+            << label
+            << ": the undefined band must start exactly where the "
+               "externally-defined band ends";
+        EXPECT_EQ(iundefsym + nundefsym, nsyms)
+            << label << ": the three bands must tile LC_SYMTAB.nsyms exactly";
+        EXPECT_GE(*canonIdx, iextdefsym)
+            << label << ": a GLOBAL canonical sits in the externally-defined "
+                        "band, never among the locals";
+        EXPECT_GE(*aliasIdx, iextdefsym)
+            << label << ": an alias is externally visible by construction and "
+                        "sits in the externally-defined band";
+        EXPECT_LT(*aliasIdx, iundefsym)
             << label
             << ": the alias is a DEFINED symbol and must sit inside the defined "
-               "band — if it spilled past `nextdefsym`, every indirect-symbol "
+               "band — if it spilled past `iundefsym`, every indirect-symbol "
                "index would be short by one";
-        for (std::uint32_t i = 0; i < nextdefsym; ++i) {
+        for (std::uint32_t i = 0; i < nlocalsym; ++i) {
+            EXPECT_EQ(typeAt(i), 0x0Eu)
+                << label << ": nlist #" << i
+                << " sits in the LOCAL band but is not bare N_SECT";
+        }
+        for (std::uint32_t i = iextdefsym; i < iundefsym; ++i) {
             EXPECT_EQ(typeAt(i), 0x0Fu)
                 << label << ": nlist #" << i
-                << " sits in the DEFINED band but is not N_SECT|N_EXT";
+                << " sits in the EXTERNALLY-DEFINED band but is not N_SECT|N_EXT";
         }
         for (std::uint32_t i = iundefsym; i < nsyms; ++i) {
             EXPECT_EQ(typeAt(i), 0x01u)

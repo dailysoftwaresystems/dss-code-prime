@@ -3,7 +3,7 @@
   "header": "pwd.h",
   "standard": "posix",
   "availableObjectFormats": ["elf", "macho"],
-  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "library": { "elf": { "role": "cLibrary" }, "macho": { "role": "cLibrary" } },
   "symbols": [
     { "name": "getpwuid", "signature": "fn(u32) -> ptr<passwd>", "kind": "function", "linkage": "external" }
   ],

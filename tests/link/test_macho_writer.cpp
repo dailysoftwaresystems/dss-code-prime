@@ -1341,11 +1341,13 @@ TEST(MachOWriter, Arm64ObjectRodataItemEmitsConstSectionAndDataSymbol) {
     EXPECT_EQ(bytes[321], 'i');
     EXPECT_EQ(bytes[322], 0u);
 
-    // LC_SYMTAB @288: symoff = 312 + 11 (no relocs), nsyms = 2.
+    // LC_SYMTAB @288: the file-backed span ends at 312 + 11 = 323 (no relocs)
+    // and the symtab starts at the first 8-aligned offset after it, 328 —
+    // D-LINK-MACHO-OBJECT-SYMTAB-MISALIGNED (pre-fix it was packed at 323).
     std::uint32_t const symoff = readU32LE(bytes, 296);
     std::uint32_t const nsyms  = readU32LE(bytes, 300);
     std::uint32_t const stroff = readU32LE(bytes, 304);
-    EXPECT_EQ(symoff, 323u);
+    EXPECT_EQ(symoff, 328u);
     ASSERT_EQ(nsyms, 2u);
     // nlist[1] = the data symbol: real name, N_SECT|N_EXT, n_sect=2,
     // n_value = the FLAT address 8.
@@ -1715,8 +1717,10 @@ TEST(MachOWriter, Arm64ObjectBssItemIsZeroFillWithVmsizeButNoFileBytes) {
     EXPECT_EQ(readU64LE(bytes, 224), 4u);    // size = reservedSize
     EXPECT_EQ(readU32LE(bytes, 232), 0u);    // offset = 0 (S_ZEROFILL)
     EXPECT_EQ(readU32LE(bytes, 248), 1u);    // flags = S_ZEROFILL (schema)
-    // symtab directly after text bytes (312 + 4) — bss stored nothing.
-    EXPECT_EQ(readU32LE(bytes, 296), 316u);
+    // The file-backed span ends after the text bytes (312 + 4 = 316) — bss
+    // stored nothing — and the symtab starts at the first 8-aligned offset
+    // after it, 320 (D-LINK-MACHO-OBJECT-SYMTAB-MISALIGNED).
+    EXPECT_EQ(readU32LE(bytes, 296), 320u);
     // The bss symbol's n_value is its flat address.
     std::uint32_t const symoff = readU32LE(bytes, 296);
     EXPECT_EQ(bytes[symoff + 16 + 5], 2u);
@@ -1743,12 +1747,14 @@ TEST(MachOWriter, Arm64ObjectDataFreeModuleKeepsSingleSectionLayout) {
     EXPECT_EQ(readU64LE(bytes, 64), 4u);     // vmsize = text only
     EXPECT_EQ(readU64LE(bytes, 72), 232u);   // fileoff = 32 + 72 + 80 + 24 + 24
     EXPECT_EQ(readU64LE(bytes, 80), 4u);     // filesize = text only
-    // LC_SYMTAB at 208; symtab right after text (232 + 4); strtab after
-    // the single 16-byte nlist.
+    // LC_SYMTAB at 208; the span ends after the text (232 + 4 = 236) and the
+    // symtab starts at the first 8-aligned offset after it, 240
+    // (D-LINK-MACHO-OBJECT-SYMTAB-MISALIGNED); strtab right after the single
+    // 16-byte nlist.
     EXPECT_EQ(readU32LE(bytes, 208), 0x02u);
-    EXPECT_EQ(readU32LE(bytes, 216), 236u);  // symoff
+    EXPECT_EQ(readU32LE(bytes, 216), 240u);  // symoff
     EXPECT_EQ(readU32LE(bytes, 220), 1u);    // nsyms
-    EXPECT_EQ(readU32LE(bytes, 224), 252u);  // stroff
+    EXPECT_EQ(readU32LE(bytes, 224), 256u);  // stroff
 }
 
 // (5) The shipped arm64 object format declares the four data-section rows

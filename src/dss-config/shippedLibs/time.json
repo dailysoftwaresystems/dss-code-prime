@@ -5,7 +5,7 @@
   "header": "time.h",
   "standard": "posix",
   "availableObjectFormats": ["elf", "macho", "pe"],
-  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib", "pe": "ucrtbase.dll" },
+  "library": { "elf": { "role": "cLibrary" }, "macho": { "role": "cLibrary" }, "pe": { "role": "cLibrary" } },
   "symbols": [
     { "name": "time",        "signature": "fn(ptr<void>) -> i64",                          "kind": "function", "linkage": "external", "availableObjectFormats": ["elf", "macho"] },
     { "name": "localtime",   "signature": "fn(ptr<void>) -> ptr<tm>",                       "kind": "function", "linkage": "external", "availableObjectFormats": ["elf", "macho"] },

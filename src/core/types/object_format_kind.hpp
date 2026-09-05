@@ -1079,6 +1079,67 @@ struct DSS_EXPORT RuntimeLibraryTable {
     [[nodiscard]] bool empty() const noexcept { return bindings.empty(); }
 };
 
+// ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE:
+//    WHO ANSWERS A SHIPPED-LIBRARY DESCRIPTOR'S `{"role": …}` ─────────────
+//
+// A descriptor's per-object-format `library` map may name a ROLE of the table
+// above instead of a literal image — `{"pe": {"role": "cLibrary"}}` — so the
+// image is written ONCE, in the format tier that owns it, and never restated
+// per header. The descriptor reader lives in `ffi`, which links `core` and
+// nothing of the format loader, so the role is resolved through THIS
+// question-answering seam. The precedent is the `TargetSchema const*` on
+// `analyze()`: a schema-shaped object answers, and the asking tier never
+// learns which document it was.
+//
+// ★ WHOSE ROW. "Which image plays role R on this object-format FAMILY" is a
+// family-level fact that the format tier writes once per FLAVOUR
+// (`tests/link/test_runtime_library_roles.cpp`'s
+// `EveryFlavourOfAFormatKindNamesOneProviderPerRole` refuses two flavours
+// naming different providers, and its own text says a flavour that does not
+// need a role must not be forced to name one). So the implementation answers
+// from the ACTIVE document when it declares the role — the row its own spine
+// blocks already resolve against, which keeps the build self-consistent — and
+// otherwise from the shipped flavours of the same kind, which must AGREE. A
+// `-staticlib` or `-dll` document never gains a row nothing of its own names
+// (the loader refuses such a row as inert config); it reaches the family's
+// answer here.
+//
+// ⚠ NULLPTR IS "THIS CALLER BINDS NO IMPORT", NEVER "GUESS". The LSP, the
+// header parser and the layout/name tests read descriptors without ever
+// producing an import; for them a role entry is validated and RECORDED
+// (`ShippedLibDescriptor::libraryRoles`) but yields no image — the stated
+// UNBOUND arm, exactly what an OMITTED key already means. Every producer of an
+// `ExternImport` passes one, and with one in hand a role that cannot be
+// answered REFUSES the read: never a fallback image, never iteration order.
+class DSS_EXPORT RuntimeLibraryRoleResolver {
+public:
+    virtual ~RuntimeLibraryRoleResolver() noexcept = default;
+
+    RuntimeLibraryRoleResolver(RuntimeLibraryRoleResolver const&)            = delete;
+    RuntimeLibraryRoleResolver& operator=(RuntimeLibraryRoleResolver const&) = delete;
+    RuntimeLibraryRoleResolver(RuntimeLibraryRoleResolver&&)                 = delete;
+    RuntimeLibraryRoleResolver& operator=(RuntimeLibraryRoleResolver&&)      = delete;
+
+    // The object-format KIND name (`objectFormatKindName`) this resolver
+    // answers for — the `library` map key whose role entries it resolves. A
+    // role entry under any OTHER key is validated and recorded only: a `pe`
+    // role has no answer inside an elf build, and asking would be a guess.
+    [[nodiscard]] virtual std::string_view formatKindName() const noexcept = 0;
+
+    // The row playing `role` for this build, or nullptr. `refusal` is written
+    // ONLY when the answer could not be computed at all (a sibling document
+    // failed to load, or two siblings name different providers); nullptr with
+    // an EMPTY `refusal` means "no document of the family declares this role".
+    // A returned row may be REALIZED (empty `image`, `source` set) — the caller
+    // decides what that means for it. The pointer stays valid for the
+    // resolver's lifetime.
+    [[nodiscard]] virtual RuntimeLibraryBinding const*
+    rowForRole(RuntimeLibraryRole role, std::string& refusal) const = 0;
+
+protected:
+    RuntimeLibraryRoleResolver() noexcept = default;
+};
+
 // ── UCRT-P4: the unwinder-personality declaration ──────────────────
 //
 // The routine an emitted unwind record names as its handler, and the image it

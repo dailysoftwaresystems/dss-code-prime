@@ -439,3 +439,20 @@ dss_add_test(NAME program/test_dependency_artifact_cache
 # APPENDED, never interleaved -- this file is append-only by lane convention.
 dss_add_test(NAME program/test_failed_build_writes_no_artifact
              SOURCES test_failed_build_writes_no_artifact.cpp)
+
+# ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE (P60 lane `dl2`)
+# The DRIVER's half of the descriptor role form: the image the LINKER RECEIVES
+# follows the format's role row. Runs `buildCuMir` over the REAL shipped corpus
+# with a `loadFromText` mutant whose `cLibrary` row is repointed, reads the
+# `externImports[].libraryPath` rows the linker is handed, and LINKS the module to
+# read the emitted image's own dependency table (the shared PE/ELF extractors in
+# `tests/test_support/image_dependency_table.hpp`): the role-bound imports FOLLOW,
+# `math.json`'s `libm.so.6` literal and windows.json's `systemPrimitives` import do
+# NOT. Also the FAMILY path (`-dll`/`-dyn`/`-dylib`/`-staticlib`, whose own tables
+# declare no `cLibrary`), the family's disagreement refusal on a doctored copy of
+# the shipped tree under `DSS_CONFIG_ROOT`, and the driver-level refusals of a
+# realized or undeclared role. HOST-INDEPENDENT: nothing is run.
+#
+# APPENDED, never interleaved -- this file is append-only by lane convention.
+dss_add_test(NAME program/test_descriptor_role_follows_the_table
+             SOURCES test_descriptor_role_follows_the_table.cpp)

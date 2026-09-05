@@ -9,7 +9,7 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-09-04 — cycles **P14 … P59**. ⚠ P52 rewrote no handoff at all, so a reader
+**Last updated:** 2026-09-05 — cycles **P14 … P60**. ⚠ P52 rewrote no handoff at all, so a reader who opened this file during P53 saw P51 described as current state; that entry in §5 was written retroactively by P53 and says so. P53's own §0 was relocated into §5 by P54 and is marked as history there.
 who opened this file during P53 saw P51 described as current state; that entry in §5 was written
 retroactively by P53 and says so. P53's own §0 was relocated into §5 by P54 and is marked as
 history there.
@@ -17,6 +17,258 @@ history there.
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
+
+**Cycle P60 closed 2026-09-05.** **FOUR lanes** plus the orchestrator, on top of `694bb6cb`, in one
+set — every lane folded, **every lane independently reviewed**, and every review finding fixed
+before the fold was allowed to stand.
+
+✔**REAL: 7 rows closed (6 production + 1 harness), 1 opened.** ✔**COUNTED by
+`check-anchor-balance --base 694bb6cb`: closed 6, opened 0, net −6** (registry 467 → 461). The
+harness row was minted **born-closed** and is therefore invisible to the gate from BOTH bases —
+the known born-closed shape, reported here because the instrument cannot.
+★ **P0 ended the cycle empty and began it empty.** The six production closures are all P1/P2.
+
+⚠ **ONE ROW WAS LEFT OPEN DELIBERATELY AND IT IS THE CYCLE'S ONE PIECE OF UNFINISHED WORK** —
+[[D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED]]. See §0.1 `rc`: the
+front-end half shipped and is proven, the **MIR/HIR lowering half was never taken**, and the row's
+own sqlite-shape axis — a 300 rc 0 / 400 SEGFAULT wall on LIST LENGTH — still stands. **It is the
+top item for P61.**
+
+**✔BASELINE at `694bb6cb`: 2054 / 2054.** **✔THIS CYCLE, Windows integrated tree through
+`scripts/run-gate/`: 2068 / 2068**, 843.82 s. The suite grew by **14** entries, **none named
+`*guard`**, so the cross-leg subtrahend is unchanged — ⚠ **re-derive it anyway** from
+`ctest -N -L repo-guard`, never quote it.
+
+## §0.1 — THE FOUR LANES, AND WHICH ARE ACTUALLY DONE
+
+★★★ **"COMPLETE" MEANS FOLDED, AND IN THIS CYCLE IT ALSO MEANS REVIEWED.** Every one of the three
+lanes that reached an independent review came back **NEEDS FIXES or with a material correction**,
+and in two of the three the defect was invisible from inside the lane.
+
+| lane | subject | state |
+|---|---|---|
+| `mo` | two Mach-O emission rows | ✅ **FOLDED · reviewed · review-fixed · rows APPLIED · worktree removed** |
+| `dl2` | descriptor `library` → format-role migration | ✅ **FOLDED · reviewed · review-fixed · row APPLIED · worktree removed** |
+| `pe` | the C23 `#embed` family (3 rows) | ✅ **FOLDED · reviewed · review-fixed · 3 rows APPLIED · worktree removed** |
+| `rc` | input-proportional recursion residue | ✅ folded · worktree removed — ⚠ **row stays 🟠 OPEN, the MIR/HIR half untaken (§0.1)** |
+
+### `mo` — DONE. Both rows ✅ CLOSED and applied.
+[[D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT]] and [[D-LINK-MACHO-OBJECT-SYMTAB-MISALIGNED]].
+Landed: one `appendImageDefinedBands` for both image arms (binding through the shared
+`definedBinding` → `definedNType`, locals-first bands, `numLocals` read back off the bytes),
+`imageBandsAgree` as the writer's loud belt over the new pure predicate `machoDysymtabBandBreach`
+(`src/link/format/macho_symtab_bands.hpp`), and the 8-aligned MH_OBJECT trailer chain with a
+`seekTo` that refuses an overrun. ✔**Witnessed on real Apple Silicon** (Apple clang 21.0.0 /
+ld-1267): `non-external _static_helper` under `nlocalsym 2 iextdefsym 2`, run rc 42,
+`codesign --verify` valid. ✔**The `.o` tier's byte-identity across the image fix held over 30
+artifacts** — which is what made it a legitimate CONTROL for the second row, taken only afterwards.
+✔macOS scoped leg **80/80**, Mac RESTORED by `leg-tree`, not left staged.
+★ [[D-LK3-DYLIB-WEAK-EXPORT]] was **scope-widened and deliberately left 🟠 OPEN**: the exec-arm
+weak canonical is the same silent downgrade, and the P23 row sized widening the refusal at "one
+line" — ✔**that premise is REFUTED with the Mac in view.** Exactly ONE corpus example
+(`examples/c/attributes_syntax`) carries a weak canonical to the image writer; it builds for a
+Mach-O exec target on every host and RUNS on darwin, and clang/ld64 build and run the same program.
+**A refusal would trade a working program for a loud one**, which the bar forbids. What ld64 emits
+instead is the whole weak machinery (`[weak-def]` trie terminal, `__got <weak-def-coalesce>` fixup,
+`MH_WEAK_DEFINES|MH_BINDS_TO_WEAK` = `0x00218085` against the weak-free `0x00200085`, `N_WEAK_DEF`)
+— that is the row's closing work, owed on the exec arms exactly as on the dylib.
+
+### `dl2` — DONE. Row ✅ CLOSED and applied.
+[[D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE]].
+★★ **The keying fork P59 stopped at was never a fork.** Design A — declare the 17 missing
+`cLibrary` rows — is ✔MEASURED to be **refused by the loader**: `object_format_schema_json.cpp`'s
+"NO `runtimeLibraries` ROW MAY SIT UNNAMED" block fails such a document AT LOAD, and the `-dll`
+document's own `$runtimeLibrariesComment` says so. So the FAMILY was not a preference, it was the
+only design the tree admits. `ObjectFormatSchema::familyRuntimeLibraryRow` resolves own-row-first,
+else the shipped flavours of the same **declared `format.kind`** (no `substr`, no suffix strip, no
+identity branch), refusing loud on a role no flavour declares and on two siblings that disagree.
+✔**67 entries migrated, 2 kept** (`math.json`/`tgmath.json` elf `libm.so.6`), `kernel32.dll` →
+`systemPrimitives`. ✔**An independent reviewer re-derived every entry from `git show HEAD:` and
+resolved each role through the shipped documents: 0 image changes.** That check is not optional —
+DSS **eager-imports** every function a descriptor lists, so one wrong image breaks EVERY binary's
+load, not one.
+⚠ **Three things the review caught that the lane had not fixed**, all now closed: the four
+`TFC112*` pins its migration reddened (helpers now build a `FormatRuntimeLibraryRoleResolver`); the
+R3 *"two owners for one body"* refusal **silently narrowed from format-independent to
+resolver-dependent** (it read the RESOLVED map, so a role-spelled entry beside a `realization`
+source could be read clean by every pe and elf build and caught only on macOS — it now reads the
+UNION of `library` and `libraryRoles`, and is `libraryRoles`' **first production reader**); and a
+memo-purity break — `familyRuntimeLibraryRow` cached siblings into the memoized schema instance,
+which `config_document_memo.hpp` itself calls *"a SILENT MISCOMPILE, not a stale cache entry"*.
+Fixed at the tier: **all derived state removed from `ObjectFormatSchema`**, the cache moved onto the
+resolver for the lifetime of one binding operation, and the sibling scan now uses
+`sourceDirectory_` rather than the ambient config dir.
+★ Half of that finding was ✔**REFUTED by the fix agent**: the `DSS_CONFIG_ROOT` scenario cannot
+happen, because the memo key is (label, digest) and the label IS the resolved path — a different
+root is a MISS, never a stale hit. The real hazard is a sibling edited in place while the member's
+own bytes do not move.
+
+### `pe` — DONE. All three rows ✅ CLOSED and applied.
+[[D-PP-EMBED-PARAMS]], [[D-PP-EMBED-ANGLE]], [[D-PP-EMBED-MACRO-ARG]].
+★★ **There is no implementation reference for `#embed`.** ✔MEASURED, each probed separately with a
+plain quoted `#embed` as the control: **gcc 13.3.0, clang 18.1.3 AND MSVC 19.51 all refuse it
+entirely** — MSVC additionally folds `__has_embed` to an ordinary identifier and predefines no
+`__STDC_EMBED_*`. ⇒ the oracle is the **ISO C23 text (N3220) alone**, and every behaviour is cited
+by clause. That makes a misreading the largest risk in the change and is why the review mattered.
+⛔ **A BLOCKING CONFORMANCE DEFECT WAS FOUND IN REVIEW AND IS NOW FIXED**, by a reviewer who
+extracted N3220 itself: `__has_embed` evaluated the `limit` clause **before** short-circuiting on an
+unsupported parameter, so `#if __has_embed("bits.bin" ds9000::element_type(short) limit(2 - 3))` —
+C23's own EXAMPLE 5 shape crossed with EXAMPLE 6 — **refused the TU** where footnote 196 on
+6.10.1p9 and 6.10.2p8 NOTE 1 require `__STDC_EMBED_NOT_FOUND__`. The **directive** side was already
+right; only the operator was wrong. ✔The order is now
+`firstUnsupportedStandardShaped()` (loud) → `anyUnsupportedPrefixed()` (mint 0) → `evaluateEmbedLimit`,
+pinned by `HasEmbedUnsupportedPrefixedParameterAnswersBeforeAnyLimit` on that exact program in three
+guard shapes with two directional controls.
+★ **Three further corrections were owed IN THE REGISTRY CELLS THEMSELVES**, and all landed:
+6.10.4.1p14 was cited **backwards** in four places (it recommends search paths *distinct from*
+include paths; the code reuses them — defensible under p8, but not endorsed by p14, and it is now
+stated as a **divergence**); the *"any parameter unsupported ⇒ 0"* claim is **prefixed-only** in the
+text; and `limit` not lifting the 16 MiB read cap was **fixed rather than deferred** —
+`handleEmbed` now orders resolve → size → width → budget → read, so the read is bounded by the
+width and 6.10.4.5's EXAMPLE 4 and `if_empty` at `limit(0)` are expressible.
+⚠ **And the lane's own trigger cell was STALE when re-read**: written at 19:43, it quoted a
+superseded red-on-disable run whose restore build was **rc 1**, and declared two arms "not claimed",
+while the final run finished at 19:50 with **3/3 OK**. A cell can go stale inside one hour.
+✔What did check out: the `limit` semantics (macro-expanded, evaluated by the one `#if` engine,
+`defined` refused both as written and as produced by expansion, `min(size,N)`, `limit(0)` ⇒ empty),
+`prefix`/`suffix` only on a non-empty resource, `if_empty` replacing the whole directive, the
+at-most-once rule, dunder folding, the quote→angle fallback through ONE resolver, angle delimiters
+matched by the schema token KINDS, the parameter vocabulary in `c.lang.json`'s new
+`preprocess.embedParameters` with **zero** role-word literals in the engine, and 27 exact-sequence
+pins with three runnable examples whose `limit`s are genuinely shorter than their resources.
+★ The lane ✔**REFUTED its brief on element width**: `CHAR_BIT` already has exactly one owner
+(`shippedLibs/limits.json`), so a config key would be a second owner with one honourable value —
+dead config. `kEmbedElementWidthBits` is a **tripwire anchor pinned against `limits.json`, not a
+width parameter** (the octet assumption is structural in the reader and splicer).
+
+### `rc` — FOLDED, and its row STAYS 🟠 OPEN. The largest piece of work in the cycle; record in `.temp/p60-rc-journal.md`.
+⚠⚠ **THIS IS THE ONE OPEN ROW P60 LEAVES, AND IT IS P61's TOP ITEM.** The front-end half shipped and
+is proven; **brief item 4 — the MIR/HIR lowering half — was never taken.** ✔MEASURED:
+`git diff --stat src/mir/lowering/` is EMPTY, and `hir_to_mir.cpp` still lowers each `SeqExpr` level
+through `lowerStmt`, which its own comment calls *"a separate machine, kept recursive"*. **The row's
+own sqlite-shape axis stands: 300 rc 0 / 400 SEGFAULT on LIST LENGTH**, plus the
+`lowerLvalueAddressNode` re-entry (`*&`, 100/200) and the unmeasured `BuiltinCall` siblings.
+★ **The lane also REFUTED the row's own #1-ranked residue.** The row called `collectLeavesBelow_`
+*"NO CAP and SILENT … the highest-risk item left"* — ✔`git show 694bb6cb:` proves it was ALREADY a
+`std::vector<NodeId> pending` + `while` loop with an output cap, **byte-identically so at the commit
+the row was last written against**. That ranking would have sent the next lane to convert something
+already converted. **A row's account of its own defect is a hypothesis** — again.
+✔**Gate on the lane's own tree: 2055/2056**, the single red being `doc_census_guard` for the example
+it added (repaired at the fold). ⓘ An earlier run of that same tree reported **1087 failures**, all
+`0xC0000142` (STATUS_DLL_INIT_FAILED) from test ~971 onward including the repo guards — a host
+resource exhaustion, **not a code result**; the two "real" failures preceding the cascade carried
+exit `-1073741502`, which IS `0xC0000142`. **Re-run before believing a cascade.**
+[[D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED]].
+★★★ **✔ALL SIX DEEP-NESTING ctest ENTRIES NOW PASS UNDER THE MSVC GENERATOR** — the toolchain the
+four-leg gate is structurally blind to, and where three of them SEGFAULTed at the base commit. That
+is the half of the row's closing work the gate could never have delivered.
+Converted: the parser's **speculation drive and expression re-entry onto ONE heap-stack driver**
+(`Parser::Impl::driveParse_`; `trySpeculativeBranch`, `parseUntilFrameDepth` and
+`driveExprWorkStack` deleted), `hir_verifier.hpp`'s `pathTerminates`, `type_reintern.cpp`'s
+`spine_`, and `~HirAggregateValue`.
+★★ **A FIFTH compiler-generated walk was found by gdb and is named in no row**: the aggregate-value
+**COPY constructor** — a 13,848-frame chain from `Lowerer::emitGlobals_` copy-constructing a
+`MirLiteralValue` — fixed at the type in **both** `mir_literal_pool.hpp` and `hir_literal_pool.hpp`.
+Caps raised on measured reference evidence, so the counter now bounds **memory and time rather than
+frames**: `maxExpressionDepth` 1024 → **16384**, `maxSpeculationDepth` 320 → **2048**,
+`speculationBudgetFactor` 64 → **128**.
+⚠ **REFUTED, and verified independently by the orchestrator:** the row's two "silent wrong answer"
+entries (`spellingBlindCompatible`'s `depth > 16`, `declaratorConstSpine`'s caps) were **already
+converted in P55** — only comments naming what replaced them remain.
+⚠ **Reported above that lane's grant and owed to somebody:** an **O(depth) checkpoint snapshot per
+speculative probe** (`TreeBuilder::checkpoint` / `SchemaWalker::snapshot`, `src/core/types`) is the
+quadratic that holds the speculation ceiling at 2048 instead of gcc's measured 65536.
+
+## §0.2 — WHAT THE ORCHESTRATOR DID, AND ONE ERROR IT MADE
+
+- ✅ **Filed born-closed:**
+  [[D-TEST-LANE-WORKTREE-SELFTEST-PROBE-NAME-OVERSPENDS-MAX-PATH-INSIDE-A-LANE-WORKTREE]].
+  `lane_worktree_guard` reddened in **every** lane's full gate and was attributable to nobody:
+  `scripts/lane-worktree/test-lane-worktree.sh` named its probes `padtest$$a`, `$$` is a SIX-digit
+  MSYS pid, so inside a lane worktree the MAX_PATH preflight left **19 spare against a required
+  margin of 20** and refused the `add` — **and the refusal's reason was discarded by
+  `2>/dev/null`**. Probe names are now ≤5 characters, a leftover sweep runs before the first add,
+  and a refused add carries `lane-worktree.sh`'s own text. ✔Verified in the main tree AND from
+  inside a throwaway nested lane worktree.
+- ✅ Applied `mo`'s three rows and `dl2`'s one through `scripts/anchors/anchors.py set`, driven
+  from the lanes' field files by an argument list rather than a shell, so a backtick or a `|`
+  inside a cell cannot be expanded or split.
+- ✅ Re-baselined the citation ratchet after `mo`'s rows converted three `macho.cpp:NNNN` citations
+  to symbol names. **It must be re-run last, before the commit.**
+- ⚠ **My own orchestration error, recorded because it cost real time:** I gave two fix agents the
+  SAME `build/dbg` and then ran my own guard checks against it. Both hit build contention.
+  **The orchestrator is a lane for the BUILD TREE too, not only for files.**
+
+## §0.3 — WHAT P61 INHERITS, IN PRIORITY ORDER
+
+1. ★★★ **FINISH [[D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED]] —
+   the MIR/HIR lowering half.** It is the one row P60 leaves open and the only reason it is open.
+   `hir_to_mir.cpp` lowers each `SeqExpr` level through `lowerStmt` (*"a separate machine, kept
+   recursive"* by its own comment); the **300 rc 0 / 400 SEGFAULT wall on LIST LENGTH** is the
+   sqlite-shape axis and it still stands, as do `lowerLvalueAddressNode`'s re-entry (`*&`, 100/200)
+   and the unmeasured `BuiltinCall` siblings. ⚠ Read the row's ranking sceptically: P60 refuted its
+   #1-ranked item as already converted at the commit the row was written against.
+2. ★★ **AN O(1) `TreeBuilder::checkpoint` / `SchemaWalker::snapshot`** (`src/core/types`) — owed to
+   somebody, outside every P60 grant, and stated in all four of `rc`'s cells. Today's **O(depth)
+   snapshot per live speculative probe** is the quadratic holding `maxSpeculationDepth` at 2048
+   against gcc's ✔measured 65536: 2048 casts **332 MiB**, 4096 **1.2 GiB**, 8192 **4.6 GiB**, 65536
+   `std::bad_alloc` after 933 s. This is a **buildable prerequisite, therefore not a gate** — it
+   unblocks the residual depth gap rather than being filed beside it.
+3. **[[D-LK3-DYLIB-WEAK-EXPORT]]** — scope widened by `mo` with the exec-arm measurement already
+   taken (ld64's shape recorded byte-for-byte). The Mac is up; the closing work is written.
+4. **[[D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL]]** (P2) — the exact ELF mirror of what `mo`
+   closed for Mach-O: locals-first band, and derive `firstNonLocal` from the emitted ordering
+   instead of the hardcoded `2`. **Cheap now that the Mach-O shape exists**, and the row already
+   says why it could not ride on the name-only fix.
+5. **Two example descriptions carry stale cap numbers** (`examples/c/deep_nested_casts` says
+   `maxSpeculationDepth` 320, now 2048; `examples/c/deeply_nested_expression_iterative` says
+   `maxExpressionDepth` 1024, now 16384) — non-functional, deliberately not edited by the lane that
+   moved the caps, because they sat outside its grant.
+6. **A harness row is owed for the over-broad build-contention wait** — see §0.4.
+7. ⚠ **UNMEASURED, and stated as such:** whether P60's conversions moot
+   [[D-TEST-ARM64-LEG-NEEDS-AMBIENT-ULIMIT-STACK-OR-595-ENTRIES-RED]]. That needs an arm64 leg run
+   held open while the question is asked; `rc` did not hold one and did not claim it.
+## §0.4 — THE THROUGH-LINE, AND ONE UNFILED HARNESS FINDING
+
+★★★ **P58 doubted the ROW. P59 doubted the GUARD. P60 DOUBTS THE LANE'S OWN CLOSING CLAIM.**
+Three lanes reached an independent review; **all three came back NEEDS FIXES or materially
+corrected**, and in two the defect was invisible from inside the lane: `mo`'s new pin covered five
+of the six cells it claimed and **could have silently emptied itself** (its static-arm expectation
+was DERIVED FROM THE FIXTURE, so whichever way the fixture went the cell agreed with it — now each
+port DECLARES its expectation and the fixture is asserted against it, proven non-vacuous by two
+mutants); `dl2` folded a tree that reddened three ctest entries it had correctly diagnosed and not
+fixed; `pe` shipped a conformance defect against a clause it had cited correctly elsewhere.
+⇒ **A lane's gate green is a claim about its own worktree. The review is not optional, and the
+orchestrator applying a lane's report without one is the same failure one level up.**
+
+★★ **AND THE FOURTH LANE EXTENDS IT ONE STEP FURTHER: `rc` DOUBTED ITS OWN ROW AND WAS RIGHT.**
+It refuted the row's #1-ranked residue as already converted **at the commit the row was written
+against**, and it refused to close on the half it had shipped. **A lane that reports its row still
+OPEN, with the measurement showing why, has done the job** — the alternative was a closure that
+read as complete while the sqlite-shape axis stayed broken.
+★ **Two of P60's three review findings were themselves partly REFUTED by the agents that fixed
+them** — `dl2`'s memo-staleness scenario could not happen through `DSS_CONFIG_ROOT` (the memo key
+IS the resolved path, so a different root is a miss, never a stale hit; the real hazard is a
+sibling edited in place), and `pe` judged one cell correctly *unchanged*. **A reviewer's finding is
+a hypothesis too.**
+
+⚠ **UNFILED, and it deserves a harness row:** a red-on-disable harness that waits on a **host-wide
+process scan** over-waits. `pe`'s harness blocked on any `ninja.exe`/`ctest.exe` anywhere on the
+host — including lane `rc` building in a completely different tree. **Contention is per-TREE**; the
+correct predicate is *"is anything writing MY build tree"*. It self-clears on a 3600 s cap, so it
+fails safe, but it can cost a lane an hour of its life.
+
+---
+
+★★★ **P59 — RELOCATED HERE BY P60, AND IT IS HISTORY, NOT STATE.** It was §0 until P60 opened.
+Every figure below is P59's own and was true at P59's tip (`98a8c8ba`); **re-derive anything you
+intend to act on.** Its through-line — *doubt the GUARD; a green instrument may be structurally
+incapable of seeing the defect beside it* — is the direct ancestor of P60's, which turns the same
+doubt one step further out, onto the LANE'S OWN CLOSING CLAIM.
+
+## ⏪ P59's former §0 (history)
+
+### ⏪ P59's own former heading, kept verbatim so the block reads as it did: *§0 — RESUME HERE (a session with no context reads this block first)*
 
 **Cycle P59 closed 2026-09-04.** **SEVEN lanes** plus the orchestrator, in three waves of at
 most four, on top of P58 (`b1f31420`).

@@ -90,39 +90,64 @@ void mix(std::uint64_t& h, std::uint64_t v) {
 // because a cycle in a C type graph must pass through a composite, and this walk
 // stops at every composite. All the cycles end up in `refs`, where the fixed
 // point in `finalize_` handles them as ordinary edges.
-void CompositeIdentityIndex::spine_(TypeInterner const& src, TypeId id,
+//
+// ★★★ AN EXPLICIT HEAP WORK STACK, NOT HOST RECURSION
+// (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED,
+// the operator's ruling of 2026-09-02). This walk used to call itself at the
+// volatile peel and once per operand, so its host-stack depth followed the
+// structural nesting of a field's type — a pointer chain, an array-of-array, a
+// function type's parameters — the same shape `TypeInterner::representationType`
+// had until P55. The digest is PRE-ORDER (everything a node mixes is mixed
+// before any operand is visited), so a LIFO of pending TypeIds with the operands
+// pushed in reverse reproduces the recursion's mixing sequence exactly and the
+// signature is byte-identical. ✔MEASURED 2026-09-04 (P60, lane `rc`), with the
+// recursive form restored in the tree (the red-on-disable mutant), on a 1 MiB
+// thread: a struct field of a pointer chain observed by this index survived
+// 2000 levels and died of stack overflow at 4000; the same fixture reaches
+// 100 000 levels here on a 256 KiB thread
+// (`tests/core/test_deep_type_layout_costs_heap.cpp`,
+// `CompositeIdentityIndexDeepNesting.SpineOverADeepPointerFieldCostsHeap`).
+void CompositeIdentityIndex::spine_(TypeInterner const& src, TypeId root,
                                     std::uint64_t& h,
                                     std::vector<std::uint32_t>& refs) {
-    if (!id.valid()) { mix(h, std::string_view{"!"}); return; }
-    // RAW kind, never the transparent `kind()`: a `volatile T` must not describe
-    // as a plain `T`, or the cross-CU merge silently drops the qualifier
-    // (c27, D-CSUBSET-VOLATILE-POINTEE).
-    TypeKind const kind = src.get(id).kind;
-    mix(h, static_cast<std::uint64_t>(kind));
+    std::vector<TypeId> pending;
+    pending.push_back(root);
+    while (!pending.empty()) {
+        TypeId const id = pending.back();
+        pending.pop_back();
+        if (!id.valid()) { mix(h, std::string_view{"!"}); continue; }
+        // RAW kind, never the transparent `kind()`: a `volatile T` must not
+        // describe as a plain `T`, or the cross-CU merge silently drops the
+        // qualifier (c27, D-CSUBSET-VOLATILE-POINTEE).
+        TypeKind const kind = src.get(id).kind;
+        mix(h, static_cast<std::uint64_t>(kind));
 
-    if (kind == TypeKind::Struct || kind == TypeKind::Union) {
-        mix(h, std::string_view{"<composite>"});
-        refs.push_back(nodeFor_(src, id));
-        return;
+        if (kind == TypeKind::Struct || kind == TypeKind::Union) {
+            mix(h, std::string_view{"<composite>"});
+            refs.push_back(nodeFor_(src, id));
+            continue;
+        }
+        if (kind == TypeKind::VolatileQual) {
+            mix(h, static_cast<std::uint64_t>(src.qualifierBits(id)));
+            pending.push_back(src.stripVolatile(id));   // the material type, next
+            continue;
+        }
+        // Every other kind is hash-consed by (kind, name, extensionKind, scalars,
+        // operands) in the host, so the signature spells the same tuple.
+        mix(h, src.name(id));
+        mix(h, static_cast<std::uint64_t>(src.get(id).extensionKind.v));
+        if (kind == TypeKind::FnSig) {
+            mix(h, static_cast<std::uint64_t>(src.fnIsVariadic(id) ? 1 : 0));
+        }
+        std::span<std::int64_t const> scalars = src.scalars(id);
+        mix(h, static_cast<std::uint64_t>(scalars.size()));
+        for (std::int64_t s : scalars) mix(h, static_cast<std::uint64_t>(s));
+        std::span<TypeId const> ops = src.operands(id);
+        mix(h, static_cast<std::uint64_t>(ops.size()));
+        // Reversed, so the first operand is described first — the recursion's
+        // pre-order, and the order the digest is keyed on.
+        for (std::size_t i = ops.size(); i-- > 0;) pending.push_back(ops[i]);
     }
-    if (kind == TypeKind::VolatileQual) {
-        mix(h, static_cast<std::uint64_t>(src.qualifierBits(id)));
-        spine_(src, src.stripVolatile(id), h, refs);
-        return;
-    }
-    // Every other kind is hash-consed by (kind, name, extensionKind, scalars,
-    // operands) in the host, so the signature spells the same tuple.
-    mix(h, src.name(id));
-    mix(h, static_cast<std::uint64_t>(src.get(id).extensionKind.v));
-    if (kind == TypeKind::FnSig) {
-        mix(h, static_cast<std::uint64_t>(src.fnIsVariadic(id) ? 1 : 0));
-    }
-    std::span<std::int64_t const> scalars = src.scalars(id);
-    mix(h, static_cast<std::uint64_t>(scalars.size()));
-    for (std::int64_t s : scalars) mix(h, static_cast<std::uint64_t>(s));
-    std::span<TypeId const> ops = src.operands(id);
-    mix(h, static_cast<std::uint64_t>(ops.size()));
-    for (TypeId op : ops) spine_(src, op, h, refs);
 }
 
 // ★ EVERY CHANNEL `reinternType` CARRIES ACROSS MUST BE HERE, and the argument

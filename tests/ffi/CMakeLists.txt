@@ -279,3 +279,17 @@ target_include_directories(dss_ffi_test_shipped_stat_typed_surface
 # default went back to `true`; fix the default, do NOT relax the pin.
 dss_add_test(NAME ffi/test_descriptor_import_referenced_only
              SOURCES test_descriptor_import_referenced_only.cpp)
+
+# ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE (P60 lane `dl2`)
+# The DECODER's half of the role form: a `library` entry naming a runtime ROLE
+# (`{"pe": {"role": "cLibrary"}}`) resolved at descriptor decode through the core
+# `RuntimeLibraryRoleResolver` seam. Drives the reader with a HAND-BUILT
+# `RuntimeLibraryTable` (a core type — no format document is loaded, which is the
+# layering split this directory keeps), so every verdict is about the decoder:
+# resolution, the per-symbol override, the no-resolver UNBOUND arm, the
+# format-INDEPENDENT refusals (asserted with no resolver so they cannot rot), the
+# resolution refusals, and the realization oracle threading the resolver over the
+# shipped corpus. Needs no json link: it writes descriptor text and reads it back
+# through the real reader.
+dss_add_test(NAME ffi/test_shipped_library_role
+             SOURCES test_shipped_library_role.cpp)

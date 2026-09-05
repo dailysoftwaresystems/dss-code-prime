@@ -122,7 +122,7 @@ know exists.
 |-------------|----------|---------|
 | `header`    | **yes**  | The header these symbols come from (`stdio.h`). This is the provenance answer to *"where does `puts` come from?"* — a descriptor that omitted it would defeat the purpose, so the reader **fails loud** (`F_ShippedLibDescriptorMalformed`) if it is missing or empty. |
 | `standard`  | no       | The language standard the surface targets (`c89`, `c99`, …). Provenance only. |
-| `library`   | no       | A per-OBJECT-FORMAT MAP (`"pe"`/`"elf"`/`"macho"` → runtime image). The active compilation target's object format selects its entry at `compile_pipeline` resolution (keyed by `objectFormatKindName`). **Optional**: a map MISSING the active format's key (or absent entirely) leaves the row UNBOUND, resolved at the LINK tier per C23 5.1.1.2 phase 8 — it does NOT inherit a per-language default, because UCRT-P4 (Decision 1) removed `externLibraryByFormat` outright as a second owner of a fact the corpus owns per SYMBOL. A key NOT in the object-format vocabulary (a typo like `"pee"`) **fails loud** (`F_ShippedLibDescriptorMalformed`) on read. **What the 30 descriptors that carry a map actually name today** (copy these, not the historical `msvcrt.dll`): 18 declare a `pe` entry — **16** `ucrtbase.dll` (the UCRT) and 2 `kernel32.dll` (`threads.json`, `windows.json`). **No descriptor names `msvcrt.dll` any more**: UCRT-P5 moved the last holdout, `setjmp.json`, once the facility was found in ucrtbase under the name `__intrinsic_setjmp` (that row pairs `library.pe` with a `linkName`, and the two must move together — see `tests/ffi/test_pe_crt_costate_binding.cpp`). Every `elf` entry is `libc.so.6` except `math.json`/`tgmath.json` (`libm.so.6`), and every `macho` entry is `/usr/lib/libSystem.B.dylib`. |
+| `library`   | no       | A per-OBJECT-FORMAT MAP (`"pe"`/`"elf"`/`"macho"` → runtime image). The active compilation target's object format selects its entry at `compile_pipeline` resolution (keyed by `objectFormatKindName`). **Optional**: a map MISSING the active format's key (or absent entirely) leaves the row UNBOUND, resolved at the LINK tier per C23 5.1.1.2 phase 8 — it does NOT inherit a per-language default, because UCRT-P4 (Decision 1) removed `externLibraryByFormat` outright as a second owner of a fact the corpus owns per SYMBOL. A key NOT in the object-format vocabulary (a typo like `"pee"`) **fails loud** (`F_ShippedLibDescriptorMalformed`) on read. **Each value is ONE of two spellings** (see [Naming a runtime role instead of an image](#naming-a-runtime-role-instead-of-an-image)): a string naming the image, or `{"role": "<runtimeLibraries role>"}` naming the runtime ROLE whose image the object format's `runtimeLibraries` table owns — `cLibrary`, `unwindPersonality`, `systemPrimitives`, `atomicsRuntime`. **Write the role whenever the image plays one**; a literal is for an image that plays NO role on that family, and the corpus guard refuses a literal that restates a role's image. ✔MEASURED 2026-09-04 (P60): of the 69 entries the 31 map-carrying descriptors declare, **67 name a role** — 16 pe `cLibrary` (the UCRT), 2 pe `systemPrimitives` (`threads.json`, `windows.json` — kernel32), 23 elf `cLibrary`, 26 macho `cLibrary` — and the **2** literals left are `math.json`/`tgmath.json`'s elf `libm.so.6`, the separate glibc math object no role names. **No descriptor names `msvcrt.dll`**: UCRT-P5 moved the last holdout, `setjmp.json`, once the facility was found in ucrtbase under the name `__intrinsic_setjmp` (that row pairs `library.pe` with a `linkName`, and the two must move together — see `tests/ffi/test_pe_crt_costate_binding.cpp`). |
 | `availableObjectFormats` | no | Per-target AVAILABILITY — which object formats this header EXISTS on (the sibling axis to `library`, which says which IMAGE per format). ABSENT/EMPTY = available on **every** format (C-standard headers omit it); a POSIX-only header carries `["elf","macho"]`, so `#include <sys/time.h>` **fails loud** for a windows-pe target and `__has_include` answers the per-target truth. Same object-format vocabulary as `library` — an unknown name **fails loud** on read. A `symbols` entry may carry its own `availableObjectFormats` to gate one symbol (see `stdio.json`'s `__stdinp` / `_wfopen`). |
 | `includes`  | no       | The transitive sibling headers this header `#include`s in the real world (`inttypes.json` declares `["stdint.h"]`, mirroring C 7.8p1). Including the parent injects each declared sibling's surface too, walking the config-declared graph cycle-safely. Each entry is a header NAME resolved by the same `<stem>.json` convention as a source angle-include (`"sys/uio.h"` → `sys/uio.json`). ABSENT/EMPTY = no transitive edges. **`includes` does NOT count toward "declares something"** — an includes-only descriptor still fails loud. |
 | `symbols`   | no\*     | The exported LINK surface (extern functions/objects). An entry accepts **THIRTEEN** keys and no more (✔MEASURED 2026-08-25 against the reader's own list; the twelve documented in this cell plus `realization`, which has its own section below) — an unknown one **fails loud** (`symbols[i]`) exactly as at the root. **`name`** (REQUIRED) — the undecorated C identifier; the linker-visible form is produced downstream by FF4 mangling. **`signature`** (REQUIRED) — a hir-text type string: a full `fn(…) -> …` FnSig for a function, or the value type for an object, decoded by the one shared `parseTypeFromText` codec. **`signatureByDataModel`** — a per-DATA-MODEL override map (`"LP64"`/`"LLP64"`/`"ILP32"` → signature string); the ACTIVE model's entry replaces `signature`, and EVERY declared override is parsed on every read, so a form that only Windows selects can never lurk malformed. An unknown model key fails loud. **`kind`** — `"function"` (default) or `"object"`; selects `ExternFunction` vs `ExternGlobal`. **`linkage`** — `"external"` (default) or `"weak"`; validated and carried (the synthesis path currently emits Strong for every shipped import). **`availableObjectFormats`** — per-SYMBOL availability, the symbol-granularity sibling of the header-level key. Load-bearing, not cosmetic: DSS imports EVERY declared shipped extern whether the program references it or not, so a name absent from the active format's runtime image must not be declared there or nothing links. **`noreturn`** — this extern never returns (`abort`, `exit`, `longjmp`, `thrd_exit`). A shipped extern has no user prototype to carry C11 `_Noreturn`, so the descriptor declares it and a direct call lowers to `Block{ call, Unreachable }`. **`returnsTwice`** — C11 7.13.1.1 (`setjmp`, `_setjmp`); rides to MIR as `MirInstFlags::ReturnsTwice`, which is what stops mem2reg promoting a live-across-`setjmp` local and stops the inliner taking the callee. **`synthesize`** — this symbol is NOT an import but a COMPILER-SYNTHESIZED body; the value is a recipe id from a CLOSED vocabulary and MUST equal `name` (the synth pass identifies each recipe by symbol name, so both an unknown id and a mismatch are rejected on read). Live use: `threads.json`'s `<threads.h>` shim (21 pe rows over kernel32, 21 macho rows over pthread/libSystem — the elf rows are ordinary glibc imports) and `stdio.json`'s five pe printf/scanf rows over the UCRT `__stdio_common_v*` cores, which `ucrtbase.dll` does not export as `printf`/`fprintf`/`sprintf`/`sscanf`/`vfprintf` at all. **`version`** — the ELF symbol VERSION this import must bind (`stdlib.json`'s `realpath` → `GLIBC_2.3` on x86_64-elf), so a reference does not misbind to a multi-versioned glibc symbol's OLDEST compat instance. A flat string, or per-target `variants` (`when` + `value`) since the version is genuinely per-target. Empty = unversioned; ELF-only semantics, carried and unused on PE/Mach-O. **`linkName`** — the UNDECORATED name the shipped library actually EXPORTS for this C identifier ON THIS TARGET, when it is not the identifier itself. Same shape as `version` (flat string, or per-target `variants` with `when` + `value`) and read by the same decoder. Live use: Darwin's modern 64-bit-inode ABI is reached through `$INODE64` asm-label aliases on **x86_64** and through the plain names on **arm64**, so `sys/stat.json`'s `stat`/`fstat`/`lstat`, `unistd.json`'s `statfs`/`fstatfs` and `dirent.json`'s `opendir`/`readdir` each carry a `when:{format:"macho",arch:"x86_64"}` arm; every other target matches nothing and keeps the identifier. ★ Write the BASE name only — `"fstat$INODE64"`, never `"_fstat$INODE64"`. Mach-O's leading underscore is a per-FORMAT fact the ENGINE composes (`ffi::linkNameFor` → `applyCMangling`), exactly as `version` composes `realpath` + `GLIBC_2.3` into `realpath@GLIBC_2.3` rather than making you spell it. ★ NOT the same thing as a user's C `__asm("x")` (which is verbatim and BYPASSES mangling); this is the INPUT to mangling, and a user `__asm` outranks it. ★ AUTHORING CHECK, and it REPLACES the older "verify the symbol is exported" rule for this class: an export check does NOT catch a wrong link name, because BOTH `_fstat` and `_fstat$INODE64` exist in libSystem's x86_64 slice. The check that works is **"does a real compiler for THIS target emit THIS name for THIS C identifier"** — compile a one-line TU with the platform toolchain and read the undefined symbol it emits. Getting this wrong does not fail loud: a descriptor SHADOWS the SDK header entirely, so the platform's own asm label never participates, the plain name resolves against the LEGACY implementation, and the program links, loads, and misbinds (MEASURED — it made `fstat` return `st_size == 0` and sqlite call every database "malformed"). **`library`** — a per-symbol OVERRIDE of the descriptor's map, same `{pe,elf,macho}` shape, MERGED over it (symbol keys win; an omitted format inherits). Counts, ✔MEASURED 2026-08-25 over the 49 shipped descriptors: `availableObjectFormats` 218 entries, `synthesize` 48, `linkName` 33, `noreturn` 6, `signatureByDataModel` 6, `returnsTwice` 2, `version` 1 — and the per-symbol `library` override is used by **no** descriptor at present. Its last user was `stdio.json`'s `__stdio_common_vsprintf` row, retired when this file's own `pe` default became `ucrtbase.dll`; it is documented because the reader accepts it and the next split-runtime symbol will need it, not because anything depends on it today. ⚠ The `linkName` 33 are NOT 33 Darwin renames: **25 are `pe` rows** where the UCRT's own C identifier simply carries a leading underscore or a width suffix (`io.json`'s `_write`/`_read`, `sys/stat.json`'s `_fstat64i32`, `time.json`'s `_time64`), **8 are the Mach-O ones** — `stat` `fstat` `lstat` `statfs` `fstatfs` `opendir` `readdir` (x86_64 only, `$INODE64`) and `realpath` (BOTH arches, `$DARWIN_EXTSN`). ★ Those eight are the COMPLETE Darwin divergence set over the current 247-identifier Mach-O import surface, ✔MEASURED symbol-by-symbol against Apple `cc` and recorded in `tests/ffi/data/darwin-link-names.tsv` (236 identifiers on 2026-08-25 plus <tgmath.h>'s eleven `<complex.h>` counterparts on 2026-08-31, every one of the eleven PLAIN on both arches); `ffi/test_darwin_link_name_oracle` reds if a NEW symbol is declared without that measurement. |
@@ -403,6 +403,66 @@ deferral entirely (a single descriptor set serves all targets).
 <stdio.h>` + `puts("hello")` links `puts` against ucrtbase.dll on Windows-PE
 (msvcrt.dll until the TF-C111 CRT migration), libc.so.6 on Linux-ELF (x86_64 +
 arm64), and libSystem on macOS-Mach-O — from the one `stdio.json`.
+
+### Naming a runtime role instead of an image
+
+An object format's `runtimeLibraries` table is the single owner of *which image
+plays which runtime role* on that family — `cLibrary`, `unwindPersonality`,
+`systemPrimitives`, `atomicsRuntime` — and every spine block in the format
+document names a ROLE, never an image. A descriptor's `library` entry does the
+same:
+
+```jsonc
+// stdio.json
+"library": { "pe": { "role": "cLibrary" }, "elf": { "role": "cLibrary" }, "macho": { "role": "cLibrary" } },
+// windows.json — the OS-primitive image, not the C library
+"library": { "pe": { "role": "systemPrimitives" } },
+// math.json — glibc's math object plays no role, so it keeps the literal
+"library": { "pe": { "role": "cLibrary" }, "elf": "libm.so.6", "macho": { "role": "cLibrary" } },
+```
+
+**Why (D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE).**
+Before this form existed, 67 of the corpus's 69 entries restated a role's image
+as a literal. Repointing a `cLibrary` row then moved the format's own `exit`
+import and left every descriptor's `puts` on the old image — rc=0 at every
+compile stage, and a binary the loader refused at process start (pe
+`0xC0000139`, macho exit 127) with no diagnostic naming any JSON line. The role
+is resolved **at descriptor decode** (`decodeLibraryMap`), through a resolver
+the driver builds over the active format, and lands in the decoded map as a
+plain image string — so nothing downstream of the reader changed.
+
+**Which row answers.** The active format document's own row when it declares
+the role (the row its own spine blocks already bind); otherwise the shipped
+flavour documents of the same kind, which must AGREE — a `-dll`, `-dyn`,
+`-dylib` or `-staticlib` document declares no `cLibrary` (the loader refuses a
+row no block names as inert config, and an archive could not record the image
+anyway) and reaches the family's row through the one adapter,
+`FormatRuntimeLibraryRoleResolver`, which assembles the siblings
+(`ObjectFormatSchema::assembleFlavourRuntimeLibraries`) at most once per binding
+operation and caches them for exactly that long — never on the schema, which is
+memoized for the process and must stay a pure function of its own bytes.
+Two siblings naming different providers is REFUSED, never resolved by scan
+order.
+
+**What is refused at read, format-independently** (so an arm no target selects
+cannot rot): an unknown role, the `none` sentinel, an `image` beside a `role`
+(the two spellings are alternatives), any other key in the object, a missing or
+non-string `role`, a value that is neither a string nor an object. **Refused
+with a resolver in hand**: a role no document of the family declares, a role the
+family REALIZES from a shipped source (`atomicsRuntime` on pe — there is no image
+to import from; that body belongs under `realization`), a family that cannot be
+assembled. A reader that binds no import (the LSP, the header parser, the
+layout/name tests) passes no resolver: the role is validated and recorded on
+`libraryRoles`, and the entry yields no image — the same UNBOUND arm an omitted
+key states.
+
+Guards: `tests/ffi/test_shipped_library_role.cpp` (the decoder),
+`tests/link/test_descriptor_library_role_agreement.cpp` (every referenced role
+resolves on every flavour of its family; no remaining literal restates a role's
+image; the `libm.so.6` exception plays no role),
+`tests/program/test_descriptor_role_follows_the_table.cpp` (a `cLibrary`
+repoint moves the image the LINKER receives for every role-bound import, and
+not the literal).
 
 ---
 

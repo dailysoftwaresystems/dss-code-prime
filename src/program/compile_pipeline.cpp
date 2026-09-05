@@ -12,6 +12,7 @@
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: BUILD half on a large stack
 #include "core/substrate/mint_monotonic_id.hpp"  // c165: fresh per-member CompilationUnitId (static pull)
 #include "core/types/config_path_walk.hpp"  // findShippedConfigDir -- the ONE shipped-config discovery precedence
+#include "core/types/object_format_kind.hpp"  // RuntimeLibraryRoleResolver (D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE)
 #include "core/substrate/phase_timers.hpp"      // c97: per-phase --time accumulation
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"  // encode-tier extern binder's scratch lattice
@@ -400,6 +401,10 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // opening the next, and any early return closes the live one.
     std::optional<substrate::PhaseTimers::Scope> phase;
     phase.emplace(substrate::CompilePhase::Semantic);
+    // D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: this
+    // producer BINDS imports, so it answers descriptor role entries — from the
+    // active format's own row, or its shipped flavour family's.
+    FormatRuntimeLibraryRoleResolver const roleResolver{format};
     auto model = analyze(
         // D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE: the operator's
         // budget, carried on `opts` from `rep` -- NOT `reporter.config()`, which
@@ -422,7 +427,13 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // only in a unit test that passes its own schema is not a shipped
         // diagnostic. `target` is the driver's own long-lived schema and
         // outlives `model`, which is the lifetime the parameter requires.
-        &target);
+        &target,
+        // The standard deep-recursion reserve (the `0` sentinel) — spelled only
+        // because the resolver behind it is positional.
+        /*deepRecursionReserveBytes=*/0,
+        // Consulted during analysis only, never republished by the model, so a
+        // reference to a local outlives every read of it.
+        &roleResolver);
     phase.reset();
     copyDiagnostics(model.diagnostics(), reporter);
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
@@ -2370,6 +2381,11 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
     if (onBinaryNames.empty()) return out;
 
     auto const scheme = format.cSymbolDecoration().scheme;
+    // D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: this
+    // oracle's rows become `ExternImport.libraryPath`, so it answers descriptor
+    // role entries exactly as the C front half does — one resolver shape, one
+    // family answer, on every path a symbol reaches the linker by.
+    FormatRuntimeLibraryRoleResolver const roleResolver{format};
 
     // The oracle interns each row's declared signature, so it needs a lattice.
     // Neither of this file's on-binary-name producers has a `SemanticModel` (the
@@ -2468,7 +2484,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
         auto const realized = ffi::realizeShippedExternSymbols(
             forwardRequest, lattice.interner(), lattice.registry(), reporter,
             format.dataModel(), std::optional<std::string_view>{target.name()},
-            format.kind(), namedTypes);
+            format.kind(), namedTypes, &roleResolver);
         if (!realized.has_value()) return std::nullopt;   // corpus not located
         for (std::size_t i = 0; i < onBinaryNames.size(); ++i) {
             if (canonicalOf[i].empty()) continue;
@@ -2519,7 +2535,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
     auto const wholeCorpus = ffi::realizeShippedExternSymbols(
         everyName, lattice.interner(), lattice.registry(), reporter,
         format.dataModel(), std::optional<std::string_view>{target.name()},
-        format.kind(), namedTypes);
+        format.kind(), namedTypes, &roleResolver);
     if (!wholeCorpus.has_value()) return std::nullopt;   // corpus not located
 
     // on-binary name -> the row realizing to it. A SECOND row claiming one name

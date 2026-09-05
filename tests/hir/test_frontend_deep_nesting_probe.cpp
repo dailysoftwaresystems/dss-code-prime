@@ -295,10 +295,13 @@ TEST(FrontendDeepNestingProbe, WalksTheConfiguredDepth) {
     ParserConfig pcfg;
     pcfg.maxExpressionDepth = cap;
     // `DSS_HS_PROBE_SPEC` lifts the SPECULATION cap (`ParserConfig::
-    // maxSpeculationDepth`, C++ default 8 and NOT config-driven today). It is a
-    // separate axis from `maxExpressionDepth` and it bounds a separate host
-    // recursion — `trySpeculativeBranch` — so measuring one says nothing about
-    // the other. Left unset the shipped default stands.
+    // maxSpeculationDepth`). It is a separate axis from `maxExpressionDepth`:
+    // it counts nested speculative probes, which (since P60) live on the
+    // parser's heap `specStack` and are bounded by the MEMORY a probe's
+    // checkpoint costs rather than by any host recursion. Left unset the C++
+    // fallback of 64 stands — NOT the shipped c value, which only
+    // `parserConfigFor` (compilation_unit.cpp) reads from `c.lang.json`; a
+    // probe that must see the shipped 2048 sets this explicitly.
     if (std::string const spec = envOr("DSS_HS_PROBE_SPEC", ""); !spec.empty()) {
         pcfg.maxSpeculationDepth =
             static_cast<std::size_t>(std::atoll(spec.c_str()));

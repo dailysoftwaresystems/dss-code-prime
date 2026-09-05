@@ -3607,15 +3607,19 @@ public:
             schema_->schemaTokens().find(cfg().variadicMarkerToken);
         // FC17.9(h): the QUOTE-include opener kind (`"` -> StringStart) that
         // `handleEmbed` matches to find the `#embed "resource"` filename, and the
-        // ANGLE opener kind (the REUSED `hasIncludeAngleOpenToken` = LtOp) so a
-        // `#embed <resource>` gets the specific angle-form deferral message. Both
-        // are CONFIG kinds (agnosticism), OPTIONAL: an empty field leaves the kind
+        // ANGLE delimiter kinds (the REUSED `hasIncludeAngleOpenToken` /
+        // `hasIncludeAngleCloseToken` = LtOp / GtOp) that delimit a
+        // `#embed <resource>` name (C23 6.10.4.1p8, D-PP-EMBED-ANGLE). All are
+        // CONFIG kinds (agnosticism), OPTIONAL: an empty field leaves the kind
         // InvalidSchemaToken and the `.valid()` guards never fire (a language that
-        // declares no `#embed` never reaches handleEmbed anyway).
+        // declares no `#embed` never reaches handleEmbed anyway; one that declares
+        // no angle pair refuses an angle operand loud as not-a-quote).
         quoteIncludeKind_ =
             schema_->schemaTokens().find(cfg().quoteIncludeToken);
         embedAngleOpenKind_ =
             schema_->schemaTokens().find(cfg().hasIncludeAngleOpenToken);
+        embedAngleCloseKind_ =
+            schema_->schemaTokens().find(cfg().hasIncludeAngleCloseToken);
         // [[D-PP-COMPUTED-INCLUDE-SILENT-DROP]]: the `#include <h>` opener kind
         // (`angleIncludeToken` = HeaderStart), which the include arm's
         // computed-form backstop needs to tell a NORMAL angle include (forwarded
@@ -5260,18 +5264,28 @@ private:
     // the existing macro expander (via the callbacks below). Returns the
     // BRANCH-TAKEN boolean (the evaluator already emitted any fail-loud
     // diagnostic; a nullopt -> false, the branch is not taken).
-    [[nodiscard]] bool evalIfOperand(std::vector<Token> const& in,
-                                     std::size_t p, std::size_t end) {
-        // The operand runs from `p` up to (but not including) the trailing
-        // newline that `lineEnd` consumed.
-        std::size_t last = end;
-        while (last > p && isNewline(in[last - 1])) --last;
-        std::vector<Token> operand(in.begin() + static_cast<std::ptrdiff_t>(p),
-                                   in.begin() + static_cast<std::ptrdiff_t>(last));
-        PpMacroExpand expandCb =
-            [this](std::vector<Token> const& toks) { return expandTokens(toks); };
-        PpIsDefined definedCb =
-            [this](std::string_view n) { return isDefined(n); };
+    // ── THE ONE CONSTRUCTION SITE of the `#if` evaluator's resolver callbacks ──
+    //
+    // `evalIfOperand` (a `#if`/`#elif` controlling expression) and `handleEmbed`
+    // (an embed `limit`, which C23 6.10.4.2p3 evaluates "using the rules
+    // specified for conditional inclusion") hand the SAME five resolvers to the
+    // same evaluator. Building them here once is what makes that a fact rather
+    // than a comment: a `__has_include` inside a `limit` clause resolves exactly
+    // as one inside a `#if` does, because it is the same closure. The EXPANDER
+    // is deliberately NOT among them -- it is the one thing the two callers
+    // legitimately differ on (`expandTokens` arms the `defined` barrier a
+    // controlling expression needs; `expandRun` is the plain normal-text engine
+    // a `limit` clause needs, whose `defined` is refused outright).
+    struct IfCallbacks {
+        PpIsDefined       defined;
+        PpHasInclude      hasInclude;
+        PpProductText     product;
+        PpHasEmbed        hasEmbed;
+        PpOperatorRevoked revoked;
+    };
+    [[nodiscard]] IfCallbacks makeIfCallbacks() {
+        IfCallbacks cb;
+        cb.defined = [this](std::string_view n) { return isDefined(n); };
         // FC15c + D-INCLUDE-ANGLE-SOURCE-FALLBACK: `__has_include` resolves a
         // header EXACTLY as the include machinery would. This is the AUTHORITATIVE
         // pass's callback (it decides the FINAL `#if` branch); it MUST agree with
@@ -5279,7 +5293,7 @@ private:
         // all three route through the SAME `resolveAngleInclude` funnel — a
         // descriptor / source / miss verdict that can never drift. Quote form =
         // self-dir + includeDirs (`resolveIncludePath`), unchanged.
-        PpHasInclude hasIncludeCb =
+        cb.hasInclude =
             [this](std::string_view filename, bool isAngle) -> bool {
             if (isAngle) {
                 // Descriptor -> per-target availability (c9: an unavailable-on-this-
@@ -5333,49 +5347,60 @@ private:
         // FC15b: surface the accumulated product tail (a predefined/`#`/`##`
         // product expanded inside this `#if` operand materializes into it) so the
         // evaluator assembles a combined prefix+product buffer to slice it.
-        PpProductText productCb =
+        cb.product =
             [this]() -> std::string_view { return productText_; };
         // FC17.9(h): `__has_embed` answers EXACTLY what `#embed` would do at the
         // operator's spot -- per-origin resolution (the dir of the file containing
-        // the operator, derived from `opSpan` via the line-map), then the C23
-        // trichotomy NOT_FOUND(0) / FOUND(1) / EMPTY(2). Angle form -> 0 (the
-        // deferred angle form resolves no binary resource). Uses the SAME
-        // resolveIncludePath + is_regular_file the directive uses, so the operator
-        // and the directive can never disagree on a resource's existence/size.
-        PpHasEmbed embedCb =
+        // the operator, derived from `opSpan` via the line-map) through the ONE
+        // resolver the directive uses (`resolveEmbedResource`: the quote search,
+        // its 6.10.4.1p9 fallback, the angle search), then the resource's byte
+        // count. The TRICHOTOMY is the evaluator's (it holds the `limit`), on
+        // the same width formula the directive splices with -- so the operator
+        // and the directive can never disagree on existence, size or emptiness.
+        cb.hasEmbed =
             [this](std::string_view filename, bool isAngle,
-                   SourceSpan opSpan) -> int {
-            if (isAngle) return 0;   // D-PP-EMBED-ANGLE: nothing to resolve
+                   SourceSpan opSpan) -> std::optional<std::uint64_t> {
             HeaderSearchResult const r =
-                resolveIncludePath(filename, embedResolutionDir(opSpan),
-                                   includeDirs_, headerNameMatching_);
+                resolveEmbedResource(filename, isAngle, opSpan);
             if (r.status == HeaderSearchStatus::AmbiguousCase) {
                 // Authoritative + live (same argument as `__has_include`
                 // above): a `__has_embed`-guarded resource whose name
                 // fold-collides is seen by NO other tier.
                 reportHeaderCaseAmbiguity(rep_, BufferId{}, SourceSpan::empty(0),
                                           filename, r.ambiguousCandidates);
-                return 0;
+                return std::nullopt;
             }
-            if (r.status != HeaderSearchStatus::Found) return 0;  // NOT_FOUND
-            auto const& resolved = r.path;
-            std::error_code ec;
-            if (!fs::is_regular_file(resolved, ec)) return 0;   // NOT_FOUND
-            auto const sz = fs::file_size(resolved, ec);
-            if (ec) return 0;                                   // stat failed
-            return sz == 0 ? 2 /*EMPTY*/ : 1 /*FOUND*/;
+            if (r.status != HeaderSearchStatus::Found) return std::nullopt;
+            // The SAME measurement the directive takes (`resourceByteCount`:
+            // regular-file check + `file_size`), so "how big is this resource"
+            // has one owner and the operator cannot drift from the splice.
+            return resourceByteCount(r.path);
         };
         // D-PP-HAS-EXTENSION-BUILTIN-ABSENT: the revocation oracle. THIS
         // expander's set, so the `#if` fold and `#ifdef` cannot disagree about
         // whether an `#undef`'d operator is still an operator — the two-verdicts-
         // on-one-file failure the TF-C86 refusal was originally protecting
         // against, now protected against on the other side of the ruling.
-        auto revokedCb = [this](std::string_view n) {
+        cb.revoked = [this](std::string_view n) {
             return operatorRevoked(n);
         };
-        auto v = evaluateIfExpression(operand, *schema_, expandCb, definedCb,
-                                      hasIncludeCb, *synth_, productCb, rep_,
-                                      embedCb, revokedCb, charIsUnsigned_);
+        return cb;
+    }
+
+    [[nodiscard]] bool evalIfOperand(std::vector<Token> const& in,
+                                     std::size_t p, std::size_t end) {
+        // The operand runs from `p` up to (but not including) the trailing
+        // newline that `lineEnd` consumed.
+        std::size_t last = end;
+        while (last > p && isNewline(in[last - 1])) --last;
+        std::vector<Token> operand(in.begin() + static_cast<std::ptrdiff_t>(p),
+                                   in.begin() + static_cast<std::ptrdiff_t>(last));
+        PpMacroExpand expandCb =
+            [this](std::vector<Token> const& toks) { return expandTokens(toks); };
+        IfCallbacks const cb = makeIfCallbacks();
+        auto v = evaluateIfExpression(operand, *schema_, expandCb, cb.defined,
+                                      cb.hasInclude, *synth_, cb.product, rep_,
+                                      cb.hasEmbed, cb.revoked, charIsUnsigned_);
         return v.has_value() && *v;
     }
 
@@ -5475,32 +5500,70 @@ private:
         return variadicMarker_.valid() && t.schemaKind == variadicMarker_;
     }
 
-    // FC17.9(h): read `path`'s bytes BINARY-exact into a string, WITHOUT minting a
-    // BufferId / registering a source (the byte-body of `SourceBuffer::fromFile`
-    // without the buffer machinery, and without throwing). nullopt on an open or
-    // read failure (the caller emits the loud unreadable diagnostic).
-    // `std::ios::binary` is load-bearing on Windows -- a CR/LF/SUB byte in the
-    // resource must survive verbatim (pinned by tests).
-    static std::optional<std::string> readResourceBytes(fs::path const& path) {
+    // FC17.9(h): the resource's byte COUNT (its implementation resource width in
+    // octets, C23 6.10.4.1p1), measured from the FILESYSTEM rather than from a
+    // buffer. nullopt when the path is not a readable regular file -> the
+    // caller's loud unreadable diagnostic.
+    //
+    // ★ IT IS A SEPARATE STEP FROM THE READ BECAUSE THE SIZE DECIDES WHETHER
+    // THE READ MAY HAPPEN AT ALL: `limit` narrows it (6.10.4.2p4) and the splice
+    // budget gates it, and both must be answerable BEFORE the bytes are in RAM.
+    static std::optional<std::uint64_t> resourceByteCount(fs::path const& path) {
         // The shared `resolveIncludePath` matches any directory ENTRY, so it can
-        // hand back a DIRECTORY. Require a regular file (nullopt -> the caller's loud
-        // unreadable diagnostic) so a directory-named resource fails LOUD, never
-        // reads as a silently-empty embed.
+        // hand back a DIRECTORY. Require a regular file (nullopt -> the caller's
+        // loud unreadable diagnostic) so a directory-named resource fails LOUD,
+        // never reads as a silently-empty embed.
         std::error_code ec;
         if (!fs::is_regular_file(path, ec)) return std::nullopt;
-        // A mid-stream IO error (disk/share failure) can silently truncate the
-        // read, and a truncated `#embed` is a SILENT MISCOMPILE — the program
-        // gets fewer bytes than the resource holds and nothing says so.
-        // THE ONE CHECKED READ
-        // (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
-        // ⚠ The `if (in.bad())` this replaces could not fire: `<< in.rdbuf()`
-        // inserts through the STREAMBUF and never touches the istream object's
-        // state (✔MEASURED), so this resource read has been unguarded since it
-        // was written. The helper compares BYTES against the size it measured,
-        // which is the only detector a short read has.
-        auto text = core::readFileChecked(path);
-        if (!text) return std::nullopt;
-        return *std::move(text);
+        auto const size = fs::file_size(path, ec);
+        if (ec) return std::nullopt;
+        return static_cast<std::uint64_t>(size);
+    }
+
+    // FC17.9(h): read AT MOST `maxBytes` of `path` BINARY-exact into a string,
+    // WITHOUT minting a BufferId / registering a source (the byte-body of
+    // `SourceBuffer::fromFile` without the buffer machinery, and without
+    // throwing). nullopt on an open or read failure (the caller emits the loud
+    // unreadable diagnostic). `std::ios::binary` is load-bearing on Windows -- a
+    // CR/LF/SUB byte in the resource must survive verbatim (pinned by tests).
+    //
+    // ★★ A RESOURCE IS NOT READ PAST ITS LIMIT (C23 6.10.4.2 EXAMPLE 4: "The
+    // limit parameter may help process only a portion of that information and
+    // PREVENT EXHAUSTION of an implementation's internal resources when
+    // processing such data"; 6.10.4.5 EXAMPLE 3 embeds `<infinite-resource>`
+    // with `limit(0)`). Reading the whole file and then discarding the tail
+    // would make `limit` a formatting option instead of the resource bound the
+    // standard designed it as.
+    static std::optional<std::string> readResourceBytes(fs::path const& path,
+                                                        std::uint64_t maxBytes) {
+        auto const size = resourceByteCount(path);
+        if (!size) return std::nullopt;
+        if (maxBytes >= *size) {
+            // A mid-stream IO error (disk/share failure) can silently truncate
+            // the read, and a truncated `#embed` is a SILENT MISCOMPILE — the
+            // program gets fewer bytes than the resource holds and nothing says
+            // so. THE ONE CHECKED READ
+            // (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT).
+            // ⚠ The `if (in.bad())` this replaces could not fire: `<< in.rdbuf()`
+            // inserts through the STREAMBUF and never touches the istream
+            // object's state (✔MEASURED), so this resource read was unguarded
+            // since it was written. The helper compares BYTES against the size
+            // it measured, which is the only detector a short read has.
+            auto text = core::readFileChecked(path);
+            if (!text) return std::nullopt;
+            return *std::move(text);
+        }
+        // The BOUNDED arm keeps the same short-read detector: `gcount()` must
+        // deliver exactly the bytes asked for, or the read failed and the
+        // caller refuses LOUD rather than embedding a shorter resource.
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return std::nullopt;
+        std::string out(static_cast<std::size_t>(maxBytes), '\0');
+        in.read(out.data(), static_cast<std::streamsize>(maxBytes));
+        if (in.gcount() != static_cast<std::streamsize>(maxBytes)) {
+            return std::nullopt;
+        }
+        return out;
     }
 
     // FC17.9(h): the directory the `#embed` quote form resolves against -- the
@@ -5524,132 +5587,387 @@ private:
         return includingDir_;
     }
 
-    // FC17.9(h) C23 `#embed` (6.10.4 / N3096 6.10.3): the directive handler
-    // (D-PP-EMBED). Splices the QUOTED resource's bytes into `body` as a
-    // comma-separated list of decimal `int` constants (0..255), via the SAME
-    // product-token mechanism (`materializeSignificant`) the `#`/`##` operators
-    // use -- the spliced tokens are ordinary IntLiteral/Comma tokens that survive
-    // expansion untouched (only Word tokens re-trigger macros) and the parser
-    // accepts in a brace initializer. `wordIdx` is the `embed` directive WORD (the
-    // anchor for every diagnostic + the per-origin resolution dir). Every
-    // non-bare-quote-filename shape and every unsupported construct fails LOUD with
+    // ── C23 6.10.4.1p8/p9: THE ONE resource resolver, for `#embed` AND `__has_embed` ──
+    //
+    // QUOTE form (p9): the quote search -- EXACTLY the quote-`#include` search
+    // (absolute -> direct; else the directory of the FILE that contains the
+    // directive, then the `-I` include dirs) -- and, if it fails, "the directive
+    // is reprocessed as if it read `# embed < h-char-sequence >`": the angle
+    // search below with the identical name. The same fallback 6.10.3p3 gives
+    // `#include "h"`.
+    //
+    // ANGLE form (p8, "a sequence of implementation-defined places"): the places
+    // the angle `#include` searches, in the same order -- the shipped system
+    // dirs, then the `-I` include dirs, with NO includer-directory prepend
+    // (6.10.3p2 parity) -- through the SHARED `findInDirs` atom, so there is no
+    // second search-path list and no second case policy. What the angle EMBED
+    // deliberately does NOT do is `resolveAngleInclude`'s `<stem>.json`
+    // DESCRIPTOR rewrite: that rewrite is DSS's model of a system HEADER's name
+    // and describes no resource -- a `<time.dat>` must not be refused because a
+    // `time.json` descriptor exists, and no binary resource is ever a shipped
+    // descriptor.
+    //
+    // ⚠ p14 SAYS THE OPPOSITE OF WHAT THIS REUSE DOES, AND THAT IS A STATED
+    // DIVERGENCE, NOT AN ENDORSEMENT. 6.10.4.1p14 is *Recommended practice*:
+    // "A mechanism similar to, but DISTINCT FROM, the implementation-defined
+    // search paths used for source file inclusion (6.10.3) is encouraged."
+    // DSS reuses the SAME two lists in the SAME order, so it does not follow
+    // that recommendation. It is free not to: p14 is non-normative ("is
+    // encouraged") and p8 makes the places implementation-defined outright.
+    // WHY REUSE IS STILL THE RIGHT CALL HERE: a second, embed-only path list
+    // would be a SECOND OWNER of "where DSS looks for a file", with no surface
+    // for a user to declare it -- neither the CLI (`-I`), the project file, nor
+    // any `.lang/.target/.format.json` has a resource-path vocabulary, so the
+    // "distinct" mechanism would have to be invented AND configured before a
+    // single `#embed <r>` could resolve. One declared search vocabulary that a
+    // user already controls beats a second, undeclarable one. If a resource
+    // path list is ever declared, THIS function is the one place that changes.
+    //
+    // Returns the tri-state verdict (`AmbiguousCase` is REPORTED by the caller,
+    // never flattened -- D-PP-HEADER-CASE-INSENSITIVE-PE). `opSpan` anchors the
+    // per-origin includer directory exactly as `embedResolutionDir` derives it.
+    [[nodiscard]] HeaderSearchResult
+    resolveEmbedResource(std::string_view filename, bool isAngle,
+                         SourceSpan opSpan) const {
+        if (!isAngle) {
+            HeaderSearchResult quote =
+                resolveIncludePath(filename, embedResolutionDir(opSpan),
+                                   includeDirs_, headerNameMatching_);
+            if (quote.status != HeaderSearchStatus::NotFound) return quote;
+        }
+        HeaderSearchResult system =
+            findInDirs(filename, systemDirs_, headerNameMatching_);
+        if (system.status != HeaderSearchStatus::NotFound) return system;
+        return findInDirs(filename, includeDirs_, headerNameMatching_);
+    }
+
+    // ── C23 6.10.4 `#embed` (D-PP-EMBED; PARAMS / ANGLE / MACRO-ARG closed P60) ──
+    //
+    // The directive handler. Splices the resource's bytes into `body` as a
+    // comma-separated list of decimal `int` constants (6.10.4.1p7/p10: values in
+    // [0, 2^elementWidth), the octet element width `kEmbedElementWidthBits`),
+    // via the SAME product-token mechanism (`materializeSignificant`) the
+    // `#`/`##` operators use -- ordinary IntLiteral/Comma tokens the parser
+    // accepts in a brace initializer -- with the standard parameters applied:
+    //   * the operand is `"resource"` (p9), `<resource>` (p8), or, matching
+    //     NEITHER, `pp-tokens` that are macro-expanded "just as in normal text"
+    //     and must then match one of the two (p11);
+    //   * the embed-parameter-sequence is read by the ONE parser `__has_embed`
+    //     uses (`parseEmbedParameterSequence`), an unknown name is a 6.10.1p9
+    //     constraint violation, and `limit` is evaluated by the ONE evaluator
+    //     `__has_embed` uses (`evaluateEmbedLimit`, 6.10.4.2);
+    //   * the resource is located by the ONE resolver `__has_embed` uses
+    //     (`resolveEmbedResource`), and its WIDTH (6.10.4.1p1/p5, 6.10.4.2p4)
+    //     by the ONE formula (`embedResourceWidthBytes`);
+    //   * an EMPTY resource expands to `if_empty`'s clause or to nothing
+    //     (6.10.4.5p2), and `prefix`/`suffix` then have no effect (6.10.4.4p3 /
+    //     6.10.4.3p3); a non-empty one expands to `prefix` + bytes + `suffix`.
+    // `wordIdx` is the `embed` directive WORD (the anchor for every diagnostic +
+    // the per-origin resolution dir). Every malformed shape fails LOUD with
     // `P_PreprocessorEmbed` -- never a silent drop, never a silent partial embed.
     void handleEmbed(std::vector<Token> const& in, std::size_t wordIdx,
                      std::size_t end, std::vector<Token>& body) {
+        using Role = PreprocessConfig::EmbedParameterRole;
         SourceSpan const dirSpan = in[wordIdx].span;   // the `embed` word
-        std::size_t p = skipTrivia(in, wordIdx + 1);
+        auto failAt = [&](SourceSpan span, std::string msg) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(), span,
+                   std::move(msg));
+        };
+        auto isQuoteOpen = [&](Token const& t) {
+            return quoteIncludeKind_.valid() && t.schemaKind == quoteIncludeKind_;
+        };
+        auto isAngleOpen = [&](Token const& t) {
+            return embedAngleOpenKind_.valid()
+                && t.schemaKind == embedAngleOpenKind_;
+        };
+        auto isAngleClose = [&](Token const& t) {
+            return embedAngleCloseKind_.valid()
+                && t.schemaKind == embedAngleCloseKind_;
+        };
 
-        // ── Extract the quote filename (the `#include "h"` shape). ──
+        std::size_t const p = skipTrivia(in, wordIdx + 1);
         if (p >= end || isNewline(in[p])) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
-                   dirSpan, "#embed requires a \"resource\" filename");
+            failAt(dirSpan, "#embed requires a \"resource\" or <resource> operand");
             return;
         }
-        // An angle opener (LtOp, the reused hasIncludeAngle kind) -> the deferred
-        // angle form (D-PP-EMBED-ANGLE: DSS ships JSON descriptors, not binary
-        // resources, on the system path). Anything that is NOT the quote opener
-        // (e.g. a macro name -- C23's "expand if not one of the forms") -> the
-        // deferred macro-argument form (D-PP-EMBED-MACRO-ARG). Never silent.
-        if (embedAngleOpenKind_.valid()
-            && in[p].schemaKind == embedAngleOpenKind_) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
-                   dirSpan,
-                   "#embed <resource> (angle form) is not supported "
-                   "(D-PP-EMBED-ANGLE); use \"resource\"");
+        // The operand run: every token after `embed` up to -- NOT including --
+        // the terminating newline (`end` is one past it, `lineEnd`).
+        std::size_t opEnd = p;
+        while (opEnd < end && !isNewline(in[opEnd])) ++opEnd;
+
+        // ── 6.10.4.1p11: an operand that starts with NEITHER delimiter is
+        // "processed just as in normal text" -- the WHOLE tail (name and
+        // parameters alike), through the plain `expandRun` engine (no `defined`
+        // barrier: 6.10.2 scopes that operator to `#if`; the `#line` 6.10.6p6
+        // precedent, ONE expander) -- and the RESULT "shall match one of the two
+        // previous forms". A tail that opens with a delimiter is NOT expanded:
+        // `#embed "r" L` matches form 1's grammar as written (`L` is a
+        // pp-parameter), so `L` is judged as a parameter, not a macro. ──
+        std::vector<Token> line;
+        bool fromMacro = false;
+        if (isQuoteOpen(in[p]) || isAngleOpen(in[p])) {
+            line.assign(in.begin() + static_cast<std::ptrdiff_t>(p),
+                        in.begin() + static_cast<std::ptrdiff_t>(opEnd));
+        } else {
+            std::vector<Token> const source(
+                in.begin() + static_cast<std::ptrdiff_t>(p),
+                in.begin() + static_cast<std::ptrdiff_t>(opEnd));
+            line      = expandRun(source);
+            fromMacro = true;
+        }
+        std::size_t q = 0;
+        while (q < line.size() && (isTrivia(line[q]) || isNewline(line[q]))) ++q;
+        if (q >= line.size() || !(isQuoteOpen(line[q]) || isAngleOpen(line[q]))) {
+            failAt(dirSpan,
+                   std::string{"#embed operand matches neither \"resource\" nor "
+                               "<resource>"}
+                       + (fromMacro ? " after macro expansion (C23 6.10.4.1p11: "
+                                      "the directive resulting after all "
+                                      "replacements shall match one of the two "
+                                      "forms)"
+                                    : ""));
             return;
         }
-        if (!quoteIncludeKind_.valid() || in[p].schemaKind != quoteIncludeKind_) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
-                   dirSpan,
-                   "#embed requires a \"resource\" filename (a macro-expanded "
-                   "argument is not supported: D-PP-EMBED-MACRO-ARG)");
-            return;
-        }
-        // The quote opener consumed only the opening `"`; the coalesced string
-        // BODY is the ADJACENT next token, its raw text the filename (escapes NOT
-        // decoded, like the include resolver). An empty body (`#embed ""`) leaves
-        // the filename empty -> loud below. The closing `"` is its OWN token
-        // (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN), so `after` must step past BOTH
-        // the body and the closer — otherwise the parameter wall right below sees
-        // the delimiter and reports `parameter '"' is not supported`, rejecting
-        // every well-formed `#embed "res.bin"`.
+        // A diagnostic about a token of the EXPANDED line points at the
+        // directive (the expansion site) -- a product token has no position a
+        // reader can look at ([[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]).
+        PpEmbedFail const failParam = [&](Token const& at, std::string msg) {
+            failAt(fromMacro ? dirSpan : at.span, std::move(msg));
+        };
+        PpTokenTextFn const textOf = [this](Token const& t) -> std::string_view {
+            return text(t);
+        };
+
+        // ── The resource name. ──
         std::string filename;
-        std::size_t after = p + 1;   // token index just past the filename body
-        if (after < end && !isTrivia(in[after]) && !isNewline(in[after])
-            && in[after].span.start() == in[p].span.end()) {
-            filename = std::string{text(in[after])};
-            after    = pastBodyAndCloser(in, after);
+        bool        isAngle = false;
+        std::size_t after   = 0;   // index in `line` just past the name
+        if (isAngleOpen(line[q])) {
+            // `<h-char-sequence>`: the raw bytes between the delimiters (matched
+            // by KIND), read through the SAME refusing slicer `__has_embed(<r>)`
+            // and `__has_include(<h>)` use -- a name spliced across buffers or
+            // lines by expansion is refused, never guessed.
+            isAngle = true;
+            ByteOffset const innerStart = line[q].span.end();
+            ByteOffset       innerEnd   = innerStart;
+            std::size_t      k          = q + 1;
+            bool             sawClose   = false;
+            for (; k < line.size(); ++k) {
+                if (isAngleClose(line[k])) { sawClose = true; break; }
+                innerEnd = line[k].span.end();
+            }
+            if (!sawClose) {
+                failAt(dirSpan, "expected '>' to close '#embed <...'");
+                return;
+            }
+            if (innerEnd > innerStart) {
+                auto raw = ppRawRun(innerStart, innerEnd, *synth_, productText_);
+                if (!raw.has_value()) {
+                    failAt(dirSpan, "#embed <resource> name could not be read as "
+                                    "one contiguous run after macro expansion");
+                    return;
+                }
+                filename = std::string{*raw};
+            }
+            after = k + 1;
+        } else {
+            // The quote opener consumed only the opening `"`; the coalesced
+            // string BODY is the ADJACENT next token, its raw text the filename
+            // (escapes NOT decoded, like the include resolver). An empty body
+            // (`#embed ""`) leaves the filename empty -> loud below. The closing
+            // `"` is its OWN token (D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN), so
+            // `after` steps past BOTH the body and the closer -- otherwise the
+            // parameter parser would meet the delimiter and refuse every
+            // well-formed `#embed "res.bin"`.
+            std::size_t const bodyIdx = q + 1;
+            after                     = bodyIdx;
+            if (bodyIdx < line.size() && !isTrivia(line[bodyIdx])
+                && !isNewline(line[bodyIdx])
+                && line[bodyIdx].span.start() == line[q].span.end()) {
+                filename = std::string{text(line[bodyIdx])};
+                after    = pastBodyAndCloser(line, bodyIdx);
+            }
         }
         if (filename.empty()) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
-                   dirSpan, "#embed has an empty resource filename");
+            failAt(dirSpan, "#embed has an empty resource name");
             return;
         }
 
-        // ── Reject parameters loudly (D-PP-EMBED-PARAMS). ANY significant token
-        // after the filename before the line-end newline -> loud, naming it.
-        // Silently honoring `limit(N)`/`prefix`/`suffix`/`if_empty`/vendor would
-        // embed a different byte set than the program asked for -- a silent
-        // miscompile class; the loud wall is the VLA-C1a fail-loud precedent. ──
-        std::size_t q = skipTrivia(in, after);
-        if (q < end && !isNewline(in[q])) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
-                   dirSpan,
-                   std::string{"#embed parameter '"} + std::string{text(in[q])}
-                       + "' is not supported (D-PP-EMBED-PARAMS); only "
-                         "`#embed \"resource\"` is supported this cycle");
+        // ── 6.10.4.1p2 / 6.10.1p4-p9: the embed-parameter-sequence, through the
+        // ONE parser `__has_embed` uses. Then 6.10.1p9: every parameter "shall
+        // be either a preprocessor standard parameter, or an implementation-
+        // defined preprocessor prefixed parameter" -- DSS defines none of the
+        // latter, so an unsupported name of EITHER shape is a constraint
+        // violation HERE, on a `#embed` line.
+        // ⚠ THE OPERATOR DIVERGES FOR EXACTLY ONE SHAPE, and footnote 196 is
+        // what draws the line: "An unrecognized preprocessor PREFIXED parameter
+        // is a constraint violation, except within has_embed expressions". So
+        // `vendor::name` is the NOT_FOUND(0) probe signal inside `__has_embed`
+        // (6.10.2p7 + p8 NOTE 1) and a violation here; an unknown
+        // STANDARD-SHAPED name is a violation in BOTH -- the carve-out never
+        // reaches it. That asymmetry is the whole point of the `vendor::`
+        // spelling: it is the shape a program can safely probe for. ──
+        auto const seq = parseEmbedParameterSequence(
+            line, after, *schema_, textOf, failParam,
+            /*stopAtOperatorClose=*/false);
+        if (!seq.has_value()) return;   // reported through failParam
+        for (PpEmbedParameter const& param : seq->parameters) {
+            if (param.role.has_value()) continue;
+            std::string declared;
+            if (cfg().embedParameters.has_value()) {
+                for (PreprocessConfig::EmbedParameterDef const& def :
+                     cfg().embedParameters->standard) {
+                    if (!declared.empty()) declared += ", ";
+                    declared += def.name;
+                }
+            }
+            if (declared.empty()) declared = "none declared by this language";
+            failParam(line[param.nameIndex],
+                      std::string{"#embed parameter '"} + param.spelling
+                          + (param.prefixed
+                                 ? "' is an implementation-defined (prefixed) "
+                                   "parameter this implementation does not "
+                                   "define (C23 6.10.1p9); probe it with "
+                                   "__has_embed before relying on it"
+                                 : "' is not a standard embed parameter (C23 "
+                                   "6.10.1p9; the standard parameters are: ")
+                          + (param.prefixed ? std::string{} : declared + ")"));
             return;
         }
 
-        // ── Resolve the resource EXACTLY as a quote-`#include` would (the ONE
-        // shared quote search: absolute -> direct; else self-dir first, then the
-        // include dirs), relative to the FILE that contains the directive. ──
+        // ── 6.10.4.2: `limit`, through the ONE evaluator `__has_embed` uses, with
+        // the SAME resolver callbacks a `#if` gets and the plain normal-text
+        // expander (p3; `defined` is refused inside it, p2). ──
+        std::optional<std::uint64_t> limit;
+        if (PpEmbedParameter const* lim = seq->find(Role::Limit)) {
+            IfCallbacks const   cb = makeIfCallbacks();
+            PpMacroExpand const expandCb =
+                [this](std::vector<Token> const& toks) { return expandRun(toks); };
+            std::span<Token const> const lineSpan{line};
+            limit = evaluateEmbedLimit(
+                lineSpan.subspan(lim->clauseBegin, lim->clauseEnd - lim->clauseBegin),
+                line[lim->nameIndex], *schema_, expandCb, cb.defined,
+                cb.hasInclude, *synth_, cb.product, rep_, cb.hasEmbed, cb.revoked,
+                charIsUnsigned_, textOf, failParam);
+            if (!limit.has_value()) return;   // reported through failParam
+        }
+
+        // ── Locate (6.10.4.1p8/p9) through the ONE resolver `__has_embed` uses. ──
         HeaderSearchResult const rr =
-            resolveIncludePath(filename, embedResolutionDir(dirSpan),
-                               includeDirs_, headerNameMatching_);
+            resolveEmbedResource(filename, isAngle, dirSpan);
         if (rr.status == HeaderSearchStatus::AmbiguousCase) {
             reportHeaderCaseAmbiguity(rep_, synth_->id(), dirSpan, filename,
                                       rr.ambiguousCandidates);
             return;
         }
         if (rr.status != HeaderSearchStatus::Found) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
-                   dirSpan, std::string{"#embed resource not found: "} + filename);
+            failAt(dirSpan,
+                   std::string{"#embed resource not found: "} + filename
+                       + (isAngle ? " (angle search: the system directories, "
+                                    "then the -I include directories)"
+                                  : " (quote search relative to the including "
+                                    "file and the -I include directories, then "
+                                    "the angle search: C23 6.10.4.1p9)"));
             return;
         }
         auto const* resolved = &rr.path;
 
-        // ── Read the bytes BINARY-exact (CRLF/SUB/NUL/0xFF preserved). ──
-        auto bytes = readResourceBytes(*resolved);
-        if (!bytes) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
-                   dirSpan, std::string{"#embed resource could not be read: "}
+        // ── 6.10.4.1p1: the IMPLEMENTATION RESOURCE WIDTH, measured from the
+        // filesystem so nothing is in RAM yet. ──
+        auto const fileBytes = resourceByteCount(*resolved);
+        if (!fileBytes) {
+            failAt(dirSpan, std::string{"#embed resource could not be read: "}
                                 + resolved->string());
             return;
         }
 
-        // ── FIX-1 (D-PP-EMBED, the streaming boundary): gate the byte COUNT
-        // through the pure size helper -- a catchable LOUD wall, never an OOM. ──
-        if (auto sizeErr = embedResourceSizeError(bytes->size())) {
-            emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
-                   dirSpan, std::move(*sizeErr));
+        // ── 6.10.4.1p1/p5 + 6.10.4.2p4: the resource WIDTH -- the directive's
+        // and `__has_embed`'s ONE formula, so the two agree on emptiness. ──
+        std::uint64_t const width = embedResourceWidthBytes(*fileBytes, limit);
+
+        // ── (D-PP-EMBED-STREAMING, the splice boundary): gate the byte count
+        // this directive will MATERIALIZE through the pure size helper -- a
+        // catchable LOUD wall, never an OOM.
+        //
+        // ★ THE GATE IS ON THE WIDTH, AND IT IS THE SAME BUDGET, APPLIED TO WHAT
+        // IT ACTUALLY PROTECTS. Its own account (preprocessor.hpp) says the cost
+        // is the SPLICE -- ~2 tokens per EMBEDDED byte across the body / out /
+        // result.tokens vectors and the parser's `fromTokens` copy -- and after
+        // `limit` the embedded count IS `width`. With no `limit`, `width` is the
+        // file size and this is byte-for-byte the check that was here before;
+        // with one, C23 6.10.4.5 EXAMPLE 3 (`#embed <infinite-resource> limit(0)
+        // if_empty(45540)` -> `45540`) and 6.10.4.2 EXAMPLE 4 (`limit(513)` over
+        // an endless stream) become expressible instead of being refused for a
+        // cost the directive never pays. ⚠ THE CAP IS NOT LOWERED, NOT LIFTED
+        // and not made conditional: a resource above it with no `limit` (or a
+        // `limit` above it) still fails LOUD, naming the limit and the
+        // construct. It now also fires BEFORE the read rather than after, so an
+        // oversized resource is refused instead of being slurped into memory
+        // first -- which is what the budget was written to prevent.
+        if (auto sizeErr =
+                embedResourceSizeError(static_cast<std::size_t>(width))) {
+            failAt(dirSpan, std::move(*sizeErr));
+            return;
+        }
+        // A parameter's balanced token sequence is spliced VERBATIM: "the
+        // directive is replaced by its expansion and ... additional or
+        // replacement token sequences" (6.10.4.1p7). The tokens then sit in the
+        // body stream where the ordinary macro pass processes them as normal
+        // text, exactly like the tokens of an included file.
+        auto spliceClause = [&](PpEmbedParameter const* param) {
+            if (param == nullptr) return;
+            for (std::size_t k = param->clauseBegin; k < param->clauseEnd; ++k) {
+                body.push_back(line[k]);
+            }
+        };
+        if (width == 0) {
+            // 6.10.4.5p2: `if_empty` REPLACES the directive entirely; 6.10.4.4p3
+            // and 6.10.4.3p3: `prefix` and `suffix` "have no effect" -- and
+            // without `if_empty` the expansion is the empty sequence (p7).
+            // ★ AND NOT ONE BYTE IS READ: at width 0 the resource contributes
+            // nothing, which is precisely 6.10.4.5 EXAMPLE 3's `limit(0)` over a
+            // resource an implementation could not read to the end.
+            spliceClause(seq->find(Role::IfEmpty));
             return;
         }
 
-        // ── Empty resource -> empty expansion (C23 6.10.3/6.10.4: the byte list
-        // is empty; cycle-1 has no `if_empty` parameter to change that). Push
-        // nothing and return -- the directive expands to the empty sequence. ──
-        if (bytes->empty()) return;
+        // ── Read the bytes BINARY-exact (CRLF/SUB/NUL/0xFF preserved), bounded
+        // by the resource width so nothing past the `limit` is ever read. ──
+        auto bytes = readResourceBytes(*resolved, width);
+        if (!bytes || bytes->size() < static_cast<std::size_t>(width)) {
+            // A short read is a SILENT MISCOMPILE if accepted: the program would
+            // get fewer bytes than the resource holds. Loud, always -- including
+            // the case where the file SHRANK between the size measurement above
+            // and this read.
+            failAt(dirSpan, std::string{"#embed resource could not be read: "}
+                                + resolved->string());
+            return;
+        }
 
-        // ── Splice: spell the bytes as a comma-separated decimal `int` list, then
-        // materialize the product tokens (IntLiteral/Comma) and push into `body`
-        // (the include-arm push point). A `'\n'` before every 16th element keeps
-        // any later diagnostic-rendered product line short; `materializeSignificant`
-        // DROPS trivia/newlines from its returned tokens, so the newlines cost
-        // zero tokens (the spliced stream is exactly `42, 13, 10, ...`). ──
+        spliceClause(seq->find(Role::Prefix));
+
+        // ── Splice: spell the first `width` bytes as a comma-separated decimal
+        // `int` list, then materialize the product tokens (IntLiteral/Comma) and
+        // push into `body` (the include-arm push point). A `'\n'` before every
+        // 16th element keeps any later diagnostic-rendered product line short;
+        // `materializeSignificant` DROPS trivia/newlines from its returned tokens,
+        // so the newlines cost zero tokens (the stream is exactly `42, 13, ...`). ──
+        //
+        // ★ THE OCTET ASSUMPTION IS ENFORCED HERE, WHERE IT LIVES. This loop
+        // spells ONE byte per element and the reader yields octets, so the code
+        // is correct only at an 8-bit embed element width (C23 6.10.4.1p6).
+        // `kEmbedElementWidthBits` is the tripwire for that, and this is the
+        // site it guards -- a different width needs a different reader and a
+        // different splicer, which is why it is an engine constant rather than
+        // a config knob.
+        static_assert(kEmbedElementWidthBits == 8,
+                      "#embed splices one OCTET per element: a different embed "
+                      "element width (C23 6.10.4.1p6) requires a different "
+                      "resource reader and a different splicer, not a "
+                      "different constant");
         std::string spelling;
-        spelling.reserve(bytes->size() * 5);
-        for (std::size_t bi = 0; bi < bytes->size(); ++bi) {
+        spelling.reserve(static_cast<std::size_t>(width) * 5);
+        for (std::size_t bi = 0; bi < static_cast<std::size_t>(width); ++bi) {
             if (bi != 0) {
                 spelling.push_back(',');
                 spelling.push_back((bi % 16 == 0) ? '\n' : ' ');
@@ -5665,11 +5983,14 @@ private:
         // put it there. ★ This arm is why the provenance is stamped at
         // `materializeSignificant` rather than in `expand`: `#embed` never goes
         // through a macro invocation at all.
-        MintScope const mintScope{*this, dirSpan.start(), 0, /*hasDef=*/false,
-                                  std::string{"#"} + cfg().embedDirective};
-        for (Token const& t : materializeSignificant(spelling)) {
-            body.push_back(t);
+        {
+            MintScope const mintScope{*this, dirSpan.start(), 0, /*hasDef=*/false,
+                                      std::string{"#"} + cfg().embedDirective};
+            for (Token const& t : materializeSignificant(spelling)) {
+                body.push_back(t);
+            }
         }
+        spliceClause(seq->find(Role::Suffix));
     }
 
     void handleDefine(std::vector<Token> const& in, std::size_t p,
@@ -8640,12 +8961,15 @@ private:
     // product).
     SchemaTokenId                        stringizeKind_{};
     SchemaTokenId                        pasteKind_{};
-    // FC17.9(h): the QUOTE-include opener kind (StringStart) + the ANGLE opener
-    // kind (the reused hasIncludeAngleOpenToken = LtOp) that `handleEmbed` matches
-    // to extract the `#embed "resource"` filename / detect the deferred angle form
-    // (InvalidSchemaToken when the language declares no `#embed`).
+    // FC17.9(h): the QUOTE-include opener kind (StringStart) + the ANGLE
+    // delimiter kinds (the reused hasIncludeAngleOpenToken/CloseToken = LtOp /
+    // GtOp -- the language's ONE angle vocabulary, shared with `__has_include`)
+    // that `handleEmbed` matches to extract the `#embed "resource"` /
+    // `#embed <resource>` name (InvalidSchemaToken when the language declares
+    // no `#embed` or no angle pair; the `.valid()` guards then keep the arm inert).
     SchemaTokenId                        quoteIncludeKind_{};
     SchemaTokenId                        embedAngleOpenKind_{};
+    SchemaTokenId                        embedAngleCloseKind_{};
     // [[D-PP-COMPUTED-INCLUDE-SILENT-DROP]]: the `#include <h>` ANGLE opener
     // kind (`angleIncludeToken` = HeaderStart). Distinct from
     // `embedAngleOpenKind_` above, which is the `hasIncludeAngleOpenToken`

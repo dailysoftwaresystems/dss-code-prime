@@ -103,8 +103,14 @@ namespace {
     // exactly as the production driver does (Program::compileFiles). A
     // deeply-nested corpus fixture (e.g. expression_too_deeply_nested.c, whose
     // paren nest exceeds the c config cap `parser.maxExpressionDepth`
-    // = 1024 to trip the depth guard) parses a ~1024-deep tree, which would
-    // overflow this test thread's default stack if built inline.
+    // = 16384 to trip the depth guard) parses a 16460-deep tree. ★ P60 raised
+    // that cap from 1024 and regenerated the fixture with it — the corpus is
+    // parsed through the SHIPPED config, so a fixture left at the old depth
+    // stops tripping the guard and emits NOTHING
+    // (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED).
+    // The parser itself no longer holds a host frame per nesting level, but the
+    // CU is still built on the large worker stack because that is what the
+    // production driver does and the tiers behind it are not all converted.
     auto cu = dss::substrate::callOnLargeStack(
         dss::substrate::kDeepRecursionStackBytes,
         [&]() -> std::shared_ptr<CompilationUnit> {

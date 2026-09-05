@@ -19,6 +19,7 @@
 #include <expected>
 #include <filesystem>
 #include <memory>
+#include <mutex>          // std::once_flag — the role resolver's one-shot family assembly
 #include <optional>
 #include <span>
 #include <string>
@@ -2374,6 +2375,43 @@ public:
     [[nodiscard]] RuntimeLibraryTable const& runtimeLibraries() const noexcept {
         return d_.runtimeLibraries;
     }
+
+    // ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ──
+    // The role table of the SHIPPED FLAVOURS OF THIS KIND — the half of a
+    // descriptor's `{"role": …}` answer this document does not declare itself,
+    // this document standing in for its shipped namesake (a `loadFromText`
+    // mutant of `…-exec` supersedes the shipped `…-exec`). Assembled by the same
+    // total, memoized scan of `object-formats/` that
+    // `runtime::resolveArchiveSiblingFormat` runs, over the directory THIS
+    // document was loaded from (`loadFromText` has none, so the ambient shipped
+    // directory answers — the mutant case, and the only one).
+    // The error arm is the family failing to ASSEMBLE — the directory not
+    // located, a sibling that does not load, or two siblings naming different
+    // providers (an image against a shipped source, or two images) — and it is
+    // never resolved by iteration order.
+    // ★ WHY NOT A ROW ON EVERY FLAVOUR. The loader refuses a `runtimeLibraries`
+    // row no block of the document names (inert config), and it is right to: an
+    // archive cannot record an image at all, so a `cLibrary` row on a
+    // `-staticlib` document could change no output. The family fact is written
+    // where a block needs it and reached from here by the flavours that do not.
+    //
+    // ⚠⚠ IT ASSEMBLES ON EVERY CALL, ON PURPOSE, AND THE CACHING BELONGS TO THE
+    // CALLER — `FormatRuntimeLibraryRoleResolver` below is the one that holds it.
+    // ✔The first cut cached the assembled family in a `mutable` member of THIS
+    // class, and this class is MEMOIZED: `loadFromFile` stores each instance in
+    // the content-addressed `ConfigDocumentMemo` with an EMPTY dependency ledger,
+    // justified by "a built schema is a pure function of this document's own
+    // bytes". A member folding TWENTY-THREE SIBLING DOCUMENTS into the instance
+    // makes that claim false — the memo key covers this document's bytes and says
+    // nothing about theirs, so a sibling edited in-process would be served from a
+    // cache keyed on bytes that did not change. `config_document_memo.hpp` calls
+    // exactly that shape "a SILENT MISCOMPILE, not a stale cache entry". A
+    // resolver, by contrast, lives for ONE binding operation — the same lifetime
+    // `resolveArchiveSiblingFormat` and `Resolver::shippedFormats_` give their own
+    // total scans — so its cache cannot outlive the state it was derived from.
+    [[nodiscard]] std::expected<RuntimeLibraryTable, std::string>
+    assembleFlavourRuntimeLibraries() const;
+
     // The format's unwinder-personality declaration, or nullopt if it declares
     // none. `synthesizeSehFunclets` fails loud on a resolved SEH region under a
     // nullopt personality — never a silently-assumed handler/image pair.
@@ -2601,7 +2639,79 @@ private:
     // needed); every other construction path leaves it empty on purpose.
     std::string contentDigest_;
 
+    // The DIRECTORY this document was read from, written ONLY by `loadFromFile`
+    // (also a static member of this class) and empty for every other
+    // construction path. It is the population `assembleFlavourRuntimeLibraries`
+    // scans, so a document's flavour family is ITS OWN siblings rather than
+    // whichever directory the ambient `DSS_CONFIG_ROOT` names at the moment the
+    // question is asked. ⓘ It is a function of the memo LABEL (the resolved
+    // path), which is already half the memo key, so recording it changes nothing
+    // about the instance's purity.
+    std::string sourceDirectory_;
+
     detail::ObjectFormatData d_;
+};
+
+// ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ────
+//
+// THE ONE ADAPTER from a format schema to the core `RuntimeLibraryRoleResolver`
+// seam a shipped-descriptor read asks. Every producer of an `ExternImport` in
+// the driver builds one over the ACTIVE format (the C front half and the
+// on-binary-name oracle), and the corpus guard in `tests/link/` builds one over
+// each shipped flavour — a second adapter would be a second reading of which
+// row answers, which is the drift this row exists to end.
+//
+// ★ IT IS ALSO WHERE THE FLAVOUR-FAMILY SCAN IS CACHED, and that is a lifetime
+// decision, not a convenience. One resolver serves ONE binding operation — a
+// `buildCuMir` of one CU, one on-binary-name oracle call, one guard arm — so its
+// cache is derived from the directory as it is NOW and dies with the operation.
+// The schema it adapts is MEMOIZED for the process, which is exactly why the
+// scan may not be cached there (see `assembleFlavourRuntimeLibraries`).
+// ★ LAZY. An `-exec`/`-pie` build, whose own table declares `cLibrary`, answers
+// from `runtimeLibraries()` and NEVER scans; a `-dll`/`-dyn`/`-dylib`/
+// `-staticlib`/bare build scans once per resolver (the 24 sibling BUILDS are
+// still memo hits after the first, so a second resolver in the same process
+// re-reads and re-digests, and rebuilds nothing).
+// ⓘ `std::once_flag`, not a bare bool: `rowForRole` is `const` on an interface
+// callers hold as a pointer, so a producer that shares one resolver across the
+// driver's per-TU threads must not race on the lazy fill. It also makes the
+// class non-copyable, which is what a resolver should be — it is an ADAPTER
+// over a reference, always constructed at the site that uses it.
+class DSS_EXPORT FormatRuntimeLibraryRoleResolver final
+    : public RuntimeLibraryRoleResolver {
+public:
+    explicit FormatRuntimeLibraryRoleResolver(ObjectFormatSchema const& format) noexcept
+        : format_(format), kindName_(objectFormatKindName(format.kind())) {}
+
+    [[nodiscard]] std::string_view formatKindName() const noexcept override {
+        return kindName_;
+    }
+
+    [[nodiscard]] RuntimeLibraryBinding const*
+    rowForRole(RuntimeLibraryRole role, std::string& refusal) const override {
+        // The ACTIVE document first: the row its own spine blocks already
+        // resolve against, so the build is self-consistent and no scan happens.
+        if (auto const* const own = format_.runtimeLibraries().rowForRole(role))
+            return own;
+        std::call_once(familyOnce_, [this] {
+            family_ = format_.assembleFlavourRuntimeLibraries();
+        });
+        if (!family_.has_value()) {
+            refusal = family_.error();
+            return nullptr;
+        }
+        return family_->rowForRole(role);
+    }
+
+private:
+    ObjectFormatSchema const& format_;
+    std::string_view          kindName_;
+    // The siblings, assembled at most once per resolver. `std::expected` so an
+    // assembly REFUSAL is remembered as a refusal rather than re-attempted (and
+    // re-reported) per role. The default-constructed value is never read: the
+    // `call_once` above always writes it first.
+    mutable std::once_flag                                   familyOnce_;
+    mutable std::expected<RuntimeLibraryTable, std::string>  family_;
 };
 
 } // namespace dss

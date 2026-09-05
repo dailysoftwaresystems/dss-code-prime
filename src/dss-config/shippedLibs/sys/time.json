@@ -3,7 +3,7 @@
   "header": "sys/time.h",
   "standard": "posix",
   "availableObjectFormats": ["elf", "macho"],
-  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "library": { "elf": { "role": "cLibrary" }, "macho": { "role": "cLibrary" } },
   "symbols": [
     { "name": "gettimeofday", "signature": "fn(ptr<timeval>, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
     { "name": "utimes",       "signature": "fn(ptr<char>, ptr<timeval>) -> i32", "kind": "function", "linkage": "external" },

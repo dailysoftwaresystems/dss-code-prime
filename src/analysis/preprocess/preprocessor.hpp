@@ -565,20 +565,62 @@ public:
     // to make greppable, because there is no choice.
     std::optional<bool>                  charIsUnsigned = std::nullopt);
 
-// FC17.9(h) (`#embed`; the size-cap boundary of D-PP-EMBED): a PURE budget
-// check for the cycle-1 `#embed` splice. The splice materializes the resource as
+// FC17.9(h) (`#embed`; the size-cap boundary of D-PP-EMBED-STREAMING): a PURE
+// budget check for the `#embed` splice. The splice materializes the resource as
 // ~2 tokens/byte (an IntLiteral + a Comma) across the body/out/result.tokens
 // vectors + the parser's `fromTokens` copy, so a large resource (tens–hundreds
 // of MiB -- the exact use case a real `#embed` targets) OOM-CRASHES long before
 // the 4 GiB `ByteOffset` text wall. An OOM is neither fail-loud nor graceful, so
-// the handler gates the resource's byte COUNT through this helper FIRST: it
-// returns a diagnostic MESSAGE when `byteCount` exceeds `kEmbedMaxResourceBytes`
-// (the caller emits it as `P_PreprocessorEmbed` on the directive word, naming the
+// the handler gates the byte COUNT through this helper FIRST: it returns a
+// diagnostic MESSAGE when `byteCount` exceeds `kEmbedMaxResourceBytes` (the
+// caller emits it as `P_PreprocessorEmbed` on the directive word, naming the
 // streaming deferral), else nullopt. Taking a COUNT (not a file) makes the
-// red-on-disable unit test call it directly with `cap+1` -- no giant fixture. A
-// real `limit`-aware streaming splice belongs with the deferred parameters cycle.
+// red-on-disable unit test call it directly with `cap+1` -- no giant fixture.
+//
+// ★ WHAT COUNT IT GATES, AND WHY THAT IS THE HONEST ONE. The caller passes the
+// RESOURCE WIDTH (C23 6.10.4.1p1) -- the file size narrowed by `limit`
+// (6.10.4.2p4) -- because the width is exactly what the splice materializes,
+// and the paragraph above is an argument about the splice, not about the file.
+// With no `limit` the width IS the file size, so the wall is unchanged. With
+// one, C23's own `limit` examples become expressible (6.10.4.2 EXAMPLE 4's
+// `limit(513)` over an endless stream, 6.10.4.5 EXAMPLE 3's `limit(0)` over
+// `<infinite-resource>`) -- and the resource is not even READ past its width,
+// so the gate now fires BEFORE any bytes reach RAM instead of after.
+// ⚠ THE CAP IS NOT LOWERED, LIFTED, OR MADE CONDITIONAL: an unlimited resource
+// above it (or a `limit` above it) still fails LOUD, naming the limit. What is
+// still deferred to D-PP-EMBED-STREAMING is embedding MORE than this many bytes
+// at once -- the splice is still a materialized vector, not a stream.
 inline constexpr std::size_t kEmbedMaxResourceBytes = 16u * 1024u * 1024u; // 16 MiB
 [[nodiscard]] DSS_EXPORT std::optional<std::string>
 embedResourceSizeError(std::size_t byteCount);
+
+// C23 6.10.4.1p6 (D-PP-EMBED-PARAMS): the EMBED ELEMENT WIDTH, in bits — the
+// width of ONE integer constant the `#embed` expansion produces, which the
+// standard fixes at CHAR_BIT unless an implementation-defined embed parameter
+// (an `element_type`-style prefixed parameter DSS does not define) changes it.
+//
+// ★ AN ENGINE CONSTANT, NOT A `c.lang.json` KEY, AND THE REASON IS OWNERSHIP.
+// `CHAR_BIT` already has exactly one owner in this tree
+// (`shippedLibs/limits.json`, value 8), no target declares a byte width, and the
+// resource reader yields OCTETS that this engine cannot combine into wider
+// elements. A language key would therefore be a SECOND owner of CHAR_BIT and a
+// knob with one honourable value — dead config, the shape the loader refuses
+// everywhere else. The coupling to `limits.json` is pinned by a test instead, so
+// it goes red the day either side moves. `limit(N)` (6.10.4.2p4) computes the
+// resource width as `elementWidth * N` bits against the implementation width
+// (bytes * elementWidth), so at octet width it is simply `min(size, N)` bytes;
+// 6.10.4.1p6's `(resource width) % (element width) == 0` holds by construction.
+//
+// ⚠ SAY WHAT IT IS: A TRIPWIRE ANCHOR, NOT A WIDTH PARAMETER. ✔MEASURED — no
+// engine site READS this value to decide anything; the octet assumption is
+// STRUCTURAL, baked into `readResourceBytes` (which yields bytes) and into
+// `handleEmbed`'s splice loop (which spells one byte per element). So changing
+// this constant alone would change NOTHING about how a resource is embedded,
+// which is the failure mode a "configurable width" reading invites. Its two
+// jobs are instead: (1) a `static_assert` at the splice site refuses to compile
+// if it ever moves off 8, so the assumption breaks LOUD at the code that owns
+// it; and (2) a unit pin asserts it equals `limits.json`'s CHAR_BIT, so the two
+// declarations of "a byte is 8 bits" cannot drift apart in silence.
+inline constexpr std::uint64_t kEmbedElementWidthBits = 8;
 
 } // namespace dss

@@ -3,7 +3,7 @@
   "header": "process.h",
   "standard": "msvcrt",
   "availableObjectFormats": ["pe"],
-  "library": { "pe": "ucrtbase.dll" },
+  "library": { "pe": { "role": "cLibrary" } },
   "symbols": [
     { "name": "_beginthreadex", "signature": "fn(ptr<void>, u32, ptr<fn(ptr<void>) -> u32>, ptr<void>, u32, ptr<u32>) -> u64", "kind": "function", "linkage": "external" },
     { "name": "_endthreadex",   "signature": "fn(u32) -> void",                                                                "kind": "function", "linkage": "external" },

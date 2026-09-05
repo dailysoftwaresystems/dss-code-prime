@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>   // std::pair — the iterative copy's (source, destination) work list
 #include <variant>
 #include <vector>
 
@@ -97,14 +98,62 @@ struct MirLiteralValue {
 
 // ── MirAggregateValue's SPECIAL MEMBERS, out of line because they need
 //    `MirLiteralValue` COMPLETE ─────────────────────────────────────────────
-// Four of the five are the compiler's own; only the destructor differs, and it
-// differs only in HOW it reaches the nodes, never in what it destroys.
+// The default constructor and the two MOVES are the compiler's own — a move
+// steals the field vector's buffer, O(1) per level. The DESTRUCTOR and the
+// two COPIES differ, and each differs only in HOW it reaches the nodes, never
+// in what it destroys or what it copies.
 inline MirAggregateValue::MirAggregateValue()                                   = default;
-inline MirAggregateValue::MirAggregateValue(MirAggregateValue const&)           = default;
 inline MirAggregateValue::MirAggregateValue(MirAggregateValue&&) noexcept       = default;
-inline MirAggregateValue& MirAggregateValue::operator=(MirAggregateValue const&) = default;
 inline MirAggregateValue&
 MirAggregateValue::operator=(MirAggregateValue&&) noexcept                       = default;
+
+// ★★★ THE COPY IS A WALK TOO, AND THE DEFAULTED ONE RECURSED EXACTLY AS THE
+// DESTRUCTOR DID (P60, D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED).
+// `= default` copies the vector, which copy-constructs every `MirLiteralValue`,
+// whose variant copy-constructs the nested `MirAggregateValue` — one host
+// frame chain per brace level, on whatever thread happens to copy the value.
+// ✔MEASURED 2026-09-04 (lane `rc`), gdb-attributed frame by frame on the MSVC
+// 19.51 Debug build with the iterative destructor already in the tree:
+// `LayoutLeverage.NestedStructGlobalInitLowersOnAnOrdinaryThread` (a 1000-level
+// global initializer) still died of stack overflow, now 13 848 frames deep
+// INSIDE THIS COPY — `_Variant_storage_ copy → MirAggregateValue(const&) →
+// vector copy → …` — the very next walk down once the teardown stopped being
+// the first to overflow. The fix copies the tree with an explicit work list:
+// each destination level's field vector is reserved to its final size BEFORE
+// any pointer into it is taken, so the (source, destination) pairs the list
+// holds stay valid while their children are still queued.
+inline MirAggregateValue::MirAggregateValue(MirAggregateValue const& other) {
+    std::vector<std::pair<MirAggregateValue const*, MirAggregateValue*>> pending;
+    pending.emplace_back(&other, this);
+    while (!pending.empty()) {
+        auto const [src, dst] = pending.back();
+        pending.pop_back();
+        dst->fields.reserve(src->fields.size());   // no reallocation below
+        for (MirLiteralValue const& f : src->fields) {
+            MirLiteralValue& d = dst->fields.emplace_back();
+            d.core = f.core;
+            if (auto const* agg = std::get_if<MirAggregateValue>(&f.value)) {
+                // An EMPTY aggregate now; its fields are copied when its pair
+                // comes off the list — never by this constructor recursing.
+                d.value.emplace<MirAggregateValue>();
+                pending.emplace_back(agg, &std::get<MirAggregateValue>(d.value));
+            } else {
+                d.value = f.value;   // a scalar arm: the variant copies a leaf
+            }
+        }
+    }
+}
+
+// Copy-and-swap over the iterative copy above and the O(1) move; the value
+// being replaced is torn down by the iterative destructor.
+inline MirAggregateValue&
+MirAggregateValue::operator=(MirAggregateValue const& other) {
+    if (this != &other) {
+        MirAggregateValue copy{other};
+        *this = std::move(copy);
+    }
+    return *this;
+}
 
 // Destroy the whole subtree with an explicit heap work list: lift each level's
 // children OUT before the level is dropped, so every `MirLiteralValue` that

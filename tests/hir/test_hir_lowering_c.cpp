@@ -22,6 +22,10 @@
 #include "hir/hir_intrinsic_registry.hpp"
 #include "hir/hir_text.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
+// D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: the one
+// adapter from a format schema to the role seam a shipped-descriptor read asks
+// (`FormatRuntimeLibraryRoleResolver`) — see `analyzeRealStdioAt`.
+#include "link/object_format_schema.hpp"
 #include "repo_root.hpp"
 #include "tokenizer/token_stream.hpp"
 #include "tokenizer/tokenizer.hpp"
@@ -9213,8 +9217,27 @@ namespace {
     builder.setActiveFormat(format);
     builder.addInMemory(std::move(src), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    // ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ──
+    // stdio.json names the runtime ROLE rather than restating the C runtime's
+    // image, and a read with NO resolver records the role and binds no image.
+    // These pins assert the resolved image (`libc.so.6` / `ucrtbase.dll`), so
+    // they carry the resolver the driver always carries. The pin's own format
+    // picks its exec flavour, which declares `cLibrary` in its own table.
+    std::string_view const execFlavour =
+        format == ObjectFormatKind::Pe ? std::string_view{"pe64-x86_64-windows-exec"}
+                                       : std::string_view{"elf64-x86_64-linux-exec"};
+    auto const formatSchema = ObjectFormatSchema::loadShipped(execFlavour);
+    if (!formatSchema) {
+        // Throw, never abort — an abort kills the whole binary and costs every
+        // sibling case its verdict (see the `shippedSchemaOrThrow` note above).
+        throw std::runtime_error{"loadShipped(\"" + std::string{execFlavour}
+                                 + "\") failed; the TF-C112 pins cannot resolve "
+                                   "the descriptor's runtime role without it"};
+    }
+    FormatRuntimeLibraryRoleResolver const roles{**formatSchema};
     return analyze(cu, DiagnosticBudget::libraryDefault(),
-                   dataModel, std::nullopt, std::nullopt, format, "x86_64");
+                   dataModel, std::nullopt, std::nullopt, format, "x86_64",
+                   LongDoubleFormat::None, nullptr, 0, &roles);
 }
 
 // How many `externDecls` rows carry `name` — i.e. how many IMPORTS the lowering

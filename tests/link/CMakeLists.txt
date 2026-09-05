@@ -509,3 +509,36 @@ dss_add_test(NAME link/test_intrasection_baked_call
 # APPENDED, never interleaved -- this file is append-only by lane convention.
 dss_add_test(NAME link/test_artifact_withheld_after_error
              SOURCES test_artifact_withheld_after_error.cpp)
+
+# D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT: both Mach-O IMAGE nlist builders
+# stamped `N_SECT|N_EXT` on EVERY defined function, so a `static` reached the
+# image under its real name with the EXTERNAL bit set and LC_DYSYMTAB published
+# `nlocalsym 0`; ld64 emits it `N_SECT` with no `N_EXT`, FIRST in the table,
+# under `ilocalsym 0 nlocalsym 1 iextdefsym 1` (✔MEASURED 2026-09-04 on Apple
+# Silicon, Apple clang 21.0.0 / ld-1267). Pins, over both ports x all three
+# image arms -- five of those six cells reach the bands, the arm64 STATIC cell
+# pinning the D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION refusal instead, each
+# port DECLARING which it expects so the coverage cannot empty itself:
+# the binding through the shared `definedNType`, the locals-first
+# band order, the six LC_DYSYMTAB fields exactly, every indirect-symbol index
+# still naming the import it named before, and the `machoDysymtabBandBreach`
+# predicate's every refusal arm — plus the same shape through the REAL
+# pipeline (the entry trampoline is the second Local), so the corpus example
+# `examples/c/macho_static_fn_image` and this pin describe one artifact.
+dss_add_test(NAME link/test_macho_image_symtab_bands
+             SOURCES test_macho_image_symtab_bands.cpp)
+
+# D-LINK-MACHO-OBJECT-SYMTAB-MISALIGNED: the MH_OBJECT writer packed its
+# trailer (the `__text` / `__data` / relro relocation tables and the nlist_64)
+# hard against the file-backed section span, so `symoff` landed wherever the
+# section bytes ended — ✔MEASURED ≡ 3/4/6/7 mod 8 on 12 of 21 base objects,
+# and ≡ 0 on every `.o` Apple clang writes. Harmless to dyld (no __LINKEDIT
+# on a relocatable) and Apple `cc` linked + ran the misaligned objects, which
+# is why the fix carries its OWN witness (an Apple `cc` link + RUN of the
+# changed objects and a byte-diff showing every moved byte is an offset field
+# or zero padding, recorded in the row) and these pins: each trailer table
+# starts 8-aligned at the first aligned offset after its predecessor, the gaps
+# are zero, the sizes are exact, and DSS's own reader walks the published
+# offsets — over modules whose raw span end is deliberately NOT aligned.
+dss_add_test(NAME link/test_macho_object_trailer_alignment
+             SOURCES test_macho_object_trailer_alignment.cpp)

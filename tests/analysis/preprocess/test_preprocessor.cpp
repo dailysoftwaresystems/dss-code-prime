@@ -6,6 +6,7 @@
 // RED-ON-DISABLE (reverting the backing impl line fails the test).
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
+#include "analysis/preprocess/pp_if_eval.hpp"   // embedResourceWidthBytes (D-PP-EMBED-PARAMS)
 #include "analysis/preprocess/preprocessor.hpp"
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/char_decode.hpp"
@@ -36,6 +37,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <tuple>         // the D-PP-EMBED-MACRO-ARG `__has_embed` case table
 #include <type_traits>   // TF-C91: the cSubset() return-shape static_assert
 #include <vector>
 
@@ -7662,6 +7664,96 @@ braceInner(std::vector<Token> const& toks, PreprocessResult const& out) {
         if (d.code == DiagnosticCode::P_PreprocessorEmbed) return d.actual;
     return {};
 }
+
+// The initializer lexemes (strictly inside the first `{ ... }`) of `text`
+// preprocessed with `mainPath` as the main source NAME (its directory is the
+// includer dir the quote search prepends), plus explicit include AND system
+// dir lists -- the two lists the angle search and the 6.10.4.1p9 fallback
+// consult. `schema` defaults to the shipped c config; the config pins hand a
+// mutant.
+[[nodiscard]] std::vector<std::string>
+embedInnerAt(std::string text, std::string mainPath, PreprocessResult& out,
+             std::vector<fsemb::path> includeDirs,
+             std::vector<fsemb::path> systemDirs,
+             std::shared_ptr<GrammarSchema const> schema = cSubset()) {
+    auto buf = SourceBuffer::fromString(std::move(text), std::move(mainPath));
+    out = preprocess(buf, schema, includeDirs, dss::kDefaultHeaderNameMatching,
+                     DiagnosticBudget::libraryDefault(), systemDirs);
+    std::vector<Token> sig;
+    for (Token const& t : out.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        sig.push_back(t);
+    }
+    return braceInner(sig, out);
+}
+[[nodiscard]] std::vector<std::string>
+embedInner(std::string text, PreprocessResult& out,
+           std::vector<fsemb::path> includeDirs) {
+    return embedInnerAt(std::move(text), "main.c", out, std::move(includeDirs), {});
+}
+// Space-joined lexemes, so a whole spliced sequence is ONE exact string compare.
+[[nodiscard]] std::string joined(std::vector<std::string> const& lexemes) {
+    std::string s;
+    for (auto const& l : lexemes) {
+        if (!s.empty()) s += ' ';
+        s += l;
+    }
+    return s;
+}
+// The `{ ... }` wrapper every directive fixture below uses.
+[[nodiscard]] std::string embedInit(std::string const& directiveLine) {
+    return "static const unsigned char x[] = {\n" + directiveLine + "\n};\n";
+}
+// The shipped c text with ONE `from` -> `to` rewrite, LOADED (a loader verdict,
+// not a schema): the config-refusal pins read the diagnostics.
+[[nodiscard]] auto loadReboundCResult(std::string const& from,
+                                      std::string const& to,
+                                      std::string const& label) {
+    std::string text = loadShippedCText();
+    auto const pos = text.find(from);
+    EXPECT_NE(pos, std::string::npos)
+        << "shipped c config no longer carries: " << from;
+    if (pos != std::string::npos) text.replace(pos, from.size(), to);
+    return GrammarSchema::loadFromText(text, label);
+}
+[[nodiscard]] bool hasConfigCode(std::vector<ConfigDiagnostic> const& diags,
+                                 DiagnosticCode code) {
+    for (auto const& d : diags)
+        if (d.code == code) return true;
+    return false;
+}
+// THE REMOVE-DIRECTION CONFIG MUTANT: the shipped c text WITHOUT its
+// `embedParameters` block (the whole object, key to closing brace), loaded. The
+// block is OPTIONAL, so this must LOAD -- and every parameter must then vanish
+// RED, never fall back silently.
+[[nodiscard]] std::shared_ptr<GrammarSchema const> cWithoutEmbedParameters() {
+    std::string text = loadShippedCText();
+    std::string const key   = "\"embedParameters\": {";
+    std::string const close = "\n    },";
+    auto const start = text.find(key);
+    if (start == std::string::npos) {
+        ADD_FAILURE() << "shipped c config no longer carries " << key;
+        return nullptr;
+    }
+    auto const end = text.find(close, start);
+    if (end == std::string::npos) {
+        ADD_FAILURE() << "could not find the end of the embedParameters block";
+        return nullptr;
+    }
+    text.erase(start, end + close.size() - start);
+    EXPECT_EQ(text.find("\"embedParameters\""), std::string::npos)
+        << "the mutant must not carry the key at all";
+    auto loaded = GrammarSchema::loadFromText(text, "<c-without-embedParameters>");
+    if (!loaded.has_value()) {
+        ADD_FAILURE() << "the block is OPTIONAL, so the mutant must load: "
+                      << (loaded.error().empty() ? "<no diagnostics>"
+                                                  : loaded.error()[0].message);
+        return nullptr;
+    }
+    return *loaded;
+}
 } // namespace
 
 // T1 (RUN FIRST — the P2 residual closure): a multi-byte resource splices to
@@ -7775,43 +7867,830 @@ TEST(Preprocessor, FC179EmbedEmptyFilenameFailsLoud) {
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
 }
 
-// T7 (D-PP-EMBED-PARAMS): ANY standard/vendor parameter after the filename fails
-// loud -- even for an EXISTING resource (silently honoring `limit` would embed a
-// different byte set = a silent miscompile). Resource present, so ONLY the param
-// can red.
-TEST(Preprocessor, FC179EmbedParametersFailLoud) {
-    auto dir = writeEmbedResource("dss_embed_t7", "r.bin", std::string("*"));
-    for (std::string const& param :
-         {"limit(1)", "if_empty(0)", "prefix(1)", "suffix(2)", "gnu"}) {
+// ══ D-PP-EMBED-PARAMS (C23 6.10.4.2–6.10.4.5), closed P60 ═══════════════════
+// The oracle is the ISO C23 text (N3220): gcc 13.3.0, clang 18.1.3 and MSVC
+// 19.51 all refuse `#embed` outright (MEASURED 2026-09-04, each separately), so
+// every expectation here is cited to its clause. The resource is 8 bytes
+// "ABCDEFGH" (65..72) -- LONGER than every `limit` used, so "limit applied" and
+// "limit ignored" are different token sequences. Every sequence is asserted
+// WHOLE (space-joined, exact), never by size or by a sample.
+
+// 6.10.4.2p4: `limit(N)` shorter than the resource embeds EXACTLY N bytes.
+TEST(Preprocessor, EmbedLimitShorterThanResourceEmbedsExactlyThatManyBytes) {
+    auto dir = writeEmbedResource("dss_embed_p1", "r.bin", "ABCDEFGH");
+    {
         PreprocessResult r;
-        (void)ppEmbedTokens(
-            "static const unsigned char x[] = {\n#embed \"r.bin\" " + param
-                + "\n};\n",
-            r, {dir});
-        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
-            << "#embed parameter must fail loud (even for an existing file): "
-            << param;
+        auto inner = embedInner(embedInit("#embed \"r.bin\" limit(3)"), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66 , 67");
+    }
+    {
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"r.bin\" limit(1)"), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65");
+    }
+    { // exactly the resource's size is not "shorter": the whole resource
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"r.bin\" limit(8)"), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66 , 67 , 68 , 69 , 70 , 71 , 72");
     }
     std::error_code ec; fsemb::remove_all(dir, ec);
 }
 
-// T8 (D-PP-EMBED-ANGLE / D-PP-EMBED-MACRO-ARG): the angle form and a
-// macro-expanded argument are deferred loud (never silent).
-TEST(Preprocessor, FC179EmbedAngleAndMacroArgFailLoud) {
+// 6.10.4.2p4: a limit LARGER than the resource -> the implementation width,
+// i.e. the whole resource (never padding, never a refusal).
+TEST(Preprocessor, EmbedLimitLargerThanResourceEmbedsTheWholeResource) {
+    auto dir = writeEmbedResource("dss_embed_p2", "r.bin", "ABCDEFGH");
+    PreprocessResult r;
+    auto inner = embedInner(embedInit("#embed \"r.bin\" limit(100)"), r, {dir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(joined(inner), "65 , 66 , 67 , 68 , 69 , 70 , 71 , 72");
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.4.1p5 + 6.10.4.5p2 + 6.10.4.4p3/6.10.4.3p3 (EXAMPLE 1 of 6.10.4.5):
+// `limit(0)` makes a FOUND resource EMPTY; `if_empty` then REPLACES the whole
+// directive and `prefix`/`suffix` have NO effect. Without `if_empty` the
+// expansion is the empty sequence.
+TEST(Preprocessor, EmbedLimitZeroIsEmptyIfEmptyReplacesAndPrefixSuffixAreIgnored) {
+    auto dir = writeEmbedResource("dss_embed_p3", "r.bin", "ABCDEFGH");
     {
         PreprocessResult r;
-        (void)ppEmbedTokens(
-            "static const unsigned char x[] = {\n#embed <r.bin>\n};\n", r, {});
-        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
-            << "the angle form is a loud deferral";
+        auto inner = embedInner(
+            embedInit("#embed \"r.bin\" limit(0) prefix(1,) suffix(,2) "
+                      "if_empty(7, 8)"),
+            r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "7 , 8")
+            << "if_empty replaces the directive; prefix/suffix are ignored";
     }
     {
         PreprocessResult r;
-        (void)ppEmbedTokens(
-            "static const unsigned char x[] = {\n#embed RES\n};\n", r, {});
-        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
-            << "a macro-expanded argument is a loud deferral";
+        auto inner = embedInner(
+            embedInit("#embed \"r.bin\" limit(0) prefix(1,) suffix(,2)\n42"),
+            r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "42")
+            << "an empty resource with no if_empty expands to NOTHING";
     }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.4.4p2 / 6.10.4.3p2: `prefix`/`suffix` wrap a NON-empty expansion;
+// 6.10.4.5p2: `if_empty` has no effect on a non-empty resource.
+TEST(Preprocessor, EmbedPrefixAndSuffixWrapANonEmptyResourceAndIfEmptyIsIgnored) {
+    auto dir = writeEmbedResource("dss_embed_p4", "r.bin", "AB");
+    PreprocessResult r;
+    auto inner = embedInner(
+        embedInit("#embed \"r.bin\" prefix(0xEF, 0xBB,) suffix(, 0) if_empty(9)"),
+        r, {dir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(joined(inner), "0xEF , 0xBB , 65 , 66 , 0");
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.4.4p3 / 6.10.4.3p3: on a genuinely EMPTY resource (0 bytes on disk),
+// `prefix` and `suffix` have no effect.
+TEST(Preprocessor, EmbedPrefixAndSuffixHaveNoEffectOnAnEmptyResource) {
+    auto dir = writeEmbedResource("dss_embed_p5", "empty.bin", std::string());
+    PreprocessResult r;
+    auto inner = embedInner(
+        embedInit("#embed \"empty.bin\" prefix(1,) suffix(,2)\n42"), r, {dir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(joined(inner), "42");
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.4.2p3 (EXAMPLE 2): the `limit` clause is macro-expanded before it is
+// evaluated -- and evaluated with the `#if` rules, so an expression is fine.
+TEST(Preprocessor, EmbedLimitClauseIsMacroExpandedBeforeEvaluation) {
+    auto dir = writeEmbedResource("dss_embed_p6", "r.bin", "ABCDEFGH");
+    {
+        PreprocessResult r;
+        auto inner = embedInner(
+            "#define TWO_PLUS_TWO 2+2\n"
+                + embedInit("#embed \"r.bin\" limit(TWO_PLUS_TWO)"),
+            r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66 , 67 , 68");
+    }
+    { // an unknown identifier folds to 0 under the 6.10.2 rules -> EMPTY
+        PreprocessResult r;
+        auto inner = embedInner(
+            embedInit("#embed \"r.bin\" limit(NOT_A_MACRO) if_empty(5)"), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "5");
+    }
+    { // a macro expanding to NOTHING leaves no constant expression -> loud
+        PreprocessResult r;
+        auto inner = embedInner(
+            "#define EMPTY\n" + embedInit("#embed \"r.bin\" limit(EMPTY)"),
+            r, {dir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+        EXPECT_TRUE(inner.empty()) << "never a silent partial embed";
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.1p5: `__limit__` / `__prefix__` / `__suffix__` / `__if_empty__` behave
+// exactly like the plain spellings.
+TEST(Preprocessor, EmbedDunderSpelledParameterBehavesLikeThePlainOne) {
+    auto dir = writeEmbedResource("dss_embed_p7", "r.bin", "ABCDEFGH");
+    {
+        PreprocessResult r;
+        auto inner = embedInner(
+            embedInit("#embed \"r.bin\" __limit__(2) __prefix__(9,) __suffix__(, 8)"),
+            r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "9 , 65 , 66 , 8");
+    }
+    {
+        PreprocessResult r;
+        auto inner = embedInner(
+            embedInit("#embed \"r.bin\" __limit__(0) __if_empty__(3)"), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "3");
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.4.2p1/p2: a `limit` that is negative, clause-less, empty, not an integer
+// constant expression, or that contains `defined` (as written OR produced by
+// expansion) is a constraint violation: loud, and NOTHING is spliced.
+TEST(Preprocessor, EmbedLimitConstraintViolationsFailLoud) {
+    auto dir = writeEmbedResource("dss_embed_p8", "r.bin", "ABCDEFGH");
+    for (std::string const& params :
+         {"limit(-1)", "limit()", "limit", "limit(1.5)", "limit(\"s\")",
+          "limit(defined(X))", "limit(defined X)", "limit(2 - 3)"}) {
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"r.bin\" " + params), r, {dir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << params;
+        EXPECT_TRUE(inner.empty()) << "never a silent partial embed: " << params;
+        EXPECT_NE(firstEmbedMsg(r).find("6.10.4.2"), std::string::npos)
+            << "the refusal cites its clause: " << params << " -> "
+            << firstEmbedMsg(r);
+    }
+    { // `defined` PRODUCED by expansion is refused too (6.10.2p13 is UB)
+        PreprocessResult r;
+        auto inner = embedInner(
+            "#define D defined\n" + embedInit("#embed \"r.bin\" limit(D(X))"),
+            r, {dir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+        EXPECT_NE(firstEmbedMsg(r).find("after macro expansion"), std::string::npos);
+        EXPECT_TRUE(inner.empty());
+    }
+    { // a negative SIGNED value is refused, an enormous UNSIGNED one is a bound
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"r.bin\" limit(0u - 1)"), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "`0u - 1` is uintmax_t, never negative (C 6.10.2p13)";
+        EXPECT_EQ(joined(inner), "65 , 66 , 67 , 68 , 69 , 70 , 71 , 72");
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.4.2p1 / .3p1 / .4p1 / .5p1: each standard parameter "may appear zero
+// times or one time" -- and the dunder spelling is the SAME parameter.
+TEST(Preprocessor, EmbedDuplicateStandardParameterFailsLoud) {
+    auto dir = writeEmbedResource("dss_embed_p9", "r.bin", "ABCDEFGH");
+    for (std::string const& params :
+         {"limit(1) limit(2)", "prefix(1) __prefix__(2)", "suffix(1) suffix(2)",
+          "if_empty(1) if_empty(2)", "limit(1) prefix(1) __limit__(2)"}) {
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"r.bin\" " + params), r, {dir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << params;
+        EXPECT_NE(firstEmbedMsg(r).find("more than once"), std::string::npos)
+            << params << " -> " << firstEmbedMsg(r);
+        EXPECT_TRUE(inner.empty()) << params;
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.1p9: a parameter "shall be either a preprocessor standard parameter, or
+// an implementation-defined preprocessor prefixed parameter". DSS defines no
+// prefixed parameter, so an unknown name of EITHER shape is a constraint
+// violation on the directive -- loud, nothing spliced, even for an existing
+// resource (silently ignoring `bogus(1)` would be a silent partial embed).
+TEST(Preprocessor, EmbedUnknownParameterFailsLoud) {
+    auto dir = writeEmbedResource("dss_embed_p10", "r.bin", "ABCDEFGH");
+    for (std::string const& params :
+         {"bogus(1)", "bogus", "gnu::offset(1)", "vendor::x", "limit(1) bogus(2)"}) {
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"r.bin\" " + params), r, {dir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << params;
+        EXPECT_NE(firstEmbedMsg(r).find("6.10.1p9"), std::string::npos)
+            << params << " -> " << firstEmbedMsg(r);
+        EXPECT_TRUE(inner.empty()) << params;
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.1p4: a parameter sequence that is not a sequence of pp-parameters --
+// a non-identifier, an unterminated or stray clause paren, a `::` with no
+// identifier after it -- is malformed: loud, nothing spliced.
+TEST(Preprocessor, EmbedMalformedParameterSequenceFailsLoud) {
+    auto dir = writeEmbedResource("dss_embed_p11", "r.bin", "ABCDEFGH");
+    for (std::string const& params :
+         {"42", "prefix((1)", "prefix(1))", "v::", "v:: (1)", "limit(1) )",
+          "limit(1 -"}) {
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"r.bin\" " + params), r, {dir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << params;
+        EXPECT_TRUE(inner.empty()) << params;
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.4.1p11 applies ONLY to a line matching neither literal form, and
+// 6.10.2p7 holds a `__has_embed` operand back from expansion: a parameter NAME
+// is never macro-replaced in the delimited forms (its `limit` CLAUSE is,
+// 6.10.4.2p3).
+TEST(Preprocessor, EmbedParameterNamesAreNotMacroExpandedInTheLiteralForms) {
+    auto dir = writeEmbedResource("dss_embed_p12", "r.bin", "ABCDEFGH");
+    {
+        PreprocessResult r;
+        auto inner = embedInner(
+            "#define limit bogus\n#define ONE 1\n"
+                + embedInit("#embed \"r.bin\" limit(ONE + 1)"),
+            r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "the parameter name `limit` must not be replaced by `bogus`";
+        EXPECT_EQ(joined(inner), "65 , 66");
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#define limit bogus\n#define ONE 1\n"
+            "#if __has_embed(\"r.bin\" limit(ONE + 1)) == __STDC_EMBED_FOUND__\n"
+            "int yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes")
+            << "6.10.2p7: the whole __has_embed operand is held back; only the "
+               "limit clause expands (6.10.4.2p3)";
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.4.1p7: "the directive is replaced by its expansion and ... additional or
+// replacement token sequences" -- the spliced `prefix` tokens then sit in the
+// body stream and are processed as normal text (a macro name in them expands).
+TEST(Preprocessor, EmbedPrefixTokensAreProcessedAsNormalTextAfterTheSplice) {
+    auto dir = writeEmbedResource("dss_embed_p13", "r.bin", "AB");
+    PreprocessResult r;
+    auto inner = embedInner(
+        "#define X 7\n" + embedInit("#embed \"r.bin\" prefix(X,) suffix(, X)"),
+        r, {dir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(joined(inner), "7 , 65 , 66 , 7");
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// C 6.10p1 dead-branch parity: a `#embed` with a constraint-violating `limit`
+// and an unknown parameter inside `#if 0` is entirely silent.
+TEST(Preprocessor, EmbedWithParametersInADeadBranchIsSilent) {
+    PreprocessResult r;
+    auto inner = embedInner(
+        "#if 0\n" + embedInit("#embed \"missing.bin\" limit(-1) bogus(1)") + "#endif\n",
+        r, {});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+    EXPECT_TRUE(inner.empty());
+}
+
+// ── `__has_embed` with parameters (C23 6.10.2p7–p8, EXAMPLE 6) ──────────────
+TEST(Preprocessor, HasEmbedParametersDecideTheTrichotomy) {
+    auto dir = writeEmbedResource("dss_embed_h1", "full.bin", std::string("*"));
+    (void)writeEmbedResource("dss_embed_h1", "empty.bin", std::string());
+    auto arm = [&](std::string const& condition, std::string const& expect,
+                   char const* why) {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if " + condition + "\nint yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << condition << ": " << why;
+        ASSERT_EQ(lexs.size(), 3u) << condition;
+        EXPECT_EQ(lexs[1], expect) << condition << ": " << why;
+    };
+    arm("__has_embed(\"full.bin\" limit(0)) == __STDC_EMBED_EMPTY__", "yes",
+        "6.10.2 EXAMPLE 6: limit(0) makes a found resource EMPTY");
+    arm("__has_embed(\"full.bin\" limit(2) prefix(1) suffix(2) if_empty(3)) "
+        "== __STDC_EMBED_FOUND__", "yes",
+        "every standard parameter is supported -> FOUND for a non-empty resource");
+    arm("__has_embed(\"empty.bin\" if_empty(1)) == __STDC_EMBED_EMPTY__", "yes",
+        "a 0-byte resource is EMPTY whatever if_empty says");
+    arm("__has_embed(\"full.bin\" acme::bogus(1)) == __STDC_EMBED_NOT_FOUND__",
+        "yes",
+        "6.10.1p9 footnote 196 + 6.10.2p8 NOTE 1: an unrecognised PREFIXED "
+        "parameter is not a violation here -- it evaluates to 0");
+    arm("__has_embed(\"full.bin\" acme::a(1) acme::b) == __STDC_EMBED_NOT_FOUND__",
+        "yes", "a prefixed parameter needs no clause (6.10.1p4: the clause is "
+               "optional on a pp-parameter) and still answers 0");
+    arm("__has_embed(\"nope.bin\" limit(1)) == __STDC_EMBED_NOT_FOUND__", "yes",
+        "the search fails -> NOT_FOUND");
+    arm("__has_embed(\"full.bin\" __limit__(0)) == __STDC_EMBED_EMPTY__", "yes",
+        "6.10.1p5: the dunder spelling is the same parameter");
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#define ZERO 0\n"
+            "#if __has_embed(\"full.bin\" limit(ZERO)) == __STDC_EMBED_EMPTY__\n"
+            "int yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes")
+            << "6.10.4.2p3: the limit clause is expanded in the operator too";
+    }
+    // Constraint violations and malformed shapes are LOUD in the operator too --
+    // INCLUDING an unknown STANDARD-SHAPED name, which C23 6.10.1p9 footnote 196
+    // does not exempt (it names the PREFIXED shape only, and 6.10.2p8 NOTE 1
+    // repeats that word). `bogus(1)` is a constraint violation here exactly as it
+    // is on a `#embed` line; only `vendor::bogus(1)` is the probe-safe spelling.
+    for (std::string const& condition :
+         {"__has_embed(\"full.bin\" limit(-1))",
+          "__has_embed(\"full.bin\" limit(1) limit(2))",
+          "__has_embed(\"full.bin\" limit)",
+          "__has_embed(\"full.bin\" 42)",
+          "__has_embed(\"full.bin\" prefix((1)",
+          "__has_embed(\"full.bin\" limit(defined(X)))",
+          "__has_embed(\"full.bin\" bogus(1))",
+          "__has_embed(\"full.bin\" bogus)",
+          "__has_embed(\"full.bin\" acme::ok(1) bogus(2))"}) {
+        PreprocessResult r;
+        (void)ppLexemesWithDirs("#if " + condition + "\nint a;\n#endif\n", r,
+                                {dir}, {});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << condition;
+    }
+    { // the standard-shaped refusal NAMES the clause and the carve-out it is not
+        PreprocessResult r;
+        (void)ppLexemesWithDirs(
+            "#if __has_embed(\"full.bin\" bogus(1))\nint a;\n#endif\n", r,
+            {dir}, {});
+        EXPECT_NE(firstEmbedMsg(r).find("6.10.1p9"), std::string::npos)
+            << firstEmbedMsg(r);
+        EXPECT_NE(firstEmbedMsg(r).find("footnote 196"), std::string::npos)
+            << firstEmbedMsg(r);
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// ★★ THE ORDER OF THE TWO VERDICTS IS NORMATIVE — C23 6.10.1p9 footnote 196
+// ("An unrecognized preprocessor PREFIXED parameter is a constraint violation,
+// except within has_embed expressions") + 6.10.2p7 (NOT_FOUND "if ... any of the
+// embed parameters ... are not supported by the implementation") + 6.10.2p8
+// NOTE 1 ("...instead cause the expression to be evaluated to 0").
+//
+// The moment the sequence carries an unrecognized PREFIXED parameter the
+// operator must MINT 0. It may NOT first evaluate a sibling `limit` clause and
+// refuse the translation unit on that clause's VALUE: 6.10.2p7 imposes only the
+// SYNTACTIC requirements of a `#embed` directive on the notional directive, and
+// a limit's value (6.10.4.2p1 "shall not evaluate to a value less than 0",
+// 6.10.4.2p2 "The token defined shall not appear") is a CONSTRAINT, not syntax.
+//
+// The fixture is C23 6.10.2 EXAMPLE 5's guard shape (`ds9000::element_type`)
+// crossed with EXAMPLE 6's `limit`: a program probing a vendor parameter must
+// take the `#elif`, never die. Getting this backwards makes every portable
+// vendor-probe that also carries a `limit` unusable.
+TEST(Preprocessor, HasEmbedUnsupportedPrefixedParameterAnswersBeforeAnyLimit) {
+    auto dir = writeEmbedResource("dss_embed_h2", "bits.bin", std::string("ABCD"));
+    for (std::string const& guard :
+         {"\"bits.bin\" ds9000::element_type(short) limit(2 - 3)",
+          "\"bits.bin\" ds9000::element_type(short) limit(defined(X))",
+          // ORDER-INDEPENDENT: the verdict is over the whole sequence, so a
+          // vendor parameter AFTER the offending `limit` short-circuits too.
+          "\"bits.bin\" limit(2 - 3) ds9000::element_type(short)"}) {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_embed(" + guard + ")\nint vendor;\n"
+            "#elif __has_embed(\"bits.bin\")\nint standard;\n"
+            "#else\nint missing;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << guard << " -> " << firstEmbedMsg(r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << guard;
+        ASSERT_EQ(lexs.size(), 3u) << guard;
+        EXPECT_EQ(lexs[1], "standard")
+            << guard
+            << ": 6.10.2p8 NOTE 1 -- an unrecognized PREFIXED parameter makes "
+               "the whole expression 0 WITHOUT evaluating a sibling limit";
+    }
+    // CONTROL: with NO unsupported parameter the same clauses are still refused
+    // -- the short-circuit is DIRECTIONAL, it did not delete 6.10.4.2.
+    for (std::string const& condition :
+         {"__has_embed(\"bits.bin\" limit(2 - 3))",
+          "__has_embed(\"bits.bin\" limit(defined(X)))"}) {
+        PreprocessResult r;
+        (void)ppLexemesWithDirs("#if " + condition + "\nint a;\n#endif\n", r,
+                                {dir}, {});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << condition;
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// ══ D-PP-EMBED-ANGLE (C23 6.10.4.1p8/p9), closed P60 ════════════════════════
+// The angle form searches the angle `#include`'s places -- the system dirs,
+// then the include dirs -- and NEVER the including file's own directory
+// (6.10.3p2 parity); the quote form falls back to that search when its own
+// fails (p9). Every fixture puts the resource where exactly ONE search finds it.
+
+TEST(Preprocessor, EmbedAngleFormSearchesTheIncludeDirsNeverTheIncluderDir) {
+    auto inc = writeEmbedResource("dss_embed_a1_inc", "r.bin", "ABCDEFGH");
+    auto self = writeEmbedResource("dss_embed_a1_self", "r.bin", "ABCDEFGH");
+    { // on the include path, main.c elsewhere -> found
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed <r.bin>"),
+                                  (self.parent_path() / "elsewhere" / "main.c").string(),
+                                  r, {inc}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66 , 67 , 68 , 69 , 70 , 71 , 72");
+    }
+    { // ONLY beside main.c, no include dirs -> the angle form must NOT find it
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed <r.bin>"),
+                                  (self / "main.c").string(), r, {}, {});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+        EXPECT_NE(firstEmbedMsg(r).find("not found"), std::string::npos);
+        EXPECT_TRUE(inner.empty());
+    }
+    { // ... while the quote form in the same setup finds it (the control)
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed \"r.bin\""),
+                                  (self / "main.c").string(), r, {}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66 , 67 , 68 , 69 , 70 , 71 , 72");
+    }
+    std::error_code ec;
+    fsemb::remove_all(inc, ec);
+    fsemb::remove_all(self, ec);
+}
+
+TEST(Preprocessor, EmbedAngleFormResolvesASubdirectoryNameWithParameters) {
+    auto inc = writeEmbedResource("dss_embed_a2", "r.bin", "ABCDEFGH");
+    (void)writeEmbedResource("dss_embed_a2/sub", "deep.bin", "xyz");
+    {
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed <sub/deep.bin>"), r, {inc});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "120 , 121 , 122");
+    }
+    {
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed <r.bin> limit(2) suffix(, 0)"),
+                                r, {inc});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66 , 0");
+    }
+    std::error_code ec; fsemb::remove_all(inc, ec);
+}
+
+TEST(Preprocessor, EmbedAngleFormMalformedFailsLoud) {
+    auto inc = writeEmbedResource("dss_embed_a3", "r.bin", "ABCDEFGH");
+    for (std::string const& line : {"#embed <r.bin", "#embed <>", "#embed <r.bin> <"}) {
+        PreprocessResult r;
+        auto inner = embedInner(embedInit(line), r, {inc});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << line;
+        EXPECT_TRUE(inner.empty()) << line;
+    }
+    std::error_code ec; fsemb::remove_all(inc, ec);
+}
+
+// 6.10.4.1p9: a quote search that fails "is reprocessed as if it read
+// `# embed < ... >`". The resource sits ONLY on a SYSTEM dir -- a place the
+// quote search never looks -- so only the fallback can find it; `__has_embed`
+// (6.10.2p7 "as if ... in a #embed directive") falls back identically.
+TEST(Preprocessor, EmbedQuoteFormFallsBackToTheAngleSearch) {
+    auto sys = writeEmbedResource("dss_embed_a4_sys", "r.bin", "ABCDEFGH");
+    {
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed \"r.bin\" limit(3)"), "main.c",
+                                  r, {}, {sys});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66 , 67");
+    }
+    { // the CONTROL: without the system dir the same line is a loud miss
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed \"r.bin\" limit(3)"), "main.c",
+                                  r, {}, {});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+        EXPECT_TRUE(inner.empty());
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_embed(\"r.bin\") == __STDC_EMBED_FOUND__\n"
+            "int yes;\n#else\nint no;\n#endif\n",
+            r, {}, {sys});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes");
+    }
+    std::error_code ec; fsemb::remove_all(sys, ec);
+}
+
+TEST(Preprocessor, HasEmbedAngleFormAgreesWithTheDirective) {
+    auto inc = writeEmbedResource("dss_embed_a5_inc", "r.bin", "ABCDEFGH");
+    auto self = writeEmbedResource("dss_embed_a5_self", "r.bin", "ABCDEFGH");
+    auto arm = [&](std::string const& condition, std::string mainPath,
+                   std::vector<fsemb::path> includeDirs, std::string const& expect,
+                   char const* why) {
+        auto buf = SourceBuffer::fromString(
+            "#if " + condition + "\nint yes;\n#else\nint no;\n#endif\n",
+            std::move(mainPath));
+        auto schema = cSubset();
+        auto r = preprocess(buf, schema, includeDirs, dss::kDefaultHeaderNameMatching,
+                            DiagnosticBudget::libraryDefault());
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << condition << ": " << why;
+        std::vector<std::string> lexs;
+        for (Token const& t : r.tokens) {
+            if (t.coreKind == CoreTokenKind::Eof
+                || t.coreKind == CoreTokenKind::Whitespace
+                || t.coreKind == CoreTokenKind::Newline) continue;
+            lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+        }
+        ASSERT_EQ(lexs.size(), 3u) << condition;
+        EXPECT_EQ(lexs[1], expect) << condition << ": " << why;
+    };
+    arm("__has_embed(<r.bin>) == __STDC_EMBED_FOUND__", "main.c", {inc}, "yes",
+        "on the include path -> FOUND");
+    arm("__has_embed(<r.bin> limit(0)) == __STDC_EMBED_EMPTY__", "main.c", {inc},
+        "yes", "limit(0) -> EMPTY through the angle form too");
+    arm("__has_embed(<nope.bin>) == __STDC_EMBED_NOT_FOUND__", "main.c", {inc},
+        "yes", "absent -> NOT_FOUND");
+    arm("__has_embed(<r.bin>) == __STDC_EMBED_NOT_FOUND__",
+        (self / "main.c").string(), {}, "yes",
+        "beside main.c only: the angle form never searches the includer dir");
+    arm("__has_embed(\"r.bin\") == __STDC_EMBED_FOUND__",
+        (self / "main.c").string(), {}, "yes",
+        "the CONTROL: the quote form does search the includer dir");
+    std::error_code ec;
+    fsemb::remove_all(inc, ec);
+    fsemb::remove_all(self, ec);
+}
+
+// ══ D-PP-EMBED-MACRO-ARG (C23 6.10.4.1p11), closed P60 ══════════════════════
+// A `# embed pp-tokens` line matching NEITHER literal form has the tokens after
+// `embed` "processed just as in normal text", and the RESULT shall match one of
+// the two forms -- the whole tail, parameters included.
+
+TEST(Preprocessor, EmbedMacroExpandedOperandMatchingAFormIsProcessed) {
+    auto inc = writeEmbedResource("dss_embed_m1", "r.bin", "ABCDEFGH");
+    struct Case { char const* defines; char const* line; char const* expect; };
+    for (Case const& c : {
+             Case{"#define R \"r.bin\"\n", "#embed R",
+                  "65 , 66 , 67 , 68 , 69 , 70 , 71 , 72"},
+             Case{"#define RL \"r.bin\" limit(2)\n", "#embed RL", "65 , 66"},
+             Case{"#define A <r.bin>\n", "#embed A",
+                  "65 , 66 , 67 , 68 , 69 , 70 , 71 , 72"},
+             Case{"#define R \"r.bin\"\n#define LIM 3\n", "#embed R limit(LIM)",
+                  "65 , 66 , 67"},
+             Case{"#define R \"r.bin\"\n", "#embed R limit(1) suffix(, 0)",
+                  "65 , 0"},
+             Case{"#define NAME(x) #x\n", "#embed NAME(r.bin) limit(2)", "65 , 66"},
+         }) {
+        PreprocessResult r;
+        auto inner = embedInner(std::string{c.defines} + embedInit(c.line), r, {inc});
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << c.line;
+        EXPECT_EQ(joined(inner), c.expect) << c.line;
+    }
+    std::error_code ec; fsemb::remove_all(inc, ec);
+}
+
+TEST(Preprocessor, EmbedMacroExpandedOperandMatchingNeitherFormFailsLoud) {
+    auto inc = writeEmbedResource("dss_embed_m2", "r.bin", "ABCDEFGH");
+    struct Case { char const* defines; char const* line; };
+    for (Case const& c : {
+             Case{"#define R r.bin\n", "#embed R"},
+             Case{"#define E\n", "#embed E"},
+             Case{"", "#embed UNDEFINED_NAME"},
+             Case{"#define R 42\n", "#embed R"},
+         }) {
+        PreprocessResult r;
+        auto inner = embedInner(std::string{c.defines} + embedInit(c.line), r, {inc});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << c.line;
+        EXPECT_NE(firstEmbedMsg(r).find("neither"), std::string::npos)
+            << c.line << " -> " << firstEmbedMsg(r);
+        EXPECT_TRUE(inner.empty()) << c.line;
+    }
+    std::error_code ec; fsemb::remove_all(inc, ec);
+}
+
+// 6.10.2p5: the second `__has_embed` form is considered only when the first
+// does not match, and its tokens are "processed just as in normal text".
+TEST(Preprocessor, HasEmbedMacroExpandedOperandIsReExamined) {
+    auto dir = writeEmbedResource("dss_embed_m3", "full.bin", std::string("*"));
+    for (auto const& [defines, condition, expect] :
+         {std::tuple{"#define R \"full.bin\"\n",
+                     "__has_embed(R) == __STDC_EMBED_FOUND__", "yes"},
+          std::tuple{"#define RL \"full.bin\" limit(0)\n",
+                     "__has_embed(RL) == __STDC_EMBED_EMPTY__", "yes"},
+          std::tuple{"#define N \"nope.bin\"\n",
+                     "__has_embed(N) == __STDC_EMBED_NOT_FOUND__", "yes"}}) {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            std::string{defines} + "#if " + condition
+                + "\nint yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << condition;
+        ASSERT_EQ(lexs.size(), 3u) << condition;
+        EXPECT_EQ(lexs[1], expect) << condition;
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// ══ THE CONFIG SURFACE: `preprocess.embedParameters` is the language's declaration ══
+
+// REMOVE-direction: with the block deleted the plain directive and the plain
+// operator still work and every parameter is refused as unknown -- in the
+// DIRECTIVE and in `__has_embed` alike, because a bare identifier that binds no
+// standard parameter is exactly the shape C23 6.10.1p9 footnote 196 does NOT
+// exempt ("An unrecognized preprocessor PREFIXED parameter ... except within
+// has_embed expressions"). The honest subset, never a silent fallback.
+TEST(Preprocessor, EmbedParameterSurfaceVanishesRedWhenTheConfigBlockIsRemoved) {
+    auto schema = cWithoutEmbedParameters();
+    ASSERT_TRUE(schema != nullptr);
+    EXPECT_FALSE(schema->preprocess().embedParameters.has_value());
+    auto dir = writeEmbedResource("dss_embed_c1", "r.bin", "ABCDEFGH");
+    {
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed \"r.bin\" limit(1)"), "main.c",
+                                  r, {dir}, {}, schema);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
+            << "without the block, `limit` is an unknown parameter";
+        EXPECT_TRUE(inner.empty()) << "never a silent partial embed";
+    }
+    {
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed \"r.bin\""), "main.c", r, {dir},
+                                  {}, schema);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66 , 67 , 68 , 69 , 70 , 71 , 72")
+            << "the plain form is unaffected";
+    }
+    auto runWith = [&](std::string text, PreprocessResult& out) {
+        auto buf = SourceBuffer::fromString(std::move(text), "main.c");
+        std::vector<fsemb::path> dirs{dir};
+        out = preprocess(buf, schema, dirs, dss::kDefaultHeaderNameMatching,
+                         DiagnosticBudget::libraryDefault());
+        std::vector<std::string> lexs;
+        for (Token const& t : out.tokens) {
+            if (t.coreKind == CoreTokenKind::Eof
+                || t.coreKind == CoreTokenKind::Whitespace
+                || t.coreKind == CoreTokenKind::Newline) continue;
+            lexs.push_back(std::string{out.synthBuffer->slice(t.span)});
+        }
+        return joined(lexs);
+    };
+    {
+        PreprocessResult r;
+        (void)runWith(
+            "#if __has_embed(\"r.bin\" limit(1))\nint yes;\n#else\nint no;\n#endif\n",
+            r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
+            << "without the block `limit` names no standard parameter, so it is "
+               "an unknown standard-shaped name -- a 6.10.1p9 constraint "
+               "violation in the OPERATOR too (footnote 196 exempts only the "
+               "prefixed shape)";
+    }
+    {
+        PreprocessResult r;
+        auto const lexs =
+            runWith("#if __has_embed(\"r.bin\")\nint found;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(lexs, "int found ;")
+            << "the PLAIN operator is unaffected by the missing block";
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// The parameter NAMES are config, never engine literals: rebind `limit` to
+// `cap` and `cap(2)` limits while `limit(2)` is unknown.
+TEST(Preprocessor, EmbedParameterNamesAreConfigDrivenNotHardcoded) {
+    auto schema = reboundC("\"name\": \"limit\"", "\"name\": \"cap\"",
+                           "<rebound-embed-limit>");
+    ASSERT_TRUE(schema != nullptr);
+    auto dir = writeEmbedResource("dss_embed_c2", "r.bin", "ABCDEFGH");
+    {
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed \"r.bin\" cap(2)"), "main.c", r,
+                                  {dir}, {}, schema);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66");
+    }
+    {
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed \"r.bin\" limit(2)"), "main.c", r,
+                                  {dir}, {}, schema);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
+            << "with the verb rebound to `cap`, `limit` is unknown";
+        EXPECT_TRUE(inner.empty());
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// The loader's guards: a CLOSED role set, one name per role and one role per
+// name (dunder-folded), a REQUIRED separator kind that must exist, a non-empty
+// row set, and no block for a surface the language does not declare.
+TEST(Preprocessor, EmbedParametersLoaderRefusesMalformedBlocks) {
+    struct Mutant { char const* from; char const* to; DiagnosticCode code; char const* why; };
+    for (Mutant const& m : {
+             Mutant{"\"role\": \"ifEmpty\"", "\"role\": \"ifEmptyX\"",
+                    DiagnosticCode::C_InvalidPreprocess, "an unknown role"},
+             Mutant{"\"role\": \"suffix\"", "\"role\": \"prefix\"",
+                    DiagnosticCode::C_InvalidPreprocess, "a role bound to two names"},
+             Mutant{"\"name\": \"suffix\"", "\"name\": \"__prefix__\"",
+                    DiagnosticCode::C_InvalidPreprocess,
+                    "a name colliding through its dunder spelling (6.10.1p5)"},
+             Mutant{"\"prefixSeparatorToken\": \"ColonColonOp\"",
+                    "\"prefixSeparatorToken\": \"NoSuchTokenKind\"",
+                    DiagnosticCode::C_UnknownToken, "an unknown separator kind"},
+             Mutant{"\"prefixSeparatorToken\": \"ColonColonOp\",",
+                    "\"$prefixSeparatorTokenRemoved\": \"ColonColonOp\",",
+                    DiagnosticCode::C_MissingField, "a missing separator kind"},
+             Mutant{"\"standard\": [", "\"standard\": [], \"$wasStandard\": [",
+                    DiagnosticCode::C_InvalidPreprocess, "an empty row set"},
+         }) {
+        auto loaded = loadReboundCResult(m.from, m.to, "<embed-params-mutant>");
+        EXPECT_FALSE(loaded.has_value()) << "must be refused: " << m.why;
+        if (!loaded.has_value()) {
+            EXPECT_TRUE(hasConfigCode(loaded.error(), m.code)) << m.why;
+        }
+    }
+    { // a block for a surface the language does not declare is dead config
+        std::string text = loadShippedCText();
+        for (std::string const& key : {"\"embedDirective\":", "\"hasEmbedOperator\":"}) {
+            auto const pos = text.find(key);
+            ASSERT_NE(pos, std::string::npos) << key;
+            text.replace(pos, key.size(), "\"$removed" + key.substr(1));
+        }
+        auto loaded = GrammarSchema::loadFromText(text, "<embed-params-dead-block>");
+        EXPECT_FALSE(loaded.has_value());
+        if (!loaded.has_value()) {
+            bool named = false;
+            for (auto const& d : loaded.error()) {
+                if (d.code == DiagnosticCode::C_InvalidPreprocess
+                    && d.message.find("does not declare") != std::string::npos) {
+                    named = true;
+                }
+            }
+            EXPECT_TRUE(named) << "the refusal names the missing surface";
+        }
+    }
+}
+
+// C23 6.10.4.1p6: the embed element width is CHAR_BIT. `CHAR_BIT` has exactly
+// ONE owner in this tree (`shippedLibs/limits.json`) and the width is an engine
+// constant rather than a second declaration of it -- this pin is the coupling
+// made visible: it goes red the day either side moves.
+//
+// ⚠ SAY WHAT `kEmbedElementWidthBits` IS: a TRIPWIRE ANCHOR, not a width
+// parameter. ✔MEASURED -- no engine site reads its VALUE to decide anything; the
+// octet assumption is structural in the resource reader (which yields bytes) and
+// in `handleEmbed`'s splice loop (which spells one byte per element), and a
+// `static_assert` at that loop refuses to compile if the constant ever moves off
+// 8. So this pin is the OTHER half of the tripwire — the half that watches
+// `limits.json` — and neither half claims the constant is a knob.
+TEST(Preprocessor, EmbedElementWidthIsTheOneCharBitOwner) {
+    auto const root = dss::test::findConfigRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::configRootDiagnostic();
+    std::ifstream in(*root / "shippedLibs" / "limits.json", std::ios::binary);
+    ASSERT_TRUE(in.is_open());
+    std::string const text{std::istreambuf_iterator<char>(in),
+                           std::istreambuf_iterator<char>()};
+    // ⚠ THE SEARCH IS BOUNDED TO CHAR_BIT'S OWN OBJECT, AND THAT IS THE WHOLE
+    // POINT OF THIS BLOCK. An unbounded `find("\"value\":", name)` reads the
+    // NEXT constant's value the day CHAR_BIT's row loses or renames the field --
+    // and SCHAR_MIN's -128 or SCHAR_MAX's 127 is not 8, so it would go red...
+    // unless the next row happened to hold an 8, in which case the pin passes
+    // while measuring the wrong macro. An instrument that can fail toward CLEAN
+    // is not an instrument: every step below refuses instead of guessing.
+    auto const constants = text.find("\"constants\"");
+    ASSERT_NE(constants, std::string::npos)
+        << "limits.json no longer has a `constants` array";
+    auto const name = text.find("\"CHAR_BIT\"", constants);
+    ASSERT_NE(name, std::string::npos) << "limits.json no longer declares CHAR_BIT";
+    auto const rowEnd = text.find('}', name);
+    ASSERT_NE(rowEnd, std::string::npos) << "CHAR_BIT's row is unterminated";
+    auto const value = text.find("\"value\":", name);
+    ASSERT_NE(value, std::string::npos);
+    ASSERT_LT(value, rowEnd)
+        << "CHAR_BIT's OWN row no longer carries a `value` field -- this pin "
+           "would otherwise have read the next constant's";
+    char const* const digits = text.c_str() + value + std::string{"\"value\":"}.size();
+    char*             parsed = nullptr;
+    std::uint64_t const charBit = std::strtoull(digits, &parsed, 10);
+    ASSERT_NE(parsed, digits) << "CHAR_BIT's `value` is not a decimal number";
+    EXPECT_EQ(charBit, kEmbedElementWidthBits)
+        << "the resource reader yields octets; a target with another CHAR_BIT "
+           "needs another reader, not a config knob";
+    EXPECT_EQ(embedResourceWidthBytes(8, std::nullopt), 8u);
+    EXPECT_EQ(embedResourceWidthBytes(8, 3), 3u);
+    EXPECT_EQ(embedResourceWidthBytes(8, 100), 8u);
+    EXPECT_EQ(embedResourceWidthBytes(8, 0), 0u);
+    EXPECT_EQ(embedResourceWidthBytes(0, std::nullopt), 0u);
 }
 
 // T9: an empty resource expands to NOTHING (C23 6.10.3/6.10.4). `{ <empty> 42 }`
@@ -7864,18 +8743,40 @@ TEST(Preprocessor, FC179HasEmbedTrichotomy) {
         ASSERT_EQ(lexs.size(), 3u);
         EXPECT_EQ(lexs[1], "no") << "a missing resource -> __has_embed == 0";
     }
-    { // an unsupported parameter clause -> NOT_FOUND(0), NOT an error
+    { // a SUPPORTED parameter clause (D-PP-EMBED-PARAMS, P60) -> FOUND(1)
         PreprocessResult r;
         auto lexs = ppLexemesWithDirs(
             "#if __has_embed(\"full.bin\" limit(1))\n"
             "int yes;\n#else\nint no;\n#endif\n",
             r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes")
+            << "limit(1) on a 1-byte resource: supported + non-empty -> 1";
+    }
+    { // an unrecognized PREFIXED parameter -> NOT_FOUND(0), NOT an error: the
+      // C23 feature-probe contract, and the ONLY shape footnote 196 exempts.
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_embed(\"full.bin\" ds9000::element_type(short))\n"
+            "int yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
         EXPECT_FALSE(r.diagnostics->hasErrors())
-            << "an unsupported parameter is the standard NOT_FOUND signal, "
-               "not an error";
+            << "6.10.1p9 footnote 196: an unrecognized PREFIXED parameter is "
+               "not a constraint violation within a has_embed expression";
         ASSERT_EQ(lexs.size(), 3u);
         EXPECT_EQ(lexs[1], "no")
-            << "any parameter clause -> __has_embed == 0 (C23 feature-probe)";
+            << "6.10.2p8 NOTE 1: it makes the expression evaluate to 0";
+    }
+    { // an unknown STANDARD-SHAPED name gets NO such exemption -> loud
+        PreprocessResult r;
+        (void)ppLexemesWithDirs(
+            "#if __has_embed(\"full.bin\" no_such_parameter(1))\n"
+            "int yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
+            << "6.10.1p9 is violated and footnote 196's carve-out names the "
+               "PREFIXED shape only";
     }
     { // malformed (no `(`) -> loud
         PreprocessResult r;
@@ -7979,6 +8880,89 @@ TEST(Preprocessor, FC179EmbedResourceSizeBudgetIsLoudNotOom) {
         << "one byte over the budget must yield a loud diagnostic, never an OOM";
     EXPECT_NE(over->find("D-PP-EMBED-STREAMING"), std::string::npos)
         << "the message names the streaming-deferral boundary";
+}
+
+// ★★ C23 6.10.4.5 EXAMPLE 3 + 6.10.4.2 EXAMPLE 4: `limit` IS THE RESOURCE
+// BOUND, so it bounds the splice budget and the read -- while the budget itself
+// is neither lowered nor lifted. EXAMPLE 4 states the purpose in the standard's
+// own words: "The limit parameter may help process only a portion of that
+// information and PREVENT EXHAUSTION of an implementation's internal resources
+// when processing such data", and EXAMPLE 3 embeds `<infinite-resource>` with
+// `limit(0) if_empty(45540)` and requires `return 45540;`.
+//
+// The fixture is a resource ONE BYTE over the splice budget, built with a seek
+// (4 real bytes, then a single put at the cap) so it costs a seek rather than
+// 16 MiB of writes. CONTROL FIRST: with no `limit` it still fails LOUD naming
+// the streaming boundary -- the cap is untouched.
+TEST(Preprocessor, EmbedLimitBoundsTheSpliceBudgetWithoutWeakeningIt) {
+    auto dir = writeEmbedResource("dss_embed_lim", "small.bin", "AB");
+    auto const big = dir / "big.bin";
+    {
+        std::ofstream out(big, std::ios::binary);
+        ASSERT_TRUE(out.is_open());
+        char const head[] = {'\x01', '\x02', '\x03', '\x04'};
+        out.write(head, 4);
+        out.seekp(static_cast<std::streamoff>(kEmbedMaxResourceBytes),
+                  std::ios::beg);
+        out.put('\xFF');
+    }
+    std::error_code szEc;
+    ASSERT_EQ(fsemb::file_size(big, szEc), kEmbedMaxResourceBytes + 1)
+        << "the fixture must sit exactly one byte over the budget";
+    { // CONTROL: unlimited, over budget -> LOUD, naming the deferral. NOT lifted.
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"big.bin\""), r, {dir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+        EXPECT_NE(firstEmbedMsg(r).find("D-PP-EMBED-STREAMING"), std::string::npos)
+            << firstEmbedMsg(r);
+        EXPECT_TRUE(inner.empty()) << "never a silent partial embed";
+    }
+    { // CONTROL: a `limit` ABOVE the budget is still refused -- `limit` narrows
+      // the width, it does not exempt the directive.
+        PreprocessResult r;
+        auto inner = embedInner(
+            embedInit("#embed \"big.bin\" limit(16777217)"), r, {dir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+        EXPECT_NE(firstEmbedMsg(r).find("D-PP-EMBED-STREAMING"), std::string::npos)
+            << firstEmbedMsg(r);
+        EXPECT_TRUE(inner.empty());
+    }
+    { // 6.10.4.2p4: a small `limit` makes the WIDTH small, so the directive is
+      // within budget and embeds exactly those bytes.
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"big.bin\" limit(4)"), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << firstEmbedMsg(r);
+        EXPECT_EQ(joined(inner), "1 , 2 , 3 , 4");
+    }
+    { // 6.10.4.5 EXAMPLE 3, verbatim in shape: `limit(0) if_empty(45540)`.
+        PreprocessResult r;
+        auto inner = embedInner(
+            embedInit("#embed \"big.bin\" limit(0) if_empty(45540)"), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << firstEmbedMsg(r);
+        EXPECT_EQ(joined(inner), "45540")
+            << "C23 6.10.4.5 EXAMPLE 3: the directive becomes `45540`";
+    }
+    { // 6.10.4.5 EXAMPLE 1 shape: `limit(0) prefix(1) if_empty(0)` -> `0`, and
+      // `prefix` is ignored because the resource is empty (6.10.4.4p3).
+        PreprocessResult r;
+        auto inner = embedInner(
+            embedInit("#embed \"big.bin\" limit(0) prefix(1) if_empty(0)"), r,
+            {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << firstEmbedMsg(r);
+        EXPECT_EQ(joined(inner), "0");
+    }
+    { // and the OPERATOR agrees: EXAMPLE 6's `limit(0)` is EMPTY over the same
+      // oversized resource -- the budget never enters the trichotomy.
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_embed(\"big.bin\" limit(0)) == __STDC_EMBED_EMPTY__\n"
+            "int yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes");
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
 }
 
 // T12 (the pre-scan-parity witness, §9 FIX-4): a `#if __has_embed("res.bin")`

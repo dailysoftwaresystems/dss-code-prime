@@ -1459,20 +1459,95 @@ struct DSS_EXPORT PreprocessConfig {
     // the language declares NO such operator (`__has_embed` then folds as an
     // ordinary identifier -> 0, the identity property).
     //
-    // ANGLE-form self-consistency (D-PP-EMBED, FIX-3, deliberate): unlike
-    // `hasIncludeOperator` (which REQUIRES both angle-delimiter tokens at load,
-    // since its angle form is supported), `hasEmbedOperator` imposes NO such
-    // load-time requirement. The `#embed <resource>` / `__has_embed(<resource>)`
-    // ANGLE form is a cycle-1 loud DEFERRAL (D-PP-EMBED-ANGLE): DSS ships JSON
-    // descriptors, not binary resources, on the system path, so an angle embed
-    // resolves nothing. `__has_embed` reuses the language's existing
-    // `hasIncludeAngleOpenToken`/`hasIncludeAngleCloseToken` KINDS to RECOGNISE an
-    // angle argument only so it can answer 0 truthfully; a language that declares
-    // `hasEmbedOperator` without them cannot lex an angle argument at all and its
-    // `__has_embed(<...>)` fails loud at RUNTIME as a malformed argument -- which
-    // suffices precisely because the angle form is deferred (no self-inconsistent
-    // contract to guard against at load).
+    // ANGLE form (C23 6.10.4.1p8, D-PP-EMBED-ANGLE closed P60): `#embed <r>` and
+    // `__has_embed(<r>)` match their delimiters by the language's EXISTING
+    // `hasIncludeAngleOpenToken` / `hasIncludeAngleCloseToken` KINDS -- the same
+    // vocabulary `__has_include(<h>)` uses, never the `<`/`>` bytes and never a
+    // private angle path -- and search the same directory lists the angle
+    // `#include` searches (systemDirs, then the `-I` includeDirs; no includer-dir
+    // prepend, the 6.10.3p2 parity), through the shared `findInDirs` atom. What
+    // the angle EMBED does NOT do is the `<stem>.json` descriptor rewrite: that
+    // rewrite is DSS's model of a system HEADER's name and describes no resource.
+    // ⚠ REUSING THE INCLUDE PATHS IS A STATED DIVERGENCE FROM 6.10.4.1p14, not
+    // a reading of it. p14 is *Recommended practice* and says the OPPOSITE:
+    // "A mechanism similar to, but DISTINCT FROM, the implementation-defined
+    // search paths used for source file inclusion (6.10.3) is encouraged."
+    // DSS declines it deliberately -- p14 is non-normative and p8 makes the
+    // places implementation-defined outright, while a second, embed-only path
+    // list would be a second owner of "where DSS looks" with NO surface (CLI,
+    // project file or `.lang/.target/.format.json`) for a user to declare it.
+    // The full argument is on `resolveEmbedResource`, the one place it changes.
+    // A language that declares `hasEmbedOperator` (or `embedDirective`) without
+    // the angle-token pair cannot lex an angle operand at all; it then fails loud
+    // at RUNTIME as a malformed operand rather than at load, because the QUOTE
+    // form is complete on its own and the pair is only required by the angle
+    // form (unlike `hasIncludeOperator`, whose angle form is the system-header
+    // form every C translation unit reaches).
     std::string hasEmbedOperator;  // "__has_embed"
+
+    // ── C23 6.10.4.2–6.10.4.5: THE STANDARD `#embed` PARAMETERS (D-PP-EMBED-PARAMS) ──
+    //
+    // The engine's four parameter VERBS. Config binds each verb to the NAME a
+    // program spells; the engine dispatches on the verb only (the `pragmaEffects`
+    // `{prefix, effect}` house pattern), so a language that spells `limit`
+    // differently rebinds it here and no `src/` line changes.
+    //   Limit   -- 6.10.4.2: `( constant-expression )`, an integer constant
+    //              expression >= 0 evaluated by the `#if` evaluator (6.10.2's
+    //              rules, `defined` forbidden); the resource width becomes
+    //              min(implementation width, elementWidth * N), and 0 makes it EMPTY.
+    //   Prefix  -- 6.10.4.4: a balanced token sequence placed immediately BEFORE
+    //              the expansion, ignored when the resource is empty.
+    //   Suffix  -- 6.10.4.3: placed immediately AFTER; ignored when empty.
+    //   IfEmpty -- 6.10.4.5: REPLACES the whole directive when the resource is
+    //              empty; ignored otherwise.
+    // Each may appear at most once (a Constraints clause on every one of the
+    // four) and its parenthesized clause is REQUIRED ("shall be present").
+    enum class EmbedParameterRole : std::uint8_t { Limit, Prefix, Suffix, IfEmpty };
+
+    // One `{ name, role }` row of `preprocess.embedParameters.standard`. `name`
+    // is the canonical spelling; 6.10.1p5 makes the `__name__` spelling behave
+    // identically, which the engine honours through the SHARED `stripDunder`
+    // (core/types/attribute_naming.hpp, the `__has_c_attribute` precedent) rather
+    // than a second declaration of the underscores here.
+    struct EmbedParameterDef {
+        std::string        name;
+        EmbedParameterRole role = EmbedParameterRole::Limit;
+    };
+
+    // The embed-parameter SURFACE a language declares (C23 6.10.1p4–p9: a
+    // pp-parameter is a standard parameter or an implementation-defined
+    // PREFIXED parameter `identifier :: identifier`).
+    //   prefixSeparatorToken -- the token KIND that spells the `::` of a prefixed
+    //                           parameter (C's `ColonColonOp`), matched by KIND.
+    //                           REQUIRED inside the block: without it the
+    //                           prefixed form of 6.10.1 is unlexable and
+    //                           `__has_embed`'s 6.10.2p8 answer (an unrecognised
+    //                           prefixed parameter is NOT a violation, it is 0)
+    //                           could not be given truthfully.
+    //   standard             -- the four verbs above, each bound to ONE name;
+    //                           a verb bound twice or a name bound twice (raw or
+    //                           after `stripDunder`) is refused at load, because
+    //                           "at most once" is only checkable against a
+    //                           one-to-one binding.
+    // ★ THE CARVE-OUT IS PREFIXED-ONLY, AND THAT IS WHY THE `::` SPELLING
+    // EXISTS. DSS defines NO implementation-defined (prefixed) parameter, so a
+    // prefixed one on a `#embed` line is a 6.10.1p9 constraint violation (loud)
+    // while inside `__has_embed` it answers 0 -- footnote 196: "An unrecognized
+    // preprocessor PREFIXED parameter is a constraint violation, EXCEPT within
+    // has_embed expressions", and 6.10.2p8 NOTE 1 to the same effect. An unknown
+    // STANDARD-SHAPED name gets no such exemption anywhere in 6.10.2: it is a
+    // 6.10.1p9 violation in the directive AND in the operator.
+    struct EmbedParameterConfig {
+        std::string                    prefixSeparatorToken;
+        std::vector<EmbedParameterDef> standard;
+    };
+    // OPTIONAL. Absent (nullopt) means the language declares NO embed-parameter
+    // surface: `limit`/`prefix`/`suffix`/`if_empty` then name nothing, so every
+    // parameter on a `#embed` line is a loud 6.10.1p9 constraint violation and
+    // `__has_embed` with one is loud too (a bare identifier binding no standard
+    // parameter is exactly the shape footnote 196 does NOT exempt) -- an honest
+    // C23 SUBSET, and this block's REMOVE-direction red-on-disable.
+    std::optional<EmbedParameterConfig> embedParameters;
 
     // FC15 paste residuals (D-PP-VARIADIC-GNU-COMMA-ELISION): opt into the GNU
     // `,##__VA_ARGS__` extension. When TRUE, a `separator ## __VA_ARGS__` whose

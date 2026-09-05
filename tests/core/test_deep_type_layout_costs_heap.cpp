@@ -24,6 +24,8 @@
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_layout.hpp"
+#include "core/types/type_lattice/type_reintern.hpp"   // CompositeIdentityIndex (the spine_ pin)
+#include "bounded_stack.hpp"                            // runOnBoundedStack — the BOUND
 #include "hir/const_eval.hpp"
 #include "hir/hir.hpp"
 #include "hir/hir_literal_pool.hpp"
@@ -101,14 +103,28 @@ struct Lowered {
 // would absorb the very recursion under test.
 constexpr std::size_t kOrdinaryThreadReserveBytes = std::size_t{1} * 1024 * 1024;
 
-[[nodiscard]] Lowered lowerC(std::string src, std::size_t exprDepthCap) {
-    auto loaded = GrammarSchema::loadShipped("c");
-    if (!loaded) throw std::runtime_error{"loadShipped(c) failed"};
-    std::shared_ptr<GrammarSchema const> schema = *loaded;
+// The shipped schemas, loaded ONCE and on the MAIN thread. Every bounded pin
+// below calls this before spawning its small-stack worker: the loader's cost is
+// large and input-INDEPENDENT (`bounded_stack.hpp` says why), so it must not
+// be what a bounded stage pays for.
+struct ShippedSchemas {
+    std::shared_ptr<GrammarSchema const> schema;
+    std::shared_ptr<TargetSchema const>  target;
+};
+[[nodiscard]] ShippedSchemas const& shipped() {
+    static ShippedSchemas const loadedOnce = [] {
+        auto loaded = GrammarSchema::loadShipped("c");
+        if (!loaded) throw std::runtime_error{"loadShipped(c) failed"};
+        auto t = TargetSchema::loadShipped("x86_64");
+        if (!t) throw std::runtime_error{"loadShipped(x86_64) failed"};
+        return ShippedSchemas{.schema = *loaded, .target = *t};
+    }();
+    return loadedOnce;
+}
 
-    auto t = TargetSchema::loadShipped("x86_64");
-    if (!t) throw std::runtime_error{"loadShipped(x86_64) failed"};
-    std::shared_ptr<TargetSchema const> target = *t;
+[[nodiscard]] Lowered lowerC(std::string src, std::size_t exprDepthCap) {
+    std::shared_ptr<GrammarSchema const> schema = shipped().schema;
+    std::shared_ptr<TargetSchema const>  target = shipped().target;
 
     auto srcBuf = SourceBuffer::fromString(std::move(src), "<deepnest>");
     Tokenizer tk{srcBuf, schema, DiagnosticBudget::libraryDefault()};
@@ -324,6 +340,60 @@ TEST(RepresentationProjectionDeepNesting, DeepPointerChainOverNullptrTRebuildsOn
            "is a silently different type, not a cosmetic difference";
 }
 
+// ── ④ CompositeIdentityIndex::spine_ — the cross-CU reintern's field digest ──
+//
+// D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED. The
+// index describes every composite's fields DOWN TO but not THROUGH the composites
+// they reach, so a field's structural nesting — a pointer chain, an array of
+// arrays — is one `spine_` level per constructor, and the walk used to call
+// itself at the volatile peel and once per operand. It runs only when a
+// cross-CU merge observes an interner, which is why no C-source probe reached
+// it and the census carried it UNMEASURED. This drives `observe` directly: a
+// struct whose one field is a kDepth-deep pointer chain, so the digest walks
+// exactly kDepth levels.
+//
+// ✔MEASURED on the ordinary thread, through `ctest` (P60, lane `rc`), with the
+// RECURSIVE walk restored: see the ceiling recorded at the site
+// (`type_reintern.cpp`, `spine_`); converted, this reaches kDepth = 100_000.
+// The digest is also asserted STABLE across the conversion in the only way that
+// is observable: two interners holding the same shape must land on ONE key, and
+// a shape one level shallower must land on ANOTHER — a walk that reordered the
+// pre-order mix would still "pass" a survival-only pin.
+// ★ ON THE BOUNDED STACK (`bounded_stack.hpp`, 256 KiB): the recursive walk
+// cost at least one frame per level (two calls' worth of locals — well over
+// 64 bytes on any toolchain), so 100_000 levels need ≥ 6 MiB against a 256 KiB
+// reserve. Restore the recursion and the process dies, on every leg.
+TEST(CompositeIdentityIndexDeepNesting, SpineOverADeepPointerFieldCostsHeap) {
+    int const kDepth = depthOr(100000);
+    auto build = [&](std::uint32_t owner, int depth) {
+        auto ti = std::make_unique<TypeInterner>(CompilationUnitId{owner});
+        TypeId chain = ti->primitive(TypeKind::I32);
+        for (int i = 0; i < depth; ++i) chain = ti->pointer(chain);
+        std::array<TypeId, 1> f{chain};
+        TypeId const s = ti->structType("Deep", f);
+        return std::pair{std::move(ti), s};
+    };
+    auto [a, sa] = build(1, kDepth);
+    auto [b, sb] = build(2, kDepth);
+    auto [c, sc] = build(3, kDepth - 1);   // one level shallower: a DIFFERENT type
+
+    std::uint64_t ka = 0, kb = 0, kc = 0;
+    test::runOnBoundedStack([&] {
+        CompositeIdentityIndex index;
+        index.observe(*a);
+        index.observe(*b);
+        index.observe(*c);
+        ka = index.keyFor(*a, sa);
+        kb = index.keyFor(*b, sb);
+        kc = index.keyFor(*c, sc);
+    });
+    EXPECT_EQ(ka, kb)
+        << "the same field shape in two CUs must digest to ONE identity key";
+    EXPECT_NE(ka, kc)
+        << "a chain one level shallower is a different type and must not merge "
+           "— a digest that lost a level would silently fork or fuse layouts";
+}
+
 // ── ② const_eval — the evalNode ⇄ evalImpl recursion ─────────────────────────
 //
 // ✔MEASURED on the ordinary thread, through `ctest`, with the DELEGATED arms
@@ -345,7 +415,14 @@ struct ConstEvalRig {
 
 } // namespace
 
-TEST(ConstEvalDeepNesting, NestedAggregatesFoldOnAnOrdinaryThread) {
+// ★ ON THE BOUNDED STACK (`bounded_stack.hpp`, 256 KiB) — the fold, then the
+// COPY, then the TEARDOWN of a 20_000-level value all run on it: the
+// recursive `evalNode ⇄ evalImpl` cost ~1 KiB per level on mingw-w64 g++
+// Debug (400 ok / 1000 crash on 1 MiB), the recursive teardown ~300 bytes,
+// the recursive copy more than either; at 20_000 levels every one of them
+// needs megabytes against 256 KiB, so restoring any of the three kills the
+// process on every leg.
+TEST(ConstEvalDeepNesting, NestedAggregatesFoldOnABoundedStack) {
     int const kDepth = depthOr(20000);
     ConstEvalRig r;
     TypeId const i32  = r.interner.primitive(TypeKind::I32);
@@ -361,33 +438,46 @@ TEST(ConstEvalDeepNesting, NestedAggregatesFoldOnAnOrdinaryThread) {
 
     HirNodeId const root = cur;
     Hir hir = std::move(r.builder).finish(root);
-    ConstEvalResult res = evaluateConstant(hir, r.interner, r.literals, root);
-    ASSERT_TRUE(res.value.has_value())
-        << "a deep aggregate initializer must fold, not crash";
+    bool folded = false;
+    int  copiedLevels = 0;
+    test::runOnBoundedStack([&] {
+        ConstEvalResult res = evaluateConstant(hir, r.interner, r.literals, root);
+        folded = res.value.has_value();
+        if (!folded) return;
 
-    // ⚠ TEAR THE FOLDED VALUE DOWN ITERATIVELY, AND THE REASON IS THE SUBJECT OF
-    // THIS FILE. A nested `HirLiteralValue`'s DESTRUCTOR is itself one host frame
-    // per level — `~variant` → `~HirAggregateValue` → `~vector` →
-    // `~HirLiteralValue` — and it is GENERATED BY THE STANDARD LIBRARY in
-    // `hir_literal_pool.hpp`, so nothing `const_eval` flattens can reach it. It
-    // is a SEPARATE, still-unconverted site; unlink the spine so the depth this
-    // case measures is the FOLD's and not somebody else's frame size. (Same
-    // treatment `MirLiteralWalk.HundredThousandLevelsCostHeapNotCallFrames`
-    // gives the MIR twin, for the same reason.)
-    {
-        std::vector<HirLiteralValue> shallow;
-        shallow.reserve(static_cast<std::size_t>(kDepth) + 2u);
-        HirLiteralValue spine = std::move(*res.value);
-        res.value.reset();
-        while (true) {
-            auto* agg = std::get_if<HirAggregateValue>(&spine.value);
-            if (agg == nullptr || agg->fields.empty()) break;
-            HirLiteralValue child = std::move(agg->fields.front());
-            agg->fields.clear();
-            shallow.push_back(std::move(spine));
-            spine = std::move(child);
+        // ★★ THE COPY IS A WALK TOO. `HirAggregateValue`'s copy constructor
+        // used to be the compiler's own — `vector` copy → variant copy →
+        // nested `HirAggregateValue` copy, one host frame chain per level —
+        // exactly the shape ✔MEASURED 2026-09-04 (P60, lane `rc`) on the MIR
+        // twin, where `emitGlobals_` copying a 1000-level pool literal died
+        // 13 848 frames deep under MSVC 19.51 Debug once the teardown stopped
+        // being the first walk to overflow. Copy the whole value here and walk
+        // the copy ITERATIVELY to prove it is complete — a copy that silently
+        // stopped short would be a wrong initializer, not a crash.
+        HirLiteralValue const copy = *res.value;
+        HirLiteralValue const* node = &copy;
+        while (auto const* agg = std::get_if<HirAggregateValue>(&node->value)) {
+            if (agg->fields.size() != 1) break;
+            node = &agg->fields[0];
+            ++copiedLevels;
         }
-    }
+
+        // ★★ AND THE TEARDOWN IS A WALK TOO. `res` and `copy` die here, at
+        // full depth: `~HirLiteralValue → ~variant → ~HirAggregateValue →
+        // ~vector → ~HirLiteralValue` is a walk the standard library generates,
+        // and until P60 it cost one host frame chain per aggregate level — this
+        // case used to UNLINK the spine by hand so that its depth measured the
+        // fold and not the destructor. ✔MEASURED 2026-09-04 (P60, lane `rc`),
+        // gdb-attributed under MSVC 19.51 Debug: that chain is 19 frames /
+        // ~1160 bytes per level and a 1000-level global initializer died in it
+        // at ~878 levels; under mingw-w64 g++ 13.2 the row records 1000–4000.
+        // `hir_literal_pool.hpp` now tears an aggregate down — and copies one —
+        // on an explicit heap work list.
+    });
+    ASSERT_TRUE(folded) << "a deep aggregate initializer must fold, not crash";
+    EXPECT_EQ(copiedLevels, kDepth)
+        << "the copy must reproduce every level — a short copy is a silently "
+           "different initializer";
 }
 
 // ⚠ EVERY LEVEL MINTS ITS OWN LITERAL NODE. Reusing one `HirNodeId` as two
@@ -527,22 +617,43 @@ TEST(LayoutLeverage, HirToMirWithDeeplyNestedTypesLowersOnAnOrdinaryThread) {
 // means the mutant's floor is NOT the original's, so this depth is set from the
 // unmodified tree's 400-rc-0 / 1000-rc-8 pair and from nothing else.
 //
-// ⚠⚠ THE USABLE WINDOW HERE IS ONE OCTAVE (1000 <= D < 2000) AND THAT IS A
-// PORTABILITY CLAIM, not a constant: it was measured on ONE leg (Windows,
-// mingw-w64 GCC 13, Debug). A leg with fatter frames could push the 2000 site
-// below 1000 and red this case for a reason that has nothing to do with what it
-// asserts. Raising kDepth becomes meaningful — and this caveat goes away — only
-// once that site is converted too.
-TEST(LayoutLeverage, NestedStructGlobalInitLowersOnAnOrdinaryThread) {
-    int const kDepth = depthOr(1000);
-    auto L = lowerC(nestedStructGlobalInitSource(kDepth),
-                    /*exprDepthCap=*/static_cast<std::size_t>(kDepth) + 1024);
+// ⚠⚠ THE ONE-OCTAVE WINDOW THIS CASE USED TO LIVE IN (1000 <= D < 2000) WAS A
+// PORTABILITY CLAIM, AND THE FATTER LEG PROVED IT: ✔MEASURED 2026-09-04 (P60,
+// lane `rc`) on MSVC 19.51 Debug, kDepth 1000 died of stack overflow on the
+// ordinary thread — gdb-attributed, in order, to THREE compiler-generated walks
+// nobody had written: `~HirLiteralValue`'s teardown (19 frames, ~1160 bytes
+// per level), then, with that converted, the `MirAggregateValue` COPY
+// constructor 13 848 frames deep (`emitGlobals_` copying the pool literal),
+// then `HirAggregateValue`'s. All three are iterative now
+// (`hir_literal_pool.hpp`, `mir_literal_pool.hpp`), and `lowerBraceInit` was
+// converted in P55, so the walls that bounded this window are gone.
+//
+// ★★ SO IT RUNS ON THE BOUNDED STACK (`bounded_stack.hpp`, 256 KiB), AT
+// 2000 — twice the old window's top. The arithmetic that makes 2000
+// discriminating on the THINNEST supported frames: the recursive teardown
+// cost ~300 bytes per level under mingw-w64 g++ Debug (the row's 1000 ok /
+// 4000 crash pair on 1 MiB), so a regression needs ≥ 600 KiB here against a
+// 256 KiB reserve; the copy chain (~14 frames per level) needs more still.
+// Restore either and the process dies — on the Ninja gate too. The schemas are
+// loaded on the main thread first (`shipped()`).
+TEST(LayoutLeverage, NestedStructGlobalInitLowersOnABoundedStack) {
+    int const kDepth = depthOr(2000);
+    (void)shipped();   // load on the MAIN thread, never on the bounded one
 
-    DiagnosticReporter reporter;
-    MirTextContext ctx;
-    ctx.interner = &L.model.lattice().interner();
-    std::string const text = emitMir(L.mir.mir, ctx, reporter);
+    std::string text;
+    std::size_t errors = 0;
+    test::runOnBoundedStack([&] {
+        auto L = lowerC(nestedStructGlobalInitSource(kDepth),
+                        /*exprDepthCap=*/static_cast<std::size_t>(kDepth) + 1024);
+        DiagnosticReporter reporter;
+        MirTextContext ctx;
+        ctx.interner = &L.model.lattice().interner();
+        text   = emitMir(L.mir.mir, ctx, reporter);
+        errors = reporter.errorCount();
+        // `L` dies here, at full depth, on the bounded stack: the HIR pool's
+        // and the MIR pool's teardowns are part of what this pin bounds.
+    });
     EXPECT_NE(text.find("lit int 3"), std::string::npos)
         << "the innermost initializer value must reach the text";
-    EXPECT_EQ(reporter.errorCount(), 0u);
+    EXPECT_EQ(errors, 0u);
 }

@@ -4,7 +4,7 @@
   "header": "io.h",
   "standard": "msvcrt",
   "availableObjectFormats": ["pe"],
-  "library": { "pe": "ucrtbase.dll" },
+  "library": { "pe": { "role": "cLibrary" } },
   "symbols": [
     { "name": "_access",  "signature": "fn(ptr<char>, i32) -> i32", "kind": "function", "linkage": "external" },
     { "name": "_waccess", "signature": "fn(ptr<u16>, i32) -> i32",  "kind": "function", "linkage": "external" },

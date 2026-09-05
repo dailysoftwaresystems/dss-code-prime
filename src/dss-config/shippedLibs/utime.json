@@ -3,7 +3,7 @@
   "header": "utime.h",
   "standard": "posix",
   "availableObjectFormats": ["elf", "macho"],
-  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "library": { "elf": { "role": "cLibrary" }, "macho": { "role": "cLibrary" } },
   "symbols": [
     { "name": "utime", "signature": "fn(ptr<char>, ptr<utimbuf>) -> i32", "kind": "function", "linkage": "external" }
   ],

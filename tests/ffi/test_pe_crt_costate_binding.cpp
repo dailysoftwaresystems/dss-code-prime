@@ -57,6 +57,7 @@
 
 #include "ffi/shipped_lib_descriptor.hpp"
 
+#include "fixture_role_resolver.hpp"   // the ONE test-side runtimeLibraries stand-in
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
@@ -193,15 +194,45 @@ struct PeBinding {
     bool        reachable{};  // survives BOTH pe availability gates
 };
 
-// Read a `library.pe` string out of any node that may carry a `library` map —
+// D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: a pe
+// entry is now ordinarily a ROLE (`{"role": "cLibrary"}`) rather than an image,
+// and the image a role denotes is owned by the pe object-format documents'
+// `runtimeLibraries` rows — pinned there by
+// `RuntimeLibraryRoles.NoPeFormatNamesTheLegacyCrtInItsRoleTable`. This file's
+// subject is the CLOSED pe runtime vocabulary and the co-state agreement across
+// it, so it carries the role half of that vocabulary as the same kind of fixture
+// its `known` image list already is: a role entry reads as the image its row
+// declares, every existing agreement / spelling / pair assertion keeps its
+// meaning (two descriptors naming `cLibrary` name ONE runtime), and a role this
+// table does not know surfaces as `role:<name>`, which no image list accepts.
+// ⓘ The table itself is the ONE test-side fixture (`fixture_role_resolver.hpp`),
+// shared with the two suites that drive a resolver from it — three copies of
+// "what does `cLibrary` mean on pe" would be the very two-owners shape the row
+// above exists to end.
+using dss::ffi_test::fixtureRoleImage;
+
+// The pe binding one `library.pe` VALUE spells: a literal image verbatim, a
+// role object as the image its pe row declares (or `role:<name>` when unknown).
+// nullopt ⇒ not a shape this file models (neither a string nor a role object).
+[[nodiscard]] std::optional<std::string> peBindingSpelling(nlohmann::json const& value) {
+    if (value.is_string()) return value.get<std::string>();
+    if (!value.is_object()) return std::nullopt;
+    auto const role = value.find("role");
+    if (role == value.end() || !role->is_string()) return std::nullopt;
+    std::string const name = role->get<std::string>();
+    if (auto image = fixtureRoleImage(dss::ObjectFormatKind::Pe, name)) return image;
+    return "role:" + name;
+}
+
+// Read a `library.pe` binding out of any node that may carry a `library` map —
 // the descriptor root or one symbol object. nullopt ⇒ this node declares no pe
 // binding of its own (for a symbol that means "inherits the root's").
 [[nodiscard]] std::optional<std::string> peImageOf(nlohmann::json const& node) {
     auto const lib = node.find("library");
     if (lib == node.end() || !lib->is_object()) return std::nullopt;
     auto const pe = lib->find("pe");
-    if (pe == lib->end() || !pe->is_string()) return std::nullopt;
-    return pe->get<std::string>();
+    if (pe == lib->end()) return std::nullopt;
+    return peBindingSpelling(*pe);
 }
 
 // EVERY pe runtime image a descriptor declares: the ROOT `library.pe` PLUS every
@@ -767,12 +798,10 @@ peBindingOfSymbol(nlohmann::json const& doc, std::string_view symbolName) {
         if (sym.at("name").get<std::string>() != symbolName) continue;
 
         PeSymbolBinding out;
-        if (doc.contains("library") && doc.at("library").is_object()
-            && doc.at("library").contains("pe"))
-            out.image = doc.at("library").at("pe").get<std::string>();
-        if (sym.contains("library") && sym.at("library").is_object()
-            && sym.at("library").contains("pe"))
-            out.image = sym.at("library").at("pe").get<std::string>();
+        // Both spellings of a pe entry read through `peBindingSpelling`: a
+        // literal image verbatim, a role as the image its pe row declares.
+        if (auto rootImage = peImageOf(doc)) out.image = std::move(*rootImage);
+        if (auto symImage = peImageOf(sym)) out.image = std::move(*symImage);
 
         out.externalName = std::string{symbolName};
         if (sym.contains("linkName")) {

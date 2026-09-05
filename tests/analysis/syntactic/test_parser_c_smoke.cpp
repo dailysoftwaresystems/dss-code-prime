@@ -2031,9 +2031,11 @@ namespace {
 
 // Parse `source` against the real shipped c schema with an explicit
 // `maxExpressionDepth` cap, on the production 64 MiB deep-recursion worker
-// stack (the parser's still-recursive paren arm needs it past a few hundred
-// levels — exactly as `Program::compileFiles` runs the real parse). Returns
-// the produced tree.
+// stack — exactly as `Program::compileFiles` runs the real parse. (Since P60
+// the parser holds no host frame per nesting level, so the worker is no
+// longer NEEDED here; it is kept because this pin is about the CAP, and the
+// production thread is the one the cap is configured for.) Returns the
+// produced tree.
 [[nodiscard]] Tree parseCWithCap(std::string source, std::size_t cap) {
     return dss::substrate::callOnLargeStack(
         dss::substrate::kDeepRecursionStackBytes, [&]() -> Tree {
@@ -2059,11 +2061,16 @@ TEST(ParserCSmoke, ExpressionDepthCapIsConfigDriven) {
     ASSERT_TRUE(cap.has_value())
         << "c `parser.maxExpressionDepth` must reach the schema "
            "(config-driven, not the hardcoded ParserConfig default)";
-    // The shipped value is HIGH (raised past the old 256) and BOUNDED. Pin the
-    // exact value so a config edit that changes it must consciously update this
-    // pin (and the corpus golden) rather than drift silently.
-    EXPECT_EQ(*cap, 1024u)
-        << "shipped c expression-depth cap (Debug-safe high bound)";
+    // The shipped value is HIGH (raised past the old 256, and past the 1024 of
+    // plan-24 Stage 7) and BOUNDED. Pin the exact value so a config edit that
+    // changes it must consciously update this pin (and the corpus golden)
+    // rather than drift silently. 16384 is the deepest paren nest a WORKING
+    // reference compiles (gcc 13.3.0; 32768 ICEs it) and the depth DSS was
+    // ✔MEASURED to run end-to-end on a 1 MiB thread (P60,
+    // D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED)
+    // — see the `$parserComment` in `c.lang.json` for the whole derivation.
+    EXPECT_EQ(*cap, 16384u)
+        << "shipped c expression-depth cap (the union's measured paren depth)";
     EXPECT_GT(*cap, 256u) << "the lift must raise the cap above the old 256";
 }
 

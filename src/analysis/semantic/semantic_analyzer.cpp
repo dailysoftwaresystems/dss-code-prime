@@ -393,6 +393,11 @@ struct EngineState {
     // c8: the active target's object-format (`analyze()`'s param) — gates
     // per-target shipped-header availability. `nullopt` ⇒ no gate (back-compat).
     std::optional<ObjectFormatKind> activeFormat;
+    // D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: who
+    // answers a descriptor `library` entry that names a runtime ROLE
+    // (`analyze()`'s param). Handed verbatim to every ffi read this tier makes;
+    // `nullptr` ⇒ this caller binds no import, role entries are recorded only.
+    RuntimeLibraryRoleResolver const* roleResolver = nullptr;
     // Plan 25: the active target's ARCH NAME (`analyze()`'s param — `target.name()`).
     // The per-target shipped-struct `variants` selector: a struct's field list is
     // chosen by (activeTarget, activeFormat) so its byte layout is correct per
@@ -18312,7 +18317,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  std::optional<ObjectFormatKind> activeFormat,
                                  std::optional<std::string_view> activeTarget,
                                  LongDoubleFormat longDoubleFormat,
-                                 TargetSchema const* target);
+                                 TargetSchema const* target,
+                                 RuntimeLibraryRoleResolver const* roleResolver);
 
 SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       DiagnosticBudget budget,
@@ -18323,7 +18329,35 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       std::optional<std::string_view> activeTarget,
                       LongDoubleFormat longDoubleFormat,
                       TargetSchema const* target,
-                      std::size_t deepRecursionReserveBytes) {
+                      std::size_t deepRecursionReserveBytes,
+                      RuntimeLibraryRoleResolver const* roleResolver) {
+    // ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ──
+    // `activeFormat` and `roleResolver` are two statements about the SAME format,
+    // and nothing but this check makes them agree. A caller passing one format's
+    // kind with the other's resolver binds NOTHING: the decoder resolves a role
+    // entry only for the key the resolver answers for, so every role-spelled
+    // `library` entry silently yields no image, every shipped import goes out
+    // unbound, and DSS eager-imports every function a descriptor lists — the
+    // symptom is a binary that fails at LOAD with no diagnostic at any compile
+    // stage ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]). That direction is unrecoverable
+    // downstream, and the mismatch is a CALLER CONTRACT violation rather than
+    // anything a user's program can provoke — so it fails the way the null-CU
+    // contract in `analyzeImpl` does, and it fails HERE, before the large-stack
+    // worker exists, so the abort happens on the caller's own thread.
+    // ⓘ NO resolver is NOT a mismatch: that is the stated UNBOUND arm, which
+    // every direct-API caller (the LSP, the header parser, ~40 test call sites
+    // that pass an `activeFormat` and bind nothing) depends on.
+    if (activeFormat.has_value() && roleResolver != nullptr
+        && roleResolver->formatKindName() != objectFormatKindName(*activeFormat)) {
+        std::fprintf(stderr,
+                     "dss::analyze fatal: activeFormat is '%s' but the "
+                     "runtime-library role resolver answers for '%s' -- a shipped "
+                     "descriptor's role entry would resolve for neither, leaving "
+                     "every import of this unit unbound\n",
+                     std::string{objectFormatKindName(*activeFormat)}.c_str(),
+                     std::string{roleResolver->formatKindName()}.c_str());
+        std::abort();
+    }
     // Run the recursive analysis on a dedicated large-stack worker thread
     // (JOIN-synchronous — no concurrency) so a deeply-nested-but-legal
     // expression tree does not overflow the host's ~1 MB main thread stack.
@@ -18345,7 +18379,8 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
     return dss::substrate::callOnLargeStack(reserveBytes, [&] {
             return analyzeImpl(std::move(cu), budget, dataModel, std::move(aggregateLayout),
                                std::move(vaListStrategy), std::move(activeFormat),
-                               std::move(activeTarget), longDoubleFormat, target);
+                               std::move(activeTarget), longDoubleFormat, target,
+                               roleResolver);
         });
 }
 
@@ -18357,7 +18392,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  std::optional<ObjectFormatKind> activeFormat,
                                  std::optional<std::string_view> activeTarget,
                                  LongDoubleFormat longDoubleFormat,
-                                 TargetSchema const* target) {
+                                 TargetSchema const* target,
+                                 RuntimeLibraryRoleResolver const* roleResolver) {
     if (!cu) {
         std::fputs("dss::analyze fatal: null CompilationUnit\n", stderr);
         std::abort();
@@ -18369,6 +18405,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     s.aggregateLayout = aggregateLayout;
     s.vaListStrategy = vaListStrategy;
     s.activeFormat = activeFormat;
+    s.roleResolver = roleResolver;
     // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: ask the ONE owner, passing the
     // active format KIND (a required argument of the accessor precisely so no
     // caller can take the processor half alone — the same arm64 CPU is UNSIGNED
@@ -19153,7 +19190,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             }
             auto desc = ffi::readShippedLibDescriptor(
                 descPath, s.lattice.interner(), s.lattice.registry(), s.reporter,
-                s.dataModel, activeTargetView, s.activeFormat, namedTypes);
+                s.dataModel, activeTargetView, s.activeFormat, namedTypes,
+                s.roleResolver);
             if (!desc) continue;
 
             // c8: per-target AVAILABILITY gate. When the active object-format is
@@ -20294,7 +20332,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             auto realized = ffi::realizeShippedExternSymbols(
                 unrealized, s.lattice.interner(), s.lattice.registry(),
                 s.reporter, s.dataModel, activeTargetView, s.activeFormat,
-                namedTypes);
+                namedTypes, s.roleResolver);
             // nullopt ⇒ the shippedLibs directory could not be located. That is a
             // statement about the ENVIRONMENT, never about the user's program, so
             // every name simply stays unrealized and routes unbound — the exact
@@ -20353,7 +20391,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     // the tree — and nothing here needs editing when a recipe lands.
                     auto surface = ffi::realizeShippedDescriptorSurfaceFor(
                         name, s.lattice.interner(), s.lattice.registry(),
-                        s.dataModel, activeTargetView, s.activeFormat, namedTypes);
+                        s.dataModel, activeTargetView, s.activeFormat, namedTypes,
+                        s.roleResolver);
                     if (!surface.has_value()) continue;
                     for (auto& [coreName, core] : *surface) {
                         // The declared name itself is already handled above, and a
