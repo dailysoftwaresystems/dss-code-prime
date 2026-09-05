@@ -5,8 +5,10 @@
 #include "core/types/object_format_kind.hpp"  // externCallUsesIndirectShape
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/section_kind.hpp"        // relocBearingGlobalSection (c145 chokepoint)
+#include "core/types/type_lattice/type_layout.hpp"  // scalarByteSize — the null import slot's pointer width
 #include "link/cross_cu_resolve.hpp"
 #include "link/entry_trampoline.hpp"
+#include "link/fresh_symbol_ids.hpp"   // maxExistingSymbolIdV — the ONE taken-id scan
 #include "link/static_init_tables.hpp"
 #include "link/format/elf.hpp"
 #include "link/format/macho.hpp"
@@ -17,6 +19,7 @@
 #include "lir/lir_pass_util.hpp"
 
 #include <format>
+#include <limits>
 #include <optional>
 #include <set>
 #include <string>
@@ -206,10 +209,20 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     AssembledModule const& m,
     AssembledModule&       filtered,
     bool                   allowUndefinedExterns,
+    std::uint64_t          pointerBytes,
     DiagnosticReporter&    reporter) {
     // Candidate test: does ANY named import need the gate — i.e. is there a
     // NON-EAGER row? An eager row is always kept, so a module whose every named
-    // import is eager has nothing to gate (the common `#include`-only fast path).
+    // import is eager has nothing to gate.
+    // ⚠ THIS SHORT-CIRCUIT USED TO CALL THAT "the common `#include`-only fast
+    // path", AND THAT SENTENCE MEANT THE SCAN BELOW HAD NEVER RUN FOR AN
+    // ORDINARY PROGRAM. ✔MEASURED 2026-09-03 while closing
+    // [[D-FFI-DESCRIPTOR-EAGER-IMPORT]]: every `#include`d descriptor symbol was
+    // eager, and `injectEntryTrampoline` appends the only other non-eager row
+    // AFTER this gate — so for an `#include`-only TU `anyCandidate` was false and
+    // the whole gate returned early, every time. It is no longer a fast path: a
+    // descriptor symbol is non-eager by default now, so this scan is LIVE for
+    // exactly the programs that never reached it.
     // This MUST fire for a library-bound non-eager row too (not just unbound
     // ones): otherwise an unreferenced `Sqlitetestsse_Init` in a module with no
     // unbound rows would skip the gate and survive to the loader. Every unbound
@@ -231,6 +244,17 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
         for (auto const& rel : di.relocations) referenced.insert(rel.target.v);
     }
     bool anyDrop = false;
+    // ★★ D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the imports this link
+    // resolves to NOTHING. A REFERENCED, UNBOUND, **WEAK** import on an artifact
+    // that cannot carry an undefined symbol is not an error — a weak reference
+    // that nothing defines resolves to nothing, which is the ONE property that
+    // makes it weak and the reason `if (&ea)` is written at all. Collected here
+    // and turned into a NULL IMPORT SLOT below.
+    // ✔MEASURED: gcc 13.3.0 and clang 18.1.3 both LINK and RUN this program on
+    // ELF, and clang does on PE through the mingw linker — DSS rejected it on
+    // all three exec formats with `K_SymbolUndefined`, which is a loud refusal
+    // of a correct program and therefore below the union.
+    std::vector<SymbolId> nullBound;
     for (auto const& ext : m.externImports) {
         if (ext.mangledName.empty()) continue;   // already rejected (compound index)
         if (ext.isEagerImport) continue;         // eager law: keep even if unreferenced
@@ -252,7 +276,63 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                 //    every referenced libc import on an exec would reject loud —
                 //    catastrophic. The `else` below (referenced + library-bound)
                 //    keeps the row silently.
-                if (!allowUndefinedExterns) {
+                if (!allowUndefinedExterns
+                    && ext.binding == SymbolBinding::Weak
+                    && ext.isData) {
+                    // ★ THE WEAK ARM, AND IT IS NOT A SOFTENING OF THE REJECT
+                    // BELOW — it is a different question with a different
+                    // answer. The reject exists because nothing later binds an
+                    // exec's undefined symbol, so the reference would read a
+                    // null slot at run time with no diagnostic. A WEAK reference
+                    // ASKED for exactly that: C's optional-symbol idiom is to
+                    // take the address, compare it against null, and take the
+                    // other path. Binding it to 0 is the answer the source
+                    // requested; refusing it is refusing a correct program.
+                    // The row leaves `externImports` (nothing to import) and its
+                    // symbol is re-declared below as a NULL IMPORT SLOT.
+                    //
+                    // ⚠⚠ `isData` IS A PRECONDITION, NOT A NARROWING FOR ITS OWN
+                    // SAKE, AND THE FUNCTION ARM BELOW IS A REFUSAL RATHER THAN A
+                    // SLOT BECAUSE OF A MEASUREMENT. A DATA reference is lowered
+                    // GOT-INDIRECT — the code materializes a slot's address and
+                    // DEREFERENCES it — so a slot holding 0 makes `&ea` yield 0.
+                    // A FUNCTION reference is lowered DIRECT (`externCallDispatch:
+                    // direct-plt` on every shipped format): `&f` IS the symbol's
+                    // own VA, deliberately the PLT/thunk address rather than any
+                    // slot's content, so a zero slot would make `&f` the slot's
+                    // ADDRESS — non-zero. ✔MEASURED with the slot given to the
+                    // function form: `extern int maybe(void)
+                    // __attribute__((weak)); if (maybe) return maybe();` linked
+                    // clean and SEGFAULTED (rc 139 on ELF and on PE), because
+                    // `lea 0x3b(%rip),%r9` put a non-null address in the test and
+                    // the guarded call then ran the zero bytes. That is a SILENT
+                    // MISCOMPILE where the pre-existing behaviour was a loud
+                    // refusal, so the function form keeps the refusal and says
+                    // why.
+                    nullBound.push_back(ext.symbol);
+                    anyDrop = true;
+                } else if (!allowUndefinedExterns
+                           && ext.binding == SymbolBinding::Weak) {
+                    report(reporter, DiagnosticCode::K_SymbolUndefined,
+                           DiagnosticSeverity::Error,
+                           "undefined symbol '" + ext.mangledName + "' — a WEAK "
+                           "extern FUNCTION reference that nothing defines and no "
+                           "library binds. Its OBJECT-tier encoding is correct (the "
+                           "emitted `.o`/`.obj` marks it a weak undefined symbol, so "
+                           "a foreign linker resolves it to nothing exactly as gcc "
+                           "and clang do), but this IMAGE cannot bind it to a null "
+                           "address: an extern function's address is materialized "
+                           "DIRECTLY from its symbol VA under the format's declared "
+                           "`externCallDispatch`, so there is no slot whose content "
+                           "could be zero, and the address the reference would "
+                           "compute is a PLT/thunk address rather than the "
+                           "function's own. Refusing rather than emitting a program "
+                           "whose `if (fn)` test is TRUE for a function that does "
+                           "not exist. Link a definition, declare the owning "
+                           "library, or emit a relocatable object and let the final "
+                           "linker resolve it. "
+                           "D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE.");
+                } else if (!allowUndefinedExterns) {
                     report(reporter, DiagnosticCode::K_SymbolUndefined,
                            DiagnosticSeverity::Error,
                            "undefined symbol '" + ext.mangledName + "' — the symbol "
@@ -260,7 +340,9 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                            "import library) but no linked compilation unit defines "
                            "it and no library import binds it. Provide a definition "
                            "in a linked translation unit, or declare the owning "
-                           "library for the symbol.");
+                           "library for the symbol. (A reference that may LEGALLY "
+                           "resolve to nothing is spelled `weak` on the declaration "
+                           "and binds to address 0 instead of reaching here.)");
                 }
                 // else: kept — resolved by the final linker (relocatable) or
                 // by ld.so's global scope at load (ELF ET_DYN).
@@ -272,11 +354,400 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     }
     if (!anyDrop) return true;   // rejects (if any) reported; module unchanged
     filtered = m;   // copy, then erase the unreferenced non-eager rows
+    // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the null-bound set is
+    // matched by SYMBOL, not by re-deriving the predicate a second time. The
+    // classification loop above already applied `!allowUndefinedExterns &&
+    // binding == Weak && libraryPath.empty() && referenced`; re-testing it here
+    // would be two spellings of one rule, and the pair drifting is how a row
+    // ends up erased from `externImports` while nothing gives it an address (an
+    // unresolved-target refusal in the walker, naming the wrong defect).
+    std::unordered_set<std::uint32_t> nullBoundIds;
+    nullBoundIds.reserve(nullBound.size());
+    for (SymbolId id : nullBound) nullBoundIds.insert(id.v);
     std::erase_if(filtered.externImports, [&](ExternImport const& ext) {
-        return !ext.mangledName.empty() && !ext.isEagerImport
-            && !referenced.contains(ext.symbol.v);
+        if (ext.mangledName.empty()) return false;
+        if (nullBoundIds.contains(ext.symbol.v)) return true;
+        return !ext.isEagerImport && !referenced.contains(ext.symbol.v);
     });
+    // ── THE NULL IMPORT SLOT ──────────────────────────────────────────────
+    //    D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE
+    //
+    // Every reference to an extern DATA import is lowered GOT-INDIRECT: the code
+    // materializes the address of a POINTER SLOT and DEREFERENCES it, because
+    // the object's address is a load-time fact (`dataImportBinding:
+    // "got-indirect"`, declared by every image format). So "this reference
+    // resolves to nothing" is not spelled by giving the SYMBOL address 0 — it is
+    // spelled by giving it a slot whose CONTENT is 0. The distinction is the
+    // whole of it, and it is not academic:
+    // ✔MEASURED, binding the symbol itself at address 0 instead: `dsscp` emitted
+    // an ELF exec that linked clean and then SEGFAULTED (rc 139), because
+    // `lea -0x401026(%rip),%r9` followed by `mov (%r9),%r9` dereferenced address
+    // 0. It was a silent wrong answer that only a RUN could see — the exact
+    // failure mode this row's own trigger warns about one tier up.
+    //
+    // ★ THE REFERENCES SPELL IT THE SAME WAY, which is what makes this the
+    // format-neutral answer rather than a DSS convention. ✔MEASURED: clang for
+    // `x86_64-w64-windows-gnu` emits `.refptr.ea` — a pointer slot in `.rdata` —
+    // and loads through it; ld leaves the GOT slot of an unresolved weak symbol
+    // zero on ELF. Both make `&ea` a LOAD that yields 0, never an address of 0.
+    //
+    // ★★ A SYNTHESIZED `AssembledData` ITEM RATHER THAN A NEW MODULE FIELD, and
+    // the simplification is the argument. The slot IS a data item — pointer-sized,
+    // pointer-aligned, all zero — so declaring it as one gives it a compound-index
+    // entry, a section, a VA from `addDataSymbolVas` and a relocation target in
+    // every walker with NOT ONE walker-side change. The alternative tried first
+    // (a second symbol list plus a shared `addNullBoundSymbolVas` called from five
+    // image arms) needed a substrate field, a new `SymbolKind`, and a per-arm call
+    // that a sixth arm could later be written without.
+    //
+    // ⓘ `Rodata`, not `Bss`: the slot is a CONSTANT null pointer that nothing
+    // writes, and the read-only section says so — a stray write faults instead of
+    // silently making a null weak symbol non-null. It carries no relocation, so
+    // it is not `RelRoConst` either.
+    for (SymbolId const id : nullBound) {
+        AssembledData slot;
+        slot.symbol    = id;
+        slot.section   = DataSectionKind::Rodata;
+        slot.bytes.assign(static_cast<std::size_t>(pointerBytes), 0u);
+        slot.alignment = Alignment::ofRuntimePow2(
+            static_cast<std::uint32_t>(pointerBytes));
+        filtered.dataItems.push_back(std::move(slot));
+    }
     return false;
+}
+
+// ── THE OBJECT-CARRIED DATA-IMPORT SLOT ───────────────────────────────
+//    D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET
+//
+// `dataImportBinding: "got-indirect"` declares that an extern DATA object's
+// address is LOADED from a pointer slot rather than computed, and MIR→LIR
+// emits exactly that pair for every such reference (`lowerGlobalAddr`'s
+// c117 arm: lea-of-slot + a 64-bit deref). On an IMAGE the slot is minted
+// by the import walker — the PE IAT entry, the ELF `.got`, the Mach-O
+// `__got`. A RELOCATABLE artifact has NO import walker, so the SAME
+// declared model can only be realized by the object CARRYING the slot,
+// which is what this does: a pointer-sized zero item holding one absolute
+// relocation against the imported name, published under the format's
+// declared prefix, with the code's own PC-RELATIVE references retargeted
+// from the import to the slot.
+//
+// ★★ WHY A RELOCATABLE FORMAT DECLARES THE BINDING AT ALL, WHICH IS THE
+// WHOLE POINT AND WAS MEASURED BEFORE IT WAS WRITTEN. A PC-relative rel32
+// cannot reach an ABSOLUTE target, and a COFF weak external's fallback IS
+// an absolute symbol of value 0 — that is how "resolved to nothing" is
+// spelled. ✔MEASURED 2026-09-02 over a DSS-emitted `pe64-x86_64-windows`
+// object for `extern int ea __attribute__((weak)); ... if (&ea)`, whose
+// `.text` carried `IMAGE_REL_AMD64_REL32 ea`:
+//   * link.exe 14.51 REFUSES it, correctly and twice — `LNK2016: absolute
+//     symbol 'ea' used as target of REL32 relocation`, then LNK1165. No
+//     image at all.
+//   * mingw GNU ld 13.2.0 links it rc 0 WITH NO DIAGNOSTIC, having
+//     TRUNCATED the out-of-range displacement: the emitted image reads
+//     `lea -0x4000102c(%rip)` = 0x100000000 for an address that must be 0,
+//     so `if (&ea)` takes the WRONG arm. On this fixture that arm then
+//     dereferences and the program dies rc 139; a fixture that only TESTS
+//     the pointer gets a wrong answer and a clean exit.
+//   * lld-link links it silently too, same wrong address, rc 139.
+//   * The ELF twin is green, and so is the DSS-linked PE exec (rc 42) —
+//     the defect is invisible from inside the pipeline and appears only
+//     when a FOREIGN linker consumes the object.
+// ★ WHY ELF IS GREEN, because "so fix ELF too" is the obvious wrong
+// conclusion and its relocations are DELIBERATELY untouched: `ld` resolves
+// an unresolved weak to address 0 there as well, but a non-PIE ELF exec is
+// based at 0x400000, so `0 - (site+4)` is a displacement a signed 32-bit
+// field HOLDS. ✔MEASURED: the same source through `elf64-x86_64-linux`
+// still emits `R_X86_64_PC32 ea - 4` and `gcc -no-pie` links it to a binary
+// that returns 42, or 7 once a definition is added. PE's 0x140000000 base
+// is what puts absolute 0 out of reach; the format, not the construct, is
+// what differs.
+// ⇒ the object is below the union: an object DSS emits must link where
+// clang's does. ✔MEASURED what the references emit, each probed
+// separately, with `weak` as the ONLY variable on one triple:
+//   * clang 18.1.3 `--target=x86_64-pc-windows-msvc` — STRONG `&ea` is a
+//     direct `REL32 ea`; WEAK `&ea` is `REL32 .refptr.ea` plus a
+//     `.rdata$.refptr.ea` COMDAT holding `ADDR64 ea`.
+//   * clang 18.1.3 `--target=x86_64-w64-windows-gnu` and mingw-w64 gcc
+//     13.2.0 — `.refptr.<name>` for EVERY PE data extern, weak or not.
+//   * cl.exe 19.51 — direct REL32 (it has no source spelling for a weak
+//     import, so it never meets the shape).
+// The carried slot is therefore the reference shape, and DSS takes the
+// mingw/clang-mingw arm — unconditional for this format's data imports
+// rather than weak-only — for a reason beyond weakness: `ld` refuses a
+// direct rel32 against a symbol it must AUTO-IMPORT from a DLL, so an
+// unconditional slot is what makes a DSS `.obj` linkable by all three.
+//
+// ★★ THE FUNCTION HALF IS NOW CLOSED TOO, AND THE PARAGRAPH THAT STOOD HERE
+// SAYING IT COULD NOT BE — "by the time the linker sees the module, `&maybe`
+// and `maybe()` are BOTH a pc-relative relocation against the same symbol with
+// no field telling them apart" — WAS TRUE AND IS STILL TRUE. It is exactly why
+// the answer is that BOTH references want the slot, so this tier never has to
+// tell them apart. D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET
+// (P54) ✔MEASURED that link.exe 14.51 answers LNK2016 TWICE on the DSS object
+// for `extern int maybe(void) __attribute__((weak)); if (maybe) maybe();` —
+// once for the ADDRESS lea and once for the direct CALL — and that it refuses
+// mingw-w64 gcc 13.2.0's own object for the same reason (gcc routes the address
+// through `.refptr.maybe` but keeps a direct `REL32 maybe` CALL; `ld` links that
+// and TRUNCATES the call displacement to 0x100000000, harmless only because the
+// null guard jumps over it). clang 18.1.3 routes BOTH references through
+// `.refptr.maybe` on BOTH windows triples, and link.exe links THAT rc 0. So the
+// relocatable pe64 formats now declare `externCallDispatch: "indirect-slot"`:
+// the call site becomes `call *[rip+sym]` (`call_indirect_via_extern`), MIR→LIR's
+// slot arm materializes `&sym` as lea+deref of the same slot, and the two
+// pc-relative references this pass retargets are both slot references by
+// construction. The import scan below is therefore NOT restricted to data.
+//
+// ★★★ AND SINCE P55 IT IS NOT UNCONDITIONAL EITHER —
+// D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT. Every sentence above
+// is about a WEAK import and every one of them still holds; what was wrong was
+// the SCOPE, because the fix above was declared for all imports while the defect
+// it closes exists only where the reference may resolve to nothing. ✔MEASURED
+// 2026-09-02 on a DSS `.obj` for the STRONG twin of the fixture above — `weak`
+// the only variable — that it carried the identical `FF 15` + `.refptr.maybe`
+// COMDAT, and that all three references emit a plain direct `REL32 maybe` with
+// NO `.refptr` section there: clang 18.1.3 on BOTH windows triples and
+// mingw-w64 gcc 13.2.0. So the two relocatable pe64 documents now also declare
+// `indirectSlotBindings: ["weak"]` and the scan below asks the SCHEMA, per
+// import, through `externRefTakesImportSlot`.
+//
+// ⓘ ONLY PC-RELATIVE references are retargeted. A STATIC-DATA initializer
+// (`int *p = &ea;`) reaches the object as an ABSOLUTE 64-bit relocation in
+// a data item, which represents an absolute-0 target perfectly well and is
+// already correct; pointing it at the slot would store the SLOT'S address
+// where the program asked for the object's. The direction of the mistake
+// is the same one indirection level this whole row is about, so the
+// predicate is stated positively rather than by excluding data items.
+[[nodiscard]] bool materializeObjectImportSlots(
+    AssembledModule const&    m,
+    AssembledModule&          withSlots,
+    ObjectFormatSchema const& fmt,
+    TargetSchema const&       targetSchema,
+    std::uint64_t             pointerBytes,
+    DiagnosticReporter&       reporter) {
+    // The gate is two DECLARED facts and one ENGINE fact, never a format
+    // identity: an artifact with no import walker (`!isImageFlavor()`) whose
+    // format nonetheless declares that data imports bind through a slot.
+    if (fmt.isImageFlavor()) return true;
+    // THE THIRD PAIRING RULE (P54,
+    // D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET). A
+    // RELOCATABLE format that declares `externCallDispatch: "indirect-slot"`
+    // has told MIR→LIR to emit `call *[rip+sym]` for every extern call and to
+    // materialize `&sym` by dereferencing the same place. Nothing else in a
+    // relocatable artifact can put a pointer there — it has no import walker
+    // — so without `objectImportSlot` every one of those references would
+    // dereference the import's OWN address. That is a SILENT wrong call
+    // target, so it is refused at the gate rather than emitted. Stated
+    // against `objectImportSlot` alone and not against `dataImportBinding`:
+    // the two arms below already own that pair, and this one is about who
+    // publishes the slot the dispatch presumes.
+    if (fmt.externCallDispatch() == ExternCallDispatch::IndirectSlot
+        && !fmt.objectImportSlot().has_value()) {
+        report(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+               DiagnosticSeverity::Error,
+               "linker: object format '" + std::string{fmt.name()}
+                   + "' is RELOCATABLE and declares 'externCallDispatch: "
+                     "indirect-slot', but no 'objectImportSlot' spelling. "
+                     "That dispatch makes every extern call a DEREFERENCE of "
+                     "a pointer slot, and a relocatable artifact has no "
+                     "import walker to mint one, so the object must carry it. "
+                     "Without the slot each call would read the import's own "
+                     "address as if it were a pointer. Declare "
+                     "'objectImportSlot', or declare 'direct-plt' dispatch. "
+                     "D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET.");
+        return false;
+    }
+    if (fmt.dataImportBinding() != DataImportBinding::GotIndirect) {
+        // The other half of the pairing rule: a format that declares the
+        // SPELLING without the BINDING has published a slot name nothing
+        // will ever mint. That is config that reads as a capability and is
+        // not one — the shape D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE
+        // records — so it is refused rather than ignored.
+        if (fmt.objectImportSlot().has_value()) {
+            report(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                   DiagnosticSeverity::Error,
+                   "linker: object format '" + std::string{fmt.name()}
+                       + "' declares 'objectImportSlot' but no "
+                         "'dataImportBinding' — the slot spelling describes "
+                         "how an extern DATA import's address is CARRIED, and "
+                         "with no declared binding no reference is ever routed "
+                         "through it. Declare 'dataImportBinding' too, or "
+                         "remove the slot block. "
+                         "D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET.");
+            return false;
+        }
+        return true;
+    }
+    if (!fmt.objectImportSlot().has_value()) {
+        report(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+               DiagnosticSeverity::Error,
+               "linker: object format '" + std::string{fmt.name()}
+                   + "' is RELOCATABLE and declares 'dataImportBinding: "
+                     "got-indirect', but no 'objectImportSlot' spelling. A "
+                     "relocatable artifact has no import walker, so the ONLY "
+                     "way to realize a got-indirect binding is for the object "
+                     "to carry the slot itself — and the code MIR->LIR emitted "
+                     "already dereferences one. Emitting it without the slot "
+                     "would leave every extern data reference loading through "
+                     "the import's own address. Declare 'objectImportSlot'. "
+                     "D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET.");
+        return false;
+    }
+
+    // WHICH imports need a slot: imports reached by at least one PC-RELATIVE
+    // code relocation. An import reached only from a data initializer, or not
+    // reached at all, gets nothing — an unreferenced COMDAT would be dead
+    // weight the final linker has to discard.
+    // ⚠⚠ WHICH KINDS, AND THE PREDICATE IS THE SAME ONE MIR→LIR USED — THIS
+    // PASS MAY ONLY RETARGET A REFERENCE THE CODE ACTUALLY DEREFERENCES.
+    // `slotIndirectAddrSymbols_` in `mir_to_lir.cpp` is populated by exactly
+    // these two declared facts, and the two tiers must agree symbol for
+    // symbol or the object is miscompiled in one direction or the other:
+    //   * DATA import + `dataImportBinding: got-indirect` — c117's lea+deref;
+    //   * an import whose BINDING the format routes through the slot
+    //     (`externCallDispatch: indirect-slot`, scoped by
+    //     `indirectSlotBindings`) — its call site is `call *[rip+sym]` and
+    //     `&sym` is a lea+deref of the same place. `externRefTakesImportSlot`
+    //     on the schema is the ONE owner of that question; this pass and
+    //     MIR→LIR both read it rather than each deriving it.
+    // ★ A FUNCTION import under `direct-plt` MUST NOT BE RETARGETED, and that
+    // is the whole reason this is a condition rather than "every import": the
+    // call site there is a plain `call rel32`, so pointing it at the slot
+    // would make the program CALL the pointer bytes. That was the discriminator
+    // the DATA half shipped as `if (ext.isData)`; widening it to every import
+    // unconditionally would have reintroduced it one dispatch over.
+    // ⚠⚠ THE SECOND BULLET USED TO READ "ANY import + `externCallDispatch:
+    // indirect-slot`", AND THE PARAGRAPH BELOW IT SAID THE NARROWING TO WEAK
+    // IMPORTS WAS UNSAFE: "Under `indirect-slot` a STRONG import's call is a
+    // slot deref too, so a weak-only rule would leave it dereferencing the
+    // import's own address." That was TRUE OF THE CODE THAT WROTE IT and is
+    // false now, and the difference is one line in MIR→LIR:
+    // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT moved the CALL
+    // SITE's shape off the format-level dispatch and onto the SAME per-symbol
+    // set the address arm already used, so a strong import's call is a plain
+    // `E8` again and there is no deref left to be wrong. The old sentence
+    // described a real hazard of a HALF narrowing — narrow the slot pass but
+    // leave the call shape format-wide — and it is preserved because that half
+    // is still exactly as broken as it says.
+    // ⓘ THE DATA ARM IS DELIBERATELY NOT NARROWED. `dataImportBinding`'s
+    // unconditional slot has its own measured reason recorded in the format
+    // document — `ld` refuses a direct rel32 against a symbol it must
+    // AUTO-IMPORT from a DLL — which has nothing to do with weakness, so the
+    // binding axis does not govern it.
+    std::unordered_set<std::uint32_t> slotImports;
+    for (auto const& ext : m.externImports) {
+        if (ext.isData || fmt.externRefTakesImportSlot(ext.binding)) {
+            slotImports.insert(ext.symbol.v);
+        }
+    }
+    if (slotImports.empty()) return true;
+    // `pcRelative` is read from the TARGET's own relocation table, never
+    // inferred from a kind constant — the agnosticism rule the absolute-
+    // pointer lookup below follows for the same reason.
+    auto const isPcRelative = [&](RelocationKind k) {
+        auto const* tri = targetSchema.relocationInfo(k);
+        return tri != nullptr && tri->pcRelative;
+    };
+    std::unordered_set<std::uint32_t> needSlot;
+    for (auto const& fn : m.functions) {
+        for (auto const& rel : fn.relocations) {
+            if (slotImports.contains(rel.target.v) && isPcRelative(rel.kind)) {
+                needSlot.insert(rel.target.v);
+            }
+        }
+    }
+    if (needSlot.empty()) return true;
+
+    // The slot's own fixup, found by FORMULA (`widthBytes == 8 &&
+    // !pcRelative`) exactly as `mergeModules` finds the thunk slot's — never
+    // by an "abs64" name or a kind constant.
+    std::optional<RelocationKind> absPtrKind;
+    for (auto const& r : targetSchema.relocations()) {
+        if (r.widthBytes == 8 && !r.pcRelative) { absPtrKind = r.kind; break; }
+    }
+    if (!absPtrKind.has_value()) {
+        report(reporter, DiagnosticCode::K_AbsolutePointerRelocMissing,
+               DiagnosticSeverity::Error,
+               "linker: target schema '" + std::string{targetSchema.name()}
+                   + "' declares no absolute 64-bit pointer relocation "
+                     "(widthBytes == 8 && !pcRelative), so the object-carried "
+                     "data-import slot format '" + std::string{fmt.name()}
+                   + "' asks for cannot be filled by the final linker. A slot "
+                     "with no fixup is a permanent null pointer. "
+                     "D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET.");
+        return false;
+    }
+
+    withSlots = m;   // copy, then append the slots and retarget the references
+    // Fresh SymbolIds are minted PAST every id already in the module, by the
+    // one shared scan `injectEntryTrampoline` uses — a mint that only looked
+    // at `functions` would collide with a string-literal data item and
+    // surface as K_DuplicateDataSymbol in a walker, away from this site.
+    std::uint32_t maxV = maxExistingSymbolIdV(withSlots);
+    std::unordered_map<std::uint32_t, SymbolId> slotBySymbol;
+    // Deterministic order: the module's OWN import order, not a hash set's.
+    // Two runs over one module must mint the same ids and emit the same
+    // bytes, and an unordered_set iteration would make the object's symbol
+    // table depend on the allocator.
+    for (auto const& ext : withSlots.externImports) {
+        if (!needSlot.contains(ext.symbol.v)) continue;
+        if (maxV == std::numeric_limits<std::uint32_t>::max()) {
+            report(reporter, DiagnosticCode::K_SymbolUndefined,
+                   DiagnosticSeverity::Error,
+                   "linker: SymbolId space exhausted minting the "
+                   "object-carried data-import slot for '" + ext.mangledName
+                       + "'.");
+            return false;
+        }
+        SymbolId const slotSym{++maxV};
+        slotBySymbol.emplace(ext.symbol.v, slotSym);
+
+        AssembledData slot;
+        slot.symbol  = slotSym;
+        // `RelRoConst`, not `Rodata`: the slot CARRIES a relocation, and the
+        // shared data-section substrate refuses a reloc-bearing rodata item
+        // (deliberately — a rodata fixup is the D-LK-RELRO-CONST-DATA class).
+        // `relro` is the section kind whose whole definition is "read-only
+        // data that the link must still fix up", which is what this is, and
+        // on PE it lands in the same `.rdata` the references place `.refptr`
+        // in (the format's relro row names it).
+        slot.section = DataSectionKind::RelRoConst;
+        slot.bytes.assign(static_cast<std::size_t>(pointerBytes), 0u);
+        slot.alignment = Alignment::ofRuntimePow2(
+            static_cast<std::uint32_t>(pointerBytes));
+        Relocation fill;
+        fill.kind   = *absPtrKind;
+        fill.offset = 0;
+        fill.target = ext.symbol;
+        fill.addend = 0;
+        slot.relocations.push_back(fill);
+        withSlots.dataItems.push_back(std::move(slot));
+
+        // WEAK, so the PE writer routes it through the format's declared
+        // weak-definition dialect — a COMDAT select-any section keyed on the
+        // slot's own name. That is not a PE detail leaking here: it is the
+        // SAME `SymbolBinding::Weak` every producer uses for "several
+        // translation units may define this, keep one", which is exactly the
+        // slot's rule, and each format walker already maps it to its own
+        // vocabulary. Without it, two DSS objects importing one name would
+        // both define the slot and the final linker would reject the pair.
+        ModuleSymbol sym;
+        sym.symbol     = slotSym;
+        sym.name       = fmt.objectImportSlot()->symbolPrefix + ext.mangledName;
+        sym.binding    = SymbolBinding::Weak;
+        sym.visibility = SymbolVisibility::Default;
+        withSlots.symbols.push_back(std::move(sym));
+    }
+    // Retarget the code references. The predicate is re-tested rather than a
+    // recorded site list being replayed, because the copy above renumbered
+    // nothing — the relocations are the same objects at the same indices, and
+    // one predicate with one owner cannot drift from itself.
+    for (auto& fn : withSlots.functions) {
+        for (auto& rel : fn.relocations) {
+            if (!isPcRelative(rel.kind)) continue;
+            auto const it = slotBySymbol.find(rel.target.v);
+            if (it != slotBySymbol.end()) rel.target = it->second;
+        }
+    }
+    return false;   // caller must switch to `withSlots`
 }
 
 // LK11a — the cross-CU symbol merge + resolution, in three steps:
@@ -562,6 +1033,40 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     // The format's extern-call shape decides the reference-resolution mechanism
     // below: an indirect-slot call site needs the deref-able thunk slot; a
     // direct-plt (or undeclared-dispatch) reference binds straight to the def.
+    //
+    // ⚠⚠ THIS USED TO BE ONE FORMAT-WIDE BOOL AND IS NOW ASKED PER REFERENCE —
+    // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT. A format may now
+    // route only SOME bindings through the slot (`indirectSlotBindings`), and
+    // this pass RETARGETS the referencing relocation: minting a thunk slot for
+    // a reference whose call site MIR→LIR emitted as a plain `E8` would point
+    // the direct call at pointer bytes and the program would execute them. The
+    // question is therefore the same per-symbol one `materializeObjectImportSlots`
+    // asks, and it is asked of the REFERENCING CU's own import row — the row
+    // MIR→LIR read when it chose the shape — never of a post-fold binding.
+    // Built ONCE rather than scanned per reference: `resolvedCrossCuRefs` is
+    // O(cross-CU edges) and the import lists are O(imports per CU), so the
+    // obvious nested scan is quadratic in exactly the shape a whole-program
+    // sqlite link produces.
+    std::unordered_map<std::uint64_t, SymbolBinding> importBindingByKey;
+    for (auto const& mod : modules) {
+        for (auto const& e : mod.externImports) {
+            importBindingByKey.emplace(
+                (static_cast<std::uint64_t>(mod.cuId.v) << 32)
+                    | static_cast<std::uint64_t>(e.symbol.v),
+                e.binding);
+        }
+    }
+    auto const referenceBinding =
+        [&](LinkedSymbolKey const& key) -> std::optional<SymbolBinding> {
+        auto const it = importBindingByKey.find(
+            (static_cast<std::uint64_t>(key.cuId.v) << 32)
+                | static_cast<std::uint64_t>(key.symbol.v));
+        if (it == importBindingByKey.end()) return std::nullopt;
+        return it->second;
+    };
+    // Whether ANY reference could want a slot — the guard the abs64-missing
+    // fail-loud below keys on, kept format-wide because it asks "can this
+    // format ever need one", not "does this reference".
     bool const useIndirectSlot =
         objectFormatSchema.externCallDispatch().has_value()
         && externCallUsesIndirectShape(*objectFormatSchema.externCallDispatch());
@@ -712,12 +1217,24 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     //     the indirect call site dereferences it. CONSTRAINT (c154 review): this arm
     //     retargets EVERY reference shape to the slot, which is correct ONLY for
     //     slot-deref-shaped sites (`FF 15` calls / GotIndirect data derefs). An
-    //     ADDRESS-TAKEN cross-CU reference (`lea`-of-extern-fn, an abs64 `&extern_fn`
-    //     data initializer) would receive the SLOT's address — one indirection off.
-    //     Unreachable today (no shipped format declares indirect-slot and no shipped
-    //     route reaches N>1 modules); when the separate-compilation trigger fires
-    //     (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION), retargeting must
-    //     key per-reference-shape or fail loud on a non-call-shaped reference here.
+    //     ADDRESS-TAKEN cross-CU reference (an abs64 `&extern_fn` data initializer)
+    //     would receive the SLOT's address — one indirection off.
+    //     ⚠ THIS PARAGRAPH'S REACHABILITY CLAUSE HAS LOST HALF ITS PREMISE, AND THE
+    //     OTHER HALF NOW CARRIES IT ALONE. It read "unreachable today (no shipped
+    //     format declares indirect-slot and no shipped route reaches N>1 modules)";
+    //     since P54 (D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET)
+    //     the two RELOCATABLE pe formats DO declare `indirect-slot`, so only the
+    //     second clause still holds — ✔MEASURED at this tree: a two-source
+    //     `--target x86_64:pe64-x86_64-windows` build emits ONE object in which the
+    //     sibling's definition is already merged at the MIR tier, so the reference
+    //     never becomes an extern import and `resolvedCrossCuRefs` stays empty.
+    //     ⓘ That same row also REMOVED one of the two wrong shapes this warns about:
+    //     a `lea`-of-extern-fn under `indirect-slot` is now a lea-of-slot + DEREF
+    //     (`slotIndirectAddrSymbols_`), so retargeting it to the slot is CORRECT.
+    //     The abs64 DATA initializer is what is left. When the separate-compilation
+    //     trigger fires (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION),
+    //     retargeting must key per-reference-shape — PC-relative only, exactly as
+    //     `materializeObjectImportSlots` above already does — or fail loud here.
     // Either way the extern import is STRIPPED (the sibling def shadows the library
     // fallback). A real FFI extern (no sibling def, absent from resolvedCrossCuRefs) is
     // untouched — that is FF11's library tier. The definition's merged id is resolvable
@@ -756,7 +1273,21 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             continue;
         }
         std::uint32_t const defId = mergedIdFor(dit->second, ref.definition.symbol);
-        if (useIndirectSlot) {
+        // The reference's OWN binding decides, through the schema's one owner.
+        // A MISS cannot happen — `resolvedCrossCuRefs` is built FROM these
+        // modules' import rows, and the loop above already fails LOUD on the
+        // sibling breach of that same invariant (the definition's CU missing
+        // from the span). It is nevertheless TOTAL rather than assumed away,
+        // and the total answer takes the FORMAT-WIDE arm because that is the
+        // conservative direction here: a slot nothing dereferences is dead
+        // weight the final linker discards, while a missing slot under an
+        // indirect call site is a wrong call target.
+        auto const refBinding = referenceBinding(ref.reference);
+        bool const thisRefUsesSlot =
+            refBinding.has_value()
+                ? objectFormatSchema.externRefTakesImportSlot(*refBinding)
+                : useIndirectSlot;
+        if (thisRefUsesSlot) {
             std::uint32_t const thunkSlotId = nextId++;
             AssembledData slot;
             slot.symbol  = SymbolId{thunkSlotId};
@@ -932,6 +1463,15 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                 // LOAD failure (pe 0xC0000139 / elf exit 127), not a size regression.
                 // Order-INDEPENDENT: whichever CU lands first, the bit is ORed in.
                 kept.isEagerImport = kept.isEagerImport || ext.isEagerImport;
+                // `binding` — STRONGEST WINS, as `ExternImport::binding`'s docblock
+                // in `core/types/extern_import.hpp` mandates and the MIR-tier merge
+                // implements through the SAME `strongerReferenceBinding` owner
+                // (D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE). Keeping the
+                // WEAK row when a sibling CU declared the same import strong would
+                // erase a requirement: the image would link with the symbol absent
+                // and the strong CU's references would read through address 0 — a
+                // silent wrong answer, not a link error. Order-INDEPENDENT.
+                kept.binding = strongerReferenceBinding(kept.binding, ext.binding);
                 // `isData` / `isThreadLocal` — a disagreement is a REAL conflict, and
                 // silently picking either row is the D-LK-EXTERN-DATA-IMPORT
                 // silent-miscompile shape: `isData` decides whether the walker binds
@@ -1239,15 +1779,50 @@ LinkedImage link(std::span<AssembledModule const> modules,
     AssembledModule unboundFilteredStorage;   // populated only when rows drop
     {
         std::size_t const errsBeforeUnbound = reporter.errorCount();
+        // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the null import slot
+        // a resolved-to-nothing WEAK reference gets is POINTER-sized, and the
+        // pointer width is the FORMAT's declared data model — never a hardcoded
+        // 8. `scalarByteSize` is the same owner every other pointer-sized
+        // decision in the tree reads, so an ILP32 format gets a 4-byte slot with
+        // no second rule to keep in step.
+        std::uint64_t const ptrBytes =
+            scalarByteSize(TypeKind::Ptr, objectFormatSchema.dataModel())
+                .value_or(8);
         if (!rejectOrDropUnreferencedExterns(*selectedInput, unboundFilteredStorage,
                                         objectFormatSchema.allowsUndefinedImports(),
-                                        reporter)) {
+                                        ptrBytes, reporter)) {
             selectedInput = &unboundFilteredStorage;
         }
         if (reporter.errorCount() != errsBeforeUnbound) {
             // Undefined symbol(s) reported — not valid emission input.
             image.resolvedFuncCount = 0;
             return image;
+        }
+    }
+    // D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET: give a
+    // RELOCATABLE artifact the data-import slots its format's declared
+    // `dataImportBinding` promises and no import walker exists to mint.
+    // ★ ORDER IS LOAD-BEARING AND RUNS BOTH WAYS. AFTER the reference gate
+    // above, because a slot minted for an import that gate then DROPS is a
+    // COMDAT pointing at nothing; and BEFORE `externImportNames` and the
+    // walker below, because both must see the retargeted relocations. The
+    // gate's own null-slot arm cannot collide with this one: it fires only
+    // when the format REFUSES undefined imports, i.e. on an image, and this
+    // one only when it allows them.
+    AssembledModule slotStorage;   // populated only when slots are minted
+    {
+        std::size_t const errsBeforeSlots = reporter.errorCount();
+        std::uint64_t const ptrBytes =
+            scalarByteSize(TypeKind::Ptr, objectFormatSchema.dataModel())
+                .value_or(8);
+        if (!materializeObjectImportSlots(*selectedInput, slotStorage,
+                                          objectFormatSchema, targetSchema,
+                                          ptrBytes, reporter)) {
+            if (reporter.errorCount() != errsBeforeSlots) {
+                image.resolvedFuncCount = 0;
+                return image;
+            }
+            selectedInput = &slotStorage;
         }
     }
     AssembledModule const& inputModule = *selectedInput;
@@ -1310,6 +1885,16 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // exec-only). A relocatable writer that DID bind data as code would have
     // to reject or fix it in ITS OWN walker (as elf.cpp does via PC32); this
     // central gate only protects the IMAGE walkers.
+    //
+    // ⓘ ONE isData-DEPENDENT STEP HAS SINCE JOINED THE RELOCATABLE PATH, and
+    // it is NOT the shape this paragraph rules out. `materializeObjectData
+    // ImportSlots` (above) gives a referenced DATA import a pointer slot the
+    // object carries and points the CODE at the slot — an extra indirection,
+    // not a binding: the import stays a faithful undefined symbol and the
+    // FINAL linker still resolves it. It is opt-in per format
+    // (D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET) and
+    // changes nothing for a format that declares no binding, which is every
+    // ELF and Mach-O relocatable flavour.
     if (objectFormatSchema.isImageFlavor()
         && !objectFormatSchema.dataImportBinding().has_value()) {
         for (auto const& ext : inputModule.externImports) {

@@ -132,6 +132,12 @@ dss_add_test(NAME lir/test_lir_asm_memory_output
 dss_add_test(NAME lir/test_lir_apple_stack_arg_packing
              SOURCES test_lir_apple_stack_arg_packing.cpp)
 
+# D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the stacked-argument ALIGNMENT rule
+# (the sibling of the packing pin above — packing says how many bytes a datum
+# owns, this says where its slot may begin).
+dss_add_test(NAME lir/test_lir_long_double_stack_arg_alignment
+             SOURCES test_lir_long_double_stack_arg_alignment.cpp)
+
 # D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES: ONE pass owns
 # every outgoing-argument byte offset. `lowerWideCallArgs` states each stacked
 # aggregate's offset on its carrier and stamps the Call; callconv reads those
@@ -225,3 +231,27 @@ dss_add_test(NAME lir/test_lir_overaligned_local_frame
 # harness fails rather than that the compiler succeeds.
 dss_add_test(NAME lir/test_lir_fixture_vacuity_guard
              SOURCES test_lir_fixture_vacuity_guard.cpp)
+
+# D-LIR-COPY-COALESCING-ASKS-THE-REGISTERS-WIDTH-NOT-THE-VALUES: the copy
+# admission test compared the copy's stated width against the widest register
+# its CLASS declares, which no FP copy on any shipped target could ever satisfy
+# (the class move carries the width-default flags, `xmm`/`v` are 16 bytes) — so
+# the whole FP file was vetoed and the identity copies the allocator left behind
+# reached the emitted stream, `lir_peephole` R1 being unable to prove them
+# no-ops for the same reason. The pins are the PREMISE (the file really is wider
+# than the copies), the POSITIVE through the real lowering on BOTH shipped
+# targets, and the two-sided NEGATIVE over the published value-width bound —
+# hand-built, because whether an unproved copy is dropped must not depend on
+# which register the linear scan happened to pick.
+dss_add_test(NAME lir/test_lir_copy_coalescing_value_width
+             SOURCES test_lir_copy_coalescing_value_width.cpp)
+
+# D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT. The peephole's
+# placement argument rests on "callconv mints exactly ZERO identity copies", and
+# the evidence it carried was a NET across three passes because no dump stage
+# existed between the peephole and callconv. This pins the claim on the pass it
+# names — the census read on BOTH SIDES OF CALLCONV ALONE — plus the one-owner
+# identity between the census and rule R1, and the fixpoint that makes any later
+# residue a refusal rather than a miss.
+dss_add_test(NAME lir/test_lir_identity_copy_stage_attribution
+             SOURCES test_lir_identity_copy_stage_attribution.cpp)

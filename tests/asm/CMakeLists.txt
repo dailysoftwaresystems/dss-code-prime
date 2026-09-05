@@ -243,3 +243,125 @@ target_link_libraries(dss_asm_test_asm_x86_sse_dialect_rows
     PRIVATE nlohmann_json::nlohmann_json)
 target_include_directories(dss_asm_test_asm_x86_sse_dialect_rows
     PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME (the arm64
+# half): the scalar-FP instruction rows that make the `w` constraint's `fpr`
+# register class nameable by a template. Before them the target declared 87
+# opcodes, this dialect spelled 51 rows covering 29, and ALL TWENTY FP/SIMD
+# opcodes were unspelled -- so `"w"` could be bound and never used.
+# The pins read the WHOLE 32-bit word, because on this ISA the single/double
+# pair is ftype[23:22] of ONE word and NO dialect row declares a width: the
+# register VIEW in the template is the only thing electing between them, so a
+# wrong-ftype variant still assembles and still runs. Declaring these rows is
+# what exposed that `fmov`'s width-32 and width-16 arms both carried the
+# width-64 word (a byte divergence from gas 2.42 AND clang 18.1.3, corrected in
+# the same cycle); `FmovSingleIsNotTheDoubleWord` is that ratchet. Also carries
+# the near-miss set that must REFUSE rather than bind to a neighbour -- the
+# conversions especially, where a width-less row would silently encode FCVTZS
+# Xd,Sn for `fcvtzs w0, s1` -- and a standing predicate that EVERY
+# constraint-bindable register class has some instruction row able to name it,
+# which is the row's own defect class asked as a question rather than retold.
+# WARNING ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL -- one removes rows from
+# the SHIPPED dialect document, the other an encoding variant from the SHIPPED
+# target -- so it MUST run through ctest: dss_add_test sets DSS_CONFIG_ROOT,
+# while a bare .exe walks the cwd and would read whichever tree the shell
+# stands in (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+dss_add_test(NAME asm/test_asm_arm64_fp_dialect_rows
+             SOURCES test_asm_arm64_fp_dialect_rows.cpp)
+target_link_libraries(dss_asm_test_asm_arm64_fp_dialect_rows
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_arm64_fp_dialect_rows
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# The LAST three gaps of the same row, closed in cycle P54 (lane el): the
+# register-CLASS election axis (the cross-file `fmov` family and the FP memory
+# forms), the DESTINATION-WIDTH axis (the whole conversion family, whose
+# measured hazard was `fcvtzs %w0, %s1` silently emitting the X form), and the
+# lane-ARRANGEMENT grammar (`cnt v0.8b` / `addv b0, v1.8b`). Every expected word
+# is byte-verified against GNU as 2.42 AND clang 18.1.3 separately.
+# WARNING ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL -- three over the SHIPPED
+# target (a deleted opcode, deleted `destWidth` declarations, a deleted result
+# bank) and one over the SHIPPED dialect (the deleted arrangement table) -- so
+# it MUST run through ctest: dss_add_test sets DSS_CONFIG_ROOT, while a bare
+# .exe walks the cwd and would read whichever tree the shell stands in
+# (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE). Measured again this
+# cycle from the other side: a CLI probe run from the repo root while the edits
+# sat in a lane worktree silently answered about the MAIN tree's config.
+dss_add_test(NAME asm/test_asm_arm64_conversion_dialect_rows
+             SOURCES test_asm_arm64_conversion_dialect_rows.cpp)
+target_link_libraries(dss_asm_test_asm_arm64_conversion_dialect_rows
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_arm64_conversion_dialect_rows
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# D-ASM-ARM64-GAS-SPELLS-NO-ROUNDING-MODE-OR-VECTOR-MOVE (cycle P54, lane av):
+# the REST of the scalar floating-point vocabulary — the eight FP->integer
+# conversions that name an explicit ROUNDING MODE, the seven round-to-integral
+# forms, the 1-/2-/3-source arithmetic, the signalling compare, and the SIMD
+# register move (`mov Vd.16b, Vn.16b`, which is the ORR alias). 28 spellings,
+# 72 encodings, every word measured against GNU as 2.42 AND clang 18.1.3
+# separately with zero disagreements.
+# The pins read the WHOLE 32-bit word, because the rounding mode is `rmode`
+# [16:15] and the float width is `ftype` [23:22] of the SAME word: a
+# mis-bound mnemonic still assembles, still runs, and returns a plausible
+# number — the silent-miscompile class this row exists to refuse. Beside the
+# equality pins sit the negative form (no rounding mode may ever emit FCVTZS's
+# word), the distinctness of the seven rint modes, the `fmax`/`fmaxnm` split
+# that is only visible on NaN, the `Ra` field placement of the FMA addend, and
+# the standing boundary in BOTH directions — what shipped, and what stays
+# refused because it needs an operand form this dialect does not model or
+# because both references refuse it at the default -march.
+# WARNING ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL -- two over the SHIPPED
+# dialect (deleted rows) and two over the SHIPPED target (a deleted opcode, a
+# deleted wire) -- so it MUST run through ctest: dss_add_test sets
+# DSS_CONFIG_ROOT, while a bare .exe walks the cwd and would read whichever
+# tree the shell stands in (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+dss_add_test(NAME asm/test_asm_arm64_rounding_dialect_rows
+             SOURCES test_asm_arm64_rounding_dialect_rows.cpp)
+target_link_libraries(dss_asm_test_asm_arm64_rounding_dialect_rows
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_arm64_rounding_dialect_rows
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# D-TARGET-ARM64-HALF-BYTE-QUAD-MEMORY-FORMS-UNDECLARED (cycle P55, lane lq):
+# the H, B and Q widths of the four scalar SIMD&FP memory opcodes, plus the
+# `q0..q31` ALIAS spellings the Q half needs to be nameable at all. Byte pins at
+# two (Rt,Rn) placements each beside the S/D controls, the near-miss immediate
+# FENCE (one byte offset encodes FIVE different imm12 fields across the five
+# widths — the silent-wrong-answer risk in this family), a REMOVE-direction
+# mutant per half with a CONTROL named by name, and the double-count negative
+# SYNTHESIZED: a convention naming the alias spelling must be REFUSED AT LOAD.
+# WARNING ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL -- both over the SHIPPED
+# target (deleted width arms, deleted alias lists) -- so it MUST run through
+# ctest: dss_add_test sets DSS_CONFIG_ROOT, while a bare .exe walks the cwd and
+# would read whichever tree the shell stands in
+# (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+dss_add_test(NAME asm/test_asm_arm64_memory_dialect_rows
+             SOURCES test_asm_arm64_memory_dialect_rows.cpp)
+target_link_libraries(dss_asm_test_asm_arm64_memory_dialect_rows
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_arm64_memory_dialect_rows
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]
+# (cycle P55, lane sp): AArch64 register field 31 names the STACK POINTER in
+# some instruction forms and the ZERO REGISTER in others, and `sp`/`xzr` (and
+# `wsp`/`wzr`) are two rows of `registers[]` at that one number. Byte pins for
+# every SP-naming form both references assemble, at more than one register
+# placement each; the ZERO-register spellings pinned by name as CONTROLS (a fix
+# that routed everything through the ADD form would pass a positive-only
+# fixture and break the zero register instead); the seventeen spellings BOTH
+# references REFUSE, which DSS accepted at the P55 base while emitting a
+# plausible instruction naming the other register; the load-time rules that make
+# a role-less collision unsayable; and five REMOVE-direction mutants, each with
+# its controls printed BY NAME.
+# WARNING ITS RED-ON-DISABLE MUTANTS ARE CONFIG-LEVEL -- over the SHIPPED target
+# AND the SHIPPED dialect -- so it MUST run through ctest: dss_add_test sets
+# DSS_CONFIG_ROOT, while a bare .exe walks the cwd and would read whichever tree
+# the shell stands in (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+dss_add_test(NAME asm/test_asm_arm64_shared_encoding_31
+             SOURCES test_asm_arm64_shared_encoding_31.cpp)
+target_link_libraries(dss_asm_test_asm_arm64_shared_encoding_31
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_arm64_shared_encoding_31
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)

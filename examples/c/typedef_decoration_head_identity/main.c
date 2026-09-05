@@ -69,9 +69,17 @@ typedef int unused;
  * AND THE REASON IS NOT COSMETIC. DSS refuses `__attribute__((aligned(N)))` on
  * a TYPEDEF with `S_AlignasInvalidContext` — "the alias resolves to the same
  * type as its aliasee" — which is a SEPARATE, pre-existing, deliberate refusal
- * carried by its own row ([[D-CSUBSET-ALIGNAS-TYPEDEF-PARAM-PARSE]], ⏳ gated:
- * C11/C23 6.7.5p2 makes an alignment specifier on a typedef a constraint
- * violation). ✔MEASURED through the shipped CLI on this very file: with
+ * carried by its own row ([[D-CSUBSET-ALIGNAS-TYPEDEF-PARAM-PARSE]] — ⚠ P58,
+ * 2026-09-03: that row is now ✅ CLOSED and is NO LONGER GATED, so the "⏳ gated"
+ * this sentence used to carry is retired, and the clause number it carried was
+ * wrong: the alignment specifier is C11 6.7.5p2 but **C23 §6.7.6p2**, C23's 6.7.5
+ * being *Function specifiers*. What is UNCHANGED — and is the half this file
+ * actually leans on — is the refusal itself: an alignment specifier on a typedef
+ * is a constraint violation, and gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0
+ * AND MSVC 19.51 all refuse it, ✔MEASURED 2026-09-03 each probed separately. P58
+ * closed the row by making the ISO `typedef alignas(16) int T;` spelling draw the
+ * same `S_AlignasInvalidContext` instead of a bare parse error; it did not soften
+ * anything this file depends on). ✔MEASURED through the shipped CLI on this very file: with
  * `aligned(16)` the example does not COMPILE, so it could witness nothing at
  * all. `may_alias` and `unused` have no layout sink, so the only question this
  * file asks is the one it is for — does the decoration's NAME displace the

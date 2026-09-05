@@ -90,14 +90,40 @@ TEST(CharDecode, OctalEscapeConsumesAtMostThreeDigitsNoMisSplit) {
     EXPECT_EQ(*r, std::string("\nS4", 3));
 }
 
-TEST(CharDecode, OctalEscapeOutOfRangeFailsLoud) {
-    // C 6.4.4.4p9: an octal escape past the unsigned-char range (\400..\777,
-    // i.e. > 255) is a constraint violation — fail loud, NEVER silently masked.
-    // RED-ON-DISABLE for the `if (v > 0xFF) return false;` guard: restore the
-    // old `v & 0xFF` and `\400` decodes to 0 → has_value() → this fails.
-    EXPECT_FALSE(decodeStringLiteralBody("\\400").has_value());   // octal 256
-    EXPECT_FALSE(decodeStringLiteralBody("\\777").has_value());   // octal 511
-    auto ok = decodeStringLiteralBody("\\377");                   // largest in range
+TEST(CharDecode, OctalEscapeOutOfRangeFailsLoudForAByteElement) {
+    // ⏳ RESTATED, NOT RETIRED (P55). The CLAIM is unchanged and still true —
+    // C 6.4.4.4p9, an octal escape past the unsigned-char range is a constraint
+    // violation and must fail loud, never be silently masked. What moved is WHO
+    // enforces it. It used to be `if (v > 0xFF)` inside the decoder, and that was
+    // wrong in the other direction: the decoder does not know the element, so it
+    // also refused `u"\777"`, which all four references assemble into one 0x1FF
+    // char16_t unit. The bound belongs to the ELEMENT, so the check is now
+    // `firstEscapeValueTooWide` and the decoder merely records the value.
+    //
+    // RED-ON-DISABLE, REMOVE DIRECTION: delete the `firstEscapeValueTooWide` call
+    // from `decodeCharLiteralBody` (or the narrow-run call in `lowerStringLiteral`)
+    // and `\400` comes back as a silent 0x00 — the first two arms go green-to-red.
+    std::string out;
+    EscapeDecodeOutcome oc256 = decodeEscapedBytes("\\400", out);
+    ASSERT_TRUE(oc256.ok()) << "the decoder records the value; it does not judge it";
+    ASSERT_EQ(oc256.escapeUnits.size(), 1u);
+    EXPECT_EQ(oc256.escapeUnits[0].value, 0400u);
+    EXPECT_TRUE(firstEscapeValueTooWide(oc256, 8).has_value())
+        << "octal 256 does not fit a byte element — the narrow path must refuse";
+
+    out.clear();
+    EscapeDecodeOutcome oc511 = decodeEscapedBytes("\\777", out);
+    ASSERT_TRUE(oc511.ok());
+    EXPECT_TRUE(firstEscapeValueTooWide(oc511, 8).has_value());
+    // ★ AND THE HALF THE OLD GUARD GOT WRONG: 0x1FF is an ordinary char16_t unit.
+    EXPECT_FALSE(firstEscapeValueTooWide(oc511, 16).has_value())
+        << "u\"\\777\" is one 0x1FF unit on gcc, clang, mingw-w64 and MSVC alike";
+
+    // The narrow ENTRY POINTS still refuse both, which is what a caller sees.
+    EXPECT_FALSE(decodeCharLiteralBody("\\400").has_value());
+    EXPECT_FALSE(decodeCharLiteralBody("\\777").has_value());
+
+    auto ok = decodeStringLiteralBody("\\377");                   // largest in a byte
     ASSERT_TRUE(ok.has_value());
     EXPECT_EQ(*ok, std::string("\xFF", 1));
 }
@@ -223,9 +249,130 @@ TEST(CharDecode, UcnFailureReportsInvalidUniversalName) {
     EXPECT_EQ(decodeEscapedBytes("\\q", out).error, EscapeDecodeError::Malformed);
 }
 
+// ── D-CSUBSET-NARROW-HEX-ESCAPE-TRUNCATED-TO-TWO-DIGITS ──────────────────────
+//
+// Every expectation below is a MEASURED reference answer, not a reading of the
+// standard: each literal was compiled AND RUN by gcc 13.3.0, clang 18.1.3,
+// mingw-w64 gcc 13.2.0 and MSVC 19.51 on 2026-09-02 with its emitted units read
+// back (scratchpad/p55/we/reference-matrix.json).
+
+TEST(CharDecode, HexEscapeConsumesEveryFollowingHexDigit) {
+    // ★ THE DEFECT, PINNED FROM THE DIRECTION IT FAILED. The old decoder took at
+    // most TWO hex digits, so `\x041` became 0x04 followed by the CHARACTER '1' —
+    // three bytes where all four references produce one. C 6.4.4.4p7 gives `\x` an
+    // unbounded digit run.
+    std::string out;
+    EscapeDecodeOutcome oc = decodeEscapedBytes("\\x041", out);
+    EXPECT_TRUE(oc.ok());
+    EXPECT_EQ(out, std::string(1, static_cast<char>(0x41)))
+        << "\\x041 is ONE byte 0x41 — gcc/clang/mingw/MSVC unanimous";
+    ASSERT_EQ(oc.escapeUnits.size(), 1u);
+    EXPECT_EQ(oc.escapeUnits[0].value, 0x41u);
+    EXPECT_TRUE(oc.escapeUnits[0].hex);
+
+    // Leading zeros are free — they must not count toward the 64-bit ceiling.
+    out.clear();
+    oc = decodeEscapedBytes("\\x0000000000041", out);
+    EXPECT_TRUE(oc.ok());
+    EXPECT_EQ(out, std::string(1, static_cast<char>(0x41)))
+        << "13 digits of which one is significant is still 0x41";
+
+    // ★ THE SHARPEST CASE: `b` IS a hex digit, so `a\xFFb` is 'a' then the ONE
+    // escape 0xFFB. DSS used to emit 61 FF 62 — matching no reference at all.
+    out.clear();
+    oc = decodeEscapedBytes("a\\xFFb", out);
+    EXPECT_TRUE(oc.ok());
+    ASSERT_EQ(oc.escapeUnits.size(), 1u);
+    EXPECT_EQ(oc.escapeUnits[0].value, 0xFFBu)
+        << "the trailing 'b' is a hex DIGIT, not a letter";
+    EXPECT_EQ(oc.escapeUnits[0].byteOffset, 1u) << "offset is past the leading 'a'";
+
+    // A non-hex neighbour DOES terminate the escape: `a\xFFz` is three bytes.
+    out.clear();
+    oc = decodeEscapedBytes("a\\xFFz", out);
+    EXPECT_TRUE(oc.ok());
+    EXPECT_EQ(out, std::string({'a', static_cast<char>(0xFF), 'z'}));
+
+    // A `\x` with NO digit at all stays malformed — never a bare 'x'.
+    out.clear();
+    EXPECT_EQ(decodeEscapedBytes("\\xz", out).error, EscapeDecodeError::Malformed);
+}
+
+TEST(CharDecode, OctalStopsAtThreeDigitsAndIsNotCappedAt255) {
+    // The two escape kinds terminate DIFFERENTLY and that asymmetry is the
+    // standard's: octal takes at most three digits, so `a\101b` keeps its 'b'.
+    std::string out;
+    EscapeDecodeOutcome oc = decodeEscapedBytes("a\\101b", out);
+    EXPECT_TRUE(oc.ok());
+    EXPECT_EQ(out, "aAb");
+
+    // ★ THE RANGE CHECK LEFT THE DECODER. `\777` is 0x1FF: a constraint violation
+    // for a narrow char, and an ordinary unit for char16_t — ✔MEASURED, all four
+    // references emit one 0x1FF unit for `u"\777"`. Rejecting it HERE (as the old
+    // decoder did) made the wide form unreachable, which is why `u"\777"` was
+    // refused as a malformed escape.
+    out.clear();
+    oc = decodeEscapedBytes("\\777", out);
+    EXPECT_TRUE(oc.ok()) << "the decoder does not know the element width";
+    ASSERT_EQ(oc.escapeUnits.size(), 1u);
+    EXPECT_EQ(oc.escapeUnits[0].value, 0x1FFu);
+    EXPECT_FALSE(oc.escapeUnits[0].hex);
+    // ...and the width-aware check is what refuses it for a byte element.
+    EXPECT_TRUE(firstEscapeValueTooWide(oc, 8).has_value());
+    EXPECT_FALSE(firstEscapeValueTooWide(oc, 16).has_value());
+}
+
+TEST(CharDecode, EscapeValueTooWideIsReportedWithItsValue) {
+    // The check returns the offending UNIT, not a bool, because the diagnostic has
+    // to name the width AND the value — both anchors this closes were cases where
+    // the compiler knew the number and did not say it.
+    std::string out;
+    EscapeDecodeOutcome oc = decodeEscapedBytes("\\x1FFFF", out);
+    ASSERT_TRUE(oc.ok());
+    auto bad = firstEscapeValueTooWide(oc, 16);
+    ASSERT_TRUE(bad.has_value());
+    EXPECT_EQ(bad->value, 0x1FFFFu);
+    EXPECT_TRUE(bad->hex);
+    EXPECT_FALSE(firstEscapeValueTooWide(oc, 32).has_value())
+        << "0x1FFFF fits a 32-bit unit — U\"\\x1FFFF\" is valid on all four references";
+
+    // A value wider than ANY code unit stops in the decoder itself.
+    out.clear();
+    EXPECT_EQ(decodeEscapedBytes("\\x123456789ABCDEF01", out).error,
+              EscapeDecodeError::EscapeValueTooLarge);
+
+    // 0xFFFFFFFF exactly fills a 32-bit unit and is PAST U+10FFFF — the proof that
+    // a byte escape is a raw code UNIT and not a code POINT.
+    out.clear();
+    oc = decodeEscapedBytes("\\xFFFFFFFF", out);
+    ASSERT_TRUE(oc.ok());
+    EXPECT_FALSE(firstEscapeValueTooWide(oc, 32).has_value());
+}
+
+TEST(CharDecode, NarrowCharLiteralRefusesAnOutOfRangeEscape) {
+    // `decodeCharLiteralBody` is the NARROW entry point, so it owns the 8-bit
+    // check. ⚠ The check must run BEFORE the single-byte test: `'\x101'` decodes
+    // to ONE placeholder byte, so a size-only test would wave it through as 0x01 —
+    // which is exactly what gcc/mingw do with a warning and what clang/MSVC refuse.
+    EscapeDecodeOutcome oc;
+    EXPECT_FALSE(decodeCharLiteralBody("\\x101", &oc).has_value());
+    EXPECT_TRUE(oc.ok()) << "the escape itself is well formed; its VALUE is out of range";
+    ASSERT_TRUE(firstEscapeValueTooWide(oc, 8).has_value());
+    EXPECT_EQ(firstEscapeValueTooWide(oc, 8)->value, 0x101u);
+
+    EXPECT_FALSE(decodeCharLiteralBody("\\777").has_value());
+    // The in-range forms are untouched.
+    auto ok = decodeCharLiteralBody("\\x41");
+    ASSERT_TRUE(ok.has_value());
+    EXPECT_EQ(*ok, 0x41u);
+    auto oct = decodeCharLiteralBody("\\101");
+    ASSERT_TRUE(oct.has_value());
+    EXPECT_EQ(*oct, 0x41u);
+}
+
 TEST(CharDecode, ByteEscapeFlagSetForHexAndOctalOnly) {
-    // FF3: the decoder flags a consumed \x / octal byte escape (the wide path
-    // rejects it fail-loud); a UCN, a named escape, and plain text do NOT.
+    // The decoder flags a consumed \x / octal byte escape; a UCN, a named escape,
+    // and plain text do NOT. `escapeUnits` carries the same population.
     std::string out;
     EXPECT_TRUE(decodeEscapedBytes("\\x41", out).usedByteEscape);
     out.clear();
@@ -238,6 +385,11 @@ TEST(CharDecode, ByteEscapeFlagSetForHexAndOctalOnly) {
     EXPECT_FALSE(decodeEscapedBytes("\\n\\t", out).usedByteEscape);
     out.clear();
     EXPECT_FALSE(decodeEscapedBytes("plain", out).usedByteEscape);
+    out.clear();
+    EXPECT_TRUE(decodeEscapedBytes("\\U0001F600", out).escapeUnits.empty())
+        << "a UCN names a code POINT and must never appear as an escape unit";
+    out.clear();
+    EXPECT_EQ(decodeEscapedBytes("\\x41\\102", out).escapeUnits.size(), 2u);
 }
 
 TEST(CharDecode, CharUcnSingleByteOkMultiByteNotSingleChar) {

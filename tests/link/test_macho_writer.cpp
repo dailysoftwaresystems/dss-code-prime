@@ -37,6 +37,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
@@ -1340,11 +1341,13 @@ TEST(MachOWriter, Arm64ObjectRodataItemEmitsConstSectionAndDataSymbol) {
     EXPECT_EQ(bytes[321], 'i');
     EXPECT_EQ(bytes[322], 0u);
 
-    // LC_SYMTAB @288: symoff = 312 + 11 (no relocs), nsyms = 2.
+    // LC_SYMTAB @288: the file-backed span ends at 312 + 11 = 323 (no relocs)
+    // and the symtab starts at the first 8-aligned offset after it, 328 —
+    // D-LINK-MACHO-OBJECT-SYMTAB-MISALIGNED (pre-fix it was packed at 323).
     std::uint32_t const symoff = readU32LE(bytes, 296);
     std::uint32_t const nsyms  = readU32LE(bytes, 300);
     std::uint32_t const stroff = readU32LE(bytes, 304);
-    EXPECT_EQ(symoff, 323u);
+    EXPECT_EQ(symoff, 328u);
     ASSERT_EQ(nsyms, 2u);
     // nlist[1] = the data symbol: real name, N_SECT|N_EXT, n_sect=2,
     // n_value = the FLAT address 8.
@@ -1714,8 +1717,10 @@ TEST(MachOWriter, Arm64ObjectBssItemIsZeroFillWithVmsizeButNoFileBytes) {
     EXPECT_EQ(readU64LE(bytes, 224), 4u);    // size = reservedSize
     EXPECT_EQ(readU32LE(bytes, 232), 0u);    // offset = 0 (S_ZEROFILL)
     EXPECT_EQ(readU32LE(bytes, 248), 1u);    // flags = S_ZEROFILL (schema)
-    // symtab directly after text bytes (312 + 4) — bss stored nothing.
-    EXPECT_EQ(readU32LE(bytes, 296), 316u);
+    // The file-backed span ends after the text bytes (312 + 4 = 316) — bss
+    // stored nothing — and the symtab starts at the first 8-aligned offset
+    // after it, 320 (D-LINK-MACHO-OBJECT-SYMTAB-MISALIGNED).
+    EXPECT_EQ(readU32LE(bytes, 296), 320u);
     // The bss symbol's n_value is its flat address.
     std::uint32_t const symoff = readU32LE(bytes, 296);
     EXPECT_EQ(bytes[symoff + 16 + 5], 2u);
@@ -1742,12 +1747,14 @@ TEST(MachOWriter, Arm64ObjectDataFreeModuleKeepsSingleSectionLayout) {
     EXPECT_EQ(readU64LE(bytes, 64), 4u);     // vmsize = text only
     EXPECT_EQ(readU64LE(bytes, 72), 232u);   // fileoff = 32 + 72 + 80 + 24 + 24
     EXPECT_EQ(readU64LE(bytes, 80), 4u);     // filesize = text only
-    // LC_SYMTAB at 208; symtab right after text (232 + 4); strtab after
-    // the single 16-byte nlist.
+    // LC_SYMTAB at 208; the span ends after the text (232 + 4 = 236) and the
+    // symtab starts at the first 8-aligned offset after it, 240
+    // (D-LINK-MACHO-OBJECT-SYMTAB-MISALIGNED); strtab right after the single
+    // 16-byte nlist.
     EXPECT_EQ(readU32LE(bytes, 208), 0x02u);
-    EXPECT_EQ(readU32LE(bytes, 216), 236u);  // symoff
+    EXPECT_EQ(readU32LE(bytes, 216), 240u);  // symoff
     EXPECT_EQ(readU32LE(bytes, 220), 1u);    // nsyms
-    EXPECT_EQ(readU32LE(bytes, 224), 252u);  // stroff
+    EXPECT_EQ(readU32LE(bytes, 224), 256u);  // stroff
 }
 
 // (5) The shipped arm64 object format declares the four data-section rows
@@ -2275,6 +2282,39 @@ namespace {
     }
     return out;
 }
+
+// ── The STATIC exec arm needs an UNSIGNED exec schema ────────────
+//
+// D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM. `encodeExec` — the static
+// arm, taken when `externImports` is empty — builds no __LINKEDIT, so it can
+// host no LC_CODE_SIGNATURE under ANY schema, and `macho::encode` now REFUSES
+// a zero-extern module whenever the format requests a signature by either key
+// rather than encoding it and dropping the request in silence. Every shipped
+// Darwin exec document requests one, so the static arm is unreachable from a
+// shipped exec schema BY CONSTRUCTION — the same conclusion `test_macho_eh_
+// frame.cpp` `MachOTextSectionAlign.TheSTATICExecArmWritesLog2Too` already
+// reached and solved the same way.
+//
+// The static-arm tests below therefore drive the shipped x86_64 exec document
+// MINUS its signature request, supplied by the SHARED fixture in
+// `macho_test_support.hpp` (which cross-checks itself field-by-field against
+// the shipped document, so it cannot drift out from under these pins). They
+// used to drive the shipped document itself, asserting `errorCount() == 0`,
+// which is exactly how ten of them stayed green over a silently dropped
+// signature.
+[[nodiscard]] Loaded loadStaticExec() {
+    Loaded out;
+    auto t = TargetSchema::loadShipped("x86_64");
+    if (!t.has_value()) {
+        ADD_FAILURE() << "loadShipped(x86_64) failed";
+        for (auto const& d : t.error()) ADD_FAILURE() << "  " << d.message;
+        return out;
+    }
+    out.target = std::move(t).value();
+    out.format = dss::macho::test::loadUnsignedExec(
+        "macho64-x86_64-darwin-exec");
+    return out;
+}
 } // namespace
 
 TEST(MachOExecFormatJson, ShippedFileLoadsCleanly) {
@@ -2290,7 +2330,7 @@ TEST(MachOExecFormatJson, ShippedFileLoadsCleanly) {
 }
 
 TEST(MachOExecWriter, MachHeaderFiletypeEqualsMhExecute) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
@@ -2303,7 +2343,7 @@ TEST(MachOExecWriter, MachHeaderFiletypeEqualsMhExecute) {
 }
 
 TEST(MachOExecWriter, PageZeroSegmentEmittedFirst) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
@@ -2321,7 +2361,7 @@ TEST(MachOExecWriter, PageZeroSegmentEmittedFirst) {
 }
 
 TEST(MachOExecWriter, LcMainEntryOffPointsToFirstFunction) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     // 2 functions: f[0] is some prelude (0x90 NOP + 0xC3 ret), f[1] is the entry.
     AssembledModule mod;
     mod.expectedFuncCount = 2;
@@ -2619,7 +2659,8 @@ TEST(MachOExecWriter, IntraModuleBranchAppliedByteForByte) {
     // Branch (rel32, kind 1) from fn[0] to fn[1].
     // sectionVa = pageZeroSize + 0x1000 = 0x100001000.
     // P = sectionVa + 1, S = sectionVa + 6, A = 0 → value = 1.
-    auto loaded = loadShippedExec();
+    // Static arm (no externImports) ⇒ the unsigned fixture.
+    auto loaded = loadStaticExec();
     AssembledModule mod;
     mod.expectedFuncCount = 2;
     AssembledFunction f0;
@@ -2666,7 +2707,7 @@ TEST(MachOExecWriter, IntraModuleBranchAppliedByteForByte) {
 }
 
 TEST(MachOExecWriter, ExternTargetFailsLoudAsUndefined) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod;
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
@@ -2893,7 +2934,7 @@ TEST(MachOExecFormatJsonValidate, MissingDylinkerPathRejected) {
 }
 
 TEST(MachOExecWriter, EmptyTextFailsLoud) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod;
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
@@ -2906,7 +2947,7 @@ TEST(MachOExecWriter, EmptyTextFailsLoud) {
 }
 
 TEST(MachOExecWriter, RelocOffsetPastFunctionBytesFailsLoud) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod;
     mod.expectedFuncCount = 2;
     AssembledFunction f0;
@@ -2938,7 +2979,7 @@ TEST(MachOExecWriter, TextSegmentVmaddrEqualsPageZeroEnd) {
     // dyld rejects both). The walker computes it; a future
     // refactor that drifts this would silently produce a non-
     // loadable image.
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
@@ -2979,7 +3020,7 @@ TEST(MachOExecWriter, LcLoadDylibStructurePinnedByteForByte) {
     // refactor changes the field layout, dyld silently looks for
     // the path at the wrong offset, fails to find libSystem, and
     // the process never starts. Pin the layout byte-for-byte.
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
@@ -3041,7 +3082,7 @@ TEST(IsImageFlavorAccessor, ConsistentAcrossThreeFormats) {
 }
 
 TEST(MachOExecWriter, DisplacementOverflowFailsLoud) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod;
     mod.expectedFuncCount = 1;
     AssembledFunction fn;

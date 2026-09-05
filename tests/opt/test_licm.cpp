@@ -1235,6 +1235,83 @@ TEST(Licm, LoadNotHoistedAcrossDistinctPrimitiveStoreInLoopUnderStrictTBAAWithCh
 }
 
 // Volatile-flagged inst NOT hoisted even if otherwise invariant.
+// D-MIR-ADDINST-ADMITS-BLOCKADDRESS-WITH-A-FORWARDED-BLOCK-ID, the LICM half.
+// `BlockAddress` is a ZERO-OPERAND leaf, so the invariance test passes it
+// vacuously (there are no operands to be loop-variant) and it is maximally
+// hoistable-looking. The preheader hoist emits through a bare `dst.addInst(op,
+// newOps, type, src_.instPayload(oldX), flags)` with no dedicated-builder
+// dispatch, so a hoisted `BlockAddress` would carry the OLD block id into the
+// rebuild's NEW numbering — `&&label` pointing at whatever block holds that
+// ordinal afterwards.
+//
+// ⚠ THE PAIR IS THE TEST. `Add(a, b)` sits in the same body block and IS
+// hoistable, so `instructionsHoisted == 1` says LICM ran, found the loop, and
+// hoisted exactly the one thing it should — not that the pass no-opped. A pin
+// asserting only "the BlockAddress did not move" would pass over a LICM that did
+// nothing at all.
+//
+// ⚠⚠ AND THE PIN IS DEFENCE-IN-DEPTH WHOSE MUTANT MUST BE TWO-FACTOR, which is
+// stated here because a one-factor mutant reads as protection and measures
+// nothing. TWO independent facts keep `BlockAddress` out of the hoist:
+//   (1) `opcodeInfo(BlockAddress).hasSideEffects`, which it carries for an
+//       UNRELATED reason — its presence is the address-taken mark, so DCE must
+//       not drop it — and which `isLicmCandidateOpcode` consults first;
+//   (2) its entry in that function's explicit leaf-exclusion list, added with
+//       this test.
+// (2) is therefore a NO-OP while (1) holds, so deleting (2) alone leaves this
+// test GREEN. The honest red-on-disable is:
+//   arm A — bypass (1) for this opcode (`hasSideEffects && op !=
+//           MirOpcode::BlockAddress`) AND delete (2)  → RED;
+//   arm B — bypass (1) the same way, KEEP (2)         → GREEN.
+// A and B differ only by the leaf-list entry, which is what makes B's green the
+// evidence that (2) carries it rather than (1). Both arms only ever DELETE a
+// guard. Mutating `opcodeInfo`'s table instead would flip DCE's address-taken
+// behaviour and red unrelated tests for the wrong reason, so the discrimination
+// is done inside `isLicmCandidateOpcode`, where both factors are read.
+TEST(Licm, BlockAddressIsNotAHoistCandidate) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const vptr  = interner.pointer(interner.primitive(TypeKind::Void));
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const body   = mb.createBlock(StructCfMarker::LoopLatch);
+    MirBlockId const exitB  = mb.createBlock(StructCfMarker::LoopExit);
+    mb.beginBlock(entry);
+    MirLiteralValue v3; v3.value = std::int64_t{3}; v3.core = TypeKind::I32;
+    MirLiteralValue v4; v4.value = std::int64_t{4}; v4.core = TypeKind::I32;
+    MirInstId const a = mb.addConst(v3, i32);
+    MirInstId const b = mb.addConst(v4, i32);
+    mb.addBr(header);
+    mb.beginBlock(header);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const cond = mb.addConst(tru, boolT);
+    mb.addCondBr(cond, body, exitB);
+    mb.beginBlock(body);
+    // The CONTROL: an ordinary invariant, which must hoist.
+    MirInstId const addOps[] = {a, b};
+    (void)mb.addInst(MirOpcode::Add, addOps, i32);
+    // The subject: `&&exitB` taken inside the loop body. Zero operands, so the
+    // invariance test cannot exclude it — only the candidate-opcode filter can.
+    (void)mb.addBlockAddress(exitB, vptr);
+    mb.addBr(header);
+    mb.beginBlock(exitB);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runLicm(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsHoisted, 1u)
+        << "the Add hoists and the BlockAddress does not — a 2 here means the "
+           "leaf-exclusion list stopped covering `BlockAddress`, and the hoisted "
+           "copy carries a block id from the OLD numbering";
+}
+
 TEST(Licm, VolatileBinaryOpNotHoisted) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32   = interner.primitive(TypeKind::I32);

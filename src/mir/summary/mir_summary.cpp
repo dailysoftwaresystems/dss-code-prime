@@ -297,16 +297,16 @@ ModuleSummary buildModuleSummary(SummaryCuInput const& cu) {
         std::uint32_t const initIdx = mir.globalInitLiteralIndex(g);
         if (initIdx != UINT32_MAX) {
             std::vector<std::uint32_t> targets;
-            auto collect = [&](auto&& self, MirLiteralValue const& v) -> void {
-                if (auto const* sa = std::get_if<MirSymbolAddrValue>(&v.value)) {
+            // D-MIR-NESTED-AGGREGATE-LITERAL-WALKS-RECURSE-PER-INITIALIZER-LEVEL:
+            // was a `self(self, …)` recursive lambda, one host frame per brace
+            // level, no cap. ⚠ `targets` is a VECTOR whose order reaches the
+            // summary, so the shared walker's field-order guarantee is required.
+            forEachLiteralNode(mir.literalValue(initIdx),
+                               [&](MirLiteralValue const& n) {
+                if (auto const* sa = std::get_if<MirSymbolAddrValue>(&n.value)) {
                     targets.push_back(sa->symbol);
-                    return;
                 }
-                if (auto const* agg = std::get_if<MirAggregateValue>(&v.value)) {
-                    for (auto const& fld : agg->fields) self(self, fld);
-                }
-            };
-            collect(collect, mir.literalValue(initIdx));
+            });
             std::vector<std::string> names;
             names.reserve(targets.size());
             for (std::uint32_t const sv : targets) {

@@ -210,6 +210,17 @@ target_link_libraries(dss_link_test_macho_object_reader
 # fuzz, the corruption red-pins (nonzero SizeOfOptionalHeader, unknown reloc
 # nativeId, out-of-range SymbolTableIndex, out-of-range SectionNumber), non-PE
 # schema fail-loud, and the DTYPE_FUNCTION extern isData inference.
+# D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET — the
+# FOREIGN-LINKER half of the object-carried data-import slot. `test_pe_writer`
+# owns the byte pins (which relocation names which symbol); only link.exe,
+# mingw `ld` and a RUN can show that the object LINKS and takes the right
+# branch, and the defect was invisible to every DSS-internal instrument (the
+# DSS-linked PE exec returned 42 throughout). Compiles through the production
+# driver, hence the `program` surface — the same reach `ffi/test_pe_abort_
+# behavior_binding` takes for the same reason.
+dss_add_test(NAME link/test_pe_object_data_import_slot
+             SOURCES test_pe_object_data_import_slot.cpp)
+
 dss_add_test(NAME link/test_coff_object_reader SOURCES test_coff_object_reader.cpp)
 # The emission-alias pin splices ONE extra `relocations[]` row into a shipped
 # `.format.json`, deriving the aliased wire id and a free `kind` FROM the
@@ -303,6 +314,16 @@ dss_add_test(NAME link/test_runtime_library_roles
              SOURCES test_runtime_library_roles.cpp)
 target_link_libraries(dss_link_test_runtime_library_roles
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE — the
+# CROSS-TIER half of the role table: the `shippedLibs/*.json` descriptors spell
+# the SAME images as literals, and nothing forced the two tiers to agree. Lives
+# under tests/link rather than tests/ffi because it loads format documents
+# through `ObjectFormatSchema::loadShipped` (their own loader, never a raw read
+# of a key the link tier owns) — the layering split tests/ffi deliberately
+# keeps. Needs no json link: both sides are read through their real loaders.
+dss_add_test(NAME link/test_descriptor_library_role_agreement
+             SOURCES test_descriptor_library_role_agreement.cpp)
 
 # D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO (Mach-O half) — the
 # `__TEXT,__eh_frame` writer. The DWARF encoder (test_dwarf_cfi) was complete
@@ -398,6 +419,18 @@ target_link_libraries(dss_link_test_extern_dispatch_and_block_shape_projection
 # the cwd unless `DSS_CONFIG_ROOT` is set, and only `dss_add_test` sets it.
 dss_add_test(NAME link/test_weak_definition_dialect
              SOURCES test_weak_definition_dialect.cpp)
+
+# D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the WEAK extern IMPORT --
+# a reference that may legally resolve to NOTHING. Asserts the SYMBOL TABLE on
+# all three formats (ELF STB_WEAK, Mach-O N_WEAK_REF, COFF WEAK_EXTERNAL plus an
+# absolute value-0 fallback), each beside its GLOBAL control in the same object,
+# plus the write/read round trip and the cross-CU strongest-wins fold. The RUN
+# witness for the resolve-to-null case is examples/c/weak_extern_import_null;
+# asserting the link SUCCEEDS is exactly what hid this defect for a year.
+# MUST run through ctest, never a bare .exe: the shipped-config resolver walks
+# the cwd unless `DSS_CONFIG_ROOT` is set, and only `dss_add_test` sets it.
+dss_add_test(NAME link/test_weak_reference_binding
+             SOURCES test_weak_reference_binding.cpp)
 target_link_libraries(dss_link_test_weak_definition_dialect
                       PRIVATE nlohmann_json::nlohmann_json)
 
@@ -476,3 +509,36 @@ dss_add_test(NAME link/test_intrasection_baked_call
 # APPENDED, never interleaved -- this file is append-only by lane convention.
 dss_add_test(NAME link/test_artifact_withheld_after_error
              SOURCES test_artifact_withheld_after_error.cpp)
+
+# D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT: both Mach-O IMAGE nlist builders
+# stamped `N_SECT|N_EXT` on EVERY defined function, so a `static` reached the
+# image under its real name with the EXTERNAL bit set and LC_DYSYMTAB published
+# `nlocalsym 0`; ld64 emits it `N_SECT` with no `N_EXT`, FIRST in the table,
+# under `ilocalsym 0 nlocalsym 1 iextdefsym 1` (✔MEASURED 2026-09-04 on Apple
+# Silicon, Apple clang 21.0.0 / ld-1267). Pins, over both ports x all three
+# image arms -- five of those six cells reach the bands, the arm64 STATIC cell
+# pinning the D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION refusal instead, each
+# port DECLARING which it expects so the coverage cannot empty itself:
+# the binding through the shared `definedNType`, the locals-first
+# band order, the six LC_DYSYMTAB fields exactly, every indirect-symbol index
+# still naming the import it named before, and the `machoDysymtabBandBreach`
+# predicate's every refusal arm — plus the same shape through the REAL
+# pipeline (the entry trampoline is the second Local), so the corpus example
+# `examples/c/macho_static_fn_image` and this pin describe one artifact.
+dss_add_test(NAME link/test_macho_image_symtab_bands
+             SOURCES test_macho_image_symtab_bands.cpp)
+
+# D-LINK-MACHO-OBJECT-SYMTAB-MISALIGNED: the MH_OBJECT writer packed its
+# trailer (the `__text` / `__data` / relro relocation tables and the nlist_64)
+# hard against the file-backed section span, so `symoff` landed wherever the
+# section bytes ended — ✔MEASURED ≡ 3/4/6/7 mod 8 on 12 of 21 base objects,
+# and ≡ 0 on every `.o` Apple clang writes. Harmless to dyld (no __LINKEDIT
+# on a relocatable) and Apple `cc` linked + ran the misaligned objects, which
+# is why the fix carries its OWN witness (an Apple `cc` link + RUN of the
+# changed objects and a byte-diff showing every moved byte is an offset field
+# or zero padding, recorded in the row) and these pins: each trailer table
+# starts 8-aligned at the first aligned offset after its predecessor, the gaps
+# are zero, the sizes are exact, and DSS's own reader walks the published
+# offsets — over modules whose raw span end is deliberately NOT aligned.
+dss_add_test(NAME link/test_macho_object_trailer_alignment
+             SOURCES test_macho_object_trailer_alignment.cpp)

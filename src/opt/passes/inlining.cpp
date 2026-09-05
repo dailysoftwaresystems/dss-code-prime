@@ -450,8 +450,16 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // presence triggers) into a caller that may not expect a shifting SP is
             // fragile, and its per-function scopeIds would collide on a twice-inlined
             // callee. Fail-SAFE (forgoes the optimization, never miscompiles) —
-            // exactly the SEH rationale above. VLA functions are leaves and rare, so
-            // the cost is ~nil.
+            // exactly the SEH rationale above.
+            // ⚠ THE COST SENTENCE HERE USED TO READ "VLA functions are leaves and rare,
+            // so the cost is ~nil", and P59 made its first clause FALSE: the non-leaf
+            // VLA frame model shipped on 2026-09-04 and a VLA function may now CALL
+            // (D-CSUBSET-VLA-NONLEAF-CALL-FRAME, CLOSED), so a VLA function is a
+            // perfectly ordinary inlining CANDIDATE and can also be a CALLER. The
+            // refusal itself is unaffected and still fail-SAFE — it forgoes the
+            // optimization and never miscompiles — but the cost is no longer
+            // self-evidently ~nil, and nobody has re-measured it. If this refusal is
+            // ever worth lifting, measure the cost first rather than quoting this line.
             if (op == MirOpcode::StackSave || op == MirOpcode::StackRestore) {
                 return std::nullopt;
             }
@@ -1176,6 +1184,54 @@ private:
                 src_.globalAddrSymbol(id), src_.instType(id)));
             return;
         }
+        // D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST (D-CSUBSET-COMPUTED-GOTO):
+        // `&&label` in the inline HOST. The payload is a BLOCK id that this
+        // rebuild RENUMBERS, and — unlike `Arg`/`Const`/`GlobalAddr`/`InlineAsm` —
+        // `MirBuilder::addInst` does NOT refuse the opcode. So the verbatim
+        // fallback below would copy the OLD id into a fresh arena and point the
+        // address at whatever block happens to carry that number: a SILENT
+        // MISCOMPILE, not an abort. That hazard is the reason a computed-goto host
+        // was routed away from this rebuilder entirely until this arm existed.
+        //
+        // ★ `blockMap_`, NEVER `blockExitMap_` — THE DIFFERENCE IS THE WHOLE POINT.
+        // A host block containing an inlined MULTI-BLOCK call is SPLIT:
+        // `blockMap_[old]` is the chain's HEAD (the instructions before the call)
+        // while `blockExitMap_[old]` is the continuation that ends up carrying the
+        // original terminator. `&&L` means "the start of L", so a later
+        // `goto *&&L` must re-enter at the head and re-run the spliced body.
+        // Taking the exit map instead would SKIP the inlined call on every
+        // indirect re-entry — well-formed IR with the wrong answer, which is
+        // precisely what `examples/c/computed_goto_inline_multiblock_host`
+        // re-enters a label to catch.
+        //
+        // ★ ORDERING — `blockMap_` IS COMPLETE BEFORE THIS RUNS. Phase 1
+        // pre-creates every caller block AND every splice's clone/continuation
+        // blocks before phase 2 emits a single instruction (the C1 layout
+        // contract), so a payload rewritten here can never observe a
+        // half-populated map. A miss is therefore a substrate violation, never a
+        // forward reference — fail loud rather than emit a stale address.
+        //
+        // (`BlockAddressExport` needs no arm: its payload is a SYMBOL id, which no
+        // rebuild renumbers, and its one operand is this instruction — mapped by
+        // the verbatim path below. That is exactly how `MirFunctionRebuilder`
+        // treats it, so the two rebuild drivers stay at parity.)
+        if (op == MirOpcode::BlockAddress) {
+            MirBlockId const oldTarget = src_.blockAddressTarget(id);
+            auto const tgtIt = blockMap_.find(oldTarget.v);
+            if (tgtIt == blockMap_.end()) {
+                std::fprintf(stderr,
+                    "dss::opt::passes::Inlining fatal: caller BlockAddress v=%u "
+                    "targets block v=%u, which is not in blockMap_ — every caller "
+                    "block is pre-created in phase 1 "
+                    "(D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST).\n",
+                    id.v, oldTarget.v);
+                std::abort();
+            }
+            rewrite_.emplace(id.v,
+                dst_.addBlockAddress(tgtIt->second, src_.instType(id),
+                                     src_.instFlags(id)));
+            return;
+        }
         auto const ops = src_.instOperands(id);
         std::vector<MirInstId> newOps;
         newOps.reserve(ops.size());
@@ -1270,6 +1326,28 @@ private:
                 for (MirBlockId const sB : oldSucc) succs.push_back(mapSucc(sB));
                 remember(dst_.cloneInlineAsmGoto(src_.asmDescriptor(id), newOps,
                                                  succs, src_.instFlags(id)));
+                return;
+            }
+            case MirOpcode::IndirectBr: {
+                // D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST
+                // (D-CSUBSET-COMPUTED-GOTO): `goto *p` in the inline HOST.
+                // operand[0] is the computed address; the successors are EVERY
+                // address-taken block of the function, remapped through `mapSucc`
+                // (= `blockMap_`, the block ENTRY) — the same rule, for the same
+                // reason, as the `BlockAddress` payload in `emitCallerInst`.
+                // ⚠ EVERY successor. This list IS the reachability of the
+                // address-taken blocks, so dropping one hands the unreachable
+                // prune a live label; the 1:1 `oldSucc` walk preserves the count
+                // by construction, and `addIndirectBr` re-checks that at least one
+                // survives.
+                // Until this arm existed the `default:` below aborted here, which
+                // is the second half of why a computed-goto host could not be
+                // rebuilt by this driver at all.
+                std::vector<MirBlockId> targets;
+                targets.reserve(oldSucc.size());
+                for (MirBlockId const s : oldSucc) targets.push_back(mapSucc(s));
+                remember(dst_.addIndirectBr(mapCallerValue(oldOps[0], id),
+                                            targets));
                 return;
             }
             case MirOpcode::Unreachable:
@@ -1632,39 +1710,30 @@ private:
     bool        malformed_    = false;
 };
 
-// True iff function `f` ITSELF contains a computed goto — a `BlockAddress` op or
-// an `IndirectBr` terminator (D-CSUBSET-COMPUTED-GOTO). Such a function must NOT
-// be rebuilt by the `MultiBlockInliner`: its hand-rolled caller-host emit copies
-// a `BlockAddress`'s block-id payload VERBATIM (a stale id once the host's blocks
-// are renumbered = silent miscompile) and has NO `IndirectBr` terminator arm
-// (it would hit the `default:` abort). The single-block `MirFunctionRebuilder`
-// path DOES remap both correctly (the shared rebuild-helper has the arms), so a
-// computed-goto host is routed there instead — single-block callees still inline
-// safely; admitting a MULTI-BLOCK callee into a computed-goto host is the named
-// follow-up `D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST`.
-[[nodiscard]] bool functionHasComputedGoto(Mir const& mir, MirFuncId f) {
-    std::uint32_t const nb = mir.funcBlockCount(f);
-    for (std::uint32_t bi = 0; bi < nb; ++bi) {
-        MirBlockId const b = mir.funcBlockAt(f, bi);
-        if (mir.instOpcode(mir.blockTerminator(b)) == MirOpcode::IndirectBr) {
-            return true;
-        }
-        std::uint32_t const ni = mir.blockInstCount(b);
-        for (std::uint32_t ii = 0; ii < ni; ++ii) {
-            if (mir.instOpcode(mir.blockInstAt(b, ii)) == MirOpcode::BlockAddress) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
+// ★ THERE IS NO `functionHasComputedGoto` ROUTING GUARD ANY MORE, AND ITS
+// ABSENCE IS THE FIX, NOT AN OVERSIGHT —
+// D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST.
+// A host that itself contains `&&label`/`goto *p` used to be forced
+// onto the single-block `MirFunctionRebuilder` route, because
+// `MultiBlockInliner`'s hand-rolled caller-host emit copied a `BlockAddress`'s
+// block-id payload VERBATIM (a stale id once the host's blocks are renumbered =
+// silent miscompile) and had NO `IndirectBr` terminator arm (it hit the
+// `default:` abort). Both arms now exist — see `emitCallerInst`'s `BlockAddress`
+// case and `emitTerminator`'s `IndirectBr` case, which mirror the shared
+// rebuild-helper's — so the guard's premise no longer holds and a MULTI-BLOCK
+// callee inlines into a computed-goto host like any other. The SEH predicate
+// below survives precisely because ITS premise still holds: this driver has no
+// `SehTryBegin`/`SehFilterReturn` arm.
+//
 // c115 SEH (D-WIN64-SEH-FUNCLETS): true iff `f` contains a SEH region opener.
-// A SEH-containing HOST must route through the single-block rebuild path (the
-// computed-goto discipline): MirFunctionRebuilder::emitTerminator carries the
-// SehTryBegin/SehFilterReturn clone arms, while MultiBlockInliner's caller-host
-// emit would abort on them. (SEH CALLEES are refused at the legality gate;
-// this predicate is about the CALLER hosting an inline of an ordinary callee.)
+// A SEH-containing HOST must route through the single-block rebuild path:
+// MirFunctionRebuilder::emitTerminator carries the SehTryBegin/SehFilterReturn
+// clone arms, while MultiBlockInliner's caller-host emit would abort on them.
+// (SEH CALLEES are refused at the legality gate; this predicate is about the
+// CALLER hosting an inline of an ordinary callee.) THE FIX FOR THE COMPUTED-GOTO
+// TWIN WAS TO ADD THE MISSING ARMS, AND THAT IS THIS PREDICATE'S EXIT ROUTE TOO:
+// give this driver the two SEH terminator arms and this guard becomes as
+// unnecessary as its computed-goto sibling was.
 [[nodiscard]] bool functionHasSeh(Mir const& mir, MirFuncId f) {
     std::uint32_t const nb = mir.funcBlockCount(f);
     for (std::uint32_t bi = 0; bi < nb; ++bi) {
@@ -1690,11 +1759,14 @@ private:
 // predicate called twice charges twice, so the second builder had to go
 // rather than be taught to skip; `InliningPolicy` now RECEIVES a plan.
 //
-// `singleBlockOnly` is the computed-goto / SEH host route, where only
-// single-block callees are ever spliced. Such a host must not merely have its
-// multi-block targets dropped downstream — it must never CHARGE for them,
-// or a computed-goto function would spend its budget on splices that never
-// happen. Admission and charging are therefore the same decision here.
+// `singleBlockOnly` is the SEH host route, where only single-block callees are
+// ever spliced. Such a host must not merely have its multi-block targets dropped
+// downstream — it must never CHARGE for them, or a SEH function would spend its
+// budget on splices that never happen. Admission and charging are therefore the
+// same decision here. (A computed-goto host used to take this route as well;
+// D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST gave the MultiBlockInliner the
+// two caller-host arms it was missing, so such a host is now budgeted and
+// spliced exactly like any other.)
 //
 // Returns whether the plan contains a MULTI-BLOCK target (the routing signal).
 [[nodiscard]] bool
@@ -1807,15 +1879,15 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
         std::unordered_map<std::uint32_t, MirFuncId> plan;
-        // D-CSUBSET-COMPUTED-GOTO: a host that itself contains a computed goto is
-        // routed through the single-block path (which remaps BlockAddress/
-        // IndirectBr correctly), NEVER the MultiBlockInliner (whose caller-host
-        // emit would mis-copy the block-id payload / abort on IndirectBr).
-        // c115 SEH: a SEH-containing host routes the same way — the rebuild
-        // path carries the SehTryBegin/SehFilterReturn clone arms the
-        // MultiBlockInliner's caller-host emit lacks (D-WIN64-SEH-FUNCLETS).
-        bool const singleBlockOnly =
-            functionHasComputedGoto(mir, f) || functionHasSeh(mir, f);
+        // c115 SEH: a SEH-containing host is forced onto the single-block path —
+        // the shared rebuilder carries the SehTryBegin/SehFilterReturn clone arms
+        // the MultiBlockInliner's caller-host emit lacks (D-WIN64-SEH-FUNCLETS).
+        // ⚠ A COMPUTED-GOTO HOST IS NO LONGER IN THIS CONDITION
+        // (D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST): the MultiBlockInliner
+        // now has both the BlockAddress and the IndirectBr caller-host arms, so
+        // there is nothing left for the routing guard to protect. See the note
+        // above `functionHasSeh` for what the two predicates did and did not share.
+        bool const singleBlockOnly = functionHasSeh(mir, f);
         bool const anyMulti =
             buildInlinePlan(mir, analysis, f, plan, inlineThreshold,
                             callerGrowthPercent, ledger, singleBlockOnly,

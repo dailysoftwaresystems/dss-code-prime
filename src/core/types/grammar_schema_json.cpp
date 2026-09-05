@@ -241,6 +241,148 @@ bool checkKeysAgainst(json const& obj, std::span<std::string_view const> known,
     return clean;
 }
 
+// ★★★ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+// THE **ONE** READER FOR AN ATTRIBUTE-RUN LIST, USED BY BOTH KEYS THAT DECLARE
+// ONE — `declarators.afterDeclaratorAttrRules` and every declaration row's
+// `declarationAttrSlotRules`.
+//
+// It is one function and not two blocks because the two keys were already
+// drifting: the after-declarator list validated its entries' rule names, the
+// slot list validated names AND rejected duplicates, and NEITHER could say what
+// its entries appertain to — which is the row this closes. Two readers would be
+// two chances to accept a grain-less entry.
+//
+// SHAPE: `[{ "rule": <name>, "appertainsTo": <grain> }, …]`. Both keys are
+// REQUIRED on every entry and the grain vocabulary is CLOSED
+// (`kAttrAppertainmentTable`).
+//
+// ⚠ A BARE STRING IS REFUSED, DELIBERATELY, AND THE MESSAGE SAYS WHAT TO WRITE.
+// The tempting compatibility shim — accept a string and assume a grain — is the
+// knob-that-lies shape this whole key family exists to avoid: the assumed grain
+// is right for `declAttrRun` and WRONG for `structMemberAttrList`, and being
+// wrong there is what let a trailing member attribute leak onto a sibling
+// declarator, which for `noreturn` ELIDES A RETURN PATH. There is no safe
+// default, so there is no default.
+//
+// ⚠ AN UNKNOWN RULE NAME IS A LOAD FAILURE, not a silent no-op — the reason
+// this family names rules instead of indexing children. A wrong INDEX makes the
+// scan descend, find no attributes and assert nothing; a wrong NAME cannot
+// resolve and dies here.
+//
+// ⚠ A DUPLICATE `rule` IS A LOAD FAILURE. Two entries for one rule make every
+// consumer visit that slot twice, so a per-attribute diagnostic fires twice and
+// a per-attribute effect applies twice. Silent today, never what was meant.
+// ⓘ THIS IS ALSO WHY c's TYPEDEF GRAMMAR HAD TO SPLIT ITS TRAILING RUN INTO ITS
+// OWN RULE NAME: `typedefAttrRun` occupied BOTH the lead and the trailing
+// position of one shape, so a single entry carried two grains and a
+// grain-per-rule key cannot describe that. Two positions, two rule names — the
+// `asmLabelRule` discipline.
+//
+// Returns false (and emits) on any malformation; `out` then holds only the
+// entries that were well-formed, which the caller must treat as a failed load.
+bool readAttrRunRules(json const& arr, RuleInterner const& rules,
+                      std::string const& path, std::string_view keyLabel,
+                      Collector& coll, std::vector<AttrRunRule>& out) {
+    static constexpr std::array<std::string_view, 2> kEntryKeys{
+        "rule", "appertainsTo"};
+    DSS_CHECK_KEY_VOCABULARY(kEntryKeys);
+    bool ok = true;
+    if (!arr.is_array()) {
+        coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                  std::format("'{}' must be an ARRAY of "
+                              "{{\"rule\": <shape name>, \"appertainsTo\": "
+                              "<{}>}} objects",
+                              keyLabel,
+                              renderAllowedList(
+                                  allNames(kAttrAppertainmentTable))));
+        return false;
+    }
+    for (auto const& e : arr) {
+        if (!e.is_object()) {
+            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                      std::format("each '{}' entry must be an OBJECT "
+                                  "{{\"rule\": <shape name>, "
+                                  "\"appertainsTo\": <{}>}} -- a bare rule-name "
+                                  "string is REFUSED because there is no safe "
+                                  "default grain: an attribute run written "
+                                  "BEFORE a declarator list appertains to every "
+                                  "declarator and one written AFTER it to the "
+                                  "last declarator alone, and assuming either "
+                                  "silently over- or under-applies every fact "
+                                  "the run carries",
+                                  keyLabel,
+                                  renderAllowedList(
+                                      allNames(kAttrAppertainmentTable))));
+            ok = false;
+            continue;
+        }
+        if (!checkKeysAgainst(e, kEntryKeys, path,
+                              std::format("a '{}' entry", keyLabel),
+                              DiagnosticCode::C_InvalidSemantics, coll)) {
+            ok = false;
+        }
+        if (!e.contains("rule") || !e.at("rule").is_string()) {
+            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                      std::format("each '{}' entry needs a 'rule' shape-name "
+                                  "string", keyLabel));
+            ok = false;
+            continue;
+        }
+        std::string const rn = e.at("rule").get<std::string>();
+        if (!e.contains("appertainsTo") || !e.at("appertainsTo").is_string()) {
+            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                      std::format("'{}' entry '{}' needs an 'appertainsTo' "
+                                  "string ({}) -- what the attributes in this "
+                                  "run appertain to. It is required precisely "
+                                  "because no reading is safe to assume",
+                                  keyLabel, rn,
+                                  renderAllowedList(
+                                      allNames(kAttrAppertainmentTable))));
+            ok = false;
+            continue;
+        }
+        std::string const grainName = e.at("appertainsTo").get<std::string>();
+        auto const grain = attrAppertainmentFromName(grainName);
+        if (!grain.has_value()) {
+            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                      std::format("'{}' entry '{}' declares appertainsTo '{}', "
+                                  "which is not one of {}",
+                                  keyLabel, rn, grainName,
+                                  renderAllowedList(
+                                      allNames(kAttrAppertainmentTable))));
+            ok = false;
+            continue;
+        }
+        if (!rules.contains(rn)) {
+            coll.emit(DiagnosticCode::C_UnknownShape, path,
+                      std::format("'{}' references unknown shape '{}' -- an "
+                                  "attribute run is named, not indexed, "
+                                  "precisely so this cannot be a silent no-op",
+                                  keyLabel, rn));
+            ok = false;
+            continue;
+        }
+        bool dup = false;
+        for (AttrRunRule const& have : out) {
+            if (have.name == rn) { dup = true; break; }
+        }
+        if (dup) {
+            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                      std::format("'{}' lists '{}' more than once -- every "
+                                  "consumer would visit that run twice, so a "
+                                  "per-attribute diagnostic fires twice and a "
+                                  "per-attribute effect applies twice. One rule "
+                                  "name, one grain: give a run that occupies "
+                                  "two positions two rule names",
+                                  keyLabel, rn));
+            ok = false;
+            continue;
+        }
+        out.push_back(AttrRunRule{rules.find(rn), rn, *grain});
+    }
+    return ok;
+}
+
 // ── diagnostic provenance for a MULTI-DOCUMENT grammar (plan 29 P1+P2) ────
 //
 // Every grammar diagnostic quotes a JSON pointer into `/shapes/<name>`. That
@@ -4532,37 +4674,60 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     }
 
     // parser: optional top-level block carrying engine-parser tunables the
-    // language wants config-driven rather than baked into a C++ default. Today
-    // the only field is `maxExpressionDepth` — the Pratt walker's
-    // expression-nesting cap (the positioned `P_ExpressionTooDeep` backstop's
-    // threshold). Omitting the block (or the field) leaves the cap at the
-    // `ParserConfig` C++ fallback (256); declaring it makes the cap 100%
-    // config-driven. The value must be a positive integer; the cap is still a
-    // hard fail-loud ceiling (a deeper nest emits the positioned diagnostic and
-    // recovers — never a crash) — declaring a high value just raises HOW deep a
-    // legal nest the engine admits before the backstop trips, bounded by the
-    // worker stack the still-recursive paren arm runs on. AGNOSTIC: every
-    // language reads its own value; the loader names no language.
+    // language wants config-driven rather than baked into a C++ default. Two
+    // fields today, and they are DIFFERENT nesting quantities — do not conflate
+    // them:
+    //   * `maxExpressionDepth`  — the Pratt walker's expression-nesting cap
+    //     (the positioned `P_ExpressionTooDeep` backstop's threshold);
+    //   * `maxSpeculationDepth` — how deep the parser may nest SPECULATIVE
+    //     probes while disambiguating alternatives (the positioned
+    //     `P_MaxSpeculationDepth` backstop's threshold). One key, BOTH stacked
+    //     caps: the parser applies it to its own probe counter AND derives the
+    //     `TreeBuilder`'s checkpoint cap from it, because every probe opens
+    //     exactly one checkpoint. Splitting them into two authored numbers is
+    //     how the second one ends up binding invisibly behind the first.
+    //   * `speculationBudgetFactor` — how many tokens ONE speculative probe may
+    //     consume, as a multiple of the alt's own declared `lookahead` (the
+    //     positioned `P_SpeculationBudgetExhausted` backstop's threshold). The
+    //     THIRD ceiling on a deeply-nested construct, and the last one that was
+    //     still a bare engine constant.
+    // Omitting the block (or a field) leaves that cap at its `ParserConfig` C++
+    // fallback; declaring it makes the cap 100% config-driven. Each value must
+    // be a positive integer; both caps stay hard fail-loud ceilings (a deeper
+    // nest emits the positioned diagnostic and recovers — never a crash), so
+    // declaring a high value only raises HOW deep a legal nest the engine admits
+    // before the backstop trips, bounded by the host stack the residual
+    // recursive arms run on. AGNOSTIC: every language reads its own values; the
+    // loader names no language.
     if (doc.contains("parser")) {
         json const& parserObj = doc.at("parser");
         if (!parserObj.is_object()) {
             coll.emit(DiagnosticCode::C_ConflictingField, "/parser",
                       "'parser' must be an object");
-        } else if (parserObj.contains("maxExpressionDepth")) {
-            json const& med = parserObj.at("maxExpressionDepth");
+        } else {
             // Must be a positive integer. `is_number_unsigned` rejects negatives
             // and floats; the explicit `> 0` rejects an authored 0 (which would
             // make every expression — even a bare identifier, depth 1 — trip the
-            // cap, never producing a usable parse). Mirrors the runtime guard in
-            // the Parser ctor (`maxExpressionDepth must be >= 1`).
-            if (!med.is_number_unsigned() || med.get<std::uint64_t>() == 0) {
-                coll.emit(DiagnosticCode::C_ConflictingField,
-                          "/parser/maxExpressionDepth",
-                          "'maxExpressionDepth' must be a positive integer");
-            } else {
-                data.maxExpressionDepth =
-                    static_cast<std::size_t>(med.get<std::uint64_t>());
-            }
+            // cap, never producing a usable parse, and for the speculation cap
+            // would refuse the FIRST probe, i.e. disable disambiguation
+            // entirely). Mirrors the runtime guards in the Parser ctor.
+            auto readPositive = [&](char const* field,
+                                    std::optional<std::size_t>& out) {
+                if (!parserObj.contains(field)) return;
+                json const& v = parserObj.at(field);
+                if (!v.is_number_unsigned() || v.get<std::uint64_t>() == 0) {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::string("/parser/") + field,
+                              std::format("'{}' must be a positive integer",
+                                          field));
+                    return;
+                }
+                out = static_cast<std::size_t>(v.get<std::uint64_t>());
+            };
+            readPositive("maxExpressionDepth", data.maxExpressionDepth);
+            readPositive("maxSpeculationDepth", data.maxSpeculationDepth);
+            readPositive("speculationBudgetFactor",
+                         data.speculationBudgetFactor);
         }
     }
 
@@ -7790,6 +7955,175 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readOptWord("errorDirective",         cfg.errorDirective);
             readOptWord("warningDirective",       cfg.warningDirective);
             readOptWord("hasEmbedOperator",       cfg.hasEmbedOperator);
+            // ── C23 6.10.4.2–6.10.4.5 (D-PP-EMBED-PARAMS): `embedParameters` ──
+            //
+            // The standard `#embed` parameter VERBS bound to the names a program
+            // spells (`{ name, role }` rows, the `pragmaEffects` house pattern)
+            // plus the token KIND of a prefixed parameter's `::` (C23 6.10.1p4).
+            // OPTIONAL: absent leaves `cfg.embedParameters` empty, so every
+            // parameter on a `#embed` line is a loud constraint violation and
+            // `__has_embed` with any parameter clause answers NOT_FOUND(0) — an
+            // honest subset, and this block's REMOVE-direction pin.
+            if (pp.contains("embedParameters")) {
+                json const& ep = pp.at("embedParameters");
+                if (!ep.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/embedParameters",
+                              "'preprocess.embedParameters' must be an object "
+                              "{ prefixSeparatorToken, standard: [{ name, role }] }");
+                } else {
+                    static constexpr std::array<std::string_view, 2>
+                        kEmbedParamKeys{"prefixSeparatorToken", "standard"};
+                    DSS_CHECK_KEY_VOCABULARY(kEmbedParamKeys);
+                    (void)checkKeysAgainst(
+                        ep, kEmbedParamKeys, "/preprocess/embedParameters",
+                        "the 'embedParameters' block",
+                        DiagnosticCode::C_InvalidPreprocess, coll);
+                    // The CLOSED verb set — ONE table read by the lookup AND by
+                    // the rejection message (the `kPragmaVerbs` precedent), so
+                    // the message can never advertise a verb that no longer
+                    // exists.
+                    static constexpr std::array<
+                        std::pair<std::string_view,
+                                  PreprocessConfig::EmbedParameterRole>, 4>
+                        kEmbedParamRoles{{
+                            {"limit",   PreprocessConfig::EmbedParameterRole::Limit},
+                            {"prefix",  PreprocessConfig::EmbedParameterRole::Prefix},
+                            {"suffix",  PreprocessConfig::EmbedParameterRole::Suffix},
+                            {"ifEmpty", PreprocessConfig::EmbedParameterRole::IfEmpty}}};
+                    DSS_CHECK_KEY_VOCABULARY(kEmbedParamRoles);
+                    static constexpr std::array<std::string_view, 2>
+                        kEmbedParamRowKeys{"name", "role"};
+                    DSS_CHECK_KEY_VOCABULARY(kEmbedParamRowKeys);
+                    PreprocessConfig::EmbedParameterConfig out;
+                    bool ok = true;
+                    // REQUIRED inside the block: without the `::` kind the
+                    // prefixed form of 6.10.1 is unlexable, and `__has_embed`
+                    // could not give 6.10.2p8's answer (an unrecognised PREFIXED
+                    // parameter is not a violation, it is 0) truthfully.
+                    if (!ep.contains("prefixSeparatorToken")
+                        || !ep.at("prefixSeparatorToken").is_string()
+                        || ep.at("prefixSeparatorToken").get<std::string>().empty()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/preprocess/embedParameters/prefixSeparatorToken",
+                                  "'preprocess.embedParameters' requires a non-empty "
+                                  "'prefixSeparatorToken' — the token KIND of a "
+                                  "prefixed parameter's '::' (C23 6.10.1p4)");
+                        ok = false;
+                    } else {
+                        out.prefixSeparatorToken =
+                            ep.at("prefixSeparatorToken").get<std::string>();
+                        checkToken(out.prefixSeparatorToken,
+                                   "embedParameters/prefixSeparatorToken");
+                    }
+                    if (!ep.contains("standard") || !ep.at("standard").is_array()
+                        || ep.at("standard").empty()) {
+                        // A block binding no verb declares nothing and reads as a
+                        // surface that is not there — the dead-config shape this
+                        // loader refuses everywhere else. Omit the block instead.
+                        coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                  "/preprocess/embedParameters/standard",
+                                  "'preprocess.embedParameters.standard' must be a "
+                                  "NON-EMPTY array of { name, role } rows — a block "
+                                  "that binds no verb declares nothing; omit it");
+                        ok = false;
+                    } else {
+                        std::unordered_set<std::string> seenNames;   // dunder-normalised
+                        std::unordered_set<std::string> seenRoles;
+                        json const& rows = ep.at("standard");
+                        for (std::size_t ri = 0; ri < rows.size(); ++ri) {
+                            auto const rpath = std::format(
+                                "/preprocess/embedParameters/standard/{}", ri);
+                            json const& row = rows[ri];
+                            if (!row.is_object() || !row.contains("name")
+                                || !row.at("name").is_string()
+                                || !row.contains("role")
+                                || !row.at("role").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess, rpath,
+                                          "each 'embedParameters.standard' row must "
+                                          "be an object { name: string, role: string }");
+                                ok = false;
+                                continue;
+                            }
+                            (void)checkKeysAgainst(
+                                row, kEmbedParamRowKeys, rpath,
+                                "an 'embedParameters.standard' row",
+                                DiagnosticCode::C_InvalidPreprocess, coll);
+                            PreprocessConfig::EmbedParameterDef def;
+                            def.name = row.at("name").get<std::string>();
+                            if (def.name.empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          rpath + "/name",
+                                          "'embedParameters.standard.name' must be a "
+                                          "non-empty identifier");
+                                ok = false;
+                                continue;
+                            }
+                            auto const roleWord = row.at("role").get<std::string>();
+                            auto const roleIt = std::ranges::find_if(
+                                kEmbedParamRoles,
+                                [&](auto const& e) { return e.first == roleWord; });
+                            if (roleIt == kEmbedParamRoles.end()) {
+                                std::string verbs;
+                                for (auto const& e : kEmbedParamRoles) {
+                                    if (!verbs.empty()) verbs += ", ";
+                                    verbs += e.first;
+                                }
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          rpath + "/role",
+                                          std::format("unknown embed parameter role "
+                                                      "'{}' — must be one of: {}",
+                                                      roleWord, verbs));
+                                ok = false;
+                                continue;
+                            }
+                            def.role = roleIt->second;
+                            // Each of 6.10.4.2–6.10.4.5's parameters "may appear
+                            // zero times or one time"; that is only checkable
+                            // against a ONE-TO-ONE name<->verb binding.
+                            if (!seenRoles.insert(roleWord).second) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          rpath + "/role",
+                                          std::format("embed parameter role '{}' is "
+                                                      "bound to two names — 'at most "
+                                                      "once' (C23 6.10.4.2–6.10.4.5) "
+                                                      "needs one name per verb",
+                                                      roleWord));
+                                ok = false;
+                                continue;
+                            }
+                            // C23 6.10.1p5: `name` and `__name__` are the SAME
+                            // parameter, so two rows may not collide either way.
+                            std::string const bare{stripDunder(def.name)};
+                            if (!seenNames.insert(bare).second) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          rpath + "/name",
+                                          std::format("embed parameter name '{}' "
+                                                      "collides with an earlier row "
+                                                      "(directly or through its "
+                                                      "`__name__` spelling, C23 "
+                                                      "6.10.1p5)",
+                                                      def.name));
+                                ok = false;
+                                continue;
+                            }
+                            out.standard.push_back(std::move(def));
+                        }
+                    }
+                    if (ok) cfg.embedParameters = std::move(out);
+                }
+            }
+            // Parameters for a surface the language does not declare are dead
+            // config: nothing could ever read them.
+            if (cfg.embedParameters.has_value() && cfg.embedDirective.empty()
+                && cfg.hasEmbedOperator.empty()) {
+                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                          "/preprocess/embedParameters",
+                          "'preprocess.embedParameters' declares parameters for a "
+                          "`#embed` directive / `__has_embed` operator the language "
+                          "does not declare (neither 'embedDirective' nor "
+                          "'hasEmbedOperator' is present)");
+            }
             // FC15c (make-or-break agnosticism): the angle-delimiter token KINDS
             // for `__has_include(<h>)`. OPTIONAL token-name fields (validated like
             // `stringizeToken`). The make-or-break SELF-CONSISTENCY rule: a
@@ -7886,6 +8220,241 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                         cfg.knownCAttributes.push_back(std::move(ka));
                     }
+                }
+            }
+
+            // ── D-PP-HAS-EXTENSION-BUILTIN-ABSENT: the FEATURE-QUERY family ──
+            //
+            // `featureQueryOperators` — `[{name, answers}]`. `answers` NAMES the
+            // already-declared capability set the operator reads, so no truth
+            // set is ever restated here. OPTIONAL; every malformed shape is a
+            // LOAD error rather than a dropped row, because a dropped row is an
+            // operator that silently stops existing and folds to 0 — the
+            // answered-in-silence failure this row exists to prevent.
+            if (pp.contains("featureQueryOperators")) {
+                json const& fqs = pp.at("featureQueryOperators");
+                if (!fqs.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/featureQueryOperators",
+                              "'preprocess.featureQueryOperators' must be an "
+                              "array");
+                } else {
+                    for (std::size_t fi = 0; fi < fqs.size(); ++fi) {
+                        const auto fpath = std::format(
+                            "/preprocess/featureQueryOperators/{}", fi);
+                        json const& e = fqs[fi];
+                        if (!e.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess, fpath,
+                                      "a 'featureQueryOperators' entry must be "
+                                      "an object");
+                            continue;
+                        }
+                        FeatureQueryOperatorDef op;
+                        if (!e.contains("name") || !e.at("name").is_string()
+                            || e.at("name").get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      fpath + "/name",
+                                      "a 'featureQueryOperators' entry requires "
+                                      "a non-empty string 'name'");
+                            continue;
+                        }
+                        op.name = e.at("name").get<std::string>();
+                        if (!e.contains("answers")
+                            || !e.at("answers").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      fpath + "/answers",
+                                      "a 'featureQueryOperators' entry requires "
+                                      "a string 'answers' naming the declared "
+                                      "capability set its answer is read from");
+                            continue;
+                        }
+                        auto const src = featureQueryAnswerSourceFromName(
+                            e.at("answers").get<std::string>());
+                        if (!src.has_value()) {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidPreprocess,
+                                fpath + "/answers",
+                                "unknown 'answers' verb '"
+                                    + e.at("answers").get<std::string>()
+                                    + "' (declared-attributes / "
+                                      "declared-builtins / "
+                                      "declared-language-features / "
+                                      "declared-language-extensions)");
+                            continue;
+                        }
+                        op.answers = *src;
+                        // ⚠ THE COLLISION CHECK IS NOT HOUSEKEEPING. A name that
+                        // is BOTH a conditional-inclusion operator and a
+                        // feature-query operator would resolve to two different
+                        // redefinition postures through `reservedIdentifierPosture`
+                        // (whose first match wins) and two different fold arms —
+                        // i.e. one spelling with two meanings, decided by
+                        // source order. Refuse it at load instead.
+                        if (isConditionalInclusionOperator(op.name, cfg)
+                            || (!cfg.definedOperator.empty()
+                                && op.name == cfg.definedOperator)) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      fpath + "/name",
+                                      "'" + op.name
+                                          + "' is already declared as another "
+                                            "preprocessor operator word");
+                            continue;
+                        }
+                        if (findFeatureQueryOperator(op.name, cfg) != nullptr) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      fpath + "/name",
+                                      "duplicate 'featureQueryOperators.name' '"
+                                          + op.name + "'");
+                            continue;
+                        }
+                        cfg.featureQueryOperators.push_back(std::move(op));
+                    }
+                }
+            }
+            // `languageFeatures` — `[{name, availability}]`, the truth set
+            // `__has_feature`/`__has_extension` read. `availability` is
+            // MANDATORY per row: defaulting it would silently decide whether a
+            // feature is reported by `__has_feature` too, and that is exactly
+            // the claim a row is being asked to make.
+            if (pp.contains("languageFeatures")) {
+                json const& lfs = pp.at("languageFeatures");
+                if (!lfs.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/languageFeatures",
+                              "'preprocess.languageFeatures' must be an array");
+                } else {
+                    for (std::size_t li = 0; li < lfs.size(); ++li) {
+                        const auto lpath =
+                            std::format("/preprocess/languageFeatures/{}", li);
+                        json const& e = lfs[li];
+                        if (!e.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess, lpath,
+                                      "a 'languageFeatures' entry must be an "
+                                      "object");
+                            continue;
+                        }
+                        LanguageFeatureDef lf;
+                        if (!e.contains("name") || !e.at("name").is_string()
+                            || e.at("name").get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      lpath + "/name",
+                                      "a 'languageFeatures' entry requires a "
+                                      "non-empty string 'name'");
+                            continue;
+                        }
+                        lf.name = e.at("name").get<std::string>();
+                        if (!e.contains("availability")
+                            || !e.at("availability").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      lpath + "/availability",
+                                      "a 'languageFeatures' entry requires a "
+                                      "string 'availability' "
+                                      "(standard / extension)");
+                            continue;
+                        }
+                        auto const av = languageFeatureAvailabilityFromName(
+                            e.at("availability").get<std::string>());
+                        if (!av.has_value()) {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidPreprocess,
+                                lpath + "/availability",
+                                "unknown 'availability' '"
+                                    + e.at("availability").get<std::string>()
+                                    + "' (standard / extension)");
+                            continue;
+                        }
+                        lf.availability = *av;
+                        bool dup = false;
+                        for (LanguageFeatureDef const& prior :
+                             cfg.languageFeatures) {
+                            if (prior.name == lf.name) dup = true;
+                        }
+                        if (dup) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      lpath + "/name",
+                                      "duplicate 'languageFeatures.name' '"
+                                          + lf.name + "'");
+                            continue;
+                        }
+                        cfg.languageFeatures.push_back(std::move(lf));
+                    }
+                }
+            }
+            // `builtinQueryKeywordTokens` — token KIND names whose keyword WORDS
+            // count as builtins for `declared-builtins`. KINDS, not words: the
+            // word is read back out of the keyword table at query time, so a
+            // rebound spelling moves the answer with it.
+            if (pp.contains("builtinQueryKeywordTokens")) {
+                json const& bks = pp.at("builtinQueryKeywordTokens");
+                if (!bks.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/builtinQueryKeywordTokens",
+                              "'preprocess.builtinQueryKeywordTokens' must be "
+                              "an array");
+                } else {
+                    for (std::size_t bi = 0; bi < bks.size(); ++bi) {
+                        const auto bpath = std::format(
+                            "/preprocess/builtinQueryKeywordTokens/{}", bi);
+                        if (!bks[bi].is_string()
+                            || bks[bi].get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess, bpath,
+                                      "a 'builtinQueryKeywordTokens' entry must "
+                                      "be a non-empty token KIND name");
+                            continue;
+                        }
+                        std::string kind = bks[bi].get<std::string>();
+                        checkToken(kind, "builtinQueryKeywordTokens");
+                        cfg.builtinQueryKeywordTokens.push_back(std::move(kind));
+                    }
+                }
+            }
+            // ★★★ `reservedIdentifiers` — THE ONE POSTURE DECLARATION both the
+            // `__STDC__` arm and the operator arm read. Every member is optional
+            // and every default is the MEASURED reference behaviour, so a
+            // language that says nothing gets the union's posture rather than a
+            // silent invention.
+            if (pp.contains("reservedIdentifiers")) {
+                json const& ri = pp.at("reservedIdentifiers");
+                if (!ri.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              "/preprocess/reservedIdentifiers",
+                              "'preprocess.reservedIdentifiers' must be an "
+                              "object");
+                } else {
+                    auto readPosture = [&](char const*                  key,
+                                           PredefinedMacroRedefinition& out) {
+                        if (!ri.contains(key)) return;
+                        if (!ri.at(key).is_string()) {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidPreprocess,
+                                std::string{"/preprocess/reservedIdentifiers/"}
+                                    + key,
+                                std::string{
+                                    "'preprocess.reservedIdentifiers."}
+                                    + key + "' must be a string");
+                            return;
+                        }
+                        std::string const verb = ri.at(key).get<std::string>();
+                        auto const p = predefinedMacroRedefinitionFromName(verb);
+                        if (!p.has_value()) {
+                            coll.emit(
+                                DiagnosticCode::C_InvalidPreprocess,
+                                std::string{"/preprocess/reservedIdentifiers/"}
+                                    + key,
+                                "unknown redefinition posture '" + verb
+                                    + "' (warn-iso-macro / warn-derived-macro / "
+                                      "ordinary / refuse)");
+                            return;
+                        }
+                        out = *p;
+                    };
+                    readPosture("definedOperator",
+                                cfg.reservedIdentifiers.definedOperator);
+                    readPosture(
+                        "conditionalInclusionOperators",
+                        cfg.reservedIdentifiers.conditionalInclusionOperators);
+                    readPosture("featureQueryOperators",
+                                cfg.reservedIdentifiers.featureQueryOperators);
                 }
             }
 
@@ -8292,6 +8861,15 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             "prototypeParamScopeRule",
                             // TF-C62 (D-CSUBSET-GNU-ATTRIBUTE): the OPTIONAL list of
                             // after-declarator attribute rules (attrSpec/stdAttr).
+                            // P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+                            // each entry now carries an `appertainsTo` grain, which
+                            // SUBSUMES and replaces the short-lived
+                            // `afterDeclaratorEntityAttrRules` subset key — a
+                            // subset can only say entity-or-not, and the measured
+                            // axis has three answers. Dropping the old name from
+                            // this vocabulary is what makes a config still
+                            // carrying it fail the load LOUDLY instead of having
+                            // it silently ignored.
                             "afterDeclaratorAttrRules",
                             // TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): the
                             // OPTIONAL third list shape — a comma-separated run of
@@ -8479,39 +9057,47 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // after-declarator attribute rules (`attrSpec`, `stdAttr`) —
                     // the init-detection scans skip a child of these rules so an
                     // after-declarator `__attribute__((...))` is not mistaken for
-                    // the initializer. Absent ⇒ empty (no after-declarator attr
-                    // suffix). Each entry must be a known rule name (else the load
-                    // fails, like the single-role helper).
+                    // the initializer. Absent => empty (no after-declarator attr
+                    // suffix).
+                    //
+                    // ★★★ P56
+                    // (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+                    // EACH ENTRY NOW DECLARES ITS `appertainsTo` GRAIN, read by
+                    // the SHARED `readAttrRunRules` — the same reader every
+                    // declaration row's `declarationAttrSlotRules` uses, so the
+                    // two keys that describe attribute runs cannot validate them
+                    // differently again.
+                    //
+                    // ★★ IT REPLACES A SEPARATE `afterDeclaratorEntityAttrRules`
+                    // SUBSET KEY (P56 lane `nr`, hours earlier) AND THAT IS A
+                    // CORRECTION, NOT A RESHUFFLE. Every measurement behind that
+                    // key RE-DERIVED true; what was wrong was the SHAPE. A subset
+                    // key can express only a BOOLEAN — entity or not — and the
+                    // measured axis has THREE answers, one of which depends on
+                    // the declarator the run follows:
+                    //   • `int x [[deprecated]];`        gcc 13.3.0 warns at the
+                    //     USE, clang 18.1.3 warns at the USE, MSVC 19.51
+                    //     /std:clatest C4996 at the USE       => the ENTITY
+                    //   • `void f(void) [[deprecated]];` gcc `'deprecated'
+                    //     attribute ignored`, clang `error: cannot be applied to
+                    //     types` (rc=1), MSVC `C4649 attributes are ignored in
+                    //     this context`                       => the TYPE
+                    // (each reference probed SEPARATELY, 2026-09-03; C23 6.7.6p1
+                    // vs 6.7.6.3p1). Under the subset key `stdAttr` had to be
+                    // either IN — which invents the first — or OUT — which drops
+                    // the second, a fact all three references confer. The grain
+                    // says `declaratorUnlessTypeDerived` and both are right.
+                    // ⓘ It also retires the subset CROSS-CHECK: a grain written
+                    // ON an entry cannot disagree with the list it is in, so the
+                    // failure mode that check existed to catch is now
+                    // unrepresentable rather than validated.
                     if (dj.contains("afterDeclaratorAttrRules")) {
-                        auto const& arr = dj.at("afterDeclaratorAttrRules");
-                        if (!arr.is_array()) {
-                            coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                      dPath + "/afterDeclaratorAttrRules",
-                                      "'declarators.afterDeclaratorAttrRules' "
-                                      "must be an array of rule-name strings");
+                        if (!readAttrRunRules(
+                                dj.at("afterDeclaratorAttrRules"), *data.rules,
+                                dPath + "/afterDeclaratorAttrRules",
+                                "declarators.afterDeclaratorAttrRules", coll,
+                                dc.afterDeclaratorAttrRules)) {
                             dOk = false;
-                        } else {
-                            for (auto const& e : arr) {
-                                if (!e.is_string()) {
-                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                              dPath + "/afterDeclaratorAttrRules",
-                                              "each entry must be a rule-name string");
-                                    dOk = false;
-                                    continue;
-                                }
-                                std::string const nm = e.get<std::string>();
-                                if (!data.rules->contains(nm)) {
-                                    coll.emit(DiagnosticCode::C_UnknownShape,
-                                              dPath + "/afterDeclaratorAttrRules",
-                                              std::format("references unknown "
-                                                          "shape '{}'", nm));
-                                    dOk = false;
-                                    continue;
-                                }
-                                dc.afterDeclaratorAttrRuleNames.push_back(nm);
-                                dc.afterDeclaratorAttrRules.push_back(
-                                    data.rules->find(nm));
-                            }
                         }
                     }
                     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the declarator-level
@@ -8938,10 +9524,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     // missing keys are BOOLEANS, so the "string
                                     // fields" half was wrong for them as well
                                     // (D-CONFIG-GRAMMAR-LOADER-KEY-SHAPE-SENTENCES-RETYPE-THEIR-VOCABULARIES).
-                                    static constexpr std::array<std::string_view, 4>
+                                    static constexpr std::array<std::string_view, 7>
                                         kLinkageEffectKeys{"binding", "visibility",
                                                            "staticStorage",
-                                                           "threadStorage"};
+                                                           "threadStorage",
+                                                           "nonDefining",
+                                                           "exclusiveGroup",
+                                                           "compatibleWith"};
                                     DSS_CHECK_KEY_VOCABULARY(kLinkageEffectKeys);
                                     if (!eff.is_object()) {
                                         coll.emit(DiagnosticCode::C_InvalidSemantics,
@@ -9048,6 +9637,98 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                         effect.threadStorage =
                                             eff.at("threadStorage").get<bool>();
                                         if (effect.threadStorage) any = true;
+                                    }
+                                    // D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS
+                                    // (P53): the NON-DEFINING axis — `extern` says
+                                    // the declaration announces a name defined
+                                    // elsewhere. The staticStorage/threadStorage
+                                    // mirror, third of three optional bools.
+                                    if (eff.contains("nonDefining")) {
+                                        if (!eff.at("nonDefining").is_boolean()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'nonDefining' must be a "
+                                                      "boolean");
+                                            continue;
+                                        }
+                                        effect.nonDefining =
+                                            eff.at("nonDefining").get<bool>();
+                                        if (effect.nonDefining) any = true;
+                                    }
+                                    // C 6.7.1p2 as CONFIG: the mutual-exclusion
+                                    // group this specifier belongs to (at most one
+                                    // DISTINCT member per declaration). A
+                                    // non-empty string is required — an empty one
+                                    // would declare a group nothing can be told
+                                    // apart from "no group", which is exactly the
+                                    // silently-inert facet this loader refuses
+                                    // everywhere else.
+                                    if (eff.contains("exclusiveGroup")) {
+                                        if (!eff.at("exclusiveGroup").is_string()
+                                            || eff.at("exclusiveGroup")
+                                                   .get<std::string>()
+                                                   .empty()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'exclusiveGroup' must be a "
+                                                      "non-empty string naming the "
+                                                      "mutual-exclusion group this "
+                                                      "specifier belongs to");
+                                            continue;
+                                        }
+                                        effect.exclusiveGroup =
+                                            eff.at("exclusiveGroup").get<std::string>();
+                                        any = true;
+                                    }
+                                    // C 6.7.1's "except that …" clause — the
+                                    // NAMED exceptions to the group. `static
+                                    // constexpr` is legal C23 while `extern
+                                    // constexpr` is not, so a flat group cannot
+                                    // state the rule on its own.
+                                    if (eff.contains("compatibleWith")) {
+                                        auto const& cw = eff.at("compatibleWith");
+                                        if (!cw.is_array()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'compatibleWith' must be an "
+                                                      "array of specifier-text "
+                                                      "strings naming the members "
+                                                      "of this specifier's "
+                                                      "exclusiveGroup it may "
+                                                      "legally co-occur with");
+                                            continue;
+                                        }
+                                        bool bad = false;
+                                        for (auto const& e2 : cw) {
+                                            if (!e2.is_string()
+                                                || e2.get<std::string>().empty()) {
+                                                coll.emit(
+                                                    DiagnosticCode::C_InvalidSemantics,
+                                                    effPath,
+                                                    "each 'compatibleWith' entry "
+                                                    "must be a non-empty specifier-"
+                                                    "text string");
+                                                bad = true;
+                                                break;
+                                            }
+                                            effect.compatibleWith.push_back(
+                                                e2.get<std::string>());
+                                        }
+                                        if (bad) continue;
+                                        // An exception list with no group to
+                                        // except FROM is a statement about
+                                        // nothing — the silently-inert facet
+                                        // this loader refuses everywhere else.
+                                        if (effect.exclusiveGroup.empty()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'compatibleWith' names "
+                                                      "exceptions to an "
+                                                      "'exclusiveGroup', so the "
+                                                      "entry must declare one");
+                                            continue;
+                                        }
+                                        any = true;
                                     }
                                     if (!any) {
                                         coll.emit(DiagnosticCode::C_InvalidSemantics,
@@ -9695,18 +10376,40 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // child INDICES: a wrong index is SILENT (the scan
                         // descends, finds no attributes, asserts nothing)
                         // whereas a wrong name cannot resolve and is rejected
-                        // right here — see the field's header comment. Unknown
-                        // name ⇒ C_InvalidSemantics, matching the sibling
-                        // rule-reference keys' fail-loud posture.
+                        // right here — see the field's header comment.
+                        //
+                        // ★★★ P56
+                        // (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+                        // EVERY ENTRY NOW DECLARES WHAT ITS ATTRIBUTES
+                        // APPERTAIN TO, through the SHARED `readAttrRunRules`
+                        // — the same reader `declarators.afterDeclaratorAttrRules`
+                        // uses. A declaration may put attribute slots on BOTH
+                        // sides of its declarator list and the two sides mean
+                        // different things: c's `declAttrRun` sits before the
+                        // list and reaches every declarator, while
+                        // `structMemberAttrList`, `paramTrailingAttrRun` and the
+                        // trailing typedef run sit after it and reach the LAST
+                        // declarator alone (✔MEASURED 2026-09-03, gcc 13.3.0 and
+                        // clang 18.1.3 agreeing: `struct S { int p, q
+                        // __attribute__((deprecated)); };` warns at a use of `q`
+                        // and is clean at a use of `p`).
+                        //
+                        // ⚠ THE KEY USED TO SAY NEITHER, AND EACH CONSUMER
+                        // GUESSED DIFFERENTLY. The noreturn fold inferred the
+                        // grain POSITIONALLY — walk the children, stop at the
+                        // first declarator-bearing one — while the FC17
+                        // attribute fold and the HIR linkage fold did not infer
+                        // it at all. A positional inference is a weaker claim
+                        // than this key, not a cheaper spelling of it: it reads
+                        // where a slot SITS in one grammar rather than what its
+                        // attributes MEAN, says nothing for a language that
+                        // writes its trailing run before its declarators, and is
+                        // invisible to any consumer that does not reimplement
+                        // the walk — which is exactly how the three consumers
+                        // came to disagree.
                         if (entry.contains("declarationAttrSlotRules")) {
                             auto const& das = entry.at("declarationAttrSlotRules");
-                            if (!das.is_array()) {
-                                coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                          path + "/declarationAttrSlotRules",
-                                          std::format("'declarations[{}]."
-                                                      "declarationAttrSlotRules' must "
-                                                      "be an array of rule names", i));
-                            } else if (das.empty()) {
+                            if (das.is_array() && das.empty()) {
                                 // An empty list is byte-identical to omitting
                                 // the key, so writing it says nothing while
                                 // reading as a configured attribute surface —
@@ -9721,51 +10424,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                       "name the attribute slots or "
                                                       "drop it", i));
                             } else {
-                                for (auto const& elem : das) {
-                                    if (!elem.is_string()) {
-                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                                  path + "/declarationAttrSlotRules",
-                                                  "each attribute-slot entry must be a "
-                                                  "rule-name string");
-                                        continue;
-                                    }
-                                    auto const rn = elem.get<std::string>();
-                                    // A repeat entry makes the semantic attribute
-                                    // scan visit that slot TWICE — every clause
-                                    // under it is then seen twice, so a
-                                    // per-attribute diagnostic fires twice and a
-                                    // per-attribute effect is applied twice.
-                                    // Silent today, and never what was meant.
-                                    if (std::ranges::find(
-                                            rule.declarationAttrSlotRuleNames, rn)
-                                        != rule.declarationAttrSlotRuleNames.end()) {
-                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                                  path + "/declarationAttrSlotRules",
-                                                  std::format("'declarations[{}]."
-                                                              "declarationAttrSlotRules' "
-                                                              "lists '{}' more than once "
-                                                              "— the attribute scan would "
-                                                              "visit that slot twice",
-                                                              i, rn));
-                                        continue;
-                                    }
-                                    if (!data.rules->contains(rn)) {
-                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                                  path + "/declarationAttrSlotRules",
-                                                  std::format("'declarations[{}]."
-                                                              "declarationAttrSlotRules' "
-                                                              "references unknown shape "
-                                                              "'{}' — an attribute slot "
-                                                              "is named, not indexed, "
-                                                              "precisely so this cannot "
-                                                              "be a silent no-op",
-                                                              i, rn));
-                                        continue;
-                                    }
-                                    rule.declarationAttrSlotRules.push_back(
-                                        data.rules->find(rn));
-                                    rule.declarationAttrSlotRuleNames.push_back(rn);
-                                }
+                                readAttrRunRules(
+                                    das, *data.rules,
+                                    path + "/declarationAttrSlotRules",
+                                    std::format("declarations[{}]."
+                                                "declarationAttrSlotRules", i),
+                                    coll, rule.declarationAttrSlotRules);
                             }
                         }
 
@@ -13240,7 +13904,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // to learn the vocabulary, so it is derived from the
                         // vocabulary rather than restated alongside it.
                         static constexpr std::array<
-                            std::pair<std::string_view, AttributeEffect>, 10>
+                            std::pair<std::string_view, AttributeEffect>, 11>
                             kEffectVerbs{{
                                 {"suppressUnused", AttributeEffect::SuppressUnused},
                                 {"warnOnUse",      AttributeEffect::WarnOnUse},
@@ -13284,6 +13948,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 // all.
                                 {"runBeforeEntry", AttributeEffect::RunBeforeEntry},
                                 {"runAfterEntry",  AttributeEffect::RunAfterEntry},
+                                // D-CSUBSET-PER-MEMBER-PACKED: GNU `packed` written
+                                // on ONE struct/union member-declarator — that
+                                // member's baseline alignment becomes 1 and its
+                                // siblings, and the aggregate's own alignment, are
+                                // untouched. DECLARATION-ATTACHED like its
+                                // neighbours (it is written in a declaration, so the
+                                // Clause-B drift cross-check requires its name in
+                                // every strict-scan row's
+                                // `linkageSpecifierIgnoredNames` — `packed` is
+                                // already on that roster, which is why moving the
+                                // name out of the `none` row does not disturb it).
+                                // The sink is the composite's `fieldPacked` channel
+                                // in the type interner, read by `computeLayout`
+                                // through the same `clampedBaselineAlign` the
+                                // whole-composite `packed` uses.
+                                {"packField",      AttributeEffect::PackField},
                                 {"none",           AttributeEffect::None}}};
                         DSS_CHECK_KEY_VOCABULARY(kEffectVerbs);
 
@@ -16455,7 +17135,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // two keys the loader reads two hundred lines further down. One
             // owner per fact: the OPTIONALITY is a comment, the MEMBERSHIP is
             // the table.
-            static constexpr std::array<std::string_view, 18> kAssemblyKeys{
+            static constexpr std::array<std::string_view, 19> kAssemblyKeys{
                 // required whenever the block is present
                 "unitRule",      "lineRule",      "elementRule",
                 "directiveRule", "statementRule", "labelTailRule",
@@ -16464,6 +17144,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 "templateLexerMode", "templateOperandRule",
                 "templateLabelRule", "templateModifierRule",
                 "templateModifiers",
+                // OPTIONAL, and NOT part of the template capability census
+                // below: a lane arrangement is written in a standalone `.s`
+                // exactly as it is in a template, so a dialect may declare it
+                // with or without a template surface.
+                // D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME.
+                "registerArrangements",
                 // OPTIONAL, and validated separately below: a dialect with no
                 // directive vocabulary refuses every directive by name, which
                 // is a coherent state.
@@ -16693,13 +17379,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // decodes it, so a 128-bit letter (`%q0` on aarch64,
                         // ✔MEASURED rendering `q0` under gcc 13.3.0 AND clang
                         // 18.1.3 on a `"w"`-bound double) states a width the
-                        // instruction model carries. What still refuses such a
-                        // letter's USE today is the template translator's
-                        // width-flag mapping, loudly and by name, until a
-                        // target declares a width-128 encoding variant — a
-                        // POSITIONED diagnostic, which a load-time width
-                        // refusal here would replace with a config error about
-                        // a letter both references render.
+                        // instruction model carries.
+                        // ⚠ THE CLAUSE THAT FOLLOWED — *what still refuses such
+                        // a letter's USE today is the template translator's
+                        // width-flag mapping … until a target declares a
+                        // width-128 encoding variant* — WENT FALSE ON
+                        // 2026-09-02 AND ITS CONCLUSION SURVIVED. `arm64.target
+                        // .json`'s `popcount_bytes` and `addlanes_bytes` grew
+                        // width-128 arms (CNT/ADDV over sixteen byte lanes,
+                        // ✔MEASURED against gas 2.42 and clang 18.1.3), the
+                        // translator's `case 128:` landed in the same change,
+                        // and a 128-bit template operand now ELECTS. What is
+                        // unchanged is why the check here stays a width-SET
+                        // test rather than a use-time one: a load-time refusal
+                        // would be a config error about a letter both
+                        // references render, where the translator's is a
+                        // POSITIONED diagnostic about the line that used it.
                         // The set itself lives on `AssemblyConfig`
                         // (`kTemplateModifierWidthBits`) so the asm tier's
                         // test can static_assert it against
@@ -16900,6 +17595,244 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     "legal-on-every-class",
                                     *firstScoped, *firstUnscoped));
                             assemblyClean = false;
+                        }
+                    }
+
+                    // ── registerArrangements ── OPTIONAL; the LANE ARRANGEMENT
+                    // suffixes this dialect writes on a vector register.
+                    // D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME.
+                    //
+                    // ★ THE SAME THREE FIELDS `templateModifiers` DECLARES —
+                    // spelling, width, class — because it is the same fact
+                    // written on the other side of the name: `v1.8b` is a
+                    // 64-bit view of `v1` exactly as `d1` is. It is parsed
+                    // beside them rather than inside them because the SHAPES
+                    // differ (a modifier is a sigil-composed PREFIX, an
+                    // arrangement a self-contained SUFFIX) and folding two
+                    // shapes into one list would make every reader ask which
+                    // one a row was.
+                    //
+                    // ⚠ `registerClass` IS REQUIRED HERE, where a modifier's is
+                    // optional: an unscoped modifier is a measured posture
+                    // (gcc accepts `%k0` on an xmm operand), while an unscoped
+                    // arrangement has no referent at all — lanes are a property
+                    // of a vector file.
+                    //
+                    // ⚠⚠ AND SO IS `laneBits`, WHICH IS THE FOURTH FIELD AND THE
+                    // ONE A MODIFIER HAS NO ANALOGUE FOR —
+                    // [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]].
+                    // The three-field row above states a WIDTH and a CLASS and
+                    // stops, so `.8b`, `.4h`, `.2s` and `.1d` were ONE row's
+                    // worth of information four times over, and a scalar `d1`
+                    // was a fifth. Requiring the key rather than defaulting it
+                    // is deliberate: a defaulted lane width would be a number
+                    // the author never wrote, keying an election that eliminates
+                    // candidates — see the struct comment for the two measured
+                    // spellings that reached the wrong instruction without it.
+                    if (as.contains("registerArrangements")) {
+                        json const& arr = as.at("registerArrangements");
+                        if (!arr.is_array() || arr.empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      "/assembly/registerArrangements",
+                                      "'registerArrangements' must be a "
+                                      "non-empty array of {suffix, widthBits, "
+                                      "laneBits, registerClass} rows; omit the "
+                                      "key entirely on a dialect whose registers "
+                                      "carry no lane arrangement");
+                            assemblyClean = false;
+                        } else {
+                            constexpr auto const& kArrWidths =
+                                AssemblyConfig::kTemplateModifierWidthBits;
+                            for (std::size_t ai = 0; ai < arr.size(); ++ai) {
+                                auto const path = std::format(
+                                    "/assembly/registerArrangements/{}", ai);
+                                json const& a = arr[ai];
+                                static constexpr std::array<std::string_view, 4>
+                                    kArrKeys{"suffix", "widthBits", "laneBits",
+                                             "registerClass"};
+                                DSS_CHECK_KEY_VOCABULARY(kArrKeys);
+                                if (!a.is_object()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidHirLowering,
+                                        path,
+                                        "each 'registerArrangements' entry "
+                                        "must be an object");
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                if (!checkKeysAgainst(
+                                        a, kArrKeys, path,
+                                        "a 'registerArrangements' row",
+                                        DiagnosticCode::C_InvalidHirLowering,
+                                        coll, "")) {
+                                    assemblyClean = false;
+                                }
+                                if (!a.contains("suffix")
+                                    || !a.at("suffix").is_string()
+                                    || a.at("suffix").get<std::string>()
+                                           .empty()) {
+                                    coll.emit(DiagnosticCode::C_MissingField,
+                                              path + "/suffix",
+                                              "'suffix' is required and must "
+                                              "be the arrangement AS WRITTEN, "
+                                              "INCLUDING its separator "
+                                              "(\".8b\", not \"8b\") — the "
+                                              "engine never spells a separator "
+                                              "byte of its own");
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                auto suffix =
+                                    a.at("suffix").get<std::string>();
+                                if (!a.contains("widthBits")
+                                    || !a.at("widthBits").is_number_unsigned()) {
+                                    coll.emit(DiagnosticCode::C_MissingField,
+                                              path + "/widthBits",
+                                              std::format(
+                                                  "arrangement '{}' must "
+                                                  "declare 'widthBits' — how "
+                                                  "wide the register IS when "
+                                                  "written this way (lanes x "
+                                                  "lane width)",
+                                                  suffix));
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                auto const width =
+                                    a.at("widthBits").get<std::uint32_t>();
+                                if (std::find(kArrWidths.begin(),
+                                              kArrWidths.end(), width)
+                                    == kArrWidths.end()) {
+                                    std::string allowed;
+                                    for (std::uint32_t const w : kArrWidths) {
+                                        if (!allowed.empty()) allowed += " | ";
+                                        allowed += std::to_string(w);
+                                    }
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidHirLowering,
+                                        path + "/widthBits",
+                                        std::format(
+                                            "arrangement '{}' declares "
+                                            "'widthBits' {}, which is not one "
+                                            "of the operation widths LIR can "
+                                            "state ({}) — a width outside the "
+                                            "set carries no instruction flag "
+                                            "and would be read back as the "
+                                            "register's own",
+                                            suffix, width, allowed));
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                // ── laneBits ── REQUIRED. See the block above.
+                                if (!a.contains("laneBits")
+                                    || !a.at("laneBits").is_number_unsigned()
+                                    || a.at("laneBits").get<std::uint32_t>()
+                                           == 0) {
+                                    coll.emit(DiagnosticCode::C_MissingField,
+                                              path + "/laneBits",
+                                              std::format(
+                                                  "arrangement '{}' must "
+                                                  "declare a non-zero "
+                                                  "'laneBits' — the width of "
+                                                  "ONE lane. Without it '{}' is "
+                                                  "indistinguishable from every "
+                                                  "other arrangement of the "
+                                                  "same total width, AND from a "
+                                                  "scalar spelling of the same "
+                                                  "register, so an instruction "
+                                                  "declared for one lane shape "
+                                                  "is reachable from all of "
+                                                  "them",
+                                                  suffix, suffix));
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                auto const laneBits =
+                                    a.at("laneBits").get<std::uint32_t>();
+                                if (laneBits > width || width % laneBits != 0) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidHirLowering,
+                                        path + "/laneBits",
+                                        std::format(
+                                            "arrangement '{}' declares "
+                                            "'widthBits' {} over 'laneBits' {}, "
+                                            "which is not a whole number of "
+                                            "lanes — a view of a register is "
+                                            "N lanes of L bits and {} / {} is "
+                                            "not an integer, so the row "
+                                            "describes no operand shape the "
+                                            "machine has",
+                                            suffix, width, laneBits, width,
+                                            laneBits));
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                if (!a.contains("registerClass")
+                                    || !a.at("registerClass").is_string()
+                                    || a.at("registerClass").get<std::string>()
+                                           .empty()) {
+                                    coll.emit(DiagnosticCode::C_MissingField,
+                                              path + "/registerClass",
+                                              std::format(
+                                                  "arrangement '{}' must name "
+                                                  "the register class it views "
+                                                  "— lanes are a property of a "
+                                                  "vector FILE, so there is no "
+                                                  "unscoped arrangement the "
+                                                  "way there is an unscoped "
+                                                  "width-view letter",
+                                                  suffix));
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                auto regClass =
+                                    a.at("registerClass").get<std::string>();
+                                auto const cls =
+                                    targetRegClassFromName(regClass);
+                                if (!cls.has_value()
+                                    || !isOperableTargetRegClass(*cls)) {
+                                    std::string allowed;
+                                    for (auto const n
+                                         : kOperableTargetRegClassNames) {
+                                        if (!allowed.empty()) allowed += " | ";
+                                        allowed += n;
+                                    }
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidHirLowering,
+                                        path + "/registerClass",
+                                        std::format(
+                                            "arrangement '{}' names register "
+                                            "class '{}', which is not an "
+                                            "operable class of the envelope "
+                                            "({})",
+                                            suffix, regClass, allowed));
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                bool duplicate = false;
+                                for (auto const& prev :
+                                     cfg.registerArrangements) {
+                                    if (prev.suffix != suffix) continue;
+                                    duplicate = true;
+                                    coll.emit(
+                                        DiagnosticCode::C_ConflictingField,
+                                        path + "/suffix",
+                                        std::format(
+                                            "arrangement '{}' is declared "
+                                            "twice ({} bits and {} bits) — one "
+                                            "spelling cannot name two widths, "
+                                            "and which one answered would be "
+                                            "decided by table order",
+                                            suffix, prev.widthBits, width));
+                                    assemblyClean = false;
+                                    break;
+                                }
+                                if (duplicate) continue;
+                                cfg.registerArrangements.push_back(
+                                    AssemblyConfig::AsmRegisterArrangement{
+                                        std::move(suffix), width, laneBits,
+                                        std::move(regClass)});
+                            }
                         }
                     }
 
@@ -17458,9 +18391,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         assemblyClean = false;
                         continue;
                     }
-                    static constexpr std::array<std::string_view, 6>
+                    static constexpr std::array<std::string_view, 8>
                         kInstRowKeys{"spelling", "opcodes", "width",
-                                     "destWidth", "cond",
+                                     "destWidth", "destWidthFromOperands",
+                                     "cond",
+                                     "opcodesAreRankedEncodings",
                                      "operandSelectors"};
                     DSS_CHECK_KEY_VOCABULARY(kInstRowKeys);
                     // ★ NAME THE RENAME. `opcode` (a single string) was this
@@ -17634,6 +18569,84 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             continue;
                         }
                         ins.destWidth = row.at("destWidth").get<std::uint32_t>();
+                    }
+                    // ── destWidthFromOperands ── OPTIONAL; "this spelling has
+                    // TWO widths and the REGISTERS state both". Anchor:
+                    // D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME.
+                    // ★★ REFUSED BESIDE `width` OR `destWidth` — each of those
+                    // STATES a number this key says the operands state, and a
+                    // fact with two owners is how the two go out of sync. It is
+                    // the same exclusivity `width`-absent already has with a
+                    // stated `width`, made explicit because here BOTH ends are
+                    // derived and a half-stated row would look reasonable.
+                    // [[D-ASM-ARM64-LDR-TO-LDUR-CONVENIENCE-ALIAS-REFUSED]]:
+                    // `opcodes` is a RANKED list of encodings of ONE operation
+                    // rather than a set of alternative instructions, so a tie
+                    // is settled by rank instead of refused. See the field's
+                    // comment for why the default refusal is right and why this
+                    // key is only safe beside `guard.immMultipleOf`.
+                    // ⚠ A ONE-CANDIDATE ROW IS REFUSED: there is no tie to
+                    // rank, so the key states nothing while looking like it
+                    // states something — and a reader would take it as
+                    // meaningful and copy it onto a row where it is not.
+                    if (row.contains("opcodesAreRankedEncodings")) {
+                        if (!row.at("opcodesAreRankedEncodings").is_boolean()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      path + "/opcodesAreRankedEncodings",
+                                      "'opcodesAreRankedEncodings' must be a "
+                                      "boolean — it says this row's 'opcodes' "
+                                      "are encodings of ONE operation, ranked, "
+                                      "so a candidate that fits later in the "
+                                      "list is a fallback rather than a rival "
+                                      "reading of the same line");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        ins.opcodesAreRankedEncodings =
+                            row.at("opcodesAreRankedEncodings").get<bool>();
+                        if (ins.opcodesAreRankedEncodings
+                            && ins.opcodeNames.size() < 2) {
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      path + "/opcodesAreRankedEncodings",
+                                      "'opcodesAreRankedEncodings' ranks the "
+                                      "candidates in 'opcodes', but this row "
+                                      "names fewer than two — there is no tie "
+                                      "for a rank to settle, so the key states "
+                                      "nothing. Drop it, or name the fallback "
+                                      "encodings it is there to rank");
+                            assemblyClean = false;
+                            continue;
+                        }
+                    }
+                    if (row.contains("destWidthFromOperands")) {
+                        if (!row.at("destWidthFromOperands").is_boolean()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      path + "/destWidthFromOperands",
+                                      "'destWidthFromOperands' must be a "
+                                      "boolean — it says the REGISTERS state "
+                                      "both of this spelling's widths, which a "
+                                      "conversion mnemonic needs because one "
+                                      "spelling covers N width pairs");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        ins.destWidthFromOperands =
+                            row.at("destWidthFromOperands").get<bool>();
+                        if (ins.destWidthFromOperands
+                            && (ins.width.has_value()
+                                || ins.destWidth.has_value())) {
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      path + "/destWidthFromOperands",
+                                      "'destWidthFromOperands' says the "
+                                      "operands state both of this spelling's "
+                                      "widths, so it cannot appear beside "
+                                      "'width' or 'destWidth', which STATE "
+                                      "them — one fact, two owners, and "
+                                      "nothing would report the day they "
+                                      "disagreed");
+                            assemblyClean = false;
+                            continue;
+                        }
                     }
                     // ── operandSelectors ── OPTIONAL; the written operands that
                     // are part of the MNEMONIC rather than operands of it.

@@ -62,18 +62,34 @@ void reportDriver(DiagnosticReporter& rep,
 }
 
 // Build the ParserConfig for parsing `schema`'s sources, applying the
-// language's config-driven knobs. Today the only such knob is the
-// expression-nesting cap (`parser.maxExpressionDepth` in the `.lang.json`):
-// when the config declares it, it overrides the `ParserConfig` C++ fallback
-// default; when omitted, the fallback (256) stands. This is THE single
-// chokepoint that makes the cap config-driven — every real parse in this file
-// routes through it. (`P_ExpressionTooDeep` remains the fail-loud backstop at
-// whatever value results.) AGNOSTIC: reads the schema's own value; no
-// language/target/format branch.
+// language's config-driven knobs. Two such knobs today, both `.lang.json`
+// `parser` fields, each overriding its `ParserConfig` C++ fallback default when
+// declared and leaving the fallback standing when omitted:
+//   * `parser.maxExpressionDepth`  — the Pratt walker's expression-nesting cap
+//     (`P_ExpressionTooDeep` is the fail-loud backstop at whatever results);
+//   * `parser.maxSpeculationDepth` — the parser's speculative-probe nesting cap
+//     (`P_MaxSpeculationDepth` is the fail-loud backstop at whatever results).
+//     The parser derives the TreeBuilder's checkpoint cap from this same value,
+//     so the two stacked caps cannot disagree and neither hides behind the
+//     other.
+//   * `parser.speculationBudgetFactor` — how many tokens ONE speculative probe
+//     may consume, as a multiple of the alt's declared `lookahead`
+//     (`P_SpeculationBudgetExhausted` is the fail-loud backstop at whatever
+//     results). The THIRD ceiling on a deeply-nested construct; all three are
+//     read here so none of them can bind while wearing another's costume.
+// This is THE single chokepoint that makes all three config-driven — every real
+// parse in this file routes through it. AGNOSTIC: reads the schema's own values;
+// no language/target/format branch.
 [[nodiscard]] ParserConfig parserConfigFor(GrammarSchema const& schema) {
     ParserConfig cfg;
     if (auto cap = schema.maxExpressionDepth()) {
         cfg.maxExpressionDepth = *cap;
+    }
+    if (auto cap = schema.maxSpeculationDepth()) {
+        cfg.maxSpeculationDepth = *cap;
+    }
+    if (auto factor = schema.speculationBudgetFactor()) {
+        cfg.speculationBudgetFactor = *factor;
     }
     return cfg;
 }
@@ -371,7 +387,11 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
                                          headerNameMatching_, budget_, systemDirs_,
                                          activeFormat_, userDefines_,
                                          targetPredefinedMacros_,
-                                         formatPredefinedMacros_);
+                                         formatPredefinedMacros_,
+                                         // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]:
+                                         // the target's plain-`char` sign, for
+                                         // the `#if` ICE fold.
+                                         charIsUnsigned_);
         phase.reset();
         auto remap = pp.makeRemap();
         // [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: the DIAGNOSTIC-shaped
@@ -721,6 +741,13 @@ void UnitBuilder::setHeaderNameMatching(HeaderNameMatching matching) {
         cuFatal("UnitBuilder::setHeaderNameMatching called after finish()");
     }
     headerNameMatching_ = matching;
+}
+
+void UnitBuilder::setCharIsUnsigned(std::optional<bool> charIsUnsigned) {
+    if (finished_) {
+        cuFatal("UnitBuilder::setCharIsUnsigned called after finish()");
+    }
+    charIsUnsigned_ = charIsUnsigned;
 }
 
 void UnitBuilder::setUserDefines(std::vector<std::string> defines) {

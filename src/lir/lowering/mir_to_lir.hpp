@@ -3,7 +3,8 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
-#include "core/types/object_format_kind.hpp"  // ExternCallDispatch (extern-call shape)
+#include "core/types/object_format_kind.hpp"  // ExternCallDispatch (extern-call shape), AtomicsRuntime
+#include "core/types/symbol_attrs.hpp"        // SymbolBinding (the `indirectSlotBindings` narrowing axis)
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "lir/lir.hpp"
@@ -354,6 +355,48 @@ lowerToLir(Mir const&          mir,
            // compare chain. Defaults to nullopt; the first non-promoting
            // frontend's driver threads the target's resolved value exactly
            // as `externCallDispatch` is threaded.
-           std::optional<bool> charIsUnsigned = std::nullopt);
+           std::optional<bool> charIsUnsigned = std::nullopt,
+           // D-CSUBSET-PACKED-ATOMIC-MEMBER: the ACTIVE object format's
+           // atomics-runtime declaration, read from
+           // `ObjectFormatSchema::atomicsRuntime()` one level up — the image
+           // that owns the GENERIC `__atomic_load`/`__atomic_store` entries
+           // plus their already-mangled names for this format. Consumed by
+           // exactly one arm: an `_Atomic` scalar access whose stamped
+           // `payload2` alignment is LESS than its width, under a target whose
+           // `underAlignedAtomicForm` is not `remainsAtomic`. `std::nullopt` =
+           // the format supplies none, and what happens then is the TARGET's
+           // answer, not a silent default: `traps` (arm64 — the native
+           // LDAR/STLR pair is a MEASURED rc 135 SIGBUS on real hardware)
+           // fails LOUD naming this key rather than emit a certain fault;
+           // `losesAtomicity` (x86_64, where the native form is what gcc ships
+           // and works) keeps the native form rather than refuse, because
+           // refusing would put a format that declares no runtime below the
+           // reference union. ⚠ THAT CLAUSE USED TO NAME pe64 as "the one
+           // shipped format with no atomics image", and P54 ended it: pe64 now
+           // declares the role and fills it from a body DSS ships and compiles
+           // (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64), so `std::nullopt` reaches
+           // no shipped format today — the arm pins a RULE, not a platform.
+           // Trailing (like `wideFloatSoftcallLibrary`) so
+           // existing positional callers are unaffected. Defaults to nullopt.
+           std::optional<AtomicsRuntime> atomicsRuntime = std::nullopt,
+           // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT: WHICH
+           // symbol BINDINGS the `indirect-slot` dispatch above applies to,
+           // read from `ObjectFormatSchema::indirectSlotBindings()` one level
+           // up — the DECLARED narrowing, verbatim. EMPTY (the default, and
+           // every format that does not declare the key) = the dispatch is
+           // UNNARROWED: every import takes the slot, which is the meaning
+           // `indirect-slot` carried before the key existed, so every caller
+           // that threads nothing keeps exactly the behaviour it asserted.
+           // Consulted ONLY under `externCallDispatch == indirect-slot`; a
+           // `direct-plt` or nullopt module ignores it entirely.
+           //
+           // ⓘ THE RULE THAT DECIDES THE SET HAS ONE OWNER AND IT IS NOT HERE:
+           // `ObjectFormatSchema::externRefTakesImportSlot` — the linker's slot
+           // pass calls it directly, and the two tiers must agree symbol for
+           // symbol or the object is miscompiled in one direction or the other
+           // (a slot nothing derefs, or a direct call retargeted at pointer
+           // bytes). What is threaded here is the DECLARED DATA that rule reads,
+           // not a second copy of the rule.
+           std::vector<SymbolBinding> indirectSlotBindings = {});
 
 } // namespace dss

@@ -204,14 +204,16 @@ mergedSymbolOf(MergePlan const& plan, std::uint32_t cuIdx, SymbolId oldSym) {
 // WITHOUT this remap the global's abs64 reloc targets a STALE CU-local id in any
 // multi-`.c` build → linker `K_SymbolUndefined` (lucky) or a silently-wrong VA
 // (id collision) — a pointer miscompile invisible to a single-CU corpus.
+// D-MIR-NESTED-AGGREGATE-LITERAL-WALKS-RECURSE-PER-INITIALIZER-LEVEL: the field
+// descent was host recursion with no cap; it is now the shared heap walker in
+// `mir/mir_literal_pool.hpp`.
 void remapLiteralSymbols(MirLiteralValue& lit, MergePlan const& plan,
                          std::uint32_t cuIdx) {
-    if (auto* sa = std::get_if<MirSymbolAddrValue>(&lit.value)) {
-        sa->symbol = mergedSymbolOf(plan, cuIdx, SymbolId{sa->symbol}).v;
-    } else if (auto* agg = std::get_if<MirAggregateValue>(&lit.value)) {
-        for (MirLiteralValue& f : agg->fields)
-            remapLiteralSymbols(f, plan, cuIdx);
-    }
+    forEachLiteralNode(lit, [&](MirLiteralValue& n) {
+        if (auto* sa = std::get_if<MirSymbolAddrValue>(&n.value)) {
+            sa->symbol = mergedSymbolOf(plan, cuIdx, SymbolId{sa->symbol}).v;
+        }
+    });
 }
 
 // ── one-function clone into the shared builder ─────────────────────
@@ -877,17 +879,19 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     // the set `remapLiteralSymbols` rewrites, so planning and remapping now walk
     // the same shape; a body whose literal named a symbol the plan never saw
     // would abort in `remapLiteralSymbols` with no way to tell which body did it.
-    auto const assignLiteralSymbols = [&](auto&& self, std::uint32_t ci,
+    // D-MIR-NESTED-AGGREGATE-LITERAL-WALKS-RECURSE-PER-INITIALIZER-LEVEL: was a
+    // `self(self, …)` recursive lambda, one host frame per brace level, no cap.
+    // ⚠ The ASSIGNMENT ORDER is observable (symbols are numbered as they are
+    // assigned), which is why the shared walker preserves field order.
+    auto const assignLiteralSymbols = [&](std::uint32_t ci,
                                           MirLiteralValue const& v) -> void {
-        if (auto const* sa = std::get_if<MirSymbolAddrValue>(&v.value)) {
-            SymbolId const s{sa->symbol};
-            assignSymbol(ci, s, cus[ci].nameOf(s), /*ffiRow=*/nullptr,
-                         /*isLocalDef=*/false);
-            return;
-        }
-        if (auto const* agg = std::get_if<MirAggregateValue>(&v.value)) {
-            for (auto const& fld : agg->fields) self(self, ci, fld);
-        }
+        forEachLiteralNode(v, [&](MirLiteralValue const& n) {
+            if (auto const* sa = std::get_if<MirSymbolAddrValue>(&n.value)) {
+                SymbolId const s{sa->symbol};
+                assignSymbol(ci, s, cus[ci].nameOf(s), /*ffiRow=*/nullptr,
+                             /*isLocalDef=*/false);
+            }
+        });
     };
 
     for (std::uint32_t ci = 0; ci < cus.size(); ++ci) {
@@ -938,8 +942,7 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                             break;
                         case MirOpcode::Const:
                             assignLiteralSymbols(
-                                assignLiteralSymbols, ci,
-                                m.literalValue(m.constLiteralIndex(inst)));
+                                ci, m.literalValue(m.constLiteralIndex(inst)));
                             break;
                         default:
                             break;
@@ -1262,6 +1265,23 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             // elf exit 127), not a size regression. Order-INDEPENDENT: whichever
             // CU's row lands first, the bit is ORed in.
             kept.isEagerImport = kept.isEagerImport || e.isEagerImport;
+            // `binding` — STRONGEST WINS, as `ExternImport::binding`'s own
+            // contract note in extern_import.hpp mandates
+            // (D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE). A STRONG
+            // reference anywhere in the program makes the symbol REQUIRED, so a
+            // CU that declared the import plain must not have its requirement
+            // erased by a sibling CU that declared the same name `weak` — that
+            // erasure is a program which links with the symbol absent and then
+            // reads through a null address. NOT a conflict like `isData`: both
+            // rows name the same object bound the same way and differ only in
+            // whether their own TU can do without it, which is a DEFINED fold.
+            // Order-INDEPENDENT: `Weak` < `Global` in the shared enum, so the max
+            // is the same whichever row lands first, and Local never reaches here
+            // (`collectExterns` refuses it at the declaration). The rule lives in
+            // `strongerReferenceBinding` so this tier and the linker's dedup fold
+            // read ONE owner — see its docblock for why it does not compare the
+            // enumerators numerically.
+            kept.binding = strongerReferenceBinding(kept.binding, e.binding);
             // `isData` / `isThreadLocal` — silently picking either row is the
             // D-LK-EXTERN-DATA-IMPORT silent-miscompile shape: `isData` decides
             // whether the walker binds the name through the DATA-slot model (the

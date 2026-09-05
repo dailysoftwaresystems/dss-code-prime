@@ -4602,3 +4602,117 @@ TEST(TargetSchema, Aapcs64VariadicSaveNeedsArgFprsToCoverFpSaveCount) {
                "from nowhere";
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// D-CSUBSET-PACKED-ATOMIC-MEMBER — `atomics.underAlignedNativeForm`
+//
+// WHAT THIS PROCESSOR'S NATIVE INLINE ATOMIC FORM DOES WHEN THE ACCESS IS NOT
+// NATURALLY ALIGNED. It is a THREE-WAY closed enum and not the boolean the
+// design was first specified as, because the two facts a boolean would fuse are
+// measurably different per processor and their REMEDIES are opposite:
+//   * aarch64  — the inlined `stlr`/`ldar` pair FAULTS. MEASURED rc 135, Bus
+//     error (core dumped), on a native aarch64 host over one `_Atomic int` at
+//     byte offset 1 of a packed struct. A format with no atomics runtime must
+//     therefore REFUSE the access: emitting a certain fault is a miscompile.
+//   * x86-64   — the inlined `xchgl` / plain `movl` pair COMPLETES (rc 42,
+//     measured on Windows and in WSL) but the plain load is not architecturally
+//     atomic across a cache line. It LOSES ATOMICITY silently. A format with no
+//     atomics runtime must therefore KEEP the native form: it is exactly what
+//     gcc ships, it works, and refusing would put DSS below the reference union
+//     on pe64 — the one shipped format with no atomics image.
+// A boolean cannot say both, and the arm it would get wrong is Windows.
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// A minimal target whose `atomics` key is exactly `body`, spliced in verbatim so
+// a MALFORMED shape can be probed and not only a wrong value.
+[[nodiscard]] std::string targetWithAtomics(std::string_view body) {
+    return std::string{
+               R"({"dssTargetVersion":1,"target":{"name":"X"},)"
+               R"("opcodes":[{"mnemonic":"invalid","result":"none"}],)"
+               R"("atomics":)"}
+           + std::string{body} + "}";
+}
+
+}  // namespace
+
+TEST(TargetSchema, AtomicsBlockAbsentMeansTheTargetDeclaredNoAnswer) {
+    // ABSENCE is a distinct state from `remainsAtomic`, and the lowering treats
+    // it the same way (native form, byte-for-byte today's output) — but a
+    // target that has never been MEASURED must not read as one that has.
+    auto ok = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},)"
+        R"("opcodes":[{"mnemonic":"invalid","result":"none"}]})");
+    ASSERT_TRUE(ok.has_value());
+    EXPECT_EQ((*ok)->underAlignedAtomicForm(), dss::UnderAlignedAtomicForm::None);
+}
+
+TEST(TargetSchema, AtomicsBlockWithNoAnswerIsRefused) {
+    // An `atomics` block that answers nothing is inert config whose PRESENCE
+    // would read as "this processor has been measured".
+    auto bad = TargetSchema::loadFromText(targetWithAtomics("{}"));
+    ASSERT_FALSE(bad.has_value());
+    EXPECT_TRUE(anyMentions(bad.error(), "underAlignedNativeForm"));
+}
+
+TEST(TargetSchema, AtomicsUnderAlignedNativeFormVocabularyIsClosed) {
+    // A typo must NOT leave the block unread with the faulting native form still
+    // emitted — the failure has to happen at LOAD, not at runtime on a host the
+    // gate cannot see.
+    auto bad = TargetSchema::loadFromText(
+        targetWithAtomics(R"({"underAlignedNativeForm":"trapz"})"));
+    ASSERT_FALSE(bad.has_value());
+    EXPECT_TRUE(anyMentions(bad.error(), "trapz"));
+    EXPECT_TRUE(anyMentions(bad.error(), "traps"))
+        << "the refusal must RENDER the accepted set, not merely reject";
+
+    // The `none` SENTINEL is not a writable spelling.
+    auto sentinel = TargetSchema::loadFromText(
+        targetWithAtomics(R"({"underAlignedNativeForm":"none"})"));
+    EXPECT_FALSE(sentinel.has_value())
+        << "'none' is the unwritten default, not a declaration a file may make";
+
+    // An unknown KEY inside the block is refused too — otherwise a misspelled
+    // `underAlignedNativeFrom` would load clean and answer nothing.
+    auto strayKey = TargetSchema::loadFromText(
+        targetWithAtomics(R"({"underAlignedNativeFrom":"traps"})"));
+    EXPECT_FALSE(strayKey.has_value());
+
+    for (auto const spelling : {"traps", "losesAtomicity", "remainsAtomic"}) {
+        auto ok = TargetSchema::loadFromText(targetWithAtomics(
+            std::string{R"({"underAlignedNativeForm":")"} + spelling + R"("})"));
+        EXPECT_TRUE(ok.has_value()) << spelling << " must be accepted";
+    }
+}
+
+TEST(TargetSchema, ShippedTargetsDeclareTheirMeasuredUnderAlignedAtomicForm) {
+    // ★ THE ANTI-DRIFT PIN, and both rows are MEASURED rather than assumed.
+    // RED-ON-DISABLE: delete the `atomics` block from either shipped target and
+    // this fails naming it — on arm64 that deletion silently restores the SIGBUS
+    // this anchor was opened for, and no gate leg that RUNS can see it (qemu
+    // does not enforce the LDAR/STLR alignment check).
+    struct Row { std::string_view target; dss::UnderAlignedAtomicForm form; };
+    Row const expected[] = {
+        {"arm64",  dss::UnderAlignedAtomicForm::Traps},
+        {"x86_64", dss::UnderAlignedAtomicForm::LosesAtomicity},
+    };
+    for (auto const& r : expected) {
+        auto loaded = TargetSchema::loadShipped(std::string{r.target});
+        ASSERT_TRUE(loaded.has_value()) << r.target;
+        EXPECT_EQ((*loaded)->underAlignedAtomicForm(), r.form)
+            << r.target << " must declare "
+            << dss::underAlignedAtomicFormName(r.form)
+            << " — the value is a MEASUREMENT about the processor, not a"
+               " preference";
+    }
+    // ⚠ AND THE TWO ANSWERS MUST DIFFER. If a later edit made them equal, the
+    // three-way enum would have collapsed back into the boolean it replaced and
+    // nothing else here would notice.
+    auto a = TargetSchema::loadShipped("arm64");
+    auto x = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(a.has_value() && x.has_value());
+    EXPECT_NE((*a)->underAlignedAtomicForm(), (*x)->underAlignedAtomicForm())
+        << "arm64 FAULTS and x86_64 silently de-atomizes; a single answer for "
+           "both is the conflation this vocabulary exists to prevent";
+}

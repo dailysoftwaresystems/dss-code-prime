@@ -427,13 +427,43 @@ enum class PredefinedMacroRedefinition {
     // D-PP-INCOMPATIBLE-REDEFINITION-IS-FATAL, which already warns-and-takes-
     // the-new-definition and was itself measured against these references).
     Ordinary,
+    // ★★★ THE FOURTH POSTURE, AND THE ONE THAT MAKES THIS ENUM SERVE BOTH ARMS
+    // (D-PP-HAS-EXTENSION-BUILTIN-ABSENT, operator ruling 2026-09-03). The name
+    // is RESERVED and the program may NOT take it over: the directive is
+    // REFUSED at Error and does NOT take effect.
+    //
+    // ⚠ IT EXISTS BECAUSE THE RESERVED SET IS NOT UNIFORM, WHICH IS EXACTLY
+    // WHAT THE RULING'S OWN PHRASING ANTICIPATED — "which names are reserved,
+    // and what SEVERITY a `#define`/`#undef` of EACH draws". ✔MEASURED
+    // 2026-09-04, each reference invoked SEPARATELY on its own fixture:
+    //
+    //   shape                          gcc 13.3.0  gcc 13.2.0  clang    cl
+    //                                    (WSL)      (mingw)    18.1.3   19.51
+    //   #define defined 1               ERROR rc1  ERROR rc1  ERROR rc1 C4117 rc0
+    //   #undef  defined                 ERROR rc1  ERROR rc1  ERROR rc1 C4117 rc0
+    //   #define __has_include(x) 0      warn  rc0  warn  rc0  warn  rc0 silent rc0
+    //   #undef  __has_include           warn  rc0  warn  rc0  warn  rc0 silent rc0
+    //   #define __has_c_attribute(x) 0  warn  rc0  warn  rc0  warn  rc0 silent rc0
+    //
+    // So `defined` and the conditional-inclusion operators are DIFFERENT
+    // classes, and a single global posture for "implementation-owned name"
+    // would have had to be wrong about one of them. cl's C4117 accepts the
+    // directive and then IGNORES it — the silently-drops-the-author's-code
+    // failure class [[D-PP-VA-SPECIAL-IDENTIFIER-NAME-POSITIONS-REFUSED-ABOVE-THE-UNION]]
+    // already ruled does not get to be the model — so `defined` is 3-1 REFUSE
+    // and the operators are 4-0 ACCEPT.
+    // ⓘ 6.10.2 makes `defined` an OPERATOR inside `#if`, so admitting it as a
+    // macro name makes conditional inclusion unparseable; that is why this one
+    // name is different in KIND and not merely in strictness.
+    Refuse,
 };
 
-inline constexpr EnumNameTable<PredefinedMacroRedefinition, 3>
+inline constexpr EnumNameTable<PredefinedMacroRedefinition, 4>
     kPredefinedMacroRedefinitionTable{{{
         { PredefinedMacroRedefinition::WarnIsoMacro,     "warn-iso-macro"     },
         { PredefinedMacroRedefinition::WarnDerivedMacro, "warn-derived-macro" },
         { PredefinedMacroRedefinition::Ordinary,         "ordinary"           },
+        { PredefinedMacroRedefinition::Refuse,           "refuse"             },
     }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -458,6 +488,16 @@ predefinedMacroRedefinitionFromName(std::string_view s) noexcept {
 [[nodiscard]] constexpr bool
 predefinedNameIsDiagnosedOnChange(PredefinedMacroRedefinition r) noexcept {
     return r != PredefinedMacroRedefinition::Ordinary;
+}
+
+// The SECOND question the same declaration answers: does the directive take
+// EFFECT? Enumerated positively (only `Refuse` refuses) because the polarity is
+// the opposite one: a fifth posture added tomorrow should APPLY by default,
+// since accepting-and-applying is what every reference does for everything
+// except `defined`, and a new refusal must be a deliberate, stated act.
+[[nodiscard]] constexpr bool
+predefinedNameChangeIsRefused(PredefinedMacroRedefinition r) noexcept {
+    return r == PredefinedMacroRedefinition::Refuse;
 }
 
 // FC15b: one config-declared predefined macro (C 6.10.8). `name` is the macro
@@ -538,6 +578,153 @@ struct DSS_EXPORT PredefinedMacroDef {
 struct DSS_EXPORT CAttributeDef {
     std::string name;       // the attribute identifier ("deprecated", ...)
     int         version = 0;  // the reported version int (> 0; e.g. 202311)
+};
+
+// ══ D-PP-HAS-EXTENSION-BUILTIN-ABSENT: THE FEATURE-QUERY OPERATOR FAMILY ══════
+//
+// `__has_attribute` / `__has_builtin` / `__has_feature` / `__has_extension` —
+// the four EXTENSION query operators, shipped by operator ruling 2026-09-03.
+// They are the `__has_c_attribute` SHAPE (operator word, one parenthesized
+// identifier argument, an integer answer) with a different truth set, so they
+// are declared as DATA rather than grown as four more scalar operator words.
+//
+// ★★★ THE ANSWER IS NEVER A LIST IN THE ENGINE, AND NEVER A SECOND COPY OF ONE
+// IN CONFIG EITHER. `answers` names the ALREADY-DECLARED capability set the
+// answer is READ FROM. That is the whole point: the day a builtin is added to
+// `semantics.builtinFunctions`, `__has_builtin` starts answering 1 for it with
+// no second edit — and a second edit is exactly what would rot.
+//
+// ⚠ EACH ANSWER IS A CLAIM THE PROJECT MUST KEEP TRUE AS THE FEATURE SET MOVES.
+// That is the accepted cost of the ruling, recorded here because the cost lands
+// on whoever edits the capability sets, not on whoever reads this file. An
+// operator that answers 1 for something this implementation does not implement
+// is STRICTLY WORSE than not having the operator: it routes a portable header
+// onto a path DSS cannot honour, converting a working compatibility fallback
+// into a silent miscompile.
+enum class FeatureQueryAnswerSource {
+    // `semantics.attributeEffects` row names ∪ `preprocess.knownCAttributes`
+    // names, matched raw AND dunder-stripped (C 6.10.1's `__name__` rule, the
+    // same normalizer `__has_c_attribute` uses). The union is not a widening:
+    // an attribute the language declares a standard VERSION for is an attribute
+    // the language knows, and gcc/clang answer 1 for both spellings of both.
+    DeclaredAttributes,
+    // `semantics.builtinFunctions` row names ∪ the WORDS of the keyword token
+    // KINDS listed in `builtinQueryKeywordTokens`. The second half exists
+    // because three GNU compile-time builtins (`__builtin_offsetof`,
+    // `__builtin_types_compatible_p`, `__builtin_choose_expr`) are OPERATORS
+    // wearing a call's punctuation and are therefore declared as grammar
+    // KEYWORDS, not as `builtinFunctions` rows — see the `$comment` on those
+    // keyword rows. ✔MEASURED: gcc 13.3.0, gcc 13.2.0 (mingw) and clang 18.1.3
+    // all answer `__has_builtin(__builtin_offsetof)` = 1, so answering 0 for a
+    // builtin DSS demonstrably implements would be a wrong answer, not a safe
+    // one. The WORD is never restated here — it is read back out of the
+    // keyword table through `GrammarSchema::lookupLexeme`.
+    DeclaredBuiltins,
+    // `preprocess.languageFeatures` rows whose availability is `Standard`.
+    DeclaredLanguageFeatures,
+    // EVERY `preprocess.languageFeatures` row, standard or extension.
+    // ✔MEASURED on clang 18.1.3, which is the only reference that implements
+    // this pair: `__has_extension` is a strict SUPERSET of `__has_feature`. In
+    // `-std=c17` both answer 1 for all six C features; in `-std=c89`
+    // `__has_feature` answers 0 for every one of them while `__has_extension`
+    // still answers 1. Modelled here as the SAME set with an availability tag,
+    // which is that behaviour exactly and not an approximation of it.
+    DeclaredLanguageExtensions,
+};
+
+inline constexpr EnumNameTable<FeatureQueryAnswerSource, 4>
+    kFeatureQueryAnswerSourceTable{{{
+        { FeatureQueryAnswerSource::DeclaredAttributes,
+          "declared-attributes" },
+        { FeatureQueryAnswerSource::DeclaredBuiltins,
+          "declared-builtins" },
+        { FeatureQueryAnswerSource::DeclaredLanguageFeatures,
+          "declared-language-features" },
+        { FeatureQueryAnswerSource::DeclaredLanguageExtensions,
+          "declared-language-extensions" },
+    }}};
+DSS_CHECK_ENUM_NAME_TABLE(kFeatureQueryAnswerSourceTable);
+
+[[nodiscard]] constexpr std::string_view
+featureQueryAnswerSourceName(FeatureQueryAnswerSource s) noexcept {
+    return kFeatureQueryAnswerSourceTable.name(s);
+}
+[[nodiscard]] constexpr std::optional<FeatureQueryAnswerSource>
+featureQueryAnswerSourceFromName(std::string_view s) noexcept {
+    return kFeatureQueryAnswerSourceTable.fromName(s);
+}
+
+// One declared feature-query operator: the WORD (matched by TEXT, like
+// `defined` / `__has_include`) and the capability set its answer is read from.
+struct DSS_EXPORT FeatureQueryOperatorDef {
+    std::string              name;
+    FeatureQueryAnswerSource answers = FeatureQueryAnswerSource::DeclaredAttributes;
+};
+
+// Whether a declared language feature is available as the LANGUAGE (so both
+// `__has_feature` and `__has_extension` report it) or only as an EXTENSION
+// beyond it (so only `__has_extension` does). clang's own two-tier model.
+enum class LanguageFeatureAvailability { Standard, Extension };
+
+inline constexpr EnumNameTable<LanguageFeatureAvailability, 2>
+    kLanguageFeatureAvailabilityTable{{{
+        { LanguageFeatureAvailability::Standard,  "standard"  },
+        { LanguageFeatureAvailability::Extension, "extension" },
+    }}};
+DSS_CHECK_ENUM_NAME_TABLE(kLanguageFeatureAvailabilityTable);
+
+[[nodiscard]] constexpr std::optional<LanguageFeatureAvailability>
+languageFeatureAvailabilityFromName(std::string_view s) noexcept {
+    return kLanguageFeatureAvailabilityTable.fromName(s);
+}
+
+// One declared language feature — the truth set `__has_feature` /
+// `__has_extension` answer from. There is no pre-existing table for these
+// (unlike attributes and builtins), so this IS the declaration rather than a
+// pointer to one, and every row is a claim about the front end.
+struct DSS_EXPORT LanguageFeatureDef {
+    std::string                 name;
+    LanguageFeatureAvailability availability = LanguageFeatureAvailability::Standard;
+};
+
+// ══ THE RESERVED-IDENTIFIER POSTURE — ONE DECLARATION, EVERY ARM ═════════════
+//
+// ★★★ OPERATOR RULING 2026-09-03: "we must accept too. best long term solution,
+// no workaround, first class implementation, 100% config driven. leave nothing
+// to be done." The last clause is what this struct is for.
+//
+// The defect the ruling is about was NOT that `#define __has_include(x) 0` was
+// refused. It was that ONE FUNCTION answered the identical error-vs-warning
+// question TWO different ways — the `__STDC__` arm warned and applied (carrying
+// the comment "being stricter than every reference is not rigor"), while the
+// operator arm three screens below refused at Error — and nothing tied the two
+// together, so they could drift again. The fix is therefore not a severity
+// change; it is that BOTH arms now read this ONE declaration, through the ONE
+// `PredefinedMacroRedefinition` vocabulary, applied by the ONE engine helper.
+//
+// ⚠ WHY THE MEMBERS ARE CLASSES AND NOT NAMES. Every name in every class is
+// ALREADY declared elsewhere in this same block (`definedOperator`,
+// `hasIncludeOperator` / `hasEmbedOperator` / `hasCAttributeOperator`,
+// `featureQueryOperators[].name`). A `{name: severity}` table here would be a
+// second copy of those spellings and would go stale the first time one was
+// rebound — the duplicated-list defect this row exists to avoid.
+struct DSS_EXPORT ReservedIdentifierPolicy {
+    // `defined` — C23 6.10.2's `#if` operator. Defaults to Refuse because that
+    // is what 3 of the 4 references do and because admitting it as a macro name
+    // makes conditional inclusion unparseable.
+    PredefinedMacroRedefinition definedOperator =
+        PredefinedMacroRedefinition::Refuse;
+    // `__has_include` / `__has_embed` / `__has_c_attribute` — the C23 6.10.10p2
+    // reserved conditional-inclusion operators. Defaults to the DIAGNOSED-and-
+    // APPLIED posture: unanimously what all four references do.
+    PredefinedMacroRedefinition conditionalInclusionOperators =
+        PredefinedMacroRedefinition::WarnIsoMacro;
+    // `__has_attribute` / `__has_builtin` / `__has_feature` / `__has_extension`
+    // — NOT reserved by 6.10.10p2 at all, which is precisely why the universal
+    // `#ifndef X / #define X(x) 0 / #endif` shim must keep installing on a
+    // compiler that lacks them and must stay DEAD on one that has them.
+    PredefinedMacroRedefinition featureQueryOperators =
+        PredefinedMacroRedefinition::WarnIsoMacro;
 };
 
 // Config-driven C-preprocessor declaration (schema v4 `preprocess` block).
@@ -1133,6 +1320,31 @@ struct DSS_EXPORT PreprocessConfig {
     // known (every `__has_c_attribute(x)` then yields 0).
     std::vector<CAttributeDef> knownCAttributes;
 
+    // D-PP-HAS-EXTENSION-BUILTIN-ABSENT: the FEATURE-QUERY operators, each
+    // naming the declared capability set its answer is read from. OPTIONAL --
+    // empty means the language declares none, and every such spelling folds as
+    // an ordinary identifier exactly as it did before (the opt-out identity
+    // property every operator word in this block has). Duplicate `name`s, an
+    // empty `name`, an unknown `answers` verb, or a `name` colliding with an
+    // already-declared operator word all fail LOUD at load.
+    std::vector<FeatureQueryOperatorDef> featureQueryOperators;
+
+    // The truth set `__has_feature` / `__has_extension` answer from. OPTIONAL --
+    // empty means every such query answers 0, which is the honest answer for a
+    // language that has declared no features. Duplicate or empty names fail
+    // loud at load.
+    std::vector<LanguageFeatureDef> languageFeatures;
+
+    // Token KIND names whose keyword WORDS are builtins for the purposes of
+    // `FeatureQueryAnswerSource::DeclaredBuiltins`. Declared as KINDS, never as
+    // words: the word is read back out of the language's own keyword table, so
+    // rebinding a keyword's spelling moves the query answer with it and no
+    // spelling is stored twice. `checkToken`-validated at load. OPTIONAL.
+    std::vector<std::string> builtinQueryKeywordTokens;
+
+    // ★★★ The ONE reserved-identifier posture declaration. See the struct.
+    ReservedIdentifierPolicy reservedIdentifiers;
+
     // FC17.9(h) (`#embed`; C23 6.10.4 / N3096 6.10.3): the `#embed` directive
     // WORD, matched by lexeme TEXT against the token after `#` (like
     // define/undef/include -- `embed` lexes as a plain Identifier, NOT a grammar
@@ -1247,20 +1459,95 @@ struct DSS_EXPORT PreprocessConfig {
     // the language declares NO such operator (`__has_embed` then folds as an
     // ordinary identifier -> 0, the identity property).
     //
-    // ANGLE-form self-consistency (D-PP-EMBED, FIX-3, deliberate): unlike
-    // `hasIncludeOperator` (which REQUIRES both angle-delimiter tokens at load,
-    // since its angle form is supported), `hasEmbedOperator` imposes NO such
-    // load-time requirement. The `#embed <resource>` / `__has_embed(<resource>)`
-    // ANGLE form is a cycle-1 loud DEFERRAL (D-PP-EMBED-ANGLE): DSS ships JSON
-    // descriptors, not binary resources, on the system path, so an angle embed
-    // resolves nothing. `__has_embed` reuses the language's existing
-    // `hasIncludeAngleOpenToken`/`hasIncludeAngleCloseToken` KINDS to RECOGNISE an
-    // angle argument only so it can answer 0 truthfully; a language that declares
-    // `hasEmbedOperator` without them cannot lex an angle argument at all and its
-    // `__has_embed(<...>)` fails loud at RUNTIME as a malformed argument -- which
-    // suffices precisely because the angle form is deferred (no self-inconsistent
-    // contract to guard against at load).
+    // ANGLE form (C23 6.10.4.1p8, D-PP-EMBED-ANGLE closed P60): `#embed <r>` and
+    // `__has_embed(<r>)` match their delimiters by the language's EXISTING
+    // `hasIncludeAngleOpenToken` / `hasIncludeAngleCloseToken` KINDS -- the same
+    // vocabulary `__has_include(<h>)` uses, never the `<`/`>` bytes and never a
+    // private angle path -- and search the same directory lists the angle
+    // `#include` searches (systemDirs, then the `-I` includeDirs; no includer-dir
+    // prepend, the 6.10.3p2 parity), through the shared `findInDirs` atom. What
+    // the angle EMBED does NOT do is the `<stem>.json` descriptor rewrite: that
+    // rewrite is DSS's model of a system HEADER's name and describes no resource.
+    // ⚠ REUSING THE INCLUDE PATHS IS A STATED DIVERGENCE FROM 6.10.4.1p14, not
+    // a reading of it. p14 is *Recommended practice* and says the OPPOSITE:
+    // "A mechanism similar to, but DISTINCT FROM, the implementation-defined
+    // search paths used for source file inclusion (6.10.3) is encouraged."
+    // DSS declines it deliberately -- p14 is non-normative and p8 makes the
+    // places implementation-defined outright, while a second, embed-only path
+    // list would be a second owner of "where DSS looks" with NO surface (CLI,
+    // project file or `.lang/.target/.format.json`) for a user to declare it.
+    // The full argument is on `resolveEmbedResource`, the one place it changes.
+    // A language that declares `hasEmbedOperator` (or `embedDirective`) without
+    // the angle-token pair cannot lex an angle operand at all; it then fails loud
+    // at RUNTIME as a malformed operand rather than at load, because the QUOTE
+    // form is complete on its own and the pair is only required by the angle
+    // form (unlike `hasIncludeOperator`, whose angle form is the system-header
+    // form every C translation unit reaches).
     std::string hasEmbedOperator;  // "__has_embed"
+
+    // ── C23 6.10.4.2–6.10.4.5: THE STANDARD `#embed` PARAMETERS (D-PP-EMBED-PARAMS) ──
+    //
+    // The engine's four parameter VERBS. Config binds each verb to the NAME a
+    // program spells; the engine dispatches on the verb only (the `pragmaEffects`
+    // `{prefix, effect}` house pattern), so a language that spells `limit`
+    // differently rebinds it here and no `src/` line changes.
+    //   Limit   -- 6.10.4.2: `( constant-expression )`, an integer constant
+    //              expression >= 0 evaluated by the `#if` evaluator (6.10.2's
+    //              rules, `defined` forbidden); the resource width becomes
+    //              min(implementation width, elementWidth * N), and 0 makes it EMPTY.
+    //   Prefix  -- 6.10.4.4: a balanced token sequence placed immediately BEFORE
+    //              the expansion, ignored when the resource is empty.
+    //   Suffix  -- 6.10.4.3: placed immediately AFTER; ignored when empty.
+    //   IfEmpty -- 6.10.4.5: REPLACES the whole directive when the resource is
+    //              empty; ignored otherwise.
+    // Each may appear at most once (a Constraints clause on every one of the
+    // four) and its parenthesized clause is REQUIRED ("shall be present").
+    enum class EmbedParameterRole : std::uint8_t { Limit, Prefix, Suffix, IfEmpty };
+
+    // One `{ name, role }` row of `preprocess.embedParameters.standard`. `name`
+    // is the canonical spelling; 6.10.1p5 makes the `__name__` spelling behave
+    // identically, which the engine honours through the SHARED `stripDunder`
+    // (core/types/attribute_naming.hpp, the `__has_c_attribute` precedent) rather
+    // than a second declaration of the underscores here.
+    struct EmbedParameterDef {
+        std::string        name;
+        EmbedParameterRole role = EmbedParameterRole::Limit;
+    };
+
+    // The embed-parameter SURFACE a language declares (C23 6.10.1p4–p9: a
+    // pp-parameter is a standard parameter or an implementation-defined
+    // PREFIXED parameter `identifier :: identifier`).
+    //   prefixSeparatorToken -- the token KIND that spells the `::` of a prefixed
+    //                           parameter (C's `ColonColonOp`), matched by KIND.
+    //                           REQUIRED inside the block: without it the
+    //                           prefixed form of 6.10.1 is unlexable and
+    //                           `__has_embed`'s 6.10.2p8 answer (an unrecognised
+    //                           prefixed parameter is NOT a violation, it is 0)
+    //                           could not be given truthfully.
+    //   standard             -- the four verbs above, each bound to ONE name;
+    //                           a verb bound twice or a name bound twice (raw or
+    //                           after `stripDunder`) is refused at load, because
+    //                           "at most once" is only checkable against a
+    //                           one-to-one binding.
+    // ★ THE CARVE-OUT IS PREFIXED-ONLY, AND THAT IS WHY THE `::` SPELLING
+    // EXISTS. DSS defines NO implementation-defined (prefixed) parameter, so a
+    // prefixed one on a `#embed` line is a 6.10.1p9 constraint violation (loud)
+    // while inside `__has_embed` it answers 0 -- footnote 196: "An unrecognized
+    // preprocessor PREFIXED parameter is a constraint violation, EXCEPT within
+    // has_embed expressions", and 6.10.2p8 NOTE 1 to the same effect. An unknown
+    // STANDARD-SHAPED name gets no such exemption anywhere in 6.10.2: it is a
+    // 6.10.1p9 violation in the directive AND in the operator.
+    struct EmbedParameterConfig {
+        std::string                    prefixSeparatorToken;
+        std::vector<EmbedParameterDef> standard;
+    };
+    // OPTIONAL. Absent (nullopt) means the language declares NO embed-parameter
+    // surface: `limit`/`prefix`/`suffix`/`if_empty` then name nothing, so every
+    // parameter on a `#embed` line is a loud 6.10.1p9 constraint violation and
+    // `__has_embed` with one is loud too (a bare identifier binding no standard
+    // parameter is exactly the shape footnote 196 does NOT exempt) -- an honest
+    // C23 SUBSET, and this block's REMOVE-direction red-on-disable.
+    std::optional<EmbedParameterConfig> embedParameters;
 
     // FC15 paste residuals (D-PP-VARIADIC-GNU-COMMA-ELISION): opt into the GNU
     // `,##__VA_ARGS__` extension. When TRUE, a `separator ## __VA_ARGS__` whose
@@ -1320,6 +1607,67 @@ isConditionalInclusionOperator(std::string_view        name,
     return (!cfg.hasIncludeOperator.empty()    && name == cfg.hasIncludeOperator)
         || (!cfg.hasEmbedOperator.empty()      && name == cfg.hasEmbedOperator)
         || (!cfg.hasCAttributeOperator.empty() && name == cfg.hasCAttributeOperator);
+}
+
+// D-PP-HAS-EXTENSION-BUILTIN-ABSENT: the FEATURE-QUERY half of the same
+// vocabulary. Returns the declaration (so the caller can read its answer
+// source) or null.
+[[nodiscard]] inline FeatureQueryOperatorDef const*
+findFeatureQueryOperator(std::string_view        name,
+                         PreprocessConfig const& cfg) noexcept {
+    if (name.empty()) return nullptr;
+    for (FeatureQueryOperatorDef const& op : cfg.featureQueryOperators) {
+        if (!op.name.empty() && name == op.name) return &op;
+    }
+    return nullptr;
+}
+
+// ★★ PROPERTY (1) ALONE — `#ifdef`/`defined()` VISIBILITY — AND IT IS A
+// DIFFERENT SET FROM THE REDEFINITION POSTURE BELOW. This is the split the
+// whole row turns on: `isConditionalInclusionOperator` used to bundle
+// visibility WITH non-definability, and adding the four feature-query operators
+// to it would have made `#ifndef __has_attribute` false AND refused the shim's
+// `#define`, leaving `#if __has_attribute(x)` as `0(x)` — a preprocessor syntax
+// error in a header essentially every macOS TU includes.
+//
+// ✔MEASURED, and the rule the measurement states: a name is `#ifdef`-visible on
+// a reference EXACTLY WHEN THAT REFERENCE IMPLEMENTS THE OPERATOR. gcc 13.3.0
+// and gcc 13.2.0 (mingw) show `__has_include`/`__has_c_attribute`/
+// `__has_attribute`/`__has_builtin` and hide `__has_feature`/`__has_extension`;
+// clang 18.1.3 shows all six; cl 19.51 shows only the two it has. MSVC's `no` on
+// `__has_attribute` is not an opinion about the name — it is MSVC correctly
+// reporting it has no such operator, and it is what makes the shim WORK there.
+//
+// ⓘ `definedOperator` is deliberately NOT a member: `defined` is an operator
+// SPELLING, not a macro name. ✔MEASURED — `#ifdef defined` is not taken on any
+// of the four. It is still governed by the redefinition posture below, which is
+// precisely why the two questions need two predicates.
+[[nodiscard]] inline bool
+isImplementationProvidedOperator(std::string_view        name,
+                                 PreprocessConfig const& cfg) noexcept {
+    return isConditionalInclusionOperator(name, cfg)
+        || findFeatureQueryOperator(name, cfg) != nullptr;
+}
+
+// ★★★ PROPERTY (2) ALONE — WHAT A PROGRAM'S `#define`/`#undef` OF THE NAME
+// DRAWS. THE ONE LOOKUP BOTH DIRECTIVE ARMS USE, and the reason the `__STDC__`
+// arm and the operator arm can no longer drift: they resolve a posture out of
+// the SAME `PredefinedMacroRedefinition` vocabulary and hand it to the SAME
+// engine helper. `std::nullopt` = the language reserves nothing about this
+// name, so the ordinary 6.10.5p2 policy is the only one that applies.
+[[nodiscard]] inline std::optional<PredefinedMacroRedefinition>
+reservedIdentifierPosture(std::string_view        name,
+                          PreprocessConfig const& cfg) noexcept {
+    if (!cfg.definedOperator.empty() && name == cfg.definedOperator) {
+        return cfg.reservedIdentifiers.definedOperator;
+    }
+    if (isConditionalInclusionOperator(name, cfg)) {
+        return cfg.reservedIdentifiers.conditionalInclusionOperators;
+    }
+    if (findFeatureQueryOperator(name, cfg) != nullptr) {
+        return cfg.reservedIdentifiers.featureQueryOperators;
+    }
+    return std::nullopt;
 }
 
 } // namespace dss

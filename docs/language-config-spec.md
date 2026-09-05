@@ -31,7 +31,7 @@ The bulk of this spec covers `sources/<lang>.lang.json` — the grammar config �
 | Target | `targets/<arch>.target.json` | Per-CPU backend data: instruction encoding, registers, calling conventions, and relocation kinds. Shipped: `x86_64`, `arm64`. |
 | Object format | `object-formats/<fmt>.format.json` | Per-object-format layout/relocation/process-exit data (section layout, relocation mapping, entry/exit conventions). Shipped: PE, ELF (x86-64 + aarch64), Mach-O, SPIR-V, WASM variants. |
 | Pipeline | `pipelines/<name>.pipeline.json` | An optimizer pass SCHEDULE: `passes` elements are pass-name leaves or `{"repeat":{count,passes}}` / `{"fixpoint":{max,passes}}` combinator nodes (a closed grammar — no seq/conditional/parallel/per-step params), plus tuning knobs (`inlineThreshold`, `verifyEveryPass`). A FLAT pass list plus top-level `maxIterations` remains valid and desugars at load to one top-level `fixpoint` — but a document using any structural node refuses `maxIterations` (one spelling per document). Load-time budgets, fail-loud: count/max ∈ [1,32], nesting depth ≤ 8, total worst-case unrolled invocations ≤ 4096, no empty node bodies. **Two-stage LTO topology (P10):** an optional top-level `"unitPipeline": "<name>"` names the pipeline document that runs at the per-CU (unit) stage instead of this one — the link-time schedule is always this document; absent key = both stages run this document (what `debug` ships); the key resolves exactly ONE hop (a unit document that itself declares it is refused). Shipped: `debug`, `release`, `release-unit` (the per-CU schedule `release`'s key names). |
-| Shipped-library FFI descriptor | `shippedLibs/<platform>/<lib>.json` | **New (this cycle).** A language-neutral descriptor of a shipped system library's exported symbols, so a program can `#include <stdio.h>` (or a language's import equivalent) and use `puts` with no inline `extern` re-declaration. See [§12](#12-shipped-library-ffi-descriptor). |
+| Shipped-library FFI descriptor | `shippedLibs/<lib>.json` | **New (this cycle).** A language-neutral descriptor of a shipped system library's exported symbols, so a program can `#include <stdio.h>` (or a language's import equivalent) and use `puts` with no inline `extern` re-declaration. See [§12](#12-shipped-library-ffi-descriptor). |
 
 These divide cleanly along the project's agnosticism axes: the **source-language** config is the only one that varies per language; the **target** and **object-format** configs are what keep the backend CPU- and format-agnostic; the **pipeline** config is target/format/language-neutral optimizer data; and the **shipped-library** descriptor is deliberately language-neutral (one descriptor serves every source language on that platform). `schemas/` alongside them holds JSON-schema validation aids, not loadable compiler config.
 
@@ -716,7 +716,7 @@ c declares `castExpr` = `[ParenOpen, castTypeRef, ParenClose, castOperand]` as a
 
 ### 12.1 Purpose
 
-A shipped system library — libc / `msvcrt.dll`, `kernel32`, `libSystem`, … — exports symbols (`puts`, `malloc`, `GetStdHandle`) that programs call without ever defining them. To call one in C you `#include <stdio.h>` and the header carries the prototype; you never re-declare `puts` yourself.
+A shipped system library — `libc.so.6`, `ucrtbase.dll`, `kernel32.dll`, `libSystem`, … — exports symbols (`puts`, `malloc`, `GetStdHandle`) that programs call without ever defining them. To call one in C you `#include <stdio.h>` and the header carries the prototype; you never re-declare `puts` yourself.
 
 DSS Code Prime ships those prototypes **once**, language-neutrally, as a JSON descriptor under `src/dss-config/shippedLibs/<lib>.json` (one neutral set — per-target library names resolve via the per-format `library` map, §12.5). A program does an angle/system include (`#include <stdio.h>`, or whatever import form the source language declares) and the symbols become visible to the call — with **no inline `extern` re-declaration** in the program. Because the descriptor is neutral JSON (not per-language source), one `stdio.json` serves c and any other language that imports it; a second language reuses the same descriptors with zero engine change.
 
@@ -728,7 +728,11 @@ The reader is `dss::ffi::readShippedLibDescriptor` ([`src/ffi/shipped_lib_descri
 {
   "header":   "stdio.h",                   // required — provenance: which header
   "standard": "c89",                       // optional — provenance: which standard
-  "library":  "msvcrt.dll",                // optional — see below
+  "library": {                             // optional — a PER-OBJECT-FORMAT map; see below
+    "pe":   { "role": "cLibrary" },        //   name the runtime ROLE the format's table owns …
+    "elf":  { "role": "cLibrary" },
+    "macho":{ "role": "cLibrary" }
+  },                                       //   … or a literal image string ("libm.so.6")
   "symbols": [                             // required, non-empty
     {
       "name":      "puts",                 // required — the canonical symbol name
@@ -740,13 +744,13 @@ The reader is `dss::ffi::readShippedLibDescriptor` ([`src/ffi/shipped_lib_descri
 }
 ```
 
-The shipped `stdio.json` (`src/dss-config/shippedLibs/windows-x86_64/stdio.json`) is exactly this shape, carrying the standard stdio surface (`puts`, `fopen`, `fread`, …). The full set of shipped surfaces and their per-platform ABI deltas are catalogued in [`src/dss-config/shippedLibs/README.md`](../src/dss-config/shippedLibs/README.md).
+The shipped `stdio.json` (`src/dss-config/shippedLibs/stdio.json` — the root is neutral, see [§12.5](#125-platform-note)) is exactly this shape, carrying the standard stdio surface (`puts`, `fopen`, `fread`, …). The full set of shipped surfaces and their per-platform ABI deltas are catalogued in [`src/dss-config/shippedLibs/README.md`](../src/dss-config/shippedLibs/README.md).
 
 | Field | Level | Required | Notes |
 |---|---|---|---|
 | `header` | top | **yes** | **Provenance.** The header these symbols come from (e.g. `"stdio.h"`) — the machine-readable answer to *"where does `puts` come from?"*, which is the whole point of a shipped descriptor. Must be a non-empty string; a missing or empty `header` is a malformed descriptor (fails loud), never silently provenance-less. |
 | `standard` | top | no | **Provenance.** The language standard the surface targets (e.g. `"c89"`, `"c99"`). Descriptive only — it drives no behavior. |
-| `library` | top | no | The runtime import library every symbol in this descriptor routes to (e.g. `"msvcrt.dll"`). **Optional** — when absent (or empty), the CST→HIR lowering falls back to the active language's per-object-format default (`externLibraryByFormat[format]` in the `.lang.json`). A descriptor MAY omit it and inherit the language's default. |
+| `library` | top **and** symbol | no | The runtime import image every symbol in this descriptor routes to, as a **per-object-format map** keyed by the object-format names (`pe` / `elf` / `macho` / …; an unknown key or the `unknown` sentinel fails loud). A symbol-level `library` overrides the descriptor-level one **per format key**. Each VALUE is EITHER a literal image string (`"libm.so.6"`) OR `{"role": "<runtimeLibraryRole>"}` naming the runtime role whose image the **object format's** `runtimeLibraries` table owns — never both, and an `image` beside a `role` is refused by name. See [§12.6](#126-naming-a-runtime-role-instead-of-an-image). **Optional, and there is NO fallback**: a format key that is absent binds NOTHING for that format. That is a routing outcome, not an error — the reference resolves at link (a sibling TU's definition, a `--resolve-library` export, or a loud `K_SymbolUndefined`). ⚠ The language-level `externLibraryByFormat` default this row once described was **RETIRED at UCRT-P4 Decision 1**: which image owns a symbol is a fact about a PLATFORM, owned per symbol by the descriptor corpus, so one string per language was both a guess and a second owner. |
 | `symbols` | top | **yes** | A **non-empty** array of symbol objects. A descriptor that declares no symbols is a no-op artifact and is rejected rather than shipped silently. |
 | `name` | symbol | **yes** | The canonical, undecorated symbol identifier (e.g. `"puts"`). Must be a non-empty string. The linker-visible decorated name is produced downstream by name mangling — the descriptor carries the source name only. |
 | `signature` | symbol | **yes** | An **IR type-text string** — a full `fn(...) -> ...` signature for a function, or a value type for an object. Decoded by the single shared `parseTypeFromText`; see [`ir-type-text.md`](./ir-type-text.md) for the complete grammar. The example `"fn(ptr<char>) -> i32"` is the C `int puts(const char*)` signature. |
@@ -762,7 +766,7 @@ How a `#include <stdio.h>` ends up as a resolved call to `puts`:
 1. **Angle/system include.** The source language declares the angle/system include form via its `imports` block's `systemPathToken` ([§11.1](#111-imports--config-driven-import-resolution)). The angle form `#include <stdio.h>` is the **system** form (distinct from the quote form's local-source search).
 2. **Map to a descriptor.** The import resolver maps the requested header to `<stem>.json` — `<stdio.h>` (or `<stdio>`) becomes `stdio.json` — and searches the `shippedLibDirs` system search path (the per-language analogue of C's `/usr/include`, declared in `SemanticConfig.shippedLibDirs`, e.g. the neutral `shippedLibs` root). A hit records the resolved descriptor path on the compilation unit; unlike a quote include it is **not** parsed as a source Tree and produces no `CrossTreeRef`.
 3. **Inject into scope.** The semantic phase reads each recorded descriptor via `readShippedLibDescriptor`, decoding every `signature` into the CU's interner and injecting the symbols (as extern functions / globals) into the semantic scope — so the program's call to `puts` resolves to a declared symbol.
-4. **FFI synthesis → linker import.** The decoded externs flow through the FFI synthesis path (synthesizing the HIR extern records) and on to the linker as library imports, with the owning library taken from `library` (or the language's `externLibraryByFormat` fallback).
+4. **FFI synthesis → linker import.** The decoded externs flow through the FFI synthesis path (synthesizing the HIR extern records) and on to the linker as library imports, with the owning image taken from `library[<active object format>]` — the literal string it names, or the image the format family's `runtimeLibraries` row plays for the role it names, already resolved by the reader ([§12.6](#126-naming-a-runtime-role-instead-of-an-image)). A missing format key routes the reference **unbound** to the link tier; there is no language-level fallback (`externLibraryByFormat` was retired at UCRT-P4 Decision 1).
 
 ### 12.4 Fail-loud
 
@@ -777,4 +781,20 @@ The reader never returns a partial result — if **any** diagnostic is emitted d
 
 ### 12.5 Platform note
 
-Descriptors are **language-neutral AND platform-neutral** (Model 3, v0.0.2): one descriptor set under the neutral `shippedLibs/` root serves every platform — the per-symbol `library` field is a **per-object-format map** (`{"pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "libSystem.B.dylib"}`) resolved per-target at compile time via `objectFormatKindName`, with the language's `externLibraryByFormat` as the fallback for a missing key (an *unknown* format key fails loud). The earlier per-platform directory layout (`windows-x86_64/` etc.) and its automatic-selection deferral (`D-FFI-SHIPPED-LIB-PLATFORM-SELECT`) were **dissolved by Model 3** — the directory carries no platform name and `shippedLibDirs` points at the neutral root. ABI-divergent signature widths (LP64 vs. LLP64 `long`) remain a descriptor-content concern; see the shippedLibs README and anchor `D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH`.
+Descriptors are **language-neutral AND platform-neutral** (Model 3, v0.0.2): one descriptor set under the neutral `shippedLibs/` root serves every platform — the `library` field (descriptor-level, overridable per symbol) is a **per-object-format map** (`{"pe": {"role": "cLibrary"}, "elf": {"role": "cLibrary"}, "macho": {"role": "cLibrary"}}`) resolved per-target at compile time via `objectFormatKindName`. A *missing* key binds nothing for that format and routes the reference unbound to the link tier; an *unknown* key fails loud. There is no language-level fallback — `externLibraryByFormat` was retired at UCRT-P4 Decision 1 (see the `library` row in [§12.2](#122-shape)). The earlier per-platform directory layout (`windows-x86_64/` etc.) and its automatic-selection deferral (`D-FFI-SHIPPED-LIB-PLATFORM-SELECT`) were **dissolved by Model 3** — the directory carries no platform name and `shippedLibDirs` points at the neutral root. ABI-divergent signature widths (LP64 vs. LLP64 `long`) remain a descriptor-content concern; see the shippedLibs README and anchor `D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH`.
+
+### 12.6 Naming a runtime role instead of an image
+
+A `library` value may name a **runtime role** rather than an image:
+
+```jsonc
+"library": { "pe": { "role": "cLibrary" }, "elf": "libm.so.6" }
+```
+
+The role is the closed `runtimeLibraries` role vocabulary of the **object format** documents (`cLibrary`, `unwindPersonality`, `systemPrimitives`, `atomicsRuntime`; the `none` sentinel is refused). It resolves **at descriptor decode** to the image that format's role table declares, and lands in the decoded map as a plain image string — every consumer downstream reads exactly what it read before and none learns a role was involved.
+
+**Why it exists.** ✔MEASURED before this form: **67** of the **69** `(descriptor, format)` entries in the shipped corpus restated an image a format document's role table already owned — one fact with two owners, in two documents, and a repoint of the `cLibrary` row moved the format's own `exit` import while leaving every descriptor's `puts` on the old image, at rc=0, ending in a load failure. The literal form STAYS for an image that plays no role: `libm.so.6` is the corpus's only true non-role literal.
+
+**Which row answers.** The active format document's own row when it declares the role; otherwise the row the shipped flavour documents of the same **kind** agree on — a `-dll`, `-dyn`, `-dylib` or `-staticlib` document declares no `cLibrary` (the loader refuses a `runtimeLibraries` row no block of the document names, as inert config), so it reaches the family's row instead. Two siblings naming different providers is REFUSED, never resolved by scan order.
+
+**Refused at read, format-independently:** an unknown role, the `none` sentinel, an `image` beside a `role`, any other key in the object, a missing or non-string `role`, a value that is neither a string nor an object. **Refused with a resolver in hand:** a role no document of the family declares, a role the family REALIZES from a shipped source (that body belongs under `realization`, which names no image to import from), a family that cannot be assembled. A reader that binds no import (the LSP, the header parser) passes no resolver: the role is validated and recorded, and the entry yields no image — the same unbound arm a missing key states.

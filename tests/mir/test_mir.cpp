@@ -547,6 +547,55 @@ TEST(MirDeathTest, AddInstRejectsValueOriginOpcodes) {
     EXPECT_DEATH({ (void)b.addInst(MirOpcode::Const, {}, kI32, 0); }, "dedicated builder");
 }
 
+// D-MIR-ADDINST-ADMITS-BLOCKADDRESS-WITH-A-FORWARDED-BLOCK-ID: the same refusal for
+// `BlockAddress`, which is the SAME structural hazard as `InlineAsm` and was the
+// only member of the class left undefended. Its payload is a TARGET BLOCK ID, and
+// every verbatim-copy site renumbers blocks, so a site that forwards `instPayload`
+// instead of calling `addBlockAddress` points `&&label` at the wrong block. That
+// failed SILENTLY — an ACCESS_VIOLATION at run time, measured as mutant A of
+// D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST — while its twin `IndirectBr`,
+// being a terminator, hit a cloner's fatal `default:` and aborted by name.
+//
+// RED-ON-DISABLE: drop `|| opcode == MirOpcode::BlockAddress` from `addInst`'s
+// dedicated-builder refusal and the EXPECT_DEATH below stops dying.
+TEST(MirDeathTest, AddInstRejectsBlockAddress) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    MirBuilder b;
+    b.addFunction(kFnSig, SymbolId{1});
+    MirBlockId e = b.createBlock();
+    b.beginBlock(e);
+    // `1` is a plausible-looking block id, which is the point: forwarding a raw
+    // payload is exactly what a copy site does, and it is indistinguishable from a
+    // correct one at the call site.
+    EXPECT_DEATH({ (void)b.addInst(MirOpcode::BlockAddress, {}, kI32, 1); },
+                 "dedicated builder");
+}
+
+// THE OTHER HALF OF THE REFUSAL, and the half a refusal-only test cannot see: the
+// SANCTIONED route must still work. A guard that reds the legitimate construction
+// path is not a fix, so this pins that `addBlockAddress` still builds the opcode,
+// still stamps the target block into the payload, and still marks that block
+// address-taken — the property `Mir::isBlockAddressTaken` derives and on which
+// SimplifyCfg's fold guard and IndirectBr's successor set both rest.
+TEST(Mir, AddBlockAddressRemainsTheSanctionedRoute) {
+    MirBuilder b;
+    b.addFunction(kFnSig, SymbolId{1});
+    MirBlockId const entry  = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const target = b.createBlock();
+    b.beginBlock(entry);
+    MirInstId const ba = b.addBlockAddress(target, kI32);
+    b.addBr(target);
+    b.beginBlock(target);
+    MirLiteralValue z; z.value = std::int64_t{0}; z.core = TypeKind::I32;
+    b.addReturn(b.addConst(z, kI32));
+    Mir m = std::move(b).finish();
+
+    EXPECT_EQ(m.instOpcode(ba), MirOpcode::BlockAddress);
+    EXPECT_EQ(m.blockAddressTarget(ba).v, target.v);
+    EXPECT_TRUE(m.isBlockAddressTaken(target));
+    EXPECT_FALSE(m.isBlockAddressTaken(entry));
+}
+
 TEST(MirDeathTest, BranchToBlockOfAnotherFunctionAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     MirBuilder b;

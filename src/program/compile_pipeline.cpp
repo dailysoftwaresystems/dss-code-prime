@@ -12,6 +12,7 @@
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: BUILD half on a large stack
 #include "core/substrate/mint_monotonic_id.hpp"  // c165: fresh per-member CompilationUnitId (static pull)
 #include "core/types/config_path_walk.hpp"  // findShippedConfigDir -- the ONE shipped-config discovery precedence
+#include "core/types/object_format_kind.hpp"  // RuntimeLibraryRoleResolver (D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE)
 #include "core/substrate/phase_timers.hpp"      // c97: per-phase --time accumulation
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"  // encode-tier extern binder's scratch lattice
@@ -271,7 +272,10 @@ bool optimizeModule(Mir&                  mir,
         }
     }
     auto const optResult = ::dss::opt::optimize(
-        mir, target, interner, *effectivePipeline, reporter, externImports);
+        mir, target, interner, *effectivePipeline, reporter, externImports,
+        // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the driver's ONE resolution
+        // of the target's plain-`char` sign, relayed to `ConstFold`.
+        opts.charIsUnsigned);
     return optResult.ok && tierClean(reporter, optEntry);
 }
 
@@ -397,6 +401,10 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // opening the next, and any early return closes the live one.
     std::optional<substrate::PhaseTimers::Scope> phase;
     phase.emplace(substrate::CompilePhase::Semantic);
+    // D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: this
+    // producer BINDS imports, so it answers descriptor role entries — from the
+    // active format's own row, or its shipped flavour family's.
+    FormatRuntimeLibraryRoleResolver const roleResolver{format};
     auto model = analyze(
         // D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE: the operator's
         // budget, carried on `opts` from `rep` -- NOT `reporter.config()`, which
@@ -419,7 +427,13 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // only in a unit test that passes its own schema is not a shipped
         // diagnostic. `target` is the driver's own long-lived schema and
         // outlives `model`, which is the lifetime the parameter requires.
-        &target);
+        &target,
+        // The standard deep-recursion reserve (the `0` sentinel) — spelled only
+        // because the resolver behind it is positional.
+        /*deepRecursionReserveBytes=*/0,
+        // Consulted during analysis only, never republished by the model, so a
+        // reference to a local outlives every read of it.
+        &roleResolver);
     phase.reset();
     copyDiagnostics(model.diagnostics(), reporter);
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
@@ -983,6 +997,10 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // D-FFI-EXTERN-CALL-DISPATCH: capture the active format's extern-call
         // shape now (the LOWER half sees only this struct, not the format).
         format.externCallDispatch(),
+        // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55):
+        // and the narrowing of WHICH bindings that dispatch applies to,
+        // for the same reason.
+        format.indirectSlotBindings(),
         // D-LK-EXTERN-DATA-IMPORT (c117): capture the format's extern-DATA
         // binding model now, for the same reason (the LOWER half's MIR→LIR
         // GlobalAddr lowering selects got-indirect deref vs a direct lea).
@@ -1127,6 +1145,20 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          // this leg has no F128 softcall binding; an F128 softcall
                          // then fails loud). Resolved per-leg by each wrapper.
                          std::optional<std::string>                  wideFloatSoftcallLibrary,
+                         // D-CSUBSET-PACKED-ATOMIC-MEMBER: the active format's
+                         // atomics-runtime block, threaded into MIR→LIR exactly
+                         // like the F128 softcall library above (nullopt = this
+                         // format supplies none; an under-aligned `_Atomic`
+                         // access then refuses loud under a `traps` target and
+                         // keeps the native form under `losesAtomicity`).
+                         std::optional<AtomicsRuntime>               atomicsRuntime,
+                         // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT
+                         // (P55): the format's DECLARED narrowing of which
+                         // symbol bindings the `indirect-slot` dispatch reaches
+                         // through the import slot. Empty = unnarrowed (every
+                         // import). Threaded into MIR→LIR exactly like the
+                         // dispatch itself, and read there ONLY under it.
+                         std::vector<SymbolBinding>                  indirectSlotBindings,
                          DiagnosticReporter&                         reporter) {
     // 4. MIR → LIR (vreg-based). Extern imports propagate through.
     // D-FFI-EXTERN-CALL-DISPATCH: the active format's extern-call shape
@@ -1147,7 +1179,19 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                           std::move(wideFloatSoftcallLibrary),
                           // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52):
                           // trailing param on lowerToLir (positional-safe).
-                          externAddrBinding);
+                          externAddrBinding,
+                          // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES:
+                          // not threaded on this route (the frontend promotes
+                          // first) — stated rather than defaulted so the
+                          // positional slot below is visible.
+                          std::nullopt,
+                          // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's
+                          // atomics runtime.
+                          std::move(atomicsRuntime),
+                          // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT
+                          // (P55): the format's declared slot-binding
+                          // narrowing.
+                          std::move(indirectSlotBindings));
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -1257,8 +1301,23 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // 8b. LIR PEEPHOLE (plan 22 OPT8) -- delete the register-to-register
     //     copies the allocator left redundant. See `lir_peephole.hpp` for
     //     why it runs HERE and not after callconv: callconv mints ZERO
-    //     additional identity copies (MEASURED 5575 at both stages over
-    //     `examples/c/**`) and its `perFuncCfi` is keyed BY `LirInstId`,
+    //     additional identity class moves, and its `perFuncCfi` is keyed BY
+    //     `LirInstId`,
+    //     ⚠ CORRECTED 2026-09-02 (P53,
+    //     D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT).
+    //     This repeated `lir_peephole.hpp`'s evidence verbatim -- "MEASURED
+    //     5575 at both stages" -- and that evidence could not support the
+    //     claim. post-rewrite and post-callconv were the only two dump stages
+    //     that existed, and THREE passes sit between them: 2addr synthesizes
+    //     class moves, the peephole DELETES members of exactly the counted
+    //     population, and callconv is the subject. An equal count across that
+    //     span is a NET, and a net of zero is equally consistent with the
+    //     peephole deleting N while callconv mints N. The CONCLUSION survives
+    //     -- re-measured per pass at the two boundaries that now exist,
+    //     callconv is +0 in every bucket on both targets -- but a figure is
+    //     quoted here no longer, because a count in a comment is a measurement
+    //     with no instrument attached. Re-derive it with the census the row
+    //     built.
     //     so a rebuild downstream of it would renumber every CFI row's
     //     subject -- an unwind table that loads clean and walks into the
     //     wrong frame.
@@ -1905,7 +1964,8 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::optional<SehPersonality> const& sehPersonality,
                      std::string_view                  formatName,
                      std::string_view                  wideFloatSoftcallLibrary,
-                     DiagnosticReporter&               reporter) {
+                     DiagnosticReporter&               reporter,
+                     std::optional<AtomicsRuntime> const& atomicsRuntime) {
     SemanticModel&       model   = cuMir.model;
     GrammarSchema const& grammar = *cuMir.grammar;
 
@@ -2135,7 +2195,8 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         cuMir.externCallDispatch, cuMir.dataImportBinding,
         cuMir.externAddrBinding,
         cuMir.tlsAccess,
-        std::move(sehScopes), std::move(wideFloatSoftcallLibraryOpt), reporter);
+        std::move(sehScopes), std::move(wideFloatSoftcallLibraryOpt),
+        atomicsRuntime, cuMir.indirectSlotBindings, reporter);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -2176,7 +2237,9 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // merge path resolves it near **formatR, exactly as
                       // externCallDispatch is pre-resolved there).
                       std::optional<std::string> wideFloatSoftcallLibrary,
-                      DiagnosticReporter& reporter) {
+                      DiagnosticReporter& reporter,
+                      std::optional<AtomicsRuntime> atomicsRuntime,
+                      std::vector<SymbolBinding> indirectSlotBindings) {
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
     // A synthesized / nameless merged symbol is absent from the map → "" → skipped
     // by the LK11a symbol-table populate (module-private), exactly as in the CU path.
@@ -2191,7 +2254,8 @@ lowerMergedToAssembly(MergedMirModule&    merged,
         dataModel, bitFieldStrategy, unnamedBitFieldAlignment,
         callingConventionIndex, cuId,
         externCallDispatch, dataImportBinding, externAddrBinding, tlsAccess,
-        std::move(sehScopes), std::move(wideFloatSoftcallLibrary), reporter);
+        std::move(sehScopes), std::move(wideFloatSoftcallLibrary),
+        std::move(atomicsRuntime), std::move(indirectSlotBindings), reporter);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU
@@ -2317,6 +2381,11 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
     if (onBinaryNames.empty()) return out;
 
     auto const scheme = format.cSymbolDecoration().scheme;
+    // D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: this
+    // oracle's rows become `ExternImport.libraryPath`, so it answers descriptor
+    // role entries exactly as the C front half does — one resolver shape, one
+    // family answer, on every path a symbol reaches the linker by.
+    FormatRuntimeLibraryRoleResolver const roleResolver{format};
 
     // The oracle interns each row's declared signature, so it needs a lattice.
     // Neither of this file's on-binary-name producers has a `SemanticModel` (the
@@ -2415,7 +2484,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
         auto const realized = ffi::realizeShippedExternSymbols(
             forwardRequest, lattice.interner(), lattice.registry(), reporter,
             format.dataModel(), std::optional<std::string_view>{target.name()},
-            format.kind(), namedTypes);
+            format.kind(), namedTypes, &roleResolver);
         if (!realized.has_value()) return std::nullopt;   // corpus not located
         for (std::size_t i = 0; i < onBinaryNames.size(); ++i) {
             if (canonicalOf[i].empty()) continue;
@@ -2466,7 +2535,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
     auto const wholeCorpus = ffi::realizeShippedExternSymbols(
         everyName, lattice.interner(), lattice.registry(), reporter,
         format.dataModel(), std::optional<std::string_view>{target.name()},
-        format.kind(), namedTypes);
+        format.kind(), namedTypes, &roleResolver);
     if (!wholeCorpus.has_value()) return std::nullopt;   // corpus not located
 
     // on-binary name -> the row realizing to it. A SECOND row claiming one name
@@ -3497,7 +3566,10 @@ assembleUnit(CompilationUnit const&        cu,
     return lowerCuMirToAssembly(
         *cuMir, format.processArgs(), format.entryVerbs(),
         format.sehPersonality(), format.name(),
-        target.wideFloatSoftcallLibrary(format.kind()), reporter);
+        target.wideFloatSoftcallLibrary(format.kind()), reporter,
+        // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics runtime, read
+        // off the schema here exactly as `sehPersonality` above is.
+        format.atomicsRuntime());
 }
 
 namespace {

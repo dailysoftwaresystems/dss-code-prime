@@ -8,6 +8,7 @@
 #include "core/substrate/relocation_table_json.hpp"
 #include "core/types/artifact_profile.hpp"  // isRegisteredArtifactProfile / registeredArtifactProfileList (AP3, shared w/ grammar loader)
 #include "core/types/config_document_parse.hpp"  // THE ONE config-document parse
+#include "core/types/include_path_resolve.hpp"  // shippedConfigRelativePathEscapes — the SHARED containment check for a config-root-relative source path
 #include "core/types/config_key_vocabulary.hpp"  // isDocumentationKey / DSS_CHECK_KEY_VOCABULARY (TF-C74 extraction)
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/predefined_macro_json.hpp"  // detail::parsePredefinedMacroArray (TF-C97 — the SHARED predefine grammar, 3rd family)
@@ -356,7 +357,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // (absence is "makes no claim", the deleted table's own behaviour for an
     // unlisted target), so the asymmetry applies in its harmless direction.
     // 32 + 1 = 33.
-    static constexpr std::array<std::string_view, 35> kFormatDocumentKeys{
+    static constexpr std::array<std::string_view, 38> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -398,11 +399,25 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         "entryVerbs",
         // import / link contract
         "externCallDispatch", "dataImportBinding", "externAddrBinding",
+        // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT: WHICH
+        // symbol bindings `externCallDispatch: indirect-slot` applies to.
+        // Registered here so a typo is REFUSED AT LOAD naming the file rather
+        // than silently leaving the dispatch unnarrowed — which reads as
+        // "correct but slower" and is exactly the state this key exists to
+        // end, so it must not be reachable by a misspelling.
+        "indirectSlotBindings",
+        // D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET: the
+        // OBJECT-CARRIED realization of `dataImportBinding` — the spelling a
+        // RELOCATABLE artifact publishes its own data-import slot under,
+        // because it has no import walker to build one. Registered here so a
+        // typo is REFUSED AT LOAD naming the file, rather than loading as a
+        // relocatable format that declares the binding and carries no slot.
+        "objectImportSlot",
         "tlsAccess", "librarySynthesis",
         // ROLE → IMAGE table + the roles that name it. A typo in either is a
         // wrong-IMAGE bind, i.e. the eager-import 0xC0000139 class on pe and an
         // undefined symbol elsewhere — never a silent fallback.
-        "runtimeLibraries", "sehPersonality",
+        "runtimeLibraries", "sehPersonality", "atomicsRuntime",
         // stack-reserve capability + its remedy axis
         "stackReserveControl", "stackReserveUnsupportedReason",
         // the weak-DEFINITION spelling (D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED).
@@ -1295,6 +1310,101 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         }
     }
 
+    // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT:
+    // `indirectSlotBindings` — WHICH symbol bindings the `indirect-slot`
+    // dispatch above applies to. An ARRAY of closed-vocabulary
+    // `SymbolBinding` names: `["weak"]`. Optional; ABSENT = every import,
+    // which is the unqualified meaning `indirect-slot` has always carried.
+    //
+    // Strict on the `entryVerbs` discipline directly below, and for the same
+    // reason one level sharper: every failure mode of this key is a SILENT
+    // widening back to the state it exists to narrow. So an unknown spelling,
+    // a duplicate, an EMPTY array, and `local` are each refused rather than
+    // absorbed. `local` in particular can never match — no format spells an
+    // undefined LOCAL symbol and `collectExterns` refuses one at the
+    // declaration's own span — so listing it is config that reads as a
+    // capability and is not one (D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE).
+    // The `indirect-slot` PAIRING rule is validate()'s, not this loader's:
+    // key ORDER in a JSON object is not guaranteed, so a rule that reads two
+    // keys belongs where both are already parsed.
+    if (doc.contains("indirectSlotBindings")) {
+        if (!doc.at("indirectSlotBindings").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/indirectSlotBindings",
+                      std::format("'indirectSlotBindings' must be an ARRAY of "
+                                  "symbol BINDING names (accepted: {})",
+                                  allowedList(allNames(kSymbolBindingTable),
+                                              ", ")));
+        } else {
+            auto const& arr = doc.at("indirectSlotBindings");
+            if (arr.empty()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/indirectSlotBindings",
+                          "'indirectSlotBindings' is present but EMPTY. An "
+                          "empty narrowing would mean no import takes the "
+                          "slot, which is not a narrowing of "
+                          "`externCallDispatch: indirect-slot` but a silent "
+                          "cancellation of it — declare `externCallDispatch: "
+                          "direct-plt` if that is what the format means, or "
+                          "name the bindings that need the slot.");
+            }
+            std::size_t i = 0;
+            for (auto const& row : arr) {
+                auto const path = std::format("/indirectSlotBindings/{}", i);
+                ++i;
+                if (!row.is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format("each indirectSlotBindings entry "
+                                          "must be a symbol binding NAME "
+                                          "string (accepted: {})",
+                                          allowedList(
+                                              allNames(kSymbolBindingTable),
+                                              ", ")));
+                    continue;
+                }
+                auto const spelling = row.get<std::string>();
+                auto const b = symbolBindingFromName(spelling);
+                if (!b.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format("unknown symbol binding '{}' — "
+                                          "accepted: {}", spelling,
+                                          allowedList(
+                                              allNames(kSymbolBindingTable),
+                                              ", ")));
+                    continue;
+                }
+                if (*b == SymbolBinding::Local) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format(
+                                  "'{}' is not a representable IMPORT binding, "
+                                  "so naming it here declares a narrowing "
+                                  "member that can never match. An import is "
+                                  "by construction a name the object does NOT "
+                                  "define, and no object format spells an "
+                                  "undefined LOCAL symbol — HIR→MIR refuses "
+                                  "one at the declaration's own span. Name "
+                                  "only bindings an import can carry: {}.",
+                                  spelling,
+                                  allowedList(allNames(kSymbolBindingTable),
+                                              ", ")));
+                    continue;
+                }
+                bool dupe = false;
+                for (auto const prior : data.indirectSlotBindings) {
+                    if (prior != *b) continue;
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format(
+                                  "duplicate symbol binding '{}' — this is a "
+                                  "SET, and a repeated member is an authoring "
+                                  "mistake this loader will not silently "
+                                  "absorb.", spelling));
+                    dupe = true;
+                    break;
+                }
+                if (!dupe) data.indirectSlotBindings.push_back(*b);
+            }
+        }
+    }
+
     // D-LK-EXTERN-DATA-IMPORT: `dataImportBinding` — the format's
     // extern-DATA import binding model ("got-indirect"). Optional in
     // the JSON (a format whose data-import model has not landed — every
@@ -1370,6 +1480,45 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                           ", ")));
             } else {
                 data.externAddrBinding = *b;
+            }
+        }
+    }
+
+    // D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET:
+    // `objectImportSlot` — the symbol-name spelling of the data-import slot a
+    // RELOCATABLE artifact carries itself, because it has no import walker to
+    // build one for it. Optional in the JSON (every IMAGE flavour omits it —
+    // its walker owns the slot — and so does a relocatable flavour that
+    // declares no `dataImportBinding` at all). A PRESENT block is strict: the
+    // key vocabulary is closed and the prefix must be a non-empty string, on
+    // the `tlsAccess` discipline directly below.
+    static constexpr std::array<std::string_view, 1> kObjectImportSlotKeys{
+        "symbolPrefix"};
+    DSS_CHECK_KEY_VOCABULARY(kObjectImportSlotKeys);
+    if (doc.contains("objectImportSlot")) {
+        auto const& os = doc.at("objectImportSlot");
+        if (!os.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/objectImportSlot",
+                      std::format("'objectImportSlot' must be an object with "
+                                  "key(s) {}",
+                                  allowedList(kObjectImportSlotKeys, ", ")));
+        } else {
+            rejectUnknownKeys(os, kObjectImportSlotKeys, "/objectImportSlot",
+                              "the 'objectImportSlot' block", coll);
+            if (!os.contains("symbolPrefix")
+                || !os.at("symbolPrefix").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/objectImportSlot/symbolPrefix",
+                          "'objectImportSlot' requires a string "
+                          "'symbolPrefix' — the name the carried slot is "
+                          "published under. There is no default: an omitted "
+                          "prefix would publish the slot under the import's "
+                          "own name.");
+            } else {
+                detail::ObjectFormatData::ObjectImportSlotInfo info;
+                info.symbolPrefix =
+                    os.at("symbolPrefix").get<std::string>();
+                data.objectImportSlot = std::move(info);
             }
         }
     }
@@ -1520,8 +1669,9 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // ── UCRT-P4: `runtimeLibraries` — the ROLE → IMAGE table ─────────────
     //
     // Parsed FIRST among the role-consuming blocks (`processExit`,
-    // `processArgs`, `sehPersonality`, `librarySynthesis` all resolve against
-    // it), so `resolveRuntimeRole` below is available to every one of them.
+    // `processArgs`, `sehPersonality`, `librarySynthesis`, `atomicsRuntime` all
+    // resolve against it), so `resolveRuntimeRole` below is available to every
+    // one of them.
     // Each row is `{"role": <closed enum>, "image": <non-empty string>}`; roles
     // are unique cross-row. An unknown role spelling, the `none` sentinel, a
     // missing/empty image, or a duplicate role all REFUSE the document — the
@@ -1533,8 +1683,14 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // eager-import 0xC0000139 class. Declared above the two shape sentences
     // that render it, rather than beside the `rejectUnknownKeys` call that
     // used to be its only reader.
-    static constexpr std::array<std::string_view, 2>
-        kRuntimeLibraryRowKeys{"role", "image"};
+    // ★★ D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64: `source` is the SECOND kind of
+    // answer a row may give — "DSS ships and compiles this body" instead of
+    // "import from that image". EXACTLY ONE of the two per row, enforced below
+    // in both directions: neither is an unfilled role, both are two owners for
+    // one body (the refusal `shippedLibs`' own `library`/`realization` pair has
+    // made since D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF).
+    static constexpr std::array<std::string_view, 3>
+        kRuntimeLibraryRowKeys{"role", "image", "source"};
     DSS_CHECK_KEY_VOCABULARY(kRuntimeLibraryRowKeys);
     if (doc.contains("runtimeLibraries")) {
         if (!doc.at("runtimeLibraries").is_array()) {
@@ -1579,15 +1735,52 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                       ", ")));
                     continue;
                 }
-                if (!row.contains("image") || !row.at("image").is_string()
-                 || row.at("image").get<std::string>().empty()) {
-                    coll.emit(DiagnosticCode::C_MissingField, path + "/image",
-                              "requires a non-empty 'image' (the DLL / "
-                              "shared-object / dylib identity that plays this "
-                              "role)");
+                auto const nonEmptyString =
+                    [&row](char const* key) -> std::optional<std::string> {
+                        if (!row.contains(key) || !row.at(key).is_string())
+                            return std::nullopt;
+                        auto s = row.at(key).get<std::string>();
+                        if (s.empty()) return std::nullopt;
+                        return s;
+                    };
+                auto const image  = nonEmptyString("image");
+                auto const source = nonEmptyString("source");
+                if (image.has_value() == source.has_value()) {
+                    coll.emit(DiagnosticCode::C_MissingField, path,
+                              image.has_value()
+                                  ? "declares BOTH a non-empty 'image' and a "
+                                    "non-empty 'source' — a role has exactly "
+                                    "ONE provider, and two owners for one body "
+                                    "is the defect this pair exists to refuse. "
+                                    "Name the platform image the entries are "
+                                    "IMPORTED from, or the shipped source DSS "
+                                    "COMPILES to define them, never both."
+                                  : "requires exactly one of a non-empty "
+                                    "'image' (the DLL / shared-object / dylib "
+                                    "identity the entries are IMPORTED from) or "
+                                    "a non-empty 'source' (a path under "
+                                    "`runtime/<tier>/src/`, relative to "
+                                    "src/dss-config/, whose compiled body "
+                                    "DEFINES them). A row with neither is an "
+                                    "unfilled role.");
                     continue;
                 }
-                if (data.runtimeLibraries.imageForRole(*role).has_value()) {
+                if (source.has_value()
+                 && shippedConfigRelativePathEscapes(*source)) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path + "/source",
+                              std::format(
+                                  "'source' must be a path RELATIVE to "
+                                  "src/dss-config/, spelled with forward "
+                                  "slashes and no '.'/'..' components, got "
+                                  "'{}' — the same shape a shipped-lib "
+                                  "descriptor's `realization.<format>.source` "
+                                  "takes, because it names a file in the same "
+                                  "tree and is compiled by the same driver "
+                                  "seam.",
+                                  *source));
+                    continue;
+                }
+                if (data.runtimeLibraries.rowForRole(*role) != nullptr) {
                     coll.emit(DiagnosticCode::C_MalformedJson, path + "/role",
                               std::format(
                                   "duplicate runtimeLibraries role '{}' — one "
@@ -1598,7 +1791,8 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 }
                 data.runtimeLibraries.bindings.push_back(
                     RuntimeLibraryBinding{*role,
-                                          row.at("image").get<std::string>()});
+                                          image.value_or(std::string{}),
+                                          source.value_or(std::string{})});
             }
         }
     }
@@ -1640,14 +1834,22 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                           ", ")));
                 return false;
             }
-            auto const image = data.runtimeLibraries.imageForRole(*role);
-            if (!image.has_value()) {
+            // ⚠ EXISTENCE IS A ROW QUESTION, NOT AN IMAGE QUESTION. A REALIZED
+            // row (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64) declares the role and
+            // carries no image at all, so testing `imageForRole().has_value()`
+            // would still answer correctly today only by the accident that an
+            // empty image is a present-but-empty view. Asking for the ROW says
+            // what is meant and cannot rot when that representation changes.
+            auto const* const row = data.runtimeLibraries.rowForRole(*role);
+            if (row == nullptr) {
                 std::string declared;
                 for (auto const& b : data.runtimeLibraries.bindings) {
                     if (!declared.empty()) declared += ", ";
                     declared += runtimeLibraryRoleName(b.role);
                     declared += " -> ";
-                    declared += b.image;
+                    declared += b.source.empty() ? b.image
+                                                 : ("(shipped source) "
+                                                    + b.source);
                 }
                 if (declared.empty()) declared = "<none>";
                 coll.emit(DiagnosticCode::C_MissingField, rolePath,
@@ -1660,7 +1862,13 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                               roleText, declared));
                 return false;
             }
-            outImage = std::string{*image};
+            // ★ A REALIZED ROLE RESOLVES TO THE EMPTY PATH, DELIBERATELY. That
+            // is not a missing answer: it is the "no library binding" shape the
+            // shipped-source realization already uses, and it is what makes the
+            // consumer branch-free — an extern minted with an empty library path
+            // is resolved from the shipped runtime archive by the linker's
+            // ordinary unresolved-symbol pull instead of becoming an import.
+            outImage = row->image;
             return true;
         };
 
@@ -1705,6 +1913,76 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 out.mangledName = sp.at("mangledName").get<std::string>();
             }
             if (ok) data.sehPersonality = std::move(out);
+        }
+    }
+
+    // ── D-CSUBSET-PACKED-ATOMIC-MEMBER: `atomicsRuntime` ──────────────────
+    //
+    // `{"role": <runtimeLibraries role>, "loadMangledName": <non-empty>,
+    //   "storeMangledName": <non-empty>}`. All three halves REQUIRED when the
+    // block is present, for the `sehPersonality` reason one level over: a
+    // runtime with no role has no image to import from, and one missing either
+    // entry name can lower only half of `_Atomic` — and the HALF THAT LOWERS
+    // would read as a working fix while the other direction kept faulting,
+    // which is the partial-fix-reads-as-complete shape exactly.
+    //
+    // OPTIONAL as a block. A format that declares none supplies no atomics
+    // runtime; the TARGET's `underAlignedAtomicForm` then decides (refuse under
+    // `traps`, keep the native form under `losesAtomicity`) — see
+    // `ObjectFormatData::atomicsRuntime`.
+    static constexpr std::array<std::string_view, 3>
+        kAtomicsRuntimeKeys{"role", "loadMangledName", "storeMangledName"};
+    DSS_CHECK_KEY_VOCABULARY(kAtomicsRuntimeKeys);
+    if (doc.contains("atomicsRuntime")) {
+        if (!doc.at("atomicsRuntime").is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/atomicsRuntime",
+                      std::format("'atomicsRuntime' must be an object with the "
+                                  "keys {}",
+                                  allowedList(kAtomicsRuntimeKeys, ", ")));
+        } else {
+            auto const& ar = doc.at("atomicsRuntime");
+            rejectUnknownKeys(ar, kAtomicsRuntimeKeys, "/atomicsRuntime",
+                              "the 'atomicsRuntime' block", coll);
+            AtomicsRuntime out;
+            bool ok = resolveRuntimeRole(ar, "/atomicsRuntime", out.libraryPath);
+            if (ok) {
+                out.role = *runtimeLibraryRoleFromName(
+                    ar.at("role").get<std::string>());
+            }
+            // The two entry names, ALREADY MANGLED for this format (Mach-O's
+            // leading underscore is the format's own `cSymbolDecoration`, and
+            // declaring it here rather than re-deriving it in the lowerer is
+            // the `processExit.importMangledName` pattern).
+            struct NameField { char const* key; std::string* out;
+                               char const* what; };
+            NameField const names[2] = {
+                {"loadMangledName",  &out.loadMangledName,
+                 "the GENERIC atomics LOAD entry "
+                 "(elf: \"__atomic_load\", macho: \"___atomic_load\")"},
+                {"storeMangledName", &out.storeMangledName,
+                 "the GENERIC atomics STORE entry "
+                 "(elf: \"__atomic_store\", macho: \"___atomic_store\")"},
+            };
+            for (auto const& n : names) {
+                if (!ar.contains(n.key) || !ar.at(n.key).is_string()
+                 || ar.at(n.key).get<std::string>().empty()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              std::string{"/atomicsRuntime/"} + n.key,
+                              std::format(
+                                  "requires a non-empty '{}' — {}. ⚠ It must be "
+                                  "the GENERIC, runtime-sized entry, never a "
+                                  "sized `__atomic_load_N`: the sized family "
+                                  "resolves to the INLINE realization and "
+                                  "SIGBUSes on the very access this block "
+                                  "exists to route around "
+                                  "(D-CSUBSET-PACKED-ATOMIC-MEMBER).",
+                                  n.key, n.what));
+                    ok = false;
+                } else {
+                    *n.out = ar.at(n.key).get<std::string>();
+                }
+            }
+            if (ok) data.atomicsRuntime = std::move(out);
         }
     }
 
@@ -2746,10 +3024,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     if (!data.runtimeLibraries.empty()) {
         // Which roles does ANY block name? Gathered from the document, generically
         // — the list of role-NAMING block keys is the only thing enumerated, and it
-        // is the same four the parsers above read.
+        // is the same five the parsers above read.
         std::vector<RuntimeLibraryRole> named;
         for (char const* blockKey : {"processExit", "processArgs",
-                                     "sehPersonality", "librarySynthesis"}) {
+                                     "sehPersonality", "librarySynthesis",
+                                     "atomicsRuntime"}) {
             if (!doc.contains(blockKey) || !doc.at(blockKey).is_object()) continue;
             auto const& blk = doc.at(blockKey);
             if (!blk.contains("role") || !blk.at("role").is_string()) continue;

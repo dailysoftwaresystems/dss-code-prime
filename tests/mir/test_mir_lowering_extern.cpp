@@ -455,6 +455,139 @@ TEST(MirLoweringExtern, ExternGlobalThreadLocalFlagReachesImportRow) {
         << "the unmarked sibling must stay process-shared";
 }
 
+// ── D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE — THE MINT SITE ─────
+//
+// `weak` on an extern IMPORT reached the HIR linkage map and STOPPED. HIR→MIR
+// consumed `linkageMap` for function DEFINITIONS and GLOBALS only, so an extern
+// import — which is neither — left the attribute in a map nothing read. The bit
+// was parsed, understood, recorded, and dropped one layer below where it was
+// recorded, which is why nothing upstream reported a problem and every emitted
+// object marked the undefined symbol STRONG on all three formats.
+//
+// ★ THE SINGLE ARM IS PINNED BESIDE ITS CONTROL, in the same lowering, because
+// a lowering that stamped Weak on EVERY import would be the worse defect: a
+// REQUIRED symbol becomes optional, the image links with it missing, and the
+// reference reads through null with no diagnostic.
+//
+// ★ BOTH RAILS, because `ExternGlobal` and `ExternFunction` build their rows
+// separately and a weak DATA import and a weak FUNCTION import are the same fact
+// about the same rail — two open-coded reads is how the two would drift.
+TEST(MirLoweringExtern, WeakOnAnExternImportReachesTheImportRowOnBothRails) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const fnTy = ti.fnSig(std::array{i32}, i32, CallConv::CcSysV);
+    HirBuilder b{"c"};
+    constexpr std::uint32_t kWeakDataSym = 51;
+    constexpr std::uint32_t kPlainDataSym = 52;
+    constexpr std::uint32_t kWeakFnSym   = 53;
+    constexpr std::uint32_t kPlainFnSym  = 54;
+    HirNodeId const weakData  = b.makeExternGlobal(i32, kWeakDataSym);
+    HirNodeId const plainData = b.makeExternGlobal(i32, kPlainDataSym);
+    HirNodeId const weakFn    = b.makeExternFunction(fnTy, kWeakFnSym, {});
+    HirNodeId const plainFn   = b.makeExternFunction(fnTy, kPlainFnSym, {});
+    HirNodeId const root =
+        b.makeModule(std::array{weakData, plainData, weakFn, plainFn});
+    Hir hir = std::move(b).finish(root);
+
+    HirFfiMap ffi{hir};
+    auto meta = [&](HirNodeId n, char const* name) {
+        FfiMetadata m;
+        m.mangledName = name;
+        m.importLibrary = "libc.so.6";
+        ffi.set(n, m);
+    };
+    meta(weakData, "wd");
+    meta(plainData, "pd");
+    meta(weakFn, "wf");
+    meta(plainFn, "pf");
+
+    // The declaration's OWN linkage, recorded on the extern node exactly as
+    // `recordExtern` records it in CST→HIR. The two unannotated siblings are
+    // deliberately left ABSENT from the map rather than set to Global: absence
+    // is the correct externally-visible default, and it is the shape every
+    // ordinary extern actually has.
+    HirLinkageMap linkage{hir};
+    LinkageAttr weakAttr;
+    weakAttr.binding = SymbolBinding::Weak;
+    linkage.set(weakData, weakAttr);
+    linkage.set(weakFn, weakAttr);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    auto result = lowerToMir(hir, pool, ti, rep,
+                             /*sourceMap=*/nullptr, MirLoweringConfig{},
+                             &ffi, &linkage);
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    ASSERT_EQ(result.externImports.size(), 4u);
+
+    auto bindingOf = [&](std::string_view name) -> SymbolBinding {
+        for (auto const& e : result.externImports)
+            if (e.mangledName == name) return e.binding;
+        ADD_FAILURE() << "no import row named " << name;
+        return SymbolBinding::Global;
+    };
+    EXPECT_EQ(bindingOf("wd"), SymbolBinding::Weak)
+        << "a WEAK extern DATA import must carry its binding onto the import row "
+           "-- otherwise the object marks the undefined symbol STRONG and a "
+           "program that tests it for null cannot link at all.";
+    EXPECT_EQ(bindingOf("wf"), SymbolBinding::Weak)
+        << "the FUNCTION rail must read the same map at the same site -- two "
+           "open-coded reads is how the two rails drift.";
+    EXPECT_EQ(bindingOf("pd"), SymbolBinding::Global)
+        << "the CONTROL: an unannotated DATA import stays a STRONG reference.";
+    EXPECT_EQ(bindingOf("pf"), SymbolBinding::Global)
+        << "the CONTROL: an unannotated FUNCTION import stays a STRONG reference.";
+}
+
+// A `Local` binding on an extern import is UNSPELLABLE — an import is a name
+// this object does not define, and module-private is the one thing such a name
+// cannot be. No format encodes an undefined LOCAL symbol, so folding it to
+// Global (or to Weak) would silently change which linker can resolve the
+// reference. It is refused at the DECLARATION, where the source span still
+// exists, rather than at a walker that could only say "unresolved symbol".
+TEST(MirLoweringExtern, LocalBindingOnAnExternImportFailsLoud) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"c"};
+    constexpr std::uint32_t kSym = 61;
+    HirNodeId const eg   = b.makeExternGlobal(i32, kSym);
+    HirNodeId const root = b.makeModule(std::array{eg});
+    Hir hir = std::move(b).finish(root);
+
+    HirFfiMap ffi{hir};
+    FfiMetadata m;
+    m.mangledName = "loc";
+    m.importLibrary = "libc.so.6";
+    ffi.set(eg, m);
+    HirLinkageMap linkage{hir};
+    LinkageAttr attr;
+    attr.binding = SymbolBinding::Local;
+    linkage.set(eg, attr);
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    auto result = lowerToMir(hir, pool, ti, rep,
+                             /*sourceMap=*/nullptr, MirLoweringConfig{},
+                             &ffi, &linkage);
+    EXPECT_FALSE(result.ok)
+        << "an unspellable import binding must stop the lowering, not ride to a "
+           "writer that has no encoding for it";
+    ASSERT_GE(rep.errorCount(), 1u);
+    bool sawIt = false;
+    for (auto const& d : rep.all())
+        if (d.actual.find("D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE")
+            != std::string::npos)
+            sawIt = true;
+    EXPECT_TRUE(sawIt)
+        << "the refusal must name the row that owns the import-binding rail, so a "
+           "reader lands on the rule rather than on a generic lowering failure";
+    EXPECT_TRUE(result.externImports.empty())
+        << "the refused declaration must mint NO import row -- a half-refused "
+           "extern that still reached the linker would be the silent half of this "
+           "defect wearing a diagnostic.";
+}
+
 TEST(MirLoweringExtern, ExternGlobalCurrentlyFailsLoudPendingFeatureWork) {
     // D-FF2-5 audit pin (2026-06-01): `extern int x;` (and the
     // array form `extern int x[10];` post-fold #11) lowers to a

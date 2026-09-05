@@ -905,6 +905,113 @@ TEST(HirText, PackedFlagRoundTrip) {
     expectRoundTrip(hir, ctx);   // emit→parse→emit byte-identical
 }
 
+// D-CSUBSET-PER-MEMBER-PACKED: the PER-FIELD packed marker round-trips. A struct with
+// ONE packed member emits ` packed` after THAT member's type and re-parses with the
+// flag on that member alone. ★ Without this the flag would cross the text boundary
+// ABSENT, and the loss is invisible to every size check: MEASURED (gcc 13.3.0 + clang
+// 18.1.3, x86_64 and aarch64), `{char a; int z <pk>; double d;}` and the undecorated
+// struct are BOTH sizeof 16 / _Alignof 8 — only z's offset differs, 1 vs 4.
+TEST(HirText, PerFieldPackedMarkerRoundTrips) {
+    TypeInterner in{CompilationUnitId{1}};
+    std::array<TypeId, 3> const fields{in.primitive(TypeKind::Char),
+                                       in.primitive(TypeKind::I32),
+                                       in.primitive(TypeKind::F64)};
+    std::array<std::int64_t, 0>  const noWidths{};
+    std::array<std::uint64_t, 0> const noOffs{};
+    std::array<std::uint32_t, 0> const noAligns{};
+    std::array<std::uint8_t, 3>  const flags{0, 1, 0};
+    TypeId const s = in.forwardComposite(TypeKind::Struct, "S", /*declSiteKey=*/77);
+    in.completeComposite(s, fields, /*packed=*/false, noWidths, noOffs, noAligns,
+                         /*explicitAlign=*/0, /*maxFieldAlign=*/0, flags);
+    TypeId const ptrS   = in.pointer(s);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::array<TypeId, 1> const params{ptrS};
+    TypeId const sig = in.fnSig(params, voidTy, CallConv::CcSysV);
+
+    HirBuilder b{"toy"};
+    HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{});
+    HirNodeId const fn   = b.makeFunction(sig, /*symbol=*/1, {}, body);
+    HirNodeId const root = b.makeModule(std::vector<HirNodeId>{fn});
+    Hir hir = std::move(b).finish(root);
+
+    std::vector<std::string> names{"", "main"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    DiagnosticReporter r;
+    std::string const text = emitHir(hir, ctx, r);
+    // The marker sits on the MEMBER, not after the struct name — a whole-composite
+    // packed would emit `struct "S" packed {`, which is a different layout.
+    EXPECT_EQ(text.find("struct \"S\" packed"), std::string::npos) << text;
+    EXPECT_NE(text.find("i32 packed"), std::string::npos) << text;
+    expectRoundTrip(hir, ctx);   // emit -> parse -> emit byte-identical
+}
+
+// D-CSUBSET-PER-MEMBER-PACKED: the codec's PARSE direction, plus the identity fork.
+// `struct "S" { i32 packed }` and `struct "S" packed { i32 }` are DIFFERENT layouts
+// and must never collapse onto one TypeId (they use distinct forward key spaces).
+TEST(ParseTypeFromText, PerFieldPackedParseAndForkIdentity) {
+    TypeInterner interner{CompilationUnitId{15}};
+    TypeRegistry reg;
+    DiagnosticReporter rep;
+
+    TypeId const perField = parseTypeFromText(
+        "struct \"S\" { i8, i32 packed }", interner, reg, rep);
+    ASSERT_TRUE(perField.valid());
+    EXPECT_EQ(interner.kind(perField), TypeKind::Struct);
+    EXPECT_FALSE(interner.isPacked(perField));
+    EXPECT_TRUE(interner.hasFieldPacked(perField));
+    EXPECT_FALSE(interner.isFieldPacked(perField, 0));
+    EXPECT_TRUE(interner.isFieldPacked(perField, 1));
+
+    // Canonical: the same text parses to the same TypeId.
+    TypeId const again = parseTypeFromText(
+        "struct \"S\" { i8, i32 packed }", interner, reg, rep);
+    EXPECT_EQ(perField, again);
+
+    // FORK: the whole-composite spelling of the same fields is a DISTINCT type.
+    TypeId const whole = parseTypeFromText(
+        "struct \"S\" packed { i8, i32 }", interner, reg, rep);
+    ASSERT_TRUE(whole.valid());
+    EXPECT_NE(perField, whole);
+    EXPECT_TRUE(interner.isPacked(whole));
+    EXPECT_FALSE(interner.hasFieldPacked(whole));
+
+    // FORK: the undecorated spelling is a THIRD distinct type.
+    TypeId const plain = parseTypeFromText(
+        "struct \"S\" { i8, i32 }", interner, reg, rep);
+    ASSERT_TRUE(plain.valid());
+    EXPECT_NE(perField, plain);
+    EXPECT_NE(whole, plain);
+    EXPECT_FALSE(interner.hasFieldPacked(plain));
+
+    // A per-field packed COMBINES with a member alignas marker, in that order.
+    TypeId const both = parseTypeFromText(
+        "struct \"P\" { i8 ~1, i32 ~2 packed }", interner, reg, rep);
+    ASSERT_TRUE(both.valid());
+    EXPECT_TRUE(interner.hasExplicitAligns(both));
+    EXPECT_TRUE(interner.hasFieldPacked(both));
+    EXPECT_EQ(interner.explicitFieldAlign(both, 1), 2u);
+    EXPECT_TRUE(interner.isFieldPacked(both, 1));
+
+    // A UNION member carries it too, and forks from the whole-composite spelling.
+    TypeId const uPerField = parseTypeFromText(
+        "union \"U\" { i8, i32 packed }", interner, reg, rep);
+    ASSERT_TRUE(uPerField.valid());
+    EXPECT_EQ(interner.kind(uPerField), TypeKind::Union);
+    EXPECT_FALSE(interner.isPacked(uPerField));
+    EXPECT_TRUE(interner.isFieldPacked(uPerField, 1));
+    TypeId const uWhole = parseTypeFromText(
+        "union \"U\" packed { i8, i32 }", interner, reg, rep);
+    EXPECT_NE(uPerField, uWhole);
+
+    // FAIL LOUD: a packed field cannot also carry an explicit offset — the interner
+    // ABORTS on that pair, so the text layer must refuse it with a diagnostic first.
+    DiagnosticReporter repBad;
+    TypeId const bad = parseTypeFromText(
+        "struct \"B\" { i8 @0, i32 @4 packed }", interner, reg, repBad);
+    EXPECT_FALSE(bad.valid());
+    EXPECT_GE(repBad.errorCount(), 1u);
+}
+
 // c107: the offset syntax ROUND-TRIPS through emit (a struct-returning fn signature
 // carries the struct text). emit → parse → emit is byte-identical, and the emitted
 // text spells `@4` — so a HIR text round-trip (verify-on-load / reintern) preserves
@@ -1553,4 +1660,84 @@ TEST(HirText, InlineAsmRegisterClassOrdinalInsideTheEnumStillLoads) {
     EXPECT_TRUE(res->inlineAsmPool.at(1).operands[0].regClassResolved);
     EXPECT_EQ(res->inlineAsmPool.at(1).operands[0].regClass,
               static_cast<std::uint8_t>(TargetRegClass::GPR));
+}
+
+// ── the self-referential composite ───────────────────────────────────────────
+//
+// `struct S { int v; struct S *next; }` is the commonest shape in C, and the
+// type graph it interns is CYCLIC: the struct's second field is `ptr<struct S>`,
+// whose operand is the struct itself. `appendType` walks operands structurally
+// with nothing tracking what it is already inside, so a naive walk re-enters the
+// struct through its own field forever. That is an INTERNER CYCLE, not a depth
+// problem — no nesting cap can bound it, because the graph has no bottom.
+//
+// ✔MEASURED 2026-09-02 BEFORE the fix, on exactly the declaration below:
+// `emitHir` died with STATUS_STACK_OVERFLOW (0xC00000FD) — an uncatchable process
+// kill, no diagnostic, no output. The claim reached this lane marked INFERRED and
+// it HELD.
+//
+// The fix is a CYCLE GUARD, not a depth cap: the graph has no bottom, so a cap
+// only chooses how much stack to burn before the same crash while also refusing
+// legitimately deep acyclic types. Since this grammar has no back-reference form,
+// the honest result is a LOUD refusal with unparseable output — `opaque` would
+// reintern a COMPLETE struct as INCOMPLETE, a silent ABI drop.
+//
+// RED-ON-DISABLE, REMOVE DIRECTION: delete the `compositesOpen_` membership test
+// in `appendType` and this test does not fail — it CRASHES THE RUNNER, which is
+// the honest signal for the defect it pins.
+TEST(HirText, SelfReferentialStructTerminates) {
+    TypeInterner in{CompilationUnitId{77}};
+    TypeId const s = in.forwardComposite(TypeKind::Struct, "S", /*declSiteKey=*/7);
+    std::array<TypeId, 2> const fields{in.primitive(TypeKind::I32), in.pointer(s)};
+    in.completeComposite(s, fields, /*packed=*/false);
+
+    HirBuilder b{"toy"};
+    HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{});
+    std::array<TypeId, 1> const params{in.pointer(s)};
+    TypeId const sig = in.fnSig(params, in.primitive(TypeKind::Void), CallConv::CcSysV);
+    HirNodeId const fn   = b.makeFunction(sig, /*symbol=*/1, {}, body);
+    HirNodeId const root = b.makeModule(std::vector<HirNodeId>{fn});
+    Hir hir = std::move(b).finish(root);
+
+    std::vector<std::string> names{"", "f"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    DiagnosticReporter r;
+    std::string const text = emitHir(hir, ctx, r);
+    // Reaching this line at all is the primary assertion: before the guard the
+    // process died here.
+    EXPECT_LT(text.size(), 4096u) << "bounded output, not a runaway expansion";
+    EXPECT_NE(text.find("struct \"S\""), std::string::npos)
+        << "the outermost spelling still happens — only the RE-ENTRY is cut\n" << text;
+    // ...and the cut is LOUD, with output that cannot be silently re-parsed.
+    EXPECT_TRUE(r.hasErrors()) << "a type this codec cannot spell must be an Error";
+    EXPECT_NE(text.find('?'), std::string::npos)
+        << "the poison token must be present so the text is refused on reintern";
+    bool saidCyclic = false;
+    for (auto const& d : r.all()) {
+        if (d.actual.find("CYCLIC") != std::string::npos) saidCyclic = true;
+    }
+    EXPECT_TRUE(saidCyclic) << "the diagnostic must name the CAUSE, not just fail";
+
+    // A sibling repeat is ordinary sharing, NOT a cycle — the guard is a stack, and
+    // a set would wrongly poison this.
+    TypeInterner in2{CompilationUnitId{78}};
+    TypeId const i32 = in2.primitive(TypeKind::I32);
+    TypeId const inner = in2.forwardComposite(TypeKind::Struct, "Inner", 8);
+    std::array<TypeId, 1> const innerFields{i32};
+    in2.completeComposite(inner, innerFields, false);
+    TypeId const outer = in2.forwardComposite(TypeKind::Struct, "Outer", 9);
+    std::array<TypeId, 2> const outerFields{inner, inner};   // the SAME type twice
+    in2.completeComposite(outer, outerFields, false);
+    HirBuilder b2{"toy"};
+    HirNodeId const body2 = b2.makeBlock(std::vector<HirNodeId>{});
+    std::array<TypeId, 1> const params2{in2.pointer(outer)};
+    TypeId const sig2 = in2.fnSig(params2, in2.primitive(TypeKind::Void), CallConv::CcSysV);
+    HirNodeId const fn2   = b2.makeFunction(sig2, 1, {}, body2);
+    Hir hir2 = std::move(b2).finish(b2.makeModule(std::vector<HirNodeId>{fn2}));
+    HirTextContext ctx2; ctx2.interner = &in2; ctx2.symbolNames = &names;
+    DiagnosticReporter r2;
+    std::string const text2 = emitHir(hir2, ctx2, r2);
+    EXPECT_FALSE(r2.hasErrors())
+        << "a sibling repeat is sharing, not a cycle — it must spell twice\n" << text2;
+    EXPECT_EQ(text2.find('?'), std::string::npos) << text2;
 }

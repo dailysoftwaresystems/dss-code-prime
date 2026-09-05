@@ -1,0 +1,34 @@
+{
+  "$comment": "P53 (D-CSUBSET-ABSTRACT-ARRAY-TYPE-NAME, ISO C 6.7.7): a direct-abstract-declarator may BE a bare `[ ... ]` suffix, so `char[4]` / `int[2][3]` / `long[2]` are type-names wherever a type-name is admitted. ✔MEASURED at P53's base, EVERY position below was a parse error (`P_NoAlternativeMatched ... got 'char'` then `P_UnexpectedToken: expected 'ParenClose' -- got ']'`); ✔MEASURED 2026-09-02 with each reference invoked SEPARATELY, gcc 13.3.0 `-std=c2x`, clang 18.1.3 `-std=c23` and MSVC 19.51 `/std:clatest` accept every construct and the gcc/clang images exit 42. ★ EVERY TYPE-NAME POSITION IS EXERCISED IN ONE PROGRAM -- sizeof, _Alignof, _Alignas, a cast, a compound literal, __builtin_types_compatible_p, _Generic -- because they all route through the single `castTypeRef` shape and a pin that reached only `sizeof` would read as a complete fix. ⚠ THE ELEMENT-COUNT IDIOM IS THE CONTROL AND IT IS THE REASON THE ARRAY BASE WAS EXCLUDED IN 2026-06 (c26): `sizeof(b)/sizeof(b[0])` must stay the VALUE reading, and `(b[0])` must stay an index expression rather than committing as a type-name `b[0]`. That premise was retired by c55 (D-CSUBSET-CALL-IN-PAREN-CAST-AMBIGUITY), which made `typeNameCommitApproved_`'s rule 1 discriminate on the BASE leftmost LEAF rather than the leaf COUNT, so an identifier-based abstract tail now falls through to the binder-sketch lookup (a known VALUE rolls back) and the follower-operator test -- exactly the two-part sequence that row's own closing work prescribed. A KEYWORD base (`char[4]`) never reaches the ambiguity at all: rule 1 commits on the leftmost leaf. ⓘ It also unlocks the strictly-ISO compile-time assertion `sizeof(char[(e) ? 1 : -1])`, which a shipped config had to work around by hanging its guard array off a struct member. RED-ON-DISABLE (REMOVE direction), ✔EXERCISED P53: remove `arrayDeclSuffix` from `abstractDirectDeclarator`'s base alt in `src/dss-config/sources/c.lang.json` and this example FAILS IN BOTH RUNNERS while `sizeof_value_array_dim` and `abstract_fnptr_cast` stay green -- the control that says the mutant is targeted rather than a blanket parse break.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

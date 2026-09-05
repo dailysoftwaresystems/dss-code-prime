@@ -4064,8 +4064,23 @@ encode(AssembledModule const&    module,
             std::uint32_t const nameOff = strtab.add(symName);
             std::uint32_t const idx =
                 static_cast<std::uint32_t>(symtab.size() / 24);
-            appendSym(nameOff, makeStInfo(STB_GLOBAL, STT_NOTYPE), 0,
-                      SHN_UNDEF, 0, 0);
+            // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the import's
+            // REFERENCE binding, through the SAME `stbForBinding` that maps a
+            // DEFINED symbol's binding a few loops up — ELF spells a weak
+            // reference and a weak definition in the one `st_info` field, so
+            // there is nothing extra to encode and no second mapping to keep in
+            // step. `externBinding` returns Global for every import that is not
+            // annotated and for the `sym_<id>` fallback, so this line is
+            // byte-identical to the STB_GLOBAL it replaces on every module that
+            // carries no weak import.
+            // ✔MEASURED: gcc 13.3.0 and clang 18.1.3 both emit `NOTYPE WEAK
+            // DEFAULT UND ea` here for `extern int ea __attribute__((weak));`,
+            // and both LINK and RUN a program that tests it for null with no
+            // definition present (exit 42, the null branch).
+            appendSym(nameOff,
+                      makeStInfo(stbForBinding(objNames.externBinding(rel.target)),
+                                 STT_NOTYPE),
+                      0, SHN_UNDEF, 0, 0);
             symIdxBySymbol.emplace(rel.target, idx);
         };
         for (auto const& fn : module.functions)

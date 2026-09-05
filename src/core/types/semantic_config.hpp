@@ -447,6 +447,75 @@ struct DSS_EXPORT LinkageSpecifierEffect {
     // co-present static's binding/staticStorage (the noreturn
     // linkage-clobber lesson: each axis folds independently).
     bool                            threadStorage = false;
+    // D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS (P53): the NON-DEFINING
+    // axis — the 5th ORTHOGONAL one. A specifier carrying it declares that the
+    // declaration it appears on ANNOUNCES a name whose storage/body lives
+    // elsewhere (C `extern`), exactly what the per-ROW `nonDefiningDeclaration`
+    // flag says for a declaration form that owns the keyword as its rule HEAD.
+    //
+    // ★★ WHY THE FACT MOVED FROM THE ROW TO THE SPECIFIER, AND WHY THAT IS THE
+    // WHOLE FIX. While `extern` was a rule head, "which rule matched" and "was
+    // `extern` written" were the same question, so a per-row boolean answered
+    // both. C 6.7.1 makes the declaration specifiers an UNORDERED SET, so a
+    // grammar that gives one specifier its own top-level rule can never admit
+    // `inline extern` — two declaration branches on one lead token cannot both
+    // survive (✔MEASURED, P53 lane `ex`). Merging the two rules is what makes
+    // the set unordered, and it costs exactly this: the non-defining fact has to
+    // be read from the SPECIFIER that states it rather than from the rule's
+    // identity. A row keeps its own `nonDefiningDeclaration` (the block-scope
+    // `externDecl` still uses it); the two are OR-ed, never exclusive.
+    //
+    // Consumed by the semantic Pass-1 specifier scan (→
+    // `SymbolRecord.isExternDeclaration`, the tentative-definition suppression
+    // and the block-scope re-home guard) and by CST→HIR, which routes the
+    // declaration to the extern/import lowering on THIS fact rather than on the
+    // rule name. OR-only across a prefix, like the two storage axes.
+    bool                            nonDefining = false;
+    // ★★ C 6.7.1p2 AS CONFIG, NOT AS ENGINE `if`s
+    // (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS, P53). The name of a
+    // MUTUAL-EXCLUSION group this specifier belongs to: at most ONE DISTINCT
+    // member of a group may appear in one declaration's specifier prefix. C's
+    // storage-class specifiers (`static`, `extern`, `constexpr`) share one
+    // group; the standard's own exception — "except that `_Thread_local` may
+    // appear with `static` or `extern`" — is stated by `_Thread_local` simply
+    // NOT declaring the group, so the exception lives in the vocabulary
+    // document beside the entry it is about rather than as an engine carve-out.
+    //
+    // ★ DISTINCT members, not repeats, and that is MEASURED rather than chosen:
+    // gcc and MSVC reject `static static int g;` but clang 18.1.3 ACCEPTS it
+    // (✔MEASURED 2026-09-02, all three probed separately), so under
+    // `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` a repeated specifier must keep
+    // compiling. `extern static` / `static extern` / `extern constexpr` /
+    // `constexpr extern` are refused by all three and must stay refused.
+    //
+    // Empty ⇒ this specifier excludes nothing (every entry before P53).
+    // Agnostic: the group's NAME is the language's own word and is rendered
+    // verbatim in the diagnostic; the engine compares strings it was handed.
+    std::string                     exclusiveGroup;
+    // ★★ THE GROUP'S NAMED EXCEPTIONS — C 6.7.1's own "except that …" clause,
+    // which is NOT one exception but a LIST of pairs, and a flat group cannot
+    // express it. C23 6.7.1p3 (N3096): `thread_local` may appear with `static`
+    // or `extern`, AND `constexpr` may appear with `auto`, `register` or
+    // `static`. So `static constexpr` is LEGAL while `extern constexpr` is a
+    // constraint violation — ✔MEASURED, and gcc 13.3.0 is the only reference
+    // that can answer it: it compiles `static constexpr int K = 4;` at rc 0 and
+    // refuses `extern constexpr int K = 4;` with "'constexpr' used with
+    // 'extern'". clang 18.1.3 and MSVC 19.51.36252 do not implement C23
+    // `constexpr` at all ("unknown type name 'constexpr'" / C2054), so they
+    // abstain on this pair rather than voting against it.
+    //
+    // ⚠ THE FIRST CUT OF THIS TABLE HAD NO SUCH FIELD AND IT REFUSED A SHIPPED
+    // EXAMPLE: `examples/c/constexpr_array_dim` writes `static constexpr double
+    // PI2 = 3.5 * 2;`. A group alone is the RIGHT shape for "at most one" and
+    // the WRONG shape for "except with"; both halves of the standard's sentence
+    // have to be sayable, or the config states a rule the language does not
+    // have.
+    //
+    // Read SYMMETRICALLY: the pair is compatible if EITHER entry names the
+    // other, so one statement is enough — though the shipped config declares
+    // both directions, because a half-declared pair reads as an accident.
+    // Empty ⇒ this specifier is compatible with no other member of its group.
+    std::vector<std::string>        compatibleWith;
 };
 
 // FC4 c1 (M5): a config-driven fail-loud gate on a declaration form. When the
@@ -492,6 +561,118 @@ struct DSS_EXPORT GatedMarker {
 // (for param-type harvesting); absent ⇒ fn suffixes always build zero-param
 // signatures. Every other role is required — the loader rejects a partial
 // block (a missing role would silently truncate the walk mid-declarator).
+
+// ★★★ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+// WHAT AN ATTRIBUTE RUN'S ATTRIBUTES APPERTAIN TO. One axis, declared ONCE per
+// run rule, read by EVERY consumer — the HIR linkage fold, the standard-
+// attribute (FC17) fold, and the noreturn folds.
+//
+// It exists because ONE key used to answer for all of these at once and each
+// consumer read it at whichever grain it happened to want, which put DSS ABOVE
+// the union on one construct and BELOW it on two others AT THE SAME TIME:
+//   • `void f(void) [[deprecated]];` was applied to the ENTITY — ✔MEASURED,
+//     gcc 13.3.0 ACCEPTS-and-IGNORES (`'deprecated' attribute ignored`), clang
+//     18.1.3 REFUSES (rc=1, `cannot be applied to types`), MSVC 19.51
+//     `/std:clatest` ACCEPTS-and-IGNORES (`C4649 attributes are ignored in
+//     this context`). NOT ONE reference confers it.
+//   • `struct S { int p, q __attribute__((deprecated)); };` conferred on
+//     NEITHER member — ✔MEASURED, gcc and clang both confer on `q` alone.
+//   • the same slot dropped a trailing `noreturn` entirely, the half
+//     [[D-CSUBSET-TRAILING-NORETURN-NOT-HONORED]] left conservative on purpose.
+//
+// ★★ THE FOURTH VALUE IS NOT A HEDGE — IT IS A MEASURED, UNANIMOUS RULE, AND
+// LEAVING IT OUT WOULD TRADE ONE DEFECT FOR ANOTHER. ✔MEASURED 2026-09-03,
+// four attributes (`deprecated`, `nodiscard`, `maybe_unused`, `noreturn`) x two
+// declarator shapes x three references: a C23 attribute-specifier-sequence
+// written after a declarator appertains to the ENTITY when that declarator is a
+// bare identifier and to the TYPE when it derives an array or function type.
+// gcc, clang AND MSVC agree, and the answer is a property of the SHAPE, not of
+// the attribute:
+//     int  x        [[deprecated]];   gcc warns at the use, clang warns at the
+//                                     use, MSVC C4996 at the use  ⇒ ENTITY
+//     int  arr[3]   [[deprecated]];   gcc `attribute ignored`, clang rc=1,
+//                                     MSVC C4649                  ⇒ TYPE
+//     void f(void)  [[deprecated]];   same three                  ⇒ TYPE
+// C23 6.7.6p1 vs 6.7.6.2p1/6.7.6.3p1 is why. A rule-name-only granularity
+// would have had to pick ONE of those for `stdAttr`, and either pick is a
+// defect: `type` drops a fact all three references confer, `declarator`
+// invents one none of them do.
+//
+// ⚠ THE GNU SPELLING HAS NO SUCH SPLIT — ✔MEASURED, `__attribute__((...))`
+// after an identifier, an array declarator, a function declarator and a
+// function-POINTER declarator all confer on the ENTITY in gcc and clang alike
+// (MSVC implements no `__attribute__` in any position — C2061 at /std:c11,
+// /std:c17 AND /std:clatest — so it abstains, and an abstention is not a
+// refusal). So the shape axis is a property of the C23 SPELLING, which is
+// exactly why the value is per-RULE and not language-wide.
+enum class AttrAppertainment : std::uint8_t {
+    // Every declarator of the declaration. ✔MEASURED: `void
+    // __attribute__((__noreturn__)) a(int), b(int);` silences a caller of
+    // BOTH in gcc and clang.
+    Declaration,
+    // The ONE declarator the run follows — for a DECLARATION-level slot
+    // written after the declarator list, that is the LAST declarator.
+    // ✔MEASURED: `void a(int) __attribute__((__noreturn__)), b(int);` silences
+    // a caller of `a` and still warns at a caller of `b`, in both references.
+    Declarator,
+    // The type the specifiers and this declarator determine. Confers NO
+    // entity-level fact — the run is still READ (an unknown name is still
+    // reported), it simply has nothing to attach a fact to.
+    Type,
+    // `Declarator` when the declarator this run follows derives no array or
+    // function type, `Type` when it does — the C23 rule above, stated
+    // generally so no language name appears in the engine.
+    DeclaratorUnlessTypeDerived,
+};
+
+// The CLOSED spelling vocabulary for the axis. There is no default row and no
+// sentinel: `fromName` returning nullopt is what makes an unknown or omitted
+// `appertainsTo` a LOUD load failure rather than a silently-chosen grain. Row 0
+// also fixes `name()`'s fall-back, and `declaration` is the widest reading — so
+// even a hypothetical fall-back over-applies visibly rather than dropping in
+// silence.
+inline constexpr EnumNameTable<AttrAppertainment, 4> kAttrAppertainmentTable{{{
+    { AttrAppertainment::Declaration,                 "declaration"                 },
+    { AttrAppertainment::Declarator,                  "declarator"                  },
+    { AttrAppertainment::Type,                        "type"                        },
+    { AttrAppertainment::DeclaratorUnlessTypeDerived, "declaratorUnlessTypeDerived" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kAttrAppertainmentTable);
+
+[[nodiscard]] constexpr std::string_view
+attrAppertainmentName(AttrAppertainment a) noexcept {
+    return kAttrAppertainmentTable.name(a);
+}
+[[nodiscard]] constexpr std::optional<AttrAppertainment>
+attrAppertainmentFromName(std::string_view s) noexcept {
+    return kAttrAppertainmentTable.fromName(s);
+}
+
+// One attribute-run rule and the grain its attributes appertain to. The NAME is
+// carried beside the resolved id because every diagnostic about this vocabulary
+// must quote the spelling the config author wrote.
+struct DSS_EXPORT AttrRunRule {
+    RuleId           rule{};
+    std::string      name;
+    AttrAppertainment appertainsTo = AttrAppertainment::Declaration;
+};
+
+// The grain a run RESOLVES to once the declarator it follows is known.
+// `declaratorIsTypeDerived` answers "does that declarator derive an array or
+// function type?" — `declaratorDerivesType` in `declarator_walk.hpp` is the ONE
+// implementation, so no consumer re-derives it.
+//
+// ⓘ A `Declaration`-grain run reaching here is passed through unchanged: it has
+// no declarator to be relative to, and callers that fold it per-declarator do
+// so deliberately (the declaration-level facts are COPIED into each declarator).
+[[nodiscard]] constexpr AttrAppertainment
+resolveAppertainment(AttrAppertainment declared,
+                     bool declaratorIsTypeDerived) noexcept {
+    if (declared != AttrAppertainment::DeclaratorUnlessTypeDerived) return declared;
+    return declaratorIsTypeDerived ? AttrAppertainment::Type
+                                   : AttrAppertainment::Declarator;
+}
+
 struct DSS_EXPORT DeclaratorConfig {
     RuleId        declaratorRule{};
     RuleId        pointerLayerRule{};
@@ -550,8 +731,31 @@ struct DSS_EXPORT DeclaratorConfig {
     // the initializer value (S_TypeMismatch). EMPTY ⇒ the language declares no
     // after-declarator attribute suffix (toy/tsql, and c before this) —
     // the scans behave exactly as before.
-    std::vector<RuleId>      afterDeclaratorAttrRules;
-    std::vector<std::string> afterDeclaratorAttrRuleNames;
+    //
+    // ★★★ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+    // EACH ENTRY NOW CARRIES THE GRAIN ITS ATTRIBUTES APPERTAIN TO — see
+    // `AttrAppertainment` above for the three-reference matrix that fixes each
+    // value. For c that is `attrSpec` ⇒ `declarator` (the GNU spelling confers
+    // on the entity in every declarator shape) and `stdAttr` ⇒
+    // `declaratorUnlessTypeDerived` (the C23 spelling confers on the entity
+    // after a bare identifier and on the TYPE after an array or function
+    // declarator — gcc, clang and MSVC unanimous).
+    //
+    // ★★ IT REPLACES A SEPARATE `afterDeclaratorEntityAttrRules` SUBSET KEY
+    // (P56 lane `nr`, hours earlier), AND THE REPLACEMENT IS A CORRECTION, NOT
+    // A RESHUFFLE. A subset key can only express a BOOLEAN — entity or not —
+    // and the measured axis has three answers, one of which depends on the
+    // declarator. Under the subset key `stdAttr` had to be either in (which
+    // invents `void f(void) [[deprecated]]`) or out (which drops `int x
+    // [[deprecated]]`, a fact ALL THREE references confer). It also required a
+    // loader cross-check that the subset was really a subset; a grain written
+    // ON the entry cannot disagree with its own list.
+    //
+    // ★ THE LIST IS STILL READ GRAIN-BLIND BY ONE CONSUMER, DELIBERATELY: the
+    // init-detection skip (`isDeclaratorDecorationRule`) must skip EVERY run
+    // whatever it appertains to, because "is this child the initializer?" is a
+    // parse-shape question, not a granularity one.
+    std::vector<AttrRunRule> afterDeclaratorAttrRules;
     // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): the OPTIONAL struct/union
     // member-declarator roles — the member-list analogue of
     // `initDeclaratorRule`/`listRule`. `memberDeclaratorRule` is the per-slot
@@ -851,8 +1055,31 @@ struct DSS_EXPORT DeclarationRule {
     // that has a silent one is the fail-loud principle applied to config SHAPE,
     // not just to config VALUES. Secondary benefit: names survive a grammar edit
     // that inserts a child, where every positional index would silently shift.
-    std::vector<RuleId>        declarationAttrSlotRules;
-    std::vector<std::string>   declarationAttrSlotRuleNames;  // source spellings, for diagnostics
+    //
+    // ★★★ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY)
+    // — EVERY ENTRY NOW CARRIES ITS `appertainsTo` GRAIN, AND THAT IS WHAT THE
+    // KEY WAS MISSING. A declaration can put attribute slots on BOTH sides of
+    // its declarator list, and the two sides mean different things: c's
+    // `declAttrRun` sits before the list (declaration-level, reaches every
+    // declarator) while `structMemberAttrList`, `paramTrailingAttrRun` and the
+    // trailing typedef run sit after it (the LAST declarator only). One key
+    // could not say which, so the noreturn fold had to infer it POSITIONALLY —
+    // walk the children and stop at the first declarator-bearing one — and the
+    // FC17 fold and the linkage fold did not infer it at all.
+    //
+    // ⚠ A POSITIONAL INFERENCE IS NOT A CHEAPER SPELLING OF THIS KEY, IT IS A
+    // DIFFERENT AND WEAKER CLAIM: it reads where a slot SITS in one grammar,
+    // not what its attributes MEAN. It answers nothing for a language whose
+    // trailing run is written before its declarators, and it is invisible to
+    // any consumer that does not re-implement the walk — which is exactly how
+    // two of the three consumers here came to disagree with the third.
+    //
+    // ⓘ ONE RULE NAME, ONE GRAIN. c's typedef row used to name a single
+    // `typedefAttrRun` occupying BOTH positions in one shape, which no per-rule
+    // grain can describe; the grammar now spells the trailing one
+    // `typedefTrailingAttrRun`. That is the `asmLabelRule` discipline (two
+    // roles, two keys) applied to two positions of one run.
+    std::vector<AttrRunRule>   declarationAttrSlotRules;
     // TF-C73 (D-CSUBSET-GNU-ATTRIBUTE): when true, an attribute in a STRICT
     // (GNU `__attribute__((...))`) specifier on THIS declaration form whose name
     // matches no `attributeSemantics.effects` row is an ERROR rather than the
@@ -2110,6 +2337,45 @@ enum class AttributeEffect : std::uint8_t {
     // entry true.
     RunBeforeEntry,
     RunAfterEntry,
+    // D-CSUBSET-PER-MEMBER-PACKED: the declared entity's BASELINE ALIGNMENT IS 1 —
+    // GNU `packed` written on ONE member-declarator of a struct/union
+    // (`struct S { char a; int z __attribute__((packed)); double d; };`), which packs
+    // `z` and nothing else. The fact folds onto the member's `SymbolRecord`, the
+    // composite's Pass-1 completion gathers one flag per field into the interner's
+    // `fieldPacked` channel, and `computeLayout` feeds it to the ONE shared
+    // `clampedBaselineAlign` the whole-composite `packed` and `#pragma pack(N)`
+    // already meet at.
+    //
+    // ★★ WHY IT IS THE EXACT INVERSE OF `Align`, AND WHY THAT MATTERS MORE HERE.
+    // `Align` RAISES an entity's alignment and folds with MAX; this LOWERS a
+    // member's baseline to 1 and is then subject to that same MAX-fold, which is
+    // what makes `__attribute__((packed, aligned(2)))` come out at 2 rather than at
+    // the type's natural 4 (✔MEASURED, gcc 13.3.0 and clang 18.1.3, x86_64 and
+    // aarch64). One channel, read in both directions — not two competing ones.
+    //
+    // ★★★ NOT `None`, AND THIS ROW IS THE COUNTEREXAMPLE TO THE ARGUMENT THAT PUT
+    // `packed` THERE. `None` asserts "KNOWN vocabulary, consumed elsewhere or
+    // deliberately inert", and for `packed` the "elsewhere" is the dedicated
+    // whole-composite scan. TF-C73 opened the MEMBER attribute position on the
+    // reasoning that "one attribute does not mean two things depending on which side
+    // of the declarator it is written" — `packed` is precisely that attribute, and
+    // for every cycle since, the member spelling has parsed and been DROPPED IN
+    // SILENCE. ✔MEASURED at base `01642ee3` through the shipped CLI:
+    // `struct { char a; int z __attribute__((packed)); double d; }` compiled rc 0
+    // with zero diagnostics and `z` at offset 4, where gcc and clang both put it at
+    // 1 — same sizeof, no warning, wrong bytes. A verb with a real sink is what
+    // makes the vocabulary entry true.
+    //
+    // ⚠ THE FACT IS INERT WHEREVER NO COMPOSITE GATHERS IT. `packed` on a file- or
+    // block-scope object, a function, or a typedef reaches this verb too; gcc warns
+    // `'packed' attribute ignored [-Wattributes]` there and clang is silent, and
+    // BOTH produce identical bytes (✔MEASURED, incl. `_Alignof` of a packed
+    // typedef's type = 4, unchanged). The four-kind `appliesTo` vocabulary cannot
+    // separate a struct MEMBER from an object — both are `variable` — so this row
+    // stays un-kinded and the member-only-ness lives in the SINK, which is the only
+    // place that can express it. That is the same posture the config's un-kinded
+    // `none` names already take, held for a measured reason rather than a shrug.
+    PackField,
     None,
 };
 struct DSS_EXPORT AttributeSemanticsRow {
@@ -2850,14 +3116,20 @@ struct DSS_EXPORT SemanticConfig {
     // C11/C23 6.7.10 (D-CSUBSET-STATIC-ASSERT): the `_Static_assert`/`static_assert`
     // static-assertion DECLARATION rule. When Pass 2 visits a node of this rule it
     // const-evaluates the FIRST meaningful child (the condition — the `assignmentExpr`
-    // after the keyword + `(`) via the SAME `constIntExpr` evaluator that folds
-    // sizeof(T)/enum/arithmetic in an array dimension: a fold to ZERO emits
+    // after the keyword + `(`) through the SAME shared evaluator that folds
+    // sizeof(T)/enum/arithmetic in an array dimension: a fold to a FALSE value emits
     // S_StaticAssertFailed (message = the OPTIONAL trailing string-literal child); a
-    // condition that does not fold to an integer constant expression (non-const /
-    // float / unresolved) ALSO emits S_StaticAssertFailed (C requires an ICE); a
-    // NONZERO fold produces nothing. The construct itself lowers to nothing (its
-    // hirLowering row maps to Skip). Invalid ⇒ the language has no static-assertion
-    // surface (toy/tsql — the check never runs).
+    // condition that does not fold to a compile-time constant at all (non-const /
+    // unresolved) ALSO emits S_StaticAssertFailed, with wording that distinguishes
+    // the two on the one code; a TRUE fold produces nothing. The construct itself
+    // lowers to nothing (its hirLowering row maps to Skip). Invalid ⇒ the language
+    // has no static-assertion surface (toy/tsql — the check never runs).
+    // ⚠ [[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]]: this used to say the
+    // condition goes through `constIntExpr` and that a FLOAT condition is refused
+    // "because C requires an ICE". Both halves were wrong in practice — the door
+    // takes the full-value `constExprValue` and asks a TRUTHINESS question, and
+    // ✔MEASURED all four reference toolchains fold a floating comparison here and
+    // treat a bare float condition by its truth value.
     RuleId        staticAssertRule{}; std::string staticAssertRuleName;
     // FC17.9(i) + inline-asm P1 (D-CSUBSET-INLINE-ASM /
     // D-LANG-GNU-EXTENDED-INLINE-ASM-UNSUPPORTED, C23 6.8 / GNU 6.47): the whole

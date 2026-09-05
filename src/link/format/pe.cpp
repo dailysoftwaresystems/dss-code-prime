@@ -97,6 +97,12 @@ constexpr std::uint8_t IMAGE_SYM_CLASS_STATIC = 3;
 constexpr std::uint8_t IMAGE_SYM_CLASS_WEAK_EXTERNAL = 105;
 // IMAGE_SECTION_NUMBER specials
 constexpr std::int16_t IMAGE_SYM_UNDEFINED = 0;
+// IMAGE_SYM_ABSOLUTE(-1): "The symbol has an absolute (non-relocatable) value
+// and is not an address." PE/COFF 5.4.2. It is the section number the weak
+// external's FALLBACK symbol carries, and with Value 0 that fallback IS the
+// null address a weak reference resolves to when nothing defines the name.
+// D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE.
+constexpr std::int16_t IMAGE_SYM_ABSOLUTE  = -1;
 // IMAGE_SYM_TYPE_*
 constexpr std::uint16_t IMAGE_SYM_DTYPE_FUNCTION = 0x20;
 
@@ -2062,14 +2068,51 @@ encode(AssembledModule const&    module,
     // type=0; cl.exe / link.exe treat a type-0 undefined symbol as either.
     std::vector<SymbolId> externSyms;
     std::unordered_set<SymbolId> externSeen;
-    auto noteExternTarget = [&](SymbolId target) {
+    // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the name of the FIRST
+    // defined symbol whose relocation named each extern. A weak import's
+    // synthesized fallback is named after it — clang's scheme
+    // (`.weak.<import>.default.<referencing function>`). Empty for an extern
+    // reached only from an unwind record, which is the personality handler and
+    // is never weak.
+    //
+    // ⚠ THE ORIGINAL SENTENCE HERE ENDED "…so two objects that weak-import ONE
+    // name do not both publish a fallback under the same symbol", and that
+    // consequence NO LONGER FOLLOWS on a format carrying import slots
+    // (D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET for DATA,
+    // and since P54 D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET
+    // for FUNCTION imports as well, under an `indirect-slot` dispatch —
+    // ✔MEASURED, the weak function fixture publishes
+    // `.weak.maybe.default..refptr.maybe` by the identical route). The
+    // premise moved out from under it: with a slot in place NO function
+    // references the import any more — the SLOT does — so the first referrer is
+    // `.refptr.<import>`, which is derived from the import's own name and is
+    // therefore the SAME in every object that imports it. The scheme is
+    // unchanged and still clang's; what changed is who the referrer is.
+    // ✔MEASURED 2026-09-02 rather than reasoned about, because the shared name
+    // is exactly the shape that would break at a linker: TWO DSS objects both
+    // weak-importing `ea`, each publishing `.weak.ea.default..refptr.ea` as an
+    // ABSOLUTE value-0 EXTERNAL, link and RUN under link.exe 14.51, mingw ld
+    // 13.2.0 AND lld-link — all three, no duplicate-symbol diagnostic, both
+    // null branches taken (rc 52). Identical absolute definitions of one name
+    // are folded, the way the `/ALTERNATENAME` shape this record belongs to
+    // always has been. The uniqueness is therefore not load-bearing here, and
+    // inventing entropy to restore a property nothing checks would trade a
+    // measured fact for an arbitrary name.
+    std::unordered_map<SymbolId, std::string> externFirstReferrer;
+    auto noteExternTarget = [&](SymbolId target, std::string_view referrer = {}) {
         if (symIdxBySymbol.contains(target)) return;   // defined
-        if (externSeen.insert(target).second) externSyms.push_back(target);
+        if (externSeen.insert(target).second) {
+            externSyms.push_back(target);
+            if (!referrer.empty())
+                externFirstReferrer.emplace(target, std::string{referrer});
+        }
     };
     for (auto const& fn : module.functions)
-        for (auto const& rel : fn.relocations) noteExternTarget(rel.target);
+        for (auto const& rel : fn.relocations)
+            noteExternTarget(rel.target, objNames.definedName(fn.symbol, "sym_"));
     for (auto const& di : module.dataItems)
-        for (auto const& rel : di.relocations) noteExternTarget(rel.target);
+        for (auto const& rel : di.relocations)
+            noteExternTarget(rel.target, objNames.definedName(di.symbol, "sym_"));
     // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO: an unwind table names symbols
     // too, and one of them is normally an EXTERN. A `__try`'s UNWIND_INFO
     // carries the personality handler's RVA (`__C_specific_handler`, which no
@@ -2084,16 +2127,106 @@ encode(AssembledModule const&    module,
     std::unordered_map<SymbolId, bool> externIsData;
     for (auto const& imp : module.externImports)
         externIsData.emplace(imp.symbol, imp.isData);
+    // ── D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE (the PE arm) ─────
+    //
+    // A WEAK reference — `extern int ea __attribute__((weak));` — is a name that
+    // MAY legally resolve to nothing, in which case its address is 0. COFF
+    // spells it as IMAGE_SYM_CLASS_WEAK_EXTERNAL + Auxiliary Format 3 whose
+    // TagIndex names a FALLBACK symbol, and making that fallback an ABSOLUTE
+    // symbol of value 0 is what turns "not found" into "address 0" rather than
+    // into a link error. It is the SAME mechanism `appendAliasEntries` uses for
+    // a weak ALIAS one loop up, pointed at a different kind of default: an alias
+    // defers to a body in this object, a weak import defers to nothing at all.
+    //
+    // ⚠⚠ THE ROW THIS CLOSES INHERITED A CLAIM THAT PE "HAS NO DIRECT
+    // EQUIVALENT" AND MUST THEREFORE FAIL LOUD. That was its author's INFERENCE
+    // and it is REFUTED. ✔MEASURED 2026-09-02, the property named before the
+    // result was read (an object whose symbol is weak AND a program that LINKS
+    // with no definition and RUNS taking the null branch):
+    //   * clang 18.1.3 `--target=x86_64-w64-windows-gnu` AND
+    //     `--target=x86_64-pc-windows-msvc` both emit `ea` as
+    //     `StorageClass: WeakExternal (0x69)`, `Section: IMAGE_SYM_UNDEFINED`,
+    //     aux `Search: Alias (0x3)` naming an ABSOLUTE value-0 default;
+    //     mingw ld links that object with NO definition (rc 0) and the PE
+    //     executable RUNS to exit 42 — the null branch — while the same object
+    //     linked WITH a definition returns 7.
+    //   * mingw-w64 gcc 13.2.0 ACCEPTS the attribute and then emits a PLAIN
+    //     `scl 2` UNDEF, and its link FAILS ("undefined reference to `ea'"). It
+    //     is therefore NOT a working reference for this construct and casts no
+    //     vote for its own output — "it compiled" is not "the weak import
+    //     works". MSVC has no source spelling for a weak import and abstains.
+    //   ⇒ one working reference makes the behaviour REQUIRED (bar §A.3b), so PE
+    //     takes the same route as ELF and Mach-O and there is no asymmetry left
+    //     to declare.
+    //
+    // ★★ THE FALLBACK IS EXTERNAL AND IS NAMED AFTER THE FIRST SYMBOL THAT
+    // REFERENCES THE IMPORT — clang's scheme, followed exactly, AFTER A CHEAPER
+    // DEVIATION WAS TRIED AND MEASURED WRONG.
+    //
+    // The deviation was IMAGE_SYM_CLASS_STATIC with a name derived from the
+    // import alone (`.weak.ea.default`). The reasoning was sound on its face: a
+    // MODULE-PRIVATE fallback cannot collide when two objects weak-import one
+    // name, whereas an EXTERNAL one named for the symbol alone could — and this
+    // writer mints one record per imported SYMBOL, not per referencing function
+    // as clang does. It even survived two checks: mingw ld links it and the
+    // binary RUNS to the null branch, and clang's own object with its fallback's
+    // storage class patched 2→3 does too.
+    // ⚠⚠ ✔MEASURED AGAINST THE THIRD LINKER, WHICH IS THE ONE THAT SAW IT:
+    // `link.exe` 14.51 refuses such an object outright — `LNK1235: corrupt or
+    // invalid COFF symbol table` — while the SAME DSS object with only the
+    // fallback's class flipped back to EXTERNAL gets past it. A DSS pe object
+    // with NO weak import links and runs under link.exe (rc 42), so the refusal
+    // is attributable to this record and to nothing else. PE/COFF 5.5.3 does not
+    // spell the requirement out, and two working linkers said nothing; the third
+    // is what made "a defensible choice" into a measured one.
+    // ⇒ EXTERNAL, and uniqueness comes from the referrer's name exactly as it
+    // does for clang. The `.`-led prefix cannot collide with a source symbol —
+    // no C identifier begins with `.`, and the same convention already carries
+    // every section symbol in this table.
     for (auto const& e : externSyms) {
         auto const it = externIsData.find(e);
         bool const isFunction = (it != externIsData.end()) && !it->second;
-        CoffSymEntry ent;
-        ent.name          = objNames.externName(e, "sym_");
-        ent.sectionNumber = IMAGE_SYM_UNDEFINED;
-        ent.type          = isFunction
+        std::string       name    = objNames.externName(e, "sym_");
+        SymbolBinding const binding = objNames.externBinding(e);
+        std::uint16_t const dtype = isFunction
                                 ? static_cast<std::uint16_t>(
                                       IMAGE_SYM_DTYPE_FUNCTION)
                                 : std::uint16_t{0};
+        if (binding == SymbolBinding::Weak) {
+            // The fallback first, so its index is known when the weak external
+            // that names it is built — no back-patching, and no window in which
+            // a TagIndex points at a record that does not exist yet.
+            CoffSymEntry def;
+            def.name          = ".weak." + name + ".default";
+            if (auto const rit = externFirstReferrer.find(e);
+                rit != externFirstReferrer.end()) {
+                def.name += "." + rit->second;
+            }
+            def.value         = 0;
+            def.sectionNumber = IMAGE_SYM_ABSOLUTE;
+            def.type          = 0;
+            def.storageClass  = IMAGE_SYM_CLASS_EXTERNAL;
+            std::uint32_t const defIdx = appendEntry(std::move(def));
+
+            CoffSymEntry ent;
+            ent.name                   = std::move(name);
+            ent.value                  = 0;
+            ent.sectionNumber          = IMAGE_SYM_UNDEFINED;
+            ent.type                   = dtype;
+            ent.storageClass           = IMAGE_SYM_CLASS_WEAK_EXTERNAL;
+            ent.hasWeakExternAux       = true;
+            ent.auxWeakTagIndex        = defIdx;
+            // The same Characteristics the alias arm uses, and for the same
+            // MEASURED reason recorded at the constant: 3 is the only value
+            // under which link.exe resolves a weak external at all.
+            ent.auxWeakCharacteristics = IMAGE_WEAK_EXTERN_SEARCH_ALIAS;
+            symIdxBySymbol.emplace(e, appendEntry(std::move(ent)));
+            continue;
+        }
+        CoffSymEntry ent;
+        ent.name          = std::move(name);
+        ent.sectionNumber = IMAGE_SYM_UNDEFINED;
+        ent.type          = dtype;
         ent.storageClass  = IMAGE_SYM_CLASS_EXTERNAL;
         symIdxBySymbol.emplace(e, appendEntry(std::move(ent)));
     }

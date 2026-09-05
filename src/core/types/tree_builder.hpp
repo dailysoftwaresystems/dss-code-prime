@@ -33,6 +33,19 @@ struct DSS_EXPORT BuilderConfig {
     // Exceeded → `P_MaxSpeculationDepth` (one-shot per build) and the
     // returned Checkpoint is a no-op guard (commit + rollback are no-ops
     // and no state was captured).
+    //
+    // ★ FOR A PARSE THIS IS DERIVED, NOT AUTHORED. `Parser::parse` sets it
+    // from `ParserConfig::maxSpeculationDepth`, which the CU build takes from
+    // the language's `parser.maxSpeculationDepth`. The parser's speculation
+    // probe is the ONLY checkpoint construction site in the engine — one probe
+    // opens exactly one checkpoint — so parser probe depth and builder
+    // checkpoint depth are the same number, and one config key drives both.
+    // This value standing on its own is what made the pair a TRAP: it sat
+    // silently behind the parser's much smaller cap and became the next
+    // binding ceiling the moment that one was lifted
+    // (D-PARSE-NINE-NESTED-CASTS-ARE-REFUSED-BY-THE-SPECULATION-CAP-WITH-A-FABRICATED-SYNTAX-ERROR).
+    // The default below is therefore the fallback for a NON-parser TreeBuilder
+    // client only; never tune it expecting a parse to feel it.
     std::size_t maxSpeculationDepth = 64;
 };
 

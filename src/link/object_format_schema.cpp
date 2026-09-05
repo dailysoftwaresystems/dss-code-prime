@@ -9,13 +9,19 @@
 #include "core/types/config_path_walk.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
+#include <algorithm>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <sstream>
+#include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 
 // ── PIN (D-CORE-JSON-LEAKS-INTO-TWO-PUBLIC-HEADERS) ─────────────────────────
@@ -132,6 +138,20 @@ ObjectFormatSchema::loadFromFile(std::filesystem::path const& path) {
     // resolved by the caller through `loadShipped`, each one its own load with
     // its own digest, so nothing is folded in behind this document's back.
     //
+    // ⚠⚠ AND THAT CLAIM IS AN INVARIANT THIS FILE MUST KEEP, NOT A DESCRIPTION
+    // OF TODAY (D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE).
+    // The flavour-family role scan reads every sibling `.format.json`, and its
+    // first cut cached the result in a `mutable` member of the instance stored
+    // BELOW — which folds 23 other documents into an entry keyed on this one's
+    // bytes, i.e. exactly the stale-hit shape `config_document_memo.hpp` names a
+    // SILENT MISCOMPILE. It is now assembled per CALLER
+    // (`FormatRuntimeLibraryRoleResolver`, whose lifetime is one binding
+    // operation) and the instance holds nothing derived from a sibling.
+    // ⇒ ANY future member whose value depends on a file other than this one must
+    // either be recorded here as a `ConfigDocumentDependency` or not live on the
+    // instance at all. `sourceDirectory_` is neither: it is a function of the
+    // memo LABEL, which is already half the key.
+    //
     // ⓘ The miss path digests these bytes twice (once here for the key, once
     // inside `loadFromText` for `contentDigest()`) — bounded to the cold path,
     // and 🧠DERIVED from the ✔MEASURED Debug digest rate (14.5 ns/byte) at well
@@ -153,6 +173,14 @@ ObjectFormatSchema::loadFromFile(std::filesystem::path const& path) {
     // ⚠ Stored only on the SUCCESS path — a failed load produced diagnostics and
     // no schema, and the loader's own refusal already reports it every time.
     if (schema) {
+        // The document's OWN directory, for the flavour-family scan. Recorded
+        // here rather than resolved from the ambient shipped root at question
+        // time: a schema's siblings are the documents beside IT, and a build
+        // that changes `DSS_CONFIG_ROOT` after loading a format must not have
+        // that format's family answered out of a different tree.
+        (*schema)->sourceDirectory_ =
+            path.has_parent_path() ? path.parent_path().generic_string()
+                                   : std::string{};
         detail::ConfigDocumentMemo<ObjectFormatSchema>::store(
             label, std::move(digest),
             std::vector<detail::ConfigDocumentDependency>{}, *schema);
@@ -167,6 +195,127 @@ ObjectFormatSchema::loadShipped(std::string_view name) {
                                    DiagnosticCode::C_InvalidFormatName});
     if (!path) return std::unexpected(std::move(path).error());
     return loadFromFile(*path);
+}
+
+// ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE:
+//    the flavour FAMILY's role table, assembled from the shipped siblings ──
+//
+// A shipped-library descriptor names a runtime role PER OBJECT-FORMAT KIND
+// (`{"pe": {"role": "cLibrary"}}`), while this tier writes the role table per
+// FLAVOUR and only where one of the flavour's own blocks names the role — a
+// `-dll` or `-staticlib` document declares no `cLibrary`, and the loader
+// would refuse one as inert config. So the flavours that do not declare a role
+// answer it from the ones that do, and the ones that do must agree: the rule
+// `EveryFlavourOfAFormatKindNamesOneProviderPerRole` pins at test time is
+// enforced here at build time, on the same population.
+namespace {
+
+[[nodiscard]] std::string providerSpelling(RuntimeLibraryBinding const& row) {
+    return row.source.empty() ? ("image '" + row.image + "'")
+                              : ("shipped source '" + row.source + "'");
+}
+
+} // namespace
+
+// Every shipped flavour of this document's kind EXCEPT its namesake, merged. The
+// scan is TOTAL and sorted by filename for the two reasons
+// `runtime::resolveArchiveSiblingFormat` gives: agreement cannot be proven by
+// a scan that stops early, and a disagreement message must not read
+// differently on NTFS (sorted) and ext4 (hash-ordered). The namesake is
+// skipped because the MEMBER is that flavour for this build — a
+// `loadFromText` mutant of `…-exec` supersedes the shipped `…-exec`, and a
+// shipped member simply meets itself.
+std::expected<RuntimeLibraryTable, std::string>
+ObjectFormatSchema::assembleFlavourRuntimeLibraries() const {
+    ObjectFormatSchema const& member = *this;
+    // THIS document's own directory, or — for a `loadFromText` schema, which
+    // came from no directory at all — the ambient shipped one. The fallback is
+    // the mutant case and only the mutant case: a document read from disk always
+    // answers out of the tree it was read from.
+    std::optional<std::filesystem::path> dir;
+    if (!sourceDirectory_.empty()) dir = std::filesystem::path{sourceDirectory_};
+    else                           dir = findShippedConfigDir("object-formats");
+    if (!dir) {
+        return std::unexpected(std::format(
+            "the shipped object-format directory (src/dss-config/object-formats) "
+            "could not be located, so the flavour family of object format '{}' "
+            "cannot be assembled",
+            member.name()));
+    }
+    std::error_code ec;
+    std::vector<std::filesystem::path> documents;
+    for (std::filesystem::directory_iterator it{*dir, ec}, end; it != end;
+         it.increment(ec)) {
+        if (ec) break;
+        std::error_code typeEc;
+        if (!it->is_regular_file(typeEc) || typeEc) continue;
+        if (!it->path().filename().string().ends_with(".format.json")) continue;
+        documents.push_back(it->path());
+    }
+    if (ec) {
+        return std::unexpected(std::format(
+            "the scan of object-format directory '{}' was interrupted after "
+            "PARTIAL enumeration ({}); a partial scan cannot prove the flavour "
+            "family of '{}' agrees, so it is refused",
+            dir->generic_string(), ec.message(), member.name()));
+    }
+    std::sort(documents.begin(), documents.end(),
+              [](std::filesystem::path const& a, std::filesystem::path const& b) {
+                  return a.filename().string() < b.filename().string();
+              });
+
+    RuntimeLibraryTable      merged;
+    std::vector<std::string> declaredBy;   // parallel to `merged.bindings`
+    for (auto const& document : documents) {
+        auto loaded = ObjectFormatSchema::loadFromFile(document);
+        if (!loaded.has_value()) {
+            // A document that cannot be read is a REFUSAL, never a skip: it
+            // could have declared the very role this family is asked for, and
+            // skipping it would answer from whichever siblings happened to load.
+            std::string detail;
+            for (auto const& diag : loaded.error()) {
+                if (!detail.empty()) detail += "; ";
+                detail += diag.message;
+            }
+            return std::unexpected(std::format(
+                "object-format document '{}' failed to load while assembling "
+                "the flavour family of '{}': {}. The scan must be TOTAL — a "
+                "document that cannot be read could have declared a role this "
+                "family is asked for",
+                document.generic_string(), member.name(), detail));
+        }
+        ObjectFormatSchema const& candidate = **loaded;
+        if (candidate.kind() != member.kind()) continue;
+        if (candidate.name() == member.name()) continue;
+        for (auto const& row : candidate.runtimeLibraries().bindings) {
+            auto const* const existing = merged.rowForRole(row.role);
+            if (existing == nullptr) {
+                merged.bindings.push_back(row);
+                declaredBy.push_back(std::string{candidate.name()});
+                continue;
+            }
+            if (existing->image == row.image && existing->source == row.source) {
+                continue;
+            }
+            auto const at = static_cast<std::size_t>(
+                existing - merged.bindings.data());
+            // The family is named by its MEMBER, never by a kind spelling: this
+            // tier asks a document what it declares and does not render format
+            // identity (`ObjectFormatBackendRegistry.SchemaTierDoesNotCompareFormatIdentity`).
+            return std::unexpected(std::format(
+                "the flavour family of object format '{}' declares "
+                "runtime-library role '{}' with two different providers across "
+                "its documents: {} in '{}', {} in '{}'. Who plays a runtime role "
+                "is a property of the format FAMILY, and a shipped-library "
+                "descriptor names the role per family; which flavour a build "
+                "happens to select must not decide which image it imports, so "
+                "the disagreement is refused rather than resolved by scan order",
+                member.name(), runtimeLibraryRoleName(row.role),
+                providerSpelling(*existing), declaredBy[at],
+                providerSpelling(row), candidate.name()));
+        }
+    }
+    return merged;
 }
 
 // ── The one reverse map (D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS) ──
@@ -539,6 +688,70 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                          "DECLARED.",
                          detail::renderAllowedList(
                              allNames(kWeakDefinitionDialectTable), " or ")));
+    }
+
+    // ── D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET: a
+    //    PRESENT `objectImportSlot` block must name a prefix ──────────────
+    //
+    // The SHAPE rule only, for the same reason the `weakDefinition` arm above
+    // states its own: presence is the declaration, so absence is not an error
+    // here. What IS an error is a block that is present and empty — the slot
+    // would then be published under the IMPORTED SYMBOL'S OWN NAME, which the
+    // final linker reads as this object DEFINING the name it is importing.
+    //
+    // ⚠ THE PAIRING RULE — that a relocatable format declaring
+    // `dataImportBinding` MUST declare this block, and that an IMAGE format
+    // must NOT — is enforced at the LINKER and deliberately not here. It reads
+    // `isImageFlavor()`, which is a BACKEND question (`ObjectFormatSchema`),
+    // and `validate()` runs on the DATA. Stating half of it here from the
+    // `container` field would be a second, weaker spelling of one rule, which
+    // is the drift shape this file's own `cSymbolDecoration` history records.
+    if (objectImportSlot.has_value() && objectImportSlot->symbolPrefix.empty()) {
+        fail("/objectImportSlot/symbolPrefix",
+             "'objectImportSlot' is present but declares an empty "
+             "'symbolPrefix' — a DECLARED block must state the name the "
+             "object-carried data-import slot is published under. An empty "
+             "prefix publishes the slot under the IMPORT'S OWN name, so the "
+             "object would DEFINE the symbol it is importing. Omit the block "
+             "entirely to declare that this format carries no slot. "
+             "D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET.");
+    }
+
+    // ── D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT:
+    //    a narrowing needs something to narrow ────────────────────────────
+    //
+    // `indirectSlotBindings` says WHICH imports the `indirect-slot` dispatch
+    // applies to. Under any other dispatch NO import takes the slot, so the
+    // list would name a rule nothing consults — config that reads as a
+    // capability and is not one, the D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE
+    // shape. Refused rather than ignored, because the direction of the
+    // mistake is the dangerous one: a format author who narrows the wrong key
+    // gets an object that still carries the unnarrowed cost and a document
+    // that says otherwise.
+    //
+    // ⓘ BOTH KEYS ARE IN `data`, so unlike the `objectImportSlot` pairing rule
+    // above this one belongs HERE rather than at the linker: it needs no
+    // `isImageFlavor()` backend question. The IMAGE side is covered without a
+    // second rule — no image format declares `indirect-slot` (their walkers
+    // point an extern's VA at a callable thunk), so this arm already refuses
+    // the narrowing on every one of them.
+    if (!indirectSlotBindings.empty()
+        && externCallDispatch != ExternCallDispatch::IndirectSlot) {
+        fail("/indirectSlotBindings",
+             std::string{"'indirectSlotBindings' narrows which imports take "
+                         "the import-slot shape, but this format declares "}
+                 + (externCallDispatch.has_value()
+                        ? std::string{"'externCallDispatch: "}
+                              + std::string{externCallDispatchName(
+                                    *externCallDispatch)} + "'"
+                        : std::string{"no 'externCallDispatch'"})
+                 + ", under which no extern reference takes a slot at all — "
+                   "so the list narrows nothing and no consumer reads it. "
+                   "Declare 'externCallDispatch: "
+                 + std::string{externCallDispatchName(
+                       ExternCallDispatch::IndirectSlot)}
+                 + "' too, or remove the narrowing. "
+                   "D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT.");
     }
 
     // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): container rules ──
@@ -1081,6 +1294,13 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
             claims.push_back({librarySynthesis->role,
                               librarySynthesis->libraryPath,
                               "/librarySynthesis"});
+        }
+        // D-CSUBSET-PACKED-ATOMIC-MEMBER: the fifth role-naming spine block.
+        if (atomicsRuntime.has_value()
+            && atomicsRuntime->role != RuntimeLibraryRole::None) {
+            claims.push_back({atomicsRuntime->role,
+                              atomicsRuntime->libraryPath,
+                              "/atomicsRuntime"});
         }
         for (auto const& c : claims) {
             auto const image = runtimeLibraries.imageForRole(c.role);

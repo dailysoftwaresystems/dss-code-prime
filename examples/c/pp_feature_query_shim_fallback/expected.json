@@ -1,0 +1,34 @@
+{
+  "$comment": "[[D-CSUBSET-COMPILER-FEATURE-QUERY-OPERATORS]] runtime witness for the PORTABLE FEATURE-QUERY SHIM -- the `#ifndef __has_X / #define __has_X(x) 0 / #endif` block the Apple SDK's sys/cdefs.h ships for FIVE operators and glibc, musl, Boost and zlib ship for one or two. DSS implements __has_include / __has_embed / __has_c_attribute and NOT __has_attribute / __has_builtin / __has_feature / __has_extension, so all four shims in main.c are LIVE, and this example proves the resulting build WORKS rather than merely not erroring. ★★★ EVERY UNIMPLEMENTED QUERY TAKES A DELIBERATELY BOGUS ARGUMENT, and that is what makes the example portable at all: a feature query is the one construct whose CORRECT answer differs between conforming implementations (__has_attribute(cold) is 1 on gcc and clang and unavailable on MSVC), so an example asserting a REAL capability could not carry one expected exit code across the union. A bogus name has ONE right answer everywhere: 0. The five weights 8/16/4/2/12 are pairwise distinct and sum to 42, so a wrong answer from ANY operator changes the exit code, including two wrong in opposite directions. The last weight arrives from a header the __has_include arm actually #includes, so that operator's 1 is fold-resistant too. ✔MEASURED 2026-09-03, each reference invoked SEPARATELY and every one COMPILED, LINKED AND RUN: gcc 13.3.0 (WSL) exit 42, gcc 13.2.0 (mingw-w64) exit 42, clang 18.1.3 exit 42, cl 19.51.36252 (vcvars64, /std:c17) exit 42 -- and MSVC's /EP output re-checked under BOTH its preprocessors, traditional and /Zc:preprocessor, yielding the same 8 + 16 + 4 + 2 + 12. RED-ON-DISABLE: making any query answer non-zero for its bogus argument drops that weight and the exit code stops being 42 -- that is the [[D-CONFIG-COMMENT-CLAIM-ROT]] failure this row exists to prevent, one tier down. Refusing the shim's `#define` -- which is exactly what adding these four names to `isConditionalInclusionOperator` would do -- fails the build outright, which is the row's own explicit warning made executable. The `release` arm runs the shipped parser->semantic->codegen->native pipeline over the same source.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "$commentNotDifferent": "HONEST, and the same reading its sibling examples/c/pp_has_include_and_attr records: the construct under test is resolved entirely in the FRONT END (the preprocessor's conditional-inclusion operator fold), so the MIR the pipeline receives already holds the answer as a constant and there is nothing left for a pass to fold. The surviving `main` is `return 8 + 16 + 4 + 2 + 12`. Deliberately NOT given `mustDifferFromBaseline` -- an honest no-op, not a missed opt-in. The arm still earns its place: it proves the whole shipped optimizing pipeline accepts and preserves the front end's answer."}
+  ]
+}

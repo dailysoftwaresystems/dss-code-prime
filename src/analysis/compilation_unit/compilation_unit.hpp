@@ -606,6 +606,18 @@ public:
     // cache key carries it. Aborts if called after finish().
     void setHeaderNameMatching(HeaderNameMatching matching);
 
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: declare the ACTIVE (target x
+    // object format)'s plain-`char` signedness -- the driver's ONE reading of
+    // `TargetSchema::charIsUnsigned(ObjectFormatKind)`. It reaches the
+    // `#if`/`#elif` ICE evaluator, where C 6.10.1p4 + 6.4.4.4p10 make
+    // `#if 'ÿ' < 0` take opposite arms on a signed- and an unsigned-`char`
+    // target. Like `headerNameMatching` it can change the preprocessed token
+    // stream, so the driver's CU cache key carries it. UNSET (the default, and
+    // every LSP / direct-API / test caller) does NOT mean signed: a code unit
+    // 0-127 is the same integer either way and folds unchanged, while a high
+    // byte refuses loud. Aborts if called after finish().
+    void setCharIsUnsigned(std::optional<bool> charIsUnsigned);
+
     // c105 (D-PP-USER-DEFINE): declare the CLI `--define NAME[=VALUE]` entries
     // (verbatim). Each lowers to a `#define` line in the preprocessor's
     // synthetic "<command-line>" prologue — command-line macros are ORDINARY
@@ -768,6 +780,9 @@ private:
     std::optional<ObjectFormatKind>      activeFormat_; // c9: per-target __has_include
     // D-PP-HEADER-CASE-INSENSITIVE-PE: the active format's header-NAME case rule.
     HeaderNameMatching                   headerNameMatching_ = kDefaultHeaderNameMatching;
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the active (target x format)'s
+    // plain-`char` sign, relayed to `preprocess()` for the `#if` fold.
+    std::optional<bool>                  charIsUnsigned_{};
     std::vector<std::string>             userDefines_;  // c105: --define NAME[=VALUE]
     std::vector<PredefinedMacroDef>      targetPredefinedMacros_;  // TF-C74: per-arch identity predefines
     std::vector<PredefinedMacroDef>      formatPredefinedMacros_;  // TF-C97: per-format data-model predefines

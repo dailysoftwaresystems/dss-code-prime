@@ -12,6 +12,7 @@
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_verifier.hpp"
 
+#include <algorithm>   // std::find / std::max — the emitters' explicit work stacks
 #include <array>
 #include <cctype>
 #include <cerrno>
@@ -472,10 +473,132 @@ private:
         out_ += "}\n";
     }
 
-    // Recursive structural type emitter — mirrors the HIR text emitter's
-    // discipline. The grammar must stay in sync with `parseType` below.
+    // ── THE STRUCTURAL TYPE EMITTER — AN EXPLICIT HEAP WORK STACK ────────────
+    //
+    // ★★★ D-MIR-TEXT-APPENDTYPE-RECURSES-PER-TYPE-LEVEL-AND-NEVER-TERMINATES-ON-A-SELF-REFERENTIAL-COMPOSITE
+    //
+    // ⚠⚠ THIS WALK USED TO BE HOST RECURSION *AND* IT DID NOT TERMINATE. The
+    // Struct / Union arms expand a composite's WHOLE FIELD LIST inline, and a
+    // field may be a `Ptr` back to the composite itself — `struct S { int v;
+    // struct S *next; }`, the commonest shape in C and the shape sqlite is built
+    // out of. `S → fields → ptr<S> → fields → …` has no base case, so the walk
+    // ran until the host stack was gone.
+    //
+    // ✔MEASURED (P55, lane `rc`) through `ctest`, never a bare `.exe`: the source
+    // `struct S { int v; struct S *next; }; struct S g;` compiled to MIR with
+    // rc 0 (`stop=mir`) and DIED with rc 8 / SEGFAULT the moment `emitMir` ran
+    // (`stop=text`) — on the ORDINARY gtest main thread, at nesting depth ONE.
+    // A finite acyclic type graph here is ~3 levels deep, so a crash is proof of
+    // a CYCLE and not of a deep input: this was non-termination, not a depth
+    // problem, and no stack size fixes it.
+    //
+    // TWO things are therefore fixed here, and they are independent:
+    //
+    //   1. THE HOST RECURSION IS GONE. Depth now costs HEAP (`stack`), which is
+    //      bounded and reportable, not call frames, which are not — the operator's
+    //      standing ruling of 2026-09-02, *"it's well known to not use recursive
+    //      structures in the compiler because big projects like sqlite will for
+    //      sure explode the stack"*.
+    //
+    //   2. A COMPOSITE THAT REACHES ITSELF IS REFUSED **LOUD**, BY NAME.
+    //      `openComposites_` holds the composites whose field list is currently
+    //      being expanded; re-entering one emits an `Error` naming it and the `?`
+    //      mark, which `parseType` refuses BY NAME on the way back in. That is
+    //      this file's own established discipline for a value the format cannot
+    //      spell — see the `TypeKind::Extension` arm, which likewise emits text
+    //      it says out loud the reader will not accept. Turning the crash into a
+    //      SILENT truncated type would have been worse than the crash: it would
+    //      round-trip a `struct S` whose `next` field had quietly lost its
+    //      pointee.
+    //
+    // ⚠ WHAT THIS DOES **NOT** DO, STATED RATHER THAN IMPLIED: it does not make a
+    // self-referential composite round-trip. It cannot, from here. `parseType`
+    // builds a composite with ONE call — `interner_.structType(name, fields)` —
+    // so a cyclic type is not representable by this reader at all; spelling one
+    // would need a two-phase (declare-tag-then-complete) interner entry point,
+    // i.e. a change to `src/core/types/**` and a matching grammar in BOTH text
+    // tiers. That is a format decision, not a bug fix, and it is recorded in the
+    // row rather than guessed at here.
+    //
+    // ⚠ THE TWIN IN `src/hir/hir_text.cpp`'s OWN `appendType` HAS THE IDENTICAL
+    // DEFECT — same inline field-list expansion, same absent cycle guard — and is
+    // OUTSIDE this lane's file set. It is named in the row, not silently left.
     bool internerWarned_ = false;
-    void appendType(TypeId t) {
+
+    // One unit of pending emit work. `Type` renders a type; `Text` appends a
+    // precomputed literal run (a closer, a separator, a formatted suffix);
+    // `CloseComposite` pops a tag off `openComposites_` once its field list is
+    // fully rendered. Tasks are pushed in REVERSE execution order.
+    struct TypeEmitTask {
+        enum class Kind : std::uint8_t { Type, Text, CloseComposite };
+        Kind          kind = Kind::Type;
+        TypeId        type{};
+        std::uint32_t tag  = 0;
+        std::string   text;
+    };
+
+    // The composites whose field list is currently open. A vector and a linear
+    // scan on purpose: this is the NESTING depth of one type, which is small
+    // even for a pathological input, and a vector keeps the open set in the same
+    // order as the text so the diagnostic can name what it is inside of.
+    std::vector<std::uint32_t> openComposites_;
+
+    void appendType(TypeId root) {
+        std::vector<TypeEmitTask> stack;
+        stack.push_back(TypeEmitTask{.kind = TypeEmitTask::Kind::Type,
+                                     .type = root});
+        std::size_t peak = 0;
+        while (!stack.empty()) {
+            peak = std::max(peak, stack.size());
+            TypeEmitTask task = std::move(stack.back());
+            stack.pop_back();
+            switch (task.kind) {
+                case TypeEmitTask::Kind::Text:
+                    out_ += task.text;
+                    continue;
+                case TypeEmitTask::Kind::CloseComposite:
+                    // The field list is finished; the composite is no longer an
+                    // ancestor of anything still to render.
+                    if (!openComposites_.empty()
+                        && openComposites_.back() == task.tag) {
+                        openComposites_.pop_back();
+                    } else {
+                        // Unreachable by construction (a CloseComposite is pushed
+                        // with, and only with, its own open entry). Fail loud
+                        // rather than silently desynchronize the cycle guard.
+                        report("internal: MIR type emitter's composite open-set "
+                               "desynchronized", DiagnosticSeverity::Error);
+                        openComposites_.clear();
+                    }
+                    continue;
+                case TypeEmitTask::Kind::Type:
+                    break;
+            }
+            appendTypeStep(task.type, stack);
+        }
+        (void)peak;
+    }
+
+    // Render ONE type node, pushing whatever remains onto `stack`. Every arm
+    // that used to recurse now pushes; nothing here calls itself.
+    void appendTypeStep(TypeId t, std::vector<TypeEmitTask>& stack) {
+        using Kind = TypeEmitTask::Kind;
+        auto pushText = [&](std::string s) {
+            stack.push_back(TypeEmitTask{.kind = Kind::Text, .text = std::move(s)});
+        };
+        auto pushType = [&](TypeId ty) {
+            stack.push_back(TypeEmitTask{.kind = Kind::Type, .type = ty});
+        };
+        // `ops` rendered comma-separated, then `closer`. Pushed in reverse so it
+        // comes back out in source order.
+        auto pushArgs = [&](std::span<TypeId const> ops, std::string closer) {
+            pushText(std::move(closer));
+            for (std::size_t i = ops.size(); i-- > 0;) {
+                pushType(ops[i]);
+                if (i != 0) pushText(", ");
+            }
+        };
+
         if (!t.valid()) { out_ += "invalid"; return; }
         if (ctx_.interner == nullptr) {
             if (!internerWarned_) {
@@ -493,36 +616,52 @@ private:
             return;
         }
         TypeInterner const& in = *ctx_.interner;
-        auto args = [&](std::span<TypeId const> ops) {
-            bool first = true;
-            for (TypeId o : ops) {
-                if (!first) out_ += ", ";
-                appendType(o);
-                first = false;
-            }
-        };
         switch (in.kind(t)) {
-            case TypeKind::Ptr:      out_ += "ptr<";      appendType(in.operands(t)[0]); out_ += '>'; return;
-            case TypeKind::Ref:      out_ += "ref<";      appendType(in.operands(t)[0]); out_ += '>'; return;
-            case TypeKind::Nullable: out_ += "nullable<"; appendType(in.operands(t)[0]); out_ += '>'; return;
-            case TypeKind::Optional: out_ += "optional<"; appendType(in.operands(t)[0]); out_ += '>'; return;
-            case TypeKind::Slice:    out_ += "slice<";    appendType(in.operands(t)[0]); out_ += '>'; return;
+            case TypeKind::Ptr:      out_ += "ptr<";      pushArgs(in.operands(t).first(1), ">"); return;
+            case TypeKind::Ref:      out_ += "ref<";      pushArgs(in.operands(t).first(1), ">"); return;
+            case TypeKind::Nullable: out_ += "nullable<"; pushArgs(in.operands(t).first(1), ">"); return;
+            case TypeKind::Optional: out_ += "optional<"; pushArgs(in.operands(t).first(1), ">"); return;
+            case TypeKind::Slice:    out_ += "slice<";    pushArgs(in.operands(t).first(1), ">"); return;
             case TypeKind::Array:
-                out_ += "arr<"; appendType(in.operands(t)[0]);
-                out_ += std::format(", {}>", in.scalars(t)[0]);
+                out_ += "arr<";
+                pushArgs(in.operands(t).first(1),
+                         std::format(", {}>", in.scalars(t)[0]));
                 return;
             // C99 _Complex (D-CSUBSET-COMPLEX): a complex slot is a Ptr<complex<elem>>
             // in MIR; spell the pointee so the .dssmir dump is legible (not '?').
             case TypeKind::Complex:
-                out_ += "complex<"; appendType(in.operands(t)[0]); out_ += '>'; return;
+                out_ += "complex<"; pushArgs(in.operands(t).first(1), ">"); return;
             case TypeKind::Tuple:
-                out_ += "tuple<"; args(in.operands(t)); out_ += '>'; return;
+                out_ += "tuple<"; pushArgs(in.operands(t), ">"); return;
             case TypeKind::Struct:
-                out_ += "struct "; out_ += quote(in.name(t)); out_ += " {";
-                args(in.operands(t)); out_ += '}'; return;
-            case TypeKind::Union:
-                out_ += "union "; out_ += quote(in.name(t)); out_ += " {";
-                args(in.operands(t)); out_ += '}'; return;
+            case TypeKind::Union: {
+                bool const isStruct = in.kind(t) == TypeKind::Struct;
+                out_ += isStruct ? "struct " : "union ";
+                out_ += quote(in.name(t));
+                // ★★ THE CYCLE GUARD. Reaching a composite that is already being
+                // expanded means the field list contains a path back to itself;
+                // expanding it again never terminates. Refuse it BY NAME, with
+                // the `?` mark the reader rejects, rather than truncating it into
+                // a type that would read back as something else.
+                if (std::find(openComposites_.begin(), openComposites_.end(), t.v)
+                    != openComposites_.end()) {
+                    report(std::format(
+                        "{} '{}' contains a path back to itself; this format "
+                        "expands a composite's field list inline and has no "
+                        "spelling for a self-referential type, so it is rendered "
+                        "as '?' and the text will NOT read back",
+                        isStruct ? "struct" : "union", in.name(t)),
+                        DiagnosticSeverity::Error);
+                    out_ += " ?";
+                    return;
+                }
+                openComposites_.push_back(t.v);
+                stack.push_back(TypeEmitTask{.kind = Kind::CloseComposite,
+                                             .tag  = t.v});
+                out_ += " {";
+                pushArgs(in.operands(t), "}");
+                return;
+            }
             // ★★ THE UNDERLYING KIND IS SPELLED BY NAME, NOT BY ITS ORDINAL, and
             // that is a correctness requirement rather than a readability one.
             // This arm used to write `std::to_string(sc[0])` — the raw `TypeKind`
@@ -561,17 +700,24 @@ private:
                 return;
             }
             case TypeKind::FnSig: {
-                out_ += "fn(";
-                args(in.fnParams(t));
-                out_ += ") -> ";
-                appendType(in.fnResult(t));
-                auto sc = in.scalars(t);
+                // `fn(P0, P1) -> R [cc NAME]`. The trailing calling-convention
+                // run is decided HERE (it reads only this node's scalars) and
+                // carried as a Text task so it lands after the result type.
+                std::string tail;
+                auto const sc = in.scalars(t);
                 if (!sc.empty()) {
                     auto const cc = static_cast<CallConv>(sc[0]);
                     if (cc != CallConv::CcSysV) {
-                        out_ += " cc "; out_ += callConvName(cc);
+                        tail += " cc ";
+                        tail += callConvName(cc);
                     }
                 }
+                out_ += "fn(";
+                // Reverse execution order: the cc tail, then the result, then
+                // `) -> `, then the parameter list.
+                if (!tail.empty()) pushText(std::move(tail));
+                pushType(in.fnResult(t));
+                pushArgs(in.fnParams(t), ") -> ");
                 return;
             }
             // ★★ WRITE-ONLY SPELLING, MADE LOUD RATHER THAN LEFT AS A WARNING
@@ -622,8 +768,48 @@ private:
     // Render a `MirLiteralValue` inline. Format mirrors HIR's: `lit
     // <variant-tag> <value>` where `<variant-tag>` disambiguates the
     // variant arm (int / uint / float / bool / str / agg).
-    void appendLiteral(MirLiteralValue const& lv) {
+    // ── THE LITERAL EMITTER — THE SAME EXPLICIT HEAP WORK STACK ──────────────
+    //
+    // D-MIR-NESTED-AGGREGATE-LITERAL-WALKS-RECURSE-PER-INITIALIZER-LEVEL: the
+    // `agg` arm used to call `appendLiteral` per nested field, one host frame per
+    // brace level of the source initializer, with NO CAP of any kind. Nesting now
+    // costs heap. The tail (` : <core>`) is a task of its own so a nested
+    // aggregate's core still renders — and still REPORTS — in output order, which
+    // computing it eagerly at push time would have quietly reordered.
+    struct LiteralEmitTask {
+        enum class Kind : std::uint8_t { Value, CoreSuffix, Text };
+        Kind                   kind = Kind::Value;
+        MirLiteralValue const* lit  = nullptr;
+        std::string            text;
+    };
+
+    void appendLiteral(MirLiteralValue const& root) {
+        std::vector<LiteralEmitTask> stack;
+        stack.push_back(LiteralEmitTask{.kind = LiteralEmitTask::Kind::Value,
+                                        .lit  = &root});
+        while (!stack.empty()) {
+            LiteralEmitTask task = std::move(stack.back());
+            stack.pop_back();
+            switch (task.kind) {
+                case LiteralEmitTask::Kind::Text:
+                    out_ += task.text;
+                    continue;
+                case LiteralEmitTask::Kind::CoreSuffix:
+                    appendLiteralCore(*task.lit);
+                    continue;
+                case LiteralEmitTask::Kind::Value:
+                    break;
+            }
+            appendLiteralStep(*task.lit, stack);
+        }
+    }
+
+    // Render ONE literal node. An aggregate pushes its fields; nothing recurses.
+    void appendLiteralStep(MirLiteralValue const& lv,
+                           std::vector<LiteralEmitTask>& stack) {
+        using Kind = LiteralEmitTask::Kind;
         out_ += "lit ";
+        MirAggregateValue const* agg = nullptr;
         std::visit([&](auto const& v) {
             using T = std::decay_t<decltype(v)>;
             if constexpr (std::is_same_v<T, std::monostate>) {
@@ -640,14 +826,12 @@ private:
             } else if constexpr (std::is_same_v<T, std::string>) {
                 out_ += "str "; out_ += quote(v);
             } else if constexpr (std::is_same_v<T, MirAggregateValue>) {
+                // The fields are pushed AFTER the visit returns (the closure
+                // cannot name `stack` and the task type at once without pulling
+                // the whole ladder into the template); record the aggregate and
+                // let the caller schedule it.
                 out_ += "agg {";
-                bool first = true;
-                for (auto const& f : v.fields) {
-                    if (!first) out_ += ", ";
-                    appendLiteral(f);
-                    first = false;
-                }
-                out_ += '}';
+                agg = &v;
             } else if constexpr (std::is_same_v<T, MirSymbolAddrValue>) {
                 // F5: link-time symbol-address literal (`&sym [+ addend]`).
                 out_ += std::format("symaddr %{}", v.symbol);
@@ -689,6 +873,27 @@ private:
                               "serialize as nothing");
             }
         }, lv.value);
+        if (agg == nullptr) {
+            appendLiteralCore(lv);
+            return;
+        }
+        // Reverse execution order: this node's ` : <core>` tail, then the closing
+        // brace, then the fields with their separators.
+        stack.push_back(LiteralEmitTask{.kind = Kind::CoreSuffix, .lit = &lv});
+        stack.push_back(LiteralEmitTask{.kind = Kind::Text, .text = "}"});
+        auto const& fields = agg->fields;
+        for (std::size_t i = fields.size(); i-- > 0;) {
+            stack.push_back(LiteralEmitTask{.kind = Kind::Value,
+                                            .lit  = &fields[i]});
+            if (i != 0) {
+                stack.push_back(LiteralEmitTask{.kind = Kind::Text,
+                                                .text = ", "});
+            }
+        }
+    }
+
+    // The ` : <core>` tail every literal carries, aggregate or not.
+    void appendLiteralCore(MirLiteralValue const& lv) {
         out_ += " : ";
         // ⚠ ONE OWNER FOR THE CORE SPELLINGS, both directions. The `else if` ladder
         // that used to stand here was a second copy of `parseLiteral`'s ladder, and
@@ -1557,8 +1762,73 @@ private:
         (void)expect(TokKind::RBrace);
     }
 
-    // Parse a structural type. Grammar mirrors `appendType`.
+    // ── THE READER HALF, ON AN EXPLICIT HEAP WORK STACK ─────────────────────
+    //
+    // D-MIR-TEXT-READER-PARSETYPE-AND-PARSELITERAL-RECURSE-PER-LEVEL-UNCAPPED.
+    // `parseType` had SIX self-calls and no cap of any kind, and its depth
+    // follows the `.dssmir` TEXT — an input this reader does not produce and
+    // must not trust. ✔MEASURED before the conversion, in-process on the
+    // ordinary ~1 MiB gtest main thread through `ctest`, gdb-attributed to
+    // `parseType` calling itself (no other frame in the stack): a `ptr<ptr<…
+    // <i32>…>>` global type parsed with rc 0 and `errors=0` at **1000** and
+    // SEGFAULTed at **2000**. The WRITER half of this same grammar was
+    // converted in P55 ([[D-MIR-NESTED-AGGREGATE-LITERAL-WALKS-RECURSE-PER-INITIALIZER-LEVEL]]
+    // and the `appendType`/`appendLiteral` stacks above), so the two halves of
+    // one format now agree about what depth costs.
+    //
+    // The frame is the state of ONE composite whose operand list is open. It
+    // carries no lexer state: the token stream is a single shared cursor, so
+    // reading a nested type advances exactly the same tokens the recursion did.
+    struct TypeParseFrame {
+        enum class Kind : std::uint8_t {
+            Wrapper,    // ptr/ref/nullable/optional/slice/complex — 1 operand, `>`
+            Array,      // arr<T, N>
+            Tuple,      // tuple<T, …>
+            Composite,  // struct/union "name" { T, … }
+            FnParams,   // fn(T, …)  — collecting parameters
+            FnReturn    // fn(…) ->  — collecting the return type
+        } kind;
+        std::string          name;             // wrapper spelling / composite name
+        bool                 isStruct = false; // Composite: struct vs union
+        std::uint32_t        paramCount = 0;   // FnReturn: how many ops are params
+        std::vector<TypeId>  ops;
+    };
+
+    // Parse a structural type. Grammar mirrors `appendType`. NOTHING here calls
+    // itself: `parseTypeHead` either completes a leaf or pushes a frame, and
+    // `advanceTypeFrame` either asks for the next operand or reduces the frame.
     [[nodiscard]] TypeId parseType() {
+        std::vector<TypeParseFrame> stack;
+        TypeId done       = InvalidType;
+        bool   needHead   = true;    // read a fresh type head from the lexer
+        bool   haveResult = false;   // `done` is a finished type awaiting delivery
+
+        for (;;) {
+            if (needHead) {
+                needHead   = false;
+                haveResult = parseTypeHead(stack, done);
+            }
+            if (stack.empty()) return done;
+            if (haveResult) {
+                stack.back().ops.push_back(done);
+                haveResult = false;
+            }
+            // `advanceTypeFrame` may set `needHead` (ask for the next operand)
+            // or return true (the frame reduced into `done`).
+            if (advanceTypeFrame(stack.back(), needHead, done)) {
+                stack.pop_back();
+                haveResult = true;
+            }
+        }
+    }
+
+    // Read ONE type head. Returns true when `out` holds a COMPLETE type (a
+    // primitive, a leaf composite, or a refusal); false when a frame was pushed
+    // and its operands are still to come. Every arm is the recursive body's arm
+    // verbatim up to the point where it used to call `parseType`.
+    [[nodiscard]] bool parseTypeHead(std::vector<TypeParseFrame>& stack,
+                                     TypeId& out) {
+        out = InvalidType;
         Tok t = lex_.take();
         if (t.kind != TokKind::Ident) {
             // ⚠ `?` IS THE WRITER'S OWN MARK AND IS REFUSED BY NAME. `appendType`
@@ -1573,14 +1843,15 @@ private:
                     "either no TypeInterner was supplied to emitMir, or the kind "
                     "has no spelling in this format. The type was NOT serialized, "
                     "so this text cannot be read back into the module it came from");
-                return InvalidType;
+                return true;
             }
             emitMalformed(std::format("expected type, got '{}'", t.text));
-            return InvalidType;
+            return true;
         }
-        if (t.text == "invalid") return InvalidType;
+        if (t.text == "invalid") return true;   // `out` is already InvalidType
         if (auto k = primKindFromName(t.text); k.has_value()) {
-            return interner_.primitive(*k);
+            out = interner_.primitive(*k);
+            return true;
         }
         if (t.text == "ptr" || t.text == "ref" || t.text == "nullable"
          || t.text == "optional" || t.text == "slice"
@@ -1592,15 +1863,10 @@ private:
          // a complex slot IS a `Ptr<complex<elem>>` — emitted text that came back
          // as `unknown type 'complex'`.
          || t.text == "complex") {
-            if (!expect(TokKind::LAngle)) return InvalidType;
-            TypeId const inner = parseType();
-            (void)expect(TokKind::RAngle);
-            if (t.text == "ptr")      return interner_.pointer(inner);
-            if (t.text == "ref")      return interner_.reference(inner);
-            if (t.text == "nullable") return interner_.nullable(inner);
-            if (t.text == "optional") return interner_.optional(inner);
-            if (t.text == "slice")    return interner_.slice(inner);
-            if (t.text == "complex")  return interner_.complex(inner);
+            if (!expect(TokKind::LAngle)) return true;
+            stack.push_back(TypeParseFrame{.kind = TypeParseFrame::Kind::Wrapper,
+                                           .name = std::move(t.text)});
+            return false;   // its ONE operand comes next
         }
         // C23 `_BitInt(N)` / `unsigned _BitInt(N)` — the inverse of `appendType`'s
         // arm, and the HIR tier's spelling (this format already shares that tier's
@@ -1608,12 +1874,13 @@ private:
         // must not have two syntaxes).
         if (t.text == "unsigned" || t.text == "_BitInt") {
             bool const isSigned = (t.text != "unsigned");
-            if (!isSigned && !expectIdent("_BitInt")) return InvalidType;
-            if (!expect(TokKind::LParen)) return InvalidType;
+            if (!isSigned && !expectIdent("_BitInt")) return true;
+            if (!expect(TokKind::LParen)) return true;
             Tok const w = lex_.take();
             auto const width = parseNumber<std::int64_t>(w.text, "_BitInt width");
             (void)expect(TokKind::RParen);
-            return interner_.bitInt(width, isSigned);
+            out = interner_.bitInt(width, isSigned);
+            return true;
         }
         // `ext "Name"` is WRITE-ONLY BY CONSTRUCTION and says so. Resolving an
         // extension kind needs a `TypeRegistry`, which `parseMir` does not take;
@@ -1626,55 +1893,35 @@ private:
                 "resolve: an extension kind is identified against a TypeRegistry "
                 "and parseMir takes none. An Extension type reaching MIR is itself "
                 "a defect — the HIR→MIR boundary should have resolved it");
-            return InvalidType;
+            return true;
         }
         if (t.text == "arr") {
-            if (!expect(TokKind::LAngle)) return InvalidType;
-            TypeId const elem = parseType();
-            (void)expect(TokKind::Comma);
-            Tok len = lex_.take();
-            if (len.kind != TokKind::Integer) {
-                emitMalformed("expected array length integer");
-                return InvalidType;
-            }
-            std::int64_t lv = parseNumber<std::int64_t>(len.text, "array length");
-            (void)expect(TokKind::RAngle);
-            return interner_.array(elem, lv);
+            if (!expect(TokKind::LAngle)) return true;
+            stack.push_back(TypeParseFrame{.kind = TypeParseFrame::Kind::Array});
+            return false;   // the ELEMENT type comes next, then `, N >`
         }
         if (t.text == "tuple") {
-            if (!expect(TokKind::LAngle)) return InvalidType;
-            std::vector<TypeId> ops;
-            while (true) {
-                Tok pk = lex_.peek();
-                if (pk.kind == TokKind::RAngle) break;
-                if (!ops.empty()) (void)expect(TokKind::Comma);
-                ops.push_back(parseType());
-            }
-            (void)expect(TokKind::RAngle);
-            return interner_.tuple(ops);
+            if (!expect(TokKind::LAngle)) return true;
+            stack.push_back(TypeParseFrame{.kind = TypeParseFrame::Kind::Tuple});
+            return false;   // a (possibly empty) operand list comes next
         }
         if (t.text == "struct" || t.text == "union") {
             Tok name = lex_.take();
             if (name.kind != TokKind::String) {
                 emitMalformed("expected struct/union name");
-                return InvalidType;
+                return true;
             }
-            if (!expect(TokKind::LBrace)) return InvalidType;
-            std::vector<TypeId> fields;
-            while (true) {
-                Tok pk = lex_.peek();
-                if (pk.kind == TokKind::RBrace) break;
-                if (!fields.empty()) (void)expect(TokKind::Comma);
-                fields.push_back(parseType());
-            }
-            (void)expect(TokKind::RBrace);
-            if (t.text == "struct") return interner_.structType(name.text, fields);
-            return interner_.unionType(name.text, fields);
+            if (!expect(TokKind::LBrace)) return true;
+            stack.push_back(TypeParseFrame{
+                .kind = TypeParseFrame::Kind::Composite,
+                .name = std::move(name.text),
+                .isStruct = (t.text == "struct")});
+            return false;   // a (possibly empty) field list comes next
         }
         if (t.text == "enum") {
             Tok name = lex_.take();
             if (name.kind != TokKind::String) {
-                emitMalformed("expected enum name"); return InvalidType;
+                emitMalformed("expected enum name"); return true;
             }
             // ⚠ FAIL LOUD, AND SPELL THE KIND BY NAME. This arm read an INTEGER and
             // cast it straight to `TypeKind` with no range check whatsoever, so
@@ -1701,58 +1948,231 @@ private:
                                                "enum underlying type", TypeKind::I32);
                 }
             }
-            return interner_.enumType(name.text, underlying);
+            out = interner_.enumType(name.text, underlying);
+            return true;
         }
         if (t.text == "fn") {
-            if (!expect(TokKind::LParen)) return InvalidType;
-            std::vector<TypeId> params;
-            while (true) {
-                Tok pk = lex_.peek();
-                if (pk.kind == TokKind::RParen) break;
-                if (!params.empty()) (void)expect(TokKind::Comma);
-                params.push_back(parseType());
-            }
-            (void)expect(TokKind::RParen);
-            (void)expect(TokKind::Arrow);
-            TypeId const ret = parseType();
-            CallConv cc = CallConv::CcSysV;
-            if (peekIdent("cc")) {
-                lex_.take();
-                Tok n = lex_.take();
-                // ⚠ FAIL LOUD, and this arm was SILENT — the same shape as the
-                // block marker below, one tier further down and with a worse
-                // consequence. It read `if (auto c = callConvFromName(n.text);
-                // c.has_value()) cc = *c;` with no `else`, so an unrecognized
-                // calling convention left `cc` at `CcSysV` and the parse
-                // SUCCEEDED. A `.dssir` naming `ms64` or `aapcs64` under any
-                // spelling this table does not carry would come back SysV: an
-                // ABI CHANGE — different argument registers, different stack
-                // discipline — applied silently to a function signature, on a
-                // format whose whole contract is lossless round-trip
-                // (D-MIR-TEXT-UNKNOWN-CALLING-CONVENTION-SILENTLY-DEGRADED-TO-SYSV).
-                if (auto c = kCallConvTable.fromName(n.text); c.has_value()) {
-                    cc = *c;
-                } else {
-                    emitUnknownName(std::format(
-                        "unknown calling convention '{}' — accepted: {}", n.text,
-                        detail::renderAllowedList(allNames(kCallConvTable))));
-                }
-            }
-            return interner_.fnSig(params, ret, cc);
+            if (!expect(TokKind::LParen)) return true;
+            stack.push_back(TypeParseFrame{.kind = TypeParseFrame::Kind::FnParams});
+            return false;   // a (possibly empty) parameter list, then `-> R`
         }
         // D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET: this named nothing at all.
         emitMalformed(std::format("unknown type '{}' — accepted: {}", t.text,
                                   typeKeywordsAccepted()));
-        return InvalidType;
+        return true;
     }
+
+    // ⚠⚠ END OF INPUT INSIDE AN OPERAND LIST IS A REFUSAL, AND BEFORE THIS IT
+    // WAS AN UNBOUNDED LOOP — D-MIR-TEXT-READER-LOOPS-FOREVER-ON-AN-UNTERMINATED-OPERAND-LIST.
+    // The three list arms read "while the next token is not my terminator, take
+    // another operand", and `Lexer::take` at end of input returns `End` WITHOUT
+    // advancing, so a truncated `tuple<i32` never reached its `>`: the arm asked
+    // for another operand, the head refused the `End` token and handed back an
+    // Invalid type, the arm appended it and asked again — forever, growing the
+    // operand vector on every turn. ✔MEASURED through `ctest` against the cycle
+    // base: `***Timeout` at 25 s on that exact input. The recursive form had the
+    // identical shape, so this is NOT a regression of the conversion; it is a
+    // defect the conversion made visible, fixed here rather than filed, on an
+    // input this reader must not trust — a `.dssmir` is truncated by any
+    // interrupted write.
+    [[nodiscard]] bool unterminatedList(TypeParseFrame const& f,
+                                        std::string_view what,
+                                        std::string_view closer, TypeId& out) {
+        if (lex_.peek().kind != TokKind::End) return false;
+        emitMalformed(std::format(
+            "unterminated {} — reached the end of the input with {} operand(s) "
+            "read and no closing {}; the type was NOT recovered", what,
+            f.ops.size(), closer));
+        out = InvalidType;
+        return true;
+    }
+
+    // Continue the top frame. Returns true when the frame REDUCED — `out` then
+    // holds its type and the caller pops it. Otherwise sets `needHead` and the
+    // caller reads the next operand. Each arm is the recursive body's tail
+    // verbatim, including which tokens a failure path does and does not consume,
+    // plus the end-of-input refusal above.
+    [[nodiscard]] bool advanceTypeFrame(TypeParseFrame& f, bool& needHead,
+                                        TypeId& out) {
+        using Kind = TypeParseFrame::Kind;
+        switch (f.kind) {
+            case Kind::Wrapper:
+                if (f.ops.empty()) { needHead = true; return false; }
+                (void)expect(TokKind::RAngle);
+                if (f.name == "ptr")      out = interner_.pointer(f.ops[0]);
+                else if (f.name == "ref")      out = interner_.reference(f.ops[0]);
+                else if (f.name == "nullable") out = interner_.nullable(f.ops[0]);
+                else if (f.name == "optional") out = interner_.optional(f.ops[0]);
+                else if (f.name == "slice")    out = interner_.slice(f.ops[0]);
+                else                           out = interner_.complex(f.ops[0]);
+                return true;
+            case Kind::Array: {
+                if (f.ops.empty()) { needHead = true; return false; }
+                (void)expect(TokKind::Comma);
+                Tok len = lex_.take();
+                if (len.kind != TokKind::Integer) {
+                    // ⚠ The recursive form returned HERE, without consuming the
+                    // closing `>`. Preserved: a different token appetite is a
+                    // different diagnostic for the text that follows.
+                    emitMalformed("expected array length integer");
+                    out = InvalidType;
+                    return true;
+                }
+                std::int64_t lv = parseNumber<std::int64_t>(len.text, "array length");
+                (void)expect(TokKind::RAngle);
+                out = interner_.array(f.ops[0], lv);
+                return true;
+            }
+            case Kind::Tuple:
+                if (unterminatedList(f, "tuple<…>", "'>'", out)) return true;
+                if (lex_.peek().kind != TokKind::RAngle) {
+                    if (!f.ops.empty()) (void)expect(TokKind::Comma);
+                    needHead = true;
+                    return false;
+                }
+                (void)expect(TokKind::RAngle);
+                out = interner_.tuple(f.ops);
+                return true;
+            case Kind::Composite:
+                if (unterminatedList(f, f.isStruct ? "struct \"…\" {…}"
+                                                   : "union \"…\" {…}",
+                                     "'}'", out)) {
+                    return true;
+                }
+                if (lex_.peek().kind != TokKind::RBrace) {
+                    if (!f.ops.empty()) (void)expect(TokKind::Comma);
+                    needHead = true;
+                    return false;
+                }
+                (void)expect(TokKind::RBrace);
+                out = f.isStruct ? interner_.structType(f.name, f.ops)
+                                 : interner_.unionType(f.name, f.ops);
+                return true;
+            case Kind::FnParams:
+                if (unterminatedList(f, "fn(…)", "')'", out)) return true;
+                if (lex_.peek().kind != TokKind::RParen) {
+                    if (!f.ops.empty()) (void)expect(TokKind::Comma);
+                    needHead = true;
+                    return false;
+                }
+                (void)expect(TokKind::RParen);
+                (void)expect(TokKind::Arrow);
+                // The parameters are collected; the RETURN type is the next
+                // operand and lands at the back of the same `ops`.
+                f.paramCount = static_cast<std::uint32_t>(f.ops.size());
+                f.kind       = Kind::FnReturn;
+                needHead     = true;
+                return false;
+            case Kind::FnReturn: {
+                std::span<TypeId const> const params{
+                    f.ops.data(), static_cast<std::size_t>(f.paramCount)};
+                TypeId const ret = f.ops.back();
+                CallConv cc = CallConv::CcSysV;
+                if (peekIdent("cc")) {
+                    lex_.take();
+                    Tok n = lex_.take();
+                    // ⚠ FAIL LOUD, and this arm was SILENT — the same shape as the
+                    // block marker below, one tier further down and with a worse
+                    // consequence. It read `if (auto c = callConvFromName(n.text);
+                    // c.has_value()) cc = *c;` with no `else`, so an unrecognized
+                    // calling convention left `cc` at `CcSysV` and the parse
+                    // SUCCEEDED. A `.dssir` naming `ms64` or `aapcs64` under any
+                    // spelling this table does not carry would come back SysV: an
+                    // ABI CHANGE — different argument registers, different stack
+                    // discipline — applied silently to a function signature, on a
+                    // format whose whole contract is lossless round-trip
+                    // (D-MIR-TEXT-UNKNOWN-CALLING-CONVENTION-SILENTLY-DEGRADED-TO-SYSV).
+                    if (auto c = kCallConvTable.fromName(n.text); c.has_value()) {
+                        cc = *c;
+                    } else {
+                        emitUnknownName(std::format(
+                            "unknown calling convention '{}' — accepted: {}", n.text,
+                            detail::renderAllowedList(allNames(kCallConvTable))));
+                    }
+                }
+                out = interner_.fnSig(params, ret, cc);
+                return true;
+            }
+        }
+        out = InvalidType;
+        return true;
+    }
+
+    // ── THE LITERAL READER, ON THE SAME EXPLICIT STACK ──────────────────────
+    //
+    // The `agg` arm is `parseLiteral`'s ONLY self-call, and its depth is the
+    // brace nesting of an UNTRUSTED `.dssmir` initializer — the exact twin of
+    // the writer's `appendLiteral`, converted in P55. One frame per open
+    // aggregate; nothing here calls itself.
+    // (D-MIR-TEXT-READER-PARSETYPE-AND-PARSELITERAL-RECURSE-PER-LEVEL-UNCAPPED)
+    struct LiteralParseFrame {
+        MirAggregateValue agg;
+    };
 
     // Parse `lit <variant-tag> <value> : <type-core>`.
     [[nodiscard]] MirLiteralValue parseLiteral() {
+        std::vector<LiteralParseFrame> stack;
+        MirLiteralValue done;
+        bool needHead   = true;
+        bool haveResult = false;
+
+        for (;;) {
+            if (needHead) {
+                needHead   = false;
+                haveResult = parseLiteralHead(stack, done);
+            }
+            if (stack.empty()) return done;
+            if (haveResult) {
+                stack.back().agg.fields.push_back(std::move(done));
+                done       = MirLiteralValue{};
+                haveResult = false;
+            }
+            // ⚠ The same end-of-input refusal the type reader's list arms carry:
+            // without it a truncated `lit agg { lit int 1 : i64` asks for another
+            // field forever (see `unterminatedList`).
+            if (lex_.peek().kind == TokKind::End) {
+                emitMalformed(std::format(
+                    "unterminated lit agg {{…}} — reached the end of the input "
+                    "with {} field(s) read and no closing '}}'; the literal was "
+                    "NOT recovered", stack.back().agg.fields.size()));
+                stack.pop_back();
+                done       = MirLiteralValue{};
+                haveResult = true;
+                continue;
+            }
+            if (lex_.peek().kind != TokKind::RBrace) {
+                if (!stack.back().agg.fields.empty()) (void)expect(TokKind::Comma);
+                needHead = true;
+                continue;
+            }
+            (void)expect(TokKind::RBrace);
+            MirLiteralValue lv;
+            lv.value = std::move(stack.back().agg);
+            stack.pop_back();
+            // The `: <core>` tail belongs to the aggregate literal itself and
+            // runs AFTER its closing brace, exactly as the recursive form did.
+            parseLiteralCoreTail(lv);
+            done       = std::move(lv);
+            haveResult = true;
+        }
+    }
+
+    // Read ONE literal head. Returns true when `out` holds a COMPLETE literal
+    // (every scalar arm, and every refusal); false when an `agg` frame was
+    // pushed and its fields are still to come.
+    [[nodiscard]] bool parseLiteralHead(std::vector<LiteralParseFrame>& stack,
+                                        MirLiteralValue& out) {
         MirLiteralValue lv;
-        if (!expectIdent("lit")) return lv;
+        out = MirLiteralValue{};
+        // ⚠ THE TWO REFUSALS BELOW RETURN WITHOUT THE `: <core>` TAIL, and the
+        // recursive form did the same — preserved so the token appetite of a
+        // malformed literal is unchanged.
+        if (!expectIdent("lit")) { out = std::move(lv); return true; }
         Tok tag = lex_.take();
         if (tag.kind != TokKind::Ident) {
-            emitMalformed("expected literal variant tag"); return lv;
+            emitMalformed("expected literal variant tag");
+            out = std::move(lv);
+            return true;
         }
         if (tag.text == "bool") {
             // ⚠ FAIL LOUD. This read `lv.value = (v.text == "true");`, so EVERY
@@ -1779,16 +2199,11 @@ private:
             Tok v = lex_.take();
             lv.value = v.text;
         } else if (tag.text == "agg") {
-            if (!expect(TokKind::LBrace)) return lv;
-            MirAggregateValue agg;
-            while (true) {
-                Tok pk = lex_.peek();
-                if (pk.kind == TokKind::RBrace) break;
-                if (!agg.fields.empty()) (void)expect(TokKind::Comma);
-                agg.fields.push_back(parseLiteral());
-            }
-            (void)expect(TokKind::RBrace);
-            lv.value = std::move(agg);
+            // ⚠ Same token appetite as the recursive form: a missing `{` returns
+            // the default literal and does NOT consume the `: <core>` tail.
+            if (!expect(TokKind::LBrace)) { out = std::move(lv); return true; }
+            stack.push_back(LiteralParseFrame{});
+            return false;   // a (possibly empty) field list comes next
         } else if (tag.text == "bitint") {
             // C4b: the inverse of `appendLiteral`'s `bitint` arm, and the SAME
             // spelling `hir_text.cpp`'s `parseLiteralValue` reads —
@@ -1816,6 +2231,15 @@ private:
         } else {
             emitMalformed(std::format("unknown literal tag '{}'", tag.text));
         }
+        parseLiteralCoreTail(lv);
+        out = std::move(lv);
+        return true;
+    }
+
+    // The shared `: <core>` tail. Every arm that produces a literal runs it —
+    // including the unknown-tag arm, which fell through to it in the recursive
+    // form and still does.
+    void parseLiteralCoreTail(MirLiteralValue& lv) {
         (void)expect(TokKind::Colon);
         // ⚠ THE LADDER HAD NO FINAL ARM. An unrecognized core spelling left
         // `lv.core` at `Void` and the parse SUCCEEDED — and the WRITER reaches this
@@ -1832,7 +2256,6 @@ private:
                 "unknown literal core type '{}' — accepted: {}",
                 coreT.text, literalCoreAccepted()));
         }
-        return lv;
     }
 
     // NOTE the `.dssmir` text format does not carry the per-global FLAG CLASS

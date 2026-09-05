@@ -23,10 +23,22 @@ Exit codes: 0 OK - 2 not a repository / git refused - 3 MAX_PATH would be breach
 param(
     [Parameter(Position = 0)][string]$Verb,
     [Parameter(Position = 1)][string]$Name,
-    [Parameter(Position = 2)][string]$Committish = 'HEAD'
+    [Parameter(Position = 2)][string]$Committish = 'HEAD',
+    # The tree to act on. DEFAULTS to the tree this script lives in -- never the
+    # caller's cwd. See `Get-RepoRoot` for the row and the measurement.
+    [string]$Repo
 )
 
 Set-StrictMode -Version Latest
+
+# ★★ THE `.ps1` OWNER OF "WHICH TREE CONTAINS THIS PATH?", REUSED RATHER THAN RESPELT.
+# ⓘ `repo-tree.ps1` guards its own dispatch on `$MyInvocation.InvocationName -ne '.'`,
+# so dot-sourcing defines and does nothing else. It also sets
+# `$ErrorActionPreference = 'Stop'` in this scope; that is harmless for the `git`
+# calls below because `$PSNativeCommandUseErrorActionPreference` is False (✔MEASURED
+# 2026-09-02, pwsh 7.5.2), so a native command's stderr still does not throw and the
+# `$LASTEXITCODE` checks in this file keep their meaning.
+. (Join-Path $PSScriptRoot '..\repo-tree\repo-tree.ps1')
 
 $MAX_PATH = 260
 # The longest build-relative suffix a worktree is expected to generate. MEASURED
@@ -43,12 +55,36 @@ function Die  {
     exit $Code
 }
 
+# ★★★ WHICH TREE THIS VERB IS ABOUT, AND THE ANSWER IS NOT "WHERE AM I STANDING".
+# [[D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED]]
+#
+# This was a bare `git rev-parse --show-toplevel`, which answers "what repository is
+# my CALLER'S SHELL in?" -- so every path built from it was rooted at whichever
+# repository somebody happened to have cd'd into. ✔MEASURED 2026-09-02, driving this
+# file out of `.worktrees/lw` from a throwaway repository outside the checkout:
+# `list` reported the THROWAWAY repository's `.worktrees/`.
+#
+# ★ THE QUESTION IS "WHICH TREE DOES MY OWN FILE BELONG TO?" -- `$PSCommandPath`, not
+# `$PWD`. The full reasoning, including the MAIN-CHECKOUT answer that was measured and
+# REJECTED because from a lane it resolves `remove <sibling>` onto a live sibling
+# lane's uncommitted work, is in `lane-worktree.sh`'s `_repo_root`; the two halves of
+# this owner must keep the same answer, so it is stated once there and cited here.
+# `-Repo <path>` is the explicit way to mean another tree.
 function Get-RepoRoot {
-    $root = (git rev-parse --show-toplevel 2>$null)
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($root)) {
-        Die 2 @('not inside a git repository -- cannot place a lane worktree.')
+    $anchor = if (-not [string]::IsNullOrWhiteSpace($Repo)) { $Repo } else { $PSCommandPath }
+    try {
+        return (Get-RepoTreeOwningRoot $anchor)
+    } catch {
+        if (-not [string]::IsNullOrWhiteSpace($Repo)) {
+            Die 2 @("--repo '$Repo' is not inside a git working tree: $($_.Exception.Message)")
+        }
+        Die 2 @(
+            'not inside a git repository -- cannot place a lane worktree.',
+            "This script resolves the tree IT LIVES IN ($PSCommandPath), never the caller's",
+            'cwd; pass -Repo <path> to name a different tree deliberately.',
+            $_.Exception.Message
+        )
     }
-    return $root.Trim()
 }
 
 # `.worktrees/` must be IGNORED, and it is CHECKED rather than assumed: that one
@@ -160,5 +196,9 @@ switch ($Verb) {
     'add'    { Invoke-Add }
     'remove' { Invoke-Remove }
     'list'   { Invoke-List }
-    default  { Die 5 @('usage: lane-worktree.ps1 {add <name> [committish] | remove <name> | list}') }
+    default  { Die 5 @(
+        'usage: lane-worktree.ps1 [-Repo <path>] {add <name> [committish] | remove <name> | list}',
+        '',
+        'The tree acted on defaults to the one THIS SCRIPT LIVES IN, never the',
+        "caller's cwd. -Repo <path> names another tree deliberately.") }
 }

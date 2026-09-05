@@ -393,10 +393,33 @@ template <typename Names>
     };
     if (eqi(s, "inf") || eqi(s, "+inf")) return std::numeric_limits<double>::infinity();
     if (eqi(s, "-inf")) return -std::numeric_limits<double>::infinity();
-    // A finite float literal. ns=nullptr → plain decimal / hex-float (strtod);
-    // `ok` is false on a partial parse OR an ERANGE overflow (overflow → infinity
-    // is rejected here — an infinity must be spelled "inf", never reached by an
-    // out-of-range finite literal).
+    // A finite float literal. ns=nullptr → plain decimal / hex-float (strtod).
+    // ⚠ THIS COMMENT SAID `ok` is false on a partial parse OR AN ERANGE OVERFLOW.
+    // The overflow half went false in P54: under
+    // D-C-FLOAT-LITERAL-OVERFLOW-REFUSED-INSTEAD-OF-YIELDING-INFINITY an
+    // overflowing literal now DECODES, with `ok` true, to the correctly-rounded
+    // signed infinity. ★ THE BEHAVIOUR HERE IS UNCHANGED AND STILL CORRECT, but it
+    // is now enforced by a DIFFERENT term of the same condition: `std::isinf(d)`
+    // below, not `!ok`. The rule it enforces is unmoved — in a DESCRIPTOR an
+    // infinity must be spelled "inf" (handled above) and must never be reached by
+    // an out-of-range finite literal, because a descriptor constant has no source
+    // location to diagnose and a silently-infinite bound is unreviewable.
+    //
+    // ★★ AND THAT LAST CLAUSE IS NOW LOAD-BEARING IN A SECOND WAY. P54 lane `fw`
+    // added the source WARNING the sibling row had left unraised —
+    // `S_FloatLiteralOverflowsToInfinity`, raised when a float literal's
+    // correctly-rounded value is an infinity. THIS CALL SITE MUST NEVER RAISE IT,
+    // and cannot, STRUCTURALLY rather than by remembering not to: the diagnostic
+    // is emitted by the SEMANTIC tier from `tree.span(node)` on a CST literal
+    // token, and this function has no Tree, no NodeId and no SourceSpan — its
+    // input is a JSON string from a shipped descriptor, whose "location" is the
+    // JSON pointer text (`…floatConstants[3]`) its caller renders. `decodeFloat`
+    // itself stays a PURE function that raises nothing, so there is no path by
+    // which a descriptor could point a user at a line of their source. What the
+    // descriptor reader does with the same FACT is its own, stricter verdict:
+    // where a source literal gets a warning and its infinity, a descriptor
+    // constant gets a REFUSAL, because a shipped bound is not a program the user
+    // wrote and can fix — it is data they must be able to review.
     bool ok = false;
     double const d = decodeFloat(s, /*ns=*/nullptr, ok);
     if (!ok || std::isinf(d) || std::isnan(d)) return std::nullopt;
@@ -1122,10 +1145,11 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
 // Decode a per-object-format `library` MAP node ({"pe":"msvcrt.dll",
 // "elf":"libc.so.6"}) into `out`. Each KEY must be a known object-format name
 // (the `objectFormatKindFromName` vocabulary — a typo like "pee" fails loud
-// HERE, not at a user's link); each VALUE must be a string. A NON-OBJECT node is
+// HERE, not at a user's link); each VALUE is a string naming an image, or — see
+// below — an object naming a runtime ROLE. A NON-OBJECT node is
 // a SHAPE error → emits + returns false (the caller ABORTS: the descriptor-level
 // map hard-returns nullopt, a per-symbol override skips that symbol). Per-KEY
-// errors (unknown format / non-string value) are collect-all (emitted + skipped;
+// errors (unknown format / malformed value) are collect-all (emitted + skipped;
 // the overall read still fails via the caller's errorCount delta). The SHARED
 // chokepoint for the descriptor-level `library` AND the per-symbol `library`
 // override — so the two validations can NEVER drift (the decodeShippedAvailability
@@ -1133,17 +1157,64 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
 // `if (key == "pe")` identity branch. `ctx` is the caller's already-quoted
 // diagnostic context (e.g. "'p'" for the root, "'p' symbols[3]" for a symbol);
 // `field` is the map's spelling ("library"). (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC)
+//
+// ── THE ROLE FORM (D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE)
+//
+// `{"pe": {"role": "cLibrary"}}` names the image by the runtime ROLE that owns
+// it in the object format's `runtimeLibraries` table, instead of restating the
+// image here. ✔MEASURED before this form existed: 67 of the 69 (descriptor,
+// format) entries in the shipped corpus restated a declared role's image, and a
+// repoint of the `cLibrary` row moved the format's own `exit` import while
+// leaving every descriptor's `puts` on the old image — rc=0 at every stage and a
+// load failure. The literal form STAYS: `libm.so.6` plays no role on elf, and an
+// image that plays no role has no other spelling.
+//
+// The value is EITHER a string (a literal image) OR an object whose one key is
+// `role` — never both, and an object carrying `image` beside `role` is refused
+// BY NAME rather than as "unknown key", because the author meant the other
+// spelling. The role spelling is the closed `RuntimeLibraryRole` vocabulary
+// minus the `none` sentinel; both refusals are format-independent so an arm no
+// current target selects cannot rot.
+//
+// RESOLUTION happens HERE, at decode, and only for the ONE key the caller's
+// `roleResolver` answers for (`formatKindName()`): that entry lands in `out` as
+// the role's image, a plain string, so every consumer of the map — `buildCuMir`'s
+// fold, the assembly binder, the archive-member binder, the semantic injector's
+// per-symbol merge — reads exactly what it read before and none learns a role was
+// involved. Every role entry, answered or not, is recorded as declared in
+// `outRoles`. With a resolver in hand, a role it cannot answer REFUSES: a role no
+// document of the family declares, a role the family REALIZES from a shipped
+// source (there is no image to import from — that is the `realization` map's
+// channel, not this one), or a family that cannot be assembled. With NO resolver
+// (a caller that binds no import — see the header) the entry is recorded and
+// yields nothing, which is the UNBOUND arm an omitted key already states.
 [[nodiscard]] bool decodeLibraryMap(json const& node, std::string const& ctx,
                                     std::string const& field,
                                     DiagnosticReporter& reporter,
-                                    std::unordered_map<std::string, std::string>& out) {
+                                    RuntimeLibraryRoleResolver const* roleResolver,
+                                    std::unordered_map<std::string, std::string>& out,
+                                    std::unordered_map<std::string, RuntimeLibraryRole>& outRoles) {
     if (!node.is_object()) {
         emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
             // The example names the MODERN pe C runtime deliberately: this text is
             // what an author copies, and `msvcrt.dll` is the legacy CRT the UCRT
-            // migration moved off (only `setjmp.json` still names it, on purpose).
+            // migration moved off. ⚠ THE PARENTHETICAL THAT USED TO STAND HERE —
+            // "only `setjmp.json` still names it, on purpose" — was ✔MEASURED
+            // FALSE (P59): ZERO shipped descriptors name `msvcrt.dll`, so the
+            // migration is complete on this side and the sentence described a
+            // configuration that no longer exists. It is replaced rather than
+            // repaired because the fact it recorded is now owned by a test —
+            // `RuntimeLibraryRoles.NoPeFormatNamesTheLegacyCrtInItsRoleTable`
+            // for the role tables, and
+            // `DescriptorLibraryRoleAgreement.EveryImageTheCorpusNamesCarriesAVerdict`
+            // for this corpus, which refuses any pe image with no stated verdict.
+            // A prose census in a diagnostic string is a copy nothing re-derives;
+            // that is exactly how this one went stale unnoticed.
+            // The example shows BOTH spellings: the role form is what an author
+            // should copy for an image that plays a runtime role, the literal is
+            // for one that plays none (`libm.so.6`).
             + "' must be a per-object-format object, e.g. "
-              "{\"pe\":\"ucrtbase.dll\",\"elf\":\"libc.so.6\"}");
+              "{\"pe\":{\"role\":\"cLibrary\"},\"elf\":\"libm.so.6\"}");
         return false;
     }
     for (auto const& kv : node.items()) {
@@ -1165,9 +1236,89 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
                 + std::string{kObjectFormatKindSentinelRejection});
             continue;
         }
+        if (kv.value().is_object()) {
+            json const&        entry = kv.value();
+            std::string const  at    = ctx + " " + field + "." + kv.key();
+            // The two spellings are ALTERNATIVES: an object exists to name a
+            // role, and an `image` beside it is the literal spelling smuggled
+            // into the role one — two owners of one fact inside one entry.
+            if (entry.contains("image")) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                    + " names BOTH a runtime role and an image; an entry is "
+                      "EITHER a string naming the image, OR {\"role\": ...} "
+                      "naming the runtime role whose image the object format's "
+                      "'runtimeLibraries' table owns — never both");
+                continue;
+            }
+            if (!rejectUnknownKeys(reporter, entry, ctx + " " + field + "." + kv.key(),
+                                   {"role"}))
+                continue;
+            if (!entry.contains("role") || !entry.at("role").is_string()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                    + " must declare a string 'role' naming a runtime-library "
+                      "role of the object format's 'runtimeLibraries' table "
+                      "(accepted: "
+                    + allowedList(kSelectableRuntimeLibraryRoleNames) + ")");
+                continue;
+            }
+            auto const roleText = entry.at("role").get<std::string>();
+            auto const role     = runtimeLibraryRoleFromName(roleText);
+            if (!role.has_value()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                    + " names unknown runtime-library role '" + roleText
+                    + "' (accepted: "
+                    + allowedList(kSelectableRuntimeLibraryRoleNames) + ")");
+                continue;
+            }
+            // `none` spells correctly, exactly as the `unknown` object-format
+            // sentinel does above: only an explicit selectability check stops
+            // a role that no table can ever declare.
+            if (!isSelectableRuntimeLibraryRole(*role)) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                    + " names the 'none' sentinel, which no 'runtimeLibraries' "
+                      "table may declare (accepted: "
+                    + allowedList(kSelectableRuntimeLibraryRoleNames) + ")");
+                continue;
+            }
+            outRoles.emplace(kv.key(), *role);
+            if (roleResolver == nullptr || roleResolver->formatKindName() != kv.key())
+                continue;   // declared and recorded; nothing here binds it
+            std::string        refusal;
+            auto const* const  row = roleResolver->rowForRole(*role, refusal);
+            if (!refusal.empty()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                    + " names runtime-library role '" + roleText
+                    + "', which cannot be answered for object-format family '"
+                    + kv.key() + "': " + refusal);
+                continue;
+            }
+            if (row == nullptr) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                    + " names runtime-library role '" + roleText
+                    + "', but no shipped '" + kv.key()
+                    + "' object-format document declares that role — a role that "
+                      "resolves to nothing would leave every symbol of this "
+                      "descriptor bound to no image. Declare the row on the "
+                      "format that needs it, or name the image");
+                continue;
+            }
+            if (row->image.empty()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                    + " names runtime-library role '" + roleText
+                    + "', which object-format family '" + kv.key()
+                    + "' REALIZES from the shipped source '" + row->source
+                    + "' rather than importing from an image; a 'library' entry "
+                      "names an image to IMPORT from, so a body DSS ships belongs "
+                      "under 'realization', never here");
+                continue;
+            }
+            out.emplace(kv.key(), row->image);
+            continue;
+        }
         if (!kv.value().is_string()) {
             emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
-                + "." + kv.key() + "' must be a string");
+                + "." + kv.key() + "' must be a string naming the image, or "
+                  "{\"role\": ...} naming the runtime-library role that owns it");
             continue;
         }
         std::string image = kv.value().get<std::string>();
@@ -1279,9 +1430,13 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
         // logical name, applied to a path: a `..` component or an absolute/rooted
         // spelling would let a descriptor reach an arbitrary file on the host, so
         // both are refused HERE rather than at the filesystem.
-        bool escapes = src.empty();
-        {
-            std::filesystem::path const asPath{src};
+        // ★★ THE PREDICATE MOVED TO `core::shippedConfigRelativePathEscapes`
+        // (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64) when an object format document's
+        // `runtimeLibraries[].source` became a second declarer of a path into
+        // the SAME tree. The reasoning below is PRESERVED here because it is the
+        // measurement that produced the predicate, and the header carries the
+        // rule; what changed is that there is now exactly one implementation.
+        bool const escapes = shippedConfigRelativePathEscapes(src);
             // ★★★ `isRootedPath`, NOT `is_absolute() || has_root_name()` —
             // [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]].
             // This is a CONTAINMENT check, and the pair it used to ask left a
@@ -1300,12 +1455,6 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
             // a plain `/abs/x` on this host, which also answers `is_absolute()`
             // FALSE with no root name. `isRootedPath` closes both, and it is the
             // ONE predicate the rest of the compiler already asks.
-            if (isRootedPath(asPath)
-                || src.find('\\') != std::string::npos)
-                escapes = true;
-            for (auto const& seg : asPath)
-                if (seg == ".." || seg == ".") escapes = true;
-        }
         if (escapes) {
             emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": '" + field
                 + "." + kv.key() + ".source' must be a non-empty path RELATIVE to "
@@ -1344,10 +1493,13 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
 // ── DEFECT ──────────────────────────────────────────────────────────────────
 //
 // MEASURED behaviour before this guard: such a descriptor compiled rc=0, emitted no
-// diagnostic, the macro silently SHADOWED the symbol at preprocess time, and the
-// symbol was STILL eagerly imported (D-FFI-DESCRIPTOR-EAGER-IMPORT) — a wasted
-// import of a name nothing could ever call. Loud at LOAD is the only place this can
-// be caught: by the time a TU is compiled the macro has already won.
+// diagnostic, and the macro silently SHADOWED the symbol at preprocess time, so no
+// spelling could reach the row. ⓘ It also cost a WASTED IMPORT of a name nothing
+// could call — that half went away in P57 with the eager-import law
+// ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]): a row nothing can reference is a row nothing
+// imports. The half this guard exists for is untouched — a platform fact declared
+// and then made unconsultable, decided at PREPROCESS time, where by the time a TU
+// compiles the macro has already won.
 //
 // ★★ …BUT "NOTHING CAN EVER CALL THE SYMBOL" IS ONLY TRUE OF AN **OBJECT-LIKE**
 // MACRO, AND THIS GUARD SHIPPED APPLYING IT TO BOTH FORMS. That is
@@ -1505,8 +1657,9 @@ void checkMacroSymbolShadowing(json const& doc, ShippedLibDescriptor const& out,
         for (auto const& body : bodiesOf(m)) {
             // C 6.10.3p10 + C 7.1.4p2 — a function-like macro is expanded ONLY where
             // its name is followed by `(`, so `&name` and `(name)(x)` reach the
-            // SYMBOL and the eager import is live. Measured identically in gcc and
-            // clang; see this function's header.
+            // SYMBOL — the row stays REACHABLE, and its import is emitted for any
+            // program that writes either. Measured identically in gcc and clang;
+            // see this function's header.
             // D-FFI-MACRO-SHADOWING-GUARD-IGNORES-C-7-1-4-FUNCTION-ADDRESSABILITY
             if (body.functionLike) continue;
             // C 6.10.3.4p2 — a replacement list is not re-scanned for the macro
@@ -1535,8 +1688,8 @@ void checkMacroSymbolShadowing(json const& doc, ShippedLibDescriptor const& out,
                 + "' — an object-like macro is expanded at EVERY occurrence of the "
                   "name, so no spelling reaches the symbol ('&"
                 + name + "' and '(" + name
-                + ")(...)' are eaten too), yet the symbol is still eagerly imported "
-                  "(a dead import in every binary). Three ways out: (a) give the "
+                + ")(...)' are eaten too), so the row declares a binding no call "
+                  "site can ever consult. Three ways out: (a) give the "
                   "macro 'params' if the symbol is meant to stay callable — a "
                   "FUNCTION-LIKE macro expands only before '(', so C 7.1.4p2 keeps "
                   "'&" + name + "' and '(" + name
@@ -2135,7 +2288,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                          DataModel                       dataModel,
                          std::optional<std::string_view> activeTarget,
                          std::optional<ObjectFormatKind> activeFormat,
-                         std::span<NamedTypeBinding const> namedTypes) {
+                         std::span<NamedTypeBinding const> namedTypes,
+                         RuntimeLibraryRoleResolver const* roleResolver) {
     std::size_t const errBefore = reporter.errorCount();
 
     // (0)+(1) Read + parse the file — via the thread-local parse cache (the same
@@ -2208,7 +2362,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // there is nothing left to bind); per-key errors ride the errorCount delta.
         if (!decodeLibraryMap(doc.at("library"),
                               std::string{"'"} + core::genericSpelling(path) + "'",
-                              "library", reporter, out.library))
+                              "library", reporter, roleResolver, out.library,
+                              out.libraryRoles))
             return std::nullopt;
     }
 
@@ -2441,7 +2596,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
 
     // (3.union) UNIONS — the named-member sibling of `structs`, resolved right
     // after typedefs (so a member may spell an earlier typedef by name, e.g.
-    // `ptr<Tcl_Obj>`) and BEFORE symbols/structs (so a later signature or struct
+    // `ptr<Tcl_Obj>`) and BEFORE structs/symbols (so a later signature or struct
     // FIELD may spell a union BY NAME, e.g. `Tcl_HashEntry.key : "Tcl_HashKey"`).
     // Each union interns as `TypeKind::Union` — every member overlaid at OFFSET 0
     // (C 6.7.2.1) — and the semantic phase injects a member field scope +
@@ -2513,6 +2668,424 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                 mergedNamedTypes.push_back(
                     NamedTypeBinding{std::string_view{typedefNameStore.back()}, ust.typeId});
                 out.unions.push_back(std::move(ust));
+            }
+        }
+    }
+
+    // (3.struct) STRUCTS (named-field aggregate types). Each entry interns a
+    // struct type (name + positional field types) the semantic phase injects as a
+    // TAG + a field scope; the layout engine DERIVES the ABI byte offsets from the
+    // field sizes (the descriptor declares names + types, never offsets).
+    //
+    // ★★ THIS RAN AFTER `symbols` UNTIL P56, AND MOVING IT IS WHAT LET A SHIPPED
+    // SIGNATURE BE TYPED OVER ITS OWN API'S STRUCTS AT ALL
+    // ([[D-FFI-DIRENT-API-DECLARED-OVER-VOID-NOT-ITS-OWN-STRUCTS]]). Typedefs
+    // (3.pre) and unions (3.union) were both relocated ahead of `symbols` for
+    // exactly this reason, each in its own cycle; structs were the one named-type
+    // surface still decoded afterwards, so a `signature` had no way to spell one.
+    // ✔MEASURED at the time of the move: across the WHOLE shipped corpus, NOT ONE
+    // symbol signature referenced any struct its own descriptor declared — 13
+    // descriptors declare structs, `readdir`/`fstat`/`stat`/`localtime`/
+    // `getrusage`/`getpwuid` and their siblings were ALL typed over `ptr<void>`,
+    // and the missing ordering is why. Publication is strictly ADDITIVE (the
+    // named-type scan is first-match and these names resolved to NOTHING before),
+    // so no signature, constant or field that already decoded changes meaning.
+    //
+    // A struct entry declares EITHER a flat `fields` (single layout, back-compat)
+    // OR per-target `variants` (plan 25): a list of `{ "when": {arch?,format?},
+    // "fields":[…] }`, the variant matching the active (arch,format) selected so
+    // a struct can carry the correct per-target byte layout. The CRUX
+    // (plan-lock-VERIFIED): x86_64/arm64 AggregateLayoutParams are byte-identical +
+    // computeLayout is param-driven (no arch branch) → the per-target offset delta
+    // comes ENTIRELY from the selected FIELD LIST. The active identity is
+    // (arch = `*activeTarget`, format = `objectFormatKindName(*activeFormat)`); a
+    // variant matches iff EVERY key its `when` specifies equals the active value
+    // (GENERIC string equality — never an `if (arch == "x86_64")` here). >1 match
+    // ⇒ fail loud (F_ShippedStructVariantAmbiguous: an under-specified `when` would
+    // otherwise silently pick the first → a wrong layout). 0 match (variants
+    // present) ⇒ no LAYOUT is injected — never a silent wrong one — while the TAG
+    // is still published INCOMPLETE, so a pointer to it stays well formed and every
+    // use needing a size or a field fails loud (P56; the arm carries the reasoning
+    // and the measurement that refuted the stricter rule it replaced).
+    // EAGER: EVERY variant's field list is decoded regardless
+    // of which is active, so a malformed INACTIVE variant fails the read on EVERY
+    // target (anti-lurking, mirrors `signatureByDataModel`).
+    //
+    // (3.struct.pre) THE BY-NAME DEPENDENCY GATE. The loop below PUBLISHES each
+    // injected struct's tag name into `mergedNamedTypes` (the typedef/union
+    // Option C mirror), so a LATER entry may spell an EARLIER one as a field type
+    // BY NAME — `{"name":"it_interval","type":"timeval"}` — instead of restating
+    // the inner body once per format (the layout-disagreement failure class).
+    // But an earlier entry carrying per-target `variants` is NOT published when
+    // ZERO of them match: `struct timeval` genuinely does not exist on a
+    // pe/unknown-format read, so neither can a struct that embeds one. Skipping
+    // the DEPENDENT — exactly as `matchCount == 0` skips the dependency — is the
+    // honest answer. Letting the EAGER field decode fail instead would take the
+    // WHOLE descriptor down on every target lacking the inner struct (both
+    // all-descriptor sweeps read every shipped file on every format, and the
+    // nullopt direct-API/LSP read selects no variant at all).
+    //
+    // SOURCE-ORDER-EXACT, so fail-loud survives intact: only a name this
+    // descriptor declared BEFORE the referring entry can suppress it. A FORWARD
+    // name (declared later), a SELF reference, and a TYPO (declared nowhere) all
+    // fall through to the ordinary decode, where `parseTypeFromText` reports
+    // `unknown type '<name>'` and `decodeStructFieldList` adds
+    // F_ShippedLibUnsupportedType — two loud diagnostics, never a silent empty
+    // type. Content-blind: a membership test over the descriptor's OWN declared
+    // vocabulary, never an `if (name == "timeval")`.
+    // (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME)
+    auto declaredNamesOf = [&](char const* key) {
+        std::vector<std::string> names;
+        if (doc.contains(key) && doc.at(key).is_array()) {
+            for (auto const& e : doc.at(key)) {
+                if (e.is_object() && e.contains("name") && e.at("name").is_string())
+                    names.push_back(e.at("name").get<std::string>());
+            }
+        }
+        return names;
+    };
+    // Declared before the loop starts: every `typedefs` + `unions` name (both
+    // surfaces decode ABOVE). Struct names join as the loop walks past them.
+    std::vector<std::string> declaredEarlier = declaredNamesOf("typedefs");
+    {
+        auto un = declaredNamesOf("unions");
+        declaredEarlier.insert(declaredEarlier.end(), un.begin(), un.end());
+    }
+    // Tag names published INCOMPLETE by the target-less arm below. They resolve in
+    // a POINTER position (`ptr<dirent>` in a signature) and must NOT satisfy this
+    // gate, because a struct FIELD of an incomplete type has no layout to
+    // contribute — the dependent entry stays unavailable exactly as it was before
+    // the incomplete publication existed.
+    std::vector<std::string> incompletelyPublished;
+    auto publishedByName = [&](std::string const& n) {
+        if (std::find(incompletelyPublished.begin(), incompletelyPublished.end(), n)
+            != incompletelyPublished.end())
+            return false;
+        return std::any_of(mergedNamedTypes.begin(), mergedNamedTypes.end(),
+                           [&](NamedTypeBinding const& nb) { return nb.name == n; });
+    };
+    // Does this entry name an EARLIER-declared type that is NOT published for the
+    // active target? Scans the flat `fields` AND every variant's `fields` — the
+    // eager decode covers them all, so ONE unavailable reference anywhere in the
+    // entry makes the whole entry unavailable here. The test is on the WHOLE
+    // `type` text (the by-name spelling); a compound spelling that merely embeds
+    // an unavailable name (`ptr<timeval>`) is NOT admitted and still fails loud —
+    // the gate accepts only what it can prove.
+    auto referencesUnavailable = [&](json const& sdef) {
+        auto scan = [&](json const& fields) {
+            if (!fields.is_array()) return false;
+            for (auto const& f : fields) {
+                if (!f.is_object() || !f.contains("type") || !f.at("type").is_string())
+                    continue;
+                std::string const t = f.at("type").get<std::string>();
+                if (std::find(declaredEarlier.begin(), declaredEarlier.end(), t)
+                        != declaredEarlier.end()
+                    && !publishedByName(t))
+                    return true;
+            }
+            return false;
+        };
+        if (sdef.contains("fields") && scan(sdef.at("fields"))) return true;
+        if (sdef.contains("variants") && sdef.at("variants").is_array()) {
+            for (auto const& v : sdef.at("variants"))
+                if (v.is_object() && v.contains("fields") && scan(v.at("fields")))
+                    return true;
+        }
+        return false;
+    };
+    if (doc.contains("structs")) {
+        if (!doc.at("structs").is_array()) {
+            emitMalformed(reporter, "shipped-lib descriptor '" + core::genericSpelling(path)
+                                        + "': 'structs' must be an array");
+        } else {
+            std::size_t sidx = 0;
+            for (auto const& sdef : doc.at("structs")) {
+                std::string const at =
+                    "'" + core::genericSpelling(path) + "' structs[" + std::to_string(sidx) + "]";
+                ++sidx;
+                if (!sdef.is_object()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
+                    continue;
+                }
+                (void)rejectUnknownKeys(reporter, sdef,
+                                        "structs[" + std::to_string(sidx - 1) + "]",
+                                        {"name", "fields", "variants"});
+                if (!sdef.contains("name") || !sdef.at("name").is_string()
+                    || sdef.at("name").get<std::string>().empty()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                + ": missing or empty 'name'");
+                    continue;
+                }
+                std::string const sname = sdef.at("name").get<std::string>();
+
+                // (3.struct.pre) THE BY-NAME DEPENDENCY GATE — see the note above the
+                // loop. Evaluated BEFORE `sname` joins `declaredEarlier`, so a
+                // SELF reference is a forward name and still fails loud; recorded
+                // right after, so every entry BELOW may name this one.
+                bool const dependencyUnavailable = referencesUnavailable(sdef);
+                declaredEarlier.push_back(sname);
+                if (dependencyUnavailable) {
+                    // ★★ THE TAG STILL EXISTS; WHAT THIS READ CANNOT STATE IS ITS
+                    // LAYOUT — the SAME answer, for the same reason, as the
+                    // no-variant-matched arm below
+                    // ([[D-FFI-SHIPPED-DESCRIPTORS-DECLARE-STRUCTS-THEIR-OWN-SIGNATURES-DO-NOT-USE]],
+                    // P56 lane sv). There are exactly TWO ways an entry can fail to
+                    // produce a layout on a given read — no variant matched, or a
+                    // by-name dependency is unavailable here — and BOTH are
+                    // statements about the LAYOUT, never about whether the tag is a
+                    // real type. Publishing only in the first case made them
+                    // disagree, and the disagreement was not academic: `struct stat`
+                    // names `timespec` from its macho variant, so on a TARGET-LESS
+                    // read (LSP, the direct API, the AllShippedDescriptorsDecode
+                    // sweep) the tag `stat` was not published AT ALL and
+                    // `fn(i32, ptr<stat>) -> i32` answered `unknown type 'stat'` —
+                    // ✔MEASURED: it took the WHOLE sys/stat.json read down, the
+                    // instant that signature stopped being typed over `ptr<void>`.
+                    //
+                    // Identical discipline to the arm below: published into the
+                    // TYPE-TEXT VOCABULARY ONLY, never into `out.structs`, so every
+                    // read's result object stays byte-identical and nothing
+                    // downstream can see an incomplete type where it saw a complete
+                    // one; and recorded in `incompletelyPublished`, so a FURTHER
+                    // dependent is still skipped rather than silently given a
+                    // fieldless body — a pointer to an incomplete type is legal, a
+                    // MEMBER of one is not, and that is the whole distinction the
+                    // gate exists to keep. No layout is invented in either arm.
+                    //
+                    // ⚠ NOT guarded by `hasVariants` (the other arm is): a FLAT
+                    // entry can never fail to select a variant, but it CAN name an
+                    // unavailable dependency — `itimerval` is flat and its two
+                    // members spell `timeval` — so guarding here would leave exactly
+                    // the flat-by-name case unpublished for no reason.
+                    typedefNameStore.push_back(sname);
+                    mergedNamedTypes.push_back(NamedTypeBinding{
+                        std::string_view{typedefNameStore.back()},
+                        interner.forwardComposite(TypeKind::Struct, sname, 0)});
+                    incompletelyPublished.push_back(sname);
+                    continue;   // dependency unavailable → inject no LAYOUT
+                }
+
+                // Exactly ONE of `fields` (flat, single layout) or `variants`
+                // (per-target). Both, or neither, is a malformed entry — fail loud
+                // (a struct with neither declares no layout; with both is ambiguous
+                // intent).
+                bool const hasFields   = sdef.contains("fields");
+                bool const hasVariants = sdef.contains("variants");
+                if (hasFields == hasVariants) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                + ": a struct must declare EXACTLY one of "
+                                                  "'fields' (single layout) or 'variants' "
+                                                  "(per-target layouts)");
+                    continue;
+                }
+
+                // The SELECTED field list (flat path = `fields`; variant path = the
+                // matching variant's `fields`). `selected` stays false on the
+                // no-variant-matches case → the struct is simply not injected.
+                ShippedStruct sst;
+                sst.name = sname;
+                std::vector<TypeId> fieldTypes;
+                bool selected = false;
+
+                if (hasFields) {
+                    if (!sdef.at("fields").is_array() || sdef.at("fields").empty()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                    + ": 'fields' must be a non-empty array");
+                        continue;
+                    }
+                    if (!decodeStructFieldList(sdef.at("fields"), at, interner, typeReg,
+                                               reporter, sst.fields, fieldTypes,
+                                               mergedNamedTypes)) {
+                        continue;
+                    }
+                    selected = true;
+                } else {
+                    // PER-TARGET VARIANTS. Decode EVERY variant's field list (eager —
+                    // a malformed inactive variant fails the read on every target),
+                    // then select the variant whose `when` matches the active target.
+                    if (!sdef.at("variants").is_array() || sdef.at("variants").empty()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                    + ": 'variants' must be a non-empty array");
+                        continue;
+                    }
+                    std::string const activeFormatName =
+                        activeFormat.has_value()
+                            ? std::string{objectFormatKindName(*activeFormat)}
+                            : std::string{};
+                    bool okVariants = true;
+                    std::size_t matchCount = 0;
+                    std::size_t vidx = 0;
+                    for (auto const& vdef : sdef.at("variants")) {
+                        std::string const vat = at + " variants[" + std::to_string(vidx) + "]";
+                        ++vidx;
+                        if (!vdef.is_object()) {
+                            emitMalformed(reporter, "shipped-lib descriptor " + vat
+                                                        + ": must be an object");
+                            okVariants = false; break;
+                        }
+                        (void)rejectUnknownKeys(reporter, vdef,
+                                                "structs[" + std::to_string(sidx - 1)
+                                                    + "] variants[" + std::to_string(vidx - 1) + "]",
+                                                {"when", "fields"});
+                        // `when` — the match selector. REQUIRED object; keys closed to
+                        // {arch, format}. An EMPTY `when:{}` matches every target
+                        // (always-match) — legal but typically ambiguous if any other
+                        // variant also matches (the ambiguity gate below catches it).
+                        if (!vdef.contains("when") || !vdef.at("when").is_object()) {
+                            emitMalformed(reporter, "shipped-lib descriptor " + vat
+                                                        + ": missing or non-object 'when' "
+                                                          "(e.g. {\"arch\":\"x86_64\",\"format\":\"elf\"})");
+                            okVariants = false; break;
+                        }
+                        // Decode this variant's field list (eager, every variant) —
+                        // BEFORE the match test so a malformed INACTIVE variant still
+                        // fails the read on every target (anti-lurking).
+                        if (!vdef.contains("fields") || !vdef.at("fields").is_array()
+                            || vdef.at("fields").empty()) {
+                            emitMalformed(reporter, "shipped-lib descriptor " + vat
+                                                        + ": 'fields' must be a non-empty array");
+                            okVariants = false; break;
+                        }
+                        std::vector<ShippedField> vFields;
+                        std::vector<TypeId>       vFieldTypes;
+                        if (!decodeStructFieldList(vdef.at("fields"), vat, interner, typeReg,
+                                                   reporter, vFields, vFieldTypes, mergedNamedTypes)) {
+                            okVariants = false; break;
+                        }
+
+                        // Does this variant's `when` MATCH the active target? (the
+                        // SHARED selector — typed surfaces allow {arch,format}.)
+                        WhenMatch const wm = matchVariantWhen(
+                            vdef.at("when"), WhenAxes::FullTarget, vat + ".when",
+                            activeTarget, activeFormat, activeFormatName,
+                            activeDataModelName, reporter);
+                        if (wm == WhenMatch::Error) { okVariants = false; break; }
+                        if (wm == WhenMatch::Match) {
+                            ++matchCount;
+                            if (matchCount == 1) {
+                                // First match — take its fields (and keep scanning so a
+                                // second match is detected → ambiguity fail-loud).
+                                sst.fields = std::move(vFields);
+                                fieldTypes = std::move(vFieldTypes);
+                            }
+                        }
+                    }
+                    if (!okVariants) continue;
+                    if (matchCount > 1) {
+                        // >1 variant matched the active target — a silent
+                        // wrong-layout risk (which would be picked?). Fail loud.
+                        dss::report(reporter, DiagnosticCode::F_ShippedStructVariantAmbiguous,
+                                    DiagnosticSeverity::Error,
+                                    "shipped-lib descriptor " + at + ": struct '" + sname
+                                        + "' has " + std::to_string(matchCount)
+                                        + " 'variants' matching the active target (arch='"
+                                        + (activeTarget.has_value() ? std::string{*activeTarget}
+                                                                    : std::string{"<none>"})
+                                        + "', format='"
+                                        + (activeFormat.has_value() ? activeFormatName
+                                                                    : std::string{"<none>"})
+                                        + "') — exactly one variant may match (refusing an "
+                                          "ambiguous per-target layout)");
+                        continue;
+                    }
+                    // matchCount 0 ⇒ no variant for this target ⇒ no LAYOUT is
+                    // injected (never a silent wrong one); the tag itself is still
+                    // published, INCOMPLETE, by the arm below. matchCount 1 ⇒ select
+                    // it.
+                    selected = (matchCount == 1);
+                }
+
+                if (!selected) {
+                    // ★★ NO VARIANT MATCHED — AND "PUBLISH NOTHING AT ALL" IS NOT
+                    // THE HONEST ANSWER
+                    // ([[D-FFI-DIRENT-API-DECLARED-OVER-VOID-NOT-ITS-OWN-STRUCTS]]).
+                    // The tag still EXISTS; what this read cannot state is its
+                    // LAYOUT, which is a per-target fact. Publishing the tag
+                    // INCOMPLETE says exactly that and invents nothing — it is what
+                    // a C header itself says before it knows — so `ptr<dirent>` in a
+                    // signature stays a well-formed pointer type while every use
+                    // that needs a SIZE or a FIELD still fails loud. A wrong layout
+                    // remains impossible: none is published.
+                    //
+                    // ⚠⚠ THE NARROWER RULE THIS REPLACES WAS WRONG, AND THE GATE
+                    // SAID SO ON TWO LEGS AT ONCE. It published only when BOTH
+                    // selectors were absent, on the argument that a read which NAMES
+                    // a target and finds no variant is a genuine per-target absence
+                    // that ought to fail loud. ✔MEASURED, that argument is refuted:
+                    // `ShippedTypeConsistency.EveryDescriptorAgreesOnEveryTagAndTypedefPerTarget`
+                    // reads EVERY descriptor on EVERY declared (format, arch), and on
+                    // `wasm32-v1` and `spirv-1.6` — formats where `<dirent.h>` does
+                    // not exist at all, and where its `availableObjectFormats` already
+                    // says so — the reference then failed to decode and took the WHOLE
+                    // descriptor read down with it. A header having no layout on a
+                    // target it does not serve is not a defect to report; it is the
+                    // ordinary case.
+                    //
+                    // ⚠ PUBLISHED INTO THE TYPE-TEXT VOCABULARY ONLY, NEVER INTO
+                    // `out.structs`. The result object is byte-identical to before on
+                    // every read, so nothing downstream (semantic tag injection, the
+                    // cross-descriptor consistency check) can see an incomplete type
+                    // where it used to see a complete one — or nothing at all.
+                    //
+                    // The name is ALSO recorded in `incompletelyPublished` so the
+                    // by-name dependency gate above keeps treating it as UNAVAILABLE
+                    // for a struct FIELD: a pointer to an incomplete type is legal, a
+                    // MEMBER of one is not, and the gate is what stops the second.
+                    if (hasVariants) {
+                        typedefNameStore.push_back(sname);
+                        mergedNamedTypes.push_back(NamedTypeBinding{
+                            std::string_view{typedefNameStore.back()},
+                            interner.forwardComposite(TypeKind::Struct, sname, 0)});
+                        incompletelyPublished.push_back(sname);
+                    }
+                    continue;   // no variant matched → inject no LAYOUT
+                }
+                // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): if the SELECTED field list
+                // carries explicit offsets, intern the struct WITH them (an
+                // overlapping FFI layout). ALL-or-NONE within the struct; a mix is
+                // malformed. The offsets enter the content identity so this tag type
+                // matches the bare typedef's inline `struct "X" { T @off }` (same
+                // TypeId → the injected field scope resolves .member on a bare-typedef
+                // value). Empty → the ordinary natural-alignment struct (unchanged).
+                std::size_t withOffset = 0;
+                for (auto const& fld : sst.fields)
+                    if (fld.offset.has_value()) ++withOffset;
+                if (withOffset != 0 && withOffset != sst.fields.size()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                + ": struct field 'offset' must be "
+                                                  "all-or-none (an overlapping layout "
+                                                  "declares every field's offset)");
+                    continue;
+                }
+                if (withOffset == sst.fields.size() && !sst.fields.empty()) {
+                    std::vector<std::uint64_t> offsets;
+                    offsets.reserve(sst.fields.size());
+                    for (auto const& fld : sst.fields) offsets.push_back(*fld.offset);
+                    std::span<std::int64_t const> const noWidths{};
+                    sst.typeId = interner.structType(sname, fieldTypes, noWidths, offsets);
+                } else {
+                    sst.typeId = interner.structType(sname, fieldTypes);
+                }
+                // Option C: publish this struct's TAG name so a LATER surface —
+                // above all another struct's FIELD — can spell it BY NAME
+                // (`{"name":"it_value","type":"timeval"}`), which is what keeps an
+                // inner struct's per-format widths in ONE place instead of being
+                // restated inside every outer struct. Byte-identical to the
+                // typedef/union publications (address-stable `typedefNameStore`
+                // backing). ⚠ A SELECTED entry publishes its COMPLETE type here; an
+                // UNSELECTED one is published INCOMPLETE by the no-variant arm above
+                // and recorded in `incompletelyPublished`, which is what keeps it
+                // usable through a pointer and unusable as a FIELD (P56 — before
+                // that an unselected struct was unnameable entirely, and a signature
+                // naming it took the whole descriptor read down). Publication is
+                // strictly ADDITIVE: the scan is first-match and these names
+                // resolved to nothing before, so no name that already resolved
+                // changes meaning.
+                // (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME)
+                typedefNameStore.push_back(sname);
+                mergedNamedTypes.push_back(
+                    NamedTypeBinding{std::string_view{typedefNameStore.back()}, sst.typeId});
+                out.structs.push_back(std::move(sst));
             }
         }
     }
@@ -2717,9 +3290,11 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // (unknown format key / non-string value fail loud); a non-object node skips
         // this symbol (the symbol-loop collect-all pattern). AGNOSTIC: a generic
         // per-format map, no name/arch/format identity branch.
-        std::unordered_map<std::string, std::string> symLibrary;
+        std::unordered_map<std::string, std::string>       symLibrary;
+        std::unordered_map<std::string, RuntimeLibraryRole> symLibraryRoles;
         if (sym.contains("library")
-            && !decodeLibraryMap(sym.at("library"), at, "library", reporter, symLibrary))
+            && !decodeLibraryMap(sym.at("library"), at, "library", reporter,
+                                 roleResolver, symLibrary, symLibraryRoles))
             continue;
 
         // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the per-SYMBOL `realization`
@@ -2847,7 +3422,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                           kind, linkage, std::move(symAvail),
                           noreturn, returnsTwice, std::move(synthesize),
                           std::move(version), std::move(linkName),
-                          std::move(symLibrary), std::move(symRealization)});
+                          std::move(symLibrary), std::move(symRealization),
+                          std::move(symLibraryRoles)});
     }
 
     // ══ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF — R1 + R3, AT LOAD ==========
@@ -2858,28 +3434,64 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // format — 39 of the 40 descriptors declare no `realization` at all and pay
     // literally nothing.
     {
-        auto effective = [&](std::unordered_map<std::string, std::string> const& base,
-                             std::unordered_map<std::string, std::string> const& ov) {
+        // Generic over the mapped type: the `library` map holds images and the
+        // `libraryRoles` map holds roles, and BOTH are overridden per symbol by
+        // the same base-then-override rule.
+        auto effective = [](auto const& base, auto const& ov) {
             auto m = base;
             for (auto const& [k, v] : ov) m.insert_or_assign(k, v);
             return m;
         };
+        // ★★★ THE IMPORT R3 IS ABOUT IS DECLARED IN EITHER SPELLING, AND READING
+        // THE RESOLVED IMAGE MAP ALONE NARROWS THE RULE FROM FORMAT-INDEPENDENT
+        // TO RESOLVER-DEPENDENT
+        // (D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE).
+        // A role entry lands in `library` ONLY when a resolver answered for that
+        // exact object-format kind, so keying R3 on `library` alone would mean:
+        // with NO resolver (the LSP, the header parser, the corpus sweeps, every
+        // direct-API caller) R3 could never fire on a role entry at all, and WITH
+        // one it would fire only for the kind that build happens to select. A
+        // descriptor gaining `"library": {"macho": {"role": "cLibrary"}}` beside
+        // `"realization": {"macho": {"source": …}}` would then read clean on
+        // every pe and elf build and be caught only by a macOS one — while the
+        // uncaught state is precisely the one this rule exists to refuse. The
+        // union is the rule: a role entry is an import DECLARATION whether or not
+        // this particular read resolved it.
+        auto declaredImport =
+            [](std::unordered_map<std::string, std::string> const& lib,
+               std::unordered_map<std::string, RuntimeLibraryRole> const& roles,
+               std::string const& fmt) -> std::string {
+                if (auto const roleIt = roles.find(fmt); roleIt != roles.end()) {
+                    std::string spelling =
+                        "'library." + fmt + "' = {\"role\": \""
+                        + std::string{runtimeLibraryRoleName(roleIt->second)} + "\"}";
+                    // The resolved image when this read had a resolver — the
+                    // author's spelling first, the consequence second.
+                    if (auto const libIt = lib.find(fmt); libIt != lib.end())
+                        spelling += ", the image '" + libIt->second + "'";
+                    return spelling;
+                }
+                if (auto const libIt = lib.find(fmt); libIt != lib.end())
+                    return "'library." + fmt + "' = '" + libIt->second + "'";
+                return {};
+            };
         auto checkOwner =
             [&](std::unordered_map<std::string, std::string> const& lib,
+                std::unordered_map<std::string, RuntimeLibraryRole> const& roles,
                 std::unordered_map<std::string, std::string> const& real,
                 std::string const& ctx) {
                 for (auto const& [fmt, src] : real) {
-                    // R3 — an IMAGE and a SOURCE for one format. Two owners for one
+                    // R3 — an IMPORT and a SOURCE for one format. Two owners for one
                     // body is the defect, not a fallback: silently preferring
                     // either is how a program links against an image that does not
                     // export the symbol and then dies at LOAD, with no diagnostic
                     // at any compile stage.
-                    if (auto const libIt = lib.find(fmt); libIt != lib.end()) {
+                    if (std::string const declared = declaredImport(lib, roles, fmt);
+                        !declared.empty()) {
                         emitMalformed(reporter,
                             "shipped-lib descriptor '" + core::genericSpelling(path) + "' "
-                            + ctx + " declares BOTH an import ('library." + fmt
-                            + "' = '" + libIt->second
-                            + "') AND a shipped-source realization ('realization."
+                            + ctx + " declares BOTH an import (" + declared
+                            + ") AND a shipped-source realization ('realization."
                             + fmt + ".source' = '" + src + "') for the object format '"
                             + fmt + "' — two owners for one body "
                             "(D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R3)");
@@ -2901,11 +3513,12 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     }
                 }
             };
-        checkOwner(out.library, out.realization, "(root)");
+        checkOwner(out.library, out.libraryRoles, out.realization, "(root)");
         for (std::size_t i = 0; i < out.symbols.size(); ++i) {
             auto const& sym = out.symbols[i];
             if (sym.realization.empty() && out.realization.empty()) continue;
             checkOwner(effective(out.library, sym.library),
+                       effective(out.libraryRoles, sym.libraryRoles),
                        effective(out.realization, sym.realization),
                        "symbols[" + std::to_string(i) + "] ('" + sym.name + "')");
         }
@@ -3006,315 +3619,14 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         }
     }
 
-    // (6) `typedefs` — resolved EARLY, BEFORE symbols/constants/structs (see the
-    // Option C block just before the `symbols` loop above,
-    // D-FFI-DESCRIPTOR-TYPEDEF-NAME-RESOLUTION). Relocated so each typedef's
-    // `name -> TypeId` is threaded into `mergedNamedTypes` and can be spelled BY
-    // NAME (`ptr<Tcl_Obj>`) by every later `parseTypeFromText` call, instead of
-    // re-inlining the full `struct "Tcl_Obj" {…}` body at ~45 sites.
+    // (6) `typedefs` — resolved EARLY, at (3.pre), BEFORE structs/symbols/
+    // constants (D-FFI-DESCRIPTOR-TYPEDEF-NAME-RESOLUTION). Relocated so each
+    // typedef's `name -> TypeId` is threaded into `mergedNamedTypes` and can be
+    // spelled BY NAME (`ptr<Tcl_Obj>`) by every later `parseTypeFromText` call,
+    // instead of re-inlining the full `struct "Tcl_Obj" {…}` body at ~45 sites.
+    // The STRUCT surface joined it ahead of `symbols` in P56, at (3.struct); all
+    // three named-type surfaces now publish before anything that can name them.
 
-    // (6.5) STRUCTS (named-field aggregate types). Each entry interns a struct
-    // type (name + positional field types) the semantic phase injects as a TAG +
-    // a field scope; the layout engine DERIVES the ABI byte offsets from the
-    // field sizes (the descriptor declares names + types, never offsets).
-    //
-    // A struct entry declares EITHER a flat `fields` (single layout, back-compat)
-    // OR per-target `variants` (plan 25): a list of `{ "when": {arch?,format?},
-    // "fields":[…] }`, the variant matching the active (arch,format) selected so
-    // a struct can carry the correct per-target byte layout. The CRUX
-    // (plan-lock-VERIFIED): x86_64/arm64 AggregateLayoutParams are byte-identical +
-    // computeLayout is param-driven (no arch branch) → the per-target offset delta
-    // comes ENTIRELY from the selected FIELD LIST. The active identity is
-    // (arch = `*activeTarget`, format = `objectFormatKindName(*activeFormat)`); a
-    // variant matches iff EVERY key its `when` specifies equals the active value
-    // (GENERIC string equality — never an `if (arch == "x86_64")` here). >1 match
-    // ⇒ fail loud (F_ShippedStructVariantAmbiguous: an under-specified `when` would
-    // otherwise silently pick the first → a wrong layout). 0 match (variants
-    // present) ⇒ NOT injected (a reference fails loud as an undefined type, never a
-    // silent wrong layout). EAGER: EVERY variant's field list is decoded regardless
-    // of which is active, so a malformed INACTIVE variant fails the read on EVERY
-    // target (anti-lurking, mirrors `signatureByDataModel`).
-    //
-    // (6.5.pre) THE BY-NAME DEPENDENCY GATE. The loop below PUBLISHES each
-    // injected struct's tag name into `mergedNamedTypes` (the typedef/union
-    // Option C mirror), so a LATER entry may spell an EARLIER one as a field type
-    // BY NAME — `{"name":"it_interval","type":"timeval"}` — instead of restating
-    // the inner body once per format (the layout-disagreement failure class).
-    // But an earlier entry carrying per-target `variants` is NOT published when
-    // ZERO of them match: `struct timeval` genuinely does not exist on a
-    // pe/unknown-format read, so neither can a struct that embeds one. Skipping
-    // the DEPENDENT — exactly as `matchCount == 0` skips the dependency — is the
-    // honest answer. Letting the EAGER field decode fail instead would take the
-    // WHOLE descriptor down on every target lacking the inner struct (both
-    // all-descriptor sweeps read every shipped file on every format, and the
-    // nullopt direct-API/LSP read selects no variant at all).
-    //
-    // SOURCE-ORDER-EXACT, so fail-loud survives intact: only a name this
-    // descriptor declared BEFORE the referring entry can suppress it. A FORWARD
-    // name (declared later), a SELF reference, and a TYPO (declared nowhere) all
-    // fall through to the ordinary decode, where `parseTypeFromText` reports
-    // `unknown type '<name>'` and `decodeStructFieldList` adds
-    // F_ShippedLibUnsupportedType — two loud diagnostics, never a silent empty
-    // type. Content-blind: a membership test over the descriptor's OWN declared
-    // vocabulary, never an `if (name == "timeval")`.
-    // (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME)
-    auto declaredNamesOf = [&](char const* key) {
-        std::vector<std::string> names;
-        if (doc.contains(key) && doc.at(key).is_array()) {
-            for (auto const& e : doc.at(key)) {
-                if (e.is_object() && e.contains("name") && e.at("name").is_string())
-                    names.push_back(e.at("name").get<std::string>());
-            }
-        }
-        return names;
-    };
-    // Declared before the loop starts: every `typedefs` + `unions` name (both
-    // surfaces decode ABOVE). Struct names join as the loop walks past them.
-    std::vector<std::string> declaredEarlier = declaredNamesOf("typedefs");
-    {
-        auto un = declaredNamesOf("unions");
-        declaredEarlier.insert(declaredEarlier.end(), un.begin(), un.end());
-    }
-    auto publishedByName = [&](std::string const& n) {
-        return std::any_of(mergedNamedTypes.begin(), mergedNamedTypes.end(),
-                           [&](NamedTypeBinding const& nb) { return nb.name == n; });
-    };
-    // Does this entry name an EARLIER-declared type that is NOT published for the
-    // active target? Scans the flat `fields` AND every variant's `fields` — the
-    // eager decode covers them all, so ONE unavailable reference anywhere in the
-    // entry makes the whole entry unavailable here. The test is on the WHOLE
-    // `type` text (the by-name spelling); a compound spelling that merely embeds
-    // an unavailable name (`ptr<timeval>`) is NOT admitted and still fails loud —
-    // the gate accepts only what it can prove.
-    auto referencesUnavailable = [&](json const& sdef) {
-        auto scan = [&](json const& fields) {
-            if (!fields.is_array()) return false;
-            for (auto const& f : fields) {
-                if (!f.is_object() || !f.contains("type") || !f.at("type").is_string())
-                    continue;
-                std::string const t = f.at("type").get<std::string>();
-                if (std::find(declaredEarlier.begin(), declaredEarlier.end(), t)
-                        != declaredEarlier.end()
-                    && !publishedByName(t))
-                    return true;
-            }
-            return false;
-        };
-        if (sdef.contains("fields") && scan(sdef.at("fields"))) return true;
-        if (sdef.contains("variants") && sdef.at("variants").is_array()) {
-            for (auto const& v : sdef.at("variants"))
-                if (v.is_object() && v.contains("fields") && scan(v.at("fields")))
-                    return true;
-        }
-        return false;
-    };
-    if (doc.contains("structs")) {
-        if (!doc.at("structs").is_array()) {
-            emitMalformed(reporter, "shipped-lib descriptor '" + core::genericSpelling(path)
-                                        + "': 'structs' must be an array");
-        } else {
-            std::size_t sidx = 0;
-            for (auto const& sdef : doc.at("structs")) {
-                std::string const at =
-                    "'" + core::genericSpelling(path) + "' structs[" + std::to_string(sidx) + "]";
-                ++sidx;
-                if (!sdef.is_object()) {
-                    emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
-                    continue;
-                }
-                (void)rejectUnknownKeys(reporter, sdef,
-                                        "structs[" + std::to_string(sidx - 1) + "]",
-                                        {"name", "fields", "variants"});
-                if (!sdef.contains("name") || !sdef.at("name").is_string()
-                    || sdef.at("name").get<std::string>().empty()) {
-                    emitMalformed(reporter, "shipped-lib descriptor " + at
-                                                + ": missing or empty 'name'");
-                    continue;
-                }
-                std::string const sname = sdef.at("name").get<std::string>();
-
-                // (6.5.pre) THE BY-NAME DEPENDENCY GATE — see the note above the
-                // loop. Evaluated BEFORE `sname` joins `declaredEarlier`, so a
-                // SELF reference is a forward name and still fails loud; recorded
-                // right after, so every entry BELOW may name this one.
-                bool const dependencyUnavailable = referencesUnavailable(sdef);
-                declaredEarlier.push_back(sname);
-                if (dependencyUnavailable) continue;   // unavailable here → inject nothing
-
-                // Exactly ONE of `fields` (flat, single layout) or `variants`
-                // (per-target). Both, or neither, is a malformed entry — fail loud
-                // (a struct with neither declares no layout; with both is ambiguous
-                // intent).
-                bool const hasFields   = sdef.contains("fields");
-                bool const hasVariants = sdef.contains("variants");
-                if (hasFields == hasVariants) {
-                    emitMalformed(reporter, "shipped-lib descriptor " + at
-                                                + ": a struct must declare EXACTLY one of "
-                                                  "'fields' (single layout) or 'variants' "
-                                                  "(per-target layouts)");
-                    continue;
-                }
-
-                // The SELECTED field list (flat path = `fields`; variant path = the
-                // matching variant's `fields`). `selected` stays false on the
-                // no-variant-matches case → the struct is simply not injected.
-                ShippedStruct sst;
-                sst.name = sname;
-                std::vector<TypeId> fieldTypes;
-                bool selected = false;
-
-                if (hasFields) {
-                    if (!sdef.at("fields").is_array() || sdef.at("fields").empty()) {
-                        emitMalformed(reporter, "shipped-lib descriptor " + at
-                                                    + ": 'fields' must be a non-empty array");
-                        continue;
-                    }
-                    if (!decodeStructFieldList(sdef.at("fields"), at, interner, typeReg,
-                                               reporter, sst.fields, fieldTypes,
-                                               mergedNamedTypes)) {
-                        continue;
-                    }
-                    selected = true;
-                } else {
-                    // PER-TARGET VARIANTS. Decode EVERY variant's field list (eager —
-                    // a malformed inactive variant fails the read on every target),
-                    // then select the variant whose `when` matches the active target.
-                    if (!sdef.at("variants").is_array() || sdef.at("variants").empty()) {
-                        emitMalformed(reporter, "shipped-lib descriptor " + at
-                                                    + ": 'variants' must be a non-empty array");
-                        continue;
-                    }
-                    std::string const activeFormatName =
-                        activeFormat.has_value()
-                            ? std::string{objectFormatKindName(*activeFormat)}
-                            : std::string{};
-                    bool okVariants = true;
-                    std::size_t matchCount = 0;
-                    std::size_t vidx = 0;
-                    for (auto const& vdef : sdef.at("variants")) {
-                        std::string const vat = at + " variants[" + std::to_string(vidx) + "]";
-                        ++vidx;
-                        if (!vdef.is_object()) {
-                            emitMalformed(reporter, "shipped-lib descriptor " + vat
-                                                        + ": must be an object");
-                            okVariants = false; break;
-                        }
-                        (void)rejectUnknownKeys(reporter, vdef,
-                                                "structs[" + std::to_string(sidx - 1)
-                                                    + "] variants[" + std::to_string(vidx - 1) + "]",
-                                                {"when", "fields"});
-                        // `when` — the match selector. REQUIRED object; keys closed to
-                        // {arch, format}. An EMPTY `when:{}` matches every target
-                        // (always-match) — legal but typically ambiguous if any other
-                        // variant also matches (the ambiguity gate below catches it).
-                        if (!vdef.contains("when") || !vdef.at("when").is_object()) {
-                            emitMalformed(reporter, "shipped-lib descriptor " + vat
-                                                        + ": missing or non-object 'when' "
-                                                          "(e.g. {\"arch\":\"x86_64\",\"format\":\"elf\"})");
-                            okVariants = false; break;
-                        }
-                        // Decode this variant's field list (eager, every variant) —
-                        // BEFORE the match test so a malformed INACTIVE variant still
-                        // fails the read on every target (anti-lurking).
-                        if (!vdef.contains("fields") || !vdef.at("fields").is_array()
-                            || vdef.at("fields").empty()) {
-                            emitMalformed(reporter, "shipped-lib descriptor " + vat
-                                                        + ": 'fields' must be a non-empty array");
-                            okVariants = false; break;
-                        }
-                        std::vector<ShippedField> vFields;
-                        std::vector<TypeId>       vFieldTypes;
-                        if (!decodeStructFieldList(vdef.at("fields"), vat, interner, typeReg,
-                                                   reporter, vFields, vFieldTypes, mergedNamedTypes)) {
-                            okVariants = false; break;
-                        }
-
-                        // Does this variant's `when` MATCH the active target? (the
-                        // SHARED selector — typed surfaces allow {arch,format}.)
-                        WhenMatch const wm = matchVariantWhen(
-                            vdef.at("when"), WhenAxes::FullTarget, vat + ".when",
-                            activeTarget, activeFormat, activeFormatName,
-                            activeDataModelName, reporter);
-                        if (wm == WhenMatch::Error) { okVariants = false; break; }
-                        if (wm == WhenMatch::Match) {
-                            ++matchCount;
-                            if (matchCount == 1) {
-                                // First match — take its fields (and keep scanning so a
-                                // second match is detected → ambiguity fail-loud).
-                                sst.fields = std::move(vFields);
-                                fieldTypes = std::move(vFieldTypes);
-                            }
-                        }
-                    }
-                    if (!okVariants) continue;
-                    if (matchCount > 1) {
-                        // >1 variant matched the active target — a silent
-                        // wrong-layout risk (which would be picked?). Fail loud.
-                        dss::report(reporter, DiagnosticCode::F_ShippedStructVariantAmbiguous,
-                                    DiagnosticSeverity::Error,
-                                    "shipped-lib descriptor " + at + ": struct '" + sname
-                                        + "' has " + std::to_string(matchCount)
-                                        + " 'variants' matching the active target (arch='"
-                                        + (activeTarget.has_value() ? std::string{*activeTarget}
-                                                                    : std::string{"<none>"})
-                                        + "', format='"
-                                        + (activeFormat.has_value() ? activeFormatName
-                                                                    : std::string{"<none>"})
-                                        + "') — exactly one variant may match (refusing an "
-                                          "ambiguous per-target layout)");
-                        continue;
-                    }
-                    // matchCount 0 ⇒ no variant for this target ⇒ NOT injected
-                    // (a reference fails loud as an undefined type, never a silent
-                    // wrong layout). matchCount 1 ⇒ select it.
-                    selected = (matchCount == 1);
-                }
-
-                if (!selected) continue;   // no variant matched → inject nothing
-                // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): if the SELECTED field list
-                // carries explicit offsets, intern the struct WITH them (an
-                // overlapping FFI layout). ALL-or-NONE within the struct; a mix is
-                // malformed. The offsets enter the content identity so this tag type
-                // matches the bare typedef's inline `struct "X" { T @off }` (same
-                // TypeId → the injected field scope resolves .member on a bare-typedef
-                // value). Empty → the ordinary natural-alignment struct (unchanged).
-                std::size_t withOffset = 0;
-                for (auto const& fld : sst.fields)
-                    if (fld.offset.has_value()) ++withOffset;
-                if (withOffset != 0 && withOffset != sst.fields.size()) {
-                    emitMalformed(reporter, "shipped-lib descriptor " + at
-                                                + ": struct field 'offset' must be "
-                                                  "all-or-none (an overlapping layout "
-                                                  "declares every field's offset)");
-                    continue;
-                }
-                if (withOffset == sst.fields.size() && !sst.fields.empty()) {
-                    std::vector<std::uint64_t> offsets;
-                    offsets.reserve(sst.fields.size());
-                    for (auto const& fld : sst.fields) offsets.push_back(*fld.offset);
-                    std::span<std::int64_t const> const noWidths{};
-                    sst.typeId = interner.structType(sname, fieldTypes, noWidths, offsets);
-                } else {
-                    sst.typeId = interner.structType(sname, fieldTypes);
-                }
-                // Option C: publish this struct's TAG name so a LATER surface —
-                // above all another struct's FIELD — can spell it BY NAME
-                // (`{"name":"it_value","type":"timeval"}`), which is what keeps an
-                // inner struct's per-format widths in ONE place instead of being
-                // restated inside every outer struct. Byte-identical to the
-                // typedef/union publications (address-stable `typedefNameStore`
-                // backing, appended only for a SELECTED entry so an unselected
-                // struct stays unnameable). Publication is strictly ADDITIVE: the
-                // scan is first-match, structs are published LAST, so no name that
-                // already resolved changes meaning.
-                // (D-CSUBSET-DARWIN-BSD-STRUCT-BY-NAME)
-                typedefNameStore.push_back(sname);
-                mergedNamedTypes.push_back(
-                    NamedTypeBinding{std::string_view{typedefNameStore.back()}, sst.typeId});
-                out.structs.push_back(std::move(sst));
-            }
-        }
-    }
 
     // (7) MACROS (the preprocessor-macro surface, interner-free). A function-like
     // or object-like `#define` the preprocessor injects when this header is
@@ -3545,85 +3857,122 @@ void forEachDescriptorInClosure(
                        HeaderSearchResult const&)> const&    onUnresolvedInclude,
     std::function<void(std::string const&,
                        std::filesystem::path const&)> const& onUnavailableChild) {
-    // ★ CYCLE / DIAMOND GUARD (correctness must): a single DFS keyed on the
-    // weakly-canonical descriptor path (the SAME key the semantic readDescriptors
-    // dedup + cachedDescriptorJson use). A path is visited AT MOST ONCE, so a cycle
-    // A→B→A stops at the second A and a diamond's shared leaf is visited once. The
-    // recursion is bounded by the finite shipped-descriptor count — no fixpoint
-    // iteration, a single DFS is complete + terminating.
-    auto const key = descriptorPathKey(startPath);
-    if (!visited.insert(key).second) return;   // already in the closure
+    // ★★ THE DESCENT COSTS HEAP, NOT HOST CALL FRAMES
+    // (feedback-no-input-proportional-recursion, operator 2026-09-02). The depth of
+    // this walk follows the descriptor INCLUDE-GRAPH — config the user writes and
+    // ships, not something this project's corpus bounds — so a host frame per level
+    // is exactly the shape the standing ruling forbids.
+    //
+    // ⚠ AN EDGE IS RESOLVED WHEN IT IS POPPED, NOT WHEN IT IS PUSHED, AND THAT IS
+    // THE WHOLE ORDER CONTRACT. The recursion resolved child[0], gated it, walked
+    // its ENTIRE subtree, and only then resolved child[1] — so `onUnresolvedInclude`
+    // and `onUnavailableChild` for a later sibling fired AFTER every diagnostic from
+    // an earlier sibling's descendants. Pushing already-resolved paths would have
+    // hoisted every sibling's resolution ahead of the first sibling's subtree and
+    // silently reordered those callbacks. Pushing the unresolved header NAME instead
+    // keeps the resolution exactly where the recursion had it. Children are pushed
+    // in REVERSE so they pop in declaration order, and a descriptor is marked
+    // `visited` when it is POPPED, as the recursive entry marked it — so a diamond
+    // and a cycle behave as before too.
+    struct Edge {
+        std::filesystem::path path;         // the descriptor to visit (root only)
+        std::string           headerName;   // non-empty ⇒ resolve `path` from this
+    };
+    std::vector<Edge> pending;
+    pending.push_back(Edge{startPath, std::string{}});
 
-    // PARENT FIRST — visit this descriptor before the siblings its `includes`
-    // declares (so the caller records/splices parent-before-transitive-child; the
-    // semantic first-wins dedup then lets the named parent's surface beat a
-    // transitively-included sibling's on any name collision).
-    visit(startPath);
+    while (!pending.empty()) {
+        Edge const edge = std::move(pending.back());
+        pending.pop_back();
 
-    // ★ A DESCRIPTOR THAT DOES NOT EXIST ON THIS FORMAT DECLARES NOTHING ON IT —
-    // ITS EDGES INCLUDED. Only ever reached for the ROOT (a child's availability is
-    // tested in the loop below, BEFORE it is visited), and the root is the header
-    // the USER named: the caller owns that verdict (the semantic tier's
-    // `F_ShippedHeaderUnavailableForTarget`, positioned on the `#include` line), so
-    // the root is still VISITED and only the DESCENT stops.
-    // ⚠ THIS FIXED A REAL LEAK, not a hypothetical one: before the gate, a root
-    // refused as unavailable still had its whole `includes` closure recorded, so
-    // the semantic tier injected every SIBLING's surface for an `#include` that had
-    // just been rejected. It was unobservable only because the rejection also
-    // errored the compile — a coincidence, not a design.
-    if (activeFormat.has_value()
-        && !shippedHeaderAvailableForFormat(startPath, *activeFormat)) {
-        return;
-    }
-
-    // Read this descriptor's `includes` interner-free with a THROWAWAY reporter: a
-    // malformed `includes` FIELD is surfaced by the semantic readShippedLibDescriptor
-    // that reads the SAME descriptor (the import resolver records a ref per closure
-    // descriptor) — never silent, never double-reported here (the
-    // shippedHeaderAvailableForFormat throwaway-reporter precedent). A malformed
-    // field ⇒ nullopt ⇒ no children traversed (the loud report comes from semantic).
-    // `activeFormat` selects the ACTIVE edges: an entry whose `when` does not match
-    // is not an edge on this target and never appears here.
-    DiagnosticReporter throwaway;
-    auto const includes = readShippedLibIncludes(startPath, throwaway, activeFormat);
-    if (!includes) return;
-    for (std::string const& headerName : *includes) {
-        // Resolve each sibling by the SAME `<stem>.json` funnel a source
-        // `#include <h>` uses (so the transitive edge and a direct include agree
-        // byte-for-byte). An entry that resolves to NO descriptor is a config error
-        // — the caller surfaces it LOUD (this is the ONLY tier that can, since the
-        // interner-less semantic tier has no systemDirs). Continue past it so one
-        // typo does not swallow the rest of the closure.
-        // D-PP-HEADER-CASE-INSENSITIVE-PE: the SAME case policy the source
-        // spelling gets — a `includes:["Windows.h"]` edge must reach
-        // `windows.json` on a pe build from ANY host, and must NOT on an elf one.
-        HeaderSearchResult child =
-            resolveSystemDescriptor(headerName, systemDirs, matching);
-        if (child.status != HeaderSearchStatus::Found) {
-            onUnresolvedInclude(headerName, child);
-            continue;
+        std::filesystem::path here = edge.path;
+        if (!edge.headerName.empty()) {
+            // Resolve each sibling by the SAME `<stem>.json` funnel a source
+            // `#include <h>` uses (so the transitive edge and a direct include agree
+            // byte-for-byte). An entry that resolves to NO descriptor is a config
+            // error — the caller surfaces it LOUD (this is the ONLY tier that can,
+            // since the interner-less semantic tier has no systemDirs). Continue past
+            // it so one typo does not swallow the rest of the closure.
+            // D-PP-HEADER-CASE-INSENSITIVE-PE: the SAME case policy the source
+            // spelling gets — a `includes:["Windows.h"]` edge must reach
+            // `windows.json` on a pe build from ANY host, and must NOT on an elf one.
+            HeaderSearchResult child =
+                resolveSystemDescriptor(edge.headerName, systemDirs, matching);
+            if (child.status != HeaderSearchStatus::Found) {
+                onUnresolvedInclude(edge.headerName, child);
+                continue;
+            }
+            // ★★ AN ACTIVE EDGE WHOSE CHILD DOES NOT EXIST ON THIS FORMAT IS A CONFIG
+            // CONTRADICTION, AND IT IS LOUD. The config said "on this format, including
+            // me also includes X" and, in the same breath, "X does not exist on this
+            // format". There is no correct silent answer: dropping the child hides a
+            // surface the parent PROMISED, and recording it makes the semantic tier
+            // report a header the user never wrote. So the walker reports it and each
+            // tier renders it in its own voice, exactly as `onUnresolvedInclude` already
+            // works — the resolver (which alone owns a positioned `#include` span) is
+            // loud; the preprocessor stays silent so nothing double-reports.
+            // ⚠ Invariant (i) in `validateShippedIncludeClosure` refuses this STATICALLY
+            // over the whole corpus, including arms no current target selects. This arm
+            // is the belt to that invariant's braces: the invariant is a sweep, and a
+            // sweep only covers the corpus it was run over.
+            if (activeFormat.has_value()
+                && !shippedHeaderAvailableForFormat(child.path, *activeFormat)) {
+                onUnavailableChild(edge.headerName, child.path);
+                continue;
+            }
+            here = child.path;
         }
-        // ★★ AN ACTIVE EDGE WHOSE CHILD DOES NOT EXIST ON THIS FORMAT IS A CONFIG
-        // CONTRADICTION, AND IT IS LOUD. The config said "on this format, including
-        // me also includes X" and, in the same breath, "X does not exist on this
-        // format". There is no correct silent answer: dropping the child hides a
-        // surface the parent PROMISED, and recording it makes the semantic tier
-        // report a header the user never wrote. So the walker reports it and each
-        // tier renders it in its own voice, exactly as `onUnresolvedInclude` already
-        // works — the resolver (which alone owns a positioned `#include` span) is
-        // loud; the preprocessor stays silent so nothing double-reports.
-        // ⚠ Invariant (i) in `validateShippedIncludeClosure` refuses this STATICALLY
-        // over the whole corpus, including arms no current target selects. This arm
-        // is the belt to that invariant's braces: the invariant is a sweep, and a
-        // sweep only covers the corpus it was run over.
+
+        // ★ CYCLE / DIAMOND GUARD (correctness must): a single DFS keyed on the
+        // weakly-canonical descriptor path (the SAME key the semantic readDescriptors
+        // dedup + cachedDescriptorJson use). A path is visited AT MOST ONCE, so a cycle
+        // A→B→A stops at the second A and a diamond's shared leaf is visited once. The
+        // walk is bounded by the finite shipped-descriptor count — no fixpoint
+        // iteration, a single DFS is complete + terminating.
+        auto const key = descriptorPathKey(here);
+        if (!visited.insert(key).second) continue;   // already in the closure
+
+        // PARENT FIRST — visit this descriptor before the siblings its `includes`
+        // declares (so the caller records/splices parent-before-transitive-child; the
+        // semantic first-wins dedup then lets the named parent's surface beat a
+        // transitively-included sibling's on any name collision).
+        visit(here);
+
+        // ★ A DESCRIPTOR THAT DOES NOT EXIST ON THIS FORMAT DECLARES NOTHING ON IT —
+        // ITS EDGES INCLUDED. Only ever DECIDES anything for the ROOT (a child's
+        // availability is tested in the edge-resolution arm ABOVE, before it reaches
+        // `visit`, so a child that got here already passed), and the root is the header
+        // the USER named: the caller owns that verdict (the semantic tier's
+        // `F_ShippedHeaderUnavailableForTarget`, positioned on the `#include` line), so
+        // the root is still VISITED and only the DESCENT stops.
+        // ⚠ THIS FIXED A REAL LEAK, not a hypothetical one: before the gate, a root
+        // refused as unavailable still had its whole `includes` closure recorded, so
+        // the semantic tier injected every SIBLING's surface for an `#include` that had
+        // just been rejected. It was unobservable only because the rejection also
+        // errored the compile — a coincidence, not a design.
         if (activeFormat.has_value()
-            && !shippedHeaderAvailableForFormat(child.path, *activeFormat)) {
-            onUnavailableChild(headerName, child.path);
+            && !shippedHeaderAvailableForFormat(here, *activeFormat)) {
             continue;
         }
-        forEachDescriptorInClosure(child.path, systemDirs, matching, activeFormat,
-                                   visited, visit, onUnresolvedInclude,
-                                   onUnavailableChild);   // DFS recurse
+
+        // Read this descriptor's `includes` interner-free with a THROWAWAY reporter: a
+        // malformed `includes` FIELD is surfaced by the semantic readShippedLibDescriptor
+        // that reads the SAME descriptor (the import resolver records a ref per closure
+        // descriptor) — never silent, never double-reported here (the
+        // shippedHeaderAvailableForFormat throwaway-reporter precedent). A malformed
+        // field ⇒ nullopt ⇒ no children traversed (the loud report comes from semantic).
+        // `activeFormat` selects the ACTIVE edges: an entry whose `when` does not match
+        // is not an edge on this target and never appears here.
+        DiagnosticReporter throwaway;
+        auto const includes = readShippedLibIncludes(here, throwaway, activeFormat);
+        if (!includes) continue;
+        // Reverse-push the UNRESOLVED edges so the stack POPS them in declaration
+        // order and each one is resolved at the moment the walk reaches it — the
+        // order the former parent-first recursion produced. See the contract note
+        // at the top of this function for why resolving here would be wrong.
+        for (std::size_t i = includes->size(); i-- > 0;) {
+            pending.push_back(Edge{std::filesystem::path{}, (*includes)[i]});
+        }
     }
 }
 
@@ -4092,6 +4441,62 @@ collectShippedExternSymbolFormats() {
     return byName;
 }
 
+namespace {
+
+// ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ─────
+//
+// Did the descriptor at `path` fail to read because of THIS BUILD, or on its own
+// terms? The oracle below swallows a failed read on purpose — it is consulted
+// for names the user never `#include`d, so an unrelated malformed descriptor
+// must not become this program's build failure. A ROLE that the active format
+// family cannot answer is the opposite kind of fault, and it arrived with the
+// role channel: the descriptor is well-formed, the corpus and the format
+// documents simply do not agree, and the consequence is that the WHOLE
+// descriptor vanishes. Its names then route unbound and the link tier blames the
+// USER's program for an undefined `puts` — a diagnostic pointing at the wrong
+// file, which is the same failure `emitCorpusInvariant` and step (2b) exist to
+// avoid. (Reached, concretely, by a `.s` writing `call puts` through the
+// assembly binder, and by an archive member through the lazy pull.)
+//
+// ★ THE CLASSIFICATION IS A RE-READ, NOT A MESSAGE MATCH. Read the same
+// descriptor again with NO resolver: everything a resolver can refuse is by
+// construction the only difference between the two reads, so a second read that
+// SUCCEEDS proves the resolver is what refused, and one that fails again proves
+// the descriptor is malformed on its own terms and the skip is right. A string
+// or code test would be a second owner of "which refusals are resolver-dependent"
+// — a list that goes stale the first time an arm is added. The cost is one extra
+// decode on a path that is already failing, and the JSON parse behind it is the
+// thread-local cache's, not a second read of the file.
+//
+// ⓘ WHY ONLY THIS ENTRY POINT. `realizeShippedDescriptorSurfaceFor` swallows the
+// same way and is deliberately left alone, for the reason its own pin already
+// states about the agreement rule: the surface fetch is a CONSEQUENCE of a shim
+// claim `realizeShippedExternSymbols` already made from the SAME descriptor, in
+// the same candidate order, with the build's own reporter — so it can never be
+// the first reader of a descriptor, and a refusal it would meet has already been
+// reported here. On the `#include` path the first reader is
+// `readShippedLibDescriptor` itself, called with the build's reporter.
+[[nodiscard]] bool
+refusalBelongsToThisBuild(std::filesystem::path const&      path,
+                          TypeInterner&                     interner,
+                          TypeRegistry&                     typeReg,
+                          DataModel                         dataModel,
+                          std::optional<std::string_view>   activeTarget,
+                          std::optional<ObjectFormatKind>   activeFormat,
+                          std::span<NamedTypeBinding const> namedTypes,
+                          RuntimeLibraryRoleResolver const* roleResolver) {
+    // No resolver ⇒ nothing but the descriptor itself could have refused.
+    if (roleResolver == nullptr) return false;
+    DiagnosticReporter withoutResolver;
+    auto const again = readShippedLibDescriptor(path, interner, typeReg,
+                                                withoutResolver, dataModel,
+                                                activeTarget, activeFormat,
+                                                namedTypes, nullptr);
+    return again.has_value();
+}
+
+} // namespace
+
 std::optional<std::unordered_map<std::string, ShippedSymbolRealization>>
 realizeShippedExternSymbols(std::span<std::string const>      names,
                             TypeInterner&                     interner,
@@ -4100,7 +4505,8 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
                             DataModel                         dataModel,
                             std::optional<std::string_view>   activeTarget,
                             std::optional<ObjectFormatKind>   activeFormat,
-                            std::span<NamedTypeBinding const> namedTypes) {
+                            std::span<NamedTypeBinding const> namedTypes,
+                            RuntimeLibraryRoleResolver const* roleResolver) {
     CorpusIndex const* const idx = corpusIndex();
     if (idx == nullptr) return std::nullopt;   // discovery failed — route unbound
     std::unordered_map<std::string, ShippedSymbolRealization> out;
@@ -4169,13 +4575,24 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
     // malformedness must not become this program's build failure. Its names then
     // stay `Unknown` and route unbound, where the link tier judges the reference
     // LOUD. (The `shippedHeaderAvailableForFormat` precedent.)
+    //
+    // ★★ EXCEPT FOR THE ONE FAULT THAT IS ABOUT THIS BUILD RATHER THAN ABOUT AN
+    // UNRELATED FILE — see `refusalBelongsToThisBuild` for the whole rule and the
+    // reason the classification is a RE-READ rather than a message match.
     std::unordered_map<std::string, ShippedLibDescriptor> decoded;
     for (auto const& rel : wantedDescriptors) {
         DiagnosticReporter throwaway;
         auto desc = readShippedLibDescriptor(idx->root / rel, interner, typeReg,
                                              throwaway, dataModel, activeTarget,
-                                             activeFormat, namedTypes);
-        if (!desc) continue;
+                                             activeFormat, namedTypes, roleResolver);
+        if (!desc) {
+            if (refusalBelongsToThisBuild(idx->root / rel, interner, typeReg,
+                                          dataModel, activeTarget, activeFormat,
+                                          namedTypes, roleResolver)) {
+                for (auto const& d : throwaway.all()) reporter.report(d);
+            }
+            continue;
+        }
         decoded.emplace(rel, std::move(*desc));
     }
 
@@ -4376,7 +4793,8 @@ realizeShippedDescriptorSurfaceFor(std::string_view                  name,
                                    DataModel                         dataModel,
                                    std::optional<std::string_view>   activeTarget,
                                    std::optional<ObjectFormatKind>   activeFormat,
-                                   std::span<NamedTypeBinding const> namedTypes) {
+                                   std::span<NamedTypeBinding const> namedTypes,
+                                   RuntimeLibraryRoleResolver const* roleResolver) {
     CorpusIndex const* const idx = corpusIndex();
     if (idx == nullptr) return std::nullopt;
     std::unordered_map<std::string, ShippedSymbolRealization> out;
@@ -4390,10 +4808,16 @@ realizeShippedDescriptorSurfaceFor(std::string_view                  name,
     // descriptor `realizeShippedExternSymbols` chose for that name, never a
     // different one that happens to declare the name too.
     for (auto const& row : nameIt->second) {
-        DiagnosticReporter throwaway;   // see the skip rationale in the header
+        // See the skip rationale in the header — and `refusalBelongsToThisBuild`
+        // for why the role-refusal exception it makes does NOT need repeating
+        // here: this fetch is a consequence of a shim claim
+        // `realizeShippedExternSymbols` already made from the SAME descriptor, in
+        // the same candidate order, on the build's own reporter.
+        DiagnosticReporter throwaway;
         auto desc = readShippedLibDescriptor(idx->root / row.relPath, interner,
                                             typeReg, throwaway, dataModel,
-                                            activeTarget, activeFormat, namedTypes);
+                                            activeTarget, activeFormat, namedTypes,
+                                            roleResolver);
         if (!desc) continue;
         bool const docHere = objectFormatInAvailabilitySet(
             desc->availableObjectFormats, *activeFormat);
@@ -4427,13 +4851,23 @@ realizeShippedDescriptorSurfaceFor(std::string_view                  name,
 
 namespace {
 
-// One descriptor claim: which (format, config-root-relative source path) pair a
-// `realization` entry names, plus a human locator for the diagnostic
-// ("dirent.json symbols[0] realization").
+// One claim on a file in the shipped runtime tree: the config-root-relative
+// source path, plus a human locator for the diagnostic.
+//
+// ⚠ `format` IS EMPTY FOR A DECLARER THAT IS NOT FORMAT-KEYED, and R1 reads that
+// emptiness rather than a sentinel. A descriptor's `realization` map is keyed BY
+// object format, so a broken entry there can name the format left without a
+// body; an object format's own `runtimeLibraries[].source` row IS that format,
+// so there is no second name to quote and quoting one produced the sentence
+// `the object format '(object format)' would be left with…`. Naming the empty
+// case is what makes the two readings distinguishable instead of one of them
+// rendering a placeholder as data.
 struct ShippedSourceClaim {
-    std::string format;
+    std::string format;   // the object-format family key, or EMPTY (see above)
     std::string source;
-    std::string where;
+    std::string where;    // a COMPLETE subject phrase — "shipped-lib descriptor
+                          // 'dirent.json (root) realization'", "object format
+                          // 'pe64-…' runtimeLibraries[atomicsRuntime]"
 };
 
 // EVERY shipped-source claim any descriptor under `descriptorDir` makes, on ANY
@@ -4465,7 +4899,7 @@ claimedShippedSources(std::filesystem::path const& descriptorDir,
                 if (!kv.value().at("source").is_string()) continue;
                 claims.push_back(ShippedSourceClaim{
                     kv.key(), kv.value().at("source").get<std::string>(),
-                    where + " " + ctx});
+                    "shipped-lib descriptor '" + where + " " + ctx + "'"});
             }
         };
         if (docPtr->contains("realization"))
@@ -4626,11 +5060,24 @@ allShippedSourcesForFormat(std::filesystem::path const& descriptorDir,
     return out;
 }
 
-bool validateShippedSourceTree(std::filesystem::path const& descriptorDir,
-                               std::filesystem::path const& runtimeRootDir,
-                               DiagnosticReporter&          reporter) {
+bool validateShippedSourceTree(
+    std::filesystem::path const&                 descriptorDir,
+    std::filesystem::path const&                 runtimeRootDir,
+    std::span<ShippedSourceDeclaration const>    foreignDeclarations,
+    DiagnosticReporter&                          reporter) {
     std::size_t const errBefore = reporter.errorCount();
-    auto const        claims    = claimedShippedSources(descriptorDir, reporter);
+    auto              claims    = claimedShippedSources(descriptorDir, reporter);
+    // D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64: an object format's
+    // `runtimeLibraries[].source` is a SECOND kind of declarer, and R1/R2 must
+    // see it or the sweep would refuse a file the format legitimately names.
+    // Folding it into the same claim list rather than testing it separately is
+    // deliberate: both rules then read ONE list, so neither can learn about a
+    // declarer the other has not.
+    for (auto const& d : foreignDeclarations) {
+        claims.push_back(ShippedSourceClaim{
+            /*format=*/std::string{}, /*source=*/d.source,
+            /*where=*/d.declarer});
+    }
 
     // R1 lives at DESCRIPTOR READ TIME (`readShippedLibDescriptor`), where it is a
     // single `is_regular_file` per declared entry and therefore free. It is
@@ -4643,23 +5090,43 @@ bool validateShippedSourceTree(std::filesystem::path const& descriptorDir,
             claimedPaths.insert(core::PathIdentity::of(look.path));
             continue;
         }
+        // ⚠ THE SUBJECT IS THE CLAIM'S OWN, AND THE CONSEQUENCE CLAUSE IS
+        // CHOSEN BY WHETHER THE DECLARER IS FORMAT-KEYED. Composing
+        // `"shipped-lib descriptor '" + where + "." + format + "'"` for EVERY
+        // claim rendered an object-format row as
+        // `shipped-lib descriptor 'an object format's runtimeLibraries[].
+        // source.(object format)'` and then `the object format '(object
+        // format)' would be left…` — a placeholder printed as data, on a
+        // fail-loud path, calling a format document a descriptor.
         emitMalformed(reporter,
-            "shipped-lib descriptor '" + c.where + "." + c.format
-            + "' declares a shipped-source realization naming '" + c.source
-            + "', but " + describeShippedSourceLookup(look, c.source)
-            + " — the object format '" + c.format
-            + "' would be left with a DECLARED symbol and no body "
-              "(D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R1)");
+            c.where + " declares a shipped-source realization naming '"
+            + c.source + "', but " + describeShippedSourceLookup(look, c.source)
+            + (c.format.empty()
+                   ? " — the runtime role it fills would be left DECLARED with "
+                     "no body"
+                   : " — the object format '" + c.format
+                         + "' would be left with a DECLARED symbol and no body")
+            + " (D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF R1)");
     }
 
     // ★★ R2 + R4 ARE ONE RULE, AND FOLDING THEM IS STRICTLY STRONGER THAN
     // KEEPING THEM APART: **every regular file under the runtime tree must be
-    // named by some descriptor's `realization` map.**
+    // named by a DECLARER.**
     //
-    // R2 (a source file no descriptor names) is that rule read forwards: nothing
-    // can ever add such a file to a build graph, because the ONLY thing that adds
-    // one is a descriptor naming it. Inert config, and the direction R1
-    // structurally cannot see.
+    // ⚠ THAT SENTENCE USED TO READ "…named by some descriptor's `realization`
+    // map", AND D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64 FALSIFIED IT WITHOUT
+    // CHANGING IT. An object format's `runtimeLibraries[].source` is a second
+    // declarer — `runtime/platform/src/atomic.c` is named by four `.format.json`
+    // documents and by NO descriptor (✔MEASURED over the shipped corpus) — so
+    // the rule as written was false of a file this very function accepts, and
+    // the acceptance came from the `foreignDeclarations` span rather than from
+    // the rule. The rule is restated over DECLARERS; the set of declarer KINDS
+    // is what grew, and it is enumerated in one place (`claims`, above).
+    //
+    // R2 (a source file no declarer names) is that rule read forwards: nothing
+    // can ever add such a file to a build graph, because the ONLY things that add
+    // one are a descriptor's `realization` map and a format's role table. Inert
+    // config, and the direction R1 structurally cannot see.
     //
     // R4 (no headers in this tree) is that SAME rule read backwards, and it needed
     // no extension vocabulary at all. The layout mirrors the include namespace, so
@@ -4720,11 +5187,12 @@ bool validateShippedSourceTree(std::filesystem::path const& descriptorDir,
             if (claimedPaths.contains(core::PathIdentity::of(p))) continue;
             emitMalformed(reporter,
                 "shipped-source tree: '" + core::genericSpelling(p)
-                + "' is named by NO "
-                "shipped-lib descriptor under '"
+                + "' is named by NO DECLARER — neither a 'realization' map of a "
+                  "shipped-lib descriptor under '"
                 + core::genericSpelling(descriptorDir)
-                + "' in a 'realization' map, so nothing can ever add it to a build "
-                  "graph. Only files a descriptor names may live under '"
+                + "' nor an object format's runtimeLibraries[].source — so "
+                  "nothing can ever add it to a build "
+                  "graph. Only files a declarer names may live under '"
                 + core::genericSpelling(authored)
                 + "' — in particular a HEADER here would sit at an INCLUDE PATH and "
                   "silently shadow the descriptor a unit exists to consume "

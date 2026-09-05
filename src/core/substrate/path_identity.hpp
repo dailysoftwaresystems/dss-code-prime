@@ -74,6 +74,24 @@ namespace dss::core {
 [[nodiscard]] DSS_EXPORT std::string
 genericSpelling(std::filesystem::path const& p);
 
+// The same answer for a path that is being carried as a STRING — a stored
+// label, a config value, a document origin — rather than as an `fs::path`.
+//
+// ★ IT EXISTS SO A TIER WITH NO OTHER PATH BUSINESS DOES NOT HAVE TO REACH FOR
+// `<filesystem>` JUST TO PRINT ONE. `GrammarSchema`/`TargetSchema` keep the
+// label their document was loaded under; the assembly walker names it in a
+// refusal. Without this overload that walker would have to construct a
+// temporary `fs::path`, which means including `<filesystem>` in a file whose
+// only relationship to the filesystem is that it renders a string — exactly the
+// "path code arriving by habit" that `check-path-identity` exists to stop, and
+// an allowlist entry that claimed an I/O need it does not have.
+//
+// ⚠ RENDERING ONLY. It is NOT a resolution, NOT a canonicalisation and NOT a
+// way to make a string into an identity — `PathIdentity::of()` remains the only
+// gate for that, and this returning a `std::string` (never a `PathIdentity`) is
+// what keeps the two from being confused.
+[[nodiscard]] DSS_EXPORT std::string genericSpelling(std::string_view spelling);
+
 // The same spelling as UTF-8, for the one caller that cannot use the narrow
 // form: a diagnostic that must NAME a file whose characters the active code
 // page cannot represent.

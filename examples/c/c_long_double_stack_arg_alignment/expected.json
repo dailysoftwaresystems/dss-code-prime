@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the CALLER's outgoing placement of a stacked `long double` and the CALLEE's incoming read of it must land on the SAME byte once the ABI's 16-byte alignment pad is inserted. `odd7` takes SEVEN integer parameters, so a1..a6 fill the SysV GPR argument registers, a7 is the first STACK argument at outgoing +0, and the `long double` follows at an ODD 8-byte cursor — the case that owes the pad (outgoing +16, NOT +8; gcc 13.3.0 and clang 18.1.3 both read exactly this signature with `fldt 24(%rsp)` = incoming +16, MEASURED 2026-09-02). `even8` is the CONTROL: an EVEN preceding stack-arg count is already 16-aligned, so the same datum reaches +16 with no pad — both arms must hold, or the pad is unconditional rather than alignment-driven. The pad is inserted by TWO walks (`StackArgCursor` on the caller's side, the incoming-parameter cursor in HIR→MIR on the callee's) and this program returns 42 only if they AGREE, so it pins against a half-applied rule — the failure mode that is otherwise invisible until a foreign boundary. Correct by construction on the other axes: pe64 x86_64 and Apple arm64 collapse `long double` to binary64 (8 bytes never out-aligns the slot) and AAPCS64 passes binary128 in a v-register rather than on the stack, so this is a real x86_64-ELF alignment witness and a real no-op elsewhere — which is the blast radius the change claims. Operands route through MUTABLE GLOBALS so the release arm proves a runtime call boundary, not a fold. WHICH LEG THIS REDDENS ON, stated because the answer is not 'all of them': MEASURED, with the callee-side round-up deleted the emitted ELF reads the home at `lea 0x68(%rsp)` instead of `lea 0x70(%rsp)` and EXECUTING it returns 4 against the unmutated 42 — so it does detect a half-applied rule, but only where the ELF arm is SPAWNED. On a Windows host the runner compiles a `runOn: [linux]` arm and skips its run (its own documented policy), and the arm that spawns there is pe64, whose axis collapses `long double` to binary64 so no datum out-aligns the slot. The Windows leg's red-on-disable therefore lives in tests/lir/test_lir_long_double_stack_arg_alignment.cpp, which reads the shipped config directly and goes red with literal ABI offsets when the sysv_amd64 `stackArgPacking` declaration is removed; this example is the LINUX-leg execution witness. exit = 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

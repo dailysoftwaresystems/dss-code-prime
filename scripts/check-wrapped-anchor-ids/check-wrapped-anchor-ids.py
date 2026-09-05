@@ -65,9 +65,20 @@ disagreeing about the same tree.
     sibling is cited (wrapped) in `src/asm/asm.cpp` and in
     `src/hir/lowering/cst_to_hir.cpp`; without (b) those two sites are invisible
     to the instrument built to see invisible sites.
-  * WHY MEMBERSHIP IS TESTED AT ALL: it is what separates a real citation from a
-    hyphenated English word that happens to break across lines. The join is only
-    a finding when the joined string IS an anchor id.
+  * WHAT MEMBERSHIP IS FOR, **AS OF P55 (2026-09-03)**, AND IT IS NO LONGER THE
+    GATE IT USED TO BE. This paragraph used to read *"the join is only a finding
+    when the joined string IS an anchor id"*, and that sentence was the guard's
+    contract AND its blindness: an id minted by the very lane that wraps it is not
+    in `.plans/` for the whole of that lane's run, so the class of id most likely
+    to be wrapped was the one class that could never fire.
+    ⇒ A join is now a finding whether or not it is a declared id; membership only
+    CLASSIFIES the finding (`declared, invisible to grep` vs `NOT a declared id`).
+    What separates a real citation from a hyphenated English word is, and always
+    was, `wrap_prefix` -- the line must end in `-` AND end with an anchor-shaped
+    fragment at a word boundary. ✔MEASURED before the change: across the governed
+    set (3,122 files, 2,790 keys) ZERO sites rejoin to a non-key and ZERO rejoin to
+    a key, so membership was contributing no discrimination at all.
+    See D-GATE-WRAPPED-ANCHOR-IDS-BLIND-TO-A-WRAP-OF-A-ROW-MINTED-THIS-CYCLE.
 
 ── THE JOIN RULE, AND WHERE IT COMES FROM ───────────────────────────────────────
 Transcribed from `check-anchor-registry.sh`'s `WRAP_JOIN_AWK`, whose two
@@ -89,7 +100,12 @@ to an id broken across THREE lines. ✔MEASURED 2026-08-23: two such sites exist
 `D-FFI-ABI-CATALOG-SELECTS-CALLING-CONVENTION-BY-FORMAT-IDENTITY`), and the
 two-line form reports them as unresolvable fragments instead of as wraps.
 The walk continues only while the line it just consumed ALSO ends mid-name, so
-it is self-limiting; the joined string must still be an exact key to fire.
+it is self-limiting. ⚠ This sentence used to end *"the joined string must still be
+an exact key to fire"* and that is FALSE as of P55 -- see the key-set section
+above. An UNDECLARED join fires too, but only when the walk ENDS, never at the
+first continuation: recording eagerly would stop a longer walk before it reached
+its key, so `D-XX-` / `P-Q-` / `R.` would be reported as `D-XX-P-Q` -- mis-naming
+the finding and hiding the real one. That ordering is pinned by its own arm.
 
 ── FAIL-CLOSED ──────────────────────────────────────────────────────────────────
 An empty scan is a COLLAPSE, not a pass (D-GATE-ANCHOR-GUARD-FAILS-OPEN-ON-MISSING-ROOT):
@@ -242,12 +258,50 @@ def continuation(line):
     return m.group(0) if m else ""
 
 
+# ★★★ THE JOIN MUST NOT REQUIRE A **KNOWN** KEY, AND THAT IS THE WHOLE OF
+# D-GATE-WRAPPED-ANCHOR-IDS-BLIND-TO-A-WRAP-OF-A-ROW-MINTED-THIS-CYCLE.
+# `anchor_key_set` harvests from `.plans/` ALONE. A lane's OWN new row lives in its
+# scratchpad until the orchestrator applies it, so for the entire lane the id is not
+# a key and NO WRAP OF IT COULD EVER JOIN -- the guard was structurally silent on the
+# one class of id a lane is most likely to wrap, because it is the one being typed
+# for the first time.
+# ⚠ THE SIBLING GUARD HID MOST OF THIS, WHICH IS WHY IT SURVIVED. A wrap that rejoins
+# WRONGLY leaves a citation resolving to nothing, and `check-anchor-registry` catches
+# that -- ✔it did, in P55, surfacing lane `nw`'s truncated id across 14 files. THE
+# UNCOVERED CASE IS A WRAP THAT REJOINS **CORRECTLY**: the citation resolves, that
+# guard is satisfied, and the id is still invisible to every grep -- which is the
+# entire harm a wrap does, and the reason this guard exists separately.
+# ✔THE WIDENING IS MEASURED SAFE, NOT ASSUMED. Over the governed set (3,122 files,
+# 2,790 harvested keys) the number of sites whose rejoin is NOT a known key is ZERO,
+# as is the number whose rejoin IS one -- so the key test was contributing NO
+# discrimination, and `wrap_prefix`'s *ends in `-` AND ends with an anchor-shaped
+# fragment at a word boundary* was already doing all of it.
+# ★ THE THRESHOLD IS DERIVED, NOT PICKED: the SHORTEST real registry row name carries
+# TWO hyphens (`D-CSUBSET-ALIGNAS`, 16 such rows out of 2,136), so any higher bar
+# would reintroduce the blindness for exactly those rows.
+# ⚠⚠ SAY WHAT IT ACTUALLY DOES, WHICH IS TODAY **NOTHING**, because a comment that
+# implies a filter it does not perform is the species this tree punishes hardest. The
+# shortest joinable string is a 1-hyphen prefix (`D-X`) plus one continuation = TWO
+# hyphens, so at 2 this rejects nothing that can be joined at all. It is a declared
+# FLOOR that happens to sit exactly at the shortest real id -- kept because it states
+# the rule and fails loud if the id shape ever shortens, NOT because it is filtering
+# anything now. ⚠ Re-derive it if the id shape changes; a literal in a comment is a
+# measurement with no instrument attached.
+_MIN_UNKNOWN_SEGMENTS = 2
+
+
 def wraps_in(lines, keys):
-    """-> [(joined_id, opening_text, continuation_texts)] for one file's lines.
+    """-> [(joined_id, opening_text, continuation_texts, known)] for one file's lines.
 
     Walks forward while each consumed line ALSO ends mid-name, so a three-line
     (or longer) split joins. Self-limiting: the walk stops at the first line
-    that does not end in `-`, and the joined string must be an exact key.
+    that does not end in `-`.
+
+    `known` says whether the rejoined id is one the plans already declare. A join
+    that is NOT a key is recorded only when the walk ENDS -- never at the first
+    continuation -- because recording early would stop a longer walk before it
+    reached its key: `D-XX-` / `P-Q-` / `R.` must join to `D-XX-P-Q-R`, and an
+    eager record at `D-XX-P-Q` would both mis-name the finding and hide the real one.
     """
     found = []
     for i, line in enumerate(lines):
@@ -262,9 +316,13 @@ def wraps_in(lines, keys):
             parts.append(lines[j])
             joined = acc + "-" + cont
             if joined in keys:
-                found.append((joined, line, list(parts)))
+                found.append((joined, line, list(parts), True))
                 break
             if not lines[j].rstrip(" \t").endswith("-"):
+                # The walk ENDS here and the join is not a declared id -- which is
+                # precisely the shape a row minted THIS CYCLE takes.
+                if joined.count("-") >= _MIN_UNKNOWN_SEGMENTS:
+                    found.append((joined, line, list(parts), False))
                 break
             acc, j = joined, j + 1
     return found
@@ -560,8 +618,16 @@ def run(root, write, baseline=False):
         for rel, ceiling, n in new:
             print("    %s: %d wrapped id(s), inventory allows %d" % (rel, n, ceiling),
                   file=sys.stderr)
-            for joined, opening, conts in now[rel][ceiling:]:
-                print("      -> %s" % joined, file=sys.stderr)
+            for joined, opening, conts, known in now[rel][ceiling:]:
+                # ★ THE TWO CLASSES READ DIFFERENTLY AND A READER MUST NOT HAVE TO
+                # OPEN THE FILE TO TELL THEM APART: a KNOWN id resolves everywhere
+                # and is invisible only to grep; an UNKNOWN one is either a row
+                # minted this cycle and not yet applied, or a false id that no
+                # registry will ever answer for.
+                print("      -> %s   [%s]"
+                      % (joined, "declared id, invisible to grep" if known else
+                         "NOT a declared id -- a row minted this cycle, or a false id"),
+                      file=sys.stderr)
                 print(_site_text(opening, conts), file=sys.stderr)
         print("  A split id still READS as a citation, but no grep for the WHOLE id "
               "will ever return it, and neither anchor guard can count it. It does "
@@ -615,7 +681,7 @@ def run(root, write, baseline=False):
 # arm that checks only the code cannot tell which one it proved. That exact
 # mistake was measured in a sibling guard.
 
-EXPECTED_ARMS = 40
+EXPECTED_ARMS = 44
 
 
 def _tmp_repo(files, ceilings, comment=None):
@@ -702,8 +768,35 @@ def selftest():
           hits("// see %s for the rest\n" % _FOO) == [])
     check("a hyphenated English word split across lines is not a finding",
           hits("the well-\nKNOWN case\n") == [])
-    check("a D-...- split whose join is not a key is not a finding",
-          hits("// D-XX-\n// QUUX\n") == [])
+    # ★★★ THIS ARM'S EXPECTATION IS **INVERTED** FROM WHAT IT ASSERTED UNTIL P55, AND
+    # THE OLD TEXT IS KEPT HERE BECAUSE THE FLIP IS THE FIX. It read *"a D-...- split
+    # whose join is not a key is not a finding"* -- which was the guard's contract and
+    # was ALSO its blindness: a row minted this cycle is never a key while the lane
+    # that mints it is running, so the class of id most likely to be wrapped was the
+    # one class that could not be found. See
+    # D-GATE-WRAPPED-ANCHOR-IDS-BLIND-TO-A-WRAP-OF-A-ROW-MINTED-THIS-CYCLE.
+    # ⚠ EVERY ARM BELOW INDEXES THROUGH A GUARDED HELPER, NEVER `hits(...)[0]`.
+    # An arm that raises IndexError under a mutant does not FAIL, it ABORTS the
+    # run -- and every arm after it, including the controls that prove the mutant
+    # was targeted, silently never executes. ✔MEASURED in this very cycle: the
+    # first red-on-disable pass here produced ONE red and FOUR greens out of 44,
+    # because the mutant emptied the list this arm indexed. Two sibling lanes
+    # reported the same masking shape the same day.
+    def first(text, idx, keys=KEYS):
+        """Field `idx` of the first hit, or None when there is no hit at all."""
+        h = hits(text, keys)
+        return h[0][idx] if h else None
+
+    check("a split whose join is NOT a declared key is a finding (the P55 fix)",
+          [h[0] for h in hits("// D-XX-\n// QUUX\n")] == ["D-XX" + "-QUUX"])
+    check("...and it is reported as NOT known, so a reader can tell the classes apart",
+          first("// D-XX-\n// QUUX\n", 3) is False)
+    check("a join that IS a declared key is still found, and marked known",
+          first("// D-XX-\n// FOO\n", 3) is True)
+    check("the three-line walk still reaches its KEY rather than recording the "
+          "intermediate join -- an eager record would mis-name the finding AND hide "
+          "the real one",
+          [(h[0], h[3]) for h in hits("// D-XX-\n// P-Q-\n// R.\n")] == [(_LONG, True)])
     check("a continuation resuming in LOWER case is prose, not a name",
           hits("// D-XX-\n// baz\n") == [])
     check("box-drawing / comment junk before the continuation is stripped",
@@ -718,9 +811,12 @@ def selftest():
           == [_FOO])
     check("a trailing CR does not hide the break (CRLF file)",
           [h[0] for h in hits("// D-XX-\r\n// FOO\r\n")] == [_FOO])
+    # ⓘ Routed through `first` for the same reason as the arms above: under a mutant
+    # that empties the hit list this arm used to raise IndexError and take the rest
+    # of the run with it. It was not the arm that exposed the shape, but it carried it.
     check("the opening line and every continuation are reported for the finding",
-          hits("// D-XX-\n// FOO\n")[0][1].strip() == "// D-XX-"
-          and hits("// D-XX-\n// FOO\n")[0][2][0].strip() == "// FOO")
+          (first("// D-XX-\n// FOO\n", 1) or "").strip() == "// D-XX-"
+          and [c.strip() for c in (first("// D-XX-\n// FOO\n", 2) or [])] == ["// FOO"])
 
     # ── B. the four row-mandated cases, through the REAL scan ───────────────
     # A synthetic repo whose `.plans/` declares one anchor, so the key set is
@@ -769,9 +865,22 @@ def selftest():
         check("(3) a hyphenated English word split across lines is GREEN",
               rc == EXIT_OK)
 
+        # ★★★ ARM (4) IS **INVERTED** FROM WHAT THE ORIGINAL ROW MANDATED, AND THE
+        # INVERSION IS THE FIX RATHER THAN A RELAXATION OF ITS DEMAND. It asserted
+        # *"a `D-...-` split whose join is NOT an anchor id is GREEN"* -- reasonable
+        # when written, and the exact shape of the blindness: an id minted by the
+        # lane that is wrapping it is NOT a key for the whole of that lane's run, so
+        # the class most likely to be wrapped was the one class guaranteed to pass.
+        # ✔The widening was measured before it was made: ZERO sites in the governed
+        # set (3,122 files) rejoin to a non-key, so this costs no false positives.
+        # See D-GATE-WRAPPED-ANCHOR-IDS-BLIND-TO-A-WRAP-OF-A-ROW-MINTED-THIS-CYCLE.
         rc, out = _run_capture(synth("// D-XX-\n// NOTAKEY here\n"))
-        check("(4) a `D-...-` split whose join is NOT an anchor id is GREEN",
-              rc == EXIT_OK)
+        check("(4) a `D-...-` split whose join is NOT a declared id is RED (P55: this "
+              "arm asserted GREEN, and that WAS the blindness)",
+              rc == EXIT_RATCHET)
+        check("(4) ... and the report says the id is NOT declared, so a wrap of a "
+              "row minted this cycle is distinguishable from a false id",
+              "NOT a declared id" in out)
 
         # ── C. the ratchet, both directions ─────────────────────────────────
         body2 = ("// D-XX-\n// WRAPCASE one\n"

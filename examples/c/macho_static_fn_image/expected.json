@@ -1,0 +1,15 @@
+{
+  "$comment": "D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT: a Mach-O image carrying a `static` function beside an exported one. Both image nlist builders used to stamp N_SECT|N_EXT on every defined function (a `static` reached the image under its real name with the EXTERNAL bit set, LC_DYSYMTAB nlocalsym 0); ld64 emits it N_SECT with no N_EXT, first in the table, under ilocalsym 0 / nlocalsym 1 / iextdefsym 1 (measured 2026-09-04, Apple clang 21.0.0 / ld-1267). The structural pin is tests/link/test_macho_image_symtab_bands.cpp; this example is the RUN witness that an image with a local band loads, passes its ad-hoc signature and exits 42 on darwin, and BUILDS everywhere. Two statics are reached through a const fn-ptr table indexed by a RUNTIME value (argc - 1), a shape chosen so no pass sees a constant index and the statics stay address-taken through the release arm -- that is the INTENT of the shape, not a measurement; what this example asserts is the exit code on both arms: table[0](40) = static_helper(40) = 42. The nlist itself is pinned by tests/link/test_macho_image_symtab_bands.cpp, which compiles the default pipeline. The pe arm RUNS on windows, elf x86_64 on linux, elf arm64 under qemu, macho arm64 on darwin.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

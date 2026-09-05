@@ -922,12 +922,21 @@ TEST(MachOTextSectionAlign, TheSTATICExecArmWritesLog2Too) {
     // ★ THE MODULE CARRIES NO EXTERN IMPORTS, AND THAT IS THE WHOLE POINT:
     // `macho::encode` routes on `externImports.empty()`, so this is the only
     // shape that reaches `encodeExec`. The synthetic schema is used rather than
-    // a shipped one because every shipped Darwin exec document declares a
-    // non-zero `image.codeSignatureSize`, and `macho::encode` REFUSES that
-    // combination outright (the static arm emits no __LINKEDIT to host the
-    // signature) — so the static arm is unreachable from a shipped exec schema
-    // by construction, and saying so here is cheaper than the next reader
-    // re-deriving it.
+    // a shipped one because every shipped Darwin exec document requests a code
+    // signature, and `macho::encode` REFUSES that combination outright (the
+    // static arm emits no __LINKEDIT to host the signature) — so the static arm
+    // is unreachable from a shipped exec schema by construction, and saying so
+    // here is cheaper than the next reader re-deriving it.
+    //
+    // ⚠ CORRECTED under D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM. This
+    // sentence used to say the shipped documents declare "a non-zero
+    // `image.codeSignatureSize`". ✔MEASURED: not one of them does — they
+    // declare `image.codeSignature`, the ad-hoc block. The CONCLUSION was right
+    // and had been right all along; the REASON was false, and it was false in
+    // the exact direction that mattered, because the gate it described tested
+    // `codeSignatureSize` alone and therefore did NOT refuse the shipped
+    // documents. A comment stating a premise no instrument checks is how a
+    // guard gets believed for a rule it does not enforce.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(execSchemaJson());

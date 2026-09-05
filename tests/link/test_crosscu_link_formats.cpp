@@ -5,7 +5,10 @@
 // The LK11b merge's cross-CU REFERENCE resolution is keyed on the format's
 // DECLARED `externCallDispatch` (config, never format identity):
 //
-//   * `direct-plt` (every shipped format) / undeclared → the reference retargets
+//   * `direct-plt` (every shipped IMAGE format; it was every shipped format
+//     until P54 pointed the two RELOCATABLE pe formats at `indirect-slot` —
+//     D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET) /
+//     undeclared → the reference retargets
 //     DIRECTLY to the sibling definition's merged id. Pre-c154 the merge
 //     unconditionally minted a GOT-like RODATA thunk slot and retargeted the
 //     DIRECT call site into the slot's DATA bytes — the linked exec SIGSEGV'd
@@ -230,8 +233,10 @@ struct Loaded {
 }
 
 // The shipped ELF dyn format's JSON text with `externCallDispatch` flipped to
-// `indirect-slot` — the indirect-dispatch variant no shipped format declares
-// (all ship `direct-plt`), used to pin the thunk-slot arm.
+// `indirect-slot` — the indirect-dispatch variant no shipped IMAGE format
+// declares (they all ship `direct-plt`; since P54 the two RELOCATABLE pe
+// formats declare `indirect-slot`, which is why this says IMAGE and no longer
+// says "no shipped format"), used to pin the thunk-slot arm.
 [[nodiscard]] std::shared_ptr<ObjectFormatSchema> loadIndirectSlotDynVariant() {
     auto path = findShippedConfig({"elf64-x86_64-linux-dyn", "object-formats",
                                    ".format.json", "object format",

@@ -14,6 +14,8 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace dss {
@@ -487,7 +489,8 @@ contentDeclSiteKey(std::span<TypeId const> fields,
                    std::span<std::uint32_t const> fieldAligns = {},
                    bool packed = false,
                    std::uint32_t explicitAlign = 0,
-                   std::uint32_t maxFieldAlign = 0) {
+                   std::uint32_t maxFieldAlign = 0,
+                   std::span<std::uint8_t const> fieldPacked = {}) {
     std::uint64_t h = kFnvOffset;
     h = fnvMix(h, fields.size());
     for (TypeId f : fields) h = fnvMix(h, f.v);
@@ -535,6 +538,20 @@ contentDeclSiteKey(std::span<TypeId const> fields,
     // byte-identically to the pre-TF-C82 function: zero TypeId churn, goldens and
     // round-trips unaffected.
     if (maxFieldAlign != 0) h = fnvMix(h, static_cast<std::uint64_t>(maxFieldAlign));
+    // D-CSUBSET-PER-MEMBER-PACKED: the per-FIELD packed flags enter the content
+    // identity, and this is the channel where omitting them would be HARDEST to
+    // notice. `struct { char a; int z; double d; }` is sizeof 16 / _Alignof 8 BOTH
+    // with and without a per-member packed on `z` — only the OFFSET of `z` moves
+    // (4 → 1). So two distinct layouts would collide on one TypeId with matching
+    // sizes and matching alignments, and every size-based check downstream would
+    // agree with the wrong one. GUARDED on non-empty (mirrors the offsets/aligns
+    // guards) so a composite with no per-member packed hashes byte-identically to
+    // the pre-channel function: zero TypeId churn, goldens and round-trips
+    // unaffected.
+    if (!fieldPacked.empty()) {
+        h = fnvMix(h, fieldPacked.size());
+        for (std::uint8_t p : fieldPacked) h = fnvMix(h, static_cast<std::uint64_t>(p));
+    }
     return h | (std::uint64_t{1} << 63);
 }
 
@@ -608,7 +625,8 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
                                      std::span<std::uint64_t const> fieldOffsets,
                                      std::span<std::uint32_t const> fieldAligns,
                                      std::uint32_t explicitAlign,
-                                     std::uint32_t maxFieldAlign) {
+                                     std::uint32_t maxFieldAlign,
+                                     std::span<std::uint8_t const> fieldPacked) {
     TypeRecord const& rec = arena_.at(id);
     if (rec.kind != TypeKind::Struct && rec.kind != TypeKind::Union) {
         latticeFatal("completeComposite: TypeId is not a Struct/Union");
@@ -647,6 +665,22 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
         latticeFatal("completeComposite: a struct cannot be BOTH packed and carry "
                      "explicit field offsets (offsets place fields wholesale, "
                      "overriding padding)");
+    }
+    // D-CSUBSET-PER-MEMBER-PACKED: the per-field flags are ALL-fields-or-NONE, the
+    // same discipline `fieldOffsets` and `fieldAligns` are held to — a partial span
+    // is a caller bug, and one silently short by a field would leave the LAST members
+    // unpacked with nothing said.
+    if (!fieldPacked.empty() && fieldPacked.size() != fields.size()) {
+        latticeFatal("completeComposite: per-field packed flags must cover every "
+                     "field (all-or-none)");
+    }
+    // D-CSUBSET-PER-MEMBER-PACKED: explicit offsets place fields wholesale, so a
+    // per-field packed is as contradictory with them as the whole-composite flag is
+    // (guard above). Fail loud rather than let one channel silently win.
+    if (!fieldPacked.empty() && !fieldOffsets.empty()) {
+        latticeFatal("completeComposite: a struct cannot carry BOTH per-field packed "
+                     "flags and explicit field offsets (offsets place fields "
+                     "wholesale, overriding padding)");
     }
     // D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): the whole-composite alignment must be a
     // representable alignment (a power of two ≤ 256) or the 0 no-request sentinel.
@@ -690,7 +724,13 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
                  // CONFLICTING re-completion — the two definitions lay out to
                  // different sizes, so keeping whichever ran first would silently
                  // pick one layout for a type the source gives two.
-                 && it->second.maxFieldAlign == maxFieldAlign;
+                 && it->second.maxFieldAlign == maxFieldAlign
+                 // D-CSUBSET-PER-MEMBER-PACKED: a re-completion that CHANGES which
+                 // members are individually packed is a CONFLICTING re-completion —
+                 // the two definitions give the same type two different field
+                 // offsets, and (on the `{char; int; double}` shape) the same size,
+                 // so keeping whichever ran first would silently pick one ABI.
+                 && it->second.fieldPacked.size() == fieldPacked.size();
         for (std::size_t i = 0; same && i < fields.size(); ++i)
             if (it->second.fields[i].v != fields[i].v) same = false;
         for (std::size_t i = 0; same && i < sc.size(); ++i)
@@ -699,6 +739,8 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
             if (it->second.fieldOffsets[i] != fieldOffsets[i]) same = false;
         for (std::size_t i = 0; same && i < fieldAligns.size(); ++i)
             if (it->second.fieldAligns[i] != fieldAligns[i]) same = false;
+        for (std::size_t i = 0; same && i < fieldPacked.size(); ++i)
+            if (it->second.fieldPacked[i] != fieldPacked[i]) same = false;
         if (!same) {
             latticeFatal("completeComposite: composite re-completed with different "
                          "fields (double-complete / tag redecl)");
@@ -712,6 +754,7 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
     it->second.packed = packed;
     it->second.explicitAlign = explicitAlign;
     it->second.maxFieldAlign = maxFieldAlign;
+    it->second.fieldPacked.assign(fieldPacked.begin(), fieldPacked.end());
     it->second.complete = true;
     ++poolGen_;   // the field view changed — invalidate any pre-completion span
 }
@@ -822,6 +865,30 @@ TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> f
     return id;
 }
 
+TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> fields,
+                                std::span<std::int64_t const> fieldBitWidths,
+                                std::span<std::uint64_t const> fieldOffsets,
+                                std::span<std::uint32_t const> fieldAligns,
+                                std::uint32_t explicitAlign,
+                                std::uint32_t maxFieldAlign,
+                                std::span<std::uint8_t const> fieldPacked) {
+    // D-CSUBSET-PER-MEMBER-PACKED: the per-field packed flags enter the content
+    // identity, so `struct { char a; int z <packed>; double d; }` and the same field
+    // list undecorated are TWO interned types. They have the SAME size (16) and the
+    // SAME alignment (8) and differ only in `z`'s offset (1 vs 4) — which is exactly
+    // why the mix is required rather than merely tidy: nothing downstream that checks
+    // sizes could ever separate them. An EMPTY span routes exactly like the 7-arg
+    // overload (byte-identical declSiteKey).
+    auto const sc = encodeFieldBitWidths(fields.size(), fieldBitWidths);
+    TypeId const id = internComposite(
+        TypeKind::Struct, name,
+        contentDeclSiteKey(fields, sc, fieldOffsets, fieldAligns, /*packed=*/false,
+                           explicitAlign, maxFieldAlign, fieldPacked));
+    completeComposite(id, fields, /*packed=*/false, fieldBitWidths, fieldOffsets,
+                      fieldAligns, explicitAlign, maxFieldAlign, fieldPacked);
+    return id;
+}
+
 bool TypeInterner::hasExplicitOffsets(TypeId id) const {
     id = materialId_(id);
     TypeKind const k = arena_.at(id).kind;
@@ -863,6 +930,25 @@ bool TypeInterner::isPacked(TypeId id) const {
     if (k != TypeKind::Struct && k != TypeKind::Union) return false;
     auto it = compositeFields_.find(id.v);
     return it != compositeFields_.end() && it->second.packed;
+}
+
+bool TypeInterner::hasFieldPacked(TypeId id) const {
+    // Same skin-strip as `hasExplicitAligns`: a qualifier never changes layout, so a
+    // `volatile struct S` carries S's per-field packed flags.
+    id = materialId_(id);
+    TypeKind const k = arena_.at(id).kind;
+    if (k != TypeKind::Struct && k != TypeKind::Union) return false;
+    auto it = compositeFields_.find(id.v);
+    return it != compositeFields_.end() && !it->second.fieldPacked.empty();
+}
+
+bool TypeInterner::isFieldPacked(TypeId id, std::size_t i) const {
+    id = materialId_(id);
+    auto it = compositeFields_.find(id.v);
+    if (it == compositeFields_.end() || i >= it->second.fieldPacked.size()) {
+        return false;   // no per-field flag → the ordinary (padded) baseline
+    }
+    return it->second.fieldPacked[i] != 0;
 }
 
 std::uint32_t TypeInterner::explicitCompositeAlign(TypeId id) const {
@@ -1165,7 +1251,84 @@ bool TypeInterner::fnIsVariadic(TypeId id) const {
 //   member is ACCESSED instead. The layout tier needs no help there — the
 //   `scalarByteSize` NullptrT arm already sizes it as a pointer, which is the same
 //   answer the projection gives.
-TypeId TypeInterner::representationType(TypeId id) {
+namespace {
+
+// ★★ ONE OWNER FOR "WHAT DOES THE PROJECTION DESCEND THROUGH". The scan, the
+// work-stack expander and the rebuild below all read this, so teaching the
+// projection a new composer is ONE edit rather than three places that must be
+// kept agreeing — the class of drift a `-Werror=switch` cannot catch because a
+// predicate with a `default:` is always "exhaustive".
+//
+// The build-time backstop the header note calls load-bearing is UNAFFECTED and
+// stays where it was: `projectRepresentationLevel` below still names every
+// enumerator with NO `default:` arm, so a new TypeKind fails the BUILD there
+// until somebody decides whether its identity and its representation coincide.
+// This helper cannot hide that; it can only make a new composer's children
+// invisible to the walk, which the main switch would then refuse to compile past.
+//
+// Yields the children whose projection this level's answer depends on:
+//   * a QUALIFIER SKIN has exactly one — its material type. Yielding it and
+//     returning is what keeps `kind()`'s transparency from double-visiting the
+//     material's own children here.
+//   * Ptr / Array — the element.
+//   * FnSig — the result, then every parameter.
+//   * everything else, INCLUDING every nominal composite — none. That is what
+//     keeps this walk out of the type graph's cycles entirely: a cycle in a C
+//     type graph must pass through a composite, and the projection stops at one.
+template <class F>
+void forEachRepresentationChild(TypeInterner const& ti, TypeId t, F&& fn) {
+    if (!t.valid()) return;
+    if (ti.qualifierBits(t) != 0) { fn(ti.stripVolatile(t)); return; }
+    switch (ti.kind(t)) {
+        case TypeKind::Ptr:
+        case TypeKind::Array: {
+            auto const ops = ti.operands(t);
+            if (!ops.empty()) fn(ops[0]);
+            return;
+        }
+        case TypeKind::FnSig: {
+            fn(ti.fnResult(t));
+            // `fnParams` is a fresh view and `fn` here only ever pushes onto a
+            // local worklist — it never interns — so no span is held across a
+            // pool reallocation. The arms that DO intern are in
+            // `projectRepresentationLevel`, and each copies its ids out first.
+            for (TypeId p : ti.fnParams(t)) fn(p);
+            return;
+        }
+        default:
+            return;
+    }
+}
+
+} // namespace
+
+// ── THE OBJECT-REPRESENTATION PROJECTION, ONE LEVEL ─────────────────────────
+//
+// The whole of the old `representationType` body, ARM FOR ARM, with the single
+// change that a child's projection is READ from `projected` instead of being
+// computed by a recursive call. `projected` maps a source TypeId to its already-
+// resolved projection; a lookup MISS answers identity, which is the conservative
+// direction — an unprojected `nullptr_t` does not become a wrong type, it
+// reaches MIR and is refused loudly there by `I_NullptrTypeInMir`.
+//
+// ⚠⚠ EVERY ARM BELOW COPIES THE OPERANDS AND SCALARS OUT *BEFORE* IT INTERNS,
+// and that is not style — it is the D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD
+// contract. `operands()` / `scalars()` / `fnParams()` hand back VIEWS into the
+// interner's pools, and building a projected type INTERNS, which reallocates
+// them. Reading the view after that is a heap-use-after-free. ✔MEASURED when
+// this projection was first written: a draft that held `auto const ops =
+// operands(id)` across the child call fired the guard (`stale operand/scalar
+// span read`) the moment `nullptr_t *` was projected — a shape no C source can
+// reach today, so ONLY the synthetic pin in
+// `tests/hir/test_type_representation_projection.cpp` could see it. Flattening
+// the recursion does not retire that rule; it makes it structural, because a
+// level now interns at most once and holds nothing across it.
+TypeId TypeInterner::projectRepresentationLevel(
+    TypeId id, std::unordered_map<TypeId, TypeId> const& projected) {
+    auto childOf = [&](TypeId c) {
+        auto const it = projected.find(c);
+        return it == projected.end() ? c : it->second;
+    };
     if (!id.valid()) return id;
     // A QUALIFIER SKIN is transparent to `kind()`, so it has to be peeled and
     // RE-APPLIED explicitly. Projecting through it and returning the bare material
@@ -1174,8 +1337,8 @@ TypeId TypeInterner::representationType(TypeId id) {
     // bit" note exists to prevent, arriving by a different door.
     if (std::int64_t const bits = qualifierBits(id); bits != 0) {
         TypeId const material  = stripVolatile(id);
-        TypeId const projected = representationType(material);
-        return projected.v == material.v ? id : qualified(projected, bits);
+        TypeId const p         = childOf(material);
+        return p.v == material.v ? id : qualified(p, bits);
     }
     switch (kind(id)) {
         // ★ THE ONE KIND WHOSE IDENTITY AND REPRESENTATION DIFFER, and the reason
@@ -1196,73 +1359,67 @@ TypeId TypeInterner::representationType(TypeId id) {
         // These three are the whole C surface that can carry a `nullptr_t` inside
         // a type without a nominal boundary: `nullptr_t *`, `nullptr_t [N]`, and a
         // function taking/returning one.
-        // ⚠⚠ EVERY ARM BELOW COPIES THE OPERANDS AND SCALARS OUT *BEFORE* IT
-        // RECURSES, and that is not style — it is the
-        // D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD contract. `operands()` /
-        // `scalars()` / `fnParams()` hand back VIEWS into the interner's pools, and
-        // the recursive call may INTERN a projected element, which reallocates
-        // them. Reading the view after that is a heap-use-after-free.
-        // ✔MEASURED while writing this: the first draft held `auto const ops =
-        // operands(id)` across `representationType(ops[0])` and the guard fired
-        // (`stale operand/scalar span read`) the moment `nullptr_t *` was
-        // projected — a shape no C source can reach today, so ONLY the synthetic
-        // pin in `tests/hir/test_type_representation_projection.cpp` could see it.
         case TypeKind::Ptr: {
-            auto const ops = operands(id);
-            if (ops.empty()) return id;
-            TypeId const elem = ops[0];             // copy OUT before interning
-            TypeId const e    = representationType(elem);
+            TypeId elem{};
+            {
+                auto const ops = operands(id);
+                if (ops.empty()) return id;
+                elem = ops[0];                  // copy OUT before interning
+            }
+            TypeId const e = childOf(elem);
             return e.v == elem.v ? id : pointer(e);
         }
         case TypeKind::Array: {
-            auto const ops = operands(id);
-            auto const sc  = scalars(id);
-            if (ops.empty() || sc.empty()) return id;
-            TypeId const       elem = ops[0];       // copy OUT before interning
+            TypeId       elem{};
             // The length scalar travels VERBATIM — including the negative
             // sentinels (`kIncompleteArrayLength` -1, `kVlaLength` -2). Rebuilding
             // through `array()` with the raw scalar preserves an incomplete or
             // variable-length array's kind exactly; reading it as a count would
             // turn a flexible-array member into a 0-element array.
-            std::int64_t const len  = sc[0];
-            TypeId const       e    = representationType(elem);
+            std::int64_t len = 0;
+            {
+                auto const ops = operands(id);
+                auto const sc  = scalars(id);
+                if (ops.empty() || sc.empty()) return id;
+                elem = ops[0];                  // copy OUT before interning
+                len  = sc[0];
+            }
+            TypeId const e = childOf(elem);
             return e.v == elem.v ? id : array(e, len);
         }
         case TypeKind::FnSig: {
-            // Snapshot the scalar-pool facts first, as VALUES: everything below
-            // recurses, and a retained view would be the stale read above.
+            // Snapshot the scalar-pool facts first, as VALUES: the rebuild below
+            // interns, and a retained view would be the stale read above.
             std::int64_t ccScalar = 0;
             {
                 auto const sc = scalars(id);
                 if (sc.empty()) return id;  // no cc scalar — malformed; stay loud
                 ccScalar = sc[0];
             }
-            bool const     isVarArgs  = fnIsVariadic(id);
-            TypeId const   srcResult  = fnResult(id);
-            std::size_t const nParams = fnParams(id).size();
-            // ★ TWO PASSES, AND THE FIRST ALLOCATES NOTHING. This query runs at
-            // every type-entry point in the HIR lowering — `nameRefExpr` reaches
-            // it once per identifier, so every function NAME in every translation
-            // unit lands here — and for a signature with no `nullptr_t` inside it
-            // the answer is "unchanged". A single-pass rebuild heap-allocates the
-            // parameter list on that path just to hand back the TypeId it was
-            // given, which is a per-identifier allocation added to every compile.
-            bool moved = representationType(srcResult).v != srcResult.v;
-            for (std::size_t i = 0; !moved && i < nParams; ++i) {
-                TypeId const p = fnParams(id)[i];   // a FRESH view per probe
-                moved = representationType(p).v != p.v;
+            bool const   isVarArgs = fnIsVariadic(id);
+            TypeId const srcResult = fnResult(id);
+            std::vector<TypeId> srcParams(fnParams(id).begin(), fnParams(id).end());
+            // ★ THE "UNCHANGED" ANSWER STILL ALLOCATES NOTHING PAST THE SNAPSHOT
+            // AND STILL RETURNS `id` ITSELF. This query runs at every type-entry
+            // point in the HIR lowering — `nameRefExpr` reaches it once per
+            // identifier, so every function NAME in every translation unit lands
+            // here — and a rebuild that handed back a fresh-but-equal TypeId
+            // would re-intern on a path that is supposed to be free.
+            TypeId const newResult = childOf(srcResult);
+            bool moved = newResult.v != srcResult.v;
+            std::vector<TypeId> projectedParams;
+            projectedParams.reserve(srcParams.size());
+            for (TypeId p : srcParams) {
+                TypeId const np = childOf(p);
+                moved = moved || np.v != p.v;
+                projectedParams.push_back(np);
             }
             if (!moved) return id;
-            // PASS 2 — rebuild. Reached only by a signature that really moved.
-            std::vector<TypeId> projected;
-            projected.reserve(nParams);
-            for (std::size_t i = 0; i < nParams; ++i)
-                projected.push_back(representationType(fnParams(id)[i]));
             // The 4-arg overload with the DECODED variadic flag reproduces the
             // original scalar encoding exactly (non-variadic → the 1-slot legacy
             // form), so a projected signature differs from its source in the
             // param/result types and in nothing else.
-            return fnSig(projected, representationType(srcResult),
+            return fnSig(projectedParams, newResult,
                          static_cast<CallConv>(ccScalar), isVarArgs);
         }
 
@@ -1305,6 +1462,116 @@ TypeId TypeInterner::representationType(TypeId id) {
     // Out-of-range-ordinal backstop only (an enum switch is not exhaustive for
     // control-flow purposes) — mirrors `isPrimitiveTypeKind`'s tail.
     return id;
+}
+
+// ── THE PROJECTION COSTS HEAP, NOT HOST CALL FRAMES ─────────────────────────
+//
+// D-TYPEINTERNER-REPRESENTATIONTYPE-RECURSES-PER-TYPE-LEVEL-UNCAPPED. This used
+// to recurse one host frame per TYPE LEVEL through the qualifier skin and the
+// three composer arms, uncapped. ✔MEASURED by P55 lane `hs` on the ordinary
+// thread through `ctest`, on `int ***…*p;`: 4297 rc 0 / 4453 SEGFAULT, with a
+// gdb backtrace at 6000 showing ~40 identical frames here under a single
+// `cst_to_hir` caller — and `stop=analyze` reaching 19378 rc 0, so the death was
+// specifically this walk and not the parse.
+//
+// ★★ TWO PASSES, AND THE FIRST ALLOCATES NOTHING FOR THE SHAPES THAT OCCUR.
+// The projection changes a type IF AND ONLY IF a `NullptrT` is reachable through
+// a qualifier skin, a Ptr, an Array or a FnSig — those are the only composers
+// that rebuild and `NullptrT` is the only leaf that moves. Asking that first is
+// what preserves the contract stated above the level function: for the ~100% of
+// types with no `nullptr_t` anywhere inside, the TypeId that comes out is the
+// same object that went in, with nothing interned and nothing allocated.
+// Ptr / Array / qualifier are SINGLE-child, so the scan walks them as a plain
+// loop and `pending` stays empty — and therefore unallocated. Only a FnSig
+// branches, and only then does the scan pay for a worklist.
+//
+// ⚠ NO CYCLE IS POSSIBLE HERE and the walk still refuses to hang on one: a cycle
+// in a C type graph must pass through a nominal composite, and
+// `forEachRepresentationChild` stops at every one of them. The rebuild's `gray`
+// set is therefore insurance rather than a live requirement — it answers a back
+// edge with IDENTITY, which terminates and cannot manufacture a wrong type (an
+// unprojected `nullptr_t` fails loud at MIR).
+TypeId TypeInterner::representationType(TypeId id) {
+    if (!id.valid()) return id;
+
+    // ── PASS 1: does anything move? ──
+    std::vector<TypeId>        pending;
+    std::unordered_set<TypeId> seen;      // only populated once a FnSig branches
+    bool branched = false;
+    bool moves    = false;
+    for (TypeId cur = id; cur.valid();) {
+        // Dedupe only AFTER a branch. A Ptr/Array/qualifier chain visits each
+        // level exactly once by construction, and paying for a hash set there
+        // would tax every pointer-typed identifier in every program; a branching
+        // signature CAN reach one parameter type by several paths, and without
+        // this the scan is exponential in the nesting — which the two-pass probe
+        // this replaces also was.
+        if (branched && !seen.insert(cur).second) {
+            if (pending.empty()) break;
+            cur = pending.back();
+            pending.pop_back();
+            continue;
+        }
+        // `kind()` is qualifier-transparent, so this also catches a
+        // `volatile nullptr_t`, which does move.
+        if (kind(cur) == TypeKind::NullptrT) { moves = true; break; }
+        TypeId      first{};
+        std::size_t n = 0;
+        forEachRepresentationChild(*this, cur, [&](TypeId c) {
+            if (n++ == 0) first = c;
+            else          pending.push_back(c);
+        });
+        if (n > 1) branched = true;
+        if (n != 0) { cur = first; continue; }
+        if (pending.empty()) break;
+        cur = pending.back();
+        pending.pop_back();
+    }
+    if (!moves) return id;
+
+    // ── PASS 2: rebuild, over an explicit heap work stack ──
+    // Reached ONLY by a type that really contains a `nullptr_t`, so this path may
+    // allocate freely. A post-order DFS with three-colour marking: `projected` is
+    // BLACK (resolved), `gray` is the current path, everything else is white. The
+    // realloc-safe rule applies to the frame stack as well as to the interner's
+    // pools — copy the frame out and advance its phase BEFORE pushing anything,
+    // because `work.back()` may dangle the moment the vector grows.
+    enum class Phase : std::uint8_t { Expand, Resolve };
+    struct Frame {
+        TypeId id;
+        Phase  phase;
+    };
+    std::unordered_map<TypeId, TypeId> projected;
+    std::unordered_set<TypeId>         gray;
+    std::vector<Frame>                 work;
+    work.push_back(Frame{id, Phase::Expand});
+
+    while (!work.empty()) {
+        Frame const f = work.back();
+        if (f.phase == Phase::Expand) {
+            if (projected.contains(f.id)) {   // already resolved by another parent
+                work.pop_back();
+                continue;
+            }
+            if (gray.contains(f.id)) {        // back edge — see the note above
+                projected.emplace(f.id, f.id);
+                work.pop_back();
+                continue;
+            }
+            gray.insert(f.id);
+            work.back().phase = Phase::Resolve;
+            forEachRepresentationChild(*this, f.id, [&](TypeId c) {
+                work.push_back(Frame{c, Phase::Expand});
+            });
+            continue;
+        }
+        gray.erase(f.id);
+        work.pop_back();
+        projected.emplace(f.id, projectRepresentationLevel(f.id, projected));
+    }
+
+    auto const it = projected.find(id);
+    return it == projected.end() ? id : it->second;
 }
 
 namespace {

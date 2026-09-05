@@ -6,6 +6,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <span>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace dss {
 
@@ -86,12 +90,18 @@ compositeSeedAlign(TypeInterner const& interner, TypeId id) noexcept {
 // ── The ONE member-alignment CLAMP (D-CSUBSET-PACKED-BITFIELD-INTERACTION) ──
 //
 // The exact DUAL of `compositeSeedAlign` above: that one RAISES the aggregate's
-// own alignment, this one LOWERS each MEMBER's baseline. `packed` and
-// `#pragma pack(N)` are the two channels that do the lowering, and EVERY
-// member-alignment site in this engine now funnels through here — the Struct
-// arm's `effectiveAlign`, the Union arm's, and BOTH bit-field packers (via
+// own alignment, this one LOWERS each MEMBER's baseline. THREE channels do the
+// lowering — the whole-composite `packed`, `#pragma pack(N)`, and (P58,
+// D-CSUBSET-PER-MEMBER-PACKED) a PER-FIELD `packed` — and EVERY member-alignment
+// site in this engine funnels through here: the Struct arm's `effectiveAlign`,
+// the Union arm's, and BOTH bit-field packers (via
 // `bitfieldPackerEffectiveAlign` for an ordinary field, and directly for a
 // bit-field's storage-unit alignment).
+//
+// ⓘ The per-field channel does NOT appear in this signature. It resolves to the
+// `packed` BOOL below through `fieldPackedBaseline`, so the third channel cost
+// this helper no new parameter and no new branch — which is the whole reason it
+// could be added without a second layout algorithm.
 //
 // TF-C97: before this cycle the clamp was written TWICE — once in each
 // non-bit-field arm — and the two bit-field packers had NEITHER copy, so
@@ -114,13 +124,43 @@ compositeSeedAlign(TypeInterner const& interner, TypeId id) noexcept {
 // `completeComposite`, so an unrepresentable one reaching here is an upstream
 // bug — fail LOUD rather than silently lay the composite out uncapped.
 //
-// AGNOSTIC: both inputs are interned per-composite data; no target/format/
-// language identity is consulted.
+// AGNOSTIC: every input is interned data — `packCap` per composite, the `packed`
+// bool now resolved per FIELD by the caller — and no target/format/language
+// identity is consulted.
 [[nodiscard]] std::optional<Alignment>
 clampedBaselineAlign(bool packed, std::uint32_t packCap, Alignment natural) noexcept {
     if (packed) return Alignment::of<1>();
     if (packCap == 0 || packCap >= natural.bytes()) return natural;
     return Alignment::fromBytes(packCap);
+}
+
+// ── D-CSUBSET-PER-MEMBER-PACKED: the `packed` INPUT to the clamp above, per FIELD ──
+//
+// GNU lets `packed` sit on ONE member-declarator — `struct S { char a; int z
+// __attribute__((packed)); double d; };` — where it lowers THAT field's baseline to 1
+// and leaves its siblings alone. Every site in this engine that used to read the
+// composite flag once, outside the field loop, now asks THIS per field instead, so
+// the two spellings meet at the ONE clamp rather than growing a second algorithm.
+//
+// ✔MEASURED gcc 13.3.0 + clang 18.1.3, probed SEPARATELY, on x86_64 natively and on
+// aarch64 under qemu — all four arms byte-identical; MSVC 19.51 implements no
+// `__attribute__` in any position (C2061 at /std:c11, c17 AND clatest) and ABSTAINS:
+//   `{char a; int z <pk>; double d;}`   16 / align 8 / a@0 z@1 d@8
+//   `{char a; int z;      double d;}`   16 / align 8 / a@0 z@4 d@8   (control)
+//   `{char a; int z; double d;} <pk>`   13 / align 1 / a@0 z@1 d@5   (whole-composite)
+// ★ THE FIRST TWO HAVE THE SAME SIZE AND THE SAME ALIGNMENT. The per-member spelling
+// is NOT the whole-composite one applied narrowly: it never touches the aggregate's
+// alignment, which stays the ordinary MAX-fold over the EFFECTIVE member alignments
+// (`{char a; int z <pk>;}` does come out 5/1, but only because 1 is then the max).
+//
+// `hasFieldPacked` is hoisted by every caller so an undecorated composite — which is
+// every composite in the tree that predates this channel — pays one bool test and
+// never reaches the side-table query at all.
+[[nodiscard]] bool
+fieldPackedBaseline(TypeInterner const& interner, TypeId id, std::size_t i,
+                    bool compositePacked, bool hasFieldPacked) noexcept {
+    if (compositePacked) return true;   // the whole-composite flag covers every field
+    return hasFieldPacked && interner.isFieldPacked(id, i);
 }
 
 // Is the declared bit-field strategy one the engine actually realizes? A
@@ -138,6 +178,118 @@ bitFieldStrategyRealized(BitFieldStrategy s) noexcept {
             return false;
     }
     return false;
+}
+
+// ── THE LAYOUT WALK COSTS HEAP, NOT HOST CALL FRAMES ────────────────────────
+//
+// D-CORE-TYPE-LAYOUT-AND-HIR-CONST-EVAL-RECURSE-PER-LEVEL. The operator's
+// standing ruling of 2026-09-02: *"it's well known to not use recursive
+// structures in the compiler because big projects like sqlite will for sure
+// explode the stack"*. `computeLayout` used to recurse once per TYPE LEVEL —
+// array element, struct/union field, complex component, flexible-array element
+// — and it sits BELOW every other walk in the compiler, so its ceiling WAS the
+// ceiling of every deep-type route in the pipeline.
+//
+// ✔MEASURED before the conversion, on the ordinary ~1 MiB thread and through
+// `ctest` (never a bare `.exe`): a 1000-level array or struct nest laid out with
+// rc 0 and a 2000-level one died at rc 8 with no message, no location and no
+// `[  FAILED  ]` line. The SAME two numbers bounded `lowerToMir` on hand-built
+// HIR whose types nest — a file this engine does not own — which is what makes
+// this the load-bearing site rather than merely one more of them.
+//
+// The shape is the standard one and it falls out of a property the engine
+// already had: a level's body is PURE in its children's layouts. So `layoutOne`
+// below is that body with every recursive call replaced by a `memo` read, and
+// the driver resolves the type graph bottom-up over an explicit heap work stack.
+// There is no surviving depth counter because there is no longer a depth to
+// count — the only limit is memory.
+//
+// ⚠⚠ A TYPE WALK NEEDS A VISITED SET, NOT ONLY A STACK, AND THE TWO ARE
+// DIFFERENT DEFECTS. `struct S { struct S *next; }` is not depth at all — a
+// POINTER is a scalar and this walk never steps through one, which is why the
+// commonest struct shape in C was never the problem. But `struct A { struct A
+// a; }`, and the mutual `A { B b; } / B { A a; }`, are genuine CYCLES in the
+// BY-VALUE graph, and a work stack without cycle detection converts a stack
+// overflow into an INFINITE LOOP, which is strictly worse. ✔MEASURED before
+// this conversion, same rig: both by-value shapes killed the process, while the
+// self-pointer control laid out fine. The precedent is `mir_text.cpp`'s
+// `appendType` ([[D-MIR-TEXT-APPENDTYPE-RECURSES-PER-TYPE-LEVEL-AND-NEVER-TERMINATES-ON-A-SELF-REFERENTIAL-COMPOSITE]]),
+// which never terminated on exactly this shape.
+//
+// A by-value cycle has NO size, so it answers `nullopt` — the same fail-loud
+// refusal an incomplete composite already gets from the guard at the top of
+// `layoutOne`, never a guessed size, never a truncation and never a hang.
+
+// The per-walk answer table: the layout (or the fail-loud `nullopt`) of every
+// type the walk has resolved, keyed by the VOLATILE-STRIPPED id — `volatile T`
+// and `T` have the same layout by construction (C 6.7.3), so they share one
+// entry rather than being walked twice.
+using LayoutMemo = std::unordered_map<TypeId, std::optional<StructLayout>>;
+
+// A field / element / component layout lookup — the ONE replacement for the
+// recursive call every arm used to make. `nullptr` is exactly the old `!fl`
+// ("this child has no layout, fail loud"), so each arm's refusal reads and
+// behaves as it did.
+//
+// A MISS also answers `nullptr`, and cannot happen: `forEachLayoutDependency`
+// enumerates a SUPERSET of what the arms ask for and the driver resolves every
+// one of them before running a level's body. Were the two ever to drift apart
+// the walk would REFUSE a type it could have laid out — a loud diagnostic at
+// the caller, never a guessed size and never a silent miscompile.
+[[nodiscard]] StructLayout const*
+childLayout(LayoutMemo const& memo, TypeInterner const& interner, TypeId id) {
+    auto const it = memo.find(interner.stripVolatile(id));
+    if (it == memo.end() || !it->second.has_value()) return nullptr;
+    return &*it->second;
+}
+
+// Every type id whose layout SOME arm of `layoutOne` can ask for, given an
+// already-volatile-stripped `id`. Deliberately a SUPERSET: resolving a type the
+// chosen arm turns out not to need costs one memo entry, while MISSING one
+// costs a wrong refusal.
+//   * only Complex / Array / Struct / Union descend at all — a Ptr is a scalar,
+//     which is what keeps a self-referential-by-pointer composite finite;
+//   * every operand is a candidate (the element for Complex/Array, every field
+//     for Struct/Union) whichever arm is ultimately taken;
+//   * a FLEXIBLE ARRAY MEMBER field is the one two-step edge in the engine —
+//     all three FAM arms ask for the incomplete array's ELEMENT layout, never
+//     the array's own (which is `nullopt` by design).
+template <class F>
+void forEachLayoutDependency(TypeInterner const& interner, TypeId id, F&& fn) {
+    switch (interner.kind(id)) {
+        case TypeKind::Complex:
+        case TypeKind::Array:
+        case TypeKind::Struct:
+        case TypeKind::Union:
+            break;
+        default:
+            return;   // every other kind answers from its own record alone
+    }
+    for (TypeId const c : interner.operands(id)) {
+        fn(interner.stripVolatile(c));
+        if (interner.isIncompleteArray(c)) {
+            auto const elem = interner.operands(c);
+            if (!elem.empty()) fn(interner.stripVolatile(elem[0]));
+        }
+    }
+}
+
+// Does this type need ANY child layout? The fast-path predicate: every scalar,
+// pointer, enum, `_BitInt`, incomplete composite, zero-field composite and
+// out-of-scope kind answers from its own record alone — the overwhelming
+// majority of the ~31 call sites' queries — and those must keep costing no
+// memo, no work stack and no allocation at all.
+[[nodiscard]] bool
+hasLayoutDependencies(TypeInterner const& interner, TypeId id) {
+    switch (interner.kind(id)) {
+        case TypeKind::Complex:
+        case TypeKind::Array:
+        case TypeKind::Struct:
+        case TypeKind::Union:
+            return !interner.operands(id).empty();
+        default:
+            return false;
+    }
 }
 
 // ── Per-strategy struct bit-field packers (D-CSUBSET-BITFIELD-ABI-EXACT) ──
@@ -170,10 +322,21 @@ bitFieldStrategyRealized(BitFieldStrategy s) noexcept {
 // Returns `nullopt` when a stored cap or override is not a power of two in [1, 256]
 // (an upstream pragma-/alignas-semantics bug — fail loud rather than silently
 // mis-pad, mirroring the non-bit-field path's `Alignment::fromBytes` reject).
+//
+// D-CSUBSET-PER-MEMBER-PACKED: `packed` arrives as the COMPOSITE flag plus the
+// `hasFieldPacked` gate, and the baseline is resolved per FIELD through
+// `fieldPackedBaseline` — so a bit-field-bearing struct honours a per-member packed
+// on its ORDINARY members exactly as the non-bit-field arm does. ✔MEASURED (gcc +
+// clang, x86_64 + aarch64): `{unsigned char a; int c <pk>; unsigned b:31; char t;}`
+// puts `c` at 1 where the undecorated control puts it at 4, with BOTH at sizeof 16
+// and _Alignof 4 — the aggregate alignment untouched, only the one offset moved.
 [[nodiscard]] std::optional<Alignment>
 bitfieldPackerEffectiveAlign(TypeInterner const& interner, TypeId id, std::size_t i,
-                             bool packed, std::uint32_t packCap, Alignment natural) {
-    auto const baseline = clampedBaselineAlign(packed, packCap, natural);
+                             bool packed, bool hasFieldPacked,
+                             std::uint32_t packCap, Alignment natural) {
+    auto const baseline = clampedBaselineAlign(
+        fieldPackedBaseline(interner, id, i, packed, hasFieldPacked),
+        packCap, natural);
     if (!baseline) return std::nullopt;
     if (!interner.hasExplicitAligns(id)) return baseline;
     std::uint32_t const ovr = interner.explicitFieldAlign(id, i);
@@ -192,16 +355,28 @@ bitfieldPackerEffectiveAlign(TypeInterner const& interner, TypeId id, std::size_
 [[nodiscard]] std::optional<StructLayout>
 layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
                                TypeInterner const& interner,
-                               AggregateLayoutParams params, DataModel dm,
-                               StructLayout out) {
+                               AggregateLayoutParams params,
+                               LayoutMemo const& memo, StructLayout out) {
     out.bitFields.assign(fields.size(), BitFieldPlacement{});
     // TF-C97 (D-CSUBSET-PACKED-BITFIELD-INTERACTION): the member-alignment cap this
     // composite was defined under — read ONCE here, then fed through
-    // `clampedBaselineAlign` at every alignment site below. `packed` is currently
-    // always false here (the Struct arm's fail-loud belt rejects packed + bit-fields
-    // before dispatch); it is threaded through anyway so this packer is correct BY
-    // CONSTRUCTION if that belt is ever lifted, rather than silently unpacked.
+    // `clampedBaselineAlign` at every alignment site below.
+    //
+    // ★ D-CSUBSET-PACKED-BITFIELD-INTERACTION: `packed` REACHES THIS PACKER NOW. It
+    // used to be always-false here (the Struct arm's belt refused packed + bit-fields
+    // before dispatch) and was threaded through so the packer would be correct BY
+    // CONSTRUCTION when the belt was lifted. The belt is lifted; the threading is what
+    // made that a deletion instead of a new algorithm, and the correctness it bought
+    // is now MEASURED rather than asserted (see the Struct arm's note for the seven
+    // gcc/clang-pinned shapes).
+    //
+    // ★ D-CSUBSET-PER-MEMBER-PACKED: `hasFieldPacked` is the O(1) gate for the
+    // PER-FIELD spelling, hoisted beside the composite flag for the same reason —
+    // read once, asked per field below. A composite with no per-member packed (every
+    // one that predates the channel) leaves it false and never queries the side
+    // table, so the shipped path is unchanged instruction-for-instruction.
     bool const          packed  = interner.isPacked(id);
+    bool const  hasFieldPacked  = interner.hasFieldPacked(id);
     std::uint32_t const packCap = interner.maxFieldAlign(id);
     // The GNU straddle rule is CONDITIONAL on there being no member-alignment cap.
     // MEASURED (`/usr/bin/clang -arch arm64`): `struct { unsigned char a; unsigned
@@ -214,17 +389,41 @@ layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
     // the whole PCC_BITFIELD_TYPE_MATTERS block — the two independent
     // implementations of the ABI this strategy names.
     //
-    // ⚠ What this gate BUYS is fail-loud, not (yet) a correct packed layout. A field
-    // that flows through a unit boundary is exactly a field that trips the
-    // representability guard further down, so under a cap a would-be straddler is
-    // REFUSED rather than laid out. That is still the whole point: with the bump left
+    // ⚠ What this gate BUYS on a field that DOES flow through a unit boundary is
+    // fail-loud, not a laid-out straddler: such a field trips the representability
+    // guard further down and is REFUSED. That is the whole point — with the bump left
     // on, `pack(2) struct { unsigned a; u64 b:40; }` silently computes sizeof 14 where
-    // clang says 10 — a wrong ABI nobody is told about. Cases where no field straddles
-    // (every one in the macOS SDK's pack+bit-field closure) are unaffected by this
-    // gate and are fixed by the alignment clamp alone.
-    bool const allowStraddlePadding = !packed && packCap == 0;
+    // clang says 10, a wrong ABI nobody is told about. Cases where no field straddles
+    // are unaffected by this gate and get a fully correct layout from the alignment
+    // clamp alone; that is the majority, including every shape in the macOS SDK's
+    // pack+bit-field closure and every gcc/clang-pinned `packed` shape below.
+    //
+    // ★ `packed` SUPPRESSES THE BUMP FOR THE SAME REASON A CAP DOES, and that is not
+    // an analogy — it is why `__attribute__((packed))` and `#pragma pack(1)` come out
+    // byte-identical on every shape measured (D-CSUBSET-PACKED-BITFIELD-INTERACTION).
+    // Both spellings set the member baseline to 1 through `clampedBaselineAlign` and
+    // both land here as "no padding to the next unit", which is exactly gcc's and
+    // clang's own rule.
+    //
+    // ★★ D-CSUBSET-PER-MEMBER-PACKED: THIS GATE IS PER-FIELD, NOT PER-COMPOSITE, AND
+    // THE DIFFERENCE IS MEASURABLE. Folding a per-member packed into the struct-wide
+    // `packed` would switch the bump off for BIT-FIELDS THE PROGRAMMER NEVER
+    // DECORATED, silently re-placing them. ✔MEASURED (gcc 13.3.0 + clang 18.1.3,
+    // x86_64 and aarch64, all four arms identical):
+    //   `{unsigned char a; unsigned b:31; int c <pk>;}` is 12 / align 4, c@8 —
+    //     BYTE-IDENTICAL to the undecorated control, so `b` still bumps to its own
+    //     unit even though a sibling is packed;
+    //   `{unsigned a; unsigned long long b:40 <pk>;}` is 12 / align 4 where the
+    //     control is 16 / align 8 — so a packed BIT-FIELD does suppress the bump,
+    //     for ITSELF.
+    // Suppression is therefore a property of the FIELD being placed, which is exactly
+    // what the composite flag has always expressed (it packs every field) read at the
+    // right granularity.
     std::uint64_t bitCursor = 0;   // absolute bits from the struct start
     for (std::size_t i = 0; i < fields.size(); ++i) {
+        bool const allowStraddlePadding =
+            !fieldPackedBaseline(interner, id, i, packed, hasFieldPacked)
+            && packCap == 0;
         TypeId const f  = fields[i];
         auto const    bw = interner.fieldBitWidth(id, i);
         if (!bw.has_value()) {
@@ -234,12 +433,12 @@ layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
                 if (i + 1 != fields.size()) return std::nullopt;
                 auto const fops = interner.operands(f);
                 if (fops.empty()) return std::nullopt;
-                auto const elem = computeLayout(fops[0], interner, params, dm);
-                if (!elem) return std::nullopt;
+                auto const* elem = childLayout(memo, interner, fops[0]);
+                if (elem == nullptr) return std::nullopt;
                 // A FAM can carry `alignas` (`alignas(16) int fam[];`): raise its
                 // effective alignment exactly as the non-bit-field path does.
                 auto const ea = bitfieldPackerEffectiveAlign(
-                    interner, id, i, packed, packCap, elem->align);
+                    interner, id, i, packed, hasFieldPacked, packCap, elem->align);
                 if (!ea) return std::nullopt;
                 std::uint64_t const fo = ea->alignUp((bitCursor + 7) / 8);
                 out.fieldOffsets.push_back(fo);
@@ -248,14 +447,14 @@ layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
                 bitCursor = fo * 8;   // no size contribution
                 continue;
             }
-            auto const fl = computeLayout(f, interner, params, dm);
-            if (!fl) return std::nullopt;
+            auto const* fl = childLayout(memo, interner, f);
+            if (fl == nullptr) return std::nullopt;
             // Fold the cap + a member `alignas` override into the ordinary field's
             // alignment (D-CSUBSET-MEMBER-ALIGNAS) — a bit-field-bearing struct's
             // non-bit-field member may be over-aligned OR capped; the offset AND the
             // struct align must honor both.
             auto const ea = bitfieldPackerEffectiveAlign(
-                interner, id, i, packed, packCap, fl->align);
+                interner, id, i, packed, hasFieldPacked, packCap, fl->align);
             if (!ea) return std::nullopt;
             std::uint64_t const fo = ea->alignUp((bitCursor + 7) / 8);
             out.fieldOffsets.push_back(fo);
@@ -264,13 +463,15 @@ layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
             continue;
         }
         // Bit-field: the allocation unit is its declared type's size.
-        auto const fl = computeLayout(f, interner, params, dm);
-        if (!fl || fl->size == 0) return std::nullopt;   // non-int bitfield → fail loud
+        auto const* fl = childLayout(memo, interner, f);
+        if (fl == nullptr || fl->size == 0) return std::nullopt;   // non-int bitfield → fail loud
         // A bit-field's storage unit contributes its declared type's alignment to the
         // struct — CLAMPED by the cap, exactly like an ordinary field's. MEASURED:
         // clang's `#pragma pack(4) struct { char c; u64 b:1; }` is _Alignof 4 (the
         // capped u64), not 8 (uncapped) and not 1 (dropped).
-        auto const unitAlign = clampedBaselineAlign(packed, packCap, fl->align);
+        auto const unitAlign = clampedBaselineAlign(
+            fieldPackedBaseline(interner, id, i, packed, hasFieldPacked),
+            packCap, fl->align);
         if (!unitAlign) return std::nullopt;
         std::uint64_t const unitBits = fl->size * 8;
         std::uint32_t const w        = *bw;
@@ -384,10 +585,14 @@ layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
 // golden below was derived empirically from cl.exe 14.51
 // (D-CSUBSET-BITFIELD-ABI-EXACT conformance witness).
 [[nodiscard]] std::optional<StructLayout>
+// (No `params` / `dm`: this packer's whole per-ABI rule is the cl.exe-derived
+// placement below plus the per-composite `packed` / `pack(N)` channels it reads
+// from the interner. The GNU sibling still takes `params` because its
+// zero-width arm reads `unnamedBitFieldAlignment`; a parameter neither reads is
+// a claim about a dependency it does not have.)
 layoutStructBitfieldsMsvcStraddle(TypeId id, std::span<TypeId const> fields,
                                   TypeInterner const& interner,
-                                  AggregateLayoutParams params, DataModel dm,
-                                  StructLayout out) {
+                                  LayoutMemo const& memo, StructLayout out) {
     out.bitFields.assign(fields.size(), BitFieldPlacement{});
     // TF-C97 (D-CSUBSET-PACKED-BITFIELD-INTERACTION): the member-alignment cap, read
     // ONCE and fed through `clampedBaselineAlign` at every alignment site below —
@@ -400,7 +605,21 @@ layoutStructBitfieldsMsvcStraddle(TypeId id, std::span<TypeId const> fields,
     // MaxFieldAlignment)` in its `layoutBitField`). The unit-REUSE rule above is
     // untouched — unlike the GNU straddle bump it is not gated on the cap, so this
     // packer keeps its cl.exe-derived placement exactly.
+    //
+    // ★ D-CSUBSET-PER-MEMBER-PACKED: the per-field gate is hoisted here for the same
+    // reason it is in the GNU packer — one bool test for every composite that carries
+    // no per-member packed. ⚠ AND THE HONEST LIMIT OF THIS ARM, stated rather than
+    // implied: MSVC implements no `__attribute__` in any position (✔MEASURED, cl.exe
+    // 19.51.36252, C2061 at /std:c11, /std:c17 AND /std:clatest), so there is no
+    // cl.exe answer for "a GNU per-member packed under the MSVC bit-field ABI" to
+    // match. The reference that DOES answer for a PE target is mingw-w64 gcc 13.2.0,
+    // and it agrees with the Linux arms on every NON-bit-field shape probed
+    // (`{char a; int z <pk>; double d;}` 16/8 z@1; `{unsigned char a; int c <pk>;
+    // unsigned b:31; char t;}` 16/4 c@1). The per-field baseline below is therefore
+    // MEASURED for an ordinary member of a bit-field-bearing struct on PE, and the
+    // unit-REUSE rule is untouched — this arm gains no new bit-field behaviour.
     bool const          packed  = interner.isPacked(id);
+    bool const  hasFieldPacked  = interner.hasFieldPacked(id);
     std::uint32_t const packCap = interner.maxFieldAlign(id);
     std::uint64_t highWaterByte = 0;   // one past all placed content
     std::uint64_t unitTypeSize  = 0;   // bytes of the open bit-field unit (0 = none)
@@ -417,12 +636,12 @@ layoutStructBitfieldsMsvcStraddle(TypeId id, std::span<TypeId const> fields,
                 if (i + 1 != fields.size()) return std::nullopt;
                 auto const fops = interner.operands(f);
                 if (fops.empty()) return std::nullopt;
-                auto const elem = computeLayout(fops[0], interner, params, dm);
-                if (!elem) return std::nullopt;
+                auto const* elem = childLayout(memo, interner, fops[0]);
+                if (elem == nullptr) return std::nullopt;
                 // A FAM can carry `alignas`: raise its effective alignment
                 // (D-CSUBSET-MEMBER-ALIGNAS), mirroring the non-bit-field path.
                 auto const ea = bitfieldPackerEffectiveAlign(
-                    interner, id, i, packed, packCap, elem->align);
+                    interner, id, i, packed, hasFieldPacked, packCap, elem->align);
                 if (!ea) return std::nullopt;
                 std::uint64_t const fo = ea->alignUp(highWaterByte);
                 out.fieldOffsets.push_back(fo);
@@ -431,13 +650,13 @@ layoutStructBitfieldsMsvcStraddle(TypeId id, std::span<TypeId const> fields,
                 highWaterByte = fo;   // no size contribution
                 continue;
             }
-            auto const fl = computeLayout(f, interner, params, dm);
-            if (!fl) return std::nullopt;
+            auto const* fl = childLayout(memo, interner, f);
+            if (fl == nullptr) return std::nullopt;
             // Fold the cap + a member `alignas` override into the ordinary field's
             // alignment (D-CSUBSET-MEMBER-ALIGNAS) — legal on a non-bit-field member
             // of a bit-field-bearing struct; the offset AND struct align honor both.
             auto const ea = bitfieldPackerEffectiveAlign(
-                interner, id, i, packed, packCap, fl->align);
+                interner, id, i, packed, hasFieldPacked, packCap, fl->align);
             if (!ea) return std::nullopt;
             std::uint64_t const fo = ea->alignUp(highWaterByte);
             out.fieldOffsets.push_back(fo);
@@ -447,12 +666,14 @@ layoutStructBitfieldsMsvcStraddle(TypeId id, std::span<TypeId const> fields,
         }
         // Bit-field: the allocation unit is its declared type's size, aligned to
         // its declared type's natural alignment.
-        auto const fl = computeLayout(f, interner, params, dm);
-        if (!fl || fl->size == 0) return std::nullopt;   // non-int bitfield → fail loud
+        auto const* fl = childLayout(memo, interner, f);
+        if (fl == nullptr || fl->size == 0) return std::nullopt;   // non-int bitfield → fail loud
         // The unit's alignment — its declared type's, CLAMPED by the cap. Used both
         // for the struct-alignment fold and to place the unit itself below, so a
         // capped composite can never open a unit at an over-aligned byte.
-        auto const unitAlign = clampedBaselineAlign(packed, packCap, fl->align);
+        auto const unitAlign = clampedBaselineAlign(
+            fieldPackedBaseline(interner, id, i, packed, hasFieldPacked),
+            packCap, fl->align);
         if (!unitAlign) return std::nullopt;
         std::uint64_t const t        = fl->size;          // unit type size (bytes)
         std::uint64_t const unitBits = t * 8;
@@ -696,18 +917,22 @@ bool isByValueClass(TypeInterner const& interner, TypeId id) noexcept {
     }
 }
 
-std::optional<StructLayout>
-computeLayout(TypeId id, TypeInterner const& interner,
-              AggregateLayoutParams params, DataModel dm) {
-    // c27 (D-CSUBSET-VOLATILE-POINTEE): a `volatile T` has the SAME layout as T
-    // (C 6.7.3 — a qualifier never changes size/alignment). Strip the VolatileQual
-    // skin ONCE here so the whole engine — incl. the raw-kind incomplete checks
-    // below and the recursive field/element layouts — operates on the material
-    // type. This single strip makes `sizeof(volatile T) == sizeof(T)` hold by
-    // construction and routes a volatile-qualified struct/array/scalar down its
-    // normal arm. (The transparent `kind()`/`operands()` would mostly suffice, but
-    // `isIncompleteComposite`/`isIncompleteArray` read the RAW record kind.)
-    id = interner.stripVolatile(id);
+namespace {
+
+// ── ONE TYPE LEVEL, AND NOTHING BELOW IT ────────────────────────────────────
+//
+// The whole of the old `computeLayout` body, ARM FOR ARM, with the single
+// change that every recursive `computeLayout(child, …)` is now a `childLayout`
+// read out of `memo`. That is what makes the level PURE in its children: it can
+// be run in any order the driver likes, exactly once per distinct type, with no
+// host frame per level.
+//
+// `id` arrives ALREADY volatile-stripped (the driver strips at every edge and
+// keys `memo` on the stripped id), so `isIncompleteComposite`/`isIncompleteArray`
+// still see the RAW record kind they need.
+[[nodiscard]] std::optional<StructLayout>
+layoutOne(TypeId id, TypeInterner const& interner,
+          AggregateLayoutParams params, DataModel dm, LayoutMemo const& memo) {
     TypeKind const kind = interner.kind(id);
 
     // D-CSUBSET-SELF-REFERENTIAL-STRUCT: an INCOMPLETE composite (a forward-declared
@@ -765,8 +990,8 @@ computeLayout(TypeId id, TypeInterner const& interner,
             // ABI-reject work); only its VALUE arithmetic walls loud downstream.
             auto const ops = interner.operands(id);
             if (ops.empty()) return std::nullopt;
-            auto const elem = computeLayout(ops[0], interner, params, dm);
-            if (!elem) return std::nullopt;
+            auto const* elem = childLayout(memo, interner, ops[0]);
+            if (elem == nullptr) return std::nullopt;
             std::uint64_t const es = elem->size;
             return StructLayout{es * 2, elem->align, {}, false};
         }
@@ -777,8 +1002,8 @@ computeLayout(TypeId id, TypeInterner const& interner,
             auto const ops = interner.operands(id);
             auto const sc  = interner.scalars(id);
             if (ops.empty() || sc.empty() || sc[0] < 0) return std::nullopt;
-            auto const elem = computeLayout(ops[0], interner, params, dm);
-            if (!elem) return std::nullopt;
+            auto const* elem = childLayout(memo, interner, ops[0]);
+            if (elem == nullptr) return std::nullopt;
             std::uint64_t const stride = elem->align.alignUp(elem->size);
             std::uint64_t const len    = static_cast<std::uint64_t>(sc[0]);
             return StructLayout{stride * len, elem->align, {}, false};
@@ -812,8 +1037,8 @@ computeLayout(TypeId id, TypeInterner const& interner,
                 for (std::size_t i = 0; i < fields.size(); ++i) {
                     auto const off = interner.explicitFieldOffset(id, i);
                     if (!off) return std::nullopt;                 // partial offsets: malformed
-                    auto const fl = computeLayout(fields[i], interner, params, dm);
-                    if (!fl) return std::nullopt;
+                    auto const* fl = childLayout(memo, interner, fields[i]);
+                    if (fl == nullptr) return std::nullopt;
                     out.fieldOffsets.push_back(*off);
                     out.align = maxAlign(out.align, fl->align);
                     extent = std::max(extent, *off + fl->size);
@@ -835,33 +1060,54 @@ computeLayout(TypeId id, TypeInterner const& interner,
             // alignment (already in `out.align`). That combination is exactly why
             // clang gives `struct S { char a; int b; } __attribute__((packed,
             // aligned(16)));` sizeof 16 / _Alignof 16, not packed's bare 5 / 1.
+            //
+            // ★★ D-CSUBSET-PER-MEMBER-PACKED: the SAME attribute is also spellable on
+            // ONE member-declarator, and that is a DIFFERENT layout, not a narrower
+            // application of this one. ✔MEASURED gcc 13.3.0 + clang 18.1.3, x86_64
+            // AND aarch64 (four arms, byte-identical; MSVC abstains):
+            //   `{char a; int z <pk>; double d;}` 16 / _Alignof 8 / a@0 z@1 d@8
+            //   `{char a; int z;      double d;}` 16 / _Alignof 8 / a@0 z@4 d@8
+            //   `{char a; int z; double d;} <pk>` 13 / _Alignof 1 / a@0 z@1 d@5
+            // The per-member spelling moves ONE offset and leaves the aggregate's
+            // size AND alignment alone — so it is read per FIELD in `effectiveAlign`
+            // below, through the same `clampedBaselineAlign` this flag uses, while
+            // the aggregate's alignment keeps coming from the unchanged MAX-fold.
+            // `hasFieldPacked` is the O(1) gate: false for every composite without a
+            // per-member packed, which leaves the shipped path untouched.
             bool const packed = interner.isPacked(id);
+            bool const hasFieldPacked = interner.hasFieldPacked(id);
             // FC8 bitfields (D-CSUBSET-BITFIELD): a bitfield-free struct interns
             // with EMPTY scalars (see TypeInterner::structType), so this O(1) test
             // routes every existing struct down the unchanged byte path below.
             bool const anyBitfield = !interner.scalars(id).empty();
-            // D-CSUBSET-PACKED F5 belt (D-CSUBSET-PACKED-BITFIELD-INTERACTION): the
-            // semantic phase REJECTS `packed` + bit-fields at the front door
-            // (`S_PackedBitfieldUnsupported`); this nullopt is its layout backstop.
+            // ★ D-CSUBSET-PACKED-BITFIELD-INTERACTION — THE BELT IS GONE, and the
+            // deliberate cycle its predecessor asked for is THIS one. A `packed`
+            // aggregate that also carries a bit-field used to fail loud twice (the
+            // semantic `S_PackedBitfieldUnsupported` front door + a `packed &&
+            // anyBitfield → nullopt` line here and in the Union arm). Both are
+            // removed: `packed` now flows into the SAME two packers every other
+            // bit-field struct uses, and the layout it produces is the references'.
             //
-            // ★ TF-C97 deliberately KEEPS this belt, and the reason has changed. It
-            // used to hold because the packed baseline was applied ONLY on the
-            // non-bit-field path, so a packed struct reaching a packer got a silently
-            // NON-packed layout. That is no longer true: both packers now take the
-            // baseline through `clampedBaselineAlign` and honor `packed`, and
-            // `__attribute__((packed))` is MEASURED byte-identical to `#pragma
-            // pack(1)` for bit-fields on clang arm64 (`{char c; unsigned b:9;}` → 3/1,
-            // `{char c; u64 b:60; char d;}` → 10/1, `{u64 a; unsigned b:1;}` → 9/1,
-            // `{char c; unsigned :0; char d;}` → 5/1, all four spellings agreeing), so
-            // the LAYOUT half is now computable.
+            // ✔MEASURED (gcc 13.3.0 + clang 18.1.3, x86_64-linux, `_Static_assert` on
+            // sizeof AND `_Alignof`, compile rc=0): `__attribute__((packed))` and
+            // `#pragma pack(1)` are BYTE-IDENTICAL on every shape probed —
+            // `{char c; unsigned b:9;}` 3/1 · `{char c; u64 b:60; char d;}` 10/1 ·
+            // `{u64 a; unsigned b:1;}` 9/1 · `{char c; unsigned :0; char d;}` 5/1 ·
+            // `{unsigned a:3; unsigned b:5;}` 1/1 · `{int f0; unsigned f1:3;}` 5/1 ·
+            // `{unsigned a:3; char x; unsigned b:5;}` 3/1. That equivalence is what
+            // makes this a DELETION rather than a new algorithm: the `#pragma pack(1)`
+            // half has shipped and been conformance-pinned since TF-C97, and `packed`
+            // reaches the identical code through `clampedBaselineAlign` (baseline 1)
+            // and `allowStraddlePadding` (off for BOTH spellings).
             //
-            // It stays shut because opening it is NOT a layout-engine change: the
-            // semantic gate is what a user actually hits, and lifting only the
-            // backstop would leave the feature still rejected while removing the guard
-            // that keeps a future gate-lift from going silently wrong. Opening it =
-            // drop `S_PackedBitfieldUnsupported` + drop this line + pin the four
-            // shapes above — one deliberate cycle, not a side effect of this one.
-            if (packed && anyBitfield) return std::nullopt;
+            // ⚠ WHY NOT KEEPING IT WAS THE FAIL-LOUD CHOICE, not a relaxation of one:
+            // all three references ACCEPT the construct (gcc 13.3.0, clang 18.1.3 via
+            // `__attribute__((packed))`; cl.exe 19.51 and mingw-w64 gcc 13.2.0 via
+            // `#pragma pack(1)`, which is MSVC's only spelling), so refusing it was a
+            // conformance divergence, not a guard. The guard that remains is the one
+            // that matters: a bit-field the placement model cannot EXPRESS still
+            // returns nullopt below (the `bitInUnit + w > unitBits` refusal), so a
+            // packed straddler is refused rather than silently mis-placed.
             if (!anyBitfield) {
                 // D-CSUBSET-MEMBER-ALIGNAS: a struct may carry per-field `alignas`
                 // overrides. Read them once here; `effectiveAlign` folds field i's
@@ -888,7 +1134,10 @@ computeLayout(TypeId id, TypeInterner const& interner,
                     // A member `alignas` still RAISES it via the MAX-fold below
                     // (alignas wins per-field even under packed — `alignas(8) int x;`
                     // in a packed struct keeps 8-byte alignment).
-                    auto const clamped = clampedBaselineAlign(packed, packCap, natural);
+                    auto const clamped = clampedBaselineAlign(
+                        fieldPackedBaseline(interner, id, i, packed,
+                                            hasFieldPacked),
+                        packCap, natural);
                     if (!clamped) return std::nullopt;   // upstream bug — never silent
                     Alignment const baseline = *clamped;
                     if (!hasAligns) return baseline;
@@ -913,8 +1162,8 @@ computeLayout(TypeId id, TypeInterner const& interner,
                         if (i + 1 != fields.size()) return std::nullopt;
                         auto const fops = interner.operands(f);
                         if (fops.empty()) return std::nullopt;
-                        auto const elem = computeLayout(fops[0], interner, params, dm);
-                        if (!elem) return std::nullopt;
+                        auto const* elem = childLayout(memo, interner, fops[0]);
+                        if (elem == nullptr) return std::nullopt;
                         // A FAM can carry alignas (`alignas(16) int fam[];`): raise
                         // its effective alignment the same way as an ordinary field.
                         auto const ea = effectiveAlign(i, elem->align);
@@ -925,8 +1174,8 @@ computeLayout(TypeId id, TypeInterner const& interner,
                         out.hasFlexibleArrayMember = true;
                         continue;  // no size contribution
                     }
-                    auto const fl = computeLayout(f, interner, params, dm);
-                    if (!fl) return std::nullopt;   // out-of-scope field type → fail loud
+                    auto const* fl = childLayout(memo, interner, f);
+                    if (fl == nullptr) return std::nullopt;   // out-of-scope field type → fail loud
                     auto const ea = effectiveAlign(i, fl->align);
                     if (!ea) return std::nullopt;
                     off = ea->alignUp(off);
@@ -947,10 +1196,10 @@ computeLayout(TypeId id, TypeInterner const& interner,
             switch (params.bitFieldStrategy) {
                 case BitFieldStrategy::GnuPacked:
                     return layoutStructBitfieldsGnuPacked(
-                        id, fields, interner, params, dm, std::move(out));
+                        id, fields, interner, params, memo, std::move(out));
                 case BitFieldStrategy::MsvcStraddle:
                     return layoutStructBitfieldsMsvcStraddle(
-                        id, fields, interner, params, dm, std::move(out));
+                        id, fields, interner, memo, std::move(out));
                 case BitFieldStrategy::None:
                     return std::nullopt;   // not declared → fail loud
             }
@@ -983,14 +1232,36 @@ computeLayout(TypeId id, TypeInterner const& interner,
             // embedded). Read once; fed into effectiveAlign's baseline below. A
             // whole-composite `aligned(N)` still RAISES it back (the seed above) —
             // packed and the request are independent, as in the Struct arm.
+            //
+            // ★ D-CSUBSET-PER-MEMBER-PACKED: a UNION member can carry the attribute
+            // individually too, and it lowers THAT member's alignment — which, since
+            // every member sits at offset 0, is observable as the union's own
+            // alignment whenever the packed member was the max contributor.
+            // ✔MEASURED gcc 13.3.0 + clang 18.1.3, x86_64 AND aarch64:
+            //   `union {char a; int z <pk>;}`           4 / _Alignof 1
+            //   `union {char a; int z;}`     (control)  4 / _Alignof 4
+            //   `union {char a[3]; long long z <pk>;}`  8 / _Alignof 1
+            //   `union {char a[3]; long long z;}`       8 / _Alignof 8
+            // ★ THE SIZE IS UNCHANGED IN BOTH PAIRS — only the alignment moves, so a
+            // sizeof-only pin is blind here exactly as it is on the struct shape.
             bool const packed = interner.isPacked(id);
+            bool const hasFieldPacked = interner.hasFieldPacked(id);
             bool const anyBitfield = !interner.scalars(id).empty();
-            // D-CSUBSET-PACKED F5 belt (D-CSUBSET-PACKED-BITFIELD-INTERACTION): the
-            // packed baseline is applied ONLY on the non-bit-field path below. A
-            // packed union carrying a bit-field member would silently get a NON-packed
-            // alignment, so fail loud here (the semantic S_PackedBitfieldUnsupported is
-            // the front door; this nullopt is the backstop).
-            if (packed && anyBitfield) return std::nullopt;
+            // ★ D-CSUBSET-PACKED-BITFIELD-INTERACTION — the union half of the belt is
+            // gone with the struct half. Its stated reason ("the packed baseline is
+            // applied ONLY on the non-bit-field path below") went STALE at TF-C97: the
+            // `effectiveAlign` lambda below runs for EVERY member, bit-field included,
+            // and routes through the one shared `clampedBaselineAlign`, so a packed
+            // union's bit-field member gets baseline 1 like every other member. A
+            // premise that stops being true does not announce itself — this one was
+            // false for a whole cycle while the line it justified kept the feature shut
+            // ([[feedback-a-rows-premise-has-a-shelf-life]]).
+            //
+            // ✔MEASURED, gcc 13.3.0 + clang 18.1.3 (x86_64-linux) AND cl.exe 19.51 +
+            // mingw-w64 gcc 13.2.0: `union { unsigned a:3; unsigned b:30; char x; }`
+            // is 4/1 under BOTH spellings on BOTH ABIs — the one shape where the two
+            // bit-field strategies happen to agree, because a union member never has a
+            // neighbour to straddle into.
             if (anyBitfield) {
                 if (!bitFieldStrategyRealized(params.bitFieldStrategy))
                     return std::nullopt;
@@ -1015,7 +1286,10 @@ computeLayout(TypeId id, TypeInterner const& interner,
                 // D-CSUBSET-PACKED / TF-C82: a packed union drops the per-member
                 // baseline to 1 and `#pragma pack(N)` caps it — the ONE shared clamp
                 // (TF-C97); a member `alignas` still RAISES it via the MAX-fold.
-                auto const clamped = clampedBaselineAlign(packed, packCap, natural);
+                auto const clamped = clampedBaselineAlign(
+                        fieldPackedBaseline(interner, id, i, packed,
+                                            hasFieldPacked),
+                        packCap, natural);
                 if (!clamped) return std::nullopt;   // upstream bug — never silent
                 Alignment const baseline = *clamped;
                 if (!hasAligns) return baseline;
@@ -1080,8 +1354,8 @@ computeLayout(TypeId id, TypeInterner const& interner,
                 && params.unnamedBitFieldAlignment == UnnamedBitFieldAlignment::None;
             std::uint64_t maxSize = 0;
             for (std::size_t i = 0; i < fields.size(); ++i) {
-                auto const fl = computeLayout(fields[i], interner, params, dm);
-                if (!fl) return std::nullopt;
+                auto const* fl = childLayout(memo, interner, fields[i]);
+                if (fl == nullptr) return std::nullopt;
                 auto const bw = anyBitfield ? interner.fieldBitWidth(id, i)
                                             : std::optional<std::uint32_t>{};
                 bool const isZeroWidth = bw.has_value() && *bw == 0;
@@ -1119,16 +1393,162 @@ computeLayout(TypeId id, TypeInterner const& interner,
     }
 }
 
+// ── THE DRIVER: one explicit heap work stack over the by-value type graph ────
+//
+// A post-order DFS with the classic three-colour marking, so it is a walk over a
+// DAG and not a tree: `memo` is BLACK (resolved — and the reason a type shared by
+// many fields is laid out ONCE rather than once per occurrence, which used to be
+// exponential on a shape like `struct L { struct L_1 a, b; }`), `gray` is the
+// current path, and everything else is white.
+//
+// ⚠ A BACK EDGE INTO `gray` IS A BY-VALUE CYCLE, and EVERY type currently on the
+// path is marked with it. That is not an approximation: a type on the path either
+// sits ON the cycle (no size — the cycle has no base case) or CONTAINS one BY
+// VALUE (no size either, because its cyclic member has none and every arm refuses
+// on a member with no layout). Both answers are `nullopt`, so marking the whole
+// path is the same answer the child-refusal would have propagated, arrived at
+// without needing the cycle to terminate first.
+//
+// ⚠ The realloc-safe rule, the same one `hir_to_mir`'s frame stacks document:
+// COPY the frame out and advance its phase BEFORE pushing anything, because
+// `work.back()` may dangle the moment the vector grows.
+[[nodiscard]] std::optional<StructLayout>
+computeLayoutIterative(TypeId root, TypeInterner const& interner,
+                       AggregateLayoutParams params, DataModel dm) {
+    enum class Phase : std::uint8_t { Expand, Resolve };
+    struct Frame {
+        TypeId id;
+        Phase  phase;
+    };
+
+    LayoutMemo                 memo;
+    std::unordered_set<TypeId> gray;     // on the current DFS path
+    std::unordered_set<TypeId> cyclic;   // on, or reaching, a by-value cycle
+    std::vector<Frame>         work;
+    work.push_back(Frame{root, Phase::Expand});
+
+    while (!work.empty()) {
+        Frame const f = work.back();
+        if (f.phase == Phase::Expand) {
+            if (memo.contains(f.id)) {   // already resolved by another parent
+                work.pop_back();
+                continue;
+            }
+            if (gray.contains(f.id)) {   // BACK EDGE — a by-value cycle
+                for (TypeId g : gray) cyclic.insert(g);
+                work.pop_back();
+                continue;
+            }
+            gray.insert(f.id);
+            work.back().phase = Phase::Resolve;
+            forEachLayoutDependency(interner, f.id, [&](TypeId c) {
+                work.push_back(Frame{c, Phase::Expand});
+            });
+            continue;
+        }
+        gray.erase(f.id);
+        work.pop_back();
+        memo.emplace(f.id, cyclic.contains(f.id)
+                               ? std::nullopt
+                               : layoutOne(f.id, interner, params, dm, memo));
+    }
+
+    auto const it = memo.find(root);
+    return it == memo.end() ? std::nullopt : it->second;
+}
+
+}  // namespace
+
+std::optional<StructLayout>
+computeLayout(TypeId id, TypeInterner const& interner,
+              AggregateLayoutParams params, DataModel dm) {
+    // c27 (D-CSUBSET-VOLATILE-POINTEE): a `volatile T` has the SAME layout as T
+    // (C 6.7.3 — a qualifier never changes size/alignment). Strip the VolatileQual
+    // skin ONCE here so the whole engine — incl. the raw-kind incomplete checks in
+    // `layoutOne` and every field/element edge the driver walks — operates on the
+    // material type. This single strip makes `sizeof(volatile T) == sizeof(T)`
+    // hold by construction and routes a volatile-qualified struct/array/scalar
+    // down its normal arm. (The transparent `kind()`/`operands()` would mostly
+    // suffice, but `isIncompleteComposite`/`isIncompleteArray` read the RAW record
+    // kind.) It is also what makes the memo key canonical: `volatile T` and `T`
+    // share one entry instead of being resolved twice.
+    TypeId const root = interner.stripVolatile(id);
+
+    // ★ THE FAST PATH IS NOT AN OPTIMISATION FOOTNOTE, IT IS THE COMMON CASE.
+    // A type with no layout DEPENDENCIES — every scalar, pointer, enum,
+    // `_BitInt`, incomplete composite, zero-field composite and out-of-scope
+    // kind — answers from its own record, so it must not pay for a memo, a
+    // colour set or a work stack. `layoutOne` never reads `memo` on those arms
+    // (there is nothing to read), which is why handing it an empty one is exact
+    // rather than merely close.
+    if (!hasLayoutDependencies(interner, root)) {
+        LayoutMemo const noChildren;
+        return layoutOne(root, interner, params, dm, noChildren);
+    }
+    return computeLayoutIterative(root, interner, params, dm);
+}
+
 bool compositeFieldsOverlap(TypeId id, TypeInterner const& interner,
                             AggregateLayoutParams params, DataModel dm) {
-    // O(1) short-circuit: natural layout is MONOTONIC (each field is placed at or
-    // after the previous field's end), so only the c107 explicit-offset channel can
-    // ever produce an intersection. `hasExplicitOffsets` is Struct/Union-only and
-    // false for every naturally-laid-out composite, so this also filters out the
-    // scalars/arrays/pointers a caller may hand us.
-    if (!interner.hasExplicitOffsets(id)) return false;
+    // Only a STRUCT/UNION has a field set at all — a scalar/pointer/array/Complex
+    // has nothing to intersect, and callers DO hand those in (the MIR and asm
+    // aggregate walks ask of whatever member type they are recursing on). This is
+    // the filter `hasExplicitOffsets` used to provide as a side effect of being
+    // Struct/Union-only; it is stated directly now that the offsets are no longer
+    // the only channel.
+    TypeKind const kind = interner.kind(id);   // qualifier-transparent
+    if (kind != TypeKind::Struct && kind != TypeKind::Union) return false;
+
+    // D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-BITFIELDS: THE TWO CHANNELS in which
+    // a composite's members can share bytes, both answerable in O(1) BEFORE any
+    // layout is attempted:
+    //   * EXPLICIT per-field byte offsets (an FFI overlay a descriptor pins);
+    //   * BIT-FIELDS — two bit-fields can land in the same byte of one allocation
+    //     unit, which is the case this predicate used to answer `false` for.
+    // `scalars()` is the layout engine's OWN "any bit-field?" test (a bit-field-free
+    // composite interns with an empty bit-width pool), so the two agree by
+    // construction rather than by a second derivation.
+    bool const explicitOffsets = interner.hasExplicitOffsets(id);
+    bool const anyBitField     = !interner.scalars(id).empty();
+    // O(1) short-circuit, SCOPED to exactly the case its justification covers — and
+    // that scope is the STRUCT, which is the whole of the justification and used to
+    // be more than it could carry. With neither channel present a STRUCT's layout is
+    // natural and MONOTONIC (each field is placed at `alignUp(off)` and then advances
+    // `off` by its own size), so no two members can intersect. That is a property of
+    // the ALGORITHM and not of a particular outcome, which is why answering here
+    // WITHOUT attempting a layout does not forfeit the header's "un-computable ⇒
+    // `true`" promise: there is no field list for which the struct path could
+    // produce an intersection.
+    //
+    // ★ D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-UNIONS: A UNION IS THE ONE
+    // COMPOSITE THE THEOREM DOES NOT COVER, AND IT USED TO LAND HERE ANYWAY. The
+    // union arm of `computeLayout` does not advance an offset at all — it places
+    // EVERY member at 0 and folds a max size — so a union with two or more sizeable
+    // members shares byte 0 BY DEFINITION and the monotonicity argument above is
+    // simply not about it. The old code answered `false` for such a union, which is
+    // the plainest possible wrong answer from the function that calls itself the
+    // authority for the question.
+    //
+    // The fix is by KIND rather than by making the promise literally unconditional,
+    // and the choice is deliberate: the struct theorem is SOUND and it is what keeps
+    // this O(1) for the overwhelmingly common shape (no layout computed, no ranges
+    // built, no sort). Routing structs through the sweep to buy a uniformity the
+    // answer does not need would cost every naturally-laid-out struct in the corpus
+    // a full `computeLayout` to be told what the algorithm already guarantees. A
+    // union falls through to the layout + range sweep below, where its all-zero
+    // `fieldOffsets` produce the correct answer with no union-specific arithmetic:
+    // two sizeable members intersect at byte 0, a single-member union does not, and
+    // a union whose members are all zero-size does not.
+    if (kind == TypeKind::Struct && !explicitOffsets && !anyBitField) return false;
+
+    // From here the answer is derived from the LAID-OUT type, and the header's
+    // "un-computable ⇒ `true`" promise now actually holds: no arm returns before
+    // this layout is attempted.
+    auto const lay = computeLayout(id, interner, params, dm);
+    if (!lay) return true;                           // un-computable: conservative
     auto const fields = interner.operands(id);
-    // Collect each field's occupied byte range. A field whose layout is
+    if (fields.size() != lay->fieldOffsets.size()) return true;   // malformed
+    // Collect each member's occupied byte range. A field whose layout is
     // un-computable makes the answer CONSERVATIVELY `true` (see the header): the
     // caller must keep refusing rather than admit an unverified layout.
     struct Range {
@@ -1138,12 +1558,50 @@ bool compositeFieldsOverlap(TypeId id, TypeInterner const& interner,
     std::vector<Range> ranges;
     ranges.reserve(fields.size());
     for (std::size_t i = 0; i < fields.size(); ++i) {
-        auto const off = interner.explicitFieldOffset(id, i);
-        if (!off) return true;                       // partial offsets: malformed
+        std::uint64_t const off = lay->fieldOffsets[i];
+        // ★ A BIT-FIELD OCCUPIES THE BYTES ITS BITS LAND IN — **NOT** ITS WHOLE
+        // ALLOCATION UNIT, and the difference is the difference between a correct
+        // answer and a false positive. Under `gnu_packed`, `struct { unsigned a:3;
+        // char x; }` places a in a 4-byte unit at 0 and `x` at byte 1 — the next
+        // ordinary member is packed INTO the unit's spare bytes (✔MEASURED, gcc
+        // 13.3.0 + clang 18.1.3: sizeof 4, `offsetof(x) == 1`) — so sweeping UNIT
+        // ranges would report `a` and `x` as sharing bytes when they provably do
+        // not, and `examples/c/bitfield_init`'s own `struct T` is that shape.
+        // (`msvc_straddle` closes the unit at an ordinary member, so the two
+        // derivations happen to agree there; `gnu_packed` is where they part.)
+        // The bits of field
+        // i run `[bitOffset, bitOffset+bitWidth)` inside the unit at `off`, so the
+        // BYTES it occupies are `off + bitOffset/8 .. off + ceil((bitOffset+
+        // bitWidth)/8)` — a range the packers' straddle refusal keeps inside the
+        // unit. The bit→byte mapping is `BitFieldPlacement`'s own documented LSB-
+        // first model (the engine has exactly one), NOT a target test: no format or
+        // arch name is read here, and a future ABI that renumbers bits changes the
+        // model in one place and this derivation with it.
+        bool const isBitField =
+            i < lay->bitFields.size() && lay->bitFields[i].unitBytes != 0;
+        if (isBitField) {
+            BitFieldPlacement const& p = lay->bitFields[i];
+            std::uint64_t const bitLo = p.bitOffset;
+            std::uint64_t const bitHi = bitLo + p.bitWidth;   // exclusive
+            ranges.push_back(Range{off + bitLo / 8u, off + (bitHi + 7u) / 8u});
+            continue;
+        }
+        // A ZERO-WIDTH bit-field (`unsigned : 0;`) is a packing BREAK with no
+        // storage: `unitBytes == 0` AND a width is recorded, and its `fieldOffsets`
+        // entry deliberately ALIASES the next unit. Charging it its declared type's
+        // width would manufacture an overlap out of a marker that occupies nothing —
+        // the same skip `asm.cpp`'s initializer packer makes for the same reason.
+        if (interner.fieldBitWidth(id, i).has_value()) continue;
+        // A FLEXIBLE ARRAY MEMBER contributes NO bytes to the struct (its tail is
+        // unsized), which is why the layout arms give it an offset and no size. Its
+        // own `computeLayout` is nullopt by design, so it must be skipped BEFORE the
+        // un-sizeable-field refusal below or every FAM-bearing bit-field struct
+        // would answer a false conservative `true`.
+        if (interner.isIncompleteArray(fields[i])) continue;
         auto const fl = computeLayout(fields[i], interner, params, dm);
         if (!fl) return true;                        // un-sizeable field
         if (fl->size == 0) continue;                 // occupies no bytes
-        ranges.push_back(Range{*off, *off + fl->size});
+        ranges.push_back(Range{off, off + fl->size});
     }
     // Sort by start offset, then a single adjacent-pair sweep: with the ranges
     // ordered, ANY intersection shows up between neighbours (a later range that

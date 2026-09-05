@@ -19,6 +19,7 @@
 #include <expected>
 #include <filesystem>
 #include <memory>
+#include <mutex>          // std::once_flag — the role resolver's one-shot family assembly
 #include <optional>
 #include <span>
 #include <string>
@@ -614,7 +615,9 @@ struct DSS_EXPORT MachODylibRef {
 // CodeDirectory carries the CS_ADHOC flag and dyld trusts the embedded
 // page hashes alone. The reservation SIZE is DERIVED from this block
 // (`adHocCodeSignatureSize`), so a hand-typed `codeSignatureSize` is not
-// needed when `codeSignature` is set.
+// merely unnecessary when `codeSignature` is set -- declaring BOTH is
+// REFUSED at load. Anchored at
+// D-LK-MACHO-CODESIGN-SIZE-SILENTLY-OVERRIDDEN-BY-ADHOC.
 //
 // The two enums are closed (one variant each today) so a typo in the
 // JSON fails loud at load (mirrors `ExternCallDispatch`'s closed-enum
@@ -922,9 +925,14 @@ struct DSS_EXPORT MachOImage {
     std::uint32_t codeSignatureSize = 0;
     // Ad-hoc code-signature FILL request (D-LK7-ADHOC-CODESIGN-MACHO
     // increment 2/2). When set, the walker DERIVES the reservation size
-    // from this block (via `adHocCodeSignatureSize`) — overriding any
-    // hand-typed `codeSignatureSize` — and writes a real CodeDirectory +
-    // SuperBlob into the reserved region instead of zeroes. When unset,
+    // from this block (via `adHocCodeSignatureSize`) and writes a real
+    // CodeDirectory + SuperBlob into the reserved region instead of
+    // zeroes. ⚠ It does NOT override a hand-typed `codeSignatureSize`
+    // any more: a document declaring BOTH keys is refused at load, so
+    // the encoder sees exactly one state instead of an invisible
+    // precedence rule. Anchored at
+    // D-LK-MACHO-CODESIGN-SIZE-SILENTLY-OVERRIDDEN-BY-ADHOC.
+    // When unset,
     // the legacy `codeSignatureSize`-only placeholder path (zero-fill)
     // is preserved unchanged. validate() rejects this block on a
     // MH_OBJECT (like the rest of the image block).
@@ -1487,6 +1495,19 @@ struct DSS_EXPORT ObjectFormatData {
     // `SehPersonality` for what two literals in `src/mir` this deletes.
     std::optional<SehPersonality> sehPersonality;
 
+    // ── D-CSUBSET-PACKED-ATOMIC-MEMBER: the atomics-runtime declaration ────
+    //
+    // OPTIONAL top-level `"atomicsRuntime"` block (`{"role": …,
+    // "loadMangledName": …, "storeMangledName": …}`). The GENERIC C11 atomics
+    // entry points an UNDER-ALIGNED `_Atomic` scalar access lowers to a CALL
+    // of. `std::nullopt` = this format supplies NO atomics runtime, which is
+    // NOT a silent default: what happens then is the TARGET's
+    // `underAlignedAtomicForm` answer — a `traps` target refuses the access
+    // loud (emitting the native form would be a guaranteed SIGBUS), a
+    // `losesAtomicity` target keeps the native form (the reference-exact
+    // choice where no runtime image exists, MEASURED: pe64 has none).
+    std::optional<AtomicsRuntime> atomicsRuntime;
+
     // ── UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): the REALIZED
     //    ENTRY-VERB set ─────────────────────────────────────────────
     //
@@ -1565,6 +1586,55 @@ struct DSS_EXPORT ObjectFormatData {
     // unknown VALUE still fails loud at load (the loader's enum check).
     std::optional<ExternCallDispatch> externCallDispatch;
 
+    // ── D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT:
+    //     WHICH imports `externCallDispatch` applies to ───────────────
+    //
+    // The symbol BINDINGS whose extern references take the `indirect-slot`
+    // shape. EMPTY (the key absent) = EVERY import, which is the unqualified
+    // meaning `indirect-slot` has always carried and what every format
+    // declaring it meant before this key existed.
+    //
+    // ★ WHY THIS IS A SECOND KEY AND NOT A THIRD `ExternCallDispatch` VALUE.
+    // `externCallDispatch` answers WHAT THE INDIRECT SHAPE IS for this format
+    // (deref a pointer slot vs. branch to a linker-synthesized stub). This key
+    // answers WHICH REFERENCES NEED IT. Those are orthogonal questions, and
+    // folding them into one enum would need a new member per (shape × scope)
+    // pair. The existing keys are all keyed by REFERENCE KIND —
+    // `externCallDispatch` for calls, `dataImportBinding` for data reads,
+    // `externAddrBinding` for address materialization; this one is keyed by
+    // the SYMBOL's binding, an axis none of them can express.
+    //
+    // ★★ WHY THE AXIS IS `SymbolBinding` AND NOT SOMETHING PE-SHAPED. A
+    // pc-relative code relocation can only name a target that will have a
+    // SECTION and an address. A WEAK undefined symbol may legally resolve to
+    // NOTHING, which COFF spells as an ABSOLUTE value-0 symbol — and no
+    // 32-bit displacement from a 0x140000000 image base reaches an absolute.
+    // A GLOBAL undefined symbol has no such resolution: the link either finds
+    // a definition or fails. So the question "can this reference be
+    // pc-relative here" is a question about the BINDING, in the same agnostic
+    // `SymbolBinding` vocabulary `ExternImport::binding` and
+    // `ModuleSymbol::binding` already speak. ✔MEASURED 2026-09-02 that all
+    // three references narrow on exactly this axis for FUNCTIONS, each probed
+    // separately with `weak` as the only variable: clang 18.1.3 emits
+    // `.rdata$.refptr.maybe` + two `REL32 .refptr.maybe` for a WEAK extern
+    // function and NO `.refptr` section at all for a STRONG one, on BOTH
+    // `--target=x86_64-pc-windows-msvc` AND `--target=x86_64-w64-windows-gnu`;
+    // mingw-w64 gcc 13.2.0 likewise emits `.refptr.maybe` only for the weak
+    // one. (Their DATA answer differs — see `dataImportBinding` below, which
+    // this key deliberately does NOT narrow, because the unconditional data
+    // slot has its own measured reason: `ld` refuses a direct rel32 against a
+    // symbol it must AUTO-IMPORT from a DLL.)
+    //
+    // ⚠ `SymbolBinding::Local` is REFUSED in this list at load: no format
+    // spells an undefined LOCAL symbol, so no import can ever carry it
+    // (`collectExterns` refuses one at the declaration's own span), and a
+    // list member that can never match is config that reads as a capability
+    // and is not one — the D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE shape.
+    //
+    // Read through `externRefSlotBindings()` / `externRefTakesImportSlot()`
+    // below, which are the ONE owner of the rule; no consumer re-derives it.
+    std::vector<SymbolBinding> indirectSlotBindings;
+
     // ── D-LK-EXTERN-DATA-IMPORT: extern-DATA import binding model ───
     //
     // How an imported library DATA OBJECT (libc `stdout`) is bound
@@ -1614,6 +1684,53 @@ struct DSS_EXPORT ObjectFormatData {
     // loud at load (the closed-enum check — the externCallDispatch /
     // dataImportBinding discipline).
     std::optional<ExternAddrBinding> externAddrBinding;
+
+    // ── D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET:
+    //     the OBJECT-CARRIED realization of `dataImportBinding` ───────
+    //
+    // `dataImportBinding: "got-indirect"` says an extern DATA object's
+    // address is LOADED from a pointer slot rather than computed. On an
+    // IMAGE the slot is built by the import walker (the PE IAT entry, the
+    // ELF `.got`, the Mach-O `__got`) and nothing else is needed. A
+    // RELOCATABLE artifact has NO import walker: the same declared model
+    // can only be realized by the object CARRYING the slot itself, as a
+    // pointer-sized item holding an absolute relocation against the
+    // imported name that the FINAL linker fills.
+    //
+    // This block is that realization's DIALECT SPELLING — the symbol-name
+    // prefix the carried slot is published under — and it exists for the
+    // same reason `weakDefinition.dialect` does: the mechanism is an
+    // engine decision, the SPELLING is a per-ecosystem fact, and a
+    // spelling hardcoded in a walker is a format-identity branch wearing a
+    // string literal. It is NOT a second decision about WHETHER to
+    // indirect: that stays `dataImportBinding`'s, and the two are locked
+    // together at the linker (a relocatable format declaring the binding
+    // with no slot spelling FAILS LOUD there, and a format declaring the
+    // spelling without the binding likewise).
+    //
+    // ✔MEASURED 2026-09-02, why the prefix is `.refptr.` on PE/COFF and why
+    // matching the reference spelling is worth declaring rather than
+    // inventing: clang 18.1.3 emits `.refptr.<name>` for BOTH windows
+    // triples, and mingw-w64 gcc 13.2.0 emits it for every PE data extern.
+    // The slot is a COMDAT, so a DSS object and a clang object that import
+    // one name publish the SAME key and the final linker folds them into
+    // ONE slot; a private prefix would silently produce two.
+    //
+    // `std::nullopt` = the format declares no carried-slot spelling — the
+    // correct state for every IMAGE flavour (its walker owns the slot) and
+    // for a relocatable flavour that declares no `dataImportBinding` at all
+    // (its extern data addresses are computed directly, which is what
+    // cl.exe emits and what every ELF/Mach-O relocatable flavour does).
+    struct ObjectImportSlotInfo {
+        // The symbol-name prefix; the slot for import `ea` is published as
+        // `<symbolPrefix>ea`. Required non-empty when the block is present
+        // (validate()-enforced): an empty prefix would publish the slot
+        // under the IMPORT'S OWN NAME, which is a duplicate-symbol error at
+        // the final linker in the best case and a self-referential slot in
+        // the worst.
+        std::string symbolPrefix;
+    };
+    std::optional<ObjectImportSlotInfo> objectImportSlot;
 
     // ── D-CSUBSET-THREAD-LOCAL (TLS C1): thread-local access block ──
     //
@@ -2258,11 +2375,55 @@ public:
     [[nodiscard]] RuntimeLibraryTable const& runtimeLibraries() const noexcept {
         return d_.runtimeLibraries;
     }
+
+    // ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ──
+    // The role table of the SHIPPED FLAVOURS OF THIS KIND — the half of a
+    // descriptor's `{"role": …}` answer this document does not declare itself,
+    // this document standing in for its shipped namesake (a `loadFromText`
+    // mutant of `…-exec` supersedes the shipped `…-exec`). Assembled by the same
+    // total, memoized scan of `object-formats/` that
+    // `runtime::resolveArchiveSiblingFormat` runs, over the directory THIS
+    // document was loaded from (`loadFromText` has none, so the ambient shipped
+    // directory answers — the mutant case, and the only one).
+    // The error arm is the family failing to ASSEMBLE — the directory not
+    // located, a sibling that does not load, or two siblings naming different
+    // providers (an image against a shipped source, or two images) — and it is
+    // never resolved by iteration order.
+    // ★ WHY NOT A ROW ON EVERY FLAVOUR. The loader refuses a `runtimeLibraries`
+    // row no block of the document names (inert config), and it is right to: an
+    // archive cannot record an image at all, so a `cLibrary` row on a
+    // `-staticlib` document could change no output. The family fact is written
+    // where a block needs it and reached from here by the flavours that do not.
+    //
+    // ⚠⚠ IT ASSEMBLES ON EVERY CALL, ON PURPOSE, AND THE CACHING BELONGS TO THE
+    // CALLER — `FormatRuntimeLibraryRoleResolver` below is the one that holds it.
+    // ✔The first cut cached the assembled family in a `mutable` member of THIS
+    // class, and this class is MEMOIZED: `loadFromFile` stores each instance in
+    // the content-addressed `ConfigDocumentMemo` with an EMPTY dependency ledger,
+    // justified by "a built schema is a pure function of this document's own
+    // bytes". A member folding TWENTY-THREE SIBLING DOCUMENTS into the instance
+    // makes that claim false — the memo key covers this document's bytes and says
+    // nothing about theirs, so a sibling edited in-process would be served from a
+    // cache keyed on bytes that did not change. `config_document_memo.hpp` calls
+    // exactly that shape "a SILENT MISCOMPILE, not a stale cache entry". A
+    // resolver, by contrast, lives for ONE binding operation — the same lifetime
+    // `resolveArchiveSiblingFormat` and `Resolver::shippedFormats_` give their own
+    // total scans — so its cache cannot outlive the state it was derived from.
+    [[nodiscard]] std::expected<RuntimeLibraryTable, std::string>
+    assembleFlavourRuntimeLibraries() const;
+
     // The format's unwinder-personality declaration, or nullopt if it declares
     // none. `synthesizeSehFunclets` fails loud on a resolved SEH region under a
     // nullopt personality — never a silently-assumed handler/image pair.
     [[nodiscard]] std::optional<SehPersonality> const&
     sehPersonality() const noexcept { return d_.sehPersonality; }
+    // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics-runtime declaration,
+    // or nullopt if it supplies none. Threaded into `lowerToLir` as an
+    // already-resolved VALUE (the `wideFloatSoftcallLibrary` pattern): the
+    // under-aligned `_Atomic` arm mints its extern import against it, and a
+    // `traps` target reaching a nullopt fails loud naming this key.
+    [[nodiscard]] std::optional<AtomicsRuntime> const&
+    atomicsRuntime() const noexcept { return d_.atomicsRuntime; }
     // The program-entry materialization VERBS this format realizes. Non-empty on
     // every exec-flavored format, empty on every other (both directions
     // load-enforced), so EMPTY is the engine's "this build needs no program
@@ -2292,6 +2453,60 @@ public:
         return d_.externCallDispatch;
     }
 
+    // ── D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT ──
+    //
+    // THE ONE OWNER OF "WHICH EXTERN REFERENCES TAKE THE IMPORT SLOT". Two
+    // tiers must agree symbol for symbol — MIR→LIR decides the emitted SHAPE
+    // (deref-the-slot vs. direct) and the linker decides WHICH imports get a
+    // slot minted and which relocations are retargeted — and a rule spelled
+    // twice is a rule that drifts (the reason `strongerReferenceBinding` and
+    // `stricterDuplicateMatch` exist one tier down). So the rule lives HERE,
+    // once, and both tiers consume the ANSWER: the linker calls
+    // `externRefTakesImportSlot` directly, MIR→LIR is threaded the list.
+    //
+    // The rule, in full — and this function is the only place it is written:
+    //   * dispatch != `indirect-slot`  → NO binding takes the slot.
+    //   * `indirect-slot`, no narrowing declared → EVERY binding does (the
+    //     unqualified meaning the key has always carried).
+    //   * `indirect-slot` + `indirectSlotBindings` → exactly those.
+    // Allocation-free on purpose: the linker asks it once per extern import,
+    // and a slot pass over a sqlite-scale object asks it hundreds of times.
+    [[nodiscard]] bool
+    externRefTakesImportSlot(SymbolBinding binding) const noexcept {
+        if (d_.externCallDispatch != ExternCallDispatch::IndirectSlot) {
+            return false;
+        }
+        if (d_.indirectSlotBindings.empty()) return true;  // unnarrowed
+        for (auto const b : d_.indirectSlotBindings) {
+            if (b == binding) return true;
+        }
+        return false;
+    }
+
+    // The same answer as a SET, for readers and diagnostics — DERIVED from the
+    // predicate above rather than re-deciding, so the two can never disagree,
+    // and PROJECTED over the vocabulary table rather than naming its members:
+    // a spelled-out `{Local, Global, Weak}` would be a second owner of the
+    // closed set and would silently omit a member added later
+    // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
+    [[nodiscard]] std::vector<SymbolBinding>
+    externRefSlotBindings() const {
+        std::vector<SymbolBinding> out;
+        for (auto const& r : kSymbolBindingTable.rows) {
+            if (externRefTakesImportSlot(r.first)) out.push_back(r.first);
+        }
+        return out;
+    }
+
+    // The DECLARED narrowing list, verbatim (empty = the key is absent).
+    // Threaded to MIR→LIR by the driver, and read by `validate()`'s pairing
+    // rules. Consumers asking "does THIS import take the slot" want
+    // `externRefTakesImportSlot` above, never this.
+    [[nodiscard]] std::vector<SymbolBinding> const&
+    indirectSlotBindings() const noexcept {
+        return d_.indirectSlotBindings;
+    }
+
     // ── D-LK-EXTERN-DATA-IMPORT accessor ─────────────────────────
     // The format's extern-DATA import binding model
     // (`got-indirect`), or nullopt if the format declared none.
@@ -2312,6 +2527,18 @@ public:
     [[nodiscard]] std::optional<ExternAddrBinding>
     externAddrBinding() const noexcept {
         return d_.externAddrBinding;
+    }
+
+    // ── D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET
+    //     accessor ──────────────────────────────────────────────────
+    // The symbol-name spelling of an OBJECT-CARRIED data-import slot, or
+    // nullopt if this format carries none. Read by the linker when it must
+    // realize a declared `dataImportBinding` inside a RELOCATABLE artifact,
+    // which has no import walker to build the slot for it.
+    [[nodiscard]]
+    std::optional<detail::ObjectFormatData::ObjectImportSlotInfo> const&
+    objectImportSlot() const noexcept {
+        return d_.objectImportSlot;
     }
 
     // ── D-CSUBSET-THREAD-LOCAL accessor (TLS C1) ─────────────────
@@ -2412,7 +2639,79 @@ private:
     // needed); every other construction path leaves it empty on purpose.
     std::string contentDigest_;
 
+    // The DIRECTORY this document was read from, written ONLY by `loadFromFile`
+    // (also a static member of this class) and empty for every other
+    // construction path. It is the population `assembleFlavourRuntimeLibraries`
+    // scans, so a document's flavour family is ITS OWN siblings rather than
+    // whichever directory the ambient `DSS_CONFIG_ROOT` names at the moment the
+    // question is asked. ⓘ It is a function of the memo LABEL (the resolved
+    // path), which is already half the memo key, so recording it changes nothing
+    // about the instance's purity.
+    std::string sourceDirectory_;
+
     detail::ObjectFormatData d_;
+};
+
+// ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ────
+//
+// THE ONE ADAPTER from a format schema to the core `RuntimeLibraryRoleResolver`
+// seam a shipped-descriptor read asks. Every producer of an `ExternImport` in
+// the driver builds one over the ACTIVE format (the C front half and the
+// on-binary-name oracle), and the corpus guard in `tests/link/` builds one over
+// each shipped flavour — a second adapter would be a second reading of which
+// row answers, which is the drift this row exists to end.
+//
+// ★ IT IS ALSO WHERE THE FLAVOUR-FAMILY SCAN IS CACHED, and that is a lifetime
+// decision, not a convenience. One resolver serves ONE binding operation — a
+// `buildCuMir` of one CU, one on-binary-name oracle call, one guard arm — so its
+// cache is derived from the directory as it is NOW and dies with the operation.
+// The schema it adapts is MEMOIZED for the process, which is exactly why the
+// scan may not be cached there (see `assembleFlavourRuntimeLibraries`).
+// ★ LAZY. An `-exec`/`-pie` build, whose own table declares `cLibrary`, answers
+// from `runtimeLibraries()` and NEVER scans; a `-dll`/`-dyn`/`-dylib`/
+// `-staticlib`/bare build scans once per resolver (the 24 sibling BUILDS are
+// still memo hits after the first, so a second resolver in the same process
+// re-reads and re-digests, and rebuilds nothing).
+// ⓘ `std::once_flag`, not a bare bool: `rowForRole` is `const` on an interface
+// callers hold as a pointer, so a producer that shares one resolver across the
+// driver's per-TU threads must not race on the lazy fill. It also makes the
+// class non-copyable, which is what a resolver should be — it is an ADAPTER
+// over a reference, always constructed at the site that uses it.
+class DSS_EXPORT FormatRuntimeLibraryRoleResolver final
+    : public RuntimeLibraryRoleResolver {
+public:
+    explicit FormatRuntimeLibraryRoleResolver(ObjectFormatSchema const& format) noexcept
+        : format_(format), kindName_(objectFormatKindName(format.kind())) {}
+
+    [[nodiscard]] std::string_view formatKindName() const noexcept override {
+        return kindName_;
+    }
+
+    [[nodiscard]] RuntimeLibraryBinding const*
+    rowForRole(RuntimeLibraryRole role, std::string& refusal) const override {
+        // The ACTIVE document first: the row its own spine blocks already
+        // resolve against, so the build is self-consistent and no scan happens.
+        if (auto const* const own = format_.runtimeLibraries().rowForRole(role))
+            return own;
+        std::call_once(familyOnce_, [this] {
+            family_ = format_.assembleFlavourRuntimeLibraries();
+        });
+        if (!family_.has_value()) {
+            refusal = family_.error();
+            return nullptr;
+        }
+        return family_->rowForRole(role);
+    }
+
+private:
+    ObjectFormatSchema const& format_;
+    std::string_view          kindName_;
+    // The siblings, assembled at most once per resolver. `std::expected` so an
+    // assembly REFUSAL is remembered as a refusal rather than re-attempted (and
+    // re-reported) per role. The default-constructed value is never read: the
+    // `call_once` above always writes it first.
+    mutable std::once_flag                                   familyOnce_;
+    mutable std::expected<RuntimeLibraryTable, std::string>  family_;
 };
 
 } // namespace dss

@@ -860,13 +860,33 @@ enum class RuntimeLibraryRole : std::uint8_t {
     // Fls*). Distinct from `cLibrary` on pe; on Mach-O the same image serves
     // both, which the table expresses by pointing both roles at it.
     SystemPrimitives  = 3,
+    // D-CSUBSET-PACKED-ATOMIC-MEMBER: the image that owns the GENERIC C11
+    // atomics runtime entry points (`__atomic_load` / `__atomic_store`, size
+    // passed at RUNTIME) an under-aligned `_Atomic` access lowers to a CALL of.
+    // ✔MEASURED 2026-09-02 (`nm -D --defined-only`): `libatomic.so.1` on BOTH
+    // Linux legs (aarch64 and x86_64) exports them as ordinary global text at
+    // the default version `@@LIBATOMIC_1.0`, while `libc.so.6` and
+    // `libgcc_s.so.1` export ZERO `__atomic_*` symbols — so on ELF this is a
+    // genuinely DISTINCT image from `cLibrary`, which is the whole argument for
+    // a role rather than reusing one. On Mach-O the SAME `/usr/lib/libSystem.B.
+    // dylib` that plays `cLibrary` carries them (Apple clang links the packed
+    // case with `otool -L` showing libSystem alone), so this format family
+    // points a SECOND row at one image — the sameness the table permits without
+    // asserting.
+    // ⚠ THE GENERIC ENTRIES, NEVER THE SIZED ONES. `__atomic_load_4` and its
+    // family are IFUNCs that resolve to the INLINE realization and SIGBUS on an
+    // under-aligned aarch64 access exactly as `LDAR` does; only the generic,
+    // runtime-sized entries dispatch through libatomic's lock table. Declaring
+    // the names per format (below) is what keeps that choice in config.
+    AtomicsRuntime    = 4,
 };
 
-inline constexpr EnumNameTable<RuntimeLibraryRole, 4> kRuntimeLibraryRoleTable{{{
+inline constexpr EnumNameTable<RuntimeLibraryRole, 5> kRuntimeLibraryRoleTable{{{
     { RuntimeLibraryRole::None,              "none"              },
     { RuntimeLibraryRole::CLibrary,          "cLibrary"          },
     { RuntimeLibraryRole::UnwindPersonality, "unwindPersonality" },
     { RuntimeLibraryRole::SystemPrimitives,  "systemPrimitives"  },
+    { RuntimeLibraryRole::AtomicsRuntime,    "atomicsRuntime"    },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -905,7 +925,7 @@ isSelectableRuntimeLibraryRole(RuntimeLibraryRole r) noexcept {
 // `core/types/target_schema.hpp`
 // (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY).
 inline constexpr auto kSelectableRuntimeLibraryRoleNames =
-    namesWhere<3>(kRuntimeLibraryRoleTable, isSelectableRuntimeLibraryRole);
+    namesWhere<4>(kRuntimeLibraryRoleTable, isSelectableRuntimeLibraryRole);
 static_assert(kRuntimeLibraryRoleTable.rows.size()
                   == kSelectableRuntimeLibraryRoleNames.size() + 1,
               "kRuntimeLibraryRoleTable must have exactly ONE unselectable row "
@@ -913,10 +933,98 @@ static_assert(kRuntimeLibraryRoleTable.rows.size()
               "literal count matching while the role refusals silently stop "
               "naming the set the loader accepts");
 
-// One `runtimeLibraries` row: a role and the image identity that plays it.
+// One `runtimeLibraries` row: a role, and WHO PLAYS IT — which is one of TWO
+// kinds of answer, exactly one of which a row may give.
+//
+// ★★★ THE SECOND KIND IS D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64, AND IT IS NOT A
+// SPECIAL CASE BOLTED ON FOR ATOMICS. `image` says the role is played by a
+// PLATFORM IMAGE and its entries are IMPORTED from it. `source` says the role is
+// played by a body DSS SHIPS AND COMPILES — a config-root-relative path into
+// `runtime/<tier>/src/` — and its entries are DEFINED IN THE PROGRAM, resolved
+// out of the shipped runtime archive by the linker's ordinary unresolved-symbol
+// pull.
+//
+// ★ THE PAIR IS LIFTED, NOT INVENTED. `src/dss-config/shippedLibs/*.json` has
+// carried exactly this pair for a year — `library` (import it) beside
+// `realization` (we ship the body), mutually exclusive, refused at load if a
+// descriptor claims both, "two owners for one body". That vocabulary answered
+// the question one tier down, for a symbol a PROGRAM declares through a header.
+// It could not answer it for a symbol the COMPILER MINTS, because a minted
+// extern has no descriptor row to hang off. Roles live here, so the same pair
+// lives here too, and every role gains the answer at once: a future
+// `libgcc`-shaped helper, a target-specific `memcpy`, an ELF unwind personality
+// on a platform that ships none, all become one row instead of one mechanism.
+//
+// ⚠ NOTHING DOWNSTREAM LEARNS THE DIFFERENCE, WHICH IS THE POINT. A realized
+// role resolves its spine block's derived `libraryPath` to the EMPTY STRING, and
+// an extern with an empty library path is already the "no library binding" shape
+// the shipped-source realization uses for `dirent`/`unistd`. So `mir_to_lir.cpp`
+// mints the same `ExternImport` either way and contains no branch at all: the
+// DOCUMENT decides, `src/` reads.
+//
+// ══ THE TWO MECHANISMS ARE SEPARATE ON PURPOSE — P54 lane `ar` ══════════════
+//
+// The question this table answers and the question `shippedLibs/*.json` answers
+// LOOK identical ("who plays this on this format family?") and are NOT the same
+// question. Keeping one vocabulary across two axes was considered and REFUSED,
+// and the reason is measured rather than aesthetic:
+//
+//   * `shippedLibs/*.json` is INCLUDE-DRIVEN AT THE DECLARATION. A descriptor's
+//     identity IS a header — the include key is the descriptor's FILENAME stem
+//     (`<stem>.json`, see `core/types/include_path_resolve.hpp`), so what a
+//     descriptor declares is exactly "what a program that writes
+//     `#include <stem.h>` may name".
+//   * This table is COMPILER-MINTED. `resolveAtomicsRuntimeExtern` invents
+//     `__atomic_load` for an under-aligned `_Atomic` access in a program that
+//     may `#include` nothing at all.
+//
+// ⇒ Moving the atomics runtime into a descriptor would need a header to hang it
+// off, and there is none: no reference declares `__atomic_load` in ANY header
+// (gcc and clang expose it as a BUILTIN, with no include; MSVC has neither), so
+// inventing `<dss_atomic.h>` would put an includable header ABOVE the union
+// `(gcc ∪ clang ∪ MSVC) ∪ ISO C`, and hanging it off `<stdatomic.h>` would claim
+// a provenance no reference has. THAT is the reason, and it is not the reason
+// one might expect —
+//
+// ⚠⚠ ✔MEASURED, AND IT REFUTES THE OBVIOUS ARGUMENT FOR THE SPLIT: a descriptor
+// realization is **not** conditional on the include. `resolveShippedRuntimeArchives`
+// asks `allShippedSourcesForFormat`, a CORPUS-WIDE walk keyed ONLY by the format
+// kind and never given the program's include closure, so `dirent.c` and
+// `unistd.c` are compiled into the pe64 runtime archive for EVERY pe64 build —
+// `program.cpp`'s own note records them being "PREPROCESSED AND PARSED on every
+// single invocation … and then, for any program that does not reach them,
+// DISCARDED". What is include-driven is the DECLARATION; what is demand-driven
+// is the LINK (the archive member is pulled by NAME off the unresolved-symbol
+// worklist). So "a descriptor realization would only reach programs that include
+// the header" is FALSE, and anyone reaching for it as the justification is
+// building on a premise the code refutes.
+//
+// ★ WHAT THE TWO AXES DO SHARE, AND IT IS ALREADY ONE SPELLING: the `source`
+// key. A descriptor writes `realization.<family>.source`, a row here writes
+// `source`, both are config-root-relative paths into `runtime/<tier>/src/`, both
+// pass the SAME containment predicate (`core::shippedConfigRelativePathEscapes`),
+// and both land in the SAME claim list in `program.cpp`. The residual mismatch is
+// that a descriptor spells the import case `library.<family>: "<image>"` while a
+// row spells it `image`. Renaming across 40 shipped descriptors was refused: the
+// two words are at DIFFERENT LEVELS — `library`/`realization` name the MAP (the
+// axis), `image`/`source` name the VALUE (the provider) — so the rename would
+// buy a coincidence of letters, not an agreement of meaning.
+//
+// ⚠ AND THE PROVIDER FACT IS FAMILY-LEVEL WHILE THIS TABLE IS PER-FLAVOUR, so a
+// pe64 provider is written FOUR times. That is a property of THIS TIER, not of
+// the realized row: ✔MEASURED over the 26 shipped documents, `libatomic.so.1`
+// appears in 10, `/usr/lib/libSystem.B.dylib` in 8+2, `libc.so.6` in 4, and the
+// whole `atomicsRuntime` SPINE BLOCK is byte-identical across every flavour of
+// all five families (11 of 23 top-level keys on pe64, 14 of 23 on elf64). There
+// is no family document in this tier to move any of it to. What IS enforced is
+// that the copies AGREE: `tests/link/test_runtime_library_roles.cpp`'s
+// `EveryFlavourOfAFormatKindNamesOneProviderPerRole` refuses two flavours of one
+// kind naming different providers for a role, so the repetition cannot become a
+// disagreement even though it cannot become a single line.
 struct DSS_EXPORT RuntimeLibraryBinding {
     RuntimeLibraryRole role = RuntimeLibraryRole::None;
     std::string        image;   // "ucrtbase.dll" / "libgcc_s.so.1" / a dylib path
+    std::string        source;  // "runtime/platform/src/atomic.c"
 };
 
 // The format's whole role table. A VECTOR of rows rather than a fixed struct of
@@ -925,18 +1033,111 @@ struct DSS_EXPORT RuntimeLibraryBinding {
 struct DSS_EXPORT RuntimeLibraryTable {
     std::vector<RuntimeLibraryBinding> bindings;
 
-    // The image playing `role`, or nullopt if this format declares no such row.
-    // ★ NULLOPT IS THE FAIL-LOUD SIGNAL, never a fallback: the loader refuses a
+    // The row playing `role`, or nullptr if this format declares no such row.
+    // ★ NULLPTR IS THE FAIL-LOUD SIGNAL, never a fallback: the loader refuses a
     // format whose spine block names a role this table does not declare, so no
-    // consumer ever has to invent an image.
+    // consumer ever has to invent a provider.
+    [[nodiscard]] RuntimeLibraryBinding const*
+    rowForRole(RuntimeLibraryRole role) const noexcept {
+        for (auto const& b : bindings) {
+            if (b.role == role) return &b;
+        }
+        return nullptr;
+    }
+
+    // The image playing `role`. ⚠ PRESENT-BUT-EMPTY IS A REAL ANSWER AND IT
+    // MEANS "REALIZED": the row exists, so the role IS declared, but no image
+    // plays it because DSS ships the body (see `RuntimeLibraryBinding`). Callers
+    // testing DECLAREDNESS must use `rowForRole`; `has_value()` here answers the
+    // same question only because a realized row still returns an (empty) view.
     [[nodiscard]] std::optional<std::string_view>
     imageForRole(RuntimeLibraryRole role) const noexcept {
-        for (auto const& b : bindings) {
-            if (b.role == role) return std::string_view{b.image};
-        }
+        if (auto const* b = rowForRole(role)) return std::string_view{b->image};
         return std::nullopt;
     }
+
+    // The shipped source realizing `role`, or nullopt when this format either
+    // declares no such row or fills it from an image.
+    [[nodiscard]] std::optional<std::string_view>
+    sourceForRole(RuntimeLibraryRole role) const noexcept {
+        auto const* b = rowForRole(role);
+        if (b == nullptr || b->source.empty()) return std::nullopt;
+        return std::string_view{b->source};
+    }
+
+    // Every shipped source this table realizes, in declaration order. The driver
+    // adds these to the shipped-runtime unit list exactly as it adds a
+    // descriptor's `realization` entries — one list, one compiler, one cache.
+    [[nodiscard]] std::vector<std::string> realizedSources() const {
+        std::vector<std::string> out;
+        for (auto const& b : bindings) {
+            if (!b.source.empty()) out.push_back(b.source);
+        }
+        return out;
+    }
+
     [[nodiscard]] bool empty() const noexcept { return bindings.empty(); }
+};
+
+// ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE:
+//    WHO ANSWERS A SHIPPED-LIBRARY DESCRIPTOR'S `{"role": …}` ─────────────
+//
+// A descriptor's per-object-format `library` map may name a ROLE of the table
+// above instead of a literal image — `{"pe": {"role": "cLibrary"}}` — so the
+// image is written ONCE, in the format tier that owns it, and never restated
+// per header. The descriptor reader lives in `ffi`, which links `core` and
+// nothing of the format loader, so the role is resolved through THIS
+// question-answering seam. The precedent is the `TargetSchema const*` on
+// `analyze()`: a schema-shaped object answers, and the asking tier never
+// learns which document it was.
+//
+// ★ WHOSE ROW. "Which image plays role R on this object-format FAMILY" is a
+// family-level fact that the format tier writes once per FLAVOUR
+// (`tests/link/test_runtime_library_roles.cpp`'s
+// `EveryFlavourOfAFormatKindNamesOneProviderPerRole` refuses two flavours
+// naming different providers, and its own text says a flavour that does not
+// need a role must not be forced to name one). So the implementation answers
+// from the ACTIVE document when it declares the role — the row its own spine
+// blocks already resolve against, which keeps the build self-consistent — and
+// otherwise from the shipped flavours of the same kind, which must AGREE. A
+// `-staticlib` or `-dll` document never gains a row nothing of its own names
+// (the loader refuses such a row as inert config); it reaches the family's
+// answer here.
+//
+// ⚠ NULLPTR IS "THIS CALLER BINDS NO IMPORT", NEVER "GUESS". The LSP, the
+// header parser and the layout/name tests read descriptors without ever
+// producing an import; for them a role entry is validated and RECORDED
+// (`ShippedLibDescriptor::libraryRoles`) but yields no image — the stated
+// UNBOUND arm, exactly what an OMITTED key already means. Every producer of an
+// `ExternImport` passes one, and with one in hand a role that cannot be
+// answered REFUSES the read: never a fallback image, never iteration order.
+class DSS_EXPORT RuntimeLibraryRoleResolver {
+public:
+    virtual ~RuntimeLibraryRoleResolver() noexcept = default;
+
+    RuntimeLibraryRoleResolver(RuntimeLibraryRoleResolver const&)            = delete;
+    RuntimeLibraryRoleResolver& operator=(RuntimeLibraryRoleResolver const&) = delete;
+    RuntimeLibraryRoleResolver(RuntimeLibraryRoleResolver&&)                 = delete;
+    RuntimeLibraryRoleResolver& operator=(RuntimeLibraryRoleResolver&&)      = delete;
+
+    // The object-format KIND name (`objectFormatKindName`) this resolver
+    // answers for — the `library` map key whose role entries it resolves. A
+    // role entry under any OTHER key is validated and recorded only: a `pe`
+    // role has no answer inside an elf build, and asking would be a guess.
+    [[nodiscard]] virtual std::string_view formatKindName() const noexcept = 0;
+
+    // The row playing `role` for this build, or nullptr. `refusal` is written
+    // ONLY when the answer could not be computed at all (a sibling document
+    // failed to load, or two siblings name different providers); nullptr with
+    // an EMPTY `refusal` means "no document of the family declares this role".
+    // A returned row may be REALIZED (empty `image`, `source` set) — the caller
+    // decides what that means for it. The pointer stays valid for the
+    // resolver's lifetime.
+    [[nodiscard]] virtual RuntimeLibraryBinding const*
+    rowForRole(RuntimeLibraryRole role, std::string& refusal) const = 0;
+
+protected:
+    RuntimeLibraryRoleResolver() noexcept = default;
 };
 
 // ── UCRT-P4: the unwinder-personality declaration ──────────────────
@@ -957,6 +1158,43 @@ struct DSS_EXPORT SehPersonality {
     RuntimeLibraryRole role = RuntimeLibraryRole::None;  // declared in JSON
     std::string libraryPath;   // DERIVED: resolved from `role` at load
     std::string mangledName;   // "__C_specific_handler"
+};
+
+// ── D-CSUBSET-PACKED-ATOMIC-MEMBER: the atomics-runtime declaration ────────
+//
+// The two GENERIC C11 atomics entry points an UNDER-ALIGNED `_Atomic` scalar
+// access lowers to a CALL of, and the image they are imported from. Populated
+// from the format JSON's `atomicsRuntime` block, whose `role` is resolved
+// against `runtimeLibraries` AT LOAD — so `libraryPath` here is a DERIVED copy
+// of a fact the role table owns, exactly like `SehPersonality` above.
+//
+// ★★ WHY THE NAMES ARE DECLARED PER FORMAT RATHER THAN SPELLED IN THE LOWERER.
+// The C-level spelling is `__atomic_load`, but the SYMBOL a Mach-O image
+// carries is `___atomic_load` — the format's own `cSymbolDecoration` leading
+// underscore. `processExit.importMangledName` already declares its entry the
+// same already-mangled way for the same reason, and that is the shipping
+// pattern: the alternative is the MIR/LIR substrate re-deriving a decoration
+// rule it has no business knowing, which is the `synth_seh_funclets.cpp`
+// hardcoded-`msvcrt.dll` defect one tier over.
+//
+// ★ THE SIGNATURES, ✔MEASURED against clang's own x86-64 call sequence and
+// against a working aarch64 probe on native hardware (P53):
+//     void __atomic_load (size_t size, const void *mem, void *ret, int model)
+//     void __atomic_store(size_t size, void *mem, void *val, int model)
+// size FIRST, memory-order model LAST, and the value/result travels through a
+// caller-supplied SLOT in BOTH directions (never a register return). The model
+// constant needs no translation — DSS's own AtomicLoad/AtomicStore payload
+// encoding (relaxed=0 … seq_cst=5) is byte-identical to `__ATOMIC_*`.
+//
+// A format that declares NO block supplies no atomics runtime; what happens
+// then is the TARGET's `underAlignedAtomicForm` question, not this one (a
+// `traps` target refuses, a `losesAtomicity` target keeps the native form —
+// see `TargetSchema`).
+struct DSS_EXPORT AtomicsRuntime {
+    RuntimeLibraryRole role = RuntimeLibraryRole::None;  // declared in JSON
+    std::string libraryPath;        // DERIVED: resolved from `role` at load
+    std::string loadMangledName;    // "__atomic_load"  / "___atomic_load"
+    std::string storeMangledName;   // "__atomic_store" / "___atomic_store"
 };
 
 // The format's shipped-library synthesis block (`"librarySynthesis"` in

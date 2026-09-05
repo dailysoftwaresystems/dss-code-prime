@@ -417,6 +417,31 @@ parentAllocaSlotIds(Mir const& mir, MirFuncId fn) {
                         "slot (H1), not a funclet Arg (D-WIN64-SEH-FUNCLETS)");
                 return false;
             }
+            case MirOpcode::BlockAddress: {
+                // ★ THIS CLONER IS THE SIXTH VERBATIM-COPY SITE, AND IT WAS THE ONE
+                // PROTECTED BY NOTHING. `&&label` inside a `__except(...)` filter
+                // expression (`__except(f(&&L))`) reached the `default:` arm below,
+                // which forwards `mir.instPayload(oldId)` — a block id in the PARENT
+                // function — into a funclet whose blocks are entirely different ones.
+                // The address emitted would name whatever block happens to hold that
+                // ordinal in the funclet, or none. `MirBuilder::addInst` now REFUSES
+                // the opcode, so deleting this arm aborts rather than miscompiling;
+                // this arm exists so the answer is a REPORTED refusal instead, because
+                // the construct is valid C that a user can write and a compiler must
+                // not abort on.
+                //
+                // A re-map is not available and would not be meaningful: the funclet
+                // is a SEPARATE function, so a parent block has no counterpart in it,
+                // and taking its address would need the parent's own block symbol
+                // threaded through the funclet's relocations. Refuse, loud and
+                // specific, exactly as the Arg arm above does for its own shape.
+                emitErr(reporter, "synthesizeSehFunclets: the SEH filter expression "
+                        "takes the address of a label (`&&label`) — the filter is "
+                        "cloned into a SEPARATE funclet function whose blocks are not "
+                        "the parent's, so a parent block address cannot be carried "
+                        "(D-WIN64-SEH-FUNCLETS)");
+                return false;
+            }
             default: {
                 // A general (side-effect-free or Load) filter inst: clone verbatim
                 // with resolved operands (each either in-block or a recoverable

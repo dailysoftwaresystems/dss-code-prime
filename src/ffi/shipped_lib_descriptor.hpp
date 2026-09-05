@@ -203,7 +203,11 @@ struct DSS_EXPORT ShippedSymbol {
     // of a threads symbol (availableObjectFormats:["pe"]); the elf entry carries no tag
     // and is a plain libc FFI import (glibc exports the C11 API from libc.so.6). At
     // CST->HIR a tagged symbol is SKIPPED from extern-import synthesis (kernel32 does
-    // not export mtx_lock — the eager-import law) and instead recorded into
+    // not export `mtx_lock`, so an import of it is a pe binary the LOADER refuses at
+    // 0xC0000139). ⓘ THE SKIP DOES NOT COME FROM THE RETIRED EAGER LAW and did not
+    // relax with it ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]): a recipe row's synthesized
+    // body CALLS the name, so referenced-only import would keep the import too. The
+    // row is REALIZED, never imported.) The tag is instead recorded into
     // `CstToHirResult.synthRecipeBySymbol` so HIR->MIR seeds `functionSymbols` (the
     // call lowers to GlobalAddr) and the synth pass supplies the definition. Empty
     // (default) for every ordinary shipped extern. (D-CSUBSET-C11-THREADS-HEADER)
@@ -325,6 +329,12 @@ struct DSS_EXPORT ShippedSymbol {
     //   R3 — one format carrying BOTH a `library` image AND a `source` ⇒ two
     //        owners for one body is the defect, not a fallback resolved silently.
     std::unordered_map<std::string, std::string> realization;
+    // D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: the
+    // per-SYMBOL `library` entries that named a ROLE rather than an image,
+    // AS DECLARED (format kind → role), recorded whether or not a resolver was
+    // in hand to turn them into `library` strings. The same contract as the
+    // descriptor-level `libraryRoles` below; see it for why both maps exist.
+    std::unordered_map<std::string, RuntimeLibraryRole> libraryRoles;
 };
 
 // True iff `id` is a member of the CLOSED synth-recipe vocabulary — 22 recipes spanning
@@ -624,6 +634,28 @@ struct DSS_EXPORT ShippedLibDescriptor {
     // symbol IMPORTS, byte-identical to the pre-ruling image. See the field of
     // the same name on `ShippedSymbol` for the full contract.
     std::unordered_map<std::string, std::string> realization;
+    // ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ──
+    // A `library` entry may name a RUNTIME ROLE instead of an image —
+    // `{"pe": {"role": "cLibrary"}}` — so the image is written ONCE, in the
+    // object format's `runtimeLibraries` table that owns it, and never
+    // restated per header (67 of the 69 shipped entries were such restatements
+    // before this channel existed; a `cLibrary` repoint left them all behind,
+    // silently, until load). The reader resolves a role entry THROUGH THE
+    // CALLER'S `RuntimeLibraryRoleResolver` into `library` above, so every
+    // consumer of that map keeps reading plain image strings and none of them
+    // learns that a role was ever involved.
+    //
+    // THIS map is the DECLARED form, kept beside the resolved one: format kind →
+    // role, for every role entry the document wrote, whether or not a resolver
+    // was in hand. Two readers need it and neither is a consumer of images: the
+    // corpus agreement guard (`tests/link/test_descriptor_library_role_agreement`)
+    // asks "which roles does the corpus reference, on which families" without
+    // a raw JSON walk — a third reading of this grammar is exactly what that
+    // guard exists to prevent — and a caller that passed NO resolver (the LSP,
+    // the header parser, layout/name tests) can still tell "this format's image
+    // is a role I did not resolve" from "this descriptor names no image here".
+    // A literal entry never appears here; a role entry always does.
+    std::unordered_map<std::string, RuntimeLibraryRole> libraryRoles;
 };
 
 // ═══ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF — THE SHIPPED SOURCE TREE ═══
@@ -759,8 +791,11 @@ allShippedSourcesForFormat(std::filesystem::path const& descriptorDir,
 //       declared entry and therefore free — that is its load-bearing home, because
 //       it is the refusal that can otherwise produce a build silently missing a
 //       body. It is repeated here so the sweep is a TOTAL statement about the tree.
-//   R2  a source file NO descriptor names ⇒ refusal (inert config: nothing can
-//       ever add it to a build graph). ⚠ GATE-TEST ONLY, and that is a deliberate
+//   R2  a source file NO DECLARER names ⇒ refusal (inert config: nothing can
+//       ever add it to a build graph). ⚠ "declarer" and not "descriptor" since
+//       D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64 gave a format's role table the same
+//       power; the rule did not change, the set of declarer KINDS did.
+//       ⚠ GATE-TEST ONLY, and that is a deliberate
 //       departure from the ruling's "LOAD ERROR" wording, stated rather than left
 //       to look like verbatim compliance: without the deleted manifest this costs
 //       a directory walk PLUS a corpus scan on EVERY compile, and an inert `.c`
@@ -786,10 +821,45 @@ allShippedSourcesForFormat(std::filesystem::path const& descriptorDir,
 // outright rather than scanned. (⚠⚠ Not closed by filtering to `.c`: that
 // would make this silently ignore a stray `.txt`/`.o` in the AUTHORED tree, which
 // is exactly the inert-config case R2 exists to catch. The subject was the bug.)
+//
+// ★★ `foreignDeclarations` IS THE SECOND DECLARER, AND IT IS PASSED RATHER
+// THAN DERIVED FOR A LAYERING REASON, NOT A CONVENIENCE ONE
+// (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64). A shipped-lib descriptor is no longer
+// the only document that can name a file in this tree: an object format's
+// `runtimeLibraries[].source` names one too, for a role whose entries the
+// COMPILER MINTS and which therefore has no descriptor row to hang off. Reading
+// `.format.json` here would put the object-format schema inside `ffi`, so the
+// caller hands over the sources it found. ⚠ A CALLER THAT READS THE KEY ITSELF
+// RATHER THAN LOADING THE FORMAT BECOMES A SECOND READER OF A CONFIG KEY, which
+// is how a sweep and a loader come to disagree about what a document says — so
+// `tests/link/test_runtime_library_roles.cpp` pins the two against each other:
+// every `source` the raw key spells is exactly what `ObjectFormatSchema`'s own
+// `realizedSources()` reports, per shipped flavour.
+//
+// ★ IT CARRIES A LOCATOR, NOT JUST A PATH, AND THAT IS A FAIL-LOUD REQUIREMENT
+// RATHER THAN A NICETY (P54 lane `ar`). The first cut passed bare strings and
+// synthesized the subject inside R1, which rendered
+// `shipped-lib descriptor 'an object format's runtimeLibraries[].source.(object
+// format)' declares … the object format '(object format)' would be left …` —
+// a placeholder printed as data, naming neither the document nor the role, and
+// calling a format document a descriptor. The caller is the only tier that KNOWS
+// which document and which row it read, so the locator travels with the claim.
+struct DSS_EXPORT ShippedSourceDeclaration {
+    // A COMPLETE subject phrase for a diagnostic, naming the document and the
+    // row — e.g. "object format 'pe64-x86_64-windows-exec'
+    // runtimeLibraries[atomicsRuntime]".
+    std::string declarer;
+    // Config-root-relative, the same spelling a descriptor's
+    // `realization.<format>.source` takes.
+    std::string source;
+};
+
 [[nodiscard]] DSS_EXPORT bool
-validateShippedSourceTree(std::filesystem::path const& descriptorDir,
-                          std::filesystem::path const& runtimeRootDir,
-                          DiagnosticReporter&          reporter);
+validateShippedSourceTree(
+    std::filesystem::path const&              descriptorDir,
+    std::filesystem::path const&              runtimeRootDir,
+    std::span<ShippedSourceDeclaration const> foreignDeclarations,
+    DiagnosticReporter&                       reporter);
 
 // Every NAME the descriptor at `path` contributes on object format `fmt` — the
 // ONE surface-presence oracle, shared by the corpus invariants and by the
@@ -927,14 +997,18 @@ validateShippedSurfaceRequirements(
 // format == `objectFormatKindName(*activeFormat)`); EVERY specified key
 // must equal the active value (generic string equality — no arch/format
 // literal in the engine). >1 variant matches ⇒ fail loud
-// (F_ShippedStructVariantAmbiguous). 0 match (variants present) ⇒ the
-// struct is NOT injected (a later reference fails loud as an undefined
-// type). EAGER: every variant's field list is decoded regardless of which
-// is active (a malformed INACTIVE variant fails the whole read on EVERY
-// target — anti-lurking, mirrors `signatureByDataModel`). Both default to
-// nullopt for direct-API/LSP/unit callers ⇒ no variant selection (a
-// flat-`fields` struct decodes exactly as before; a struct that carries
-// ONLY `variants` is not injected when no selector is available).
+// (F_ShippedStructVariantAmbiguous). 0 match (variants present) ⇒ no
+// LAYOUT is injected — the struct does not enter `structs` — while the TAG
+// is published INCOMPLETE into the type-text vocabulary, so `ptr<tag>` in a
+// signature stays a well-formed pointer and every use needing a size or a
+// field fails loud (P56 — see the arm in the .cpp for why the stricter
+// "publish nothing" rule was refuted). EAGER: every variant's field list is
+// decoded regardless of which is active (a malformed INACTIVE variant fails
+// the whole read on EVERY target — anti-lurking, mirrors
+// `signatureByDataModel`). Both default to nullopt for direct-API/LSP/unit
+// callers ⇒ no variant selection (a flat-`fields` struct decodes exactly as
+// before; a struct that carries ONLY `variants` contributes no layout when
+// no selector is available).
 // c82 `namedTypes` (D-FFI-DESCRIPTOR-VA-LIST-TYPE): optional caller-supplied
 // NAME → TypeId bindings threaded verbatim into EVERY `parseTypeFromText`
 // call this read performs (signatures, per-model overrides, typedefs, struct
@@ -970,6 +1044,26 @@ struct DSS_EXPORT ShippedDescriptorCacheStats {
 };
 [[nodiscard]] DSS_EXPORT ShippedDescriptorCacheStats shippedDescriptorCacheStats();
 
+// ── `roleResolver` (D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE)
+//
+// Who answers a `library` entry that names a ROLE (`{"pe": {"role": "cLibrary"}}`)
+// for the format kind the resolver declares (`formatKindName()`): the entry is
+// resolved to that role's IMAGE and lands in `library` as a plain string, so no
+// consumer of the map changes. Every role entry is ALSO recorded as declared in
+// `libraryRoles`. A resolver in hand makes an unanswerable role a REFUSAL of the
+// read — a role no document of the family declares, a role the family REALIZES
+// from a shipped source (no image to import from; that is `realization`'s
+// channel), or a family that cannot be assembled — never a fallback image.
+//
+// ⚠ `nullptr` (the default) means THIS CALLER BINDS NO IMPORT — the LSP, the
+// header parser, and the layout/name/structural tests, ✔MEASURED at ≥40 call
+// sites across 17 test files passing an `activeFormat` with no table in hand,
+// most of them reading the SHIPPED corpus. For them a role entry is validated
+// (unknown role, the `none` sentinel, an unknown key, an image beside a role —
+// all format-independent and always loud), recorded, and yields no `library`
+// string: the stated UNBOUND arm, byte-identical to an omitted key. Every
+// producer of an `ExternImport` (the driver's `analyze()` call and its
+// archive-member / assembly binders) passes one.
 [[nodiscard]] DSS_EXPORT std::optional<ShippedLibDescriptor>
 readShippedLibDescriptor(std::filesystem::path const&    path,
                          TypeInterner&                   interner,
@@ -978,7 +1072,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                          DataModel                       dataModel    = DataModel::Lp64,
                          std::optional<std::string_view> activeTarget = std::nullopt,
                          std::optional<ObjectFormatKind> activeFormat = std::nullopt,
-                         std::span<NamedTypeBinding const> namedTypes = {});
+                         std::span<NamedTypeBinding const> namedTypes = {},
+                         RuntimeLibraryRoleResolver const* roleResolver = nullptr);
 
 // Read ONLY the `macros` surface from the neutral descriptor at `path`, WITHOUT a
 // TypeInterner. Macros are pure preprocessor token text (no types), so the
@@ -1497,7 +1592,10 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
                             DataModel                         dataModel,
                             std::optional<std::string_view>   activeTarget,
                             std::optional<ObjectFormatKind>   activeFormat,
-                            std::span<NamedTypeBinding const> namedTypes = {});
+                            std::span<NamedTypeBinding const> namedTypes = {},
+                            // Threaded verbatim into every descriptor read this
+                            // oracle performs — see `readShippedLibDescriptor`.
+                            RuntimeLibraryRoleResolver const* roleResolver = nullptr);
 
 // EVERY symbol row of the descriptor that declares `name`, realized for the active
 // target — i.e. the whole import surface that descriptor would contribute.
@@ -1522,7 +1620,13 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
 // Returns nullopt on config-discovery failure (same contract as
 // `realizeShippedExternSymbols`); an EMPTY map when nothing declares `name`. Rows
 // that are not `Realized` on this format are OMITTED — a companion that does not
-// exist here must never become an import (the eager-import law's whole point).
+// exist here must never become an import, because an import of a name its runtime
+// does not export is a binary the LOADER refuses (pe 0xC0000139 / elf exit 127) with
+// no link error and no diagnostic naming the JSON line. ⓘ Referenced-only import
+// ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]) NARROWED that blast radius from every binary
+// that so much as `#include`d the header to every binary that REFERENCES the name —
+// which makes this omission MORE load-bearing, not less: the failure is now later and
+// harder to notice, and this is where it is still cheap to prevent.
 // `name` ITSELF is included; the caller already has its realization and can skip it.
 [[nodiscard]] DSS_EXPORT
 std::optional<std::unordered_map<std::string, ShippedSymbolRealization>>
@@ -1532,7 +1636,8 @@ realizeShippedDescriptorSurfaceFor(std::string_view                  name,
                                    DataModel                         dataModel,
                                    std::optional<std::string_view>   activeTarget,
                                    std::optional<ObjectFormatKind>   activeFormat,
-                                   std::span<NamedTypeBinding const> namedTypes = {});
+                                   std::span<NamedTypeBinding const> namedTypes = {},
+                                   RuntimeLibraryRoleResolver const* roleResolver = nullptr);
 
 } // namespace ffi
 } // namespace dss

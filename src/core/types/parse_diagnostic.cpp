@@ -121,6 +121,14 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_LinkageRedeclarationMismatch";
         case DiagnosticCode::S_NoreturnNonFunctionObject:
             return "S_NoreturnNonFunctionObject";
+        case DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger:
+            return "S_SubscriptOperandsNotPointerAndInteger";
+        case DiagnosticCode::S_ConflictingStorageClassSpecifiers:
+            return "S_ConflictingStorageClassSpecifiers";
+        case DiagnosticCode::S_FloatLiteralOverflowsToInfinity:
+            return "S_FloatLiteralOverflowsToInfinity";
+        case DiagnosticCode::S_ArrayParamStarInFunctionDefinition:
+            return "S_ArrayParamStarInFunctionDefinition";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
@@ -130,6 +138,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::P_UncommittedCheckpoint:    return "P_UncommittedCheckpoint";
         case DiagnosticCode::P_BacktrackFailed:          return "P_BacktrackFailed";
         case DiagnosticCode::P_DiagnosticsElided:        return "P_DiagnosticsElided";
+        case DiagnosticCode::P_SpeculationBudgetExhausted: return "P_SpeculationBudgetExhausted";
         case DiagnosticCode::C_MissingField:             return "C_MissingField";
         case DiagnosticCode::C_UnknownShape:             return "C_UnknownShape";
         case DiagnosticCode::C_UnknownToken:             return "C_UnknownToken";
@@ -338,7 +347,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_Utf8CharLiteralOutOfRange: return "H_Utf8CharLiteralOutOfRange";
         case DiagnosticCode::H_WideCharValueUnrepresentable: return "H_WideCharValueUnrepresentable";
         case DiagnosticCode::H_InvalidUniversalCharacterName: return "H_InvalidUniversalCharacterName";
-        case DiagnosticCode::H_WideByteEscapeUnsupported: return "H_WideByteEscapeUnsupported";
+        case DiagnosticCode::H_EscapeValueExceedsCodeUnit: return "H_EscapeValueExceedsCodeUnit";
         case DiagnosticCode::H_ConflictingStringLiteralPrefixes: return "H_ConflictingStringLiteralPrefixes";
         case DiagnosticCode::H_VlaJumpIntoScope:         return "H_VlaJumpIntoScope";
         case DiagnosticCode::H_VlaComputedGotoInScope:   return "H_VlaComputedGotoInScope";

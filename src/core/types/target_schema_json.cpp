@@ -198,6 +198,15 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
     };
     parseImmBound("immMin", variant.immMin);
     parseImmBound("immMax", variant.immMax);
+    // [[D-ASM-ARM64-LDR-TO-LDUR-CONVENIENCE-ALIAS-REFUSED]]: OPTIONAL
+    // `immMultipleOf` (a positive integer). Absent ⇒ the variant does not
+    // discriminate on divisibility (every pre-existing variant). Present ⇒ the
+    // matcher additionally requires the magnitude to be an exact multiple of
+    // it — which is what a `imm12.scaled` slot can actually carry, and what
+    // `immMin`/`immMax` alone cannot say. Read through the SAME helper as the
+    // bounds so the three keys cannot disagree about what a number is; a value
+    // of 0 or 1 is refused at validate() (see the field's comment).
+    parseImmBound("immMultipleOf", variant.immMultipleOf);
     // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB (introduced) /
     // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE (generalized + renamed):
     // OPTIONAL `negValue` (bool). Absent ⇒ false (the non-negative magnitude
@@ -257,9 +266,9 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
     // generalized from a memory displacement to any value-bearing operand;
     // the old spelling now lands here as an unknown key rather than being
     // read as `false`.
-    static constexpr std::array<std::string_view, 6> kGuardKeys{
+    static constexpr std::array<std::string_view, 7> kGuardKeys{
         "operandKinds", "width", "immMin", "immMax", "negValue",
-        "memoryDestination"};
+        "immMultipleOf", "memoryDestination"};
     DSS_CHECK_KEY_VOCABULARY(kGuardKeys);
     rejectUnknownKeys(g, kGuardKeys,
                       std::format("/opcodes/{}/encoding/variants/{}/guard",
@@ -575,6 +584,34 @@ void parseVariantResultSlot(json const& v, std::size_t opIdx, std::size_t vi,
 // `isOperableTargetRegClass` owns the "may a field draw from it" question, and
 // splitting one of those two facts across two files is how the two drift. The
 // message a `"none"` author sees names the operable set, from validate().
+// ★★ THE SHARED-ENCODING **ROLE** READER, one function for the three keys that
+// spell one ([[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]):
+// a wire's `regRole`, a variant's `resultRegRole` and its `requiresRegRole`.
+// Same reasoning as `parseRegClassField` above — one reader means the three
+// cannot disagree about what a role identifier is.
+//
+// ⚠ THE ROLE IS AN OPAQUE STRING AND THIS READER KNOWS NO VOCABULARY. The set
+// of roles is whatever the target's own `registers[]` declared, so the closed
+// set lives in `validate()`, which can see the table; a reader that hard-coded
+// a list would have to name AArch64's stack pointer in the ENGINE, which is
+// precisely the agnosticism break this axis exists to avoid.
+std::string parseRegRoleField(json const& obj, std::string_view key,
+                              std::string const& path, Collector& coll) {
+    if (!obj.contains(key)) return {};
+    auto const& n = obj.at(key);
+    if (!n.is_string() || n.get<std::string>().empty()) {
+        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                  std::format("'{}' must be a non-empty string naming a role "
+                              "some register row declares in its "
+                              "'encodingRole' (an absent key is spelled by "
+                              "omitting it, and means this field reads the "
+                              "shared encoding's DEFAULT register)",
+                              key));
+        return {};
+    }
+    return n.get<std::string>();
+}
+
 std::optional<TargetRegClass>
 parseRegClassField(json const& obj, std::string_view key,
                    std::string const& path, Collector& coll) {
@@ -600,6 +637,60 @@ parseRegClassField(json const& obj, std::string_view key,
         return std::nullopt;
     }
     return c;
+}
+
+// [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]]: the shared parse of
+// ONE register field's LANE SHAPE — the presence key (`lanes` / `destLanes`)
+// and its refinement (`laneBits` / `destLaneBits`). ONE reader for both sites
+// for the same reason `parseRegClassField` is one reader for three: an
+// instruction's source and destination ends state the identical kind of fact,
+// and two readers would be two chances to disagree about what "no lanes" means.
+//
+// ⚠ THE REFINEMENT WITHOUT THE PRESENCE KEY IS A LOAD ERROR, not a silent
+// promotion to `lanes: true`. An author who writes `laneBits` alone has stated
+// a lane width for a field they also said reads a scalar; promoting it would
+// guess which half they meant, and guessing wrong here widens a candidate set
+// (see `TargetEncodingWire::lanes` for the two measured wrong-instruction
+// spellings this axis exists to make unsayable).
+void parseLaneShape(json const& obj, std::string_view presenceKey,
+                    std::string_view widthKey, std::string const& path,
+                    bool& lanesOut, std::uint8_t& laneBitsOut,
+                    Collector& coll) {
+    if (obj.contains(presenceKey)) {
+        auto const& l = obj.at(presenceKey);
+        if (!l.is_boolean()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("{}/{}", path, presenceKey),
+                      std::format("'{}' must be a boolean — true when this "
+                                  "field reads its register as a VECTOR OF "
+                                  "LANES, omitted when it reads it as a scalar",
+                                  presenceKey));
+        } else {
+            lanesOut = l.get<bool>();
+        }
+    }
+    if (!obj.contains(widthKey)) return;
+    auto const& lb    = obj.at(widthKey);
+    auto const  lbPath = std::format("{}/{}", path, widthKey);
+    if (!lb.is_number_integer() || lb.get<std::int64_t>() <= 0
+        || lb.get<std::int64_t>() > 255) {
+        coll.emit(DiagnosticCode::C_MalformedJson, lbPath,
+                  std::format("'{}' must be a positive integer no wider than "
+                              "255 — the width of ONE lane, in bits", widthKey));
+        return;
+    }
+    if (!lanesOut) {
+        coll.emit(DiagnosticCode::C_MalformedJson, lbPath,
+                  std::format("'{}' is declared but '{}' is not — a lane width "
+                              "on a field that reads its register as a scalar "
+                              "describes nothing, and this key ELIMINATES "
+                              "candidates at election, so a declaration that "
+                              "can never be true would silently narrow a "
+                              "candidate set",
+                              widthKey, presenceKey));
+        return;
+    }
+    laneBitsOut = static_cast<std::uint8_t>(lb.get<std::int64_t>());
 }
 
 // D-AS4-3 (multi-instruction-macro encoder): parse `extraResultSlots`
@@ -629,8 +720,12 @@ void parseVariantExtraResultSlots(json const& v, std::size_t opIdx,
                       "each 'extraResultSlots' entry must be an object");
             continue;
         }
-        static constexpr std::array<std::string_view, 2> kExtraSlotKeys{
-            "slotKind", "wordIndex"};
+        static constexpr std::array<std::string_view, 3> kExtraSlotKeys{
+            "slotKind", "wordIndex",
+            // [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]:
+            // this PLACEMENT's own reading of a shared register encoding — a
+            // macro's words can disagree, and on arm64's `lea` they do.
+            "regRole"};
         DSS_CHECK_KEY_VOCABULARY(kExtraSlotKeys);
         rejectUnknownKeys(e, kExtraSlotKeys, ePath,
                           "an extra result-slot placement", coll);
@@ -649,6 +744,8 @@ void parseVariantExtraResultSlots(json const& v, std::size_t opIdx,
         }
         ResultSlotExtra extra;
         extra.slotKind = *sk;
+        extra.regRole = parseRegRoleField(
+            e, "regRole", std::format("{}/regRole", ePath), coll);
         // wordIndex optional, default 0.
         if (e.contains("wordIndex")) {
             auto const wiPath = std::format("{}/wordIndex", ePath);
@@ -692,17 +789,28 @@ void parseVariantWires(json const& v, std::size_t opIdx, std::size_t vi,
         // A dropped `relocationKind` is the sharpest hazard here: the wire
         // would encode literal bits where the linker was meant to patch a
         // symbol address.
-        static constexpr std::array<std::string_view, 6> kWireKeys{
+        static constexpr std::array<std::string_view, 9> kWireKeys{
             "index", "slotKind", "relocationKind", "wordIndex",
             "prefixOpcodeBytes",
             // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: this field's
             // register-bank override.
-            "regClass"};
+            "regClass",
+            // [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]]: whether
+            // this field reads its register as a VECTOR OF LANES, and how wide
+            // one lane is. See `TargetEncodingWire::lanes`.
+            "lanes", "laneBits",
+            // [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]:
+            // which READING of a shared register encoding this field has.
+            "regRole"};
         DSS_CHECK_KEY_VOCABULARY(kWireKeys);
         rejectUnknownKeys(o2, kWireKeys, wirePath, "an operand wire", coll);
         TargetEncodingWire wire;
         wire.regClass = parseRegClassField(
             o2, "regClass", std::format("{}/regClass", wirePath), coll);
+        parseLaneShape(o2, "lanes", "laneBits", wirePath, wire.lanes,
+                       wire.laneBits, coll);
+        wire.regRole = parseRegRoleField(
+            o2, "regRole", std::format("{}/regRole", wirePath), coll);
         if (!o2.contains("index") || !o2.at("index").is_number_integer()) {
             coll.emit(DiagnosticCode::C_MissingField,
                       std::format("{}/index", wirePath),
@@ -847,11 +955,24 @@ void parseEncodingVariants(json const& vs,
         // leaving an ALL-DEFAULT template (fixedWord 0, no opcode bytes) that
         // the encoder would emit as zero words. The neighbouring guard loop
         // is what made the absence invisible.
-        static constexpr std::array<std::string_view, 6> kVariantKeys{
+        static constexpr std::array<std::string_view, 11> kVariantKeys{
             "guard", "template", "resultSlot", "extraResultSlots", "wires",
             // D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD: the result
             // field's register-bank override.
-            "resultRegClass"};
+            "resultRegClass",
+            // D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME:
+            // the result field's WIDTH — the other half of the same fact, and
+            // deliberately a sibling of `resultRegClass` rather than a member
+            // of `guard`. See `TargetEncodingVariant::destWidthBits`.
+            "destWidth",
+            // [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]]: the
+            // result field's LANE SHAPE — a third sibling in the same family,
+            // and a declaration rather than a guard for the same reason.
+            "destLanes", "destLaneBits",
+            // [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]:
+            // the result field's shared-encoding READING, and the condition
+            // that makes this encoding the one an alias spells at all.
+            "resultRegRole", "requiresRegRole"};
         DSS_CHECK_KEY_VOCABULARY(kVariantKeys);
         rejectUnknownKeys(v, kVariantKeys,
                           std::format("/opcodes/{}/encoding/variants/{}",
@@ -863,6 +984,44 @@ void parseEncodingVariants(json const& vs,
             std::format("/opcodes/{}/encoding/variants/{}/resultRegClass",
                         opIdx, vi),
             coll);
+        variant.resultRegRole = parseRegRoleField(
+            v, "resultRegRole",
+            std::format("/opcodes/{}/encoding/variants/{}/resultRegRole",
+                        opIdx, vi),
+            coll);
+        variant.requiresRegRole = parseRegRoleField(
+            v, "requiresRegRole",
+            std::format("/opcodes/{}/encoding/variants/{}/requiresRegRole",
+                        opIdx, vi),
+            coll);
+        if (v.contains("destWidth")) {
+            auto const& dw   = v.at("destWidth");
+            auto const  path = std::format(
+                "/opcodes/{}/encoding/variants/{}/destWidth", opIdx, vi);
+            // ⚠ THE SAME CLOSED WIDTH VOCABULARY `guard.width` USES, and for
+            // the same reason: a width outside it is a value no operand
+            // spelling can ever state, so the variant would match nothing and
+            // the document would load clean.
+            if (!dw.is_number_integer()
+                || (dw.get<std::int64_t>() != 8 && dw.get<std::int64_t>() != 16
+                    && dw.get<std::int64_t>() != 32
+                    && dw.get<std::int64_t>() != 64
+                    && dw.get<std::int64_t>() != 128)) {
+                coll.emit(DiagnosticCode::C_MalformedJson, path,
+                          "'destWidth' must be the integer 8, 16, 32, 64, or "
+                          "128 — the same operation-width vocabulary "
+                          "'guard.width' uses, because a destination width is "
+                          "a width a register spelling has to be able to state "
+                          "(D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME)");
+            } else {
+                variant.destWidthBits =
+                    static_cast<std::uint8_t>(dw.get<std::int64_t>());
+            }
+        }
+        parseLaneShape(
+            v, "destLanes", "destLaneBits",
+            std::format("/opcodes/{}/encoding/variants/{}", opIdx, vi),
+            variant.destLanes, variant.destLaneBits, coll);
         parseVariantGuard      (v, opIdx, vi, variant, coll);
         parseVariantTemplate   (v, opIdx, vi, variant.tmpl, coll);
         parseVariantResultSlot (v, opIdx, vi, variant, coll);
@@ -1207,7 +1366,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // guard would reject every shipped target on its first load.
     //
     // Every name here is a key the loader genuinely reads.
-    static constexpr std::array<std::string_view, 17> kTargetDocumentKeys{
+    static constexpr std::array<std::string_view, 18> kTargetDocumentKeys{
         // identity + loader gates
         "dssTargetVersion", "target",
         // per-target LANGUAGE-affecting semantics
@@ -1242,6 +1401,12 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         "condCodeEncoding",
         // ABI / softcall surface
         "wideFloatSoftcalls", "wideFloatSoftcallLibraryByFormat",
+        // D-CSUBSET-PACKED-ATOMIC-MEMBER: what the native inline atomic form
+        // does under an under-aligned access. A typo here does NOT default
+        // silently to a safe answer — it leaves the block unread and the
+        // faulting native form emitted, which is why the key is registered so
+        // the load refuses rather than the runtime.
+        "atomics",
         "callingConventions"};
     DSS_CHECK_KEY_VOCABULARY(kTargetDocumentKeys);
     // The ROOT runs the same check as every nested object — it had its own
@@ -1999,6 +2164,63 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         }
     }
 
+    // ── atomics (D-CSUBSET-PACKED-ATOMIC-MEMBER) ──────────────────────
+    //
+    // `{"underAlignedNativeForm": "traps" | "losesAtomicity" |
+    //   "remainsAtomic"}` — what this PROCESSOR's native inline atomic
+    // load/store form DOES when the accessed object is not naturally aligned.
+    // The full measurement, and why this is a three-way enum and not the
+    // boolean it was first specified as, is written out at
+    // `UnderAlignedAtomicForm` in `target_schema.hpp`.
+    //
+    // OPTIONAL as a block; absent ⇒ `None` ⇒ the native form is emitted, which
+    // is byte-for-byte today's output. The KEY inside it is REQUIRED once the
+    // block is present: an `atomics` block that answers nothing is inert config
+    // whose presence would read as "this target has been measured".
+    if (doc.contains("atomics")) {
+        json const& at = doc.at("atomics");
+        if (!at.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/atomics",
+                      "'atomics' must be an OBJECT — "
+                      R"({"underAlignedNativeForm": "traps"|"losesAtomicity"|"remainsAtomic"})");
+        } else {
+            static constexpr std::array<std::string_view, 1>
+                kAtomicsKeys{"underAlignedNativeForm"};
+            DSS_CHECK_KEY_VOCABULARY(kAtomicsKeys);
+            rejectUnknownKeys(at, kAtomicsKeys, "/atomics",
+                              "the 'atomics' block", coll);
+            if (!at.contains("underAlignedNativeForm")
+             || !at.at("underAlignedNativeForm").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/atomics/underAlignedNativeForm",
+                          std::format(
+                              "'atomics' must state 'underAlignedNativeForm' "
+                              "({}) — the block exists to record a MEASUREMENT "
+                              "about this processor, so one that answers "
+                              "nothing would read as 'measured' while leaving "
+                              "the faulting native form emitted",
+                              detail::renderAllowedList(
+                                  kSelectableUnderAlignedAtomicFormNames)));
+            } else {
+                auto const text =
+                    at.at("underAlignedNativeForm").get<std::string>();
+                auto const form = underAlignedAtomicFormFromName(text);
+                if (!form.has_value()
+                 || *form == UnderAlignedAtomicForm::None) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/atomics/underAlignedNativeForm",
+                              std::format(
+                                  "unknown under-aligned atomic form '{}' — "
+                                  "accepted: {}", text,
+                                  detail::renderAllowedList(
+                                      kSelectableUnderAlignedAtomicFormNames)));
+                } else {
+                    data.underAlignedAtomicForm = *form;
+                }
+            }
+        }
+    }
+
     // ── predefinedMacros (TF-C74 — per-architecture identity macros) ──
     // The macros that identify this CPU ARCHITECTURE to the preprocessor
     // (`__aarch64__`, `__x86_64__`, …). Declared HERE, next to the other
@@ -2576,9 +2798,11 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                               "register entry must be an object");
                     continue;
                 }
-                static constexpr std::array<std::string_view, 6> kRegisterKeys{
-                    "name", "class", "subOf", "widthBytes", "hwEncoding",
-                    "dwarfNumber"};
+                static constexpr std::array<std::string_view, 10> kRegisterKeys{
+                    "name", "class", "subOf", "aliases", "widthBytes",
+                    "hwEncoding", "dwarfNumber",
+                    "nameRequiresLaneArrangement",
+                    "encodingRole", "encodingRoleIsDefault"};
                 DSS_CHECK_KEY_VOCABULARY(kRegisterKeys);
                 rejectUnknownKeys(r, kRegisterKeys,
                                   std::format("/registers/{}", i),
@@ -2608,6 +2832,102 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 if (r.contains("subOf") && r.at("subOf").is_string()) {
                     info.subOf = r.at("subOf").get<std::string>();
                 }
+                // ★★ ADDITIONAL SPELLINGS OF THIS SAME REGISTER
+                // (`TargetRegisterInfo::aliases`). Read here, entered into
+                // `registerIndex` at the SAME ORDINAL below — a malformed
+                // entry is refused rather than skipped, because a silently
+                // dropped alias is a spelling that stops resolving with no
+                // diagnostic anywhere.
+                if (r.contains("aliases")) {
+                    if (!r.at("aliases").is_array()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  std::format("/registers/{}/aliases", i),
+                                  "'aliases' must be an array of additional "
+                                  "spellings for this register");
+                    } else {
+                        auto const& arr = r.at("aliases");
+                        for (std::size_t a = 0; a < arr.size(); ++a) {
+                            if (!arr[a].is_string()) {
+                                coll.emit(
+                                    DiagnosticCode::C_MalformedJson,
+                                    std::format("/registers/{}/aliases/{}", i, a),
+                                    "an alias must be a string (a second "
+                                    "assembler spelling of this register)");
+                                continue;
+                            }
+                            info.aliases.push_back(arr[a].get<std::string>());
+                        }
+                    }
+                }
+                // ★★ THIS ROW'S OWN NAME IS SPELLABLE ONLY WITH A LANE
+                // ARRANGEMENT. The anchor, whole on one line:
+                // [[D-ASM-ARM64-BARE-V-REGISTER-ACCEPTED-IN-A-SCALAR-MEMORY-OPERAND]]
+                // See the field's comment for what it governs (a NAME in one
+                // position, never the register).
+                // ⚠ A NON-BOOLEAN IS REFUSED RATHER THAN COERCED: read as a
+                // truthy 0/1 a typo would silently unspell an entire register
+                // file, and the failure would be an assembler that rejects
+                // every line naming it.
+                if (r.contains("nameRequiresLaneArrangement")) {
+                    if (!r.at("nameRequiresLaneArrangement").is_boolean()) {
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format(
+                                "/registers/{}/nameRequiresLaneArrangement", i),
+                            "'nameRequiresLaneArrangement' must be a boolean — "
+                            "it states that this row's own NAME denotes the "
+                            "register only when a lane arrangement is written "
+                            "on it (its aliases and sub-registers are "
+                            "unaffected)");
+                    } else {
+                        info.nameRequiresLaneArrangement =
+                            r.at("nameRequiresLaneArrangement").get<bool>();
+                    }
+                }
+                // ★★ WHICH READING OF A SHARED `hwEncoding` THIS REGISTER IS.
+                // [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]
+                // The role is an OPAQUE IDENTIFIER, never an enum the engine
+                // knows: `validate()` checks that the roles of one shared
+                // encoding are distinct and that exactly one is the default,
+                // and nothing anywhere asks what "stackPointer" MEANS. A target
+                // that shares a number for some other reason gets the axis with
+                // no engine change, which is the whole agnosticism argument.
+                if (r.contains("encodingRole")) {
+                    if (!r.at("encodingRole").is_string()
+                        || r.at("encodingRole").get<std::string>().empty()) {
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format("/registers/{}/encodingRole", i),
+                            "'encodingRole' must be a non-empty string naming "
+                            "which reading of a SHARED hwEncoding this register "
+                            "is (an empty string is spelled by omitting the "
+                            "key, which means the encoding is this register's "
+                            "alone)");
+                    } else {
+                        info.encodingRole =
+                            r.at("encodingRole").get<std::string>();
+                    }
+                }
+                // ⚠ A NON-BOOLEAN IS REFUSED RATHER THAN COERCED, the same
+                // reasoning `nameRequiresLaneArrangement` above states: read as
+                // truthy, a typo would silently move which register every
+                // unannotated field in the document resolves to — and that is
+                // the exact silent wrong-register answer this axis exists to
+                // remove.
+                if (r.contains("encodingRoleIsDefault")) {
+                    if (!r.at("encodingRoleIsDefault").is_boolean()) {
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format("/registers/{}/encodingRoleIsDefault",
+                                        i),
+                            "'encodingRoleIsDefault' must be a boolean — it "
+                            "states that this row's role is the reading a "
+                            "register field gets when it names none");
+                    } else {
+                        info.encodingRoleIsDefault =
+                            r.at("encodingRoleIsDefault").get<bool>();
+                    }
+                }
                 std::string const regPath = std::format("/registers/{}", i);
                 readBoundedInt(r, coll, regPath, "widthBytes", info.widthBytes);
                 readBoundedInt(r, coll, regPath, "hwEncoding", info.hwEncoding);
@@ -2632,6 +2952,29 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                               std::format("/registers/{}/name", i),
                               std::format("duplicate register name '{}'", info.name));
                     continue;  // skip push_back so vector & index stay in sync
+                }
+                // ★★★ EVERY ALIAS ENTERS THE INDEX AT **THIS SAME ORDINAL**,
+                // which is the whole of what an alias is: one register, two
+                // spellings. Nothing downstream needs to know — `registerByName`
+                // answers with the row's ordinal for either name, so the asm
+                // register resolution, `canonicalAsmRegister`'s clobber
+                // canonicalisation and `lir_text`'s ordinal comparison all agree
+                // without a second walk any of them could get wrong.
+                // ⚠ A COLLISION IS A LOAD ERROR, never a silent overwrite: the
+                // spelling would otherwise resolve to whichever row was declared
+                // FIRST, which is a wrong-register answer with no diagnostic.
+                for (auto const& alias : info.aliases) {
+                    if (!data.registerIndex.emplace(alias, ordinal).second) {
+                        coll.emit(
+                            DiagnosticCode::C_MalformedJson,
+                            std::format("/registers/{}/aliases", i),
+                            std::format("register '{}': alias '{}' is already a "
+                                        "declared register spelling on this "
+                                        "target — an alias must be a NEW name "
+                                        "for this register, never a second "
+                                        "claim on one that already resolves",
+                                        info.name, alias));
+                    }
                 }
                 data.registers.push_back(std::move(info));
             }
@@ -3788,12 +4131,16 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         coll.emit(DiagnosticCode::C_MalformedJson, sapPath,
                                   "'stackArgPacking' must be an object with the "
                                   "optional keys 'namedScalars' / "
-                                  "'namedAggregates' / 'variadic'");
+                                  "'namedAggregates' / 'variadic' / "
+                                  "'maxScalarAlignment' / "
+                                  "'maxAggregateAlignment'");
                     } else {
                         auto const& sap = c.at("stackArgPacking");
-                        static constexpr std::array<std::string_view, 3>
+                        static constexpr std::array<std::string_view, 5>
                             kStackArgPackingKeys{"namedScalars",
-                                                 "namedAggregates", "variadic"};
+                                                 "namedAggregates", "variadic",
+                                                 "maxScalarAlignment",
+                                                 "maxAggregateAlignment"};
                         DSS_CHECK_KEY_VOCABULARY(kStackArgPackingKeys);
                         rejectUnknownKeys(sap, kStackArgPackingKeys, sapPath,
                                           "a stack-arg-packing row", coll);
@@ -3832,30 +4179,67 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         readAxis("namedScalars",    cc.stackArgPacking.namedScalars);
                         readAxis("namedAggregates", cc.stackArgPacking.namedAggregates);
                         readAxis("variadic",        cc.stackArgPacking.variadic);
+                        // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the two
+                        // alignment caps. Omitted ⇒ 0 ⇒ no over-alignment
+                        // honoured, which is the pre-existing flat-slot stride.
+                        readBoundedInt(sap, coll, sapPath, "maxScalarAlignment",
+                                       cc.stackArgPacking.maxScalarAlignment);
+                        readBoundedInt(sap, coll, sapPath,
+                                       "maxAggregateAlignment",
+                                       cc.stackArgPacking.maxAggregateAlignment);
+                        // A cap is an ALIGNMENT, so it is 0 or a power of two —
+                        // the same shape rule `stackAlignment` carries. A typo'd
+                        // 24 would silently mis-place every over-aligned stacked
+                        // argument rather than failing, which is the ABI
+                        // divergence that compiles clean and breaks at the
+                        // boundary.
+                        for (auto const& [key, value] :
+                             {std::pair<char const*, std::uint16_t>{
+                                  "maxScalarAlignment",
+                                  cc.stackArgPacking.maxScalarAlignment},
+                              std::pair<char const*, std::uint16_t>{
+                                  "maxAggregateAlignment",
+                                  cc.stackArgPacking.maxAggregateAlignment}}) {
+                            if (value != 0
+                                && (value & static_cast<std::uint16_t>(
+                                                value - 1)) != 0) {
+                                coll.emit(
+                                    DiagnosticCode::C_MalformedJson,
+                                    std::format("{}/{}", sapPath, key),
+                                    std::format(
+                                        "'{}' ({}) must be 0 (no over-alignment "
+                                        "honoured) or a power of two — it is the "
+                                        "largest own-alignment this calling "
+                                        "convention honours for a stacked "
+                                        "argument", key, value));
+                            }
+                        }
                         // ⚠ ONE BUILDABLE VALUE ON THE AGGREGATE AXIS, AND THE
-                        // OTHER IS REFUSED RATHER THAN APPROXIMATED. Natural
-                        // packing needs the datum's own ALIGNMENT; a stacked
-                        // aggregate reaches the placement tier through the
-                        // `ByValueStackAgg` carrier, which states a byte SIZE and
-                        // nothing else. Accepting "natural" here would make the
-                        // cursor align aggregates to the slot while advancing by
-                        // their exact size — a THIRD rule nobody measured, shipped
-                        // under the name of one that was. ✔MEASURED: both shipped
-                        // ABIs slot-round aggregates, so nothing is lost today.
+                        // OTHER IS REFUSED RATHER THAN APPROXIMATED. ✔MEASURED:
+                        // both shipped ABIs slot-round the SIZE of a stacked
+                        // aggregate (Apple puts an `int` after a 3-byte struct at
+                        // +8, after a 12-byte one at +16 — not +3 / +12), so
+                        // `slot` is the only spelling anything has measured.
+                        // Accepting "natural" would ship a rule nobody measured
+                        // under the name of one that was.
+                        // ⓘ The reason recorded here USED to be that the carrier
+                        // states a byte SIZE and no alignment. That half is now
+                        // FALSE — D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT made
+                        // the carrier state its own alignment, and
+                        // `StackArgCursor::placeNamedAggregate` reads it. What
+                        // still blocks the axis is only the missing MEASUREMENT.
                         if (cc.stackArgPacking.namedAggregates
                                 != StackArgPacking::Slot) {
                             coll.emit(
                                 DiagnosticCode::C_MalformedJson,
                                 std::format("{}/namedAggregates", sapPath),
                                 std::format(
-                                    "'namedAggregates' may only be '{}' today: "
-                                    "natural aggregate packing needs the "
-                                    "aggregate's own alignment, which the "
-                                    "by-value stack-aggregate carrier does not "
-                                    "state (it carries a byte size only), so the "
-                                    "placement tier cannot honour it — refusing "
-                                    "rather than approximating it as "
-                                    "slot-aligned-but-exactly-sized ({})",
+                                    "'namedAggregates' may only be '{}' today: no "
+                                    "measured ABI packs a stacked aggregate's SIZE "
+                                    "naturally — both shipped ones slot-round it — "
+                                    "so accepting 'natural' would ship an "
+                                    "unmeasured third rule under a measured rule's "
+                                    "name ({})",
                                     stackArgPackingName(StackArgPacking::Slot),
                                     kApplePackingAnchor));
                             cc.stackArgPacking.namedAggregates =
@@ -4797,6 +5181,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
 
     auto schema = std::make_shared<TargetSchema>(std::move(data));
     schema->contentDigest_ = std::move(digest);
+    // WHERE IT CAME FROM, verbatim — see `configDocumentOrigin()`. Set on the
+    // SUCCESS path only, beside the digest and for the same reason: a load that
+    // produced diagnostics and no schema has nothing to attribute.
+    schema->documentOrigin_ = std::string{sourceLabel};
     return schema;
 }
 

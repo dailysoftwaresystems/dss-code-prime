@@ -209,35 +209,42 @@ enum class DiagnosticCode : std::uint16_t {
     P_PreprocessorPragma          = 0x0020,
 
     // P_PreprocessorOperatorNameNotDefinable: TF-C86
-    // (D-CSUBSET-STDARG-F001A). A `#define` or `#undef` named one of the
-    // language's CONDITIONAL-INCLUSION OPERATORS — the `#if`-only
-    // `__has_include` / `__has_embed` / `__has_c_attribute` spellings the
-    // grammar declares (`isConditionalInclusionOperator`). C23 6.10.1 reserves
-    // those identifiers to the implementation, and DSS IMPLEMENTS them, so a
+    // (D-CSUBSET-STDARG-F001A). A `#define` or `#undef` named an identifier the
+    // language declares NON-DEFINABLE.
+    //
+    // ⚠⚠ ITS SUBJECT NARROWED TO EXACTLY ONE NAME IN P59 (2026-09-04), AND THE
+    // PARAGRAPHS THAT USED TO STAND HERE DESCRIBED THE OLD ONE. Until then this
+    // code covered the CONDITIONAL-INCLUSION OPERATORS (`__has_include` /
+    // `__has_embed` / `__has_c_attribute`) and refused a `#define`/`#undef` of
+    // any of them at Error. An operator ruling of 2026-09-03 reversed that:
+    // ✔MEASURED, all four references ACCEPT such a `#define` at at most a
+    // WARNING and APPLY it, and being stricter than the entire union is not
+    // rigor. Their posture is now DATA (`preprocess.reservedIdentifiers`), the
+    // same declaration the `__STDC__` arm reads.
+    //
+    // ⇒ THE ONLY REMAINING CLIENT IS `defined`, and it is the one name this
+    // code's wording is true about. ✔MEASURED 2026-09-04, each reference
+    // probed separately: `#define defined 1` / `#undef defined` is a HARD ERROR
+    // in gcc 13.3.0, mingw-w64 gcc 13.2.0 and clang 18.1.3 (`cl` warns C4117
+    // and ignores it), so refusing it keeps DSS inside the union rather than
+    // above it. C23 6.10.1 reserves the identifier and DSS implements it, so a
     // program cannot take the name over.
     //
-    // Why an ERROR and not a silent accept: honoring the redefinition makes
-    // `#include <h>` and `__has_include(<h>)` answer DIFFERENTLY about the same
-    // header — the header gets textually spliced while the guard that decides
-    // whether to splice it reads 0. That is a silent miscompile, and it is
-    // exactly the shape that produced the TF-C86 `F001A` cascade before the
-    // operators became `defined`.
+    // ★ AND THE REFUSAL DID NOT EXIST FOR `defined` UNTIL P59. Before it,
+    // `#define defined 1` compiled rc 0 IN SILENCE — `isConditionalInclusionOperator`
+    // deliberately excluded `definedOperator` and nothing else covered it,
+    // while `preprocess_config.hpp` asserted in a comment that the refusal
+    // "lives in the conditional-inclusion-operator guard". A comment claiming a
+    // guard that did not exist.
     //
-    // ★ THIS ARM IS A BELT, NOT A BREAK. The ubiquitous portability shim
-    //       #ifndef __has_include
-    //       #define __has_include(x) 0
-    //       #endif
-    //   (Apple SDK `sys/cdefs.h`, glibc, musl, ...) is now DEAD code on DSS
-    //   — `#ifndef __has_include` is false because the operator IS defined — so
-    //   the `#define` inside it never executes and this code never fires for
-    //   it. MEASURED: zero occurrences of an UNGUARDED `#define`/`#undef` of
-    //   these three names across the 189-TU sqlite corpus. What remains for
-    //   this code to catch is a program that really does try to shadow the
-    //   operator outright.
+    // Why an ERROR and not a silent accept: `defined` is what every `#if` is
+    // written in terms of. A program that redefines it changes the meaning of
+    // every conditional in every header it reaches, and the references agree
+    // that is not a program.
     //
-    // Member of `kUnsuppressableCodes`: suppressing it would restore precisely
-    // the silent include/`__has_include` disagreement it exists to prevent.
-    // Remediation: guard the shim with `#ifndef`, or stop shadowing the name.
+    // Member of `kUnsuppressableCodes`: see `kWhyOperatorNameNotDefinable` in
+    // `unsuppressable_codes.cpp` for the membership reason, which was restated
+    // in the same pass. Remediation: stop shadowing `defined`.
     P_PreprocessorOperatorNameNotDefinable = 0x0021,
 
     // P_PreprocessorIncludeReentryRefused: TF-C87
@@ -395,6 +402,32 @@ enum class DiagnosticCode : std::uint16_t {
     // emitting 51 warnings of one kind — turning a volume notice into a build
     // failure. At Warning it would do the same under `--warnings-as-errors`.
     P_DiagnosticsElided           = 0x9007,
+
+    // Speculative-probe TOKEN budget exhausted. A single speculative branch
+    // consumed more tokens than `ParserConfig::speculationBudgetFactor` x the
+    // alt's declared `lookahead` allows, so the parser abandoned the probe
+    // without ever deciding whether the branch was right.
+    //
+    // ★ WHY IT NEEDED ITS OWN CODE RATHER THAN THE SILENCE IT HAD. This is the
+    // THIRD ceiling stacked on one construct (after the parser's speculation
+    // DEPTH cap and the builder's checkpoint cap), and it was the only one that
+    // reported nothing at all: the probe just failed, the alt fell through to
+    // its non-speculative fallback replay, and the replay reliably ended in a
+    // `P_NoAlternativeMatched` positioned on a token the user had written
+    // CORRECTLY. ✔MEASURED: with the two depth caps lifted, `(int)` x341 nested
+    // casts compiled rc 0 and x342 was refused that way — 341 x 3 tokens = 1023,
+    // one under the 64 x 16 budget — while gcc, mingw-w64 gcc, clang and MSVC
+    // all accept far deeper. A ceiling that fabricates a syntax error against
+    // valid source is worse than one that refuses loudly, because it sends the
+    // reader to fix code that is already right
+    // (D-PARSE-NINE-NESTED-CASTS-ARE-REFUSED-BY-THE-SPECULATION-CAP-WITH-A-FABRICATED-SYNTAX-ERROR).
+    //
+    // Reported at the token the abandoned probe had reached, and RECOVERED
+    // (panic scan + graceful unwind) exactly like `P_ExpressionTooDeep` — never
+    // an abort. Deliberately NOT in `kUnsuppressableCodes`, matching its two
+    // siblings `P_MaxSpeculationDepth` / `P_BacktrackFailed`: the Error leaf it
+    // leaves behind still fails the build, so suppressing it hides no failure.
+    P_SpeculationBudgetExhausted  = 0x9008,
 
     // ── C0xxx — config loader (see plan §5.12) ──
     C_MissingField                = 0xC001,
@@ -872,14 +905,27 @@ enum class DiagnosticCode : std::uint16_t {
     // `H_UnknownLinkageSpecifier`: fail loud rather than silently drop an attribute
     // the program may depend on. The `.actual` names the offending spelling.
     S_UnknownTypeAttribute        = 0xE031,
-    // FC16 (D-CSUBSET-PACKED / D-CSUBSET-PACKED-BITFIELD-INTERACTION): a `packed`
-    // struct/union that ALSO contains a bit-field member. Bit-granular packed
-    // packing is a distinct algorithm (a named, deferred gap); combining the two is
-    // UNSUPPORTED — fail loud at the SEMANTIC tier rather than silently emit a
-    // NON-packed layout (the layout engine's nullopt belt is the backstop). Emitted
-    // at the composite-completion site; unsuppressable (a suppressed one would ship
-    // the wrong — padded — bytes).
-    S_PackedBitfieldUnsupported   = 0xE032,
+    // FC16 (D-CSUBSET-PACKED): formerly "a `packed` struct/union that ALSO contains
+    // a bit-field member is UNSUPPORTED". RETIRED by
+    // D-CSUBSET-PACKED-BITFIELD-INTERACTION:
+    // the combination is SUPPORTED — `packed` takes the same two per-ABI
+    // bit-field packers `#pragma pack(N)` takes, and the two spellings are MEASURED
+    // byte-identical (gcc 13.3.0 + clang 18.1.3 for gnu_packed; cl.exe 19.51 +
+    // mingw-w64 gcc 13.2.0 for msvc_straddle). The refusal was a conformance
+    // divergence: every reference accepts the construct.
+    //
+    // The code + its span slot are KEPT (never renumber — the append-only
+    // discipline) so every historical 0xE032 golden stays stable; no live site
+    // references it. De-listed from `kUnsuppressableCodes` in the same change, the
+    // 0xE04E precedent: an unemittable code cannot be suppressed, and leaving it
+    // listed is what makes a dead code read as load-bearing.
+    //
+    // ⚠ The residual it used to cover is NOT this code's job and never was: a
+    // bit-field that CROSSES its declared allocation unit is unrepresentable in
+    // `BitFieldPlacement` and still fails loud at layout — MEASURED identical on both
+    // spellings (`H_UnsupportedLoweringForKind`), which is the pre-existing
+    // `#pragma pack` behaviour rather than a new one.
+    S_PackedBitfieldUnsupported   = 0xE032,  // RETIRED — see comment
     // C23 §6.5 (D-CSUBSET-NULLPTR): the predefined constant `nullptr` (type
     // nullptr_t) used as an operand where nullptr_t is not permitted — any
     // arithmetic/bitwise/shift binary (`nullptr + 1`), any relational (`nullptr <
@@ -2134,6 +2180,161 @@ enum class DiagnosticCode : std::uint16_t {
     // build proceeds identically, so hiding the advice ships nothing wrong —
     // the S_AsmLabelOnAutomaticVariable negative-pin posture.
     S_NoreturnNonFunctionObject = 0xE076,
+    // C 6.5.3.2p1 (D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE): a subscript
+    // `a[b]` whose operands cannot satisfy the constraint — "one operand shall
+    // be a pointer to a complete object type, the OTHER shall have integer
+    // type". TWO shapes, one predicate, two messages: BOTH operands are
+    // containers (`p[q]`), or NEITHER is (`a[b]` on two ints). The constraint is
+    // stated symmetrically and `E1[E2]` is defined as `*((E1)+(E2))`, so this
+    // code is about the operand TYPES and never about which side they are
+    // written on — `p[i]` and `i[p]` are the same expression and both reach here
+    // only when the pair is genuinely wrong.
+    //
+    // ★ IT EXISTS BECAUSE NEITHER SHAPE WAS REPORTED AT ALL. ✔MEASURED at P53's
+    // base: `int *p, *q; return p[q];` ABORTED the process inside the type
+    // lattice (`TypeInterner::primitive: TypeKind Ptr is not a LEAF kind`, exit
+    // 0xC0000409) with no `error[…]` line, and `int a, b; return a[b];` reached
+    // the HIR verifier as `hir node #8 (HirKind ordinal 34)` — an internal node
+    // ordinal shown to a user who wrote `a[b]`. gcc 13.3.0 and clang 18.1.3 both
+    // refuse both shapes at the user's own token.
+    //
+    // Emitted by the CST→HIR tier, which still knows the source construct.
+    // Suppressable: silencing it cannot ship a wrong artifact, because the
+    // lowering returns an Error sentinel either way and the build still fails.
+    S_SubscriptOperandsNotPointerAndInteger = 0xE077,
+    // C 6.7.1p2 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): TWO DISTINCT
+    // members of one config-declared mutual-exclusion group appear in one
+    // declaration's specifier prefix — for C, two different storage-class
+    // specifiers (`extern static int g;`, `constexpr extern int g = 1;`).
+    //
+    // ★★ IT EXISTS BECAUSE A GRAMMAR ACCIDENT STOPPED ENFORCING THE CONSTRAINT.
+    // Until P53 `extern` was the HEAD of its own declaration rule, so `extern
+    // static` could not parse and the refusal was a by-product of the rule
+    // shape. Merging the two file-scope declaration rules — the only design that
+    // makes C's specifier SET genuinely unordered — deletes that accident, so
+    // the constraint has to be STATED. ✔MEASURED 2026-09-02, all three
+    // references probed separately: gcc 13.3.0, clang 18.1.3 and MSVC
+    // 19.51.36252 each REFUSE `extern static` / `static extern` /
+    // `extern constexpr` / `constexpr extern`; without this code DSS would
+    // compile all four at rc 0, i.e. sit ABOVE the reference union.
+    //
+    // ⚠ DISTINCT members only. clang ACCEPTS `static static int g;` and
+    // `extern extern int g;` (gcc and MSVC refuse), so under the union rule a
+    // REPEATED specifier must keep compiling and is deliberately not reported.
+    //
+    // WHICH specifiers exclude which is entirely per-language config (the
+    // `exclusiveGroup` field on a `linkageSpecifiers` entry); the engine holds
+    // no pair list, and C 6.7.1p2's own `_Thread_local` exception is expressed
+    // by that entry not declaring the group. Emitted by the semantic tier, once
+    // per declaration, naming BOTH specifiers. Renders error[S078].
+    S_ConflictingStorageClassSpecifiers = 0xE078,
+    // C23 5.2.5.3.3¶19 / Annex F.2.2¶1
+    // (D-C-FLOAT-LITERAL-OVERFLOW-REFUSED-INSTEAD-OF-YIELDING-INFINITY): a
+    // floating CONSTANT whose correctly-rounded value at its own declared type
+    // is a signed INFINITY — `1e400` for `double`, `1e40f` for `float`,
+    // `1e5000L` on a wide `long double` axis, `0x1p+99999` on any of them. The
+    // value is not wrong and the program is not refused: on an IEC 60559
+    // implementation ±∞ IS the nearest representable value, exactly as
+    // 0x3FB999999999999A is 0.1's, which is why the sibling row made DSS accept
+    // it. This code reports that the literal's MAGNITUDE was not carried — the
+    // one rounding a programmer almost never intends.
+    //
+    // ★★ WARNING, AND THE MEASUREMENT IS WHAT DECIDES IT — NOT A PREFERENCE.
+    // ✔MEASURED 2026-09-02, each reference invoked SEPARATELY, DEFAULT and
+    // STRICT columns, on `double v = 1e400;` and its `float` / `long double` /
+    // hex-float siblings:
+    //   gcc 13.3.0        DEFAULT warns `floating constant exceeds range of
+    //                     'double' [-Woverflow]` rc 0; under `-Werror` the same
+    //                     text as `error [-Werror=overflow]`, rc 1
+    //   clang 18.1.3      DEFAULT warns `magnitude of floating-point constant
+    //                     too large for type 'double'; maximum is
+    //                     1.7976931348623157E+308 [-Wliteral-range]` rc 0;
+    //                     `-Werror` promotes it, rc 1
+    //   mingw-w64 13.2.0  gcc's text verbatim, both columns
+    //   MSVC 19.51.36252  REFUSES outright, `error C2177: constant too big`,
+    //                     identically at `/W4 /WX` and with no flags
+    // ⇒ **NOT ONE MEMBER OF THE UNION ACCEPTS THIS LITERAL SILENTLY.** Three
+    // speak and one refuses. Silence was therefore the single posture no
+    // reference takes, and it is the posture DSS held between the sibling row
+    // landing and this code existing. Warning is the only severity that is
+    // simultaneously at-or-above the union's floor (something is said) and not
+    // above its ceiling (the program still compiles for the three that compile
+    // it).
+    //
+    // ⚠ `--warnings-as-errors` PROMOTES THIS, AND THAT IS THE POINT, NOT A
+    // SURPRISE. Under that flag DSS refuses `1e400` — which is precisely MSVC's
+    // unconditional behaviour and precisely gcc's and clang's under `-Werror`.
+    // Every reference posture is therefore reachable from DSS: default = the
+    // gcc/clang default, `--warnings-as-errors` = `-Werror` = MSVC. Whoever
+    // builds with that flag and hits this is seeing the strict reading they
+    // asked for.
+    //
+    // ⚠ WHERE IT MUST NOT FIRE, ✔MEASURED on all four references, which are
+    // SILENT on every one of these: `DBL_MAX` (1.7976931348623157e308) and
+    // `FLT_MAX` (3.40282347e38f) — the largest FINITE values, one ulp below the
+    // first literal that does warn; a binary64 SUBNORMAL (`1e-320`), which is an
+    // ordinary representable value; and `1e400L` on the x87-80 and binary128
+    // axes, where it is FINITE (both carry a 15-bit exponent and top out near
+    // 1.19e4932 — the overflow there begins around 1e4933). The predicate is the
+    // ROUNDED VALUE being infinite, never a decimal-exponent threshold, so those
+    // fall out rather than being special-cased.
+    //
+    // ⓘ UNDERFLOW IS DELIBERATELY NOT THIS CODE'S, and the reason is the same
+    // measurement read the other way. On flush-to-zero (`1e-330`) gcc, clang and
+    // mingw warn (`floating constant truncated to zero` / `magnitude … too
+    // small`) but ✔MEASURED MSVC 19.51.36252 ACCEPTS IT SILENTLY at `/W4 /WX` —
+    // so unlike the overflow case a silent accept IS a reference posture, and
+    // DSS matching it sits inside the union rather than below it. Two further
+    // reasons: the wide door still REFUSES a `long double` underflow
+    // (`D-CSUBSET-LONG-DOUBLE-CONSTFOLD-SUBNORMAL-RESULT`, still open), so a
+    // warning would cover one of the two doors and speak with two voices about
+    // one class; and promoting it under `--warnings-as-errors` would restore a
+    // refusal `D-C-DECODEFLOAT-TREATS-UNDERFLOW-AS-FATAL` deliberately removed.
+    //
+    // Emitted by the SEMANTIC tier from the ONE literal-typing chokepoint, so it
+    // fires once for EVERY occurrence of the literal in the translation unit
+    // regardless of what a later phase does with it — ✔MEASURED that gcc and
+    // clang warn in an unevaluated `sizeof` operand, a `_Static_assert`
+    // condition, a `if (0)` branch, an uncalled function and an unused file-scope
+    // static alike, none of which the lowering tier necessarily reaches.
+    // SUPPRESSABLE, deliberately: hiding it ships the identical artifact (the
+    // value is the correctly-rounded one either way), so it fails both prongs of
+    // `kUnsuppressableCodes` — the `S_AsmLabelOnAutomaticVariable` /
+    // `S_DeprecatedSymbolUsed` negative-pin posture. Suppressibility is also what
+    // lets the Pass-1.5 + Pass-2 double visit of a literal leaf collapse in the
+    // reporter's recent-duplicate window, exactly as `S_IntegerLiteralTooLarge`'s
+    // does. Renders warning[S079].
+    S_FloatLiteralOverflowsToInfinity = 0xE079,
+
+    // VLA C4c (D-CSUBSET-VLA-PARAM-STAR, reopened + reclosed P57, C 6.7.6.3p12): the
+    // unspecified-size `[*]` array-declarator suffix appears on a parameter of a
+    // function DEFINITION. C 6.7.6.3p12 permits `[*]` only where the function
+    // declarator is NOT part of a definition of that function (C 6.7.6.2p4 spells the
+    // same rule as "function prototype scope"), because a definition's parameters have
+    // BLOCK scope (C 6.2.1p4) and the body needs a bound the `*` deliberately withholds.
+    // ✔MEASURED 2026-09-03, each reference probed SEPARATELY: gcc 13.3.0 refuses
+    // (`'[*]' not allowed in other than function prototype scope`) and clang 18.1.3
+    // refuses (`variable length array must be bound in function definition`) on all
+    // three reachable spellings — a NAMED `int f(int n, int a[*]) {…}`, the ABSTRACT
+    // `int f(int, int[*]) {…}`, and the outer-dim `int f(int a[*][3]) {…}`. MSVC
+    // ABSTAINS: it implements no C99 VLA and dies on the token (`C2059: syntax error:
+    // ']'`) at every `/std:`, so it casts no vote on the constraint. DSS accepted and
+    // RAN all three before this code existed — ABOVE the union, which the bar treats as
+    // a defect exactly as it treats being below it.
+    // ★ SCOPE, and it is the half a subtree scan gets wrong: a `[*]` in a NESTED
+    // declarator's own prototype INSIDE a definition's parameter list is LEGAL —
+    // `int f(int (*g)(int, int[*])) {…}` — because that inner declarator is not part of
+    // a definition. ✔MEASURED: gcc AND clang both compile and RUN it (exit 42). The
+    // emit site therefore stops descending at any nested function suffix, and
+    // `AbstractStarInNestedPrototypeInsideDefinitionStaysLegal` pins it.
+    // SUPPRESSABLE, deliberately, and it fails BOTH prongs of `kUnsuppressableCodes`:
+    // a `[*]` parameter decays to the SAME `Ptr<element>` a bare `[]` does (C 6.7.6.3p7),
+    // so silencing this ships the artifact the source already appears to describe —
+    // there is no second candidate lowering, no wrong size and no wrong stride to hide.
+    // The `S_AsmLabelOnAutomaticVariable` / `S_DeprecatedSymbolUsed` /
+    // `S_FloatLiteralOverflowsToInfinity` negative-pin posture: a pure CONSTRAINT
+    // diagnostic, not a silent-miscompile guard. Renders error[S07A].
+    S_ArrayParamStarInFunctionDefinition = 0xE07A,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -3331,15 +3532,27 @@ enum class DiagnosticCode : std::uint16_t {
     //   VALID and never trips this. An `Error` HIR node continues the collect-all
     //   lowering, exactly like H_WideCharValueUnrepresentable.
     H_InvalidUniversalCharacterName = 0xF015,
-    // H_WideByteEscapeUnsupported (C11/C23 6.4.5, D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE):
-    //   a `\x` hex / `\ooo` octal escape inside a wide/UTF literal (`u"…"`/`U"…"`/
-    //   `u8"…"`/`L"…"` or the char forms). A byte escape names a raw code-unit VALUE,
-    //   not a code point; assembling that value directly is a deferred feature, so it
-    //   FAILS LOUD here rather than the old silent UTF-8-collapse (`u"\xC3\xA9"` once
-    //   became ONE 0x00E9 unit instead of two intended units). Narrow `"…"`/`'…'`
-    //   keep `\x`/octal (byte-producing, correct for a narrow element). Use `\u`/`\U`
-    //   for a code point. An `Error` HIR node continues the collect-all lowering.
-    H_WideByteEscapeUnsupported   = 0xF016,
+    // H_EscapeValueExceedsCodeUnit (C 6.4.4.4 / 6.4.5, closing the P55 pair
+    //   D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE + D-CSUBSET-NARROW-HEX-ESCAPE-TRUNCATED-TO-TWO-DIGITS):
+    //   a `\x` hex / `\ooo` octal escape whose VALUE does not fit ONE code unit of the
+    //   literal's element — `"\x101"` or `"\777"` in a narrow `char` string, `u"\x1FFFF"`
+    //   under a 16-bit `char16_t`/`wchar_t`, `u8"\x100"` under `char8_t`. A byte escape
+    //   names a raw code-unit VALUE (not a code point), so the bound is the ELEMENT WIDTH
+    //   and nothing else: `u"\xFFFF"`, `u"\xD800"` and `U"\xFFFFFFFF"` are all VALID and
+    //   assemble to one unit each. The `actual` names the WIDTH and the VALUE, because
+    //   neither alone is actionable.
+    //   ⚠ THE REFERENCES SPLIT HERE AND THE REFUSAL IS THE UNION OVER WHAT *WORKS*:
+    //   gcc 13.3.0 and mingw-w64 gcc 13.2.0 accept by TRUNCATING with a warning
+    //   (`u"\x1FFFF"` → 0xFFFF, and narrow `"\x100"` → a silent NUL), clang 18.1.3 and
+    //   MSVC 19.51 REFUSE. A reference that only accepts by narrowing the value away is
+    //   not a working reference for that literal, so DSS refuses — never truncates.
+    //   ⓘ RENAMED IN PLACE from H_WideByteEscapeUnsupported, which held this ordinal while
+    //   a byte escape in a wide literal was refused WHOLESALE. That refusal is gone (the
+    //   escape now assembles as a unit); the ordinal is retained rather than freed so no
+    //   later allocation can silently inherit an old fixture's numeric expectation, and
+    //   the old NAME resolves nowhere, which is loud.
+    //   An `Error` HIR node continues the collect-all lowering.
+    H_EscapeValueExceedsCodeUnit  = 0xF016,
     // H_ConflictingStringLiteralPrefixes (C11/C23 6.4.5p5, Cycle D): a run of
     //   ADJACENT string literals mixes TWO DIFFERENT non-narrow encoding prefixes
     //   (`u"a" U"b"`, `u8"a" u"b"`, `L"a" u"b"`, …). 6.4.5p5 leaves "whether

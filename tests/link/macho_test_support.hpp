@@ -8,12 +8,20 @@
 
 #include "link_test_support.hpp"
 
+#include "link/format/macho.hpp"          // requestsCodeSignature
+#include "link/object_format_schema.hpp"  // loadUnsignedExec
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace dss::macho::test {
@@ -139,5 +147,177 @@ findSection(std::span<std::uint8_t const> bytes,
 // wrappers were over-engineered DRY violations).
 using ::dss::link_format::test::readU32LE;
 using ::dss::link_format::test::readU64LE;
+
+// ── AN EXEC SCHEMA THE STATIC WALKER MAY LEGALLY ENCODE ──────────────
+//
+// D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM.
+//
+// `macho::encodeExec` — the arm `macho::encode` takes when `externImports`
+// is empty — builds no `__LINKEDIT`, so it can host no LC_CODE_SIGNATURE
+// under ANY schema. `macho::encode` therefore REFUSES a zero-extern module
+// whenever the format requests a signature by either key, instead of
+// encoding it and dropping the request in silence. EVERY shipped Darwin exec
+// document requests one (it is what makes the image pass AMFI), so the static
+// arm is unreachable from a shipped exec schema by construction.
+//
+// That leaves the static walker live code with no schema to drive it, which
+// is what this returns: **the shipped exec document MINUS its signature
+// request, and nothing else changed.** Keeping every other field is not
+// tidiness — `macho64-arm64-darwin-exec` also declares `image.buildVersion`,
+// which `encodeExec` refuses on its own, and dropping that too would silently
+// delete the only pin that boundary has that runs.
+// D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION
+//
+// ★ THE CROSS-CHECK IS THE POINT, NOT THE COPY. A synthetic document that
+// merely resembles the shipped one drifts out from under its pins the first
+// time the shipped one moves, so every field a static-arm test reads back out
+// of an emitted image is asserted here to still equal the shipped document's,
+// and the ONE sanctioned divergence is asserted in BOTH directions.
+//
+// Returns nullptr after ADD_FAILURE on any trouble; callers assert on it.
+[[nodiscard]] inline std::shared_ptr<ObjectFormatSchema>
+loadUnsignedExec(std::string_view shippedExecName) {
+    // Values copied from the shipped documents. Divergences from a sibling
+    // are REAL and per-port: arm64 uses a 16 KiB VM segment page (Apple
+    // Silicon rejects 4 KiB-aligned segments at exec) with __text at
+    // pageZero+0x4000, and declares `image.buildVersion`; x86_64 uses the
+    // 4 KiB default with __text at pageZero+0x1000 and deliberately omits
+    // `buildVersion`. Neither carries `codeSignature` — that omission is
+    // this fixture's entire reason to exist.
+    constexpr std::string_view kArm64Json = R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "apple_arm64" },
+      "outputExtension": "",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-insensitive",
+      "format": {"name":"macho64-arm64-darwin-exec-unsigned","kind":"macho"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
+      "entryCallingConvention": "apple_arm64",
+      "entryPoint": "",
+      "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "segmentPageSize": 16384,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+        "bindNow": true,
+        "buildVersion": {"platform":"macos","minOs":"11.0","sdk":"11.0"}
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294983680}
+      ],
+      "relocations":[
+        {"name":"ARM64_RELOC_BRANCH26","kind":1,"nativeId":620756992,"isCall":true},
+        {"name":"ARM64_RELOC_PAGE21","kind":2,"nativeId":889192448},
+        {"name":"ARM64_RELOC_PAGEOFF12","kind":3,"nativeId":1140850688},
+        {"name":"ARM64_RELOC_UNSIGNED","kind":4,"nativeId":100663296}
+      ]
+    })";
+    constexpr std::string_view kX86Json = R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-insensitive",
+      "format": {"name":"macho64-x86_64-darwin-exec-unsigned","kind":"macho"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
+      "entryCallingConvention": "sysv_amd64",
+      "entryPoint": "",
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+        "bindNow": true
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ],
+      "relocations":[
+        {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
+        {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
+        {"name":"X86_64_RELOC_UNSIGNED_4","kind":3,"nativeId":33554432}
+      ]
+    })";
+
+    std::string_view json;
+    if (shippedExecName == "macho64-arm64-darwin-exec")       json = kArm64Json;
+    else if (shippedExecName == "macho64-x86_64-darwin-exec")  json = kX86Json;
+    else {
+        ADD_FAILURE() << "loadUnsignedExec: no unsigned counterpart for '"
+                      << shippedExecName << "' — add one beside the two above "
+                         "rather than hand-copying a schema into a test";
+        return {};
+    }
+
+    auto fixture = ObjectFormatSchema::loadFromText(json);
+    if (!fixture.has_value()) {
+        ADD_FAILURE() << "loadUnsignedExec: the unsigned counterpart of '"
+                      << shippedExecName << "' failed to load";
+        for (auto const& d : fixture.error()) ADD_FAILURE() << "  " << d.message;
+        return {};
+    }
+    auto shipped = ObjectFormatSchema::loadShipped(shippedExecName);
+    if (!shipped.has_value()) {
+        ADD_FAILURE() << "loadUnsignedExec: loadShipped('" << shippedExecName
+                      << "') failed";
+        return {};
+    }
+
+    // ── The anti-drift cross-check ──────────────────────────────────
+    // EXPECT throughout: this function RETURNS a value, so a fatal assertion
+    // cannot be spelled in it at all; every comparison is bounds-guarded by
+    // hand instead.
+    auto const& fIm = (*fixture)->machoImage();
+    auto const& sIm = (*shipped)->machoImage();
+    char const* const drift = "unsigned exec fixture drifted from the shipped "
+                              "document it is derived from";
+    EXPECT_EQ(fIm.pageZeroSize,    sIm.pageZeroSize)    << drift;
+    EXPECT_EQ(fIm.segmentPageSize, sIm.segmentPageSize) << drift;
+    EXPECT_EQ(fIm.dylinkerPath,    sIm.dylinkerPath)    << drift;
+    EXPECT_EQ(fIm.bindNow,         sIm.bindNow)         << drift;
+    EXPECT_EQ(fIm.buildVersion.has_value(),
+              sIm.buildVersion.has_value())
+        << drift << " — and buildVersion decides whether the static arm "
+                    "REFUSES or ENCODES, so this one is load-bearing";
+    EXPECT_EQ(fIm.loadDylibs.size(), sIm.loadDylibs.size()) << drift;
+    for (std::size_t i = 0;
+         i < std::min(fIm.loadDylibs.size(), sIm.loadDylibs.size()); ++i) {
+        EXPECT_EQ(fIm.loadDylibs[i].path, sIm.loadDylibs[i].path) << drift;
+    }
+    EXPECT_TRUE((*fixture)->macho().filetype == (*shipped)->macho().filetype)
+        << drift;
+    EXPECT_EQ((*fixture)->macho().cputype,    (*shipped)->macho().cputype)
+        << drift;
+    EXPECT_EQ((*fixture)->macho().cpusubtype, (*shipped)->macho().cpusubtype)
+        << drift;
+    EXPECT_EQ((*fixture)->macho().flags,      (*shipped)->macho().flags)
+        << drift;
+    auto const* fText = (*fixture)->sectionByKind(SectionKind::Text);
+    auto const* sText = (*shipped)->sectionByKind(SectionKind::Text);
+    EXPECT_NE(fText, nullptr);
+    EXPECT_NE(sText, nullptr);
+    if (fText != nullptr && sText != nullptr) {
+        EXPECT_EQ(fText->virtualAddress, sText->virtualAddress) << drift;
+        EXPECT_EQ(fText->addrAlign,      sText->addrAlign)      << drift;
+    }
+    // The ONE sanctioned divergence, both directions so neither half rots.
+    EXPECT_TRUE(dss::macho::requestsCodeSignature(sIm))
+        << shippedExecName
+        << " no longer requests a code signature — it can take the static arm "
+           "again and this fixture is unnecessary; delete it rather than leave "
+           "a copy of a shipped document behind";
+    EXPECT_FALSE(dss::macho::requestsCodeSignature(fIm))
+        << "the unsigned fixture requests a signature — macho::encode will "
+           "refuse it on the static arm and every pin driving it becomes a "
+           "test of the refusal instead";
+    return *fixture;
+}
 
 }  // namespace dss::macho::test

@@ -6,6 +6,7 @@
 // RED-ON-DISABLE (reverting the backing impl line fails the test).
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
+#include "analysis/preprocess/pp_if_eval.hpp"   // embedResourceWidthBytes (D-PP-EMBED-PARAMS)
 #include "analysis/preprocess/preprocessor.hpp"
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/char_decode.hpp"
@@ -36,6 +37,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <tuple>         // the D-PP-EMBED-MACRO-ARG `__has_embed` case table
 #include <type_traits>   // TF-C91: the cSubset() return-shape static_assert
 #include <vector>
 
@@ -179,6 +181,24 @@ static_assert(std::is_reference_v<decltype(cSubset())>,
         if (d.code == code) return d.severity;
     }
     return std::nullopt;
+}
+
+// How MANY reports a (code, severity) pair drew.
+// D-PP-VA-SPECIAL-IDENTIFIER-OUTSIDE-REPLACEMENT-LIST: a constraint that fires
+// per OCCURRENCE needs a COUNT, not a presence bit. `hasPPCode` cannot tell one
+// report from three, and `ppCodeSeverity` returns only the FIRST — so a check
+// that collapsed every occurrence on a line into a single report, or that
+// double-reported one occurrence from two call sites, would stay green under
+// both of them. The severity is part of the key because the same code is used
+// at Error severity by the sibling refusals in this file.
+[[nodiscard]] std::size_t ppCountCodeAtSeverity(PreprocessResult const& r,
+                                                DiagnosticCode     code,
+                                                DiagnosticSeverity sev) {
+    std::size_t n = 0;
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.code == code && d.severity == sev) ++n;
+    }
+    return n;
 }
 
 // Read the shipped c config TEXT so a test can REBIND a single config
@@ -928,6 +948,578 @@ TEST(Preprocessor, VaArgsInNonVariadicMacroFailsLoud) {
     }
 }
 
+// ══ D-PP-VA-SPECIAL-IDENTIFIER-OUTSIDE-REPLACEMENT-LIST ═════════════════════
+//
+// C23 6.10.5p5 is a CONSTRAINT: the variadic catch-all identifier and the va-opt
+// introducer "shall occur only in the replacement-list of a function-like macro
+// that uses the ellipsis notation". DSS used to enforce it ONLY inside a
+// `#define`; every other position was accepted in SILENCE.
+//
+// ★★ THE SEVERITY IS THE SUBJECT OF THESE PINS, NOT AN INCIDENTAL PROPERTY, so
+// every one of them asserts `ppCodeSeverity` rather than `hasPPCode` -- the same
+// lesson `ppCodeSeverity` was introduced for. ✔MEASURED 2026-09-02, each of the
+// four reference toolchains invoked SEPARATELY, compile-only: gcc 13.3.0 (WSL),
+// gcc 13.2.0 (mingw-w64), clang 18.1.3 (WSL) and cl 19.51.36252 EACH diagnose
+// and EACH exit 0 at their DEFAULT settings; only `-pedantic-errors` / `/W4 /WX`
+// make it fatal. The union decides ACCEPTANCE, so a refusal here would put DSS
+// above it and silence leaves it below it -- a Warning is the only answer level
+// on both axes, and `--warnings-as-errors` reproduces the strict arm.
+//
+// RED-ON-DISABLE (REMOVE direction): delete the `specialVariadicSpelling` call
+// from `Preprocessor::run`'s live-token path and the ORDINARY-CODE cases below
+// report `std::nullopt` (no diagnostic at all); delete the
+// `scanLineForSpecialVariadicIdentifiers` call at the top of `handleDirective`
+// and the DIRECTIVE-LINE cases do the same. Neither deletion touches the other,
+// which is why the two halves are pinned separately.
+TEST(Preprocessor, SpecialVariadicIdentifierOutsideReplacementListWarns) {
+    struct Case {
+        char const* src;
+        std::size_t count;   // how many OCCURRENCES must be reported
+        char const* why;
+    };
+    // Each source is written so the ONLY diagnosable thing in it is the
+    // constraint violation -- no undefined symbol, no arity error -- so a
+    // reported count is unambiguous.
+    const Case cases[] = {
+        {"int __VA_ARGS__ = 1;\n", 1,
+         "a declarator name in ordinary program text"},
+        {"int __VA_OPT__ = 1;\n", 1,
+         "the va-opt spelling as a declarator name"},
+        {"struct S { int __VA_ARGS__; };\n", 1, "a struct member name"},
+        {"struct S { int __VA_OPT__; };\n", 1,
+         "the va-opt spelling as a struct member name"},
+        {"void f(void){ __VA_ARGS__: ; }\n", 1, "a label"},
+        {"void f(void){ __VA_OPT__: ; }\n", 1,
+         "the va-opt spelling as a label"},
+        {"#define V(...) 0\nint v = V(__VA_ARGS__);\n", 1,
+         "an ARGUMENT of a variadic macro is not its replacement list"},
+        {"#if __VA_ARGS__\n#endif\nint v = 0;\n", 1,
+         "a #if controlling expression"},
+        {"#if __VA_OPT__\n#endif\nint v = 0;\n", 1,
+         "the va-opt spelling in a #if controlling expression"},
+        {"#if defined(__VA_ARGS__)\n#endif\nint v = 0;\n", 1,
+         "a defined() operand in a #if"},
+        {"#undef __VA_ARGS__\nint v = 0;\n", 1, "an #undef operand"},
+        {"#define __VA_ARGS__ 1\nint v = 0;\n", 1, "a #define macro NAME"},
+        // The name AND the later use: two occurrences, two reports. This is the
+        // pin that a per-OCCURRENCE report is not silently collapsed to one.
+        {"#define __VA_ARGS__ 1\nint v = __VA_ARGS__;\n", 2,
+         "the #define name and the ordinary-code use are two occurrences"},
+    };
+    for (Case const& c : cases) {
+        PreprocessResult r;
+        (void)ppLexemes(std::string{c.src}, r);
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "must be reported, and as a WARNING: " << c.why << "\nsrc: "
+            << c.src;
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "every reference COMPILES this at its default settings, so a "
+               "refusal would put DSS above the union: "
+            << c.why << "\nsrc: " << c.src;
+        EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                        DiagnosticSeverity::Warning),
+                  c.count)
+            << "one report per OCCURRENCE, no more and no fewer: " << c.why
+            << "\nsrc: " << c.src;
+    }
+}
+
+// The NEGATIVE half, and it is what stops the fix from being a blanket
+// token-stream sweep: the LEGITIMATE position must stay completely silent, and
+// so must an ELIDED conditional branch.
+//
+// ⚠ THE DEAD-BRANCH ARM IS MEASURED, NOT ASSUMED. ✔MEASURED 2026-09-02: `#if 0`
+// / `int __VA_ARGS__ = 1;` / `#endif` draws NOTHING from gcc 13.3.0, gcc 13.2.0
+// (mingw), clang 18.1.3 or cl 19.51.36252 -- a skipped group is only parsed far
+// enough to track nesting (C 6.10p1), so diagnosing there would be a warning DSS
+// invents where no reference has one.
+TEST(Preprocessor, SpecialVariadicIdentifierLegitimatePositionsStaySilent) {
+    char const* const silent[] = {
+        // The one legitimate position, both spellings, invoked and not.
+        "#define V(...) g(__VA_ARGS__)\nint v = V(1,2);\n",
+        "#define V(...) g(__VA_ARGS__)\nint v = 0;\n",
+        "#define V(a, ...) g(a __VA_OPT__(,) __VA_ARGS__)\nint v = V(1,2);\n",
+        "#define V(a, ...) g(a __VA_OPT__(,) __VA_ARGS__)\nint v = V(1);\n",
+        // `__VA_OPT__()` with EMPTY content is a well-formed no-op.
+        "#define V(...) g(0 __VA_OPT__())\nint v = V();\n",
+        // An ELIDED branch: reachability, not recognition.
+        "#if 0\nint __VA_ARGS__ = 1;\n#endif\nint v = 0;\n",
+        "#if 0\nint __VA_OPT__ = 1;\n#endif\nint v = 0;\n",
+        "#if 0\n#if __VA_ARGS__\n#endif\n#endif\nint v = 0;\n",
+        // A COMMENT and a STRING that spell the identifier are not tokens of it.
+        "/* __VA_ARGS__ __VA_OPT__ */\nint v = 0;\n",
+        "char const* s = \"__VA_ARGS__ __VA_OPT__\";\n",
+    };
+    for (char const* src : silent) {
+        PreprocessResult r;
+        (void)ppLexemes(std::string{src}, r);
+        EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                        DiagnosticSeverity::Warning),
+                  0u)
+            << "this position is legitimate (or unreachable) and must draw "
+               "NOTHING\nsrc: "
+            << src;
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << "src: " << src;
+    }
+}
+
+// ══ D-PP-VA-SPECIAL-IDENTIFIER-IN-A-NONVARIADIC-BODY-REFUSED-ABOVE-THE-UNION ═
+//
+// ★★ THIS TEST HAS NOW BEEN REPAIRED TWICE AND THE SECOND REPAIR EMPTIED IT,
+// WHICH IS WHY IT IS STILL HERE. It began as
+// `SpecialVariadicIdentifierRefusalsAreRecordedDivergences` pinning SIX
+// refusals as deliberate divergences; lane `vh` relaxed four by operator ruling
+// (2026-09-02) and left the two non-variadic-replacement-list shapes; lane `ob`
+// then relaxed those two under the same ruling, and the divergence list on the
+// ACCEPTANCE axis is now EMPTY. The name changed with the claim -- keeping
+// `RefusalsAreRecordedDivergences` over a body that records none would be a
+// name outliving its subject, the defect class this cycle found ten times.
+//
+// The test is the WHOLE FAMILY as one enumeration, and it is the instrument
+// that catches a later cycle re-introducing a refusal anywhere in it. Each
+// shape must (a) not error under any code, (b) still WARN -- 6.10.5p5 remains a
+// constraint and every reference diagnoses it, so going silent would put DSS
+// below the union on the diagnostic axis -- and (c) never reach
+// `P_PreprocessorOperatorNameNotDefinable`, which belongs to the
+// conditional-inclusion operators alone.
+//
+// ✔MEASURED 2026-09-02 (lane `ob`), each reference invoked SEPARATELY, DEFAULT
+// settings, every shape below with the macro NEVER USED: rc 0 on gcc 13.3.0,
+// gcc 13.2.0 (mingw), clang 18.1.3 and cl 19.51.36252 -- with ONE exception,
+// `#define M(a) __VA_OPT__`, where clang alone hard-errors `missing '('
+// following __VA_OPT__`. The disjunction decides acceptance and 3-1 is still
+// acceptance; that row is pinned separately and deliberately by
+// `Preprocessor.NonVariadicBodyAcceptanceDivergesFromClangByRuling`.
+TEST(Preprocessor, SpecialVariadicIdentifierFamilyHasNoSurvivingRefusals) {
+    struct Case { char const* src; char const* why; };
+    const Case shapes[] = {
+        // The four lane `vh` relaxed: the `#define`/`#undef` NAME positions and
+        // either spelling as a macro PARAMETER name.
+        {"#define __VA_OPT__ 1\nint v = 0;\n", "the va-opt spelling as a #define name"},
+        {"#undef __VA_OPT__\nint v = 0;\n", "the va-opt spelling as an #undef operand"},
+        {"#define M(__VA_ARGS__) 0\nint v = 0;\n", "the catch-all as a parameter name"},
+        {"#define M(__VA_OPT__) 0\nint v = 0;\n", "the va-opt spelling as a parameter name"},
+        // The six lane `ob` relaxed: either spelling in a NON-VARIADIC
+        // replacement list, object-like and function-like, bare and
+        // parenthesized. These were an Error until P54 -- the catch-all from
+        // `handleDefine`'s own guard, the va-opt spelling from `validateVaOpt`.
+        {"#define OBJ __VA_ARGS__\nint v = 0;\n",
+         "the catch-all in an object-like replacement list -- the shape the row was filed on"},
+        {"#define OBJ __VA_OPT__\nint v = 0;\n",
+         "the va-opt spelling in an object-like replacement list"},
+        {"#define OBJ __VA_OPT__(x)\nint v = 0;\n",
+         "the va-opt spelling FOLLOWED BY '(' in an object-like replacement list"},
+        {"#define M(a) __VA_ARGS__\nint v = 0;\n",
+         "the catch-all in a NON-VARIADIC function-like replacement list"},
+        {"#define M(a) __VA_OPT__(a)\nint v = 0;\n",
+         "the va-opt spelling followed by '(' in a non-variadic function-like list"},
+        {"#define M(a) __VA_OPT__\nint v = 0;\n",
+         "the BARE va-opt spelling in a non-variadic function-like list -- the "
+         "one shape clang refuses, accepted 3-1 by the disjunction"},
+    };
+    for (Case const& c : shapes) {
+        PreprocessResult r;
+        (void)ppLexemes(std::string{c.src}, r);
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "RELAXED by operator ruling 2026-09-02 -- refusing puts DSS above "
+               "the union: " << c.why << "\nsrc: " << c.src;
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "relaxing must not go SILENT: 6.10.5p5 is still a constraint and "
+               "every reference diagnoses it: " << c.why << "\nsrc: " << c.src;
+        EXPECT_FALSE(hasPPCode(
+            r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+            << "the operator-name refusal code must not be reached by any "
+               "variadic spelling -- since P59 it belongs to `defined` ALONE "
+               "(the conditional-inclusion operators are now warn-and-apply, "
+               "[[D-PP-HAS-EXTENSION-BUILTIN-ABSENT]]): "
+            << c.why << "\nsrc: " << c.src;
+    }
+}
+
+// ⛔ WHAT IS STILL DIVERGENT AFTER THE FAMILY WAS RELAXED, AND IT IS NOT AN
+// ACCEPTANCE GAP. Two references lose code in this position and DSS follows
+// neither; both divergences are RULED, so a later cycle applying the
+// disjunction by reflex has to come and change a test that says why.
+//
+// ✔MEASURED 2026-09-02 (lane `ob`), each reference invoked SEPARATELY:
+//   * clang 18.1.3 REFUSES `#define M(a) __VA_OPT__` outright (`error: missing
+//     '(' following __VA_OPT__`) while gcc 13.3.0, gcc 13.2.0 (mingw) and cl
+//     19.51.36252 accept it, rc 0. ACCEPT is 3-1 and the disjunction decides
+//     acceptance, so DSS accepts. ⚠ clang does NOT refuse the same spelling in
+//     an OBJECT-LIKE body -- the union here is per-CONSTRUCT, not per-reference.
+//   * clang ELIDES a USED `__VA_OPT__( ... )` inside a NON-variadic
+//     function-like macro (`#define NV(X) v( X __VA_OPT__(,) )` / `NV(1)` gives
+//     `v( 1 )`) where gcc and mingw gcc keep it verbatim, and cl DELETES the
+//     bare token wherever it appears. DSS keeps it verbatim: 2-1 among the
+//     references that compile the use, and the reading that loses nothing.
+// The MSVC half of this ruling for the NAME positions is pinned one test over,
+// by `Preprocessor.SpecialVariadicNameMeaningDivergesFromMsvcByRuling`.
+TEST(Preprocessor, NonVariadicBodyAcceptanceDivergesFromClangByRuling) {
+    {   // The shape clang refuses. DSS accepts, warns, and defines it.
+        PreprocessResult r;
+        auto lexs = ppLexemes("#define M(a) __VA_OPT__\nint v = M(1);\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "accepted DELIBERATELY over clang 18.1.3's refusal -- gcc, mingw "
+               "gcc and cl all take it, and 3-1 is still the disjunction";
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning});
+        // int v = __VA_OPT__ ;
+        ASSERT_EQ(lexs.size(), 5u) << "expected: int v = __VA_OPT__ ;";
+        EXPECT_EQ(lexs[3], "__VA_OPT__")
+            << "and the definition takes effect -- the spelling is an ordinary "
+               "identifier, gcc's and mingw gcc's reading";
+    }
+    {   // The MEANING divergence, at the point of use.
+        PreprocessResult r;
+        auto lexs = ppLexemes("#define NV(X) v( X __VA_OPT__(,) )\nNV(1)\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        bool kept = false;
+        for (std::string const& l : lexs) kept |= (l == "__VA_OPT__");
+        EXPECT_TRUE(kept)
+            << "DSS keeps the token; clang 18.1.3 elides the whole construct "
+               "here and cl 19.51.36252 deletes the token. Both silently drop "
+               "code the author wrote, which is the failure class that loses -- "
+               "the same tie-break as `#pragma once`";
+    }
+}
+
+// The MEANING of the relaxed position, pinned on its own rather than left to
+// the divergence test: a non-variadic replacement list carrying either spelling
+// must expand to the spelling ITSELF, so the macro denotes whatever an ordinary
+// identifier of that name denotes.
+//
+// ✔MEASURED 2026-09-02: `int __VA_ARGS__ = 42;` / `#define OBJ __VA_ARGS__` /
+// `return OBJ == 42` preprocesses to `__VA_ARGS__` and the BUILT PROGRAM EXITS
+// 0 on gcc 13.3.0, gcc 13.2.0 (mingw) and clang 18.1.3.
+//
+// ⚠ THE COUNT IS PART OF THE CLAIM AND IT IS THE REFERENCES' COUNT. gcc reports
+// ONE PER SOURCE OCCURRENCE and never per expansion: on `#define OBJ
+// __VA_ARGS__` / `int __VA_ARGS__ = 42;` / `OBJ + OBJ` it reports exactly TWO --
+// the replacement list and the declarator -- and DSS matches, because the
+// definition is scanned once and `run()` checks the SOURCE token before
+// `flushExpand`. An implementation that re-scanned expansion products would
+// report four here and still look "fail-loud".
+TEST(Preprocessor, NonVariadicBodyKeepsTheSpellingVerbatim) {
+    for (char const* spelling : {"__VA_ARGS__", "__VA_OPT__"}) {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            std::string{"#define OBJ "} + spelling + "\nint v = OBJ;\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << spelling;
+        // int v = <spelling> ;
+        ASSERT_EQ(lexs.size(), 5u) << spelling << ": expected int v = " << spelling << ";";
+        EXPECT_EQ(lexs[3], spelling)
+            << spelling
+            << ": the token is an ORDINARY IDENTIFIER in a non-variadic "
+               "replacement list and must pass through verbatim";
+        EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                        DiagnosticSeverity::Warning),
+                  1u)
+            << spelling
+            << ": ONE report, at the #define. The expansion product is NOT "
+               "re-reported -- gcc reports per SOURCE occurrence";
+    }
+    {   // The full reference-count shape, both positions in one TU.
+        PreprocessResult r;
+        (void)ppLexemes("#define OBJ __VA_ARGS__\nint __VA_ARGS__ = 42;\n"
+                        "int v = OBJ + OBJ;\n", r);
+        EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                        DiagnosticSeverity::Warning),
+                  2u)
+            << "the replacement list and the ordinary declarator are two source "
+               "occurrences; the two USES of OBJ are not. gcc 13.3.0 and gcc "
+               "13.2.0 (mingw) report exactly two on this source";
+    }
+}
+
+// `#define __VA_ARGS__ 1` now WARNS and STILL TAKES EFFECT -- the diagnostic was
+// added without moving the meaning, which is the whole reason the arm is a
+// fall-through warning and not a refusal. ✔MEASURED 2026-09-02: gcc 13.3.0, gcc
+// 13.2.0 (mingw) and clang 18.1.3 all behave this way (the definition applies);
+// cl 19.51.36252 discards it. DSS keeps the behaviour it already had, so this
+// change is a pure diagnostic addition. RED-ON-DISABLE in BOTH directions:
+// dropping the new warning fails the first assertion, and "fixing" the arm by
+// refusing (an early `return` instead of a fall-through) fails the second.
+TEST(Preprocessor, VaArgsNameAsMacroNameWarnsAndStillDefines) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define __VA_ARGS__ 42\nint v = __VA_ARGS__;\n", r);
+    EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+              std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // int v = 42 ;
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int v = 42 ;";
+    EXPECT_EQ(lexs[3], "42")
+        << "the definition must still take effect -- the warning is a "
+           "diagnostic, not a refusal, and the reference DSS follows here "
+           "(gcc/clang) applies it";
+}
+
+// ══ D-PP-VA-SPECIAL-IDENTIFIER-NAME-POSITIONS-REFUSED-ABOVE-THE-UNION ═══════
+//
+// The four shapes the operator relaxed on 2026-09-02, pinned POSITIVELY: each
+// must WARN, must not error, and must MEAN what gcc/mingw-gcc/clang say it
+// means. ⚠ THIS SENTENCE USED TO CONTINUE "the complement -- that the two
+// surviving refusals are still refusals -- is pinned by
+// `SpecialVariadicIdentifierRefusalsAreRecordedDivergences` above", and P54
+// lane `ob` made it false in both halves: the operator extended the same ruling
+// to those two shapes, so there is no complement left and that test is now
+// `Preprocessor.SpecialVariadicIdentifierFamilyHasNoSurvivingRefusals`, which
+// enumerates the WHOLE family instead.
+//
+// ★★ THE RULING AND ITS BASIS. ✔MEASURED 2026-09-02, each of the four reference
+// toolchains invoked SEPARATELY (gcc 13.3.0 in WSL, gcc 13.2.0 mingw-w64 native,
+// clang 18.1.3 in WSL, cl 19.51.36252), acceptance probed with the name never
+// USED so no reference's MEANING choice could masquerade as a refusal:
+//
+//   shape                     gcc    mingw   clang    cl        union
+//   #define __VA_ARGS__ 42    rc 0   rc 0    rc 0     rc 0      ACCEPT
+//   #define __VA_OPT__  42    rc 0   rc 0    rc 0     rc 0      ACCEPT
+//   #undef  __VA_ARGS__       rc 0   rc 0    rc 0     rc 0      ACCEPT
+//   #undef  __VA_OPT__        rc 0   rc 0    rc 0     rc 0      ACCEPT
+//
+// Acceptance is UNANIMOUS, so the disjunction forbids refusing. On MEANING the
+// references split 3-1: gcc, mingw gcc and clang HONOUR the definition
+// (`_Static_assert(__VA_OPT__ == 42)` passes and the built program exits 0 on
+// all three), while cl answers C4117 "'#define' ignored" and DISCARDS it. DSS
+// follows the three -- and the tie-break is not the head-count but the failure
+// class: MSVC's alternative silently drops code the author wrote. Same reasoning
+// that decided `#pragma once`.
+TEST(Preprocessor, VaOptNameAsMacroNameWarnsAndStillDefines) {
+    PreprocessResult r;
+    auto lexs = ppLexemes("#define __VA_OPT__ 42\nint v = __VA_OPT__;\n", r);
+    EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+              std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning});
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "all four references accept this at their default settings";
+    ASSERT_EQ(lexs.size(), 5u) << "expected: int v = 42 ;";
+    EXPECT_EQ(lexs[3], "42")
+        << "the va-opt spelling is an ordinary macro NAME here and the "
+           "definition must take effect -- the gcc/mingw-gcc/clang answer";
+}
+
+// The `#undef` half of the same ruling, BOTH spellings. An `#undef` that only
+// warned without taking effect would be the worst of both readings: a
+// diagnostic with no consequence, and `#ifdef` still true.
+TEST(Preprocessor, SpecialVariadicNameUndefWarnsAndTakesEffect) {
+    for (char const* spelling : {"__VA_ARGS__", "__VA_OPT__"}) {
+        std::string const src = std::string{"#define "} + spelling
+            + " 42\n#undef " + spelling + "\n#ifdef " + spelling
+            + "\nint yes;\n#else\nint no;\n#endif\n";
+        PreprocessResult r;
+        auto lexs = ppLexemes(src, r);
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << spelling;
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << spelling << ": still a 6.10.5p5 constraint violation";
+        ASSERT_EQ(lexs.size(), 3u) << spelling;
+        EXPECT_EQ(lexs[1], "no")
+            << spelling << ": the #undef must REMOVE the definition. ✔MEASURED "
+                           "on gcc 13.3.0, gcc 13.2.0 (mingw) and clang 18.1.3, "
+                           "where the same program takes the #else arm";
+    }
+}
+
+// EITHER spelling as a macro PARAMETER NAME: accepted, warned per occurrence,
+// and the parameter BINDS. ✔MEASURED 2026-09-02 that `F(41)` is 42 on gcc
+// 13.3.0, gcc 13.2.0 (mingw) and cl 19.51.36252 for both spellings, and on
+// clang 18.1.3 for the catch-all spelling (clang refuses a replacement-list
+// `__VA_OPT__` that is not followed by `(`, which is its own reading and does
+// not narrow the union: three references accept).
+//
+// ⚠ THE COUNT IS PART OF THE PIN. gcc reports TWO here -- the parameter name and
+// the replacement-list use -- because a NON-variadic replacement list is also an
+// illegal position. Asserting only "at least one" would let the replacement-list
+// scan be deleted while this test stayed green.
+TEST(Preprocessor, SpecialVariadicNameAsMacroParameterWarnsAndBinds) {
+    for (char const* spelling : {"__VA_ARGS__", "__VA_OPT__"}) {
+        std::string const src = std::string{"#define F("} + spelling + ") (("
+            + spelling + ") + 1)\nint v = F(41);\n";
+        PreprocessResult r;
+        auto lexs = ppLexemes(src, r);
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << spelling << ": refusing would put DSS above the union";
+        EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                        DiagnosticSeverity::Warning),
+                  2u)
+            << spelling << ": the parameter NAME and the replacement-list USE "
+                           "are two illegal positions, and gcc reports both";
+        // int v = ( ( 41 ) + 1 ) ;
+        ASSERT_EQ(lexs.size(), 11u) << spelling << ": expected int v = ((41)+1);";
+        EXPECT_EQ(lexs[5], "41")
+            << spelling << ": the declared PARAMETER must bind -- the argument "
+                           "reaches the replacement list";
+    }
+}
+
+// ★★ THE SHADOW RULE, which is what makes accepting the parameter name safe.
+// A declared parameter of either spelling SHADOWS the engine-provided construct
+// throughout that macro's replacement list -- so `#define F(__VA_ARGS__, ...)`
+// binds the PARAMETER, not the variadic catch-all, and `#define F(__VA_OPT__,
+// ...)` binds the PARAMETER, not the va-opt operator.
+//
+// ✔MEASURED 2026-09-02, the only row where the two readings are observably
+// different (`(__VA_OPT__ (0))` inside a variadic macro): gcc 13.3.0, gcc 13.2.0
+// (mingw) and cl 19.51.36252 all substitute the PARAMETER and then fail
+// DOWNSTREAM on `7 (0)` ("called object is not a function" / C2064) -- a type
+// error in the user's program, not a preprocessing refusal -- while only clang
+// 18.1.3 reads the operator. 3-1 for the parameter, so this is the measured
+// majority, not a tidy invention.
+//
+// RED-ON-DISABLE (REMOVE direction): delete the `declaresSpecialParam` clause
+// from `isVaArgsName` and the first case yields the variadic tail (2) instead of
+// the named argument (1); delete it from `isVaOptName` (and from
+// `validateVaOpt`) and the second case stops parsing at all.
+TEST(Preprocessor, SpecialVariadicParameterShadowsTheEngineConstruct) {
+    {
+        // The catch-all spelling as the FIRST parameter of a VARIADIC macro.
+        // Parameter binding gives 1; catch-all binding would give 2.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define F(__VA_ARGS__, ...) (__VA_ARGS__)\nint v = F(1, 2);\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        // int v = ( 1 ) ;
+        ASSERT_EQ(lexs.size(), 7u) << "expected: int v = ( 1 ) ;";
+        EXPECT_EQ(lexs[4], "1")
+            << "the declared PARAMETER must win over the variadic catch-all. "
+               "✔MEASURED: clang 18.1.3 and cl 19.51.36252 answer 1 (gcc "
+               "refuses the line outright as a duplicate parameter, because it "
+               "names its own variadic parameter __VA_ARGS__ internally)";
+    }
+    {
+        // The va-opt spelling as the FIRST parameter of a VARIADIC macro.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define F(__VA_OPT__, ...) (__VA_OPT__)\nint v = F(7, 9);\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        // int v = ( 7 ) ;
+        ASSERT_EQ(lexs.size(), 7u) << "expected: int v = ( 7 ) ;";
+        EXPECT_EQ(lexs[4], "7")
+            << "the declared PARAMETER must win over the va-opt operator. "
+               "✔MEASURED: gcc 13.3.0, gcc 13.2.0 (mingw) and cl 19.51.36252 "
+               "all answer 7";
+    }
+    {
+        // ⚠ ONE WARNING, NOT TWO. The occurrence sits in the replacement list of
+        // a VARIADIC function-like macro, which is the position 6.10.5p5
+        // permits -- only the parameter NAME is the violation. gcc reports
+        // exactly one here too. This is the pin that the replacement-list scan
+        // is gated on `!def.isVariadic` and not on "is this shadowed".
+        PreprocessResult r;
+        (void)ppLexemes(
+            "#define F(__VA_OPT__, ...) (__VA_OPT__)\nint v = F(7, 9);\n", r);
+        EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                        DiagnosticSeverity::Warning),
+                  1u)
+            << "inside a VARIADIC replacement list the position is legitimate; "
+               "only the parameter name is diagnosed";
+    }
+}
+
+// The definition must not COST the engine construct. Honouring `#define
+// __VA_OPT__ 42` would be a bad trade if it also disabled `__VA_OPT__( ... )`,
+// and honouring `#define __VA_ARGS__ 42` would be a bad trade if it shadowed the
+// catch-all inside a variadic macro. Neither happens, because both constructs
+// are matched by CONFIG TEXT inside a variadic replacement list and never
+// through the program's macro table.
+//
+// ✔MEASURED 2026-09-02: all four references keep both constructs working across
+// a `#define` AND across an `#undef` of the same spelling -- each built program
+// exits 0 on gcc 13.3.0, gcc 13.2.0 (mingw) and clang 18.1.3, and cl compiles
+// the equivalent _Static_assert.
+TEST(Preprocessor, SpecialVariadicNameDefinitionDoesNotDisableTheConstruct) {
+    {   // `#define __VA_OPT__` then the OPERATOR, both arms of the elision.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define __VA_OPT__ 42\n"
+            "#define V(a, ...) (a __VA_OPT__(+ 1))\n"
+            "int p = V(1, 2);\nint q = V(1);\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        // int p = ( 1 + 1 ) ; int q = ( 1 ) ;
+        ASSERT_EQ(lexs.size(), 16u) << "expected: int p = (1 + 1); int q = (1);";
+        EXPECT_EQ(lexs[4], "1");
+        EXPECT_EQ(lexs[5], "+")
+            << "the va-opt operator must still FIRE when the variable arguments "
+               "have a non-empty substitution";
+        EXPECT_EQ(lexs[13], "1");
+        EXPECT_EQ(lexs[14], ")")
+            << "and must still ELIDE when they do not -- `42` must appear "
+               "NOWHERE in either expansion";
+        for (std::string const& l : lexs) {
+            EXPECT_NE(l, "42")
+                << "the object-like definition must not leak into the operator "
+                   "position";
+        }
+    }
+    {   // `#undef __VA_OPT__` then the OPERATOR.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#undef __VA_OPT__\n"
+            "#define V(a, ...) (a __VA_OPT__(+ 1))\n"
+            "int p = V(1, 2);\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        // int p = ( 1 + 1 ) ;
+        ASSERT_EQ(lexs.size(), 9u) << "expected: int p = ( 1 + 1 ) ;";
+        EXPECT_EQ(lexs[5], "+")
+            << "an #undef removes a PROGRAM macro; the operator lives in the "
+               "language document and cannot be reached from the macro table";
+    }
+    {   // `#define __VA_ARGS__` then the CATCH-ALL inside a variadic macro.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define __VA_ARGS__ 42\n"
+            "#define V(...) (__VA_ARGS__)\nint v = V(7);\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        // int v = ( 7 ) ;
+        ASSERT_EQ(lexs.size(), 7u) << "expected: int v = ( 7 ) ;";
+        EXPECT_EQ(lexs[4], "7")
+            << "inside a variadic replacement list the spelling is the "
+               "catch-all, not the object-like macro the program defined";
+    }
+}
+
+// ⚠⚠ THE RULED DIVERGENCE FROM MSVC, PINNED SO IT CANNOT BE QUIETLY "FIXED"
+// BACK. After this change a translation unit can MEAN different things under
+// DSS and under cl: DSS (with gcc, mingw gcc and clang) HONOURS a `#define` of
+// either special variadic spelling, while cl 19.51.36252 answers C4117 "macro
+// name '__VA_ARGS__' is reserved, '#define' ignored" and DISCARDS the
+// definition, and answers the same for `#undef`.
+//
+// This is a DELIBERATE, OPERATOR-RULED choice, not an oversight: the disjunction
+// decides ACCEPTANCE (all four accept, so DSS must), and where the references
+// split on MEANING, a reference that silently discards code the author wrote
+// does not get to be the model. A later cycle applying the disjunction by reflex
+// must come and change THIS test, which says why.
+TEST(Preprocessor, SpecialVariadicNameMeaningDivergesFromMsvcByRuling) {
+    for (char const* spelling : {"__VA_ARGS__", "__VA_OPT__"}) {
+        PreprocessResult r;
+        auto lexs = ppLexemes(std::string{"#define "} + spelling
+                                  + " 42\nint v = " + spelling + ";\n", r);
+        ASSERT_EQ(lexs.size(), 5u) << spelling;
+        EXPECT_EQ(lexs[3], "42")
+            << spelling
+            << ": DSS follows gcc/mingw-gcc/clang and HONOURS the definition. "
+               "cl 19.51.36252 would leave the identifier verbatim (C4117, "
+               "'#define' ignored) and then fail on it -- that divergence is "
+               "RULED, not accidental";
+        // And the divergence is bounded: `#ifdef` agrees with the expansion,
+        // so DSS is at least self-consistent where the two references are not.
+        PreprocessResult r2;
+        auto lexs2 = ppLexemes(std::string{"#define "} + spelling
+                                   + " 42\n#ifdef " + spelling
+                                   + "\nint yes;\n#else\nint no;\n#endif\n", r2);
+        ASSERT_EQ(lexs2.size(), 3u) << spelling;
+        EXPECT_EQ(lexs2[1], "yes")
+            << spelling << ": a honoured definition must also read as DEFINED";
+    }
+}
+
+// ⓘ The AGNOSTICISM arm for these positions
+// (Preprocessor.SpecialVariadicNamePositionsAreConfigDriven) lives beside its
+// sibling further down, next to
+// Preprocessor.SpecialVariadicIdentifierConstraintIsConfigDriven: both need
+// `reboundC`, which is defined below this point in the file.
+
 // DUPLICATE parameter name fails loud (C 6.10.3p6): #define F(a,a) ...
 TEST(Preprocessor, DuplicateMacroParameterFailsLoud) {
     PreprocessResult r;
@@ -1407,6 +1999,174 @@ TEST(Preprocessor, VaArgsNameIsConfigDrivenNotHardcoded) {
     }
 }
 
+// D-PP-VA-SPECIAL-IDENTIFIER-OUTSIDE-REPLACEMENT-LIST, the agnosticism arm, and
+// the twin of the test above one constraint over. The spellings the 6.10.5p5
+// check matches come from the LANGUAGE DOCUMENT (`preprocess.variadicArgsName` /
+// `preprocess.vaOptName`), never from a literal in `src/`. Rebind the catch-all
+// to `__REST__` and the constraint must FOLLOW the rebound spelling while the
+// abandoned one becomes an ordinary identifier. RED-ON-DISABLE: hard-coding
+// `__VA_ARGS__` anywhere in the new check fails BOTH halves at once -- (1) goes
+// silent and (2) starts warning.
+TEST(Preprocessor, SpecialVariadicIdentifierConstraintIsConfigDriven) {
+    auto schema = reboundC("\"variadicArgsName\": \"__VA_ARGS__\"",
+                           "\"variadicArgsName\": \"__REST__\"",
+                           "<rebound-vaargs-constraint-c>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_EQ(schema->preprocess().variadicArgsName, "__REST__");
+
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+
+    // (1) The REBOUND spelling in ordinary code is now the violation.
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"int __REST__ = 1;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs,
+                                        dss::kDefaultHeaderNameMatching,
+                                        DiagnosticBudget::libraryDefault());
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "the constraint must follow the REBOUND spelling";
+    }
+    // (2) The ABANDONED spelling is an ordinary identifier and draws nothing.
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"int __VA_ARGS__ = 1;\n"}, "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs,
+                                        dss::kDefaultHeaderNameMatching,
+                                        DiagnosticBudget::libraryDefault());
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::nullopt)
+            << "with the catch-all rebound away, the literal __VA_ARGS__ is an "
+               "ordinary identifier -- proving the spelling is read from the "
+               "language document, not hard-coded";
+    }
+}
+
+// D-PP-VA-SPECIAL-IDENTIFIER-NAME-POSITIONS-REFUSED-ABOVE-THE-UNION, the
+// agnosticism arm for the RELAXED NAME POSITIONS, and the twin of the test
+// directly above one position over. The `#define` name arm, the `#undef` name
+// arm and the PARAMETER-NAME arm all read the spelling from the LANGUAGE
+// DOCUMENT (`preprocess.vaOptName`), never from a literal in `src/`. Rebind the
+// va-opt spelling to `DSS_OPT`: the rebound name must draw the 6.10.5p5 warning
+// and still define, and the abandoned `__VA_OPT__` must become an utterly
+// ordinary macro name that draws nothing at all. RED-ON-DISABLE: hard-coding
+// `__VA_OPT__` in any of the three arms fails both halves at once -- (1) goes
+// silent and (2) starts warning.
+TEST(Preprocessor, SpecialVariadicNamePositionsAreConfigDriven) {
+    auto schema = reboundC("\"vaOptName\": \"__VA_OPT__\"",
+                           "\"vaOptName\": \"DSS_OPT\"",
+                           "<rebound-vaopt-name-positions-c>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_EQ(schema->preprocess().vaOptName, "DSS_OPT");
+
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    auto run = [&](std::string text) {
+        auto buf = SourceBuffer::fromString(std::move(text), "main.c");
+        return preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching,
+                          DiagnosticBudget::libraryDefault());
+    };
+    {   // (1) The REBOUND spelling is now the one the constraint names.
+        PreprocessResult r = run("#define DSS_OPT 42\nint v = DSS_OPT;\n");
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "the constraint must follow the REBOUND spelling";
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+    }
+    {   // (2) The ABANDONED spelling draws nothing -- it is just an identifier.
+        PreprocessResult r = run("#define __VA_OPT__ 42\nint v = __VA_OPT__;\n");
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::nullopt)
+            << "with the va-opt spelling rebound away, the literal __VA_OPT__ "
+               "is an ordinary macro name -- proving the position check reads "
+               "the language document and not a hard-coded lexeme";
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+    }
+    {   // (3) The PARAMETER-NAME arm follows the rebinding too.
+        PreprocessResult r = run("#define F(DSS_OPT) ((DSS_OPT) + 1)\n"
+                                 "int v = F(41);\n");
+        EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                        DiagnosticSeverity::Warning),
+                  2u)
+            << "the parameter-name arm reads the same config field";
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+    }
+    {   // (4) The `#undef` arm follows it as well, and still takes effect.
+        PreprocessResult r = run("#define DSS_OPT 42\n#undef DSS_OPT\n"
+                                 "#ifdef DSS_OPT\nint yes;\n#else\nint no;\n"
+                                 "#endif\n");
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "the #undef arm reads the same config field";
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+    }
+}
+
+// D-PP-VA-SPECIAL-IDENTIFIER-IN-A-NONVARIADIC-BODY-REFUSED-ABOVE-THE-UNION, the
+// agnosticism arm for the RELAXED NON-VARIADIC REPLACEMENT-LIST position, and
+// the third of these twins. Both spellings the position check matches come from
+// the LANGUAGE DOCUMENT, never from a literal in `src/`; so does the acceptance
+// that replaced the refusal. Rebind the va-opt spelling to `DSS_OPT` and BOTH
+// halves must move together: the rebound name must warn-and-define in a
+// non-variadic body, and the abandoned `__VA_OPT__` must become an utterly
+// ordinary identifier that draws nothing.
+//
+// ⚠ THE SECOND HALF IS THE ONE THAT MATTERS HERE AND IT IS NOT REDUNDANT WITH
+// ITS SIBLINGS. `validateVaOpt`'s early return is reached through `isVaOptWord`,
+// which reads `cfg().vaOptName`; a hard-coded `__VA_OPT__` anywhere on that path
+// would keep warning about the abandoned spelling AND stop warning about the
+// rebound one, and both halves below would go red at once.
+TEST(Preprocessor, NonVariadicBodyAcceptanceIsConfigDriven) {
+    auto schema = reboundC("\"vaOptName\": \"__VA_OPT__\"",
+                           "\"vaOptName\": \"DSS_OPT\"",
+                           "<rebound-vaopt-nonvariadic-body-c>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_EQ(schema->preprocess().vaOptName, "DSS_OPT");
+
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    auto run = [&](std::string text) {
+        auto buf = SourceBuffer::fromString(std::move(text), "main.c");
+        return preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching,
+                          DiagnosticBudget::libraryDefault());
+    };
+    {   // (1) The REBOUND spelling in a non-variadic body: warns, still defines.
+        PreprocessResult r = run("#define OBJ DSS_OPT\nint v = 0;\n");
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "the constraint must follow the REBOUND spelling";
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+    }
+    {   // (2) The same, in a NON-VARIADIC FUNCTION-LIKE body -- the arm that
+        //     used to die inside `validateVaOpt` rather than in `handleDefine`.
+        PreprocessResult r = run("#define M(a) DSS_OPT\nint v = 0;\n");
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+    }
+    {   // (3) The ABANDONED spelling draws nothing at all -- it is not the
+        //     va-opt introducer any more, and `variadicArgsName` is untouched
+        //     here, so nothing else can be reporting it either.
+        PreprocessResult r = run("#define OBJ __VA_OPT__\nint v = 0;\n");
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::nullopt)
+            << "with the va-opt spelling rebound away, the literal __VA_OPT__ is "
+               "an ordinary identifier -- proving the acceptance and the warning "
+               "both read the language document, not a hard-coded lexeme";
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+    }
+    {   // (4) And the STRUCTURAL rules still apply where they belong: inside a
+        //     VARIADIC macro the rebound introducer must still require its `(`.
+        //     The early return must be gated on `!def.isVariadic`, not blanket.
+        PreprocessResult r = run("#define V(...) q( DSS_OPT )\nV(1)\n");
+        EXPECT_TRUE(r.diagnostics->hasErrors())
+            << "a malformed va-opt inside a VARIADIC macro is still a refusal -- "
+               "there the construct really is present, and every reference "
+               "rejects it";
+    }
+}
+
 // FC13 cycle 4 (D-PP-MACRO-HIDESET-PRECISE) -- FLIP of the cycle-2/3
 // `DeepMacroExpansionFailsLoudNotSilent` premise. Under the PRECISE per-token
 // hide set a finite object-macro CHAIN (`M0`->`M1`->...->`M300`->0) expands
@@ -1451,6 +2211,76 @@ TEST(Preprocessor, DeepFiniteMacroChainExpandsToValue) {
 // nesting level pre-expands its argument one frame deeper, so the >256 guard
 // trips. RED-ON-DISABLE: removing the emitPP at the backstop makes the deep nest
 // truncate silently with NO P_Preprocessor* diagnostic -> this test fails.
+// ★★★ THE NESTING CEILING IS AN EXPLICIT COUNTER, NOT THE HOST'S THREAD STACK.
+// Operator ruling 2026-09-02: *"it's well known to not use recursive structures
+// in the compiler because big projects like sqlite will for sure explode the
+// stack"*. Argument pre-expansion used to spend a CALL FRAME per source nesting
+// level; it now spends a heap frame on `MacroExpander`'s explicit expansion
+// stack.
+//
+// ⚠⚠ THE TEST BELOW WAS PASSING FOR THE WRONG REASON, AND ON THIS HOST IT WAS
+// NOT PASSING AT ALL. ✔MEASURED 2026-09-02 (P54, lane `ob`), Windows Debug: the
+// recursive expander completed a 252-deep nest on gtest's default ~1 MiB main
+// thread and died at 256 with STATUS_STACK_OVERFLOW (rc 0xC00000FD) -- FOUR
+// levels short of its own >256 backstop, so `DeepNestedMacroArgumentFailsLoud
+// NotSilent` and `CompilationUnitPPGate.FatalMacroNestingTruncationGatesParser`
+// both SEGFAULTED. ✔MEASURED IDENTICAL (252) with `preprocessor.cpp` restored to
+// the cycle base commit, so no P54 change consumed the margin: a latent defect
+// exposed, not one introduced. It never bit through the CLI only because
+// `program.cpp` runs every CU inside `substrate::callOnLargeStack`, i.e. the old
+// answer was a BIGGER STACK -- which still fails for a deeper input, and is what
+// the ruling rejects.
+//
+// THIS test is the one the conversion is FOR, and it is deliberately far past
+// the ceiling: 1024 levels is 4x the backstop and 4x what the recursive form
+// could survive on ANY default thread (it died at 256). It runs on the ORDINARY
+// gtest thread, so it fails the instant depth goes back to costing call frames.
+// ⓘ The depth is 1024 rather than larger only because the entry is quadratic in
+// the SOURCE length, not because 1024 is a limit: the same walk reaches 4000 in
+// ~12.7 s, and the pin is worth about 3 s of Debug suite time, not thirteen.
+// ✔MEASURED after the conversion: the same walk reaches 400 with rc 0 where it
+// previously died at 256, and the CLI's boundary is unmoved -- 256 accepted,
+// 257 refused with the identical diagnostic.
+TEST(Preprocessor, DeepNestingCostsHeapNotCallFrames) {
+    const int nest = 1024;   // 4x the >256 backstop
+    std::string src = "#define F(x) (x)\nint v = ";
+    for (int n = 0; n < nest; ++n) src += "F(";
+    src += "0";
+    for (int n = 0; n < nest; ++n) src += ")";
+    src += ";\n";
+
+    PreprocessResult r;
+    (void)ppLexemes(src, r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+        << "a nest this deep must still be REFUSED by the explicit counter, "
+           "loudly and by name -- turning the crash into a silent truncation "
+           "would be worse than the crash";
+    EXPECT_TRUE(r.diagnostics->hasErrors())
+        << "and the refusal is an ERROR, exactly as at 257";
+}
+
+// The other half of the same claim: a nest just BELOW the ceiling must still
+// EXPAND, correctly, on that same ordinary thread. Without this a future change
+// could satisfy the test above by lowering the limit until nothing deep runs --
+// the fix the operator ruled out in the same breath.
+TEST(Preprocessor, NestingJustBelowTheCeilingStillExpandsOnAnOrdinaryThread) {
+    const int nest = 256;   // the deepest accepted nest
+    std::string src = "#define F(x) (x)\nint v = ";
+    for (int n = 0; n < nest; ++n) src += "F(";
+    src += "42";
+    for (int n = 0; n < nest; ++n) src += ")";
+    src += ";\n";
+
+    PreprocessResult r;
+    auto lexs = ppLexemes(src, r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "256 is INSIDE the ceiling and must expand";
+    // int v = ( ( ... ( 42 ) ... ) ) ;  -> 3 + 256 + 1 + 256 + 1
+    ASSERT_EQ(lexs.size(), static_cast<std::size_t>(3 + nest + 1 + nest + 1));
+    EXPECT_EQ(lexs[3 + nest], "42")
+        << "and the innermost argument must survive every level";
+}
+
 TEST(Preprocessor, DeepNestedMacroArgumentFailsLoudNotSilent) {
     const int nest = 300;  // > the 256 nesting backstop
     std::string src = "#define F(x) (x)\nint v = ";
@@ -6834,6 +7664,96 @@ braceInner(std::vector<Token> const& toks, PreprocessResult const& out) {
         if (d.code == DiagnosticCode::P_PreprocessorEmbed) return d.actual;
     return {};
 }
+
+// The initializer lexemes (strictly inside the first `{ ... }`) of `text`
+// preprocessed with `mainPath` as the main source NAME (its directory is the
+// includer dir the quote search prepends), plus explicit include AND system
+// dir lists -- the two lists the angle search and the 6.10.4.1p9 fallback
+// consult. `schema` defaults to the shipped c config; the config pins hand a
+// mutant.
+[[nodiscard]] std::vector<std::string>
+embedInnerAt(std::string text, std::string mainPath, PreprocessResult& out,
+             std::vector<fsemb::path> includeDirs,
+             std::vector<fsemb::path> systemDirs,
+             std::shared_ptr<GrammarSchema const> schema = cSubset()) {
+    auto buf = SourceBuffer::fromString(std::move(text), std::move(mainPath));
+    out = preprocess(buf, schema, includeDirs, dss::kDefaultHeaderNameMatching,
+                     DiagnosticBudget::libraryDefault(), systemDirs);
+    std::vector<Token> sig;
+    for (Token const& t : out.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        sig.push_back(t);
+    }
+    return braceInner(sig, out);
+}
+[[nodiscard]] std::vector<std::string>
+embedInner(std::string text, PreprocessResult& out,
+           std::vector<fsemb::path> includeDirs) {
+    return embedInnerAt(std::move(text), "main.c", out, std::move(includeDirs), {});
+}
+// Space-joined lexemes, so a whole spliced sequence is ONE exact string compare.
+[[nodiscard]] std::string joined(std::vector<std::string> const& lexemes) {
+    std::string s;
+    for (auto const& l : lexemes) {
+        if (!s.empty()) s += ' ';
+        s += l;
+    }
+    return s;
+}
+// The `{ ... }` wrapper every directive fixture below uses.
+[[nodiscard]] std::string embedInit(std::string const& directiveLine) {
+    return "static const unsigned char x[] = {\n" + directiveLine + "\n};\n";
+}
+// The shipped c text with ONE `from` -> `to` rewrite, LOADED (a loader verdict,
+// not a schema): the config-refusal pins read the diagnostics.
+[[nodiscard]] auto loadReboundCResult(std::string const& from,
+                                      std::string const& to,
+                                      std::string const& label) {
+    std::string text = loadShippedCText();
+    auto const pos = text.find(from);
+    EXPECT_NE(pos, std::string::npos)
+        << "shipped c config no longer carries: " << from;
+    if (pos != std::string::npos) text.replace(pos, from.size(), to);
+    return GrammarSchema::loadFromText(text, label);
+}
+[[nodiscard]] bool hasConfigCode(std::vector<ConfigDiagnostic> const& diags,
+                                 DiagnosticCode code) {
+    for (auto const& d : diags)
+        if (d.code == code) return true;
+    return false;
+}
+// THE REMOVE-DIRECTION CONFIG MUTANT: the shipped c text WITHOUT its
+// `embedParameters` block (the whole object, key to closing brace), loaded. The
+// block is OPTIONAL, so this must LOAD -- and every parameter must then vanish
+// RED, never fall back silently.
+[[nodiscard]] std::shared_ptr<GrammarSchema const> cWithoutEmbedParameters() {
+    std::string text = loadShippedCText();
+    std::string const key   = "\"embedParameters\": {";
+    std::string const close = "\n    },";
+    auto const start = text.find(key);
+    if (start == std::string::npos) {
+        ADD_FAILURE() << "shipped c config no longer carries " << key;
+        return nullptr;
+    }
+    auto const end = text.find(close, start);
+    if (end == std::string::npos) {
+        ADD_FAILURE() << "could not find the end of the embedParameters block";
+        return nullptr;
+    }
+    text.erase(start, end + close.size() - start);
+    EXPECT_EQ(text.find("\"embedParameters\""), std::string::npos)
+        << "the mutant must not carry the key at all";
+    auto loaded = GrammarSchema::loadFromText(text, "<c-without-embedParameters>");
+    if (!loaded.has_value()) {
+        ADD_FAILURE() << "the block is OPTIONAL, so the mutant must load: "
+                      << (loaded.error().empty() ? "<no diagnostics>"
+                                                  : loaded.error()[0].message);
+        return nullptr;
+    }
+    return *loaded;
+}
 } // namespace
 
 // T1 (RUN FIRST — the P2 residual closure): a multi-byte resource splices to
@@ -6947,43 +7867,830 @@ TEST(Preprocessor, FC179EmbedEmptyFilenameFailsLoud) {
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
 }
 
-// T7 (D-PP-EMBED-PARAMS): ANY standard/vendor parameter after the filename fails
-// loud -- even for an EXISTING resource (silently honoring `limit` would embed a
-// different byte set = a silent miscompile). Resource present, so ONLY the param
-// can red.
-TEST(Preprocessor, FC179EmbedParametersFailLoud) {
-    auto dir = writeEmbedResource("dss_embed_t7", "r.bin", std::string("*"));
-    for (std::string const& param :
-         {"limit(1)", "if_empty(0)", "prefix(1)", "suffix(2)", "gnu"}) {
+// ══ D-PP-EMBED-PARAMS (C23 6.10.4.2–6.10.4.5), closed P60 ═══════════════════
+// The oracle is the ISO C23 text (N3220): gcc 13.3.0, clang 18.1.3 and MSVC
+// 19.51 all refuse `#embed` outright (MEASURED 2026-09-04, each separately), so
+// every expectation here is cited to its clause. The resource is 8 bytes
+// "ABCDEFGH" (65..72) -- LONGER than every `limit` used, so "limit applied" and
+// "limit ignored" are different token sequences. Every sequence is asserted
+// WHOLE (space-joined, exact), never by size or by a sample.
+
+// 6.10.4.2p4: `limit(N)` shorter than the resource embeds EXACTLY N bytes.
+TEST(Preprocessor, EmbedLimitShorterThanResourceEmbedsExactlyThatManyBytes) {
+    auto dir = writeEmbedResource("dss_embed_p1", "r.bin", "ABCDEFGH");
+    {
         PreprocessResult r;
-        (void)ppEmbedTokens(
-            "static const unsigned char x[] = {\n#embed \"r.bin\" " + param
-                + "\n};\n",
-            r, {dir});
-        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
-            << "#embed parameter must fail loud (even for an existing file): "
-            << param;
+        auto inner = embedInner(embedInit("#embed \"r.bin\" limit(3)"), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66 , 67");
+    }
+    {
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"r.bin\" limit(1)"), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65");
+    }
+    { // exactly the resource's size is not "shorter": the whole resource
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"r.bin\" limit(8)"), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66 , 67 , 68 , 69 , 70 , 71 , 72");
     }
     std::error_code ec; fsemb::remove_all(dir, ec);
 }
 
-// T8 (D-PP-EMBED-ANGLE / D-PP-EMBED-MACRO-ARG): the angle form and a
-// macro-expanded argument are deferred loud (never silent).
-TEST(Preprocessor, FC179EmbedAngleAndMacroArgFailLoud) {
+// 6.10.4.2p4: a limit LARGER than the resource -> the implementation width,
+// i.e. the whole resource (never padding, never a refusal).
+TEST(Preprocessor, EmbedLimitLargerThanResourceEmbedsTheWholeResource) {
+    auto dir = writeEmbedResource("dss_embed_p2", "r.bin", "ABCDEFGH");
+    PreprocessResult r;
+    auto inner = embedInner(embedInit("#embed \"r.bin\" limit(100)"), r, {dir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(joined(inner), "65 , 66 , 67 , 68 , 69 , 70 , 71 , 72");
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.4.1p5 + 6.10.4.5p2 + 6.10.4.4p3/6.10.4.3p3 (EXAMPLE 1 of 6.10.4.5):
+// `limit(0)` makes a FOUND resource EMPTY; `if_empty` then REPLACES the whole
+// directive and `prefix`/`suffix` have NO effect. Without `if_empty` the
+// expansion is the empty sequence.
+TEST(Preprocessor, EmbedLimitZeroIsEmptyIfEmptyReplacesAndPrefixSuffixAreIgnored) {
+    auto dir = writeEmbedResource("dss_embed_p3", "r.bin", "ABCDEFGH");
     {
         PreprocessResult r;
-        (void)ppEmbedTokens(
-            "static const unsigned char x[] = {\n#embed <r.bin>\n};\n", r, {});
-        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
-            << "the angle form is a loud deferral";
+        auto inner = embedInner(
+            embedInit("#embed \"r.bin\" limit(0) prefix(1,) suffix(,2) "
+                      "if_empty(7, 8)"),
+            r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "7 , 8")
+            << "if_empty replaces the directive; prefix/suffix are ignored";
     }
     {
         PreprocessResult r;
-        (void)ppEmbedTokens(
-            "static const unsigned char x[] = {\n#embed RES\n};\n", r, {});
-        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
-            << "a macro-expanded argument is a loud deferral";
+        auto inner = embedInner(
+            embedInit("#embed \"r.bin\" limit(0) prefix(1,) suffix(,2)\n42"),
+            r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "42")
+            << "an empty resource with no if_empty expands to NOTHING";
     }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.4.4p2 / 6.10.4.3p2: `prefix`/`suffix` wrap a NON-empty expansion;
+// 6.10.4.5p2: `if_empty` has no effect on a non-empty resource.
+TEST(Preprocessor, EmbedPrefixAndSuffixWrapANonEmptyResourceAndIfEmptyIsIgnored) {
+    auto dir = writeEmbedResource("dss_embed_p4", "r.bin", "AB");
+    PreprocessResult r;
+    auto inner = embedInner(
+        embedInit("#embed \"r.bin\" prefix(0xEF, 0xBB,) suffix(, 0) if_empty(9)"),
+        r, {dir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(joined(inner), "0xEF , 0xBB , 65 , 66 , 0");
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.4.4p3 / 6.10.4.3p3: on a genuinely EMPTY resource (0 bytes on disk),
+// `prefix` and `suffix` have no effect.
+TEST(Preprocessor, EmbedPrefixAndSuffixHaveNoEffectOnAnEmptyResource) {
+    auto dir = writeEmbedResource("dss_embed_p5", "empty.bin", std::string());
+    PreprocessResult r;
+    auto inner = embedInner(
+        embedInit("#embed \"empty.bin\" prefix(1,) suffix(,2)\n42"), r, {dir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(joined(inner), "42");
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.4.2p3 (EXAMPLE 2): the `limit` clause is macro-expanded before it is
+// evaluated -- and evaluated with the `#if` rules, so an expression is fine.
+TEST(Preprocessor, EmbedLimitClauseIsMacroExpandedBeforeEvaluation) {
+    auto dir = writeEmbedResource("dss_embed_p6", "r.bin", "ABCDEFGH");
+    {
+        PreprocessResult r;
+        auto inner = embedInner(
+            "#define TWO_PLUS_TWO 2+2\n"
+                + embedInit("#embed \"r.bin\" limit(TWO_PLUS_TWO)"),
+            r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66 , 67 , 68");
+    }
+    { // an unknown identifier folds to 0 under the 6.10.2 rules -> EMPTY
+        PreprocessResult r;
+        auto inner = embedInner(
+            embedInit("#embed \"r.bin\" limit(NOT_A_MACRO) if_empty(5)"), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "5");
+    }
+    { // a macro expanding to NOTHING leaves no constant expression -> loud
+        PreprocessResult r;
+        auto inner = embedInner(
+            "#define EMPTY\n" + embedInit("#embed \"r.bin\" limit(EMPTY)"),
+            r, {dir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+        EXPECT_TRUE(inner.empty()) << "never a silent partial embed";
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.1p5: `__limit__` / `__prefix__` / `__suffix__` / `__if_empty__` behave
+// exactly like the plain spellings.
+TEST(Preprocessor, EmbedDunderSpelledParameterBehavesLikeThePlainOne) {
+    auto dir = writeEmbedResource("dss_embed_p7", "r.bin", "ABCDEFGH");
+    {
+        PreprocessResult r;
+        auto inner = embedInner(
+            embedInit("#embed \"r.bin\" __limit__(2) __prefix__(9,) __suffix__(, 8)"),
+            r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "9 , 65 , 66 , 8");
+    }
+    {
+        PreprocessResult r;
+        auto inner = embedInner(
+            embedInit("#embed \"r.bin\" __limit__(0) __if_empty__(3)"), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "3");
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.4.2p1/p2: a `limit` that is negative, clause-less, empty, not an integer
+// constant expression, or that contains `defined` (as written OR produced by
+// expansion) is a constraint violation: loud, and NOTHING is spliced.
+TEST(Preprocessor, EmbedLimitConstraintViolationsFailLoud) {
+    auto dir = writeEmbedResource("dss_embed_p8", "r.bin", "ABCDEFGH");
+    for (std::string const& params :
+         {"limit(-1)", "limit()", "limit", "limit(1.5)", "limit(\"s\")",
+          "limit(defined(X))", "limit(defined X)", "limit(2 - 3)"}) {
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"r.bin\" " + params), r, {dir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << params;
+        EXPECT_TRUE(inner.empty()) << "never a silent partial embed: " << params;
+        EXPECT_NE(firstEmbedMsg(r).find("6.10.4.2"), std::string::npos)
+            << "the refusal cites its clause: " << params << " -> "
+            << firstEmbedMsg(r);
+    }
+    { // `defined` PRODUCED by expansion is refused too (6.10.2p13 is UB)
+        PreprocessResult r;
+        auto inner = embedInner(
+            "#define D defined\n" + embedInit("#embed \"r.bin\" limit(D(X))"),
+            r, {dir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+        EXPECT_NE(firstEmbedMsg(r).find("after macro expansion"), std::string::npos);
+        EXPECT_TRUE(inner.empty());
+    }
+    { // a negative SIGNED value is refused, an enormous UNSIGNED one is a bound
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"r.bin\" limit(0u - 1)"), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "`0u - 1` is uintmax_t, never negative (C 6.10.2p13)";
+        EXPECT_EQ(joined(inner), "65 , 66 , 67 , 68 , 69 , 70 , 71 , 72");
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.4.2p1 / .3p1 / .4p1 / .5p1: each standard parameter "may appear zero
+// times or one time" -- and the dunder spelling is the SAME parameter.
+TEST(Preprocessor, EmbedDuplicateStandardParameterFailsLoud) {
+    auto dir = writeEmbedResource("dss_embed_p9", "r.bin", "ABCDEFGH");
+    for (std::string const& params :
+         {"limit(1) limit(2)", "prefix(1) __prefix__(2)", "suffix(1) suffix(2)",
+          "if_empty(1) if_empty(2)", "limit(1) prefix(1) __limit__(2)"}) {
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"r.bin\" " + params), r, {dir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << params;
+        EXPECT_NE(firstEmbedMsg(r).find("more than once"), std::string::npos)
+            << params << " -> " << firstEmbedMsg(r);
+        EXPECT_TRUE(inner.empty()) << params;
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.1p9: a parameter "shall be either a preprocessor standard parameter, or
+// an implementation-defined preprocessor prefixed parameter". DSS defines no
+// prefixed parameter, so an unknown name of EITHER shape is a constraint
+// violation on the directive -- loud, nothing spliced, even for an existing
+// resource (silently ignoring `bogus(1)` would be a silent partial embed).
+TEST(Preprocessor, EmbedUnknownParameterFailsLoud) {
+    auto dir = writeEmbedResource("dss_embed_p10", "r.bin", "ABCDEFGH");
+    for (std::string const& params :
+         {"bogus(1)", "bogus", "gnu::offset(1)", "vendor::x", "limit(1) bogus(2)"}) {
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"r.bin\" " + params), r, {dir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << params;
+        EXPECT_NE(firstEmbedMsg(r).find("6.10.1p9"), std::string::npos)
+            << params << " -> " << firstEmbedMsg(r);
+        EXPECT_TRUE(inner.empty()) << params;
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.1p4: a parameter sequence that is not a sequence of pp-parameters --
+// a non-identifier, an unterminated or stray clause paren, a `::` with no
+// identifier after it -- is malformed: loud, nothing spliced.
+TEST(Preprocessor, EmbedMalformedParameterSequenceFailsLoud) {
+    auto dir = writeEmbedResource("dss_embed_p11", "r.bin", "ABCDEFGH");
+    for (std::string const& params :
+         {"42", "prefix((1)", "prefix(1))", "v::", "v:: (1)", "limit(1) )",
+          "limit(1 -"}) {
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"r.bin\" " + params), r, {dir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << params;
+        EXPECT_TRUE(inner.empty()) << params;
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.4.1p11 applies ONLY to a line matching neither literal form, and
+// 6.10.2p7 holds a `__has_embed` operand back from expansion: a parameter NAME
+// is never macro-replaced in the delimited forms (its `limit` CLAUSE is,
+// 6.10.4.2p3).
+TEST(Preprocessor, EmbedParameterNamesAreNotMacroExpandedInTheLiteralForms) {
+    auto dir = writeEmbedResource("dss_embed_p12", "r.bin", "ABCDEFGH");
+    {
+        PreprocessResult r;
+        auto inner = embedInner(
+            "#define limit bogus\n#define ONE 1\n"
+                + embedInit("#embed \"r.bin\" limit(ONE + 1)"),
+            r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "the parameter name `limit` must not be replaced by `bogus`";
+        EXPECT_EQ(joined(inner), "65 , 66");
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#define limit bogus\n#define ONE 1\n"
+            "#if __has_embed(\"r.bin\" limit(ONE + 1)) == __STDC_EMBED_FOUND__\n"
+            "int yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes")
+            << "6.10.2p7: the whole __has_embed operand is held back; only the "
+               "limit clause expands (6.10.4.2p3)";
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// 6.10.4.1p7: "the directive is replaced by its expansion and ... additional or
+// replacement token sequences" -- the spliced `prefix` tokens then sit in the
+// body stream and are processed as normal text (a macro name in them expands).
+TEST(Preprocessor, EmbedPrefixTokensAreProcessedAsNormalTextAfterTheSplice) {
+    auto dir = writeEmbedResource("dss_embed_p13", "r.bin", "AB");
+    PreprocessResult r;
+    auto inner = embedInner(
+        "#define X 7\n" + embedInit("#embed \"r.bin\" prefix(X,) suffix(, X)"),
+        r, {dir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(joined(inner), "7 , 65 , 66 , 7");
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// C 6.10p1 dead-branch parity: a `#embed` with a constraint-violating `limit`
+// and an unknown parameter inside `#if 0` is entirely silent.
+TEST(Preprocessor, EmbedWithParametersInADeadBranchIsSilent) {
+    PreprocessResult r;
+    auto inner = embedInner(
+        "#if 0\n" + embedInit("#embed \"missing.bin\" limit(-1) bogus(1)") + "#endif\n",
+        r, {});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+    EXPECT_TRUE(inner.empty());
+}
+
+// ── `__has_embed` with parameters (C23 6.10.2p7–p8, EXAMPLE 6) ──────────────
+TEST(Preprocessor, HasEmbedParametersDecideTheTrichotomy) {
+    auto dir = writeEmbedResource("dss_embed_h1", "full.bin", std::string("*"));
+    (void)writeEmbedResource("dss_embed_h1", "empty.bin", std::string());
+    auto arm = [&](std::string const& condition, std::string const& expect,
+                   char const* why) {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if " + condition + "\nint yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << condition << ": " << why;
+        ASSERT_EQ(lexs.size(), 3u) << condition;
+        EXPECT_EQ(lexs[1], expect) << condition << ": " << why;
+    };
+    arm("__has_embed(\"full.bin\" limit(0)) == __STDC_EMBED_EMPTY__", "yes",
+        "6.10.2 EXAMPLE 6: limit(0) makes a found resource EMPTY");
+    arm("__has_embed(\"full.bin\" limit(2) prefix(1) suffix(2) if_empty(3)) "
+        "== __STDC_EMBED_FOUND__", "yes",
+        "every standard parameter is supported -> FOUND for a non-empty resource");
+    arm("__has_embed(\"empty.bin\" if_empty(1)) == __STDC_EMBED_EMPTY__", "yes",
+        "a 0-byte resource is EMPTY whatever if_empty says");
+    arm("__has_embed(\"full.bin\" acme::bogus(1)) == __STDC_EMBED_NOT_FOUND__",
+        "yes",
+        "6.10.1p9 footnote 196 + 6.10.2p8 NOTE 1: an unrecognised PREFIXED "
+        "parameter is not a violation here -- it evaluates to 0");
+    arm("__has_embed(\"full.bin\" acme::a(1) acme::b) == __STDC_EMBED_NOT_FOUND__",
+        "yes", "a prefixed parameter needs no clause (6.10.1p4: the clause is "
+               "optional on a pp-parameter) and still answers 0");
+    arm("__has_embed(\"nope.bin\" limit(1)) == __STDC_EMBED_NOT_FOUND__", "yes",
+        "the search fails -> NOT_FOUND");
+    arm("__has_embed(\"full.bin\" __limit__(0)) == __STDC_EMBED_EMPTY__", "yes",
+        "6.10.1p5: the dunder spelling is the same parameter");
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#define ZERO 0\n"
+            "#if __has_embed(\"full.bin\" limit(ZERO)) == __STDC_EMBED_EMPTY__\n"
+            "int yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes")
+            << "6.10.4.2p3: the limit clause is expanded in the operator too";
+    }
+    // Constraint violations and malformed shapes are LOUD in the operator too --
+    // INCLUDING an unknown STANDARD-SHAPED name, which C23 6.10.1p9 footnote 196
+    // does not exempt (it names the PREFIXED shape only, and 6.10.2p8 NOTE 1
+    // repeats that word). `bogus(1)` is a constraint violation here exactly as it
+    // is on a `#embed` line; only `vendor::bogus(1)` is the probe-safe spelling.
+    for (std::string const& condition :
+         {"__has_embed(\"full.bin\" limit(-1))",
+          "__has_embed(\"full.bin\" limit(1) limit(2))",
+          "__has_embed(\"full.bin\" limit)",
+          "__has_embed(\"full.bin\" 42)",
+          "__has_embed(\"full.bin\" prefix((1)",
+          "__has_embed(\"full.bin\" limit(defined(X)))",
+          "__has_embed(\"full.bin\" bogus(1))",
+          "__has_embed(\"full.bin\" bogus)",
+          "__has_embed(\"full.bin\" acme::ok(1) bogus(2))"}) {
+        PreprocessResult r;
+        (void)ppLexemesWithDirs("#if " + condition + "\nint a;\n#endif\n", r,
+                                {dir}, {});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << condition;
+    }
+    { // the standard-shaped refusal NAMES the clause and the carve-out it is not
+        PreprocessResult r;
+        (void)ppLexemesWithDirs(
+            "#if __has_embed(\"full.bin\" bogus(1))\nint a;\n#endif\n", r,
+            {dir}, {});
+        EXPECT_NE(firstEmbedMsg(r).find("6.10.1p9"), std::string::npos)
+            << firstEmbedMsg(r);
+        EXPECT_NE(firstEmbedMsg(r).find("footnote 196"), std::string::npos)
+            << firstEmbedMsg(r);
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// ★★ THE ORDER OF THE TWO VERDICTS IS NORMATIVE — C23 6.10.1p9 footnote 196
+// ("An unrecognized preprocessor PREFIXED parameter is a constraint violation,
+// except within has_embed expressions") + 6.10.2p7 (NOT_FOUND "if ... any of the
+// embed parameters ... are not supported by the implementation") + 6.10.2p8
+// NOTE 1 ("...instead cause the expression to be evaluated to 0").
+//
+// The moment the sequence carries an unrecognized PREFIXED parameter the
+// operator must MINT 0. It may NOT first evaluate a sibling `limit` clause and
+// refuse the translation unit on that clause's VALUE: 6.10.2p7 imposes only the
+// SYNTACTIC requirements of a `#embed` directive on the notional directive, and
+// a limit's value (6.10.4.2p1 "shall not evaluate to a value less than 0",
+// 6.10.4.2p2 "The token defined shall not appear") is a CONSTRAINT, not syntax.
+//
+// The fixture is C23 6.10.2 EXAMPLE 5's guard shape (`ds9000::element_type`)
+// crossed with EXAMPLE 6's `limit`: a program probing a vendor parameter must
+// take the `#elif`, never die. Getting this backwards makes every portable
+// vendor-probe that also carries a `limit` unusable.
+TEST(Preprocessor, HasEmbedUnsupportedPrefixedParameterAnswersBeforeAnyLimit) {
+    auto dir = writeEmbedResource("dss_embed_h2", "bits.bin", std::string("ABCD"));
+    for (std::string const& guard :
+         {"\"bits.bin\" ds9000::element_type(short) limit(2 - 3)",
+          "\"bits.bin\" ds9000::element_type(short) limit(defined(X))",
+          // ORDER-INDEPENDENT: the verdict is over the whole sequence, so a
+          // vendor parameter AFTER the offending `limit` short-circuits too.
+          "\"bits.bin\" limit(2 - 3) ds9000::element_type(short)"}) {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_embed(" + guard + ")\nint vendor;\n"
+            "#elif __has_embed(\"bits.bin\")\nint standard;\n"
+            "#else\nint missing;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << guard << " -> " << firstEmbedMsg(r);
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << guard;
+        ASSERT_EQ(lexs.size(), 3u) << guard;
+        EXPECT_EQ(lexs[1], "standard")
+            << guard
+            << ": 6.10.2p8 NOTE 1 -- an unrecognized PREFIXED parameter makes "
+               "the whole expression 0 WITHOUT evaluating a sibling limit";
+    }
+    // CONTROL: with NO unsupported parameter the same clauses are still refused
+    // -- the short-circuit is DIRECTIONAL, it did not delete 6.10.4.2.
+    for (std::string const& condition :
+         {"__has_embed(\"bits.bin\" limit(2 - 3))",
+          "__has_embed(\"bits.bin\" limit(defined(X)))"}) {
+        PreprocessResult r;
+        (void)ppLexemesWithDirs("#if " + condition + "\nint a;\n#endif\n", r,
+                                {dir}, {});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << condition;
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// ══ D-PP-EMBED-ANGLE (C23 6.10.4.1p8/p9), closed P60 ════════════════════════
+// The angle form searches the angle `#include`'s places -- the system dirs,
+// then the include dirs -- and NEVER the including file's own directory
+// (6.10.3p2 parity); the quote form falls back to that search when its own
+// fails (p9). Every fixture puts the resource where exactly ONE search finds it.
+
+TEST(Preprocessor, EmbedAngleFormSearchesTheIncludeDirsNeverTheIncluderDir) {
+    auto inc = writeEmbedResource("dss_embed_a1_inc", "r.bin", "ABCDEFGH");
+    auto self = writeEmbedResource("dss_embed_a1_self", "r.bin", "ABCDEFGH");
+    { // on the include path, main.c elsewhere -> found
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed <r.bin>"),
+                                  (self.parent_path() / "elsewhere" / "main.c").string(),
+                                  r, {inc}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66 , 67 , 68 , 69 , 70 , 71 , 72");
+    }
+    { // ONLY beside main.c, no include dirs -> the angle form must NOT find it
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed <r.bin>"),
+                                  (self / "main.c").string(), r, {}, {});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+        EXPECT_NE(firstEmbedMsg(r).find("not found"), std::string::npos);
+        EXPECT_TRUE(inner.empty());
+    }
+    { // ... while the quote form in the same setup finds it (the control)
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed \"r.bin\""),
+                                  (self / "main.c").string(), r, {}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66 , 67 , 68 , 69 , 70 , 71 , 72");
+    }
+    std::error_code ec;
+    fsemb::remove_all(inc, ec);
+    fsemb::remove_all(self, ec);
+}
+
+TEST(Preprocessor, EmbedAngleFormResolvesASubdirectoryNameWithParameters) {
+    auto inc = writeEmbedResource("dss_embed_a2", "r.bin", "ABCDEFGH");
+    (void)writeEmbedResource("dss_embed_a2/sub", "deep.bin", "xyz");
+    {
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed <sub/deep.bin>"), r, {inc});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "120 , 121 , 122");
+    }
+    {
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed <r.bin> limit(2) suffix(, 0)"),
+                                r, {inc});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66 , 0");
+    }
+    std::error_code ec; fsemb::remove_all(inc, ec);
+}
+
+TEST(Preprocessor, EmbedAngleFormMalformedFailsLoud) {
+    auto inc = writeEmbedResource("dss_embed_a3", "r.bin", "ABCDEFGH");
+    for (std::string const& line : {"#embed <r.bin", "#embed <>", "#embed <r.bin> <"}) {
+        PreprocessResult r;
+        auto inner = embedInner(embedInit(line), r, {inc});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << line;
+        EXPECT_TRUE(inner.empty()) << line;
+    }
+    std::error_code ec; fsemb::remove_all(inc, ec);
+}
+
+// 6.10.4.1p9: a quote search that fails "is reprocessed as if it read
+// `# embed < ... >`". The resource sits ONLY on a SYSTEM dir -- a place the
+// quote search never looks -- so only the fallback can find it; `__has_embed`
+// (6.10.2p7 "as if ... in a #embed directive") falls back identically.
+TEST(Preprocessor, EmbedQuoteFormFallsBackToTheAngleSearch) {
+    auto sys = writeEmbedResource("dss_embed_a4_sys", "r.bin", "ABCDEFGH");
+    {
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed \"r.bin\" limit(3)"), "main.c",
+                                  r, {}, {sys});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66 , 67");
+    }
+    { // the CONTROL: without the system dir the same line is a loud miss
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed \"r.bin\" limit(3)"), "main.c",
+                                  r, {}, {});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+        EXPECT_TRUE(inner.empty());
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_embed(\"r.bin\") == __STDC_EMBED_FOUND__\n"
+            "int yes;\n#else\nint no;\n#endif\n",
+            r, {}, {sys});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes");
+    }
+    std::error_code ec; fsemb::remove_all(sys, ec);
+}
+
+TEST(Preprocessor, HasEmbedAngleFormAgreesWithTheDirective) {
+    auto inc = writeEmbedResource("dss_embed_a5_inc", "r.bin", "ABCDEFGH");
+    auto self = writeEmbedResource("dss_embed_a5_self", "r.bin", "ABCDEFGH");
+    auto arm = [&](std::string const& condition, std::string mainPath,
+                   std::vector<fsemb::path> includeDirs, std::string const& expect,
+                   char const* why) {
+        auto buf = SourceBuffer::fromString(
+            "#if " + condition + "\nint yes;\n#else\nint no;\n#endif\n",
+            std::move(mainPath));
+        auto schema = cSubset();
+        auto r = preprocess(buf, schema, includeDirs, dss::kDefaultHeaderNameMatching,
+                            DiagnosticBudget::libraryDefault());
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << condition << ": " << why;
+        std::vector<std::string> lexs;
+        for (Token const& t : r.tokens) {
+            if (t.coreKind == CoreTokenKind::Eof
+                || t.coreKind == CoreTokenKind::Whitespace
+                || t.coreKind == CoreTokenKind::Newline) continue;
+            lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+        }
+        ASSERT_EQ(lexs.size(), 3u) << condition;
+        EXPECT_EQ(lexs[1], expect) << condition << ": " << why;
+    };
+    arm("__has_embed(<r.bin>) == __STDC_EMBED_FOUND__", "main.c", {inc}, "yes",
+        "on the include path -> FOUND");
+    arm("__has_embed(<r.bin> limit(0)) == __STDC_EMBED_EMPTY__", "main.c", {inc},
+        "yes", "limit(0) -> EMPTY through the angle form too");
+    arm("__has_embed(<nope.bin>) == __STDC_EMBED_NOT_FOUND__", "main.c", {inc},
+        "yes", "absent -> NOT_FOUND");
+    arm("__has_embed(<r.bin>) == __STDC_EMBED_NOT_FOUND__",
+        (self / "main.c").string(), {}, "yes",
+        "beside main.c only: the angle form never searches the includer dir");
+    arm("__has_embed(\"r.bin\") == __STDC_EMBED_FOUND__",
+        (self / "main.c").string(), {}, "yes",
+        "the CONTROL: the quote form does search the includer dir");
+    std::error_code ec;
+    fsemb::remove_all(inc, ec);
+    fsemb::remove_all(self, ec);
+}
+
+// ══ D-PP-EMBED-MACRO-ARG (C23 6.10.4.1p11), closed P60 ══════════════════════
+// A `# embed pp-tokens` line matching NEITHER literal form has the tokens after
+// `embed` "processed just as in normal text", and the RESULT shall match one of
+// the two forms -- the whole tail, parameters included.
+
+TEST(Preprocessor, EmbedMacroExpandedOperandMatchingAFormIsProcessed) {
+    auto inc = writeEmbedResource("dss_embed_m1", "r.bin", "ABCDEFGH");
+    struct Case { char const* defines; char const* line; char const* expect; };
+    for (Case const& c : {
+             Case{"#define R \"r.bin\"\n", "#embed R",
+                  "65 , 66 , 67 , 68 , 69 , 70 , 71 , 72"},
+             Case{"#define RL \"r.bin\" limit(2)\n", "#embed RL", "65 , 66"},
+             Case{"#define A <r.bin>\n", "#embed A",
+                  "65 , 66 , 67 , 68 , 69 , 70 , 71 , 72"},
+             Case{"#define R \"r.bin\"\n#define LIM 3\n", "#embed R limit(LIM)",
+                  "65 , 66 , 67"},
+             Case{"#define R \"r.bin\"\n", "#embed R limit(1) suffix(, 0)",
+                  "65 , 0"},
+             Case{"#define NAME(x) #x\n", "#embed NAME(r.bin) limit(2)", "65 , 66"},
+         }) {
+        PreprocessResult r;
+        auto inner = embedInner(std::string{c.defines} + embedInit(c.line), r, {inc});
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << c.line;
+        EXPECT_EQ(joined(inner), c.expect) << c.line;
+    }
+    std::error_code ec; fsemb::remove_all(inc, ec);
+}
+
+TEST(Preprocessor, EmbedMacroExpandedOperandMatchingNeitherFormFailsLoud) {
+    auto inc = writeEmbedResource("dss_embed_m2", "r.bin", "ABCDEFGH");
+    struct Case { char const* defines; char const* line; };
+    for (Case const& c : {
+             Case{"#define R r.bin\n", "#embed R"},
+             Case{"#define E\n", "#embed E"},
+             Case{"", "#embed UNDEFINED_NAME"},
+             Case{"#define R 42\n", "#embed R"},
+         }) {
+        PreprocessResult r;
+        auto inner = embedInner(std::string{c.defines} + embedInit(c.line), r, {inc});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed)) << c.line;
+        EXPECT_NE(firstEmbedMsg(r).find("neither"), std::string::npos)
+            << c.line << " -> " << firstEmbedMsg(r);
+        EXPECT_TRUE(inner.empty()) << c.line;
+    }
+    std::error_code ec; fsemb::remove_all(inc, ec);
+}
+
+// 6.10.2p5: the second `__has_embed` form is considered only when the first
+// does not match, and its tokens are "processed just as in normal text".
+TEST(Preprocessor, HasEmbedMacroExpandedOperandIsReExamined) {
+    auto dir = writeEmbedResource("dss_embed_m3", "full.bin", std::string("*"));
+    for (auto const& [defines, condition, expect] :
+         {std::tuple{"#define R \"full.bin\"\n",
+                     "__has_embed(R) == __STDC_EMBED_FOUND__", "yes"},
+          std::tuple{"#define RL \"full.bin\" limit(0)\n",
+                     "__has_embed(RL) == __STDC_EMBED_EMPTY__", "yes"},
+          std::tuple{"#define N \"nope.bin\"\n",
+                     "__has_embed(N) == __STDC_EMBED_NOT_FOUND__", "yes"}}) {
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            std::string{defines} + "#if " + condition
+                + "\nint yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << condition;
+        ASSERT_EQ(lexs.size(), 3u) << condition;
+        EXPECT_EQ(lexs[1], expect) << condition;
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// ══ THE CONFIG SURFACE: `preprocess.embedParameters` is the language's declaration ══
+
+// REMOVE-direction: with the block deleted the plain directive and the plain
+// operator still work and every parameter is refused as unknown -- in the
+// DIRECTIVE and in `__has_embed` alike, because a bare identifier that binds no
+// standard parameter is exactly the shape C23 6.10.1p9 footnote 196 does NOT
+// exempt ("An unrecognized preprocessor PREFIXED parameter ... except within
+// has_embed expressions"). The honest subset, never a silent fallback.
+TEST(Preprocessor, EmbedParameterSurfaceVanishesRedWhenTheConfigBlockIsRemoved) {
+    auto schema = cWithoutEmbedParameters();
+    ASSERT_TRUE(schema != nullptr);
+    EXPECT_FALSE(schema->preprocess().embedParameters.has_value());
+    auto dir = writeEmbedResource("dss_embed_c1", "r.bin", "ABCDEFGH");
+    {
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed \"r.bin\" limit(1)"), "main.c",
+                                  r, {dir}, {}, schema);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
+            << "without the block, `limit` is an unknown parameter";
+        EXPECT_TRUE(inner.empty()) << "never a silent partial embed";
+    }
+    {
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed \"r.bin\""), "main.c", r, {dir},
+                                  {}, schema);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66 , 67 , 68 , 69 , 70 , 71 , 72")
+            << "the plain form is unaffected";
+    }
+    auto runWith = [&](std::string text, PreprocessResult& out) {
+        auto buf = SourceBuffer::fromString(std::move(text), "main.c");
+        std::vector<fsemb::path> dirs{dir};
+        out = preprocess(buf, schema, dirs, dss::kDefaultHeaderNameMatching,
+                         DiagnosticBudget::libraryDefault());
+        std::vector<std::string> lexs;
+        for (Token const& t : out.tokens) {
+            if (t.coreKind == CoreTokenKind::Eof
+                || t.coreKind == CoreTokenKind::Whitespace
+                || t.coreKind == CoreTokenKind::Newline) continue;
+            lexs.push_back(std::string{out.synthBuffer->slice(t.span)});
+        }
+        return joined(lexs);
+    };
+    {
+        PreprocessResult r;
+        (void)runWith(
+            "#if __has_embed(\"r.bin\" limit(1))\nint yes;\n#else\nint no;\n#endif\n",
+            r);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
+            << "without the block `limit` names no standard parameter, so it is "
+               "an unknown standard-shaped name -- a 6.10.1p9 constraint "
+               "violation in the OPERATOR too (footnote 196 exempts only the "
+               "prefixed shape)";
+    }
+    {
+        PreprocessResult r;
+        auto const lexs =
+            runWith("#if __has_embed(\"r.bin\")\nint found;\n#endif\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(lexs, "int found ;")
+            << "the PLAIN operator is unaffected by the missing block";
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// The parameter NAMES are config, never engine literals: rebind `limit` to
+// `cap` and `cap(2)` limits while `limit(2)` is unknown.
+TEST(Preprocessor, EmbedParameterNamesAreConfigDrivenNotHardcoded) {
+    auto schema = reboundC("\"name\": \"limit\"", "\"name\": \"cap\"",
+                           "<rebound-embed-limit>");
+    ASSERT_TRUE(schema != nullptr);
+    auto dir = writeEmbedResource("dss_embed_c2", "r.bin", "ABCDEFGH");
+    {
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed \"r.bin\" cap(2)"), "main.c", r,
+                                  {dir}, {}, schema);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_EQ(joined(inner), "65 , 66");
+    }
+    {
+        PreprocessResult r;
+        auto inner = embedInnerAt(embedInit("#embed \"r.bin\" limit(2)"), "main.c", r,
+                                  {dir}, {}, schema);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
+            << "with the verb rebound to `cap`, `limit` is unknown";
+        EXPECT_TRUE(inner.empty());
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// The loader's guards: a CLOSED role set, one name per role and one role per
+// name (dunder-folded), a REQUIRED separator kind that must exist, a non-empty
+// row set, and no block for a surface the language does not declare.
+TEST(Preprocessor, EmbedParametersLoaderRefusesMalformedBlocks) {
+    struct Mutant { char const* from; char const* to; DiagnosticCode code; char const* why; };
+    for (Mutant const& m : {
+             Mutant{"\"role\": \"ifEmpty\"", "\"role\": \"ifEmptyX\"",
+                    DiagnosticCode::C_InvalidPreprocess, "an unknown role"},
+             Mutant{"\"role\": \"suffix\"", "\"role\": \"prefix\"",
+                    DiagnosticCode::C_InvalidPreprocess, "a role bound to two names"},
+             Mutant{"\"name\": \"suffix\"", "\"name\": \"__prefix__\"",
+                    DiagnosticCode::C_InvalidPreprocess,
+                    "a name colliding through its dunder spelling (6.10.1p5)"},
+             Mutant{"\"prefixSeparatorToken\": \"ColonColonOp\"",
+                    "\"prefixSeparatorToken\": \"NoSuchTokenKind\"",
+                    DiagnosticCode::C_UnknownToken, "an unknown separator kind"},
+             Mutant{"\"prefixSeparatorToken\": \"ColonColonOp\",",
+                    "\"$prefixSeparatorTokenRemoved\": \"ColonColonOp\",",
+                    DiagnosticCode::C_MissingField, "a missing separator kind"},
+             Mutant{"\"standard\": [", "\"standard\": [], \"$wasStandard\": [",
+                    DiagnosticCode::C_InvalidPreprocess, "an empty row set"},
+         }) {
+        auto loaded = loadReboundCResult(m.from, m.to, "<embed-params-mutant>");
+        EXPECT_FALSE(loaded.has_value()) << "must be refused: " << m.why;
+        if (!loaded.has_value()) {
+            EXPECT_TRUE(hasConfigCode(loaded.error(), m.code)) << m.why;
+        }
+    }
+    { // a block for a surface the language does not declare is dead config
+        std::string text = loadShippedCText();
+        for (std::string const& key : {"\"embedDirective\":", "\"hasEmbedOperator\":"}) {
+            auto const pos = text.find(key);
+            ASSERT_NE(pos, std::string::npos) << key;
+            text.replace(pos, key.size(), "\"$removed" + key.substr(1));
+        }
+        auto loaded = GrammarSchema::loadFromText(text, "<embed-params-dead-block>");
+        EXPECT_FALSE(loaded.has_value());
+        if (!loaded.has_value()) {
+            bool named = false;
+            for (auto const& d : loaded.error()) {
+                if (d.code == DiagnosticCode::C_InvalidPreprocess
+                    && d.message.find("does not declare") != std::string::npos) {
+                    named = true;
+                }
+            }
+            EXPECT_TRUE(named) << "the refusal names the missing surface";
+        }
+    }
+}
+
+// C23 6.10.4.1p6: the embed element width is CHAR_BIT. `CHAR_BIT` has exactly
+// ONE owner in this tree (`shippedLibs/limits.json`) and the width is an engine
+// constant rather than a second declaration of it -- this pin is the coupling
+// made visible: it goes red the day either side moves.
+//
+// ⚠ SAY WHAT `kEmbedElementWidthBits` IS: a TRIPWIRE ANCHOR, not a width
+// parameter. ✔MEASURED -- no engine site reads its VALUE to decide anything; the
+// octet assumption is structural in the resource reader (which yields bytes) and
+// in `handleEmbed`'s splice loop (which spells one byte per element), and a
+// `static_assert` at that loop refuses to compile if the constant ever moves off
+// 8. So this pin is the OTHER half of the tripwire — the half that watches
+// `limits.json` — and neither half claims the constant is a knob.
+TEST(Preprocessor, EmbedElementWidthIsTheOneCharBitOwner) {
+    auto const root = dss::test::findConfigRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::configRootDiagnostic();
+    std::ifstream in(*root / "shippedLibs" / "limits.json", std::ios::binary);
+    ASSERT_TRUE(in.is_open());
+    std::string const text{std::istreambuf_iterator<char>(in),
+                           std::istreambuf_iterator<char>()};
+    // ⚠ THE SEARCH IS BOUNDED TO CHAR_BIT'S OWN OBJECT, AND THAT IS THE WHOLE
+    // POINT OF THIS BLOCK. An unbounded `find("\"value\":", name)` reads the
+    // NEXT constant's value the day CHAR_BIT's row loses or renames the field --
+    // and SCHAR_MIN's -128 or SCHAR_MAX's 127 is not 8, so it would go red...
+    // unless the next row happened to hold an 8, in which case the pin passes
+    // while measuring the wrong macro. An instrument that can fail toward CLEAN
+    // is not an instrument: every step below refuses instead of guessing.
+    auto const constants = text.find("\"constants\"");
+    ASSERT_NE(constants, std::string::npos)
+        << "limits.json no longer has a `constants` array";
+    auto const name = text.find("\"CHAR_BIT\"", constants);
+    ASSERT_NE(name, std::string::npos) << "limits.json no longer declares CHAR_BIT";
+    auto const rowEnd = text.find('}', name);
+    ASSERT_NE(rowEnd, std::string::npos) << "CHAR_BIT's row is unterminated";
+    auto const value = text.find("\"value\":", name);
+    ASSERT_NE(value, std::string::npos);
+    ASSERT_LT(value, rowEnd)
+        << "CHAR_BIT's OWN row no longer carries a `value` field -- this pin "
+           "would otherwise have read the next constant's";
+    char const* const digits = text.c_str() + value + std::string{"\"value\":"}.size();
+    char*             parsed = nullptr;
+    std::uint64_t const charBit = std::strtoull(digits, &parsed, 10);
+    ASSERT_NE(parsed, digits) << "CHAR_BIT's `value` is not a decimal number";
+    EXPECT_EQ(charBit, kEmbedElementWidthBits)
+        << "the resource reader yields octets; a target with another CHAR_BIT "
+           "needs another reader, not a config knob";
+    EXPECT_EQ(embedResourceWidthBytes(8, std::nullopt), 8u);
+    EXPECT_EQ(embedResourceWidthBytes(8, 3), 3u);
+    EXPECT_EQ(embedResourceWidthBytes(8, 100), 8u);
+    EXPECT_EQ(embedResourceWidthBytes(8, 0), 0u);
+    EXPECT_EQ(embedResourceWidthBytes(0, std::nullopt), 0u);
 }
 
 // T9: an empty resource expands to NOTHING (C23 6.10.3/6.10.4). `{ <empty> 42 }`
@@ -7036,18 +8743,40 @@ TEST(Preprocessor, FC179HasEmbedTrichotomy) {
         ASSERT_EQ(lexs.size(), 3u);
         EXPECT_EQ(lexs[1], "no") << "a missing resource -> __has_embed == 0";
     }
-    { // an unsupported parameter clause -> NOT_FOUND(0), NOT an error
+    { // a SUPPORTED parameter clause (D-PP-EMBED-PARAMS, P60) -> FOUND(1)
         PreprocessResult r;
         auto lexs = ppLexemesWithDirs(
             "#if __has_embed(\"full.bin\" limit(1))\n"
             "int yes;\n#else\nint no;\n#endif\n",
             r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes")
+            << "limit(1) on a 1-byte resource: supported + non-empty -> 1";
+    }
+    { // an unrecognized PREFIXED parameter -> NOT_FOUND(0), NOT an error: the
+      // C23 feature-probe contract, and the ONLY shape footnote 196 exempts.
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_embed(\"full.bin\" ds9000::element_type(short))\n"
+            "int yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
         EXPECT_FALSE(r.diagnostics->hasErrors())
-            << "an unsupported parameter is the standard NOT_FOUND signal, "
-               "not an error";
+            << "6.10.1p9 footnote 196: an unrecognized PREFIXED parameter is "
+               "not a constraint violation within a has_embed expression";
         ASSERT_EQ(lexs.size(), 3u);
         EXPECT_EQ(lexs[1], "no")
-            << "any parameter clause -> __has_embed == 0 (C23 feature-probe)";
+            << "6.10.2p8 NOTE 1: it makes the expression evaluate to 0";
+    }
+    { // an unknown STANDARD-SHAPED name gets NO such exemption -> loud
+        PreprocessResult r;
+        (void)ppLexemesWithDirs(
+            "#if __has_embed(\"full.bin\" no_such_parameter(1))\n"
+            "int yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
+            << "6.10.1p9 is violated and footnote 196's carve-out names the "
+               "PREFIXED shape only";
     }
     { // malformed (no `(`) -> loud
         PreprocessResult r;
@@ -7151,6 +8880,89 @@ TEST(Preprocessor, FC179EmbedResourceSizeBudgetIsLoudNotOom) {
         << "one byte over the budget must yield a loud diagnostic, never an OOM";
     EXPECT_NE(over->find("D-PP-EMBED-STREAMING"), std::string::npos)
         << "the message names the streaming-deferral boundary";
+}
+
+// ★★ C23 6.10.4.5 EXAMPLE 3 + 6.10.4.2 EXAMPLE 4: `limit` IS THE RESOURCE
+// BOUND, so it bounds the splice budget and the read -- while the budget itself
+// is neither lowered nor lifted. EXAMPLE 4 states the purpose in the standard's
+// own words: "The limit parameter may help process only a portion of that
+// information and PREVENT EXHAUSTION of an implementation's internal resources
+// when processing such data", and EXAMPLE 3 embeds `<infinite-resource>` with
+// `limit(0) if_empty(45540)` and requires `return 45540;`.
+//
+// The fixture is a resource ONE BYTE over the splice budget, built with a seek
+// (4 real bytes, then a single put at the cap) so it costs a seek rather than
+// 16 MiB of writes. CONTROL FIRST: with no `limit` it still fails LOUD naming
+// the streaming boundary -- the cap is untouched.
+TEST(Preprocessor, EmbedLimitBoundsTheSpliceBudgetWithoutWeakeningIt) {
+    auto dir = writeEmbedResource("dss_embed_lim", "small.bin", "AB");
+    auto const big = dir / "big.bin";
+    {
+        std::ofstream out(big, std::ios::binary);
+        ASSERT_TRUE(out.is_open());
+        char const head[] = {'\x01', '\x02', '\x03', '\x04'};
+        out.write(head, 4);
+        out.seekp(static_cast<std::streamoff>(kEmbedMaxResourceBytes),
+                  std::ios::beg);
+        out.put('\xFF');
+    }
+    std::error_code szEc;
+    ASSERT_EQ(fsemb::file_size(big, szEc), kEmbedMaxResourceBytes + 1)
+        << "the fixture must sit exactly one byte over the budget";
+    { // CONTROL: unlimited, over budget -> LOUD, naming the deferral. NOT lifted.
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"big.bin\""), r, {dir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+        EXPECT_NE(firstEmbedMsg(r).find("D-PP-EMBED-STREAMING"), std::string::npos)
+            << firstEmbedMsg(r);
+        EXPECT_TRUE(inner.empty()) << "never a silent partial embed";
+    }
+    { // CONTROL: a `limit` ABOVE the budget is still refused -- `limit` narrows
+      // the width, it does not exempt the directive.
+        PreprocessResult r;
+        auto inner = embedInner(
+            embedInit("#embed \"big.bin\" limit(16777217)"), r, {dir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+        EXPECT_NE(firstEmbedMsg(r).find("D-PP-EMBED-STREAMING"), std::string::npos)
+            << firstEmbedMsg(r);
+        EXPECT_TRUE(inner.empty());
+    }
+    { // 6.10.4.2p4: a small `limit` makes the WIDTH small, so the directive is
+      // within budget and embeds exactly those bytes.
+        PreprocessResult r;
+        auto inner = embedInner(embedInit("#embed \"big.bin\" limit(4)"), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << firstEmbedMsg(r);
+        EXPECT_EQ(joined(inner), "1 , 2 , 3 , 4");
+    }
+    { // 6.10.4.5 EXAMPLE 3, verbatim in shape: `limit(0) if_empty(45540)`.
+        PreprocessResult r;
+        auto inner = embedInner(
+            embedInit("#embed \"big.bin\" limit(0) if_empty(45540)"), r, {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << firstEmbedMsg(r);
+        EXPECT_EQ(joined(inner), "45540")
+            << "C23 6.10.4.5 EXAMPLE 3: the directive becomes `45540`";
+    }
+    { // 6.10.4.5 EXAMPLE 1 shape: `limit(0) prefix(1) if_empty(0)` -> `0`, and
+      // `prefix` is ignored because the resource is empty (6.10.4.4p3).
+        PreprocessResult r;
+        auto inner = embedInner(
+            embedInit("#embed \"big.bin\" limit(0) prefix(1) if_empty(0)"), r,
+            {dir});
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << firstEmbedMsg(r);
+        EXPECT_EQ(joined(inner), "0");
+    }
+    { // and the OPERATOR agrees: EXAMPLE 6's `limit(0)` is EMPTY over the same
+      // oversized resource -- the budget never enters the trichotomy.
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_embed(\"big.bin\" limit(0)) == __STDC_EMBED_EMPTY__\n"
+            "int yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes");
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
 }
 
 // T12 (the pre-scan-parity witness, §9 FIX-4): a `#if __has_embed("res.bin")`
@@ -9420,50 +11232,323 @@ TEST(Preprocessor, TFC86PortabilityShimDoesNotShadowTheOperatorEndToEnd) {
     fs::remove_all(inc, ec);
 }
 
-// The `#define` refusal, for EVERY declared operator. An UNGUARDED shadow is a
-// silent miscompile (the guard would answer 0 while `#include` still splices),
-// so it is refused loudly and the operator KEEPS working.
-TEST(Preprocessor, TFC86UnguardedDefineOfOperatorFailsLoudEveryOperator) {
+// ★★★ RENAMED AND REVERSED, NOT DELETED
+// ([[D-PP-HAS-EXTENSION-BUILTIN-ABSENT]], operator ruling 2026-09-03). This was
+// `TFC86UnguardedDefineOfOperatorFailsLoudEveryOperator` and it pinned TF-C86's
+// Error refusal of `#define __has_include(x) 0`. The operator RULED that DSS
+// must ACCEPT and APPLY it: *"we must accept too. best long term solution, no
+// workaround, first class implementation, 100% config driven. leave nothing to
+// be done."* A name is a claim, and leaving one that says `FailsLoud` over a
+// body that pins acceptance is the same defect class as a comment outliving its
+// code.
+//
+// ✔MEASURED 2026-09-04, each reference invoked SEPARATELY, WITH A CONTROL that
+// proves the untouched operator answers 1 for the same local header (without it
+// a 0 is equally consistent with the header not being found — which is exactly
+// what MSVC's answer looked like until the control was run): gcc 13.3.0, gcc
+// 13.2.0 (mingw) and clang 18.1.3 all WARN, cl 19.51.36252 is SILENT, and ALL
+// FOUR exit 0 and ALL FOUR APPLY the definition.
+//
+// ⚠ THE TF-C86 REASON THE REFUSAL GAVE IS NOT OVERRULED, IT IS RE-ASSIGNED. It
+// held that honouring the shadow makes `#include <h>` and `__has_include(<h>)`
+// disagree about one file. It does — but that disagreement is now the PROGRAM's,
+// deliberately written and diagnosed, exactly as it is on every reference,
+// rather than the implementation's silent one. What the refusal was really
+// protecting (the GUARDED shim must not shadow the operator) is protected by
+// `#ifndef` being false, which is pinned by
+// `TFC86PortabilityShimDoesNotShadowTheOperatorEndToEnd` above.
+TEST(Preprocessor, TFC86UnguardedDefineOfOperatorIsAcceptedAndAppliedEveryOperator) {
     for (std::string const& op : tfc86DeclaredOperators()) {
         PreprocessResult r;
         auto lexs = ppLexemes(
-            "#define " + op + "(x) 0\n"
-            "#ifdef " + op + "\nint yes;\n#else\nint no;\n#endif\n", r);
-        EXPECT_TRUE(hasPPCode(
+            "#define " + op + " 5\n"
+            "int v = " + op + ";\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "#define " << op
+            << " must be ACCEPTED — all four references accept it at their "
+               "default settings, so refusing put DSS above the union";
+        EXPECT_FALSE(hasPPCode(
             r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
-            << "#define " << op << " must fail LOUD";
-        ASSERT_EQ(lexs.size(), 3u) << op;
-        EXPECT_EQ(lexs[1], "yes")
-            << op << " must STILL be the operator after the refusal — a "
-                     "refusal that also dropped the name would leave the "
-                     "program in the shadowed state it was refused for";
+            << "the refusal code now belongs to `defined` ALONE";
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorPredefinedMacro),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "accepted, but NEVER in silence. ✔MEASURED: gcc emits `warning: "
+               "\"" << op << "\" redefined` and clang emits `warning: redefining "
+               "builtin macro [-Wbuiltin-macro-redefined]` — and both emit the "
+               "BYTE-IDENTICAL diagnostic for `#undef __STDC__`, which is why "
+               "DSS uses one code for both arms rather than drawing a "
+               "distinction only DSS draws.";
+        // ★ THE APPLICATION IS THE CLAIM, not the acceptance. An object-like
+        // `#define` is used here on purpose: it makes the definition's EFFECT
+        // observable as a lexeme, so an accept-and-ignore implementation (which
+        // is what cl does for the `#undef` half) cannot pass this arm.
+        ASSERT_EQ(lexs.size(), 5u) << op << " — expected: int v = 5 ;";
+        EXPECT_EQ(lexs[3], "5")
+            << op << ": the definition must be APPLIED. Accepting and ignoring "
+                     "is a silent wrong answer and fails the bar outright.";
     }
 }
 
-// The `#undef` half. Symmetric, and equally load-bearing: an `#undef` that
-// SUCCEEDED would turn the operator back into an ordinary identifier folding
-// to 0 — the same include-vs-guard disagreement by a different route.
-TEST(Preprocessor, TFC86UndefOfOperatorFailsLoudEveryOperator) {
+// The `#undef` half. ★★ AND IT IS THE HALF WHERE THE REFERENCES SPLIT ON
+// MEANING, WHICH REFUTES ONE HALF OF THE MEASUREMENT THIS ROW'S RULING WAS
+// ASKED ON (the row records "all four ... APPLY it"). ✔MEASURED 2026-09-04,
+// `#undef __has_include` then `#ifdef __has_include`:
+//   gcc 13.3.0 (WSL)    warns, rc 0, #ifdef FALSE  -> APPLIES
+//   gcc 13.2.0 (mingw)  warns, rc 0, #ifdef FALSE  -> APPLIES
+//   clang 18.1.3        warns, rc 0, #ifdef FALSE  -> APPLIES
+//   cl 19.51.36252      SILENT, rc 0, #ifdef TRUE  -> IGNORES IT
+// Acceptance is unanimous; MEANING is 3-1. DSS follows the three on the
+// tie-break [[D-PP-VA-SPECIAL-IDENTIFIER-NAME-POSITIONS-REFUSED-ABOVE-THE-UNION]]
+// already ruled in this same function: a reference that SILENTLY DISCARDS code
+// the author wrote does not get to be the model.
+TEST(Preprocessor, TFC86UndefOfOperatorIsAcceptedAndAppliedEveryOperator) {
     for (std::string const& op : tfc86DeclaredOperators()) {
         PreprocessResult r;
         auto lexs = ppLexemes(
             "#undef " + op + "\n"
             "#ifdef " + op + "\nint yes;\n#else\nint no;\n#endif\n", r);
-        EXPECT_TRUE(hasPPCode(
-            r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
-            << "#undef " << op << " must fail LOUD";
+        EXPECT_FALSE(r.diagnostics->hasErrors()) << "#undef " << op;
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorPredefinedMacro),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "#undef " << op << " must diagnose, and only warn";
         ASSERT_EQ(lexs.size(), 3u) << op;
-        EXPECT_EQ(lexs[1], "yes")
-            << op << " must survive the refused #undef";
+        EXPECT_EQ(lexs[1], "no")
+            << op
+            << ": the `#undef` must TAKE EFFECT. An operator lives in the CONFIG,"
+               " not in the macro table, so `table_.erase` cannot reach it — this"
+               " arm is what proves the engine records the revocation instead of"
+               " emitting a warning that changes nothing, which would be worse"
+               " than the refusal it replaced.";
     }
 }
 
-// The refusal is UNSUPPRESSABLE: `--suppress` of it would restore exactly the
-// silent include-vs-guard disagreement it exists to prevent.
+// The refusal code SURVIVES, with exactly ONE client, and it is the one its
+// name is TRUE about. ✔MEASURED 2026-09-04: `#define defined 1` and `#undef
+// defined` are a hard ERROR (rc 1) on gcc 13.3.0, gcc 13.2.0 (mingw) and clang
+// 18.1.3; only cl 19.51 accepts, with C4117, and then IGNORES the directive —
+// the silently-drops-the-author's-code failure class this project refuses. 3-1
+// REFUSE, and it is different in KIND rather than in strictness: C23 6.10.2
+// makes `defined` an OPERATOR inside `#if`, so admitting it as a macro name
+// makes conditional inclusion unparseable.
+//
+// ⚠ AND THIS REFUSAL IS NEW, NOT PRESERVED. ✔MEASURED at this row's base commit
+// b1f31420 through the shipped CLI: `#define defined 1` compiled rc 0, in
+// SILENCE — `isConditionalInclusionOperator` deliberately excluded
+// `definedOperator`, so nothing refused it, while `preprocess_config.hpp`'s own
+// comment asserted "that refusal lives in the conditional-inclusion-operator
+// guard". A comment claiming a guard that does not exist.
+TEST(Preprocessor, DefineOrUndefOfTheDefinedOperatorIsRefused) {
+    auto schema = cSubset();
+    std::string const& definedKw = schema->preprocess().definedOperator;
+    ASSERT_FALSE(definedKw.empty())
+        << "the shipped c must declare `defined`; without it this test measures "
+           "nothing";
+    for (std::string const& src :
+         {"#define " + definedKw + " 1\nint v = 0;\n",
+          "#undef " + definedKw + "\nint v = 0;\n"}) {
+        PreprocessResult r;
+        (void)ppLexemes(src, r);
+        EXPECT_TRUE(hasPPCode(
+            r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+            << "must fail LOUD:\n" << src;
+        EXPECT_EQ(ppCodeSeverity(
+                      r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Error})
+            << "an Error, not a warning — unlike its operator siblings, and the "
+               "SEVERITY DIFFERENCE IS CONFIG DATA "
+               "(`preprocess.reservedIdentifiers.definedOperator`), not an `if` "
+               "in the engine:\n" << src;
+    }
+}
+
+// ★★★ THE ACCEPTANCE CRITERION OF [[D-PP-HAS-EXTENSION-BUILTIN-ABSENT]]'s
+// SECOND RULING, MACHINE-CHECKED: **THE `__STDC__` ARM AND THE OPERATOR ARM
+// READ THE SAME DECLARATION.**
+//
+// The defect the ruling is about was never the severity. It was that ONE
+// FUNCTION answered the identical error-vs-warning question TWO different ways —
+// `handleDefine`'s predefined-macro arm warned and applied, carrying the comment
+// "being stricter than every reference is not rigor", while its operator arm
+// three screens below refused at Error — and nothing tied them together, so they
+// could drift again. *"Leave nothing to be done"* is part of the ruling: a fix
+// that repaired the operator shape and left the two arms independent would have
+// recreated exactly the defect the ruling is about.
+//
+// ★★ SO THIS TEST PINS THE TIE ITSELF, NOT EITHER OUTCOME. For every posture
+// verb, the two shapes must produce the IDENTICAL diagnostic code, the IDENTICAL
+// severity, and the IDENTICAL apply-or-refuse decision. Prose in a comment
+// cannot hold that; this can. A cycle that gives either arm its own severity
+// ladder, its own code, or its own fall-through rule reds here even if every
+// other test in the file still passes.
+//
+// ⚠ THE `refuse` ROW IS THE ONE THAT MATTERS MOST, because it is the pairing
+// that did NOT exist before: the predefined arm had no refusal at all and the
+// operator arm had nothing but one. Under the shared applier, declaring either
+// side `refuse` now produces the same code and the same non-application.
+TEST(Preprocessor, TheStdcArmAndTheOperatorArmReadOneDeclaration) {
+    constexpr std::string_view kStdcRow =
+        "\"name\": \"__STDC__\",            \"kind\": \"constant\", "
+        "\"value\": \"1\", \"programRedefinition\": \"warn-iso-macro\"";
+    constexpr std::string_view kOpRow =
+        "\"conditionalInclusionOperators\": \"warn-iso-macro\"";
+
+    // The shipped document must declare BOTH sides with the SAME verb, or the
+    // comparison below is measuring two different questions.
+    {
+        auto schema = cSubset();
+        auto const& pp = schema->preprocess();
+        EXPECT_EQ(pp.reservedIdentifiers.conditionalInclusionOperators,
+                  PredefinedMacroRedefinition::WarnIsoMacro);
+        bool sawStdc = false;
+        for (auto const& m : pp.predefinedMacros) {
+            if (m.name == "__STDC__") {
+                sawStdc = true;
+                EXPECT_EQ(m.programRedefinition,
+                          PredefinedMacroRedefinition::WarnIsoMacro);
+            }
+        }
+        EXPECT_TRUE(sawStdc) << "the shipped c must predefine __STDC__";
+    }
+
+    struct Outcome {
+        std::optional<DiagnosticSeverity> predefinedCode;   // P_PreprocessorPredefinedMacro
+        std::optional<DiagnosticSeverity> refusalCode;      // ...OperatorNameNotDefinable
+        bool                              applied = false;  // #ifdef went FALSE
+    };
+
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    auto measure = [&](std::shared_ptr<GrammarSchema const> const& schema,
+                       std::string const& name) {
+        auto buf = SourceBuffer::fromString(
+            "#undef " + name + "\n#ifdef " + name
+                + "\nint still_here;\n#else\nint gone;\n#endif\n",
+            "main.c");
+        PreprocessResult r =
+            preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching,
+                       DiagnosticBudget::libraryDefault());
+        Outcome o;
+        o.predefinedCode =
+            ppCodeSeverity(r, DiagnosticCode::P_PreprocessorPredefinedMacro);
+        o.refusalCode = ppCodeSeverity(
+            r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable);
+        // ⚠ SCAN EVERY NON-TRIVIA TOKEN BY LEXEME, never by `CoreTokenKind::
+        // Identifier`. The preprocessor emits an alphanumeric run as `Word`
+        // (keyword-vs-identifier is resolved later, in the parser), so an
+        // Identifier-keyed scan matches NOTHING and `applied` is false for every
+        // arm — an instrument that answers an adjacent question and fails toward
+        // "not applied". It was caught only because the M3 red-on-disable
+        // RESTORE did not go green; the arm had never passed.
+        for (Token const& t : r.tokens) {
+            if (t.coreKind == CoreTokenKind::Eof) continue;
+            if (t.coreKind == CoreTokenKind::Whitespace) continue;
+            if (t.coreKind == CoreTokenKind::Newline) continue;
+            if (r.synthBuffer->slice(t.span) == "gone") o.applied = true;
+        }
+        return o;
+    };
+
+    // Every posture verb the two sides can both express, each applied to BOTH
+    // sides at once so the comparison is like-for-like.
+    for (char const* verb : {"warn-iso-macro", "ordinary", "refuse"}) {
+        std::string text = loadShippedCText();
+        ASSERT_FALSE(text.empty());
+        auto const sp = text.find(kStdcRow);
+        ASSERT_NE(sp, std::string::npos)
+            << "the shipped c config no longer carries the __STDC__ row in that "
+               "spelling; re-point this test rather than deleting it";
+        text.replace(sp, kStdcRow.size(),
+                     "\"name\": \"__STDC__\",            \"kind\": \"constant\", "
+                     "\"value\": \"1\", \"programRedefinition\": \""
+                         + std::string{verb} + "\"");
+        auto const op = text.find(kOpRow);
+        ASSERT_NE(op, std::string::npos)
+            << "the shipped c config no longer carries the "
+               "reservedIdentifiers.conditionalInclusionOperators row";
+        text.replace(op, kOpRow.size(),
+                     "\"conditionalInclusionOperators\": \"" + std::string{verb}
+                         + "\"");
+
+        auto loaded = GrammarSchema::loadFromText(
+            text, std::string{"<one-posture-"} + verb + "-c>");
+        ASSERT_TRUE(loaded.has_value())
+            << "the doubly-rebound config must LOAD for verb " << verb;
+        std::shared_ptr<GrammarSchema const> schema = *loaded;
+
+        Outcome const stdcArm = measure(schema, "__STDC__");
+        Outcome const opArm   = measure(schema, "__has_include");
+
+        EXPECT_EQ(stdcArm.predefinedCode, opArm.predefinedCode)
+            << "verb `" << verb
+            << "`: the two arms must draw the SAME advisory code at the SAME "
+               "severity. They differ, which means one of them grew its own "
+               "severity ladder — the drift the 2026-09-03 ruling exists to "
+               "close.";
+        EXPECT_EQ(stdcArm.refusalCode, opArm.refusalCode)
+            << "verb `" << verb << "`: same for the refusal code.";
+        EXPECT_EQ(stdcArm.applied, opArm.applied)
+            << "verb `" << verb
+            << "`: the two arms must make the SAME apply-or-refuse decision. A "
+               "diagnostic with no effect is the worst of both readings, and an "
+               "arm that applies while its twin refuses is the original defect.";
+
+        // ...and the pair is not vacuously equal: each verb must produce the
+        // outcome it names, or "identical" would be satisfied by both arms
+        // being broken the same way.
+        if (std::string_view{verb} == "refuse") {
+            EXPECT_EQ(opArm.refusalCode,
+                      std::optional<DiagnosticSeverity>{DiagnosticSeverity::Error});
+            EXPECT_FALSE(opArm.applied) << "a refusal must not take effect";
+        } else {
+            EXPECT_FALSE(opArm.refusalCode.has_value()) << verb;
+            EXPECT_TRUE(opArm.applied)
+                << verb << ": everything but `refuse` APPLIES";
+            EXPECT_EQ(opArm.predefinedCode.has_value(),
+                      std::string_view{verb} != "ordinary")
+                << verb << ": `ordinary` is the silent verb, the others warn";
+        }
+    }
+}
+
+// ★ THE POSTURE IS DATA, AND THIS IS THE ARM THAT PROVES IT. Rebinding the
+// declared posture for `defined` from `refuse` to the warn-and-apply verb must
+// move the BEHAVIOUR, with no engine edit. If a later cycle re-hardcodes the
+// severity, the rebound schema keeps refusing and this reds.
+//
+// ⚠ REMOVE-DIRECTION, deliberately: the mutant takes a refusal AWAY from a
+// config that has it. An ADD-direction fixture (declaring a posture a config
+// lacks) stays green when the real config loses the feature.
+TEST(Preprocessor, ReservedIdentifierPostureIsConfigDrivenNotHardcoded) {
+    auto schema = reboundC("\"definedOperator\":               \"refuse\"",
+                           "\"definedOperator\":               \"warn-iso-macro\"",
+                           "<rebound-defined-posture-c>");
+    ASSERT_NE(schema, nullptr);
+
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    auto buf = SourceBuffer::fromString(
+        std::string{"#define defined 1\nint v = 0;\n"}, "main.c");
+    PreprocessResult r = preprocess(buf, schema, noDirs,
+                                    dss::kDefaultHeaderNameMatching,
+                                    DiagnosticBudget::libraryDefault());
+    EXPECT_FALSE(hasPPCode(
+        r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+        << "with the posture rebound to the warn verb, the engine must stop "
+           "refusing — the severity comes from `.lang.json`, never from a "
+           "literal in the directive handler";
+    EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorPredefinedMacro),
+              std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+        << "and it must still diagnose: the rebound posture selects the "
+           "SEVERITY, not silence";
+}
+
+// The refusal is UNSUPPRESSABLE: `--suppress` of it would let a program take
+// over `defined` with nothing said, after which every `#if defined(X)` in the
+// translation unit means something else.
 TEST(Preprocessor, TFC86OperatorNameRefusalIsUnsuppressable) {
     EXPECT_TRUE(isUnsuppressable(
         DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
-        << "suppressing this code re-opens the silent miscompile channel";
+        << "suppressing this code lets a program silently take over `defined`";
 }
 
 // AGNOSTICISM (opt-OUT). With `hasIncludeOperator` stripped from config, DSS no
@@ -9568,17 +11653,28 @@ TEST(Preprocessor, TFC86PreScanDefinednessGatesTheAngleSourceSplice) {
     fs::remove_all(inc, ec);
 }
 
-// The pre-scan's SECOND guard, pinned on its own for the same reason. Here the
-// shadowing `#define` IS present but UNGUARDED, so `sbNameDefined` cannot be
-// what saves it (the operator is defined either way): what must hold is that
-// the pre-scan REFUSES to record the operator into `localMacros`. If it
-// recorded it, FIX-3 would see a function-like macro in the following
-// `#if __has_include(<...>)` guard, go conservative-uncertain, and skip the
-// splice — reproducing the F001A cascade with the definedness fix in place.
+// ★★★ RENAMED AND REVERSED ([[D-PP-HAS-EXTENSION-BUILTIN-ABSENT]]). This was
+// `TFC86PreScanRefusesToRecordAShadowingOperatorDefine`, and its whole premise
+// was that the AUTHORITATIVE pass refused the unguarded shadow — so a pre-scan
+// that recorded it would disagree with the pass that decides. The 2026-09-03
+// ruling inverted the premise: the authoritative pass now APPLIES the
+// definition, so a pre-scan that still filtered it out would produce EXACTLY
+// the two-verdicts-on-one-file disagreement the old filter existed to prevent,
+// pointing the other way.
 //
-// RED-ON-DISABLE: MEASURED — dropping the `isConditionalInclusionOperator`
-// filter from the pre-scan's `#define` arm reds this test.
-TEST(Preprocessor, TFC86PreScanRefusesToRecordAShadowingOperatorDefine) {
+// ★★ THE INVARIANT IS UNCHANGED AND IT IS THE ONLY THING THIS TEST EVER
+// PINNED: the pre-scan and the authoritative pass must reach the SAME macro
+// state on the same input. What changed is which state that is. Here the
+// program really does shadow the operator, so the guard answers 0, the include
+// is NOT taken, and `NOREC_MARKER` must NOT expand — which is what gcc 13.3.0,
+// gcc 13.2.0 (mingw) and clang 18.1.3 all do on this exact source (✔MEASURED:
+// the guarded `__has_include` answers 0 after the `#define` while an untouched
+// control answers 1 for the same header).
+//
+// RED-ON-DISABLE: MEASURED — restore the `isConditionalInclusionOperator`
+// filter on the pre-scan's `#define` arm and the pre-scan splices the header
+// the authoritative pass skipped, so `norec_sym` reappears and this reds.
+TEST(Preprocessor, TFC86PreScanAppliesAShadowingOperatorDefineLikeTheAuthoritativePass) {
     namespace fs = std::filesystem;
     auto inc = ppScratchRoot() / "dss_tfc86_prescan_norecord";
     std::error_code ec;
@@ -9587,28 +11683,54 @@ TEST(Preprocessor, TFC86PreScanRefusesToRecordAShadowingOperatorDefine) {
     { std::ofstream(inc / "norec.h", std::ios::binary)
         << "#define NOREC_MARKER 7373\nint norec_sym;\n"; }
 
+    auto has = [](std::vector<std::string> const& lexs, std::string_view s) {
+        for (auto const& l : lexs) if (l == s) return true;
+        return false;
+    };
+
+    // ★ THE CONTROL, and it is not optional: without it "the header was not
+    // spliced" is equally consistent with "the header was never findable".
+    {
+        PreprocessResult ctl;
+        auto ctlLexs = ppLexemesWithDirs(
+            "#if __has_include(<norec.h>)\n"
+            "#include <norec.h>\n"
+            "#endif\n"
+            "int u = NOREC_MARKER;\n",
+            ctl, {inc}, {});
+        ASSERT_FALSE(ctl.diagnostics->hasErrors());
+        ASSERT_TRUE(has(ctlLexs, "norec_sym"))
+            << "CONTROL: with the operator untouched the header IS found and "
+               "spliced — so a miss below is the #define taking effect, not a "
+               "missing header";
+        ASSERT_TRUE(has(ctlLexs, "7373"));
+    }
+
     PreprocessResult r;
     auto lexs = ppLexemesWithDirs(
-        "#define __has_include(x) 0\n"      // UNGUARDED — refused, and refused
-        "#if __has_include(<norec.h>)\n"    // loudly (asserted below)
+        "#define __has_include(x) 0\n"      // UNGUARDED — accepted, diagnosed,
+        "#if __has_include(<norec.h>)\n"    // and APPLIED
         "#include <norec.h>\n"
         "#endif\n"
         "int u = NOREC_MARKER;\n",
         r, {inc}, {});
 
-    EXPECT_TRUE(hasPPCode(
-        r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
-        << "the unguarded shadow must be refused LOUDLY";
-    auto has = [&](std::string_view s) {
-        for (auto const& l : lexs) if (l == s) return true;
-        return false;
-    };
-    EXPECT_TRUE(has("norec_sym"))
-        << "the refused #define must leave the operator INTACT in the pre-scan "
-           "too — a pre-scan that recorded it would go FIX-3-uncertain on the "
-           "next guard and skip this splice";
-    EXPECT_TRUE(has("7373"))
-        << "NOREC_MARKER must EXPAND — the splice really happened";
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "the unguarded shadow is ACCEPTED by every reference, so DSS accepts "
+           "it too";
+    EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorPredefinedMacro),
+              std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+        << "accepted, never in silence";
+    EXPECT_FALSE(has(lexs, "norec_sym"))
+        << "the program's own macro answered 0, so the include must NOT be "
+           "taken — in the PRE-SCAN as well as in the authoritative pass. A "
+           "pre-scan that filtered the #define out would splice a header the "
+           "deciding pass skipped: one program, two verdicts on one file.";
+    EXPECT_FALSE(has(lexs, "7373"))
+        << "and nothing from the un-taken header may reach the token stream";
+    EXPECT_TRUE(has(lexs, "NOREC_MARKER"))
+        << "the un-expanded macro NAME must survive — which is what gcc, mingw "
+           "gcc and clang leave here too";
     fs::remove_all(inc, ec);
 }
 
@@ -11264,21 +13386,70 @@ namespace {
 }
 } // namespace
 
-TEST(PreprocessorVaOpt, InANonVariadicFunctionLikeMacroFailsLoud) {
+// ★★ RENAMED AND REVERSED, NOT DELETED
+// ([[D-PP-VA-SPECIAL-IDENTIFIER-IN-A-NONVARIADIC-BODY-REFUSED-ABOVE-THE-UNION]],
+// P54 lane `ob`). These two were `InANonVariadicFunctionLikeMacroFailsLoud` and
+// `InAnObjectLikeMacroFailsLoud`, and they pinned FC18a's refusal of the va-opt
+// spelling in a non-variadic replacement list. THE OPERATOR RULED 2026-09-02
+// that the position is ACCEPTED AND WARNED, so the old names asserted the
+// opposite of the truth -- a test name is a claim, and one that says `FailsLoud`
+// over a body pinning acceptance is the comment-rot defect class with a build
+// step. The SOURCES are unchanged so the two verdicts are directly comparable.
+//
+// ✔MEASURED 2026-09-02, each reference invoked SEPARATELY, DEFAULT settings, on
+// THESE EXACT SOURCES:
+//
+//   source                                gcc/mingw expansion   clang        cl
+//   #define NV(X) v( X __VA_OPT__(,) )    v( 1 __VA_OPT__(,) )  v( 1 )       v( 1(,) )
+//   #define OL __VA_OPT__(x)              __VA_OPT__(x)         __VA_OPT__(x) (x)
+//
+// All four rc 0, all four warn (cl: C5108). DSS keeps the spelling VERBATIM,
+// which is gcc's and mingw gcc's answer on both rows and clang's on the second.
+// The construct is INERT outside a variadic macro -- there is no
+// va-opt-replacement there for 6.10.5.1p3 to constrain -- so `isVaOptName`'s
+// `def.isVariadic` requirement, which predates this change, already gave the
+// right meaning and only the definition-time refusal had to go.
+TEST(PreprocessorVaOpt, InANonVariadicFunctionLikeMacroIsInertAndWarns) {
     PreprocessResult r;
-    (void)ppLexemes("#define NV(X) v( X __VA_OPT__(,) )\nNV(1)\n", r);
-    EXPECT_TRUE(r.diagnostics->hasErrors());
+    auto lexs = ppLexemes("#define NV(X) v( X __VA_OPT__(,) )\nNV(1)\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "every reference compiles this at its default settings, so refusing "
+           "puts DSS above the union: "
+        << ppAllMessages(r);
+    EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                    DiagnosticSeverity::Warning),
+              1u)
+        << "accepting must not go SILENT -- 6.10.5p5 is still a constraint and "
+           "all four references diagnose it, once, at the replacement list";
     std::string const m = ppAllMessages(r);
     EXPECT_NE(m.find("__VA_OPT__"), std::string::npos)
         << "the diagnostic must NAME the construct, not say \"expected ')'\": " << m;
     EXPECT_NE(m.find("variadic"), std::string::npos) << m;
+    // v ( 1 __VA_OPT__ ( , ) )
+    ASSERT_EQ(lexs.size(), 8u) << "expected: v ( 1 __VA_OPT__ ( , ) )";
+    EXPECT_EQ(lexs[3], "__VA_OPT__")
+        << "the spelling is an ORDINARY IDENTIFIER here and passes through "
+           "verbatim -- gcc 13.3.0 and gcc 13.2.0 (mingw) both emit "
+           "`v( 1 __VA_OPT__(,) )`. ⚠ clang 18.1.3 ELIDES it (`v( 1 )`) and cl "
+           "19.51.36252 DELETES the token (`v( 1(,) )`); DSS follows neither, "
+           "because both silently drop what the author wrote";
+    EXPECT_EQ(lexs[2], "1")
+        << "and the declared parameter still substitutes normally";
 }
 
-TEST(PreprocessorVaOpt, InAnObjectLikeMacroFailsLoud) {
+TEST(PreprocessorVaOpt, InAnObjectLikeMacroIsInertAndWarns) {
     PreprocessResult r;
-    (void)ppLexemes("#define OL __VA_OPT__(x)\nOL\n", r);
-    EXPECT_TRUE(r.diagnostics->hasErrors());
+    auto lexs = ppLexemes("#define OL __VA_OPT__(x)\nOL\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors()) << ppAllMessages(r);
+    EXPECT_EQ(ppCountCodeAtSeverity(r, DiagnosticCode::P_PreprocessorDirective,
+                                    DiagnosticSeverity::Warning),
+              1u);
     EXPECT_NE(ppAllMessages(r).find("__VA_OPT__"), std::string::npos);
+    // __VA_OPT__ ( x )
+    ASSERT_EQ(lexs.size(), 4u) << "expected: __VA_OPT__ ( x )";
+    EXPECT_EQ(lexs[0], "__VA_OPT__")
+        << "gcc 13.3.0, gcc 13.2.0 (mingw) AND clang 18.1.3 all emit "
+           "`__VA_OPT__(x)` here -- 3-1 verbatim, only cl erases it";
 }
 
 TEST(PreprocessorVaOpt, WithoutAnOpeningParenFailsLoud) {
@@ -11325,16 +13496,63 @@ TEST(PreprocessorVaOpt, PasteAtEitherEndOfTheContentFailsLoud) {
     EXPECT_TRUE(hasPPCode(r2, DiagnosticCode::P_PreprocessorPaste));
 }
 
-TEST(PreprocessorVaOpt, DefineOrUndefOfTheReservedNameFailsLoud) {
-    PreprocessResult r;
-    (void)ppLexemes("#define __VA_OPT__ 1\n", r);
-    EXPECT_TRUE(r.diagnostics->hasErrors());
-    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable));
-
-    PreprocessResult r2;
-    (void)ppLexemes("#undef __VA_OPT__\n", r2);
-    EXPECT_TRUE(r2.diagnostics->hasErrors());
-    EXPECT_TRUE(hasPPCode(r2, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable));
+// ★★ RENAMED AND REVERSED, NOT DELETED
+// ([[D-PP-VA-SPECIAL-IDENTIFIER-NAME-POSITIONS-REFUSED-ABOVE-THE-UNION]], P54
+// lane vh). This was `PreprocessorVaOpt.DefineOrUndefOfTheReservedNameFailsLoud`
+// and it pinned FC18a's refusal of `#define __VA_OPT__` / `#undef __VA_OPT__`
+// with `P_PreprocessorOperatorNameNotDefinable`. The operator RULED on
+// 2026-09-02 that both are ACCEPTED and the definition HONOURED, so the old name
+// asserted the opposite of the truth -- a name is a claim, and leaving one that
+// says `FailsLoud` over a body that pins acceptance is the same defect class as
+// a comment outliving its code.
+//
+// ✔MEASURED 2026-09-02, each reference invoked SEPARATELY, with the defined name
+// NEVER USED so no reference's MEANING choice could be mistaken for a refusal:
+// `#define __VA_OPT__ 42` and `#undef __VA_OPT__` are rc 0 on gcc 13.3.0 (WSL),
+// gcc 13.2.0 (mingw-w64), clang 18.1.3 AND cl 19.51.36252 -- acceptance is
+// UNANIMOUS, so refusing put DSS above the union.
+//
+// ⚠ THE FC18a REASON THE REFUSAL GAVE IS ANSWERED, NOT OVERRULED. It held that
+// honouring the directive "would shadow a construct the engine implements,
+// leaving one spelling with two meanings". It cannot: the va-opt operator is
+// matched by CONFIG TEXT inside a variadic replacement list (`isVaOptName`) and
+// never through `table_`, so a program's `#define` reaches the macro table and
+// the operator is untouched -- which the second half of this test asserts
+// directly, and `Preprocessor.SpecialVariadicNameDefinitionDoesNotDisableTheConstruct`
+// asserts across both elision arms.
+TEST(PreprocessorVaOpt, DefineOrUndefOfTheOperatorNameIsAcceptedAndHonoured) {
+    {   // The `#define` is accepted, DIAGNOSED (6.10.5p5 is still a constraint),
+        // and takes effect.
+        PreprocessResult r;
+        auto lexs = ppLexemes("#define __VA_OPT__ 1\nint v = __VA_OPT__;\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "all four references accept this at their default settings";
+        EXPECT_FALSE(hasPPCode(
+            r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable))
+            << "that code is ERROR + unsuppressable and, since P59, belongs "
+               "to `defined` ALONE";
+        EXPECT_EQ(ppCodeSeverity(r, DiagnosticCode::P_PreprocessorDirective),
+                  std::optional<DiagnosticSeverity>{DiagnosticSeverity::Warning})
+            << "accepted, but never in silence";
+        ASSERT_EQ(lexs.size(), 5u) << "expected: int v = 1 ;";
+        EXPECT_EQ(lexs[3], "1") << "the definition must be HONOURED";
+    }
+    {   // The `#undef` is accepted and takes effect -- and the OPERATOR survives
+        // it, which is the property FC18a's refusal was protecting.
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#define __VA_OPT__ 1\n#undef __VA_OPT__\n"
+            "#define V(a, ...) (a __VA_OPT__(+ 1))\nint v = V(2, 3);\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        EXPECT_FALSE(hasPPCode(
+            r, DiagnosticCode::P_PreprocessorOperatorNameNotDefinable));
+        // int v = ( 2 + 1 ) ;
+        ASSERT_EQ(lexs.size(), 9u) << "expected: int v = ( 2 + 1 ) ;";
+        EXPECT_EQ(lexs[5], "+")
+            << "the va-opt operator is config-matched inside a variadic "
+               "replacement list and cannot be reached from the macro table, so "
+               "neither the #define nor the #undef can disturb it";
+    }
 }
 
 // ── Agnosticism: the spelling comes from CONFIG, never from the C source. ────
@@ -13465,4 +15683,427 @@ TEST(Preprocessor, ComputedIncludeTakesTheFirstCloserAndToleratesTrailingTokens)
     }
     std::error_code ec;
     fs::remove_all(inc, ec);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// D-PP-SYNTHBUILDER-PREDEFINED-DEFINEDNESS — THE PRE-SCAN'S PREDEFINED
+// DEFINEDNESS ORACLE, PINNED ON BOTH AXES.
+//
+// ★ WHAT THE ROW ORIGINALLY CLAIMED, AND WHY IT IS PINNED RATHER THAN FIXED.
+// The row (2026-07-09) said the pre-scan's bare-name check (`isDefinedTok`)
+// consulted ONLY `localMacros` while `#if defined()` (`definedCb`) also saw the
+// predefines, so the two spellings of one question took DIFFERENT branches.
+// ✔MEASURED 2026-09-03 through the shipped CLI over every predefine ORIGIN the
+// `--dump-predefined-macros` axis names (language / target / format /
+// command-line) and all four bare-name directives: they AGREE. C19
+// (`D-PP-PRESCAN-DEFINEDNESS-PARITY`) routed both through `sbNameDefined`, and
+// C21 + TF-C74 + TF-C86 widened that one oracle. What was missing was a pin, so
+// the FIRST test below is the row's own claim, held.
+//
+// ★ THE GATE MUST BE FUNCTION-LIKE, for the reason the TF-C74 pins already
+// state: an OBJECT-like predefine is materialized into `localMacros` by the C21
+// value prefix, which `sbNameDefined` consults FIRST — so an object-like gate
+// masks the predefined arm and a revert leaves the test green.
+namespace {
+
+// A function-like predefine, available on every format. `Ordinary` is STATED,
+// not defaulted: a `PredefinedMacroDef` built in C++ never passes through the
+// JSON loader that would enforce it (the same note the TF-C74 pins carry).
+[[nodiscard]] PredefinedMacroDef ppFunctionLikePredefine(std::string name) {
+    PredefinedMacroDef pm;
+    pm.name               = std::move(name);
+    pm.kind               = PredefinedMacroKind::Constant;
+    pm.value              = "";
+    pm.params             = {"x"};
+    pm.isFunctionLike     = true;
+    pm.programRedefinition = PredefinedMacroRedefinition::Ordinary;
+    return pm;
+}
+
+// Every arm below is the SAME question in a different spelling, gating the SAME
+// quote-`#include`. `marker` is present iff the header was spliced.
+[[nodiscard]] bool ppSplicedUnder(std::string const& guard,
+                                  std::span<PredefinedMacroDef const> pms,
+                                  std::span<std::filesystem::path const> dirs,
+                                  PreprocessResult& out) {
+    auto lexs = ppLexemesForTarget(guard + "\n#include \"definedness_gate.h\"\n"
+                                           "#endif\nint after;\n",
+                                   ObjectFormatKind::Elf, pms, out, dirs);
+    for (auto const& l : lexs) {
+        if (l == "MARKER_DEFINEDNESS_GATE") return true;
+    }
+    return false;
+}
+
+}   // namespace
+
+// ── AXIS 1: the row's own claim. All four bare-name directives must answer a
+// predefined macro's definedness the way `#if defined()` answers it.
+//
+// RED-ON-DISABLE (REMOVE direction): drop the `effectivePredefines` arm from
+// `SynthBuilder::sbNameDefined` — the two POSITIVE bare-name arms
+// (`#ifdef`/`#elifdef`) stop splicing while the `#if defined()` CONTROL keeps
+// its verdict, which is exactly the disagreement the row names.
+TEST(Preprocessor, PredefinedDefinednessAgreesAcrossAllFourBareNameDirectives) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_pp_definedness_parity_four";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    { std::ofstream(dir / "definedness_gate.h", std::ios::binary)
+        << "int MARKER_DEFINEDNESS_GATE = 1;\n"; }
+    std::vector<fs::path> const dirs{dir};
+    std::vector<PredefinedMacroDef> pms{ppFunctionLikePredefine("__FNPROBE__")};
+
+    struct Arm { char const* name; char const* guard; bool expectSplice; };
+    // The bare-name spelling and the `defined()` spelling of the SAME question
+    // are adjacent on purpose: a fixture exercising only one path cannot see a
+    // divergence between them, which is the whole defect class.
+    Arm const arms[] = {
+        {"#ifdef",          "#ifdef __FNPROBE__",                 true},
+        {"#if defined()",   "#if defined(__FNPROBE__)",           true},
+        {"#ifndef",         "#ifndef __FNPROBE__",                false},
+        {"#if !defined()",  "#if !defined(__FNPROBE__)",          false},
+        {"#elifdef",        "#if 0\n#elifdef __FNPROBE__",        true},
+        {"#elif defined()", "#if 0\n#elif defined(__FNPROBE__)",  true},
+        {"#elifndef",       "#if 0\n#elifndef __FNPROBE__",       false},
+        {"#elif !defined()","#if 0\n#elif !defined(__FNPROBE__)", false},
+    };
+    for (Arm const& a : arms) {
+        PreprocessResult r;
+        bool const spliced = ppSplicedUnder(a.guard, pms, dirs, r);
+        EXPECT_EQ(spliced, a.expectSplice)
+            << "arm " << a.name << ": the pre-scan's definedness oracle must "
+               "give this spelling the SAME answer as every other spelling of "
+               "the same question — two spellings disagreeing is a silent wrong "
+               "branch, not a refusal";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "arm " << a.name << ": a pre-scan that reads the group DEAD "
+               "while the authoritative pass reads it LIVE is refused here — "
+               "no arm may reach that refusal";
+    }
+    fs::remove_all(dir, ec);
+}
+
+// ── AXIS 2: `#undef` composes. THE BEHAVIOUR THIS ROW CHANGED.
+//
+// `sbNameDefined` answers for a FUNCTION-like predefine out of a walk over
+// `effectivePredefines` — a CONFIG list that no directive can subtract from —
+// while the authoritative `MacroExpander` holds the same row in `table_` (c105
+// lowers it to a `<built-in>` `#define`), where `#undef` DOES erase it. So after
+// a `#undef` the pre-scan read the name DEFINED and the real pass read it
+// UNDEFINED.
+//
+// ⚠ THE POLARITY IS THE WHOLE POINT. The tolerated skew is pre-scan MORE live;
+// `#ifdef` inverts to `#ifndef`, so an over-answering oracle reads the negative
+// spellings DEAD where the real pass reads them LIVE — the P0016 direction. It
+// did not miscompile: the authoritative pass's unresolved-live-quote-include
+// arm refused it. ✔MEASURED 2026-09-03 through the shipped CLI: `#undef
+// __declspec` (c.lang.json's one function-like predefine) then `#ifndef
+// __declspec` / `#elifndef __declspec` / `#if !defined(__declspec)` gating a
+// quote-`#include` was a HARD `P_PreprocessorIncludeError`, where mingw-w64 gcc
+// 13.2.0, WSL gcc 13.3.0 and clang 18.1.3 all compile and run the program (all
+// three exit 42; probed separately).
+//
+// RED-ON-DISABLE (REMOVE direction): drop the `undefinedNames` guard from
+// `sbNameDefined` — every arm below stops splicing AND raises
+// `P_PreprocessorIncludeError`, while the AXIS-1 test stays green (it has no
+// `#undef`), which is what makes this a pin on the fix and not on the oracle.
+TEST(Preprocessor, UndefOfAFunctionLikePredefineComposesInThePreScan) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_pp_definedness_undef_composes";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    { std::ofstream(dir / "definedness_gate.h", std::ios::binary)
+        << "int MARKER_DEFINEDNESS_GATE = 1;\n"; }
+    std::vector<fs::path> const dirs{dir};
+    std::vector<PredefinedMacroDef> pms{ppFunctionLikePredefine("__FNPROBE__")};
+
+    struct Arm { char const* name; char const* guard; bool expectSplice; };
+    Arm const arms[] = {
+        // The three NEGATIVE spellings — the P0016-direction arms this fixes.
+        {"#undef + #ifndef",
+         "#undef __FNPROBE__\n#ifndef __FNPROBE__",                    true},
+        {"#undef + #if !defined()",
+         "#undef __FNPROBE__\n#if !defined(__FNPROBE__)",              true},
+        {"#undef + #elifndef",
+         "#undef __FNPROBE__\n#if 0\n#elifndef __FNPROBE__",           true},
+        // The three POSITIVE spellings — the mirror. A `#undef`ed name must now
+        // read UNDEFINED here too, so these must NOT splice. Without them the
+        // test would pass on an oracle that simply answered "defined" never.
+        {"#undef + #ifdef",
+         "#undef __FNPROBE__\n#ifdef __FNPROBE__",                     false},
+        {"#undef + #if defined()",
+         "#undef __FNPROBE__\n#if defined(__FNPROBE__)",               false},
+        {"#undef + #elifdef",
+         "#undef __FNPROBE__\n#if 0\n#elifdef __FNPROBE__",            false},
+    };
+    for (Arm const& a : arms) {
+        PreprocessResult r;
+        bool const spliced = ppSplicedUnder(a.guard, pms, dirs, r);
+        EXPECT_EQ(spliced, a.expectSplice)
+            << "arm " << a.name << ": a LIVE `#undef` must subtract from the "
+               "pre-scan's predefined arm exactly as it subtracts from the "
+               "authoritative `table_`";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+            << "arm " << a.name << ": the pre-scan reading the group DEAD while "
+               "the real pass reads it LIVE is what raises this code";
+    }
+    fs::remove_all(dir, ec);
+}
+
+// ── AXIS 2, the ORDERING control. The `#undef` record must not be STICKY: a
+// later `#define` of the same name re-defines it. Without this the fix could be
+// implemented as a permanent poison and still pass the test above.
+// ✔The reference agrees: mingw-w64 gcc 13.2.0 compiles and runs the same shape
+// over its own predefined `__declspec` and exits 42 (MEASURED 2026-09-03).
+TEST(Preprocessor, UndefThenRedefineOfAPredefineIsDefinedAgainInThePreScan) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_pp_definedness_undef_redefine";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    { std::ofstream(dir / "definedness_gate.h", std::ios::binary)
+        << "int MARKER_DEFINEDNESS_GATE = 1;\n"; }
+    std::vector<fs::path> const dirs{dir};
+    std::vector<PredefinedMacroDef> pms{ppFunctionLikePredefine("__FNPROBE__")};
+
+    PreprocessResult r;
+    EXPECT_TRUE(ppSplicedUnder("#undef __FNPROBE__\n#define __FNPROBE__(x)\n"
+                               "#ifdef __FNPROBE__",
+                               pms, dirs, r))
+        << "`localMacros` is consulted BEFORE the `#undef` record, so a "
+           "re-definition wins with no ordering hazard";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError));
+    fs::remove_all(dir, ec);
+}
+
+// ── AXIS 2, the CROSS-BUILDER control. The `#undef` record is shared BY
+// REFERENCE across the whole builder tree, like `localMacros` beside it — a
+// `#undef` reached through a nested quote-`#include` must be visible to the
+// PARENT's later guard, in document order.
+//
+// ★ THIS IS PINNED BECAUSE THE EXACT PROPERTY BROKE BEFORE, one field over.
+// `localMacros` was per-builder until TF-C60 (D-PP-PRESCAN-CROSS-BUFFER-MACRO-STATE):
+// a `#define` arriving via a nested include was invisible to the parent's later
+// `#if`, the guard folded 0, and the gated quote-`#include` was SILENTLY DROPPED
+// (sqlite os_unix.c). A per-builder `#undef` record would put the new field back
+// in exactly that shape — over-answering inside the header's own scope only —
+// and nothing else in this file would notice.
+// ✔The reference agrees: mingw-w64 gcc 13.2.0 runs the same shape (a header that
+// `#undef`s its own predefined `__declspec`, then the includer's `#ifndef`-gated
+// quote-include) and exits 42; DSS matches (MEASURED 2026-09-03).
+TEST(Preprocessor, UndefInsideAHeaderReachesTheParentsLaterGuardInThePreScan) {
+    namespace fs = std::filesystem;
+    auto dir = ppScratchRoot() / "dss_pp_definedness_undef_crossbuilder";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    { std::ofstream(dir / "definedness_gate.h", std::ios::binary)
+        << "int MARKER_DEFINEDNESS_GATE = 1;\n"; }
+    { std::ofstream(dir / "undefs_the_predefine.h", std::ios::binary)
+        << "#undef __FNPROBE__\n"; }
+    std::vector<fs::path> const dirs{dir};
+    std::vector<PredefinedMacroDef> pms{ppFunctionLikePredefine("__FNPROBE__")};
+
+    PreprocessResult r;
+    EXPECT_TRUE(ppSplicedUnder("#include \"undefs_the_predefine.h\"\n"
+                               "#ifndef __FNPROBE__",
+                               pms, dirs, r))
+        << "a `#undef` performed by a CHILD builder must reach the parent's "
+           "later guard — a per-builder record would leave the parent still "
+           "answering DEFINED and skip this splice";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError));
+
+    // The MIRROR, so the arm above cannot pass on a builder that simply answers
+    // "undefined" for everything: WITHOUT the child's `#undef` the same guard
+    // must NOT splice.
+    PreprocessResult r2;
+    EXPECT_FALSE(ppSplicedUnder("#ifndef __FNPROBE__", pms, dirs, r2));
+    EXPECT_FALSE(hasPPCode(r2, DiagnosticCode::P_PreprocessorIncludeError));
+    fs::remove_all(dir, ec);
+}
+
+// ── [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]] (the P0 arm) /
+//    [[D-CSUBSET-CHAR-HIGHBYTE-ICE-SIGNEDNESS]] ────────────────────────────────
+//
+// C 6.10.1p4 makes a character constant in a `#if` an `int`; C 6.4.4.4p10 says
+// WHICH int, and it is not the code unit: `'\xff'` is -1 where the target
+// declares plain `char` SIGNED and +255 where it declares it UNSIGNED. This
+// evaluator used to hand the raw code unit to the fold, so `#if '\xff' < 0`
+// took the `#else` arm on EVERY target. ✔MEASURED at b1f31420 through the
+// shipped CLI on `x86_64:elf64-x86_64-linux-exec`: rc 0, ZERO diagnostics, and a
+// different program compiled than the one gcc 13.3.0 and clang 18.1.3 compile
+// (both take the `#if` arm; each probed separately, and MSVC 19.51 agrees with a
+// non-vacuous control).
+//
+// ⚠ THE THREE ARMS BELOW ARE ONE TEST BECAUSE ANY ONE OF THEM ALONE PASSES FOR
+// THE WRONG REASON. The signed arm alone is satisfied by hard-coding signed; the
+// unsigned arm alone is satisfied by the ORIGINAL defect (the raw code unit IS
+// the unsigned answer); and the target-less arm is what pins that "no answer"
+// means REFUSE rather than "pick one". Only all three together say the value is
+// being read from the declaration.
+TEST(Preprocessor, HighByteCharConstantInIfTakesItsSignFromTheTarget) {
+    auto schema = cSubset();
+    std::vector<std::filesystem::path> noDirs;
+    auto const evalUnder = [&](std::optional<bool> charIsUnsigned) {
+        auto buf = SourceBuffer::fromString(
+            "#if '\xff' < 0\n"
+            "int NEGATIVE;\n"
+            "#else\n"
+            "int NONNEGATIVE;\n"
+            "#endif\n", "main.c");
+        PreprocessResult r = preprocess(
+            buf, schema, noDirs, dss::kDefaultHeaderNameMatching,
+            DiagnosticBudget::libraryDefault(), {}, std::nullopt, {}, {}, {},
+            charIsUnsigned);
+        std::vector<std::string> lexs;
+        for (Token const& t : r.tokens) {
+            if (t.coreKind == CoreTokenKind::Eof) continue;
+            if (t.coreKind == CoreTokenKind::Whitespace) continue;
+            if (t.coreKind == CoreTokenKind::Newline) continue;
+            lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+        }
+        struct Out { std::vector<std::string> lexemes; bool refused; };
+        return Out{std::move(lexs),
+                   hasPPCode(r, DiagnosticCode::P_PreprocessorDirective)};
+    };
+
+    // SIGNED target (x86_64 everywhere, arm64 x macho): `'\xff'` is -1 < 0.
+    auto const signedArm = evalUnder(false);
+    EXPECT_FALSE(signedArm.refused);
+    EXPECT_NE(std::find(signedArm.lexemes.begin(), signedArm.lexemes.end(),
+                        std::string{"NEGATIVE"}),
+              signedArm.lexemes.end())
+        << "on a signed-`char` target `#if '\xff' < 0` must take the `#if` arm "
+           "(C 6.4.4.4p10 — the constant's value is -1, not the code unit 255)";
+    EXPECT_EQ(std::find(signedArm.lexemes.begin(), signedArm.lexemes.end(),
+                        std::string{"NONNEGATIVE"}),
+              signedArm.lexemes.end());
+
+    // UNSIGNED target (arm64 x elf — the one DSS ships): `'\xff'` is +255.
+    auto const unsignedArm = evalUnder(true);
+    EXPECT_FALSE(unsignedArm.refused);
+    EXPECT_NE(std::find(unsignedArm.lexemes.begin(), unsignedArm.lexemes.end(),
+                        std::string{"NONNEGATIVE"}),
+              unsignedArm.lexemes.end())
+        << "on an unsigned-`char` target the SAME source must take the `#else` "
+           "arm — this is the leg where the defect and the fix agree, so it is "
+           "here to prove the answer is READ and not hard-coded";
+    EXPECT_EQ(std::find(unsignedArm.lexemes.begin(), unsignedArm.lexemes.end(),
+                        std::string{"NEGATIVE"}),
+              unsignedArm.lexemes.end());
+
+    // NO target supplied (the LSP / FFI header parser / direct-API callers):
+    // the answer is target-dependent and unknown, so REFUSE — never guess.
+    auto const noTargetArm = evalUnder(std::nullopt);
+    EXPECT_TRUE(noTargetArm.refused)
+        << "a character constant above 0x7F in `#if` has a target-dependent "
+           "value; with no target threaded the fold must fail LOUD rather than "
+           "silently pick a sign";
+}
+
+// The COMPANION that keeps the arm above from being over-broad: a 0-127 body is
+// the SAME integer under both readings, so it must fold with no target at all.
+// Without this, "refuse when the target is absent" could quietly have been
+// widened to every character constant — which would break the LSP, the FFI
+// header parser and ~180 direct-API call sites for a question that has only one
+// answer. It is also why the corpus (sqlite included) never saw this defect.
+TEST(Preprocessor, AsciiCharConstantInIfNeedsNoTargetBecauseItCannotDiffer) {
+    auto schema = cSubset();
+    std::vector<std::filesystem::path> noDirs;
+    auto buf = SourceBuffer::fromString(
+        "#if 'A' == 65\n"
+        "int ASCII_OK;\n"
+        "#endif\n", "main.c");
+    PreprocessResult r = preprocess(
+        buf, schema, noDirs, dss::kDefaultHeaderNameMatching,
+        DiagnosticBudget::libraryDefault(), {}, std::nullopt, {}, {}, {},
+        /*charIsUnsigned=*/std::nullopt);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective));
+    bool sawMarker = false;
+    for (Token const& t : r.tokens) {
+        if (r.synthBuffer->slice(t.span) == "ASCII_OK") sawMarker = true;
+    }
+    EXPECT_TRUE(sawMarker)
+        << "`'A'` is 65 under either signedness, so it must fold with no target "
+           "threaded — the refusal is scoped to code units above 0x7F";
+}
+
+// ── THE CORPUS ANCHOR, AND IT IS THE ROW'S OWN STATED TRIGGER ────────────────
+// [[D-CSUBSET-CHAR-HIGHBYTE-ICE-SIGNEDNESS]] said its trigger was "a runtime-vs-
+// fold probe confirms a disagreement, OR A REAL PROGRAM HITS THE BOUNDARY", and
+// recorded that "0–127 bodies (all real-world usage incl. sqlite) have ZERO
+// divergence". ✔MEASURED: the second half is FALSE. `sqlite3.c` ships
+//
+//     #if 'A' == '\301'
+//
+// as its EBCDIC detection (also in `src/sqliteInt.h` and `tsrc/sqliteInt.h` —
+// three occurrences in the staged tree, found by scanning every `*.c`/`*.h` in
+// it). `'\301'` is octal 301 = 0xC1, a HIGH-BYTE narrow character constant in a
+// `#if` controlling expression: exactly the boundary the row was waiting for, in
+// the project's own corpus, all along.
+//
+// ⚠ AND IT IS FALSE UNDER BOTH READINGS, WHICH IS WHY NOTHING EVER NOTICED. On an
+// ASCII host `'A'` is 65, and `'\301'` is either -63 (signed `char`) or +193
+// (unsigned) — 65 equals neither, so the `#else` arm is taken either way and the
+// corpus built green through the entire life of the defect. That coincidence is
+// the whole reason this pin exists: the construct is REACHED constantly, so the
+// fold must keep working and must not start refusing, while the divergence it
+// could have exposed never fired.
+//
+// ✔MEASURED through the shipped CLI on `x86_64:elf64-x86_64-linux-exec` and
+// `arm64:elf64-aarch64-linux-exec`, debug and release: exit 42 (the `#else`,
+// ASCII arm) on all four, matching gcc 13.3.0, clang 18.1.3 and
+// aarch64-linux-gnu-gcc 13.3.0, each probed separately.
+TEST(Preprocessor, SqlitesEbcdicGuardIsAHighByteCharConstantAndStillFolds) {
+    auto schema = cSubset();
+    std::vector<std::filesystem::path> noDirs;
+    auto const takesAsciiArm = [&](std::optional<bool> charIsUnsigned) {
+        auto buf = SourceBuffer::fromString(
+            "#if 'A' == '\301'\n"
+            "int EBCDIC_HOST;\n"
+            "#else\n"
+            "int ASCII_HOST;\n"
+            "#endif\n", "main.c");
+        PreprocessResult r = preprocess(
+            buf, schema, noDirs, dss::kDefaultHeaderNameMatching,
+            DiagnosticBudget::libraryDefault(), {}, std::nullopt, {}, {}, {},
+            charIsUnsigned);
+        struct Out { bool ascii; bool ebcdic; bool refused; };
+        Out o{false, false,
+              hasPPCode(r, DiagnosticCode::P_PreprocessorDirective)};
+        for (Token const& t : r.tokens) {
+            auto const s = r.synthBuffer->slice(t.span);
+            if (s == "ASCII_HOST")  o.ascii  = true;
+            if (s == "EBCDIC_HOST") o.ebcdic = true;
+        }
+        return o;
+    };
+
+    // Both readings must reach the ASCII arm — the values differ (-63 vs +193)
+    // but neither equals 65, so the ANSWER is the same and sqlite is unaffected.
+    for (bool cu : {false, true}) {
+        auto const o = takesAsciiArm(cu);
+        EXPECT_FALSE(o.refused) << "charIsUnsigned=" << cu;
+        EXPECT_TRUE(o.ascii)   << "charIsUnsigned=" << cu
+            << ": 'A' is 65 and '\301' is -63 or +193 — never 65, so the ASCII "
+               "arm is taken under either reading";
+        EXPECT_FALSE(o.ebcdic) << "charIsUnsigned=" << cu;
+    }
+
+    // ⚠ THE TARGET-LESS ARM REFUSES, AND THAT IS DELIBERATE EVEN THOUGH THE
+    // ANSWER WOULD HAVE BEEN THE SAME. The refusal is scoped to the OPERAND (a
+    // code unit above 0x7F), not to the expression's answer, because deciding
+    // "would it have mattered?" requires folding the whole expression under both
+    // readings and comparing — an instrument that answers an adjacent question
+    // and fails toward `clean`. Every real compile threads the target, so this
+    // costs the corpus nothing; what it buys is that no target-less consumer can
+    // ever quietly get a `#if` arm that a target would have flipped.
+    auto const noTarget = takesAsciiArm(std::nullopt);
+    EXPECT_TRUE(noTarget.refused)
+        << "with no target threaded, a high-byte character constant in `#if` "
+           "must fail loud — the refusal keys on the OPERAND, not on whether "
+           "this particular comparison happens to be sign-agnostic";
 }

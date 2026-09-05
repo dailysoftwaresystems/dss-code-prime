@@ -318,8 +318,34 @@ bool ShippedTypeConsistency::addRealizationsOf(
 
 void ShippedTypeConsistency::walk(TypeId t, std::string_view origin,
                                   DiagnosticReporter& reporter, bool& ok) {
-    if (!t.valid()) return;
-    if (!visited_.insert(t.v).second) return;
+    // ★★ THE DESCENT COSTS HEAP, NOT HOST CALL FRAMES
+    // (feedback-no-input-proportional-recursion, operator 2026-09-02). The depth
+    // here follows the TYPE GRAPH a descriptor declares — `ptr<ptr<…>>`, a struct
+    // whose field is a struct whose field is … — and a descriptor is CONFIG the
+    // user writes, so nothing in this project bounds it. `visited_` makes the walk
+    // TERMINATE on a cycle; it never made it SHALLOW. The explicit `pending` stack
+    // reproduces the former recursion's order exactly: operands are pushed in
+    // REVERSE so they pop in declaration order, and a type is marked visited when
+    // it is POPPED, as the recursive entry marked it — so the diagnostics this
+    // emits come out in the same order they did.
+    std::vector<TypeId> pending;
+    pending.push_back(t);
+
+    while (!pending.empty()) {
+        TypeId const cur = pending.back();
+        pending.pop_back();
+        if (!cur.valid()) continue;
+        if (!visited_.insert(cur.v).second) continue;
+        walkOne(cur, origin, reporter, ok);
+        auto const kids = in_->operands(cur);
+        for (std::size_t i = kids.size(); i-- > 0;) pending.push_back(kids[i]);
+    }
+}
+
+// The per-type body of `walk`, split out so the traversal above is a plain loop
+// over a heap stack and this stays a straight-line check of ONE type.
+void ShippedTypeConsistency::walkOne(TypeId t, std::string_view origin,
+                                     DiagnosticReporter& reporter, bool& ok) {
     TypeKind const k = in_->kind(t);
     if (isTagKind(k)) {
         std::string_view const tag = in_->name(t);
@@ -357,7 +383,6 @@ void ShippedTypeConsistency::walk(TypeId t, std::string_view origin,
             }
         }
     }
-    for (TypeId child : in_->operands(t)) walk(child, origin, reporter, ok);
 }
 
 bool ShippedTypeConsistency::add(std::string_view            origin,

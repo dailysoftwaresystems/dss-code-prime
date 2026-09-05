@@ -211,6 +211,265 @@ TEST(TypeLayout, CompositeFieldsOverlapDetectsSharedBytes) {
     EXPECT_FALSE(compositeFieldsOverlap(ps, ti, kNatural16, DataModel::Ilp32));
 }
 
+// D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-UNIONS: the THIRD and last way a
+// composite's members share bytes, and the one the authority answered `false` to.
+// A union places EVERY member at byte 0 — that is what a union IS — so a union with
+// two or more sizeable members overlaps by definition. It used to reach the O(1)
+// short-circuit (no explicit offsets, no bit-fields ⇒ `false`) and be reported as
+// disjoint.
+//
+// The short-circuit's justification is a theorem about the natural/packed BYTE
+// path — `off = alignUp(off); push(off); off += size` cannot emit an intersection —
+// and a union is not laid out by that path at all: its arm places every member at 0
+// and folds a max size. The theorem was sound and was simply being applied outside
+// its domain, which is why the fix keys the short-circuit on `Struct` rather than
+// deleting it.
+//
+// RED-ON-DISABLE (the union half): restore the short-circuit to
+// `if (!explicitOffsets && !anyBitField) return false;` — i.e. drop the
+// `kind == TypeKind::Struct` conjunct — and every EXPECT_TRUE below flips while the
+// struct EXPECT_FALSEs stay green, which is what shows the conjunct is load-bearing
+// in exactly one direction.
+TEST(TypeLayout, CompositeFieldsOverlapTellsTheTruthAboutUnions) {
+    auto ti = makeInterner(1);
+    TypeId const u64 = ti.primitive(TypeKind::U64);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    TypeId const chr = ti.primitive(TypeKind::Char);
+
+    // The plain shape: `union { unsigned a; unsigned long long b; }`. Both members
+    // start at byte 0, so [0,4) and [0,8) intersect. Neither channel is present —
+    // no explicit offsets, no bit-fields — so this is exactly the case the
+    // short-circuit used to swallow.
+    std::array<TypeId, 2> const twoScalars{u32, u64};
+    TypeId const u = ti.unionType("U", twoScalars);
+    EXPECT_FALSE(ti.hasExplicitOffsets(u))
+        << "fixture precondition: NO explicit-offset channel";
+    EXPECT_TRUE(ti.scalars(u).empty())
+        << "fixture precondition: and NO bit-field channel either";
+    EXPECT_TRUE(compositeFieldsOverlap(u, ti, kNatural16, DataModel::Lp64))
+        << "a union's members share byte 0 by definition";
+
+    // The DISCRIMINATING negatives — without these the `true` above is satisfied by
+    // any implementation that simply answers `true` for every union.
+    //   * a ONE-member union has nothing to intersect with;
+    std::array<TypeId, 1> const oneScalar{u32};
+    EXPECT_FALSE(compositeFieldsOverlap(ti.unionType("U1", oneScalar), ti,
+                                        kNatural16, DataModel::Lp64))
+        << "one member cannot intersect itself";
+    //   * and the same field list as a STRUCT does not overlap, because there the
+    //     monotonic byte path really does apply. This pair is what shows the answer
+    //     comes from the LAYOUT and not from the member list.
+    EXPECT_FALSE(compositeFieldsOverlap(ti.structType("S", twoScalars), ti,
+                                        kNatural16, DataModel::Lp64))
+        << "the same members laid out as a struct are disjoint";
+
+    // The union answer is derived from a LAID-OUT type like every other, so it is
+    // ABI-dependent in the same way: `union { char c; SOMETHING; }` overlaps only
+    // when the second member is sizeable. A pointer member is 8 bytes under LP64 and
+    // 4 under ILP32 — both overlap `char` at byte 0, so the discriminating ABI case
+    // here is the SIZE of the union, not its overlap; what this pins is that the
+    // sweep really ran (a short-circuit cannot produce `true` at all).
+    std::array<TypeId, 2> const charAndPtr{chr, ti.pointer(u32)};
+    TypeId const cp = ti.unionType("CharOrPtr", charAndPtr);
+    EXPECT_TRUE(compositeFieldsOverlap(cp, ti, kNatural16, DataModel::Lp64));
+    EXPECT_TRUE(compositeFieldsOverlap(cp, ti, kNatural16, DataModel::Ilp32));
+}
+
+// D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-BITFIELDS: the SECOND channel in which a
+// composite's members share bytes. `compositeFieldsOverlap` used to answer an
+// unconditional `false` for every composite carrying no EXPLICIT offsets, so two
+// bit-fields packed into ONE byte — the plainest case of "these members share
+// bytes" the language has — were reported as disjoint by the function that calls
+// itself the authority for the question.
+//
+// RED-ON-DISABLE (the whole test): restore `if (!interner.hasExplicitOffsets(id))
+// return false;` as the first statement of `compositeFieldsOverlap` and every
+// EXPECT_TRUE below flips.
+TEST(TypeLayout, CompositeFieldsOverlapSeesBitFieldsThatShareBytes) {
+    auto ti = makeInterner(1);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    TypeId const chr = ti.primitive(TypeKind::Char);
+    std::int64_t const O = kNotBitfield;
+
+    // `struct { unsigned a:3; unsigned b:5; }` — one 4-byte unit at offset 0 with
+    // `a` at bit 0 and `b` at bit 3, so BOTH members live in BYTE 0.
+    std::array<TypeId, 2>       const twoU32{u32, u32};
+    std::array<std::int64_t, 2> const w35{3, 5};
+    TypeId const shared = ti.structType("BfShared", twoU32, w35);
+    auto const sharedLay = computeLayout(shared, ti, kGnu16, DataModel::Lp64);
+    ASSERT_TRUE(sharedLay.has_value());
+    ASSERT_EQ(sharedLay->fieldOffsets.size(), 2u);
+    ASSERT_EQ(sharedLay->bitFields.size(), 2u);
+    ASSERT_EQ(sharedLay->fieldOffsets[0], 0u);
+    ASSERT_EQ(sharedLay->fieldOffsets[1], 0u);
+    ASSERT_EQ(sharedLay->bitFields[1].bitOffset, 3u)
+        << "fixture precondition: `b` must start inside `a`'s byte";
+    EXPECT_TRUE(compositeFieldsOverlap(shared, ti, kGnu16, DataModel::Lp64));
+
+    // The PACKED twin — the header's headline example, where the whole struct IS
+    // that single shared byte (sizeof 1, pinned by
+    // `TypeInterner.PackedBitfieldCompositeLaysOutGnuTight`).
+    TypeId const packedTy = ti.forwardComposite(TypeKind::Struct, "BfPacked", 77);
+    ti.completeComposite(packedTy, twoU32, /*packed=*/true, w35);
+    auto const packedLay = computeLayout(packedTy, ti, kGnu16, DataModel::Lp64);
+    ASSERT_TRUE(packedLay.has_value());
+    ASSERT_EQ(packedLay->size, 1u) << "fixture precondition: two members, ONE byte";
+    EXPECT_TRUE(compositeFieldsOverlap(packedTy, ti, kGnu16, DataModel::Lp64));
+
+    // A UNION whose members are bit-fields: every member sits at offset 0 in bits
+    // [0, W), so they share byte 0.
+    TypeId const bfUnion = ti.unionType("BfUnion", twoU32, w35);
+    EXPECT_TRUE(compositeFieldsOverlap(bfUnion, ti, kGnu16, DataModel::Lp64));
+
+    // ★ A BIT-FIELD'S EXTENT IS ITS BITS' BYTES, NOT ITS ALLOCATION UNIT, and these
+    // two shapes are what that distinction buys. Sweeping UNIT ranges — the obvious
+    // implementation, and the one the row's own closing note prescribed — reports
+    // BOTH of them as overlapping, and both answers would be WRONG.
+    //
+    //   * `struct { unsigned a:3; char x; }`: `a`'s unit is the 4 bytes at offset 0
+    //     but its BITS are in byte 0, and `x` goes at byte 1 — INSIDE the unit,
+    //     sharing no byte with `a`. ✔MEASURED (gcc 13.3.0 + clang 18.1.3,
+    //     `-std=c17 -c`, `_Static_assert`, both rc=0): sizeof 4, `offsetof(x) == 1`.
+    std::array<TypeId, 2>       const bfThenChar{u32, chr};
+    std::array<std::int64_t, 2> const w3O{3, O};
+    TypeId const nextByte = ti.structType("BfThenChar", bfThenChar, w3O);
+    auto const nextByteLay = computeLayout(nextByte, ti, kGnu16, DataModel::Lp64);
+    ASSERT_TRUE(nextByteLay.has_value());
+    ASSERT_EQ(nextByteLay->bitFields.size(), 2u);
+    ASSERT_EQ(nextByteLay->fieldOffsets.size(), 2u);
+    ASSERT_EQ(nextByteLay->bitFields[0].unitBytes, 4u)
+        << "fixture precondition: the allocation UNIT must span bytes 0..4";
+    ASSERT_EQ(nextByteLay->fieldOffsets[1], 1u)
+        << "fixture precondition: and `x` must sit INSIDE it, at byte 1";
+    EXPECT_FALSE(compositeFieldsOverlap(nextByte, ti, kGnu16, DataModel::Lp64))
+        << "a 3-bit field occupies ONE byte, not its whole 4-byte unit";
+
+    //   * `struct { unsigned a:16; unsigned b:16; }`: ONE shared unit, and yet `a`
+    //     owns bytes [0,2) and `b` owns [2,4) — they share a UNIT, never a BYTE.
+    std::array<std::int64_t, 2> const w1616{16, 16};
+    TypeId const halves = ti.structType("BfHalves", twoU32, w1616);
+    auto const halvesLay = computeLayout(halves, ti, kGnu16, DataModel::Lp64);
+    ASSERT_TRUE(halvesLay.has_value());
+    ASSERT_EQ(halvesLay->fieldOffsets.size(), 2u);
+    ASSERT_EQ(halvesLay->bitFields.size(), 2u);
+    ASSERT_EQ(halvesLay->fieldOffsets[1], 0u)
+        << "fixture precondition: both halves must be anchored on the SAME unit";
+    ASSERT_EQ(halvesLay->bitFields[1].bitOffset, 16u);
+    EXPECT_FALSE(compositeFieldsOverlap(halves, ti, kGnu16, DataModel::Lp64))
+        << "sharing an allocation unit is NOT sharing a byte";
+
+    // ★ THE MATCHED PAIR THAT SHOWS THE `true` COMES FROM THE RIGHT MEMBERS, and it
+    // is `examples/c/bitfield_init`'s own `struct T` — the shape that corpus exists
+    // to pin. `struct { char x; unsigned a:3; unsigned b:4; }` puts x in byte 0 and
+    // anchors a's 4-byte unit at offset 0 too, so x sits INSIDE the unit; a is at
+    // bits 8..10 and b at bits 11..14, i.e. BOTH in byte 1.
+    //   * the THREE-member form overlaps — a ∩ b in byte 1;
+    //   * the TWO-member form (drop b) does NOT — x owns byte 0, a owns byte 1.
+    // A unit-range sweep answers `true` to BOTH, so the pair is exactly what
+    // separates a correct answer from one that is right for the wrong reason.
+    std::array<TypeId, 3>       const corpusT{chr, u32, u32};
+    std::array<std::int64_t, 3> const wT{O, 3, 4};
+    TypeId const tThree = ti.structType("CorpusT", corpusT, wT);
+    EXPECT_TRUE(compositeFieldsOverlap(tThree, ti, kGnu16, DataModel::Lp64))
+        << "`a:3` and `b:4` are both in byte 1";
+    std::array<TypeId, 2>       const corpusT2{chr, u32};
+    std::array<std::int64_t, 2> const wT2{O, 3};
+    TypeId const tTwo = ti.structType("CorpusT2", corpusT2, wT2);
+    auto const tTwoLay = computeLayout(tTwo, ti, kGnu16, DataModel::Lp64);
+    ASSERT_TRUE(tTwoLay.has_value());
+    ASSERT_EQ(tTwoLay->fieldOffsets.size(), 2u);
+    ASSERT_EQ(tTwoLay->bitFields.size(), 2u);
+    ASSERT_EQ(tTwoLay->fieldOffsets[1], 0u)
+        << "fixture precondition: `a`'s unit is anchored at byte 0, WITH x in it";
+    ASSERT_EQ(tTwoLay->bitFields[1].bitOffset, 8u)
+        << "fixture precondition: …but its BITS are in byte 1";
+    EXPECT_FALSE(compositeFieldsOverlap(tTwo, ti, kGnu16, DataModel::Lp64))
+        << "an ordinary field inside a bit-field's UNIT shares no BYTE with it";
+
+    // CONTROL: the same two `unsigned`s with NO bit-widths keep the O(1)
+    // short-circuit and answer `false` — so the pins above are on the bit-field
+    // channel doing something, not on the sweep reporting `true` for everything.
+    EXPECT_FALSE(compositeFieldsOverlap(ti.structType("Plain", twoU32), ti,
+                                        kGnu16, DataModel::Lp64));
+}
+
+// D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-BITFIELDS, the two members that occupy
+// NO bytes by construction. Each is its own RED-ON-DISABLE: delete the matching
+// `continue` in `compositeFieldsOverlap` and that half reports a phantom overlap.
+TEST(TypeLayout, CompositeFieldsOverlapSkipsMembersThatOccupyNoBytes) {
+    auto ti = makeInterner(1);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    TypeId const chr = ti.primitive(TypeKind::Char);
+    std::int64_t const O = kNotBitfield;
+
+    // A ZERO-WIDTH bit-field is a packing BREAK with no storage, and its
+    // `fieldOffsets` entry deliberately aliases the NEXT unit — here byte 4, where
+    // `d` lives. Charging it its declared type's 4 bytes would manufacture an
+    // overlap with `d` out of a marker that occupies nothing.
+    std::array<TypeId, 3>       const cZeroD{chr, u32, chr};
+    std::array<std::int64_t, 3> const wZero{O, 0, O};
+    TypeId const zeroWidth = ti.structType("CZeroD", cZeroD, wZero);
+    auto const zwLay = computeLayout(zeroWidth, ti, kGnuIgnored16, DataModel::Lp64);
+    ASSERT_TRUE(zwLay.has_value());
+    ASSERT_EQ(zwLay->bitFields.size(), 3u);
+    ASSERT_EQ(zwLay->fieldOffsets.size(), 3u);
+    ASSERT_EQ(zwLay->bitFields[1].unitBytes, 0u)
+        << "fixture precondition: the marker declares no storage";
+    ASSERT_EQ(zwLay->fieldOffsets[1], zwLay->fieldOffsets[2])
+        << "fixture precondition: and its offset must ALIAS the next member's";
+    EXPECT_FALSE(
+        compositeFieldsOverlap(zeroWidth, ti, kGnuIgnored16, DataModel::Lp64));
+
+    // A FLEXIBLE ARRAY MEMBER contributes no bytes (its tail is unsized) and its
+    // own `computeLayout` is nullopt BY DESIGN, so it must be skipped ahead of the
+    // un-sizeable-field refusal — otherwise every FAM-bearing bit-field struct
+    // answers a phantom conservative `true`.
+    std::array<TypeId, 2>       const bfThenFam{u32, ti.incompleteArray(i32)};
+    std::array<std::int64_t, 2> const wBfFam{3, O};
+    TypeId const famStruct = ti.structType("BfThenFam", bfThenFam, wBfFam);
+    auto const famLay = computeLayout(famStruct, ti, kGnu16, DataModel::Lp64);
+    ASSERT_TRUE(famLay.has_value());
+    ASSERT_TRUE(famLay->hasFlexibleArrayMember)
+        << "fixture precondition: the trailing member must be a FAM";
+    EXPECT_FALSE(compositeFieldsOverlap(famStruct, ti, kGnu16, DataModel::Lp64));
+}
+
+// D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-BITFIELDS, the SECOND defect the row
+// recorded: the header promises that an UN-COMPUTABLE layout answers `true` — the
+// conservative direction, so a caller keeps its LOUD refusal — but the old O(1)
+// short-circuit returned `false` before any layout was attempted, so the promise
+// held only for a composite carrying explicit offsets.
+//
+// `kNatural16` leaves `bitFieldStrategy` UNDECLARED, so a bit-field composite has
+// no computable layout under it. RED-ON-DISABLE: restore the unconditional
+// `if (!interner.hasExplicitOffsets(id)) return false;` and this answers `false` —
+// the permissive direction, over a layout nothing could verify.
+TEST(TypeLayout, CompositeFieldsOverlapIsConservativeWhenTheLayoutIsUncomputable) {
+    auto ti = makeInterner(1);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    std::array<TypeId, 2>       const twoU32{u32, u32};
+    std::array<std::int64_t, 2> const w35{3, 5};
+    TypeId const bf = ti.structType("BfNoStrategy", twoU32, w35);
+
+    ASSERT_FALSE(computeLayout(bf, ti, kNatural16, DataModel::Lp64).has_value())
+        << "fixture precondition: an undeclared bit-field strategy has no layout";
+    EXPECT_TRUE(compositeFieldsOverlap(bf, ti, kNatural16, DataModel::Lp64))
+        << "an un-verifiable layout must answer CONSERVATIVELY";
+
+    // CONTROL — a MATCHED PAIR, one type asked twice: `{unsigned a:16; unsigned
+    // b:16;}` shares an allocation unit but no BYTE, so under a realized strategy it
+    // answers `false`, and under the undeclared one it answers the conservative
+    // `true`. The difference is un-computability alone, which is what keeps the pin
+    // above from being satisfied by "a bit-field composite always answers true".
+    std::array<std::int64_t, 2> const w1616{16, 16};
+    TypeId const halves = ti.structType("BfHalvesNoStrategy", twoU32, w1616);
+    ASSERT_TRUE(computeLayout(halves, ti, kGnu16, DataModel::Lp64).has_value());
+    EXPECT_FALSE(compositeFieldsOverlap(halves, ti, kGnu16, DataModel::Lp64));
+    ASSERT_FALSE(computeLayout(halves, ti, kNatural16, DataModel::Lp64).has_value());
+    EXPECT_TRUE(compositeFieldsOverlap(halves, ti, kNatural16, DataModel::Lp64));
+}
+
 // D-CSUBSET-MEMBER-ALIGNAS: a member `alignas(16)` RAISES the field's (and thus the
 // struct's) alignment, padding the struct up to 16. `struct{alignas(16) int x;}`:
 // x@0 (int align raised to 16), struct align 16, size rounded up to 16.
@@ -559,18 +818,31 @@ TEST(TypeLayout, NestedPackedStructPacksInnerToOffsetOne) {
     EXPECT_EQ(l.size, 6u);              // 1 + 5
 }
 
-TEST(TypeLayout, PackedPlusBitfieldFailsLoud) {
+// D-CSUBSET-PACKED-BITFIELD-INTERACTION: RETARGETED from the `FailsLoud` pin this
+// test used to be. The `packed && anyBitfield -> nullopt` belt it asserted is GONE,
+// because the refusal was a conformance divergence and not a safety net: all three
+// references ACCEPT a packed aggregate carrying a bit-field (gcc 13.3.0 and clang
+// 18.1.3 through `__attribute__((packed))`, MSVC 19.51 and mingw-w64 gcc 13.2.0
+// through `#pragma pack(1)`, which is MSVC's only spelling), and both gcc and clang
+// lay THIS shape out at 5/1 — MEASURED, `_Static_assert` battery, rc=0.
+//
+// ⚠ THE PIN THAT REPLACES IT ASSERTS THE VALUE, NOT MERELY THE ABSENCE OF A REFUSAL.
+// "computeLayout returns something" would stay green over a wrong layout, which is
+// the direction that costs a miscompile rather than a diagnostic. The full per-ABI
+// matrix lives in `TypeInterner.PackedBitfieldCompositeLaysOutGnuTight` (this is its
+// case S4, offsets included); this entry keeps the layout tier honest on its own.
+TEST(TypeLayout, PackedPlusBitfieldLaysOutTight) {
     auto ti = makeInterner(1);
-    // A packed struct carrying a bit-field is UNSUPPORTED (bit-granular packed
-    // packing is a distinct algorithm) — computeLayout returns nullopt (the F5
-    // belt), the reliable backstop behind the semantic S_PackedBitfieldUnsupported.
     std::array<TypeId, 2> const fields{ti.primitive(TypeKind::I32),
                                        ti.primitive(TypeKind::U32)};
     std::array<std::int64_t, 2> const widths{-1 /*kNotBitfield*/, 3};
     TypeId const s = ti.forwardComposite(TypeKind::Struct, "S", 1);
     ti.completeComposite(s, fields, /*packed=*/true, widths);
     EXPECT_TRUE(ti.isPacked(s));
-    EXPECT_FALSE(computeLayout(s, ti, kGnu16, DataModel::Lp64).has_value());  // belt
+    auto const l = computeLayout(s, ti, kGnu16, DataModel::Lp64);
+    ASSERT_TRUE(l.has_value());
+    EXPECT_EQ(l->size, 5u);            // gcc/clang: 5   RED-ON-DISABLE (restore the belt)
+    EXPECT_EQ(l->align.bytes(), 1u);   // gcc/clang: 1
 }
 
 // ── D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): the WHOLE-COMPOSITE `aligned(N)` ──────

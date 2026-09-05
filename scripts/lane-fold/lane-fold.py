@@ -86,12 +86,20 @@ merely taken, because a gate cannot tell a deliberate POSIX-or-portable-only
 script from a forgotten twin.
 Exit codes: 0 OK · 2 refused (nothing written) · 3 usage error.
 
+⚠ THE TREE ACTED ON IS THE ONE THIS SCRIPT LIVES IN, never the caller's cwd --
+[[D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED]], see `repo_root`. `--repo <path>`
+names another tree deliberately, and works with every verb.
+
 Usage:
     python scripts/lane-fold/lane-fold.py seed <lane>           # carry the main
                                           #   tree's uncommitted state into the lane
     python scripts/lane-fold/lane-fold.py seed <lane> --empty   # created at HEAD and
                                           #   given nothing: record the manifest only
     python scripts/lane-fold/lane-fold.py fold <lane> [--apply]     # dry run without --apply
+    python scripts/lane-fold/lane-fold.py refresh-plans <lane> [--apply]
+                                          #   re-copy .plans/ into a LIVE lane and
+                                          #   update its manifest, so a row applied
+                                          #   mid-cycle stops reddening its guards
     python scripts/lane-fold/lane-fold.py list
     python scripts/lane-fold/lane-fold.py --self-test
 """
@@ -127,16 +135,52 @@ def die(msg, code=2):
     sys.exit(code)
 
 
-def repo_root():
-    """The repository root, from git rather than from a hardcoded path.
+def repo_root(anchor=None):
+    """The root of the working tree that CONTAINS THIS SCRIPT (or `anchor`).
 
     ⚠ A predecessor hardcoded `C:\\Source\\DailySoftware\\dss-code-prime`, which makes
     the tool unusable from a worktree, from any clone, and on every non-Windows leg.
+
+    ★★★ AND ITS REPLACEMENT -- a bare `git rev-parse --show-toplevel` -- TRADED THAT
+    FOR A SUBTLER WRONG ANSWER. [[D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED]]
+    A bare `rev-parse` answers "what repository is my CALLER'S SHELL in?", so `wt`,
+    `mpath`, every `os.path.join(root, rel)` a fold WRITES to, and every path it
+    REMOVES were rooted at whichever repository somebody happened to have cd'd into.
+    ✔MEASURED 2026-09-02, live, on this repository's own orchestrator: a shell that
+    had drifted into `.worktrees/io` ran the MAIN tree's copy of this script, and
+    `fold io --apply` refused with
+        no worktree at <repo>\\.worktrees\\io\\.worktrees\\io
+    -- the loud direction, by luck of the doubled path. ✔MEASURED the same day from a
+    throwaway repository outside the checkout: `list` reported THAT repository's
+    `.worktrees/`, which is the quiet direction, and a `fold` from there would have
+    measured one tree and written into another.
+
+    ★ THE QUESTION IS "WHICH TREE DOES MY OWN FILE BELONG TO?" -- `__file__`, not
+    `os.getcwd()`. `$PWD` is a property of the caller's shell; the script's path is a
+    property of the script, and only the second survives a `cd`. In the measured
+    incident this is exactly right: the orchestrator invoked the MAIN tree's copy, so
+    `__file__` names the main checkout no matter where the shell had wandered.
+    The rejected alternative -- "the MAIN checkout, because only it owns
+    `.worktrees/`" -- is recorded with its measurement in `lane-worktree.sh`'s
+    `_repo_root`; briefly, from a lane it aims a removal at a live SIBLING lane, and
+    for a submodule checkout it names a directory inside `.git`.
+
+    ⓘ ONE SPELLING PER LANGUAGE. The `.sh` and `.ps1` halves of this fix route
+    through their existing owners (`leg_tree_owning_root`, `Get-RepoTreeOwningRoot`).
+    Python's named owner is `scripts/carriage-excludes/carriage-excludes.py`, whose
+    `_git_prefix`/`_git` answer "how do I run git against a tree I have already
+    identified" -- the same adjacent question the other two owners' identity
+    functions answer, and not this one. This is the only Python caller that needs the
+    derivation, so it lives here, once, rather than in a shared module with one user.
     """
-    out = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+    if anchor is None:
+        anchor = os.path.dirname(os.path.realpath(__file__))
+    out = subprocess.run(["git", "-C", anchor, "rev-parse", "--show-toplevel"],
                          capture_output=True)
     if out.returncode != 0:
-        die("not inside a git repository (git rev-parse --show-toplevel failed).", 3)
+        die("no git working tree contains %s.\n"
+            "  This script resolves the tree IT LIVES IN, never the caller's cwd;\n"
+            "  pass --repo <path> to name a different tree deliberately." % anchor, 3)
     return os.path.realpath(out.stdout.decode("utf-8", "surrogateescape").strip())
 
 
@@ -307,9 +351,79 @@ def cmd_seed(root, lane, empty=False, force=False):
     return 0
 
 
+# ─────────────────────────────── refresh-plans ─────────────────────────────────
+
+# ★★ THE ONE TREE A LIVE LANE MAY BE RE-SEEDED FROM, AND WHY IT IS SAFE WHERE A BULK
+# RE-SEED IS NOT. `seed` refuses a working worktree because the copy overwrites files
+# the lane is mid-edit on and the lane never re-reads a file it believes it owns. That
+# reasoning is about SOURCE. `.plans/**` is different in the one way that matters: no
+# lane owns it (the orchestrator does), nothing compiles it, and no lane's binaries can
+# change because of it.
+#
+# ⚠ ✔MEASURED 2026-09-02 (P54, lane `ar`): a lane's `anchor_registry_guard` reds for an
+# anchor whose row IS registered in the main tree, because the lane holds the snapshot
+# `seed` took before the orchestrator applied that row. **A false red every lane hits**,
+# and the dangerous half is that a lane learns to discount that guard — which is the one
+# instrument that catches an id cited in `src/` with no row anywhere.
+#
+# ★ AND UPDATING THE MANIFEST IS HALF THE FIX, not bookkeeping. A refreshed path whose
+# manifest md5 is also updated becomes INHERITED at fold time, so the fold subtracts it
+# by construction. Without that, the refresh would make `.plans/` look like the lane's
+# own change and the fold would try to write a stale registry back over the live one —
+# which is what `--settled` has been working around by hand, once per lane, all cycle.
+def cmd_refresh_plans(root, lane, apply_it):
+    wt = worktree_path(root, lane)
+    mpath = manifest_path(root, lane)
+    if not os.path.isdir(wt):
+        die("no worktree at %s" % wt)
+    if not os.path.isfile(mpath):
+        die("no seed manifest at %s -- refresh only makes sense for a seeded lane"
+            % mpath)
+    seed = json.load(io.open(mpath, encoding="utf-8"))
+
+    live = sorted(q for q in set(changed_paths(root))
+                  if q.startswith(".plans/") and os.path.isfile(os.path.join(root, q)))
+    if not live:
+        print("lane-fold: the main tree has no changed .plans/ path -- nothing to refresh")
+        return 0
+
+    moved = []
+    for rel in live:
+        src, dst = os.path.join(root, rel), os.path.join(wt, rel)
+        if os.path.isfile(dst) and md5_file(dst) == md5_file(src):
+            continue
+        moved.append(rel)
+
+    # ⚠ THE LANE MUST NOT HAVE EDITED IT. If the worktree's copy differs from BOTH the
+    # seed md5 and the main tree's, something wrote it there -- refuse rather than
+    # silently discard a lane's edit to a file it was told not to touch.
+    conflicts = [rel for rel in moved
+                 if rel in seed and os.path.isfile(os.path.join(wt, rel))
+                 and md5_file(os.path.join(wt, rel)) != seed[rel]]
+    if conflicts:
+        die("the lane's own copy of %d path(s) differs from what it was seeded with, so "
+            "refreshing would DISCARD an edit made inside the worktree: %s"
+            % (len(conflicts), ", ".join(conflicts[:4])))
+
+    print("lane-fold: %d .plans/ path(s) would refresh into lane %s:" % (len(moved), lane))
+    for rel in moved:
+        print("   %s" % rel)
+    if not apply_it:
+        print("lane-fold: dry run. pass --apply to write.")
+        return 0
+
+    for rel in moved:
+        copy_atomic(os.path.join(root, rel), os.path.join(wt, rel))
+        seed[rel] = md5_file(os.path.join(wt, rel))
+    write_atomic(mpath, json.dumps(seed, indent=1, sort_keys=True))
+    print("lane-fold: REFRESHED %d path(s) and updated the manifest, so the fold now "
+          "subtracts them as INHERITED." % len(moved))
+    return 0
+
+
 # ──────────────────────────────────── fold ─────────────────────────────────────
 
-def classify(root, wt, seed):
+def classify(root, wt, seed, settled=()):
     """-> (mine, deleted, inherited, refusals). Pure measurement; writes nothing.
 
     ⚠⚠ `deleted` EXISTS BECAUSE A LANE'S DELETION USED TO VANISH AT THE FOLD.
@@ -327,6 +441,7 @@ def classify(root, wt, seed):
     the main tree's bytes must still match the seed (or the HEAD blob), or the fold
     REFUSES the whole batch rather than destroying work it cannot account for."""
     mine, deleted, inherited, refusals = [], [], [], []
+    settled_paths = []
     for rel in sorted(set(changed_paths(wt))):
         if is_lane_tree(rel):
             continue          # a nested lane tree is never this lane's contribution
@@ -358,6 +473,22 @@ def classify(root, wt, seed):
         if not inside(root, dest):
             refusals.append("escapes the repository: %s" % rel)
             continue
+        if rel in settled:
+            # ★★ DECLARED SETTLED BY HAND -- the ONE escape from an all-or-nothing
+            # refusal, and it exists because the refusal message PROMISED it and the
+            # tool did not provide it. ✔MEASURED 2026-09-02 (P54): the message says
+            # "merge the second lane's changes by hand, then re-run this fold: the
+            # remaining paths still land automatically". They cannot. The drift test
+            # compares the DESTINATION against the SEED, so a hand-merge makes the
+            # destination differ MORE, and re-running refuses identically -- twice in
+            # one cycle, on `.plans/` documents two lanes had both written.
+            # ⚠ IT IS NOT A --force. It drops ONE named path from this lane's change
+            # set so the OTHER paths can land; nothing about that path is written,
+            # and the caller is asserting they have already reconciled it themselves.
+            # Every settled path is REPORTED, because a silent skip is how a lane's
+            # work goes missing while the fold says it succeeded.
+            settled_paths.append(rel)
+            continue
         if rel in seed and md5_file(src) == seed[rel]:
             inherited.append(rel)
             continue
@@ -387,10 +518,10 @@ def classify(root, wt, seed):
                 refusals.append("untracked at HEAD yet present in the main tree: %s" % rel)
                 continue
         mine.append(rel)
-    return mine, deleted, inherited, refusals
+    return mine, deleted, inherited, refusals, settled_paths
 
 
-def cmd_fold(root, lane, apply_it):
+def cmd_fold(root, lane, apply_it, settled=()):
     wt = worktree_path(root, lane)
     mpath = manifest_path(root, lane)
     if not os.path.isdir(wt):
@@ -402,7 +533,7 @@ def cmd_fold(root, lane, apply_it):
             % (mpath, lane))
     seed = json.load(io.open(mpath, encoding="utf-8"))
 
-    mine, deleted, inherited, refusals = classify(root, wt, seed)
+    mine, deleted, inherited, refusals, settled_paths = classify(root, wt, seed, settled)
 
     if refusals:
         print("lane-fold: REFUSED -- nothing written. %d problem(s):" % len(refusals))
@@ -410,9 +541,22 @@ def cmd_fold(root, lane, apply_it):
             print("   " + r)
         print("  A DRIFT refusal is usually TWO LANES ON ONE FILE. Merge the second "
               "lane's declared changes into the main tree by hand, then re-run this "
-              "fold: the remaining paths still land automatically.")
+              "fold: then re-run naming each reconciled path\n"
+              "  `--settled <path>` (repeatable), which drops JUST those paths from "
+              "this lane's\n  change set so the rest can land. ⚠ A bare re-run will "
+              "refuse identically: the\n  drift test compares the DESTINATION against "
+              "the SEED, so merging by hand makes\n  the destination differ MORE, not "
+              "less. `--settled` is an assertion that YOU have\n  already reconciled "
+              "that path; it is not a --force, and nothing is written for it.")
         return 2
 
+    if settled_paths:
+        # Never silent: a skipped path is how a lane's work goes missing while the
+        # fold reports success.
+        print("lane-fold: %d path(s) DECLARED SETTLED BY HAND -- not written, not "
+              "compared:" % len(settled_paths))
+        for rel in settled_paths:
+            print("   %s" % rel)
     print("lane-fold: lane %s -- %d inherited path(s) skipped, %d path(s) are this "
           "lane's:" % (lane, len(inherited), len(mine)))
     for rel in mine:
@@ -544,7 +688,7 @@ def self_test():
         # (a) the lane leaves the seeded file alone and edits two of its own.
         write_atomic(os.path.join(wt, "tracked.txt"), "lane edit\n")
         write_atomic(os.path.join(wt, "a file - with spaces.md"), "lane edit\n")
-        mine, _del, inherited, refusals = classify(root, wt, seed)
+        mine, _del, inherited, refusals, _s = classify(root, wt, seed)
         pin(not refusals, "a clean fold refuses nothing", "refusals=%s" % refusals)
         pin(inherited == ["shared.json"],
             "(a) a seeded path the lane never touched is INHERITED, not folded back",
@@ -555,7 +699,7 @@ def self_test():
 
         # (b) the main tree drifts under the lane.
         write_atomic(os.path.join(root, "tracked.txt"), "someone else\n")
-        mine2, _del2, _inh2, refusals2 = classify(root, wt, seed)
+        mine2, _del2, _inh2, refusals2, _s2 = classify(root, wt, seed)
         pin(len(refusals2) == 1 and "DRIFTED from HEAD" in refusals2[0],
             "(b) a destination that drifted from HEAD is REFUSED", "got=%s" % refusals2)
         pin(cmd_fold(root, "x", apply_it=True) == 2,
@@ -569,10 +713,80 @@ def self_test():
         # the seeded document drifts too -- the two-lanes-on-one-file case.
         write_atomic(os.path.join(wt, "shared.json"), '{"from":"lane-two"}\n')
         write_atomic(os.path.join(root, "shared.json"), '{"from":"folded-one"}\n')
-        _m3, _d3, _i3, refusals3 = classify(root, wt, seed)
+        _m3, _d3, _i3, refusals3, _s3 = classify(root, wt, seed)
         pin(any("DRIFTED since seeding" in r and "shared.json" in r for r in refusals3),
             "two lanes on ONE shared document REFUSES rather than reverting the first",
             "got=%s" % refusals3)
+
+        # ── `--settled`, and the arm ORDER is the argument for it ──────────────────
+        # (k) The refusal above used to end the story: the message told the caller to
+        # merge by hand and re-run, and a bare re-run REFUSES IDENTICALLY because the
+        # drift test compares the DESTINATION to the SEED -- a hand-merge moves the
+        # destination FURTHER from the seed, never back. ✔MEASURED 2026-09-02 (P54),
+        # twice in one cycle. So the promised remedy is pinned here as a real one.
+        _m4, _d4, _i4, refusals4, settled4 = classify(
+            root, wt, seed, settled=("shared.json",))
+        # ⚠ The assertion is "no refusal NAMES shared.json", not "no refusals at all":
+        # by this point the fixture carries an unrelated drift on `tracked.txt` from an
+        # earlier arm, and a blanket `not refusals4` would pass or fail on that instead
+        # of on the property under test.
+        pin(not any("shared.json" in r for r in refusals4) and settled4 == ["shared.json"],
+            "(k) --settled drops the reconciled path so the lane's OTHER work can land",
+            "refusals=%s settled=%s" % (refusals4, settled4))
+        pin(_m4 == ["a file - with spaces.md"],
+            "(k2) ...and the paths it did NOT name are still folded",
+            "got=%s" % _m4)
+        # (l) THE CONTROL, because a flag that silently skips is worse than a refusal:
+        # the settled path must NOT be written, and the destination must keep the
+        # content the hand-merge left there.
+        cmd_fold(root, "x", apply_it=True, settled=("shared.json",))
+        pin(io.open(os.path.join(root, "shared.json"), encoding="utf-8").read()
+            == '{"from":"folded-one"}\n',
+            "(l) a --settled path is NOT written -- the hand-merged content survives",
+            "got=%r" % io.open(os.path.join(root, "shared.json"),
+                               encoding="utf-8").read())
+        write_atomic(os.path.join(root, "shared.json"), '{"from":"folded-one"}\n')
+
+        # ── `refresh-plans`, and the arm ORDER carries the argument ────────────────
+        # (m) The orchestrator applies a row to `.plans/` MID-CYCLE, so a live lane's
+        # copy goes stale and its `anchor_registry_guard` reds for an anchor that IS
+        # registered. Refreshing must fix that WITHOUT the fold then trying to write the
+        # lane's stale registry back over the live one -- which is why the manifest is
+        # updated in the same step, making the path INHERITED by construction.
+        os.makedirs(os.path.join(root, ".plans"), exist_ok=True)
+        os.makedirs(os.path.join(wt, ".plans"), exist_ok=True)
+        write_atomic(os.path.join(root, ".plans", "reg.md"), "row A\nrow B\n")
+        write_atomic(os.path.join(wt, ".plans", "reg.md"), "row A\n")
+        seed_before = json.load(io.open(manifest_path(root, "x"), encoding="utf-8"))
+        cmd_refresh_plans(root, "x", apply_it=True)
+        seed_after = json.load(io.open(manifest_path(root, "x"), encoding="utf-8"))
+        pin(io.open(os.path.join(wt, ".plans", "reg.md"), encoding="utf-8").read()
+            == "row A\nrow B\n",
+            "(m) refresh-plans carries a mid-cycle registry edit into a LIVE lane")
+        pin(seed_after.get(".plans/reg.md") != seed_before.get(".plans/reg.md")
+            and seed_after.get(".plans/reg.md") is not None,
+            "(m2) ...and UPDATES the manifest, so the fold subtracts it as inherited",
+            "before=%r after=%r" % (seed_before.get(".plans/reg.md"),
+                                    seed_after.get(".plans/reg.md")))
+        _m5, _d5, inh5, _r5, _s5 = classify(
+            root, wt, json.load(io.open(manifest_path(root, "x"), encoding="utf-8")))
+        pin(".plans/reg.md" in inh5,
+            "(m3) CONTROL: the refreshed path is INHERITED at fold time, not written back",
+            "inherited=%s" % [q for q in inh5 if q.startswith(".plans/")])
+        # (m4) THE REFUSAL: if the LANE itself edited the file, refreshing would discard
+        # that edit -- so it must refuse rather than silently overwrite.
+        write_atomic(os.path.join(root, ".plans", "reg.md"), "row A\nrow B\nrow C\n")
+        write_atomic(os.path.join(wt, ".plans", "reg.md"), "the lane wrote this\n")
+        try:
+            cmd_refresh_plans(root, "x", apply_it=True)
+            refused_lane_edit = False
+        except SystemExit as exc:
+            refused_lane_edit = exc.code == 2
+        pin(refused_lane_edit
+            and io.open(os.path.join(wt, ".plans", "reg.md"),
+                        encoding="utf-8").read() == "the lane wrote this\n",
+            "(m4) ...and REFUSES when the lane's own copy diverged from its seed, "
+            "leaving that copy untouched")
 
         # (e) THE REFUSAL THAT PROTECTS A RUNNING LANE. By this point the lane has
         # edits of its own, so a second `seed` must refuse rather than overwrite
@@ -654,18 +868,58 @@ def self_test():
             subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "add todelete"],
                            capture_output=True, check=True)
         os.remove(os.path.join(wt, "todelete.txt"))
-        m_del, d_del, _i, r_del = classify(root, wt, {})
+        m_del, d_del, _i, r_del, _s4 = classify(root, wt, {})
         pin("todelete.txt" in d_del and "todelete.txt" not in m_del
             and not [x for x in r_del if "todelete.txt" in x],
             "(h) a path the lane DELETED is measured as a deletion, not dropped",
             "deleted=%s mine=%s refusals=%s" % (d_del, m_del, r_del))
 
         write_atomic(os.path.join(root, "todelete.txt"), "someone else edited this\n")
-        _m, d_drift, _i2, r_drift = classify(root, wt, {})
+        _m, d_drift, _i2, r_drift, _s5 = classify(root, wt, {})
         pin("todelete.txt" not in d_drift
             and any("refusing to DELETE" in x and "todelete.txt" in x for x in r_drift),
             "(h) a deletion whose destination DRIFTED is REFUSED, not carried out",
             "deleted=%s refusals=%s" % (d_drift, r_drift))
+
+        # (i) THE ROOT IS THIS SCRIPT'S OWN TREE, NOT THE CALLER'S CWD.
+        # [[D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED]]
+        #
+        # ⚠⚠ THE ARM SETS A DIFFERENT CWD DELIBERATELY, AND THAT IS THE WHOLE REASON
+        # IT EXISTS. Everything above runs with the cwd wherever the caller left it
+        # and never notices, because a wrong root and a right one look identical
+        # while they agree. `root` here is a REAL repository -- `git init` above --
+        # so a cwd-keyed `repo_root()` succeeds and answers about IT, which is the
+        # quiet direction this row is about.
+        #
+        # ★ BOTH HALVES ARE ASSERTED. The positive (it names the tree holding this
+        # file) and the negative (it does NOT name the fixture) -- a positive-only
+        # pin would pass on a resolver that somehow reached both, and the negative
+        # alone would pass on one that returned nothing.
+        # ⓘ `os.chdir` is restored in a `finally`: the arms above measured with the
+        # original cwd and the temp directory is about to be deleted, so leaving the
+        # process inside it would break the cleanup on Windows.
+        mine_tree = os.path.realpath(
+            os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", ".."))
+        was = os.getcwd()
+        try:
+            os.chdir(root)
+            got = repo_root()
+        finally:
+            os.chdir(was)
+        pin(os.path.realpath(got) == mine_tree
+            and os.path.realpath(got) != os.path.realpath(root),
+            "(i) driven from ANOTHER repository's cwd, repo_root() still names the "
+            "tree THIS FILE lives in",
+            "got=%s wanted=%s cwd-was=%s" % (got, mine_tree, root))
+
+        # (j) `--repo <path>` IS THE EXPLICIT ESCAPE HATCH, and the CONTROL for (i).
+        # ⚠ Without it, (i) passes over a `repo_root` that had simply stopped being
+        # able to reach any tree but its own -- the capability the old cwd-keying
+        # provided BY ACCIDENT would have been removed rather than named, and
+        # nothing would have measured the difference.
+        pin(os.path.realpath(repo_root(root)) == os.path.realpath(root),
+            "(j) CONTROL: --repo <path> still reaches another tree, deliberately",
+            "got=%s wanted=%s" % (repo_root(root), root))
 
     print("lane-fold self-test: %d failed" % failed[0])
     return 1 if failed[0] else 0
@@ -679,12 +933,43 @@ def main(argv):
     if not argv:
         print(__doc__)
         return 3
-    verb, rest = argv[0], argv[1:]
-    root = repo_root()
+    # ── `--repo <path>` ─────────────────────────────────────────────────────────
+    # ⚠ EXTRACTED FROM THE WHOLE ARGUMENT LIST, BEFORE THE VERB IS READ, so it works
+    # on either side of the verb. A first draft scanned only `argv[1:]`, and
+    # `lane-fold.py --repo <path> fold lw` then died with "unknown verb '--repo'"
+    # while the `.sh` twin accepted the same spelling -- two halves of one tool
+    # disagreeing about their own grammar, which is a thing a caller discovers at the
+    # moment they most want the escape hatch.
+    # ⓘ THE FLAG IS THE CAPABILITY THE OLD CWD-KEYED BEHAVIOUR PROVIDED BY ACCIDENT:
+    # driving the verb at another tree used to be done by cd'ing there and hoping.
+    # Saying it out loud is the difference between a decision and a side effect.
+    override = None
+    kept = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--repo":
+            if i + 1 >= len(argv):
+                die("--repo needs a directory.", 3)
+            override, i = argv[i + 1], i + 2
+            continue
+        if argv[i].startswith("--repo="):
+            override, i = argv[i][len("--repo="):], i + 1
+            if not override:
+                die("--repo needs a directory.", 3)
+            continue
+        kept.append(argv[i])
+        i += 1
+    if not kept:
+        print(__doc__)
+        return 3
+    verb, rest = kept[0], kept[1:]
+    if override is not None and not os.path.isdir(override):
+        die("--repo %r: no such directory." % override, 3)
+    root = repo_root(override)
     if verb == "list":
         return cmd_list(root)
-    if verb not in ("seed", "fold"):
-        die("unknown verb %r -- expected seed, fold or list." % verb, 3)
+    if verb not in ("seed", "fold", "refresh-plans"):
+        die("unknown verb %r -- expected seed, fold, refresh-plans or list." % verb, 3)
     if not rest or rest[0].startswith("-"):
         die("verb %s needs a lane name." % verb, 3)
     lane = rest[0]
@@ -693,7 +978,25 @@ def main(argv):
     if verb == "seed":
         return cmd_seed(root, lane, empty="--empty" in rest,
                         force="--force" in rest)
-    return cmd_fold(root, lane, apply_it="--apply" in rest)
+    if verb == "refresh-plans":
+        return cmd_refresh_plans(root, lane, apply_it="--apply" in rest)
+    # `--settled <path>` is repeatable; see `classify` for why it exists and for the
+    # measurement that the refusal message previously promised something impossible.
+    settled, j = [], 0
+    while j < len(rest):
+        if rest[j] == "--settled":
+            if j + 1 >= len(rest):
+                die("--settled needs a repo-relative path.", 3)
+            settled.append(rest[j + 1].replace(os.sep, "/"))
+            j += 2
+            continue
+        if rest[j].startswith("--settled="):
+            value = rest[j][len("--settled="):]
+            if not value:
+                die("--settled needs a repo-relative path.", 3)
+            settled.append(value.replace(os.sep, "/"))
+        j += 1
+    return cmd_fold(root, lane, apply_it="--apply" in rest, settled=tuple(settled))
 
 
 if __name__ == "__main__":

@@ -296,11 +296,18 @@ struct DSS_EXPORT ExternDeclRef {
     // descriptor reader. Empty ⇒ unversioned. A plain string (already resolved,
     // not a per-format map), threaded verbatim to FfiMetadata.version.
     std::string_view version{};
-    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: TRUE ⇒ an EAGER shipped-descriptor
-    // import (producer C). Threaded verbatim to `FfiMetadata.isEagerImport` by
-    // the FFI synthesize/ingest stages so the eager law rides to the linker's
-    // reference gate (an eager row is kept even when unreferenced). INVARIANT:
-    // isEagerImport ⟹ library-bound. Non-eager (producers A/B) leaves it false.
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: TRUE ⇒ an EAGER import — one the
+    // linker's reference gate keeps even when no relocation references it.
+    // Threaded verbatim to `FfiMetadata.isEagerImport` by the FFI
+    // synthesize/ingest stages, which are CONDUITS and never decide it.
+    // ⚠ NO PRODUCER REACHING THIS STAGE SETS IT SINCE P57. It used to be TRUE for
+    // every shipped-descriptor import (producer C) — the retired eager-import law
+    // [[D-FFI-DESCRIPTOR-EAGER-IMPORT]] — and descriptor rows are now non-eager
+    // like producers A and B. The one remaining eager producer in the tree is the
+    // SEH personality, which is minted at the MIR tier and never travels this
+    // path. The field stays because EAGER is still a representable and meaningful
+    // property: "referenced by something the reloc-based gate cannot see".
+    // INVARIANT: isEagerImport ⟹ library-bound.
     bool isEagerImport = false;
     // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the EXPLICIT assembler name
     // this extern was

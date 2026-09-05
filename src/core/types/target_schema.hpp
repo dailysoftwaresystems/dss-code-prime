@@ -387,7 +387,142 @@ struct DSS_EXPORT TargetRegisterInfo {
     // `subOf` lets a target declare aliasing relationships (e.g. "eax"
     // is the low 32 bits of "rax") so ML6 regalloc can track full
     // clobber sets correctly. Empty when this register is independent.
+    //
+    // ★★ IT ASSERTS **CONTAINMENT**, AND `validate()` ENFORCES THAT: the
+    // parent must be STRICTLY WIDER, of the SAME class, at the SAME
+    // `hwEncoding`. That rule used to live only in
+    // `TargetSubRegisters.NoSubRegisterAppearsInAnyCallingConventionList`,
+    // where it judged the two SHIPPED tables and nothing else; a
+    // hand-authored or generated target declaring a same-width `subOf`
+    // LOADED CLEAN (✔MEASURED 2026-09-02, cycle P55 lane lq). It is a
+    // load-time refusal now because it is the rule that makes `aliases`
+    // below the ONE way to say "same register, second spelling" — see
+    // that field for why two ways would be a silent wrong answer.
     std::string    subOf;
+    // ★★★ ADDITIONAL SPELLINGS OF **THIS SAME** REGISTER — the sibling of
+    // `subOf` that asserts IDENTITY where `subOf` asserts CONTAINMENT
+    // (D-TARGET-ARM64-HALF-BYTE-QUAD-MEMORY-FORMS-UNDECLARED, 2026-09-02).
+    //
+    // ★★ WHY IT IS A NAME LIST ON THE ROW AND NOT A SECOND ROW. An
+    // assembler that spells one physical register two ways at ONE width
+    // (AArch64 `q0` and `v0` — the scalar 128-bit form and the vector form
+    // of register 0) is stating a fact about VOCABULARY, not about the
+    // machine: the class, the width, the `hwEncoding` and the DWARF number
+    // are all the same, so a second ROW would carry no field that differs
+    // and would have to be pinned back to the first by five load-time rules.
+    // A name list needs none of them, because `registerIndex` maps every
+    // spelling to the SAME ORDINAL and there is only ever one register.
+    //
+    // ★★★ AND THAT IS WHAT KEEPS THE DOUBLE-COUNT UNREACHABLE **BY
+    // CONSTRUCTION** RATHER THAN BY A RULE
+    // ([[D-TARGET-ALIASED-VIEWS-BOTH-ALLOCATABLE-DOUBLE-COUNT-ONE-FILE]]).
+    // The allocator may never hand two spellings of one machine register to
+    // two live values; with one ordinal it cannot, because
+    // `lir_regalloc::buildFreeLists` walks the register TABLE and each row
+    // contributes at most one free-list entry. A second row would have been
+    // a second entry the moment anything made it allocatable.
+    //
+    // ⚠ AN ALIAS IS NOT SPELLABLE IN A CALLING CONVENTION, and `validate()`
+    // refuses one BY NAME for a measured reason rather than a stylistic one:
+    // `buildFreeLists` tests `allocatable.contains(info.name)` against the
+    // row's CANONICAL name, so a convention naming `q0` would match no row —
+    // the producer would have declared a register, got no register, and got
+    // no diagnostic. That is the identical failure shape
+    // D-TARGET-CC-NAMES-SUB-REGISTER exists for, reached through the other
+    // key, and it is refused beside it.
+    //
+    // ⓘ EMPTY IS THE NORMAL STATE: only a target whose assembler admits two
+    // names for one register at one width declares any (✔MEASURED at HEAD:
+    // x86_64 declares none, arm64 declares exactly one per `v` row).
+    std::vector<std::string> aliases;
+    // ★★★ THIS ROW'S **OWN NAME** IS NOT AN OPERAND SPELLING ON ITS OWN — it
+    // denotes the register only when a lane arrangement is written on it
+    // ([[D-ASM-ARM64-BARE-V-REGISTER-ACCEPTED-IN-A-SCALAR-MEMORY-OPERAND]],
+    // 2026-09-03).
+    //
+    // ★★ WHAT IT IS FOR, AND WHY THE FACT HAS NOWHERE ELSE TO LIVE. AArch64's
+    // register 0 has SIX spellings — `b0`, `h0`, `s0`, `d0` (rows of their own,
+    // `subOf` this one), `q0` (an `aliases` entry here) and `v0` (this row's
+    // name) — and exactly ONE of them is not a scalar operand: ✔MEASURED
+    // 2026-09-03, gas 2.42 and clang 18.1.3 probed SEPARATELY and agreeing,
+    // `ldr v0,[x9,#16]` is `Error: unexpected register type at operand 1` /
+    // `invalid operand for instruction` while `ldr q0,[x9,#16]` assembles to
+    // 0x3DC00520 on both. A `v` name denotes the VECTOR view, which the
+    // instruction set spells with an arrangement (`v0.16b`) and never bare.
+    // ⚠ NOTHING ELSE ON THE ROW SEPARATES THE TWO SPELLINGS: `v0` and `q0` are
+    // ONE ordinal at ONE width in ONE class, which is exactly the identity
+    // `aliases` asserts — so the discriminator cannot be derived and has to be
+    // DECLARED.
+    //
+    // ★★★ IT GOVERNS THE **NAME**, NEVER THE REGISTER, AND THAT ASYMMETRY IS
+    // THE WHOLE KEY. The row stays a perfectly ordinary register: it is
+    // allocatable, it carries a DWARF number, `subOf` rows still resolve
+    // THROUGH it, and every `aliases` spelling stays bare-spellable. What the
+    // flag removes is one SPELLING in one position — an assembly-text operand
+    // written with no arrangement. ⇒ `q0` is unaffected (it is an alias),
+    // `d0`/`s0`/`h0`/`b0` are unaffected (their own rows do not set it), and
+    // `v0.16b` is unaffected (an arrangement was written).
+    //
+    // ⚠ AND IT IS READ AT EXACTLY ONE SEAM — the assembly-text operand decode,
+    // which is the only tier that knows what a programmer WROTE. The compiler's
+    // own lowering names registers by ordinal and never through a spelling, so
+    // no compiler-generated instruction can reach this refusal. Declaring the
+    // flag therefore cannot change a single byte of a compiled `.c`.
+    //
+    // ⓘ FALSE IS THE NORMAL STATE: a target whose every register name is a
+    // scalar operand spelling declares none (✔MEASURED at HEAD: x86_64 sets it
+    // nowhere; arm64 sets it on the 32 `v` rows and nowhere else).
+    bool nameRequiresLaneArrangement = false;
+    // ★★★ WHICH **READING** OF A SHARED `hwEncoding` THIS REGISTER IS — the JSON
+    // key `encodingRole`. [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]
+    // (cycle P55, 2026-09-03).
+    //
+    // ★★ THE FACT IT CARRIES, AND WHY NOTHING ELSE ON THE ROW COULD. Two
+    // registers may be DIFFERENT registers and still occupy the same number in
+    // an instruction's register field. AArch64 register field 31 is the classic
+    // case: it names the STACK POINTER in an add/subtract-immediate, in the
+    // extended-register forms and as a load/store BASE, and the ZERO REGISTER
+    // everywhere else. `sp` and `xzr` are therefore two rows at one
+    // `hwEncoding`, and which one a field means is a property of the FIELD, not
+    // of the number. `subOf` cannot say it (they contain nothing of each other),
+    // `aliases` cannot (they are not one register), and the encoding cannot
+    // (it is the very thing they share).
+    //
+    // ★★★ THE DEFECT THIS CLOSES WAS A SILENT MISCOMPILE ON TWO OF THE
+    // COMMONEST LINES IN HAND-WRITTEN aarch64. ✔MEASURED at the P55 base
+    // through the real CLI, every word read back with
+    // `aarch64-linux-gnu-objdump`: `mov x0, sp` emitted 0xAA1F03E0, which
+    // decodes as `mov x0, xzr` — x0 received ZERO instead of the stack pointer
+    // — and `mov sp, x0` emitted 0xAA0003FF, `mov xzr, x0`, a NO-OP. Both
+    // references (gas 2.42 and clang 18.1.3, probed SEPARATELY and agreeing on
+    // all 128 probes of that census) emit the ADD-immediate alias 0x910003E0 /
+    // 0x9100001F. rc=0, no diagnostic, wrong code. Ten more forms were wrong
+    // the same way and fifteen more were ACCEPTED where both references refuse.
+    //
+    // ⓘ EMPTY IS THE NORMAL STATE — a register whose `hwEncoding` is its own.
+    // `validate()` refuses a role on a register that shares its
+    // (class, widthBytes, hwEncoding) with no other row (the key would then
+    // narrow every field for nothing), and refuses a SHARED encoding whose rows
+    // do NOT all declare distinct roles — which is what makes this whole defect
+    // class unsayable in a target document rather than merely fixed in one.
+    std::string encodingRole;
+    // ★★★ IS THIS ROLE THE READING A FIELD GETS WHEN IT NAMES NONE? — the JSON
+    // key `encodingRoleIsDefault`.
+    //
+    // ★★ WITHOUT IT EVERY REGISTER FIELD IN THE DOCUMENT WOULD HAVE TO SPEAK.
+    // An ISA that shares an encoding almost always has one reading that is the
+    // rule and one that is the exception: on AArch64, field 31 is the zero
+    // register everywhere except the add/subtract-immediate, extended-register
+    // and memory-base forms. Declaring the RULE once on the register row lets
+    // the ~200 fields that follow it stay silent and stay correct, and leaves
+    // the exception to be spelled where it actually lives — on the field.
+    //
+    // ⚠ IT IS NOT A CONVENIENCE: the alternative is annotating every field, and
+    // an author who forgets one gets a REFUSAL of a legitimate spelling with no
+    // hint about which of two hundred wires is silent. `validate()` requires
+    // EXACTLY ONE default per shared-encoding group, so the fall-back reading is
+    // never ambiguous and never absent.
+    bool encodingRoleIsDefault = false;
     // 16/8/4/1 etc. — width in bytes. Required so ML6 knows spill-slot
     // sizing without re-deriving it from the regClass.
     std::uint16_t  widthBytes = 0;
@@ -539,21 +674,60 @@ struct DSS_EXPORT TargetRegisterClassOps {
     }
 };
 
-// D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the six abstract wide-float
+// D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the abstract wide-float
 // (IEEE binary128 `long double`) operations a softfloat-libcall target
 // realizes by CALLING a runtime helper (`__addtf3`/`__fixtfsi`/…) instead of
 // an inline instruction sequence. The engine keys the softcall verb on
 // `TypeKind::F128` + the PRESENCE of a config row for the op (never a
 // target/format identity branch): a target that declares F128 but no softcall
 // rows falls straight through to the `requireEncodedFloatWidth` fail-loud gate.
+//
+// D-TARGET-ENCODING-WIDTH-GUARD (LD-3) added the SIX COMPARISON rows. They are
+// one row per C comparison operator rather than one shared three-way compare
+// because that is what the libgcc ABI publishes and what both aarch64
+// references emit — ✔MEASURED 2026-09-03, gcc 13.3.0 and clang 18.1.3 probed
+// separately and agreeing helper-for-helper. Each returns an `int` whose SIGN
+// answers the predicate, with a NaN operand returning the sign that makes the
+// ordered predicates false and `!=` true (C 6.5.9), so the lowering finishes
+// them on an INTEGER condition code. ⓘ There is deliberately no `cmp` row for
+// libgcc's three-way `__cmptf2`: its result is unspecified on NaN, and
+// `nm -D /usr/aarch64-linux-gnu/lib/libgcc_s.so.1` shows it is not even
+// EXPORTED, while all six of these are.
+// D-TARGET-ENCODING-WIDTH-GUARD (LD-5) added the SIX remaining rows: `neg`,
+// `to_u32`, `to_i64`, `to_f64`, `to_f32` and `from_f32`. Five of them are
+// conversions and follow the `to_i32`/`from_f64` shape exactly — one binary128
+// operand or result, the other end a native scalar. ⚠ `neg` is the one that
+// does NOT match what either reference EMITS, and that is a deliberate,
+// measured choice rather than an oversight: aarch64-linux-gnu-gcc 13.3.0 flips
+// the sign bit inline (`eor x1, x2, #0x8000000000000000` on the high word) and
+// clang 18.1.3 does the same on byte 15 (`ldrb w8,[sp,#15]; eor w8,w8,#0x80`),
+// so NEITHER calls `__negtf2`. Realizing it inline here would put the LOCATION
+// OF THE SIGN BIT — byte 15, bit 7, i.e. little-endian binary128 — inside the
+// target-agnostic lowerer, which is the slow agnosticism break this project
+// keeps paying for. ✔MEASURED instead that the libcall is bit-for-bit the same
+// function: under qemu-aarch64, `__negtf2` from libgcc_s.so.1 maps +0.0↔-0.0,
+// flips 1.0's sign exponent-word only, and PRESERVES both a qNaN payload and a
+// signalling NaN's quiet bit (0x7fff…a55a → 0xffff…a55a; 0x7fff…0033 →
+// 0xffff…0033) — a pure sign-bit flip, so the difference from the references is
+// a peephole, not a semantic one.
 enum class WideFloatOp : std::uint8_t {
     Add = 0, Sub = 1, Mul = 2, Div = 3, ToInt32 = 4, FromFloat64 = 5,
+    CmpLt = 6, CmpLe = 7, CmpGt = 8, CmpGe = 9, CmpEq = 10, CmpNe = 11,
+    Neg = 12, ToUInt32 = 13, ToInt64 = 14, ToFloat64 = 15, ToFloat32 = 16,
+    FromFloat32 = 17,
 };
-inline constexpr std::size_t kWideFloatOpCount = 6;
-inline constexpr EnumNameTable<WideFloatOp, 6> kWideFloatOpTable{{{
+inline constexpr std::size_t kWideFloatOpCount = 18;
+inline constexpr EnumNameTable<WideFloatOp, 18> kWideFloatOpTable{{{
     { WideFloatOp::Add, "add" }, { WideFloatOp::Sub, "sub" },
     { WideFloatOp::Mul, "mul" }, { WideFloatOp::Div, "div" },
     { WideFloatOp::ToInt32, "to_i32" }, { WideFloatOp::FromFloat64, "from_f64" },
+    { WideFloatOp::CmpLt, "cmp_lt" }, { WideFloatOp::CmpLe, "cmp_le" },
+    { WideFloatOp::CmpGt, "cmp_gt" }, { WideFloatOp::CmpGe, "cmp_ge" },
+    { WideFloatOp::CmpEq, "cmp_eq" }, { WideFloatOp::CmpNe, "cmp_ne" },
+    { WideFloatOp::Neg, "neg" }, { WideFloatOp::ToUInt32, "to_u32" },
+    { WideFloatOp::ToInt64, "to_i64" }, { WideFloatOp::ToFloat64, "to_f64" },
+    { WideFloatOp::ToFloat32, "to_f32" },
+    { WideFloatOp::FromFloat32, "from_f32" },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -763,13 +937,94 @@ stackArgPackingFromName(std::string_view s) noexcept {
     return kStackArgPackingTable.fromName(s);
 }
 
-// The three measured axes, declared per calling convention. An OMITTED
-// `stackArgPacking` object (and an omitted key inside it) means `Slot`, so every
-// pre-existing CC is byte-unchanged by construction rather than by testing.
+// D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the byte alignment a stacked
+// argument of own-alignment `ownAlign` actually receives, given the CC's
+// declared `cap` and its stack-slot quantum `slotBytes`.
+//
+// ★ THE SINGLE OWNER OF THE CLAMP, DELIBERATELY IN THE SCHEMA RATHER THAN IN
+// EITHER TIER THAT APPLIES IT. Two tiers place stacked arguments — `hir_to_mir`
+// walks the CALLEE's incoming region (the only tier that still has TYPES, hence
+// the only one that can compute an alignment) and `StackArgCursor` (lir_callconv)
+// walks the CALLER's outgoing one. If those two clamp differently the caller
+// writes where the callee does not read, which is exactly the silent
+// byte-offset mismatch this anchor records. Putting the arithmetic beside the
+// fields it reads means neither tier spells it, so neither can drift.
+//
+// `cap == 0` (an undeclared CC) and `ownAlign == 0` (an unstated datum) both
+// yield the plain slot — i.e. the classic flat stride, byte-for-byte. That is
+// what keeps every CC that declares nothing unchanged by construction.
+[[nodiscard]] constexpr std::uint32_t
+stackedArgAlignment(std::uint32_t ownAlign, std::uint32_t cap,
+                    std::uint32_t slotBytes) noexcept {
+    std::uint32_t const slot = slotBytes == 0 ? 1u : slotBytes;
+    if (cap == 0 || ownAlign == 0) return slot;
+    std::uint32_t const honoured = ownAlign < cap ? ownAlign : cap;
+    return honoured < slot ? slot : honoured;
+}
+
+// D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the OWN alignment of a scalar of
+// `sizeBytes` bytes under `params` — the config's bounded-natural rule, which is
+// `min(size, maxAlignment)`. The SAME arithmetic `type_layout`'s `scalarAlign`
+// applies; restated here (over a SIZE rather than a TypeId) because the two tiers
+// that place stacked arguments hold the size, not the layout engine, and they must
+// not each spell it. AGNOSTIC: both operands are config, no arch branch.
+[[nodiscard]] constexpr std::uint32_t
+naturalScalarAlignment(std::uint32_t sizeBytes,
+                       AggregateLayoutParams params) noexcept {
+    switch (params.scalarAlignment) {
+        case ScalarAlignmentRule::Natural:
+            break;
+    }
+    std::uint32_t const size = sizeBytes == 0 ? 1u : sizeBytes;
+    std::uint32_t const cap  = params.maxAlignment;
+    return (cap != 0 && size > cap) ? cap : size;
+}
+
+// The three measured PACKING axes plus the two measured ALIGNMENT CAPS, declared
+// per calling convention. An OMITTED `stackArgPacking` object (and an omitted key
+// inside it) means `Slot` / cap 0, so every pre-existing CC is byte-unchanged by
+// construction rather than by testing.
+//
+// ⚠ THE CAPS ARE NOT A FOURTH PACKING AXIS — read the `StackArgPacking` docblock's
+// "do NOT add a fourth axis speculatively" note as the rule it is. Packing answers
+// "how many bytes does this datum OWN"; a cap answers "how far may this datum's own
+// ALIGNMENT push the cursor before its slot begins". They are independent: Apple
+// arm64 packs named scalars naturally and caps aggregate alignment at the slot,
+// while x86_64 SysV packs everything by slot and honours a 16-byte alignment.
+//
+// ✔MEASURED 2026-09-02, gcc 13.3.0 and clang 18.1.3 agreeing byte-for-byte on
+// every case, callee-side offsets read out of `-O1 -S` (incoming offset 0 = the
+// first stack argument), each datum placed after an ODD number of 8-byte stack
+// args so a 16-byte alignment is observable as a PAD:
+//   x86_64 SysV   `long double` after 1 stacked long → +16 (not +8)  ⇒ cap ≥ 16
+//   x86_64 SysV   `struct{long double;}`             → +16           ⇒ aggregate too
+//   x86_64 SysV   `struct{long x,y;}` (align 8)      → +8            ⇒ NOT size-driven
+//   x86_64 SysV   `struct aligned(16){long x,y;}`    → +16
+//   x86_64 SysV   `struct aligned(32){long x,y;}`    → +32           ⇒ cap ≥ 32
+//   AAPCS64       binary128 `long double`            → +16           ⇒ scalar cap 16
+//   AAPCS64       `struct aligned(16){long x,y;}`    → +8            ⇒ aggregate cap 8
+// ★ The last two rows are why this is CONFIG and not a constant: the two ABIs
+// give the SAME 16-byte-aligned aggregate DIFFERENT answers, and the third and
+// fourth rows are why it cannot be derived from the datum's SIZE — two 16-byte
+// aggregates with different alignments land at different offsets.
 struct StackArgPackingRules {
     StackArgPacking namedScalars    = StackArgPacking::Slot;
     StackArgPacking namedAggregates = StackArgPacking::Slot;
     StackArgPacking variadic        = StackArgPacking::Slot;
+    // The largest own-alignment this CC honours for a stacked SCALAR / stacked
+    // by-value AGGREGATE. 0 ⇒ none above the slot (the pre-existing behaviour).
+    // Validated as 0-or-a-power-of-two at load, like every other alignment field.
+    std::uint16_t   maxScalarAlignment    = 0;
+    std::uint16_t   maxAggregateAlignment = 0;
+
+    [[nodiscard]] constexpr std::uint32_t
+    scalarAlignment(std::uint32_t ownAlign, std::uint32_t slotBytes) const noexcept {
+        return stackedArgAlignment(ownAlign, maxScalarAlignment, slotBytes);
+    }
+    [[nodiscard]] constexpr std::uint32_t
+    aggregateAlignment(std::uint32_t ownAlign, std::uint32_t slotBytes) const noexcept {
+        return stackedArgAlignment(ownAlign, maxAggregateAlignment, slotBytes);
+    }
 };
 
 // D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE:
@@ -1100,6 +1355,13 @@ struct DSS_EXPORT TargetCallingConvention {
     // in JSON ⇒ all three `Slot` ⇒ every pre-existing CC keeps its exact
     // placement AND its 8-byte access width. `apple_arm64` declares
     // `namedScalars: "natural"`.
+    // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the same object carries the two
+    // stacked-argument ALIGNMENT CAPS. Omitted ⇒ 0 ⇒ no over-alignment honoured
+    // ⇒ the classic flat slot stride. `sysv_amd64` declares
+    // `maxScalarAlignment`/`maxAggregateAlignment` so a stacked `long double`
+    // (and a long-double-leaf aggregate) lands on the 16-byte boundary the x87
+    // ABI requires; `aapcs64` declares the scalar cap only, because a 16-byte
+    // aggregate is measurably NOT over-aligned there.
     StackArgPackingRules stackArgPacking{};
 
     // FC7 by-value aggregate ABI (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the
@@ -2426,6 +2688,70 @@ struct DSS_EXPORT TargetEncodingWire {
     // `encodingWireRegClass` below for why the two levels exist and why
     // neither one may be missing for a register-bearing field.
     std::optional<TargetRegClass> regClass;
+    // ── [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]]: DOES THIS
+    // FIELD READ ITS REGISTER AS A **VECTOR OF LANES** OR AS A **SCALAR**? —
+    // the JSON key `lanes` (bool), refined by `laneBits`.
+    //
+    // ★★★ ABSENT MEANS **SCALAR**, WHICH IS A CLAIM AND NOT AN ABSTENTION, and
+    // that is the whole difference between this axis and `regClass` beside it.
+    // A register field on any ISA reads its register one of exactly two ways;
+    // there is no third "unstated" reading for an author to fall into. So the
+    // default is the STRICT arm, every pre-existing field states the truth
+    // without being edited, and the direction a forgotten key fails in is
+    // REFUSAL of a lane spelling rather than acceptance of one.
+    //
+    // ★★ WHY IT COULD NOT BE DERIVED FROM THE WIDTH — the defect this closes.
+    // ✔MEASURED 2026-09-02, both directions, gas 2.42 and clang 18.1.3 both
+    // REJECTING both spellings: `cnt d0, d1` compiled and emitted
+    // `cnt v0.8b, v1.8b` (a scalar spelling reaching a lane form), and
+    // `fadd v0.8b, v1.8b, v2.8b` compiled and emitted `fadd d0, d1, d2`
+    // (0x1E622820) — a scalar double add for a byte-lane spelling, rc=0, no
+    // diagnostic. `.8b` and `d` are BOTH 64 bits, so the width axis is blind to
+    // the difference by construction, and so is `regClass`: `v0` is `d0`'s root
+    // and the class is one file.
+    //
+    // ⚠ IT IS A DECLARATION, NOT A GUARD, for exactly the reason `destWidth`
+    // is (see its comment): a LIR instruction carries no lane shape, so the
+    // ENCODER, re-selecting post-regalloc, would have nothing to read it from.
+    // It is consumed ONLY by `asm_elect::electOpcode`, which knows what the
+    // programmer WROTE, and the election's answer is carried in the OPCODE the
+    // encoder does read — so the two tiers still cannot disagree.
+    bool             lanes           = false;
+    // The lane WIDTH this field reads, in bits. 0 with `lanes` = "this encoding
+    // does not distinguish lane widths" — the honest reading of a BITWISE
+    // vector form, and not a shortcut: ✔MEASURED, clang 18.1.3 assembles
+    // `mov v0.8b/.4h/.2s/.1d` to the one word 0x0EA11C20, because the ORR alias
+    // this target spells as `move_bytes` is bit-for-bit lane-agnostic. A
+    // lane-SENSITIVE form states the number (`addv h0, v1.4h` = 0x0E71B820
+    // against `addv b0, v1.8b` = 0x0E31B820), and then a spelling at any other
+    // lane width elects nothing. validate() refuses it without `lanes`.
+    std::uint8_t     laneBits        = 0;
+    // ── [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]:
+    // WHICH **READING** OF A SHARED REGISTER ENCODING THIS FIELD HAS — the JSON
+    // key `regRole`, matched against `TargetRegisterInfo::encodingRole`.
+    //
+    // ★★★ EMPTY MEANS "THE GROUP'S DEFAULT READING", NOT "ANY READING", and that
+    // is the whole difference between this axis and `regClass` above. A register
+    // field on an ISA that shares an encoding reads it exactly one way; there is
+    // no third "unstated" reading for an author to fall into. So a silent field
+    // keeps whatever the register table declared as the rule (AArch64: the zero
+    // register), every pre-existing field states the truth without being edited,
+    // and the direction a FORGOTTEN key fails in is a loud refusal of a stack-
+    // pointer spelling — never acceptance of one.
+    //
+    // ⚠ A REGISTER THAT DECLARES NO ROLE FITS EVERY FIELD. `x0` is register 0 in
+    // both readings, so narrowing it would refuse the ordinary case; the axis
+    // discriminates ONLY among the rows that actually share a number.
+    //
+    // ⚠ IT IS A DECLARATION, NOT A GUARD — the same argument `lanes` above makes.
+    // The role of a register is a property of the TARGET TABLE, which
+    // `variantMatchesInst` (the shared encoder/lowering matcher) has no handle
+    // on; it is consumed by `asm_elect::electOpcode`, which does. The election's
+    // answer is carried in the OPCODE the encoder re-reads, so the two tiers
+    // still cannot disagree — and `validate()` refuses two same-shape same-width
+    // variants of ONE opcode regardless, so this axis can never be the thing
+    // that separates a variant the encoder would then re-pick differently.
+    std::string      regRole;
     // D-AS4-3 (multi-instruction-macro encoder): which 32-bit word
     // (0-based) of a multi-word `fixed32` template this wire's slot
     // lives in. DEFAULT 0 — every existing single-word wire is
@@ -2478,6 +2804,27 @@ struct DSS_EXPORT TargetEncodingWire {
 struct DSS_EXPORT ResultSlotExtra {
     EncodingSlotKind slotKind  = EncodingSlotKind::Rd;
     std::uint8_t     wordIndex = 0;
+    // ── [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]:
+    // THIS PLACEMENT'S OWN READING of a shared register encoding — the JSON key
+    // `regRole`, the same axis `TargetEncodingWire::regRole` carries.
+    //
+    // ★★★ IT IS PER-PLACEMENT AND NOT PER-VARIANT BECAUSE A MULTI-WORD MACRO'S
+    // WORDS CAN DISAGREE, AND ON THIS TARGET THEY DO. ✔MEASURED 2026-09-03:
+    // `adr xzr, main` compiled rc=0 and emitted `adrp xzr, main` followed by
+    // **`add sp, sp, #:lo12:main`** — the stack pointer overwritten with a
+    // relocated address, silently. arm64's `lea` is the two-word macro
+    // `ADRP Xd, sym; ADD Xd, Xd, #:lo12:sym`, and ADRP's Rd reads encoding 31
+    // as the ZERO register while ADD-immediate's Rd reads it as the STACK
+    // POINTER. One `resultRegRole` for the whole variant could state only one
+    // of those and would have to be wrong about the other word.
+    //
+    // ⓘ THE CONSEQUENCE IS THE RIGHT ONE: a destination register must fit
+    // EVERY placement, so a macro whose words disagree accepts only registers
+    // that carry no role at all — which is exactly the set for which the two
+    // readings are the same register. `adr x0, main` is untouched; `adr xzr,
+    // main` becomes a loud refusal, and `adr sp, main` (which both references
+    // also refuse) stays refused.
+    std::string      regRole;
 };
 
 struct DSS_EXPORT TargetEncodingVariant {
@@ -2552,6 +2899,37 @@ struct DSS_EXPORT TargetEncodingVariant {
     // on a variant with NEITHER an `imm32` NOR a `memoffset` operand (no
     // value to sign-route on).
     bool                               negValue = false;
+    // ── DIVISIBILITY routing axis — the JSON key `guard.immMultipleOf`
+    // (a positive integer). Anchor:
+    // [[D-ASM-ARM64-LDR-TO-LDUR-CONVENIENCE-ALIAS-REFUSED]], 2026-09-03.
+    //
+    // ABSENT (nullopt) ⇒ this variant does not discriminate on divisibility —
+    // every pre-existing variant. PRESENT ⇒ it matches only when the magnitude
+    // the range gate already reads is an exact multiple of this number.
+    //
+    // ★★★ WHY THE AXIS HAS TO EXIST, AND IT IS THE SAME SENTENCE `immMin` AND
+    // `immMax` ANSWER ONE STEP FURTHER. A `imm12.scaled` slot encodes
+    // `byteOffset / accessSize`, so its reach is not an interval: it is the
+    // multiples of the access size inside one. `immMin`/`immMax` can state the
+    // interval and cannot state the lattice — so a variant bounded by them
+    // alone MATCHES an offset its own encoder will then REFUSE, which is
+    // exactly the divergence `asm_variant_elect.hpp`'s banner exists to
+    // prevent: the election picks an opcode the encoder cannot emit, and the
+    // dialect's OTHER candidate — the unscaled form that could have carried it
+    // — is never reached. ✔MEASURED 2026-09-03 at the P55 base: DSS refused
+    // `ldr h0,[x1,#1]`, `ldr s0,[x1,#1]`, `ldr d0,[x1,#255]` and `ldr q0,
+    // [x1,#255]` while gas 2.42 and clang 18.1.3 (probed SEPARATELY, agreeing,
+    // NEITHER warning) assemble all four to the LDUR encoding.
+    //
+    // ⚠ IT GATES THE MAGNITUDE, SO IT COMPOSES WITH `negValue` FOR FREE: a
+    // `negValue` variant tests the divisibility of the |value| it already
+    // routed on. Nothing here knows what an access size is — the number is the
+    // target's, and a format whose field is unscaled declares none.
+    // ⓘ 1 IS REFUSED BY `validate()` RATHER THAN ACCEPTED AS A NO-OP: every
+    // integer is a multiple of 1, so the key would state nothing while looking
+    // like it states something — the same rule `aliases` applies to a row that
+    // lists its own name.
+    std::optional<std::uint32_t>       immMultipleOf;
     // ── MEMORY-DIRECTION routing axis — the JSON key
     // `guard.memoryDestination` (bool). Anchor:
     // D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE.
@@ -2593,6 +2971,101 @@ struct DSS_EXPORT TargetEncodingVariant {
     // one class. Meaningful only with a `resultSlot` (validate() refuses it
     // otherwise — a class for a field the variant does not have).
     std::optional<TargetRegClass>      resultRegClass;
+    // ── D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME:
+    // HOW WIDE THE RESULT FIELD IS — the JSON key `destWidth`, a SIBLING of
+    // `resultRegClass` and not a member of `guard`. 0 = not declared.
+    //
+    // ★★★ IT IS A DECLARATION, NOT A GUARD, AND THE DIFFERENCE IS THE WHOLE
+    // SOUNDNESS ARGUMENT. `guard.width` is read by BOTH tiers off the same
+    // `LirInst::flags` byte, which is what keeps the text lowering's election
+    // and the encoder's variant choice identical. A LIR instruction carries
+    // exactly ONE width, so a SECOND width cannot be a guard: the encoder,
+    // re-selecting post-regalloc, would have nothing to read it from. This key
+    // is therefore consumed ONLY by the tier that knows what the programmer
+    // WROTE — `asm_elect::electOpcode`, choosing between candidate OPCODES —
+    // and never by `variantMatchesInst`. The election's answer is then carried
+    // in the instruction's OPCODE field, which the encoder does read, so the
+    // two tiers still cannot disagree.
+    //
+    // ★★ WHY A SECOND WIDTH EXISTS AT ALL. A conversion is one mnemonic whose
+    // two ends deliberately disagree: aarch64 `fcvtzs` is FOUR instructions
+    // (Wd|Xd × Sn|Dn) that gas and clang spell identically, ✔MEASURED — gas
+    // 2.42 and clang 18.1.3 agree on all four: `fcvtzs w0,s1` = 0x1E380020,
+    // `fcvtzs w0,d1` = 0x1E780020, `fcvtzs x0,s1` = 0x9E380020, `fcvtzs x0,d1`
+    // = 0x9E780020. The SOURCE width already rides `guard.width`; only the
+    // DESTINATION width separates the first from the third. Without this key a
+    // dialect row for `fcvtzs` elects the source-width variant and silently
+    // emits the X form for a W destination — ✔MEASURED as exactly that
+    // (`fcvtzs %w0, %s1` → `fcvtzs x16, s29`, 0x9E3803B0) before this key
+    // existed.
+    //
+    // ★ AND THE GATE IS TWO-SIDED, WHICH IS WHAT MAKES THE WRONG WIDTH
+    // UNSAYABLE RATHER THAN MERELY UNLIKELY: a candidate declaring a
+    // `destWidth` that disagrees with the written destination is ELIMINATED,
+    // AND an instruction whose destination width differs from its operation
+    // width is REFUSED unless the elected variant declares a matching one
+    // (`asm_elect::variantHonorsDeclaredDestWidth`). A target that forgets the
+    // key cannot silently keep the old behaviour on the dangerous shape.
+    //
+    // ⓘ ABSENT IS "THIS VARIANT'S RESULT IS AS WIDE AS ITS OPERATION", which
+    // is true of every ordinary instruction and is why every pre-existing
+    // variant is unaffected. validate() refuses it on a variant with no
+    // `resultSlot` — a destination width for a field the variant does not have
+    // — the same coherence rule `resultRegClass` carries.
+    std::uint8_t                       destWidthBits = 0;
+    // ── [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]]: the RESULT
+    // field's half of the lane axis — the JSON keys `destLanes` (bool) and
+    // `destLaneBits`, siblings of `destWidth` and read by exactly the tier that
+    // reads it. See `TargetEncodingWire::lanes` for the axis itself.
+    //
+    // ★★★ IT IS A SEPARATE FIELD FROM THE WIRES' AND NOT A CONVENIENCE. An
+    // instruction's two ends can disagree about lanes exactly as they can
+    // disagree about width: ✔MEASURED, `addv b0, v1.8b` = 0x0E31B820 reduces a
+    // vector of eight byte lanes into a SCALAR `b` destination, and both
+    // references reject `addv b0, d1` (a scalar source) and `addv v0.8b, v1.8b`
+    // (a vector destination). One key covering both ends could state neither
+    // case, and a widening form (`saddlp v0.4h, v1.8b`) disagrees in the lane
+    // WIDTH while agreeing that both ends are vectors.
+    bool                               destLanes     = false;
+    std::uint8_t                       destLaneBits  = 0;
+    // ── [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]:
+    // the RESULT field's half of the shared-encoding axis — the JSON key
+    // `resultRegRole`, the sibling of `destWidth`/`destLanes` and read by the
+    // same tier. See `TargetEncodingWire::regRole` for the axis itself.
+    //
+    // ★ IT IS SEPARATE FROM THE WIRES' FOR THE SAME REASON THE LANE AND WIDTH
+    // KEYS ARE, and here the two ends genuinely differ on the SHIPPED table: a
+    // store's `rd` slot carries the transferred register — ✔MEASURED, both
+    // references assemble `str xzr,[sp]` (0xF90003FF) and REFUSE `str sp,[x0]`
+    // — while its `rn` slot carries the base, where 31 is the stack pointer and
+    // `ldr x0,[xzr]` is refused by both. One key covering both ends could state
+    // neither.
+    std::string                        resultRegRole;
+    // ── [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]:
+    // THIS ENCODING IS THE ONE WRITTEN **ONLY WHEN** A REGISTER IN THIS ROLE IS
+    // NAMED — the JSON key `requiresRegRole`.
+    //
+    // ★★★ WHY AN ACCEPTANCE AXIS IS NOT ENOUGH, WHICH IS THE SUBTLE HALF OF THE
+    // ANCHOR. `mov Xd, Xm` and `mov Xd, SP` are DIFFERENT INSTRUCTIONS sharing a
+    // mnemonic: the first is `ORR Xd, XZR, Xm` and the second `ADD Xd, SP, #0`
+    // (ARM ARM C6.2.209, MOV (to/from SP), an alias of ADD (immediate) whose
+    // preference condition is literally *Rd or Rn is 31*). The role axis alone
+    // makes the ORR form REFUSE `sp` — but it cannot stop the ADD form from also
+    // accepting `mov x0, x1`, because `x0` and `x1` carry no role and fit every
+    // field. Two candidates would then both match and the election would report
+    // an ambiguity on the commonest line in the dialect.
+    //
+    // ⓘ SO THE CONDITION IS DECLARED, NOT INFERRED, AND IT IS THE ARCHITECTURE'S
+    // OWN SENTENCE rather than a tie-break: an encoding that exists only to
+    // spell a role says so, and correctness stops depending on the order two
+    // candidates were listed in. ✔MEASURED that the order-free reading is the
+    // references' too — gas 2.42 and clang 18.1.3 both emit ORR for
+    // `mov x0, x1` (0xAA0103E0) and ADD for `mov x0, sp` (0x910003E0).
+    //
+    // ⚠ THE ROLE MAY BE CARRIED BY THE RESULT AS WELL AS BY A SOURCE — `mov x0,
+    // sp` names it on the source and `mov sp, x0` on the destination, and both
+    // are the same instruction.
+    std::string                        requiresRegRole;
     // D-AS4-3: additional placements of the SAME result register in a
     // multi-word template (see `ResultSlotExtra`). Empty for every
     // single-word / single-placement opcode. validate() requires a
@@ -2914,6 +3387,91 @@ static_assert(kExitMechanismTable.rows.size()
               "'none' sentinel) — a second one leaves `namesWhere`'s literal "
               "count matching while the projection silently stops being 'the "
               "table minus its sentinel'");
+
+// ── D-CSUBSET-PACKED-ATOMIC-MEMBER: what the NATIVE inline atomic form ────
+//    DOES when the access is not naturally aligned ───────────────────────
+//
+// ★★★ THE KEY IS NAMED FOR THE QUESTION IT ANSWERS, AND THAT IS THE WHOLE
+// POINT OF IT BEING A THREE-WAY ENUM RATHER THAN A BOOLEAN. The first draft of
+// this vocabulary was a single `requiresNaturalAlignment` bool, and it
+// CONFLATED two facts that are measurably different per processor:
+//   * does the native under-aligned form FAULT? and
+//   * does it stay ATOMIC?
+// ✔MEASURED 2026-09-02, one misaligned `_Atomic int` at `&g.a` offset 1:
+//   * aarch64 (NATIVE VPS, gcc 13.3.0): the inlined `stlr`/`ldar` pair dies
+//     rc 135, Bus error (core dumped). It FAULTS.
+//   * x86-64 (gcc 13.3.0, WSL + Windows): the inlined `xchgl 1+g(%rip)` /
+//     `movl 1+g(%rip)` pair RUNS, rc 42. It does NOT fault — but the two
+//     halves are not equally safe. The `xchg` carries x86's implicit LOCK and
+//     stays atomic; the paired PLAIN `movl` is not architecturally atomic when
+//     the four bytes straddle a cache line. It SILENTLY LOSES ATOMICITY.
+// A boolean forces those two into one cell, and the remedy when the format
+// supplies NO atomics runtime is opposite for each: emitting a form that is
+// certain to fault is a miscompile and must be refused, while emitting a form
+// that is what gcc itself ships is the reference-exact answer and refusing it
+// would put DSS below the (gcc ∪ clang ∪ MSVC) ∪ ISO C union. So the fact is
+// declared, per target, as what the form DOES.
+enum class UnderAlignedAtomicForm : std::uint8_t {
+    // The target declares no answer. Treated exactly as `RemainsAtomic` by the
+    // lowering (today's behaviour, byte-identical output), and kept DISTINCT
+    // from it so "unanswered" and "answered: safe" are different states in the
+    // config — a target that has never been measured must not read as one that
+    // has.
+    None           = 0,
+    // The native inline form is fully atomic at ANY alignment; no runtime call
+    // is ever needed. No shipped target declares this today; it exists because
+    // the fact is a per-processor MEASUREMENT and a processor that genuinely
+    // answers this way must be expressible without a code change.
+    RemainsAtomic  = 1,
+    // The native inline form TRAPS on an under-aligned access (aarch64
+    // LDAR/STLR — ✔MEASURED rc 135 SIGBUS on native hardware; qemu-user does
+    // NOT enforce the check, so an emulated leg is structurally blind to this).
+    // Under-aligned accesses MUST route through the format's atomics runtime; a
+    // format that declares none fails LOUD rather than emit a certain fault.
+    Traps          = 2,
+    // The native inline form completes but is not architecturally atomic when
+    // the datum straddles a cache line (x86-64's plain paired load). Under-
+    // aligned accesses route through the atomics runtime when the format
+    // supplies one; when it does not, the native form STANDS — it is what gcc
+    // emits, it works, and refusing would be below the union.
+    LosesAtomicity = 3,
+};
+
+inline constexpr EnumNameTable<UnderAlignedAtomicForm, 4>
+    kUnderAlignedAtomicFormTable{{{
+    { UnderAlignedAtomicForm::None,           "none"           },
+    { UnderAlignedAtomicForm::RemainsAtomic,  "remainsAtomic"  },
+    { UnderAlignedAtomicForm::Traps,          "traps"          },
+    { UnderAlignedAtomicForm::LosesAtomicity, "losesAtomicity" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kUnderAlignedAtomicFormTable);
+
+[[nodiscard]] constexpr std::string_view
+underAlignedAtomicFormName(UnderAlignedAtomicForm f) noexcept {
+    return kUnderAlignedAtomicFormTable.name(f);
+}
+[[nodiscard]] constexpr std::optional<UnderAlignedAtomicForm>
+underAlignedAtomicFormFromName(std::string_view s) noexcept {
+    return kUnderAlignedAtomicFormTable.fromName(s);
+}
+
+[[nodiscard]] constexpr bool
+isSelectableUnderAlignedAtomicForm(UnderAlignedAtomicForm f) noexcept {
+    return f != UnderAlignedAtomicForm::None;
+}
+
+// ⚠ Literal `M` plus the sentinel-count assert, both halves required — the
+// nine-arm measurement is written out at `kSelectableExitMechanismNames` above
+// (D-CORE-NAMESWHERE-COUNT-DERIVED-FROM-THE-TABLE-IS-A-TAUTOLOGY).
+inline constexpr auto kSelectableUnderAlignedAtomicFormNames =
+    namesWhere<3>(kUnderAlignedAtomicFormTable,
+                  isSelectableUnderAlignedAtomicForm);
+static_assert(kUnderAlignedAtomicFormTable.rows.size()
+                  == kSelectableUnderAlignedAtomicFormNames.size() + 1,
+              "kUnderAlignedAtomicFormTable must have exactly ONE unselectable "
+              "row (the 'none' sentinel) — a second one leaves `namesWhere`'s "
+              "literal count matching while the refusals silently stop naming "
+              "the set the loader accepts");
 
 // Per-OS process-exit descriptor. Lives on `ObjectFormatData`
 // (loaded from format JSON's `processExit` block). The trampoline
@@ -4044,6 +4602,14 @@ struct DSS_EXPORT TargetSchemaData {
     std::array<bool, kObjectFormatKindCount> charIsUnsignedByFormat{};
     std::array<bool, kObjectFormatKindCount> charIsUnsignedByFormatDeclared{};
 
+    // D-CSUBSET-PACKED-ATOMIC-MEMBER: what this PROCESSOR's native inline
+    // atomic load/store form does when the access is not naturally aligned
+    // (`atomics.underAlignedNativeForm` in the `.target.json`). `None` = the
+    // target declares no `atomics` block. Read by MIR→LIR through the ONE
+    // accessor below; NEVER by an arch-name test.
+    UnderAlignedAtomicForm underAlignedAtomicForm =
+        UnderAlignedAtomicForm::None;
+
     // TF-C74 (D-CONFIG-PER-ARCH-PREDEFINED-MACROS): the target's
     // PER-ARCHITECTURE IDENTITY predefined macros
     // (`"predefinedMacros"` — the same entry grammar as the language's
@@ -4262,6 +4828,43 @@ public:
     // returns nullptr.
     [[nodiscard]] TargetRegisterInfo const* registerInfo(std::uint16_t ordinal) const noexcept {
         return (ordinal < d_.registers.size()) ? &d_.registers[ordinal] : nullptr;
+    }
+
+    // ★★★ MAY THIS REGISTER BE WRITTEN IN A FIELD THAT READS A SHARED ENCODING
+    // THIS WAY? [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]].
+    //
+    // `fieldRole` is the field's own `regRole` (empty = the field named none, so
+    // it reads the group's DEFAULT). Three answers, and every one of them is a
+    // fact the target document declared:
+    //
+    //   * the register declares NO role — it does not share its number with
+    //     anything, so every reading of that number is the same register and it
+    //     fits any field. This is ~every row in both shipped tables.
+    //   * the field named a role — it fits iff the roles are the same string.
+    //   * the field named none — it fits iff this register IS the group's
+    //     default reading, which `validate()` proves exists and is unique.
+    //
+    // ⚠ AN UNKNOWN ORDINAL ANSWERS **true** AND THAT IS NOT A HOLE: this is an
+    // ELECTION filter, and `walker_util::hwEncodingOf` refuses an ordinal that
+    // is not in the table, by name, at encode time. Failing it here would
+    // replace that precise message with a generic "no candidate matched".
+    [[nodiscard]] bool registerFitsFieldRole(
+            std::uint16_t ordinal, std::string_view fieldRole) const noexcept {
+        auto const* info = registerInfo(ordinal);
+        if (info == nullptr || info->encodingRole.empty()) return true;
+        if (!fieldRole.empty()) return info->encodingRole == fieldRole;
+        return info->encodingRoleIsDefault;
+    }
+
+    // The role this register declares, or empty when it shares its encoding with
+    // nothing. The `requiresRegRole` half of the axis asks this directly: it
+    // needs to know whether a role was NAMED, which `registerFitsFieldRole`
+    // deliberately folds away.
+    [[nodiscard]] std::string_view registerEncodingRole(
+            std::uint16_t ordinal) const noexcept {
+        auto const* info = registerInfo(ordinal);
+        return (info == nullptr) ? std::string_view{}
+                                 : std::string_view{info->encodingRole};
     }
 
     // Look up by name (heterogeneous; no allocation). Returns the
@@ -4546,6 +5149,16 @@ public:
         return d_.charIsUnsignedDefault;
     }
 
+    // D-CSUBSET-PACKED-ATOMIC-MEMBER: what this processor's native inline
+    // atomic form does under an under-aligned access. `None` when the target
+    // declares no `atomics` block — the lowering then keeps the native form,
+    // which is byte-for-byte today's output. The SOLE reader is MIR→LIR's
+    // `_Atomic` arm; it asks THIS, never the target's name.
+    [[nodiscard]] UnderAlignedAtomicForm
+    underAlignedAtomicForm() const noexcept {
+        return d_.underAlignedAtomicForm;
+    }
+
     // ── Per-architecture identity predefined macros (TF-C74) ──────
     // The target's `predefinedMacros` rows, in declaration order and
     // UNFILTERED (the per-entry `availableObjectFormats` filter is
@@ -4622,11 +5235,30 @@ public:
     static LoadResult<std::shared_ptr<TargetSchema>> loadFromText(
         std::string_view jsonText, std::string_view sourceLabel = "<inline>");
 
+    // ★★ WHERE THIS DOCUMENT CAME FROM — the label `loadFromText` was given,
+    // which for every shipped and every file load is the ABSOLUTE path the
+    // precedence walk resolved. The TARGET half of
+    // `GrammarSchema::configDocumentOrigin()`, whose docblock carries the full
+    // argument for why attribution is per-document rather than per-process
+    // ([[D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE]]).
+    //
+    // ★ BOTH FAMILIES CARRY IT BECAUSE A DIAGNOSTIC NAMES BOTH DOCUMENTS. The
+    // assembly walker's `pairSuffix()` says "this dialect and this target
+    // disagree"; naming one by path and the other by name would leave a reader
+    // able to open only half of the pair it was told to compare.
+    [[nodiscard]] std::string_view configDocumentOrigin() const noexcept {
+        return documentOrigin_;
+    }
+
 private:
     // Lowercase 64-hex SHA-256 of the document bytes — see `contentDigest()`.
     // Written ONLY by `loadFromText` (a static member, so no friend is
     // needed); every other construction path leaves it empty on purpose.
     std::string contentDigest_;
+
+    // Written ONLY by `loadFromText`, exactly as `contentDigest_` is, and empty
+    // on every other construction path — see `configDocumentOrigin()`.
+    std::string documentOrigin_;
 
     detail::TargetSchemaData d_;
 };

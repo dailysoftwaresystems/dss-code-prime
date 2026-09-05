@@ -449,6 +449,26 @@ struct CompileOptions {
 
     DiagnosticBudget diagBudget;
 
+    // ── [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: PLAIN `char`'s SIGN, FOR
+    //    THIS (target x object format) ─────────────────────────────────────────
+    // `TargetSchema::charIsUnsigned(ObjectFormatKind)` -- the ONE accessor, on
+    // the ONE owner, with the format kind REQUIRED so no caller can take the
+    // processor half alone (the same arm64 CPU is unsigned under GNU/Linux and
+    // signed under Darwin). Resolved once by the driver, per target spec, and
+    // relayed from here; NEVER re-derived downstream.
+    //
+    // It rides `CompileOptions` rather than a parameter because its consumer is
+    // the MIR OPTIMIZER, which carries neither a target nor a format of its own
+    // -- the very reason the row this closes calls an `EvalOptions`-only fix a
+    // half-measure. `optimizeModule` reads it here and hands it to
+    // `opt::optimize` -> `ConstFold`, where `intKindInfo`'s `Char` row lives.
+    //
+    // ⚠ `nullopt` MEANS "NOT SUPPLIED" AND NOT "SIGNED": a `char`-typed fold
+    // then refuses (the instruction is copied verbatim -- a missed fold, never a
+    // wrong constant). A `false` default would have been right on three shipped
+    // legs and a silent wrong answer on the fourth.
+    std::optional<bool> charIsUnsigned{};
+
     // Selects the default optimizer pipeline when `pipelineOverride`
     // is null. Resolved via `resolvePipelineName` (a constexpr table
     // indexed by ordinal — NO `if (config == Release)` branches per
@@ -692,6 +712,15 @@ struct DSS_EXPORT CuMirModule {
     // selects the right call-site opcode. nullopt iff the format declared
     // none — MIR→LIR then fails loud on any extern call.
     std::optional<ExternCallDispatch> externCallDispatch;
+    // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55): the
+    // DECLARED narrowing of WHICH symbol bindings that dispatch reaches
+    // through the import slot, captured here for the SAME reason as
+    // `externCallDispatch` — the LOWER half sees only this struct. EMPTY = the
+    // format declares no narrowing, i.e. every import (the unqualified meaning
+    // `indirect-slot` has always carried). The RULE that reads it has one
+    // owner, `ObjectFormatSchema::externRefTakesImportSlot`, which the linker
+    // calls directly; what travels here is the declared DATA.
+    std::vector<SymbolBinding> indirectSlotBindings;
     // D-LK-EXTERN-DATA-IMPORT (c117): the active object format's extern-DATA
     // binding model (got-indirect / copy-relocation), captured here for the
     // SAME reason as `externCallDispatch` — the LOWER half (which sees only
@@ -948,7 +977,22 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::optional<SehPersonality> const& sehPersonality,
                      std::string_view                  formatName,
                      std::string_view                  wideFloatSoftcallLibrary,
-                     DiagnosticReporter&               reporter);
+                     DiagnosticReporter&               reporter,
+                     // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics-runtime
+                     // block (the image owning the GENERIC `__atomic_load`/
+                     // `__atomic_store` entries + their already-mangled names for
+                     // this format). Threaded into MIR→LIR exactly like
+                     // `wideFloatSoftcallLibrary` above, and read off the schema at
+                     // the call site for the same reason. nullopt = this format
+                     // supplies none: an under-aligned `_Atomic` access then refuses
+                     // LOUD under a `traps` target (arm64 — the native LDAR/STLR pair
+                     // is a MEASURED SIGBUS) and keeps the native form under
+                     // `losesAtomicity` (x86_64, where it is what gcc ships). TRAILING
+                     // + DEFAULTED, the same positional-safe shape every format fact
+                     // on `lowerToLir` already takes, so a fixture that builds a raw
+                     // `CuMirModule` states "no format declared" by saying nothing.
+                     std::optional<AtomicsRuntime> const& atomicsRuntime =
+                         std::nullopt);
 
 // ── D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: PROGRAM-ENTRY RESOLUTION ───────────────
 //
@@ -1071,7 +1115,29 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // softcall runtime library, pre-resolved in program.cpp
                       // (no ObjectFormatKind in scope in the merge lower body).
                       std::optional<std::string> wideFloatSoftcallLibrary,
-                      DiagnosticReporter&  reporter);
+                      DiagnosticReporter&  reporter,
+                      // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's
+                      // atomics-runtime block, pre-resolved in program.cpp for
+                      // the same reason the softcall library above is (no
+                      // ObjectFormatKind in scope in the merge lower body).
+                      // Trailing + defaulted, like every format fact on
+                      // `lowerToLir`.
+                      std::optional<AtomicsRuntime> atomicsRuntime =
+                          std::nullopt,
+                      // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT
+                      // (P55): the format's DECLARED narrowing of WHICH symbol
+                      // bindings the `indirect-slot` dispatch above reaches
+                      // through the import slot, pre-resolved in program.cpp
+                      // for the same reason the two facts above are.
+                      // ⚠ NOT DEFAULTED-AND-FORGOTTEN AT THE CALL SITE: the
+                      // merge path emits `.obj`s too, and a merged module that
+                      // silently lost the narrowing would carry the
+                      // unnarrowed cost while its format document said
+                      // otherwise — and, worse, its call sites would disagree
+                      // with the linker's slot pass, which reads the format
+                      // directly. Defaulted only so the positional tail stays
+                      // additive; program.cpp passes it.
+                      std::vector<SymbolBinding> indirectSlotBindings = {});
 
 // Link N assembled CUs into one image + commit to `outPath` (the shared half of
 // `compileSingleUnit`). N==1 is the v1 single-CU path; N>1 triggers the linker's

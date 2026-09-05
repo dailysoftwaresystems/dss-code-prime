@@ -167,6 +167,28 @@ struct EvalOptions {
     // with `LossyFloatConversion`. OFF by default — codegen consumers
     // want runtime-equivalent silent precision loss.
     bool refuseOnLossyFloatConversion = false;
+    // ── [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: THE ONE TARGET FACT ON THIS
+    // STRUCT, AND IT IS NOT A POLICY KNOB ────────────────────────────────────
+    // Everything above is a caller's CHOICE; this is an answer the caller is
+    // RELAYING. It is here anyway, and deliberately, because `EvalOptions` is
+    // already the only channel that reaches `applyBinaryInt` — and therefore
+    // `intKindInfo`'s `Char` row — from BOTH the HIR walker and the MIR
+    // optimizer's `ConstFold`, which carries no target and no format of its own.
+    // The row this closes says in as many words that an `EvalOptions`-only fix
+    // is a half-measure that leaves the optimizer blind; the answer was to make
+    // the optimizer pass one too, not to open a second channel.
+    //
+    // The value is `TargetSchema::charIsUnsigned(ObjectFormatKind)` — the ONE
+    // accessor, on the ONE owner, with the format kind required so no caller can
+    // take the processor half alone. NEVER re-derive it: `char` signedness is
+    // (processor × platform) and the same arm64 CPU answers differently under
+    // GNU/Linux and under Darwin.
+    //
+    // ⚠ `nullopt` MEANS "NOT SUPPLIED", AND EVERY `char` FOLD THEN REFUSES —
+    // it does NOT mean signed. A default of `false` would have been correct on
+    // three of the four shipped legs and a silent wrong answer on the fourth,
+    // which is the shape of defect this row exists for.
+    std::optional<bool> charIsUnsigned{};
 };
 
 struct ConstEvalResult {

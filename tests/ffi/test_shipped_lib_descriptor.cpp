@@ -473,9 +473,12 @@ TEST(ShippedLibDescriptor, SymbolLibraryOverrideSentinelFormatFailsLoud) {
 // ══ (UCRT-P4, narrowed by P41) ═══════════════════════════════════════════════
 //
 // Before this guard the shape below compiled rc=0 with NO diagnostic: the macro
-// silently won at preprocess time, nothing could ever call the symbol, and the
-// symbol was STILL eagerly imported (D-FFI-DESCRIPTOR-EAGER-IMPORT) — a dead import
-// in every binary that included the header.
+// silently won at preprocess time and nothing could ever call the symbol. ⓘ It also
+// cost a DEAD IMPORT in every binary that included the header, because a descriptor
+// row was imported whether referenced or not; P57 retired that law
+// ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]) and the dead import went with it. What did NOT
+// go away, and is why this guard stays, is the UNREACHABLE ROW: a declared symbol no
+// call site can ever reach is a platform fact stated and then made unconsultable.
 //
 // ★ THE TESTS BELOW ARE ONE ARGUMENT AND MUST BE READ TOGETHER. The naive rule
 // "same name + overlapping format = error" is FALSE and would red 21 in-tree,
@@ -559,9 +562,10 @@ TEST(ShippedLibDescriptor, FunctionLikeMacroShadowingSymbolWithoutReferenceIsAcc
     DiagnosticReporter rep;
     auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
     EXPECT_TRUE(desc.has_value())
-        << "C 7.1.4p2 guarantees '&g' and '(g)(1)' reach the SYMBOL, so the eager "
-           "import is LIVE — refusing this makes a standard-mandated shape "
-           "undeclarable (it is exactly C23 <stdbit.h>'s stdc_* shape)";
+        << "C 7.1.4p2 guarantees '&g' and '(g)(1)' reach the SYMBOL, so the "
+           "import is REACHABLE and gets emitted the moment a program writes "
+           "either — refusing this makes a standard-mandated shape undeclarable "
+           "(it is exactly C23 <stdbit.h>'s stdc_* shape)";
     EXPECT_FALSE(rep.hasErrors());
 }
 
@@ -597,7 +601,7 @@ TEST(ShippedLibDescriptor, MacroShadowingSymbolItReferencesIsAccepted) {
     // ★ THE C 7.25 <tgmath.h> PATTERN, WHICH THE REAL CORPUS USES 17 TIMES. The
     // replacement REFERENCES the shadowed name, so by C 6.10.3.4p2 (a replacement
     // list is not re-scanned for the macro being replaced) the symbol is the
-    // macro's OWN CALLEE and the eager import is exactly right.
+    // macro's OWN CALLEE, so the import is both reachable and exactly right.
     // RED-ON-DISABLE for the false rule: implement "same name + overlapping format
     // = error" and this test fails, naming tgmath.
     auto const path = writeTemp(dir, "shadow_benign_ref.json", R"JSON({
@@ -3710,9 +3714,27 @@ TEST(ShippedLibDescriptor, ShippedStdioLibraryMapRoutesPerObjectFormat) {
     // `_setjmp`, and the descriptor now reaches it through `linkName`. The
     // GROUP-WIDE atomicity is pinned in tests/ffi/test_pe_crt_costate_binding.cpp;
     // this test keeps its original single-descriptor scope.
-    EXPECT_EQ(desc->library.at("pe"),    "ucrtbase.dll");
-    EXPECT_EQ(desc->library.at("elf"),   "libc.so.6");
-    EXPECT_EQ(desc->library.at("macho"), "/usr/lib/libSystem.B.dylib");
+    //
+    // ★ D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE
+    // RE-AIMED IT AGAIN, and this time the CLAIM moved tier. stdio.json no longer
+    // spells an image on any format: it names the runtime ROLE (`cLibrary`) whose
+    // image the object format's `runtimeLibraries` table owns, and the reader
+    // resolves it only through a caller-supplied resolver. So the descriptor's
+    // own claim — the thing THIS read can witness with no resolver in hand — is
+    // the role, per format, recorded on `libraryRoles`; the image identity
+    // (pe = ucrtbase.dll, never msvcrt.dll) is the format tier's row and is
+    // pinned there (`RuntimeLibraryRoles.NoPeFormatNamesTheLegacyCrtInItsRoleTable`)
+    // and end-to-end by `program/test_descriptor_role_follows_the_table`. A
+    // revert of any arm to a literal reds `link/test_descriptor_library_role_agreement`'s
+    // ratchet. Still one exact assertion per format, and `library` must be EMPTY:
+    // with no resolver a role entry yields no image, and stdio names no literal.
+    ASSERT_EQ(desc->libraryRoles.size(), 3u);
+    EXPECT_EQ(desc->libraryRoles.at("pe"),    RuntimeLibraryRole::CLibrary);
+    EXPECT_EQ(desc->libraryRoles.at("elf"),   RuntimeLibraryRole::CLibrary);
+    EXPECT_EQ(desc->libraryRoles.at("macho"), RuntimeLibraryRole::CLibrary);
+    EXPECT_TRUE(desc->library.empty())
+        << "stdio.json names only roles; a literal here is the duplication the "
+           "row ended";
 }
 
 // An UNKNOWN object-format key in the `library` map is a typo/garbage and fails
@@ -4949,12 +4971,15 @@ TEST(ShippedLibDescriptor, RealIntrinHeaderIsPeOnlyAndCarriesNoEagerSymbols) {
                                                ObjectFormatKind::Elf));
     EXPECT_FALSE(objectFormatInAvailabilitySet(desc->availableObjectFormats,
                                                ObjectFormatKind::MachO));
-    // (2) no eager-import surface — a compiler-intrinsic header must never
-    //     declare linkable symbols (the 0xC0000139 loader trap).
+    // (2) NO IMPORT SURFACE AT ALL — a compiler-intrinsic header must never
+    //     declare linkable symbols (the 0xC0000139 loader trap). Asserted on the
+    //     DESCRIPTOR rather than on an emitted image, so it holds regardless of
+    //     whether any program happens to reference such a row.
     EXPECT_TRUE(desc->symbols.empty())
         << "intrin.h intrinsics are builtins, NOT descriptor symbols — a "
-           "symbols entry here eager-imports a non-export and crashes the "
-           "pe loader (STATUS_ENTRYPOINT_NOT_FOUND)";
+           "symbols entry here plants an import of a non-export, and the first "
+           "program to reference it crashes the pe loader "
+           "(STATUS_ENTRYPOINT_NOT_FOUND)";
     // (3) the size_t typedef is the non-empty payload, u64 on pe64/LLP64.
     ASSERT_EQ(desc->typedefs.size(), 1u);
     EXPECT_EQ(desc->typedefs[0].name, "size_t");
@@ -5462,8 +5487,10 @@ constexpr RecipeExpectation kPinnedRecipes[] = {
 // popen/pclose/fileno are", and BOTH halves of that are now false — `snprintf` reads
 // [elf,macho], and so do `fileno` and (as of this cycle) `popen`/`pclose`. The staging it
 // described was real and its REASON still governs any FUTURE row (the libSystem export was
-// INFERRED, never measured, and under the eager-import law a wrong guess breaks the LOAD of
-// every macho binary that includes <stdio.h>) — it simply ENDED, on a measurement taken on
+// INFERRED, never measured, and a wrong guess breaks the LOAD of every macho binary that
+// REFERENCES the name — every one that so much as INCLUDED <stdio.h>, before P57 retired
+// the eager-import law [[D-FFI-DESCRIPTOR-EAGER-IMPORT]]) — it simply ENDED, on a
+// measurement taken on
 // the operator's real Mac. Nothing here ASSERTS an availability set, so the rot was
 // invisible to the suite; that is exactly why it is corrected rather than left.
 // `puts`/`fputs`/`__stdio_common_vsprintf` remain here and are NOT
@@ -6048,6 +6075,14 @@ TEST(ShippedLibDescriptor, TypedefDataModelVariantSelectsAndFailsLoud) {
 // end-to-end by `examples/c/shipped_ioctl_iowr_macho/`, which
 // `_Static_assert`s the encoded numbers (0xc0207a17 &c.) that were measured
 // against the real SDK sys/ioccom.h.
+//
+// D-FFI-IOCTL-SIZE-FIELD-OVERFLOW-SILENT: the three SIZED arms now end in a
+// per-format SIZE CEILING — a named array member of length 1 in range and -1
+// over it, inside a `struct` defined in `sizeof` and multiplied by `0u`, so an
+// oversized type is a C 6.7.6.2p1 constraint violation and the encoded value of
+// every accepted type is unchanged. This file pins the ceiling as TEXT (which
+// arm carries which literal); `test_shipped_ioctl_size_ceiling.cpp` pins the
+// BEHAVIOUR by compiling boundary types through the real front end.
 TEST(ShippedLibDescriptor, RealIoctlRequestEncodingMacrosPerFormat) {
     fs::path const root = shippedLibsRoot();
     ASSERT_FALSE(root.empty());
@@ -6122,19 +6157,137 @@ TEST(ShippedLibDescriptor, RealIoctlRequestEncodingMacrosPerFormat) {
     expectBody(macho, "_IO",
                "(0x20000000u | (((0u) & 0x1fffu) << 16) | ((g) << 8) | (n))", "macho");
     expectBody(macho, "_IOR",
-               "(0x40000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n))", "macho");
+               "(0x40000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n)"
+               " | (0u * sizeof(struct { char "
+               "dss_ioctl_arg_size_exceeds_IOCPARM_MASK_8191"
+               "[(sizeof(t) > 0x1fffu) ? -1 : 1]; })))", "macho");
     expectBody(macho, "_IOW",
-               "(0x80000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n))", "macho");
+               "(0x80000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n)"
+               " | (0u * sizeof(struct { char "
+               "dss_ioctl_arg_size_exceeds_IOCPARM_MASK_8191"
+               "[(sizeof(t) > 0x1fffu) ? -1 : 1]; })))", "macho");
     expectBody(macho, "_IOWR",
-               "(0xc0000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n))", "macho");
+               "(0xc0000000u | ((sizeof(t) & 0x1fffu) << 16) | ((g) << 8) | (n)"
+               " | (0u * sizeof(struct { char "
+               "dss_ioctl_arg_size_exceeds_IOCPARM_MASK_8191"
+               "[(sizeof(t) > 0x1fffu) ? -1 : 1]; })))", "macho");
     expectBody(elf, "_IO",
                "(((0u) << 30) | ((g) << 8) | (n) | ((0u) << 16))", "elf");
     expectBody(elf, "_IOR",
-               "(((2u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16))", "elf");
+               "(((2u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16)"
+               " | (0u * sizeof(struct { char "
+               "dss_ioctl_arg_size_exceeds_IOC_SIZEMASK_16383"
+               "[(sizeof(t) > 0x3fffu) ? -1 : 1]; })))", "elf");
     expectBody(elf, "_IOW",
-               "(((1u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16))", "elf");
+               "(((1u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16)"
+               " | (0u * sizeof(struct { char "
+               "dss_ioctl_arg_size_exceeds_IOC_SIZEMASK_16383"
+               "[(sizeof(t) > 0x3fffu) ? -1 : 1]; })))", "elf");
     expectBody(elf, "_IOWR",
-               "(((3u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16))", "elf");
+               "(((3u) << 30) | ((g) << 8) | (n) | (sizeof(t) << 16)"
+               " | (0u * sizeof(struct { char "
+               "dss_ioctl_arg_size_exceeds_IOC_SIZEMASK_16383"
+               "[(sizeof(t) > 0x3fffu) ? -1 : 1]; })))", "elf");
+
+    // D-FFI-IOCTL-SIZE-FIELD-OVERFLOW-SILENT: each SIZED arm carries ITS OWN
+    // format's ceiling and NOT the other's. The exact-text pins above already
+    // fix this, but they fail as one opaque string diff; these say which half
+    // moved. `_IO` has no size operand on either format, so it carries neither.
+    struct CeilingExpectation {
+        std::vector<ShippedMacro> const* macros;
+        char const*                      fmtName;
+        char const*                      mine;
+        char const*                      theirs;
+    };
+    for (auto const& exp : std::vector<CeilingExpectation>{
+             {&macho, "macho", "(sizeof(t) > 0x1fffu) ? -1 : 1",
+              "(sizeof(t) > 0x3fffu) ? -1 : 1"},
+             {&elf, "elf", "(sizeof(t) > 0x3fffu) ? -1 : 1",
+              "(sizeof(t) > 0x1fffu) ? -1 : 1"}}) {
+        for (auto const& name : {"_IOR", "_IOW", "_IOWR"}) {
+            auto const* sized = find(*exp.macros, name);
+            ASSERT_NE(sized, nullptr) << name << " on " << exp.fmtName;
+            EXPECT_NE(sized->replacement.find(exp.mine), std::string::npos)
+                << name << " on " << exp.fmtName
+                << " lost its size CEILING — an oversized type would encode a "
+                   "well-formed WRONG request number with no diagnostic "
+                   "(macho truncates to 13 bits, elf overflows into the "
+                   "2-bit DIRECTION field and turns _IOR into _IOWR)";
+            EXPECT_EQ(sized->replacement.find(exp.theirs), std::string::npos)
+                << name << " on " << exp.fmtName
+                << " carries the OTHER format's ceiling — the two are 8191 "
+                   "(Darwin IOCPARM_MASK) and 16383 (Linux _IOC_SIZEMASK), so "
+                   "a copy-paste between the arms mis-sizes one of them";
+        }
+        auto const* io = find(*exp.macros, "_IO");
+        ASSERT_NE(io, nullptr) << "_IO on " << exp.fmtName;
+        EXPECT_EQ(io->replacement.find("? -1 : 1"), std::string::npos)
+            << "_IO on " << exp.fmtName
+            << " has no size operand, so it must carry no ceiling either";
+    }
+
+    // ★★ THE CEILING'S ARRAY MUST STAY *NAMED*, AND THAT IS NOW A MEASURED
+    // CHOICE RATHER THAN THE SHAPE A PARSER GAP ONCE FORCED.
+    //
+    // The exact-text pins above would already catch a lost name — but they fail
+    // as one opaque 200-character string diff, and a lane deliberately
+    // simplifying this guard would simply update them and see green. This
+    // assertion is the one that refuses, and it names the alternative it
+    // refuses so the refusal is arguable rather than mysterious.
+    //
+    // WHY. `sizeof(char[(e) ? -1 : 1])` is the strictly-ISO spelling; DSS could
+    // not parse it when the ceiling shipped, and it CAN since
+    // D-CSUBSET-ABSTRACT-ARRAY-TYPE-NAME closed. It was then re-measured
+    // through this very descriptor and REJECTED, because an abstract declarator
+    // has no identifier at all (C 6.7.7p1) and the identifier is the entire
+    // announcement. At ceiling+1, each reference invoked separately:
+    //   gcc 13.3.0 / mingw-w64 gcc 13.2.0
+    //     named  : size of array 'dss_ioctl_arg_size_exceeds_…' is negative
+    //     plain  : size of unnamed array is negative
+    //   clang 18.1.3
+    //     named  : '…' declared as an array with a negative size
+    //     plain  : array size is negative
+    //   MSVC 19.51 — C2118 negative subscript for both; it names neither.
+    // Three of four references print the name. DSS matters most of all: it
+    // still mislocates a macro-expanded constraint violation to the synthetic
+    // define block and renders a raw source slice, so this identifier is the
+    // ONLY token in its whole message that says WHICH limit was exceeded.
+    // Removing it buys a shorter line and spends the entire signal.
+    struct NamedCeiling {
+        std::vector<ShippedMacro> const* macros;
+        char const*                      fmtName;
+        char const*                      identifier;
+    };
+    for (auto const& exp : std::vector<NamedCeiling>{
+             {&macho, "macho", "dss_ioctl_arg_size_exceeds_IOCPARM_MASK_8191"},
+             {&elf, "elf", "dss_ioctl_arg_size_exceeds_IOC_SIZEMASK_16383"}}) {
+        // `<identifier>[` — the name must sit immediately before the length, so
+        // a name left behind in prose while the declarator went anonymous does
+        // not pass.
+        std::string const declarator = std::string{exp.identifier} + "[";
+        for (auto const& name : {"_IOR", "_IOW", "_IOWR"}) {
+            auto const* sized = find(*exp.macros, name);
+            ASSERT_NE(sized, nullptr) << name << " on " << exp.fmtName;
+            EXPECT_NE(sized->replacement.find(declarator), std::string::npos)
+                << name << " on " << exp.fmtName
+                << ": the size ceiling still fires, but its array is no longer "
+                   "NAMED, so the refusal no longer says what it refused. Three "
+                   "of four references print this identifier and DSS carries it "
+                   "too; without it a user one byte over the limit is told only "
+                   "that an array length must be positive, at a location inside "
+                   "a synthetic define block. See the `$comment` in "
+                   "src/dss-config/shippedLibs/sys/ioctl.json for the five-way "
+                   "measurement behind this.";
+            EXPECT_EQ(sized->replacement.find("sizeof(char["), std::string::npos)
+                << name << " on " << exp.fmtName
+                << ": the ceiling was rewritten to the anonymous ISO form "
+                   "`sizeof(char[(e) ? -1 : 1])`. That form does parse now and "
+                   "it does fire — this is not a conformance objection. It was "
+                   "measured against the named one and lost on diagnostic "
+                   "quality alone. If it is to be adopted anyway, the argument "
+                   "has to beat that measurement, not skip it.";
+        }
+    }
 
     // The per-format VARIANT SELECTION really diverged — if the selector ever
     // handed one format the other's arm, these would compare equal. This is the
@@ -6296,8 +6449,9 @@ static void expectMachoOnlyFn(DarwinBsdClusterRead const& r, std::string_view na
     }
     EXPECT_EQ(sym->availableObjectFormats, (std::vector<std::string>{"macho"}))
         << name << " must be gated macho-ONLY: its only consumers are inside "
-           "os_unix.c's __APPLE__ && SQLITE_ENABLE_LOCKING_STYLE region, and "
-           "DSS eager-imports every DECLARED shipped extern";
+           "os_unix.c's __APPLE__ && SQLITE_ENABLE_LOCKING_STYLE region, and a "
+           "row declared on a format whose runtime lacks the export is a binary "
+           "the LOADER refuses as soon as anything references it";
     EXPECT_TRUE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
                                               ObjectFormatKind::MachO)) << name;
     EXPECT_FALSE(objectFormatInAvailabilitySet(sym->availableObjectFormats,
@@ -6491,8 +6645,9 @@ TEST(ShippedLibDescriptor, RealStdlibJsonMallocZoneMachoOnly) {
 //       the emptiness of the availability set is asserted AND the injector gate is
 //       probed on all three formats;
 //   (4) the LIBRARY comes from the DESCRIPTOR map with pe on `ucrtbase.dll`, and the row
-//       carries NO per-symbol override — the eager-import law means a declared
-//       non-export breaks the LOAD of every binary including <stdlib.h>, and a per-symbol
+//       carries NO per-symbol override — a declared non-export breaks the LOAD of every
+//       binary that REFERENCES it (every one that merely included <stdlib.h>, before P57
+//       retired the eager law [[D-FFI-DESCRIPTOR-EAGER-IMPORT]]), and a per-symbol
 //       override would mint a SECOND owner of a fact declared once and let the two drift.
 //
 // RED-on-disable: delete the row (1 fails), re-sign it `fn(i32, ptr<char>) -> i32`
@@ -6505,12 +6660,17 @@ TEST(ShippedLibDescriptor, RealStdlibJsonSetlocaleUngatedAllFormats) {
     ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
     fs::path const path = root / "stdlib.json";
 
-    // The three (format, expected image) pairs the descriptor map must resolve.
-    struct Leg { ObjectFormatKind fmt; char const* image; char const* arch; };
+    // The three (format, expected ROLE) pairs the descriptor map must declare.
+    // D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: this
+    // used to be (format, expected IMAGE) — ucrtbase.dll / libc.so.6 / libSystem
+    // — read off the descriptor's literal. The image is now the format tier's
+    // `cLibrary` row, named here by ROLE, and its identity is pinned where it is
+    // owned (`RuntimeLibraryRoles.*`, `program/test_descriptor_role_follows_the_table`).
+    struct Leg { ObjectFormatKind fmt; RuntimeLibraryRole role; char const* arch; };
     std::array<Leg, 3> const legs{{
-        {ObjectFormatKind::Pe,    "ucrtbase.dll",                 "x86_64"},
-        {ObjectFormatKind::Elf,   "libc.so.6",                    "x86_64"},
-        {ObjectFormatKind::MachO, "/usr/lib/libSystem.B.dylib",   "arm64"},
+        {ObjectFormatKind::Pe,    RuntimeLibraryRole::CLibrary, "x86_64"},
+        {ObjectFormatKind::Elf,   RuntimeLibraryRole::CLibrary, "x86_64"},
+        {ObjectFormatKind::MachO, RuntimeLibraryRole::CLibrary, "arm64"},
     }};
 
     for (auto const& leg : legs) {
@@ -6558,19 +6718,26 @@ TEST(ShippedLibDescriptor, RealStdlibJsonSetlocaleUngatedAllFormats) {
         EXPECT_TRUE(objectFormatInAvailabilitySet(sym->availableObjectFormats, leg.fmt))
             << "the injector gate must admit setlocale on this format";
 
-        // (4) THE IMAGE comes from the DESCRIPTOR map, and pe is UCRT.
+        // (4) THE IMAGE is the C LIBRARY's, named by ROLE from the DESCRIPTOR map
+        // and resolved by the driver against the object format's own table — pe
+        // in particular reaches ucrtbase.dll (measured export) and never the
+        // legacy msvcrt.dll, because that is what the pe `cLibrary` row says and
+        // `RuntimeLibraryRoles.NoPeFormatNamesTheLegacyCrtInItsRoleTable` keeps it
+        // saying. With no resolver in hand this read sees the DECLARED role and
+        // no image at all — the image map must be EMPTY, never a guess.
         auto const it =
-            r.desc->library.find(std::string{objectFormatKindName(leg.fmt)});
-        ASSERT_NE(it, r.desc->library.end())
-            << "stdlib.json must declare a runtime image for this format";
-        EXPECT_EQ(it->second, leg.image)
-            << "setlocale is eager-imported from this image by EVERY program that "
-               "includes <stdlib.h>; pe in particular must be ucrtbase.dll (measured "
-               "export) and not the legacy msvcrt.dll this arc is retiring";
-        EXPECT_TRUE(sym->library.empty())
-            << "NO per-symbol library override: the descriptor map already names exactly "
-               "the three images setlocale lives in, and a second owner of that fact "
-               "would drift from the first";
+            r.desc->libraryRoles.find(std::string{objectFormatKindName(leg.fmt)});
+        ASSERT_NE(it, r.desc->libraryRoles.end())
+            << "stdlib.json must name a runtime role for this format";
+        EXPECT_EQ(it->second, leg.role)
+            << "setlocale is imported from the C library's image by every program "
+               "that CALLS it, on every format";
+        EXPECT_EQ(r.desc->library.count(std::string{objectFormatKindName(leg.fmt)}), 0u)
+            << "no resolver was supplied, so no image may have been invented";
+        EXPECT_TRUE(sym->library.empty() && sym->libraryRoles.empty())
+            << "NO per-symbol library override: the descriptor map already names the "
+               "role setlocale lives under on all three formats, and a second owner "
+               "of that fact would drift from the first";
     }
 }
 
@@ -6584,11 +6751,18 @@ TEST(ShippedLibDescriptor, RealSysTimeJsonFutimesMachoOnly) {
         DarwinBsdClusterRead m;
         ASSERT_NO_FATAL_FAILURE(readDarwinBsdCluster(path, arch,
                                                      ObjectFormatKind::MachO, m));
-        // The timeval pointer keeps utimes' own ptr<void> spelling (sqlite's
-        // sole call passes NULL, so no layout knowledge rides on the param).
+        // ⚠ THIS EXPECTATION WAS INVERTED IN P56 (lane sv,
+        // [[D-FFI-SHIPPED-DESCRIPTORS-DECLARE-STRUCTS-THEIR-OWN-SIGNATURES-DO-NOT-USE]])
+        // and the sentence that stood here is kept so the inversion is legible:
+        // "The timeval pointer keeps utimes' own ptr<void> spelling (sqlite's sole
+        // call passes NULL, so no layout knowledge rides on the param)". That
+        // argued from ONE CALL SITE to a TYPE — the wrong direction; a shipped
+        // signature states what the API IS. The SDK spells it
+        // `int futimes(int, const struct timeval *)`, this descriptor already
+        // declared `timeval`, so the pointee is now that STRUCT.
         expectMachoOnlyFn(m, "futimes", K::I32,
                           {K::I32, K::Ptr},
-                          {std::nullopt, K::Void});
+                          {std::nullopt, K::Struct});
     }
 
     DarwinBsdClusterRead e;
@@ -6639,8 +6813,8 @@ TEST(ShippedLibDescriptor, RealUnistdJsonFsctlMachoOnly) {
     // ⚠ THE CONTROL MOVED OFF `close`, AND WHY IT HAD TO IS THE POINT. Every
     // `unistd.json` symbol row is now explicitly gated, and MUST be: the header
     // opened on pe, where an ungated POSIX row would declare an extern the
-    // runtime does not export and break the binary's LOAD under the
-    // eager-import law. `lseek` is NOT a control (it is gated too) — so the
+    // runtime does not export and break the LOAD of any binary that reaches
+    // it. `lseek` is NOT a control (it is gated too) — so the
     // control is the descriptor-level fact instead, asserted on the row this
     // test already read: `fsctl` carries a set, and the set is EXACTLY [macho].
     // That keeps the control's job (prove `availableObjectFormats` is being
@@ -6717,7 +6891,7 @@ TEST(ShippedLibDescriptor, RealUnistdJsonDarwinFsSysctlMachoOnly) {
                                                    ObjectFormatKind::Elf))
             << name << " must NOT be injected on elf: glibc exports no "
                        "sysctlbyname, and declaring it there would plant an "
-                       "undefined import (DSS eager-imports every shipped extern)";
+                       "undefined import the loader cannot resolve";
     }
     // Positive control — see the twin in `RealUnistdJsonFsctlMachoOnly` for why
     // it is no longer `close`: every `unistd.json` symbol row is now explicitly

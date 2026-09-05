@@ -139,10 +139,27 @@ struct PrattRules {
 //   * ternary middle    → `AfterTernaryMiddle`
 //   * ternary else      → `AfterTernaryElse`
 //   * infix RHS         → `AfterInfixRhs`
-// (the paren / postfix-body atom re-entry stays a `walkExpression`
-// call, which opens a FRESH driver baseline on the SAME work-stack —
-// see `driveExprWorkStack`). Left/None-assoc chains never push a child:
-// they wrap in place inside `Climb`, exactly as before.
+// Left/None-assoc chains never push a child: they wrap in place inside
+// `Climb`, exactly as before.
+//
+// ★★★ P60 (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED):
+// THE ATOM / POSTFIX-BODY RE-ENTRY IS A PHASE TOO, NOT A HOST CALL. Stage 5
+// left one recursion in place — the paren / postfix-body atom, where the
+// walker handed the schema dispatch a frame depth to close down to
+// (`parseUntilFrameDepth`) and BLOCKED on it, and that dispatch re-entered
+// `walkExpression` for the inner expression, which opened a fresh driver
+// loop on the same vector. One nested `(` therefore cost five host frames
+// (`driveExprWorkStack → exprPrimaryStep → parseUntilFrameDepth → stepOnce →
+// walkExpression`), and with a speculative alt in between (a cast) three more.
+// ✔MEASURED 2026-09-04, gdb-attributed on the MSVC 19.51 Debug build: 8576
+// bytes per nested cast, 1 MB gone at ~120 levels, while the config's ceiling
+// promised a loud refusal at 320. Now the frame RECORDS the depth it is waiting
+// for (`AwaitDispatch` + `awaitDepth`) and the parser's ONE driver
+// (`Parser::Impl::driveParse_`) runs the schema dispatch until that depth is
+// reached, then resumes the frame at `resumePhase`; a `walkExpression` re-entry
+// pushes a root frame that closes its own `exprRule` frame when it pops
+// (`closesEntryFrame`) instead of running a nested loop. No host frame is ever
+// held across a nesting level.
 struct ExprFrame {
     enum class Phase : std::uint8_t {
         Primary,             // parse the primary (prefix op or atom)
@@ -151,6 +168,11 @@ struct ExprFrame {
         AfterTernaryMiddle,  // resume: check `:`, parse the else clause
         AfterTernaryElse,    // resume: close the ternary wrapper
         AfterInfixRhs,       // resume: close the binary wrapper
+        AwaitDispatch,       // the schema dispatch is closing frames down to
+                             // `awaitDepth`; resume at `resumePhase` once there
+        AfterPostfixFollower,// resume: close the postfix wrapper, climb
+        AfterGroupedBody,    // resume: expect `groupedEndsAt`, close the
+                             // postfix wrapper, climb
     };
 
     PrattRules         rules;
@@ -166,6 +188,25 @@ struct ExprFrame {
     // transition); ignored otherwise.
     SchemaTokenId      ternaryMiddleTok{};   // the `:` separator token id
     std::int32_t       ternaryElsePrec = 0;  // the else clause's minPrec
+    // `AwaitDispatch` contract: the parser-frame depth the schema dispatch has
+    // to close down to (the depth BEFORE the atom / body frame was opened) and
+    // the phase to resume at once it has — exactly the two facts the blocking
+    // `parseUntilFrameDepth` call used to hold on the host stack.
+    std::size_t        awaitDepth  = 0;
+    Phase              resumePhase = Phase::Climb;
+    // `AfterGroupedBody` contract: the closer the grouped postfix expects
+    // after its body (the operator-table entry's `endsAt`), captured at the
+    // opener so the resume can check it after the body has been parsed.
+    SchemaTokenId      groupedEndsAt{};
+    // True for the ROOT frame a `walkExpression` entry pushes: popping it
+    // closes the `exprRule` frame that entry opened, which the blocking form
+    // did with a `closeFrameOnce()` after its nested drive returned.
+    bool               closesEntryFrame = false;
+    // `Impl::specStack.size()` when this frame was pushed. The driver's
+    // "who is innermost?" test: a speculation site pushed AFTER this frame
+    // (its dispatch ran under this frame's await) is innermost and is driven
+    // first; the frame resumes only once every such site has been decided.
+    std::size_t        specDepthAtPush = 0;
 };
 
 } // namespace
@@ -289,14 +330,91 @@ struct Parser::Impl {
     // speculation rollback to keep accounting honest.
     std::size_t diagsEmitted = 0;
 
-    // Speculation-nesting counter. Incremented on entry to
-    // `trySpeculativeBranch`, decremented on every exit path. Bound
-    // by `config.maxSpeculationDepth`; over-cap entry emits
-    // `P_MaxSpeculationDepth` and refuses the probe (caller then
-    // emits `P_BacktrackFailed` + consumes peek for forward
-    // progress). Adversarial input that nests speculative alts
-    // indefinitely would otherwise stack-loop the call stack.
+    // Speculation-nesting counter: the number of LIVE `SpeculationProbe`s
+    // (each one's ctor increments it, its dtor decrements it). Bound by
+    // `config.maxSpeculationDepth`; over-cap entry LATCHES `speculationCapHit_`
+    // and refuses the probe. ★ Since P60 a probe lives on the heap
+    // (`specStack`), so this is a SEMANTIC nesting limit that fails loud by
+    // name — no longer a stand-in for a host-stack backstop
+    // (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED).
     std::size_t speculationDepth = 0;
+
+    // ── the speculation-ceiling LATCH ────────────────────────────────
+    //
+    // Set when a speculative probe is abandoned because one of the
+    // speculation ceilings was reached — either the DEPTH cap
+    // (`config.maxSpeculationDepth`) or the per-probe TOKEN budget
+    // (`config.speculationBudgetFactor` × the alt's declared lookahead).
+    // Carries which ceiling, and the token the parser was looking at
+    // (span + already-rendered lexeme) so the refusal can be POSITIONED
+    // where the parse actually ran out of resource.
+    //
+    // ★ DELIBERATELY NOT CAPTURED/RESTORED BY `SpeculationProbe`, unlike
+    // every other piece of parser state. A ceiling the parse actually
+    // reached is a fact about the PARSE, not a property of the branch
+    // that discovered it — and rolling it back with the branch is
+    // exactly what used to make it invisible: the over-cap
+    // `P_MaxSpeculationDepth` was emitted INSIDE a probe, so the
+    // enclosing probe both (a) erased it on rollback and (b) read the
+    // emission as "this branch failed", cascading into a
+    // `P_NoAlternativeMatched` positioned on the user's own — correct —
+    // token. Nine nested `(int)` casts were refused with a fabricated
+    // syntax error blaming the `int`
+    // (D-PARSE-NINE-NESTED-CASTS-ARE-REFUSED-BY-THE-SPECULATION-CAP-WITH-A-FABRICATED-SYNTAX-ERROR).
+    //
+    // Lifetime: RESET at every depth-0 entry to the speculative-alt
+    // candidate loop and CONSUMED by `recoverSpeculationTooDeep_` at
+    // depth 0. So a ceiling hit under an alt that then resolved through
+    // another candidate cannot be blamed on a later, unrelated alt —
+    // the misattribution this whole mechanism exists to delete.
+    enum class SpeculationCeiling : std::uint8_t {
+        Depth,            // config.maxSpeculationDepth
+        TokenBudget,      // config.speculationBudgetFactor x alt lookahead
+        ExpressionDepth,  // config.maxExpressionDepth, hit INSIDE a probe
+    };
+    struct SpeculationCapHit {
+        SourceSpan         span;
+        std::string        actual;   // pre-rendered, quoted (renderActual)
+        std::size_t        limit;    // the ceiling's value, as configured
+        SpeculationCeiling which;
+    };
+    std::optional<SpeculationCapHit> speculationCapHit_;
+
+    // ── the cascade shield ───────────────────────────────────────────
+    //
+    // Set when a speculation ceiling has been reported and the construct
+    // it fired inside was ABANDONED. Everything still ahead of the parser
+    // in that construct is unparseable BY OUR OWN DECISION, not by the
+    // author's: each remaining alternative re-reaches the same ceiling and
+    // each failure lands on a token the author wrote correctly. ✔MEASURED
+    // on `(int)` x321 at cap 320: one honest `P_MaxSpeculationDepth`
+    // followed by ~320 `P_BacktrackFailed`, one per cast, every one of
+    // them pointing at a valid `(`.
+    //
+    // While set, a recovery site at depth 0 still RECOVERS (Error leaf +
+    // panic scan + forward progress — the tree and the exit code are
+    // unchanged) but does not SPEAK, until the parser reaches a
+    // schema-declared sync token and the region is genuinely over. That is
+    // this file's own bar — one structural error yields one diagnostic —
+    // applied to the one recovery that was exempt from it.
+    //
+    // ⚠ DEPTH 0 ONLY. A suppressed emission inside a probe would also
+    // suppress the `emittedDiag()` DELTA the probe reads as "this branch
+    // failed", and the probe would COMMIT a half-built branch. Inside a
+    // probe the diagnostics are rolled back anyway, so there is nothing to
+    // shield there.
+    bool suppressCascadeUntilSync_ = false;
+
+    // Latch one ceiling hit at `peek`. FIRST hit wins: the deepest /
+    // earliest refusal is the one that describes where the parse actually
+    // ran out, and a later outer refusal is its consequence.
+    void latchSpeculationCeiling_(SpeculationCeiling which,
+                                  std::size_t        limit) {
+        if (speculationCapHit_) return;
+        Token const& peek  = tokens.peek();
+        speculationCapHit_ = SpeculationCapHit{peek.span, renderActual(peek),
+                                               limit, which};
+    }
 
     // Pratt-walker expression-nesting depth. Incremented on every PUSH
     // onto `exprWorkStack` (each push = one logical level the recursive
@@ -305,19 +423,18 @@ struct Parser::Impl {
     // an explicit counter for a self-documenting cap check at the push
     // site. When it would exceed `config.maxExpressionDepth` the walker
     // emits a positioned `P_ExpressionTooDeep` diagnostic and recovers (it
-    // does NOT abort) — the descent is now FLAT (an explicit heap work-
-    // stack, see `ExprFrame` / `driveExprWorkStack`), so the cap is a
-    // SEMANTIC nesting limit, no longer a host-stack-overflow backstop.
+    // does NOT abort) — the descent is FLAT (an explicit heap work-stack,
+    // see `ExprFrame` / `driveParse_`), so the cap is a SEMANTIC nesting
+    // limit, no longer a host-stack-overflow backstop.
     std::size_t expressionDepth = 0;
 
     // The EXPLICIT expression-descent work-stack (D-PARSE-DEEP-NEST-RECURSION-MEMORY).
-    // Replaces the recursive `parseExpressionAt`
-    // re-entries with heap frames so a deeply-nested expression carries
-    // FLAT O(1) host-stack cost. `driveExprWorkStack(baseline)` processes
-    // frames until the stack returns to `baseline`; each `walkExpression`
-    // entry records a baseline, pushes its root frame, and drives down to
-    // it — so re-entrant `walkExpression` (a paren / postfix-rule body)
-    // nests cleanly on the SAME vector. A `SpeculationProbe` that rolls
+    // Replaces the recursive `parseExpressionAt` re-entries with heap frames
+    // so a deeply-nested expression carries FLAT O(1) host-stack cost. Every
+    // `walkExpression` entry — the schema dispatch reaching an `expr` rule, a
+    // speculative expr-shaped branch, a postfix follower / grouped body —
+    // pushes a ROOT frame here and RETURNS; the parser's one driver
+    // (`driveParse_`) runs whatever is on top. A `SpeculationProbe` that rolls
     // back mid-expression truncates this back to its pre-probe size
     // (`exprWorkStackSizeBefore_`), exactly as it pops `frames`.
     std::vector<ExprFrame> exprWorkStack;
@@ -326,7 +443,7 @@ struct Parser::Impl {
     // — reused across tokens so the speculative hot path performs zero
     // heap allocations after warmup. Sized ONCE in the ctor
     // (maxSpeculationDepth + 2: the over-cap guard in
-    // `trySpeculativeBranch` bounds live depths at the cap, +1 for depth
+    // `startNextCandidate_` bounds live depths at the cap, +1 for depth
     // 0, +1 belt-and-braces) so the OUTER vector never reallocates —
     // a span over slot D stays valid while nested probes fill slot D+1.
     // See the lifetime contract on `candidateBranches`.
@@ -354,13 +471,21 @@ struct Parser::Impl {
         , schema(std::move(sc))
         , tokens(std::move(ts))
         , budget(bdg)
+        // Designated initializers, not positional: this copies EVERY
+        // `ParserConfig` field except the walker (moved out separately
+        // below), so a field added to the struct and forgotten here would
+        // silently parse at the C++ fallback instead of the language's
+        // configured value — the exact failure shape that let the two
+        // speculation caps stay hardcoded. Naming each field makes the
+        // omission visible at the edit site.
         , config{
-            cfg.maxSpeculationDepth,
-            cfg.maxExpressionDepth,
-            cfg.recoveryStrategy,
-            cfg.maxSyncScanTokens,
-            nullptr,
-            std::move(cfg.seedGlobalTypeNames),
+            .maxSpeculationDepth     = cfg.maxSpeculationDepth,
+            .speculationBudgetFactor = cfg.speculationBudgetFactor,
+            .maxExpressionDepth      = cfg.maxExpressionDepth,
+            .recoveryStrategy        = cfg.recoveryStrategy,
+            .maxSyncScanTokens       = cfg.maxSyncScanTokens,
+            .prattWalker             = nullptr,
+            .seedGlobalTypeNames     = std::move(cfg.seedGlobalTypeNames),
           }
         , identifierKind(schema->schemaTokens().find("Identifier"))
         , errorKind(schema->schemaTokens().find("Error"))
@@ -429,6 +554,22 @@ struct Parser::Impl {
     void emitParserError(DiagnosticCode code, SourceSpan span,
                          std::string actual,
                          std::span<SchemaTokenId const> expected = {}) {
+        // THE CASCADE SHIELD (see `suppressCascadeUntilSync_`). Recovery is
+        // untouched — the Error leaf, the panic scan, the frames, the tree
+        // and the exit code are all exactly what they were — only the
+        // SPEAKING stops, and only while walking out of a construct a
+        // speculation ceiling has already reported and abandoned. Placed at
+        // the single emission chokepoint rather than at `recoverAt`, because
+        // the cascade arrives through three of them (`recoverAt`,
+        // `synthesizeMissingRule`, the direct `P_UnexpectedToken` /
+        // `P_MissingRequiredChild` sites) and shielding one leaves the
+        // others talking.
+        //
+        // ⚠ DEPTH 0 ONLY: a suppressed emission inside a probe would also
+        // suppress the `diagsEmitted` DELTA the probe reads as "this branch
+        // failed", and the probe would commit a half-built branch. Inside a
+        // probe every diagnostic is rolled back anyway.
+        if (suppressCascadeUntilSync_ && speculationDepth == 0) return;
         ParseDiagnostic d;
         d.code        = code;
         d.severity    = DiagnosticSeverity::Error;
@@ -544,6 +685,25 @@ struct Parser::Impl {
     // operator peek), so exactly one diagnostic surfaces. The Error
     // leaf propagates HasError up through every wrapper frame.
     void recoverExpressionTooDeep_(Token const& peek) {
+        // ★ INSIDE A SPECULATIVE PROBE THIS DIAGNOSTIC DOES NOT SURVIVE, so
+        // latch the fact as well. The emission below both (a) is erased when
+        // the enclosing probe rolls its reporter back and (b) marks the probe
+        // as having emitted, i.e. as having FAILED — after which the alt's
+        // non-speculative fallback replay ends in a `P_NoAlternativeMatched`
+        // against a token the user wrote correctly. So the honest ceiling
+        // (`P_ExpressionTooDeep`, which knows its own name and value) was
+        // being swapped for a fabricated syntax error, exactly as the two
+        // speculation ceilings were. ✔MEASURED on `(int)`-chains with the
+        // speculation ceilings lifted: 1023 compiled rc 0 and 1024 was
+        // refused with `expected Identifier … got 'int'` and no mention of
+        // the expression cap at all. Latching lets the outermost alt report
+        // the real ceiling by name (see `recoverSpeculationTooDeep_`).
+        // At depth 0 there is no probe to erase it, so the emission below is
+        // the whole story and nothing is latched.
+        if (speculationDepth > 0) {
+            latchSpeculationCeiling_(SpeculationCeiling::ExpressionDepth,
+                                     config.maxExpressionDepth);
+        }
         // No `expected` set — the reporter renders `got <actual>`, so
         // `actual` carries the explanation plus the offending lexeme.
         emitParserError(
@@ -554,6 +714,98 @@ struct Parser::Impl {
                 renderActual(peek), config.maxExpressionDepth));
         (void)panicRecover();
         stepRecovered_ = true;
+    }
+
+    // REPORT an OVER-SPECULATED region: while disambiguating the
+    // alternatives at some token, the parser hit one of its speculation
+    // ceilings — nested probes `config.maxSpeculationDepth` deep, one probe
+    // past its token budget, or the expression-nesting cap reached inside a
+    // probe — and abandoned, so it never learned which alternative was
+    // right. Called ONLY at `speculationDepth == 0` — the outermost alt owns
+    // the whole speculation subtree the ceiling was reached inside — and
+    // only once per hit (the latch is consumed here).
+    //
+    // ★ REPORTS ONLY; IT DOES NOT RECOVER. The alt's existing recovery (the
+    // nullable skip, the declared-last fallback replay, then
+    // `P_BacktrackFailed` + panic scan) runs immediately after this,
+    // UNCHANGED — same tokens consumed, same frames, same tree. That is
+    // deliberate: the defect being fixed is what the compiler SAYS, and a
+    // bespoke recovery path here would be a second, untested unwinder for
+    // the rarest case in the parser. ✔MEASURED: an earlier attempt that did
+    // recover here — discarding to the next sync token — left the walker
+    // still needing an operand, ate the statement's `;` and the block's `}`,
+    // and ended in `P_BuilderInvariant: scope stack non-empty at finish`.
+    // The shield below deletes the cascade instead, which is the part that
+    // was wrong.
+    //
+    // ★ THE DIAGNOSTIC NAMES ITS OWN LIMIT. The refusal is the PARSER's
+    // resource ceiling, not a defect in the program: the token at the
+    // reported position may be — and in the motivating case is —
+    // perfectly valid C that gcc, clang, mingw-w64 gcc and MSVC all
+    // accept. Saying `expected Identifier … got 'int'` there sends the
+    // reader to fix code that is already right, which is worse than
+    // saying nothing. MSVC's own ceiling reports itself the same honest
+    // way (`fatal error C1026: parser stack overflow, program too
+    // complex`) and names no token of the user's.
+    //
+    // Positioned at the token the DEEPEST refused probe was looking at
+    // (where the nesting actually ran out), then panic-scans forward to
+    // the next stop-point so the parse makes progress and the rest of the
+    // file is still diagnosed — the same shape as
+    // `recoverExpressionTooDeep_`, never an abort.
+    void reportSpeculationCeiling_() {
+        const SpeculationCapHit hit = *speculationCapHit_;
+        speculationCapHit_.reset();
+        // ONE owner for the three ceilings' vocabulary: the code, the prose
+        // name and the config key that sets it, so a reader who sees the
+        // message can find the knob and a future ceiling cannot be added
+        // with only two of the three filled in.
+        struct Ceiling {
+            DiagnosticCode code;
+            char const*    what;
+            char const*    key;
+        };
+        const Ceiling c = [&]() -> Ceiling {
+            switch (hit.which) {
+            case SpeculationCeiling::Depth:
+                return {DiagnosticCode::P_MaxSpeculationDepth,
+                        "speculation-depth limit", "maxSpeculationDepth"};
+            case SpeculationCeiling::TokenBudget:
+                return {DiagnosticCode::P_SpeculationBudgetExhausted,
+                        "per-alternative token budget",
+                        "speculationBudgetFactor"};
+            case SpeculationCeiling::ExpressionDepth:
+                break;
+            }
+            return {DiagnosticCode::P_ExpressionTooDeep,
+                    "expression-nesting limit", "maxExpressionDepth"};
+        }();
+        // No `expected` set — the reporter renders `got <actual>`, so
+        // `actual` carries the explanation plus the offending lexeme. The
+        // message names the LIMIT, its VALUE and the CONFIG KEY that sets
+        // it, and says in as many words that the token may be valid — the
+        // three things the fabricated `P_NoAlternativeMatched` it replaces
+        // got wrong.
+        emitParserError(
+            c.code, hit.span,
+            std::format(
+                "{} — the parser gave up choosing between the alternatives "
+                "that start here because it reached its {} of {}, so this "
+                "construct was not parsed; the token itself may be valid "
+                "(the limit is the language config's `parser.{}`)",
+                hit.actual, c.what, hit.limit, c.key));
+        // Raise the shield AFTER speaking, so the ceiling's own diagnostic is
+        // the one that gets through and everything the alt's ordinary
+        // recovery says on the way out of the same construct does not.
+        //
+        // ⚠ NOT RAISED AT ALL for a grammar that declares no `syncTokens`:
+        // the shield's only exit is reaching one, so without any the silence
+        // would run to end of file and swallow every later diagnostic in the
+        // translation unit. Failing toward SPEAKING is the only safe default
+        // for a mechanism whose whole job is to say less.
+        if (!schema->syncTokens().empty()) {
+            suppressCascadeUntilSync_ = true;
+        }
     }
 
     // Recover a MISSING required RULE: the dispatch needs to descend into
@@ -819,18 +1071,40 @@ struct Parser::Impl {
     // once `out.size() > cap` — the triage only ever distinguishes
     // "exactly one" from "more". Error/Missing leaves count as content
     // (a non-identifier form → rule-1 commit; semantic diagnoses).
+    //
+    // ★★ THE DESCENT COSTS HEAP, NOT HOST CALL FRAMES
+    // (feedback-no-input-proportional-recursion, operator 2026-09-02). `cap`
+    // bounds the OUTPUT, never the DEPTH: the walk still has to reach the
+    // leftmost leaf, and that path is as deep as the subtree — the parser's own
+    // `maxExpressionDepth` says nothing about it, since this runs over a subtree
+    // that is already BUILT. `pending` is that stack; children are pushed in
+    // REVERSE so they pop left-to-right, which is the order the recursion
+    // visited them in and which the "first leaf" tests below depend on.
+    //
+    // The empty-space filter stays exactly where it was — applied to CHILDREN at
+    // the push site, and to a LEAF as it is recorded (which is what makes an
+    // empty-space ROOT contribute nothing while an internal root is still
+    // entered). ✔MEASURED before the conversion, on the ordinary thread through
+    // `ctest`: no C source could drive this past a handful of levels, because in
+    // every guarded shape the leftmost path hits a token almost immediately
+    // (`(a)(x+1+…+1)` at 38812 terms returned rc 0). It is converted anyway — the
+    // bound was a property of today's grammars, not of this code.
     void collectLeavesBelow_(NodeId node, std::vector<NodeId>& out,
                              std::size_t cap) const {
-        if (out.size() > cap) return;
-        const NodeKind k = builder->nodeKind(node);
-        if (k != NodeKind::Internal) {
-            if (!isEmptySpace(builder->nodeFlags(node))) out.push_back(node);
-            return;
-        }
-        for (NodeId c : builder->nodeChildren(node)) {
-            if (isEmptySpace(builder->nodeFlags(c))) continue;
-            collectLeavesBelow_(c, out, cap);
+        std::vector<NodeId> pending{node};
+        while (!pending.empty()) {
             if (out.size() > cap) return;
+            const NodeId n = pending.back();
+            pending.pop_back();
+            if (builder->nodeKind(n) != NodeKind::Internal) {
+                if (!isEmptySpace(builder->nodeFlags(n))) out.push_back(n);
+                continue;
+            }
+            const std::span<NodeId const> kids = builder->nodeChildren(n);
+            for (std::size_t i = kids.size(); i-- > 0;) {
+                if (isEmptySpace(builder->nodeFlags(kids[i]))) continue;
+                pending.push_back(kids[i]);
+            }
         }
     }
 
@@ -1084,7 +1358,7 @@ struct Parser::Impl {
     // probe's calls run at depth+1 (its SpeculationProbe increments
     // `speculationDepth` first), hitting a different slot. The pool is
     // sized ONCE (maxSpeculationDepth + 2 — the over-cap guard in
-    // trySpeculativeBranch bounds live depths) so inner buffers never move
+    // startNextCandidate_ bounds live depths) so inner buffers never move
     // while an outer span is live.
     [[nodiscard]] std::span<RuleId const>
     candidateBranches(SchemaTokenId tokKind, std::size_t lookahead,
@@ -1208,16 +1482,20 @@ struct Parser::Impl {
             // the delta `nowDesynced && !desyncedBefore` only fails
             // when *this branch* tripped the latch.
             , desyncedBefore_(impl.walker.isDesynced())
-            // Budget: 16× the schema's declared lookahead. The
-            // declared lookahead is the disambiguation distance,
-            // not a total-cost bound, so multiply by a generous
-            // factor to let the branch make legitimate progress
-            // (descents, token consumption) while still aborting
-            // adversarial input.
-            , budget_(static_cast<std::size_t>(
-                  impl.walker.lookahead() > 0
-                      ? impl.walker.lookahead() * 16u
-                      : 64u))
+            // Budget: `config.speculationBudgetFactor` × the schema's
+            // declared lookahead. The declared lookahead is the
+            // disambiguation distance, not a total-cost bound, so the
+            // factor is what lets the branch make legitimate progress
+            // (descents, token consumption) while still abandoning
+            // adversarial input. The factor is CONFIG-DRIVEN (fallback
+            // 16, the constant that used to be spelled here); the
+            // lookahead-less fallback keeps its historic shape of
+            // 4×factor so an alt with no declared lookahead is unchanged
+            // at the default.
+            , budget_(impl.walker.lookahead() > 0
+                          ? static_cast<std::size_t>(impl.walker.lookahead())
+                                * impl.config.speculationBudgetFactor
+                          : 4u * impl.config.speculationBudgetFactor)
             , stepRecoveredBefore_(impl.stepRecovered_)
             // FC4 c1: the forward-progress watchdog tuple is probe state
             // too. Without restoring it, a rolled-back probe leaves
@@ -1271,20 +1549,16 @@ struct Parser::Impl {
                 // `impl_.frames`, popped above), so a plain `resize` is the
                 // complete restore.
                 //
-                // DEFENSE-IN-DEPTH, not currently load-bearing: every entry into
-                // the expression descent (`DefaultPrattWalker::walkExpression`,
-                // including the re-entrant paren / postfix-body atom) records a
-                // baseline and `driveExprWorkStack`s the stack back DOWN to it
-                // before returning — so the work-stack (and `expressionDepth`)
-                // is BALANCED at every speculation boundary, exactly as the
-                // recursive predecessor's RAII `DepthGuard` kept `expressionDepth`
-                // balanced (that probe restored neither, correctly). Verified:
-                // disabling these two lines leaves the whole speculation + cast
-                // suite green, including the deep speculate-rollback pin. They
-                // are retained so a FUTURE change to the drive/speculation
-                // boundary that breaks the balance invariant cannot silently
-                // desync the parser — the restore makes the invariant a
-                // guarantee rather than a coincidence.
+                // LOAD-BEARING SINCE P60. With the expression frames and the
+                // speculation sites driven from one loop, a frame pushed INSIDE
+                // this probe's branch is still on the work-stack when the branch
+                // is abandoned (the driver only reaches this probe's checks once
+                // those frames are innermost no longer, i.e. once they popped —
+                // but a rollback triggered by the branch's Done / desync leaves
+                // nothing above, and the resize below is what makes that a
+                // guarantee rather than an argument). Before P60 the nested
+                // drive balanced the stack before returning and these two lines
+                // were defense-in-depth only; now they ARE the restore.
                 impl_.exprWorkStack.resize(exprWorkStackSizeBefore_);
                 impl_.expressionDepth = expressionDepthBefore_;
                 impl_.walker.restore(std::move(*walkerSnap_));
@@ -1308,7 +1582,7 @@ struct Parser::Impl {
         // Token position at probe construction. Used by the
         // commitAfterPrefix CUT to measure how many tokens the branch has
         // consumed since the probe opened (vs. the rule's fixed prefix
-        // length). See `trySpeculativeBranch`.
+        // length). See the site's post-step checks in `driveParse_`.
         [[nodiscard]] std::size_t startPos() const noexcept {
             return probeStartPos_;
         }
@@ -1320,6 +1594,10 @@ struct Parser::Impl {
         [[nodiscard]] bool exceededBudget() const noexcept {
             return impl_.tokens.position() - probeStartPos_ > budget_;
         }
+
+        // The token budget this probe was given, for the fail-loud
+        // diagnostic that names it.
+        [[nodiscard]] std::size_t budget() const noexcept { return budget_; }
 
         [[nodiscard]] bool emittedDiag() const noexcept {
             return impl_.diagsEmitted > diagsBefore_;
@@ -1379,33 +1657,6 @@ struct Parser::Impl {
         bool                                   committed_ = false;
     };
 
-    // Drive the dispatch loop until the parser-frame stack drops back
-    // to `targetDepth`. Used by `DefaultPrattWalker` to delegate atom
-    // parsing to the schema-driven recursive-descent machinery — the
-    // walker opens an atom rule frame and then hands off until that
-    // frame closes. Mirrors the inner-loop pattern in
-    // `trySpeculativeBranch` minus the failure-mode bookkeeping.
-    //
-    // On `stepOnce → Done` mid-atom (EOF before the atom frame closed),
-    // emits `P_PrematureEndOfInput` and forcibly closes remaining
-    // frames down to `targetDepth`. Silent return would leave the
-    // walker with an unbalanced frame stack and the caller would close
-    // the wrong rule on its own teardown.
-    void parseUntilFrameDepth(std::size_t targetDepth) {
-        while (frames.size() > targetDepth) {
-            if (stepOnce() == StepOutcome::Done) {
-                if (frames.size() > targetDepth) {
-                    emitParserError(
-                        DiagnosticCode::P_PrematureEndOfInput,
-                        tokens.peek().span,
-                        "premature end of input inside Pratt-walker atom");
-                    while (frames.size() > targetDepth) closeFrameOnce();
-                }
-                return;
-            }
-        }
-    }
-
     // Open a frame for `rule` (parser side + builder side + parser
     // walker entry), mirroring the inline pattern previously repeated
     // at every walker open site. Pushes to the parallel `frameRules`
@@ -1460,139 +1711,281 @@ struct Parser::Impl {
         return true;
     }
 
-    // Try one speculative branch. Opens the branch frame inside a
-    // `SpeculationProbe` and drives `stepOnce` repeatedly until
-    // either the branch's frame closes (`frames.size() ==
-    // probe.targetDepth()` → success → commit + return true) or a
-    // failure signal fires:
-    //   - probe.isDesynced()    → grammar mismatch this branch
-    //   - probe.exceededBudget()→ 16 × `walker.lookahead()` safety
-    //                             bound; a branch that doesn't close
-    //                             within budget is unlikely to be
-    //                             the right choice
-    //   - probe.emittedDiag()   → branch dispatch raised
-    //                             P_NoAlternativeMatched /
-    //                             P_UnexpectedToken /
-    //                             P_MissingRequiredChild
-    //   - stepOnce → Done       → reached EOF mid-branch; needs more
-    //                             input
-    // Any return-without-commit path triggers the probe's RAII
-    // restore (tokens + builder + walker + frames + diag counter).
-    [[nodiscard]] bool trySpeculativeBranch(RuleId branch) {
-        if (speculationDepth >= config.maxSpeculationDepth) {
-            emitParserError(
-                DiagnosticCode::P_MaxSpeculationDepth,
-                tokens.peek().span,
-                std::format(
-                    "parser speculation depth {} exceeds configured cap {}",
-                    speculationDepth, config.maxSpeculationDepth));
-            return false;
-        }
-
-        // FC2: an ambiguous type-name candidate produced by the commit
-        // triage must SURVIVE the rollback of its own probe (the
-        // rolled-back value reading is the chosen parse; the candidate
-        // is the oracle's input for the cross-file second chance). The
-        // probe's RAII restore covers the sketch — so the triage hands
-        // the candidate OUT and it is recorded after the probe
-        // destructs, into the restored sketch. An ENCLOSING probe that
-        // later rolls back erases it correctly (the winning parse
-        // re-encounters and re-records the site) — convergent to
-        // exactly the surviving parse's candidates. (The Pratt walker
-        // itself records each site exactly once: its wrap-in-place
-        // climb never rolls back.)
+    // ── THE SPECULATION STACK ────────────────────────────────────────
+    //
+    // ★★★ P60 (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED,
+    // the operator's ruling of 2026-09-02): speculation is driven from the
+    // HEAP, not from nested host frames. `trySpeculativeBranch` used to open a
+    // probe and DRIVE `stepOnce` in a loop until the branch closed — and that
+    // dispatch, reaching the next speculative alt, called `trySpeculativeBranch`
+    // again: one host recursion per nested speculation, with the expression
+    // walker's atom re-entry threaded through it. ✔MEASURED 2026-09-04 (lane
+    // `rc`), gdb-attributed frame by frame on the MSVC 19.51 Debug build: each
+    // nested `(int)` cast cost EIGHT host frames — `trySpeculativeBranch → its
+    // lambda → stepOnce → walkExpression → driveExprWorkStack → exprPrimaryStep
+    // → parseUntilFrameDepth → stepOnce` — at 1072 bytes each, 8576 bytes per
+    // level, so a 1 MB stack died at ~120 casts while `c.lang.json` promised a
+    // loud `P_MaxSpeculationDepth` at 320; the same chain under mingw-w64 g++
+    // 13.2 cost ~1.63 KiB per level and survived to 640. The counter's promise
+    // held on the toolchain the gate builds with and was broken on the one it
+    // does not, which is exactly the shape the ruling forbids.
+    //
+    // Now a speculative AltChoice pushes a `SpeculationSite` — its candidate
+    // list, the candidate under probe and the probe itself — and the parser's
+    // ONE driver (`driveParse_`) runs the site's probe one `stepOnce` at a
+    // time, applying the SAME checks in the SAME order the loop applied them:
+    //   loop head : branch frame closed → decide (type-name triage, commit);
+    //               desynced → fail; over budget → latch + fail;
+    //   step      : `stepOnce`; Done mid-branch → fail;
+    //   post-step : emitted a diagnostic → fail; desynced → fail;
+    //               commitAfterPrefix CUT reached → commit, frame stays open.
+    // A nested speculative alt reached by that step pushes ITS site on top
+    // and is decided first; an expression walk reached by it pushes its
+    // frames on top and finishes first. A site's post-step checks run only
+    // once everything its step spawned has been decided — which is precisely
+    // when the recursive `stepOnce` call would have returned. OUTPUT-IDENTITY:
+    // this is a control-flow transform; every token consumed, every
+    // diagnostic emitted and every latch set happen in the same order.
+    //
+    // The probe stays what it was — the RAII object whose destructor rolls
+    // the five state machines back unless committed — it just lives in a
+    // `unique_ptr` on the site now, so "abandon this candidate" is a `reset()`
+    // and the restore discipline is unchanged.
+    struct SpeculationSite {
+        // The alt's pruned candidate set, a span over the per-depth scratch
+        // slot `candidateBranches` filled at this site's depth. Valid for the
+        // site's whole life: the slot is only rewritten by a call at the SAME
+        // depth, and while this site is live every nested call runs one probe
+        // deeper (the structural set the failure tail computes at this depth
+        // is computed only after the last candidate has been abandoned).
+        std::span<RuleId const>            candidates;
+        std::size_t                        next = 0;      // next candidate to try
+        RuleId                             branch{};      // the candidate under probe
+        std::unique_ptr<SpeculationProbe>  probe;         // live while it is driven
+        bool                               exprBranch = false;
+        // A `stepOnce` (or an expression walk) was issued under this probe
+        // and its post-step checks are still owed. Consumed the next time
+        // the site is innermost.
+        bool                               stepPending = false;
+        // FC2: an ambiguous type-name candidate produced by the commit triage
+        // must SURVIVE the rollback of its own probe (the rolled-back value
+        // reading is the chosen parse; the candidate is the oracle's input
+        // for the cross-file second chance). The probe's RAII restore covers
+        // the sketch — so the triage hands the candidate OUT here and it is
+        // recorded after the probe destructs, into the restored sketch. An
+        // ENCLOSING probe that later rolls back erases it correctly (the
+        // winning parse re-encounters and re-records the site) — convergent
+        // to exactly the surviving parse's candidates. (The Pratt walker
+        // itself records each site exactly once: its wrap-in-place climb
+        // never rolls back.)
         std::optional<AmbiguousTypeNameCandidate> rolledBackCandidate;
+    };
+    std::vector<SpeculationSite> specStack;
 
-        const bool committed = [&]() -> bool {
-        SpeculationProbe probe{*this};
-
-        // FC4 c1: an `expr`-shape BRANCH (e.g. c forInitAmbig's
-        // `expression`) must hand off to the Pratt walker exactly like the
-        // RuleLeaf dispatch does — `openExprFrame` would compile the branch
-        // as its transparent atom reference, parse ONLY the first operand,
-        // and silently COMMIT a truncated expression (`i = 9` consuming
-        // just `i`). The walker balances its own frames; failure surfaces
-        // via the probe's diagnostic/desync deltas and rolls back so the
-        // alt's next candidate gets its shot.
-        if (schema->isExprRule(branch)) {
-            prattWalker->walkExpression(*outer, branch,
-                                        schema->exprMinPrecedence(branch));
-            if (probe.emittedDiag())   return false;
-            if (probe.isDesynced())    return false;
-            probe.commit();
+    // Open a probe on the site's next admissible candidate. Returns true
+    // when one is live (the driver takes it from here) and false when the
+    // site is EXHAUSTED — every remaining candidate was refused at the depth
+    // ceiling — in which case the caller pops the site and runs the failure
+    // tail (`finishFailedSpeculation_`).
+    [[nodiscard]] bool startNextCandidate_(SpeculationSite& site) {
+        while (site.next < site.candidates.size()) {
+            const RuleId branch = site.candidates[site.next++];
+            if (speculationDepth >= config.maxSpeculationDepth) {
+                // LATCH, do not emit. Emitting here would land the
+                // diagnostic inside the ENCLOSING probe, which erases it on
+                // rollback and reads the emission as "this branch failed" —
+                // the two steps that together manufactured a syntax error
+                // against a correct token. The latch survives every
+                // rollback; the OUTERMOST alt (speculationDepth == 0) turns
+                // it into one positioned, self-naming `P_MaxSpeculationDepth`.
+                // First hit wins: the deepest/earliest position is the one
+                // that describes where the nesting actually ran out.
+                latchSpeculationCeiling_(SpeculationCeiling::Depth,
+                                         config.maxSpeculationDepth);
+                continue;
+            }
+            site.branch      = branch;
+            site.exprBranch  = schema->isExprRule(branch);
+            site.stepPending = false;
+            site.rolledBackCandidate.reset();
+            site.probe       = std::make_unique<SpeculationProbe>(*this);
+            if (site.exprBranch) {
+                // FC4 c1: an `expr`-shape BRANCH (e.g. c forInitAmbig's
+                // `expression`) must hand off to the Pratt walker exactly
+                // like the RuleLeaf dispatch does — `openExprFrame` would
+                // compile the branch as its transparent atom reference, parse
+                // ONLY the first operand, and silently COMMIT a truncated
+                // expression (`i = 9` consuming just `i`). The walk IS this
+                // candidate's one step: its frames run on top of this site
+                // and, once they are gone, the post-step checks decide it
+                // (emitted a diagnostic / desynced → fail; else commit).
+                site.stepPending = true;
+                prattWalker->walkExpression(*outer, branch,
+                                            schema->exprMinPrecedence(branch));
+            } else {
+                openExprFrame(branch);
+            }
             return true;
         }
-
-        openExprFrame(branch);
-
-        while (frames.size() > probe.targetDepth()) {
-            if (probe.isDesynced())     return false;
-            if (probe.exceededBudget()) return false;
-            // Note: do NOT bail on `isAtSourceEnd && !walker.canEndSource()`
-            // — the branch's last iteration legitimately runs with peek
-            // == Eof when the cursor is at End and `closeFrameOnce` is
-            // the next action. Premature-EOF mid-branch is caught by
-            // stepOnce's own EOF handler, which emits
-            // P_MissingRequiredChild → the post-stepOnce diag recheck
-            // below fires.
-
-            const auto outcome = stepOnce();
-            if (outcome == StepOutcome::Done) {
-                // Done at the outer parser level only when
-                // canEndSource is true AND tokens drained — but
-                // we're inside an unclosed branch frame here, so
-                // this signals the branch needs more input than is
-                // available. Treat as failure.
-                return false;
-            }
-            // Post-step rechecks: stepOnce may have emitted a
-            // diagnostic and closed the branch frame in the same
-            // iteration (peek=EOF mid-rule). Without these the loop
-            // exits via `frames.size() == targetDepth` and commits a
-            // half-built branch. Mirror the loop-head checks.
-            if (probe.emittedDiag()) return false;
-            if (probe.isDesynced())  return false;
-
-            // commitAfterPrefix CUT (PEG cut): once this branch's fixed
-            // leading token-prefix is consumed without failure, no other alt
-            // can match, so COMMIT and hand the still-open frame to the
-            // non-speculative dispatch loop — the rest of the rule parses
-            // with NO budget. Fully generic (names no token/rule/language).
-            // Mirrors the unique-production direct descent's "open frame, let
-            // the outer loop drive it".
-            if (const std::size_t pfx = schema->commitAfterPrefix(branch)
-                                            ? schema->predictivePrefixLen(branch) : 0;
-                pfx > 0 && (tokens.position() - probe.startPos()) >= pfx) {
-                probe.commit();
-                return true;
-            }
-        }
-
-        // FC2 type-name commit guard: a `commitRequiresTypeName`-marked
-        // branch commits only per the generic triage (lone-identifier
-        // type names need binder-sketch / follower evidence; every other
-        // type form commits). The guard's declared POLARITY (FC4 c1 M4)
-        // selects the unknown-name arm. Returning false lets the probe's
-        // RAII restore roll the branch back and the caller try the alt's
-        // next candidate — the value reading.
-        if (const RuleId typeRule = schema->typeNameCommitRule(branch);
-            typeRule.valid()) {
-            if (!typeNameCommitApproved_(branch, typeRule,
-                                         schema->typeNameCommitPolarity(branch),
-                                         rolledBackCandidate)) {
-                return false;
-            }
-        }
-
-        probe.commit();
-        return true;
-        }();   // probe destructs here — rollback restored the sketch
-
-        if (!committed && rolledBackCandidate.has_value()) {
-            sketch.recordCandidate(std::move(*rolledBackCandidate));
-        }
-        return committed;
+        return false;
     }
+
+    // Abandon the candidate under probe: the probe's destructor restores the
+    // five state machines, then the triage's rolled-back candidate (if any)
+    // is recorded into the RESTORED sketch — the order the recursive form
+    // kept by recording after its probe went out of scope.
+    void abandonCandidate_(SpeculationSite& site) {
+        site.probe.reset();
+        if (site.rolledBackCandidate.has_value()) {
+            sketch.recordCandidate(std::move(*site.rolledBackCandidate));
+            site.rolledBackCandidate.reset();
+        }
+    }
+
+    // Commit the candidate under probe and retire the site: the enclosing
+    // driver (an awaiting expression frame, an outer site, or the root)
+    // continues from the committed state. When `frameStaysOpen` (the
+    // commitAfterPrefix CUT) the branch frame is still open and that driver
+    // parses the rest of the rule non-speculatively, with no budget.
+    void commitCandidate_() {
+        specStack.back().probe->commit();
+        specStack.back().probe.reset();
+        specStack.pop_back();
+    }
+
+    // The candidate under probe was abandoned: try the site's next one, or —
+    // with none left — pop the site and run the alt's failure tail.
+    void abandonAndAdvance_() {
+        abandonCandidate_(specStack.back());
+        if (startNextCandidate_(specStack.back())) return;
+        specStack.pop_back();
+        (void)finishFailedSpeculation_();
+    }
+
+    // The branch frame closed with the probe still clean: the FC2 type-name
+    // commit guard decides. A `commitRequiresTypeName`-marked branch commits
+    // only per the generic triage (lone-identifier type names need
+    // binder-sketch / follower evidence; every other type form commits). The
+    // guard's declared POLARITY (FC4 c1 M4) selects the unknown-name arm. A
+    // refused commit rolls the branch back and the site tries its next
+    // candidate — the value reading.
+    void decideClosedCandidate_() {
+        SpeculationSite& site = specStack.back();
+        if (const RuleId typeRule = schema->typeNameCommitRule(site.branch);
+            typeRule.valid()) {
+            if (!typeNameCommitApproved_(site.branch, typeRule,
+                                         schema->typeNameCommitPolarity(site.branch),
+                                         site.rolledBackCandidate)) {
+                abandonAndAdvance_();
+                return;
+            }
+        }
+        commitCandidate_();
+    }
+
+    // EVERY CANDIDATE OF THE ALT FAILED. The parser is back at the alt's own
+    // token (each probe restored it), so this is the tail the speculative
+    // AltChoice arm ran after its candidate loop — verbatim: report a ceiling
+    // if one latched (depth 0 only), take a nullable skip, replay the
+    // declared-last candidate non-speculatively (depth 0, one-shot), else
+    // `P_BacktrackFailed` + panic scan. Returns the dispatch outcome exactly
+    // as that arm returned it.
+    StepOutcome finishFailedSpeculation_() {
+        // THE CEILING, REPORTED AS ITSELF. Every candidate failed and the
+        // parse hit one of its speculation ceilings on the way — so the
+        // failure is the parser running out of a resource, not the program
+        // being malformed. Say so here, positioned and by name, BEFORE the
+        // recovery below runs: that recovery ends in the declared-last
+        // fallback replay, which on a legal-but-deep construct reliably
+        // produces `P_NoAlternativeMatched` against a token the user wrote
+        // correctly — the fabricated syntax error this whole arm exists to
+        // delete
+        // (D-PARSE-NINE-NESTED-CASTS-ARE-REFUSED-BY-THE-SPECULATION-CAP-WITH-A-FABRICATED-SYNTAX-ERROR).
+        // The recovery itself is left exactly as it was; the shield this
+        // raises silences it until the next sync token, so the region yields
+        // ONE honest diagnostic instead of one honest one buried under N
+        // fabricated ones. Checked only at depth 0: at depth > 0 the
+        // enclosing probe still owns the failure and must roll back normally.
+        if (speculationDepth == 0 && speculationCapHit_) {
+            reportSpeculationCeiling_();
+        }
+
+        Token const& peek = tokens.peek();
+        const SchemaTokenId tokKind =
+            effectiveKind(peek, identifierKind, errorKind);
+
+        // D-PARSE-SPECULATIVE-OPTIONAL: a speculative OPTIONAL whose inner
+        // clause did not match — every candidate pruned (the peek belongs to
+        // the continuation) or every probe failed — must be SKIPPED, not
+        // diagnosed. The skip/continuation branch is nullable-tailed and its
+        // rules were excluded from the candidate set
+        // (collectAltBranchRules), so control reaches here with the candidate
+        // set exhausted. Take the nullable skip so the continuation parses
+        // non-speculatively. `skipWouldAbandonToken` preserves the fail-loud
+        // contract at end-of-root; mirrors the non-speculative optional skip
+        // and the !inUnion speculative skip. Every SHIPPED speculative alt is
+        // non-nullable-tailed, so `nullableTail()` is false for them and this
+        // is inert.
+        if (walker.nullableTail()
+            && !skipWouldAbandonToken(peek)
+            && walker.takeNullableBranch()) {
+            return StepOutcome::Continue;
+        }
+
+        // FC4 c1: every candidate failed. At the OUTERMOST level, REPLAY the
+        // declared-LAST candidate non-speculatively so its precise
+        // diagnostics land where the user can act on them — the declared
+        // order makes the last branch the language's fallback reading (c
+        // declOrExprStmt's exprStmt), and pre-FC4 that reading was a direct
+        // alt branch whose errors surfaced directly. Pure rollback would bury
+        // the real error (`a ? b ;` → "missing ':'") under an opaque
+        // P_BacktrackFailed.
+        //
+        // ONE-SHOT per (cursor, token position): a replayed branch that fails
+        // WITHOUT net token consumption unwinds back to this very alt with
+        // the same peek — a second replay would loop until the
+        // forward-progress watchdog aborts. The re-entry falls through to the
+        // P_BacktrackFailed + consume hatch, which guarantees progress exactly
+        // as the pre-replay contract did. Inside a NESTED probe the rollback
+        // semantics stay pure (the outer probe owns the failure), so no
+        // replay fires there either.
+        //
+        // The replay target is the declared-last of the STRUCTURAL
+        // (1-token-FIRST-gated, UN-pruned) candidate set, not the pruned
+        // speculation set: the predictive prune can legitimately empty the
+        // speculation set (every branch's FIRST_k rejects the later tokens,
+        // e.g. `A X ;` where neither `A B ;` nor `A C ;` matches at offset
+        // 1), but the fallback must still replay a branch to surface its
+        // precise diagnostic instead of an opaque P_BacktrackFailed.
+        const auto structuralCandidates = candidateBranches(
+            tokKind, walker.lookahead(), /*applyPrune=*/false);
+        if (speculationDepth == 0 && !structuralCandidates.empty()
+            && !(replayedFallback_
+                 && lastReplayCursor_ == walker.cursor()
+                 && lastReplayTokPos_ == tokens.position())) {
+            replayedFallback_  = true;
+            lastReplayCursor_  = walker.cursor();
+            lastReplayTokPos_  = tokens.position();
+            const RuleId fallback = structuralCandidates.back();
+            if (schema->isExprRule(fallback)) {
+                prattWalker->walkExpression(
+                    *outer, fallback,
+                    schema->exprMinPrecedence(fallback));
+                return StepOutcome::Continue;
+            }
+            openExprFrame(fallback);
+            return StepOutcome::Continue;
+        }
+
+        return recoverAt(DiagnosticCode::P_BacktrackFailed,
+                         peek, walker.expectedSet());
+    }
+
+    // THE ONE DRIVER. Runs the parse to completion: the schema dispatch, the
+    // expression work-stack and the speculation stack, each stepped from this
+    // single loop so that no nesting level of the input ever holds a host
+    // frame. Defined after the expression-step helpers it calls.
+    void driveParse_();
 
     // ── one dispatch iteration ─────────────────────────────────────
 
@@ -1604,6 +1997,22 @@ struct Parser::Impl {
         // the same broken region.
         const bool prevStepRecovered = stepRecovered_;
         stepRecovered_ = false;
+
+        // Lower the cascade shield the moment the parser reaches a
+        // schema-declared sync token: the abandoned construct is over and
+        // whatever comes next is the author's again, so it must be
+        // diagnosed normally. Bounding the shield by `syncTokens` — not by
+        // a token count and not by "the next recovery" — is what keeps it a
+        // ONE-REGION silence rather than a general softening of the parser.
+        // Grammar-driven: the token set is config data.
+        if (suppressCascadeUntilSync_ && !tokens.isAtEnd()) {
+            const auto sync = schema->syncTokens();
+            const SchemaTokenId k =
+                effectiveKind(tokens.peek(), identifierKind, errorKind);
+            if (std::ranges::find(sync, k) != sync.end()) {
+                suppressCascadeUntilSync_ = false;
+            }
+        }
 
         // Termination at root: `canEndSource` returns true only at
         // the root rule's nullable-tail end position; combined with
@@ -1960,81 +2369,28 @@ struct Parser::Impl {
                     return StepOutcome::Continue;
                 }
 
-                for (auto const branch : candidates) {
-                    if (trySpeculativeBranch(branch)) {
-                        return StepOutcome::Continue;
-                    }
-                }
+                // Depth-0 entry owns the whole speculation subtree about to
+                // run, so any ceiling latch left over from an EARLIER alt —
+                // one that hit the ceiling under some candidate and then
+                // resolved through another — is not this alt's to report.
+                // Clearing it here is what keeps the ceiling diagnostic
+                // attributable: it can only ever describe speculation this
+                // alt actually performed.
+                if (speculationDepth == 0) speculationCapHit_.reset();
 
-                // D-PARSE-SPECULATIVE-OPTIONAL: a speculative OPTIONAL whose
-                // inner clause did not match — every candidate pruned (the
-                // peek belongs to the continuation) or every probe failed —
-                // must be SKIPPED, not diagnosed. The skip/continuation
-                // branch is nullable-tailed and its rules were excluded from
-                // the candidate set (collectAltBranchRules), so control
-                // reaches here with the candidate set exhausted. Take the
-                // nullable skip so the continuation parses non-speculatively.
-                // `skipWouldAbandonToken` preserves the fail-loud contract at
-                // end-of-root; mirrors the non-speculative optional skip
-                // (~:1993) and the !inUnion speculative skip (~:1837). Every
-                // SHIPPED speculative alt is non-nullable-tailed, so
-                // `nullableTail()` is false for them and this is inert.
-                if (walker.nullableTail()
-                    && !skipWouldAbandonToken(peek)
-                    && walker.takeNullableBranch()) {
+                // Open the site and its first admissible probe; the parser's
+                // driver (`driveParse_`) steps it from here — this dispatch
+                // iteration is over the moment a probe is live, exactly as it
+                // was when `trySpeculativeBranch` returned true. A site whose
+                // every candidate is refused at the depth ceiling before any
+                // probe opens is the recursive loop's "all failed" case and
+                // runs its tail right here.
+                specStack.push_back(SpeculationSite{.candidates = candidates});
+                if (startNextCandidate_(specStack.back())) {
                     return StepOutcome::Continue;
                 }
-
-                // FC4 c1: every candidate failed. At the OUTERMOST level,
-                // REPLAY the declared-LAST candidate non-speculatively so
-                // its precise diagnostics land where the user can act on
-                // them — the declared order makes the last branch the
-                // language's fallback reading (c declOrExprStmt's
-                // exprStmt), and pre-FC4 that reading was a direct alt
-                // branch whose errors surfaced directly. Pure rollback
-                // would bury the real error (`a ? b ;` → "missing ':'")
-                // under an opaque P_BacktrackFailed.
-                //
-                // ONE-SHOT per (cursor, token position): a replayed branch
-                // that fails WITHOUT net token consumption unwinds back to
-                // this very alt with the same peek — a second replay would
-                // loop until the forward-progress watchdog aborts. The
-                // re-entry falls through to the P_BacktrackFailed +
-                // consume hatch, which guarantees progress exactly as the
-                // pre-replay contract did. Inside a NESTED probe the
-                // rollback semantics stay pure (the outer probe owns the
-                // failure), so no replay fires there either.
-                //
-                // The replay target is the declared-last of the STRUCTURAL
-                // (1-token-FIRST-gated, UN-pruned) candidate set, not the
-                // pruned speculation set: the predictive prune can legitimately
-                // empty the speculation set (every branch's FIRST_k rejects the
-                // later tokens, e.g. `A X ;` where neither `A B ;` nor `A C ;`
-                // matches at offset 1), but the fallback must still replay a
-                // branch to surface its precise diagnostic instead of an opaque
-                // P_BacktrackFailed.
-                const auto structuralCandidates = candidateBranches(
-                    tokKind, walker.lookahead(), /*applyPrune=*/false);
-                if (speculationDepth == 0 && !structuralCandidates.empty()
-                    && !(replayedFallback_
-                         && lastReplayCursor_ == walker.cursor()
-                         && lastReplayTokPos_ == tokens.position())) {
-                    replayedFallback_  = true;
-                    lastReplayCursor_  = walker.cursor();
-                    lastReplayTokPos_  = tokens.position();
-                    const RuleId fallback = structuralCandidates.back();
-                    if (schema->isExprRule(fallback)) {
-                        prattWalker->walkExpression(
-                            *outer, fallback,
-                            schema->exprMinPrecedence(fallback));
-                        return StepOutcome::Continue;
-                    }
-                    openExprFrame(fallback);
-                    return StepOutcome::Continue;
-                }
-
-                return recoverAt(DiagnosticCode::P_BacktrackFailed,
-                                 peek, walker.expectedSet());
+                specStack.pop_back();
+                return finishFailedSpeculation_();
             }
 
             // Non-speculative AltChoice.
@@ -2174,7 +2530,29 @@ Parser::~Parser() = default;
 ParseResult Parser::parse() && {
     auto& I = *impl_;
 
-    I.builder = std::make_unique<TreeBuilder>(I.src, I.schema, I.budget);
+    // ★ THE SECOND CAP, DERIVED — NEVER AUTHORED SEPARATELY. Before this,
+    // the builder was constructed with a DEFAULT `BuilderConfig`, whose own
+    // `maxSpeculationDepth` (64) sat behind the parser's and bound the moment
+    // the parser's was lifted past it — a second ceiling nobody could see
+    // until someone wrote one more level of nesting. The two are the SAME
+    // quantity measured at two layers: `SpeculationProbe` is the only
+    // construction site of a builder checkpoint in the whole engine (one
+    // probe ⇒ exactly one checkpoint), so the builder's checkpoint depth
+    // equals the parser's probe depth by construction. Deriving it from the
+    // one config-driven value is therefore not a coincidence to be kept in
+    // sync by hand — it is the only wiring under which the two CANNOT
+    // disagree, and it guarantees the parser's counter (which reports itself
+    // by name and position) is always the ceiling that actually fires.
+    //
+    // Equal, not padded: `startNextCandidate_` refuses at depth == cap, so at
+    // most `cap` probes are ever live and the builder sees at most `cap`
+    // simultaneous checkpoints — exactly what it permits. Its own one-shot
+    // `P_MaxSpeculationDepth` therefore stays reachable ONLY for a non-parser
+    // TreeBuilder client, where it remains the correct backstop.
+    BuilderConfig builderCfg;
+    builderCfg.maxSpeculationDepth = I.config.maxSpeculationDepth;
+    I.builder = std::make_unique<TreeBuilder>(I.src, I.schema, I.budget,
+                                              builderCfg);
 
     // Fold the tokenizer's lexer diagnostics into the builder's reporter
     // before the walk, so the finished Tree owns lexer + parser diagnostics
@@ -2218,8 +2596,16 @@ ParseResult Parser::parse() && {
         I.builder->pushToken(I.tokens.advance());
     }
 
-    while (true) {
-        if (I.stepOnce() == StepOutcome::Done) break;
+    I.driveParse_();
+
+    // The driver returns only from the ROOT dispatch, which runs only while
+    // no expression frame and no speculation site is live — so both stacks
+    // are empty here by construction. A leftover would mean a frame or a
+    // site outlived the dispatch that owned it, a driver bug that must not
+    // be folded into a "tree finished" silently.
+    if (!I.exprWorkStack.empty() || !I.specStack.empty()) {
+        fatal("dss::Parser::parse: the driver finished with expression frames "
+              "or speculation sites still live");
     }
 
     // Close remaining frames (root in the happy path) before
@@ -2260,12 +2646,14 @@ ParseResult Parser::parse() && {
 // RIGHT.
 //
 // FLAT DESCENT (D-PARSE-DEEP-NEST-RECURSION-MEMORY, Stage 5): the walker
-// is an explicit-stack driver over `Impl::exprWorkStack`, NOT host
+// is an explicit-stack machine over `Impl::exprWorkStack`, NOT host
 // recursion. Each former recursive `parseExpressionAt(minPrec)` level is a
 // heap `ExprFrame`; a deepening operand is a `pushExprFrame` + a resume
 // `phase` rather than a C++ call. One logical level:
 //   1. `Primary` — parse a primary (prefix-op + nested operand OR the atom).
-//      A prefix operand becomes a child frame (resume `AfterPrefixOperand`).
+//      A prefix operand becomes a child frame (resume `AfterPrefixOperand`);
+//      the atom is an `AwaitDispatch` on the schema dispatch closing the atom
+//      frame (the P60 conversion — no nested drive).
 //   2. `Climb` — while peek is an op at >= minPrec, wrap the already-built
 //      last child in the matching wrapper frame
 //      (`TreeBuilder::wrapLastChildInFrame`) and gather the operator's
@@ -2274,14 +2662,15 @@ ParseResult Parser::parse() && {
 //          returns to THIS frame's climb and wraps THIS wrapper → left
 //          nesting, NO child pushed), at `prec` for Right (the RHS child
 //          consumes the chain → right nesting).
-//        - postfix: no further operand (or a grouped/follower body parsed by
-//          a balanced `walkExpression` / sub-drive — stays in this frame).
+//        - postfix: no further operand, or a grouped/follower body — an
+//          expr-rule body pushes a child ROOT frame, any other body is an
+//          `AwaitDispatch`; either way this frame resumes at
+//          `AfterPostfixFollower` / `AfterGroupedBody`.
 //        - ternary: middle at 0, else at `prec` (right-assoc) — each clause
 //          a child frame (resume `AfterTernaryMiddle` / `AfterTernaryElse`).
 //      Each iteration strictly extends the consumed range — terminates.
-// The driver runs until the work-stack returns to the entering
-// `walkExpression`'s baseline; re-entry (a paren / postfix-body atom) nests
-// on the SAME vector (see `driveExprWorkStack`).
+// The frames are stepped by `Parser::Impl::driveParse_`, the parser's one
+// driver; `walkExpression` only pushes a root frame and returns.
 namespace {
 
 // Push trivia tokens through the builder until peek is meaningful.
@@ -2296,22 +2685,24 @@ void pumpTrivia(Parser::Impl& I) {
 // ── Explicit expression-descent work-stack (D-PARSE-DEEP-NEST-RECURSION-MEMORY)
 //    ────────────────────────────────────────────────────────────
 //
-// The former recursive `parseExpressionAt` is now a FLAT driver over the
+// The former recursive `parseExpressionAt` is a FLAT machine over the
 // `I.exprWorkStack` member: each former re-entry is a `pushExprFrame`
 // (heap) + a resume `phase`, so a deeply-nested expression carries O(1)
-// host-stack cost. The driver `driveExprWorkStack(I, baseline)` runs until
-// the work-stack returns to `baseline`. `walkExpression` (the sole entry,
-// and the re-entrant paren / postfix-body atom path) records a baseline,
-// pushes its root frame, and drives down to it — so re-entry nests cleanly
-// on the SAME vector.
+// host-stack cost. `exprStep` advances the TOP frame by one phase; the
+// parser's one driver (`Parser::Impl::driveParse_`) calls it whenever an
+// expression frame is the innermost live activity, and runs the schema
+// dispatch for it while it is `AwaitDispatch`-ing on an atom / body frame.
+// `walkExpression` (every entry — the schema dispatch, a speculative expr
+// branch, a postfix body) pushes a ROOT frame and returns.
 //
 // OUTPUT-IDENTITY: this is a control-flow transform only. Each former
 // `return`/`continue`/recursive-call maps 1:1 (a `return` → pop the frame,
 // a `continue` → re-run the same frame, a recursion → push a child frame +
-// resume phase). The wrap-in-place left/none-assoc climb is UNCHANGED (it
-// never pushed a child and still doesn't); the trivia hold/place discipline
-// is preserved verbatim (held trivia is placed BEFORE any child push, as
-// the recursive form placed it before the operator token + recursion).
+// resume phase, a blocking sub-drive → an await + resume phase). The
+// wrap-in-place left/none-assoc climb is UNCHANGED (it never pushed a child
+// and still doesn't); the trivia hold/place discipline is preserved verbatim
+// (held trivia is placed BEFORE any child push, as the recursive form placed
+// it before the operator token + recursion).
 
 // Push one CHILD expression frame (a former `parseExpressionAt` re-entry).
 // Enforces the depth cap at the push site — the SAME logical point the
@@ -2331,20 +2722,43 @@ void pumpTrivia(Parser::Impl& I) {
     // needs to locals and advances its own `phase` BEFORE calling this —
     // never holding a `exprWorkStack.back()` reference across the push.
     I.exprWorkStack.push_back(ExprFrame{
-        .rules   = rules,
-        .minPrec = minPrec,
-        .phase   = ExprFrame::Phase::Primary,
+        .rules           = rules,
+        .minPrec         = minPrec,
+        .phase           = ExprFrame::Phase::Primary,
+        .specDepthAtPush = I.specStack.size(),
     });
     return true;
 }
 
+// Pop the top expression frame (a former `parseExpressionAt` RETURN). A root
+// frame also closes the `exprRule` frame its `walkExpression` entry opened —
+// the `closeFrameOnce()` that entry used to run after its nested drive.
+void popExprFrame(Parser::Impl& I) {
+    const bool closesEntry = I.exprWorkStack.back().closesEntryFrame;
+    I.exprWorkStack.pop_back();
+    --I.expressionDepth;
+    if (closesEntry) I.closeFrameOnce();
+}
+
+// Park the top frame until the schema dispatch has closed the parser-frame
+// stack back down to `awaitDepth` (the depth BEFORE the atom / body frame it
+// just opened), then resume it at `resume`. This is the blocking
+// `parseUntilFrameDepth(awaitDepth)` call turned into state: the driver
+// steps the dispatch for it and hands control back.
+void awaitDispatchDownTo(Parser::Impl& I, std::size_t awaitDepth,
+                         ExprFrame::Phase resume) {
+    ExprFrame& f  = I.exprWorkStack.back();
+    f.awaitDepth  = awaitDepth;
+    f.resumePhase = resume;
+    f.phase       = ExprFrame::Phase::AwaitDispatch;
+}
+
 // Run the `Primary` phase for the top frame: parse the prefix-op + nested
-// operand, or the schema's atom rule. Returns true if it pushed a CHILD
-// frame (the prefix operand) — the driver must then re-loop without
-// touching the (possibly reallocated) frame. Returns false if the primary
-// completed in place (atom, or a prefix whose operand tripped the cap) and
-// the caller should advance the SAME frame to `Climb`.
-[[nodiscard]] bool exprPrimaryStep(Parser::Impl& I) {
+// operand, or open the schema's atom rule. Advances the frame itself: a
+// prefix operand becomes a CHILD frame (this frame resumes at
+// `AfterPrefixOperand`); an atom parks this frame in `AwaitDispatch` until
+// the dispatch has closed the atom frame, then it climbs.
+void exprPrimaryStep(Parser::Impl& I) {
     // Copy the fields we need BEFORE any push (realloc-safety).
     const PrattRules rules = I.exprWorkStack.back().rules;
     const std::int32_t minPrec = I.exprWorkStack.back().minPrec;
@@ -2372,13 +2786,16 @@ void pumpTrivia(Parser::Impl& I) {
         // form: the guarded callee returned, then `closeFrameOnce`).
         I.exprWorkStack.back().phase = ExprFrame::Phase::AfterPrefixOperand;
         (void)pushExprFrame(I, rules, prefix->precedence);
-        return true;
+        return;
     }
 
+    // The atom: open its rule frame and let the schema dispatch parse it —
+    // the dispatch closes that frame when the atom is complete, and this
+    // frame climbs from there. (A `(`-led atom is a speculative alt in c,
+    // whose site lands on top of this frame and is decided first.)
     const std::size_t depthBeforeAtom = I.frames.size();
     I.openExprFrame(rules.atom);
-    I.parseUntilFrameDepth(depthBeforeAtom);
-    return false;
+    awaitDispatchDownTo(I, depthBeforeAtom, ExprFrame::Phase::Climb);
 }
 
 // Run ONE operator-climb iteration for the top frame. Returns:
@@ -2457,10 +2874,13 @@ void pumpTrivia(Parser::Impl& I) {
     // Postfix is LEFT-associative: iterative wrapping via
     // `wrapLastChildExprFrame` wraps the previously-built primary (or a
     // prior chain wrap) as the new postfix-wrapper's first child. The body
-    // (a follower / grouped rule) is parsed by a `walkExpression` call or a
-    // `parseUntilFrameDepth` drive that BALANCES its own frames before
-    // returning — no child pushed onto THIS work-stack — so the postfix arm
-    // stays in place and the driver simply re-runs this frame.
+    // (a follower / grouped rule) used to be parsed by a BLOCKING
+    // `walkExpression` call or `parseUntilFrameDepth` drive — the P60
+    // conversion: an expr-rule body pushes a child ROOT frame on top of this
+    // one, any other body parks this frame in `AwaitDispatch`, and this frame
+    // resumes at `AfterPostfixFollower` / `AfterGroupedBody` to close the
+    // wrapper (and check the grouped closer) exactly where the blocking form
+    // did it. A body with nothing to parse resumes on the very next turn.
     if (postfixInClimb) {
         I.wrapLastChildExprFrame(rules.postfix);
         placeHeldTrivia();
@@ -2484,16 +2904,21 @@ void pumpTrivia(Parser::Impl& I) {
             // own shape terminates the body. Mutually exclusive with
             // `grouped` (loader enforces).
             RuleId const fr = *postfix->followerRule;
+            I.exprWorkStack.back().phase = ExprFrame::Phase::AfterPostfixFollower;
             if (I.schema->isExprRule(fr)) {
+                // Pushes the body's root frame above this one (or, on a cap
+                // trip, closes its rule frame at once and pushes nothing —
+                // this frame then resumes on the next turn, as the blocking
+                // form resumed after the guarded walk returned).
                 I.prattWalker->walkExpression(
                     *I.outer, fr,
                     I.schema->exprMinPrecedence(fr));
             } else {
                 const std::size_t bodyDepth = I.frames.size();
                 I.openExprFrame(fr);
-                I.parseUntilFrameDepth(bodyDepth);
+                awaitDispatchDownTo(I, bodyDepth,
+                                    ExprFrame::Phase::AfterPostfixFollower);
             }
-            I.closeFrameOnce();
             return StepOutcome::Continue;
         }
         if (postfix->grouped) {
@@ -2508,12 +2933,15 @@ void pumpTrivia(Parser::Impl& I) {
                       "entry has invalid endsAt — loader contract "
                       "violated");
             }
-            // Grouped postfix: drive the body until the closer. An expr-rule
-            // body (e.g. `[expression]` for indexing) must run through the
-            // Pratt walker so operator climb applies inside the brackets;
-            // calling `openExprFrame` directly would skip precedence and
-            // produce a flat tree. Same routing rule as `stepOnce`'s
-            // AltChoice→RuleLeaf path for expr-rules.
+            // Grouped postfix: parse the body, then expect the closer
+            // (`AfterGroupedBody`). An expr-rule body (e.g. `[expression]`
+            // for indexing) must run through the Pratt walker so operator
+            // climb applies inside the brackets; calling `openExprFrame`
+            // directly would skip precedence and produce a flat tree. Same
+            // routing rule as `stepOnce`'s AltChoice→RuleLeaf path for
+            // expr-rules.
+            I.exprWorkStack.back().groupedEndsAt = gp.endsAt;
+            I.exprWorkStack.back().phase = ExprFrame::Phase::AfterGroupedBody;
             if (gp.bodyRule.valid()) {
                 if (I.schema->isExprRule(gp.bodyRule)) {
                     I.prattWalker->walkExpression(
@@ -2522,30 +2950,11 @@ void pumpTrivia(Parser::Impl& I) {
                 } else {
                     const std::size_t bodyDepth = I.frames.size();
                     I.openExprFrame(gp.bodyRule);
-                    I.parseUntilFrameDepth(bodyDepth);
+                    awaitDispatchDownTo(I, bodyDepth,
+                                        ExprFrame::Phase::AfterGroupedBody);
                 }
             }
-            pumpTrivia(I);
-            Token const& closerPeek = I.tokens.peek();
-            const SchemaTokenId closerKind = effectiveKind(
-                closerPeek, I.identifierKind, I.errorKind);
-            if (closerKind.v != gp.endsAt.v) {
-                // Closer missing. Emit the diagnostic AND drop an Error leaf
-                // at the missing-closer position so the HasError flag
-                // propagates up through the postfix wrapper and the tree
-                // carries the structural signal (not just a sidecar
-                // diagnostic). We do NOT consume `closerPeek` — the parent
-                // dispatch resumes from it (typically `recoverAt` scans to
-                // the next sync token).
-                I.emitParserError(
-                    DiagnosticCode::P_MissingRequiredChild,
-                    closerPeek.span,
-                    I.renderActual(closerPeek),
-                    std::span<SchemaTokenId const>{&gp.endsAt, 1});
-                I.builder->pushErrorNode(closerPeek.span);
-            } else {
-                (void)I.pushOperatorToken();
-            }
+            return StepOutcome::Continue;
         }
         I.closeFrameOnce();
         return StepOutcome::Continue;
@@ -2617,13 +3026,15 @@ void pumpTrivia(Parser::Impl& I) {
     return StepOutcome::Continue;
 }
 
-// The FLAT expression-descent driver. Processes `I.exprWorkStack` until it
-// returns to `baseline` (the size recorded by the entering `walkExpression`).
-// Each iteration dispatches the TOP frame on its `phase`:
-//   Primary            → parse the primary; on a prefix-operand child push,
-//                        re-loop (the child runs first); else advance to Climb.
+// Advance the TOP expression frame by ONE phase. The driver calls this only
+// while that frame is the innermost live activity and is not awaiting the
+// dispatch. Each phase:
+//   Primary            → parse the primary; a prefix-operand child is pushed
+//                        (it runs first); an atom parks the frame in
+//                        `AwaitDispatch` (the driver steps the dispatch).
 //   Climb              → one climb iteration; Done pops this frame, Continue
-//                        re-loops (either a postfix re-run or a pushed child).
+//                        leaves it (a postfix re-run, a parked body, or a
+//                        pushed child now on top).
 //   AfterPrefixOperand → the prefix operand finished → close the unary
 //                        wrapper, advance to Climb.
 //   AfterTernaryMiddle → the middle finished → check `:`; on success push the
@@ -2631,85 +3042,284 @@ void pumpTrivia(Parser::Impl& I) {
 //                        `:`, recover + close the ternary wrapper + pop.
 //   AfterTernaryElse   → the else finished → close the ternary wrapper, Climb.
 //   AfterInfixRhs      → the RHS finished → close the binary wrapper, Climb.
+//   AfterPostfixFollower → the follower body finished → close the postfix
+//                        wrapper, Climb.
+//   AfterGroupedBody   → the grouped body finished → expect the closer, close
+//                        the postfix wrapper, Climb.
 //
 // Popping a frame decrements `expressionDepth` (the cap counter) — the FLAT
-// analogue of the recursive `DepthGuard` destructor.
-void driveExprWorkStack(Parser::Impl& I, std::size_t baseline) {
-    while (I.exprWorkStack.size() > baseline) {
-        const ExprFrame::Phase phase = I.exprWorkStack.back().phase;
-        switch (phase) {
-        case ExprFrame::Phase::Primary:
-            if (exprPrimaryStep(I)) {
-                continue;   // pushed a prefix-operand child — run it first
-            }
-            I.exprWorkStack.back().phase = ExprFrame::Phase::Climb;
-            continue;
+// analogue of the recursive `DepthGuard` destructor — and, for a root frame,
+// closes the `exprRule` frame its `walkExpression` entry opened.
+void exprStep(Parser::Impl& I) {
+    switch (I.exprWorkStack.back().phase) {
+    case ExprFrame::Phase::Primary:
+        exprPrimaryStep(I);   // advances the frame itself
+        return;
 
-        case ExprFrame::Phase::Climb:
-            if (exprClimbStep(I) == StepOutcome::Done) {
-                I.exprWorkStack.pop_back();
-                --I.expressionDepth;
-            }
-            // Continue: either a postfix re-run (same frame) or a pushed
-            // child (its frame is now on top) — either way, re-loop.
-            continue;
+    case ExprFrame::Phase::Climb:
+        if (exprClimbStep(I) == StepOutcome::Done) popExprFrame(I);
+        // Continue: a postfix re-run (same frame), a parked body, or a
+        // pushed child (its frame is now on top).
+        return;
 
-        case ExprFrame::Phase::AfterPrefixOperand:
-            // The prefix operand child completed (or tripped the cap and was
-            // never pushed). Close the unary wrapper, then climb.
+    case ExprFrame::Phase::AfterPrefixOperand:
+        // The prefix operand child completed (or tripped the cap and was
+        // never pushed). Close the unary wrapper, then climb.
+        I.closeFrameOnce();
+        I.exprWorkStack.back().phase = ExprFrame::Phase::Climb;
+        return;
+
+    case ExprFrame::Phase::AfterTernaryMiddle: {
+        // The middle clause completed. Verify the `:` separator (the token
+        // captured on the frame at the `?` site), then push the else child
+        // at the operator's own precedence — or recover on a missing `:`.
+        // Copy the fields we need BEFORE the else-child push (realloc-
+        // safety): rules, the `:` token id, and the else precedence.
+        const PrattRules rules = I.exprWorkStack.back().rules;
+        const SchemaTokenId midSep = I.exprWorkStack.back().ternaryMiddleTok;
+        const std::int32_t elsePrec = I.exprWorkStack.back().ternaryElsePrec;
+        pumpTrivia(I);
+        Token const& midPeek = I.tokens.peek();
+        const SchemaTokenId midKind =
+            effectiveKind(midPeek, I.identifierKind, I.errorKind);
+        if (!midSep.valid() || midKind.v != midSep.v) {
+            // Missing `:`. Emit a diagnostic + an Error leaf so HasError
+            // propagates through the ternary wrapper; don't consume
+            // midPeek (parent recovery resumes from it).
+            I.emitParserError(DiagnosticCode::P_MissingRequiredChild,
+                              midPeek.span,
+                              "ternary expression is missing its ':' "
+                              "separator");
+            I.builder->pushErrorNode(midPeek.span);
             I.closeFrameOnce();
-            I.exprWorkStack.back().phase = ExprFrame::Phase::Climb;
-            continue;
-
-        case ExprFrame::Phase::AfterTernaryMiddle: {
-            // The middle clause completed. Verify the `:` separator (the token
-            // captured on the frame at the `?` site), then push the else child
-            // at the operator's own precedence — or recover on a missing `:`.
-            // Copy the fields we need BEFORE the else-child push (realloc-
-            // safety): rules, the `:` token id, and the else precedence.
-            const PrattRules rules = I.exprWorkStack.back().rules;
-            const SchemaTokenId midSep = I.exprWorkStack.back().ternaryMiddleTok;
-            const std::int32_t elsePrec = I.exprWorkStack.back().ternaryElsePrec;
-            pumpTrivia(I);
-            Token const& midPeek = I.tokens.peek();
-            const SchemaTokenId midKind =
-                effectiveKind(midPeek, I.identifierKind, I.errorKind);
-            if (!midSep.valid() || midKind.v != midSep.v) {
-                // Missing `:`. Emit a diagnostic + an Error leaf so HasError
-                // propagates through the ternary wrapper; don't consume
-                // midPeek (parent recovery resumes from it).
-                I.emitParserError(DiagnosticCode::P_MissingRequiredChild,
-                                  midPeek.span,
-                                  "ternary expression is missing its ':' "
-                                  "separator");
-                I.builder->pushErrorNode(midPeek.span);
-                I.closeFrameOnce();
-                I.exprWorkStack.pop_back();
-                --I.expressionDepth;
-                continue;
-            }
-            (void)I.pushOperatorToken();                         // `:`
-            I.exprWorkStack.back().phase = ExprFrame::Phase::AfterTernaryElse;
-            (void)pushExprFrame(I, rules, elsePrec);             // else
-            continue;
+            popExprFrame(I);
+            return;
         }
-
-        case ExprFrame::Phase::AfterTernaryElse:
-            // The else clause completed. Close the ternary wrapper, climb.
-            I.closeFrameOnce();
-            I.exprWorkStack.back().phase = ExprFrame::Phase::Climb;
-            continue;
-
-        case ExprFrame::Phase::AfterInfixRhs:
-            // The RHS completed. Close the binary wrapper, climb.
-            I.closeFrameOnce();
-            I.exprWorkStack.back().phase = ExprFrame::Phase::Climb;
-            continue;
-        }
+        (void)I.pushOperatorToken();                         // `:`
+        I.exprWorkStack.back().phase = ExprFrame::Phase::AfterTernaryElse;
+        (void)pushExprFrame(I, rules, elsePrec);             // else
+        return;
     }
+
+    case ExprFrame::Phase::AfterTernaryElse:
+        // The else clause completed. Close the ternary wrapper, climb.
+        I.closeFrameOnce();
+        I.exprWorkStack.back().phase = ExprFrame::Phase::Climb;
+        return;
+
+    case ExprFrame::Phase::AfterInfixRhs:
+        // The RHS completed. Close the binary wrapper, climb.
+        I.closeFrameOnce();
+        I.exprWorkStack.back().phase = ExprFrame::Phase::Climb;
+        return;
+
+    case ExprFrame::Phase::AfterPostfixFollower:
+        // The follower body completed (its own frames are closed). Close the
+        // postfix wrapper, then re-run the climb — the blocking form's
+        // `closeFrameOnce(); return Continue;`.
+        I.closeFrameOnce();
+        I.exprWorkStack.back().phase = ExprFrame::Phase::Climb;
+        return;
+
+    case ExprFrame::Phase::AfterGroupedBody: {
+        // The grouped body completed (or there was none). Expect the closer
+        // captured at the opener, close the postfix wrapper, climb.
+        const SchemaTokenId endsAt = I.exprWorkStack.back().groupedEndsAt;
+        pumpTrivia(I);
+        Token const& closerPeek = I.tokens.peek();
+        const SchemaTokenId closerKind = effectiveKind(
+            closerPeek, I.identifierKind, I.errorKind);
+        if (closerKind.v != endsAt.v) {
+            // Closer missing. Emit the diagnostic AND drop an Error leaf
+            // at the missing-closer position so the HasError flag
+            // propagates up through the postfix wrapper and the tree
+            // carries the structural signal (not just a sidecar
+            // diagnostic). We do NOT consume `closerPeek` — the parent
+            // dispatch resumes from it (typically `recoverAt` scans to
+            // the next sync token).
+            I.emitParserError(
+                DiagnosticCode::P_MissingRequiredChild,
+                closerPeek.span,
+                I.renderActual(closerPeek),
+                std::span<SchemaTokenId const>{&endsAt, 1});
+            I.builder->pushErrorNode(closerPeek.span);
+        } else {
+            (void)I.pushOperatorToken();
+        }
+        I.closeFrameOnce();
+        I.exprWorkStack.back().phase = ExprFrame::Phase::Climb;
+        return;
+    }
+
+    case ExprFrame::Phase::AwaitDispatch:
+        break;   // the driver never steps a parked frame
+    }
+    fatal("dss::Parser: exprStep on a frame that is awaiting the dispatch");
 }
 
 } // namespace
+
+// ── THE ONE DRIVER ──────────────────────────────────────────────────────
+//
+// ★★★ P60 (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED).
+// Three loops used to drive this parser, nested on the host stack once per
+// input nesting level: `parse()`'s root loop, `trySpeculativeBranch`'s probe
+// loop, and the expression walker's drive (with `parseUntilFrameDepth`
+// blocking inside its atom). This is the one loop that replaces them. Every
+// turn asks which activity is INNERMOST — the same question the host stack
+// used to answer by who called whom — and steps only that:
+//
+//   * the top EXPRESSION FRAME, if no speculation site was pushed after it
+//     (`specDepthAtPush == specStack.size()`): run one phase, or, while it
+//     is parked in `AwaitDispatch`, resume it once the parser-frame stack is
+//     back down to `awaitDepth` and otherwise run one `stepOnce` for it;
+//   * else the top SPECULATION SITE: the probe's checks and one `stepOnce`,
+//     in the order `trySpeculativeBranch`'s loop applied them (see the
+//     `SpeculationSite` note);
+//   * else the ROOT dispatch: one `stepOnce`; `Done` ends the parse.
+//
+// Why the innermost test is exact: an expression frame pushed while a site's
+// probe was live records that site (`specDepthAtPush` counts it), and a site
+// pushed while a frame was awaiting is counted by nothing the frame recorded
+// — so a frame is innermost iff no site outlives its own push, and a live
+// site is innermost otherwise. Both stacks only ever pop from the top, which
+// is what keeps the two counts comparable.
+void Parser::Impl::driveParse_() {
+    for (;;) {
+        bool exprInnermost = false;
+        if (!exprWorkStack.empty()) {
+            const std::size_t depthAtPush = exprWorkStack.back().specDepthAtPush;
+            if (depthAtPush > specStack.size()) {
+                fatal("dss::Parser: an expression frame outlived the "
+                      "speculation site it was pushed under");
+            }
+            exprInnermost = (depthAtPush == specStack.size());
+        }
+
+        if (exprInnermost) {
+            ExprFrame& top = exprWorkStack.back();
+            if (top.phase != ExprFrame::Phase::AwaitDispatch) {
+                exprStep(*this);
+                continue;
+            }
+            // Parked on the dispatch closing frames down to `awaitDepth`.
+            if (frames.size() <= top.awaitDepth) {
+                top.phase = top.resumePhase;
+                continue;
+            }
+            const std::size_t awaitDepth = top.awaitDepth;
+            if (stepOnce() == StepOutcome::Done) {
+                // EOF before the atom / body frame closed. Emit
+                // `P_PrematureEndOfInput` and forcibly close the frames down
+                // to the awaited depth — a silent resume would leave the
+                // walker with an unbalanced frame stack and it would close
+                // the wrong rule on its own teardown. (Verbatim from the
+                // blocking `parseUntilFrameDepth`.)
+                if (frames.size() > awaitDepth) {
+                    emitParserError(
+                        DiagnosticCode::P_PrematureEndOfInput,
+                        tokens.peek().span,
+                        "premature end of input inside Pratt-walker atom");
+                    while (frames.size() > awaitDepth) closeFrameOnce();
+                }
+            }
+            continue;
+        }
+
+        if (!specStack.empty()) {
+            SpeculationSite& site = specStack.back();
+            if (!site.probe) {
+                fatal("dss::Parser: a speculation site with no live probe");
+            }
+            SpeculationProbe& probe = *site.probe;
+
+            if (site.stepPending) {
+                // Post-step rechecks: the step may have emitted a
+                // diagnostic and closed the branch frame in the same
+                // iteration (peek=EOF mid-rule). Without these the site
+                // would see `frames.size() == targetDepth` and commit a
+                // half-built branch.
+                site.stepPending = false;
+                if (probe.emittedDiag() || probe.isDesynced()) {
+                    abandonAndAdvance_();
+                    continue;
+                }
+                if (site.exprBranch) {
+                    // The expr-shaped branch's walk is complete and clean:
+                    // commit, exactly as the blocking form did after its
+                    // `walkExpression` returned.
+                    commitCandidate_();
+                    continue;
+                }
+                // commitAfterPrefix CUT (PEG cut): once this branch's fixed
+                // leading token-prefix is consumed without failure, no other
+                // alt can match, so COMMIT and hand the still-open frame to
+                // the enclosing dispatch — the rest of the rule parses with
+                // NO budget. Fully generic (names no token/rule/language).
+                // Mirrors the unique-production direct descent's "open
+                // frame, let the outer loop drive it".
+                if (const std::size_t pfx =
+                        schema->commitAfterPrefix(site.branch)
+                            ? schema->predictivePrefixLen(site.branch) : 0;
+                    pfx > 0 && (tokens.position() - probe.startPos()) >= pfx) {
+                    commitCandidate_();
+                    continue;
+                }
+            }
+            if (site.exprBranch) {
+                fatal("dss::Parser: an expr-shaped speculative branch with "
+                      "no walk pending");
+            }
+
+            // Loop head, in the recursive loop's order.
+            if (frames.size() <= probe.targetDepth()) {
+                decideClosedCandidate_();
+                continue;
+            }
+            if (probe.isDesynced()) {
+                abandonAndAdvance_();
+                continue;
+            }
+            if (probe.exceededBudget()) {
+                // The SECOND ceiling this machinery enforces, and the one
+                // that used to be silent: the probe ran out of its token
+                // budget before the branch closed, so — exactly as at the
+                // depth cap — the parser abandons without ever deciding.
+                // Latch (never emit inside a probe) so the outermost alt can
+                // name it instead of falling through to a fabricated
+                // `P_NoAlternativeMatched` on correct source.
+                latchSpeculationCeiling_(SpeculationCeiling::TokenBudget,
+                                         probe.budget());
+                abandonAndAdvance_();
+                continue;
+            }
+            // Note: do NOT bail on `isAtSourceEnd && !walker.canEndSource()`
+            // — the branch's last iteration legitimately runs with peek
+            // == Eof when the cursor is at End and `closeFrameOnce` is
+            // the next action. Premature-EOF mid-branch is caught by
+            // stepOnce's own EOF handler, which emits
+            // P_MissingRequiredChild → the post-step recheck fires.
+            site.stepPending = true;
+            const std::size_t sitesBefore = specStack.size();
+            if (stepOnce() == StepOutcome::Done) {
+                // Done at the outer parser level only when canEndSource is
+                // true AND tokens drained — but we're inside an unclosed
+                // branch frame here, so this signals the branch needs more
+                // input than is available. Treat as failure.
+                if (specStack.size() != sitesBefore) {
+                    fatal("dss::Parser: a dispatch step that pushed a "
+                          "speculation site reported Done");
+                }
+                specStack.back().stepPending = false;
+                abandonAndAdvance_();
+            }
+            continue;
+        }
+
+        // The root dispatch: nothing is live above it.
+        if (stepOnce() == StepOutcome::Done) return;
+    }
+}
 
 void DefaultPrattWalker::walkExpression(Parser& parser,
                                         RuleId        exprRule,
@@ -2752,24 +3362,24 @@ void DefaultPrattWalker::walkExpression(Parser& parser,
     }
 
     I.openExprFrame(exprRule);
-    // FLAT expression descent (D-PARSE-DEEP-NEST-RECURSION-MEMORY): record
-    // the current work-stack size as this entry's baseline, push the root
-    // expression frame, and drive the explicit work-stack down to the
-    // baseline. This replaces the recursive `parseExpressionAt(I, rules,
-    // minPrec)` call — and because the baseline is captured per entry, a
-    // RE-ENTRANT `walkExpression` (a parenthesized atom, or a postfix
-    // follower/grouped expr-rule body, which reach here through
-    // `parseUntilFrameDepth`→`stepOnce`) nests cleanly on the SAME vector:
-    // it pushes its own frames above the caller's and drives only its own
-    // sub-stack. The host stack stays FLAT for the direct re-entries
-    // (prefix/ternary/infix) that the work-stack absorbs.
-    const std::size_t baseline = I.exprWorkStack.size();
+    // FLAT expression descent (D-PARSE-DEEP-NEST-RECURSION-MEMORY, and the
+    // P60 conversion of its last re-entry): push the ROOT expression frame
+    // and RETURN. The parser's one driver (`Parser::Impl::driveParse_`) runs
+    // it — and everything it pushes — until it pops, at which point the frame
+    // closes this `exprRule` frame itself (`closesEntryFrame`). A RE-ENTRANT
+    // `walkExpression` (a parenthesized atom, a postfix follower / grouped
+    // expr-rule body, a speculative expr-shaped branch) therefore nests on
+    // the SAME vector with no host frame held across it: its root frame sits
+    // above the caller's and is finished first, exactly as the nested drive
+    // used to finish before returning.
     if (pushExprFrame(I, rules, minPrec)) {
-        driveExprWorkStack(I, baseline);
+        I.exprWorkStack.back().closesEntryFrame = true;
+        return;
     }
-    // else: the depth cap tripped at the root push — `recoverExpressionTooDeep_`
-    // already emitted + recovered (nothing was pushed), mirroring the recursive
-    // form where the guarded `parseExpressionAt` returned immediately.
+    // The depth cap tripped at the root push — `recoverExpressionTooDeep_`
+    // already emitted + recovered (nothing was pushed), mirroring the
+    // recursive form where the guarded `parseExpressionAt` returned
+    // immediately; close the frame now, as that form did on its way out.
     I.closeFrameOnce();
 }
 

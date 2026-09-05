@@ -13,6 +13,8 @@
   },
   "$defaultAssemblyLanguageComment": "★★★ A NAME, AND ONLY A NAME (D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET, 2026-08-13). This key answers ONE question — 'when the caller names no source language, which shipped `<stem>.lang.json` spells THIS processor's assembly?' — and the value is a `loadShipped` stem, exactly what `--language` takes. It is the ONLY assembly fact this file carries, and that boundary is load-bearing rather than stylistic.\n★★ WHY NOT A BLOCK. An `asmSyntax` block WAS added here once — `registerPrefix: \"%\"`, `immediatePrefix: \"$\"`, `commentPrefixes`, and operand order via a per-instruction `destinationOperand` — and it was REVERTED the same day it was written, built and gated green ([[D-CONFIG-ASM-DIALECT-DECLARED-AS-TARGET-VOCABULARY]]). ✔THE DISQUALIFYING MEASUREMENT, taken with gcc on THIS target: AT&T `movq %rsi, (%rdi)` versus Intel (`-masm=intel`) `mov QWORD PTR [rdi], rsi` — one CPU, one compiler, two dialects differing in register sigil, immediate sigil, comment character, OPERAND ORDER, memory-operand form and mnemonic spelling. Every one of those is a function of (target, DIALECT); storing them per-target stores a per-(X,Y) fact per-X, and it only looked right because exactly one dialect per target exists today. What is genuinely per-target is WHICH dialect document is the default — this key. Do not re-propose the block.\n★ NOT A LIST, DELIBERATELY. `asm-x86_64-intel` is the sibling that would make it one, and it does not exist yet; a list would need a selector, and the only honest selector before a second dialect ships is the one that already works — naming the language explicitly (`--language asm-x86_64-intel`). A `-masm=`-style flag today would be a knob with nothing to switch to.\n★ OMITTING THIS KEY IS A LEGITIMATE STATE, not a malformed document: a target with no assembly dialect simply fails loud BY NAME when a build needs one. The empty string is REJECTED by the loader, because 'absent' and 'meant to fill this in' are operator-distinguishable and folding them together is how a config key stops meaning anything.",
   "defaultAssemblyLanguage": "asm-x86_64-att",
+  "$atomicsComment": "D-CSUBSET-PACKED-ATOMIC-MEMBER — the arm64 twin carries the fault half of this argument; read that file's copy. ★★ THIS PROCESSOR'S ANSWER IS `losesAtomicity`, AND IT IS A DIFFERENT FACT FROM arm64's, WHICH IS THE WHOLE REASON THIS KEY IS A THREE-WAY ENUM AND NOT A BOOLEAN. ✔MEASURED 2026-09-02, one `_Atomic int` at byte offset 1 of a packed struct: gcc 13.3.0 INLINES `xchgl 1+g(%rip)` for the store and a PLAIN `movl 1+g(%rip)` for the load, and DSS's own x86_64 output (pe64 on Windows, elf64 in WSL) runs `rc 42` on both — so the native form does NOT fault here. ⚠ THAT rc 42 IS A TRUE ANSWER TO THE NARROWER QUESTION ONLY: it proves no FAULT, never ATOMICITY ([[feedback-an-instrument-that-answers-an-adjacent-question]]). The two halves of gcc's sequence are not equally safe — `xchg` with a memory operand carries x86's implicit LOCK and stays atomic misaligned, while the paired plain `movl` is NOT architecturally atomic when the four bytes straddle a cache line. clang 18.1.3 measured on the same source emits `callq __atomic_store@PLT` / `callq __atomic_load@PLT` for the packed member and inlines only for an aligned control, i.e. clang's rule is IDENTICAL on x86-64 and aarch64. MSVC casts no vote: `cl.exe` 14.51.36231 refuses `_Atomic` as a type qualifier under both /std:c11 and /std:c17, including the ALIGNED control, so it is a missing feature and not an opinion. ⇒ ORCHESTRATOR RULING (P53, judgement not measurement, recorded so it can be overruled without archaeology): route the under-aligned access through the runtime here TOO, because a silent loss of atomicity is the same defect shape as arm64's SIGBUS with a quieter failure mode, and one working reference makes the safe route required. ⚠ THE RULING IS HONOURED WHEREVER A RUNTIME IMAGE EXISTS AND CANNOT BE ON pe64: ✔MEASURED — `libatomic.so.1` exports the generic entries on x86_64 Linux (`T __atomic_load@@LIBATOMIC_1.0`) and libSystem carries them on darwin, so elf64 and macho64 declare the `atomicsRuntime` role; UCRT exports NO `__atomic_*` symbol and there is no PE atomics image to name, so pe64 declares none and the `losesAtomicity` arm deliberately KEEPS the native form there — refusing would put DSS below the union on the one platform whose only C reference (mingw-w64 gcc) inlines and works. That per-format difference is expressible only because the FORMAT declares the image and the TARGET declares the hardware fact; a single boolean here could not have said it.",
+  "atomics": { "underAlignedNativeForm": "losesAtomicity" },
   "$predefinedMacrosComment": "TF-C74: the per-ARCHITECTURE identity macros this CPU predefines, merged with the language's `preprocess.predefinedMacros` at preprocess time. Declared on the TARGET (like aggregateLayout/tls below) because they are per-CPU facts; putting them on the language would force c.lang.json to enumerate CPU architectures. COLLISION POLICY: a name declared by BOTH this file and the language config is FATAL (C_ConflictingPredefinedMacro) — neither side silently wins. GATING (MEASURED 2026-07-28 with `clang -dM -E -x c /dev/null -target <triple>`): all four spellings are defined identically by x86_64-linux-gnu, x86_64-apple-darwin AND x86_64-pc-windows-msvc, so all four are UNGATED — unlike the arm64 twin, where `__arm64__`/`__arm64` are Apple-only and must carry availableObjectFormats. DELIBERATELY NOT SHIPPED: `_M_X64` (an MSVC TOOLCHAIN-profile macro, not a CPU fact — it belongs with the pe-gated `_MSC_VER` family on the language side); SHIPPED, BUT NOT HERE -- LANDED ON THE OBJECT FORMAT (TF-C97, D-PP-FORMAT-DATA-MODEL-PREDEFINES): `__LP64__`/`_LP64` are a DATA MODEL, not an architecture -- x86_64:pe64 is LLP64 while the SAME CPU is LP64 under elf64/macho64 -- so a row here would be wrong on one of this target's own formats. This note used to read 'DELIBERATELY NOT SHIPPED' and was a HANDOFF that went four cycles uncompleted; it is now DONE: every LP64 `*.format.json` declares both spellings through the format schema's own `predefinedMacros` key (the same key name, the same shared entry grammar, the same C_ConflictingPredefinedMacro collision policy as this file's), and every LLP64/ILP32 one declares NEITHER -- the negative being the whole reason the channel sits at the format layer. Do not add them here. ★ `__BYTE_ORDER__` USED TO BE LISTED HERE AS 'DELIBERATELY NOT SHIPPED (its value must be a macro REFERENCE, e.g. `__ORDER_LITTLE_ENDIAN__`, which needs a different mechanism than a literal Constant body)'. THAT CLAIM WAS FALSE AND IS NOW REFUTED BY MEASUREMENT (TF-C115, D-PP-ENDIANNESS-PREDEFINES): the `constant` kind ALREADY carries a macro-reference body, because a materialized predefine is spliced over its invocation and RESCANNED like any other replacement (`preprocessor.cpp` — `spliceOver(...); continue;   // rescan from the materialized value`). MEASURED 2026-08-04 against a patched config copy reached through DSS_CONFIG_ROOT: with `__BYTE_ORDER__` = `__ORDER_LITTLE_ENDIAN__`, all of `defined(__BYTE_ORDER__)`, `__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__`, `__BYTE_ORDER__ == 1234` and `!(__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)` hold; the same probe against the UNPATCHED config fired 6 of its 8 `#error` legs (A/B/C/E/F/G; 6 x P001E), INCLUDING the one asserting `__BYTE_ORDER__ != __ORDER_BIG_ENDIAN__` — i.e. the unshipped state was not merely silent, it selected the BIG-ENDIAN arm of any such ladder (`0 == 0`, C 6.10.1p4). No engine change was needed; the note had never been tested. The two endianness rows are now SHIPPED below. Still DELIBERATELY NOT SHIPPED: toolchain identity (`__GNUC__`/`__clang__`) which is a COMPILER profile, not a CPU.",
   "$endiannessPredefinesComment": "TF-C115 (D-PP-ENDIANNESS-PREDEFINES). ★ THIS IS A DOCUMENTATION KEY ONLY — there is deliberately NO `endianness` root key (see below); it annotates the two endianness rows in `predefinedMacros`. THE LAYER, ARGUED FROM THE SAME RULE `__LP64__` LOST ON: a fact belongs on the layer where it does not vary. Endianness DOES vary by CPU (MEASURED: clang defines `__BIG_ENDIAN__` and `__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__` for aarch64_be-linux-gnu, `__LITTLE_ENDIAN__` for aarch64-linux-gnu) and does NOT vary across the object formats a single DSS target serves — x86_64 is little-endian under elf64, macho64 AND pe64, and arm64 is little-endian under elf64 and macho64 — which is precisely the test `__LP64__` FAILED (x86_64 is LP64 on elf/macho and LLP64 on pe, so its row had to move to the format). So these belong HERE, per-CPU, exactly like `__x86_64__`. NO SEPARATE `endianness` KEY IS DECLARED alongside them: the `charIsUnsigned` precedent (arm64.target.json) shows that a second notation of one fact is a DRIFT SOURCE requiring its own coherence test, and unlike `charIsUnsigned` — which HIR→MIR genuinely reads for the char→int promotion — nothing in the engine consumes an endianness value today (`bitFieldStrategy` already carries the LSB-first bit-field rule these targets need). A key with no consumer is dead config that can silently disagree with the macro; the day a consumer exists, it gets declared and THEN gets its coherence example. GATING (MEASURED 2026-08-04, `clang-19 -dM -E -x c /dev/null -target <triple>`, Ubuntu clang 19.1.1): `__LITTLE_ENDIAN__` is defined as 1 on ALL FIVE little-endian triples DSS targets — arm64-apple-darwin, x86_64-apple-darwin, aarch64-linux-gnu, x86_64-unknown-linux-gnu AND x86_64-pc-windows-msvc — so it is UNGATED, like the four x86_64 identity spellings above and unlike arm64's Apple-only `__arm64__`. Same for `__BYTE_ORDER__`. ★ `__BIG_ENDIAN__` IS DELIBERATELY ABSENT, AND THE ABSENCE IS THE DECLARATION: MEASURED, clang defines it ONLY on a big-endian triple (aarch64_be-linux-gnu), so shipping it anywhere here would be a lie about the machine, and Apple's `libkern/OSByteOrder.h` selects its swap-macro family on `defined(__BIG_ENDIAN__)` FIRST — a stray row would silently pick byte-swapping macros on a little-endian host. The negative is asserted by examples/c/endianness_predefines, which is red if `__BIG_ENDIAN__` ever appears on any leg. ★ NOT A GCC PROFILE: MEASURED, gcc 13.3.0 (native x86_64 and the aarch64-linux-gnu cross) defines `__BYTE_ORDER__` and the `__ORDER_*` triple but NOT `__LITTLE_ENDIAN__` — that spelling is a clang/Apple-toolchain one. Shipping it is consistent with the identity this compiler already claims unconditionally (`__clang__` in c.lang.json), and it is what unblocks the Apple SDK: `libkern/OSByteOrder.h:314` is a bare `#error Unknown endianess.` when neither spelling is defined. THE `__ORDER_*` CONSTANTS THIS ROW'S VALUE NAMES ARE NOT HERE — they are invariant across every triple and live on the LANGUAGE (c.lang.json); see that row's comment for the argument.",
   "predefinedMacros": [
@@ -1156,6 +1158,7 @@
             "guard":    { "operandKinds": ["reg"], "width": 8 },
             "template": { "opcode": [15, 182], "forceRexPrefix": true },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -1165,6 +1168,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
             "template": { "opcode": [15, 182] },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -1176,6 +1180,7 @@
             "guard":    { "operandKinds": ["reg"], "width": 16 },
             "template": { "opcode": [15, 183] },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -1185,6 +1190,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
             "template": { "opcode": [15, 183] },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -1209,6 +1215,7 @@
             "guard":    { "operandKinds": ["reg"], "width": 8 },
             "template": { "opcode": [15, 190], "forceRexPrefix": true },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -1218,6 +1225,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
             "template": { "opcode": [15, 190] },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -1229,6 +1237,7 @@
             "guard":    { "operandKinds": ["reg"], "width": 16 },
             "template": { "opcode": [15, 191] },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -1238,6 +1247,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
             "template": { "opcode": [15, 191] },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -1262,6 +1272,7 @@
             "guard":    { "operandKinds": ["reg"], "width": 8 },
             "template": { "mandatoryPrefix": [102], "opcode": [15, 182], "forceRexPrefix": true },
             "resultSlot": "modrm.reg",
+            "destWidth": 16,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -1271,6 +1282,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
             "template": { "mandatoryPrefix": [102], "opcode": [15, 182] },
             "resultSlot": "modrm.reg",
+            "destWidth": 16,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -1295,6 +1307,7 @@
             "guard":    { "operandKinds": ["reg"], "width": 8 },
             "template": { "mandatoryPrefix": [102], "opcode": [15, 190], "forceRexPrefix": true },
             "resultSlot": "modrm.reg",
+            "destWidth": 16,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -1304,6 +1317,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
             "template": { "mandatoryPrefix": [102], "opcode": [15, 190] },
             "resultSlot": "modrm.reg",
+            "destWidth": 16,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -2819,6 +2833,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "rexW": true, "opcode": [99] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
@@ -2826,6 +2841,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 8 },
             "template":   { "rexW": true, "opcode": [15, 190] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
@@ -2833,6 +2849,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 16 },
             "template":   { "rexW": true, "opcode": [15, 191] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
@@ -2840,6 +2857,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
             "template": { "rexW": true, "opcode": [15, 190] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -2851,6 +2869,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
             "template": { "rexW": true, "opcode": [15, 191] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -2862,6 +2881,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
             "template": { "rexW": true, "opcode": [99] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -2888,6 +2908,7 @@
             "guard":    { "operandKinds": ["reg"], "width": 64 },
             "template": { "rexW": true, "opcode": [15, 182] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm" }
             ]
@@ -2897,6 +2918,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "opcode": [139] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
@@ -2904,6 +2926,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 16 },
             "template":   { "rexW": true, "opcode": [15, 183] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
@@ -2911,6 +2934,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 8 },
             "template":   { "rexW": true, "opcode": [15, 182] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
@@ -2918,6 +2942,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
             "template": { "rexW": true, "opcode": [15, 182] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -2929,6 +2954,7 @@
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
             "template": { "rexW": true, "opcode": [15, 183] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem" },
               { "index": 1, "slotKind": "membase.scale" },
@@ -3880,6 +3906,155 @@
       }
     },
     {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-3): FUCOMIP ST(0),ST(1) = DF E9 (Intel SDM: \"Compare ST(0) with ST(1), set status flags accordingly, check for ordered values, and pop register stack\" — the DF E8+i family, i=1). A BARE 2-byte fixed opcode, ZERO operands, no ModR/M (st0/st1 are implicit), the faddp shape. ★★ THE POINT OF THIS ROW IS THAT IT WRITES **EFLAGS**, NOT the x87 status word: FUCOMIP is the x87 compare that reports into ZF/PF/CF, and the pattern it leaves is UCOMISD's BIT FOR BIT (unordered → ZF=PF=CF=1; greater → all 0; less → CF=1; equal → ZF=1). That identity is what lets `long double` reuse the ENTIRE FCmp realization — floatCmpPlan's derivation, its Olt/Ole swap canonicalization, its Foeq/Fune two-setcc compositions and the fused jcc — with nothing re-derived; see mir_to_lir's emitF80Compare. ⓘ QUIET, not signaling: `fcomip` (DF F1) is the signaling sibling and is what gcc/clang emit for `< <= > >=`, but the `fcmp` row above already selects the quiet UCOMISD for every F64/F32 predicate on the stated ground that DSS models no FP environment, so `long double` follows DSS's own rule and the comparison RESULTS are identical on every input. result:none + hasSideEffects (writes EFLAGS AND pops the implicit x87 stack — must never be reordered or DCE'd; no vreg dep expresses either).",
+      "mnemonic": "fucomip", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 0, "maxOperands": 0,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          { "guard": { "operandKinds": [] }, "template": { "opcode": [223, 233] } }
+        ]
+      }
+    },
+    {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-3): FSTP ST(0) = DD D8 (Intel SDM: \"Copy ST(0) to ST(0) and pop the register stack\" — the DD D8+i family, i=0; a REGISTER-form FSTP, distinct from the memory-form fstp_m80 above, which is why it is its own row rather than a variant). A BARE 2-byte fixed opcode, ZERO operands, the faddp shape. Its ONE job is the compare sequence's cleanup: FUCOMIP pops only ONE of the two pushed operands, so this pops the survivor and restores the LD-1 model's invariant that every x87 sequence starts and ends with an EMPTY stack — leak it and eight comparisons overflow the eight-deep stack and start returning NaN indefinites. ⚠ FSTP writes the x87 STATUS WORD, never EFLAGS, so the flags FUCOMIP just set survive it; that is why the cleanup may legally sit between the compare and the setcc/jcc reading it, and both reference compilers emit exactly that order. result:none + hasSideEffects (pops the implicit x87 stack).",
+      "mnemonic": "fstp_st0", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 0, "maxOperands": 0,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          { "guard": { "operandKinds": [] }, "template": { "opcode": [221, 216] } }
+        ]
+      }
+    },
+    {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-5): FCHS = D9 E0 (Intel SDM: \"Complements sign of ST(0)\"). A BARE 2-byte fixed opcode, ZERO operands, no ModR/M — the faddp shape. It is the whole realization of `-someLongDouble` on this axis, and it is a SIGN-BIT TOGGLE, not `0.0L - x`: FCHS gives -(+0.0)=-0.0, -(-0.0)=+0.0 and flips a NaN's sign while keeping its payload, where the subtraction gets the first two wrong. That is the SAME IEEE-exactness argument the F64/F32 `fneg_mask` row (XORPD against a sign mask) already makes one tier up, which is why the two widths agree on semantics while using different instructions. ✔MEASURED 2026-09-04 that both references emit exactly `fld m80; fchs; fstp m80`, probed separately (gcc 13.3.0 and clang 18.1.3), and ✔byte-verified `d9 e0` against GNU as 2.42. result:none + hasSideEffects (mutates the implicit x87 stack top; no vreg dep expresses that, so it must never be reordered or DCE'd).",
+      "mnemonic": "fchs", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 0, "maxOperands": 0,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          { "guard": { "operandKinds": [] }, "template": { "opcode": [217, 224] } }
+        ]
+      }
+    },
+    {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-5): FLD m32fp = D9 /0 — push a SINGLE-precision memory operand onto st0, WIDENING it to the stack's 80-bit working format on the way in. ★ THE WIDENING IS THE WHOLE POINT AND IT LIVES IN THE MEMORY OPERAND: the x87 stack has ONE working format and NO register-to-register conversion instruction, so `(long double)someFloat` is realized as `movss [slot],xmm ; fld_m32 [slot] ; fstp_m80 [home]` — exactly what gcc 13.3.0 and clang 18.1.3 both emit (✔MEASURED 2026-09-04, probed separately). Same base+disp memory operand shape as fld_m80 ([addr-reg, MemBase, MemOffset], modrm.rm.mem → mod=10 + disp32); modrmRegExt=0 = the /0 digit. ✔Byte-verified against GNU as 2.42: `fld DWORD PTR [rbx+0x11223344]` = d9 83 44 33 22 11. result:none + hasSideEffects (pushes the implicit x87 stack).",
+      "mnemonic": "fld_m32", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 3, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template": { "opcode": [217], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-5): FLD m64fp = DD /0 — the DOUBLE-precision sibling of fld_m32, and the widening half of `(long double)someDouble` (`movsd [slot],xmm ; fld_m64 [slot] ; fstp_m80 [home]`). ⚠ THE ONLY DIFFERENCE FROM fld_m32 IS THE FIRST OPCODE BYTE (DD vs D9) — the /0 digit and the whole operand shape are identical — so a row that got that byte wrong would still assemble, still run, and read four bytes where eight were meant. ✔Byte-verified against GNU as 2.42: `fld QWORD PTR [rbx+0x11223344]` = dd 83 44 33 22 11 versus `fld DWORD PTR [...]` = d9 83 …; the emitting verb picks between them from the SOURCE type's own width, never from a default. result:none + hasSideEffects.",
+      "mnemonic": "fld_m64", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 3, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template": { "opcode": [221], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-5): FSTP m32fp = D9 /3 — pop st0 and store it ROUNDED to single precision. The narrowing half of `(float)someLongDouble` (`fld_m80 [src] ; fstp_m32 [slot] ; movss xmm,[slot]`), and the rounding is the instruction's, not a separate step: x87 stores round the 80-bit working value to the destination format under the current control word. ✔MEASURED 2026-09-04 that gcc 13.3.0 and clang 18.1.3 both emit exactly this, probed separately. ✔Byte-verified against GNU as 2.42: `fstp DWORD PTR [rbx+0x11223344]` = d9 9b 44 33 22 11 (the /3 digit puts 011 in ModR/M.reg → 0x9b at mod=10, base=rbx). Same memory shape as fstp_m80; the STORED value is the implicit st0, so there is no value operand. result:none + hasSideEffects (writes memory + pops).",
+      "mnemonic": "fstp_m32", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 3, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template": { "opcode": [217], "modrmRegExt": 3 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-5): FSTP m64fp = DD /3 — the DOUBLE-precision sibling of fstp_m32, and the narrowing half of `(double)someLongDouble`. ⚠ SAME ONE-BYTE HAZARD AS THE fld PAIR: DD vs D9 with an identical /3 digit and operand shape, so the wrong byte writes four bytes where eight were meant with nothing to object. ✔Byte-verified against GNU as 2.42: `fstp QWORD PTR [rbx+0x11223344]` = dd 9b 44 33 22 11. ⓘ This is ALSO the instruction that makes `(double)ld` lossy in the way C requires — the value is rounded once, by the store, rather than reinterpreted. result:none + hasSideEffects.",
+      "mnemonic": "fstp_m64", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 3, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template": { "opcode": [221], "modrmRegExt": 3 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-5): FISTTP m64int = DD /1 — store st0 with TRUNCATION to a 64-bit integer and pop; the wider sibling of fisttp_m32 above, which explains why FISTTP (SSE3) rather than the fnstcw/fistp/fldcw bracketing BOTH references emit. It serves TWO C casts: `(long long)ld` directly, and `(unsigned)ld`, whose full range [0, 2^32) does NOT fit a signed m32int — a value above 2^31 would store the 0x80000000 integer-indefinite and read back as a wrong answer with no fault — but fits a signed m64int exactly, after which the pipeline's own `trunc` verb takes the low 32 bits in a REGISTER (never by reading half the slot, which would be a byte-order assumption). ✔Byte-verified against GNU as 2.42: `fisttp QWORD PTR [rbx+0x11223344]` = dd 8b 44 33 22 11, against the shipped m32 form's db 8b … — the /1 digit is shared and only the first byte differs. ⓘ `(unsigned long long)ld` is still NOT realized: above 2^63 there is no x87 store form at all, and both references branch on a 2^63 compare to bias the value — a branching sequence this straight-line lowerer cannot emit — so that cast stays fail-loud on BOTH long-double axes rather than shipping on one. result:none + hasSideEffects (writes m64 + pops st0).",
+      "mnemonic": "fisttp_m64", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 3, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template": { "opcode": [221], "modrmRegExt": 1 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "Float-to-float precision change (FPTrunc f64→f32, FPExt f32→f64). FC3.5 sweep-c2: encoded — CVTSD2SS xmm1, xmm2 = F2 0F 5A /r (double→single) and CVTSS2SD xmm1, xmm2 = F3 0F 5A /r (single→double), Intel SDM CVTSD2SS/CVTSS2SD: SAME opcode bytes, the mandatory prefix names the SOURCE width. The width axis therefore keys on the SOURCE: the MIR→LIR FPTrunc/FPExt arm threads a widthOverride from the source operand's type (the result-width default would select exactly the WRONG sibling — FPTrunc's F32 result would pick the F3 widen). ModR/M.reg = the xmm destination (resultSlot), ModR/M.rm = the xmm source.",
       "mnemonic": "fpcvt", "result": "value",
       "minOperands": 1, "maxOperands": 1,
@@ -3893,6 +4068,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "mandatoryPrefix": [242], "opcode": [15, 90] },
             "resultSlot": "modrm.reg",
+            "destWidth": 32,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
@@ -3900,6 +4076,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "mandatoryPrefix": [243], "opcode": [15, 90] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           }
         ]
@@ -3918,6 +4095,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "mandatoryPrefix": [242], "rexW": true, "opcode": [15, 44] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm", "regClass": "fpr" }]
           },
           {
@@ -3925,6 +4103,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "mandatoryPrefix": [243], "rexW": true, "opcode": [15, 44] },
             "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm", "regClass": "fpr" }]
           }
         ]
@@ -3980,6 +4159,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 64 },
             "template":   { "mandatoryPrefix": [242], "rexW": true, "opcode": [15, 42] },
             "resultRegClass": "fpr", "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           },
           {
@@ -3987,6 +4167,7 @@
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "mandatoryPrefix": [242], "opcode": [15, 42] },
             "resultRegClass": "fpr", "resultSlot": "modrm.reg",
+            "destWidth": 64,
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
           }
         ]
@@ -4385,6 +4566,8 @@
     {
       "name": "sysv_amd64",
       "$comment": "System V AMD64 ABI (Linux, macOS, BSD). Integer args: RDI/RSI/RDX/RCX/R8/R9 then stack. Float args: XMM0..7 then stack. Integer return: RAX (low 64 bits) + RDX (high 64 bits if >64-bit aggregate). Float return: XMM0/XMM1. Stack 16-byte aligned BEFORE call (RSP%16==0); the call instruction pushes RIP, leaving RSP%16==8 at callee entry. 128-byte red zone below RSP for leaf functions.",
+      "$stackArgPackingComment": "D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT — SysV places a MEMORY-class argument at its own natural alignment, floored at the 8-byte slot, so an x87 `long double` gets a 16-ALIGNED slot rather than the next 8-byte one. ✔MEASURED 2026-09-02, gcc 13.3.0 and clang 18.1.3 agreeing byte-for-byte on `-O1 -S`, callee-side incoming offsets (0 = the first stack argument), each datum placed after an ODD number of 8-byte stack args so the pad is observable: `long double` after one stacked `long` → +16 (NOT +8); `struct{long double;}` → +16; `struct{long x,y;}` (16 bytes, align 8) → +8, which is why the rule is keyed on ALIGNMENT and not on SIZE; `struct __attribute__((aligned(16))){long x,y;}` → +16. The caps are the ISA's largest FUNDAMENTAL alignment, the same 16 `aggregateLayout.maxAlignment` declares. ⓘ gcc and clang also honour an EXPLICIT `aligned(32)` request (both put that struct at +32), which a cap of 16 would clamp — unreachable today because DSS cannot form an over-16-aligned stacked aggregate, and a config edit when it can. Only `long double` (and a long-double-leaf aggregate) exceeds the slot today, so every other stacked argument is byte-unchanged.",
+      "stackArgPacking": { "maxScalarAlignment": 16, "maxAggregateAlignment": 16 },
       "argGprs":     ["rdi", "rsi", "rdx", "rcx", "r8", "r9"],
       "argFprs":     ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"],
       "returnGprs":  ["rax", "rdx"],

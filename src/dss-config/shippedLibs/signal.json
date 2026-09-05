@@ -3,7 +3,7 @@
   "header": "signal.h",
   "standard": "c89",
   "availableObjectFormats": ["elf", "macho"],
-  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "library": { "elf": { "role": "cLibrary" }, "macho": { "role": "cLibrary" } },
   "symbols": [
     { "name": "signal", "signature": "fn(i32, ptr<fn(i32) -> void>) -> ptr<fn(i32) -> void>", "kind": "function", "linkage": "external" },
     { "name": "raise",  "signature": "fn(i32) -> i32",                                        "kind": "function", "linkage": "external" }

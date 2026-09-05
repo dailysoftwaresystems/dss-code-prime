@@ -175,6 +175,78 @@ leg_tree_driver_git() {
     fi
 }
 
+# leg_tree_owning_root <path>
+#
+# Print the absolute root of the WORKING TREE THAT CONTAINS <path>. Returns 1 when
+# no working tree contains it. <path> may be a file or a directory; a file is taken
+# by its directory.
+#
+# ★★★ THIS ANSWERS A DIFFERENT QUESTION FROM `leg_tree_driver_identity`, AND THAT IS
+# WHY IT EXISTS RATHER THAN BEING FOLDED INTO IT.
+#   leg_tree_driver_identity <src>  -- "WHAT is the tree at <src>?"  (branch, sha, gitdir)
+#   leg_tree_owning_root     <path> -- "WHICH tree contains <path>?" (a root)
+# The identity resolver TAKES the tree as its argument: every caller must already
+# know which tree it means. This one DERIVES that argument. Making the identity
+# resolver return a root would have been a true answer to the wrong question --
+# [[feedback-an-instrument-that-answers-an-adjacent-question]] -- so the reuse runs
+# the other way: this helper is a thin layer ON the identity resolver, in the same
+# file, and case 2 below is nothing but a call into it. There is no second resolver.
+#
+# ⚠⚠ THE CALLER THIS WAS ADDED FOR PASSES ITS OWN SCRIPT PATH, NOT `$PWD`, AND THE
+# DIFFERENCE IS THE WHOLE POINT.
+# [[D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED]] `scripts/lane-worktree/` and
+# `scripts/lane-fold/` derived their root from a bare `git rev-parse --show-toplevel`,
+# which answers "what repository am I STANDING in?" -- so every path they then
+# computed, including an `rm -rf` target, was rooted at whichever repository the
+# caller's shell happened to be in. ✔MEASURED 2026-09-02 from a throwaway repository
+# outside this one: all three lane verbs reported that repository's `.worktrees/`
+# while running out of this one's checkout.
+# ⇒ a verb that manages `.worktrees/` must ask which tree ITS OWN FILE belongs to.
+# `$PWD` is a property of the caller's shell; the script's path is a property of the
+# script. Only the second is stable under `cd`.
+#
+# ⓘ THE ORDINARY ANSWER IS `--show-toplevel` RUN AT THE RIGHT PLACE -- with `-C
+# <dir-of-my-file>` rather than at the cwd. That single change is the fix; case 2
+# exists only for the namespace crossing the identity resolver already owns.
+# ✔MEASURED 2026-09-02, why `--show-toplevel` and not `--git-common-dir`: for a
+# SUBMODULE checkout (`.git` a file naming `<super>/.git/modules/<name>`),
+# `--git-common-dir` names `<super>/.git/modules/<name>` and `git worktree list`
+# names it too -- neither is a working tree at all, and rooting a removal there
+# would aim it inside `.git`. `--show-toplevel` answers `<super>/child`, correctly.
+# A bare repository has no working tree; `--show-toplevel` fatals there and case 2's
+# `.git` test does not match, so this helper correctly returns 1 rather than handing
+# back the bare directory as somewhere to put a checkout.
+leg_tree_owning_root() {
+    _lt_or_p=$(leg_tree_abs "$1")
+    [ -n "$_lt_or_p" ] || return 1
+    [ -d "$_lt_or_p" ] || _lt_or_p=$(dirname "$_lt_or_p")
+    _lt_or_d=$(cd "$_lt_or_p" 2>/dev/null && pwd -P) || return 1
+
+    # 1. The ordinary case, in every namespace that can simply see the tree.
+    if _lt_or_t=$(git -C "$_lt_or_d" rev-parse --show-toplevel 2>/dev/null) \
+       && [ -n "$_lt_or_t" ]; then
+        printf '%s\n' "$_lt_or_t"
+        return 0
+    fi
+
+    # 2. A worktree whose `.git` FILE names a gitdir THIS namespace cannot follow --
+    # the Windows-created worktree read from inside WSL that
+    # `leg_tree_driver_identity` was written for. `git -C` fails outright there, so
+    # walk up to the directory that HOLDS the `.git` and let the identity resolver
+    # prove it can describe it. The directory holding a resolvable `.git` IS the
+    # root, so nothing here re-derives what case 1 would have printed.
+    while :; do
+        if [ -e "$_lt_or_d/.git" ] \
+           && leg_tree_driver_identity "$_lt_or_d" >/dev/null 2>&1; then
+            printf '%s\n' "$_lt_or_d"
+            return 0
+        fi
+        _lt_or_up=$(dirname "$_lt_or_d")
+        [ "$_lt_or_up" != "$_lt_or_d" ] || return 1
+        _lt_or_d="$_lt_or_up"
+    done
+}
+
 # leg_tree_prepare <repo> <branch> <sha>
 #
 # ⚠ `<sha>` is the DRIVER's HEAD. It is normally already on the remote, because a gate

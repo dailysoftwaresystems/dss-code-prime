@@ -16,11 +16,16 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/target_schema.hpp"   // D-TEST-THE-HIR-LOWERING-FIXTURE-ANALYZES-WITH-NO-TARGET-IN-SCOPE
+#include "core/types/wide_string_encode.hpp"   // elementByteWidth (assert unit COUNTS, not format-specific bytes)
 #include "hir/const_eval.hpp"
 #include "hir/hir.hpp"
 #include "hir/hir_intrinsic_registry.hpp"
 #include "hir/hir_text.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
+// D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: the one
+// adapter from a format schema to the role seam a shipped-descriptor read asks
+// (`FormatRuntimeLibraryRoleResolver`) — see `analyzeRealStdioAt`.
+#include "link/object_format_schema.hpp"
 #include "repo_root.hpp"
 #include "tokenizer/token_stream.hpp"
 #include "tokenizer/tokenizer.hpp"
@@ -111,8 +116,17 @@ namespace {
     // D-TEST-THE-HIR-LOWERING-FIXTURE-ANALYZES-WITH-NO-TARGET-IN-SCOPE: the target
     // + its va_list strategy, exactly as `compile_pipeline.cpp` and the sibling MIR
     // harness thread them. See `fixtureTarget` for why they are process-owned.
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the OBJECT FORMAT is threaded
+    // too, and it is not decoration here. Plain `char`'s signedness is a
+    // (processor x object format) fact — the same arm64 CPU is unsigned under
+    // GNU/Linux and signed under Darwin — and the accessor requires the format
+    // KIND precisely so no caller can take the processor half alone. Without it
+    // this fixture analyzed with a target but NO answer for `char`, so a
+    // high-byte character constant would refuse here while compiling cleanly
+    // through the real pipeline. ELF is what every fixture in this file was
+    // implicitly written against.
     return analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
-                   std::nullopt, fixtureVaListStrategy(), std::nullopt,
+                   std::nullopt, fixtureVaListStrategy(), ObjectFormatKind::Elf,
                    std::nullopt, LongDoubleFormat::None, fixtureTarget());
 }
 
@@ -2942,10 +2956,25 @@ TEST(HirLoweringC, VisibilityDefaultRowsAreIndependentlyLoadBearing) {
         "__attribute__((visibility(\"default\"))) int f_vd(int v) "
         "{ return v + 1; }\n"
         "int main(void){ return f_vd(g_vd); }\n";
+    // ⚠ P53 CORRECTION, BY MEASUREMENT
+    // (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): this source used to be
+    // written at FILE scope, and that spelling no longer routes through
+    // `externDecl` at all — the file-scope declaration rules were MERGED, so a
+    // file-scope `extern` now reads `topLevelDecl`'s map and the two arms below
+    // measured the same row twice (✔MEASURED: row-1 disabled gave 2, not 0).
+    // The INVARIANT is unchanged and still worth pinning — two scan roots, two
+    // maps, independently load-bearing — but `externDecl` survives only as the
+    // BLOCK-scope rule (D-CSUBSET-BLOCK-SCOPE-EXTERN), so that is where its form
+    // has to be spelled. A test whose premise moves out from under it while its
+    // assertions still pass is the failure this repository names
+    // [[feedback-a-rows-premise-has-a-shelf-life]]; here the premise moved and
+    // the assertion went red, which is the instrument working.
     std::string const externSrc =
-        "extern __attribute__((visibility(\"default\"))) int g_ed;\n"
-        "extern __attribute__((visibility(\"default\"))) int f_ed(int);\n"
-        "int main(void){ return f_ed(g_ed); }\n";
+        "int main(void){\n"
+        "  extern __attribute__((visibility(\"default\"))) int g_ed;\n"
+        "  extern __attribute__((visibility(\"default\"))) int f_ed(int);\n"
+        "  return f_ed(g_ed);\n"
+        "}\n";
 
     // Row 1 = topLevelDecl: both attributed top-level declarations go loud.
     EXPECT_EQ(unknownLinkageWithDefaultRowDisabled(topLevelSrc, 1), 2u)
@@ -4873,6 +4902,22 @@ TEST(HirLoweringC, PointerDerefAndAddressOfLower) {
     EXPECT_EQ(ti.kind(res->hir.typeId(deref)), TypeKind::I32);
 }
 
+// [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: THE PAYLOAD IS THE CONSTANT'S VALUE,
+// NOT THE CODE UNIT — and it now rides the SIGNED arm. This used to assert
+// `std::uint64_t`, which was the arm the old lowering used because it stored the
+// raw byte the decoder hands back. C 6.4.4.4p10 makes a narrow character
+// constant's value that byte read as a plain `char`, and this fixture's target
+// declares plain `char` SIGNED, so the value is a signed integer and belongs in
+// the signed arm. For `'a'` the NUMBER is 97 either way; the arm moved because
+// the literal is now honest about its own type, and a Char-cored payload outside
+// a signed `char`'s range was exactly the lie that let five consumers of one
+// declaration disagree.
+//
+// ⓘ Nothing downstream reads signedness off the ARM — `const_eval_arith.hpp` says
+// so in as many words ("THE SOURCE'S SIGNEDNESS IS CARRIED BY ITS CORE, NEVER BY
+// WHICH VARIANT ARM HOLDS IT") and `asInt64`/`asIntBits` bridge both arms — so
+// this is a representation change with one observable consequence: `'\xff'` is
+// finally -1 where the target says plain `char` is signed.
 TEST(HirLoweringC, CharLiteralLowersToCharValue) {
     // `'a'` — coalesced body token, decoded to a Char codepoint.
     SemanticModel model = analyzeC("char f() { return 'a'; }");
@@ -4883,8 +4928,31 @@ TEST(HirLoweringC, CharLiteralLowersToCharValue) {
     ASSERT_EQ(res->literalPool.size(), 1u);
     auto const& v = res->literalPool.at(0);
     EXPECT_EQ(v.core, TypeKind::Char);
-    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(v.value));
-    EXPECT_EQ(std::get<std::uint64_t>(v.value), static_cast<std::uint64_t>('a'));
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(v.value));
+    EXPECT_EQ(std::get<std::int64_t>(v.value), static_cast<std::int64_t>('a'));
+}
+
+// The half of the pair that is NOT sign-neutral, and the reason the arm moved.
+// `'\xff'` is -1 on this fixture's target (x86_64 declares plain `char` SIGNED)
+// and would be +255 on the one unsigned-`char` leg DSS ships. ✔MEASURED at
+// b1f31420 the lowering stored 255 on EVERY target, and the runtime path hid it:
+// MIR materializes the low byte and extends per target, so 255 and -1 produce
+// identical machine code — which is precisely why only the COMPILE-TIME consumers
+// ever saw the defect, and why a green runtime witness proved nothing about them.
+TEST(HirLoweringC, HighByteCharLiteralLowersToItsSignedValueOnASignedCharTarget) {
+    SemanticModel model = analyzeC("char f() { return '\\xff'; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::Char);
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(v.value));
+    EXPECT_EQ(std::get<std::int64_t>(v.value), -1)
+        << "C 6.4.4.4p10: the constant's value is the code unit read as a plain "
+           "`char`, and this target declares plain `char` SIGNED — 255 is the "
+           "code unit, not the value";
 }
 
 TEST(HirLoweringC, CharEscapeLowersToControlCodepoint) {
@@ -4894,7 +4962,8 @@ TEST(HirLoweringC, CharEscapeLowersToControlCodepoint) {
     auto res = lowerToHir(model, r);
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     ASSERT_EQ(res->literalPool.size(), 1u);
-    EXPECT_EQ(std::get<std::uint64_t>(res->literalPool.at(0).value), 10u);  // '\n'
+    // Signed arm — see `CharLiteralLowersToCharValue`. 10 is sign-neutral.
+    EXPECT_EQ(std::get<std::int64_t>(res->literalPool.at(0).value), 10);  // '\n'
 }
 
 TEST(HirLoweringC, EmptyCharLiteralFailsLoud) {
@@ -5330,37 +5399,204 @@ TEST(HirLoweringC, UcnSurrogateHalfStringFailsLoud) {
     EXPECT_EQ(countCode(r, DiagnosticCode::H_InvalidUniversalCharacterName), 1u);
 }
 
-TEST(HirLoweringC, WideStringByteEscapeFailsLoud) {
-    // FF3: `u"\xC3\xA9"` uses `\x` byte escapes in a wide/UTF string. The old path
-    // silently collapsed the two intended code units into one (0x00E9); Cycle C
-    // fails loud with H_WideByteEscapeUnsupported (a raw code-unit value is not a
-    // code point — the escape-value-as-code-unit feature is deferred). Narrow
-    // `"\xC3\xA9"` is UNCHANGED (byte-producing).
+TEST(HirLoweringC, WideStringByteEscapeAssemblesOneUnitEach) {
+    // ✅ THE CLAIM THIS TEST MAKES IS INVERTED, AND THE INVERSION IS THE FIX (P55,
+    // D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE). It used to assert that `u"\xC3\xA9"`
+    // is REFUSED, because DSS could not express an escape's value as a code unit.
+    // ⚠ IT MUST NOT BE READ AS "the guard was deleted": the behaviour BEFORE that
+    // refusal was a SILENT COLLAPSE of these exact two escapes into ONE wrong
+    // 0x00E9 unit, so the literal is pinned here BY VALUE. A regression to the
+    // collapse gives one unit and reddens arm two; a regression to the blanket
+    // refusal reddens arm one.
+    // ✔MEASURED: gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51 all
+    // emit the two units 0xC3, 0xA9 for this literal.
     SemanticModel model = analyzeC("void f() { u\"\\xC3\\xA9\"; }");
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    EXPECT_FALSE(res->ok) << "a byte escape in a wide string must fail lowering";
-    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideByteEscapeUnsupported), 1u);
+    ASSERT_TRUE(res->ok) << "u\"\\xC3\\xA9\" is two code units and must lower";
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U16);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    // Two 16-bit LE units: C3 00 A9 00 — NOT the one 0x00E9 the collapse produced.
+    EXPECT_EQ(std::get<std::string>(v.value),
+              std::string({static_cast<char>(0xC3), 0, static_cast<char>(0xA9), 0}))
+        << "each byte escape is its OWN code unit; the UTF-8 re-decode is bypassed";
 }
 
-TEST(HirLoweringC, WideCharByteEscapeFailsLoud) {
-    // MEDIUM-1 (code-audit): the wide-CHAR byte-escape path is the char twin of
-    // WideStringByteEscapeFailsLoud (FF3). `u'\xC3\xA9'` must fail loud with
-    // H_WideByteEscapeUnsupported (decodeWideCharCodepoint → ByteEscapeInWide), NOT
-    // silently collapse C3 A9 → one char16_t 0x00E9. This is the sole exerciser of the
-    // ByteEscapeInWide enumerator on the char path — a refactor dropping the guard would
-    // reintroduce the collapse miscompile for the char form with nothing red.
-    SemanticModel model = analyzeC("void f() { u'\\xC3\\xA9'; }");
+TEST(HirLoweringC, WideStringByteEscapeAgreesWithTheSemanticArrayLength) {
+    // ★★ THE TIER-AGREEMENT PIN, and the reason the semantic tier had to move with
+    // the encoder rather than after it. HIR emits the code units and the semantic
+    // typer derives `Array<char16_t, N+1>` from the SAME buffer through the SAME
+    // encoder; if only one of them were given the escape values, one would count a
+    // byte escape as one unit and the other would re-read its placeholder byte as
+    // UTF-8. `sizeof` reads the semantic answer and the literal pool holds HIR's,
+    // so asserting both in one test is what makes a divergence impossible to miss.
+    SemanticModel model = analyzeC("void f() { u\"\\xC3\\xA9\"; }");
+    EXPECT_FALSE(model.hasErrors()) << "the wide literal must TYPE, not merely lower";
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    EXPECT_FALSE(res->ok) << "a byte escape in a wide char must fail lowering";
-    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideByteEscapeUnsupported), 1u);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    // HIR's answer: the emitted byte string, divided by the element width.
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    std::uint32_t const w        = elementByteWidth(v.core);
+    std::size_t const   hirUnits = std::get<std::string>(v.value).size() / w;
+
+    // The semantic tier's answer: the Array bound stamped on the same node, which
+    // is `codeUnits + 1` for the NUL. Reading BOTH in one test is the point — a
+    // tier that were given the escape values while the other was not would still
+    // pass every single-tier assertion in this file.
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(hirUnits, 2u) << "two escapes, two code units";
+    EXPECT_EQ(ti.scalars(ty)[0], static_cast<std::int64_t>(hirUnits + 1))
+        << "the semantic array length and the HIR unit count must agree";
+}
+
+TEST(HirLoweringC, WideStringEscapeTooWideForElementFailsLoud) {
+    // ★ THE FAIL-LOUD CLAIM THE OLD WideStringByteEscapeFailsLoud CARRIED LIVES
+    // HERE NOW — moved to the case where the references actually split, not
+    // deleted. gcc 13.3.0 and mingw-w64 gcc 13.2.0 truncate `u"\x1FFFF"` to 0xFFFF
+    // with a warning; clang 18.1.3 and MSVC 19.51 refuse. The union over what WORKS
+    // is a refusal, because a truncation is the same silent wrong answer this
+    // anchor pair exists to end.
+    SemanticModel model = analyzeC("void f() { u\"\\x1FFFF\"; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "an escape wider than char16_t must fail, never truncate";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_EscapeValueExceedsCodeUnit), 1u);
+
+    // The SAME value under a 32-bit element is valid — the bound is the ELEMENT
+    // WIDTH, not Unicode and not a ban on byte escapes.
+    SemanticModel wide = analyzeC("void f() { U\"\\x1FFFF\"; }");
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(wide, r2);
+    EXPECT_TRUE(res2->ok) << "U\"\\x1FFFF\" is one char32_t unit on all four references";
+}
+
+TEST(HirLoweringC, WideStringConcatRebasesEscapeOffsets) {
+    // ★★ THE OFFSET REBASE, pinned from the direction it fails. Phase 5 decodes
+    // each segment independently and phase 6 joins the bytes, so an escape recorded
+    // at offset 0 of its OWN segment sits at offset 1 of the joined buffer here.
+    // Without the rebase in `decodeAdjacentStringBodies` the encoder splices the
+    // unit at the wrong place and re-reads a real byte as text — silently.
+    // ✔MEASURED: all four references give `u"\xF" "F"` the units 0x000F, 0x0046.
+    SemanticModel model = analyzeC("void f() { u\"\\xF\" \"F\"; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value),
+              std::string({0x0F, 0, 0x46, 0}))
+        << "the escape stays in the FIRST segment's position after the join";
+}
+
+TEST(HirLoweringC, WideStringEscapeIsARawUnitNotACodePoint) {
+    // ★★★ THE PROPERTY MOST LIKELY TO BE "TIDIED" AWAY by a later refactor that
+    // routes byte escapes back through the code-point validator. ✔MEASURED,
+    // unanimous in BOTH directions on all four references: `u"\xD800"` assembles a
+    // LONE SURROGATE unit and `U"\xFFFFFFFF"` a unit PAST U+10FFFF, while the UCN
+    // spellings of those same numbers are refused by all four. If a refactor makes
+    // these two fail, it has re-imposed Unicode rules on something that is not a
+    // code point.
+    SemanticModel surro = analyzeC("void f() { u\"\\xD800\"; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(surro, r);
+    EXPECT_TRUE(res->ok) << "a lone-surrogate VALUE is a legal code unit";
+
+    SemanticModel past = analyzeC("void f() { U\"\\xFFFFFFFF\"; }");
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(past, r2);
+    EXPECT_TRUE(res2->ok) << "0xFFFFFFFF fills a char32_t unit exactly";
+
+    // ...and the UCN spelling of the surrogate stays refused.
+    SemanticModel ucn = analyzeC("void f() { u\"\\uD800\"; }");
+    DiagnosticReporter r3;
+    auto res3 = lowerToHir(ucn, r3);
+    EXPECT_FALSE(res3->ok) << "\\uD800 names a surrogate CODE POINT and must fail";
+    EXPECT_EQ(countCode(r3, DiagnosticCode::H_InvalidUniversalCharacterName), 1u);
+}
+
+TEST(HirLoweringC, WideCharByteEscapeAssemblesOneUnit) {
+    // ✅ THE CLAIM THIS TEST MAKES IS INVERTED, AND THAT IS THE POINT (P55,
+    // D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE, character half). It used to assert that
+    // `u'\xC3\xA9'` fails loud; the reason it failed was that DSS could not express
+    // an escape's VALUE, and the reason it must not simply be deleted is that the
+    // behaviour BEFORE that refusal was a silent collapse to one 0x00E9 unit.
+    //
+    // Both hazards are now pinned positively. `u'\xFFFF'` is ONE 0xFFFF code unit —
+    // ✔MEASURED identical on gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC
+    // 19.51 — and a regression to the collapse would give 0xFFFD or a refusal, both
+    // caught here. `u'\xC3\xA9'` keeps a REFUSAL, but for the honest reason: a
+    // character constant denotes ONE code unit and that body names two.
+    SemanticModel model = analyzeC("void f() { u'\\xFFFF'; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << "u'\\xFFFF' names one 0xFFFF code unit and must lower";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_EscapeValueExceedsCodeUnit), 0u);
+
+    // The two-escape body is not one unit — refused, and NOT as a width failure.
+    SemanticModel two = analyzeC("void f() { u'\\xC3\\xA9'; }");
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(two, r2);
+    EXPECT_FALSE(res2->ok) << "u'\\xC3\\xA9' is two units, not one — must fail loud";
+    EXPECT_EQ(countCode(r2, DiagnosticCode::H_WideCharValueUnrepresentable), 1u);
+}
+
+TEST(HirLoweringC, WideCharByteEscapeTooWideForElementFailsLoud) {
+    // ★ THE FAIL-LOUD CLAIM MOVED HERE rather than being dropped (P55). The
+    // references SPLIT on an escape that overflows the element: gcc 13.3.0 and
+    // mingw-w64 gcc 13.2.0 truncate `u'\x1FFFF'` to 0xFFFF WITH A WARNING, clang
+    // 18.1.3 and MSVC 19.51 REFUSE. A reference that only accepts by narrowing the
+    // value away is not a working reference, so DSS refuses — a truncation here is
+    // the same silent wrong answer the whole P55 pair exists to end.
+    SemanticModel model = analyzeC("void f() { u'\\x1FFFF'; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "an escape wider than char16_t must fail, never truncate";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_EscapeValueExceedsCodeUnit), 1u);
+
+    // U'\xFFFFFFFF' EXACTLY fills a 32-bit unit and is valid on all four references
+    // — including past U+10FFFF, which is the proof that a byte escape is a raw
+    // code UNIT and not a code POINT.
+    SemanticModel wide = analyzeC("void f() { U'\\xFFFFFFFF'; }");
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(wide, r2);
+    EXPECT_TRUE(res2->ok) << "U'\\xFFFFFFFF' fills a char32_t unit exactly";
+}
+
+TEST(HirLoweringC, WideCharSurrogateEscapeIsAUnitButTheUcnIsNot) {
+    // ★★ THE SHARPEST MEASURED ASYMMETRY, and the one a later refactor is most
+    // likely to "tidy" away by routing byte escapes back through the code-point
+    // validator. ✔MEASURED, unanimous in BOTH directions on gcc 13.3.0, clang
+    // 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51: `u'\xD800'` assembles to one
+    // 0xD800 unit, while `u'\uD800'` — the same number spelled as a universal
+    // character name — is REFUSED by all four. A raw code unit may be a lone
+    // surrogate; a code point may not.
+    SemanticModel esc = analyzeC("void f() { u'\\xD800'; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(esc, r);
+    EXPECT_TRUE(res->ok) << "u'\\xD800' is a raw code unit and must lower";
+
+    SemanticModel ucn = analyzeC("void f() { u'\\uD800'; }");
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(ucn, r2);
+    EXPECT_FALSE(res2->ok) << "u'\\uD800' names a surrogate CODE POINT and must fail";
+    EXPECT_EQ(countCode(r2, DiagnosticCode::H_InvalidUniversalCharacterName), 1u);
 }
 
 TEST(HirLoweringC, WideStringIllFormedUtf8FailsLoud) {
     // MEDIUM-2 (code-audit): after Cycle C, H_WideCharSurrogateUnsupported's surviving
     // trigger is a RAW ill-formed UTF-8 byte in a wide string body (astral-under-U16 now
-    // surrogate-encodes; the `\x` route is shadowed by FF3's H_WideByteEscapeUnsupported).
+    // surrogate-encodes; the `\x` route is shadowed by the wide-string escape guard).
     // A lone 0x80 (an invalid UTF-8 lead byte) must fail loud, not emit a garbage code
     // unit — this is the sole red-on-disable for that still-live diagnostic.
     std::string src = "void f() { u\"";
@@ -5583,15 +5819,32 @@ TEST(HirLoweringC, ConcatFF3MixedNarrowWidePrefixFailsLoud) {
     // The FF3-mixed hole (now CLOSED): `"a" L"\xC3"` — the run is WIDE (effective
     // prefix L) but the FIRST opener is narrow. Pre-Cycle-D the FF3 byte-escape guard
     // keyed on the first opener → narrow → MISS → the old silent UTF-8 collapse. Now
-    // the guard keys on the run's effective prefix, so the `\xC3` byte escape in a
-    // wide run fails loud with H_WideByteEscapeUnsupported.
+    // the guard keys on the run's effective prefix.
+    // ⏳ P55 INVERTS THE OUTCOME AND KEEPS THE PROPERTY. `"a" L"\xC3"` now LOWERS,
+    // because a byte escape in a wide run is a code unit rather than a refusal —
+    // but what this test exists for is unchanged and still load-bearing: the run's
+    // element must come from the EFFECTIVE prefix, never the FIRST opener. Keying
+    // on the first opener would make this run NARROW, and `\xC3` would be emitted
+    // as one raw byte inside what must be a 16-bit array — the original silent
+    // miscompile, reached by a different road. Pinning the UNITS is what detects
+    // that; a bare "it compiles" would not.
     SemanticModel model = analyzeC("void f() { \"a\" L\"\\xC3\"; }");
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    EXPECT_FALSE(res->ok) << "a byte escape in a wide (via a later prefix) run must fail";
-    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideByteEscapeUnsupported), 1u);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     EXPECT_EQ(countCode(r, DiagnosticCode::H_ConflictingStringLiteralPrefixes), 0u)
-        << "a SINGLE non-narrow prefix is not a conflict — only the byte escape fires";
+        << "a SINGLE non-narrow prefix is not a conflict";
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_NE(v.core, TypeKind::Char)
+        << "the run is WIDE via its later prefix — a narrow core here is the "
+           "first-opener bug returning as a silent miscompile";
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    // 'a' then the 0xC3 unit, each in the element's width (2 on pe, 4 on elf/macho
+    // for L") — so assert the UNIT COUNT rather than a format-specific byte string.
+    std::uint32_t const w = elementByteWidth(v.core);
+    EXPECT_EQ(std::get<std::string>(v.value).size(), 2u * w)
+        << "two code units: 'a' and the escape's 0xC3";
 }
 
 TEST(HirLoweringC, ConcatAllNarrowUnchanged) {
@@ -5664,8 +5917,11 @@ namespace {
 // the source by hand. MEASURED cost: that is exactly how sqlite's `shell.c`
 // `struct stat x = {0};` had to be located.
 //
-// RED-ON-DISABLE: drop the `track(...)` wrapper on either `lowerBraceInit`'s or
-// `lowerUnionBraceInit`'s returned aggregate and the matching arm below goes red.
+// RED-ON-DISABLE: drop the `track(...)` wrapper on `finishBraceLevel`'s returned
+// aggregate and the matching arm below goes red. ⚠ THAT USED TO NAME TWO SITES,
+// `lowerBraceInit`'s and `lowerUnionBraceInit`'s. There is ONE now: the brace-init
+// work-stack conversion folded the union arm in as a one-slot level, so every
+// level — struct, array and union alike — is `track`ed in one place.
 TEST(HirLoweringC, BraceInitAggregateCarriesASourceSpan) {
     SemanticModel model = analyzeC(
         "struct S { int a; int b; };\n"
@@ -5912,6 +6168,65 @@ TEST(HirLoweringC, D5_3_ChainedBraceNesting) {
     ASSERT_EQ(kids.size(), 2u);
     EXPECT_EQ(res->hir.kind(kids[0]), HirKind::ConstructAggregate);
     EXPECT_EQ(res->hir.kind(kids[1]), HirKind::ConstructAggregate);
+}
+
+// ── [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]] ───────────────
+//
+// An index designator is the ONE integer-constant-expression consumer that lives
+// at this tier, and its const-expr surface had quietly fallen behind the semantic
+// tier's: `evalCstConstInt` carried no cast-target resolver at all, so
+// `{ [(int)1] = 7 }` was refused with "index designator must be an integer
+// literal" while the byte-identical expression folded fine as an array bound.
+// ✔MEASURED: gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51 all
+// accept `[(int)1]` AND `[(int)1.5]`.
+//
+// ⚠ THE ASSERTION IS WHERE THE 7 LANDED, not that lowering succeeded. A resolver
+// that folded `(int)1.5` to 0 or 2 would still lower cleanly and would still be
+// wrong; the slot is the only thing that says which.
+TEST(HirLoweringC, IndexDesignatorFoldsACastToAnInteger) {
+    struct Case { char const* src; char const* what; };
+    Case const cases[] = {
+        {"int a[3] = { [(int)1] = 7 };\n",   "an integer cast"},
+        {"int a[3] = { [(int)1.5] = 7 };\n", "a float cast, truncated toward zero"},
+        {"int a[3] = { [(int)1.9] = 7 };\n", "and truncation, not rounding"},
+    };
+    for (Case const& c : cases) {
+        SemanticModel model = analyzeC(std::string{"void f() { "} + c.src + "}\n");
+        ASSERT_FALSE(model.hasErrors()) << c.what;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok)
+            << c.what << ": " << (r.all().empty() ? "" : r.all()[0].actual);
+        HirNodeId fn   = firstFunction(res->hir);
+        HirNodeId init = firstVarInitOfFn(res->hir, fn);
+        ASSERT_TRUE(init.valid()) << c.what;
+        EXPECT_EQ(res->hir.kind(init), HirKind::ConstructAggregate) << c.what;
+        auto kids = res->hir.children(init);
+        ASSERT_EQ(kids.size(), 3u) << c.what;
+        // Slot 1 carries the 7; the designator resolved to index 1 and nowhere
+        // else. Slots 0 and 2 are the zero fill.
+        std::int64_t got[3] = {-1, -1, -1};
+        for (std::size_t i = 0; i < 3; ++i) {
+            ASSERT_EQ(res->hir.kind(kids[i]), HirKind::Literal) << c.what;
+            auto const lit = res->literalPool.at(res->hir.payload(kids[i]));
+            ASSERT_TRUE(std::holds_alternative<std::int64_t>(lit.value)) << c.what;
+            got[i] = std::get<std::int64_t>(lit.value);
+        }
+        EXPECT_EQ(got[0], 0) << c.what;
+        EXPECT_EQ(got[1], 7) << c.what;
+        EXPECT_EQ(got[2], 0) << c.what;
+    }
+}
+
+// The wall this tier keeps: a float-VALUED index is refused, exactly as all four
+// references refuse `{ [1.5] = 7 }`. Without this control, "casts fold here now"
+// would be indistinguishable from "floats are integers here now".
+TEST(HirLoweringC, IndexDesignatorStillRefusesAFloatVALUE) {
+    SemanticModel model = analyzeC("void f() { int a[3] = { [1.5] = 7 }; }\n");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    bool const refused = model.hasErrors() || !res->ok;
+    EXPECT_TRUE(refused) << "a float-valued index designator must fail loud";
 }
 
 // Lock-in: field designator naming a NON-EXISTENT field emits a
@@ -6190,11 +6505,21 @@ TEST(HirLoweringC, D5_3_CompoundLiteralInVarDeclInit) {
     EXPECT_EQ(res->hir.children(init).size(), 2u);
 }
 
-// Substrate-blocked: non-literal index designator (e.g. `[n] = 7`)
-// must emit a diagnostic that names CST-side const-eval as the blocker.
-// Strict form: when semantic accepts the input, the lowering MUST emit
-// the diagnostic (silent acceptance would be a regression the looser
+// A NON-CONSTANT index designator (`[n] = 7`, `n` a mutable local) must be
+// diagnosed. Strict form: when semantic accepts the input, the lowering MUST
+// emit the diagnostic (silent acceptance would be a regression the looser
 // `found || res->ok` form would have missed).
+//
+// ⚠ REPAIRED, NOT DELETED, under
+// [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]]. Two things about
+// this pin had gone stale while the assertion it makes stayed exactly right.
+// (1) It matched the diagnostic by the words "integer literal", which described
+// a designator surface that had already grown past literals (`[1+0]` folds) and
+// has now grown a cast too — the message names C 6.7.10p4's actual requirement,
+// an integer constant EXPRESSION, so the match is on that. (2) Its comment
+// called this "substrate-blocked ... pending CST-side const-eval", which stopped
+// being the reason long ago: the substrate is here, and `n` is refused because
+// it is genuinely not a constant, which is what all four references also say.
 TEST(HirLoweringC, D5_3_NonLiteralIndexDesignatorEmitsDiag) {
     SemanticModel model = analyzeC(
         "void f() { int n = 1; int xs[3] = {[n] = 7}; }\n");
@@ -6203,17 +6528,15 @@ TEST(HirLoweringC, D5_3_NonLiteralIndexDesignatorEmitsDiag) {
     auto res = lowerToHir(model, r);
     bool found = false;
     for (auto const& d : r.all()) {
-        if (d.actual.find("integer literal") != std::string::npos
+        if (d.actual.find("integer constant") != std::string::npos
          || d.actual.find("const-eval") != std::string::npos) {
             found = true; break;
         }
     }
     EXPECT_TRUE(found)
-        << "non-literal index designator MUST be diagnosed pending "
-           "CST-side const-eval substrate";
+        << "a non-constant index designator MUST be diagnosed";
     EXPECT_FALSE(res->ok)
-        << "lowering must fail when a non-literal index designator "
-           "appears (substrate-blocked path)";
+        << "lowering must fail when a non-constant index designator appears";
 }
 
 // ── plan 12.5 §0.2 D6: CST-side const-eval ──────────────────────────
@@ -6642,8 +6965,9 @@ TEST(HirLoweringC, D5_4_UnionChainedDesignatorEmitsDiag) {
     EXPECT_FALSE(res->ok);
 }
 
-// Union nested inside a struct: the recursive InitSlot path lands on
-// the union's `lowerUnionBraceInit` correctly + omitted struct slots
+// Union nested inside a struct: the InitSlot path lands on the union's own
+// level (`prepareUnionBraceInit` picks the variant, the brace-init work stack
+// runs it as a one-slot level) correctly + omitted struct slots
 // containing unions zero-fill via the corrected `synthZeroOrError`
 // Union arm (1-child first-variant).
 TEST(HirLoweringC, D5_4_UnionNestedInStruct) {
@@ -6690,8 +7014,9 @@ TEST(HirLoweringC, D5_4_UnionZeroFilledByContainingStruct) {
     EXPECT_EQ(res->hir.children(kids[1]).size(), 1u);
 }
 
-// Compound literal of union type: `(union U){.c='a'}` exercises
-// lowerCompoundLiteral → lowerBraceInit → lowerUnionBraceInit chain.
+// Compound literal of union type: `(union U){.c='a'}` exercises the
+// lowerCompoundLiteral → lowerBraceInit → openBraceLevel → prepareUnionBraceInit
+// chain (the union is a one-slot level of the brace-init work stack).
 TEST(HirLoweringC, D5_4_UnionCompoundLiteral) {
     SemanticModel model = analyzeC(
         "union U { int i; char c; };\n"
@@ -8208,14 +8533,30 @@ TEST(HirLoweringC, StaticAssertEnumConstantFolds) {
     EXPECT_FALSE(model.hasErrors());
 }
 
-// NON-CONSTANT condition (a float — not an integer constant expression) fails
-// loud. C 6.7.10 requires an integer constant expression; a float condition
-// cannot fold in `constIntExpr` → S_StaticAssertFailed.
-TEST(HirLoweringC, StaticAssertFloatConditionFailsAsNonConstant) {
-    SemanticModel model = analyzeC(
-        "_Static_assert(3.5, \"float is not an ICE\");\n"
+// A FLOAT condition is decided by its TRUTH VALUE, not refused for being a float
+// — [[D-C-STATIC-ASSERT-REFUSES-A-LONG-DOUBLE-COMPARISON]].
+//
+// ⚠⚠ THIS TEST USED TO ASSERT THE OPPOSITE, and it was wrong. It required
+// `_Static_assert(3.5, "")` to FAIL "because C 6.7.10 requires an integer
+// constant expression". ✔MEASURED at close time, probed SEPARATELY: clang 18.1.3
+// and MSVC 19.51 ACCEPT it; gcc 13.3.0 and mingw-w64 gcc 13.2.0 refuse it as
+// "not an integer". `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` governs an
+// accept-vs-refuse split, so DSS accepts. The REFUSAL the test was really
+// guarding — that a float condition cannot silently pass whatever its value —
+// is kept below and is stronger: a float that is FALSE still fails loud, which
+// all four references agree on.
+TEST(HirLoweringC, StaticAssertFloatConditionIsDecidedByItsTruthValue) {
+    SemanticModel accepted = analyzeC(
+        "_Static_assert(3.5, \"a non-zero float is true\");\n"
         "int main(void){ return 0; }\n");
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u);
+    EXPECT_EQ(countCode(accepted.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+    SemanticModel refused = analyzeC(
+        "_Static_assert(0.0, \"a zero float is false\");\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_EQ(countCode(refused.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u)
+        << "a FALSE floating condition must still fail loud";
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -8876,8 +9217,27 @@ namespace {
     builder.setActiveFormat(format);
     builder.addInMemory(std::move(src), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    // ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ──
+    // stdio.json names the runtime ROLE rather than restating the C runtime's
+    // image, and a read with NO resolver records the role and binds no image.
+    // These pins assert the resolved image (`libc.so.6` / `ucrtbase.dll`), so
+    // they carry the resolver the driver always carries. The pin's own format
+    // picks its exec flavour, which declares `cLibrary` in its own table.
+    std::string_view const execFlavour =
+        format == ObjectFormatKind::Pe ? std::string_view{"pe64-x86_64-windows-exec"}
+                                       : std::string_view{"elf64-x86_64-linux-exec"};
+    auto const formatSchema = ObjectFormatSchema::loadShipped(execFlavour);
+    if (!formatSchema) {
+        // Throw, never abort — an abort kills the whole binary and costs every
+        // sibling case its verdict (see the `shippedSchemaOrThrow` note above).
+        throw std::runtime_error{"loadShipped(\"" + std::string{execFlavour}
+                                 + "\") failed; the TF-C112 pins cannot resolve "
+                                   "the descriptor's runtime role without it"};
+    }
+    FormatRuntimeLibraryRoleResolver const roles{**formatSchema};
     return analyze(cu, DiagnosticBudget::libraryDefault(),
-                   dataModel, std::nullopt, std::nullopt, format, "x86_64");
+                   dataModel, std::nullopt, std::nullopt, format, "x86_64",
+                   LongDoubleFormat::None, nullptr, 0, &roles);
 }
 
 // How many `externDecls` rows carry `name` — i.e. how many IMPORTS the lowering
@@ -10315,6 +10675,18 @@ TEST(HirLoweringC, AttributeVocabularyStillAppliesAfterTheKeywordDenial) {
 // the semantic bit is not what suppresses a body. Both facts are true and this
 // tier is the one that decides the artifact — which is precisely why this table
 // is not a restatement of the semantic truth table.
+//   ~~ P53 CORRECTION, BY MEASUREMENT
+// (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): the sentence above about
+// "a definition whose `extern` is the DECLARATION RULE'S HEAD" describes a tree
+// that no longer exists. At FILE scope `extern` is now an ordinary
+// `singleDeclSpecifier` and every declaration routes through `topLevelDecl`, so
+// these definitions DO reach `lowerInlineDefinitionAsDeclaration` — and reach it
+// carrying the keyword, which is why `specifierPrefixHasInline`'s `extern` test
+// (`semantics.inline.externSpecifierTokens`) is now load-bearing on this route
+// rather than moot. That is the SECOND symptom this row named, closed BY the
+// merge rather than beside it. The paragraph is kept because its P51 measurement
+// was true of the P51 tree and the `externSpecifierTokens` mutant's reach is a
+// fact worth not re-deriving; do not read it as describing the current one.
 TEST(HirLoweringC, InlineBaselineSpellingsCarryTheReferenceLinkageState) {
     struct Row {
         char const*   spelling;
@@ -10328,6 +10700,19 @@ TEST(HirLoweringC, InlineBaselineSpellingsCarryTheReferenceLinkageState) {
         {"static inline",   0u, false, SymbolBinding::Local,  "t p"},
         {"extern inline",   0u, false, SymbolBinding::Global, "T p"},
         {"extern __inline", 0u, false, SymbolBinding::Global, "T p"},
+        // ★★★ P53 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS): THE SAME
+        // SPELLINGS WITH THE SPECIFIERS IN THE OTHER ORDER. Every one of these
+        // was `error[P_NoAlternativeMatched]` before the file-scope declaration-
+        // rule merge, because `extern` was the HEAD of its own rule — so the
+        // table above could only ever measure half of C 6.7.1's unordered set.
+        // They carry the SAME expectations as their mirrors, and that identity
+        // is the assertion: `nm` on gcc 13.3.0 and clang 18.1.3 objects
+        // (probed separately 2026-09-02, this exact shape) gives `T p` for BOTH
+        // `extern inline` and `inline extern`, so the two orders do not merely
+        // both compile — they MEAN the same external definition.
+        {"inline extern",   0u, false, SymbolBinding::Global, "T p"},
+        {"__inline extern", 0u, false, SymbolBinding::Global, "T p"},
+        {"inline static",   0u, false, SymbolBinding::Local,  "t p"},
     };
     for (Row const& row : kRows) {
         SCOPED_TRACE(row.spelling);
@@ -10362,4 +10747,526 @@ TEST(HirLoweringC, InlineBaselineSpellingsCarryTheReferenceLinkageState) {
                   std::optional{row.binding})
             << row.spelling << " — reference `nm` column " << row.referenceNm;
     }
+}
+
+// ── D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE (C 6.5.3.2p1) ────────────────
+//
+// `E1[E2]` is `*((E1)+(E2))` and the constraint is stated symmetrically, so the
+// lowering must ASK which operand is the container rather than assume the base
+// is. The corpus example `subscript_commuted_operands` pins the VALUES a running
+// program reads; these pin the two REFUSALS, which a running program cannot
+// witness, and the positive/negative pair in one place.
+//
+// ⚠ THE TWO REFUSALS ARE WHY A "just admit the reversed spelling" FIX WOULD BE
+// WRONG: if the lowering merely stopped asking, `p[q]` and `a[b]` would go quiet
+// too. Both are refused by gcc 13.3.0 and clang 18.1.3 at the user's own token
+// ("array subscript is not an integer" / "subscripted value is neither array nor
+// pointer nor vector") — ✔MEASURED 2026-09-02, each probed SEPARATELY.
+TEST(HirLoweringC, CommutedSubscriptLowersCleanBothDirections) {
+    SemanticModel model = analyzeC(
+        "static int d[4] = {0,1,2,3};\n"
+        "int main(void) { int *p = d; int i = 2; return i[p] + p[i]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok)
+        << "`i[p]` is `p[i]` (C 6.5.3.2p1) — the lowering must type both; "
+        << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger),
+              0u)
+        << "one pointer and one integer satisfies the constraint in EITHER order";
+}
+// RED-ON-DISABLE: delete the `Ambiguous` arm from `indexContainerOperand` and
+// this reds — the law answers `Base`, the integer promotion is then handed a
+// pointer, and the process ABORTS inside the type lattice instead of reporting
+// (`TypeInterner::primitive: TypeKind Ptr is not a LEAF kind`, exit 0xC0000409,
+// ✔MEASURED at P53's base through the shipped CLI).
+TEST(HirLoweringC, SubscriptOfTwoPointersIsRefusedNotResolved) {
+    SemanticModel model = analyzeC(
+        "static int d[4];\n"
+        "int main(void) { int *p = d; int *q = d; return p[q]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_FALSE(res->ok) << "`p[q]` satisfies 6.5.3.2p1 in NEITHER direction";
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger),
+              1u)
+        << "exactly one refusal, naming the construct rather than a node ordinal";
+}
+TEST(HirLoweringC, SubscriptOfTwoIntegersIsRefusedNamingTheConstruct) {
+    SemanticModel model = analyzeC(
+        "int main(void) { int a = 1, b = 2; return a[b]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_FALSE(res->ok) << "neither operand of `a[b]` can be the pointer";
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger),
+              1u);
+    // ★ THE DIAGNOSTIC-QUALITY HALF THE ROW CARRIES. At P53's base this shape
+    // reached the HIR verifier as `hir node #8 (HirKind ordinal 34)` — an
+    // internal enumerator number shown to a user who wrote `a[b]`. The refusal
+    // must name the CONSTRUCT and the standard clause, and no message anywhere
+    // in the run may spell a raw kind ordinal.
+    bool sawSubscriptText = false;
+    for (auto const& d : r.all()) {
+        EXPECT_EQ(d.actual.find("HirKind ordinal"), std::string::npos)
+            << "a user-facing message must not name an internal kind ordinal: "
+            << d.actual;
+        if (d.code == DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger
+            && d.actual.find("6.5.3.2p1") != std::string::npos
+            && d.actual.find("subscript") != std::string::npos) {
+            sawSubscriptText = true;
+        }
+    }
+    EXPECT_TRUE(sawSubscriptText)
+        << "the refusal must name the construct and the constraint it violates";
+}
+
+// The OTHER half of 6.5.3.2p1 — "the other shall have INTEGER type". Both
+// shapes below ABORTED THE PROCESS at P53's base (exit 0xC0000409, no
+// `error[…]` line at all), and a float index instead travelled to the ASSEMBLER
+// and was refused there as a register-CLASS mismatch naming xmm3 — a machine
+// fact standing in for a source constraint. gcc 13.3.0 and clang 18.1.3 refuse
+// all three at the user's own token with "array subscript is not an integer"
+// (✔MEASURED 2026-09-02, each probed SEPARATELY).
+//
+// ⚠ THE CONTROL IS THE POINT AND IT IS BELOW: the check judges only kinds the
+// lattice can PROVE are not integers, so `char`, `_Bool`, `enum`, `long` and
+// `unsigned char` indices must stay clean. An accept-list would have had to
+// enumerate them and one omission REFUSES A CORRECT PROGRAM.
+TEST(HirLoweringC, FloatSubscriptIsRefusedAtTheSourceTier) {
+    SemanticModel model = analyzeC(
+        "static int d[4];\n"
+        "int main(void) { int *p = d; double x = 1.0; return p[x]; }\n");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_FALSE(res->ok) << "a double cannot be a subscript (C 6.5.3.2p1)";
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger),
+              1u);
+}
+TEST(HirLoweringC, StructSubscriptIsRefusedNotAborted) {
+    SemanticModel model = analyzeC(
+        "struct S { int a; };\nstatic int d[4];\n"
+        "int main(void) { int *p = d; struct S s = {0}; return p[s]; }\n");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_FALSE(res->ok) << "a struct cannot be a subscript (C 6.5.3.2p1)";
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger),
+              1u);
+}
+TEST(HirLoweringC, NarrowAndNominalIntegerSubscriptsStayClean) {
+    // char / _Bool / enum / long / unsigned char, forward AND commuted. These
+    // are the accept-list this check deliberately does NOT enumerate.
+    SemanticModel model = analyzeC(
+        "enum E { E_TWO = 2 };\nstatic int d[8];\n"
+        "int main(void) {\n"
+        "  int *p = d; char c = 1; _Bool b = 1; enum E e = E_TWO;\n"
+        "  long l = 3; unsigned char u = 2;\n"
+        "  return p[c] + c[p] + p[b] + b[p] + p[e] + e[p]\n"
+        "       + p[l] + l[p] + p[u] + u[p];\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res != nullptr);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_SubscriptOperandsNotPointerAndInteger),
+              0u)
+        << "every C integer type is a legal subscript in EITHER position";
+}
+
+// ═══ P53 — [[D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS]], the HIR half ══
+//
+// THE PROPERTY: after the file-scope declaration-rule merge, the CST->HIR
+// EXTERN ROUTE is selected by the FOLDED SPECIFIER, not by which grammar rule
+// matched. `externDecl` no longer appears in /shapes/topLevel at all, so a
+// file-scope `extern` reaches `lowerExternDeclInto` only because
+// `topLevelDecl`'s `linkageSpecifiers` maps the keyword to {nonDefining:true}
+// and `lowerTopLevelInto` reads that fold.
+//
+// ★★ THIS IS THE TIER WHERE THE SILENT MISCOMPILE LIVED. With the grammar merge
+// alone -- no `extern` entry on the map -- dsscp reported
+// warning[H_UnknownLinkageSpecifier] and EXITED 0: the extern-ness was dropped,
+// every extern OBJECT became a tentative definition and emitted its own
+// storage. A SEMANTIC-tier test cannot see that (it merges either way with zero
+// diagnostics); only the Global-vs-ExternGlobal split here can, exactly as
+// TentativeDefAfterExternEmitsStorageNotImport records for its own axis.
+//
+// RED-ON-DISABLE (REMOVE direction): delete the `"extern"` entry from
+// topLevelDecl's `linkageSpecifiers` in c.lang.json -> these arms go red (one
+// Global, zero ExternGlobals, plus H_UnknownLinkageSpecifier) while
+// BlockScopeExternRehomesToModuleDecls stays GREEN -- the control that says the
+// mutant hit the FILE-scope specifier fact and not the extern machinery, since
+// the block-scope rule still carries its own per-row nonDefiningDeclaration.
+
+TEST(HirLoweringC, ExternSpecifierRoutesToTheImportLoweringInEveryOrder) {
+    for (std::string_view const decl : {"extern int g;\n",
+                                        "extern __attribute__((weak)) int g;\n",
+                                        "extern int g, h;\n"}) {
+        SemanticModel model = analyzeC(std::string{decl}
+                                       + "int use(void){ return g; }\n");
+        ASSERT_FALSE(model.hasErrors())
+            << decl
+            << (model.diagnostics().all().empty()
+                    ? "" : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << decl << (r.all().empty() ? "" : r.all()[0].actual);
+        std::size_t globals = 0, externGlobals = 0;
+        for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+            if (res->hir.kind(d) == HirKind::Global)       ++globals;
+            if (res->hir.kind(d) == HirKind::ExternGlobal) ++externGlobals;
+        }
+        EXPECT_EQ(globals, 0u)
+            << decl << " -- an `extern` OBJECT must emit NO storage in this TU";
+        EXPECT_GE(externGlobals, 1u)
+            << decl << " -- it must emit an ExternGlobal IMPORT";
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+            << decl
+            << " -- `extern` must RESOLVE in the linkage map. An unresolved one "
+               "is a WARNING, so the extern-ness would be dropped at rc 0.";
+    }
+}
+
+// A file-scope `extern` FUNCTION prototype must still lower to an
+// ExternFunction import through the merged rule, and its per-declaration
+// import-library override (D-CSUBSET-EXTERN-LIBRARY-SYNTAX) must still be
+// decoded -- that trailing `stringLiteralExpr` slot moved from `externDecl`'s
+// sequence into `topLevelDecl`'s, where a wrong index would shift the
+// kindByChild discriminator and mis-lower every function definition in the TU.
+TEST(HirLoweringC, MergedRuleKeepsExternFunctionImportAndLibraryOverride) {
+    SemanticModel model = analyzeC(
+        "extern void* GetStdHandle(int) \"kernel32.dll\";\n"
+        "int use(void){ return GetStdHandle(0) != 0; }\n"
+        "int def(int x){ return x + 1; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    std::size_t externFns = 0, fns = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) == HirKind::ExternFunction) ++externFns;
+        if (res->hir.kind(d) == HirKind::Function)       ++fns;
+    }
+    EXPECT_EQ(externFns, 1u)
+        << "the extern prototype must lower to ONE ExternFunction import";
+    EXPECT_EQ(fns, 2u)
+        << "the two ordinary definitions must still lower as Functions -- a "
+           "shifted kindByChild index would turn a definition into a "
+           "declaration silently";
+    bool sawLibrary = false;
+    for (auto const& row : res->externDecls) {
+        for (auto const& [format, lib] : row.libraryOverride) {
+            (void)format;
+            if (lib == "kernel32.dll") sawLibrary = true;
+        }
+    }
+    EXPECT_TRUE(sawLibrary)
+        << "the trailing per-declaration library override must still be decoded "
+           "after the slot moved into topLevelDecl's sequence";
+}
+
+// ⓘ C99 6.7.4p7 THROUGH THE REVERSED ORDER — the row's SECOND symptom — is
+// pinned by EXTENDING `InlineBaselineSpellingsCarryTheReferenceLinkageState`'s
+// table with the `inline extern` / `__inline extern` / `inline static` rows,
+// NOT by a second test here. That table already asserts the triple
+// (externRows, 6.7.4p7 mark, binding) against measured `nm` ground truth, and a
+// function-COUNT assertion beside it would have been a weaker instrument that
+// disagreed with it: the body is lowered in EVERY row (the optimizer needs it),
+// so counting Functions cannot tell a suppressed definition from an emitted one.
+// That is not a hypothetical — it was written that way first and went red
+// against its own subject.
+
+// ★★★ [[D-CSUBSET-ATTRIBUTE-BEFORE-EXTERN-KEYWORD]] — CLOSED BY THIS MERGE, AND
+// ITS OWN CLOSING CELL DEMANDS THE EFFECT, NOT THE PARSE ("both spellings compile
+// clean AND the attribute's EFFECT is asserted — a binding read back, or an
+// address — never that the line parses").
+//
+// That row prescribed escape (ii), the shared-prefix factoring, as its closing
+// work and rejected escape (i) outright. This is escape (ii): with ONE top-level
+// declaration rule there is no second FIRST set for `AttributeKeyword` to
+// collide with, so the `C_AmbiguousAlternatives`-at-LOAD wall it recorded has
+// nothing left to detect. ✔MEASURED 2026-09-02, gcc 13.3.0 `-std=c2x` and clang
+// 18.1.3 `-std=c23` probed SEPARATELY: both ACCEPT
+// `__attribute__((weak)) extern int g;` and `__attribute__((weak)) extern int
+// f(int);` at rc 0, so the previous DSS refusal was BELOW the reference union.
+//
+// The BINDING is what is asserted here — read back off the HIR linkage map for
+// the emitted import — because a leading attribute that parses and silently
+// drops its binding is the exact failure TF-C73 measured for the trailing
+// position, and it is invisible until link time.
+TEST(HirLoweringC, AttributeBeforeExternKeywordBindsItsAttribute) {
+    SemanticModel model = analyzeC(
+        "__attribute__((weak)) extern int wf(int);\n"
+        "__attribute__((visibility(\"hidden\"))) extern int hg;\n"
+        "int use(void){ return wf(1) + hg; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+        << "a leading attribute must RESOLVE, not fall through the unknown gate";
+    EXPECT_EQ(declaredBinding(*res, model, "wf"),
+              std::optional{SymbolBinding::Weak})
+        << "an attribute BEFORE the storage-class keyword must bind, not merely "
+           "parse — a silently dropped `weak` is wrong linkage at link time with "
+           "no diagnostic anywhere";
+    auto const hl = declaredLinkage(*res, model, "hg");
+    ASSERT_TRUE(hl.has_value());
+    EXPECT_EQ(hl->visibility, SymbolVisibility::Hidden);
+}
+
+// An `extern` declaration that declares ONLY A TAG (`extern struct S { int a; };`)
+// must take the TypeDecl path, not the import path: gcc accepts it with
+// "useless storage class specifier in empty declaration". The route test is
+// ordered AFTER the no-named-declarator arm precisely so this shape never
+// reaches lowerExternDeclInto, and this pin is what says so.
+TEST(HirLoweringC, ExternOnATagOnlyDeclarationEmitsNoImport) {
+    SemanticModel model = analyzeC(
+        "extern struct S { int a; };\n"
+        "int use(void){ struct S s = {1}; return s.a; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    std::size_t externGlobals = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root()))
+        if (res->hir.kind(d) == HirKind::ExternGlobal) ++externGlobals;
+    EXPECT_EQ(externGlobals, 0u)
+        << "a tag-only declaration declares no object, so there is nothing to "
+           "import";
+}
+
+// ── [[D-CSUBSET-VLA-SIZEOF-TYPEFORM]] part (1): `sizeof(int[n])` ────────────────
+//
+// C 6.5.3.4p2: *"If the type of the operand is a variable length array type, the
+// operand is evaluated"* — the ONE `sizeof` whose operand is evaluated, so the
+// bound is RE-READ at every `sizeof` and its side effects HAPPEN.
+// ✔MEASURED 2026-09-04, references probed SEPARATELY: gcc 13.3.0 and clang
+// 18.1.3 both compile and RUN it at `-std=c17` AND `-std=c2x`, both give two
+// DIFFERENT answers when `n` changes between two `sizeof(int[n])`, and both
+// execute a side effect in the bound; MSVC 19.44.35228 ABSTAINS (`C2057` + `C4034`).
+//
+// These two pins name the TIER and the MECHANISM. The corpus witness
+// (`examples/c/c99_vla_sizeof_type_name`) proves the VALUES end to end; what
+// cannot be seen from the values alone is that the lowering happens HERE, and
+// why it must: a `vlaArray` TypeId carries NO length operand (every VLA of one
+// element interns to a single TypeId), so a `SizeOf` node whose TypeRef is a VLA
+// has already lost `n` before MIR — there would be nothing left downstream to
+// re-evaluate. Pin 1 therefore asserts that NO VLA-typed `SizeOf` node is minted
+// at all and that a Mul over a live `Ref` to the bound stands in its place.
+
+// Pin 1 — THE SHAPE AND THE FRESHNESS. RED-ON-DISABLE: drop the
+// `lowerVlaTypeNameSizeof` dispatch in `lowerSizeof` and the single SizeOf here
+// carries the VLA array type again (the `isVlaArray` EXPECT flips) while the Mul
+// and the Ref disappear entirely.
+TEST(HirLoweringC, SizeofOfVlaTypeNameLowersToFreshBoundArithmeticNotAVlaSizeOf) {
+    SemanticModel model = analyzeC(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 3;\n"
+        "  unsigned long a = sizeof(int[n]);\n"
+        "  return (int)a;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+                                              : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    ASSERT_TRUE(fn.valid());
+    auto const& ti = model.lattice().interner();
+
+    std::vector<HirNodeId> sizeofs;
+    std::vector<HirNodeId> muls;
+    auto const collect = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::SizeOf) sizeofs.push_back(n);
+        if (res->hir.kind(n) == HirKind::BinaryOp
+            && isCoreOp(res->hir.payload(n))
+            && decodeCoreOp(res->hir.payload(n)) == HirOpKind::Mul)
+            muls.push_back(n);
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    collect(collect, res->hir.functionBody(fn));
+
+    // (1) EXACTLY ONE SizeOf, and it sizes the ELEMENT — never the VLA type. A
+    // VLA-typed SizeOf is precisely what HIR→MIR refuses (H_UnsupportedLowering-
+    // ForKind, "sizeof of an incomplete or un-sizeable type"), so its ABSENCE is
+    // the property, not an implementation detail.
+    ASSERT_EQ(sizeofs.size(), 1u)
+        << "the VLA type-name lowers to ONE static SizeOf (the element's), never "
+           "a SizeOf of the array itself";
+    auto const skids = res->hir.children(sizeofs[0]);
+    ASSERT_EQ(skids.size(), 1u) << "SizeOf carries exactly [TypeRef]";
+    TypeId const sizedT = res->hir.typeId(skids.front());
+    ASSERT_TRUE(sizedT.valid());
+    EXPECT_FALSE(ti.isVlaArray(sizedT))
+        << "no SizeOf node may carry a variable-length array type — its TypeId "
+           "has no length operand, so MIR could not size it and refuses";
+    EXPECT_FALSE(ti.typeContainsVla(sizedT));
+    EXPECT_EQ(ti.kind(sizedT), TypeKind::I32)
+        << "`int[n]`'s element is `int`, and its size is the static half of the "
+           "product";
+
+    // (2) A Mul typed size_t stands where the VLA SizeOf used to be.
+    ASSERT_GE(muls.size(), 1u)
+        << "`sizeof(int[n])` is `n * sizeof(int)` — a runtime Mul, not a fold";
+    HirNodeId chosen{};
+    for (HirNodeId m : muls)
+        if (res->hir.typeId(m).valid()
+            && ti.kind(res->hir.typeId(m)) == TypeKind::U64)
+            chosen = m;
+    ASSERT_TRUE(chosen.valid()) << "the product is typed size_t (C 6.5.3.4p5)";
+
+    // (3) FRESHNESS AT THIS TIER: the product's non-SizeOf operand subtree must
+    // reach a live `Ref` to the bound. A constant-folded implementation would put
+    // a Literal there and would pass every value test that only ever reads one
+    // `n` — which is why the Ref, not the number, is what this pins.
+    auto const kids = res->hir.children(chosen);
+    ASSERT_EQ(kids.size(), 2u);
+    HirNodeId const boundSide =
+        (res->hir.kind(kids[1]) == HirKind::SizeOf) ? kids[0] : kids[1];
+    bool sawRef = false;
+    auto const hunt = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::Ref) sawRef = true;
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    hunt(hunt, boundSide);
+    EXPECT_TRUE(sawRef)
+        << "the bound must be lowered as a live read of `n` (C 6.5.3.4p2 makes "
+           "the operand EVALUATED), never folded to a constant";
+}
+
+// Pin 2 — SUFFIX↔LEVEL PAIRING, the half a single-dimension test cannot see.
+// `typedef int Row[3]; sizeof(Row[n])` has ONE array suffix but TWO array levels,
+// and its value is `n * sizeof(int[3])` (✔MEASURED: gcc 13.3.0 and clang 18.1.3
+// both exit 42 on the 60-byte witness). An implementation that descended to the
+// FIRST NON-ARRAY element would multiply by `sizeof(int)` and under-report by 3×
+// — a plausible wrong number, never a refusal, which is the failure direction
+// this project ranks worst. RED-ON-DISABLE: change the element walk to descend
+// past every Array level and this EXPECT flips Array→I32.
+TEST(HirLoweringC, SizeofOfVlaTypeNamePairsOneSuffixPerArrayLevelNotToTheLeaf) {
+    SemanticModel model = analyzeC(
+        "typedef int Row[3];\n"
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 5;\n"
+        "  unsigned long a = sizeof(Row[n]);\n"
+        "  return (int)a;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+                                              : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    ASSERT_TRUE(fn.valid());
+    auto const& ti = model.lattice().interner();
+
+    std::vector<HirNodeId> sizeofs;
+    auto const collect = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::SizeOf) sizeofs.push_back(n);
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    collect(collect, res->hir.functionBody(fn));
+    ASSERT_EQ(sizeofs.size(), 1u);
+    auto const skids = res->hir.children(sizeofs[0]);
+    ASSERT_EQ(skids.size(), 1u);
+    TypeId const sizedT = res->hir.typeId(skids.front());
+    ASSERT_TRUE(sizedT.valid());
+    ASSERT_EQ(ti.kind(sizedT), TypeKind::Array)
+        << "ONE suffix consumes ONE array level, so `Row[n]`'s element is the "
+           "whole `int[3]` — descending to the leaf would size `int` and "
+           "under-report the answer by a factor of 3";
+    EXPECT_FALSE(ti.isVlaArray(sizedT))
+        << "…and that element is the FIXED `int[3]`, statically sizeable";
+}
+
+// Pin 3 — ★★ THE FAIL-LOUD ARM, AND THE REASON IT EXISTS IS A DEFECT THIS CHANGE
+// INTRODUCED AND THEN REMOVED. C 6.7.6.2p1 requires a variable-length array's size
+// expression to have INTEGER type. `validateVlaDeclarator` enforces that
+// (`S_VlaSizeNotInteger`) for a DECLARATOR, but an ABSTRACT type-name has no
+// declarator and never reaches that validator — an omission that was invisible
+// while the whole construct was refused at MIR.
+// ✔MEASURED 2026-09-04 on the first working build of part (1): with the type-name
+// form lowered but WITHOUT this guard, `double x; sizeof(int[x])` compiled rc=0
+// and answered 12 (the widening Cast silently truncated 3.5) and
+// `int *p; sizeof(int[p])` compiled and answered from the pointer's numeric value
+// — two SILENT WRONG ANSWERS where the base (b1f31420) had refused loudly.
+// ✔gcc 13.3.0 and clang 18.1.3, probed SEPARATELY, both REFUSE both shapes
+// ("size of array has non-integer type"). So this is not a defensive extra: it is
+// the difference between the feature being shippable and being a miscompile.
+// RED-ON-DISABLE: delete the integer arm in `lowerVlaTypeNameSizeof` and both
+// ASSERT_TRUEs below flip — the lowering succeeds and produces a number.
+TEST(HirLoweringC, SizeofOfVlaTypeNameWithNonIntegerBoundFailsLoud) {
+    auto const mustRefuse = [](char const* what, std::string src) {
+        SemanticModel model = analyzeC(std::move(src));
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        bool const refused = model.hasErrors() || !res->ok;
+        EXPECT_TRUE(refused)
+            << what
+            << " must be REFUSED (C 6.7.6.2p1 — the size expression of a "
+               "variable-length array must have integer type), never silently "
+               "converted into a size; gcc and clang both refuse it";
+    };
+    mustRefuse("a floating bound",
+               "int main(void) {\n"
+               "  double x;\n"
+               "  x = 3.5;\n"
+               "  unsigned long s = sizeof(int[x]);\n"
+               "  return (int)s;\n"
+               "}\n");
+    mustRefuse("a pointer bound",
+               "int main(void) {\n"
+               "  int v;\n"
+               "  v = 3;\n"
+               "  int *p = &v;\n"
+               "  unsigned long s = sizeof(int[p]);\n"
+               "  return (int)s;\n"
+               "}\n");
+    // CONTROL, and the reason the refusal above is not a blanket one: an
+    // ENUM-typed variable IS an integer type (C 6.7.6.2p1) and must still be
+    // ACCEPTED. ✔gcc 13.3.0 and clang 18.1.3 both compile and run it (20).
+    SemanticModel ok = analyzeC(
+        "enum E { A = 3, B = 5 };\n"
+        "int main(void) {\n"
+        "  enum E e;\n"
+        "  e = B;\n"
+        "  unsigned long s = sizeof(int[e]);\n"
+        "  return (int)s;\n"
+        "}\n");
+    ASSERT_FALSE(ok.hasErrors())
+        << (ok.diagnostics().all().empty() ? std::string{}
+                                           : ok.diagnostics().all()[0].actual);
+    DiagnosticReporter okr;
+    auto okres = lowerToHir(ok, okr);
+    EXPECT_TRUE(okres->ok)
+        << "an enum-typed bound is an INTEGER bound and must not be caught by the "
+           "non-integer refusal: "
+        << (okr.all().empty() ? "" : okr.all()[0].actual);
 }

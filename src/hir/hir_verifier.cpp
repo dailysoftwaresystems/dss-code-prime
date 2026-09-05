@@ -17,6 +17,8 @@
 #include <functional>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -55,6 +57,30 @@ void reportAt(DiagnosticReporter& reporter, DiagnosticCode code, HirNodeId id,
     }
     d.actual = std::move(actual);
     reporter.report(std::move(d));
+}
+
+// ★★★ THE CONSTRUCT'S NAME, NEVER A BARE ORDINAL — the diagnostic half of
+// D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE, which this file carried for every
+// kind rather than for subscripts alone.
+//
+// Every message below used to print `HirKind ordinal 34`, so a user who wrote
+// `2[p]` was told an internal enumerator number for a node they never authored
+// (✔MEASURED at P53's base: `error[H_TypeUnresolved]: hir node #23 (HirKind
+// ordinal 34)`). `hirKindName` already existed and is proven complete by a
+// `Count_` static_assert next to its table, so there was never a reason to
+// render the number.
+//
+// ⚠ IT HANDLES THE EMPTY CASE ITSELF, WHICH IS THE WHOLE REASON IT IS A HELPER.
+// `hirKindName` returns EMPTY for a value with no spelling — `Count_`, a
+// corrupted node, a registry-minted extension id that reached a `HirKind`
+// parameter — and printing `''` there would be the second plausible wrong
+// answer, a message about a construct whose name is nothing. An unnamed kind
+// falls back to the ordinal it always printed, so this can only ever ADD
+// information.
+[[nodiscard]] std::string describeKind(HirKind kind) {
+    std::string_view const name = hirKindName(kind);
+    if (!name.empty()) return std::string{name};
+    return std::format("HirKind ordinal {}", static_cast<unsigned>(kind));
 }
 
 } // namespace
@@ -101,8 +127,8 @@ void HirVerifier::checkRequiredTypes(DiagnosticReporter& reporter) const {
         if (hir_.typeId(id).valid()) continue;
 
         reportAt(reporter, DiagnosticCode::H_TypeUnresolved, id,
-                 std::format("hir node #{} (HirKind ordinal {})",
-                             id.v, static_cast<unsigned>(kind)),
+                 std::format("{} expression (hir node #{}) has no resolved type",
+                             describeKind(kind), id.v),
                  sourceMap_);
     }
 }
@@ -167,8 +193,8 @@ void HirVerifier::checkNodeArity(DiagnosticReporter& reporter) const {
                 ? std::format("at least {}", a.min)
                 : std::format("[{}, {}]", a.min, a.max);
             reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
-                     std::format("HirKind ordinal {} node #{} expects {} children, got {}",
-                                 static_cast<unsigned>(kind), id.v, bound, count),
+                     std::format("{} node #{} expects {} children, got {}",
+                                 describeKind(kind), id.v, bound, count),
                      sourceMap_);
         }
     }
@@ -663,8 +689,8 @@ void HirVerifier::checkDeclarationShape(DiagnosticReporter& reporter) const {
     auto checkParam = [&](HirNodeId param) {
         if (hir_.kind(param) != HirKind::VarDecl) {
             reportAt(reporter, DiagnosticCode::H_VerifierFailure, param,
-                     std::format("parameter #{} must be a VarDecl (HirKind ordinal {})",
-                                 param.v, static_cast<unsigned>(hir_.kind(param))),
+                     std::format("parameter #{} must be a VarDecl, not {}",
+                                 param.v, describeKind(hir_.kind(param))),
                      sourceMap_);
         } else if (!hir_.children(param).empty()) {
             reportAt(reporter, DiagnosticCode::H_VerifierFailure, param,
@@ -685,9 +711,9 @@ void HirVerifier::checkDeclarationShape(DiagnosticReporter& reporter) const {
             // Last child is the body Block; the rest are parameters.
             if (hir_.kind(kids.back()) != HirKind::Block) {
                 reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
-                         std::format("Function #{} body (last child) must be a Block "
-                                     "(HirKind ordinal {})",
-                                     id.v, static_cast<unsigned>(hir_.kind(kids.back()))),
+                         std::format("Function #{} body (last child) must be a Block, "
+                                     "not {}",
+                                     id.v, describeKind(hir_.kind(kids.back()))),
                          sourceMap_);
             }
             for (HirNodeId param : kids.subspan(0, kids.size() - 1)) checkParam(param);
@@ -1020,7 +1046,7 @@ void HirVerifier::checkMemberAccess(DiagnosticReporter& reporter) const {
 void HirVerifier::checkConstructAggregate(DiagnosticReporter& reporter) const {
     // D5.4-FU1 + FU4: every ConstructAggregate's child count and types
     // must match its declared result type's shape. The HIR lowering
-    // (`lowerBraceInit` / `lowerUnionBraceInit` / `synthZeroOrError`)
+    // (`lowerBraceInit`'s work stack / `prepareUnionBraceInit` / `synthZeroOrError`)
     // produces well-formed aggregates by construction; this rule
     // catches lowering BUGS and synthetic-IR misuse.
     if (interner_ == nullptr) return;

@@ -3847,57 +3847,189 @@ TEST(Inlining, ComputedGotoCalleeWithIndirectBrIsNotInlined) {
     EXPECT_EQ(countOpInModule(mir, MirOpcode::IndirectBr), 1u);
 }
 
-// CALLER direction (the pr-review's silent-miscompile catch): a HOST that itself
-// contains computed goto AND calls a MULTI-BLOCK helper must route to the single-
-// block rebuilder, NEVER the MultiBlockInliner (whose caller-host emit mis-copies
-// the BlockAddress block-id payload + aborts on IndirectBr). RED-ON-DISABLE: drop
-// the `functionHasComputedGoto` routing guard and runInlining aborts/corrupts.
-TEST(Inlining, ComputedGotoHostWithMultiBlockCalleeRoutesSafely) {
+// CALLER direction — D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST. A HOST that
+// itself contains computed goto AND calls a MULTI-BLOCK helper is rebuilt by the
+// `MultiBlockInliner`, whose caller-host emit now carries the two arms it used to
+// lack: `BlockAddress` (block-id payload remapped through `blockMap_`) and
+// `IndirectBr` (successors remapped). Before those arms the host was routed away
+// to the single-block rebuilder and the helper simply stayed a call.
+//
+// ★ THE FIXTURE PUTS THE CALL INSIDE THE ADDRESS-TAKEN BLOCK ON PURPOSE. That is
+// the one shape where the two candidate maps disagree: the splice SPLITS the
+// label block, so `blockMap_[L]` is the head (the instructions before the call)
+// while `blockExitMap_[L]` is the continuation that inherits the old terminator.
+// `&&L` must remap through the HEAD — a `goto *&&L` re-enters the label and must
+// re-run the spliced body. A fixture whose label block contains no call cannot
+// tell the two apart, and would pass over the wrong map.
+//
+// RED-ON-DISABLE (REMOVE-direction, both in `src/opt/passes/inlining.cpp`):
+//   * delete `MultiBlockInliner::emitCallerInst`'s `BlockAddress` arm — the
+//     verbatim `addInst` fallback copies the OLD block id (`MirBuilder::addInst`
+//     does not refuse the opcode), and `TargetIsTheSplitHead` below fails;
+//   * delete `MultiBlockInliner::emitTerminator`'s `IndirectBr` arm — the
+//     switch's `default:` aborts the rebuild.
+TEST(Inlining, ComputedGotoHostInlinesMultiBlockCalleeAndKeepsGoto) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
     TypeId const vptr  = interner.pointer(interner.primitive(TypeKind::Void));
     TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
     MirBuilder mb;
 
     // MULTI-block inline-eligible helper (SymbolId 50): cond-branch to two returns.
+    // ⚠ THE CONDITION IS Bool-TYPED, and that is load-bearing rather than tidy:
+    // this test runs the MirVerifier, and an i32 condition is I_TerminatorTypeMismatch
+    // in BOTH the original helper and its clone — a red that says nothing about
+    // the splice under test.
     mb.addFunction(fnSig, SymbolId{50});
     MirBlockId const hEntry = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const hThen  = mb.createBlock(StructCfMarker::Linear);
     MirBlockId const hElse  = mb.createBlock(StructCfMarker::Linear);
     mb.beginBlock(hEntry);
-    mb.addCondBr(mb.addConst(i32Lit(1), i32), hThen, hElse);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    mb.addCondBr(mb.addConst(tru, boolT), hThen, hElse);
     mb.beginBlock(hThen);
     mb.addReturn(mb.addConst(i32Lit(3), i32));
     mb.beginBlock(hElse);
     mb.addReturn(mb.addConst(i32Lit(4), i32));
 
-    // computed-goto HOST main (SymbolId 100): BlockAddress + IndirectBr + a call.
+    // computed-goto HOST main (SymbolId 100), TWO multi-block call sites.
+    //
+    // ★★★ THE ENTRY BLOCK'S CALL IS THE INSTRUMENT, NOT DECORATION, AND ITS
+    // ABSENCE MADE THIS TEST VACUOUS. ✔MEASURED: with the call ONLY in the
+    // address-taken block, deleting the `BlockAddress` arm under test left this
+    // test GREEN over a live mutant — the stale payload happened to be the RIGHT
+    // number. `main`'s old blocks were {3,4} and the splice appended its clones
+    // AFTER both, so the address-taken block was new-id 4 as well as old-id 4 and
+    // a verbatim copy was indistinguishable from a correct remap. Splicing in the
+    // ENTRY block first pushes the address-taken block from old-id 4 to new-id 8,
+    // so a stale payload now names a CLONE of the callee instead. A fixture whose
+    // renumbering is the identity cannot test a renumbering.
+    //
+    // It also buys a second shape for free: the `IndirectBr` is emitted from the
+    // entry's split CONTINUATION rather than from the caller block it started in.
     mb.addFunction(fnSig, SymbolId{100});
     MirBlockId const mmEntry  = mb.createBlock(StructCfMarker::EntryBlock);
     MirBlockId const mmTarget = mb.createBlock(StructCfMarker::Linear);
     mb.beginBlock(mmEntry);
-    MirInstId const mAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
-    std::array<MirInstId, 1> mOps{mAddr};
-    mb.addInst(MirOpcode::Call, mOps, i32);
-    MirInstId const mba = mb.addBlockAddress(mmTarget, vptr);
+    MirInstId const eAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    std::array<MirInstId, 1> eOps{eAddr};
+    MirInstId const ePre = mb.addInst(MirOpcode::Call, eOps, i32);
+    MirInstId const mba  = mb.addBlockAddress(mmTarget, vptr);
     std::array<MirBlockId, 1> msuccs{mmTarget};
     mb.addIndirectBr(mba, msuccs);
     mb.beginBlock(mmTarget);
-    mb.addReturn(mb.addConst(i32Lit(9), i32));
+    std::array<MirInstId, 2> markerOps{mb.addConst(i32Lit(11), i32),
+                                       mb.addConst(i32Lit(22), i32)};
+    MirInstId const marker = mb.addInst(MirOpcode::Add, markerOps, i32);
+    MirInstId const mAddr  = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    std::array<MirInstId, 1> mOps{mAddr};
+    MirInstId const mCall = mb.addInst(MirOpcode::Call, mOps, i32);
+    std::array<MirInstId, 2> sumOps{marker, mCall};
+    MirInstId const sum = mb.addInst(MirOpcode::Add, sumOps, i32);
+    std::array<MirInstId, 2> totOps{sum, ePre};
+    mb.addReturn(mb.addInst(MirOpcode::Add, totOps, i32));
     Mir mir = std::move(mb).finish();
 
     ASSERT_EQ(countOpInModule(mir, MirOpcode::IndirectBr), 1u);
     ASSERT_EQ(countOpInModule(mir, MirOpcode::BlockAddress), 1u);
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u);
     DiagnosticReporter rep;
     auto const r = opt::passes::runInlining(mir, interner, rep,
                                             opt::kMaxInlineThreshold);
-    EXPECT_TRUE(r.ok)
+    ASSERT_TRUE(r.ok)
         << "inlining a multi-block callee INTO a computed-goto host must not abort";
+    EXPECT_EQ(r.callsInlined, 2u)
+        << "BOTH multi-block call sites are inlined into the computed-goto host "
+           "(D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST)";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 0u)
+        << "the spliced Call is gone from the host";
     EXPECT_EQ(countOpInModule(mir, MirOpcode::IndirectBr), 1u);
     EXPECT_EQ(countOpInModule(mir, MirOpcode::BlockAddress), 1u);
-    EXPECT_EQ(r.callsInlined, 0u)
-        << "the multi-block helper is NOT inlined into the computed-goto host "
-           "(follow-up D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST)";
+
+    // Locate the host, its surviving BlockAddress and its IndirectBr.
+    MirFuncId host{};
+    MirInstId ba{}, ibr{};
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < nf; ++fi) {
+        MirFuncId const fn = mir.funcAt(fi);
+        if (mir.funcSymbol(fn).v != 100u) continue;
+        host = fn;
+        std::uint32_t const nb = mir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(fn, bi);
+            if (mir.instOpcode(mir.blockTerminator(b)) == MirOpcode::IndirectBr) {
+                ibr = mir.blockTerminator(b);
+            }
+            std::uint32_t const ni = mir.blockInstCount(b);
+            for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                MirInstId const inst = mir.blockInstAt(b, ii);
+                if (mir.instOpcode(inst) == MirOpcode::BlockAddress) ba = inst;
+            }
+        }
+    }
+    ASSERT_TRUE(host.valid()) << "the computed-goto host must survive the rebuild";
+    ASSERT_TRUE(ba.valid())   << "the host's BlockAddress must be locatable";
+    ASSERT_TRUE(ibr.valid())  << "the host's IndirectBr must be locatable";
+
+    // ── TargetIsTheSplitHead ─────────────────────────────────────────────────
+    // The address-taken block was SPLIT by the splice. `&&L` must still name the
+    // HEAD — the block holding the pre-call `Add(11, 22)` — and NOT the
+    // continuation that inherited the Return. A verbatim (stale-payload) copy
+    // names an unrelated block; a `blockExitMap_` remap names the continuation.
+    // Both produce well-formed IR, so this is the assertion that discriminates.
+    MirBlockId const target = mir.blockAddressTarget(ba);
+    bool headHasMarker = false;
+    std::uint32_t const tni = mir.blockInstCount(target);
+    for (std::uint32_t ii = 0; ii < tni; ++ii) {
+        MirInstId const inst = mir.blockInstAt(target, ii);
+        if (mir.instOpcode(inst) != MirOpcode::Add) continue;
+        auto const ops = mir.instOperands(inst);
+        if (ops.size() != 2) continue;
+        if (mir.instOpcode(ops[0]) != MirOpcode::Const
+            || mir.instOpcode(ops[1]) != MirOpcode::Const) {
+            continue;
+        }
+        auto const lhs = std::get<std::int64_t>(
+            mir.literalValue(mir.constLiteralIndex(ops[0])).value);
+        auto const rhs = std::get<std::int64_t>(
+            mir.literalValue(mir.constLiteralIndex(ops[1])).value);
+        if (lhs == 11 && rhs == 22) headHasMarker = true;
+    }
+    EXPECT_TRUE(headHasMarker)
+        << "the BlockAddress must name the SPLIT HEAD (the block carrying the "
+           "pre-call Add(11,22)), not the continuation and not a stale block id "
+           "— an indirect re-entry that lands past the splice silently skips the "
+           "inlined body";
+    EXPECT_EQ(mir.instOpcode(mir.blockTerminator(target)), MirOpcode::Br)
+        << "the split head now branches into the cloned callee entry";
+
+    // The IndirectBr's successor set is exactly the address-taken block, remapped
+    // 1:1. Dropping the edge hands the unreachable prune a live label.
+    auto const succ = mir.blockSuccessors(mir.instBlock(ibr));
+    ASSERT_EQ(succ.size(), 1u) << "one address-taken label, one IndirectBr edge";
+    EXPECT_EQ(succ[0].v, target.v)
+        << "the IndirectBr's successor must be the same block the BlockAddress "
+           "names — the two remap through the same map or the goto lands "
+           "somewhere the address does not point";
+
+    // ★ THE VERDICT CARRIES THE VERIFIER'S OWN PROSE. A bare `false` here names
+    // the assertion and not the violated invariant, and the two mistakes this
+    // arm exists to catch (a stale block-id payload, a dropped IndirectBr edge)
+    // surface as DIFFERENT verifier codes — so the message is what tells them
+    // apart on a future red.
+    MirVerifier verifier{mir, &interner};
+    bool const verified = verifier.verify(rep);
+    std::string verifierProse;
+    for (ParseDiagnostic const& d : rep.all()) {
+        verifierProse += "\n  [";
+        verifierProse += diagnosticCodeName(d.code);
+        verifierProse += "] ";
+        verifierProse += d.actual;
+    }
+    EXPECT_TRUE(verified)
+        << "the module must stay verifier-valid after inlining a MULTI-block "
+           "callee into a computed-goto host:" << verifierProse;
 }
 
 // The single-block-callee-INTO-host case (self-audit gap pin): the host routes to

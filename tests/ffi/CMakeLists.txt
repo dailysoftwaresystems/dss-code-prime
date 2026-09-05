@@ -210,3 +210,86 @@ dss_add_test(NAME ffi/test_shipped_mtx_type_declarations
              SOURCES test_shipped_mtx_type_declarations.cpp)
 target_link_libraries(dss_ffi_test_shipped_mtx_type_declarations
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-FFI-IOCTL-SIZE-FIELD-OVERFLOW-SILENT (P53 lane io): the per-format SIZE
+# CEILING in the `<sys/ioctl.h>` request-encoding macros, pinned as BEHAVIOUR
+# rather than as descriptor TEXT (its sibling above does the text). It compiles
+# boundary types through the real front end for both formats and both arches of
+# each, so the REFUSE half — the whole point of the row, a program that must NOT
+# compile — has somewhere to live: the examples corpus has no compile-failure
+# convention, and both ioctl example directories declare runOn linux/darwin, so
+# neither RUNS on a Windows host. Needs no json link: it writes C source and
+# drives `Program::compileFiles`, it does not read the descriptor's JSON.
+dss_add_test(NAME ffi/test_shipped_ioctl_size_ceiling
+             SOURCES test_shipped_ioctl_size_ceiling.cpp)
+
+# ── D-COMPILER-INPUT-PROPORTIONAL-RECURSION residue, FFI half (P55 lane `hs`) ──
+# Its own binary because a red here is a STACK OVERFLOW: the process dies with no
+# `[  FAILED  ]` line and no case name, so a sibling in a shared binary would lose
+# its verdict to an unattributable death.
+dss_add_test(NAME ffi/test_descriptor_walk_costs_heap
+             SOURCES test_descriptor_walk_costs_heap.cpp)
+
+# ── D-FFI-DIRENT-API-DECLARED-OVER-VOID-NOT-ITS-OWN-STRUCTS (P56 lane `dt`) ──
+# The <dirent.h> surface typed over its OWN types (`DIR`, `struct dirent`)
+# instead of over `void`. Two tiers in one binary because the row's claim spans
+# them: the DESCRIPTOR tier (the signature carries the very TypeId the per-format
+# `structs` variant injects — asserted on all three served formats, whose layouts
+# are 280 / 268 / 1048 bytes) and the SEMANTIC tier (the REFUSALS the row exists
+# for — `int *x = readdir(d);` — each beside its accepting twin, which the
+# examples corpus has no convention for since a program that must not compile is
+# not a runnable example). Reads the descriptor through the real reader rather
+# than its JSON, so no json link; it DOES drive the front end, hence the tests/
+# include root its semantic siblings use for `semantic_test_fixture.hpp`.
+dss_add_test(NAME ffi/test_shipped_dirent_typed_surface
+             SOURCES test_shipped_dirent_typed_surface.cpp)
+target_include_directories(dss_ffi_test_shipped_dirent_typed_surface
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# [[D-FFI-SHIPPED-DESCRIPTORS-DECLARE-STRUCTS-THEIR-OWN-SIGNATURES-DO-NOT-USE]] -
+# the CORPUS-WIDE sibling of the dirent fixture above: seven descriptors whose
+# signatures now name the structs those same files already declared, plus - and
+# this is the half a sweep would have got wrong - an ACCEPTING arm for every
+# `ptr<void>` deliberately LEFT ALONE, because most of the corpus's 378
+# signature-level occurrences are the reference type. Same two tiers and the
+# same wiring as its sibling: it reads the real shipped descriptors through the
+# real reader (so no json link) AND drives the front end for the refusals,
+# hence the tests/ include root its semantic siblings use for
+# `semantic_test_fixture.hpp`.
+dss_add_test(NAME ffi/test_shipped_stat_typed_surface
+             SOURCES test_shipped_stat_typed_surface.cpp)
+target_include_directories(dss_ffi_test_shipped_stat_typed_surface
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# ── D-FFI-DESCRIPTOR-EAGER-IMPORT (P57 lane `ei`) ────────────────────────────
+# REFERENCED-ONLY import of shipped-descriptor symbols, asserted on the EMITTED
+# IMAGE of all five targets the descriptor mechanism ships for. Drives the real
+# production driver (`Program::compileFiles`) and then walks each format's real
+# import pointer chain — ELF `.dynsym` SHN_UNDEF rows, the PE hint/name table,
+# Mach-O LC_SYMTAB N_UNDF|N_EXT — because the load-bearing assertions here are
+# ABSENCES, and a substring scan cannot tell an import row from an incidental
+# string in a neighbouring blob. HOST-INDEPENDENT: nothing is run, so every leg
+# answers for every target. Reads no descriptor JSON, hence no json link; it uses
+# the shared PE extractor and the ELF/Mach-O dependency tables from
+# `tests/test_support/image_dependency_table.hpp`, which `dss_add_test` already
+# puts on the include path for its siblings in this file.
+# The behaviour it pins is `ShippedExternSymbol::eagerImport`'s default in
+# `src/analysis/semantic/semantic_model.hpp`, which is FALSE — descriptor imports
+# are referenced-only. A failure here reading "the eager law is back" means that
+# default went back to `true`; fix the default, do NOT relax the pin.
+dss_add_test(NAME ffi/test_descriptor_import_referenced_only
+             SOURCES test_descriptor_import_referenced_only.cpp)
+
+# ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE (P60 lane `dl2`)
+# The DECODER's half of the role form: a `library` entry naming a runtime ROLE
+# (`{"pe": {"role": "cLibrary"}}`) resolved at descriptor decode through the core
+# `RuntimeLibraryRoleResolver` seam. Drives the reader with a HAND-BUILT
+# `RuntimeLibraryTable` (a core type — no format document is loaded, which is the
+# layering split this directory keeps), so every verdict is about the decoder:
+# resolution, the per-symbol override, the no-resolver UNBOUND arm, the
+# format-INDEPENDENT refusals (asserted with no resolver so they cannot rot), the
+# resolution refusals, and the realization oracle threading the resolver over the
+# shipped corpus. Needs no json link: it writes descriptor text and reads it back
+# through the real reader.
+dss_add_test(NAME ffi/test_shipped_library_role
+             SOURCES test_shipped_library_role.cpp)

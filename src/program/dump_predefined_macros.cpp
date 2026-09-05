@@ -1,13 +1,16 @@
 #include "program/dump_predefined_macros.hpp"
 
 #include "analysis/preprocess/preprocessor.hpp"   // mergePredefinedMacros — THE owner
-#include "core/types/config_path_walk.hpp"   // resolveSystemDirs — THE owner of the shippedLibDirs walk
+#include "core/substrate/path_identity.hpp"  // genericSpelling — the UNC-safe path spelling
+#include "core/types/config_path_walk.hpp"   // resolveSystemDirs — THE owner of the shippedLibDirs walk;
+                                             // configRootOfShippedDocument — THE inverse of its composition
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"    // validateShippedSurfaceRequirements (the `impliedSurface` satisfaction half)
 #include "link/object_format_schema.hpp"
+#include "program/program.hpp"               // reportConfigRootProvenance — ONE wording, two modes
 #include "program/target_spec.hpp"
 
 #include <algorithm>
@@ -224,6 +227,11 @@ renderPredefinedMacroDump(PredefinedMacroDumpRequest const& req) {
     out += std::to_string(merged.effective.size());
     out += " command-line-defines=";
     out += std::to_string(req.userDefines.size());
+    // LAST on the line, and that placement is the same rule `value=` follows:
+    // this is the only field whose spelling can contain a space (it is a
+    // filesystem path), so it has to be the unambiguous remainder.
+    out += " config-root=";
+    out += req.configRoot.empty() ? std::string_view{"<none>"} : req.configRoot;
     out += '\n';
 
     // ── Attributing an ORIGIN without opening a second walk ─────────────────
@@ -375,6 +383,12 @@ renderPredefinedMacroDump(PredefinedMacroDumpRequest const& req) {
 
 int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
                          std::ostream& err) {
+    // WHICH CONFIG TREE, when the answer is a surprise. `main` answers this mode
+    // AHEAD of `Program`, so the site in `Program::run` cannot reach it — and
+    // the one instrument whose whole job is to say what was resolved must not be
+    // the one instrument that cannot say which tree resolved it. Same function,
+    // same wording; see `reportConfigRootProvenance`.
+    reportConfigRootProvenance(err);
     // Defence in depth: `parseCliArgs` already demands both for this mode, but
     // this function is also called directly (tests, embedders), and an empty
     // language would otherwise reach `loadShipped("")` and fail with a message
@@ -464,6 +478,18 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
         return 1;
     }
 
+    // WHICH `src/dss-config` THIS DUMP IS DESCRIBING — computed ONCE, from the
+    // language document that actually loaded, and echoed into every section
+    // header ([[D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE]]).
+    std::string const configRootSpelling = [&] {
+        auto const root =
+            configRootOfShippedDocument(
+                std::filesystem::path{grammar->configDocumentOrigin()});
+        // Empty, not a guess. `<none>` is rendered by the dump itself so the
+        // spelling of "there is no document" has one owner.
+        return root.has_value() ? core::genericSpelling(*root) : std::string{};
+    }();
+
     // ── Render EVERY section before printing ANY ────────────────────────────
     // All-or-nothing across targets (see the header): a failure on target N must
     // not leave targets 1..N-1 on stdout looking complete.
@@ -516,6 +542,13 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
         // identities are presentable.
         req.exclusiveGroups = grammar->preprocess().mutuallyExclusivePredefinedMacros;
         req.userDefines    = args.defines;
+        // WHICH TREE ANSWERED — from the LANGUAGE document that actually
+        // loaded, never from a fresh precedence walk. See the field's docblock.
+        // ⓘ Hoisted out of the loop (`configRootSpelling`) because it is a
+        // property of the invocation's language, not of a target: recomputing it
+        // per section would let two sections of one dump disagree, which is the
+        // shape of the defect rather than a report of it.
+        req.configRoot     = configRootSpelling;
 
         // ★★★ D-LANG-PREDEFINED-MACRO-REQUIRES-REALIZED-SURFACE — THE DUMP MUST
         // TELL THE SAME TRUTH THE COMPILER DOES.

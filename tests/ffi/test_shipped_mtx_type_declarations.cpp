@@ -218,9 +218,12 @@ void expectMtxInitOn(fs::path const& cfgRoot, ObjectFormatKind fmt, char const* 
             EXPECT_EQ(rows[0]->synthesize, std::string{"mtx_init"})
                 << where << ": neither kernel32/ucrtbase nor libSystem exports a C11 "
                 << "`mtx_init`, so this arm must be synthesized. Losing the tag turns "
-                << "the row into an eager import of an absent name and EVERY binary "
-                << "built against this descriptor fails to LOAD "
-                << "(D-FFI-DESCRIPTOR-EAGER-IMPORT)";
+                << "the row into an import of an absent name, and every binary that "
+                << "CALLS it fails to LOAD — which is every binary a `mtx_init` user "
+                << "builds, since losing the tag also removes the body that would "
+                << "have answered the call "
+                << "([[D-FFI-DESCRIPTOR-EAGER-IMPORT]] retired the wider blast "
+                << "radius, not this one)";
             auto const family = ffi::shimFamilyOf(rows[0]->synthesize);
             ASSERT_TRUE(family.has_value()) << where << ": `mtx_init` has no family";
             EXPECT_EQ(*family, ffi::ShimFamily::Threads);

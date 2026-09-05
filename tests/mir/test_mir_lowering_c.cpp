@@ -30,6 +30,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
@@ -194,8 +195,28 @@ struct Lowered {
             vaStrategy = cc->vaListLayout->strategy;
         }
     }
+    // ── [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: RESOLVE THE OBJECT-FORMAT KIND
+    //    BEFORE `analyze`, NOT AFTER IT ──────────────────────────────────────
+    // It used to be resolved only down in the `mirCfg` block, so `analyze` was
+    // handed `nullopt` for `activeFormat` while MIR lowering got the real kind —
+    // and once plain `char`'s signedness became a fact the FRONT END reads (it
+    // decides the VALUE of `'ÿ'`, C 6.4.4.4p10, not merely how the byte is
+    // extended), that split meant this harness ran the two tiers under DIFFERENT
+    // answers: the semantic/HIR tiers with none at all, MIR with the target's.
+    // `compile_pipeline.cpp` passes the kind to both, so the fixture now does
+    // too. EMPTY `formatName` ⇒ ELF, the format every pre-existing fixture here
+    // was implicitly written against.
+    auto formatKind = ObjectFormatKind::Elf;
+    if (!formatName.empty()) {
+        auto f = ObjectFormatSchema::loadShipped(formatName);
+        if (!f) {
+            ADD_FAILURE() << "loadShipped(format) failed: " << formatName;
+            std::abort();
+        }
+        formatKind = (*f)->kind();
+    }
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
-                         dataModel, std::nullopt, vaStrategy, std::nullopt,
+                         dataModel, std::nullopt, vaStrategy, formatKind,
                          std::nullopt, ldf, targetSchema.get());
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
@@ -249,15 +270,8 @@ struct Lowered {
         // than left to a no-arg accessor BECAUSE there is no no-arg accessor:
         // the object format is a required argument precisely so a caller cannot
         // silently take the processor half alone.
-        auto formatKind = ObjectFormatKind::Elf;
-        if (!formatName.empty()) {
-            auto f = ObjectFormatSchema::loadShipped(formatName);
-            if (!f) {
-                ADD_FAILURE() << "loadShipped(format) failed: " << formatName;
-                std::abort();
-            }
-            formatKind = (*f)->kind();
-        }
+        // Resolved ONCE, above `analyze`, so the front end and MIR lowering
+        // cannot be handed different answers — see the note at that site.
         mirCfg.charIsUnsigned        = t->charIsUnsigned(formatKind);
         // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the active CC's by-value
         // params so a struct passed/returned BY VALUE classifies. Mirrors
@@ -12362,25 +12376,155 @@ TEST(MirLoweringC, SizeofOfVlaLoadsDeclFrozenSizeSlot) {
            "static Const fold (a VLA sizeof is not a constant expression)";
 }
 
-// VLA C2 (D-CSUBSET-VLA) — CRITICAL-1 guard: `sizeof` of a COMPOSITE operand whose value
-// is a VLA (`sizeof(0, a)` — a comma expression) must NOT be treated as the object's
-// frozen size. C decays the comma result (an rvalue) to a pointer, so its sizeof is the
-// pointer size; the c does not model that decay, so this must FAIL LOUD (H0009 at
-// MIR) — never silently Load a (possibly wrong) VLA's frozen size. Red-on-disable for the
-// operand-shape guard in `vlaObjectOperandSymbol`: a broad "find any VLA leaf" match would
-// mis-key `a` here and lower a bogus runtime size (mir.ok would flip true).
-TEST(MirLoweringC, SizeofOfCompositeVlaOperandFailsLoud) {
+// VLA C2 (D-CSUBSET-VLA) → [[D-CSUBSET-VLA-SIZEOF-TYPEFORM]] part (2), C 6.5.17p2.
+//
+// ★★ THIS TEST WAS INVERTED, AND THE SENTENCE IT USED TO ASSERT IS WHY. Its docblock said,
+// correctly, that "C decays the comma result (an rvalue) to a pointer, so its sizeof is
+// the pointer size" — and then required DSS to FAIL LOUD instead of doing that, because
+// the tier did not model the decay. A refusal was the right thing to pin while the decay
+// was missing (a loud refusal outranks a wrong number), but what it pinned was the ABSENCE
+// of a language rule, and the rule now exists: the comma's result type is routed through
+// the shared `arrayToPointerDecay` in BOTH tiers that must agree — the semantic
+// `subtreeType`/`combineBinary` and the CST→HIR `combineComma` — so `sizeof(0, a)` is the
+// pointer size and no VLA size Load is involved at all.
+//
+// ⚠ THE FIXED-ARRAY TWIN WAS NEVER A REFUSAL — IT WAS A SILENT WRONG ANSWER, which is what
+// made this a defect rather than a gap. ✔MEASURED at b1f31420 through the shipped CLI:
+// `sizeof(fb, fa)` on `int fa[7]` yielded 28, rc 0 and zero diagnostics, where gcc 13.3.0,
+// clang 18.1.3 AND MSVC 19.51 all yield 8 — each probed separately, MSVC through a
+// `typedef char x[(sizeof(fb,fa)==sizeof(int*))?1:-1]` accepted at rc 0 beside a
+// known-FALSE control arm in the same file that errors C2118, so the clean rc is not
+// vacuous. Unanimous 3/3 against DSS. The VLA form pinned here was the same defect wearing
+// its loud face.
+//
+// What this now guards is that the decay happens AT THE TYPE and not at the use: `sizeof`
+// is the ONE observer of the un-decayed type. `int *p = (fb,fa)`, `(fb,fa)+1`, `(fb,fa)[1]`,
+// a deref, a call argument and a pointer comparison were ALL already correct at b1f31420,
+// each rescued by `coerce` at its own use site — which is exactly why the type itself went
+// unfixed. Red-on-disable: drop the decay from EITHER tier and this returns to a loud MIR
+// refusal (mir.ok false), because the sizeof operand is a VLA-typed composite again.
+TEST(MirLoweringC, SizeofOfCompositeVlaOperandDecaysToPointer) {
     auto L = lowerC(
         "int main(void) {\n"
         "  int n;\n"
         "  n = 4;\n"
         "  int a[n];\n"
-        "  return (int)sizeof(0, a);\n"   // composite operand — must fail loud, not Load a
+        "  return (int)sizeof(0, a);\n"   // C 6.5.17p2: the comma's value is `int *`
         "}\n");
-    // The front-end accepts it (a is a valid VLA); the failure is the sizeof lowering.
-    EXPECT_FALSE(L.mir.ok)
-        << "sizeof of a composite (comma) operand yielding a VLA must fail loud (its C "
-           "value decays to a pointer), never silently load the VLA's frozen size";
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "sizeof of a comma expression whose right operand is a VLA is the POINTER size "
+           "(C 6.5.17p2 rvalue conversion + 6.3.2.1p3 decay) and must lower cleanly: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    // ★ THE EXPECTED NUMBER IS MEASURED, NOT WRITTEN DOWN. A CONTROL lowering of
+    // `sizeof p` on a plain `int *` gives this target's pointer size through the very
+    // machinery under test, so the assertion below cannot pass by agreeing with a
+    // hard-coded 8 on a target where that is wrong.
+    auto const constValues = [](Lowered const& lowered) {
+        std::vector<std::int64_t> vs;
+        Mir const& mm = lowered.mir.mir;
+        if (mm.moduleFuncCount() == 0u) return vs;
+        MirBlockId const b0 = mm.funcEntry(mm.funcAt(0));
+        for (std::uint32_t i = 0; i < mm.blockInstCount(b0); ++i) {
+            MirInstId const id = mm.blockInstAt(b0, i);
+            if (mm.instOpcode(id) != MirOpcode::Const) continue;
+            auto const& lit = mm.literalValue(mm.constLiteralIndex(id));
+            if (auto const* iv = std::get_if<std::int64_t>(&lit.value)) {
+                vs.push_back(*iv);
+            } else if (auto const* uv = std::get_if<std::uint64_t>(&lit.value)) {
+                vs.push_back(static_cast<std::int64_t>(*uv));
+            }
+        }
+        return vs;
+    };
+    auto C = lowerC(
+        "int main(void) {\n"
+        "  int *p;\n"
+        "  return (int)sizeof p;\n"
+        "}\n");
+    ASSERT_TRUE(C.mir.ok)
+        << (C.mirReporter.all().empty() ? "" : C.mirReporter.all()[0].actual);
+    auto const controlConsts = constValues(C);
+    std::int64_t ptrBytes = 0;
+    for (std::int64_t v : controlConsts) if (v > 0) ptrBytes = v;
+    ASSERT_GT(ptrBytes, 0) << "the control `sizeof p` must fold to a positive Const";
+
+    // The sizeof is a STATIC Const equal to that pointer size — never a Load of the VLA's
+    // decl-frozen size slot. Both halves carry weight: a Load would mean the operand is
+    // still VLA-typed, and a Const of 16 (4 * sizeof(int)) would mean the type decayed to
+    // nothing and the ARRAY's own size was read instead.
+    auto const subjectConsts = constValues(L);
+    EXPECT_NE(std::find(subjectConsts.begin(), subjectConsts.end(), ptrBytes),
+              subjectConsts.end())
+        << "`sizeof(0, a)` must fold to the POINTER size as a static Const — the comma's "
+           "result is an rvalue `int *`, so the VLA's runtime size is not involved";
+    EXPECT_EQ(std::find(subjectConsts.begin(), subjectConsts.end(),
+                        static_cast<std::int64_t>(16)),
+              subjectConsts.end())
+        << "16 would be `4 * sizeof(int)` — the ARRAY's size, i.e. the decay never "
+           "happened and sizeof read the object instead of the comma's value";
+}
+
+// [[D-CSUBSET-VLA-SIZEOF-TYPEFORM]] part (1) — the MIR-tier consequence of lowering the
+// VLA TYPE-NAME form at CST→HIR: `sizeof(int[n])` reaches MIR as ordinary arithmetic and
+// lowers CLEANLY, where at this cycle's base (b1f31420) it was a hard refusal —
+// `error[H_UnsupportedLoweringForKind]: sizeof of an incomplete or un-sizeable type`,
+// raised by the SizeOf case below when `cachedOperandLayout` nullopts on the VLA type.
+// So the leading ASSERT_TRUE is itself the red-on-disable: revert the
+// `lowerVlaTypeNameSizeof` dispatch and `L.mir.ok` flips false.
+//
+// ★ WHAT THE MUL PINS THAT `mir.ok` DOES NOT: that the size is RE-EVALUATED rather than
+// folded. C 6.5.3.4p2 evaluates the operand of a VLA-typed sizeof, so the bound must be
+// a live Load of `n` feeding a Mul — a static Const would be a wrong answer for every
+// program that changes `n` between two `sizeof(int[n])`, and would pass any test that
+// only ever reads one value of `n`.
+TEST(MirLoweringC, SizeofOfVlaTypeNameLowersToARuntimeMulNotARefusal) {
+    auto L = lowerC(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 4;\n"
+        "  return (int)sizeof(int[n]);\n"   // 4*4 == 16, re-read at the sizeof
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)   // red-on-disable: the base refuses here (H0009)
+        << "a VLA type-name sizeof must lower cleanly (C 6.5.3.4p2 evaluates the "
+           "operand): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    TypeInterner const& in = L.model.lattice().interner();
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // A size_t-typed Mul whose operands include a LOAD — the fresh read of `n`.
+    bool sawFreshMul = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Mul) continue;
+        if (in.kind(m.instType(id)) != TypeKind::U64) continue;
+        for (MirInstId op : m.instOperands(id)) {
+            MirInstId probe = op;
+            // A widening Cast may sit between the Load and the Mul (the bound is
+            // `int`, the product `size_t`), so look through a single-operand
+            // conversion before demanding the Load.
+            for (int hop = 0; hop < 4 && probe.v != 0; ++hop) {
+                if (m.instOpcode(probe) == MirOpcode::Load) { sawFreshMul = true; break; }
+                auto const inner = m.instOperands(probe);
+                if (inner.size() != 1u) break;
+                probe = inner[0];
+            }
+        }
+    }
+    EXPECT_TRUE(sawFreshMul)
+        << "`sizeof(int[n])` must lower to a size_t Mul over a live Load of the bound "
+           "(fresh evaluation, C 6.5.3.4p2), never to a static Const";
 }
 
 // ── VLA C4b (D-CSUBSET-VLA): the VLA-typedef FREEZE + COPY-DOWN MIR pins ─────────
@@ -12698,12 +12842,18 @@ TEST(MirLoweringC, PtrToVlaTypedefObjectCopiesFrozenPointeeStride) {
 }
 
 // (d) CHAINED VLA typedef `typedef int R[n]; typedef R S;` — S aliases a VLA typedef with
-// NO own `[n]` suffix (D-CSUBSET-VLA-TYPEDEF-CHAINED). The semantic I1 gate stamps S's
-// `vlaTypedefOrigin` (declTy==headTy), so `lowerTypeDecl` recognizes the chained form and
-// fails loud CLEANLY (a real "not yet supported" diagnostic) instead of the generic
-// captureVlaSize "no suffix" desync. Red-on-disable: drop the vlaTypedefOrigin discriminator
-// and S routes back into captureVlaSize → the confusing internal-desync message.
-TEST(MirLoweringC, ChainedVlaTypedefFailsLoud) {
+// NO own `[n]` suffix. D-CSUBSET-VLA-TYPEDEF-CHAINED ✅ CLOSED in P57: this used to assert
+// `EXPECT_FALSE(L.hir->ok)` because S had no way to say WHICH typedef froze its size. It
+// does now — `SymbolRecord::vlaTypedefOrigin` names the typedef that OWNS a captured bound
+// (transitively, resolved at each alias's own declaration), so `S a;` reaches R's frozen
+// slots through the SAME C4b copy-down a direct `R a;` uses, and S's own TypeDecl emits no
+// node at all (it captured nothing and owes nothing — C 6.7.7p3 froze the size once, at R).
+// ✔MEASURED 2026-09-03: gcc 13.3.0 and clang 18.1.3 both compile and RUN this shape and the
+// three-deep `typedef S T;` form; MSVC ABSTAINS (no C99 VLA at all). Runtime witness:
+// examples/c/c99_vla_typedef_chained. RED-ON-DISABLE: restore the
+// `kind == DeclarationKind::Variable` gate on the vlaTypedefOrigin stamp in
+// semantic_analyzer.cpp and `ok` goes false again with the old chained-alias diagnostic.
+TEST(MirLoweringC, ChainedVlaTypedefLowersFromTheOriginsFrozenSlots) {
     auto L = lowerC(
         "int main(void) {\n"
         "  int n;\n"
@@ -12714,9 +12864,42 @@ TEST(MirLoweringC, ChainedVlaTypedefFailsLoud) {
         "  a[0] = 42;\n"
         "  return a[0];\n"
         "}\n");
-    EXPECT_FALSE(L.hir->ok)
-        << "a chained VLA typedef (`typedef int R[n]; typedef R S;`) is deferred — must "
-           "fail loud at HIR, never silently alias a frozen size";
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? ""
+                                                : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << "a chained VLA typedef must LOWER — S inherits R's decl-frozen size rather than "
+           "re-evaluating `n` at its own declaration: "
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    // ⚠ THE ACCESSORS HERE WERE WRONG WHEN THIS BLOCK LANDED, and the note is kept
+    // because the failure mode is generic. Lane `vl` handed the orchestrator a
+    // replacement for the old `ChainedVlaTypedefFailsLoud` with an explicit warning that
+    // it had NOT been compiled in that lane (`tests/mir/**` was outside its grant) and
+    // that the neighbouring `PtrToVlaTypedefObjectCopiesFrozenPointeeStride` should be
+    // copied for the accessor spelling. It was applied verbatim instead, and
+    // `L.mir->entryBlock(L.mainFn)` does not compile: `L.mir` is a `HirToMirResult` BY
+    // VALUE (not a pointer) and the fixture exposes no `mainFn`. ⇒ **A brief that says
+    // "I did not compile this" is a fact about the patch, not a politeness**, and the
+    // repair is the one the note asked for: `Mir const& m = L.mir.mir;` plus
+    // `m.funcEntry(m.funcAt(0))`, exactly as every sibling in this file spells it.
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // `S a;` must take a RUNTIME-sized alloca (an Alloca WITH a size operand), exactly as a
+    // direct `R a;` does — a chained alias that silently fell back to a static layout would
+    // still report ok and would be the one wrong answer worth catching here.
+    int runtimeAllocas = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) == MirOpcode::Alloca && !m.instOperands(id).empty())
+            ++runtimeAllocas;
+    }
+    EXPECT_GT(runtimeAllocas, 0)
+        << "`S a;` must allocate at RUNTIME from R's frozen whole-object slot";
 }
 
 // ── VLA C3 (D-CSUBSET-VLA): multi-dimensional VLAs (runtime row stride) ───────
@@ -13106,6 +13289,174 @@ TEST(MirLoweringC, ForInitAndBodyVlaTornDownAtDistinctPoints) {
     EXPECT_NE(forInitBlk, bodyBlk)
         << "the for-init and body restores sit in DIFFERENT blocks — the for-init is "
            "not folded into the body's per-iteration back-edge teardown";
+}
+
+// ── D-CSUBSET-VLA-MULTIDECLARATOR-STATEMENT-TEARDOWN / -FOR-INIT-MULTIDECL ──────
+// ONE declaration, MANY declarators. C 6.2.4 gives every object of `int a[n], b[n];`
+// the scope of the ENCLOSING block — the declaration is not a scope — but cst_to_hir
+// must hand a statement position ONE node and wraps the N declarators in a Block.
+// Read as a scope, that Block freed both objects at the end of the STATEMENT.
+
+// Every StackRestore's (targeted scopeId, containing block).
+[[nodiscard]] std::vector<std::pair<std::uint32_t, std::uint32_t>>
+restoreTargetsAndBlocks(Mir const& m) {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> out;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+                MirInstId const id = m.blockInstAt(b, ii);
+                if (m.instOpcode(id) != MirOpcode::StackRestore) continue;
+                auto const rops = m.instOperands(id);
+                if (rops.size() != 1u) continue;
+                out.emplace_back(m.instPayload(rops[0]), b.v);
+            }
+        }
+    }
+    return out;
+}
+
+// THE P0. `int a[n], b[n];` then `int c[n];` in one loop body. TWO facts, and the
+// counts are what separate them from the defect:
+//   * ONE watermark per declaration STATEMENT, not per declarator → 2 StackSaves
+//     (the group + `c`), never 3. The group's is scopeId 0, taken before `a`.
+//   * The teardown fires at the enclosing SCOPE's exit, not the statement's → ONE
+//     StackRestore, and it targets scopeId 0 so it reclaims a, b AND c.
+// RED-ON-DISABLE: restore the per-declarator push and saves becomes 3; restore the
+// declaration-wrapper-is-a-scope reading and a SECOND restore appears mid-body,
+// freeing a and b while live — which is exactly the silent miscompile (the runtime
+// witness examples/c/c99_vla_multideclarator then returns 7 instead of 42).
+TEST(MirLoweringC, MultiDeclaratorVlaStatementIsOneWatermarkFreedAtScopeExit) {
+    auto L = lowerC(
+        "int main(void) {\n"
+        "  volatile int vn = 4;\n"
+        "  int n = vn;\n"
+        "  int i;\n"
+        "  for (i = 0; i < 3; i = i + 1) {\n"
+        "    int a[n], b[n];\n"      // ONE declaration, TWO variable-length objects
+        "    int c[n];\n"            // a THIRD object in the SAME scope
+        "    a[0] = 1; b[0] = 2; c[0] = 3;\n"
+        "  }\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    auto const ops = allOpcodes(L.mir.mir);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::StackSave), 2u)
+        << "one watermark per declaration STATEMENT: the (a, b) group opens ONE, `c` "
+           "opens the second. A third would be a save nothing can ever restore to — "
+           "the scope exit restores to the SHALLOWEST frame it opened";
+    auto const restores = restoreTargetsAndBlocks(L.mir.mir);
+    ASSERT_EQ(restores.size(), 1u)
+        << "exactly ONE restore, at the loop body's fall-through exit. A second one "
+           "means the declaration statement was read as a scope and freed a and b "
+           "while they were still live";
+    EXPECT_EQ(restores[0].first, 0u)
+        << "the restore targets the GROUP's watermark (scopeId 0, SP captured before "
+           "`a`), so it reclaims a, b and c together";
+}
+
+// THE SIBLING ROW, AND IT MOVES IN THE OPPOSITE DIRECTION. A multi-declarator
+// `for`-init was a LOUD REFUSAL ("...is not yet torn down at loop exit — deferred
+// (D-CSUBSET-VLA-FOR-INIT-MULTIDECL)") of a program gcc 13.3.0 and clang 18.1.3 both
+// compile and RUN. It must now lower, with for-SCOPE lifetime: ONE watermark for the
+// whole init clause and exactly ONE restore, at the loop EXIT — NEVER on the back
+// edge, where freeing it is a use-after-free from iteration 2 on.
+// RED-ON-DISABLE: reinstate the refusal and `L.mir.ok` is false here.
+TEST(MirLoweringC, MultiDeclaratorForInitVlaLowersWithForScopeTeardown) {
+    auto L = lowerC(
+        "int main(void) {\n"
+        "  volatile int vn = 4;\n"
+        "  int n = vn;\n"
+        "  int i;\n"
+        "  i = 0;\n"
+        "  for (int a[n], b[n]; i < 3; i = i + 1) {\n"
+        "    a[0] = i; b[0] = i;\n"   // body uses BOTH init objects; body has no VLA
+        "  }\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "a multi-declarator for-init VLA must lower (the deferral is closed): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    auto const ops = allOpcodes(L.mir.mir);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::StackSave), 1u)
+        << "the whole init clause is ONE declaration statement → ONE watermark";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::StackRestore), 1u)
+        << "freed ONLY at the loop exit — a back-edge restore would free a and b "
+           "while the next iteration still reads them";
+}
+
+// A LABEL is the OTHER non-scope wrapper between a declaration and its block
+// (C23 6.8.1; gcc 13.3.0 and clang 18.1.3 both compile and RUN it, clang calling the
+// C17 spelling a C23 extension rather than an error). Both spellings must anchor at
+// the enclosing block: the GROUP form was silently freeing at the statement, and the
+// SINGLE-declarator form — which has no wrapper Block at all — was refused loud with
+// "a variable-length array in this declaration position is not yet torn down at
+// scope exit". RED-ON-DISABLE: drop the LabelStmt leg of the walk-out and the single
+// form fails `L.mir.ok` while the group form grows a second, mid-body restore.
+TEST(MirLoweringC, LabelledVlaDeclarationAnchorsAtTheEnclosingBlockScope) {
+    struct Case { char const* decl; unsigned saves; char const* what; };
+    Case const cases[] = {
+        {"L: int a[n], b[n];\n    a[0] = 1; b[0] = 2;", 1u, "labelled group"},
+        {"L: int a[n];\n    a[0] = 1;",                 1u, "labelled single declarator"},
+    };
+    for (Case const& c : cases) {
+        std::string const src =
+            std::string("int main(void) {\n"
+                        "  volatile int vn = 4;\n  int n = vn;\n  int i;\n"
+                        "  for (i = 0; i < 3; i = i + 1) {\n    ")
+            + c.decl + "\n  }\n  return 0;\n}\n";
+        auto L = lowerC(src);
+        ASSERT_FALSE(L.model.hasErrors()) << c.what << "\n" << src
+            << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.mir.ok) << c.what << "\n" << src
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        auto const ops = allOpcodes(L.mir.mir);
+        EXPECT_EQ(countOpcode(ops, MirOpcode::StackSave), c.saves) << c.what;
+        EXPECT_EQ(countOpcode(ops, MirOpcode::StackRestore), 1u)
+            << c.what << ": one restore, at the enclosing block's exit — a label is "
+               "not a scope, so it must not free anything of its own";
+    }
+}
+
+// ★★ THE ANCHOR IS THE SCOPE'S DIRECT CHILD, NOT THE VarDecl. `goto` teardown asks
+// whether the target label lies inside a frame's scope by looking the frame's anchor
+// up in that scope's CHILD LIST. A group's VarDecls are nested inside the wrapper and
+// are NOT in that list, so a frame anchored at the VarDecl reads as "does not enclose
+// the label" and the jump frees objects that are still live at it. Here the label is
+// in the SAME block, after the group, so the goto edge must free NOTHING.
+// RED-ON-DISABLE: anchor the frame at the VarDecl again and a second StackRestore
+// appears on the goto edge (and the runtime witness's arm 11 goes wrong).
+TEST(MirLoweringC, GotoForwardPastADeclarationGroupFreesNothing) {
+    auto L = lowerC(
+        "int main(void) {\n"
+        "  volatile int vn = 4;\n"
+        "  int n = vn;\n"
+        "  int i;\n"
+        "  for (i = 0; i < 3; i = i + 1) {\n"
+        "    int a[n], b[n];\n"
+        "    a[0] = 1; b[0] = 2;\n"
+        "    if (a[0] == 1) { goto L; }\n"   // stays INSIDE a/b's scope
+        "    a[0] = 9;\n"
+        "  L: ;\n"
+        "  }\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    auto const ops = allOpcodes(L.mir.mir);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::StackSave), 1u)
+        << "one declaration statement → one watermark";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::StackRestore), 1u)
+        << "only the body's fall-through exit restores. A restore on the goto edge "
+           "would free a and b at a label where they are still in scope";
 }
 
 // ── VLA C4a-local (D-CSUBSET-VLA): pointer-to-VLA (runtime pointee row stride) ──
@@ -15516,5 +15867,271 @@ TEST(MirLoweringC, PointerArithNonIntegerIndexRefusalNoLongerNamesTheEnum) {
     for (auto const& d : L.mirReporter.all()) {
         EXPECT_EQ(d.actual.find("an enum index is deferred"), std::string::npos)
             << "an enum index is SUPPORTED — no refusal may still call it deferred";
+    }
+}
+
+// ── D-CSUBSET-PACKED-ATOMIC-MEMBER: the PROVABLE-ALIGNMENT stamp ───────────
+//
+// HIR→MIR stamps every AtomicLoad/AtomicStore's `payload2` with the lvalue's
+// provable alignment in bytes, and MIR→LIR reads it to choose between the
+// target's native inline atomic instruction and the format's atomics runtime.
+// This is the LAST tier that has the HIR access chain, so it is the only one
+// that can derive the fact at all.
+//
+// ★ THE RULE, and it reproduces clang on all six lvalue forms measured (P53,
+// clang 18.1.3 `--target=aarch64-linux-gnu -S` plus Apple clang 21):
+//     align(L) = min over the chain of
+//                { the aggregate's own StructLayout.align,
+//                  the largest power of two dividing each field offset }
+// with a `Deref` STOPPING the walk at the pointee's natural alignment (C
+// 6.5.3.2 guarantees an `_Atomic T *` points at a properly-aligned object, and
+// clang assumes exactly that).
+//
+// ⚠⚠ THE RECURSION IS THE PART THAT IS EASY TO GET WRONG AND IMPOSSIBLE TO SEE.
+// A one-level `min(StructLayout.align, 2^ctz(offset))` calls `p.q.a` ALIGNED
+// when `q` (align 4, offset 0 within itself) sits at byte offset 1 of a packed
+// `p` — a silent SIGBUS at depth 2 on real aarch64, invisible on every gate leg
+// that RUNS. `NestedPackedMemberIsUnderAlignedAtDepthTwo` below is that case.
+namespace {
+
+// The `payload2` of the FIRST AtomicLoad (or AtomicStore) in the module, or
+// nullopt when the module contains none.
+[[nodiscard]] std::optional<std::uint32_t>
+firstAtomicAlign(Mir const& m, MirOpcode want) {
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                if (m.instOpcode(id) == want) return m.instPayload2(id);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
+TEST(MirLoweringC, PackedAtomicMemberStampsAnUnderAlignedProvableAlignment) {
+    // `g.a` sits at byte offset 1 of an align-1 struct: provable alignment 1,
+    // against a natural alignment of 4.
+    auto L = lowerC(
+        "struct __attribute__((packed)) P { char pad; _Atomic int a; };\n"
+        "struct P g;\n"
+        "int main(void) { g.a = 7; return g.a; }\n");
+    ASSERT_TRUE(L.mir.ok);
+    auto const st = firstAtomicAlign(L.mir.mir, MirOpcode::AtomicStore);
+    auto const ld = firstAtomicAlign(L.mir.mir, MirOpcode::AtomicLoad);
+    ASSERT_TRUE(st.has_value()) << "the packed member write must be an atomic store";
+    ASSERT_TRUE(ld.has_value()) << "the packed member read must be an atomic load";
+    EXPECT_EQ(*st, 1u) << "RED-ON-DISABLE: a packed member at offset 1 is provably "
+                          "1-byte aligned; anything larger routes it back onto the "
+                          "faulting native instruction";
+    EXPECT_EQ(*ld, 1u);
+}
+
+TEST(MirLoweringC, UnpackedAtomicMemberStampsItsNaturalAlignment) {
+    // THE CONTROL. Same member type, same access, ordinary struct.
+    auto L = lowerC(
+        "struct Q { char pad; _Atomic int a; };\n"
+        "struct Q h;\n"
+        "int main(void) { h.a = 7; return h.a; }\n");
+    ASSERT_TRUE(L.mir.ok);
+    auto const st = firstAtomicAlign(L.mir.mir, MirOpcode::AtomicStore);
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(*st, 4u) << "a naturally-aligned member must stamp its full "
+                          "alignment, or every atomic in the program pays for a "
+                          "libcall it does not need";
+}
+
+TEST(MirLoweringC, PackedMemberAtOffsetZeroIsStillUnderAligned) {
+    // ★ THE STRUCT-ALIGN TERM IS LOAD-BEARING. Offset 0 divides by every power
+    // of two, so an offset-only rule would call this ALIGNED — but the object
+    // itself is only 1-byte aligned because the struct is packed, so the member
+    // can land anywhere. clang libcalls this case too (measured).
+    auto L = lowerC(
+        "struct __attribute__((packed)) R { _Atomic int a; char pad; };\n"
+        "struct R r;\n"
+        "int main(void) { r.a = 7; return r.a; }\n");
+    ASSERT_TRUE(L.mir.ok);
+    auto const st = firstAtomicAlign(L.mir.mir, MirOpcode::AtomicStore);
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(*st, 1u)
+        << "RED-ON-DISABLE: drop the aggregate-alignment term and this reads 4 "
+           "while the object is byte-aligned — a silent fault on aarch64";
+}
+
+TEST(MirLoweringC, NestedPackedMemberIsUnderAlignedAtDepthTwo) {
+    // ⚠⚠ THE RECURSION PIN. `q` is an ORDINARY struct (align 4, its `a` at
+    // offset 0), nested at byte offset 1 of a PACKED outer struct. A one-level
+    // rule looks only at `q`'s own layout, sees align 4 and offset 0, and
+    // answers ALIGNED — which is a SIGBUS on real hardware and green on every
+    // emulated leg. Only walking the whole lvalue chain gets this right.
+    auto L = lowerC(
+        "struct Inner { _Atomic int a; };\n"
+        "struct __attribute__((packed)) Outer { char pad; struct Inner q; };\n"
+        "struct Outer o;\n"
+        "int main(void) { o.q.a = 7; return o.q.a; }\n");
+    ASSERT_TRUE(L.mir.ok);
+    auto const st = firstAtomicAlign(L.mir.mir, MirOpcode::AtomicStore);
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(*st, 1u)
+        << "RED-ON-DISABLE: apply the alignment rule ONE LEVEL instead of over "
+           "the whole chain and this reads 4 — the depth-2 silent SIGBUS";
+}
+
+TEST(MirLoweringC, PlainAtomicGlobalAndPointerDerefStampFullAlignment) {
+    // The two forms that must NOT be pessimised. A plain `_Atomic` object is
+    // naturally aligned; a deref of an `_Atomic int *` is guaranteed so by C
+    // 6.5.3.2, and routing every pointer-mediated atomic through a libcall
+    // would be a large cost bought with no measured safety.
+    {
+        auto L = lowerC("_Atomic int g;\n"
+                        "int main(void) { g = 7; return g; }\n");
+        ASSERT_TRUE(L.mir.ok);
+        auto const st = firstAtomicAlign(L.mir.mir, MirOpcode::AtomicStore);
+        ASSERT_TRUE(st.has_value());
+        EXPECT_EQ(*st, 4u) << "a plain _Atomic global is naturally aligned";
+    }
+    {
+        auto L = lowerC("int f(_Atomic int *p) { *p = 7; return *p; }\n");
+        ASSERT_TRUE(L.mir.ok);
+        auto const st = firstAtomicAlign(L.mir.mir, MirOpcode::AtomicStore);
+        ASSERT_TRUE(st.has_value());
+        EXPECT_EQ(*st, 4u)
+            << "a deref STOPS the walk at the pointee's guaranteed alignment";
+    }
+}
+
+TEST(MirLoweringC, PackedAtomicThroughAPointerIsStillUnderAligned) {
+    // The pointer's POINTEE is the packed struct, so the walk restarts at
+    // align 1 and the member offset keeps it there. clang libcalls this too.
+    auto L = lowerC(
+        "struct __attribute__((packed)) P { char pad; _Atomic int a; };\n"
+        "int f(struct P *p) { p->a = 7; return p->a; }\n");
+    ASSERT_TRUE(L.mir.ok);
+    auto const st = firstAtomicAlign(L.mir.mir, MirOpcode::AtomicStore);
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(*st, 1u);
+}
+
+// ── [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]] — THE GLOBAL-INITIALIZER TIER ────
+//
+// A `static`/file-scope initializer is folded by the HIR const-eval, a different
+// evaluator from the array-dimension one and from the `#if` one, and it reads
+// `intKindInfo`'s `Char` row. That row said `{32, UNSIGNED}` and BOTH fields
+// were wrong: `char` is eight bits in every data model DSS ships, and its sign
+// is what the target declares (C 6.2.5p15).
+//
+// ★ THE WIDTH BUG MASKED THE SIGN BUG, WHICH IS WHY BOTH ARMS ARE HERE. At 32
+// bits a value that survives un-truncated is IDENTICAL under both signs, so no
+// probe could tell them apart — an agent who checked signedness while the width
+// was wrong measured the mask, not the code. The width arm is also the only one
+// of the two that is non-vacuous on an unsigned-`char` leg.
+//
+// ✔MEASURED at b1f31420 through the shipped CLI, each reference probed
+// separately: `static int g = (char)300; g == 44` answered NO in DSS on BOTH
+// legs where gcc 13.3.0, clang 18.1.3 and aarch64-linux-gnu-gcc 13.3.0 all
+// answer YES; `static int g = (char)200; g == -56` answered NO on x86_64 where
+// gcc and clang answer YES. Both compiled rc 0 with zero diagnostics.
+TEST(MirLoweringC, GlobalInitCharCastTruncatesToEightBitsOnEveryTarget) {
+    // The WIDTH half, and it is TARGET-INDEPENDENT: 300 truncated to any 8-bit
+    // `char` is 44 whether that `char` is signed or unsigned. Asserted on BOTH
+    // legs precisely because it is the arm that does not depend on the sign.
+    for (auto const& [targetName, ccName] :
+         std::vector<std::pair<std::string, std::string>>{
+             {"x86_64", "sysv_amd64"}, {"arm64", "aapcs64"}}) {
+        auto L = lowerC("int g = (char)300;\n", targetName, ccName);
+        ASSERT_TRUE(L.mir.ok)
+            << targetName << ": "
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        ASSERT_EQ(m.moduleGlobalCount(), 1u);
+        MirGlobalId const g = m.globalAt(0);
+        ASSERT_NE(m.globalInitLiteralIndex(g), UINT32_MAX)
+            << targetName << ": a `(char)` cast of a constant must FOLD, not "
+               "route through __module_init__";
+        EXPECT_EQ(std::get<std::int64_t>(
+                      m.literalValue(m.globalInitLiteralIndex(g)).value),
+                  44)
+            << targetName << ": `char` is EIGHT bits, so (char)300 == 44 — a "
+               "32-bit `char` model keeps 300 and masks the signedness question "
+               "entirely";
+    }
+}
+
+TEST(MirLoweringC, GlobalInitCharCastTakesItsSignFromTheTargetDeclaration) {
+    // x86_64 declares plain `char` SIGNED: (char)200 == -56.
+    {
+        auto L = lowerC("int g = (char)200;\n", "x86_64", "sysv_amd64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        ASSERT_EQ(m.moduleGlobalCount(), 1u);
+        MirGlobalId const g = m.globalAt(0);
+        ASSERT_NE(m.globalInitLiteralIndex(g), UINT32_MAX);
+        EXPECT_EQ(std::get<std::int64_t>(
+                      m.literalValue(m.globalInitLiteralIndex(g)).value),
+                  -56)
+            << "x86_64 declares plain `char` signed, so (char)200 is -56";
+    }
+    // arm64 x ELF declares it UNSIGNED — the ONE unsigned leg DSS ships — so the
+    // SAME source must fold to 200. This arm is what makes the pair a test of
+    // the DECLARATION rather than of a hard-coded sign: satisfy the arm above by
+    // hard-coding signed and this one goes red.
+    {
+        auto L = lowerC("int g = (char)200;\n", "arm64", "aapcs64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        ASSERT_EQ(m.moduleGlobalCount(), 1u);
+        MirGlobalId const g = m.globalAt(0);
+        ASSERT_NE(m.globalInitLiteralIndex(g), UINT32_MAX);
+        EXPECT_EQ(std::get<std::int64_t>(
+                      m.literalValue(m.globalInitLiteralIndex(g)).value),
+                  200)
+            << "arm64 x elf declares plain `char` UNSIGNED, so the same "
+               "(char)200 is 200 — one CPU, and the OBJECT FORMAT is half the "
+               "answer (arm64 x macho is signed)";
+    }
+}
+
+// [[D-CSUBSET-CHAR-HIGHBYTE-ICE-SIGNEDNESS]]: the CHARACTER CONSTANT reaches its
+// value through `decodeCharLiteral`, with no truncation involved at all — so
+// unlike the cast above, +255 vs -1 is DIRECTLY observable here and the width
+// bug never masked it. It was simply wrong: the decoder answers with the code
+// unit, and the code unit is the unsigned reading spelled as if it were no
+// reading. ✔MEASURED at b1f31420: `static int g = '\xff'; g == -1` answered NO
+// on x86_64 where gcc 13.3.0 and clang 18.1.3 answer YES.
+TEST(MirLoweringC, GlobalInitHighByteCharConstantTakesItsSignFromTheTarget) {
+    {
+        auto L = lowerC("int g = '\xff';\n", "x86_64", "sysv_amd64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        ASSERT_EQ(m.moduleGlobalCount(), 1u);
+        MirGlobalId const g = m.globalAt(0);
+        ASSERT_NE(m.globalInitLiteralIndex(g), UINT32_MAX);
+        EXPECT_EQ(std::get<std::int64_t>(
+                      m.literalValue(m.globalInitLiteralIndex(g)).value),
+                  -1)
+            << "C 6.4.4.4p10: on a signed-`char` target `'\xff'` is -1, NOT the "
+               "code unit 255";
+    }
+    {
+        auto L = lowerC("int g = '\xff';\n", "arm64", "aapcs64");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        ASSERT_EQ(m.moduleGlobalCount(), 1u);
+        MirGlobalId const g = m.globalAt(0);
+        ASSERT_NE(m.globalInitLiteralIndex(g), UINT32_MAX);
+        EXPECT_EQ(std::get<std::int64_t>(
+                      m.literalValue(m.globalInitLiteralIndex(g)).value),
+                  255)
+            << "on the unsigned-`char` leg the SAME constant is +255 — this is "
+               "the leg where the old defect and the correct answer coincide, "
+               "so it is here to prove the value is READ from the declaration";
     }
 }

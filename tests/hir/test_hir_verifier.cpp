@@ -1453,3 +1453,68 @@ TEST(HirVerifier, WideningInlineAsmArityDidNotWidenItsFormerCaseGroupNeighbours)
                "they are leaves and must stay {0,0}";
     }
 }
+
+// ── D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE, the DIAGNOSTIC half ─────────
+//
+// Every message in this file used to render the offending kind as
+// `HirKind ordinal N`, so a user who wrote `2[p]` was told an internal
+// enumerator number for a node they never authored (✔MEASURED at P53's base
+// through the shipped CLI: `error[H_TypeUnresolved]: hir node #23 (HirKind
+// ordinal 34)`). `hirKindName` already existed and is proven complete by a
+// `Count_` static_assert beside its table.
+//
+// ⚠ THE NODE IDENTITY MUST SURVIVE. It is not decoration: `actual` participates
+// in the reporter's dedup key, so two findings on DIFFERENT nodes that both lack
+// a span would COALESCE into one if the id left the message. Both assertions
+// below are therefore paired — the name is present AND the `#N` still is.
+//
+// RED-ON-DISABLE (REMOVE direction): replace `describeKind(kind)` with the
+// former `static_cast<unsigned>(kind)` rendering in `checkRequiredTypes` and
+// `checkNodeArity` and both tests red on the name assertion while every count
+// assertion in this file stays green — the control that says these pin the
+// MESSAGE and not the rule.
+TEST(HirVerifier, TypeUnresolvedNamesTheConstructNotAnOrdinal) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+
+    HirBuilder b{"toy"};
+    HirNodeId const base = b.makeLiteral(i32);
+    HirNodeId const idx  = b.makeLiteral(i32);
+    // An untyped Index — the exact node the commuted subscript used to produce.
+    HirNodeId const bad =
+        b.addParent(HirKind::Index, std::array{base, idx}, dss::InvalidType, 0);
+    Hir h = std::move(b).finish(bad);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    ASSERT_EQ(countCode(reporter, DiagnosticCode::H_TypeUnresolved), 1u);
+    std::string const& text = reporter.all().front().actual;
+    EXPECT_NE(text.find(hirKindName(HirKind::Index)), std::string::npos)
+        << "the message must NAME the construct: " << text;
+    EXPECT_EQ(text.find("HirKind ordinal"), std::string::npos)
+        << "no user-facing message may spell a raw kind ordinal: " << text;
+    EXPECT_NE(text.find("#" + std::to_string(bad.v)), std::string::npos)
+        << "the node id must survive — it is the reporter's dedup key: " << text;
+}
+
+TEST(HirVerifier, ArityFailureNamesTheConstructNotAnOrdinal) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+
+    HirBuilder b{"toy"};
+    HirNodeId const a   = b.makeLiteral(i32);
+    HirNodeId const bad = b.addParent(HirKind::BinaryOp, std::array{a}, i32,
+                                      encodeOp(HirOpKind::Add));
+    Hir h = std::move(b).finish(bad);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE(HirVerifier{h}.verify(reporter));
+    ASSERT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+    std::string const& text = reporter.all().front().actual;
+    EXPECT_NE(text.find(hirKindName(HirKind::BinaryOp)), std::string::npos)
+        << "the arity message must NAME the construct: " << text;
+    EXPECT_EQ(text.find("HirKind ordinal"), std::string::npos)
+        << "no user-facing message may spell a raw kind ordinal: " << text;
+    EXPECT_NE(text.find("#" + std::to_string(bad.v)), std::string::npos)
+        << "the node id must survive — it is the reporter's dedup key: " << text;
+}

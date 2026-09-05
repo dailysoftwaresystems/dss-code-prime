@@ -583,6 +583,15 @@ public:
     MirInstId addGlobalAddr(SymbolId symbol, TypeId type, MirInstFlags flags = MirInstFlags::None);
     // D-CSUBSET-COMPUTED-GOTO: `&&label` — the runtime address of `target` as a
     // value (`type` = a pointer). `target` may be a forward block reference.
+    //
+    // A DEDICATED BUILDER, not `addInst`, for the same reason `addInlineAsm` is
+    // one: the payload is a BLOCK id, every verbatim-copy site RENUMBERS blocks,
+    // and a forwarded id names a different block (or none) in the destination.
+    // `addInst` REFUSES this opcode so a copy site that forgets its re-mapping
+    // arm ABORTS instead of emitting a stale address — the failure mode measured
+    // at D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST was an ACCESS_VIOLATION
+    // at run time, not a diagnostic. The site census lives beside that refusal in
+    // `addInst`; a NEW copy site must be added there.
     MirInstId addBlockAddress(MirBlockId target, TypeId type,
                               MirInstFlags flags = MirInstFlags::None);
     // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: publish `blockAddr`'s
