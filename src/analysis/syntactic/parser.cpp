@@ -339,6 +339,22 @@ struct Parser::Impl {
     // (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED).
     std::size_t speculationDepth = 0;
 
+    // Declared here so `innermostProbe_` can name it; defined below.
+    class SpeculationProbe;
+
+    // The INNERMOST live probe, or null when none is. Maintained strictly
+    // LIFO by the probe's own constructor and destructor (each site resets
+    // its probe BEFORE opening the next candidate, so no two probes of one
+    // site are ever alive at once), and the destructor fatal-aborts if it
+    // ever finds itself somewhere other than the top.
+    //
+    // It exists so a probe can charge its token budget at ITS OWN nesting
+    // level: on destruction a probe hands its net token advance to its
+    // enclosing probe, which subtracts it from its own span. See
+    // `exceededBudget` for why that is what makes the budget a token ceiling
+    // rather than a second, weaker depth ceiling.
+    SpeculationProbe* innermostProbe_ = nullptr;
+
     // ── the speculation-ceiling LATCH ────────────────────────────────
     //
     // Set when a speculative probe is abandoned because one of the
@@ -1492,10 +1508,20 @@ struct Parser::Impl {
             // lookahead-less fallback keeps its historic shape of
             // 4×factor so an alt with no declared lookahead is unchanged
             // at the default.
+            //
+            // ★ IT IS A CONSTANT, AND IT MUST STAY ONE. What varies with
+            // nesting is not the allowance but the CHARGE — see
+            // `exceededBudget`, which subtracts what the probes nested
+            // inside this one consumed. A depth-proportional ALLOWANCE was
+            // tried and ✔MEASURED WRONG in both directions; the record is
+            // in `exceededBudget`.
             , budget_(impl.walker.lookahead() > 0
                           ? static_cast<std::size_t>(impl.walker.lookahead())
                                 * impl.config.speculationBudgetFactor
                           : 4u * impl.config.speculationBudgetFactor)
+            // The enclosing live probe, captured BEFORE the ctor body
+            // publishes this one as the innermost. Null at the outermost.
+            , parent_(impl.innermostProbe_)
             , stepRecoveredBefore_(impl.stepRecovered_)
             // FC4 c1: the forward-progress watchdog tuple is probe state
             // too. Without restoring it, a rolled-back probe leaves
@@ -1516,6 +1542,7 @@ struct Parser::Impl {
             // same discipline as diagsEmitted / stepRecovered_.
             , sketchSnap_(impl.sketch.snapshot()) {
             ++impl_.speculationDepth;
+            impl_.innermostProbe_ = this;
         }
 
         SpeculationProbe(SpeculationProbe const&)            = delete;
@@ -1572,6 +1599,24 @@ struct Parser::Impl {
                 impl_.firstIteration = firstIterationBefore_;
                 impl_.sketch.restore(std::move(sketchSnap_));
             }
+            // Hand this probe's NET token advance to the enclosing probe, so
+            // that probe is charged only for what it consumed at its own
+            // nesting level (see `exceededBudget`). Read AFTER the restore
+            // above: a rolled-back probe has put the stream back at
+            // `probeStartPos_`, so it hands over zero, which is correct —
+            // an abandoned branch's tokens are re-read by whoever parses
+            // them next, and that reader is charged for them.
+            if (impl_.innermostProbe_ != this) {
+                fatal("dss::Parser: a speculation probe was destroyed while "
+                      "it was not the innermost live one — the probe stack "
+                      "is no longer LIFO and the token charge would be "
+                      "attributed to the wrong probe");
+            }
+            impl_.innermostProbe_ = parent_;
+            if (parent_ != nullptr) {
+                parent_->nestedAdvance_ +=
+                    impl_.tokens.position() - probeStartPos_;
+            }
             --impl_.speculationDepth;
         }
 
@@ -1591,8 +1636,83 @@ struct Parser::Impl {
             return impl_.walker.isDesynced() && !desyncedBefore_;
         }
 
+        // ★★★ THE BUDGET IS CHARGED AT THIS PROBE'S OWN NESTING LEVEL — AND
+        // THAT IS WHAT KEEPS IT A TOKEN CEILING INSTEAD OF A SECOND, WEAKER
+        // DEPTH CEILING.
+        //
+        // `speculationBudgetFactor` is documented in every language document
+        // that sets it as "how many tokens ONE speculative probe may
+        // consume". This used to charge a probe for its whole token SPAN,
+        // which includes every token its NESTED probes consumed — so on a
+        // chain of N nested constructs the outermost probe was charged for
+        // the entire chain, and the budget refused the chain long before
+        // `maxSpeculationDepth` was reached. Two ceilings, one axis, and the
+        // one that fired was the one the config block explicitly says must
+        // NOT be the binding one for that shape.
+        //
+        // Each nested probe carries its OWN budget, and how many of them
+        // there may be is `maxSpeculationDepth`'s question, already asked and
+        // answered at `startNextCandidate_`. So the charge is this probe's
+        // span MINUS the net advance of the probes nested inside it
+        // (`nestedAdvance_`, handed over by each child's destructor). Total
+        // speculative work stays bounded — by the two ceilings JOINTLY, one
+        // per axis: budget bounds the tokens at one level, depth bounds the
+        // levels.
+        //
+        // ⚠ TWO DEPTH-PROPORTIONAL ALLOWANCES WERE TRIED FIRST AND BOTH ARE
+        // ✔MEASURED WRONG. Instrument: the real `dsscp` CLI, a scratch config
+        // root with `speculationBudgetFactor` 4 (so the budget is the alt's
+        // lookahead 64 × 4 = 256 tokens) and the depth and expression
+        // ceilings lifted, on `return (int)…x;`.
+        //   * `budget + 3 × speculationDepth` gives the extra allowance to
+        //     the probes that need it LEAST. A D-cast chain's probe at
+        //     nesting index k spans 3(D−k)+1 tokens — DECREASING in k —
+        //     while the term INCREASES in k, and the outermost probe, the
+        //     one that spans everything, is constructed at
+        //     `speculationDepth == 0` and receives nothing. ✔MEASURED: 85
+        //     casts compiled and 86 was refused, byte-identical to the
+        //     unmodified accounting, with the refusal naming budget 256.
+        //     (At 200 casts it named 427 = 256 + 3×57, i.e. the term reached
+        //     only a probe that would have passed anyway.)
+        //   * A flat rise of the factor — or any allowance keyed on
+        //     `maxSpeculationDepth` rather than on actual nesting — buys the
+        //     cast chain by weakening the guard for EVERY shape, including
+        //     the flat one the factor exists for: at the shipped 128 a
+        //     `(int)(x+1+1+…)` of 4000 terms parses and 4100 is refused, and
+        //     a factor of 3073 (the smallest that admits a 65536-cast chain:
+        //     3×65536+1 = 196609 tokens ≤ 64F ⟹ F ≥ 3072.02) would move that
+        //     refusal out past 98000 terms.
+        // Charging at the probe's own level leaves the flat shape's refusal
+        // EXACTLY where it was — that probe has no nested probes, so its
+        // charge is unchanged — and takes the budget off the depth axis
+        // altogether. ✔MEASURED both, see the row.
+        //
+        // ⚠ ALSO NOT A COEFFICIENT PER NESTING LEVEL. "3 tokens per level"
+        // is a fact about C's `( type-name )`, and this file may not know it:
+        // a per-level token constant in the parser is exactly the
+        // language-vocabulary-in-the-engine break the project forbids. The
+        // charge below names no such constant.
+        //
+        // Only ever asked of the INNERMOST live probe (the driver reads
+        // `specStack.back()`), which is what makes `nestedAdvance_` complete
+        // at the moment of the question: every probe opened inside this one
+        // has already been destroyed and handed its advance over. Asking a
+        // probe that still has live children would count their tokens twice,
+        // so the case fatal-aborts rather than answering.
         [[nodiscard]] bool exceededBudget() const noexcept {
-            return impl_.tokens.position() - probeStartPos_ > budget_;
+            if (impl_.innermostProbe_ != this) {
+                fatal("dss::Parser: a speculation probe's token budget was "
+                      "measured while a nested probe was still live — the "
+                      "nested probe's tokens have not been discounted yet "
+                      "and the answer would be wrong");
+            }
+            const std::size_t span = impl_.tokens.position() - probeStartPos_;
+            if (nestedAdvance_ > span) {
+                fatal("dss::Parser: a speculation probe was credited with "
+                      "more nested token advance than it spans — a nested "
+                      "probe reported an advance outside its parent's span");
+            }
+            return span - nestedAdvance_ > budget_;
         }
 
         // The token budget this probe was given, for the fail-loud
@@ -1648,6 +1768,12 @@ struct Parser::Impl {
         std::size_t                            probeStartPos_;
         bool                                   desyncedBefore_;
         std::size_t                            budget_;
+        // The enclosing live probe (null at the outermost), and the net token
+        // advance the probes nested DIRECTLY inside this one contributed.
+        // Together they make the budget a per-LEVEL charge — see
+        // `exceededBudget`.
+        SpeculationProbe*                      parent_;
+        std::size_t                            nestedAdvance_ = 0;
         bool                                   stepRecoveredBefore_;
         SchemaCursor                           lastCursorBefore_;
         std::size_t                            lastTokPosBefore_;

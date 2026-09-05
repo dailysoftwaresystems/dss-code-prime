@@ -402,3 +402,31 @@ dss_add_test(NAME core/test_config_document_parse
              SOURCES test_config_document_parse.cpp)
 target_link_libraries(dss_core_test_config_document_parse
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# P61 lane ck -- the speculative checkpoint stopped costing O(depth).
+# * `test_speculation_trail` unit-tests the undo journal itself, including the
+#   claim a naive implementation gets wrong: a push needs no record, and a
+#   reverse-chronological replay of the SUPERSEDED values is exact.
+# * `test_checkpoint_identity` is the one that protects the compiler -- it
+#   builds each tree twice, plainly and through a rolled-back speculative
+#   excursion, and compares the two finished trees node for node. It went RED
+#   against the pre-trail rendition on two real holes (the pending-children
+#   staging area restored by SIZE, and an in-place `parent` write on a node
+#   older than the checkpoint).
+# * `test_checkpoint_cost` pins the complexity claim on BOTH axes: wall time as
+#   a RATIO ACROSS DEPTHS (allocated bytes measured in-process reports a flat
+#   zero -- the engine is a DLL and Windows has no symbol interposition), and
+#   PEAK RESIDENT SET, read from a CHILD PROCESS so a regression that restored
+#   the O(depth) copy and merely made it fast still reds.
+dss_add_test(NAME core/test_speculation_trail
+             SOURCES test_speculation_trail.cpp)
+dss_add_test(NAME core/test_checkpoint_identity
+             SOURCES test_checkpoint_identity.cpp)
+dss_add_test(NAME core/test_checkpoint_cost
+             SOURCES test_checkpoint_cost.cpp)
+# The memory arm of `test_checkpoint_cost` reads a child process's peak working
+# set. On Windows that is `GetProcessMemoryInfo`; POSIX uses `getrusage`, which
+# needs no extra library.
+if(WIN32)
+    target_link_libraries(dss_core_test_checkpoint_cost PRIVATE psapi)
+endif()

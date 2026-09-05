@@ -22,7 +22,8 @@
 #include "ffi/ingest.hpp"
 #include "ffi/mangling/c_mangle.hpp"  // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: applyCMangling
 #include "ffi/shipped_lib_descriptor.hpp"  // c162: collectShippedExternSymbolNames
-#include "core/types/symbol_attrs.hpp"  // isExternallyVisible (armap export filter, c163)
+#include "core/types/symbol_attrs.hpp"  // isExternallyVisible (dynamic-export questions)
+#include "link/format/object_symbol_names.hpp"  // hasExternalLinkage -- the ONE static-resolution predicate (armap + static pull)
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "link/format/ar.hpp"  // writeArArchive (D-LK-STATIC-ARCHIVE-WRITER, c163)
@@ -3007,9 +3008,24 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
 
     // Names already satisfied by a DEFINITION (every client module, then each
     // pulled member). A worklist name that is already defined is never pulled
-    // again. Only externally-visible definitions can satisfy a cross-module
-    // reference (the same filter the c163 armap writer applies), so Local defs
-    // are excluded.
+    // again. Only EXTERNAL-LINKAGE definitions can satisfy a cross-module
+    // reference (`hasExternalLinkage`, the same filter the c163 armap writer
+    // applies), so Local defs are excluded.
+    //
+    // ⚠ THIS PREDICATE AND THE ARMAP WRITER'S MUST MOVE TOGETHER, and the
+    // reason is not symmetry for its own sake —
+    // D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL. Both were
+    // `isExternallyVisible`, which folds VISIBILITY into a question about
+    // LINKAGE and so calls a `visibility("hidden")` non-static definition
+    // false. Fixing only the WRITER would have created a defect that did not
+    // exist before: a DSS-written archive would then index `vis_hidden`, so a
+    // client module that ALREADY defines `vis_hidden` would no longer suppress
+    // the pull (its own definition never entering `definedNames`) and the link
+    // would merge two definitions of one symbol. ✔MEASURED against gcc 13.3.0
+    // + binutils 2.42 and clang 18.1.3: a hidden definition inside an archive
+    // member DOES satisfy a cross-module reference (`gcc use.o libhid.a` links
+    // rc 0 and runs), which is the whole reason the writer indexes it — so the
+    // resolver must agree that it is satisfied.
     // ⚠ EVERY module in `clientModules`, not merely the compiled one -- see the
     // header's plural note
     // (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION). A
@@ -3019,8 +3035,7 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     std::unordered_set<std::string> definedNames;
     for (auto const& clientModule : clientModules) {
         for (auto const& ms : clientModule.symbols) {
-            if (!ms.name.empty()
-                && isExternallyVisible(ms.binding, ms.visibility)) {
+            if (link::format::ObjectSymbolNames::hasExternalLinkage(ms)) {
                 definedNames.insert(ms.name);
             }
         }
@@ -3073,11 +3088,17 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
                                     archivePaths[ai], member.name, reporter);
         if (!member_mod) return std::nullopt;   // member-read fail-loud
 
-        // A pulled member's externally-visible definitions satisfy later
-        // worklist names; its OWN unresolved externs feed the next pass -- the
-        // transitive lazy-pull (a member referencing another member).
+        // A pulled member's EXTERNAL-LINKAGE definitions satisfy later worklist
+        // names; its OWN unresolved externs feed the next pass -- the
+        // transitive lazy-pull (a member referencing another member). Same
+        // predicate as the client scan above and as the armap writer, for the
+        // reason stated there
+        // (D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL): a member that
+        // defines a hidden non-static function HAS satisfied that name, and a
+        // resolver that disagreed with the index it just searched would pull a
+        // second member defining the same symbol.
         for (auto const& ms : member_mod->symbols) {
-            if (!ms.name.empty() && isExternallyVisible(ms.binding, ms.visibility)) {
+            if (link::format::ObjectSymbolNames::hasExternalLinkage(ms)) {
                 definedNames.insert(ms.name);
             }
         }
@@ -3475,9 +3496,35 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
     }
 
     // Link each module INDEPENDENTLY to its own `.o` bytes (a 1-element link,
-    // never the cross-CU merge) + collect its DEFINED externally-visible
-    // symbols for the armap (the same on-binary names the object writer put in
-    // the member's symbol table).
+    // never the cross-CU merge) + collect its DEFINED EXTERNAL-LINKAGE symbols
+    // for the armap (the same on-binary names the object writer put in the
+    // member's symbol table).
+    //
+    // ★★ THE FILTER MUST BE THE SAME ONE THE MEMBER OBJECT'S `.symtab` USED,
+    // AND FOR A WHILE IT WAS NOT — D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL.
+    // The member `.o` names its defined symbols through
+    // `ObjectSymbolNames::definedName`, gated by `hasExternalLinkage`; this
+    // index used `isExternallyVisible`, which additionally folds VISIBILITY in
+    // and therefore answers false for a `visibility("hidden")` non-static
+    // definition. The two disagreeing produces an archive that CONTRADICTS
+    // ITSELF: the member defines `vis_hidden` under its real name with
+    // STB_GLOBAL, and the index the foreign linker actually searches omits it,
+    // so `ld` reports "undefined reference to vis_hidden" for exactly the
+    // symbol the object provides. An armap is a STATIC-LINK resolution index,
+    // which is the `hasExternalLinkage` question; `isExternallyVisible` asks
+    // about DYNAMIC visibility and stays where that is what is being asked.
+    //
+    // ✔MEASURED 2026-09-05, each reference probed SEPARATELY, with CONTROLS in
+    // the SAME member object (a `static`, which must be ABSENT, and a plain
+    // extern-linkage function, which must be PRESENT — without them "hidden is
+    // indexed" is equally consistent with "this `ar` indexes everything"):
+    // gcc 13.3.0 + GNU ar/nm 2.42 at -O0 and -O2, and clang 18.1.3, ALL put
+    // `vis_hidden`, `vis_internal` AND `vis_protected` in the `.a`'s "/" armap
+    // while omitting the `static`; `gcc use.o libhid.a -o prog` then resolves
+    // `vis_hidden` from the archive, links rc 0 and RUNS to 42, whereas the
+    // CONTROL link that asks for the `static` name fails "undefined reference
+    // to `static_local'". So the reference behaviour is the widened set, on
+    // both toolchains, with the boundary held at Local.
     std::vector<link::format::ArMemberInput> members;
     members.reserve(modules.size());
     for (std::size_t i = 0; i < modules.size(); ++i) {
@@ -3493,7 +3540,7 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
         }
         std::vector<std::string> exported;
         for (ModuleSymbol const& ms : modules[i].symbols) {
-            if (isExternallyVisible(ms.binding, ms.visibility) && !ms.name.empty()) {
+            if (link::format::ObjectSymbolNames::hasExternalLinkage(ms)) {
                 exported.push_back(ms.name);
             }
         }

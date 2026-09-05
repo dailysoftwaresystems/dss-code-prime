@@ -1819,12 +1819,17 @@ struct DSS_EXPORT ObjectFormatData {
     // Declared by every format whose walker arm CONSULTS it, and by no other:
     // the pe object + staticlib documents (the COFF `.obj` writer), all ten ELF
     // documents (`elf::encode`, whose alias pass reaches `stbForBinding` on
-    // every flavor), and the four Mach-O OBJECT/staticlib documents
-    // (`macho::encode`'s MH_OBJECT arm). The Mach-O IMAGE documents, the pe
-    // IMAGE documents, wasm and spirv declare NOTHING, because their walkers
-    // encode no weak definition — a key nobody reads drifts silently while
-    // reading as authoritative, which is worse than no key at all
+    // every flavor), and all EIGHT Mach-O documents (`macho::encode` asks once
+    // above its filetype dispatch, so the MH_OBJECT, MH_EXECUTE and MH_DYLIB
+    // arms all reach it). The pe IMAGE documents, wasm and spirv declare
+    // NOTHING, because their walkers encode no weak definition — a key nobody
+    // reads drifts silently while reading as authoritative, which is worse than
+    // no key at all
     // ([[D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS]]).
+    // ⓘ The four Mach-O IMAGE documents were in the second list until
+    // [[D-LK3-DYLIB-WEAK-EXPORT]] closed, because their walker refused a weak
+    // definition rather than state part of what an image needs; it states all
+    // of it now, so they moved to the first.
     std::optional<WeakDefinition> weakDefinition;
 
     // ── D-LK2-RODATA closure: producer-data-section capability set ──

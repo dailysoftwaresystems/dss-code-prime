@@ -107,10 +107,30 @@ struct ShippedSchemas {
     return loadedOnce;
 }
 
+// ★ THE PROBE-ONLY SPECULATION BUDGET. Every env-gated PROBE in this file passes
+// this factor to `lowerC`; every PIN passes nothing and gets the SHIPPED one.
+// The shipped budget refuses a few-thousand-element comma chain LOUD
+// (`P_SpeculationBudgetExhausted`) before the MIR tier ever runs, and a probe
+// that stops at a stage BEFORE the one under test reports green for the wrong
+// reason. 1<<20 is far past any depth walked here, so what ends a probe is the
+// site being measured.
+constexpr std::size_t kProbeBudgetFactor = std::size_t{1} << 20;
+
 // ⚠ A THROW, NEVER `std::abort()` — an abort kills the process and every sibling
 // here loses its verdict, which is the exact signature these tests exist to tell
 // APART from a stack overflow. `no_abort_in_tests_guard` enforces the same rule.
-[[nodiscard]] Lowered lowerC(std::string src, std::size_t exprDepthCap) {
+// `budgetFactorOverride` is ZERO for every PIN in this file: a pin must be
+// parsed with the parser `dsscp` ships, which is the whole subject of
+// D-TEST-DEEP-NESTING-FIXTURE-PARSED-WITH-A-STRICTER-PARSER-THAN-THE-SHIPPED-ONE.
+// The env-gated PROBES below pass a larger factor deliberately, and only because
+// the property they measure sits BELOW the parser: past a few thousand comma
+// elements the shipped `parser.speculationBudgetFactor` refuses the input LOUD
+// (`P_SpeculationBudgetExhausted`), so the MIR tier never runs and a green would
+// mean "the thing never executed" — the instrument defect this whole class keeps
+// paying for. Raising the factor makes the parser LOOSER, never stricter, so it
+// can only expose a MIR-tier ceiling, never hide one.
+[[nodiscard]] Lowered lowerC(std::string src, std::size_t exprDepthCap,
+                             std::size_t budgetFactorOverride = 0) {
     std::shared_ptr<GrammarSchema const> schema = shipped().schema;
     std::shared_ptr<TargetSchema const>  target = shipped().target;
 
@@ -139,6 +159,7 @@ struct ShippedSchemas {
     ParserConfig pcfg;
     if (auto cap = schema->maxSpeculationDepth())     pcfg.maxSpeculationDepth = *cap;
     if (auto f   = schema->speculationBudgetFactor()) pcfg.speculationBudgetFactor = *f;
+    if (budgetFactorOverride != 0) pcfg.speculationBudgetFactor = budgetFactorOverride;
     pcfg.maxExpressionDepth = exprDepthCap;
     Parser p{srcBuf, schema, std::move(stream), DiagnosticBudget::libraryDefault(),
              std::move(pcfg), std::move(lexDiags)};
@@ -888,10 +909,295 @@ TEST(HirToMirSeqExprProbe, WalksTheConfiguredCommaChainLength) {
     src += "; return x; }";
     std::fprintf(stdout, "PROBE-MARK BEGIN comma=%d\n", n);
     std::fflush(stdout);
-    auto L = lowerC(std::move(src), /*exprDepthCap=*/static_cast<std::size_t>(n) + 4096);
+    auto L = lowerC(std::move(src), /*exprDepthCap=*/static_cast<std::size_t>(n) + 4096,
+                    /*budgetFactorOverride=*/kProbeBudgetFactor);
     std::fprintf(stdout, "PROBE-MARK MIR funcs=%u\n",
                  static_cast<unsigned>(L.mir.mir.funcCount()));
     std::fflush(stdout);
+}
+
+// ── THE SIBLING AXES THIS ROW LEFT UNMEASURED ───────────────────────────────
+//
+// Each is idle unless its variable is set, so the ordinary gate is unaffected,
+// and each names its AXIS: what a real corpus would have to contain to reach it.
+//
+// ⚠ A PROBE IS ONLY A MEASUREMENT IF THE CONSTRUCT REACHES THE SITE. This row
+// has recorded a wrong ceiling twice for exactly that reason — a left-deep
+// `argc+argc+…` spine that never reached the re-entry it was aimed at, and a
+// cast chain refused by a parser cap before the recursion ran. Every shape here
+// was checked against `request`'s flatten set before being written: `*&` reaches
+// the AddressOf/Deref rewrite, `__builtin_popcount(…)` reaches the DELEGATED
+// `BuiltinCall` arm (no `request` case claims it), an aggregate comma reaches
+// the by-ADDRESS `SeqExpr` arm, and a long statement list reaches the `Block`
+// frame's child cursor.
+
+TEST(HirToMirStarAmpProbe, WalksTheConfiguredStarAmpChainLength) {
+    char const* const e = std::getenv("DSS_MIR_PROBE_STARAMP");
+    if (e == nullptr || *e == '\0') {
+        GTEST_SKIP() << "DSS_MIR_PROBE_STARAMP unset — probe idle";
+    }
+    int const n = std::atoi(e);
+    (void)shipped();
+    // AXIS: chain LENGTH through the AddressOf/Deref request rewrite.
+    std::string src = "int x; int *p = &x;\nint main(void){ int *r = ";
+    for (int i = 0; i < n; ++i) src += "*&";
+    src += "p;\nreturn *r; }";
+    std::fprintf(stdout, "PROBE-MARK BEGIN staramp=%d\n", n);
+    std::fflush(stdout);
+    auto L = lowerC(std::move(src), /*exprDepthCap=*/static_cast<std::size_t>(n) * 4 + 4096,
+                    /*budgetFactorOverride=*/kProbeBudgetFactor);
+    std::fprintf(stdout, "PROBE-MARK MIR funcs=%u\n",
+                 static_cast<unsigned>(L.mir.mir.funcCount()));
+    std::fflush(stdout);
+}
+
+TEST(HirToMirBuiltinProbe, WalksTheConfiguredBuiltinNestDepth) {
+    char const* const e = std::getenv("DSS_MIR_PROBE_BUILTIN");
+    if (e == nullptr || *e == '\0') {
+        GTEST_SKIP() << "DSS_MIR_PROBE_BUILTIN unset — probe idle";
+    }
+    int const n = std::atoi(e);
+    (void)shipped();
+    // AXIS: BuiltinCall NESTING — the `lowerExprNode` arm no `request` case
+    // claims, so every level costs a fresh driver. `v` is a parameter, so the
+    // chain is not constant-folded.
+    std::string src = "int main(int argc, char **argv){ unsigned v = (unsigned)argc; (void)argv; return ";
+    for (int i = 0; i < n; ++i) src += "__builtin_popcount(";
+    src += "v";
+    for (int i = 0; i < n; ++i) src += ")";
+    src += "; }";
+    std::fprintf(stdout, "PROBE-MARK BEGIN builtin=%d\n", n);
+    std::fflush(stdout);
+    auto L = lowerC(std::move(src), /*exprDepthCap=*/static_cast<std::size_t>(n) * 2 + 4096,
+                    /*budgetFactorOverride=*/kProbeBudgetFactor);
+    std::fprintf(stdout, "PROBE-MARK MIR funcs=%u\n",
+                 static_cast<unsigned>(L.mir.mir.funcCount()));
+    std::fflush(stdout);
+}
+
+TEST(HirToMirStmtListProbe, WalksTheConfiguredStatementListLength) {
+    char const* const e = std::getenv("DSS_MIR_PROBE_STMTLIST");
+    if (e == nullptr || *e == '\0') {
+        GTEST_SKIP() << "DSS_MIR_PROBE_STMTLIST unset — probe idle";
+    }
+    int const n = std::atoi(e);
+    (void)shipped();
+    // AXIS: LIST LENGTH inside ONE block — sqlite's own shape (357 statements in
+    // a single block in `sqlite3.c`). The CONTROL for the comma probe: the same
+    // N assignments, written as siblings instead of as a comma chain.
+    std::string src = "int main(void){ int x = 0; ";
+    for (int i = 1; i <= n; ++i) src += "x = " + std::to_string(i) + "; ";
+    src += "return x; }";
+    std::fprintf(stdout, "PROBE-MARK BEGIN stmtlist=%d\n", n);
+    std::fflush(stdout);
+    auto L = lowerC(std::move(src), /*exprDepthCap=*/static_cast<std::size_t>(n) + 4096,
+                    /*budgetFactorOverride=*/kProbeBudgetFactor);
+    std::fprintf(stdout, "PROBE-MARK MIR funcs=%u\n",
+                 static_cast<unsigned>(L.mir.mir.funcCount()));
+    std::fflush(stdout);
+}
+
+TEST(HirToMirAggregateSeqProbe, WalksTheConfiguredAggregateCommaChainLength) {
+    char const* const e = std::getenv("DSS_MIR_PROBE_AGGCOMMA");
+    if (e == nullptr || *e == '\0') {
+        GTEST_SKIP() << "DSS_MIR_PROBE_AGGCOMMA unset — probe idle";
+    }
+    int const n = std::atoi(e);
+    (void)shipped();
+    // AXIS: LIST LENGTH through the BY-ADDRESS `SeqExpr` arm. An aggregate-typed
+    // comma has no SSA rvalue, so both the discarded left spine and the result
+    // tail resolve through `lowerLvalueAddress` — a different arm from the scalar
+    // comma above, and a separate defect if only one of the two is flattened.
+    std::string src = "struct S { int a; };\nint main(void){ struct S s = {1}; struct S r = (";
+    for (int i = 0; i < n; ++i) src += "s, ";
+    src += "s); return r.a; }";
+    std::fprintf(stdout, "PROBE-MARK BEGIN aggcomma=%d\n", n);
+    std::fflush(stdout);
+    auto L = lowerC(std::move(src), /*exprDepthCap=*/static_cast<std::size_t>(n) + 4096,
+                    /*budgetFactorOverride=*/kProbeBudgetFactor);
+    std::fprintf(stdout, "PROBE-MARK MIR funcs=%u\n",
+                 static_cast<unsigned>(L.mir.mir.funcCount()));
+    std::fflush(stdout);
+}
+
+// ── D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED ─
+//                       the MIR tier's `SeqExpr` cluster (P61)
+//
+// ★★★ THE AXIS IS LIST LENGTH, WHICH IS THE ONE A REAL CORPUS REACHES. sqlite's
+// amalgamation nests SHALLOWLY (paren 18, brace 13, struct-in-struct 4) and
+// LISTS LONG (1765 initializer elements in one brace of `fts5.c`, 357 statements
+// in one block of `sqlite3.c`). `a, b, c` nests LEFT — cst_to_hir's
+// `combineComma` builds `SeqExpr([ExprStmt(lhs)], rhs)` — so a comma chain's
+// depth IS its length.
+//
+// ✔MEASURED BEFORE, on the ordinary ~1 MiB gtest main thread through `ctest`:
+// **320 rc 0 / 340 stack death**, and ✔ATTRIBUTED WITH gdb rather than by
+// bisecting a compile: 2389 frames deep at the SIGSEGV, closing a SEVEN-frame
+// cycle per comma element — `lowerDiscardedExpr` → `lowerOneDiscardedExpr` →
+// `lowerExpr` → `runExprDriver` → `lowerStmt` → `enterStmt` → `lowerStmtNode` —
+// at ~866 B per frame (CFA deltas between frames 200 and 400) ≈ 6.1 KiB per
+// element. Three drivers, each iterative on its own, calling one another in a
+// ring: an alternating cycle flattens ONLY when every edge is on one stack.
+//
+// ✔MEASURED AFTER: the same shape reaches 8000 elements, and what ends it there
+// is not a stack death but the parser's own LOUD `P_SpeculationBudgetExhausted`.
+//
+// ★★ AND THESE PINS ASSERT **ORDER**, NOT MERELY SURVIVAL. A comma chain's whole
+// meaning is the sequence its side effects run in; a work-stack rewrite that
+// drained the statements out of order, dropped one or ran one twice would still
+// lower, still verify and still emit — silently differently. Each element here
+// stores a DISTINCT constant, and the pin reads the stored constants back in
+// emission order and demands 1, 2, 3, … N.
+//
+// ★ ON A 256 KiB BOUNDED STACK (`tests/core/bounded_stack.hpp`), the P60 rule:
+// the pre-P61 lowering needed ~6.1 KiB per element under mingw-w64 g++ Debug and
+// several times that under MSVC, so 2000 elements wanted ~12 MiB against 256 KiB.
+// Restore the recursion and the process dies — under the gate's own toolchain,
+// whatever its frames weigh.
+//
+// ⚠ The parser config is the SHIPPED one (no `budgetFactorOverride`), which is
+// what D-TEST-DEEP-NESTING-FIXTURE-PARSED-WITH-A-STRICTER-PARSER-THAN-THE-SHIPPED-ONE
+// asks of a PIN; the depths below are chosen to sit inside it.
+
+namespace {
+
+// Walk every block of every function in emission order and collect the integer
+// constant each `Store` writes. That sequence IS the evaluation order of the
+// assignments, which is the property a flattening can break without failing.
+[[nodiscard]] std::vector<std::int64_t> storedConstantsInOrder(Mir const& m) {
+    std::vector<std::int64_t> out;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const bb = m.funcBlockAt(f, bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(bb); ++ii) {
+                MirInstId const id = m.blockInstAt(bb, ii);
+                if (m.instOpcode(id) != MirOpcode::Store) continue;
+                auto ops = m.instOperands(id);
+                if (ops.empty()) continue;
+                if (m.instOpcode(ops[0]) != MirOpcode::Const) continue;
+                auto const& lit = m.literalValue(m.constLiteralIndex(ops[0]));
+                if (auto const* iv = std::get_if<std::int64_t>(&lit.value)) {
+                    out.push_back(*iv);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] std::size_t opCountIn(Mir const& m, MirOpcode want) {
+    std::size_t n = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const bb = m.funcBlockAt(f, bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(bb); ++ii) {
+                if (m.instOpcode(m.blockInstAt(bb, ii)) == want) ++n;
+            }
+        }
+    }
+    return n;
+}
+
+} // namespace
+
+TEST(HirToMirSeqExpr, LongCommaChainLowersInOrderOnABoundedStack) {
+    constexpr int kDepth = 2000;   // 6x the MEASURED pre-fix wall (320 rc 0 / 340 death)
+    (void)shipped();
+    // `x = 0; x = 1, x = 2, …, x = kDepth;` — every element stores a DISTINCT
+    // constant, and `x` is a runtime variable so nothing folds.
+    std::string src = "int main(void){ int x = 0; ";
+    for (int i = 1; i <= kDepth; ++i) {
+        if (i > 1) src += ", ";
+        src += "x = " + std::to_string(i);
+    }
+    src += "; return x; }";
+
+    std::vector<std::int64_t> stored;
+    std::size_t funcs = 0;
+    test::runOnBoundedStack([&] {
+        auto L = lowerC(std::move(src), /*exprDepthCap=*/kDepth + 4096);
+        funcs  = L.mir.mir.moduleFuncCount();
+        stored = storedConstantsInOrder(L.mir.mir);
+    });
+
+    ASSERT_GT(funcs, 0u);
+    // The declarator's own `x = 0` store comes first, then one per comma element.
+    ASSERT_EQ(stored.size(), static_cast<std::size_t>(kDepth) + 1u)
+        << "one Store per assignment — a different count means the comma chain "
+           "dropped or duplicated an element";
+    for (std::size_t i = 0; i < stored.size(); ++i) {
+        ASSERT_EQ(stored[i], static_cast<std::int64_t>(i))
+            << "the comma chain's side effects must be emitted in SOURCE order; "
+               "element " << i << " is out of place, which is a silent miscompile "
+               "rather than a crash";
+    }
+}
+
+TEST(HirToMirSeqExpr, AggregateCommaChainLowersInOrderOnABoundedStack) {
+    constexpr int kDepth = 1000;   // 5x the MEASURED pre-fix wall (200 rc 0 / 300 death)
+    (void)shipped();
+    // Each element is `(x = k, gs)` — a comma whose VALUE is an aggregate, so the
+    // enclosing chain is aggregate-typed and both its discarded left spine and its
+    // result tail resolve BY ADDRESS (`lowerLvalueAddress`), a different arm from
+    // the scalar chain above. The embedded scalar assignment is what makes the
+    // ORDER observable at the MIR level.
+    std::string src = "struct S { int a; };\nstruct S gs = {9};\nint x;\n"
+                      "int main(void){ struct S r = (";
+    for (int i = 1; i <= kDepth; ++i) {
+        if (i > 1) src += ", ";
+        src += "(x = " + std::to_string(i) + ", gs)";
+    }
+    src += "); return r.a + x; }";
+
+    std::vector<std::int64_t> stored;
+    std::size_t funcs = 0;
+    test::runOnBoundedStack([&] {
+        auto L = lowerC(std::move(src), /*exprDepthCap=*/kDepth + 4096);
+        funcs  = L.mir.mir.moduleFuncCount();
+        stored = storedConstantsInOrder(L.mir.mir);
+    });
+
+    ASSERT_GT(funcs, 0u);
+    ASSERT_EQ(stored.size(), static_cast<std::size_t>(kDepth))
+        << "one Store per `x = k` — the aggregate spine must run every element's "
+           "side effects exactly once";
+    for (std::size_t i = 0; i < stored.size(); ++i) {
+        ASSERT_EQ(stored[i], static_cast<std::int64_t>(i) + 1)
+            << "the BY-ADDRESS comma arm must run its side effects in SOURCE "
+               "order too — flattening only the scalar arm is a partial fix that "
+               "reads as a complete one";
+    }
+}
+
+TEST(HirToMirBuiltinCall, DeepBuiltinNestCostsHeapNotCallFrames) {
+    constexpr int kDepth = 2000;   // 10x the MEASURED pre-fix wall (200 rc 0 / 400 death)
+    (void)shipped();
+    // AXIS: BuiltinCall NESTING. Until P61 no `request` case claimed `BuiltinCall`,
+    // so every level delegated to `lowerExprNode` and opened a FRESH driver —
+    // three host frames per level. gcc 13.3.0 compiles this shape to at least
+    // 16384 levels, so the depth is the references' to set, not ours.
+    std::string src = "int main(int argc, char **argv){ unsigned v = (unsigned)argc; "
+                      "(void)argv; return ";
+    for (int i = 0; i < kDepth; ++i) src += "__builtin_popcount(";
+    src += "v";
+    for (int i = 0; i < kDepth; ++i) src += ")";
+    src += "; }";
+
+    std::size_t funcs = 0;
+    std::size_t popcounts = 0;
+    test::runOnBoundedStack([&] {
+        auto L = lowerC(std::move(src), /*exprDepthCap=*/kDepth * 2 + 4096);
+        funcs     = L.mir.mir.moduleFuncCount();
+        popcounts = opCountIn(L.mir.mir, MirOpcode::Popcount);
+    });
+
+    ASSERT_GT(funcs, 0u);
+    // SHAPE, not just survival: exactly one Popcount per source level. A pump
+    // that lost or repeated an argument would show up here, not as a crash.
+    EXPECT_EQ(popcounts, static_cast<std::size_t>(kDepth))
+        << "every nesting level must emit exactly one Popcount";
 }
 
 TEST(HirToMirAtomicAlign, DeepPackedChainStaysUnderAlignedPastTheOldDepthCap) {

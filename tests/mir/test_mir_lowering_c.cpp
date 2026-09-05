@@ -16135,3 +16135,132 @@ TEST(MirLoweringC, GlobalInitHighByteCharConstantTakesItsSignFromTheTarget) {
                "so it is here to prove the value is READ from the declaration";
     }
 }
+
+namespace {
+
+// Every `Call` inside the MIR function whose HIR symbol is named `fnName`,
+// rendered as the NAME of the callee its operand 0 resolves to (empty when the
+// callee is not a direct `GlobalAddr`). Operand 0 is the callee for EVERY Call
+// shape — `callSetup` pushes it before the optional sret pointer and before any
+// argument — so this reads the call graph of one function body in emission
+// order. Used by the call-once pin below.
+[[nodiscard]] std::vector<std::string>
+directCalleeNamesIn(Lowered const& L, std::string_view fnName) {
+    Mir const& m = L.mir.mir;
+    std::vector<std::string> out;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        auto const* frec = L.model.recordFor(SymbolId{m.funcSymbol(f).v});
+        if (frec == nullptr || frec->name != fnName) continue;
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                if (m.instOpcode(id) != MirOpcode::Call) continue;
+                auto const ops = m.instOperands(id);
+                std::string name;
+                if (!ops.empty()
+                    && m.instOpcode(ops[0]) == MirOpcode::GlobalAddr) {
+                    auto const* crec =
+                        L.model.recordFor(m.globalAddrSymbol(ops[0]));
+                    if (crec != nullptr) name = crec->name;
+                }
+                out.push_back(std::move(name));
+            }
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] std::size_t countCalls(std::vector<std::string> const& v,
+                                     std::string_view n) {
+    return static_cast<std::size_t>(std::count(v.begin(), v.end(), n));
+}
+
+} // namespace
+
+// ★★★ AN ARGUMENT EXPRESSION IS EVALUATED EXACTLY ONCE — C 6.5.2.2p10 — AND A
+// BY-VALUE AGGREGATE ARGUMENT IS NOT AN EXCEPTION.
+// D-MIR-CALLCTX-REFERENCE-HELD-ACROSS-A-NESTED-LOWERING-DUPLICATES-THE-ARGUMENT
+//
+// `op(mk())` where `mk` returns a by-value-class struct routes the argument
+// through `processOneCallArg` → `emitByValueStructCallArg` → `appendByValueArg`,
+// which calls `lowerLvalueAddress(argNode)` FIRST and pushes the resulting
+// operands AFTER. When the argument is itself an aggregate-returning CALL, that
+// lowering re-enters the expression driver and pushes onto `callCtxs`. While
+// `callCtxs` was a driver LOCAL the nested lowering got a FRESH vector; once it
+// became a MEMBER of the shared driver, the push could REALLOCATE it, and the
+// `CallLowerCtx&` / `ctx.operands` reference the helpers held across that
+// lowering dangled — `++ctx.argIdx` landed in the freed object, the LIVE
+// `argIdx` never advanced, `pumpCallArgs`' `StructDone → continue` re-entered on
+// the SAME argument, and `mk()` was EMITTED TWICE. Nothing refused; the program
+// compiled, linked and ran, and its only symptom was running a side effect one
+// time too many. ✔MEASURED end to end through `dsscp` at that state: this exact
+// program exited **5** where gcc 13.3.0 (`-std=c2x -O0`, the control) exited
+// **4**.
+//
+// ⚠ WHY THE EXISTING CORPUS CANNOT SEE THIS, stated because it is the reason the
+// defect shipped green through 2070 entries: the by-value-struct-argument shapes
+// the corpus already carries (`examples/c/c_int128_float_conv`'s `op(mk(3u,0u))`
+// among them) pass PURE launderers, so evaluating the argument twice produces
+// the identical value and the identical exit code. Only an argument with an
+// OBSERVABLE SIDE EFFECT discriminates. This pin therefore asserts the emitted
+// CALL COUNT rather than a value: `mk` appears in `main` exactly once.
+//
+// RED-ON-DISABLE: restore the pre-fix shape — `emitByValueStructCallArg` taking
+// `CallLowerCtx&` and `processOneCallArg` binding one across the materialization
+// — and the struct arm reads 2 calls to `mk`. The SCALAR arm is the CONTROL: it
+// reaches the same call frame through `ScalarPending`, never enters the by-value
+// synthesis at all, and stays at one call each in both directions, so "the
+// struct arm went red" cannot be confused with "the fixture broke".
+TEST(MirLoweringC, ByValueStructArgumentCallIsLoweredExactlyOnce) {
+    {
+        // THE SUBJECT: the by-value aggregate argument is itself a call.
+        auto L = lowerC(
+            "struct U128 { unsigned long long lo; unsigned long long hi; };\n"
+            "int counter = 0;\n"
+            "struct U128 mk(void) { counter += 1; struct U128 r; r.lo = 1;\n"
+            "                       r.hi = 2; return r; }\n"
+            "unsigned long long op(struct U128 v) { return v.lo + v.hi; }\n"
+            "int main(void) {\n"
+            "    return (int)(op(mk()) + (unsigned long long)counter);\n"
+            "}\n");
+        ASSERT_FALSE(L.model.hasErrors());
+        ASSERT_TRUE(L.hir->ok);
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        auto const calls = directCalleeNamesIn(L, "main");
+        EXPECT_EQ(countCalls(calls, "mk"), 1u)
+            // ⚠ The anchor id sits on ONE source line. Split across two string
+            // literals it still CONCATENATES at runtime, but every grep and the
+            // registry guard see two ids — one of them invented. That is
+            // D-ANCHOR-ID-WRAPPED-ACROSS-A-LINE-BREAK-IS-INVISIBLE-TO-EVERY-GREP,
+            // and this line carried an instance of it until the guard said so.
+            << "C 6.5.2.2p10: `op(mk())` evaluates `mk()` ONCE. Two emitted "
+               "Calls means the by-value argument path lowered the argument "
+               "expression twice — a duplicated side effect with no diagnostic: "
+               "D-MIR-CALLCTX-REFERENCE-HELD-ACROSS-A-NESTED-LOWERING-DUPLICATES-THE-ARGUMENT";
+        EXPECT_EQ(countCalls(calls, "op"), 1u)
+            << "the OUTER call must also be emitted exactly once";
+        EXPECT_EQ(calls.size(), 2u)
+            << "`main` calls exactly `mk` then `op` and nothing else";
+    }
+    {
+        // THE CONTROL: identical nesting, SCALAR argument. This never enters
+        // `emitByValueStructCallArg`, so it is green with and without the fix —
+        // which is what makes the arm above attributable.
+        auto L = lowerC(
+            "int counter = 0;\n"
+            "int mki(void) { counter += 1; return 3; }\n"
+            "int opi(int v) { return v + 1; }\n"
+            "int main(void) { return opi(mki()) + counter; }\n");
+        ASSERT_FALSE(L.model.hasErrors());
+        ASSERT_TRUE(L.hir->ok);
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        auto const calls = directCalleeNamesIn(L, "main");
+        EXPECT_EQ(countCalls(calls, "mki"), 1u) << "CONTROL: scalar arg, once";
+        EXPECT_EQ(countCalls(calls, "opi"), 1u) << "CONTROL: outer call, once";
+        EXPECT_EQ(calls.size(), 2u) << "CONTROL: exactly two calls in `main`";
+    }
+}

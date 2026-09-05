@@ -542,3 +542,38 @@ dss_add_test(NAME link/test_macho_image_symtab_bands
 # offsets — over modules whose raw span end is deliberately NOT aligned.
 dss_add_test(NAME link/test_macho_object_trailer_alignment
              SOURCES test_macho_object_trailer_alignment.cpp)
+
+# D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL +
+# D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL: the ELF `.symtab`'s TWO
+# linkage axes, pinned together because ONE shared decision produces both.
+# Both IMAGE `.symtab` builders stamped STB_GLOBAL on EVERY defined function,
+# so a `static` reached the image under its real name with a linkage that
+# misdescribes it and `.symtab.sh_info` never moved off 2; and the shared
+# `ObjectSymbolNames` predicate answered a LINKAGE question with
+# `isExternallyVisible` (a question about other IMAGES), so a called
+# `visibility("hidden")` function came out STB_LOCAL on every writer and lost
+# its NAME at the ET_REL tier as well. ✔MEASURED 2026-09-05 (Ubuntu 24.04,
+# binutils 2.42 / llvm 18), each reference probed separately with CONTROLS in
+# the same artifact: gcc 13.3.0 and clang 18.1.3 emit a `static` `FUNC LOCAL
+# DEFAULT` inside the prefix `sh_info` names and a called hidden function
+# `FUNC GLOBAL HIDDEN` past it, in a linked exec on x86_64 and aarch64 at -O0
+# and -O2 and in a `.o`, while the ordinary extern-linkage CONTROLS of the same
+# artifact stay `FUNC GLOBAL DEFAULT`. Pins, over both ports x all three image
+# arms (static ET_EXEC, dynamic exec, ET_DYN shared object) plus the ET_REL
+# tier of the same module, each arm DECLARING its `sh_info` and whether it
+# carries or exports a `.dynsym` so a cell cannot silently stop covering the
+# builder it names: the exact `.symtab` sequence of names, st_info AND
+# st_other; the locals-first order, with a LOCAL CANONICAL CARRYING A GLOBAL
+# ALIAS as the only row that can tell an interleaved alias emission from a
+# banded one; the published `sh_info` against the arm's own absolute; and the
+# `.dynsym` export set still refusing both the `static` and the hidden symbol.
+# Plus the `-staticlib` ARCHIVE INDEX, a SECOND statement about the same
+# definitions that was built from the OTHER predicate (an armap omitting a name
+# its own member defines makes a foreign `ld` report "undefined reference" for a
+# symbol the archive contains); and the same shapes through the REAL pipeline
+# over two corpus sources that are themselves RUN witnesses on the linux legs
+# (`examples/c/macho_static_fn_image` and
+# `examples/c/gnu_attribute_linkage_positions_crosscu`), so the run and the
+# structural pin describe ONE artifact.
+dss_add_test(NAME link/test_elf_image_symtab_partition
+             SOURCES test_elf_image_symtab_partition.cpp)

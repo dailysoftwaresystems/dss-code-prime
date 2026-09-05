@@ -3622,9 +3622,89 @@ loadChainedFixupsExecFormat() {
                      "/usr/lib/libSystem.B.dylib"});
     return mod;
 }
+// A second fixture whose image has ONE MORE SEGMENT than the one above: a
+// writable global forces __DATA between __DATA_CONST and __LINKEDIT. It is
+// the CONTROL for the seg_count pins — without it, "seg_count is 4" is
+// equally consistent with "the writer emits the constant 4", which is the
+// shape of the defect D-LK6-14-CHAINED-STARTS-SEG-COUNT-MISDECLARED names.
+// (It mirrors the ld64 measurement, which used exactly this pair: the same
+// program with and without a writable global, giving seg_count 4 then 5.)
+[[nodiscard]] std::shared_ptr<ObjectFormatSchema const>
+loadChainedFixupsExecFormatWithData() {
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+  "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
+      "format": {"name":"macho-cfx-integration-data","kind":"macho"},
+      "entryPoint": "",
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
+      "entryCallingConvention": "sysv_amd64",
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+        "useChainedFixups": true
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392},
+        {"kind":"data","name":"__data","segment":"__DATA","type":0,"flags":0,"addrAlign":8,"entrySize":0,"virtualAddress":0}
+      ],
+      "relocations":[
+        {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
+        {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
+        {"name":"X86_64_RELOC_UNSIGNED_4","kind":3,"nativeId":33554432}
+      ]
+    })");
+    if (!fmt.has_value()) return nullptr;
+    return *fmt;
+}
+[[nodiscard]] AssembledModule chainedFixupsTestModuleWithData() {
+    AssembledModule mod = chainedFixupsTestModule();
+    AssembledData d;
+    d.symbol    = SymbolId{7};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {1, 0, 0, 0};
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{7}, "_g_mutable",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    return mod;
+}
 // LC_DYLD_CHAINED_FIXUPS = 0x80000034 (LC_REQ_DYLD bit set).
 constexpr std::uint32_t kLcDyldChainedFixups = 0x80000034u;
 constexpr std::uint32_t kLcDyldInfoOnly      = 0x80000022u;
+constexpr std::uint32_t kLcSegment64         = 0x19u;
+
+// The LC_SEGMENT_64 names of an emitted image, in load-command order. The
+// index of a name in this vector IS the segment ordinal that dyld's fixup
+// tables address, so the seg_count pins can check the payload against the
+// image's ACTUAL segments rather than against a number typed twice.
+[[nodiscard]] std::vector<std::string>
+segmentNamesOf(std::vector<std::uint8_t> const& bytes) {
+    std::vector<std::string> names;
+    if (bytes.size() < 32) return names;
+    std::uint32_t const ncmds = readU32LE(bytes, 16);
+    std::size_t off = 32;
+    for (std::uint32_t i = 0; i < ncmds && off + 8 <= bytes.size(); ++i) {
+        std::uint32_t const cmd     = readU32LE(bytes, off);
+        std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
+        if (cmdsize == 0) break;
+        if (cmd == kLcSegment64 && off + 24 <= bytes.size()) {
+            char const* p = reinterpret_cast<char const*>(&bytes[off + 8]);
+            names.emplace_back(p, std::find(p, p + 16, '\0'));
+        }
+        off += cmdsize;
+    }
+    return names;
+}
 } // namespace
 
 TEST(MachOExecWriter, ChainedFixupsLcPresent) {
@@ -3900,17 +3980,56 @@ TEST(MachOExecWriter, ChainedFixupsPayloadHasStartsInSegment) {
         readU32LE(bytes, *lcOff + 8);
     // starts_offset is at payload+4 (header field).
     std::uint32_t const startsOff = readU32LE(bytes, dataoff + 4);
-    // starts_in_image: seg_count (u32) at startsOff, seg_info_offset[0]
-    // (u32) at startsOff+4.
-    EXPECT_EQ(readU32LE(bytes, dataoff + startsOff), 1u)
-        << "seg_count must be 1 (single __DATA_CONST segment)";
-    std::uint32_t const segInfoOffset =
-        readU32LE(bytes, dataoff + startsOff + 4);
-    EXPECT_EQ(segInfoOffset, 8u)
-        << "seg_info_offset[0] must be 8 (immediately after the "
-           "starts_in_image header); a regression dropping segInfo "
-           "would leave this 0 (substrate behavior) and dyld would "
-           "see 'no chains in segment'";
+    // ── D-LK6-14-CHAINED-STARTS-SEG-COUNT-MISDECLARED ──────────────────
+    // `dyld_chained_starts_in_image` is a table INDEXED BY SEGMENT, so
+    // `seg_count` is the image's LC_SEGMENT_64 count and the table carries
+    // one entry per segment — the chained segment's alone non-zero.
+    // ⚠ THIS CELL PINNED THE DEFECT: it asserted `seg_count == 1` with the
+    // justification "single __DATA_CONST segment", over an image that has
+    // four segments and that Apple's own reader refused with `chained
+    // fixups, seg_count does not match number of segments`.
+    // The expected values are DERIVED from the emitted image below, never
+    // typed as constants — a layout change that adds or drops a segment
+    // moves the pin with it instead of falsifying it.
+    std::vector<std::string> const segs = segmentNamesOf(bytes);
+    ASSERT_EQ(segs.size(), 4u)
+        << "this fixture's image is __PAGEZERO/__TEXT/__DATA_CONST/"
+           "__LINKEDIT; the pins below read the payload against it";
+    auto const dataConstIt =
+        std::find(segs.begin(), segs.end(), std::string{"__DATA_CONST"});
+    ASSERT_NE(dataConstIt, segs.end()) << "__DATA_CONST carries the __got";
+    auto const dataConstIdx = static_cast<std::uint32_t>(
+        std::distance(segs.begin(), dataConstIt));
+    EXPECT_EQ(readU32LE(bytes, dataoff + startsOff),
+              static_cast<std::uint32_t>(segs.size()))
+        << "seg_count must equal the image's LC_SEGMENT_64 count — "
+           "D-LK6-14-CHAINED-STARTS-SEG-COUNT-MISDECLARED";
+    // Table length is 4 + 4 × seg_count; the struct offset is that rounded
+    // up to 8 (`_Alignof(dyld_chained_starts_in_segment)` is 8, and ld64
+    // was measured writing exactly this on real Apple Silicon).
+    constexpr std::size_t kAlign =
+        ::dss::macho::detail::kDyldChainedRegionAlign;
+    std::size_t const tableSize = 4u + 4u * segs.size();
+    std::uint32_t const expectedSegInfoOffset = static_cast<std::uint32_t>(
+        ((tableSize + kAlign - 1u) / kAlign) * kAlign);
+    std::uint32_t segInfoOffset = 0;
+    for (std::uint32_t i = 0; i < segs.size(); ++i) {
+        std::uint32_t const entry =
+            readU32LE(bytes, dataoff + startsOff + 4 + 4 * i);
+        if (i == dataConstIdx) {
+            segInfoOffset = entry;
+            EXPECT_EQ(entry, expectedSegInfoOffset)
+                << "seg_info_offset[" << i << "] (" << segs[i] << ") must "
+                   "point at the starts_in_segment struct; a regression "
+                   "dropping segInfo would leave this 0 and dyld would see "
+                   "'no chains in segment'";
+        } else {
+            EXPECT_EQ(entry, 0u)
+                << "seg_info_offset[" << i << "] (" << segs[i] << ") must be "
+                   "0 — only __DATA_CONST carries chains";
+        }
+    }
+    ASSERT_EQ(segInfoOffset, expectedSegInfoOffset);
     // dyld_chained_starts_in_segment at startsOff + 8:
     //   [ 0.. 3] size           [ 4.. 5] page_size
     //   [ 6.. 7] pointer_format [ 8..15] segment_offset
@@ -3943,6 +4062,55 @@ TEST(MachOExecWriter, ChainedFixupsPayloadHasStartsInSegment) {
     EXPECT_EQ(readU16LE(bytes, segStructOff + 22), 0u)
         << "page_starts[0] must be 0 (first chained pointer at byte "
            "0 of the page — __got starts at __DATA_CONST start)";
+}
+
+// D-LK6-14-CHAINED-STARTS-SEG-COUNT-MISDECLARED — the CONTROL arm.
+// The same program plus one writable global gains a __DATA segment, and the
+// payload must follow it: seg_count 5, the table one entry wider, and the
+// chained entry at __DATA_CONST's NEW ordinal. Without this arm, the pin
+// above is equally consistent with a writer that emits the constant 4 — and
+// emitting a constant is precisely the defect. It reproduces the shape of
+// the ld64 measurement (a four-segment exec and its five-segment twin).
+TEST(MachOExecWriter, ChainedFixupsStartsInImageTracksTheImageSegmentCount) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = loadChainedFixupsExecFormatWithData();
+    ASSERT_NE(fmt, nullptr);
+    auto mod = chainedFixupsTestModuleWithData();
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, **target, *fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    std::vector<std::string> const segs = segmentNamesOf(bytes);
+    ASSERT_EQ(segs.size(), 5u)
+        << "a writable global adds __DATA: __PAGEZERO/__TEXT/__DATA_CONST/"
+           "__DATA/__LINKEDIT";
+    auto const dataConstIt =
+        std::find(segs.begin(), segs.end(), std::string{"__DATA_CONST"});
+    ASSERT_NE(dataConstIt, segs.end());
+    auto const dataConstIdx = static_cast<std::uint32_t>(
+        std::distance(segs.begin(), dataConstIt));
+
+    auto const lcOff =
+        dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups);
+    ASSERT_TRUE(lcOff.has_value());
+    std::uint32_t const dataoff   = readU32LE(bytes, *lcOff + 8);
+    std::uint32_t const startsOff = readU32LE(bytes, dataoff + 4);
+    EXPECT_EQ(readU32LE(bytes, dataoff + startsOff), 5u)
+        << "seg_count must be 5 here and 4 for the __DATA-free twin — the "
+           "value TRACKS the image, it is not a constant — "
+           "D-LK6-14-CHAINED-STARTS-SEG-COUNT-MISDECLARED";
+    // 4 + 4×5 = 24, already 8-aligned, so no padding this time. The twin's
+    // table ends at 20 and pads to 24: the two arms exercise BOTH parities
+    // of the alignment, which is the same pair ld64 was measured on.
+    EXPECT_EQ(readU32LE(bytes, dataoff + startsOff + 4 + 4 * dataConstIdx),
+              24u)
+        << "seg_info_offset[__DATA_CONST] = the 24-byte table, 8-aligned";
+    for (std::uint32_t i = 0; i < segs.size(); ++i) {
+        if (i == dataConstIdx) continue;
+        EXPECT_EQ(readU32LE(bytes, dataoff + startsOff + 4 + 4 * i), 0u)
+            << "seg_info_offset[" << i << "] (" << segs[i] << ") must be 0";
+    }
 }
 
 // D-LK6-14-SIZEOFCMDS-DELTA-PIN: chained path's sizeofcmds must be

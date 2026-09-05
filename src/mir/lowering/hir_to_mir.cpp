@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>     // D-MIR-OVERLAP-STRUCT-ZERO-INIT: std::signbit (rejects -0.0)
+#include <deque>     // P61: the shared driver stack — reference-stable on push
 #include <format>
 #include <limits>
 #include <map>       // FC17.5 F2: the string-global byte-content memo
@@ -3090,6 +3091,269 @@ struct Lowerer {
         }
     }
 
+    // ★ P61 — the BuiltinCall EMISSION body, shared by the recursive
+    // `lowerExprNode` arm and the work-stack `LowerFrame::ValueKind::BuiltinCall`
+    // frame. Both lower EVERY child into `operands` first and only then dispatch
+    // on the payload, so lifting the dispatch here changes nothing a program can
+    // observe — it removes the SECOND copy that a flattened arm would otherwise
+    // have needed. `operands` is read-only here (every arm indexes it or hands it
+    // to `addInst`), which is what makes one body serve both callers.
+    [[nodiscard]] MirInstId emitBuiltinCall(
+        HirNodeId node, std::vector<MirInstId> const& operands) {
+        TypeId const t = hir.typeId(node);
+        auto kids = hir.children(node);
+        (void)kids;
+            switch (static_cast<BuiltinLowering>(hir.payload(node))) {
+                case BuiltinLowering::UMulHigh:
+                    return mir.addInst(MirOpcode::UMulH, operands, t);
+                // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): the 3 bit-count
+                // primitives. `t` is the builtin's result type (I32, since GCC's
+                // __builtin_popcount/clz/ctz all return `int`); the single
+                // operand is U32 (…) / U64 (…ll) and the mir_to_lir lowering
+                // reads the OPERAND's width via mir.instType(operand) to pick the
+                // 32- vs 64-bit realization. The count (0..P, P≤64) has zero
+                // upper bits, so it reads correctly at the I32 result with no
+                // explicit Trunc (the ICmp→Bool narrowing precedent).
+                case BuiltinLowering::Popcount:
+                    return mir.addInst(MirOpcode::Popcount, operands, t);
+                case BuiltinLowering::Clz:
+                    return mir.addInst(MirOpcode::Clz, operands, t);
+                case BuiltinLowering::Ctz:
+                    return mir.addInst(MirOpcode::Ctz, operands, t);
+                // D-CSUBSET-INTRINSIC-BSWAP: `_byteswap_{ushort,ulong,uint64}`
+                // → MirOpcode::Bswap. Unlike the bit-count trio above, `t` is
+                // NOT a fixed I32: each row's `result` core EQUALS its param
+                // core (U16/U32/U64 — the MSVC signatures), so the width the
+                // mir_to_lir lowering needs travels on BOTH the operand type
+                // and the result type and can never drift from the encoding
+                // it selects. Arity is checked HERE (not left to the
+                // mir_to_lir operand helper) so a malformed config row —
+                // `params` with 0 or 2 entries against a 1-operand MIR op —
+                // fails at the frontend with the source node in hand rather
+                // than as a shapeless L_UnsupportedLoweringForOpcode later.
+                case BuiltinLowering::Bswap: {
+                    if (operands.size() != 1) {
+                        unsupported(node,
+                            "a byte-swap builtin expects exactly 1 argument");
+                        return InvalidMirInst;
+                    }
+                    return mir.addInst(MirOpcode::Bswap, operands, t);
+                }
+                // FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 stdc_* ops
+                // COMPOSE the 3 primitives above + universal ALU verbs into the
+                // N3096 §7.18 formula — one shared, width-correct, single-eval,
+                // branchless emitter (emitStdbitOp) the 14 leaf lowerings route
+                // through (NO new MIR op; the operand is bound ONCE in operands).
+                case BuiltinLowering::StdcLeadingZeros:
+                case BuiltinLowering::StdcLeadingOnes:
+                case BuiltinLowering::StdcTrailingZeros:
+                case BuiltinLowering::StdcTrailingOnes:
+                case BuiltinLowering::StdcFirstLeadingZero:
+                case BuiltinLowering::StdcFirstLeadingOne:
+                case BuiltinLowering::StdcFirstTrailingZero:
+                case BuiltinLowering::StdcFirstTrailingOne:
+                case BuiltinLowering::StdcCountZeros:
+                case BuiltinLowering::StdcCountOnes:
+                case BuiltinLowering::StdcHasSingleBit:
+                case BuiltinLowering::StdcBitWidth:
+                case BuiltinLowering::StdcBitFloor:
+                case BuiltinLowering::StdcBitCeil: {
+                    if (kids.size() != 1) {
+                        unsupported(node,
+                            "a stdc_* bit builtin expects exactly 1 argument");
+                        return InvalidMirInst;
+                    }
+                    // The operand's width is read from its coerced HIR type
+                    // (its builtin param core), not the MirBuilder value.
+                    return emitStdbitOp(
+                        static_cast<BuiltinLowering>(hir.payload(node)),
+                        operands[0], hir.typeId(kids[0]), node, t);
+                }
+                case BuiltinLowering::AtomicCas: {
+                    // c104: MIR AtomicCas is the UNIVERSAL CAS order
+                    // [ptr, comparand(expected), newval(desired)] — the
+                    // C11 atomic_compare_exchange / LLVM cmpxchg shape a
+                    // future frontend would also target. The WIN32
+                    // intrinsic this builtin binds spells its args
+                    // (dest, EXCHANGE, comparand) — exchange BEFORE
+                    // comparand — so THIS arm (the one place the Win32
+                    // binding is defined) reorders [c0, c2, c1]. Passing
+                    // the args through positionally silently INVERTS the
+                    // CAS (the compare tests the new value, the store
+                    // writes the comparand — the exit-26 corpus catch).
+                    if (operands.size() != 3) {
+                        unsupported(node, "AtomicCas expects exactly 3 args");
+                        return InvalidMirInst;
+                    }
+                    std::array<MirInstId, 3> const casOrder{
+                        operands[0], operands[2], operands[1]};
+                    return mir.addInst(MirOpcode::AtomicCas, casOrder, t);
+                }
+                case BuiltinLowering::AtomicLoad: {
+                    // FC17.9(d) (D-CSUBSET-ATOMIC): atomic_load_explicit(ptr, order)
+                    // → AtomicLoad([ptr], payload=order). The order arg (kids[1]) is
+                    // const-folded into the payload and DROPPED from the operands
+                    // (audit c); the lowered-but-unused order value is dead (DCE).
+                    if (operands.size() != 2) {
+                        unsupported(node,
+                            "atomic_load_explicit expects exactly 2 args");
+                        return InvalidMirInst;
+                    }
+                    std::array<MirInstId, 1> const ld{operands[0]};
+                    return mir.addInst(MirOpcode::AtomicLoad, ld, t,
+                                       foldAtomicOrder(kids[1]),
+                                       MirInstFlags::None,
+                                       atomicPointerAlignPayload(kids[0]));
+                }
+                case BuiltinLowering::AtomicStore: {
+                    // FC17.9(d) (D-CSUBSET-ATOMIC): atomic_store_explicit(ptr, val,
+                    // order) → AtomicStore([val, ptr], payload=order). Operands are
+                    // [value, ptr] (the plain-Store order the AtomicStore opcode
+                    // reuses — mind the swap: HIR arg0=ptr, arg1=value). R::None ⇒
+                    // InvalidType result (the Store convention). Order = kids[2].
+                    if (operands.size() != 3) {
+                        unsupported(node,
+                            "atomic_store_explicit expects exactly 3 args");
+                        return InvalidMirInst;
+                    }
+                    std::array<MirInstId, 2> const st{operands[1], operands[0]};
+                    return mir.addInst(MirOpcode::AtomicStore, st, InvalidType,
+                                       foldAtomicOrder(kids[2]),
+                                       MirInstFlags::None,
+                                       atomicPointerAlignPayload(kids[0]));
+                }
+                case BuiltinLowering::AtomicFence: {
+                    // D-CSUBSET-ATOMIC-FENCE + D-CSUBSET-SYNC-BUILTIN-BARRIER:
+                    // __sync_synchronize() → AtomicFence(payload=seq_cst). The builtin takes NO arguments and IS the
+                    // strongest fence by definition (GCC __sync builtins are
+                    // full barriers), so the order is const-baked at 5 —
+                    // there is no order argument to fold. R::None ⇒
+                    // InvalidType (the CompilerBarrier/Store convention).
+                    // Unlike Barrier below (zero instructions), this op
+                    // survives to mir_to_lir and emits a REAL fence
+                    // instruction (x86 MFENCE, arm64 DMB ISH).
+                    if (!operands.empty()) {
+                        unsupported(node,
+                            "__sync_synchronize expects exactly 0 args");
+                        return InvalidMirInst;
+                    }
+                    return mir.addInst(MirOpcode::AtomicFence, operands,
+                                       InvalidType,
+                                       /*payload=*/kAtomicOrderSeqCst,
+                                       MirInstFlags::None);
+                }
+                case BuiltinLowering::Barrier:
+                    // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier —
+                    // a 0-operand, void, side-effecting compiler fence
+                    // (`operands` is empty; the builtin declares no params).
+                    // Emits NO runtime instruction; the side-effect flag makes
+                    // the CSE/LICM clobber walk forbid memory motion across it.
+                    // R::None ⇒ InvalidType (the Store convention — supplying
+                    // a result type is a MirBuilder fatal).
+                    return mir.addInst(MirOpcode::CompilerBarrier, operands,
+                                       InvalidType);
+                case BuiltinLowering::SehExceptionCode:
+                    // c115 SEH: `_exception_code()` — a 0-operand value op
+                    // (u32) reading the dispatch context. Position legality
+                    // (filter expr / handler body only) was proven by
+                    // HirVerifier::checkSehContext before lowering ran.
+                    return mir.addInst(MirOpcode::SehExceptionCode, operands, t);
+                case BuiltinLowering::SehExceptionInfo:
+                    // c115 SEH: `_exception_info()` — a 0-operand value op
+                    // (void* → EXCEPTION_POINTERS), filter-expression only.
+                    return mir.addInst(MirOpcode::SehExceptionInfo, operands, t);
+                case BuiltinLowering::ComplexMake: {
+                    // C99 _Complex (D-CSUBSET-COMPLEX / CRITICAL-2):
+                    // __builtin_complex(re, im) constructs a complex BY ADDRESS —
+                    // the FIRST aggregate-returning builtin. `t` is the complex
+                    // result type; operands = [re, im] (scalar values). Alloca a
+                    // slot, store re@0/im@es, RETURN THE SLOT ADDRESS (the memory-
+                    // resident model's "value" — lowerLvalueAddressNode's new
+                    // BuiltinCall arm delegates here so `I` reached by address works).
+                    if (operands.size() != 2) {
+                        unsupported(node, "__builtin_complex expects exactly 2 args");
+                        return InvalidMirInst;
+                    }
+                    auto const cp = complexParts(t);
+                    if (!cp.has_value()) {
+                        unsupported(node, "__builtin_complex result requires a "
+                                          "sizeable complex element layout");
+                        return InvalidMirInst;
+                    }
+                    MirInstId const dst = freshAggregateTemp(t);
+                    if (!dst.valid()) {
+                        unsupported(node, "__builtin_complex result requires a "
+                                          "sizeable layout");
+                        return InvalidMirInst;
+                    }
+                    MirInstId const re = convertScalar(
+                        operands[0], hir.typeId(kids[0]), cp->elemTy, node);
+                    MirInstId const im = convertScalar(
+                        operands[1], hir.typeId(kids[1]), cp->elemTy, node);
+                    if (!re.valid() || !im.valid()) return InvalidMirInst;
+                    storeComplex(dst, *cp, re, im);
+                    return dst;
+                }
+                case BuiltinLowering::ComplexReal:
+                case BuiltinLowering::ComplexImag: {
+                    // C99 _Complex (D-CSUBSET-COMPLEX / CRITICAL-4): creal(z)/
+                    // cimag(z). `z` is complex-by-address — the request flip
+                    // delivered operands[0] as z's base address (WITHOUT the flip
+                    // the Ref value arm would Load a 16-byte aggregate as a
+                    // scalar). Gep+Load component 0 / es; the F64 result is `t`.
+                    if (operands.size() != 1) {
+                        unsupported(node, "creal/cimag expects exactly 1 arg");
+                        return InvalidMirInst;
+                    }
+                    auto const cp = complexParts(hir.typeId(kids[0]));
+                    if (!cp.has_value()) {
+                        unsupported(node, "creal/cimag on a non-complex or "
+                                          "un-sizeable argument");
+                        return InvalidMirInst;
+                    }
+                    bool const wantImag =
+                        static_cast<BuiltinLowering>(hir.payload(node))
+                            == BuiltinLowering::ComplexImag;
+                    std::int64_t const off = wantImag ? cp->elemSize : 0;
+                    MirInstId const comp = loadComponent(
+                        complexCompAddr(operands[0], off, cp->elemTy), cp->elemTy);
+                    // Element IS F64 this cycle (monomorph); convert to the
+                    // declared result `t` if a future element diverges.
+                    return convertScalar(comp, cp->elemTy, t, node);
+                }
+                case BuiltinLowering::ComplexConj: {
+                    // C99 _Complex (D-CSUBSET-COMPLEX): conj(z) = (re, -im), BY
+                    // ADDRESS. z is complex-by-address (operands[0]).
+                    if (operands.size() != 1) {
+                        unsupported(node, "conj expects exactly 1 arg");
+                        return InvalidMirInst;
+                    }
+                    auto const cp = complexParts(t);
+                    if (!cp.has_value()) {
+                        unsupported(node, "conj result requires a sizeable complex "
+                                          "element layout");
+                        return InvalidMirInst;
+                    }
+                    MirInstId const dst = freshAggregateTemp(t);
+                    if (!dst.valid()) {
+                        unsupported(node, "conj result requires a sizeable layout");
+                        return InvalidMirInst;
+                    }
+                    MirInstId re = InvalidMirInst, im = InvalidMirInst;
+                    if (!loadComplex(operands[0], *cp, re, im))
+                        return InvalidMirInst;
+                    std::array<MirInstId, 1> nb{im};
+                    MirInstId const nim = mir.addInst(MirOpcode::FNeg, nb, cp->elemTy);
+                    storeComplex(dst, *cp, re, nim);
+                    return dst;
+                }
+                case BuiltinLowering::None:
+                    break;
+            }
+        unsupported(node, "BuiltinCall carries no valid lowering");
+        return InvalidMirInst;
+    }
+
     // Lower ONE HIR expression node in the currently-open MIR block, given
     // that its child sub-expressions are lowered by RE-ENTERING `lowerExpr`
     // (the driver below). Returns the MirInstId that produces the value
@@ -3482,7 +3746,7 @@ struct Lowerer {
                 // Plan 24 (hir_to_mir Call residual): this RECURSIVE body is now
                 // the byte-identical FALLBACK — it drives the SAME shared helpers
                 // (`callSetup` / `processOneCallArg` / `finishScalarCallArg` /
-                // `finishCall`) as the iterative `runExprDriver` Call frame, which
+                // `finishCall`) as the iterative driver's Call frame, which
                 // is what actually lowers a call at runtime (so a deep
                 // `f(f(f(…)))` chain carries flat host-stack cost — only the arg
                 // VALUE-lowering recursion is hoisted; the struct ABI synthesis
@@ -3498,8 +3762,12 @@ struct Lowerer {
                 if (!callee.valid()) return InvalidMirInst;
                 CallLowerCtx ctx{.node = node, .resultTy = t};
                 if (!callSetup(callee, ctx)) return InvalidMirInst;
+                // The ctx is a STACK LOCAL here, so nothing can move it — but it
+                // is still handed over as a callable, because the helper's
+                // contract is storage-agnostic by design (see processOneCallArg).
+                auto const ctxAt = [&ctx]() -> CallLowerCtx& { return ctx; };
                 for (;;) {
-                    CallArgStep const step = processOneCallArg(ctx);
+                    CallArgStep const step = processOneCallArg(ctxAt);
                     if (step == CallArgStep::Error) return InvalidMirInst;
                     if (step == CallArgStep::Done) break;
                     if (step == CallArgStep::StructDone) continue;
@@ -3546,255 +3814,7 @@ struct Lowerer {
                     if (!arg.valid()) return InvalidMirInst;
                     operands.push_back(arg);
                 }
-                switch (static_cast<BuiltinLowering>(hir.payload(node))) {
-                    case BuiltinLowering::UMulHigh:
-                        return mir.addInst(MirOpcode::UMulH, operands, t);
-                    // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): the 3 bit-count
-                    // primitives. `t` is the builtin's result type (I32, since GCC's
-                    // __builtin_popcount/clz/ctz all return `int`); the single
-                    // operand is U32 (…) / U64 (…ll) and the mir_to_lir lowering
-                    // reads the OPERAND's width via mir.instType(operand) to pick the
-                    // 32- vs 64-bit realization. The count (0..P, P≤64) has zero
-                    // upper bits, so it reads correctly at the I32 result with no
-                    // explicit Trunc (the ICmp→Bool narrowing precedent).
-                    case BuiltinLowering::Popcount:
-                        return mir.addInst(MirOpcode::Popcount, operands, t);
-                    case BuiltinLowering::Clz:
-                        return mir.addInst(MirOpcode::Clz, operands, t);
-                    case BuiltinLowering::Ctz:
-                        return mir.addInst(MirOpcode::Ctz, operands, t);
-                    // D-CSUBSET-INTRINSIC-BSWAP: `_byteswap_{ushort,ulong,uint64}`
-                    // → MirOpcode::Bswap. Unlike the bit-count trio above, `t` is
-                    // NOT a fixed I32: each row's `result` core EQUALS its param
-                    // core (U16/U32/U64 — the MSVC signatures), so the width the
-                    // mir_to_lir lowering needs travels on BOTH the operand type
-                    // and the result type and can never drift from the encoding
-                    // it selects. Arity is checked HERE (not left to the
-                    // mir_to_lir operand helper) so a malformed config row —
-                    // `params` with 0 or 2 entries against a 1-operand MIR op —
-                    // fails at the frontend with the source node in hand rather
-                    // than as a shapeless L_UnsupportedLoweringForOpcode later.
-                    case BuiltinLowering::Bswap: {
-                        if (operands.size() != 1) {
-                            unsupported(node,
-                                "a byte-swap builtin expects exactly 1 argument");
-                            return InvalidMirInst;
-                        }
-                        return mir.addInst(MirOpcode::Bswap, operands, t);
-                    }
-                    // FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 stdc_* ops
-                    // COMPOSE the 3 primitives above + universal ALU verbs into the
-                    // N3096 §7.18 formula — one shared, width-correct, single-eval,
-                    // branchless emitter (emitStdbitOp) the 14 leaf lowerings route
-                    // through (NO new MIR op; the operand is bound ONCE in operands).
-                    case BuiltinLowering::StdcLeadingZeros:
-                    case BuiltinLowering::StdcLeadingOnes:
-                    case BuiltinLowering::StdcTrailingZeros:
-                    case BuiltinLowering::StdcTrailingOnes:
-                    case BuiltinLowering::StdcFirstLeadingZero:
-                    case BuiltinLowering::StdcFirstLeadingOne:
-                    case BuiltinLowering::StdcFirstTrailingZero:
-                    case BuiltinLowering::StdcFirstTrailingOne:
-                    case BuiltinLowering::StdcCountZeros:
-                    case BuiltinLowering::StdcCountOnes:
-                    case BuiltinLowering::StdcHasSingleBit:
-                    case BuiltinLowering::StdcBitWidth:
-                    case BuiltinLowering::StdcBitFloor:
-                    case BuiltinLowering::StdcBitCeil: {
-                        if (kids.size() != 1) {
-                            unsupported(node,
-                                "a stdc_* bit builtin expects exactly 1 argument");
-                            return InvalidMirInst;
-                        }
-                        // The operand's width is read from its coerced HIR type
-                        // (its builtin param core), not the MirBuilder value.
-                        return emitStdbitOp(
-                            static_cast<BuiltinLowering>(hir.payload(node)),
-                            operands[0], hir.typeId(kids[0]), node, t);
-                    }
-                    case BuiltinLowering::AtomicCas: {
-                        // c104: MIR AtomicCas is the UNIVERSAL CAS order
-                        // [ptr, comparand(expected), newval(desired)] — the
-                        // C11 atomic_compare_exchange / LLVM cmpxchg shape a
-                        // future frontend would also target. The WIN32
-                        // intrinsic this builtin binds spells its args
-                        // (dest, EXCHANGE, comparand) — exchange BEFORE
-                        // comparand — so THIS arm (the one place the Win32
-                        // binding is defined) reorders [c0, c2, c1]. Passing
-                        // the args through positionally silently INVERTS the
-                        // CAS (the compare tests the new value, the store
-                        // writes the comparand — the exit-26 corpus catch).
-                        if (operands.size() != 3) {
-                            unsupported(node, "AtomicCas expects exactly 3 args");
-                            return InvalidMirInst;
-                        }
-                        std::array<MirInstId, 3> const casOrder{
-                            operands[0], operands[2], operands[1]};
-                        return mir.addInst(MirOpcode::AtomicCas, casOrder, t);
-                    }
-                    case BuiltinLowering::AtomicLoad: {
-                        // FC17.9(d) (D-CSUBSET-ATOMIC): atomic_load_explicit(ptr, order)
-                        // → AtomicLoad([ptr], payload=order). The order arg (kids[1]) is
-                        // const-folded into the payload and DROPPED from the operands
-                        // (audit c); the lowered-but-unused order value is dead (DCE).
-                        if (operands.size() != 2) {
-                            unsupported(node,
-                                "atomic_load_explicit expects exactly 2 args");
-                            return InvalidMirInst;
-                        }
-                        std::array<MirInstId, 1> const ld{operands[0]};
-                        return mir.addInst(MirOpcode::AtomicLoad, ld, t,
-                                           foldAtomicOrder(kids[1]),
-                                           MirInstFlags::None,
-                                           atomicPointerAlignPayload(kids[0]));
-                    }
-                    case BuiltinLowering::AtomicStore: {
-                        // FC17.9(d) (D-CSUBSET-ATOMIC): atomic_store_explicit(ptr, val,
-                        // order) → AtomicStore([val, ptr], payload=order). Operands are
-                        // [value, ptr] (the plain-Store order the AtomicStore opcode
-                        // reuses — mind the swap: HIR arg0=ptr, arg1=value). R::None ⇒
-                        // InvalidType result (the Store convention). Order = kids[2].
-                        if (operands.size() != 3) {
-                            unsupported(node,
-                                "atomic_store_explicit expects exactly 3 args");
-                            return InvalidMirInst;
-                        }
-                        std::array<MirInstId, 2> const st{operands[1], operands[0]};
-                        return mir.addInst(MirOpcode::AtomicStore, st, InvalidType,
-                                           foldAtomicOrder(kids[2]),
-                                           MirInstFlags::None,
-                                           atomicPointerAlignPayload(kids[0]));
-                    }
-                    case BuiltinLowering::AtomicFence: {
-                        // D-CSUBSET-ATOMIC-FENCE + D-CSUBSET-SYNC-BUILTIN-BARRIER:
-                        // __sync_synchronize() → AtomicFence(payload=seq_cst). The builtin takes NO arguments and IS the
-                        // strongest fence by definition (GCC __sync builtins are
-                        // full barriers), so the order is const-baked at 5 —
-                        // there is no order argument to fold. R::None ⇒
-                        // InvalidType (the CompilerBarrier/Store convention).
-                        // Unlike Barrier below (zero instructions), this op
-                        // survives to mir_to_lir and emits a REAL fence
-                        // instruction (x86 MFENCE, arm64 DMB ISH).
-                        if (!operands.empty()) {
-                            unsupported(node,
-                                "__sync_synchronize expects exactly 0 args");
-                            return InvalidMirInst;
-                        }
-                        return mir.addInst(MirOpcode::AtomicFence, operands,
-                                           InvalidType,
-                                           /*payload=*/kAtomicOrderSeqCst,
-                                           MirInstFlags::None);
-                    }
-                    case BuiltinLowering::Barrier:
-                        // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier —
-                        // a 0-operand, void, side-effecting compiler fence
-                        // (`operands` is empty; the builtin declares no params).
-                        // Emits NO runtime instruction; the side-effect flag makes
-                        // the CSE/LICM clobber walk forbid memory motion across it.
-                        // R::None ⇒ InvalidType (the Store convention — supplying
-                        // a result type is a MirBuilder fatal).
-                        return mir.addInst(MirOpcode::CompilerBarrier, operands,
-                                           InvalidType);
-                    case BuiltinLowering::SehExceptionCode:
-                        // c115 SEH: `_exception_code()` — a 0-operand value op
-                        // (u32) reading the dispatch context. Position legality
-                        // (filter expr / handler body only) was proven by
-                        // HirVerifier::checkSehContext before lowering ran.
-                        return mir.addInst(MirOpcode::SehExceptionCode, operands, t);
-                    case BuiltinLowering::SehExceptionInfo:
-                        // c115 SEH: `_exception_info()` — a 0-operand value op
-                        // (void* → EXCEPTION_POINTERS), filter-expression only.
-                        return mir.addInst(MirOpcode::SehExceptionInfo, operands, t);
-                    case BuiltinLowering::ComplexMake: {
-                        // C99 _Complex (D-CSUBSET-COMPLEX / CRITICAL-2):
-                        // __builtin_complex(re, im) constructs a complex BY ADDRESS —
-                        // the FIRST aggregate-returning builtin. `t` is the complex
-                        // result type; operands = [re, im] (scalar values). Alloca a
-                        // slot, store re@0/im@es, RETURN THE SLOT ADDRESS (the memory-
-                        // resident model's "value" — lowerLvalueAddressNode's new
-                        // BuiltinCall arm delegates here so `I` reached by address works).
-                        if (operands.size() != 2) {
-                            unsupported(node, "__builtin_complex expects exactly 2 args");
-                            return InvalidMirInst;
-                        }
-                        auto const cp = complexParts(t);
-                        if (!cp.has_value()) {
-                            unsupported(node, "__builtin_complex result requires a "
-                                              "sizeable complex element layout");
-                            return InvalidMirInst;
-                        }
-                        MirInstId const dst = freshAggregateTemp(t);
-                        if (!dst.valid()) {
-                            unsupported(node, "__builtin_complex result requires a "
-                                              "sizeable layout");
-                            return InvalidMirInst;
-                        }
-                        MirInstId const re = convertScalar(
-                            operands[0], hir.typeId(kids[0]), cp->elemTy, node);
-                        MirInstId const im = convertScalar(
-                            operands[1], hir.typeId(kids[1]), cp->elemTy, node);
-                        if (!re.valid() || !im.valid()) return InvalidMirInst;
-                        storeComplex(dst, *cp, re, im);
-                        return dst;
-                    }
-                    case BuiltinLowering::ComplexReal:
-                    case BuiltinLowering::ComplexImag: {
-                        // C99 _Complex (D-CSUBSET-COMPLEX / CRITICAL-4): creal(z)/
-                        // cimag(z). `z` is complex-by-address — the request flip
-                        // delivered operands[0] as z's base address (WITHOUT the flip
-                        // the Ref value arm would Load a 16-byte aggregate as a
-                        // scalar). Gep+Load component 0 / es; the F64 result is `t`.
-                        if (operands.size() != 1) {
-                            unsupported(node, "creal/cimag expects exactly 1 arg");
-                            return InvalidMirInst;
-                        }
-                        auto const cp = complexParts(hir.typeId(kids[0]));
-                        if (!cp.has_value()) {
-                            unsupported(node, "creal/cimag on a non-complex or "
-                                              "un-sizeable argument");
-                            return InvalidMirInst;
-                        }
-                        bool const wantImag =
-                            static_cast<BuiltinLowering>(hir.payload(node))
-                                == BuiltinLowering::ComplexImag;
-                        std::int64_t const off = wantImag ? cp->elemSize : 0;
-                        MirInstId const comp = loadComponent(
-                            complexCompAddr(operands[0], off, cp->elemTy), cp->elemTy);
-                        // Element IS F64 this cycle (monomorph); convert to the
-                        // declared result `t` if a future element diverges.
-                        return convertScalar(comp, cp->elemTy, t, node);
-                    }
-                    case BuiltinLowering::ComplexConj: {
-                        // C99 _Complex (D-CSUBSET-COMPLEX): conj(z) = (re, -im), BY
-                        // ADDRESS. z is complex-by-address (operands[0]).
-                        if (operands.size() != 1) {
-                            unsupported(node, "conj expects exactly 1 arg");
-                            return InvalidMirInst;
-                        }
-                        auto const cp = complexParts(t);
-                        if (!cp.has_value()) {
-                            unsupported(node, "conj result requires a sizeable complex "
-                                              "element layout");
-                            return InvalidMirInst;
-                        }
-                        MirInstId const dst = freshAggregateTemp(t);
-                        if (!dst.valid()) {
-                            unsupported(node, "conj result requires a sizeable layout");
-                            return InvalidMirInst;
-                        }
-                        MirInstId re = InvalidMirInst, im = InvalidMirInst;
-                        if (!loadComplex(operands[0], *cp, re, im))
-                            return InvalidMirInst;
-                        std::array<MirInstId, 1> nb{im};
-                        MirInstId const nim = mir.addInst(MirOpcode::FNeg, nb, cp->elemTy);
-                        storeComplex(dst, *cp, re, nim);
-                        return dst;
-                    }
-                    case BuiltinLowering::None:
-                        break;
-                }
-                unsupported(node, "BuiltinCall carries no valid lowering");
-                return InvalidMirInst;
+                return emitBuiltinCall(node, operands);
             }
             case HirKind::Ternary: {
                 // children: [cond, thenExpr, elseExpr]. Lower as a diamond
@@ -5088,8 +5108,30 @@ struct Lowerer {
     // `phase` sequences a frame's child requests; the final phase pops + emits
     // via the matching `combine*`. `c0` stashes ONE child result across the next
     // request (Binary: the LHS; IndexAddr: the byte-scaled index).
-    struct ValueFrame {
-        enum class Kind : std::uint8_t {
+    // ★★★ P61 — ONE FRAME STACK FOR ALL THREE FAMILIES
+    // (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED).
+    //
+    // The value driver, the statement driver and the discarded-expression driver
+    // used to own a work-stack EACH, and the three called one another: a comma
+    // chain's `SeqExpr` arm ran its side-effect statements through `lowerStmt`,
+    // whose `ExprStmt` arm ran `lowerDiscardedExpr`, which ran `lowerExpr`, which
+    // opened a FRESH value driver — a seven-frame host cycle per comma element
+    // and the one axis a real corpus reaches (LIST LENGTH). An alternating cycle
+    // flattens only when EVERY edge sits on ONE stack, so the three stacks are
+    // now this one, and the three entry points are wrappers over `runUntil`.
+    //
+    // The `family` tag is not decoration: it is what keeps each stepper's
+    // `switch` EXHAUSTIVE over its own enum, so `-Werror=switch` still refuses a
+    // new frame kind that no arm handles. A single flat enum would have needed a
+    // `default:` in three places and disarmed that guard.
+    // ⚠ The claim is only worth what the code does: ALL THREE steppers must
+    // dispatch with a real `switch` and NO `default:`. `stepDiscardFrame` shipped
+    // as an `if (dkind == Ternary)` falling through to the `One` path — the same
+    // sentence, one arm short of it — and a third discard kind would have been
+    // handled silently as `One`. Check the dispatch, not the comment.
+    struct LowerFrame {
+        enum class Family : std::uint8_t { Value, Stmt, Discard };
+        enum class ValueKind : std::uint8_t {
             Unary, Binary, Deref, Cast, MemberAddr, IndexAddr,
             // Stage 4-cfg: the control-flow VALUE arms. Each is a multi-phase
             // machine that INTERLEAVES createBlock/addCondBr/addBr/beginBlock
@@ -5105,65 +5147,86 @@ struct Lowerer {
             // per-call state lives in a `callCtxs` LIFO vector (a nested call's
             // arg grows it mid-pump → a held reference would dangle); the frame
             // references its ctx by the STABLE index `aux`.
-            Call, IntrinsicCall
-        } kind;
+            Call, IntrinsicCall,
+            // P61: the BuiltinCall VALUE arm — `__builtin_popcount(__builtin_
+            // popcount(…))` nests as deep as the user writes it and was the one
+            // remaining un-flattened multi-child expression kind. Its args pump
+            // through `callCtxs[aux].operands` exactly as IntrinsicCall's do;
+            // `emitBuiltinCall` is the shared emission body.
+            BuiltinCall
+        };
+        enum class StmtKind : std::uint8_t {
+            Block, If, While, DoWhile, For, Label, Switch, Seh
+        };
+        // P61: the DISCARD family. `One` lowers ONE expression in discard
+        // position (the `ExprStmt` / for-clause chokepoint); `Ternary` is the
+        // void-ternary diamond's continuation, whose two arms are themselves
+        // discarded. Together they replace `lowerDiscardedExpr`'s private stack.
+        enum class DiscardKind : std::uint8_t { One, Ternary };
+
+        Family      family;
+        ValueKind   vkind{};
+        StmtKind    skind{};
+        DiscardKind dkind{};
         HirNodeId node;
         std::uint8_t phase;
-        MirInstId c0;
-        std::uint32_t aux{};   // Call/IntrinsicCall: index into the local callCtxs
+        MirInstId c0{};
+        // Value Call/IntrinsicCall/BuiltinCall: index into `callCtxs`.
+        // Value SeqExpr: the side-effect statement cursor.
+        // Stmt Block: index into `blockCtxs`. Stmt Seh: the SEH region id.
+        std::uint32_t aux{};
         // CFG-frame state, carried across phases (realloc-safe — they live in
         // the vector element, copied to locals before any push). Unused by the
         // straight-line/address kinds. `bb0/bb1/bb2` are the minted blocks
         // (Ternary: then/else/join; Logical: rhs/join, bb2 unused); `v0` is the
         // first-arm value (Ternary: thenVal; Logical: lhs); `pred0` is the
         // first-arm predecessor block (Ternary: thenPred; Logical: lhsPred).
+        // Statement arms additionally use bb3/bb4 (see the StmtKind table);
+        // Discard::Ternary uses bb0=elseBB, bb1=joinBB.
         MirBlockId bb0{};
         MirBlockId bb1{};
         MirBlockId bb2{};
+        MirBlockId bb3{};
+        MirBlockId bb4{};
         MirInstId  v0{};
         MirBlockId pred0{};
+        // Stmt If/Seh: `joinReached`. Value SeqExpr: the result tail is wanted
+        // by ADDRESS (the aggregate comma) rather than by value.
+        bool flag0{};
+        // Stmt Block: `vlaScopeStack_.size()` captured at the block's entry.
+        std::uint32_t vlaBase{};
     };
+    using LFam = LowerFrame::Family;
+    using LVK  = LowerFrame::ValueKind;
+    using LSK  = LowerFrame::StmtKind;
+    using LDK  = LowerFrame::DiscardKind;
 
-    // The shared {Value,Address} expression-lowering driver over an explicit
-    // heap work-stack. `rootWantAddr` selects the ROOT request: false → the
-    // node's VALUE (`lowerExpr`), true → its lvalue ADDRESS (`lowerLvalueAddress`).
+    // Classify `n` under the requested kind: push a frame for a flattenable
+    // deep arm (and return), else lower it via the per-node body (delegating;
+    // its children re-enter this driver). A VALUE request flattens the four
+    // straight-line value arms; an ADDRESS request flattens MemberAccess and
+    // Index (the deep base axes). NOTE: a push MUST be the LAST action of any
+    // caller path that has copied out its frame fields — `work.back()` may
+    // dangle after.
+    //
     // `request(n, wantAddr)` either PUSHES a frame for a deep flattenable arm or
     // delegates to the matching per-node body (`lowerExprNode` / `lowerLvalue
     // AddressNode`), which lowers that one node and RE-ENTERS this driver for its
-    // children. The two families share ONE work-stack + ONE `result` slot, so a
-    // by-value read that needs a base address (MemberAccess/Index rvalue) and a
-    // by-address chain that needs a value (an Index subscript, a pointer base)
-    // flatten through each other. Output-identity: the flattened arms reproduce
-    // the recursive child-lowering ORDER + `combine*` exactly, so the emitted MIR
+    // children. Every family shares ONE work-stack, ONE `result` slot and ONE
+    // `ok` slot, so a by-value read that needs a base address (MemberAccess/Index
+    // rvalue), a by-address chain that needs a value (an Index subscript, a
+    // pointer base), and a comma chain's side-effect STATEMENTS all flatten
+    // through each other. Output-identity: the flattened arms reproduce the
+    // recursive child-lowering ORDER + `combine*` exactly, so the emitted MIR
     // (inst order, vreg ids, operands) is byte-identical to the recursive form.
-    [[nodiscard]] MirInstId runExprDriver(HirNodeId node, bool rootWantAddr) {
-        std::vector<ValueFrame> work;
-        // Plan 24: the flattened Call/IntrinsicCall accumulators (see `CallLowerCtx`
-        // + the ValueFrame::Kind::Call note). A LIFO stack parallel to `work`; a
-        // Call frame references its ctx by the STABLE index `aux` (a scalar arg
-        // that is itself a call grows this vector mid-pump, so the index — never a
-        // held reference — is what survives).
-        std::vector<CallLowerCtx> callCtxs;
-        // Default-init: `request` ALWAYS assigns `result` for a delegated node,
-        // and every pushed frame delivers into `result` before it is read (then
-        // popped), so this sentinel never leaks.
-        MirInstId result = InvalidMirInst;
-
-        // Classify `n` under the requested kind: push a frame for a flattenable
-        // deep arm (and return), else lower it via the per-node body (delegating;
-        // its children re-enter this driver). A VALUE request flattens the four
-        // straight-line value arms; an ADDRESS request flattens MemberAccess and
-        // Index (the deep base axes). NOTE: a push MUST be the LAST action of any
-        // caller path that has copied out its frame fields — `work.back()` may
-        // dangle after.
-        auto const request = [&](HirNodeId n, bool wantAddr) {
+    void request(HirNodeId n, bool wantAddr) {
           // ★★★ TWO ARMS ARE PURE REQUEST REWRITES AND THEY LOOP HERE RATHER
           // THAN RE-ENTERING THE DRIVER — D-MIR-HIRTOMIR-ADDRESSOF-DEREF-REENTRY-RECURSES-PER-LINK.
           // `lowerExprNode`'s AddressOf arm is exactly `lowerLvalueAddress(child)`
           // and `lowerLvalueAddressNode`'s Deref arm is exactly `lowerExpr(child)`
           // — neither emits anything of its own, and each is the SAME request
           // with the address/value flag flipped. Written as delegations they
-          // spun up a FRESH `runExprDriver` per link, so `*&*&…p` cost four host
+          // spun up a FRESH driver invocation per link, so `*&*&…p` cost four host
           // frames per `*&` pair; written as a rewrite loop they cost none.
           // ⚠ THE ARITY GUARDS STAY ON THE DELEGATED SIDE: a malformed node
           // falls out of this loop and reaches its own fail-loud, unchanged.
@@ -5215,7 +5278,7 @@ struct Lowerer {
                         // the base lvalue address (the deep axis). A malformed
                         // arity delegates (fail loud, byte-identical guard).
                         if (hir.children(n).size() == 1) {
-                            work.push_back({.kind = ValueFrame::Kind::MemberAddr,
+                            work.push_back({.family = LFam::Value, .vkind = LVK::MemberAddr,
                                             .node = n, .phase = 0});
                             return;
                         }
@@ -5224,16 +5287,31 @@ struct Lowerer {
                         // `base[idx]`: subscript VALUE then base (storage ADDRESS
                         // or pointer VALUE) — both re-enter this driver.
                         if (hir.children(n).size() == 2) {
-                            work.push_back({.kind = ValueFrame::Kind::IndexAddr,
+                            work.push_back({.family = LFam::Value, .vkind = LVK::IndexAddr,
                                             .node = n, .phase = 0});
                             return;
                         }
                         break;
+                    case HirKind::SeqExpr:
+                        // P61: the BY-ADDRESS comma. An aggregate-typed comma has
+                        // no SSA rvalue, so BOTH its discarded left spine and its
+                        // result tail resolve through `lowerLvalueAddress` — a
+                        // DIFFERENT arm from the scalar comma below and a separate
+                        // defect if only one of the two is flattened
+                        // ([[feedback-a-partial-fix-reads-as-a-complete-one]]).
+                        // `flag0` records that the result tail is wanted by
+                        // ADDRESS; the shared SeqExpr machine runs the same
+                        // statements in the same order either way. The by-address
+                        // arm carries NO aggregate guard (this IS the aggregate
+                        // path), which is why phase 0 keys the guard on `flag0`.
+                        work.push_back({.family = LFam::Value, .vkind = LVK::SeqExpr,
+                                        .node = n, .phase = 0, .flag0 = true});
+                        return;
                     default: break;
                 }
                 // Every OTHER lvalue arm (Ref/global, Deref, Call-sret, the
-                // CFG/slot arms ConstructAggregate/Ternary/SeqExpr/VaArg) keeps
-                // its recursive body; its own re-entries still flatten.
+                // CFG/slot arms ConstructAggregate/Ternary/VaArg) keeps its
+                // recursive body; its own re-entries still flatten.
                 result = lowerLvalueAddressNode(n);
                 return;
             }
@@ -5250,28 +5328,28 @@ struct Lowerer {
                     // extension op or malformed arity delegates (fail loud
                     // there, byte-identical to the recursive guards).
                     if (isCoreOp(hir.payload(n)) && hir.children(n).size() == 1) {
-                        work.push_back({.kind = ValueFrame::Kind::Unary,
+                        work.push_back({.family = LFam::Value, .vkind = LVK::Unary,
                                         .node = n, .phase = 0});
                         return;
                     }
                     break;
                 case HirKind::BinaryOp:
                     if (isCoreOp(hir.payload(n)) && hir.children(n).size() == 2) {
-                        work.push_back({.kind = ValueFrame::Kind::Binary,
+                        work.push_back({.family = LFam::Value, .vkind = LVK::Binary,
                                         .node = n, .phase = 0});
                         return;
                     }
                     break;
                 case HirKind::Deref:
                     if (hir.children(n).size() == 1) {
-                        work.push_back({.kind = ValueFrame::Kind::Deref,
+                        work.push_back({.family = LFam::Value, .vkind = LVK::Deref,
                                         .node = n, .phase = 0});
                         return;
                     }
                     break;
                 case HirKind::Cast:
                     if (castFlattens(n)) {
-                        work.push_back({.kind = ValueFrame::Kind::Cast,
+                        work.push_back({.family = LFam::Value, .vkind = LVK::Cast,
                                         .node = n, .phase = 0});
                         return;
                     }
@@ -5285,7 +5363,7 @@ struct Lowerer {
                 // delegates to the recursive body (its own fail-loud guard).
                 case HirKind::Ternary:
                     if (hir.children(n).size() == 3) {
-                        work.push_back({.kind = ValueFrame::Kind::Ternary,
+                        work.push_back({.family = LFam::Value, .vkind = LVK::Ternary,
                                         .node = n, .phase = 0});
                         return;
                     }
@@ -5293,19 +5371,21 @@ struct Lowerer {
                 case HirKind::LogicalAnd:
                 case HirKind::LogicalOr:
                     if (hir.children(n).size() == 2) {
-                        work.push_back({.kind = ValueFrame::Kind::Logical,
+                        work.push_back({.family = LFam::Value, .vkind = LVK::Logical,
                                         .node = n, .phase = 0});
                         return;
                     }
                     break;
                 case HirKind::SeqExpr:
-                    // The side-effect statements lower via `lowerStmt` (a
-                    // separate machine, kept recursive); only the RESULT-tail
-                    // re-enters this driver, so a deep comma chain's result
-                    // expression flattens. Push unconditionally (no arity gate —
-                    // SeqExpr has no `children()` arity; it carries stmts+result
-                    // accessors) and run the guard+stmts in phase 0.
-                    work.push_back({.kind = ValueFrame::Kind::SeqExpr,
+                    // P61: the side-effect statements are PUMPED onto THIS stack
+                    // (phase 0 dispatch / 1 resume / 2 tail) — nothing here calls
+                    // `lowerStmt`, and the whole point of the merge is that they
+                    // no longer do: `SeqExpr → lowerStmt → ExprStmt →
+                    // lowerDiscardedExpr → lowerExpr` was the seven-frame host
+                    // cycle this row exists to break. Push unconditionally (no
+                    // arity gate — SeqExpr has no `children()` arity; it carries
+                    // stmts+result accessors) and run the guard+stmts in phase 0.
+                    work.push_back({.family = LFam::Value, .vkind = LVK::SeqExpr,
                                     .node = n, .phase = 0});
                     return;
                 // Plan 24: a Call flattens its callee + each SCALAR argument
@@ -5320,7 +5400,7 @@ struct Lowerer {
                             static_cast<std::uint32_t>(callCtxs.size());
                         callCtxs.push_back(CallLowerCtx{
                             .node = n, .resultTy = hir.typeId(n)});
-                        work.push_back({.kind = ValueFrame::Kind::Call,
+                        work.push_back({.family = LFam::Value, .vkind = LVK::Call,
                                         .node = n, .phase = 0, .aux = ctxIdx});
                         return;   // phase 0 enters the callee
                     }
@@ -5332,7 +5412,28 @@ struct Lowerer {
                         .node = n, .resultTy = hir.typeId(n), .isIntrinsic = true,
                         .intrinsicId = hir.payload(n)});
                     callCtxs.back().argIdx = 0;   // intrinsic args start at 0
-                    work.push_back({.kind = ValueFrame::Kind::IntrinsicCall,
+                    work.push_back({.family = LFam::Value, .vkind = LVK::IntrinsicCall,
+                                    .node = n, .phase = 0, .aux = ctxIdx});
+                    return;
+                }
+                // P61: BuiltinCall was the last multi-child expression kind no
+                // `request` case claimed, so `__builtin_popcount(__builtin_
+                // popcount(…))` opened a fresh driver per level — THREE host
+                // frames each, and gcc compiles that shape to at least 16384
+                // levels. Its args pump exactly as IntrinsicCall's do; the
+                // payload dispatch is `emitBuiltinCall`, shared verbatim with
+                // the recursive body so there is ONE emission source of truth.
+                // A ZERO-child builtin is admitted too (the pump finishes
+                // immediately and `emitBuiltinCall` runs on an empty operand
+                // list), which is byte-identical to the recursive arm's loop
+                // over an empty child span.
+                case HirKind::BuiltinCall: {
+                    std::uint32_t const ctxIdx =
+                        static_cast<std::uint32_t>(callCtxs.size());
+                    callCtxs.push_back(CallLowerCtx{
+                        .node = n, .resultTy = hir.typeId(n)});
+                    callCtxs.back().argIdx = 0;
+                    work.push_back({.family = LFam::Value, .vkind = LVK::BuiltinCall,
                                     .node = n, .phase = 0, .aux = ctxIdx});
                     return;
                 }
@@ -5341,21 +5442,29 @@ struct Lowerer {
             result = lowerExprNode(n);   // delegate (terminal / CFG / by-address)
             return;
           }
-        };
+    }
 
-        // Plan 24: the per-arg pump for a flattened Call (ctx at stable index
-        // `ctxIdx`). Advances `processOneCallArg` until a SCALAR arg is reached
-        // (struct args materialize inline there), which it routes through `request`
-        // (the Call frame's phase 2 then collects it). Returns true iff it entered
-        // a scalar arg's value-lowering (the caller must wait for it); false when
-        // all args are consumed (the caller finishes the call). `request` (if
-        // called) is the LAST action, so the dangling-`work.back()` rule holds.
-        // Re-addresses `callCtxs[ctxIdx]` fresh each access — a scalar arg that is
-        // itself a call grows `callCtxs`, so the INDEX is stable where a reference
-        // would dangle. Returns -1 to signal a fail-loud (the caller aborts).
-        auto const pumpCallArgs = [&](std::uint32_t ctxIdx) -> int {
+    // Plan 24: the per-arg pump for a flattened Call (ctx at stable index
+    // `ctxIdx`). Advances `processOneCallArg` until a SCALAR arg is reached
+    // (struct args materialize inline there), which it routes through `request`
+    // (the Call frame's phase 2 then collects it). Returns true iff it entered
+    // a scalar arg's value-lowering (the caller must wait for it); false when
+    // all args are consumed (the caller finishes the call). `request` (if
+    // called) is the LAST action, so the dangling-`work.back()` rule holds.
+    // Re-addresses `callCtxs[ctxIdx]` fresh each access — a scalar arg that is
+    // itself a call grows `callCtxs`, so the INDEX is stable where a reference
+    // would dangle. Returns -1 to signal a fail-loud (the caller aborts).
+    // ⚠ `ctxAt` is handed to `processOneCallArg` as a CALLABLE, never as a
+    // `CallLowerCtx&`: a by-value AGGREGATE arg is materialized inside that call
+    // and materializing one LOWERS the argument expression, which can push onto
+    // `callCtxs` and reallocate it
+    // (D-MIR-CALLCTX-REFERENCE-HELD-ACROSS-A-NESTED-LOWERING-DUPLICATES-THE-ARGUMENT).
+    [[nodiscard]] int pumpCallArgs(std::uint32_t ctxIdx) {
+            auto const ctxAt = [this, ctxIdx]() -> CallLowerCtx& {
+                return callCtxs[ctxIdx];
+            };
             for (;;) {
-                CallArgStep const step = processOneCallArg(callCtxs[ctxIdx]);
+                CallArgStep const step = processOneCallArg(ctxAt);
                 if (step == CallArgStep::Error) return -1;          // fail-loud
                 if (step == CallArgStep::Done) return 0;            // finish
                 if (step == CallArgStep::StructDone) continue;      // next arg
@@ -5367,13 +5476,15 @@ struct Lowerer {
                 request(argN, false);
                 return 1;   // entered a scalar arg — wait
             }
-        };
+    }
 
-        request(node, rootWantAddr);
-        while (!work.empty()) {
-            ValueFrame& f = work.back();
-            switch (f.kind) {
-            case ValueFrame::Kind::Unary:
+    // One step of the VALUE/ADDRESS family's top frame. `break` leaves the arm;
+    // `runUntil` re-enters with whatever the arm left on top of `work`.
+    void stepValueFrame() {
+        {
+            LowerFrame& f = work.back();
+            switch (f.vkind) {
+            case LowerFrame::ValueKind::Unary:
                 if (f.phase == 0) {
                     f.phase = 1;
                     HirNodeId const operandN = hir.children(f.node)[0];
@@ -5386,7 +5497,7 @@ struct Lowerer {
                                              : InvalidMirInst;
                 }
                 break;
-            case ValueFrame::Kind::Binary:
+            case LowerFrame::ValueKind::Binary:
                 // LHS first (phase 0→1), then RHS (phase 1→2) — matching the
                 // recursive `lhs = lowerExpr(kids[0]); rhs = lowerExpr(kids[1]);`
                 // which are two SEQUENTIAL statements → left-to-right, NOT
@@ -5412,7 +5523,7 @@ struct Lowerer {
                                  : InvalidMirInst;
                 }
                 break;
-            case ValueFrame::Kind::Deref:
+            case LowerFrame::ValueKind::Deref:
                 if (f.phase == 0) {
                     f.phase = 1;
                     HirNodeId const ptrN = hir.children(f.node)[0];
@@ -5425,7 +5536,7 @@ struct Lowerer {
                                          : InvalidMirInst;
                 }
                 break;
-            case ValueFrame::Kind::Cast:
+            case LowerFrame::ValueKind::Cast:
                 if (f.phase == 0) {
                     f.phase = 1;
                     HirNodeId const operandN = hir.children(f.node)[0];
@@ -5438,7 +5549,7 @@ struct Lowerer {
                                              : InvalidMirInst;
                 }
                 break;
-            case ValueFrame::Kind::MemberAddr:
+            case LowerFrame::ValueKind::MemberAddr:
                 // Base lvalue ADDRESS (the deep axis), then offset + Gep — the
                 // recursive arm's `basePtr = lowerLvalueAddress(kids[0]);` then
                 // `combineMemberAddr`. ONE child request → phase 0 enter, phase
@@ -5455,7 +5566,7 @@ struct Lowerer {
                                              : InvalidMirInst;
                 }
                 break;
-            case ValueFrame::Kind::IndexAddr:
+            case LowerFrame::ValueKind::IndexAddr:
                 // Subscript VALUE first (phase 0→1), then — IN THE RECURSIVE
                 // ORDER — scale the index to bytes (emit the stride Mul BEFORE
                 // the base), then the base (storage ADDRESS or pointer VALUE)
@@ -5499,7 +5610,7 @@ struct Lowerer {
                                  : InvalidMirInst;
                 }
                 break;
-            case ValueFrame::Kind::Ternary:
+            case LowerFrame::ValueKind::Ternary:
                 // `cond ? then : else` → a diamond CFG with a phi at the join.
                 // Replicates the recursive Ternary arm BYTE-FOR-BYTE:
                 //   phase 0: aggregate guard, then lower COND.
@@ -5575,7 +5686,7 @@ struct Lowerer {
                     result = mir.addPhi(hir.typeId(node2), incomings);
                 }
                 break;
-            case ValueFrame::Kind::Logical:
+            case LowerFrame::ValueKind::Logical:
                 // `lhs && rhs` / `lhs || rhs` short-circuit → a one-armed
                 // diamond. Replicates the recursive LogicalAnd/Or arm
                 // BYTE-FOR-BYTE:
@@ -5628,36 +5739,76 @@ struct Lowerer {
                     result = mir.addPhi(hir.typeId(node2), incomings);
                 }
                 break;
-            case ValueFrame::Kind::SeqExpr:
-                // `(s1, s2, …, result)` → run the side-effect statements in
-                // order (via `lowerStmt`, a separate machine kept recursive —
-                // it spins up its OWN local driver for any sub-expressions, so
-                // it never touches THIS work-stack), then yield the RESULT
-                // expression's value. Only the result tail re-enters this driver
-                // (phase 0 requests it), so a deep comma chain's result spine
-                // flattens. Byte-identical to the recursive arm: same aggregate
-                // guard, same stmt order, then `lowerExpr(result)`.
+            case LowerFrame::ValueKind::SeqExpr: {
+                // ★★★ P61 — THE COMMA CHAIN, AND THE WHOLE REASON THE THREE
+                // DRIVERS ARE NOW ONE STACK.
+                //
+                // `(s1, s2, …, result)` → run the side-effect statements IN
+                // ORDER, then yield the RESULT expression's value. Both halves
+                // now ride THIS work-stack: `enterStmt` pushes a statement frame
+                // for each `si` (phase 1 → 2 → 1 …), and the result tail is a
+                // `request` (phase 3). Nothing here calls `lowerStmt`.
+                //
+                // ⚠ WHY THAT MATTERS. `a, b, c` nests LEFT — cst_to_hir's
+                // `combineComma` builds `SeqExpr([ExprStmt(lhs)], rhs)` — so a
+                // comma chain's depth is its LENGTH, the axis a real corpus
+                // reaches. While the statements ran through `lowerStmt` the
+                // chain closed a SEVEN-frame host cycle per element
+                // (`lowerDiscardedExpr` → `lowerOneDiscardedExpr` → `lowerExpr`
+                // → `runExprDriver` → `lowerStmt` → `enterStmt` →
+                // `lowerStmtNode`), gdb-attributed, and died in the low 300s.
+                // Flattening only the discard side, or only this side, would
+                // have left the other half dying at the same depth: an
+                // alternating cycle flattens only when EVERY edge is on one
+                // stack.
+                //
+                // ORDER IS PRESERVED EXACTLY: a statement's frames sit ON TOP of
+                // this one and drain completely before phase 2 resumes, which is
+                // what the nested `lowerStmt` call did with its own stack. Same
+                // aggregate guard, same statement order, same tail request.
+                //
+                // `flag0` selects the BY-ADDRESS variant (an aggregate comma,
+                // whose recursive twin lives in `lowerLvalueAddressNode`): it
+                // skips the guard — that arm never had one, because reaching a
+                // carrier by address is the remedy the guard demands — and asks
+                // for the tail's ADDRESS instead of its value.
                 if (f.phase == 0) {
                     HirNodeId const node2 = f.node;
-                    if (seqExprAggregateGuardFails(node2)) {
+                    if (!f.flag0 && seqExprAggregateGuardFails(node2)) {
                         work.pop_back(); result = InvalidMirInst; break;
                     }
-                    bool stmtFailed = false;
-                    for (HirNodeId stmt : hir.seqExprStmts(node2)) {
-                        if (!lowerStmt(stmt)) { stmtFailed = true; break; }
-                    }
-                    if (stmtFailed) { work.pop_back(); result = InvalidMirInst; break; }
                     f.phase = 1;
-                    // `lowerStmt` did not push to THIS work-stack, so `f` is
-                    // still live; the result-tail request is the last action.
-                    HirNodeId const resultN = hir.seqExprResult(node2);
-                    request(resultN, false);  // lower result tail — may invalidate `f`
-                } else {
-                    // `result` already holds the tail expression's value.
+                    f.aux   = 0;
+                }
+                if (f.phase == 2) {
+                    // A side-effect statement just finished; `ok` is its verdict.
+                    if (!ok) { work.pop_back(); result = InvalidMirInst; break; }
+                    ++f.aux;
+                    f.phase = 1;
+                }
+                if (f.phase == 3) {
+                    // `result` already holds the tail expression's value/address.
                     work.pop_back();
+                    break;
+                }
+                {
+                    HirNodeId const node2 = f.node;
+                    auto stmts = hir.seqExprStmts(node2);
+                    std::uint32_t const i = f.aux;
+                    if (i < stmts.size()) {
+                        HirNodeId const stmtN = stmts[i];
+                        f.phase = 2;
+                        enterStmt(stmtN);   // lower one stmt — may invalidate `f`
+                        break;
+                    }
+                    f.phase = 3;
+                    bool const wantAddr = f.flag0;
+                    HirNodeId const resultN = hir.seqExprResult(node2);
+                    request(resultN, wantAddr);  // tail — may invalidate `f`
                 }
                 break;
-            case ValueFrame::Kind::Call:
+            }
+            case LowerFrame::ValueKind::Call:
                 // `f(a, b, …)`: build the callee FIRST (phase 0→1, matching the
                 // recursive arm's `callee = lowerExpr(kids[0])` which sequences
                 // before the args), run the pre-loop setup (phase 1: callee-
@@ -5713,7 +5864,7 @@ struct Lowerer {
                     work.pop_back(); callCtxs.pop_back();
                 }
                 break;
-            case ValueFrame::Kind::IntrinsicCall: {
+            case LowerFrame::ValueKind::IntrinsicCall: {
                 // `__intrinsic(a, b, …)`: all-scalar args, no callee child, no
                 // struct ABI. phase 0 requests the FIRST arg (if any); phase 1
                 // collects the just-lowered arg, advances, and requests the next —
@@ -5750,25 +5901,207 @@ struct Lowerer {
                 request(argN, false);   // lower the next arg — may invalidate `f`
                 break;
             }
+            case LowerFrame::ValueKind::BuiltinCall: {
+                // P61: `__builtin_x(a, b, …)` — the IntrinsicCall machine with
+                // `emitBuiltinCall` as the emission body. Byte-identical to the
+                // recursive arm, which lowers EVERY child into `operands` first
+                // and only then dispatches on the payload; the pump reproduces
+                // that order one arg at a time.
+                std::uint32_t const ctxIdx = f.aux;
+                if (f.phase == 1) {
+                    MirInstId const argVal = result;
+                    if (!argVal.valid()) {
+                        work.pop_back(); callCtxs.pop_back();
+                        result = InvalidMirInst; break;
+                    }
+                    callCtxs[ctxIdx].operands.push_back(argVal);
+                    ++callCtxs[ctxIdx].argIdx;
+                }
+                if (callCtxs[ctxIdx].argIdx
+                    >= hir.children(callCtxs[ctxIdx].node).size()) {
+                    HirNodeId const node2 = callCtxs[ctxIdx].node;
+                    // Copy the operands out BEFORE popping the ctx: emission may
+                    // itself lower (the ComplexMake arm allocates a slot), which
+                    // can grow `callCtxs` and dangle a held reference.
+                    std::vector<MirInstId> operands =
+                        std::move(callCtxs[ctxIdx].operands);
+                    work.pop_back(); callCtxs.pop_back();
+                    result = emitBuiltinCall(node2, operands);
+                    break;
+                }
+                f.phase = 1;
+                HirNodeId const argN =
+                    hir.children(callCtxs[ctxIdx].node)[callCtxs[ctxIdx].argIdx];
+                request(argN, false);   // lower the next arg — may invalidate `f`
+                break;
+            }
             }
         }
-        return result;
+    }
+
+    // ── P61 — the DISCARD family, formerly `lowerDiscardedExpr`'s own stack ───
+    //
+    // Push a frame that lowers `n` in DISCARD position. Always pushes (the
+    // classification happens in the step), so this can never recurse.
+    void enterDiscard(HirNodeId n) {
+        work.push_back({.family = LFam::Discard, .dkind = LDK::One,
+                        .node = n, .phase = 0});
+    }
+
+    // The innermost half of the old `failUnwind`: a discarded expression that
+    // FAILED adds ONE `Unreachable` — and only when there is an enclosing void-
+    // ternary diamond, because a top-level scalar discard that fails never added
+    // one. Called AFTER the failed frame is popped, so `work.back()` is the
+    // enclosing level if there is one. Each enclosing `Discard::Ternary` then
+    // seals what its own level created as `ok == false` propagates down, which is
+    // the same innermost-first order the recursive unwind walked.
+    void failDiscardLevel() {
+        if (!work.empty() && work.back().family == LFam::Discard
+            && work.back().dkind == LDK::Ternary
+            && !mir.openBlockHasTerminator()) {
+            mir.addUnreachable();
+        }
+    }
+
+    // One step of the DISCARD family's top frame. A REAL `switch` over
+    // `DiscardKind` with no `default:`, on the same argument the family split
+    // was made for: `-Werror=switch` must refuse a third discard kind that no
+    // arm handles. ⚠ This was an `if (dkind == Ternary) { … }` falling through
+    // to the `One` path, which would have handled a third kind SILENTLY as
+    // `One` — the guard the `LowerFrame` comment claims for all three steppers
+    // was armed in two of them.
+    void stepDiscardFrame() {
+        switch (work.back().dkind) {
+        case LowerFrame::DiscardKind::Ternary: {
+            LowerFrame& f = work.back();
+            {
+                // An arm just finished; `ok` carries its verdict.
+                MirBlockId const elseBB = f.bb0;
+                MirBlockId const joinBB = f.bb1;
+                HirNodeId const node2   = f.node;
+                std::uint8_t const phase = f.phase;
+                if (!ok) {
+                    if (phase == 0) sealCreatedAsUnreachable(elseBB);
+                    sealCreatedAsUnreachable(joinBB);
+                    work.pop_back();
+                    ok = false;
+                    return;
+                }
+                if (phase == 0) {
+                    mir.addBr(joinBB);
+                    mir.beginBlock(elseBB);
+                    f.phase = 1;
+                    enterDiscard(hir.children(node2)[2]);  // may invalidate `f`
+                    return;
+                }
+                mir.addBr(joinBB);
+                // The slot IS where control resumes — no value, because none exists.
+                mir.beginBlock(joinBB);
+                work.pop_back();
+                ok = true;
+                return;
+            }
+        }
+        case LowerFrame::DiscardKind::One: {
+            LowerFrame& f = work.back();
+            if (f.phase == 1) {
+                // The expression's value (or address) is in `result`.
+                bool const good = result.valid();
+                work.pop_back();
+                if (!good) { failDiscardLevel(); ok = false; return; }
+                ok = true;
+                return;
+            }
+            if (f.phase == 2) {
+                // The void ternary's CONDITION is in `result`.
+                HirNodeId const node2 = f.node;
+                if (!result.valid()) {
+                    work.pop_back(); failDiscardLevel(); ok = false; return;
+                }
+                MirInstId const cond = result;
+                auto kids = hir.children(node2);
+                // The SAME StructCfMarker triple the scalar diamond uses — the
+                // verifier pairs markers by COUNT, so an IfThen/IfElse/IfJoin
+                // that did not match would break the structured-CF invariant.
+                MirBlockId const thenBB = mir.createBlock(StructCfMarker::IfThen);
+                MirBlockId const elseBB = mir.createBlock(StructCfMarker::IfElse);
+                MirBlockId const joinBB = mir.createBlock(StructCfMarker::IfJoin);
+                mir.addCondBr(cond, thenBB, elseBB);
+                mir.beginBlock(thenBB);
+                f.dkind = LDK::Ternary;
+                f.phase = 0;             // 0 = the THEN arm is in flight
+                f.bb0   = elseBB;
+                f.bb1   = joinBB;
+                enterDiscard(kids[1]);   // may invalidate `f`
+                return;
+            }
+            // phase 0 — classify. Byte-identical to the classification the
+            // recursive `lowerDiscardedExpr` ran per expression before P61.
+            HirNodeId const expr = f.node;
+            if (TypeId const et = hir.typeId(expr); et.valid()) {
+                // A memory-resident result (Struct/Union/Array AND a wide
+                // `_BitInt(N>64)`, D-CSUBSET-BITINT-C2-WIDE) has no bare-SSA
+                // value — route it BY ADDRESS, the same by-construction path
+                // aggregates use.
+                if (isMemoryResidentType(interner, et)) {
+                    f.phase = 1;
+                    request(expr, /*wantAddr=*/true);   // may invalidate `f`
+                    return;
+                }
+                if (interner.kind(et) == TypeKind::Void
+                    && hir.kind(expr) == HirKind::Ternary) {
+                    if (hir.children(expr).size() != 3) {
+                        unsupported(expr, "malformed Ternary (expect 3 children)");
+                        work.pop_back(); failDiscardLevel(); ok = false;
+                        return;
+                    }
+                    f.phase = 2;
+                    request(hir.children(expr)[0], false);  // may invalidate `f`
+                    return;
+                }
+            }
+            f.phase = 1;
+            request(expr, /*wantAddr=*/false);   // may invalidate `f`
+            return;
+        }
+        }
+    }
+
+    // ── P61 — THE ONE DRIVER LOOP ────────────────────────────────────────────
+    // Drain `work` back down to `base`. Every public entry records its own base
+    // and calls this, so a driver invocation nested inside a DELEGATED node body
+    // (`lowerExprNode`'s Ternary arm, `lowerStmtNode`'s leaf arms) still costs
+    // exactly one host frame and can never pop a caller's frames.
+    void runUntil(std::size_t base) {
+        while (work.size() > base) {
+            switch (work.back().family) {
+                case LFam::Value:   stepValueFrame();   break;
+                case LFam::Stmt:    stepStmtFrame();    break;
+                case LFam::Discard: stepDiscardFrame(); break;
+            }
+        }
     }
 
     // The public VALUE-lowering entry: lower an HIR expression to the MirInstId
-    // that produces its rvalue. A thin wrapper over the shared {Value,Address}
-    // driver (root request = VALUE).
+    // that produces its rvalue. A thin wrapper over the shared driver (root
+    // request = VALUE).
     [[nodiscard]] MirInstId lowerExpr(HirNodeId node) {
-        return runExprDriver(node, /*rootWantAddr=*/false);
+        std::size_t const base = work.size();
+        request(node, /*wantAddr=*/false);
+        runUntil(base);
+        return result;
     }
 
     // The public ADDRESS-lowering entry: resolve the pointer value an lvalue
     // names (a `Store` target, an `AddressOf` result, a base for member/index).
-    // A thin wrapper over the shared {Value,Address} driver (root request =
-    // ADDRESS). Distinct from `lowerExpr` which yields the lvalue's RVALUE
-    // (`Load(ptr)`); see `lowerLvalueAddressNode` for the per-arm semantics.
+    // A thin wrapper over the shared driver (root request = ADDRESS). Distinct
+    // from `lowerExpr` which yields the lvalue's RVALUE (`Load(ptr)`); see
+    // `lowerLvalueAddressNode` for the per-arm semantics.
     [[nodiscard]] MirInstId lowerLvalueAddress(HirNodeId node) {
-        return runExprDriver(node, /*rootWantAddr=*/true);
+        std::size_t const base = work.size();
+        request(node, /*wantAddr=*/true);
+        runUntil(base);
+        return result;
     }
 
     // Error-recovery helper: every forward-`createBlock`'d block in a
@@ -8473,7 +8806,7 @@ struct Lowerer {
     // ── Plan 24 (hir_to_mir Call residual) — shared Call-arm pieces ─────────
     // The accumulating per-call state for lowering a `Call` / `IntrinsicCall`.
     // The recursive `lowerExprNode` Call arm builds one of these on the stack;
-    // the iterative `runExprDriver` Call frame keeps one in a `callCtxs` LIFO
+    // the iterative driver's Call frame keeps one in a `callCtxs` LIFO
     // vector keyed by a STABLE index (the cst_to_hir `CallCtx` idiom — a nested
     // call's argument grows that vector mid-pump, so a held reference would
     // dangle while the index survives). The four helpers below
@@ -8504,6 +8837,18 @@ struct Lowerer {
     // it reports `ScalarPending` so the caller can lower it (recursively, or via
     // the work-stack) and then call `finishScalarCallArg` with the result.
     enum class CallArgStep : std::uint8_t { Done, ScalarPending, StructDone, Error };
+
+    // What materializing ONE by-value aggregate argument produced: the Call
+    // operands to append (in order) and the per-class register cursor AFTER the
+    // argument. Returned BY VALUE rather than written through a `CallLowerCtx&`
+    // for the reason spelled out on `processOneCallArg` — the synthesis lowers,
+    // and a lowering can move the ctx. `operands` is owned by the CALLER's frame,
+    // so the `std::vector<MirInstId>&` the two appenders take can never dangle.
+    struct ByValueArgResult {
+        std::vector<MirInstId> operands;    // append to `ctx.operands`, in order
+        std::uint32_t          runGpr = 0;  // the ctx's NEW runGpr (not a delta)
+        std::uint32_t          runFpr = 0;  // the ctx's NEW runFpr (not a delta)
+    };
 
     // Pre-arg-loop setup for a `Call` (mirrors the recursive arm's lines between
     // the callee `lowerExpr` and the arg loop). The callee MirInstId is already
@@ -8580,18 +8925,48 @@ struct Lowerer {
     // work-stack); it reports `ScalarPending` with `ctx.argIdx` STILL pointed at
     // the in-flight arg so `finishScalarCallArg` derives the same `argTy`. When
     // all args are consumed → `Done`. A fail-loud (already emitted) → `Error`.
-    [[nodiscard]] CallArgStep processOneCallArg(CallLowerCtx& ctx) {
-        auto kids = hir.children(ctx.node);
-        if (ctx.argIdx >= kids.size()) return CallArgStep::Done;
-        std::size_t const i = ctx.argIdx;
+    //
+    // ⚠⚠ `ctxOf` IS A CALLABLE, NOT A `CallLowerCtx&`, AND THAT IS LOAD-BEARING —
+    // D-MIR-CALLCTX-REFERENCE-HELD-ACROSS-A-NESTED-LOWERING-DUPLICATES-THE-ARGUMENT.
+    // Materializing a by-value aggregate argument LOWERS that argument's expression
+    // (`appendByValueArg` → `lowerLvalueAddress`), and an argument that is itself an
+    // aggregate-returning CALL re-enters the expression driver, which pushes onto
+    // `callCtxs` and can REALLOCATE it. Any `CallLowerCtx&` — or any reference into
+    // one, such as `ctx.operands` — taken BEFORE that lowering is dangling AFTER it,
+    // so `++ctx.argIdx` lands in the freed object, the live `argIdx` never advances,
+    // and the pump re-enters on the SAME argument: the argument expression is
+    // lowered TWICE. A side-effecting argument then runs twice (C's evaluation-count
+    // rule broken with no diagnostic). Handing back the ctx on DEMAND makes that
+    // reference inexpressible: the driver returns `callCtxs[ctxIdx]` (a stable
+    // INDEX), the recursive arm returns its stack local, and neither caller can hold
+    // one across the lowering. This is the same invariant the `BuiltinCall` frame
+    // states for its operands, moved from per-site discipline into the SIGNATURE.
+    template <typename CtxOf>
+    [[nodiscard]] CallArgStep processOneCallArg(CtxOf const& ctxOf) {
+        auto kids = hir.children(ctxOf().node);
+        if (ctxOf().argIdx >= kids.size()) return CallArgStep::Done;
+        std::size_t const i = ctxOf().argIdx;
         TypeId const argTy = hir.typeId(kids[i]);
         if (argTy.valid()) {
             // D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt` arg is passed BY VALUE exactly
             // like a struct/union (isByValueClass → classifyAggregate → 2-GPR / by-ref),
             // materialized here; it never becomes a ScalarPending register value.
             if (isByValueClass(interner, argTy)) {
-                if (!emitByValueStructCallArg(ctx, kids[i], argTy))
+                // Copy every ctx INPUT out before the lowering, and apply every
+                // ctx OUTPUT after it — the ctx is untouched across the window.
+                bool          const variadicCallee = ctxOf().calleeVariadic;
+                std::uint32_t const inGpr = ctxOf().runGpr;
+                std::uint32_t const inFpr = ctxOf().runFpr;
+                ByValueArgResult materialized;
+                if (!emitByValueStructCallArg(kids[i], argTy, variadicCallee,
+                                              inGpr, inFpr, materialized))
                     return CallArgStep::Error;
+                CallLowerCtx& ctx = ctxOf();   // RE-ACQUIRED after the lowering
+                ctx.operands.insert(ctx.operands.end(),
+                                    materialized.operands.begin(),
+                                    materialized.operands.end());
+                ctx.runGpr = materialized.runGpr;
+                ctx.runFpr = materialized.runFpr;
                 if (i == ctx.fnParamsSize) {
                     ctx.fixedOperandCount =
                         ctx.operands.size() - ctx.operandsBeforeArgs;
@@ -8607,11 +8982,18 @@ struct Lowerer {
     // The by-value struct/union ARG synthesis lifted VERBATIM from the recursive
     // arm's loop body (the ~200-line ABI block: classify, variadic carrier
     // selection per va_list strategy, the all-or-nothing register-exhaustion
-    // split, the InRegisters piece push). Pushes onto `ctx.operands` and advances
-    // `ctx.runGpr`/`ctx.runFpr`. Returns false on a fail-loud (already emitted).
-    [[nodiscard]] bool emitByValueStructCallArg(CallLowerCtx& ctx, HirNodeId argNode,
-                                                TypeId argTy) {
-        std::vector<MirInstId>& operands = ctx.operands;
+    // split, the InRegisters piece push). Reads the ctx's `calleeVariadic` /
+    // `runGpr` / `runFpr` as VALUES and reports its operands + the new cursor
+    // through `out`; it never sees the ctx, because it lowers (see
+    // `processOneCallArg`). Returns false on a fail-loud (already emitted).
+    [[nodiscard]] bool emitByValueStructCallArg(HirNodeId argNode, TypeId argTy,
+                                                bool calleeVariadic,
+                                                std::uint32_t runGpr,
+                                                std::uint32_t runFpr,
+                                                ByValueArgResult& out) {
+        std::vector<MirInstId>& operands = out.operands;
+        out.runGpr = runGpr;
+        out.runFpr = runFpr;
         auto const abi = byValueClassify(argTy);
         if (!abi.has_value()) {
             unsupported(argNode,
@@ -8621,7 +9003,7 @@ struct Lowerer {
             return false;
         }
         if (abi->kind == AbiPassing::Kind::ByReference) {
-            if (ctx.calleeVariadic) {
+            if (calleeVariadic) {
                 if (!config.vaListLayout.has_value()) {
                     unsupported(argNode,
                         "passing a struct/union BY VALUE to a "
@@ -8635,11 +9017,11 @@ struct Lowerer {
                 if (vlMem.strategy == VaListStrategy::HomogeneousPointer) {
                     if (!appendByValueArg(operands, argNode, argTy, *abi))
                         return false;
-                    ctx.runGpr += 1;
+                    out.runGpr += 1;
                 } else if (vlMem.strategy == VaListStrategy::Aapcs64DualCursor) {
                     if (!appendByValueArg(operands, argNode, argTy, *abi))
                         return false;
-                    ctx.runGpr += 1;
+                    out.runGpr += 1;
                 } else if (vlMem.strategy == VaListStrategy::SysVRegisterSave) {
                     if (!appendByValueStackArg(operands, argNode, argTy))
                         return false;
@@ -8654,7 +9036,7 @@ struct Lowerer {
             } else {
                 if (!appendByValueArg(operands, argNode, argTy, *abi))
                     return false;
-                ctx.runGpr += 1;   // the pointer operand is GPR-class
+                out.runGpr += 1;   // the pointer operand is GPR-class
             }
         } else {
             // InRegisters: count the eightbyte pieces per class.
@@ -8670,7 +9052,7 @@ struct Lowerer {
                     "violated)");
                 return false;
             }
-            if (ctx.calleeVariadic && !config.vaListLayout.has_value()) {
+            if (calleeVariadic && !config.vaListLayout.has_value()) {
                 unsupported(argNode,
                     "passing a struct/union BY VALUE to a variadic "
                     "function requires the CC's 'vaListLayout' "
@@ -8680,8 +9062,8 @@ struct Lowerer {
                 return false;
             }
             bool const routeToStack = !config.argSlotAligned
-                && (ctx.runGpr + numGp > config.argGprCount
-                    || ctx.runFpr + numFp > config.argFprCount);
+                && (out.runGpr + numGp > config.argGprCount
+                    || out.runFpr + numFp > config.argFprCount);
             if (routeToStack) {
                 std::uint8_t const exhaustClass =
                     config.aggregateStackExhaustsRegisters
@@ -8691,16 +9073,16 @@ struct Lowerer {
                 if (!appendByValueStackArg(operands, argNode, argTy, exhaustClass))
                     return false;
                 if (config.aggregateStackExhaustsRegisters) {
-                    if (ctx.runGpr + numGp > config.argGprCount)
-                        ctx.runGpr = config.argGprCount;
-                    if (ctx.runFpr + numFp > config.argFprCount)
-                        ctx.runFpr = config.argFprCount;
+                    if (out.runGpr + numGp > config.argGprCount)
+                        out.runGpr = config.argGprCount;
+                    if (out.runFpr + numFp > config.argFprCount)
+                        out.runFpr = config.argFprCount;
                 }
             } else {
                 if (!appendByValueArg(operands, argNode, argTy, *abi))
                     return false;
-                ctx.runGpr += numGp;
-                ctx.runFpr += numFp;
+                out.runGpr += numGp;
+                out.runFpr += numFp;
             }
         }
         return true;
@@ -9853,156 +10235,30 @@ struct Lowerer {
     // reachable ONLY by genuine internal misrouting (unreachable from user code).
     // A scalar discard lowers as an ordinary rvalue via `lowerExpr`.
     //
-    // ★★ P55 lane `ag`: the void-ternary arm no longer RE-ENTERS this function.
+    // ★★ P55 lane `ag`: the void-ternary arm does not RE-ENTER this function.
     // `c ? (d ? … : …) : (e ? … : …);` nests as deep as the user writes it and
     // carried no cap, so under the operator's ruling of 2026-09-02 the nesting
-    // costs heap: an explicit continuation stack holds the diamond's three
-    // blocks and which arm is being emitted, and the driver resumes the frame
-    // instead of unwinding a host frame. The emitted CFG is unchanged — the same
-    // blocks in the same order with the same StructCfMarker triple.
+    // costs heap. ★★★ P61 moved that continuation stack onto the ONE shared
+    // driver stack, because the diamond was only half the recursion here: the
+    // ORDINARY arm — `return lowerExpr(expr)` — opened a fresh expression driver,
+    // and a comma chain reaches this funnel once per element through `ExprStmt`.
+    // The frames now live in `LowerFrame::DiscardKind::{One,Ternary}`; there is
+    // no second copy of the classification, which is the property this single
+    // chokepoint exists to have.
     //
     // ⚠ THE FAILURE PATH IS THE SUBTLE HALF AND IT IS PRESERVED EXACTLY. In the
     // recursive form a failure deep inside an arm added ONE `Unreachable` (the
     // innermost level, if its block had no terminator) and then, unwinding,
     // every enclosing level sealed the blocks it had created — the then-level
-    // sealing else+join, the else-level sealing join. Here the unwind walks the
-    // frame stack innermost-first and seals in that same order, and the
-    // `Unreachable` is added only when there IS an enclosing diamond, because a
-    // top-level scalar discard that fails never added one.
-    struct DiscardedTernaryFrame {
-        enum class Phase : std::uint8_t { Then, Else };
-        HirNodeId  node;
-        MirBlockId elseBB;
-        MirBlockId joinBB;
-        Phase      phase = Phase::Then;
-    };
-
+    // sealing else+join, the else-level sealing join. `failDiscardLevel` adds
+    // that one `Unreachable` iff an enclosing diamond exists, and each enclosing
+    // `Discard::Ternary` frame seals its own blocks as `ok == false` propagates
+    // down — the same innermost-first order.
     [[nodiscard]] bool lowerDiscardedExpr(HirNodeId expr) {
-        std::vector<DiscardedTernaryFrame> work;
-        // Unwind every enclosing diamond, sealing exactly what each level would
-        // have sealed on its way out. Returns false so callers can `return` it.
-        auto failUnwind = [&]() -> bool {
-            if (!work.empty() && !mir.openBlockHasTerminator())
-                mir.addUnreachable();
-            while (!work.empty()) {
-                DiscardedTernaryFrame const& f = work.back();
-                if (f.phase == DiscardedTernaryFrame::Phase::Then)
-                    sealCreatedAsUnreachable(f.elseBB);
-                sealCreatedAsUnreachable(f.joinBB);
-                work.pop_back();
-            }
-            return false;
-        };
-        HirNodeId pending     = expr;
-        bool      havePending = true;
-        for (;;) {
-            if (havePending) {
-                HirNodeId const cur = pending;
-                havePending = false;
-                switch (lowerOneDiscardedExpr(cur, work, pending, havePending)) {
-                    case DiscardStep::Failed: return failUnwind();
-                    case DiscardStep::Pushed: continue;   // descend into an arm
-                    case DiscardStep::Done:   break;
-                }
-            }
-            if (work.empty()) return true;
-            DiscardedTernaryFrame& f = work.back();
-            if (f.phase == DiscardedTernaryFrame::Phase::Then) {
-                mir.addBr(f.joinBB);
-                mir.beginBlock(f.elseBB);
-                f.phase     = DiscardedTernaryFrame::Phase::Else;
-                pending     = hir.children(f.node)[2];
-                havePending = true;
-                continue;
-            }
-            mir.addBr(f.joinBB);
-            // The slot IS where control resumes — no value, because none exists.
-            mir.beginBlock(f.joinBB);
-            work.pop_back();
-        }
-    }
-
-    enum class DiscardStep : std::uint8_t { Done, Pushed, Failed };
-
-    // Lower ONE expression in discard position. A void ternary opens its diamond,
-    // pushes a frame and hands back its THEN arm as the next thing to lower;
-    // everything else completes here.
-    [[nodiscard]] DiscardStep
-    lowerOneDiscardedExpr(HirNodeId expr,
-                          std::vector<DiscardedTernaryFrame>& work,
-                          HirNodeId& pending, bool& havePending) {
-        if (TypeId const et = hir.typeId(expr); et.valid()) {
-            // A memory-resident result (Struct/Union/Array AND a wide `_BitInt(N>64)`,
-            // D-CSUBSET-BITINT-C2-WIDE) has no bare-SSA value — route it BY ADDRESS, the
-            // same by-construction path aggregates use. `isMemoryResidentType` folds the
-            // wide-BitInt case in (previously a discarded wide expr relied on lowerExpr's
-            // request-flip — harmless, but off the shared funnel).
-            if (isMemoryResidentType(interner, et)) {
-                return lowerLvalueAddress(expr).valid() ? DiscardStep::Done
-                                                        : DiscardStep::Failed;
-            }
-            // D-CSUBSET-VOID-TERNARY-LOWERS-A-PHI-OF-VOID: a conditional whose
-            // arms are BOTH `void` (C 6.5.15p3 — "if both the second and third
-            // operands have void type, the result has void type") is legal C that
-            // gcc 13.3.0 (`-std=c2x`) and clang 18.1.3 (`-std=c23`), probed
-            // SEPARATELY, both compile and RUN. DSS refused it, and the refusal
-            // was an INTERNAL message two tiers below the source:
-            // `L_UnsupportedLoweringForOpcode: MIR value %N used …`.
-            //
-            // ✔MEASURED: the value path's diamond ends in `mir.addPhi(t, …)`, and
-            // `Phi` is a `Value`-result opcode — its type MUST be valid — so a
-            // VOID result asks for a phi of a thing that has no value. FIVE
-            // distinct source shapes all produced that one error, which is what
-            // identified the phi rather than any one syntax as the defect:
-            // `c ? g() : h();` · `(void)(c ? g() : h());` · `((c?g():h()), 5)` ·
-            // the same inside a loop body · `c ? g() : (void)0;`.
-            //
-            // ★ AND ALL FIVE ARRIVE HERE, WHICH IS WHY ONE ARM CLOSES THEM ALL.
-            // The bare statement and the loop body are ExprStmts; the comma's left
-            // operand is a `SeqExpr` side-effect statement, hence an ExprStmt; and
-            // `(void)X` mints NO Cast node at all (D-CSUBSET-CAST-VOID-DISCARD in
-            // cst_to_hir strips it and keeps the operand with a void type), so it
-            // is an ExprStmt too. This funnel is the ONE discard chokepoint they
-            // share — the same property that already lets the aggregate arm above
-            // cover every discarded aggregate shape.
-            //
-            // The lowering is the diamond WITHOUT the join phi: each arm is
-            // DISCARDED through this same funnel (so a nested void ternary, or a
-            // discarded aggregate inside an arm, keeps working by recursion), and
-            // the join is simply where control resumes. No value is produced
-            // because none exists — the correct answer, not a synthesized one.
-            //
-            // ⚠ THE VALUE PATH KEEPS ITS REFUSAL DELIBERATELY. A void ternary
-            // whose value is USED is a constraint violation (C 6.3.2.2), refused
-            // at the semantic tier by D-CSUBSET-VOID-VALUE-AS-AN-OPERATOR-OPERAND;
-            // if one ever reached `lowerExpr` anyway it still hits the phi-of-void
-            // fail-loud rather than silently acquiring a value here.
-            if (interner.kind(et) == TypeKind::Void
-                && hir.kind(expr) == HirKind::Ternary) {
-                auto kids = hir.children(expr);
-                if (kids.size() != 3) {
-                    unsupported(expr, "malformed Ternary (expect 3 children)");
-                    return DiscardStep::Failed;
-                }
-                MirInstId const cond = lowerExpr(kids[0]);
-                if (!cond.valid()) return DiscardStep::Failed;
-                // The SAME StructCfMarker triple the scalar diamond uses — the
-                // verifier pairs markers by COUNT, so an IfThen/IfElse/IfJoin
-                // that did not match would break the structured-CF invariant.
-                MirBlockId const thenBB = mir.createBlock(StructCfMarker::IfThen);
-                MirBlockId const elseBB = mir.createBlock(StructCfMarker::IfElse);
-                MirBlockId const joinBB = mir.createBlock(StructCfMarker::IfJoin);
-                mir.addCondBr(cond, thenBB, elseBB);
-
-                mir.beginBlock(thenBB);
-                work.push_back(DiscardedTernaryFrame{
-                    expr, elseBB, joinBB, DiscardedTernaryFrame::Phase::Then});
-                pending     = kids[1];
-                havePending = true;
-                return DiscardStep::Pushed;
-            }
-        }
-        return lowerExpr(expr).valid() ? DiscardStep::Done : DiscardStep::Failed;
+        std::size_t const base = work.size();
+        enterDiscard(expr);
+        runUntil(base);
+        return ok;
     }
 
     // ── FC12a-core variadic CALLEE lowering (D-FC12A-VARIADIC-CALLEE) ────────────
@@ -11152,43 +11408,26 @@ struct Lowerer {
     // accumulator `blockCtxs` referenced by the stable index `aux` (the
     // `callCtxs` pattern) — a nested block grows `blockCtxs`, so a held reference
     // would dangle; the index does not.
-    struct StmtFrame {
-        enum class Kind : std::uint8_t {
-            Block, If, While, DoWhile, For, Label, Switch, Seh
-        } kind;
-        HirNodeId node;
-        std::uint8_t phase;
-        // Block handles minted by a control-flow arm, carried across phases.
-        // If    : bb0=thenBB, bb1=elseBB(invalid if no else), bb2=joinBB.
-        // While : bb0=header, bb1=body, bb2=exit.
-        // DoWhile: bb0=body, bb1=continueBB, bb2=exit.
-        // For   : bb0=header, bb1=body, bb2=update(invalid if none), bb3=exit,
-        //         bb4=backTarget.
-        // Label : bb0=label block.
-        // Switch: bb0=exitBB (per-arm + case blocks live in blockCtxs/exprdata).
-        // Seh   : bb0=tryBB, bb1=filterBB, bb2=handlerBB, bb3=joinBB.
-        MirBlockId bb0{};
-        MirBlockId bb1{};
-        MirBlockId bb2{};
-        MirBlockId bb3{};
-        MirBlockId bb4{};
-        // If: tracks whether any path reaches the join (the recursive
-        // `joinReached`). Seh: the same `joinReached`. While/For/DoWhile: unused.
-        bool flag0{};
-        // Block: index into `blockCtxs` (the child cursor). Seh: the SEH REGION
-        // ID minted at phase 0 — it is consumed by the `SehTryEnd` marker and by
-        // `addSehFilterReturn` in a LATER phase, so it has to survive the resume
-        // like any other per-arm bookkeeping. Unused (0) by the others. (c60: the
-        // Switch frame no longer needs a per-arm cursor — its body lowers as ONE
-        // Block via the work-stack — so it carries only `bb0`.)
-        std::uint32_t aux{};
-        // VLA C5 (D-CSUBSET-VLA): for a Block frame, `vlaScopeStack_.size()` captured
-        // at the block's entry (phase 0). At the block's fall-through finish, the
-        // frames [vlaBase, size) are the VLAs this block declared — restore SP to the
-        // shallowest (index vlaBase) + pop them (`closeVlaBlockScope`). Unused (0) by
-        // the other kinds.
-        std::uint32_t vlaBase{};
-    };
+    // The statement family's block handles live in `LowerFrame::bb0..bb4`, and
+    // this is the table of what each arm keeps where:
+    //   If     : bb0=thenBB, bb1=elseBB(invalid if no else), bb2=joinBB.
+    //   While  : bb0=header, bb1=body, bb2=exit.
+    //   DoWhile: bb0=body, bb1=continueBB, bb2=exit.
+    //   For    : bb0=header, bb1=body, bb2=update(invalid if none), bb3=exit,
+    //            bb4=backTarget.
+    //   Label  : bb0=label block.
+    //   Switch : bb0=exitBB (per-arm + case blocks live in blockCtxs/exprdata).
+    //   Seh    : bb0=tryBB, bb1=filterBB, bb2=handlerBB, bb3=joinBB.
+    // `flag0` is `joinReached` for If and Seh (unused by While/For/DoWhile).
+    // `aux` is the `blockCtxs` index for Block and the SEH REGION ID for Seh —
+    // that id is minted at phase 0 and consumed by the `SehTryEnd` marker and by
+    // `addSehFilterReturn` in a LATER phase, so it has to survive the resume like
+    // any other per-arm bookkeeping. (c60: the Switch frame no longer needs a
+    // per-arm cursor — its body lowers as ONE Block via the work-stack.)
+    // `vlaBase` is a Block frame's `vlaScopeStack_.size()` at entry (VLA C5,
+    // D-CSUBSET-VLA): at the block's fall-through finish the frames
+    // [vlaBase, size) are the VLAs it declared, so SP is restored to the
+    // shallowest and they are popped (`closeVlaBlockScope`).
 
     // LIFO cursor for an unbounded child-statement list (a Block's stmts, or a
     // switch arm's body). Created when the arm starts iterating, popped when it
@@ -11200,6 +11439,51 @@ struct Lowerer {
     };
     std::vector<BlockIterCtx> blockCtxs;
 
+    // ── P61 — THE ONE SHARED DRIVER STATE ────────────────────────────────────
+    // Members rather than locals of a driver function, because the value, the
+    // statement and the discard families now share ONE stack: a `SeqExpr` frame
+    // pushes STATEMENT frames, an `ExprStmt` pushes a DISCARD frame, and a
+    // discard pushes a VALUE frame. Every public entry (`lowerExpr`,
+    // `lowerLvalueAddress`, `lowerStmt`, `lowerDiscardedExpr`) records
+    // `work.size()` as its BASE and drains only back to it, so a driver
+    // invocation nested inside a delegated per-node body is still perfectly
+    // scoped and can never pop a caller's frame.
+    //
+    // `result` and `ok` are the two delivery slots. A nested driver overwrites
+    // them, which is safe because every consumer reads its child's delivery as
+    // the FIRST action of the resumed phase, and every delegating assignment
+    // (`result = lowerExprNode(n)`, `ok = lowerStmtNode(n)`) writes AFTER any
+    // nesting inside that body has finished.
+    //
+    // ⚠⚠ A `std::deque`, AND THE REASON IS A DEFECT THIS MERGE ACTUALLY CAUSED,
+    // NOT A PREFERENCE. Both drivers were written to the rule "copy the frame's
+    // fields to locals and advance `phase` BEFORE any push, because `work.back()`
+    // may dangle after" — and that rule was stated against a stack that only the
+    // SAME family pushed to. Merging the families made `lowerExpr(cond)` inside a
+    // STATEMENT arm a push onto THIS stack, so the `LowerFrame& f` those arms
+    // hold across a condition/discriminant/filter lowering became a reference
+    // into a freed buffer. ✔MEASURED: with a `std::vector` here,
+    // `MirLoweringC.ComplexConditionTestsBothComponentsAgainstZero` and two
+    // sibling entries aborted with `MirBuilder fatal: block … was created but
+    // never filled + terminated` — the arm's `f.bbN = …` writes landing in the
+    // old allocation, so the block handles it minted were simply lost.
+    // `std::deque` does not invalidate references to existing elements on
+    // `push_back`, which is exactly the invariant ~100 call sites already assume;
+    // encoding that invariant in the CONTAINER rather than in per-site discipline
+    // is what makes it hold for the next arm somebody writes.
+    // ⓘ Cost, stated: MSVC's `_DEQUESIZ` is one element per block at this frame
+    // size, so a deep drive pays one small allocation per level. That is a
+    // constant-factor heap cost on a structure whose whole purpose is to move
+    // depth OFF the host stack — the trade this row's ruling asks for.
+    std::deque<LowerFrame> work;
+    // Plan 24: the flattened Call/IntrinsicCall/BuiltinCall accumulators. A LIFO
+    // stack parallel to `work`; a frame references its ctx by the STABLE index
+    // `aux` (an argument that is itself a call grows this vector mid-pump, so the
+    // index — never a held reference — is what survives).
+    std::vector<CallLowerCtx> callCtxs;
+    MirInstId result{InvalidMirInst};
+    bool      ok{false};
+
     // The public statement-lowering entry: a driver over an explicit heap
     // work-stack. For each node, `enterStmt` either PUSHES a frame for a
     // deeply-nesting control-flow arm or delegates to `lowerStmtNode` (which
@@ -11210,10 +11494,13 @@ struct Lowerer {
     // emitted MIR (block ids, branch targets, op order, vreg ids) is
     // byte-identical to the recursive `lowerStmt`.
     //
-    // NOTE — the EXTERNAL callers (`lowerFunction`'s body, `lowerForClauseNode`,
-    // the expression driver's SeqExpr arm) call this driver; each spins up its
-    // OWN local work-stack, so a for-init/SeqExpr statement subtree drains fully
-    // before its caller resumes — identical ordering to the recursive nesting.
+    // NOTE — there is NO per-entry work-stack any more, and that is the P61
+    // change: `lowerFunction`'s body and `lowerForClauseNode` call this driver,
+    // which records `work.size()` as its BASE and drains only back to it, so a
+    // for-init statement subtree still finishes before its caller resumes —
+    // identical ordering to the recursive nesting, on ONE shared stack. (The
+    // expression driver's `SeqExpr` arm no longer calls in at all: it pumps its
+    // side-effect statements as frames on that same stack.)
     // ★★★ INLINE-ASM P5 (D-CSUBSET-INLINE-ASM-OPERANDS) — THE HIR→MIR SEAM.
     //
     // `HirKind::InlineAsm` carries a `HirInlineAsmPool` HANDLE in its payload and its
@@ -12020,66 +12307,70 @@ struct Lowerer {
         return true;
     }
 
-    [[nodiscard]] bool lowerStmt(HirNodeId node) {
-        std::vector<StmtFrame> work;
-        // `enterStmt` ALWAYS assigns `ok` for a delegated node, and every pushed
-        // frame delivers into `ok` before it is read (then popped), so this
-        // sentinel never leaks.
-        bool ok = false;
-
-        // Classify `n`: push a frame for a flattenable control-flow arm (and
-        // return), else lower it here via `lowerStmtNode` (a leaf arm — it does
-        // not recurse into `lowerStmt`). A frame is pushed ONLY for the seven
-        // arms whose recursion is `lowerStmt(child)`. `enterStmt` (push) MUST be
-        // the LAST action of any caller path that copied out its frame fields —
-        // `work.back()` may dangle after.
-        auto const enterStmt = [&](HirNodeId n) {
+    // Classify `n`: push a frame for a flattenable control-flow arm (and
+    // return), else lower it here via `lowerStmtNode` (a leaf arm — it does
+    // not recurse into `lowerStmt`). A frame is pushed ONLY for the arms whose
+    // recursion is `lowerStmt(child)`. `enterStmt` (push) MUST be the LAST
+    // action of any caller path that copied out its frame fields —
+    // `work.back()` may dangle after.
+    void enterStmt(HirNodeId n) {
             switch (hir.kind(n)) {
                 case HirKind::Block:
-                    work.push_back({.kind = StmtFrame::Kind::Block,
+                    work.push_back({.family = LFam::Stmt, .skind = LSK::Block,
                                     .node = n, .phase = 0});
                     return;
                 case HirKind::IfStmt:
-                    work.push_back({.kind = StmtFrame::Kind::If,
+                    work.push_back({.family = LFam::Stmt, .skind = LSK::If,
                                     .node = n, .phase = 0});
                     return;
                 case HirKind::WhileStmt:
-                    work.push_back({.kind = StmtFrame::Kind::While,
+                    work.push_back({.family = LFam::Stmt, .skind = LSK::While,
                                     .node = n, .phase = 0});
                     return;
                 case HirKind::DoWhileStmt:
-                    work.push_back({.kind = StmtFrame::Kind::DoWhile,
+                    work.push_back({.family = LFam::Stmt, .skind = LSK::DoWhile,
                                     .node = n, .phase = 0});
                     return;
                 case HirKind::ForStmt:
-                    work.push_back({.kind = StmtFrame::Kind::For,
+                    work.push_back({.family = LFam::Stmt, .skind = LSK::For,
                                     .node = n, .phase = 0});
                     return;
                 case HirKind::LabelStmt:
-                    work.push_back({.kind = StmtFrame::Kind::Label,
+                    work.push_back({.family = LFam::Stmt, .skind = LSK::Label,
                                     .node = n, .phase = 0});
                     return;
                 case HirKind::SwitchStmt:
-                    work.push_back({.kind = StmtFrame::Kind::Switch,
+                    work.push_back({.family = LFam::Stmt, .skind = LSK::Switch,
                                     .node = n, .phase = 0});
                     return;
                 case HirKind::SehTryExcept:
-                    work.push_back({.kind = StmtFrame::Kind::Seh,
+                    work.push_back({.family = LFam::Stmt, .skind = LSK::Seh,
                                     .node = n, .phase = 0});
+                    return;
+                // ★★★ P61 — THE OTHER HALF OF THE COMMA CYCLE. `lowerStmtNode`'s
+                // ExprStmt arm is exactly `lowerDiscardedExpr(exprStmtExpr(n))`,
+                // and that opened a discard driver which opened a VALUE driver.
+                // Pushing the discard frame here puts that edge on this stack,
+                // so `SeqExpr → ExprStmt → SeqExpr` closes with ZERO host frames.
+                // The delegated arm below stays as the byte-identical recursive
+                // fallback, exactly as Block's does.
+                case HirKind::ExprStmt:
+                    enterDiscard(hir.exprStmtExpr(n));
                     return;
                 default: break;
             }
-            ok = lowerStmtNode(n);   // leaf (Return/ExprStmt/VarDecl/Assign/…)
-        };
+            ok = lowerStmtNode(n);   // leaf (Return/VarDecl/Assign/Break/Goto/…)
+    }
 
-        enterStmt(node);
-        while (!work.empty()) {
-            StmtFrame& f = work.back();
-            switch (f.kind) {
+    // One step of the STATEMENT family's top frame.
+    void stepStmtFrame() {
+        {
+            LowerFrame& f = work.back();
+            switch (f.skind) {
             // ── Block: lower each child in order, minting a fresh dead Linear
             // block between a sealed child and its next sibling (byte-identical
             // to the recursive loop). The child cursor is in `blockCtxs[aux]`.
-            case StmtFrame::Kind::Block: {
+            case LowerFrame::StmtKind::Block: {
                 if (f.phase == 0) {
                     f.aux = static_cast<std::uint32_t>(blockCtxs.size());
                     // VLA C5 (D-CSUBSET-VLA): watermark the VLA-scope stack at this
@@ -12138,7 +12429,7 @@ struct Lowerer {
             // requests then. phase 1 (after then): Br(join) if fell through,
             // then if else exists beginBlock(else)+request else, else finalize.
             // phase 2 (after else): Br(join) if fell through, finalize join.
-            case StmtFrame::Kind::If: {
+            case LowerFrame::StmtKind::If: {
                 if (f.phase == 0) {
                     HirNodeId const node2 = f.node;
                     HirNodeId const condN = hir.ifCondition(node2);
@@ -12209,7 +12500,7 @@ struct Lowerer {
             //          beginBlock(body), push BranchFrame{header,exit},
             //          request body. phase 1 (after body): pop BranchFrame,
             //          Br(header) if fell through, beginBlock(exit).
-            case StmtFrame::Kind::While: {
+            case LowerFrame::StmtKind::While: {
                 if (f.phase == 0) {
                     HirNodeId const node2 = f.node;
                     HirNodeId const condN = *hir.loopCondition(node2);
@@ -12261,7 +12552,7 @@ struct Lowerer {
             //          then if (continueReferenced || bodyFellThrough)
             //          beginBlock(continueBB)+lower cond (flat)+CondBr, else
             //          seal continueBB unreachable; beginBlock(exit).
-            case StmtFrame::Kind::DoWhile: {
+            case LowerFrame::StmtKind::DoWhile: {
                 if (f.phase == 0) {
                     HirNodeId const node2 = f.node;
                     MirBlockId const body =
@@ -12323,7 +12614,7 @@ struct Lowerer {
             //          request body. phase 1 (after body): pop BranchFrame,
             //          Br(backTarget) if fell through; if update beginBlock+
             //          lower update + Br(header); beginBlock(exit).
-            case StmtFrame::Kind::For: {
+            case LowerFrame::StmtKind::For: {
                 if (f.phase == 0) {
                     HirNodeId const node2 = f.node;
                     auto const initN   = hir.forInit(node2);
@@ -12430,7 +12721,7 @@ struct Lowerer {
             // request the labeled statement. phase 1: deliver its result.
             // (The recursive arm tail-returns `lowerStmt(labelBody)`, so the
             // labeled statement's bool IS the label's bool.)
-            case StmtFrame::Kind::Label: {
+            case LowerFrame::StmtKind::Label: {
                 if (f.phase == 0) {
                     HirNodeId const node2 = f.node;
                     MirBlockId const lb =
@@ -12454,7 +12745,7 @@ struct Lowerer {
             // pre-case block, and requests the body Block; phase 1 wires the body's
             // fall-off-the-end to the join. `bb0` = the join/exit block. NO per-arm
             // blocks — fall-through is straight-line inside the body.
-            case StmtFrame::Kind::Switch: {
+            case LowerFrame::StmtKind::Switch: {
                 if (f.phase == 0) {
                     HirNodeId const node2 = f.node;
                     HirNodeId const discN = hir.switchDiscriminant(node2);
@@ -12541,13 +12832,15 @@ struct Lowerer {
             //   joinBB   : the continuation.
             // phase 0 mints the region + the four blocks, opens tryBB and requests
             // the GUARDED BODY. phase 1 closes the region, lowers the FILTER (via
-            // `lowerExpr` — a separate machine with its OWN work-stack, exactly
-            // like the If/While/Switch arms' conditions, so `f` survives it),
+            // `lowerExpr`, exactly like the If/While/Switch arms' conditions —
+            // which since P61 pushes VALUE frames onto THIS stack, so `f` survives
+            // it only because `work` is a `std::deque`, never because the filter
+            // runs on a machine of its own; see the note on `work`),
             // opens handlerBB and requests the HANDLER. phase 2 finalizes the
             // join. `bb0..bb3` are the four blocks, `aux` the region id and
             // `flag0` the recursive arm's `joinReached` — byte-identical
             // createBlock order, branch successors and sub-statement order.
-            case StmtFrame::Kind::Seh: {
+            case LowerFrame::StmtKind::Seh: {
                 if (f.phase == 0) {
                     HirNodeId const node2 = f.node;
                     std::uint32_t const regionId = sehRegionCounter_++;
@@ -12645,6 +12938,16 @@ struct Lowerer {
             }
             }
         }
+    }
+
+    // The public STATEMENT-lowering entry: a thin wrapper over the shared driver
+    // (root = a statement request). Records its own base so a driver invocation
+    // nested inside a delegated `lowerStmtNode` leaf arm can never pop a frame
+    // belonging to an enclosing lowering.
+    [[nodiscard]] bool lowerStmt(HirNodeId node) {
+        std::size_t const base = work.size();
+        enterStmt(node);
+        runUntil(base);
         return ok;
     }
 
@@ -12665,17 +12968,17 @@ struct Lowerer {
     // Unreachable, ExprStmt, VarDecl, AssignStmt, Break, Continue, Goto,
     // IndirectGoto) are reached through the driver UNCHANGED, and the flattened
     // control-flow arms here are retained as the dead-via-driver recursive
-    // fallback (the driver's `StmtFrame` machine reproduces their createBlock
+    // fallback (the driver's statement-frame machine reproduces their createBlock
     // order, branch successors, and sub-statement lowering order BYTE-FOR-BYTE;
     // the EXPRESSION lowering inside any statement — conditions, rhs, discrim —
-    // still flattens via `lowerExpr`/`runExprDriver`, called exactly as today).
+    // still flattens via `lowerExpr`, called exactly as today).
     bool lowerStmtNode(HirNodeId node) {
         HirKind const k = hir.kind(node);
         switch (k) {
             case HirKind::Block: {
                 // NOTE (VLA C5, D-CSUBSET-VLA): this recursive Block arm is DEAD via
-                // the StmtFrame driver (enterStmt intercepts Block); the LIVE block-
-                // scope VLA teardown lives in StmtFrame::Kind::Block. The same
+                // the statement driver (enterStmt intercepts Block); the LIVE block-
+                // scope VLA teardown lives in LowerFrame::StmtKind::Block. The same
                 // `closeVlaBlockScope` helper is mirrored here so a future
                 // reactivation of this fallback cannot silently leak the dynamic stack.
                 std::size_t const vlaBase = vlaScopeStack_.size();
@@ -12744,6 +13047,13 @@ struct Lowerer {
                 // Discard the value; emit for side effects. The aggregate-discard
                 // chokepoint is shared with the for-clause site — see
                 // lowerDiscardedExpr (one funnel, no per-kind/per-position miss).
+                //
+                // NOTE (P61): this arm is DEAD via the driver — `enterStmt`
+                // intercepts `ExprStmt` and pushes a DISCARD frame, which is what
+                // puts the `SeqExpr` ⇄ `ExprStmt` edge on the shared stack. It is
+                // retained as the byte-identical recursive fallback exactly as the
+                // Block arm above is, and it calls the same public entry, so the
+                // two cannot drift.
                 return lowerDiscardedExpr(hir.exprStmtExpr(node));
             }
             case HirKind::InlineAsm:
@@ -13106,9 +13416,9 @@ struct Lowerer {
                 return true;
             }
             case HirKind::SehTryExcept: {
-                // NOTE (P56): this recursive arm is DEAD via the StmtFrame driver
+                // NOTE (P56): this recursive arm is DEAD via the statement driver
                 // (`enterStmt` intercepts SehTryExcept and runs the flattened
-                // `StmtFrame::Kind::Seh` machine, which reproduces the emission
+                // `LowerFrame::StmtKind::Seh` machine, which reproduces the emission
                 // below byte-for-byte). It is retained as the fallback the other
                 // flattened arms are, so the two forms stay side by side and
                 // readable — but the LIVE path is the driver's.

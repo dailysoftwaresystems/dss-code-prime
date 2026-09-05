@@ -1484,12 +1484,19 @@ struct DSS_EXPORT StackReserveControl {
 // ([[D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS]],
 // cycle P28). The shared gate is `link/format/weak_definition_gate.hpp`, called
 // once by `pe::encode`'s Obj arm, once by `elf::encode`, and once by
-// `macho::encode`'s MH_OBJECT arm. A format document gains the key IN THE SAME
-// CHANGE as its writer's consultation, never before it — which is why the
-// shipped corpus declares it on 16 of 24 documents and not on 24: the four
-// Mach-O IMAGE documents, the two pe IMAGE documents, wasm and spirv encode no
-// weak definition in any spelling, so a declaration there would be a key nobody
-// reads, drifting silently while reading as authoritative.
+// `macho::encode` — the last ABOVE its filetype dispatch, so the MH_OBJECT,
+// MH_EXECUTE and MH_DYLIB arms all reach it. A format document gains the key IN
+// THE SAME CHANGE as its writer's consultation, never before it — which is why
+// the shipped corpus declares it on 20 of 24 documents and not on 24: the two
+// pe IMAGE documents, wasm and spirv encode no weak definition in any spelling,
+// so a declaration there would be a key nobody reads, drifting silently while
+// reading as authoritative.
+// ⓘ It was 16 of 24 until [[D-LK3-DYLIB-WEAK-EXPORT]] closed: the four Mach-O
+// IMAGE documents were undeclared because their walker REFUSED a weak
+// definition rather than state part of what an image needs (the nlist bit
+// without the export-trie terminal or the MH_WEAK_DEFINES header bit). It
+// states all of it now, so they declare `symbol-flag` like their MH_OBJECT
+// siblings.
 //
 // ★ AND THE SET IS CHECKED FROM BOTH ENDS. `ObjectFormatBackend::
 // weakDefinitionDialects()` reports which dialects a WALKER spells, so the

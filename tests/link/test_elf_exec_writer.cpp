@@ -4166,7 +4166,11 @@ TEST(ElfImageSymbolNames,
         // only that `sh_info` agrees with wherever the locals happen to end. The
         // derivation's FAILURE arm — an entry appended on the wrong side — is
         // unreachable from any module and is driven directly over hand-built
-        // tables in `ElfSymtabPartition.EveryBreachArmFiresAndNamesTheOffender`.
+        // tables in `ElfSymtabPartition.EveryBreachArmFiresAndNamesTheOffender`
+        // (the four breach arms) and `ElfSymtabPartition.HoldsOnAWellFormedTable`
+        // (the well-formed, all-local, all-global and empty arms of both the
+        // breach predicate and the boundary reader). Those two are THE place
+        // the predicate pair is driven; no third pin restates them.
         if (dynamicArm) {
             int const dynsymIdx = findSectionByName(bytes, ".dynsym");
             ASSERT_GE(dynsymIdx, 0) << label;
@@ -4238,10 +4242,25 @@ TEST(ElfImageSymbolNames,
             << label
             << ": the `.text` section symbol's st_value must be the section's "
                "load address in an image";
-        EXPECT_EQ(shInfo, 2u)
+        // The third local is fn #9 — the fixture's nameless
+        // trampoline-shaped symbol, which `definedBinding` resolves to Local
+        // and which this arm therefore emits STB_LOCAL since
+        // D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL closed. It sits at
+        // index 2, ahead of the canonical, because the local pass runs first.
+        // This literal was `2` while every image function was forced GLOBAL,
+        // and it is exactly the assumption that anchor existed to falsify.
+        ASSERT_GE(nsyms, 3u) << label;
+        EXPECT_EQ(infoAt(2), 0x02u)
             << label
-            << ": and those two are the ONLY locals in these images - a third "
-               "would mean the alias pass had run inside the LOCAL region";
+            << ": symbol #2 must be the nameless (trampoline-shaped) function, "
+               "STB_LOCAL|STT_FUNC";
+        EXPECT_EQ(nameAt(2), "sym_9")
+            << label << ": ...and it keeps the `sym_<id>` fallback name";
+        EXPECT_EQ(shInfo, 3u)
+            << label
+            << ": and those three are the ONLY locals in these images - a "
+               "fourth would mean the alias pass had run inside the LOCAL "
+               "region";
     };
 
     for (auto const& port : ports) {
@@ -4289,6 +4308,25 @@ TEST(ElfSymtabPartition, HoldsOnAWellFormedTable) {
     EXPECT_EQ(dss::link::format::elfSymtabPartitionBreach(allGlobal, 0), "");
     std::vector<std::uint8_t> const empty;
     EXPECT_EQ(dss::link::format::elfSymtabPartitionBreach(empty, 0), "");
+
+    // ── ...and the boundary READER both writers publish `sh_info` from ─────
+    //    D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL replaced three
+    //    POSITIONAL snapshots (each a statement about where the writer stood,
+    //    not about where the locals end) with `elfSymtabFirstNonLocal`. It is
+    //    the SAME decision this test already drives, over the SAME hand-built
+    //    tables, so it is extended here rather than given a third pin of its
+    //    own. The arm that matters is the LAST one: a bare search loop returns
+    //    0 for a table with no non-local record, which would publish a
+    //    `sh_info` of 0 for a module of nothing but statics — the exact
+    //    all-local shape the ET_REL writer reaches.
+    EXPECT_EQ(dss::link::format::elfSymtabFirstNonLocal(t), 2u)
+        << "two locals, then a global: the boundary is 2";
+    EXPECT_EQ(dss::link::format::elfSymtabFirstNonLocal(allLocal), 2u)
+        << "a table with NO non-local record has its boundary at the END, not "
+           "at 0";
+    EXPECT_EQ(dss::link::format::elfSymtabFirstNonLocal(allGlobal), 0u);
+    EXPECT_EQ(dss::link::format::elfSymtabFirstNonLocal(empty), 0u)
+        << "an empty table: no records, so nothing can sit on either side";
 }
 
 TEST(ElfSymtabPartition, EveryBreachArmFiresAndNamesTheOffender) {

@@ -57,12 +57,17 @@ char const* const kMachOBlocks[] = { "macho", "image" };
 // alongside an ordinary N_SECT|N_EXT binding — never as a binding value of its
 // own, which is what separates `symbol-flag` from ELF's `symbol-binding`.
 //
-// ⚠ THIS IS THE WALKER'S CAPABILITY, NOT EVERY MACH-O DOCUMENT'S. Only the
-// MH_OBJECT arm encodes one; the image arms REFUSE a weak definition outright
-// (`refuseWeakImageAlias` — N_WEAK_DEF on an image needs MH_WEAK_DEFINES in
-// the mach header, D-LK3-DYLIB-WEAK-EXPORT), which is why the exec/dylib
-// documents declare no dialect at all. Per-format declaration is the schema's
-// question; this answers only "can this walker spell it".
+// ⚠ THIS IS THE WALKER'S CAPABILITY, NOT EVERY MACH-O DOCUMENT'S — and the
+// two answers stopped differing when [[D-LK3-DYLIB-WEAK-EXPORT]] closed. This
+// note used to read "only the MH_OBJECT arm encodes one; the image arms REFUSE
+// a weak definition outright, which is why the exec/dylib documents declare no
+// dialect at all"; that was true while the image arms could state only part of
+// what an image needs (N_WEAK_DEF without the export-trie terminal or the
+// MH_WEAK_DEFINES header bit). They now state all of it, `macho::encode` asks
+// the dialect question ABOVE its filetype dispatch, and all EIGHT Mach-O
+// documents declare `symbol-flag`. The distinction the sentence draws still
+// stands in general: per-format declaration is the schema's question; this
+// answers only "can this walker spell it".
 constexpr WeakDefinitionDialect kMachOWeakDialects[] = {
     WeakDefinitionDialect::SymbolFlag,
 };
@@ -1336,24 +1341,41 @@ public:
                                      "entry (no LC_MAIN; D-LK3-3).",
                                      entryPoint));
                 }
-                // The dylib arm emits its EXPORT TRIE through the
-                // legacy LC_DYLD_INFO_ONLY export_off field; the
-                // chained-fixups path would need the separate
-                // LC_DYLD_EXPORTS_TRIE load command, which is not
-                // implemented — reject the combination loud rather
-                // than emit a dylib whose exports dyld never finds
-                // (D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE).
-                if (mi.useChainedFixups) {
-                    fail("/image/useChainedFixups",
-                         "'useChainedFixups' = true is not supported "
-                         "on a Mach-O MH_DYLIB schema -- the dylib "
-                         "export trie is emitted through the legacy "
-                         "LC_DYLD_INFO_ONLY export_off field; the "
-                         "chained-fixups path would need the separate "
-                         "LC_DYLD_EXPORTS_TRIE load command "
-                         "(D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE). "
-                         "Set 'useChainedFixups' = false.");
-                }
+                // ── D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE: THE REFUSAL
+                //    THAT USED TO STAND HERE IS GONE, BECAUSE THE
+                //    CAPABILITY IT NAMED NOW EXISTS.
+                //
+                // It rejected `useChainedFixups: true` on a Mach-O MH_DYLIB
+                // schema, and its stated reason was that the export trie is
+                // emitted through the legacy LC_DYLD_INFO_ONLY.export_off
+                // field while the chained path needs the separate
+                // LC_DYLD_EXPORTS_TRIE, "which is not implemented". The
+                // writer emits LC_DYLD_EXPORTS_TRIE now, for BOTH image
+                // flavors (it is keyed on a non-empty trie, never on the
+                // filetype), so the reason was false and the refusal had
+                // become an asymmetry with no argument behind it: the EXEC
+                // flavor was never refused this key, and both flavors reach
+                // the same writer.
+                //
+                // ⚠ A REFUSAL WHOSE STATED REASON HAS GONE FALSE IS NOT A
+                // CONSERVATIVE DEFAULT — it is a capability hole that reads
+                // as a decision. Deleting it is the whole remedy; nothing
+                // takes its place, and the DATA half the anchor also named
+                // stays refused LOUD one tier down, at the site that owns it
+                // (`encodeExecDynamic`'s chained-fixups DATA-fixup guard,
+                // D-LK6-14), where the exec meets exactly the same wall.
+                //
+                // ✔MEASURED before the deletion, not after: with the gate
+                // lifted, an MH_DYLIB schema declaring `useChainedFixups`
+                // encodes with zero diagnostics, carries
+                // LC_DYLD_CHAINED_FIXUPS and NO LC_DYLD_INFO_ONLY, and its
+                // weak definition is walkable in the trie named by
+                // LC_DYLD_EXPORTS_TRIE, carrying the weak-definition export
+                // flag and the two mach-header coalescing bits. Pinned in
+                // the `MachoChainedFixupsExportTrie` suite, one cell per
+                // image flavor — no identifier is wrapped across a line
+                // here, because a wrapped name is invisible to every grep
+                // that would come looking for it.
             }
         }
         }

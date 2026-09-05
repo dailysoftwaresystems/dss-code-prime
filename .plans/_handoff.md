@@ -9,7 +9,7 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-09-05 — cycles **P14 … P60**. ⚠ P52 rewrote no handoff at all, so a reader who opened this file during P53 saw P51 described as current state; that entry in §5 was written retroactively by P53 and says so. P53's own §0 was relocated into §5 by P54 and is marked as history there.
+**Last updated:** 2026-09-05 — cycles **P14 … P61**. ⚠ P52 rewrote no handoff at all, so a reader who opened this file during P53 saw P51 described as current state; that entry in §5 was written retroactively by P53 and says so. P53's own §0 was relocated into §5 by P54 and is marked as history there.
 who opened this file during P53 saw P51 described as current state; that entry in §5 was written
 retroactively by P53 and says so. P53's own §0 was relocated into §5 by P54 and is marked as
 history there.
@@ -17,6 +17,174 @@ history there.
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
+
+**Cycle P61 closed 2026-09-05.** **FOUR lanes plus a remnant lane and the orchestrator**, on top of
+P60 (`9d08773a`). Every lane was independently reviewed; **every single one came back with a real
+defect**, and three of those defects were invisible to a green whole-tree gate.
+
+✔**REAL: 8 rows closed, 8 opened — of which 3 were minted AND closed inside the cycle** (invisible to
+the balance gate from both bases) **and 5 remain open.** ✔**COUNTED by
+`check-anchor-balance --base 9d08773a`: 5 closed, 5 opened, net 0.**
+★ **P0 began and ended empty.**
+
+⚠⚠ **NET 0 IS THE HONEST NUMBER AND IT IS NOT A GOOD ONE.** Five production rows closed and five
+opened. Every opened row is a MEASURED production defect with a reference control — not a
+speculation, not a follow-up dressed as a finding — and four of the five were found by *running*
+newly-unlocked paths on real hardware rather than by reading code. But the operator's own test is
+whether the number falls, and this cycle it did not. **The five are named in §0.3 and they are P62's
+work.**
+
+## §0.1 — WHAT LANDED
+
+| lane | subject | outcome |
+|---|---|---|
+| `ml` | the MIR/HIR half of the recursion residue | ✅ row CLOSED — and it introduced a **silent miscompile** the review caught |
+| `ck` | O(1) `TreeBuilder::checkpoint` / `SchemaWalker::snapshot` | ✅ the other half of that row; **80× memory at depth 8192** |
+| `wk` | Mach-O weak definitions | ✅ 3 rows closed; found a **wire-format struct written 4 bytes short** |
+| `ef` | the ELF mirror of P60's Mach-O binding fix | ✅ 2 rows closed; the defect was **worse than the row said** |
+| `sc` | remnant: the one row a reviewer called *filed instead of done* | ✅ closed, ~15 lines, and it found a **`dyld_info` crash** |
+
+### The recursion row is CLOSED, in two halves that had to meet
+[[D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED]] — P60 did the front
+end, P61 did the rest. `ml` merged the value driver, the statement driver and `lowerDiscardedExpr`'s
+private stack into ONE `LowerFrame` stack: the comma-chain wall went **320 → 8000**, aggregate comma
+**200 → 2000**, nested builtins **200 → 16000**. `ck` replaced the O(depth) per-probe COPY with a
+**mark into an undo journal** (`src/core/types/speculation_trail.hpp`): peak at depth 8192 fell
+**4689.9 → 58.1 MiB (80×)**, and **65536 nested casts — gcc's measured working depth — now compile
+rc 0 in 6.82 s at a flat 12.8 MiB where the base died `std::bad_alloc` after 853 s.**
+★ The two lanes wrote cells for the SAME row from different halves; `ml` closed it, `ck` correctly
+declined to. The orchestrator merged both accounts after verifying their preserved tails were
+**byte-identical**, which is what makes "same base row" a measurement rather than an assumption.
+⚠ **`ck` REFUTED the orchestrator's own proposed formula, with numbers.** A
+`+ 3 × speculationDepth` budget term is **directionally inverted** — probe *k* of a D-cast chain
+spans `3(D−k)+1` tokens, decreasing in *k*, and the ctor reads the depth BEFORE the body increments
+it, so the outermost probe (which spans everything) is built at depth 0 and gets nothing. And `3` is
+a **C fact**, so it would have put language vocabulary in the engine. What shipped instead charges
+each probe at its OWN nesting level, and **the flat-expression guard did not move at the shipped
+factor 128** — 4000 terms parse, 4100 refused, byte-identical before and after.
+
+### Two silent miscompiles, both invisible to a green gate
+1. ⚠⚠ **`ml`'s own merge introduced one.** Hoisting `callCtxs` from a driver-LOCAL vector to a
+   member re-armed a dangling reference: a by-value struct or `__int128` argument whose expression
+   contains a call was **evaluated TWICE**. ✔REPRODUCED through the CLI — **DSS exited 5 where
+   gcc 13.3.0 exited 4.** ★ It fires on the FIRST such shape in a TU and then hides, because vector
+   capacity only grows — which is most of why 2070 green entries could not see it. Fixed at the
+   SIGNATURE so neither caller can express it, and pinned with a side-effect counter.
+   Row: [[D-MIR-CALLCTX-REFERENCE-HELD-ACROSS-A-NESTED-LOWERING-DUPLICATES-THE-ARGUMENT]].
+2. ⚠⚠ **`ck` found two in the EXISTING checkpoint**, neither visible to the axis-at-a-time tests:
+   `pendingChildren_` restored by SIZE although it shrinks on frame close, and
+   `wrapLastChildInFrame` writing a pre-checkpoint node's `parent` IN PLACE. Closed with a
+   DIFFERENTIAL test (build each tree twice, compare node-for-node). Its reviewer then found the
+   **third of the same shape** — `DiagnosticReporter::truncateTo` restores `all_` by size while
+   rewriting marker prose in place — which `ck` closed by re-deriving the prose from the ledger.
+
+### Mach-O and ELF: the same defect class, four rows
+`wk` shipped the four facts of a weak definition (n_desc `N_WEAK_DEF`, the trie terminal's
+`EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION`, content-derived `MH_WEAK_DEFINES|MH_BINDS_TO_WEAK`, and the
+bind stream), **grew an export trie the exec arm never had**, and deleted the dylib refusal —
+closing [[D-LK3-DYLIB-WEAK-EXPORT]] and, by emitting `LC_DYLD_EXPORTS_TRIE`,
+[[D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE]]. ✔Witnessed on Apple Silicon against ld64: header flags
+`0x00218085` vs the weak-free control's `0x00200085`, `[weak-def]` in the trie, and a **coalescing
+RUN** where a DSS exec wins against an Apple dylib (rc 22 vs the strong control's 21).
+⚠⚠ **AND IT FOUND A WIRE-FORMAT STRUCT WRITTEN 4 BYTES SHORT.**
+`dyld_chained_fixups_header` is **28 bytes / seven `uint32_t`**; DSS wrote **24 with u16 fields**, so
+a reader took `symbols_format` from the next region's `seg_count` (always ≥ 1 = "zlib compressed")
+over an uncompressed pool and `dyld_info` refused the image — **while dyld ran it anyway, rc 42.**
+★★ **The existing pin asserted the WRONG shape and stayed green.** Closed born-in-cycle as
+[[D-LK6-14-CHAINED-FIXUPS-HEADER-TRUNCATED]]; the sibling `seg_count` defect closed by lane `sc` as
+[[D-LK6-14-CHAINED-STARTS-SEG-COUNT-MISDECLARED]] (✔DSS now writes ld64's exact table, `seg_count 4`
+/ `[0, 0, 24, 0]`, and `dyld_info -exports` LISTS the symbols instead of refusing).
+`ef` closed [[D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL]] and — because deleting the
+`isExec ? Global` override removed an escape a SECOND row's rationale depended on —
+[[D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL]] as well. ⚠ **That one was worse than its row
+said:** on the ELF `.o` tier a called hidden function lost its **NAME** (`sym_95`), so a foreign
+`ld` reports "undefined reference" — against the row's own prose saying no relocatable writer was
+reached live. Fixed at the shared decision with a real VISIBILITY axis, and the fix needed **three**
+sites, not one: widening the archive index without widening the static-pull resolver would have
+pulled a member over a definition the link already held.
+
+## §0.2 — WHAT THE ORCHESTRATOR DID, AND TWO ERRORS IT MADE
+
+- **The `macho.cpp` hand-merge.** `wk` and `ef` both rewrote `appendImageDefinedBands` from the same
+  base. ⚠ `wk` reported the merge as textual; a reviewer **measured 3 conflicts** and showed that
+  taking `ef`'s lambda wholesale would have **silently reverted the weak fix to `n_desc = 0`**. The
+  resolution keeps `ef`'s visibility argument AND `wk`'s `definedNDesc`, with the deleted refusal
+  staying deleted. ✔36/36 across both lanes' subjects afterwards — semantically correct, not merely
+  conflict-free. **This is the P59 lesson (*a clean three-way merge is not a correct merge*) paying
+  for itself.**
+- ⚠ **ERROR 1 — the first resolution attempt was wrong and the compiler caught it.** `--settled`
+  drops a path from the fold entirely, so applying only the three conflict resolutions on top of
+  `wk`'s file silently discarded every hunk `git merge-file` had AUTO-merged from `ef`. It failed to
+  build, which is the good direction. Redone from the real merge output.
+- ⚠⚠ **ERROR 2 — the cap raise was wrong in THREE ways and the gate cost 68 minutes proving it.**
+  See §0.3 item 1: it is now this cycle's best evidence for a row.
+- Applied `wk`'s config prerequisite (four Mach-O documents gain `weakDefinition.dialect`), all
+  rows, the census refresh, and the citation ratchet.
+
+## §0.3 — WHAT P62 INHERITS, IN PRIORITY ORDER
+
+1. ★★★ **[[D-PARSE-SPECULATION-REFUSAL-REPLAY-IS-QUADRATIC]] — and it BLOCKS the reference floor.**
+   ✔MEASURED one past the cap at the shipped factor: 256 → 1.26 s, 512 → 4.47, 1024 → 15.85,
+   2048 → 62.46, 4096 → **254.99 s** (ratios 3.55/3.55/3.94/4.08). ⚠⚠ **The orchestrator raised
+   `maxSpeculationDepth` 2048 → 16384 and had to REVERT it**: the gate spent **4083 s (68 min)** on
+   `analysis/syntactic/test_parser_speculation_ceilings` and then FAILED — on **three** assertions,
+   two of them structural, because the raise left the token budget too small to hold a chain at the
+   new depth AND made `maxSpeculationDepth` equal `maxExpressionDepth` so neither would bind.
+   ★ **The ACCEPTING path is already linear and fast (6.82 s at 65536); it is the REFUSAL that is
+   quadratic, and it blocks raising the ceiling AT ALL.** Remedy named by `ck`: memoise the
+   speculative parse so a failed probe's work is not re-done by the fallback replay. **A refusal
+   nobody waits for is not fail-loud**, which is the operator ruling this row family serves.
+2. **[[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]]** — `dyld_info -fixups`
+   **SIGSEGVs** on a DSS chained image. ✔Proved twice: the crash frame is `addStubSymbols()`, and
+   neutralising ONLY `LC_DYSYMTAB` in ld64's own chained exec reproduces it identically. DSS drops
+   that command calling it "redundant" — true for BINDING, false for TOOLING.
+3. **[[D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING]]** — a DSS dylib's own call to its weak
+   definition never coalesces. ✔MEASURED: DSS dylib rc 1 where ld64's gives rc 2, one process with
+   two answers for one symbol. Both images publish identical weak facts, so it is **call lowering**
+   (`src/mir/**`), not the writer.
+4. **[[D-LINK-MACHO-IMAGE-NO-DATA-SYMBOLS-IN-SYMTAB]]** — `appendImageDefinedBands` walks
+   `module.functions` only, so no defined DATA symbol has ever reached a Mach-O image nlist.
+   Misdescription only (the trie carries it), and the open ELF twin wants one shared design.
+5. **[[D-LK3-EXEC-EXPORT-SCOPE-NOT-CONFIG-DRIVEN]]** — the exec's export-set narrowing is a
+   hardcoded walker policy where ld64 publishes the whole externally-visible set.
+6. **Still owed, unfiled:** a PROTOTYPE-position `visibility("hidden")` is not merged onto the
+   definition (`vis_tail` emits `GLOBAL DEFAULT` where gcc and clang give `GLOBAL HIDDEN`) — an HIR
+   linkage-merge gap, pinned as a CONTROL that says so.
+
+## §0.4 — THE THROUGH-LINE, AND A HARNESS FINDING
+
+★★★ **P58 doubted the ROW. P59 doubted the GUARD. P60 doubted the LANE'S CLOSING CLAIM. P61 IS THE
+ANSWER TO "WHAT DOES A GREEN WHOLE-TREE GATE STILL NOT SEE?" — AND IT IS: A SILENT MISCOMPILE THAT
+FIRES ONCE, A WIRE FORMAT NOTHING READS BACK, AND A TOOL NOBODY RAN.**
+- `ml`'s duplicated evaluation fires on the FIRST such shape and then hides behind vector capacity.
+- The chained-fixups header was 4 bytes short **for the life of the feature**, and its own pin
+  asserted the wrong shape and stayed green — dyld ran the image, so "does it work?" never asked.
+- ⇒ **Three of P61's eight closures came from reading an artifact with the platform's OWN tools
+  (`nm`, `dyld_info`, `readelf`) rather than from running it.** An exit code cannot see a binding, a
+  visibility, a struct width, or a load command.
+★★ **AND EVERY ONE OF THE FIVE REVIEWS FOUND SOMETHING**, including two that refuted the reviewer
+back with measurement — `ck` on the budget formula, `wk` on the weak-bind stream. **A reviewer's
+finding is a hypothesis too.**
+
+⚠ **HARNESS, and it is the orchestrator's own:** `.worktrees/ck` left **one 1230-byte
+`LastTest.log.tmp`** on disk, held by an orphaned `ctest` from a killed agent.
+`lane-worktree.sh remove` **correctly REFUSED to report success** over a removal that did not
+happen — the right behaviour, and worth keeping. The git registration is pruned and `.worktrees/` is
+gitignored and pinned in the carriage's never-travel floor, so it cannot reach a commit or a gate
+host. ⓘ A lane that kills a test process orphans its file handles; the removal verb should say which
+PID holds the file rather than guessing at "a stalled ctest".
+
+---
+
+★★★ **P60 — RELOCATED HERE BY P61, AND IT IS HISTORY, NOT STATE.** It was §0 until P61 opened.
+Every figure below is P60's own and was true at its tip (`9d08773a`); **re-derive anything you
+intend to act on.** Its through-line — *doubt the LANE'S OWN CLOSING CLAIM* — is the direct
+ancestor of P61's, which asks the next question out: what does a GREEN WHOLE-TREE GATE still
+not see?
+
+## ⏪ P60's former §0 (history)
+
+### ⏪ P60's own former heading, kept verbatim so the block reads as it did: *§0 — RESUME HERE (a session with no context reads this block first)*
 
 **Cycle P60 closed 2026-09-05.** **FOUR lanes** plus the orchestrator, on top of `694bb6cb`, in one
 set — every lane folded, **every lane independently reviewed**, and every review finding fixed

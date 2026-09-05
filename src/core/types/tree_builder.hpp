@@ -9,6 +9,7 @@
 #include "core/types/scope_kind.hpp"
 #include "core/types/source_buffer.hpp"
 #include "core/types/source_span.hpp"
+#include "core/types/speculation_trail.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/token.hpp"
 #include "core/types/tree.hpp"
@@ -276,10 +277,27 @@ public:
     // the seam both FC2 consumers read from.
     [[nodiscard]] std::span<NodeId const> currentFramePendingChildren() const noexcept;
 
-    // Snapshot full builder state (arena, child-index, pending children,
-    // open frames, scope stack, cursor + stack, cookie counter, closed-
-    // cookie set, desync latch, watchdog latch, reporter accumulator).
-    // Closing an outer frame inside speculation emits `P_BuilderInvariant`.
+    // Open a speculative checkpoint over the full builder state (arena,
+    // child-index, pending children, open frames, scope stack, cursor +
+    // stack, cookie counter, closed-cookie set, desync latch, watchdog
+    // latch, reporter accumulator).
+    //
+    // ★ O(1) IN THE DEPTH, AND THAT IS LOAD-BEARING. This used to COPY the
+    // open-frame stack and the scope stack, and to take an O(depth)
+    // `SchemaWalker::snapshot` on top — so D nested probes at depth ~D cost
+    // Θ(D²) bytes and the shipped speculation ceiling was a MEMORY bound,
+    // two orders of magnitude below gcc's measured working depth. Every
+    // captured axis is now either a size, a scalar, or an undo-journal mark
+    // (`core/types/speculation_trail.hpp`); rollback costs the mutations
+    // since the mark rather than the state at it.
+    //
+    // ⚠ THE OLD WORDING HERE SAID "closing an outer frame inside
+    // speculation emits `P_BuilderInvariant`", AND THAT WAS NOT TRUE. What
+    // is diagnosed is closing OUT OF LIFO ORDER, inside speculation or
+    // outside it. Closing a PRE-checkpoint frame IN ORDER is silent — and
+    // it is now exactly restorable, because the journal puts back the
+    // staging area and the node fields that close rewrote, neither of which
+    // a size-only checkpoint could reach.
     // Over-cap produces a no-op guard (`id == kNoOpCheckpointId`); commit/
     // rollback on it are safe no-ops.
     [[nodiscard]] Checkpoint checkpoint();
@@ -308,12 +326,21 @@ private:
     // re-exposed at the top). Storing children as offsets into one
     // vector keeps the per-frame footprint small and makes speculative
     // rollback an integer truncation rather than N per-frame resizes.
+    // ⚠ EVERY MEMBER CARRIES A DEFAULT INITIALIZER, INCLUDING `openerSpan`.
+    // `SourceSpan`'s only constructor is private, so a Frame without one is
+    // not default-constructible — and `TrailedStack::rewindTo` has to be able
+    // to re-extend the stack when a branch drained it BELOW the mark (every
+    // slot it re-extends over is then overwritten from the journal, so the
+    // placeholder value is never observed). `cookie = 0` is already this
+    // type's reserved "invalid" value, so a placeholder that somehow survived
+    // would fail the builder's own cookie lookup loudly rather than pass for
+    // a real frame.
     struct Frame {
-        NodeId               id;           // the Internal node being built
-        RuleId               rule;
-        SourceSpan           openerSpan;   // first source position seen at open() — used as opener for Missing diags
-        std::uint32_t        pendingStart; // index into pendingChildren_ where this frame's children begin
-        std::uint32_t        cookie;       // matches OpenScope::cookie_
+        NodeId               id{};           // the Internal node being built
+        RuleId               rule{};
+        SourceSpan           openerSpan = SourceSpan::empty(0);   // first source position seen at open() — used as opener for Missing diags
+        std::uint32_t        pendingStart = 0; // index into pendingChildren_ where this frame's children begin
+        std::uint32_t        cookie       = 0; // matches OpenScope::cookie_ (0 = reserved invalid)
     };
 
     // ── speculative checkpoint state ──
@@ -322,22 +349,43 @@ private:
     // Checkpoint guard carries an index into `checkpointStack_`; commit
     // and rollback pop entries above that index (cascade-cleanup if a
     // caller forgot to commit/rollback an inner checkpoint before an
-    // outer one). Snapshots are O(open_frames + cursorStack.size()
-    // + closedCookies_.size()) — small, but not zero, so unlimited
-    // depth is gated by BuilderConfig::maxSpeculationDepth.
+    // outer one).
+    //
+    // ★ EVERY FIELD IS A SIZE, A SCALAR, OR A MARK — nothing here is
+    // proportional to the open depth. `openFrames` / `scopes` /
+    // `closedCookies` used to be whole-container COPIES and the walker
+    // field a whole cursor-stack copy; those are the Θ(D²) this design
+    // removed.
+    //
+    // ⚠ THE ONE FIELD THAT IS NEITHER IS `reporterSnap`, AND ITS BOUND IS
+    // PER CHECKPOINT, NOT IN AGGREGATE. One snapshot costs the dedup window
+    // plus the number of DISTINCT diagnostic codes seen — a constant of the
+    // reporter's CONFIGURATION, independent of the parse's depth. But one is
+    // taken per LIVE probe, so D simultaneously-live probes on a translation
+    // unit that has already emitted C distinct codes cost Θ(D × C), and the
+    // shape that reaches maximum D is a deep speculation, which a
+    // diagnostics-live file can perfectly well contain. ✔MEASURED with the
+    // memory arm of `tests/core/test_checkpoint_cost.cpp`
+    // (`--nest-diag-codes=`), which exists to keep this a number rather than
+    // an argument. It is not a quadratic in the PARSE — C does not grow with
+    // the input the way depth does, and the reporter's own caps bound it —
+    // but "O(1) per checkpoint" was the wrong sentence to leave alone once
+    // `maxSpeculationDepth` moved.
     struct CheckpointSnapshot {
         std::size_t                       nodesSize;
-        std::size_t                       childIndexSize;
-        std::size_t                       pendingChildrenSize;
-        std::vector<Frame>                openFrames;          // snapshot copy
-        std::vector<ScopeKind>            scopes;
+        TrailedStack<NodeId>::Mark        childIndex;
+        TrailedStack<NodeId>::Mark        pendingChildren;
+        TrailedStack<Frame>::Mark         openFrames;
+        TrailedStack<ScopeKind>::Mark     scopes;
+        TrailedSet<std::uint32_t>::Mark   closedCookies;
+        TrailedWriteLog<NodeId,
+                        detail::Node>::Mark nodeWrites;
         // SchemaWalker::Snapshot is non-default-constructible by
         // design (every instance must originate from `snapshot()`).
         // Wrap in std::optional so CheckpointSnapshot can be built
         // field-by-field; populated immediately by `checkpoint()`.
         std::optional<SchemaWalker::Snapshot> walker;
         std::uint32_t                     nextCookie;
-        std::unordered_set<std::uint32_t> closedCookies;
         bool                              maxSpeculationDepthReached;
         DiagnosticReporter::Snapshot      reporterSnap;
     };
@@ -372,6 +420,25 @@ private:
     // restoring state. Used by commit(). No-op for the no-op marker.
     void                    commitToId_(std::uint32_t id) noexcept;
 
+    // Capture the current value of `id`'s arena node IF a rollback could
+    // still need it — that is, if a checkpoint is live and the node is old
+    // enough to SURVIVE that checkpoint's `truncateTo`. Call immediately
+    // BEFORE any in-place write through `arena_.at(id)`.
+    void                    recordNodeWrite_(NodeId id);
+
+    // Every trail is armed by the first `checkpoint()` and stays armed
+    // until the last one retires; this is the single place that retires
+    // them, so a journal cannot outlive the speculation that needed it.
+    void                    discardTrailsIfIdle_() noexcept;
+
+    // Entry owning `id`, or `checkpointStack_.end()` for a stale id.
+    // Binary: `checkpointStack_` is sorted by id (monotonic counter,
+    // append-only, suffix-erase only), and a linear scan per commit or
+    // rollback would be one more Θ(D²) at a cap free to follow the
+    // reference compilers.
+    [[nodiscard]] std::vector<std::pair<std::uint32_t, CheckpointSnapshot>>::iterator
+                            findCheckpoint_(std::uint32_t id) noexcept;
+
     // ── state ──
     std::shared_ptr<SourceBuffer>          source_;
     std::shared_ptr<GrammarSchema const>   schema_;
@@ -382,16 +449,39 @@ private:
     // (SP1). emit_ appends through it; checkpoint/rollback use size()/
     // truncateTo(); finish() && hands off a frozen ArenaContainer.
     substrate::ArenaBuilder<detail::Node, NodeId, TreeId> arena_;
-    std::vector<NodeId>                    childIndex_;  // flat children table under construction
+    // Flat children table under construction, handed to the finished Tree by
+    // `finish()` (through `take()`, so the wrapper costs no copy).
+    //
+    // ⚠ TRAILED THOUGH IT IS APPEND-ONLY, AND THAT IS THE POINT. A size-only
+    // restore is content-exact for an append-only container — and NOTHING
+    // ENFORCED THE APPEND-ONLY PART. One future `childIndex_[i] = …`, or one
+    // erase, and the rollback would go back to handing out the right LENGTH
+    // holding a rolled-back branch's node ids: the pending-children hole
+    // (case 1 of `test_checkpoint_identity`) reappearing in the table those
+    // children are flushed INTO. Trailed, the assumption is not needed: an
+    // in-place write goes through `assign` and is journaled, a pop is
+    // journaled, and a push still writes no record — so the append-only path
+    // costs exactly what the bare vector cost, and the other paths are
+    // correct instead of forbidden by a comment.
+    TrailedStack<NodeId>                   childIndex_;
 
     // Staging vector for children of open frames. Each open Frame owns the
     // range `[pendingStart, pendingChildren_.size())`. On close, the
     // range is flushed to `childIndex_` and the staging vector truncates
     // back to the parent's range. `attachToCurrentFrame_` appends here.
-    std::vector<NodeId>                    pendingChildren_;
+    //
+    // ⚠ TRAILED RATHER THAN SIZE-RESTORED, AND THAT IS A CORRECTNESS FIX,
+    // NOT A PERFORMANCE ONE. This vector SHRINKS during a build
+    // (`closeFrame_` truncates it back to the closing frame's
+    // `pendingStart`; `wrapLastChildInFrame` pops the child it re-parents).
+    // The old checkpoint captured only its SIZE, so a speculative branch
+    // that let it dip below the checkpoint's size and then regrew it would
+    // "restore" the right LENGTH holding the WRONG NODE IDS. The journal
+    // restores the values.
+    TrailedStack<NodeId>                   pendingChildren_;
 
-    std::vector<Frame>                     open_;        // LIFO open-frame stack
-    std::vector<ScopeKind>                 scopes_;      // current scope stack
+    TrailedStack<Frame>                    open_;        // LIFO open-frame stack
+    TrailedStack<ScopeKind>                scopes_;      // current scope stack
 
     // Schema-cursor state machine mirroring `open_`. Walked through
     // enterRule on open(), leaveRule on close, and advance on
@@ -431,23 +521,46 @@ private:
     // OpenScope guards are still alive (and will eventually call close()
     // when destroyed). A subsequent close() for these is a clean no-op
     // rather than a spurious P_BuilderInvariant. Bounded by the number of
-    // cascade events and synthetic closes; expected to stay small.
-    std::unordered_set<std::uint32_t>      closedCookies_;
+    // cascade events and synthetic closes; expected to stay small — but
+    // "expected to stay small" is not a bound, so it is journaled like
+    // every other rolled-back axis rather than copied per checkpoint.
+    TrailedSet<std::uint32_t>              closedCookies_;
+
+    // Values displaced by IN-PLACE writes to arena nodes that PREDATE the
+    // innermost live checkpoint.
+    //
+    // ⚠ THE SECOND CORRECTNESS FIX. `arena_.truncateTo(nodesSize)` undoes
+    // every node a speculative branch APPENDED, and nothing else. Two
+    // sites write through `arena_.at(...)` to nodes that may be older than
+    // the checkpoint: `wrapLastChildInFrame` re-parents the already-built
+    // left operand it wraps (routinely a pre-checkpoint node — a
+    // rolled-back wrap left its `parent` naming a node id the truncation
+    // had just destroyed), and `closeFrame_` rolls span / HasError /
+    // firstChild / childCount onto a frame's node when a PRE-checkpoint
+    // frame is closed inside speculation (diagnosed by
+    // `P_BuilderInvariant`, but diagnosed is not prevented). Writes to
+    // nodes the rollback truncates away need no record and get none.
+    TrailedWriteLog<NodeId, detail::Node>  nodeWrites_;
 
     std::uint32_t                          nextCookie_ = 1;   // 0 reserved as "invalid"
     bool                                   finished_   = false;
 
     // ── speculative state ──
     //
-    // Each entry carries its own id. Lookup by id is a linear search
-    // (depth ≤ maxSpeculationDepth, typically ≤ 64 — trivially fast and
-    // cache-friendly). Index-arithmetic shortcuts (e.g. `firstId =
-    // nextCheckpointId_ - stack.size()`) silently break when `commitToId_`
-    // truncates from the middle of the stack on inner-commit-then-outer-
-    // rollback sequences, so the stable invariant is "each snapshot owns
-    // its id." `kNoOpCheckpointId` is the sentinel returned by
-    // `checkpoint()` when the cap is reached; both commit/rollback paths
-    // short-circuit on it.
+    // Each entry carries its own id, and lookup by id is a BINARY search
+    // (`findCheckpoint_`): ids come from a monotonic counter and entries are
+    // only ever appended or erased as a suffix, so the stack is sorted by id
+    // for free. It used to be a linear scan justified by "depth is typically
+    // ≤ 64" — an assumption `maxSpeculationDepth` at gcc's working cast depth
+    // falsifies, and one that made rollback O(depth) in a design whose whole
+    // point is that nothing here follows the depth.
+    //
+    // Index-arithmetic shortcuts (e.g. `firstId = nextCheckpointId_ -
+    // stack.size()`) silently break when `commitToId_` truncates from the
+    // middle of the stack on inner-commit-then-outer-rollback sequences, so
+    // the stable invariant is "each snapshot owns its id."
+    // `kNoOpCheckpointId` is the sentinel returned by `checkpoint()` when the
+    // cap is reached; both commit/rollback paths short-circuit on it.
     static constexpr std::uint32_t kNoOpCheckpointId = 0;
 
     BuilderConfig                          builderConfig_{};

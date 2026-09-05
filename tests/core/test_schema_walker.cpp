@@ -288,24 +288,89 @@ TEST(SchemaWalker, SpeculationLoopPattern) {
     (void)baseline;  // suppress unused-variable
 }
 
-TEST(SchemaWalker, SnapshotRoundTripsAcrossWalkersOnSameSchema) {
-    // Snapshot is opaque + non-default-constructible: every Snapshot
-    // must originate from a live `walker.snapshot()` call. Verifies
-    // it survives independent walker destruction and round-trips
-    // into a fresh walker bound to the same schema (a different
-    // walker instance over the SAME schema is the legitimate case;
-    // cross-schema restore aborts — see the dedicated death test).
+TEST(SchemaWalkerDeath, SnapshotDoesNotTransferBetweenWalkersOnOneSchema) {
+    // ⚠ THIS CONTRACT NARROWED IN P61, AND THE NARROWING IS THE POINT.
+    // A Snapshot used to be a COPY of the walker's state, so restoring one
+    // into a DIFFERENT walker over the same schema compiled and "worked" —
+    // which is what this case used to assert. It is now a MARK into ITS OWN
+    // walker's undo journal, so a foreign walker would rewind against a
+    // journal that never recorded those frames.
+    //
+    // Removing the capability is a strengthening, not a loss. Nothing in
+    // production ever did it (both consumers snapshot and restore the same
+    // walker), and the header's own contract says the cursor stack mirrors
+    // the CONSUMER's frames 1:1 — so installing another consumer's stack
+    // desynchronizes the one that owns it. What used to be a silent
+    // desynchronization is now a fatal abort that names the confusion.
     auto h = load();
-    auto makeSnap = [&]() {
-        SchemaWalker w{h.schema};
-        w.enterRule(h.rootRule);
+    SchemaWalker a{h.schema};
+    a.enterRule(h.rootRule);
+    a.enterRule(h.stmtRule);
+    auto snap = a.snapshot();
+
+    SchemaWalker b{h.schema};
+    b.enterRule(h.rootRule);
+    b.enterRule(h.stmtRule);
+    EXPECT_DEATH(b.restore(std::move(snap)),
+                 "belongs to a different walker instance");
+}
+
+TEST(SchemaWalkerDeath, DestroyingAWalkerWithALiveSnapshotAborts) {
+    // The lifetime rule a raw back-pointer needs, made observable. A
+    // Snapshot retires its mark from its own destructor, so one that
+    // outlived its walker would touch freed memory — the walker refuses to
+    // die first instead.
+    auto h = load();
+    EXPECT_DEATH(
+        {
+            std::optional<SchemaWalker::Snapshot> held;
+            {
+                SchemaWalker w{h.schema};
+                w.enterRule(h.rootRule);
+                held.emplace(w.snapshot());
+            }
+        },
+        "destroyed while a Snapshot is still outstanding");
+}
+
+TEST(SchemaWalker, RetiringTheLastSnapshotDropsTheUndoJournal) {
+    // The property that keeps a whole-file parse LINEAR rather than
+    // accumulating one undo record per frame close forever, observed at the
+    // WALKER's level: after every mark has retired, a long run of enter /
+    // leave cycles must still rewind correctly against a FRESH mark.
+    //
+    // ⚠ WHAT THIS CASE CAN AND CANNOT SEE, STATED RATHER THAN CONCEDED. The
+    // journal is `frames_`' business and the walker exposes no size, so the
+    // arm that would red on a journal growing forever is
+    // `SpeculationTrail.RepeatedMarkAndRewindCyclesDoNotAccumulateRecords`,
+    // which asserts `journalSize() == 0` after each cycle on the container
+    // itself. What is checkable HERE is that the rewind stays EXACT once the
+    // journal has been dropped and re-armed many times — so the assertions
+    // below compare the restored CURSOR and expected set, not just the stack
+    // depth. A length-only check was the previous shape and it would have
+    // passed on a stack of the right height holding the wrong frames.
+    auto h = load();
+    SchemaWalker w{h.schema};
+    w.enterRule(h.rootRule);
+    const SchemaCursor atRoot = w.cursor();
+    ASSERT_TRUE(atRoot.valid());
+
+    for (int cycle = 0; cycle < 200; ++cycle) {
+        auto snap = w.snapshot();
         w.enterRule(h.stmtRule);
-        return w.snapshot();
-    };
-    SchemaWalker w2{h.schema};
-    w2.restore(makeSnap());
-    EXPECT_TRUE(w2.cursor().valid());
-    EXPECT_EQ(w2.depth(), 2u);
+        w.leaveRule(SourceSpan::empty(0), h.stmtRule);
+        w.leaveRule(SourceSpan::empty(0), h.rootRule);   // BELOW the mark
+        w.enterRule(h.stmtRule);                          // and refill
+        w.restore(std::move(snap));
+        ASSERT_EQ(w.depth(), 1u) << "cycle " << cycle;
+        // The frame CONTENTS, not merely the count: a stack rebuilt from a
+        // stale journal would come back the right height around the `stmt`
+        // frame the branch pushed over the vacated slot.
+        ASSERT_EQ(w.cursor(), atRoot) << "cycle " << cycle;
+        ASSERT_FALSE(w.isDesynced()) << "cycle " << cycle;
+    }
+    EXPECT_EQ(w.depth(), 1u);
+    EXPECT_EQ(w.cursor(), atRoot);
 }
 
 // Compile-time pin: Snapshot must be non-default-constructible so a
@@ -483,4 +548,119 @@ TEST(SchemaWalkerDeath, RestoreFromDifferentWalkerAborts) {
     SchemaWalker b{h.schema};
     EXPECT_DEATH(b.restore(std::move(crossSnap)),
                  "schema pointer mismatch");
+}
+
+// ── The wrap depth must survive a speculative rewind ─────────────────────
+//
+// ★ THE INVARIANT NOTHING CHECKED. `wrapDepth_` — the O(1) "is any ancestor
+// frame a Pratt auto-interned wrapper" counter that SUPPRESSES the desync
+// latch — is restored from a SCALAR carried in the Snapshot, while the frame
+// stack it must agree with is rewound from the undo journal. Two restores from
+// two places, and until `assertWrapDepthMatchesFrames_` nothing related them.
+// The predecessor design kept the wrap flags in a vector parallel to the
+// cursor stack and fail-loud checked that the two LENGTHS agreed on restore;
+// folding the flag into the frame made that check vacuous and it was retired
+// with nothing put in its place.
+//
+// ⚠ AND NO EXISTING CASE COULD HAVE SEEN IT. Every snapshot case above walks
+// `stmt`, for which `isAutoInternedWrapperRule` answers FALSE — so the wrap
+// count is zero on both sides of every rewind in this file and any restore of
+// it, correct or not, agrees. This schema declares real `expr.wrapperRules`,
+// so `bExpr` below is auto-interned by the loader and IS a wrapper.
+constexpr std::string_view kWrapSchema = R"JSON({
+  "dssSchemaVersion": 4,
+  "language": { "name": "WrapW", "version": "0.1.0" },
+  "tokens": {
+    ";": [{ "kind": "Semi" }],
+    ",": [{ "kind": "Comma" }]
+  },
+  "shapes": {
+    "root":       { "sequence": ["expression", "Semi"] },
+    "expression": {
+      "expr": {
+        "atom": "operand",
+        "wrapperRules": { "binary": "bExpr", "unary": "uExpr", "postfix": "pExpr" }
+      }
+    },
+    "operand":    { "alt": ["Identifier"] }
+  }
+})JSON";
+
+TEST(SchemaWalker, WrapDepthSurvivesARewindThatDrainedBelowTheMark) {
+    auto loaded = GrammarSchema::loadFromText(kWrapSchema);
+    ASSERT_TRUE(loaded.has_value())
+        << (loaded.error().empty() ? "<no diagnostics>" : loaded.error()[0].message);
+    auto schema = *loaded;
+
+    const RuleId rootRule    = schema->rules().find("root");
+    const RuleId operandRule = schema->rules().find("operand");
+    const RuleId exprRule    = schema->rules().find("expression");
+    ASSERT_TRUE(rootRule.valid());
+    ASSERT_TRUE(operandRule.valid());
+    ASSERT_TRUE(exprRule.valid());
+    const auto pack = schema->exprWrapperRules(exprRule);
+    ASSERT_TRUE(pack.valid());
+    // The premise, asserted rather than assumed: `bExpr` IS an auto-interned
+    // wrapper and `operand` is not. If the loader ever stops interning
+    // wrappers this case must red HERE, not by silently comparing two
+    // ordinary rules and reporting agreement.
+    ASSERT_TRUE(schema->isAutoInternedWrapperRule(pack.binary));
+    ASSERT_FALSE(schema->isAutoInternedWrapperRule(operandRule));
+
+    const SchemaTokenId comma = schema->schemaTokens().find("Comma");
+    ASSERT_TRUE(comma.valid());
+
+    // One arm of the experiment. `middle` is the frame whose wrap-ness is
+    // under test, and a REAL rule is opened UNDER it so the cursor is valid
+    // going in — which is what makes the advance below a genuine
+    // valid→invalid transition instead of a no-op the latch never sees.
+    // Snapshot, drain the stack BELOW the mark and refill it with non-wrap
+    // frames, rewind, then force the transition and report whether the desync
+    // latch fired. Suppression is exactly what `wrapDepth_` decides, so the
+    // count IS the restored wrap depth, observed through behaviour.
+    auto desyncsAfterRewind = [&](RuleId middle) {
+        int fired = 0;
+        SchemaWalker w{schema, [&](SourceSpan, std::optional<RuleId>) { ++fired; }};
+        w.enterRule(rootRule);
+        w.enterRule(middle);
+        w.enterRule(operandRule);
+        auto snap = w.snapshot();
+        w.leaveRule(SourceSpan::empty(0), operandRule);
+        w.leaveRule(SourceSpan::empty(0), middle);
+        w.leaveRule(SourceSpan::empty(0), rootRule);   // BELOW the mark
+        w.enterRule(rootRule);                         // ... and refill it,
+        w.enterRule(operandRule);                      // with frames that are
+        w.enterRule(operandRule);                      // NOT wraps
+        w.restore(std::move(snap));
+        EXPECT_EQ(w.depth(), 3u);
+        EXPECT_FALSE(w.isDesynced()) << "the rewind must re-arm the latch";
+        // Count only what happens AFTER the rewind: the branch above can trip
+        // the callback on its own, and folding that in would make the two arms
+        // differ for a reason that is not the subject.
+        fired = 0;
+        // ⚠ THE PRECONDITION IS ASSERTED, NOT ASSUMED — this case was VACUOUS
+        // once and its own red-on-disable arm caught it. The first rendition
+        // opened the wrapper and advanced straight out of it; a wrapper rule
+        // has no body in the position graph, so the cursor was ALREADY invalid
+        // and `noteDesync_` returned before ever consulting the wrap depth. It
+        // reported 0 for the wrong reason and stayed GREEN under a mutant that
+        // deleted the wrap-depth restore outright.
+        EXPECT_TRUE(w.cursor().valid())
+            << "the advance below must be a valid->invalid transition or this "
+               "case measures nothing";
+        const bool stillValid = w.advance(comma, SourceSpan::empty(0), middle);
+        EXPECT_FALSE(stillValid)
+            << "the advance must invalidate the cursor or the latch is never "
+               "consulted";
+        return fired;
+    };
+
+    // CONTROL first, so "0 everywhere" cannot pass for a result: with an
+    // ordinary rule in the middle the same transition MUST reach the latch.
+    EXPECT_EQ(desyncsAfterRewind(operandRule), 1)
+        << "the control arm never desynced, so the wrap arm's 0 proves nothing";
+    EXPECT_EQ(desyncsAfterRewind(pack.binary), 0)
+        << "the rewind lost the wrap frame's depth: the desync latch fired "
+           "under an auto-interned wrapper rule, where cursor invalidation is "
+           "structural noise rather than a real grammar mismatch";
 }

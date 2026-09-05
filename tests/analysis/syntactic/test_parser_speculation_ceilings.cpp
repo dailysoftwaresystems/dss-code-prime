@@ -314,25 +314,37 @@ TEST(ParserSpeculationCeilings, BuilderCheckpointCapNoLongerBindsAtSixtyFive) {
 
 // ── (C3) RED-ON-DISABLE: the per-probe TOKEN BUDGET ─────────────────────────
 // The third ceiling, and the one that was completely silent. With the factor
-// back at the old hardcoded 16, c `operand`'s lookahead of 64 gives a 1024-token
-// budget: `(int)` is 3 tokens, so 341 casts (1023) is the last that fits and 342
-// is refused. It must be refused BY NAME.
+// back at the old hardcoded 16, c `operand`'s lookahead of 64 gives a
+// 1024-token budget, and the TOKEN-LONG / NESTING-SHALLOW shape is what that
+// budget bounds: `(int)(x+1+1+…)` puts the whole chain inside ONE probe at two
+// tokens a term, so ~511 terms is the last that fits. It must be refused BY
+// NAME.
+//
+// ⚠ THIS CASE USED THE CAST CHAIN AND NO LONGER CAN, AND THAT IS THE CHANGE
+// RATHER THAN A WEAKENING. The budget is now charged at each probe's OWN
+// nesting level — a probe is no longer billed for the tokens its NESTED probes
+// consumed, because each of those carries its own budget and how many there
+// may be is `maxSpeculationDepth`'s question. A D-cast chain therefore charges
+// every probe 3 tokens instead of charging the outermost one for the whole
+// chain, so no cast chain reaches this ceiling at any depth and this input can
+// no longer produce this diagnostic. `TheBudgetIsChargedPerProbeNotPerChain`
+// below is the other half of the same pin, and this case is what keeps the
+// change from reading as "the budget stopped firing".
 // ISOLATION: the depth ceiling is lifted to 500 for this case ONLY, so the
 // budget is provably the ceiling under test and not a second name for the
-// depth cap. 500 stays well under the MEASURED 641-cast ordinary-thread stack
-// floor, so lifting it here cannot turn a red into a crash.
+// depth cap.
 TEST(ParserSpeculationCeilings, TokenBudgetReimposedAtSixteenStillFailsLoud) {
     ParserConfig cfg = shippedCConfig();
     cfg.speculationBudgetFactor = 16;
     cfg.maxSpeculationDepth     = 500;
-    Tree t = parseC(castChain(342), std::move(cfg));
+    Tree t = parseC(longExprInCast(600), std::move(cfg));
 
     ASSERT_NE(t.root(), InvalidNode) << "must RECOVER, never abort";
     EXPECT_TRUE(t.diagnostics().hasErrors());
     ASSERT_GE(countCode(t, DiagnosticCode::P_SpeculationBudgetExhausted), 1u)
-        << "342 casts = 1026 tokens exceeds 64 x 16; the budget must fail loud "
-           "BY NAME rather than silently failing the probe; codes=["
-        << allCodes(t) << "]";
+        << "600 terms is 1200+ tokens inside ONE probe and exceeds 64 x 16; "
+           "the budget must fail loud BY NAME rather than silently failing the "
+           "probe; codes=[" << allCodes(t) << "]";
     EXPECT_EQ(countCode(t, DiagnosticCode::P_NoAlternativeMatched), 0u)
         << "codes=[" << allCodes(t) << "]";
 
@@ -341,6 +353,49 @@ TEST(ParserSpeculationCeilings, TokenBudgetReimposedAtSixteenStillFailsLoud) {
     EXPECT_NE(msg.find("per-alternative token budget"), std::string::npos) << msg;
     EXPECT_NE(msg.find("parser.speculationBudgetFactor"), std::string::npos)
         << msg;
+}
+
+// ── (C3b) THE BUDGET IS A TOKEN CEILING, NOT A SECOND DEPTH CEILING ─────────
+//
+// The complement of the case above, and the pin on the accounting itself. The
+// per-probe budget used to be charged the whole SPAN a probe covered, nested
+// probes' tokens included — so on a chain of N nested constructs the OUTERMOST
+// probe was charged for all of them and the budget refused the chain at
+// budget/3 casts, whatever `maxSpeculationDepth` said. Two ceilings on one
+// axis, and the one that fired was the one c.lang.json explicitly says must
+// not be binding for this shape.
+//
+// At factor 16 the budget is 1024 tokens, so the old accounting refused from
+// 342 casts. This parses 1000 — 3001 tokens, nearly 3× the budget — with the
+// depth ceiling lifted well past it, and requires it CLEAN. Revert the
+// discount in `SpeculationProbe::exceededBudget` and this reds by name.
+//
+// ⚠ AND THE CEILING IT SHIFTS THE WORK ONTO IS ASSERTED TOO, not assumed: the
+// same input one past a LOW depth cap must still be refused, by the depth
+// ceiling, by name. A budget that stopped firing without the depth ceiling
+// taking over would be a hole, not a fix.
+TEST(ParserSpeculationCeilings, TheBudgetIsChargedPerProbeNotPerChain) {
+    ParserConfig cfg = shippedCConfig();
+    cfg.speculationBudgetFactor = 16;      // budget = 64 × 16 = 1024 tokens
+    cfg.maxSpeculationDepth     = 4096;
+    cfg.maxExpressionDepth      = 4096;
+    Tree t = parseC(castChain(1000), std::move(cfg));
+
+    EXPECT_EQ(countCode(t, DiagnosticCode::P_SpeculationBudgetExhausted), 0u)
+        << "1000 nested casts is 3001 tokens against a 1024-token budget, but "
+           "no single probe consumes more than one `(int)` at its own level — "
+           "the budget must not be standing in for the depth ceiling; codes=["
+        << allCodes(t) << "]";
+    EXPECT_FALSE(t.diagnostics().hasErrors()) << allCodes(t);
+
+    ParserConfig capped = shippedCConfig();
+    capped.speculationBudgetFactor = 16;
+    capped.maxSpeculationDepth     = 100;
+    capped.maxExpressionDepth      = 4096;
+    Tree u = parseC(castChain(1000), std::move(capped));
+    EXPECT_GE(countCode(u, DiagnosticCode::P_MaxSpeculationDepth), 1u)
+        << "the DEPTH ceiling must be the one that now refuses a chain this "
+           "deep, and must refuse it by name; codes=[" << allCodes(u) << "]";
 }
 
 // ── (C4) RED-ON-DISABLE: the EXPRESSION-depth ceiling, hit INSIDE a probe ───

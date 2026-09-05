@@ -184,6 +184,13 @@ loadUnsignedExec(std::string_view shippedExecName) {
     // 4 KiB default with __text at pageZero+0x1000 and deliberately omits
     // `buildVersion`. Neither carries `codeSignature` — that omission is
     // this fixture's entire reason to exist.
+    //
+    // ⚠ BOTH DECLARE `weakDefinition`, because both shipped exec documents do
+    // since [[D-LK3-DYLIB-WEAK-EXPORT]] closed and `macho::encode` asks the
+    // dialect question ABOVE its filetype dispatch. Without the block a
+    // fixture module carrying a weak symbol is refused by the DIALECT gate,
+    // which would silently retarget every weak cell in this file away from the
+    // arm it meant to probe — a fixture that answers an adjacent question.
     constexpr std::string_view kArm64Json = R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
@@ -191,6 +198,7 @@ loadUnsignedExec(std::string_view shippedExecName) {
       "outputExtension": "",
       "dataModel": "LP64",
       "headerNameMatching": "case-insensitive",
+      "weakDefinition": { "dialect": "symbol-flag" },
       "format": {"name":"macho64-arm64-darwin-exec-unsigned","kind":"macho"},
       "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
       "entryVerbs": ["none","argc-argv"],
@@ -223,6 +231,7 @@ loadUnsignedExec(std::string_view shippedExecName) {
       "outputExtension": "",
       "dataModel": "LP64",
       "headerNameMatching": "case-insensitive",
+      "weakDefinition": { "dialect": "symbol-flag" },
       "format": {"name":"macho64-x86_64-darwin-exec-unsigned","kind":"macho"},
       "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
       "entryVerbs": ["none","argc-argv"],

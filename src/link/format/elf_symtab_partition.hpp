@@ -20,8 +20,14 @@
 // to an already-emitted atom are appended AFTER both binding-ordered passes
 // have run, so an alias that ever resolved to STB_LOCAL would land past
 // `sh_info` and the section header would lie about where the locals end.
-// `definedAliases` yields only externally-visible rows today, which is exactly
-// the kind of premise that stops being true quietly — and a mis-partitioned
+// `definedAliases` yields only EXTERNAL-LINKAGE rows today (`hasExternalLinkage`
+// — a named row whose binding is not Local; it asks nothing about VISIBILITY,
+// so a Global/Weak + Hidden/Internal alias qualifies), which is exactly the
+// kind of premise that stops being true quietly — the predicate behind it was
+// `isExternallyVisible` until
+// D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL swapped it, and that swap
+// WIDENED the set without changing this conclusion. It would stop holding the
+// moment a Local row were admitted — and a mis-partitioned
 // `.symtab` is invisible to DSS's own reader (which never consults `sh_info`)
 // while `ld`, `readelf`, `nm` and `gdb` all silently mis-partition. So the
 // invariant is CHECKED over the finished bytes rather than argued for in a
@@ -36,6 +42,36 @@ namespace dss::link::format {
 // st_size(8). st_info's high nibble is the binding; STB_LOCAL is 0.
 inline constexpr std::size_t kElf64SymSize   = 24;
 inline constexpr std::size_t kElf64StInfoOff = 4;
+
+// The boundary itself, READ BACK off the records that were emitted rather than
+// snapshotted from wherever the writer happened to be standing.
+// D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL.
+//
+// ★ WHY THIS REPLACED THREE POSITIONAL SNAPSHOTS. Both `.symtab` builders and
+// the `.dynsym` builder used to take `sh_info` as "the table's length at the
+// moment the local pass ended" (and the `.dynsym` one open-coded this scan a
+// third time). That is a statement about the EMISSION SITE, not about the
+// table: it proves `sh_info` matched a position, never that the position is
+// where the locals actually end. Reading the boundary off `st_info` makes the
+// published `sh_info` a function of the bytes alone, so a record emitted into
+// the wrong pass moves the boundary instead of silently invalidating it — and
+// `elfSymtabPartitionBreach` below then still refuses the table, because a
+// local appended AFTER a non-local lands past the first-non-local index. One
+// implementation, because `.symtab` and `.dynsym` share Elf64_Sym's layout and
+// the gABI's local-before-global rule.
+//
+// A table with no non-local record has its boundary at the END (every symbol
+// is local, `sh_info == n`), which is the arm a bare search loop returns 0 for.
+[[nodiscard]] inline std::uint32_t
+elfSymtabFirstNonLocal(std::span<std::uint8_t const> symtab) noexcept {
+    std::size_t const n = symtab.size() / kElf64SymSize;
+    for (std::size_t i = 0; i < n; ++i) {
+        if ((symtab[i * kElf64SymSize + kElf64StInfoOff] >> 4) != 0u) {
+            return static_cast<std::uint32_t>(i);
+        }
+    }
+    return static_cast<std::uint32_t>(n);
+}
 
 // Returns an empty string when the partition holds; otherwise a sentence
 // naming the offending symbol index and the side it sits on, for the caller's
