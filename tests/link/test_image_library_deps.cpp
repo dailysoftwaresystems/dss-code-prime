@@ -167,8 +167,16 @@ void checkEveryLibraryRecorded(FormatLeg const& leg) {
 
     auto const mod = makeTwoLibraryModule(leg.libA, leg.libB, leg.ret);
     DiagnosticReporter rep;
-    auto const image =
-        linker::link(mod, *loaded.target, *loaded.format, rep);
+        // D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT:
+        // the darwin legs' shipped documents declare their ad-hoc code-signature
+        // identity as a FUNCTION of the artifact, and an emission that cannot
+        // name the file it produces is REFUSED with no fallback. The name is a
+        // FACT the driver supplies on every emission, never a knob, so stating it
+        // here is right for EVERY leg -- a format declaring no placeholder
+        // ignores it.
+        auto const image = linker::link(
+        mod, *loaded.target, *loaded.format, rep,
+        dss::ImageRequest{.artifactFileName = "deps_probe"});
     ASSERT_FALSE(rep.hasErrors())
         << "a two-library import set must link clean; first diagnostic: "
         << (rep.all().empty() ? "" : rep.all().front().actual);
@@ -212,8 +220,9 @@ void checkExtractorReportsOnlyRecorded(FormatLeg const& leg) {
     // Both imports bind to libA; libB is never referenced by this module.
     auto const mod = makeTwoLibraryModule(leg.libA, leg.libA, leg.ret);
     DiagnosticReporter rep;
-    auto const image =
-        linker::link(mod, *loaded.target, *loaded.format, rep);
+    auto const image = linker::link(
+        mod, *loaded.target, *loaded.format, rep,
+        dss::ImageRequest{.artifactFileName = "deps_probe"});
     ASSERT_FALSE(rep.hasErrors())
         << (rep.all().empty() ? "" : rep.all().front().actual);
     ASSERT_FALSE(image.bytes.empty());

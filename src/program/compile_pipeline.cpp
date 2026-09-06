@@ -1199,6 +1199,22 @@ lowerMirModuleToAssembly(Mir&                                        mir,
             definedSymbolNames.push_back(
                 DefinedSymbolName{sym, std::move(nm)});
         }
+        // ★★ THE ADDRESS HALF: module GLOBALS too. ✔MEASURED 2026-09-05 that
+        // gcc 13.3.0 and clang 18.1.3 materialize `&exported_data` inside a
+        // `.so` through the SAME `R_X86_64_GLOB_DAT` GOT slot they use for
+        // `&exported_function`, weak and strong global alike, with the `static`
+        // and `visibility("hidden")` siblings in the same object left a bare
+        // `lea` — so a data definition the loader can see is preemptible on
+        // exactly the terms a function definition is, and the reference minted
+        // for it is looked up by the same kind of name.
+        for (std::size_t gi = 0; gi < mir.moduleGlobalCount(); ++gi) {
+            MirGlobalId const gid = mir.globalAt(static_cast<std::uint32_t>(gi));
+            SymbolId const    sym = mir.globalSymbol(gid);
+            std::string       nm  = nameOf(sym);
+            if (nm.empty()) continue;   // synthesized: no loader name
+            definedSymbolNames.push_back(
+                DefinedSymbolName{sym, std::move(nm)});
+        }
     }
     // 4. MIR → LIR (vreg-based). Extern imports propagate through.
     // D-FFI-EXTERN-CALL-DISPATCH: the active format's extern-call shape
@@ -2322,7 +2338,22 @@ bool linkAndWrite(std::span<AssembledModule const> modules,
     // c97: link phase — resolution + byte emission + image write.
     substrate::PhaseTimers::Scope linkPhase{substrate::CompilePhase::Link};
     auto const linkEntry = reporter.errorCount();
-    auto image = linker::link(modules, target, format, reporter, request);
+    // ── D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ──
+    //
+    // THE ONE PLACE THAT HOLDS BOTH HALVES, which is why the identity is bound
+    // here. A format document may declare an identity string that is a FUNCTION
+    // of the artifact being produced (a Mach-O dylib's LC_ID_DYLIB install
+    // name); the DOCUMENT states the shape and only this frame knows the file
+    // being written. The schema cannot carry it: `ObjectFormatSchema` is
+    // move-only and the driver hands the same memoized instance to every
+    // artifact of a format in one build — precisely the artifacts that must
+    // differ — so it rides the per-emission request instead.
+    // ⓘ The archive path below passes `request` through unchanged: an `ar`
+    // member is a relocatable object with no image identity to bind.
+    ImageRequest emissionRequest = request;
+    emissionRequest.artifactFileName = outPath.filename().string();
+    auto image = linker::link(modules, target, format, reporter,
+                              emissionRequest);
     if (!image.ok() || !tierClean(reporter, linkEntry)) {
         return false;
     }

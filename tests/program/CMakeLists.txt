@@ -456,3 +456,15 @@ dss_add_test(NAME program/test_failed_build_writes_no_artifact
 # APPENDED, never interleaved -- this file is append-only by lane convention.
 dss_add_test(NAME program/test_descriptor_role_follows_the_table
              SOURCES test_descriptor_role_follows_the_table.cpp)
+
+# D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT: the DRIVER
+# tier of "every resolved library reaches the emitted dependency table", with
+# the identity left UNSTATED so the recorder must read each binary's own
+# embedded one -- the precedence level the collapse lived on, and the level both
+# existing pins bypassed (one tests the writer; the other states the identity on
+# purpose, to keep its Mach-O leg from passing for the wrong reason).
+# HOST-INDEPENDENT: nothing is run, the subject is the emitted bytes.
+#
+# APPENDED, never interleaved -- this file is append-only by lane convention.
+dss_add_test(NAME program/test_macho_install_name_identity
+             SOURCES test_macho_install_name_identity.cpp)

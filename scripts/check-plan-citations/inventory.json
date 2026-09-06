@@ -25,7 +25,7 @@
     ".plans/29-inline-asm-plan - tbd.md": 42,
     ".plans/_deferred-anchor-registry-done.md": 1363,
     ".plans/_deferred-anchor-registry-harness.md": 251,
-    ".plans/_deferred-anchor-registry-production.md": 296,
+    ".plans/_deferred-anchor-registry-production.md": 294,
     ".plans/_handoff.md": 60,
     ".plans/_next-session-brief.md": 2,
     "examples/c/abstract_fnptr_cast/main.c": 1,
@@ -216,7 +216,7 @@
     "src/dss-config/shippedLibs/unistd.json": 16,
     "src/dss-config/shippedLibs/utime.json": 1,
     "src/dss-config/sources/asm.lang.json": 1,
-    "src/dss-config/sources/c.lang.json": 65,
+    "src/dss-config/sources/c.lang.json": 64,
     "src/dss-config/targets/arm64.target.json": 4,
     "src/dss-config/targets/x86_64.target.json": 4
   }

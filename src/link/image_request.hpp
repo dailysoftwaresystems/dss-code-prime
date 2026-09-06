@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <string_view>
 
 // Per-PROGRAM image requests — knobs the PROGRAM BEING BUILT asks of the
@@ -40,9 +41,40 @@ struct DSS_EXPORT ImageRequest {
     // — never clamped, never rounded, never silently dropped.
     std::optional<std::uint64_t> stackReserveBytes;
 
+    // ── D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ──
+    //
+    // The FILE NAME (no directory) of the artifact this emission is producing.
+    // A format document may declare an identity string that is a FUNCTION of
+    // it — the Mach-O LC_ID_DYLIB install name is the first — and the walker
+    // resolves the declaration against this. EMPTY means "the caller could not
+    // say", which is a REFUSAL wherever a declaration needs it and a silent
+    // no-op wherever none does.
+    //
+    // ★ WHY IT RIDES THE REQUEST RATHER THAN THE SCHEMA, and it is not a
+    // preference. `ObjectFormatSchema`'s copy constructor is deleted and the
+    // driver hands the SAME memoized `shared_ptr<ObjectFormatSchema const>` to
+    // every artifact of a format inside one build — so an identity stored there
+    // would be shared by exactly the artifacts that must differ, which is the
+    // collapse this field exists to end. The request is per-emission by
+    // construction, and this struct's own docblock already draws the line it
+    // falls on: a property of the PROGRAM being built, never of its format.
+    //
+    // ★ IT IS A FACT, NOT A KNOB, so it is deliberately absent from `empty()`
+    // below and from `enforceImageRequest`'s capability gate. The gate asks
+    // "did the user REQUEST something this format cannot do?"; the driver
+    // supplies this on every emission, so counting it would make every request
+    // non-empty and turn a question about user intent into a constant. A format
+    // that declares no placeholder ignores it — nothing is dropped, because
+    // nothing was asked. What CANNOT happen silently is the converse: a format
+    // that DOES declare one and an emission that cannot answer, which the
+    // walker refuses loud by name.
+    std::string artifactFileName;
+
     // True iff this request asks for anything at all. Lets a caller skip the
     // whole gate cheaply, and keeps the "did the user request something?"
     // question in ONE place as fields are added.
+    // ⚠ `artifactFileName` is NOT consulted — see its docblock: it is a fact
+    // the driver supplies unconditionally, not a request a format could refuse.
     [[nodiscard]] bool empty() const noexcept {
         return !stackReserveBytes.has_value();
     }

@@ -82,6 +82,18 @@
 #include <utility>
 #include <vector>
 
+// ── D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ────────
+//
+// The cases below drive `macho::encode` DIRECTLY, so nothing supplied the
+// per-EMISSION artifact identity that an MH_DYLIB document's
+// `image.installName` now names through `${artifactFileName}`. A real build
+// states it in `linkAndWrite` from the path it is about to write; a writer unit
+// test writes no file, so it states it here. Omitting it is not a smaller test
+// — it is the REFUSAL arm, and that arm has its own named case rather than
+// being asserted by accident in every unrelated one.
+constexpr char const* kFixtureArtifactFileName = "fixture.dylib";
+
+
 using namespace dss;
 using dss::link_format::test::countAtPath;
 using dss::link_format::test::errorCount;
@@ -640,7 +652,8 @@ decodeRebaseStream(std::span<std::uint8_t const> stream) {
 encodeDylib(AssembledModule const& mod, Loaded const& loaded) {
     DiagnosticReporter rep;
     auto bytes =
-        dss::macho::encode(mod, *loaded.target, *loaded.format, rep);
+        dss::macho::encode(mod, *loaded.target, *loaded.format, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
     EXPECT_EQ(rep.errorCount(), 0u);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     EXPECT_FALSE(bytes.empty());
@@ -660,8 +673,14 @@ TEST(MachoDylibFormatJson, ShippedFileLoadsCleanly) {
     EXPECT_EQ(loaded.format->macho().cputype, 0x0100000Cu);
     EXPECT_EQ(loaded.format->machoImage().pageZeroSize, 0u);
     EXPECT_TRUE(loaded.format->machoImage().dylinkerPath.empty());
+    // D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT: the
+    // DECLARATION, not the emitted identity. It was the literal
+    // `@rpath/libdss.dylib` and every DSS-built dylib inherited it; it is now a
+    // function of the artifact. The emitted bytes are pinned separately in
+    // `MachoDylibInstallName` (tests/link/test_macho_writer.cpp), which is
+    // where the SUBSTITUTION and its refusal arm belong.
     EXPECT_EQ(loaded.format->machoImage().installName,
-              "@rpath/libdss.dylib");
+              "@rpath/${artifactFileName}");
 }
 
 TEST(MachoDylibFormatPolicy, ImageFlavorTrueUndefinedImportsFalse) {
@@ -716,7 +735,10 @@ TEST(MachoDylibWriter, HeaderPinsDylibShape) {
     EXPECT_EQ(readU32LE(bytes, *idLc + 8), 24u);   // lc_str offset
     std::string const name(
         reinterpret_cast<char const*>(&bytes[*idLc + 24]));
-    EXPECT_EQ(name, "@rpath/libdss.dylib");
+    // D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT: the
+    // EMITTED identity is now the document's declared shape with this
+    // emission's artifact substituted, so it tracks the fixture name above.
+    EXPECT_EQ(name, std::string{"@rpath/"} + kFixtureArtifactFileName);
 
     // NO LC_MAIN, NO LC_LOAD_DYLINKER, NO __PAGEZERO.
     EXPECT_FALSE(findLoadCommand(bytes, kLcMain).has_value());
@@ -1153,7 +1175,8 @@ TEST(MachoDylibWriter, WeakExportCarriesAllFourWeakDefinitionFacts) {
         AssembledModule mod = makeExportModule();
         mod.symbols[0].binding = binding;
         DiagnosticReporter rep;
-        auto img = dss::macho::encode(mod, *loaded.target, *loaded.format, rep);
+        auto img = dss::macho::encode(mod, *loaded.target, *loaded.format, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         std::string diags;
         for (auto const& d : rep.all()) diags += d.actual + "\n";
         return std::tuple{std::move(img), rep.errorCount(), diags,
@@ -1243,7 +1266,8 @@ TEST(MachoDylibWriter, ModuleSymbolNamingExternImportFailsLoud) {
                                        SymbolBinding::Global,
                                        SymbolVisibility::Default});
     DiagnosticReporter rep;
-    auto img = dss::macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = dss::macho::encode(mod, *loaded.target, *loaded.format, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
     EXPECT_TRUE(img.empty());
     EXPECT_GT(rep.errorCount(), 0u);
     EXPECT_TRUE(sawDiagnosticContaining(rep, "EXTERN IMPORT"));
@@ -1259,7 +1283,8 @@ TEST(MachoDylibWriter, ImageEntryOverrideFailsLoud) {
     AssembledModule mod = makeExportModule();
     mod.imageEntryOverride = 0u;
     DiagnosticReporter rep;
-    auto img = dss::macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = dss::macho::encode(mod, *loaded.target, *loaded.format, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
     EXPECT_TRUE(img.empty());
     EXPECT_GT(rep.errorCount(), 0u);
     EXPECT_TRUE(sawDiagnosticContaining(rep, "imageEntryOverride"));
@@ -1298,7 +1323,12 @@ TEST(MachoDylibWriter, ThreadLocalDylibLinksAndCarriesTLV) {
                                        SymbolBinding::Global,
                                        SymbolVisibility::Default});
     DiagnosticReporter rep;
-    auto img = linker::link(mod, *loaded.target, *loaded.format, rep);
+    // The artifact identity rides the image request through `linker::link`
+    // exactly as a real build's `linkAndWrite` supplies it
+    // (D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT).
+    auto img = linker::link(mod, *loaded.target, *loaded.format, rep,
+                            dss::ImageRequest{
+                                .artifactFileName = kFixtureArtifactFileName});
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     // Links CLEAN — the pre-walker gate now ADMITS tdata/tbss (the old
     // rejection was the absence this row existed for).
@@ -1569,7 +1599,10 @@ TEST(MachoDylibWriterX86_64, HeaderPinsDylibShape) {
     EXPECT_EQ(readU32LE(bytes, *idLc + 8), 24u);   // lc_str offset
     std::string const name(
         reinterpret_cast<char const*>(&bytes[*idLc + 24]));
-    EXPECT_EQ(name, "@rpath/libdss.dylib");
+    // D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT: the
+    // EMITTED identity is now the document's declared shape with this
+    // emission's artifact substituted, so it tracks the fixture name above.
+    EXPECT_EQ(name, std::string{"@rpath/"} + kFixtureArtifactFileName);
 
     // NO LC_MAIN, NO LC_LOAD_DYLINKER, NO __PAGEZERO (a dylib is
     // base-0; dyld slides the whole image).
@@ -1813,7 +1846,8 @@ TEST(MachoImageSymbolNames,
             && (*fmt)->machoImage().buildVersion.has_value();
 
         DiagnosticReporter rep;
-        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep);
+        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         std::string diags;
         for (auto const& d : rep.all()) diags += d.actual + "\n";
 
@@ -2104,7 +2138,8 @@ TEST(MachoImageLinkeditAlignment,
         if (!isDylibCell) mod.imageEntryOverride = std::size_t{0};
 
         DiagnosticReporter rep;
-        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep);
+        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         std::string diags;
         for (auto const& d : rep.all()) diags += d.actual + "\n";
         ASSERT_EQ(rep.errorCount(), 0u) << label << "\n" << diags;
@@ -2335,7 +2370,8 @@ TEST(MachoImageSymbolNames,
             && (*fmt)->machoImage().buildVersion.has_value();
 
         DiagnosticReporter rep;
-        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep);
+        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         std::string diags;
         for (auto const& d : rep.all()) diags += d.actual + "\n";
 
@@ -2684,7 +2720,8 @@ TEST(MachoImageWeakAlias, EveryImageArmPublishesAWeakAliasAsAWeakDefinition) {
         }
 
         DiagnosticReporter rep;
-        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep);
+        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         std::string diags;
         for (auto const& d : rep.all()) diags += d.actual + "\n";
 
@@ -2812,7 +2849,8 @@ TEST(MachoChainedFixupsExportTrie, WeakExecPublishesItsTrieThroughItsOwnLoadComm
     auto encodeWith = [&](SymbolBinding binding) {
         auto mod = chainedFixupsWeakModule(binding);
         DiagnosticReporter rep;
-        auto img = dss::macho::encode(mod, **target, *fmt, rep);
+        auto img = dss::macho::encode(mod, **target, *fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         std::string diags;
         for (auto const& d : rep.all()) diags += d.actual + "\n";
         return std::tuple{std::move(img), rep.errorCount(), diags};
@@ -2915,7 +2953,8 @@ TEST(MachoChainedFixupsExportTrie,
     mod.externImports.push_back(std::move(imp));
 
     DiagnosticReporter rep;
-    auto const img = dss::macho::encode(mod, **target, **fmt, rep);
+    auto const img = dss::macho::encode(mod, **target, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
     std::string diags;
     for (auto const& d : rep.all()) diags += d.actual;
     ASSERT_EQ(rep.errorCount(), 0u) << diags;
@@ -2982,7 +3021,8 @@ TEST(MachoDylibWriter, HiddenWeakDefinitionPublishesNoCoalescingSurface) {
         mod.symbols[0].binding    = SymbolBinding::Weak;
         mod.symbols[0].visibility = vis;
         DiagnosticReporter rep;
-        auto img = dss::macho::encode(mod, *loaded.target, *loaded.format, rep);
+        auto img = dss::macho::encode(mod, *loaded.target, *loaded.format, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         std::string diags;
         for (auto const& d : rep.all()) diags += d.actual + "\n";
         return std::tuple{std::move(img), rep.errorCount(), diags,
@@ -3073,7 +3113,8 @@ TEST(MachoExternCallDispatch, RefusalNamesTheDeclaredSpellingAndTheAcceptedSet) 
     mod.externImports.push_back(std::move(imp));
 
     DiagnosticReporter rep;
-    auto const bytes = dss::macho::encode(mod, **target, **fmt, rep);
+    auto const bytes = dss::macho::encode(mod, **target, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
     std::string diags;
     for (auto const& d : rep.all()) diags += d.actual + "\n";
     EXPECT_TRUE(bytes.empty()) << diags;

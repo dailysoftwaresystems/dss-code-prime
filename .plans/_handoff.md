@@ -9,13 +9,153 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-09-05 — cycles **P14 … P62**. ⚠ P52 rewrote no handoff at all, so a reader who opened this file during P53 saw P51 described as current state; that entry in §5 was written after the fact and says so.
+**Last updated:** 2026-09-06 — cycles **P14 … P62**. ⚠ P52 rewrote no handoff at all, so a reader who opened this file during P53 saw P51 described as current state; that entry in §5 was written after the fact and says so.
 
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
 
-**Cycle P62 closed 2026-09-05.** **FIVE lanes plus four remediations and the orchestrator**, on top
+**Cycle P62 closed 2026-09-06.** **EIGHT lanes in two waves, plus six remediations, four independent
+reviews and the orchestrator**, on top of P61 (`ed1ac9c4`), committed in two parts.
+**Every lane was independently reviewed; every single review found a real defect.**
+
+✔**REAL: 13 rows closed, 3 opened, net −10.** ✔**COUNTED by `check-anchor-balance --base ed1ac9c4`:
+4 closed, 3 opened, net −1 (802 → 801).**
+⚠ **The gate's 4 and the real 13 differ because NINE rows were minted AND closed inside the cycle**,
+which is invisible from BOTH bases. Report both; never soften the instrument.
+**Production 8 closed / 3 opened · harness 5 closed / 0 opened.** ★ **P0 began and ended empty.**
+
+★★★ **THE THROUGH-LINE: P62 DOUBTS THE ROW'S PRESCRIBED *REMEDY*.** P58 doubted the ROW, P59 the
+GUARD, P60 the LANE'S OWN CLOSING CLAIM, P61 asked what a green whole-tree gate cannot see. **Five
+rows this cycle had their remedy refuted** — a `Closing work` cell is a plan against a tree that has
+since moved, and a lane briefed to *"do what the row says"* builds the wrong thing correctly while
+every gate stays green.
+
+## §0.1 — THE FIVE REFUTED REMEDIES, because they are the cycle's most transferable result
+
+1. **`D-PARSE-SPECULATION-REFUSAL-REPLAY-IS-QUADRATIC`** named MEMOISATION. Lane `sp` counted inside
+   the parser: fallback replays fire **exactly 1** at every cap. **A memo would have hit nothing.**
+   The mechanism was a WINDOW, not a repetition — 65537 casts, ~18 HOURS → **8.41 s**.
+2. **`D-FFI-RESOLVE-LIBRARY-DOES-NOT-CHECK-THE-LIBRARY-ARCH`** said *"do it in the same change as the
+   format check"* — that change had landed **ten days earlier**.
+3. **`D-FFI-RESOLVE-LIBRARY-DEMANDS-A-BINARY`** rested on a silent-wrong-binary defect **already
+   fixed** when `externLibraryByFormat` was retired. Re-ranked P1 → P2.
+4. **`D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING`** asked for *"a dylib ordinal meaning resolve
+   from the coalescing scope"*. ✔That spelling exists only under CHAINED FIXUPS; the shipped dylib
+   documents declare none, and ld64 under `-no_fixup_chains` uses a 16-byte `weak_bind_off` stream
+   **carrying no dylib ordinal at all**. The prescribed fix would have written an ordinal opcode
+   into a stream with no ordinal field.
+5. **`D-CSUBSET-ATTRIBUTE-ARG-CONSTANT-EXPRESSION`** prescribed a fail-loud arm that was **already
+   done** since TF-C73. Zero new diagnostic ordinals were needed.
+
+## §0.2 — WHAT LANDED
+
+**WAVE 1 (`04c0dec9`):** `sp` (the quadratic above) · `wc` — `preemptibleDefinitionBindings`, a
+declared per-format set, after refuting *"a NON-weak call must not be routed"* as a **Mach-O** rule
+(gcc AND clang both route a `.so`'s call to its own **strong global** through the PLT) and finding
+the ELF rail had the identical divergence · `ff` — one chokepoint now walks every archive member,
+after the review's blocking finding was itself **measured false and the real hole was wider**
+(an x86_64 `.a` into an aarch64 target built rc=0 with zero diagnostics) · `dy` — five de-gated
+sites in `encodeExecDynamic` · `vt` — `foldDeclaredAxis` taking severity and residue as parameters,
+after review caught the first fix **shipping a new wrong answer** (a `static` definition escaping as
+`FUNC WEAK DEFAULT`).
+
+**WAVE 2:** `mo` — Mach-O `installName` is now `@rpath/${artifactFileName}` resolved per emission,
+and the coalescing rail WORKS on real Apple Silicon (rc 2 matching an ld64 control) · `pa` — the
+ADDRESS of a preemptible definition, ELF, witnessed on real loaders · `ae` — `sizeof`/`_Alignof`
+**and operator expressions** in an attribute argument · `ax` — a regression that turned out not to
+exist (§0.4).
+
+## §0.3 — THE FOUR FINDINGS WORTH CARRYING FORWARD
+
+- ★★★ **A PIN MAY NOT ROUTE AROUND THE DEFECT IT DOCUMENTS.** The driver-tier pin for the
+  install-name property was GREEN — because its own comment states each identity explicitly *"so the
+  shipped single `installName` would make the Mach-O leg pass for a reason unrelated to the
+  defect."* Someone SAW the collapse, wrote it down inside the test meant to catch it, and shipped.
+  Now `D-HARNESS-A-PIN-MAY-NOT-ROUTE-AROUND-THE-DEFECT-IT-DOCUMENTS`.
+- ★★★ **FOUR SHIPPED TESTS WERE PINNING A DIVERGENCE AS THE CONTRACT.** Each used a
+  `global`+`default` definition inside a `.so` as its *"internal control that must stay RELATIVE"* —
+  the exact shape both references route through the GOT. Repaired by moving the SUBJECT to `hidden`,
+  never by weakening an assertion.
+- ★★★ **A PARTIAL FIX SHIPPED A NEW WRONG ANSWER.** Fixing `&w` in code and not in a static
+  initializer made `lib_self_consistent` **0** where gcc gives **3** — inside one library, two forms
+  of one expression disagreed. Before the fix both were wrong and AGREED. Caught by a reviewer's own
+  C 6.2.2p2 probe.
+- ★★★ **A `.so` WITH A STRING LITERAL DID NOT COMPILE**, and no gate could see it: exactly one
+  corpus example builds a `.so` and **neither of its sources contains a `"` character**. The
+  predicate answered "preemptible" for synthetic nameless globals; the correct filter was already
+  written one tier away.
+
+## §0.4 — WHAT THE ORCHESTRATOR GOT WRONG
+
+1. **I edited `c.lang.json` under my own running gate.** Eight examples failed
+   `C_UnbackedPredefinedMacro` about shipped-library descriptors — which reads as a defect in the
+   FFI work folded hours earlier, and that is where I looked. All eight passed on the settled tree.
+   Both `run-gate` twins now bracket the run and refuse with **exit 3**, checked BEFORE rc and
+   BEFORE the witness. No escape hatch.
+2. **I chased a regression that did not exist.** Two inline-asm tests went red; I hypothesised a
+   grammar re-pointing and was **refuted**. ✔The real cause: `test_semantic_analyzer_c.cpp.obj` was
+   dated **Sep 4**, never recompiled after `SemanticConfig` gained a field in its MIDDLE (`sizeof`
+   4224 → 4264, shifting `.inlineAsm` and two siblings by exactly 40 bytes), but RELINKED. It read
+   the struct at stale offsets. `check-ninja-deps` named it: **1 of 625 objects with zero recorded
+   header deps** — the already-open `D-BUILD-NINJA-RECORDS-ZERO-HEADER-DEPS-UNDER-CONCURRENT-BUILDS`.
+   I wiped `build/dbg` rather than deleting one object: the tool sees ZERO-dep objects, and a
+   truncated record is the same defect and invisible.
+3. **My `DSS_CONFIG_ROOT` control was misconfigured, not refuting** — the variable names the
+   directory CONTAINING `src/dss-config`. I concluded "the binary ignores it" and would have
+   eliminated the real suspect on that basis.
+4. **I created a grant collision** (`mo` and `pa` both held `linker.cpp` and `compile_pipeline.cpp`)
+   by intersecting the GRANTS I wrote instead of the file lists — the exact failure the project
+   already has a memory about. Recovered by three-way merge.
+5. **My "skip and re-derive" fold rule dropped work** — right for derived figures, wrong when a lane
+   ALSO added census MARKERS. Recovered; the file now carries 34 machine-checked figures.
+6. **A hand-rolled closure counter matched row names inside other rows' cross-references** and
+   reported 434 closures where the truth was 4. Deleted, not patched — that question belongs to
+   `check-anchor-balance`.
+
+## §0.5 — WHAT P63 INHERITS, IN PRIORITY ORDER
+
+1. **`D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN` (P1, NEW).** ✔gcc and clang RUN
+   `aligned(N)` at 256/512/1024/4096; DSS runs 128 and 256 and refuses **from 512**. 4096 is a page
+   — the first alignment a program asking for one would write. The cap is SHARED with `_Alignas`.
+   **It must become a DECLARED per-format limit, not a larger constant.**
+2. **`D-CSUBSET-ATTRIBUTE-MID-DECLARATOR-POSITION-REFUSED` (P1, NEW).** Three references build and
+   run it; DSS refuses `P_UnexpectedToken`. Both neighbouring positions agree exactly, so the
+   isolation is exact. ⚠ `D-CSUBSET-ATTRIBUTE-MEMBER-POSITION` is CLOSED and covers only the
+   LEADING position — it reads as complete coverage and is not.
+3. **`D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING` (P2)** — ONE half left, and neither lane's
+   stated reason is it. Both deferred to each other and both landed; ✔`addressSlotSymbol` occurs
+   once in `elf.cpp` and **zero times in `macho.cpp`**. Give Mach-O the address slot-VA binding,
+   measured against ld64 for the address form, then delete the loud refusal.
+4. **`D-LK-MACHO-EMITS-NO-LC-UUID` (P3, NEW)** — dyld reports `<no uuid>` against ld64's. Not a
+   union violation; a missing artifact facility that defeats symbolication.
+5. The rest of the P1 production band, heavily `D-CSUBSET-*`.
+
+## §0.6 — THE GATE
+
+| leg | result |
+|---|---|
+| **Windows** `build/dbg` | **2099/2099**, 0 failures, on a WIPED-AND-REBUILT tree (`check-ninja-deps` OK, 625 objects) |
+| **WSL x86_64** | **2099/2099**, 0 failures, `inputs held still` |
+| **arm64 under qemu** | ✔**COVERED BY THE WSL LEG, and asserted rather than assumed** — that leg ends with a positive *emulator witness* proving arm64 artifacts were actually SPAWNED and RAN on the host (`6 verified, 6 ran`), which is what stops a silent all-skip from reading as a pass. ⓘ It is the corpus's arm64 execution, not a second whole-tree ctest; `wc`'s and `pa`'s own aarch64 run witnesses were taken in-lane under qemu and are recorded in their rows. |
+| **macOS arm64** (real Apple Silicon) | **2073/2073**, 0 failures |
+
+★ Every gate run recorded **`inputs held still`** through the `run-gate` bracket added this cycle.
+
+---
+
+★★★ **P62 WAVE 1 — RELOCATED HERE BY P62 WAVE 2, AND IT IS HISTORY, NOT STATE.** It was §0 between
+the two commits of this same cycle. Every figure below is wave 1's own and was true at its tip
+(`04c0dec9`) — the closure counts in particular are SMALLER than the cycle's final ones, because
+wave 2 had not run; **re-derive anything you intend to act on** from the §0 above, not from here.
+⚠ This block is kept rather than overwritten because it is the record of what wave 2 was standing on
+when it started, and three of wave 2's findings only make sense against it.
+
+## ⏪ P62 wave 1's former §0 (history)
+
+### ⏪ Wave 1's own former heading, kept verbatim so the block reads as it did: *§0 — RESUME HERE (a session with no context reads this block first)*
+
+**Cycle P62 wave 1 closed 2026-09-05.** **FIVE lanes plus four remediations and the orchestrator**, on top
 of P61 (`ed1ac9c4`). Every lane was independently reviewed; **every single one came back with a real
 defect**, and one review found a lane's fix had SHIPPED A NEW WRONG ANSWER.
 

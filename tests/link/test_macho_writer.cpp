@@ -168,6 +168,24 @@ struct Loaded {
 // the field) and any non-Mach-O format passed here route through
 // untouched, and no library-flavored walker ever sees an override it
 // would rightly reject.
+// ── D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ──
+//
+// ★ AND IT NOW CARRIES A SECOND CONTRACT, for the same reason and in the same
+// place. Every shipped darwin document declares its ad-hoc code-signature
+// identity as a FUNCTION of the artifact, so an emission that cannot name the
+// file it is producing is REFUSED — deliberately, with no fallback. A direct
+// writer call is exactly such an emission: it has no output path. So the ONE
+// helper states a name once, and every byte-level pin in this file inherits it
+// rather than 30-odd call sites each learning the rule separately (~31 cases
+// across three files went red the moment the declaration landed, all with the
+// identical diagnostic).
+//
+// ⚠ THE NAME IS DELIBERATELY NOT "a.out" OR ANYTHING PLAUSIBLE. It appears
+// verbatim in the CodeDirectory of every image these pins emit, so a byte
+// comparison that accidentally depends on it should read as this fixture's
+// name and not as something a real build might produce.
+constexpr char const* kWriterPinArtifactFileName = "dss_writer_pin_artifact";
+
 [[nodiscard]] std::vector<std::uint8_t>
 encodeUntrampolined(AssembledModule&          module,
                     TargetSchema const&       target,
@@ -176,7 +194,9 @@ encodeUntrampolined(AssembledModule&          module,
     if (format.processExit().has_value()) {
         module.imageEntryOverride = 0u;
     }
-    return macho::encode(module, target, format, reporter);
+    return macho::encode(
+        module, target, format, reporter,
+        dss::ImageRequest{.artifactFileName = kWriterPinArtifactFileName});
 }
 
 } // namespace
@@ -5614,4 +5634,1245 @@ TEST(MachOTlvWriter, NoThreadLocalEmitsNoThreadSectionsSqliteDormant) {
     // closure pin — it goes red if the TLV bit is ever made unconditional.
     EXPECT_EQ(readU32LE(bytes, 24) & 0x00800000u, 0u)
         << "no-TLS image must NOT set MH_HAS_TLV_DESCRIPTORS";
+}
+
+// ══ D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ═══════
+//
+// The install name IS the dylib's runtime identity — the string a client
+// records at link time and dyld resolves at load — so a fixed string in shared
+// config gives every artifact of that format ONE identity. ✔MEASURED before the
+// fix, through the real driver: two distinct DSS-built dylibs both named on
+// `--resolve-library` produced rc 0, ZERO diagnostics, and an executable
+// recording ONE `LC_LOAD_DYLIB @rpath/libdss.dylib`, while the ELF control on
+// the identical shape recorded TWO correct `DT_NEEDED` entries.
+//
+// ★ THESE ARE THE WRITER-TIER ARMS: that the shipped documents DECLARE the
+// artifact-keyed shape, that two emissions differing ONLY in artifact name
+// produce DIFFERENT LC_ID_DYLIB bytes, and that an emission which cannot name
+// its artifact is REFUSED rather than given a fabricated identity. The
+// end-to-end arm — that the RECORDER then tells the two libraries apart
+// WITHOUT being handed a stated import name — is a driver question and lives in
+// `tests/program/test_macho_install_name_identity.cpp`.
+
+namespace {
+
+struct DylibLeg {
+    char const* label;
+    char const* target;
+    char const* format;
+};
+
+// ⚠ ONE PHYSICAL LINE, AND THAT IS A RULE RATHER THAN A FORMATTING CHOICE. An
+// anchor id split across two string-literal fragments still COMPILES and still
+// MATCHES at run time, so nothing here would fail — but every grep in the
+// project, `anchor_registry_guard` included, then sees the first fragment as a
+// whole id and MINTS one that does not exist. ✔MEASURED in this very file: the
+// wrapped form made `anchor_registry_guard` report TWO unresolved ids where one
+// row was missing — the real one, and a phantom ending at the wrap point.
+// ⚠ AND THE FIX HAS THE SAME TRAP ON ITS OTHER SIDE: naming that phantom here,
+// even inside prose explaining it, MINTS IT AGAIN. ✔MEASURED — the first draft
+// of this very comment quoted it and the guard reported it a second time. Talk
+// about the truncation; never spell one.
+constexpr char const* kInstallNameAnchorId = "D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT";
+
+// Both shipped darwin dylib documents, because a declaration fixed on one port
+// and forgotten on the other is exactly the asymmetry this suite exists to
+// notice.
+constexpr DylibLeg kDylibLegs[] = {
+    {"arm64",  "arm64",  "macho64-arm64-darwin-dylib"},
+    {"x86_64", "x86_64", "macho64-x86_64-darwin-dylib"},
+};
+
+// The LC_ID_DYLIB payload of an emitted image, or nullopt when the command is
+// absent. Reads the command's own `lc_str` offset rather than assuming 24, so a
+// future wire-shape change fails as a MISSING NAME rather than as garbage.
+[[nodiscard]] std::optional<std::string>
+readIdDylibName(std::span<std::uint8_t const> bytes) {
+    constexpr std::uint32_t kLcIdDylibCmd = 0x0Du;
+    auto const at = dss::macho::test::findLoadCommand(bytes, kLcIdDylibCmd);
+    if (!at.has_value()) return std::nullopt;
+    std::uint32_t const nameOff = readU32LE(bytes, *at + 8);
+    if (*at + nameOff >= bytes.size()) return std::nullopt;
+    return std::string(reinterpret_cast<char const*>(&bytes[*at + nameOff]));
+}
+
+// A minimal exportable dylib module: one externally-visible function, which is
+// all the export trie needs and all these arms care about.
+[[nodiscard]] AssembledModule makeInstallNameDylibModule() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};   // arm64 `ret`; opaque bytes here
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_dss_add",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    return mod;
+}
+
+} // namespace
+
+TEST(MachoDylibInstallName, ShippedDocumentsDeclareTheArtifactNotAConstant) {
+    for (auto const& leg : kDylibLegs) {
+        SCOPED_TRACE(leg.label);
+        auto fmt = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(fmt.has_value());
+        auto const declared = (*fmt)->machoImage().installName;
+        // The placeholder must be PRESENT. A document that declared a literal
+        // would emit one identity for every artifact, which is the defect.
+        EXPECT_TRUE(dss::declaresArtifactIdentityPlaceholder(declared))
+            << "the shipped '" << leg.format << "' document declares '"
+            << declared << "', which is a CONSTANT: every dylib this format "
+               "produces would embed that one LC_ID_DYLIB, and a program "
+               "loading two of them would resolve the name once and lose the "
+               "second library's symbols";
+        EXPECT_NE(declared.find(dss::kArtifactFileNamePlaceholder),
+                  std::string::npos)
+            << "declared '" << declared << "'";
+        // ...and the replaced constant must not have survived anywhere in it.
+        EXPECT_EQ(declared.find("libdss.dylib"), std::string::npos)
+            << "the replaced constant is still present in '" << declared << "'";
+    }
+}
+
+TEST(MachoDylibInstallName, TwoArtifactsOfOneFormatGetDifferentIdentities) {
+    for (auto const& leg : kDylibLegs) {
+        SCOPED_TRACE(leg.label);
+        auto target = TargetSchema::loadShipped(leg.target);
+        auto fmt    = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(target.has_value());
+        ASSERT_TRUE(fmt.has_value());
+
+        // The SAME module and the SAME format, twice — the only difference is
+        // the artifact being produced. Anything shared between the two
+        // emissions (a constant, a field cached on the memoized schema)
+        // collapses them, which is precisely what shipped before.
+        DiagnosticReporter repA;
+        auto const bytesA = dss::macho::encode(
+            makeInstallNameDylibModule(), **target, **fmt, repA,
+            dss::ImageRequest{.artifactFileName = "alpha.dylib"});
+        for (auto const& d : repA.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(repA.errorCount(), 0u);
+
+        DiagnosticReporter repB;
+        auto const bytesB = dss::macho::encode(
+            makeInstallNameDylibModule(), **target, **fmt, repB,
+            dss::ImageRequest{.artifactFileName = "beta_longer.dylib"});
+        for (auto const& d : repB.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(repB.errorCount(), 0u);
+
+        auto const nameA = readIdDylibName(bytesA);
+        auto const nameB = readIdDylibName(bytesB);
+        ASSERT_TRUE(nameA.has_value());
+        ASSERT_TRUE(nameB.has_value());
+        EXPECT_EQ(*nameA, "@rpath/alpha.dylib");
+        EXPECT_EQ(*nameB, "@rpath/beta_longer.dylib");
+        EXPECT_NE(*nameA, *nameB)
+            << "two artifacts of one format embedded the SAME LC_ID_DYLIB";
+        // ★ THE SIZE, NOT ONLY THE PAYLOAD. The command is SIZED once and
+        // EMITTED once, from two reads of the same declaration, so a resolution
+        // done twice (or a size taken from the unresolved template) desyncs
+        // `cmdsize` from its payload. The two names differ in length by more
+        // than the 8-byte command alignment, so the two `cmdsize` values must
+        // differ too — and each must be large enough to hold its own
+        // NUL-terminated name past the `lc_str` offset.
+        // ⚠ NOT the total image size: ✔MEASURED that both images come out at
+        // 8474 bytes, because __LINKEDIT padding absorbs a name-length change.
+        // A whole-image size comparison LOOKS like this property and is not it.
+        constexpr std::uint32_t kLcIdDylibCmd = 0x0Du;
+        auto const atA = dss::macho::test::findLoadCommand(bytesA, kLcIdDylibCmd);
+        auto const atB = dss::macho::test::findLoadCommand(bytesB, kLcIdDylibCmd);
+        ASSERT_TRUE(atA.has_value());
+        ASSERT_TRUE(atB.has_value());
+        std::uint32_t const sizeA = readU32LE(bytesA, *atA + 4);
+        std::uint32_t const sizeB = readU32LE(bytesB, *atB + 4);
+        EXPECT_NE(sizeA, sizeB)
+            << "one LC_ID_DYLIB cmdsize served two identities of different "
+               "lengths — the size did not follow the resolved name";
+        EXPECT_GE(sizeA, readU32LE(bytesA, *atA + 8) + nameA->size() + 1u);
+        EXPECT_GE(sizeB, readU32LE(bytesB, *atB + 8) + nameB->size() + 1u);
+    }
+}
+
+TEST(MachoDylibInstallName, AnEmissionThatCannotNameItsArtifactIsRefused) {
+    for (auto const& leg : kDylibLegs) {
+        SCOPED_TRACE(leg.label);
+        auto target = TargetSchema::loadShipped(leg.target);
+        auto fmt    = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(target.has_value());
+        ASSERT_TRUE(fmt.has_value());
+
+        // No artifact name on the request. There is deliberately no fallback:
+        // substituting anything fixed here rebuilds the collapse.
+        DiagnosticReporter rep;
+        auto const bytes =
+            dss::macho::encode(makeInstallNameDylibModule(), **target, **fmt,
+                               rep, dss::ImageRequest{});
+        EXPECT_TRUE(bytes.empty())
+            << "an image was emitted despite an unresolvable identity";
+        ASSERT_GT(rep.errorCount(), 0u)
+            << "silently emitting SOME identity is the defect, not the fix";
+        bool named = false;
+        for (auto const& d : rep.all()) {
+            if (d.code == DiagnosticCode::K_WalkerInputContractViolation
+                && d.actual.find("image.installName") != std::string::npos
+                && d.actual.find(kInstallNameAnchorId) != std::string::npos) {
+                named = true;
+            }
+        }
+        EXPECT_TRUE(named)
+            << "the refusal must name its key AND its anchor; got: "
+            << diagSummary(rep);
+    }
+}
+
+TEST(MachoDylibInstallName, AnUnknownPlaceholderIsRefusedRatherThanShipped) {
+    // A mis-spelled placeholder is a property of the DOCUMENT, so it fails
+    // where the document is read. Passed through, it would ship as literal text
+    // inside a binary's runtime identity and be discovered by a loader.
+    auto const misspelled =
+        dss::resolveArtifactIdentity("@rpath/${artifcatFileName}", "a.dylib");
+    ASSERT_FALSE(misspelled.has_value());
+    EXPECT_NE(misspelled.error().find("artifcatFileName"), std::string::npos)
+        << misspelled.error();
+
+    // An unterminated placeholder is the other half of the same rule.
+    auto const unterminated =
+        dss::resolveArtifactIdentity("@rpath/${artifactFileName", "a.dylib");
+    EXPECT_FALSE(unterminated.has_value());
+
+    // CONTROL, in the same arm so "everything is refused" cannot pass for the
+    // property: a LITERAL identity carries no placeholder and resolves to
+    // ITSELF, with or without an artifact name — which is also why a dylib that
+    // genuinely wants a fixed identity (ld64's own `-install_name`) still can.
+    auto const literal =
+        dss::resolveArtifactIdentity("@rpath/libfixed.dylib", "");
+    ASSERT_TRUE(literal.has_value());
+    EXPECT_EQ(*literal, "@rpath/libfixed.dylib");
+
+    // ...and the document LOADER refuses the mis-spelling at its SOURCE, so a
+    // mis-spelled placeholder can never reach a walker at all.
+    auto const rejected = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"typo-dylib","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "dylib", "flags": 0 },
+      "image": { "pageZeroSize": 0, "segmentPageSize": 4096,
+                 "installName": "@rpath/${artifcatFileName}",
+                 "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_FALSE(rejected.has_value())
+        << "a document naming an unknown placeholder loaded cleanly";
+    EXPECT_EQ(countAtPath(rejected, "/image/installName"), 1u)
+        << rejectSummary(rejected);
+
+    // CONTROL, byte-identical but for the spelling: it LOADS. Without it,
+    // "the document was rejected" is equally consistent with "this fixture is
+    // rejected for some unrelated reason".
+    auto const accepted = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"typo-dylib","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "dylib", "flags": 0 },
+      "image": { "pageZeroSize": 0, "segmentPageSize": 4096,
+                 "installName": "@rpath/${artifactFileName}",
+                 "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })");
+    EXPECT_TRUE(accepted.has_value()) << rejectSummary(accepted);
+}
+
+// ★★★ THE NEAR-MISS TABLE — every spelling an author might reach for, PINNED
+// IN BOTH DIRECTIONS, because the first cut of this vocabulary closed only over
+// the two-character `${` and SIX other spellings shipped silently.
+//
+// ✔MEASURED end to end through `dsscp.exe` with a copied `DSS_CONFIG_ROOT`
+// whose arm64 darwin dylib document carried each spelling in turn (cycle P62,
+// lane `mo` remediation, after an independent review found four of the six):
+//
+//   @rpath/$(artifactFileName)   → rc 0, LC_ID_DYLIB '@rpath/$(artifactFileName)'
+//   @rpath/$artifactFileName     → rc 0, LC_ID_DYLIB '@rpath/$artifactFileName'
+//   @rpath/$ {artifactFileName}  → rc 0, LC_ID_DYLIB '@rpath/$ {artifactFileName}'
+//   @rpath/$${artifactFileName}  → rc 0, LC_ID_DYLIB '@rpath/$probe.dylib'
+//   @rpath/a$b.dylib             → rc 0, LC_ID_DYLIB '@rpath/a$b.dylib'
+//   @rpath/${artifactFileName}$  → rc 0, LC_ID_DYLIB '@rpath/probe.dylib$'
+//   @rpath/{artifactFileName}    → rc 0, LC_ID_DYLIB '@rpath/{artifactFileName}'
+//
+// `$(NAME)` is Make's and the shell's spelling and `$NAME` is sh's — the two
+// likeliest wrong guesses — and each one gave EVERY artifact of that format ONE
+// literal identity: precisely the collapse
+// D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT exists to
+// end, reachable by a plausible typo, with rc 0 and zero diagnostics.
+//
+// ⚠ AND THE PROSE CLAIMED OTHERWISE. The header's "★ THE PLACEHOLDER IS A
+// CLOSED VOCABULARY, AND AN UNKNOWN ONE IS A REFUSAL" and this row's own
+// trigger cell were both TRUE for one typo class and FALSE for these. A comment
+// stating a guarantee the code does not provide is an unfiled defect.
+//
+// ⇒ The rule is now: every `$` must open a well-formed `${key}` from the closed
+//   set, AND a key name must not appear outside a placeholder. The ACCEPT rows
+//   below are what makes this a table rather than a blanket refusal — without
+//   them "everything is rejected" would pass.
+TEST(MachoDylibInstallName, EveryNearMissSpellingOfThePlaceholderIsRefused) {
+    struct Row {
+        std::string_view declared;
+        // nullopt = must be REFUSED; a value = must resolve to exactly this.
+        std::optional<std::string_view> resolved;
+        std::string_view why;
+    };
+    constexpr std::string_view kArtifact = "probe.dylib";
+    const Row rows[] = {
+        // ── ACCEPT. The vocabulary still works, and a literal is still legal.
+        {"@rpath/${artifactFileName}", "@rpath/probe.dylib",
+         "the declared spelling, which both shipped documents use"},
+        {"@rpath/${artifactFileName}.${artifactFileName}",
+         "@rpath/probe.dylib.probe.dylib",
+         "two placeholders in one identity — the scan is a loop, not a "
+         "single-shot replace"},
+        {"@rpath/libfixed.dylib", "@rpath/libfixed.dylib",
+         "a literal identity is an explicit, config-visible choice "
+         "(ld64's -install_name), not a code fallback"},
+        {"", "", "an empty declaration resolves to itself; the REQUIRED check "
+                 "belongs to validate(), not to the resolver"},
+        // ── REFUSE, `${...}`-shaped: the class the first cut already caught.
+        {"@rpath/${artifcatFileName}", std::nullopt, "a typo INSIDE the braces"},
+        {"@rpath/${artifactFileName", std::nullopt, "unterminated"},
+        {"@rpath/${}", std::nullopt, "empty key"},
+        {"@rpath/${ artifactFileName }", std::nullopt, "padded key"},
+        {"@rpath/${${artifactFileName}}", std::nullopt, "nested"},
+        // ── REFUSE, OTHER DIALECTS. The six that used to ship.
+        {"@rpath/$(artifactFileName)", std::nullopt,
+         "Make's and the shell's spelling — the likeliest wrong guess"},
+        {"@rpath/$artifactFileName", std::nullopt, "sh's spelling"},
+        {"@rpath/$ {artifactFileName}", std::nullopt, "a space after the sigil"},
+        {"@rpath/$${artifactFileName}", std::nullopt,
+         "the shell's ESCAPE guess; it used to resolve to '@rpath/$probe.dylib'"},
+        {"@rpath/a$b.dylib", std::nullopt, "a stray sigil in the middle"},
+        {"@rpath/${artifactFileName}$", std::nullopt,
+         "a stray sigil AFTER a good placeholder — the half-right case"},
+        {"@rpath/{artifactFileName}", std::nullopt,
+         "the key with NO sigil at all: the sigil scan has nothing to see, so "
+         "the key-outside-a-placeholder rule is what catches it"},
+    };
+    for (auto const& row : rows) {
+        SCOPED_TRACE(std::string{row.declared} + "  — " + std::string{row.why});
+        auto const got = dss::resolveArtifactIdentity(row.declared, kArtifact);
+        if (row.resolved.has_value()) {
+            ASSERT_TRUE(got.has_value())
+                << "a legal identity was refused: " << got.error();
+            EXPECT_EQ(*got, *row.resolved);
+        } else {
+            ASSERT_FALSE(got.has_value())
+                << "SHIPPED as the artifact's literal runtime identity: '"
+                << *got << "'";
+            // The refusal must be about THIS key, not a generic parse moan —
+            // a message that does not name the subject cannot be acted on.
+            EXPECT_NE(got.error().find(row.declared), std::string::npos)
+                << "the refusal does not quote the declared identity: "
+                << got.error();
+        }
+    }
+}
+
+// The same table, one level up: a DOCUMENT carrying a near-miss must fail at
+// LOAD. Without this the rule would hold in a helper nobody is obliged to call,
+// and the sigil check lives in the schema tier precisely so every format key
+// that ever adopts the vocabulary inherits it rather than re-implementing it.
+TEST(MachoDylibInstallName, ANearMissSpellingIsRefusedAtDocumentLoad) {
+    auto docWith = [](std::string_view installName) {
+        return std::string{R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"nearmiss-dylib","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "dylib", "flags": 0 },
+      "image": { "pageZeroSize": 0, "segmentPageSize": 4096,
+                 "installName": ")"} + std::string{installName} + R"(",
+                 "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })";
+    };
+    constexpr std::string_view kNearMisses[] = {
+        "@rpath/$(artifactFileName)",
+        "@rpath/$artifactFileName",
+        "@rpath/{artifactFileName}",
+        "@rpath/${artifactFileName}$",
+    };
+    for (auto const& spelling : kNearMisses) {
+        SCOPED_TRACE(std::string{spelling});
+        auto const rejected = ObjectFormatSchema::loadFromText(docWith(spelling));
+        ASSERT_FALSE(rejected.has_value())
+            << "the document loaded, so this spelling reaches a binary";
+        EXPECT_EQ(countAtPath(rejected, "/image/installName"), 1u)
+            << rejectSummary(rejected);
+    }
+    // CONTROL, same fixture, correct spelling: it LOADS. Without it, "rejected"
+    // is equally consistent with "this fixture is broken".
+    auto const accepted = ObjectFormatSchema::loadFromText(
+        docWith("@rpath/${artifactFileName}"));
+    EXPECT_TRUE(accepted.has_value()) << rejectSummary(accepted);
+}
+
+// ══ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING — the Mach-O realization ══
+//
+// A shared library's call to its OWN preemptible definition must be resolved by
+// the LOADER, not branched to the local body: dyld coalesces weak definitions
+// across images, so another image may win the name, and a library that took the
+// direct branch answers one identifier differently from every other image in
+// the process — silently. ✔MEASURED cycle P61 on Apple Silicon: a DSS-built
+// dylib returned rc 1 (its own body) where the ld64-built one from identical
+// source returned rc 2 (the consumer's).
+//
+// ★ THE ENCODING IS A SECOND STREAM, NOT A SPECIAL ORDINAL, and that had to be
+// measured rather than read off `<mach-o/loader.h>`. ✔MEASURED 2026-09-06 on
+// the operator's Apple Silicon host (macOS 25.6.0, Apple clang 21.0.0 /
+// ld-1267): built the modern way ld64 emits LC_DYLD_CHAINED_FIXUPS and
+// `dyld_info -fixups` prints `bind <weak-def-coalesce>/_w`; asked for the
+// legacy shape DSS's shipped dylib document actually emits
+// (`-Wl,-no_fixup_chains`) the SAME source gives `bind_size 0` and
+// `weak_bind_size 16`, whose whole content is the byte string this suite pins.
+// The weak stream carries NO dylib ordinal at all — which IS the coalescing
+// scope: dyld searches every loaded image instead of one named library.
+//
+// The CONTROLS from that same probe, all built by one clang from one shape: a
+// dylib's call to its own STRONG GLOBAL and to a `static` each stayed a DIRECT
+// `bl` with an empty weak stream. That is why the Mach-O preemptible set is
+// `["weak"]` and a strict subset of ELF's, and it is pinned as a declaration in
+// `link/test_preemptible_definition_declaration`.
+//
+// ⛔ NOT PINNED HERE, because no writer test can: the divergence itself needs a
+// RIVAL definition in a second image. That run was taken on real hardware — a
+// DSS-built dylib under an Apple-clang executable defining a rival weak body
+// returned rc 2, against the ld64-built control's rc 2 in the same session.
+//
+// ⚠⚠ AND THE RUN'S "RELEASE" ARM WAS VACUOUS, WHICH IS RECORDED RATHER THAN
+// QUIETLY DROPPED. It was first reported as "rc 2 in debug AND release". An
+// independent review MEASURED that the two files pushed to the Apple Silicon
+// host had the SAME md5: the witness source was so small that `--config=release`
+// transformed nothing, so one measurement was reported twice. The hardware run
+// therefore witnesses ONE configuration, not two.
+// ✔RE-MEASURED here on a subject with real optimizer work
+// (`examples/c/two_dynlibs_distinct_identity/dssalpha.c`, whose weak definition
+// runs a loop over an inlinable helper), arm64 darwin dylib through the same
+// `build/mo` binaries:
+//     debug   md5 3d98c766b00abd95f219c42ffa29f4b3
+//     release md5 dc3d0968ca775b409b136564e823404d   ← the bytes DO differ
+//     both: LC_ID_DYLIB '@rpath/dssalpha.dylib', weak stream (24 bytes)
+//           405f616c7068615f7765616b5f7061727400517100900000 — IDENTICAL,
+//           and `_alpha_answer`'s BL lands INSIDE __TEXT.__stubs in both.
+//     (debug carries a second, DIRECT BL to the `static` helper; release
+//      inlines it away — which is the proof the release arm did real work.)
+// ⇒ The ROUTING survives release; the RUN witness covers one configuration.
+//   Two claims, separately sourced, because one of them was not measured.
+
+namespace {
+
+// The exact bytes Apple's ld64 emits for one coalescing-scope reference to
+// `_w`, taken from the legacy-shape probe above and reproduced here as the
+// oracle. Read: SET_SYMBOL_TRAILING_FLAGS_IMM(0) "_w"\0 | SET_TYPE_IMM(POINTER)
+// | SET_SEGMENT_AND_OFFSET_ULEB(segment 1 == __DATA_CONST) + 0 | DO_BIND.
+constexpr std::uint8_t kLd64WeakBindEntryForW[] = {
+    0x40, 0x5F, 0x77, 0x00, 0x51, 0x71, 0x00, 0x90,
+};
+
+// The LC_DYLD_INFO_ONLY (off, size) pair for one of the five streams, by field
+// index: 0 rebase, 1 bind, 2 weak, 3 lazy, 4 export.
+[[nodiscard]] std::optional<std::pair<std::uint32_t, std::uint32_t>>
+dyldInfoStream(std::span<std::uint8_t const> bytes, unsigned field) {
+    constexpr std::uint32_t kLcDyldInfoOnly = 0x80000022u;
+    auto const at = dss::macho::test::findLoadCommand(bytes, kLcDyldInfoOnly);
+    if (!at.has_value()) return std::nullopt;
+    return std::pair{readU32LE(bytes, *at + 8 + field * 8),
+                     readU32LE(bytes, *at + 12 + field * 8)};
+}
+
+// A dylib module whose ONLY import is the coalescing-scope reference the engine
+// mints for a call to this artifact's own preemptible definition: an empty
+// `libraryPath` (there is no library to name — the winner may be any image) and
+// `isPreemptionReference` set. The definition itself is in the module, exported
+// WEAK, which is what makes the reference resolvable at all.
+[[nodiscard]] AssembledModule makeCoalescingScopeModule() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_w",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+    ExternImport ref{SymbolId{2}, "_w", ""};
+    ref.isPreemptionReference = true;
+    ref.binding = SymbolBinding::Weak;
+    mod.externImports.push_back(std::move(ref));
+    return mod;
+}
+
+// The CONTROL module: the same shape with an ORDINARY named-library import in
+// place of the coalescing-scope one. Everything else is identical, so a
+// difference between the two is attributable to the one field that differs.
+[[nodiscard]] AssembledModule makeNamedImportModule() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_w",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+    mod.externImports.push_back(
+        ExternImport{SymbolId{2}, "_w", "/usr/lib/libSystem.B.dylib"});
+    return mod;
+}
+
+} // namespace
+
+TEST(MachoCoalescingScopeReference, WeakBindStreamMatchesLd64ByteForByte) {
+    for (auto const& leg : kDylibLegs) {
+        SCOPED_TRACE(leg.label);
+        auto target = TargetSchema::loadShipped(leg.target);
+        auto fmt    = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(target.has_value());
+        ASSERT_TRUE(fmt.has_value());
+
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(
+            makeCoalescingScopeModule(), **target, **fmt, rep,
+            dss::ImageRequest{.artifactFileName = "libcoalesce.dylib"});
+        for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(rep.errorCount(), 0u);
+        ASSERT_FALSE(bytes.empty());
+
+        auto const weak = dyldInfoStream(bytes, 2);
+        ASSERT_TRUE(weak.has_value())
+            << "no LC_DYLD_INFO_ONLY — the legacy arm is the one this format "
+               "declares (no image.useChainedFixups)";
+        ASSERT_GE(weak->second, sizeof kLd64WeakBindEntryForW)
+            << "weak_bind_size " << weak->second << " is too small to hold one "
+               "entry: the coalescing-scope reference was not encoded, so the "
+               "call reaches this artifact's own body and disagrees with every "
+               "other image in the process";
+        ASSERT_LE(weak->first + weak->second, bytes.size());
+        for (std::size_t i = 0; i < sizeof kLd64WeakBindEntryForW; ++i) {
+            EXPECT_EQ(bytes[weak->first + i], kLd64WeakBindEntryForW[i])
+                << "weak-bind byte " << i << " differs from ld64's";
+        }
+        // Terminated, then padded — dyld reads the stream byte-by-byte.
+        EXPECT_EQ(bytes[weak->first + sizeof kLd64WeakBindEntryForW], 0u)
+            << "the stream must be terminated with BIND_OPCODE_DONE";
+
+        // ★ AND IT MUST NOT ALSO BE IN THE REGULAR BIND STREAM. A row in both
+        // would name a dylib ordinal for a reference that has no library —
+        // `dylibOrdinal` misses an empty path and returns 0, which is
+        // BIND_SPECIAL_DYLIB_SELF, i.e. "bind to this image's own definition":
+        // the defect, re-encoded, and invisible to a test that only asked
+        // whether the weak stream was non-empty.
+        auto const bind = dyldInfoStream(bytes, 1);
+        ASSERT_TRUE(bind.has_value());
+        bool namedInRegularStream = false;
+        for (std::uint32_t i = 0; i + 2 < bind->second; ++i) {
+            if (bytes[bind->first + i] == 0x40u
+                && bytes[bind->first + i + 1] == '_'
+                && bytes[bind->first + i + 2] == 'w') {
+                namedInRegularStream = true;
+            }
+        }
+        EXPECT_FALSE(namedInRegularStream)
+            << "'_w' appears in the ORDINARY bind stream too, where dyld would "
+               "resolve it against a named dylib ordinal";
+
+        // The header must advertise the contract, or dyld runs no coalescing
+        // pass for this image at all (MH_WEAK_DEFINES | MH_BINDS_TO_WEAK).
+        EXPECT_EQ(readU32LE(bytes, 24) & 0x00018000u, 0x00018000u)
+            << "flags 0x" << std::hex << readU32LE(bytes, 24);
+    }
+}
+
+TEST(MachoCoalescingScopeReference, AnOrdinaryNamedImportLeavesTheWeakStreamEmpty) {
+    // THE CONTROL. Without it, "the weak stream held our entry" is equally
+    // consistent with "this walker puts every import in the weak stream" — and
+    // an image that weak-bound its libc imports would be resolved from the
+    // coalescing scope instead of from libSystem.
+    for (auto const& leg : kDylibLegs) {
+        SCOPED_TRACE(leg.label);
+        auto target = TargetSchema::loadShipped(leg.target);
+        auto fmt    = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(target.has_value());
+        ASSERT_TRUE(fmt.has_value());
+
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(
+            makeNamedImportModule(), **target, **fmt, rep,
+            dss::ImageRequest{.artifactFileName = "libnamed.dylib"});
+        for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(rep.errorCount(), 0u);
+
+        auto const weak = dyldInfoStream(bytes, 2);
+        ASSERT_TRUE(weak.has_value());
+        EXPECT_EQ(weak->second, 0u)
+            << "an ordinary named-library import reached the weak-bind stream";
+        EXPECT_EQ(weak->first, 0u)
+            << "an empty stream must report offset 0, as ld64's does";
+
+        // ...and it IS in the regular stream, so the control is not passing by
+        // emitting nothing at all.
+        auto const bind = dyldInfoStream(bytes, 1);
+        ASSERT_TRUE(bind.has_value());
+        EXPECT_GT(bind->second, 0u)
+            << "the named import vanished from BOTH streams";
+    }
+}
+
+// ══ THE CHAINED-FIXUPS RAIL — the second spelling, previously UNWITNESSED ════
+//
+// ⚠⚠ WHY THIS BLOCK EXISTS, stated plainly because it is the finding that
+// bought it. The coalescing-scope encoding ships on TWO rails: the legacy
+// LC_DYLD_INFO_ONLY weak-bind stream (pinned above, byte-identical to ld64's)
+// and LC_DYLD_CHAINED_FIXUPS, where the same meaning is the SPECIAL ORDINAL
+// BIND_SPECIAL_DYLIB_WEAK_LOOKUP (-3) that `dyld_info -fixups` renders
+// `<weak-def-coalesce>`. An independent review of this lane MEASURED that the
+// chained arm was code only: no shipped document sets `image.useChainedFixups`
+// (it defaults false), no test combined it with a preemption reference, and the
+// red-on-disable script mutated the legacy arm alone — so **changing the -3 to
+// any other value, or deleting the chained branch outright, would have stayed
+// green**. Shipping an unexercised arm of a fix is shipping an unmeasured
+// claim.
+//
+// ⓘ NOT reachable from a shipped configuration today, and pinned anyway: an
+// author writing their own darwin dylib document with `useChainedFixups: true`
+// reaches it, and this substrate's whole premise is that a `.format.json` IS
+// the compiler's behaviour.
+
+namespace {
+
+// A darwin DYLIB document on the chained rail. Deliberately the shipped dylib
+// shape plus `image.useChainedFixups` and the `weakDefinition` dialect every
+// shipped Mach-O image document declares — without the dialect block the export
+// gate refuses first and these cells would be probing that refusal instead of
+// the import row (the "fixture that answers an adjacent question" shape).
+[[nodiscard]] std::string chainedDylibJson() {
+    return R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "apple_arm64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "weakDefinition": { "dialect": "symbol-flag" },
+      "externCallDispatch": "direct-plt",
+      "preemptibleDefinitionBindings": ["weak"],
+      "format": {"name":"chained-coalesce-dylib","kind":"macho"},
+      "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "dylib", "flags": 1048709 },
+      "image": { "useChainedFixups": true, "segmentPageSize": 16384,
+                 "installName": "@rpath/${artifactFileName}",
+                 "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":16384}]
+    })";
+}
+
+// The packed DYLD_CHAINED_IMPORT rows of an emitted image, in payload order.
+// Format 1 is flat: bits [0..7] lib_ordinal (SIGNED 8-bit), bit [8] weak_import,
+// bits [9..31] name_offset.
+[[nodiscard]] std::vector<std::int8_t>
+chainedImportOrdinals(std::vector<std::uint8_t> const& bytes) {
+    std::vector<std::int8_t> out;
+    auto const lc =
+        dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups);
+    if (!lc.has_value()) return out;
+    std::uint32_t const dataOff = readU32LE(bytes, *lc + 8);
+    std::uint32_t const importsOff = readU32LE(bytes, dataOff + 8);
+    std::uint32_t const importsCount = readU32LE(bytes, dataOff + 16);
+    for (std::uint32_t i = 0; i < importsCount; ++i) {
+        std::uint32_t const packed =
+            readU32LE(bytes, dataOff + importsOff + i * 4u);
+        out.push_back(static_cast<std::int8_t>(packed & 0xFFu));
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(MachoCoalescingScopeReference,
+     ChainedFixupsEncodeTheSpecialCoalesceOrdinal) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(chainedDylibJson());
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+
+    DiagnosticReporter rep;
+    auto const bytes = dss::macho::encode(
+        makeCoalescingScopeModule(), **target, **fmt, rep,
+        dss::ImageRequest{.artifactFileName = "libchained.dylib"});
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    // The rail itself, asserted before what rides on it: a chained image has
+    // NO LC_DYLD_INFO_ONLY, so reading a weak stream here would read nothing.
+    EXPECT_TRUE(
+        dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups)
+            .has_value())
+        << "the document asked for the chained rail and did not get it";
+    EXPECT_FALSE(dss::macho::test::findLoadCommand(bytes, kLcDyldInfoOnly)
+                     .has_value());
+
+    auto const ordinals = chainedImportOrdinals(bytes);
+    ASSERT_EQ(ordinals.size(), 1u) << "one import, one row";
+    // -3 == BIND_SPECIAL_DYLIB_WEAK_LOOKUP. ⚠ 0 is BIND_SPECIAL_DYLIB_SELF,
+    // which is what `dylibOrdinal("")` returns when the branch is removed —
+    // the defect, re-encoded — so the assertion names the wrong value it is
+    // guarding against rather than only the right one.
+    EXPECT_EQ(ordinals[0], -3)
+        << "expected BIND_SPECIAL_DYLIB_WEAK_LOOKUP (-3); got "
+        << static_cast<int>(ordinals[0])
+        << (ordinals[0] == 0
+                ? " == BIND_SPECIAL_DYLIB_SELF, i.e. bound to this image's own "
+                  "definition — the defect this anchor closed"
+                : "");
+
+    EXPECT_EQ(readU32LE(bytes, 24) & 0x00018000u, 0x00018000u)
+        << "MH_WEAK_DEFINES | MH_BINDS_TO_WEAK must be set on the chained rail "
+           "too, or dyld runs no coalescing pass and the -3 is inert";
+}
+
+TEST(MachoCoalescingScopeReference,
+     ChainedFixupsGiveAnOrdinaryImportItsNamedLibraryOrdinal) {
+    // THE CONTROL for the cell above, and it is not decorative: without it
+    // "the import row said -3" is equally consistent with "this walker writes
+    // -3 into every chained import", which would send an image's libc calls
+    // through the coalescing scope instead of libSystem.
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(chainedDylibJson());
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+
+    DiagnosticReporter rep;
+    auto const bytes = dss::macho::encode(
+        makeNamedImportModule(), **target, **fmt, rep,
+        dss::ImageRequest{.artifactFileName = "libchainednamed.dylib"});
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    auto const ordinals = chainedImportOrdinals(bytes);
+    ASSERT_EQ(ordinals.size(), 1u);
+    EXPECT_EQ(ordinals[0], 1)
+        << "an ordinary import must name its LC_LOAD_DYLIB index (1-based), "
+           "not the coalescing scope";
+}
+
+// The inert-stream guard, on the rail that did not have one. The legacy arm
+// refuses a coalescing-scope reference in an image publishing no weak
+// definition, because the header bits are derived from the export trie and an
+// unadvertised stream is silently ignored by dyld. That guard used to ask
+// `!dyldWeakBindBlob.empty()` — a property of the LEGACY BUFFER, so the chained
+// rail, whose header bits come from the very same count, inherited nothing.
+TEST(MachoCoalescingScopeReference, AnInertCoalescingReferenceIsRefusedOnBothRails) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+
+    // The module: a coalescing-scope reference whose definition is exported
+    // GLOBAL, so `numWeakExports` is zero and MH_WEAK_DEFINES would be unset.
+    auto inertModule = [] {
+        AssembledModule mod = makeCoalescingScopeModule();
+        mod.symbols.clear();
+        mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_w",
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+        return mod;
+    };
+
+    struct Rail {
+        char const* label;
+        bool        chained;
+    };
+    const Rail rails[] = {{"legacy LC_DYLD_INFO_ONLY", false},
+                          {"LC_DYLD_CHAINED_FIXUPS", true}};
+    for (auto const& rail : rails) {
+        SCOPED_TRACE(rail.label);
+        auto fmt = rail.chained
+                       ? ObjectFormatSchema::loadFromText(chainedDylibJson())
+                       : ObjectFormatSchema::loadShipped(
+                             "macho64-arm64-darwin-dylib");
+        ASSERT_TRUE(fmt.has_value());
+
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(
+            inertModule(), **target, **fmt, rep,
+            dss::ImageRequest{.artifactFileName = "libinert.dylib"});
+        EXPECT_TRUE(bytes.empty())
+            << "an image shipped whose coalescing reference dyld would ignore";
+        ASSERT_GT(rep.errorCount(), 0u);
+        bool named = false;
+        for (auto const& d : rep.all()) {
+            if (d.actual.find("MH_WEAK_DEFINES") != std::string::npos
+                && d.actual.find("D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING")
+                       != std::string::npos) {
+                named = true;
+            }
+        }
+        EXPECT_TRUE(named)
+            << "the refusal must name the header bits and its anchor; got: "
+            << diagSummary(rep);
+    }
+
+    // CONTROL: the SAME module with the definition exported WEAK encodes fine
+    // on both rails. Without it, "both rails refused" is equally consistent
+    // with "this fixture cannot be encoded at all".
+    for (auto const& rail : rails) {
+        SCOPED_TRACE(std::string{rail.label} + " CONTROL");
+        auto fmt = rail.chained
+                       ? ObjectFormatSchema::loadFromText(chainedDylibJson())
+                       : ObjectFormatSchema::loadShipped(
+                             "macho64-arm64-darwin-dylib");
+        ASSERT_TRUE(fmt.has_value());
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(
+            makeCoalescingScopeModule(), **target, **fmt, rep,
+            dss::ImageRequest{.artifactFileName = "libweak.dylib"});
+        EXPECT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+        EXPECT_FALSE(bytes.empty());
+    }
+}
+
+// ── THE ADDRESS HALF IS REFUSED, NOT MIS-ENCODED ────────────────────────────
+//
+// Taking the ADDRESS of a preemptible definition inside the same image routes
+// through the __DATA extern-address bind path, which resolves a row's dylib
+// ordinal from its `libraryPath`. A coalescing-scope reference has none, and
+// `dylibOrdinal("")` misses and returns 0 == BIND_SPECIAL_DYLIB_SELF — "bind to
+// this image's own definition", the defect re-encoded on the data side.
+//
+// ⓘ UNREACHABLE from the current pipeline (MIR→LIR's `lowerCall` is the only
+// minter of preemption references, and none of them reaches a data relocation),
+// and pinned anyway: this anchor's own closing work names the address-taken
+// case as the next half, so the site is naked for the work that arrives next.
+// The walker REFUSES rather than guessing an encoding — the call-site stream
+// was pinned byte-for-byte against ld64 before it shipped, and the data-side
+// one owes the same probe first.
+TEST(MachoCoalescingScopeReference, TakingTheAddressOfAPreemptibleDefinitionIsRefused) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-dylib");
+    ASSERT_TRUE(target.has_value());
+    ASSERT_TRUE(fmt.has_value());
+
+    // One weak definition, one coalescing-scope reference to it, and a __DATA
+    // slot whose abs64 relocation TARGETS that reference.
+    auto addressTakingModule = [](bool viaPreemptionReference) {
+        AssembledModule mod;
+        mod.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};
+        mod.functions.push_back(std::move(fn));
+        mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_w",
+                                           SymbolBinding::Weak,
+                                           SymbolVisibility::Default});
+        ExternImport ref{SymbolId{2}, "_w", ""};
+        if (viaPreemptionReference) {
+            ref.isPreemptionReference = true;
+            ref.binding = SymbolBinding::Weak;
+        } else {
+            // The CONTROL's import is an ORDINARY named one, which is the only
+            // field that differs between the two arms.
+            ref.mangledName = "_puts";
+            ref.libraryPath = "/usr/lib/libSystem.B.dylib";
+        }
+        mod.externImports.push_back(std::move(ref));
+        AssembledData slot;
+        slot.symbol    = SymbolId{5};
+        slot.section   = DataSectionKind::Data;
+        slot.bytes     = std::vector<std::uint8_t>(8, 0);
+        slot.alignment = Alignment::of<8>();
+        Relocation rel;
+        rel.offset = 0;
+        rel.target = SymbolId{2};
+        rel.kind   = RelocationKind{4};   // abs64
+        rel.addend = 0;
+        slot.relocations.push_back(rel);
+        mod.dataItems.push_back(std::move(slot));
+        mod.symbols.push_back(ModuleSymbol{SymbolId{5}, "_slot",
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+        return mod;
+    };
+
+    DiagnosticReporter rep;
+    auto const bytes = dss::macho::encode(
+        addressTakingModule(true), **target, **fmt, rep,
+        dss::ImageRequest{.artifactFileName = "libaddr.dylib"});
+    EXPECT_TRUE(bytes.empty())
+        << "an image shipped whose data slot binds a coalescing-scope "
+           "reference through the ordinary stream";
+    ASSERT_GT(rep.errorCount(), 0u)
+        << "silently emitting BIND_SPECIAL_DYLIB_SELF is the defect, not the "
+           "fix";
+    bool named = false;
+    for (auto const& d : rep.all()) {
+        if (d.actual.find("coalescing-scope") != std::string::npos
+            && d.actual.find("D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING")
+                   != std::string::npos) {
+            named = true;
+        }
+    }
+    EXPECT_TRUE(named)
+        << "the refusal must name what it refused and its anchor; got: "
+        << diagSummary(rep);
+
+    // CONTROL: the same shape with an ORDINARY named import in the slot
+    // encodes cleanly. Without it, "the emission was refused" is equally
+    // consistent with "this walker cannot bind a data slot at all" — which is
+    // the very capability D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR shipped.
+    DiagnosticReporter ctlRep;
+    auto const ctlBytes = dss::macho::encode(
+        addressTakingModule(false), **target, **fmt, ctlRep,
+        dss::ImageRequest{.artifactFileName = "libaddrctl.dylib"});
+    EXPECT_EQ(ctlRep.errorCount(), 0u) << diagSummary(ctlRep);
+    EXPECT_FALSE(ctlBytes.empty());
+}
+
+// ══ D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ══════
+//
+// `image.codeSignature.identifier` is the CodeDirectory's `identOffset`
+// payload — the artifact's CODE IDENTITY. Every shipped darwin document
+// declared a CONSTANT (`com.dss.dylib` on both dylib documents; a name taken
+// from ONE example on each exec document), so every artifact a format ever
+// produced answered to one identity.
+//
+// ★★ THE MEASUREMENT, because this row is NOT the install-name row wearing a
+// different key and the difference is the whole point. ✔MEASURED on Apple
+// Silicon (macOS 26.6.2, ld-1267), FOUR arms driven by one instrument: two DSS
+// dylibs sharing `com.dss.dylib`; the SAME two DSS dylibs with distinct
+// identifiers and nothing else changed; an ld64 + `codesign -s -` pair with its
+// default identifiers; and — the decisive control — an ld64+codesign pair
+// FORCED to the shared identifier.
+//   * NOTHING about loading is affected. Both `dlopen` (distinct handles,
+//     distinct `dladdr` files), both link into one executable and answer
+//     correctly, `codesign --verify` returns 0 on each, and the same bytes at
+//     two paths yield two images. The MECHANISM is that an ad-hoc DESIGNATED
+//     REQUIREMENT is CDHASH-keyed — `codesign -d -r-` prints
+//     `designated => cdhash H"..."` on DSS and ld64 artifacts alike — so the
+//     identifier never reaches dyld's load path.
+//   * WHAT IS AFFECTED is identity-based requirement matching. A requirement
+//     `identifier "com.dss.dylib"` written for the FIRST library ACCEPTS the
+//     SECOND (rc 0 both), where the same requirement over DISTINCT identifiers
+//     REFUSES (rc 3) and a cdhash requirement over those SAME two files
+//     REFUSES. The forced-shared ld64 arm behaves identically to the DSS one,
+//     which is what says the EMITTER is right and the DECLARATION was wrong.
+//   * Apple's own `codesign -s -` derives the identifier per artifact, from the
+//     output's leaf name plus its `LC_UUID` (`alpha-55554944<uuid>`), so the
+//     reference never produces one identity for two artifacts by itself.
+// ⇒ Not a load failure, and not harmless: two artifacts answering to one code
+// identity, which is the only thing a constant in shared config can produce.
+//
+// ★ THESE ARMS ARE THE WRITER TIER. All FOUR shipped darwin documents are
+// checked for the DECLARATION, because a key fixed on one port and forgotten on
+// another is the asymmetry this suite exists to notice; the EMISSION arms drive
+// the two dylib documents, whose module fixture this file already owns.
+
+namespace {
+
+struct CodeSignatureLeg {
+    char const* label;
+    char const* target;
+    char const* format;
+    char const* replacedConstant;   // must NOT survive in the declaration
+    bool        emissionArm;        // this file owns a module the doc accepts
+};
+
+// ⚠ ONE PHYSICAL LINE — a wrapped anchor id compiles, matches at run time, and
+// makes every grep (this project's registry guard included) see the first
+// fragment as a whole id, MINTING one that does not exist.
+constexpr char const* kCodeSignatureIdentityAnchorId = "D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT";
+
+constexpr CodeSignatureLeg kCodeSignatureLegs[] = {
+    {"arm64 dylib",  "arm64",  "macho64-arm64-darwin-dylib",  "com.dss.dylib", true},
+    {"x86_64 dylib", "x86_64", "macho64-x86_64-darwin-dylib", "com.dss.dylib", true},
+    {"arm64 exec",   "arm64",  "macho64-arm64-darwin-exec",   "com.dss.macho_arm64_exit", false},
+    {"x86_64 exec",  "x86_64", "macho64-x86_64-darwin-exec",  "com.dss.macho_x86_64_darwin_exec", false},
+};
+
+// The SuperBlob / CodeDirectory headers are BIG-endian; the Mach-O around them
+// is little-endian. Spelled here rather than reused from a sibling TU because
+// these arms must not depend on another test binary's fixtures.
+[[nodiscard]] std::uint32_t readCsU32BE(std::span<std::uint8_t const> b,
+                                        std::size_t off) {
+    return (static_cast<std::uint32_t>(b[off]) << 24)
+         | (static_cast<std::uint32_t>(b[off + 1]) << 16)
+         | (static_cast<std::uint32_t>(b[off + 2]) << 8)
+         | static_cast<std::uint32_t>(b[off + 3]);
+}
+
+struct EmittedSignature {
+    std::string   identifier;    // the CodeDirectory ident C-string
+    std::uint32_t dataOff{};     // LC_CODE_SIGNATURE.dataoff
+    std::uint32_t dataSize{};    // LC_CODE_SIGNATURE.datasize
+    std::uint32_t superBlobLen{};
+};
+
+// Read the identity DSS actually EMITTED, by walking the emitted bytes:
+// LC_CODE_SIGNATURE -> SuperBlob -> BlobIndex[0] -> CodeDirectory.identOffset.
+// Every offset is PARSED, never assumed, so a wire-shape change fails as a
+// missing signature rather than as a plausible wrong string.
+[[nodiscard]] std::optional<EmittedSignature>
+readEmittedSignature(std::span<std::uint8_t const> bytes) {
+    constexpr std::uint32_t kLcCodeSignatureCmd = 0x1Du;
+    auto const at = dss::macho::test::findLoadCommand(bytes, kLcCodeSignatureCmd);
+    if (!at.has_value()) return std::nullopt;
+    EmittedSignature out;
+    out.dataOff  = readU32LE(bytes, *at + 8);
+    out.dataSize = readU32LE(bytes, *at + 12);
+    if (static_cast<std::size_t>(out.dataOff) + 20u > bytes.size())
+        return std::nullopt;
+    if (readCsU32BE(bytes, out.dataOff) != 0xFADE0CC0u) return std::nullopt;
+    out.superBlobLen = readCsU32BE(bytes, out.dataOff + 4);
+    std::size_t const cd = out.dataOff + readCsU32BE(bytes, out.dataOff + 16);
+    if (cd + 24u > bytes.size()) return std::nullopt;
+    if (readCsU32BE(bytes, cd) != 0xFADE0C02u) return std::nullopt;
+    std::size_t const identAt = cd + readCsU32BE(bytes, cd + 20);
+    if (identAt >= bytes.size()) return std::nullopt;
+    out.identifier = std::string(
+        reinterpret_cast<char const*>(bytes.data() + identAt));
+    return out;
+}
+
+} // namespace
+
+TEST(MachoCodeSignatureIdentity, ShippedDocumentsDeclareTheArtifactNotAConstant) {
+    for (auto const& leg : kCodeSignatureLegs) {
+        SCOPED_TRACE(leg.label);
+        auto fmt = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(fmt.has_value());
+        auto const& cs = (*fmt)->machoImage().codeSignature;
+        ASSERT_TRUE(cs.has_value())
+            << "this document stopped requesting an ad-hoc signature, which "
+               "would make every arm below vacuously green";
+        EXPECT_TRUE(dss::declaresArtifactIdentityPlaceholder(cs->identifier))
+            << "the shipped '" << leg.format << "' document declares '"
+            << cs->identifier << "', which is a CONSTANT: every artifact this "
+               "format produces would carry that one code identity, and a code "
+               "requirement naming it could not tell two of them apart";
+        EXPECT_NE(cs->identifier.find(dss::kArtifactFileNamePlaceholder),
+                  std::string::npos)
+            << "declared '" << cs->identifier << "'";
+        EXPECT_EQ(cs->identifier.find(leg.replacedConstant), std::string::npos)
+            << "the replaced constant '" << leg.replacedConstant
+            << "' is still present in '" << cs->identifier << "'";
+    }
+}
+
+TEST(MachoCodeSignatureIdentity, TwoArtifactsOfOneFormatGetDifferentIdentifiers) {
+    // The SUBJECT. Two emissions of the SAME module through the SAME format
+    // differing ONLY in the artifact being produced. Anything shared between
+    // them — a constant in the document, a value cached on the memoized schema
+    // — collapses them, which is exactly what shipped before.
+    for (auto const& leg : kCodeSignatureLegs) {
+        if (!leg.emissionArm) continue;
+        SCOPED_TRACE(leg.label);
+        auto target = TargetSchema::loadShipped(leg.target);
+        auto fmt    = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(target.has_value());
+        ASSERT_TRUE(fmt.has_value());
+
+        DiagnosticReporter repA;
+        auto const bytesA = dss::macho::encode(
+            makeInstallNameDylibModule(), **target, **fmt, repA,
+            dss::ImageRequest{.artifactFileName = "alpha.dylib"});
+        for (auto const& d : repA.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(repA.errorCount(), 0u);
+
+        DiagnosticReporter repB;
+        auto const bytesB = dss::macho::encode(
+            makeInstallNameDylibModule(), **target, **fmt, repB,
+            dss::ImageRequest{.artifactFileName = "beta_much_longer.dylib"});
+        for (auto const& d : repB.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(repB.errorCount(), 0u);
+
+        auto const sigA = readEmittedSignature(bytesA);
+        auto const sigB = readEmittedSignature(bytesB);
+        ASSERT_TRUE(sigA.has_value()) << "no parsable ad-hoc signature emitted";
+        ASSERT_TRUE(sigB.has_value()) << "no parsable ad-hoc signature emitted";
+
+        // The identity in the EMITTED BYTES, not the declaration.
+        EXPECT_EQ(sigA->identifier, "com.dss.alpha.dylib");
+        EXPECT_EQ(sigB->identifier, "com.dss.beta_much_longer.dylib");
+        EXPECT_NE(sigA->identifier, sigB->identifier)
+            << "two artifacts of one format embedded the SAME CodeDirectory "
+               "identifier — a code requirement naming it accepts both, which "
+               "is the defect this row closed";
+
+        // ★ THE RESERVATION FOLLOWS THE RESOLVED NAME, NOT THE DECLARATION.
+        // The identifier is read TWICE by the walker — once to SIZE the
+        // reservation (`adHocCodeSignatureSize`) and once to BUILD the blob —
+        // so a size taken from the unresolved template, or a second
+        // independent resolution, desyncs the two. The two names differ in
+        // length, so the two signatures must differ in length too.
+        EXPECT_NE(sigA->dataSize, sigB->dataSize)
+            << "one reservation size served two identifiers of different "
+               "lengths — the size did not follow the RESOLVED identity";
+        // ...and each SuperBlob must fill its own reservation exactly. The
+        // walker's own invariant says so; this asserts it from the bytes.
+        EXPECT_EQ(sigA->superBlobLen, sigA->dataSize);
+        EXPECT_EQ(sigB->superBlobLen, sigB->dataSize);
+        EXPECT_EQ(sigA->dataOff + sigA->dataSize, bytesA.size());
+        EXPECT_EQ(sigB->dataOff + sigB->dataSize, bytesB.size());
+    }
+}
+
+TEST(MachoCodeSignatureIdentity, AnEmissionThatCannotNameItsArtifactIsRefused) {
+    // ⚠ THIS ARM DOES NOT USE A SHIPPED DOCUMENT, AND THE REASON IS A DEFECT
+    // IT FOUND IN ITS OWN FIRST DRAFT. Every shipped dylib document declares
+    // BOTH `installName` and `codeSignature.identifier` through the
+    // placeholder, and the walker resolves the install name FIRST and returns
+    // on failure — so a nameless emission against a shipped document refuses
+    // citing the INSTALL NAME and never reaches this key at all. ✔MEASURED:
+    // the first draft asserted this key's diagnostic against the shipped
+    // arm64/x86_64 dylib documents and read back the install-name refusal, on
+    // both legs. An arm that can only ever see its sibling's diagnostic is not
+    // a pin on this one; it would have gone green the day the ORDER changed.
+    // So the fixture declares a LITERAL install name and leaves only the
+    // code-signature identity unresolvable, which isolates the key under test.
+    auto const fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"csid-refusal-dylib","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "dylib", "flags": 0 },
+      "image": { "pageZeroSize": 0, "segmentPageSize": 4096,
+                 "installName": "@rpath/libliteral.dylib",
+                 "codeSignature": {"kind":"adhoc","hashAlgorithm":"sha256","pageSize":4096,"identifier":"com.dss.${artifactFileName}"},
+                 "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+
+    // No artifact name on the request. There is deliberately no fallback:
+    // substituting anything fixed rebuilds the shared identity.
+    DiagnosticReporter rep;
+    auto const bytes =
+        dss::macho::encode(makeInstallNameDylibModule(), **target,
+                           **fmt, rep, dss::ImageRequest{});
+    EXPECT_TRUE(bytes.empty())
+        << "an image was emitted despite an unresolvable code identity";
+    ASSERT_GT(rep.errorCount(), 0u)
+        << "silently signing under SOME identity is the defect, not the fix";
+    bool named = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_WalkerInputContractViolation
+            && d.actual.find("image.codeSignature.identifier")
+                   != std::string::npos
+            && d.actual.find(kCodeSignatureIdentityAnchorId)
+                   != std::string::npos) {
+            named = true;
+        }
+    }
+    EXPECT_TRUE(named)
+        << "the refusal must name its key AND its anchor; got: "
+        << diagSummary(rep);
+
+    // CONTROL, the same document with the artifact NAMED: it encodes cleanly.
+    // Without it, "the emission was refused" is equally consistent with "this
+    // fixture cannot encode at all", and the arm would prove nothing.
+    DiagnosticReporter ctlRep;
+    auto const ctlBytes =
+        dss::macho::encode(makeInstallNameDylibModule(), **target, **fmt,
+                           ctlRep,
+                           dss::ImageRequest{.artifactFileName = "named.dylib"});
+    EXPECT_EQ(ctlRep.errorCount(), 0u) << diagSummary(ctlRep);
+    EXPECT_FALSE(ctlBytes.empty());
+    auto const ctlSig = readEmittedSignature(ctlBytes);
+    ASSERT_TRUE(ctlSig.has_value());
+    EXPECT_EQ(ctlSig->identifier, "com.dss.named.dylib");
+}
+
+TEST(MachoCodeSignatureIdentity, ANearMissSpellingIsRefusedAtDocumentLoad) {
+    // The vocabulary is CLOSED and is the SAME one `image.installName` uses —
+    // one resolver, one key set. A mis-spelled placeholder is a property of the
+    // DOCUMENT, so it must fail where the document is read; passed through it
+    // would ship as literal text inside a binary's code identity.
+    // ⚠ A CUSTOM RAW-STRING DELIMITER, and it is not a style choice. The
+    // spelling under test is `$(artifactFileName)`, whose `)"` ENDS a default
+    // `R"( … )"` literal in the middle of the JSON — it compiled as garbage
+    // with "missing terminating \" character" rather than as this fixture.
+    // The two CONTROL documents below keep the default delimiter, which is
+    // itself the tell that only this one contains the sequence.
+    auto const rejected = ObjectFormatSchema::loadFromText(R"JSON({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"csid-dylib","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "dylib", "flags": 0 },
+      "image": { "pageZeroSize": 0, "segmentPageSize": 4096,
+                 "installName": "@rpath/${artifactFileName}",
+                 "codeSignature": {"kind":"adhoc","hashAlgorithm":"sha256","pageSize":4096,"identifier":"com.dss.$(artifactFileName)"},
+                 "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })JSON");
+    ASSERT_FALSE(rejected.has_value())
+        << "a document spelling the placeholder `$( )` loaded cleanly";
+    EXPECT_EQ(countAtPath(rejected, "/image/codeSignature/identifier"), 1u)
+        << rejectSummary(rejected);
+
+    // CONTROL, byte-identical but for that one spelling: it LOADS. Without it,
+    // "the document was rejected" is equally consistent with "this fixture is
+    // rejected for some unrelated reason", and the arm would prove nothing.
+    auto const accepted = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"csid-dylib","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "dylib", "flags": 0 },
+      "image": { "pageZeroSize": 0, "segmentPageSize": 4096,
+                 "installName": "@rpath/${artifactFileName}",
+                 "codeSignature": {"kind":"adhoc","hashAlgorithm":"sha256","pageSize":4096,"identifier":"com.dss.${artifactFileName}"},
+                 "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })");
+    EXPECT_TRUE(accepted.has_value()) << rejectSummary(accepted);
+
+    // SECOND CONTROL, the other direction: a LITERAL identity carries no
+    // placeholder and stays legal, so a document that genuinely wants a fixed
+    // ident (what `codesign -i` gives) still loads. "Everything with a `$` is
+    // refused" and "everything is refused" are different claims.
+    auto const literal = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"csid-dylib","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "dylib", "flags": 0 },
+      "image": { "pageZeroSize": 0, "segmentPageSize": 4096,
+                 "installName": "@rpath/${artifactFileName}",
+                 "codeSignature": {"kind":"adhoc","hashAlgorithm":"sha256","pageSize":4096,"identifier":"com.dss.fixed"},
+                 "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })");
+    EXPECT_TRUE(literal.has_value()) << rejectSummary(literal);
 }

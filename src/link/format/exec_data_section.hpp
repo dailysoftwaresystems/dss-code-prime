@@ -4,6 +4,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/section_kind.hpp"
+#include "core/types/symbol_attrs.hpp"    // definitionIsPreemptible (the ONE owner)
 #include "core/types/target_schema.hpp"   // F5: TargetSchema::relocationInfo (abs64)
 #include "link/format/byte_emit.hpp"
 
@@ -22,7 +23,18 @@
 // kind-parameterized layout + symbolVa logic ELF / PE / Mach-O all reuse so a
 // section's byte layout lives in ONE place, not copy-pasted per writer. Closes
 // D-LK4-DATA-PRODUCER (writable `.data` + zero-fill `.bss`) atop the original
-// `D-LK1-ELF-EXEC-DATA-SECTIONS` rodata arm. Two concerns live here:
+// `D-LK1-ELF-EXEC-DATA-SECTIONS` rodata arm.
+//
+// ⚠ THE TWO NUMBERED CONCERNS BELOW ARE THE ONES THIS HEADER WAS BUILT AROUND,
+// NOT AN INVENTORY OF WHAT IT NOW HOLDS — it grew `mergeFileBackedDataSection`,
+// `addTlsSymbolOffsets`, `addTlsTemplateOffsets`, `collectPreemptibleDefinitions`
+// and `applyDataItemRelocations` afterwards, each documented at its own
+// definition. The count is left as history rather than re-counted here, because
+// a summary that must be renumbered on every addition is one that goes stale
+// silently; what a reader needs is that EVERY function here is format-neutral
+// and fronted by the caller's `writerName`, which is stated below and stays true.
+//
+// The two founding concerns:
 //
 //   1. `buildExecDataSection(kind, …)` — select the `AssembledData` items whose
 //      `section == kind`, validate them (no data→data relocations; a Bss item
@@ -417,6 +429,61 @@ inline void mergeFileBackedDataSection(ExecDataSectionLayout&       into,
         tlsSymbols.insert(di.symbol);
     }
     return true;
+}
+
+// ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING — the STATIC-INITIALIZER
+// half of the ADDRESS residual: WHICH of this module's own definitions may the
+// loader replace, so a data slot initialized with one's address must be filled
+// by the LOADER instead of baked by this writer.
+//
+// A data slot holding `&g` for a definition this artifact owns is normally a
+// link-time constant: `applyDataItemRelocations` below bakes S + A, and a slid
+// image emits the format's SELF-RELATIVE rebase row so the loader adds the
+// slide. That is right for a definition no loader can replace. It is WRONG for a
+// PREEMPTIBLE one, whose winner may live in another image entirely: baking this
+// artifact's own body address splits ONE identifier into TWO addresses INSIDE
+// ONE ARTIFACT — the CODE form (already routed through the loader-resolved slot)
+// and the INITIALIZER form disagree, a C 6.2.2p2 identity break the program can
+// observe with `==` and nothing diagnoses.
+//
+// ✔MEASURED (gcc 13.3.0 and clang 18.1.3, one `.so` each, `-O1 -shared -fPIC`,
+// `fp tbl[3] = { &w, &st, &sf }` with `w` weak, `st` strong global and `sf`
+// `static` as the IN-OBJECT control): both references emit a SYMBOL-based
+// `R_X86_64_64 w` / `R_X86_64_64 st` for the two preemptible entries and leave
+// the `static` entry a bare `R_X86_64_RELATIVE`. The control is what makes that
+// a statement about preemptibility rather than about the target.
+//
+// ★ WHY THE SELECTION IS HERE AND THE ENCODING IS NOT. WHICH definitions qualify
+// is a module + declaration fact — `definitionIsPreemptible` is its ONE owner,
+// and every writer must answer it identically for one symbol or the tiers drift
+// (`core/types/symbol_attrs.hpp` states that reason for the three tiers that
+// already share it). HOW the resulting slot is expressed is per format: ELF
+// writes a `.rela.dyn` symbol row over a ZEROED slot, Mach-O would write a BIND
+// where it writes a REBASE today. Only the first half lives here.
+//
+// The RETURNED SET IS EMPTY whenever `preemptibleBindings` is empty — which is
+// every exec / PIE flavour (a main executable is always its own winner), every
+// relocatable and static-library flavour (no loader is involved), every PE
+// (Windows has no symbol interposition) and both Mach-O dylibs until their own
+// list is declared. An empty set means every caller's bytes are unchanged, so
+// this function is INERT for every format that does not declare the key.
+[[nodiscard]] inline std::unordered_set<SymbolId> collectPreemptibleDefinitions(
+    AssembledModule const&         module,
+    std::span<SymbolBinding const> preemptibleBindings) {
+    std::unordered_set<SymbolId> preemptible;
+    if (preemptibleBindings.empty()) return preemptible;  // nothing qualifies
+    for (auto const& ms : module.symbols) {
+        // A nameless row is not in any dynamic export set, so no loader can see
+        // it — the same reason the visibility half of the predicate is asked
+        // first and universally.
+        if (ms.name.empty()) continue;
+        if (!::dss::definitionIsPreemptible(ms.binding, ms.visibility,
+                                            preemptibleBindings)) {
+            continue;
+        }
+        preemptible.insert(ms.symbol);
+    }
+    return preemptible;
 }
 
 // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): patch each reloc-bearing data item's bytes

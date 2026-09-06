@@ -232,10 +232,20 @@ struct DSS_EXPORT MirToLirResult {
 // driver hands the lowerer the same rows it is already computing, rather than a
 // name being threaded through every MIR node.
 //
-// ⓘ FUNCTIONS ONLY. The routing this feeds decides a CALL's shape; a preemptible
-// DATA global's address is a separate reference kind with its own declared
-// binding (`dataImportBinding`), and mixing the two into one channel would make
-// this vector answer a question its consumer never asks.
+// ⚠ IT USED TO SAY "FUNCTIONS ONLY", and that note was TRUE OF ITS CONSUMER AND
+// FALSE OF ITS SUBJECT. The consumer was the CALL routing, which only ever asks
+// about a function; the note then reasoned from that to "a preemptible DATA
+// global's address is a separate reference kind with its own declared binding",
+// which the references refute. ✔MEASURED 2026-09-05 (gcc 13.3.0, clang 18.1.3,
+// one `.so` each, with `static` and `visibility("hidden")` siblings in the SAME
+// object and the same source as a `-pie`/`-no-pie` executable as controls):
+// `&exported_data` and `&exported_function` inside a `.so` BOTH load a
+// `R_X86_64_GLOB_DAT` GOT slot, and the `static`/hidden siblings of BOTH are a
+// bare `lea`. `dataImportBinding` answers a different question — how an
+// UNDEFINED name from another image is bound — and cannot answer this one, which
+// is about a name this artifact DEFINES. So the rows cover every DEFINITION the
+// loader can see, function and data alike, and the ADDRESS half of
+// [[D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING]] reads the same channel.
 struct DSS_EXPORT DefinedSymbolName {
     SymbolId    symbol{};
     std::string name;   // the on-binary spelling; never empty

@@ -2278,6 +2278,79 @@ TEST(GrammarSchema, AttributeArgRuleUnknownShapeReportsInvalid) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
 }
 
+// ── P62 [[D-CSUBSET-ATTRIBUTE-ARG-CONSTANT-EXPRESSION]]: the OPTIONAL
+//    `attributeSemantics.attributeArgExprRule` key ──────────────────────────
+//
+// The key names the CONSTANT-EXPRESSION shape inside an attribute argument, and
+// its whole job is to be the STOP of `attrClauseArgOperand`'s sole-Internal-child
+// descent: without it that descent walks past the operand, through `sizeofExpr`
+// into `sizeofType` and on into `castTypeRef`, and hands the const-evaluator a
+// TYPE REFERENCE where the program wrote an expression.
+//
+// ⚠⚠ THESE FOUR PINS EXIST BECAUSE THE KEY SHIPPED WITH NONE, ONE ROW AFTER THE
+// SIBLING THAT LEARNED THE LESSON. `attributeArgRule` above carries three pins
+// under a comment saying in as many words that they exist because
+// D-CONFIG-ATTRIBUTE-ARG-RULE-DOCUMENTED-BUT-UNIMPLEMENTED was opened over a key
+// with "no loader key, no field, no consumer, NO TEST" while two shipped
+// `$comment`s asserted the mechanism in the present tense — and that row is STILL
+// 🟠 OPEN. `grep -rn "attributeArgExprRule" tests/` returned NOTHING when this
+// key landed, beside a very large shipped `$comment` asserting its behaviour and
+// a live engine consumer. Same shape, one key along.
+
+// PRESENT + VALID: the key loads and reaches `SemanticConfig`.
+TEST(GrammarSchema, AttributeArgExprRuleLoadsWhenPresent) {
+    auto const cfg = attributeSemanticsSchemaWith(
+        R"("attributeArgRule": "stdAttr", "attributeArgExprRule": "attrSpec",)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    EXPECT_EQ((*r)->semantics().attributeArgExprRuleName, "attrSpec");
+    EXPECT_TRUE((*r)->semantics().attributeArgExprRule.valid());
+}
+
+// ABSENT: still loads, and the rule stays INVALID — the pre-P62 state, in which
+// the descent is exactly the depth-agnostic wrapper walk it always was. Every
+// language that declares an attribute surface with no constant-expression
+// argument grammar depends on this staying optional.
+TEST(GrammarSchema, AttributeArgExprRuleIsOptional) {
+    auto r = GrammarSchema::loadFromText(attributeSemanticsSchemaWith(""));
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    EXPECT_FALSE((*r)->semantics().attributeArgExprRule.valid());
+    EXPECT_TRUE((*r)->semantics().attributeArgExprRuleName.empty());
+}
+
+// PRESENT but naming a shape that does not exist → C_UnknownShape, LOUD.
+// ★ Optional must not mean forgiving: a typo'd name that merely left the id
+// invalid would silently restore the "descend into the type reference" defect the
+// key exists to stop, and the load would report success.
+TEST(GrammarSchema, AttributeArgExprRuleUnknownShapeReportsInvalid) {
+    auto const cfg = attributeSemanticsSchemaWith(
+        R"("attributeArgRule": "stdAttr",
+            "attributeArgExprRule": "attrArgConstExprTypo",)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "an attributeArgExprRule naming a nonexistent shape must fail the "
+           "load, not leave the descent stop silently unset";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// ★ THE DEPENDENCY ARM, and it is the one a copy of the sibling's three pins
+// would have missed. The descent this key steers only ever RUNS from an
+// `attributeArgRule` node, so declaring the expression rule WITHOUT the argument
+// rule is dead config that reads as configured — C_InvalidSemantics, not a key
+// that quietly does nothing. (The reverse — an argument rule with no expression
+// rule — is the legitimate pre-P62 state and is the pin above.)
+TEST(GrammarSchema, AttributeArgExprRuleWithoutTheArgRuleReportsInvalid) {
+    auto const cfg = attributeSemanticsSchemaWith(
+        R"("attributeArgExprRule": "attrSpec",)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "an expression rule with no argument rule is dead config and must "
+           "fail the load rather than load clean and steer nothing";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
 // (The shipped-config regression wall for this vocabulary lives at the end
 // of the file, next to the helper that locates c.lang.json.)
 

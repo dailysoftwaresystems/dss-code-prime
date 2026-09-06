@@ -855,11 +855,28 @@ TEST(FfiResolveLibraryRoundTrip, MissingResolveLibraryPathFailsLoudEvenWithNoExt
 // `kFormatLegs`.
 //
 // The library identity is STATED via `--resolve-library <path>=<name>`
-// (D-FFI-DECLARED-IMPORT-NAME) rather than left to the binary's embedded
-// identity, because the shipped Mach-O dylib schema declares a single
-// `installName` ("@rpath/libdss.dylib") that BOTH stand-ins would inherit —
-// two libraries collapsing to one recorded name would make the Mach-O leg
-// pass for a reason unrelated to the defect.
+// (D-FFI-DECLARED-IMPORT-NAME), which exercises PRECEDENCE LEVEL 1 — a
+// declared name beats a binary's embedded identity — and that is the level
+// this case is for. It deliberately does NOT reach level 2 (the embedded
+// identity), and the reason is worth the sentence:
+//
+// ⚠⚠ THIS COMMENT ONCE JUSTIFIED THE `=name` FORM BY THE DEFECT IT WAS
+// ROUTING AROUND, AND SHIPPED GREEN. It read: the shipped Mach-O dylib schema
+// "declares a single `installName` ("@rpath/libdss.dylib") that BOTH stand-ins
+// would inherit — two libraries collapsing to one recorded name would make the
+// Mach-O leg pass for a reason unrelated to the defect." That was TRUE, it was
+// the whole shape of
+// D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT, and this
+// pin — the driver-tier one meant to catch exactly that class — SAW it, NAMED
+// it, and stepped one precedence level up to stay green. A pin that documents
+// its own blindness and ships is worse than a narrow one: it proves someone
+// looked. See D-HARNESS-A-PIN-MAY-NOT-ROUTE-AROUND-THE-DEFECT-IT-DOCUMENTS.
+// ⇒ No shipped document declares a constant identity any more, and level 2 is
+//   now pinned on its own by `program/test_macho_install_name_identity`, which
+//   drives this same driver with BARE PATHS and asserts each dylib's own
+//   LC_ID_DYLIB differs before asserting both dependency entries. Keep the
+//   `=name` form HERE: with level 2 pinned elsewhere, the two cases cover the
+//   two precedence levels instead of both covering one.
 TEST(FfiResolveLibraryRoundTrip, EveryResolvedLibraryReachesTheEmittedDependencyTable) {
     struct TwoLibLeg {
         char const* label;

@@ -1484,4 +1484,170 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
 
 } // namespace detail
 
+// ── D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ───────
+//
+// The placeholder scanner and the substitution, in ONE pass so the two cannot
+// disagree about what a placeholder is. See the header for why the vocabulary
+// is closed and why an unknown spelling is a refusal rather than a pass-through.
+
+namespace {
+
+// The SIGIL. Every one of these in a declared identity must open a well-formed
+// placeholder — see `resolveArtifactIdentity` and the header's ★ note on why
+// the scan keys on the sigil alone rather than on the two-character `${`.
+constexpr char kPlaceholderSigil = '$';
+
+// The opening delimiter. The closing one is a single `}`, so a placeholder
+// cannot nest and the scan needs no depth counter.
+constexpr std::string_view kPlaceholderOpen = "${";
+
+// The closed vocabulary, spelled ONCE. `kArtifactFileNamePlaceholder` in the
+// header is `kPlaceholderOpen + kArtifactFileNameKey + '}'`, and the static
+// assertion below refuses a future edit that lets the two drift.
+constexpr std::string_view kArtifactFileNameKey = "artifactFileName";
+
+// ⓘ These compare STRINGS, not lengths. The first draft asserted only that the
+// sizes matched, under a message claiming "must be the same string" — a comment
+// stating a property its own check could not see, which is the failure class
+// this project files as a defect. C++23 gives `string_view` a constexpr `==`.
+static_assert(kArtifactFileNamePlaceholder.size()
+                  == kPlaceholderOpen.size() + kArtifactFileNameKey.size() + 1u,
+              "the exported placeholder spelling and the key this TU "
+              "substitutes must be the same string");
+static_assert(kArtifactFileNamePlaceholder.substr(0, kPlaceholderOpen.size())
+                  == kPlaceholderOpen,
+              "the exported placeholder must open with the delimiter this TU "
+              "scans for");
+static_assert(kArtifactFileNamePlaceholder.substr(kPlaceholderOpen.size(),
+                                                  kArtifactFileNameKey.size())
+                  == kArtifactFileNameKey,
+              "the exported placeholder must name the key this TU substitutes");
+static_assert(kArtifactFileNamePlaceholder.back() == '}',
+              "the exported placeholder must be closed");
+static_assert(kPlaceholderOpen.front() == kPlaceholderSigil,
+              "the sigil the scan keys on must be the delimiter's first "
+              "character, or a well-formed placeholder would not be found");
+
+// ★ THE NEAR-MISS RULE, HALF TWO. A vocabulary key spelled with NO sigil at
+// all — `{artifactFileName}` — is the one wrong guess the sigil scan cannot
+// see, because there is nothing in it to scan. So a literal run of the
+// identity that CONTAINS a key name is refused too: an author who typed the
+// key meant the substitution, whatever dialect they reached for.
+// ⚠ This is deliberately over-broad by one absurd case — an artifact honestly
+// named `artifactFileName.dylib` is refused. That trade is the whole point of
+// the row: a false positive here is a loud diagnostic at document load that
+// says exactly what to write, and a false negative is a binary shipping an
+// identity nobody meant, discovered by a loader on someone else's machine.
+[[nodiscard]] bool literalRunNamesAKey(std::string_view run) noexcept {
+    return run.find(kArtifactFileNameKey) != std::string_view::npos;
+}
+
+} // namespace
+
+bool declaresArtifactIdentityPlaceholder(
+        std::string_view declaredIdentity) noexcept {
+    return declaredIdentity.find(kPlaceholderSigil) != std::string_view::npos;
+}
+
+std::expected<std::string, std::string>
+resolveArtifactIdentity(std::string_view declaredIdentity,
+                        std::string_view artifactFileName) {
+    // ── The literal run that precedes the next sigil (or the tail). Refused
+    // when it names a key with no sigil; appended to the output otherwise.
+    auto takeLiteralRun =
+        [&](std::string_view run) -> std::expected<std::string, std::string> {
+        if (literalRunNamesAKey(run)) {
+            return std::unexpected(std::format(
+                "the declared identity '{}' spells the placeholder key '{}' "
+                "outside a placeholder. Every substitution in this vocabulary "
+                "is written '{}' — `{{{}}}`, `$({})` and `${}` are other "
+                "dialects' spellings and mean nothing here, so they would ship "
+                "as the artifact's LITERAL runtime identity. Write '{}' if you "
+                "meant the substitution.",
+                declaredIdentity, kArtifactFileNameKey,
+                kArtifactFileNamePlaceholder, kArtifactFileNameKey,
+                kArtifactFileNameKey, kArtifactFileNameKey,
+                kArtifactFileNamePlaceholder));
+        }
+        return std::string{run};
+    };
+
+    std::string out;
+    out.reserve(declaredIdentity.size());
+    std::size_t cursor = 0;
+    while (cursor < declaredIdentity.size()) {
+        std::size_t const open =
+            declaredIdentity.find(kPlaceholderSigil, cursor);
+        if (open == std::string_view::npos) {
+            auto tail = takeLiteralRun(declaredIdentity.substr(cursor));
+            if (!tail.has_value()) {
+                return std::unexpected(std::move(tail).error());
+            }
+            out.append(*tail);
+            break;
+        }
+        auto run = takeLiteralRun(declaredIdentity.substr(cursor, open - cursor));
+        if (!run.has_value()) {
+            return std::unexpected(std::move(run).error());
+        }
+        out.append(*run);
+        // ★ THE NEAR-MISS RULE, HALF ONE. The scan keys on the SIGIL, not on
+        // the two-character `${`, so every OTHER dialect's spelling is a
+        // refusal instead of a silent pass-through: `$(NAME)` is Make's and
+        // `$NAME` is sh's — the two likeliest wrong guesses — and a stray or
+        // trailing `$` is a typo. All of them used to ship rc 0 with the
+        // author's mistake embedded verbatim in the binary's identity.
+        if (declaredIdentity.substr(open, kPlaceholderOpen.size())
+            != kPlaceholderOpen) {
+            return std::unexpected(std::format(
+                "the declared identity '{}' carries a '{}' that does not open "
+                "'{}'. In this vocabulary the '{}' is a SUBSTITUTION SIGIL and "
+                "nothing else: there is no literal '{}' and no other dialect's "
+                "spelling, because a '{}' passed through verbatim ships inside "
+                "the artifact's runtime identity and is discovered by a loader "
+                "rather than by this build. Write '{}', or remove the '{}'.",
+                declaredIdentity, kPlaceholderSigil, kPlaceholderOpen,
+                kPlaceholderSigil, kPlaceholderSigil, kPlaceholderSigil,
+                kArtifactFileNamePlaceholder, kPlaceholderSigil));
+        }
+        std::size_t const close = declaredIdentity.find('}', open);
+        if (close == std::string_view::npos) {
+            return std::unexpected(std::format(
+                "the declared identity '{}' opens a placeholder with '{}' that "
+                "is never closed by a '}}'. An identity is embedded in the "
+                "emitted artifact verbatim, so an unterminated placeholder "
+                "would ship as literal text and be discovered by a loader "
+                "rather than by this build. Close it, or remove the '{}'.",
+                declaredIdentity, kPlaceholderOpen, kPlaceholderOpen));
+        }
+        std::string_view const key = declaredIdentity.substr(
+            open + kPlaceholderOpen.size(),
+            close - open - kPlaceholderOpen.size());
+        if (key != kArtifactFileNameKey) {
+            return std::unexpected(std::format(
+                "the declared identity '{}' names the placeholder '${{{}}}', "
+                "which is not one this substrate can answer. The vocabulary is "
+                "closed and holds exactly: '{}'. An unknown spelling is refused "
+                "rather than passed through, because a passed-through typo "
+                "ships as the artifact's literal runtime identity.",
+                declaredIdentity, key, kArtifactFileNamePlaceholder));
+        }
+        if (artifactFileName.empty()) {
+            return std::unexpected(std::format(
+                "the declared identity '{}' is a function of the artifact being "
+                "produced, but this emission was given no artifact file name to "
+                "resolve '{}' against. There is deliberately NO fallback: "
+                "substituting a fixed name here is exactly the defect this "
+                "declaration replaced — every artifact of one format then "
+                "claims one runtime identity, and a program that loads two of "
+                "them gets one. Supply the artifact file name on the image "
+                "request, or declare a literal identity.",
+                declaredIdentity, kArtifactFileNamePlaceholder));
+        }
+        out.append(artifactFileName);
+        cursor = close + 1u;
+    }
+    return out;
+}
+
 } // namespace dss

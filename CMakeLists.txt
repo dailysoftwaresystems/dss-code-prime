@@ -1108,12 +1108,83 @@ if(DSS_BUILD_TESTS)
     # ⓘ The PROBE form still cannot be registered: it needs a build directory, and
     # a source checkout has none. Registering the self-test is what stops the
     # verdict rule from drifting unwatched.
+    # ~~ ⚠ THAT LAST SENTENCE IS REFUTED BY MEASUREMENT AND IS CORRECTED IN PLACE
+    # RATHER THAN LEFT TO BE RE-READ AS TRUE (P62 lane `ax`). "A source checkout
+    # has none" is a claim about a SHELL invoked in a checkout; it is not a claim
+    # about CMake, which is generating INTO a build directory and therefore knows
+    # `${CMAKE_BINARY_DIR}` at configure time. The probe form IS registrable, it is
+    # registered immediately below, and the eleven-day gap between writing that
+    # sentence and testing it cost cycle P62 a phantom regression — see there. ~~
     add_test(
         NAME ninja_deps_selftest_guard
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/scripts/check-ninja-deps/check-ninja-deps.py"
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # ── THE PROBE FORM, ENFORCED: IS THIS BUILD DIRECTORY FRESH ENOUGH TO BE
+    #    BELIEVED? (P62 lane `ax` —
+    #    D-BUILD-NINJA-RECORDS-ZERO-HEADER-DEPS-UNDER-CONCURRENT-BUILDS) ──
+    #
+    # ★★★ WHAT IT COST TO LEAVE THIS UNREGISTERED, ✔MEASURED IN THE CYCLE THAT
+    # ADDED IT. Cycle P62's wave-2 gate came back with two `SemanticAnalyzerC`
+    # inline-asm cases red and every other entry green, and the reds were read as a
+    # grammar regression a lane had just landed. They were nothing of the kind:
+    # `check-ninja-deps.py build/dbg` reported `1 of 625 objects have ZERO recorded
+    # header deps`, and the one object was
+    # `…/dss_analysis_semantic_test_semantic_analyzer_c.dir/test_semantic_analyzer_c.cpp.obj`
+    # — two days stale, never recompiled after a lane inserted a member INTO THE
+    # MIDDLE of `SemanticConfig`, then RELINKED against a freshly built
+    # `libdsscp.dll` whose layout had moved. The stale object read
+    # `semantics().inlineAsm` at an offset one `RuleId` + one `std::string` too low,
+    # so `inlineAsm.rule` resolved to `expression` instead of `asmStmt` and the
+    # facts gatherer walked the wrong nodes and found nothing. ✔REPRODUCED ON
+    # DEMAND by compiling one probe against the pre-change header and linking the
+    # post-change DLL: `ia.rule` 25/`asmStmt` became 2/`expression`, and the
+    # per-fixture match counts matched the gate's transcript exactly.
+    # ⇒ The cost of a build-directory invariant that only runs when someone
+    # remembers is not a slow build. It is a gate that reports a defect the source
+    # does not contain, in a file the guilty lane never touched.
+    #
+    # ★★ NOT NAMED `*_guard`, AND THAT IS THE LOAD-BEARING PART OF THE NAME. The
+    # label sweep near the end of this file gives every test whose name ends in
+    # `guard` the `repo-guard` label, and an indirect leg (WSL, macOS, the arm64
+    # VPS) SKIPS that label by operator ruling — correctly, because a repo guard
+    # reads the SOURCE TREE and the tree is byte-identical everywhere. This entry
+    # reads a BUILD DIRECTORY, and every leg has its own, with its own
+    # `.ninja_deps` and its own concurrency history. Inheriting the label would
+    # have switched it off on precisely the three legs whose build trees this
+    # project has least visibility into.
+    #
+    # ★ THE `--allow-non-ninja` ESCAPE IS DIRECTIONAL AND CANNOT BE REACHED FROM A
+    # NINJA TREE — an escape every caller triggers is an escape that disarms the
+    # guard. It is decided HERE, at configure time, from `CMAKE_GENERATOR`, which
+    # the build cannot fake; on Ninja (the generator `scripts/local-build` pins for
+    # every leg) the flag is not passed AT ALL, so the SKIP arm is unreachable and
+    # a missing `build.ninja` would be FATAL rather than a pass. On a genuinely
+    # non-Ninja tree the entry passes while printing `NOTHING WAS VERIFIED here`,
+    # which is a visible skip rather than a silent one.
+    #
+    # ⓘ `ninja` is put on PATH from `CMAKE_MAKE_PROGRAM` rather than assumed: the
+    # tool spawns `ninja -t deps`, and a `ctest` run from a shell that built
+    # nothing would otherwise get `FATAL -- ninja is not on PATH` — a refusal that
+    # is correct in kind and useless in practice.
+    set(_dss_ninja_deps_args "${CMAKE_BINARY_DIR}")
+    if(NOT CMAKE_GENERATOR MATCHES "Ninja")
+        list(APPEND _dss_ninja_deps_args --allow-non-ninja)
+    endif()
+    add_test(
+        NAME build/ninja-deps-freshness
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-ninja-deps/check-ninja-deps.py"
+                ${_dss_ninja_deps_args}
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    get_filename_component(_dss_ninja_dir "${CMAKE_MAKE_PROGRAM}" DIRECTORY)
+    if(_dss_ninja_dir)
+        set_tests_properties(build/ninja-deps-freshness PROPERTIES
+            ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:${_dss_ninja_dir}")
+    endif()
 
     # Export-macro placement guard (2026-08-28 —
     # D-BUILD-EXPORT-MACRO-ON-AN-EXPORTED-CLASS-MEMBER-BREAKS-MSVC).

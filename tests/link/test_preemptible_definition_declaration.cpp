@@ -190,19 +190,28 @@ TEST(PreemptibleDefinitionDeclaration,
 //
 // ★★ THE ASYMMETRY IS THE OTHER HALF, AND IT IS DELIBERATE — pinning it is what
 // stops a later cycle from "completing" the set by reflex. ELF declares
-// ["global","weak"]; the two darwin dylib documents declare NOTHING YET.
+// ["global","weak"]; the two darwin dylib documents declare ["weak"].
 // ✔MEASURED, each reference probed separately with controls: gcc 13.3.0 and
 // clang 18.1.3 both route a `.so`'s call to its own STRONG GLOBAL through the
-// PLT, so ELF's set is the wider one; Mach-O's is `weak` only. The Mach-O
-// declaration is WITHHELD not because the set is unknown but because the writer
-// has no import ordinal meaning "resolve from the loader's coalescing scope" —
-// declaring it today would turn a silent wrong answer into a LOUD REFUSAL of a
-// program Apple clang builds correctly, trading one violation of the bar for
-// another. See D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING, still OPEN for
-// exactly that half.
-// ⇒ WHEN THAT HALF LANDS, THIS CASE MUST BE UPDATED IN THE SAME COMMIT. It is
-//   written to fail loudly on the day the Mach-O documents gain the key, rather
-//   than to pass quietly through the change it is meant to notice.
+// PLT, so ELF's set is the wider one; Apple clang 21.0.0 / ld-1267 on Apple
+// Silicon leaves a dylib's call to its own strong global and to a `static` a
+// DIRECT `bl` with an empty weak-bind stream, so Mach-O's set is `weak` only.
+// The assertion below is an EXACT SET COMPARISON in both directions, so
+// "completing" either list goes red on size.
+//
+// ⓘ HISTORY, KEPT BECAUSE THE REASON OUTLIVES THE STATE. The two darwin rows
+// read `{}` until cycle P62: the sets were known, but the Mach-O writer had no
+// encoding meaning "resolve from the loader's coalescing scope", and declaring
+// the key without one would have turned a silent wrong answer into a LOUD
+// REFUSAL of a program Apple clang builds correctly — one violation of the bar
+// traded for another. The writer gained the encoding in that cycle (the
+// LC_DYLD_INFO_ONLY weak-bind stream, byte-identical to ld64's, plus the
+// chained `<weak-def-coalesce>` ordinal), so the declaration landed with it and
+// D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING closed on both rails.
+// ⇒ THE STANDING RULE THAT PRODUCED THAT UPDATE STILL BINDS: a format that
+//   gains or loses a preemptible binding updates THIS case in the SAME commit.
+//   It is written to fail loudly on the day a shipped document's list moves,
+//   rather than to pass quietly through the change it is meant to notice.
 TEST(PreemptibleDefinitionDeclaration, TheShippedDocumentsDeclareTheMeasuredSets) {
     struct Row {
         std::string_view format;
@@ -215,10 +224,33 @@ TEST(PreemptibleDefinitionDeclaration, TheShippedDocumentsDeclareTheMeasuredSets
          "through the PLT"},
         {"elf64-aarch64-linux-dyn", {SymbolBinding::Global, SymbolBinding::Weak},
          "same measurement, run under qemu with a matching aarch64 control"},
-        {"macho64-arm64-darwin-dylib", {},
-         "WITHHELD: the writer has no coalescing-scope import ordinal yet"},
-        {"macho64-x86_64-darwin-dylib", {},
-         "WITHHELD: same reason as its arm64 sibling"},
+        // ★ THE WITHHELD PAIR IS NOW DECLARED, AND THE ASYMMETRY IS STILL THE
+        // POINT. These two read `{}` while the Mach-O writer had no way to
+        // encode a coalescing-scope reference — declaring the key then would
+        // have turned a SILENT wrong answer into a LOUD REFUSAL of a program
+        // Apple clang builds correctly. The writer gained the encoding (the
+        // LC_DYLD_INFO_ONLY weak-bind stream, byte-identical to ld64's, and the
+        // chained `<weak-def-coalesce>` ordinal), so the declaration lands with
+        // it. ✔MEASURED on Apple Silicon 2026-09-06, the discriminating run: a
+        // DSS-built dylib under an Apple-built executable defining a rival weak
+        // body returns the CONSUMER's answer (rc 2) where it returned its own
+        // (rc 1) before, with the ld64-built control returning rc 2 in the same
+        // session. ⚠ ONE configuration: that run's second, "release" arm shipped
+        // the SAME BYTES (the witness source was too small for the release
+        // pipeline to transform it), so it witnessed nothing extra and the
+        // release half is carried at the BYTE level instead, on a subject whose
+        // release artifact genuinely differs — see the note in
+        // `link/test_macho_writer`.
+        // ⚠ WEAK ONLY, and that is the measurement rather than caution: in the
+        // same probe a dylib's call to its own STRONG GLOBAL and to a `static`
+        // both stayed a DIRECT `bl` with an empty weak-bind stream, while ELF
+        // routes the strong one through the PLT. The two rails genuinely
+        // differ, which is why this is declared per format instead of being one
+        // rule in the code — do not "complete" this list to match ELF's.
+        {"macho64-arm64-darwin-dylib", {SymbolBinding::Weak},
+         "dyld coalesces WEAK definitions only; strong and static stay direct"},
+        {"macho64-x86_64-darwin-dylib", {SymbolBinding::Weak},
+         "same rule, same loader — the port does not change what dyld coalesces"},
     };
     for (auto const& row : rows) {
         SCOPED_TRACE(std::string{row.format});

@@ -1451,6 +1451,50 @@ encodeElfExecDynamic(
         appendDynsymEntry(ex.nameOff, ex.info, SHN_UNDEF, 0, ex.size);
     }
 
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING — the STATIC-INITIALIZER
+    // half of the ADDRESS residual, and the ONE table that carries it.
+    //
+    // A data slot initialized with the address of one of THIS artifact's own
+    // PREEMPTIBLE definitions must be filled by the LOADER, not baked here. The
+    // apply below writes S + A into the slot and the RELATIVE row makes the
+    // loader add the slide — which materializes THIS image's body for a name the
+    // loader may resolve elsewhere. The lowering already routes the CODE form of
+    // the same address through a loader-resolved slot, so leaving the
+    // INITIALIZER form baked gives ONE identifier TWO addresses INSIDE ONE
+    // ARTIFACT: `tbl[0] == code_w()` answers FALSE inside the library that wrote
+    // both, a C 6.2.2p2 identity break nothing diagnoses. ✔MEASURED exactly
+    // that, on a real loader, before this map existed.
+    //
+    // The row emitted instead is gcc's and clang's shape, MEASURED in one `.so`
+    // from one source with the `static` sibling as the in-object CONTROL:
+    // `R_X86_64_64 w + 0` / `R_X86_64_64 st + 0` over a ZEROED slot for the two
+    // preemptible entries, and a bare `R_X86_64_RELATIVE` left alone for the
+    // `static` one. The index named is the DEFINED EXPORT's — the same entry
+    // whose `st_value` this image publishes — so ld.so's global-scope lookup
+    // decides the winner exactly as it does for the code form.
+    //
+    // WHICH definitions qualify is NOT decided here: `collectPreemptibleDefinitions`
+    // asks the ONE owner (`definitionIsPreemptible`) against this format's
+    // DECLARED `preemptibleDefinitionBindings`. Absent (every exec / PIE
+    // flavour, every relocatable, every PE) ⇒ an EMPTY set ⇒ this map is empty
+    // and every byte below is unchanged. On a non-dyn flavour `dynExports` is
+    // empty as well, so the map is empty from both directions.
+    //
+    // The value is the index into `dynExports` (never a pointer into it, and
+    // never a copied name): the row's `.dynsym` index and its name both come
+    // from the ONE export record, so they cannot disagree.
+    std::unordered_map<SymbolId, std::size_t> preemptibleDefExportIdx;
+    {
+        std::unordered_set<SymbolId> const preemptibleDefs =
+            link::format::collectPreemptibleDefinitions(
+                module, fmt.preemptibleDefinitionBindings());
+        preemptibleDefExportIdx.reserve(preemptibleDefs.size());
+        for (std::size_t i = 0; i < dynExports.size(); ++i) {
+            if (!preemptibleDefs.contains(dynExports[i].sym)) continue;
+            preemptibleDefExportIdx.emplace(dynExports[i].sym, i);
+        }
+    }
+
     // ── (f) .hash body (DT_HASH single-bucket)
     //
     // ONE bucket whose chain threads EVERY dynsym entry (imports AND
@@ -1690,7 +1734,7 @@ encodeElfExecDynamic(
     // stores a pointer ONE INDIRECTION OFF — ✔MEASURED as a SILENT
     // miscompile (`static = 0x403240` = the slot; `runtime = 0x7f..d58` = the
     // object) before this counter existed.
-    // The ET_DYN arm already solved it (its `externAddrBySlotVa` fold below
+    // The ET_DYN arm already solved it (its `loaderResolvedSlotByVa` fold below
     // emits a SYMBOL-BASED absolute reloc and ZEROES the slot, letting ld.so
     // write the real address — gcc's own PIE shape, `R_X86_64_64 environ`).
     // The exec arm gets the SAME rows; the PREDICATE is stated as a reason, not
@@ -1706,8 +1750,27 @@ encodeElfExecDynamic(
     for (std::size_t i = 0; i < numExterns; ++i) {
         externIdxBySym.emplace(module.externImports[i].symbol, i);
     }
+    // ★★ TWO REASONS a data slot needs a SYMBOL-based row instead of the
+    // baked/RELATIVE path, stated as reasons rather than flavours:
+    //
+    //  (1) the target is an EXTERN whose address is not a link-time constant in
+    //      THIS image — always for a DATA import (got-indirect binds at load),
+    //      and for any extern in a SLID image (a base-relative stub VA cannot be
+    //      baked absolutely);
+    //  (2) the target is one of THIS artifact's own PREEMPTIBLE DEFINITIONS
+    //      (D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING, the
+    //      static-initializer half) — this image HAS a link-time address for it,
+    //      and using it is precisely the defect: the loader may resolve the name
+    //      to another image's definition, and the code form of the same address
+    //      already goes through the loader. `preemptibleDefExportIdx` is empty
+    //      unless the format DECLARES the binding set, so this arm adds nothing
+    //      to any format that does not.
+    //
+    // The two are mutually exclusive by construction: an extern SymbolId that
+    // collided with an intra-module definition is refused above.
     auto const dataItemRelocNeedsSymbolRow =
         [&](Relocation const& rel) -> bool {
+        if (preemptibleDefExportIdx.contains(rel.target)) return true;
         auto const it = externIdxBySym.find(rel.target);
         if (it == externIdxBySym.end()) return false;        // internal target
         return isDyn || module.externImports[it->second].isData;
@@ -2371,6 +2434,30 @@ encodeElfExecDynamic(
                  "silently bypass dyld resolution.");
             return {};
         }
+        // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING (the ADDRESS
+        // half): an import may carry a SECOND symbol naming the slot that
+        // holds its loader-resolved ADDRESS. Its VA is the GOT slot this
+        // writer already mints for the import — the one `.rela.dyn` fills
+        // with `R_*_GLOB_DAT` — so the answer is the SAME expression the
+        // data arm above uses, and NO new section, slot or relocation is
+        // created. It exists because the FUNCTION arm's `symbolVa` is the
+        // PLT STUB: correct for a call, and not the function's address.
+        // (A data import's own VA already IS the slot, so a slot symbol on
+        // one is redundant rather than wrong, and lands on the same VA.)
+        SymbolId const slotSym = module.externImports[i].addressSlotSymbol;
+        if (slotSym.valid()) {
+            std::uint64_t const slotVa = gotVa + gotSlotIndexFor(i) * 8;
+            if (!symbolVa.emplace(slotSym, slotVa).second) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::string{"elf::encodeElfExecDynamic: the address "
+                                 "slot symbol #"} +
+                     std::to_string(slotSym.v) + " of extern '" +
+                     module.externImports[i].mangledName +
+                     "' collides with another symbol's VA — the slot names "
+                     "one loader-resolved address and cannot be shared.");
+                return {};
+            }
+        }
     }
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols (the `&&label`
     // block-address `lea`s) get their interior-block VAs before relocation
@@ -2507,7 +2594,19 @@ encodeElfExecDynamic(
     // invariant below is unchanged. The abs64 native id comes from the
     // reloc's own format row (machine-agnostic — R_AARCH64_ABS64 on an
     // aarch64 dyn schema).
-    struct ExternAddrSite {
+    //
+    // ★★ AND THE SECOND REASON, WHICH IS WHY THIS IS NOT AN "extern" TABLE:
+    // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING's static-initializer half.
+    // A slot naming one of THIS artifact's PREEMPTIBLE DEFINITIONS takes the
+    // very same row — a symbol-based absolute reloc over a zeroed slot — for a
+    // DIFFERENT reason: this image HAS a link-time address for the name and
+    // must not use it, because the loader may award the name to another image.
+    // Both reasons produce ONE shape, so they share ONE site record; the
+    // predicate above states which reason admitted a given site, and the
+    // collection below picks the `.dynsym` entry each reason names (the UNDEF
+    // import row for an extern, this image's own DEFINED export row for a
+    // preemptible definition — gcc's and clang's choice, MEASURED).
+    struct LoaderResolvedSlotSite {
         std::uint32_t dynsymIdx = 0;
         std::uint32_t nativeId  = 0;
         std::int64_t  addend    = 0;
@@ -2516,7 +2615,8 @@ encodeElfExecDynamic(
     // `dataItemRelocNeedsSymbolRow` above states WHY a site qualifies), because
     // the exec arm needs exactly these rows for its extern-DATA sites since the
     // copy-relocation deletion — see the sizing comment at `relaDynSz`.
-    std::unordered_map<std::uint64_t, ExternAddrSite> externAddrBySlotVa;
+    std::unordered_map<std::uint64_t, LoaderResolvedSlotSite>
+        loaderResolvedSlotByVa;
     // ★ AND THE SAME SITES IN LAYOUT ORDER. The dyn arm emits by walking
     // `relativeSiteVas` (a vector) and LOOKING UP the map, so its row order is
     // deterministic; the exec arm has no such vector and must not iterate the
@@ -2524,39 +2624,59 @@ encodeElfExecDynamic(
     // runs of the same input, i.e. a non-reproducible image. This vector is
     // filled in data-item/relocation order, the same walk the layout-time
     // counter above uses, so sizing and emission agree by construction.
-    std::vector<std::pair<std::uint64_t, ExternAddrSite>> externAddrSitesInOrder;
+    std::vector<std::pair<std::uint64_t, LoaderResolvedSlotSite>>
+        loaderResolvedSlotsInOrder;
     if (hasDataDyn) {
         for (std::size_t j = 0; j < dataDynLayout.itemIndices.size(); ++j) {
             AssembledData const& di =
                 module.dataItems[dataDynLayout.itemIndices[j]];
             for (auto const& rel : di.relocations) {
                 if (!dataItemRelocNeedsSymbolRow(rel)) continue;
-                std::size_t const extIdx = externIdxBySym.at(rel.target);
+                // Which `.dynsym` entry the row must name, and under which of
+                // the predicate's two reasons. A PREEMPTIBLE DEFINITION names
+                // its own DEFINED export entry (gcc's and clang's shape); an
+                // EXTERN names its UNDEF import entry.
+                auto const preemptIt = preemptibleDefExportIdx.find(rel.target);
+                bool const targetIsPreemptibleDef =
+                    preemptIt != preemptibleDefExportIdx.end();
+                std::uint32_t          rowDynsymIdx = 0;
+                std::string_view       rowName;
+                if (targetIsPreemptibleDef) {
+                    rowDynsymIdx = dynExports[preemptIt->second].dynsymIdx;
+                    rowName      = dynExports[preemptIt->second].name;
+                } else {
+                    std::size_t const extIdx = externIdxBySym.at(rel.target);
+                    rowDynsymIdx = dynsymIdx[extIdx];
+                    rowName      = module.externImports[extIdx].mangledName;
+                }
                 auto const* fmtReloc = fmt.relocationByKind(rel.kind);
                 if (fmtReloc == nullptr) {
                     emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                          std::format(
                              "elf::encodeElfExecDynamic: data-item "
-                             "relocation kind {} targeting extern '{}' is not "
+                             "relocation kind {} targeting {} '{}' is not "
                              "declared by object format '{}' - cannot emit "
                              "the symbol-based absolute reloc.",
                              rel.kind.v,
-                             module.externImports[extIdx].mangledName,
-                             fmt.name()));
+                             targetIsPreemptibleDef ? "preemptible definition"
+                                                    : "extern",
+                             rowName, fmt.name()));
                     return {};
                 }
                 std::uint64_t const slotVa = dataVa
                     + dataDynLayout.itemOffsets[j]
                     + static_cast<std::uint64_t>(rel.offset);
-                ExternAddrSite const site{dynsymIdx[extIdx],
-                                          fmtReloc->nativeId, rel.addend};
+                LoaderResolvedSlotSite const site{
+                    rowDynsymIdx, fmtReloc->nativeId, rel.addend};
                 auto const [it, inserted] =
-                    externAddrBySlotVa.insert_or_assign(slotVa, site);
+                    loaderResolvedSlotByVa.insert_or_assign(slotVa, site);
                 (void)it;
                 // Two relocations naming the SAME slot would otherwise emit two
                 // rows for one 8 bytes while the map kept one — the count
                 // cross-check below would catch it, but say why here.
-                if (inserted) externAddrSitesInOrder.emplace_back(slotVa, site);
+                if (inserted) {
+                    loaderResolvedSlotsInOrder.emplace_back(slotVa, site);
+                }
             }
         }
     }
@@ -2572,6 +2692,27 @@ encodeElfExecDynamic(
             for (auto const& rel :
                  module.dataItems[rodataDynLayout.itemIndices[j]].relocations) {
                 if (!dataItemRelocNeedsSymbolRow(rel)) continue;
+                // The predicate's OTHER reason (a preemptible definition of
+                // this artifact) cannot reach here: this arm is `!isDyn`, where
+                // `dynExports` is empty and so `preemptibleDefExportIdx` is
+                // empty too. Named rather than assumed — reading the extern
+                // table for a non-extern target would THROW, and the guard
+                // below turns that into a loud diagnostic if the invariant ever
+                // moves.
+                auto const rodataExtIt = externIdxBySym.find(rel.target);
+                if (rodataExtIt == externIdxBySym.end()) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format(
+                             "elf::encodeElfExecDynamic: a READ-ONLY "
+                             "(`.rodata`) data item holds a load-time-resolved "
+                             "address for symbol #{}, which is not an extern "
+                             "import -- a preemptible DEFINITION reached the "
+                             "exec-flavour read-only path, where this image "
+                             "publishes no dynamic export to name. "
+                             "D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING.",
+                             rel.target.v));
+                    return {};
+                }
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                      std::format(
                          "elf::encodeElfExecDynamic: a READ-ONLY (`.rodata`) "
@@ -2586,7 +2727,7 @@ encodeElfExecDynamic(
                          "WRITABLE storage (drop a `const`, or let it be "
                          "relro) so the loader can fix it up. "
                          "D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET.",
-                         module.externImports[externIdxBySym.at(rel.target)]
+                         module.externImports[rodataExtIt->second]
                              .mangledName));
                 return {};
             }
@@ -2607,18 +2748,22 @@ encodeElfExecDynamic(
         }
         for (std::uint64_t const siteVa : relativeSiteVas) {
             std::uint64_t const slotOff = siteVa - dataVa;
-            // Extern-targeted slot: symbol-based row + zeroed slot (the
-            // apply's slot/stub VA is UNDONE — the review-fold above).
-            if (auto const extSite = externAddrBySlotVa.find(siteVa);
-                extSite != externAddrBySlotVa.end()) {
+            // A slot the LOADER must fill — an extern, or one of this
+            // artifact's own preemptible definitions: symbol-based row over a
+            // ZEROED slot, undoing the apply's baked value (the review-fold
+            // above states both reasons). The `static`/hidden sibling of a
+            // preemptible definition never lands here, so it keeps the RELATIVE
+            // row below — the in-object CONTROL both references emit.
+            if (auto const loaderSite = loaderResolvedSlotByVa.find(siteVa);
+                loaderSite != loaderResolvedSlotByVa.end()) {
                 for (int b = 0; b < 8; ++b) {
                     dataDynLayout.bytes[static_cast<std::size_t>(
                         slotOff + static_cast<std::uint64_t>(b))] = 0;
                 }
                 appendU64LE(relaDyn, siteVa);
-                appendU64LE(relaDyn, makeRelaInfo(extSite->second.dynsymIdx,
-                                                  extSite->second.nativeId));
-                appendI64LE(relaDyn, extSite->second.addend);
+                appendU64LE(relaDyn, makeRelaInfo(loaderSite->second.dynsymIdx,
+                                                  loaderSite->second.nativeId));
+                appendI64LE(relaDyn, loaderSite->second.addend);
                 continue;
             }
             std::uint64_t addend = 0;
@@ -2644,7 +2789,7 @@ encodeElfExecDynamic(
         // was counted but not emitted (or vice versa) cannot slip through as a
         // wrong DT_RELASZ.
         std::size_t emitted = 0;
-        for (auto const& [siteVa, site] : externAddrSitesInOrder) {
+        for (auto const& [siteVa, site] : loaderResolvedSlotsInOrder) {
             std::uint64_t const slotOff = siteVa - dataVa;
             for (int b = 0; b < 8; ++b) {
                 dataDynLayout.bytes[static_cast<std::size_t>(

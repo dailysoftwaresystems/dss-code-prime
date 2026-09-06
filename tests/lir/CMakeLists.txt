@@ -268,3 +268,16 @@ dss_add_test(NAME lir/test_lir_identity_copy_stage_attribution
 # call an indirection for a definition no loader can replace.
 dss_add_test(NAME lir/test_preemptible_definition_routing
              SOURCES test_preemptible_definition_routing.cpp)
+
+# D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING, the ADDRESS half: the same
+# artifact must not materialize its own body's ADDRESS for a name its loader may
+# replace — `&w` inside the library and `&w` in the executable would then be two
+# different pointers for one identifier, where C 6.2.2p2 gives one identifier one
+# function/object across the whole program (MEASURED: gcc 13.3.0 and clang 18.1.3
+# both GOT-load `&wk`, `&st`, `&wd` and `&sd` in a `.so` while leaving the
+# `static` and hidden siblings in the SAME object a bare `lea`). Its own target
+# beside the routing matrix because the SUBJECT differs: a call wants the entry
+# the format's dispatch names, an address wants the loader-filled slot's CONTENT,
+# and under `direct-plt` those are two different VAs of one import.
+dss_add_test(NAME lir/test_preemptible_definition_address
+             SOURCES test_preemptible_definition_address.cpp)

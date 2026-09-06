@@ -877,22 +877,54 @@ struct DSS_EXPORT MachOImage {
     std::vector<MachODylibRef> loadDylibs; // each → LC_LOAD_DYLIB
     // D-LK3-3 (c153): the MH_DYLIB LC_ID_DYLIB install name — the
     // identity a CLIENT records at link time and dyld resolves at its
-    // load (`@rpath/libdss.dylib` is the modern convention). REQUIRED
-    // non-empty on a Dylib schema and REJECTED on every other filetype
-    // (dead config there): every ld64-produced MH_DYLIB carries an
-    // LC_ID_DYLIB, and dyld's two-level-namespace client binding keys
-    // on it — emitting a dylib without one is an unverifiable-without-
-    // a-Mac corner this substrate does not ship. Config-driven + honest
-    // (the c150 DT_SONAME discipline): the walker NEVER derives the
-    // name from the output file name (it emits bytes and does not know
-    // it), and an unset field fails loud at validate() rather than
-    // silently inventing an identity. The shipped
-    // `macho64-arm64-darwin-dylib` schema declares a generic default
-    // (the same shipped-schema-identity concession as
-    // `codeSignature.identifier`); a differently-named artifact
-    // overrides via its own format JSON. Not needed for plain
-    // dlopen-by-path (dyld keys that on the path), but clients that
-    // LINK against the dylib record this string verbatim.
+    // load (`@rpath/${artifactFileName}` is what both shipped darwin
+    // dylib documents declare). REQUIRED non-empty on a Dylib schema
+    // and REJECTED on every other filetype (dead config there): every
+    // ld64-produced MH_DYLIB carries an LC_ID_DYLIB, and dyld's
+    // two-level-namespace client binding keys on it — emitting a dylib
+    // without one is an unverifiable-without-a-Mac corner this
+    // substrate does not ship. An unset field fails loud at validate()
+    // rather than silently inventing an identity.
+    //
+    // ⓘ THE ADJACENT QUESTION THIS ROW DID NOT SETTLE IS NOW SETTLED,
+    // and the pointer is kept because the ANSWER is the part worth
+    // reading. This block used to say `codeSignature.identifier` was
+    // still ONE constant per format and that whether it mattered "is
+    // NOT MEASURED and cannot be measured off a Mac". It was measured
+    // on a Mac, and it did matter — see
+    // D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT
+    // and the `codeSignature` field's own docblock below. ⚠ THE PROBE
+    // THIS BLOCK RECORDED WAS NOT SUFFICIENT AS WRITTEN — it named a
+    // DSS pair against "an ld64+codesign control", which varies the
+    // identifier AND the whole signature producer at once, so a passing
+    // result would have been equally consistent with "the identifier is
+    // harmless" and "DSS's signature is ignored". The run that settled
+    // it added the two arms that isolate the variable: the same DSS
+    // bytes with DISTINCT identifiers, and Apple's own toolchain FORCED
+    // to the shared one.
+    //
+    // ⚠ THIS COMMENT USED TO SAY, AS THE DISCIPLINE THAT KEPT THE FIELD
+    // HONEST, that "the walker NEVER derives the name from the output
+    // file name (it emits bytes and does not know it)", and that the
+    // shipped schema declares "a generic default … the same
+    // shipped-schema-identity concession as `codeSignature.identifier`".
+    // Both are now FALSE, and the second was the defect wearing a
+    // discipline's clothes: a single generic default meant every dylib
+    // DSS ever produced embedded ONE identity, so two of them loaded
+    // into one program collapsed to one. See
+    // D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT
+    // and `kArtifactFileNamePlaceholder` at the end of this header. The
+    // walker now RESOLVES the declared identity against the artifact
+    // named on the `ImageRequest`, so it does know which file it is
+    // producing — and a document may still declare a literal, which is
+    // then an explicit, config-visible choice (ld64's `-install_name`)
+    // rather than a code fallback. There is NO fallback: an emission
+    // that cannot name its artifact against a placeholder-bearing
+    // declaration is refused, never quietly given a constant.
+    //
+    // Not needed for plain dlopen-by-path (dyld keys that on the path),
+    // but clients that LINK against the dylib record this string
+    // verbatim.
     std::string   installName;
     // Eager-vs-lazy dynamic-binding choice (parallel to
     // `ElfIdentity.bindNow` — same semantic across ELF + Mach-O).
@@ -936,6 +968,47 @@ struct DSS_EXPORT MachOImage {
     // the legacy `codeSignatureSize`-only placeholder path (zero-fill)
     // is preserved unchanged. validate() rejects this block on a
     // MH_OBJECT (like the rest of the image block).
+    //
+    // ── D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ──
+    //
+    // ★ `identifier` NAMES THE ARTIFACT, through the SAME closed
+    // `${...}` vocabulary `installName` uses — one resolver, one
+    // vocabulary, and `kArtifactFileNamePlaceholder` at the end of this
+    // header is its only key. All four shipped darwin documents declare
+    // `com.dss.${artifactFileName}`; each used to declare a constant,
+    // so every artifact a format ever produced answered to one code
+    // identity.
+    //
+    // ★★ WHAT THE MEASUREMENT SAID, because "harmless" and "broken" are
+    // BOTH wrong here and the distinction is the whole finding. Four
+    // arms on Apple Silicon (macOS 26.6.2, ld-1267): two DSS dylibs
+    // sharing an identifier; the same two with distinct ones; an
+    // ld64+`codesign -s -` pair; and Apple's own pair FORCED to the
+    // shared identifier. NOTHING about loading is affected — both
+    // `dlopen`, both link into one executable, each resolves to its own
+    // file under `dladdr`, `codesign --verify` returns 0 on each — and
+    // the mechanism is that an ad-hoc DESIGNATED REQUIREMENT is
+    // CDHASH-keyed (`codesign -d -r-` prints `designated => cdhash
+    // H"…"` on both producers), so the identifier never reaches dyld's
+    // load path. What IS affected is identity-based requirement
+    // matching: a requirement `identifier "com.dss.dylib"` written for
+    // the first library ACCEPTS the second, where the same requirement
+    // over distinct identifiers REFUSES and a cdhash requirement over
+    // those same two files REFUSES. Apple's own ad-hoc signing derives
+    // the identifier per artifact (leaf name + LC_UUID), so the
+    // reference never produces one identity for two artifacts by
+    // itself. ⇒ not a load failure, and not harmless: two artifacts
+    // answering to one code identity, which is the only thing a
+    // constant in shared config can ever produce.
+    //
+    // ⚠ THE WALKER RESOLVES THIS ONCE INTO A LOCAL and reads that local
+    // twice — the reservation size (`adHocCodeSignatureSize`) and the
+    // blob (`buildAdHocCodeSignature`). Resolving twice is how a
+    // reservation stops matching its payload; the substrate invariant
+    // downstream would then fail loud on a defect one local prevents
+    // outright. There is no fallback: an emission that cannot name its
+    // artifact against a placeholder-bearing declaration is refused,
+    // because substituting something fixed IS the defect.
     std::optional<MachOCodeSignature> codeSignature;
     // LC_BUILD_VERSION platform / min-OS / SDK (D-LK10-ENTRY-MACHO-EXIT).
     // When set, BOTH Mach-O exec walkers emit a `build_version_command`
@@ -2807,5 +2880,89 @@ private:
     mutable std::once_flag                                   familyOnce_;
     mutable std::expected<RuntimeLibraryTable, std::string>  family_;
 };
+
+// ── D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ───────
+//
+// ★★★ THE ARTIFACT-IDENTITY PLACEHOLDER — the vocabulary that lets a format
+// document declare an identity string which is a FUNCTION OF THE ARTIFACT
+// BEING PRODUCED rather than one constant every artifact of that format
+// inherits.
+//
+// WHY IT HAD TO EXIST. A shipped `.format.json` states what is true of EVERY
+// image in that format, and an image's own RUNTIME IDENTITY — the Mach-O
+// LC_ID_DYLIB install name a client records and dyld later resolves — is not
+// such a fact: it is true of exactly ONE output. The two shipped darwin dylib
+// documents declared the literal `@rpath/libdss.dylib`, so every dylib DSS has
+// ever produced embedded the same identity. ✔MEASURED (cycle P62, lane `ff`'s
+// reproducer, re-run in this lane): two distinct DSS-built dylibs both named on
+// `--resolve-library` produced rc 0, ZERO diagnostics, and an executable
+// recording ONE `LC_LOAD_DYLIB @rpath/libdss.dylib` — the second library's
+// symbols simply absent at load — where the ELF control on the identical shape
+// recorded TWO correct `DT_NEEDED` entries. The recorder was right (it PREFERS
+// a binary's own embedded identity over its basename, which is what makes a
+// cross-compilation stand-in work); the two binaries were genuinely
+// indistinguishable, because the config said they were the same library.
+//
+// ★ THE PLACEHOLDER IS A CLOSED VOCABULARY, AND AN UNKNOWN ONE IS A REFUSAL.
+// `${artifactFileName}` is the whole set today. A `${...}` spelling that is not
+// in the set is REFUSED rather than passed through verbatim: a typo that
+// shipped as a literal would embed `${artifcatFileName}` in a binary's identity
+// and be discovered by a loader, months later, on someone else's machine.
+//
+// ★★ AND THE CLOSURE IS OVER THE SIGIL, NOT OVER `${`. This is the correction
+// that matters, and it was bought with a measurement. The first cut of this
+// vocabulary scanned for the two-character `${`, so `${...}` typos were refused
+// and EVERY OTHER DIALECT'S SPELLING SHIPPED SILENTLY. ✔MEASURED end to end
+// through the CLI against a hand-edited darwin dylib document (cycle P62, lane
+// `mo` remediation): `$(artifactFileName)` — Make's and shell's spelling —
+// `$artifactFileName` — sh's — `$ {artifactFileName}`, `$${artifactFileName}`,
+// a stray `a$b`, and a trailing `$` after a GOOD placeholder all produced rc 0,
+// zero diagnostics, and an artifact whose LC_ID_DYLIB was the author's mistake
+// verbatim. SIX spellings, every one of them the exact collapse this row
+// exists to end, reachable by a plausible typo. So:
+//   1. every `$` must open a well-formed `${key}` whose key is in the set —
+//      there is deliberately NO literal `$` and NO escape (`$$` is refused
+//      today, which leaves it free to MEAN a literal `$` later should a real
+//      use ever appear; widening a refusal is always available, narrowing an
+//      acceptance is not), and
+//   2. a key name spelled with NO sigil at all — `{artifactFileName}` — is
+//      refused as well, since the sigil scan has nothing to see there and an
+//      author who typed the key meant the substitution.
+// ⚠ Rule 2 is over-broad by one absurd case (an artifact honestly named
+// `artifactFileName.dylib`). Deliberate: the false positive is a loud
+// document-load diagnostic naming the fix, the false negative is a binary
+// shipping an identity nobody meant.
+//
+// ★ AND THERE IS NO FALLBACK, DELIBERATELY. A document whose identity names the
+// artifact and an emission that cannot say which artifact it is producing is a
+// contradiction, and the ONLY quiet way out of it is to substitute a constant —
+// which is the defect this vocabulary exists to end. The caller gets a refusal
+// REASON and fails loud in its own voice.
+//
+// ⓘ Returns a REASON rather than emitting a diagnostic because the schema tier
+// owns no diagnostic code: the WALKER that could not honour the declaration is
+// the tier that must name itself, its key path and its anchor. Same shape as
+// `assembleFlavourRuntimeLibraries` above.
+inline constexpr std::string_view kArtifactFileNamePlaceholder =
+    "${artifactFileName}";
+
+// True iff `declaredIdentity` carries the placeholder SIGIL `$` at all. On any
+// identity this substrate ACCEPTS the sigil and a well-formed known placeholder
+// coincide (rule 1 above), so this is exactly "does this identity depend on the
+// artifact being produced?" — the question a caller deciding whether an
+// emission owes an artifact name is really asking. A caller that must PRODUCE
+// the identity calls `resolveArtifactIdentity` and reads its refusal, which is
+// strictly more informative.
+[[nodiscard]] DSS_EXPORT bool
+declaresArtifactIdentityPlaceholder(std::string_view declaredIdentity) noexcept;
+
+// The declared identity with every placeholder replaced by the corresponding
+// fact about the artifact being produced. `artifactFileName` is the FILE NAME
+// (no directory) of the output this emission writes; EMPTY means the caller
+// could not say, which is a refusal whenever a placeholder is present and a
+// no-op when none is.
+[[nodiscard]] DSS_EXPORT std::expected<std::string, std::string>
+resolveArtifactIdentity(std::string_view declaredIdentity,
+                        std::string_view artifactFileName);
 
 } // namespace dss

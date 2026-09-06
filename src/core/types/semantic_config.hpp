@@ -3020,6 +3020,27 @@ struct DSS_EXPORT SemanticConfig {
     // c before TF-C73) — never a silent behavior change. Source-AGNOSTIC:
     // WHICH rule is per-language config; the engine never names `attrArgs`.
     RuleId attributeArgRule{};      std::string attributeArgRuleName;
+    // D-CSUBSET-ATTRIBUTE-ARG-CONSTANT-EXPRESSION: the rule that spells a CONSTANT
+    // EXPRESSION inside an attribute argument, and therefore the point at which the
+    // attribute-argument WRAPPER CHAIN ENDS.
+    //
+    // `attrClauseArgOperand` finds an `aligned(N)` operand by following the sole
+    // Internal child down from the `attributeArgRule` node. That descent is
+    // DEPTH-AGNOSTIC (a fixed depth already broke this path once) and it is correct
+    // for as long as every level it crosses is a transparent wrapper — an argument
+    // list, an argument item, an argument atom, or the nested argument group the
+    // double-paren form writes. It becomes WRONG the moment a level carries meaning:
+    // a `sizeof(T)` operand would be walked straight THROUGH, into the sizeof form
+    // and on into its type reference, handing the const-evaluator a type where an
+    // expression was written and refusing legal C for a reason no diagnostic could
+    // explain. This field names the ONE rule that is not transparent, so the descent
+    // stops on it.
+    //
+    // INVALID (the default, and every language that declares no such surface) ⇒ the
+    // descent behaves exactly as it did before this key existed — never a silent
+    // behavior change. Source-AGNOSTIC: WHICH rule is per-language config, and the
+    // engine never names it.
+    RuleId attributeArgExprRule{};  std::string attributeArgExprRuleName;
     // D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED:
     // the token kinds admissible as an attribute clause NAME, resolved from the
     // document's `tokenClasses.<clauseNameTokenClass>` — the SAME declaration the

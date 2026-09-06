@@ -512,6 +512,51 @@ visibleChildren(Tree const& tree, NodeId parent) {
     return out;
 }
 
+// ★★ [[D-C-SPECIFIER-PREFIX-TOKEN-SCANS-READ-AN-ERROR-NODE-AS-A-TOKEN]] — THE ONE
+// ANSWER to "visit every TOKEN leaf under `root`", shared by every specifier-prefix
+// scan below.
+//
+// ★ IT EXISTS BECAUSE `NodeKind` HAS THREE ARMS AND SIX SCANS ASSUMED TWO. Each of
+// them walked a bounded descendant stack shaped
+// `if (kind == Internal) { push children; continue; } <read it as a Token>`, which
+// treats `NodeKind::Error` — the parser's error-recovery node — as a Token. On such
+// a node `Tree::tokenKind` reads the WRONG ARM of the node's discriminated union:
+// in a debug build its assert fires and ABORTS THE PROCESS; in a release build
+// there is no assert at all, so it returns whatever the union happens to hold and
+// the scan can silently decide a declaration is `_Noreturn` / `constexpr` /
+// `inline` when the source never said so. That is a silent MISREAD in the tier
+// whose whole contract is fail-loud, and it is one predicate away from correct.
+// ✔MEASURED, and the instrument was the harness: a corpus fixture whose attribute
+// argument fails to parse (`__attribute__((__aligned__(2 +)))`) reaches
+// `scanNoreturnSpelling` through `analyze()` and kills the whole
+// `analysis/test_diagnostic_corpus` BINARY with `0xc0000409` at its first fixture,
+// taking every other fixture's verdict with it — the P58 88-pin class. gdb named
+// the frame; nothing else in the transcript did.
+//
+// ★ WHY A HELPER RATHER THAN SIX ADDED `if`s: N copies of one walk is N chances to
+// forget the third arm, and the sixth copy is how this one survived five reviews.
+// The token test lives HERE now, once. A node that is neither Internal nor Token
+// is an Error node and is SKIPPED — it carries its own ParseDiagnostic, so the
+// refusal is already reported and a specifier scan has nothing to learn from it.
+// `guardBudget` keeps the caller's existing bound (an input-proportional walk is
+// heap, not host stack — [[D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED]]).
+// `fn` returns false to STOP the walk early (the callers that answer a yes/no
+// question), true to continue.
+template <typename Fn>
+void forEachTokenLeafUnder(Tree const& tree, NodeId root, int guardBudget, Fn&& fn) {
+    if (!root.valid()) return;
+    std::vector<NodeId> stack{root};
+    for (int guard = 0; guard < guardBudget && !stack.empty(); ++guard) {
+        NodeId const c = stack.back(); stack.pop_back();
+        if (tree.kind(c) == NodeKind::Internal) {
+            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+            continue;
+        }
+        if (tree.kind(c) != NodeKind::Token) continue;   // Error node — skip
+        if (!fn(c)) return;
+    }
+}
+
 // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: does this node have a VISIBLE CHILD
 // of the given rule? The dual-mode discriminator for the unified composite
 // specifier — `structSpec` is a DEFINITION when it has a `structBody` child,
@@ -4845,14 +4890,7 @@ void scanNoreturnSpelling(SemanticConfig const& cfg, Tree const& tree,
     bool const haveKeyword = cfg.noreturnKeywordToken.has_value()
                           && cfg.noreturnKeywordToken->valid();
     if (!haveKeyword && cfg.noreturnAttributeNames.empty()) return;
-    if (!root.valid()) return;
-    std::vector<NodeId> stack{root};
-    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
-        NodeId c = stack.back(); stack.pop_back();
-        if (tree.kind(c) == NodeKind::Internal) {
-            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
-            continue;
-        }
+    forEachTokenLeafUnder(tree, root, 8192, [&](NodeId c) {
         // (a) the `_Noreturn` KEYWORD token.
         if (haveKeyword && tree.tokenKind(c).v == cfg.noreturnKeywordToken->v)
             out.keyword = true;
@@ -4863,8 +4901,8 @@ void scanNoreturnSpelling(SemanticConfig const& cfg, Tree const& tree,
             for (std::string const& nm : cfg.noreturnAttributeNames)
                 if (id == nm) out.attribute = true;
         }
-        if (out.keyword && out.attribute) break;   // both found — done
-    }
+        return !(out.keyword && out.attribute);   // both found — done
+    });
 }
 
 [[nodiscard]] NoreturnSpelling
@@ -5113,17 +5151,13 @@ specifierPrefixHasConstexpr(SemanticConfig const& cfg, Tree const& tree,
         return false;
     }
     NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
-    if (!prefix.valid()) return false;
-    std::vector<NodeId> stack{prefix};
-    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
-        NodeId c = stack.back(); stack.pop_back();
-        if (tree.kind(c) == NodeKind::Internal) {
-            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
-            continue;
-        }
-        if (tree.tokenKind(c).v == cfg.constexprKeywordToken->v) return true;
-    }
-    return false;
+    bool found = false;
+    forEachTokenLeafUnder(tree, prefix, 8192, [&](NodeId c) {
+        if (tree.tokenKind(c).v != cfg.constexprKeywordToken->v) return true;
+        found = true;
+        return false;
+    });
+    return found;
 }
 
 // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): true iff a declaration's
@@ -5151,21 +5185,16 @@ specifierPrefixHasInline(SemanticConfig const& cfg, Tree const& tree,
         return false;
     }
     NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
-    if (!prefix.valid()) return false;
     bool sawInline = false;
-    std::vector<NodeId> stack{prefix};
-    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
-        NodeId c = stack.back(); stack.pop_back();
-        if (tree.kind(c) == NodeKind::Internal) {
-            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
-            continue;
-        }
+    bool sawExtern = false;
+    forEachTokenLeafUnder(tree, prefix, 8192, [&](NodeId c) {
         SchemaTokenId const kind = tree.tokenKind(c);
-        if (kind.v == cfg.inlineKeywordToken->v) { sawInline = true; continue; }
+        if (kind.v == cfg.inlineKeywordToken->v) { sawInline = true; return true; }
         for (SchemaTokenId ex : cfg.inlineExternSpecifierTokens)
-            if (kind == ex) return false;
-    }
-    return sawInline;
+            if (kind == ex) { sawExtern = true; return false; }
+        return true;
+    });
+    return sawInline && !sawExtern;
 }
 
 // TLS C1 (D-CSUBSET-THREAD-LOCAL): the storage-duration facts folded from ONE
@@ -5405,19 +5434,14 @@ firstPrefixTokenOfKinds(Tree const& tree, NodeId declNode,
                         std::vector<SchemaTokenId> const& kinds) {
     if (kinds.empty()) return {};
     NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
-    if (!prefix.valid()) return {};
-    std::vector<NodeId> stack{prefix};
-    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
-        NodeId c = stack.back(); stack.pop_back();
-        if (tree.kind(c) == NodeKind::Internal) {
-            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
-            continue;
-        }
+    NodeId hit{};
+    forEachTokenLeafUnder(tree, prefix, 8192, [&](NodeId c) {
         for (SchemaTokenId k : kinds) {
-            if (tree.tokenKind(c).v == k.v) return c;
+            if (tree.tokenKind(c).v == k.v) { hit = c; return false; }
         }
-    }
-    return {};
+        return true;
+    });
+    return hit;
 }
 
 // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): the standard-attribute
@@ -5508,6 +5532,22 @@ struct AttributeSemanticsFacts {
 // Returns an INVALID NodeId when the clause has no argument group at all (bare
 // `__attribute__((aligned))`) or an EMPTY one (`aligned()`) — the caller FAILS
 // LOUD on both rather than guessing "maximum useful alignment".
+//
+// ★★ D-CSUBSET-ATTRIBUTE-ARG-CONSTANT-EXPRESSION — WHERE THE DESCENT STOPS, AND
+// WHY IT NEEDED A DECLARATION RATHER THAN A DEPTH.
+//
+// "Follow the sole Internal child" is right for as long as every level it crosses
+// is a TRANSPARENT WRAPPER, which was true of every attribute argument this
+// grammar admitted before P62 (an atom bottomed out on a TOKEN, so the loop simply
+// ran out of Internal children). The moment an argument may be a CONSTANT
+// EXPRESSION that stops being true: `aligned(sizeof(T))`'s wrappers bottom out on
+// an expression node whose own sole Internal child is the sizeof FORM, whose sole
+// Internal child is a TYPE REFERENCE — so an unguarded descent walks past the
+// operand and hands the const-evaluator a type where the program wrote an
+// expression, refusing legal C with a diagnostic that points at neither.
+// `cfg.attributeArgExprRule` names the one rule that is not transparent; the loop
+// stops ON it and the caller's own one-level unwrap yields the expression. INVALID
+// (a language declaring no such surface) ⇒ the loop is exactly what it was.
 [[nodiscard]] NodeId attrClauseArgOperand(SemanticConfig const& cfg,
                                           Tree const& tree, NodeId clauseNode) {
     if (!cfg.attributeArgRule.valid() || !clauseNode.valid()) return {};
@@ -5519,6 +5559,8 @@ struct AttributeSemanticsFacts {
     if (!group.valid()) return {};
     NodeId cur = group;
     for (int guard = 0; guard < 32; ++guard) {
+        if (cfg.attributeArgExprRule.valid()
+            && tree.rule(cur).v == cfg.attributeArgExprRule.v) break;
         NodeId only{};
         int n = 0;
         for (NodeId c : visibleChildren(tree, cur)) {
@@ -9452,18 +9494,13 @@ resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
         bool found = false;
         NodeId const prefix = specifierPrefixChild(tree, node, decl);
         if (prefix.valid()) {
-            std::vector<NodeId> stack{prefix};
-            for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
-                NodeId c = stack.back(); stack.pop_back();
-                if (tree.kind(c) == NodeKind::Internal) {
-                    for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
-                    continue;
-                }
+            forEachTokenLeafUnder(tree, prefix, 8192, [&](NodeId c) {
                 if (tree.tokenKind(c).v == decl.requiredSpecifierToken->v) {
                     found = true;
-                    break;
+                    return false;
                 }
-            }
+                return true;
+            });
         }
         if (!found) {
             emit(DiagnosticCode::S_AutoInferenceInvalid, node,
@@ -9527,6 +9564,10 @@ resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
                 plain = false;   // fnSuffix / arrayDeclSuffix / parenDeclarator
                 break;
             }
+            // Explicitly TOKEN, never "not Internal": the third `NodeKind` arm is
+            // `Error`, and reading its `tokenKind` is the wrong union arm — see
+            // `forEachTokenLeafUnder`.
+            if (tree.kind(c) != NodeKind::Token) continue;
             if (tree.tokenKind(c) == dc.nameToken) haveName = true;
         }
         plain = plain && haveName;

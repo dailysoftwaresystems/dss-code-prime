@@ -108,6 +108,19 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                    "import-table entries require a non-empty symbol name.");
         }
         declare(ext.symbol, SymbolKind::Extern, "extern import");
+        // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING (the ADDRESS half):
+        // an import may carry a SECOND module-local symbol naming the slot that
+        // holds its loader-resolved address (`ExternImport::addressSlotSymbol`).
+        // It is DECLARED here for the same reason a synthetic block symbol is:
+        // the per-CU relocation-resolvability check below is what turns a
+        // dangling mint into a loud link error instead of a zero address at run
+        // (D-LINK-MERGE-DOES-NOT-REMAP-BLOCK-SYMBOLS is the shape of that
+        // failure). It is `Extern` because it names the same loader-resolved
+        // identity — the per-format walker assigns its VA alongside the import's.
+        if (ext.addressSlotSymbol.valid()) {
+            declare(ext.addressSlotSymbol, SymbolKind::Extern,
+                    "extern import address slot");
+        }
     }
 }
 
@@ -209,6 +222,15 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     AssembledModule const& m,
     AssembledModule&       filtered,
     bool                   allowUndefinedExterns,
+    // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: does the FORMAT'S WALKER
+    // encode a reference the loader resolves from its global coalescing scope?
+    // A separate permission from `allowUndefinedExterns`, because the two
+    // answer different questions: that one asks whether an artifact of this
+    // FLAVOUR may carry an undefined symbol at all; this one asks whether the
+    // BYTES for one specific, fully-defined-here shape exist. A Mach-O dylib
+    // says no to the first and yes to the second, which is exactly the
+    // combination the preemption arm below has to distinguish.
+    bool                   realizesCoalescingScopeReferences,
     std::uint64_t          pointerBytes,
     DiagnosticReporter&    reporter) {
     // Candidate test: does ANY named import need the gate — i.e. is there a
@@ -242,6 +264,20 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     }
     for (auto const& di : m.dataItems) {
         for (auto const& rel : di.relocations) referenced.insert(rel.target.v);
+    }
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING (the ADDRESS half): a
+    // reference to an import's ADDRESS SLOT is a reference to the IMPORT. A
+    // module that only ever takes `&w` (never calls it) names the slot symbol in
+    // every relocation and the import's own symbol in none — so without this
+    // fold the row would be read as unreferenced and DROPPED, and the slot the
+    // walker mints for it would go with it, leaving a relocation pointing at
+    // nothing. The two symbols are one identity; the scan is told so once here
+    // rather than at each of the three decisions below.
+    for (auto const& ext : m.externImports) {
+        if (ext.addressSlotSymbol.valid()
+            && referenced.contains(ext.addressSlotSymbol.v)) {
+            referenced.insert(ext.symbol.v);
+        }
     }
     bool anyDrop = false;
     // ★★ D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the imports this link
@@ -290,14 +326,39 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                 // lines away in its own symbol table, and telling an author to
                 // "link a definition" for a symbol they just defined sends them
                 // hunting for a bug that is ours.
-                if (!allowUndefinedExterns && ext.isPreemptionReference) {
+                // ⚠ AND THE REFUSAL IS NOW CONDITIONAL ON THE WALKER, which
+                // is the half this gate could not see when it was written:
+                // "this format's artifacts cannot carry a reference resolved
+                // from the loader's GLOBAL scope" is a statement about the
+                // BYTES ITS WALKER WRITES, not about its schema. Mach-O's
+                // walker gained exactly those bytes (the LC_DYLD_INFO_ONLY
+                // weak-bind stream / the chained `<weak-def-coalesce>`
+                // ordinal), so such a row now passes through to it. A backend
+                // that has NOT gained them still refuses here, by name —
+                // `realizesCoalescingScopeReferences()` defaults to FALSE, so
+                // silence is never the default answer.
+                if (!allowUndefinedExterns && ext.isPreemptionReference
+                    && realizesCoalescingScopeReferences) {
+                    // ★★ KEPT — the walker writes the bytes. This arm must be
+                    // its OWN branch and not a relaxed condition on the refusal
+                    // below it: the chain's tail rejects every remaining
+                    // unbound row, so a preemption reference that merely
+                    // stopped matching the refusal would fall through and be
+                    // rejected as "no linked compilation unit defines it" — a
+                    // report that is FALSE (the module defines it three lines
+                    // away) and points the author at a bug that is ours.
+                    // ✔MEASURED: exactly that happened on the first cut of this
+                    // change, and the darwin dylib refused with the generic
+                    // undefined-symbol message instead of linking.
+                } else if (!allowUndefinedExterns && ext.isPreemptionReference) {
                     report(reporter, DiagnosticCode::K_SymbolUndefined,
                            DiagnosticSeverity::Error,
-                           "cannot route the call to '" + ext.mangledName
+                           "cannot route the reference to '" + ext.mangledName
                            + "' — this artifact DEFINES that symbol, and the "
                              "active object format declares its binding "
                              "PREEMPTIBLE ('preemptibleDefinitionBindings'), so "
-                             "a call made inside the artifact must be resolved "
+                             "a reference made inside the artifact — a CALL to "
+                             "it, or its ADDRESS taken — must be resolved "
                              "by the LOADER rather than branched to the local "
                              "body: another image in the process may define the "
                              "same name and win, and an image that branched to "
@@ -307,7 +368,8 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                              "resolved from the loader's GLOBAL scope — every "
                              "import here binds against a NAMED library — so "
                              "the routed reference has nowhere to go. Refusing "
-                             "rather than emitting the direct branch, which "
+                             "rather than emitting the direct branch (or, for "
+                             "an address, the local body's own VA), which "
                              "compiles, links, loads and silently answers the "
                              "wrong question. Remove "
                              "'preemptibleDefinitionBindings' from this "
@@ -1482,6 +1544,19 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                 if (firstOfItsKind) {
                     ExternImport out = ext;
                     out.symbol = SymbolId{mergedIdFor(i, ext.symbol)};  // the CANONICAL id
+                    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING (the
+                    // ADDRESS half): the second symbol is remapped TOO, exactly
+                    // as `AssembledFunction::blockSymbols` are and for exactly
+                    // the reason D-LINK-MERGE-DOES-NOT-REMAP-BLOCK-SYMBOLS
+                    // names — `ExternImport out = ext` copies it VERBATIM, so a
+                    // row left un-remapped would DECLARE the old per-CU id while
+                    // `retargetRelocs` asked for the new one, and the address
+                    // relocation would resolve against nothing. Invisible in a
+                    // single-CU build, where the mint is the identity.
+                    if (ext.addressSlotSymbol.valid()) {
+                        out.addressSlotSymbol =
+                            SymbolId{mergedIdFor(i, ext.addressSlotSymbol)};
+                    }
                     combined.externImports.push_back(std::move(out));
                     continue;
                 }
@@ -1551,14 +1626,61 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                 // onto the definition it names, and a merged row that lost it would
                 // restore the direct branch silently, in a multi-object link only.
                 // Order-INDEPENDENT (the `isEagerImport` OR one field group up).
-                // ⓘ The two kinds are not reachable in one dedup group TODAY — an
-                // ordinary unbound reference to a name some CU defines is STRIPPED by
-                // `resolveCrossCuSymbols` before it reaches here, and a preemption row
-                // exists only where that definition exists — so this fold is a
-                // fail-SAFE, not a live path. It is written because the alternative
-                // failure is silent and the guard costs one `||`.
+                // ⓘ THE DEDUP GROUP ITSELF IS A LIVE PATH, and an earlier note here
+                // said it was not. ✔MEASURED 2026-09-06 (shipped CLI,
+                // `elf64-x86_64-linux-dyn`): two translation units that EACH define
+                // `__attribute__((weak)) int w(void)` and EACH take `&w` is legal C,
+                // DSS accepts it (rc 0), and both CUs mint a preemption row for the
+                // one name — so two such rows meet here, and the `addressSlotSymbol`
+                // fold immediately below is what turns their two slot symbols into
+                // the ONE slot the loader fills. The emitted artifact carries exactly
+                // one `R_X86_64_GLOB_DAT w`, which is also exactly what gcc 13.3.0
+                // emits for the same two sources.
+                // What is NOT reachable today is the MIXED group — an ORDINARY
+                // unbound reference beside a preemption row — because an ordinary
+                // unbound reference to a name some CU defines is STRIPPED by
+                // `resolveCrossCuSymbols` before it reaches here. In the live
+                // all-preemption group this `||` is a no-op (both sides are already
+                // true); it is written for the mixed group, whose alternative failure
+                // is silent and whose guard costs one `||`.
                 kept.isPreemptionReference =
                     kept.isPreemptionReference || ext.isPreemptionReference;
+                // ★★ ...AND THE ADDRESS SLOT FOLDS ONTO THE KEPT ROW'S. Two CUs
+                // that each take `&w` mint their OWN slot symbol for one dynamic
+                // symbol; the loader fills ONE slot, so the losing CU's
+                // relocations must be retargeted at the kept row's — the same
+                // pre-seeding of `remap` the retarget above performs for the
+                // import's own symbol. A row that had no slot ADOPTS the
+                // incoming one (one is enough and the two name one identity);
+                // the direction cannot lose a slot a CU is relying on.
+                if (ext.addressSlotSymbol.valid()) {
+                    if (!kept.addressSlotSymbol.valid()) {
+                        kept.addressSlotSymbol =
+                            SymbolId{mergedIdFor(i, ext.addressSlotSymbol)};
+                    } else {
+                        LinkedSymbolKey const slotKey{
+                            modules[i].cuId, ext.addressSlotSymbol};
+                        if (auto const [sit, fresh] =
+                                remap.emplace(slotKey,
+                                              kept.addressSlotSymbol.v);
+                            !fresh && sit->second
+                                          != kept.addressSlotSymbol.v) {
+                            report(reporter, DiagnosticCode::K_SymbolUndefined,
+                                   DiagnosticSeverity::Error,
+                                   "extern import \"" + ext.mangledName +
+                                   "\" (CU #" +
+                                   std::to_string(modules[i].cuId.v) +
+                                   ") already maps its address slot to merged "
+                                   "id " + std::to_string(sit->second) +
+                                   " but its dedup group canonicalizes that "
+                                   "slot to " +
+                                   std::to_string(kept.addressSlotSymbol.v) +
+                                   " — one dynamic symbol has one "
+                                   "loader-resolved address slot. "
+                                   "D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING.");
+                        }
+                    }
+                }
                 // Every remaining ExternImport field is accounted for: `symbol` IS the
                 // dedup output (replaced by the canonical merged id above), and
                 // `mangledName` / `libraryPath` / `version` are the KEY, hence equal
@@ -1854,8 +1976,11 @@ LinkedImage link(std::span<AssembledModule const> modules,
         std::uint64_t const ptrBytes =
             scalarByteSize(TypeKind::Ptr, objectFormatSchema.dataModel())
                 .value_or(8);
+        auto const* const fmtBackend = objectFormatSchema.backend();
         if (!rejectOrDropUnreferencedExterns(*selectedInput, unboundFilteredStorage,
                                         objectFormatSchema.allowsUndefinedImports(),
+                                        fmtBackend != nullptr
+                                            && fmtBackend->realizesCoalescingScopeReferences(),
                                         ptrBytes, reporter)) {
             selectedInput = &unboundFilteredStorage;
         }

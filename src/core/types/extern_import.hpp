@@ -254,6 +254,37 @@ struct DSS_EXPORT ExternImport {
     // GLOB_DAT; the shape ld emits for the same source). Nothing downstream
     // needs a second mechanism — only permission not to fold it away.
     bool isPreemptionReference = false;
+
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING, THE ADDRESS HALF: a
+    // SECOND, module-local SymbolId bound by the format walker to the VA of the
+    // SLOT that holds this import's loader-resolved ADDRESS. Invalid (the
+    // default) on every import that does not need one, so a producer that mints
+    // none leaves every tier byte-identical.
+    //
+    // ★ WHY A SECOND SYMBOL AND NOT A SECOND ROW. One dynamic symbol is one
+    // import — `dedupKey` says so and the `isData` conflict enforces it — so a
+    // name that is both CALLED and ADDRESSED inside one artifact cannot be two
+    // rows. What differs between the two uses is not the symbol but WHICH of the
+    // import's realizations the reference wants:
+    //   * the CALL wants the entry the format's `externCallDispatch` names — a
+    //     PLT stub under `direct-plt`, the slot itself under `indirect-slot`;
+    //   * the ADDRESS wants the SLOT's CONTENT, always, because a pointer to a
+    //     call thunk is not the function's address and comparing it against the
+    //     same name taken in another image would answer false (C 6.2.2p2 gives
+    //     one identifier one object/function across the program).
+    // Under `indirect-slot` the two coincide — `symbol` IS the slot — and the
+    // field stays invalid; under `direct-plt` they are two different VAs of one
+    // import, and this is the second one. The precedent is
+    // `AssembledFunction::blockSymbols`: a row carrying extra module-local
+    // symbols the walker gives VAs, remapped through the merge exactly the same
+    // way (D-LINK-MERGE-DOES-NOT-REMAP-BLOCK-SYMBOLS is what happens when that
+    // remap is skipped).
+    //
+    // ⚠ A walker that does not bind it FAILS LOUD rather than mis-binding: the
+    // symbol is declared in the compound index, so a relocation naming a VA the
+    // walker never assigned is a resolution error at link, never a zero address
+    // at run.
+    SymbolId addressSlotSymbol{};
 };
 
 } // namespace dss

@@ -13765,10 +13765,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // Closed keys (typo discriminator) — the `$`-prefixed
                     // documentation convention stays exempt, exactly as in
                     // `declarators` and the enclosing `semantics` object.
-                    static constexpr std::array<std::string_view, 6>
+                    static constexpr std::array<std::string_view, 7>
                         kAttributeSemanticsKeys{"attrSpecRule", "stdAttrRule",
                                                 "bareStatementRule", "effects",
                                                 "attributeArgRule",
+                                                "attributeArgExprRule",
                                                 "clauseNameTokenClass"};
                     DSS_CHECK_KEY_VOCABULARY(kAttributeSemanticsKeys);
                     (void)checkKeysAgainst(
@@ -13840,6 +13841,57 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             } else {
                                 cfg.attributeArgRule = data.rules->find(nm);
                                 cfg.attributeArgRuleName = std::move(nm);
+                            }
+                        }
+                    }
+                    // D-CSUBSET-ATTRIBUTE-ARG-CONSTANT-EXPRESSION: the rule that
+                    // spells a CONSTANT EXPRESSION inside an attribute argument —
+                    // the point where the argument WRAPPER CHAIN ends and the
+                    // alignment-operand descent must stop. OPTIONAL for the same
+                    // reason `attributeArgRule` is: a language may declare an
+                    // attribute surface whose arguments are atoms only, and ABSENT
+                    // must keep that descent byte-identical to its pre-key
+                    // behaviour rather than refuse to load.
+                    // ★ PRESENT-BUT-UNKNOWN IS LOUD (C_UnknownShape), and here that
+                    // is worth more than usual: a silently-invalid rule id would
+                    // restore the walk-through-the-operand bug this key exists to
+                    // stop, and the symptom is a REFUSAL OF LEGAL C whose diagnostic
+                    // points at a type reference the program never wrote.
+                    // ⚠ DEPENDENT, NOT INDEPENDENT: the descent this steers only
+                    // runs from an `attributeArgRule` node, so declaring an
+                    // expression rule without an argument rule is dead config —
+                    // C_InvalidSemantics rather than a key that quietly does
+                    // nothing. The reverse is fine and is the pre-P62 state.
+                    if (as.contains("attributeArgExprRule")) {
+                        json const& xr = as.at("attributeArgExprRule");
+                        if (!xr.is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/attributeSemantics/"
+                                      "attributeArgExprRule",
+                                      "'attributeArgExprRule' must be a string "
+                                      "naming the attribute-argument "
+                                      "constant-expression shape");
+                        } else if (!cfg.attributeArgRule.valid()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/attributeSemantics/"
+                                      "attributeArgExprRule",
+                                      "'attributeArgExprRule' is meaningless without "
+                                      "'attributeArgRule': the operand descent it "
+                                      "stops only runs from an attribute-argument "
+                                      "group");
+                        } else {
+                            std::string nm = xr.get<std::string>();
+                            if (!data.rules->contains(nm)) {
+                                coll.emit(DiagnosticCode::C_UnknownShape,
+                                          "/semantics/attributeSemantics/"
+                                          "attributeArgExprRule",
+                                          std::format("'attributeSemantics."
+                                                      "attributeArgExprRule' "
+                                                      "references unknown shape '{}'",
+                                                      nm));
+                            } else {
+                                cfg.attributeArgExprRule = data.rules->find(nm);
+                                cfg.attributeArgExprRuleName = std::move(nm);
                             }
                         }
                     }

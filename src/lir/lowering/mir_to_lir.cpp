@@ -1111,11 +1111,26 @@ struct Lowerer {
     // read the DEFINITION's own binding + visibility. Built only when the
     // format declares at least one preemptible binding.
     std::unordered_map<std::uint32_t, MirFuncId> funcBySymbol_;
+    // ★★ THE ADDRESS HALF: the same question asked of a DATA definition. A
+    // module global carries the identical two facts (`mir.globalBinding` /
+    // `mir.globalVisibility`), and ✔MEASURED 2026-09-05 gcc 13.3.0 and clang
+    // 18.1.3 route `&exported_global` inside a `.so` through a
+    // `R_X86_64_GLOB_DAT` GOT slot for exactly the reason they route
+    // `&exported_function` — one identifier, one object, across the whole
+    // program (C 6.2.2p2). The predicate reads BOTH tables so the rule has one
+    // owner rather than a function copy and a data copy.
+    std::unordered_map<std::uint32_t, MirGlobalId> globalBySymbol_;
     // Memo: defined symbol → the SymbolId of the loader-resolved reference this
     // lowering minted for it. ONE reference per name per module — every call
     // site to the same preemptible definition shares it, exactly as every call
     // to one extern shares that extern's row.
     std::unordered_map<std::uint32_t, SymbolId> preemptionImportBySymbol_;
+    // Memo: defined symbol → the SymbolId whose VA is the SLOT holding that
+    // name's loader-resolved ADDRESS. Under an `indirect-slot` dispatch this is
+    // the reference's own symbol (its VA already IS the slot); under
+    // `direct-plt` it is the reference's `addressSlotSymbol`, because there the
+    // reference's VA is a call thunk. One per definition, like the reference.
+    std::unordered_map<std::uint32_t, SymbolId> preemptionSlotBySymbol_;
 
     // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the ACTIVE format's
     // extern-ADDRESS binding + the derived set of extern SymbolIds whose
@@ -1436,6 +1451,14 @@ struct Lowerer {
                 MirFuncId const f = mir.funcAt(fi);
                 funcBySymbol_.emplace(mir.funcSymbol(f).v, f);
             }
+            // ★★ THE ADDRESS HALF: module GLOBALS join the same table, for the
+            // same declared reason. A `.so`'s own exported data object is
+            // replaceable by the loader exactly as its exported function is,
+            // and both references materialize `&it` through the GOT there.
+            for (std::size_t gi = 0; gi < mir.moduleGlobalCount(); ++gi) {
+                MirGlobalId const g = mir.globalAt(gi);
+                globalBySymbol_.emplace(mir.globalSymbol(g).v, g);
+            }
             for (auto const& d : definedSymbolNames) {
                 if (d.name.empty()) continue;   // synthesized: no loader name
                 definedNameBySymbol_.emplace(d.symbol.v, d.name);
@@ -1686,18 +1709,72 @@ struct Lowerer {
     //     only `weak`. Hard-coding either would put DSS below one reference
     //     union or above the other.
     //
-    // A symbol that is not a defined function of THIS module answers false —
-    // an extern reference is already routed by the extern machinery, and
-    // routing it twice is not expressible.
-    [[nodiscard]] bool calleeIsPreemptible(SymbolId s) const noexcept {
+    // A symbol that is not a definition of THIS module answers false — an
+    // extern reference is already routed by the extern machinery, and routing
+    // it twice is not expressible.
+    //
+    // ★★ IT ASKS THE SAME QUESTION OF A DATA DEFINITION, AND THE REASON IS A
+    // MEASUREMENT, NOT A GENERALIZATION. The call half read only
+    // `funcBySymbol_`, which was the whole subject it had. ✔MEASURED 2026-09-05
+    // (gcc 13.3.0, clang 18.1.3, one `.so` each, with a `static` and a
+    // `visibility("hidden")` sibling as the in-object control and the same
+    // source as a `-pie`/`-no-pie` executable as the out-of-object control):
+    // `&exported_data` inside a `.so` loads a `R_X86_64_GLOB_DAT` GOT slot in
+    // BOTH references, weak and strong global alike, exactly as
+    // `&exported_function` does — and the `static` / hidden siblings are a bare
+    // `lea` in the same object. Binding and visibility are the discriminator for
+    // a data definition and a function definition alike, so ONE predicate reads
+    // both tables rather than a function copy and a data copy that could drift.
+    //
+    // ★★★ AN ON-BINARY NAME IS A PRECONDITION OF PREEMPTIBILITY, NOT AN
+    // ACCIDENT OF IT — asked FIRST, before either table, and universally.
+    // A LOADER RESOLVES A REFERENCE BY NAME: a definition that carries no
+    // on-binary spelling is in no image's dynamic export set, so no loader can
+    // see it and none can replace it, whatever its binding and visibility say.
+    // The link tier states the identical rule for the identical reason
+    // (`link::format::collectPreemptibleDefinitions` in `exec_data_section.hpp`
+    // skips a nameless `module.symbols` row); the two tiers read different data
+    // models — MIR ids against interned names here, `AssembledModule` rows there
+    // — so the rule is spelled once per model and cross-referenced rather than
+    // re-derived, and moving one without the other is what would look like a
+    // drift.
+    //
+    // ✔MEASURED 2026-09-06, and this is not hypothetical: `hir_to_mir.cpp` mints
+    // the string-literal POOL global and the promoted FLOAT-CONSTANT global with
+    // `SymbolBinding::Global` + `SymbolVisibility::Default` and a SymbolId seeded
+    // past the whole semantic id space, so `nameOf` on it is "". That is exactly
+    // the (binding, visibility) pair the shipped ELF dyn documents declare
+    // preemptible — so without this precondition
+    // `const char *greet(void){ return "hello, world"; }` was a HARD REFUSAL at
+    // `elf64-x86_64-linux-dyn` and `elf64-aarch64-linux-dyn` (rc 1) while
+    // compiling at rc 0 on every format that declares no set. Every reference
+    // compiles that program. The precondition also closes the same latent hole
+    // on the FUNCTION side, which no shipped input reaches today.
+    //
+    // WHY IT CANNOT SILENTLY DISABLE THE ROUTING (the fail-toward-wrong-answer
+    // direction, which is the one worth checking): `definedNameBySymbol_` is
+    // built from `definedSymbolNames`, and its producer walks the SAME
+    // `moduleFuncCount()` + `moduleGlobalCount()` enumeration that fills
+    // `funcBySymbol_` / `globalBySymbol_`, differing ONLY by skipping an empty
+    // `nameOf`. So the precondition can subtract exactly the nameless entries
+    // and nothing else.
+    [[nodiscard]] bool symbolIsPreemptibleDefinition(SymbolId s) const noexcept {
         if (preemptibleDefinitionBindings_.empty()) return false;
-        auto const it = funcBySymbol_.find(s.v);
-        if (it == funcBySymbol_.end()) return false;
+        if (!definedNameBySymbol_.contains(s.v)) return false;
         // The RULE has ONE owner (`core/types/symbol_attrs.hpp`); this
         // only supplies the DEFINITION's two facts out of MIR.
-        return ::dss::definitionIsPreemptible(
-            mir.funcBinding(it->second), mir.funcVisibility(it->second),
-            preemptibleDefinitionBindings_);
+        if (auto const it = funcBySymbol_.find(s.v); it != funcBySymbol_.end()) {
+            return ::dss::definitionIsPreemptible(
+                mir.funcBinding(it->second), mir.funcVisibility(it->second),
+                preemptibleDefinitionBindings_);
+        }
+        if (auto const it = globalBySymbol_.find(s.v);
+            it != globalBySymbol_.end()) {
+            return ::dss::definitionIsPreemptible(
+                mir.globalBinding(it->second), mir.globalVisibility(it->second),
+                preemptibleDefinitionBindings_);
+        }
+        return false;
     }
 
     [[nodiscard]] std::optional<std::uint16_t> opcode(MnemonicSlot s) const {
@@ -7129,18 +7206,30 @@ struct Lowerer {
             it != preemptionImportBySymbol_.end()) {
             return it->second;
         }
+        // ★ A STRUCTURAL BACKSTOP, NO LONGER A REACHABLE PATH — and it is kept
+        // deliberately. `symbolIsPreemptibleDefinition` now REFUSES a nameless
+        // definition outright (a loader resolves by name, so a nameless
+        // definition is preemptible by nobody), and every caller of this
+        // function is gated on that predicate — so an in-tree program cannot
+        // reach this branch any more. It stays because the alternative failure
+        // is SILENT: a future caller that reached here without the predicate,
+        // or a producer that stopped supplying a name for a definition that has
+        // one, would otherwise fall through to the direct branch, which is the
+        // divergence this routing exists to remove. The message therefore says
+        // REFERENCE, not "call": both the call arm and the `MIR GlobalAddr`
+        // address arm route through here.
         auto const nameIt = definedNameBySymbol_.find(defined.v);
         if (nameIt == definedNameBySymbol_.end()) {
             dss::report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
                 DiagnosticSeverity::Error,
                 std::format(
                     "{}: the active object format declares this definition's "
-                    "binding PREEMPTIBLE, so the call must be resolved by the "
-                    "loader rather than branched to the local body — but no "
+                    "binding PREEMPTIBLE, so the reference must be resolved by "
+                    "the loader rather than bound to the local body — but no "
                     "on-binary NAME was supplied for the definition, and a "
                     "loader resolves a reference BY NAME. Refusing rather than "
-                    "emitting the direct branch, which is the divergence this "
-                    "routing exists to remove. "
+                    "emitting the direct reference, which is the divergence "
+                    "this routing exists to remove. "
                     "D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING.",
                     context));
             return std::nullopt;
@@ -7167,7 +7256,20 @@ struct Lowerer {
         imp.symbol                = SymbolId{};
         imp.mangledName           = nameIt->second;
         imp.libraryPath           = "";   // the loader's GLOBAL scope
-        imp.isData                = false;
+        // ★ THE KIND OF THING THE LOADER IS BEING ASKED FOR, read from the
+        // DEFINITION rather than assumed. `funcBySymbol_` and `globalBySymbol_`
+        // partition this module's definitions, so a definition that is a module
+        // GLOBAL is a data object and nothing else. It used to be hard-coded
+        // false, and the consequence was measurable rather than cosmetic: the
+        // ELF writer gives a FUNCTION import a PLT stub and a DATA import a GOT
+        // slot alone, so a data preemption row bought a stub nothing can ever
+        // branch to (✔MEASURED: four stubs where gcc emits two), and its `.dynsym`
+        // UND row was typed `STT_NOTYPE` where a data symbol is `STT_OBJECT`.
+        // A DEFINITION cannot be both, so the two uses of one name that the
+        // dedup key must reconcile (called AND addressed) are both FUNCTION uses
+        // and still agree — an `isData` disagreement remains a hard
+        // `K_ExternImportAttributeConflict`, and this cannot produce one.
+        imp.isData                = globalBySymbol_.contains(defined.v);
         imp.version               = "";
         imp.binding               = SymbolBinding::Global;
         imp.isPreemptionReference = true;
@@ -7195,6 +7297,72 @@ struct Lowerer {
         newWideFloatExterns_.push_back(std::move(imp));
         preemptionImportBySymbol_.emplace(defined.v, sym);
         return sym;
+    }
+
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING, THE ADDRESS HALF: the
+    // symbol whose VA is the SLOT holding `defined`'s loader-resolved address.
+    //
+    // WHY IT IS NOT THE CALL REFERENCE'S OWN SYMBOL. A call wants the entry the
+    // format's `externCallDispatch` names; an ADDRESS wants the slot's CONTENT.
+    // Under `indirect-slot` those coincide — the reference's VA already IS the
+    // slot, which is why `lowerCall` derefs it there — and this returns the
+    // reference itself. Under `direct-plt` the reference's VA is a PLT STUB, and
+    // a pointer to a stub is not the function's address: two images asked for
+    // `&w` would answer with two different pointers for one identifier, which is
+    // precisely the divergence being closed one use-form over. So there the
+    // import carries a SECOND symbol (`ExternImport::addressSlotSymbol`) the
+    // format walker binds to the slot it already mints for that import — ELF's
+    // `.got` entry with its `R_*_GLOB_DAT`, which is byte-for-byte the slot ld
+    // gives the same source. NOTHING NEW IS MINTED AT THE LINK TIER; what
+    // changes is that the slot becomes NAMEABLE.
+    //
+    // The question is asked of DECLARED VOCABULARY (`externCallDispatch`),
+    // never of a format identity, and answered once per definition.
+    //
+    // Returns nullopt ONLY after reporting; the caller must then bail rather
+    // than fall back to the bare `lea`, which is the defect.
+    [[nodiscard]] std::optional<SymbolId>
+    resolvePreemptionAddressSlot(SymbolId defined, std::string_view context) {
+        if (auto const it = preemptionSlotBySymbol_.find(defined.v);
+            it != preemptionSlotBySymbol_.end()) {
+            return it->second;
+        }
+        auto const ref = resolvePreemptionImport(defined, context);
+        if (!ref.has_value()) return std::nullopt;   // already reported
+        // `externCallDispatch_` is non-nullopt here: `resolvePreemptionImport`
+        // reports and bails otherwise, which the `!ref` guard just consumed.
+        if (externCallUsesIndirectShape(*externCallDispatch_)
+            && importTakesSlot(SymbolBinding::Global)) {
+            preemptionSlotBySymbol_.emplace(defined.v, *ref);
+            return *ref;                             // the reference IS the slot
+        }
+        // `direct-plt`: name the import's own address slot. The row was pushed
+        // by `resolvePreemptionImport` above and is the LAST one it pushed, but
+        // it is found by symbol rather than by position so a future producer
+        // between the two calls cannot silently retarget the stamp.
+        SymbolId const slot = mintJumpTableSymbol();
+        bool stamped = false;
+        for (auto& e : newWideFloatExterns_) {
+            if (e.symbol != *ref) continue;
+            e.addressSlotSymbol = slot;
+            stamped = true;
+            break;
+        }
+        if (!stamped) {
+            dss::report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "{}: the loader-resolved reference minted for preemptible "
+                    "definition '{}' could not be found to carry its "
+                    "address slot — refusing rather than emitting the bare "
+                    "address of the local body, which is the divergence this "
+                    "routing exists to remove. "
+                    "D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING.",
+                    context, definedNameBySymbol_.at(defined.v)));
+            return std::nullopt;
+        }
+        preemptionSlotBySymbol_.emplace(defined.v, slot);
+        return slot;
     }
 
     // c116 H1 (D-WIN64-SEH-FUNCLETS): lower `RecoverParentFrameSlot(establisher)`
@@ -7802,6 +7970,19 @@ struct Lowerer {
         if (threadLocalSymbols_.contains(mir.globalAddrSymbol(gaId).v)) {
             return false;
         }
+        // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING (the ADDRESS half):
+        // a PREEMPTIBLE DEFINITION is never foldable, and the failure it
+        // prevents is the same off-by-one-indirection the two arms above
+        // prevent, arriving from the other side. The definition's address is
+        // materialized by LOADING the loader-resolved slot, so a folded riprel
+        // load would read the SLOT's own bytes as if they were the object —
+        // and, worse for a definition, the un-suppressed fold would instead read
+        // the LOCAL BODY directly, reinstating the divergence for exactly the
+        // programs that read a preemptible global's VALUE (`x = g;`) rather than
+        // taking its address. Both readings are wrong; the fold is refused.
+        if (symbolIsPreemptibleDefinition(mir.globalAddrSymbol(gaId))) {
+            return false;
+        }
         auto const it = mirValueUses_.find(gaId.v);
         if (it == mirValueUses_.end() || it->second.count != 1) {
             return false;  // zero or multiple users — keep the lea
@@ -8300,6 +8481,62 @@ struct Lowerer {
         }
         SymbolId const sym = mir.globalAddrSymbol(id);
         LirRegClass const cls = regClassFor(id);
+        // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING, THE ADDRESS HALF.
+        // The ADDRESS of a definition THIS MODULE makes but the artifact's
+        // LOADER may replace is not the local body's address. If it were
+        // materialized as a bare `lea`, `&w` evaluated inside the library and
+        // `&w` evaluated in the executable would be two different pointers for
+        // one identifier — C 6.2.2p2 gives one identifier one function/object
+        // across the whole program, so a comparison, a callback table or a
+        // registration that crosses the image boundary answers wrong, silently.
+        //
+        // ✔MEASURED 2026-09-05, gcc 13.3.0 and clang 18.1.3, one `.so` each:
+        // both LOAD a `R_X86_64_GLOB_DAT` GOT slot for `&wk` and `&st` (weak and
+        // strong global, default visibility) while emitting a bare `lea` for the
+        // `static` and `visibility("hidden")` siblings in the SAME object, and a
+        // bare `lea` for all four when the same source is an executable
+        // (`-pie` and `-no-pie` alike). The discriminator is the SAME one the
+        // call half routes on, which is why it reads the same declared set
+        // through the same owner and mints no second declaration.
+        //
+        // ★ IT CANNOT RIDE THE CALL PATH, and that is a design constraint rather
+        // than a shortcut not taken: under `direct-plt` the routed reference's
+        // VA is the PLT STUB — the right answer for a call and the wrong answer
+        // for an address. What an address needs is the slot's CONTENT, which is
+        // what `resolvePreemptionAddressSlot` names and this lea+deref reads.
+        // The emitted pair is the SAME shape the GOT-indirect extern arm below
+        // emits, for the same reason: the symbol names a pointer, and the
+        // program asked for what it points at.
+        //
+        // ⚠ Ordered BEFORE the two extern arms: they key on sets of EXTERN
+        // symbols and a defined symbol is in neither, so the order is for the
+        // reader — but the arm must stay ahead of the fall-through `lea`, which
+        // IS the defect.
+        if (symbolIsPreemptibleDefinition(sym)) {
+            auto const loadOp = classOp(cls, RegClassOp::Load);
+            if (!loadOp.has_value()) {
+                reportMissingClassOp(cls, RegClassOp::Load,
+                                     "MIR GlobalAddr (preemptible definition)");
+                return;
+            }
+            auto const slot =
+                resolvePreemptionAddressSlot(sym, "MIR GlobalAddr");
+            if (!slot.has_value()) return;   // already reported
+            LirReg const slotAddr = lir.newVReg(cls);
+            std::array<LirOperand, 1> leaOps{LirOperand::makeSymbolRef(slot->v)};
+            emitInst(*opcode(MnemonicSlot::Lea), slotAddr, leaOps);
+            LirReg const objectAddr = lir.newVReg(cls);
+            std::array<LirOperand, 3> loadOps{
+                LirOperand::makeReg(slotAddr),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(0),
+            };
+            // The slot always holds a 64-bit pointer — width-default (flags 0
+            // ⇒ 64), exactly as the extern GOT-indirect arm below loads it.
+            emitInst(*loadOp, objectAddr, loadOps, /*payload=*/0, /*flags=*/0);
+            defineValue(id, objectAddr);
+            return;
+        }
         // D-LK-EXTERN-DATA-IMPORT (c117): a GOT-indirect extern-DATA object's
         // address is NOT its symbol VA. The linker binds `symbolVa[sym]` to
         // the object's __got slot (a non-lazy pointer), which dyld fills at
@@ -8655,7 +8892,7 @@ struct Lowerer {
         // so the two can never both fire: an extern is already loader-resolved,
         // and a definition is by construction not an import.
         if (calleeIsGlobalAddr && !calleeIsExtern
-            && calleeIsPreemptible(calleeSym)) {
+            && symbolIsPreemptibleDefinition(calleeSym)) {
             auto const routed =
                 resolvePreemptionImport(calleeSym, "MIR Call");
             if (!routed.has_value()) return;   // already reported

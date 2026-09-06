@@ -25,6 +25,18 @@
 #include <string_view>
 #include <vector>
 
+// ── D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ────────
+//
+// The cases below drive `macho::encode` DIRECTLY, so nothing supplied the
+// per-EMISSION artifact identity that an MH_DYLIB document's
+// `image.installName` now names through `${artifactFileName}`. A real build
+// states it in `linkAndWrite` from the path it is about to write; a writer unit
+// test writes no file, so it states it here. Omitting it is not a smaller test
+// — it is the REFUSAL arm, and that arm has its own named case rather than
+// being asserted by accident in every unrelated one.
+constexpr char const* kFixtureArtifactFileName = "fixture.dylib";
+
+
 using namespace dss;
 
 namespace {
@@ -85,7 +97,8 @@ TEST(BinaryReaderMachoRoundTrip, ReadsRealDssDylibExportTrie) {
     AssembledModule mod = makeExportModule();
 
     DiagnosticReporter wrep;
-    auto image = dss::macho::encode(mod, *target.value(), *format.value(), wrep);
+    auto image = dss::macho::encode(mod, *target.value(), *format.value(), wrep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
     ASSERT_EQ(wrep.errorCount(), 0u) << "dylib encode emitted errors";
     ASSERT_FALSE(image.empty());
 

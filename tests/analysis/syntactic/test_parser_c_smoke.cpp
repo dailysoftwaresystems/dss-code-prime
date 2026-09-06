@@ -2615,8 +2615,27 @@ TEST(ParserCSmoke, LeadingAlignasBeforeTypedefStaysALoudRefusal) {
 // GAP 2 — `attrArgItem` accepts a `key = value` argument. Real SDK witness
 // `sys/cdefs.h` (the `__swift_unavailable(_msg)` macro):
 // `__attribute__((__availability__(swift, unavailable, message=_msg)))`.
-// The assignment is an OPTIONAL TAIL on the item, so FIRST(attrArgItem) is
-// unchanged and the comma list stays predictive.
+// The assignment is an OPTIONAL TAIL on the item, not a second alternative, so
+// the comma list stays predictive.
+//
+// ★★ P62 [[D-CSUBSET-ATTRIBUTE-ARG-CONSTANT-EXPRESSION]] MOVED THE SHAPE THIS PIN
+// READS, AND THE PIN CATCHING IT IS THE PIN WORKING. The argument's first element
+// is now `attrArgConstExpr` — the constant-EXPRESSION level — rather than
+// `attrArgAtom` directly, because an attribute argument is a constant-expression
+// (gcc, clang and mingw-w64 gcc all build AND RUN `aligned(2 * 8)` and
+// `aligned(sizeof(int) * 2)`). The expected roles below are updated to the new
+// tree; WHAT THE PIN CLAIMS IS UNCHANGED and is the reason it is updated rather
+// than deleted: the `=` is still a TAIL on the item, never a second alternative,
+// so the comma-separated list is still decided without speculation at this level.
+//
+// ⚠ ONE HALF OF THE OLD COMMENT WAS RETIRED WITH THE SHAPE AND IS SAID SO PLAINLY:
+// FIRST(attrArgItem) is NOT unchanged any more. It is now FIRST(attrArgConstExpr),
+// which is FIRST(attrArgAtom) PLUS the prefix operators (`-`, `~`, `!`, …) the
+// shared expression walker admits. That widening is harmless where it matters —
+// the set stays disjoint from Comma, ParenClose and AssignOp, which are the only
+// tokens the surrounding rules have to tell it apart from — but "unchanged" would
+// now be false, and a false sentence in a pin's own comment is how the next reader
+// is misled about what the pin proves.
 TEST(ParserCSmoke, AttributeArgumentAcceptsKeyEqualsValue) {
     Tree t = parseC(
         "int f(void) __attribute__((__availability__(swift, unavailable, "
@@ -2626,8 +2645,8 @@ TEST(ParserCSmoke, AttributeArgumentAcceptsKeyEqualsValue) {
         << "sys/cdefs.h must parse: " << firstErrorText(t);
 
     // Exactly one of the three arg items carries the `=` tail, and its shape is
-    // atom/`=`/atom — pinned so a future edit cannot quietly turn the tail into
-    // a separate alt (which would change FIRST(attrArgItem) and the pruning).
+    // constant-expression/`=`/atom — pinned so a future edit cannot quietly turn
+    // the tail into a separate alt, which would make this position speculative.
     RuleId const itemRule = t.schema().rules().find("attrArgItem");
     ASSERT_TRUE(itemRule.valid());
     int assigned = 0;
@@ -2636,9 +2655,9 @@ TEST(ParserCSmoke, AttributeArgumentAcceptsKeyEqualsValue) {
         NodeId const id{i};
         if (t.kind(id) != NodeKind::Internal || t.rule(id).v != itemRule.v) continue;
         std::string const roles = visibleChildRoles(t, id);
-        if (roles == "rule:attrArgAtom/tok:AssignOp/rule:attrArgAtom") {
+        if (roles == "rule:attrArgConstExpr/tok:AssignOp/rule:attrArgAtom") {
             ++assigned;
-        } else if (roles == "rule:attrArgAtom") {
+        } else if (roles == "rule:attrArgConstExpr") {
             ++plain;
         } else {
             ADD_FAILURE() << "unexpected attrArgItem shape: " << roles;

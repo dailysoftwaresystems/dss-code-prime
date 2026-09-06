@@ -247,3 +247,20 @@ dss_add_test(NAME analysis/semantic/test_generic_selection_constant_expression
              SOURCES test_generic_selection_constant_expression.cpp)
 target_include_directories(dss_analysis_semantic_test_generic_selection_constant_expression
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P62 lane ae: [[D-CSUBSET-ATTRIBUTE-ARG-CONSTANT-EXPRESSION]] — a KEYWORD-LED
+# constant expression as an attribute argument (`aligned(sizeof(T))`,
+# `aligned(_Alignof(T))`), the shape the shipped Xcode SDK's
+# OSAtomicDeprecated.h writes and `attrArgItem` could not match because `sizeof`
+# and `_Alignof` are KEYWORDS. Every pin asserts the STORED ALIGNMENT rather than
+# a clean parse, because "it stopped erroring" and "it works" are different
+# claims and only the second closes the row. It also owns the two halves an
+# example structurally cannot show: the un-foldable operand's LOUD refusal beside
+# its foldable control (an accepted-then-dropped alignment is a silent
+# miscompile), and the symmetry of the operator-expression residue in both
+# directions. Shares `semantic_test_fixture.hpp`, so it needs the tests/ include
+# root for the same reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_attribute_arg_const_expr
+             SOURCES test_attribute_arg_const_expr.cpp)
+target_include_directories(dss_analysis_semantic_test_attribute_arg_const_expr
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

@@ -4,6 +4,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
+#include "link/image_request.hpp"      // ImageRequest — the per-EMISSION facts
 #include "link/object_format_schema.hpp"
 
 #include <cstdint>
@@ -78,10 +79,20 @@ requestsCodeSignature(MachOImage const& im) noexcept {
     return im.codeSignatureSize != 0 || im.codeSignature.has_value();
 }
 
+// ── D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ───────
+//
+// `request` carries the per-EMISSION facts the format document cannot state —
+// today the one that matters here is `artifactFileName`, which an MH_DYLIB
+// document's `image.installName` may name through the `${artifactFileName}`
+// placeholder. It DEFAULTS to `{}` so every existing direct caller compiles
+// unchanged; a caller that omits it while the schema's identity names the
+// artifact is REFUSED loud (`K_WalkerInputContractViolation`) rather than
+// given a fabricated identity — see `resolveArtifactIdentity`.
 [[nodiscard]] DSS_EXPORT std::vector<std::uint8_t>
 encode(AssembledModule const&    module,
        TargetSchema const&       targetSchema,
        ObjectFormatSchema const& objectFormatSchema,
-       DiagnosticReporter&       reporter);
+       DiagnosticReporter&       reporter,
+       ImageRequest const&       request = {});
 
 } // namespace dss::macho

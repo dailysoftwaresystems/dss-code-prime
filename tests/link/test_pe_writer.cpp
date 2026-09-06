@@ -5190,7 +5190,16 @@ namespace {
         d.bytes = {'x'};
     }
     mod.dataItems.push_back(std::move(d));
-    return linker::link(mod, target, fmt, rep);
+    // D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT:
+    // the darwin legs' shipped documents declare their ad-hoc code-signature
+    // identity as a FUNCTION of the artifact, and an emission that cannot
+    // name the file it produces is REFUSED with no fallback. The name is a
+    // FACT the driver supplies on every emission, never a knob, so stating it
+    // here is right for EVERY leg -- a format declaring no placeholder
+    // ignores it.
+    return linker::link(
+        mod, target, fmt, rep,
+        dss::ImageRequest{.artifactFileName = "rodata_probe"});
 }
 } // namespace
 

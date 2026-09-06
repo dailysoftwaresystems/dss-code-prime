@@ -450,7 +450,8 @@ public:
                                   "/image/installName",
                                   "'installName' must be a string (the "
                                   "LC_ID_DYLIB name a client links "
-                                  "against, e.g. '@rpath/libdss.dylib' -- "
+                                  "against, e.g. "
+                                  "'@rpath/${artifactFileName}' -- "
                                   "MH_DYLIB only)");
                     } else {
                         data.machoImage.installName =
@@ -673,13 +674,25 @@ public:
                             }
                         }
                         // identifier (non-empty; required).
+                        //
+                        // ⚠ THIS DIAGNOSTIC USED TO SAY "the kernel keys the
+                        // signature on it". ✔MEASURED FALSE on Apple Silicon
+                        // (macOS 26.6.2): `codesign -d -r-` reports the ad-hoc
+                        // designated requirement as `cdhash H"…"` on BOTH DSS-
+                        // and ld64-produced artifacts, so the identifier does
+                        // not feed the requirement the loader checks. What it
+                        // DOES key is identity-based matching — a requirement
+                        // `identifier "X"` accepts every artifact carrying X.
+                        // D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT.
                         if (!cs.contains("identifier")) {
                             coll.emit(DiagnosticCode::C_MalformedJson,
                                       "/image/codeSignature/identifier",
                                       "'identifier' is required and must be "
                                       "a non-empty string (the CodeDirectory "
-                                      "identOffset payload; the kernel keys "
-                                      "the signature on it).");
+                                      "identOffset payload -- the artifact's "
+                                      "code identity, which a code requirement "
+                                      "can match on, e.g. "
+                                      "'com.dss.${artifactFileName}').");
                             ok = false;
                         } else if (!cs.at("identifier").is_string()
                                 || cs.at("identifier").get<std::string>()
@@ -692,6 +705,29 @@ public:
                         } else {
                             sig.identifier =
                                 cs.at("identifier").get<std::string>();
+                            // ── D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ──
+                            //
+                            // The identity may be a FUNCTION of the artifact,
+                            // spelled with the SAME closed `${...}` vocabulary
+                            // `image.installName` uses — one resolver, one
+                            // vocabulary, no second spelling to drift. Shape is
+                            // checked HERE, at LOAD, for the same reason it is
+                            // for the install name: a mis-spelled placeholder is
+                            // a property of the DOCUMENT, and left to the walker
+                            // it would surface only once someone signed
+                            // something. The stand-in name separates the
+                            // ANSWERABLE cases (unknown key, unterminated
+                            // placeholder) from the one that is legitimate here
+                            // and not at emission — no artifact name yet.
+                            auto const shape = resolveArtifactIdentity(
+                                sig.identifier, "a.dylib");
+                            if (!shape.has_value()) {
+                                coll.emit(
+                                    DiagnosticCode::C_MalformedJson,
+                                    "/image/codeSignature/identifier",
+                                    shape.error());
+                                ok = false;
+                            }
                         }
                         if (ok) {
                             data.machoImage.codeSignature = std::move(sig);
@@ -1103,17 +1139,41 @@ public:
             // D-LK3-3: the LC_ID_DYLIB install name — REQUIRED on a
             // dylib (every ld64-produced MH_DYLIB carries one; clients
             // record it at link time), dead config anywhere else. The
-            // walker never derives it from the output file name
-            // (config-driven + honest — the c150 DT_SONAME
-            // discipline), so an unset field must fail HERE, not
-            // silently emit an identity-less dylib.
+            // walker fills exactly the placeholders this document
+            // DECLARES and invents nothing when it declares none (the
+            // c150 DT_SONAME discipline is about not INVENTING an
+            // identity silently, not about refusing to know which
+            // artifact is being written —
+            // D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT),
+            // so an unset field must fail HERE, not silently emit an
+            // identity-less dylib.
             if (isDylibImage && mi.installName.empty()) {
                 fail("/image/installName",
                      "Mach-O MH_DYLIB requires non-empty "
                      "'image.installName' (the LC_ID_DYLIB name a "
                      "client links against, e.g. "
-                     "'@rpath/libdss.dylib'). The walker never derives "
-                     "it from the output file name (D-LK3-3).");
+                     "'@rpath/${artifactFileName}'). The walker fills "
+                     "only the placeholders this document DECLARES and "
+                     "invents nothing when it declares none (D-LK3-3).");
+            }
+            // ── D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ──
+            //
+            // The identity may be a FUNCTION of the artifact, spelled with the
+            // closed `${...}` vocabulary. Its shape is checked HERE, at LOAD,
+            // and not only at emission: a mis-spelled placeholder is a property
+            // of the DOCUMENT, so the document is where it must fail. Left to
+            // the walker it would surface once someone built a dylib, and left
+            // unchecked entirely it would ship as literal text inside a
+            // binary's runtime identity. `resolveArtifactIdentity` is asked with
+            // a stand-in name so the ANSWERABLE cases (unknown key, unterminated
+            // placeholder) separate cleanly from the one case that is legitimate
+            // here and not at emission — no artifact name yet.
+            if (isDylibImage && !mi.installName.empty()) {
+                auto const shape = resolveArtifactIdentity(
+                    mi.installName, "a.dylib");
+                if (!shape.has_value()) {
+                    fail("/image/installName", shape.error());
+                }
             }
             if (!isDylibImage && !mi.installName.empty()) {
                 fail("/image/installName",
@@ -1381,15 +1441,30 @@ public:
         }
     }
 
+    // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: YES, since the walker
+    // learned the LC_DYLD_INFO_ONLY *weak bind* stream (`appendWeakBindEntry`
+    // in `macho.cpp`) and the chained-fixups `BIND_SPECIAL_DYLIB_WEAK_LOOKUP`
+    // ordinal. Both encode "resolve from the loader's coalescing scope", which
+    // is what dyld calls `<weak-def-coalesce>`; before they existed this
+    // returned the base class's false and the linker refused such a module by
+    // name rather than shipping a silent wrong answer.
+    [[nodiscard]] bool
+    realizesCoalescingScopeReferences() const noexcept override { return true; }
+
     [[nodiscard]] std::vector<std::uint8_t>
     encode(AssembledModule const&    module,
            TargetSchema const&       targetSchema,
            ObjectFormatSchema const& objectFormatSchema,
            DiagnosticReporter&       reporter,
            ImageRequest const&       request) const override {
-        (void)request;  // no declared vehicle — see stackReserveVehicles()
+        // D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT:
+        // the request is FORWARDED now rather than discarded. It still declares
+        // no stack-reserve VEHICLE (see stackReserveVehicles(), which is what
+        // the old `(void)request` was about), but it carries the per-EMISSION
+        // artifact identity an MH_DYLIB's `image.installName` may name — and a
+        // walker that never saw it could only answer with a constant.
         return macho::encode(module, targetSchema, objectFormatSchema,
-                             reporter);
+                             reporter, request);
     }
 
     // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: the read counterpart of

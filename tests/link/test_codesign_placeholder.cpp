@@ -112,13 +112,26 @@ makeTrivialModule(std::uint32_t funcSymV = 1) {
 // deliberately — semantically a no-op, since index 0 is what the
 // pre-gate default produced implicitly. One door per walker so a new
 // call site cannot quietly skip the contract.
+// ── D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ──
+//
+// ★ THE SAME ONE-DOOR ARGUMENT NOW CARRIES A SECOND CONTRACT. Every shipped
+// darwin document declares its ad-hoc code-signature identity as a FUNCTION of
+// the artifact, so an emission that cannot name the file it produces is
+// REFUSED with no fallback — and a direct writer call has no output path to
+// name. Stating the name HERE means these reservation pins keep driving the
+// walker directly without each one having to learn the rule.
+// ⓘ Only the MACH-O door needs it: the PE sibling below has no such key.
+constexpr char const* kCodesignPinArtifactFileName = "dss_codesign_pin_artifact";
+
 [[nodiscard]] std::vector<std::uint8_t>
 encodeMachoUntrampolined(AssembledModule           mod,  // by value: stamped copy
                          TargetSchema const&       target,
                          ObjectFormatSchema const& fmt,
                          DiagnosticReporter&       reporter) {
     mod.imageEntryOverride = std::size_t{0};
-    return macho::encode(mod, target, fmt, reporter);
+    return macho::encode(
+        mod, target, fmt, reporter,
+        dss::ImageRequest{.artifactFileName = kCodesignPinArtifactFileName});
 }
 
 [[nodiscard]] std::vector<std::uint8_t>
@@ -606,11 +619,23 @@ TEST(MachOCodeSignPlaceholder, ShippedX86DarwinExecEmitsAdHocSignature) {
         << "the shipped format declares image.codeSignature but the "
            "walker emitted no LC_CODE_SIGNATURE — the signature would "
            "be silently dropped and the binary would not exec";
+    // ── D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ──
+    //
+    // The identity this document declares is a FUNCTION of the artifact, so
+    // the size is derived over the RESOLVED string, never the declaration.
+    // ⚠ THIS ARM CAUGHT THE DISTINCTION FOR REAL: before the resolution
+    // landed the two were the same string and this line could not tell them
+    // apart; with the placeholder in place, comparing against the DECLARATION
+    // reads 264 against the emitted 270 — i.e. this assertion is now a live
+    // pin on the reservation following the resolved name rather than the
+    // template it came from.
+    auto const resolvedIdentifier = dss::resolveArtifactIdentity(
+        im.codeSignature->identifier, kCodesignPinArtifactFileName);
+    ASSERT_TRUE(resolvedIdentifier.has_value()) << resolvedIdentifier.error();
     // Size DERIVED from the block, to the byte.
     EXPECT_EQ(dataSize,
               dss::macho::detail::adHocCodeSignatureSize(
-                  dataOff, im.codeSignature->pageSize,
-                  im.codeSignature->identifier));
+                  dataOff, im.codeSignature->pageSize, *resolvedIdentifier));
     ASSERT_LE(static_cast<std::size_t>(dataOff) + dataSize, bytes.size());
     // Blob CONTENT — big-endian. SuperBlob: magic / length / count.
     auto beU32 = [&bytes](std::size_t at) {
@@ -651,9 +676,18 @@ TEST(MachOCodeSignPlaceholder, ShippedX86DarwinExecEmitsAdHocSignature) {
               bytes.end())
         << "CodeDirectory identifier is not NUL-terminated inside the image";
     std::string ident(reinterpret_cast<char const*>(&bytes[identOff]));
-    EXPECT_EQ(ident, im.codeSignature->identifier)
-        << "the CodeDirectory identifier must be the schema's, not a "
-           "walker-invented one";
+    EXPECT_EQ(ident, *resolvedIdentifier)
+        << "the CodeDirectory identifier must be the schema's DECLARATION "
+           "resolved against this artifact, not a walker-invented one and not "
+           "the unresolved template "
+           "(D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT)";
+    // ...and the template must NOT have survived into the binary: a
+    // pass-through would ship `${artifactFileName}` as literal text inside the
+    // artifact's code identity, which is the loudest way this could fail
+    // quietly.
+    EXPECT_EQ(ident.find(dss::kArtifactFileNamePlaceholder), std::string::npos)
+        << "the unresolved placeholder reached the emitted CodeDirectory: '"
+        << ident << "'";
 }
 
 // ── THE FLIP MARKER HAS FLIPPED: the static exec arm now REFUSES ─────
