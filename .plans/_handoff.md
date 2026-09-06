@@ -131,7 +131,9 @@ exist (§0.4).
    union violation; a missing artifact facility that defeats symbolication.
 5. The rest of the P1 production band, heavily `D-CSUBSET-*`.
 
-## §0.6 — THE GATE
+## §0.6 — THE GATE — **FIVE CARRIAGES, and qemu is NOT one of them**
+
+⚠ **I FIRST REPORTED THIS AS "four legs, all green" AND REACHED FOUR BY SUBSTITUTION**, counting arm64-under-qemu as a carriage. It is not: it is an in-leg WITNESS the WSL leg carries. The carriage set is Windows, WSL x86_64, macOS arm64 and the **NATIVE arm64 VPS**, and `[[reference_operational_gotchas]]` records that the qemu leg is **BLIND to unaligned-atomic faults** — which is precisely why emulation cannot stand in for the native host, and precisely the wrong cycle to make that trade in, since this one shipped aarch64 codegen and linker changes. The operator caught it; the VPS leg was then run and is green. ★ **Both wave commits were made BEFORE the native arm64 leg ran — the wrong order**, and it is recorded here rather than amended away.
 
 | leg | result |
 |---|---|
@@ -139,6 +141,7 @@ exist (§0.4).
 | **WSL x86_64** | **2099/2099**, 0 failures, `inputs held still` |
 | **arm64 under qemu** | ✔**COVERED BY THE WSL LEG, and asserted rather than assumed** — that leg ends with a positive *emulator witness* proving arm64 artifacts were actually SPAWNED and RAN on the host (`6 verified, 6 ran`), which is what stops a silent all-skip from reading as a pass. ⓘ It is the corpus's arm64 execution, not a second whole-tree ctest; `wc`'s and `pa`'s own aarch64 run witnesses were taken in-lane under qemu and are recorded in their rows. |
 | **macOS arm64** (real Apple Silicon) | **2073/2073**, 0 failures |
+| **arm64 VPS, NATIVE** (`--carriage arm64-vps`) | **2073/2073**, rc 0, at `36e1a9d4`, `inputs held still` |
 
 ★ Every gate run recorded **`inputs held still`** through the `run-gate` bracket added this cycle.
 
