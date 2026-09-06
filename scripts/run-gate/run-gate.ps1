@@ -352,6 +352,50 @@ if (-not $resolved) {
     exit 127
 }
 
+# ---- THE RUN'S INPUTS MUST HOLD STILL, OR ITS VERDICT IS NOT EVIDENCE -------
+#
+# The twin of the block of the same name in run-gate.sh; that file carries the
+# full argument and the measurement. In short: this project's runners read
+# `src/dss-config/**`, `tests/corpus/**` and `examples/**` from the SOURCE TREE
+# at TEST TIME, so an edit to one of them while a suite is in flight makes the
+# run measure a tree that never existed as a whole.
+#
+# +MEASURED 2026-09-05 (P62): a whole-tree ctest reported 9 failures out of 2087;
+# EIGHT were examples failing `C_UnbackedPredefinedMacro` about shipped-library
+# descriptors, which reads as a defect in a sibling lane's FFI work -- and that
+# is where the investigation went. The cause was the orchestrator rewriting
+# `c.lang.json` mid-run. All eight passed on the stable tree seconds later.
+#
+# NO ESCAPE HATCH, deliberately: an escape every caller can set is one every
+# caller sets. A command that rewrites these roots is a build step, not a gate.
+# A root that does not exist contributes nothing, so a worktree carrying a subset
+# of the tree is not penalised for it.
+$script:RunGateInputRoots = @('src/dss-config', 'tests/corpus', 'examples')
+$script:RunGateMarker = "$LogPath.inputs-marker"
+try {
+    New-Item -ItemType File -Path $script:RunGateMarker -Force -ErrorAction Stop | Out-Null
+} catch {
+    Write-Host "run-gate.ps1: FAIL - cannot create the input marker '$($script:RunGateMarker)', so the run"
+    Write-Host "  could not be proved to have measured a still tree. Nothing was run."
+    Write-Host "  This refusal is about the MARKER PATH, which sits beside the log path you gave."
+    Write-Host "  shell   : $(Get-RunGateShellIdentity)"
+    Restore-CplDefault
+    exit 2
+}
+$script:RunGateMarkerTime = (Get-Item -LiteralPath $script:RunGateMarker).LastWriteTimeUtc
+
+function Get-RunGateMovedInputs {
+    $moved = @()
+    foreach ($root in $script:RunGateInputRoots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $moved += Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTimeUtc -gt $script:RunGateMarkerTime } |
+            ForEach-Object { $_.FullName }
+    }
+    # Same cap as the .sh twin: the refusal names the class, it is not a manifest.
+    return @($moved | Select-Object -First 20)
+}
+
 # Redirect ALL streams to the log with `*>` so the native command stays last
 # and $LASTEXITCODE is its own, not a pipeline's.
 try {
@@ -366,11 +410,37 @@ if ($null -eq $rc) {
     $rc = 0
 }
 
+$movedInputs = Get-RunGateMovedInputs
+Remove-Item -LiteralPath $script:RunGateMarker -Force -ErrorAction SilentlyContinue
+
 Add-Content -LiteralPath $LogPath -Value @"
 --- run-gate.ps1 ---
 command : $Command $($CommandArgs -join ' ')
 rc      : $rc
 "@
+if ($movedInputs.Count -gt 0) {
+    Add-Content -LiteralPath $LogPath -Value "inputs  : MOVED DURING THE RUN - this verdict is not evidence"
+    foreach ($m in $movedInputs) { Add-Content -LiteralPath $LogPath -Value "          $m" }
+} else {
+    Add-Content -LiteralPath $LogPath -Value "inputs  : held still ($($script:RunGateInputRoots -join ' '))"
+}
+
+# Checked BEFORE rc, and before the witness: a run whose inputs moved has no
+# verdict to report, and calling it a pass or a failure is the misattribution
+# this block exists to prevent. Exit 3 matches the .sh twin.
+if ($movedInputs.Count -gt 0) {
+    Write-Host "run-gate.ps1: FAIL - the tree CHANGED UNDER THE RUN, so its result is not evidence"
+    Write-Host "  (command exited $rc; that number describes a tree that never existed as a whole)."
+    Write-Host "  These read-at-test-time files were modified after the run started:"
+    foreach ($m in $movedInputs) { Write-Host "      $m" }
+    Write-Host "  This is NOT 'the gate failed'. Any failure it reported may belong to the edit"
+    Write-Host "    rather than to the code under test, and any PASS is equally unproven."
+    Write-Host "  Let the tree settle and run it again. If you are the one who edited it: this"
+    Write-Host "    project's runners read src/dss-config, tests/corpus and examples from the"
+    Write-Host "    SOURCE TREE at test time, so an edit there is not inert while a suite runs."
+    Write-Host "  (log: $LogPath)"
+    exit 3
+}
 
 function Show-Tail {
     if (Test-Path -LiteralPath $LogPath) {

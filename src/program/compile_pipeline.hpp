@@ -469,6 +469,25 @@ struct CompileOptions {
     // legs and a silent wrong answer on the fourth.
     std::optional<bool> charIsUnsigned{};
 
+    // ── ★★ [[D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING]]: WHICH OF THIS
+    //    ARTIFACT'S OWN DEFINITIONS ITS LOADER MAY REPLACE ──────────────────
+    // The active object format's `preemptibleDefinitionBindings`, verbatim.
+    // Relayed to `opt::optimize` and from there to the Inlining pass, which
+    // must not splice a body the loader may not run: in a shared library the
+    // local body of a default-visibility definition is not necessarily the one
+    // that executes, so inlining it bakes in the wrong answer exactly as
+    // inlining a WEAK body does.
+    //
+    // It rides `CompileOptions` for the SAME reason `charIsUnsigned` above
+    // does, and the reason is worth restating rather than referring to: the MIR
+    // OPTIMIZER carries neither a target nor a format of its own. Read once
+    // from the format at the driver and relayed from here; NEVER re-derived
+    // downstream.
+    //
+    // EMPTY (every format that declares no preemptible binding) leaves the
+    // Inlining pass byte-identical.
+    std::vector<SymbolBinding> preemptibleDefinitionBindings{};
+
     // Selects the default optimizer pipeline when `pipelineOverride`
     // is null. Resolved via `resolvePipelineName` (a constexpr table
     // indexed by ordinal — NO `if (config == Release)` branches per
@@ -721,6 +740,16 @@ struct DSS_EXPORT CuMirModule {
     // owner, `ObjectFormatSchema::externRefTakesImportSlot`, which the linker
     // calls directly; what travels here is the declared DATA.
     std::vector<SymbolBinding> indirectSlotBindings;
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the active object
+    // format's DECLARED set of definition bindings this artifact's LOADER may
+    // replace with another image's body, captured here for the SAME reason as
+    // `externCallDispatch` above — the LOWER half sees only this struct. Empty
+    // (every format that does not declare the key) = nothing is preemptible and
+    // every module-internal call stays the direct branch it has always been.
+    // The RULE that reads it has one owner,
+    // `ObjectFormatSchema::definitionIsPreemptible`; what travels here is the
+    // declared DATA.
+    std::vector<SymbolBinding> preemptibleDefinitionBindings;
     // D-LK-EXTERN-DATA-IMPORT (c117): the active object format's extern-DATA
     // binding model (got-indirect / copy-relocation), captured here for the
     // SAME reason as `externCallDispatch` — the LOWER half (which sees only
@@ -1137,7 +1166,19 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // with the linker's slot pass, which reads the format
                       // directly. Defaulted only so the positional tail stays
                       // additive; program.cpp passes it.
-                      std::vector<SymbolBinding> indirectSlotBindings = {});
+                      std::vector<SymbolBinding> indirectSlotBindings = {},
+                      // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
+                      // the format's DECLARED set of definition bindings
+                      // this artifact's LOADER may replace with another
+                      // image's body, pre-resolved in program.cpp for the
+                      // same reason the facts above are. Empty = nothing is
+                      // preemptible. ⚠ PASSED AT THE CALL SITE, NOT LEFT TO
+                      // THE DEFAULT, for the reason the narrowing above
+                      // states one level sharper: a merged module lowered
+                      // without it emits the DIRECT branch that is the
+                      // whole defect, and nothing downstream can tell that
+                      // branch from a legitimately module-private one.
+                      std::vector<SymbolBinding> preemptibleDefinitionBindings = {});
 
 // Link N assembled CUs into one image + commit to `outPath` (the shared half of
 // `compileSingleUnit`). N==1 is the v1 single-CU path; N>1 triggers the linker's

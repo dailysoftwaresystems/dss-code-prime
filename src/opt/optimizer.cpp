@@ -49,7 +49,9 @@ struct PassRunResult {
                                     OptPipeline const& pipeline,
                                     DiagnosticReporter& reporter,
                                     passes::InlineGrowthLedger& inlineLedger,
-                                    std::optional<bool> charIsUnsigned) {
+                                    std::optional<bool> charIsUnsigned,
+                                    std::span<SymbolBinding const>
+                                        preemptibleDefinitionBindings) {
     switch (id) {
         case PassId::Identity:
             return {true, false};  // no-op; exercises the engine wiring.
@@ -98,7 +100,10 @@ struct PassRunResult {
             auto const r = passes::runInlining(
                 mir, interner, reporter, pipeline.inlineThreshold,
                 pipeline.inlineCallerGrowthPercent, inlineLedger,
-                pipeline.verifyEveryPass);
+                pipeline.verifyEveryPass,
+                // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the
+                // load-time half of the pass's own gate rule 2.
+                preemptibleDefinitionBindings);
             return {r.ok, r.callsInlined > 0};
         }
     }
@@ -257,6 +262,9 @@ struct ScheduleInterpreter {
     // see `optimize`'s doc comment for why it is a relayed value and not read
     // off `target` here.
     std::optional<bool> charIsUnsigned;
+    // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: threaded to the Inlining
+    // leaf, for the reason stated one line up about `charIsUnsigned`.
+    std::span<SymbolBinding const> preemptibleDefinitionBindings;
 
     // Failure latch — once a pass or a verify fails, unwind without
     // running anything further (the pre-tree early `return result`).
@@ -411,7 +419,8 @@ struct ScheduleInterpreter {
         }
         auto const passResult =
             runPass(p, mir, target, interner, pipeline, reporter,
-                    inlineLedger, charIsUnsigned);
+                    inlineLedger, charIsUnsigned,
+                    preemptibleDefinitionBindings);
         if (optTrace) {
             auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
@@ -529,7 +538,9 @@ OptResult optimize(Mir& mir,
                    OptPipeline const& pipeline,
                    DiagnosticReporter& reporter,
                    std::span<ExternImport const> externImports,
-                   std::optional<bool> charIsUnsigned) {
+                   std::optional<bool> charIsUnsigned,
+                   std::span<SymbolBinding const>
+                       preemptibleDefinitionBindings) {
     // D-OPT1-RETURN-FALSE-DIAGNOSTIC-CONTRACT: a false return MUST
     // be paired with a new error. Snapshot + belt-and-suspenders
     // emit below covers any future failure path that forgets to.
@@ -569,7 +580,8 @@ OptResult optimize(Mir& mir,
     ScheduleInterpreter interp{mir, target, interner, pipeline, reporter,
                                result, entryErrorCount,
                                std::getenv("DSS_OPT_TRACE") != nullptr,
-                               inlineLedger, charIsUnsigned};
+                               inlineLedger, charIsUnsigned,
+                               preemptibleDefinitionBindings};
     interp.run(pipeline.schedule, std::string{});
     if (interp.stopped) {
         // A failed pass / failed verify unwinds WITHOUT the epilogues —

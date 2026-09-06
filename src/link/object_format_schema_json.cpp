@@ -357,7 +357,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // (absence is "makes no claim", the deleted table's own behaviour for an
     // unlisted target), so the asymmetry applies in its harmless direction.
     // 32 + 1 = 33.
-    static constexpr std::array<std::string_view, 38> kFormatDocumentKeys{
+    static constexpr std::array<std::string_view, 39> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -406,6 +406,15 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // "correct but slower" and is exactly the state this key exists to
         // end, so it must not be reachable by a misspelling.
         "indirectSlotBindings",
+        // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: WHICH of this
+        // artifact's OWN definitions the loader may replace, so a reference
+        // made inside the artifact must be loader-resolved rather than bound to
+        // the local body. Registered here so a typo is REFUSED AT LOAD naming
+        // the file rather than silently leaving nothing preemptible — the
+        // failure this key exists to end is exactly a SILENT one (one process,
+        // two answers for one symbol), so it must not be reachable by a
+        // misspelling.
+        "preemptibleDefinitionBindings",
         // D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET: the
         // OBJECT-CARRIED realization of `dataImportBinding` — the spelling a
         // RELOCATABLE artifact publishes its own data-import slot under,
@@ -1401,6 +1410,104 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     break;
                 }
                 if (!dupe) data.indirectSlotBindings.push_back(*b);
+            }
+        }
+    }
+
+    // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
+    // `preemptibleDefinitionBindings` — WHICH of this artifact's OWN
+    // externally-visible definitions the artifact's LOADER may replace with
+    // another image's definition, so a reference made INSIDE the artifact must
+    // be resolved by the loader instead of bound to the local body. An ARRAY of
+    // closed-vocabulary `SymbolBinding` names: `["global", "weak"]` on an ELF
+    // shared object, `["weak"]` on a Mach-O dylib. Optional; ABSENT = nothing is
+    // preemptible, the behaviour every artifact had before this key existed.
+    //
+    // ⚠ THE ABSENT-KEY DEFAULT IS THE OPPOSITE OF `indirectSlotBindings`' AND
+    // THE EMPTY-ARRAY REFUSAL IS THEREFORE NOT THE SAME RULE, though the wording
+    // rhymes. There, an empty array silently CANCELS an outer declaration; here
+    // there is no outer declaration, so an empty array says exactly what
+    // omitting the key says — and a key present-but-meaningless is an authoring
+    // mistake, not a declaration. Refused for that reason rather than absorbed.
+    // The `externCallDispatch` PAIRING rule is validate()'s, not this loader's:
+    // key ORDER in a JSON object is not guaranteed, so a rule reading two keys
+    // belongs where both are already parsed.
+    if (doc.contains("preemptibleDefinitionBindings")) {
+        if (!doc.at("preemptibleDefinitionBindings").is_array()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/preemptibleDefinitionBindings",
+                      std::format("'preemptibleDefinitionBindings' must be an "
+                                  "ARRAY of symbol BINDING names (accepted: "
+                                  "{})",
+                                  allowedList(allNames(kSymbolBindingTable),
+                                              ", ")));
+        } else {
+            auto const& arr = doc.at("preemptibleDefinitionBindings");
+            if (arr.empty()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/preemptibleDefinitionBindings",
+                          "'preemptibleDefinitionBindings' is present but "
+                          "EMPTY, which says exactly what OMITTING the key "
+                          "says — nothing is preemptible. A key that declares "
+                          "nothing still reads as an authoritative answer to "
+                          "the next person who greps for it, so it is refused "
+                          "rather than absorbed: remove it, or name the "
+                          "bindings this artifact's loader may replace.");
+            }
+            std::size_t i = 0;
+            for (auto const& row : arr) {
+                auto const path =
+                    std::format("/preemptibleDefinitionBindings/{}", i);
+                ++i;
+                if (!row.is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format("each preemptibleDefinitionBindings "
+                                          "entry must be a symbol binding NAME "
+                                          "string (accepted: {})",
+                                          allowedList(
+                                              allNames(kSymbolBindingTable),
+                                              ", ")));
+                    continue;
+                }
+                auto const spelling = row.get<std::string>();
+                auto const b = symbolBindingFromName(spelling);
+                if (!b.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format("unknown symbol binding '{}' — "
+                                          "accepted: {}", spelling,
+                                          allowedList(
+                                              allNames(kSymbolBindingTable),
+                                              ", ")));
+                    continue;
+                }
+                if (*b == SymbolBinding::Local) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format(
+                                  "'{}' is a MODULE-PRIVATE binding, so naming "
+                                  "it here declares a member that can never "
+                                  "match: a local definition is in no image's "
+                                  "dynamic export set, so no loader can see it "
+                                  "and none can replace it — under ANY format. "
+                                  "Name only bindings a published definition "
+                                  "can carry: {}.",
+                                  spelling,
+                                  allowedList(allNames(kSymbolBindingTable),
+                                              ", ")));
+                    continue;
+                }
+                bool dupe = false;
+                for (auto const prior : data.preemptibleDefinitionBindings) {
+                    if (prior != *b) continue;
+                    coll.emit(DiagnosticCode::C_MalformedJson, path,
+                              std::format(
+                                  "duplicate symbol binding '{}' — this is a "
+                                  "SET, and a repeated member is an authoring "
+                                  "mistake this loader will not silently "
+                                  "absorb.", spelling));
+                    dupe = true;
+                    break;
+                }
+                if (!dupe) data.preemptibleDefinitionBindings.push_back(*b);
             }
         }
     }

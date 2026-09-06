@@ -20,3 +20,9 @@ dss_add_test(NAME analysis/syntactic/test_significant_newline SOURCES test_signi
 # cliff the pin exists to catch.
 dss_add_test(NAME analysis/syntactic/test_parser_decl_specifier_lead SOURCES test_parser_decl_specifier_lead.cpp)
 dss_add_test(NAME analysis/syntactic/test_corpus                SOURCES test_corpus.cpp)
+# D-PARSE-SPECULATION-REFUSAL-REPLAY-IS-QUADRATIC: the refusal one past the
+# speculation-depth ceiling used to cost Theta(D^2). The cost pin is on the
+# parser's own tokenAccessCount (deterministic), the loudness pin is at a LARGE
+# ceiling, and the identity pin renders every tree so the two renditions can be
+# diffed byte-for-byte. See the file header.
+dss_add_test(NAME analysis/syntactic/test_parser_speculation_refusal_cost SOURCES test_parser_speculation_refusal_cost.cpp)

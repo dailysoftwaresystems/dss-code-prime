@@ -955,14 +955,28 @@ TEST(ElfImageSymtabPartition, RealPipelineExecPublishesLocalBandForStatics) {
 // with the ET_REL spec as its second tier. So the corpus manifest is the RUN
 // witness for the IMAGE half only, and the `.o` half's witness is this test.
 //
-// ⚠ `vis_tail` IS THE CONTROL, NOT A SECOND SUBJECT, and the reason is a
-// MEASURED front-end gap this lane did not own: its `visibility("hidden")` sits
-// on a PROTOTYPE and the definition follows, and DSS does not merge the
-// declaration's visibility onto the definition — so its `ModuleSymbol` carries
-// `Default` and it is emitted `GLOBAL DEFAULT`. gcc and clang both merge and
-// emit `GLOBAL HIDDEN`. That divergence is real, is reported, and lives in the
-// HIR linkage merge rather than in any writer; asserting `Default` here is what
-// keeps this pin honest about what it does and does not prove.
+// ★★ `vis_tail` IS NOW A SECOND SUBJECT, AND THE FLIP IS THE POINT.
+//
+// This pin used to assert `vis_tail` is `GLOBAL DEFAULT` and say so as a
+// CONTROL, because its `visibility("hidden")` sits on a PROTOTYPE and the
+// definition follows, and the front end did not merge a declaration's declared
+// linkage onto the definition — so its `ModuleSymbol` carried `Default` while
+// gcc 13.3.0 and clang 18.1.3 both emit `GLOBAL HIDDEN`. That control carried
+// its own expiry in place: "If this ever reads HIDDEN the gap closed and this
+// control must become a second subject."
+//
+// The gap closed — D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION,
+// fixed in the HIR linkage fold (`cst_to_hir.cpp`'s `mergeDeclaredLinkage`),
+// NOT in any writer — so the assertion is INVERTED rather than deleted: it now
+// demands `STV_HIDDEN`, which is strictly STRONGER than what it demanded before
+// and which the whole writer path below must carry unchanged. `vis_lead` (the
+// definition-position spelling) stays the first subject, and `main` remains the
+// GLOBAL DEFAULT control that makes either reading possible at all.
+//
+// ⚠ THE TWO SUBJECTS ARE NOT REDUNDANT. They enter the writer from DIFFERENT
+// front-end paths — a definition's own fold versus a fold inherited across a
+// redeclaration — and only `vis_tail` can catch the inheritance being lost
+// between HIR and the emitted `st_other`.
 TEST(ElfHiddenVisibility, CalledHiddenFunctionKeepsGlobalBindingOnBothTiers) {
     using dss::test_support::Location;
     using dss::test_support::ScratchDir;
@@ -1045,16 +1059,23 @@ TEST(ElfHiddenVisibility, CalledHiddenFunctionKeepsGlobalBindingOnBothTiers) {
             << tier.label
             << ": the CONTROL must NOT pick up the hidden row's st_other";
 
-        // CONTROL 2 — the prototype-position case, whose visibility the front
-        // end does not merge onto the definition (see this test's docblock).
+        // SUBJECT 2 — the PROTOTYPE-position spelling. Its `visibility("hidden")`
+        // rides a declaration the definition does not repeat, so it reaches this
+        // writer only if the front end folded the entity's declared linkage
+        // across its declarations
+        // (D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION).
         SymRecord const* const tail = findRecord(symtab, "vis_tail");
         ASSERT_NE(tail, nullptr) << tier.label;
-        EXPECT_EQ(tail->other, kVisDefault)
+        EXPECT_EQ(tail->info, kInfoGlobalFunc)
             << tier.label
-            << ": `vis_tail`'s visibility rides a PROTOTYPE and DSS does not "
-               "merge it onto the definition — a MEASURED front-end gap, not a "
-               "writer one. If this ever reads HIDDEN the gap closed and this "
-               "control must become a second subject";
+            << ": a `visibility(\"hidden\")` function has EXTERNAL LINKAGE "
+               "however the attribute reached it";
+        EXPECT_EQ(tail->other, kVisHidden)
+            << tier.label
+            << ": `vis_tail`'s visibility rides a PROTOTYPE and the definition "
+               "carries none of its own; DEFAULT here means the fold across the "
+               "entity's declarations was lost and this symbol is EXPORTED where "
+               "gcc 13.3.0 and clang 18.1.3 both emit GLOBAL HIDDEN";
 
         EXPECT_EQ(elfSymtabPartitionBreach(symtab.raw, symtab.shInfo), "")
             << tier.label;
@@ -1066,6 +1087,14 @@ TEST(ElfHiddenVisibility, CalledHiddenFunctionKeepsGlobalBindingOnBothTiers) {
             EXPECT_EQ(findRecord(dynsym, "vis_lead"), nullptr)
                 << tier.label
                 << ": a hidden symbol must never reach the dynamic export set";
+            // …and the inherited-visibility spelling is held to the SAME rule.
+            // Before the fold landed, `vis_tail` was DEFAULT and this assertion
+            // would have been vacuous for the wrong reason.
+            EXPECT_EQ(findRecord(dynsym, "vis_tail"), nullptr)
+                << tier.label
+                << ": a symbol made hidden by a PRIOR declaration is just as "
+                   "hidden — the export set cannot depend on which declaration "
+                   "spelled the attribute";
         }
     }
 }

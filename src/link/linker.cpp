@@ -276,7 +276,47 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                 //    every referenced libc import on an exec would reject loud —
                 //    catastrophic. The `else` below (referenced + library-bound)
                 //    keeps the row silently.
-                if (!allowUndefinedExterns
+                // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: ASKED
+                // FIRST, BECAUSE THE ARMS BELOW WOULD ALL SAY SOMETHING FALSE.
+                // A preemption reference is unbound BY DESIGN — the loader must
+                // search its GLOBAL scope, because the winner may be any image
+                // in the process including this one — so it reaches this gate
+                // looking exactly like a missing import while being neither
+                // missing nor an import. On a format whose artifacts CAN carry
+                // such a reference (a relocatable object, an ELF `.so`) the
+                // `allowUndefinedExterns` guard already lets it through
+                // untouched. On one that cannot, the honest report is not "no
+                // compilation unit defines it" — the module defines it three
+                // lines away in its own symbol table, and telling an author to
+                // "link a definition" for a symbol they just defined sends them
+                // hunting for a bug that is ours.
+                if (!allowUndefinedExterns && ext.isPreemptionReference) {
+                    report(reporter, DiagnosticCode::K_SymbolUndefined,
+                           DiagnosticSeverity::Error,
+                           "cannot route the call to '" + ext.mangledName
+                           + "' — this artifact DEFINES that symbol, and the "
+                             "active object format declares its binding "
+                             "PREEMPTIBLE ('preemptibleDefinitionBindings'), so "
+                             "a call made inside the artifact must be resolved "
+                             "by the LOADER rather than branched to the local "
+                             "body: another image in the process may define the "
+                             "same name and win, and an image that branched to "
+                             "its own body would then disagree with every other "
+                             "image about what one identifier means. But this "
+                             "format's artifacts cannot carry a reference "
+                             "resolved from the loader's GLOBAL scope — every "
+                             "import here binds against a NAMED library — so "
+                             "the routed reference has nowhere to go. Refusing "
+                             "rather than emitting the direct branch, which "
+                             "compiles, links, loads and silently answers the "
+                             "wrong question. Remove "
+                             "'preemptibleDefinitionBindings' from this "
+                             "format's `.format.json` if its loader really does "
+                             "bind such a definition locally, or emit this "
+                             "translation unit for a format whose loader "
+                             "resolves from the global scope. "
+                             "D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING.");
+                } else if (!allowUndefinedExterns
                     && ext.binding == SymbolBinding::Weak
                     && ext.isData) {
                     // ★ THE WEAK ARM, AND IT IS NOT A SOFTENING OF THE REJECT
@@ -907,9 +947,20 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
     // An extern with no cross-CU definition stays a real FFI import (resolved via the
     // import table — unchanged). Local defs are not in `winners`, so a Local of the same
     // name never satisfies an extern (correct — Local is module-private).
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: ...WITH ONE EXCEPTION,
+    // AND IT IS THE ONE THIS FOLD WOULD SILENTLY UNDO. A preemption reference is
+    // a reference to a name THIS ARTIFACT ITSELF DEFINES, routed through the
+    // loader on purpose because the format declares that definition replaceable.
+    // Its winner is therefore ALWAYS found here — by construction, since the
+    // definition it names is in this very link — and binding it to that
+    // definition would restore the direct branch MIR→LIR removed, reinstating
+    // the defect one tier below where it was fixed, with no diagnostic anywhere.
+    // The row says what it is; this loop believes it rather than re-deriving it
+    // from a name match (see `ExternImport::isPreemptionReference`).
     image.resolvedCrossCuRefs.clear();
     for (auto const& m : modules) {
         for (auto const& ext : m.externImports) {
+            if (ext.isPreemptionReference) continue;
             auto it = resolution.winners.find(ext.mangledName);
             if (it != resolution.winners.end()) {
                 image.resolvedCrossCuRefs.push_back(LinkedImage::CrossCuRef{
@@ -1493,6 +1544,21 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                             "`dataSizeBytes` (declared object size)", ext);
                 foldNonZero(kept.dataAlignBytes, ext.dataAlignBytes,
                             "`dataAlignBytes` (declared object alignment)", ext);
+                // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: OR-fold, and
+                // the direction is the whole point. If ANY contributing row is a
+                // preemption reference, the merged row must stay one — that flag is
+                // what keeps the cross-CU resolver from folding the reference back
+                // onto the definition it names, and a merged row that lost it would
+                // restore the direct branch silently, in a multi-object link only.
+                // Order-INDEPENDENT (the `isEagerImport` OR one field group up).
+                // ⓘ The two kinds are not reachable in one dedup group TODAY — an
+                // ordinary unbound reference to a name some CU defines is STRIPPED by
+                // `resolveCrossCuSymbols` before it reaches here, and a preemption row
+                // exists only where that definition exists — so this fold is a
+                // fail-SAFE, not a live path. It is written because the alternative
+                // failure is silent and the guard costs one `||`.
+                kept.isPreemptionReference =
+                    kept.isPreemptionReference || ext.isPreemptionReference;
                 // Every remaining ExternImport field is accounted for: `symbol` IS the
                 // dedup output (replaced by the canonical merged id above), and
                 // `mangledName` / `libraryPath` / `version` are the KEY, hence equal

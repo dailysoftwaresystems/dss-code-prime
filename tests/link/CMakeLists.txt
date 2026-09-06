@@ -577,3 +577,14 @@ dss_add_test(NAME link/test_macho_object_trailer_alignment
 # structural pin describe ONE artifact.
 dss_add_test(NAME link/test_elf_image_symtab_partition
              SOURCES test_elf_image_symtab_partition.cpp)
+
+# D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the DECLARATION half of the
+# routing — `preemptibleDefinitionBindings`, which names the definitions of its
+# own that an artifact's LOADER may replace. Its own target because EVERY
+# failure mode of this key is silent in the SAME direction (the routing quietly
+# does not happen and the artifact looks fine), so the loader's refusals — empty
+# array, unknown spelling, `local`, a duplicate, and the missing
+# `externCallDispatch` pairing — are the only thing between a typo and the
+# divergence coming back.
+dss_add_test(NAME link/test_preemptible_definition_declaration
+             SOURCES test_preemptible_definition_declaration.cpp)

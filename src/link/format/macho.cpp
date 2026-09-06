@@ -4493,12 +4493,15 @@ encodeExecDynamic(AssembledModule const&    module,
     // is what lands in __LINKEDIT at `dyldBindOff`; the load-command
     // emission below picks the matching LC.
     //
-    // D-LK6-14-INTEGRATION-PAYLOAD (this commit): the chained-fixups
-    // arm calls `dss::macho::detail::buildChainedFixupsPayload` and
-    // emits LC_DYLD_CHAINED_FIXUPS pointing at the result. __got
-    // slots remain zero-initialized — D-LK6-14-INTEGRATION-GOT-SLOTS
-    // is the companion fold that populates them as
-    // DYLD_CHAINED_PTR_64 bitfields + drops LC_DYSYMTAB.
+    // D-LK6-14-INTEGRATION-PAYLOAD: the chained-fixups arm calls
+    // `dss::macho::detail::buildChainedFixupsPayload` and emits
+    // LC_DYLD_CHAINED_FIXUPS pointing at the result;
+    // D-LK6-14-INTEGRATION-GOT-SLOTS is the companion fold that
+    // populates the __got slots as DYLD_CHAINED_PTR_64 bitfields.
+    // ⚠ That fold ALSO dropped LC_DYSYMTAB, and
+    // [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]]
+    // put it back: the two commands are ORTHOGONAL, exactly as they
+    // are in ld64's own chained output.
     bool const useChainedFixups = im.useChainedFixups;
     std::vector<std::uint8_t> dyldBindBlob;
     // `chainedImports` is built in section (i) for the chained path
@@ -4830,23 +4833,77 @@ encodeExecDynamic(AssembledModule const&    module,
     //       [numDefs .. numDefs + numExterns) by construction.
     std::uint32_t const numDefs =
         static_cast<std::uint32_t>(nlistBytes.size() / kNlist64Size);
+    //
+    // ⚠⚠ THE TABLE IS BUILT ON BOTH PATHS, AND THE "REDUNDANT ON CHAINED"
+    // PREMISE THAT ONCE SKIPPED IT IS REFUTED —
+    // [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]].
+    // D-LK6-14-INTEGRATION-GOT-SLOTS (a prose-only id — it names the second
+    // half of D-LK6-14-INTEGRATION-PAYLOAD's fold and never had a registry row
+    // of its own, so it is deliberately NOT written as a `[[...]]` link that
+    // would resolve nowhere) dropped this construction, the
+    // LC_DYSYMTAB that publishes it and the __LINKEDIT region that holds it
+    // whenever `useChainedFixups` was set, reasoning that a chained pointer in
+    // __got encodes its import ordinal directly so nothing needs the indirect
+    // symbol table. ★ THAT IS TRUE FOR BINDING AND FALSE FOR TOOLING, and the
+    // difference is not cosmetic: `dyld_info -fixups` SIGSEGVs
+    // (EXC_BAD_ACCESS, KERN_INVALID_ADDRESS at 0x0, top frame
+    // `other_tools::SymbolicatedImage::addStubSymbols()`) on an image that
+    // omits it, because that routine names __stubs/__got slots THROUGH this
+    // table and dereferences it unconditionally. ⚠ dyld itself LOADS AND RUNS
+    // the image either way (rc 42 on both), so no exit code and no green suite
+    // can see this — only a reader of the artifact can.
+    //
+    // ✔MEASURED on Apple Silicon (macOS 26.6.2, Apple clang 21.0.0 / ld-1267),
+    // ONE program linked TWICE with only the fixup encoding moving — `cc` for
+    // the chained arm, `cc -Wl,-no_fixup_chains` for the CONTROL. Without that
+    // control "ld64 emits LC_DYSYMTAB" is equally consistent with "ld64 always
+    // does", which is not the question; the question is whether its CHAINED arm
+    // keeps it. It does, and the SHAPE is identical: LC_DYSYMTAB present on
+    // both, `__stubs.reserved1` 0 and `__got.reserved1` 1 on both, one indirect
+    // entry per stub then one per __got slot on both, each naming an UNDEFINED
+    // external symbol.
+    //
+    // ⚠ WHAT IS *NOT* IDENTICAL IS THE CONTENT, and saying "only the
+    // __la_symbol_ptr entry disappears" would be FALSE — two of ld64's three
+    // legacy entries move. Legacy: `[_puts (stubs), dyld_stub_binder (got),
+    // _puts (la_symbol_ptr)]`. Chained: `[_puts (stubs), _puts (got)]`. So the
+    // chained arm drops the `__la_symbol_ptr` entry WITH its section, AND its
+    // `__got` entry names the REAL import where the legacy arm's names
+    // `dyld_stub_binder` — because lazy binding is what needs that helper and
+    // a chained image has no lazy binding. ⇒ ld64's own two arms differ in the
+    // __got band's SYMBOL; they do not differ in whether the table exists or in
+    // where the two bands begin.
+    //
+    // ★ DSS HAS NEITHER MOVING PART, which is why the shape below is the same
+    // on both of ITS paths: the writer emits no `__la_symbol_ptr` section and
+    // synthesizes no `dyld_stub_binder` (it has no lazy-binding stub helper at
+    // all), so its two bands name real externs whichever binding encoding is
+    // selected. ⇒ the shape below is already ld64's shape; it was the SKIP that
+    // was wrong, so the skip is gone rather than a second chained-only shape
+    // being invented.
+    //
+    // ★★ THE DISCRIMINATOR THAT SAYS *WHY*, on the reference's OWN bytes, and
+    // it is kept because "DSS reads clean now" alone is consistent with some
+    // other difference having helped. Take ld64's chained exec, rewrite ONLY
+    // its LC_DYSYMTAB as an equally-sized ignorable LC_SOURCE_VERSION so every
+    // later byte offset is unchanged, re-sign, and `dyld_info -fixups`
+    // SIGSEGVs on it (rc 139) — while the SAME copy re-signed WITHOUT the
+    // patch reads fine (rc 0), which is what rules the re-sign step out. Both
+    // patched arms still RUN (rc 42). ⓘ `otool -Iv` survives and says the
+    // quiet part: "entries extends past the end of the indirect symbol table",
+    // "reserved1 field greater than the table size" — the two `reserved1`
+    // origins below are what it is complaining about.
     std::vector<std::uint32_t> indirectSyms;
-    if (!useChainedFixups) {
-        // D-LK6-14-INTEGRATION-GOT-SLOTS: chained pointers in __got
-        // encode the import ordinal directly, so the indirect symbol
-        // table is redundant. Skip construction (and the matching
-        // LC_DYSYMTAB + __LINKEDIT emission below) on chained path.
-        indirectSyms.reserve(numFuncExterns + numExterns);
-        // __stubs band: one entry per FUNCTION extern (compacted — a DATA extern
-        // has no stub, D-LK-MACHO-DATA-EXTERN-DEAD-STUB), the func extern's
-        // undefined-symbol index. Order MATCHES the stub-emit loop (funcExternIdxs).
-        for (std::size_t j = 0; j < numFuncExterns; ++j)
-            indirectSyms.push_back(
-                numDefs + static_cast<std::uint32_t>(funcExternIdxs[j]));
-        // __got band: one entry per extern (LOCKSTEP with the __got slots).
-        for (std::size_t i = 0; i < numExterns; ++i)
-            indirectSyms.push_back(numDefs + static_cast<std::uint32_t>(i));
-    }
+    indirectSyms.reserve(numFuncExterns + numExterns);
+    // __stubs band: one entry per FUNCTION extern (compacted — a DATA extern
+    // has no stub, D-LK-MACHO-DATA-EXTERN-DEAD-STUB), the func extern's
+    // undefined-symbol index. Order MATCHES the stub-emit loop (funcExternIdxs).
+    for (std::size_t j = 0; j < numFuncExterns; ++j)
+        indirectSyms.push_back(
+            numDefs + static_cast<std::uint32_t>(funcExternIdxs[j]));
+    // __got band: one entry per extern (LOCKSTEP with the __got slots).
+    for (std::size_t i = 0; i < numExterns; ++i)
+        indirectSyms.push_back(numDefs + static_cast<std::uint32_t>(i));
 
     for (std::size_t i = 0; i < numExterns; ++i) {
         auto const& ext = module.externImports[i];
@@ -5031,11 +5088,12 @@ encodeExecDynamic(AssembledModule const&    module,
     //       + [LC_DYLD_EXPORTS_TRIE when emitExportsTrieCmd]
     //       + [LC_LOAD_DYLINKER] + [LC_MAIN] + [LC_ID_DYLIB]
     //       + N × LC_LOAD_DYLIB
-    //       + LC_SYMTAB + (LC_DYSYMTAB when !useChainedFixups —
-    //       D-LK6-14-INTEGRATION-GOT-SLOTS drops it because chained
-    //       pointers in __got encode the import ordinal directly, so
-    //       the indirect symbol table is redundant) + LC_CODE_SIGNATURE
-    //       when emitCodeSig + LC_BUILD_VERSION when emitBuildVersion.
+    //       + LC_SYMTAB + LC_DYSYMTAB (UNCONDITIONAL — ld64 emits it on
+    //       the chained path too, ✔MEASURED with the -no_fixup_chains
+    //       control; see the indirect-symbol construction above and
+    //       [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]])
+    //       + LC_CODE_SIGNATURE when emitCodeSig + LC_BUILD_VERSION when
+    //       emitBuildVersion.
     // Segment count: __TEXT + __LINKEDIT = 2, plus __PAGEZERO
     // (exec-flavor only), __DATA_CONST (externs present), __DATA
     // (writable globals — D-LK4-DATA-PRODUCER).
@@ -5049,7 +5107,7 @@ encodeExecDynamic(AssembledModule const&    module,
         + (isDylib ? 1u : 0u)          // LC_ID_DYLIB
         + (isDylib ? 0u : 1u)          // LC_MAIN
         + emittedDylibs.size() + 1u    // N × LC_LOAD_DYLIB (schema ∪ referenced)
-        + (useChainedFixups ? 0u : 1u)
+        + 1u                           // LC_DYSYMTAB (both binding paths)
         + (emitExportsTrieCmd ? 1u : 0u)
         + (emitCodeSig ? 1u : 0u)
         + (emitBuildVersion ? 1u : 0u));
@@ -5063,8 +5121,7 @@ encodeExecDynamic(AssembledModule const&    module,
         segCmdPageZeroActual + kSegCmdTextSize + segCmdDataConstActual +
         kSegCmdDataSize + kSegCmdLinkeditSize + dyldBindCmdSize +
         dylinkerCmdSizeActual + lcMainSizeActual + idDylibCmdSize +
-        totalDylibCmdSize + kSymtabCommandSize +
-        (useChainedFixups ? 0u : kDysymtabCommandSize) +
+        totalDylibCmdSize + kSymtabCommandSize + kDysymtabCommandSize +
         (emitExportsTrieCmd ? kLinkeditDataCommandSize : 0u) +
         (emitCodeSig ? kCodeSigCommandSize : 0u) +
         (emitBuildVersion ? kBuildVersionCommandSize : 0u);
@@ -5640,14 +5697,19 @@ encodeExecDynamic(AssembledModule const&    module,
     // Indirect-symtab reserved1 indices: __stubs uses [0..numFuncExterns) —
     // one entry per FUNCTION extern (a DATA extern has no stub,
     // D-LK-MACHO-DATA-EXTERN-DEAD-STUB) — and __got uses
-    // [numFuncExterns .. numFuncExterns + numExterns). On the chained-fixups
-    // path the indirect symbol table is absent; reserved1 = 0 for both
-    // sections (D-LK6-14-INTEGRATION-GOT-SLOTS — chained pointers in __got
-    // encode the ordinal directly).
+    // [numFuncExterns .. numFuncExterns + numExterns).
+    //
+    // ⚠ BOTH BINDING PATHS, and the chained arm used to zero them —
+    // [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]]. A
+    // `reserved1` on an `S_SYMBOL_STUBS` / `S_NON_LAZY_SYMBOL_POINTERS`
+    // section is that section's ORIGIN in the indirect symbol table, so
+    // zeroing __got's makes its slots claim the __stubs band's entries — the
+    // wrong symbol named for every __got slot, in a table Apple's inspectors
+    // read. ✔MEASURED: ld64's chained arm and its `-no_fixup_chains` control
+    // publish the SAME pair (0 and 1 for one function extern).
     constexpr std::uint32_t kStubsReserved1 = 0;
-    std::uint32_t const kGotReserved1 = useChainedFixups
-        ? 0u
-        : static_cast<std::uint32_t>(numFuncExterns);
+    std::uint32_t const kGotReserved1 =
+        static_cast<std::uint32_t>(numFuncExterns);
 
     // ── (m) Emit bytes ───────────────────────────────────────────
     std::vector<std::uint8_t> bytes;
@@ -6049,7 +6111,9 @@ encodeExecDynamic(AssembledModule const&    module,
         // The 16-byte linkedit_data_command points at the
         // buildChainedFixupsPayload blob in __LINKEDIT. Companion
         // D-LK6-14-INTEGRATION-GOT-SLOTS populates __got slots with
-        // DYLD_CHAINED_PTR_64 bitfields + drops LC_DYSYMTAB below.
+        // DYLD_CHAINED_PTR_64 bitfields. LC_DYSYMTAB below is emitted
+        // BESIDE this command, not instead of it —
+        // [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]].
         appendU32LE(bytes, LC_DYLD_CHAINED_FIXUPS);
         appendU32LE(bytes, static_cast<std::uint32_t>(kLinkeditDataCommandSize));
         appendU32LE(bytes, static_cast<std::uint32_t>(bindOff));
@@ -6140,38 +6204,37 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, static_cast<std::uint32_t>(strtabOff));
     appendU32LE(bytes, static_cast<std::uint32_t>(strtabSize));
 
-    if (!useChainedFixups) {
-        // LC_DYSYMTAB (indirect symbol table for __stubs/__got).
-        // D-LK6-14-INTEGRATION-GOT-SLOTS CLOSED: chained fixups make
-        // this LC redundant — the chained pointers in __got encode
-        // the import ordinal directly via DYLD_CHAINED_PTR_64 row
-        // bits[0..23]. The entire block is skipped on chained path
-        // (the ncmds/sizeofcmds arithmetic above accounts for the
-        // absence). Indirect-symtab byte emission below is similarly
-        // skipped.
-        appendU32LE(bytes, LC_DYSYMTAB);
-        appendU32LE(bytes, static_cast<std::uint32_t>(kDysymtabCommandSize));
-        // The three bands `appendImageDefinedBands` laid the table out in:
-        // [0, numLocals) local, [numLocals, numDefs) externally defined,
-        // [numDefs, numDefs + numExterns) undefined — the coordinates the
-        // band belt above checked (D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT).
-        appendU32LE(bytes, 0);                    // ilocalsym
-        appendU32LE(bytes, numLocals);            // nlocalsym
-        appendU32LE(bytes, numLocals);            // iextdefsym
-        appendU32LE(bytes, numDefs - numLocals);  // nextdefsym
-        appendU32LE(bytes, numDefs);              // iundefsym
-        appendU32LE(bytes,
-                    static_cast<std::uint32_t>(numExterns));  // nundefsym
-        appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // toc
-        appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // modtab
-        appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // extrefsym
-        appendU32LE(bytes,
-                    static_cast<std::uint32_t>(indirectSymtabOff));
-        appendU32LE(bytes,
-                    static_cast<std::uint32_t>(indirectSyms.size()));
-        appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // extrel
-        appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // locrel
-    }
+    // LC_DYSYMTAB (indirect symbol table for __stubs/__got) — emitted on BOTH
+    // binding paths. D-LK6-14-INTEGRATION-GOT-SLOTS skipped the whole block
+    // whenever `useChainedFixups` was set, on the premise that a chained
+    // pointer carries its import ordinal in DYLD_CHAINED_PTR_64 row bits and so
+    // needs no indirect symbol table.
+    // [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]]
+    // REFUTES it: redundant for BINDING, load-bearing for TOOLING — see the
+    // indirect-symbol construction above for the crash and for the ld64
+    // measurement (with its `-no_fixup_chains` control) that fixed this shape.
+    appendU32LE(bytes, LC_DYSYMTAB);
+    appendU32LE(bytes, static_cast<std::uint32_t>(kDysymtabCommandSize));
+    // The three bands `appendImageDefinedBands` laid the table out in:
+    // [0, numLocals) local, [numLocals, numDefs) externally defined,
+    // [numDefs, numDefs + numExterns) undefined — the coordinates the
+    // band belt above checked (D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT).
+    appendU32LE(bytes, 0);                    // ilocalsym
+    appendU32LE(bytes, numLocals);            // nlocalsym
+    appendU32LE(bytes, numLocals);            // iextdefsym
+    appendU32LE(bytes, numDefs - numLocals);  // nextdefsym
+    appendU32LE(bytes, numDefs);              // iundefsym
+    appendU32LE(bytes,
+                static_cast<std::uint32_t>(numExterns));  // nundefsym
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // toc
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // modtab
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // extrefsym
+    appendU32LE(bytes,
+                static_cast<std::uint32_t>(indirectSymtabOff));
+    appendU32LE(bytes,
+                static_cast<std::uint32_t>(indirectSyms.size()));
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // extrel
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // locrel
 
     // LK7: LC_CODE_SIGNATURE placeholder. linkedit_data_command =
     // cmd(4) cmdsize(4) dataoff(4) datasize(4). Plan 16 fills the

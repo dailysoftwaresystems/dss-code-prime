@@ -216,12 +216,34 @@ TEST(ParserSpeculationCeilings, EveryCeilingIsConfigDriven) {
     auto spec = (*loaded)->maxSpeculationDepth();
     ASSERT_TRUE(spec.has_value())
         << "c `parser.maxSpeculationDepth` must reach the schema";
-    // 2048 since P60 (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED):
-    // the drive is heap-driven, so the value is bounded by the MEMORY a live
-    // probe's checkpoint costs (quadratic in depth — ✔MEASURED 332 MiB at 2048,
-    // 1.2 GiB at 4096), not by a host stack. The `$parserComment` in
-    // `c.lang.json` carries the whole derivation.
-    EXPECT_EQ(*spec, 2048u) << "shipped c speculation-depth ceiling";
+    // 16383 since P62 (D-PARSE-SPECULATION-REFUSAL-REPLAY-IS-QUADRATIC): the
+    // drive is heap-driven, so the value is not bounded by a host stack.
+    //
+    // ★ THIS COMMENT IS THE RECORD OF TWO DEAD PREMISES, AND SAYING SO HERE IS
+    // THE POINT. It once read "bounded by the MEMORY a live probe's checkpoint
+    // costs (quadratic in depth — ✔MEASURED 332 MiB at 2048, 1.2 GiB at
+    // 4096)". P61 replaced that checkpoint with the O(1) trail in
+    // `src/core/types/speculation_trail.hpp`: ✔MEASURED 65536 nested casts
+    // compile rc 0 at a FLAT 12.7–12.8 MiB, so the quadratic MEMORY the value
+    // was pinned to stopped existing. What held it at 2048 afterwards was the
+    // REFUSAL cost — Θ(D²) one cast past the ceiling, which hung the gate when
+    // P61 tried 16384 — and P62 made that linear (✔MEASURED 0.29 / 0.32 /
+    // 0.39 / 0.48 s at caps 256 / 512 / 1024 / 2048, and 8.41 s at 65537
+    // against an inferred ~18 HOURS before). With both gone the raise landed:
+    // ✔MEASURED at 16383 the deepest chain that compiles is 16383 casts
+    // (2.64 s), 16384 is refused BY NAME (2.33 s), and this suite costs 26.5 s
+    // against 24.3 s at 2048 — ~2.2 s for an 8× working depth.
+    // ⚠ THE GAP TO THE DEEPEST WORKING REFERENCE IS 4× AND STILL OPEN: gcc
+    // 13.3.0 compiles 65536 of this shape. It is no longer a recursion, a
+    // checkpoint or the refusal curve — it is GATE TIME on the arm that must
+    // reach the ceiling, and ✔MEASURED that cost belongs to
+    // `maxExpressionDepth`, not to this key. The `$parserComment` in
+    // `c.lang.json` carries the whole derivation; this assertion is the pin
+    // that makes the number and its narration move together.
+    EXPECT_EQ(*spec, 16383u) << "shipped c speculation-depth ceiling";
+    EXPECT_GT(*spec, 2048u)
+        << "P62 raised this past the value two dead premises had held it at — "
+           "a silent revert to 2048 must be red here, not merely unnoticed";
     EXPECT_GT(*spec, 63u)
         << "ISO C23 5.2.4.1 requires 63 nesting levels of parenthesised "
            "expressions — the FLOOR, not the target";
@@ -232,15 +254,30 @@ TEST(ParserSpeculationCeilings, EveryCeilingIsConfigDriven) {
     auto factor = (*loaded)->speculationBudgetFactor();
     ASSERT_TRUE(factor.has_value())
         << "c `parser.speculationBudgetFactor` must reach the schema";
-    // 128 since P60: the outermost probe of a cast chain holds the WHOLE chain
-    // (3 tokens per cast), so at the old 64 x 64 = 4096 tokens the budget would
-    // have silently taken over from the depth ceiling at ~1365 casts.
+    // 128 since P60.
+    //
+    // ⚠⚠ THE COUPLING THAT USED TO BE ASSERTED HERE IS GONE, AND ITS PREMISE
+    // DIED IN P61. This block asserted `factor * 64 >= 3 * spec + 1` — "the
+    // operand alt's budget must hold a cast chain at the depth ceiling" — on
+    // the ground that the OUTERMOST probe of a cast chain holds the WHOLE
+    // chain at 3 tokens per cast. P61 lane `ck` made the budget a PER-PROBE
+    // charge (a probe's span MINUS the net advance of the probes nested inside
+    // it), so the outermost probe is no longer billed for its children and the
+    // arithmetic no longer describes anything. ✔MEASURED 2026-09-05 through
+    // the real CLI at the SHIPPED factor 128 with `maxSpeculationDepth`
+    // 131072 — where the dead inequality would demand a factor of 6145 —
+    // 65536 nested casts compile rc 0 in 8.4 s. The assertion was passing only
+    // because 2048 happens to sit under 2730, and it would have REFUSED any
+    // raise of the depth ceiling past that while stating a reason that had
+    // already stopped being true (D-PARSE-SPECULATION-REFUSAL-REPLAY-IS-QUADRATIC).
+    //
+    // The property that DID survive is behavioural and is pinned by
+    // `TheBudgetIsChargedPerProbeNotPerChain` below — a chain far past
+    // `factor x lookahead / 3` parses clean, and the DEPTH ceiling is what a
+    // deeper one meets. That case can go red; an arithmetic identity between
+    // two config values could only ever restate a comment.
     EXPECT_EQ(*factor, 128u) << "shipped c speculative token-budget factor";
     EXPECT_GT(*factor, 16u) << "the lift must raise it above the old hardcoded 16";
-    EXPECT_GE(*factor * 64u, 3u * *spec + 1u)
-        << "the operand alt's budget (factor x its lookahead of 64) must hold a "
-           "cast chain at the depth ceiling, or the budget — not the depth — is "
-           "what a deep cast chain meets";
 
     auto expr = (*loaded)->maxExpressionDepth();
     ASSERT_TRUE(expr.has_value())

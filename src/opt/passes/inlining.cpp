@@ -197,15 +197,51 @@ struct GateAdmission {
 [[nodiscard]] std::optional<GateAdmission>
 inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
                    MirFuncId caller, MirInstId callId,
-                   std::uint32_t inlineThreshold) {
+                   std::uint32_t inlineThreshold,
+                   std::span<SymbolBinding const>
+                       preemptibleDefinitionBindings) {
     // Rule 1: direct call to a defined callee in this module.
     auto const calleeOpt = resolveDirectCallee(mir, a, callId);
     if (!calleeOpt.has_value()) return std::nullopt;
     MirFuncId const callee = *calleeOpt;
 
-    // Rule 2: THE correctness rule — never inline a Weak callee. A
-    // strong definition of the same name may replace it at link.
+    // Rule 2: THE correctness rule — never inline a callee whose body is not
+    // the body that will run. TWO independent replacement mechanisms reach it,
+    // and the rule covered only the first until P62:
+    //
+    //   (a) LINK-TIME, and UNIVERSAL: a WEAK definition may be replaced by a
+    //       strong definition of the same name when the objects are linked.
+    //       True under every format, for every artifact flavour — so this half
+    //       is unconditional and reads nothing from config.
+    //
+    //   (b) LOAD-TIME, and DECLARED
+    //       ([[D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING]]): in an
+    //       artifact whose LOADER may hand the process a different image's body
+    //       for this name, the local body is again not the one that will run.
+    //       WHICH bindings that reaches is the format's answer, not ours: ELF
+    //       preempts `global` and `weak` alike in a shared object, Mach-O's
+    //       two-level namespace preempts only `weak`, and a main executable
+    //       preempts neither because it is always its own winner. VISIBILITY is
+    //       a universal precondition on top — a `static` or hidden-visibility
+    //       definition is in no image's dynamic export set, so no loader can
+    //       see it and inlining it stays legal in the very same object.
+    //
+    // ⚠ (b) IS NOT REDUNDANT WITH THE CALL-SITE ROUTING IT PAIRS WITH, and the
+    // half that is missing fails in the direction that looks fine: MIR→LIR
+    // routes the call through the loader, but a call the inliner already
+    // spliced away is not there to route. ✔MEASURED: with only the routing, a
+    // `.so`'s strong `st()` came out folded to a constant in its caller under
+    // the shipped `release` pipeline while the PLT stub sat beside it unused.
     if (mir.funcBinding(callee) == SymbolBinding::Weak) return std::nullopt;
+    // Half (b) delegates to the ONE owner of the load-time rule
+    // (`core/types/symbol_attrs.hpp`), which MIR→LIR's call-site routing
+    // reads too — the two must agree symbol for symbol or the splice removes
+    // exactly the call the routing is redirecting.
+    if (::dss::definitionIsPreemptible(mir.funcBinding(callee),
+                                       mir.funcVisibility(callee),
+                                       preemptibleDefinitionBindings)) {
+        return std::nullopt;
+    }
 
     // Rule 2b: TF-C78 (D-CSUBSET-NOINLINE) — never inline a callee the SOURCE
     // declared `__attribute__((noinline))`. Unlike every other rule here this
@@ -1777,7 +1813,9 @@ buildInlinePlan(Mir const& src, ModuleAnalysis const& analysis,
                 std::uint32_t callerGrowthPercent,
                 InlineGrowthLedger& ledger,
                 bool singleBlockOnly,
-                std::size_t& budgetedOut) {
+                std::size_t& budgetedOut,
+                std::span<SymbolBinding const>
+                    preemptibleDefinitionBindings) {
     planOut.clear();
     bool anyMulti = false;
 
@@ -1807,7 +1845,8 @@ buildInlinePlan(Mir const& src, ModuleAnalysis const& analysis,
             MirInstId const id = src.blockInstAt(b, ii);
             if (src.instOpcode(id) != MirOpcode::Call) continue;
             auto const adm =
-                inlineLegalityGate(src, analysis, caller, id, inlineThreshold);
+                inlineLegalityGate(src, analysis, caller, id, inlineThreshold,
+                                   preemptibleDefinitionBindings);
             if (!adm.has_value()) continue;
             bool const multi = src.funcBlockCount(adm->callee) != 1;
             if (singleBlockOnly && multi) continue;  // never spliced ⇒ never charged
@@ -1843,7 +1882,7 @@ InliningResult runInlining(Mir& mir, TypeInterner const& interner,
     InlineGrowthLedger oneShot;
     return runInlining(mir, interner, reporter, inlineThreshold,
                        kDefaultInlineCallerGrowthPercent, oneShot,
-                       maintainMarkers);
+                       maintainMarkers, {});
 }
 
 InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
@@ -1851,7 +1890,9 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
                            std::uint32_t inlineThreshold,
                            std::uint32_t callerGrowthPercent,
                            InlineGrowthLedger& ledger,
-                           bool maintainMarkers) {
+                           bool maintainMarkers,
+                           std::span<SymbolBinding const>
+                               preemptibleDefinitionBindings) {
     InliningResult result{};
     MirBuilder builder;
 
@@ -1891,7 +1932,7 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
         bool const anyMulti =
             buildInlinePlan(mir, analysis, f, plan, inlineThreshold,
                             callerGrowthPercent, ledger, singleBlockOnly,
-                            callsBudgeted);
+                            callsBudgeted, preemptibleDefinitionBindings);
         if (!singleBlockOnly && anyMulti) {
             MultiBlockInliner mb{mir, builder, plan};
             mb.rebuildFunction(f);

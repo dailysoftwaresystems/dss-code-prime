@@ -17,6 +17,15 @@
 // with it and the build fails loud: DSS reports `K_SymbolRedefinedAcrossUnits`,
 // clang's linker reports `duplicate symbol`. Both were MEASURED.
 //
+// `wmerge` is the STRONG half of the CROSS-DECLARATION pair
+// (D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION): cu_a.c writes
+// `weak` on a PROTOTYPE and defines the function PLAINLY afterwards, so the
+// binding reaches the definition only if the compiler folds a linkage facet
+// across an entity's several declarations. If it does, this strong definition
+// wins and the program observes 9; if it does not, cu_a.c's definition is ALSO
+// strong and the LINK fails on a duplicate symbol — which is exactly what DSS
+// did before the fold landed, and the loudest witness available for that half.
+//
 // Do NOT add `__attribute__((weak))` to anything in this file. Two weak
 // definitions of the same symbol make the winner an arbitrary linker choice
 // rather than a language rule, and the checks in cu_a.c would stop meaning
@@ -28,3 +37,5 @@ int wp(void) { return 8; }
 int wfun(void) { return 12; }
 int wd_lead = 5;
 int wd_tail = 5;
+
+int wmerge(void) { return 9; }

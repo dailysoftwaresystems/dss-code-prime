@@ -9,14 +9,162 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-09-05 — cycles **P14 … P61**. ⚠ P52 rewrote no handoff at all, so a reader who opened this file during P53 saw P51 described as current state; that entry in §5 was written retroactively by P53 and says so. P53's own §0 was relocated into §5 by P54 and is marked as history there.
-who opened this file during P53 saw P51 described as current state; that entry in §5 was written
-retroactively by P53 and says so. P53's own §0 was relocated into §5 by P54 and is marked as
-history there.
+**Last updated:** 2026-09-05 — cycles **P14 … P62**. ⚠ P52 rewrote no handoff at all, so a reader who opened this file during P53 saw P51 described as current state; that entry in §5 was written after the fact and says so.
 
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
+
+**Cycle P62 closed 2026-09-05.** **FIVE lanes plus four remediations and the orchestrator**, on top
+of P61 (`ed1ac9c4`). Every lane was independently reviewed; **every single one came back with a real
+defect**, and one review found a lane's fix had SHIPPED A NEW WRONG ANSWER.
+
+✔**REAL: 8 rows closed, 0 opened.** ✔**COUNTED by `check-anchor-balance --base ed1ac9c4`:
+3 closed, 0 opened, net −3 (802 → 799).**
+⚠ **The gate's 3 and the real 8 differ because FIVE rows were minted AND closed inside the cycle**,
+which is invisible from BOTH bases — the standing rule is to report both numbers and never to
+soften the instrument. **Production 4 · harness 4.**
+★ **P0 began and ended empty.**
+
+★★★ **THE THROUGH-LINE: P62 DOUBTS THE ROW'S PRESCRIBED *REMEDY*.** P58 doubted the ROW, P59 the
+GUARD, P60 the LANE'S OWN CLOSING CLAIM, P61 asked what a green whole-tree gate cannot see. This
+cycle **three rows had their remedy refuted, each in a different way** — a `Closing work` cell is a
+plan against a tree that has since moved, and a lane briefed to *"do what the row says"* builds the
+wrong thing correctly while every gate stays green.
+
+## §0.1 — WHAT LANDED
+
+**`sp` — `D-PARSE-SPECULATION-REFUSAL-REPLAY-IS-QUADRATIC` ✅.** The row named **memoisation** for a
+cost it blamed on a fallback replay re-parsing the chain. The lane counted inside the parser:
+**fallback replays fire EXACTLY 1 at every cap.** Nothing was re-parsed — a memo would have hit
+nothing. The real mechanism is a **WINDOW, not a repetition**: a probe whose rollback was already
+certain kept parsing until its site's next post-step check. One test moved to the top of the driver
+loop took **65537 casts from an estimated ~18 HOURS to 8.41 s**. ⚠ Review then found the first cut
+DESTROYED a `P_MaxSpeculationDepth` refusal and re-emitted a fabricated cascade; the remediation
+raised the existing shield instead, and the witness for a probe-rollback leak cost **1150
+differential programs to find (0 in the first 510)**.
+
+**`wc` — `D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING`, ELF half; row stays 🟠 OPEN.** Two
+premises refuted with each reference probed separately and controlled: *"a NON-weak call must not be
+routed"* is a **Mach-O** rule, not a portable one (gcc 13.3.0 and clang 18.1.3 both route a `.so`'s
+call to its own **strong global** through the PLT), and this was never a Mach-O-only defect — **the
+ELF rail had the identical divergence**. New declared format key `preemptibleDefinitionBindings`
+(absent = nothing preemptible, lowering byte-identical). ✔RUN WITNESS rc 6 on x86_64 debug, x86_64
+`--config=release` and aarch64 under qemu, each against a gcc-built control returning the same.
+★ The **release arm defeated the routing until the inliner learned the rule**.
+
+**`ff` — `D-FFI-RESOLVE-LIBRARY-DOES-NOT-CHECK-THE-LIBRARY-ARCH` ✅;
+`D-FFI-RESOLVE-LIBRARY-DEMANDS-A-BINARY` re-ranked P1 → P2 with its premise refuted.** Both rows
+rested on mechanisms already fixed or removed elsewhere. The review's blocking finding was itself
+**measured FALSE and the real hole was WIDER**: `partitionResolveLibraries` strips archives **and**
+relocatable objects before the per-CU build, so an x86_64 `.a` fed to an aarch64 target built
+**rc=0 with zero diagnostics**. One chokepoint now walks every archive member.
+
+**`dy` — `D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO` ✅.** Five de-gated sites in
+`encodeExecDynamic`; `__got.reserved1` is `numFuncExterns`, not a constant. Remediation closed 10
+review findings and **re-MEASURED rather than re-quoting** — two mutant counts had gone stale
+between the review and the fix.
+
+**`vt` — `D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION`, born closed ✅.**
+`foldDeclaredAxis` now takes severity and residue as PARAMETERS: a binding conflict is an ERROR with
+confining residue, visibility a warning with first-wins. ⚠ Review caught the first fix **shipping a
+new wrong answer** — a `static` definition escaping as `FUNC WEAK DEFAULT` — because one rule had
+been lifted over an axis set carrying a measurement taken only on the first axis.
+
+## §0.2 — THREE HARNESS DEFECTS, EACH FIXED THE MOMENT IT BLOCKED
+
+All three were found by **USING** the harness, not by auditing it, and all three were born closed.
+
+- **`D-HARNESS-LOCAL-BUILD-SILENT-NONZERO-EXIT-READS-AS-A-SOURCE-DEFECT`** — three states, not two,
+  so the reporter stops claiming a cause is *ruled out* when it never checked. Twin-ported; arm
+  outputs diffed byte-identical, 14 arms each.
+- **`D-HARNESS-DOC-CENSUS-GUARD-SCANS-GITIGNORED-SCRATCH`** — the guard walked `.temp/` (176 markdown
+  files) and reported **14 divergences against a lane's working COPY of `examples/README.md`**;
+  `--write` would have EDITED that copy. The skip set is now **read from `.gitignore`** rather than
+  enumerated a second time.
+- **`D-GATE-RUN-GATE-CANNOT-SEE-THE-TREE-MOVING-UNDER-THE-RUN`** — ★★★ **the fourth way a gate's
+  exit code can mean nothing, and the only one that needs no work to be skipped.** I rewrote
+  `c.lang.json` while a whole-tree `ctest` was in flight; **8 examples failed
+  `C_UnbackedPredefinedMacro` about shipped-library descriptors, which reads exactly like a defect
+  in the FFI work `ff` had folded hours earlier — and that is where the investigation went.** All
+  eight passed unchanged on the settled tree seconds later. Both `run-gate` twins now bracket the
+  run and refuse with **exit 3**, checked **BEFORE rc and BEFORE the success witness**; no escape
+  hatch, because an escape every caller can set is one every caller sets.
+
+## §0.3 — WHAT THE ORCHESTRATOR DID, AND THE ERRORS IT MADE
+
+**Config, both mine:**
+- `parser.maxSpeculationDepth` **2048 → 16383**, with the whole `$parserComment` derivation replaced
+  rather than the number alone — two dead premises recorded as dead, the measured cost of the new
+  value stated, and the residual **4× gap to gcc's working 65536** attributed to the
+  EXPRESSION-ceiling arm's gate time rather than glossed. `maxExpressionDepth` stays **16384 because
+  it IS the union**: max over what WORKS is gcc's 16384 (clang segfaults at 4096 even with
+  `-fbracket-depth`; MSVC dies at 4096).
+- `preemptibleDefinitionBindings` declared for the **two ELF dyn formats only**. ⚠ **The two Mach-O
+  declarations are deliberately HELD BACK** — without an import ordinal meaning *"resolve from the
+  loader's coalescing scope"* they would turn a silent wrong answer into a **loud refusal of a
+  program Apple clang builds correctly**, trading one violation of the bar for another.
+
+**Errors I made, and what caught them:**
+1. **I edited config under my own running gate** — §0.2's third row. My own rule, written down
+   before I broke it.
+2. **I applied a config change nothing observed.** ✔MEASURED after the fact: deleting
+   `preemptibleDefinitionBindings` from BOTH shipped ELF documents left the whole tree GREEN — every
+   existing case drove `loadFromText` on a synthetic document. `TheShippedDocumentsDeclareTheMeasuredSets`
+   now reads all four through `loadShipped` and **pins the asymmetry**, so the Mach-O half cannot
+   land without updating it in the same commit.
+3. **I wrote a dangling anchor id into shipped config**, relayed from a lane's handover
+   (`D-PARSE-SPECULATION-CHECKPOINT-COST` resolves nowhere). `check-anchor-registry` caught it; the
+   real row is `D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED`.
+4. **I hand-rolled a closure counter that matched cross-references instead of rows** and reported
+   434 closures. The gate is purpose-built for that question; I used it instead.
+
+## §0.4 — WHAT P63 INHERITS, IN PRIORITY ORDER
+
+1. ⚠ **`D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING` (P2, production) — TWO halves left, both
+   named in the row.** (a) The **Mach-O call half**: an import ordinal meaning *"resolve from the
+   loader's coalescing scope"* (ld64's `bind <weak-def-coalesce>`), then apply the two withheld
+   declarations. (b) The **ADDRESS half**, measured by `wc`: both references load a `GLOB_DAT` GOT
+   slot when taking `&w` inside the library, DSS emits a bare `lea`, so `&w` inside the `.so` and in
+   the executable are **two different pointers**. ★ It cannot ride the call fix — under
+   `direct-plt` the call reference's VA *is* the PLT stub.
+2. **The Mach-O `installName` collapse** — no row yet; lane `ff` left a self-contained reproducer at
+   `.temp/p62-ff-scratch/f4_macho_install_name_collapse.sh`. Two distinct DSS-built dylibs collapse
+   into ONE `LC_LOAD_DYLIB` (rc=0, zero diagnostics) because `image.installName` is the literal
+   constant `@rpath/libdss.dylib` in both darwin dylib documents. ELF control records two correct
+   `DT_NEEDED`. ★ A CLOSED row had prescribed exactly the right pin and
+   `ImageLibraryDeps.EveryResolvedLibraryIsRecordedOnEveryFormat` **exists and is green** — it tests
+   the WRITER; the collapse is upstream in the **RECORDER**.
+3. **`D-CSUBSET-ATTRIBUTE-ARG-CONSTANT-EXPRESSION` (P1)** — `sizeof`/`_Alignof` in an attribute
+   argument, blocking a real Xcode SDK header. ⚠ **Two of its claims are already dead**: its
+   *"acceptable residue, raise priority when a TU needs it"* posture was overtaken by the
+   2026-08-24 batch ruling, and the intersection it names with
+   `D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK` is gone — that row CLOSED in P45.
+4. The rest of the P1 production band: 70 rows, heavily `D-CSUBSET-*`.
+
+## §0.5 — THE GATE
+
+| leg | result |
+|---|---|
+| **Windows** `build/dbg` | ctest **2086/2087** — sole failure the plan-citation ceiling (302 → 296, banked); `-L repo-guard` **26/26** green after |
+| **WSL x86_64** | ctest **2086/2087**, **same single cause**, synced before the fix; guards re-run against the corrected tree **rc=0, all green** |
+| **macOS arm64** (real Apple Silicon) | **2061/2061**, 0 failures |
+| **qemu arm64** | ⚠ **NOT RUN this cycle — stated, not skipped silently.** The x86_64 and arm64-under-qemu run witnesses for `wc`'s ELF routing were taken in the lane worktree and are recorded in its row. |
+
+★ Every gate run recorded **`inputs held still`** through the new `run-gate` bracket — the first
+cycle in which that is a measured fact rather than an assumption.
+
+---
+
+★★★ **P61 — RELOCATED HERE BY P62, AND IT IS HISTORY, NOT STATE.** It was §0 until P62 opened.
+Every figure below is P61's own and was true at its tip (`ed1ac9c4`); **re-derive anything you
+intend to act on.** Its through-line — *what does a GREEN WHOLE-TREE GATE still not see?* — is
+the direct ancestor of P62's, which turns the same doubt onto the ROW ITSELF: not its premise, which
+P58 already taught us to check, but its prescribed **REMEDY**.
+
+## ⏪ P61's former §0 (history)
+
+### ⏪ P61's own former heading, kept verbatim so the block reads as it did: *§0 — RESUME HERE (a session with no context reads this block first)*
 
 **Cycle P61 closed 2026-09-05.** **FOUR lanes plus a remnant lane and the orchestrator**, on top of
 P60 (`9d08773a`). Every lane was independently reviewed; **every single one came back with a real

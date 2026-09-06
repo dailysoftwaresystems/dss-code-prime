@@ -55,6 +55,7 @@
 #include <string_view>
 #include <memory>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 // The single language-agnostic CST→HIR engine (plan 09 HR8). Reads the schema's
@@ -360,6 +361,58 @@ struct Lowerer {
     // stays block-scoped. Set at each `lowerTree` entry; null outside a tree
     // walk (the static-emit site fails loud on null — never a silent drop).
     std::vector<HirNodeId>* moduleDecls_ = nullptr;
+
+    // ★★★ THE CROSS-DECLARATION HALF OF THE LINKAGE FOLD.
+    // Anchor: D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION.
+    //
+    // `linkageFrom` folds ONE declaration's specifiers; nothing folded them
+    // across the SEVERAL declarations C 6.2.2 lets one entity have. So
+    // `int f(void) __attribute__((visibility("hidden"))); int f(void){…}` —
+    // the attribute on the PROTOTYPE, the body on a later plain declaration —
+    // emitted the definition `GLOBAL DEFAULT`, i.e. an EXPORTED symbol for a
+    // program that asked for a hidden one. Per entity, per CU: this holds the
+    // facets the entity has been given SO FAR, and each later declaration both
+    // contributes to and reads from it. Cross-CU merging is the LINKER's job
+    // and is deliberately not attempted here.
+    //
+    // ★★ KEYED ON THE ENTITY'S **SURVIVING SymbolId**, WHICH IS THE SEMANTIC
+    // TIER'S OWN ANSWER TO "WHICH ENTITY IS THIS" — see `entityFor`. It is NOT
+    // the declaration's own id (every declaration of one name mints its OWN
+    // `SymbolRecord`, so a raw `SymbolId` key merges nothing at all — ✔MEASURED
+    // by building exactly that and watching all nine subject arms stay at their
+    // pre-change values), and it is NOT a hand-rolled `(scope, identifier)`
+    // pair. A `(scope, identifier)` key is the C 6.2.1 identity rule spelled out
+    // a SECOND time in this tier, and it gets C 6.2.2p4 WRONG: a block-scope
+    // `extern int gv;` is minted in the BLOCK's scope while denoting the
+    // FILE-scope entity, so it keys separately and never merges — ✔MEASURED,
+    // `GLOBAL DEFAULT` where gcc 13.3.0 emits `GLOBAL HIDDEN` / `WEAK`. The
+    // semantic tier already resolves that (it repoints the block binding at the
+    // file-scope symbol), so reading its answer is both cheaper and correct.
+    struct CarriedLinkageFacets {
+        std::optional<SymbolBinding>    binding{};
+        std::optional<SymbolVisibility> visibility{};
+        // ★ Set once the entity's DEFINING declaration has been folded. A facet
+        // written on a declaration that FOLLOWS the definition is IGNORED with a
+        // diagnostic rather than folded — ✔MEASURED, clang 18.1.3's exact
+        // answer (`attribute declaration must precede definition
+        // [-Wignored-attributes]`, then the pre-attribute bytes). Without this
+        // bit the cross-declaration conflict rule would ERROR on
+        // `static int f(void){…} int f(void) __attribute__((weak));`, a program
+        // clang ACCEPTS — and the disjunction decides acceptance.
+        bool definitionFolded = false;
+    };
+    // ⚠ SPARSE, AND THE SPARSENESS IS A COMPILE-TIME REQUIREMENT, NOT A TIDINESS
+    // ONE. `mergeDeclaredLinkage` indexed this with `operator[]`, which
+    // DEFAULT-INSERTS for every declarator that reaches it — overwhelmingly
+    // declarators specifying nothing at all — so a `std::map` keyed on a
+    // `std::string` pair cost one string copy plus one red-black node per
+    // file-scope declarator per TU, on a project with a pinned compile-time
+    // baseline it is actively burning down. An entry is now created ONLY for an
+    // entity that either declares a facet or has been DEFINED (the bit above);
+    // every other declarator takes a hashed `find` that misses and allocates
+    // nothing.
+    std::unordered_map<std::uint32_t /*entity SymbolId.v*/, CarriedLinkageFacets>
+        carriedLinkage_;
 
     // O(1) lookups.
     std::unordered_map<std::uint32_t, std::size_t> ruleMap_;     // RuleId.v → ruleMappings idx
@@ -2469,6 +2522,302 @@ struct Lowerer {
         }
         return attr;
     }
+
+    // ── D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION ─────────
+    //
+    // THE ONE CROSS-DECLARATION RULE, STATED ONCE AND APPLIED TO EVERY DECLARED
+    // AXIS. `carried` is the entity's accumulation; `declaredHere` is what THIS
+    // declaration's own fold specified for the axis (empty ⇒ it specified
+    // nothing). The rule:
+    //   * nothing specified here ⇒ INHERIT whatever the entity carries;
+    //   * first specification ⇒ it becomes what the entity carries;
+    //   * a later RESTATEMENT of the same value ⇒ silent;
+    //   * a later DIFFERENT value ⇒ warn, and the FIRST one stands.
+    //
+    // ★★★ THE CONFLICT VERDICT IS **PER AXIS**, AND MEASURING ONE AXIS AND
+    // APPLYING THE ANSWER TO THE OTHER IS EXACTLY THE DEFECT THIS BLOCK EXISTS
+    // TO PREVENT. The first cut measured VISIBILITY, found gcc accepting, and
+    // let the template carry accept-and-keep-the-first onto BINDING as well —
+    // where NO reference accepts, and where the residue it produced was the one
+    // the within-declaration guard above explicitly rejects. Both axes are
+    // therefore measured SEPARATELY below, each with its own CONTROL, and the
+    // verdict travels as a PARAMETER rather than as a shared default.
+    //
+    // ── VISIBILITY, across declarations: ACCEPT, warn, keep the FIRST ─────────
+    // ✔MEASURED 2026-09-05 (Ubuntu 24.04 under WSL), probed SEPARATELY, every
+    // artifact carrying a plain-symbol CONTROL:
+    //   * two conflicting visibilities on ONE declaration — gcc 13.3.0 AND
+    //     clang 18.1.3 both REFUSE, both orders, no object. Unanimous ⇒ the
+    //     within-declaration guard above stays an ERROR.
+    //   * two conflicting visibilities on TWO declarations of one entity — gcc
+    //     WARNS ("redeclaration of 'cx' with different visibility (old
+    //     visibility preserved)"), emits the object, and keeps the value the
+    //     FIRST declaration gave, in BOTH orders; clang ERRORS ("visibility does
+    //     not match previous declaration") and emits nothing. A split on
+    //     ACCEPT-vs-REFUSE, which the disjunction governs ⇒ DSS must ACCEPT, and
+    //     gcc is then the only reference voting on what the program MEANS, so
+    //     first-wins is the only working answer available.
+    //
+    // ── BINDING, across declarations: REFUSE, and confine the residue ────────
+    // ★★ THE SAME PROBE SHAPE GIVES THE OPPOSITE ANSWER, AND THE CONTROLS ARE
+    // WHAT MAKE IT READABLE. The only binding pair the config can express across
+    // two declarations is {internal, weak} — `SymbolBinding::Global` is the
+    // unspecified state — so every reachable conflict is a `static` meeting a
+    // `weak`. ✔MEASURED 2026-09-05, gcc 13.3.0 and clang 18.1.3 probed
+    // SEPARATELY, `-Wall -Wextra`, `-O0` AND `-O2`, each case its own TU:
+    //   * `static int e(void); int e(void) __attribute__((weak));
+    //      static int e(void){…}` — gcc REFUSES ("weak declaration of 'e' being
+    //     applied to a already existing, static definition"), clang REFUSES
+    //     ("weak declaration cannot have internal linkage"), neither emits an
+    //     object. Its CONTROL — the identical program with the attribute REMOVED
+    //     — is ACCEPTED by both and emits `FUNC LOCAL`, so the refusal is the
+    //     binding conflict itself and not the shape around it. The `extern`
+    //     OBJECT twin behaves identically in both references.
+    //   * `int e(void) __attribute__((weak)); static int e(void){…}` — both
+    //     REFUSE, but so does its no-attribute CONTROL ("static declaration of
+    //     'e' follows non-static declaration"), so that arm votes on C 6.2.2's
+    //     internal/external mismatch rather than on this axis.
+    // NOT ONE ACCEPTING REFERENCE anywhere on the binding axis ⇒ the disjunction
+    // supplies no permission to accept, and the residue first-wins produced was
+    // `Weak` on a `static` DEFINITION — ✔MEASURED, DSS emitted `FUNC WEAK
+    // DEFAULT` and `OBJECT WEAK DEFAULT`, a symbol that ESCAPES the TU for a
+    // program that said `static`, which is verbatim what the within-declaration
+    // guard above chose `Local` to prevent. So: ERROR, and the residue is the
+    // CONFINING binding by that guard's own argument — the diagnostic already
+    // fails the build, and `Local` is the only residue that cannot BECOME a
+    // wrong export if a consumer reads past the error.
+    //
+    // Reuses H_UnknownLinkageSpecifier, and that is the right code rather than
+    // merely the available one: the within-declaration guard above reports the
+    // SAME two conflicts under it, having explicitly REJECTED a dedicated code
+    // so the two halves of one anchor cannot diverge in how they report. (A new
+    // code would also need `core/types/parse_diagnostic.hpp`, which this lane
+    // does not own.)
+    template <class T>
+    [[nodiscard]] std::optional<T> foldDeclaredAxis(
+        std::optional<T>& carried, std::optional<T> declaredHere, NodeId at,
+        char const* axis, std::string_view (*nameOf)(T) noexcept,
+        DiagnosticSeverity severity, T residue) {
+        if (!declaredHere.has_value()) return carried;
+        if (!carried.has_value() || *carried == *declaredHere) {
+            carried = declaredHere;
+            return carried;
+        }
+        emitHAt(DiagnosticCode::H_UnknownLinkageSpecifier, severity, at,
+                std::format("this declaration specifies '{}' {}, which does not "
+                            "match the '{}' {} an earlier declaration of the "
+                            "same entity specified — '{}' is kept",
+                            nameOf(*declaredHere), axis, nameOf(*carried), axis,
+                            nameOf(residue)));
+        // The ENTITY now carries the residue, so a THIRD declaration inherits
+        // the value this conflict settled on rather than the one it rejected.
+        carried = residue;
+        return carried;
+    }
+
+    // Fold ONE declaration's declared linkage facets into its ENTITY's
+    // accumulation, and return `declared` with every axis this declaration left
+    // UNSPECIFIED filled in from it. Called with the CST declarator (or
+    // declaration) node the fold came from, which is where a conflict is
+    // reported.
+    //
+    // ★★ GENERIC OVER THE FACETS `LinkageAttr` CARRIES, NOT A `visibility`
+    // SPECIAL CASE. Both of them — `binding` and `visibility` — travel this
+    // path, because BOTH were measured broken the same way:
+    // `int f(void) __attribute__((weak)); int f(void){…}` emitted a STRONG
+    // definition where gcc and clang both emit `FUNC WEAK`. A third facet added
+    // to `LinkageAttr` is one block here, and no specifier NAME appears anywhere
+    // in it — the values are the config's own vocabulary.
+    //
+    // ⚠ "THE FACETS `LinkageAttr` CARRIES" IS NARROWER THAN "THE AXES A
+    // `linkageSpecifiers` ENTRY CAN SET", and the difference is measured rather
+    // than assumed: the shipped rows also set `threadStorage`, `staticStorage`,
+    // `nonDefining`, `exclusiveGroup` and `compatibleWith`. Those three facts do
+    // NOT ride this fold and do not need to — ✔MEASURED 2026-09-05, each with
+    // its own probe: `threadStorage` already fails loud across a redeclaration
+    // (`S_ThreadLocalRedeclarationMismatch`, rc=1, matching gcc's and clang's
+    // own refusals); `staticStorage`'s cross-declaration meaning is C 6.2.2p4/p5
+    // linkage INHERITANCE, owned by `recordLinkage`'s arm below reading the
+    // semantic tier's `isInternalLinkage`; and `nonDefining` is a ROUTING answer
+    // consumed before any node exists, resolved by the Pass-1 absorbed-declarator
+    // merge. Naming a fourth axis here would give a fact that already has an
+    // owner a second one.
+    //
+    // ⚠ THE TWO AXES DIFFER IN HOW "UNSPECIFIED" IS SPELLED, and that asymmetry
+    // is not cosmetic. `SymbolBinding::Global` is UNWRITABLE from config, so it
+    // IS the unspecified state; `SymbolVisibility::Default` is BOTH a sentinel
+    // and a writable value, which is exactly why `LinkageAttr` carries the
+    // explicit `visibilitySpecified` bit. Reading the wrong one would make a
+    // declaration that explicitly says `visibility("default")` look silent and
+    // inherit a `hidden` it deliberately overrode.
+    //
+    // ★ IT CANNOT DRIFT FROM `recordLinkage`'s 6.2.2p4 ARM. That arm supplies
+    // `Local` from the merge survivor's `isInternalLinkage`, and it is guarded on
+    // the binding still being unspecified — so where both have an answer they
+    // have the SAME answer (`Local`), and where this one is silent the record
+    // still speaks. The two can only agree.
+    //
+    // ⚠ CALL IT EXACTLY ONCE PER DECLARATION. It is a WRITE — it advances the
+    // entity's accumulation and it can DIAGNOSE — so a second call for the same
+    // declarator is not a harmless re-read: under the after-the-definition rule
+    // it would report a definition as following itself. A site that needs the
+    // merged answer again is handed the CALLER's (see `recordExtern`), which is
+    // why no read-only twin of this function exists: one would have no call site
+    // and an uncalled accessor is how a second, drifting owner starts.
+    //
+    // ⚠ `sym` MUST BE VALID AND NAMED. An abstract declarator declares no
+    // entity, and its callers skip this call rather than passing an invalid id —
+    // see `declaratorSymbol`, which distinguishes the two. A NAMED declarator
+    // whose symbol did not resolve is an invariant break, so it fails loud here
+    // instead of silently keeping the declaration's own facets: "if we cannot
+    // determine the entity, keep the default" is the shape a wrong export hides
+    // in.
+    [[nodiscard]] LinkageAttr mergeDeclaredLinkage(SymbolId sym, NodeId at,
+                                                   LinkageAttr declared) {
+        auto const* rec = sym.valid() ? model.recordFor(sym) : nullptr;
+        if (rec == nullptr || rec->name.empty()) {
+            emitH(DiagnosticCode::H_UnsupportedLoweringForKind, at,
+                  "a named declarator reached the cross-declaration linkage fold "
+                  "with no resolved symbol record, so the entity whose declared "
+                  "linkage facets must be merged cannot be identified "
+                  "(D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION)");
+            return declared;
+        }
+
+        std::optional<SymbolBinding> bindingHere;
+        if (declared.binding != SymbolBinding::Global)
+            bindingHere = declared.binding;
+        std::optional<SymbolVisibility> visibilityHere;
+        if (declared.visibilitySpecified) visibilityHere = declared.visibility;
+        // A DEFINING declaration is one the semantic tier did not mark
+        // non-defining — exactly the three flags its own `definingRank` reads, so
+        // this tier classifies nothing of its own. A TENTATIVE definition counts
+        // as non-defining here, which is what lets `int x; int x
+        // __attribute__((visibility("hidden"))); int x = 3;` still fold.
+        bool const definingHere = !(rec->isProtoDeclaration
+                                    || rec->isExternDeclaration
+                                    || rec->isTentativeDefinition);
+
+        // ⚠ `find` BEFORE INSERT — see `carriedLinkage_`'s sparseness note. A
+        // declaration that neither declares a facet nor defines the entity has
+        // nothing to contribute, so it must not materialize a node.
+        std::uint32_t const key = entityFor(sym).v;
+        auto it = carriedLinkage_.find(key);
+        if (it == carriedLinkage_.end()) {
+            if (!bindingHere && !visibilityHere && !definingHere)
+                return declared;
+            it = carriedLinkage_.emplace(key, CarriedLinkageFacets{}).first;
+        }
+        CarriedLinkageFacets& carried = it->second;
+
+        // ★★ A FACET WRITTEN AFTER THE ENTITY'S DEFINITION IS IGNORED, AND SAID
+        // SO — clang's measured behaviour, adopted as a QUALITY match rather
+        // than settled as a fork. ✔MEASURED 2026-09-05: on
+        // `int f(void){…} int f(void) __attribute__((visibility("hidden")));`
+        // gcc 13.3.0 applies the attribute RETROACTIVELY (`GLOBAL HIDDEN`,
+        // and `WEAK` for the binding twin) while clang 18.1.3 accepts, emits
+        // `GLOBAL DEFAULT`, and WARNS `attribute declaration must precede
+        // definition [-Wignored-attributes]`. Both ACCEPT and disagree on what
+        // the program MEANS — an architectural fork, and DSS's answer stays
+        // clang's. But DSS used to drop the facet in TOTAL SILENCE, which is
+        // NEITHER reference: a stated program property discarded with nothing
+        // said is what the fail-loud rule exists to catch, and telling the
+        // programmer is a quality match the union settles, not a second fork.
+        // ⚠ THE COST OF THE FORK, WRITTEN DOWN SO A LATER CYCLE CANNOT "FIX" IT
+        // BY REFLEX: a program whose attribute follows its definition gets a
+        // DIFFERENT SYMBOL BINDING out of DSS than out of gcc — `WEAK` there,
+        // `GLOBAL` here — so a two-TU link can keep a different body. The
+        // warning is what makes that difference visible at the source.
+        if (carried.definitionFolded && (bindingHere || visibilityHere)) {
+            emitHAt(DiagnosticCode::H_UnknownLinkageSpecifier,
+                    DiagnosticSeverity::Warning, at,
+                    "this declaration specifies linkage for an entity that is "
+                    "already DEFINED in this translation unit — a linkage "
+                    "attribute declaration must precede the definition, so it "
+                    "is ignored");
+            bindingHere.reset();
+            visibilityHere.reset();
+        }
+
+        if (auto const b = foldDeclaredAxis<SymbolBinding>(
+                carried.binding, bindingHere, at, "binding", &symbolBindingName,
+                DiagnosticSeverity::Error, SymbolBinding::Local))
+            declared.binding = *b;
+
+        // FIRST-WINS: the residue of a visibility conflict is the value the
+        // entity already carries. The `value_or` is unreachable-by-construction
+        // (a conflict needs an incumbent) and is written rather than asserted
+        // because the argument is evaluated before the fold can prove it.
+        SymbolVisibility const visibilityResidue =
+            carried.visibility.value_or(declared.visibility);
+        if (auto const v = foldDeclaredAxis<SymbolVisibility>(
+                carried.visibility, visibilityHere, at, "visibility",
+                &symbolVisibilityName, DiagnosticSeverity::Warning,
+                visibilityResidue)) {
+            declared.visibility          = *v;
+            declared.visibilitySpecified = true;
+        }
+        if (definingHere) carried.definitionFolded = true;
+        return declared;
+    }
+
+    // ★★★ THE ENTITY A DECLARATION DENOTES — THE SEMANTIC TIER'S ANSWER, READ
+    // RATHER THAN RE-DERIVED. Every declaration of one name mints its own
+    // `SymbolRecord`, and the tier resolves which entity they all denote by
+    // REPOINTING the declaring scope's binding at the survivor:
+    // `mergeOrCollideRedeclaration` does it when a more-defining declaration
+    // wins, and the P50 block-scope sweep does it for a block-scope `extern`,
+    // whose binding is repointed at the FILE-scope symbol C 6.2.2p4 says it
+    // denotes. So the binding IS the identity, and one hop through it is the
+    // whole resolution: a survivor's own scope binds itself, so the hop is a
+    // fixpoint by construction and never needs a second one.
+    //
+    // ★ THIS IS WHAT MAKES 6.2.2p4 WORK. ✔MEASURED 2026-09-05: with a
+    // `(scope, identifier)` key,
+    // `int f(void); void h(void){ extern int f(void) __attribute__((weak)); }
+    //  int f(void){…}` emitted `FUNC GLOBAL` — byte-identical before and after
+    // the cross-declaration fold landed — where gcc 13.3.0 emits `FUNC WEAK`
+    // (clang 18.1.3 discards the attribute in silence at `-Wall -Wextra`, so it
+    // casts no vote on what WORKS). Falls back to the declaration's own id when
+    // its scope binds nothing under its name, which is every symbol the tier
+    // never bound by name.
+    [[nodiscard]] SymbolId entityFor(SymbolId sym) const {
+        auto const* rec = model.recordFor(sym);
+        if (rec == nullptr || rec->name.empty()) return sym;
+        auto const& scopes = model.scopes();
+        if (rec->scope.v >= scopes.size()) return sym;
+        auto const& bindings = scopes[rec->scope.v].bindings;
+        auto const it = bindings.find(rec->name);
+        if (it == bindings.end() || !it->second.valid()) return sym;
+        return it->second;
+    }
+
+    // The per-DECLARATOR entry point: fold this declarator's declared facets
+    // into the entity it names. Resolves the symbol by the SAME two calls every
+    // per-declarator site uses, so the merge and the emission can never disagree
+    // about which entity a declarator names.
+    //
+    // Two skips, and both are the ABSENCE of an entity rather than a failure to
+    // find one:
+    //   * no declarator node at all — a shape with no declarator to fold, which
+    //     the sibling `declaratorLinkage` call at every such site also treats as
+    //     "prefix only";
+    //   * an ABSTRACT declarator (`int *;`) — it declares nothing, so there is
+    //     no entity to accumulate onto.
+    // A NAMED declarator whose symbol does not resolve is NOT skipped: it falls
+    // through to `mergeDeclaredLinkage`'s fail-loud, because "we could not
+    // determine the entity, so keep this declaration's own facets" is precisely
+    // the silent fallback that ships a wrong export.
+    [[nodiscard]] LinkageAttr mergeDeclaratorLinkage(NodeId declaratorNode,
+                                                     DeclaratorConfig const& dc,
+                                                     LinkageAttr declared) {
+        if (!declaratorNode.valid()) return declared;
+        NodeId const nameNode = declaratorNameNode(tree(), declaratorNode, dc);
+        if (!nameNode.valid()) return declared;
+        return mergeDeclaredLinkage(model.symbolAt(nameNode), declaratorNode,
+                                    declared);
+    }
+
     // Record NON-default linkage for a lowered decl node (sparse: default linkage
     // is the implicit externally-visible state and needn't be stored).
     // `sym`, when valid, contributes the STATIC-INITIALIZER SCHEDULE the semantic
@@ -11498,6 +11847,23 @@ struct Lowerer {
                 // PER-DECLARATOR (`d`), not per-declaration: the gate below asks
                 // whether THIS prototype has internal linkage, and a sibling
                 // declarator's binding attribute must not answer for it.
+                // ⚠ D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION
+                // DELIBERATELY DOES **NOT** RUN HERE, and the reason is measured
+                // rather than an omission. A first cut wrapped this fold in
+                // `mergeDeclaredLinkage` "for symmetry"; that made it the second
+                // fold of a declarator `topLevelDecl`'s `perDeclarator` loop has
+                // already folded (this function is reached only through it for
+                // `asGlobal`), i.e. a WRITE repeated — and the accumulation is
+                // not idempotent under the after-the-definition rule. It also
+                // could not change any answer: the gate below reads only
+                // `.binding`, and for the entity's accumulation to hold `Local`
+                // while the SURVIVING prototype's own tokens do not, a LATER
+                // declaration would have to add `static` — which is
+                // `static`-after-non-`static`, refused by gcc 13.3.0 and clang
+                // 18.1.3 alike (✔MEASURED 2026-09-05, both orders, `-O0` and
+                // `-O2`, with a no-attribute CONTROL). A site that cannot change
+                // an answer and cannot be pinned is how a fix rots, so it is
+                // gone rather than wired.
                 auto protoLinkage = [&]() -> LinkageAttr {
                     if (!asGlobal) return staticLinkage;
                     return declaratorLinkage(
@@ -12382,9 +12748,17 @@ struct Lowerer {
             // is unambiguous here. (A trailing attribute on a DEFINITION is
             // rejected upstream today; wiring it anyway means this path needs no
             // revisit when that gap closes.)
-            LinkageAttr const fnLink =
-                declaratorLinkage(prefixLink, decl,
-                                  declarators.empty() ? NodeId{} : declarators[0]);
+            //
+            // D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION: the
+            // definition is one declaration of the entity among several, so its
+            // own fold is merged with what earlier declarations established —
+            // this is the READING end of the accumulation the declaration arm
+            // below feeds.
+            NodeId const fnDeclarator =
+                declarators.empty() ? NodeId{} : declarators[0];
+            LinkageAttr const fnLink = mergeDeclaratorLinkage(
+                fnDeclarator, dc,
+                declaratorLinkage(prefixLink, decl, fnDeclarator));
             // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): a C99 6.7.4p7 inline
             // definition provides no external definition — lower it as a
             // DECLARATION, plus (D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED)
@@ -12494,10 +12868,19 @@ struct Lowerer {
         // `int f(void) __attribute__((frobnicate)); int f(void){…}` (the proto is
         // superseded by the definition, so it emits nothing), and the typo went
         // back to being accepted in silence — MEASURED, this exact regression.
+        //
+        // ★★ AND THAT SAME "every declarator, emitting or not" property is what
+        // makes this the ONE place a PROTOTYPE's declared linkage can join its
+        // entity's accumulation (D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION).
+        // An absorbed prototype emits no node, so a merge hung off the emission
+        // loop below would never see the declaration that carries the attribute
+        // — which is precisely how `int f(void) __attribute__((visibility(
+        // "hidden"))); int f(void){…}` came out EXPORTED.
         std::vector<LinkageAttr> perDeclarator;
         perDeclarator.reserve(declarators.size());
         for (NodeId d : declarators)
-            perDeclarator.push_back(declaratorLinkage(prefixLink, decl, d));
+            perDeclarator.push_back(mergeDeclaratorLinkage(
+                d, dc, declaratorLinkage(prefixLink, decl, d)));
 
         std::size_t const before = out.size();
         std::vector<NodeId> origins;
@@ -12544,8 +12927,25 @@ struct Lowerer {
         // D-CSUBSET-LINKAGE-SPECIFIERS: linkage from the (optional) specifier
         // prefix, attached below to the lowered Function/Global node and threaded
         // to MIR for DCE protection.
-        LinkageAttr const linkAttr =
+        // D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION: merged
+        // across the entity's declarations on the LEGACY path too, by the same
+        // argument `recordLinkage`'s `sym` is passed here — a split between the
+        // two file-scope producers is exactly the shape that surfaces as a
+        // miscompile in one grammar and not the other.
+        // ⚠ NOT PINNABLE FROM ANY SHIPPED CONFIG, and stated rather than
+        // pretended: `linkageSpecifiers` appears in exactly ONE shipped language
+        // document (c), and c is DECLARATOR-MODE, so this positional producer can
+        // never fold a non-default facet today and no mutant can red it. It is
+        // wired because the fold belongs to the ENGINE and not to one grammar
+        // shape — a positional language that declares `linkageSpecifiers`
+        // tomorrow must not silently get the pre-fix miscompile.
+        // A declaration row with no `nameChild` names no entity (`sym` invalid);
+        // there is nothing to accumulate onto, so the prefix fold stands alone.
+        LinkageAttr const prefixOnly =
             linkageFrom(linkagePrefixRoots(node, decl), decl);
+        LinkageAttr const linkAttr =
+            sym.valid() ? mergeDeclaredLinkage(sym, node, prefixOnly)
+                        : prefixOnly;
         // Function iff the kindByChild discriminator matches funcDefTail.
         NodeId discNode{};
         if (decl.kindByChild) {
@@ -12681,8 +13081,15 @@ struct Lowerer {
         }
         // LEGACY positional path: no declarator vocabulary, so no
         // after-declarator attribute slot exists — the prefix is the whole story.
-        LinkageAttr const linkAttr =
+        // Merged across the entity's declarations for the same reason
+        // `lowerTopLevel` is (D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION),
+        // and UNPINNABLE from any shipped config for the same reason — see the
+        // note there.
+        LinkageAttr const prefixOnly =
             linkageFrom(linkagePrefixRoots(node, decl), decl);
+        LinkageAttr const linkAttr =
+            sym.valid() ? mergeDeclaredLinkage(sym, node, prefixOnly)
+                        : prefixOnly;
         std::vector<HirNodeId> params;
         if (decl.paramsChild && *decl.paramsChild < vis.size())
             collectParams(vis[*decl.paramsChild], params);
@@ -12798,9 +13205,21 @@ struct Lowerer {
                 collectDeclarators(tree(), vis[*decl.declaratorListChild], dc,
                                    fnDeclarators);
             }
-            LinkageAttr const fnLink = declaratorLinkage(
-                linkageFrom(linkagePrefixRoots(node, decl), decl), decl,
-                fnDeclarators.empty() ? NodeId{} : fnDeclarators[0]);
+            // D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION.
+            // ⚠ UNPINNABLE FROM c, and stated: a file-scope
+            // `extern int f(void){…}` is a DEFINITION, so `topLevelDecl`'s own
+            // `isFn` arm takes it (the extern route is gated on `!isFn`), and a
+            // block-scope one is a nested function, refused upstream. This arm
+            // is reached only by a language that dispatches an `externDecl` rule
+            // directly; it folds anyway so the two definition producers cannot
+            // disagree.
+            NodeId const fnDeclarator =
+                fnDeclarators.empty() ? NodeId{} : fnDeclarators[0];
+            LinkageAttr const fnLink = mergeDeclaratorLinkage(
+                fnDeclarator, dc,
+                declaratorLinkage(
+                    linkageFrom(linkagePrefixRoots(node, decl), decl), decl,
+                    fnDeclarator));
             out.push_back(lowerDeclaratorModeFunction(node, decl, dc, discNode,
                                                       fnLink));
             return;
@@ -12902,9 +13321,24 @@ struct Lowerer {
         // AGNOSTIC: every input is DATA on a descriptor row, already per-format
         // selected by the shared availability predicate. No format / arch / language
         // identity test, and no symbol name is special-cased.
-        auto recordExtern = [&](HirNodeId h, SymbolId sym, NodeId fromDeclarator) {
-            recordLinkage(h,
-                          declaratorLinkage(externPrefixLink, decl, fromDeclarator));
+        auto recordExtern = [&](HirNodeId h, SymbolId sym,
+                                LinkageAttr mergedLinkage) {
+            // D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION: an
+            // `extern` declaration is a declaration of the same entity a later
+            // definition defines, so its facets join the accumulation —
+            // `extern int x __attribute__((visibility("hidden"))); int x = 8;`
+            // is `OBJECT GLOBAL HIDDEN` in gcc AND clang and was `DEFAULT` here.
+            // ⚠ THE FOLD IS THE CALLER'S, AND IS HANDED IN. It used to re-fold
+            // the declarator its caller had folded moments earlier, on the
+            // reasoning that a repeat is a no-op — it is not: the accumulation
+            // is a WRITE that can DIAGNOSE, and under the after-the-definition
+            // rule a second fold reports a declaration as following itself. It
+            // is passed EXPLICITLY rather than by handing `recordLinkage` the
+            // symbol for the separate reason that that parameter also switches
+            // on the record's static-initializer schedule and its 6.2.2p4 arm,
+            // which are answers about the DEFINING declaration and have no
+            // business being re-asked at an import row.
+            recordLinkage(h, mergedLinkage);
             auto const* rec = model.recordFor(sym);
             // A SOURCE override present ⇒ the user STATED the image; the platform
             // row is not consulted at all (precedence 1 above).
@@ -12954,6 +13388,25 @@ struct Lowerer {
             SymbolId const sym = model.symbolAt(nameNode);
             auto const* rec = model.recordFor(sym);
             if (rec == nullptr) continue;
+            // ★★ FOLD **BEFORE** THE ABSORBED SKIP BELOW, and that order is the
+            // whole of D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION
+            // on this row. An `extern` declaration superseded by an in-TU
+            // definition emits nothing, so a fold hung off the emission below
+            // never saw the declaration that CARRIES the attribute:
+            // `extern int x __attribute__((visibility("hidden"))); int x = 8;`
+            // came out `OBJECT GLOBAL DEFAULT` where gcc 13.3.0 and clang 18.1.3
+            // both emit `GLOBAL HIDDEN`. The sibling `topLevelDecl` arm already
+            // folds every declarator for exactly this reason (its `perDeclarator`
+            // loop) — this row simply did not, and the same skip also made an
+            // unknown trailing attribute on an absorbed `extern` silent, since
+            // the fold IS the validation.
+            // ★ THIS IS THE **ONLY** FOLD ON THIS ROW: the emitting sites below
+            // are handed the answer (`recordExtern`'s `mergedLinkage`) rather
+            // than re-folding, because the accumulation is a write, not a query.
+            // It is also the fold that makes a BLOCK-scope `extern` reach its
+            // FILE-scope entity (C 6.2.2p4) — see `entityFor`.
+            LinkageAttr const mergedLinkage = mergeDeclaredLinkage(
+                sym, d, declaratorLinkage(externPrefixLink, decl, d));
             // D-CSUBSET-EXTERN-DEFINITION-MERGE: an extern superseded by an in-TU
             // DEFINITION (the Pass-1 merge set isAbsorbedProto — the definition won
             // the binding) emits NO node + NO import row (the definition carries the
@@ -12989,7 +13442,7 @@ struct Lowerer {
                 collectParams(d, params);
                 HirNodeId const ef =
                     track(builder.makeExternFunction(type, sym.v, params), d);
-                recordExtern(ef, sym, d);
+                recordExtern(ef, sym, mergedLinkage);
                 out.push_back(ef);
                 continue;
             }
@@ -13006,7 +13459,7 @@ struct Lowerer {
                 continue;
             }
             HirNodeId const g = track(builder.makeExternGlobal(type, sym.v), d);
-            recordExtern(g, sym, d);
+            recordExtern(g, sym, mergedLinkage);
             // TLS C1 (D-CSUBSET-THREAD-LOCAL): `extern thread_local int e;` — the
             // record's flag rides the intra-module global side-table so HIR→MIR's
             // extern-data pre-pass stamps ExternImport.isThreadLocal.

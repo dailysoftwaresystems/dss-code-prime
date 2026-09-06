@@ -1635,6 +1635,59 @@ struct DSS_EXPORT ObjectFormatData {
     // below, which are the ONE owner of the rule; no consumer re-derives it.
     std::vector<SymbolBinding> indirectSlotBindings;
 
+    // ── D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING ────────────
+    //
+    // WHICH of THIS ARTIFACT'S OWN externally-visible definitions the artifact's
+    // LOADER may replace with another image's definition of the same name — so a
+    // reference made from INSIDE the artifact must be resolved by the loader
+    // rather than bound statically to the local body. The sibling question to
+    // `indirectSlotBindings` above, one step over: that key narrows which
+    // IMPORTS take a slot, this one names which DEFINITIONS cannot be reached
+    // directly. Same `SymbolBinding` vocabulary, same "empty means absent" rule.
+    //
+    // ⚠ ABSENCE IS "NOTHING IS PREEMPTIBLE", NOT "UNNARROWED" — the OPPOSITE
+    // default from `indirectSlotBindings`, and deliberately so. An empty
+    // `indirectSlotBindings` under an `indirect-slot` dispatch means the key
+    // adds no narrowing to a shape the format ALREADY declared; here there is
+    // no outer declaration to narrow, so an absent key can only mean "this
+    // format declares no preemption", which is the pre-existing behaviour
+    // BYTE-IDENTICALLY. Every relocatable object, every static library, and
+    // every main-executable flavour leaves it absent.
+    //
+    // ★★ WHY IT IS A PER-FORMAT SET AND NOT ONE RULE — ✔MEASURED 2026-09-05,
+    // and the two ecosystems give DIFFERENT answers to the same question:
+    //   * ELF: gcc 13.3.0 AND clang 18.1.3 route a shared object's own call to
+    //     its own definition through the PLT for a WEAK definition AND for a
+    //     STRONG global one alike (`call <w@plt>`, `call <st@plt>` in one
+    //     `.so`), because the ELF search scope puts the executable first and any
+    //     default-visibility definition in a library is therefore interposable.
+    //     The CONTROL in the SAME object: a `static` callee and a
+    //     `visibility("hidden")` callee are both DIRECT. The CONTROL in the same
+    //     ecosystem: an EXECUTABLE (`-pie` and `-no-pie`) binds BOTH its weak and
+    //     its strong self-calls directly, because the executable is always its
+    //     own winner. So ELF declares `["global", "weak"]` on its `.so` flavour
+    //     and nothing anywhere else.
+    //   * Mach-O: dyld's two-level namespace binds a STRONG dylib definition
+    //     locally and coalesces only WEAK ones (✔MEASURED on Apple Silicon in
+    //     cycle P61: the same source, weak → the consumer's answer, strong → the
+    //     dylib's own). So a Mach-O dylib's set is `["weak"]` — a STRICT SUBSET
+    //     of ELF's, which is exactly why this cannot be one hard-coded rule.
+    //   * PE: Windows has no symbol interposition; a DLL's internal call is
+    //     always its own. Absent.
+    //
+    // ⚠ VISIBILITY IS A PRECONDITION AND IS **NOT** IN THIS LIST. A `local`
+    // symbol, and any symbol whose visibility is not `default`, is absent from
+    // every image's dynamic export set, so NO loader can preempt it under ANY
+    // format — that is a universal fact, not a per-format declaration, and
+    // putting it in config would be a key whose only legal value is the one the
+    // engine must apply anyway. `SymbolBinding::Local` is REFUSED in this list
+    // at load for the same reason `indirectSlotBindings` refuses it: a member
+    // that can never match reads as a capability and is not one.
+    //
+    // Read through `definitionIsPreemptible()` below — the ONE owner of the
+    // rule, exactly as `externRefTakesImportSlot` is for its key.
+    std::vector<SymbolBinding> preemptibleDefinitionBindings;
+
     // ── D-LK-EXTERN-DATA-IMPORT: extern-DATA import binding model ───
     //
     // How an imported library DATA OBJECT (libc `stdout`) is bound
@@ -2510,6 +2563,42 @@ public:
     [[nodiscard]] std::vector<SymbolBinding> const&
     indirectSlotBindings() const noexcept {
         return d_.indirectSlotBindings;
+    }
+
+    // ── D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING ───────────
+    //
+    // THE ONE OWNER OF "MAY THIS ARTIFACT'S LOADER REPLACE THIS DEFINITION".
+    // Both tiers that must agree symbol for symbol read THIS: MIR→LIR decides
+    // whether the reference is emitted through the loader-resolved indirection,
+    // and the linker decides whether the matching import row survives to the
+    // walker. A rule spelled twice is a rule that drifts — the reason
+    // `externRefTakesImportSlot` above is written exactly once, one level over.
+    //
+    // The rule, in full:
+    //   * a non-`default` visibility (hidden / protected / internal) is NEVER
+    //     preemptible — it is not in any image's dynamic export set, so no
+    //     loader can see it, under any format. Asked FIRST, so a format that
+    //     over-declares still cannot reach a hidden body.
+    //   * no `preemptibleDefinitionBindings` declared → NOTHING is preemptible
+    //     (the absent-key default; the pre-change behaviour byte-identically).
+    //   * declared → exactly the listed bindings.
+    // `SymbolBinding::Local` never reaches the list (refused at load) and would
+    // fail the visibility test in any case — a module-private symbol is not
+    // externally visible, so the two guards agree rather than overlap.
+    [[nodiscard]] bool
+    definitionIsPreemptible(SymbolBinding binding,
+                            SymbolVisibility visibility) const noexcept {
+        return ::dss::definitionIsPreemptible(
+            binding, visibility, d_.preemptibleDefinitionBindings);
+    }
+
+    // The DECLARED list, verbatim (empty = the key is absent). Threaded to
+    // MIR→LIR by the driver and read by `validate()`'s pairing rules; a
+    // consumer asking "is THIS definition preemptible" wants the predicate
+    // above, never this.
+    [[nodiscard]] std::vector<SymbolBinding> const&
+    preemptibleDefinitionBindings() const noexcept {
+        return d_.preemptibleDefinitionBindings;
     }
 
     // ── D-LK-EXTERN-DATA-IMPORT accessor ─────────────────────────

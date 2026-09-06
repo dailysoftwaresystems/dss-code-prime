@@ -1084,6 +1084,39 @@ struct Lowerer {
     std::vector<SymbolBinding> indirectSlotBindings_;
     std::unordered_set<std::uint32_t> slotIndirectAddrSymbols_;
 
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the format's DECLARED
+    // set of definition bindings this artifact's LOADER may replace, plus the
+    // two side tables the routing needs.
+    //
+    // The defect, stated once: a shared library that BRANCHES to its own body
+    // for a name the loader has coalesced away disagrees with every other image
+    // in the process about what that identifier means — one process, two
+    // answers, no diagnostic. ✔MEASURED on both rails: a DSS-built ELF `.so`
+    // returns its OWN bodies (rc 4) where the gcc-built `.so` from the same
+    // source returns the executable's (rc 6); a DSS-built darwin dylib returns
+    // rc 1 where ld64's returns rc 2 (cycle P61, Apple Silicon).
+    //
+    // EMPTY = nothing is preemptible ⇒ every table below stays empty, no
+    // reference is minted, and lowering is BYTE-IDENTICAL to the pre-change
+    // engine. That is the state of every relocatable object, every static
+    // library and every main-executable flavour, and it is why an executable's
+    // self-call keeps its direct branch: the main executable is always its own
+    // winner, so routing it would buy an indirection and nothing else.
+    std::vector<SymbolBinding> preemptibleDefinitionBindings_;
+    // Defined FUNCTION symbol → its on-binary name (the driver's `nameOf`
+    // answers, threaded in — see `DefinedSymbolName`). Consulted ONLY when the
+    // decision above already said "preemptible".
+    std::unordered_map<std::uint32_t, std::string> definedNameBySymbol_;
+    // Defined symbol → the MIR function that defines it, so the decision can
+    // read the DEFINITION's own binding + visibility. Built only when the
+    // format declares at least one preemptible binding.
+    std::unordered_map<std::uint32_t, MirFuncId> funcBySymbol_;
+    // Memo: defined symbol → the SymbolId of the loader-resolved reference this
+    // lowering minted for it. ONE reference per name per module — every call
+    // site to the same preemptible definition shares it, exactly as every call
+    // to one extern shares that extern's row.
+    std::unordered_map<std::uint32_t, SymbolId> preemptionImportBySymbol_;
+
     // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the ACTIVE format's
     // extern-ADDRESS binding + the derived set of extern SymbolIds whose
     // ADDRESS (as a live code-form VALUE — an argument, an automatic's
@@ -1307,7 +1340,9 @@ struct Lowerer {
             std::optional<std::string> wideFloatSoftcallLibrary,
             std::optional<bool> charIsUnsigned,
             std::optional<AtomicsRuntime> atomicsRuntime,
-            std::vector<SymbolBinding> indirectSlotBindings)
+            std::vector<SymbolBinding> indirectSlotBindings,
+            std::vector<SymbolBinding> preemptibleDefinitionBindings,
+            std::span<DefinedSymbolName const> definedSymbolNames)
         : mir(m), target(t), interner(i), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()),
           externCallDispatch_(externCallDispatch),
@@ -1315,6 +1350,8 @@ struct Lowerer {
           atomicsRuntime_(std::move(atomicsRuntime)),
           dataImportBinding_(dataImportBinding),
           indirectSlotBindings_(std::move(indirectSlotBindings)),
+          preemptibleDefinitionBindings_(
+              std::move(preemptibleDefinitionBindings)),
           externAddrBinding_(externAddrBinding),
           tlsAccess_(tlsAccess), sehScopesIn_(sehScopes),
           charIsUnsigned_(charIsUnsigned) {
@@ -1387,6 +1424,21 @@ struct Lowerer {
         if (externAddrBinding_ == ExternAddrBinding::Got) {
             for (auto const& e : externImports) {
                 externAddrGotSymbols_.insert(e.symbol.v);
+            }
+        }
+        // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the two side
+        // tables the preemption routing reads, built ONLY when the format
+        // declared at least one preemptible binding. A module under a format
+        // that declared none pays nothing and lowers byte-identically — the
+        // same "empty set ⇒ unchanged" discipline every block above uses.
+        if (!preemptibleDefinitionBindings_.empty()) {
+            for (std::uint32_t fi = 0; fi < mir.moduleFuncCount(); ++fi) {
+                MirFuncId const f = mir.funcAt(fi);
+                funcBySymbol_.emplace(mir.funcSymbol(f).v, f);
+            }
+            for (auto const& d : definedSymbolNames) {
+                if (d.name.empty()) continue;   // synthesized: no loader name
+                definedNameBySymbol_.emplace(d.symbol.v, d.name);
             }
         }
         // TLS C1 (D-CSUBSET-THREAD-LOCAL): collect every THREAD-LOCAL
@@ -1612,6 +1664,40 @@ struct Lowerer {
     // the only way they can still agree.
     [[nodiscard]] bool externRefUsesSlot(SymbolId s) const noexcept {
         return slotIndirectAddrSymbols_.contains(s.v);
+    }
+
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: may this artifact's
+    // LOADER replace the definition `s` names with another image's body?
+    //
+    // Asked of the DEFINITION's own binding + visibility, read out of MIR —
+    // never of the reference, and never of the format alone. Both halves
+    // matter and they are not the same question:
+    //   * VISIBILITY first, and it is UNIVERSAL rather than declared: a
+    //     `local`, `hidden`, `protected` or `internal` definition is in no
+    //     image's dynamic export set, so no loader can see it and none can
+    //     replace it under ANY format. ✔MEASURED in ONE object: gcc 13.3.0 and
+    //     clang 18.1.3 both route a `.so`'s call to its weak AND to its strong
+    //     default-visibility callee through the PLT while leaving the `static`
+    //     and the `visibility("hidden")` callee beside them DIRECT.
+    //   * BINDING second, and it IS declared, because the two ecosystems
+    //     disagree: ELF preempts `global` and `weak` alike (the search scope
+    //     puts the executable first, which is what makes LD_PRELOAD and
+    //     semantic interposition work), Mach-O's two-level namespace preempts
+    //     only `weak`. Hard-coding either would put DSS below one reference
+    //     union or above the other.
+    //
+    // A symbol that is not a defined function of THIS module answers false —
+    // an extern reference is already routed by the extern machinery, and
+    // routing it twice is not expressible.
+    [[nodiscard]] bool calleeIsPreemptible(SymbolId s) const noexcept {
+        if (preemptibleDefinitionBindings_.empty()) return false;
+        auto const it = funcBySymbol_.find(s.v);
+        if (it == funcBySymbol_.end()) return false;
+        // The RULE has ONE owner (`core/types/symbol_attrs.hpp`); this
+        // only supplies the DEFINITION's two facts out of MIR.
+        return ::dss::definitionIsPreemptible(
+            mir.funcBinding(it->second), mir.funcVisibility(it->second),
+            preemptibleDefinitionBindings_);
     }
 
     [[nodiscard]] std::optional<std::uint16_t> opcode(MnemonicSlot s) const {
@@ -7011,6 +7097,106 @@ struct Lowerer {
         return sym;
     }
 
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the LOADER-RESOLVED
+    // reference that replaces a direct branch to a preemptible definition.
+    //
+    // Callers have ALREADY established `definitionIsPreemptible(defined)`. This
+    // mints (once per definition, memoized) the reference the format's own
+    // import machinery realizes — an SHN_UNDEF dynamic symbol plus the format's
+    // loader-bound slot, which is byte-for-byte the shape ld emits for
+    // `call w@PLT` out of a `.so` and ld64 emits as `__got` + `bind
+    // <weak-def-coalesce>`. Nothing new is invented at the link tier; what
+    // changes is that the reference EXISTS instead of being folded into the
+    // local body at compile time.
+    //
+    // ⚠ `libraryPath` IS DELIBERATELY EMPTY, AND THAT IS THE WHOLE MECHANISM.
+    // The name must be resolved from the loader's GLOBAL scope — the scope in
+    // which the executable comes first and this artifact comes later — not from
+    // a named library, because the winner may be ANY image in the process
+    // including this one. An empty library on a shared-object flavour is
+    // already the declared, walker-supported shape (`elf.cpp`'s zero-DT_NEEDED
+    // guard exempts exactly it, with the reason spelled out: "its externs may
+    // all be global-scope-resolved"). A format whose loader cannot express a
+    // library-less reference REFUSES this row at the linker, loudly and by
+    // name, rather than emitting an image that binds it somewhere arbitrary.
+    //
+    // Returns nullopt ONLY after reporting; the caller must then bail rather
+    // than fall back to the direct branch, because the direct branch is the
+    // defect this row exists to remove.
+    [[nodiscard]] std::optional<SymbolId>
+    resolvePreemptionImport(SymbolId defined, std::string_view context) {
+        if (auto const it = preemptionImportBySymbol_.find(defined.v);
+            it != preemptionImportBySymbol_.end()) {
+            return it->second;
+        }
+        auto const nameIt = definedNameBySymbol_.find(defined.v);
+        if (nameIt == definedNameBySymbol_.end()) {
+            dss::report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "{}: the active object format declares this definition's "
+                    "binding PREEMPTIBLE, so the call must be resolved by the "
+                    "loader rather than branched to the local body — but no "
+                    "on-binary NAME was supplied for the definition, and a "
+                    "loader resolves a reference BY NAME. Refusing rather than "
+                    "emitting the direct branch, which is the divergence this "
+                    "routing exists to remove. "
+                    "D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING.",
+                    context));
+            return std::nullopt;
+        }
+        // The routed reference is an ordinary loader-resolved call, so it needs
+        // the format's declared call shape — the same gate the softcall mint
+        // re-asserts, and for the same reason: a module whose ONLY loader-
+        // resolved reference is this one never passed the ctor's extern gate.
+        if (!externCallDispatch_.has_value()) {
+            dss::report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "{}: a call to preemptible definition '{}' must go through "
+                    "the loader, but the active object format declares no "
+                    "`externCallDispatch` shape for a loader-resolved call — "
+                    "declare it in the format's `.format.json` "
+                    "(D-FFI-EXTERN-CALL-DISPATCH), or remove "
+                    "`preemptibleDefinitionBindings`. "
+                    "D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING.",
+                    context, nameIt->second));
+            return std::nullopt;
+        }
+        ExternImport imp;
+        imp.symbol                = SymbolId{};
+        imp.mangledName           = nameIt->second;
+        imp.libraryPath           = "";   // the loader's GLOBAL scope
+        imp.isData                = false;
+        imp.version               = "";
+        imp.binding               = SymbolBinding::Global;
+        imp.isPreemptionReference = true;
+        // The shape this reference will take, decided by the SAME per-symbol
+        // rule every other reference in this lowerer reads — asked BEFORE the
+        // mint so a format that cannot encode the shape refuses instead of
+        // leaving a row whose call site has no form.
+        MnemonicSlot const needSlot =
+            (externCallUsesIndirectShape(*externCallDispatch_)
+             && importTakesSlot(imp.binding))
+                ? MnemonicSlot::CallIndirectViaExtern
+                : MnemonicSlot::Call;
+        if (!opcode(needSlot).has_value()) {
+            reportMissingOpcode(needSlot,
+                                "MIR Call (preemptible definition)");
+            return std::nullopt;
+        }
+        SymbolId const sym = mintJumpTableSymbol();
+        imp.symbol = sym;
+        externSymbols.insert(sym.v);
+        if (externCallDispatch_ == ExternCallDispatch::IndirectSlot
+            && importTakesSlot(imp.binding)) {
+            slotIndirectAddrSymbols_.insert(sym.v);
+        }
+        newWideFloatExterns_.push_back(std::move(imp));
+        preemptionImportBySymbol_.emplace(defined.v, sym);
+        return sym;
+    }
+
     // c116 H1 (D-WIN64-SEH-FUNCLETS): lower `RecoverParentFrameSlot(establisher)`
     // (payload = the parent-local slot index) to the LIR `recover_parent_frame_slot`
     // op — operand[0] = the establisher-frame base register, payload = the slot
@@ -8458,6 +8644,24 @@ struct Lowerer {
         // bytes. `externRefUsesSlot` is the one per-symbol answer both this
         // site and the address arm read. A non-extern callee is never in the
         // set, so the ordinary direct `Call` is unchanged.
+        // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: a call to a
+        // definition IN THIS MODULE that the artifact's LOADER may replace is
+        // NOT a module-internal call, however much it looks like one. Rewrite
+        // the callee to the loader-resolved reference minted for that name, and
+        // every line below then treats it as the cross-image reference it now
+        // is — one rewrite, no second call-emission path.
+        //
+        // Ordered AFTER the extern classification and gated on `!calleeIsExtern`
+        // so the two can never both fire: an extern is already loader-resolved,
+        // and a definition is by construction not an import.
+        if (calleeIsGlobalAddr && !calleeIsExtern
+            && calleeIsPreemptible(calleeSym)) {
+            auto const routed =
+                resolvePreemptionImport(calleeSym, "MIR Call");
+            if (!routed.has_value()) return;   // already reported
+            calleeSym      = *routed;
+            calleeIsExtern = true;
+        }
         bool const useIndirectExtern =
             calleeIsExtern && externRefUsesSlot(calleeSym);
         MnemonicSlot const callSlot = useIndirectExtern
@@ -13523,7 +13727,10 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           std::optional<ExternAddrBinding> externAddrBinding,
                           std::optional<bool> charIsUnsigned,
                           std::optional<AtomicsRuntime> atomicsRuntime,
-                          std::vector<SymbolBinding> indirectSlotBindings) {
+                          std::vector<SymbolBinding> indirectSlotBindings,
+                          std::vector<SymbolBinding>
+                              preemptibleDefinitionBindings,
+                          std::vector<DefinedSymbolName> definedSymbolNames) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
     // extern-targeting calls from module-internal direct calls.
@@ -13555,11 +13762,17 @@ MirToLirResult lowerToLir(Mir const&          mir,
     // format's DECLARED narrowing of which symbol bindings the `indirect-slot`
     // dispatch applies to. Empty = unnarrowed (every import), the meaning the
     // dispatch carried before the key existed.
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: also pass the format's
+    // DECLARED set of definition bindings this artifact's LOADER may replace,
+    // and the on-binary names of this module's defined functions. Empty (every
+    // format that does not declare the key) = nothing is preemptible and every
+    // module-internal call stays the direct branch it has always been.
     Lowerer L{mir, target, interner, reporter, externImports,
               externCallDispatch, dataImportBinding, externAddrBinding,
               tlsAccess, sehScopes,
               std::move(wideFloatSoftcallLibrary), charIsUnsigned,
-              std::move(atomicsRuntime), std::move(indirectSlotBindings)};
+              std::move(atomicsRuntime), std::move(indirectSlotBindings),
+              std::move(preemptibleDefinitionBindings), definedSymbolNames};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
     // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /

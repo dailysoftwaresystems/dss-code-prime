@@ -17,6 +17,7 @@
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"  // TypeLattice (fresh merge host)
 #include "ffi/abi/abi_catalog.hpp"
+#include "ffi/ingest.hpp"  // checkMergedLibraryInputsMatchTargetFormat — the boundary check for the MERGED --resolve-library partitions (D-FFI-RESOLVE-LIBRARY-DOES-NOT-CHECK-THE-LIBRARY-ARCH)
 #include "ffi/mangling/c_mangle.hpp"  // applyCMangling — the cross-CU merge-key mangling (D-LK-MACHO-CROSSCU-MANGLE-MERGE-KEY)
 #include "ffi/shipped_lib_descriptor.hpp"  // isKnownSynthesizeRecipe (FC17.9a threads-shim vocab)
 #include "link/object_format_schema.hpp"
@@ -1182,6 +1183,34 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     auto resolveLibs = partitionResolveLibraries(
         std::span<ResolveLibrarySpec const>{compileOpts.resolveLibraries},
         **formatR, reporter);
+
+    // ── D-FFI-RESOLVE-LIBRARY-DOES-NOT-CHECK-THE-LIBRARY-ARCH: THE TWO
+    //    PARTITIONS THE EAGER PROBE CANNOT SEE ────
+    //
+    // `compile_pipeline`'s step 2.5-pre validates every `--resolve-library`
+    // entry against the target's object format AND architecture -- but it runs
+    // over `perCuOpts.resolveLibraries`, which is the DYNAMIC residual the
+    // partition above just produced. The archives and the relocatable objects
+    // were removed one statement ago and reached NO boundary check at all.
+    // ✔MEASURED at the cycle base: an x86_64 `.a` fed to
+    // `arm64:elf64-aarch64-linux-exec` built rc=0 with ZERO diagnostics and
+    // emitted an aarch64 image; so did a PE `.lib` fed to an ELF build.
+    //
+    // ★ THIS SITE OWNS THE FEED, NOT THE COMPARISON. The sentence, the codes
+    // and the member walk all live in `ffi::checkLibraryMatchesTargetFormat`,
+    // the same single author the dynamic probe asks -- one chokepoint reached
+    // from three places, never a second guard written beside it. It runs HERE
+    // because this is the only scope where the three partitions are all in
+    // hand, and BEFORE the per-CU build because a wrong-architecture input
+    // must fail on the first TU rather than on whichever one later happens to
+    // reference it.
+    if (!ffi::checkMergedLibraryInputsMatchTargetFormat(
+            std::span<std::filesystem::path const>{resolveLibs.staticArchives},
+            std::span<std::filesystem::path const>{resolveLibs.objectInputs},
+            **formatR, reporter)) {
+        return std::nullopt;   // reported loud there
+    }
+
     std::vector<std::filesystem::path> staticArchives =
         std::move(resolveLibs.staticArchives);
     CompileOptions perCuOpts = compileOpts;
@@ -2306,7 +2335,17 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                      // DIRECTLY — a merged module lowered
                                      // without the narrowing would disagree
                                      // with it symbol for symbol.
-                                     (*formatR)->indirectSlotBindings());
+                                     (*formatR)->indirectSlotBindings(),
+                                     // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
+                                     // WHICH of this artifact's OWN
+                                     // definitions its loader may replace.
+                                     // Passed here for the same reason the
+                                     // narrowing above is: a merged module
+                                     // lowered without it would branch to
+                                     // its own body for a name the loader
+                                     // has already given the process a
+                                     // different answer for.
+                                     (*formatR)->preemptibleDefinitionBindings());
     if (!mod) return std::nullopt;  // back-half tier failure already reported via `reporter`
     // c165 (D-LK-STATIC-LINK): the merged whole-program client module links
     // against any `ar` static archives named on `--resolve-library` the same way
@@ -4691,6 +4730,20 @@ int runCusToTargets(
         // it from there rather than re-asking is the whole point — a second
         // derivation site is what this row exists to remove.
         compileOpts.charIsUnsigned   = keyPerTarget[i].charIsUnsigned;
+        // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: WHICH of this
+        // artifact's OWN definitions its loader may replace. Read off the
+        // FORMAT (the owner), relayed through `CompileOptions` to the MIR
+        // optimizer, which carries no format of its own. Without it the
+        // Inlining pass splices away exactly the calls MIR→LIR is routing
+        // through the loader, and the release arm answers differently from the
+        // debug arm of the same source.
+        {
+            auto const fmtIt = formatByName.find(keyPerTarget[i].formatName);
+            if (fmtIt != formatByName.end() && fmtIt->second != nullptr) {
+                compileOpts.preemptibleDefinitionBindings =
+                    fmtIt->second->preemptibleDefinitionBindings();
+            }
+        }
         compileOpts.pipelineOverride = pipelineOverride;
         compileOpts.ltoMode = ltoMode == LtoModeArg::Thin
                                   ? CompileOptions::LtoMode::Thin

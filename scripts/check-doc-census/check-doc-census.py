@@ -120,6 +120,44 @@ PROVIDERS = {
 SKIP_DIRS = {".git", ".worktrees", ".secrets", "node_modules", "__pycache__"}
 SKIP_DIR_PREFIXES = ("build",)
 
+# ⚠⚠ AND SO IS EVERY DIRECTORY `.gitignore` DECLARES, FOR THE SAME REASON `.worktrees`
+# IS. ✔MEASURED 2026-09-05 (P62): this guard walked `.temp/` -- 176 markdown files of
+# session scratch -- and one of them was a lane's working COPY of `examples/README.md`,
+# so the run reported 14 phantom divergences against a file that is not a document of
+# this project, and `--write` would have EDITED THAT COPY to "repair" it. The class is
+# identical to the `census-quoted:` story above: a guard biting a document it has no
+# business reading. It had always done this; it only became visible when a scratch file
+# happened to carry the marker.
+# ★ DECLARATION-DRIVEN, NOT A SECOND HAND-KEPT LIST. The set is read from `.gitignore`'s
+#   directory-only entries, so adding a scratch home to the ignore file is the whole
+#   edit and the two cannot drift. A hardcoded twin of `.temp`, `scratchpad`,
+#   `test-scratch`, ... is exactly the duplicate that goes stale on the next one.
+# ★ NAME-KEYED, MATCHING THE HARD LIST'S SEMANTICS: `.temp/` skips a directory called
+#   `.temp` at any depth, which is what os.walk pruning can express. A path-anchored
+#   ignore (`/src/dss-config/runtime/platform/dist/`) contributes its LAST segment
+#   only; over-skipping a same-named directory elsewhere is not a risk this guard runs,
+#   because every such entry names build output.
+# ⚠ It DEGRADES TO THE HARD LIST when there is no `.gitignore` -- the self-test's
+#   synthetic roots rely on that, and arm 24 makes the degradation itself observable.
+def scratch_dirs(repo):
+    """Directory names `.gitignore` declares, so scratch is never read as a document."""
+    out = set()
+    try:
+        text = io.open(os.path.join(repo, ".gitignore"), encoding="utf-8",
+                       errors="replace").read()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("!"):
+            continue
+        if not line.endswith("/"):
+            continue                      # a file pattern, not a directory home
+        name = line.rstrip("/").rstrip("/").split("/")[-1]
+        if name and "*" not in name and "?" not in name:
+            out.add(name)
+    return out
+
 # A marker, then optional markdown emphasis / whitespace, then the figure.
 # The figure may carry `,` thousands separators; the separator style is PRESERVED
 # on --write, so repairing a number never restyles the prose around it.
@@ -175,9 +213,10 @@ class Claim:
 def markdown_docs(repo):
     """Every markdown document in the tree, excluding the homes listed above."""
     out = []
+    skip = SKIP_DIRS | scratch_dirs(repo)
     for root, dirs, files in os.walk(repo):
         dirs[:] = sorted(d for d in dirs
-                         if d not in SKIP_DIRS and not d.startswith(SKIP_DIR_PREFIXES))
+                         if d not in skip and not d.startswith(SKIP_DIR_PREFIXES))
         for f in sorted(files):
             if f.lower().endswith(".md"):
                 out.append(os.path.join(root, f))
@@ -530,6 +569,36 @@ def selftest():
                                      "<!--census:examples:manifests-->**634**", 1))
         ok &= _arm("15 LIVE-CLAIM-BESIDE-QUOTATION", q, EXIT_DISAGREE,
                    says="documented 634, actual 788")
+
+        # 16-19 -- THE `.gitignore`-DECLARED SCRATCH HOMES, PINNED IN EVERY DIRECTION.
+        # ⚠ THE FIXTURE SYNTHESIZES THE *NEGATIVE*: the drifted scratch document is
+        #   written FIRST and arm 16 proves it REDS without the declaration, so arms 17
+        #   and 18 are measuring the skip rather than an empty directory. An arm that
+        #   only ADDED the ignore line would stay green if the skip did nothing at all.
+        sc = _fixture(tmp, "scratch")
+        st = os.path.join(sc, ".temp", "p62-lane-scratch")
+        os.makedirs(st, exist_ok=True)
+        _write(os.path.join(st, "examples_README.md"),
+               "# a lane's working COPY\n\n<!--census:examples:manifests-->**1**\n")
+        # 16: with NO `.gitignore`, `.temp` is not declared scratch and the copy REDS --
+        #     this is the state P62 actually found, and the arm that makes it a defect.
+        ok &= _arm("16 SCRATCH-UNDECLARED-REDS", sc, EXIT_DISAGREE,
+                   says="documented 1, actual 788")
+        # 17: declaring it in `.gitignore` -- the ONLY edit -- silences it.
+        _write(os.path.join(sc, ".gitignore"), "*.obj\n.temp/\nbuild/\n")
+        ok &= _arm("17 SCRATCH-DECLARED-IGNORED", sc, EXIT_OK, says="every documented figure")
+        # 18: ... and the SAME drift in the live tree beside it is still CAUGHT, so the
+        #     new exclusion cannot have widened to swallow the real document.
+        _write(_doc(sc), _read(_doc(sc)).replace("**788**", "**1**", 1))
+        ok &= _arm("18 LIVE-TREE-STILL-CAUGHT-BESIDE-SCRATCH", sc, EXIT_DISAGREE,
+                   says="documented 1, actual 788")
+        # 19: a FILE pattern is not a directory home. `.temp` written without its
+        #     trailing slash must NOT skip anything -- otherwise `*.md`-style entries
+        #     could silence arbitrary documents, and the escape would be unbounded.
+        _write(_doc(sc), _read(_doc(sc)).replace("**1**", "**788**", 1))
+        _write(os.path.join(sc, ".gitignore"), "*.obj\n.temp\nbuild/\n")
+        ok &= _arm("19 FILE-PATTERN-DOES-NOT-SKIP", sc, EXIT_DISAGREE,
+                   says="documented 1, actual 788")
 
     print("check-doc-census --selftest: %s" % ("PASS" if ok else "FAIL"))
     return EXIT_OK if ok else EXIT_DISAGREE

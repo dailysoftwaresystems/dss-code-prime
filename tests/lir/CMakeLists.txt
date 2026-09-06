@@ -255,3 +255,16 @@ dss_add_test(NAME lir/test_lir_copy_coalescing_value_width
 # residue a refusal rather than a miss.
 dss_add_test(NAME lir/test_lir_identity_copy_stage_attribution
              SOURCES test_lir_identity_copy_stage_attribution.cpp)
+
+# D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: a shared library's own call to
+# its own definition must be resolved by the LOADER, not branched to the local
+# body — otherwise that image answers one identifier differently from every
+# other image in the process, silently (MEASURED: a DSS-built ELF `.so` gave
+# rc 4 where the gcc-built control gave rc 6; a DSS-built darwin dylib gave rc 1
+# where ld64's gave rc 2). Its own target because the routing is a MATRIX —
+# (visibility × binding × the format's declaration) — and the over-routing and
+# back-compat directions are as load-bearing as the defect itself: routing a
+# `static` callee, or routing anything at all in a main executable, costs every
+# call an indirection for a definition no loader can replace.
+dss_add_test(NAME lir/test_preemptible_definition_routing
+             SOURCES test_preemptible_definition_routing.cpp)

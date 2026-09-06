@@ -237,14 +237,96 @@ if ! { : > "$log"; } 2>/dev/null; then
     exit 2
 fi
 
+# ── THE RUN'S INPUTS MUST HOLD STILL, OR ITS VERDICT IS NOT EVIDENCE ────────
+#
+# ★★★ THE FOURTH WAY A GATE'S EXIT CODE CAN MEAN NOTHING, and unlike the three
+# at the top of this file it does not need the gate to skip any work. This
+# project's runners read `src/dss-config/**`, `tests/corpus/**` and `examples/**`
+# from the SOURCE TREE at TEST TIME, not from the build directory. Edit one while
+# a suite is in flight and the run measures a tree that never existed: some tests
+# saw the old vocabulary, some the new, and the report names neither.
+#
+# ✔MEASURED 2026-09-05 (P62, and it is the reason this block exists). A whole-tree
+# `ctest` reported 9 failures out of 2087. EIGHT of them were examples failing with
+# `C_UnbackedPredefinedMacro` — "predefined macro '__MINGW32__' requires shipped
+# header 'dirent.h' … but no descriptor for it is on the shipped-library search
+# path" — which reads as a defect in the FFI/shipped-library work a sibling lane
+# had just folded, and that is exactly where the investigation started. The real
+# cause was the ORCHESTRATOR rewriting `src/dss-config/sources/c.lang.json` while
+# the run was in flight. ✔All eight passed on the stable tree, unchanged, seconds
+# later. The gate had no way to say so: a torn read of a config file is not a
+# failure mode any assertion in the suite is written against.
+#
+# ★★ IT IS THE ORCHESTRATOR-LANE FORM OF A RULE THIS PROJECT ALREADY HAS —
+# "a config edit under a running lane changes what its binaries MEAN; the
+# orchestrator is a lane too". That rule was written down, and the edit happened
+# anyway. Vigilance is the wrong mechanism for a recurring failure; this file
+# already says so about its first three occurrences.
+#
+# ★ NO ESCAPE HATCH, DELIBERATELY. The obvious accommodation is an env var for
+# "this gate legitimately rewrites config" — and an escape that every caller can
+# set is an escape every caller sets, which refuses nothing. A command that
+# rewrites these roots is a BUILD STEP, not a gate, and does not belong under a
+# wrapper whose whole contract is that its verdict can be trusted.
+#
+# ⓘ MARKER + `find -newer`, not a hash: it needs no hashing tool at all (macOS
+# has `md5`, Linux `md5sum`, and this script runs on both carriages), it is the
+# same technique `scripts/local-build/local-build.sh` uses for the sibling
+# question, and `-newer` is strictly-greater — which is the RIGHT direction here,
+# because the marker is written BEFORE the run and an offending edit lands after.
+# ⓘ A root that does not exist contributes nothing, so a lane worktree carrying a
+# subset of the tree, or a synthetic self-test root, is not penalised for it.
+# ✔MEASURED cost: 1971 files across the three roots, 0.31 s — against gates that
+# run for a quarter of an hour.
+run_gate_input_roots="src/dss-config tests/corpus examples"
+run_gate_marker="${log}.inputs-marker"
+run_gate_moved_inputs() {
+    [ -f "$run_gate_marker" ] || return 1
+    # shellcheck disable=SC2086
+    find $run_gate_input_roots -type f -newer "$run_gate_marker" 2>/dev/null | head -20
+}
+if ! { : > "$run_gate_marker"; } 2>/dev/null; then
+    echo "run-gate.sh: FAIL — cannot create the input marker '$run_gate_marker', so the run" >&2
+    echo "  could not be proved to have measured a still tree. Nothing was run." >&2
+    echo "  This refusal is about the MARKER PATH, which sits beside the log path you gave." >&2
+    echo "  shell   : $(run_gate_shell_identity)" >&2
+    exit 2
+fi
+
 "$@" >>"$log" 2>&1
 rc=$?
+
+run_gate_moved="$(run_gate_moved_inputs)"
+rm -f "$run_gate_marker"
 
 {
     echo "--- run-gate.sh ---"
     echo "command : $*"
     echo "rc      : $rc"
+    if [ -n "$run_gate_moved" ]; then
+        echo "inputs  : MOVED DURING THE RUN — this verdict is not evidence"
+        echo "$run_gate_moved" | sed 's/^/          /'
+    else
+        echo "inputs  : held still ($run_gate_input_roots)"
+    fi
 } >> "$log"
+
+# Checked BEFORE rc, and before the witness: a run whose inputs moved has no
+# verdict to report, and saying "the gate failed" or "the gate passed" about it
+# would be the misattribution this block exists to prevent.
+if [ -n "$run_gate_moved" ]; then
+    echo "run-gate.sh: FAIL — the tree CHANGED UNDER THE RUN, so its result is not evidence" >&2
+    echo "  (command exited $rc; that number describes a tree that never existed as a whole)." >&2
+    echo "  These read-at-test-time files were modified after the run started:" >&2
+    echo "$run_gate_moved" | sed 's/^/      /' >&2
+    echo "  ⚠ This is NOT 'the gate failed'. Any failure it reported may belong to the edit" >&2
+    echo "    rather than to the code under test, and any PASS is equally unproven." >&2
+    echo "  Let the tree settle and run it again. If you are the one who edited it: this" >&2
+    echo "    project's runners read src/dss-config, tests/corpus and examples from the" >&2
+    echo "    SOURCE TREE at test time, so an edit there is not inert while a suite runs." >&2
+    echo "  (log: $log)" >&2
+    exit 3
+fi
 
 # ★ 127 IS ITS OWN REFUSAL, AND IT SAYS SO. rc 127 from a POSIX shell means the
 # COMMAND WAS NOT FOUND — the gate never started, which is a categorically

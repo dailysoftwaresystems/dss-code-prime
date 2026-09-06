@@ -293,3 +293,15 @@ dss_add_test(NAME ffi/test_descriptor_import_referenced_only
 # through the real reader.
 dss_add_test(NAME ffi/test_shipped_library_role
              SOURCES test_shipped_library_role.cpp)
+
+# -- D-FFI-RESOLVE-LIBRARY-DOES-NOT-CHECK-THE-LIBRARY-ARCH (P62 lane `ff`)
+# The LOCATION TABLE under the end-to-end refusal: where each object format keeps
+# the CPU it was built for. Pins the three properties the end-to-end arms in
+# `tests/program/test_ffi_resolve_library.cpp` structurally cannot see -- that the
+# PE offset is READ from `e_lfanew` rather than constant (two different values, so
+# a hardcoded offset reds), that the `ar` / Mach-O-universal / Mach-O-32 arms
+# answer `nullopt` on purpose so their own precise refusals reach the operator,
+# and that a truncated header locates nothing instead of reading past the buffer.
+# Pure byte decoding: nothing is built, nothing is run, so every host answers.
+dss_add_test(NAME ffi/test_binary_architecture_field
+             SOURCES test_binary_architecture_field.cpp)

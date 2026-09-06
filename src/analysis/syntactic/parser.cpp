@@ -322,6 +322,17 @@ struct Parser::Impl {
     // a rolled-back probe cannot leave it stale.
     bool         stepRecovered_ = false;
 
+    // The value `stepRecovered_` had when the CURRENT dispatch step began —
+    // i.e. "the step before this one recovered", the parser's one definition
+    // of *still resyncing the SAME broken region*. `synthesizeMissingRule`
+    // consumed it as a parameter long before this; it is a member now because
+    // the recovery chokepoint (`recoverAt`) needs the same fact and is reached
+    // from `finishFailedSpeculation_` as well as from the dispatch arms
+    // (D-PARSE-SPECULATION-REFUSAL-REPLAY-IS-QUADRATIC).
+    // Captured + restored across speculative probes for the same reason
+    // `stepRecovered_` is: a rolled-back probe must not leave it stale.
+    bool         prevStepRecovered_ = false;
+
     // Diagnostic-emission counter. Incremented by `emitDiag`; lets
     // the speculation sub-loop detect "branch dispatch emitted a
     // diagnostic" without builder-side introspection. Rollback
@@ -683,6 +694,61 @@ struct Parser::Impl {
     StepOutcome recoverAt(DiagnosticCode code,
                           Token const& peek,
                           std::span<SchemaTokenId const> expected) {
+        // ★★★ ONE STRUCTURAL ERROR YIELDS ONE DIAGNOSTIC — APPLIED TO THE
+        // BACK-TO-BACK RECOVERY CHAIN
+        // (D-PARSE-SPECULATION-REFUSAL-REPLAY-IS-QUADRATIC).
+        //
+        // A recovery whose IMMEDIATELY PRECEDING dispatch step also recovered
+        // is not a second error, it is the same one still being resynced: no
+        // step in between succeeded, so nothing of the author's has been
+        // parsed since the last thing we complained about. Every token of that
+        // run is unparseable BY OUR OWN DECISION — the same sentence the
+        // cascade shield was written for — so raise the shield and let the
+        // FIRST voice of the region be the only one, until a schema-declared
+        // sync token says the region is genuinely over.
+        //
+        // ⚠ RAISED BEFORE THE EMISSION, not after: `emitParserError` is the
+        // chokepoint the shield acts at, so raising afterwards would let this
+        // recovery speak and silence only the NEXT one — one diagnostic late,
+        // every time.
+        //
+        // ✔MEASURED, real CLI, shipped `c.lang.json`, on
+        // `return (int)sizeof({x) + (int)…x` (a genuine unbalanced brace ahead
+        // of a cast chain): 1 `P_NoAlternativeMatched` + 26 `P_UnexpectedToken`
+        // marching one-per-token through `sizeof`, `(`, `{`, `x`, `+`, `(`,
+        // `int`, … — every one of them a token the author wrote correctly —
+        // collapses to the single positioned diagnostic that names the real
+        // error. The count grew with the chain (2 more per cast), which is
+        // what a cascade is.
+        //
+        // ⚠ DEPTH 0 ONLY, and for the reason the shield itself carries: a
+        // suppressed emission inside a probe would also suppress the
+        // `diagsEmitted` DELTA the probe reads as "this branch failed", and
+        // the probe would COMMIT a half-built branch. Inside a probe the
+        // diagnostics are rolled back anyway.
+        // ⚠ AND ONLY FOR A GRAMMAR THAT DECLARES `syncTokens`: the shield's
+        // only exit is reaching one, so without any, silence would run to end
+        // of file. Failing toward SPEAKING is the only safe default for a
+        // mechanism whose whole job is to say less. The silence is bounded by
+        // the grammar, not by this rule: c declares `EndStatement` and
+        // `BlockClose`, so at most one statement is ever quiet.
+        //
+        // ⚠ IT CAN RAISE IN THE SAME STEP `stepOnce` LOWERED IT, AND THAT IS
+        // NOT THE TWO RULES FIGHTING. The lowering is a HYPOTHESIS — "the peek
+        // is a sync token, so the broken region should be over". Arriving here
+        // afterwards REFUTES it: the dispatch could not place that very token
+        // either, with no successful step since the last complaint, so the
+        // region demonstrably is not over. ✔MEASURED on the whole diagnostic
+        // corpus (178 c files + the tsql and toy sets): three goldens move and
+        // every one of them LOSES a cascade — 3 adjacent `P_UnexpectedToken`
+        // become 1 on `asm_label_invalid.c`; the over-deep paren nest reports
+        // its ceiling and nothing else; and `SELECT FROM Users;` yields the one
+        // `P_NoAlternativeMatched` at `FROM` instead of that plus an
+        // "unexpected `;`" and a missing-child at EOF.
+        if (prevStepRecovered_ && speculationDepth == 0
+            && !schema->syncTokens().empty()) {
+            suppressCascadeUntilSync_ = true;
+        }
         emitParserError(code, peek.span, renderActual(peek), expected);
         (void)panicRecover();
         stepRecovered_ = true;
@@ -1523,6 +1589,7 @@ struct Parser::Impl {
             // publishes this one as the innermost. Null at the outermost.
             , parent_(impl.innermostProbe_)
             , stepRecoveredBefore_(impl.stepRecovered_)
+            , prevStepRecoveredBefore_(impl.prevStepRecovered_)
             // FC4 c1: the forward-progress watchdog tuple is probe state
             // too. Without restoring it, a rolled-back probe leaves
             // `last*` pointing at a position INSIDE the discarded branch
@@ -1593,6 +1660,7 @@ struct Parser::Impl {
                 impl_.tokens.restore(bookmark_);
                 impl_.diagsEmitted = diagsBefore_;
                 impl_.stepRecovered_ = stepRecoveredBefore_;
+                impl_.prevStepRecovered_ = prevStepRecoveredBefore_;
                 impl_.lastCursor     = lastCursorBefore_;
                 impl_.lastTokPos     = lastTokPosBefore_;
                 impl_.lastDepth      = lastDepthBefore_;
@@ -1723,6 +1791,26 @@ struct Parser::Impl {
             return impl_.diagsEmitted > diagsBefore_;
         }
 
+        // ★★★ THE BRANCH IS ALREADY DECIDED — the ONE predicate that says a
+        // probe can no longer win, named once so the driver's early test and
+        // its post-step test cannot drift apart
+        // (D-PARSE-SPECULATION-REFUSAL-REPLAY-IS-QUADRATIC).
+        //
+        // A branch that has emitted a diagnostic, or desynced the walker, is
+        // refuted: NO path in `driveParse_` commits such a probe — the
+        // post-step check tests exactly this pair BEFORE the expr-branch
+        // commit, before the `commitAfterPrefix` CUT and before the
+        // frame-closed decision, and `stepPending` is set on every step the
+        // site issues, so the check is reached after every one of them. What
+        // was NOT bounded is WHEN: the site's checks only run once everything
+        // its step SPAWNED (an expression walk, a nested site) has finished,
+        // and a refuted branch went on parsing — recovering, panic-scanning
+        // and re-scanning — to the end of its rule, with every token of it
+        // discarded by the rollback that was already certain. See the driver.
+        [[nodiscard]] bool isRefuted() const noexcept {
+            return emittedDiag() || isDesynced();
+        }
+
         // Commit the probe. After this the dtor is a no-op (beyond
         // the speculation-depth decrement) and the four-machine
         // state stays at its post-commit position. Also re-baselines
@@ -1775,6 +1863,7 @@ struct Parser::Impl {
         SpeculationProbe*                      parent_;
         std::size_t                            nestedAdvance_ = 0;
         bool                                   stepRecoveredBefore_;
+        bool                                   prevStepRecoveredBefore_;
         SchemaCursor                           lastCursorBefore_;
         std::size_t                            lastTokPosBefore_;
         std::size_t                            lastDepthBefore_;
@@ -2122,6 +2211,7 @@ struct Parser::Impl {
         // suppress a redundant diagnostic when it fires while still resyncing
         // the same broken region.
         const bool prevStepRecovered = stepRecovered_;
+        prevStepRecovered_ = prevStepRecovered;
         stepRecovered_ = false;
 
         // Lower the cascade shield the moment the parser reaches a
@@ -2131,7 +2221,21 @@ struct Parser::Impl {
         // a token count and not by "the next recovery" — is what keeps it a
         // ONE-REGION silence rather than a general softening of the parser.
         // Grammar-driven: the token set is config data.
-        if (suppressCascadeUntilSync_ && !tokens.isAtEnd()) {
+        //
+        // ⚠⚠ DEPTH 0, LIKE EVERY OTHER USE OF THIS FLAG. The shield is RAISED
+        // at depth 0 and CONSULTED at depth 0 (`emitParserError`), and
+        // `SpeculationProbe` deliberately does not snapshot it — so lowering
+        // it from inside a live probe made a SPECULATIVE, rolled-back walk
+        // permanently disarm a shield the depth-0 parse had raised, and the
+        // cascade the shield existed to silence then spoke. The probe's
+        // rollback restores every other machine and cannot restore this one.
+        // ✔MEASURED: an over-cap paren nest followed by a stray `]` inside a
+        // cast chain reported its ceiling and then 20 more diagnostics
+        // (1 `P_NoAlternativeMatched` + 1 `P_MissingRequiredChild` +
+        // 18 `P_UnexpectedToken`) that the shield was holding
+        // (D-PARSE-SPECULATION-REFUSAL-REPLAY-IS-QUADRATIC).
+        if (suppressCascadeUntilSync_ && speculationDepth == 0
+            && !tokens.isAtEnd()) {
             const auto sync = schema->syncTokens();
             const SchemaTokenId k =
                 effectiveKind(tokens.peek(), identifierKind, errorKind);
@@ -3312,6 +3416,66 @@ void exprStep(Parser::Impl& I) {
 // is what keeps the two counts comparable.
 void Parser::Impl::driveParse_() {
     for (;;) {
+        // ★★★ A REFUTED HYPOTHESIS IS NOT PARSED ANY FURTHER
+        // (D-PARSE-SPECULATION-REFUSAL-REPLAY-IS-QUADRATIC).
+        //
+        // The innermost live probe is the top site's, and once
+        // `probe->isRefuted()` holds nothing this parse does under it can
+        // change its outcome: the rollback is certain, so every token it goes
+        // on consuming, every diagnostic it goes on emitting and every
+        // recovery it goes on running are work whose only consumer is the
+        // discard. Asking here — before the expression frames and before the
+        // site's own step — is what makes that WINDOW O(1) instead of "until
+        // the branch's rule ends", because the site's post-step check is
+        // reached only after everything its step SPAWNED has finished.
+        //
+        // ✔MEASURED, real CLI, `(int)`-chain one cast past
+        // `maxSpeculationDepth`, `maxExpressionDepth` lifted, shipped
+        // `speculationBudgetFactor` 128, counting inside the parser: caps
+        // 64/128/256/512 opened 65/129/257/513 speculation SITES and
+        // 128/256/512/1024 probes — LINEAR, and the alt's non-speculative
+        // fallback REPLAY fired exactly ONCE at every cap — while
+        // `P_BacktrackFailed` recoveries ran 2272/8640/33664/132864 times —
+        // C(C+7)/2 exactly, at all four points: the quadratic. Of the 134401
+        // PANIC SCANS at cap 512, 133376 (99.2 %) ran inside a still-live
+        // probe; that percentage is scans-inside-a-probe over scans, and it is
+        // NOT a share of the recovery count beside it (133376 of 132864 would
+        // be over 100 %, which is how the wrong denominator announces itself).
+        // Each of those recoveries was the SAME refuted branch recovering its
+        // way through the rest of the chain before its site was next asked.
+        //
+        // OUTCOME-IDENTICAL, and the one thing it changes is an improvement:
+        // the only parser state a rollback does NOT restore is the speculation
+        // ceiling LATCH, so cutting a refuted branch short can only drop a
+        // ceiling that branch would have reached AFTER it was already refuted.
+        // Blaming the parse's refusal on a resource limit hit under a reading
+        // the parser had already rejected is the misattribution
+        // `speculationCapHit_` exists to prevent — it is reset at every
+        // depth-0 alt entry for exactly that reason, and this applies the same
+        // rule WITHIN a branch. Both ceilings latch BEFORE they emit
+        // (`startNextCandidate_`, `recoverExpressionTooDeep_`) or without
+        // emitting at all (the budget check), so no ceiling that fires on its
+        // own evidence is lost.
+        // ⚠ ONLY THE INNERMOST LIVE PROBE MAY BE ASKED. A nested probe's
+        // rollback restores `diagsEmitted` to ITS baseline, so an ENCLOSING
+        // probe's delta can go back to zero — asking an enclosing probe would
+        // abandon it for a diagnostic that was about to be un-emitted.
+        // `innermostProbe_` is read directly (one pointer, on a loop that runs
+        // once per parse step) rather than through `specStack.back()`; the two
+        // are the same object by the probe stack's LIFO invariant, and that
+        // equality is checked — fail-loud — on the rare refuted path.
+        if (innermostProbe_ != nullptr && innermostProbe_->isRefuted()) {
+            if (specStack.empty()
+                || specStack.back().probe.get() != innermostProbe_) {
+                fatal("dss::Parser: the innermost live speculation probe is "
+                      "not the top site's — the probe stack is no longer LIFO "
+                      "and a refuted branch would be abandoned on the wrong "
+                      "site");
+            }
+            abandonAndAdvance_();
+            continue;
+        }
+
         bool exprInnermost = false;
         if (!exprWorkStack.empty()) {
             const std::size_t depthAtPush = exprWorkStack.back().specDepthAtPush;
@@ -3366,9 +3530,14 @@ void Parser::Impl::driveParse_() {
                 // would see `frames.size() == targetDepth` and commit a
                 // half-built branch.
                 site.stepPending = false;
-                if (probe.emittedDiag() || probe.isDesynced()) {
-                    abandonAndAdvance_();
-                    continue;
+                // The refuted pair (`emittedDiag() || isDesynced()`) was
+                // tested at the TOP of this loop, which every path reaches
+                // before arriving here, so a refuted probe never gets this
+                // far. ONE owner for that predicate — see `isRefuted`.
+                if (probe.isRefuted()) {
+                    fatal("dss::Parser: a refuted speculation probe reached "
+                          "its site's post-step checks — the driver's "
+                          "top-of-loop refutation test did not fire");
                 }
                 if (site.exprBranch) {
                     // The expr-shaped branch's walk is complete and clean:

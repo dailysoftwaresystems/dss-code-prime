@@ -17,7 +17,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"  // encode-tier extern binder's scratch lattice
 #include "ffi/abi/abi_catalog.hpp"  // resolveAbi (encode-tier va_list shape, per active ABI)
-#include "ffi/binary_reader.hpp"  // readImports (encode-tier --resolve-library binder)
+#include "ffi/binary_reader.hpp"  // the FF1 reader vocabulary (BinaryReadError / ImportSurface). ⚠ NOT `readImports`: no --resolve-library input is read through the bare reader from here — the encode-tier binder calls ffi::readImportsForTargetFormat (ingest.hpp) so the format+architecture boundary check cannot be bypassed (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL)
 #include "ffi/binary_readers/ar_reader.hpp"  // c165: readArArchive (static-pull member index)
 #include "ffi/ingest.hpp"
 #include "ffi/mangling/c_mangle.hpp"  // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: applyCMangling
@@ -276,7 +276,10 @@ bool optimizeModule(Mir&                  mir,
         mir, target, interner, *effectivePipeline, reporter, externImports,
         // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the driver's ONE resolution
         // of the target's plain-`char` sign, relayed to `ConstFold`.
-        opts.charIsUnsigned);
+        opts.charIsUnsigned,
+        // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: relayed to the
+        // Inlining leaf's gate rule 2 (its load-time half).
+        opts.preemptibleDefinitionBindings);
     return optResult.ok && tierClean(reporter, optEntry);
 }
 
@@ -1002,6 +1005,10 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // and the narrowing of WHICH bindings that dispatch applies to,
         // for the same reason.
         format.indirectSlotBindings(),
+        // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: and WHICH of this
+        // artifact's OWN definitions its loader may replace, for the same
+        // reason — the LOWER half never sees the format.
+        format.preemptibleDefinitionBindings(),
         // D-LK-EXTERN-DATA-IMPORT (c117): capture the format's extern-DATA
         // binding model now, for the same reason (the LOWER half's MIR→LIR
         // GlobalAddr lowering selects got-indirect deref vs a direct lea).
@@ -1160,7 +1167,39 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          // import). Threaded into MIR→LIR exactly like the
                          // dispatch itself, and read there ONLY under it.
                          std::vector<SymbolBinding>                  indirectSlotBindings,
+                         // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
+                         // the format's DECLARED set of definition bindings
+                         // this artifact's LOADER may replace with another
+                         // image's body. Empty = nothing is preemptible and
+                         // every module-internal call stays a direct branch.
+                         // Threaded into MIR→LIR exactly like the narrowing
+                         // above; the NAMES the routing needs are built from
+                         // `nameOf` right below, not threaded from the caller.
+                         std::vector<SymbolBinding>                  preemptibleDefinitionBindings,
                          DiagnosticReporter&                         reporter) {
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the on-binary names
+    // MIR→LIR needs to MINT a loader-resolved reference for a preemptible
+    // definition. Built HERE because this is where names live — `nameOf` is
+    // this function's own parameter, and the IRs deliberately stay numeric (the
+    // same reason `assembled.symbols` is built from `nameOf` below rather than
+    // threaded through MIR/LIR). Built ONLY when the format declared a
+    // preemptible binding, so every other leg pays one branch and no walk.
+    std::vector<DefinedSymbolName> definedSymbolNames;
+    if (!preemptibleDefinitionBindings.empty()) {
+        definedSymbolNames.reserve(mir.moduleFuncCount());
+        for (std::uint32_t fi = 0; fi < mir.moduleFuncCount(); ++fi) {
+            MirFuncId const fid = mir.funcAt(fi);
+            SymbolId const  sym = mir.funcSymbol(fid);
+            std::string     nm  = nameOf(sym);
+            // "" = a compiler-SYNTHESIZED symbol with no declared name (the
+            // same skip `appendSym` makes below, for the same reason): it is
+            // module-private by construction, never published, so no loader can
+            // preempt it and no name is needed.
+            if (nm.empty()) continue;
+            definedSymbolNames.push_back(
+                DefinedSymbolName{sym, std::move(nm)});
+        }
+    }
     // 4. MIR → LIR (vreg-based). Extern imports propagate through.
     // D-FFI-EXTERN-CALL-DISPATCH: the active format's extern-call shape
     // selects the call-site opcode (indirect-slot → call_indirect_via_extern;
@@ -1192,7 +1231,12 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                           // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT
                           // (P55): the format's declared slot-binding
                           // narrowing.
-                          std::move(indirectSlotBindings));
+                          std::move(indirectSlotBindings),
+                          // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
+                          // the format's declared preemptible-definition
+                          // bindings, and the names the routing mints with.
+                          std::move(preemptibleDefinitionBindings),
+                          std::move(definedSymbolNames));
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -2197,7 +2241,8 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         cuMir.externAddrBinding,
         cuMir.tlsAccess,
         std::move(sehScopes), std::move(wideFloatSoftcallLibraryOpt),
-        atomicsRuntime, cuMir.indirectSlotBindings, reporter);
+        atomicsRuntime, cuMir.indirectSlotBindings,
+        cuMir.preemptibleDefinitionBindings, reporter);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -2240,7 +2285,12 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       std::optional<std::string> wideFloatSoftcallLibrary,
                       DiagnosticReporter& reporter,
                       std::optional<AtomicsRuntime> atomicsRuntime,
-                      std::vector<SymbolBinding> indirectSlotBindings) {
+                      std::vector<SymbolBinding> indirectSlotBindings,
+                      // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
+                      // the format's declared preemptible-definition
+                      // bindings, pre-resolved one level up in program.cpp
+                      // (same shape as `indirectSlotBindings` above).
+                      std::vector<SymbolBinding> preemptibleDefinitionBindings) {
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
     // A synthesized / nameless merged symbol is absent from the map → "" → skipped
     // by the LK11a symbol-table populate (module-private), exactly as in the CU path.
@@ -2256,7 +2306,8 @@ lowerMergedToAssembly(MergedMirModule&    merged,
         callingConventionIndex, cuId,
         externCallDispatch, dataImportBinding, externAddrBinding, tlsAccess,
         std::move(sehScopes), std::move(wideFloatSoftcallLibrary),
-        std::move(atomicsRuntime), std::move(indirectSlotBindings), reporter);
+        std::move(atomicsRuntime), std::move(indirectSlotBindings),
+        std::move(preemptibleDefinitionBindings), reporter);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU

@@ -754,6 +754,32 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                    "D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT.");
     }
 
+    // ── D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
+    //    a preemptible definition needs a shape to be REACHED by ───────────
+    //
+    // `preemptibleDefinitionBindings` says the loader may replace one of this
+    // artifact's own definitions, so a reference made INSIDE the artifact must
+    // go through the loader rather than branch to the local body. The reference
+    // that replaces the direct branch is an ordinary loader-resolved call, and
+    // WHAT SHAPE that call takes is `externCallDispatch`'s answer. A format
+    // that declares preemption but no dispatch has declared a rule whose
+    // consumer cannot act: MIR→LIR would have to pick a call shape blind, and
+    // picking the wrong one is a SIGSEGV, not a slow path
+    // (see `externCallUsesIndirectShape`'s docblock). Refused at LOAD, where
+    // the document that made the claim can still be named.
+    if (!preemptibleDefinitionBindings.empty()
+        && !externCallDispatch.has_value()) {
+        fail("/preemptibleDefinitionBindings",
+             "'preemptibleDefinitionBindings' declares that this artifact's "
+             "own definitions may be replaced by the loader, so a reference "
+             "made inside the artifact must be resolved by the loader instead "
+             "of branching to the local body — but this format declares no "
+             "'externCallDispatch', so there is no declared shape for that "
+             "reference and MIR->LIR cannot emit one. Declare "
+             "'externCallDispatch' too, or remove the preemption list. "
+             "D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING.");
+    }
+
     // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): container rules ──
     //
     // `container: archive` is a STATIC-LIBRARY format: its driver output is

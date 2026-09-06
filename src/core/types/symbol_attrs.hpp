@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string_view>
 
 namespace dss {
@@ -84,6 +85,54 @@ symbolVisibilityName(SymbolVisibility v) noexcept {
 [[nodiscard]] constexpr std::optional<SymbolVisibility>
 symbolVisibilityFromName(std::string_view s) noexcept {
     return kSymbolVisibilityTable.fromName(s);
+}
+
+// ★★ THE single source of truth for "MAY THIS ARTIFACT'S LOADER REPLACE THIS
+// DEFINITION" — D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING, and the exact
+// sibling of `externCallUsesIndirectShape` above, for the same stated reason:
+// THREE independent tiers must answer it identically for one symbol, and a rule
+// spelled three times is a rule that drifts.
+//
+//   * `mir_to_lir.cpp::lowerCall` — whether the call site is a direct branch to
+//     the local body or a loader-resolved reference.
+//   * `opt/passes/inlining.cpp::inlineLegalityGate` — whether the local body may
+//     be SPLICED. ⚠ Disagreement here is not a slow path: if the inliner splices
+//     a body the lowering was routing, the routed reference survives as dead
+//     code beside a baked-in answer, and the release arm silently disagrees with
+//     the debug arm of the same source. ✔MEASURED exactly that, before this
+//     function existed.
+//   * `ObjectFormatSchema::definitionIsPreemptible` — the schema-side reader,
+//     which delegates here rather than restating it.
+//
+// The rule, in full:
+//   * a non-`default` VISIBILITY is NEVER preemptible, under ANY format, and it
+//     is asked FIRST. Such a definition is in no image's dynamic export set, so
+//     no loader can see it and none can replace it. Universal, so it is engine
+//     logic and not a declaration — a config key whose only legal value is the
+//     one the engine must apply anyway is not a declaration. ✔MEASURED in ONE
+//     object: gcc 13.3.0 and clang 18.1.3 both leave a `static` and a
+//     `visibility("hidden")` callee DIRECT in a `.so` whose default-visibility
+//     callees they PLT-route.
+//   * the BINDING half IS declared, because the ecosystems disagree: ELF
+//     preempts `global` and `weak` alike in a shared object (the search scope
+//     puts the executable first — what makes LD_PRELOAD and semantic
+//     interposition work), Mach-O's two-level namespace preempts only `weak`,
+//     and a main executable preempts NEITHER because it is always its own
+//     winner. Hard-coding any one of those puts DSS below one reference union
+//     or above another.
+//   * an EMPTY list means nothing is preemptible — the pre-key behaviour,
+//     byte-identically. ⚠ NOTE THE POLARITY: empty here is NOT "unnarrowed",
+//     the opposite of `indirectSlotBindings`' empty, because there is no outer
+//     declaration for this list to narrow.
+[[nodiscard]] constexpr bool
+definitionIsPreemptible(SymbolBinding binding, SymbolVisibility visibility,
+                        std::span<SymbolBinding const>
+                            preemptibleBindings) noexcept {
+    if (visibility != SymbolVisibility::Default) return false;
+    for (auto const b : preemptibleBindings) {
+        if (b == binding) return true;
+    }
+    return false;
 }
 
 // ── WHAT A WEAK DEFINITION PROMISES ABOUT ITS DUPLICATES ──────────────────

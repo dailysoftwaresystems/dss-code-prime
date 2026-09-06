@@ -3825,19 +3825,112 @@ TEST(MachOExecWriter, ChainedFixupsSymbolsPoolContainsExternName) {
            "→ payload pool flow";
 }
 
-// 8aabc04 audit fold (test-analyzer + test-analyzer-dim-2 HIGH):
-// pin LC_DYSYMTAB stays emitted on the chained path. The companion
-// D-LK6-14-INTEGRATION-GOT-SLOTS will drop it together with __got
-// slot bitfield population — a premature regression that drops
-// LC_DYSYMTAB here would produce structurally broken chained
-// binaries with no failing test.
-// D-LK6-14-INTEGRATION-GOT-SLOTS closed: LC_DYSYMTAB is DROPPED on
-// the chained-fixups path (chained pointers in __got encode the
-// import ordinal directly via DYLD_CHAINED_PTR_64 bits [0..23], so
-// the indirect symbol table is redundant). The prior pin (which
-// pinned PRESENCE during the substrate window) is now inverted.
-TEST(MachOExecWriter, ChainedFixupsDropsLcDysymtab) {
-    constexpr std::uint32_t kLcDysymtab = 0x0Bu;
+// ⚠⚠ THIS PIN HAS BEEN INVERTED TWICE, AND THE HISTORY IS THE POINT.
+// 8aabc04 pinned LC_DYSYMTAB PRESENT on the chained path during the substrate
+// window. D-LK6-14-INTEGRATION-GOT-SLOTS then inverted it to ABSENT, on the
+// premise that a chained pointer carries its import ordinal in
+// DYLD_CHAINED_PTR_64 bits so the indirect symbol table is redundant.
+// [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]] refutes
+// that premise and this pin returns to PRESENT — with the CONTENT checked, not
+// only the command, because presence alone was what the first version pinned
+// and it could not have caught a command over an empty or stale region.
+//
+// ★ WHY IT IS NOT A MATTER OF TASTE. `dyld_info -fixups` SIGSEGVs on an image
+// without it (`other_tools::SymbolicatedImage::addStubSymbols()` reads the
+// indirect symbol table unconditionally to name __stubs/__got slots), while
+// dyld LOADS AND RUNS that same image — so nothing at runtime, and no exit
+// code, can see this. ✔MEASURED against ld64 on Apple Silicon with the arm
+// that discriminates: one program, `cc` versus `cc -Wl,-no_fixup_chains`, and
+// LC_DYSYMTAB + the whole indirect table are IDENTICAL across the two.
+namespace {
+constexpr std::uint32_t kLcDysymtabCmd = 0x0Bu;
+// nlist_64: n_strx(4) n_type(1) n_sect(1) n_desc(2) n_value(8).
+constexpr std::size_t   kNlist64Bytes  = 16;
+constexpr std::uint8_t  kNTypeUndefExt = 0x01;  // N_UNDF | N_EXT
+
+// The LEGACY (LC_DYLD_INFO_ONLY) twin of `loadChainedFixupsExecFormat` —
+// character-for-character the same document with `image.useChainedFixups`
+// absent (it defaults to false). ONE owner, because it is the CONTROL arm for
+// every chained-vs-legacy comparison below and two copies of a control that
+// must differ in exactly one key is how a control quietly stops discriminating.
+[[nodiscard]] std::shared_ptr<ObjectFormatSchema const>
+loadLegacyBindingExecFormat() {
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+  "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
+      "format": {"name":"macho-legacy-for-delta","kind":"macho"},
+      "entryPoint": "",
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
+      "entryCallingConvention": "sysv_amd64",
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"]
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ],
+      "relocations":[
+        {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
+        {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
+        {"name":"X86_64_RELOC_UNSIGNED_4","kind":3,"nativeId":33554432}
+      ]
+    })");
+    if (!fmt.has_value()) return nullptr;
+    return *fmt;
+}
+
+// Every indirect-symbol entry of an emitted image, resolved through the nlist
+// and string table the image really carries, as (entryIndex → symbol name).
+// A raw index vector would let a wrong-but-in-range index pass; following it
+// into the table is what makes a mis-bound slot visible.
+[[nodiscard]] std::vector<std::string>
+indirectSymbolNamesOf(std::vector<std::uint8_t> const& bytes) {
+    std::vector<std::string> names;
+    auto const symtabOff = dss::macho::test::findLoadCommand(bytes, 0x02u);
+    auto const dysymOff  = dss::macho::test::findLoadCommand(bytes,
+                                                             kLcDysymtabCmd);
+    if (!symtabOff.has_value() || !dysymOff.has_value()) return names;
+    std::size_t const st = static_cast<std::size_t>(*symtabOff);
+    std::size_t const dy = static_cast<std::size_t>(*dysymOff);
+    std::uint32_t const symoff  = readU32LE(bytes, st + 8);
+    std::uint32_t const nsyms   = readU32LE(bytes, st + 12);
+    std::uint32_t const stroff  = readU32LE(bytes, st + 16);
+    std::uint32_t const indOff  = readU32LE(bytes, dy + 8 + 12 * 4);
+    std::uint32_t const indCount = readU32LE(bytes, dy + 8 + 13 * 4);
+    for (std::uint32_t k = 0; k < indCount; ++k) {
+        std::size_t const at = static_cast<std::size_t>(indOff) + 4u * k;
+        if (at + 4 > bytes.size()) { names.emplace_back("<past EOF>"); continue; }
+        std::uint32_t const idx = readU32LE(bytes, at);
+        if (idx >= nsyms) { names.emplace_back("<out of range>"); continue; }
+        std::size_t const rec =
+            static_cast<std::size_t>(symoff) + kNlist64Bytes * idx;
+        if (rec + kNlist64Bytes > bytes.size()) {
+            names.emplace_back("<record past EOF>"); continue;
+        }
+        if (bytes[rec + 4] != kNTypeUndefExt) {
+            names.emplace_back("<not N_UNDF|N_EXT>"); continue;
+        }
+        std::size_t p = static_cast<std::size_t>(stroff)
+                        + static_cast<std::size_t>(readU32LE(bytes, rec));
+        std::string name;
+        for (; p < bytes.size() && bytes[p] != 0u; ++p)
+            name.push_back(static_cast<char>(bytes[p]));
+        names.push_back(std::move(name));
+    }
+    return names;
+}
+} // namespace
+
+TEST(MachOExecWriter, ChainedFixupsKeepsLcDysymtabOverARealIndirectTable) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = loadChainedFixupsExecFormat();
@@ -3846,15 +3939,220 @@ TEST(MachOExecWriter, ChainedFixupsDropsLcDysymtab) {
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, **target, *fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
-    EXPECT_FALSE(
-        dss::macho::test::findLoadCommand(bytes, kLcDysymtab).has_value())
-        << "LC_DYSYMTAB MUST be absent on the chained-fixups path — "
-           "D-LK6-14-INTEGRATION-GOT-SLOTS closed: chained pointers "
-           "in __got encode the import ordinal directly so the "
-           "indirect symbol table is redundant. A regression that "
-           "re-emits LC_DYSYMTAB here would produce dyld-rejected "
-           "binaries because ncmds/sizeofcmds arithmetic accounts "
-           "for the absence.";
+    auto const dysymOff =
+        dss::macho::test::findLoadCommand(bytes, kLcDysymtabCmd);
+    ASSERT_TRUE(dysymOff.has_value())
+        << "LC_DYSYMTAB MUST be emitted on the chained-fixups path — "
+           "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO. "
+           "ld64 emits it on ITS chained path (measured against its own "
+           "-no_fixup_chains control), and Apple's `dyld_info -fixups` "
+           "dereferences the indirect symbol table it names without checking "
+           "for it, so an image without one CRASHES the reader while still "
+           "loading and running.";
+    std::size_t const dy = static_cast<std::size_t>(*dysymOff);
+    // The command must be the full dysymtab_command, not a stub: cmdsize 80.
+    EXPECT_EQ(readU32LE(bytes, dy + 4), 80u)
+        << "LC_DYSYMTAB cmdsize must be the whole 80-byte dysymtab_command";
+    // ONE function extern → one __stubs entry + one __got entry.
+    EXPECT_EQ(readU32LE(bytes, dy + 8 + 13 * 4), 2u)
+        << "nindirectsyms must be numFuncExterns + numExterns (1 + 1 here) — "
+           "the same two-band table ld64's chained image carries. Anchored "
+           "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO.";
+    std::uint32_t const indOff = readU32LE(bytes, dy + 8 + 12 * 4);
+    EXPECT_NE(indOff, 0u)
+        << "indirectsymoff must name the region, not 0 — a command over no "
+           "region is exactly what the reader walks off the end of";
+    EXPECT_EQ(indOff % 8u, 0u)
+        << "the indirect-symbol region rides the 8-byte __LINKEDIT blob "
+           "chain (D-LINK-MACHO-LINKEDIT-SYMTAB-MISALIGNED)";
+    // Follow every entry into the table it indexes. Both bands name the one
+    // undefined extern the fixture imports.
+    EXPECT_EQ(indirectSymbolNamesOf(bytes),
+              (std::vector<std::string>{"_printf", "_printf"}))
+        << "each indirect entry must resolve to an N_UNDF|N_EXT nlist record "
+           "for the extern its slot binds — __stubs band first, then __got, "
+           "which is the order the two reserved1 origins address";
+}
+
+// The CONTROL for the pin above, and it is what makes that pin a statement
+// about the CHAINED path rather than about the writer in general: the LEGACY
+// fixture — same module, same program, only `image.useChainedFixups` moving —
+// must produce the SAME table. Without this arm, "the chained image has an
+// indirect table" is equally consistent with "every image gets one no matter
+// what", which is true and says nothing about the defect. It is the direct
+// analogue of the `cc` vs `cc -Wl,-no_fixup_chains` arm measured on ld64.
+TEST(MachOExecWriter, LegacyPathCarriesTheSameIndirectTableAsTheChainedPath) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmtChained = loadChainedFixupsExecFormat();
+    ASSERT_NE(fmtChained, nullptr);
+    auto fmtLegacy = loadLegacyBindingExecFormat();
+    ASSERT_NE(fmtLegacy, nullptr);
+    auto mod = chainedFixupsTestModule();
+    DiagnosticReporter rep;
+    auto chained = encodeUntrampolined(mod, **target, *fmtChained, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    auto legacy = encodeUntrampolined(mod, **target, *fmtLegacy, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    auto const dyChained =
+        dss::macho::test::findLoadCommand(chained, kLcDysymtabCmd);
+    auto const dyLegacy =
+        dss::macho::test::findLoadCommand(legacy, kLcDysymtabCmd);
+    ASSERT_TRUE(dyChained.has_value());
+    ASSERT_TRUE(dyLegacy.has_value());
+    // The six band fields plus nindirectsyms are the binding-path-independent
+    // half of the command; only the two file OFFSETS legitimately differ
+    // (the two paths lay different-sized blobs ahead of the region).
+    for (std::size_t f : {0u, 1u, 2u, 3u, 4u, 5u, 13u}) {
+        EXPECT_EQ(readU32LE(chained, static_cast<std::size_t>(*dyChained) + 8
+                                         + 4 * f),
+                  readU32LE(legacy, static_cast<std::size_t>(*dyLegacy) + 8
+                                        + 4 * f))
+            << "LC_DYSYMTAB field #" << f << " must not depend on which "
+               "binding encoding the image uses — the fixup encoding and the "
+               "symbol-table description are orthogonal, exactly as they are "
+               "in ld64's two arms. Anchored "
+               "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO.";
+    }
+    EXPECT_EQ(indirectSymbolNamesOf(chained), indirectSymbolNamesOf(legacy))
+        << "the indirect symbol table must be the same on both paths. Anchored "
+           "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO.";
+    EXPECT_FALSE(indirectSymbolNamesOf(legacy).empty())
+        << "the control arm must itself be non-empty, or the equality above "
+           "is two empty vectors agreeing";
+}
+
+namespace {
+// The ONE extern ORDERING that discriminates the __stubs band's compaction, and
+// until this fixture existed the whole tree lacked it.
+//
+// ★ WHY IT HAD TO BE BUILT RATHER THAN FOUND. The __stubs band pushes
+// `numDefs + funcExternIdxs[j]` — the compaction that skips DATA externs
+// (D-LK-MACHO-DATA-EXTERN-DEAD-STUB). ✔MEASURED: every hand-written Mach-O
+// image fixture in the tree puts its DATA extern AFTER its function externs
+// (`MachOExecWriter.DataExternGetsGotSlotButNoStub` is the only one with an
+// `isData` extern at all, and its data extern sits at index 1), so
+// `funcExternIdxs[j] == j` in all of them and a `j`-for-`funcExternIdxs[j]`
+// mutant is BYTE-IDENTICAL everywhere. The ELF side already orders `dataExt`
+// before `fnExt` in `tests/link/test_elf_dyn_writer.cpp`; the Mach-O side did
+// not, so the compaction was unpinned by CONTENT. Putting the data extern
+// FIRST makes `funcExternIdxs == {1}` while `j` is 0, and the two expressions
+// finally disagree.
+//
+// ⚠ THE PRODUCTION BELT CANNOT COVER THIS, and that is structural rather than
+// an omission to file: `machoIndirectSymbolBreach` checks that each index is in
+// range and lands on an `N_UNDF|N_EXT` record. A compaction slip lands on
+// ANOTHER undefined extern, so it passes — and the belt cannot be strengthened
+// to catch it, because an undefined nlist_64 record carries no function/data
+// distinction (n_sect is 0, n_desc holds the dylib ordinal) and re-deriving the
+// band from the same `funcExternIdxs` the loop used would be the `x == x`
+// tautology that header's own docblock exists to warn against. So the check
+// belongs HERE, over the emitted bytes, where the expected names are written
+// down independently of the arithmetic that produced them.
+// The two binding arms for that fixture, from ONE document text with ONE key
+// toggled. A data import needs `dataImportBinding` declared — the walker
+// refuses without it (D-LK-EXTERN-DATA-IMPORT), which is why neither existing
+// exec fixture can carry this module — and writing the document twice is how a
+// control that must differ in exactly one key quietly stops differing in
+// exactly one key.
+[[nodiscard]] std::shared_ptr<ObjectFormatSchema const>
+loadDataImportExecFormat(bool useChainedFixups) {
+    std::string text = R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"macho-data-import-order","kind":"macho"},
+      "entryPoint": "",
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
+      "entryCallingConvention": "sysv_amd64",
+      "dataImportBinding": "got-indirect",
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"]__CHAINED__
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ],
+      "relocations":[
+        {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
+        {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
+        {"name":"X86_64_RELOC_UNSIGNED_4","kind":3,"nativeId":33554432}
+      ]
+    })";
+    auto const at = text.find("__CHAINED__");
+    text.replace(at, std::strlen("__CHAINED__"),
+                 useChainedFixups ? ",\n        \"useChainedFixups\": true"
+                                  : "");
+    auto fmt = ObjectFormatSchema::loadFromText(text);
+    if (!fmt.has_value()) return nullptr;
+    return *fmt;
+}
+
+[[nodiscard]] AssembledModule dataExternBeforeFunctionExternModule() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};  // CALL rel32 _f ; RET
+    Relocation rel;
+    rel.offset = 1; rel.target = SymbolId{99};
+    rel.kind = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    // ORDER IS THE WHOLE POINT: the DATA extern is index 0, the FUNCTION extern
+    // index 1. Reverse them and this fixture stops discriminating.
+    ExternImport dataExt{SymbolId{98}, "_d", "/usr/lib/libSystem.B.dylib"};
+    dataExt.isData = true;
+    mod.externImports.push_back(std::move(dataExt));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_f", "/usr/lib/libSystem.B.dylib"});
+    return mod;
+}
+} // namespace
+
+TEST(MachOExecWriter, StubsBandSkipsDataExternWhenItSortsBeforeTheFunction) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmtChained = loadDataImportExecFormat(true);
+    ASSERT_NE(fmtChained, nullptr);
+    auto fmtLegacy = loadDataImportExecFormat(false);
+    ASSERT_NE(fmtLegacy, nullptr);
+    auto mod = dataExternBeforeFunctionExternModule();
+    DiagnosticReporter rep;
+    auto chained = encodeUntrampolined(mod, **target, *fmtChained, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    auto legacy = encodeUntrampolined(mod, **target, *fmtLegacy, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    // ONE function extern → a one-entry __stubs band naming `_f`; then the
+    // __got band, one entry per extern in externImports order, `_d` then `_f`.
+    // A band that read `j` instead of `funcExternIdxs[j]` would name `_d` in
+    // the stub slot — a call to `_f` entering the data import's address.
+    std::vector<std::string> const expected{"_f", "_d", "_f"};
+    EXPECT_EQ(indirectSymbolNamesOf(chained), expected)
+        << "the __stubs band must name the FUNCTION extern even though a DATA "
+           "extern sorts ahead of it — the compaction of "
+           "D-LK-MACHO-DATA-EXTERN-DEAD-STUB, checked by CONTENT. Anchored "
+           "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO.";
+    EXPECT_EQ(indirectSymbolNamesOf(legacy), expected)
+        << "and identically on the legacy binding path — the compaction is a "
+           "property of the extern list, not of the fixup encoding. Anchored "
+           "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO.";
+    // Non-vacuity: the expectation above is only a check if the fixture really
+    // does place a DATA extern ahead of a FUNCTION extern, which is what makes
+    // `funcExternIdxs[0]` (1) differ from `j` (0).
+    ASSERT_EQ(mod.externImports.size(), 2u);
+    EXPECT_TRUE(mod.externImports[0].isData)
+        << "extern #0 must be the DATA one, or this fixture is a duplicate of "
+           "every other Mach-O image fixture and discriminates nothing";
+    EXPECT_FALSE(mod.externImports[1].isData);
 }
 
 // D-LK6-14-INTEGRATION-GOT-SLOTS pin: each __got slot must hold a
@@ -3911,10 +4209,18 @@ TEST(MachOExecWriter, ChainedFixupsGotSlotsHaveBindBitfield) {
     }
     ASSERT_TRUE(dataConstFileOff.has_value())
         << "__DATA_CONST LC_SEGMENT_64 must be present";
-    // D-LK6-14-INTEGRATION-GOT-SLOTS: __got section_64.reserved1
-    // MUST be 0 on the chained path (was numExterns on legacy as
-    // an indirect-symtab index; on chained the indirect symtab is
-    // dropped so the reference becomes invalid). section_64 starts
+    // ⚠ __got section_64.reserved1 IS THE __got BAND'S ORIGIN IN THE INDIRECT
+    // SYMBOL TABLE, ON BOTH BINDING PATHS —
+    // [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]].
+    // D-LK6-14-INTEGRATION-GOT-SLOTS zeroed it on the chained path because it
+    // had dropped the table the index points into; with the table back, a zero
+    // here would make every __got slot claim the __stubs band's entries and be
+    // named after the wrong symbol by `otool -Iv`, `dyld_info` and `nm`. The
+    // fixture imports TWO function externs, so the __stubs band is [0,2) and
+    // __got starts at 2 — a value that moves with the fixture rather than a
+    // constant, which is what makes it a check. ✔MEASURED: ld64's chained arm
+    // and its -no_fixup_chains control publish the same pair.
+    // section_64 starts
     // at segment_command_64 + 72 (cmd(4)+cmdsize(4)+segname[16]
     // +vmaddr(8)+vmsize(8)+fileoff(8)+filesize(8)+maxprot(4)
     // +initprot(4)+nsects(4)+flags(4)); reserved1 within
@@ -3930,10 +4236,22 @@ TEST(MachOExecWriter, ChainedFixupsGotSlotsHaveBindBitfield) {
         << "expected __got at section[0] of __DATA_CONST — a sibling "
            "section reshape would silently shift offsets and read "
            "the wrong section's reserved1.";
-    EXPECT_EQ(readU32LE(bytes, sect0Off + 68), 0u)
-        << "section_64.__got.reserved1 must be 0 on the chained path "
-           "(was numExterns as indirect-symtab index on legacy; the "
-           "indirect symtab is gone so the reference would be stale)";
+    EXPECT_EQ(readU32LE(bytes, sect0Off + 68), 2u)
+        << "section_64.__got.reserved1 must be the __got band's origin in the "
+           "indirect symbol table — numFuncExterns, which is 2 for this "
+           "fixture's two function externs — on the CHAINED path as much as "
+           "the legacy one. A 0 here re-aims every __got slot at the __stubs "
+           "band's entries. Anchored "
+           "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO.";
+    // And the table those origins address must really carry the four entries
+    // the two bands claim: __stubs [0,2) then __got [2,4), each naming the
+    // undefined extern its slot binds.
+    EXPECT_EQ(indirectSymbolNamesOf(bytes),
+              (std::vector<std::string>{"_a", "_b", "_a", "_b"}))
+        << "two bands of two, in stub-then-got order — a reserved1 that is "
+           "right over a table that is wrong would still mis-name every slot. "
+           "Anchored "
+           "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO.";
     // Read slot[0] and slot[1] (8 bytes each).
     std::uint64_t const slot0 = readU64LE(bytes, *dataConstFileOff);
     std::uint64_t const slot1 = readU64LE(bytes, *dataConstFileOff + 8);
@@ -4120,44 +4438,15 @@ TEST(MachOExecWriter, ChainedFixupsStartsInImageTracksTheImageSegmentCount) {
 TEST(MachOExecWriter, ChainedFixupsSizeofcmdsDelta) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
-    // Legacy fixture (useChainedFixups absent → defaults to false).
-    // Its entry cluster mirrors the chained fixture's — required by
-    // validate() on an MH_EXECUTE schema (D-LK10-ENTRY 2.13) and
-    // IDENTICAL on both sides, so the sizeofcmds delta pinned below
-    // isolates exactly the LC_DYLD_INFO_ONLY/LC_DYSYMTAB swap.
-    auto fmtLegacy = ObjectFormatSchema::loadFromText(R"({
-      "dssObjectFormatVersion": 1,
-      "cSymbolDecoration": { "scheme": "leading-underscore" },
-      "cCallingConvention": { "convention": "sysv_amd64" },
-      "outputExtension": ".dylib",
-  "dataModel": "LP64",
-  "headerNameMatching": "case-sensitive",
-      "format": {"name":"macho-legacy-for-delta","kind":"macho"},
-      "entryPoint": "",
-      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
-      "entryVerbs": ["none","argc-argv"],
-      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
-        "importMangledName": "_exit" },
-      "entryCallingConvention": "sysv_amd64",
-      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
-      "image": {
-        "pageZeroSize": 4294967296,
-        "dylinkerPath": "/usr/lib/dyld",
-        "loadDylibs": ["/usr/lib/libSystem.B.dylib"]
-      },
-      "sections":[
-        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
-      ],
-      "relocations":[
-        {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
-        {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
-        {"name":"X86_64_RELOC_UNSIGNED_4","kind":3,"nativeId":33554432}
-      ]
-    })");
-    ASSERT_TRUE(fmtLegacy.has_value());
+    // The legacy fixture's entry cluster mirrors the chained one's — required
+    // by validate() on an MH_EXECUTE schema (D-LK10-ENTRY 2.13) and IDENTICAL
+    // on both sides, so the delta pinned below isolates exactly the
+    // LC_DYLD_INFO_ONLY ↔ LC_DYLD_CHAINED_FIXUPS swap.
+    auto fmtLegacy = loadLegacyBindingExecFormat();
+    ASSERT_NE(fmtLegacy, nullptr);
     auto mod = chainedFixupsTestModule();
     DiagnosticReporter rep;
-    auto bytesLegacy = encodeUntrampolined(mod, **target, **fmtLegacy, rep);
+    auto bytesLegacy = encodeUntrampolined(mod, **target, *fmtLegacy, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     auto fmtChained = loadChainedFixupsExecFormat();
     ASSERT_NE(fmtChained, nullptr);
@@ -4168,13 +4457,40 @@ TEST(MachOExecWriter, ChainedFixupsSizeofcmdsDelta) {
         readU32LE(bytesLegacy, 20);
     std::uint32_t const sizeofcmdsChained =
         readU32LE(bytesChained, 20);
-    // Delta = LC_DYLD_INFO_ONLY (48) - LC_DYLD_CHAINED_FIXUPS (16)
-    //       + LC_DYSYMTAB (80, dropped on chained) = 112.
-    EXPECT_EQ(sizeofcmdsLegacy - sizeofcmdsChained, 112u)
-        << "sizeofcmds delta: legacy emits LC_DYLD_INFO_ONLY (48) + "
-           "LC_DYSYMTAB (80) = 128; chained emits LC_DYLD_CHAINED_"
-           "FIXUPS (16) only = 16; delta = 112. Regression in any "
-           "arm of the ternary or in the LC sizes would shift this.";
+    // ⚠ THE DELTA HAS A THIRD TERM, AND IT IS ZERO ONLY BECAUSE OF THIS
+    // FIXTURE. In full it is
+    //     LC_DYLD_INFO_ONLY (48) − LC_DYLD_CHAINED_FIXUPS (16)
+    //       − LC_DYLD_EXPORTS_TRIE (16, chained-only)
+    // because the writer emits LC_DYLD_EXPORTS_TRIE when `useChainedFixups`
+    // AND the export-trie blob is non-empty, while the legacy arm carries its
+    // trie inside LC_DYLD_INFO_ONLY's own export fields at no extra command.
+    // This module defines no weak symbol and the schema's filetype is
+    // `execute`, so the exec arm builds NO trie, the third term is 0 and the
+    // delta is 32. Grow this fixture a weak definition and it becomes 16 — so
+    // the premise is ASSERTED below rather than left as a comment, because a
+    // silent 32 → 16 would read as a regression in the two commands this cell
+    // is actually about.
+    constexpr std::uint32_t kLcDyldExportsTrie = 0x80000033u;
+    ASSERT_FALSE(dss::macho::test::findLoadCommand(bytesChained,
+                                                   kLcDyldExportsTrie)
+                     .has_value())
+        << "this fixture must define no exported trie terminal — the 32 below "
+           "is the two-command delta only while LC_DYLD_EXPORTS_TRIE is absent "
+           "from the chained arm";
+    // Delta = LC_DYLD_INFO_ONLY (48) - LC_DYLD_CHAINED_FIXUPS (16) = 32.
+    // ⚠ IT WAS 112 UNTIL
+    // [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]], and
+    // the missing 80 was LC_DYSYMTAB — a command the chained arm dropped and
+    // ld64 does not. This cell is the arithmetic half of that closure: the
+    // ONLY load command the two paths differ by is now the binding command
+    // itself, which is what "orthogonal" means when written as a number.
+    EXPECT_EQ(sizeofcmdsLegacy - sizeofcmdsChained, 32u)
+        << "sizeofcmds delta: legacy emits LC_DYLD_INFO_ONLY (48), chained "
+           "emits LC_DYLD_CHAINED_FIXUPS (16); both emit LC_SYMTAB and "
+           "LC_DYSYMTAB, so the delta is 32. A regression that drops "
+           "LC_DYSYMTAB from the chained arm again would read 112 here. "
+           "Anchored "
+           "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO.";
 }
 
 // D-LK6-14-MULTI-PAGE-GOT guard pin (2ba0489 audit fold, test-

@@ -519,6 +519,22 @@ struct OptResult {
                                             std::span<ExternImport const>
                                                 externImports = {},
                                             std::optional<bool>
-                                                charIsUnsigned = std::nullopt);
+                                                charIsUnsigned = std::nullopt,
+                                            // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
+                                            // the ACTIVE object format's DECLARED
+                                            // set of definition bindings this
+                                            // artifact's LOADER may replace with
+                                            // another image's body. Relayed to the
+                                            // Inlining leaf, which must not splice a
+                                            // body the loader may not run — the
+                                            // load-time half of gate rule 2. It
+                                            // rides a parameter for the SAME reason
+                                            // `charIsUnsigned` does: the MIR
+                                            // optimizer carries neither a target nor
+                                            // a format of its own. EMPTY (every
+                                            // format that declares none) leaves
+                                            // inlining byte-identical.
+                                            std::span<SymbolBinding const>
+                                                preemptibleDefinitionBindings = {});
 
 } // namespace dss::opt

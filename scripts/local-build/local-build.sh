@@ -105,6 +105,86 @@ local_build_report_io_failure() {
     echo "  full log: $log" >&2
 }
 
+# ★★★ A NON-ZERO BUILD THAT PRINTED NO DIAGNOSTIC AT ALL IS ITS OWN CLASS, AND IT
+# IS NOT A SOURCE DEFECT. ✔MEASURED 2026-09-05 (P62 lane `dy`): editing a source
+# file while ninja was already running in the same tree cost TWO WHOLE BUILDS.
+# Each ended rc=1 with a log that stopped mid-compile and named no error -- at the
+# exit code, indistinguishable from a real compile failure, so the lane re-ran, and
+# re-ran again. Nothing in the tooling prevented it and nothing in the log explained
+# it. The I/O classifier above could not see it either: that one keys on a
+# diagnostic of a particular SHAPE, and this class prints no diagnostic to key on.
+#
+# ★★ DEFINED BY THE COMPLEMENT, never by enumerating the shapes a silent failure
+# takes -- the whole point is that there is nothing to enumerate. "A diagnostic was
+# printed" is the positive vocabulary; its absence is the class. A shape nobody has
+# thought of yet therefore counts as SILENT, which is the direction that fails
+# toward looking at the log rather than toward trusting it.
+# ⚠ THE COLON (or the MSVC code) IS LOAD-BEARING. This repository ships
+# `src/core/error/` and `tests/link/test_artifact_withheld_after_error.cpp`, whose
+# names appear in an ordinary ninja PROGRESS line on every single build. Matching a
+# bare `error` would see one of those and conclude a diagnostic had been printed --
+# blinding the guard in exactly the tree it is meant to protect.
+local_build_no_diagnostic() {
+    ! grep -Eq '(^|[^[:alnum:]_])[Ee]rror:|fatal error|[Ee]rror [A-Z]+[0-9]{4}|undefined reference' "$1"
+}
+
+# Which of OUR sources moved while the build was running. This is a MEASUREMENT of
+# the named cause, not a guess at it: the marker's mtime is the instant before
+# `cmake --build` was invoked, so anything newer changed underneath ninja.
+local_build_sources_touched_since() {
+    local marker=$1
+    [[ -f "$marker" ]] || return 1
+    find src tests -type f -newer "$marker" 2>/dev/null | head -20
+}
+
+# ⚠ THREE STATES, NOT TWO, AND THE THIRD IS WHY THIS HELPER EXISTS. "no file is
+# newer than the marker" and "there is no marker, so nothing was compared" are
+# different facts, and collapsing them makes the report assert a RULING-OUT it
+# never performed — the instrument answering an adjacent question, failing toward
+# clean. ✔This was live for the length of one self-test run: arm 11 caught it.
+local_build_touched_verdict() {
+    local marker=$1
+    [[ -f "$marker" ]] || { echo unchecked; return; }
+    if [[ -n "$(local_build_sources_touched_since "$marker")" ]]; then
+        echo moved
+    else
+        echo clean
+    fi
+}
+
+local_build_report_no_diagnostic() {
+    local log=$1 marker=$2
+    echo "local-build.sh: FAIL — THE BUILD EXITED NON-ZERO AND PRINTED NO DIAGNOSTIC." >&2
+    echo "  No line in the log matches any shape our toolchains emit for an error." >&2
+    echo "  ⚠ THIS IS NOT EVIDENCE OF A SOURCE DEFECT. Do NOT start 'fixing' the last" >&2
+    echo "    file the log happened to name — that file is where the log STOPPED, which" >&2
+    echo "    is not where anything went wrong." >&2
+    if grep -q '^FAILED: ' "$log"; then
+        echo "  ninja named a failed target, so a command died without saying why:" >&2
+        grep '^FAILED: ' "$log" | head -3 | sed 's/^/    /' >&2
+    else
+        echo "  ninja named NO failed target — the log simply ends. The build process" >&2
+        echo "    itself went away (killed, or its input changed underneath it)." >&2
+    fi
+    case "$(local_build_touched_verdict "$marker")" in
+        moved)
+            echo "  ★ MEASURED: these source files CHANGED WHILE THIS BUILD WAS RUNNING —" >&2
+            echo "    this is the known cause, and re-running the build is the whole remedy:" >&2
+            local_build_sources_touched_since "$marker" | sed 's/^/    /' >&2 ;;
+        clean)
+            echo "  ★ MEASURED: no file under src/ or tests/ changed while the build ran, so" >&2
+            echo "    the edit-under-ninja cause is RULED OUT here. Re-run once; if it recurs" >&2
+            echo "    at the same point, say so in the row rather than retrying a third time." >&2 ;;
+        *)
+            echo "  ⚠ NOT MEASURED: no build-start marker, so nothing was compared and the" >&2
+            echo "    edit-under-ninja cause is neither shown nor ruled out. This is what an" >&2
+            echo "    absent marker means — it is NOT a clean bill of health." >&2 ;;
+    esac
+    echo "  ⚠ If this happened during a RED-ON-DISABLE arm, that arm measured NOTHING —" >&2
+    echo "    a build that never completed is not evidence about your change." >&2
+    echo "  full log: $log" >&2
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --test)      run_test=1 ;;
@@ -190,11 +270,103 @@ while [[ $# -gt 0 ]]; do
                     echo "self-test arm 4 MESSAGE                 names the shape, the file and the red-on-disable hazard" ;;
                 *)  echo "self-test arm 4 MESSAGE                 incomplete: $msg" >&2; st_fail=1 ;;
             esac
+            # Arms 7..11 are the SILENT half — a non-zero build that printed no
+            # diagnostic at all. Every negative arm here is a log that DOES carry a
+            # diagnostic, in a different vendor's spelling, because the failure mode
+            # that matters is this classifier swallowing a REAL defect.
+            printf '%s\n' \
+                "[412/1180] Building CXX object src/hir/CMakeFiles/dss_hir.dir/hir_builder.cpp.obj" \
+                "[413/1180] Building CXX object src/mir/CMakeFiles/dss_mir.dir/hir_to_mir.cpp.obj" \
+                > "$st_dir/silent.log"
+            if local_build_no_diagnostic "$st_dir/silent.log"; then
+                echo "self-test arm 7 SILENT-STOP             classified as expected"
+            else
+                echo "self-test arm 7 SILENT-STOP             NOT classified — the guard is blind to the silent half" >&2; st_fail=1
+            fi
+            # ★ THE ARM THIS CLASSIFIER EXISTS TO SURVIVE. These two paths ship in
+            # this repository and appear in an ordinary progress line on EVERY build;
+            # a bare `error` match would read them as a diagnostic and go blind here.
+            printf '%s\n' \
+                "[7/9] Building CXX object src/core/CMakeFiles/dss_core.dir/error/reporter.cpp.obj" \
+                "[8/9] Building CXX object tests/link/CMakeFiles/x.dir/test_artifact_withheld_after_error.cpp.obj" \
+                > "$st_dir/silent-errorpath.log"
+            if local_build_no_diagnostic "$st_dir/silent-errorpath.log"; then
+                echo "self-test arm 8 SILENT-ON-ERROR-PATH    classified as expected"
+            else
+                echo "self-test arm 8 SILENT-ON-ERROR-PATH    NOT classified — a FILE NAME fooled it" >&2; st_fail=1
+            fi
+            if local_build_no_diagnostic "$st_dir/real.log"; then
+                echo "self-test arm 9 REAL-COMPILE-ERROR      misclassified — it would HIDE a real defect" >&2; st_fail=1
+            else
+                echo "self-test arm 9 REAL-COMPILE-ERROR      left alone as expected"
+            fi
+            # Two more vendors, because "a diagnostic was printed" is the positive
+            # vocabulary and a gap in it silences a real defect.
+            printf '%s\n' \
+                "src${st_at}mir${st_at}x.cpp(42): error C2065: 'q': undeclared identifier" \
+                > "$st_dir/msvc.log"
+            printf '%s\n' \
+                "/usr/bin/ld: x.o: in function \`main':" \
+                "x.c:(.text+0x9): undefined reference to \`helper'" > "$st_dir/ldundef.log"
+            if local_build_no_diagnostic "$st_dir/msvc.log" || local_build_no_diagnostic "$st_dir/ldundef.log"; then
+                echo "self-test arm 10 MSVC-AND-LD-DIAGNOSTIC misclassified — a vendor spelling is missing from the positive set" >&2; st_fail=1
+            else
+                echo "self-test arm 10 MSVC-AND-LD-DIAGNOSTIC left alone as expected"
+            fi
+            # The MESSAGE arm: the report must name the hazard AND must not claim a
+            # cause it has not measured. With no marker file, the mtime probe cannot
+            # run, and the text has to say the cause is ruled out rather than assert it.
+            msg=$(local_build_report_no_diagnostic "$st_dir/silent.log" "$st_dir/no-such-marker" 2>&1)
+            case "$msg" in
+                *"PRINTED NO DIAGNOSTIC"*"NOT EVIDENCE OF A SOURCE DEFECT"*"RED-ON-DISABLE"*)
+                    echo "self-test arm 11 MESSAGE                names the class, the mis-fix hazard and the red-on-disable hazard" ;;
+                *)  echo "self-test arm 11 MESSAGE                incomplete: $msg" >&2; st_fail=1 ;;
+            esac
+            # ★★ ARMS 12..14 DRIVE ALL THREE VERDICTS, and the third arm is the
+            # reason: with a marker ABSENT nothing was compared, and saying so is a
+            # different sentence from "nothing changed". Collapsing the two made this
+            # reporter assert a ruling-out it had never performed — live until arm 11
+            # printed the text and it could be read. An instrument that answers the
+            # adjacent question fails toward CLEAN, every time.
+            case "$(local_build_touched_verdict "$st_dir/absent-marker")" in
+                unchecked) echo "self-test arm 12 VERDICT-UNCHECKED     no marker reported as NOT MEASURED" ;;
+                *)  echo "self-test arm 12 VERDICT-UNCHECKED     a missing marker did not report as unchecked" >&2; st_fail=1 ;;
+            esac
+            printf '' > "$st_dir/marker"
+            case "$(local_build_touched_verdict "$st_dir/marker")" in
+                clean) echo "self-test arm 13 VERDICT-CLEAN         nothing newer than the marker reported as clean" ;;
+                *)  echo "self-test arm 13 VERDICT-CLEAN         a quiet tree did not report as clean" >&2; st_fail=1 ;;
+            esac
+            # ⚠ THE POSITIVE VERDICT NEEDS A DETERMINISTIC GAP, AND WRITE-ORDER DOES
+            # NOT PROVIDE ONE. ✔MEASURED on this host: a marker and a probe written
+            # back-to-back get mtimes equal TO THE NANOSECOND (the Windows clock tick
+            # is ~15 ms), and `-newer` is strictly-greater, so the arm read `clean`
+            # and the guard looked blind when it was not. The marker is back-dated
+            # HERE, in the fixture, for that reason alone.
+            # ★★ PRODUCTION DELIBERATELY DOES NOT BACK-DATE, and that asymmetry is the
+            # point: a marker aged even one second would flag the file the caller had
+            # just edited before starting the build — which is the ordinary workflow —
+            # so the report would fire on every failed build and mean nothing. The
+            # real cost of strict comparison is a ~15 ms tie window at the very start
+            # of a build that runs for minutes; a tie there loses a diagnosis, it
+            # never invents one.
+            st_probe="tests/.local-build-selftest-probe"
+            printf '' > "$st_dir/marker"
+            # `-t CCYYMMDDhhmm` is the POSIX spelling and BSD/macOS `touch` accepts
+            # it; `-d <string>` is a GNU extension and would fail on the darwin leg.
+            # An assertion measured on one leg is a portability claim.
+            touch -t 200001010000 "$st_dir/marker"
+            printf 'probe\n' > "$st_probe"
+            case "$(local_build_touched_verdict "$st_dir/marker")" in
+                moved) echo "self-test arm 14 VERDICT-MOVED         a file changed after the marker was seen" ;;
+                *)  echo "self-test arm 14 VERDICT-MOVED         a CHANGED FILE WAS MISSED — the measurement is blind" >&2; st_fail=1 ;;
+            esac
+            rm -f "$st_probe"
             # NOT `[[ ... ]] && echo` — under the `set -e` in force here a false
             # test would abort the script before `exit "$st_fail"` runs. Same exit
             # code either way, but the reader could not tell which path it took.
             if [[ $st_fail -eq 0 ]]; then
-                echo "local-build: self-test OK — 6 arms, both directions exercised."
+                echo "local-build: self-test OK — 14 arms, both directions exercised."
             fi
             exit "$st_fail" ;;
         -h|--help)
@@ -269,6 +441,12 @@ fi
 # which would leave exactly the misattribution this code exists to prevent.
 # `pipefail` is left alone: it is set globally and the rest of the script relies on it.
 build_log="$BUILD_DIR/.local-build-last.log"
+# Stamped the instant BEFORE the build starts, so "newer than this" is exactly
+# "changed while ninja was running". Written unconditionally: a marker left over
+# from a previous run would date the wrong build and turn the one measurement this
+# reporter makes into a fabrication.
+build_marker="$BUILD_DIR/.local-build-started"
+printf '' > "$build_marker"
 set +e
 # ★★★ OPERATOR RULING 2026-08-25: "never use all CPUS, the idea is to keep build + tests + run always at 4 cpus", AMENDED same-day to "make it 6 cores, not 4, everywhere".
 # ⚠ A BARE `cmake --build` HANDS OFF TO NINJA, WHOSE DEFAULT IS ALL CORES. This site
@@ -279,6 +457,15 @@ set -e
 if [[ $build_rc -ne 0 ]] && local_build_toolchain_io_failure "$build_log"; then
     local_build_report_io_failure "$build_log"
     exit 9
+fi
+# ⚠ ORDER IS DELIBERATE: the I/O classifier runs FIRST because an I/O failure DOES
+# print a diagnostic (`fatal error: error writing to ...`), so it is a strictly more
+# specific class. Reaching here means the build failed having printed nothing any
+# toolchain would call an error. Its OWN exit code, distinct from both 9 and a real
+# compiler's rc, so a caller can tell "nothing was measured" from "your code is wrong".
+if [[ $build_rc -ne 0 ]] && local_build_no_diagnostic "$build_log"; then
+    local_build_report_no_diagnostic "$build_log" "$build_marker"
+    exit 10
 fi
 [[ $build_rc -eq 0 ]] || exit "$build_rc"
 

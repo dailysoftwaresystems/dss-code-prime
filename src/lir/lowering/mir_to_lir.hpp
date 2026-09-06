@@ -222,6 +222,25 @@ struct DSS_EXPORT MirToLirResult {
     bool                   ok = true;
 };
 
+// ★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: one DEFINED symbol of this
+// module paired with the on-binary NAME the loader will look it up by.
+//
+// The IRs are deliberately numeric — a `SymbolId` carries no string, and the
+// driver resolves names once (`nameOf`) when it builds `AssembledModule::
+// symbols`. The preemption routing needs a name, because the reference it mints
+// is a real loader-resolved import and an import is looked up BY NAME. So the
+// driver hands the lowerer the same rows it is already computing, rather than a
+// name being threaded through every MIR node.
+//
+// ⓘ FUNCTIONS ONLY. The routing this feeds decides a CALL's shape; a preemptible
+// DATA global's address is a separate reference kind with its own declared
+// binding (`dataImportBinding`), and mixing the two into one channel would make
+// this vector answer a question its consumer never asks.
+struct DSS_EXPORT DefinedSymbolName {
+    SymbolId    symbol{};
+    std::string name;   // the on-binary spelling; never empty
+};
+
 // Lower the frozen `mir` module to LIR, dispatched against `target`.
 // Diagnostics are emitted into `reporter`; unsupported opcodes produce
 // `L_UnsupportedLoweringForOpcode` and the lowerer seals the affected
@@ -397,6 +416,59 @@ lowerToLir(Mir const&          mir,
            // (a slot nothing derefs, or a direct call retargeted at pointer
            // bytes). What is threaded here is the DECLARED DATA that rule reads,
            // not a second copy of the rule.
-           std::vector<SymbolBinding> indirectSlotBindings = {});
+           std::vector<SymbolBinding> indirectSlotBindings = {},
+           // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: WHICH of THIS
+           // ARTIFACT'S OWN externally-visible definitions the artifact's
+           // LOADER may replace with another image's definition of the same
+           // name, read from
+           // `ObjectFormatSchema::preemptibleDefinitionBindings()` one level
+           // up — the DECLARED list, verbatim. EMPTY (the default, and every
+           // format that does not declare the key) = nothing is preemptible
+           // and every call to a module-internal definition stays the direct
+           // branch it has always been: byte-identical lowering.
+           //
+           // Under a NON-empty list, a call whose callee is a definition IN
+           // THIS MODULE with a listed binding and DEFAULT visibility is no
+           // longer branched to directly. It is routed through the format's
+           // ordinary loader-resolved reference — the same PLT stub / import
+           // slot an extern call takes, chosen by `externCallDispatch` — so
+           // the loader's chosen winner is what runs. That is what ld and ld64
+           // both emit for the same source (✔MEASURED: gcc 13.3.0 and clang
+           // 18.1.3 emit `call <w@plt>` from a `.so`'s own body, DIRECT from an
+           // executable's), and skipping it is a MEANING divergence rather than
+           // a slow path: one process ends up holding two answers for one
+           // identifier, silently.
+           //
+           // ⚠ VISIBILITY IS NOT IN THE LIST AND IS CHECKED HERE ANYWAY. A
+           // non-`default` visibility is in no image's dynamic export set, so
+           // no loader can replace it under ANY format — a universal fact, not
+           // a per-format declaration. Both references agree in the SAME
+           // object: `static` and `visibility("hidden")` callees stay DIRECT in
+           // a `.so` whose weak and strong default-visibility callees are both
+           // PLT-routed.
+           //
+           // ⓘ THE RULE HAS ONE OWNER AND IT IS NOT HERE:
+           // `ObjectFormatSchema::definitionIsPreemptible`. What is threaded is
+           // the DECLARED DATA that rule reads.
+           std::vector<SymbolBinding> preemptibleDefinitionBindings = {},
+           // The on-binary NAMES of this module's DEFINED function symbols —
+           // the channel that lets the routing above MINT its loader-resolved
+           // reference, which needs a name the loader can look up.
+           //
+           // ⚠ IT IS A CHANNEL, NOT A SECOND OWNER OF THE DECISION. The
+           // decision reads MIR's own `funcBinding` / `funcVisibility` against
+           // the declared list above; this supplies only the string the IRs
+           // deliberately do not carry ("IRs stay numeric" — the same reason
+           // `AssembledModule::symbols` is built at the driver from `nameOf`
+           // rather than threaded through MIR/LIR, and the same shape
+           // `externImports` already has, which carries its own names for
+           // exactly this reason). A module whose format declares no
+           // preemptible binding never reads it; passing it is harmless and
+           // costs one map build.
+           //
+           // A definition the routing selects but this vector does not name is
+           // a FAIL-LOUD, never a silent fallback to the direct branch: the
+           // direct branch is the defect.
+           std::vector<DefinedSymbolName> definedSymbolNames = {});
 
 } // namespace dss

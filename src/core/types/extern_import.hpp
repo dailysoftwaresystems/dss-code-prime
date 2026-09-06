@@ -226,6 +226,34 @@ struct DSS_EXPORT ExternImport {
     // rows describe the same object bound the same way and differ only in whether
     // this TU could do without it.
     SymbolBinding binding = SymbolBinding::Global;
+
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: this row is NOT a
+    // foreign name. It is a reference to a symbol THIS ARTIFACT ITSELF DEFINES,
+    // routed through the loader on purpose because the active format declares
+    // that definition PREEMPTIBLE (`preemptibleDefinitionBindings`) — the
+    // loader may hand the whole process a different image's body for that name,
+    // and an image that branched to its own body would then disagree with every
+    // other image in the process about what one identifier means. `false` for
+    // every other producer, so a module that mints none is unchanged.
+    //
+    // ★ WHY IT IS A DECLARED FLAG AND NOT INFERRED FROM `libraryPath.empty()`
+    // PLUS A NAME MATCH. Two folds in the link tier collapse an import onto a
+    // definition of the same NAME — `resolveCrossCuSymbols` (which then makes
+    // `mergeModules` strip the row) and, one tier down, `mergeCuMirs` — and
+    // both are RIGHT for an ordinary import: a sibling CU's definition really
+    // does shadow the library fallback, and binding it directly is both correct
+    // and cheaper. For THIS row the same fold is the exact defect being closed,
+    // reintroduced by the linker after the lowering removed it. Re-deriving
+    // "is this that kind of row" from a name match would make two owners of one
+    // fact, and the one that got it wrong would fail SILENTLY — back to one
+    // process holding two answers. The producer knows; it says so here.
+    //
+    // ⚠ THE ROW IS STILL A REAL IMPORT ON THE WIRE. It publishes an undefined
+    // dynamic symbol and takes the format's ordinary loader-resolved slot (ELF:
+    // an SHN_UNDEF `.dynsym` entry + a PLT stub + a GOT slot + its `.rela.dyn`
+    // GLOB_DAT; the shape ld emits for the same source). Nothing downstream
+    // needs a second mechanism — only permission not to fold it away.
+    bool isPreemptionReference = false;
 };
 
 } // namespace dss

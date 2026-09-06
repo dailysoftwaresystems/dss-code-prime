@@ -11270,3 +11270,539 @@ TEST(HirLoweringC, SizeofOfVlaTypeNameWithNonIntegerBoundFailsLoud) {
            "non-integer refusal: "
         << (okr.all().empty() ? "" : okr.all()[0].actual);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// D-C-DECLARED-LINKAGE-FACET-NOT-MERGED-ACROSS-A-REDECLARATION
+//
+// C 6.2.2 lets ONE entity have SEVERAL declarations, and a GNU linkage
+// attribute written on ANY of them belongs to the entity. `linkageFrom` folds
+// ONE declaration's specifiers and nothing folded them ACROSS declarations, so
+// `int f(void) __attribute__((visibility("hidden"))); int f(void){…}` emitted
+// the definition GLOBAL DEFAULT — an EXPORTED symbol for a program that asked
+// for a hidden one — while the sibling spelling with the attribute ON the
+// definition was already right. ★ The BINDING axis was broken identically and
+// worse: a `weak` PROTOTYPE produced a STRONG definition, which does not merely
+// mis-describe the symbol, it changes which definition a linker keeps.
+//
+// ✔MEASURED at the cycle base commit, DSS's own ELF `.o` and linked exec, one
+// program carrying all nine shapes (`.temp/p62-vt-scratch/probe_vis.c`):
+// `sub_proto_hidden`, `sub_lead_proto`, `sub_data_proto_hidden` all `GLOBAL
+// DEFAULT` and `sub_proto_weak` `FUNC GLOBAL`, beside CONTROLS that were already
+// correct (`ctl_def_hidden` GLOBAL HIDDEN, `ctl_def_weak` FUNC WEAK, `ctl_plain`
+// GLOBAL DEFAULT) — so the split is DECLARATION POSITION, not the attribute.
+//
+// ✔MEASURED 2026-09-05 (Ubuntu 24.04 under WSL), gcc 13.3.0 and clang 18.1.3
+// probed SEPARATELY, `-c` AND linked `-no-pie`, `-O0` AND `-O2`, every artifact
+// carrying its own CONTROLS in the SAME translation unit (a plain function and a
+// plain object, `GLOBAL DEFAULT` in every arm — without them "gcc emits HIDDEN"
+// would be equally consistent with "this toolchain hides everything"). ALL FOUR
+// ARMS OF BOTH REFERENCES AGREED:
+//   * `visibility("hidden")` on an AFTER-DECLARATOR prototype  → GLOBAL HIDDEN
+//   * `visibility("hidden")` on a LEADING-position prototype   → GLOBAL HIDDEN
+//   * `visibility("hidden")` on an `extern` OBJECT declaration → GLOBAL HIDDEN
+//   * `weak` on a prototype                                    → WEAK DEFAULT
+//   * the attribute on the DEFINITION with a plain prototype AFTER it → the
+//     attribute STANDS; a later silent declaration resets nothing.
+// MSVC casts no vote anywhere here: `__attribute__((visibility(…)))` is not in
+// its vocabulary at all, so it is not a reference that WORKS on this construct.
+//
+// ★ THE ASSERTIONS ARE THE APPLIED LINKAGE, NEVER A DIAGNOSTIC COUNT. Both the
+// correct behaviour and the regression are SILENT — the defect shipped a
+// wrong-linkage object with rc=0 and no text at any stage — so a count pin would
+// read 0 straight through the miscompile.
+//
+// RED-ON-DISABLE (REMOVE-direction): drop the `mergeDeclaredLinkage` wrapper off
+// the `perDeclarator` fold in `cst_to_hir.cpp` and every SUBJECT arm below falls
+// back to the implicit default while every CONTROL arm stays green.
+namespace {
+// The declared linkage of the DEFINING module decl for `name` — a Global or a
+// Function, never an import row. `declaredLinkage` returns the FIRST module decl
+// bound to the name, which for `extern int x …; int x = 8;` can be the import
+// row; what these pins are about is what the DEFINITION emits.
+[[nodiscard]] std::optional<LinkageAttr>
+definedLinkage(CstToHirResult const& res, SemanticModel const& model,
+               std::string_view name) {
+    for (HirNodeId d : res.hir.moduleDecls(res.hir.root())) {
+        SymbolId sym{};
+        switch (res.hir.kind(d)) {
+            case HirKind::Global:   sym = res.hir.globalSymbol(d);   break;
+            case HirKind::Function: sym = res.hir.functionSymbol(d); break;
+            default: continue;
+        }
+        auto const* rec = sym.valid() ? model.recordFor(sym) : nullptr;
+        if (rec == nullptr || rec->name != name) continue;
+        return res.linkageMap.has(d) ? res.linkageMap.get(d) : LinkageAttr{};
+    }
+    return std::nullopt;
+}
+}  // namespace
+
+TEST(HirLoweringC, DeclaredLinkageOnAPriorDeclarationReachesTheDefinition) {
+    struct Case {
+        char const*      what;
+        char const*      src;
+        SymbolBinding    binding;
+        SymbolVisibility visibility;
+    };
+    // Every source defines the SUBJECT `sub` and the CONTROLS `ctl_fn` / `ctl_ob`,
+    // which carry no attribute anywhere and must stay at the implicit default.
+    std::string const tail =
+        "int ctl_fn(void) { return 1; }\n"
+        "int ctl_ob = 9;\n"
+        "int main(void) { return ctl_fn() + ctl_ob; }\n";
+    for (Case const c : {
+             Case{"visibility on an AFTER-DECLARATOR prototype",
+                  "int sub(void) __attribute__((visibility(\"hidden\")));\n"
+                  "int sub(void) { return 3; }\n",
+                  SymbolBinding::Global, SymbolVisibility::Hidden},
+             Case{"visibility on a LEADING-position prototype",
+                  "__attribute__((visibility(\"hidden\"))) int sub(void);\n"
+                  "int sub(void) { return 3; }\n",
+                  SymbolBinding::Global, SymbolVisibility::Hidden},
+             Case{"weak on an AFTER-DECLARATOR prototype",
+                  "int sub(void) __attribute__((weak));\n"
+                  "int sub(void) { return 3; }\n",
+                  SymbolBinding::Weak, SymbolVisibility::Default},
+             Case{"weak on a LEADING-position prototype",
+                  "__attribute__((weak)) int sub(void);\n"
+                  "int sub(void) { return 3; }\n",
+                  SymbolBinding::Weak, SymbolVisibility::Default},
+             // BOTH axes at once, from one prior declaration: the fold is per
+             // AXIS, so a declaration carrying two must land both.
+             Case{"weak AND visibility on one prototype",
+                  "int sub(void) __attribute__((weak, visibility(\"hidden\")));\n"
+                  "int sub(void) { return 3; }\n",
+                  SymbolBinding::Weak, SymbolVisibility::Hidden},
+             // REVERSE ORDER — the attribute is on the DEFINITION and a PLAIN
+             // prototype FOLLOWS it. Both references keep the attribute; a later
+             // silent declaration must reset nothing. (Correct before this change
+             // too — it is here because a merge is exactly the kind of change
+             // that can start letting a later silent declaration win.)
+             Case{"visibility on the DEFINITION, plain prototype AFTER",
+                  "__attribute__((visibility(\"hidden\"))) int sub(void) "
+                  "{ return 3; }\n"
+                  "int sub(void);\n",
+                  SymbolBinding::Global, SymbolVisibility::Hidden},
+             Case{"weak on the DEFINITION, plain prototype AFTER",
+                  "__attribute__((weak)) int sub(void) { return 3; }\n"
+                  "int sub(void);\n",
+                  SymbolBinding::Weak, SymbolVisibility::Default},
+             // The OBJECT twin, through the `extern` declaration row — a SEPARATE
+             // `linkageSpecifiers` map in `c.lang.json`, so the function row is
+             // no evidence for it.
+             Case{"visibility on an `extern` object declaration",
+                  "extern int sub __attribute__((visibility(\"hidden\")));\n"
+                  "int sub = 8;\n",
+                  SymbolBinding::Global, SymbolVisibility::Hidden},
+             Case{"visibility on a LEADING `extern` object declaration",
+                  "__attribute__((visibility(\"hidden\"))) extern int sub;\n"
+                  "int sub = 8;\n",
+                  SymbolBinding::Global, SymbolVisibility::Hidden}}) {
+        std::string const src = std::string(c.src) + tail;
+        SemanticModel model = analyzeC(src);
+        ASSERT_FALSE(model.hasErrors())
+            << c.what << ": "
+            << (model.diagnostics().all().empty()
+                    ? std::string{}
+                    : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << c.what << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(r.errorCount(), 0u)
+            << c.what << " — both references ACCEPT this program: "
+            << (r.all().empty() ? "" : r.all()[0].actual);
+
+        auto const got = definedLinkage(*res, model, "sub");
+        ASSERT_TRUE(got.has_value())
+            << c.what << " — test setup: `sub` must lower to a DEFINING node";
+        EXPECT_EQ(got->binding, c.binding)
+            << c.what
+            << " — a linkage attribute belongs to the ENTITY, not to the one "
+               "declaration that spelled it; `global` here is the strong "
+               "definition a `weak` prototype used to produce";
+        EXPECT_EQ(got->visibility, c.visibility)
+            << c.what
+            << " — `default` here means the definition is EXPORTED where gcc "
+               "13.3.0 and clang 18.1.3 both emit GLOBAL HIDDEN";
+
+        // THE CONTROLS — same program, no attribute anywhere. Without them a
+        // green subject is equally consistent with "everything is hidden now".
+        auto const ctlFn = definedLinkage(*res, model, "ctl_fn");
+        ASSERT_TRUE(ctlFn.has_value()) << c.what;
+        EXPECT_EQ(ctlFn->binding, SymbolBinding::Global) << c.what;
+        EXPECT_EQ(ctlFn->visibility, SymbolVisibility::Default)
+            << c.what
+            << " — the CONTROL function must not pick up the subject's facets";
+        auto const ctlOb = definedLinkage(*res, model, "ctl_ob");
+        ASSERT_TRUE(ctlOb.has_value()) << c.what;
+        EXPECT_EQ(ctlOb->binding, SymbolBinding::Global) << c.what;
+        EXPECT_EQ(ctlOb->visibility, SymbolVisibility::Default)
+            << c.what
+            << " — the CONTROL object must not pick up the subject's facets";
+    }
+}
+
+// ★★ THE **VISIBILITY** CONFLICT ACROSS DECLARATIONS — ACCEPTED, WARNED, AND
+// THE FIRST VALUE STANDS.
+//
+// ⚠⚠ THE VERDICT BELOW IS THIS AXIS'S ALONE, AND CARRYING IT ONTO THE BINDING
+// AXIS SHIPPED A WRONG ANSWER. A first cut measured only what follows, then let
+// one generic rule apply accept-and-keep-the-first to `binding` as well — where
+// NO reference accepts, and where the residue is a `weak` GLOBAL on a `static`
+// DEFINITION. `DeclaredBindingConflictAcrossDeclarationsIsRefusedAndConfines`
+// below is that axis's own measurement and its opposite verdict; the two tests
+// exist as a pair so neither can be read as evidence for the other.
+//
+// This is also NOT the within-one-declaration conflict this file already pins
+// (`VisibilityConflictFailsLoudAndKeepsConfiningVisibility`), and those two are
+// deliberately answered differently because the REFERENCES answer them
+// differently. ✔MEASURED 2026-09-05, each probed SEPARATELY, both orders, each
+// beside a plain-symbol CONTROL:
+//   * two conflicting visibilities on ONE declaration — gcc 13.3.0 AND clang
+//     18.1.3 BOTH REFUSE and emit no object ("'dv_hd' redeclared with different
+//     visibility" / "visibility does not match previous declaration"). Unanimous
+//     ⇒ DSS's ERROR there is union-compliant and is untouched by this change.
+//   * two conflicting visibilities on TWO declarations of one entity — gcc WARNS
+//     ("redeclaration of 'cx' with different visibility (old visibility
+//     preserved)") and EMITS THE OBJECT keeping the FIRST value, in BOTH orders;
+//     clang ERRORS and emits nothing. That is accept-vs-refuse, which the
+//     disjunction governs, so DSS must ACCEPT — and gcc is then the ONLY
+//     reference casting a vote on what the program MEANS, which makes first-wins
+//     the only working answer there is.
+//
+// ⚠ THE RESIDUE IS ORDER-SENSITIVE ON PURPOSE, and the two arms exist to say so.
+// `hidden`→`default` keeps HIDDEN and `default`→`hidden` keeps DEFAULT: a
+// "confining wins" rule — the right one WITHIN a declaration, where the build
+// fails anyway and no artifact is produced — would be a MEASURED disagreement
+// with the only reference that compiles this program.
+TEST(HirLoweringC, DeclaredVisibilityConflictAcrossDeclarationsWarnsAndKeepsTheFirst) {
+    struct Case {
+        char const*      what;
+        char const*      src;
+        SymbolVisibility kept;
+    };
+    for (Case const c : {
+             Case{"hidden prototype, default definition",
+                  "int sub(void) __attribute__((visibility(\"hidden\")));\n"
+                  "__attribute__((visibility(\"default\"))) int sub(void) "
+                  "{ return 3; }\n",
+                  SymbolVisibility::Hidden},
+             Case{"default prototype, hidden definition",
+                  "int sub(void) __attribute__((visibility(\"default\")));\n"
+                  "__attribute__((visibility(\"hidden\"))) int sub(void) "
+                  "{ return 3; }\n",
+                  SymbolVisibility::Default}}) {
+        std::string const src =
+            std::string(c.src) + "int main(void) { return sub(); }\n";
+        SemanticModel model = analyzeC(src);
+        ASSERT_FALSE(model.hasErrors()) << c.what;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << c.what << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(r.errorCount(), 0u)
+            << c.what
+            << " — gcc COMPILES this program, so the disjunction forbids DSS "
+               "refusing it: "
+            << (r.all().empty() ? "" : r.all()[0].actual);
+
+        // WARNED, never silent: a silent first-wins is a linkage the source
+        // contradicts, chosen without telling anyone.
+        std::size_t warned = 0;
+        for (auto const& d : r.all()) {
+            if (d.code != DiagnosticCode::H_UnknownLinkageSpecifier) continue;
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning)
+                << c.what
+                << " — a cross-declaration conflict is ACCEPTED by gcc, so it "
+                   "cannot be an error here";
+            ++warned;
+        }
+        EXPECT_EQ(warned, 1u)
+            << c.what
+            << " — exactly one conflict report; zero means the mismatch went "
+               "silent and the artifact's linkage now contradicts its source";
+        std::string const msg =
+            firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier);
+        EXPECT_NE(msg.find("does not match"), std::string::npos)
+            << c.what << " — got: \"" << msg << "\"";
+
+        auto const got = definedLinkage(*res, model, "sub");
+        ASSERT_TRUE(got.has_value()) << c.what;
+        EXPECT_EQ(got->visibility, c.kept)
+            << c.what
+            << " — the value the FIRST declaration gave must stand, which is "
+               "what gcc emits (`old visibility preserved`) in this exact order";
+    }
+}
+
+// ★★★ THE **BINDING** CONFLICT ACROSS DECLARATIONS — REFUSED, AND THE RESIDUE
+// CONFINES. The opposite verdict from its visibility sibling above, and the
+// opposition is MEASURED on this axis rather than inherited from that one.
+//
+// The only binding pair the config can express across two declarations is
+// {internal, weak} — `SymbolBinding::Global` is the unspecified state — so every
+// reachable conflict is a `static` meeting a `__attribute__((weak))`.
+// ✔MEASURED 2026-09-05 (Ubuntu 24.04 under WSL), gcc 13.3.0 and clang 18.1.3
+// probed SEPARATELY, `-Wall -Wextra`, `-O0` AND `-O2`, each case its own TU so a
+// refusal in one cannot hide another:
+//   * `static int e(void); int e(void) __attribute__((weak));
+//      static int e(void){…}` — gcc REFUSES ("weak declaration of 'e' being
+//     applied to a already existing, static definition"), clang REFUSES ("weak
+//     declaration cannot have internal linkage"), NEITHER emits an object. Its
+//     CONTROL — the identical program with the attribute REMOVED — is ACCEPTED
+//     by both and emits `FUNC LOCAL`, which is what proves the refusal is the
+//     binding conflict and not the shape around it.
+//   * the `extern` OBJECT twin behaves identically in both references.
+//   * `int e(void) __attribute__((weak)); static int e(void){…}` — both REFUSE,
+//     and so does its no-attribute CONTROL ("static declaration of 'e' follows
+//     non-static declaration"), so that arm votes on C 6.2.2's internal/external
+//     mismatch as well; it is included because it is the order that produced the
+//     wrong answer.
+// NOT ONE ACCEPTING REFERENCE ⇒ the disjunction supplies no permission to
+// accept, so this is an ERROR like its within-declaration sibling.
+//
+// ★ AND THE RESIDUE IS THE ASSERTION THAT MATTERS. Under plain first-wins DSS
+// emitted `FUNC WEAK DEFAULT` / `OBJECT WEAK DEFAULT` for these programs
+// (✔MEASURED, rc=0, ELF `.o`) — a symbol that ESCAPES the TU for a program that
+// said `static`, which is verbatim what `VisibilityConflictFailsLoudAndKeeps`
+// `ConfiningVisibility`'s binding sibling chose `Local` to prevent. A
+// message-only assertion cannot see that; every arm below reads the RESIDUE.
+TEST(HirLoweringC, DeclaredBindingConflictAcrossDeclarationsIsRefusedAndConfines) {
+    struct Case { char const* what; char const* src; };
+    for (Case const c : {
+             Case{"weak prototype then static definition",
+                  "int sub(void) __attribute__((weak));\n"
+                  "static int sub(void) { return 3; }\n"},
+             Case{"static prototype then weak redeclaration",
+                  "static int sub(void);\n"
+                  "int sub(void) __attribute__((weak));\n"
+                  "static int sub(void) { return 3; }\n"},
+             Case{"weak extern object declaration then static definition",
+                  "extern int sub __attribute__((weak));\n"
+                  "static int sub = 8;\n"},
+             Case{"static object declaration then weak extern redeclaration",
+                  "static int sub;\n"
+                  "extern int sub __attribute__((weak));\n"
+                  "static int sub = 8;\n"}}) {
+        std::string const src =
+            std::string(c.src)
+            + "int ctl_fn(void) { return 1; }\n"
+              "int ctl_ob = 9;\n"
+              "int main(void) { return ctl_fn() + ctl_ob; }\n";
+        SemanticModel model = analyzeC(src);
+        ASSERT_FALSE(model.hasErrors()) << c.what;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+
+        std::size_t errored = 0;
+        for (auto const& d : r.all()) {
+            if (d.code != DiagnosticCode::H_UnknownLinkageSpecifier) continue;
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Error)
+                << c.what
+                << " — NO reference accepts a cross-declaration binding "
+                   "conflict, so a WARNING here is DSS accepting what gcc and "
+                   "clang both refuse";
+            ++errored;
+        }
+        EXPECT_EQ(errored, 1u)
+            << c.what
+            << " — exactly one conflict report; zero means the mismatch went "
+               "silent and the artifact's binding now contradicts its source";
+        std::string const msg =
+            firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier);
+        EXPECT_NE(msg.find("does not match"), std::string::npos)
+            << c.what << " — got: \"" << msg << "\"";
+        EXPECT_NE(msg.find("'local' is kept"), std::string::npos)
+            << c.what << " — the message must name the residue it actually "
+                         "keeps; got: \"" << msg << "\"";
+
+        EXPECT_EQ(declaredBinding(*res, model, "sub"),
+                  std::optional{SymbolBinding::Local})
+            << c.what
+            << " — the CONFINING binding must be the residue: `weak` here is a "
+               "symbol that ESCAPES the TU for a program that said `static`, "
+               "which is the wrong answer this arm exists to refuse";
+
+        // CONTROLS — same program, no attribute anywhere. Without them "the
+        // residue is Local" is equally consistent with "everything went local".
+        EXPECT_EQ(declaredBinding(*res, model, "ctl_fn"),
+                  std::optional{SymbolBinding::Global})
+            << c.what << " — the CONTROL function must keep external binding";
+        EXPECT_EQ(declaredBinding(*res, model, "ctl_ob"),
+                  std::optional{SymbolBinding::Global})
+            << c.what << " — the CONTROL object must keep external binding";
+    }
+}
+
+// ★★★ C 6.2.2p4 — A BLOCK-SCOPE `extern` DECLARES THE **FILE-SCOPE** ENTITY, SO
+// ITS DECLARED FACETS REACH THAT ENTITY'S DEFINITION.
+//
+// The first cut keyed the accumulation on `(declaring scope, identifier)`, which
+// is the C 6.2.1 identity rule spelled out a second time in the HIR tier — and
+// it gets p4 wrong, because a block-scope `extern` is minted in the BLOCK's
+// scope while denoting the file-scope entity. ✔MEASURED at that state: every arm
+// below emitted the implicit default, BYTE-IDENTICAL to the pre-fold tree, i.e.
+// the fix did not reach this shape at all.
+//
+// ✔MEASURED 2026-09-05, gcc 13.3.0 and clang 18.1.3 probed SEPARATELY, `-O0` AND
+// `-O2`, each artifact carrying plain-symbol CONTROLS: gcc emits `FUNC GLOBAL
+// HIDDEN`, `OBJECT GLOBAL HIDDEN` and `FUNC WEAK`; clang emits `GLOBAL DEFAULT`
+// for all three and says NOTHING at `-Wall -Wextra` — it accepts the program
+// while silently discarding a stated property, so under this project's
+// `#pragma once` precedent it casts no vote on what WORKS. One working reference
+// makes the behaviour REQUIRED.
+//
+// The fold now resolves the entity through the SEMANTIC TIER's own binding, which
+// the P50 block-scope sweep repoints at the file-scope symbol — so this tier
+// stops owning a second copy of the identity rule.
+TEST(HirLoweringC, DeclaredLinkageOnABlockScopeExternReachesTheFileScopeEntity) {
+    struct Case {
+        char const*      what;
+        char const*      src;
+        SymbolBinding    binding;
+        SymbolVisibility visibility;
+    };
+    for (Case const c : {
+             Case{"visibility on a block-scope extern function declaration",
+                  "int sub(void);\n"
+                  "int use(void) {\n"
+                  "  extern int sub(void) __attribute__((visibility(\"hidden\")));\n"
+                  "  return sub();\n"
+                  "}\n"
+                  "int sub(void) { return 3; }\n",
+                  SymbolBinding::Global, SymbolVisibility::Hidden},
+             Case{"weak on a block-scope extern function declaration",
+                  "int sub(void);\n"
+                  "int use(void) {\n"
+                  "  extern int sub(void) __attribute__((weak));\n"
+                  "  return sub();\n"
+                  "}\n"
+                  "int sub(void) { return 3; }\n",
+                  SymbolBinding::Weak, SymbolVisibility::Default},
+             Case{"visibility on a block-scope extern object declaration",
+                  "int sub;\n"
+                  "int use(void) {\n"
+                  "  extern int sub __attribute__((visibility(\"hidden\")));\n"
+                  "  return sub;\n"
+                  "}\n"
+                  "int sub = 8;\n",
+                  SymbolBinding::Global, SymbolVisibility::Hidden}}) {
+        std::string const src =
+            std::string(c.src)
+            + "int ctl_fn(void) { return 1; }\n"
+              "int ctl_ob = 9;\n"
+              "int main(void) { return use() + ctl_fn() + ctl_ob; }\n";
+        SemanticModel model = analyzeC(src);
+        ASSERT_FALSE(model.hasErrors())
+            << c.what << ": "
+            << (model.diagnostics().all().empty()
+                    ? std::string{}
+                    : model.diagnostics().all()[0].actual);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << c.what << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(r.errorCount(), 0u)
+            << c.what << " — gcc COMPILES this program: "
+            << (r.all().empty() ? "" : r.all()[0].actual);
+
+        auto const got = definedLinkage(*res, model, "sub");
+        ASSERT_TRUE(got.has_value())
+            << c.what << " — test setup: `sub` must lower to a DEFINING node";
+        EXPECT_EQ(got->binding, c.binding)
+            << c.what
+            << " — a block-scope `extern` declares the FILE-scope entity (C "
+               "6.2.2p4), so its facets belong to that entity's definition; "
+               "`global` here is the strong definition gcc emits `WEAK`";
+        EXPECT_EQ(got->visibility, c.visibility)
+            << c.what
+            << " — `default` here means the definition is EXPORTED where gcc "
+               "13.3.0 emits GLOBAL HIDDEN";
+
+        auto const ctlFn = definedLinkage(*res, model, "ctl_fn");
+        ASSERT_TRUE(ctlFn.has_value()) << c.what;
+        EXPECT_EQ(ctlFn->binding, SymbolBinding::Global) << c.what;
+        EXPECT_EQ(ctlFn->visibility, SymbolVisibility::Default)
+            << c.what
+            << " — the CONTROL function must not pick up the subject's facets";
+        auto const ctlOb = definedLinkage(*res, model, "ctl_ob");
+        ASSERT_TRUE(ctlOb.has_value()) << c.what;
+        EXPECT_EQ(ctlOb->binding, SymbolBinding::Global) << c.what;
+        EXPECT_EQ(ctlOb->visibility, SymbolVisibility::Default)
+            << c.what
+            << " — the CONTROL object must not pick up the subject's facets";
+    }
+}
+
+// ⚠ THE ONE DIRECTION THIS FOLD DELIBERATELY DOES NOT TAKE, PINNED SO THE
+// BOUNDARY IS VISIBLE RATHER THAN ASSUMED — **AND NO LONGER SILENT**.
+//
+// A linkage attribute on a redeclaration that FOLLOWS the definition is a place
+// where the two references ACCEPT THE SAME PROGRAM AND DISAGREE ABOUT WHAT IT
+// MEANS. ✔MEASURED 2026-09-05, each beside a plain-symbol control:
+//   * gcc 13.3.0 applies it retroactively — `FUNC GLOBAL HIDDEN`, `FUNC WEAK`.
+//   * clang 18.1.3 warns `attribute declaration must precede definition
+//     [-Wignored-attributes]` and IGNORES it — `FUNC GLOBAL DEFAULT`,
+//     `FUNC GLOBAL DEFAULT`.
+// A MEANING split is an architectural fork, not a gap the disjunction settles,
+// so which BYTES DSS emits is not decided by this change: DSS's answer is, and
+// remains, clang's, and moving to gcc's is a deliberate act that must fail this
+// test first.
+//
+// ★★ BUT THE SILENCE WAS A THIRD ANSWER, AND IT IS GONE. DSS used to emit
+// clang's bytes while saying NOTHING — neither reference's behaviour, and a
+// stated program property discarded with no diagnostic is exactly what the
+// fail-loud rule exists to catch. Emitting clang's ignored-attribute report is a
+// QUALITY match settled by the union, not a second fork, so the diagnostic is
+// asserted here beside the bytes; a pin on the bytes ALONE ratchets the silence
+// in.
+//
+// ⚠ THE COST OF THE FORK, STATED so a later cycle does not "fix" it by reflex:
+// a program whose attribute follows its definition gets a DIFFERENT SYMBOL
+// BINDING out of DSS (`GLOBAL`) than out of gcc (`WEAK`), so a two-TU link can
+// keep a different body. The warning is what makes that difference visible at
+// the source rather than at the far end of a link.
+TEST(HirLoweringC, DeclaredLinkageAfterTheDefinitionIsIgnoredAndSaidSo) {
+    for (char const* src : {
+             "int sub(void) { return 3; }\n"
+             "int sub(void) __attribute__((visibility(\"hidden\")));\n",
+             "int sub(void) { return 3; }\n"
+             "int sub(void) __attribute__((weak));\n"}) {
+        std::string const full =
+            std::string(src) + "int main(void) { return sub(); }\n";
+        SemanticModel model = analyzeC(full);
+        ASSERT_FALSE(model.hasErrors()) << src;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << src << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(r.errorCount(), 0u)
+            << src << " — clang COMPILES this program: "
+            << (r.all().empty() ? "" : r.all()[0].actual);
+
+        std::size_t warned = 0;
+        for (auto const& d : r.all()) {
+            if (d.code != DiagnosticCode::H_UnknownLinkageSpecifier) continue;
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning) << src;
+            ++warned;
+        }
+        EXPECT_EQ(warned, 1u)
+            << src
+            << " — exactly one report; zero is the silent drop of a stated "
+               "program property, which is neither reference's behaviour";
+        std::string const msg =
+            firstMessageFor(r, DiagnosticCode::H_UnknownLinkageSpecifier);
+        EXPECT_NE(msg.find("must precede the definition"), std::string::npos)
+            << src << " — got: \"" << msg << "\"";
+
+        auto const got = definedLinkage(*res, model, "sub");
+        ASSERT_TRUE(got.has_value()) << src;
+        EXPECT_EQ(got->binding, SymbolBinding::Global)
+            << src
+            << " — clang IGNORES an attribute declared after the definition and "
+               "gcc applies it; DSS follows clang, and moving to gcc's answer is "
+               "an architectural decision, not a bug fix";
+        EXPECT_EQ(got->visibility, SymbolVisibility::Default) << src;
+    }
+}
