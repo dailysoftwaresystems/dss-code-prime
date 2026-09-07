@@ -4050,6 +4050,89 @@ TEST(PeExecTls, OveralignedThreadLocalFailsLoud) {
            "the loader cannot guarantee the per-thread block alignment";
 }
 
+// ── D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN (P63) ──────────
+//
+// The ORDINARY-STORAGE twin of `OveralignedThreadLocalFailsLoud` above, and it sits
+// here rather than beside the semantic alignment pins on purpose: this is a FORMAT
+// ceiling, not a type one. A PE image's sections begin at multiples of the format
+// document's declared `SectionAlignment` (4096 on the shipped exec document) and
+// nothing stronger, so a statically allocated object asking for more cannot be
+// placed — it must be REFUSED, never emitted at whatever address the section base
+// happens to give it.
+//
+// ✔MEASURED with this gate absent and the requestable ceiling raised: a program
+// with four `__attribute__((aligned(8192)))` statics behind odd-sized fillers built
+// rc 0 and the FIRST one failed its own `address % 8192` check at run time. A clean
+// build placing an over-aligned object misaligned is the silent miscompile this
+// project ranks below every diagnostic. (One object at a section head can be right
+// BY LUCK — a single-object probe returned 42 at the same value — which is why the
+// runtime witness `examples/c/alignment_static_exceeds_format` carries several.)
+//
+// ★ THE UNION SAYS THE CEILING IS REAL: mingw-w64 gcc 13.2.0 refuses a PE static
+// above 8192 ("alignment of 'g' is greater than maximum object file alignment
+// 8192") and MSVC 19.51 refuses `__declspec(align(16384))` with `error C2345`, both
+// probed SEPARATELY. ★★ AND THE CONTROLS SAY IT IS ABOUT STORAGE, NOT ABOUT
+// ALIGNMENT: the same compiler at the same value BUILDS AND RUNS the request on a
+// TYPE and on an AUTOMATIC object — which is why this gate must never migrate into
+// the semantic ladder, where it would refuse `aligned(65536)` types that every
+// reference runs.
+TEST(PeExecData, OveralignedStaticObjectFailsLoud) {
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {1, 0, 0, 0};
+    d.alignment = Alignment::ofRuntimePow2(8192);   // one step past SectionAlignment
+    mod.dataItems.push_back(std::move(d));
+
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty()) << "no artifact may be written";
+    bool saw = false;
+    for (auto const& diag : rep.all())
+        if (diag.code == DiagnosticCode::K_StaticObjectOveralignedForFormat)
+            saw = true;
+    EXPECT_TRUE(saw)
+        << "a static object over-aligned past the document's declared "
+           "SectionAlignment must fail loud on pe64 — the image cannot place it";
+}
+
+// The BOUNDARY, and the arm that makes the refusal above a statement about the
+// DECLARED number rather than about over-alignment in general: alignment EXACTLY
+// equal to the document's `SectionAlignment` (4096) is the largest that passes.
+// The gate is `>`, not `>=`. This is also the alignment `examples/c/
+// alignment_page_request` runs at on every shipped format.
+TEST(PeExecData, StaticObjectAtTheDeclaredSectionAlignmentCompilesClean) {
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {1, 0, 0, 0};
+    d.alignment = Alignment::ofRuntimePow2(4096);
+    mod.dataItems.push_back(std::move(d));
+
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& diag : rep.all())
+        EXPECT_NE(diag.code, DiagnosticCode::K_StaticObjectOveralignedForFormat)
+            << "4096 IS the declared SectionAlignment — the gate must not bite it";
+    EXPECT_FALSE(bytes.empty()) << "a page-aligned static must still emit an image";
+}
+
 TEST(PeExecTls, SixteenByteAlignedThreadLocalCompilesClean) {
     // Boundary pin: alignment EXACTLY 16 (== the loader's guarantee) is the
     // largest that passes — the gate is `> 16`, not `>= 16`. Every normal

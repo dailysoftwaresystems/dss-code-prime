@@ -322,6 +322,12 @@ constexpr MembershipReason kWhyLinkerImage{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, errorCount() reads zero while the image on disk is "
     "refused, empty, missing or truncated"};
+constexpr MembershipReason kWhyOveralignedForFormat{
+    MembershipProng::BuildFailsWithNothingSaid,
+    "silenced, the format walker still refuses the image (it returns no bytes) "
+    "but the build then fails with nothing said about the one thing that could "
+    "be changed -- the alignment asked for, or the format document's declared "
+    "section alignment"};
 constexpr MembershipReason kWhyNoMatchingObjectFormat{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, the linker dispatches the wrong format walker and writes a "
@@ -630,7 +636,7 @@ constexpr MembershipReason kWhyIncludeReentryRefused{
 // suppressed. ✔The explicit extent did its job a SIXTH time, in the other
 // direction: the three well-formedness `static_assert`s fired on the `None` slot
 // the removal left behind, so shrinking the table could not be forgotten.
-constexpr std::array<UnsuppressableEntry, 168> kUnsuppressableCodes{{
+constexpr std::array<UnsuppressableEntry, 170> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -1121,6 +1127,15 @@ constexpr std::array<UnsuppressableEntry, 168> kUnsuppressableCodes{{
     // K_WalkerInputContractViolation — walker received malformed input
     //   from the linker driver (suppressing → upstream corruption
     //   propagates downstream silently)
+    // P63 (D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN): the two
+    // OVER-ALIGNED-FOR-THIS-FORMAT gates. Each aborts the walker (`return {}`),
+    // so silencing one cannot ship a wrong artifact -- it makes the build fail
+    // with NOTHING said, which is the table's second prong. The static gate is
+    // new this cycle; its TLS twin was already shipped and already unprotected,
+    // and adding one without the other would have left the pair meaning two
+    // different things by which cycle wrote it.
+    {DiagnosticCode::K_StaticObjectOveralignedForFormat, kWhyOveralignedForFormat},
+    {DiagnosticCode::K_ThreadLocalOveralignedForFormat, kWhyOveralignedForFormat},
     {DiagnosticCode::K_NoMatchingObjectFormat, kWhyNoMatchingObjectFormat},
     {DiagnosticCode::K_FormatLacksImportSupport, kWhyFormatLacksImportSupport},
     {DiagnosticCode::K_RelocationKindMismatch, kWhyRelocationKindMismatch},

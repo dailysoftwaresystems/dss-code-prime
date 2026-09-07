@@ -19,6 +19,7 @@
 #include "analysis/semantic/symbol_table.hpp"
 #include "analysis/semantic/type_rules.hpp"
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: run analyze on a large stack
+#include "core/types/alignment.hpp"          // Alignment::kMaxBytes — the ONE representable-alignment bound
 #include "core/types/attribute_naming.hpp"   // D-CSUBSET-PACKED: stripDunder (shared with the preprocessor)
 #include "core/types/data_model.hpp"
 #include "core/types/decl_prefix_strip.hpp"   // declRoleChildren / descendVisibleDecl / specifierPrefixChild
@@ -6324,7 +6325,10 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
 //   • 0 ⇒ nullopt, NO error (6.7.5p3: "an alignment specification of zero has no
 //     effect" — a NO-OP, treated as "no override" by the caller);
 //   • not a power of two ⇒ S_AlignasNotPowerOfTwo, nullopt;
-//   • > 256 ⇒ S_AlignasExceedsMax, nullopt (the `Alignment` newtype cap);
+//   • above the TARGET's DECLARED `aggregateLayout.maxRequestedAlignment`, or
+//     outside the `Alignment` newtype's representable domain ⇒
+//     S_AlignasExceedsMax, nullopt, with the declared ceiling NAMED in the
+//     message (D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN);
 //   • non-constant value ⇒ S_AlignasNonConstant, nullopt.
 //
 // `argNode` is the operand (an `alignasArg` alt wrapper, or a GNU attribute's
@@ -6336,14 +6340,17 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
 foldAlignmentOperand(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                      NodeId argNode, NodeId diagNode, ScopeId fromScope) {
     if (!argNode.valid() || !diagNode.valid()) return std::nullopt;
-    auto emit = [&](DiagnosticCode code) {
+    auto emitWith = [&](DiagnosticCode code, std::string actual) {
         ParseDiagnostic d;
         d.code     = code;
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(diagNode);
-        d.actual   = std::string{tree.text(diagNode)};
+        d.actual   = std::move(actual);
         s.reporter.report(std::move(d));
+    };
+    auto emit = [&](DiagnosticCode code) {
+        emitWith(code, std::string{tree.text(diagNode)});
     };
     // The `alignasArg` speculative alt commits EITHER the `alignasTypeName` wrapper
     // (TYPE form) OR a value expression (VALUE form); discriminate by the committed
@@ -6411,7 +6418,43 @@ foldAlignmentOperand(EngineState& s, SemanticConfig const& cfg, Tree const& tree
     // alignment is a positive power of two, C 6.7.5p3).
     std::uint64_t const uv = static_cast<std::uint64_t>(value);
     if ((uv & (uv - 1u)) != 0u) { emit(DiagnosticCode::S_AlignasNotPowerOfTwo); return std::nullopt; }
-    if (uv > 256u)             { emit(DiagnosticCode::S_AlignasExceedsMax);      return std::nullopt; }
+    // ── D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN (P63) ──
+    //
+    // ⚠⚠ THIS ARM USED TO READ `if (uv > 256u)`, WITH A SIBLING COMMENT CALLING
+    // 256 "the `Alignment` newtype cap". Both halves were wrong. It was a POLICY
+    // number hand-copied into three places, and it REFUSED CORRECT CODE: ✔MEASURED
+    // 2026-09-07, each reference probed SEPARATELY, BUILD **and** RUN with the exit
+    // asserted and an N=16 CONTROL arm green throughout — gcc 13.3.0 and clang
+    // 18.1.3 both RUN `struct __attribute__((aligned(N))) big { char c; };` and its
+    // `_Alignas(N)` twin at N = 512, 1024, 4096, 8192, 16384, 65536, 2^20 and 2^28.
+    // A page (4096) is the first alignment a program asking for one would write.
+    // The refusal was LOUD, so nothing was miscompiled — which is exactly why it
+    // sat unnoticed with every gate green.
+    //
+    // ★ THE CEILING IS NOW DECLARED, per target, as
+    // `aggregateLayout.maxRequestedAlignment` (2^28 on both shipped targets — the
+    // number gcc names when it refuses 2^29, identically on x86_64-linux,
+    // aarch64-linux and mingw-w64 PE). ⚠ It is NOT `maxAlignment`, which is the
+    // ISA's largest FUNDAMENTAL alignment (16) and would refuse `_Alignas(32)`.
+    //
+    // ⓘ NO DECLARED BLOCK ⇒ the only remaining bound is REPRESENTABILITY, and that
+    // is deliberate rather than lax: a target that declares no `aggregateLayout`
+    // cannot lay out an aggregate at all, so its layout path already fails loud
+    // with a positioned diagnostic. Inventing a policy number here would be the
+    // silent default this arm exists to remove.
+    std::uint32_t const declaredMax =
+        (s.aggregateLayout.has_value()
+         && s.aggregateLayout->maxRequestedAlignment != 0u)
+            ? s.aggregateLayout->maxRequestedAlignment
+            : Alignment::kMaxBytes;
+    if (uv > declaredMax) {
+        emitWith(DiagnosticCode::S_AlignasExceedsMax,
+                 std::format("{} requests {}-byte alignment, above the {}-byte "
+                             "maximum this target declares it can be asked for "
+                             "(aggregateLayout.maxRequestedAlignment)",
+                             tree.text(diagNode), uv, declaredMax));
+        return std::nullopt;
+    }
     return static_cast<std::uint32_t>(uv);
 }
 

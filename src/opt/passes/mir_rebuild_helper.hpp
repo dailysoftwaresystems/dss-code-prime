@@ -159,13 +159,26 @@ public:
 
     // ★★★ THE PASS THIS POLICY BELONGS TO, PRINTED BY EVERY FATAL THE REBUILD
     // SUBSTRATE CAN RAISE (D-OPT-MIR-REBUILDER-FATAL-CANNOT-NAME-THE-PASS).
-    // ~9 policies drive one rebuilder, and its aborts used to name only the
+    // <!--census:source:opt.mirRebuildPolicies-->11 policies drive one rebuilder,
+    // and its aborts used to name only the
     // HELPER: `rewriteOperand: old MirInstId v=N has no rewrite entry` reads
     // identically whichever policy produced it. ✔MEASURED as a cost, not a
     // theory — isolating D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR-REBUILDER
     // took a `DSS_OPT_TRACE` run whose ONLY product was the word `SimplifyCfg`.
     // A fatal is the one message a reader cannot follow up interactively (the
     // process is gone), so it is the least able to afford a missing attribution.
+    //
+    // ⓘ THAT FIGURE IS MACHINE-CHECKED, WHICH IS THE ONLY REASON IT IS SAFE TO
+    // WRITE A NUMBER HERE. It read `~9` until 2026-09-07 (cycle P63) and was wrong
+    // by two, and nothing in the tree could see that — a count in a comment is a
+    // measurement with no instrument attached, so it decays silently in the
+    // direction of looking authoritative
+    // (D-TEST-CMAKE-COMMENT-QUOTES-A-CORPUS-COUNT-THE-TEST-IT-REGISTERS-FORBIDS).
+    // The `census:` marker binds it to the `opt.mirRebuildPolicies` key of
+    // `scripts/check-doc-census/source-census.json`, which OWNS the counting
+    // pattern. ★ The pattern is deliberately NOT restated here: a pattern quoted in
+    // prose rots exactly like the number it derives. `doc_census_guard` reds on
+    // drift, and `check-doc-census.py --write` repairs the figure in place.
     //
     // ★★ PURE VIRTUAL, AND THAT IS THE MECHANISM RATHER THAN AN OVERSIGHT. A
     // defaulted `passName = "unknown"` parameter would re-create this exact row

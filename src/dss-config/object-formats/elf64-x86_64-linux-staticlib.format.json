@@ -221,6 +221,12 @@
       "kind": 5,
       "nativeId": 2,
       "emitOnly": true
+    },
+    {
+      "$comment": "D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: GOT-slot-relative reference, ELF type R_X86_64_GOTPCREL = 9. `kind` = 7 matches x86_64.target.json's `gotpcrel32` row. DECODE-ONLY IN PRACTICE: DSS never emits this type -- it is declared so a REAL foreign static-archive member can be READ (a distro glibc `libc.a` carries 78 of them, in exit.o / fork.o / uselocale.o / setlocale.o / memstream.o and eight more). No `pltNativeId`: a GOT-slot reference never names a call, and routing it through a PLT stub would make the loaded value the stub address instead of the symbol's.",
+      "name": "R_X86_64_GOTPCREL",
+      "kind": 7,
+      "nativeId": 9
     }
   ]
 }

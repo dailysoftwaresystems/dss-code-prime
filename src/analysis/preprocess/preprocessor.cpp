@@ -4570,10 +4570,28 @@ private:
     }
 
     // Decode + VALIDATE a `#pragma pack` alignment operand. Must be a positive
-    // power of two no greater than 256 — the same envelope `alignas` /
-    // `__attribute__((aligned(N)))` are held to, because it lands in the same
-    // layout channel and a value the layout engine cannot represent would abort
-    // deep in `computeLayout` with no source position.
+    // power of two no greater than 256.
+    //
+    // ⚠ THE SENTENCE THAT USED TO JUSTIFY THAT 256 WENT FALSE IN P63 AND IS
+    // REPLACED, BUT THE NUMBER ITSELF IS UNCHANGED AND CORRECT. It read: "the
+    // same envelope `alignas` / `__attribute__((aligned(N)))` are held to,
+    // because it lands in the same layout channel". Those two are no longer
+    // held to 256 — their POLICY ceiling is now declared per target as the
+    // `aggregateLayout.maxRequestedAlignment` key, closed under
+    // [[D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN]]
+    // — so the shared-envelope argument no longer holds and must not be used
+    // to move this bound in sympathy.
+    //
+    // ★ THEY ARE DIFFERENT QUANTITIES AND ONLY LOOK ALIKE. `alignas(N)` /
+    // `aligned(N)` RAISE an object's alignment; `#pragma pack(N)` CLAMPS a
+    // struct's field alignment DOWN to at most N. One asks for more, the other
+    // permits less, so a ceiling that is wrong for the first is not thereby
+    // wrong for the second. MSVC — whose extension this is — documents
+    // `#pragma pack` as accepting 1, 2, 4, 8 and 16 only, so 256 is already
+    // strictly more permissive than the reference that defines it, and raising
+    // it would be inventing an extension rather than closing a divergence.
+    // A value the layout engine cannot represent would still abort deep in
+    // `computeLayout` with no source position, which is why the check is here.
     [[nodiscard]] std::optional<std::uint32_t> packOperandValue(
         Token const& t, SourceSpan diagSpan) {
         std::string_view const lex = text(t);

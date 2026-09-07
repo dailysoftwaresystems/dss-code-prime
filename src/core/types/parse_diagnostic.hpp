@@ -4758,7 +4758,30 @@ enum class DiagnosticCode : std::uint16_t {
     //   artifact) is left BYTE-INTACT: the refusal happens before the
     //   staging-temp claim, so the commit rename never runs.
     K_ArtifactWithheldAfterError   = 0x8023,
-    // K-NEXT-SLOT: 0x8024 — grep this marker before adding a K_* code.
+    // K_StaticObjectOveralignedForFormat
+    //   (D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN, P63):
+    //   a statically allocated object requires a stronger alignment than the
+    //   OUTPUT FORMAT can place it at. This is a SECOND, narrower ceiling than
+    //   the target's `aggregateLayout.maxRequestedAlignment`, and the two are
+    //   deliberately different questions: a TYPE (and a stack local) may be
+    //   over-aligned far beyond what a section base can guarantee.
+    //   ✔MEASURED 2026-09-07, mingw-w64 gcc 13.2.0 targeting PE, three arms per
+    //   value: at 16384 the TYPE builds and runs, an AUTOMATIC object builds and
+    //   runs, and only a STATIC object is refused — *"alignment of 'g' is greater
+    //   than maximum object file alignment 8192"*; MSVC 19.51 refuses the same
+    //   value as `error C2345: align(16384): illegal alignment value`. Both PE
+    //   references land on the format's own encoding limit, independently.
+    //   ⚠ WHAT MAKES IT LOAD-BEARING RATHER THAN PEDANTIC: with the ceiling
+    //   raised and this gate ABSENT, DSS built a PE image CLEAN and placed a
+    //   4-object over-aligned static run MISALIGNED (✔MEASURED: exit 50, the
+    //   first object failing its own `% N` check) — a silent miscompile, the
+    //   worst outcome available. The bound is the format document's OWN declared
+    //   section alignment, so raising the document raises the ceiling; nothing
+    //   here is a hardcoded platform number.
+    //   Fires from the PE walker (pe.cpp, exec/dll arm), alongside the
+    //   K_ThreadLocalOveralignedForFormat gate it is modelled on.
+    K_StaticObjectOveralignedForFormat = 0x8024,
+    // K-NEXT-SLOT: 0x8025 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

@@ -2285,6 +2285,20 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         return std::nullopt;  // unsupported SEH shape (c116b frontier) — fail-loud reported.
     }
 
+    // ══ VERIFY THE POST-SYNTHESIS MODULE ═════════════════════════════════════
+    //
+    // [[D-MIR-SYNTH-PASSES-UNVERIFIED-ON-SINGLE-CU-PATH]]: a NEW verify on this
+    // seam, not a moved one. `optimizeModule` above verifies after every pass IT
+    // runs — but it runs BEFORE `synthesizeSehFunclets`, so on the merge path the
+    // SEH pass's output was the one module state nothing ever checked. The
+    // single-CU seam in `compile_pipeline.cpp` calls the same function at the same
+    // point relative to the same pass; keeping the two AGREEING is what
+    // [[D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY]] exists to protect,
+    // and `SynthVerifySeamGuard` is what reds when one of them moves.
+    if (!verifySynthesizedModule(merged->mir, merged->host.interner(), reporter)) {
+        return std::nullopt;  // the broken invariant + the tier are both reported.
+    }
+
     // D-FFI-EXTERN-CALL-DISPATCH: the merged module compiles to ONE
     // (target, format); pass that format's extern-call shape so MIR→LIR
     // selects the right call-site opcode for any surviving extern import.

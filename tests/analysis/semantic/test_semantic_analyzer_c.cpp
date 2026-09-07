@@ -2084,7 +2084,16 @@ TEST(SemanticAnalyzerC, StaticAssertAlignofFoldsFalseFailsLoud) {
 // D-CSUBSET-ALIGNAS. `analyze` is given the SAME aggregateLayout params the
 // _Alignof pins use (Natural, stack-align 16) so member layout is exact.
 namespace {
-constexpr AggregateLayoutParams kAlignasLayout{ScalarAlignmentRule::Natural, 16};
+// D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN (P63): the
+// requestable ceiling is DECLARED per target, so a fixture that exercises it must
+// DECLARE it — and with the SHIPPED `.target.json` value, so these pins move with
+// the real config rather than with whatever the struct defaults to. Designated
+// initialisers: this is a params struct and a positional init is a latent
+// mis-assignment the next field silently makes.
+constexpr AggregateLayoutParams kAlignasLayout{
+    .scalarAlignment       = ScalarAlignmentRule::Natural,
+    .maxAlignment          = 16,
+    .maxRequestedAlignment = 268435456};
 // D-CSUBSET-PACKED-BITFIELD-INTERACTION: the same params PLUS a declared
 // bit-field strategy, for the pins that lay a bit-field out end to end.
 // `kAlignasLayout` leaves `bitFieldStrategy` at `None`, which is the correct
@@ -2092,8 +2101,11 @@ constexpr AggregateLayoutParams kAlignasLayout{ScalarAlignmentRule::Natural, 16}
 // `Ignored` is the x86_64-linux / Apple answer for an unnamed bit-field's
 // alignment contribution (D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT).
 constexpr AggregateLayoutParams kGnuBitfieldLayout{
-    ScalarAlignmentRule::Natural, 16, BitFieldStrategy::GnuPacked,
-    UnnamedBitFieldAlignment::Ignored};
+    .scalarAlignment          = ScalarAlignmentRule::Natural,
+    .maxAlignment             = 16,
+    .bitFieldStrategy         = BitFieldStrategy::GnuPacked,
+    .unnamedBitFieldAlignment = UnnamedBitFieldAlignment::Ignored,
+    .maxRequestedAlignment    = 268435456};
 }  // namespace
 
 // PARSE: a global variable `alignas(16) int x;` (value form) parses cleanly —
@@ -2637,16 +2649,351 @@ TEST(SemanticAnalyzerC, AlignasNotPowerOfTwoFailsLoud) {
                         DiagnosticCode::S_AlignasNotPowerOfTwo), 1u);
 }
 
-// CONSTRAINT: a value over the 256-byte cap → S_AlignasExceedsMax (a distinct
-// code from not-power-of-two — 512 IS a power of two, just too large).
+// CONSTRAINT: a value over the TARGET'S DECLARED requestable ceiling ->
+// S_AlignasExceedsMax (a distinct code from not-power-of-two - the value IS a
+// power of two, just larger than this target says it may be asked for).
+//
+// WARNING P63 (D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN):
+// THIS TEST USED TO SPELL THE SUBJECT `alignas(512)` AND THE CEILING "256", AND IT
+// WAS PINNING A UNION VIOLATION AS THE CONTRACT - a green test asserting that DSS
+// refuses what two working references build and run. MEASURED 2026-09-07, each
+// reference probed SEPARATELY, BUILD and RUN with the exit asserted and an N=16
+// CONTROL arm green throughout: gcc 13.3.0 and clang 18.1.3 both RUN `alignas(N)`
+// and `__attribute__((aligned(N)))` at N = 512 through 2^28. The subject is now
+// 2^29, the first value gcc itself refuses ("requested alignment '536870912'
+// exceeds maximum 268435456"), and the ACCEPT arm below is the control that makes
+// this a statement about the CEILING rather than about the code path.
 TEST(SemanticAnalyzerC, AlignasExceedsMaxFailsLoud) {
-    auto cu = buildShippedUnit("c", { "alignas(512) int x;\n" });
+    auto cu = buildShippedUnit("c", { "alignas(536870912) int x;\n" });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasExceedsMax), 1u);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_AlignasNotPowerOfTwo), 0u);
+    // The refusal must NAME the declared ceiling and the key that carries it -
+    // "too large" without a number is a diagnostic nobody can act on.
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code != DiagnosticCode::S_AlignasExceedsMax) continue;
+        EXPECT_NE(d.actual.find("268435456"), std::string::npos) << d.actual;
+        EXPECT_NE(d.actual.find("maxRequestedAlignment"), std::string::npos) << d.actual;
+    }
+}
+
+// THE ACCEPT ARM - every value the old hardcoded 256 refused and both references
+// RUN, in BOTH spellings, asserted to reach the SYMBOL rather than merely to stop
+// erroring. Red at every single value before P63.
+TEST(SemanticAnalyzerC, AlignasBelowTheDeclaredCeilingIsHonored) {
+    for (unsigned n : {512u, 1024u, 4096u, 8192u, 65536u, 268435456u}) {
+        for (bool gnu : {false, true}) {
+            std::string const src =
+                gnu ? std::format("int x __attribute__((aligned({})));\n", n)
+                    : std::format("alignas({}) int x;\n", n);
+            auto cu = buildShippedUnit("c", { src });
+            assertNoBuilderErrors(*cu);
+            auto model = analyze(cu, DiagnosticBudget::libraryDefault(),
+                                 DataModel::Lp64, kAlignasLayout);
+            EXPECT_EQ(countCode(model.diagnostics(),
+                                DiagnosticCode::S_AlignasExceedsMax), 0u)
+                << "n=" << n << " gnu=" << gnu;
+            SymbolRecord const* x = findSym(model, "x");
+            ASSERT_NE(x, nullptr) << "n=" << n << " gnu=" << gnu;
+            ASSERT_TRUE(x->explicitAlignment.has_value())
+                << "n=" << n << " gnu=" << gnu << " - accepted but DROPPED";
+            EXPECT_EQ(*x->explicitAlignment, n) << "n=" << n << " gnu=" << gnu;
+        }
+    }
+}
+
+// THE DECLARATION IS WHAT DECIDES, not a constant in the engine: the SAME source is
+// accepted or refused according to the params the caller declares. This is the arm
+// that would stay green if the ceiling were merely re-hardcoded at a bigger number,
+// so it is the one that makes "DECLARED" mean something.
+TEST(SemanticAnalyzerC, TheRequestableCeilingComesFromTheDeclaredParams) {
+    constexpr AggregateLayoutParams kTight{
+        .scalarAlignment       = ScalarAlignmentRule::Natural,
+        .maxAlignment          = 16,
+        .maxRequestedAlignment = 1024};
+    {
+        auto cu = buildShippedUnit("c", { "alignas(1024) int x;\n" });
+        auto m = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kTight);
+        EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_AlignasExceedsMax), 0u)
+            << "at the declared ceiling exactly - accepted";
+    }
+    {
+        auto cu = buildShippedUnit("c", { "alignas(2048) int x;\n" });
+        auto m = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kTight);
+        EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_AlignasExceedsMax), 1u)
+            << "one step above the DECLARED ceiling - refused, on the same source "
+               "the wider params accept";
+    }
+    {   // CONTROL: the same 2048 under the shipped-value params is ACCEPTED, so the
+        // refusal above is attributable to the DECLARATION and to nothing else.
+        auto cu = buildShippedUnit("c", { "alignas(2048) int x;\n" });
+        auto m = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+        EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_AlignasExceedsMax), 0u);
+    }
+}
+
+// ── D-CSUBSET-ATTRIBUTE-MID-DECLARATOR-POSITION-REFUSED (P63) ───────────────────
+//
+// `struct s { char pad; char __attribute__((__aligned__(16))) v; };` — a GNU
+// attribute run between a member's TYPE HEAD and its declarator. MEASURED as
+// `error[P_UnexpectedToken] expected 'EndStatement' — got 'v'` before this cycle,
+// while gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 all BUILD AND RUN it.
+//
+// THE ALIGNMENT IS ASSERTED AT ITS SINK — the decorated member follows a `char`, so
+// BOTH its offset and the aggregate size move when the request lands; "the parse
+// stopped erroring" is not the claim. gcc and clang, agreeing: pad@0, v@16,
+// sizeof 32, _Alignof 16. An undecorated control is 0/1/2/1.
+TEST(SemanticAnalyzerC, MidDeclaratorMemberAttributeReachesTheLayout) {
+    auto cu = buildShippedUnit("c", {
+        "struct s { char pad; char __attribute__((__aligned__(16))) v; };\n"
+        "struct s g;\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+    EXPECT_FALSE(model.hasErrors())
+        << "the mid-declarator member position must parse and analyze cleanly";
+    SymbolRecord const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    ASSERT_TRUE(g->type.valid());
+    auto const& ti = model.lattice().interner();
+    auto const layout = computeLayout(g->type, ti, kAlignasLayout, DataModel::Lp64);
+    ASSERT_TRUE(layout.has_value());
+    ASSERT_EQ(layout->fieldOffsets.size(), 2u);
+    EXPECT_EQ(layout->fieldOffsets[0], 0u);
+    EXPECT_EQ(layout->fieldOffsets[1], 16u)
+        << "gcc + clang: offsetof(v) == 16 — parsed-and-dropped gives 1";
+    EXPECT_EQ(layout->size, 32u)          << "gcc + clang: sizeof == 32 (dropped: 2)";
+    EXPECT_EQ(layout->align.bytes(), 16u) << "gcc + clang: _Alignof == 16 (dropped: 1)";
+}
+
+// THE UNDECORATED CONTROL, so the numbers above are attributable to the attribute
+// and not to the member shape.
+TEST(SemanticAnalyzerC, MidDeclaratorMemberControlIsUndecoratedLayout) {
+    auto cu = buildShippedUnit("c", {
+        "struct s { char pad; char v; };\n"
+        "struct s g;\n"
+        "int main(void){ return 0; }\n",
+    });
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    auto const& ti = model.lattice().interner();
+    auto const layout = computeLayout(g->type, ti, kAlignasLayout, DataModel::Lp64);
+    ASSERT_TRUE(layout.has_value());
+    ASSERT_EQ(layout->fieldOffsets.size(), 2u);
+    EXPECT_EQ(layout->fieldOffsets[1], 1u);
+    EXPECT_EQ(layout->size, 2u);
+    EXPECT_EQ(layout->align.bytes(), 1u);
+}
+
+// ★★ WHAT IT DECORATES, MEASURED RATHER THAN ASSUMED — AND THE ANCHOR ROW'S OWN
+// PRESCRIPTION WAS WRONG. The row (and the cycle brief) said a mid-declarator
+// attribute "binds to the DECLARATOR it precedes". A TWO-declarator subject refutes
+// that, and it is the only subject that can: the two candidate answers give
+// DIFFERENT numbers, so the test cannot pass either way.
+//   per-declarator (the row's claim) : a@0  b@1   sizeof 16
+//   per-declaration (measured)       : a@0  b@16  sizeof 32
+// MEASURED 2026-09-07, gcc 13.3.0 AND clang 18.1.3 AGREEING: a@0 b@16 sizeof 32
+// _Alignof 16 — the SECOND declarator is aligned too. The file-scope twin
+// `char __attribute__((__aligned__(16))) a, b;` aligns BOTH on both references, and
+// that is this same already-shipped `declAttrRun` slot with `appertainsTo:
+// declaration`. P56's own control says it independently for `noreturn`.
+TEST(SemanticAnalyzerC, MidDeclaratorMemberAttributeAppertainsToTheWholeDeclaration) {
+    auto cu = buildShippedUnit("c", {
+        "struct s { char __attribute__((__aligned__(16))) a, b; };\n"
+        "struct s g;\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    auto const& ti = model.lattice().interner();
+    auto const layout = computeLayout(g->type, ti, kAlignasLayout, DataModel::Lp64);
+    ASSERT_TRUE(layout.has_value());
+    ASSERT_EQ(layout->fieldOffsets.size(), 2u);
+    EXPECT_EQ(layout->fieldOffsets[0], 0u);
+    EXPECT_EQ(layout->fieldOffsets[1], 16u)
+        << "gcc + clang: the SECOND declarator is aligned too — per-declarator "
+           "binding would put b at 1 and sizeof at 16";
+    EXPECT_EQ(layout->size, 32u);
+    EXPECT_EQ(layout->align.bytes(), 16u);
+}
+
+// THE UNION HALF — a union member declaration must not mean something different
+// from a struct one. `unionField` carries its own row and its own shape, so it is a
+// separate omission, exactly as P48 recorded for the const marker.
+TEST(SemanticAnalyzerC, MidDeclaratorUnionMemberAttributeReachesTheLayout) {
+    auto cu = buildShippedUnit("c", {
+        "union u { char pad; char __attribute__((__aligned__(16))) v; };\n"
+        "union u g;\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+    EXPECT_FALSE(model.hasErrors())
+        << "the mid-declarator UNION member position must parse and analyze cleanly";
+    SymbolRecord const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    auto const& ti = model.lattice().interner();
+    auto const layout = computeLayout(g->type, ti, kAlignasLayout, DataModel::Lp64);
+    ASSERT_TRUE(layout.has_value());
+    EXPECT_EQ(layout->align.bytes(), 16u)
+        << "the request must reach the union's own alignment (dropped: 1)";
+    EXPECT_EQ(layout->size, 16u) << "a union rounds to its alignment (dropped: 1)";
+}
+
+// THE TWO RETAINED CONTROLS on either side of the newly-admitted position. They are
+// what make the isolation exact: DSS already agreed with all three references on
+// both, and admitting the middle slot must not move either.
+//  * TRAILING — `char v __attribute__((aligned(16)));` — 42 on all four before P63.
+//  * LEADING  — `__attribute__((aligned(16))) char v; char pad;` — the DIFFERENT
+//    member ORDER makes it sizeof 16 / _Alignof 16, which is why the reference
+//    probe returns 7 for it rather than 42; all four agree.
+TEST(SemanticAnalyzerC, MidDeclaratorNeighbourPositionsAreUnmoved) {
+    {   // TRAILING
+        auto cu = buildShippedUnit("c", {
+            "struct s { char pad; char v __attribute__((__aligned__(16))); };\n"
+            "struct s g;\n"
+            "int main(void){ return 0; }\n",
+        });
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+        EXPECT_FALSE(model.hasErrors());
+        SymbolRecord const* g = findSym(model, "g");
+        ASSERT_NE(g, nullptr);
+        auto const& ti = model.lattice().interner();
+        auto const layout = computeLayout(g->type, ti, kAlignasLayout, DataModel::Lp64);
+        ASSERT_TRUE(layout.has_value());
+        ASSERT_EQ(layout->fieldOffsets.size(), 2u);
+        EXPECT_EQ(layout->fieldOffsets[1], 16u);
+        EXPECT_EQ(layout->size, 32u);
+    }
+    {   // LEADING (the specifier prefix)
+        auto cu = buildShippedUnit("c", {
+            "struct s { __attribute__((__aligned__(16))) char v; char pad; };\n"
+            "struct s g;\n"
+            "int main(void){ return 0; }\n",
+        });
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
+        EXPECT_FALSE(model.hasErrors());
+        SymbolRecord const* g = findSym(model, "g");
+        ASSERT_NE(g, nullptr);
+        auto const& ti = model.lattice().interner();
+        auto const layout = computeLayout(g->type, ti, kAlignasLayout, DataModel::Lp64);
+        ASSERT_TRUE(layout.has_value());
+        EXPECT_EQ(layout->align.bytes(), 16u);
+        EXPECT_EQ(layout->size, 16u);
+    }
+}
+
+// ★★★ P63 [[D-CSUBSET-ATTRIBUTE-MID-DECLARATOR-POSITION-REFUSED]] — THIS TEST
+// ASSERTED `EXPECT_TRUE(builderError)` UNTIL 2026-09-07 AND WAS PINNING A UNION
+// VIOLATION AS THE CONTRACT.
+//
+// Its heading called the position "RESIDUE, NAMED AND LOUD", and residue that a
+// cycle states as a trade-off is legitimate — but a TEST is not a trade-off
+// statement. It is the contract, and a green test asserting DSS refuses a
+// construct is precisely what stops a later cycle from fixing it. P62 spent a
+// wave removing four tests of exactly this class.
+//
+// ✔MEASURED, each reference SEPARATELY, BUILD **and** RUN, with an undecorated
+// control (`struct s { char a, b; }`) green in every cell:
+//   • clang 18.1.3 — BUILDS, RUNS, AND THE ALIGNMENT REACHES THE SINK. A
+//     `static struct s g` asserting `&g.b % 16 == 0` and `offsetof(b) % 16 == 0`
+//     at RUN TIME returns 42; a miscompile would have returned 60/61.
+//   • gcc 13.3.0 — build rc 1. mingw-w64 gcc 13.2.0 — build rc 1.
+//     MSVC 19.51, in its OWN `__declspec(align(16))` spelling — C2143.
+// A minority-of-one, where the feature's own vendor refuses. But
+// `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` is a union over what WORKS, the split
+// here is accept-vs-refuse rather than a disagreement about what the program
+// MEANS, and one working reference makes the construct REQUIRED.
+//
+// ⚠ THE SENTENCE THAT LICENSED THE OLD PIN WAS ALSO WRONG ABOUT ITS SCOPE.
+// "gcc REFUSES it and clang accepts it" is true INSIDE A MEMBER LIST only:
+// ✔MEASURED, the identical spelling at FILE SCOPE (`char a,
+// __attribute__((aligned(16))) b, c;`) BUILDS AND RUNS on gcc 13.3.0, clang
+// 18.1.3 AND mingw-w64 gcc 13.2.0 — every reference that speaks `__attribute__`
+// at all. gcc's objection is member-list-LOCAL, not positional.
+TEST(SemanticAnalyzerC, MidListMemberAttributeIsHonoredAndBindsPerDeclarator) {
+    auto cu = buildShippedUnit("c", {
+        "struct s { char a, __attribute__((__aligned__(16))) b; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    bool builderError = false;
+    for (auto const& t : cu->trees())
+        for (auto const& d : t.diagnostics().all())
+            if (d.severity == DiagnosticSeverity::Error) builderError = true;
+    EXPECT_FALSE(builderError)
+        << "clang builds, runs, and lands the alignment at the sink — refusing "
+           "it pins a union violation as the contract";
+
+    // ★★ THE BINDING IS PER-DECLARATOR, AND A TWO-DECLARATOR SUBJECT CANNOT
+    // SHOW IT. `char a, __attr__ b;` gives `a@0 b@16 sizeof 32` whether the
+    // attribute binds to `b` alone or to the whole declaration — the two
+    // candidate answers coincide, so such a probe passes either way. THREE
+    // declarators separate them. ✔MEASURED: clang gives `a=0 b=16 c=17
+    // sizeof 32`, and the file-scope twin on gcc AND clang puts `c` at `&b+1`
+    // — so the attribute binds to `b` ALONE. Declaration grain would put `c`
+    // at 32 and `sizeof` at 48: a SILENT WRONG LAYOUT from a rule that parses.
+    auto model = analyzeShipped("c", {
+        "struct S { char a, __attribute__((__aligned__(16))) b, c; };\n" });
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* s = findSym(model, "S");
+    if (s != nullptr) {
+        auto const& ti = model.lattice().interner();
+        auto const layout =
+            computeLayout(s->type, ti, kAlignasLayout, DataModel::Lp64);
+        if (layout.has_value()) {
+            EXPECT_EQ(layout->align.bytes(), 16u);
+            EXPECT_EQ(layout->size, 32u)
+                << "sizeof 48 would mean the attribute leaked to `c` — the "
+                   "declaration grain, which no reference agrees with";
+        }
+    }
+}
+
+// ★★ THE GRAIN OF THE NEW SLOT, WITNESSED ON THE AXIS WHERE IT IS OBSERVABLE — and
+// this test exists because a mutant PROVED the obvious one vacuous. ✔MEASURED: with
+// the mid-declarator slot's `appertainsTo` flipped from `declaration` to
+// `declarator`, EVERY alignment pin above stayed GREEN. Alignment is folded from the
+// declaration node whatever the grain says, so no `aligned(...)` test can witness the
+// value; `deprecated` is the axis P56 established for exactly this question, and it
+// is the one that moves.
+//
+// gcc 13.3.0 and clang 18.1.3, MEASURED by P56 with two different attributes (so the
+// grain is a property of the POSITION, not of the attribute): a run BEFORE the
+// declarators reaches EVERY declarator. The trailing run reaches only the LAST, and
+// its own test above pins that — the two together are what stop one attribute
+// meaning two things on two sides of a declarator.
+TEST(SemanticAnalyzerC, MidDeclaratorMemberAttrSlotConfersOnEveryDeclarator) {
+    auto model = analyzeShipped("c", {
+        "struct S { int __attribute__((deprecated)) p, q; };\n" });
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* p = findSym(model, "p");
+    SymbolRecord const* q = findSym(model, "q");
+    ASSERT_NE(p, nullptr);
+    ASSERT_NE(q, nullptr);
+    EXPECT_TRUE(p->isDeprecated)
+        << "the mid-declarator run appertains to the DECLARATION — gcc and clang "
+           "both flag the first declarator";
+    EXPECT_TRUE(q->isDeprecated)
+        << "…and the SECOND one. This is the assertion a `declarator` grain breaks, "
+           "and the only one in this file that does";
+    // NEGATIVE CONTROL, in the same test so it cannot drift away: the TRAILING slot
+    // still reaches the LAST declarator ONLY. If admitting the middle position had
+    // widened the trailing scan, this would go red.
+    auto trail = analyzeShipped("c", {
+        "struct S { int p, q __attribute__((deprecated)); };\n" });
+    EXPECT_FALSE(trail.hasErrors());
+    SymbolRecord const* tp = findSym(trail, "p");
+    ASSERT_NE(tp, nullptr);
+    EXPECT_FALSE(tp->isDeprecated)
+        << "a trailing run must still not leak leftward";
 }
 
 // CONSTRAINT: an alignment WEAKER than the declared type's natural alignment →
@@ -2868,7 +3215,10 @@ TEST(SemanticAnalyzerC, AlignasOnAParameterInheritsTheWholeValidationLadder) {
         EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_AlignasNotPowerOfTwo), 1u);
     }
     {
-        auto cu = buildShippedUnit("c", { "void f(alignas(512) int p) { (void)p; }\n" });
+        // P63: 512 is below the declared ceiling now; 2^29 is the first
+        // value above it, and above gcc's own.
+        auto cu = buildShippedUnit("c",
+            { "void f(alignas(536870912) int p) { (void)p; }\n" });
         assertNoBuilderErrors(*cu);
         auto m = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
         EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_AlignasExceedsMax), 1u);
@@ -14901,13 +15251,16 @@ TEST(SemanticAnalyzerC, GnuAlignedSharesTheAlignasValidationLadder) {
                             DiagnosticCode::S_AlignasNotPowerOfTwo), 1u)
             << "aligned(3) must fail through the SHARED ladder, not silently";
     }
-    {   // over the 256 cap — the SAME code alignas(512) emits
+    {   // over the DECLARED ceiling — the SAME code alignas(2^29) emits.
+        // P63: the subject was `aligned(512)` against a hardcoded 256, which
+        // both references build and run; the shared-ladder claim is unchanged,
+        // only the value that actually exceeds the ceiling.
         auto cu = buildShippedUnit("c",
-                                   { "int x __attribute__((aligned(512)));\n" });
+                                   { "int x __attribute__((aligned(536870912)));\n" });
         auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
         EXPECT_EQ(countCode(model.diagnostics(),
                             DiagnosticCode::S_AlignasExceedsMax), 1u)
-            << "aligned(512) must hit the SAME >256 cap alignas does";
+            << "the GNU spelling must hit the SAME declared ceiling alignas does";
     }
     {   // the alignas TWIN — proves the two spellings agree, code for code
         auto cu = buildShippedUnit("c", { "alignas(3) int x;\n" });

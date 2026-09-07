@@ -1,5 +1,6 @@
 #include "core/types/type_lattice/type_lattice.hpp"
 
+#include "core/types/alignment.hpp"              // the ONE owner of the representable-alignment domain
 #include "core/types/config_key_vocabulary.hpp"  // renderAllowedList — the ONE "expected one of …" renderer
 #include "core/types/grammar_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -556,17 +557,25 @@ contentDeclSiteKey(std::span<TypeId const> fields,
 }
 
 // D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): is a stored whole-composite alignment
-// REPRESENTABLE — a power of two in [1, 256] (the `Alignment` newtype's domain), or
-// the 0 "no request" sentinel? A value outside that can never be honored by the
-// layout engine, so it is rejected AT THE SINK rather than silently rounded or
-// dropped downstream (the fail-loud bar). The upstream semantic ladder
-// (`foldAlignmentOperand`) already rejects non-pow2/>256 with a positioned
-// diagnostic; this is the interner-direct backstop for a shipped descriptor, a
-// text round-trip, or a future front end that bypasses it.
+// REPRESENTABLE — inside the `Alignment` newtype's own domain, or the 0 "no
+// request" sentinel? A value outside that can never be honored by the layout
+// engine, so it is rejected AT THE SINK rather than silently rounded or dropped
+// downstream (the fail-loud bar). The upstream semantic ladder
+// (`foldAlignmentOperand`) already rejects a non-power-of-two, and anything above
+// the target's DECLARED `maxRequestedAlignment`, with a positioned diagnostic;
+// this is the interner-direct backstop for a shipped descriptor, a text
+// round-trip, or a future front end that bypasses it.
+//
+// ⚠ P63 (D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN): this
+// predicate used to spell `a > 256u` itself, with a comment calling 256 "the
+// Alignment cap" — the THIRD hand-written copy of a bound the newtype owns. It
+// now ASKS the newtype, so the domain cannot be raised in one place and left
+// stale in another. That is not tidiness: while the three copies existed, raising
+// the semantic ladder alone turned `struct __attribute__((aligned(512)))` from a
+// positioned diagnostic into a `latticeFatal` abort (✔MEASURED, exit 0xC0000409).
 [[nodiscard]] bool representableCompositeAlign(std::uint32_t a) noexcept {
     if (a == 0) return true;                       // no request
-    if (a > 256u) return false;                    // beyond the Alignment cap
-    return (a & (a - 1u)) == 0u;                   // power of two
+    return Alignment::fromBytes(a).has_value();    // pow2 AND in the newtype's domain
 }
 } // namespace
 
@@ -683,7 +692,8 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
                      "wholesale, overriding padding)");
     }
     // D-CSUBSET-COMPOSITE-ALIGNED (TF-C73): the whole-composite alignment must be a
-    // representable alignment (a power of two ≤ 256) or the 0 no-request sentinel.
+    // representable alignment (a power of two the `Alignment` newtype can carry)
+    // or the 0 no-request sentinel.
     // An unrepresentable value CANNOT be honored by `computeLayout`, so it is
     // rejected HERE rather than silently rounded, clamped, or dropped at layout —
     // the fail-loud bar. NOTE this pairs deliberately with packed rather than
@@ -693,7 +703,8 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
     // offsets place fields wholesale, and the aggregate alignment still folds MAX.
     if (!representableCompositeAlign(explicitAlign)) {
         latticeFatal("completeComposite: the whole-composite explicit alignment must "
-                     "be a power of two in [1, 256] (or 0 for no request)");
+                     "be a power of two the Alignment newtype can carry "
+                     "(or 0 for no request)");
     }
     // TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack(N)` cap is held to the SAME
     // envelope, and for the same reason — a value `computeLayout` cannot represent
@@ -704,7 +715,8 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
     // reintern, a hand-built type, a descriptor.)
     if (!representableCompositeAlign(maxFieldAlign)) {
         latticeFatal("completeComposite: the #pragma pack member-alignment cap must "
-                     "be a power of two in [1, 256] (or 0 for no cap)");
+                     "be a power of two the Alignment newtype can carry "
+                     "(or 0 for no cap)");
     }
     if (it->second.complete) {
         // Idempotent for an IDENTICAL re-completion (a benign re-resolution); a

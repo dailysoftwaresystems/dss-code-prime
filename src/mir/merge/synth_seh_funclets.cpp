@@ -7,6 +7,7 @@
 #include "ffi/mangling/c_mangle.hpp"   // applyCMangling (per-format personality name)
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
+#include "mir/mir_struct_markers.hpp"  // rederiveStructCfMarkers (the relayout's duty)
 #include "opt/passes/mir_rebuild_helper.hpp"
 
 #include <algorithm>   // std::max
@@ -746,6 +747,40 @@ bool synthesizeSehFunclets(Mir&                                  mir,
 
     opt::passes::cloneGlobalsVerbatim(mir, builder);
     mir = std::move(builder).finish();
+
+    // Canonicalize StructCfMarkers module-wide from the CFG — the same call, at
+    // the same point, as `realizeEntryShape` (in `synth_pe_startup.cpp`, whose
+    // FILE name is all that survives of the old `synthesizePeStartup`, kept so
+    // `git log --follow` stays intact), `synthesizeStdioShim`,
+    // `synthesizeThreadsShim` and `mergeCuMirs`. This pass was the only module
+    // rebuild in `src/mir/merge/` that did not make it
+    // ([[D-MIR-SYNTH-PASSES-UNVERIFIED-ON-SINGLE-CU-PATH]]).
+    //
+    // ★ WHY IT IS NEEDED HERE, WHICH IS NOT THE REASON THE SIBLINGS NEED IT.
+    // They synthesize MULTI-BLOCK bodies whose blocks are created with default
+    // markers. This pass creates almost nothing — it REORDERS, laying each
+    // guarded region's body out contiguously, and `MirFunctionRebuilder` copies
+    // every source block's stored marker onto its new block. A reorder looks
+    // harmless because the derivation is a function of the CFG, and ✔MEASURED
+    // (cycle P63) it IS harmless for the whole `__try` corpus and for a simple
+    // diamond region. But rules 4 and 5 of the derivation iterate in FUNCTION
+    // BLOCK ORDER and claim FIRST-CLAIM-WINS, so a block that two CondBr heads
+    // would label differently is decided by which head comes first — and moving
+    // a region's exit head in front of a non-region head is precisely what this
+    // relayout does. `SynthSehFunclets.RelayoutLeavesStructCfMarkersCanonical`
+    // builds that shape: without this line it ships `IfThen` where the verifier
+    // derives `IfElse`.
+    //
+    // ⚠ AND THE CONSEQUENCE CHANGED IN THE SAME CYCLE. A stale marker used to be
+    // an invisible inconsistency, because nothing verified behind this pass. The
+    // post-synthesis verify now runs at BOTH driver seams AFTER it, so the same
+    // stale marker is a hard compile REFUSAL on a user's `__try` program. The
+    // fix belongs here, in the pass that moved the blocks — never in the
+    // verifier, which would delete the honesty check to hide the defect.
+    //
+    // Cheap where it does not apply: the fast presence scan has already returned
+    // for every module without a `__try`, so no non-SEH build reaches this.
+    rederiveStructCfMarkers(mir);
 
     // (3) Emit the scope records, re-keyed to the REBUILT module's block ids (the
     //     rebuild minted fresh ids in a new arena). The LIR lowering then maps each

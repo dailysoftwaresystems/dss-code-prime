@@ -468,3 +468,30 @@ dss_add_test(NAME program/test_descriptor_role_follows_the_table
 # APPENDED, never interleaved -- this file is append-only by lane convention.
 dss_add_test(NAME program/test_macho_install_name_identity
              SOURCES test_macho_install_name_identity.cpp)
+
+# D-MIR-SYNTH-PASSES-UNVERIFIED-ON-SINGLE-CU-PATH (P63 lane `sh`): the ORDER half
+# of that closure. Once the SEH pass re-derives its own StructCfMarkers, a correct
+# compiler is silent whether the post-synthesis verify runs before it, after it, or
+# not at all -- the placement is only observable on the NEXT defect. So the pin is
+# structural: at BOTH driver seams the `verifySynthesizedModule` call must FOLLOW
+# the `synthesizeSehFunclets` call, and each must appear exactly once.
+# HOST-INDEPENDENT: nothing is compiled and nothing is run.
+#
+# APPENDED, never interleaved -- this file is append-only by lane convention.
+dss_add_test(NAME program/test_synth_verify_seam_guard
+             SOURCES test_synth_verify_seam_guard.cpp)
+
+# D-MIR-SYNTH-PASSES-UNVERIFIED-ON-SINGLE-CU-PATH (P63 remediation): the
+# BEHAVIOURAL half of the same closure. The seam guard above pins WHERE
+# `verifySynthesizedModule` is called; nothing pinned what it DOES -- measured in
+# P63's review, the function shipped with zero callers anywhere under tests/, so
+# its `I_VerifierFailure` tier diagnostic and the pass list inside it had no pin
+# at all. This calls it directly: a control arm (well-formed module verifies,
+# reports nothing) and a broken arm (one falsified StructCfMarker on a reachable
+# non-entry block) that must be REFUSED naming BOTH the broken rule
+# (I_StructCfMismatch) and the synthesis TIER (I_VerifierFailure).
+# HOST-INDEPENDENT: nothing is compiled and nothing is run.
+#
+# APPENDED, never interleaved -- this file is append-only by lane convention.
+dss_add_test(NAME program/test_synth_verify_failure_path
+             SOURCES test_synth_verify_failure_path.cpp)

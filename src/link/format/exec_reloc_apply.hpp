@@ -456,6 +456,42 @@ namespace dss::link::format {
                                "(D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT).");
                     return false;
                 }
+                case RelocFormulaKind::X86_64GotPcRel: {
+                    // D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS:
+                    // R_X86_64_GOTPCREL names the SLOT that holds the
+                    // symbol's address, not the symbol. `symbolVa` carries
+                    // the symbol's own VA, and DSS's static ET_EXEC path
+                    // synthesizes no `.got` at all, so there is no slot to
+                    // name here. Writing `S + A − P` would emit a DIRECT
+                    // pc-relative reference where an INDIRECT one was
+                    // meant — and ✔MEASURED against a real glibc `exit.o`,
+                    // every plain-GOTPCREL site there is a
+                    // `cmpq $0x0,sym@GOTPCREL(%rip)` weak-undefined NULL
+                    // check, so the fabricated value would be the
+                    // reference site's own address (never zero) and the
+                    // branch would take the wrong arm forever. That is the
+                    // silent-miscompile class, so REFUSE.
+                    //
+                    // Declaring the wire type is what lets a real foreign
+                    // member be READ; giving the resolution a GOT slot is
+                    // separate work the row names, and until it lands this
+                    // arm is the thing standing between a decoded member
+                    // and a wrong artifact.
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         prefixStr + ": relocation '" + tri->name
+                             + "' is an x86_64 GOT-slot-relative reference "
+                               "(R_X86_64_GOTPCREL) — it names the slot "
+                               "HOLDING the symbol's address, and this image "
+                               "has no GOT slot for symbol #"
+                             + std::to_string(rel.target.v)
+                             + ". DSS reads this relocation out of a foreign "
+                               "static-archive member but does not yet "
+                               "synthesize the slot that resolves it; "
+                               "patching a direct pc-relative displacement "
+                               "instead would be a wrong-address miscompile "
+                               "(D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS).");
+                    return false;
+                }
             }
         }
     }

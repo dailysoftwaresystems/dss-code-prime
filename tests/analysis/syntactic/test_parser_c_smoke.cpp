@@ -2753,18 +2753,32 @@ TEST(ParserCSmoke, TypedefAttributeMustNotHijackTheHeadType) {
 
 // `structField`'s child layout with NO decoration — the control half of the
 // index-preservation contract. The declaration row reads `head: 0` /
-// `declaratorList: 1` POST-STRIP, so this string is what those indices mean.
+// `declaratorList: 2` POST-STRIP, so this string is what those indices mean.
+//
+// ⚠ P63 (D-CSUBSET-ATTRIBUTE-MID-DECLARATOR-POSITION-REFUSED): `declAttrRun` now
+// sits between the head and the declarator list, and it is ALWAYS EMITTED (that is
+// the whole point of wrapping a `{repeat}` in a named rule — the index is constant
+// whether or not the run matched anything), so it appears HERE, in the UNDECORATED
+// string, and `declaratorList` moved 1 → 2 in the same commit. A role string that
+// still omitted it would be asserting the pre-P63 shape.
 constexpr std::string_view kUndecoratedMemberRoles =
-    "rule:typeRefAllowingStruct/rule:structMemberDeclaratorList/tok:EndStatement";
+    "rule:typeRefAllowingStruct/rule:declAttrRun/"
+    "rule:structMemberDeclaratorList/tok:EndStatement";
 
-// …and WITH one. `structMemberAttrList` is a TRAILING `{optional}`, so it
-// appends at the end and the two role indices above are untouched. If it were
-// an always-emitted node instead, it would land at index 1 whenever the
-// (optional) declarator list is absent — the `int ;` declares-nothing form —
-// and `declaratorList: 1` would silently address an attribute run.
-constexpr std::string_view kDecoratedMemberRoles =
-    "rule:typeRefAllowingStruct/rule:structMemberDeclaratorList/"
-    "rule:structMemberAttrList/tok:EndStatement";
+// …and WITH one. ★★ P63
+// [[D-CSUBSET-ATTRIBUTE-MID-DECLARATOR-POSITION-REFUSED]]: THE DECORATED FIELD
+// NOW HAS THE **SAME** ROLE STRING AS THE UNDECORATED ONE, because
+// `structMemberAttrList` MOVED OUT of `structField` and into the per-slot
+// `structMemberDeclarator`. A run parked on the FIELD can only ever reach the
+// LAST declarator, so `struct s { int a __attribute__((aligned(16))), b; }` —
+// which gcc 13.3.0 AND clang 18.1.3 both BUILD AND RUN, agreeing on
+// `a=0 b=1 c=2 sizeof 16` for a three-declarator subject — was unreachable by
+// CONSTRUCTION rather than merely unimplemented. Moving the run into the slot
+// is what closes it, and the config loader independently FORCED the move:
+// with the new leading run present and this one left on the field, every
+// subject died at load with `error[C_AmbiguousAlternatives] at
+// /shapes/structField: alt branches share FIRST token 'AttributeKeyword'`.
+constexpr std::string_view kDecoratedMemberRoles = kUndecoratedMemberRoles;
 
 TEST(ParserCSmoke, UndecoratedStructMemberKeepsItsChildLayout) {
     Tree t = parseC("struct S { int x; };\n");
@@ -2773,11 +2787,11 @@ TEST(ParserCSmoke, UndecoratedStructMemberKeepsItsChildLayout) {
     NodeId const field = findFirstNodeWithRule(t, "structField");
     ASSERT_TRUE(field.valid());
     EXPECT_EQ(visibleChildRoles(t, field), kUndecoratedMemberRoles)
-        << "an undecorated member must keep head:0 / declaratorList:1";
+        << "an undecorated member must keep head:0 / declaratorList:2";
 }
 
 // RED-ON-DISABLE (measured): remove `{ \"optional\": \"structMemberAttrList\" }`
-// from `structField` and this input reports, through the real CLI,
+// from `structMemberDeclarator` and this input reports, through the real CLI,
 //   error[P0001]: expected 'EndStatement' — got '__attribute__'
 //   error[P0001]: expected 'EndStatement' — got 'aligned'
 TEST(ParserCSmoke, StructMemberAttributeParsesIntoTheMemberAttrList) {
@@ -2789,21 +2803,57 @@ TEST(ParserCSmoke, StructMemberAttributeParsesIntoTheMemberAttrList) {
     NodeId const field = findFirstNodeWithRule(t, "structField");
     ASSERT_TRUE(field.valid());
     EXPECT_EQ(visibleChildRoles(t, field), kDecoratedMemberRoles)
-        << "the decoration must APPEND — head:0 / declaratorList:1 unmoved";
+        << "the decoration lives in the SLOT now — head:0 / declaratorList:2 "
+           "unmoved, and the field's own role string is unchanged by it";
 
-    // The run must be a DIRECT child of the declaration node, because that is
-    // exactly what `declarationAttrSlotRules` matches. Nested one level deeper
-    // (inside `structMemberDeclarator`, where GNU's per-declarator binding
-    // would put it) the scan cannot see it and the alignment is silently
-    // dropped — so this is a structural pin on the honoring path, not on shape
-    // for its own sake.
+    // ★★ P63: the run must be a DIRECT child of the DECLARATOR SLOT, because
+    // that is what `semantics.declarators.afterDeclaratorAttrRules` matches —
+    // it scans the direct visible children of `memberDeclaratorRule` by rule
+    // id. This USED TO PIN THE OPPOSITE (a direct child of `structField`,
+    // matched by `declarationAttrSlotRules`), and that shape is what made the
+    // after-a-non-last-declarator position unreachable: a run on the FIELD has
+    // no way to say WHICH declarator it decorates, so it resolved to the last
+    // one via `isLast` and every earlier position was a parse error. Both
+    // shapes honor `int x __attribute__((aligned(8)));` identically — for a
+    // LAST declarator "the run on the field" and "the run in the slot" are the
+    // same answer — so this is a structural pin on the honoring path, and the
+    // path moved.
     NodeId const run = findFirstNodeWithRule(t, "structMemberAttrList");
     ASSERT_TRUE(run.valid());
-    EXPECT_EQ(t.parent(run).v, field.v)
-        << "structMemberAttrList must be a DIRECT child of structField — a "
-           "deeper nesting is invisible to declarationAttrSlotRules";
+    NodeId const slot = findFirstNodeWithRule(t, "structMemberDeclarator");
+    ASSERT_TRUE(slot.valid());
+    EXPECT_EQ(t.parent(run).v, slot.v)
+        << "structMemberAttrList must be a DIRECT child of "
+           "structMemberDeclarator — on the field it is invisible to "
+           "afterDeclaratorAttrRules, and it can never reach a non-last "
+           "declarator";
     EXPECT_EQ(visibleChildRoles(t, run), "rule:attrSpec")
         << "the GNU attribute is the run's sole entry";
+}
+
+// ★★★ P63 [[D-CSUBSET-ATTRIBUTE-MID-DECLARATOR-POSITION-REFUSED]] — THE
+// POSITION THE OLD SHAPE COULD NOT EXPRESS. An attribute after a NON-LAST
+// declarator binds to THAT declarator, and nothing else in the list moves.
+// ✔MEASURED, gcc 13.3.0 AND clang 18.1.3 agreeing, three declarators so the
+// candidate bindings give different numbers:
+//   `struct s { char a __attribute__((aligned(16))), b, c; }`
+//     -> a=0 b=1 c=2 sizeof 16 _Alignof 16   (only `a` is over-aligned)
+//   undecorated CONTROL -> a=0 b=1 c=2 sizeof 3 _Alignof 1
+TEST(ParserCSmoke, MemberAttributeAfterANonLastDeclaratorParsesIntoItsOwnSlot) {
+    Tree t = parseC(
+        "struct S { char a __attribute__((aligned(16))), b, c; };\n");
+    ASSERT_NE(t.root(), InvalidNode);
+    ASSERT_FALSE(t.diagnostics().hasErrors())
+        << "gcc and clang both build and run this: " << firstErrorText(t);
+
+    NodeId const run = findFirstNodeWithRule(t, "structMemberAttrList");
+    ASSERT_TRUE(run.valid())
+        << "the decoration must land in a run, never be dropped";
+    NodeId const firstSlot = findFirstNodeWithRule(t, "structMemberDeclarator");
+    ASSERT_TRUE(firstSlot.valid());
+    EXPECT_EQ(t.parent(run).v, firstSlot.v)
+        << "the run belongs to the FIRST slot — the one whose declarator it "
+           "follows — not to the field and not to the last slot";
 }
 
 TEST(ParserCSmoke, UnionMemberAttributeParsesIntoTheMemberAttrList) {
@@ -2831,17 +2881,71 @@ TEST(ParserCSmoke, MemberAttrListDoesNotDisturbBitfieldMembers) {
     EXPECT_TRUE(hasInternalNodeWithRule(t, "bitfieldDeclSuffix"));
 }
 
-// NAMED RESIDUE, pinned so it stays LOUD rather than drifting into a silent
-// mis-parse. `structMemberAttrList` admits the after-LIST position only, so a
-// MID-LIST decoration is rejected. The input is valid C (clang accepts it
-// clean) — this pins DSS's narrower admission, not a claim about the language.
-TEST(ParserCSmoke, MidListMemberAttributeFailsLoud) {
+// ★★★ P63 [[D-CSUBSET-ATTRIBUTE-MID-DECLARATOR-POSITION-REFUSED]] — THIS PIN
+// ASSERTED THE OPPOSITE UNTIL 2026-09-07, AND IT WAS PINNING A UNION VIOLATION
+// AS THE CONTRACT.
+//
+// It used to read `EXPECT_TRUE(t.diagnostics().hasErrors())` under the heading
+// "NAMED RESIDUE … this pins DSS's narrower admission, not a claim about the
+// language". A test is not a trade-off statement — it is the contract, and it
+// is the thing that stops a future cycle fixing the divergence. ✔MEASURED,
+// each reference separately, BUILD **and** RUN, with an undecorated control
+// green in every cell: `struct s { int a __attribute__((aligned(16))), b; }`
+// BUILDS AND RUNS on gcc 13.3.0 AND clang 18.1.3, and the two AGREE on the
+// layout (`a` alone over-aligned, the struct's `_Alignof` raised to 16). Under
+// `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` — the union over what WORKS — two
+// working references make the construct REQUIRED.
+//
+// The refusal it pinned was not a language judgement at all: it was the shape
+// of `structMemberAttrList`, which sat on `structField` and therefore had no
+// way to name a non-last declarator. See
+// `MemberAttributeAfterANonLastDeclaratorParsesIntoItsOwnSlot` above for the
+// positive pin that replaces it, and
+// `MemberAttributeAfterACommaParsesIntoTheFollowingSlot` below for the
+// after-comma position.
+TEST(ParserCSmoke, MidListMemberAttributeParsesAndBindsToItsOwnDeclarator) {
     Tree t = parseC(
         "struct S { int x __attribute__((aligned(8))), y; };\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_TRUE(t.diagnostics().hasErrors())
-        << "a MID-LIST member decoration is residue — it must fail loud, "
-           "never parse into a shape that drops the attribute";
+    ASSERT_FALSE(t.diagnostics().hasErrors())
+        << "gcc and clang both build and run this — a refusal here pins a "
+           "union violation as the contract: " << firstErrorText(t);
+    NodeId const run = findFirstNodeWithRule(t, "structMemberAttrList");
+    ASSERT_TRUE(run.valid()) << "the attribute must be parsed, never dropped";
+}
+
+// ★★★ P63 — THE AFTER-COMMA POSITION, the one whose semantic pin
+// (`SemanticAnalyzerC.MidListMemberAttributeIsStillRefusedLoudly`) also
+// asserted a refusal. ✔MEASURED: clang 18.1.3 BUILDS AND RUNS
+// `struct s { char a, __attribute__((aligned(16))) b; }` AND THE ALIGNMENT
+// REACHES THE SINK — a `static struct s g` asserting `&g.b % 16 == 0` and
+// `offsetof(b) % 16 == 0` at RUN TIME returns 42. gcc, mingw-w64 gcc and MSVC
+// (in its own `__declspec(align(N))` spelling) refuse it, so this is a
+// minority-of-one ACCEPTANCE — and the disjunction decides acceptance.
+TEST(ParserCSmoke, MemberAttributeAfterACommaParsesIntoTheFollowingSlot) {
+    Tree t = parseC(
+        "struct S { char a, __attribute__((aligned(16))) b, c; };\n");
+    ASSERT_NE(t.root(), InvalidNode);
+    ASSERT_FALSE(t.diagnostics().hasErrors())
+        << "clang builds, runs, and lands the alignment at the sink: "
+        << firstErrorText(t);
+    // The run must sit in the slot it PRECEDES, so the binding is `b` alone.
+    // The decorated slot's own child layout is the witness: the attribute run
+    // comes FIRST, the declarator it decorates second.
+    NodeId const run = findFirstNodeWithRule(t, "attrSpec");
+    ASSERT_TRUE(run.valid());
+    NodeId const parent = t.parent(run);
+    ASSERT_TRUE(parent.valid());
+    EXPECT_EQ(visibleChildRoles(t, parent), "rule:attrSpec/rule:declarator")
+        << "the leading run belongs to the declarator SLOT — parked anywhere "
+           "else it would bind to the whole declaration and put `c` at 32 "
+           "instead of 17, a silent wrong layout";
+    // …and that slot is a member-list slot, not the field itself.
+    NodeId const field = findFirstNodeWithRule(t, "structField");
+    ASSERT_TRUE(field.valid());
+    EXPECT_NE(parent.v, field.v)
+        << "a run on the FIELD is declaration-grain and cannot name one "
+           "declarator";
 }
 
 // ── TF-C94: the LEADING member attribute position (`structMemberDeclSpecifier`)
@@ -2858,13 +2962,14 @@ TEST(ParserCSmoke, MidListMemberAttributeFailsLoud) {
 // plus two cascading `— got '('`, all with `scope: Block`.
 //
 // The prefix is child 0 and is STRIPPED by decl_prefix_strip.hpp before
-// positional counting, so the structField row's `head: 0` / `declaratorList: 1`
-// are unmoved — the same contract `structMemberDeclSpecifiers` already had for
+// positional counting, so the structField row's `head: 0` / `declaratorList: 2`
+// are unmoved by the PREFIX (P63 moved the list index for a different reason — the
+// always-emitted `declAttrRun` mid-declarator slot at index 1) — the same contract `structMemberDeclSpecifiers` already had for
 // `alignas`. That is what the role string pins: the attribute must ride the
 // EXISTING prefix rather than becoming a new positional child.
 constexpr std::string_view kLeadDecoratedMemberRoles =
     "rule:structMemberDeclSpecifiers/rule:typeRefAllowingStruct/"
-    "rule:structMemberDeclaratorList/tok:EndStatement";
+    "rule:declAttrRun/rule:structMemberDeclaratorList/tok:EndStatement";
 
 TEST(ParserCSmoke, StructMemberLeadingGnuAttributeRidesTheSpecifierPrefix) {
     Tree t = parseC(
@@ -2929,7 +3034,8 @@ TEST(ParserCSmoke, StructMemberLeadingAlignasStillRidesTheSamePrefix) {
 
 // The two member slots are INDEPENDENT: a leading decoration and the shipped
 // TF-C73 trailing one coexist on one member, each in its own node, and the
-// declarator list still sits between them at role index 1 post-strip.
+// declarator list still sits between them — at role index 2 post-strip since P63
+// put the always-emitted `declAttrRun` mid-declarator slot at 1.
 TEST(ParserCSmoke, MemberLeadingAndTrailingAttributeSlotsCoexist) {
     Tree t = parseC(
         "struct S { __attribute__((aligned(8))) int x __attribute__((aligned(16))); };\n");
@@ -2939,9 +3045,21 @@ TEST(ParserCSmoke, MemberLeadingAndTrailingAttributeSlotsCoexist) {
     ASSERT_TRUE(field.valid());
     EXPECT_EQ(visibleChildRoles(t, field),
               "rule:structMemberDeclSpecifiers/rule:typeRefAllowingStruct/"
-              "rule:structMemberDeclaratorList/rule:structMemberAttrList/"
+              "rule:declAttrRun/"
+              "rule:structMemberDeclaratorList/"
               "tok:EndStatement")
-        << "leading prefix + trailing run must both be present and distinct";
+        << "leading prefix + MID slot on the FIELD; since P63 the TRAILING run "
+           "lives in the per-slot structMemberDeclarator, so it no longer "
+           "appears here — the mid slot is still present even when it matched "
+           "nothing";
+    // The trailing run is still there, one level down, in the slot it decorates.
+    NodeId const run = findFirstNodeWithRule(t, "structMemberAttrList");
+    ASSERT_TRUE(run.valid()) << "the trailing decoration must still be parsed";
+    NodeId const slot = findFirstNodeWithRule(t, "structMemberDeclarator");
+    ASSERT_TRUE(slot.valid());
+    EXPECT_EQ(t.parent(run).v, slot.v)
+        << "the two slots stay INDEPENDENT — the leading one on the field's "
+           "specifier prefix, the trailing one in the declarator slot";
 }
 
 // A member with NO leading decoration must emit NO prefix node — the

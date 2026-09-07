@@ -3262,6 +3262,40 @@ enum class RelocFormulaKind : std::uint8_t {
     // scaled 12-bit GOT-slot offset). Same foreign-linked-only /
     // fail-loud-in-kernel discipline as Aarch64AdrGotPage above.
     Aarch64Ld64GotLo12    = 6,
+    // x86_64 R_X86_64_GOTPCREL = 9
+    // (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS): the
+    // 32-bit displacement of a `<insn> sym@GOTPCREL(%rip)` — a reference
+    // to the SLOT that holds the symbol's address, never to the symbol.
+    // `value = GOTSLOT(S) + A − P`, written 4 LE bytes.
+    //
+    // ★ IT IS A SEPARATE FORMULA KIND, AND THAT IS FORCED BY MEASUREMENT,
+    // NOT PREFERENCE. Declaring it Linear/pcRelative/bias-0/width-4 —
+    // which is what its wire arithmetic looks like — is REFUSED at read
+    // by the FDE disambiguator: `pcrel32` already occupies the
+    // "32-bit PC-relative, no implicit addend bias" description, and a
+    // target declaring two rows matching it makes
+    // D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS unable to say which
+    // one an FDE `initial_location` means. ✔MEASURED 2026-09-07 through
+    // the CLI against a real glibc member.
+    //
+    // ⚠ AND THE INDIRECTION IS THE MEANING, NOT AN ENCODING DETAIL.
+    // ✔MEASURED against `exit.o` of a real distro glibc `libc.a`: both of
+    // its plain-GOTPCREL sites are `cmpq $0x0,sym@GOTPCREL(%rip)` against
+    // a NOTYPE WEAK HIDDEN UND symbol — the weak-undefined NULL check —
+    // and GNU ld 2.42 does NOT relax them in a `-static` link; it
+    // allocates a real `.got` slot and points the displacement at it.
+    // A "relaxation" to a direct PC-relative reference would compare the
+    // reference site's own address, never zero, and silently take the
+    // wrong branch forever. Only the `*_GOTPCRELX` (41) / `REX_GOTPCRELX`
+    // (42) forms are relaxable, and they say so on the wire BECAUSE the
+    // assembler checked the instruction shape.
+    //
+    // DSS synthesizes no GOT in its static ET_EXEC path, so the
+    // `applyExecRelocations` kernel arm is an EXPLICIT FAIL-LOUD REFUSAL
+    // — the same discipline as the two arm64 GOT rows above, and for the
+    // same reason: fabricating `S + A − P` here would patch a direct
+    // reference where an indirect one was meant.
+    X86_64GotPcRel        = 7,
 };
 
 // Single source of truth — `relocFormulaName` + `parseRelocFormulaKind`
@@ -3270,7 +3304,7 @@ enum class RelocFormulaKind : std::uint8_t {
 // on size catches forgetting one half. (architect + type-design
 // 4-agent convergence at post-fold #2 — was previously 3 independent
 // hand-rolled enumerations, DRY hazard waiting for the 5th variant.)
-inline constexpr EnumNameTable<RelocFormulaKind, 7> kRelocFormulaTable{{{
+inline constexpr EnumNameTable<RelocFormulaKind, 8> kRelocFormulaTable{{{
     { RelocFormulaKind::Linear,               "linear" },
     { RelocFormulaKind::Aarch64Call26,        "aarch64_call26" },
     { RelocFormulaKind::Aarch64AdrPrelPgHi21, "aarch64_adr_prel_pg_hi21" },
@@ -3278,6 +3312,7 @@ inline constexpr EnumNameTable<RelocFormulaKind, 7> kRelocFormulaTable{{{
     { RelocFormulaKind::Aarch64TprelAddHi12,  "aarch64_tprel_add_hi12" },
     { RelocFormulaKind::Aarch64AdrGotPage,    "aarch64_adr_got_page" },
     { RelocFormulaKind::Aarch64Ld64GotLo12,   "aarch64_ld64_got_lo12" },
+    { RelocFormulaKind::X86_64GotPcRel,       "x86_64_gotpcrel" },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate

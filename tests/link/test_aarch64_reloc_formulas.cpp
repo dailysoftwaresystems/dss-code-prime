@@ -118,6 +118,9 @@ TEST(RelocFormulaKind, NameRoundTrip) {
     // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the GOT-address pair.
     EXPECT_EQ(relocFormulaName(RelocFormulaKind::Aarch64AdrGotPage),    "aarch64_adr_got_page");
     EXPECT_EQ(relocFormulaName(RelocFormulaKind::Aarch64Ld64GotLo12),   "aarch64_ld64_got_lo12");
+    // D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: the x86_64
+    // GOT-slot-relative reference a real glibc archive member carries.
+    EXPECT_EQ(relocFormulaName(RelocFormulaKind::X86_64GotPcRel),       "x86_64_gotpcrel");
 
     EXPECT_EQ(parseRelocFormulaKind("linear"),                   RelocFormulaKind::Linear);
     EXPECT_EQ(parseRelocFormulaKind("aarch64_call26"),           RelocFormulaKind::Aarch64Call26);
@@ -126,6 +129,7 @@ TEST(RelocFormulaKind, NameRoundTrip) {
     EXPECT_EQ(parseRelocFormulaKind("aarch64_tprel_add_hi12"),   RelocFormulaKind::Aarch64TprelAddHi12);
     EXPECT_EQ(parseRelocFormulaKind("aarch64_adr_got_page"),     RelocFormulaKind::Aarch64AdrGotPage);
     EXPECT_EQ(parseRelocFormulaKind("aarch64_ld64_got_lo12"),    RelocFormulaKind::Aarch64Ld64GotLo12);
+    EXPECT_EQ(parseRelocFormulaKind("x86_64_gotpcrel"),          RelocFormulaKind::X86_64GotPcRel);
     EXPECT_EQ(parseRelocFormulaKind("nonsense"),                 std::nullopt);
     EXPECT_EQ(parseRelocFormulaKind(""),                         std::nullopt);
 }
@@ -156,6 +160,51 @@ TEST(Aarch64GotAddr, ApplyFailsLoudLd64GotLo12) {
     auto p = applyOneReloc(tgt, 0xF9400000u, 0x400000, 0, 0x400000, 0);
     EXPECT_FALSE(p.ok)
         << "DSS must NOT apply an arm64 GOT-lo12 reloc — it is foreign-linked.";
+}
+
+// D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: the x86_64
+// GOT-slot-relative reference. Same discipline as the two arm64 rows above and
+// for a sharper reason — DSS READS this relocation out of a real foreign
+// static-archive member (that is the whole point of declaring it), so a decoded
+// module CAN reach this kernel. `symbolVa` holds the SYMBOL's address; the
+// relocation names the SLOT that holds it, and DSS's static ET_EXEC path
+// synthesizes no `.got`. Writing `S + A − P` would emit a direct reference
+// where an indirect one was meant. ✔MEASURED against a real glibc `exit.o`:
+// every plain-GOTPCREL site there is `cmpq $0x0,sym@GOTPCREL(%rip)` — a
+// weak-undefined NULL check — so the fabricated value would be the reference
+// site's own address, never zero, and the branch would take the wrong arm
+// forever. RED-ON-DISABLE: delete the kernel arm and this build fails
+// `-Werror=switch` on the exhaustive switch over RelocFormulaKind; keep the arm
+// but make it fall through to Linear and this test goes red.
+TEST(X86_64GotPcRel, ApplyFailsLoudRatherThanFabricatingADirectReference) {
+    auto tgt = loadOneRelocTarget("x86_64_gotpcrel");
+    ASSERT_NE(tgt, nullptr);
+    auto const* tri = tgt->relocationInfo(RelocationKind{1});
+    ASSERT_NE(tri, nullptr);
+    EXPECT_EQ(tri->formulaKind, RelocFormulaKind::X86_64GotPcRel);
+    // The addend a real glibc `cmpq $0x0,sym@GOTPCREL(%rip)` site carries.
+    auto p = applyOneReloc(tgt, 0u, 0x400000, -5, 0x400000, 0);
+    EXPECT_FALSE(p.ok)
+        << "DSS must NOT fabricate a direct pc-relative displacement for a "
+           "GOT-slot-relative reference it has no slot for.";
+    // Non-vacuous CONTROL: the SAME module + the SAME addend under a Linear
+    // 32-bit pc-relative row is applied happily. So the refusal is a property
+    // of the FORMULA KIND, not of the fixture (an empty text buffer, a missing
+    // symbol VA, or an out-of-range value would refuse under both).
+    auto linR = TargetSchema::loadFromText(R"({
+      "dssTargetVersion": 1,
+      "target": {"name":"x86_64_test_control"},
+      "relocations":[
+        { "name": "control_pcrel32", "kind": 1, "formula": "linear",
+          "pcRelative": true, "addendBias": 0, "widthBytes": 4 }
+      ],
+      "opcodes":[ {"mnemonic":"invalid","result":"none"} ]
+    })");
+    ASSERT_TRUE(linR.has_value());
+    auto q = applyOneReloc(*linR, 0u, 0x400000, -5, 0x400000, 0);
+    EXPECT_TRUE(q.ok)
+        << "control: the Linear arm applies this exact fixture — so the "
+           "GOTPCREL refusal above is about the formula, not the setup.";
 }
 
 // TF-C52 loader coherence: a GOT-address formula is non-Linear, so
@@ -646,6 +695,12 @@ TEST(ShippedX86_64Target, LinearRoundTripsAllRows) {
 }
 
 // architect Q2 post-fold #1: acceptedRelocFormulaList contains every variant.
+//
+// ⚠ A TEST NAMED "AllVariants" MUST ACTUALLY NAME THEM ALL. When P63 added
+// `x86_64_gotpcrel` this case kept passing while covering 7 of 8 — its exact-string
+// sibling below was extended correctly, so nothing was uncovered, but THIS name went
+// false. A name is a claim like any other figure in this repository, and it rots the
+// same way: by OMISSION, silently, on the day something is added beside it.
 TEST(RelocFormulaKind, AcceptedListContainsAllVariants) {
     auto const list = acceptedRelocFormulaList();
     EXPECT_NE(list.find("'linear'"),                   std::string::npos);
@@ -655,6 +710,7 @@ TEST(RelocFormulaKind, AcceptedListContainsAllVariants) {
     EXPECT_NE(list.find("'aarch64_tprel_add_hi12'"),   std::string::npos);
     EXPECT_NE(list.find("'aarch64_adr_got_page'"),     std::string::npos);
     EXPECT_NE(list.find("'aarch64_ld64_got_lo12'"),    std::string::npos);
+    EXPECT_NE(list.find("'x86_64_gotpcrel'"),          std::string::npos);
 }
 
 // ── Post-fold #2 (second 7-agent audit) ──────────────────────
@@ -667,7 +723,7 @@ TEST(RelocFormulaKind, AcceptedListIsCommaSpaceQuotedExactly) {
               "'linear', 'aarch64_call26', "
               "'aarch64_adr_prel_pg_hi21', 'aarch64_add_abs_lo12', "
               "'aarch64_tprel_add_hi12', 'aarch64_adr_got_page', "
-              "'aarch64_ld64_got_lo12'");
+              "'aarch64_ld64_got_lo12', 'x86_64_gotpcrel'");
 }
 
 // pr-test-analyzer Rating 7: whitespace tolerance pinned as reject

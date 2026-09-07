@@ -1,0 +1,63 @@
+{
+  "$comment": "D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING, the ADDRESS half, inside a SHARED OBJECT -- the arm the corpus did not have. `preemptible_definition_address_control` pins the EXECUTABLE direction (an exec is always its own winner, so every address there must stay direct) on all four legs; NOTHING in examples/ built a shared object that takes the address of its OWN preemptible definition, so the routing this row installs and the walker paths that realize it had no corpus arm at all. This entry builds `dsssubject.c` into a DYNAMIC library for each target -- a .dll on pe64, a .so on both elf64 targets, a .dylib on macho64 -- and links `main.c` against it with `--resolve-library`, the same dependsOn shape `dynlib_resolve_roundtrip` established. WHAT IT ASSERTS, and it needs no rival image to assert it: the library carries BOTH use forms of one identifier -- the RUNTIME address-take (`&w` inside a function, which under a direct-plt dispatch mints a second symbol naming the loader-filled slot) and the STATIC-INITIALIZER form (`int (*p_w)(void) = w;` at file scope, which is a data-item relocation and never reaches the lowering at all) -- and `self_consistent()` compares them INSIDE the library. A build that routes one form and bakes the other gives ONE identifier TWO addresses in ONE image and reds here, with no reference toolchain in the picture and nothing synthetic in the input. The `static` sibling is the IN-OBJECT CONTROL, checked in both forms too: module-private, in no image's dynamic export set, so no loader can replace it under any format, and its address must stay this object's own -- without it, 'the two forms agree' would be equally consistent with 'this build routes every address', which would cost a load through memory to reach a definition nothing can replace. WHY 42 ON EVERY ARM THOUGH THE ROUTING DIFFERS: the declared set is per format -- [global, weak] on the two elf64-*-linux-dyn documents, [weak] on the two macho64-*-darwin-dylib ones, ABSENT on pe64 because Windows has no symbol interposition -- so `w` is routed on three arms and direct on the fourth while `st` is direct on all four. The ANSWER is the same either way, which is the point: what is asserted is not WHICH mechanism was chosen but that every mechanism yields one address for one identifier. RUNTIME, and why exactly one arm declares a runOn -- the same runner fact `dynlib_resolve_roundtrip` records: an exec importing from a dynamic library needs the loader to FIND that library at run time; on Windows the DLL sits beside the exe in the arm's own output directory and the loader searches there, so the pe64 arm RUNS; the elf64 arms would need LD_LIBRARY_PATH or an rpath and the macho64 arm an LC_RPATH, and neither is a capability the runners have, so those three are runOn: [] -- COMPILE-ONLY. ** READ THE pe64 GREEN CORRECTLY: IT IS NOT COVERAGE OF THIS EXAMPLE'S SUBJECT. ** pe64 is the one arm of the four whose format document declares NO preemptibleDefinitionBindings, because Windows has no symbol interposition -- so on the only arm that RUNS, both use forms are baked direct and `self_consistent()` cannot fail. The run arm proves the library links, loads and answers 42; it does not exercise the routing. An earlier version of this comment argued the three compile-only arms lose nothing because 'the Mach-O ADDRESS half's realization is a WALKER event, and a walker that stops binding the address slot cannot emit the image at all -- the darwin arm goes red at BUILD'. That is TRUE of the ADDRESS-SLOT half and FALSE of the STATIC-INITIALIZER half, which is the half this file's `p_w` is about: removing the initializer fold yields a perfectly emittable image that is merely WRONG (the DYLD weak-bind band disappears while the rebase band stays, and the writer returns rc 0), and no compile-only arm can see that. WHAT ACTUALLY COVERS IT, so nobody has to re-derive this: the unit case MachoCoalescingScopeReference.AStaticInitializerNamingAPreemptibleDefinitionIsLoaderResolved, which reds under exactly that mutation; the darwin hardware run; and -- MEASURED 2026-09-07 -- a manual ELF witness anyone can reproduce in a minute, which is worth writing down because it shows the property holding on a SECOND platform under a real loader. Build this directory's two sources for x86_64:elf64-x86_64-linux-{dyn,exec} with --resolve-library, put the .so beside the exe, and run it under Linux: with nothing else it exits 127 (`error while loading shared libraries: dsssubject.so`), because `readelf -d` shows DT_NEEDED holding a bare SONAME and the image carries neither DT_RPATH nor DT_RUNPATH; with `LD_LIBRARY_PATH=.` the SAME binaries exit 42 -- the control that makes the 127 a statement about the search path rather than about the artifact, and the arm on which `w` really is routed (elf64-x86_64-linux-dyn declares [global, weak]). ⇒ turning any of the three compile-only arms into a running one needs a runner that can thread a library search path (tests/examples/examples_runner.cpp and tests/integrated/runner.cpp) or an ELF DT_RUNPATH capability -- a harness/format change, not a change to this example. `optimizedPipelines`: the release arm carries no arm-level mustDifferFromBaseline because main.c is deliberately thin; the assertion that bites is `mustDifferFromBaseline: true` on each dependency, which compares THE LIBRARY'S OWN IMAGE and is the only form that asserts the library was compiled through the arm's pipeline. `lib_mix_sum` is an inlinable static helper inside a loop so that difference is real work rather than incidental, and its result is CHECKED at run time so the optimized library is executed and not merely compared. Leg-by-leg results are NOT recorded here -- whoever runs the legs writes them.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "dependsOn": [
+        {
+          "sources": ["dsssubject.c"],
+          "spec": "x86_64:pe64-x86_64-windows-dll",
+          "artifact": "dsssubject.dll",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [],
+      "dependsOn": [
+        {
+          "sources": ["dsssubject.c"],
+          "spec": "x86_64:elf64-x86_64-linux-dyn",
+          "artifact": "dsssubject.so",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [],
+      "dependsOn": [
+        {
+          "sources": ["dsssubject.c"],
+          "spec": "arm64:elf64-aarch64-linux-dyn",
+          "artifact": "dsssubject.so",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [],
+      "dependsOn": [
+        {
+          "sources": ["dsssubject.c"],
+          "spec": "arm64:macho64-arm64-darwin-dylib",
+          "artifact": "dsssubject.dylib",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

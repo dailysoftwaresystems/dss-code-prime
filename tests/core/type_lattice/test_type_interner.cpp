@@ -402,24 +402,39 @@ TEST(TypeInterner, CompositeExplicitAlignIsPartOfInterningIdentity) {
 }
 
 TEST(TypeInternerDeathTest, CompleteCompositeUnrepresentableAlignAborts) {
-    // FAIL LOUD AT THE SINK: an alignment the layout engine could never honor (not a
-    // power of two, or beyond the `Alignment` newtype's 256 cap) is rejected where it
-    // is stored, not silently rounded/clamped/dropped downstream. The semantic
-    // ladder rejects it first with a positioned diagnostic; this is the backstop for
-    // a shipped descriptor or a future front end that bypasses that ladder.
+    // FAIL LOUD AT THE SINK: an alignment the layout engine could never honor is
+    // rejected where it is STORED, not silently rounded/clamped/dropped downstream.
+    // The semantic ladder rejects it first with a positioned diagnostic; this is the
+    // backstop for a shipped descriptor or a future front end that bypasses it.
+    //
+    // WARNING P63 (D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN):
+    // THIS TEST USED TO ASSERT THAT 512 ABORTS, AND THAT ASSERTION WAS PINNING A
+    // DEFECT AS THE CONTRACT. 512 is an ordinary alignment that gcc 13.3.0 and clang
+    // 18.1.3 both BUILD AND RUN (MEASURED, both spellings, exit 42). What is
+    // genuinely unrepresentable is a NON-POWER-OF-TWO: for a `uint32_t` operand every
+    // power of two is inside `Alignment`'s domain, which is the honest shape of a
+    // STORAGE bound. The POLICY ceiling moved to the target's declared
+    // `aggregateLayout.maxRequestedAlignment`, where the semantic ladder enforces it
+    // with a positioned diagnostic that names the number.
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     auto notPow2 = [] {
         auto ti = makeInterner(1);
         const TypeId n = ti.forwardComposite(TypeKind::Struct, "N", 1);
         ti.completeComposite(n, {}, /*packed=*/false, {}, {}, {}, /*explicitAlign=*/3u);
     };
-    EXPECT_DEATH({ notPow2(); }, "power of two in \\[1, 256\\]");
-    auto tooBig = [] {
+    EXPECT_DEATH({ notPow2(); }, "power of two the Alignment newtype can carry");
+    // The dual, in the OTHER direction, and it is what makes the death arm a
+    // statement about POWER-OF-TWO-NESS rather than about SIZE. Every one of these
+    // aborted before P63; 4096 is a page and 268435456 is gcc's own type-level
+    // ceiling on x86_64, aarch64 and mingw-w64 PE alike.
+    for (std::uint32_t a : {512u, 4096u, 65536u, 268435456u}) {
         auto ti = makeInterner(1);
         const TypeId n = ti.forwardComposite(TypeKind::Struct, "N", 1);
-        ti.completeComposite(n, {}, /*packed=*/false, {}, {}, {}, /*explicitAlign=*/512u);
-    };
-    EXPECT_DEATH({ tooBig(); }, "power of two in \\[1, 256\\]");
+        ti.completeComposite(n, {}, /*packed=*/false, {}, {}, {}, a);
+        EXPECT_EQ(ti.explicitCompositeAlign(n), a)
+            << "explicitAlign " << a << " is a power of two the Alignment newtype "
+               "carries; refusing it here is what refused aligned(4096) up front";
+    }
 }
 
 TEST(TypeInternerDeathTest, CompositeAlignConflictingReCompletionAborts) {

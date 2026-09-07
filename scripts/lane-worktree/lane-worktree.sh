@@ -43,8 +43,13 @@
 #   Both fit. The session-scratch root that produced the anchor does NOT, and this
 #   script now refuses it by arithmetic instead of discovering it by cryptic red.
 #
-# Exit codes: 0 OK - 2 not a repository / git refused - 3 MAX_PATH would be
-#             breached - 4 .worktrees/ is not ignored - 5 usage.
+# Exit codes: 0 OK - 2 not a repository / git refused / a path that cannot be
+#             resolved - 3 MAX_PATH would be breached - 4 .worktrees/ is not
+#             ignored - 5 usage - 6 the worktree is STILL ON DISK after remove,
+#             prune and rm -rf - 7 a scratchpad would be lost (see `cmd_remove`).
+# ⚠ 6 and 7 were implemented and NOT listed here for two cycles; a reader of this
+#   header learned nothing about the very refusal `cmd_remove` leads with. The
+#   `.ps1` twin's header carries the same list, and the two must not drift again.
 set -uo pipefail
 
 MAX_PATH=260
@@ -197,7 +202,25 @@ cmd_add() {  # <name> [committish]
 
   _say "created $rel at $(git -C "$abs" rev-parse --short HEAD)"
   _say "seed manifest reset to empty (this lane starts from the commit, not from uncommitted work)"
-  _say "build into $rel/build/<lane> -- never into the main tree's build/."
+  _say "build into $rel/build/$name -- never into the main tree's build/."
+  # ⚠ THE FIRST BUILD OF A FRESH TREE NEEDS --build-type, AND THIS LINE EXISTS
+  #    BECAUSE THE ORCHESTRATOR KEPT WRITING BRIEFS THAT OMITTED IT.
+  #    `local-build.sh` maps only `dbg` -> Debug and `rel` -> Release, and REFUSES
+  #    (rc 3) to guess one for any other tree name. That refusal is CORRECT and is
+  #    not to be softened: guessing Debug for an unknown lane would hand a
+  #    Release-intending caller a Debug tree silently, which is the
+  #    fails-to-WRONG-ANSWER direction. ✔MEASURED (P63): a lane hit the rc 3, and
+  #    the brief that sent it there had never been run by its author --
+  #    [[D-CYCLE-BRIEF-STATED-AN-INVOCATION-ITS-AUTHOR-HAD-NEVER-RUN]], whose class
+  #    this repository has now paid for more than once.
+  #    ⇒ The command belongs where the lane name is KNOWN, which is here. A
+  #    convention that lives in the orchestrator's head is a convention that
+  #    erodes -- the same argument this file already makes about its own
+  #    scratchpad-preserve step, one verb below.
+  #    ⓘ `--configure` is NOT needed: an absent build.ninja enters the configure
+  #    block on its own. Naming it would teach a redundant flag.
+  _say "FIRST build of this tree:  DSS_JOBS=6 bash scripts/local-build/local-build.sh --tree $name --build-type Debug"
+  _say "        every build after:  DSS_JOBS=6 bash scripts/local-build/local-build.sh --tree $name"
   printf '%s\n' "$abs"
 }
 

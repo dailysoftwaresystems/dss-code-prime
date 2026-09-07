@@ -3475,6 +3475,60 @@ encodeExec(AssembledModule const&    module,
     bool const hasRdata = !rdataDataLayout.empty();
     bool const hasData  = !dataDataLayout.empty();
     bool const hasBss   = !bssDataLayout.empty();
+    // ── D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN (P63):
+    //    fail loud on a STATICALLY ALLOCATED object this image cannot place ──
+    //
+    // A PE image's sections start at RVAs that are multiples of the optional
+    // header's `SectionAlignment` and NOTHING STRONGER, so an item whose own
+    // alignment exceeds that value lands wherever the section base happens to
+    // fall. ✔MEASURED 2026-09-07 with this gate ABSENT and the semantic ceiling
+    // raised: a module with FOUR `__attribute__((aligned(8192)))` statics
+    // separated by odd-sized fillers built rc 0 and returned 50 at run time —
+    // the FIRST object failing its own `address % 8192` check. A clean build
+    // placing an over-aligned object misaligned is a silent miscompile, the one
+    // outcome this project ranks below every diagnostic.
+    //
+    // ★ THE BOUND IS THE FORMAT DOCUMENT'S OWN DECLARED `sectionAlignment`, read
+    // here — not a hardcoded Windows number. A `.format.json` declaring a larger
+    // one raises the ceiling with no code change, which is the same lever
+    // `link.exe` exposes as `/ALIGN`.
+    //
+    // ⚠ THE UNION SAYS THIS CEILING IS REAL, AND SAYS WHERE IT STOPS. ✔MEASURED,
+    // each PE reference probed SEPARATELY: mingw-w64 gcc 13.2.0 refuses a STATIC
+    // above 8192 — *"alignment of 'g' is greater than maximum object file
+    // alignment 8192"* — and MSVC 19.51 refuses `__declspec(align(16384))` as
+    // `error C2345`. Both land on PE's own encoding limit. ★ The CONTROLS are
+    // what make it a statement about STORAGE and not about alignment: the same
+    // compiler BUILDS AND RUNS the same value on a TYPE and on an AUTOMATIC
+    // object. So this gate must never move to the semantic ladder — there it
+    // would refuse `aligned(65536)` types that every reference runs.
+    //
+    // Modelled on `K_ThreadLocalOveralignedForFormat` above, deliberately: same
+    // shape, same tier, same format-local knowledge, one line apart in the code
+    // that would otherwise have grown two different idioms for one idea.
+    {
+        std::uint64_t staticMaxAlign = 1;
+        if (hasRdata) staticMaxAlign = std::max(staticMaxAlign, rdataDataLayout.maxAlign);
+        if (hasData)  staticMaxAlign = std::max(staticMaxAlign, dataDataLayout.maxAlign);
+        if (hasBss)   staticMaxAlign = std::max(staticMaxAlign, bssDataLayout.maxAlign);
+        if (staticMaxAlign > static_cast<std::uint64_t>(sectionAlignE)) {
+            emit(reporter, DiagnosticCode::K_StaticObjectOveralignedForFormat,
+                 std::format(
+                     "pe::encodeExec: a statically allocated object requires "
+                     "{}-byte alignment, but this image's sections begin at "
+                     "multiples of the format document's declared "
+                     "SectionAlignment ({} bytes) and nothing stronger — the "
+                     "object would be placed MISALIGNED with no other sign. "
+                     "Declare a larger `optionalHeader.sectionAlignment` in the "
+                     "object-format document AND raise every non-zero "
+                     "`sections[].virtualAddress` in it to a multiple of the "
+                     "new value (PE/COFF 3.4 requires that, and the loader "
+                     "refuses the document otherwise), or lower the request "
+                     "(D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN).",
+                     staticMaxAlign, sectionAlignE));
+            return {};
+        }
+    }
     // u32 overflow guard (PE/COFF SizeOfImage / virtualSize / sizeOfRawData are
     // u32 wire fields). A producer that lands > 4 GiB in any section would
     // silently truncate at the narrowing casts below; surface it loud.

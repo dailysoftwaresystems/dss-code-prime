@@ -283,6 +283,46 @@ bool optimizeModule(Mir&                  mir,
     return optResult.ok && tierClean(reporter, optEntry);
 }
 
+// ══ VERIFY THE POST-SYNTHESIS MODULE — ONE DEFINITION, BOTH DRIVER SEAMS ═════
+//
+// ★ THE HOLE THIS CLOSES, AND HOW IT WAS FOUND (UCRT-P4). TF-C112 advertised MIR
+// call-site signature checking as covering "wrong arity at every hand-built call
+// in every synthesis pass". MEASURED that it did not: a 3-parameter
+// `int main(int, char**, char**)` compiled rc=0 while the synthesized startup
+// called it with TWO arguments. The verifier's arity rule
+// (`I_CallSignatureMismatch`) is fully CAPABLE of catching that — it reads the
+// callee's FnSig straight off the `GlobalAddr`'s own type, needs no definition
+// and no symbol table — so the defect was pure COVERAGE: the last verify on the
+// single-CU path happened inside `optimizeModule` during the BUILD half, and
+// every synthesis pass ran afterwards, unverified.
+//
+// ★★ WHY IT IS A FUNCTION AND NOT A BLOCK AT EACH SEAM.
+// [[D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY]] is open precisely
+// because the two driver seams drifted into doing different things with the same
+// passes. Two hand-copied verify blocks are that drift's mechanism: each carries
+// its own message, its own pass list, and its own chance of being edited alone.
+// One definition makes "the two seams verify the same thing" true by
+// construction, and leaves exactly one thing for a test to police — the POSITION
+// of each call, which `SynthVerifySeamGuard` reads out of these two files.
+bool verifySynthesizedModule(Mir const&          mir,
+                             TypeInterner const& interner,
+                             DiagnosticReporter& reporter) {
+    MirVerifier verifier{mir, &interner};
+    if (verifier.verify(reporter)) return true;
+    // The verifier has already reported the specific broken invariant (with the
+    // offending instruction); this names the TIER.
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::I_VerifierFailure;
+    d.severity = DiagnosticSeverity::Error;
+    d.actual   = "the module failed MIR verification AFTER the synthesis passes "
+                 "(entry realization / threads shim / stdio shim / SEH funclet "
+                 "synthesis) — a synthesized body broke a structural, SSA or "
+                 "call-signature invariant. This is a compiler defect, never a "
+                 "program error.";
+    reporter.report(std::move(d));
+    return false;
+}
+
 // BUILD half (Cycle 24): semantic analysis → HIR → FFI synthesis → MIR → optimize for
 // ONE CompilationUnit, returning the `CuMirModule` the LOWER half consumes. The
 // `SemanticModel` is MOVED into the result so its `TypeLattice` interner stays alive
@@ -2134,53 +2174,6 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         return std::nullopt;  // recipe/helper-import/va-strategy mismatch — reported.
     }
 
-    // ══ VERIFY THE POST-SYNTHESIS MODULE (UCRT-P4) ═══════════════════════════
-    //
-    // ★ THE HOLE THIS CLOSES, AND HOW IT WAS FOUND. TF-C112 advertised MIR
-    // call-site signature checking as covering "wrong arity at every hand-built
-    // call in every synthesis pass". MEASURED that it did not: a 3-parameter
-    // `int main(int, char**, char**)` compiled rc=0 while the synthesized startup
-    // called it with TWO arguments. The verifier's arity rule
-    // (`I_CallSignatureMismatch`) is fully CAPABLE of catching that — it reads the
-    // callee's FnSig straight off the `GlobalAddr`'s own type, needs no definition
-    // and no symbol table — so the defect was pure COVERAGE: on the single-CU path
-    // the LAST verify happens inside `optimizeModule` during the BUILD half, and
-    // every synthesis pass runs afterwards in this LOWER half, unverified.
-    //
-    // ★ POSITION IS THE WHOLE DESIGN, and it MIRRORS THE MERGED PATH EXACTLY.
-    // On the N>1 path `program.cpp` runs `realizeEntryShape` → threads → stdio and
-    // THEN `optimizeModule`, whose verify covers all three; `synthesizeSehFunclets`
-    // runs after it and is uncovered there too. Placing this verify at the same
-    // point makes the two seams AGREE on what is verified instead of one silently
-    // checking less than the other (`D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY`).
-    //
-    // ⚠ IT DELIBERATELY PRECEDES `synthesizeSehFunclets`, AND THAT RESIDUE IS
-    // STATED, NOT HIDDEN. That pass RELAYOUTS parent blocks to make each `__try`
-    // body PC-contiguous and does not re-derive the StructCf markers the verifier
-    // compares (its three siblings all do, at their own sites). Verifying after it
-    // would therefore red on the marker equality and the layout-position rules for
-    // reasons that are the PASS's to fix, inside `src/mir/merge/`. Extending
-    // coverage over the SEH pass is its own change; what must not happen is this
-    // verify being dropped because that one is harder.
-    {
-        MirVerifier verifier{cuMir.mir, &model.lattice().interner()};
-        if (!verifier.verify(reporter)) {
-            // The verifier already reported the specific broken invariant (with the
-            // offending instruction); this names the TIER so the reader knows a
-            // SYNTHESIS pass produced it rather than the optimizer or the front end.
-            ParseDiagnostic d;
-            d.code     = DiagnosticCode::I_VerifierFailure;
-            d.severity = DiagnosticSeverity::Error;
-            d.actual   = "the module failed MIR verification AFTER the synthesis "
-                         "passes (entry realization / threads shim / stdio shim) — "
-                         "a synthesized body broke a structural, SSA or call-"
-                         "signature invariant. This is a compiler defect, never a "
-                         "program error.";
-            reporter.report(std::move(d));
-            return std::nullopt;
-        }
-    }
-
     // c116 (D-WIN64-SEH-FUNCLETS): synthesize the SEH filter funclets + record the
     // scope ranges (post-optimize; the CU is already optimized here). Trigger =
     // presence of SehTryBegin — a no-op fast-return for the overwhelming majority
@@ -2197,6 +2190,44 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                                sehScopes, reporter)) {
         return std::nullopt;  // unsupported SEH shape (c116b frontier) / no declared
                               // personality — fail-loud.
+    }
+
+    // ══ VERIFY THE POST-SYNTHESIS MODULE ═════════════════════════════════════
+    //
+    // ★ POSITION IS THE WHOLE DESIGN, and it MIRRORS THE MERGE PATH EXACTLY —
+    // `program.cpp` calls the SAME function at the SAME point relative to the
+    // SAME pass, so neither seam can silently verify less than the other
+    // ([[D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY]]). The coverage hole
+    // this closes is documented on `verifySynthesizedModule` itself.
+    //
+    // ⚠ IT USED TO PRECEDE `synthesizeSehFunclets`, AND THE CAVEAT THAT SAID SO
+    // IS REPLACED HERE BECAUSE IT WAS MEASURED FALSE — a stale caveat claiming a
+    // hole that does not exist is its own defect. It read: that pass relayouts
+    // parent blocks to make each `__try` body PC-contiguous "and does not
+    // re-derive the StructCf markers the verifier compares", so verifying behind
+    // it "would red on the marker equality and the layout-position rules".
+    // ✔MEASURED 2026-09-07 (cycle P63), landing this move with that re-derivation
+    // deliberately ABSENT: it does NOT red — `mir/test_mir_merge` and every
+    // `examples/c/seh_*` arm stayed green. `deriveStructCfMarkers` is a function
+    // of the CFG (predecessors, RPO, dominators, post-dominators) and the
+    // relayout REORDERS blocks without adding, removing or repointing one edge.
+    // The claim came from a grep — three sibling passes call
+    // `rederiveStructCfMarkers` and this one did not — that was never run.
+    //
+    // ⓘ The residue is not zero, it is NARROWER than the caveat said, and it is
+    // fixed where it belongs. Rules 4 and 5 of the derivation iterate in FUNCTION
+    // BLOCK ORDER with a first-claim-wins rule, so a block two CondBr heads would
+    // label differently IS order-sensitive; `synthesizeSehFunclets` now re-derives
+    // for exactly that case, and its own call site carries the measurement. This
+    // verify does not depend on that fix — the ordering constraint the row
+    // imposed on this change was measured false — but the fix is what keeps this
+    // verify from turning a latent marker desync into a compile refusal.
+    //
+    // What must NOT happen is this verify moving back in front of that pass
+    // because some future pass is harder to verify behind. `SynthVerifySeamGuard`
+    // reds if it does.
+    if (!verifySynthesizedModule(cuMir.mir, model.lattice().interner(), reporter)) {
+        return std::nullopt;  // the broken invariant + the tier are both reported.
     }
 
     // `nameOf`: SymbolId → the on-binary symbol name = the declared name run

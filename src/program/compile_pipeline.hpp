@@ -91,9 +91,17 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // compiles anything.
 //
 // ★★ AND THE CLASSIFICATION IS PER **ROUTE**, NOT PER ENTRY POINT. The driver
-// reaches `linkAndWriteWithStaticArchives` by THREE routes (the `encode` tier,
-// the N==1 sole CU, the N>1 merge) and `optimizeModule` by THREE (archive
-// member, N==1, merged). Each is a separate argument list a later edit can
+// reaches `linkAndWriteWithStaticArchives` by
+// <!--census:source:program.staticArchiveLinkRoutes-->4 routes (the `encode`
+// tier, the N==1 sole CU, the N>1 merge, and the archive-member link) and
+// `optimizeModule` by THREE (archive member, N==1, merged).
+// ⚠ This said THREE until P63. The fourth route was a real call site the prose
+// never absorbed — and the miscount is instructive, because the argument this
+// very paragraph makes is that ROUTES are what a later edit changes
+// independently. It undercounted the thing it was arguing about. The figure is
+// now census-bound and matched on the CALL form, never the bare name: this file
+// mentions the function five times in prose, so a name-only count returns nine.
+// Each route is a separate argument list a later edit can
 // change independently — which is exactly how a parameter ends up threaded to
 // two call sites out of three. A pin on one route says NOTHING about the
 // others, so every citation below names its route.
@@ -110,14 +118,34 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // 21. ✔RE-MEASURED: that command returns 22, because THIS COMMENT contains the
 // very token it counts — the citation went stale the moment it landed, inside
 // its own cycle, which is the same failure mode as citing a line number. Anchor
-// the pattern to the START of a declaration line and no prose can pollute it,
-// because every line in this block opens with a slash pair:
-//     grep -cE '^(struct |\[\[nodiscard\]\] )?DSS_EXPORT' <this header>  = 21
-// — EIGHTEEN exported functions plus three exported structs (`CuMirModule`,
-// `EntryCandidate`, `ResolvedEntry`). Driver call-site counts below come from a
-// COMMENT-STRIPPED scan of `src/program/program.cpp` — 21 call sites over 13 of
-// the 18 entry points. A raw grep over-counts there too: `linkAndWrite`
-// "appears" twice and both occurrences are prose.
+// the pattern to the START of a declaration line and no prose can pollute it.
+//
+// ⚠⚠ AND THAT WAS STILL NOT ENOUGH. THE RE-ANCHORED INSTRUMENT WENT STALE BY SIX.
+// ✔MEASURED 2026-09-07 (cycle P63): the anchored count had been 21 here while the
+// tree said 27, and this block carried SEVEN false figures at once — the total,
+// both halves of the split, an `isArArchiveFile` driver call that is 0 and not 1,
+// "THREE routes" that are four, and a manifest ratio wrong in both terms. Nothing
+// in the paragraph above is wrong; the author reasoned correctly, fixed the real
+// pollution bug, and explained it — **and the number rotted anyway, because a
+// figure in a comment has no instrument attached.** ★ Care is not the missing
+// ingredient. A COMPARISON is. The figures below now carry
+// `<!--census:source:<key>-->` markers bound to `scripts/check-doc-census/source-census.json`,
+// so `doc_census_guard` re-derives them on every ctest run and a drift is a RED
+// rather than a discovery. The PATTERN lives in that document, not here — a
+// pattern quoted in prose is prose, and rots exactly like the number did:
+//     <!--census:source:program.exportedDecls-->28 exported declarations
+// — <!--census:source:program.exportedFunctions-->24 exported functions plus
+// <!--census:source:program.exportedStructs-->4 exported structs (`CuMirModule`,
+// `EntryCandidate`, `ResolvedEntry`, `ResolveLibraryPartition`).
+//
+// ⚠ THE CALL-SITE FIGURES BELOW ARE **NOT** MACHINE-CHECKED, and that is stated
+// rather than left to be assumed from the markers above. Driver call-site counts
+// come from a COMMENT-STRIPPED scan of `src/program/program.cpp` — 28 call sites
+// over 18 of the 24 entry points — and neither is expressible as a census CLAIM,
+// which binds one integer to one line-count: "18 of 24" is a DISTINCT count and
+// the ratio further down is a RATIO. They were corrected by hand in P63 and are
+// unguarded. A raw grep over-counts there too: `linkAndWrite` "appears" twice and
+// both occurrences are prose.
 //
 // ── A. NO DRIVER SEAM — `program.cpp` never calls these ────────────────────
 // `effectiveLongDoubleFormat`, `compileSingleUnit`, `assembleUnit`,
@@ -199,8 +227,16 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 //   `program/test_driver_argument_supply`
 //   `DriverArgumentSupply.MergedMultiCuRouteSuppliesTheFormatsEntryVerbs`.
 //
-// `isArArchiveFile` (1) — the supply risk is the driver not making the CALL, so
-//   a `.a` on `--resolve-library` goes to the dynamic export reader. PINNED by
+// `isArArchiveFile` (**0** — ⚠ this said "1" until P63, and 0 is not a smaller
+//   number, it is a DIFFERENT CLAIM: `program.cpp` never calls this predicate, so
+//   the entry belongs with section A's no-driver-seam group and the "(1)" was
+//   asserting a seam that does not exist. ⓘ Left unbound by the census on
+//   purpose — every occurrence of the name in that file is PROSE, and the source
+//   provider counts matching lines without stripping comments, so a marker here
+//   would bind to 3 and be confidently wrong. An instrument that cannot express a
+//   claim must not be pointed at it) — the supply risk is precisely the driver
+//   not making the CALL, so a `.a` on `--resolve-library` goes to the dynamic
+//   export reader. PINNED by
 //   `program/test_static_link` `StaticLink.DriverStaticLinkBuildsSelfContainedExec`
 //   (`StaticLink.ArMagicDispatchByBytesNotExtension` is the UNIT half — it calls
 //   this predicate directly and cannot see the driver skipping it).
@@ -313,13 +349,23 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // allocation outcome, it belongs here in place of the run.
 //
 // ── AND WHAT THE MERGED ROUTE COSTS TO REACH AT ALL ────────────────────────
-// ✔MEASURED — by walking `examples/` for directories carrying an
-// `expected.json` and counting their `.c`/`.s` files — the merged route is
-// reachable ONLY through `Program::compileUnits` with ≥2 sources, and 22 of 613
-// shipped corpus example manifests have ≥2 such sources, so the corpus
-// exercises it about 3.6% as often as the single-CU route. (An earlier
-// spelling of this line said "22 of 614" with no instrument named; the
-// numerator reproduces, the denominator does not — hence the instrument.)
+// ✔MEASURED — the merged route is reachable ONLY through
+// `Program::compileUnits` with ≥2 sources, and
+// <!--census:examples:top.sources-->26 of the
+// <!--census:examples:manifests-->815 shipped corpus example manifests declare a
+// multi-source `sources` array, so the corpus exercises it roughly 3% as often
+// as the single-CU route.
+// ⚠ THE RATIO IS THE ONE FIGURE HERE THAT IS **NOT** MACHINE-CHECKED — a census
+// CLAIM binds one integer to one count, and a percentage is neither. It is left
+// deliberately coarse ("roughly 3%") so that it cannot be precisely wrong; the
+// two integers it is derived from ARE bound, so a reader can recompute it.
+// ★ THIS LINE HAS NOW BEEN WRONG THREE TIMES, EACH TIME MORE CAREFULLY. It began
+// as "22 of 614" with no instrument; a later cycle named an ad-hoc walk and made
+// it "22 of 613"; ✔P63 measured that BOTH numerator and denominator had drifted
+// again. The repair is not a fourth hand count — it is deleting the bespoke walk
+// in favour of the corpus census that already ships, so the figure is derived by
+// the same instrument that derives every other corpus number in this repository
+// and is compared on every ctest run.
 // That ratio is why this route accumulated the gaps, and why
 // each pin above builds its own 2-CU program rather than reusing a fixture: a
 // pin that quietly lost its second source would keep passing while testing the
@@ -972,6 +1018,25 @@ optimizeModule(Mir&                  mir,
                // per-CU here, whole-program in `Program::compileOneTarget` —
                // because a body surviving either optimize reaches codegen.
                std::span<ExternImport const> externImports = {});
+
+// The POST-SYNTHESIS MIR verify, run by BOTH driver seams — `buildCuMir`'s LOWER
+// half here and `Program::compileOneTarget` on the merge path — immediately
+// after the LAST synthesis pass (`synthesizeSehFunclets`). Returns true iff the
+// module verifies; on failure `MirVerifier` has already reported the specific
+// broken invariant and this adds one `I_VerifierFailure` naming the synthesis
+// TIER, so a reader knows a synthesized body produced it rather than the
+// optimizer or the front end.
+//
+// ★ ONE FUNCTION, NOT A BLOCK COPIED INTO EACH DRIVER, and that is deliberate:
+// [[D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY]] exists because the two
+// seams can silently come to check different things, and a hand-copied block is
+// exactly how that happens. With one definition the only remaining degree of
+// freedom is WHERE each seam calls it — which is what the source-order guard in
+// `tests/program` pins. See the definition for the coverage hole this closed.
+[[nodiscard]] DSS_EXPORT bool
+verifySynthesizedModule(Mir const&          mir,
+                        TypeInterner const& interner,
+                        DiagnosticReporter& reporter);
 
 // LOWER half: MIR → LIR → liveness → regalloc → rewrite → legalize → callconv →
 // assemble → symbol-table populate → user-entry scan. Consumes the `CuMirModule`

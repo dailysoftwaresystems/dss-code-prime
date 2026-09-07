@@ -588,3 +588,20 @@ dss_add_test(NAME link/test_elf_image_symtab_partition
 # divergence coming back.
 dss_add_test(NAME link/test_preemptible_definition_declaration
              SOURCES test_preemptible_definition_declaration.cpp)
+
+# D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: the relocation
+# VOCABULARY of the ELF relocatable-object reader, measured on REAL members of a
+# REAL distro glibc `libc.a` (embedded as golden fixtures) rather than on a
+# synthesised object -- a DSS-emitted object is written by the same table the
+# reader reads back, so it can never carry a wire type DSS has not declared and
+# can never exercise this. Its own target because the three properties it pins
+# pull in opposite directions (the guard REFUSES an undeclared type, one more
+# declared row makes a real member READ, and that row must not make the guard
+# permissive) and a shared binary would let one of them go vacuous unnoticed.
+dss_add_test(NAME link/test_glibc_relocation_vocabulary
+             SOURCES test_glibc_relocation_vocabulary.cpp)
+# Splices ONE extra `relocations[]` row into the SHIPPED target + format documents,
+# deriving the free `kind` FROM the document rather than hardcoding it -- hence the
+# json link, the same pattern the COFF reader pin above uses.
+target_link_libraries(dss_link_test_glibc_relocation_vocabulary
+                      PRIVATE nlohmann_json::nlohmann_json)

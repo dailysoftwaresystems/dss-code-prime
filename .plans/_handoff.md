@@ -9,11 +9,230 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-09-06 — cycles **P14 … P62**. ⚠ P52 rewrote no handoff at all, so a reader who opened this file during P53 saw P51 described as current state; that entry in §5 was written after the fact and says so.
+**Last updated:** 2026-09-07 — cycles **P14 … P63**. ⚠ P52 rewrote no handoff at all, so a reader who opened this file during P53 saw P51 described as current state; that entry in §5 was written after the fact and says so.
 
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
+
+**Cycle P63 closed 2026-09-07.** **FIVE lanes plus a sixth harness lane, four independent reviews and
+four remediations**, on top of P62 (`79746d80`). **Every lane was independently reviewed; every review
+found a real defect, and two found BLOCKING ones.**
+
+✔**REAL: 7 rows closed, 0 opened.** ✔**COUNTED by `check-anchor-balance --base 79746d80`:
+5 closed, 0 opened, net −5 (801 → 796; registry 460 → 455).**
+⚠ **The gate's 5 and the real 7 differ for two DIFFERENT reasons, and the second is worse than the
+first.** One row was **born closed** inside the cycle (`D-HARNESS-DOC-CENSUS-BLIND-TO-A-FIGURE-IN-A-SOURCE-COMMENT`),
+invisible from both bases — the familiar case. The other was **FALSELY closed before the cycle
+began**: `D-CYCLE-LANE-WORKTREE-REMOVE-DISCARDS-AN-UNPRESERVED-SCRATCHPAD` read ✅ while the defect it
+names was still live in the PowerShell twin. **A real fix landed and no counter can see it, because
+the counter had already been told the work was done.**
+✔**Per bucket, re-derived with the sanctioned reader: production 268 OPEN · harness 187 OPEN**
+(268 + 187 = 455, which equals the gate's registry total — that sum is the cross-check).
+★ **P0 began and ended empty.**
+
+## ★★★ THE THROUGH-LINE: **AN ENUMERATION IS NEVER COMPLETE BECAUSE SOMEONE COUNTED IT**
+
+P58 doubted the ROW. P59 the GUARD. P60 the LANE'S OWN CLOSING CLAIM. P61 asked what a green
+whole-tree gate cannot see. P62 doubted the row's prescribed REMEDY. **P63 doubts the COUNT** — and it
+held every single time it was tested:
+
+| the count | grew to | who found the extra, and by asking what |
+|---|---|---|
+| spellings of the `> 256` alignment cap | **1 → 3 → 4 → 5** | brief measured one · lane made three work · reviewer asked *where else could this value live* · remediation swept and found a fifth |
+| divergences between the `lane-worktree` twins | **2 → 6** | I read two · the lane audited the pair and ran both |
+| false figures in one `compile_pipeline.hpp` comment | **1 → 7** | I measured one · the reviewer read the block |
+| stale `ncmds` blocks in `macho.cpp` | **2 → 3** | the reviewer found two · the remediation re-read adversarially and found the CODE defect under them |
+| kinds of `dylibOrdinal` call site | **2 → 3** (over 5 sites) | the docblock enumerated four of five |
+| routes to `linkAndWriteWithStaticArchives` | **3 → 4** | a paragraph arguing that ROUTES matter had miscounted its own |
+
+⇒ **The lane that reports "there were N" has reported the number it FOUND, never the number there
+are.** The difference between the two questions is the whole result: *"did the sites I found change?"*
+finds nothing new; *"where else could this live?"* finds the next one, every time.
+⇒ **Ask a second party for the enumeration, and ask for the SEARCH rather than the number.**
+
+## §0.1 — SIX REFUTED PREMISES, and three of them were MINE
+
+P62's lesson was that a row's REMEDY decays. P63 shows the same is true of anything an author asserts
+without re-measuring — **including a brief written two days earlier**.
+
+1. **The row's ordering constraint** (`sh`) — *"(b)+(c) must not land without (a) or the gate reds on
+   every `__try` TU"*. ✔Landed (b)+(c) with (a) absent: **8 of 8 green, zero `__try` TUs red.**
+2. **The row's stated CAUSE** (`sh`) — reached by grep, never run. `deriveStructCfMarkers` is a
+   function of the CFG; the relayout reorders blocks without touching an edge. What is true is far
+   narrower: rules 4/5 iterate in FUNCTION BLOCK ORDER with first-claim-wins.
+3. **The row's prescribed relaxation** (`gp`) — *would have been a SILENT MISCOMPILE.* The GOTPCREL
+   sites in glibc's `exit.o` are `cmpq $0x0,sym@GOTPCREL(%rip)` against weak-undefined symbols;
+   GNU ld, lld **and** gold all refuse to relax. Relaxed, the compare tests its own address and is
+   never zero. ★ The reviewer added the control that clinches it: one of the two slots really does
+   hold 0 at run time.
+4. **MY brief's "the config is withheld in a patch"** (`mu`) — ✔FALSE at HEAD; both darwin documents
+   already carried the key, and the comment beside it narrates the withholding *in the past tense*. I
+   relayed a two-day-old scratch note instead of reading the tree.
+5. **MY brief's "the ceiling is what the format can ENCODE"** (`al`) — there are **two** ceilings at
+   two tiers. On PE at 16384 the TYPE builds and runs, an AUTOMATIC object builds and runs, only a
+   STATIC object is refused. A format ceiling in the semantic tier would refuse types all four
+   references run.
+6. **MY brief's binding rule** (`alr`) — and this one is the sharpest. Every earlier subject (the
+   lane's, the reviewer's, mine) had **TWO declarators, where the candidate bindings COINCIDE.** With
+   three, clang gives `a=0 b=16 c=17` ⇒ **per-declarator** for the mid positions, while the leading
+   position is per-declaration. Shipping my rule would have put `c` at 32 — a silent wrong layout.
+   ⇒ ★★ **A fixture with N=2 cannot separate two hypotheses that agree at N=2.** Size the fixture to
+   the hypotheses, not to the feature.
+
+Also refuted, and the refutation made the conclusion STRONGER rather than killing it: the reviewer's
+*"LC_UUID is the only undeclared load command"* was **false** (three others are undeclared, and
+correctly) — but the writer's real rule, **declare what the reference makes a per-link POLICY**, holds
+with no exception across thirteen commands, and `ld -no_uuid` / `-random_uuid` both exist. The
+declaration was owed for a reason nobody had stated.
+
+## §0.2 — WHAT LANDED
+
+**`al` + `alr` — two P1 C-conformance rows ✅✅.** The `aligned(N)` ceiling was a hardcoded `256`
+spelled in **five** places; raising one turned a diagnostic into a **compiler abort**
+(`latticeFatal`, `0xC0000409`). `Alignment` now owns its domain and the others ask it; the policy
+ceiling is a declared `.target.json` key (`maxRequestedAlignment`, 268435456 on both targets),
+validated pow2 / representable / **not below `maxAlignment`** — that last arm exists because reusing
+`maxAlignment`, which sits right next to the decision and means *the ISA's largest FUNDAMENTAL
+alignment*, would have refused `aligned(32)`. **A silent miscompile was found on the way**: a PE image
+with four `aligned(8192)` statics built rc 0 and placed the first MISALIGNED. ELF places all four
+correctly, so the new `K_StaticObjectOveralignedForFormat` gate is PE-local **by measurement**.
+Three attribute positions the union requires now build and run; two shipped pins that ASSERTED the
+refusal are inverted. ⓘ Bonus: the same grammar change closed conformance probe
+`b_elided_struct_member_declarator` — DSS now rejects `struct T { int a, , b; };` like all three
+references.
+
+**`mu` + `mur` — `D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING` ✅ and `D-LK-MACHO-EMITS-NO-LC-UUID` ✅.**
+Run-witnessed on real Apple Silicon with an ld64 control answering identically in the same run. ★ The
+lane found **a third Mach-O half nobody had named**: the static-initializer form emitted a bare rebase
+where ld64 emits that rebase **plus** a weak bind — *silently the wrong answer, every gate green*.
+LC_UUID is content-derived (the reviewer independently recomputed the derivation and matched it on
+four artifacts), stamped before the ad-hoc signature, and — after `mur` — **declared in the format
+documents** rather than emitted unconditionally from code.
+
+**`sh` + `shr` — `D-MIR-SYNTH-PASSES-UNVERIFIED-ON-SINGLE-CU-PATH` ✅.** One shared
+`verifySynthesizedModule` called from BOTH driver seams after the last synthesis pass, and
+`synthesizeSehFunclets` re-derives its markers like its siblings. ⚠ The new source-order guard shipped
+**VACUOUS against a commented-out call** and the reviewer caught it: it now matches over a comment-
+and literal-blanked copy of the file, and its "three ways this reopens" claim was widened to four by
+the same change that widened the coverage.
+
+**`dc` — `D-HARNESS-DOC-CENSUS-BLIND-TO-A-FIGURE-IN-A-SOURCE-COMMENT` ✅ (born closed).**
+`check-doc-census` now scans source files, keyed on a **declared** suffix constant, with a `source`
+provider whose regex is DATA — never re-typed in the comment it checks. Self-test 20 arms → 28.
+★ Escape reach measured in the direction the standing rule demands: 35 of 38 markers reach the
+comparison, and **zero** of the 178 excluded files carries a marker.
+
+**`lw` — `D-CYCLE-LANE-WORKTREE-REMOVE-DISCARDS-AN-UNPRESERVED-SCRATCHPAD` ✅ re-closed, amended.**
+See §0.3.
+
+**`gp` — `D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS` 🟠 STAYS OPEN**, the cycle's
+one open row, with its remedy refuted twice and the residue attributed. The wire type is now declared
+and the reader accepts it; a real glibc `exit.o` READS. What is left is a static `.got` in the
+ET_EXEC path — ✔scoped by the reviewer as **two files and NO config change**.
+
+## §0.3 — THE FINDING WORTH CARRYING FURTHEST: **TWO CLOSED ROWS HAD LANDED ON ONE TWIN**
+
+`lane-worktree.sh` and `lane-worktree.ps1` are one behaviour in two files. **P46's
+remove-then-verify-then-speak and P50's scratchpad gate had each fixed a real defect, pinned it, and
+closed its row — on the `.sh` only.** The `.ps1` still carried both verbatim, plus four more
+divergences (six total; one found only by running both twins back to back, where `list` reported the
+internal manifests directory *as a lane*).
+
+⇒ **A guard written against one implementation certifies that implementation, not the behaviour** —
+so neither row's pin could see the other twin, both ✅s were half true, and nothing in the project
+could tell. The guard now drives BOTH twins (13 assertions / 9 arms → **27 / 18**) and probes for
+`pwsh` **by execution against the subject**, so an absent interpreter is a loud CANNOT-RUN.
+⇒ **Before closing a row, ask: is there a second implementation of this behaviour, and did my pin run
+against it?**
+
+## §0.4 — WHAT THE ORCHESTRATOR GOT WRONG
+
+1. ⚠⚠ **I ran a gate against a build directory another process was already using**, got
+   2100/2101 with one red, and `run-gate` reported `inputs : held still`. **That run had no verdict.**
+   The bracket I built in P62 watches the SOURCE moving; contention on the BUILD DIRECTORY invalidates
+   a verdict identically and is unwatched. I built a guard against one of the two ways a gate can lie
+   and walked into the other within a cycle. **Lane `hg` closes it.**
+2. **Three brief premises of mine were false** (§0.1, items 4–6). All three came from relaying a note
+   or a prior measurement instead of re-reading the tree. **A scratch note from last cycle has exactly
+   the shelf life of a row's premise.**
+3. **My own hand-rolled counters were wrong twice in three minutes** while reconciling the per-bucket
+   split (189, then 185, against the sanctioned reader's 187). The standing rule against re-typing the
+   "is this row open" vocabulary earned itself again.
+4. **I nearly acted on a lane's blocked-file report as if it were a workaround.** `al` said it was
+   blocked by `compile_pipeline.cpp` and chose a different design; the reviewer settled it with a
+   measured counterfactual — the alternative would refuse types mingw runs. **The design was right and
+   the blocked-file report was a red herring.**
+5. **I told a lane there were four worktrees; there were five.** I had created the fifth myself an
+   hour earlier.
+6. ⓘ Two smaller ones, both caught by the next check: a grep for a phrase that WRAPS a line reported
+   my own edit missing, and the first draft of a citation-conversion script **quoted the two
+   positional citations it was removing** — its own post-condition refused it.
+
+## §0.5 — WHAT P64 INHERITS, IN PRIORITY ORDER
+
+1. **`D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS`** (P1, the one open row) — the
+   static `.got` synthesis. ✔Scoped: `elf.cpp` + `exec_reloc_apply.hpp`, **no config change**, one
+   lane. ⚠ The reviewer believes the row still cannot close because TLS types 22/23 remain; I judge
+   those belong to `D-LK-DYN-TLS-MODEL`, which exists. **Measure before deciding.**
+2. **THE FIFTH ALIGNMENT-CAP SPELLING**, unclaimed: `mir_text.cpp`'s `kMirTextMaxGlobalAlignBytes = 256`
+   — its writer emits `align=N` unbounded and its reader refuses >256, paired in shipped code by
+   `mir_body_codec.cpp`. ✔MEASURED latent (not reachable through the ordinary CLI).
+3. **PE static over-alignment** — a live union violation. ⚠ **Both stated reasons for deferring it are
+   wrong**: mingw runs an 8192-aligned static with `SectionAlignment` **unchanged** at 0x1000, padding
+   *within* `.bss`. So it is neither behind `linker.cpp` nor a document raise; the fix is offset
+   placement in `pe.cpp`.
+4. **ELF build-id** — ✔a real union violation, measured with the control the lane omitted: gcc **and**
+   clang emit a reproducible `.note.gnu.build-id` at default flags on exec **and** `.so`,
+   `-Wl,--build-id=none` removes it, and DSS emits **no `SHT_NOTE` at all**.
+5. **Three attribute/alignment residues, each with its measurement in the closed rows**: MSVC `/DEBUG`
+   PE debug-directory (stated **unmeasured**), `MH_NOUNDEFS` set on dylibs carrying a UND row where
+   ld64 carries none, and `D-LK-DYN-TLS-MODEL` inheriting GOTTPOFF/TPOFF32.
+6. **Two figures in `compile_pipeline.hpp` remain unguarded ON PURPOSE** — a DISTINCT count and a
+   RATIO, neither expressible as a census CLAIM. Corrected by hand and marked as unguarded.
+
+## §0.6 — THE GATE — **FOUR CARRIAGES plus the in-leg qemu WITNESS**
+
+✔**ALL GREEN, and every leg through `scripts/run-gate/` with a tool-emitted witness and
+`inputs held still`.**
+
+| carriage | result |
+|---|---|
+| **Windows** (`build/dbg`, direct) | **2114/2114**, rc 0, 796 s |
+| **WSL x86_64** (direct) | **2114/2114**, rc 0, 451 s |
+| **macOS arm64** (real Apple Silicon) | **2088/2088**, rc 0, 910 s |
+| **arm64 VPS, NATIVE** (`--carriage arm64-vps`) | **2088/2088**, rc 0, 1230 s |
+| *arm64 under qemu* — **an in-leg WITNESS the WSL leg carries, NOT a carriage** | `c/builtin_bitcount`: **6 verified, 6 ran**, 0 poisoned |
+
+✔**The counts reconcile in both directions.** Base **2099** + `sh` 2 + `gp` 1 + `mu` 2 + `al` 6 +
+`alr` 4 = **2114**, derived from the RUN and then checked against the parts, never summed from lane
+reports. The indirect legs are **2088 = 2114 − 26 repo guards**, which every indirect leg skips by the
+standing 2026-08-25 ruling.
+
+★★ **AND THIS TIME THE NATIVE arm64 LEG RAN BEFORE THE COMMIT, NOT AFTER.** P62 shipped two commits
+before it ran and recorded the wrong order rather than amending it away; the operator had caught the
+prior cycle reaching "four legs" **by substitution**, counting arm64-under-qemu as a carriage. It is
+not one — it is a witness the WSL leg carries, and `[[reference_operational_gotchas]]` records that it
+is **BLIND to unaligned-atomic faults**. This cycle shipped `.target.json` alignment keys and linker
+changes, so emulation could not have stood in.
+
+⚠ **ONE RED WAS FOUND AND FIXED BEFORE THIS RUN, AND IT IS THE ONE I HAD PREDICTED IN WRITING.**
+`plan_citations_guard` refused at 2113/2114: closing a row MOVES it production → done, and the ratchet
+refuses a ceiling that is EXCEEDED **or STALE**. Because `sh`'s two positional citations were
+CONVERTED rather than carried, the archive stayed inside its ceiling and only production went slack —
+294 against a live 292. Lowered in the same commit with `--write`, a verb that only ever lowers.
+★ Both converted citations were **factually wrong** as well as positional: one labelled *the
+unverified seam* pointed at a `MirSourceMap` comment, the other labelled `I_CallSignatureMismatch`
+landed on the `I_NotDominated` arm. Each had drifted onto unrelated code while its LABEL went on
+asserting the old target — **the citation read as precise and was false.** That is the standing
+"never cite a line number" rule measured rather than asserted.
+
+⚠ **WHAT THIS GATE DOES NOT COVER:** `.plans/_handoff.md` was edited AFTER the whole-tree run above
+(this block is that edit). The three guards that read `.plans/` at test time —
+`plan_citations_guard`, `anchor_registry_guard`, `doc_census_guard` — were re-run afterwards and are
+green; the 2114 figure predates this paragraph and is stated so rather than implied to cover it.
+
+---
 
 **Cycle P62 closed 2026-09-06.** **EIGHT lanes in two waves, plus six remediations, four independent
 reviews and the orchestrator**, on top of P61 (`ed1ac9c4`), committed in two parts.

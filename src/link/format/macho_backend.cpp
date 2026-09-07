@@ -550,6 +550,64 @@ public:
                             im.at("useChainedFixups").get<bool>();
                     }
                 }
+                // D-LK-MACHO-EMITS-NO-LC-UUID (increment 2/2) — the image's
+                // LC_UUID. Optional nested object; ABSENT = no LC_UUID, which
+                // is what every MH_OBJECT flavour wants and what `clang -c`
+                // emits. Present = the walker emits a `uuid_command` and
+                // stamps the payload from the image's own content. Declared
+                // rather than unconditional because the reference exposes it
+                // as a per-link policy on both axes (`-no_uuid`,
+                // `-random_uuid`) — the measurement, and the discriminator
+                // that keeps this from meaning "declare every load command",
+                // are in `MachOUuid`'s docblock. `derivation` is a CLOSED
+                // vocabulary: a typo fails loud here rather than silently
+                // getting the content hash.
+                if (im.contains("uuid")) {
+                    auto const& uu = im.at("uuid");
+                    if (!uu.is_object()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/image/uuid",
+                                  "'uuid' must be an object {derivation}");
+                    } else {
+                        MachOUuid uid;
+                        bool ok = true;
+                        // derivation (closed enum; default "content-hash").
+                        if (uu.contains("derivation")) {
+                            if (!uu.at("derivation").is_string()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          "/image/uuid/derivation",
+                                          "'derivation' must be a string "
+                                          "(\"content-hash\")");
+                                ok = false;
+                            } else {
+                                auto const s = uu.at("derivation")
+                                                   .get<std::string>();
+                                auto const d =
+                                    machoUuidDerivationFromName(s);
+                                if (!d.has_value()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_MalformedJson,
+                                        "/image/uuid/derivation",
+                                        std::format("unknown uuid derivation "
+                                                    "'{}' — accepted: "
+                                                    "\"content-hash\" "
+                                                    "(SHA-256 over the image "
+                                                    "with the payload zeroed; "
+                                                    "ld64's -random_uuid has "
+                                                    "no DSS equivalent, "
+                                                    "because a random UUID "
+                                                    "makes a release artifact "
+                                                    "differ from itself).",
+                                                    s));
+                                    ok = false;
+                                } else {
+                                    uid.derivation = *d;
+                                }
+                            }
+                        }
+                        if (ok) data.machoImage.uuid = uid;
+                    }
+                }
                 // D-LK7-ADHOC-CODESIGN-MACHO (increment 2/2) — ad-hoc
                 // code-signature FILL request. Optional nested object;
                 // absent = the legacy `codeSignatureSize`-only placeholder

@@ -545,6 +545,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_FormatLacksThreadLocalSupport";
         case DiagnosticCode::K_ThreadLocalOveralignedForFormat:
             return "K_ThreadLocalOveralignedForFormat";
+        case DiagnosticCode::K_StaticObjectOveralignedForFormat:
+            return "K_StaticObjectOveralignedForFormat";
         case DiagnosticCode::K_ArchiveMemberNameInvalid:
             return "K_ArchiveMemberNameInvalid";
         case DiagnosticCode::K_ArchiveFieldOverflow:

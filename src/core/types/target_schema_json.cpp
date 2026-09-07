@@ -1,6 +1,7 @@
 #include "core/types/target_schema.hpp"
 
 #include "core/crypto/sha256.hpp"                 // crypto::sha256Hex — the retained content digest
+#include "core/types/alignment.hpp"               // Alignment::kMaxBytes — the ONE representable-alignment bound
 #include "core/substrate/diagnostic_collector.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/substrate/relocation_table_json.hpp"
@@ -1920,8 +1921,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // this block accepts, `bitFieldStrategy` silently absent. A message narrower
     // than its own check tells an author, by name, that a key the loader takes
     // is not allowed.
-    static constexpr std::array<std::string_view, 3> kAggregateLayoutKeys{
-        "scalarAlignment", "maxAlignment", "bitFieldStrategy"};
+    static constexpr std::array<std::string_view, 4> kAggregateLayoutKeys{
+        "scalarAlignment", "maxAlignment", "maxRequestedAlignment",
+        "bitFieldStrategy"};
     DSS_CHECK_KEY_VOCABULARY(kAggregateLayoutKeys);
     if (doc.contains("aggregateLayout")) {
         auto const& al = doc.at("aggregateLayout");
@@ -1977,6 +1979,59 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     ok = false;
                 } else {
                     data.aggregateLayout.maxAlignment =
+                        static_cast<std::uint32_t>(v);
+                }
+            }
+            // D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN (P63):
+            // the largest alignment a PROGRAM may REQUEST (`_Alignas(N)` /
+            // `__attribute__((aligned(N)))`). REQUIRED for the same reason
+            // `maxAlignment` is — a silent default is a policy nobody wrote down,
+            // and the one that WAS silently defaulted (a hardcoded 256 in the
+            // semantic ladder) refused `aligned(4096)` that two working references
+            // build and run.
+            // ⚠ THE BOUND IS THE `Alignment` NEWTYPE'S DOMAIN, NOT `maxAlignment`'s
+            // [1, 256]. These are two different quantities and the check above must
+            // never be copied down here: `maxAlignment` is the ISA's largest
+            // FUNDAMENTAL alignment; this is how far a user may over-align.
+            if (!al.contains("maxRequestedAlignment")
+                || !al.at("maxRequestedAlignment").is_number_integer()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/aggregateLayout/maxRequestedAlignment",
+                          "missing required 'maxRequestedAlignment' integer (the "
+                          "largest alignment a program may REQUEST via _Alignas / "
+                          "__attribute__((aligned)), a power of two — NOT the ISA's "
+                          "fundamental 'maxAlignment')");
+                ok = false;
+            } else {
+                auto const v =
+                    al.at("maxRequestedAlignment").get<std::int64_t>();
+                if (v < 1
+                    || v > static_cast<std::int64_t>(Alignment::kMaxBytes)
+                    || (v & (v - 1)) != 0) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/aggregateLayout/maxRequestedAlignment",
+                              std::format("maxRequestedAlignment {} must be a "
+                                          "power of two in [1, {}] (the Alignment "
+                                          "newtype's representable domain)",
+                                          v, Alignment::kMaxBytes));
+                    ok = false;
+                } else if (v < static_cast<std::int64_t>(
+                                   data.aggregateLayout.maxAlignment)) {
+                    // A requestable ceiling BELOW the ISA's own fundamental
+                    // alignment would refuse an alignment the target produces by
+                    // nature — the author has almost certainly swapped the two
+                    // keys, which is exactly the confusion this pair invites.
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/aggregateLayout/maxRequestedAlignment",
+                              std::format("maxRequestedAlignment {} is below "
+                                          "maxAlignment {} — a program could not "
+                                          "request the alignment the ISA gives a "
+                                          "scalar by nature; the two keys are "
+                                          "different quantities and look swapped",
+                                          v, data.aggregateLayout.maxAlignment));
+                    ok = false;
+                } else {
+                    data.aggregateLayout.maxRequestedAlignment =
                         static_cast<std::uint32_t>(v);
                 }
             }

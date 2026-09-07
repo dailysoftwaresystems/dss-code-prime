@@ -666,6 +666,69 @@ kMachOCodeSignatureHashAlgoTable{{{
 // would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
 DSS_CHECK_ENUM_NAME_TABLE(kMachOCodeSignatureHashAlgoTable);
 
+// LC_UUID (`uuid_command`). The image's identity — a 16-byte payload the
+// debugger, `dsymutil`, the crash reporter and `dyld_info` key on.
+//
+// ★★ WHY THIS IS A DECLARATION AND NOT A CONSTANT IN THE WRITER. It was
+// emitted unconditionally from `macho::encodeExec` / `encodeExecDynamic` when
+// D-LK-MACHO-EMITS-NO-LC-UUID first closed, on the argument that "a UUID
+// identifies a LINKED image, so adding a knob would invent a choice the
+// reference does not offer". ✔MEASURED 2026-09-07 on Apple Silicon (macOS
+// 26.6.2, Apple clang 21.0.0, `ld` PROJECT:ld-1267) that the reference DOES
+// offer it, on two axes:
+//   * `-no_uuid` — "Do not generate an LC_UUID load command in the output
+//     file" (man ld). Measured: it removes the command from BOTH a filetype-2
+//     exec and a filetype-6 dylib, with a plain rebuild immediately after as
+//     the CONTROL, which carries one again at the byte-identical payload — so
+//     the absence is the FLAG and not a build-to-build accident.
+//   * `-random_uuid` — "By default the linker generates the UUID of the output
+//     file based on a hash of the output file's content"; the flag substitutes
+//     a random one (measured: RFC variant-4 nibble, against the default's 3).
+// ⇒ presence and derivation are per-link POLICY in the reference, exactly as
+// signing (`-adhoc_codesign`) and platform (`-platform_version`) are — and
+// those two ARE declared here, as `codeSignature` and `buildVersion`.
+//
+// ★ THE DISCRIMINATOR, so this does not read as "declare everything". The
+// commands this writer emits from code — LC_SYMTAB, LC_DYSYMTAB and the
+// structural LC_SEGMENT_64s — have NO ld64 presence knob: ✔MEASURED, `-S` and
+// `-x` are CONTENT knobs that leave both commands standing, and `man ld` names
+// no load command at all except LC_UUID and LC_ID_DYLIB. The rule this file
+// follows is therefore *declare what the reference makes a policy*, and LC_UUID
+// was on the wrong side of it. (D-LK-MACHO-EMITS-NO-LC-UUID, second increment.)
+//
+// Absent → no LC_UUID, byte-identical to the pre-LC_UUID layout, which is also
+// what every MH_OBJECT flavour wants (`clang -c` emits none — measured in the
+// same run). `derivation` is a CLOSED vocabulary with one enumerator: DSS
+// derives the payload from content and will not offer a random one, because
+// several corpus examples compare a `--config=release` artifact byte-for-byte
+// and a random UUID makes every such artifact differ from itself. A document
+// asking for anything else fails loud at load rather than silently getting the
+// content hash.
+struct DSS_EXPORT MachOUuid {
+    enum class Derivation : std::uint8_t {
+        // SHA-256 over the image with the payload zeroed, truncated to 16
+        // bytes, RFC 9562 version-8 nibble + variant `10`. See
+        // `stampImageUuid` for the fixed-point argument.
+        ContentHash = 1,
+    };
+    Derivation derivation = Derivation::ContentHash;
+};
+
+inline constexpr EnumNameTable<MachOUuid::Derivation, 1>
+kMachOUuidDerivationTable{{{
+    { MachOUuid::Derivation::ContentHash, "content-hash" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kMachOUuidDerivationTable);
+
+[[nodiscard]] constexpr std::optional<MachOUuid::Derivation>
+machoUuidDerivationFromName(std::string_view s) noexcept {
+    return kMachOUuidDerivationTable.fromName(s);
+}
+
 [[nodiscard]] constexpr std::optional<MachOCodeSignature::Kind>
 machoCodeSignatureKindFromName(std::string_view s) noexcept {
     return kMachOCodeSignatureKindTable.fromName(s);
@@ -1017,6 +1080,12 @@ struct DSS_EXPORT MachOImage {
     // (byte-identical to every pre-arm64 / MH_OBJECT schema). validate()
     // rejects this block on a MH_OBJECT (like the rest of the image).
     std::optional<MachOBuildVersion> buildVersion;
+    // LC_UUID (D-LK-MACHO-EMITS-NO-LC-UUID). When set, both Mach-O IMAGE
+    // walkers emit a `uuid_command` and stamp its payload from the image's own
+    // content. Absent → no LC_UUID, which is what every MH_OBJECT flavour
+    // wants. See `MachOUuid` for the reference measurement that made this a
+    // declaration rather than an unconditional emission.
+    std::optional<MachOUuid> uuid;
     // Modern dyld binding format (Xcode 12+ / macOS 12+). When
     // `true`, the walker emits `LC_DYLD_CHAINED_FIXUPS` (0x80000034)
     // pointing at a `dyld_chained_fixups_header` + chained-pointer
