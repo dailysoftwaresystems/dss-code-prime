@@ -1433,3 +1433,111 @@ endif()
 # actually compiles. Included LAST because it modifies targets created by
 # `add_subdirectory(src)` above.
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DssInstall.cmake")
+
+# ── P63: the two proofs this cycle added, registered here rather than beside ──
+#         their siblings, and labelled EXPLICITLY.
+#
+# ⚠ APPENDED AT THE END on purpose: this file is shared by concurrent lanes, and
+#   an append is the one edit that cannot collide with a sibling's.
+# ⚠ THE LABEL IS SET BY HAND, and that is not a style choice: the `repo-guard`
+#   scan above runs BEFORE this point, so a test registered here is invisible to
+#   it. An unlabelled guard is not skipped anywhere — it simply runs on every
+#   leg — so the failure direction is "too much testing", but the indirect legs
+#   would be paying for a tree they cannot learn anything new about.
+if(DSS_BUILD_TESTS)
+    # ── run_gate_guard ────────────────────────────────────────────────────
+    # `scripts/run-gate/test-run-gate.sh` has existed since P62 and NOTHING RAN
+    # IT. It proves both run-gate twins refuse a run whose evidence is spoiled —
+    # a moving source tree (exit 3) and a build directory shared with another
+    # live run (exit 4) — with a passing CONTROL on each twin for each subject.
+    # ✔MEASURED at the commit that added this: 12 arms, 33 assertions, 0
+    # failures, ~40 s.
+    # ⓘ It drives BOTH twins from one bash fixture, so this single entry is the
+    # anti-drift instrument for the pair; there is deliberately no `.ps1` copy of
+    # the fixture, which would be the divergence it exists to catch.
+    # ⚠ THE BASH IS THE ONE ALREADY PROVED, not a fresh search:
+    # `DSS_BASH_FOR_LANE_GUARD` is selected and PROBED above (a bare `bash` on
+    # Windows resolves to the WSL shim, which cannot open a `C:/` path at all).
+    # Re-deriving it here would be a second answer that drifts from the first.
+    set(_dss_rg_bash "")
+    if(DSS_BASH_FOR_LANE_GUARD)
+        set(_dss_rg_bash "${DSS_BASH_FOR_LANE_GUARD}")
+    else()
+        find_program(_dss_rg_found_bash NAMES bash NO_CACHE)
+        if(_dss_rg_found_bash)
+            set(_dss_rg_bash "${_dss_rg_found_bash}")
+        endif()
+    endif()
+    if(_dss_rg_bash)
+        get_filename_component(_dss_rg_bash_dir  "${_dss_rg_bash}" DIRECTORY)
+        get_filename_component(_dss_rg_ctest_dir "${CMAKE_CTEST_COMMAND}" DIRECTORY)
+        add_test(
+            NAME run_gate_guard
+            COMMAND "${_dss_rg_bash}"
+                    "${CMAKE_SOURCE_DIR}/scripts/run-gate/test-run-gate.sh"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        # ⚠ MODIFIES the inherited environment, never replaces it — the same
+        # measurement `lane_worktree_guard` carries above. The fixture needs
+        # Git-for-Windows' `usr/bin` tools AND `ctest` itself, and ctest launches
+        # a test with the inherited PATH, so neither is guaranteed to be there.
+        set_tests_properties(run_gate_guard PROPERTIES
+            ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:${_dss_rg_bash_dir};PATH=path_list_prepend:${_dss_rg_ctest_dir}")
+    else()
+        # A guard that cannot run FAILS rather than disappearing: a gate figure
+        # that silently omits an entry is about the host, not about the tree.
+        set(_dss_rg_refusal_script "${CMAKE_CURRENT_BINARY_DIR}/run_gate_guard_refusal.cmake")
+        file(WRITE "${_dss_rg_refusal_script}"
+             "message(FATAL_ERROR \"run_gate_guard CANNOT RUN: no bash was found for scripts/run-gate/test-run-gate.sh, so neither run-gate twin's refusals were exercised. Point -DDSS_BASH_FOR_LANE_GUARD at a working bash.\")\n")
+        add_test(NAME run_gate_guard COMMAND ${CMAKE_COMMAND} -P "${_dss_rg_refusal_script}")
+        message(STATUS "run_gate_guard registered as a REFUSAL: no usable bash")
+    endif()
+
+    # ── line_endings_watchdog_guard ───────────────────────────────────────
+    # Proves the 600 s bound this cycle put on `check-line-endings`: a probe that
+    # genuinely hangs must be CUT SHORT inside its budget, the refusal must name
+    # BOTH the timeout and the query it was waiting on, and a named CONTROL run
+    # must still pass. ✔MEASURED: ~7 s (.sh) / ~8 s (.ps1), 5 arms each.
+    # ⓘ SEPARATE FROM `line_endings_guard` because the proof necessarily costs a
+    # real timeout, and that guard's own `--selftest` runs on every invocation on
+    # every leg.
+    # ★ BOTH TWINS ARE REGISTERED ON WINDOWS, unlike `line_endings_guard`, which
+    # runs only the platform's primary twin. The indirect legs skip `repo-guard`
+    # entirely, so the `.sh` twin's bound would otherwise be proved on NO leg —
+    # and a property held in one twin and not the other is how every pairing
+    # defect in this repository has started.
+    if(WIN32)
+        add_test(
+            NAME line_endings_watchdog_guard
+            COMMAND ${POWERSHELL_EXE}
+                    -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_SOURCE_DIR}/scripts/check-line-endings/check-line-endings.ps1"
+                    --selftest-watchdog
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(_dss_rg_bash)
+            add_test(
+                NAME line_endings_watchdog_sh_guard
+                COMMAND "${_dss_rg_bash}"
+                        "${CMAKE_SOURCE_DIR}/scripts/check-line-endings/check-line-endings.sh"
+                        --selftest-watchdog
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+            set_tests_properties(line_endings_watchdog_sh_guard PROPERTIES
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dss_rg_bash_dir}")
+        endif()
+    else()
+        add_test(
+            NAME line_endings_watchdog_guard
+            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-line-endings/check-line-endings.sh"
+                    --selftest-watchdog
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    endif()
+
+    # The label the scan above could no longer apply, applied by name.
+    set(_dss_p63_guard_tests run_gate_guard line_endings_watchdog_guard)
+    if(WIN32 AND _dss_rg_bash)
+        list(APPEND _dss_p63_guard_tests line_endings_watchdog_sh_guard)
+    endif()
+    set_tests_properties(${_dss_p63_guard_tests} PROPERTIES LABELS "repo-guard")
+    list(LENGTH _dss_p63_guard_tests _dss_p63_guard_count)
+    message(STATUS "repo-guard label applied to ${_dss_p63_guard_count} additional test(s) registered after the scan")
+endif()

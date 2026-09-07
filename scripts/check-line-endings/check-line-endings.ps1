@@ -63,6 +63,88 @@ $RepoRoot  = Split-Path -Parent (Split-Path -Parent $ScriptDir)
 # silently answers about the wrong file.
 $InvokedFrom = (Get-Location).Path
 
+# ── A GUARD THAT CAN HANG FOREVER IS INDISTINGUISHABLE FROM SLOW WORK ──────
+#
+# ★★★ D-GATE-LINE-ENDINGS-GUARD-CAN-WAIT-FOREVER-WITHOUT-NAMING-ITS-SUBJECT.
+# The twin of the block of the same name in `check-line-endings.sh`, which
+# carries the full account. In short: ✔REPORTED 2026-09-07 (P63), THREE ctest
+# runs on this workstation hung — 65 min, 11 min, and a whole-tree gate stalled
+# at 898/2109 — with every process at ZERO CPU delta, and TWICE the hung child
+# was THIS FILE with a hung `git rev-parse` while `git` answered the same query
+# by hand in 29 ms.
+#
+# ⚠⚠ NOT ROOT-CAUSED, and this block does not claim to be a fix. ✔MEASURED
+# 2026-09-07: 96 concurrent runs across two reproduction probes (48 at 12-way
+# concurrency, 48 more beside six endless `git` loops on the same gitdir) — zero
+# hangs, worst case 23 s. The bound ships anyway, because a wait with no end
+# cannot be told apart from work that is merely slow.
+#
+# ★ THE BUDGET IS A CONSTANT ON PURPOSE. This guard costs ~3.2 s here and 23 s
+# at its measured worst; 600 s cannot red honest work and still turns a
+# 65-minute stall into a 10-minute diagnosis. An environment variable would be
+# an escape every caller sets, and "wait longer" is never the remedy for a wait
+# that has no end.
+#
+# ⓘ A THREAD JOB, NOT A SECOND PROCESS, and the reason is measured: a separate
+# watchdog PROCESS would inherit this one's stdout/stderr handles and could keep
+# ctest's pipe open after the guard exits — which is the very stall shape being
+# guarded against. ✔MEASURED: a thread job costs 12 ms to start, sees a
+# `[hashtable]::Synchronized` by reference so no temp file is needed, and does
+# NOT delay process exit (a script with a live 60 s thread job still exited in
+# 1.4 s with its own exit code).
+$LeWatchdogBudget = 600
+$script:LeActivity = [hashtable]::Synchronized(@{ what = 'starting up (no query issued yet)' })
+$script:LeWatchdogArmed = $false
+
+function Set-LeActivity([string]$What) { $script:LeActivity.what = $What }
+
+function Start-LeWatchdog([int]$Budget) {
+    if (-not (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)) {
+        # LOUD, and deliberately NOT a refusal: the guard's subject is the CR
+        # contract, not the bound. Losing the bound returns this file to its
+        # pre-2026-09-07 behaviour, and `--selftest-watchdog` — which IS a
+        # separate ctest entry — reds on such a host, which is where a missing
+        # capability belongs.
+        Write-Host "line-endings: NOTE - Start-ThreadJob is unavailable in this PowerShell, so this run is NOT bounded."
+        Write-Host "    A hang here would be indistinguishable from slow work. Run it under pwsh 7+."
+        return
+    }
+    $null = Start-ThreadJob -ScriptBlock {
+        param($Shared, $Seconds, $Start)
+        $deadline = $Start.AddSeconds($Seconds)
+        while ((Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 2000 }
+        $act = [string]$Shared.what
+        if (-not $act) { $act = '<no activity recorded>' }
+        $elapsed = [int]((Get-Date) - $Start).TotalSeconds
+        # [Console] and [Environment] are .NET and safe off the pipeline thread;
+        # Write-Host would not be. Exit 2 is this guard's existing meaning for
+        # "could not be measured", and setting it from here is why the message
+        # and the exit code can still agree after the main line has stopped.
+        [Console]::Error.WriteLine("line-endings: FAIL - TIMED OUT after ${Seconds}s. This guard was still waiting, so it")
+        [Console]::Error.WriteLine("  measured NOTHING and its silence must not be read as a clean tree.")
+        [Console]::Error.WriteLine("  it was waiting on : $act")
+        [Console]::Error.WriteLine("  elapsed           : ${elapsed}s since the guard started")
+        [Console]::Error.WriteLine("  [!] A hang is indistinguishable from slow work, which is why this is a RED and not a")
+        [Console]::Error.WriteLine("      longer wait. REPORTED 2026-09-07: three ctest runs on this host hung with every")
+        [Console]::Error.WriteLine("      process at ZERO CPU, twice with this guard stuck on a git query that answered by")
+        [Console]::Error.WriteLine("      hand in 29 ms. The mechanism is NOT root-caused; this bound only makes it visible.")
+        [Console]::Error.WriteLine("      Re-run once - if it recurs at the same activity, say so in the row.")
+        [Environment]::Exit(2)
+    } -ArgumentList $script:LeActivity, $Budget, (Get-Date)
+    $script:LeWatchdogArmed = $true
+}
+
+# ⚠ READ BEFORE THE WATCHDOG STARTS, because it decides that watchdog's budget.
+# ★ `--watchdog-probe` IS NOT AN ESCAPE HATCH, AND THE REASON IS DIRECTIONAL: the
+# mode performs NO CHECK AT ALL and has no path that exits 0, so it is a way to
+# run NOTHING with a chosen budget, never a way to run the GUARD with a longer
+# one. The real budget stays a constant nobody can set.
+$__leBudget = $LeWatchdogBudget
+if ($args.Count -ge 1 -and $args[0] -eq '--watchdog-probe') {
+    $__leBudget = if ($args.Count -ge 2) { [int]$args[1] } else { 5 }
+}
+Start-LeWatchdog $__leBudget
+
 # ── THE ONE ROOT ──────────────────────────────────────────────────────────
 # ⛔⛔ D-SCRIPT-GUARDS-ASK-GIT-FROM-THE-LANE-WORKTREE. Until 2026-09-01 this file
 # said `Set-Location $RepoRoot` and then read repo-relative paths git had handed
@@ -99,6 +181,12 @@ function Get-GitLines([string[]]$GitArgs) {
         Write-Error "line-endings: FAIL - a git query was made before the guard entered its tree. Refusing to answer from an unidentified root."
         exit 2
     }
+    # ⓘ THE ONE FUNNEL, so recording WHAT THE GUARD IS WAITING ON costs one line
+    # and cannot be forgotten at a call site. ⚠ The `git` child is actually
+    # launched by `Invoke-RepoTreeGit` in `scripts/repo-tree/repo-tree.ps1`,
+    # which this lane does not own; the note is taken HERE, where the query is
+    # asked, and it names the file that runs it.
+    Set-LeActivity ("git " + ($GitArgs -join ' ') + "  (via Invoke-RepoTreeGit, scripts/repo-tree/repo-tree.ps1)")
     # ⚠ PLAIN `@(...)`. A caller that needs `.Count` writes `@(...)` at ITS call
     # site -- the idiom this file already uses everywhere else. See the measured
     # note on `Invoke-RepoTreeGit` for why the `,@(...)` shortcut is worse: it
@@ -309,6 +397,76 @@ function Invoke-SelfTest {
     return 0
 }
 
+# ── PROVING THE BOUND — a watchdog nobody has watched fire is a comment ─────
+# ★★ SYNTHESIZES THE NEGATIVE, like every other arm in this file: the probe
+# genuinely hangs and the arm asserts it is CUT SHORT and NAMED.
+# ⓘ A SEPARATE ENTRY POINT and NOT part of `--selftest`, deliberately:
+# `--selftest` runs on every invocation of this guard on every leg, and a proof
+# that necessarily costs a real timeout has no business in that path. It is its
+# own ctest entry (`line_endings_watchdog_guard`), the twin of the `.sh`
+# sibling's `--selftest-watchdog`, with the same five arms.
+function Invoke-WatchdogSelfTest {
+    $fail = 0
+    $shell = Join-Path $PSHOME 'pwsh.exe'
+    if (-not (Test-Path -LiteralPath $shell -PathType Leaf)) { $shell = Join-Path $PSHOME 'powershell.exe' }
+    if (-not (Test-Path -LiteralPath $shell -PathType Leaf)) {
+        Write-Host "line-endings: FAIL - watchdog selftest cannot locate its own PowerShell under `$PSHOME ($PSHOME)."
+        return 2
+    }
+    $out = Join-Path ([IO.Path]::GetTempPath()) ("dss-le-wd-" + [Guid]::NewGuid().ToString('N') + ".txt")
+    $ctl = Join-Path ([IO.Path]::GetTempPath()) ("dss-le-ctl-" + [Guid]::NewGuid().ToString('N') + ".txt")
+    try {
+        # ARM W1 - THE NEGATIVE: a run that never finishes must be CUT SHORT.
+        $t0 = Get-Date
+        & $shell -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath --watchdog-probe 5 *> $out
+        $rc = $LASTEXITCODE
+        $elapsed = [int]((Get-Date) - $t0).TotalSeconds
+        $text = try { [IO.File]::ReadAllText($out) } catch { '' }
+        if ($rc -eq 0) {
+            Write-Host "line-endings: FAIL - watchdog selftest: the hanging probe exited 0. The bound did not hold."; $fail = 1
+        }
+        # ARM W2 - and cut short WITHIN the bound, not merely eventually.
+        if ($elapsed -gt 60) {
+            Write-Host "line-endings: FAIL - watchdog selftest: a 5 s budget took ${elapsed}s to fire."; $fail = 1
+        }
+        # ARM W3 - the refusal must NAME the timeout...
+        if ($text -notmatch 'TIMED OUT after 5s') {
+            Write-Host "line-endings: FAIL - watchdog selftest: the refusal never said it timed out."
+            Write-Host $text; $fail = 1
+        }
+        # ARM W4 - ...and NAME WHAT IT WAS WAITING ON. A bounded wait that cannot
+        # say its subject is only marginally better than an unbounded one.
+        if ($text -notmatch 'it was waiting on : SYNTHETIC watchdog probe') {
+            Write-Host "line-endings: FAIL - watchdog selftest: the refusal did not name the activity it was waiting on."
+            Write-Host $text; $fail = 1
+        }
+        # ARM W5 - THE CONTROL, named: an ordinary run under the REAL budget must
+        # still finish and still pass. Without it, "the probe died" is equally
+        # consistent with "this watchdog now kills everything".
+        [IO.File]::WriteAllBytes($ctl, [byte[]]@(97, 10, 98, 10))
+        $t0 = Get-Date
+        & $shell -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath --files $ctl *> $null
+        $crc = $LASTEXITCODE
+        $celapsed = [int]((Get-Date) - $t0).TotalSeconds
+        if ($crc -ne 0) {
+            Write-Host "line-endings: FAIL - watchdog selftest CONTROL: an ordinary --files run over a clean file did not pass (rc=$crc)."; $fail = 1
+        }
+        if ($celapsed -gt 60) {
+            Write-Host "line-endings: FAIL - watchdog selftest CONTROL: an ordinary run took ${celapsed}s; the watchdog is interfering with honest work."; $fail = 1
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $ctl -Force -ErrorAction SilentlyContinue
+    }
+    if ($fail -ne 0) {
+        Write-Host "line-endings: FAIL - the WATCHDOG self-test failed (above)."
+        return 2
+    }
+    Write-Host "line-endings: watchdog OK (5 arms: a hanging probe was cut short inside its budget, the refusal named the timeout AND its subject, and a named CONTROL run still passed)"
+    return 0
+}
+
 # CR-INSTRUMENT-QUOTED:BEGIN - the help text NAMES the blind idiom.
 function Show-Usage {
     Write-Host @'
@@ -324,7 +482,15 @@ check-line-endings.ps1 - the LF-contract guard, and the repo's CR instrument.
   --files-from FILE   The same, one path per line ('-' reads stdin).
   --audit-instruments Run Check F alone.
   --selftest          Run the self-test alone.
+  --selftest-watchdog Prove the timeout: hang on purpose, assert the guard is
+                      cut short inside its budget and NAMES what it waited on,
+                      and take a control run that still passes. Its own ctest
+                      entry, because it necessarily costs a real timeout.
   --help              This text.
+
+THIS GUARD IS BOUNDED. It gives up after 600 s and reds, naming the query it was
+waiting on. A hang cannot be told apart from slow work, and three ctest runs on
+this workstation were voided by exactly that ambiguity on 2026-09-07.
 
 WHY --files EXISTS: until 2026-08-27 this guard answered exactly one question,
 "is the whole repo clean?", and took no arguments. A lane holding thirteen
@@ -352,8 +518,18 @@ if ($args.Count -gt 0) {
                 Write-Host "line-endings: FAIL - cannot read path list '$src'"; exit 2 }
             exit (Invoke-FilesMode @($lines | Where-Object { $_ -ne '' }))
         }
-        '--audit-instruments' { $RepoTree = Enter-RepoTree $RepoRoot; exit (Invoke-InstrumentAudit) }
-        '--selftest'          { $RepoTree = Enter-RepoTree $RepoRoot; exit (Invoke-SelfTest) }
+        '--audit-instruments' { Set-LeActivity 'Enter-RepoTree (git rev-parse, inside scripts/repo-tree/repo-tree.ps1)'; $RepoTree = Enter-RepoTree $RepoRoot; exit (Invoke-InstrumentAudit) }
+        '--selftest'          { Set-LeActivity 'Enter-RepoTree (git rev-parse, inside scripts/repo-tree/repo-tree.ps1)'; $RepoTree = Enter-RepoTree $RepoRoot; exit (Invoke-SelfTest) }
+        '--selftest-watchdog' { exit (Invoke-WatchdogSelfTest) }
+        '--watchdog-probe'    {
+            # INTERNAL, and it can never report a clean tree: it checks NOTHING
+            # and has no path that exits 0. Either the watchdog kills it (exit 2)
+            # or the wait runs out and it refuses below.
+            Set-LeActivity 'SYNTHETIC watchdog probe - this run checks nothing and is waiting to be killed'
+            Start-Sleep -Seconds 3600
+            Write-Host "line-endings: FAIL - the watchdog did NOT fire within its budget; the bound is not holding."
+            exit 2
+        }
         default { Write-Host "line-endings: FAIL - unknown argument '$($args[0])' (see --help)"; exit 2 }
     }
 }
@@ -368,6 +544,7 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
 # tree AND when the enumeration root and the read root disagree. The old code
 # tested only the first with a bare `git rev-parse HEAD`, which is exactly the
 # check that passes while every read lands somewhere else.
+Set-LeActivity 'Enter-RepoTree (git rev-parse, inside scripts/repo-tree/repo-tree.ps1)'
 try {
     $RepoTree = Enter-RepoTree $RepoRoot
 } catch {
