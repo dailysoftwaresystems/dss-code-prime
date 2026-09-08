@@ -1,5 +1,6 @@
 #include "mir/mir_text.hpp"
 
+#include "core/types/alignment.hpp"  // Alignment::kMaxBytes — the ONE owner of the representable align domain
 #include "core/types/config_key_vocabulary.hpp"  // renderAllowedList (the refusals project their table)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/enum_name_table.hpp"  // EnumNameTable / allNames — ONE owner per text spelling set
@@ -95,12 +96,31 @@ inline constexpr std::string_view kMirTextRunAfterEntryAttr  = "initafter";
 inline constexpr std::string_view kMirTextConstAttr       = "const";
 inline constexpr std::string_view kMirTextThreadLocalAttr = "threadlocal";
 inline constexpr std::string_view kMirTextAlignAttr       = "align";
-// The alignment ceiling `MirBuilder::addGlobal` documents (a power of two
-// ≤ 256). ⚠ `addGlobal` does NOT enforce it — ✔MEASURED, it stores the
-// value verbatim — so a text reader that passed a bad one through would
-// build a module the assembler mishandles, with no diagnostic anywhere. The
-// reader validates because nothing downstream does.
-inline constexpr std::uint32_t kMirTextMaxGlobalAlignBytes = 256;
+// ⚠⚠ THE FIFTH HAND-WRITTEN COPY OF THE ALIGNMENT CAP, AND IT SPELLED 256.
+// [[D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN]] removed the
+// other four in P63, where the count went 1 → 3 → 4 → 5 as successive readers
+// asked "where ELSE could this value live?" — this reader was the fifth, and it
+// is the shape the row itself named as still owed.
+//
+// ★ WHAT WAS ACTUALLY WRONG, which is not "a stale constant": this reader and
+// its own WRITER disagreed. `emitGlobal` prints `align=N` for whatever N the
+// module carries, UNBOUNDED, while this reader refused anything over 256 — and
+// `mir/summary/mir_body_codec.cpp` pairs the two in SHIPPED code, so a module
+// legitimately carrying a 512-byte-aligned global could be written and then not
+// read back. ✔MEASURED LATENT: a two-CU build at align 512 runs 42 today, so it
+// is not reachable through the ordinary CLI — but "unreachable today" is the
+// same sentence the other four copies carried.
+//
+// ★ THE RULE, IDENTICAL TO `mir_verifier`'s Alloca arm: a bound is ASKED OF THE
+// TYPE THAT OWNS THE DOMAIN, never restated. `Alignment::kMaxBytes` is the
+// REPRESENTABILITY bound; the POLICY ceiling (how large an alignment a PROGRAM
+// may request) is declared per target as `maxRequestedAlignment` and enforced at
+// the semantic tier, where a refusal carries a source position. A `.dssir` text
+// reader is neither of those: it is checking that a value it read can be carried
+// at all, which is exactly the representability question.
+// ⚠ `addGlobal` does NOT enforce anything — ✔MEASURED, it stores the value
+// verbatim — so this reader still validates, because nothing downstream does.
+inline constexpr std::uint32_t kMirTextMaxGlobalAlignBytes = Alignment::kMaxBytes;
 
 // The five per-global fields the text format carries, as ONE value.
 //
@@ -2306,11 +2326,21 @@ private:
                 // `addGlobal` documents \"power of two ≤ 256\" and ✔MEASURED
                 // stores whatever it is handed, so an out-of-contract value
                 // read from text would reach the assembler unchallenged.
-                if (bytes == 0 || (bytes & (bytes - 1)) != 0
-                    || bytes > kMirTextMaxGlobalAlignBytes) {
+                // ASK the type that owns the domain rather than restating its
+                // three conditions (non-zero, power of two, in range) — the
+                // `mir_verifier` Alloca arm's rule, and the reason the other
+                // four copies of this ladder are gone.
+                if (bytes != 0 && !Alignment::fromBytes(bytes).has_value()) {
                     emitMalformed(std::format(
                         "global alignment {} is not a power of two in [1, {}]",
                         bytes, kMirTextMaxGlobalAlignBytes));
+                    break;
+                }
+                if (bytes == 0) {
+                    emitMalformed(std::format(
+                        "global alignment 0 is undefined — '{}' takes a power "
+                        "of two in [1, {}]", kMirTextAlignAttr,
+                        kMirTextMaxGlobalAlignBytes));
                     break;
                 }
                 attrs.alignmentBytes = bytes;

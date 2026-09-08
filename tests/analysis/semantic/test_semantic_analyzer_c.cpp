@@ -23,6 +23,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <filesystem>
 #include <format>
@@ -73,13 +74,22 @@ TEST(SemanticAnalyzerC, FunctionLocalIntDeclTypedAsI32) {
     // `_byteswap_ulong`/`_byteswap_uint64` + their GCC spellings
     // `__builtin_bswap16`/`__builtin_bswap32`/`__builtin_bswap64` — six NAMES over
     // ONE `lowering: "bswap"` verb, always-injected like every other builtin).
-    ASSERT_EQ(model.symbols().size() - 1, 88u)
+    // D-CSUBSET-ATOMIC-RMW (P64): + the 8 C11 §7.17.7 read-modify-write
+    // `_explicit` accessors — `atomic_fetch_{add,sub,or,xor,and}_explicit`,
+    // `atomic_exchange_explicit` and
+    // `atomic_compare_exchange_{strong,weak}_explicit` — always-injected
+    // intrinsics beside the load/store pair above (the non-`_explicit` spellings
+    // are seq_cst MACROS in shippedLibs/stdatomic.json, so they mint no symbol).
+    // ⚠ The COUNT alone would be satisfied by any 8 arrivals; the roster is what
+    // makes it say which, so it moves with the number.
+    ASSERT_EQ(model.symbols().size() - 1, 96u)
         << "main + x + __va_list_tag + va_list + __builtin_va_list + __umulh + "
            "_InterlockedCompareExchange + _InterlockedCompareExchange64 + "
            "_ReadWriteBarrier + __sync_synchronize + "
            "_exception_code + _exception_info + the 6 __builtin bit-count "
            "intrinsics + the 56 __builtin_stdc_* <stdbit.h> intrinsics + "
-           "atomic_load_explicit + atomic_store_explicit + the 4 __builtin_complex/"
+           "atomic_load_explicit + atomic_store_explicit + the 8 atomic RMW "
+           "_explicit accessors + the 4 __builtin_complex/"
            "creal/cimag/conj complex builtins + the 6 byte-swap builtins "
            "(_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 + "
            "__builtin_bswap16/32/64) + __func__ + __FUNCTION__";
@@ -4040,7 +4050,7 @@ TEST(SemanticAnalyzerC, NestedBlocksShadowWithoutRedecl) {
     // builtins (_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 +
     // __builtin_bswap16/32/64) + the 2 FC17.5 predefined function-name symbols
     // (__func__ + __FUNCTION__, per function definition — D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
-    EXPECT_EQ(model.symbols().size() - 1, 89u);
+    EXPECT_EQ(model.symbols().size() - 1, 97u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -4074,7 +4084,7 @@ TEST(SemanticAnalyzerC, ForwardReferenceWithinBlock) {
     // (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64) — an under-aligned 8-byte `_Atomic`
     // needs the 64-bit compare-exchange, and it minted no new encoding because
     // x86_64's width-64 `lock_cmpxchg` variant already existed.
-    ASSERT_EQ(model.symbols().size() - 1, 88u);
+    ASSERT_EQ(model.symbols().size() - 1, 96u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -7081,7 +7091,7 @@ TEST(SemanticAnalyzerC, ValueStarValueStaysExpressionStatement) {
     // (_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 + __builtin_bswap16/32/64) +
     // the 2 FC17.5 predefined function-name symbols (__func__ + __FUNCTION__) — the
     // multiplication must mint NO symbol.
-    EXPECT_EQ(model.symbols().size() - 1, 89u)
+    EXPECT_EQ(model.symbols().size() - 1, 97u)
         << "main + a + b + __va_list_tag + va_list + __builtin_va_list + "
            "the 6 intrinsic builtins + "
            "the 6 __builtin bit-count intrinsics + the 56 __builtin_stdc_* "
@@ -22530,4 +22540,83 @@ TEST(SemanticAnalyzerC, EveryOccurrenceOfAnOverflowingLiteralIsReported) {
     });
     EXPECT_EQ(overflowWarnings(model), 3u);
     EXPECT_FALSE(model.hasErrors());
+}
+
+// ── P64 REMEDIATION: the generic accessors' BINDING position ─────────────────
+//
+// `genericPointee` binds `T` from the argument in the binding position, and it
+// asked `kind(argTy) == Ptr` BEFORE C 6.3.2.1p3's array-to-pointer decay. An
+// ARRAY therefore answered `Array`, the binding was skipped, and the exemplar's
+// strict check then reported `S_TypeMismatch` on a shape both references run
+// (✔MEASURED: gcc 13.3.0 -O2 and clang 18.1.3 -O2, `arr` and `arr + 2`, exit 42).
+// A refusal is loud, but the union makes acceptance REQUIRED here.
+//
+// REMOVE direction: delete `arrayToPointerDecay` from
+// `specializeGenericPointeeSignature` and the first two arms go red. The last
+// two are the CONTROL — shapes that were ALREADY accepted, so "everything
+// compiles" cannot be what this test is reporting.
+TEST(SemanticAnalyzerC, AnArrayInTheGenericAccessorBindingPositionDecays) {
+    struct Arm { char const* expr; char const* why; };
+    std::array<Arm, 4> const arms{{
+        {"arr",
+         "a bare array NAME decays to a pointer to its first element"},
+        {"arr + 2",
+         "and so does array-name arithmetic"},
+        {"&arr[2]",
+         "CONTROL: the already-accepted address-of-element spelling"},
+        {"p",
+         "CONTROL: the already-accepted pointer-variable spelling"},
+    }};
+    for (auto const& a : arms) {
+        auto model = analyzeShipped("c", {
+            std::string("_Atomic long long arr[4];\n"
+            "long long f(void) {\n"
+            "    _Atomic long long *p = &arr[0];\n"
+            "    (void)p;\n"
+            "    return atomic_load_explicit(") + a.expr + ", 5);\n"
+            "}\n",
+        });
+        EXPECT_FALSE(model.hasErrors())
+            << a.expr << ": " << a.why;
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_TypeMismatch), 0u)
+            << a.expr << ": the binding must SPECIALIZE, not fall back to the "
+                         "i32 exemplar and mismatch against it";
+    }
+}
+
+// ── P64: C §7.17.1p6's `M` in the SEMANTIC tier ──────────────────────────────
+//
+// "For atomic integer types, M is C. For atomic pointer types, M is ptrdiff_t."
+// The declaration substituted `C` into the operand parameter for EVERY object
+// type, so an atomic pointer's operand parameter came out as `int *` — a
+// parameter no correct call can satisfy, and the whole atomic-pointer
+// arithmetic surface was refused `S_TypeMismatch` while gcc AND clang both ran
+// it. (They disagree about the MEANING — gcc unscaled, clang scaled — and the
+// standard text settles that against gcc; see the lowering's own note.)
+//
+// REMOVE direction: delete `pointerDifferenceParams` from the
+// `atomic_fetch_{add,sub}_explicit` rows in `sources/c.lang.json` and the first
+// two arms go red. The INTEGER arm is the CONTROL: `M` is `C` there, so it must
+// keep working through the unchanged `applyToParams` substitution.
+TEST(SemanticAnalyzerC, AnAtomicPointerRmwOperandIsPtrdiffNotThePointee) {
+    struct Arm { char const* decl; char const* call; char const* why; };
+    std::array<Arm, 3> const arms{{
+        {"int * _Atomic gp;", "atomic_fetch_add_explicit(&gp, 2, 5)",
+         "an atomic POINTER's fetch_add operand is ptrdiff_t (§7.17.1p6)"},
+        {"int * _Atomic gp;", "atomic_fetch_sub_explicit(&gp, 2, 5)",
+         "and so is fetch_sub's"},
+        {"_Atomic long gp;",  "atomic_fetch_add_explicit(&gp, 2, 5)",
+         "CONTROL: for an atomic INTEGER object M is C, unchanged"},
+    }};
+    for (auto const& a : arms) {
+        auto model = analyzeShipped("c", {
+            std::string(a.decl) + "\nint main(void) { (void)(" + a.call
+            + "); return 0; }\n",
+        });
+        EXPECT_FALSE(model.hasErrors()) << a.call << ": " << a.why;
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_TypeMismatch), 0u)
+            << a.call << ": " << a.why;
+    }
 }

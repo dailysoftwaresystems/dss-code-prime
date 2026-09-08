@@ -15063,10 +15063,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // 'name'; 'signature' and 'params'/'result' are mutually
                         // exclusive). `$`-prefixed keys are the codebase-wide
                         // documentation convention, never a role.
-                        static constexpr std::array<std::string_view, 7>
+                        static constexpr std::array<std::string_view, 8>
                             kBuiltinFnKeys{"name", "signature",
                                            "signatureByDataModel", "params",
-                                           "result", "variadic", "lowering"};
+                                           "result", "variadic", "lowering",
+                                           // D-CSUBSET-ATOMIC-MONOMORPH-I32
+                                           "genericPointee"};
                         DSS_CHECK_KEY_VOCABULARY(kBuiltinFnKeys);
                         {
                             bool keysOk = true;
@@ -15172,7 +15174,173 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 }
                                 m.lowering = *lw;
                             }
+                            // D-CSUBSET-ATOMIC-MONOMORPH-I32: the OPTIONAL
+                            // type-generic declaration. Only meaningful on the
+                            // `signature` form (the scalar params/result axis
+                            // cannot spell a pointer, so it can carry no pointee
+                            // to bind from) — the `params`/`result` branch below
+                            // rejects it explicitly rather than ignoring it.
+                            if (entry.contains("genericPointee")) {
+                                json const& gp = entry.at("genericPointee");
+                                static constexpr std::array<std::string_view, 4>
+                                    kGenericPointeeKeys{"bindFromParam",
+                                                        "applyToParams",
+                                                        "applyToResult",
+                                                        "pointerDifferenceParams"};
+                                DSS_CHECK_KEY_VOCABULARY(kGenericPointeeKeys);
+                                if (!gp.is_object()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/genericPointee",
+                                              "'genericPointee' must be an object "
+                                              "{ bindFromParam, applyToParams, "
+                                              "applyToResult }");
+                                    continue;
+                                }
+                                if (!checkKeysAgainst(
+                                        gp, kGenericPointeeKeys,
+                                        path + "/genericPointee",
+                                        "a 'genericPointee' block",
+                                        DiagnosticCode::C_InvalidSemantics, coll))
+                                    continue;
+                                BuiltinGenericPointee g;
+                                if (!gp.contains("bindFromParam")
+                                    || !gp.at("bindFromParam").is_number_unsigned()) {
+                                    coll.emit(DiagnosticCode::C_MissingField,
+                                              path + "/genericPointee/bindFromParam",
+                                              "'bindFromParam' is required and must "
+                                              "be a non-negative parameter index");
+                                    continue;
+                                }
+                                g.bindFromParam =
+                                    gp.at("bindFromParam").get<std::uint32_t>();
+                                // An EMPTY / absent `applyToParams` with no
+                                // `applyToResult` would declare a generic that
+                                // substitutes NOWHERE — a knob that lies, the same
+                                // class this loader rejects everywhere else. Refuse
+                                // it rather than load a no-op declaration clean.
+                                if (gp.contains("applyToParams")) {
+                                    json const& ap = gp.at("applyToParams");
+                                    if (!ap.is_array()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  path + "/genericPointee/applyToParams",
+                                                  "'applyToParams' must be an array "
+                                                  "of parameter indices");
+                                        continue;
+                                    }
+                                    bool apOk = true;
+                                    for (auto const& e : ap) {
+                                        if (!e.is_number_unsigned()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      path + "/genericPointee/applyToParams",
+                                                      "each 'applyToParams' entry must "
+                                                      "be a non-negative parameter index");
+                                            apOk = false;
+                                            break;
+                                        }
+                                        g.applyToParams.push_back(
+                                            e.get<std::uint32_t>());
+                                    }
+                                    if (!apOk) continue;
+                                }
+                                if (gp.contains("applyToResult")) {
+                                    if (!gp.at("applyToResult").is_boolean()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  path + "/genericPointee/applyToResult",
+                                                  "'applyToResult' must be a boolean");
+                                        continue;
+                                    }
+                                    g.applyToResult =
+                                        gp.at("applyToResult").get<bool>();
+                                }
+                                // C §7.17.1p6's `M`: the parameters that take the
+                                // language's POINTER-DIFFERENCE type instead of
+                                // `T` when `T` is itself a pointer. A REFINEMENT
+                                // of `applyToParams`, so every index must appear
+                                // there too — otherwise a reader of
+                                // `applyToParams` would not see every substituted
+                                // position, and `bindFromParam` (which takes the
+                                // argument verbatim) can never be one of them.
+                                if (gp.contains("pointerDifferenceParams")) {
+                                    json const& pd =
+                                        gp.at("pointerDifferenceParams");
+                                    if (!pd.is_array()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  path + "/genericPointee"
+                                                         "/pointerDifferenceParams",
+                                                  "'pointerDifferenceParams' must be "
+                                                  "an array of parameter indices");
+                                        continue;
+                                    }
+                                    bool pdOk = true;
+                                    for (auto const& e : pd) {
+                                        if (!e.is_number_unsigned()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      path + "/genericPointee"
+                                                             "/pointerDifferenceParams",
+                                                      "each 'pointerDifferenceParams' "
+                                                      "entry must be a non-negative "
+                                                      "parameter index");
+                                            pdOk = false;
+                                            break;
+                                        }
+                                        auto const idx = e.get<std::uint32_t>();
+                                        if (idx == g.bindFromParam) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      path + "/genericPointee"
+                                                             "/pointerDifferenceParams",
+                                                      "'pointerDifferenceParams' may "
+                                                      "not name 'bindFromParam' — that "
+                                                      "parameter takes the binding "
+                                                      "argument's own type, not a "
+                                                      "substituted one");
+                                            pdOk = false;
+                                            break;
+                                        }
+                                        if (std::find(g.applyToParams.begin(),
+                                                      g.applyToParams.end(), idx)
+                                            == g.applyToParams.end()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      path + "/genericPointee"
+                                                             "/pointerDifferenceParams",
+                                                      "each 'pointerDifferenceParams' "
+                                                      "entry must also appear in "
+                                                      "'applyToParams' — it REFINES a "
+                                                      "declared substitution, it does "
+                                                      "not add one");
+                                            pdOk = false;
+                                            break;
+                                        }
+                                        g.pointerDifferenceParams.push_back(idx);
+                                    }
+                                    if (!pdOk) continue;
+                                }
+                                if (g.applyToParams.empty() && !g.applyToResult) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/genericPointee",
+                                              "'genericPointee' substitutes nowhere "
+                                              "— declare at least one entry in "
+                                              "'applyToParams' or set "
+                                              "'applyToResult'");
+                                    continue;
+                                }
+                                m.genericPointee = std::move(g);
+                            }
                             cfg.builtinFunctions.push_back(std::move(m));
+                            continue;
+                        }
+                        // D-CSUBSET-ATOMIC-MONOMORPH-I32: `genericPointee` binds
+                        // `T` from a POINTER parameter's pointee, and the scalar
+                        // `params`/`result` axis cannot declare a pointer at all —
+                        // so on this branch it could never bind. Same fail-loud as
+                        // `signatureByDataModel` below, for the same reason: a knob
+                        // that loads clean and does nothing is the failure mode.
+                        if (entry.contains("genericPointee")) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      path + "/genericPointee",
+                                      "'genericPointee' and 'params'/'result' are "
+                                      "mutually exclusive — it binds a POINTER "
+                                      "parameter's pointee, which the scalar "
+                                      "params/result axis cannot declare");
                             continue;
                         }
                         // D-LANG-TYPE-IDENTITY-VOCABULARY: `signatureByDataModel`

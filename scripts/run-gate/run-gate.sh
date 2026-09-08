@@ -52,6 +52,78 @@ fi
 log="$1";     shift
 witness="$1"; shift
 
+# ══ PREFLIGHT: A PARALLEL ctest UNDER MSYS DIES PART-WAY. REFUSE IT UP FRONT. ══
+#
+# ⚠⚠ ✔MEASURED 2026-09-08 (P64), a discriminator, not a correlation. The SAME
+# `ctest --test-dir build/dbg -j 4`, on the SAME tree, in the SAME minutes:
+#
+#     launched through THIS script from Git Bash   -> died at 8, then 83, then
+#                                                     271, then 612 of 2131
+#     launched from PowerShell, no bash in between -> 2131/2131, rc 0, 910 s
+#
+# Four aborts, four different points, NO test ever reporting a failure, 36 GB RAM
+# free, and excluding every repo guard changed nothing. It is not ctest and it is
+# not the tree: it is MSYS's `fork()` emulation. Under `-j N` each ctest worker
+# spawns a compiler which spawns children; the emulation runs out and the SHELL
+# dies, taking its whole child tree with it.
+#
+# ★ THE EXIT CODE WAS TELLING ME THIS THE WHOLE TIME AND I READ IT AS A QUIRK:
+# one of those runs came back **127**, and a POSIX shell reserves 127 for "command
+# not found" — the shell saying it could not exec. The rc-127 arm at the bottom of
+# this file already explains that; nothing connected it to the aborts because the
+# other runs returned 1. ⇒ Four wasted runs, and a truncated log whose rc reads
+# exactly like an ordinary test failure.
+#
+# ⇒ **REFUSE BEFORE STARTING, never truncate half a gate.** A gate that examines
+# 4% of the suite and returns a failure-shaped code is worse than one that will
+# not start: the first invites you to debug the tree, the second names the fix.
+# The `.ps1` twin is the supported path on this host and it is not affected.
+#
+# ⓘ SCOPED DELIBERATELY: only MSYS, only `ctest`, only genuine parallelism. A
+# serial `ctest` under MSYS is fine (measured), so it is allowed through — an
+# escape everything triggers would refuse nothing
+# ([[feedback-an-escape-every-row-triggers-disarms-the-guard]]).
+run_gate_preflight_exit=4
+case "$(uname -s 2>/dev/null || echo unknown)" in
+    MSYS*|MINGW*)
+        run_gate_is_ctest=0
+        case "${1##*/}" in ctest|ctest.exe) run_gate_is_ctest=1 ;; esac
+        if [ "$run_gate_is_ctest" -eq 1 ]; then
+            run_gate_par=""
+            run_gate_prev=""
+            for run_gate_a in "$@"; do
+                case "$run_gate_a" in
+                    -j[0-9]*)      run_gate_par="${run_gate_a#-j}" ;;
+                    --parallel=*)  run_gate_par="${run_gate_a#--parallel=}" ;;
+                esac
+                case "$run_gate_prev" in
+                    -j|--parallel) run_gate_par="$run_gate_a" ;;
+                esac
+                run_gate_prev="$run_gate_a"
+            done
+            case "$run_gate_par" in
+                ''|1) : ;;   # serial is fine under MSYS — measured
+                *)
+                    echo "run-gate.sh: REFUSED — a PARALLEL ctest under MSYS dies part-way (rc=$run_gate_preflight_exit)." >&2
+                    echo "  shell    : $(uname -s) (Git Bash / MSYS)" >&2
+                    echo "  command  : $*" >&2
+                    echo "  parallel : -j $run_gate_par" >&2
+                    echo "  ✔MEASURED P64: this exact command died at 8, 83, 271 and 612 of 2131 under" >&2
+                    echo "    MSYS — four runs, four points, ZERO tests reporting a failure — while the" >&2
+                    echo "    same command from PowerShell completed 2131/2131 rc 0. MSYS's fork()" >&2
+                    echo "    emulation cannot sustain the process fan-out of a parallel ctest." >&2
+                    echo "  ⇒ USE THE .ps1 TWIN, which is unaffected:" >&2
+                    echo "      pwsh -NoProfile -File scripts/run-gate/run-gate.ps1 <log> <regex> $*" >&2
+                    echo "  ⇒ Or run it serially here (-j 1), which is measured-safe but ~4x slower." >&2
+                    echo "  This refusal exists because the alternative is a gate that stops at 4% of" >&2
+                    echo "  the suite and returns a code indistinguishable from a real test failure." >&2
+                    exit "$run_gate_preflight_exit"
+                    ;;
+            esac
+        fi
+        ;;
+esac
+
 # ── WHICH SHELL IS ACTUALLY RUNNING THIS, NAMED IN EVERY REFUSAL ────────────
 #
 # ★★ A GATE THAT REFUSES MUST SAY WHICH REFUSAL IT IS. This wrapper's whole

@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -98,6 +99,27 @@ findExecSectionVirtualSize(std::vector<std::uint8_t> const& img,
             if (static_cast<char>(img[h + b]) != name[b]) { eq = false; break; }
         }
         if (eq) return readU32LE(img, h + 8);
+    }
+    return 0u;
+}
+
+// D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN (P64): a section's SizeOfRawData (section
+// header +16) — the FILE extent, which is what bounds a search through the
+// emitted bytes. Misc.VirtualSize above is page-rounded and can reach past the
+// section's own raw data into the next one's, so a scan bounded by IT could
+// match a neighbour's bytes and report a placement the writer never made.
+// Returns 0 if absent (the caller asserts).
+[[nodiscard]] std::uint32_t
+findExecSectionRawSize(std::vector<std::uint8_t> const& img,
+                       std::array<char, 8> const&       name) {
+    std::uint16_t const n = readU16LE(img, 0x86);
+    for (std::uint16_t i = 0; i < n; ++i) {
+        std::size_t const h = 0x188u + static_cast<std::size_t>(i) * 40u;
+        bool eq = true;
+        for (std::size_t b = 0; b < 8; ++b) {
+            if (static_cast<char>(img[h + b]) != name[b]) { eq = false; break; }
+        }
+        if (eq) return readU32LE(img, h + 16);
     }
     return 0u;
 }
@@ -4019,15 +4041,33 @@ TEST(PeExecTls, FunctionTlsKindRelocTargetingNonTlsSymbolFailsLoud) {
     EXPECT_TRUE(saw) << "a tls-kind reloc against a non-tls symbol fails loud";
 }
 
-TEST(PeExecTls, OveralignedThreadLocalFailsLoud) {
-    // ★ D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN (audit FOLD-1), RED-on-disable:
-    // an `_Alignas(32) thread_local` var can't be honored on PE/x64 — the
-    // Windows loader guarantees only 16-byte (MEMORY_ALLOCATION_ALIGNMENT)
-    // static-TLS block-base alignment and IMAGE_TLS_DIRECTORY64 has no field
-    // to request more. The writer MUST fail loud
-    // (K_ThreadLocalOveralignedForFormat 0x8016) rather than silently
-    // under-align every thread's copy. Disable the pe.cpp gate → this
-    // compiles clean = the silent miscompile (the red).
+// ── D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN (P64) ─────────────────────────────────
+//
+// ⚠⚠ WHAT USED TO BE PINNED HERE WAS THE DIVERGENCE, NOT THE CONTRACT. The test
+// that stood in this slot asserted that an `_Alignas(32) thread_local` is
+// REFUSED on pe64, on the premise that the Windows loader guarantees only
+// MEMORY_ALLOCATION_ALIGNMENT and that IMAGE_TLS_DIRECTORY64 "has no field to
+// request more". ✔BOTH HALVES ARE REFUTED BY MEASUREMENT:
+//
+//   * THE FIELD EXISTS. `Characteristics` is a union in the Windows SDK's own
+//     `winnt.h` — `{ Reserved0 : 20; Alignment : 4; Reserved1 : 8; }`, the
+//     ordinary IMAGE_SCN_ALIGN_* nibble.
+//   * THE LOADER HONOURS IT, and the evidence is a DISCRIMINATOR rather than a
+//     correlation: one MSVC-linked image carrying seven 4096-aligned
+//     `__declspec(thread)` objects RAN 42 with every address `% 4096 == 0` on
+//     the main thread and on a `CreateThread` worker; the SAME FILE with ONLY
+//     that nibble rewritten 4096 → 16 RAN 50 (`t1 mod 4096 = 720`). Same
+//     template, same block size, same code bytes.
+//   * THE REFERENCES BUILD AND RUN IT. MSVC 19.51 (native Windows TLS) returns
+//     42 at 8, 16 (control), 32, 64, 4096 and — with `/link /ALIGN:8192` — 8192;
+//     mingw-w64 gcc 13.2.0 returns 42 across the same range.
+//
+// ★ WHAT SURVIVES IS THE CEILING THE CONTAINER IMPOSES: a FOUR-BIT field tops
+// out at IMAGE_SCN_ALIGN_8192BYTES, and BOTH references stop at exactly 8192 by
+// name (gcc "requested alignment '16384' exceeds object file maximum 8192";
+// MSVC `error C2345`). So the refusal moved from 16 to 16384-and-up, which is
+// inside the union rather than above it.
+TEST(PeExecTls, ThreadLocalPastTheEncodableCeilingFailsLoud) {
     auto loaded = loadShippedExec();
     ASSERT_TRUE(loaded.target && loaded.format);
     AssembledModule mod;
@@ -4036,47 +4076,122 @@ TEST(PeExecTls, OveralignedThreadLocalFailsLoud) {
     fn.symbol = SymbolId{1};
     fn.bytes  = {0xC3};
     mod.functions.push_back(std::move(fn));
-    mod.dataItems.push_back(makeTdataItem(42, {1, 0, 0, 0}, 32));  // _Alignas(32)
+    mod.dataItems.push_back(makeTdataItem(42, {1, 0, 0, 0}, 16384));
 
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
+    EXPECT_TRUE(bytes.empty()) << "no artifact may be written";
     bool saw = false;
     for (auto const& diag : rep.all())
         if (diag.code == DiagnosticCode::K_ThreadLocalOveralignedForFormat)
             saw = true;
     EXPECT_TRUE(saw)
-        << "an over-aligned (>16) thread-local must fail loud on pe64 — "
-           "the loader cannot guarantee the per-thread block alignment";
+        << "16384 exceeds the four-bit IMAGE_SCN_ALIGN_* field's largest value "
+           "(8192), so the block-base request cannot be expressed — both PE "
+           "references refuse the same value by name";
 }
 
-// ── D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN (P63) ──────────
+// The BOUNDARY, and the arm that makes the refusal above a statement about what
+// the CONTAINER holds rather than about over-alignment in general: 8192 is the
+// largest value the nibble encodes, and it must COMPILE. This is the arm that
+// goes red if anyone re-tightens the ceiling toward the withdrawn 16.
+TEST(PeExecTls, ThreadLocalAtTheEncodableCeilingCompilesClean) {
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    mod.dataItems.push_back(makeTdataItem(42, {1, 0, 0, 0}, 8192));
+
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& diag : rep.all())
+        EXPECT_NE(diag.code, DiagnosticCode::K_ThreadLocalOveralignedForFormat)
+            << "8192 IS encodable (IMAGE_SCN_ALIGN_8192BYTES) — the gate is `>`";
+    EXPECT_FALSE(bytes.empty())
+        << "an 8192-aligned thread-local must still emit an image; both PE "
+           "references build AND run this value";
+}
+
+// ★★ THE BYTE-LEVEL PIN, and it is the one that would have caught the original
+// defect. Accepting an over-aligned thread-local is worthless — strictly worse
+// than the old refusal — unless the image ASKS the loader for the alignment,
+// and the only place it can ask is this nibble. Two arms, because a single
+// value cannot tell "the writer computed it" from "the writer hardcoded it".
+TEST(PeExecTls, DirectoryCharacteristicsCarryTheBlockBaseAlignment) {
+    auto const nibbleFor = [](std::uint32_t align) -> std::uint32_t {
+        auto loaded = loadShippedExec();
+        EXPECT_TRUE(loaded.target && loaded.format);
+        AssembledModule mod;
+        mod.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        fn.bytes  = {0xC3};
+        mod.functions.push_back(std::move(fn));
+        mod.dataItems.push_back(makeTdataItem(42, {7, 0, 0, 0}, align));
+        DiagnosticReporter rep;
+        auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+        EXPECT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+        EXPECT_FALSE(bytes.empty());
+        if (bytes.empty()) return 0xFFFFFFFFu;
+        // DataDirectory[9] (TLS) RVA is at 0x150; map it back through the
+        // `.tls` section header to a file offset, then read Characteristics at
+        // directory + 36.
+        std::uint32_t const dirRva = readU32LE(bytes, 0x150);
+        auto const tls = findExecSection(bytes, {'.', 't', 'l', 's', 0, 0, 0, 0});
+        EXPECT_NE(tls.first, 0u);
+        std::size_t const dirOff = tls.second + (dirRva - tls.first);
+        return (readU32LE(bytes, dirOff + 36) & 0x00F00000u) >> 20;
+    };
+    // 2^(k-1) bytes: 4096 → 13, 8192 → 14. Two DIFFERENT values, so the arm
+    // fails on a constant as loudly as on a dropped write.
+    EXPECT_EQ(nibbleFor(4096), 13u)
+        << "IMAGE_SCN_ALIGN_4096BYTES — the loader allocates every thread's "
+           "block on that boundary";
+    EXPECT_EQ(nibbleFor(8192), 14u) << "IMAGE_SCN_ALIGN_8192BYTES";
+    // ★ AND THE FLOOR: at or below the platform's own 16-byte guarantee the
+    // field stays ZERO ("unspecified — take the default"). Requesting LESS than
+    // the default would be a downgrade, and requesting exactly it would rewrite
+    // the bytes of every TLS image this project has ever emitted to say what
+    // the loader already does.
+    EXPECT_EQ(nibbleFor(4), 0u)  << "below the default: unspecified";
+    EXPECT_EQ(nibbleFor(16), 0u) << "AT the default: still unspecified";
+}
+
+// ── D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN, static twin (P64) ────────────────────
 //
-// The ORDINARY-STORAGE twin of `OveralignedThreadLocalFailsLoud` above, and it sits
-// here rather than beside the semantic alignment pins on purpose: this is a FORMAT
-// ceiling, not a type one. A PE image's sections begin at multiples of the format
-// document's declared `SectionAlignment` (4096 on the shipped exec document) and
-// nothing stronger, so a statically allocated object asking for more cannot be
-// placed — it must be REFUSED, never emitted at whatever address the section base
-// happens to give it.
+// The ORDINARY-STORAGE twin of the thread-local arms above, and it sits here
+// rather than beside the semantic alignment pins on purpose: this is a FORMAT
+// ceiling, not a type one.
 //
-// ✔MEASURED with this gate absent and the requestable ceiling raised: a program
-// with four `__attribute__((aligned(8192)))` statics behind odd-sized fillers built
-// rc 0 and the FIRST one failed its own `address % 8192` check at run time. A clean
-// build placing an over-aligned object misaligned is the silent miscompile this
-// project ranks below every diagnostic. (One object at a section head can be right
-// BY LUCK — a single-object probe returned 42 at the same value — which is why the
-// runtime witness `examples/c/alignment_static_exceeds_format` carries several.)
+// ⚠⚠ THE OLD BOUND WAS THE FORMAT DOCUMENT'S DECLARED `SectionAlignment` (4096),
+// AND IT WAS WRONG IN BOTH DIRECTIONS. It refused 8192 statics that BOTH PE
+// references build and RUN (✔MEASURED, multi-object subject, runtime address
+// asserted: mingw-w64 gcc 13.2.0 → 42; MSVC 19.51 with `/link /ALIGN:8192` →
+// 42) — and its stated remedy, raise `optionalHeader.sectionAlignment`, is not
+// what the reference does: ✔`pedump` on the mingw-linked image shows
+// SectionAlignment UNCHANGED at 0x1000, `.bss` based at an RVA that is ≡ 4096
+// mod 8192, and the objects inside it nonetheless ≡ 0 mod 8192. `ld` PADS WITHIN
+// THE SECTION, and `pe::encodeExec` now does the same.
 //
-// ★ THE UNION SAYS THE CEILING IS REAL: mingw-w64 gcc 13.2.0 refuses a PE static
-// above 8192 ("alignment of 'g' is greater than maximum object file alignment
-// 8192") and MSVC 19.51 refuses `__declspec(align(16384))` with `error C2345`, both
-// probed SEPARATELY. ★★ AND THE CONTROLS SAY IT IS ABOUT STORAGE, NOT ABOUT
-// ALIGNMENT: the same compiler at the same value BUILDS AND RUNS the request on a
-// TYPE and on an AUTOMATIC object — which is why this gate must never migrate into
-// the semantic ladder, where it would refuse `aligned(65536)` types that every
-// reference runs.
-TEST(PeExecData, OveralignedStaticObjectFailsLoud) {
+// ✔THE MISCOMPILE THE GATE STILL PREVENTS IS REAL (P63, measured with neither
+// gate nor padding): four `aligned(8192)` statics behind odd-sized fillers built
+// rc 0 and the FIRST one failed its own `address % 8192` check at run time. One
+// object at a section head can be right BY LUCK — a single-object probe returned
+// 42 at the same value — which is why the witnesses carry several.
+//
+// ★ WHAT SURVIVES IS THE CONTAINER'S OWN LIMIT: PE/COFF spells an object's
+// alignment in a FOUR-BIT IMAGE_SCN_ALIGN_* field, largest value 8192, and both
+// references stop at exactly that by name (gcc "requested alignment '16384'
+// exceeds object file maximum 8192"; MSVC `error C2345`). ★★ AND THE CONTROLS
+// SAY IT IS ABOUT STORAGE, NOT ABOUT ALIGNMENT: the same compiler at the same
+// value BUILDS AND RUNS the request on a TYPE and on an AUTOMATIC object — which
+// is why this gate must never migrate into the semantic ladder, where it would
+// refuse `aligned(65536)` types that every reference runs.
+TEST(PeExecData, StaticObjectPastTheEncodableCeilingFailsLoud) {
     auto loaded = loadShippedExec();
     ASSERT_TRUE(loaded.target && loaded.format);
     AssembledModule mod;
@@ -4089,7 +4204,7 @@ TEST(PeExecData, OveralignedStaticObjectFailsLoud) {
     d.symbol    = SymbolId{42};
     d.section   = DataSectionKind::Data;
     d.bytes     = {1, 0, 0, 0};
-    d.alignment = Alignment::ofRuntimePow2(8192);   // one step past SectionAlignment
+    d.alignment = Alignment::ofRuntimePow2(16384);  // one step past the nibble
     mod.dataItems.push_back(std::move(d));
 
     DiagnosticReporter rep;
@@ -4100,16 +4215,14 @@ TEST(PeExecData, OveralignedStaticObjectFailsLoud) {
         if (diag.code == DiagnosticCode::K_StaticObjectOveralignedForFormat)
             saw = true;
     EXPECT_TRUE(saw)
-        << "a static object over-aligned past the document's declared "
-           "SectionAlignment must fail loud on pe64 — the image cannot place it";
+        << "16384 cannot be encoded in PE/COFF's four-bit alignment field, so "
+           "the object could only be placed misaligned — both PE references "
+           "refuse the same value by name";
 }
 
-// The BOUNDARY, and the arm that makes the refusal above a statement about the
-// DECLARED number rather than about over-alignment in general: alignment EXACTLY
-// equal to the document's `SectionAlignment` (4096) is the largest that passes.
-// The gate is `>`, not `>=`. This is also the alignment `examples/c/
-// alignment_page_request` runs at on every shipped format.
-TEST(PeExecData, StaticObjectAtTheDeclaredSectionAlignmentCompilesClean) {
+// The BOUNDARY: 8192 is the largest encodable value and it must COMPILE. This is
+// the arm that goes red if anyone re-ties the ceiling to `SectionAlignment`.
+TEST(PeExecData, StaticObjectAtTheEncodableCeilingCompilesClean) {
     auto loaded = loadShippedExec();
     ASSERT_TRUE(loaded.target && loaded.format);
     AssembledModule mod;
@@ -4122,22 +4235,123 @@ TEST(PeExecData, StaticObjectAtTheDeclaredSectionAlignmentCompilesClean) {
     d.symbol    = SymbolId{42};
     d.section   = DataSectionKind::Data;
     d.bytes     = {1, 0, 0, 0};
-    d.alignment = Alignment::ofRuntimePow2(4096);
+    d.alignment = Alignment::ofRuntimePow2(8192);
     mod.dataItems.push_back(std::move(d));
 
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     for (auto const& diag : rep.all())
         EXPECT_NE(diag.code, DiagnosticCode::K_StaticObjectOveralignedForFormat)
-            << "4096 IS the declared SectionAlignment — the gate must not bite it";
-    EXPECT_FALSE(bytes.empty()) << "a page-aligned static must still emit an image";
+            << "8192 is encodable — the gate is `>`, and it is not tied to "
+               "the document's SectionAlignment any more";
+    EXPECT_FALSE(bytes.empty())
+        << "an 8192-aligned static must still emit an image; both PE references "
+           "build AND run this value";
+}
+
+// ★★ THE PLACEMENT PIN, and it is the one that makes acceptance worth having.
+// Accepting an 8192 static and then putting it wherever the section base falls
+// is strictly worse than the old refusal, so this arm reads the EMITTED IMAGE
+// and computes each object's virtual address the way the loader will:
+// `imageBase + sectionRva + offsetInSection`. The offsets are FOUND by searching
+// the raw section bytes for each object's own marker rather than recomputed from
+// the layout rule, so the arm cannot agree with the writer by sharing its
+// arithmetic. Two over-aligned objects, separated by an ODD-sized filler, so the
+// second one is provably not at the section head.
+TEST(PeExecData, OveralignedStaticsLandOnAlignedVirtualAddresses) {
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    auto const dataItem = [](std::uint32_t sym, std::vector<std::uint8_t> b,
+                             std::uint32_t align) {
+        AssembledData d;
+        d.symbol    = SymbolId{sym};
+        d.section   = DataSectionKind::Data;
+        d.bytes     = std::move(b);
+        d.alignment = Alignment::ofRuntimePow2(align);
+        return d;
+    };
+    // ⚠⚠ THIS `.rdata` ITEM IS THE WHOLE ARM, AND ITS ABSENCE MADE THE ARM
+    // VACUOUS. ✔MEASURED: with only `.data` present, the section chains to RVA
+    // 0x2000 and `imageBase + 0x2000` is ALREADY 8192-aligned, so the head pad
+    // is zero and this test passed IDENTICALLY with the padding pass deleted —
+    // a red-on-disable run reddened the corpus example and left this arm GREEN.
+    // One `.rdata` item takes a whole page (VirtualSize is section-aligned), so
+    // `.data` moves to 0x3000 and its base VA becomes ≡ 4096 mod 8192: the pad
+    // is now the only thing that can put these objects on 8192. The arm asserts
+    // that below, so it can never silently become vacuous again.
+    AssembledData ro;
+    ro.symbol    = SymbolId{41};
+    ro.section   = DataSectionKind::Rodata;
+    ro.bytes     = {0xC1, 0xC2, 0xC3, 0xC4};
+    ro.alignment = Alignment::ofRuntimePow2(4);
+    mod.dataItems.push_back(std::move(ro));
+    // Distinctive 4-byte markers so the search cannot latch onto padding.
+    mod.dataItems.push_back(dataItem(42, {0xA1, 0xA2, 0xA3, 0xA4}, 8192));
+    mod.dataItems.push_back(dataItem(43, {9, 9, 9, 9, 9, 9, 9}, 1));   // odd filler
+    mod.dataItems.push_back(dataItem(44, {0xB1, 0xB2, 0xB3, 0xB4}, 8192));
+
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    ASSERT_FALSE(bytes.empty());
+
+    constexpr std::uint64_t kImageBase = 0x140000000ull;
+    auto const dataSec = findExecSection(bytes, {'.', 'd', 'a', 't', 'a', 0, 0, 0});
+    ASSERT_NE(dataSec.first, 0u) << ".data must exist";
+    // ★ NON-VACUITY, ASSERTED RATHER THAN ARRANGED AND FORGOTTEN: the section
+    // this arm reads must NOT already begin on an 8192 boundary, or the head
+    // pad would be zero and the two checks below would hold with the padding
+    // pass deleted. If a future change to the section chain moves `.data` back
+    // onto a boundary, THIS is the line that says so.
+    ASSERT_NE((kImageBase + dataSec.first) % 8192ull, 0ull)
+        << ".data's own base is 8192-aligned, so this arm proves nothing about "
+           "the head pad — give the module another section ahead of `.data`";
+    std::uint32_t const dataRawSize =
+        findExecSectionRawSize(bytes, {'.', 'd', 'a', 't', 'a', 0, 0, 0});
+    ASSERT_GT(dataRawSize, 0u);
+
+    auto const findMarker =
+        [&](std::array<std::uint8_t, 4> const& m) -> std::optional<std::uint64_t> {
+        for (std::uint32_t o = 0; o + 4 <= dataRawSize; ++o) {
+            std::size_t const f = dataSec.second + o;
+            if (f + 4 > bytes.size()) break;
+            if (bytes[f] == m[0] && bytes[f + 1] == m[1]
+                && bytes[f + 2] == m[2] && bytes[f + 3] == m[3])
+                return static_cast<std::uint64_t>(o);
+        }
+        return std::nullopt;
+    };
+    auto const offA = findMarker({0xA1, 0xA2, 0xA3, 0xA4});
+    auto const offB = findMarker({0xB1, 0xB2, 0xB3, 0xB4});
+    ASSERT_TRUE(offA.has_value()) << "the first over-aligned item's bytes";
+    ASSERT_TRUE(offB.has_value()) << "the second over-aligned item's bytes";
+    EXPECT_NE(*offA, *offB) << "two distinct objects";
+
+    std::uint64_t const vaA = kImageBase + dataSec.first + *offA;
+    std::uint64_t const vaB = kImageBase + dataSec.first + *offB;
+    EXPECT_EQ(vaA % 8192ull, 0ull)
+        << "the FIRST 8192-aligned static's load address; .data's own base is "
+           "only SectionAlignment-aligned, so this holds only because the "
+           "writer pads the section head";
+    EXPECT_EQ(vaB % 8192ull, 0ull)
+        << "the SECOND one — past an odd-sized filler, so it cannot be right "
+           "by sitting at the section head";
 }
 
 TEST(PeExecTls, SixteenByteAlignedThreadLocalCompilesClean) {
-    // Boundary pin: alignment EXACTLY 16 (== the loader's guarantee) is the
-    // largest that passes — the gate is `> 16`, not `>= 16`. Every normal
-    // scalar / pointer / small aggregate thread_local (align <= 16) stays
-    // green; only explicit over-alignment bites.
+    // The ORDINARY case, and the reason it keeps its own arm after the ceiling
+    // moved: 16 is the platform's own block-base guarantee, so this is the
+    // alignment every normal scalar / pointer / small aggregate thread_local
+    // asks for. It compiles clean, it emits `.tls`, and (pinned separately in
+    // `DirectoryCharacteristicsCarryTheBlockBaseAlignment`) it leaves the
+    // directory's alignment nibble at zero — byte-identical to what this writer
+    // has always emitted. What changed in P64 is only what happens ABOVE it.
     auto loaded = loadShippedExec();
     ASSERT_TRUE(loaded.target && loaded.format);
     AssembledModule mod;

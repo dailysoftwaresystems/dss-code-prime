@@ -4028,9 +4028,27 @@ encodeExecDynamic(AssembledModule const&    module,
     // thread-local requiring > 16-byte alignment. Reuses the format-generic
     // K_ThreadLocalOveralignedForFormat (0x8016, C3). Mach-O CAN express a
     // section align, but whether dyld over-aligns the per-thread TLV block
-    // base beyond malloc's 16 is UNVERIFIABLE without a Mac — conservative +
-    // consistent with the PE leg, never a silent under-align. A normal
-    // scalar/pointer/small aggregate (incl. _Alignas(16)) passes.
+    // base beyond malloc's 16 was UNVERIFIABLE without a Mac — conservative,
+    // never a silent under-align. A normal scalar/pointer/small aggregate
+    // (incl. _Alignas(16)) passes.
+    //
+    // ⚠⚠ THIS BOUND'S SECOND JUSTIFICATION IS GONE. It read "conservative +
+    // consistent with the PE leg", and ✔P64 moved the PE leg from 16 to 8192 on
+    // a measurement: `IMAGE_TLS_DIRECTORY64.Characteristics` carries a 4-bit
+    // alignment nibble, and the Windows loader HONOURS it — proved by a
+    // discriminator rather than a correlation, one image run twice with only that
+    // nibble edited (4096 → 42, 16 → 50, back to 4096 → md5 restored and 42
+    // again). ⇒ "Consistent with PE" now argues for raising this, not for keeping
+    // it, so it is deleted rather than left to be read as support.
+    //
+    // ★ WHAT SURVIVES IS THE HONEST HALF, AND IT IS STILL SUFFICIENT ON ITS OWN:
+    // nobody has measured what dyld does above 16. That is a question about a
+    // LOADER, and this project answers those by running on the real one — macOS
+    // is up. Until someone does, the refusal stands because it is UNMEASURED, not
+    // because a sibling format used to agree with it.
+    // ⇒ [[D-CSUBSET-THREAD-LOCAL-MACHO-OVERALIGN]] carries the same stale
+    // justification twice in its own trigger; it must now stand on dyld's
+    // behaviour or fall.
     constexpr std::uint64_t kMachoTlvBlockBaseAlign = 16;
     std::uint64_t tlsMaxAlign = 1;
     if (hasTdata) tlsMaxAlign = std::max(tlsMaxAlign, tdataLayout.maxAlign);

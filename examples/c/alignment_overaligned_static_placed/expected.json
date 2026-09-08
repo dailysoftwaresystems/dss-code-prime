@@ -1,0 +1,28 @@
+{
+  "$comment": "P64 [[D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN]] (static twin, P63's stated residue): the POSITIVE runtime witness that an over-aligned STATIC is PLACED rather than refused. Before this cycle the pe64 leg refused every static above the format document's declared `SectionAlignment` (4096) with `K_StaticObjectOveralignedForFormat`, and the refusal's own advice -- raise `optionalHeader.sectionAlignment` -- was measured WRONG: mingw-w64 `ld` leaves SectionAlignment at 0x1000 and PADS WITHIN the section, so following the advice would have doubled every image's VA granularity and, taken verbatim, hit a second refusal on `sections[].virtualAddress` (PE/COFF 3.4). `pe::encodeExec` now does what the reference does. $$ THE REFERENCE TABLE, each probed SEPARATELY, BUILD **and** RUN with the address asserted at run time on a MULTI-OBJECT subject, CONTROL arm N=16 green throughout: mingw-w64 gcc 13.2.0 returns 42 at 16, 32, 4096 and 8192 and refuses 16384 with \"requested alignment '16384' exceeds object file maximum 8192\"; MSVC 19.51 returns 42 at 16, 32, 4096 and (with `/link /ALIGN:8192`) 8192, and refuses `__declspec(align(16384))` with `error C2345`. Both stop at 8192 independently because that is the largest value PE/COFF's FOUR-BIT IMAGE_SCN_ALIGN_* field can encode. $ WHY IT RUNS RATHER THAN COMPILES: the defect this replaces produced a CLEAN BUILD and a MISPLACED object (P63: exit 50 on four `aligned(8192)` statics), so an arm asserting only that the compile stopped erroring would have passed while the program was wrong. Every exit code here is derived from an address the linker chose. $ WHY EIGHT OBJECTS: one object sits at its section head and is right BY LUCK -- P63's one-object 8192 probe returned 42 with the defect live. Odd-sized fillers separate them and both storage classes (.bss and .data) are covered, because PE gives those two different section bases. $ NO MACH-O ARM: the Mach-O writer owns its own thread-local ceiling under its own anchor and this lane may not touch that file; the ELF arms are here because P63 measured them placing the same objects correctly.",
+  "$commentRedOnDisable": "REMOVE direction: in `src/link/format/pe.cpp`, delete the `alignSectionHeadToItems` forward pass (the lambda and its three calls) inside the static-placement block of `pe::encodeExec`. Build rc 0, source md5 moved and returned, the mutated TU's .obj md5 moved and returned; this example then BUILDS CLEAN and FAILS AT RUN TIME on the pe64 leg in BOTH runners with exit 50, while `examples/c/alignment_page_request` (whose request equals the section alignment, so the pad is zero) stays GREEN as the named control.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

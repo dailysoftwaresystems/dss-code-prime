@@ -2,6 +2,7 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/compilation_unit/unit_attribute.hpp"
+#include "analysis/semantic/type_rules.hpp"   // arrayToPointerDecay (C 6.3.2.1p3)
 #include "core/export.hpp"
 #include "core/substrate/transparent_string_hash.hpp"  // c97: heterogeneous scope-binding lookup
 #include "core/types/data_model.hpp"
@@ -13,6 +14,7 @@
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -226,6 +228,12 @@ struct DSS_EXPORT SymbolRecord {
     // lowering, which HIR→MIR maps to the dedicated MirOpcode — NOT an ordinary
     // Call. None (the default) for every non-lowering symbol.
     BuiltinLowering builtinLowering = BuiltinLowering::None;
+    // D-CSUBSET-ATOMIC-MONOMORPH-I32: copied from the builtin's
+    // BuiltinFunctionMapping.genericPointee at injection. Present ⇒ `type` above
+    // is the EXEMPLAR signature and the call site derives the real one from the
+    // actual argument (see `specializeGenericPointeeBuiltin`). Absent ⇒ `type`
+    // binds verbatim, which is every non-generic symbol in the CU.
+    std::optional<BuiltinGenericPointee> genericPointee;
     // SE7/D8: copied from the minting DeclarationRule's `warnIfUnused`. After
     // analysis, a symbol with this flag set AND an empty use-set emits
     // S_UnusedVariable (a WARNING) at `declRuleNode`'s span.
@@ -1268,5 +1276,133 @@ static_assert(!std::is_copy_constructible_v<SemanticModel>,
 static_assert(!std::is_copy_assignable_v<SemanticModel>,
               "SemanticModel must be move-only.");
 static_assert(std::is_move_constructible_v<SemanticModel>);
+
+// ── D-CSUBSET-ATOMIC-MONOMORPH-I32: the type-generic builtin substitution ────
+//
+// ★★ WHY THIS IS A FREE FUNCTION IN A SHARED HEADER RATHER THAN A PRIVATE
+// HELPER OF THE ANALYZER. ✔MEASURED: stamping the specialized FnSig on the
+// callee name token from the semantic tier alone DOES NOT REACH THE LOWERING —
+// the reference-rules pass re-stamps that node from the symbol afterwards, so
+// CST→HIR read the EXEMPLAR back (debug trace: analyzer wrote type 82 on node
+// 72; `cst_to_hir` read 34 for the same call) and coerced the argument to the
+// exemplar's `int`. That produced a value TRUNCATED to 32 bits under a `long`
+// atomic store — caught loud by the MIR verifier's memory-write typing belt
+// (`I_StoreValueTypeMismatch`), never silently, but it is the reason the
+// substitution has to be a FACT BOTH TIERS DERIVE rather than a value one tier
+// hands the other through a table the other tier may overwrite.
+//
+// Replace the innermost core of a DECLARED parameter/result type with `bound`,
+// preserving every pointer derivation level the declaration spelled:
+// `ptr<i32>` → `ptr<T>`, `ptr<ptr<i32>>` → `ptr<ptr<T>>`, a bare `i32` → `T`.
+// ⓘ `kind()` is transparent through the `_Atomic`/`volatile` skin, so a
+// qualified exemplar core needs no separate arm.
+[[nodiscard]] inline TypeId substituteDeclaredCore(TypeInterner& in,
+                                                   TypeId declared, TypeId bound) {
+    if (!declared.valid()) return declared;
+    if (in.kind(declared) == TypeKind::Ptr) {
+        auto const ops = in.operands(declared);
+        if (ops.size() != 1 || !ops[0].valid()) return declared;
+        return in.pointer(substituteDeclaredCore(in, ops[0], bound));
+    }
+    return bound;
+}
+
+// Derive a type-generic builtin's REAL signature at one call site from the
+// EXEMPLAR its config row declares (see `BuiltinGenericPointee`). `argTy` is the
+// actual type of the argument in the `bindFromParam` position.
+//
+// Returns the exemplar UNCHANGED whenever the binding cannot be made — a
+// non-pointer argument, an index the exemplar has no parameter for — so the
+// ordinary strict check then reports the real mismatch against the declared
+// signature, exactly as it did before this mechanism existed. This function
+// never diagnoses; it only decides which signature its callers work from.
+//
+// ★ THE `bindFromParam` PARAMETER TAKES THE ARGUMENT'S OWN TYPE VERBATIM rather
+// than a rebuilt `ptr<T>`: rebuilding it from the stripped `T` would hand the
+// checker a `ptr<i64>` for an argument typed `ptr<atomic<i64>>` — two distinct
+// interned ids — and the qualifier skin would then have to survive an
+// assignability rule that has nothing to do with this feature. The argument is
+// where `T` CAME FROM, so it is assignable to itself by construction, and every
+// OTHER substituted position still gets the ordinary strict check.
+// ⓘ This also ACCEPTS a plain (non-`_Atomic`) pointer argument, which is the
+// union's answer: gcc's `__atomic_*` builtins take any pointer while clang's
+// `__c11_atomic_*` require `_Atomic` — one working reference accepts, so DSS must.
+// ★★ THE BINDING ARGUMENT DECAYS FIRST (C 6.3.2.1p3). An ARRAY in the binding
+// position — `atomic_load_explicit(counters, 5)`, or `counters + 2` — is a
+// pointer to its first element everywhere else in C, and BOTH references run
+// both spellings (✔MEASURED: gcc 13.3.0 -O2 and clang 18.1.3 -O2, `arr` and
+// `arr + 2`, exit 42; DSS refused both `S_TypeMismatch`). Without the decay the
+// `Ptr` test below answers `Array`, the binding is skipped, and the exemplar's
+// strict check then reports a mismatch against a signature that was never
+// specialized — a LOUD refusal, but one the union forbids.
+// ⓘ It runs HERE, in the single function both tiers derive through, rather than
+// at either call site: a decay applied in one tier and not the other is the
+// exact two-derivations-disagree failure this function's own doc exists to
+// prevent. It reuses the lattice's own `arrayToPointerDecay` — the C 6.3.2.1p3
+// projection every other value-context site already calls — so the binding
+// position is not a second spelling of the same conversion.
+// ★ `pointerDifferenceTy` is C §7.17.1p6's `M` for an atomic POINTER object —
+// the language's declared `ptrdiff_t`, RESOLVED BY THE CALLER from
+// `SemanticConfig::pointerDifferenceType` under the active data model. It is a
+// REQUIRED parameter with no default on purpose: both tiers derive this
+// signature independently, and a default would let one tier quietly answer a
+// different question than the other — the exact failure this function's own doc
+// exists to prevent. Passing `InvalidType` is honest (a language with no
+// declared pointer-difference type), and a row that NEEDS it then falls back to
+// the exemplar, so the ordinary strict check refuses LOUDLY rather than
+// accepting a wrong operand type.
+[[nodiscard]] inline TypeId specializeGenericPointeeSignature(
+        TypeInterner& in, TypeId exemplar, TypeId argTy,
+        BuiltinGenericPointee const& gp, TypeId pointerDifferenceTy) {
+    if (!exemplar.valid() || in.kind(exemplar) != TypeKind::FnSig)
+        return exemplar;
+    argTy = arrayToPointerDecay(in, argTy);
+    if (!argTy.valid() || in.kind(argTy) != TypeKind::Ptr) return exemplar;
+    auto const pointee = in.operands(argTy);
+    if (pointee.size() != 1 || !pointee[0].valid()) return exemplar;
+    // The MATERIAL pointee: C yields the NON-atomic, non-volatile value type
+    // (`atomic_load_explicit(const volatile A *obj)` returns `C`).
+    TypeId const bound = in.stripVolatile(pointee[0]);
+    if (!bound.valid()) return exemplar;
+
+    std::vector<TypeId> params = [&] {
+        auto const sp = in.fnParams(exemplar);
+        return std::vector<TypeId>(sp.begin(), sp.end());
+    }();
+    // C §7.17.1p6: `M` is `C` for an atomic INTEGER object and `ptrdiff_t` for an
+    // atomic POINTER one. The declaration says WHICH parameters carry `M`; this
+    // is the only place the two answers differ, and it differs only when the
+    // bound `T` is itself a pointer.
+    bool const boundIsPointer = (in.kind(bound) == TypeKind::Ptr);
+    auto const carriesPointerDifference = [&](std::uint32_t idx) {
+        return boundIsPointer
+            && std::find(gp.pointerDifferenceParams.begin(),
+                         gp.pointerDifferenceParams.end(), idx)
+               != gp.pointerDifferenceParams.end();
+    };
+    for (std::uint32_t const idx : gp.applyToParams) {
+        if (idx >= params.size()) return exemplar;   // decl / exemplar disagree
+        if (idx == gp.bindFromParam) { params[idx] = argTy; continue; }
+        if (carriesPointerDifference(idx)) {
+            // No declared pointer-difference type ⇒ do not guess one. Returning
+            // the exemplar hands the call to the ordinary strict check, which
+            // refuses by name — the fail-loud direction.
+            if (!pointerDifferenceTy.valid()) return exemplar;
+            params[idx] = pointerDifferenceTy;
+            continue;
+        }
+        params[idx] = substituteDeclaredCore(in, params[idx], bound);
+    }
+    TypeId result = in.fnResult(exemplar);
+    if (gp.applyToResult) result = substituteDeclaredCore(in, result, bound);
+    // Preserve the exemplar's own calling convention rather than re-picking one:
+    // scalars[0] of a FnSig is the CC (scalars[1], when present, is the variadic
+    // bit — these builtins are never variadic, and an absent scalar falls back to
+    // the same CcSysV placeholder the builtin-injection site uses).
+    CallConv cc = CallConv::CcSysV;
+    if (auto const sc = in.scalars(exemplar); !sc.empty())
+        cc = static_cast<CallConv>(sc[0]);
+    return in.fnSig(params, result, cc);
+}
 
 } // namespace dss

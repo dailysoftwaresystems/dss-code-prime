@@ -17,6 +17,7 @@
 #include "core/substrate/thread_pool.hpp"  // IExecutor (the thin-LTO stage's optional pool)
 #include "core/types/type_lattice/type_interner.hpp"  // TypeInterner (optimizeModule arg)
 #include "core/types/type_lattice/type_lattice.hpp"  // TypeLattice (CuMirModule::importedHost)
+#include "hir/lowering/cst_to_hir.hpp"  // CstToHirResult (CuHirModule member, held by unique_ptr)
 #include "link/image_request.hpp"  // ImageRequest (linkAndWrite per-program knobs)
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly arg)
@@ -133,19 +134,26 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // so `doc_census_guard` re-derives them on every ctest run and a drift is a RED
 // rather than a discovery. The PATTERN lives in that document, not here — a
 // pattern quoted in prose is prose, and rots exactly like the number did:
-//     <!--census:source:program.exportedDecls-->28 exported declarations
-// — <!--census:source:program.exportedFunctions-->24 exported functions plus
-// <!--census:source:program.exportedStructs-->4 exported structs (`CuMirModule`,
-// `EntryCandidate`, `ResolvedEntry`, `ResolveLibraryPartition`).
+//     <!--census:source:program.exportedDecls-->30 exported declarations
+// — <!--census:source:program.exportedFunctions-->25 exported functions plus
+// <!--census:source:program.exportedStructs-->5 exported structs (`CuMirModule`,
+// `CuHirModule`, `EntryCandidate`, `ResolvedEntry`, `ResolveLibraryPartition`).
 //
 // ⚠ THE CALL-SITE FIGURES BELOW ARE **NOT** MACHINE-CHECKED, and that is stated
 // rather than left to be assumed from the markers above. Driver call-site counts
-// come from a COMMENT-STRIPPED scan of `src/program/program.cpp` — 28 call sites
-// over 18 of the 24 entry points — and neither is expressible as a census CLAIM,
-// which binds one integer to one line-count: "18 of 24" is a DISTINCT count and
-// the ratio further down is a RATIO. They were corrected by hand in P63 and are
-// unguarded. A raw grep over-counts there too: `linkAndWrite` "appears" twice and
-// both occurrences are prose.
+// come from a COMMENT-STRIPPED scan of `src/program/program.cpp` — 29 call sites
+// over 19 of the 25 entry points — and neither is expressible as a census CLAIM,
+// which binds one integer to one line-count: "19 of 25" is a DISTINCT count and
+// the ratio further down is a RATIO. They were corrected by hand in P63 and
+// again in P64 and are unguarded. A raw grep over-counts there too:
+// `linkAndWrite` "appears" twice and both occurrences are prose.
+//
+// ★ THE P64 CORRECTION IS THE POINT THE PARAGRAPH ABOVE ARGUES, HAPPENING AGAIN.
+// `--write` moved the three MARKED figures (28→30 decls, 24→25 functions, 4→5
+// structs) and could not have moved either sentence around them: the STRUCT
+// ENUMERATION had gone one name short (`CuHirModule` was missing while the count
+// beside it was already repaired to 5), and the unmarked call-site pair was
+// stale. A number is repairable by a script; the claim it sits in is not.
 //
 // ── A. NO DRIVER SEAM — `program.cpp` never calls these ────────────────────
 // `effectiveLongDoubleFormat`, `compileSingleUnit`, `assembleUnit`,
@@ -187,6 +195,22 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 //   command line into `main(int, char**)`, which reads rcx/rdx under MS_x64 and
 //   rdi/rsi under SysV. ⚠ Windows-only, and it takes `compileFiles` — the N==1
 //   route. See section D for the merged route.
+//
+// `buildCuHir` (1: `--emit-hir`'s stage stop inside `compileOneTarget`) — the
+//   SAME (target × format × callingConventionIndex) triple `buildCuMir` gets, and
+//   for the same reason: HIR is TARGET-DEPENDENT, so a mis-supply here does not
+//   fail loud — it emits a well-formed artifact describing a DIFFERENT program.
+//   ✔MEASURED: one source, two data models — `long` renders `i64 "long"` under
+//   LP64 and `i32 "long"` under LLP64, and a narrowing initializer carries an
+//   explicit `Cast` NODE on the first and NO node at all on the second (the
+//   identity retag). The node SET moves, not merely the spelling.
+//   PINNED by `program/test_emit_hir_mode` — one arm emits the same source for
+//   both targets and asserts the cast node is present on one and ABSENT on the
+//   other, which no single-target arm could distinguish from "types print
+//   differently". Its `diagBudget` parameter is deliberately a `DiagnosticBudget`
+//   rather than the whole `CompileOptions`: every other field of that bag
+//   describes the LOWER half, and narrowing the parameter makes a future
+//   lower-half option impossible to silently ignore on this route.
 //
 // `optimizeModule` (3) — `stage` is STRUCTURAL knowledge of WHICH call site this
 //   is, and nothing downstream can check it; `externImports` is DEFAULTED `= {}`.
@@ -352,7 +376,7 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // ✔MEASURED — the merged route is reachable ONLY through
 // `Program::compileUnits` with ≥2 sources, and
 // <!--census:examples:top.sources-->26 of the
-// <!--census:examples:manifests-->815 shipped corpus example manifests declare a
+// <!--census:examples:manifests-->820 shipped corpus example manifests declare a
 // multi-source `sources` array, so the corpus exercises it roughly 3% as often
 // as the single-CU route.
 // ⚠ THE RATIO IS THE ONE FIGURE HERE THAT IS **NOT** MACHINE-CHECKED — a census
@@ -492,6 +516,30 @@ struct CompileOptions {
     // updated deliberately instead of silently reinstating the library default.
     explicit CompileOptions(DiagnosticBudget b) noexcept : diagBudget(b) {}
     CompileOptions() = delete;
+
+    // ── `--emit-hir`: THE STAGE STOP ────────────────────────────────────────
+    //
+    // Non-null ⇒ `compileOneTarget` runs the front end to HIR, RENDERS the
+    // `.dsshir` text into this buffer, and RETURNS. No FFI resolution, no MIR,
+    // no optimizer, no codegen, no link, no object file, no artifact.
+    // Null on every compiling build, which is every build but `--emit-hir`'s.
+    //
+    // ★ A BUFFER, NOT A PATH OR A STREAM, AND THE CHOICE IS DELIBERATE. Where
+    // the artifact goes — a file, stdout, a test's `std::string` — is the
+    // DRIVER's policy, and `compileOneTarget` has no business opening files it
+    // was not already opening. Handing back the bytes keeps the one thing this
+    // seam knows (what the HIR of this unit is) separate from the one thing it
+    // does not (where the operator wants it), and it is what makes the whole
+    // path exercisable in-process without a filesystem.
+    //
+    // ⚠ THIS IS NOT A "COMPILE AND ALSO DUMP HIR" MODIFIER, and it must never
+    // become one. The CLI surface is a MODE (`--emit-hir`, mutually exclusive
+    // with `--compile`) precisely so that `rc == 0` means *"DSS accepted this
+    // source and the artifact is written"* and nothing else. A modifier would
+    // reintroduce the state the mode exists to remove: a non-zero exit standing
+    // beside a perfectly good artifact because a LATER stage — one with nothing
+    // to do with HIR — failed.
+    std::string* emitHirText = nullptr;
 
     DiagnosticBudget diagBudget;
 
@@ -966,6 +1014,56 @@ buildCuMir(CompilationUnit const&         cu,
            std::uint16_t                  callingConventionIndex,
            DiagnosticReporter&            reporter,
            CompileOptions const&          opts);
+
+// ── The front half's front half: everything up to and including HIR ──────────
+//
+// What `buildCuMir` produces before it has lowered anything to MIR: the
+// `SemanticModel` (which owns the type interner every downstream reader needs)
+// and the `CstToHirResult` (the module, its literal / inline-asm pools, and the
+// per-node side-tables lowering populated — `sourceMap` among them).
+//
+// Move-only, because both members are: `SemanticModel` is move-only and
+// `CstToHirResult` is neither copyable NOR movable, which is why it travels
+// behind a `unique_ptr` — its side-table maps bind to `&hir` inside itself, so
+// the object's ADDRESS is load-bearing and only a heap allocation keeps it
+// stable across a return.
+struct DSS_EXPORT CuHirModule {
+    SemanticModel                   model;
+    std::unique_ptr<CstToHirResult> hir;
+    // FC12b: the RESOLVED calling convention's whole `vaListLayout` block, or
+    // nullopt when the CC declares no variadic-callee ABI. Carried out of the
+    // front half rather than re-resolved by the lower half, because resolving
+    // the same fact twice is how two halves of one compile come to disagree.
+    std::optional<VaListLayout>     vaListLayout;
+};
+
+// Run semantic analysis and CST→HIR for ONE compilation unit against ONE
+// (target × format × calling convention), and STOP. Returns nullopt on any
+// front-half tier failure, with diagnostics on `reporter` — exactly
+// `buildCuMir`'s contract for the same two stages, because it IS those two
+// stages (see the implementation's docblock: `buildCuMir` calls this).
+//
+// ★ THE STOP IS THE PRODUCT. `--emit-hir` needs the HIR of a translation unit
+// that may not LINK — a single function in isolation is a normal input — so it
+// must not run, and must not require, FFI resolution / MIR / codegen / link.
+// Routing it through `buildCuMir` and discarding the tail would make HIR
+// emission conditional on stages that have nothing to do with HIR.
+//
+// ⚠ HIR IS TARGET-DEPENDENT, so this takes the same target/format/CC triple
+// `buildCuMir` does and is not a target-free operation. The data model decides
+// integer widths (and therefore which conversions are identity retags),
+// `long double`'s format, aggregate layout and the bit-field ABI; all four are
+// visible in the emitted text.
+//
+// Runs on the deep worker stack (D-PARSE-DEEP-FRONTEND-STACK) like `buildCuMir`.
+[[nodiscard]] DSS_EXPORT std::optional<CuHirModule>
+buildCuHir(CompilationUnit const&         cu,
+           GrammarSchema const&           grammar,
+           TargetSchema const&            target,
+           ObjectFormatSchema const&      format,
+           std::uint16_t                  callingConventionIndex,
+           DiagnosticBudget               diagBudget,
+           DiagnosticReporter&            reporter);
 
 // Run the configured optimizer pipeline over `mir` in place. Resolves the pipeline
 // the same way `buildCuMir` always did: an explicit `opts.pipelineOverride` (the

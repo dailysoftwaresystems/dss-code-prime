@@ -16264,3 +16264,182 @@ TEST(MirLoweringC, ByValueStructArgumentCallIsLoweredExactlyOnce) {
         EXPECT_EQ(calls.size(), 2u) << "CONTROL: exactly two calls in `main`";
     }
 }
+
+// ── D-CSUBSET-ATOMIC-RMW / D-CSUBSET-ATOMIC-MONOMORPH-I32 (P64) ──────────────
+namespace {
+
+// Every opcode in the module, in block order, for the shape assertions below.
+[[nodiscard]] std::vector<MirOpcode> atomicRmwOpcodesIn(Lowered const& L) {
+    std::vector<MirOpcode> out;
+    Mir const& m = L.mir.mir;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i)
+                out.push_back(m.instOpcode(m.blockInstAt(b, i)));
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] std::size_t countAtomicRmwOpcode(std::vector<MirOpcode> const& ops,
+                                               MirOpcode want) {
+    return static_cast<std::size_t>(std::count(ops.begin(), ops.end(), want));
+}
+
+}  // namespace
+
+// D-CSUBSET-ATOMIC-RMW: `atomic_fetch_add_explicit` COMPOSES the already-shipped
+// `MirOpcode::AtomicCas` into a retry loop — it neither mints a new RMW opcode
+// nor lowers to a plain non-atomic read-modify-write.
+//
+// The three things that make this indivisible rather than three separate ops,
+// each asserted: (1) an AtomicLoad reads the object, (2) an AtomicCas COMMITS
+// the computed value, so any interleaved write discards the iteration, and
+// (3) an ICmpEq plus a real back-edge re-runs it on failure. Drop any one and
+// the sequence still computes the right answer single-threaded while no longer
+// being atomic — exactly the failure a value-only test cannot see.
+//
+// RED-ON-DISABLE: delete the `AtomicFetchAdd` arm from `emitBuiltinCall` in
+// hir_to_mir -> the builtin has no lowering and the MIR build fails; delete the
+// `atomic_fetch_add_explicit` row from `c.lang.json` `builtinFunctions` -> the
+// name does not resolve and `L.model.hasErrors()` flips.
+TEST(MirLoweringC, AtomicFetchAddComposesTheShippedCasIntoARetryLoop) {
+    auto L = lowerC(
+        "_Atomic int g;\n"
+        "int main(void) { return atomic_fetch_add_explicit(&g, 2, 5); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    auto const ops = atomicRmwOpcodesIn(L);
+    EXPECT_EQ(countAtomicRmwOpcode(ops, MirOpcode::AtomicCas), 1u)
+        << "the RMW must COMMIT through the shipped AtomicCas — without it the "
+           "sequence is a plain load-op-store and is not indivisible";
+    EXPECT_GE(countAtomicRmwOpcode(ops, MirOpcode::AtomicLoad), 1u)
+        << "the loop must re-READ the object atomically each iteration";
+    EXPECT_GE(countAtomicRmwOpcode(ops, MirOpcode::Add), 1u)
+        << "fetch_add's ALU step is the universal Add verb, not a new opcode";
+    EXPECT_GE(countAtomicRmwOpcode(ops, MirOpcode::ICmpEq), 1u)
+        << "the retry decision compares the CAS's observed value against the "
+           "value this iteration read";
+    EXPECT_EQ(countAtomicRmwOpcode(ops, MirOpcode::Store), 0u)
+        << "an RMW must never lower to a plain non-atomic store";
+
+    // The loop is REAL CFG: a LoopHeader/LoopExit pair marks it, which is what
+    // the retry back-edge needs and what the structural-CF verifier pairs.
+    Mir const& m = L.mir.mir;
+    bool sawLoopHeader = false, sawLoopExit = false;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            switch (m.blockMarker(m.funcBlockAt(f, bi))) {
+                case StructCfMarker::LoopHeader: sawLoopHeader = true; break;
+                case StructCfMarker::LoopExit:   sawLoopExit   = true; break;
+                default: break;
+            }
+        }
+    }
+    EXPECT_TRUE(sawLoopHeader) << "the CAS retry needs a real loop header";
+    EXPECT_TRUE(sawLoopExit)   << "the CAS retry needs a real loop exit";
+}
+
+// D-CSUBSET-ATOMIC-RMW: `atomic_compare_exchange_strong_explicit` emits the
+// FAILURE-ONLY write-back C §7.17.7.4 requires (`*expected = observed`).
+//
+// ★ THIS IS THE HALF A POSITIONAL PASS-THROUGH SILENTLY DROPS. Dropping it
+// compiles, links, and returns the correct `_Bool` — and then a caller looping
+// on `while (!atomic_compare_exchange_weak(&o, &e, f(e)))` spins forever on a
+// stale `e`. So the plain `Store` back through the `expected` pointer is pinned
+// here, beside the AtomicCas that produced the observed value.
+//
+// RED-ON-DISABLE: delete the fail-arm `Store` from `emitAtomicCompareExchange`
+// -> this test's Store count drops while every value-level test stays green.
+TEST(MirLoweringC, AtomicCompareExchangeWritesTheObservedValueBackOnFailure) {
+    auto L = lowerC(
+        "_Atomic int g;\n"
+        "int main(void) {\n"
+        "    int expected = 1;\n"
+        "    return atomic_compare_exchange_strong_explicit("
+        "&g, &expected, 2, 5, 5) ? 42 : expected;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    auto const ops = atomicRmwOpcodesIn(L);
+    EXPECT_EQ(countAtomicRmwOpcode(ops, MirOpcode::AtomicCas), 1u)
+        << "a compare-exchange IS the shipped AtomicCas — it needs no loop";
+    EXPECT_EQ(countAtomicRmwOpcode(ops, MirOpcode::AtomicLoad), 0u)
+        << "a compare-exchange must NOT re-read the object atomically: the CAS "
+           "itself reports the observed value on BOTH outcomes";
+    EXPECT_GE(countAtomicRmwOpcode(ops, MirOpcode::Store), 2u)
+        << "one Store initializes `expected`; the SECOND is the C-mandated "
+           "failure-only write-back of the OBSERVED value through it";
+}
+
+// D-CSUBSET-ATOMIC-MONOMORPH-I32: the `<stdatomic.h>` accessor surface is no
+// longer monomorphized to i32 — the config row's signature is an EXEMPLAR and
+// the real one is derived per call site from the argument's pointee.
+//
+// ★ THE ASSERTION IS ON THE STORED VALUE'S WIDTH, NOT ON "IT COMPILED". Before
+// the `genericPointee` declaration this program was refused `S_TypeMismatch`;
+// while the mechanism was being built it briefly COMPILED with the value coerced
+// to the exemplar's `int` — a 64-bit value silently truncated to 32, caught only
+// because the MIR verifier types memory writes. The width is the property that
+// was actually broken, so the width is what this pins.
+//
+// RED-ON-DISABLE: delete the `genericPointee` block from
+// `atomic_store_explicit`'s row in `c.lang.json` -> the specialization never
+// happens and the value type is I32 (or the program is refused outright).
+TEST(MirLoweringC, AtomicStoreExplicitSpecializesToTheArgumentsPointeeWidth) {
+    auto L = lowerC(
+        "_Atomic long long g;\n"
+        "int main(void) {\n"
+        "    atomic_store_explicit(&g, 8589934591LL, 5);\n"
+        "    return 42;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    bool checkedAtomicStore = false;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                if (m.instOpcode(id) != MirOpcode::AtomicStore) continue;
+                auto const operands = m.instOperands(id);
+                ASSERT_EQ(operands.size(), 2u);
+                // Operands are [value, ptr] — the plain-Store order AtomicStore
+                // reuses. The VALUE's width is the whole point of this test.
+                TypeId const valueTy = m.instType(operands[0]);
+                ASSERT_TRUE(valueTy.valid());
+                EXPECT_EQ(L.model.lattice().interner().kind(valueTy),
+                          TypeKind::I64)
+                    << "the stored value must keep the object's 64-bit width — "
+                       "a 32-bit value here is the exemplar's `int` leaking "
+                       "through, i.e. a silently truncated store";
+                checkedAtomicStore = true;
+            }
+        }
+    }
+    EXPECT_TRUE(checkedAtomicStore)
+        << "the program must lower to an AtomicStore at all";
+}

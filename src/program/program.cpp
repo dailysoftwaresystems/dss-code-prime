@@ -31,6 +31,20 @@
 #include "program/build_scripts.hpp"  // runBuildScripts — the manifest's pre/post build hooks
 #include "program/cli_args.hpp"
 #include "program/compile_pipeline.hpp"
+#include "hir/hir_text.hpp"  // `--emit-hir` / `--dump-hir-kinds`: emitHir, HirTextContext, renderHirKindInventory
+// ⚠ SECOND INCLUDER OF THE BUILD STAMP, AND THE HEADER CALLS THAT A REVIEW-STOP
+// — so here is the reason, stated where the next reader meets it.
+// `runtime_object_cache.cpp` was the only one, because the stamp identifies the
+// COMPILER and the only question that had was "may this cached object be
+// reused". `--emit-hir` asks the same question in the other direction: an
+// artifact a consumer publishes a verdict against must name the compiler that
+// produced it, or the verdict is not re-derivable by anyone. `DSS_PROJECT_VERSION`
+// cannot serve — the stamp's own docblock records that a whole release's worth of
+// codegen changes share one version string.
+// ⓘ It is included from a `.cpp`, not from a header, so the recompile-on-every-
+// dirty-edit hazard the warning is about does not spread: `program` already opts
+// in via `dss_use_build_stamp(program)`, so no CMake edge is added either.
+#include "program/dss_build_stamp.hpp"  // runtime::kBuildStamp — the `producer` field
 #include "program/cross_validate_language_target.hpp"
 #include "program/cross_validate_target_format.hpp"
 #include "program/dependency_resolver.hpp"  // AP6: `dependsOn` resolution
@@ -941,6 +955,139 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     auto const span = (*targetR)->callingConventions();
     std::uint16_t const ccIndex = static_cast<std::uint16_t>(
         std::distance(span.data(), abi->cc));
+
+    // ── `--emit-hir`: run the front end to HIR, render it, and STOP ─────────
+    //
+    // Placed HERE and not one line earlier: the emission is TARGET-DEPENDENT
+    // through this very triple. `abi`/`ccIndex` above resolve the calling
+    // convention whose `vaListLayout` sizes a `va_list`, `**formatR` supplies
+    // the data model that decides integer widths (and therefore which
+    // conversions survive as explicit `cast` nodes rather than collapsing to
+    // identity retags), and `**targetR` supplies aggregate layout. HIR emitted
+    // without them would be HIR for a different program.
+    //
+    // Placed here and not one line LATER, either: everything below is about
+    // WHERE AN IMAGE GOES, and this mode emits no image.
+    if (compileOpts.emitHirText != nullptr) {
+        // ★ ONE MODULE PER ARTIFACT. `--emit-hir` routes through `compileFiles`,
+        // which builds ONE compilation unit from its whole file list (the CU5
+        // multi-file-single-CU shape), so `cus` holds exactly one unit — and one
+        // `.dsshir` file holds exactly one module. An empty `cus` is the
+        // all-object-input shape, which has no front end to run and therefore
+        // no HIR: refused by name rather than silently producing an empty
+        // artifact that would read as "this program has no code in it".
+        if (cus.size() != 1) {
+            emitDriver(reporter, DiagnosticCode::D_EmptyInput,
+                       std::format(
+                           "--emit-hir needs exactly ONE translation unit to "
+                           "emit, and this build produced {}. A `.dsshir` file "
+                           "holds one module; pre-assembled object inputs have "
+                           "no front end and contribute none.",
+                           cus.size()));
+            return std::nullopt;
+        }
+        auto const hirEntry = reporter.errorCount();
+        auto front = buildCuHir(cus[0], grammar, **targetR, **formatR, ccIndex,
+                                compileOpts.diagBudget, reporter);
+        if (!front) {
+            // `buildCuHir` reports every front-half failure itself; a null with
+            // a clean reporter would be the silent-refusal archetype, so it is
+            // named the same way the `buildCuMir` path names it.
+            if (reporter.errorCount() == hirEntry) {
+                emitDriver(reporter, DiagnosticCode::D_CompileUnitNullNoDiagnostic,
+                           "the front end (buildCuHir) returned no HIR and "
+                           "emitted no diagnostic");
+            }
+            return std::nullopt;
+        }
+        HirTextContext hirCtx;
+        hirCtx.interner = &front->model.lattice().interner();
+        // The SOURCE-LEVEL names, from the semantic model's own symbol table.
+        // Without them every `%N` in the artifact is an ordinal a reader cannot
+        // report a property about — "the parameter x", not "%2".
+        std::vector<std::string> hirSymbolNames;
+        hirSymbolNames.reserve(front->model.symbols().size());
+        for (auto const& s : front->model.symbols()) hirSymbolNames.push_back(s.name);
+        hirCtx.symbolNames = &hirSymbolNames;
+        hirCtx.literalPool   = &front->hir->literalPool;
+        hirCtx.inlineAsmPool = &front->hir->inlineAsmPool;
+        // Source spans, and the buffer→name table that makes them resolvable
+        // OUTSIDE this process. Supplied together, always: `BufferId` is a
+        // process-global counter, so `@loc(buf 7, …)` without the table names
+        // nothing a reader can act on.
+        hirCtx.sourceMap = &front->hir->sourceMap;
+        std::vector<HirTextBufferName> hirBufferNames;
+        auto const noteBuffer = [&hirBufferNames, &cu = cus[0]](
+                                    BufferId id, std::string_view name) {
+            if (!id.valid()) return;
+            for (auto const& b : hirBufferNames) {
+                if (b.buffer == id.v) return;
+            }
+            // ⚠ A SYNTHESIZED PREPROCESSOR BUFFER IS CONSTRUCTED WITH THE MAIN
+            // SOURCE'S NAME, so `name` alone cannot tell the two apart and a
+            // reader would index the real file with offsets that belong to the
+            // preprocessed text. `isSynthesizedPreprocessorBuffer` is the CU's
+            // own discriminator — the same one its diagnostic-position refusal
+            // uses — so the artifact says which it is instead of leaving the
+            // reader to guess from a name that is deliberately identical.
+            std::uint32_t origin = 0;
+            if (cu.isSynthesizedPreprocessorBuffer(id)) {
+                BufferId const main = cu.mainOriginForSynth(id);
+                origin = main.valid() ? main.v : id.v;
+            }
+            hirBufferNames.push_back(
+                HirTextBufferName{id.v, std::string{name}, origin});
+        };
+        for (auto const& tree : cus[0].trees()) {
+            SourceBuffer const& buf = tree.source();
+            noteBuffer(buf.id(), buf.name());
+        }
+        for (auto const& b : cus[0].auxiliaryBuffers()) {
+            if (b) noteBuffer(b->id(), b->name());
+        }
+        hirCtx.bufferNames = &hirBufferNames;
+        // WHO COMPILED THIS. The one fact the artifact cannot derive and the one
+        // a consumer needs to make a published verdict re-derivable by anyone
+        // else. `kBuildStamp` is version + commit + a digest of any dirt.
+        hirCtx.producer = runtime::kBuildStamp;
+
+        *compileOpts.emitHirText = emitHir(front->hir->hir, hirCtx, reporter);
+        // THE EMITTER'S OWN ERRORS ARE FATAL, and that is the contract this mode
+        // sells. `emitHir` reports Error severity exactly when it has written
+        // something the reader will REFUSE — the `?` poison token. Returning rc 0
+        // beside such a file would hand a consumer an artifact that cannot be
+        // parsed, which is worse than refusing: they would meet it later, out of
+        // context, against a file we told them was good. See
+        // docs/hir-text-format.md §2.1, which states the contract to consumers.
+        // ⓘ The example this comment used to name — a cyclic composite,
+        // `struct S { struct S *next; }` — is NO LONGER one: format v3 gave the
+        // type grammar a back-reference (`rec <H>`), so lists and trees emit
+        // normally (P64 lane `cy`). The GATE is unchanged and still needed: a
+        // shape this codec cannot spell must never reach a consumer as a file.
+        //
+        // ⚠⚠ THIS LINE IS NOT THE SOLE OWNER OF THAT OUTCOME, AND SAYING SO IS
+        // THE POINT. ✔MEASURED 2026-09-07 (P64 lane `hx`, red-on-disable arm A5):
+        // deleting it left every arm GREEN. `runCusToTargets` already gates on
+        // the per-target scratch (`if (!artifact || scratch.hasErrors()) exitCode
+        // = 1; else artifactsOut[i] = …`), and the emitter reports into exactly
+        // that reporter — so the run still exits non-zero, the artifact slot
+        // still stays disengaged, and `Program::emitHirText` still writes
+        // nothing. There is no observable difference.
+        // ⇒ It is KEPT because it is this file's established shape for a failed
+        // tier (`if (!cuMirSlots[0]) … return std::nullopt;` two stages down) and
+        // because failing where the fact is known beats relying on a gate in
+        // another function. It is NOT kept as a pin: the behaviour's pin lives in
+        // `tests/program/test_emit_hir_mode.cpp`
+        // (`RejectedSourceExitsNonZeroAndWritesNothing`), which the pre-existing
+        // gate carries on its own. Do not cite this line as red-on-disable
+        // evidence — it has none.
+        if (reporter.errorCount() != hirEntry) return std::nullopt;
+        // The `path` this returns is the DRIVER's to decide (it may be stdout),
+        // so the artifact path is reported as the source stem — the caller
+        // overwrites it with the real destination. Non-nullopt is the success
+        // signal; nothing downstream of `--emit-hir` reads the value.
+        return fs::path{sourceStem};
+    }
 
     // Output path convention (cycle 2 v1; plan 6 owns the
     // authoritative artifact-profile-driven scheme). The artifact base
@@ -4116,7 +4263,19 @@ int runCusToTargets(
     // the `Program` knob. nullopt (every CLI build, every root project build,
     // every dependency under a manifest that declares none) ⇒ no consult, no
     // store, byte-identical behaviour.
-    std::optional<DependencyArtifactCacheConfig> const& artifactCachePolicy) {
+    std::optional<DependencyArtifactCacheConfig> const& artifactCachePolicy,
+    // `--emit-hir`: non-null ⇒ every target's `compileOneTarget` stops after
+    // HIR and renders the `.dsshir` text into this buffer instead of compiling
+    // (see `CompileOptions::emitHirText`, which is what this becomes). Null on
+    // every compiling build. It is threaded rather than stamped on a global for
+    // the reason every other per-build knob here is: this function is the one
+    // place a target's `CompileOptions` is assembled, so a knob that reaches
+    // `compileOneTarget` reaches it from here or not at all.
+    //
+    // ⓘ The mode admits exactly one `--target`, so one buffer is one artifact;
+    // the CLI refuses the N-target spelling (`AmbiguousEmitHirTarget`) rather
+    // than letting N modules overwrite each other here.
+    std::string* emitHirTextSink = nullptr) {
     // ── TF-C74 (a): resolve every target — and every object format — BEFORE
     //    the CU build ───────────────────────────────────────────────────────
     //
@@ -4736,6 +4895,7 @@ int runCusToTargets(
         scratchCfg.dedupWindow    = 0;
         DiagnosticReporter scratch{scratchCfg};
         CompileOptions compileOpts{DiagnosticBudget{rep.config()}};
+        compileOpts.emitHirText      = emitHirTextSink;  // `--emit-hir` stage stop
         compileOpts.config           = config;
         // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: this target's plain-`char`
         // sign, for the MIR optimizer's `ConstFold` (which carries no target
@@ -5172,6 +5332,17 @@ int Program::run(int argc, char* argv[]) {
     if (args.lspMode) {
         return runLspMode(args);
     }
+    // `--dump-hir-kinds`: an inventory of THIS BINARY's node set. Answered here,
+    // beside `--lsp` and ahead of the reporter/config stamping below, because it
+    // reads no config, resolves no target and compiles nothing — the same reason
+    // `--dump-predefined-macros` is answered ahead of `Program` entirely. It
+    // stays inside `Program::run` rather than moving to `main` only because it
+    // needs no earlier position than this: nothing above it can change the
+    // answer.
+    if (args.dumpHirKinds) {
+        std::cout << renderHirKindInventory(runtime::kBuildStamp);
+        return 0;
+    }
     // Build the diagnostic policy config BEFORE the dispatch fork —
     // every CLI-routed entry point (compileProject, transpile,
     // compileFiles, compileDirectory) honors `--warnings-as-errors`
@@ -5256,6 +5427,14 @@ int Program::run(int argc, char* argv[]) {
     // an escaping exception was never going to unwind through here anyway.
     auto const timedRunStart = std::chrono::steady_clock::now();
     int const  dispatchRc    = [&]() -> int {
+    if (args.emitHirPath.has_value()) {
+        // `parseCliArgs` has already guaranteed non-empty files and EXACTLY ONE
+        // `--target` for this mode, so the indexing is a consequence of the
+        // parser's contract rather than an assumption made here.
+        return emitHirText(args.emitHirFiles, args.languageName,
+                           args.targets.front(), *args.emitHirPath,
+                           std::cout, std::cerr, cfg);
+    }
     if (args.projectPath.has_value()) {
         return compileProject(*args.projectPath, cfg);
     }
@@ -6118,7 +6297,89 @@ int Program::compileFiles(
         // the cross-build artifact cache policy. nullopt on every CLI build and
         // on every ROOT project build; engaged only on a DEPENDENCY sub-build,
         // where `Resolver::buildNode_` stamped the ROOT manifest's policy on.
-        dependencyArtifactCache_);
+        dependencyArtifactCache_,
+        // `--emit-hir`'s stage stop, or null. `compileFiles` is the ONE entry
+        // point it routes through, because one `.dsshir` holds one module and
+        // this is the entry that builds one compilation unit from its whole file
+        // list (`compileUnits` makes one unit PER FILE, which is N modules).
+        hirTextSink_);
+}
+
+int Program::emitHirText(
+    const std::vector<std::string>& sourceFiles,
+    const std::string& languageName,
+    const std::string& target,
+    const std::string& path,
+    std::ostream& out,
+    std::ostream& err,
+    DiagnosticReporter::Config const& reporterConfig
+) {
+    std::string text;
+    // ★ SCOPE-BOUND, AND RESTORED ON EVERY EXIT INCLUDING AN EXCEPTION. The
+    // sink is the one piece of state that turns a compiling entry point into a
+    // non-compiling one, so a leaked engagement would make the NEXT
+    // `compileFiles` on this `Program` silently emit HIR and link nothing.
+    // Leaving it engaged is not a state any caller could diagnose from the
+    // outside, which is exactly why it is not left to a `return` path.
+    struct SinkGuard {
+        std::string*& slot;
+        ~SinkGuard() { slot = nullptr; }
+    } const guard{hirTextSink_};
+    hirTextSink_ = &text;
+
+    // One target, one unit, one module — the mode's whole shape. `compileFiles`
+    // builds ONE compilation unit from the file list, and `parseCliArgs` has
+    // already refused a second `--target` (`AmbiguousEmitHirTarget`), so this is
+    // the single-artifact case by construction rather than by convention.
+    DiagnosticReporter rep = buildReporter(reporterConfig);
+    int const rc = compileFiles(sourceFiles, languageName,
+                                std::vector<std::string>{target}, rep);
+    if (rc != 0) {
+        // The front end already put its diagnostics on stderr through
+        // `compileFiles`'s own drain. Nothing is written, and that is the
+        // contract: rc != 0 ⇔ DSS rejected the input ⇒ no artifact.
+        return rc;
+    }
+    // ⚠ A ZERO EXIT WITH AN EMPTY BUFFER WOULD BE THE SILENT-SUCCESS ARCHETYPE:
+    // the caller writes an empty file and reads it as "this translation unit
+    // has no code". Every emission carries at least the `dsshir`/`producer`
+    // header, so empty here means the stop never ran — a routing defect, not an
+    // empty program.
+    if (text.empty()) {
+        err << "error: --emit-hir produced no artifact for '" << target
+            << "' although the front end reported success. Nothing was "
+               "written.\n";
+        return 1;
+    }
+    // `-` is stdout, the spelling the ASK asked for and the one every
+    // filter-shaped tool uses. It is checked against the WHOLE path, never a
+    // prefix: a real file may legitimately be named `-something`.
+    if (path == "-") {
+        out << text;
+        if (!out) {
+            err << "error: --emit-hir: writing the artifact to standard output "
+                   "failed.\n";
+            return 1;
+        }
+        return 0;
+    }
+    // Binary mode, so the LF-only artifact stays LF on Windows. A `.dsshir` is
+    // compared byte-for-byte by its consumers (and by this repo's goldens), so a
+    // host-dependent line ending would make the same compiler produce two
+    // different files for one input.
+    std::ofstream o{fs::path{path}, std::ios::binary | std::ios::trunc};
+    if (!o) {
+        err << "error: --emit-hir: could not open '" << path
+            << "' for writing.\n";
+        return 1;
+    }
+    o.write(text.data(), static_cast<std::streamsize>(text.size()));
+    o.close();
+    if (!o) {
+        err << "error: --emit-hir: writing '" << path << "' failed.\n";
+        return 1;
+    }
+    return 0;
 }
 
 int Program::compileUnits(

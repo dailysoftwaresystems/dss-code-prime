@@ -9,11 +9,171 @@
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-09-07 — cycles **P14 … P63**. ⚠ P52 rewrote no handoff at all, so a reader who opened this file during P53 saw P51 described as current state; that entry in §5 was written after the fact and says so.
+**Last updated:** 2026-09-08 — cycles **P14 … P64**. ⚠ P52 rewrote no handoff at all, so a reader who opened this file during P53 saw P51 described as current state; that entry in §5 was written after the fact and says so.
 
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
+
+**Cycle P64 closed 2026-09-08.** **FIVE lanes, four independent reviews and three remediations**, on
+top of P63 (`cd1331eb`). **Every lane was independently reviewed; every review found a real defect, and
+one found a BLOCKING one.**
+
+✔**REAL: 8 rows closed, 0 opened.** ✔**COUNTED by `check-anchor-balance --base cd1331eb`:
+4 closed, 0 opened, net −4 (796 → 792; registry 455 → 451).**
+⚠ **The gate's 4 and the real 8 differ because FOUR rows were minted AND closed inside the cycle** —
+`D-LK-ELF-EMITS-NO-BUILD-ID-NOTE`, `D-HIR-TEXT-EMISSION-EMBEDS-A-PROCESS-GLOBAL-BUFFER-ID`,
+`D-HIR-TEXT-CYCLIC-COMPOSITE-HAS-NO-REPRESENTATION`,
+`D-HIR-TEXT-INCOMPLETE-UNION-READS-BACK-AS-A-COMPLETE-ZERO-MEMBER-UNION` — which is invisible from
+BOTH bases. Report both numbers; never soften the instrument.
+★ **P0 began and ended empty. Production P1 count is the number to watch, not the total.**
+
+## ★★★ THE THROUGH-LINE: **CODE WITH NO CONSUMER WAS NEVER VALIDATED, AND THE FIRST REAL CONSUMER FINDS EVERYTHING AT ONCE**
+
+P62 doubted the row's prescribed REMEDY. P63 doubted the COUNT. **P64 doubts anything that ships
+without something exercising it** — and every significant defect this cycle was of that shape:
+
+| what shipped | what had never used it | what the first consumer found |
+|---|---|---|
+| `emitHir` / the `.dsshir` text format | **zero product callers** — tests only | cyclic composites **unrepresentable**; buffer ids **process-global** so two emissions in one process differed; an incomplete union reading back as a **complete zero-member** one |
+| `MirOpcode::AtomicCas` | no **sub-word** consumer existed | `lock cmpxchg QWORD PTR` over a **1-byte** object, clobbering seven neighbours |
+| the `symbolVa` GOTPCREL convention | no static `.got` was ever synthesized | the documented convention was **false** — one symbol needs two different values |
+| a phantom `_GLOBAL_OFFSET_TABLE_` extern | unreachable without a static `.got` | forced static modules down the **dynamic** walker |
+| `run-gate.ps1` | never invoked; everyone used the `.sh` | **four gates truncated** at ≤612 of 2131, silently |
+
+⇒ **"It has a test" and "something uses it" are different claims, and only the second is protection.**
+A round-trip test that stays inside one process cannot see a process-global counter. A test-only
+format is a format nobody pointed at real code.
+⇒ **When you give something its first consumer, budget for a cluster of defects, not one.** Lane `hx`
+found three in the format the moment it wired a caller; lane `at` found one the moment it created the
+first sub-word CAS.
+
+## §0.1 — WHAT LANDED
+
+**`at` + `atr` — `D-CSUBSET-ATOMIC-RMW` ✅ and `D-CSUBSET-ATOMIC-MONOMORPH-I32` ✅.** The whole C11
+§7.17.7 family as a **composition over the already-shipped `AtomicCas`** — no new MIR opcode, no new
+mnemonic slot, no new target vocabulary — because the row's *"needs a new op family"* premise was
+measured false before the lane was briefed. Plus a declared `genericPointee` mechanism replacing the
+i32 monomorphization.
+⚠ **Its first cut shipped a SILENT WRONG ANSWER and the review caught it:** sub-word signed
+compare-exchange returned `true` **without exchanging** on arm64 release, because a comparand
+materialized as `0xFFFFFFFF` compared unequal to a zero-extended `0x000000FF` in the CAS while the MIR
+tier sign-extended both and said equal. **Before this lane that path refused loudly.** Fixed *by
+construction* — one owner for the compare's register form, narrowing both operands with the target's
+declared extend verb — and the sweep that followed found one more site of the shape and measured it
+unreachable.
+★ **ISO C settled the atomic-pointer question, so it was never a fork.** C23 §7.17.1p6 — *"For atomic
+pointer types, M is `ptrdiff_t`"* — plus §7.17.7.5's mapping to `+` makes it C 6.5.6 arithmetic, i.e.
+**scaled**: clang is right, gcc is wrong, and p3's *"may be an undefined address"* has a referent only
+under that reading. ⓘ The lane then refuted its own first cut, which had additionally refused *bitwise*
+verbs on atomic pointers — gcc runs those, so refusing would have put DSS below the union.
+
+**`pe` — `D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN` ✅, with the static twin closed inside it.** Both shapes
+now build and run to 8192. ★ **The row's premise was false in both halves, refuted by a
+DISCRIMINATOR:** `IMAGE_TLS_DIRECTORY64.Characteristics` *does* carry a 4-bit alignment nibble and the
+Windows loader honours it — one image run twice with **only that nibble edited** (4096 → RUN 42,
+16 → RUN 50, back → md5 restored and 42 again). And the row's own P29 compile-time witness was a
+**false positive**: mingw emits `.align 32` for an *undecorated* `_Thread_local int` too, because it
+lowers thread-locals to emutls. The real ceiling is PE/COFF's four-bit field, not a loader promise.
+
+**`el` + `elr` — `D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS` ✅** (the row P63 could
+not close) **and `D-LK-ELF-EMITS-NO-BUILD-ID-NOTE` ✅.** Static `.got` synthesis in the ET_EXEC path,
+verified end to end on real glibc `exit.o`; build-id as a content-derived fixed point following the
+Mach-O UUID precedent, declared per format document rather than hardcoded.
+⚠ `elr` **refuted my own instruction**: I asked for a declared `.target.json` property for
+"references a GOT slot", and it measured that across 16 relocation rows in 2 documents the fact is a
+**total function of `formula`** — no independent variation — and that a settable flag would make a
+**silent** incoherent state expressible (`formula: linear` + true mints a slot nothing reads). No
+config change.
+
+**`hx` — `--emit-hir` shipped as a MODE** (plus `--dump-hir-kinds`), for `dss-omega-ai`, whose accepted
+set is defined as exactly ours. See §0.4.
+
+**`cy` — cyclic composites ✅ and the incomplete-union misread ✅.** A `rec` back-reference binder in
+the type grammar, format **v2 → v3**. ✔Measured as a **SET DIFF**, not two prose figures: 790 → **791**
+of 840 corpus files, newly passing = `struct_self_ref` and only it, **newly failing = none.**
+
+## §0.2 — WHAT THE ORCHESTRATOR GOT WRONG
+
+1. ⚠⚠ **I LOST FOUR GATE RUNS TO A SHELL, AND THE EXIT CODE HAD TOLD ME ON THE FIRST ONE.**
+   `ctest -j 4` launched through `run-gate.sh` from **Git Bash (MSYS)** died at **8, 83, 271 and 612**
+   of 2131 — four runs, four points, **no test ever reporting a failure**, 36 GB RAM free, guards
+   excluded as a cause. The same command from **PowerShell**: **2131/2131, rc 0.** MSYS's `fork()`
+   emulation cannot sustain a parallel ctest's process fan-out; the shell dies and takes its child tree
+   with it. ★ One of those runs returned **127** — and this repository's own `run-gate.sh` already
+   carries a paragraph explaining that a POSIX shell reserves 127 for *"could not exec"*. I read it as
+   a harness quirk because the others returned 1. **An instrument I had already built was answering,
+   and I did not listen.**
+   ⇒ `run-gate.sh` now **REFUSES up front (exit 4)** when MSYS + `ctest` + real parallelism coincide,
+   naming the `.ps1` twin. Serial is allowed (measured safe); non-ctest commands are untouched.
+   **A gate that stops at 4% of the suite and returns a failure-shaped code is worse than one that
+   will not start.**
+2. **Four brief premises of mine were false**, all from quoting rather than re-deriving: a stale test
+   baseline (2114 where the tree said 2117 — two lanes caught it independently), "four guards red by
+   design" when only two were, the GOT-slot config property above, and the `AtomicCas`-doesn't-exist
+   framing I had *correctly* pre-measured but under-scoped.
+3. **I truncated a file to zero bytes.** Updating the sibling project's contract, `open(path,"w")` in a
+   script with a bad unicode escape truncated **before** the encode failed. Rewritten from context.
+   ★ The failure leaves no error where the damage is — I found it only because I checked the file
+   rather than trusting the traceback.
+4. **My own new guard shipped a bash-4 builtin** (`mapfile`) that silently yields an **empty array** on
+   macOS's bash 3.2 — a root-litter guard that would have reported "no litter" on a supported host.
+   `shell_portability_guard` caught it; `bash -n` cannot see it.
+
+## §0.3 — HARNESS, AND TWO THINGS THIS HOST DOES
+
+- **`run-gate` gained a build-directory contention check in P63 wave 2 and it works** — every footer
+  now reports `builddir` and `contended:`, including a count of processes it could **not** judge.
+- ⚠ **`line_endings_guard` / `line_endings_watchdog_guard` hang intermittently under `ctest -j`** (~3 of
+  4), parent and child at ~0 CPU. Budget cut **600 s → 90 s** (a bound is only free while nothing
+  reaches it). **Two hypotheses were refuted with measurements and are recorded in the source so the
+  next reader does not re-walk them:** not the .NET-tool shim `pwsh` (4 concurrent runs, 5 s), not git
+  contention across the shared `.git` (5 worktrees at once, 1 s). It is also **not load-driven** — a
+  reviewer saw both pass under *heavier* load — and **not one activity**, which refutes the
+  `git rev-parse` lead an earlier draft of that comment gave.
+- **New `root_litter_guard`** (30 repo guards now): refuses any untracked file directly in a repository
+  root. ✔Two occurrences in two cycles — a 0-byte `256` from a `> 256` that reached a shell as a
+  redirect, then **15** reference-probe files. The brief already forbade it; a rule living only in a
+  document has no teeth at the moment of the decision.
+
+## §0.4 — `dss-omega-ai` IS NOW A CONSUMER, AND THAT IS A STANDING OBLIGATION
+
+`--emit-hir` exists because a sibling project defines its accepted set as **exactly what we accept**.
+The contract we answered them with lives in their scratchpad
+(`ANSWER-dss-code-prime-2026-09-07.md`); the durable one is **`docs/hir-text-format.md`**, written for
+a consumer outside this repository.
+
+**The policy we committed to, and it binds future cycles:** `.dsshir` carries an explicit integer
+**format version** and a **producer revision**, both mandatory on read; **a version bump is breaking**
+and there is no compatibility window. ⇒ **A change to the HIR text format is now an outward-facing
+change.** P64 already spent v2 → v3 on the `rec` binder.
+⚠ **Their accepted set moves when ours does.** Two of their four MUST-HAVEs turned out already
+satisfied (source names always travelled inside the artifact; a version already existed) — they had
+misread our tree in their favour, which is worth remembering when reading any external report about us.
+
+## §0.5 — WHAT P65 INHERITS, IN PRIORITY ORDER
+
+1. **`@loc` spans are in PREPROCESSOR-SYNTHESIZED coordinates, not origin** — labelled
+   `synthesized from N`, not remapped. This is the last partial in the omega contract (their item 5).
+   ✔Scoped by lane `hx`: the remap closure and its `LineMap` are already on the finished CU but
+   **private**; it needs `src/analysis/compilation_unit/compilation_unit.{hpp,cpp}` and "a few lines".
+   ⛔ **Do NOT route it through `remapPreprocessedPositions` on a scratch reporter** — the cap/dedup
+   would silently drop spans.
+2. **Enumerator NAMES do not travel in `.dsshir`** (omega item 2's other boundary).
+3. **`D-LIR-LLSC-SPILL-EXCLUSION`'s trigger has FIRED** — its own text names *"a 2nd LL/SC-loop
+   intrinsic (atomic add/or/and family)"*, which P64 shipped. ✔Lane `atr` measured the exposure as more
+   FREQUENT but no deeper (the ALU step sits outside the exclusive window). It needs a status/trigger
+   amendment, not a re-scope.
+4. **The `.obj` (relocatable) PE arm** writes section characteristics straight from the format
+   document — ✔the `pe` reviewer measured this NOT to be a defect today (the align nibble is already
+   derived), so it is recorded as **checked and clean**, not as owed.
+5. **`D-CSUBSET-THREAD-LOCAL-MACHO-OVERALIGN`'s justification is now stale** — it cited *"consistent
+   with the pe gate"* twice, and the PE gate moved from 16 to 8192. The source comment is corrected;
+   the ROW must now stand on dyld's own behaviour or fall. macOS is up.
+6. **The line-endings hang** (§0.3) — the remaining lead is a blocked pipe under ctest's own output
+   capture, which a file redirect can never reproduce.
+
+---
 
 **Cycle P63 closed 2026-09-07.** **FIVE lanes plus a sixth harness lane, four independent reviews and
 four remediations**, on top of P62 (`79746d80`). **Every lane was independently reviewed; every review

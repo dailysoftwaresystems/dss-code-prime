@@ -92,7 +92,25 @@ $InvokedFrom = (Get-Location).Path
 # `[hashtable]::Synchronized` by reference so no temp file is needed, and does
 # NOT delay process exit (a script with a live 60 s thread job still exited in
 # 1.4 s with its own exit code).
-$LeWatchdogBudget = 600
+# ⚠⚠ 600 → 90 IN P64. ✔MEASURED: the hang FIRES ROUTINELY — a lane hit it on 3 of
+# 3 attempts and paid 600 s twice per gate. 90 s is still ~4× the 23.2 s worst case
+# measured under deliberate git-lock contention and ~34× the 2.6 s this guard costs
+# under `ctest` on a quiet tree. Kept in parity with the `.sh` twin, which carries
+# the full refutation log.
+#
+# ★★ AND THE PARAGRAPH ABOVE IS THE BEST LEAD ANYONE HAS. It already names the
+# shape — *"a separate watchdog PROCESS would inherit this one's stdout/stderr
+# handles and could keep ctest's pipe open after the guard exits"* — and then
+# rules it out for the WATCHDOG by making that a thread job. ⓘ But the watchdog is
+# not the only child: every `git` this guard runs inherits the same handles, and a
+# lingering git grandchild would hold ctest's pipe open exactly the same way, with
+# ctest and the guard both sitting at ~0 CPU waiting on a pipe nobody is writing
+# to. That fits every symptom, and it fits why the POSIX twin — measured passing in
+# 7.31 s in the same conditions this one hung in — is unaffected.
+# ⇒ NEXT PROBE STARTS HERE: run under `ctest` (not a file redirect — a file never
+# blocks, which is why both P64 probes came back clean), and after the guard's own
+# exit, look for a surviving git descendant still holding the inherited handle.
+$LeWatchdogBudget = 90
 $script:LeActivity = [hashtable]::Synchronized(@{ what = 'starting up (no query issued yet)' })
 $script:LeWatchdogArmed = $false
 

@@ -939,6 +939,337 @@ struct Lowerer {
         return static_cast<std::uint32_t>(v);
     }
 
+    // D-CSUBSET-ATOMIC-RMW: the ALU verb each `atomic_fetch_*` verb folds into
+    // the retry loop. `AtomicExchange` has NO ALU step (the new value IS the
+    // operand), which is why it answers `Invalid` here rather than getting a row.
+    // A closed table, never an `if (name ==)`: an unlisted verb never reaches
+    // `emitAtomicRmw` (its caller's switch enumerates the same six).
+    [[nodiscard]] static MirOpcode atomicRmwAluOpcode(BuiltinLowering op) noexcept {
+        switch (op) {
+            case BuiltinLowering::AtomicFetchAdd: return MirOpcode::Add;
+            case BuiltinLowering::AtomicFetchSub: return MirOpcode::Sub;
+            case BuiltinLowering::AtomicFetchOr:  return MirOpcode::Or;
+            case BuiltinLowering::AtomicFetchXor: return MirOpcode::Xor;
+            case BuiltinLowering::AtomicFetchAnd: return MirOpcode::And;
+            default:                              return MirOpcode::Invalid;
+        }
+    }
+
+    // D-CSUBSET-ATOMIC-RMW: the width the read-modify-write ALU + equality steps
+    // compute at. C §6.3.1.1 promotes a sub-`int` operand to `int`, and the
+    // shipped targets have no native byte/half ALU encodings anyway
+    // (D-CSUBSET-32BIT-ALU-FORMS refuses them BY NAME rather than computing wide
+    // and lying about the width). A width the probe cannot read answers the
+    // object type itself, which then fails loud downstream rather than guessing.
+    [[nodiscard]] TypeId atomicRmwPromotedType(TypeId valueTy) const {
+        int const w = intBitWidth(interner.kind(valueTy));
+        if (w == 0 || w >= 32) return valueTy;
+        return interner.primitive(TypeKind::I32);
+    }
+
+    // Widen a value to `atomicRmwPromotedType(valueTy)` (identity at >= 32 bits,
+    // and for a non-integer object type where the promotion does not apply).
+    //
+    // ★★ THE CROSS-TIER INVARIANT THIS FUNCTION IS ONE HALF OF, stated here
+    // because the OTHER half is in another file and a reader of either half
+    // needs it: a compare-exchange decides equality in BOTH tiers — here (the
+    // `ICmpEq` that produces the `_Bool` result and gates the failure
+    // write-back) and inside `mir_to_lir`'s `lowerAtomicCas` (which decides
+    // whether the exchange COMMITS). Both must compute the SAME predicate, and
+    // the construction that guarantees it is that EACH tier applies ONE
+    // extension to BOTH of its operands, from the ONE width both read off this
+    // AtomicCas's own `instType`. Equality in the low N bits survives any
+    // extension applied to both operands, so the direction (this tier's
+    // signedness-driven cast, the LIR tier's `zext` narrowing) is free; the
+    // WIDTH is the shared fact. ⚠ A tier that instead REASONS about what its
+    // operands' producers already did is the defect this invariant replaced —
+    // see `atomicCasCompareOperand`, which carries the measurement.
+    [[nodiscard]] MirInstId promoteForAtomicRmw(MirInstId v, TypeId valueTy) {
+        if (!v.valid()) return v;
+        TypeId const pTy = atomicRmwPromotedType(valueTy);
+        if (pTy == valueTy) return v;
+        std::array<MirInstId, 1> const ops{v};
+        return mir.addInst(mapCast(interner.kind(valueTy), interner.kind(pTy)),
+                           ops, pTy);
+    }
+
+    // The inverse: narrow a promoted result back to the object type. Exact for
+    // add/sub/and/or/xor — the low W bits of the promoted result ARE the W-bit
+    // result under two's complement.
+    [[nodiscard]] MirInstId narrowFromAtomicRmw(MirInstId v, TypeId valueTy) {
+        if (!v.valid()) return v;
+        TypeId const pTy = atomicRmwPromotedType(valueTy);
+        if (pTy == valueTy) return v;
+        std::array<MirInstId, 1> const ops{v};
+        return mir.addInst(mapCast(interner.kind(pTy), interner.kind(valueTy)),
+                           ops, valueTy);
+    }
+
+    // ── D-CSUBSET-ATOMIC-RMW: the C11/C23 §7.17.7 read-modify-write family ──
+    //
+    // ★ THE ROW SAID THIS "needs a real AtomicRmw/AtomicCas MIR family". HALF OF
+    // THAT PREMISE WAS ALREADY FALSE: `MirOpcode::AtomicCas` ships complete, with
+    // BOTH realizations (`lowerAtomicCas` Rule 1 = x86 `lock cmpxchg` on the
+    // implicit-RAX roles; Rule 2 = a real arm64 CFG LL/SC retry loop over
+    // `ldaxr`/`stlxr`). So the family needs no new MIR opcode, no new mnemonic
+    // slot and no new target vocabulary — it is a HIR→MIR COMPOSITION over the
+    // shipped op, exactly as the 14 `stdc_*` verbs compose Popcount/Clz/Ctz.
+    //
+    //   pre:     br header
+    //   header:  old  = AtomicLoad(obj)            ; LoopHeader
+    //            new  = old <alu> operand          ; absent for `exchange`
+    //            prev = AtomicCas(obj, old, new)
+    //            CondBr(prev == old, exit, body)
+    //   body:    br header                         ; the retry back-edge
+    //   exit:    <value> = old                     ; LoopExit
+    //
+    // ★★ WHY THIS IS INDIVISIBLE AND NOT AN APPROXIMATION. The CAS commits only
+    // if the location STILL holds the value the iteration read, so the store that
+    // lands is always derived from the value that store itself observed. Any
+    // interleaved write makes the CAS fail and the whole iteration is discarded.
+    // That is C11's requirement; a native `lock xadd` / `ldaddal` would be an
+    // OPTIMISATION (one instruction rather than a loop), never a correctness fix.
+    // ⓘ ABA cannot bite: an integer RMW's result depends on the VALUE at the
+    // commit, never on the history that produced it.
+    //
+    // ★★ AND THE ALU STEP IS OUTSIDE arm64's EXCLUSIVE WINDOW. It is emitted
+    // BETWEEN the AtomicLoad and the AtomicCas — OUTSIDE the ldaxr..stlxr region
+    // `lowerAtomicCas` builds — so this family makes D-LIR-LLSC-SPILL-EXCLUSION's
+    // hazard more FREQUENT, never deeper.
+    // ⚠⚠ THAT IS BACKED BY AN OBJDUMP SCAN OF BUILT ARTIFACTS, NOT BY A BELT. An
+    // earlier draft of this comment claimed mir_to_lir had an "exclusive-window
+    // belt" that "now proves" the property — no such code was ever written, and
+    // the row is still open with its remedy unbuilt. An existence measurement
+    // over the artifacts scanned is not a proof over the ones that were not, and
+    // the window is NOT immune to register-allocator traffic (✔MEASURED: reload
+    // `ldr`s inside the region under `--config=release` — harmless, since a load
+    // does not clear the local monitor, but not "exactly two instructions").
+    // ⓘ `lowerAtomicCas` also narrows both compare operands INSIDE this region
+    // at a SUB-WORD object width — one extra ALU instruction, no store, and the
+    // price of the two tiers agreeing about equality (see `atomicCasCompareOperand`).
+    //
+    // `old` is defined in `header`, which DOMINATES `exit` — a normal
+    // loop-spanning live range, so the result needs no Phi (the `&&`/`||`
+    // join-Phi shape is for values from DIFFERENT predecessors; here there is one
+    // definition, re-executed).
+    //
+    // ⚠ The memory ORDER argument reaches the AtomicLoad's payload, but the CAS
+    // itself is realized at the strongest order each target offers (x86 `lock
+    // cmpxchg` = a full barrier; arm64 `ldaxr`/`stlxr` = acquire/release). A
+    // request for a WEAKER order is therefore over-fenced, which is C11-legal and
+    // strictly more permissive — never a missing fence.
+    // `operandTy` is the OPERAND ARGUMENT's own declared type — C §7.17.1p6's `M`,
+    // which for an atomic POINTER object is `ptrdiff_t` and NOT the object type.
+    // It is passed in rather than read back off the MIR value because the index
+    // widening below must see the type C gave the operand, exactly as the
+    // `p ± n` arm reads `hir.typeId(kids[1])` for the same decision.
+    [[nodiscard]] MirInstId emitAtomicRmw(BuiltinLowering op, MirInstId objPtr,
+                                          MirInstId operandVal, TypeId valueTy,
+                                          TypeId operandTy,
+                                          std::uint32_t order,
+                                          std::uint32_t alignPayload,
+                                          HirNodeId node) {
+        if (!objPtr.valid()
+            || (op != BuiltinLowering::AtomicExchange && !operandVal.valid())) {
+            return InvalidMirInst;
+        }
+        if (!isIntegerLikeAtomicRmwType(valueTy)) {
+            unsupported(node,
+                "[[D-CSUBSET-ATOMIC-RMW]] an atomic read-modify-write needs an "
+                "integer or pointer object type — the load-op-store composition "
+                "is defined over the integer ALU verbs");
+            return InvalidMirInst;
+        }
+        MirOpcode const alu = atomicRmwAluOpcode(op);
+        if (alu == MirOpcode::Invalid && op != BuiltinLowering::AtomicExchange) {
+            unsupported(node,
+                "[[D-CSUBSET-ATOMIC-RMW]] no ALU verb is declared for this "
+                "read-modify-write builtin");
+            return InvalidMirInst;
+        }
+
+        MirBlockId const header = mir.createBlock(StructCfMarker::LoopHeader);
+        MirBlockId const bodyBB = mir.createBlock(StructCfMarker::Linear);
+        MirBlockId const exitBB = mir.createBlock(StructCfMarker::LoopExit);
+
+        mir.addBr(header);
+        mir.beginBlock(header);
+        std::array<MirInstId, 1> const ldOps{objPtr};
+        MirInstId const oldVal =
+            mir.addInst(MirOpcode::AtomicLoad, ldOps, valueTy, order,
+                        MirInstFlags::None, alignPayload);
+        if (!oldVal.valid()) return InvalidMirInst;
+        MirInstId newVal = operandVal;
+        bool const pointerArith = interner.kind(valueTy) == TypeKind::Ptr
+            && (op == BuiltinLowering::AtomicFetchAdd
+             || op == BuiltinLowering::AtomicFetchSub);
+        if (pointerArith) {
+            // ── C §7.17.7.5 ON AN ATOMIC POINTER OBJECT — SCALED, NOT BYTE-WISE ──
+            //
+            // §7.17.1p6 says the operand of an atomic pointer RMW is `ptrdiff_t`
+            // (`M`), and §7.17.7.5 says the object is replaced with "the result of
+            // the computation applied to the value pointed to by object and the
+            // given operand", where `add`'s computation is the `+` operator. `+`
+            // over (pointer, ptrdiff_t) is C 6.5.6 pointer arithmetic, so the step
+            // is `sizeof(*p)`, not one byte — and p3's "for address types, the
+            // result may be an undefined address" has a referent only under that
+            // reading. ⚠ THE REFERENCES SPLIT HERE AND THE STANDARD BREAKS THE
+            // TIE: ✔MEASURED, gcc 13.3.0 computes it UNSCALED and clang 18.1.3
+            // SCALED, both accepting. DSS follows the TEXT (= clang); gcc's
+            // `<stdatomic.h>` forwards to `__atomic_fetch_add`, whose operand is
+            // byte-wise by that BUILTIN's contract rather than by §7.17.
+            // ★ It reuses `emitPointerOffsetGep`, the very function `p ± n` uses,
+            // so the stride, the index widening's sign and the wide-index refusal
+            // are one implementation and not two.
+            //
+            // ⚠⚠ ADD/SUB ONLY, AND THE BITWISE VERBS DELIBERATELY FALL THROUGH TO
+            // THE UNCHANGED INTEGER PATH. §7.17.7.5p1 restricts or/xor/and to
+            // atomic INTEGER types, and clang REFUSES them on an atomic pointer by
+            // name (✔MEASURED: *"address argument to atomic operation must be a
+            // pointer to atomic integer"*) — but gcc ACCEPTS and RUNS them, and
+            // one working reference makes acceptance REQUIRED. Intercepting them
+            // here to refuse would put DSS BELOW the union to buy tidiness, so
+            // they keep the bit-wise `Or`/`Xor`/`And` over the pointer value that
+            // this file already emitted, which is gcc's meaning exactly.
+            auto const ptOps = interner.operands(valueTy);
+            if (ptOps.size() != 1 || !ptOps[0].valid()) {
+                unsupported(node,
+                    "[[D-CSUBSET-ATOMIC-RMW]] atomic pointer arithmetic: the "
+                    "object's pointer type has no pointee to take a stride from");
+                return InvalidMirInst;
+            }
+            newVal = emitPointerOffsetGep(
+                oldVal, valueTy, operandVal, operandTy, ptOps[0],
+                /*negate=*/op == BuiltinLowering::AtomicFetchSub, node);
+            if (!newVal.valid()) return InvalidMirInst;
+        } else if (op != BuiltinLowering::AtomicExchange) {
+            // ⚠ THE ALU STEP RUNS AT THE PROMOTION WIDTH, NOT THE OBJECT WIDTH.
+            // ✔MEASURED: a byte/half `Add` is refused by name on BOTH shipped
+            // targets — `L_UnsupportedLoweringForOpcode ... has no native-width
+            // ALU forms (D-CSUBSET-32BIT-ALU-FORMS)`, because the shipped integer
+            // encodings compute 32/64-bit and a narrower claim would silently
+            // violate the type's wraparound. Promoting is not a workaround around
+            // that row: it is C's own rule (§6.3.1.1 — the operands of `+` on a
+            // `char` are promoted to `int`), and for the five verbs here
+            // (add/sub/and/or/xor) the low W bits of the promoted result are
+            // exactly the W-bit result, so the truncation back is exact. Both
+            // operands take the SAME extension, which is also what keeps the
+            // `prev == old` equality below faithful at the promoted width.
+            MirInstId const promotedOld = promoteForAtomicRmw(oldVal, valueTy);
+            MirInstId const promotedVal = promoteForAtomicRmw(operandVal, valueTy);
+            if (!promotedOld.valid() || !promotedVal.valid())
+                return InvalidMirInst;
+            TypeId const aluTy = atomicRmwPromotedType(valueTy);
+            std::array<MirInstId, 2> const aluOps{promotedOld, promotedVal};
+            MirInstId const promotedNew = mir.addInst(alu, aluOps, aluTy);
+            if (!promotedNew.valid()) return InvalidMirInst;
+            newVal = narrowFromAtomicRmw(promotedNew, valueTy);
+            if (!newVal.valid()) return InvalidMirInst;
+        }
+        // The UNIVERSAL CAS operand order the shipped opcode documents:
+        // [ptr, comparand(expected), newval(desired)].
+        std::array<MirInstId, 3> const casOps{objPtr, oldVal, newVal};
+        MirInstId const prev =
+            mir.addInst(MirOpcode::AtomicCas, casOps, valueTy);
+        if (!prev.valid()) return InvalidMirInst;
+        MirInstId const cmpPrev = promoteForAtomicRmw(prev, valueTy);
+        MirInstId const cmpOld  = promoteForAtomicRmw(oldVal, valueTy);
+        if (!cmpPrev.valid() || !cmpOld.valid()) return InvalidMirInst;
+        std::array<MirInstId, 2> const eqOps{cmpPrev, cmpOld};
+        MirInstId const committed =
+            mir.addInst(MirOpcode::ICmpEq, eqOps,
+                        interner.primitive(TypeKind::Bool));
+        if (!committed.valid()) return InvalidMirInst;
+        mir.addCondBr(committed, exitBB, bodyBB);
+
+        mir.beginBlock(bodyBB);
+        mir.addBr(header);
+
+        mir.beginBlock(exitBB);
+        // C11 §7.17.7.5: every `atomic_fetch_*` and `atomic_exchange` yields the
+        // value the object held BEFORE the operation.
+        return oldVal;
+    }
+
+    // D-CSUBSET-ATOMIC-RMW: `atomic_compare_exchange_{strong,weak}_explicit`.
+    // The ONE member of the family that needs no loop — it IS the shipped
+    // AtomicCas — plus the two things C requires around it (§7.17.7.4):
+    //   * a `_Bool` result saying whether the exchange happened, and
+    //   * on FAILURE ONLY, `*expected = <the value actually observed>`.
+    // The second is the half a positional pass-through would silently drop, and
+    // dropping it is not a compile error anywhere downstream — a caller looping
+    // on `while (!atomic_compare_exchange_weak(&o, &e, f(e)))` would spin forever
+    // on a stale `e`. So the store is emitted on its own arm:
+    //   entry: exp  = Load(expected); prev = AtomicCas(obj, exp, desired)
+    //          ok   = (prev == exp);  CondBr(ok, join, fail)
+    //   fail:  Store(prev, expected); br join
+    //   join:  <value> = ok
+    // `ok` is defined in the entry block, which dominates `join`.
+    // ⓘ Both the `_strong` and `_weak` spellings route here: C permits the weak
+    // form to fail spuriously but never REQUIRES it to, so a strong CAS is a
+    // conforming realization of both.
+    [[nodiscard]] MirInstId emitAtomicCompareExchange(
+            MirInstId objPtr, MirInstId expectedPtr, MirInstId desired,
+            TypeId valueTy, TypeId resultTy, HirNodeId node) {
+        if (!objPtr.valid() || !expectedPtr.valid() || !desired.valid())
+            return InvalidMirInst;
+        if (!isIntegerLikeAtomicRmwType(valueTy)) {
+            unsupported(node,
+                "[[D-CSUBSET-ATOMIC-RMW]] an atomic compare-exchange needs an "
+                "integer or pointer object type");
+            return InvalidMirInst;
+        }
+        std::array<MirInstId, 1> const expLd{expectedPtr};
+        MirInstId const expected =
+            mir.addInst(MirOpcode::Load, expLd, valueTy);
+        if (!expected.valid()) return InvalidMirInst;
+        std::array<MirInstId, 3> const casOps{objPtr, expected, desired};
+        MirInstId const prev =
+            mir.addInst(MirOpcode::AtomicCas, casOps, valueTy);
+        if (!prev.valid()) return InvalidMirInst;
+        // The same promotion rule as `emitAtomicRmw`: a byte/half ICmp has no
+        // native-width form on either shipped target (D-CSUBSET-32BIT-ALU-FORMS),
+        // and both operands take the SAME extension, so equality is preserved.
+        MirInstId const cmpPrev = promoteForAtomicRmw(prev, valueTy);
+        MirInstId const cmpExp  = promoteForAtomicRmw(expected, valueTy);
+        if (!cmpPrev.valid() || !cmpExp.valid()) return InvalidMirInst;
+        std::array<MirInstId, 2> const eqOps{cmpPrev, cmpExp};
+        MirInstId const ok =
+            mir.addInst(MirOpcode::ICmpEq, eqOps,
+                        interner.primitive(TypeKind::Bool));
+        if (!ok.valid()) return InvalidMirInst;
+
+        MirBlockId const failBB = mir.createBlock(StructCfMarker::IfThen);
+        MirBlockId const joinBB = mir.createBlock(StructCfMarker::IfJoin);
+        mir.addCondBr(ok, joinBB, failBB);
+        mir.beginBlock(failBB);
+        std::array<MirInstId, 2> const st{prev, expectedPtr};
+        mir.addInst(MirOpcode::Store, st, InvalidType);
+        mir.addBr(joinBB);
+        mir.beginBlock(joinBB);
+
+        if (!resultTy.valid() || interner.kind(resultTy) == TypeKind::Bool)
+            return ok;
+        std::array<MirInstId, 1> const ze{ok};
+        return mir.addInst(mapCast(TypeKind::Bool, interner.kind(resultTy)), ze,
+                           resultTy);
+    }
+
+    // D-CSUBSET-ATOMIC-RMW: the object types the load-op-store composition is
+    // defined over. Integers (every width the target's atomic access matrix
+    // realizes) and object pointers; a float/aggregate atomic object would need a
+    // bit-cast round trip the row does not claim, so it is REFUSED BY NAME rather
+    // than lowered to something plausible.
+    // ⓘ `interner.kind()` is TRANSPARENT through the `_Atomic`/`volatile` skin
+    // (the qualifier record's own doc states it), so an `_Atomic long` answers
+    // I64 here with NO explicit strip — the same property every other structural
+    // consumer in this TU relies on.
+    [[nodiscard]] bool isIntegerLikeAtomicRmwType(TypeId ty) const {
+        if (!ty.valid()) return false;
+        TypeKind const k = interner.kind(ty);
+        return intBitWidth(k) != 0 || k == TypeKind::Ptr || k == TypeKind::Enum;
+    }
+
     // Map a HIR core operator + operand TypeKind to a MIR opcode. Integer
     // signed/unsigned is type-driven (HirOpKind has only `Div`/`Rem`/`Shr`,
     // not separate signed/unsigned forms — same convention as type_lattice).
@@ -3222,6 +3553,69 @@ struct Lowerer {
                                        MirInstFlags::None,
                                        atomicPointerAlignPayload(kids[0]));
                 }
+                // ── D-CSUBSET-ATOMIC-RMW: C11 §7.17.7 read-modify-write ──
+                // `atomic_<op>_explicit(obj, operand, order)` → the AtomicCas
+                // retry loop (`emitAtomicRmw`). The order argument const-folds
+                // into the loop's AtomicLoad payload exactly as it does for
+                // `atomic_load_explicit`; the CAS itself is realized at each
+                // target's strongest available order (over-fencing is C11-legal).
+                // The value type is the builtin's RESULT type — C defines every
+                // `atomic_fetch_*`/`atomic_exchange` to yield the object's prior
+                // value, so result and object type are the same type and cannot
+                // drift from the width the CAS encodes.
+                case BuiltinLowering::AtomicFetchAdd:
+                case BuiltinLowering::AtomicFetchSub:
+                case BuiltinLowering::AtomicFetchOr:
+                case BuiltinLowering::AtomicFetchXor:
+                case BuiltinLowering::AtomicFetchAnd:
+                case BuiltinLowering::AtomicExchange: {
+                    if (operands.size() != 3 || kids.size() != 3) {
+                        unsupported(node,
+                            "an atomic read-modify-write builtin expects exactly "
+                            "3 arguments (object, operand, memory_order)");
+                        return InvalidMirInst;
+                    }
+                    return emitAtomicRmw(
+                        static_cast<BuiltinLowering>(hir.payload(node)),
+                        operands[0], operands[1], t, hir.typeId(kids[1]),
+                        foldAtomicOrder(kids[2]),
+                        atomicPointerAlignPayload(kids[0]), node);
+                }
+                // `atomic_compare_exchange_{strong,weak}_explicit(obj, expected,
+                // desired, succ_order, fail_order)`. The object's value type is
+                // the POINTEE of arg0 (the result here is `_Bool`, so it cannot
+                // supply the width the CAS must encode — reading it from the
+                // result would silently compare at 1 bit).
+                case BuiltinLowering::AtomicCompareExchange: {
+                    if (operands.size() != 5 || kids.size() != 5) {
+                        unsupported(node,
+                            "an atomic compare-exchange builtin expects exactly 5 "
+                            "arguments (object, expected, desired, success order, "
+                            "failure order)");
+                        return InvalidMirInst;
+                    }
+                    TypeId const objPtrTy = hir.typeId(kids[0]);
+                    TypeId valueTy = InvalidType;
+                    if (objPtrTy.valid()
+                        && interner.kind(objPtrTy) == TypeKind::Ptr) {
+                        auto const pointee = interner.operands(objPtrTy);
+                        // The MATERIAL type under the `_Atomic` skin: the CAS is
+                        // itself the atomic access, so the operand types it
+                        // carries are the plain value type (the ONE strip
+                        // chokepoint `type_interner` documents for exactly this).
+                        if (pointee.size() == 1)
+                            valueTy = interner.stripVolatile(pointee[0]);
+                    }
+                    if (!valueTy.valid()) {
+                        unsupported(node,
+                            "[[D-CSUBSET-ATOMIC-RMW]] an atomic compare-exchange's "
+                            "first argument must be a pointer to the atomic object");
+                        return InvalidMirInst;
+                    }
+                    return emitAtomicCompareExchange(operands[0], operands[1],
+                                                     operands[2], valueTy, t,
+                                                     node);
+                }
                 case BuiltinLowering::AtomicFence: {
                     // D-CSUBSET-ATOMIC-FENCE + D-CSUBSET-SYNC-BUILTIN-BARRIER:
                     // __sync_synchronize() → AtomicFence(payload=seq_cst). The builtin takes NO arguments and IS the
@@ -4532,54 +4926,8 @@ struct Lowerer {
             // width refusal), so nothing miscompiles today — but the wall is
             // incidental, and this tier is the one that knows the operand is an
             // address. Refuse it HERE, by intent.
-            TypeId const i64ty = interner.primitive(TypeKind::I64);
-            MirInstId intIdx = rhs;
-            TypeKind const rawIndexKind = interner.kind(indexTy);
-            if (isWideInt(interner, indexTy)) {
-                unsupported(node, std::format(
-                    "pointer arithmetic: a WIDE integer index ({}) is "
-                    "memory-resident and reaches this site as an ADDRESS, so it "
-                    "cannot be narrowed to a 64-bit byte offset by a cast "
-                    "(D-CSUBSET-INT128-LIR-WIDTH / D-CSUBSET-BITINT-C2-WIDE)",
-                    wideIntSpelling(indexTy)));
-                return InvalidMirInst;
-            }
-            if (rawIndexKind != TypeKind::I64) {
-                MirOpcode const ext =
-                    mapCast(resolveScalarIntKind(indexTy), TypeKind::I64);
-                // c65: a NON-INTEGER index kind (Array/Struct/…) still has no
-                // widening cast → mapCast returns Invalid. FAIL LOUD here —
-                // passing Invalid to addInst std::abort()s the whole compiler (the
-                // c65 sqlite crash class: `p - arrayName`, now fixed at the HIR
-                // tier by array decay → ptrSub). The pre-existing `.valid()` guard
-                // below runs AFTER addInst, i.e. too late.
-                // ⚠ The message no longer names the enum: an enum index is
-                // SUPPORTED, so keeping it in the text would send the next reader
-                // after a cause that cannot fire, and would name a closed row as
-                // the reason for an unrelated refusal.
-                if (ext == MirOpcode::Invalid) {
-                    unsupported(node, std::format(
-                        "pointer arithmetic: index TypeKind {} is not an integer "
-                        "type and has no widening cast to a 64-bit offset (C23 "
-                        "6.5.7p2 admits only an integer operand; an array index "
-                        "must decay to a pointer difference)",
-                        static_cast<unsigned>(rawIndexKind)));
-                    return InvalidMirInst;
-                }
-                std::array<MirInstId, 1> eo{rhs};
-                intIdx = mir.addInst(ext, eo, i64ty);
-                if (!intIdx.valid()) return InvalidMirInst;
-            }
-            if (op == HirOpKind::Sub) {
-                std::array<MirInstId, 1> ni{intIdx};
-                intIdx = mir.addInst(MirOpcode::Neg, ni, i64ty);
-                if (!intIdx.valid()) return InvalidMirInst;
-            }
-            MirInstId const byteOff =
-                scaleIndexToBytes(intIdx, pointee, node, i64ty);
-            if (!byteOff.valid()) return InvalidMirInst;
-            std::array<MirInstId, 2> gepOps{lhs, byteOff};
-            return mir.addInst(MirOpcode::Gep, gepOps, t);
+            return emitPointerOffsetGep(lhs, t, rhs, indexTy, pointee,
+                                        /*negate=*/op == HirOpKind::Sub, node);
         }
         // C23 _BitInt(N) (D-CSUBSET-BITINT, CRIT-2): both operands are `_BitInt(N)`
         // (a `_BitInt op int` was coerced to a standard int by the UAC, so it never
@@ -7681,6 +8029,72 @@ struct Lowerer {
     // identical (no regression). `indexTy` widths the stride constant + the
     // Mul. InvalidMirInst (fail-loud already reported) on an un-sizeable
     // element type.
+    // ── C 6.5.6p8's `p ± n`, AS ONE FUNCTION RATHER THAN TWO COPIES ────────
+    //
+    // ★★ EXTRACTED VERBATIM out of the binary-operator arm so the ATOMIC
+    // pointer read-modify-write can REUSE C's pointer arithmetic instead of
+    // re-deriving it. That reuse is the point: `atomic_fetch_add` on an
+    // `int *_Atomic` is defined by C §7.17.7.5 as the `+` operator applied to
+    // the object and a `ptrdiff_t`, so it must scale by `sizeof(*p)` the SAME
+    // way `p + n` does — including the widening cast's SIGN, the wide-integer
+    // refusal, and `scaleIndexToBytes`'s VLA/stride-1 handling. A second
+    // spelling of any of those is a divergence waiting to happen
+    // ([[feedback_reuse_pipeline_verbs_across_languages_2026_08_12]]).
+    // `negate` is the `p - n` direction; `resultPtrTy` is the RESULT pointer
+    // type (the operator arm's own `t`, which may differ from `base`'s type).
+    [[nodiscard]] MirInstId emitPointerOffsetGep(
+            MirInstId base, TypeId resultPtrTy, MirInstId idx,
+            TypeId indexTy, TypeId pointee, bool negate, HirNodeId node) {
+        TypeId const i64ty = interner.primitive(TypeKind::I64);
+        MirInstId intIdx = idx;
+        TypeKind const rawIndexKind = interner.kind(indexTy);
+        if (isWideInt(interner, indexTy)) {
+            unsupported(node, std::format(
+                "pointer arithmetic: a WIDE integer index ({}) is "
+                "memory-resident and reaches this site as an ADDRESS, so it "
+                "cannot be narrowed to a 64-bit byte offset by a cast "
+                "(D-CSUBSET-INT128-LIR-WIDTH / D-CSUBSET-BITINT-C2-WIDE)",
+                wideIntSpelling(indexTy)));
+            return InvalidMirInst;
+        }
+        if (rawIndexKind != TypeKind::I64) {
+            MirOpcode const ext =
+                mapCast(resolveScalarIntKind(indexTy), TypeKind::I64);
+            // c65: a NON-INTEGER index kind (Array/Struct/…) still has no
+            // widening cast → mapCast returns Invalid. FAIL LOUD here —
+            // passing Invalid to addInst std::abort()s the whole compiler (the
+            // c65 sqlite crash class: `p - arrayName`, now fixed at the HIR
+            // tier by array decay → ptrSub). The pre-existing `.valid()` guard
+            // below runs AFTER addInst, i.e. too late.
+            // ⚠ The message no longer names the enum: an enum index is
+            // SUPPORTED, so keeping it in the text would send the next reader
+            // after a cause that cannot fire, and would name a closed row as
+            // the reason for an unrelated refusal.
+            if (ext == MirOpcode::Invalid) {
+                unsupported(node, std::format(
+                    "pointer arithmetic: index TypeKind {} is not an integer "
+                    "type and has no widening cast to a 64-bit offset (C23 "
+                    "6.5.7p2 admits only an integer operand; an array index "
+                    "must decay to a pointer difference)",
+                    static_cast<unsigned>(rawIndexKind)));
+                return InvalidMirInst;
+            }
+            std::array<MirInstId, 1> eo{idx};
+            intIdx = mir.addInst(ext, eo, i64ty);
+            if (!intIdx.valid()) return InvalidMirInst;
+        }
+        if (negate) {
+            std::array<MirInstId, 1> ni{intIdx};
+            intIdx = mir.addInst(MirOpcode::Neg, ni, i64ty);
+            if (!intIdx.valid()) return InvalidMirInst;
+        }
+        MirInstId const byteOff =
+            scaleIndexToBytes(intIdx, pointee, node, i64ty);
+        if (!byteOff.valid()) return InvalidMirInst;
+        std::array<MirInstId, 2> gepOps{base, byteOff};
+        return mir.addInst(MirOpcode::Gep, gepOps, resultPtrTy);
+    }
+
     [[nodiscard]] MirInstId scaleIndexToBytes(MirInstId idx, TypeId elemTy,
                                               HirNodeId node, TypeId indexTy) {
         // VLA C3 (CRITICAL-1): a VLA-ROW element (the subscript RESULT type contains a

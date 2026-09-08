@@ -130,6 +130,8 @@ The pipeline is **fully config-driven end to end.** A `.lang.json` declares a la
 
 Three-tier IR: **HIR** (language-neutral, typed) → **MIR** (SSA over a CFG with structured-control-flow markers) → **LIR** (per-target, post-register-allocation). Each tier has its own arena substrate, verifier, and round-trippable text format (`.dsshir` / `.dssir` / `.dsslir`).
 
+`dsscp --emit-hir <path> --target <spec> <file>` writes a translation unit's HIR as self-contained `.dsshir` text and stops there — no codegen, no link, and a unit that would not link is a normal input. See [`docs/hir-text-format.md`](docs/hir-text-format.md) for the format, its versioning policy, and the exit-code contract.
+
 ## Roadmap & vision
 
 DSS Code Prime is one instance of a larger thesis: **one engine, many languages, many targets, every byte owned.** The road ahead:

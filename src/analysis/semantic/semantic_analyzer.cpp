@@ -16938,7 +16938,44 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // FFI descriptor's. The predicate, not the declaration's provenance, decides:
     // `sameRepresentation` still refuses a different width, signedness or base kind,
     // and the fn-pointer / indirect sites below pass false. Config gate inside.
-    checkCallAgainstSig(s, cfg, tree, node, kids, call, fnTy,
+    // D-CSUBSET-ATOMIC-MONOMORPH-I32: a builtin whose config row declares
+    // `genericPointee` carries an EXEMPLAR signature; derive the real one from
+    // this call's own argument before checking. Non-generic symbols (everything
+    // else in the CU) take `fnTy` unchanged.
+    TypeId checkedSig = fnTy;
+    if (auto const& gp = s.symbols.at(calleeSym).genericPointee;
+        gp.has_value()) {
+        // Bind T from THIS call's own argument. CST->HIR derives the same
+        // signature independently from the same SymbolRecord and the same
+        // argument node (see `specializeGenericPointeeSignature`'s note on why
+        // the two tiers derive it rather than one handing it to the other).
+        std::vector<NodeId> genericArgs;
+        if (call.argsChild < kids.size())
+            gatherArgExpressions(tree, kids[call.argsChild], genericArgs);
+        TypeId const bindTy = (gp->bindFromParam < genericArgs.size())
+            ? subtreeType(s, tree, genericArgs[gp->bindFromParam], scope)
+            : InvalidType;
+        // ★ MEMOIZE THE BINDING ARGUMENT'S TYPE ONTO ITS OWN NODE. `subtreeType`
+        // COMPUTES an expression wrapper's type by descent and does not record
+        // it, so CST→HIR's `typeAtOr` on that same node answers InvalidType and
+        // the lowering could not re-derive the binding — ✔MEASURED: without this,
+        // the lowering fell back to the exemplar and coerced a 64-bit value to
+        // `int` under an `_Atomic long` store. This writes back exactly the value
+        // `subtreeType` just returned for that node, so it is a memo, not a new
+        // fact: any later reader (including `subtreeType` itself, which
+        // short-circuits on a stamped type) sees what it would have computed.
+        if (bindTy.valid() && gp->bindFromParam < genericArgs.size())
+            s.nodeToType.set(genericArgs[gp->bindFromParam], bindTy);
+        // C §7.17.1p6's `M` for an atomic POINTER object. Resolved through the
+        // SAME `synthesizedType` seam `p - q` uses, from the SAME declaration and
+        // the SAME data model CST→HIR reads — which is what makes the two tiers'
+        // independent derivations answer identically.
+        checkedSig = specializeGenericPointeeSignature(
+            s.lattice.interner(), fnTy, bindTy, *gp,
+            synthesizedType(s.lattice.interner(), cfg.pointerDifferenceType,
+                            s.dataModel, TypeKind::I64));
+    }
+    checkCallAgainstSig(s, cfg, tree, node, kids, call, checkedSig,
                         s.symbols.at(calleeSym).variadicBuiltin,
                         /*calleeIsDirectSymbol=*/true, scope);
 }
@@ -18709,6 +18746,11 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             rec.type            = fnTy;
             rec.variadicBuiltin = bf.variadic;
             rec.builtinLowering = bf.lowering;  // c103: intrinsic-lowering builtins
+            // D-CSUBSET-ATOMIC-MONOMORPH-I32: carry the type-generic declaration
+            // to the symbol. `rec.type` stays the EXEMPLAR — every consumer that
+            // does not specialize (arity, callability, the diagnostic that prints
+            // the signature) keeps working on it unchanged.
+            rec.genericPointee  = bf.genericPointee;
             SymbolId const id = s.symbols.mint(rec);
             s.scopes.injectBinding(builtinScope, bf.name, id);
         }

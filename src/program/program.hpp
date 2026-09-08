@@ -192,6 +192,37 @@ public:
         DiagnosticReporter::Config const& reporterConfig = {}
     );
 
+    /// `--emit-hir <path>`: run the front end for ONE translation unit built
+    /// from `sourceFiles`, against the ONE `target`, and write its HIR as
+    /// `.dsshir` text. Then STOP — no MIR, no codegen, no link, no object.
+    ///
+    /// Returns 0 IF AND ONLY IF DSS accepted the source AND the artifact was
+    /// written in full; non-zero means DSS rejected the input (or the write
+    /// failed) and said why on `err`. ★ That equivalence is the deliverable,
+    /// not a side effect: the consumer this exists for treats `rc == 0` as
+    /// *"this program is in our accepted set, and here is its HIR"*, so a
+    /// non-zero exit beside a good artifact — which is what HIR emission as a
+    /// `--compile` MODIFIER would produce on a link failure — would make the
+    /// status answer a question nobody asked.
+    ///
+    /// ⚠ A TRANSLATION UNIT THAT WOULD NOT LINK IS A NORMAL INPUT. A single
+    /// function in isolation, a call to an undefined symbol, no `main` — all
+    /// emit cleanly, because nothing downstream of HIR runs to object to them.
+    ///
+    /// `out` receives the artifact when `path` is `-`; otherwise the file at
+    /// `path` does. Streams are parameters, not `std::cout`/`std::cerr`
+    /// captures, so the whole path is exercisable in-process by a unit test
+    /// without spawning the CLI (same discipline as `dumpPredefinedMacros`).
+    int emitHirText(
+        const std::vector<std::string>& sourceFiles,
+        const std::string& languageName,
+        const std::string& target,
+        const std::string& path,
+        std::ostream& out,
+        std::ostream& err,
+        DiagnosticReporter::Config const& reporterConfig = {}
+    );
+
     /// `--output <dir>` (D-LK10-ENTRY Slice C companion): routes
     /// emitted binaries into the named directory. When set, the
     /// output-path convention becomes `<outputDir>/<binary>` for
@@ -530,6 +561,12 @@ private:
     // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: --stack-reserve / manifest
     // `stackReserve` (nullopt = the format's declared default).
     std::optional<std::uint64_t>           stackReserveBytes_;
+    /// `--emit-hir`: the buffer `compileOneTarget` renders the `.dsshir` text
+    /// into instead of compiling. Set ONLY by `emitHirText`, for the duration of
+    /// that one call, and cleared on the way out — a compiling entry point must
+    /// never find it engaged. Null on every other path, which is every other
+    /// path there is.
+    std::string*                           hirTextSink_ = nullptr;
 };
 
 } // namespace dss

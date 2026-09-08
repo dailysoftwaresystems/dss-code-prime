@@ -126,7 +126,53 @@ INVOKED_FROM="$(pwd -P)"
 # ★ COST TO THE COMMON CASE: one `mktemp`, one background subshell, and one
 # small write per git query. The watchdog polls with `sleep 5`, so it is asleep
 # essentially the whole time. Nothing is skipped and no check is weakened.
-_LE_WATCHDOG_BUDGET=600
+#
+# ⚠⚠ 600 → 90 IN P64, AND THE REASONING ABOVE IS AMENDED RATHER THAN REPLACED.
+# Everything it says stands; what changed is that the bound stopped being
+# hypothetical. ✔MEASURED P64: the hang FIRES ROUTINELY — a lane hit it on 3 of 3
+# attempts, both twins, and paid 600 s twice per gate. A budget is only free while
+# nothing reaches it. 90 s is still ~4× the 23218 ms worst case that paragraph
+# measured under deliberate git-lock contention, and ~34× the 2.6 s this guard
+# actually costs under `ctest` on a quiet tree — so it still cannot red honest
+# work, and it turns a 20-minute tax per lane into a 3-minute one.
+#
+# ⚠ THE MECHANISM IS STILL NOT DIAGNOSED, AND TWO PLAUSIBLE CAUSES ARE NOW
+# REFUTED — recorded so the next reader does not re-walk them:
+#   * NOT the `pwsh` binary. `find_program` resolves `POWERSHELL_EXE` to the
+#     .NET-TOOL SHIM (`~/.dotnet/tools/pwsh.exe`), which spawns
+#     dotnet → pwsh.dll → the real pwsh.exe — a three-process chain that looks
+#     exactly like a deadlock waiting to happen. ✔MEASURED: FOUR concurrent runs
+#     of this script finish in 5 s on the shim and 3 s on the real binary. Both
+#     fine.
+#   * NOT `git` contention across linked worktrees. All five trees share one
+#     `.git`, so concurrent `git ls-files --eol` was the obvious suspect.
+#     ✔MEASURED: five trees serially = 2 s, five trees AT ONCE = 1 s, every rc 0.
+#   * NOT host load, and this one refutes a guess of MINE rather than a lane's.
+#     ✔MEASURED by an independent P64 reviewer running these guards with TWO
+#     sibling ctest runs live — heavier load than any hang was seen under — and
+#     both PASSED, in 3.22 s and 7.85 s. ⇒ It is INTERMITTENT (3 of 4 across the
+#     cycle, not the 3-of-3 a single lane reported), and "more load" does not
+#     make it likelier. An earlier draft of this very paragraph said "FIRES
+#     ROUTINELY" and implied a load correlation; that is corrected here rather
+#     than quietly reworded, because a wrong lead costs the next reader more than
+#     no lead.
+#   * NOT a slow `git rev-parse`, and this refutes the lead THIS COMMENT used to
+#     give. ✔MEASURED P64: a lane hit the timeout twice in one run and the guard
+#     was stalled at TWO DIFFERENT activities, not both at the same query. An
+#     earlier draft here said "the stall is ON a `git rev-parse` the guard NAMES"
+#     and pointed the next probe at that query; one observation of one activity is
+#     not a pattern, and the second observation broke it. Recorded rather than
+#     reworded, because a confident wrong lead costs the next reader more than an
+#     honest absence of one.
+#   ⓘ What is left, and what the next probe should start from: it reproduces only
+#   under `ctest` (alone under ctest, on a quiet tree, it passes in 2.6 s), parent
+#   and child both sit at ~0 CPU, it is INTERMITTENT rather than load-driven, and
+#   the POSIX twin has been seen to pass in the same conditions the PowerShell twin
+#   hung in. A blocked pipe under ctest's own output capture fits all of those and
+#   is activity-INDEPENDENT, which the two-different-activities observation now
+#   favours; a file redirect — which is what both probes above used — would never
+#   show it.
+_LE_WATCHDOG_BUDGET=90
 _le_watchdog_pid=""
 _le_activity_file=""
 _le_started_at="$(date +%s 2>/dev/null || echo 0)"

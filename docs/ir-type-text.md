@@ -131,8 +131,8 @@ Elements are comma-separated and parsed until the closing `>`.
 A nominal aggregate with a quoted name and a brace-delimited list of member types:
 
 ```
-struct "Name" { T, ... }
-union "Name" { T, ... }
+struct "Name" [opaque | [rec <H>] [packed]] { T [@off | ~align] [packed], ... }
+union  "Name" [opaque | [rec <H>] [packed]] { T [packed], ... }
 ```
 
 Examples:
@@ -141,9 +141,17 @@ Examples:
 struct "Point" { f32, f32 }
 union "Value" { i64, f64, ptr<char> }
 struct "Empty" { }
+struct "FILE" opaque              // INCOMPLETE — no field list, and `{}` would be a different type
+struct "Node" rec 1 { i32, ptr<rec 1> }   // self-referential
 ```
 
 The name is a quoted string literal; members are comma-separated types until the closing `}`. The member *types* round-trip; member *names* are not part of the type record (they live in the `SemanticModel`).
+
+**`opaque`** marks an **incomplete** composite (a tag declared but not defined). It is terminal — no field list follows — and it is *not* interchangeable with `{ }`, which is a legal **complete** zero-member composite. Both `struct` and `union` accept it.
+
+**`rec <H>`** marks a composite whose own type graph reaches itself, and **`rec <H>` in type position** is the back-reference that closes the cycle. `H` is a handle for the *composite*, artifact-local and 1-based, and the same composite carries the same handle everywhere in one document — which is what lets a mutually recursive pair be written down, since one type then has two different spellings in one file. A back-reference resolves only against composites **currently open** at that point; a handle of `0`, a back-reference to a closed composite, and one handle carrying two different bodies are each refused by name. See [`hir-text-format.md` §5.1](./hir-text-format.md) for the worked mutual-recursion example and what a reader that re-interns must do about it.
+
+**`packed`** (after the name) is the whole-composite packed flag; **`@<byteOffset>`** and **`~<align>`** after a field are explicit offsets and per-member alignment (all-or-none, and mutually exclusive with each other); a trailing **`packed`** on one field is the per-member packed attribute.
 
 ### 2.7 `enum`
 
@@ -151,17 +159,17 @@ A nominal enum with a quoted name and an **optional** underlying-type selector:
 
 ```
 enum "Name"
-enum "Name" : <underlyingOrdinal>
+enum "Name" : <underlyingKeyword>
 ```
 
 Examples:
 
 ```
 enum "Color"              // underlying defaults to i32
-enum "Flags" : 7          // underlying = the TypeKind whose ordinal is 7
+enum "Flags" : u8         // underlying = u8
 ```
 
-When the `: <ordinal>` suffix is present, the integer is read as a `TypeKind` ordinal and used as the enum's underlying scalar type (it must be a valid `TypeKind` ordinal; otherwise the default `i32` is kept). Enumerator *names* are not stored in the type record — only the nominal name and the underlying `TypeKind` round-trip here.
+When the `: <keyword>` suffix is present it is a **primitive type keyword**, the same spelling the primitive table prints — never a `TypeKind` *ordinal*, which is version-fragile and is deliberately not serialized anywhere in this format. A keyword the table does not carry is refused by name, with the accepted set. The suffix is omitted when the underlying type is the `i32` default, and the reader's default matches. Enumerator *names* are not stored in the type record — only the nominal name and the underlying kind round-trip here.
 
 ### 2.8 `fn` — function signatures
 
@@ -240,7 +248,8 @@ This is the IR type-text for the C signature `int puts(const char *)`: a functio
 | slice | `slice<T>` |
 | vector / matrix / array | `vec<T, n>`, `mat<T, r, c>`, `arr<T, n>` |
 | tuple | `tuple<T, ...>` |
-| struct / union | `struct "N" { T, ... }`, `union "N" { T, ... }` |
-| enum | `enum "N"`, `enum "N" : <ordinal>` |
+| struct / union | `struct "N" { T, ... }`, `union "N" { T, ... }`, `struct "N" opaque`, `struct "N" rec 1 { ptr<rec 1> }` |
+| recursive back-reference | `rec <H>` (in type position — names an enclosing `rec <H>` composite) |
+| enum | `enum "N"`, `enum "N" : u8` |
 | function | `fn(T, ...) -> R`, `fn(...) -> R cc <name>` |
 | extension | `ext "name" (T, ...)`, `ext "name" (...) [n, ...]` |

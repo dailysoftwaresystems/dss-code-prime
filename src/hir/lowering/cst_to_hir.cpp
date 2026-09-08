@@ -466,8 +466,11 @@ struct Lowerer {
     // language config declares WHICH vocabulary entry serves the role under the
     // active data model; this carries only the resolved (core, tag) pair, so no
     // site branches on a spelling. Undeclared ⇒ the historic anonymous core.
+    // `const`: it mints into the REFERENCED interner, never into the lowerer, so
+    // a const derivation site (`specializedCalleeSig`) can ask for C §7.17.1p6's
+    // `M` through this same seam instead of resolving it a second way.
     [[nodiscard]] TypeId synthesizedType(SynthesizedTypeRule const& rule,
-                                         TypeKind historicCore) {
+                                         TypeKind historicCore) const {
         if (auto const r = rule.resolve(dataModel_)) {
             return interner.primitive(r->first, r->second);
         }
@@ -3987,7 +3990,9 @@ struct Lowerer {
                     // copy `interner.fnParams()` to an OWNED vector BEFORE lowering
                     // any arg (the span dangles if an arg grows the operand pool).
                     callCtxs[ctxIdx].baseE = result;
-                    TypeId const calleeSig = calleeSigOf(result.type);
+                    TypeId const calleeSig = specializedCalleeSig(
+                        f.n0, callCtxs[ctxIdx].argNodes,
+                        calleeSigOf(result.type));
                     if (calleeSig.valid()) {
                         auto const paramSpan = interner.fnParams(calleeSig);
                         callCtxs[ctxIdx].paramTypes.assign(paramSpan.begin(), paramSpan.end());
@@ -4976,6 +4981,45 @@ struct Lowerer {
     // width/signedness miscompile class). InvalidType when the callee
     // type is neither shape (opaque/extension callee — the verifier
     // owns arity rules there).
+    // D-CSUBSET-ATOMIC-MONOMORPH-I32: a builtin whose config row declares
+    // `genericPointee` carries an EXEMPLAR signature; derive the REAL one for
+    // this call site from the argument in the declared binding position, so the
+    // per-argument coercion below and the call's result type both use the
+    // specialized parameter types.
+    //
+    // ⚠ THE LOWERING TIER DERIVES THIS ITSELF RATHER THAN READING WHAT THE
+    // SEMANTIC TIER COMPUTED. ✔MEASURED: a specialized FnSig stamped on the
+    // callee name token is re-stamped from the symbol by the reference-rules
+    // pass, so this tier read the exemplar back and coerced the value argument
+    // to the exemplar's `int` — a 64-bit value TRUNCATED under an
+    // `_Atomic long` store. It was caught loud by the MIR verifier's write-typing
+    // belt rather than miscompiled, and the fix is that BOTH tiers derive the
+    // same fact from the same SymbolRecord and the same argument node.
+    //
+    // `argTy` comes from the CST arg node's stamped type (the semantic tier's,
+    // unambiguous and already computed) — not from a lowered argument, which at
+    // this point does not exist: the parameter types are what the args are about
+    // to be coerced TO.
+    [[nodiscard]] TypeId specializedCalleeSig(NodeId calleeNode,
+                                              std::vector<NodeId> const& argNodes,
+                                              TypeId calleeSig) const {
+        if (!calleeSig.valid()) return calleeSig;
+        NameHit const h = firstNameToken(calleeNode);
+        if (!h.sym.valid()) return calleeSig;
+        auto const* rec = model.recordFor(h.sym);
+        if (rec == nullptr || !rec->genericPointee.has_value()) return calleeSig;
+        auto const& gp = *rec->genericPointee;
+        if (gp.bindFromParam >= argNodes.size()) return calleeSig;
+        // C §7.17.1p6's `M` for an atomic POINTER object, through the SAME
+        // `synthesizedType` seam and the SAME declaration the semantic tier
+        // reads — the two derivations must answer identically, so neither may
+        // resolve this from anywhere else.
+        return specializeGenericPointeeSignature(
+            interner, calleeSig,
+            typeAtOr(argNodes[gp.bindFromParam], InvalidType), gp,
+            synthesizedType(sem.pointerDifferenceType, TypeKind::I64));
+    }
+
     [[nodiscard]] TypeId calleeSigOf(TypeId t) const {
         if (!t.valid()) return InvalidType;
         if (interner.kind(t) == TypeKind::FnSig) return t;
@@ -6343,7 +6387,16 @@ struct Lowerer {
             // interner growth. Cost: one small heap allocation per
             // call site; rare alternative is a `std::array`-backed
             // small-buffer for ≤8-param calls (most calls).
-            TypeId const calleeSig = calleeSigOf(base.type);
+            // D-CSUBSET-ATOMIC-MONOMORPH-I32: the recursive twin of the
+            // iterative Call arm's specialization — the two makeCall sites stay
+            // in lockstep (the same reason `emitCallOrBuiltin` is shared).
+            std::vector<NodeId> const genericArgNodes = [&] {
+                std::vector<NodeId> out;
+                for (NodeId a : argExpressions(rest)) out.push_back(a);
+                return out;
+            }();
+            TypeId const calleeSig = specializedCalleeSig(
+                baseN, genericArgNodes, calleeSigOf(base.type));
             std::vector<TypeId> paramTypes;
             if (calleeSig.valid()) {
                 auto const paramSpan = interner.fnParams(calleeSig);

@@ -98,6 +98,53 @@ struct DSS_EXPORT CliArgs {
     // gcc's `-d<CHARS>` dump family, and claiming that spelling would promise a
     // family DSS does not implement. (`--define` likewise has no `-D` alias.)
     bool                     dumpPredefinedMacros = false;
+    // ── `--emit-hir <path>` ─────────────────────────────────────
+    //
+    // Run the front end for ONE translation unit against ONE target and write
+    // its HIR as `.dsshir` text to `path` (`-` = stdout). Then STOP: no MIR, no
+    // codegen, no link, no object file.
+    //
+    // ★ WHY IT IS A MODE AND NOT A MODIFIER ON `--compile`, and the reason is
+    // the EXIT CODE. The consumer this exists for reads the artifact of a
+    // translation unit that may not link — a single function in isolation is a
+    // normal input for it — and needs `rc == 0` to mean exactly *"DSS accepted
+    // this source and here is its HIR"*. As a modifier, a link failure would
+    // return non-zero with perfectly good HIR already on disk, so the status
+    // would answer a question nobody asked and the one question they did ask
+    // would have no answer at all. As a mode there is nothing downstream of HIR
+    // to fail, so `rc == 0` ⇔ the file is written and readable, and `rc != 0` ⇔
+    // DSS rejected the input and said why. (Same argument that makes
+    // `--dump-predefined-macros` a mode, one stage further down the pipeline.)
+    //
+    // ⚠ IT STILL TAKES `--target`, because HIR IS TARGET-DEPENDENT — the data
+    // model decides integer widths (and therefore which conversions survive as
+    // explicit `cast` nodes and which collapse to identity retags), the
+    // `long double` format, aggregate layout and the bit-field ABI. It is a
+    // STAGE STOP, not a target-free operation, and it takes exactly ONE target
+    // for that reason: one path can hold one module, and silently emitting the
+    // first of three targets' HIR would be a confidently wrong answer.
+    //
+    // `--language` is OPTIONAL here on the same footing as `--compile`: omitted,
+    // each target supplies the source language it declares.
+    std::optional<std::string> emitHirPath;   // --emit-hir <path> ("-" = stdout)
+    std::vector<std::string>   emitHirFiles;  // the TU's source files (positional)
+    // ── `--dump-hir-kinds` ──────────────────────────────────────
+    //
+    // Print this build's HIR node-kind inventory — every `HirKind` name it can
+    // emit, with its arity class — and exit 0 having compiled nothing.
+    //
+    // ★ WHY IT IS A MODE, AND WHY IT NEEDS NEITHER A LANGUAGE NOR A TARGET.
+    // The question is about the COMPILER, not about a program: the core kind set
+    // is a property of this binary and does not vary with source language, CPU
+    // or object format. Requiring a triple would be requiring an answer to a
+    // question that is not being asked. (`--dump-predefined-macros` requires one
+    // for the opposite reason — its answer genuinely differs per target.)
+    //
+    // It exists so a consumer's HIR reader can compare its own coverage against
+    // the real node set AT BUILD TIME and refuse an uncovered construct BY NAME,
+    // instead of meeting it at run time and skipping it. A reader that silently
+    // skips a node has read a different program from the one in the file.
+    bool                     dumpHirKinds = false;
     std::vector<std::string> sourceFiles; // populated by --compile <files>...
     std::vector<std::string> transpileFiles; // populated by --transpile <files>...
     std::optional<std::string> directoryPath; // populated by --directory <path>
@@ -387,6 +434,14 @@ enum class CliArgsError : std::uint8_t {
                                 // supported — use a config predefine)
     InvalidJobs         = 13,   // D-PERF-4: --jobs with a non-numeric value, a
                                 // zero, or trailing junk (`--jobs 0`, `--jobs x`)
+    AmbiguousEmitHirTarget = 19, // --emit-hir with more than one --target.
+                                // HIR is target-dependent and `--emit-hir
+                                // <path>` names ONE file, so N targets would
+                                // mean N different modules competing for one
+                                // path. Refused rather than resolved: picking
+                                // the first is a confidently wrong answer, and
+                                // writing N files under invented names invents a
+                                // naming scheme the operator never asked for.
     InvalidLto          = 18,   // D-OPT11-LAZY-IMPORT-EDGE: --lto with a mode
                                 // this driver does not know. A CLOSED
                                 // vocabulary on purpose — an unrecognized mode

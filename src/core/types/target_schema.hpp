@@ -3290,11 +3290,22 @@ enum class RelocFormulaKind : std::uint8_t {
     // (42) forms are relaxable, and they say so on the wire BECAUSE the
     // assembler checked the instruction shape.
     //
-    // DSS synthesizes no GOT in its static ET_EXEC path, so the
-    // `applyExecRelocations` kernel arm is an EXPLICIT FAIL-LOUD REFUSAL
-    // — the same discipline as the two arm64 GOT rows above, and for the
-    // same reason: fabricating `S + A − P` here would patch a direct
-    // reference where an indirect one was meant.
+    // ⚠ THIS PARAGRAPH USED TO SAY *"DSS synthesizes no GOT in its static
+    // ET_EXEC path, so the `applyExecRelocations` kernel arm is an EXPLICIT
+    // FAIL-LOUD REFUSAL"*, AND IT WENT FALSE WHEN THE WALKER LEARNED TO MINT
+    // ONE. The ELF static ET_EXEC walker now lays a `.got` — one pointer slot
+    // per symbol a GOT-slot-relative relocation names — and the kernel arm
+    // RESOLVES the relocation against that slot's address, which travels in
+    // its OWN map (`gotSlotVa`) rather than in `symbolVa`, because one symbol
+    // can need the slot's address at a GOTPCREL site and its own address at a
+    // PLT32 site in the SAME member.
+    //
+    // ★ THE REFUSAL SURVIVES WHERE NO SLOT EXISTS, and that is the whole
+    // guard: a walker that mints no GOT passes no map, so the arm fails LOUD
+    // instead of falling back to `symbolVa` — fabricating `S + A − P` there
+    // would patch a DIRECT reference where an INDIRECT one was meant. That is
+    // still the same discipline as the two arm64 GOT rows above; what changed
+    // is that ONE walker now has an answer, not that the refusal was relaxed.
     X86_64GotPcRel        = 7,
 };
 

@@ -145,6 +145,16 @@
       "virtualAddress": 0
     },
     {
+      "$comment": "D-LK-ELF-EMITS-NO-BUILD-ID-NOTE: the image's CONTENT-DERIVED identity, the thing a debugger, a core dump and debuginfod key on. sh_type = SHT_NOTE (7); sh_flags = SHF_ALLOC (2) so it is MAPPED (the reference puts it in the first PT_LOAD, and an unmapped identity is invisible to a crash reporter); addralign = 4 (the gABI note record aligns namesz/descsz to 4); entrySize 0 (a note section is not an array of fixed-size records). PRESENCE IS A PER-LINK POLICY IN THE REFERENCE AND THEREFORE A DECLARATION HERE, NOT A CONSTANT IN THE WRITER -- exactly the argument macho64-*'s `image.uuid` row carries. MEASURED 2026-09-07 (WSL Ubuntu 24.04, GNU ld 2.42): gcc 13.3.0 and clang 18.1.3 BOTH emit `.note.gnu.build-id` at DEFAULT flags on exec and on .so, reproducibly (the same source built twice stamps the same id, a changed source a different one), and `-Wl,--build-id=none` REMOVES it (3 NOTE sections become 2) -- so DSS emitting none was below the union. Omit this row and the walker emits no note, which is the `--build-id=none` arm. The DESCRIPTOR is a full SHA-256: the note format fixes no descriptor length (ld writes 20 for its default sha1, 16 for md5, any length for an explicit hex id) and every consumer treats it as opaque bytes, so DSS publishes the digest it actually computed instead of truncating to claim a width it did not. The SAME `note` kind carries the EMPTY .note.GNU-stack marker on the ET_REL documents: one declared row, a different note per artifact flavour, because neither flavour wants the other's (gcc -c and clang -c emit no build-id note at all).",
+      "kind": "note",
+      "name": ".note.gnu.build-id",
+      "type": 7,
+      "flags": 2,
+      "addrAlign": 4,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
       "$comment": "Symbol table (the LOADER reads .dynsym). sh_entsize = 24.",
       "kind": "symtab",
       "name": ".symtab",

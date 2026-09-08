@@ -76,6 +76,7 @@ the other in the same commit.
 | **`check-path-identity`** | `check-path-identity.py` | refuse a second path canonicalizer -- path resolution lives in exactly one place. |
 | **`check-plan-citations`** | `check-plan-citations.py` | refuse a new `path:line` citation in the plans -- a citation names a stable reference, never a line number. |
 | **`check-retyped-closed-sets`** | `check-retyped-closed-sets.py` | census the diagnostics that RETYPE a closed vocabulary instead of projecting it. |
+| **`check-root-litter`** | `check-root-litter.sh`, `test-check-root-litter.sh` | refuse any untracked file sitting directly in a repository root -- the probe litter lanes leave behind when a bare filename lands in their cwd. |
 | **`check-scripts-index`** | `check-scripts-index.py` | refuse a script that no index documents, and an index entry that no script backs. |
 | **`check-shell-portability`** | `check-shell-portability.py` | refuse a tracked shell script that cannot run on bash 3.2 without declaring it. |
 | **`check-stale-refusal-citations`** | `check-stale-refusal-citations.py` | refuse a new present-tense refusal sentence that cites an anchor row already marked CLOSED. |

@@ -10985,6 +10985,75 @@ struct Lowerer {
     //
     //   Else → fail loud (no atomic-CAS realization declared); a half-declared
     //   ldaxr/stlxr pair is a misdeclaration → fail loud naming the absent half.
+
+    // ★★★ THE ONE OWNER OF "WHAT REGISTER FORM DOES A CAS COMPARE?" — and the
+    // reason the answer is a FUNCTION rather than a width constant.
+    //
+    // A compare-exchange decides equality TWICE, in two tiers, and the two
+    // answers reach different consumers:
+    //   * the LIR in-CAS compare here decides whether the exchange COMMITS;
+    //   * the MIR-tier `ICmpEq` that `emitAtomicCompareExchange` (hir_to_mir)
+    //     builds decides the `_Bool` RESULT and the failure write-back.
+    // If those two disagree, `atomic_compare_exchange` returns `true` without
+    // having exchanged — a SILENT WRONG ANSWER, and the thing every lock-free
+    // algorithm built on a CAS assumes cannot happen.
+    //
+    // ⚠⚠ THEY DID DISAGREE, AND THE WAY THEY DISAGREED IS THE LESSON. The first
+    // cut of the sub-word CAS surface widened THIS compare to the container
+    // width and justified it by ENUMERATING the producers of a sub-word value —
+    // "the exclusive load is `ldaxrb`/`ldaxrh`, the plain load is `ldrb`/`ldrh`
+    // (x86: `movzx`), and the `zext` verb is `uxtb`/`uxth`, so the register is
+    // always zero-extended". ✔MEASURED FALSE: a MATERIALIZED NEGATIVE CONSTANT
+    // is not in that list. `_Atomic signed char sc; expected = -1` under
+    // `--config=release` (where Mem2Reg removes the stack round trip that had
+    // been canonicalising the comparand) put `0x00000000FFFFFFFF` in the
+    // comparand register against `ldaxrb`'s `0x000000FF`: the container-width
+    // `cmp` said NOT EQUAL and skipped `stlxr`, while the MIR tier's
+    // `sxtb`/`sxtb`/`cmp` said EQUAL and reported SUCCESS. gcc -O2 and clang -O2
+    // both give the right answer; DSS gave a wrong one on arm64 release only.
+    // ★ AND BEFORE THAT WIDENING THE SAME SITE REFUSED LOUDLY
+    // (`A_NoMatchingEncodingVariant` — arm64 declares `cmp` at 32/64 only), so
+    // the widening turned a refusal into a wrong answer, which is the single
+    // worst trade this project recognises.
+    //
+    // ★★★ SO THE FIX IS NOT A BETTER ENUMERATION — AN ENUMERATION OF PRODUCERS
+    // IS THE DEFECT CLASS ([[feedback-a-partial-fix-reads-as-a-complete-one]]:
+    // you do not know the count). THIS FUNCTION ASSUMES NOTHING ABOUT WHERE A
+    // VALUE CAME FROM. It NARROWS its operand to the object's own width with the
+    // target's declared `zext` verb, so the returned register holds exactly the
+    // object's `width` bits and nothing else. Called on BOTH operands, it makes
+    // the container-width compare compute `equal in the low <width> bits` — and
+    // that is the SAME PREDICATE the MIR tier computes, because
+    // `promoteForAtomicRmw` likewise extends BOTH of its operands from that one
+    // width (the width both tiers read off the SAME MIR type: the AtomicCas's
+    // `instType`). Two tiers computing one predicate cannot disagree; keeping
+    // two approximations in agreement is what could not be maintained.
+    // ⓘ Extension DIRECTION is deliberately not a second decision to keep in
+    // step: equality in the low N bits is preserved by ANY extension applied to
+    // BOTH operands, so the MIR tier's sign-extension and this tier's
+    // zero-extension are the same predicate. What must match is the WIDTH, and
+    // there is one owner of it (`memAccessWidthFlags` over the object type).
+    // ⓘ A native-width object needs no narrowing (the register IS the object),
+    // so this is byte-identical for every ≥32-bit CAS — including both
+    // `_InterlockedCompareExchange{,64}` intrinsics.
+    // ⚠ NOT an `if (arch ==)`: a target that realizes a sub-word CAS but
+    // declares no `zext` at that width FAILS LOUD by name rather than silently
+    // comparing wide.
+    [[nodiscard]] std::optional<LirReg> atomicCasCompareOperand(
+            LirReg reg, std::uint8_t widthFlags, MirInstId id) {
+        if (lirInstWidthBits(widthFlags) >= 32u) return reg;
+        auto const zextOp = opcode(MnemonicSlot::ZExt);
+        if (!zextOp.has_value()) {
+            reportMissingOpcode(MnemonicSlot::ZExt,
+                                "MIR AtomicCas (sub-word compare narrowing)");
+            return std::nullopt;
+        }
+        LirReg const narrowed = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> const ops{LirOperand::makeReg(reg)};
+        emitInst(*zextOp, narrowed, ops, /*payload=*/0, widthFlags);
+        return narrowed;
+    }
+
     void lowerAtomicCas(MirInstId id) {
         auto const operands = mir.instOperands(id);
         if (operands.size() != 3) {
@@ -10996,7 +11065,28 @@ struct Lowerer {
         std::optional<LirReg> const newval    = regForValue(operands[2]);
         if (!ptr.has_value() || !comparand.has_value() || !newval.has_value())
             return;
-        std::uint8_t const widthFlags = widthFlagsForType(mir.instType(id));
+        // ⚠⚠ `memAccessWidthFlags`, NOT `widthFlagsForType` — AN ATOMIC CAS IS A
+        // MEMORY ACCESS AND MUST BE BYTE-EXACT TO ITS OBJECT.
+        // ✔MEASURED (P64, D-CSUBSET-ATOMIC-RMW): `widthFlagsForType` maps `Bool`
+        // (and `Byte`) to the width-DEFAULT — its own doc says the sub-native
+        // register-plumbing widths it does return are for extension SOURCES, and
+        // its ALU note says "Bool/Char/Byte never reach an ALU op". So an
+        // `_Atomic _Bool` compare-exchange emitted
+        // `lock cmpxchg QWORD PTR [reg], reg` — an EIGHT-BYTE read-modify-write
+        // of a ONE-BYTE object, which compared and clobbered SEVEN BYTES OF
+        // NEIGHBOURING GLOBALS. It reproduced only when the neighbours were
+        // non-zero, so it read as "works" in a small program and as a wrong
+        // answer in a larger one: a silent miscompile, not a refusal.
+        // ★ PRE-EXISTING, MADE REACHABLE HERE. Before this cycle the only
+        // AtomicCas consumers were the `_InterlockedCompareExchange{,64}`
+        // intrinsics, whose signatures are i32/i64 — no sub-word CAS could be
+        // spelled at all. The RMW family and the width-generic accessors are what
+        // opened the path, which is exactly why the widening arrived with them.
+        // `memAccessWidthFlags` is the ONE owner of "how many bytes does a memory
+        // op of this type touch" (D-LIR-INT-MEMORY-WIDTH-EXACT) and lists Bool
+        // among the 1-byte cases; asking it is the whole fix.
+        std::uint8_t const widthFlags =
+            memAccessWidthFlags(mir.instType(id), regClassFor(id));
 
         // Rule 1 — x86 single-op `lock cmpxchg` with implicit-RAX roles.
         if (auto const casOp = opcode(MnemonicSlot::LockCmpxchg); casOp.has_value()) {
@@ -11086,6 +11176,14 @@ struct Lowerer {
             LirReg const oldReg    = lir.newVReg(regClassFor(id));
             LirReg const statusReg = lir.newVReg(LirRegClass::GPR);
 
+            // The comparand is LOOP-INVARIANT, so its narrowing is emitted ONCE
+            // here, BEFORE the branch into `retry` — keeping the ldaxr..stlxr
+            // exclusive window as narrow as it can be while still comparing at
+            // the object width (D-LIR-LLSC-SPILL-EXCLUSION's subject).
+            std::optional<LirReg> const cmpComparand =
+                atomicCasCompareOperand(*comparand, widthFlags, id);
+            if (!cmpComparand.has_value()) return;
+
             emitBr(*jmpOp, retry);
             lir.beginBlock(retry);
             // ldaxr old, [ptr] — load-acquire exclusive; W-form via widthFlags.
@@ -11093,12 +11191,22 @@ struct Lowerer {
                 std::array<LirOperand, 1> const ldOps{LirOperand::makeReg(*ptr)};
                 emitInst(*ldaxrOp, oldReg, ldOps, /*payload=*/0, widthFlags);
             }
-            // cmp old, comparand (the value width); b.ne → done (CAS failure
-            // observes `old` as the result), fall through → store.
+            // The observed value's narrowing MUST be inside the loop — it is
+            // redefined by every `ldaxr` iteration.
+            std::optional<LirReg> const cmpOld =
+                atomicCasCompareOperand(oldReg, widthFlags, id);
+            if (!cmpOld.has_value()) return;
+            // cmp old, comparand; b.ne → done (CAS failure observes `old` as the
+            // result), fall through → store.
+            //
+            // Both operands arrive already NARROWED to the object width by
+            // `atomicCasCompareOperand` (see its doc — this is the site that
+            // makes the two tiers' equality the same predicate), so the compare
+            // itself takes the default container width and is EXACT.
             {
                 std::array<LirOperand, 2> const cmpOps{
-                    LirOperand::makeReg(oldReg), LirOperand::makeReg(*comparand)};
-                emitInst(*cmpOp, InvalidLirReg, cmpOps, /*payload=*/0, widthFlags);
+                    LirOperand::makeReg(*cmpOld), LirOperand::makeReg(*cmpComparand)};
+                emitInst(*cmpOp, InvalidLirReg, cmpOps);
                 std::array<LirOperand, 2> const jccOps{
                     LirOperand::makeBlockRef(done.v),
                     LirOperand::makeBlockRef(store.v)};

@@ -717,6 +717,22 @@
             "wires":      [
               { "index": 0, "slotKind": "rn" }
             ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 8 },
+            "template":   { "fixedWord": 140508160 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 16 },
+            "template":   { "fixedWord": 1214249984 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
           }
         ]
       }
@@ -744,6 +760,24 @@
           {
             "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
             "template":   { "fixedWord": 3355507712 },
+            "resultSlot": "rm",
+            "wires":      [
+              { "index": 0, "slotKind": "rd" },
+              { "index": 1, "slotKind": "rn" }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 8 },
+            "template":   { "fixedWord": 134282240 },
+            "resultSlot": "rm",
+            "wires":      [
+              { "index": 0, "slotKind": "rd" },
+              { "index": 1, "slotKind": "rn" }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 16 },
+            "template":   { "fixedWord": 1208024064 },
             "resultSlot": "rm",
             "wires":      [
               { "index": 0, "slotKind": "rd" },
@@ -777,6 +811,26 @@
           {
             "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
             "template":   { "fixedWord": 3370122240 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regRole": "stackPointer" },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "memoffset.zero"  }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
+            "template":   { "fixedWord": 148896768 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regRole": "stackPointer" },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "memoffset.zero"  }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
+            "template":   { "fixedWord": 1222638592 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn", "regRole": "stackPointer" },
@@ -817,6 +871,26 @@
               { "index": 2, "slotKind": "membase.noscale" },
               { "index": 3, "slotKind": "memoffset.zero"  }
             ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template":   { "fixedWord": 144702464 },
+            "wires":      [
+              { "index": 0, "slotKind": "rd"              },
+              { "index": 1, "slotKind": "rn", "regRole": "stackPointer" },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "memoffset.zero"  }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template":   { "fixedWord": 1218444288 },
+            "wires":      [
+              { "index": 0, "slotKind": "rd"              },
+              { "index": 1, "slotKind": "rn", "regRole": "stackPointer" },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "memoffset.zero"  }
+            ]
           }
         ]
       }
@@ -845,6 +919,26 @@
           {
             "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
             "template":   { "fixedWord": 3365927936 },
+            "wires":      [
+              { "index": 0, "slotKind": "rd"              },
+              { "index": 1, "slotKind": "rn", "regRole": "stackPointer" },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "memoffset.zero"  }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template":   { "fixedWord": 144702464 },
+            "wires":      [
+              { "index": 0, "slotKind": "rd"              },
+              { "index": 1, "slotKind": "rn", "regRole": "stackPointer" },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "memoffset.zero"  }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template":   { "fixedWord": 1218444288 },
             "wires":      [
               { "index": 0, "slotKind": "rd"              },
               { "index": 1, "slotKind": "rn", "regRole": "stackPointer" },

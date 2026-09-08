@@ -605,3 +605,29 @@ dss_add_test(NAME link/test_glibc_relocation_vocabulary
 # json link, the same pattern the COFF reader pin above uses.
 target_link_libraries(dss_link_test_glibc_relocation_vocabulary
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: the RESOLUTION
+# half. The vocabulary target above proves a REAL glibc `libc.a` member READS;
+# this one proves the read module LINKS -- the static ET_EXEC walker mints a
+# `.got`, every GOT-slot-relative site is patched to name a slot inside it, and
+# each slot holds the target's link-time address. Its own target because its
+# three arms are a closure, a CONTROL that the section is minted on demand
+# rather than always, and the guard that a still-undeclared wire type is STILL
+# refused -- folding them into a shared binary is how one of the three goes
+# vacuous without anyone noticing.
+dss_add_test(NAME link/test_glibc_gotpcrel_resolution
+             SOURCES test_glibc_gotpcrel_resolution.cpp)
+
+# D-LK-ELF-EMITS-NO-BUILD-ID-NOTE: the ELF image's `.note.gnu.build-id` -- its
+# wire record, the fixed-point content derivation, reproducibility, distinctness,
+# and the `--build-id=none` CONTROL (a document derived from the shipped one with
+# the `note` row REMOVED emits no note at all). Its own target because the
+# control derives a SECOND format document at run time, which needs the json
+# link -- the same pattern the glibc vocabulary target above uses -- and because
+# a build id that is present but not content-derived, or content-derived but not
+# reproducible, are different defects that a shared binary would let hide behind
+# one another.
+dss_add_test(NAME link/test_elf_build_id_note
+             SOURCES test_elf_build_id_note.cpp)
+target_link_libraries(dss_link_test_elf_build_id_note
+                      PRIVATE nlohmann_json::nlohmann_json)

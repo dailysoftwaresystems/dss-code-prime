@@ -495,3 +495,18 @@ dss_add_test(NAME program/test_synth_verify_seam_guard
 # APPENDED, never interleaved -- this file is append-only by lane convention.
 dss_add_test(NAME program/test_synth_verify_failure_path
              SOURCES test_synth_verify_failure_path.cpp)
+
+# `--emit-hir <path>` + `--dump-hir-kinds` (P64 lane `hx`): the HIR of a
+# translation unit as a FILE, for a consumer outside this repository. `emitHir`
+# shipped with ZERO product callers, so every property such a consumer depends on
+# -- self-contained types, source-level names, a version and producer on the
+# artifact's face, rc 0 <=> an artifact was written, and emission for a TU that
+# would NOT LINK -- was true only by accident and untestable from outside the
+# process that emitted it. Every arm here reads the artifact BACK through
+# `parseHir` (which runs `HirVerifier` on load) rather than inspecting the
+# in-process `Hir`, because that is the only thing a reader holding the bytes can
+# do. HOST-INDEPENDENT: the front end runs; nothing is codegen'd, linked or run.
+#
+# APPENDED, never interleaved -- this file is append-only by lane convention.
+dss_add_test(NAME program/test_emit_hir_mode
+             SOURCES test_emit_hir_mode.cpp)

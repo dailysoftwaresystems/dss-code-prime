@@ -3399,32 +3399,73 @@ encodeExec(AssembledModule const&    module,
     // starting at its aligned base. `SizeOfZeroFill` = the block memsz beyond
     // the template. A tbss item's secrel (registered below) is
     // `tbssBlockBase + itemOffset`, landing in that zero-fill tail.
-    // ── D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN (audit FOLD-1): fail loud on an
-    // OVER-ALIGNED thread-local. The Windows x64 loader allocates each
-    // thread's static-TLS block at only MEMORY_ALLOCATION_ALIGNMENT (16 bytes
-    // = 2*sizeof(void*)), and IMAGE_TLS_DIRECTORY64 carries NO block-base-
-    // alignment field to request more — so a var whose alignment exceeds 16
-    // would be SILENTLY under-aligned in every thread's copy (a SIMD / atomic
-    // thread_local relying on it is UB). ELF's PT_TLS p_align honors any
-    // alignment (the C1/C2 `_Alignas(32) thread_local` witnesses run green),
-    // so this gate is PE-format-LOCAL — the format writer's own ABI knowledge,
-    // never a shared-substrate branch. Alignments <= 16 (every normal scalar /
-    // pointer / small aggregate, incl. `_Alignas(16)`) pass; the gate bites
-    // ONLY explicit over-alignment.
-    constexpr std::uint64_t kPeX64TlsBlockBaseAlign = 16;  // MEMORY_ALLOCATION_ALIGNMENT
+    // ── D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN: an over-aligned thread-local is
+    // PLACED, and the ceiling is what PE/COFF can ENCODE ──────────────────
+    //
+    // ⚠ WHAT STOOD HERE REFUSED EVERY `thread_local` ABOVE 16 BYTES, on the
+    // premise that *"the Windows x64 loader guarantees only
+    // MEMORY_ALLOCATION_ALIGNMENT static-TLS block-base alignment and
+    // IMAGE_TLS_DIRECTORY64 has no field to request more"*. ✔BOTH HALVES ARE
+    // REFUTED BY MEASUREMENT (P64):
+    //
+    //  (1) THE FIELD EXISTS. `IMAGE_TLS_DIRECTORY64.Characteristics` is a
+    //      union — Windows SDK 10.0.26100.0 `um/winnt.h` declares it over
+    //      `{ Reserved0 : 20; Alignment : 4; Reserved1 : 8; }`, the ordinary
+    //      `IMAGE_SCN_ALIGN_*` nibble at bits 20..23. (mingw-w64's own
+    //      `winnt.h` still declares a bare `DWORD`, which is how the field
+    //      came to be believed absent.) The directory-patching block below —
+    //      the one that writes StartAddressOfRawData / EndAddressOfRawData /
+    //      AddressOfIndex — now sets that nibble from `tlsMaxAlign`.
+    //  (2) THE LOADER HONOURS IT. ✔MEASURED with a DISCRIMINATOR, not a
+    //      correlation: one MSVC-linked image carrying seven 4096-aligned
+    //      `__declspec(thread)` objects RUNS 42 with every address `% 4096 ==
+    //      0` on the main thread AND on a second `CreateThread` thread; the
+    //      SAME FILE with ONLY this nibble rewritten 4096 → 16, nothing else
+    //      touched, RUNS 50 — `t1 mod 4096 = 720`, misaligned. Same template,
+    //      same block size, same code bytes.
+    //
+    // ★ THE REAL CEILING IS 8192, AND IT IS PE/COFF's WIRE LIMIT rather than a
+    // policy: the ALIGN field is FOUR BITS, and `IMAGE_SCN_ALIGN_8192BYTES`
+    // (nibble 14) is its largest defined value — in a section header and in
+    // this directory alike. BOTH PE references land on exactly that number and
+    // say so by name: mingw-w64 gcc 13.2.0 refuses 16384 with *"requested
+    // alignment '16384' exceeds object file maximum 8192"* (thread-local AND
+    // static), and MSVC 19.51 refuses `__declspec(align(16384))` as
+    // `error C2345`. Below it, both BUILD and RUN: ✔a multi-object probe (four
+    // over-aligned `tbss` objects and three `tdata` ones, separated by
+    // odd-sized fillers so none can be right by luck) returns 42 at 8/16/32/64/
+    // 4096/8192 on both compilers, addresses asserted at run time on two
+    // threads.
+    //
+    // ⓘ The number is NOT read from the format document, deliberately, and this
+    // is the same species as the `checkU32Span` wire guard a few lines below: a
+    // document declaring 16384 would not raise this ceiling, it would state a
+    // falsehood about what the container can hold. Format-LOCAL wire knowledge
+    // belongs in the format writer; it is per-TARGET *policy* that belongs in
+    // config, and that ceiling (`AggregateLayoutParams::maxRequestedAlignment`)
+    // is declared and enforced elsewhere.
+    constexpr std::uint64_t kPeCoffMaxEncodableAlign = 8192;  // IMAGE_SCN_ALIGN_8192BYTES
+    // What the loader gives a TLS block with no request on it — the value the
+    // withdrawn refusal treated as a hard ceiling. It is a FLOOR, and the
+    // directory writer below uses it as one.
+    constexpr std::uint64_t kPeX64TlsDefaultBlockAlign = 16;  // MEMORY_ALLOCATION_ALIGNMENT
     std::uint64_t tlsMaxAlign = 1;
     if (hasTdata) tlsMaxAlign = std::max(tlsMaxAlign, tdataLayout.maxAlign);
     if (hasTbss)  tlsMaxAlign = std::max(tlsMaxAlign, tbssLayout.maxAlign);
-    if (hasTls && tlsMaxAlign > kPeX64TlsBlockBaseAlign) {
+    if (hasTls && tlsMaxAlign > kPeCoffMaxEncodableAlign) {
         emit(reporter, DiagnosticCode::K_ThreadLocalOveralignedForFormat,
              std::format(
                  "pe::encodeExec: a thread-local object requires {}-byte "
-                 "alignment, but the Windows x64 loader guarantees only "
-                 "{}-byte (MEMORY_ALLOCATION_ALIGNMENT) static-TLS block-base "
-                 "alignment and IMAGE_TLS_DIRECTORY64 has no field to request "
-                 "more — the per-thread copy would be silently under-aligned "
+                 "alignment, but IMAGE_TLS_DIRECTORY64.Characteristics encodes "
+                 "the per-thread block's base alignment in a FOUR-BIT "
+                 "IMAGE_SCN_ALIGN_* field whose largest value is {} bytes — a "
+                 "stricter request cannot be expressed, and the loader would "
+                 "silently under-align every thread's copy. Lower the request "
+                 "to {} or less (both PE references stop at the same value: "
+                 "mingw-w64 gcc says \"exceeds object file maximum 8192\", "
+                 "MSVC says error C2345) "
                  "(D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN).",
-                 tlsMaxAlign, kPeX64TlsBlockBaseAlign));
+                 tlsMaxAlign, kPeCoffMaxEncodableAlign, kPeCoffMaxEncodableAlign));
         return {};
     }
     std::uint64_t const tdataSpan = tdataLayout.spanSize;   // 0 if none
@@ -3445,18 +3486,18 @@ encodeExec(AssembledModule const&    module,
         /*allowItemRelocations=*/true);
     if (!rdataLayoutOpt.has_value()) return {};
     auto& rdataDataLayout = *rdataLayoutOpt;
-    auto const dataLayoutOpt = link::format::buildExecDataSection(
+    auto dataLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Data,
         /*alignFloor=*/1, "pe::encodeExec", reporter,
         /*allowItemRelocations=*/true);
     if (!dataLayoutOpt.has_value()) return {};
-    auto const& dataDataLayout = *dataLayoutOpt;
-    auto const bssLayoutOpt = link::format::buildExecDataSection(
+    auto& dataDataLayout = *dataLayoutOpt;
+    auto bssLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Bss,
         /*alignFloor=*/1, "pe::encodeExec", reporter,
         /*allowItemRelocations=*/true);
     if (!bssLayoutOpt.has_value()) return {};
-    auto const& bssDataLayout = *bssLayoutOpt;
+    auto& bssDataLayout = *bssLayoutOpt;
     // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a CONST global carrying LOAD-TIME
     // relocations (a const function-pointer table — sqlite os_win.c aSyscall[])
     // lands in `relro`. In the PE32+ image we FOLD it into read-only `.rdata`
@@ -3475,59 +3516,112 @@ encodeExec(AssembledModule const&    module,
     bool const hasRdata = !rdataDataLayout.empty();
     bool const hasData  = !dataDataLayout.empty();
     bool const hasBss   = !bssDataLayout.empty();
-    // ── D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN (P63):
-    //    fail loud on a STATICALLY ALLOCATED object this image cannot place ──
+    // ── D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN (static twin, P63 residue):
+    //    a STATICALLY ALLOCATED over-aligned object is PLACED, not refused ──
     //
-    // A PE image's sections start at RVAs that are multiples of the optional
-    // header's `SectionAlignment` and NOTHING STRONGER, so an item whose own
-    // alignment exceeds that value lands wherever the section base happens to
-    // fall. ✔MEASURED 2026-09-07 with this gate ABSENT and the semantic ceiling
-    // raised: a module with FOUR `__attribute__((aligned(8192)))` statics
-    // separated by odd-sized fillers built rc 0 and returned 50 at run time —
-    // the FIRST object failing its own `address % 8192` check. A clean build
-    // placing an over-aligned object misaligned is a silent miscompile, the one
-    // outcome this project ranks below every diagnostic.
+    // ⚠ WHAT STOOD HERE REFUSED ANY STATIC STRICTER THAN THE DOCUMENT'S
+    // `sectionAlignment` (4096 on every shipped `pe64-*` document), and named
+    // raising that key as the remedy. ✔THE REMEDY IS REFUTED BY THE REFERENCE:
+    // `pedump` on a mingw-w64-linked image carrying eight 8192-aligned statics
+    // shows `SectionAlignment` UNCHANGED at 0x1000, no section header carrying
+    // an ALIGN nibble, `.bss` at RVA 0x13000 (so its base 0x140013000 is ≡ 4096
+    // mod 8192 — the SECTION is not over-aligned at all), and every object
+    // inside it nonetheless ≡ 0 mod 8192. ⇒ `ld` PADS WITHIN THE SECTION.
+    // Raising `sectionAlignment` would double the VA granularity of every image
+    // this document describes and still would not generalise — and following
+    // the old message verbatim hit a SECOND refusal, because PE/COFF §3.4 also
+    // requires every non-zero `sections[].virtualAddress` to be a multiple of
+    // the new value.
     //
-    // ★ THE BOUND IS THE FORMAT DOCUMENT'S OWN DECLARED `sectionAlignment`, read
-    // here — not a hardcoded Windows number. A `.format.json` declaring a larger
-    // one raises the ceiling with no code change, which is the same lever
-    // `link.exe` exposes as `/ALIGN`.
+    // ★ SO THIS WRITER DOES WHAT THE REFERENCE DOES: `alignSectionHeadToItems`
+    // below inserts a LEADING PAD in each data section so that
+    // `imageBase + sectionRva + pad ≡ 0 (mod maxAlign)`, after which every item
+    // offset (already a multiple of its own alignment, by construction in
+    // `buildExecDataSection`) lands on a correctly aligned VA. Sections stay
+    // CONTIGUOUS and `SectionAlignment` is untouched.
     //
-    // ⚠ THE UNION SAYS THIS CEILING IS REAL, AND SAYS WHERE IT STOPS. ✔MEASURED,
-    // each PE reference probed SEPARATELY: mingw-w64 gcc 13.2.0 refuses a STATIC
-    // above 8192 — *"alignment of 'g' is greater than maximum object file
-    // alignment 8192"* — and MSVC 19.51 refuses `__declspec(align(16384))` as
-    // `error C2345`. Both land on PE's own encoding limit. ★ The CONTROLS are
-    // what make it a statement about STORAGE and not about alignment: the same
-    // compiler BUILDS AND RUNS the same value on a TYPE and on an AUTOMATIC
-    // object. So this gate must never move to the semantic ladder — there it
-    // would refuse `aligned(65536)` types that every reference runs.
+    // ⚠ THE SILENT MISCOMPILE THIS REPLACES IS REAL AND WAS MEASURED (P63):
+    // with neither the gate nor the padding, a module with four
+    // `aligned(8192)` statics behind odd-sized fillers built rc 0 and returned
+    // 50 at run time — the FIRST object failing its own `address % 8192` check.
+    // One object at a section head can be right BY LUCK, which is why the
+    // runtime witness carries several.
     //
-    // Modelled on `K_ThreadLocalOveralignedForFormat` above, deliberately: same
-    // shape, same tier, same format-local knowledge, one line apart in the code
-    // that would otherwise have grown two different idioms for one idea.
+    // What remains refused is what PE/COFF cannot ENCODE — the same 8192
+    // four-bit `IMAGE_SCN_ALIGN_*` ceiling the thread-local gate above explains
+    // in full, and the same number both PE references stop at by name.
     {
         std::uint64_t staticMaxAlign = 1;
         if (hasRdata) staticMaxAlign = std::max(staticMaxAlign, rdataDataLayout.maxAlign);
         if (hasData)  staticMaxAlign = std::max(staticMaxAlign, dataDataLayout.maxAlign);
         if (hasBss)   staticMaxAlign = std::max(staticMaxAlign, bssDataLayout.maxAlign);
-        if (staticMaxAlign > static_cast<std::uint64_t>(sectionAlignE)) {
+        if (staticMaxAlign > kPeCoffMaxEncodableAlign) {
             emit(reporter, DiagnosticCode::K_StaticObjectOveralignedForFormat,
                  std::format(
                      "pe::encodeExec: a statically allocated object requires "
-                     "{}-byte alignment, but this image's sections begin at "
-                     "multiples of the format document's declared "
-                     "SectionAlignment ({} bytes) and nothing stronger — the "
-                     "object would be placed MISALIGNED with no other sign. "
-                     "Declare a larger `optionalHeader.sectionAlignment` in the "
-                     "object-format document AND raise every non-zero "
-                     "`sections[].virtualAddress` in it to a multiple of the "
-                     "new value (PE/COFF 3.4 requires that, and the loader "
-                     "refuses the document otherwise), or lower the request "
-                     "(D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN).",
-                     staticMaxAlign, sectionAlignE));
+                     "{}-byte alignment, but PE/COFF encodes an object's "
+                     "alignment in a FOUR-BIT IMAGE_SCN_ALIGN_* field whose "
+                     "largest value is {} bytes — a stricter request cannot be "
+                     "expressed in this container, so the object would be "
+                     "placed MISALIGNED with no other sign. Lower the request "
+                     "to {} or less (both PE references stop at the same value: "
+                     "mingw-w64 gcc says \"exceeds object file maximum 8192\", "
+                     "MSVC says error C2345) "
+                     "(D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN).",
+                     staticMaxAlign, kPeCoffMaxEncodableAlign,
+                     kPeCoffMaxEncodableAlign));
             return {};
         }
+        // ── The PLACEMENT, and why it is a forward pass rather than a rule ──
+        //
+        // A data section's head pad depends on where that section BEGINS, and
+        // where it begins depends on how much the sections before it grew. So
+        // the pads are computed in the SAME order the RVA chain assigns them
+        // (`.text` → `.rdata` → `.data` → `.bss`), each one from the cursor the
+        // previous pad already moved. `.tls` is deliberately absent: its items
+        // are offsets into a block the LOADER allocates, whose base alignment
+        // rides the directory's own nibble, so a pad there would shift every
+        // thread-local for nothing.
+        //
+        // The pad is 0 whenever `maxAlign <= sectionAlignment`, which is every
+        // ordinary program — the cursor is always section-aligned and a valid
+        // PE's `imageBase` is a multiple of 64 KiB, so the running VA is
+        // already 4096-aligned and byte-identity for such an image is
+        // preserved.
+        //
+        // ★ WHY A LINK-TIME CONGRUENCE SURVIVES TO RUN TIME, WHICH IS THE ONLY
+        // THING THAT MAKES THIS SOUND UNDER ASLR: the image carries
+        // DYNAMIC_BASE, so the loader may place it somewhere else entirely —
+        // but it relocates at the Windows 64 KiB ALLOCATION GRANULARITY, and
+        // every alignment this gate admits divides 65536. The slide is
+        // therefore a multiple of `want`, so `(base + slide) + rva + pad` keeps
+        // the congruence computed here. ⓘ That also means the arithmetic is
+        // correct for ANY declared `imageBase`, aligned or not — the pad is
+        // solved against the actual VA rather than assumed away.
+        auto const alignSectionHeadToItems =
+            [&](link::format::ExecDataSectionLayout& layout, bool present,
+                bool fileBacked, std::uint64_t& vaCursor) {
+                if (!present) return;
+                std::uint64_t const want = layout.maxAlign;
+                std::uint64_t const pad =
+                    want <= 1 ? 0u : ((want - (vaCursor % want)) % want);
+                if (pad != 0) {
+                    for (auto& off : layout.itemOffsets) off += pad;
+                    layout.spanSize += pad;
+                    if (fileBacked) {
+                        layout.bytes.insert(layout.bytes.begin(),
+                                            static_cast<std::size_t>(pad),
+                                            std::uint8_t{0});
+                    }
+                }
+                vaCursor += alignUp(layout.spanSize, sectionAlignE);
+            };
+        std::uint64_t vaCursor = oh.imageBase
+                                 + static_cast<std::uint64_t>(secText.virtualAddress)
+                                 + textVirtualSizeE;
+        alignSectionHeadToItems(rdataDataLayout, hasRdata, /*fileBacked=*/true, vaCursor);
+        alignSectionHeadToItems(dataDataLayout,  hasData,  /*fileBacked=*/true, vaCursor);
+        alignSectionHeadToItems(bssDataLayout,   hasBss,   /*fileBacked=*/false, vaCursor);
     }
     // u32 overflow guard (PE/COFF SizeOfImage / virtualSize / sizeOfRawData are
     // u32 wire fields). A producer that lands > 4 GiB in any section would
@@ -4807,7 +4901,34 @@ encodeExec(AssembledModule const&    module,
         putTlsU64(dirOff + 16, idxVa);                     // AddressOfIndex
         putTlsU64(dirOff + 24, 0);                         // AddressOfCallBacks = 0
         putTlsU32(dirOff + 32, 0);                         // SizeOfZeroFill = 0
-        putTlsU32(dirOff + 36, 0);                         // Characteristics = 0
+        // ── D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN: the per-thread BLOCK's base
+        // alignment, and the ONLY place a PE image can ask for it.
+        // `Characteristics` is an `IMAGE_SCN_ALIGN_*` nibble at bits 20..23
+        // (the Windows SDK's `winnt.h` spells the union out; mingw-w64's still
+        // declares a bare DWORD, which is how the field came to be believed
+        // absent). Value `k` means 2^(k-1) bytes, so 16 → 5 and 8192 → 14. The
+        // gate in the layout section above has already refused anything the
+        // nibble cannot hold, and ✔the loader-side discriminator that proves
+        // this field is load-bearing is written up there in full.
+        //
+        // ★ ZERO BELOW 16, AND THAT IS A DECISION RATHER THAN A GAP. Zero means
+        // *"unspecified — take the platform default"*, and that default IS the
+        // 16-byte MEMORY_ALLOCATION_ALIGNMENT every ordinary thread-local
+        // already relies on. Asking for LESS than the default would be a
+        // downgrade dressed as precision (a module whose strictest thread-local
+        // is a 4-byte int would be requesting a 4-byte block base); asking for
+        // EXACTLY the default would change the bytes of every TLS image this
+        // project has ever emitted to say what the loader already does. So the
+        // field moves only when a thread-local genuinely asks for more than the
+        // platform gives — which keeps byte-identity for every existing program
+        // and makes this write, when it happens, mean something.
+        if (tlsMaxAlign > kPeX64TlsDefaultBlockAlign) {
+            std::uint32_t alignNibble = 1;                 // 2^0 = 1 byte
+            for (std::uint64_t a = 1; a < tlsMaxAlign; a <<= 1) ++alignNibble;
+            putTlsU32(dirOff + 36, alignNibble << 20);     // Characteristics
+        } else {
+            putTlsU32(dirOff + 36, 0);                     // platform default
+        }
         // The 3 VA-field SITE RVAs (Start/End/AddressOfIndex) — NOT callbacks.
         std::uint32_t const dirRvaBase =
             tlsRva + static_cast<std::uint32_t>(tlsDirOffset);

@@ -365,6 +365,55 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
         });
 }
 
+// ★★ THE FRONT HALF OF THE FRONT HALF — semantic analysis + CST→HIR, and
+// NOTHING below HIR. This is literally `buildCuMirImpl`'s steps 1 and 2, moved
+// out because a SECOND caller now has to stop here: `--emit-hir` asks for the
+// HIR of a translation unit and must not run — must not even REQUIRE — FFI
+// resolution, MIR lowering, codegen or a link.
+//
+// ⚠ IT IS AN EXTRACTION, NOT A COPY, AND THAT IS THE POINT. A parallel
+// "just analyze and lower" path in the driver would become a SECOND OWNER of
+// the data-model / aggregate-layout / va-list-strategy threading below, and the
+// two would drift on the first target axis either one gained — a divergence
+// that shows up as HIR describing a different program from the one the compiler
+// compiles. There is ONE front end; a caller chooses where to STOP in it, never
+// which one to run.
+//
+// ★ IT TAKES A `DiagnosticBudget`, NOT A `CompileOptions`. The budget is the
+// only field of the options bag the front half reads; every other field
+// describes the lower half. Narrowing the parameter is what makes it impossible
+// for a future lower-half option to be silently ignored on this path — it
+// cannot be passed here at all.
+//
+// ⓘ NOT wrapped in `callOnLargeStack`: both callers already run on the deep
+// worker stack (`buildCuMir` wraps `buildCuMirImpl`; `buildCuHir` below wraps
+// this), and nesting a 64 MiB worker inside a 64 MiB worker buys nothing.
+static std::optional<CuHirModule> buildCuHirImpl(
+                                      CompilationUnit const&        cu,
+                                      GrammarSchema const&          grammar,
+                                      TargetSchema const&           target,
+                                      ObjectFormatSchema const&     format,
+                                      std::uint16_t                 callingConventionIndex,
+                                      DiagnosticBudget              diagBudget,
+                                      DiagnosticReporter&           reporter);
+
+std::optional<CuHirModule> buildCuHir(CompilationUnit const&        cu,
+                                      GrammarSchema const&          grammar,
+                                      TargetSchema const&           target,
+                                      ObjectFormatSchema const&     format,
+                                      std::uint16_t                 callingConventionIndex,
+                                      DiagnosticBudget              diagBudget,
+                                      DiagnosticReporter&           reporter) {
+    // D-PARSE-DEEP-FRONTEND-STACK: the same reserve and the same reason as
+    // `buildCuMir` — `analyze` and `lowerToHir` are the two stages that
+    // motivated it, and they are the two stages this function runs.
+    return substrate::callOnLargeStack(
+        substrate::kDeepRecursionStackBytes, [&] {
+            return buildCuHirImpl(cu, grammar, target, format,
+                                  callingConventionIndex, diagBudget, reporter);
+        });
+}
+
 static std::optional<CuMirModule> buildCuMirImpl(
                                       CompilationUnit const&        cu,
                                       GrammarSchema const&          grammar,
@@ -373,125 +422,30 @@ static std::optional<CuMirModule> buildCuMirImpl(
                                       std::uint16_t                 callingConventionIndex,
                                       DiagnosticReporter&           reporter,
                                       CompileOptions const&         opts) {
-    // Take a CU pointer matching `analyze()`'s shared_ptr signature.
-    // The CU is borrowed (caller owns); we re-wrap as a shared_ptr
-    // with a null deleter so `analyze`'s ref-counting contract is
-    // satisfied without taking ownership of the caller's CU.
-    // `analyze` only reads from the CU; the temporary shared_ptr
-    // owns nothing beyond the call.
-    auto borrowed = std::shared_ptr<CompilationUnit const>(
-        &cu, [](CompilationUnit const*) noexcept {});
-
-    // 1. Semantic analysis. `analyze` accumulates into the model's
-    //    OWN reporter; drain into the caller's so operator-visible
-    //    stderr sees the S_* family. Without this drain, a semantic
-    //    error (e.g. S_UndeclaredIdentifier) silently aborts the
-    //    pipeline with no diagnostic surfacing. (code-reviewer F1
-    //    fold + post-fold-1 architect: routed through the hoisted
-    //    `copyDiagnostics` helper to eliminate the inline-drain
-    //    duplicate.)
-    auto const semEntry = reporter.errorCount();
-    // FC3 c1: thread the FORMAT's declared data model (its REQUIRED
-    // `dataModel` field) into the per-(CU × target) analysis — the
-    // single source for every width-dependent resolution downstream
-    // (builtinTypes/typeSpecifiers `coreByDataModel`, the integer-
-    // literal ladder, descriptor `signatureByDataModel`). The HIR
-    // lowering reads the SAME value back off the SemanticModel.
-    // FC6 deferral-close: also thread the target's aggregate-layout params so a
-    // `sizeof` in an array-dimension const-expression (`int a[sizeof(T)]`) folds
-    // through the same `computeLayout` engine MIR uses — `nullopt` when the
-    // target declared no block (the fold then fails loud, never a wrong size).
-    // D-CSUBSET-BITFIELD-ABI-EXACT: overlay the FORMAT-resolved bit-field strategy
-    // onto the target's params (the strategy is OS/format-determined; the target
-    // supplies only the alignment rule). A `sizeof` over a bit-field struct in an
-    // array dimension then folds with the byte-ABI-exact layout.
-    auto const effectiveBfStrategy = effectiveBitFieldStrategy(target, format);
-    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: resolved beside the strategy and
-    // overlaid at the SAME three consumer sites, because the two axes are read by one
-    // packer and a site that got one without the other would lay out to a mixture of
-    // two ABIs.
+    // Steps 1 + 2 — semantic analysis and CST→HIR — are `buildCuHirImpl`; see
+    // its docblock for why they are their own function. Called through the
+    // un-wrapped Impl because `buildCuMir` already put this call on the deep
+    // worker stack.
+    auto front = buildCuHirImpl(cu, grammar, target, format,
+                                callingConventionIndex, opts.diagBudget, reporter);
+    if (!front) return std::nullopt;
+    SemanticModel&                    model           = front->model;
+    std::unique_ptr<CstToHirResult>&  hir             = front->hir;
+    std::optional<VaListLayout> const analyzeVaLayout = front->vaListLayout;
+    // The two FORMAT-resolved aggregate axes, read back from their ONE owner
+    // rather than carried across the seam: `buildCuHirImpl` calls the same two
+    // functions for the analysis-side overlay, and both are pure functions of
+    // (target, format), so a second call cannot disagree with the first.
+    auto const effectiveBfStrategy     = effectiveBitFieldStrategy(target, format);
     auto const effectiveUnnamedBfAlign =
         effectiveUnnamedBitFieldAlignment(target, format);
-    std::optional<AggregateLayoutParams> analyzeLayout;
-    if (target.aggregateLayoutLoaded()) {
-        analyzeLayout = target.aggregateLayout();
-        analyzeLayout->bitFieldStrategy = effectiveBfStrategy;
-        analyzeLayout->unnamedBitFieldAlignment = effectiveUnnamedBfAlign;
-    }
-    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-2): capture the RESOLVED CC's
-    // WHOLE `vaListLayout` block. Read from the SAME resolved CC the MirLoweringConfig
-    // reads its `vaListLayout` from (below); `nullopt` when the CC declares no
-    // variadic-callee ABI.
-    //
-    // TWO consumers, each taking the part it needs from this ONE lookup:
-    //   * the semantic `va_list`-type injection wants only `.strategy`, to size the `ap`
-    //     local per ABI (SysV __va_list_tag[1]=24B vs Win64 char*=8B). `nullopt` there ⇒
-    //     the SysV-family default, which is inert (a CC with no vaListLayout has no
-    //     variadic-callee surface at all).
-    //   * D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): `synthesizeStdioShim`, across the MIR/LIR
-    //     seam, needs the WHOLE block — `.variadicUsesOverflowBase` is what selects its
-    //     va leaf, and reading only `.strategy` there was a latent silent miscompile (see
-    //     `CuMirModule::vaListLayout`). Same resolved CC, resolved ONCE.
-    std::optional<VaListLayout> analyzeVaLayout;
-    if (auto const* cc = target.callingConvention(callingConventionIndex);
-        cc != nullptr && cc->vaListLayout.has_value()) {
-        analyzeVaLayout = *cc->vaListLayout;
-    }
-    std::optional<VaListStrategy> const analyzeVaStrategy =
-        analyzeVaLayout.has_value() ? std::optional<VaListStrategy>{analyzeVaLayout->strategy}
-                                    : std::nullopt;
-    // c97: sequential per-phase scoping via optional emplace — emplace
-    // destroys the prior Scope (closing its accumulation window) BEFORE
-    // opening the next, and any early return closes the live one.
+    // c97: sequential per-phase scoping via optional emplace — see the identical
+    // declaration in `buildCuHirImpl`, which owns the Semantic and LowerHir
+    // windows. This one owns every window from HIR→MIR down, and it is a
+    // SEPARATE optional rather than a threaded one because a Scope must not
+    // outlive the function whose phases it measures: `buildCuHirImpl` closes its
+    // last window (`phase.reset()`) before it returns, so the two never overlap.
     std::optional<substrate::PhaseTimers::Scope> phase;
-    phase.emplace(substrate::CompilePhase::Semantic);
-    // D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: this
-    // producer BINDS imports, so it answers descriptor role entries — from the
-    // active format's own row, or its shipped flavour family's.
-    FormatRuntimeLibraryRoleResolver const roleResolver{format};
-    auto model = analyze(
-        // D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE: the operator's
-        // budget, carried on `opts` from `rep` -- NOT `reporter.config()`, which
-        // is the relaxed per-target scratch.
-        std::move(borrowed), opts.diagBudget,
-        format.dataModel(), analyzeLayout, analyzeVaStrategy,
-        format.kind(),       // c8: the active object-format → per-target availability gate
-        target.name(),       // plan 25: the active arch → per-target shipped-struct variant selector
-        // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the format-resolved `long double`
-        // axis — drives the coreByLongDoubleFormat row overrides; None (wasm/
-        // spirv) leaves `long double` rows unrealized (loud on use).
-        effectiveLongDoubleFormat(target, format),
-        // ★ Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): THE ACTIVE TARGET.
-        // Without it `analyze` runs with `target == nullptr`, and its two
-        // target-dependent asm checks — `S_InlineAsmConstraintLetterUndeclared`
-        // (0xE065) and `S_InlineAsmClobberUnknown` (0xE068) — correctly decline
-        // to guess and DO NOT RUN. ✔MEASURED before this argument existed: a
-        // `"=Zq"` constraint and a `"notaregister"` clobber BOTH compiled to a
-        // clean `.o` at rc=0 through this very pipeline. A diagnostic that fires
-        // only in a unit test that passes its own schema is not a shipped
-        // diagnostic. `target` is the driver's own long-lived schema and
-        // outlives `model`, which is the lifetime the parameter requires.
-        &target,
-        // The standard deep-recursion reserve (the `0` sentinel) — spelled only
-        // because the resolver behind it is positional.
-        /*deepRecursionReserveBytes=*/0,
-        // Consulted during analysis only, never republished by the model, so a
-        // reference to a local outlives every read of it.
-        &roleResolver);
-    phase.reset();
-    copyDiagnostics(model.diagnostics(), reporter);
-    if (model.hasErrors() || !tierClean(reporter, semEntry)) {
-        return std::nullopt;
-    }
-
-    // 2. CST → HIR.
-    auto const hirEntry = reporter.errorCount();
-    phase.emplace(substrate::CompilePhase::LowerHir);
-    auto hir = lowerToHir(model, reporter);
-    phase.reset();
-    if (!hir || !hir->ok || !tierClean(reporter, hirEntry)) {
-        return std::nullopt;
-    }
 
     // 2.5-pre. c162 (D-FF1-READER-CONSUMER) EAGER path validation: a
     //      `--resolve-library <path>` names a binary the build is pointed
@@ -1098,6 +1052,142 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // could not tell from a genuine declaration. Consulted only if a stdio recipe appears.
     cuMir.vaListLayout = analyzeVaLayout;
     return cuMir;
+}
+
+static std::optional<CuHirModule> buildCuHirImpl(
+                                      CompilationUnit const&        cu,
+                                      GrammarSchema const&          grammar,
+                                      TargetSchema const&           target,
+                                      ObjectFormatSchema const&     format,
+                                      std::uint16_t                 callingConventionIndex,
+                                      DiagnosticBudget              diagBudget,
+                                      DiagnosticReporter&           reporter) {
+    // Take a CU pointer matching `analyze()`'s shared_ptr signature.
+    // The CU is borrowed (caller owns); we re-wrap as a shared_ptr
+    // with a null deleter so `analyze`'s ref-counting contract is
+    // satisfied without taking ownership of the caller's CU.
+    // `analyze` only reads from the CU; the temporary shared_ptr
+    // owns nothing beyond the call.
+    auto borrowed = std::shared_ptr<CompilationUnit const>(
+        &cu, [](CompilationUnit const*) noexcept {});
+
+    // 1. Semantic analysis. `analyze` accumulates into the model's
+    //    OWN reporter; drain into the caller's so operator-visible
+    //    stderr sees the S_* family. Without this drain, a semantic
+    //    error (e.g. S_UndeclaredIdentifier) silently aborts the
+    //    pipeline with no diagnostic surfacing. (code-reviewer F1
+    //    fold + post-fold-1 architect: routed through the hoisted
+    //    `copyDiagnostics` helper to eliminate the inline-drain
+    //    duplicate.)
+    auto const semEntry = reporter.errorCount();
+    // FC3 c1: thread the FORMAT's declared data model (its REQUIRED
+    // `dataModel` field) into the per-(CU × target) analysis — the
+    // single source for every width-dependent resolution downstream
+    // (builtinTypes/typeSpecifiers `coreByDataModel`, the integer-
+    // literal ladder, descriptor `signatureByDataModel`). The HIR
+    // lowering reads the SAME value back off the SemanticModel.
+    // FC6 deferral-close: also thread the target's aggregate-layout params so a
+    // `sizeof` in an array-dimension const-expression (`int a[sizeof(T)]`) folds
+    // through the same `computeLayout` engine MIR uses — `nullopt` when the
+    // target declared no block (the fold then fails loud, never a wrong size).
+    // D-CSUBSET-BITFIELD-ABI-EXACT: overlay the FORMAT-resolved bit-field strategy
+    // onto the target's params (the strategy is OS/format-determined; the target
+    // supplies only the alignment rule). A `sizeof` over a bit-field struct in an
+    // array dimension then folds with the byte-ABI-exact layout.
+    auto const effectiveBfStrategy = effectiveBitFieldStrategy(target, format);
+    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: resolved beside the strategy and
+    // overlaid at the SAME three consumer sites, because the two axes are read by one
+    // packer and a site that got one without the other would lay out to a mixture of
+    // two ABIs.
+    auto const effectiveUnnamedBfAlign =
+        effectiveUnnamedBitFieldAlignment(target, format);
+    std::optional<AggregateLayoutParams> analyzeLayout;
+    if (target.aggregateLayoutLoaded()) {
+        analyzeLayout = target.aggregateLayout();
+        analyzeLayout->bitFieldStrategy = effectiveBfStrategy;
+        analyzeLayout->unnamedBitFieldAlignment = effectiveUnnamedBfAlign;
+    }
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-2): capture the RESOLVED CC's
+    // WHOLE `vaListLayout` block. Read from the SAME resolved CC the MirLoweringConfig
+    // reads its `vaListLayout` from (below); `nullopt` when the CC declares no
+    // variadic-callee ABI.
+    //
+    // TWO consumers, each taking the part it needs from this ONE lookup:
+    //   * the semantic `va_list`-type injection wants only `.strategy`, to size the `ap`
+    //     local per ABI (SysV __va_list_tag[1]=24B vs Win64 char*=8B). `nullopt` there ⇒
+    //     the SysV-family default, which is inert (a CC with no vaListLayout has no
+    //     variadic-callee surface at all).
+    //   * D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): `synthesizeStdioShim`, across the MIR/LIR
+    //     seam, needs the WHOLE block — `.variadicUsesOverflowBase` is what selects its
+    //     va leaf, and reading only `.strategy` there was a latent silent miscompile (see
+    //     `CuMirModule::vaListLayout`). Same resolved CC, resolved ONCE.
+    std::optional<VaListLayout> analyzeVaLayout;
+    if (auto const* cc = target.callingConvention(callingConventionIndex);
+        cc != nullptr && cc->vaListLayout.has_value()) {
+        analyzeVaLayout = *cc->vaListLayout;
+    }
+    std::optional<VaListStrategy> const analyzeVaStrategy =
+        analyzeVaLayout.has_value() ? std::optional<VaListStrategy>{analyzeVaLayout->strategy}
+                                    : std::nullopt;
+    // c97: sequential per-phase scoping via optional emplace — emplace
+    // destroys the prior Scope (closing its accumulation window) BEFORE
+    // opening the next, and any early return closes the live one.
+    std::optional<substrate::PhaseTimers::Scope> phase;
+    phase.emplace(substrate::CompilePhase::Semantic);
+    // D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: this
+    // producer BINDS imports, so it answers descriptor role entries — from the
+    // active format's own row, or its shipped flavour family's.
+    FormatRuntimeLibraryRoleResolver const roleResolver{format};
+    auto model = analyze(
+        // D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE: the operator's
+        // budget, carried on `opts` from `rep` -- NOT `reporter.config()`, which
+        // is the relaxed per-target scratch.
+        std::move(borrowed), diagBudget,
+        format.dataModel(), analyzeLayout, analyzeVaStrategy,
+        format.kind(),       // c8: the active object-format → per-target availability gate
+        target.name(),       // plan 25: the active arch → per-target shipped-struct variant selector
+        // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the format-resolved `long double`
+        // axis — drives the coreByLongDoubleFormat row overrides; None (wasm/
+        // spirv) leaves `long double` rows unrealized (loud on use).
+        effectiveLongDoubleFormat(target, format),
+        // ★ Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): THE ACTIVE TARGET.
+        // Without it `analyze` runs with `target == nullptr`, and its two
+        // target-dependent asm checks — `S_InlineAsmConstraintLetterUndeclared`
+        // (0xE065) and `S_InlineAsmClobberUnknown` (0xE068) — correctly decline
+        // to guess and DO NOT RUN. ✔MEASURED before this argument existed: a
+        // `"=Zq"` constraint and a `"notaregister"` clobber BOTH compiled to a
+        // clean `.o` at rc=0 through this very pipeline. A diagnostic that fires
+        // only in a unit test that passes its own schema is not a shipped
+        // diagnostic. `target` is the driver's own long-lived schema and
+        // outlives `model`, which is the lifetime the parameter requires.
+        &target,
+        // The standard deep-recursion reserve (the `0` sentinel) — spelled only
+        // because the resolver behind it is positional.
+        /*deepRecursionReserveBytes=*/0,
+        // Consulted during analysis only, never republished by the model, so a
+        // reference to a local outlives every read of it.
+        &roleResolver);
+    phase.reset();
+    copyDiagnostics(model.diagnostics(), reporter);
+    if (model.hasErrors() || !tierClean(reporter, semEntry)) {
+        return std::nullopt;
+    }
+
+    // 2. CST → HIR.
+    auto const hirEntry = reporter.errorCount();
+    phase.emplace(substrate::CompilePhase::LowerHir);
+    auto hir = lowerToHir(model, reporter);
+    phase.reset();
+    if (!hir || !hir->ok || !tierClean(reporter, hirEntry)) {
+        return std::nullopt;
+    }
+
+    // Both products of the front half, plus the ONE derived fact the lower half
+    // still needs from step 1 (`analyzeVaLayout` — resolved from the same CC the
+    // MIR lowering config reads, so resolving it twice could disagree).
+    return CuHirModule{.model        = std::move(model),
+                       .hir          = std::move(hir),
+                       .vaListLayout = analyzeVaLayout};
 }
 
 // LOWER half body (Cycle 25, Stage C): MIR → LIR → liveness → regalloc → rewrite →

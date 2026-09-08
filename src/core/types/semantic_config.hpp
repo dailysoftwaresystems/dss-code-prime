@@ -1471,6 +1471,66 @@ enum class BuiltinLowering : std::uint16_t {
     // payload prints numerically in `.dsshir` text (the AtomicLoad/Store +
     // ComplexConj + AtomicFence numeric-stability precedent).
     Bswap,
+    // D-CSUBSET-ATOMIC-RMW: the C11/C23 §7.17.7 read-modify-write family.
+    // ⚠ §7.17.7 ONLY. An earlier draft of this line said "§7.17.7-§7.17.8" and
+    // that overclaimed by a whole subclause: §7.17.8 is `atomic_flag` /
+    // `atomic_flag_test_and_set` / `atomic_flag_clear`, which this tree does not
+    // implement at all — ✔MEASURED, the only `atomic_flag` in `src/` is a NAMED
+    // deferral in `shippedLibs/stdatomic.json`'s own $comment (plus this engine's
+    // own C++ `std::atomic_flag`, which is not the C surface). ★ It is the ONE
+    // type C requires to be lock-free (§7.17.8p2), so its absence is a real gap
+    // and must not be hidden behind a range that reads as coverage.
+    // Each is an INDIVISIBLE load-op-store, and each is realized as a HIR→MIR
+    // COMPOSITION over the already-shipped `MirOpcode::AtomicCas` — the
+    // `emitStdbitOp` precedent (14 stdc_* verbs composing 3 primitives + universal
+    // ALU verbs; NO new MIR op, NO new encoding, NO new target vocabulary).
+    //
+    // ★ WHY A CAS RETRY LOOP IS A REAL RMW AND NOT AN APPROXIMATION. The loop is
+    //     retry: old = AtomicLoad(ptr); new = old <alu> val;
+    //            prev = AtomicCas(ptr, old, new); if (prev != old) goto retry
+    // and the CAS COMMITS ONLY IF the location still holds `old`. Any interleaved
+    // write makes the CAS fail and the iteration is discarded, so the store that
+    // lands is derived from the value the store itself observed — which is exactly
+    // C11's indivisibility requirement. A native `lock xadd` / `ldaddal` would be
+    // an OPTIMISATION over this (one instruction instead of a loop), never a
+    // correctness fix. ⓘ ABA is not a hazard here: these are integer ops whose
+    // result depends on the VALUE, not on its history.
+    // ★★ AND THE LOOP'S ALU STEP IS OUTSIDE THE arm64 EXCLUSIVE WINDOW. The ALU
+    // op sits BETWEEN the AtomicLoad and the AtomicCas, so it never enters the
+    // ldaxr..stlxr region `lowerAtomicCas` builds: this family makes
+    // D-LIR-LLSC-SPILL-EXCLUSION's hazard more FREQUENT, not deeper.
+    // ⚠⚠ WHAT BACKS THAT IS A MEASUREMENT OVER BUILT ARTIFACTS, NOT A BELT. An
+    // earlier draft of this comment said `mir_to_lir` had an "exclusive-window
+    // belt" that "now proves" the property; NO SUCH CODE WAS EVER WRITTEN, and
+    // D-LIR-LLSC-SPILL-EXCLUSION is still open with its own remedy (a regalloc
+    // spill-exclusion, or a lir_rewrite-tier assert that no store lands between
+    // a ldaxr and its stlxr) unbuilt. What exists is an OBJDUMP SCAN of the
+    // emitted arm64 artifacts, which is an existence result over the inputs
+    // scanned and carries no guarantee for inputs not scanned.
+    // ⚠ Nor is the window immune to register-allocator traffic: ✔MEASURED under
+    // `--config=release`, windows carrying a reload `ldr` inside the exclusive
+    // region (harmless — a LOAD does not clear the local monitor; the row's own
+    // text says so). "No STORE in the window" is what was measured; "the window
+    // is exactly two instructions" is not true and must not be written.
+    //
+    // APPENDED (not grouped with AtomicCas) so every pre-existing enumerator keeps
+    // its integer value — the BuiltinCall payload prints numerically in `.dsshir`
+    // text (the AtomicLoad/Store + ComplexConj + AtomicFence + Bswap precedent).
+    AtomicFetchAdd,
+    AtomicFetchSub,
+    AtomicFetchOr,
+    AtomicFetchXor,
+    AtomicFetchAnd,
+    // `atomic_exchange_explicit(obj, desired, order)` — the same loop with the
+    // ALU step dropped (`new` IS `desired`).
+    AtomicExchange,
+    // `atomic_compare_exchange_{strong,weak}_explicit(obj, expected, desired,
+    // succ, fail)` — the ONE member that needs NO loop: it IS an AtomicCas, plus
+    // the C-mandated failure side effect (`*expected = observed`) and the _Bool
+    // success result. A strong CAS is a conforming realization of the weak form
+    // (the weak form is permitted, never required, to fail spuriously), so both
+    // spellings share this verb.
+    AtomicCompareExchange,
 };
 
 // ── THE ONE OWNER OF THE `lowering` SPELLINGS ────────────────────────────
@@ -1481,7 +1541,7 @@ enum class BuiltinLowering : std::uint16_t {
 // level up: the grammar loader's refusal for an unrecognized `lowering`
 // (`unknown builtin lowering '<x>'`) NAMED NO ACCEPTED SET AT ALL. A config
 // author who wrote `popcnt` was told their name was wrong and never told what
-// the loader would have taken — for a closed set of THIRTY verbs, most of them
+// the loader would have taken — for a closed set of THIRTY-SEVEN verbs, most of them
 // `stdc_*` names that differ by one word. Nothing could render the set, because
 // an if-chain is not enumerable.
 //
@@ -1495,7 +1555,7 @@ enum class BuiltinLowering : std::uint16_t {
 // `enum_name_table.hpp`'s `nameOrEmpty` note describes, so the projection below
 // uses `nameOrEmpty`: an unlisted value renders EMPTY rather than wearing row
 // 0's spelling (`"umulh"`), which is what `name()` would have done.
-inline constexpr EnumNameTable<BuiltinLowering, 30> kBuiltinLoweringTable{{{
+inline constexpr EnumNameTable<BuiltinLowering, 37> kBuiltinLoweringTable{{{
     { BuiltinLowering::UMulHigh,              "umulh"                    },
     // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS)
     { BuiltinLowering::AtomicCas,             "atomic_cas"               },
@@ -1537,10 +1597,22 @@ inline constexpr EnumNameTable<BuiltinLowering, 30> kBuiltinLoweringTable{{{
     { BuiltinLowering::StdcBitWidth,          "stdc_bit_width"           },
     { BuiltinLowering::StdcBitFloor,          "stdc_bit_floor"           },
     { BuiltinLowering::StdcBitCeil,           "stdc_bit_ceil"            },
+    // D-CSUBSET-ATOMIC-RMW: the 7 read-modify-write verbs. `atomic_fetch_*` and
+    // `atomic_exchange` compose the shipped AtomicCas into a retry loop;
+    // `atomic_compare_exchange` IS the AtomicCas plus C's failure side effect.
+    // Both the `_strong` and `_weak` spellings bind the SAME verb — a strong CAS
+    // conforms as a weak one.
+    { BuiltinLowering::AtomicFetchAdd,        "atomic_fetch_add"         },
+    { BuiltinLowering::AtomicFetchSub,        "atomic_fetch_sub"         },
+    { BuiltinLowering::AtomicFetchOr,         "atomic_fetch_or"          },
+    { BuiltinLowering::AtomicFetchXor,        "atomic_fetch_xor"         },
+    { BuiltinLowering::AtomicFetchAnd,        "atomic_fetch_and"         },
+    { BuiltinLowering::AtomicExchange,        "atomic_exchange"          },
+    { BuiltinLowering::AtomicCompareExchange, "atomic_compare_exchange"  },
 }}};
-// ★ THE UNDER-FILL GUARD, and for a 30-row hand-written table it is not
-// ceremony: `EnumNameTable<BuiltinLowering, 30>` with 29 initializers is legal
-// C++ — it value-initializes the tail, so row 29 becomes
+// ★ THE UNDER-FILL GUARD, and for a 37-row hand-written table it is not
+// ceremony: `EnumNameTable<BuiltinLowering, 37>` with 36 initializers is legal
+// C++ — it value-initializes the tail, so row 36 becomes
 // `{ BuiltinLowering(0), "" }` and `builtinLoweringFromName("")` starts
 // RESOLVING, to `None`, which is the sentinel meaning "this knob does nothing".
 // A dropped row would therefore not break the build; it would make an empty
@@ -1576,6 +1648,78 @@ builtinLoweringName(BuiltinLowering lowering) noexcept {
 // scope (visible everywhere, shadow-able by user decls). Interned as a
 // FnSig over `paramCores` → `resultCore`. A `variadic` builtin skips the
 // arg-count check (e.g. tsql's COALESCE accepts any arity).
+// ── D-CSUBSET-ATOMIC-MONOMORPH-I32: a DECLARED type-generic builtin ──────────
+//
+// ★ THE PROBLEM THIS EXISTS TO REMOVE. `BuiltinFunctionMapping::signatureText`
+// is ONE fixed type text, so a builtin that C defines as a GENERIC FUNCTION
+// (C11 §7.17.1p6 — every `<stdatomic.h>` accessor) could only be declared at one
+// concrete width. That is the whole of the `<stdatomic.h>` object surface's i32
+// monomorphization: nothing downstream was width-locked, only the declaration.
+//
+// ★ AND WHY NOT PER-WIDTH ROWS + `_Generic` (the `D-FULLC-STDBIT` precedent).
+// stdbit's operand is a plain integer, so 4 widths × 14 ops enumerates cleanly.
+// The atomic surface does not: its argument is `_Atomic T *` for EVERY scalar T
+// including `_Bool` and every OBJECT POINTER type, which `_Generic` cannot
+// enumerate at all — so the "precedent" would have to stop short of the very
+// types the row names, and would still be an i-something monomorphization, just
+// nine of them. This declares the SHAPE instead, once per operation, and the
+// width comes from the argument the way C says it does.
+//
+// The three cells are all DECLARATION, never engine policy:
+//   `bindFromParam`  — the parameter whose ACTUAL argument supplies `T`. Its
+//                      declared form must be a pointer; `T` is that argument's
+//                      pointee with the `_Atomic`/`volatile` skin stripped
+//                      (C: `atomic_load_explicit(const volatile A *)` yields the
+//                      NON-atomic `C`).
+//   `applyToParams`  — the parameters whose declared type has its innermost core
+//                      replaced by `T`, the pointer derivation preserved:
+//                      `ptr<i32>` → `ptr<T>`, a bare `i32` → `T`.
+//   `applyToResult`  — the same substitution on the result type.
+// A parameter NOT listed keeps its declared type exactly — which is what makes
+// the trailing `memory_order` argument stay `int` while the value parameter
+// beside it, spelled with the same `i32` exemplar core, becomes `T`.
+//
+// ── `pointerDifferenceParams` — C §7.17.1p6's `M`, and why it is a FOURTH cell ─
+//
+// ★★★ THE STANDARD DEFINES TWO SUBSTITUTIONS, NOT ONE, AND THIS PROJECT SHIPPED
+// ONLY THE FIRST. C11/C23 §7.17.1p6 writes every `<stdatomic.h>` synopsis in
+// three letters: *"An A refers to an atomic type. A C refers to its corresponding
+// non-atomic type. An M refers to the type of the other argument for arithmetic
+// operations. For atomic integer types, M is C. FOR ATOMIC POINTER TYPES, M IS
+// `ptrdiff_t`."* `applyToParams` expresses the `C` substitution. `M` is a
+// DIFFERENT function of `T`, and collapsing the two made the operand of
+// `atomic_fetch_add_explicit(int *_Atomic *, ...)` come out as `int *` — a
+// parameter no correct call can satisfy, so DSS REFUSED the whole atomic-pointer
+// arithmetic surface (`S_TypeMismatch`) while both references ran it.
+//
+// ★★ WHY THIS IS NOT A REFERENCE FORK, WHICH IS THE INTERESTING PART. ✔MEASURED:
+// gcc 13.3.0 ACCEPTS and computes the add UNSCALED; clang 18.1.3 ACCEPTS and
+// computes it SCALED. Two working references disagreeing about what a program
+// MEANS is normally an architectural fork to pause on — but the union's last
+// resort is ISO C, and here ISO C SETTLES IT: §7.17.7.5's table maps key `add`
+// to operator `+` and computation "addition", and p3 says the object is replaced
+// with *"the result of the computation applied to the value pointed to by object
+// and the given operand"* — i.e. `C + M` = pointer + `ptrdiff_t` = C's own
+// §6.5.6 pointer arithmetic, SCALED. p3's *"for address types, the result may be
+// an undefined address"* has a referent only under scaling. ⇒ clang is right,
+// gcc is wrong (its `<stdatomic.h>` forwards to `__atomic_fetch_add`, whose
+// operand is byte-wise by that builtin's own contract), and DSS implements the
+// TEXT. ★ The measurement to take when references split on MEANING is therefore
+// "does the standard settle it", BEFORE reaching for the fork rule.
+//
+// The cell lists parameter indices that carry `M` rather than `C`. It is a
+// REFINEMENT of `applyToParams`, never a second list beside it: every index here
+// must also appear there (validated fail-loud at load), so a reader of
+// `applyToParams` still sees every substituted position. When the bound `T` is
+// NOT a pointer the cell does nothing at all — `M` is `C` for an integer object,
+// which is exactly the substitution `applyToParams` already performs.
+struct DSS_EXPORT BuiltinGenericPointee {
+    std::uint32_t              bindFromParam = 0;
+    std::vector<std::uint32_t> applyToParams;
+    bool                       applyToResult = false;
+    std::vector<std::uint32_t> pointerDifferenceParams;
+};
+
 struct DSS_EXPORT BuiltinFunctionMapping {
     std::string           name;
     std::vector<TypeKind> paramCores;
@@ -1606,6 +1750,11 @@ struct DSS_EXPORT BuiltinFunctionMapping {
     // the injection site regardless of which model is active, so a malformed
     // INACTIVE override fails on EVERY target (anti-lurking).
     std::unordered_map<DataModel, std::string> signatureTextByDataModel;
+    // D-CSUBSET-ATOMIC-MONOMORPH-I32: OPTIONAL. Present ⇒ `signatureText` is the
+    // EXEMPLAR and the real signature is derived per call site by the rule the
+    // struct above documents. Absent (the default) ⇒ the declared signature binds
+    // verbatim, exactly as every pre-existing row does.
+    std::optional<BuiltinGenericPointee> genericPointee;
 };
 
 // D5.1: a member-access expression rule. When Pass 2 sees a node with this

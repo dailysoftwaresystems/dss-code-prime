@@ -2,6 +2,7 @@
 #include "link/format/object_format_backends.hpp"
 
 #include "core/cpp_invariants.hpp"  // arithmetic-right-shift assert
+#include "core/crypto/sha256.hpp"  // build-id derivation (content hash)
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/symbol_attrs.hpp"  // isExternallyVisible (ET_DYN exports)
 #include "link/format/byte_emit.hpp"
@@ -16,6 +17,7 @@
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -143,6 +145,56 @@ constexpr std::uint32_t SHT_DYNSYM   = 11;
 constexpr std::uint64_t SHF_WRITE     = 1;
 constexpr std::uint64_t SHF_ALLOC     = 2;
 constexpr std::uint64_t SHF_EXECINSTR = 4;
+
+// ── The static image's OWN GOT ─────────────────────────────────────────────
+//    D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS
+//
+// `.got` is WRITER-OWNED — no `.format.json` row, like `.plt` / `.rela.dyn` in
+// the dynamic walker. A producer cannot place anything in it: every slot is
+// minted by the linker for a relocation that names one, so there is nothing
+// for a schema author to decide. ✔MEASURED: no shipped document under
+// `src/dss-config/` DECLARES a `.got` section row — the name appears there only
+// inside `$comment` prose describing the dynamic walker's GOT, never as a row a
+// loader reads.
+//
+// ⚠ THIS SENTENCE USED TO READ *"zero `.got` hits under `src/dss-config/`"* AND
+// THAT GREP RETURNS FOUR. The intended claim was always the structural one
+// above and it is TRUE; the sentence stating it was a self-documenting COUNT
+// that was already false when it was typed
+// (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED, one
+// tier earlier: false at the moment of typing). The claim is stated
+// structurally rather than as a figure because it is not a line count over a
+// named file set — the four prose hits are exactly what such a count would
+// report — so there is nothing here for the source census to bind.
+constexpr std::string_view kGotSectionName = ".got";
+// Slot width. ELF64 throughout this walker (`Elf64_Ehdr`, `Elf64_Shdr`), and
+// the dynamic walker's `.got` uses the same 8.
+constexpr std::uint64_t kGotSlotBytes = 8;
+
+// ── `.note.gnu.build-id` ───────────────────────────────────────────────────
+//    D-LK-ELF-EMITS-NO-BUILD-ID-NOTE
+//
+// The gABI note record is `n_namesz / n_descsz / n_type` (three LE u32s), then
+// the owner name padded to 4, then the descriptor padded to 4. The GNU
+// build-id note's owner is "GNU\0" and its type is NT_GNU_BUILD_ID.
+constexpr std::uint32_t NT_GNU_BUILD_ID = 3;
+// Spelled as BYTES, not as a string literal: `"GNU\0"` makes gcc warn
+// `null character(s) preserved in literal`, and a warning on a deliberate
+// wire constant is noise that trains a reader to skip warnings.
+constexpr std::array<std::uint8_t, 4> kBuildIdOwner{{'G', 'N', 'U', 0}};
+constexpr std::uint32_t kBuildIdOwnerBytes = 4;   // "GNU\0", already 4-aligned
+// ★ THE DESCRIPTOR IS A FULL SHA-256 AND ITS LENGTH SAYS SO. The note format
+// fixes no descriptor size — GNU ld writes 20 bytes for `--build-id=sha1` (its
+// default, ✔MEASURED: `n_descsz` 0x14 on gcc 13.3.0 and clang 18.1.3 images),
+// 16 for `md5`, and any length at all for `--build-id=0x<hex>` — and every
+// consumer treats it as opaque bytes. DSS hashes with `dss::crypto::sha256`,
+// the NIST-vector-verified digest this repository already owns, so it publishes
+// all 32 rather than truncating to claim a width it did not compute. (Mach-O's
+// LC_UUID truncates only because its payload field IS 16 bytes wide.)
+constexpr std::uint32_t kBuildIdDescBytes = 32;
+// Byte offset of the descriptor inside the note body: the 12-byte header plus
+// the 4-byte owner name.
+constexpr std::size_t kBuildIdDescOffset = 12 + 4;
 
 // Elf64 p_type / p_flags (gABI Fig. 5-2).
 constexpr std::uint32_t PT_LOAD    = 1;
@@ -537,6 +589,46 @@ inline void appendBytes(std::vector<std::uint8_t>& out,
          std::to_string(machine) + " has no PLT stub emitter — "
          "caller's machine-guard should have rejected this.");
     return false;
+}
+
+// The `.note.gnu.build-id` body with a ZEROED descriptor — the shape both image
+// walkers emit, built in ONE place so the two can never disagree about the wire
+// record. `stampBuildIdNote` fills the descriptor once the image is complete.
+[[nodiscard]] std::vector<std::uint8_t> makeBuildIdNoteBody() {
+    std::vector<std::uint8_t> note;
+    appendU32LE(note, kBuildIdOwnerBytes);   // n_namesz ("GNU\0")
+    appendU32LE(note, kBuildIdDescBytes);    // n_descsz
+    appendU32LE(note, NT_GNU_BUILD_ID);      // n_type
+    note.insert(note.end(), kBuildIdOwner.begin(), kBuildIdOwner.end());
+    note.insert(note.end(), kBuildIdDescBytes, std::uint8_t{0});
+    return note;
+}
+
+// Derive the image's build id FROM ITS OWN CONTENT and write it into the
+// descriptor the note body reserved. `bytes` must already hold every byte of
+// the finished image, so the caller calls this LAST.
+//
+// ★★ WHY CONTENT-DERIVED AND NEVER RANDOM, and this is a repository invariant
+// rather than a preference: several corpus examples compare a `--config=release`
+// artifact BYTE-FOR-BYTE, and a random id would make every such artifact differ
+// from itself. ✔MEASURED 2026-09-07 that the references derive it from content
+// too — gcc 13.3.0 built the same source twice to two paths and stamped
+// `df4a8b78d56207b6df0e681bb4c1b48d54f6d124` both times, clang 18.1.3 stamped
+// `49138c0b580bd392b24f1d5ca445d45b51f1788e` both times, and a one-character
+// source change moved gcc's to `703e81b32e5595635a80b3f9186895a42dcb51ab`.
+//
+// ★ THE DESCRIPTOR IS INSIDE THE HASHED REGION AND IS ZERO WHEN IT IS HASHED,
+// so the derivation is a FIXED POINT rather than a self-reference: stamping
+// cannot change the digest that produced it. Identical to `stampImageUuid`'s
+// arrangement in the Mach-O walker, which is the precedent this follows.
+void stampBuildIdNote(std::vector<std::uint8_t>& bytes,
+                      std::size_t                noteOffset) {
+    auto const digest = dss::crypto::sha256(
+        std::span<std::uint8_t const>{bytes.data(), bytes.size()});
+    std::size_t const descAt = noteOffset + kBuildIdDescOffset;
+    for (std::size_t i = 0; i < kBuildIdDescBytes; ++i) {
+        bytes[descAt + i] = digest[i];
+    }
 }
 
 void writeSectionHeader(std::vector<std::uint8_t>& out, SectionHeader const& h) {
@@ -1222,6 +1314,28 @@ encodeElfExecDynamic(
     // (D-CSUBSET-THREAD-LOCAL: `.tdata` right before `.data` matches the
     // file layout — its bytes physically open PT_LOAD #2; `.tbss` (NOBITS,
     // no file bytes) sits beside its template, the gcc pairing.)
+    // ── `.note.gnu.build-id` (D-LK-ELF-EMITS-NO-BUILD-ID-NOTE) ───────────
+    //
+    // The DYNAMIC arm emits the same content-derived identity the static arm
+    // does, from the SAME declared `note` row and the SAME body builder. It has
+    // to: `elf::encode` routes a format to THIS walker the moment the module
+    // carries an extern import, so a document whose freestanding programs got a
+    // build id and whose libc-using ones did not would be one document with two
+    // behaviours — the silent-inconsistency class, not a scope boundary.
+    //
+    // ⚠ THE HEADER GOES LAST, AFTER `.shstrtab`, WHILE THE BYTES GO INSIDE
+    // PT_LOAD #1. Appending the row leaves every `IDX_*` and `e_shstrndx`
+    // exactly where they were, so an image whose format declares no note row is
+    // byte-identical to before; ELF does not require section headers to be in
+    // address order, and this table already is not (`.symtab` and friends carry
+    // sh_addr 0 ahead of nothing).
+    auto const* secNoteDyn = fmt.sectionByKind(SectionKind::Note);
+    bool const hasBuildIdDyn = (secNoteDyn != nullptr);
+    std::vector<std::uint8_t> const buildIdNoteDyn =
+        hasBuildIdDyn ? makeBuildIdNoteBody() : std::vector<std::uint8_t>{};
+    std::uint64_t const buildIdAlignDyn =
+        hasBuildIdDyn ? std::max<std::uint64_t>(secNoteDyn->addrAlign, 1u) : 1u;
+
     std::uint16_t idxCursor = 0;
     auto nextIdx = [&]() { return idxCursor++; };
     std::uint16_t const IDX_NULL   = nextIdx();  (void)IDX_NULL;
@@ -1274,6 +1388,11 @@ encodeElfExecDynamic(
     std::uint16_t const IDX_SYMTAB = nextIdx();  (void)IDX_SYMTAB;
     std::uint16_t const IDX_STRTAB = nextIdx();
     std::uint16_t const IDX_SHSTRTAB = nextIdx();
+    // `.note.gnu.build-id` LAST — see the declaration above for why the header
+    // is appended here while its bytes live in PT_LOAD #1.
+    std::uint16_t const IDX_NOTE =
+        hasBuildIdDyn ? nextIdx() : std::uint16_t{0};
+    (void)IDX_NOTE;
     std::uint16_t const kNumSections = idxCursor;
 
     // ── (b.7) ET_DYN export set (c150, D-LK1-4) ─────────────────
@@ -1798,7 +1917,14 @@ encodeElfExecDynamic(
         hasEhFrame ? alignUp(ehFrameOff + ehFrameSz, 4) : ehFrameOff;
     std::uint64_t const ehFrameHdrVa = baseImageVa + ehFrameHdrOff;
 
-    std::uint64_t const ptLoad1End = ehFrameHdrOff + ehFrameHdrSz;
+    // `.note.gnu.build-id` closes PT_LOAD #1 when the format declares it — it is
+    // SHF_ALLOC and read-only, so it belongs in the same segment `.rodata` and
+    // the unwind tables do (D-LK-ELF-EMITS-NO-BUILD-ID-NOTE).
+    std::uint64_t const noteOffDyn =
+        hasBuildIdDyn ? alignUp(ehFrameHdrOff + ehFrameHdrSz, buildIdAlignDyn)
+                      : (ehFrameHdrOff + ehFrameHdrSz);
+    std::uint64_t const noteVaDyn = baseImageVa + noteOffDyn;
+    std::uint64_t const ptLoad1End = noteOffDyn + buildIdNoteDyn.size();
 
     // PT_LOAD #2 (R+W) — page-aligned in both file + VA. Holds the WRITABLE
     // sections: `.data` (file-backed, mutable initialized globals —
@@ -2282,6 +2408,11 @@ encodeElfExecDynamic(
     auto const shsSymtab   = shstrtab.add(".symtab");
     auto const shsStrtab   = shstrtab.add(".strtab");
     auto const shsShStrtab = shstrtab.add(".shstrtab");
+    // Added ONLY when the format declares the row, so an image without one
+    // keeps its `.shstrtab` byte-for-byte (the same discipline `.gnu.version`
+    // follows two adds up).
+    std::uint32_t const shsNoteDyn =
+        hasBuildIdDyn ? shstrtab.add(std::string{secNoteDyn->name}) : 0u;
 
     std::uint64_t const symtabOff = alignUp(ptLoad2End, 8);
     std::uint64_t const symtabSz  = symtab.size();
@@ -3000,6 +3131,9 @@ encodeElfExecDynamic(
         padToOffset(bytes, ehFrameOff);    appendBytes(bytes, ehFrameOpt->bytes);
         padToOffset(bytes, ehFrameHdrOff); appendBytes(bytes, ehFrameHdr);
     }
+    if (hasBuildIdDyn) {
+        padToOffset(bytes, noteOffDyn);   appendBytes(bytes, buildIdNoteDyn);
+    }
     padToOffset(bytes, ptLoad2Start);                                // PT_LOAD #2 boundary
     // `.tdata` (thread-local template) opens PT_LOAD #2 (D-CSUBSET-THREAD-LOCAL)
     // — its (possibly reloc-patched) bytes precede `.data`'s.
@@ -3181,6 +3315,18 @@ encodeElfExecDynamic(
     writeSectionHeader(bytes, SectionHeader{
         .name_offset = shsShStrtab, .type = SHT_STRTAB,
         .offset = shstrtabOff, .size = shstrtabSz, .addr_align = 1});
+    // `.note.gnu.build-id` (D-LK-ELF-EMITS-NO-BUILD-ID-NOTE) — sh_type /
+    // sh_flags / sh_addralign come from the DECLARED row, never hardcoded here,
+    // so the document that decides the note exists also decides how it is
+    // mapped.
+    if (hasBuildIdDyn) {
+        writeSectionHeader(bytes, SectionHeader{
+            .name_offset = shsNoteDyn, .type = secNoteDyn->type,
+            .flags = secNoteDyn->flags, .addr = noteVaDyn,
+            .offset = noteOffDyn, .size = buildIdNoteDyn.size(),
+            .addr_align = secNoteDyn->addrAlign,
+            .entry_size = secNoteDyn->entrySize});
+    }
 
     // ── (p) Fill in Elf64_Ehdr ─────────────────────────────────
     //
@@ -3235,6 +3381,13 @@ encodeElfExecDynamic(
     appendU16LE(ehdr, kNumSections);
     appendU16LE(ehdr, IDX_SHSTRTAB);
     std::memcpy(bytes.data(), ehdr.data(), kEhdrSize);
+
+    // D-LK-ELF-EMITS-NO-BUILD-ID-NOTE: derive the identity from the FINISHED
+    // image, after the Ehdr is written back, so nothing the loader maps is
+    // outside what the id covers.
+    if (hasBuildIdDyn) {
+        stampBuildIdNote(bytes, static_cast<std::size_t>(noteOffDyn));
+    }
 
     return bytes;
 }
@@ -3628,7 +3781,18 @@ encode(AssembledModule const&    module,
     // executable carries stack policy in a PT_GNU_STACK program header, not a
     // section). `secNote` may be null; the peek never fails loud.
     auto const* secNote = fmt.sectionByKind(SectionKind::Note);
-    bool const hasNote  = !isExec && (secNote != nullptr);
+    // D-LK-ELF-EMITS-NO-BUILD-ID-NOTE: the SAME declared `note` row carries a
+    // DIFFERENT note per artifact flavour, which is why this is one row and not
+    // two. An ET_REL object's note is the EMPTY `.note.GNU-stack` marker above;
+    // an IMAGE's is `.note.gnu.build-id`, a content-derived identity a debugger,
+    // a core dump and debuginfod key on — and neither flavour wants the other's.
+    // ✔MEASURED 2026-09-07 (WSL Ubuntu 24.04): `gcc -c` and `clang -c` emit NO
+    // build-id note on a `.o` (0 in both), while `gcc`/`clang` at DEFAULT flags
+    // emit one on every exec and `.so`. Still SCHEMA-DRIVEN + graceful: a format
+    // that declares no `note` row emits neither, which is the `--build-id=none`
+    // arm of the reference (the CONTROL that proves presence is per-link POLICY:
+    // 3 NOTE sections become 2).
+    bool const hasNote  = (secNote != nullptr);
     // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: ET_REL now EMITS dataItems (a
     // global → `.rodata`/`.data`/`.bss` + a section-relative `.symtab` symbol +
     // `.rela.text` relocs). The deferred cases still fail loud upstream: an
@@ -3824,19 +3988,86 @@ encode(AssembledModule const&    module,
     std::uint64_t const bssAlign  = hasBss ? bssLayout.maxAlign : 1;
     std::uint64_t const dataSize  = dataLayout.spanSize;
     std::uint64_t const bssSize   = bssLayout.spanSize;
-    bool const hasWritableSeg = hasData || hasBss;
-    // End of the read-only VA span (text + optional rodata).
-    std::uint64_t const roSpanEndVa =
+
+    // ── `.note.gnu.build-id` body (image flavour only) ────────────────────
+    //    D-LK-ELF-EMITS-NO-BUILD-ID-NOTE
+    //
+    // An `Elf64_Nhdr` (three LE u32s) + the 4-byte "GNU\0" owner name +
+    // the descriptor, each padded to 4. The descriptor is emitted ZEROED and
+    // stamped from the finished image's own bytes at the very end of this
+    // function (`stampBuildIdNote`) — the same fixed-point arrangement Mach-O's
+    // `stampImageUuid` uses, and for the same reason: the payload sits INSIDE
+    // the hashed region and is zero while it is hashed, so stamping cannot
+    // change the digest that produced it.
+    bool const hasBuildId = isExec && hasNote;
+    std::vector<std::uint8_t> const buildIdNote =
+        hasBuildId ? makeBuildIdNoteBody() : std::vector<std::uint8_t>{};
+    std::uint64_t const buildIdAlign =
+        hasBuildId ? std::max<std::uint64_t>(secNote->addrAlign, 1u) : 1u;
+    // The note closes the READ-ONLY span: it is SHF_ALLOC and immutable, so it
+    // rides PT_LOAD #1 beside `.rodata` rather than opening a second segment.
+    std::uint64_t const roDataEndVa =
         hasRodata ? rodataSectionVa + rodataBytes.size()
                   : secText->virtualAddress + text.size();
+    std::uint64_t const buildIdSectionVa =
+        hasBuildId ? alignUp(roDataEndVa, buildIdAlign) : 0;
+
+    // ── `.got` — the GOT-slot table this image mints for itself ───────────
+    //    D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS
+    //
+    // One pointer-sized slot per symbol a GOT-SLOT-RELATIVE relocation names
+    // (`planGotSlotSymbols`), in first-reference order. A foreign
+    // static-archive member reaches this: glibc's `exit.o` carries
+    // `cmpq $0x0,sym@GOTPCREL(%rip)` against two weak-undefined symbols, and
+    // the whole meaning of that idiom is the CONTENT of the slot.
+    //
+    // ★ IN A STATIC, NON-PIE IMAGE A SLOT IS A LINK-TIME CONSTANT. There is no
+    // loader to write it and no `.rela.dyn` to describe it: the writer stores
+    // the target's resolved VA and the image is final. That is what separates
+    // this from the ET_DYN `.got`, whose slots are filled by ld.so through
+    // GLOB_DAT.
+    //
+    // ★ THE NAME IS WRITER-OWNED, like `.plt` / `.rela.dyn` in the dynamic
+    // walker — because the section is not a place a PRODUCER can put anything.
+    // ✔MEASURED: no shipped document declares a `.got` section row; the write-up
+    // and the correction of this sentence's earlier COUNT form live at
+    // `kGotSectionName`.
+    std::vector<SymbolId> const gotSlotSymbols =
+        isExec ? link::format::planGotSlotSymbols(module, targetSchema)
+               : std::vector<SymbolId>{};
+    bool const hasGot = !gotSlotSymbols.empty();
+    std::uint64_t const gotSize =
+        static_cast<std::uint64_t>(gotSlotSymbols.size()) * kGotSlotBytes;
+
+    bool const hasWritableSeg = hasData || hasBss || hasGot;
+    // End of the read-only VA span (text + optional rodata + optional note).
+    std::uint64_t const roSpanEndVa =
+        hasBuildId ? buildIdSectionVa + buildIdNote.size() : roDataEndVa;
     std::uint64_t const writableSegVa =
         hasWritableSeg ? alignUp(roSpanEndVa, pageAlignStatic) : 0;
     std::uint64_t const dataSectionVa =
         hasData ? alignUp(writableSegVa, dataAlign) : 0;
+    // `.got` sits between `.data` and `.bss`: file-backed like `.data` (its
+    // slots carry resolved VAs, not zeroes), and BEFORE `.bss` because `.bss`
+    // must stay last so PT_LOAD #2's p_memsz tail is the only thing past
+    // p_filesz.
+    std::uint64_t const gotSectionVa =
+        hasGot ? alignUp((hasData ? dataSectionVa + dataSize : writableSegVa),
+                         kGotSlotBytes)
+               : 0;
     std::uint64_t const bssSectionVa =
-        hasBss ? alignUp((hasData ? dataSectionVa + dataSize : writableSegVa),
+        hasBss ? alignUp((hasGot    ? gotSectionVa + gotSize
+                          : hasData ? dataSectionVa + dataSize
+                                    : writableSegVa),
                          bssAlign)
                : 0;
+
+    // `.got` body + the slot-address map, declared OUT here because the
+    // section layout below needs the bytes and the `isExec` block below needs
+    // to fill them (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS).
+    std::vector<std::uint8_t> gotBytes;
+    gotBytes.reserve(static_cast<std::size_t>(gotSize));
+    std::unordered_map<SymbolId, std::uint64_t> gotSlotVa;
 
     // ── ET_EXEC: apply intra-module relocations in-place ───────
     //
@@ -3901,10 +4132,34 @@ encode(AssembledModule const&    module,
                 "elf::encode (ET_EXEC)", reporter)) {
             return {};
         }
+        // D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: fill the
+        // `.got` slots planned above, now that `symbolVa` is complete, and hand
+        // the applier the slot ADDRESSES in their own map. The two maps are
+        // deliberately separate: ✔MEASURED on the real glibc `exit.o`, both
+        // `__call_tls_dtors` and `_IO_cleanup` are the target of a GOTPCREL AND
+        // of a PLT32 in the SAME member, so one symbol needs its slot's address
+        // at one site and its own address at another.
+        for (SymbolId const slotSym : gotSlotSymbols) {
+            auto const symIt = symbolVa.find(slotSym);
+            if (symIt == symbolVa.end()) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::string{"elf::encode (ET_EXEC): a GOT-slot-relative "
+                                 "relocation names symbol #"}
+                         + std::to_string(slotSym.v)
+                         + ", which no function, data item or import gives an "
+                           "address — the slot would hold a fabricated value "
+                           "and every load through it would read the wrong "
+                           "object "
+                           "(D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS).");
+                return {};
+            }
+            gotSlotVa.emplace(slotSym, gotSectionVa + gotBytes.size());
+            appendU64LE(gotBytes, symIt->second);
+        }
         if (!link::format::applyExecRelocations(
                 text, module, funcTextStart, symbolVa,
                 targetSchema, secText->virtualAddress,
-                "elf::encode (ET_EXEC)", reporter)) {
+                "elf::encode (ET_EXEC)", reporter, &gotSlotVa)) {
             return {};
         }
         // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): `.data` now carries reloc-
@@ -3956,7 +4211,7 @@ encode(AssembledModule const&    module,
     std::uint16_t const IDX_BSS    =
         hasBss ? static_cast<std::uint16_t>(
                      2u + (hasRodata ? 1u : 0u) + (hasData ? 1u : 0u)
-                     + (hasRelRo ? 1u : 0u))
+                     + (hasRelRo ? 1u : 0u) + (hasGot ? 1u : 0u))
                : 0u;
 
     StringTable strtab;
@@ -4612,6 +4867,7 @@ encode(AssembledModule const&    module,
     SectionHeader hRodata{};
     SectionHeader hData{};
     SectionHeader hBss{};
+    SectionHeader hGot{};          // .got (ET_EXEC) — GOT-slot table
     SectionHeader hRelRo{};        // c145: .data.rel.ro (ET_REL)
     SectionHeader hRela{};
     SectionHeader hRelaData{};     // c145: .rela.data (ET_REL)
@@ -4665,6 +4921,9 @@ encode(AssembledModule const&    module,
     }
     if (hasBss) {
         hBss.name_offset   = shstrtab.add(secBss->name);
+    }
+    if (hasGot) {
+        hGot.name_offset   = shstrtab.add(std::string{kGotSectionName});
     }
     if (secRela != nullptr) {
         hRela.name_offset  = shstrtab.add(secRela->name);
@@ -4726,6 +4985,9 @@ encode(AssembledModule const&    module,
     if (hasRodata) { (void)nextIdxS(); }
     if (hasData)   { (void)nextIdxS(); }
     if (hasRelRo)  { (void)nextIdxS(); }           // .data.rel.ro (ET_REL) c145
+    if (hasGot)    { (void)nextIdxS(); }           // .got (ET_EXEC) — before
+                                                   // `.bss`, matching the VA
+                                                   // order and the push order
     if (hasBss)    { (void)nextIdxS(); }
     if (!isExec) { (void)nextIdxS(); }            // .rela.text slot (ET_REL)
     // c145: `.rela.data` / `.rela.data.rel.ro` follow `.rela.text` (ET_REL only,
@@ -4786,6 +5048,20 @@ encode(AssembledModule const&    module,
         hBss.entry_size  = secBss->entrySize;
         hBss.size        = bssSize;
         hBss.addr        = isExec ? bssSectionVa : 0;  // ET_REL: unbound
+    }
+    // `.got` (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS) —
+    // SHT_PROGBITS + SHF_ALLOC|SHF_WRITE with an 8-byte entry size, the shape
+    // `readelf -S` shows for a real static image's GOT. The values here are
+    // WRITER-OWNED rather than schema rows for the same reason the name is: a
+    // producer cannot put anything in this section, so there is nothing for a
+    // `.format.json` author to decide.
+    if (hasGot) {
+        hGot.type        = SHT_PROGBITS;
+        hGot.flags       = SHF_ALLOC | SHF_WRITE;
+        hGot.addr_align  = kGotSlotBytes;
+        hGot.entry_size  = kGotSlotBytes;
+        hGot.size        = gotSize;
+        hGot.addr        = gotSectionVa;
     }
     // `.data.rel.ro` section header (D-LK-RELRO-CONST-DATA-RELOCATABLE, c145).
     // sh_type / sh_flags from the SCHEMA ROW (SHT_PROGBITS + SHF_ALLOC|SHF_WRITE,
@@ -4856,16 +5132,23 @@ encode(AssembledModule const&    module,
     hShStrtab.entry_size = secShStrtab->entrySize;
     hShStrtab.size       = shstrtab.size();
 
-    // `.note.GNU-stack` — empty (size 0) SHT_PROGBITS with sh_flags=0 (NO
-    // SHF_EXECINSTR): its mere presence tells `ld` the object needs no
-    // executable stack. type/flags/align all from the schema row (not
-    // hardcoded), matching `.section .note.GNU-stack,"",@progbits`.
+    // The `note` row — ONE declared row, a DIFFERENT note per artifact flavour
+    // (D-LK-ELF-EMITS-NO-BUILD-ID-NOTE), with type/flags/align read from the
+    // schema in BOTH cases rather than hardcoded here:
+    //   * ET_REL  → `.note.GNU-stack`, EMPTY (size 0) SHT_PROGBITS with
+    //     sh_flags=0 (NO SHF_EXECINSTR); its mere presence tells `ld` the object
+    //     needs no executable stack, matching
+    //     `.section .note.GNU-stack,"",@progbits`. No VA — it is not mapped.
+    //   * ET_EXEC → `.note.gnu.build-id`, a real SHT_NOTE body at a real VA
+    //     inside PT_LOAD #1. `buildIdNote` is EMPTY unless `hasBuildId`, so the
+    //     one expression below spells both sizes without a branch.
     if (hasNote) {
         hNote.type       = secNote->type;
         hNote.flags      = secNote->flags;
         hNote.addr_align = std::max<std::uint64_t>(1, secNote->addrAlign);
         hNote.entry_size = secNote->entrySize;
-        hNote.size       = 0;
+        hNote.size       = buildIdNote.size();
+        hNote.addr       = hasBuildId ? buildIdSectionVa : 0;
     }
     // `.eh_frame`: SHT_PROGBITS + SHF_ALLOC, addralign = the DWARF record
     // alignment (`buildEhFrame` pads every CIE/FDE to the address size, and a
@@ -4970,6 +5253,24 @@ encode(AssembledModule const&    module,
             }
         }
     }
+    // `.note.gnu.build-id` closes PT_LOAD #1, after `.rodata`
+    // (D-LK-ELF-EMITS-NO-BUILD-ID-NOTE). Same file/VA congruence guard as
+    // `.rodata`: the note is SHF_ALLOC, so a desync would make the loader map
+    // the wrong bytes at the address `readelf -n` reads the build id from.
+    if (hasBuildId) {
+        layoutSection(hNote, buildIdNote);
+        std::uint64_t const noteFileDelta = hNote.offset - hText.offset;
+        if (secText->virtualAddress + noteFileDelta != buildIdSectionVa) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("elf::encode (ET_EXEC): .note.gnu.build-id "
+                             "file/VA congruence broken — textVa({}) + "
+                             "fileDelta({}) != buildIdSectionVa({}). "
+                             "D-LK-ELF-EMITS-NO-BUILD-ID-NOTE.",
+                             secText->virtualAddress, noteFileDelta,
+                             buildIdSectionVa));
+            return {};
+        }
+    }
     // `.data` + `.bss` (D-LK4-DATA-PRODUCER) — the WRITABLE segment, page-
     // aligned above the read-only sections so they form a SEPARATE R+W PT_LOAD
     // (W^X). `.data` is file-backed; `.bss` consumes NO file bytes (its sh_offset
@@ -5001,6 +5302,26 @@ encode(AssembledModule const&    module,
     if (hasRelRo) {
         layoutSection(hRelRo, relroLayout.bytes);
     }
+    // `.got` — file-backed, right after `.data`, before the zero-fill `.bss`
+    // tail. ET_EXEC only, and its file/VA congruence is asserted like `.data`'s
+    // (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS).
+    if (hasGot) {
+        layoutSection(hGot, gotBytes);
+        std::uint64_t const gotFileDelta = hGot.offset - hText.offset;
+        if (secText->virtualAddress + gotFileDelta != gotSectionVa) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("elf::encode (ET_EXEC): .got file/VA congruence "
+                             "broken — textVa({}) + fileDelta({}) != "
+                             "gotSectionVa({}). Every GOT-slot-relative "
+                             "displacement was computed against the VA, so a "
+                             "desync makes each one load from the wrong file "
+                             "bytes. "
+                             "D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS.",
+                             secText->virtualAddress, gotFileDelta,
+                             gotSectionVa));
+            return {};
+        }
+    }
     if (hasBss) {
         // NOBITS: record sh_offset at the current cursor (conventional — points
         // just past .data) WITHOUT appending bytes; sh_size is the zero-fill
@@ -5018,7 +5339,14 @@ encode(AssembledModule const&    module,
     // `.note.GNU-stack` last — a zero-length body, so it just records a valid
     // sh_offset (no bytes appended). Keeping it after .shstrtab is what leaves
     // every existing section index + e_shstrndx untouched.
-    if (hasNote) layoutSection(hNote, std::span<std::uint8_t const>{});
+    // ⚠ ET_REL ONLY. An IMAGE's note is `.note.gnu.build-id`, whose bytes were
+    // already placed inside PT_LOAD #1 above — a SHF_ALLOC section laid out here
+    // would sit past `.shstrtab`, outside every loadable segment, and the
+    // loader would never map the identity the note exists to publish. Only the
+    // header slot is shared between the two flavours; the placement is not.
+    if (hasNote && !isExec) {
+        layoutSection(hNote, std::span<std::uint8_t const>{});
+    }
     // `.eh_frame` + `.rela.eh_frame` last, matching the index cursor above.
     if (hasEhFrame) {
         layoutSection(hEhFrame, ehFrameOpt->bytes);
@@ -5050,6 +5378,8 @@ encode(AssembledModule const&    module,
     if (hasData) headers.push_back(&hData);
     // `.data.rel.ro` (c145) between `.data` and `.bss` (ET_REL only).
     if (hasRelRo) headers.push_back(&hRelRo);
+    // `.got` before `.bss` — MUST match the cursor above and the VA order.
+    if (hasGot) headers.push_back(&hGot);
     if (hasBss) headers.push_back(&hBss);
     if (!isExec) headers.push_back(&hRela);
     // `.rela.data` / `.rela.data.rel.ro` (c145) after `.rela.text` (ET_REL only).
@@ -5192,9 +5522,11 @@ encode(AssembledModule const&    module,
         // = R+X (W^X preserved). Span derived from the on-disk extent.
         std::uint32_t pFlags1 = shFlagsToPFlags(secText->flags);
         if (hasRodata) pFlags1 |= shFlagsToPFlags(secRodata->flags);
+        if (hasBuildId) pFlags1 |= shFlagsToPFlags(secNote->flags);
         std::uint64_t const seg1ByteLen =
-            hasRodata ? (hRodata.offset + rodataBytes.size() - hText.offset)
-                      : text.size();
+            hasBuildId ? (hNote.offset + buildIdNote.size() - hText.offset)
+            : hasRodata ? (hRodata.offset + rodataBytes.size() - hText.offset)
+                        : text.size();
         appendPhdr(pFlags1, hText.offset, secText->virtualAddress,
                    seg1ByteLen, seg1ByteLen);
         // PT_LOAD #2 (R+W) covers `.data` (file-backed) + `.bss` (zero-fill).
@@ -5205,18 +5537,36 @@ encode(AssembledModule const&    module,
             std::uint32_t pFlags2 = 0;
             if (hasData) pFlags2 |= shFlagsToPFlags(secData->flags);
             if (hasBss)  pFlags2 |= shFlagsToPFlags(secBss->flags);
+            // `.got` is SHF_ALLOC|SHF_WRITE by construction (it is not a schema
+            // row), so it contributes R+W exactly as `.data` does.
+            if (hasGot)  pFlags2 |= shFlagsToPFlags(SHF_ALLOC | SHF_WRITE);
             std::uint64_t const seg2Off =
-                hasData ? hData.offset : hBss.offset;
+                hasData ? hData.offset : (hasGot ? hGot.offset : hBss.offset);
             std::uint64_t const seg2Va = writableSegVa;
-            std::uint64_t const seg2FileSz =
-                hasData ? (hData.offset + dataSize - seg2Off) : 0;
+            // p_filesz spans every FILE-BACKED member (`.data` then `.got`);
+            // `.bss` adds none.
+            std::uint64_t const seg2FileEnd =
+                hasGot    ? (hGot.offset + gotSize)
+                : hasData ? (hData.offset + dataSize)
+                          : seg2Off;
+            std::uint64_t const seg2FileSz = seg2FileEnd - seg2Off;
             std::uint64_t const seg2MemEnd =
-                hasBss ? (bssSectionVa + bssSize)
-                       : (dataSectionVa + dataSize);
+                hasBss    ? (bssSectionVa + bssSize)
+                : hasGot  ? (gotSectionVa + gotSize)
+                          : (dataSectionVa + dataSize);
             std::uint64_t const seg2MemSz = seg2MemEnd - seg2Va;
             appendPhdr(pFlags2, seg2Off, seg2Va, seg2FileSz, seg2MemSz);
         }
         std::memcpy(bytes.data() + kEhdrSize, phdr.data(), phdr.size());
+    }
+
+    // D-LK-ELF-EMITS-NO-BUILD-ID-NOTE: derive the identity from the FINISHED
+    // image and stamp it into the descriptor reserved above. LAST, after the
+    // program headers are written back, so every byte the loader maps is
+    // covered — an id that omitted the segment table would not change when the
+    // layout did.
+    if (hasBuildId) {
+        stampBuildIdNote(bytes, static_cast<std::size_t>(hNote.offset));
     }
 
     return bytes;

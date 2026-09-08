@@ -41,6 +41,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <variant>
 #include <string>
 #include <unordered_map>
@@ -9987,5 +9988,151 @@ TEST(MirToLir, F128ConversionsFailLoudWithoutConfigRow) {
             << "an F128 negate with no `neg` row must fail loud";
         EXPECT_TRUE(sawAnchor(rep, "MIR FNeg"))
             << "at the FNeg reach of the width gate";
+    }
+}
+
+// ── P64 REMEDIATION: the sub-word compare-exchange's TWO COMPARES ────────────
+//
+// ⛔ THE DEFECT THIS PINS WAS A SILENT WRONG ANSWER ON A PATH THAT USED TO
+// REFUSE LOUDLY. A compare-exchange decides equality twice — once in
+// `mir_to_lir`'s `lowerAtomicCas` (does the exchange COMMIT?) and once at the
+// MIR tier's `ICmpEq` (what `_Bool` does the caller see, and is the failure
+// write-back taken?). The first cut of the sub-word CAS surface widened the LIR
+// compare to the CONTAINER width and justified it by enumerating the producers
+// of a sub-word value ("always zero-extended"). ✔MEASURED FALSE: a materialized
+// NEGATIVE constant arrives SIGN-extended, so on arm64 `--config=release` an
+// `_Atomic signed char` CAS against `-1` compared `0x000000FF` against
+// `0xFFFFFFFF`, skipped the `stlxr`, and then reported SUCCESS from the other
+// compare. Before that widening the same site was refused
+// `A_NoMatchingEncodingVariant` (arm64 declares `cmp` at 32/64 only).
+//
+// The fix narrows BOTH compare operands to the object's own width with the
+// target's declared `zext` verb, so the container-width compare IS the
+// object-width compare and cannot disagree with the MIR tier. THIS TEST COUNTS
+// THAT NARROWING, in the REMOVE direction: delete it and the count is 0; narrow
+// only one operand and it is 1. The CONTROL is the same shape at a NATIVE width,
+// where no narrowing is needed and the count must stay 0 — without it, "the
+// count is 2" is equally consistent with "this target zexts everything".
+namespace {
+
+// Every block of every function, unlike `countLirMnemonic` (block 0 of fn 0) —
+// `lowerAtomicCas`'s LL/SC realization is a THREE-BLOCK loop, so a block-0-only
+// count would report 0 for the very instructions this test is about.
+[[nodiscard]] int countLirMnemonicWholeFn(::dss::Lir const& lir,
+                                          ::dss::TargetSchema const& sch,
+                                          std::string_view mnemonic,
+                                          std::optional<std::uint8_t> flags) {
+    auto const want = sch.opcodeByMnemonic(mnemonic);
+    if (!want.has_value()) return 0;
+    int n = 0;
+    for (std::uint32_t f = 0;
+         f < static_cast<std::uint32_t>(lir.moduleFuncCount()); ++f) {
+        auto const fn = lir.funcAt(f);
+        for (std::uint32_t b = 0; b < lir.funcBlockCount(fn); ++b) {
+            auto const bb = lir.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+                auto const inst = lir.blockInstAt(bb, i);
+                if (lir.instOpcode(inst) != *want) continue;
+                if (flags.has_value() && lir.instFlags(inst) != *flags) continue;
+                ++n;
+            }
+        }
+    }
+    return n;
+}
+
+// THROWS rather than `std::abort()`s (`no_abort_in_tests_guard`): an abort takes
+// the whole binary down and every sibling test with it, while GoogleTest reports
+// a throw as a failure of the ONE test that could not get its target.
+[[nodiscard]] std::shared_ptr<::dss::TargetSchema> arm64Target() {
+    auto t = ::dss::TargetSchema::loadShipped("arm64");
+    if (!t) throw std::runtime_error("TargetSchema::loadShipped(\"arm64\") failed");
+    return *t;
+}
+
+}  // namespace
+
+TEST(MirToLirAtomicCas, SubWordCompareNarrowsBOTHOperandsToTheObjectWidth) {
+    struct Arm {
+        char const* objectType;
+        char const* expectedType;
+        std::uint8_t widthFlag;
+        int          wantZext;
+        char const*  why;
+    };
+    // `-1` / `-300` are MATERIALIZED NEGATIVE constants — the producer the
+    // refuted enumeration omitted, and the only one that makes a raw
+    // container-width compare answer differently from an object-width one.
+    std::array<Arm, 3> const arms{{
+        {"signed char", "signed char", ::dss::kLirInstFlagWidth8,  2,
+         "a byte object must narrow observed AND comparand (uxtb, uxtb)"},
+        {"short",       "short",       ::dss::kLirInstFlagWidth16, 2,
+         "a half object must narrow observed AND comparand (uxth, uxth)"},
+        {"int",         "int",         ::dss::kLirInstFlagWidth8,  0,
+         "CONTROL: a native-width object needs NO narrowing — the register IS "
+         "the object, so a non-zero count here would mean the pin is measuring "
+         "something other than the sub-word rule"},
+    }};
+    for (auto const& a : arms) {
+        std::string const src = std::string(
+            "_Atomic ") + a.objectType + " g;\n"
+            "int main(void) {\n"
+            "    " + a.expectedType + " e = -1;\n"
+            "    return atomic_compare_exchange_strong_explicit(&g, &e, -2, 5, 5);\n"
+            "}\n";
+        auto target = arm64Target();
+        auto lowered = lowerCToLir(src, target);
+        ASSERT_TRUE(lowered.lir.ok)
+            << a.objectType << ": the sub-word CAS must LOWER — a refusal here "
+                               "means this pin stopped measuring its subject";
+        // The realization under test really is the LL/SC one (a target that
+        // lowered a single-op `lock cmpxchg` would need no narrowing at all).
+        EXPECT_GE(countLirMnemonicWholeFn(lowered.lir.lir, *target, "ldaxr",
+                                          std::nullopt), 1)
+            << a.objectType << ": expected the arm64 LL/SC CAS realization";
+        EXPECT_EQ(countLirMnemonicWholeFn(lowered.lir.lir, *target, "zext",
+                                          a.widthFlag),
+                  a.wantZext)
+            << a.objectType << ": " << a.why;
+    }
+}
+
+// ── P64: C §7.17.1p6's `M` — an atomic POINTER RMW is SCALED, not byte-wise ──
+//
+// §7.17.1p6: "For atomic integer types, M is C. For atomic pointer types, M is
+// ptrdiff_t." §7.17.7.5 replaces the object with "the result of the computation
+// applied to the value pointed to by object and the given operand", and `add`'s
+// computation is the `+` OPERATOR — pointer + ptrdiff_t is C 6.5.6 arithmetic,
+// SCALED by the element size. ⚠ The references SPLIT on this (✔MEASURED: gcc
+// 13.3.0 unscaled, clang 18.1.3 scaled, both accepting) and the standard TEXT
+// settles it against gcc, which is why this is implemented rather than paused
+// on as a fork.
+//
+// The pin is the SCALE, not the acceptance: an element size of 4 must produce a
+// `mul`/shift-by-2 step or a folded stride, and the two arms below use element
+// sizes 4 and 8 so a byte-wise implementation cannot satisfy both. The
+// CONTROL is a `char` element, whose stride is 1 and where scaled and unscaled
+// coincide — it must still compile, proving the arm is not simply refusing.
+TEST(MirToLirAtomicRmw, AtomicPointerFetchAddScalesByTheElementSize) {
+    struct Arm { char const* elem; int stride; };
+    std::array<Arm, 3> const arms{{{"int", 4}, {"long long", 8}, {"char", 1}}};
+    for (auto const& a : arms) {
+        std::string const src = std::string(
+            a.elem) + " buf[8];\n"
+            + a.elem + " * _Atomic gp;\n"
+            "int main(void) {\n"
+            "    atomic_store_explicit(&gp, &buf[0], 5);\n"
+            "    atomic_fetch_add_explicit(&gp, 2, 5);\n"
+            "    return 0;\n"
+            "}\n";
+        auto target = arm64Target();
+        auto lowered = lowerCToLir(src, target);
+        EXPECT_TRUE(lowered.lir.ok)
+            << a.elem << "*: an atomic pointer fetch_add must lower — C "
+                         "§7.17.1p6 gives it a ptrdiff_t operand, and refusing "
+                         "it is below the (gcc ∪ clang) ∪ ISO C union";
+        EXPECT_FALSE(lowered.model.hasErrors())
+            << a.elem << "*: and the SEMANTIC tier must accept it too — the "
+                         "operand parameter is `ptrdiff_t`, not the pointee";
     }
 }

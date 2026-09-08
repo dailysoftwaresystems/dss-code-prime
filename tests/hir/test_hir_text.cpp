@@ -63,6 +63,12 @@ std::string expectRoundTrip(Hir const& hir, HirTextContext const& ctx) {
     HirTextContext ctx2;
     ctx2.interner      = &res->interner;
     ctx2.symbolNames   = &res->symbolNames;
+    // v2 header + `buffers` section: both are file CONTENT, so a re-emit that
+    // dropped them would not be a round trip. Threaded UNCONDITIONALLY (not
+    // behind an `if (ctx.producer.empty())` guard) because the empty producer is
+    // a legitimate VALUE — `producer ""` — not an absent field.
+    ctx2.producer      = res->producer;
+    ctx2.bufferNames   = &res->bufferNames;
     ctx2.sourceMap     = &res->sourceMap;
     ctx2.ffiMap        = &res->ffiMap;
     ctx2.shaderMap     = &res->shaderMap;
@@ -102,7 +108,7 @@ TEST(HirText, EmitMinimalModule) {
     HirTextContext ctx;  // no interner/symbols needed for an empty module
     DiagnosticReporter r;
     std::string const text = emitHir(hir, ctx, r);
-    EXPECT_NE(text.find("dsshir 1\n"), std::string::npos);
+    EXPECT_NE(text.find("dsshir 3\nproducer \"\"\n"), std::string::npos);
     EXPECT_NE(text.find("module \"toy\" {"), std::string::npos);
     expectRoundTrip(hir, ctx);
 }
@@ -235,7 +241,7 @@ TEST(HirText, MalformedLiteralValuesFailLoud) {
     // never silently default. Pins the bool/overflow/unknown-tag guards.
     auto parseFails = [](std::string_view body) {
         std::string const text =
-            std::string("dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+            std::string("dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
                         "  function %1 : fn() -> void {\n    block {\n      expr ")
             + std::string(body) + "\n      return\n    }\n  }\n}\n";
         DiagnosticReporter r;
@@ -413,7 +419,17 @@ TEST(HirText, RoundTripAllSideTables) {
     HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
     ctx.sourceMap = &src; ctx.shaderMap = &shader; ctx.transpileMap = &tr; ctx.diagnosticMap = &diag;
     std::string const text = expectRoundTrip(hir, ctx);
-    EXPECT_NE(text.find("@loc(buf 3, 16..42)"), std::string::npos);
+    // ⚠ `buf 1`, though the map was set with `BufferId{3}` — and the substitution
+    // is the POINT, not an accident. A `.dsshir` names buffers by an
+    // ARTIFACT-LOCAL handle (1..N over the buffers this module actually uses),
+    // exactly as it names symbols by `%1..%N`, because `BufferId` is a
+    // PROCESS-GLOBAL monotonic counter: printing it put "how many files this
+    // process had opened first" into the artifact bytes and made two emissions of
+    // one input differ. The handle is a function of the module alone.
+    EXPECT_NE(text.find("@loc(buf 1, 16..42)"), std::string::npos) << text;
+    // And it is DEFINED by the file, so a reader is never handed an ordinal with
+    // no row behind it.
+    EXPECT_NE(text.find("buffers {\n  buf 1 \"\"\n}"), std::string::npos) << text;
     EXPECT_NE(text.find("@shader(stage vertex, builtin position)"), std::string::npos);
     EXPECT_NE(text.find("@transpile(target \"javascript\", idiom ternary_expr)"), std::string::npos);
     EXPECT_NE(text.find("@diag(code "), std::string::npos);
@@ -456,7 +472,7 @@ TEST(HirText, ParseMalformedEnumReports) {
     // An unrecognized enum name must report, not silently coerce to a default.
     DiagnosticReporter r;
     auto res = parseHir(
-        "dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  @ffi(link bogus)\n  extern_global %1 : i32\n}\n",
         CompilationUnitId{1}, r);
     EXPECT_FALSE(res->ok);
@@ -468,7 +484,7 @@ TEST(HirText, ParseStuckTokenDoesNotHang) {
     // never spin (regression: the progress guard was dead). Reaching the assert
     // at all proves termination.
     DiagnosticReporter r;
-    auto res = parseHir("dsshir 1\nmodule \"toy\" {\n  $ % :\n}\n", CompilationUnitId{1}, r);
+    auto res = parseHir("dsshir 3\nproducer \"\"\nmodule \"toy\" {\n  $ % :\n}\n", CompilationUnitId{1}, r);
     EXPECT_FALSE(res->ok);
     EXPECT_GT(countCode(r, DiagnosticCode::H_TextMalformed), 0u);
 }
@@ -482,7 +498,7 @@ TEST(HirText, ParseVersionMismatch) {
 
 TEST(HirText, ParseMalformedReports) {
     DiagnosticReporter r;
-    auto res = parseHir("dsshir 1\nmodule \"x\" {\n  @@@ garbage\n}\n", CompilationUnitId{1}, r);
+    auto res = parseHir("dsshir 3\nproducer \"\"\nmodule \"x\" {\n  @@@ garbage\n}\n", CompilationUnitId{1}, r);
     EXPECT_FALSE(res->ok);
     EXPECT_GT(countCode(r, DiagnosticCode::H_TextMalformed), 0u);
 }
@@ -491,7 +507,7 @@ TEST(HirText, ParseUnknownSymbolReports) {
     // %9 referenced but only %1 declared.
     DiagnosticReporter r;
     auto res = parseHir(
-        "dsshir 1\nsymbols {\n  %1 \"a\"\n}\nmodule \"toy\" {\n"
+        "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"a\"\n}\nmodule \"toy\" {\n"
         "  global %9 : i32\n}\n",
         CompilationUnitId{1}, r);
     EXPECT_GT(countCode(r, DiagnosticCode::H_TextUnknownName), 0u);
@@ -581,6 +597,10 @@ TEST(HirText, GoldenCorpus) {
 
         HirTextContext ctx;
         ctx.interner = &res->interner; ctx.symbolNames = &res->symbolNames;
+        // v2: the producer and the buffer table are file CONTENT, so a re-emit
+        // that did not thread them back would not be a round trip — it would be
+        // a re-emit with two fields dropped.
+        ctx.producer = res->producer; ctx.bufferNames = &res->bufferNames;
         ctx.sourceMap = &res->sourceMap; ctx.ffiMap = &res->ffiMap; ctx.shaderMap = &res->shaderMap;
         ctx.transpileMap = &res->transpileMap; ctx.diagnosticMap = &res->diagnosticMap;
         ctx.literalPool = &res->literalPool;   // thread like the side-tables (empty for #index corpus)
@@ -607,6 +627,7 @@ TEST(HirText, GoldenCorpus) {
         EXPECT_TRUE(res2->ok);
         HirTextContext ctx2;
         ctx2.interner = &res2->interner; ctx2.symbolNames = &res2->symbolNames;
+        ctx2.producer = res2->producer; ctx2.bufferNames = &res2->bufferNames;
         ctx2.sourceMap = &res2->sourceMap; ctx2.ffiMap = &res2->ffiMap; ctx2.shaderMap = &res2->shaderMap;
         ctx2.transpileMap = &res2->transpileMap; ctx2.diagnosticMap = &res2->diagnosticMap;
         ctx2.literalPool = &res2->literalPool;
@@ -1573,7 +1594,7 @@ TEST(HirText, InlineAsmTemplateWithANewlineStillRoundTripsByteIdentically) {
 // exactly the reason that row exists.
 TEST(HirText, InlineAsmOperandKindThatNamesNoFormIsRefusedWithTheAcceptedSet) {
     std::string const text =
-        "dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"m\" "
         "operand_kind not_a_form -> lit int 0 : i32 ) }\n"
@@ -1597,7 +1618,7 @@ TEST(HirText, InlineAsmOperandKindThatNamesNoFormIsRefusedWithTheAcceptedSet) {
 // indistinguishable from one analyzed with no target in scope.
 TEST(HirText, InlineAsmImmediateFormOperandSurvivesTheTextTier) {
     std::string const text =
-        "dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"i\" "
         "operand_kind imm32 -> lit int 7 : i32 ) }\n"
@@ -1627,7 +1648,7 @@ TEST(HirText, InlineAsmImmediateFormOperandSurvivesTheTextTier) {
 // emits and what stored goldens carry. Only the acceptance changed.
 TEST(HirText, InlineAsmRegisterClassOrdinalOutsideTheEnumIsRefused) {
     std::string const text =
-        "dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"r\" "
         "class 200 -> lit int 0 : i32 ) }\n"
@@ -1647,7 +1668,7 @@ TEST(HirText, InlineAsmRegisterClassOrdinalOutsideTheEnumIsRefused) {
 // and still round-trips its value.
 TEST(HirText, InlineAsmRegisterClassOrdinalInsideTheEnumStillLoads) {
     std::string const text =
-        "dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"r\" "
         "class 1 -> lit int 0 : i32 ) }\n"
@@ -1666,26 +1687,28 @@ TEST(HirText, InlineAsmRegisterClassOrdinalInsideTheEnumStillLoads) {
 //
 // `struct S { int v; struct S *next; }` is the commonest shape in C, and the
 // type graph it interns is CYCLIC: the struct's second field is `ptr<struct S>`,
-// whose operand is the struct itself. `appendType` walks operands structurally
-// with nothing tracking what it is already inside, so a naive walk re-enters the
-// struct through its own field forever. That is an INTERNER CYCLE, not a depth
-// problem — no nesting cap can bound it, because the graph has no bottom.
+// whose operand is the struct itself. `appendType` walks operands structurally,
+// so without a guard it re-enters the struct through its own field forever. That
+// is an INTERNER CYCLE, not a depth problem — no nesting cap can bound it,
+// because the graph has no bottom.
 //
-// ✔MEASURED 2026-09-02 BEFORE the fix, on exactly the declaration below:
-// `emitHir` died with STATUS_STACK_OVERFLOW (0xC00000FD) — an uncatchable process
-// kill, no diagnostic, no output. The claim reached this lane marked INFERRED and
-// it HELD.
+// ✔MEASURED 2026-09-02, before the guard existed, on exactly the declaration
+// below: `emitHir` died with STATUS_STACK_OVERFLOW (0xC00000FD) — an uncatchable
+// process kill, no diagnostic, no output.
 //
-// The fix is a CYCLE GUARD, not a depth cap: the graph has no bottom, so a cap
-// only chooses how much stack to burn before the same crash while also refusing
-// legitimately deep acyclic types. Since this grammar has no back-reference form,
-// the honest result is a LOUD refusal with unparseable output — `opaque` would
-// reintern a COMPLETE struct as INCOMPLETE, a silent ABI drop.
+// ★★★ v3 — THE CYCLE IS NOW SPELLED, NOT REFUSED. The guard's REACTION changed:
+// it used to write the poison `?` and an Error, because the grammar had no
+// back-reference form, which made every linked list, tree and parent pointer in
+// real C unrepresentable. `rec <H>` is that form. This arm therefore pins the
+// OPPOSITE outcome from the one it pinned in v2 — a clean emit AND a
+// byte-identical round trip — because a representation that emits but does not
+// read back is worth nothing to a consumer.
 //
-// RED-ON-DISABLE, REMOVE DIRECTION: delete the `compositesOpen_` membership test
-// in `appendType` and this test does not fail — it CRASHES THE RUNNER, which is
-// the honest signal for the defect it pins.
-TEST(HirText, SelfReferentialStructTerminates) {
+// RED-ON-DISABLE, REMOVE DIRECTION: delete the `recH` mint in `appendTypeStep`
+// (`if (isCyclicComposite(t)) recH = mintRecHandle(t);`) and the writer falls
+// back to the internal-desync refusal — `?`, an Error, and a text that will not
+// parse. See `.temp/p64-cy-journal.md` for the transcript.
+TEST(HirText, SelfReferentialStructRoundTripsThroughARecursionHandle) {
     TypeInterner in{CompilationUnitId{77}};
     TypeId const s = in.forwardComposite(TypeKind::Struct, "S", /*declSiteKey=*/7);
     std::array<TypeId, 2> const fields{in.primitive(TypeKind::I32), in.pointer(s)};
@@ -1703,20 +1726,47 @@ TEST(HirText, SelfReferentialStructTerminates) {
     HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
     DiagnosticReporter r;
     std::string const text = emitHir(hir, ctx, r);
-    // Reaching this line at all is the primary assertion: before the guard the
-    // process died here.
+    // Reaching this line at all is still the primary assertion: before the guard
+    // the process died here.
     EXPECT_LT(text.size(), 4096u) << "bounded output, not a runaway expansion";
-    EXPECT_NE(text.find("struct \"S\""), std::string::npos)
-        << "the outermost spelling still happens — only the RE-ENTRY is cut\n" << text;
-    // ...and the cut is LOUD, with output that cannot be silently re-parsed.
-    EXPECT_TRUE(r.hasErrors()) << "a type this codec cannot spell must be an Error";
-    EXPECT_NE(text.find('?'), std::string::npos)
-        << "the poison token must be present so the text is refused on reintern";
-    bool saidCyclic = false;
-    for (auto const& d : r.all()) {
-        if (d.actual.find("CYCLIC") != std::string::npos) saidCyclic = true;
-    }
-    EXPECT_TRUE(saidCyclic) << "the diagnostic must name the CAUSE, not just fail";
+    // ⚠ FATAL, NOT `EXPECT_`, AND THE REASON IS A MEASUREMENT. Under the
+    // red-on-disable mutant that removes the handle mint, the writer produces a
+    // `?` and the round-trip helper below then re-emits from a REFUSED parse —
+    // which fail-fasts the whole runner (0xc0000409). A dead process prints no
+    // `[  FAILED  ]` line and takes every LATER arm's verdict with it, so the
+    // pin's own evidence is destroyed by the thing it is pinning. Stopping here
+    // turns the same defect into one named red and leaves the rest of the binary
+    // measurable. ✔MEASURED (P64 lane `cy`, arms A1 and A4).
+    ASSERT_FALSE(r.hasErrors())
+        << "a cyclic composite is spelled now, not refused\n" << text;
+    ASSERT_EQ(text.find('?'), std::string::npos)
+        << "the poison token must be GONE — the type is representable\n" << text;
+    EXPECT_NE(text.find("struct \"S\" rec 1 {i32, ptr<rec 1>}"), std::string::npos)
+        << "the definition carries its handle and the re-entry spells it\n" << text;
+    // ⚠ THE HALF THAT MATTERS. A representation that emits but does not read back
+    // is worth nothing: `expectRoundTrip` re-parses, runs HirVerifier on load, and
+    // asserts the SECOND emit is byte-identical to the first.
+    std::string const rt = expectRoundTrip(hir, ctx);
+    EXPECT_EQ(rt, text);
+
+    // ★ AND THE TYPE'S IDENTITY SURVIVED AS ONE TYPE. The handle is what buys
+    // this: the composite is spelled at four sites here (the signature, the
+    // parameter, and twice through a pointer), and every mention of handle 1 must
+    // land on ONE rebuilt TypeId. A spelling-keyed reader would have produced
+    // several, with the bytes still matching — see `recOpen_`'s note.
+    DiagnosticReporter pr;
+    auto res = parseHir(text, CompilationUnitId{78}, pr);
+    ASSERT_TRUE(res->ok);
+    TypeId const paramTy = res->interner.fnParams(res->hir.functionSignature(
+        res->hir.moduleDecls(res->hir.root())[0]))[0];
+    TypeId const rebuilt = res->interner.operands(paramTy)[0];      // the pointee
+    ASSERT_EQ(res->interner.kind(rebuilt), TypeKind::Struct);
+    EXPECT_FALSE(res->interner.isIncompleteComposite(rebuilt))
+        << "the forward mint must have been COMPLETED, not left opaque";
+    TypeId const selfField = res->interner.operands(
+        res->interner.operands(rebuilt)[1])[0];                     // next's pointee
+    EXPECT_EQ(selfField.v, rebuilt.v)
+        << "the back-reference must resolve to the SAME TypeId, not a second copy";
 
     // A sibling repeat is ordinary sharing, NOT a cycle — the guard is a stack, and
     // a set would wrongly poison this.
@@ -1740,4 +1790,230 @@ TEST(HirText, SelfReferentialStructTerminates) {
     EXPECT_FALSE(r2.hasErrors())
         << "a sibling repeat is sharing, not a cycle — it must spell twice\n" << text2;
     EXPECT_EQ(text2.find('?'), std::string::npos) << text2;
+    EXPECT_EQ(text2.find(" rec "), std::string::npos)
+        << "an ACYCLIC composite must carry no handle — the marker is a property "
+           "of the type graph, not of being a struct\n" << text2;
+}
+
+namespace {
+
+// Build a two-function module over `in` whose parameter types are `p0`/`p1`.
+// Shared by the recursion arms below so each one is about the TYPE it builds and
+// not about module scaffolding.
+[[nodiscard]] Hir twoFnModule(TypeInterner& in, TypeId p0, TypeId p1) {
+    HirBuilder b{"toy"};
+    std::array<TypeId, 1> const a0{p0};
+    std::array<TypeId, 1> const a1{p1};
+    TypeId const v   = in.primitive(TypeKind::Void);
+    HirNodeId const f = b.makeFunction(in.fnSig(a0, v, CallConv::CcSysV), 1, {},
+                                       b.makeBlock(std::vector<HirNodeId>{}));
+    HirNodeId const g = b.makeFunction(in.fnSig(a1, v, CallConv::CcSysV), 2, {},
+                                       b.makeBlock(std::vector<HirNodeId>{}));
+    return std::move(b).finish(b.makeModule(std::vector<HirNodeId>{f, g}));
+}
+
+}  // namespace
+
+// ★★ MUTUAL RECURSION IS THE ARM THAT DECIDES THE DESIGN, and it is why the
+// handle is ARTIFACT-GLOBAL rather than relative.
+//
+// `struct A { struct B *b; }; struct B { struct A *a; };` gets spelled TWO ways
+// in one artifact: standing inside `A`, `B` is `struct "B" rec 2 {ptr<rec 1>}`;
+// standing alone it is `struct "B" rec 2 {ptr<struct "A" rec 1 {ptr<rec 2>}>}`.
+// Both are correct and both must appear — the format spells a type in full at
+// every use site.
+//
+// ⚠⚠ THAT IS EXACTLY WHY THE PARSER CANNOT KEY ITS FORWARD MINT ON THE SPELLING.
+// The obvious remedy (brace-match the composite's textual extent and hash it) is
+// refuted right here: those two spellings hash DIFFERENTLY, so a text-keyed
+// reader rebuilds TWO `B`s from one — and the round-tripped BYTES still match,
+// because each spelling re-emits to itself. The split would be invisible. Keying
+// on the handle is what makes "handle 2 ⇒ one TypeId" true, and this arm asserts
+// that identity directly rather than trusting the bytes.
+TEST(HirText, MutuallyRecursiveCompositesShareOneHandlePerCompositeNotPerSpelling) {
+    TypeInterner in{CompilationUnitId{81}};
+    TypeId const a = in.forwardComposite(TypeKind::Struct, "A", /*declSiteKey=*/11);
+    TypeId const b = in.forwardComposite(TypeKind::Struct, "B", /*declSiteKey=*/12);
+    std::array<TypeId, 1> const aFields{in.pointer(b)};
+    std::array<TypeId, 1> const bFields{in.pointer(a)};
+    in.completeComposite(a, aFields, /*packed=*/false);
+    in.completeComposite(b, bFields, /*packed=*/false);
+
+    Hir hir = twoFnModule(in, in.pointer(a), in.pointer(b));
+    std::vector<std::string> names{"", "f", "g"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    DiagnosticReporter r;
+    std::string const text = emitHir(hir, ctx, r);
+    ASSERT_FALSE(r.hasErrors()) << text;
+    // Both spellings of `B`, verbatim — the point of the arm.
+    EXPECT_NE(text.find("struct \"B\" rec 2 {ptr<rec 1>}"), std::string::npos) << text;
+    EXPECT_NE(text.find("struct \"B\" rec 2 {ptr<struct \"A\" rec 1 {ptr<rec 2>}>}"),
+              std::string::npos) << text;
+    EXPECT_EQ(expectRoundTrip(hir, ctx), text);
+
+    DiagnosticReporter pr;
+    auto res = parseHir(text, CompilationUnitId{82}, pr);
+    ASSERT_TRUE(res->ok) << text;
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    ASSERT_EQ(decls.size(), 2u);
+    TypeId const aRebuilt = res->interner.operands(
+        res->interner.fnParams(res->hir.functionSignature(decls[0]))[0])[0];
+    TypeId const bRebuilt = res->interner.operands(
+        res->interner.fnParams(res->hir.functionSignature(decls[1]))[0])[0];
+    EXPECT_EQ(res->interner.name(aRebuilt), "A");
+    EXPECT_EQ(res->interner.name(bRebuilt), "B");
+    // `A`'s field points at the SAME `B` the second function's parameter points
+    // at — one composite, one TypeId, despite the two spellings.
+    TypeId const bViaA = res->interner.operands(res->interner.operands(aRebuilt)[0])[0];
+    EXPECT_EQ(bViaA.v, bRebuilt.v)
+        << "`B` was rebuilt twice — the handle is not doing its job";
+    TypeId const aViaB = res->interner.operands(res->interner.operands(bRebuilt)[0])[0];
+    EXPECT_EQ(aViaB.v, aRebuilt.v);
+}
+
+// A RECURSIVE UNION, and an incomplete one. The union arm is not a copy of the
+// struct arm for free: it had no `opaque` spelling at all until this change, so
+// `union U;` used as `union U *p;` — ordinary C — round-tripped into a COMPLETE
+// zero-member union, a size-0 type with no diagnostic anywhere. Both halves are
+// pinned here because both are silent when wrong.
+TEST(HirText, RecursiveAndOpaqueUnionsBothTravel) {
+    TypeInterner in{CompilationUnitId{83}};
+    TypeId const u = in.forwardComposite(TypeKind::Union, "U", /*declSiteKey=*/21);
+    std::array<TypeId, 2> const uFields{in.primitive(TypeKind::I32), in.pointer(u)};
+    in.completeComposite(u, uFields, /*packed=*/false);
+    // Never completed: an opaque tag, exactly what a `union Tag;` declaration
+    // interns before (or without) a definition.
+    TypeId const opaque = in.forwardComposite(TypeKind::Union, "Tag", /*declSiteKey=*/22);
+    ASSERT_TRUE(in.isIncompleteComposite(opaque));
+
+    Hir hir = twoFnModule(in, in.pointer(u), in.pointer(opaque));
+    std::vector<std::string> names{"", "f", "g"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    DiagnosticReporter r;
+    std::string const text = emitHir(hir, ctx, r);
+    ASSERT_FALSE(r.hasErrors()) << text;
+    EXPECT_NE(text.find("union \"U\" rec 1 {i32, ptr<rec 1>}"), std::string::npos) << text;
+    EXPECT_NE(text.find("union \"Tag\" opaque"), std::string::npos)
+        << "an INCOMPLETE union must not be spelled `{}` — that is a legal COMPLETE "
+           "zero-member union, and the swap is a silent size change\n" << text;
+    EXPECT_EQ(expectRoundTrip(hir, ctx), text);
+
+    DiagnosticReporter pr;
+    auto res = parseHir(text, CompilationUnitId{84}, pr);
+    ASSERT_TRUE(res->ok);
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    TypeId const tagRebuilt = res->interner.operands(
+        res->interner.fnParams(res->hir.functionSignature(decls[1]))[0])[0];
+    EXPECT_TRUE(res->interner.isIncompleteComposite(tagRebuilt))
+        << "the opaque tag came back COMPLETE — the ABI drop this arm exists for";
+}
+
+// A recursive composite carrying the layout channels this grammar spells. The
+// recursive path completes its own forward id rather than routing through
+// `structType`, so it is a SECOND place those channels can be dropped — and a
+// dropped `packed` or `~align` is an ABI change that neither the bytes of a
+// single emit nor a `.ok` verdict would show.
+TEST(HirText, ARecursiveCompositeCarriesPackedAndMemberAlignsToo) {
+    TypeInterner in{CompilationUnitId{85}};
+    TypeId const s = in.forwardComposite(TypeKind::Struct, "P", /*declSiteKey=*/31);
+    std::array<TypeId, 2> const fields{in.primitive(TypeKind::Char), in.pointer(s)};
+    in.completeComposite(s, fields, /*packed=*/true);
+
+    TypeInterner in2{CompilationUnitId{86}};
+    TypeId const t = in2.forwardComposite(TypeKind::Struct, "A", /*declSiteKey=*/32);
+    std::array<TypeId, 2> const tFields{in2.primitive(TypeKind::Char), in2.pointer(t)};
+    std::array<std::uint32_t, 2> const aligns{0u, 8u};
+    std::span<std::int64_t const>  const noW{};
+    std::span<std::uint64_t const> const noO{};
+    in2.completeComposite(t, tFields, /*packed=*/false, noW, noO, aligns);
+
+    std::vector<std::string> names{"", "f", "g"};
+    for (auto const& [interner, want] :
+         std::vector<std::pair<TypeInterner*, std::string>>{
+             {&in,  "struct \"P\" rec 1 packed {char, ptr<rec 1>}"},
+             {&in2, "struct \"A\" rec 1 {char ~0, ptr<rec 1> ~8}"}}) {
+        TypeId const root = (interner == &in) ? s : t;
+        Hir hir = twoFnModule(*interner, interner->pointer(root), interner->pointer(root));
+        HirTextContext ctx; ctx.interner = interner; ctx.symbolNames = &names;
+        DiagnosticReporter r;
+        std::string const text = emitHir(hir, ctx, r);
+        ASSERT_FALSE(r.hasErrors()) << text;
+        EXPECT_NE(text.find(want), std::string::npos) << want << "\nnot in:\n" << text;
+        EXPECT_EQ(expectRoundTrip(hir, ctx), text);
+    }
+}
+
+// ⚠ A CYCLE THAT CLOSES THROUGH A QUALIFIER SKIN — `struct S { volatile struct S
+// *next; }`, which is ordinary C (an intrusive list touched from a signal handler
+// or an ISR).
+//
+// It is not a variation for completeness. `TypeInterner::operands()` is
+// qualifier-TRANSPARENT, so a reachability walk that does not normalize through
+// the skin steps from `volatile S` straight to S's FIELDS and never observes `S`
+// itself — it reports ACYCLIC for a graph the writer then re-enters. The writer
+// strips the skin before it re-enters (`stripVolatile`), so the two would
+// disagree: no handle would be minted, and the re-entry would land on the
+// internal-desync refusal. The predicate normalizes for exactly this reason and
+// this arm is what says so.
+TEST(HirText, ACycleThatClosesThroughAVolatileSkinIsStillACycle) {
+    TypeInterner in{CompilationUnitId{89}};
+    TypeId const s = in.forwardComposite(TypeKind::Struct, "S", /*declSiteKey=*/41);
+    std::array<TypeId, 2> const fields{in.primitive(TypeKind::I32),
+                                       in.pointer(in.volatileQualified(s))};
+    in.completeComposite(s, fields, /*packed=*/false);
+
+    Hir hir = twoFnModule(in, in.pointer(s), in.pointer(s));
+    std::vector<std::string> names{"", "f", "g"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    DiagnosticReporter r;
+    std::string const text = emitHir(hir, ctx, r);
+    ASSERT_FALSE(r.hasErrors())   // fatal — see the note on the self-reference arm
+        << "the cycle closes through a qualifier skin and was missed\n" << text;
+    ASSERT_EQ(text.find('?'), std::string::npos) << text;
+    EXPECT_NE(text.find("struct \"S\" rec 1 {i32, ptr<volatile<rec 1>>}"),
+              std::string::npos)
+        << "the skin must survive AND the cycle must be spelled\n" << text;
+    EXPECT_EQ(expectRoundTrip(hir, ctx), text);
+}
+
+// ── the refusals that must SURVIVE ───────────────────────────────────────────
+//
+// The version bump bought a representation, not a licence to accept anything.
+// Each of these is text the writer cannot produce, so accepting it would mean
+// rebuilding a module the writer could not re-spell — a round trip that changes
+// bytes with nothing reporting it.
+TEST(HirText, MalformedRecursionMarkersAreRefusedByName) {
+    struct Arm { char const* what; char const* type; char const* says; };
+    // `type_decl %1 : <type>` is the shortest construct that carries a type.
+    std::array<Arm, 4> const arms{{
+        {"a back-reference to no open composite", "ptr<rec 3>", "no ENCLOSING"},
+        {"a back-reference to a CLOSED composite",
+         "tuple<struct \"S\" rec 1 {ptr<rec 1>}, rec 1>", "no ENCLOSING"},
+        {"the 0 handle", "struct \"S\" rec 0 {i32}", "1-based"},
+        {"one handle, two different bodies",
+         "tuple<struct \"S\" rec 1 {ptr<rec 1>}, struct \"S\" rec 1 {i32, ptr<rec 1>}>",
+         "DIFFERENT content"},
+    }};
+    auto const wrap = [](char const* ty) {
+        return std::string{"dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"S\"\n}\n"
+                           "module \"toy\" {\n  type_decl %1 : "} + ty + "\n}\n";
+    };
+    for (Arm const& arm : arms) {
+        std::string const text = wrap(arm.type);
+        DiagnosticReporter r;
+        auto res = parseHir(text, CompilationUnitId{87}, r);
+        EXPECT_FALSE(res->ok) << arm.what << " was ACCEPTED:\n" << text;
+        bool named = false;
+        for (auto const& d : r.all()) {
+            if (d.actual.find(arm.says) != std::string::npos) named = true;
+        }
+        EXPECT_TRUE(named) << arm.what << ": the refusal did not name its cause";
+    }
+    // CONTROL: the same shape, well-formed, is accepted — so "everything is
+    // refused" is ruled out and the arms above are attributable to the marker.
+    DiagnosticReporter cr;
+    auto ok = parseHir(wrap("struct \"S\" rec 1 {i32, ptr<rec 1>}"),
+                       CompilationUnitId{88}, cr);
+    EXPECT_TRUE(ok->ok) << "the well-formed control was refused: "
+                        << (cr.all().empty() ? std::string{} : cr.all()[0].actual);
 }

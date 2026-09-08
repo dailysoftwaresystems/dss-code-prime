@@ -4424,17 +4424,27 @@ enum class DiagnosticCode : std::uint16_t {
     //   fires from the walker tiers (slices B/C).
     K_FormatLacksThreadLocalSupport = 0x8015,
     // K_ThreadLocalOveralignedForFormat (D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN):
-    //   a thread-local object requires an alignment the OUTPUT FORMAT's
-    //   per-thread TLS block cannot guarantee. On PE/x64 the loader allocates
-    //   each thread's static-TLS block at only MEMORY_ALLOCATION_ALIGNMENT
-    //   (16 bytes), and IMAGE_TLS_DIRECTORY64 carries NO block-base-alignment
-    //   field to request more — so an `_Alignas(32) thread_local` var would be
-    //   SILENTLY under-aligned (a SIMD/atomic thread_local relying on it is
-    //   UB). ELF has no such limit (PT_TLS p_align honors any alignment), so
-    //   this is a PE-format-LOCAL fail-loud gate (the format plugin's own
-    //   knowledge — never a shared-substrate branch); the alignment axis is
-    //   otherwise fully honored. Fires from the PE walker (pe.cpp) when the
-    //   max TLS-block var alignment exceeds the format's guaranteed 16.
+    //   a thread-local object requires an alignment the OUTPUT FORMAT cannot
+    //   ENCODE. On PE the per-thread block's base alignment travels in
+    //   IMAGE_TLS_DIRECTORY64.Characteristics as a FOUR-BIT IMAGE_SCN_ALIGN_*
+    //   nibble, so 8192 (IMAGE_SCN_ALIGN_8192BYTES) is the strictest request
+    //   expressible; above it the loader would silently under-align every
+    //   thread's copy. Both PE references stop at the same number by name
+    //   (mingw-w64 gcc 13.2.0: *"requested alignment '16384' exceeds object
+    //   file maximum 8192"*; MSVC 19.51: `error C2345`), so the refusal is
+    //   inside the reference union rather than above it.
+    //   ⚠ THIS CODE ONCE FIRED AT 16, on the premise that the loader guarantees
+    //   only MEMORY_ALLOCATION_ALIGNMENT and that the directory has no field to
+    //   ask for more. ✔BOTH HALVES WERE REFUTED (P64): the field is declared in
+    //   the Windows SDK's own `winnt.h`, and rewriting ONLY that nibble in an
+    //   otherwise byte-identical linked image flips a 4096-aligned thread-local
+    //   program from RUN 42 to RUN 50. The gate now bounds what the CONTAINER
+    //   holds, which is a permanent fact, rather than what a loader was
+    //   believed to promise.
+    //   ELF has no such limit (PT_TLS p_align honors any alignment), so this
+    //   stays a PE-format-LOCAL fail-loud gate — the format plugin's own wire
+    //   knowledge, never a shared-substrate branch. Fires from the PE walker
+    //   (pe.cpp) when the max TLS-block item alignment exceeds 8192.
     K_ThreadLocalOveralignedForFormat = 0x8016,
     // K_ArchiveMemberNameInvalid (D-LK-STATIC-ARCHIVE-WRITER): the `ar`
     //   static-archive writer was handed a member whose file name is empty
@@ -4775,11 +4785,18 @@ enum class DiagnosticCode : std::uint16_t {
     //   raised and this gate ABSENT, DSS built a PE image CLEAN and placed a
     //   4-object over-aligned static run MISALIGNED (✔MEASURED: exit 50, the
     //   first object failing its own `% N` check) — a silent miscompile, the
-    //   worst outcome available. The bound is the format document's OWN declared
-    //   section alignment, so raising the document raises the ceiling; nothing
-    //   here is a hardcoded platform number.
+    //   worst outcome available.
+    //   ⚠ THE BOUND MOVED IN P64, AND THE OLD ONE WAS WRONG IN BOTH DIRECTIONS.
+    //   It used to be the format document's declared `sectionAlignment` (4096),
+    //   which refused 8192 statics that BOTH PE references build and run, and
+    //   its advice — raise `optionalHeader.sectionAlignment` — is not what the
+    //   reference does: ✔`ld` leaves SectionAlignment at 0x1000 and PADS WITHIN
+    //   the section. The PE writer now does the same, so the gate bounds only
+    //   what PE/COFF can ENCODE: a four-bit IMAGE_SCN_ALIGN_* field, largest
+    //   value 8192, which is exactly where both references stop by name.
     //   Fires from the PE walker (pe.cpp, exec/dll arm), alongside the
-    //   K_ThreadLocalOveralignedForFormat gate it is modelled on.
+    //   K_ThreadLocalOveralignedForFormat gate it is modelled on — the two now
+    //   share one ceiling and one anchor.
     K_StaticObjectOveralignedForFormat = 0x8024,
     // K-NEXT-SLOT: 0x8025 — grep this marker before adding a K_* code.
 

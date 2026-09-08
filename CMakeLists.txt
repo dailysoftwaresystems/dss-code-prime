@@ -806,6 +806,28 @@ if(DSS_BUILD_TESTS)
             # what a REPLACING `ENVIRONMENT` property costs.
             set_tests_properties(lane_worktree_guard PROPERTIES
                 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dss_lane_bash_dir}")
+
+            # ── Root-litter guard (2026-09-07, P64) ────────────────────────────
+            # Refuses any untracked file sitting directly in a repository root —
+            # the probe artifacts a lane leaves when a bare filename lands in its
+            # cwd. ✔MEASURED twice in two cycles: a 0-byte `256` from a `> 256`
+            # that reached a shell as a redirect, then FIFTEEN reference-probe
+            # files (`pa.c`, `g.s`, four binaries, six captured `.txt`s).
+            # ★ REGISTERED HERE, not with its bash siblings above, and that is the
+            # point of putting it in this block: those are inside an `else()` that
+            # only runs on NON-Windows hosts, and this defect is produced by lanes
+            # on THIS host. `DSS_BASH_FOR_LANE_GUARD` is the bash already proven
+            # able to open a `C:/` path — a bare `bash` on Windows can be the WSL
+            # shim, which cannot, and would make the guard silently absent.
+            # ⓘ Runs the GUARD, not its self-test: the self-test plants a file in
+            # the root and would race a parallel `ctest -j` against this entry.
+            add_test(
+                NAME root_litter_guard
+                COMMAND "${DSS_BASH_FOR_LANE_GUARD}"
+                        "${CMAKE_SOURCE_DIR}/scripts/check-root-litter/check-root-litter.sh"
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+            set_tests_properties(root_litter_guard PROPERTIES
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dss_lane_bash_dir}")
         else()
             set(_dss_lane_refusal_script
                 "${CMAKE_CURRENT_BINARY_DIR}/lane_worktree_guard_refusal.cmake")

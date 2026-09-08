@@ -67,7 +67,13 @@ Patched applyOneReloc(std::shared_ptr<TargetSchema const> tgt,
                       std::uint64_t symbolVa,
                       std::int64_t  addend,
                       std::uint64_t patchSectionVa,
-                      std::uint64_t funcOffset) {
+                      std::uint64_t funcOffset,
+                      // D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS:
+                      // the GOT slot the image minted for the target, or 0 for
+                      // "this image minted none" — which is what every caller
+                      // but the GOTPCREL pair means, and what the walkers that
+                      // synthesize no GOT pass.
+                      std::uint64_t gotSlotVa = 0) {
     Patched out;
     out.text.resize(funcOffset + 4);
     // assembler emitted base inst at funcOffset (LE)
@@ -92,9 +98,12 @@ Patched applyOneReloc(std::shared_ptr<TargetSchema const> tgt,
     std::unordered_map<SymbolId, std::uint64_t> symbolVaMap{{SymbolId{2}, symbolVa}};
 
     DiagnosticReporter rep;
+    std::unordered_map<SymbolId, std::uint64_t> gotMap;
+    if (gotSlotVa != 0) gotMap.emplace(SymbolId{2}, gotSlotVa);
     out.ok = applyExecRelocations(
         out.text, mod, funcTextStart, symbolVaMap,
-        *tgt, patchSectionVa, "test", rep);
+        *tgt, patchSectionVa, "test", rep,
+        gotSlotVa != 0 ? &gotMap : nullptr);
     return out;
 }
 
@@ -163,26 +172,53 @@ TEST(Aarch64GotAddr, ApplyFailsLoudLd64GotLo12) {
 }
 
 // D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: the x86_64
-// GOT-slot-relative reference. Same discipline as the two arm64 rows above and
-// for a sharper reason — DSS READS this relocation out of a real foreign
-// static-archive member (that is the whole point of declaring it), so a decoded
-// module CAN reach this kernel. `symbolVa` holds the SYMBOL's address; the
-// relocation names the SLOT that holds it, and DSS's static ET_EXEC path
-// synthesizes no `.got`. Writing `S + A − P` would emit a direct reference
-// where an indirect one was meant. ✔MEASURED against a real glibc `exit.o`:
-// every plain-GOTPCREL site there is `cmpq $0x0,sym@GOTPCREL(%rip)` — a
-// weak-undefined NULL check — so the fabricated value would be the reference
-// site's own address, never zero, and the branch would take the wrong arm
-// forever. RED-ON-DISABLE: delete the kernel arm and this build fails
-// `-Werror=switch` on the exhaustive switch over RelocFormulaKind; keep the arm
-// but make it fall through to Linear and this test goes red.
+// GOT-slot-relative reference. `symbolVa` holds the SYMBOL's address; the
+// relocation names the SLOT that holds it, so the kernel reads a SECOND map —
+// `gotSlotVa`, which the walker fills while it lays the `.got` out.
+//
+// ⚠ THE TWO MAPS ARE A MEASUREMENT. ✔MEASURED on the real glibc `exit.o`
+// (`/usr/lib/x86_64-linux-gnu/libc.a`), `__call_tls_dtors` is the target of a
+// GOTPCREL at `.rela.text` 0x1b AND of a PLT32 at 0x294 — one symbol needing
+// its slot's address at one site and its own address at another, which a single
+// map cannot express.
+//
+// The pair below is the whole contract: WITH a slot the reference resolves
+// through it; WITHOUT one it REFUSES rather than falling back to `symbolVa`,
+// because writing `S + A − P` would emit a DIRECT reference where an INDIRECT
+// one was meant. Every plain-GOTPCREL site in that member is
+// `cmpq $0x0,sym@GOTPCREL(%rip)` — a weak-undefined NULL check — so the
+// fabricated value would be the reference site's own address, never zero, and
+// the branch would take the wrong arm forever.
+TEST(X86_64GotPcRel, ResolvesThroughTheSlotTheImageMinted) {
+    auto tgt = loadOneRelocTarget("x86_64_gotpcrel");
+    ASSERT_NE(tgt, nullptr);
+    auto const* tri = tgt->relocationInfo(RelocationKind{1});
+    ASSERT_NE(tri, nullptr);
+    EXPECT_EQ(tri->formulaKind, RelocFormulaKind::X86_64GotPcRel);
+    // Patch site at VA 0x400000; the slot at 0x404020; the addend a real
+    // `cmpq $0x0,sym@GOTPCREL(%rip)` site carries. value = slot + A - P.
+    constexpr std::uint64_t kSlot = 0x404020;
+    constexpr std::uint64_t kSite = 0x400000;
+    auto p = applyOneReloc(tgt, 0u, /*symbolVa=*/0x401234, -5, kSite, 0, kSlot);
+    ASSERT_TRUE(p.ok)
+        << "a GOT-slot-relative reference must RESOLVE once the image mints the "
+           "slot it names";
+    auto const written = static_cast<std::int32_t>(readInst(p.text, 0));
+    EXPECT_EQ(written, static_cast<std::int32_t>(
+                           static_cast<std::int64_t>(kSlot) - 5
+                           - static_cast<std::int64_t>(kSite)))
+        << "the displacement must reach the SLOT, not the symbol — a value "
+           "computed from symbolVa (0x401234) would load from the object "
+           "itself and the `cmpq $0x0` idiom would compare the wrong bytes";
+}
+
 TEST(X86_64GotPcRel, ApplyFailsLoudRatherThanFabricatingADirectReference) {
     auto tgt = loadOneRelocTarget("x86_64_gotpcrel");
     ASSERT_NE(tgt, nullptr);
     auto const* tri = tgt->relocationInfo(RelocationKind{1});
     ASSERT_NE(tri, nullptr);
     EXPECT_EQ(tri->formulaKind, RelocFormulaKind::X86_64GotPcRel);
-    // The addend a real glibc `cmpq $0x0,sym@GOTPCREL(%rip)` site carries.
+    // No slot map — the state every walker that mints no GOT is in.
     auto p = applyOneReloc(tgt, 0u, 0x400000, -5, 0x400000, 0);
     EXPECT_FALSE(p.ok)
         << "DSS must NOT fabricate a direct pc-relative displacement for a "
