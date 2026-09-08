@@ -426,6 +426,40 @@ def make_row(anchor, priority, status, trigger, closing="", cross_refs="", minti
     if bal.row_name(cells[C_ANCHOR]) != anchor:
         raise Refused("assembled row reads back as %r, not %r"
                       % (bal.row_name(cells[C_ANCHOR]), anchor))
+    # ★★ AND THE VERDICT MUST NOT BE STATED TWICE, DIFFERENTLY. Since the six-cell shape
+    # landed, `Status` carries the verdict and `Trigger` still opens with glyph-led prose
+    # -- two cells stating one fact, so they can disagree. `check-anchor-balance` ARM 6
+    # refuses that AFTER the fact; nothing refused it at the moment of writing.
+    # ✔MEASURED 2026-09-08: three rows minted through this writer in P64 carried
+    # `Status = closed` beside a Trigger opening with the bare word CLOSED and no closure
+    # mark, and ARM 6 failed on all three at HEAD. `is_closed` is a LEADING-POSITION test,
+    # so "says CLOSED in words" is not the same fact as "reads CLOSED", and only the gate
+    # knew that. ⇒ Asked here through `bal.is_closed` on the SPLIT-BACK cells, which is
+    # byte-for-byte the question the gate will ask, so the writer and the gate cannot
+    # drift apart about what a contradiction is.
+    # ⚠ NO ESCAPE, deliberately: a row is allowed to disagree with itself in exactly zero
+    # cases, and an opt-out here would be taken by every row that trips it -- the failure
+    # this project already measured when a guard's escape was satisfied by every subject.
+    # ⓘ It bites ONLY the closed-vs-not axis, the same axis ARM 6 owns; OPEN-vs-GATED is
+    # ARM 7's, is a differential, and is not decidable from one row in isolation.
+    if str(trigger).strip() and bal.is_closed(cells[C_STATUS]) != bal.is_closed(
+            cells[C_TRIGGER]):
+        raise Refused(
+            "the Status column and the Trigger prose state DIFFERENT verdicts.\n"
+            "  Status : %s  -> reads %s\n"
+            "  Trigger: %s -> reads %s\n"
+            "  A verdict is one fact and this row states it twice. `is_closed` is a "
+            "LEADING-POSITION test, so a Trigger that says CLOSED in words but does not "
+            "OPEN with the closure mark reads as NOT CLOSED -- which is what "
+            "`check-anchor-balance` ARM 6 will report on this row the moment it lands. "
+            "Lead the Trigger with the mark the Status column carries (the archive spells "
+            "it `%s **CLOSED <date> (<cycle>, lane `<x>`)** - ...`), or set the status the "
+            "prose actually means."
+            % (" ".join(cells[C_STATUS].split()),
+               "CLOSED" if bal.is_closed(cells[C_STATUS]) else "NOT CLOSED",
+               " ".join(cells[C_TRIGGER].split())[:56],
+               "CLOSED" if bal.is_closed(cells[C_TRIGGER]) else "NOT CLOSED",
+               bal.CLOSED_MARK))
     return row
 
 
@@ -875,12 +909,40 @@ def self_test():
         "(3) a priority outside P0..P5 is REFUSED")
     pin("controlled vocabulary" in (refuse(make_row, CC_, "P1", "wibble", "t") or ""),
         "(4) a status outside the three-value vocabulary is REFUSED")
-    r = make_row(CC_, "P0", "closed", "verdict | with a raw pipe", "a\nb", "")
+    # ⓘ The Trigger leads with the closure mark because the STATUS is closed, and the
+    # split-verdict refusal below now requires the two to agree. That is incidental to
+    # what THIS arm measures -- the pipe and the newline -- and weakens none of it.
+    r = make_row(CC_, "P0", "closed", "✅ **CLOSED** verdict | with a raw pipe",
+                 "a\nb", "")
     c = bal.split_row(r)
     pin(len(c) == 8 and "with a raw pipe" in c[C_TRIGGER]
         and c[C_CLOSING].strip() == "a b" and bal.is_closed(c[C_STATUS]),
         "(5) a raw pipe is ESCAPED and a newline COLLAPSED -- neither can add a column "
         "or wrap an id", "cells=%d" % (len(c) - 2))
+    # ── (5b..5f) THE VERDICT STATED TWICE ────────────────────────────────────
+    # ✔The negative is the case that actually shipped: P64 minted three rows through
+    # this writer with `Status = closed` and a Trigger opening with the bare WORD
+    # CLOSED, and `check-anchor-balance` ARM 6 failed on all three at HEAD. Both
+    # directions are pinned because only one of them had ever occurred, and the three
+    # CONTROLS are here so a refusal that fired on everything could not produce this
+    # transcript -- including (5f), which proves the rule is the CLOSED axis and not
+    # "the two cells must match".
+    pin("DIFFERENT verdicts" in (refuse(make_row, CC_, "P1", "closed",
+                                        "CLOSED 2026-09-07 -- says it in words") or ""),
+        "(5b) status CLOSED + a Trigger that says CLOSED in WORDS but carries no "
+        "closure mark is REFUSED -- the exact row shape that reached HEAD in P64")
+    pin("DIFFERENT verdicts" in (refuse(make_row, CC_, "P1", "open",
+                                        "✅ **CLOSED** -- but the column says open") or ""),
+        "(5c) ... and the OTHER direction too, a closed-looking prose under an OPEN "
+        "column, which no row has done yet and which hides finished work")
+    pin(refuse(make_row, CC_, "P1", "closed", "✅ **CLOSED 2026-09-08** -- agreed") is None,
+        "(5d) CONTROL: closed + closure-marked prose is ACCEPTED")
+    pin(refuse(make_row, CC_, "P1", "open", "🟠 **OPEN** -- agreed") is None,
+        "(5e) CONTROL: open + open-marked prose is ACCEPTED")
+    pin(refuse(make_row, CC_, "P1", "gated", "🟠 **OPEN -- TRIGGER-GATED**") is None,
+        "(5f) CONTROL: GATED beside OPEN prose is ACCEPTED HERE -- this arm owns the "
+        "CLOSED axis only; the open-vs-gated skew is ARM 7's differential and is not "
+        "decidable from one row in isolation")
     # ★ THE ROUND TRIP AS A PROPERTY, not as an escape spelling: read a cell back out,
     # feed it straight in again, and the cell must be identical. That is exactly what
     # `set-anchor` does to every field it was not asked to change.
@@ -908,7 +970,7 @@ def self_test():
     pin("[|]" in _pre,
         "(6d) ...and it names the spelling for a cell that WANTS to show a backslash "
         "before a pipe, so the refusal is not a dead end")
-    pin(bal.split_row(make_row(CC_, "P1", "done", "t"))[C_STATUS].strip()
+    pin(bal.split_row(make_row(CC_, "P1", "done", "✅ **CLOSED** t"))[C_STATUS].strip()
         == STATUS["closed"],
         "(7) `done` is accepted as a spelling of `closed` -- the operator's own word")
 
@@ -960,7 +1022,7 @@ def self_test():
         pin(msg is not None and "already has a row" in msg,
             "(14) --insert over an EXISTING row is REFUSED")
         msg = refuse(place_row, tmp, "done", B_,
-                     make_row(B_, "P1", "closed", "t"), True, report=quiet)
+                     make_row(B_, "P1", "closed", "✅ **CLOSED** t"), True, report=quiet)
         pin(msg is not None and "must be one of" in msg,
             "(15) the archive is never declared as a destination -- it is DERIVED")
 
@@ -1007,7 +1069,7 @@ def self_test():
         box(tmp)
         before = io.open(os.path.join(tmp, REL["production"]), encoding="utf-8").read()
         place_row(tmp, "production", B_,
-                  make_row(B_, "P1", "closed", "t"), write=False, report=quiet)
+                  make_row(B_, "P1", "closed", "✅ **CLOSED** t"), write=False, report=quiet)
         pin(io.open(os.path.join(tmp, REL["production"]), encoding="utf-8").read()
             == before, "(24) a dry run writes nothing at all")
 
@@ -1029,7 +1091,7 @@ def self_test():
 
         globals()["_rewrite"] = _fail_after_first
         try:
-            place_row(tmp, "production", B_, make_row(B_, "P1", "closed", "t"),
+            place_row(tmp, "production", B_, make_row(B_, "P1", "closed", "✅ **CLOSED** t"),
                       write=True, report=quiet)
         except IOError:
             pass

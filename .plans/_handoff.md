@@ -1,19 +1,156 @@
 # DSS Code Prime — HANDOFF
 
 > **REWRITTEN at the end of every cycle** (`/dss-cycle` Step 8.1) and **READ FIRST at the start of
-> every cycle** (Step 0). §1–§4 are a *replacement* — stale lines are deleted, not appended past.
-> **§5 TIMELINE is the sole exception and accumulates.** State is what is true now; the timeline is
-> how it got here.
+> every cycle** (Step 0).
+>
+> **The file is two things.** **§0 is STATE** — a *replacement*, where stale lines are deleted rather
+> than appended past, and where the newest cycle's block leads. **`## 8. TIMELINE` (near the end)
+> ACCUMULATES** and is the sole exception. State is what is true now; the timeline is how it got
+> here. ⚠ This paragraph used to promise §1–§4 and a §5 timeline; ✔MEASURED 2026-09-08, **no such
+> sections exist** — the map in the one paragraph a contextless reader trusts first was describing a
+> shape the file had stopped having.
 >
 > Every claim is labelled ✔**MEASURED** / 📄**DOCUMENTED** / 🧠**INFERRED**. An unlabelled claim here
 > is a defect: this file is read by someone with no context, which is exactly when an unmarked
 > inference does the most damage.
 
-**Last updated:** 2026-09-08 — cycles **P14 … P64**. ⚠ P52 rewrote no handoff at all, so a reader who opened this file during P53 saw P51 described as current state; that entry in §5 was written after the fact and says so.
+## HOW TO ORIENT IN THIS REPOSITORY, IF NOBODY HAS TOLD YOU
+
+⚠ Written 2026-09-08 because the next reader was expected to be **a session with no memory, on a
+different account**. Nothing outside this repository is guaranteed to reach you; everything named
+below is IN it.
+
+**The authority chain, in order.** Later entries never override earlier ones.
+
+1. **This file, §0.** What is true right now, and what is owed. Rewritten every cycle.
+2. **`.plans/_deferred-anchor-registry-production.md`** — the open defects a USER of the compiler
+   could hit. **This is the priority, always.**
+3. **`.plans/_deferred-anchor-registry-harness.md`** — the open defects only WE can hit (tests,
+   gates, scripts, carriages). A RECORD, not a backlog: drained by encounter, never scheduled.
+4. **`.plans/_deferred-anchor-registry-done.md`** — the archive. **Nothing here is work.**
+   ⚠ Closing a row MOVES it between these files. It is never marked in place.
+   ⛔ **Never hand-edit or hand-read a row.** `scripts/anchors/{write,set,read}-anchor` is the only
+   door, and `read-anchor <ID> --json` the only sanctioned reader — the raw table line stores every
+   `|` escaped, and reading it raw hands the escape back doubled.
+5. **`.claude/skills/dss-cycle/SKILL.md`** — the operator's standing rulings, in force, verbatim,
+   with the measurements that produced them. **Read it before deciding anything about scope, about
+   what counts as done, or about what the reference compilers are evidence FOR.**
+6. **`.claude/skills/dss-code-prime/SKILL.md`** — conventions; it wins on any conflict about those.
+7. **`git log`** — DEMOTED. PR #56 was squashed and the P45–P52 messages are unrecoverable, which is
+   the argument for putting substance in the ROWS rather than in commit messages.
+
+**The three things that will bite you first.**
+- ⛔ **Never `git stash` / `git checkout --` / `git clean` / `git reset`** — a concurrent governance
+  workstream shares this tree. Stage by explicit path; never `git add -A`. Every commit `-s` (DCO).
+- ★★ **Never re-quote a figure from this file — RE-MEASURE it** at the commit that carries it. Every
+  claim here is labelled ✔MEASURED / 📄DOCUMENTED / 🧠INFERRED; an unlabelled claim is a defect.
+- ⚠ **A row's status can be right while the prose keeping it open has gone false**, and its
+  prescribed REMEDY decays fastest of all. Measure the mechanism before implementing what a row
+  tells you to implement.
+
+---
+
+**Last updated:** 2026-09-08 — cycles **P14 … P64**. ⛔ **P64 IS NOT FINISHED: its commit is unpushed, three carriage legs are red against it, and lane `ea` is unfolded. READ §0.0 BEFORE ANYTHING ELSE.** ⚠ P52 rewrote no handoff at all, so a reader who opened this file during P53 saw P51 described as current state; that entry in §5 was written after the fact and says so.
 
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
+
+## ⛔ §0.0 — STOP: THE TREE IS **MID-FLIGHT**. NOTHING BELOW THIS BLOCK IS A STARTING POINT.
+
+**P64's commit exists, is NOT PUSHED, THREE carriage legs are RED against it, and one lane is still
+unfolded in a worktree.** A cycle normally hands over a clean, pushed, all-legs-green tree. This one
+does not. Every count in §0.1 onward was taken BEFORE the legs ran, and describes the COMMIT rather
+than the verified state of the branch.
+
+✔**MEASURED 2026-09-08. Re-derive every line of it before acting — this table is the thing here most
+likely to be stale by the time you read it.**
+
+| fact | value | how to re-derive |
+|---|---|---|
+| branch | `feature/c23-conformance-burndown-6` | `git status -sb` |
+| HEAD | `0dde6a8f` — *"Cycle P64: code with no consumer was never validated…"* | `git log --oneline -1` |
+| pushed? | **NO — `ahead 1` of `origin/`** | `git status -sb` |
+| registry OPEN | **451** = production **264** + harness **187** (the sum IS the cross-check) | `python scripts/check-anchor-balance/check-anchor-balance.py --breakdown --denominator registry` |
+| lane worktrees | `.worktrees/{at,cy,el,hx,pe}` are **SPENT** · `.worktrees/ea` is **NOT** | `git worktree list` |
+
+### ★★★ THE FIVE THINGS OWED, IN ORDER. DO NOT REORDER 1 AND 3.
+
+**1. FOLD LANE `ea` INTO THE MAIN TREE.** ✔It is based on `0dde6a8f`, its work is complete, and it was
+   **never folded**. Six paths: `src/link/format/elf.cpp`, `src/link/format/exec_data_section.hpp`,
+   `tests/link/CMakeLists.txt`, the NEW `tests/link/test_elf_image_overaligned_section_placement.cpp`,
+   and both files of `examples/c/alignment_overaligned_static_placed/`.
+   It closes **`D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET`** (born ✅ CLOSED in
+   the lane, suggested **P1**) — read that row FIRST; it carries the measurement.
+   ⚠ **The row lives in the LANE's worktree, not in the main tree's registry.** Apply it at fold time
+   or the fix reads as *closed 0, opened 0* — i.e. as no fix at all.
+   ⓘ `git -C .worktrees/ea diff 0dde6a8f` shows the change; the UNTRACKED test file is not in that
+   diff and must be copied separately.
+   ⓘ Items `ea` reported but did NOT take, and which nobody has since: `pe.cpp` and `macho*.cpp` share
+   the same `va == base + offset` identity and the same segment-promise concept and **neither was
+   read**; and `byte_emit.hpp`'s `alignUp` comment is false as written.
+
+**2. FIX `run_gate_guard` ON NON-WINDOWS HOSTS — it is one of the three reds, and it is NOT a tree
+   defect.** `scripts/run-gate/test-run-gate.sh` drives BOTH twins; `powershell` does not exist on
+   Linux or macOS, so every `.ps1` arm returns **127** and the parity arm reports `.sh=3 vs .ps1=127`.
+   **The fix:** probe for a working PowerShell **BY EXECUTION** (`command -v` is documented to lie over
+   ssh on the macOS carriage), and where there is none report the `.ps1` arms as **NOT APPLICABLE ON
+   THIS HOST**, naming them and the reason — never a silent skip, never a failure.
+   ⚠ **State the reach in the guard's own text:** the escape is taken on **2 of 3** carriages, so
+   **only the Windows leg proves twin parity**. That is a real limitation and belongs in the guard,
+   not in a commit message.
+   ★ **THE PROCESS FINDING IS THE BIGGER ONE.** That guard shipped in **P63 wave 2**, which was
+   committed **after** the carriage legs ran — so the Linux leg met it for the first time one cycle
+   late. **A wave-2 commit that skips the leg matrix defers its own verification to whoever runs the
+   matrix next.** Fix the cadence, not just the guard.
+
+**3. RE-RUN ALL THREE CARRIAGE LEGS — AFTER 1 AND 2, NEVER BEFORE.** ✔The three reds, measured against
+   `0dde6a8f`:
+
+   | leg | red | invoke |
+   |---|---|---|
+   | WSL x86_64 | `run_gate_guard` · `examples/c/alignment_overaligned_static_placed` | `wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage wsl` |
+   | macOS | `link/test_elf_build_id_note` | `wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage macos` |
+   | arm64 VPS | `integrated_tests/c/…` **and** `examples/c/…` `alignment_overaligned_static_placed` | `wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage arm64-vps` |
+
+   ★★ **THE macOS RED IS THE INTERESTING ONE, AND ITS DIAGNOSIS MATTERS MORE THAN ITS FAILURE.**
+   `ElfBuildIdNote.TwoDistinctImagesGetDistinctIds` builds two images from **different code**
+   (`nop nop ret` vs `nop nop nop ret`) and gets the **SAME** descriptor. The bytes the failure prints
+   are not a hash — `02 00 3E 00 01 00 00 00 / 00 10 40 00 …` is the **ELF header** (`e_type=ET_EXEC`,
+   `e_machine=EM_X86_64`, `e_entry=0x401000`, `e_phoff=0x40`), read at image offset 16, which means
+   `note.offset` resolved to **0**: `descriptorOf` is reading the file header, not the note descriptor.
+   ★★ **AND IT IS A CROSS-COMPILE TEST** — it builds an ELF image in memory and never spawns
+   anything, so **the host should be irrelevant**, and it is not. That is the finding, not the red.
+   ⚠⚠ **IT ALMOST CERTAINLY PASSES ON WINDOWS FOR THE WRONG REASON.** If `descriptorOf` reads the
+   header on every host, the two headers must have DIFFERED on Windows (e.g. `e_entry` shifted by the
+   extra instruction byte) and `EXPECT_NE` passed **by luck**; on macOS they are identical and the
+   luck ran out. ⇒ **A green on Windows is not evidence this property holds anywhere.**
+   ⓘ Siblings `TheDescriptorIsDerivedFromTheImageItIdentifies` and
+   `RebuildingTheSameModuleReproducesTheSameId` PASS on macOS, which argues `descriptorOf` is NOT
+   simply broken — so **do not assume the helper; measure where `note.offset` actually lands in each
+   of the four tests.** The failing one is the only test that encodes **two different byte vectors**.
+   ⛔ **Do NOT fix it by loosening the assertion.** *"Two distinct images get distinct ids"* is the
+   entire point of a build id; an id that does not move identifies nothing.
+   ★ **MEASURE IT AFTER THE `ea` FOLD, NOT BEFORE.** `ea` fixes ELF section placement and this failure
+   is a section-offset symptom. If it disappears, a lane dispatched now would have been work against a
+   symptom of a bug already fixed. If it survives the fold, it is genuinely separate and earns its own
+   lane with a far sharper question.
+
+**4. PUSH — ONLY ONCE ALL THREE LEGS ARE GREEN.** The Windows leg was ✔**2131/2131 rc 0** at
+   `0dde6a8f`; the other three had never run against it. PR #57 is the destination.
+
+**5. CLEAN UP THE SIX LANE WORKTREES** — `at cy ea el hx pe`. Five are spent; `ea` only after step 1.
+   ⮕ `scripts/lane-worktree/lane-worktree.sh remove <name>`.
+
+ⓘ A longer form of items 1–3 was written to `.temp/p64-OWED-after-ea.md`. **`.temp/` is gitignored, so
+it does NOT travel to another machine or another account** — which is exactly why the substance is
+inlined above rather than cited. If that file is missing, nothing has been lost.
+
+⚠ **ONE HOST FACT THAT WILL COST YOU AN HOUR IF YOU MEET IT COLD:** from **Git Bash (MSYS)** a
+PARALLEL `ctest` dies part-way through with no test ever reporting a failure (measured at 8, 83, 271
+and 612 of 2131). `run-gate.sh` now REFUSES that combination up front with **exit 4**. Run the
+Windows suite from **PowerShell**, or serially. See §0.2 item 1.
+
 
 **Cycle P64 closed 2026-09-08.** **FIVE lanes, four independent reviews and three remediations**, on
 top of P63 (`cd1331eb`). **Every lane was independently reviewed; every review found a real defect, and
@@ -153,6 +290,9 @@ misread our tree in their favour, which is worth remembering when reading any ex
 
 ## §0.5 — WHAT P65 INHERITS, IN PRIORITY ORDER
 
+⚠ **This list is the NEXT WORK. It is not the FIRST work.** §0.0's five owed items come first, and
+until they are done P64 is not finished and none of this is safely startable.
+
 1. **`@loc` spans are in PREPROCESSOR-SYNTHESIZED coordinates, not origin** — labelled
    `synthesized from N`, not remapped. This is the last partial in the omega contract (their item 5).
    ✔Scoped by lane `hx`: the remap closure and its `LineMap` are already on the finished CU but
@@ -172,6 +312,51 @@ misread our tree in their favour, which is worth remembering when reading any ex
    the ROW must now stand on dyld's own behaviour or fall. macOS is up.
 6. **The line-endings hang** (§0.3) — the remaining lead is a blocked pipe under ctest's own output
    capture, which a file redirect can never reproduce.
+
+## §0.6 — WAVE 3 (2026-09-08, main tree, no lane): THE WRITER COULD MINT WHAT THE GATE REFUSES
+
+Found while re-deriving the registry count **for this handoff** — the count could not be stated
+honestly until it was resolved, which is the *fix a harness defect the moment it blocks you* rule
+doing its job rather than a scheduled item.
+
+**`D-ANCHORS-WRITER-MINTS-A-ROW-WHOSE-TWO-VERDICT-CELLS-DISAGREE` ✅ (P2, harness).**
+`check-anchor-balance` **FAILED at `0dde6a8f`** on three rows P64 itself had minted: `Status = CLOSED`
+beside a Trigger opening with the bare WORD `CLOSED` and no closure mark. **The gate that refuses the
+contradiction already existed; nothing consulted it at the moment of WRITING**, so the only way to
+learn a row was malformed was to run the gate after the row had already landed in a commit.
+★ `is_closed` is a LEADING-POSITION test, so *says CLOSED in words* and *reads CLOSED* are two
+different facts — and only the gate knew that. ✔1712 of 1715 archived rows lead the Trigger with the
+closure mark; the three exceptions were minted the same day by the same author.
+⇒ `make_row` — the ONE assembler both `write-anchor` and `set-anchor` route through — now splits
+its own product back and REFUSES when `is_closed(Status) != is_closed(Trigger)`, asking through the
+**gate's own predicate on the gate's own cells** so the writer and ARM 6 cannot drift apart about what
+a contradiction is. **No escape, deliberately** — an opt-out here would be taken by every row that
+trips it. Pinned by anchors self-test arms (5b)/(5c), *both* directions, with (5d)/(5e)/(5f) as
+CONTROLS; **(5f) is the one that proves the rule is the CLOSED axis and not *the two cells must
+match***. Four pre-existing fixtures that paired a closed status with a bare trigger were corrected to
+lead with the mark; each one's subject (pipe escaping, the `done` alias, move-on-close routing) is
+untouched.
+⚠ **A second, smaller lie in the same instrument — and it fails toward ALARM, not toward clean:**
+the mismarked-closure DEBT line asserted *"Each counts OPEN, so the population is OVER-reported"*.
+✔MEASURED: those three six-cell rows sat in that DEBT list while the registry read **451** open, and
+repairing them left it at **451**. The sentence is true only of the FOUR-cell shape, where the prose
+IS the status cell. It is now conditioned on actual open-membership and says which rows do and do not
+skew the count.
+ⓘ That reporting TEXT is **not pinned** — `self_test` pins `scan_document`, not `main()`'s printing.
+Stated rather than quietly assumed.
+
+**AND `root_litter_guard` WAS GREEN OVER A DIRTY ROOT FOR A WHOLE DAY.** It shipped in P64 seeing only
+the UNTRACKED half, while the root held **seven `*.obj` files** from a probe run days earlier that
+`.gitignore` covers — plus a directory literally named `C:` holding seven empty directories, a Windows
+path that reached a POSIX `mkdir -p`. Both are caught now: `--ignored=matching` in the git query, and a
+**shape** arm refusing any root entry whose name contains `:` or a backslash.
+★ **Widened on MEASUREMENT, not instinct.** The ignored-at-depth-1 set was **7 entries, all `.obj`
+spill, ZERO legitimate** ⇒ no allowlist is owed. Directories stay excluded for the OPPOSITE reason:
+every ignored root directory (`.kilo/ .secrets/ .temp/ .worktrees/ build/ scratchpad/`) is legitimate,
+so a directory rule would need an allowlist — *an escape every subject takes*. The one bad directory
+ever seen is caught by name SHAPE instead.
+⇒ **The same shape as everything else in P64: an instrument answering a narrower question than the
+one you think you asked.**
 
 ---
 

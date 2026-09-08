@@ -2692,11 +2692,32 @@ def main():
         print("anchor-balance: DEBT - %d row(s) open with a CLOSURE VERDICT while their "
               "marker says otherwise (pre-existing at %s, not this cycle's doing):"
               % (len(old_mismarked), args.base))
+        # ⚠ THE CLAIM IS CONDITIONED, BECAUSE ONE SENTENCE DESCRIBED TWO SHAPES AND
+        # WAS TRUE OF ONLY ONE. In the FOUR-cell shape the prose IS the status cell, so a
+        # closure verdict under a non-closure marker genuinely counts OPEN and the
+        # population really is inflated. In the SIX-cell registry shape `Status` decides
+        # and the prose glyph moves nothing -- the row is counted CLOSED and the only
+        # defect is that two cells disagree, which ARM 6 refuses on its own terms.
+        # ✔MEASURED 2026-09-08: three six-cell rows sat here while the registry read
+        # 451 open; repairing their prose left the count at 451, exactly as this split
+        # now predicts. An instrument that overstates its own skew teaches a later cycle
+        # to distrust a number that was right. (This reporting TEXT is not pinned by
+        # self_test, which pins `scan_document` rather than main()'s printing -- stated
+        # rather than quietly assumed.)
+        counted = [k for k in old_mismarked if k in after.rows]
         for k in old_mismarked:
-            print("  ~ %s   %s" % (k, after.mismarked[k]))
-        print("  Each counts OPEN, so the population is OVER-reported until the mark is "
-              "repaired with the net-neutral bookkeeping pair or the opening verdict is "
-              "reworded.")
+            print("  ~ %s%s   %s"
+                  % (k, "" if k in after.rows else "  [Status column already reads CLOSED]",
+                     after.mismarked[k]))
+        if counted:
+            print("  %d of them COUNT OPEN, so the population is OVER-reported by that "
+                  "many until the mark is repaired with the net-neutral bookkeeping pair "
+                  "or the opening verdict is reworded." % len(counted))
+        if len(counted) != len(old_mismarked):
+            print("  %d carry a `Status` column that already reads CLOSED, so they are "
+                  "counted CLOSED and the population is NOT skewed by them; reword the "
+                  "opening verdict so the two cells stop disagreeing."
+                  % (len(old_mismarked) - len(counted)))
 
     # == ARM 3: A GATED ROW MUST NAME THE ROW THAT OPENS IT ====================
     # Operator ruling 2026-08-23. Differential for the same reason as arm 2 -- and

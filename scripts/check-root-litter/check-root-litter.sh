@@ -58,15 +58,41 @@ git -C "$_root" rev-parse --git-dir >/dev/null 2>&1 || {
 # clean, on a supported host, written by someone whose whole cycle was about that
 # class. `bash -n` cannot see it; only that guard can.
 # ⇒ A `while read` loop over a pipeline is bash-3.2 clean and needs no version gate.
+#
+# ⚠⚠ `--ignored=matching` IS LOAD-BEARING, AND ITS ABSENCE WAS A REAL HOLE.
+# ✔MEASURED 2026-09-08, the day after this guard shipped: the root held SEVEN
+# `*.obj` files from a probe run days earlier, and this guard was GREEN through
+# every one of them — because `.gitignore` carries `*.obj` (for `build/**`), so
+# `git status` never listed them as untracked. **Ignored junk is still junk**, and
+# a guard that only sees the untracked half reports a clean root over a dirty one.
+# ⇒ Measured before widening, so this is not a guess: the ignored-at-depth-1 set
+#   was **7 entries, all `.obj` spill, ZERO legitimate**. There is no allowlist and
+#   none is owed — real work never lands loose at the root.
+#   ⓘ DIRECTORIES are still excluded, and there the reasoning inverts: the ignored
+#   root directories are `.kilo/ .secrets/ .temp/ .worktrees/ build/ scratchpad/`,
+#   every one legitimate, so a directory rule would need an allowlist — an escape
+#   every subject takes. The one bad directory ever seen is caught by SHAPE below.
 _litter=()
 while IFS= read -r _p; do
     [ -n "$_p" ] && _litter+=("$_p")
 done < <(
-    git -C "$_root" status --porcelain=v1 --untracked-files=normal 2>/dev/null \
-    | sed -n 's/^?? //p' \
+    git -C "$_root" status --porcelain=v1 --untracked-files=normal --ignored=matching 2>/dev/null \
+    | sed -n -e 's/^?? //p' -e 's/^!! //p' \
     | grep -vE '/' \
-    | LC_ALL=C sort
+    | LC_ALL=C sort -u
 )
+
+# ★ AND A SECOND, SHAPE-BASED ARM — no allowlist, so no escape.
+# ✔MEASURED the same day: the root held a DIRECTORY literally named `C:`, holding
+# `Users/rafae/AppData/Local/Temp/claude` — seven empty directories, zero files. A
+# Windows path reached a POSIX `mkdir -p`, which is the quoting-trap class this
+# repository has already been burned by. A name carrying `:` or `\` is never a
+# legitimate entry in this tree on any platform, so this needs no exceptions.
+while IFS= read -r _p; do
+    case "$_p" in
+        *:*|*\\*) _litter+=("$_p  ← a Windows path leaked into a POSIX command") ;;
+    esac
+done < <(ls -1 "$_root" 2>/dev/null)
 
 if [ "${#_litter[@]}" -eq 0 ]; then
     echo "check-root-litter: OK -- no untracked files at the root of $_root"
