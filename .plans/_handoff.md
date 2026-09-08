@@ -69,8 +69,9 @@ likely to be stale by the time you read it.**
 | fact | value | how to re-derive |
 |---|---|---|
 | branch | `feature/c23-conformance-burndown-6` | `git status -sb` |
-| HEAD | `0dde6a8f` — *"Cycle P64: code with no consumer was never validated…"* | `git log --oneline -1` |
-| pushed? | **NO — `ahead 1` of `origin/`** | `git status -sb` |
+| HEAD | ⚠ **not named here, deliberately** — the commit carrying this table moves HEAD past any sha the table could state, so this line would be false the instant it was written | `git log --oneline -3` |
+| the commit the LEGS were measured against | **`0dde6a8f`** — *"Cycle P64: code with no consumer was never validated…"*. This one does NOT move when the handoff is edited, which is why it is the sha worth writing down | `git log --oneline` |
+| pushed? | **NO — the branch is AHEAD of `origin/`.** ⚠ Re-derive the count; every handoff edit adds one | `git status -sb` |
 | registry OPEN | **451** = production **264** + harness **187** (the sum IS the cross-check) | `python scripts/check-anchor-balance/check-anchor-balance.py --breakdown --denominator registry` |
 | lane worktrees | `.worktrees/{at,cy,el,hx,pe}` are **SPENT** · `.worktrees/ea` is **NOT** | `git worktree list` |
 
@@ -137,7 +138,11 @@ likely to be stale by the time you read it.**
    lane with a far sharper question.
 
 **4. PUSH — ONLY ONCE ALL THREE LEGS ARE GREEN.** The Windows leg was ✔**2131/2131 rc 0** at
-   `0dde6a8f`; the other three had never run against it. PR #57 is the destination.
+   `0dde6a8f`; the other three had never run against it. PR #57 is the destination. Push the WHOLE
+   branch, not one commit: wave 3 (the handoff and the anchor-writer refusal) sits on top of it and
+   is ✔30/30 repo-guard green on Windows but has had **no carriage leg of its own** — it touches no
+   `src/`, so the legs are unchanged by it, and that reasoning is worth exactly as much as the
+   sentence saying so until a leg agrees.
 
 **5. CLEAN UP THE SIX LANE WORKTREES** — `at cy ea el hx pe`. Five are spent; `ea` only after step 1.
    ⮕ `scripts/lane-worktree/lane-worktree.sh remove <name>`.
