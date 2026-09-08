@@ -142,6 +142,26 @@ struct Shdr {
     }
     return nullptr;
 }
+// ⚠⚠ THE RVALUE OVERLOAD IS DELETED, AND THIS IS THE THIRD TIME THIS REPOSITORY
+// HAS PAID FOR THE CLASS. `find(readSections(img), name)` returns a pointer INTO A
+// TEMPORARY that dies at the end of the full expression, so every later `*note`
+// reads freed memory. ✔MEASURED 2026-09-08 on the macOS carriage: two images built
+// from DIFFERENT code both read `note->offset == 0`, so `descriptorOf` returned
+// bytes 16..47 of the image — the ELF header (`e_type=2`, `e_machine=0x3E`,
+// `e_entry=0x401000`, `e_phoff=0x40`) — identically for both, and
+// `TwoDistinctImagesGetDistinctIds` failed. On Linux and Windows the freed bytes
+// still held the old header, so the SAME undefined behaviour passed on two of three
+// carriages.
+// ★★ AND THE SIBLING TEST PASSED **VACUOUSLY**: `RebuildingTheSameModuleReproduces-
+// TheSameId` asserts EQUALITY, and two dangling reads that both land on offset 0 are
+// equal. It was green on every host while proving nothing. A test that cannot fail is
+// worse than one that does.
+// ⇒ Both prior occurrences (`D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE`, and the
+// `named(arrayOf(...), ...)` copy in `tests/ffi/test_pe_abort_behavior_binding.cpp`)
+// were fixed by ADOPTING THE NAMED-LOCAL CONVENTION. A convention has no teeth at the
+// moment of the decision, which is exactly why the class came back. This deletion
+// makes the mistake a COMPILE ERROR instead: bind the sections to a named local first.
+Shdr const* find(std::vector<Shdr>&&, std::string const&) = delete;
 
 [[nodiscard]] std::size_t countNoteSections(std::vector<std::uint8_t> const& b) {
     std::size_t n = 0;
@@ -345,10 +365,15 @@ TEST(ElfBuildIdNote, RebuildingTheSameModuleReproducesTheSameId) {
         << "the whole image must be byte-identical across two encodes — a "
            "non-reproducible build id would make every release artifact differ "
            "from itself";
-    auto const* na = find(readSections(a), kNoteName);
-    auto const* nb = find(readSections(b), kNoteName);
+    auto const sa = readSections(a);
+    auto const sb = readSections(b);
+    auto const* na = find(sa, kNoteName);
+    auto const* nb = find(sb, kNoteName);
     ASSERT_NE(na, nullptr);
     ASSERT_NE(nb, nullptr);
+    // ⚠ Until 2026-09-08 both pointers dangled, so this EXPECT_EQ compared two reads
+    // of freed memory and passed for that reason on every host. See the deleted
+    // rvalue overload of `find`.
     EXPECT_EQ(descriptorOf(a, *na), descriptorOf(b, *nb));
 }
 
@@ -361,8 +386,10 @@ TEST(ElfBuildIdNote, TwoDistinctImagesGetDistinctIds) {
     auto const b = encodeTrivial({0x90, 0x90, 0x90, 0xC3}, loaded);
     ASSERT_FALSE(a.empty());
     ASSERT_FALSE(b.empty());
-    auto const* na = find(readSections(a), kNoteName);
-    auto const* nb = find(readSections(b), kNoteName);
+    auto const sa = readSections(a);
+    auto const sb = readSections(b);
+    auto const* na = find(sa, kNoteName);
+    auto const* nb = find(sb, kNoteName);
     ASSERT_NE(na, nullptr);
     ASSERT_NE(nb, nullptr);
     EXPECT_NE(descriptorOf(a, *na), descriptorOf(b, *nb))
@@ -389,7 +416,8 @@ TEST(ElfBuildIdNote, AFormatDeclaringNoNoteRowEmitsNoNote) {
            "`-Wl,--build-id=none` arm both references offer, and it is what "
            "makes presence a per-link policy rather than a constant in the "
            "walker";
-    EXPECT_EQ(find(readSections(without), kNoteName), nullptr);
+    auto const withoutSections = readSections(without);
+    EXPECT_EQ(find(withoutSections, kNoteName), nullptr);
     EXPECT_LT(without.size(), withNote.size())
         << "the note's bytes must actually be gone, not merely unnamed";
     EXPECT_EQ(readU16(without, 60) + 1u, readU16(withNote, 60))

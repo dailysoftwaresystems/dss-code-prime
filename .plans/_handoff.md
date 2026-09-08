@@ -111,31 +111,26 @@ likely to be stale by the time you read it.**
    | leg | red | invoke |
    |---|---|---|
    | WSL x86_64 | `run_gate_guard` · `examples/c/alignment_overaligned_static_placed` | `wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage wsl` |
-   | macOS | `link/test_elf_build_id_note` | `wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage macos` |
+   | macOS | `link/test_elf_build_id_note` — ✅ **FIXED in wave 4**, re-run to confirm nothing else is red | `wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage macos` |
    | arm64 VPS | `integrated_tests/c/…` **and** `examples/c/…` `alignment_overaligned_static_placed` | `wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage arm64-vps` |
 
-   ★★ **THE macOS RED IS THE INTERESTING ONE, AND ITS DIAGNOSIS MATTERS MORE THAN ITS FAILURE.**
-   `ElfBuildIdNote.TwoDistinctImagesGetDistinctIds` builds two images from **different code**
-   (`nop nop ret` vs `nop nop nop ret`) and gets the **SAME** descriptor. The bytes the failure prints
-   are not a hash — `02 00 3E 00 01 00 00 00 / 00 10 40 00 …` is the **ELF header** (`e_type=ET_EXEC`,
-   `e_machine=EM_X86_64`, `e_entry=0x401000`, `e_phoff=0x40`), read at image offset 16, which means
-   `note.offset` resolved to **0**: `descriptorOf` is reading the file header, not the note descriptor.
-   ★★ **AND IT IS A CROSS-COMPILE TEST** — it builds an ELF image in memory and never spawns
-   anything, so **the host should be irrelevant**, and it is not. That is the finding, not the red.
-   ⚠⚠ **IT ALMOST CERTAINLY PASSES ON WINDOWS FOR THE WRONG REASON.** If `descriptorOf` reads the
-   header on every host, the two headers must have DIFFERED on Windows (e.g. `e_entry` shifted by the
-   extra instruction byte) and `EXPECT_NE` passed **by luck**; on macOS they are identical and the
-   luck ran out. ⇒ **A green on Windows is not evidence this property holds anywhere.**
-   ⓘ Siblings `TheDescriptorIsDerivedFromTheImageItIdentifies` and
-   `RebuildingTheSameModuleReproducesTheSameId` PASS on macOS, which argues `descriptorOf` is NOT
-   simply broken — so **do not assume the helper; measure where `note.offset` actually lands in each
-   of the four tests.** The failing one is the only test that encodes **two different byte vectors**.
-   ⛔ **Do NOT fix it by loosening the assertion.** *"Two distinct images get distinct ids"* is the
-   entire point of a build id; an id that does not move identifies nothing.
-   ★ **MEASURE IT AFTER THE `ea` FOLD, NOT BEFORE.** `ea` fixes ELF section placement and this failure
-   is a section-offset symptom. If it disappears, a lane dispatched now would have been work against a
-   symptom of a bug already fixed. If it survives the fold, it is genuinely separate and earns its own
-   lane with a far sharper question.
+   ✅ **THE macOS RED IS CLOSED — see `D-TEST-ELF-BUILD-ID-SECTION-POINTER-INTO-A-DESTROYED-TEMPORARY`
+   (P64 wave 4).** It was **a dangling pointer in the TEST**, not a defect in the emitter and not a
+   defect in the build id. `find(readSections(a), kNoteName)` returns a pointer INTO the vector
+   `readSections` returned BY VALUE, which dies at the end of the full expression, so `note->offset`
+   read freed memory — **0 on macOS**, which made `descriptorOf` fetch image bytes 16..47, the ELF
+   header. On Windows and Linux the freed bytes still held the old values, so **the same undefined
+   behaviour passed on two of three carriages.** ★★ And its sibling
+   `RebuildingTheSameModuleReproducesTheSameId` carried the identical pattern while asserting
+   EQUALITY — two dangling reads both landing on 0 are equal — so it was **green on every host while
+   proving nothing.** Fixed by DELETING `find`'s rvalue overload, which makes the mistake a compile
+   error; this was the THIRD occurrence of the class in this tree and the first two were both fixed
+   by *adopting a convention*.
+   ⛔ **MY OWN PRESCRIBED REMEDY FOR THIS RED WAS REFUTED ONE DAY AFTER I WROTE IT.** This block used
+   to say *"measure it after the `ea` fold — it may be a section-offset symptom"*. `ea` is irrelevant
+   to it. That instruction was written from the failure BYTES without reading the CALL SITES, which
+   is [[feedback-a-rows-prescribed-remedy-decays-fastest]] with the ink still wet. **The remaining
+   macOS obligation is a FULL leg, not this test.**
 
 **4. PUSH — ONLY ONCE ALL THREE LEGS ARE GREEN.** The Windows leg was ✔**2131/2131 rc 0** at
    `0dde6a8f`; the other three had never run against it. PR #57 is the destination. Push the WHOLE
@@ -362,6 +357,35 @@ so a directory rule would need an allowlist — *an escape every subject takes*.
 ever seen is caught by name SHAPE instead.
 ⇒ **The same shape as everything else in P64: an instrument answering a narrower question than the
 one you think you asked.**
+
+## §0.7 — WAVE 4 (2026-09-08, main tree, no lane): THE macOS RED WAS UNDEFINED BEHAVIOUR IN THE TEST
+
+**`D-TEST-ELF-BUILD-ID-SECTION-POINTER-INTO-A-DESTROYED-TEMPORARY` ✅ (P2, harness).** Prompted by a
+direct question — *"were the elf headers fixed cross compile? what about the guid id?"* — whose honest
+answer turned out to be **neither was ever broken**.
+
+`tests/link/test_elf_build_id_note.cpp` bound four section-header pointers into a vector
+`readSections` returned BY VALUE, which dies at the end of the full expression. Every later
+`note->offset` read freed memory: **0** on macOS, so `descriptorOf` fetched image bytes 16..47 — the
+ELF header — identically for two images built from different code, and
+`TwoDistinctImagesGetDistinctIds` failed. On Windows and Linux the freed bytes still held the old
+values, so **the same UB passed on two of three carriages**.
+★★ **AND THE SIBLING WAS PASSING VACUOUSLY EVERYWHERE.**
+`RebuildingTheSameModuleReproducesTheSameId` has the identical dangling pattern and asserts
+EQUALITY — two dangling reads that both land on 0 are equal — so it was green on every host while
+proving nothing. **No gate anywhere could see that one.**
+ⓘ The emitter and the build id were correct throughout:
+`TheDescriptorIsDerivedFromTheImageItIdentifies` re-derives SHA-256 over the zeroed image and
+**passes on macOS**. The three tests that bind `auto const sections = ...` to a named local all pass.
+The binding was the entire difference.
+⇒ Fixed by `= delete`ing `find`'s rvalue overload, so the mistake is a COMPILE ERROR.
+★ **THIS WAS THE THIRD OCCURRENCE OF THE CLASS**, after
+`D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE` and the `named(arrayOf(...))` copy in
+`tests/ffi/test_pe_abort_behavior_binding.cpp` — **both previously fixed by adopting the named-local
+CONVENTION**, in a file whose author had the citation in front of them. A convention has no teeth at
+the moment of the decision; a deleted overload does.
+⚠ **No escape:** the one call site that was genuinely safe was converted too, because an escape *for
+the spellings that happen to be safe* is one every later reader must re-derive per site.
 
 ---
 
