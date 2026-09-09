@@ -3430,7 +3430,9 @@ TEST(SynthThreadsShim, ThrdExitConvertsExplicitlyToEachVehiclesExitParameterType
         ASSERT_EQ(conv.size(), 1u);
         EXPECT_EQ(mir.instOpcode(conv[0]), MirOpcode::Arg)
             << "the converted value is thrd_exit's own parameter";
-        EXPECT_EQ(mir.argIndex(conv[0]), 0u);
+        // `try*`: the EXPECT above is non-fatal, so a non-Arg here would fall
+        // through into an aborting read [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]].
+        EXPECT_EQ(mir.tryArgIndex(conv[0]), 0u);
         EXPECT_EQ(in.kind(mir.instType(conv[0])), TypeKind::I32)
             << "thrd_exit's declared parameter stays SIGNED int (C11 7.26.5.5) — the fix is "
                "a conversion at the call, never a re-signed Arg";
@@ -4503,37 +4505,50 @@ std::uint32_t countOpcodeIn(Mir const& mir, MirFuncId fn, MirOpcode op) {
 
 // ── SINGLE-SLOT IDENTITY PROBES ─────────────────────────────────────────────────────
 // Each answers "does THIS operand slot hold THAT value" and reports what it found
-// instead. They check the opcode FIRST and only then read the opcode-specific payload,
-// because `Mir::argIndex` / `Mir::constLiteralIndex` / `Mir::instPayload` abort LOUD on
-// a wrong opcode: a plain `EXPECT_EQ(opcode, …)` followed by a payload read would take
-// the whole test binary down on the first mismatch instead of failing one assertion and
-// letting the remaining slots report too.
+// instead. A plain `EXPECT_EQ(opcode, …)` followed by a payload read would take the
+// whole test binary down on the first mismatch — `EXPECT` records and falls THROUGH,
+// straight into an accessor that aborts — instead of failing one assertion and letting
+// the remaining slots report too. These probes exist to avoid that.
+//
+// ★ THEY NOW ASK THROUGH THE `try*` TWINS RATHER THAN HAND-ROLLING THE OPCODE TEST
+// [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]]. Same guarantee, one mechanism, and the
+// twin cannot drift from its aborting sibling because it delegates to it.
+//
+// ⚠ CORRECTED HERE: this block used to name `Mir::instPayload` among the accessors
+// that "abort LOUD on a wrong opcode". It does NOT — `instPayload` is the RAW payload
+// reader (`instArena_.at(id).payload`), bounds- and provenance-checked but with no
+// opcode test at all, so it has no `try*` twin and needs none. `isVaLeaf` below still
+// tests the opcode first, but for the OPPOSITE reason: a raw read on the wrong opcode
+// yields a meaningless NUMBER rather than a crash, which is the quieter failure.
 
 testing::AssertionResult isArg(Mir const& mir, MirInstId op, std::uint32_t ordinal) {
-    if (mir.instOpcode(op) != MirOpcode::Arg)
+    auto const idx = mir.tryArgIndex(op);
+    if (!idx.has_value())
         return testing::AssertionFailure()
                << "slot holds opcode #" << static_cast<int>(mir.instOpcode(op))
                << ", not the parameter `Arg " << ordinal << "`";
-    if (mir.argIndex(op) != ordinal)
+    if (*idx != ordinal)
         return testing::AssertionFailure()
-               << "slot holds parameter `Arg " << mir.argIndex(op) << "`, want `Arg "
+               << "slot holds parameter `Arg " << *idx << "`, want `Arg "
                << ordinal << "` — the arm forwarded the WRONG PARAMETER into this slot "
                              "(a transposition; both are pointers, so no type check "
                              "anywhere can see it)";
-    if (mir.argPosition(op) != ordinal)
+    auto const pos = mir.tryArgPosition(op);
+    if (pos != ordinal)
         return testing::AssertionFailure()
                << "`Arg " << ordinal << "` records flat call-operand position "
-               << mir.argPosition(op);
+               << pos.value_or(0);
     return testing::AssertionSuccess();
 }
 
 testing::AssertionResult isIntConst(Mir const& mir, MirInstId op, std::int64_t want,
                                     TypeKind wantCore) {
-    if (mir.instOpcode(op) != MirOpcode::Const)
+    auto const litIdx = mir.tryConstLiteralIndex(op);
+    if (!litIdx.has_value())
         return testing::AssertionFailure()
                << "slot holds opcode #" << static_cast<int>(mir.instOpcode(op))
                << ", not a Const (want " << want << ")";
-    MirLiteralValue const& lit = mir.literalValue(mir.constLiteralIndex(op));
+    MirLiteralValue const& lit = mir.literalValue(*litIdx);
     auto const* got = std::get_if<std::int64_t>(&lit.value);
     if (got == nullptr)
         return testing::AssertionFailure() << "Const does not carry an integer literal";

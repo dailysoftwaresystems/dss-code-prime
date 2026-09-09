@@ -50,107 +50,161 @@ below is IN it.
 
 ---
 
-**Last updated:** 2026-09-08 — cycles **P14 … P64**. ⛔ **P64 IS NOT FINISHED: its commit is unpushed, three carriage legs are red against it, and lane `ea` is unfolded. READ §0.0 BEFORE ANYTHING ELSE.** ⚠ P52 rewrote no handoff at all, so a reader who opened this file during P53 saw P51 described as current state; that entry in §5 was written after the fact and says so.
+**Last updated:** 2026-09-08 — cycles **P14 … P65**. ⚠ P52 rewrote no handoff at all, so a reader who opened this file during P53 saw P51 described as current state; that entry in the TIMELINE was written after the fact and says so.
 
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
 
-## ⛔ §0.0 — STOP: THE TREE IS **MID-FLIGHT**. NOTHING BELOW THIS BLOCK IS A STARTING POINT.
+## §0.0 — STATE
 
-**P64's commit exists, is NOT PUSHED, THREE carriage legs are RED against it, and one lane is still
-unfolded in a worktree.** A cycle normally hands over a clean, pushed, all-legs-green tree. This one
-does not. Every count in §0.1 onward was taken BEFORE the legs ran, and describes the COMMIT rather
-than the verified state of the branch.
-
-✔**MEASURED 2026-09-08. Re-derive every line of it before acting — this table is the thing here most
-likely to be stale by the time you read it.**
+✔**MEASURED 2026-09-08 at the commit this file ships in. Re-derive every line before acting — this
+table is the thing here most likely to be stale by the time you read it.**
 
 | fact | value | how to re-derive |
 |---|---|---|
-| branch | `feature/c23-conformance-burndown-6` | `git status -sb` |
-| HEAD | ⚠ **not named here, deliberately** — the commit carrying this table moves HEAD past any sha the table could state, so this line would be false the instant it was written | `git log --oneline -3` |
-| the commit the LEGS were measured against | **`0dde6a8f`** — *"Cycle P64: code with no consumer was never validated…"*. This one does NOT move when the handoff is edited, which is why it is the sha worth writing down | `git log --oneline` |
-| pushed? | **NO — the branch is AHEAD of `origin/`.** ⚠ Re-derive the count; every handoff edit adds one | `git status -sb` |
-| registry OPEN | **451** = production **264** + harness **187** (the sum IS the cross-check) | `python scripts/check-anchor-balance/check-anchor-balance.py --breakdown --denominator registry` |
-| lane worktrees | `.worktrees/{at,cy,el,hx,pe}` are **SPENT** · `.worktrees/ea` is **NOT** | `git worktree list` |
+| branch | `feature/c23-conformance-burndown-6`, PR #57 | `git status -sb` |
+| HEAD | ⚠ **not named here, deliberately** — the commit carrying this table moves HEAD past any sha the table could state, so the line would be false the instant it was written | `git log --oneline -3` |
+| the cycle's BASE, for every delta below | **`cb45f10b`** — it does not move when this file is edited, which is why it is the sha worth writing down | `git log --oneline` |
+| registry OPEN | **787** = production **259** + harness **187** (the sum IS the cross-check) | `python scripts/check-anchor-balance/check-anchor-balance.py --breakdown --denominator registry` |
+| lane worktrees | **none** — all sixteen removed | `git worktree list` |
 
-### ★★★ THE FIVE THINGS OWED, IN ORDER. DO NOT REORDER 1 AND 3.
+⇒ **P65 handed over CLEAN**, which P64 did not: no unfolded lane, no open row of its own, no red leg.
 
-**1. FOLD LANE `ea` INTO THE MAIN TREE.** ✔It is based on `0dde6a8f`, its work is complete, and it was
-   **never folded**. Six paths: `src/link/format/elf.cpp`, `src/link/format/exec_data_section.hpp`,
-   `tests/link/CMakeLists.txt`, the NEW `tests/link/test_elf_image_overaligned_section_placement.cpp`,
-   and both files of `examples/c/alignment_overaligned_static_placed/`.
-   It closes **`D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET`** (born ✅ CLOSED in
-   the lane, suggested **P1**) — read that row FIRST; it carries the measurement.
-   ⚠ **The row lives in the LANE's worktree, not in the main tree's registry.** Apply it at fold time
-   or the fix reads as *closed 0, opened 0* — i.e. as no fix at all.
-   ⓘ `git -C .worktrees/ea diff 0dde6a8f` shows the change; the UNTRACKED test file is not in that
-   diff and must be copied separately.
-   ⓘ Items `ea` reported but did NOT take, and which nobody has since: `pe.cpp` and `macho*.cpp` share
-   the same `va == base + offset` identity and the same segment-promise concept and **neither was
-   read**; and `byte_emit.hpp`'s `alignUp` comment is false as written.
+## §0.1 — WHAT P65 DID, AND THE TWO NUMBERS THAT DIFFER
 
-**2. FIX `run_gate_guard` ON NON-WINDOWS HOSTS — it is one of the three reds, and it is NOT a tree
-   defect.** `scripts/run-gate/test-run-gate.sh` drives BOTH twins; `powershell` does not exist on
-   Linux or macOS, so every `.ps1` arm returns **127** and the parity arm reports `.sh=3 vs .ps1=127`.
-   **The fix:** probe for a working PowerShell **BY EXECUTION** (`command -v` is documented to lie over
-   ssh on the macOS carriage), and where there is none report the `.ps1` arms as **NOT APPLICABLE ON
-   THIS HOST**, naming them and the reason — never a silent skip, never a failure.
-   ⚠ **State the reach in the guard's own text:** the escape is taken on **2 of 3** carriages, so
-   **only the Windows leg proves twin parity**. That is a real limitation and belongs in the guard,
-   not in a commit message.
-   ★ **THE PROCESS FINDING IS THE BIGGER ONE.** That guard shipped in **P63 wave 2**, which was
-   committed **after** the carriage legs ran — so the Linux leg met it for the first time one cycle
-   late. **A wave-2 commit that skips the leg matrix defers its own verification to whoever runs the
-   matrix next.** Fix the cadence, not just the guard.
+**SIXTEEN lanes** (`ea` folded from P64, then `rg lw al dg mi xw ev dq op sr rc hf pl en eh sp`),
+each independently briefed, folded and verified before the next set was seeded.
 
-**3. RE-RUN ALL THREE CARRIAGE LEGS — AFTER 1 AND 2, NEVER BEFORE.** ✔The three reds, measured against
-   `0dde6a8f`:
+✔**REAL: 30 rows closed, 0 left open.** ✔**COUNTED by `check-anchor-balance --base cb45f10b`:
+5 closed, 0 opened, net −5 (792 → 787; registry 264+187 → 259+187).**
+⚠ **The gate's 5 and the real 30 differ because TWENTY-FIVE rows were minted AND closed inside the
+cycle** — invisible from BOTH bases, which is the instrument working as designed and not a fault in
+it ([[feedback-the-gate-cannot-see-a-row-born-in-the-cycle]]). **Report both numbers; never soften
+the instrument.** ★ P0 began and ended empty; production P1 is the band to watch.
 
-   | leg | red | invoke |
-   |---|---|---|
-   | WSL x86_64 | `run_gate_guard` · `examples/c/alignment_overaligned_static_placed` | `wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage wsl` |
-   | macOS | `link/test_elf_build_id_note` — ✅ **FIXED in wave 4**, re-run to confirm nothing else is red | `wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage macos` |
-   | arm64 VPS | `integrated_tests/c/…` **and** `examples/c/…` `alignment_overaligned_static_placed` | `wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage arm64-vps` |
+## §0.2 — ★★★ THE THROUGH-LINE: **A CLOSED ROW IS A CLAIM ABOUT THE SITES ITS INSTRUMENT COULD SEE**
 
-   ✅ **THE macOS RED IS CLOSED — see `D-TEST-ELF-BUILD-ID-SECTION-POINTER-INTO-A-DESTROYED-TEMPORARY`
-   (P64 wave 4).** It was **a dangling pointer in the TEST**, not a defect in the emitter and not a
-   defect in the build id. `find(readSections(a), kNoteName)` returns a pointer INTO the vector
-   `readSections` returned BY VALUE, which dies at the end of the full expression, so `note->offset`
-   read freed memory — **0 on macOS**, which made `descriptorOf` fetch image bytes 16..47, the ELF
-   header. On Windows and Linux the freed bytes still held the old values, so **the same undefined
-   behaviour passed on two of three carriages.** ★★ And its sibling
-   `RebuildingTheSameModuleReproducesTheSameId` carried the identical pattern while asserting
-   EQUALITY — two dangling reads both landing on 0 are equal — so it was **green on every host while
-   proving nothing.** Fixed by DELETING `find`'s rvalue overload, which makes the mistake a compile
-   error; this was the THIRD occurrence of the class in this tree and the first two were both fixed
-   by *adopting a convention*.
-   ⛔ **MY OWN PRESCRIBED REMEDY FOR THIS RED WAS REFUTED ONE DAY AFTER I WROTE IT.** This block used
-   to say *"measure it after the `ea` fold — it may be a section-offset symptom"*. `ea` is irrelevant
-   to it. That instruction was written from the failure BYTES without reading the CALL SITES, which
-   is [[feedback-a-rows-prescribed-remedy-decays-fastest]] with the ink still wet. **The remaining
-   macOS obligation is a FULL leg, not this test.**
+P62 doubted a row's REMEDY. P63 doubted a COUNT. P64 doubted anything shipping without a consumer.
+**P65 doubts the CLOSURE ITSELF** — and the cycle's sharpest findings are all one shape: a row read
+✅ CLOSED while the defect it names still shipped somewhere its own instrument never looked.
 
-**4. PUSH — ONLY ONCE ALL THREE LEGS ARE GREEN.** The Windows leg was ✔**2131/2131 rc 0** at
-   `0dde6a8f`; the other three had never run against it. PR #57 is the destination. Push the WHOLE
-   branch, not one commit: wave 3 (the handoff and the anchor-writer refusal) sits on top of it and
-   is ✔30/30 repo-guard green on Windows but has had **no carriage leg of its own** — it touches no
-   `src/`, so the legs are unchanged by it, and that reasoning is worth exactly as much as the
-   sentence saying so until a leg agrees.
+| row that read CLOSED | what it had actually converted | what still shipped |
+|---|---|---|
+| `D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED` | `hir_text.cpp`'s **type** printer | the **node** walk beside it — and `--emit-hir` died of a raw 0xC00000FD with **zero diagnostics** on a program `--compile` takes |
+| the same row, again | its MIR-tier half | ★ **its own P61 runnable witness `examples/c/deep_comma_chain_lowers_in_order` crashed `--emit-hir` on the day the row was marked closed.** Nothing saw it because **no test and no examples runner emits `.dsshir`** |
+| `D-ASM-AARCH64-FRAME-OFFSET-BEYOND-SCALED-IMM12` (closed 2026-08-27) | its own subject | `D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS` still says *"BLOCKED ON"* it — one of **70** such citations |
+| `D-C-FILE-SCOPE-INFERRED-AUTO-MUST-LEAD-THE-DECLARATION-SPECIFIERS` | — | its premise called a budget cliff a cost a future change *would introduce*; ✔it was **already refusing ordinary C** |
 
-**5. CLEAN UP THE SIX LANE WORKTREES** — `at cy ea el hx pe`. Five are spent; `ea` only after step 1.
-   ⮕ `scripts/lane-worktree/lane-worktree.sh remove <name>`.
+⇒ **When you close a row, name the instrument and state what it could NOT see.** A conversion closes
+the sites its measurement reached; the rest is unexamined, not fixed.
+⇒ **A new instrument shipped for exactly this**: `scripts/check-stale-blockers/check-stale-blockers.py`
+enumerates open rows whose Closing-work cell waits on a blocker that has since CLOSED — a class both
+anchor gates are structurally blind to, and for good reasons of their own that the row records.
+✔First census: **70 citations, 32 production, 16 at P1.** ⚠ They are LEADS, not verdicts — a cited
+row can close on a half the citing row was not waiting for. Read each before acting.
 
-ⓘ A longer form of items 1–3 was written to `.temp/p64-OWED-after-ea.md`. **`.temp/` is gitignored, so
-it does NOT travel to another machine or another account** — which is exactly why the substance is
-inlined above rather than cited. If that file is missing, nothing has been lost.
+## §0.3 — WHAT LANDED (production)
 
-⚠ **ONE HOST FACT THAT WILL COST YOU AN HOUR IF YOU MEET IT COLD:** from **Git Bash (MSYS)** a
-PARALLEL `ctest` dies part-way through with no test ever reporting a failure (measured at 8, 83, 271
-and 612 of 2131). `run-gate.sh` now REFUSES that combination up front with **exit 4**. Run the
-Windows suite from **PowerShell**, or serially. See §0.2 item 1.
+- **ELF/Mach-O image placement.** `ea` closed the ELF over-alignment defect (address-first placement,
+  honest segment promise). `al` then measured the siblings: **PE has no such defect** —
+  `va == base + offset` does not exist there — but **Mach-O did**, and it was a *load-time coin flip*:
+  a DSS artifact with the gate removed returned the wrong answer **11 of 20 runs on real Apple
+  hardware**. `ev` closed two more in the same family, including one where `alignUp(v, 0)` returned 0
+  for every `v`.
+- **C declaration specifiers, five rows.** Order-free specifier runs at file, block, for-init and
+  parameter position (`dq`); C23 §6.7.2 exclusivity at block scope, **60 case-instances** DSS accepted
+  that every reference refuses (`sr`); file-scope `extern`-with-initializer as a definition and a
+  minted redundancy warning (`fs`, `hf`); file-scope `auto` inference and then its specifier-led
+  spellings (`fs`, `pl`); `extern auto` (`sp`).
+- **Two silent accepts of malformed source, operator-reported.** An empty element mid-list —
+  `enum E { A, , B }` and `int a[3]={1,,3}`, the latter silently sliding every later element down a
+  position — closed in ONE change because they were the same copied shape, the only two in any
+  shipped `.lang.json` (`en`). And the `--emit-hir` stack overflow (`eh`).
+- **A parser budget cliff nobody knew about** (`pl`): `const int big[] = {3001};`, `volatile`,
+  `_Atomic`, `__attribute__((aligned(16)))` and `[[maybe_unused]]` leads all died
+  `P_SpeculationBudgetExhausted` on ordinary C. Fixed by descending into the declared-last structural
+  candidate instead of probing it — with **20 real syntax errors producing byte-identical stderr**.
 
+## §0.4 — WHAT LANDED (harness) — five guards that were lying
+
+`rg` `lw` `xw` `rc` closed a family: `run-gate.ps1` printing **`inputs : held still` over a tree that
+had moved** (dot-files invisible to `Get-ChildItem` off Windows); the same wrapper watching the
+**wrong tree entirely** (input roots resolved against the process cwd, not the gated build tree —
+both directions measured, the silent one included); two fixtures driving a Windows-only interpreter
+on every host; `repo_tree_guard` **silently vanishing** where no PowerShell was found; and a guard
+condition that was a **tautology**, under which a PowerShell-less host could not configure the tree
+at all. ★ The prerequisite for that last one — a mingw-w64 C++ cross driver in WSL — was **installed
+rather than filed**, per the operator's *a buildable prerequisite is not a gate* ruling.
+
+## §0.5 — WHAT P66 INHERITS, IN PRIORITY ORDER
+
+**All measured this cycle. None is a hypothesis.**
+
+1. **`static [[maybe_unused]] int m = 1;` is ACCEPTED and gcc AND clang both REFUSE it** — DSS
+   **above** the union. A `[[…]]` sequence prefixes a declaration; it is not a declaration-specifier,
+   and `stdAttr` sits in `singleDeclSpecifier` and `topLevelAutoSpecifier` today. Pre-existing.
+2. **`auto a = 1, b = 2;` — gcc REFUSES, clang ACCEPTS** (`D a; D b`), at file and block scope; DSS
+   refuses `S_AutoRequiresSingleDeclarator`. Arguably **below** the union — settle it on what WORKS.
+3. **`int f(int a, ..., int b);` is still silently accepted** — `/shapes/paramList` has no *the
+   ellipsis terminates the list* rule (C 6.7.6.3). The last live member of the elision family, on
+   record as probe `b_ellipsis_not_last_parameter`; its two siblings closed this cycle.
+4. **Nothing in `src/` outside tests calls `parseHir`** — no CLI mode loads a `.dsshir`, no runner
+   round-trips one. That missing instrument is why three writer spellings could go unreadable
+   unnoticed (a VLA sentinel **aborting the process**, `goto *expr` with no `*` token, and a float
+   past 2^64 **silently returning 0.0 with a clean reporter**). Lives in `src/program/**`.
+5. **The stale-blocker census** — 32 production leads, 16 at P1:
+   `python scripts/check-stale-blockers/check-stale-blockers.py --production --band P1`.
+6. **`D-CSUBSET-DECL-GRAMMAR-LOW-RESIDUES` residue (2)'s remaining axis** — storage-class AFTER the
+   type (`int static g;`, accepted by all three references). Its old one-line remedy is **REFUTED**
+   in the row; the corrected design (a declared TRAILING specifier region at declaration level) is
+   written there, including the two spellings it still would not reach.
+7. **The omega contract's last partial**: `@loc` spans are in preprocessor-synthesized coordinates,
+   and enumerator NAMES do not travel in `.dsshir`. ✔Both re-measured 2026-09-08 and still true.
+
+## §0.6 — WHAT THE ORCHESTRATOR GOT WRONG
+
+1. **A brief premise of mine was refuted in almost every lane, and that is the control loop working
+   rather than a run of bad luck.** The largest: PE does not share the ELF identity at all; the
+   run-gate escape was needed on **1 of 4** hosts, not 2 of 3 (a skip-shaped fix would have retired
+   real coverage *and* hidden a second defect); `instPayload` never had the defect its row claimed;
+   the emitter cycle is `emitExpr` → its own lambda, **not** `emitNodeLine`; `extern auto` needed no
+   `cst_to_hir.cpp` change; and marking the existing list shape speculative fixes nothing.
+   ⇒ **Say "unmeasured, verify first" in a brief rather than stating a relayed fact flat.**
+2. **I took an exit code through a pipeline and it lied.** A reference probe reported **rc=0** on
+   input it had just printed `error:` for — `head` in the pipeline, not the compiler. Caught only
+   because the rc contradicted the same probe's own stderr. **Never pipe a measurement's exit code.**
+3. **I was too cautious about file contention for two full turns**, queueing two operator-reported
+   defects behind a lane instead of dispatching. `lane-fold`'s drift refusal exists precisely so two
+   lanes CAN share a document; the reconciliation is a three-way merge with the lane's own pre-edit
+   backup as the base, and it was clean both times.
+4. **I polled far more than I acted on.** Long waits belong in one `sleep`, not in a stream of status
+   checks that produce nothing.
+
+## §0.7 — THE GATE THIS COMMIT CARRIES
+
+✔**MEASURED on the settled tree, all lanes folded and all worktrees removed:**
+
+| leg | result |
+|---|---|
+| Windows (`build/dbg`, `run-gate.ps1`, `-j 6`) | **2154/2154, rc 0**, `inputs: held still`, `contended: no` |
+| repo guards | **30/30** |
+| WSL x86_64 (`wsl-leg.sh`) | **OK, rc 0** — and its arm64 **qemu emulator witness** fired: `c/builtin_bitcount: 6 verified (6 ran)`, so arm64 artifacts were spawned and RAN, not merely built |
+| macOS arm64 (`remote-leg --carriage macos`) | **100% tests passed, 0 failed out of 2124**, rc 0 |
+| arm64 VPS (`remote-leg --carriage arm64-vps`) | **100% tests passed out of 2124**, rc 0 |
+
+★ **ALL FOUR LEGS GREEN ON ONE SETTLED TREE**, which P64 could not say. ⓘ The remote totals (2124)
+are lower than Windows (2154) because both remote drivers append `-LE repo-guard` by default — the
+repo guards run on the root host only, by the standing rule, and that is a scope difference rather
+than a coverage gap.
+ⓘ **The WSL footer is also the first production sighting of this cycle's `run-gate` fix**: it now
+prints `srctree :` with `decided by: CMAKE_HOME_DIRECTORY recorded in …/build/dbg/CMakeCache.txt`
+and the three RESOLVED absolute `watched :` roots, so a reader of a gate log can tell WHICH TREE was
+watched without reconstructing the caller's working directory.
+
+⚠ **The Windows total moved 2132 → 2154 (+22)** — every one of them a new pin, none a rename.
+
+---
 
 **Cycle P64 closed 2026-09-08.** **FIVE lanes, four independent reviews and three remediations**, on
 top of P63 (`cd1331eb`). **Every lane was independently reviewed; every review found a real defect, and

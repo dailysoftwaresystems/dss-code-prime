@@ -3401,20 +3401,43 @@ enum class DiagnosticCode : std::uint16_t {
     //   `hirLowering` config has no mapping for it, the mapping names an
     //   unknown HIR kind/op, or the construct is a known-deferred one
     //   (typedef-of-pointer / compound-assign / ++ / arrays / strings —
-    //   owned by a later plan; extern decls are fully lowered, and
-    //   `extern int x = 5;` rejects via `H_ExternHasInitializer`). An
+    //   owned by a later plan; extern decls are fully lowered, and a
+    //   BLOCK-SCOPE `extern int x = 5;` rejects via
+    //   `H_ExternHasInitializer`). An
     //   `Error` HIR node is emitted as a recovery sentinel and lowering
     //   continues (collect-all); never a silent skip or a miscompile.
+    //   ⚠ THE SCOPE WORD IS LOAD-BEARING AND WAS ADDED IN P65: the same
+    //   spelling at FILE scope is a DEFINITION (C 6.9.2p1) that lowers to a
+    //   Global and merely warns — see `H_ExternRedundantOnDefinition`. An
+    //   example here that omitted the scope would send a reader looking for a
+    //   refusal that no longer fires on the construct as written.
     H_UnsupportedLoweringForKind  = 0xF009,
-    // H_ExternHasInitializer: an `extern` declaration carries an
-    //   initializer (e.g. `extern int x = 5;`, `extern int y = z;`,
-    //   `extern int a[2] = {0,1};`, even `extern int b = {};`). Extern
-    //   announces a symbol whose storage lives in another translation
-    //   unit — an initializer would either redefine the symbol locally
-    //   (contradicting `extern`) or be silently dropped at lowering
-    //   (D-FF2-3 fold replaces that drop). Detection is shape-based:
-    //   any non-arrayDeclSuffix internal child of `varDeclTail` IS the
-    //   init subtree. Distinct remediation from
+    // H_ExternHasInitializer: a BLOCK-SCOPE `extern` declaration carries an
+    //   initializer (e.g. `void f(void){ extern int x = 5; }`, and likewise
+    //   `= z`, `= {0,1}`, even `= {}`). C 6.7.11p5 forbids an initializer on a
+    //   block-scope declaration of an identifier WITH LINKAGE: the identifier
+    //   names an object whose storage lives in another translation unit, so an
+    //   initializer would either redefine it locally (contradicting `extern`)
+    //   or be silently dropped at lowering (the D-FF2-3 fold replaced that
+    //   drop). ✔MEASURED — all three references refuse it: gcc 13.3.0 "'x' has
+    //   both 'extern' and initializer", clang 18.1.3 "declaration of block
+    //   scope identifier with linkage cannot have an initializer", MSVC
+    //   19.51 error C2205.
+    //   ⚠⚠ SCOPE, NOT SPELLING, AND THIS SENTENCE WAS STALE FROM P65 UNTIL IT
+    //   WAS CORRECTED HERE. Until
+    //   [[D-C-FILE-SCOPE-EXTERN-WITH-INITIALIZER-IS-A-DEFINITION]] this block
+    //   documented the code as firing on *an extern declaration carries an
+    //   initializer*, scope-free — which was the code's real behaviour then and
+    //   became false the day the file-scope arm split away. At FILE scope
+    //   C 6.9.2p1 makes the same spelling a DEFINITION, all three references
+    //   accept it, and DSS now lowers it to a Global and reports the redundant
+    //   keyword as `H_ExternRedundantOnDefinition` instead. The emitted MESSAGE
+    //   was corrected in `lowerExternDeclInto` at the time; this prose was the
+    //   half that lagged, which is why the header and the message are worth
+    //   reading against each other.
+    //   Detection is shape-based: any non-arrayDeclSuffix internal child of
+    //   `varDeclTail` IS the init subtree (`initDeclaratorInitNode`, the ONE
+    //   scan both arms and `lowerVarLikeInto` share). Distinct remediation from
     //   `H_UnsupportedLoweringForKind`: "remove the initializer", not
     //   "extend the engine".
     H_ExternHasInitializer        = 0xF00A,
@@ -3605,6 +3628,51 @@ enum class DiagnosticCode : std::uint16_t {
     //   NOT a substitute for the ordinary import path — an ordinary (recipe-less)
     //   suppressed row is untouched by this check.
     H_ShippedShimSignatureMismatch = 0xF01A,
+    // H_ExternRedundantOnDefinition
+    //   [[D-C-FILE-SCOPE-EXTERN-INITIALIZER-EMITS-NO-REDUNDANCY-WARNING]] (P65).
+    //   A FILE-SCOPE declaration spells `extern` AND carries an initializer, so
+    //   C 6.9.2p1 — "a declaration of an identifier for an object that has file
+    //   scope with an initializer is a definition" — makes it a DEFINITION and
+    //   the `extern` contributes nothing. Well-formed: the object is defined
+    //   here, with the linkage C 6.2.2p4 gives it. Emitted from
+    //   `lowerExternDeclInto`'s file-scope definition arm, per DECLARATOR
+    //   (`extern int a = 1, b;` warns on `a` only, because only `a` is defined).
+    //
+    //   ★ A WARNING, AND THAT IS A DECISION RATHER THAN A CONFORMANCE
+    //   REQUIREMENT. ✔MEASURED 2026-09-08, each reference probed SEPARATELY on
+    //   its own translation unit: gcc 13.3.0 `-std=c2x -c` rc=0 warning "'x'
+    //   initialized and declared 'extern'"; clang 18.1.3 `-std=c23 -c` rc=0
+    //   warning `-Wextern-initializer`; MSVC 19.51.36252 `/std:c17` AND
+    //   `/std:clatest` rc=0 SILENT — silent even at `/Wall`. All three ACCEPT,
+    //   so `DSS = (gcc u clang u MSVC) u ISO C` settles ACCEPTANCE and says
+    //   nothing about the advisory; the union neither requires this diagnostic
+    //   nor forbids it. What decides it is the failure it prevents, MEASURED
+    //   rather than argued: `extern int hx = 1;` in a HEADER included by two
+    //   translation units compiles clean on gcc and clang and then dies at the
+    //   LINK — "multiple definition of `hx'", rc=1 on both — with the linker's
+    //   message naming object files rather than the header line that caused it.
+    //   Two of the three references warn precisely there. Following the silent
+    //   reference would make DSS's advisory surface the INTERSECTION of the
+    //   three while its acceptance surface is their union, which is the wrong
+    //   way round for this project.
+    //
+    //   ★ SUPPRESSIBLE, AND DELIBERATELY NOT IN `kUnsuppressableCodes` — decided
+    //   by argument, not by proximity to `H_ExternHasInitializer`. Neither
+    //   membership prong reaches it: silencing it neither fails a build with
+    //   nothing said (the build SUCCEEDS and is meant to) nor ships a wrong
+    //   artifact green (the bytes are identical either way — the Global, its
+    //   initializer and its linkage are emitted whether or not the advisory is
+    //   rendered). This is the `H_UnreachableCode` posture, for the same stated
+    //   reason: silencing it cannot mask a miscompile. It also lands DSS between
+    //   the two warning references — ✔MEASURED, gcc's carries no `[-W…]` tag and
+    //   `-Wno-extern-initializer` does NOT silence it, while clang's does —
+    //   and clang's suppressible model is the considered one.
+    //   ⚠ It is a SEPARATE code from `H_ExternHasInitializer` on purpose:
+    //   that one is an unsuppressable ERROR for the BLOCK-scope construct, and
+    //   an unsuppressable WARNING under the same id would be a third meaning for
+    //   one code. Two scopes, two rules, two codes, two remediations ("drop the
+    //   `extern`" here; "remove the initializer" there).
+    H_ExternRedundantOnDefinition = 0xF01B,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,
@@ -4798,7 +4866,86 @@ enum class DiagnosticCode : std::uint16_t {
     //   K_ThreadLocalOveralignedForFormat gate it is modelled on — the two now
     //   share one ceiling and one anchor.
     K_StaticObjectOveralignedForFormat = 0x8024,
-    // K-NEXT-SLOT: 0x8025 — grep this marker before adding a K_* code.
+    // ── The static-data producer's own causes, split OUT of
+    //    `K_NoMatchingObjectFormat` (D-DIAG-OVERLAP-REFUSAL-CODE-NOT-DISCRIMINATING,
+    //    P65). Every refusal in `lowerMirGlobalsToDataItems` and its
+    //    `encodeAggregateValue` / `encodeBitIntImage` / `bitIntLiteralValue`
+    //    recursion used to render under that ONE code, so a consumer that
+    //    triages, filters or greps BY CODE could not tell "your initializer
+    //    names members that share bytes" from "this target declares no
+    //    `aggregateLayout`" from "the encoder and the layout authority
+    //    disagree". The MESSAGES discriminated; the code did not, and message
+    //    text is the least stable surface this project has.
+    //    ★ THE AXIS IS *WHO MUST CHANGE SOMETHING*, not which arm fired — a
+    //    code names the RULE violated, and these are the two rules whose
+    //    remediation differs in KIND from the residual family:
+    //      * K_OverlappingStaticInitUnsupported — the USER edits the
+    //        initializer, and the fix is stated in the message.
+    //      * K_StaticDataEncoderInvariantBreach — NOBODY can; it is a compiler
+    //        defect and the source is blameless.
+    //    Everything left on `K_NoMatchingObjectFormat` in that producer states
+    //    ONE residual rule — "this producer has no byte encoding for this
+    //    global because a declared capability or an implemented lowering is
+    //    missing" — whose remediation is uniform in kind (change the target,
+    //    the config, or wait for the shape to be implemented). That residual is
+    //    a stated set, not a leftover: a third code carving it further would
+    //    separate causes no consumer triages differently.
+    // K_OverlappingStaticInitUnsupported
+    //   A static initializer would have to write two or more objects that
+    //   SHARE BYTES, so a positional member-wise walk's result would depend on
+    //   declaration order. Fires from `encodeAggregateValue`, on both arms of
+    //   the shared-bytes gate: an explicit-offset struct whose overlay members
+    //   carry a NON-ZERO leaf (an all-zero `{0}`/`{}` fill IS supported —
+    //   D-MIR-OVERLAP-STRUCT-ZERO-INIT), and a union initializer supplying
+    //   more than one member (C 6.7.9p17 names exactly one, and the union's
+    //   route past that same gate is valid only for that single write).
+    //   ⓘ USER-ACTIONABLE AND SPECIFICALLY SO: the remedy — assign the members
+    //   individually — is in the message, which is why this cause and not its
+    //   siblings earns the first split. Its MIR-tier twin refuses the same
+    //   construct in brace-init lowering under `H_UnsupportedLoweringForKind`;
+    //   one rule, two tiers, and now a code per tier rather than one tier's
+    //   cause hidden inside a linker-band bucket.
+    //   ★ UNSUPPRESSABLE, ARGUED NOT INHERITED — see `unsuppressable_codes.cpp`.
+    //   The parent's rationale ("the linker dispatches the wrong format walker")
+    //   is about walker dispatch and does NOT transfer to a data producer; the
+    //   membership is re-derived from THIS code's own control flow, where the
+    //   refusal is followed by a `continue` that drops the global's
+    //   `AssembledData` entirely.
+    K_OverlappingStaticInitUnsupported = 0x8025,
+    // K_StaticDataEncoderInvariantBreach
+    //   The static-data encoder's OWN invariant was violated: its byte count
+    //   and the layout authority's disagree, it was handed an interned record
+    //   it declares malformed, a normalizer was reached with a type it does not
+    //   accept, or a literal arrived in a variant arm no encoder handles.
+    //   Fires from `bitIntLiteralValue` (non-`_BitInt` type; a width outside
+    //   [1,kBitIntMaxWidth]; an initializer in no integer literal arm), from
+    //   `encodeBitIntImage` (no computable container size; a wrapped value
+    //   shorter than its container; a value byte above the container that is
+    //   not pure extension; an encoded size that is not the container's), from
+    //   `encodeAggregateValue` (a `_Complex` literal that is not a
+    //   two-component aggregate, or carries more than two; a `_BitInt` member
+    //   image that overruns the laid-out extent) and from
+    //   `lowerMirGlobalsToDataItems` (a 128-bit initializer in no integer
+    //   literal arm; the 128-bit, `_BitInt`, F80-folded, F80-widened,
+    //   F128-folded and F128-widened size disagreements; a literal in the
+    //   `monostate` arm).
+    //   ⚠ NOT USER-ACTIONABLE AND NOT TARGET-DEPENDENT. Nothing in the source
+    //   or in any `.lang`/`.target`/`.format` document can make it go away —
+    //   reaching it means two parts of this compiler that must agree have
+    //   drifted, and the ONLY correct response is to refuse rather than emit
+    //   the fabricated or truncated image the disagreement would produce. Same
+    //   class as `D_SynthRecipeFamilyUnknown`,
+    //   `D_CompileUnitNullNoDiagnostic` and
+    //   `X_OptReturnFalseWithoutDiagnostic`: a substrate-contract guard that
+    //   should be unreachable and must be deafening if reached. Splitting it
+    //   out is what lets a triage consumer separate "DSS has a bug" from "your
+    //   target is missing a capability" without reading prose.
+    //   ★ UNSUPPRESSABLE for two independent reasons, both argued in
+    //   `unsuppressable_codes.cpp`: the dropped-`AssembledData` mechanism it
+    //   shares with the code above, AND that suppressing a compiler-defect
+    //   report is never a legitimate user action.
+    K_StaticDataEncoderInvariantBreach = 0x8026,
+    // K-NEXT-SLOT: 0x8027 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission
@@ -4880,7 +5027,13 @@ enum class DiagnosticCode : std::uint16_t {
     // (D-FF2-3 CLOSED 2026-06-01 via `H_ExternHasInitializer`
     // (0xF00A) at the lowering tier — the FFI walker reuses the
     // c frontend, so the reject reaches it through the
-    // shared lowering pipeline; no separate F_* code needed.)
+    // shared lowering pipeline; no separate F_* code needed.
+    // ⚠ NARROWED IN P65 and the narrowing changes which KIND a header
+    // gets back, so it is recorded here rather than only at 0xF00A:
+    // the lowering reject is now BLOCK-SCOPE only. A header carrying
+    // file-scope `extern int x = 5;` no longer fails lowering at all —
+    // it lowers to a Global, and the walker's `HirKind::Global` arm
+    // returns `HeaderHasNonExternDecl`, not `HeaderParseFailed`.)
     F_HeaderParseFailed            = 0x5008,
     F_HeaderHasFunctionBody        = 0x5009,
     F_HeaderHasNonExternDecl       = 0x500A,

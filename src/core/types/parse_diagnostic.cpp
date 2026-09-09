@@ -336,6 +336,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_TextUnknownName:          return "H_TextUnknownName";
         case DiagnosticCode::H_UnsupportedLoweringForKind: return "H_UnsupportedLoweringForKind";
         case DiagnosticCode::H_ExternHasInitializer:     return "H_ExternHasInitializer";
+        case DiagnosticCode::H_ExternRedundantOnDefinition:
+            return "H_ExternRedundantOnDefinition";
         case DiagnosticCode::H_ExternDeclMalformed:      return "H_ExternDeclMalformed";
         case DiagnosticCode::H_UnknownLinkageSpecifier:  return "H_UnknownLinkageSpecifier";
         case DiagnosticCode::H_UnreachableCode:          return "H_UnreachableCode";
@@ -573,6 +575,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_FormatLacksWeakDefinitionDialect";
         case DiagnosticCode::K_ArtifactWithheldAfterError:
             return "K_ArtifactWithheldAfterError";
+        case DiagnosticCode::K_OverlappingStaticInitUnsupported:
+            return "K_OverlappingStaticInitUnsupported";
+        case DiagnosticCode::K_StaticDataEncoderInvariantBreach:
+            return "K_StaticDataEncoderInvariantBreach";
 
         // Optimizer/pipeline (X_) family.
         case DiagnosticCode::X_UnknownPassId:                return "X_UnknownPassId";

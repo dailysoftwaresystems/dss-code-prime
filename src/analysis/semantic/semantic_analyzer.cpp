@@ -1245,6 +1245,87 @@ subtreeContainsToken(Tree const& tree, NodeId node, SchemaTokenId kind,
     return false;
 }
 
+// ── THE SPECIFIER PREFIX'S TYPE QUALIFIERS (P65) ─────────────────────────────
+//
+// [[D-CSUBSET-DECL-QUALIFIER-BEFORE-STORAGE-CLASS]] + residue (2) of
+// [[D-CSUBSET-DECL-GRAMMAR-LOW-RESIDUES]]. C 6.7p2 makes a declaration's
+// specifiers an UNORDERED SET, so a TYPE QUALIFIER may be written before, or
+// among, the storage-class specifiers — `const static int g = 1;`. A language
+// that models the declaration as `specifier-prefix + type head` (as the C
+// grammar document does) therefore has qualifier tokens landing in the PREFIX,
+// which every positional consumer STRIPS. This is the accessor that goes and
+// gets them, so a qualifier means exactly the same thing on either side of a
+// storage-class keyword.
+//
+// ★★ IT COLLECTS THE **SINGLE-TOKEN** SPECIFIERS AND NOTHING ELSE, AND THAT
+// NARROWNESS IS THE POINT rather than an optimisation. Every specifier a prefix
+// can hold arrives as a one-token wrapper node (the grammar's specifier and
+// qualifier rules are alternations of token leaves, and a pure-alt rule DOES
+// emit its own node here — ✔MEASURED against the corpus tree golden
+// `tests/corpus/c/mini_calc.c.tree`, which renders `rule:singleDeclSpecifier >
+// tok:\"extern\"`; an earlier draft of this function assumed such a rule was
+// transparent, took only DIRECT token children, and therefore found NOTHING —
+// every file-scope `const` silently stopped qualifying its object). So the walk
+// descends through single-visible-child wrappers and takes the token at the
+// bottom. Everything ELSE a prefix can hold — an attribute clause, an
+// alignment specifier and its OPERAND — is a multi-child node and is skipped
+// WITHOUT being entered, so an operand such as `alignas(const T)` can never
+// const-qualify the declared object. That is the opacity hazard
+// `subtreeContainsToken`'s `opaqueRules` parameter exists for, discharged
+// STRUCTURALLY instead of by enumerating rules someone must remember to add.
+//
+// ★ ENGINE-AGNOSTIC: nothing here names a language, a keyword or a rule. WHICH
+// rule is the prefix comes from the declaration row's `specifierPrefixRule`
+// (via the shared `specifierPrefixChild`), and WHICH token kinds are qualifiers
+// is asked by the callers against the config markers they already read
+// (`constMarker` / `volatileMarker` / `atomicMarker`). A language whose
+// declarations have no specifier prefix gets an empty span and no behaviour
+// change at all.
+[[nodiscard]] std::vector<NodeId>
+specifierPrefixQualifierTokens(Tree const& tree, NodeId declNode,
+                               DeclarationRule const& decl) {
+    std::vector<NodeId> out;
+    NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
+    if (!prefix.valid()) return out;
+    // One visible child, or nothing: the shape a specifier wrapper has and an
+    // attribute / alignment specifier never does.
+    auto soleVisibleChild = [&tree](NodeId n) -> NodeId {
+        NodeId only{};
+        for (auto const& c : tree.children(n)) {
+            if (isEmptySpace(tree.flags(c))) continue;
+            if (only.valid()) return {};      // more than one ⇒ not a wrapper
+            only = c;
+        }
+        return only;
+    };
+    for (auto const& child : tree.children(prefix)) {
+        if (isEmptySpace(tree.flags(child))) continue;
+        NodeId cur = child;
+        // Bounded: a wrapper chain is one or two levels in every shipped
+        // grammar, and a cap turns a corrupt node graph into a miss instead of
+        // a hang (the `declaratorNameNode` depth-cap posture).
+        for (int step = 0; step < 8 && cur.valid()
+                           && tree.kind(cur) == NodeKind::Internal; ++step) {
+            cur = soleVisibleChild(cur);
+        }
+        if (cur.valid() && tree.kind(cur) == NodeKind::Token) out.push_back(cur);
+    }
+    return out;
+}
+
+// Does the prefix-qualifier run carry `marker`? An invalid marker (a language
+// that declares none) is never carried — the honest answer for a language that
+// cannot spell the qualifier at all.
+[[nodiscard]] bool
+prefixQualifiersHave(Tree const& tree, std::span<NodeId const> prefixQualifiers,
+                     SchemaTokenId marker) {
+    if (!marker.valid()) return false;
+    for (NodeId const q : prefixQualifiers)
+        if (tree.kind(q) == NodeKind::Token && tree.tokenKind(q) == marker)
+            return true;
+    return false;
+}
+
 // c36 (D-CSUBSET-MUTABLE-POINTER-TO-CONST): does THIS declarator declare a
 // const OBJECT? `const` qualifies the type it directly modifies (C 6.7.3):
 // `const char *p` qualifies the POINTEE — the pointer OBJECT `p` is MUTABLE
@@ -1281,7 +1362,8 @@ declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
                         std::unordered_map<std::uint32_t, std::size_t> const*
                             declByRule,
                         NodeId headNode,
-                        std::span<RuleId const> opaqueRules = {}) {
+                        std::span<RuleId const> opaqueRules = {},
+                        std::span<NodeId const> prefixQualifiers = {}) {
     // Descend a per-slot wrapper (initDeclarator / memberDeclarator) to the
     // inner declaratorRule — the same descent declaratorDeclaredType uses.
     NodeId inner = dNode;
@@ -1358,7 +1440,16 @@ declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
     // `r = …`. Scan the HEAD (base type, no pointer stars) — mirrors the legacy
     // positional path's `kids[*decl.typeChild]` scoping; a genuine `const int r`
     // keeps its const in the head, so it stays correctly rejected.
-    return subtreeContainsToken(tree, headNode.valid() ? headNode : declNode,
+    // P65 (D-CSUBSET-DECL-QUALIFIER-BEFORE-STORAGE-CLASS): a `const` written
+    // BEFORE the storage-class specifiers (`const static int l = 3;`) is in the
+    // stripped specifier PREFIX, not in the head — it is the same C 6.7p2
+    // declaration-specifier qualifier and it qualifies the same base type, so it
+    // is OR'd in here and nowhere else. Deliberately NOT consulted in the
+    // pointer-layer arm above: a prefix `const` is a BASE qualifier exactly like
+    // a head one, so `const static char *p` declares a MUTABLE pointer to const
+    // char, matching `static const char *p` token for token.
+    return prefixQualifiersHave(tree, prefixQualifiers, constMarker)
+        || subtreeContainsToken(tree, headNode.valid() ? headNode : declNode,
                                 constMarker, declByRule, opaqueRules);
 }
 
@@ -1519,7 +1610,8 @@ declaratorConstSpine(Tree const& tree, NodeId dNode, NodeId headNode,
                          declByRule,
                      std::span<RuleId const> opaqueRules = {},
                      SchemaTokenId restrictMarker = {},
-                     SchemaIndexes const* idx = nullptr) {
+                     SchemaIndexes const* idx = nullptr,
+                     std::span<NodeId const> prefixQualifiers = {}) {
     // ★★★ P55 — ONE EXPLICIT HEAP WORK STACK FOR THE WHOLE CLAIM TREE, AND THE
     // `nestDepth >= 4` IT REPLACES WAS THE SECOND DROPPED DIAGNOSTIC IN THIS
     // FUNCTION ([[D-SEMANTIC-DEPTH-CAPS-TRUNCATE-INTO-TWO-WRONG-ANSWERS]]).
@@ -1555,6 +1647,12 @@ declaratorConstSpine(Tree const& tree, NodeId dNode, NodeId headNode,
         // object nor the slot can move under a pending job.
         DeclaredQualification* into       = nullptr;
         std::size_t            paramIndex = 0;
+        // P65 (D-CSUBSET-DECL-QUALIFIER-BEFORE-STORAGE-CLASS): does THIS level's
+        // declaration carry a `const` in its specifier PREFIX rather than in its
+        // type head (C 6.7p2 order-free specifiers — `const static int l;`)? True
+        // only for the ROOT job: a nested function level's parameters have their
+        // own declaration rows and their own prefixes, read where they are pushed.
+        bool                   prefixConst = false;
     };
     // A nested function level's claim, and the spine level it hangs off. Attached
     // AFTER the stack drains, because "did ANY parameter produce a spine" — the
@@ -1570,7 +1668,9 @@ declaratorConstSpine(Tree const& tree, NodeId dNode, NodeId headNode,
     std::vector<SpineJob>         work;
     std::vector<FnLevelLink>      links;
     work.push_back(SpineJob{dNode, headNode, constMarker, restrictMarker,
-                            nullptr, 0});
+                            nullptr, 0,
+                            prefixQualifiersHave(tree, prefixQualifiers,
+                                                 constMarker)});
 
     while (!work.empty()) {
         SpineJob const job = work.back();
@@ -1582,9 +1682,13 @@ declaratorConstSpine(Tree const& tree, NodeId dNode, NodeId headNode,
         // qualifier from ⇒ nothing can be claimed honestly. The slot stays
         // `nullopt`, which is "no claim".
         if (!job.constMarker.valid() || !job.head.valid()) continue;
-        bool const headConst = subtreeContainsToken(tree, job.head,
-                                                    job.constMarker, declByRule,
-                                                    opaqueRules);
+        // P65: a specifier-prefix `const` is the same C 6.7p2 declaration-specifier
+        // qualifier as a head one and qualifies the same BASE, so it enters the
+        // spine at exactly the level a head `const` does — level 0 for a scalar,
+        // the pointee level for a pointer — with no separate rule.
+        bool const headConst = job.prefixConst
+            || subtreeContainsToken(tree, job.head, job.constMarker, declByRule,
+                                    opaqueRules);
         // The one-level answer: an abstract parameter with no declarator at all
         // (`int f(const char)`), where the head IS the whole type. A one-level
         // spine is a BASE and nothing else, so it can carry no restrict bit.
@@ -1781,10 +1885,17 @@ declaratorConstSpine(Tree const& tree, NodeId dNode, NodeId headNode,
                 if (pDecl.declaratorChild.has_value()
                     && *pDecl.declaratorChild < pKids.size())
                     pDeclarator = pKids[*pDecl.declaratorChild];
+                // P65: the nested parameter's OWN specifier prefix (a param row
+                // may declare one), never the enclosing declaration's — a
+                // qualifier belongs to the declaration it is written in.
+                auto const pPrefixQuals =
+                    specifierPrefixQualifierTokens(tree, rows[i], pDecl);
                 work.push_back(SpineJob{
                     pDeclarator, pKids[*pDecl.headChild], *pDecl.constMarker,
                     pDecl.restrictMarker.value_or(SchemaTokenId{}), claim.get(),
-                    i});
+                    i,
+                    prefixQualifiersHave(tree, pPrefixQuals,
+                                         *pDecl.constMarker)});
             }
             links.push_back(FnLevelLink{owner, level, std::move(claim)});
         }
@@ -1921,10 +2032,16 @@ harvestFunctionQualification(TypeInterner const& in, SchemaIndexes const& idx,
     if (!mine.valid()) return std::nullopt;
 
     DeclaredQualification q;
+    // P65 (D-CSUBSET-DECL-QUALIFIER-BEFORE-STORAGE-CLASS): a C 6.7p2 qualifier
+    // written before the storage-class specifiers sits in the STRIPPED specifier
+    // prefix, so the head alone under-reports it — and an under-reported const on
+    // this axis would accept a redeclaration C 6.7.6.1p2 refuses.
+    auto const prefixQuals =
+        specifierPrefixQualifierTokens(tree, rec.declRuleNode, decl);
     q.result = declaratorConstSpine(tree, mine, head, dc, *decl.constMarker,
                                     &idx.declByRule, typeofOpaqueRules,
                                     decl.restrictMarker.value_or(SchemaTokenId{}),
-                                    &idx);
+                                    &idx, prefixQuals);
 
     std::size_t const wanted = in.fnParams(fnType).size();
     q.params.assign(wanted, std::nullopt);
@@ -1947,10 +2064,13 @@ harvestFunctionQualification(TypeInterner const& in, SchemaIndexes const& idx,
                 if (pDecl.declaratorChild.has_value()
                     && *pDecl.declaratorChild < pKids.size())
                     pDeclarator = pKids[*pDecl.declaratorChild];
+                auto const pPrefixQuals =
+                    specifierPrefixQualifierTokens(tree, rows[i], pDecl);
                 q.params[i] = declaratorConstSpine(
                     tree, pDeclarator, pKids[*pDecl.headChild], dc,
                     *pDecl.constMarker, &idx.declByRule, typeofOpaqueRules,
-                    pDecl.restrictMarker.value_or(SchemaTokenId{}), &idx);
+                    pDecl.restrictMarker.value_or(SchemaTokenId{}), &idx,
+                    pPrefixQuals);
             }
         }
     }
@@ -2317,10 +2437,58 @@ genericSelectedArm(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 // (one definitive diagnostic per bad type, the house one-diag bar).
 // The public wrapper below owns the flag; external callers are
 // signature-unchanged.
+// ── THE BASE TYPE-QUALIFIER SKIN, IN ONE PLACE ───────────────────────────────
+//
+// c27 (D-CSUBSET-VOLATILE-POINTEE) + D-CSUBSET-ATOMIC (FC17.9(d) 1b): wrap a
+// resolved BASE type in the {volatile, atomic} qualifier skin. A leading
+// qualifier qualifies the BASE (the eventual innermost pointee, C 6.7.3), so
+// this runs BEFORE any pointer layer is folded on top. `qualified` merges bits,
+// so `_Atomic volatile int` is ONE {V,A} skin whichever wrap runs first.
+//
+// D-CSUBSET-ATOMIC-NONLOCKFREE: `_Atomic` is supported only on a naturally
+// aligned lock-free SCALAR. On an aggregate or a wide scalar (`isByValueClass`)
+// a copy decomposes to plain field/byte Load/Store AFTER `computeLayout` strips
+// this TRANSPARENT skin, so the type-based atomic-access belt would see only
+// plain types and the access would be SILENTLY non-atomic (C11 7.17.5). FAIL
+// LOUD and do NOT wrap.
+//
+// ★ EXTRACTED IN P65 (D-CSUBSET-DECL-QUALIFIER-BEFORE-STORAGE-CLASS) RATHER THAN
+// COPIED. C 6.7p2 makes the declaration specifiers unordered, so a qualifier can
+// now be written before the storage-class specifiers and reach the declaration
+// through a SECOND route — an initializer-inferred declaration (`volatile auto v
+// = 1;`) resolves no type-position head at all, so it cannot ride the resolver's
+// own scan. Two call sites, one body: the fail-loud arm and the merge order
+// cannot drift apart, which is exactly the [[a partial fix reads as a complete
+// one]] failure this would otherwise be.
+[[nodiscard]] TypeId
+applyBaseQualifiers(EngineState& s, Tree const& tree, TypeId base,
+                    bool isVolatile, bool isAtomic, NodeId diagNode,
+                    bool emitOnMiss) {
+    if (!base.valid()) return base;
+    if (isVolatile) base = s.lattice.interner().volatileQualified(base);
+    if (isAtomic) {
+        if (isByValueClass(s.lattice.interner(), base)) {
+            if (emitOnMiss) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_AtomicNonLockFree;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(diagNode);
+                d.actual   = std::string{tree.text(diagNode)};
+                s.reporter.report(std::move(d));
+            }
+        } else {
+            base = s.lattice.interner().atomicQualified(base);
+        }
+    }
+    return base;
+}
+
 [[nodiscard]] TypeId
 resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     NodeId node, ScopeId scope, bool emitOnMiss,
-                    bool emitTypeUse, bool& specifierDiagnosed) {
+                    bool emitTypeUse, bool& specifierDiagnosed,
+                    std::span<NodeId const> coQualifiers = {}) {
     if (!node.valid()) return InvalidType;
     auto const k = tree.kind(node);
     if (k == NodeKind::Internal) {
@@ -2905,6 +3073,38 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         bool baseIsVolatile = false;
         bool baseIsAtomic   = false;
         if (cfg.volatileMarker.has_value() || cfg.atomicMarker.has_value()) {
+            // ★ P65 (D-CSUBSET-DECL-QUALIFIER-BEFORE-STORAGE-CLASS, C 6.7p2): the
+            // CO-LOCATED qualifiers a caller found OUTSIDE this node but in the
+            // same declaration-specifier run — a `volatile` / `_Atomic` written
+            // BEFORE the storage-class specifiers (`volatile static int v;`)
+            // lands in the declaration's specifier PREFIX, which every positional
+            // consumer strips, so the head node alone can no longer answer "is
+            // the base qualified". They are read HERE rather than wrapped by the
+            // caller so the qualifier takes the ONE existing base-wrap path — the
+            // same interner call, the same {volatile,atomic} skin merge, and the
+            // same S_AtomicNonLockFree fail-loud — instead of a second copy that
+            // could drift from it.
+            // ⚠ They join the QUALIFIER scan ONLY, never the base-type race below:
+            // a specifier prefix can hold an attribute clause whose NAME would
+            // resolve through the scope chain and hijack the head
+            // (D-CSUBSET-TYPEDEF-HEAD-DECORATION-TYPE-HIJACK). They are also
+            // unconditionally BEFORE every star at this node — a declaration's
+            // specifiers all precede its declarators — so no star-run break
+            // applies to them.
+            for (NodeId q : coQualifiers) {
+                if (cfg.volatileMarker.has_value()
+                    && subtreeContainsToken(tree, q, *cfg.volatileMarker,
+                                            &s.idx().declByRule,
+                                            typeofOpaqueRules)) {
+                    baseIsVolatile = true;
+                }
+                if (cfg.atomicMarker.has_value()
+                    && subtreeContainsToken(tree, q, *cfg.atomicMarker,
+                                            &s.idx().declByRule,
+                                            typeofOpaqueRules)) {
+                    baseIsAtomic = true;
+                }
+            }
             for (auto child : kids) {
                 if (isPointerStar(child)) {
                     break;   // reached the star run — a later qualifier is the pointer object's
@@ -3059,34 +3259,8 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             // `volatile u32 **` = Ptr<Ptr<VolatileQual(U32)>> (C 6.7.3). Idempotent
             // in the interner. For zero stars this is the bare `volatile T` (the
             // scalar / split-form head); the caller's declarator adds any pointers.
-            if (baseIsVolatile)
-                inner = s.lattice.interner().volatileQualified(inner);
-            // D-CSUBSET-ATOMIC (FC17.9(d) 1b): wrap the base in the Atomic bit too.
-            // `qualified` merges bits, so `_Atomic volatile int` becomes ONE {V,A}
-            // skin regardless of which wrap runs first (order-independent).
-            if (baseIsAtomic) {
-                // D-CSUBSET-ATOMIC-NONLOCKFREE: `_Atomic` is supported this cycle ONLY
-                // on a naturally-aligned lock-free SCALAR. On an aggregate or a wide
-                // scalar (`isByValueClass`), a copy decomposes to plain field/byte
-                // Load/Store AFTER `computeLayout` strips this TRANSPARENT skin — the
-                // type-based atomic-access belt then sees only plain types, so it would
-                // be a SILENT non-atomic access (C11 7.17.5). FAIL LOUD + do NOT wrap
-                // (never let an atomic-qualified non-lock-free type reach codegen); the
-                // lock-table / large-atomic path is deferred beyond atomic cycle-1.
-                if (isByValueClass(s.lattice.interner(), inner)) {
-                    if (emitOnMiss) {
-                        ParseDiagnostic d;
-                        d.code     = DiagnosticCode::S_AtomicNonLockFree;
-                        d.severity = DiagnosticSeverity::Error;
-                        d.buffer   = tree.source().id();
-                        d.span     = tree.span(node);
-                        d.actual   = std::string{tree.text(node)};
-                        s.reporter.report(std::move(d));
-                    }
-                } else {
-                    inner = s.lattice.interner().atomicQualified(inner);
-                }
-            }
+            inner = applyBaseQualifiers(s, tree, inner, baseIsVolatile,
+                                        baseIsAtomic, node, emitOnMiss);
             for (std::uint32_t i = 0; i < ptrDepth; ++i)
                 inner = s.lattice.interner().pointer(inner);
             // c26: fold the abstract declarator (fn-ptr / array type-name) onto the
@@ -3234,10 +3408,11 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 [[nodiscard]] TypeId
 resolveTypeNode(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 NodeId node, ScopeId scope, bool emitOnMiss = true,
-                bool emitTypeUse = true) {
+                bool emitTypeUse = true,
+                std::span<NodeId const> coQualifiers = {}) {
     bool specifierDiagnosed = false;
     return resolveTypeNodeImpl(s, cfg, tree, node, scope, emitOnMiss,
-                               emitTypeUse, specifierDiagnosed);
+                               emitTypeUse, specifierDiagnosed, coQualifiers);
 }
 
 // True for the core integer kinds (signed + unsigned). Array lengths must be
@@ -5161,29 +5336,66 @@ specifierPrefixHasConstexpr(SemanticConfig const& cfg, Tree const& tree,
     return found;
 }
 
-// TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): true iff a declaration's
-// specifier prefix carries the C99 6.7.4 `inline` KEYWORD *without* one of
-// `cfg.inlineExternSpecifierTokens`. The `specifierPrefixHasConstexpr` mirror,
-// keyword-form only — `inline` has no attribute spelling (GNU's `__inline` /
-// `__inline__` are additional KEYWORD spellings that share the one token kind,
-// not attribute names), so unlike `specifierPrefixNamesNoreturn` there is no
+// TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER): the two DIFFERENT facts a
+// declaration's specifier prefix carries about the C `inline` keyword. The
+// `specifierPrefixNamesNoreturn` → `NoreturnSpelling` shape (P50), and for the
+// same reason: ONE scan, TWO named answers, because two consumers were asking
+// two different questions through one boolean and the narrower answer was
+// silently deciding the wider question.
+struct InlineSpelling {
+    // ★ C23 6.7.5p2's CONSTRAINT is about PRESENCE: "Function specifiers shall
+    // be used only in the declaration of an identifier for a function." No
+    // clause exempts a specifier written beside `extern`, so the non-function
+    // diagnostic must read THIS field.
+    bool present = false;
+    // ★ C23 6.7.5p7's rule is about presence WITHOUT `extern`: a definition is
+    // an INLINE definition (providing no external definition) only if every
+    // file-scope declaration spells `inline` without `extern`. The two tokens
+    // together mean the OPPOSITE of `inline` alone, which is why the `extern`
+    // test belongs inside the scan rather than in a second query — it is what
+    // lets the caller AND-merge ONE boolean across every declaration of the
+    // function and land on the standard's rule exactly.
+    bool withoutExtern = false;
+};
+
+// Keyword-form only — `inline` has no attribute spelling (GNU's `__inline` /
+// `__inline__` are additional KEYWORD spellings sharing the one token kind, not
+// attribute names), so unlike `specifierPrefixNamesNoreturn` there is no
 // identifier arm and a name-matching pass would be dead code.
 //
-// ★ THE `extern` TEST IS PART OF THE PREDICATE, NOT A SEPARATE QUERY, because
-// 6.7.4p7 is phrased over "the inline function specifier without extern" — the
-// two tokens together mean the OPPOSITE of `inline` alone (an EXTERNAL
-// definition rather than an inline definition). Folding both into one scan is
-// what lets the caller AND-merge a single boolean across every declaration of
-// the function and land on the standard's rule exactly.
+// ⚠⚠ P65 — WHY THIS RETURNS A PAIR AND NOT THE BOOLEAN IT USED TO. It returned
+// `sawInline && !sawExtern` alone, and BOTH consumers read that: the 6.7.5p7
+// `isInline` store (correct) AND the 6.7.5p2 non-function constraint (WRONG —
+// p2 is a presence rule). So an `extern` anywhere in the prefix switched the
+// CONSTRAINT off and the specifier was accepted and then dropped in silence.
+// ✔MEASURED 2026-09-08 through the shipped CLI at the PRE-CHANGE config: while
+// `inline int x = 1;` was `error[S_InlineNonFunction]` rc=1, `extern inline int
+// x = 1;` and `inline extern int x = 1;` were both **rc=0** with no mention of
+// `inline` at all — a silently dropped specifier, which is precisely the
+// failure this project's bar names. It is a TRUE answer to the WRONG question,
+// and it failed toward clean.
+// ✔THE REFERENCES on `extern inline int x = 1;`, each probed SEPARATELY on its
+// own translation unit: clang 18.1.3 `-std=c23` REFUSES ("'inline' can only
+// appear on functions"); MSVC 19.51.36252 REFUSES in `/std:c17` AND
+// `/std:clatest` (`error C2433: 'x': 'inline' not permitted on data
+// declarations`); gcc 13.3.0 `-std=c2x` accepts rc=0 but warns "variable 'x'
+// declared 'inline'" and its own `-pedantic-errors` turns that into an ERROR,
+// and it emits a BYTE-IDENTICAL object to the undecorated control — so it
+// accepts and honours the specifier NOWHERE, and casts no vote for its output.
+// Two working references refuse on point and ISO C 6.7.5p2 refuses.
+// ⚠ THE FUNCTION SPELLINGS MUST STAY SILENT, and they do because the constraint
+// arm is additionally gated on the declared type: `extern inline int f(void);`
+// and `extern inline int f(void){…}` are ordinary C that gcc, clang AND MSVC
+// all accept rc=0 (✔MEASURED), and they reach the arm with a FUNCTION form.
 //
-// Emits NOTHING: the 6.7.4p1 non-function constraint is reported by the caller,
-// which is the only site that knows the declared type.
-[[nodiscard]] bool
+// Emits NOTHING: the 6.7.5p2 constraint is reported by the caller, which is the
+// only site that knows the declared type.
+[[nodiscard]] InlineSpelling
 specifierPrefixHasInline(SemanticConfig const& cfg, Tree const& tree,
                          NodeId declNode, DeclarationRule const& decl) {
     if (!cfg.inlineKeywordToken.has_value()
         || !cfg.inlineKeywordToken->valid()) {
-        return false;
+        return {};
     }
     NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
     bool sawInline = false;
@@ -5192,10 +5404,10 @@ specifierPrefixHasInline(SemanticConfig const& cfg, Tree const& tree,
         SchemaTokenId const kind = tree.tokenKind(c);
         if (kind.v == cfg.inlineKeywordToken->v) { sawInline = true; return true; }
         for (SchemaTokenId ex : cfg.inlineExternSpecifierTokens)
-            if (kind == ex) { sawExtern = true; return false; }
+            if (kind == ex) { sawExtern = true; return true; }
         return true;
     });
-    return sawInline && !sawExtern;
+    return InlineSpelling{sawInline, sawInline && !sawExtern};
 }
 
 // TLS C1 (D-CSUBSET-THREAD-LOCAL): the storage-duration facts folded from ONE
@@ -5418,9 +5630,57 @@ scanSpecifierPrefixStorage(SemanticConfig const& cfg, Tree const& tree,
 // entry, so the specifier half is silent there and the row flag is the only
 // answer. Reading only the specifier would have silently turned every
 // block-scope `extern` into a tentative definition.
+//
+// ★★★ P65 — AN INITIALIZER ON THE DECLARATOR OUTRANKS BOTH OF THEM AT FILE
+// SCOPE (the file-scope half of D-FF2-3, whose refusal this narrows), and that
+// override is the third thing this predicate now says. C 6.9.2p1: *a
+// declaration of an identifier for an object that has file scope WITH AN
+// INITIALIZER is a definition* — no clause exempts `extern`, so the keyword is
+// REDUNDANT there rather than contradictory, and the object is defined with
+// external linkage. ✔MEASURED 2026-09-08 on `extern int x = 0;`, each reference
+// probed SEPARATELY: gcc 13.3.0 `-std=c2x` rc=0 (warns `'x' initialized and
+// declared 'extern'`), clang 18.1.3 `-std=c23` rc=0 (warns
+// `-Wextern-initializer`), MSVC 19.51.36231 `/std:c17` AND `/std:clatest` rc=0
+// SILENTLY; gcc/clang `nm` both show a DEFINED symbol and a second definition
+// in another TU still collides at link.
+//
+// ⚠ THE OVERRIDE IS SCOPE-GATED AND IT MUST STAY THAT WAY — the same spelling
+// inside a body is a CONSTRAINT VIOLATION, not the same rule seen twice.
+// C 6.7.11p5: *if the declaration of an identifier has block scope, and the
+// identifier has external or internal linkage, the declaration shall have no
+// initializer.* ✔MEASURED, all three refuse it: gcc `error: 'x' has both
+// 'extern' and initializer`, clang `error: declaration of block scope
+// identifier with linkage cannot have an initializer`, MSVC `error C2205`.
+// So `atFileScope` is not a convenience parameter: passing `true` from a
+// block-scope minting site would trade a loud refusal for a silent local
+// redefinition. The caller owns the scope fact (it is the one holding the
+// ScopeId), which is why the flag is a parameter rather than re-derived here.
+//
+// ⚠ AND IT IS PER-DECLARATOR, NOT PER-DECLARATION — `extern int a = 1, b;`
+// defines `a` and merely declares `b` (✔MEASURED: gcc AND clang both emit `D a`
+// and NO symbol for `b`). A declaration-level answer would either invent storage
+// for `b` or refuse `a`, so `declaratorNode` is what the initializer is read
+// from. An INVALID `declaratorNode` (the positional mint path, which has no
+// per-declarator carrier) simply declines the override and keeps the two
+// historic answers byte-identical.
+//
+// P65: forward declaration — `declaratorHasInitializer` is defined with the rest
+// of the declarator-walk helpers below, and the C 6.9.2p1 override above is the
+// FIRST consumer that needs it this early. Declaring it here rather than moving
+// the definition keeps that helper beside its siblings (the two init scans that
+// must agree about what a declarator DECORATION is).
+[[nodiscard]] bool declaratorHasInitializer(Tree const& tree,
+                                            DeclaratorConfig const& dc,
+                                            NodeId dNode);
+
 [[nodiscard]] bool
 declarationIsNonDefining(SemanticConfig const& cfg, Tree const& tree,
-                         NodeId declNode, DeclarationRule const& decl) {
+                         NodeId declNode, DeclarationRule const& decl,
+                         NodeId declaratorNode = NodeId{},
+                         bool atFileScope = false) {
+    if (atFileScope && declaratorNode.valid() && cfg.declarators.has_value()
+        && declaratorHasInitializer(tree, *cfg.declarators, declaratorNode))
+        return false;   // C 6.9.2p1 — the initializer DEFINES the object
     if (decl.nonDefiningDeclaration) return true;
     return scanSpecifierPrefixStorage(cfg, tree, declNode, decl).nonDefining;
 }
@@ -7101,8 +7361,14 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         if (!cfg.declarators.has_value()) return InvalidType;  // loader invariant
         TypeId head = InvalidType;
         if (decl.headChild.has_value() && *decl.headChild < kids.size()) {
+            // P65: hand the specifier prefix's own qualifier tokens to the
+            // resolver as co-located base qualifiers (C 6.7p2 order-free
+            // specifiers — see specifierPrefixQualifierTokens).
+            auto const prefixQuals =
+                specifierPrefixQualifierTokens(tree, declNode, decl);
             head = resolveTypeNode(s, cfg, tree, kids[*decl.headChild], scope,
-                                   emitOnMiss);
+                                   emitOnMiss, /*emitTypeUse=*/true,
+                                   prefixQuals);
         }
         if (decl.declaratorChild.has_value()) {
             if (*decl.declaratorChild < kids.size()) {
@@ -8504,6 +8770,16 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // rows (params/locals/globals) never set anonymousNameAllowed
                     // so the anon block is inert for them.
                     bool boundNamed = false;
+                    // P65 (the file-scope half of D-FF2-3): the scope half of C
+                    // 6.9.2p1's override, hoisted out of the
+                    // loop because it is a property of the DECLARATION's position,
+                    // not of any one declarator. `current` — not `here` — is the
+                    // scope the declarators BIND in (see `bindScope` below); `here`
+                    // is the child scope a function-definition row opened for its
+                    // params, and reading it would make every `extern`-with-
+                    // initializer inside a function body look file-scoped.
+                    bool const atFileScope =
+                        current.v == fileScopeOf(s, tree, current).v;
                     for (NodeId dNode : declarators) {
                         NodeId const nameNode = declaratorNameNode(
                             tree, dNode, *cfg.declarators);
@@ -8624,7 +8900,8 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // file scope, so the guard is a no-op there.
                         ScopeId bindScope = current;
                         if (isProto
-                            && !declarationIsNonDefining(cfg, tree, node, decl))
+                            && !declarationIsNonDefining(cfg, tree, node, decl,
+                                                         dNode, atFileScope))
                             bindScope = fileScopeOf(s, tree, current);
                         // c33 (D-CSUBSET-TENTATIVE-DEFINITION): a FILE-SCOPE object
                         // declaration with NO initializer is a TENTATIVE DEFINITION
@@ -8656,7 +8933,8 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         bool const isTentativeDefinition =
                             (effectiveKind == DeclarationKind::Variable)
                             && !isProto
-                            && !declarationIsNonDefining(cfg, tree, node, decl)
+                            && !declarationIsNonDefining(cfg, tree, node, decl,
+                                                         dNode, atFileScope)
                             && decl.declaratorListChild.has_value()
                             && bindScope == fileScopeOf(s, tree, current)
                             && cfg.declarators.has_value()
@@ -8730,7 +9008,8 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         if (!rec.asmName.empty()
                             && effectiveKind == DeclarationKind::Variable
                             && !isProto
-                            && !declarationIsNonDefining(cfg, tree, node, decl)
+                            && !declarationIsNonDefining(cfg, tree, node, decl,
+                                                         dNode, atFileScope)
                             && bindScope.v != fileScopeOf(s, tree, bindScope).v
                             && !scanSpecifierPrefixStorage(cfg, tree, node, decl)
                                     .staticStorage) {
@@ -8775,14 +9054,36 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             // strips it — either way the coarse token must not leak).
                             std::array<RuleId, 2> const typeofOpaqueRules{
                                 cfg.typeofTypeRule, cfg.typeofValueRule};
-                            rec.isConst = cfg.declarators.has_value()
+                            // P65 (D-CSUBSET-DECL-QUALIFIER-BEFORE-STORAGE-CLASS,
+                            // C 6.7p2): `const static int l = 3;` puts the const
+                            // in the STRIPPED specifier prefix, not in the head.
+                            // Without this the object would bind non-const and a
+                            // later `l = 4;` would be ACCEPTED — a silently wrong
+                            // program, which is why the grammar half and this half
+                            // are one change.
+                            auto const prefixQuals =
+                                specifierPrefixQualifierTokens(tree, node, decl);
+                            // ★ P65 — A HEAD-LESS ROW ANSWERS FROM THE PREFIX
+                            // ALONE, AND THAT IS NOT AN OPTIMISATION. An
+                            // `inferTypeFromInitializer` row (C23 `auto`) has NO
+                            // type-specifier head, so both scans below would fall
+                            // back to the whole declaration NODE — which spans the
+                            // INITIALIZER and re-opens the c58 const-token leak
+                            // (`auto p = (const char*)s;` marking `p` const). The
+                            // specifier prefix is the ONLY specifier region such a
+                            // row has, so it is the whole honest answer.
+                            rec.isConst =
+                                !decl.headChild.has_value()
+                                ? prefixQualifiersHave(tree, prefixQuals,
+                                                       *decl.constMarker)
+                                : cfg.declarators.has_value()
                                 ? declaratorObjectIsConst(
                                       tree, node, dNode, *cfg.declarators,
                                       *decl.constMarker, &s.idx().declByRule,
                                       (decl.headChild.has_value()
                                        && *decl.headChild < kids.size())
                                           ? kids[*decl.headChild] : NodeId{},
-                                      typeofOpaqueRules)
+                                      typeofOpaqueRules, prefixQuals)
                                 : subtreeContainsToken(
                                       tree, node, *decl.constMarker,
                                       &s.idx().declByRule);
@@ -8809,7 +9110,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                     *cfg.declarators, *decl.constMarker,
                                     &s.idx().declByRule, typeofOpaqueRules,
                                     decl.restrictMarker.value_or(SchemaTokenId{}),
-                                    &s.idx());
+                                    &s.idx(), prefixQuals);
                             }
                         }
                         // c27 (D-CSUBSET-VOLATILE-POINTEE): object-volatility is now
@@ -8895,7 +9196,8 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // definition-is-defining suppression below covers both
                         // spellings by the same test it always used.
                         bool const isExtern =
-                            declarationIsNonDefining(cfg, tree, node, decl)
+                            declarationIsNonDefining(cfg, tree, node, decl,
+                                                     dNode, atFileScope)
                             && effectiveKind != DeclarationKind::Function;
                         rec.isExternDeclaration = isExtern;
                         // c33 (D-CSUBSET-TENTATIVE-DEFINITION): record the tentative
@@ -8907,7 +9209,58 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         boundNamed = true;
                         SymbolId const prior =
                             s.scopes.bind(bindScope, name, newId);
-                        if (prior.valid()) {
+                        if (prior.valid()
+                            && decl.inferTypeFromInitializer) {
+                            // ★★★ P65 — C23's UNDERSPECIFIED-DECLARATION rule, and it
+                            // is the one place an inferred declaration must NOT reach
+                            // the merge table. An inference declaration derives the
+                            // identifier's type FROM its own initializer, so a
+                            // declaration of the same name that is already in scope
+                            // has nothing to merge with: the two would have to agree
+                            // about a type only one of them states. Both references
+                            // refuse it, and the refusal is ASYMMETRIC, which is
+                            // exactly why the merge table cannot express it —
+                            // ✔MEASURED 2026-09-08, gcc 13.3.0 (-std=c2x) and clang
+                            // 18.1.3 (-std=c23) probed SEPARATELY:
+                            //   `extern int g;  auto g = 42;`  → BOTH rc=1
+                            //   `int g;         auto g = 42;`  → BOTH rc=1
+                            //   `static int g;  auto g = 42;`  → BOTH rc=1
+                            //     (gcc "underspecified declaration of 'g', which is
+                            //      already declared in this scope"; clang
+                            //      "redefinition of 'g' with a different type:
+                            //      'auto' vs 'int'")
+                            // while the SAME pairs in the OPPOSITE order are rc=0 on
+                            // both — `auto g = 42; extern int g;` and
+                            // `auto g = 42; int g;` are legal. The merge table reads
+                            // the pair (priorNonDef, newNonDef) and is order-blind on
+                            // the nonDefining→definition arm, so it would silently
+                            // accept the refused order; this arm is what makes the
+                            // ORDER decide, and it fires only when the INFERENCE
+                            // declaration is the later one.
+                            //
+                            // Config-keyed on `inferTypeFromInitializer`, so it is the
+                            // property that makes the rule true — not a rule name and
+                            // not a scope. It therefore also covers the block-scope
+                            // and for-init inference rows, where the same asymmetry
+                            // holds and both references also refuse.
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_RedeclaredSymbol;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(nameNode);
+                            d.actual   = std::format(
+                                "'{}' is already declared in this scope, so its type "
+                                "cannot be inferred from an initializer here", name);
+                            auto const& priorRec = s.symbols.at(prior);
+                            if (priorRec.tree.v == tree.id().v) {
+                                d.related.push_back(RelatedLocation{
+                                    tree.source().id(),
+                                    tree.span(priorRec.declNode),
+                                    "previously declared here",
+                                });
+                            }
+                            s.reporter.report(std::move(d));
+                        } else if (prior.valid()) {
                             // The new decl's category (Function via Function-kind or a
                             // bare proto, else Variable/Type/Table) is read from its
                             // record inside the helper. A real function definition is
@@ -9807,9 +10160,17 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
             // head) fire here, at the row's own definitive visit.
             if (decl.isDeclaratorMode() && cfg.declarators.has_value()) {
                 TypeId headTy = InvalidType;
+                // P65: the declaration's own specifier-prefix qualifiers ride
+                // along as co-located BASE qualifiers, so `volatile static int
+                // v;` builds VolatileQual(I32) exactly as `static volatile int
+                // v;` does. Without them the volatile would be dropped in
+                // SILENCE — the one outcome this compiler may never produce.
+                auto const prefixQuals =
+                    specifierPrefixQualifierTokens(tree, node, decl);
                 if (decl.headChild.has_value() && *decl.headChild < kids.size()) {
                     headTy = resolveTypeNode(
-                        s, cfg, tree, kids[*decl.headChild], here);
+                        s, cfg, tree, kids[*decl.headChild], here,
+                        /*emitOnMiss=*/true, /*emitTypeUse=*/true, prefixQuals);
                 }
                 // FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): an
                 // `inferTypeFromInitializer` row has NO head — the declared
@@ -9824,8 +10185,29 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                 // never silently resurrect the declaration).
                 bool inferenceRejected = false;
                 if (decl.inferTypeFromInitializer) {
+                    // P65: this row resolves no type-position head, so the
+                    // resolver's own co-located qualifier scan never runs for it —
+                    // yet `volatile auto v = 1;` and `_Atomic auto a = 1;` PARSE
+                    // now that the specifier run is order-free (both accepted by
+                    // gcc 13.3.0 and clang 18.1.3, probed separately). The
+                    // qualifier is applied to the INFERRED type through the SAME
+                    // `applyBaseQualifiers` body the resolver uses, so the
+                    // non-lock-free `_Atomic` refusal stays fail-loud here too.
+                    // ⚠ It is applied AFTER the inference, never before: C23
+                    // 6.7.9 infers from the initializer's UNQUALIFIED type (the
+                    // arm's own `stripVolatile`), and the declaration's written
+                    // qualifier then qualifies the declared object.
                     headTy = resolveAutoInferredDeclaration(
                         s, cfg, tree, node, decl, kids, here);
+                    headTy = applyBaseQualifiers(
+                        s, tree, headTy,
+                        cfg.volatileMarker.has_value()
+                            && prefixQualifiersHave(tree, prefixQuals,
+                                                    *cfg.volatileMarker),
+                        cfg.atomicMarker.has_value()
+                            && prefixQualifiersHave(tree, prefixQuals,
+                                                    *cfg.atomicMarker),
+                        node, /*emitOnMiss=*/true);
                     inferenceRejected = !headTy.valid();
                 }
                 // kindByChild discriminator (mirrors the legacy arm): a
@@ -9943,11 +10325,16 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                     // list (`_Noreturn int a, b;`), the alignasContextReported
                     // precedent one page up.
                     bool noreturnNonFnReported = false;
-                    // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C99 6.7.4):
-                    // does this declaration's specifier prefix spell `inline`
-                    // WITHOUT `extern`? Computed ONCE per declaration (the
-                    // `declNoreturn` shape); STORED per-declarator below.
-                    bool const declHasInline =
+                    // TF-C79 (D-CSUBSET-INLINE-FUNCTION-SPECIFIER, C23 6.7.5):
+                    // BOTH readings of this declaration's `inline` spelling —
+                    // `.present` for p2's presence CONSTRAINT and
+                    // `.withoutExtern` for p7's inline-definition rule. Computed
+                    // ONCE per declaration (the `declNoreturn` shape); consumed
+                    // per-declarator below. ⚠ P65: this used to be ONE boolean
+                    // carrying only the p7 reading, and the p2 constraint read
+                    // it too — see `specifierPrefixHasInline`'s own block for
+                    // the measurement of what that silently accepted.
+                    InlineSpelling const declInline =
                         specifierPrefixHasInline(cfg, tree, node, decl);
                     // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): fold the standard-
                     // attribute effects from this declaration's specifier
@@ -10124,7 +10511,9 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // define"; the per-declaration fact can.
                         bool const allowIncomplete =
                             decl.allowFlexibleArray
-                            || declarationIsNonDefining(cfg, tree, node, decl);
+                            || declarationIsNonDefining(
+                                   cfg, tree, node, decl, dNode,
+                                   here.v == fileScopeOf(s, tree, here).v);
                         // D-CSUBSET-INCOMPLETE-ARRAY-TYPEDEF: a row that declares a
                         // TYPE rather than an object may name an INCOMPLETE array
                         // (C 6.7.6.2p1) — `typedef int T[];`. Config-declared via
@@ -10878,17 +11267,48 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         //
                         // ★ THE NON-FUNCTION CASE IS LOUD, NOT INERT — the one
                         // place this departs from `declNoreturn` right above.
-                        // 6.7.4p1 confines the specifier to "the declaration of
-                        // a function", and unlike a stray `_Noreturn` (whose
-                        // loss is a safe miss) a dropped `inline` here would be
-                        // a specifier the compiler parsed and then honored
-                        // nowhere. `isFunctionForm` keeps a declarator whose
-                        // TYPE failed to resolve from producing a second,
-                        // misleading diagnostic on top of its own.
-                        if (isFnSig && declHasInline) {
+                        // 6.7.5p2 confines the specifier to "the declaration of
+                        // an identifier for a function", and unlike a stray
+                        // `_Noreturn` (whose loss is a safe miss) a dropped
+                        // `inline` here would be a specifier the compiler parsed
+                        // and then honored nowhere. `isFunctionForm` keeps a
+                        // declarator whose TYPE failed to resolve from producing
+                        // a second, misleading diagnostic on top of its own.
+                        //
+                        // ⚠⚠ P65 — THE TWO ARMS READ TWO DIFFERENT FIELDS, AND
+                        // THAT SPLIT IS A DEFECT FIX RATHER THAN A TIDY-UP. They
+                        // both used to read the p7 predicate (`inline` WITHOUT
+                        // `extern`), so an `extern` in the prefix switched the p2
+                        // CONSTRAINT off: ✔MEASURED at the pre-change tree,
+                        // `extern inline int x = 1;` and `inline extern int
+                        // x = 1;` were rc=0 with NO mention of `inline`, while
+                        // the bare `inline int x = 1;` was refused — an accept
+                        // with the specifier silently dropped, on a program clang
+                        // 18.1.3 and MSVC 19.51.36252 both REFUSE and whose
+                        // acceptance by gcc 13.3.0 emits an object BYTE-IDENTICAL
+                        // to the undecorated control. The STORE keeps reading
+                        // `.withoutExtern` because 6.7.5p7 really is phrased that
+                        // way; the CONSTRAINT reads `.present` because 6.7.5p2
+                        // really is not.
+                        // ⚠ AND THEY ARE TWO INDEPENDENT `if`s, NOT A CHAIN.
+                        // While both read one boolean the `else` silently
+                        // supplied the constraint arm's `!isFnSig` term; with
+                        // the fields split it no longer can, and leaving the
+                        // chain would REFUSE the perfectly ordinary prototype
+                        // `extern inline int f(void);` — `isFnSig` true,
+                        // `.withoutExtern` false, so it would fall through to a
+                        // constraint arm whose only function gate
+                        // (`isFunctionForm`) is set for a DEFINITION and not for
+                        // a declaration. ✔MEASURED: gcc 13.3.0, clang 18.1.3 and
+                        // MSVC 19.51.36252 all take that prototype rc=0, and so
+                        // does `extern inline int f(void){…}`. The `!isFnSig`
+                        // term is therefore written out, exactly as the
+                        // `declNoreturn` arm above writes its own.
+                        if (isFnSig && declInline.withoutExtern) {
                             s.symbols.at(sym).isInline = true;
-                        } else if (declHasInline && declTy.valid()
-                                   && !isFunctionForm) {
+                        }
+                        if (declInline.present && !isFnSig && declTy.valid()
+                            && !isFunctionForm) {
                             ParseDiagnostic d;
                             d.code     = DiagnosticCode::S_InlineNonFunction;
                             d.severity = DiagnosticSeverity::Error;
@@ -10897,7 +11317,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                                                     : node);
                             d.actual   =
                                 "'inline' on a declaration that does not declare "
-                                "a function (C99 6.7.4p1)";
+                                "a function (C99 6.7.4p1, C23 6.7.5p2)";
                             s.reporter.report(std::move(d));
                         }
                         // ★ TF-C73 ROOT (b) — DECLARATOR-DEPTH ATTRIBUTES.

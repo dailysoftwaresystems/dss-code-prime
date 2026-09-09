@@ -1091,8 +1091,15 @@ struct LoweredAgg {
     std::string                messages;   // C4b (I2): concatenated diag text for substring pins
     // A1 (audit fold): the CODE half, so a refusal pin can assert code AND text.
     // Text alone would go green on a diagnostic that says the right words under a
-    // wrong code; a code alone cannot tell two arms of this function apart (every
-    // arm of `lowerMirGlobalsToDataItems` shares `K_NoMatchingObjectFormat`).
+    // wrong code; a code alone could not tell two arms of this function apart,
+    // because every arm of `lowerMirGlobalsToDataItems` used to share
+    // `K_NoMatchingObjectFormat`. ★ THAT SECOND HALF IS NO LONGER TRUE AND THE
+    // FIELD IS NOW LOAD-BEARING (D-DIAG-OVERLAP-REFUSAL-CODE-NOT-DISCRIMINATING,
+    // P65): the arms are partitioned across `K_OverlappingStaticInitUnsupported`,
+    // `K_StaticDataEncoderInvariantBreach` and the residual
+    // `K_NoMatchingObjectFormat`, so a code assertion here now DISCRIMINATES.
+    // Both are still collected — the pair is what proves a cause is filed under
+    // its own code AND says the words that cause owes.
     std::vector<DiagnosticCode> codes;
 };
 [[nodiscard]] LoweredAgg lowerOneAggGlobal(
@@ -2220,7 +2227,12 @@ TEST(AsmAggregateGlobal, NonZeroInitIntoOverlappingStructFailsLoudWithOverlapRea
     EXPECT_TRUE(r.items.empty())
         << "a refused initializer must emit NO partial member bytes";
     ASSERT_EQ(r.codes.size(), 1u);
-    EXPECT_EQ(r.codes[0], DiagnosticCode::K_NoMatchingObjectFormat);
+    // D-DIAG-OVERLAP-REFUSAL-CODE-NOT-DISCRIMINATING (P65): this assertion used
+    // to read `K_NoMatchingObjectFormat` — the code every arm of
+    // `lowerMirGlobalsToDataItems` shared — so it could not tell this cause from
+    // the other seventeen and the pin rested entirely on the message substrings
+    // below. The cause now carries its own code out of `encodeAggregateValue`.
+    EXPECT_EQ(r.codes[0], DiagnosticCode::K_OverlappingStaticInitUnsupported);
     EXPECT_NE(r.messages.find("overlapping explicit-offset struct is unsupported"),
               std::string::npos)
         << "the refusal must name the ACTUAL cause: " << r.messages;

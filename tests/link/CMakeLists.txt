@@ -631,3 +631,40 @@ dss_add_test(NAME link/test_elf_build_id_note
              SOURCES test_elf_build_id_note.cpp)
 target_link_libraries(dss_link_test_elf_build_id_note
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET: an ELF image's
+# allocated sections must sit on the alignment their own headers declare, on BOTH
+# shipped ports and BOTH image arms. Its own target because the two ports' declared
+# bases make the luck run in OPPOSITE directions (0x400000 divides 8192, 0x401000
+# does not), so a cell that passes proves nothing about its sibling -- exactly the
+# way a single-port pin called half of this fixed.
+dss_add_test(NAME link/test_elf_image_overaligned_section_placement
+             SOURCES test_elf_image_overaligned_section_placement.cpp)
+
+# D-LINK-MACHO-IMAGE-OVERALIGNED-STATIC-IS-A-LOAD-TIME-COIN-FLIP: the Mach-O half
+# of the ELF over-alignment row. Two halves in one target because they are two
+# answers to ONE question and separating them would let a reader take the
+# refutation for the whole finding: the LOAD-TIME half is a real defect (Mach-O's
+# segment_command_64 has no p_align equivalent, so an above-page static is a coin
+# flip on dyld's slide and is now refused at image.segmentPageSize), while the
+# ADDRESS-vs-OFFSET half was already fail-loud here and is pinned through a
+# DERIVED document, since every shipped darwin base divides every admitted
+# alignment and no shipped document can reach the mechanism. Its own target
+# because the derived-document arm needs the json link, as the build-id sibling
+# above does.
+dss_add_test(NAME link/test_macho_image_overaligned_section_placement
+             SOURCES test_macho_image_overaligned_section_placement.cpp)
+target_link_libraries(dss_link_test_macho_image_overaligned_section_placement
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LINK-ELF-STATIC-EXEC-VA-CHAIN-ROUNDS-TO-AN-UNDECLARED-PAGE +
+# D-LINK-ELF-STATIC-IMAGE-BASE-UNDERFLOWS-BELOW-ITS-OWN-HEADERS: what the static
+# ELF layout does with the two document values its VA chain reads -- an absent
+# `elf.pageAlign` (the relocatable and staticlib documents declare none) and a
+# `.text` virtualAddress standing below the headers the image emits. Its own
+# target because the second half needs a DERIVED document, so it carries the
+# json link the shipped-document tests do not.
+dss_add_test(NAME link/test_elf_static_va_chain_document_boundaries
+             SOURCES test_elf_static_va_chain_document_boundaries.cpp)
+target_link_libraries(dss_link_test_elf_static_va_chain_document_boundaries
+                      PRIVATE nlohmann_json::nlohmann_json)

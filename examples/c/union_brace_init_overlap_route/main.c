@@ -38,7 +38,7 @@
  *     fail to compile with error[H_UnsupportedLoweringForKind]
  *     "brace-initialization of an overlapping explicit-offset struct";
  *   * delete it in `encodeAggregateValue` and blocks (4)-(5) fail with
- *     error[K_NoMatchingObjectFormat] "static initialization of an overlapping
+ *     error[K_OverlappingStaticInitUnsupported] "static initialization of an overlapping
  *     explicit-offset struct".
  * The `release` arm re-runs all of it through the shipped optimizer. */
 

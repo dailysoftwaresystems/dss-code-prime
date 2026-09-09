@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -1759,10 +1760,17 @@ encodeElfExecDynamic(
     // to the layout's max item alignment (gABI sh_addralign). Empty when
     // the module has no rodata → zero-size section, `.plt` follows `.text`
     // directly (byte-identical to the pre-rodata image).
+    //
+    // The alignment is applied to the ADDRESS and the file offset derived from
+    // it (`imageOffsetForAlignedVa`), not the other way round: `baseImageVa` is
+    // only `pageAlign`-aligned, so aligning the OFFSET would satisfy any
+    // stronger request — an over-aligned `const` object — only by the accident
+    // of the base. See the helper for the measurement.
     std::uint64_t const rodataAlignDyn =
         hasRodataDyn ? rodataDynLayout.maxAlign : 1;
     std::uint64_t const rodataOff =
-        hasRodataDyn ? alignUp(textOff + text.size(), rodataAlignDyn)
+        hasRodataDyn ? link::format::imageOffsetForAlignedVa(
+                           baseImageVa, textOff + text.size(), rodataAlignDyn)
                      : textOff + text.size();
     std::uint64_t const rodataVa  = baseImageVa + rodataOff;
     std::uint64_t const rodataSz  = rodataDyn.size();
@@ -1952,11 +1960,19 @@ encodeElfExecDynamic(
     // alignments (each layout.maxAlign already folds its schema floor).
     // HIGH-1(b): glibc computes each thread's block base as an
     // alignUp(..., p_align)-adjusted address — the link-time tpoffs
-    // below are only valid when tdataVa ≡ 0 (mod tlsAlign). tdataOff is
-    // alignUp(page-aligned ptLoad2Start, tlsAlign), so that holds
-    // whenever tlsAlign ≤ pageAlign; a stricter-than-page TLS alignment
-    // has no shipped producer (alignas caps at 256) but would silently
-    // break the congruence — fail loud instead.
+    // below are only valid when tdataVa ≡ 0 (mod tlsAlign). `tdataOff`
+    // is chosen ADDRESS-FIRST (`imageOffsetForAlignedVa`), so that holds
+    // for any tlsAlign; the refusal below stays because PT_LOAD #2's
+    // p_align is `pageAlign`, and a TLS block asking for more than the
+    // segment's own mapping granularity is a promise this image cannot
+    // keep. A stricter-than-page TLS alignment has no shipped producer
+    // (alignas caps at 256) — fail loud rather than emit it.
+    // ⚠ The earlier form of this note reasoned that `alignUp` on the
+    // page-aligned `ptLoad2Start` was sufficient. It was — but only
+    // because `baseImageVa` is itself pageAlign-aligned, which is the
+    // unstated premise that placed `.data` 4096 bytes off its requested
+    // 8192 boundary on `elf64-aarch64-linux-exec`
+    // (D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET).
     std::uint64_t tlsAlignAcc = 1;
     if (hasTdataDyn) tlsAlignAcc = std::max(tlsAlignAcc, tdataDynLayout.maxAlign);
     if (hasTbssDyn)  tlsAlignAcc = std::max(tlsAlignAcc, tbssDynLayout.maxAlign);
@@ -1975,7 +1991,9 @@ encodeElfExecDynamic(
         return {};
     }
     std::uint64_t const tdataOff =
-        hasTls ? alignUp(ptLoad2Start, tlsAlign) : ptLoad2Start;
+        hasTls ? link::format::imageOffsetForAlignedVa(baseImageVa,
+                                                       ptLoad2Start, tlsAlign)
+               : ptLoad2Start;
     std::uint64_t const tdataVa   = baseImageVa + tdataOff;
     std::uint64_t const tdataSpan = tdataDynLayout.spanSize;  // 0 if none
     // The per-thread block: tdata template bytes, then the tbss zero-fill
@@ -1999,8 +2017,16 @@ encodeElfExecDynamic(
         hasTls ? tdataOff + tdataSpan : ptLoad2Start;
     std::uint64_t const dataAlignDyn =
         hasDataDyn ? dataDynLayout.maxAlign : 1;
+    // ★ ADDRESS-FIRST (D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET).
+    // `.bss` two blocks down aligns its VA directly and was always right; `.data`
+    // aligned its FILE OFFSET and inherited whatever alignment `baseImageVa`
+    // happened to have. That asymmetry — same image, same walker, one section
+    // right and one wrong — is the whole defect, and closing it means the two
+    // now decide the same thing the same way.
     std::uint64_t const dataOff =
-        hasDataDyn ? alignUp(rwFileCursor, dataAlignDyn) : rwFileCursor;
+        hasDataDyn ? link::format::imageOffsetForAlignedVa(
+                         baseImageVa, rwFileCursor, dataAlignDyn)
+                   : rwFileCursor;
     std::uint64_t const dataVa  = baseImageVa + dataOff;
     std::uint64_t const dataSz  = dataDynLayout.spanSize;
 
@@ -3067,10 +3093,25 @@ encodeElfExecDynamic(
         appendPhdrEntry(PT_INTERP,  PF_R,        interpOff,    interpVa,
                         interp.size(), interp.size(), 1);
     }
+    // The LOAD-TIME half of
+    // D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET: a
+    // PT_LOAD's `p_align` is the granularity the loader slides a base-relative
+    // image on, so it must cover the strongest member the segment maps or an
+    // over-aligned object loses at LOAD what the placement above got right.
+    // The rule (and the measurement behind it) lives in the shared
+    // `segmentAlignForImageBase` — ONE owner, because this walker and the
+    // static one below would otherwise drift about what a segment claims.
+    auto segmentAlign = [&](std::uint64_t strongestMember) {
+        return link::format::segmentAlignForImageBase(baseImageVa, pageAlign,
+                                                      strongestMember);
+    };
     // PT_LOAD #1 R+X — Ehdr + PHT + [.interp] + .text + .plt + .dynsym
     //                  + .dynstr + .hash + .rela.dyn
     appendPhdrEntry(PT_LOAD,    PF_X | PF_R, 0,            baseImageVa,
-                    ptLoad1End,    ptLoad1End,    pageAlign);
+                    ptLoad1End,    ptLoad1End,
+                    segmentAlign(std::max({secText.addrAlign,
+                                           rodataAlignDyn,
+                                           buildIdAlignDyn})));
     // PT_LOAD #2 R+W — [.tdata] + [.data] + .got + .dynamic + [.bss].
     // p_filesz covers the file-backed sections (INCLUDING the `.tdata`
     // template bytes at the segment head — they must be mapped for the
@@ -3080,7 +3121,9 @@ encodeElfExecDynamic(
     // the per-thread copies live in loader-allocated TLS blocks
     // sized by PT_TLS p_memsz, not in this segment). D-LK4-DATA-PRODUCER.
     appendPhdrEntry(PT_LOAD,    PF_W | PF_R, ptLoad2Start, ptLoad2VaStart,
-                    ptLoad2FileSize, ptLoad2MemSize, pageAlign);
+                    ptLoad2FileSize, ptLoad2MemSize,
+                    segmentAlign(std::max({tlsAlign, dataAlignDyn,
+                                           bssAlignDyn, kGotSlotBytes})));
     appendPhdrEntry(PT_DYNAMIC, PF_W | PF_R, dynamicOff,   dynamicVa,
                     dynamicSz,     dynamicSz,     8);
     // PT_TLS (D-CSUBSET-THREAD-LOCAL, audit fold HIGH-2) — present ONLY
@@ -3969,11 +4012,29 @@ encode(AssembledModule const&    module,
     // the rodata section's addralign (D-LK1-ELF-EXEC-DATA-SECTIONS).
     // Computed HERE (now that `text.size()` is known) so it is in
     // scope for BOTH the symbolVa map below AND the file-layout pass
-    // further down. The file-offset congruence (rodata-from-text on
-    // disk == rodata-from-text in VA) is asserted at layout time.
+    // further down. The file offset the layout pass gives it is DERIVED
+    // from this address, so the two cannot disagree.
+    //
+    // ⚠ THE ROUND-UP IS APPLIED TO THE ADDRESS, NOT TO THE DELTA
+    // (D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET).
+    // `textVa + alignUp(text.size(), A)` aligns the DISTANCE FROM `.text`,
+    // which lands on a multiple of `A` only when `textVa` already is — and
+    // `.text`'s VA is DECLARED per format, so whether an over-aligned `const`
+    // is placed correctly used to depend on which document was loaded:
+    // ✔MEASURED, `elf64-x86_64-linux-exec` declares 0x401000 (NOT a multiple of
+    // 8192) while `elf64-aarch64-linux-exec` declares 0x400000 (which is). The
+    // form below is right for every declared base.
+    //
+    // ⚠ AND IT IS AN IMAGE ADDRESS, so it is computed only for an image. An
+    // ET_REL section is UNBOUND — the linker that consumes the object chooses
+    // where it goes — and this walker writes `sh_addr = 0` there. Evaluating
+    // the address anyway produced a discarded, plausible-looking number; the
+    // writable half of the same chain did it with an alignment the relocatable
+    // documents do not declare, which is the defect this gate's twin below
+    // closes.
     std::uint64_t const rodataSectionVa =
-        hasRodata
-            ? secText->virtualAddress + alignUp(text.size(), rodataAlign)
+        (isExec && hasRodata)
+            ? alignUp(secText->virtualAddress + text.size(), rodataAlign)
             : 0;
 
     // Writable data segment (R+W PT_LOAD #2) for `.data` + `.bss` —
@@ -4043,24 +4104,58 @@ encode(AssembledModule const&    module,
     // End of the read-only VA span (text + optional rodata + optional note).
     std::uint64_t const roSpanEndVa =
         hasBuildId ? buildIdSectionVa + buildIdNote.size() : roDataEndVa;
+    // ★★ THE WHOLE WRITABLE-SEGMENT VA CHAIN IS IMAGE-ONLY, AND SAYING SO IS
+    // THE FIX —
+    // D-LINK-ELF-STATIC-EXEC-VA-CHAIN-ROUNDS-TO-AN-UNDECLARED-PAGE.
+    // An ET_REL object has no segments and no addresses, and this chain used to
+    // be evaluated on that path anyway. Its first step rounds to
+    // `fmt.elf().pageAlign`, which the RELOCATABLE and STATICLIB documents
+    // declare NOWHERE — so the alignment arrived as 0, and `alignUp(v, 0)`
+    // returns 0 for every `v` (the mask computes `~(0 - 1)` = 0 and erases the
+    // value). ✔MEASURED with a temporary `std::source_location` parameter on
+    // `alignUp`: 37 such calls across the whole suite, every one from this
+    // function, every one `a = 0`, and NO other violating caller in any walker.
+    //
+    // ⚠ "IT COLLAPSES TO 0, WHICH IS WHAT AN ET_REL SECTION WANTS" IS ONLY HALF
+    // TRUE, AND THE OTHER HALF IS WHAT CHOSE THE FIX. ✔MEASURED on a real `.o`
+    // (`examples/c/alignment_overaligned_static_placed` through
+    // `elf64-x86_64-linux`): `writableSegVa` and `dataSectionVa` did collapse to
+    // 0, but `bssSectionVa` came out **24576**, because it is measured from
+    // `dataSectionVa + dataSize` and not from the collapsed page. What kept that
+    // harmless is not the arithmetic: it is that every consumer of these four
+    // values sits inside this function's `if (isExec)` block and every `sh_addr`
+    // they reach is written `isExec ? va : 0`.
+    //
+    // ⚠ THE OTHER CANDIDATE FIX WAS BUILT, MEASURED SIDE BY SIDE, AND REJECTED.
+    // Clamping the call — `alignUp(roSpanEndVa, std::max<std::uint64_t>(1,
+    // pageAlignStatic))` — defines the ill-formed call away instead of removing
+    // it, and on that same `.o` it turns ONE meaningless non-zero address into
+    // THREE (seg 2838, data 8192, bss 32768). Gating removes the call outright:
+    // `isExec` means the document describes an image, and `elf_backend`'s
+    // validate() refuses an ET_EXEC or ET_DYN document that declares no
+    // `elf.pageAlign` and refuses any `pageAlign` that is not a positive power
+    // of two — so the argument is guaranteed at the DOCUMENT boundary, which is
+    // what lets `detail::alignUp` carry its precondition assert.
     std::uint64_t const writableSegVa =
-        hasWritableSeg ? alignUp(roSpanEndVa, pageAlignStatic) : 0;
+        (isExec && hasWritableSeg) ? alignUp(roSpanEndVa, pageAlignStatic) : 0;
     std::uint64_t const dataSectionVa =
-        hasData ? alignUp(writableSegVa, dataAlign) : 0;
+        (isExec && hasData) ? alignUp(writableSegVa, dataAlign) : 0;
     // `.got` sits between `.data` and `.bss`: file-backed like `.data` (its
     // slots carry resolved VAs, not zeroes), and BEFORE `.bss` because `.bss`
     // must stay last so PT_LOAD #2's p_memsz tail is the only thing past
     // p_filesz.
     std::uint64_t const gotSectionVa =
-        hasGot ? alignUp((hasData ? dataSectionVa + dataSize : writableSegVa),
-                         kGotSlotBytes)
-               : 0;
+        (isExec && hasGot)
+            ? alignUp((hasData ? dataSectionVa + dataSize : writableSegVa),
+                      kGotSlotBytes)
+            : 0;
     std::uint64_t const bssSectionVa =
-        hasBss ? alignUp((hasGot    ? gotSectionVa + gotSize
-                          : hasData ? dataSectionVa + dataSize
-                                    : writableSegVa),
-                         bssAlign)
-               : 0;
+        (isExec && hasBss)
+            ? alignUp((hasGot    ? gotSectionVa + gotSize
+                       : hasData ? dataSectionVa + dataSize
+                                 : writableSegVa),
+                      bssAlign)
+            : 0;
 
     // `.got` body + the slot-address map, declared OUT here because the
     // section layout below needs the bytes and the `isExec` block below needs
@@ -5198,12 +5293,32 @@ encode(AssembledModule const&    module,
                   + symtab.size() + strtab.size() + shstrtab.size() + 7 * 64);
     bytes.resize(kEhdrSize + phtSize);  // placeholder; rewritten below
 
+    // The image's verbatim-mapping delta: `va == imageBaseVa + fileOffset` for
+    // every ALLOCATED section of an ET_EXEC image. DERIVED from `.text`'s
+    // emitted file offset immediately below rather than assumed from
+    // `pageAlign`, so it stays true even if the Ehdr + PHT ever grow past a
+    // page. Unused (and zero) on the ET_REL arm, which has no addresses at all.
+    std::uint64_t imageBaseVa = 0;
+
     // Single layout lambda — `vector<uint8_t> const&` decays to
     // `span<uint8_t const>` so both the in-memory section bodies
     // (text / relaText / symtab) and the StringTable views share
     // one code path.
-    auto layoutSection = [&](SectionHeader& h, std::span<std::uint8_t const> body) {
-        if (h.addr_align > 1) padTo(bytes, h.addr_align);
+    //
+    // `allocVa`, when given, is the ADDRESS the writer already chose for an
+    // allocated exec section; the file offset is then whatever that address
+    // implies (`va - imageBaseVa`), never an independently rounded cursor.
+    // ⚠ ROUNDING THE FILE CURSOR TO `sh_addralign` INSTEAD agrees with the
+    // chosen address only while `imageBaseVa` is itself a multiple of that
+    // alignment — the accident that decided, per DECLARED `.text` VA, whether
+    // an over-aligned object landed where it asked
+    // (D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET). A
+    // section with no address (ET_REL, and the non-allocated tables) keeps the
+    // plain alignment pad, which is the whole and correct rule there.
+    auto layoutSection = [&](SectionHeader& h, std::span<std::uint8_t const> body,
+                             std::optional<std::uint64_t> allocVa = std::nullopt) {
+        if (allocVa.has_value()) padToOffset(bytes, *allocVa - imageBaseVa);
+        else if (h.addr_align > 1) padTo(bytes, h.addr_align);
         h.offset = bytes.size();
         bytes.insert(bytes.end(), body.begin(), body.end());
     };
@@ -5221,20 +5336,68 @@ encode(AssembledModule const&    module,
     std::uint64_t const pageAlign = fmt.elf().pageAlign;
     if (isExec) padTo(bytes, pageAlign);
     layoutSection(hText, text);
+    // `.text` is placed; the image's constant VA<->file delta is now KNOWN, and
+    // every allocated section below is written at the offset its chosen ADDRESS
+    // implies (see `layoutSection`'s `allocVa`). Derived rather than assumed:
+    // the alternative, `secText->virtualAddress - pageAlign`, silently becomes
+    // wrong the day the Ehdr + program headers outgrow one page.
+    //
+    // ⚠ BUT THE BASE MUST EXIST FIRST, AND UNTIL P65 NOTHING SAID SO —
+    // D-LINK-ELF-STATIC-IMAGE-BASE-UNDERFLOWS-BELOW-ITS-OWN-HEADERS.
+    // `.text`'s VA is DECLARED per document and its file offset is what this
+    // pass just emitted; a document that puts `.text` BELOW the headers makes
+    // the subtraction WRAP. ★ AND THE WRAP CANCELS, which is why it is silent:
+    // every allocated section is then written at `va - imageBaseVa`, i.e.
+    // `va - textVa + textOff`, an ordinary small offset, so `.rodata`'s file/VA
+    // congruence guard below PASSES and the object looks well formed. What does
+    // not survive is the PT_LOAD: `p_vaddr` is the declared sub-header VA while
+    // `p_offset` is a whole page, so the kernel's
+    // `p_vaddr % p_align == p_offset % p_align` rule breaks and execve() answers
+    // ENOEXEC with nothing said by the toolchain. ✔MEASURED with this guard
+    // removed, on BOTH shipped exec documents: `.text` VA 0x800 emits a clean
+    // image, zero diagnostics, whose PT_LOAD #0 maps file offset 0x1000 at
+    // address 0x800 with p_align 0x1000.
+    //
+    // ⚠ THE SHAPE MATTERS, AND THE FIRST DRAFT OF THIS PARAGRAPH GOT IT WRONG:
+    // it said every congruence guard below passes. ✔MEASURED — they do not. A
+    // module WITH writable data is caught further down by the `.data` belt
+    // (`textVa(2048) + fileDelta(4096) != dataSectionVa(4096)`), which refuses
+    // the build but names `.data` rather than the base that underflowed. It is
+    // the TEXT-ONLY image that reaches no belt at all and ships. So this guard's
+    // unique value is that shape, and it also turns the other one from a
+    // misdirected refusal into an accurate one.
+    //
+    // validate() rejects only `virtualAddress == 0`, so this is reachable from a
+    // document it accepts, and `encodeElfExecDynamic` has refused the same shape
+    // since it was written ("baseImageVa would underflow") while this walker had
+    // no belt at all. Stated against the offset actually emitted rather than
+    // against `pageAlign`, for the same reason the subtraction itself is.
+    if (isExec && secText->virtualAddress < hText.offset) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("elf::encode (ET_EXEC): .text virtualAddress ({:#x}) "
+                         "is below the file offset this image gives it ({:#x}) "
+                         "— the image base would UNDERFLOW. Every allocated "
+                         "section would still be written at a sane-looking "
+                         "offset (the two wraps cancel), but the PT_LOAD would "
+                         "break the kernel's p_vaddr/p_offset page congruence "
+                         "and execve() would answer ENOEXEC with no diagnostic. "
+                         "The format document must leave room below `.text` for "
+                         "the Ehdr and the program headers. D-LK6-3.",
+                         secText->virtualAddress, hText.offset));
+        return {};
+    }
+    if (isExec) imageBaseVa = secText->virtualAddress - hText.offset;
     // `.rodata` immediately after `.text` (D-LK1-ELF-EXEC-DATA-SECTIONS).
-    // The on-disk rodata-from-text delta MUST equal the
-    // VA rodata-from-text delta so the single PT_LOAD's file<->mem
-    // mapping is congruent: hText.offset is page-aligned (already
-    // rodataAlign-aligned since rodataAlign | pageAlign for the
-    // shipped 8|4096 case), and layoutSection pads rodata to
-    // rodataAlign — so `hRodata.offset - hText.offset ==
-    // alignUp(text.size(), rodataAlign)`, matching the early
-    // `rodataSectionVa`. Defend that congruence with a fail-loud
-    // guard (a non-divisor rodataAlign or future layout change would
-    // otherwise silently desync VA from file offset → the loader
-    // maps the wrong bytes at the global's runtime address).
+    // The on-disk rodata-from-text delta MUST equal the VA rodata-from-text
+    // delta so the single PT_LOAD's file<->mem mapping is congruent. That now
+    // holds BY CONSTRUCTION — the offset is computed from `rodataSectionVa` —
+    // and the fail-loud guard below is kept as the belt on that construction
+    // (a desync would make the loader map the wrong bytes at the global's
+    // runtime address, and nothing downstream would notice).
     if (hasRodata) {
-        layoutSection(hRodata, rodataBytes);
+        layoutSection(hRodata, rodataBytes,
+                      isExec ? std::optional<std::uint64_t>{rodataSectionVa}
+                             : std::nullopt);
         // ET_REL has no VA — the file/VA congruence check (a PT_LOAD invariant)
         // is exec-only. D-LK-OBJECT-DATA-SECTION-RELOCATABLE.
         if (isExec) {
@@ -5258,7 +5421,7 @@ encode(AssembledModule const&    module,
     // `.rodata`: the note is SHF_ALLOC, so a desync would make the loader map
     // the wrong bytes at the address `readelf -n` reads the build id from.
     if (hasBuildId) {
-        layoutSection(hNote, buildIdNote);
+        layoutSection(hNote, buildIdNote, buildIdSectionVa);
         std::uint64_t const noteFileDelta = hNote.offset - hText.offset;
         if (secText->virtualAddress + noteFileDelta != buildIdSectionVa) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
@@ -5282,7 +5445,9 @@ encode(AssembledModule const&    module,
         padTo(bytes, pageAlign);   // PT_LOAD #2 page boundary (file + VA)
     }
     if (hasData) {
-        layoutSection(hData, dataLayout.bytes);
+        layoutSection(hData, dataLayout.bytes,
+                      isExec ? std::optional<std::uint64_t>{dataSectionVa}
+                             : std::nullopt);
         if (isExec) {   // exec-only file/VA congruence (PT_LOAD invariant)
             std::uint64_t const fileDelta = hData.offset - hText.offset;
             if (secText->virtualAddress + fileDelta != dataSectionVa) {
@@ -5306,7 +5471,7 @@ encode(AssembledModule const&    module,
     // tail. ET_EXEC only, and its file/VA congruence is asserted like `.data`'s
     // (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS).
     if (hasGot) {
-        layoutSection(hGot, gotBytes);
+        layoutSection(hGot, gotBytes, gotSectionVa);
         std::uint64_t const gotFileDelta = hGot.offset - hText.offset;
         if (secText->virtualAddress + gotFileDelta != gotSectionVa) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
@@ -5505,7 +5670,7 @@ encode(AssembledModule const&    module,
         phdr.reserve(kPtLoadCount * kProgramHeaderSize);
         auto appendPhdr = [&](std::uint32_t pFlags, std::uint64_t pOffset,
                                std::uint64_t pVaddr, std::uint64_t pFilesz,
-                               std::uint64_t pMemsz) {
+                               std::uint64_t pMemsz, std::uint64_t pAlign) {
             appendU32LE(phdr, 1);             // p_type = PT_LOAD
             appendU32LE(phdr, pFlags);
             appendU64LE(phdr, pOffset);
@@ -5513,7 +5678,17 @@ encode(AssembledModule const&    module,
             appendU64LE(phdr, pVaddr);        // p_paddr
             appendU64LE(phdr, pFilesz);
             appendU64LE(phdr, pMemsz);
-            appendU64LE(phdr, pageAlign);     // p_align (kernel congruence)
+            appendU64LE(phdr, pAlign);        // p_align (kernel congruence)
+        };
+        // The granularity each segment PROMISES — the SAME shared rule the
+        // dynamic walker uses, deliberately not a second copy. This walker
+        // emits fixed-address ET_EXEC only, where the bound the rule applies
+        // costs nothing; it is here so the two walkers cannot come to disagree
+        // about what a segment claims.
+        // D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET.
+        auto segmentAlign = [&](std::uint64_t strongestMember) {
+            return link::format::segmentAlignForImageBase(imageBaseVa, pageAlign,
+                                                          strongestMember);
         };
         // PT_LOAD #1 (R+X) covers `.text` and — when present — `.rodata`
         // (D-LK1-ELF-EXEC-DATA-SECTIONS). Both are contiguous on disk + VA
@@ -5528,7 +5703,9 @@ encode(AssembledModule const&    module,
             : hasRodata ? (hRodata.offset + rodataBytes.size() - hText.offset)
                         : text.size();
         appendPhdr(pFlags1, hText.offset, secText->virtualAddress,
-                   seg1ByteLen, seg1ByteLen);
+                   seg1ByteLen, seg1ByteLen,
+                   segmentAlign(std::max({hText.addr_align, rodataAlign,
+                                          buildIdAlign})));
         // PT_LOAD #2 (R+W) covers `.data` (file-backed) + `.bss` (zero-fill).
         // p_flags = OR of .data/.bss sh_flags → R+W. p_filesz spans the file-
         // backed `.data`; p_memsz additionally covers `.bss` so the loader
@@ -5542,7 +5719,17 @@ encode(AssembledModule const&    module,
             if (hasGot)  pFlags2 |= shFlagsToPFlags(SHF_ALLOC | SHF_WRITE);
             std::uint64_t const seg2Off =
                 hasData ? hData.offset : (hasGot ? hGot.offset : hBss.offset);
-            std::uint64_t const seg2Va = writableSegVa;
+            // ⚠ THE SEGMENT'S ADDRESS IS DERIVED FROM ITS FILE OFFSET, not
+            // taken as `writableSegVa`. The loader maps `file[p_offset …]` at
+            // `p_vaddr`, so the two must differ by the image's one delta — and
+            // `.data`'s offset is now the one its (possibly over-aligned)
+            // ADDRESS implies, which can sit above the page-aligned segment
+            // start. Taking `writableSegVa` there would map `.data`'s bytes one
+            // or more pages BELOW the address every symbol and relocation names,
+            // silently. Identical to `writableSegVa` whenever no member asks for
+            // more than a page, which is why no ordinary image moves.
+            // D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET.
+            std::uint64_t const seg2Va = imageBaseVa + seg2Off;
             // p_filesz spans every FILE-BACKED member (`.data` then `.got`);
             // `.bss` adds none.
             std::uint64_t const seg2FileEnd =
@@ -5555,7 +5742,9 @@ encode(AssembledModule const&    module,
                 : hasGot  ? (gotSectionVa + gotSize)
                           : (dataSectionVa + dataSize);
             std::uint64_t const seg2MemSz = seg2MemEnd - seg2Va;
-            appendPhdr(pFlags2, seg2Off, seg2Va, seg2FileSz, seg2MemSz);
+            appendPhdr(pFlags2, seg2Off, seg2Va, seg2FileSz, seg2MemSz,
+                       segmentAlign(std::max({dataAlign, bssAlign,
+                                              kGotSlotBytes})));
         }
         std::memcpy(bytes.data() + kEhdrSize, phdr.data(), phdr.size());
     }

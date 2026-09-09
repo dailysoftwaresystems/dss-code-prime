@@ -87,6 +87,89 @@ struct ExecDataSectionLayout {
     [[nodiscard]] bool empty() const noexcept { return itemIndices.empty(); }
 };
 
+// Where a section whose members demand `align` must START, expressed as a FILE
+// OFFSET, inside an image whose allocated sections satisfy the verbatim-mapping
+// identity `va == imageBaseVa + fileOffset` (the arrangement every exec writer
+// here builds: one PT_LOAD/segment mapping the file at a constant delta).
+// `cursorOffset` is the first free file offset; the answer is >= it.
+//
+// ★★ THE RULE THIS EXISTS TO STATE: **ALIGN THE ADDRESS, THEN DERIVE THE
+// OFFSET — NEVER ALIGN THE OFFSET.** `alignUp(cursorOffset, align)` produces an
+// address that is a multiple of `align` only when `imageBaseVa` ALREADY is, so a
+// request stronger than the image base's own alignment is silently downgraded to
+// a multiple of `gcd(align, imageBaseVa)`. Nothing fails: the section header
+// still says `sh_addralign = align`, the segment still maps, the program still
+// runs — on an object placed somewhere it did not ask to be.
+//
+// ✔MEASURED (P64) and this is why the helper is worth its name: an image base of
+// 0x400000 divides 8192, so `alignUp` on the OFFSET gave the right answer on
+// `elf64-x86_64-linux-exec` (`.text` VA 0x401000, base 0x400000) and the WRONG
+// one, by exactly 4096, on `elf64-aarch64-linux-exec` (`.text` VA 0x400000, base
+// 0x3FF000) — same engine, same section, same alignment request, and the
+// difference lived entirely in a DECLARED address. The x86_64 leg was not
+// verifying the rule; it was benefiting from an accident of its own base.
+// Aligning the VA is correct for EVERY base, so no leg is left green by luck.
+//
+// ⓘ The `align <= 1` short-circuit keeps the no-alignment case byte-identical.
+// ⓘ A base-relative image (`imageBaseVa == 0`) makes the two domains coincide,
+// so this returns exactly what rounding the offset would have — correct, and
+// the reason no ET_DYN byte moves. ⚠ THAT IS A STATEMENT ABOUT THE LINK-TIME
+// ADDRESS ONLY: what a base-relative image is finally mapped at is the loader's
+// slide, whose granularity is the largest `p_align` among its PT_LOADs, and
+// this helper has no say in that.
+[[nodiscard]] inline constexpr std::uint64_t imageOffsetForAlignedVa(
+        std::uint64_t imageBaseVa,
+        std::uint64_t cursorOffset,
+        std::uint64_t align) noexcept {
+    if (align <= 1) return cursorOffset;
+    std::uint64_t const va = imageBaseVa + cursorOffset;
+    std::uint64_t const alignedVa = ((va + align - 1) / align) * align;
+    return alignedVa - imageBaseVa;
+}
+
+// The mapping granularity a LOADABLE SEGMENT may promise, given the image base
+// it sits in, the format's page alignment, and the strongest alignment among the
+// sections the segment maps.
+//
+// ★★ WHY A SEGMENT HAS TO PROMISE ANYTHING. A BASE-RELATIVE image (an ELF
+// ET_DYN — a PIE or a shared object) has no fixed address: the loader places it
+// at a slide that is a multiple of the LARGEST segment alignment the image
+// declares. So a member asking for more than that keeps the address the linker
+// chose and LOSES its alignment at load, and nothing in the image records that
+// it happened.
+//
+// ✔MEASURED (P64), twenty runs per port because one run decides nothing here: a
+// DSS PIE carrying `aligned(8192)` statics, with every segment alignment pinned
+// at the page size, returned 42 or 50 DEPENDING ON THE RUN — 10 of 20 wrong on
+// arm64, 12 of 20 on x86_64 — while gcc's PIE of the same source returned 42
+// twenty times out of twenty, having raised that one segment to 0x2000 and left
+// its siblings at 0x1000.
+//
+// ⚠ RAISED ONLY AS FAR AS THE IMAGE BASE CAN KEEP IT. A loader maps
+// `file[offset …]` at `base + offset`, and ELF's kernel loader additionally
+// requires `p_vaddr % p_align == p_offset % p_align`; the two differ by exactly
+// `imageBaseVa`, so the strongest promise a segment can honour is bounded by the
+// base's own alignment. A base-relative image has `imageBaseVa == 0` and is
+// never bounded; a fixed-address image is mapped at its stated address and loses
+// nothing by being. That is why there is no image-flavour test here — the bound
+// falls out of the arithmetic, and a flavour test would be a second owner for a
+// fact this expression already holds.
+//
+// ⓘ ONE IMPLEMENTATION ON PURPOSE. Both ELF exec walkers need this and neither
+// may own it: they name their base differently and would drift into disagreeing
+// about what a segment claims, which is precisely the failure above wearing a
+// different hat.
+[[nodiscard]] inline constexpr std::uint64_t segmentAlignForImageBase(
+        std::uint64_t imageBaseVa,
+        std::uint64_t pageAlign,
+        std::uint64_t strongestMemberAlign) noexcept {
+    std::uint64_t promise = std::max(pageAlign, strongestMemberAlign);
+    while (promise > pageAlign && imageBaseVa % promise != 0) {
+        promise = std::max(pageAlign, promise / 2);
+    }
+    return promise;
+}
+
 // Validate + lay out the `dataItems` whose `section == kind` into ONE section.
 //
 // Items whose section differs from `kind` are SKIPPED (they belong to another

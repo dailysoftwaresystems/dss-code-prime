@@ -357,10 +357,12 @@ fi
 # same technique `scripts/local-build/local-build.sh` uses for the sibling
 # question, and `-newer` is strictly-greater — which is the RIGHT direction here,
 # because the marker is written BEFORE the run and an offending edit lands after.
-# ⓘ A root that does not exist contributes nothing, so a lane worktree carrying a
-# subset of the tree, or a synthetic self-test root, is not penalised for it.
 # ✔MEASURED cost: 1971 files across the three roots, 0.31 s — against gates that
 # run for a quarter of an hour.
+# ⚠ WHICH TREE those three roots are read from is a SEPARATE question with its own
+# defect and its own measurement, and it is answered where the roots are built —
+# see "AND THE ROOTS ARE THE GATE COMMAND'S TREE, NOT THIS SHELL'S" below. It is
+# not repeated here, so the two cannot drift into describing it differently.
 # ── AND THE BUILD DIRECTORY MUST BE THIS RUN'S ALONE ────────────────────────
 #
 # ★★★ THE FIFTH WAY A GATE'S EXIT CODE CAN MEAN NOTHING, AND IT IS THE OTHER
@@ -436,7 +438,13 @@ run_gate_is_windows() {
 # see the note about `scripts/check-path-identity` further up this file. It
 # normalises exactly three things and says so: separator, trailing slash, and
 # (on Windows only, where the filesystem is case-insensitive) case.
-run_gate_norm_dir() {   # <path>
+#
+# ⓘ SPLIT IN TWO because the two callers want DIFFERENT halves, and folding case
+# for both would print a path this project never spells that way. Comparing two
+# processes' directories needs the case fold; NAMING a directory in the log does
+# not, and `c:/source/dailysoftware/...` in a footer reads as a different tree
+# from the one the reader knows. `tidy` is the shared half.
+run_gate_tidy_dir() {   # <path> — separator and trailing slash only
     _rg_np="$(printf '%s' "$1" | tr '\\' '/')"
     while :; do
         case "$_rg_np" in
@@ -444,6 +452,10 @@ run_gate_norm_dir() {   # <path>
             *)   break ;;
         esac
     done
+    printf '%s' "$_rg_np"
+}
+run_gate_norm_dir() {   # <path> — tidy, plus case on Windows
+    _rg_np="$(run_gate_tidy_dir "$1")"
     if run_gate_is_windows; then
         _rg_np="$(printf '%s' "$_rg_np" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"
     fi
@@ -457,7 +469,7 @@ run_gate_norm_dir() {   # <path>
 # ⓘ A RELATIVE token is resolved against THIS shell's working directory, because
 # a process's own working directory is not readable from outside on Windows.
 # Every refusal below SAYS SO, so a reader can judge a match made that way.
-run_gate_resolve_dir() {   # <path>
+run_gate_abs_dir() {   # <path> — absolute and tidy, NOT case-folded
     _rg_rd="$(printf '%s' "$1" | tr '\\' '/')"
     _rg_ra="$(cd "$_rg_rd" 2>/dev/null && pwd -P)"
     if [ -z "$_rg_ra" ]; then
@@ -469,7 +481,10 @@ run_gate_resolve_dir() {   # <path>
     if run_gate_is_windows && command -v cygpath >/dev/null 2>&1; then
         _rg_ra="$(cygpath -m "$_rg_ra" 2>/dev/null || printf '%s' "$_rg_ra")"
     fi
-    run_gate_norm_dir "$_rg_ra"
+    run_gate_tidy_dir "$_rg_ra"
+}
+run_gate_resolve_dir() {   # <path> — absolute AND comparable
+    run_gate_norm_dir "$(run_gate_abs_dir "$1")"
 }
 
 # WHICH BUILD DIRECTORY DOES *THIS* GATE COMMAND NAME? Read from the real argv,
@@ -635,19 +650,177 @@ run_gate_refuse_contention() {   # <when>
     echo "  (log: $log)" >&2
 }
 
-run_gate_input_roots="src/dss-config tests/corpus examples"
+# ── AND THE ROOTS ARE THE GATE COMMAND'S TREE, NOT THIS SHELL'S ─────────────
+#
+# ★★★ THE THREE ROOT NAMES ARE RELATIVE, AND WHAT THEY ARE RELATIVE **TO** IS
+# THE WHOLE QUESTION. They used to be resolved against the PROCESS WORKING
+# DIRECTORY, which is right only when the caller happens to be standing in the
+# tree the gate command reads — and this project gates lane worktrees from
+# sibling trees all day.
+#
+# ✔MEASURED 2026-09-08 (P65, lane `rc`), BOTH DIRECTIONS, BOTH TWINS, with two
+# synthetic trees A and B: cwd = B, gate command = `ctest --test-dir A/build/x`.
+#   · edit an input root in **B** (a tree the run never reads) -> exit 3, both
+#     twins, naming `examples/.probe-…` — a LOUD FALSE REFUSAL that spends a
+#     15-minute gate on a file the run could not have seen. A sibling lane hit
+#     exactly this shape in the field.
+#   · edit an input root in **A** (the tree whose build directory the command
+#     names, and whose config its tests read) -> exit **0**, both twins, footer
+#     `inputs  : held still`. ⇒ THE SILENT WRONG ANSWER, and it is the one
+#     sentence this whole block exists to be unable to say wrongly. The false
+#     refusal wastes a run; this one SHIPS a verdict that has none.
+#
+# ★★★ WHAT THEY ARE RESOLVED AGAINST NOW, AND THE MECHANISM RATHER THAN A
+# PREFERENCE: **the source tree that CMake itself records as having configured
+# the build directory this command names.** `<build>/CMakeCache.txt` carries
+# `CMAKE_HOME_DIRECTORY:INTERNAL=<dir>`; the tests registered in that build tree
+# are the ones that will read `src/dss-config`, `tests/corpus` and `examples` at
+# test time, and they will read them THERE. Nothing else in reach is evidence
+# about which tree a gate command reads — this is CMake's own record of it.
+#
+# ✔AND THE BUILD SYSTEM SAYS IT IN SO MANY WORDS, which is why this is the
+# MECHANISM and not an inference. `CMakeLists.txt` gives 35 registered tests
+# `WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"`, and `tests/CMakeLists.txt` bakes
+# `DSS_TEST_REPO_ROOT="${CMAKE_SOURCE_DIR}"` into every test binary — which is
+# what `tests/test_support/repo_root.hpp`'s `bakedRepoRoot()` returns and what
+# every helper there resolves the three roots against. `CMAKE_SOURCE_DIR` is
+# EXACTLY the value CMake writes to the cache as `CMAKE_HOME_DIRECTORY`. So the
+# tree named here is the same tree the test binaries were compiled to read; the
+# cwd agreed with it only when the caller happened to be standing in it.
+#
+# ⚠ WHAT THIS STILL DOES NOT REACH, stated rather than left to be discovered:
+# `$DSS_CONFIG_ROOT`. The compiler's own walk composes `<that>/src/dss-config`
+# (`src/core/types/config_path_walk.cpp`, `repoShapedConfigRoot`), so a gate run
+# with that variable pointing OUTSIDE the tree named here reads a config tree
+# this scan never walks. It is NOT guessed at here, deliberately: the compiler
+# and `repo_root.hpp` document precedences that do not obviously agree about
+# whether the variable names a tree root or the config directory itself, and a
+# rule built on the wrong one would watch a directory that does not exist —
+# which contributes nothing and restores the very `held still` this block
+# exists to prevent, by a new door. ✔MEASURED: the one shipped caller that sets
+# it, `scripts/profile-compile/profile-compile.sh`, sets it to the repository it
+# is already standing in, so nothing is relocated today; the footer's absolute
+# roots below are what make a future divergence visible.
+#
+# ⚠ THREE OTHER CANDIDATES WERE MEASURED AND ALL THREE ARE WRONG:
+#   · **the repository root containing the build tree** — ✔MEASURED IN THIS
+#     REPOSITORY: `build/rvff` sits in the main checkout and carries
+#     `CMAKE_HOME_DIRECTORY:INTERNAL=…/.worktrees/ff`. A build tree in one tree,
+#     configured from another. Walking up from the build directory answers "the
+#     main checkout"; its tests read the worktree. The obvious rule is refuted
+#     by a build tree this project already has on disk.
+#   · **this wrapper's own location** — the fixture refutes it: test-run-gate.sh
+#     drives the repository's `scripts/run-gate/run-gate.sh` from a SYNTHETIC
+#     sandbox, so a script-relative rule would point every arm at the real
+#     `examples/`, which is precisely the hazard
+#     D-GATE-RUN-GATE-BLIND-TO-A-SECOND-RUN-IN-THE-SAME-BUILD-DIRECTORY closed
+#     (a fixture that makes everyone else's gate exit 3).
+#   · **the cwd** — the measurement above, in both directions.
+#
+# ⓘ THE CWD REMAINS THE FALLBACK, AND IT IS NOW STATED RATHER THAN ASSUMED. A
+# gate command need not name a build directory at all (`remote-leg` hands this
+# wrapper a `bash`, and its tree is on another host), and a named directory need
+# not be a CMake build tree (this file's own fixture builds bare `ctest` trees).
+# In both cases the wrapper has no evidence about which tree the command reads,
+# and the cwd is the only thing it knows — so it says which rule decided, on
+# every run, in the log.
+#
+# ⓘ NOT AN ESCAPE HATCH: nothing here is settable by a caller. Which rule fires
+# is decided by what the argv NAMES and what is on disk beside it, exactly like
+# the contention check above.
+run_gate_input_root_names="src/dss-config tests/corpus examples"
+run_gate_source_tree=""
+run_gate_source_tree_why=""
+run_gate_source_tree_miss=""
+run_gate_source_tree_found=""
 run_gate_marker="${log}.inputs-marker"
+
+# CMake's own record of which tree configured this build tree, or nothing — and
+# when nothing, WHY nothing, in `run_gate_source_tree_miss`.
+# ★★ THE FOUR MISSES ARE NOT ONE MISS, and collapsing them into "not a CMake
+# build tree" is the shape of message this file keeps refusing: a sentence that
+# outruns its evidence. ✔MEASURED while building this — a CMakeCache whose
+# recorded home directory THIS SHELL CANNOT SEE is a real, reachable state (an
+# MSYS-spelled `/c/…` is invisible to PowerShell and a `C:/…` is invisible to a
+# WSL bash, which is the same wrong-bash family this file already documents at
+# `run_gate_shell_identity`), and it is emphatically NOT "there is no cache".
+# ⚠ IT SETS VARIABLES AND DOES NOT ECHO, deliberately: a `$( … )` runs in a
+# SUBSHELL, so the reason for a miss would be set in a process that exits before
+# anyone could read it — and the caller would then print the WRONG reason with
+# every appearance of having asked. Same class as this file's other "a message
+# that outruns its evidence" notes.
+run_gate_source_tree_of_build_dir() {   # <absolute build dir>
+    run_gate_source_tree_miss=""; run_gate_source_tree_found=""
+    if [ -z "${1:-}" ]; then
+        run_gate_source_tree_miss="this command names no build directory, so there is nothing to ask"
+        return 1
+    fi
+    _rg_cache="$1/CMakeCache.txt"
+    if [ ! -f "$_rg_cache" ]; then
+        run_gate_source_tree_miss="the build directory it names has no CMakeCache.txt, so nothing on disk records which tree configured it"
+        return 1
+    fi
+    _rg_home="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$_rg_cache" 2>/dev/null | head -1 | tr -d '\r')"
+    if [ -z "$_rg_home" ]; then
+        run_gate_source_tree_miss="its CMakeCache.txt carries no CMAKE_HOME_DIRECTORY entry"
+        return 1
+    fi
+    if [ ! -d "$_rg_home" ]; then
+        run_gate_source_tree_miss="its CMakeCache.txt names '$_rg_home' as CMAKE_HOME_DIRECTORY and THIS SHELL ($(run_gate_shell_identity)) CANNOT SEE THAT DIRECTORY — a DOS-drive path is invisible to a WSL bash and an MSYS '/c/…' path is invisible to PowerShell, so check which shell you handed this gate to"
+        return 1
+    fi
+    run_gate_source_tree_found="$(run_gate_tidy_dir "$_rg_home")"
+    return 0
+}
+
+run_gate_decide_input_roots() {
+    if run_gate_source_tree_of_build_dir "$run_gate_abs_build_dir"; then
+        run_gate_source_tree="$run_gate_source_tree_found"
+        run_gate_source_tree_why="CMAKE_HOME_DIRECTORY recorded in ${run_gate_abs_build_dir}/CMakeCache.txt — the tree this command's build directory was configured from"
+        return 0
+    fi
+    run_gate_source_tree="$(run_gate_abs_dir .)"
+    run_gate_source_tree_why="this shell's working directory — $run_gate_source_tree_miss"
+}
+
+# The three roots as ABSOLUTE paths, one per line. ⓘ Used by BOTH the scan and
+# the footer on purpose: a footer that names roots the scan did not walk is the
+# class of lie this row is about.
+run_gate_abs_input_roots() {
+    for _rg_n in $run_gate_input_root_names; do
+        printf '%s/%s\n' "$run_gate_source_tree" "$_rg_n"
+    done
+}
+
+# ⚠ ONE `find` PER ROOT, EACH ARGUMENT QUOTED, AND EACH ROOT EXISTENCE-CHECKED.
+# The former single `find $roots …` relied on word splitting, so an absolute root
+# holding a space (`C:/Program Files/…` is a real spelling on this host) tore in
+# half — and if the list had ever been empty, `find` with no path operand walks
+# the CURRENT DIRECTORY under GNU find, which is the same wrong-tree answer this
+# block exists to remove, arriving by a different door.
+# ⓘ A root that does not exist contributes nothing, so a lane worktree carrying a
+# subset of the tree, or a synthetic self-test root, is not penalised for it.
 run_gate_moved_inputs() {
     [ -f "$run_gate_marker" ] || return 1
-    # shellcheck disable=SC2086
-    find $run_gate_input_roots -type f -newer "$run_gate_marker" 2>/dev/null | head -20
+    run_gate_abs_input_roots | while IFS= read -r _rg_root; do
+        [ -n "$_rg_root" ] || continue
+        [ -d "$_rg_root" ] || continue
+        find "$_rg_root" -type f -newer "$run_gate_marker" 2>/dev/null
+    done | head -20
 }
 # ── PRE-RUN: refuse a contended build directory BEFORE anything starts ──────
 # ⚠ Placed AHEAD of the input marker deliberately, so a refusal here leaves no
 # marker file behind for the next run to trip over.
+run_gate_abs_build_dir=""
 if run_gate_raw_build_dir="$(run_gate_dir_named_by_argv "$@")"; then
-    run_gate_build_dir="$(run_gate_resolve_dir "$run_gate_raw_build_dir")"
+    # TWO SPELLINGS OF ONE DIRECTORY, and each has exactly one caller: the
+    # case-folded one is only ever COMPARED against another process's spelling;
+    # the plain one is what gets NAMED in a message and what CMakeCache.txt is
+    # read beside.
+    run_gate_abs_build_dir="$(run_gate_abs_dir "$run_gate_raw_build_dir")"
+    run_gate_build_dir="$(run_gate_norm_dir "$run_gate_abs_build_dir")"
 fi
+run_gate_decide_input_roots
 run_gate_scan_contention
 if [ -n "$run_gate_contenders" ]; then
     {
@@ -686,8 +859,17 @@ run_gate_scan_contention
         echo "inputs  : MOVED DURING THE RUN — this verdict is not evidence"
         echo "$run_gate_moved" | sed 's/^/          /'
     else
-        echo "inputs  : held still ($run_gate_input_roots)"
+        echo "inputs  : held still"
     fi
+    # ★★ THE FOOTER NAMES THE TREE IT WATCHED, ABSOLUTELY, ON EVERY RUN — green,
+    # refused, or failed. `held still` is a claim about a DIRECTORY, and a reader
+    # who has to reconstruct the caller's working directory to learn which
+    # directory cannot check the claim at all. This is the half of the fix that
+    # costs three lines and would have made the measured defect self-evident in
+    # the log the first time it happened.
+    echo "srctree : $run_gate_source_tree"
+    echo "          decided by: $run_gate_source_tree_why"
+    run_gate_abs_input_roots | sed 's/^/watched : /'
     if [ -z "$run_gate_build_dir" ]; then
         echo "builddir: none named by this command — the contention check had no subject"
     else
@@ -712,6 +894,8 @@ if [ -n "$run_gate_moved" ]; then
     echo "  (command exited $rc; that number describes a tree that never existed as a whole)." >&2
     echo "  These read-at-test-time files were modified after the run started:" >&2
     echo "$run_gate_moved" | sed 's/^/      /' >&2
+    echo "  source tree watched: $run_gate_source_tree" >&2
+    echo "    decided by: $run_gate_source_tree_why" >&2
     echo "  ⚠ This is NOT 'the gate failed'. Any failure it reported may belong to the edit" >&2
     echo "    rather than to the code under test, and any PASS is equally unproven." >&2
     echo "  Let the tree settle and run it again. If you are the one who edited it: this" >&2

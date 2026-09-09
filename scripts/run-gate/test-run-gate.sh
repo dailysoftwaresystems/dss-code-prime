@@ -2,9 +2,23 @@
 # test-run-gate.sh -- prove BOTH run-gate twins refuse a run whose evidence is
 # spoiled, and that they still pass a run whose evidence is intact.
 #
-# TWO SUBJECTS, one fixture, because they are one contract:
+# THREE SUBJECTS, one fixture, because they are one contract:
 #   * the SOURCE TREE moving under the run          -> exit 3
 #   * ANOTHER RUN live in the same BUILD DIRECTORY  -> exit 4
+#   * WHICH TREE those roots are read from at all   -> 3 or 0, and which one it
+#     was must be readable from the log ALONE
+#
+# ⚠⚠ THE THIRD SUBJECT IS THE ONE WHOSE FAILURE IS SILENT, and that is why it is
+#   proved in BOTH directions rather than only the refusing one. The input roots
+#   are three RELATIVE names, and what they were relative to used to be the
+#   PROCESS WORKING DIRECTORY. ✔MEASURED 2026-09-08 (P65) on both twins, with the
+#   cwd in tree B and the gate command naming tree A's build directory:
+#     · an edit in B (a tree the run never reads) -> exit 3, a LOUD FALSE
+#       REFUSAL that throws away a quarter-hour gate;
+#     · an edit in A (the tree whose config the run's tests actually read)
+#       -> exit 0 and `inputs  : held still`, THE SILENT WRONG ANSWER.
+#   The second is the reason this subject exists: a refusal that fires wrongly
+#   costs a run, and a `held still` that is wrong ships a verdict that has none.
 #
 # A SIBLING FILE, not a `--selftest` flag: run-gate's interface is POSITIONAL and
 # its first argument is a LOG PATH, which it refuses when it begins with '-' (see
@@ -12,9 +26,9 @@
 # colliding with that refusal, so the proof lives beside the subject instead --
 # the same shape as scripts/lane-worktree/test-lane-worktree.sh.
 #
-# ! THE CONTROLS ARE THE POINT. Arms 1, 4, 7 and 9 must PASS: without them, a
-#   green refusal arm is equally consistent with "this wrapper now refuses
-#   everything".
+# ! THE CONTROLS ARE THE POINT. Arms 1, 4, 7, 9, 14 and 16 must PASS: without
+#   them, a green refusal arm is equally consistent with "this wrapper now
+#   refuses everything".
 # ! The mutations are REAL -- a real edit to a real read-at-test-time root while
 #   the gate command runs, and a real second `ctest` alive in the same build
 #   directory -- rather than simulations with a pre-dated marker or a fake
@@ -49,6 +63,65 @@
 #       that plainly contains the string. Read it through `logtext`, never
 #       directly -- otherwise this fixture reports a defect in the subject that
 #       belongs to the reader.
+#
+# ⚠⚠ THE .ps1 ARMS ARE HOST-CONDITIONAL, AND THAT CONDITION IS THE ONLY ESCAPE IN
+#   THIS FIXTURE. Not every carriage this project gates on carries a PowerShell,
+#   and an arm that CANNOT run must say so -- never fail, never vanish.
+#   ★ THE PROBE IS BY EXECUTION, NEVER BY LOOKUP (`run_gate_powershell`): each
+#     candidate is actually RUN and has to hand a known token back with rc 0.
+#     `command -v` is documented IN THIS REPOSITORY to LIE over a non-interactive
+#     ssh session on the macOS carriage -- `scripts/remote-leg/remote-leg.sh`
+#     carries the measurement, where tools that exist at `/opt/homebrew/bin` were
+#     reported NOT FOUND. A lookup can also fail the other way, and that is the
+#     direction that would hurt here: it would name an interpreter that cannot
+#     start, and every .ps1 arm would then fail for a reason that is not the
+#     subject's.
+#   ★ THE CANDIDATE ORDER IS `pwsh` THEN `powershell`, AND IT IS NOT A GUESS: it
+#     is exactly `find_program(POWERSHELL_EXE NAMES pwsh powershell REQUIRED)` in
+#     `CMakeLists.txt`, so this fixture proves the twin under the SAME interpreter
+#     the build system already picks for every other `.ps1` ctest entry. A second
+#     answer spelled here is a second answer that drifts from the first.
+#   ★★ THE ESCAPE IS DIRECTIONAL, AND THE FIXTURE RE-MEASURES THAT ON EVERY RUN.
+#     Arm `0-probe-negative` calls the SAME probe with a PATH that reaches no
+#     interpreter at all and requires it to report ABSENT. Without that arm, a
+#     probe which had quietly degenerated to "always absent" would skip every
+#     .ps1 arm on every host and still print a green run. ⚠ This repository has
+#     already paid for the opposite direction: a guard grew an escape that EVERY
+#     subject triggered, so it refused nothing and three mutants came back green.
+#   ★ NOTHING HERE IS SETTABLE BY A CALLER. The candidate list is a constant and
+#     there is no environment override, so the escape cannot be SPELLED -- it is
+#     taken only when execution genuinely fails. Same ruling, and the same reason,
+#     as both run-gate twins' own "no escape hatch, deliberately".
+#   ★★ ON WINDOWS THE ESCAPE IS NOT AVAILABLE AT ALL (`run_gate_host_is_windows`,
+#     the same predicate the subject uses). PowerShell ships with that OS and
+#     `CMakeLists.txt` already refuses to configure without one, so a Windows host
+#     answering "no PowerShell" has a broken PATH, not a legitimate absence --
+#     and left escapable it would silently drop all NINE .ps1 arms on the one host
+#     category where twin parity is actually proved, while reporting green for
+#     doing less work.
+#   ★ THE .sh ARMS ARE NEVER ESCAPABLE. A host with no PowerShell still proves the
+#     .sh twin: arms 1, 2, 3, 7, 8, 12, 13 and 14 run everywhere, unconditionally.
+#
+# ⚠⚠ THE REACH OF THIS GUARD -- WHERE TWIN PARITY IS ACTUALLY PROVED, AND WHERE IT
+#   IS NOT. ✔MEASURED BY EXECUTION 2026-09-08 on all four hosts this project gates
+#   on, by running each candidate and requiring the token back:
+#       Windows (Git Bash)   pwsh 7 AND powershell 5.1 present  -> .ps1 arms RUN
+#       WSL x86_64           /usr/bin/pwsh 7.5.4                -> .ps1 arms RUN
+#       macOS arm64          /usr/local/bin/pwsh                -> .ps1 arms RUN
+#       arm64 VPS (ubuntu)   NEITHER spelling present           -> .ps1 arms N/A
+#   ⇒ on the arm64 VPS leg, arms 4, 5, 9, 10, 15 and 16 -- and with them ALL THREE
+#     parity arms, 6, 11 and 17 -- are not proved, and that is PERMANENT rather
+#     than pending:
+#     nothing in this tree installs PowerShell there. A green `run_gate_guard` on
+#     that carriage is evidence about `run-gate.sh` ALONE. The run says so in
+#     words AND in a count of not-applicable arms, so the two cannot be confused.
+#   ⚠ THE PRIOR ASSUMPTION WAS WRONG IN THE DANGEROUS DIRECTION, which is why the
+#     table above is measured rather than reasoned: the defect this replaced
+#     invoked `powershell` LITERALLY -- a spelling that exists on ONE of the four
+#     hosts -- so every .ps1 arm returned 127 on the other three and arm 6 reported
+#     `.sh=3 vs .ps1=127`. Two of those three hosts can in fact run the twin, and
+#     `run-gate.ps1` was already cross-platform (`Test-RunGateIsWindows`, and the
+#     `ps -eo` branch of `Get-RunGateProcessTable`); only the fixture was not.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
@@ -59,12 +132,69 @@ SANDBOX="${SCRATCH}/tree"
 rm -rf "$SCRATCH"
 mkdir -p "$SANDBOX/examples" "$SANDBOX/src/dss-config" "$SANDBOX/tests/corpus"
 PROBE_REL="examples/.test-run-gate-input-probe.txt"
+NOWHERE_BIN="${SCRATCH}/no-interpreter-here"
+mkdir -p "$NOWHERE_BIN"
 fails=0
+arms_ran=0
+arms_na=0
+
+# ── WHICH POWERSHELL, IF ANY, CAN RUN THE .ps1 TWIN ON THIS HOST ────────────
+# BY EXECUTION, never by lookup -- see the block above for why `command -v` is
+# not trusted here. Echoes the winning candidate and returns 0; echoes nothing
+# and returns 1 when no candidate actually ran.
+# ⓘ USES ONLY SHELL BUILTINS on purpose: `case` and `[` rather than `grep`/`tr`,
+#   so that arm `0-probe-negative` can point PATH at an empty directory and
+#   disable the CANDIDATES without also disabling the probe -- which would make
+#   the negative arm pass for the wrong reason.
+PS_PROBE_TOKEN='DSS_RUN_GATE_PS_ALIVE'
+PS_CANDIDATES='pwsh powershell'
+run_gate_powershell() {
+    local cand out rc
+    for cand in $PS_CANDIDATES; do
+        out=$("$cand" -NoProfile -Command "Write-Output $PS_PROBE_TOKEN" 2>/dev/null)
+        rc=$?
+        [ "$rc" -eq 0 ] || continue
+        case "$out" in
+            *"$PS_PROBE_TOKEN"*) echo "$cand"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# ⚠ THE SAME PREDICATE AS `run_gate_is_windows` IN THE SUBJECT, deliberately
+#   spelled the same way: a second answer to "is this Windows" is how two halves
+#   of one pair start disagreeing. It cannot be reused by sourcing, because
+#   run-gate.sh EXECUTES.
+run_gate_host_is_windows() {
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        MINGW*|MSYS*|CYGWIN*) return 0 ;;
+        *)                    return 1 ;;
+    esac
+}
+
+ran() { arms_ran=$((arms_ran + 1)); }
+
+# An arm this host CANNOT run. Named, with its reason, and counted -- the three
+# things a silent skip omits.
+na() {  # <label> <reason>
+    arms_na=$((arms_na + 1))
+    echo "  [n/a ] $1   NOT APPLICABLE ON THIS HOST: $2"
+}
 
 # A synthetic ctest tree: a `CTestTestfile.cmake` alone is enough for ctest to
 # run -- ✔MEASURED, no configure and no project needed. `slow` exists so a
 # contender can still be alive while the arm under test starts.
-BASH_W="$(command -v cygpath >/dev/null 2>&1 && cygpath -m /usr/bin/bash || echo /usr/bin/bash)"
+# ⚠ THE INTERPRETER IS `$BASH` -- THE ONE ALREADY RUNNING THIS FIXTURE -- NOT A
+#   HARD-CODED `/usr/bin/bash`. ✔MEASURED 2026-09-08 on the macOS carriage:
+#   `/usr/bin/bash` DOES NOT EXIST there (only `/bin/bash`), so the synthetic
+#   `add_test` below named a program that could not be launched, every arm from
+#   `7-sh-alone` on lost its success witness, and the guard would have red on
+#   that leg naming the SUBJECT for a defect in the fixture's own test tree.
+#   ⓘ `$BASH` needs no probe and cannot lie: it is the absolute path of the shell
+#     executing this line. `cygpath -m` converts it for CMake only on MSYS, where
+#     a `/usr/bin/...` path is not something `ctest` can spawn.
+BASH_W="$BASH"
+if command -v cygpath >/dev/null 2>&1; then BASH_W="$(cygpath -m "$BASH")"; fi
 mk_ctest_dir() {  # <dir> <fast|slow>
     mkdir -p "$1"
     if [ "$2" = slow ]; then
@@ -77,12 +207,70 @@ mk_ctest_dir() {  # <dir> <fast|slow>
     fi
 }
 
+# THE SPELLING run-gate ITSELF PRINTS for a directory. ⚠ NOT a second
+# canonicaliser: it is the SAME two steps the subject takes -- `cd && pwd -P`,
+# then MSYS's own `cygpath -m` on Windows -- so the assertions below compare like
+# with like. A fixture that spells a path its own way reports a defect that
+# belongs to its own reader, and this file already carries two of those.
+gate_spelling() {  # <dir>
+    local abs
+    abs=$(cd "$1" && pwd -P) || return 1
+    if command -v cygpath >/dev/null 2>&1; then cygpath -m "$abs"; else printf '%s\n' "$abs"; fi
+}
+
+# A synthetic SOURCE tree: its own three read-at-test-time roots, nothing else.
+mk_source_tree() {  # <dir>
+    mkdir -p "$1/examples" "$1/src/dss-config" "$1/tests/corpus"
+}
+
+# A build directory that RECORDS WHICH TREE CONFIGURED IT, which is the only
+# evidence run-gate has about where a gate command's tests read their config
+# from. ⚠ The recorded path is written in the spelling BOTH twins can open: CMake
+# writes a NATIVE path, and an MSYS `/c/...` home directory is INVISIBLE to
+# PowerShell (`Test-Path` answers False). ✔MEASURED while these arms were built --
+# a `/c/...` cache sent the .ps1 twin back to the cwd, so the arm went green on
+# one twin and red on the other for a reason that was in the FIXTURE.
+mk_cmake_build_dir() {  # <build dir> <source tree> <the sh -c command for its one test>
+    mkdir -p "$1"
+    printf 'CMAKE_HOME_DIRECTORY:INTERNAL=%s\n' "$(gate_spelling "$2")" > "$1/CMakeCache.txt"
+    printf 'add_test(probe "%s" "-c" "%s")\n' "$BASH_W" "$3" > "$1/CTestTestfile.cmake"
+}
+
+# ⚠ TREE_A IS A SIBLING OF THE SANDBOX AND SHARES NO PATH PREFIX WITH IT. Put it
+#   under one of the sandbox's own roots and an edit in A would ALSO be an edit
+#   in B, both candidate answers would agree, and the arms below could not fail
+#   -- the vacuous-arm shape this repository has already paid for twice.
+TREE_A="${SCRATCH}/gate-tree-a"
+mk_source_tree "$TREE_A"
+TREE_A_SPELT="$(gate_spelling "$TREE_A")"
+SANDBOX_SPELT="$(gate_spelling "$SANDBOX")"
+
+# ⚠⚠ AND THE TWO SPELLINGS MUST BE NON-EMPTY AND DISTINCT, OR EVERY PATH
+#   ASSERTION BELOW PASSES WITHOUT PROVING ANYTHING. `gate_spelling` returns 1
+#   when it cannot enter the directory, and an EMPTY spelling degrades
+#   `says … "srctree : $TREE_A_SPELT"` into `says … "srctree : "` -- a needle
+#   present in every log this wrapper has ever written -- while `says_not` on an
+#   empty needle refuses nothing at all. Two coinciding spellings would collapse
+#   the two candidate answers into one and make the arms unfalsifiable the other
+#   way. Both are the vacuous-arm shape this repository has already paid for, so
+#   this refuses LOUDLY here rather than reporting a green run that measured
+#   nothing.
+if [ -z "$TREE_A_SPELT" ] || [ -z "$SANDBOX_SPELT" ] || [ "$TREE_A_SPELT" = "$SANDBOX_SPELT" ]; then
+    echo "test-run-gate.sh: REFUSED -- the two synthetic trees did not resolve to two"
+    echo "  distinct, non-empty absolute spellings, so every path assertion in the"
+    echo "  third subject's arms would pass vacuously and this run would prove nothing."
+    echo "    tree A  : '$TREE_A' -> '$TREE_A_SPELT'"
+    echo "    sandbox : '$SANDBOX' -> '$SANDBOX_SPELT'"
+    exit 1
+fi
+
 cd "$SANDBOX" || { echo "test-run-gate.sh: cannot enter the sandbox $SANDBOX"; exit 1; }
 
 logtext() { tr -d '\000' < "$1" 2>/dev/null; }   # UTF-16LE or UTF-8, either way
 
 arm() {  # <label> <want-rc> ...cmd
     local label=$1 want=$2; shift 2
+    ran
     "$@" > "$SCRATCH/$label.out" 2>&1
     local rc=$?
     echo "$rc" > "$SCRATCH/$label.rc"
@@ -106,7 +294,62 @@ says() {  # <label-or-file> <needle> [--log]
     fi
 }
 
+# ★ THE NEGATIVE HALF, AND IT IS NOT SYMMETRY FOR ITS OWN SAKE. "The footer names
+#   the right tree" is only half a claim: a wrapper that watched BOTH candidate
+#   trees would satisfy every `says` above and still be watching a tree the gate
+#   command never reads. This is what makes that impossible to pass by accident.
+says_not() {  # <label-or-file> <needle> [--log]
+    local f="$SCRATCH/$1.out"
+    [ "${3:-}" = "--log" ] && f="$SCRATCH/$1"
+    if logtext "$f" | grep -qF "$2"; then
+        echo "  [FAIL] $1   SAID what it must not: $2"
+        fails=$((fails + 1))
+    else
+        echo "  [ok  ] $1   does not say: $2"
+    fi
+}
+
 echo "run-gate evidence-integrity proof (sandbox: $SANDBOX)"
+
+# ---- ARM 0 THE ESCAPE MUST BE DIRECTIONAL, AND IT IS MEASURED HERE ----------
+# The SAME probe, run where PATH reaches an EMPTY directory and nothing else,
+# must report ABSENT. Without this arm, a probe that had degenerated to "always
+# absent" would declare every .ps1 arm not-applicable on every host and still
+# print a green run -- the exact shape of an escape that refuses nothing.
+# ⓘ A subshell, not a `VAR= func` prefix: bash keeps such an assignment in the
+#   caller's environment for a FUNCTION, which would break every later arm.
+ran
+neg_out=$( PATH="$NOWHERE_BIN"; run_gate_powershell ); neg_rc=$?
+if [ "$neg_rc" -eq 0 ]; then
+    echo "  [FAIL] 0-probe-negative   probe claimed PowerShell '$neg_out' with no interpreter on PATH"
+    fails=$((fails + 1))
+else
+    echo "  [ok  ] 0-probe-negative   no interpreter reachable -> probe reports ABSENT (the escape is directional)"
+fi
+
+# ---- ARM 0b WHICH INTERPRETER THIS HOST ACTUALLY HAS ------------------------
+# ★★ ON WINDOWS THE ESCAPE IS NOT AVAILABLE AT ALL, AND THAT IS THE OTHER HALF OF
+#   MAKING IT DIRECTIONAL. Windows ships PowerShell 5.1 with the OS and
+#   `CMakeLists.txt` already REFUSES TO CONFIGURE without one
+#   (`find_program(POWERSHELL_EXE NAMES pwsh powershell REQUIRED)`), so a Windows
+#   host that answers "no PowerShell" has a broken environment, not a legitimate
+#   absence. Left escapable, a `ctest` launched with a stripped PATH would drop
+#   all nine .ps1 arms on the ONE host category where every carriage proves twin
+#   parity, and report a green run for doing less work. It fails loud instead.
+ran
+if PS_EXE=$(run_gate_powershell); then
+    echo "  [ok  ] 0-probe-positive   .ps1 arms will run under '$PS_EXE' (probed BY EXECUTION, not by lookup)"
+elif run_gate_host_is_windows; then
+    PS_EXE=""
+    echo "  [FAIL] 0-probe-positive   THIS IS WINDOWS and none of '$PS_CANDIDATES' ran: PowerShell ships with"
+    echo "         the OS and CMake already requires one, so this is a broken PATH, not a host without"
+    echo "         PowerShell. The .ps1 arms are NOT escapable here. Put pwsh or powershell on PATH."
+    fails=$((fails + 1))
+else
+    PS_EXE=""
+    echo "  [ok  ] 0-probe-positive   no working PowerShell here: none of '$PS_CANDIDATES' returned '$PS_PROBE_TOKEN' with rc 0"
+fi
+PS_ABSENT_WHY="no working PowerShell on this host (each of '$PS_CANDIDATES' was RUN and did not return '$PS_PROBE_TOKEN' with rc 0)"
 
 # ---- ARM 1 (sh) CONTROL: inputs held still -> the wrapper still passes -------
 rm -f "$PROBE_REL"
@@ -117,6 +360,11 @@ says a1.log 'inputs  : held still' --log
 # ...and a command that names no build directory must SAY it had no subject,
 # rather than reporting a contention verdict it never took.
 says a1.log 'builddir: none named by this command' --log
+# ...and it must NAME, absolutely, the tree whose stillness it just vouched for.
+# A `held still` whose subject the reader has to reconstruct from the caller's
+# working directory is a claim that cannot be checked at all.
+says a1.log "srctree : $SANDBOX_SPELT" --log
+says a1.log "watched : $SANDBOX_SPELT/examples" --log
 
 # ---- ARM 2 (sh) THE DEFECT: an input root is edited DURING the run ----------
 rm -f "$PROBE_REL"
@@ -130,6 +378,7 @@ rm -f "$PROBE_REL"
 # ---- ARM 3 (sh) ORDERING: rc=0 AND the witness present is NOT enough --------
 # Arm 2's command exits 0 and prints the witness, so a wrapper that checked
 # either one first would have PASSED it. This names that ordering.
+ran
 if logtext "$SCRATCH/2-sh-moved.out" | grep -q 'run-gate.sh: OK'; then
     echo "  [FAIL] 3-sh-order   the moved-input run reported OK"
     fails=$((fails + 1))
@@ -137,36 +386,45 @@ else
     echo "  [ok  ] 3-sh-order   a witness-matching rc=0 run was still refused"
 fi
 
-# ---- ARM 4 (ps1) CONTROL ----------------------------------------------------
-rm -f "$PROBE_REL"
-arm 4-ps1-control 0 powershell -NoProfile -ExecutionPolicy Bypass \
-    -File "$GATE_PS1" "$SCRATCH/a4.log" 'HELLO' \
-    powershell -NoProfile -Command "Write-Output HELLO"
-says 4-ps1-control 'run-gate.ps1: OK'
-says a4.log 'inputs  : held still' --log
-says a4.log 'builddir: none named by this command' --log
+if [ -n "$PS_EXE" ]; then
+    # ---- ARM 4 (ps1) CONTROL ------------------------------------------------
+    rm -f "$PROBE_REL"
+    arm 4-ps1-control 0 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+        -File "$GATE_PS1" "$SCRATCH/a4.log" 'HELLO' \
+        "$PS_EXE" -NoProfile -Command "Write-Output HELLO"
+    says 4-ps1-control 'run-gate.ps1: OK'
+    says a4.log 'inputs  : held still' --log
+    says a4.log 'builddir: none named by this command' --log
+    says a4.log "srctree : $SANDBOX_SPELT" --log
+    says a4.log "watched : $SANDBOX_SPELT/examples" --log
 
-# ---- ARM 5 (ps1) THE DEFECT -------------------------------------------------
-rm -f "$PROBE_REL"
-arm 5-ps1-moved 3 powershell -NoProfile -ExecutionPolicy Bypass \
-    -File "$GATE_PS1" "$SCRATCH/a5.log" 'HELLO' \
-    powershell -NoProfile -Command \
-    "Start-Sleep -Seconds 2; Set-Content -Path '$PROBE_REL' -Value touched; Write-Output HELLO"
-says 5-ps1-moved 'the tree CHANGED UNDER THE RUN'
-says 5-ps1-moved 'test-run-gate-input-probe'
-says 5-ps1-moved 'This is NOT'
-rm -f "$PROBE_REL"
+    # ---- ARM 5 (ps1) THE DEFECT ---------------------------------------------
+    rm -f "$PROBE_REL"
+    arm 5-ps1-moved 3 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+        -File "$GATE_PS1" "$SCRATCH/a5.log" 'HELLO' \
+        "$PS_EXE" -NoProfile -Command \
+        "Start-Sleep -Seconds 2; Set-Content -Path '$PROBE_REL' -Value touched; Write-Output HELLO"
+    says 5-ps1-moved 'the tree CHANGED UNDER THE RUN'
+    says 5-ps1-moved 'test-run-gate-input-probe'
+    says 5-ps1-moved 'This is NOT'
+    rm -f "$PROBE_REL"
 
-# ---- ARM 6 TWIN PARITY, ASSERTED FROM THE OBSERVED EXIT CODES ---------------
-# ⚠ The first draft of this arm asserted parity from the EXISTENCE of the two
-#   output files, which is true whenever the arms ran at all and says nothing
-#   about what they decided. Compare the numbers the twins actually returned.
-sh_rc=$(cat "$SCRATCH/2-sh-moved.rc"); ps_rc=$(cat "$SCRATCH/5-ps1-moved.rc")
-if [ "$sh_rc" = "$ps_rc" ] && [ "$sh_rc" = "3" ]; then
-    echo "  [ok  ] 6-parity   both twins refused the moved tree with exit $sh_rc"
+    # ---- ARM 6 TWIN PARITY, ASSERTED FROM THE OBSERVED EXIT CODES -----------
+    # ⚠ The first draft of this arm asserted parity from the EXISTENCE of the two
+    #   output files, which is true whenever the arms ran at all and says nothing
+    #   about what they decided. Compare the numbers the twins actually returned.
+    ran
+    sh_rc=$(cat "$SCRATCH/2-sh-moved.rc"); ps_rc=$(cat "$SCRATCH/5-ps1-moved.rc")
+    if [ "$sh_rc" = "$ps_rc" ] && [ "$sh_rc" = "3" ]; then
+        echo "  [ok  ] 6-parity   both twins refused the moved tree with exit $sh_rc"
+    else
+        echo "  [FAIL] 6-parity   .sh returned $sh_rc, .ps1 returned $ps_rc (both must be 3)"
+        fails=$((fails + 1))
+    fi
 else
-    echo "  [FAIL] 6-parity   .sh returned $sh_rc, .ps1 returned $ps_rc (both must be 3)"
-    fails=$((fails + 1))
+    na 4-ps1-control "$PS_ABSENT_WHY -- the .ps1 twin's still-tree CONTROL was not taken"
+    na 5-ps1-moved   "$PS_ABSENT_WHY -- the .ps1 twin was never shown a moving tree"
+    na 6-parity      "$PS_ABSENT_WHY -- arm 2 still proves the .sh twin refuses a moving tree, but the twins were NOT compared"
 fi
 
 # ═══ THE SECOND SUBJECT: A BUILD DIRECTORY SHARED WITH ANOTHER LIVE RUN ═════
@@ -196,37 +454,45 @@ says 8-sh-contended 'bd-shared'
 says 8-sh-contended 'This is NOT'
 wait $bg8 2>/dev/null
 
-# ---- ARM 9 (ps1) CONTROL ----------------------------------------------------
-arm 9-ps1-alone 0 powershell -NoProfile -ExecutionPolicy Bypass \
-    -File "$GATE_PS1" "$SCRATCH/a9.log" '100% tests passed' \
-    ctest --test-dir "$SANDBOX/bd-alone"
-says 9-ps1-alone 'run-gate.ps1: OK'
-says a9.log 'contended: no' --log
+if [ -n "$PS_EXE" ]; then
+    # ---- ARM 9 (ps1) CONTROL ------------------------------------------------
+    arm 9-ps1-alone 0 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+        -File "$GATE_PS1" "$SCRATCH/a9.log" '100% tests passed' \
+        ctest --test-dir "$SANDBOX/bd-alone"
+    says 9-ps1-alone 'run-gate.ps1: OK'
+    says a9.log 'contended: no' --log
 
-# ---- ARM 10 (ps1) THE DEFECT ------------------------------------------------
-ctest --test-dir "$SANDBOX/bd-shared" > "$SCRATCH/bg10.log" 2>&1 &
-bg10=$!
-sleep 3
-arm 10-ps1-contended 4 powershell -NoProfile -ExecutionPolicy Bypass \
-    -File "$GATE_PS1" "$SCRATCH/a10.log" '100% tests passed' \
-    ctest --test-dir "$SANDBOX/bd-shared"
-says 10-ps1-contended 'ANOTHER RUN IS LIVE IN THIS BUILD DIRECTORY'
-says 10-ps1-contended 'bd-shared'
-wait $bg10 2>/dev/null
+    # ---- ARM 10 (ps1) THE DEFECT --------------------------------------------
+    ctest --test-dir "$SANDBOX/bd-shared" > "$SCRATCH/bg10.log" 2>&1 &
+    bg10=$!
+    sleep 3
+    arm 10-ps1-contended 4 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+        -File "$GATE_PS1" "$SCRATCH/a10.log" '100% tests passed' \
+        ctest --test-dir "$SANDBOX/bd-shared"
+    says 10-ps1-contended 'ANOTHER RUN IS LIVE IN THIS BUILD DIRECTORY'
+    says 10-ps1-contended 'bd-shared'
+    wait $bg10 2>/dev/null
 
-# ---- ARM 11 TWIN PARITY ON THE SECOND SUBJECT ------------------------------
-sh_rc=$(cat "$SCRATCH/8-sh-contended.rc"); ps_rc=$(cat "$SCRATCH/10-ps1-contended.rc")
-if [ "$sh_rc" = "$ps_rc" ] && [ "$sh_rc" = "4" ]; then
-    echo "  [ok  ] 11-parity  both twins refused the shared build directory with exit $sh_rc"
+    # ---- ARM 11 TWIN PARITY ON THE SECOND SUBJECT ---------------------------
+    ran
+    sh_rc=$(cat "$SCRATCH/8-sh-contended.rc"); ps_rc=$(cat "$SCRATCH/10-ps1-contended.rc")
+    if [ "$sh_rc" = "$ps_rc" ] && [ "$sh_rc" = "4" ]; then
+        echo "  [ok  ] 11-parity  both twins refused the shared build directory with exit $sh_rc"
+    else
+        echo "  [FAIL] 11-parity  .sh returned $sh_rc, .ps1 returned $ps_rc (both must be 4)"
+        fails=$((fails + 1))
+    fi
 else
-    echo "  [FAIL] 11-parity  .sh returned $sh_rc, .ps1 returned $ps_rc (both must be 4)"
-    fails=$((fails + 1))
+    na 9-ps1-alone      "$PS_ABSENT_WHY -- the .ps1 twin's uncontended CONTROL was not taken"
+    na 10-ps1-contended "$PS_ABSENT_WHY -- the .ps1 twin never saw a shared build directory"
+    na 11-parity        "$PS_ABSENT_WHY -- arm 8 still proves the .sh twin refuses a shared build directory, but the twins were NOT compared"
 fi
 
 # ---- ARM 12 THE TWO REFUSALS MUST STAY TELLABLE APART ----------------------
 # ★ A reader who cannot tell 3 from 4 cannot tell whether to settle the tree or
 #   wait for a sibling -- two different remedies. This asserts the codes differ
 #   AND that neither refusal borrows the other's sentence.
+ran
 moved_rc=$(cat "$SCRATCH/2-sh-moved.rc"); cont_rc=$(cat "$SCRATCH/8-sh-contended.rc")
 if [ "$moved_rc" != "$cont_rc" ] \
    && ! logtext "$SCRATCH/8-sh-contended.out" | grep -q 'CHANGED UNDER THE RUN' \
@@ -238,5 +504,98 @@ else
 fi
 
 rm -f "$PROBE_REL"
-echo "run-gate evidence-integrity proof: $fails failure(s)"
+
+# ═══ THE THIRD SUBJECT: WHICH TREE THE INPUT ROOTS ARE READ FROM ═══════════
+# ✔MEASURED 2026-09-08 (P65), both twins, both directions -- the block at the top
+# of this file carries the numbers. Every arm here runs with the cwd in the
+# SANDBOX and the gate command naming a build directory inside TREE_A, so the two
+# candidate answers are DIFFERENT DIRECTORIES and no arm can pass by accident.
+# ★ THE PAIR IS THE POINT, not either half. An arm that only proves the refusal
+#   fires is equally consistent with "this wrapper refuses whenever anything on
+#   the disk moves"; an arm that only proves it stays quiet is consistent with
+#   "this wrapper stopped watching". 13/15 are the refusal, 14/16 are the CONTROL
+#   -- and 13/15 are the direction whose failure was SILENT, which is why they
+#   are here at all rather than being left to the older arms 2/5.
+mk_cmake_build_dir "$TREE_A/build/own" "$TREE_A" \
+    "sleep 1; echo touched > '$TREE_A/examples/.probe-own-tree.txt'; echo ok"
+mk_cmake_build_dir "$TREE_A/build/foreign" "$TREE_A" \
+    "sleep 1; echo touched > '$SANDBOX/examples/.probe-foreign-tree.txt'; echo ok"
+
+# ---- ARM 13 (sh) THE DEFECT: a foreign cwd must not HIDE this run's own tree --
+rm -f "$TREE_A/examples/.probe-own-tree.txt"
+arm 13-sh-own-tree-moves 3 bash "$GATE_SH" "$SCRATCH/a13.log" '100% tests passed' \
+    ctest --test-dir "$TREE_A/build/own"
+says 13-sh-own-tree-moves 'the tree CHANGED UNDER THE RUN'
+says 13-sh-own-tree-moves '.probe-own-tree.txt'
+says a13.log "srctree : $TREE_A_SPELT" --log
+rm -f "$TREE_A/examples/.probe-own-tree.txt"
+
+# ---- ARM 14 (sh) CONTROL: a FOREIGN tree moving must NOT refuse this run ------
+# ⚠ This is the direction the old behaviour failed LOUDLY -- exit 3 naming a file
+#   the run could not have read, throwing away a quarter-hour gate. Arm 13 is the
+#   direction it failed SILENTLY.
+rm -f "$SANDBOX/examples/.probe-foreign-tree.txt"
+arm 14-sh-foreign-tree-moves 0 bash "$GATE_SH" "$SCRATCH/a14.log" '100% tests passed' \
+    ctest --test-dir "$TREE_A/build/foreign"
+says 14-sh-foreign-tree-moves 'run-gate.sh: OK'
+says a14.log 'inputs  : held still' --log
+says a14.log "watched : $TREE_A_SPELT/examples" --log
+says_not a14.log "watched : $SANDBOX_SPELT/examples" --log
+rm -f "$SANDBOX/examples/.probe-foreign-tree.txt"
+
+if [ -n "$PS_EXE" ]; then
+    # ---- ARM 15 (ps1) THE DEFECT --------------------------------------------
+    rm -f "$TREE_A/examples/.probe-own-tree.txt"
+    arm 15-ps1-own-tree-moves 3 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+        -File "$GATE_PS1" "$SCRATCH/a15.log" '100% tests passed' \
+        ctest --test-dir "$TREE_A/build/own"
+    says 15-ps1-own-tree-moves 'the tree CHANGED UNDER THE RUN'
+    says 15-ps1-own-tree-moves '.probe-own-tree.txt'
+    says a15.log "srctree : $TREE_A_SPELT" --log
+    rm -f "$TREE_A/examples/.probe-own-tree.txt"
+
+    # ---- ARM 16 (ps1) CONTROL -----------------------------------------------
+    rm -f "$SANDBOX/examples/.probe-foreign-tree.txt"
+    arm 16-ps1-foreign-tree-moves 0 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+        -File "$GATE_PS1" "$SCRATCH/a16.log" '100% tests passed' \
+        ctest --test-dir "$TREE_A/build/foreign"
+    says 16-ps1-foreign-tree-moves 'run-gate.ps1: OK'
+    says a16.log 'inputs  : held still' --log
+    says a16.log "watched : $TREE_A_SPELT/examples" --log
+    says_not a16.log "watched : $SANDBOX_SPELT/examples" --log
+    rm -f "$SANDBOX/examples/.probe-foreign-tree.txt"
+
+    # ---- ARM 17 TWIN PARITY ON THE THIRD SUBJECT, IN BOTH DIRECTIONS --------
+    # ⚠ Asserted from the four exit codes the twins actually returned, never from
+    #   the existence of their logs -- the correction arm 6 already carries.
+    ran
+    own_sh=$(cat "$SCRATCH/13-sh-own-tree-moves.rc")
+    own_ps=$(cat "$SCRATCH/15-ps1-own-tree-moves.rc")
+    fgn_sh=$(cat "$SCRATCH/14-sh-foreign-tree-moves.rc")
+    fgn_ps=$(cat "$SCRATCH/16-ps1-foreign-tree-moves.rc")
+    if [ "$own_sh" = "3" ] && [ "$own_ps" = "3" ] && [ "$fgn_sh" = "0" ] && [ "$fgn_ps" = "0" ]; then
+        echo "  [ok  ] 17-parity  both twins read their roots from the gate command's tree (own moved 3/3, foreign moved 0/0)"
+    else
+        echo "  [FAIL] 17-parity  own tree moved: .sh=$own_sh .ps1=$own_ps (both must be 3); foreign tree moved: .sh=$fgn_sh .ps1=$fgn_ps (both must be 0)"
+        fails=$((fails + 1))
+    fi
+else
+    na 15-ps1-own-tree-moves     "$PS_ABSENT_WHY -- the .ps1 twin was never shown its OWN tree moving from a foreign cwd"
+    na 16-ps1-foreign-tree-moves "$PS_ABSENT_WHY -- the .ps1 twin's foreign-tree CONTROL was not taken"
+    na 17-parity                 "$PS_ABSENT_WHY -- arms 13 and 14 still prove the .sh twin reads the gate command's tree, but the twins were NOT compared"
+fi
+
+# ---- WHAT THIS RUN ACTUALLY PROVED -----------------------------------------
+# The count is printed on EVERY host, green or not. A reader who sees only
+# "0 failure(s)" cannot tell a run that proved both twins from one that proved
+# half of them, and that is the whole reason the not-applicable arms are counted
+# rather than skipped.
+echo "run-gate evidence-integrity proof: $arms_ran arm(s) ran, $arms_na not applicable on this host, $fails failure(s)"
+if [ "$arms_na" -gt 0 ]; then
+    echo "  ! NOT PROVED HERE: the .ps1 twin, and therefore TWIN PARITY. This host has no"
+    echo "    working PowerShell, so a green run above is evidence about run-gate.sh ALONE."
+    echo "    Not-applicable is not a failure and this fixture still exits on failures only."
+else
+    echo "  both twins were driven on this host; twin parity is proved here."
+fi
 exit $fails

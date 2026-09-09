@@ -6,14 +6,26 @@
 // speculative probe, so its body may be arbitrarily long.
 //
 // ★★ WHY IT NEEDS A PIN OF ITS OWN, AND WHY THE PIN IS TWO HALVES. `/shapes/
-// topLevel` is a SPECULATIVE alt (P42). It is affordable for exactly one
-// reason: every lead token still resolves to a UNIQUE branch, so the parser's
-// LL(k) candidate set is a singleton and it takes the unique-production DIRECT
+// topLevel` is a SPECULATIVE alt (P42). It used to be affordable for exactly
+// one reason: every lead token resolved to a UNIQUE branch, so the parser's
+// LL(k) candidate set was a singleton and it took the unique-production DIRECT
 // DESCENT — `Parser::Impl::stepOnce`'s `candidates.size() == 1` arm — with no
-// probe, no checkpoint and no budget. The moment TWO branches share a lead
-// token, that lead enters a `SpeculationProbe` whose budget is
+// probe, no checkpoint and no budget. The moment TWO branches shared a lead
+// token, that lead entered a `SpeculationProbe` whose budget is
 // `lookahead x 16` = 8 x 16 = 128 tokens, and a top-level probe must swallow
 // the whole FUNCTION BODY.
+//
+// ⚠⚠ P65 [[D-C-FILE-SCOPE-INFERRED-AUTO-MUST-LEAD-THE-DECLARATION-SPECIFIERS]]
+// — THE PARAGRAPH ABOVE IS HISTORY NOW, AND HALF 1 CHANGED WITH IT. The parser
+// also descends into an alt's FINAL candidate when that candidate is the
+// declared-last STRUCTURAL one (`finalCandidateDirectDescent_`), which is the
+// rule the all-fail path already replayed with no budget — so a SECOND owner
+// declared BEFORE `topLevelDecl` now costs one fast-failing probe and nothing
+// more. What still decides whether a long body parses is not HOW MANY branches
+// claim the lead but WHICH one claims it LAST, so half 1 asserts that instead.
+// The helper below carries the measurement; half 2 is unchanged and is what
+// actually caught the proxy going stale — six leads gained a second owner while
+// every body-size arm stayed green.
 //
 // ✔MEASURED 2026-09-02 (P53 lane `ex`, this worktree, through the shipped CLI)
 // against the design this row's next attempt will reach for — a companion
@@ -140,22 +152,60 @@ constexpr std::size_t kBodySizes[] = {0, 2, 8, 64, 512};
 // ── HALF 1: the STRUCTURAL invariant that makes half 2 possible ─────────────
 //
 // For every declaration-specifier keyword that may LEAD a top-level
-// declaration, exactly ONE branch of `/shapes/topLevel` admits it as a first
-// token. This is the property the refuted design breaks, and it breaks
-// INSTANTLY — no long body required — which is why it is pinned separately
-// from the behaviour it protects.
+// declaration, the DECLARED-LAST branch of `/shapes/topLevel` admitting it is
+// `topLevelDecl` — the alt's fallback reading, which the parser reaches with no
+// probe and no budget. This is the property the refuted design breaks, and it
+// breaks INSTANTLY — no long body required — which is why it is pinned
+// separately from the behaviour it protects.
 //
 // ⓘ `AttributeKeyword` and `BracketOpen` are DELIBERATELY ABSENT from the list
-// below: they are the one documented overlap ({typedefDecl, topLevelDecl}, a
-// leading attribute on a typedef) and the entire reason this alt carries
-// `speculative: true`. Adding them here would pin a falsehood.
+// below, and for a reason the P65 restatement makes narrower rather than
+// wider: they are a documented FIRST-set overlap ({typedefDecl,
+// autoInferredTopLevelDecl, topLevelDecl} — a leading attribute may precede a
+// typedef, an inferred `auto`, or an ordinary declaration) and the reason this
+// alt carries `speculative: true`. `topLevelDecl` IS their declared-last owner
+// too, so they would in fact pass the assertion below; they stay out because
+// this list is the one the P53 row named and adding to it silently would blur
+// which leads the row measured.
 namespace {
 
-// Assert that every declaration-specifier keyword lead has EXACTLY ONE owning
-// branch at the alt `cur` points at. `where` names the site for the failure
-// message.
-void expectOneOwnerPerSpecifierLead(GrammarSchema const& schema,
-                                    SchemaCursor cur, std::string_view where) {
+// Assert that at the alt `cur` points at, the DECLARED-LAST branch admitting
+// each declaration-specifier keyword lead is the merged declaration rule
+// `topLevelDecl`. `where` names the site for the failure message.
+//
+// ⚠⚠ P65 (D-C-FILE-SCOPE-INFERRED-AUTO-MUST-LEAD-THE-DECLARATION-SPECIFIERS) —
+// THIS HELPER USED TO ASSERT `count == 1`, AND THAT PROXY IS REFUTED. It read:
+// "two owners put every declaration led by this keyword through a 128-token
+// speculative probe that must swallow the function body", which was TRUE of the
+// parser it was written against and is no longer true of this one.
+// `finalCandidateDirectDescent_` DESCENDS into an outermost alt's final
+// candidate — with no probe, no checkpoint and no budget — whenever that
+// candidate is the declared-last STRUCTURAL candidate, which is exactly the
+// rule the all-fail path already replayed. A second owner declared BEFORE
+// `topLevelDecl` therefore costs one fast-failing probe and nothing else.
+//
+// ✔MEASURED, and the count-based reading was already refusing a grammar the
+// behaviour half of this very file says is fine: with `autoInferredTopLevelDecl`
+// admitting a leading specifier run, six of the seven leads below have two
+// owners, while `InlineLedDefinitionParsesAtEveryBodySize`,
+// `InlineLedStaticDefinitionParsesAtEveryBodySize`,
+// `ExternLedDefinitionParsesAtEveryBodySize`,
+// `ReversedExternOrdersParseAtEveryBodySize` and
+// `OtherSpecifierLeadsParseAtEveryBodySize` are all GREEN at 512 body
+// statements — a proxy disagreeing with the property it proxies for.
+//
+// ★★★ WHAT REPLACES IT IS STRICTLY STRONGER, NOT WEAKER, and it is the fact the
+// long body actually depends on: the declaration rule must be the alt's
+// FALLBACK READING. Both the descent and the all-fail replay target the
+// declared-LAST structural candidate (parser.cpp's `lastStructuralCandidate_`),
+// so if any branch declared AFTER `topLevelDecl` claimed one of these leads,
+// that branch — not the declaration — would be the budget-free reading, and
+// every long-bodied definition with that lead would go through the probe. The
+// old assertion could not see that at all: it counted owners without asking
+// WHICH, so it stayed green under the one rearrangement that breaks the
+// behaviour, and went red under the one that does not.
+void expectSpecifierLeadFallsBackToTheDeclarationRule(
+    GrammarSchema const& schema, SchemaCursor cur, std::string_view where) {
     const std::span<RuleId const> branches = schema.altRuleBranches(cur);
     ASSERT_FALSE(branches.empty())
         << where << " must be an alt with enumerable rule branches";
@@ -169,20 +219,22 @@ void expectOneOwnerPerSpecifierLead(GrammarSchema const& schema,
         ASSERT_TRUE(tok.valid()) << "unknown token kind " << kind;
 
         std::string owners;
-        std::size_t count = 0;
+        std::string last;
         for (RuleId const branch : branches) {
             if (schema.firstSetContains(branch, tok)) {
-                ++count;
-                owners += schema.rules().name(branch);
+                last = schema.rules().name(branch);
+                owners += last;
                 owners += ' ';
             }
         }
-        EXPECT_EQ(count, 1U)
-            << kind << " must lead EXACTLY ONE branch of " << where
-            << " so the parser takes the unique-production direct descent; "
-               "owners = [ " << owners << "]. Two owners put every declaration "
-               "led by this keyword through a 128-token speculative probe that "
-               "must swallow the function body.";
+        EXPECT_EQ(last, "topLevelDecl")
+            << kind << " must have the merged declaration rule as the "
+               "declared-LAST branch of " << where
+            << " that admits it, because that is the reading the parser "
+               "descends into (and replays) with NO probe budget; owners = [ "
+            << owners << "]. A branch declared AFTER `topLevelDecl` claiming "
+               "this lead would take the budget-free reading away from every "
+               "declaration and put the function body inside a probe.";
     }
 }
 
@@ -194,37 +246,42 @@ TEST(ParserDeclSpecifierLead, EachSpecifierLeadHasExactlyOneTopLevelOwner) {
 
     const RuleId topLevel = schema->rules().find("topLevel");
     ASSERT_TRUE(topLevel.valid()) << "the `c` grammar must declare `topLevel`";
-    expectOneOwnerPerSpecifierLead(*schema, schema->enterRule(topLevel),
-                                   "/shapes/topLevel");
+    expectSpecifierLeadFallsBackToTheDeclarationRule(
+        *schema, schema->enterRule(topLevel), "/shapes/topLevel");
 
     // ✔MEASURED 2026-09-02 by printing every branch's `predictivePrefixLen`
-    // here: `topLevelDecl` and `externDecl` both report ZERO (a length-1
-    // prefix is dropped by `computePredictivePrefixes`, and both rules enter
-    // on a variable-width element). So the LL(k) PRUNE never separated these
-    // two branches and cannot be restored to — the single-candidate FIRST gate
-    // asserted above is the ONLY thing keeping them off the probe. Asserted
-    // rather than narrated, because a repair that hopes to buy the prune back
-    // with a two-token lead is chasing a mechanism that was never running.
+    // here: `topLevelDecl` reports ZERO (a length-1 prefix is dropped by
+    // `computePredictivePrefixes`, and the rule enters on a variable-width
+    // element). So the LL(k) PRUNE never separated this branch from a sibling
+    // sharing its lead and cannot be restored to — the FALLBACK-READING
+    // invariant asserted above is the ONLY thing keeping a long body off the
+    // speculative probe. Asserted rather than narrated, because a repair that
+    // hopes to buy the prune back with a two-token lead is chasing a mechanism
+    // that was never running. (`externDecl` stood beside it here until P53
+    // merged it into `topLevelDecl`; the rule no longer exists, so asking about
+    // it would assert on nothing.)
     for (RuleId const branch :
          schema->altRuleBranches(schema->enterRule(topLevel))) {
-        if (branch.v == schema->rules().find("topLevelDecl").v
-            || branch.v == schema->rules().find("externDecl").v) {
+        if (branch.v == schema->rules().find("topLevelDecl").v) {
             EXPECT_LT(schema->predictivePrefixLen(branch), 2U)
                 << schema->rules().name(branch)
                 << " has no multi-token predictive prefix, so nothing but the "
-                   "one-owner-per-lead invariant keeps it off the speculative "
+                   "fallback-reading invariant keeps it off the speculative "
                    "probe";
         }
     }
 
-    // ★★★ P53, THE MERGE'S OWN INVARIANT — WHICH branch owns `extern`, not
-    // merely how many. `expectOneOwnerPerSpecifierLead` above would stay green
-    // if the merge were UNDONE and `externDecl` came back as this alt's sole
-    // `extern` owner: one owner either way. What made every ordering parse is
-    // that the one owner is `topLevelDecl`, i.e. that `extern` is now an
-    // ordinary `singleDeclSpecifier` sitting in the SAME rule as `inline` /
-    // `_Noreturn` / the thread-local pair. Pin the identity, or the count alone
-    // silently permits the shape this row spent three cycles refuting.
+    // ★★★ P53, THE MERGE'S OWN INVARIANT — that `extern` is owned by the
+    // DECLARATION rule and not by a second top-level declaration rule of its
+    // own. The pre-P65 helper counted owners without asking which, and would
+    // have stayed green if the merge were UNDONE and `externDecl` came back as
+    // this alt's sole `extern` owner — one owner either way. The helper above
+    // now asserts the identity for all seven leads, so this block is that
+    // assertion's `extern` case restated where the P53 row can find it, and it
+    // is kept rather than deleted because the row cites the fact by name: what
+    // made every ordering parse is that `extern` became an ordinary
+    // `singleDeclSpecifier` in the SAME rule as `inline` / `_Noreturn` / the
+    // thread-local pair.
     {
         const SchemaTokenId ext = schema->schemaTokens().find("ExternKeyword");
         ASSERT_TRUE(ext.valid());
@@ -258,7 +315,7 @@ TEST(ParserDeclSpecifierLead, ExtensionTopLevelAltCarriesTheSameInvariant) {
         schema->advance(schema->enterRule(ext), kw);
     ASSERT_TRUE(afterKeyword.valid())
         << "`extensionTopLevel` must begin with `ExtensionKeyword`";
-    expectOneOwnerPerSpecifierLead(*schema, afterKeyword,
+    expectSpecifierLeadFallsBackToTheDeclarationRule(*schema, afterKeyword,
                                    "/shapes/extensionTopLevel's inner alt");
 }
 

@@ -351,9 +351,28 @@ struct Case {
           + std::string(24, ')') + "; }",
           DiagnosticCode::P_ExpressionTooDeep, 2048, 16);
     // TOKEN BUDGET: the ceiling that latches WITHOUT emitting at all.
+    // ⚠ P65 (D-C-FILE-SCOPE-INFERRED-AUTO-MUST-LEAD-THE-DECLARATION-SPECIFIERS)
+    // — THIS CASE USED TO BE `return (x+1+1+…);` AND THAT PROGRAM IS NO LONGER
+    // REFUSED, WHICH IS THE FIX RATHER THAN A HOLE. A bare parenthesised
+    // expression makes `parenExpr` both the last SURVIVING candidate of c's
+    // `operand` alt and its declared-last STRUCTURAL one, so
+    // `finalCandidateDirectDescent_` descends into it with no budget — and it
+    // always could have, because the all-fail path was going to REPLAY that
+    // same rule without a budget one step later. The budget was refusing a
+    // program gcc 13.3.0 and clang 18.1.3 both compile, and then parsing it
+    // correctly on the replay while still exiting 1.
+    // ★ THE CEILING IS STILL REACHABLE AND IS STILL PINNED HERE — a CAST
+    // operand reaches it, because the prune drops `parenExpr` on `(int)…` so
+    // the last survivor is `castExpr` while the fallback reading stays
+    // `parenExpr`, and a candidate that is not the fallback reading keeps its
+    // budget. ✔MEASURED through the shipped CLI at the SHIPPED
+    // `speculationBudgetFactor` of 128, after the change:
+    // `return (int)(x+1 x4100);` is error[P_SpeculationBudgetExhausted] rc=1
+    // while `return (x+1 x4100);` is rc=0 — so the config key is still
+    // falsifiable and the two shapes say which mechanism each one exercises.
     addAt("ceiling-budget",
           [] {
-              std::string s = "int main(void){ int x=0; return (x";
+              std::string s = "int main(void){ int x=0; return (int)(x";
               for (int i = 0; i < 400; ++i) s += "+1";
               s += "); }";
               return s;
@@ -641,7 +660,20 @@ TEST(ParserSpeculationRefusalCost, ARolledBackProbeDoesNotDisarmTheCascadeShield
     ASSERT_NE(schema, nullptr);
 
     ParserConfig cfg = shippedCConfig(*schema);
-    cfg.maxSpeculationDepth = 8;
+    // ⚠ P65 (D-C-FILE-SCOPE-INFERRED-AUTO-MUST-LEAD-THE-DECLARATION-SPECIFIERS)
+    // — THE CEILING MOVED BY ONE LEVEL AND THE CAP IS LOWERED TO MATCH, WHICH IS
+    // A RECALIBRATION OF THE INSTRUMENT AND NOT A WEAKENING OF WHAT IT ASSERTS.
+    // `finalCandidateDirectDescent_` removed ONE enclosing probe from this
+    // shape: the depth-0 statement alt's final candidate is now DESCENDED into
+    // rather than probed, so the cast chain below starts one speculation level
+    // shallower and this program stopped reaching a cap of 8 at all —
+    // ✔MEASURED, `countCode(P_MaxSpeculationDepth)` went 1 -> 0 and the shielded
+    // cascade leaked exactly as the mutant's transcript below predicts, which is
+    // what turned the arm red. The VERBATIM machine-found program is kept
+    // (paraphrasing it would discard the 1150-program search that found it) and
+    // the cap moves instead, so the arm still asserts the same three facts: the
+    // ceiling reports ONCE, by name, and the region it shields stays shielded.
+    cfg.maxSpeculationDepth = 7;
     cfg.maxExpressionDepth  = 64;
 
     ParseResult r = parseCFull(

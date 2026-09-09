@@ -28,19 +28,58 @@
 # OWN control (an empty scratchpad still removes with no flag) so it cannot pass over a
 # gate that simply refuses everything.
 #
-# ⚠⚠ A MISSING `pwsh` IS A FAILURE, NOT A SKIP, AND THAT IS DELIBERATE. A guard that
-# quietly does not run publishes a gate figure about the operator's PATH rather than
-# about the tree -- the same ruling `CMakeLists.txt` already applies to the bash it hunts
-# for this very test, where a host with no working bash gets a REGISTERED REFUSAL rather
-# than a vanished entry. ✔MEASURED 2026-09-07: pwsh 7.5.2 on the Windows host and
-# /usr/bin/pwsh inside WSL -- and those two are exactly the carriages that run repo-guards
-# (`remote-leg.sh` appends `-LE repo-guard`, `wsl-leg.sh` defaults to running them), so
-# this cannot red a leg that actually executes this guard.
-# ★ THE PROBE LOOKS FOR THE SUBJECT'S OWN VERDICT LINE, NEVER THE EXIT CODE. This
-# script's history includes a driver that reported a bash-not-found `rc=127` as "the pin
-# stayed green" -- CANNOT-RUN, RED and VACUOUS are three different findings and naming
-# one as another sends the next reader to repair something that was never broken
-# [[feedback-a-vacuous-skip-and-a-misnamed-red]].
+# ⚠⚠ THE `.ps1` ARMS ARE HOST-CONDITIONAL, AND THAT CONDITION IS THE ONLY ESCAPE IN THIS
+# FIXTURE. The registry row for this repair is named in `CMakeLists.txt`, beside the
+# `repo_tree_guard` registration that carried the SAME host-blindness the other way round;
+# it is deliberately not cited by id here, because `scripts/` is a scanned root for
+# `check-anchor-registry` and a lane that may not write `.plans/**` would be citing a row
+# that does not exist yet — an unresolvable citation is a red about bookkeeping, not tree.
+# ⛔ IT USED TO BE A FAILURE: a host with no PowerShell got `fail=1` and the sentence
+# *CANNOT RUN -- no pwsh could execute lane-worktree.ps1*. ✔MEASURED 2026-09-08 (P65):
+# that is a RED NAMING THIS GUARD FOR A PROPERTY OF THE HOST'S SOFTWARE INVENTORY -- the
+# misattributing-instrument class -- and it was masked only because every leg driver
+# appends `-LE repo-guard`; a plain `ctest` on a PowerShell-less carriage, or any leg run
+# with guards forced on, met it. The sibling `run_gate_guard` met exactly that and it
+# blocked a push [[D-GUARD-RUN-GATE-FIXTURE-DRIVES-A-WINDOWS-ONLY-INTERPRETER-ON-EVERY-HOST]].
+# ⇒ an arm this host CANNOT run is now reported NOT APPLICABLE, BY NAME, WITH THE REASON,
+#   and COUNTED. Never a failure, and never a silent skip -- the three things that are
+#   different findings [[feedback-a-vacuous-skip-and-a-misnamed-red]].
+# ★ THE PROBE IS BY EXECUTION, NEVER BY LOOKUP (`lane_worktree_powershell`), AND WHAT IT
+#   RUNS IS THE SUBJECT ITSELF. The old loop gated each candidate behind
+#   `command -v`, which is documented IN THIS REPOSITORY to LIE over a non-interactive
+#   ssh session on the macOS carriage (`scripts/remote-leg/remote-leg.sh` carries that
+#   measurement, where tools sitting at /opt/homebrew/bin were reported NOT FOUND). A
+#   lookup also fails the other way -- naming an interpreter that cannot start -- and that
+#   is the direction that hurts here: every `.ps1` arm would then fail for a reason that
+#   is not the subject's. The probe requires `lane-worktree.ps1`'s OWN usage line back, so
+#   an interpreter that runs but cannot open or parse the subject is ABSENT, not present.
+# ★ THE CANDIDATE ORDER `pwsh powershell` IS NOT A GUESS: it is exactly
+#   `find_program(POWERSHELL_EXE NAMES pwsh powershell REQUIRED)` in `CMakeLists.txt`, so
+#   this fixture drives the twin under the SAME interpreter the build system already picks
+#   for every other `.ps1` ctest entry. ✔MEASURED 2026-09-08 on this Windows host: BOTH
+#   spellings reach lane-worktree.ps1's usage refusal (`pwsh` 7.5.2 and `powershell` 5.1
+#   both print `lane-worktree: usage:` and exit 5), so the fallback is real coverage and
+#   not a spelling that would have been rejected anyway.
+# ★★ THE ESCAPE IS DIRECTIONAL, AND THE FIXTURE RE-MEASURES THAT ON EVERY RUN. Arm (0a)
+#   calls the SAME probe with PATH pointing at an empty directory and requires it to report
+#   ABSENT. Without it, a probe that had quietly degenerated to *always absent* would
+#   declare every `.ps1` arm not-applicable on every host and still print a green run.
+#   ⚠ This repository has already paid for the opposite direction: a guard grew an escape
+#   that EVERY subject triggered, so it refused nothing and three mutants came back green
+#   [[feedback-an-escape-every-row-triggers-disarms-the-guard]].
+# ★★ ON WINDOWS THE ESCAPE IS NOT AVAILABLE AT ALL (arm (0b), `lane_worktree_host_is_windows`).
+#   PowerShell ships with that OS, `CMakeLists.txt` already refuses to configure without
+#   one, and `lane-worktree.ps1` is the entry point THIS host calls -- so a Windows host
+#   answering *no PowerShell* has a broken PATH, not a legitimate absence. Left escapable,
+#   a `ctest` launched with a stripped PATH would drop all eight `.ps1` arms on the one
+#   host category the twin actually runs on, and report green for doing less work.
+# ★ NOTHING HERE IS SETTABLE BY A CALLER. The candidate list is a constant and there is no
+#   environment override, so the escape cannot be SPELLED -- an escape that can be spelled
+#   is one that will be.
+# ★ THE `.sh` ARMS ARE NEVER ESCAPABLE. Arms (1)-(10), and the `(18)` control together
+#   with its `.sh` half, run everywhere and unconditionally; a host with no PowerShell
+#   still proves the `.sh` twin. ⓘ The `(18)` control and `.sh` half USED to sit inside
+#   the pwsh branch, so a PowerShell-less host silently lost them too.
 #
 # ⚠ THE TWO SHELLS DISAGREE ABOUT HOW TO SPELL ONE DIRECTORY, AND A `-PreserveTo` PATH
 # CROSSES THAT BOUNDARY. ✔MEASURED 2026-09-07 under Git Bash: handing pwsh the MSYS
@@ -79,7 +118,10 @@
 # and by a sweep of same-named leftovers BEFORE the first add: isolation between concurrent
 # gates is by TREE (each worktree has its own `.worktrees/`), never by the name's length.
 #
-# Exit codes: 0 all arms passed - 1 an arm failed, or an implementation could not be run.
+# Exit codes: 0 every arm this host CAN run passed - 1 an arm failed, or the fixture's own
+# driver (bash, git, or the two subject scripts) is missing. ⚠ An arm reported NOT
+# APPLICABLE is neither: it is named, counted and printed, and it does not move the exit
+# code. The run's own last lines say how many of each there were.
 set -uo pipefail
 
 _here="$(cd "$(dirname "$0")" && pwd -P)"
@@ -111,6 +153,16 @@ L1="t${_sfx}a"; L2="t${_sfx}b"; L3="t${_sfx}c"; L4="t${_sfx}d"; L5="t${_sfx}e"
 P1="t${_sfx}f"; P2="t${_sfx}g"; P3="t${_sfx}h"
 MANIFESTS="$REPO/.worktrees/.manifests"
 fail=0
+# WHAT THIS RUN ACTUALLY PROVED, counted rather than claimed. The summary used to state
+# a CONSTANT ("27 assertions over 18 arms") that stayed true only on a host carrying both
+# interpreters; on any other it was a figure about a run that never happened.
+_asserts=0    # assertions that really executed
+_failures=0   # of those, how many failed -- `fail` stays the 0/1 EXIT contract
+_na_arms=0    # arms this host cannot run, each named with its reason below
+# A directory that exists and holds nothing, so arm (0a) can point PATH at a real place
+# that reaches no interpreter. ⚠ Under $TMP, so the EXIT trap removes it.
+NOWHERE_BIN="$TMP/no-interpreter-here"
+mkdir -p "$NOWHERE_BIN"
 
 _sweep() {
   for l in "$L1" "$L2" "$L3" "$L4" "$L5" "$P1" "$P2" "$P3"; do
@@ -131,16 +183,36 @@ trap _cleanup EXIT
 _sweep
 
 _arm() {  # <label> <expected-substring> <actual>
+  _asserts=$(( _asserts + 1 ))
   case "$3" in
     (*"$2"*) printf '  ok   %s\n' "$1" ;;
-    (*) fail=1; printf '  FAIL %s\n       wanted: %s\n       got   : %s\n' "$1" "$2" "$3" ;;
+    (*) fail=1; _failures=$(( _failures + 1 ))
+        printf '  FAIL %s\n       wanted: %s\n       got   : %s\n' "$1" "$2" "$3" ;;
   esac
 }
 _arm_absent() {  # <label> <forbidden-substring> <actual>
+  _asserts=$(( _asserts + 1 ))
   case "$3" in
-    (*"$2"*) fail=1; printf '  FAIL %s\n       must NOT contain: %s\n       got   : %s\n' "$1" "$2" "$3" ;;
+    (*"$2"*) fail=1; _failures=$(( _failures + 1 ))
+             printf '  FAIL %s\n       must NOT contain: %s\n       got   : %s\n' "$1" "$2" "$3" ;;
     (*) printf '  ok   %s\n' "$1" ;;
   esac
+}
+# Counted like an assertion, because the manual checks below are assertions; they simply
+# cannot be expressed as a substring match.
+_ok() {  # <label>
+  _asserts=$(( _asserts + 1 )); printf '  ok   %s\n' "$1"
+}
+_fail() {  # <label> [detail]
+  _asserts=$(( _asserts + 1 )); _failures=$(( _failures + 1 )); fail=1; printf '  FAIL %s\n' "$1"
+  [ $# -gt 1 ] && printf '       %s\n' "$2"
+  return 0
+}
+# An arm this host CANNOT run. Named, with its reason, and counted -- the three things a
+# silent skip omits, and the three a red gets wrong in the other direction.
+_na() {  # <label> <reason>
+  _na_arms=$(( _na_arms + 1 ))
+  printf '  n/a  %s\n       NOT APPLICABLE ON THIS HOST: %s\n' "$1" "$2"
 }
 # A stale manifest whose CONTENT is recognisable, so "reset to {}" cannot be confused with
 # "the file was never written". ⚠ The fixture is the REMOVE direction: it plants what a real
@@ -166,15 +238,15 @@ printf 'evidence\n' > "$REPO/.worktrees/$L1/scratchpad/p/lane/probe.log"
 out="$(bash "$LW" remove "$L1" 2>&1)"; rc=$?
 _arm "(1) a scratchpad with files and NO flag is REFUSED" "holds a scratchpad with 1 file(s)" "$out"
 _arm "(1) ... with the scratchpad exit code, not a generic one" "7" "$rc"
-if [ -d "$REPO/.worktrees/$L1" ]; then printf '  ok   (1) ... and the worktree is STILL ON DISK\n'
-else fail=1; printf '  FAIL (1) the worktree was removed despite the refusal\n'; fi
+if [ -d "$REPO/.worktrees/$L1" ]; then _ok "(1) ... and the worktree is STILL ON DISK"
+else _fail "(1) the worktree was removed despite the refusal"; fi
 
 # ── (2)(3) --preserve-to copies, VERIFIES, then removes ──────────────────────
 out="$(bash "$LW" remove "$L1" --preserve-to "$TMP/kept" 2>&1)"
 _arm "(2) --preserve-to reports a VERIFIED copy" "preserved 1 scratchpad file(s)" "$out"
 _arm "(2) ... and only then removes the worktree" "VERIFIED absent" "$out"
-if [ -f "$TMP/kept/p/lane/probe.log" ]; then printf '  ok   (3) the evidence really is at the destination\n'
-else fail=1; printf '  FAIL (3) the preserved file is not at the destination\n'; fi
+if [ -f "$TMP/kept/p/lane/probe.log" ]; then _ok "(3) the evidence really is at the destination"
+else _fail "(3) the preserved file is not at the destination"; fi
 
 # ── (4) --discard-scratchpad is a DECISION, and says so ──────────────────────
 bash "$LW" add "$L2" >/dev/null 2>&1
@@ -229,7 +301,7 @@ if git init -q "$FOREIGN" 2>/dev/null \
   # repository before anything runs in it.
   _f_real="$(cd "$FOREIGN" && pwd -P)"
   case "$_f_real/" in
-    "$REPO"/*) echo "  FAIL (7) fixture $_f_real is INSIDE $REPO -- refusing to probe"; fail=1 ;;
+    "$REPO"/*) _fail "(7) fixture $_f_real is INSIDE $REPO -- refusing to probe" ;;
     *)
       # ★ THE POSITIVE HALF IS A LANE THE VERB ITSELF CREATED IN ITS OWN TREE, not a
       # path string. ⓘ Deliberately NOT a comparison against `$REPO`: this test
@@ -247,9 +319,9 @@ if git init -q "$FOREIGN" 2>/dev/null \
       # reached BOTH trees.
       case "$out" in
         *decoylane*)
-          fail=1
-          printf '  FAIL (7) the verb reported the FOREIGN cwd'"'"'s lane "decoylane" -- the root is cwd-keyed\n       got   : %s\n' "$out" ;;
-        *) printf '  ok   (7) ... and does NOT report the foreign cwd'"'"'s lane\n' ;;
+          _fail "(7) the verb reported the FOREIGN cwd's lane \"decoylane\" -- the root is cwd-keyed" \
+                "got   : $out" ;;
+        *) _ok "(7) ... and does NOT report the foreign cwd's lane" ;;
       esac
       bash "$LW" remove "$L5" --discard-scratchpad >/dev/null 2>&1
 
@@ -262,8 +334,10 @@ if git init -q "$FOREIGN" 2>/dev/null \
       ;;
   esac
 else
-  fail=1
-  printf '  FAIL (7) could not build the foreign-repo fixture -- the cwd arm did not run\n'
+  # ⚠ A FAILURE, NOT A NOT-APPLICABLE: `git` is this fixture's own driver (every arm
+  # above already ran it), so a host that cannot build a two-commit throwaway repo is
+  # broken rather than merely different.
+  _fail "(7) could not build the foreign-repo fixture -- the cwd arm did not run"
 fi
 
 # ── (9) CONTROL FOR (7): the decoy the negative half looks for really EXISTS ──
@@ -276,9 +350,9 @@ fi
 # on purpose, so "decoylane did not appear in (7)" means "the resolver did not go
 # there", not "there was nothing to find".
 if [ -f "$FOREIGN/.worktrees/decoylane/marker.txt" ]; then
-  printf '  ok   (9) CONTROL: the decoy lane the negative half looks for really exists\n'
+  _ok "(9) CONTROL: the decoy lane the negative half looks for really exists"
 else
-  fail=1; printf '  FAIL (9) CONTROL: the decoy fixture was never built -- (7) measured nothing\n'
+  _fail "(9) CONTROL: the decoy fixture was never built -- (7) measured nothing"
 fi
 
 # ── (10) `add` RESETS A STALE SEED MANIFEST -- the `.sh` half ────────────────
@@ -296,60 +370,133 @@ _arm "(10) .sh add RESETS a stale seed manifest to empty" "{}" "$(_manifest_of "
 # Everything below drives `lane-worktree.ps1` through the arms above. See the header
 # for why a green run of (1)-(10) said nothing whatever about this half for two cycles.
 #
-# ★ THE PROBE IS THE SUBJECT'S OWN VERDICT LINE. `pwsh` with no verb must reach
-# lane-worktree.ps1's usage refusal; an interpreter that runs but cannot open or parse
-# the script is CANNOT-RUN, and so is a `pwsh` that is not there at all. Neither is a
-# pass, and neither is reported as a gate failure.
-PWSH=""
-PWSH_WHY=""
-for _c in pwsh pwsh.exe; do
-  if ! command -v "$_c" >/dev/null 2>&1; then
-    PWSH_WHY="$PWSH_WHY
-       [$_c] not found on PATH"
-    continue
-  fi
-  _probe="$("$_c" -NoProfile -NoLogo -File "$LWPS" 2>&1)"; _prc=$?
-  case "$_probe" in
-    *"usage: lane-worktree.ps1"*) PWSH="$_c"; break ;;
-    *) PWSH_WHY="$PWSH_WHY
-       [$_c] ran but never reached lane-worktree.ps1's own usage refusal (exit $_prc): $(printf '%s' "$_probe" | tr '\n' ' ')" ;;
+# ★ THE PROBE IS THE SUBJECT'S OWN VERDICT LINE, NEVER A LOOKUP AND NEVER AN EXIT CODE.
+# The candidate is RUN against `lane-worktree.ps1` itself and must hand back that script's
+# own usage refusal; an interpreter that starts but cannot open or parse the subject is
+# therefore ABSENT here, exactly like one that is not installed. This script's history
+# includes a driver that reported a bash-not-found `rc=127` as "the pin stayed green" --
+# CANNOT-RUN, RED and VACUOUS are three different findings [[feedback-a-vacuous-skip-and-a-misnamed-red]].
+LWPS_USAGE='usage: lane-worktree.ps1'
+PWSH_CANDIDATES='pwsh powershell'
+PWSH_PROBE_LOG="$TMP/pwsh-probe.log"
+# ⓘ DECIDES WITH SHELL BUILTINS ONLY (`case`, `[`, `printf`, `local`) on purpose: arm (0a)
+#   points PATH at an empty directory to disable the CANDIDATES, and a probe that also
+#   needed `grep` or `tr` to reach its verdict would report ABSENT there for the wrong
+#   reason -- a negative arm that passes vacuously proves nothing about directionality.
+#   The diagnostic LOG line below is written after the verdict and cannot influence it.
+lane_worktree_powershell() {   # echoes the winning candidate, rc 0; echoes nothing, rc 1
+  local _c _out _rc
+  : > "$PWSH_PROBE_LOG"
+  for _c in $PWSH_CANDIDATES; do
+    _out="$("$_c" -NoProfile -NoLogo -File "$LWPS" 2>&1)"; _rc=$?
+    case "$_out" in
+      (*"$LWPS_USAGE"*) printf '%s' "$_c"; return 0 ;;
+    esac
+    printf '       [%s] did not reach lane-worktree.ps1 own usage refusal (exit %s): %s\n' \
+           "$_c" "$_rc" "${_out//$'\n'/ }" >> "$PWSH_PROBE_LOG"
+  done
+  return 1
+}
+
+# ⚠ THE SAME PREDICATE THE SIBLING FIXTURE USES, deliberately spelled the same way: a
+#   second answer to "is this Windows" is how two halves of one rule start disagreeing.
+lane_worktree_host_is_windows() {
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    (MINGW*|MSYS*|CYGWIN*) return 0 ;;
+    (*)                    return 1 ;;
   esac
-done
+}
+
+# ── (0a) THE ESCAPE MUST BE DIRECTIONAL, AND THAT IS RE-MEASURED ON EVERY RUN ──
+# The SAME probe, run where PATH reaches an EMPTY directory and nothing else, must report
+# ABSENT. Without this arm a probe that had quietly degenerated to "always absent" would
+# declare every `.ps1` arm not-applicable on every host and still print a green run --
+# the exact shape of an escape that refuses nothing.
+# ⓘ A subshell, not a `VAR= func` prefix: bash keeps such an assignment in the CALLER'S
+#   environment for a FUNCTION, which would strip PATH for every arm that follows.
+_neg="$( PATH="$NOWHERE_BIN"; lane_worktree_powershell )"; _neg_rc=$?
+if [ "$_neg_rc" -eq 0 ]; then
+  _fail "(0a) DIRECTIONALITY: the probe claimed PowerShell '$_neg' with no interpreter reachable on PATH"
+else
+  _ok "(0a) DIRECTIONALITY: PATH reaching no interpreter -> the probe reports ABSENT"
+fi
+
+# ── (0b) WHICH INTERPRETER THIS HOST ACTUALLY HAS ────────────────────────────
+# ★★ ON WINDOWS THE ESCAPE IS NOT AVAILABLE AT ALL, and that is the other half of making
+# it directional -- see the header block for the measurement.
+PWSH="$(lane_worktree_powershell)"
+if [ -n "$PWSH" ]; then
+  _ok "(0b) the .ps1 arms will run under '$PWSH' (probed BY EXECUTION against lane-worktree.ps1's own usage line)"
+elif lane_worktree_host_is_windows; then
+  _fail "(0b) THIS IS WINDOWS and none of '$PWSH_CANDIDATES' reached lane-worktree.ps1's usage refusal." \
+        "PowerShell ships with this OS, CMake already requires one, and lane-worktree.ps1 is the entry point THIS host calls: that is a broken PATH, not a host without PowerShell. The .ps1 arms are NOT escapable here."
+  printf '%s' "$(cat "$PWSH_PROBE_LOG" 2>/dev/null)" >&2; printf '\n' >&2
+else
+  _ok "(0b) no working PowerShell on this host, so the .ps1 arms are NOT APPLICABLE (named below)"
+fi
+PWSH_ABSENT_WHY="no working PowerShell on this host (each of '$PWSH_CANDIDATES' was RUN against lane-worktree.ps1 and none returned its own '$LWPS_USAGE' line)"
+
+# ── (18) CONTROL AND ITS `.sh` HALF -- UNCONDITIONAL, AND THAT IS THE FIX ────
+# ✔MEASURED 2026-09-07 (P63): the two `list` implementations did NOT name the same set.
+# `.sh` globs `<repo>/.worktrees/*/`, which skips leading-dot entries; `.ps1` used
+# `Get-ChildItem -Directory -Force`, which does not -- so it reported
+# `.worktrees/.manifests`, `lane-fold`'s seed bookkeeping, as a removable lane holding 238
+# files. ★ The CONTROL is first and is not optional: without it both negative halves pass
+# on a tree where `.manifests` simply does not exist, which is the vacuous direction.
+# ⚠ THESE TWO USED TO SIT INSIDE THE `pwsh` BRANCH, so a PowerShell-less host lost the
+#   CONTROL and the `.sh` negative as well -- coverage that needs no PowerShell at all,
+#   silently retired by an escape taken for the other twin.
+if [ -d "$MANIFESTS" ]; then _ok "(18) CONTROL: .worktrees/.manifests really is on disk"
+else _fail "(18) CONTROL: .worktrees/.manifests is absent -- the negatives below measure nothing"; fi
+_arm_absent "(18) .sh list does not present .manifests as a lane" \
+            ".worktrees/.manifests" "$(bash "$LW" list 2>&1)"
 
 if [ -z "$PWSH" ]; then
-  # ⚠⚠ A FAILURE, NOT A SKIP. A guard that quietly does not run publishes a figure about
-  # the operator's PATH instead of about the tree, and the `.ps1` half of this owner is
-  # the one the WINDOWS host actually calls. It is reported as CANNOT-RUN so nobody
-  # repairs a gate that never executed [[feedback-a-vacuous-skip-and-a-misnamed-red]].
-  fail=1
-  printf 'lane-worktree self-test: CANNOT RUN -- no pwsh could execute %s, so the .ps1 twin was NOT exercised.\n' "$LWPS" >&2
-  printf '  This is a FAILURE, not a skip: the .ps1 is the entry point the Windows host uses,\n' >&2
-  printf '  and its scratchpad gate is the half that was missing for two cycles.\n' >&2
-  printf '  Candidates tried:%s\n' "$PWSH_WHY" >&2
-  printf '  Install PowerShell 7 (pwsh) or put it on PATH, then re-run.\n' >&2
+  # ⚠⚠ NOT A FAILURE AND NOT A SILENT SKIP. Each arm the missing interpreter costs is
+  # named, given its reason, and counted; the summary then states in words that the `.ps1`
+  # twin was not proved here, so a green run cannot be read as proof of the pairing.
+  _na "(11) .ps1 a scratchpad with files and NO flag is REFUSED" \
+      "$PWSH_ABSENT_WHY -- the .ps1 twin's scratchpad refusal, its exit 7 and the survival of the worktree were NOT taken"
+  _na "(12) .ps1 -PreserveTo reports a VERIFIED copy" \
+      "$PWSH_ABSENT_WHY -- the .ps1 twin was never asked to preserve before removing"
+  _na "(13) .ps1 the evidence really is at the destination" \
+      "$PWSH_ABSENT_WHY -- no .ps1 preserve ran, so no destination could be read back"
+  _na "(14) .ps1 -DiscardScratchpad names what it discards" \
+      "$PWSH_ABSENT_WHY -- the .ps1 twin's explicit-discard sentence was not read"
+  _na "(15) .ps1 CONTROL: an EMPTY scratchpad removes with NO flag" \
+      "$PWSH_ABSENT_WHY -- the .ps1 CONTROL was not taken, so nothing here would have caught a .ps1 gate that refused everything"
+  _na "(16) .ps1 -PreserveTo with -DiscardScratchpad is a usage refusal" \
+      "$PWSH_ABSENT_WHY -- the .ps1 twin's contradiction refusal was not read"
+  _na "(17) .ps1 add RESETS a stale seed manifest" \
+      "$PWSH_ABSENT_WHY -- the .ps1 add never ran, so the manifest reset was not observed on that twin"
+  _na "(18) .ps1 list does not present .manifests as a lane" \
+      "$PWSH_ABSENT_WHY -- arm (18) still proves the .sh list above, but the two lists were NOT compared"
 else
   # ── (11) .ps1: files present, no flag -> REFUSED, and the worktree SURVIVES ──
   _plant_stale_manifest "$P1"
   if ! _add_out="$("$PWSH" -NoProfile -NoLogo -File "$LWPS" add "$P1" 2>&1)"; then
-    fail=1
-    printf 'lane-worktree self-test: CANNOT RUN -- .ps1 add of %s failed; lane-worktree.ps1 said:\n%s\n' \
-      "$P1" "$_add_out" >&2
+    # ⚠ A FAILURE, NOT A NOT-APPLICABLE, AND THE DISTINCTION IS THE WHOLE POINT OF (0b):
+    # a WORKING interpreter was found and the subject's own `add` refused, so this is the
+    # subject misbehaving on a host that can run it. The refusal's own text travels with
+    # it; an error that hides its diagnosis is a defect in its own right.
+    _fail "(11) .ps1 add of $P1 failed, so arms (11) (12) (13) and (17) could not be taken" \
+          "lane-worktree.ps1 said: ${_add_out//$'\n'/ }"
   else
     mkdir -p "$REPO/.worktrees/$P1/scratchpad/p/lane"
     printf 'evidence\n' > "$REPO/.worktrees/$P1/scratchpad/p/lane/probe.log"
     out="$("$PWSH" -NoProfile -NoLogo -File "$LWPS" remove "$P1" 2>&1)"; rc=$?
     _arm "(11) .ps1 a scratchpad with files and NO flag is REFUSED" "holds a scratchpad with 1 file(s)" "$out"
     _arm "(11) .ps1 ... with the scratchpad exit code, not a generic one" "7" "$rc"
-    if [ -d "$REPO/.worktrees/$P1" ]; then printf '  ok   (11) .ps1 ... and the worktree is STILL ON DISK\n'
-    else fail=1; printf '  FAIL (11) .ps1 the worktree was removed despite the refusal\n'; fi
+    if [ -d "$REPO/.worktrees/$P1" ]; then _ok "(11) .ps1 ... and the worktree is STILL ON DISK"
+    else _fail "(11) .ps1 the worktree was removed despite the refusal"; fi
 
     # ── (12)(13) .ps1: -PreserveTo copies, VERIFIES, then removes ─────────────
     # The destination is handed over in the spelling BOTH shells resolve (header).
     out="$("$PWSH" -NoProfile -NoLogo -File "$LWPS" remove "$P1" -PreserveTo "$TMP_NATIVE/keptps" 2>&1)"
     _arm "(12) .ps1 -PreserveTo reports a VERIFIED copy" "preserved 1 scratchpad file(s)" "$out"
     _arm "(12) .ps1 ... and only then removes the worktree" "VERIFIED absent" "$out"
-    if [ -f "$TMP/keptps/p/lane/probe.log" ]; then printf '  ok   (13) .ps1 the evidence really is at the destination\n'
-    else fail=1; printf '  FAIL (13) .ps1 the preserved file is not at the destination\n'; fi
+    if [ -f "$TMP/keptps/p/lane/probe.log" ]; then _ok "(13) .ps1 the evidence really is at the destination"
+    else _fail "(13) .ps1 the preserved file is not at the destination"; fi
 
     # ── (17) .ps1 `add` RESETS A STALE SEED MANIFEST ──────────────────────────
     # Read after the removes above, because the manifest outlives the worktree by design.
@@ -378,23 +525,31 @@ else
   out="$("$PWSH" -NoProfile -NoLogo -File "$LWPS" remove "$P3" -PreserveTo "$TMP_NATIVE/xps" -DiscardScratchpad 2>&1)"
   _arm "(16) .ps1 -PreserveTo with -DiscardScratchpad is a usage refusal" "contradict each other" "$out"
 
-  # ── (18) THE TWO `list`s MUST NAME THE SAME SET ─────────────────────────────
-  # ✔MEASURED 2026-09-07 (P63): they did not. `.sh` globs `<repo>/.worktrees/*/`, which
-  # skips leading-dot entries; `.ps1` used `Get-ChildItem -Directory -Force`, which does
-  # not -- so it reported `.worktrees/.manifests`, `lane-fold`'s seed bookkeeping, as a
-  # removable lane holding 238 files. ★ The CONTROL is first and is not optional: without
-  # it both negative halves pass on a tree where `.manifests` simply does not exist, which
-  # is the vacuous direction.
-  if [ -d "$MANIFESTS" ]; then printf '  ok   (18) CONTROL: .worktrees/.manifests really is on disk\n'
-  else fail=1; printf '  FAIL (18) CONTROL: .worktrees/.manifests is absent -- the two negatives below measure nothing\n'; fi
-  _arm_absent "(18) .sh list does not present .manifests as a lane" \
-              ".worktrees/.manifests" "$(bash "$LW" list 2>&1)"
+  # ── (18) THE `.ps1` HALF OF "THE TWO `list`s MUST NAME THE SAME SET" ────────
+  # ⓘ Its CONTROL and its `.sh` half ran unconditionally above, before this branch, so a
+  # host without PowerShell keeps them; only the COMPARISON is lost there.
   _arm_absent "(18) .ps1 list does not present .manifests as a lane" \
               ".worktrees/.manifests" "$("$PWSH" -NoProfile -NoLogo -File "$LWPS" list 2>&1)"
 fi
 
+# ── WHAT THIS RUN ACTUALLY PROVED ───────────────────────────────────────────
+# ★ THE COUNTS ARE COUNTED, NOT CLAIMED, AND THEY ARE PRINTED ON EVERY HOST, GREEN OR
+# NOT. This line used to be the constant "27 assertions over 18 arms ... BOTH twins
+# driven", which is a sentence about a run that only ever happened on a host carrying
+# both interpreters. A reader who sees only "OK" cannot tell a run that proved both twins
+# from one that proved half of them -- which is the entire reason the not-applicable arms
+# are named and counted rather than skipped.
+printf 'lane-worktree self-test: %s assertion(s) ran, %s arm(s) not applicable on this host, %s failure(s)\n' \
+  "$_asserts" "$_na_arms" "$_failures"
+if [ "$_na_arms" -gt 0 ]; then
+  echo "  ! NOT PROVED HERE: the .ps1 twin of lane-worktree, and therefore the PARITY of the"
+  echo "    two implementations. This host has no working PowerShell, so a green run above is"
+  echo "    evidence about lane-worktree.sh ALONE -- and the .ps1 half is the entry point the"
+  echo "    WINDOWS host calls, whose scratchpad gate was missing for two cycles."
+  echo "    Not applicable is not a failure, and this fixture still exits on failures only."
+fi
 if [ "$fail" -eq 0 ]; then
-  echo "lane-worktree self-test: OK - 27 assertions over 18 arms (14 gate, 3 control, 1 parity-with-control), BOTH twins driven; this gate is PROVEN able to fail."
+  echo "lane-worktree self-test: OK - the scratchpad gate, the root resolver and the seed-manifest reset do what they say; this gate is PROVEN able to fail."
 else
   echo "lane-worktree self-test: FAILED - the scratchpad gate, the root resolver, the seed-manifest reset or one of the two twins is not doing what it says." >&2
 fi

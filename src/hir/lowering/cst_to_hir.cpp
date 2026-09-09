@@ -11991,16 +11991,13 @@ struct Lowerer {
             if (auto const* rec = model.recordFor(sym)) type = reprOf(rec->type);
             // The init = the init-declarator's visible Internal child that
             // is NOT the declarator (`[declarator, '=', initValue]`).
+            // P65: through the SHARED `initDeclaratorInitNode` — this used to be
+            // its own copy of that walk, and the extern-definition arm would have
+            // made it the third.
             std::optional<HirNodeId> init;
-            if (tree().rule(d).v == dc.initDeclaratorRule.v) {
-                for (NodeId c : visible(d)) {
-                    if (isToken(c)) continue;
-                    if (tree().rule(c).v == dc.declaratorRule.v) continue;
-                    if (isAfterDeclaratorAttr(c, dc)) continue;   // TF-C62
-                    init = lowerExprOrBraceInit(c, type);
-                    break;
-                }
-            }
+            if (NodeId const initNode = initDeclaratorInitNode(d, dc);
+                initNode.valid())
+                init = lowerExprOrBraceInit(initNode, type);
             // D-CSUBSET-LOCAL-STATIC: a `static` local is a hidden module-global.
             // Emit makeGlobal + internal ({Local}) linkage + const-ness, append
             // it to the MODULE decls (so collectGlobals sees it → its Ref routes
@@ -13499,16 +13496,95 @@ struct Lowerer {
                 out.push_back(ef);
                 continue;
             }
-            // An OBJECT declarator → ExternGlobal. D-FF2-3: reject `extern int x = 5;`
-            // LOUD — an extern announces storage in another TU; an initializer would
-            // either redefine it locally (contradicting `extern`) or be silently
-            // dropped. An initializer shows up as the initDeclarator carrying a
-            // non-declarator visible child (the `= initValue`); check per-declarator.
-            if (initDeclaratorHasInitializer(d, dc)) {
-                emitH(DiagnosticCode::H_ExternHasInitializer, d,
-                      "extern declarations cannot carry an initializer — storage "
-                      "lives in another translation unit; remove the initializer");
-                out.push_back(errorNode(d));
+            // An OBJECT declarator → ExternGlobal, UNLESS it carries an
+            // initializer. An initializer shows up as the initDeclarator carrying a
+            // non-declarator visible child (the `= initValue`); per-declarator,
+            // because `extern int a = 1, b;` is one declaration with two different
+            // answers.
+            //
+            // ★★★ P65 (the FILE-SCOPE half of D-FF2-3) —
+            // THE ARM SPLITS ON WHAT THE SEMANTIC TIER ALREADY DECIDED, NOT ON A
+            // SECOND READING OF THE SCOPE. `isExternDeclaration` is Pass 1's answer
+            // from `declarationIsNonDefining`, which now applies C 6.9.2p1: a
+            // FILE-scope declarator WITH an initializer DEFINES the object and the
+            // `extern` is redundant. Reading the record rather than re-deriving
+            // "am I at file scope" here is what makes the two tiers unable to
+            // disagree — and they must not, because disagreeing in THIS direction
+            // (semantic says definition, HIR says import) emits an import row for a
+            // symbol this TU also defines, which is a link-time duplicate, not a
+            // diagnostic.
+            //   * NOT an extern declaration ⇒ a DEFINITION: emit a Global with the
+            //     lowered initializer, exactly as `lowerVarLikeInto` would for
+            //     `int x = 0;`. ✔MEASURED, all three references accept it at file
+            //     scope (gcc 13.3.0 and clang 18.1.3 with a warning, MSVC
+            //     19.51.36231 silently) and all three emit a DEFINED symbol.
+            //   * STILL an extern declaration ⇒ BLOCK scope, and C 6.7.11p5 makes
+            //     an initializer a constraint violation there. D-FF2-3's loud
+            //     refusal is unchanged and is what all three references also do
+            //     (gcc "'x' has both 'extern' and initializer", clang "declaration
+            //     of block scope identifier with linkage cannot have an
+            //     initializer", MSVC C2205).
+            if (NodeId const initNode = initDeclaratorInitNode(d, dc);
+                initNode.valid()) {
+                if (rec->isExternDeclaration) {
+                    emitH(DiagnosticCode::H_ExternHasInitializer, d,
+                          "extern declarations cannot carry an initializer at "
+                          "block scope — the identifier has linkage and its "
+                          "storage lives in another translation unit; remove the "
+                          "initializer, or move the declaration to file scope");
+                    out.push_back(errorNode(d));
+                    continue;
+                }
+                // ★★ P65
+                // ([[D-C-FILE-SCOPE-EXTERN-INITIALIZER-EMITS-NO-REDUNDANCY-WARNING]])
+                // — SAY SO. This arm is the ONE place that knows the `extern`
+                // was written AND that C 6.9.2p1 made it redundant, and until
+                // this emit landed the arm was silent by ACCIDENT of the
+                // vocabulary rather than by decision. ✔MEASURED 2026-09-08, each
+                // reference probed SEPARATELY: gcc 13.3.0 warns "'x' initialized
+                // and declared 'extern'", clang 18.1.3 warns
+                // `-Wextern-initializer`, MSVC 19.51.36252 is SILENT even at
+                // `/Wall` — so the union does not REQUIRE a diagnostic and this
+                // is a choice. It is made FOR the warning because the construct's
+                // failure mode is remote from its cause: ✔MEASURED, the same
+                // declaration in a HEADER included by two translation units
+                // compiles clean and then fails the LINK with "multiple
+                // definition" on gcc AND clang (rc=1 both), a message that names
+                // object files rather than the header line. WARNING severity, so
+                // the well-formed program still builds; SUPPRESSIBLE, because
+                // silencing it changes no byte of the artifact (see the code's
+                // block in `parse_diagnostic.hpp` for why neither unsuppressable
+                // prong reaches it).
+                emitHAt(DiagnosticCode::H_ExternRedundantOnDefinition,
+                        DiagnosticSeverity::Warning, d,
+                        "`extern` is redundant on '" + rec->name
+                            + "': a file-scope declaration WITH an initializer "
+                              "is a definition (C 6.9.2p1), so this defines the "
+                              "object here rather than importing it — drop the "
+                              "`extern`, or drop the initializer to make it a "
+                              "declaration of storage defined elsewhere");
+                HirNodeId const g = track(
+                    builder.makeGlobal(type, sym.v,
+                                       lowerExprOrBraceInit(initNode, type)), d);
+                // The SAME four facet records `lowerVarLikeInto` writes on a
+                // file-scope Global, in its order — a definition reached through
+                // this route is not a different kind of definition, and dropping
+                // any of them would make `extern const int c = 5;` land in
+                // writable `.data` (mutability), `extern thread_local int t = 1;`
+                // lose its TLS block (threadLocal), `extern volatile int v = 1;`
+                // lose the load-time init store's volatility, and
+                // `extern alignas(64) int a = 1;` lose its section alignment.
+                recordMutability(g, sym);
+                recordThreadLocal(g, sym);
+                recordVolatility(g, sym);
+                recordAlignment(g, sym);
+                // `sym` is passed for the SAME reason `lowerTopLevelInto` passes
+                // it: C 6.2.2p4 — a prior INTERNAL-linkage declaration outranks
+                // the redundant `extern`. ✔MEASURED, `static int x; extern int x =
+                // 0;` on gcc 13.3.0 emits a LOCAL symbol (`b x`, lower case), not
+                // a global one.
+                recordLinkage(g, mergedLinkage, sym);
+                out.push_back(g);
                 continue;
             }
             HirNodeId const g = track(builder.makeExternGlobal(type, sym.v), d);
@@ -13578,14 +13654,27 @@ struct Lowerer {
 
     [[nodiscard]] bool
     initDeclaratorHasInitializer(NodeId d, DeclaratorConfig const& dc) {
-        if (tree().rule(d).v != dc.initDeclaratorRule.v) return false;
+        return initDeclaratorInitNode(d, dc).valid();
+    }
+
+    // P65 (the file-scope half of D-FF2-3): the SAME scan
+    // as a NODE rather than a bool, because a declarator whose initializer is
+    // legal must now be LOWERED and not merely detected. It is one scan with
+    // three consumers — the has-initializer predicate above, `lowerVarLikeInto`'s
+    // own init lookup, and the file-scope extern-definition arm — which is the
+    // point: the three used to be three copies of the same four-line walk, and a
+    // decoration kind added to only two of them is exactly how `int gv
+    // __asm("myglobal") = 7;` once lowered the LABEL as the initializer.
+    [[nodiscard]] NodeId
+    initDeclaratorInitNode(NodeId d, DeclaratorConfig const& dc) {
+        if (tree().rule(d).v != dc.initDeclaratorRule.v) return NodeId{};
         for (NodeId c : visible(d)) {
             if (isToken(c)) continue;
             if (tree().rule(c).v == dc.declaratorRule.v) continue;
             if (isAfterDeclaratorAttr(c, dc)) continue;   // TF-C62: not the init
-            return true;   // a non-declarator internal child = the initializer
+            return c;   // a non-declarator internal child = the initializer
         }
-        return false;
+        return NodeId{};
     }
 
     HirNodeId lowerFunction(NodeId node, SymbolId sym, TypeId sig,

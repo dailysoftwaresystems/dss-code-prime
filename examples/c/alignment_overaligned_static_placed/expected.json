@@ -1,6 +1,6 @@
 {
-  "$comment": "P64 [[D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN]] (static twin, P63's stated residue): the POSITIVE runtime witness that an over-aligned STATIC is PLACED rather than refused. Before this cycle the pe64 leg refused every static above the format document's declared `SectionAlignment` (4096) with `K_StaticObjectOveralignedForFormat`, and the refusal's own advice -- raise `optionalHeader.sectionAlignment` -- was measured WRONG: mingw-w64 `ld` leaves SectionAlignment at 0x1000 and PADS WITHIN the section, so following the advice would have doubled every image's VA granularity and, taken verbatim, hit a second refusal on `sections[].virtualAddress` (PE/COFF 3.4). `pe::encodeExec` now does what the reference does. $$ THE REFERENCE TABLE, each probed SEPARATELY, BUILD **and** RUN with the address asserted at run time on a MULTI-OBJECT subject, CONTROL arm N=16 green throughout: mingw-w64 gcc 13.2.0 returns 42 at 16, 32, 4096 and 8192 and refuses 16384 with \"requested alignment '16384' exceeds object file maximum 8192\"; MSVC 19.51 returns 42 at 16, 32, 4096 and (with `/link /ALIGN:8192`) 8192, and refuses `__declspec(align(16384))` with `error C2345`. Both stop at 8192 independently because that is the largest value PE/COFF's FOUR-BIT IMAGE_SCN_ALIGN_* field can encode. $ WHY IT RUNS RATHER THAN COMPILES: the defect this replaces produced a CLEAN BUILD and a MISPLACED object (P63: exit 50 on four `aligned(8192)` statics), so an arm asserting only that the compile stopped erroring would have passed while the program was wrong. Every exit code here is derived from an address the linker chose. $ WHY EIGHT OBJECTS: one object sits at its section head and is right BY LUCK -- P63's one-object 8192 probe returned 42 with the defect live. Odd-sized fillers separate them and both storage classes (.bss and .data) are covered, because PE gives those two different section bases. $ NO MACH-O ARM: the Mach-O writer owns its own thread-local ceiling under its own anchor and this lane may not touch that file; the ELF arms are here because P63 measured them placing the same objects correctly.",
-  "$commentRedOnDisable": "REMOVE direction: in `src/link/format/pe.cpp`, delete the `alignSectionHeadToItems` forward pass (the lambda and its three calls) inside the static-placement block of `pe::encodeExec`. Build rc 0, source md5 moved and returned, the mutated TU's .obj md5 moved and returned; this example then BUILDS CLEAN and FAILS AT RUN TIME on the pe64 leg in BOTH runners with exit 50, while `examples/c/alignment_page_request` (whose request equals the section alignment, so the pad is zero) stays GREEN as the named control.",
+  "$comment": "P64 [[D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN]] (static twin, P63's stated residue): the POSITIVE runtime witness that an over-aligned STATIC is PLACED rather than refused. Before this cycle the pe64 leg refused every static above the format document's declared `SectionAlignment` (4096) with `K_StaticObjectOveralignedForFormat`, and the refusal's own advice -- raise `optionalHeader.sectionAlignment` -- was measured WRONG: mingw-w64 `ld` leaves SectionAlignment at 0x1000 and PADS WITHIN the section, so following the advice would have doubled every image's VA granularity and, taken verbatim, hit a second refusal on `sections[].virtualAddress` (PE/COFF 3.4). `pe::encodeExec` now does what the reference does. $$ THE REFERENCE TABLE, each probed SEPARATELY, BUILD **and** RUN with the address asserted at run time on a MULTI-OBJECT subject, CONTROL arm N=16 green throughout: mingw-w64 gcc 13.2.0 returns 42 at 16, 32, 4096 and 8192 and refuses 16384 with \"requested alignment '16384' exceeds object file maximum 8192\"; MSVC 19.51 returns 42 at 16, 32, 4096 and (with `/link /ALIGN:8192`) 8192, and refuses `__declspec(align(16384))` with `error C2345`. Both stop at 8192 independently because that is the largest value PE/COFF's FOUR-BIT IMAGE_SCN_ALIGN_* field can encode. $ WHY IT RUNS RATHER THAN COMPILES: the defect this replaces produced a CLEAN BUILD and a MISPLACED object (P63: exit 50 on four `aligned(8192)` statics), so an arm asserting only that the compile stopped erroring would have passed while the program was wrong. Every exit code here is derived from an address the linker chose. $ WHY EIGHT OBJECTS: one object sits at its section head and is right BY LUCK -- P63's one-object 8192 probe returned 42 with the defect live. Odd-sized fillers separate them and both storage classes (.bss and .data) are covered, because PE gives those two different section bases. $$ THE MACH-O ARM IS arm64 ONLY, BY A DECLARED NUMBER RATHER THAN A CAPABILITY. P65 measured that Mach-O cannot honour a static aligned above the image's own mapping granularity at all -- segment_command_64 carries NO alignment field (section_64.align is read by the STATIC LINKER, never by dyld) and a base-relative image is slid by a multiple of image.segmentPageSize, so an above-page object keeps its link-time address and loses its alignment on about half of all runs. That key is 16384 on macho64-arm64-darwin-exec and 4096 on the x86_64 sibling, so THIS program's 8192 request is PLACED on one and REFUSED BY NAME on the other, from config alone; examples/c/alignment_static_exceeds_macho_segment_page is the negative half at the same value. MEASURED P65 on real Apple Silicon (macOS 26.6.2): the DSS-built arm64 image declares __data addr 0x10000c000 and __bss addr 0x100012000, both align 2^13 (8192), and returns 42 TWENTY TIMES OUT OF TWENTY with dyld placing __DATA at three different addresses -- twenty runs because the failure ruled out is a coin flip on the loader's slide. THE REFERENCE, same host, Apple clang 21.0.0 / ld PROJECT:ld-1267: 42 at 16/4096/16384, and at 32768 ld64 warns \\\"reducing alignment of section __DATA,__data from 0x8000 to 0x4000 because it exceeds segment maximum alignment\\\" and the program returns 50 or 54 BY RUN, never 42; -Wl,-segalign,0x8000 is refused outright. D-LINK-MACHO-IMAGE-OVERALIGNED-STATIC-IS-A-LOAD-TIME-COIN-FLIP. $$ THE ELF ARMS ARE NOT A REGRESSION GUARD -- THEY WERE THE SECOND DEFECT. This cell used to read 'the ELF arms are here because P63 measured them placing the same objects correctly'; that measurement was carried forward from a ONE-OBJECT probe and is MEASURED FALSE. P64: this program returned 54 on arm64:elf64-aarch64-linux-exec (= 50 + 4 = `d1`, the first `.data` object) from an image whose `.data` header declared sh_addralign 8192 beside sh_addr 0x401000. The ELF image writer aligned `.data`'s FILE OFFSET and derived its ADDRESS by adding the image base, which is only page-aligned -- so a request above a page was granted or refused by the accident of a DECLARED base: x86_64's 0x400000 divides 8192, arm64's 0x3FF000 does not. Fixed address-first; D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET.",
+  "$commentRedOnDisable": "REMOVE direction: in `src/link/format/pe.cpp`, delete the `alignSectionHeadToItems` forward pass (the lambda and its three calls) inside the static-placement block of `pe::encodeExec`. Build rc 0, source md5 moved and returned, the mutated TU's .obj md5 moved and returned; this example then BUILDS CLEAN and FAILS AT RUN TIME on the pe64 leg in BOTH runners with exit 50, while `examples/c/alignment_page_request` (whose request equals the section alignment, so the pad is zero) stays GREEN as the named control. ELF half, REMOVE direction: in `src/link/format/elf.cpp` replace the address-first placement (`imageOffsetForAlignedVa` in `encodeElfExecDynamic`, and `layoutSection`'s `allocVa` arm in the static walker) with the pre-fix offset-first form; the arm64 ELF leg then BUILDS CLEAN and returns 54, and the unit matrix `tests/link/test_elf_image_overaligned_section_placement` reds the exact (port, image-arm) cell. Mach-O half, REMOVE direction: delete the `K_StaticObjectOveralignedForFormat` block from `macho::encodeExecDynamic` in `src/link/format/macho.cpp`; the arm64 arm here is UNAFFECTED (8192 is inside the 16384 page and was always placed correctly), and the reddening witness is its sibling `examples/c/alignment_static_exceeds_macho_segment_page`, whose expect-error verdict goes empty, plus the named cell `MachOImageOverAlignedSectionPlacement.AnAlignmentAboveTheDeclaredSegmentPageSizeIsRefusedByNameNotShippedAsACoinFlip` in `tests/link/test_macho_image_overaligned_section_placement`.",
   "language": "c",
   "source": "main.c",
   "exitCode": 42,
@@ -8,21 +8,39 @@
     {
       "spec": "x86_64:pe64-x86_64-windows-exec",
       "artifact": "main.exe",
-      "runOn": ["windows"]
+      "runOn": [
+        "windows"
+      ]
     },
     {
       "spec": "x86_64:elf64-x86_64-linux-exec",
       "artifact": "main",
-      "runOn": ["linux"]
+      "runOn": [
+        "linux"
+      ]
     },
     {
       "spec": "arm64:elf64-aarch64-linux-exec",
       "artifact": "main",
-      "runOn": ["linux"],
+      "runOn": [
+        "linux"
+      ],
       "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
     }
   ],
   "optimizedPipelines": [
-    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
   ]
 }

@@ -414,9 +414,15 @@ TEST(MirLoweringC, StraightLineAddFunction) {
     MirInstId const ret    = m.blockInstAt(entry, 3);
 
     EXPECT_EQ(m.instOpcode(arg0), MirOpcode::Arg);
-    EXPECT_EQ(m.argIndex(arg0), 0u);
+    // ⚠ `tryArgIndex`, not `argIndex` — the rule for every `try*` in this file
+    // [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]]. The opcode line above is an
+    // `EXPECT`: it records a failure and falls THROUGH, so the aborting reader
+    // would kill this binary on exactly the lowering regression the pair exists
+    // to report — every other case in the file losing its verdict with it. The
+    // twin yields `nullopt`, which fails this case, by name, and runs on.
+    EXPECT_EQ(m.tryArgIndex(arg0), 0u);
     EXPECT_EQ(m.instOpcode(arg1), MirOpcode::Arg);
-    EXPECT_EQ(m.argIndex(arg1), 1u);
+    EXPECT_EQ(m.tryArgIndex(arg1), 1u);
 
     EXPECT_EQ(m.instOpcode(sum), MirOpcode::Add);
     auto sumOps = m.instOperands(sum);
@@ -1393,7 +1399,9 @@ TEST(MirLoweringC, ReturnLiteralProducesConst) {
     MirInstId const ret = m.blockInstAt(entry, 1);
 
     EXPECT_EQ(m.instOpcode(c), MirOpcode::Const);
-    auto const& lit = m.literalValue(m.constLiteralIndex(c));
+    auto const cIdx = m.tryConstLiteralIndex(c);
+    ASSERT_TRUE(cIdx.has_value()) << "entry[0] is no longer a Const";
+    auto const& lit = m.literalValue(*cIdx);
     ASSERT_TRUE(std::holds_alternative<std::int64_t>(lit.value));
     EXPECT_EQ(std::get<std::int64_t>(lit.value), 42);
 
@@ -2172,8 +2180,9 @@ TEST(MirLoweringC, TernaryLowersToDiamondPhi) {
     // join's first instruction is the phi.
     MirInstId const phi = m.blockInstAt(join, 0);
     EXPECT_EQ(m.instOpcode(phi), MirOpcode::Phi);
-    auto inc = m.phiIncomings(phi);
-    EXPECT_EQ(inc.size(), 2u);
+    auto inc = m.tryPhiIncomings(phi);
+    ASSERT_TRUE(inc.has_value()) << "the join's first instruction is not a Phi";
+    EXPECT_EQ(inc->size(), 2u);
 }
 
 // LogicalAnd `a && b` short-circuits: lhs is evaluated in the current block,
@@ -4399,8 +4408,13 @@ TEST(MirLoweringC, MemberAccessReadEmitsGepThenLoad) {
     ASSERT_EQ(gepOps.size(), 2u);
     EXPECT_EQ(gepOps[0], m.blockInstAt(entry, 0));
     EXPECT_EQ(gepOps[1], m.blockInstAt(entry, 1));
-    auto const& offLit =
-        m.literalValue(m.constLiteralIndex(m.blockInstAt(entry, 1)));
+    // ⚠ The Const is located POSITIONALLY, so a lowering that inserts or
+    // reorders one instruction makes entry[1] something else — and the aborting
+    // reader would answer that with a dead binary rather than a named failure
+    // [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]].
+    auto const offIdx = m.tryConstLiteralIndex(m.blockInstAt(entry, 1));
+    ASSERT_TRUE(offIdx.has_value()) << "entry[1] is no longer the byte-offset Const";
+    auto const& offLit = m.literalValue(*offIdx);
     EXPECT_EQ(std::get<std::int64_t>(offLit.value), 0)
         << "field x is at byte offset 0";
 }
@@ -4810,8 +4824,9 @@ TEST(MirLoweringC, MemberAccessAssignEmitsGepThenStore) {
     EXPECT_EQ(ops[1], m.blockInstAt(entry, 3)) << "Store ptr should be Gep";
     // FC7: the GEP's 2nd operand is field y's BYTE OFFSET (LP64: x@0, y@4),
     // not field index 1 — a wrong offset would store into the wrong field.
-    auto const& offLit =
-        m.literalValue(m.constLiteralIndex(m.blockInstAt(entry, 2)));
+    auto const offIdx = m.tryConstLiteralIndex(m.blockInstAt(entry, 2));
+    ASSERT_TRUE(offIdx.has_value()) << "entry[2] is no longer the byte-offset Const";
+    auto const& offLit = m.literalValue(*offIdx);
     EXPECT_EQ(std::get<std::int64_t>(offLit.value), 4)
         << "field y is at byte offset 4 under LP64";
 }
@@ -5133,15 +5148,17 @@ TEST(MirLoweringC, NestedMemberAccessComposesChainedGepOffsets) {
     auto g1 = m.instOperands(gep1);
     ASSERT_EQ(g1.size(), 2u);
     EXPECT_EQ(g1[0], argP) << "outer GEP bases on Arg p";
-    auto const& off1 =
-        m.literalValue(m.constLiteralIndex(m.blockInstAt(entry, 1)));
+    auto const off1Idx = m.tryConstLiteralIndex(m.blockInstAt(entry, 1));
+    ASSERT_TRUE(off1Idx.has_value()) << "entry[1] is no longer the outer offset Const";
+    auto const& off1 = m.literalValue(*off1Idx);
     EXPECT_EQ(std::get<std::int64_t>(off1.value), 0) << "`in` at offset 0";
     auto g2 = m.instOperands(gep2);
     ASSERT_EQ(g2.size(), 2u);
     EXPECT_EQ(g2[0], gep1)
         << "nested `.y` chains off the inner GEP, not Arg p";
-    auto const& off2 =
-        m.literalValue(m.constLiteralIndex(m.blockInstAt(entry, 3)));
+    auto const off2Idx = m.tryConstLiteralIndex(m.blockInstAt(entry, 3));
+    ASSERT_TRUE(off2Idx.has_value()) << "entry[3] is no longer the inner offset Const";
+    auto const& off2 = m.literalValue(*off2Idx);
     EXPECT_EQ(std::get<std::int64_t>(off2.value), 4)
         << "`y` at offset 4 WITHIN Inner (composed 0 + 4)";
 }
@@ -9708,7 +9725,7 @@ TEST(MirLoweringC, IterativeDeepBinaryChainLowersFlatAndByteIdentical) {
     ASSERT_EQ(m.blockInstCount(entry), 2u * kDepth + 3u);
     MirInstId const arg0 = m.blockInstAt(entry, 0);
     EXPECT_EQ(m.instOpcode(arg0), MirOpcode::Arg);
-    EXPECT_EQ(m.argIndex(arg0), 0u);
+    EXPECT_EQ(m.tryArgIndex(arg0), 0u);
 
     // The leaf value `a*a` (the deepest spine node) is the first emitted op.
     MirInstId const leafMul = m.blockInstAt(entry, 1);

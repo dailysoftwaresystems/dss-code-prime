@@ -184,8 +184,12 @@ struct Lowered {
 // the fact that some lowering accepted it.
 [[nodiscard]] std::optional<std::int64_t> constValue(Mir const& mir,
                                                      MirInstId id) {
-    if (mir.instOpcode(id) != MirOpcode::Const) return std::nullopt;
-    MirLiteralValue const& lit = mir.literalValue(mir.constLiteralIndex(id));
+    // The opcode test and the payload read are one call
+    // [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]] — this used to hand-roll the
+    // guard that keeps `constLiteralIndex` from aborting the whole binary.
+    auto const litIdx = mir.tryConstLiteralIndex(id);
+    if (!litIdx.has_value()) return std::nullopt;
+    MirLiteralValue const& lit = mir.literalValue(*litIdx);
     if (auto const* i = std::get_if<std::int64_t>(&lit.value))  return *i;
     if (auto const* u = std::get_if<std::uint64_t>(&lit.value))
         return static_cast<std::int64_t>(*u);

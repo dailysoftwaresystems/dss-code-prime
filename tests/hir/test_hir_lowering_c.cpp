@@ -1713,14 +1713,36 @@ TEST(HirLoweringC, ExternFunctionDefinitionWithLibraryOverrideRejectedLoud) {
            "silently drop the body";
 }
 
-TEST(HirLoweringC, ExternGlobalWithInitializerRejectedLoud) {
-    // D-FF2-3: `extern int x = 5;` is a contradiction — extern means
-    // "storage lives elsewhere"; an init would either redefine the
-    // symbol locally OR be silently dropped (the prior behavior).
-    // Reject loud with H_ExternHasInitializer (remediation-distinct
-    // from H_UnsupportedLoweringForKind: remove the init or drop
-    // the `extern` keyword — not "extend the engine").
-    SemanticModel model = analyzeC("extern int x = 5;\n");
+// ★★★ P65 — RE-POINTED, NOT DELETED, AND THE MOVE IS THE POINT.
+//
+// This arm asserted D-FF2-3's refusal on a FILE-SCOPE `extern int x = 5;`.
+// [[D-C-FILE-SCOPE-EXTERN-WITH-INITIALIZER-IS-A-DEFINITION]] measured that
+// C 6.9.2p1 makes that spelling a DEFINITION — "a declaration of an identifier
+// for an object that has file scope with an initializer is a definition", with
+// no clause exempting `extern` — and that gcc 13.3.0, clang 18.1.3 and MSVC
+// 19.51 all accept it. So this test's SUBJECT no longer exists at file scope.
+//
+// It is not a "convenient failure" test that could take any other input: the
+// refusal WAS the subject. What survives is the same refusal one scope down —
+// C 6.7.11p5 forbids an initializer on a block-scope declaration of an
+// identifier WITH LINKAGE, and all three references refuse it there (gcc "'x'
+// has both 'extern' and initializer", clang "declaration of block scope
+// identifier with linkage cannot have an initializer", MSVC C2205). So the arm
+// moves to block scope rather than being deleted, and the file-scope half it
+// used to hold is now `FileScopeExternWithInitializerLowersToADefinition`
+// below, which asserts the DEFINITION the refusal became. Coverage moved; none
+// of it was dropped.
+//
+// ⚠ THE HIR SHAPE ASSERTION HAD TO CHANGE WITH THE SCOPE, and asserting the old
+// one would have been the quiet way to get this wrong. A block-scope
+// `externDecl` does NOT land in the statement list: `lowerStmt` routes its
+// lowered nodes to the MODULE decls (the D-CSUBSET-BLOCK-SCOPE-EXTERN /
+// local-static precedent) and lowers the statement itself to an empty Block. So
+// the Error sentinel appears among the module decls ALONGSIDE the enclosing
+// function, not at `decls[0]` — hence the search rather than an index.
+TEST(HirLoweringC, BlockScopeExternWithInitializerRejectedLoud) {
+    SemanticModel model =
+        analyzeC("int f(void) { extern int x = 5; return x; }\n");
     ASSERT_FALSE(model.hasErrors())
         << "test setup: the c grammar accepts the form; the "
            "rejection is at lowering, not at parse";
@@ -1728,12 +1750,127 @@ TEST(HirLoweringC, ExternGlobalWithInitializerRejectedLoud) {
     auto res = lowerToHir(model, r);
     EXPECT_FALSE(res->ok);
     EXPECT_EQ(countCode(r, DiagnosticCode::H_ExternHasInitializer), 1u);
-    // The pre-fix silent path landed an ExternGlobal at top level; the
-    // new path lands an Error sentinel so downstream tooling can't
-    // mistake it for a successful extern declaration.
+    // The file-scope arm's warning must NOT fire here — this is the control
+    // that keeps the two P65 arms from collapsing into one. A refusal that also
+    // emitted the redundancy advisory would mean the scope gate had been read
+    // twice and disagreed with itself.
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_ExternRedundantOnDefinition), 0u)
+        << "C 6.7.11p5 is a constraint violation, not a redundant keyword";
+    // The pre-D-FF2-3 silent path landed an ExternGlobal; the refusal lands an
+    // Error sentinel so downstream tooling cannot mistake it for a successful
+    // extern declaration. Exactly one, and no surviving Extern* row for `x`.
+    auto decls = res->hir.moduleDecls(res->hir.root());
+    std::size_t errors = 0;
+    std::size_t externGlobals = 0;
+    for (HirNodeId d : decls) {
+        if (res->hir.kind(d) == HirKind::Error) ++errors;
+        if (res->hir.kind(d) == HirKind::ExternGlobal) ++externGlobals;
+    }
+    EXPECT_EQ(errors, 1u) << "the refusal must leave an Error recovery sentinel";
+    EXPECT_EQ(externGlobals, 0u)
+        << "a refused block-scope extern must not also plant an import row";
+}
+
+// ★ THE FILE-SCOPE HALF THE ARM ABOVE GAVE UP, ASSERTED AT THE TIER THAT OWNS
+// IT. [[D-C-FILE-SCOPE-EXTERN-WITH-INITIALIZER-IS-A-DEFINITION]] landed its
+// witnesses at the SEMANTIC tier (on `SymbolRecord::isExternDeclaration`), which
+// is the right place for the definedness FACT and cannot see the HIR shape the
+// fact has to produce. That shape is the half where a wrong answer is a LINK
+// failure rather than a diagnostic: an `ExternGlobal` here would emit an import
+// row for a symbol this translation unit also defines. Nothing pinned it at
+// this tier, so this arm is a synthesized fixture, not a re-pointed one.
+//
+// The initializer VALUE is asserted, not merely its presence — a Global that
+// dropped its initializer would still be a Global, and would silently ship an
+// all-zero object where the source said 5.
+TEST(HirLoweringC, FileScopeExternWithInitializerLowersToADefinition) {
+    SemanticModel model = analyzeC("extern int x = 5;\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "C 6.9.2p1: gcc, clang and MSVC all accept this at file scope";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_ExternHasInitializer), 0u)
+        << "C 6.7.11p5 is a BLOCK-scope constraint; it must not reach file scope";
     auto decls = res->hir.moduleDecls(res->hir.root());
     ASSERT_EQ(decls.size(), 1u);
-    EXPECT_EQ(res->hir.kind(decls[0]), HirKind::Error);
+    ASSERT_EQ(res->hir.kind(decls[0]), HirKind::Global)
+        << "a definition, not an import — an ExternGlobal here would announce "
+           "storage in another translation unit for a symbol THIS unit defines, "
+           "which is a duplicate at link and not a diagnostic anywhere";
+    auto const init = res->hir.globalInit(decls[0]);
+    ASSERT_TRUE(init.has_value())
+        << "the initializer is what MAKES it a definition; a Global without it "
+           "would ship zeroes where the source said 5";
+    auto cer = evaluateConstant(res->hir, model.lattice().interner(),
+                                res->literalPool, *init);
+    ASSERT_TRUE(cer.value.has_value());
+    EXPECT_EQ(std::get<std::int64_t>(cer.value->value), 5);
+}
+
+// [[D-C-FILE-SCOPE-EXTERN-INITIALIZER-EMITS-NO-REDUNDANCY-WARNING]] (P65): the
+// acceptance above is REPORTED, not silent. Before this the arm emitted nothing
+// at all — silent by accident of the vocabulary rather than by decision, which
+// is the state that row existed to end.
+//
+// ✔MEASURED 2026-09-08, each reference probed SEPARATELY on its own translation
+// unit: gcc 13.3.0 `-std=c2x -c` rc=0 warning "'x' initialized and declared
+// 'extern'"; clang 18.1.3 `-std=c23 -c` rc=0 warning `-Wextern-initializer`;
+// MSVC 19.51.36252 `/std:c17` AND `/std:clatest` rc=0 SILENT, silent even at
+// `/Wall`. The union therefore does not REQUIRE this diagnostic — DSS emits it
+// because the construct's failure mode is remote from its cause (✔MEASURED: the
+// same declaration in a header included by two translation units links with
+// "multiple definition", rc=1, on gcc AND clang).
+//
+// ★ SEVERITY AND rc ARE BOTH ASSERTED, and together they are the whole claim: a
+// Warning that flipped `ok` would be an error wearing a warning's name, and a
+// diagnostic emitted at the wrong severity is exactly what `--warnings-as-errors`
+// then escalates into a broken build for a legal program.
+//
+// ⚠ PER DECLARATOR, NOT PER DECLARATION, and the second arm is what proves it:
+// `extern int a = 1, b;` DEFINES `a` and merely DECLARES `b`, so the advisory
+// belongs to `a` alone. ✔MEASURED — gcc and clang both warn once and both emit
+// `D a` with no symbol at all for `b`. A declaration-level emit would warn twice
+// and would be telling the user something false about `b`.
+TEST(HirLoweringC, FileScopeExternInitializerWarnsThatExternIsRedundant) {
+    {
+        SemanticModel model = analyzeC("extern int x = 5;\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok)
+            << "a warning must not fail the build for a well-formed program";
+        ASSERT_EQ(countCode(r, DiagnosticCode::H_ExternRedundantOnDefinition), 1u);
+        for (auto const& d : r.all()) {
+            if (d.code != DiagnosticCode::H_ExternRedundantOnDefinition) continue;
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning);
+            // ⚠ QUOTED. A bare `find("x")` would match the `x` inside the word
+            // `extern` in this very message and assert nothing at all.
+            EXPECT_NE(d.actual.find("'x'"), std::string::npos)
+                << "the message must name the object, as gcc and clang both do";
+        }
+        EXPECT_FALSE(r.hasErrors());
+    }
+    {
+        SemanticModel model = analyzeC("extern int a = 1, b;\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_ExternRedundantOnDefinition), 1u)
+            << "`b` carries no initializer and stays an ordinary extern "
+               "declaration — a declaration-level emit would warn about it too";
+    }
+    {
+        // The NEGATIVE that keeps the advisory from becoming noise on every
+        // extern: no initializer, nothing redundant, nothing said.
+        SemanticModel model = analyzeC("extern int g;\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_ExternRedundantOnDefinition), 0u);
+    }
 }
 
 // D-CSUBSET-PACKED (F4): a `packed` spelling in the LEADING declaration-specifier
@@ -1807,14 +1944,17 @@ TEST(HirLoweringC, LeadingDeprecatedAttributeStillIgnored) {
         << "[[deprecated]] stays standard-ignorable; only packed fails loud";
 }
 
-TEST(HirLoweringC, ExternGlobalWithIdentifierInitializerRejectedLoud) {
-    // Post-fold #7 PT1a: pin identifier-init `extern int x = y;`
-    // (RHS is an operand-rule referencing a prior decl), not just
-    // literal-init. Shape-based F4 detector trips on any non-
-    // arrayDeclSuffix initValue subtree regardless of RHS shape.
+// P65 — RE-POINTED to block scope, same reasoning as
+// `BlockScopeExternWithInitializerRejectedLoud` above. The SUBJECT here is NOT
+// the scope: it is that `initDeclaratorInitNode`'s detection is SHAPE-based and
+// trips on any non-arrayDeclSuffix initValue subtree regardless of the RHS's
+// own shape — an identifier operand referencing a prior declaration, not just a
+// literal. That property is scope-independent and survives intact; only the
+// scope the refusal fires in had to move.
+TEST(HirLoweringC, BlockScopeExternWithIdentifierInitializerRejectedLoud) {
     SemanticModel model = analyzeC(
         "int y = 1;\n"
-        "extern int x = y;\n");
+        "int f(void) { extern int x = y; return x; }\n");
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
@@ -1822,13 +1962,16 @@ TEST(HirLoweringC, ExternGlobalWithIdentifierInitializerRejectedLoud) {
     EXPECT_EQ(countCode(r, DiagnosticCode::H_ExternHasInitializer), 1u);
 }
 
-TEST(HirLoweringC, ExternGlobalWithEmptyBraceInitializerRejectedLoud) {
-    // Post-fold #7 silent-failure F4: pre-fold the init-walk searched
-    // for `isExprNode` descendants — `extern int x = {};` has NONE
-    // (empty braceInitList), so the silent-accept arm fired. The
-    // shape-based detector now keys on the initValue subtree's
-    // existence and rejects loud regardless of contents.
-    SemanticModel model = analyzeC("extern int x = {};\n");
+// P65 — RE-POINTED to block scope. The SUBJECT survives untouched and is the
+// most valuable of the three: post-fold #7 silent-failure F4 measured that an
+// init-walk searching for `isExprNode` DESCENDANTS misses `= {}` entirely (an
+// empty braceInitList has none), so the silent-accept arm fired on it. The
+// detector keys on the initValue subtree's EXISTENCE instead, and that is what
+// this pins — a question about the walk's shape, which block scope asks exactly
+// as well as file scope did.
+TEST(HirLoweringC, BlockScopeExternWithEmptyBraceInitializerRejectedLoud) {
+    SemanticModel model =
+        analyzeC("int f(void) { extern int x = {}; return x; }\n");
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);

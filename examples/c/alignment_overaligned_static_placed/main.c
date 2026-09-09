@@ -29,14 +29,55 @@
  * why both land there independently; `examples/c/alignment_static_exceeds_format`
  * is the negative half, one step above.
  *
- * ⓘ NOT A MACH-O ARM, and the reason is ownership rather than doubt: the Mach-O
- * writer carries its own thread-local ceiling under its own anchor, and this
- * lane may not touch that file. The ELF legs are here because P63 measured them
- * placing the same objects correctly, so a regression there would be visible.
+ * ★★ THE MACH-O ARM IS arm64 ONLY, AND THE REASON IS A DECLARED NUMBER, not a
+ * capability. P65 measured that Mach-O cannot honour a static aligned above its
+ * image's own mapping granularity at all: `segment_command_64` carries NO
+ * alignment field (`section_64.align` is read by the STATIC LINKER, never by
+ * dyld), and a base-relative image is slid by a multiple of `segmentPageSize` —
+ * so an above-page object keeps the address the linker chose and loses its
+ * alignment at load, on about half of all runs. `image.segmentPageSize` is
+ * 16384 on `macho64-arm64-darwin-exec` and 4096 on the x86_64 sibling, so this
+ * program's 8192 request is PLACED on one and REFUSED BY NAME on the other, from
+ * config alone. `examples/c/alignment_static_exceeds_macho_segment_page` is that
+ * negative half, and it carries the same source at the same value.
  *
- * Exit 42. RED-on-disable: delete the `alignSectionHeadToItems` pass in
- * `pe::encodeExec` and this example still BUILDS CLEAN and returns 50 on the
- * pe64 leg — which is the whole point of asserting the address.
+ * ✔MEASURED P65, the DSS-built arm64 image on real Apple Silicon (macOS 26.6.2):
+ * `__data addr 0x10000c000` and `__bss addr 0x100012000`, both declaring
+ * `align 2^13 (8192)`, and the program returns 42 TWENTY TIMES OUT OF TWENTY
+ * with dyld placing __DATA at three different addresses across the runs. Twenty
+ * because the failure this arm rules out is a coin flip on the loader's slide,
+ * and one run of a coin flip is not a measurement.
+ * ✔THE REFERENCE, the same day, same host, Apple clang 21.0.0 / ld
+ * PROJECT:ld-1267: this shape returns 42 at 16 / 4096 / 16384; at 32768 ld64
+ * WARNS "reducing alignment of section __DATA,__data from 0x8000 to 0x4000
+ * because it exceeds segment maximum alignment" and the program then returns 50
+ * or 54 BY RUN — never 42. The cap tracks the page (0x1000 on x86_64), and
+ * `-Wl,-segalign,0x8000` does not lift it: ld64 refuses that link outright.
+ * (D-LINK-MACHO-IMAGE-OVERALIGNED-STATIC-IS-A-LOAD-TIME-COIN-FLIP.)
+ *
+ * ⚠⚠ THE ELF LEGS WERE NOT ALREADY GREEN, AND THE CLAIM THAT THEY WERE IS WHAT
+ * THIS COMMENT USED TO SAY. It read "the ELF legs are here because P63 measured
+ * them placing the same objects correctly" — a measurement CARRIED FORWARD from
+ * a ONE-OBJECT probe, and the very reason this example carries eight. ✔MEASURED
+ * P64: this program returned 54 on `arm64:elf64-aarch64-linux-exec` (= 50 + 4 =
+ * `d1`, the first `.data` object) from an image whose `.data` header declared
+ * `sh_addralign = 8192` beside `sh_addr = 0x401000`. The ELF image writer chose
+ * `.data`'s FILE OFFSET at the requested alignment and derived its ADDRESS by
+ * adding the image base — which is only page-aligned — so every request above a
+ * page was granted or refused by the accident of a DECLARED base address.
+ * x86_64's is 0x400000 and divides 8192; arm64's is 0x3FF000 and does not.
+ * ⇒ The legs are here because they are a DIFFERENT WRITER from the pe64 one and
+ * this shape had never run on them; a carried-forward "measured correct" is not
+ * a measurement of the subject in front of you.
+ * (D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET.)
+ *
+ * Exit 42. RED-on-disable, pe64 leg: delete the `alignSectionHeadToItems` pass
+ * in `pe::encodeExec` and this example still BUILDS CLEAN and returns 50 —
+ * which is the whole point of asserting the address. On the ELF legs the
+ * equivalent removal is the address-first placement in the ELF image writer;
+ * `tests/link/test_elf_image_overaligned_section_placement` pins that half over
+ * both ports and both image arms, because the two ports' declared bases make
+ * the luck run in OPPOSITE directions and a single-port pin proves half of it.
  */
 
 #define BIG   8192

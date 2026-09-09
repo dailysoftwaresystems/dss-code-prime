@@ -365,3 +365,20 @@ target_link_libraries(dss_asm_test_asm_arm64_shared_encoding_31
     PRIVATE nlohmann_json::nlohmann_json)
 target_include_directories(dss_asm_test_asm_arm64_shared_encoding_31
     PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# [[D-DIAG-OVERLAP-REFUSAL-CODE-NOT-DISCRIMINATING]] (cycle P65, lane dg): the
+# static-data producer's diagnostic CODES, pinned as a PARTITION rather than one
+# at a time. Every arm of `lowerMirGlobalsToDataItems` used to pass
+# `K_NoMatchingObjectFormat`, so only the message text told the causes apart and
+# a consumer that triages or greps BY CODE could not. Three fixtures raise the
+# three classes through the arms that really produce them -- a shared-bytes
+# initializer (the user edits the source), a `_Complex` literal that is not a
+# two-component aggregate (a DSS defect), and an aggregate global against a
+# target declaring no `aggregateLayout` (a capability gap) -- and the codes are
+# compared to EACH OTHER, so a collapse in either direction reds. The residual
+# arm is the named CONTROL: it must still be `K_NoMatchingObjectFormat`, so an
+# over-eager re-key of the whole function reds there while the specific pins
+# stay green. Nameability and the unsuppressable membership are asserted too:
+# an unnameable code is ungreppable, which is the defect itself.
+dss_add_test(NAME asm/test_static_data_diagnostic_codes
+             SOURCES test_static_data_diagnostic_codes.cpp)

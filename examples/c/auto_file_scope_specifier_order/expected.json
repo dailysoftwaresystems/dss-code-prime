@@ -1,0 +1,40 @@
+{
+  "$comment": "P65 [[D-C-FILE-SCOPE-INFERRED-AUTO-MUST-LEAD-THE-DECLARATION-SPECIFIERS]] (C 6.7p2 + C23 6.7.9): the SPECIFIER-LED half of file-scope type inference. Its sibling `auto_file_scope_inference` writes every specifier AFTER `auto` because that was all DSS accepted when [[D-CSUBSET-AUTO-FILE-SCOPE]] landed; this one writes them BEFORE, which is the spelling a human types and — for `alignas` — the only spelling clang accepts. C 6.7p2 makes the declaration specifiers an UNORDERED SET, so the two orders are the same declaration. ✔MEASURED 2026-09-08, each reference probed SEPARATELY on its own translation unit: `static auto g = 42;` and `auto static g = 42;` are both rc=0 on gcc 13.3.0 -std=c2x with `nm` reading `d g` for BOTH (internal) and both rc=0 on clang 18.1.3 -std=c23; `const auto k = 42;` and `auto const k = 42;` are rc=0 with `nm` `R k` for both orders on BOTH references; `thread_local auto t = 5;` gives `D t` on both; and `alignas(16) auto a = 3;` is accepted by gcc AND clang while the trailing `auto alignas(16) a = 3;` is rc=1 on clang — so the restriction this closes was not merely stylistic. MSVC 19.51.36231 ABSTAINS on the whole question: it reads the spelling as the C89 storage class over an implicit int and refuses `static auto g = 42;` with C2159, so it is not voting on C23 inference. THE EXAMPLE TESTS MEANING, NOT PARSING, and the order is exactly where a parse test would miss: the risk is that the declaration parses into the right rule while the specifier written on the WRONG SIDE of `auto` is never read again — a `static` that stops conferring internal linkage or a `const` that stops binding, both silent. So every arm gates on a runtime consequence of a specifier written BEFORE `auto`: def.c's `[[maybe_unused]] auto g_ext = 11;` is read here through a plain `extern int g_ext;` (a leading attribute must not cost the definition its external linkage, or the example fails to LINK); `static auto s_int = 20;` must keep internal linkage and hold its value; `const auto k_const = 7;` must bind the qualifier from the LEADING position; `const auto d_dbl = 2.0;` must reach codegen as a DOUBLE; and `static auto p_str = \"ok\";` must DECAY to a pointer and be indexable. exit = 11 + 20 + 7 + 4 = 42, the same total the auto-led sibling produces from the same five declarations. WHAT MADE THE LEADING ORDER COST SOMETHING AND WHY IT NO LONGER DOES: admitting a specifier before `auto` puts {static, const, constexpr, thread_local, inline, alignas, __attribute__, [[} into the inference rule's FIRST, so each of those leads gains a SECOND top-level candidate; the parser used to decide by PROBING the other candidate under a token budget, and a file-scope construct contains function definitions, an unbounded token class. The parser now DESCENDS into an alt's final candidate when that candidate is the declared-last STRUCTURAL one — the same rule its all-fail path already replayed with no budget — so the budget never binds on the reading it was going to take (`finalCandidateDirectDescent_`, src/analysis/syntactic/parser.cpp). RED-ON-DISABLE (REMOVE direction), TWO INDEPENDENT MUTANTS because the capability has two halves: (1) CONFIG, and the mutant is the DOCUMENT — c.lang.json is read at RUN time through $DSS_CONFIG_ROOT, so no translation unit recompiles and NO object md5 is involved; what moves is the config file's own md5, which must move and RETURN. Delete the LEADING {\"repeat\": \"topLevelAutoSpecifier\"} from `topLevelAutoSpecifiers` in src/dss-config/sources/c.lang.json — every declaration in main.c and def.c becomes error[P_NoAlternativeMatched] and the example never links. (2) ENGINE, where source AND object md5 both move — delete the `finalCandidateDirectDescent_()` call from `abandonAndAdvance_` in src/analysis/syntactic/parser.cpp; these short declarations still parse, so this example stays GREEN and is the CONTROL for that mutant, whose reds are FileScopeDeclarationDefinedness.{LargeQualifierLedFileScopeInitializerIsNotProbed, LargeQualifierLedFunctionBodyIsNotProbed, LargeFileScopeInitializerAfterALeadingSpecifierIsNotProbed}.",
+  "language": "c",
+  "sources": [
+    "main.c",
+    "def.c"
+  ],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

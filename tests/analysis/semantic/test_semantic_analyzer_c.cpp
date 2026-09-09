@@ -13194,11 +13194,77 @@ TEST(SemanticAnalyzerC, AutoForInitInfersAndStaticStaysGated) {
 // file-scope `auto g = 42;` (C23 ALLOWS it — D-CSUBSET-AUTO-FILE-SCOPE is
 // the named deferral; DSS keeps the pre-existing loud parse reject) and the
 // qualified forms `const auto` / `auto const` (D-CSUBSET-AUTO-QUALIFIED).
+// ⚠ P65 — THE "AND QUALIFIED" HALF OF THIS PIN INVERTED, AND THE NAME IS KEPT
+// ON PURPOSE. [[D-CSUBSET-AUTO-QUALIFIED]] CLOSED in P65: `const auto x = 5;`,
+// `auto const x = 5;` and `volatile auto v = 1;` now PARSE and bind their
+// qualifier, which is what gcc 13.3.0 (`-std=c2x`) and clang 18.1.3
+// (`-std=c23`) do — ✔MEASURED separately, both ACCEPT all three and both REFUSE
+// the assignment that follows a `const` one. Their assertions moved to
+// `AutoQualifiedInferenceBindsTheQualifier` below. The NAME stays because
+// [[D-CSUBSET-AUTO-FILE-SCOPE]]'s registry row cites this test BY NAME for the
+// half that is still true, and that row is not this cycle's to edit.
+//
+// ⚠⚠ P65, LANE `fs` — THE SECOND HALF INVERTED TOO, AND THE NAME IS AGAIN KEPT
+// ON PURPOSE. [[D-CSUBSET-AUTO-FILE-SCOPE]] CLOSED in P65: `topLevelDecl` gained
+// a head-less sibling (`autoInferredTopLevelDecl`), so file-scope
+// `auto g = 42;` now infers and DEFINES an externally-linked global — which is
+// what gcc 13.3.0 (`-std=c2x`) and clang 18.1.3 (`-std=c23`) do, ✔MEASURED
+// separately, both accepting it and both emitting `D g`. The positive
+// assertions moved to the named sibling suite
+// `FileScopeDeclarationDefinedness` (tests/analysis/semantic/
+// test_file_scope_declaration_definedness.cpp), whose
+// `AutoFileScopeInfersAndDefinesAGlobal` is the direct successor of the arm
+// that used to stand here.
+//
+// ⚠⚠⚠ P65, LANE `pl` — A THIRD HALF INVERTED, AND THE NAME IS KEPT FOR THE
+// THIRD TIME. The row
+// [[D-C-FILE-SCOPE-INFERRED-AUTO-MUST-LEAD-THE-DECLARATION-SPECIFIERS]]
+// CLOSED: the head-less rule's specifier run became ORDER-FREE
+// (C 6.7p2), so `static auto g = 42;` — the entry that used to sit in the
+// rejects list below — now parses, infers and takes INTERNAL linkage, which is
+// what gcc 13.3.0 and clang 18.1.3 do (✔MEASURED separately; `nm` gives the
+// same letter for both written orders on both references). Its assertions live
+// in `FileScopeDeclarationDefinedness.SpecifierLedFileScopeAutoMeansWhatThe-
+// AutoLedOrderMeans`.
+//
+// WHAT THIS PIN KEEPS IS ITS ORIGINAL PROPERTY, WHICH DID NOT INVERT: the
+// head-less top-level rule must never turn a REFUSAL into a silent C89
+// implicit-int. Each source below STRUCTURALLY matches the new production —
+// specifier prefix, init-declarator list, semicolon — and each is refused by
+// gcc AND clang, so each must stay LOUD. The ★C1 `requiredSpecifierToken`
+// presence gate is what refuses the first two; the single-declarator and
+// plain-identifier gates refuse the rest. Without them the new rule would have
+// bought file-scope inference by making `static x = 5;` compile.
+// ★ The order-free run makes this property MORE load-bearing, not less: the
+// two SPECIFIER-LED negatives added below (`static auto *p = 0;`,
+// `static auto g;`) reach the head-less production through a spelling that did
+// not parse at all before this cycle, so each is a fresh way for the gates to
+// be bypassed. ✔MEASURED, they are stopped by NAME —
+// S_AutoRequiresPlainIdentifier and S_AutoRequiresInitializer — not by the
+// grammar running out of alternatives.
 TEST(SemanticAnalyzerC, AutoFileScopeAndQualifiedStayLoudParseErrors) {
     char const* const rejects[] = {
-        "auto g = 42;\nint main(void) { return g; }\n",
-        "int main(void) { const auto x = 5; return x; }\n",
-        "int main(void) { auto const x = 5; return x; }\n",
+        "static x = 5;\nint main(void) { return x; }\n",
+        "constexpr y = 5;\nint main(void) { return y; }\n",
+        "auto g = 1, h = 2;\nint main(void) { return g + h; }\n",
+        "auto *p = 0;\nint main(void) { return p != 0; }\n",
+        "auto g;\nint main(void) { return g; }\n",
+        // ⚠ P65, lane `pl` — THE `static auto g = 42;` ENTRY THAT STOOD HERE IS
+        // GONE, and what replaces it is the half that did NOT invert.
+        // [[D-C-FILE-SCOPE-INFERRED-AUTO-MUST-LEAD-THE-DECLARATION-SPECIFIERS]]
+        // CLOSED in P65: C 6.7p2 makes the declaration specifiers an UNORDERED
+        // set, `topLevelAutoSpecifiers` is now an order-free run around a
+        // required `AutoKeyword`, and gcc 13.3.0 (`-std=c2x`) and clang 18.1.3
+        // (`-std=c23`) both accept the specifier-led spelling with the SAME `nm`
+        // linkage as the `auto`-led one (✔MEASURED separately). The positives
+        // moved to `FileScopeDeclarationDefinedness.SpecifierLedFileScopeAuto-
+        // MeansWhatTheAutoLedOrderMeans`. What stays here is this pin's own
+        // property, which the order-free run makes MORE reachable rather than
+        // less: a leading specifier must not turn a REFUSAL into a silent C89
+        // implicit-int. Both sources below now parse INTO the head-less
+        // production and are stopped by its semantic gates.
+        "static auto *p = 0;\nint main(void) { return p != 0; }\n",
+        "static auto g;\nint main(void) { return g; }\n",
     };
     for (auto const* src : rejects) {
         auto cu = buildShippedUnit("c", {std::string{src}});
@@ -13210,9 +13276,78 @@ TEST(SemanticAnalyzerC, AutoFileScopeAndQualifiedStayLoudParseErrors) {
                 }
             }
         }
-        EXPECT_TRUE(anyParseError)
-            << "must stay a loud parse error (named deferral): " << src;
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+        EXPECT_TRUE(anyParseError || model.hasErrors())
+            << "must stay LOUD — gcc and clang each refuse it: " << src;
     }
+
+    // THE LIVE CONTROL, and it is what makes the arms above non-vacuous: the
+    // capability they bound actually exists now, so the suite cannot be passing
+    // because file-scope `auto` is still refused wholesale.
+    auto ok = analyzeShipped("c", {"auto g = 42;\nint main(void) { return g; }\n"});
+    EXPECT_FALSE(ok.hasErrors())
+        << "[[D-CSUBSET-AUTO-FILE-SCOPE]] closed in P65 — file-scope inference "
+           "is legal C23 6.7.9 and both references accept it";
+
+    // THE SECOND LIVE CONTROL, added when the specifier-led half inverted: the
+    // written ORDER is free now too, so the `static auto *p` / `static auto g`
+    // arms above cannot be passing because a leading specifier is refused
+    // wholesale — which is exactly how they would have passed before P65.
+    auto led = analyzeShipped(
+        "c", {"static auto g = 42;\nint main(void) { return g - 42; }\n"});
+    EXPECT_FALSE(led.hasErrors())
+        << "the row "
+           "[[D-C-FILE-SCOPE-INFERRED-AUTO-MUST-LEAD-THE-DECLARATION-SPECIFIERS]]"
+           " closed in P65 — C 6.7p2 makes the specifier run unordered and gcc "
+           "AND clang both accept this spelling";
+}
+
+// P65 [[D-CSUBSET-AUTO-QUALIFIED]] — THE INVERTED HALF. C 6.7p2 made the
+// declaration-specifier run order-free, so a qualifier now reaches the
+// head-less inference row through its specifier PREFIX. The row still declares
+// no whole-declaration const scan (that is the c58
+// [[D-CSUBSET-INITIALIZER-CONST-TOKEN-LEAK]], and `auto p = (const char*)s;`
+// below is the live control proving it stayed closed): the verdict is read from
+// the PREFIX ALONE, which is the only specifier region a head-less row has.
+TEST(SemanticAnalyzerC, AutoQualifiedInferenceBindsTheQualifier) {
+    for (char const* const src : {
+             "int main(void) { const auto x = 5; return x; }\n",
+             "int main(void) { auto const x = 5; return x; }\n",
+             "int main(void) { volatile auto v = 1; return v; }\n",
+         }) {
+        auto model = analyzeShipped("c", {std::string{src}});
+        EXPECT_FALSE(model.hasErrors())
+            << "a QUALIFIED inference declaration is legal C23 6.7.9 and both "
+               "gcc and clang accept it: " << src;
+    }
+
+    // The qualifier is not merely parsed — it BINDS.
+    auto constAuto = analyzeShipped("c", {
+        "int main(void) { const auto x = 5; x = 6; return x; }\n",
+    });
+    EXPECT_TRUE(hasCode(constAuto.diagnostics(),
+                        DiagnosticCode::S_ConstViolation))
+        << "`const auto x = 5;` declares a CONST object; gcc and clang each "
+           "refuse the assignment";
+
+    // CONTROL 1 — an unqualified inference is NOT const, so the arm above
+    // cannot be passing because every `auto` became const.
+    auto plainAuto = analyzeShipped("c", {
+        "int main(void) { auto x = 5; x = 6; return x; }\n",
+    });
+    EXPECT_FALSE(hasCode(plainAuto.diagnostics(),
+                         DiagnosticCode::S_ConstViolation));
+
+    // CONTROL 2 — the c58 initializer-const leak must STAY closed: a `const`
+    // inside the INITIALIZER is not a declaration specifier and must not mark
+    // the object. This is the reason the row reads the PREFIX and not the node.
+    auto initLeak = analyzeShipped("c", {
+        "int main(void) { char c = 'a'; char *s = &c;\n"
+        "                 auto p = (const char*)s; p = 0; return p == 0; }\n",
+    });
+    EXPECT_FALSE(hasCode(initLeak.diagnostics(),
+                         DiagnosticCode::S_ConstViolation))
+        << "a `const` in the initializer must not qualify the inferred object";
 }
 
 // Positive inference-KIND breadth (code-audit fold): the inferred type is

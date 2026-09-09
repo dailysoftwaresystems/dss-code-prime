@@ -332,6 +332,38 @@ constexpr MembershipReason kWhyNoMatchingObjectFormat{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, the linker dispatches the wrong format walker and writes a "
     "corrupted artifact"};
+// D-DIAG-OVERLAP-REFUSAL-CODE-NOT-DISCRIMINATING (P65). The two static-data
+// producer codes split out of `K_NoMatchingObjectFormat`.
+// ⚠⚠ THE PARENT'S RATIONALE DOES NOT TRANSFER, AND INHERITING IT WOULD HAVE
+// PUT A FALSE SENTENCE IN THIS TABLE. `kWhyNoMatchingObjectFormat` above says
+// "the linker dispatches the wrong format walker" — that is the LINKER's
+// walker-dispatch invariant, and neither of these codes can reach it: both fire
+// from the static-DATA producer, upstream of any walker, and no walker choice
+// depends on them. Membership is therefore re-derived from these codes' OWN
+// control flow, MEASURED in `lowerMirGlobalsToDataItems`: every site that emits
+// either code is followed by `continue`, which skips the `out.push_back` that
+// ends the per-global loop body. So the refused global contributes NO
+// `AssembledData` at all. Silenced, `errorCount()` reads zero and the artifact
+// is written with that object's bytes ABSENT — the symbol resolves to nothing
+// (a load-time failure in the user's process, not a build failure) or another
+// producer's zero span makes it read as all-zero instead of its initializer.
+// That is prong 1 established on this tier's own mechanism.
+constexpr MembershipReason kWhyOverlappingStaticInit{
+    MembershipProng::WrongArtifactShipsGreen,
+    "silenced, the static object whose overlapping members could not be "
+    "encoded contributes no data item at all, and the build reports success "
+    "with the object's initializer bytes missing from the artifact"};
+// The invariant-breach code carries a SECOND, independent reason on top of the
+// dropped-data-item mechanism above: it reports a COMPILER DEFECT. Suppressing
+// a report that two parts of this compiler disagree is never a legitimate user
+// action — there is no source or config change it could accompany — and this
+// project already holds that class deafening by construction
+// (`D_SynthRecipeFamilyUnknown`, `X_OptReturnFalseWithoutDiagnostic`).
+constexpr MembershipReason kWhyStaticDataEncoderInvariant{
+    MembershipProng::WrongArtifactShipsGreen,
+    "silenced, a byte-count or record disagreement inside the static-data "
+    "encoder drops the global's data item and ships a green build whose "
+    "artifact is missing bytes only this compiler's own defect explains"};
 constexpr MembershipReason kWhyFormatLacksImportSupport{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, an extern goes unresolved in a dynamic image whose format "
@@ -636,7 +668,19 @@ constexpr MembershipReason kWhyIncludeReentryRefused{
 // suppressed. ✔The explicit extent did its job a SIXTH time, in the other
 // direction: the three well-formedness `static_assert`s fired on the `None` slot
 // the removal left behind, so shrinking the table could not be forgotten.
-constexpr std::array<UnsuppressableEntry, 170> kUnsuppressableCodes{{
+// ⓘ EXTENT 170 → 172 (2026-09-08, cycle P65,
+// D-DIAG-OVERLAP-REFUSAL-CODE-NOT-DISCRIMINATING):
+// `K_OverlappingStaticInitUnsupported` (0x8025) and
+// `K_StaticDataEncoderInvariantBreach` (0x8026) join, both on prong (1). They
+// are the two causes split OUT of `K_NoMatchingObjectFormat` in the static-data
+// producer, and their membership is the one thing about them that could not be
+// inherited: the parent's rationale is the LINKER's walker-dispatch invariant,
+// which neither of these can reach. The argument is re-derived from their own
+// control flow beside each `kWhy*` below. ⚠ Had they been added by inheritance
+// they would still be here — with a reason that is false — which is why the row
+// required the argument to be MADE. ✔The explicit extent did its job a SEVENTH
+// time: the count refused the two new rows until this note existed.
+constexpr std::array<UnsuppressableEntry, 172> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -1137,6 +1181,14 @@ constexpr std::array<UnsuppressableEntry, 170> kUnsuppressableCodes{{
     {DiagnosticCode::K_StaticObjectOveralignedForFormat, kWhyOveralignedForFormat},
     {DiagnosticCode::K_ThreadLocalOveralignedForFormat, kWhyOveralignedForFormat},
     {DiagnosticCode::K_NoMatchingObjectFormat, kWhyNoMatchingObjectFormat},
+    // P65 (D-DIAG-OVERLAP-REFUSAL-CODE-NOT-DISCRIMINATING): the two static-data
+    // producer codes. They are NOT here because their former parent is — the
+    // argument for each is written at its `kWhy*` above and rests on the
+    // dropped-`AssembledData` mechanism, not on inheritance.
+    {DiagnosticCode::K_OverlappingStaticInitUnsupported,
+     kWhyOverlappingStaticInit},
+    {DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+     kWhyStaticDataEncoderInvariant},
     {DiagnosticCode::K_FormatLacksImportSupport, kWhyFormatLacksImportSupport},
     {DiagnosticCode::K_RelocationKindMismatch, kWhyRelocationKindMismatch},
     {DiagnosticCode::K_WalkerInputContractViolation, kWhyWalkerInputContract},

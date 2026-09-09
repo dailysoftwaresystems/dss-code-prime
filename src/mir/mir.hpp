@@ -154,6 +154,65 @@ public:
     // InlineAsm / InlineAsmGoto — the index into `asmDescriptorPool()`.
     [[nodiscard]] std::uint32_t asmDescriptorIndex(MirInstId id) const;
 
+    // ── `try*` — the NON-FATAL twins of the readers above ──
+    // [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]]
+    //
+    // ★★★ THESE EXIST FOR TEST CODE. `src/` MUST KEEP CALLING THE ABORTING FORM,
+    // and `MirTryAccessors.AreTestOnlyAndAbsentFromSrc` in tests/mir/test_mir_try_accessors.cpp
+    // FAILS THE BUILD'S TEST SUITE if any of these names appears anywhere under
+    // `src/` except this declaration block and their definitions in mir.cpp. A
+    // wrong-opcode read in the compiler is a CALLER BUG, and an accessor that
+    // answered it with a value — any value — would be the silent-wrong-answer
+    // failure this project refuses. That is why the twin exists ALONGSIDE the
+    // aborting reader rather than replacing it: nothing here weakens `src/`.
+    //
+    // ★ WHAT THE ABORT COSTS, MEASURED, AND WHY A TWIN IS THE FIX. `std::abort()`
+    // kills the whole test BINARY, so a wrong-opcode read costs every SIBLING
+    // test in that executable its verdict — no `[  FAILED  ]` line, no case name,
+    // the unattributable signature `no_abort_in_tests_guard` exists to prevent.
+    // The shape that produces it is not exotic, it is the natural one:
+    //
+    //     EXPECT_EQ(m.instOpcode(x), MirOpcode::Arg);   // non-fatal: falls THROUGH
+    //     EXPECT_EQ(m.argIndex(x), 0u);                 // aborts on exactly the
+    //                                                   // regression above catches
+    //
+    // The guard is decorative there: `EXPECT_*` records the failure and keeps
+    // going, straight into the abort, so the run dies on precisely the mismatch
+    // the pair was written to report. Writing it safely instead costs a
+    // hand-rolled opcode test per assertion — which is why `tests/mir/
+    // test_mir_merge.cpp`'s SINGLE-SLOT IDENTITY PROBES and
+    // `test_mir_inline_asm_immediate.cpp`'s `constValue` each grew their own
+    // copy — and a defensive `if (wrong opcode) return;` in a test SKIPS rather
+    // than fails, trading a crash for a VACUOUS PASS. The twin removes the
+    // choice: nullopt is a value the assertion can compare and print.
+    //
+    // ⚠ THEY SOFTEN THE OPCODE CHECK AND NOTHING ELSE. Bounds, cross-module
+    // provenance (`instArena_.at`) and operand/phi pool-range violations still
+    // abort in every form — those are a CORRUPT MODULE, not a caller asking the
+    // wrong question of a sound one, and a test has no more business continuing
+    // past them than the compiler does.
+    [[nodiscard]] std::optional<std::uint32_t> tryArgIndex(MirInstId id) const;
+    [[nodiscard]] std::optional<std::uint32_t> tryArgPosition(MirInstId id) const;
+    [[nodiscard]] std::optional<std::uint32_t> tryConstLiteralIndex(MirInstId id) const;
+    [[nodiscard]] std::optional<SymbolId>      tryGlobalAddrSymbol(MirInstId id) const;
+    [[nodiscard]] std::optional<MirBlockId>    tryBlockAddressTarget(MirInstId id) const;
+    [[nodiscard]] std::optional<SymbolId>      tryBlockAddressExportSymbol(MirInstId id) const;
+    [[nodiscard]] std::optional<std::uint32_t> tryIntrinsicId(MirInstId id) const;
+    [[nodiscard]] std::optional<std::uint32_t> tryReturnPieceOrdinal(MirInstId id) const;
+    [[nodiscard]] std::optional<TargetRegClass> tryReturnPieceRegClass(MirInstId id) const;
+    [[nodiscard]] std::optional<std::uint32_t> tryAsmDescriptorIndex(MirInstId id) const;
+    // Pointer rather than `optional`, because `std::optional<T const&>` does not
+    // exist and copying a descriptor to report "wrong opcode" would be absurd.
+    // nullptr carries the identical meaning: this instruction is not an asm form.
+    [[nodiscard]] MirAsmDescriptor const* tryAsmDescriptor(MirInstId id) const;
+    // The two operand-pool readers are one decision — "which pool does this
+    // instruction's operand range address" — so they get one pair of twins.
+    // `tryInstOperands` is nullopt for a Phi; `tryPhiIncomings` for everything
+    // else. Both still ABORT on a range that escapes its pool.
+    [[nodiscard]] std::optional<std::span<MirInstId const>> tryInstOperands(MirInstId id) const;
+    [[nodiscard]] std::optional<std::span<MirPhiIncoming const>>
+        tryPhiIncomings(MirInstId id) const;
+
     // D-CSUBSET-COMPUTED-GOTO (MF-C): is `block` the target of some `BlockAddress`
     // in its function (i.e. its runtime address is taken via `&&label`)? DERIVED by
     // scanning the IR — the canonical, drift-proof source consumed by SimplifyCfg

@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <optional>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -221,7 +222,13 @@ TEST(Mir, BuildsAndReadsAStraightLineFunction) {
 
     // instruction tier — the fused value model
     EXPECT_EQ(m.instOpcode(arg), MirOpcode::Arg);
-    EXPECT_EQ(m.argIndex(arg), 0u);                  // typed payload accessor
+    // ⚠ `tryArgIndex`, not `argIndex` — and the reason applies to every `try*`
+    // in this file [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]]. The line above is
+    // an `EXPECT`, which RECORDS a failure and falls through; the aborting
+    // reader would then kill this whole binary on exactly the regression the
+    // pair was written to report, costing every sibling case its verdict. The
+    // twin reports `nullopt`, so the mismatch fails HERE, by name, twice.
+    EXPECT_EQ(m.tryArgIndex(arg), 0u);               // typed payload accessor
     EXPECT_EQ(m.instOpcode(c), MirOpcode::Const);
     EXPECT_EQ(m.instType(sum), kI32);
     // reverse lookup: every instruction maps back to its block
@@ -233,7 +240,9 @@ TEST(Mir, BuildsAndReadsAStraightLineFunction) {
     EXPECT_EQ(sumOps[1], c);
 
     // literal pool — the const carries its decoded value (via typed accessor)
-    auto const& lit = m.literalValue(m.constLiteralIndex(c));
+    auto const litIdx = m.tryConstLiteralIndex(c);
+    ASSERT_TRUE(litIdx.has_value()) << "entry[1] is no longer a Const";
+    auto const& lit = m.literalValue(*litIdx);
     EXPECT_EQ(lit.core, TypeKind::I32);
     ASSERT_TRUE(std::holds_alternative<std::int64_t>(lit.value));
     EXPECT_EQ(std::get<std::int64_t>(lit.value), 5);
@@ -280,12 +289,13 @@ TEST(Mir, BuildsADiamondWithCondBrAndPhi) {
     EXPECT_EQ(m.blockSuccessors(elseB)[0], join);
     // join phi has both incomings
     EXPECT_EQ(m.instOpcode(phi), MirOpcode::Phi);
-    auto const inc = m.phiIncomings(phi);
-    ASSERT_EQ(inc.size(), 2u);
-    EXPECT_EQ(inc[0].value, x);
-    EXPECT_EQ(inc[0].pred, thenB);
-    EXPECT_EQ(inc[1].value, y);
-    EXPECT_EQ(inc[1].pred, elseB);
+    auto const inc = m.tryPhiIncomings(phi);   // non-fatal on a non-Phi
+    ASSERT_TRUE(inc.has_value()) << "the join's first instruction is not a Phi";
+    ASSERT_EQ(inc->size(), 2u);
+    EXPECT_EQ((*inc)[0].value, x);
+    EXPECT_EQ((*inc)[0].pred, thenB);
+    EXPECT_EQ((*inc)[1].value, y);
+    EXPECT_EQ((*inc)[1].pred, elseB);
 }
 
 // Phi incomings may be backpatched after the predecessor blocks are filled
@@ -591,7 +601,9 @@ TEST(Mir, AddBlockAddressRemainsTheSanctionedRoute) {
     Mir m = std::move(b).finish();
 
     EXPECT_EQ(m.instOpcode(ba), MirOpcode::BlockAddress);
-    EXPECT_EQ(m.blockAddressTarget(ba).v, target.v);
+    auto const baTarget = m.tryBlockAddressTarget(ba);
+    ASSERT_TRUE(baTarget.has_value()) << "the address-of node is not a BlockAddress";
+    EXPECT_EQ(baTarget->v, target.v);
     EXPECT_TRUE(m.isBlockAddressTaken(target));
     EXPECT_FALSE(m.isBlockAddressTaken(entry));
 }
@@ -986,8 +998,15 @@ TEST(Mir, AggregatePathOperandsCarryCorrectValues) {
 
     auto const ops = m.instOperands(xv);
     ASSERT_EQ(ops.size(), 3u);
-    auto const& lit0 = m.literalValue(m.constLiteralIndex(ops[1]));
-    auto const& lit1 = m.literalValue(m.constLiteralIndex(ops[2]));
+    // The path operands are Consts by ExtractValue's contract — but "by
+    // contract" is what a regression breaks, and the aborting readers would
+    // answer that break with a dead binary rather than a named failure.
+    auto const p0 = m.tryConstLiteralIndex(ops[1]);
+    auto const p1 = m.tryConstLiteralIndex(ops[2]);
+    ASSERT_TRUE(p0.has_value() && p1.has_value())
+        << "ExtractValue's path operands must both be Const";
+    auto const& lit0 = m.literalValue(*p0);
+    auto const& lit1 = m.literalValue(*p1);
     ASSERT_TRUE(std::holds_alternative<std::int64_t>(lit0.value));
     ASSERT_TRUE(std::holds_alternative<std::int64_t>(lit1.value));
     EXPECT_EQ(std::get<std::int64_t>(lit0.value), 3);

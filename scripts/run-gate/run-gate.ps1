@@ -401,6 +401,7 @@ if (-not $resolved) {
 #   same reason: the shells marshal, they do not each invent a scan.
 $script:RunGateContentionExit = 4
 $script:RunGateBuildDir       = ''
+$script:RunGateAbsBuildDir    = ''
 $script:RunGateContenders     = @()
 $script:RunGateUnreadable     = 0
 $script:RunGateTableOk        = $false
@@ -414,9 +415,17 @@ function Test-RunGateIsWindows {
 
 # ONE SPELLING for a directory. Normalises exactly three things, like the twin:
 # separator, trailing slash, and (on Windows only) case.
-function Get-RunGateNormDir([string]$p) {
+# ! SPLIT IN TWO, exactly as the twin is, because the two callers want DIFFERENT
+#   halves: comparing two processes' directories needs the case fold, NAMING one
+#   in the log does not -- `c:/source/dailysoftware/...` in a footer reads as a
+#   different tree from the one the reader knows. `Tidy` is the shared half.
+function Get-RunGateTidyDir([string]$p) {
     $n = $p -replace '\\', '/'
     while ($n.Length -gt 1 -and $n.EndsWith('/')) { $n = $n.Substring(0, $n.Length - 1) }
+    return $n
+}
+function Get-RunGateNormDir([string]$p) {
+    $n = Get-RunGateTidyDir $p
     if (Test-RunGateIsWindows) { return $n.ToLowerInvariant() }
     return $n
 }
@@ -424,14 +433,17 @@ function Get-RunGateNormDir([string]$p) {
 # A directory token made absolute. A RELATIVE token is resolved against THIS
 # shell's working directory, because a process's own working directory is not
 # readable from outside on Windows; every refusal below says so when it applies.
-function Resolve-RunGateDir([string]$p) {
+function Get-RunGateAbsDir([string]$p) {
     $d = $p -replace '\\', '/'
     $full = $null
     try { $full = (Resolve-Path -LiteralPath $d -ErrorAction Stop).ProviderPath } catch { $full = $null }
     if (-not $full) {
         try { $full = [IO.Path]::GetFullPath([IO.Path]::Combine((Get-Location).Path, $d)) } catch { $full = $d }
     }
-    return Get-RunGateNormDir $full
+    return Get-RunGateTidyDir $full
+}
+function Resolve-RunGateDir([string]$p) {
+    return Get-RunGateNormDir (Get-RunGateAbsDir $p)
 }
 
 # Quote-aware split. +MEASURED: a Windows command line reads
@@ -565,11 +577,133 @@ function Show-RunGateContentionRefusal([string]$When) {
     Write-Host "  (log: $LogPath)"
 }
 
+# ---- AND THE ROOTS ARE THE GATE COMMAND'S TREE, NOT THIS SHELL'S ------------
+#
+# ★★★ THE THREE ROOT NAMES ARE RELATIVE, AND WHAT THEY ARE RELATIVE **TO** IS THE
+# WHOLE QUESTION. They used to be resolved against the PROCESS WORKING DIRECTORY,
+# which is right only when the caller happens to be standing in the tree the gate
+# command reads -- and this project gates lane worktrees from sibling trees.
+#
+# +MEASURED 2026-09-08 (P65, lane `rc`), BOTH DIRECTIONS, BOTH TWINS, with two
+# synthetic trees A and B: cwd = B, gate command = `ctest --test-dir A/build/x`.
+#   . edit an input root in B (a tree the run never reads) -> exit 3 on BOTH
+#     twins, naming a file the run could not have seen: a LOUD FALSE REFUSAL
+#     that spends a quarter-hour gate. A sibling lane hit this shape in the field.
+#   . edit an input root in A (the tree whose build directory the command names,
+#     and whose config its tests read) -> exit 0 on BOTH twins, footer
+#     `inputs  : held still`. => THE SILENT WRONG ANSWER, and the one sentence
+#     this block exists to be unable to say wrongly.
+#
+# ★★★ WHAT DECIDES NOW, FROM THE MECHANISM RATHER THAN A PREFERENCE: the source
+# tree CMake itself records as having configured the build directory this command
+# names. `<build>/CMakeCache.txt` carries `CMAKE_HOME_DIRECTORY:INTERNAL=<dir>`,
+# and the tests registered in that build tree read `src/dss-config`,
+# `tests/corpus` and `examples` from THERE at test time.
+#
+# +AND THE BUILD SYSTEM SAYS IT IN SO MANY WORDS, which is why this is the
+# MECHANISM and not an inference. `CMakeLists.txt` gives 35 registered tests
+# `WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"`, and `tests/CMakeLists.txt` bakes
+# `DSS_TEST_REPO_ROOT="${CMAKE_SOURCE_DIR}"` into every test binary -- what
+# `tests/test_support/repo_root.hpp`'s `bakedRepoRoot()` returns and what every
+# helper there resolves the three roots against. `CMAKE_SOURCE_DIR` is EXACTLY
+# the value CMake writes to the cache as `CMAKE_HOME_DIRECTORY`.
+#
+# ! WHAT THIS STILL DOES NOT REACH, stated rather than left to be discovered:
+# `$DSS_CONFIG_ROOT`. The compiler's own walk composes `<that>/src/dss-config`
+# (`src/core/types/config_path_walk.cpp`, `repoShapedConfigRoot`), so a gate run
+# with that variable pointing OUTSIDE the tree named here reads a config tree
+# this scan never walks. NOT guessed at, deliberately -- the compiler and
+# `repo_root.hpp` document precedences that do not obviously agree about whether
+# the variable names a tree root or the config directory itself, and a rule
+# built on the wrong one would watch a directory that does not exist, which
+# contributes nothing and restores the very `held still` this block exists to
+# prevent. +MEASURED: the one shipped caller that sets it,
+# `scripts/profile-compile/profile-compile.sh`, sets it to the repository it is
+# already standing in, so nothing is relocated today.
+#
+# ! THREE OTHER CANDIDATES WERE MEASURED AND ALL THREE ARE WRONG -- the twin
+#   carries the full argument; the short form is: the repository root containing
+#   the build tree is refuted by `build/rvff` in this very repository, which sits
+#   in the main checkout and names a WORKTREE as its home directory; this
+#   wrapper's own location is refuted by its fixture, which drives the
+#   repository's copy over a synthetic sandbox; and the cwd is refuted by the
+#   measurement above, in both directions.
+#
+# (i) THE CWD REMAINS THE FALLBACK and is now STATED rather than assumed: a gate
+#   command need not name a build directory (`remote-leg` hands this wrapper a
+#   `bash`), and a named directory need not be a CMake build tree. In both cases
+#   there is no evidence about which tree the command reads, so the wrapper says
+#   which rule decided, on every run, in the log.
+# (i) NOT AN ESCAPE HATCH: nothing here is settable by a caller.
+$script:RunGateInputRootNames = @('src/dss-config', 'tests/corpus', 'examples')
+$script:RunGateSourceTree     = ''
+$script:RunGateSourceTreeWhy  = ''
+$script:RunGateSourceTreeMiss = ''
+
+# CMake's own record of which tree configured this build tree, or $null -- and
+# when $null, WHY, in $script:RunGateSourceTreeMiss.
+# ★★ THE FOUR MISSES ARE NOT ONE MISS, and collapsing them into "not a CMake
+# build tree" is the shape of message this pair keeps refusing: a sentence that
+# outruns its evidence. +MEASURED while building this -- a CMakeCache whose
+# recorded home directory THIS SHELL CANNOT SEE is a real, reachable state (an
+# MSYS-spelled `/c/...` is invisible to PowerShell and a `C:/...` is invisible to
+# a WSL bash), and it is emphatically NOT "there is no cache".
+function Get-RunGateSourceTreeOfBuildDir([string]$buildDir) {
+    $script:RunGateSourceTreeMiss = ''
+    if (-not $buildDir) {
+        $script:RunGateSourceTreeMiss = 'this command names no build directory, so there is nothing to ask'
+        return $null
+    }
+    $cache = "$buildDir/CMakeCache.txt"
+    if (-not (Test-Path -LiteralPath $cache -PathType Leaf)) {
+        $script:RunGateSourceTreeMiss = 'the build directory it names has no CMakeCache.txt, so nothing on disk records which tree configured it'
+        return $null
+    }
+    $hit = Select-String -LiteralPath $cache -Pattern '^CMAKE_HOME_DIRECTORY:INTERNAL=' -List -ErrorAction SilentlyContinue
+    $homeDir = ''
+    if ($hit) { $homeDir = $hit.Line.Substring('CMAKE_HOME_DIRECTORY:INTERNAL='.Length).Trim() }
+    if (-not $homeDir) {
+        $script:RunGateSourceTreeMiss = 'its CMakeCache.txt carries no CMAKE_HOME_DIRECTORY entry'
+        return $null
+    }
+    if (-not (Test-Path -LiteralPath $homeDir -PathType Container)) {
+        $script:RunGateSourceTreeMiss = "its CMakeCache.txt names '$homeDir' as CMAKE_HOME_DIRECTORY and THIS SHELL ($(Get-RunGateShellIdentity)) CANNOT SEE THAT DIRECTORY - a DOS-drive path is invisible to a WSL bash and an MSYS '/c/...' path is invisible to PowerShell, so check which shell you handed this gate to"
+        return $null
+    }
+    return (Get-RunGateTidyDir $homeDir)
+}
+
+function Set-RunGateInputRoots {
+    $fromBuild = Get-RunGateSourceTreeOfBuildDir $script:RunGateAbsBuildDir
+    if ($fromBuild) {
+        $script:RunGateSourceTree    = $fromBuild
+        $script:RunGateSourceTreeWhy = "CMAKE_HOME_DIRECTORY recorded in $($script:RunGateAbsBuildDir)/CMakeCache.txt - the tree this command's build directory was configured from"
+        return
+    }
+    $script:RunGateSourceTree    = Get-RunGateAbsDir '.'
+    $script:RunGateSourceTreeWhy = "this shell's working directory - $($script:RunGateSourceTreeMiss)"
+}
+
+# The three roots as ABSOLUTE paths. (i) Used by BOTH the scan and the footer on
+# purpose: a footer naming roots the scan did not walk is the class of lie this
+# whole block is about.
+function Get-RunGateAbsInputRoots {
+    return @($script:RunGateInputRootNames | ForEach-Object { "$($script:RunGateSourceTree)/$_" })
+}
+
 # ---- PRE-RUN: refuse a contended build directory BEFORE anything starts -----
 # ! Placed AHEAD of the input marker deliberately, so a refusal here leaves no
 #   marker file behind for the next run to trip over.
 $__rawBuildDir = @(Get-RunGateDirsInTokens $Command $CommandArgs) | Select-Object -First 1
-if ($__rawBuildDir) { $script:RunGateBuildDir = Resolve-RunGateDir $__rawBuildDir }
+if ($__rawBuildDir) {
+    # TWO SPELLINGS OF ONE DIRECTORY, each with exactly one caller, like the twin:
+    # the case-folded one is only ever COMPARED against another process's
+    # spelling; the plain one is what gets NAMED in a message and what
+    # CMakeCache.txt is read beside.
+    $script:RunGateAbsBuildDir = Get-RunGateAbsDir $__rawBuildDir
+    $script:RunGateBuildDir    = Get-RunGateNormDir $script:RunGateAbsBuildDir
+}
+Set-RunGateInputRoots
 Get-RunGateContention
 if ($script:RunGateContenders.Count -gt 0) {
     Add-Content -LiteralPath $LogPath -Value @"
@@ -584,7 +718,6 @@ contended: YES, BEFORE THE RUN - nothing was executed
     exit $script:RunGateContentionExit
 }
 
-$script:RunGateInputRoots = @('src/dss-config', 'tests/corpus', 'examples')
 $script:RunGateMarker = "$LogPath.inputs-marker"
 try {
     New-Item -ItemType File -Path $script:RunGateMarker -Force -ErrorAction Stop | Out-Null
@@ -598,11 +731,32 @@ try {
 }
 $script:RunGateMarkerTime = (Get-Item -LiteralPath $script:RunGateMarker).LastWriteTimeUtc
 
+# ⚠⚠ `-Force` IS LOAD-BEARING, AND WITHOUT IT THIS TWIN IS BLIND OFF WINDOWS.
+# `Get-ChildItem -Recurse` omits HIDDEN entries, and on Linux and macOS "hidden"
+# means A LEADING DOT -- so every dot-file under the three input roots was
+# invisible here while `find -type f -newer` in the .sh twin saw it. That is the
+# worst possible direction for this particular check: the wrapper printed
+# `inputs  : held still` over a tree that HAD moved, which is the one sentence it
+# exists to be unable to say wrongly.
+# ✔MEASURED 2026-09-08 on WSL x86_64 (pwsh 7.5.4): `Get-ChildItem -Recurse -File`
+# under a directory holding `.dotfile` and `plain.txt` returned only `plain.txt`;
+# with `-Force` it returned both. The fixture's own probe file is a dot-file, so
+# arm `5-ps1-moved` of `scripts/run-gate/test-run-gate.sh` returned 0 instead of 3
+# and arm `6-parity` reported `.sh=3 vs .ps1=0`.
+# ⚠ IT WAS INVISIBLE ON WINDOWS FOR TWO COMPOUNDING REASONS: NTFS does not treat a
+# leading dot as hidden, so the same file was returned there without `-Force`; and
+# the fixture drove the .ps1 arms with a literal `powershell`, so they had never
+# run on a host where the difference exists. `-Force` also picks up genuinely
+# hidden-attributed files on Windows, which is what the .sh twin already did.
+# (i) A root that does not exist contributes nothing, so a lane worktree carrying
+#   a subset of the tree, or a synthetic self-test root, is not penalised for it.
+#   The roots are ABSOLUTE (see "AND THE ROOTS ARE THE GATE COMMAND'S TREE"
+#   above), so this walks the tree the gate command reads and not this shell's.
 function Get-RunGateMovedInputs {
     $moved = @()
-    foreach ($root in $script:RunGateInputRoots) {
-        if (-not (Test-Path -LiteralPath $root)) { continue }
-        $moved += Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
+    foreach ($root in (Get-RunGateAbsInputRoots)) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        $moved += Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue |
             Where-Object { $_.LastWriteTimeUtc -gt $script:RunGateMarkerTime } |
             ForEach-Object { $_.FullName }
     }
@@ -639,8 +793,15 @@ if ($movedInputs.Count -gt 0) {
     Add-Content -LiteralPath $LogPath -Value "inputs  : MOVED DURING THE RUN - this verdict is not evidence"
     foreach ($m in $movedInputs) { Add-Content -LiteralPath $LogPath -Value "          $m" }
 } else {
-    Add-Content -LiteralPath $LogPath -Value "inputs  : held still ($($script:RunGateInputRoots -join ' '))"
+    Add-Content -LiteralPath $LogPath -Value "inputs  : held still"
 }
+# ★★ THE FOOTER NAMES THE TREE IT WATCHED, ABSOLUTELY, ON EVERY RUN -- green,
+# refused, or failed. `held still` is a claim about a DIRECTORY, and a reader who
+# has to reconstruct the caller's working directory to learn which directory
+# cannot check the claim at all.
+Add-Content -LiteralPath $LogPath -Value "srctree : $($script:RunGateSourceTree)"
+Add-Content -LiteralPath $LogPath -Value "          decided by: $($script:RunGateSourceTreeWhy)"
+foreach ($r in (Get-RunGateAbsInputRoots)) { Add-Content -LiteralPath $LogPath -Value "watched : $r" }
 if (-not $script:RunGateBuildDir) {
     Add-Content -LiteralPath $LogPath -Value "builddir: none named by this command - the contention check had no subject"
 } else {
@@ -663,6 +824,8 @@ if ($movedInputs.Count -gt 0) {
     Write-Host "  (command exited $rc; that number describes a tree that never existed as a whole)."
     Write-Host "  These read-at-test-time files were modified after the run started:"
     foreach ($m in $movedInputs) { Write-Host "      $m" }
+    Write-Host "  source tree watched: $($script:RunGateSourceTree)"
+    Write-Host "    decided by: $($script:RunGateSourceTreeWhy)"
     Write-Host "  This is NOT 'the gate failed'. Any failure it reported may belong to the edit"
     Write-Host "    rather than to the code under test, and any PASS is equally unproven."
     Write-Host "  Let the tree settle and run it again. If you are the one who edited it: this"

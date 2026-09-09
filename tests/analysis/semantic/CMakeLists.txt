@@ -264,3 +264,58 @@ dss_add_test(NAME analysis/semantic/test_attribute_arg_const_expr
              SOURCES test_attribute_arg_const_expr.cpp)
 target_include_directories(dss_analysis_semantic_test_attribute_arg_const_expr
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P65 [[D-CSUBSET-DECL-QUALIFIER-BEFORE-STORAGE-CLASS]]: a type qualifier written
+# BEFORE the storage-class specifiers (C 6.7p2 order-free declaration specifiers)
+# lands in the STRIPPED specifier prefix, so this file pins that it still MEANS
+# what the same token means one slot to the right -- the const verdict, the
+# volatile/_Atomic type skin, and the C 6.7.1p2 refusals in every order. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root.
+dss_add_test(NAME analysis/semantic/test_decl_specifier_order
+             SOURCES test_decl_specifier_order.cpp)
+target_include_directories(dss_analysis_semantic_test_decl_specifier_order
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P65 [[D-CSUBSET-BLOCK-SCOPE-STORAGE-CLASS-EXCLUSIVITY-UNSTATED]]: C23 6.7.2p2
+# at BLOCK scope and in a FOR-INIT -- the two declaration rows the file-scope
+# twin never covered, where DSS compiled eight specifier pairs that gcc, clang
+# and MSVC each refuse. Every refusal arm here is paired with a live ACCEPTANCE
+# twin, because the `auto` bullet ("may appear with all the others except
+# typedef") makes the tempting flat-group fix refuse programs a reference RUNS;
+# the axis that decides `auto` is 6.7.2p4's "if the type is to be inferred",
+# i.e. WHICH declaration row matched. Shares `semantic_test_fixture.hpp`, so it
+# needs the tests/ include root for the same reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_block_scope_storage_class_exclusivity
+             SOURCES test_block_scope_storage_class_exclusivity.cpp)
+target_include_directories(dss_analysis_semantic_test_block_scope_storage_class_exclusivity
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P65 lane `fs` -- FILE-SCOPE declaration DEFINEDNESS: what a file-scope
+# declaration DEFINES on the two axes where DSS sat below the reference union.
+# `extern int x = 0;` at file scope is a DEFINITION (C 6.9.2p1) that all three
+# references accept, while the same spelling at BLOCK scope stays a loud refusal
+# (C 6.7.11p5) that all three also make; and [[D-CSUBSET-AUTO-FILE-SCOPE]]'s
+# C23 6.7.9 inference now has a top-level rule, whose branch ORDER against the
+# unbounded file-scope declaration class is pinned here. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root for the same
+# reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_file_scope_declaration_definedness
+             SOURCES test_file_scope_declaration_definedness.cpp)
+target_include_directories(dss_analysis_semantic_test_file_scope_declaration_definedness
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P65 lane `sp` -- TWO SPECIFIER-**SET** QUESTIONS ON A FILE-SCOPE DECLARATION,
+# as distinct from the ORDER question its `test_decl_specifier_order` and
+# `test_file_scope_declaration_definedness` siblings own: which specifiers the
+# set may CONTAIN. `extern auto g = 1;` and `auto extern g = 1;` were refused
+# IDENTICALLY, so no reordering could reach them -- C23 6.7.2p2 admits `auto`
+# beside every storage-class specifier but `typedef`, and both working
+# references accept with -pedantic-errors clean. The `inline`-on-an-object half
+# is the paired DECIDED DIVERGENCE: gcc accepts and emits a BYTE-IDENTICAL
+# object, clang and MSVC refuse on point, so the loud refusal stays. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root for the same
+# reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_specifier_set_extern_auto_and_inline_object
+             SOURCES test_specifier_set_extern_auto_and_inline_object.cpp)
+target_include_directories(dss_analysis_semantic_test_specifier_set_extern_auto_and_inline_object
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

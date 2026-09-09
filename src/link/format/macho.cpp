@@ -4135,6 +4135,83 @@ encodeExecDynamic(AssembledModule const&    module,
     bool const hasConst = !constLayout.empty();
     bool const hasData  = !dataLayout.empty();
     bool const hasBss   = !bssLayout.empty();
+    // ── D-LINK-MACHO-IMAGE-OVERALIGNED-STATIC-IS-A-LOAD-TIME-COIN-FLIP:
+    //    a STATIC stronger than the image's own mapping granularity cannot be
+    //    honoured by ANY Mach-O image, so it is REFUSED, never shipped ────────
+    //
+    // ★★ WHY MACH-O NEEDS A CEILING WHERE ELF NEEDED A PROMISE. An ELF PT_LOAD
+    // carries `p_align`, so the ELF row
+    // [[D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET]] could
+    // close its load-time half by RAISING a segment's declared granularity
+    // until it covered the strongest member the segment maps.
+    // `segment_command_64` HAS NO SUCH FIELD — `section_64.align` is read by the
+    // STATIC LINKER, never by dyld — and every darwin image this writer emits is
+    // base-relative (MH_PIE exec, MH_DYLIB), so its final address is the
+    // link-time one plus a slide dyld chooses at a multiple of the VM page size.
+    // An object asking for more than a page therefore keeps the address chosen
+    // here and LOSES its alignment at load, on roughly half of all runs, with
+    // nothing in the image recording that it happened.
+    //
+    // ✔MEASURED ON THE REFERENCE — Apple Silicon, macOS 26.6.2, Apple clang
+    // 21.0.0, ld PROJECT:ld-1267 — each port probed SEPARATELY on one source,
+    // BUILD **and** RUN, twenty runs per cell because one run decides nothing
+    // about a coin flip:
+    //   * arm64 (page 16384): align 16 / 4096 / 16384 return 42 twenty times out
+    //     of twenty. align 32768 makes ld64 WARN "reducing alignment of section
+    //     __DATA,__data from 0x8000 to 0x4000 because it exceeds segment maximum
+    //     alignment", and the program then returns 50 or 54 BY RUN — never 42.
+    //   * x86_64 (page 4096): align 4096 returns 42. align 8192 draws the SAME
+    //     warning with the numbers 0x2000 -> 0x1000, and flickers 50/52 by run.
+    // ⇒ THE CAP TRACKS THE PAGE AND THE REFERENCE NAMES IT: 0x4000 on the 16 KiB
+    // port, 0x1000 on the 4 KiB one — a page, not a constant.
+    // `-Wl,-segalign,0x8000` does not lift it: ld64 refuses the link outright
+    // with "chained fixups, page_size not 4KB or 16KB in segment #2".
+    //
+    // ★ SO NO REFERENCE MAKES AN ABOVE-PAGE STATIC *WORK* ON MACH-O, and under
+    // `DSS = (gcc union clang union MSVC)` the union is over what WORKS: a
+    // reference that accepts a request and then ships a program wrong half the
+    // time casts no vote. DSS is one notch stricter than ld64 deliberately —
+    // ld64 warns and continues; this project does not ship a warning where the
+    // outcome is a silent, non-deterministic miscompile.
+    //
+    // ⚠ WHAT STOOD HERE WAS NOTHING AT ALL. The thread-local ceiling above is
+    // the only alignment gate this walker had; a STATIC was placed at whatever
+    // it asked for and the coin flip shipped without even ld64's warning.
+    //
+    // ⓘ THE NUMBER IS READ FROM THE DOCUMENT, never from the architecture:
+    // `image.segmentPageSize` is the same key every LC_SEGMENT_64 vmaddr/fileoff
+    // is already rounded to, so the ceiling and the granularity it protects
+    // cannot drift apart, and there is no format or cputype test here.
+    //
+    // ⚠ `__bss` IS INCLUDED THOUGH IT STORES NO FILE BYTES. Its VA is slid
+    // exactly like a file-backed section's, so a zero-fill static is as exposed
+    // as an initialized one. The ELF row's `.bss` arm was the half that had
+    // always been RIGHT, and the reason was that ELF could raise `p_align` — so
+    // that asymmetry does NOT carry over, and assuming it did is how this gate
+    // would have been written to cover half the sections.
+    {
+        std::uint64_t staticMaxAlign = 1;
+        if (hasConst) staticMaxAlign = std::max(staticMaxAlign, constLayout.maxAlign);
+        if (hasData)  staticMaxAlign = std::max(staticMaxAlign, dataLayout.maxAlign);
+        if (hasBss)   staticMaxAlign = std::max(staticMaxAlign, bssLayout.maxAlign);
+        if (staticMaxAlign > kPageSize) {
+            emit(reporter, DiagnosticCode::K_StaticObjectOveralignedForFormat,
+                 std::format(
+                     "macho::encodeExecDynamic: a statically allocated object "
+                     "requires {}-byte alignment, but this image's mapping "
+                     "granularity is {} bytes ('image.segmentPageSize') and "
+                     "Mach-O's segment_command_64 carries NO alignment field — "
+                     "dyld slides a base-relative image by a multiple of that "
+                     "page size, so the object would be correctly aligned on "
+                     "some runs and misaligned on others with no diagnostic. "
+                     "Lower the request to {} or less (ld64 stops at the same "
+                     "number, reducing the section alignment to the page and "
+                     "warning \"exceeds segment maximum alignment\") "
+                     "(D-LINK-MACHO-IMAGE-OVERALIGNED-STATIC-IS-A-LOAD-TIME-COIN-FLIP).",
+                     staticMaxAlign, kPageSize, kPageSize));
+            return {};
+        }
+    }
     // TLS C4: the three __thread_* sections also live in __DATA, so any
     // thread-local forces the writable segment even with no ordinary globals.
     bool const hasDataSeg = hasData || hasBss || hasTls;   // needs __DATA
@@ -5776,6 +5853,73 @@ encodeExecDynamic(AssembledModule const&    module,
     std::uint64_t const stubsFileOff = textFileOff + textFileSize;
     std::uint64_t const stubsFileSize =
         static_cast<std::uint64_t>(numFuncExterns) * stubSize;
+
+    // ── WHY THIS LATE CHAIN MAY ROUND A FILE OFFSET WHERE `elf.cpp` MAY NOT,
+    //    i.e. the OTHER half of the ELF over-alignment question, MEASURED ────
+    //
+    // [[D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET]] is a
+    // shipped, measured defect whose mechanism is exactly the shape below: an
+    // exec image's allocated sections satisfy `va == base + fileOffset`, and
+    // rounding the OFFSET to a section's alignment yields an aligned ADDRESS
+    // only when the base already is — so a request stronger than the base's own
+    // alignment is silently downgraded, and WHICH happens is decided by a number
+    // typed into a `.format.json`. That row's Cross-refs says this writer "was
+    // not read for either half". It has been, and the answer is NOT the ELF one.
+    //
+    // ★ FACT 1 — THE DELTA IS `image.pageZeroSize`, EXACTLY. Every allocated
+    // section here satisfies `addr == (sectionVa - textFileOff) + offset`, and
+    // `textSegmentVaMatchesFileOff` above requires
+    // `__text.virtualAddress - pageZeroSize == textFileOff`, so that delta IS
+    // `pageZeroSize`. Nothing else can be.
+    //
+    // ★ FACT 2 — THE KERNEL ALREADY FORCES THAT DELTA TO BE A MULTIPLE OF THE
+    // PAGE. `__TEXT.vmaddr` IS `pageZeroSize` and `__TEXT.fileoff` is 0, and the
+    // mmap rule is `vmaddr % segmentPageSize == fileoff % segmentPageSize`; a
+    // `pageZeroSize` that is not a multiple of the page maps `__TEXT` at the
+    // wrong address and the kernel refuses the image with EBADMACHO. So the
+    // delta divides the page on every image that can LOAD AT ALL.
+    //
+    // ★ FACT 3 — AND NO REQUEST CAN EXCEED THE PAGE, because the gate above
+    // refuses one. Composing the three: every admitted alignment is a power of
+    // two dividing `segmentPageSize`, which divides the delta, so
+    // `alignUp(offset, A) + delta == alignUp(offset + delta, A)` — rounding the
+    // offset and rounding the address are THE SAME EXPRESSION here. That is a
+    // proof, not an observation, and it is why this chain is left alone.
+    //
+    // ⚠⚠ SO THE ELF REMEDY WAS MEASURED AND REJECTED FOR THIS WRITER, and the
+    // reason is worth more than the conclusion. Routing the four SECTION offsets
+    // below through the shared `imageOffsetForAlignedVa` was written and then
+    // reverted: it changes no byte of any loadable image (Fact 3), and the only
+    // input that distinguishes it is a document whose `pageZeroSize` does not
+    // divide the page — an image the kernel refuses whatever this code does.
+    // Worse, it would have been a PARTIAL adoption that reads as a complete one:
+    // the four SEGMENT boundaries (`gotFileOff`, `dataSegFileOff` and the two
+    // page-rounded spans) round file offsets too and CANNOT be converted, since
+    // an address-aligned segment start with a non-congruent file offset is
+    // precisely what EBADMACHO names. A reader would have been left believing
+    // this writer is address-first when half of it structurally cannot be.
+    //
+    // ★★ WHAT WAS NEVER SILENT HERE, WHICH IS THE REAL DIFFERENCE FROM ELF: the
+    // EARLY chain (far above) rounds ADDRESSES and binds symbolVa before the
+    // relocation kernel runs; this LATE chain rounds offsets; and four fail-loud
+    // congruence guards (`__const`, `__eh_frame`, `__got`, `__DATA`) compare the
+    // two derivations and REFUSE the image when they disagree. ELF had no such
+    // comparison, which is why its divergence shipped as a misplaced object and
+    // this one cannot. ✔MEASURED with a derived document whose `pageZeroSize`
+    // sits BELOW the page: the `__got` guard fires and the image is withheld.
+    //
+    // ⚠ THE ONE GAP THIS LEAVES, AND IT IS NOT IN THIS FILE: Fact 2 is a KERNEL
+    // rule that `macho_backend`'s validate() does not check. It requires
+    // `image.pageZeroSize` to be a POWER OF TWO — its own comment says the
+    // purpose is "so that __TEXT.vmaddr (= pageZeroSize) preserves the kernel's
+    // mmap congruence" — but a power of two BELOW `segmentPageSize` satisfies
+    // the check and breaks the rule, and the neighbouring `__text.virtualAddress`
+    // check measures the offset WITHIN the segment rather than the segment's own
+    // address, so it does not catch it either. Every shipped document declares
+    // 0x100000000 or 0 and is far clear of it; the missing predicate is
+    // `pageZeroSize % segmentPageSize == 0`, and its owner is validate(), where
+    // the message can name the document key.
+    // (D-LINK-MACHO-IMAGE-OVERALIGNED-STATIC-IS-A-LOAD-TIME-COIN-FLIP.)
 
     // __TEXT,__const file offset — H1-aligned above __stubs, inside the
     // same __TEXT segment (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror). Because

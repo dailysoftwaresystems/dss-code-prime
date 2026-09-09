@@ -700,9 +700,13 @@ TEST(MirInlineAsm, AsmGotoWithOutputsPlacesPiecesAtSinglePredecessorSuccessorHea
         MirInstId const p1 = mir.blockInstAt(s, 1);
         EXPECT_EQ(mir.instOpcode(p0), MirOpcode::ReturnPiece);
         EXPECT_EQ(mir.instOpcode(p1), MirOpcode::ReturnPiece);
-        EXPECT_EQ(mir.returnPieceOrdinal(p0), 0u);
-        EXPECT_EQ(mir.returnPieceRegClass(p0), TargetRegClass::GPR);
-        EXPECT_EQ(mir.returnPieceRegClass(p1), TargetRegClass::FPR);
+        // `try*`: the two EXPECTs above are non-fatal, and an edge-placement
+        // regression that put something else in these slots would otherwise
+        // abort here [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]] — killing the
+        // loop, the case, and every sibling in this binary at once.
+        EXPECT_EQ(mir.tryReturnPieceOrdinal(p0), 0u);
+        EXPECT_EQ(mir.tryReturnPieceRegClass(p0), TargetRegClass::GPR);
+        EXPECT_EQ(mir.tryReturnPieceRegClass(p1), TargetRegClass::FPR);
         EXPECT_EQ(mir.instOperands(p0)[0].v,
                   mir.blockTerminator(pre).v)
             << "each piece is anchored to the asm goto itself";

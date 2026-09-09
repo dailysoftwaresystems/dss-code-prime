@@ -114,6 +114,41 @@ class TypeRegistry;
 // a `Node` with no `next`.
 inline constexpr std::uint32_t kHirTextFormatVersion = 3;
 
+// ── kHirTextMaxNodeDepth — THE FORMAT'S DECLARED NESTING LIMIT ────────────────
+//
+// ★★★ THE NESTING LIMIT SURVIVES AS A COUNTER, IT IS NO LONGER THE HOST STACK
+// (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED, the
+// operator's ruling of 2026-09-02). The node walk on both sides of this codec
+// used to be host recursion with no cap of any kind, so "how deep may a module
+// be" was answered by whichever thread happened to be running the emitter —
+// ✔MEASURED 2026-09-08: `dsscp --emit-hir` died of STATUS_STACK_OVERFLOW
+// (0xC00000FD) with ZERO bytes on stderr and no diagnostic on a flat
+// `x +1 +1 …` chain of 2000 terms, while `--compile` took the same file at rc 0.
+// The walk is now an explicit heap work stack, and the limit it lost is
+// reinstated HERE, as a number, in the header where the format's other declared
+// constants live.
+//
+// ⚠ IT IS A LIMIT OF THE FORMAT, NOT OF THE WRITER, AND THAT IS WHY IT IS PUBLIC.
+// A writer that spelled a module deeper than its own reader accepts would ship an
+// artifact that cannot be read back — a round trip that fails at the consumer
+// rather than here. Both halves read this one constant, so the two cannot drift.
+//
+// WHY THIS VALUE, stated rather than assumed:
+//   * FROM BELOW — it must exceed the deepest HIR the front end can hand the
+//     writer, or `--emit-hir` would refuse programs `--compile` compiles. The c
+//     grammar declares `parser.maxExpressionDepth` 16384 (its own semantic cap on
+//     nesting), and ✔MEASURED 2026-09-08 a flat 8000-term chain — which does NOT
+//     count against that cap, because a left-associative chain climbs
+//     iteratively — compiles at rc 0 and yields an ~8000-deep HIR. This bound is
+//     16x the declared cap and 32x that measured chain.
+//   * FROM ABOVE — the walk's cost is now HEAP, so the bound is what makes that
+//     heap finite. At most three live tasks per level at ~56 bytes each puts the
+//     emitter's worst case at the bound near 44 MiB, which is bounded and
+//     reportable, where an uncapped walk is neither.
+// A module past it is REFUSED BY NAME with an Error diagnostic and the `?` poison
+// token — never a truncation that would read back as a smaller, valid program.
+inline constexpr std::uint32_t kHirTextMaxNodeDepth = 262144;
+
 // ── HirTextBufferName ─────────────────────────────────────────────────────────
 //
 // One buffer → source-name binding, as it travels in the file's `buffers`

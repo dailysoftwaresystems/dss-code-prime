@@ -297,6 +297,82 @@ MirAsmDescriptor const& Mir::asmDescriptor(MirInstId id) const {
     return asmDescriptorPool_.at(asmDescriptorIndex(id));
 }
 
+// ── `try*` — the non-fatal twins [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]] ──
+//
+// ★★★ EVERY TWIN TESTS THE OPCODE AND THEN DELEGATES TO ITS ABORTING SIBLING —
+// it never decodes `payload` itself, and that is the load-bearing property, not
+// a shortcut. Each of these payloads is an ENCODING (`arg_payload` packs an
+// ordinal and a position into one word; `return_piece_payload` packs an ordinal
+// and a register class), and a twin that re-spelled the decode would be a second
+// copy free to drift from the first. It would drift SILENTLY and in the worst
+// direction: the aborting form is what `src/` reads, so a divergence would make
+// the tests agree with themselves about a value the compiler never sees. By
+// construction here, a `try*` that returns a value returns the SAME value its
+// sibling would have, or the sibling aborts and so does it.
+//
+// ⚠ `instOpcode` still routes through `instArena_.at`, so a stale, out-of-range
+// or CROSS-MODULE id aborts in the twin exactly as it does in the sibling. The
+// only thing softened is the opcode mismatch.
+std::optional<std::uint32_t> Mir::tryArgIndex(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::Arg) return std::nullopt;
+    return argIndex(id);
+}
+std::optional<std::uint32_t> Mir::tryArgPosition(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::Arg) return std::nullopt;
+    return argPosition(id);
+}
+std::optional<std::uint32_t> Mir::tryConstLiteralIndex(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::Const) return std::nullopt;
+    return constLiteralIndex(id);
+}
+std::optional<SymbolId> Mir::tryGlobalAddrSymbol(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::GlobalAddr) return std::nullopt;
+    return globalAddrSymbol(id);
+}
+std::optional<MirBlockId> Mir::tryBlockAddressTarget(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::BlockAddress) return std::nullopt;
+    return blockAddressTarget(id);
+}
+std::optional<SymbolId> Mir::tryBlockAddressExportSymbol(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::BlockAddressExport) return std::nullopt;
+    return blockAddressExportSymbol(id);
+}
+std::optional<std::uint32_t> Mir::tryIntrinsicId(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::IntrinsicCall) return std::nullopt;
+    return intrinsicId(id);
+}
+std::optional<std::uint32_t> Mir::tryReturnPieceOrdinal(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::ReturnPiece) return std::nullopt;
+    return returnPieceOrdinal(id);
+}
+std::optional<TargetRegClass> Mir::tryReturnPieceRegClass(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::ReturnPiece) return std::nullopt;
+    return returnPieceRegClass(id);
+}
+std::optional<std::uint32_t> Mir::tryAsmDescriptorIndex(MirInstId id) const {
+    // The two-arm test its sibling makes, asked the same way round: "is this an
+    // asm block", not "is it the non-terminator one".
+    MirOpcode const op = instOpcode(id);
+    if (op != MirOpcode::InlineAsm && op != MirOpcode::InlineAsmGoto) return std::nullopt;
+    return asmDescriptorIndex(id);
+}
+MirAsmDescriptor const* Mir::tryAsmDescriptor(MirInstId id) const {
+    MirOpcode const op = instOpcode(id);
+    if (op != MirOpcode::InlineAsm && op != MirOpcode::InlineAsmGoto) return nullptr;
+    return &asmDescriptor(id);
+}
+std::optional<std::span<MirInstId const>> Mir::tryInstOperands(MirInstId id) const {
+    // The descriptor flag is the sibling's own source of truth for which pool a
+    // node's operand range addresses — asked here rather than re-listing opcodes,
+    // so a second pool-bearing opcode generalises to both forms at once.
+    if (opcodeInfo(instOpcode(id)).usesPhiPool) return std::nullopt;
+    return instOperands(id);
+}
+std::optional<std::span<MirPhiIncoming const>> Mir::tryPhiIncomings(MirInstId id) const {
+    if (!opcodeInfo(instOpcode(id)).usesPhiPool) return std::nullopt;
+    return phiIncomings(id);
+}
+
 MirFuncId Mir::blockFunc(MirBlockId id) const {
     return MirFuncId{blockArena_.at(id).func, this->id().v};
 }

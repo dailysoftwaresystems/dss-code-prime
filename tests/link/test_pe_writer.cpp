@@ -4506,6 +4506,55 @@ TEST(PeExecFormatJsonValidate, NonPow2SectionAlignmentRejected) {
     EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
 }
 
+// ── The `fileAlignment` twin of the rule above, and the ONE member of the
+//    `alignUp` precondition's distributed enforcement that nothing pinned ──
+//
+// `detail::alignUp` in `src/link/format/byte_emit.hpp` is the power-of-two
+// BITMASK `(v + a - 1) & ~(a - 1)`, and `pe::encodeExec` feeds it
+// `optionalHeader.fileAlignment` at every section's raw-data pointer. A
+// non-power-of-two there does not fail: `alignUp(600, 600)` returns 512, so
+// SizeOfHeaders and every PointerToRawData come out at offsets that overlap the
+// data they claim to start, and the image is built around them silently.
+//
+// ⚠ THIS TEST IS THE HALF THAT WAS MISSING, NOT A NEW RULE. validate() has
+// refused this since the key landed; the SIBLING key (`sectionAlignment`) is
+// pinned directly above, and `image.segmentPageSize`'s identical guard is pinned
+// in `test_macho_arm64_exit`. `fileAlignment`'s was the only one of the three
+// with no test, so a refactor could have dropped it and left every suite green
+// — which is exactly the shape that lets a silent-wrong-answer path reopen.
+// (P65, alongside the correction of `alignUp`'s own contract comment, which had
+// claimed for the life of the function that a non-power-of-two was "handled with
+// the modulo-cycle form".)
+TEST(PeExecFormatJsonValidate, NonPow2FileAlignmentRejected) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".exe",
+  "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
+      "format": {"name":"odd-file-align","kind":"pe"},
+      "$entryClusterComment": "Entry cluster + pe.characteristics: verbatim from the shipped pe64-x86_64-windows-exec.format.json. Present so this fixture is rejected ONLY for the defect it pins -- see the block comment above these tests.",
+      "runtimeLibraries": [{"role":"cLibrary","image":"ucrtbase.dll"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
+      "entryCallingConvention": "ms_x64",
+      "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
+      "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 600, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
+      "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin, the same discipline as the sibling above: 600 is
+    // chosen so it violates EXACTLY ONE rule -- it is inside PE/COFF's
+    // [512, 65536] window and below the 4096 sectionAlignment, so neither the
+    // range rule nor the ordering rule fires. One error, and it is this one.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/optionalHeader/fileAlignment"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countWithMessage(r, "'fileAlignment' must be a positive"), 1u)
+        << rejectSummary(r);
+}
+
 // ── New tests folded from 7-agent review of LK2 cycle 2 ────────
 
 TEST(PeExecFormatJsonValidate, SectionAlignmentBelowPageSizeRejected) {

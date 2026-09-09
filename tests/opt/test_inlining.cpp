@@ -1736,7 +1736,17 @@ TEST(Inlining, IntrinsicCalleeIsNotInlined) {
                 foundCall = true;
                 auto const cops = mir.instOperands(id);
                 ASSERT_FALSE(cops.empty());
-                EXPECT_EQ(mir.globalAddrSymbol(cops[0]).v, 55u)
+                // ⚠ NOTHING ESTABLISHES THAT OPERAND 0 IS A `GlobalAddr`. A gate
+                // regression that let the callee arrive indirectly makes it a
+                // Load or a Phi, and the aborting `globalAddrSymbol` would then
+                // kill the binary on the very case this pins
+                // [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]].
+                auto const callee = mir.tryGlobalAddrSymbol(cops[0]);
+                ASSERT_TRUE(callee.has_value())
+                    << "the Call's operand 0 must be the callee's GlobalAddr, "
+                       "not an indirect value (it is a "
+                    << mnemonic(mir.instOpcode(cops[0])) << ")";
+                EXPECT_EQ(callee->v, 55u)
                     << "the surviving Call must target f (the intrinsic-bearing "
                        "callee), not the control h";
             }
@@ -2209,9 +2219,15 @@ TEST(Inlining, MultiBlockSingleReturnLeafElidesMergePhi) {
         // value, threaded straight to main's Return (no Phi indirection).
         EXPECT_EQ(mir.instOpcode(retVal), MirOpcode::Const)
             << "main must return the elided cloned Const, NOT a merge Phi";
-        EXPECT_EQ(std::get<std::int64_t>(
-                      mir.literalValue(mir.constLiteralIndex(retVal)).value),
-                  7)
+        // ⚠ THE TWIN, because the opcode line above is an `EXPECT`: it records
+        // and falls THROUGH, so on exactly the regression it reports (the merge
+        // Phi coming back) the aborting `constLiteralIndex` would kill this
+        // binary — no case name, and every sibling test in it losing its
+        // verdict [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]].
+        auto const retLit = mir.tryConstLiteralIndex(retVal);
+        ASSERT_TRUE(retLit.has_value())
+            << "main's returned value is not a Const, so it carries no literal";
+        EXPECT_EQ(std::get<std::int64_t>(mir.literalValue(*retLit).value), 7)
             << "the elided single-return value (7) must reach main's Return";
     }
 
@@ -2338,9 +2354,13 @@ TEST(Inlining, MultiBlockVoidLeafIsInlined) {
         ASSERT_TRUE(retVal.valid());
         EXPECT_EQ(mir.instOpcode(retVal), MirOpcode::Const)
             << "main must return its own Const, not a spliced/void value";
-        EXPECT_EQ(std::get<std::int64_t>(
-                      mir.literalValue(mir.constLiteralIndex(retVal)).value),
-                  0)
+        // ⚠ THE TWIN — same reason as `MultiBlockSingleReturnLeafElidesMergePhi`:
+        // a void-call splice that dropped main's own Const would be reported by
+        // the `EXPECT` above and then EXECUTED by the aborting reader.
+        auto const retLit = mir.tryConstLiteralIndex(retVal);
+        ASSERT_TRUE(retLit.has_value())
+            << "main's returned value is not a Const, so it carries no literal";
+        EXPECT_EQ(std::get<std::int64_t>(mir.literalValue(*retLit).value), 0)
             << "main returns its own Const 0 (the void call yields no value)";
     }
 
@@ -2900,7 +2920,21 @@ std::vector<MirInstId> phisInFuncBySymbol(Mir const& mir, std::uint32_t sym) {
 // here and compare the CLONE against it after.
 std::vector<std::int64_t> captureConstPhiValues(Mir const& m, MirInstId phi) {
     std::vector<std::int64_t> vs;
-    for (MirPhiIncoming const& inc : m.phiIncomings(phi)) {
+    // ⚠ THE TWIN, AND THIS HELPER IS WHY IT HAD TO EXIST. `phi` is a PARAMETER —
+    // nothing here establishes its opcode — and the function returns a value, so
+    // `ASSERT_*` (which expands to `return;`) will not even COMPILE here. Before
+    // the twin, the only fail-loud option was the aborting reader, i.e. killing
+    // the binary [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]]. `ADD_FAILURE` records
+    // the failure and lets every other case in this binary keep its verdict; the
+    // empty vector it returns cannot pass vacuously, because the caller compares
+    // it against a NON-EMPTY expected multiset.
+    auto const incs = m.tryPhiIncomings(phi);
+    if (!incs.has_value()) {
+        ADD_FAILURE() << "captureConstPhiValues was handed a non-Phi (a "
+                      << mnemonic(m.instOpcode(phi)) << ")";
+        return vs;
+    }
+    for (MirPhiIncoming const& inc : *incs) {
         if (m.instOpcode(inc.value) != MirOpcode::Const) continue;
         vs.push_back(std::get<std::int64_t>(
             m.literalValue(m.constLiteralIndex(inc.value)).value));
@@ -2929,7 +2963,17 @@ std::vector<std::int64_t> captureConstPhiValues(Mir const& m, MirInstId phi) {
 void assertConstArmedPhiClonePairing(
     Mir const& cloned, MirInstId clonePhi,
     std::vector<std::int64_t> const& srcConstVals) {
-    auto const cloneIncs = cloned.phiIncomings(clonePhi);
+    // ⚠ THE TWIN — `clonePhi` is a parameter, so its opcode is a CALLER promise
+    // rather than a fact established here, and the aborting reader would answer a
+    // broken promise with a dead binary
+    // [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]]. `ASSERT_*` is available (this
+    // helper is `void`) and is the right stop: with no incomings there is nothing
+    // left to assert.
+    auto const cloneIncsOpt = cloned.tryPhiIncomings(clonePhi);
+    ASSERT_TRUE(cloneIncsOpt.has_value())
+        << "the cloned callee phi is no longer a Phi (it is a "
+        << mnemonic(cloned.instOpcode(clonePhi)) << ")";
+    auto const cloneIncs = *cloneIncsOpt;
     ASSERT_EQ(cloneIncs.size(), srcConstVals.size())
         << "the cloned callee phi must have the SAME incoming count as the "
            "source callee phi";
@@ -3244,10 +3288,31 @@ Mir buildDiamondPhiModule(TypeInterner& interner, bool transpose,
 // iff the phi pairs `then`→7. A transposition flips this to `then`→9 while
 // the verifier stays green (both consts dominate from the entry).
 bool diamondPairingHolds(Mir const& m, MirInstId phi, MirBlockId thenB) {
-    for (MirPhiIncoming const& inc : m.phiIncomings(phi)) {
+    // ⚠ BOTH READS GO THROUGH THE TWINS, and this helper is the sharpest case for
+    // them [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]]. It returns `bool`, so
+    // `ASSERT_*` will not compile; `phi` is a parameter; and `inc.value` is an
+    // incoming, which a mis-splice can make ANY opcode. Both reads were therefore
+    // naked calls into a process abort. ⚠ AND THE `return false` IS NOT A SILENT
+    // SKIP: every path that gives up first records an `ADD_FAILURE`, so a
+    // wrong-opcode module reds by NAME instead of reading as "pairing does not
+    // hold" — which the caller would otherwise report as an ordinary transposition.
+    auto const incs = m.tryPhiIncomings(phi);
+    if (!incs.has_value()) {
+        ADD_FAILURE() << "diamondPairingHolds was handed a non-Phi (a "
+                      << mnemonic(m.instOpcode(phi)) << ")";
+        return false;
+    }
+    for (MirPhiIncoming const& inc : *incs) {
         if (inc.pred.v != thenB.v) continue;
-        std::int64_t const v = std::get<std::int64_t>(
-            m.literalValue(m.constLiteralIndex(inc.value)).value);
+        auto const lit = m.tryConstLiteralIndex(inc.value);
+        if (!lit.has_value()) {
+            ADD_FAILURE() << "the then-arm incoming is not a Const (it is a "
+                          << mnemonic(m.instOpcode(inc.value))
+                          << "), so the diamond carries no literal to pair";
+            return false;
+        }
+        std::int64_t const v =
+            std::get<std::int64_t>(m.literalValue(*lit).value);
         return v == 7;  // the `then` arm must carry 7 in the canonical intent
     }
     return false;
@@ -3786,8 +3851,17 @@ TEST(Inlining, CalleePhiCommonDominatorArmsPairedThroughInliner) {
     bool sawThen = false, sawElse = false;
     std::int64_t thenVal = 0, elseVal = 0;
     for (MirPhiIncoming const& inc : incs) {
+        // ⚠ THE TWIN — nothing above establishes that an incoming VALUE is a
+        // Const. The splice under test is exactly what decides that, so a clone
+        // that carried the callee's `Arg` across instead of the caller's Const
+        // would have killed this binary rather than named this case
+        // [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]].
+        auto const lit = mir.tryConstLiteralIndex(inc.value);
+        ASSERT_TRUE(lit.has_value())
+            << "every cloned phi incoming must be a Const (this one is a "
+            << mnemonic(mir.instOpcode(inc.value)) << ")";
         std::int64_t const v = std::get<std::int64_t>(
-            mir.literalValue(mir.constLiteralIndex(inc.value)).value);
+            mir.literalValue(*lit).value);
         if (inc.pred.v == arms.ifTrue.v)       { sawThen = true; thenVal = v; }
         else if (inc.pred.v == arms.ifFalse.v) { sawElse = true; elseVal = v; }
     }

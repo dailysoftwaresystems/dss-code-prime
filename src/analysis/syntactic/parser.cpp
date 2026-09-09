@@ -1413,21 +1413,12 @@ struct Parser::Impl {
     // NAMING — interner ids are assigned in alphabetical key order —
     // silently overriding the author's declared branch order whenever
     // two branches structurally accept the same input.
-    // `applyPrune` selects the candidate set's purpose:
-    //   true  → the SPECULATION set: the predictive prune is applied, so the
-    //           probe loop / unique-production descent only sees branches
-    //           whose FIRST_k can still match. This is the O(N) lever.
-    //   false → the STRUCTURAL set: only the 1-token FIRST gate + routing,
-    //           NO predictive prune. This is the set the all-fail fallback
-    //           REPLAY draws its declared-last diagnostic target from — the
-    //           replay deliberately runs a doomed branch for its precise
-    //           errors, so the prune (which removes branches that can't match
-    //           LATER tokens) must NOT strip the replay's target. Sourcing
-    //           the replay target from the pruned set would, for input that
-    //           every branch's FIRST_k rejects, leave the fallback with no
-    //           target and surface an opaque P_BacktrackFailed instead
-    //           (pinned by ParserSpeculation.BacktrackFailedAndRecoveryOn-
-    //           BogusInput).
+    // This is the SPECULATION set: the predictive prune is always applied, so
+    // the probe loop / unique-production descent only sees branches whose
+    // FIRST_k can still match. That is the O(N) lever. The STRUCTURAL set —
+    // the same enumeration WITHOUT the prune, which the alt's fallback reading
+    // is drawn from — is `lastStructuralCandidate_` below, and it returns one
+    // RuleId rather than a span precisely so that it needs no scratch slot.
     //
     // c97 (allocation-free hot path): returns a SPAN over a per-depth
     // SCRATCH buffer (`candidateScratch_[speculationDepth]`) instead of a
@@ -1435,16 +1426,16 @@ struct Parser::Impl {
     // precomputed schema span now, so a speculative token costs ZERO heap
     // allocations here after warmup. Scratch-lifetime contract: the span is
     // valid until the NEXT candidateBranches call at the SAME speculation
-    // depth. Both call sites honor it — the pruned set's last use (the
-    // probe loop) precedes the structural set's computation, and a nested
-    // probe's calls run at depth+1 (its SpeculationProbe increments
-    // `speculationDepth` first), hitting a different slot. The pool is
-    // sized ONCE (maxSpeculationDepth + 2 — the over-cap guard in
+    // depth. There is now exactly ONE call site per depth — the speculative
+    // AltChoice arm — because the structural set moved to
+    // `lastStructuralCandidate_`, which allocates and enumerates nothing into
+    // the pool; a nested probe's calls run at depth+1 (its SpeculationProbe
+    // increments `speculationDepth` first), hitting a different slot. The pool
+    // is sized ONCE (maxSpeculationDepth + 2 — the over-cap guard in
     // startNextCandidate_ bounds live depths) so inner buffers never move
     // while an outer span is live.
     [[nodiscard]] std::span<RuleId const>
-    candidateBranches(SchemaTokenId tokKind, std::size_t lookahead,
-                      bool applyPrune) {
+    candidateBranches(SchemaTokenId tokKind, std::size_t lookahead) {
         auto& out = candidateScratch_[
             speculationDepth < candidateScratch_.size()
                 ? speculationDepth
@@ -1455,14 +1446,51 @@ struct Parser::Impl {
             // O(1) FIRST gate (bitset) — an empty FIRST contains nothing,
             // so the former `.empty()` skip folds into the same test.
             if (!schema->firstSetContains(candidate, tokKind)) continue;
-            if (applyPrune && predictivePrefixPrunes(candidate, lookahead))
-                continue;
+            if (predictivePrefixPrunes(candidate, lookahead)) continue;
             const auto routed =
                 schema->routeToRuleLeaf(walker.cursor(), candidate);
             if (!routed.valid()) continue;
             out.push_back(candidate);
         }
         return out;
+    }
+
+    // The alt's FALLBACK READING: the DECLARED-LAST branch the 1-token FIRST
+    // gate and the routing check admit, WITHOUT the predictive prune. Invalid
+    // when the alt structurally admits nothing at this token.
+    //
+    // Two consumers, and they are the same decision taken at two moments.
+    // `finishFailedSpeculation_` REPLAYS this rule non-speculatively once every
+    // candidate has failed, so that the branch's own precise diagnostics land
+    // instead of an opaque P_BacktrackFailed; `finalCandidateDirectDescent_`
+    // takes that same reading BEFORE the last probe rather than after it. The
+    // prune is deliberately NOT applied to either: it removes branches that
+    // cannot match LATER tokens, and the fallback deliberately runs a doomed
+    // branch for its errors. Sourcing the target from the pruned set would, for
+    // input every branch's FIRST_k rejects, leave the fallback with no target
+    // at all (pinned by
+    // ParserSpeculation.BacktrackFailedAndRecoveryOnBogusInput).
+    //
+    // ★ IT RETURNS ONE RuleId AND TOUCHES NO SCRATCH SLOT, which is what makes
+    // a LIVE site's `candidates` span safe. This used to be a second
+    // `candidateBranches` call, and a second enumeration at the same depth
+    // rewrites the very buffer that span points at — tolerable while the only
+    // caller ran after the site was popped, and a trap for any caller that does
+    // not. `finalCandidateDirectDescent_` is exactly such a caller: it asks
+    // while its site is still on the stack. Computing only the LAST element
+    // removes the hazard rather than documenting it.
+    [[nodiscard]] RuleId
+    lastStructuralCandidate_(SchemaTokenId tokKind) const {
+        RuleId last{};
+        for (RuleId const candidate
+             : schema->altRuleBranches(walker.cursor())) {
+            if (!schema->firstSetContains(candidate, tokKind)) continue;
+            if (!schema->routeToRuleLeaf(walker.cursor(), candidate).valid()) {
+                continue;
+            }
+            last = candidate;
+        }
+        return last;
     }
 
     // True iff `candidate`'s LL(k) predictive prefix provably CANNOT match
@@ -1971,8 +1999,9 @@ struct Parser::Impl {
         // slot `candidateBranches` filled at this site's depth. Valid for the
         // site's whole life: the slot is only rewritten by a call at the SAME
         // depth, and while this site is live every nested call runs one probe
-        // deeper (the structural set the failure tail computes at this depth
-        // is computed only after the last candidate has been abandoned).
+        // deeper. The alt's FALLBACK READING is asked for while this site IS
+        // live (`finalCandidateDirectDescent_`), which is why
+        // `lastStructuralCandidate_` enumerates into no buffer at all.
         std::span<RuleId const>            candidates;
         std::size_t                        next = 0;      // next candidate to try
         RuleId                             branch{};      // the candidate under probe
@@ -2068,10 +2097,110 @@ struct Parser::Impl {
         specStack.pop_back();
     }
 
-    // The candidate under probe was abandoned: try the site's next one, or —
-    // with none left — pop the site and run the alt's failure tail.
+    // ★★★ FINAL-CANDIDATE DIRECT DESCENT — the alt's fallback reading is taken
+    // BEFORE its probe instead of after it
+    // (D-C-FILE-SCOPE-INFERRED-AUTO-MUST-LEAD-THE-DECLARATION-SPECIFIERS).
+    //
+    // At an OUTERMOST speculative alt whose earlier candidates have all been
+    // refused, the parser's next two moves are already decided: probe the last
+    // candidate, and — when it fails — REPLAY it non-speculatively so its own
+    // precise diagnostics land (`finishFailedSpeculation_`'s fallback). When
+    // that last candidate IS the alt's declared-last STRUCTURAL candidate, the
+    // two moves parse the SAME rule from the SAME token twice and only the
+    // second one can produce output. Descending into it directly collapses
+    // them: identical accept, identical diagnostics on failure, one parse
+    // instead of two. It is the same reasoning the `candidates.size() == 1`
+    // unique-production descent applies one candidate earlier — once nothing is
+    // left to disambiguate, the lookahead has already SELECTED the production.
+    //
+    // ⚠⚠ AND IT IS NOT MERELY A SAVING — IT REMOVES A REFUSAL THAT THE PROBE
+    // ITSELF CREATES. A probe carries a TOKEN BUDGET and the replay does not,
+    // so a construct larger than the budget is abandoned by the probe,
+    // `finishFailedSpeculation_` REPORTS the latched ceiling BEFORE it replays,
+    // and the replay then parses the construct correctly while the compile
+    // still exits 1 — a loud refusal of a program every reference accepts.
+    // ✔MEASURED on this tree through the shipped CLI at `topLevel`'s budget of
+    // 1024 (its default lookahead 8 × c's `parser.speculationBudgetFactor`
+    // 128): each of these ordinary C file-scope declarations was
+    // `error[P_SpeculationBudgetExhausted]` rc=1 BEFORE this change and rc=0
+    // after it, with a 3001-element initializer or a 1200-statement body —
+    //     const int big[] = {…};   volatile int big[] = {…};
+    //     _Atomic int big[] = {…};   [[maybe_unused]] int big[] = {…};
+    //     __attribute__((aligned(16))) int big[] = {…};
+    //     const int f(void) { … }
+    // — none of which has anything to do with the row this landed under. Each
+    // of those leads has `typedefDecl` as a SECOND candidate (a typedef may
+    // carry leading qualifiers and attributes), so the ordinary declaration
+    // that follows was the LAST candidate and was PROBED. Raising the budget
+    // was never the fix: a file-scope construct contains function definitions,
+    // an unbounded token class, so no finite number bounds it.
+    //
+    // THE FOUR GATES, each of which is what makes this the REPLAY rather than a
+    // new behaviour:
+    //   * `speculationDepth == 0` — the replay is depth-0-only, because at
+    //     depth > 0 the ENCLOSING probe still owns the failure and its rollback
+    //     is real. Committing there would let a reading the parser is about to
+    //     discard parse unbounded input whose only consumer is the discard,
+    //     which is the budget's whole job.
+    //   * the candidate must BE the declared-last STRUCTURAL candidate, i.e.
+    //     the replay's own target. The pruned set's last element is often a
+    //     DIFFERENT rule — on `(int)` the prune drops c `operand`'s `parenExpr`
+    //     so the last SURVIVOR is `castExpr` while the fallback READING stays
+    //     `parenExpr` — and descending into a rule the fallback would not have
+    //     replayed changes which diagnostics the author sees. That gate is also
+    //     what keeps the speculation ceilings reachable on a cast chain.
+    //   * no `commitRequiresTypeName` triage on it — that guard needs a probe
+    //     to roll back, exactly as the unique-production direct descent already
+    //     requires.
+    //   * no nullable tail — an alt that may legitimately SKIP must keep that
+    //     option, and committing forecloses it (D-PARSE-SPECULATIVE-OPTIONAL).
+    //
+    // The one-shot `(cursor, tokPos)` latch is the REPLAY's own, consulted here
+    // and set here: a descended branch that fails without net consumption
+    // unwinds to this same alt, and the second visit falls through to the probe
+    // and then to the `P_BacktrackFailed` forward-progress hatch exactly as it
+    // did before. A ceiling an EARLIER candidate latched is left alone for the
+    // same reason `commitCandidate_` leaves it alone — the alt RESOLVED through
+    // another reading, so blaming its outcome on a limit reached under a
+    // rejected one is the misattribution `speculationCapHit_` exists to
+    // prevent; the next depth-0 alt entry resets it.
+    //
+    // Fully generic: no token, rule or language is named.
+    [[nodiscard]] bool finalCandidateDirectDescent_() {
+        SpeculationSite& site = specStack.back();
+        if (site.next + 1 != site.candidates.size()) return false;
+        if (speculationDepth != 0) return false;
+        if (walker.nullableTail()) return false;
+        const RuleId last = site.candidates[site.next];
+        if (schema->typeNameCommitRule(last).valid()) return false;
+        const SchemaTokenId tokKind =
+            effectiveKind(tokens.peek(), identifierKind, errorKind);
+        if (lastStructuralCandidate_(tokKind) != last) return false;
+        if (replayedFallback_
+            && lastReplayCursor_ == walker.cursor()
+            && lastReplayTokPos_ == tokens.position()) {
+            return false;
+        }
+        replayedFallback_ = true;
+        lastReplayCursor_ = walker.cursor();
+        lastReplayTokPos_ = tokens.position();
+        specStack.pop_back();
+        if (schema->isExprRule(last)) {
+            prattWalker->walkExpression(*outer, last,
+                                        schema->exprMinPrecedence(last));
+        } else {
+            openExprFrame(last);
+        }
+        return true;
+    }
+
+    // The candidate under probe was abandoned: descend into the site's last
+    // candidate when that is the alt's fallback reading anyway, else try the
+    // site's next one, or — with none left — pop the site and run the alt's
+    // failure tail.
     void abandonAndAdvance_() {
         abandonCandidate_(specStack.back());
+        if (finalCandidateDirectDescent_()) return;
         if (startNextCandidate_(specStack.back())) return;
         specStack.pop_back();
         (void)finishFailedSpeculation_();
@@ -2172,16 +2301,14 @@ struct Parser::Impl {
         // e.g. `A X ;` where neither `A B ;` nor `A C ;` matches at offset
         // 1), but the fallback must still replay a branch to surface its
         // precise diagnostic instead of an opaque P_BacktrackFailed.
-        const auto structuralCandidates = candidateBranches(
-            tokKind, walker.lookahead(), /*applyPrune=*/false);
-        if (speculationDepth == 0 && !structuralCandidates.empty()
+        const RuleId fallback = lastStructuralCandidate_(tokKind);
+        if (speculationDepth == 0 && fallback.valid()
             && !(replayedFallback_
                  && lastReplayCursor_ == walker.cursor()
                  && lastReplayTokPos_ == tokens.position())) {
             replayedFallback_  = true;
             lastReplayCursor_  = walker.cursor();
             lastReplayTokPos_  = tokens.position();
-            const RuleId fallback = structuralCandidates.back();
             if (schema->isExprRule(fallback)) {
                 prattWalker->walkExpression(
                     *outer, fallback,
@@ -2554,8 +2681,7 @@ struct Parser::Impl {
                 // prune (k = the alt's declared lookahead) so doomed probes
                 // never run.
                 const auto candidates =
-                    candidateBranches(tokKind, walker.lookahead(),
-                                      /*applyPrune=*/true);
+                    candidateBranches(tokKind, walker.lookahead());
 
                 // LL(k) UNIQUE-PRODUCTION DIRECT DESCENT. When the
                 // predictive prune leaves EXACTLY ONE viable candidate and

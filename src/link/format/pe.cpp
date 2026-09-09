@@ -3595,9 +3595,42 @@ encodeExec(AssembledModule const&    module,
         // but it relocates at the Windows 64 KiB ALLOCATION GRANULARITY, and
         // every alignment this gate admits divides 65536. The slide is
         // therefore a multiple of `want`, so `(base + slide) + rva + pad` keeps
-        // the congruence computed here. ⓘ That also means the arithmetic is
+        // the congruence computed here.
+        //
+        // ⚠ THAT PARAGRAPH USED TO BE AN ARGUMENT AND IS NOW A MEASUREMENT,
+        // because the sibling format got the same argument wrong. ✔MEASURED
+        // (P65): `GetSystemInfo` on this host reports
+        // `dwAllocationGranularity = 65536` beside `dwPageSize = 4096` — the
+        // two are DIFFERENT numbers and only the larger one bounds an image
+        // relocation, which is the entire reason PE survives what Mach-O does
+        // not. `65536 % 8192 == 0`, and 8192 is the ceiling above. ✔AND THE
+        // OUTCOME, not only the mechanism: the shipped multi-object subject
+        // `examples/c/alignment_overaligned_static_placed` returns 42 TWENTY
+        // TIMES OUT OF TWENTY from an image whose header carries
+        // DllCharacteristics 0x8160 (DYNAMIC_BASE | HIGH_ENTROPY_VA). Twenty
+        // runs because the failure being ruled out is a coin flip on the
+        // loader's choice, and one run of a coin flip is not a measurement.
+        //
+        // ★★ THE CONTRAST THAT MAKES THIS WORTH STATING HERE:
+        // [[D-LINK-MACHO-IMAGE-OVERALIGNED-STATIC-IS-A-LOAD-TIME-COIN-FLIP]] is
+        // the same question answered the other way. Mach-O has no allocation
+        // granularity above its page and no segment alignment field, so dyld's
+        // slide destroys any above-page request and the Mach-O writer must
+        // REFUSE at `image.segmentPageSize`. PE places what Mach-O refuses, and
+        // the difference is a documented OS constant rather than a policy.
+        //
+        // ⓘ That also means the arithmetic is
         // correct for ANY declared `imageBase`, aligned or not — the pad is
-        // solved against the actual VA rather than assumed away.
+        // solved against the actual VA rather than assumed away. ⚠ AND THAT IS
+        // THE PROPERTY WITH NO PIN OF ITS OWN, stated so it is not rediscovered
+        // the hard way: every shipped `imageBase` (0x140000000, 0x180000000) is
+        // a multiple of 65536 and therefore of every encodable alignment, so
+        // solving the pad against the RVA ALONE would be green on the whole
+        // corpus — and that is precisely the shape of the ELF defect
+        // [[D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET]],
+        // where a DECLARED address silently decided whether an object landed
+        // where it asked. `vaCursor` starts from `oh.imageBase` for that reason
+        // and must keep doing so.
         auto const alignSectionHeadToItems =
             [&](link::format::ExecDataSectionLayout& layout, bool present,
                 bool fileBacked, std::uint64_t& vaCursor) {
