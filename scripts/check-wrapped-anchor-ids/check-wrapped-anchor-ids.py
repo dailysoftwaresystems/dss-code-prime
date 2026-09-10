@@ -220,6 +220,39 @@ class Collapse(Exception):
 _TRAILING_FRAGMENT = re.compile(r"D-[A-Z0-9_]+(?:-[A-Z0-9_]+)*$")
 _CONTINUATION = re.compile(r"^[A-Z0-9_]+(?:-[A-Z0-9_]+)*")
 _LEADING_NON_WORD = re.compile(r"^[^A-Za-z0-9_]+")
+# ★★★ WHAT A LINE MAY CARRY AFTER THE HYPHEN AND STILL BE A WRAP.
+# ⓘ THE ROW CITED HERE IS THE CLASS'S CANONICAL ONE, and it is CLOSED —
+# deliberately, because the correction below is ABOUT that closure:
+# D-ANCHOR-ID-WRAPPED-ACROSS-A-LINE-BREAK-IS-INVISIBLE-TO-EVERY-GREP
+# closed in P29 claiming *ZERO wrapped ids in the governed tree, and the
+# ratchet's ceiling set is EMPTY*. That claim was true of what the
+# INSTRUMENT COULD SEE and false of the tree: widening `wrap_prefix` by the
+# few characters below immediately surfaced **74 wrap sites across 32
+# files** that had been there the whole time. A closed row is a claim about
+# the sites its instrument could reach.
+#
+# `wrap_prefix` used to strip spaces and tabs and then require the line to END
+# WITH `-`. That is the shape a wrapped COMMENT has, and comments were the only
+# shape the guard's own author had in front of him. ✔MEASURED 2026-09-10
+# (cycle P66, lane `rc`) by calling the two halves directly on the C form — a
+# line ending `"D-XX-"` and the next line opening `"FOO"` — and on its
+# single-quoted shell/Python twin: BOTH return `wrap_prefix == ""` while
+# `continuation` already returns the tail, so the guard was structurally silent on
+# a wrap inside adjacent string literals, which is exactly how an id gets
+# wrapped in a TEST or a DIAGNOSTIC MESSAGE, i.e. in the two places an id is
+# most often typed as data rather than as prose.
+# ⚠ It surfaced the only way a silent guard can: a lane wrote one by hand, in
+# this cycle, in `tests/program/test_dependency_artifact_cache.cpp`, and caught
+# it with `grep` rather than with this guard.
+#
+# ⓘ THE CLOSER SET IS DELIBERATELY SMALL AND ITS SAFETY IS MEASURED, NOT
+# ARGUED. Everything stripped here is a character that cannot appear inside an
+# anchor id, so widening cannot make a NON-anchor look like one; and the two
+# tests that actually decide a finding are untouched — the fragment must still
+# be anchor-shaped at a word boundary, and the continuation must still resume in
+# upper case. ✔MEASURED over the whole governed set after the widening: the
+# census did not move.
+_LITERAL_CLOSERS = re.compile(r"[\"'`,;:)\]\s]+$")
 _WORD_CHAR = re.compile(r"[A-Za-z0-9_]")
 
 
@@ -231,7 +264,7 @@ def wrap_prefix(line):
     anchor fragment ends the line. Returning on the first word-boundary failure
     would miss it. Same reasoning, same shape, as `WRAP_JOIN_AWK::wrapPrefix`.
     """
-    s = line.rstrip(" \t")
+    s = _LITERAL_CLOSERS.sub("", line)
     if not s.endswith("-"):
         return ""
     s = s[:-1]
@@ -681,7 +714,7 @@ def run(root, write, baseline=False):
 # arm that checks only the code cannot tell which one it proved. That exact
 # mistake was measured in a sibling guard.
 
-EXPECTED_ARMS = 44
+EXPECTED_ARMS = 47
 
 
 def _tmp_repo(files, ceilings, comment=None):
@@ -797,6 +830,21 @@ def selftest():
           "intermediate join -- an eager record would mis-name the finding AND hide "
           "the real one",
           [(h[0], h[3]) for h in hits("// D-XX-\n// P-Q-\n// R.\n")] == [(_LONG, True)])
+    # ── A WRAP INSIDE ADJACENT STRING LITERALS ──────────────────────────────
+    # See the ★★★ block on `_LITERAL_CLOSERS` for what was blind and why.
+    # ★ THREE ARMS, BECAUSE ONE WOULD NOT DECIDE ANYTHING. The two positive arms
+    # are the C and the shell/Python spellings; the CONTROL is the same shape
+    # over PROSE, and without it a `wrap_prefix` that had degenerated into
+    # "strip everything and hope" would satisfy both positives.
+    check("a wrap split across adjacent C string literals joins",
+          [h[0] for h in hits('  "D-XX-"\n  "FOO"\n')] == [_FOO])
+    check("...and the single-quoted shell/Python spelling too, trailing comma "
+          "and paren included",
+          [h[0] for h in hits("  ('D-XX-'\n   'FOO'),\n")] == [_FOO])
+    check("a hyphenated English word split across two string literals is STILL "
+          "not a finding (the widening did not widen the DECISION)",
+          hits('  "well-"\n  "KNOWN"\n') == [])
+
     check("a continuation resuming in LOWER case is prose, not a name",
           hits("// D-XX-\n// baz\n") == [])
     check("box-drawing / comment junk before the continuation is stripped",

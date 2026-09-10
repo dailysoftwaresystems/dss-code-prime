@@ -473,6 +473,34 @@ run_gate_contention_exit=4
 run_gate_build_dir=""
 run_gate_contention_note=""
 
+# ── THE TWO IMAGE SETS, EACH SPELLED ONCE ───────────────────────────────────
+#
+# ⚠ The build-tool list used to live inside the awk candidate filter and nowhere
+# else. It now has a SECOND reader — the ancestor walk below asks whether one of
+# OUR OWN ancestors is a build tool — so it moved out here rather than being
+# typed twice. A second spelling of this set would not fail: it would quietly
+# classify one process differently in the two places.
+run_gate_build_tools="ctest ninja cmake make gmake msbuild"
+
+# ★★★ THE COMPILER'S OWN IMAGE, AND WHY IT IS A SECOND SUBJECT RATHER THAN A
+# SEVENTH BUILD TOOL. [[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]
+#
+# ✔MEASURED 2026-09-10 (cycle P66): two corpus examples went red inside an
+# otherwise 2172/2174 run because a SECOND `dsscp` on the machine deleted a
+# cache entry this run had been handed the path to — and this wrapper printed
+# `contended: no`, which was TRUE (nothing else named the build directory) and
+# useless (the resource actually shared lives in `%LOCALAPPDATA%`, outside both
+# `srctree` and `builddir`).
+#
+# ⚠ IT IS NOT ADDED TO `run_gate_build_tools`, AND THE DIFFERENCE IS NOT
+# COSMETIC. A build tool is matched only when its ARGV NAMES THIS BUILD
+# DIRECTORY, and `dsscp` has no such argument to name — the cache it contends
+# for is per-USER, so the subject is the MACHINE and the verdict is a different
+# sentence. Folding it into the same list would have made every `dsscp` on the
+# host either invisible (it names no build dir) or a build-directory contender
+# (a claim that is simply false).
+run_gate_compiler_image="dsscp"
+
 run_gate_is_windows() {
     case "$(uname -s 2>/dev/null || echo unknown)" in
         MINGW*|MSYS*|CYGWIN*) return 0 ;;
@@ -598,7 +626,7 @@ run_gate_self_pid() {
 # `"C:\Program Files\CMake\bin\cmake.exe" --build build/hg --parallel 6`, so a
 # split on whitespace alone tears the program path in half.
 run_gate_candidates_from_table() {
-    awk -F'\t' '
+    awk -F'\t' -v tools=" $run_gate_build_tools " '
         function tokenize(line,   i, c, n, inq, cur) {
             n = 0; inq = 0; cur = ""
             for (i = 1; i <= length(line); i++) {
@@ -613,7 +641,7 @@ run_gate_candidates_from_table() {
         {
             pid = $1; img = tolower($3); cl = $4
             sub(/\.exe$/, "", img)
-            if (img != "ctest" && img != "ninja" && img != "cmake" && img != "make" && img != "gmake" && img != "msbuild") next
+            if (index(tools, " " img " ") == 0) next
             if (cl == "") { print "UNREADABLE\t" pid "\t" img; next }
             n = tokenize(cl)
             for (i = 1; i <= n; i++) {
@@ -630,12 +658,62 @@ run_gate_candidates_from_table() {
         }'
 }
 
+# Every live `dsscp` that is NOT part of THIS gate's own process tree, one row:
+#   pid <TAB> image <TAB> command-line
+#
+# ★★★ THE DISCRIMINATOR IS DESCENT, AND THE NAIVE VERSION IS USELESS. This
+# gate's own `ctest` spawns hundreds of `dsscp` children, so *any live dsscp*
+# would report on every run — the mirror image of
+# [[feedback-an-escape-every-row-triggers-disarms-the-guard]], a signal that
+# fires unconditionally and therefore carries nothing.
+#
+# ⚠ AND "OURS" IS BOUNDED, DELIBERATELY, BECAUSE THE OBVIOUS DEFINITION
+# DISARMS THE CHECK IN THE OTHER DIRECTION. *Descends from any ancestor of
+# mine* sounds right and is not: an ancestor chain that reaches a login shell,
+# a session manager or `explorer.exe` makes EVERY process on the host a
+# descendant of one of my ancestors, and the check then reports nothing, ever.
+# ⇒ `own` is THIS SHELL, plus the ancestor chain UP TO AND INCLUDING THE
+# OUTERMOST ANCESTOR THAT IS A BUILD TOOL. With no build-tool ancestor it is
+# this shell alone. That covers the one case that needs covering — a gate
+# invoked from INSIDE a `ctest`, which this repository does register, whose
+# sibling `dsscp` processes belong to the same logical run — and it cannot
+# widen past the build machinery no matter how the caller was launched.
+#
+# ⓘ ONE awk PASS, not a shell loop calling awk per ancestor: awk builds the
+# pid → ppid map itself. The shell version was O(processes x depth) subshells
+# on a table this file already measured at 534 rows.
+run_gate_foreign_from_table() {   # <own-pid-list>
+    awk -F'\t' -v own="$1" -v want="$run_gate_compiler_image" '
+        BEGIN { n = split(own, o, " "); for (i = 1; i <= n; i++) if (o[i] != "") OWN[o[i]] = 1 }
+        { par[$1] = $2; nm[$1] = $3; cl[$1] = $4; order[++k] = $1 }
+        END {
+            for (i = 1; i <= k; i++) {
+                p = order[i]
+                m = tolower(nm[p]); sub(/\.exe$/, "", m)
+                if (m != want) continue
+                a = p; d = 0; ours = 0
+                while (a != "" && d < 24) {
+                    if (a in OWN) { ours = 1; break }
+                    if (!(a in par)) break
+                    a = par[a]; d++
+                }
+                if (ours) continue
+                print p "\t" nm[p] "\t" cl[p]
+            }
+        }'
+}
+
 # The refusal text, shared by the pre-run and post-run arms so the two cannot
 # drift into describing the same fact differently.
 run_gate_contenders="" ; run_gate_unreadable=0 ; run_gate_table_ok=0 ; run_gate_relative_match=0
-run_gate_scan_contention() {   # sets run_gate_contenders / run_gate_unreadable / run_gate_table_ok
+run_gate_foreign="" ; run_gate_foreign_count=0
+run_gate_scan_contention() {   # sets run_gate_contenders / run_gate_unreadable / run_gate_table_ok / run_gate_foreign
     run_gate_contenders=""; run_gate_unreadable=0; run_gate_table_ok=0; run_gate_relative_match=0
-    [ -n "$run_gate_build_dir" ] || return 0
+    run_gate_foreign=""; run_gate_foreign_count=0
+    # ⚠ NO EARLY RETURN ON AN UNNAMED BUILD DIRECTORY ANY MORE. This function
+    # now answers TWO questions, and only the first one has the build directory
+    # as its subject; `run-gate.sh <log> <witness> bash -c …` names no build
+    # directory and can still be sharing a machine with another compiler.
     _rg_tbl="$(run_gate_process_table)" || return 0
     [ -n "$_rg_tbl" ] || return 0
     run_gate_table_ok=1
@@ -643,18 +721,40 @@ run_gate_scan_contention() {   # sets run_gate_contenders / run_gate_unreadable 
     # OUR OWN ANCESTORS ARE NOT CONTENDERS. A gate legitimately invoked from
     # inside a `ctest` (this repository registers guards that way) would
     # otherwise refuse itself the moment it named the same tree.
+    # ⓘ TWO SETS COME OUT OF ONE WALK. `_rg_exclude` is every ancestor — the
+    # build-directory question asks *did I name this myself*, and any ancestor
+    # of mine did. `_rg_own` is the BOUNDED prefix documented on
+    # `run_gate_foreign_from_table`, because the machine-wide question asks
+    # *is this process part of my run*, which a login shell three levels up
+    # does not make true.
     _rg_self="$(run_gate_self_pid)"
     _rg_exclude=""
+    _rg_own=""
     if [ -n "$_rg_self" ]; then
-        _rg_walk="$_rg_self"; _rg_depth=0
+        _rg_walk="$_rg_self"; _rg_depth=0; _rg_chain=""; _rg_own=" $_rg_self"
         while [ -n "$_rg_walk" ] && [ "$_rg_depth" -lt 24 ]; do
             _rg_exclude="$_rg_exclude $_rg_walk"
+            _rg_chain="$_rg_chain $_rg_walk"
+            _rg_aimg="$(printf '%s\n' "$_rg_tbl" | awk -F'\t' -v p="$_rg_walk" '$1 == p { print tolower($3); exit }')"
+            _rg_aimg="${_rg_aimg%.exe}"
+            case " $run_gate_build_tools " in
+                *" $_rg_aimg "*) _rg_own="$_rg_chain" ;;
+            esac
             _rg_walk="$(printf '%s\n' "$_rg_tbl" | awk -F'\t' -v p="$_rg_walk" '$1 == p { print $2; exit }')"
             _rg_depth=$((_rg_depth + 1))
         done
     else
-        run_gate_contention_note="ancestry: UNRESOLVED (this shell's pid was not found in the process table; nothing was excluded)"
+        run_gate_contention_note="ancestry: UNRESOLVED (this shell's pid was not found in the process table; nothing was excluded, and every live compiler reads as external)"
     fi
+
+    # THE MACHINE-WIDE SUBJECT. Asked whether or not a build directory was
+    # named, and never fatal — see the footer for why.
+    run_gate_foreign="$(printf '%s\n' "$_rg_tbl" | run_gate_foreign_from_table "$_rg_own")"
+    if [ -n "$run_gate_foreign" ]; then
+        run_gate_foreign_count="$(printf '%s\n' "$run_gate_foreign" | grep -c . || true)"
+    fi
+
+    [ -n "$run_gate_build_dir" ] || return 0
 
     _rg_cands="$(printf '%s\n' "$_rg_tbl" | run_gate_candidates_from_table)"
     run_gate_unreadable="$(printf '%s\n' "$_rg_cands" | grep -c '^UNREADABLE' || true)"
@@ -1011,10 +1111,39 @@ run_gate_scan_contention
             echo "contended: YES, ANOTHER RUN WAS LIVE IN IT — this verdict is not evidence"
             printf '%s' "$run_gate_contenders"
         elif [ "$run_gate_table_ok" -eq 1 ]; then
-            echo "contended: no (this run was alone in it; $run_gate_unreadable candidate process(es) had no readable command line and could not be judged)"
+            # ⚠ THE WORDING IS NARROWED, AND THE OLD ONE WAS NOT WRONG — IT WAS
+            # OVER-READ, WHICH IS WORSE. It said "this run was alone in it", and
+            # "it" is the BUILD DIRECTORY, which was true of the run that took
+            # two false reds from a second compiler. A line that is true and
+            # invites the wrong conclusion costs more than one that is false,
+            # because nobody re-checks it. The subject is now named in the
+            # sentence, and the machine-wide subject has a line of its own.
+            echo "contended: no — no other build-tool run named THIS BUILD DIRECTORY ($run_gate_unreadable candidate process(es) had no readable command line and could not be judged). ⚠ This says NOTHING about the rest of the machine; see 'compilers:' below."
         else
             echo "contended: UNKNOWN — no process table could be read on this host, so nothing was ruled out"
         fi
+    fi
+    # ★★★ THE MACHINE-WIDE SUBJECT, ON EVERY RUN, GREEN OR NOT, AND WITH OR
+    # WITHOUT A BUILD DIRECTORY. [[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]
+    #
+    # ⚠ IT REPORTS AND DOES NOT REFUSE, and that is a decision rather than
+    # timidity. `exit 4` means THIS RUN HAS NO VERDICT, and a second compiler
+    # no longer takes one away: the mechanism that made it do so — a store
+    # deleting a cache entry it could not prove was dead — is gone in the same
+    # change that added this line. What is left is real but weaker (CPU, a
+    # shared cache being warmed under us), and refusing on it would refuse
+    # EVERY gate of a project whose own working rule is up to four lanes
+    # building in parallel — a refusal that fires on every honest run, which is
+    # exactly as useless as an escape that does.
+    # ⇒ The line exists so that the NEXT unexplained red has this fact in its
+    # log instead of needing an operator to remember they had a shell open.
+    if [ "$run_gate_table_ok" -ne 1 ]; then
+        echo "compilers: UNKNOWN — no process table could be read on this host"
+    elif [ "$run_gate_foreign_count" -eq 0 ]; then
+        echo "compilers: none outside this gate's own process tree"
+    else
+        echo "compilers: $run_gate_foreign_count live '$run_gate_compiler_image' process(es) OUTSIDE this gate's process tree — they share this user's compiler caches with this run, which are NOT under srctree or builddir"
+        printf '%s\n' "$run_gate_foreign" | sed 's/^/          /'
     fi
     [ -n "$run_gate_contention_note" ] && echo "$run_gate_contention_note"
 } >> "$log"

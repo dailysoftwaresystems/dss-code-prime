@@ -516,12 +516,47 @@ function Get-RunGateProcessTable {
     } catch { return @() }
 }
 
+# ── THE TWO IMAGE SETS, EACH SPELLED ONCE (twin of run-gate.sh) ─────────────
+#
+# [!] The build-tool list gained a SECOND reader when the ancestor walk started
+# asking whether one of OUR OWN ancestors is a build tool, so it is a variable
+# rather than two literals. A second spelling would not fail; it would classify
+# one process differently in the two places.
+$script:RunGateBuildTools = @('ctest', 'ninja', 'cmake', 'make', 'gmake', 'msbuild')
+
+# ★★★ THE COMPILER'S OWN IMAGE, AND WHY IT IS A SECOND SUBJECT RATHER THAN A
+# SEVENTH BUILD TOOL.
+# D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT
+#
+# +MEASURED 2026-09-10 (cycle P66): two corpus examples went red inside an
+# otherwise 2172/2174 run because a SECOND `dsscp` on the machine deleted a
+# cache entry this run had been handed the path to - and this wrapper printed
+# `contended: no`, which was TRUE (nothing else named the build directory) and
+# useless (the shared resource lives in %LOCALAPPDATA%, outside both srctree
+# and builddir).
+#
+# [!] It is NOT in the build-tool list. A build tool is matched only when its
+# ARGV NAMES THIS BUILD DIRECTORY, and `dsscp` has no such argument: the cache
+# it contends for is per-USER, so the subject is the MACHINE and the verdict is
+# a different sentence.
+$script:RunGateCompilerImage = 'dsscp'
+
+# The image name as the tables spell it, lowercased with any `.exe` removed.
+function Get-RunGateImageKey([string]$Name) {
+    $i = $Name.ToLowerInvariant()
+    if ($i.EndsWith('.exe')) { $i = $i.Substring(0, $i.Length - 4) }
+    return $i
+}
+
 function Get-RunGateContention {
     $script:RunGateContenders    = @()
     $script:RunGateUnreadable    = 0
     $script:RunGateTableOk       = $false
     $script:RunGateRelativeMatch = $false
-    if (-not $script:RunGateBuildDir) { return }
+    $script:RunGateForeign       = @()
+    $script:RunGateForeignCount  = 0
+    # [!] NO EARLY RETURN ON AN UNNAMED BUILD DIRECTORY. This function answers
+    # TWO questions and only the first has the build directory as its subject.
     $table = Get-RunGateProcessTable
     if ($table.Count -eq 0) { return }
     $script:RunGateTableOk = $true
@@ -529,22 +564,54 @@ function Get-RunGateContention {
     # OUR OWN ANCESTORS ARE NOT CONTENDERS. A gate legitimately invoked from
     # inside a `ctest` (this repository registers guards that way) would
     # otherwise refuse itself the moment it named the same tree.
+    # (i) TWO SETS COME OUT OF ONE WALK. `$exclude` is every ancestor - the
+    # build-directory question asks *did I name this myself*. `$own` is the
+    # BOUNDED prefix: this process, plus the chain UP TO AND INCLUDING THE
+    # OUTERMOST BUILD-TOOL ANCESTOR.
+    #
+    # [!] THE BOUND IS THE WHOLE POINT AND ITS ABSENCE DISARMS THE CHECK.
+    # *Descends from any ancestor of mine* sounds right and is not: a chain
+    # that reaches a login shell or a session manager makes EVERY process on
+    # the host a descendant of one of my ancestors, and the check then reports
+    # nothing, ever.
     $byId = @{}
     foreach ($r in $table) { if (-not $byId.ContainsKey($r.ProcId)) { $byId[$r.ProcId] = $r } }
     $exclude = @{}
+    $own = @{ $PID = $true }
+    $chain = @($PID)
     $walk = $PID; $depth = 0
     while ($walk -and $depth -lt 24) {
         $exclude[$walk] = $true
         if (-not $byId.ContainsKey($walk)) { break }
+        if ($script:RunGateBuildTools -contains (Get-RunGateImageKey $byId[$walk].Image)) {
+            foreach ($c in $chain) { $own[$c] = $true }
+        }
         $walk = $byId[$walk].ParentId
         $depth++
+        if ($walk) { $chain += $walk }
     }
 
-    $tools = @('ctest', 'ninja', 'cmake', 'make', 'gmake', 'msbuild')
+    # THE MACHINE-WIDE SUBJECT. Asked whether or not a build directory was
+    # named, and never fatal - see the footer for why.
     foreach ($r in $table) {
-        $img = $r.Image.ToLowerInvariant()
-        if ($img.EndsWith('.exe')) { $img = $img.Substring(0, $img.Length - 4) }
-        if ($tools -notcontains $img) { continue }
+        if ((Get-RunGateImageKey $r.Image) -ne $script:RunGateCompilerImage) { continue }
+        $a = $r.ProcId; $d = 0; $ours = $false
+        while ($a -and $d -lt 24) {
+            if ($own.ContainsKey($a)) { $ours = $true; break }
+            if (-not $byId.ContainsKey($a)) { break }
+            $a = $byId[$a].ParentId
+            $d++
+        }
+        if ($ours) { continue }
+        $script:RunGateForeignCount++
+        $script:RunGateForeign += "          $($r.ProcId)`t$($r.Image)`t$($r.CmdLine)"
+    }
+
+    if (-not $script:RunGateBuildDir) { return }
+
+    foreach ($r in $table) {
+        $img = Get-RunGateImageKey $r.Image
+        if ($script:RunGateBuildTools -notcontains $img) { continue }
         if (-not $r.CmdLine) { $script:RunGateUnreadable++; continue }
         if ($exclude.ContainsKey($r.ProcId)) { continue }
         foreach ($raw in (Get-RunGateDirsInTokens $img (Split-RunGateCommandLine $r.CmdLine))) {
@@ -915,10 +982,36 @@ if (-not $script:RunGateBuildDir) {
         Add-Content -LiteralPath $LogPath -Value "contended: YES, ANOTHER RUN WAS LIVE IN IT - this verdict is not evidence"
         foreach ($l in $script:RunGateContenders) { Add-Content -LiteralPath $LogPath -Value $l }
     } elseif ($script:RunGateTableOk) {
-        Add-Content -LiteralPath $LogPath -Value "contended: no (this run was alone in it; $($script:RunGateUnreadable) candidate process(es) had no readable command line and could not be judged)"
+        # [!] THE WORDING IS NARROWED, AND THE OLD ONE WAS NOT WRONG - IT WAS
+        # OVER-READ, WHICH IS WORSE. It said "this run was alone in it", and
+        # "it" is the BUILD DIRECTORY, which was true of the run that took two
+        # false reds from a second compiler. A line that is true and invites the
+        # wrong conclusion costs more than one that is false, because nobody
+        # re-checks it.
+        Add-Content -LiteralPath $LogPath -Value "contended: no - no other build-tool run named THIS BUILD DIRECTORY ($($script:RunGateUnreadable) candidate process(es) had no readable command line and could not be judged). [!] This says NOTHING about the rest of the machine; see 'compilers:' below."
     } else {
         Add-Content -LiteralPath $LogPath -Value "contended: UNKNOWN - no process table could be read on this host, so nothing was ruled out"
     }
+}
+# ★★★ THE MACHINE-WIDE SUBJECT, ON EVERY RUN, GREEN OR NOT, AND WITH OR WITHOUT
+# A BUILD DIRECTORY.
+# D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT
+#
+# [!] IT REPORTS AND DOES NOT REFUSE, and that is a decision rather than
+# timidity. `exit 4` means THIS RUN HAS NO VERDICT, and a second compiler no
+# longer takes one away: the mechanism that made it do so - a store deleting a
+# cache entry it could not prove was dead - is gone in the same change that
+# added this line. What is left is real but weaker (CPU, a shared cache warmed
+# under us), and refusing on it would refuse EVERY gate of a project whose own
+# working rule is up to four lanes building in parallel - a refusal that fires
+# on every honest run, which is exactly as useless as an escape that does.
+if (-not $script:RunGateTableOk) {
+    Add-Content -LiteralPath $LogPath -Value "compilers: UNKNOWN - no process table could be read on this host"
+} elseif ($script:RunGateForeignCount -eq 0) {
+    Add-Content -LiteralPath $LogPath -Value "compilers: none outside this gate's own process tree"
+} else {
+    Add-Content -LiteralPath $LogPath -Value "compilers: $($script:RunGateForeignCount) live '$($script:RunGateCompilerImage)' process(es) OUTSIDE this gate's process tree - they share this user's compiler caches with this run, which are NOT under srctree or builddir"
+    foreach ($l in $script:RunGateForeign) { Add-Content -LiteralPath $LogPath -Value $l }
 }
 
 # Checked BEFORE rc, and before the witness: a run whose inputs moved has no

@@ -198,6 +198,42 @@ na() {  # <label> <reason>
 #     a `/usr/bin/...` path is not something `ctest` can spawn.
 BASH_W="$BASH"
 if command -v cygpath >/dev/null 2>&1; then BASH_W="$(cygpath -m "$BASH")"; fi
+
+# ── A STAND-IN COMPILER, AND IT IS A COPY OF `sleep` RATHER THAN THE REAL ONE ─
+#
+# The subject matches on the process IMAGE NAME, so a copy of any long-lived
+# program named `dsscp` is exactly as good a subject as the compiler and costs
+# no build. ⚠ Running the REAL `dsscp` here would be actively wrong: it writes
+# to the per-user cache this whole subject is about, so the fixture would
+# perturb the machine it is measuring.
+# ⓘ `.exe` on MSYS because that is the name Win32 reports and the matcher
+# strips; a bare name elsewhere. `$STUB` is empty when no `sleep` binary can be
+# copied, and the arms below then report NOT APPLICABLE rather than skipping.
+STUB=""
+STUB_W=""
+if _rg_sleep="$(command -v sleep 2>/dev/null)" && [ -x "$_rg_sleep" ]; then
+    mkdir -p "$SCRATCH/bin"
+    if run_gate_host_is_windows; then STUB="$SCRATCH/bin/dsscp.exe"; else STUB="$SCRATCH/bin/dsscp"; fi
+    if cp "$_rg_sleep" "$STUB" 2>/dev/null; then
+        chmod +x "$STUB" 2>/dev/null || true
+        STUB_W="$STUB"
+        if command -v cygpath >/dev/null 2>&1; then STUB_W="$(cygpath -m "$STUB")"; fi
+    else
+        STUB=""
+    fi
+fi
+STUB_ABSENT_WHY="no 'sleep' binary could be copied to a stand-in named after the compiler, so no live-compiler subject could be created on this host"
+
+# A stand-in compiler with NO RESOLVABLE ANCESTRY — the shape a compiler started
+# from another terminal has, as seen from here.
+# ⚠ THE ORPHANING IS THE FIXTURE, NOT AN ACCIDENT. The inner shell exits
+# immediately, so the stub's recorded parent is gone before the scan runs and
+# the subject's upward walk stops at a pid that is not in the table. ✔MEASURED
+# on MSYS: that is also what a background job started from ANY shell looks like
+# here, because MSYS's fork/exec emulation leaves a transient parent behind.
+plant_foreign_compiler() {  # <seconds>
+    bash -c "nohup '$STUB' $1 >/dev/null 2>&1 &"
+}
 mk_ctest_dir() {  # <dir> <fast|slow>
     mkdir -p "$1"
     if [ "$2" = slow ]; then
@@ -677,6 +713,119 @@ else
     na 20-ps1-backdated-change-refuses  "$PS_ABSENT_WHY -- the .ps1 twin was never shown a change wearing an old timestamp"
     na 21-ps1-future-stamped-bystander  "$PS_ABSENT_WHY -- the .ps1 twin's future-stamped-bystander CONTROL was not taken"
     na 22-parity                        "$PS_ABSENT_WHY -- arms 18 and 19 still prove the .sh twin ignores timestamp order, but the twins were NOT compared"
+fi
+
+# ═══ THE FIFTH SUBJECT: A COMPILER RUNNING OUTSIDE THIS GATE'S PROCESS TREE ══
+#
+# [[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]
+# ✔MEASURED 2026-09-10 (P66): two corpus examples went red inside an otherwise
+# 2172/2174 run because a second `dsscp` deleted a cache entry the run had been
+# handed the path to — and run-gate printed `contended: no`, a sentence that was
+# TRUE of the build directory and silent about the machine. The resource shared
+# is a PER-USER cache under `%LOCALAPPDATA%`, outside both `srctree` and
+# `builddir`, so no subject this wrapper already had could see it.
+#
+# ★★★ THE THREE ARMS ARE A SET AND NONE OF THEM MEANS ANYTHING ALONE.
+#   · the DESCENDANT arm proves the check is not "any live dsscp", which would
+#     fire on every gate this project runs (its own ctest spawns hundreds);
+#   · the FOREIGN arm proves it is not permanently silent — and it is also the
+#     descendant arm's control, because a matcher that recognised nothing would
+#     satisfy the descendant arm perfectly;
+#   · the CONTROL arm (arms 1 and 7 already carry the line) proves it says
+#     "none" when there is nothing to say.
+# Run in that order so the foreign arm's orphan cannot be alive during the
+# descendant arm.
+
+if [ -n "$STUB" ]; then
+    # ---- ARM 23 (sh) A DESCENDANT COMPILER MUST NOT BE REPORTED -------------
+    # The fixture is a REAL ctest running two tests concurrently: the stub, and
+    # a nested run-gate. Both are children of that ctest, so the stub is inside
+    # the gate's own process tree through a BUILD-TOOL ancestor — the one case
+    # the bounded "own" set exists to cover, and the shape a guard registered as
+    # a ctest test really has in this repository.
+    # ⚠ IT CANNOT BE BUILT AS "the gate command backgrounds a child": the scans
+    # run BEFORE and AFTER the command, so such a child is either not yet born
+    # or already orphaned. ✔MEASURED — an orphaned child reads as FOREIGN, which
+    # is the fail-toward-reporting direction and is what arm 24 relies on.
+    mkdir -p "$SANDBOX/bd-nested"
+    {
+        printf 'add_test(busy "%s" "8")\n' "$STUB_W"
+        printf 'add_test(gate "%s" "%s" "%s" "HELLO" "%s" "-c" "echo HELLO")\n' \
+            "$BASH_W" "$(gate_spelling "$ROOT")/scripts/run-gate/run-gate.sh" \
+            "$SCRATCH/a23.log" "$BASH_W"
+    } > "$SANDBOX/bd-nested/CTestTestfile.cmake"
+    arm 23-sh-descendant-compiler 0 ctest --test-dir "$SANDBOX/bd-nested" -j 2
+    # The ctest verdict IS this arm's precondition: `busy` must actually have
+    # run, or the nested gate looked at a machine with no stub on it and the
+    # assertion below holds vacuously.
+    # ⓘ AND IT MUST HAVE OUTLIVED THE GATE, which is why the stub sleeps 8 s:
+    # ✔MEASURED on this host the nested gate finished in 5.10 s (two process
+    # table reads dominate it) while `busy` ran the full 8.04 s, so the stub was
+    # live across BOTH of the gate's scans. A stub that exited first would make
+    # this arm agree with a broken subject.
+    says 23-sh-descendant-compiler 'tests failed out of 2'
+    says a23.log "compilers: none outside" --log
+
+    # ---- ARM 24 (sh) THE DEFECT: A COMPILER OUTSIDE THIS GATE'S TREE --------
+    plant_foreign_compiler 12
+    arm 24-sh-foreign-compiler 0 bash "$GATE_SH" "$SCRATCH/a24.log" 'HELLO' \
+        bash -c 'echo HELLO'
+    says 24-sh-foreign-compiler 'run-gate.sh: OK'
+    says_not a24.log 'compilers: none' --log
+    says a24.log "OUTSIDE this gate's process tree" --log
+    says a24.log 'dsscp' --log
+    # ⚠ AND IT MUST NOT HAVE BECOME A REFUSAL. The line is an OBSERVATION: the
+    # mechanism that made a second compiler destroy a verdict is gone, and
+    # refusing here would refuse every gate of a project that runs four lanes in
+    # parallel by design. rc 0 above is that claim; this is it said out loud.
+    says_not 24-sh-foreign-compiler 'FAIL'
+else
+    na 23-sh-descendant-compiler "$STUB_ABSENT_WHY"
+    na 24-sh-foreign-compiler    "$STUB_ABSENT_WHY"
+fi
+
+if [ -n "$PS_EXE" ] && [ -n "$STUB" ]; then
+    # ---- ARM 25 (ps1) THE DEFECT -------------------------------------------
+    plant_foreign_compiler 12
+    arm 25-ps1-foreign-compiler 0 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+        -File "$GATE_PS1" "$SCRATCH/a25.log" 'HELLO' \
+        "$PS_EXE" -NoProfile -Command "Write-Output HELLO"
+    says 25-ps1-foreign-compiler 'run-gate.ps1: OK'
+    says_not a25.log 'compilers: none' --log
+    says a25.log "OUTSIDE this gate's process tree" --log
+
+    # ---- ARM 26 (ps1) THE CONTROL, i.e. THE ESCAPE IS DIRECTIONAL ----------
+    # ⚠ WITHOUT THIS THE TWIN COULD SIMPLY ALWAYS REPORT. Arm 25 alone is
+    # satisfied by a line that fires unconditionally, which is the failure this
+    # whole subject was written to avoid in the other direction.
+    # ⓘ It waits for arm 25's orphan rather than asserting over it: 12 s was
+    # chosen to outlive one gate and not two.
+    sleep 13
+    arm 26-ps1-no-compiler 0 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+        -File "$GATE_PS1" "$SCRATCH/a26.log" 'HELLO' \
+        "$PS_EXE" -NoProfile -Command "Write-Output HELLO"
+    says a26.log "compilers: none outside" --log
+
+    # ---- ARM 27 TWIN PARITY ON THE FIFTH SUBJECT ---------------------------
+    ran
+    sh_saw=$(logtext "$SCRATCH/a24.log" | grep -c "OUTSIDE this gate's process tree" || true)
+    ps_saw=$(logtext "$SCRATCH/a25.log" | grep -c "OUTSIDE this gate's process tree" || true)
+    sh_rc=$(cat "$SCRATCH/24-sh-foreign-compiler.rc")
+    ps_rc=$(cat "$SCRATCH/25-ps1-foreign-compiler.rc")
+    if [ "$sh_saw" -ge 1 ] && [ "$ps_saw" -ge 1 ] && [ "$sh_rc" = "0" ] && [ "$ps_rc" = "0" ]; then
+        echo "  [ok  ] 27-parity  both twins REPORTED a foreign compiler and both still exited 0"
+    else
+        echo "  [FAIL] 27-parity  .sh reported=$sh_saw rc=$sh_rc, .ps1 reported=$ps_saw rc=$ps_rc (both must report, both must exit 0)"
+        fails=$((fails + 1))
+    fi
+elif [ -z "$STUB" ]; then
+    na 25-ps1-foreign-compiler "$STUB_ABSENT_WHY"
+    na 26-ps1-no-compiler      "$STUB_ABSENT_WHY"
+    na 27-parity               "$STUB_ABSENT_WHY -- the twins were NOT compared on the fifth subject"
+else
+    na 25-ps1-foreign-compiler "$PS_ABSENT_WHY -- the .ps1 twin was never shown a foreign compiler"
+    na 26-ps1-no-compiler      "$PS_ABSENT_WHY -- the .ps1 twin's no-compiler CONTROL was not taken"
+    na 27-parity               "$PS_ABSENT_WHY -- arms 23 and 24 still prove the .sh twin, but the twins were NOT compared"
 fi
 
 # ---- WHAT THIS RUN ACTUALLY PROVED -----------------------------------------

@@ -631,30 +631,17 @@ void recordJobBatch(JobBatchRecord rec) {
 // codebase rejects everywhere.
 struct ArtifactCacheTicket {
     dss::runtime::RuntimeObjectKey key;
-    dss::runtime::CacheEviction    eviction;
 };
 
-// The manifest's eviction vocabulary → the store's.
-//
-// ★ A `switch` WITH NO `default`, NOT A TERNARY, AND THAT IS THE POINT. The
-// ternary this replaced mapped `Retain` to `Retain` and EVERYTHING ELSE to
-// `PruneSuperseded`, so a third manifest token would have silently acquired
-// pruning semantics nobody wrote — the "enumerate the members, never the
-// complement" trap this repo has paid for before. With no `default` arm, adding
-// an enumerator is a COMPILE error at exactly the site that must decide.
-[[nodiscard]] dss::runtime::CacheEviction
-storeEvictionFor(DependencyArtifactCacheEviction manifestPolicy) noexcept {
-    switch (manifestPolicy) {
-        case DependencyArtifactCacheEviction::PruneSuperseded:
-            return dss::runtime::CacheEviction::PruneSuperseded;
-        case DependencyArtifactCacheEviction::Retain:
-            return dss::runtime::CacheEviction::Retain;
-    }
-    // Unreachable for every declared enumerator; present because a value
-    // outside the enumeration is undefined behaviour rather than a case, and
-    // the pruning arm is the one that DELETES files.
-    return dss::runtime::CacheEviction::Retain;
-}
+// ⓘ A `storeEvictionFor` mapping the manifest's eviction vocabulary onto the
+// store's stood here, and the ticket carried its result. Both are gone with the
+// policy itself
+// ([[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]):
+// the store no longer deletes anything, so there is no second behaviour for a
+// manifest to select between. ★ The ticket is deliberately kept as a struct
+// rather than collapsed to a bare key — it is what `compileOneTarget` receives,
+// and a named type is where the next thing a target must carry to participate
+// in the cache will land.
 
 // Consult the cache for `ticket` and, on a VERIFIED hit, place the cached bytes
 // at `outPath`.
@@ -3407,8 +3394,7 @@ void storeBuiltArtifactInCache(ArtifactCacheTicket const& ticket,
         return;
     }
     auto const stored = dss::runtime::storeRuntimeObject(
-        ticket.key, std::span<std::uint8_t const>{bytes->data(), bytes->size()},
-        ticket.eviction);
+        ticket.key, std::span<std::uint8_t const>{bytes->data(), bytes->size()});
     if (!stored.has_value()) reportDriverNote(stored.error());
 }
 
@@ -4170,15 +4156,16 @@ buildDependencyArtifactKey(
                   "the next build will compile it again.");
             continue;
         }
-        // ⓘ `PruneSuperseded` STATED rather than defaulted, and it is this
-        // site's pre-existing behaviour written down: ONE shipped unit has ONE
-        // current object per (target, config), so an entry a rebuild supersedes
-        // is dead weight. The policy is a parameter because the OTHER subject
-        // class — a project's dependency artifacts — legitimately wants the
-        // opposite; see `CacheEviction`.
+        // ⓘ THIS SITE USED TO STATE `CacheEviction::PruneSuperseded`, on the
+        // reasoning that ONE shipped unit has ONE current object per
+        // (target, config) so a superseded entry is dead weight. The first half
+        // is true and the conclusion did not follow: an entry with another index
+        // is *the previous build in this tree* or *a concurrent build reading a
+        // different tree*, and a store cannot tell those apart. See
+        // `storeRuntimeObject` in `runtime_object_cache.hpp`.
+        // [[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]
         auto const stored = dss::runtime::storeRuntimeObject(
-            *key, std::span<std::uint8_t const>{bytes->data(), bytes->size()},
-            dss::runtime::CacheEviction::PruneSuperseded);
+            *key, std::span<std::uint8_t const>{bytes->data(), bytes->size()});
         if (!stored.has_value()) {
             reportDriverNote(stored.error());
             continue;
@@ -5077,9 +5064,7 @@ int runCusToTargets(
                                "dependency artifact cache: the target spec does "
                                "not parse, so no key can be composed."});
             if (key.has_value()) {
-                cacheTicket = ArtifactCacheTicket{
-                    std::move(*key),
-                    storeEvictionFor(artifactCachePolicy->eviction)};
+                cacheTicket = ArtifactCacheTicket{std::move(*key)};
             } else {
                 // ⚠ LOUD, AND NOT FATAL. A key that cannot be COMPUTED means
                 // the optimization is unavailable for this target — not that
