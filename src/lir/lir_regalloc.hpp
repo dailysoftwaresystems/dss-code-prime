@@ -8,6 +8,7 @@
 #include "lir/lir_liveness.hpp"
 #include "lir/lir_reg.hpp"
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <variant>
@@ -215,6 +216,34 @@ struct DSS_EXPORT LirFuncAllocation {
     // frame the function does not reserve).
     std::uint32_t                 coalescedCopies     = 0;
     std::uint32_t                 coalescedSpillSlots = 0;
+
+    // ── THE SPILL-RELOAD SCRATCH RESERVATION, AS ASKED FOR AND AS ACHIEVED ──
+    //
+    // ★★★ D-AS-REGALLOC-SCRATCH-POOL-EXHAUSTED-BY-A-LARGE-FUNCTION-IN-RELEASE.
+    // Indexed by `LirRegClass` ordinal. `reloadReserveDemand[c]` is this
+    // function's PEAK single-instruction same-class reload demand — the number
+    // of scratch registers of class `c` the rewriter can need at once for ONE
+    // instruction (`computeReloadReserve`). `reloadReserveAchieved[c]` is how
+    // many the free-list build actually held back for it.
+    //
+    // ⚠ THEY WERE ALLOWED TO DISAGREE SILENTLY, AND THAT WAS THE DEFECT. The
+    // reservation could draw only from the class's NON-ARGUMENT CALLER-SAVED
+    // registers, and when a convention declares fewer of those than the demand
+    // it "reserved what exists and stopped". The shortfall is invisible until
+    // register pressure happens to assign every other register of the class, at
+    // which point the rewriter's pool holds exactly the achieved count and the
+    // first instruction asking for the demanded count fails loud, naming
+    // pressure rather than the shortfall. ✔MEASURED on ms_x64, whose FPR class
+    // has exactly TWO non-argument caller-saved registers against a demand of
+    // three. The reservation now draws its shortfall from the class's
+    // callee-saved registers, so `achieved >= demand` holds wherever the class
+    // has the registers at all — and these two fields are what a pin asserts
+    // that against, rather than against any particular function size.
+    //
+    // ⓘ OBSERVATIONS, never inputs to a decision: nothing downstream reads them
+    // to choose anything, so a drifted counter cannot change what is emitted.
+    std::array<std::uint16_t, kLirRegClassCount> reloadReserveDemand{};
+    std::array<std::uint16_t, kLirRegClassCount> reloadReserveAchieved{};
 
     // ── THE WIDTH-SAFE COPIES, AND THIS ONE **IS** AN INPUT TO A DECISION ──
     //

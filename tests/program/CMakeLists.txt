@@ -510,3 +510,28 @@ dss_add_test(NAME program/test_synth_verify_failure_path
 # APPENDED, never interleaved -- this file is append-only by lane convention.
 dss_add_test(NAME program/test_emit_hir_mode
              SOURCES test_emit_hir_mode.cpp)
+
+# D-HIR-TEXT-NODE-WALK-RECURSES-PER-LEVEL-ON-BOTH-HALVES-AND-THREE-SPELLINGS-DO-NOT-READ-BACK
+# left one thing NAMED and unfixed: nothing in `src/` outside the tests called
+# `parseHir`, so the `.dsshir` reader shipped as a `DSS_EXPORT` for consumers with
+# no run of any kind feeding it what our own writer produces. That is why THREE
+# shipped writer spellings could be unreadable at once -- one ABORTED the reading
+# process, one was refused for a token the lexer lacked, and one came back as 0.0
+# through a CLEAN reporter -- and all three were found by a person round-tripping
+# the corpus by hand. This entry is that walk, standing where the person stood:
+# every `examples/c` case is emitted at its OWN first declared target and the
+# artifact must parse back AND re-emit BYTE FOR BYTE. A decline by the front end
+# is counted and printed rather than dropped, and the emitted count is FLOORED, so
+# the walk cannot rot into measuring nothing; a NEGATIVE CONTROL fires the
+# predicate on a known-unreadable artifact before any example is walked.
+# HOST-INDEPENDENT: the front end runs for every case; nothing is codegen'd,
+# assembled, linked or executed.
+#
+# APPENDED, never interleaved -- this file is append-only by lane convention.
+dss_add_test(NAME program/test_emit_hir_round_trips_every_example
+             SOURCES test_emit_hir_round_trips_every_example.cpp)
+# The corpus manifests are JSON, and this walk needs two fields out of each:
+# the source list and the first declared target. Same nlohmann consumer as the
+# runtime-cache wiring case above.
+target_link_libraries(dss_program_test_emit_hir_round_trips_every_example
+                      PRIVATE nlohmann_json::nlohmann_json)

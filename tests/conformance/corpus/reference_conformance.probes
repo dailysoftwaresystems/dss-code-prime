@@ -311,10 +311,42 @@ struct DssElidedMember { int a, , b; };
 @min-stdc 0
 @families gnu,msvc
 @expect-ref reject
-@acknowledged-gap MEASURED: DSS ACCEPTS `int f(int a, ..., int b);`. /shapes/paramList repeats `{Comma, paramOrEllipsis}` with no rule that the ellipsis terminates the list (C 6.7.6.3), and no semantic check supplies one.
-@why /shapes/paramList repeats `{Comma, paramOrEllipsis}` with no "the ellipsis terminates the list" rule. C 6.7.6.3 puts `...` last, full stop.
+@why CLOSED 2026-09-09 (P66, lane `cf`, [[D-CSUBSET-THE-VARIADIC-MARKER-DOES-NOT-TERMINATE-THE-PARAMETER-LIST]]) — the `@acknowledged-gap` line is deleted because DSS now REJECTS this probe, as `@expect-ref reject` says every reference does. The gap read: "MEASURED: DSS ACCEPTS `int f(int a, ..., int b);`. /shapes/paramList repeats `{Comma, paramOrEllipsis}` with no rule that the ellipsis terminates the list (C 6.7.6.3), and no semantic check supplies one." BOTH halves of that sentence were true and only the SECOND one moved: `/shapes/paramList` is UNCHANGED and still repeats `{Comma, paramOrEllipsis}`, and what supplies the rule is now a semantic check — `checkVariadicMarkerTerminatesParamList`, run from `pass1Node` once per parameter-list node, refusing S_VariadicMarkerMustEndParameterList positioned AT the marker (1:14 here) with the following parameter as a related location. ✔MEASURED at close, each reference probed SEPARATELY on its own TU: gcc 13.3.0 `-std=c2x` rc 1 (`expected ')' before ',' token`), clang 18.1.3 `-std=c23` rc 1 (`expected ')'`), MSVC 19.51.36257 `/std:clatest` rc 2 (`C2760: ',' was unexpected here; expected ')'`) — unanimous, and all three point at the SEPARATOR while DSS points at the MARKER, which is stated rather than papered over. ★★ THE GRAMMAR CANNOT EXPRESS IT, AND THAT IS MEASURED RATHER THAN ASSERTED: five shapes were written into a private `$DSS_CONFIG_ROOT` copy and run through the shipped CLI — `param (sep param)* {optional: sep ellipsis}` is REFUSED AT LOAD in three variants (`C_AmbiguousAlternatives at /shapes/paramList: alt branches share FIRST token 'Comma'`, the same refusal `/shapes/listSeparator`'s `$whyNotTheStandardSpellingComment` records for C23's trailing comma); a one-branch `speculative` alt around the loop body LOADS but regresses legal C23 (`int f(int a, ...);` → `P_NoAlternativeMatched` at 1:18, because this engine does not roll a failed repeat iteration back); and `/shapes/enumBody`'s own topology refuses all five misplaced-marker forms but newly ACCEPTS `int f(int a,)`, trading one Direction-B silent accept for another. The check is nonetheless 100% document-driven — the list rule is the config's `declarators.fnSuffixParamsRule` and the token is its `declarators.variadicMarker`. ★ IT WAS NOT ONE SPELLING BUT FOUR: the declaration, the DEFINITION, the double-marker `int f(int a, ..., ...);` and the function-POINTER `int (*p)(int a, ..., int b);` were all rc 0, and the last of those is reached by a path NEITHER named FnSig resolver sees — which is why the check is a rule-keyed pre-order visit and not a hook in a resolver. ⚠ A NESTED prototype's own marker stays its own business: `int g(int (*cb)(int, ...), int n);` is legal and still compiles, pinned. ⓘ `int f(...);` — the C23 bare-ellipsis parameter list — is a SEPARATE, still-open Direction-A divergence found while measuring this one: gcc and clang accept it, MSVC refuses, DSS refuses (`P_NoAlternativeMatched` at 1:6). It is untouched here and has no row; it is recorded so the next reader does not mistake this closure for covering it. ★ This was the LAST live member of the elision family; its two siblings closed in P65 and the struct-member one in P63.
 @code
 int dss_ellipsis_mid_probe(int a, ..., int b);
+@end
+
+@probe b_attribute_sequence_between_declaration_specifiers
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@why ([[D-CSUBSET-A-C23-ATTRIBUTE-SEQUENCE-IS-ACCEPTED-BETWEEN-TWO-DECLARATION-SPECIFIERS]]) C23 6.7 gives a `[[…]]` attribute-specifier-sequence exactly TWO positions in a declaration — LEADING the whole declaration (`attribute-specifier-sequence declaration-specifiers init-declarator-list ;`) or at the END of the declaration specifiers (`declaration-specifier attribute-specifier-sequence_opt`, which by construction admits no further specifier after it). BETWEEN two declaration specifiers it is ill-formed, and gcc 13.3.0 `-std=c2x`, clang 18.1.3 `-std=c23` and MSVC 19.51.36257 `/std:clatest` all three refuse it — ✔MEASURED 2026-09-09, each probed SEPARATELY on its own TU, across ELEVEN spellings (file scope after `static`/`const`/`static const`/`extern`, block scope after `static`/`const`, both sides of `typedef`, a parameter after `register`/`const`, and both sides of an inferred `auto`). DSS ACCEPTED all ten of the pre-existing ones at rc 0 with zero bytes on stderr until P66, because `stdAttr` was an ordinary member of five specifier-run alternatives. It is now refused at the `[` (1:8 here — the SAME column clang reports; gcc points at 1:25 and MSVC gives no column). ⚠ THE GNU `__attribute__` SPELLING IS A DIFFERENT SURFACE AND IS DELIBERATELY NOT PROBED HERE: gcc AND clang both ACCEPT it mid-run (MSVC abstains — no such syntax), so `static __attribute__((unused)) int m = 1;` is REQUIRED and still compiles. A probe that conflated the two spellings would have demanded a refusal that puts DSS below the union.
+@code
+static [[maybe_unused]] int dss_attr_midrun_probe = 1;
+@end
+
+@probe b_parameter_after_a_bare_variadic_marker
+@direction B
+@mode extended
+@min-stdc 0
+@families gnu,msvc
+@expect-ref reject
+@why ([[D-C-A-BARE-ELLIPSIS-PARAMETER-LIST-IS-REFUSED-SO-A-VARIADIC-FUNCTION-NEEDS-A-NAMED-PARAMETER]]) (cycle P66, lane `ca`) THE GUARD ON THE SAME CYCLE'S BARE-ELLIPSIS WIDENING, and it exists because that widening is the only edit that could ever buy this. C23 6.7.7.1 admits `...` in exactly two places -- ending a `parameter-list` or as the WHOLE list -- and in neither may a parameter follow it. MEASURED 2026-09-09, each reference probed SEPARATELY on its own TU: gcc 13.3.0 `-std=c2x` rc 1 (`expected ')' before ',' token`), clang 18.1.3 `-std=c23` rc 1 (`expected ')'`), MSVC 19.51.36257 `/std:clatest` rc 2 (`C2143`) -- UNANIMOUS refusal, each pointing at the separator. DSS refuses it at PARSE (`error[P_UnexpectedToken]: expected 'ParenClose' -- got ','`) because `/shapes/paramList`'s bare-marker branch ENDS the list rather than continuing into the separator repeat; the sibling spelling `int f(int a, ..., int b);` is refused one tier later by `checkVariadicMarkerTerminatesParamList` (`S_VariadicMarkerMustEndParameterList`, cycle P66 lane `cf`). A bare `...` IS the whole list; a `...` FOLLOWED by a parameter is an error in both spellings, and this row is what keeps the first sentence from quietly becoming the second.
+@code
+int dss_bare_ellipsis_then_param_probe(..., int b);
+@end
+
+@probe a_auto_multi_declarator_c23
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why ([[D-CSUBSET-INFERRED-AUTO-REFUSES-THE-MULTI-DECLARATOR-FORM-THE-STANDARD-NAMES-A-COMMON-EXTENSION]]) C23 6.7.10 (Type inference) states NO declarator-count constraint: its one Constraint is that the declaration contain `auto`. The count is Annex J.2(78) UNDEFINED BEHAVIOUR — so no diagnostic is required and accepting and refusing are BOTH conforming — and Annex J.5.12 (Common extensions) names "may … have more than one declarator" outright, with footnote 164 recommending ISO/IEC 14882's semantics: ONE type deduced for the whole declaration, shared by every declarator. ✔MEASURED 2026-09-09, each reference probed SEPARATELY on its own TU: clang 18.1.3 `-std=c23` ACCEPTS at file AND block scope, SILENTLY at `-Wall -Wextra -pedantic`, and a linked EXECUTED binary gives both objects `int` (`_Generic`), `sizeof` 4, binds `int *` to each and returns the written values; gcc 13.3.0 `-std=c2x` REFUSES ("'auto' may only be used with a single declarator"); MSVC 19.51.36257 ABSTAINS rather than voting — it reads `auto` as the C89 storage class over an implicit `int`, accepting `auto a = 1, b = 2.5;` silently and failing `auto a = &x; *a` with C2100, so it answers a different question and the family is narrowed to `gnu` for that reason. One WORKING accepting reference makes it REQUIRED; DSS refused it `S_AutoRequiresSingleDeclarator` until P66 and now accepts it, constraining instead that the declarators AGREE (S_AutoDeclaratorsInferDifferentTypes, which gcc AND clang both refuse).
+@code
+auto dss_auto_multi_a = 1, dss_auto_multi_b = 2;
 @end
 
 @probe b_duplicate_array_param_qualifiers
@@ -652,6 +684,28 @@ int dss_enum_fixed_probe(void) { return (int)DSS_FIXED_B; }
 @why C23 6.7.12.1 [[maybe_unused]] on a PARAMETER declaration.
 @code
 int dss_attr_param_probe([[maybe_unused]] int unused_param);
+@end
+
+@probe a_bare_ellipsis_parameter_list_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why ([[D-C-A-BARE-ELLIPSIS-PARAMETER-LIST-IS-REFUSED-SO-A-VARIADIC-FUNCTION-NEEDS-A-NAMED-PARAMETER]]) (cycle P66, lane `ca`) C23 6.7.7.1 gives `parameter-type-list` THREE productions -- `parameter-list`, `parameter-list , ...` and a BARE `...` -- and DSS carried only the first two, so `int f(...);` was `error[P_NoAlternativeMatched]: expected 'StringStart', 'EndStatement', ... or 'BlockOpen' -- got '('` at 1:6: the parameter list never opened at all. The third production is a function VARIADIC WITH ZERO NAMED PARAMETERS, and it pairs with the ONE-ARGUMENT `va_start(ap)` the same edition introduced (there is no `last` to name), which DSS already accepted. MEASURED 2026-09-09, each reference probed SEPARATELY on its own TU: gcc 13.3.0 `-std=c2x` rc 0 and clang 18.1.3 `-std=c23` rc 0, both SILENT at `-Wall -Wextra` AND at `-pedantic-errors`, across the declaration, the definition, a zero-argument call, a call with arguments, the function-POINTER spelling `int (*p)(...)`, the typedef spelling `typedef int F(...)`, an abstract parameter `int h(int (*cb)(...))` and a `va_start(ap)` + `va_arg` read-back; MSVC 19.51.36257 `/std:clatest` REFUSES every one (`C2143: syntax error: missing ')' before '...'`). That is a MINORITY REFUSAL and not an abstention -- MSVC has C23 attributes and the syntactic position, it has simply not implemented this production -- so the family is NOT narrowed and MSVC's disagreement is left visible in the census. TWO WORKING accepting references make it REQUIRED. `@min-stdc 202311` because both accepting references refuse it BEFORE C23 (`-std=c17 -pedantic-errors`: gcc `ISO C requires a named argument before '...' before C2X`, clang `ISO C requires a named parameter before '...'`); gcc 13.3 measures __STDC_VERSION__ 202000L at `-std=c2x` and so abstains here BY MEASUREMENT rather than by a special case, leaving clang (202311L) as the judging accept.
+@code
+int dss_bare_ellipsis_probe(...);
+@end
+
+@probe a_struct_member_leading_attribute_c23
+@direction A
+@mode strict
+@min-stdc 202311
+@families gnu,msvc
+@expect-ref accept
+@why ([[D-C-A-LEADING-C23-ATTRIBUTE-SEQUENCE-ON-A-STRUCT-MEMBER-IS-REFUSED-WHILE-THE-GNU-SPELLING-IS-ACCEPTED]]) (cycle P66, lane `ca`) C23 6.7.2.1 writes the leading member attribute into the grammar directly -- `member-declaration: attribute-specifier-sequence_opt specifier-qualifier-list member-declarator-list_opt ;` -- and 6.7.2.1p9 gives it a meaning: the sequence "appertains to each of the members declared by the member declarator list". DSS refused it: `struct S { [[maybe_unused]] int a; };` was `error[P_NoAlternativeMatched]: expected 'Identifier', 'BlockClose', ... 'AttributeKeyword' or 'ExtensionKeyword' -- got '['`, because `/shapes/structMemberDeclSpecifier` carried `extensionRun`, `alignasSpec` and `attrSpec` and no `stdAttr` at all -- the C23 spelling of a position the GNU spelling already had. MEASURED 2026-09-09, each reference probed SEPARATELY on its own TU: gcc 13.3.0 `-std=c2x` rc 0 SILENT at `-Wall -Wextra` and at `-pedantic-errors`, clang 18.1.3 `-std=c23` rc 0 likewise, MSVC 19.51.36257 `/std:clatest` rc 0 SILENT at /W4 -- UNANIMOUS acceptance, in the union spelling and the multi-declarator spelling too, and gcc and clang both HONOUR it (`struct S { [[deprecated]] int a, b; };` flags BOTH members on both). `@min-stdc 202311` because both gnu references refuse it before C23 (`-std=c17 -pedantic-errors`: gcc `ISO C does not support '[[]]' attributes before C2X`, clang `[[]] attributes are a C23 extension`). NOTE the ADJACENT position this probe deliberately does not claim: `struct S { int [[maybe_unused]] a; };` -- the END of the specifier-qualifier list -- is a different slot that C23 6.7.2.1p9 makes appertain to the TYPE, which C23 6.7.13.4's Constraints do not admit for `maybe_unused`; clang and MSVC refuse it, gcc accepts and DROPS it, and DSS still refuses it.
+@code
+struct dss_member_attr_probe { [[maybe_unused]] int probe_member; };
 @end
 
 @probe a_empty_initializer_c23
@@ -1352,4 +1406,115 @@ extern __thread int dss_thread_local_gnu_probe;
 @code
 __extension__ int dss_extension_decl_probe;
 int dss_extension_expr_probe(void) { return __extension__ (0); }
+@end
+
+# ── P66 (lane `al`) [[D-C-A-GNU-ALIGNED-ATTRIBUTE-ON-A-TYPEDEF-IS-REFUSED-WHILE-BOTH-REFERENCES-HONOUR-IT]]
+# The GNU `aligned(N)` attribute on a TYPEDEF. Censused because the SAME position
+# in the ISO `_Alignas` spelling has the OPPOSITE correct answer (all references
+# refuse it — a_alignas_typedef_is_refused below), so the two must be visible side
+# by side or a later cycle re-derives one from the other and gets it backwards.
+
+@probe a_gnu_aligned_typedef
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why GNU `__attribute__((aligned(N)))` on a TYPEDEF — an over-aligned type ALIAS. ✔MEASURED 2026-09-09, each reference probed SEPARATELY on its own translation unit with rc read DIRECTLY: gcc 13.3.0 and clang 18.1.3 each compile it rc 0 with stderr EMPTY at `-Wall -Wextra`, and both CONFER — `_Static_assert(_Alignof(A8) == 8)` PASSES while the `== 4` twin FAILS, in BOTH orders (attribute after the specifiers and before them); `sizeof(A8)` stays 4; `struct S { char c; A8 v; }` is sizeof 16 / _Alignof 8 / offsetof(v) 8; an EXECUTED binary places a static AND an automatic object of the type on 8 at -O0 and -O2. mingw-w64 gcc 13.2.0 agrees. MSVC 19.51.36257 ABSTAINS ON THE SPELLING (no `__attribute__` syntax at all, C2143) and casts the same vote through the spelling it implements — `typedef __declspec(align(8)) int A8;` compiles rc 0 with `int p[(__alignof(A8)==8)?1:-1]` while the `==4` twin fails C2118 — so the CONSTRUCT is conferred by all three, and the `@families gnu` narrowing here is about the SURFACE only. ★ CLOSED 2026-09-09 (P66, lane `al`): DSS was BELOW the union, refusing this with `error[S_AlignasInvalidContext]` because a typedef interned to the SAME TypeId as its aliasee and there was nowhere to put the alignment. It now interns to a distinct TYPE-LEVEL ALIGNMENT SKIN and the value is CONFERRED, not merely tolerated — runnable witness examples/c/gnu_aligned_typedef_conferred (exit 42, four target specs, `release` arm, live in BOTH runners). ⚠ The body deliberately asserts the CONFERRAL rather than only parsing: an accept-and-drop would satisfy a parse-only probe and is exactly the silent wrong answer this row exists to prevent.
+@code
+typedef int __attribute__((aligned(8))) dss_gnu_aligned_typedef_probe_t;
+_Static_assert(_Alignof(dss_gnu_aligned_typedef_probe_t) == 8,
+               "the alias must CONFER the alignment, not merely tolerate it");
+_Static_assert(sizeof(dss_gnu_aligned_typedef_probe_t) == 4,
+               "and it must NOT change the size — both references keep 4");
+@end
+
+@probe a_alignas_typedef_is_refused
+@direction A
+@mode strict
+@min-stdc 201112
+@families gnu,msvc
+@expect-ref reject
+@why THE DELIBERATE TWIN OF a_gnu_aligned_typedef, AND THE REASON THIS PAIR IS CENSUSED AT ALL: the ISO alignment specifier in the SAME position has the OPPOSITE correct answer. ISO C 6.7.6p2 (C11 6.7.5p2) names `typedef` explicitly among the storage-class specifiers an alignment specifier shall not be used with, and ✔MEASURED 2026-09-09 all four references AGREE: gcc 13.3.0 `error: alignment specified for typedef 'A8'`; clang 18.1.3 `error: '_Alignas' attribute only applies to variables and fields`; mingw-w64 gcc 13.2.0 as gcc; MSVC 19.51.36257 `error C7704`. DSS refuses it too — [[D-CSUBSET-ALIGNAS-TYPEDEF-PARAM-PARSE]] (P58), re-measured this cycle and still holding. ★ `@expect-ref reject` is the measurement-RED direction here (a universal claim met by a WITNESS), so this row turns loud the moment any reference starts accepting it — which is precisely what would have to happen before DSS should. ⚠ It exists to stop a future cycle from "unifying" the two spellings on the CONTEXT they share: one construct, two spellings, opposite verdicts, and a fix keyed on `this is a typedef` would put DSS ABOVE the union here in the same stroke it fixed being BELOW it there.
+@code
+typedef _Alignas(8) int dss_alignas_typedef_probe_t;
+@end
+
+@probe a_gnu_aligned_typedef_weaker_than_natural
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why ★★★ THE WEAKENING FORM, AND IT IS THE ONE THAT WAS SILENT. `__attribute__((aligned(2)))` on an `int` alias is an alignment WEAKER than natural, and every reference that implements the construct LOWERS to it. ✔MEASURED 2026-09-09, each reference probed SEPARATELY on its own translation unit, rc read DIRECTLY and never through a pipeline, at `-Wall -Wextra`: gcc 13.3.0 (`-std=c2x`), clang 18.1.3 (`-std=c23`), mingw-w64 gcc 13.2.0 and aarch64-linux-gnu-gcc 13.3.0 all compile it rc 0 with stderr EMPTY and all give `_Alignof(A2)` **2** — the `== 4` twin FAILS on all four — in BOTH orders, with `sizeof(A2)` still 4, and `struct T { char c; A2 v; }` sizeof **6** / _Alignof 2 / offsetof(v) **2** (the sizeof-8 twin FAILS on all four). A chained alias, a struct alias and a pointer alias all lower too, and `aligned(1)` reaches 1. gcc documents the asymmetry itself: on a TYPEDEF `aligned` may both increase and decrease; on a variable or a composite only increase. ⓘ MSVC 19.51.36257 abstains on the SURFACE (`__attribute__` is C2061) and, through the spelling it implements, does NOT lower — `typedef __declspec(align(2)) int A2;` compiles rc 0 keeping `__alignof` 4, the `==2` twin failing C2118. Recorded AS a measurement and NOT read as a fork: MSVC has no `__attribute__((aligned))`, and increase-only is a documented property of a DIFFERENT attribute; `@families gnu` says the surface is GNU-only. ★ CLOSED 2026-09-09 (P66, lane `ag`) [[D-C-THREE-GNU-ALIGNED-ATTRIBUTE-FORMS-REMAIN-AND-THE-WEAKENING-ONE-IS-SILENT]] form 1: DSS ACCEPTED this and silently kept 4, laying `struct T` out at 8/4 — ✔EXECUTED at the pre-change base, a DSS binary of that shape returned 10 where gcc, clang and aarch64-gcc under qemu all returned 42. It was not a refusal and not a diagnostic, which is what made it the dangerous one; the `layoutOne` fold now REPLACES rather than MAXes for the type-level channel. ⚠ THE BODY ASSERTS THE STRUCT LAYOUT AND NOT ONLY `_Alignof`, because an `_Alignof`-only probe is satisfied by a fix that never reaches an object — the exact partial-fix shape this row's parent paid for. ⛔ THE BOUND IS THE SIBLING PROBE a_gnu_aligned_composite_does_not_lower.
+@code
+typedef int dss_gnu_aligned_weak_probe_t __attribute__((aligned(2)));
+struct dss_gnu_aligned_weak_probe_s { char c; dss_gnu_aligned_weak_probe_t v; };
+_Static_assert(_Alignof(dss_gnu_aligned_weak_probe_t) == 2,
+               "a request WEAKER than natural must LOWER — every reference does");
+_Static_assert(sizeof(dss_gnu_aligned_weak_probe_t) == 4,
+               "and it must NOT change the size");
+_Static_assert(sizeof(struct dss_gnu_aligned_weak_probe_s) == 6,
+               "the lowering must reach the AGGREGATE, not stop at the type");
+_Static_assert(__builtin_offsetof(struct dss_gnu_aligned_weak_probe_s, v) == 2,
+               "and the MEMBER OFFSET is where it becomes ABI-visible");
+@end
+
+@probe a_gnu_aligned_composite_does_not_lower
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why ⛔ THE BOUND ON a_gnu_aligned_weaker_than_natural, CENSUSED BESIDE IT SO A LATER CYCLE CANNOT GENERALISE ONE INTO THE OTHER. The WHOLE-COMPOSITE `aligned` is increase-only where the TYPE-LEVEL one is not. ✔MEASURED 2026-09-09, each reference separately, rc read directly: gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and aarch64-linux-gnu-gcc 13.3.0 all compile `struct __attribute__((aligned(1))) S { int a; };` rc 0 and all keep `_Alignof(struct S)` at **4** — the `== 1` twin FAILS on all four. A per-MEMBER `int v __attribute__((aligned(2)))` does not lower either (its `offsetof == 2` assertion FAILS on all four). DSS agrees on both and always did; `explicitAlign` and `fieldAligns` keep their MAX folds. ★ This probe is the measurement-RED direction for the WRONG generalisation: it goes loud the moment someone makes alignment lowerable everywhere instead of on the one channel where all four references lower.
+@code
+struct __attribute__((aligned(1))) dss_gnu_aligned_composite_probe_s { int a; };
+_Static_assert(_Alignof(struct dss_gnu_aligned_composite_probe_s) == 4,
+               "the whole-composite channel is increase-only in EVERY reference");
+struct dss_gnu_aligned_member_probe_s { char c; int v __attribute__((aligned(2))); };
+_Static_assert(__builtin_offsetof(struct dss_gnu_aligned_member_probe_s, v) == 4,
+               "and so is the per-member channel");
+@end
+
+@probe a_gnu_aligned_typedef_mid_list
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why ★★ A MID-LIST TYPEDEF DECLARATOR CARRIES ITS OWN `aligned` RUN, AND CONFERS ON **ITSELF ALONE**. ✔MEASURED 2026-09-09, each reference probed SEPARATELY on its own translation unit with rc read DIRECTLY: gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and aarch64-linux-gnu-gcc 13.3.0 all compile `typedef int A __attribute__((aligned(8))), B;` rc 0 with stderr EMPTY, and on all four `_Alignof(A)==8` and `_Alignof(B)==4` both PASS while the `_Alignof(B)==8` twin FAILS. Three declarators with the middle one decorated gives 4/16/4; `typedef char A __attribute__((aligned(8))), B, C;` gives 8/1/1. The decl-specifier PREFIX spelling `typedef __attribute__((aligned(8))) int A, B;` is the OPPOSITE grain and confers on BOTH — also measured on all four, and the two are asserted together here so the distinction cannot be lost. ★ CLOSED 2026-09-09 (P66, lane `ag`) form 2: DSS drew `error[P_UnexpectedToken]`, i.e. BELOW the union but loudly. c's typedef declarator list gained a per-slot wrapper (`typedefDeclaratorSlot`, declared as `semantics.declarators.plainSlotRule`) so the run reaches the per-declarator attribute fold with DECLARATOR grain. ⚠⚠ THE `B == 4` ASSERTION IS THE LOAD-BEARING ONE: a fix that conferred on both declarators would compile this program and satisfy every acceptance check, and would be a NEW defect ABOVE the union that only this half can see. ⚠ THE BINDING IS THE OPPOSITE OF THE C23 SIBLING: `typedef int A, B [[deprecated]];` warns at a use of **B**, measured by lane `td` the same day in the same slot. Neither generalises to the other; both were measured, not derived.
+@code
+typedef int dss_gnu_aligned_midlist_a_t __attribute__((aligned(8))),
+            dss_gnu_aligned_midlist_b_t;
+_Static_assert(_Alignof(dss_gnu_aligned_midlist_a_t) == 8,
+               "the decorated slot gets it");
+_Static_assert(_Alignof(dss_gnu_aligned_midlist_b_t) == 4,
+               "and its SIBLING must NOT — conferring on both is above the union");
+typedef __attribute__((aligned(8))) int dss_gnu_aligned_prefix_a_t,
+                                        dss_gnu_aligned_prefix_b_t;
+_Static_assert(_Alignof(dss_gnu_aligned_prefix_a_t) == 8,
+               "the PREFIX spelling has DECLARATION grain...");
+_Static_assert(_Alignof(dss_gnu_aligned_prefix_b_t) == 8,
+               "...and reaches every declarator, which is the opposite grain");
+@end
+
+@probe a_gnu_aligned_zero_argument
+@direction A
+@mode extended
+@min-stdc 0
+@families gnu
+@expect-ref accept
+@why ★★ THE ZERO-ARGUMENT FORM IS THE TARGET'S MAXIMUM USEFUL ALIGNMENT (gcc's BIGGEST_ALIGNMENT), AND IT IS A TARGET QUANTITY RATHER THAN A CONSTANT. ✔MEASURED 2026-09-09, each reference probed SEPARATELY, rc read DIRECTLY at `-Wall -Wextra`: gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and aarch64-linux-gnu-gcc 13.3.0 all compile `typedef int AM __attribute__((aligned));` rc 0 with stderr EMPTY and all give `_Alignof(AM)` **16** — the `== 8` and `== 32` twins FAIL on all four — independent of the decorated type (a `char` alias is 16 too), on a composite (align 16 AND sizeof 16) and on a member (offset 16). ✔EXECUTED, not merely asserted: a binary returning `_Alignof(int-alias) * 100 + _Alignof(char-alias)` exits 1616 on gcc and clang on x86_64 AND under qemu-aarch64, so 16 is measured on BOTH shipped targets. The dunder spelling `__aligned__` behaves identically. ⓘ MSVC 19.51.36257 has no argument-less `__declspec(align)` (C2059) and abstains here. ★ CLOSED 2026-09-09 (P66, lane `ag`) form 3: DSS drew `error[S_UnknownTypeAttribute]` from TWO sites (the declaration-level Align verb and the composite scan), each carrying its own copy of the reason — "a TARGET-dependent number this engine has no business inventing". THE REASON WAS RIGHT AND THE CONCLUSION DID NOT FOLLOW: the engine must not INVENT the number and does not have to, because the target DECLARES it as `aggregateLayout.maxAlignment` (16 on both shipped targets). Reading a declared value is the opposite of guessing one, and it is never `if (arch == …)`. ⚠ It is NOT `maxRequestedAlignment` (2^28); confusing the two would give every bare `aligned` a 256 MiB alignment. ⓘ This probe asserts 16 because both shipped targets declare 16 and all four references measure 16 on both; the CONFIG-DRIVEN half is discriminated where it can be — `GnuAlignedThreeForms.TheZeroArgumentFormIsReadFromTheTargetNotCompiledIn` runs the same source under `maxAlignment = 32` and requires the answer to move.
+@code
+typedef int dss_gnu_aligned_bare_probe_t __attribute__((aligned));
+typedef char dss_gnu_aligned_bare_char_probe_t __attribute__((__aligned__));
+struct __attribute__((aligned)) dss_gnu_aligned_bare_probe_s { char c; };
+_Static_assert(_Alignof(dss_gnu_aligned_bare_probe_t) == 16,
+               "the bare form is the target's maximum useful alignment");
+_Static_assert(_Alignof(dss_gnu_aligned_bare_char_probe_t) == 16,
+               "and it does not depend on the decorated type");
+_Static_assert(_Alignof(struct dss_gnu_aligned_bare_probe_s) == 16,
+               "the composite arm answers the same number");
+_Static_assert(sizeof(struct dss_gnu_aligned_bare_probe_s) == 16,
+               "and pads the aggregate to it");
 @end

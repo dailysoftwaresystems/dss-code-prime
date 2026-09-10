@@ -306,7 +306,8 @@ TypeId TypeInterner::optional(TypeId inner) {
 
 // ── type qualifiers (D-CSUBSET-VOLATILE-POINTEE / c27 · D-CSUBSET-QUAL-BITSET) ──
 
-TypeId TypeInterner::qualified(TypeId inner, std::int64_t addBits) {
+TypeId TypeInterner::qualified(TypeId inner, std::int64_t addBits,
+                               std::uint32_t addAlign) {
     if (!inner.valid()) return InvalidType;
     // STRIP → UNION → RE-INTERN — never a "return inner if already qualified"
     // early-out, which would silently DROP `addBits` when `inner` is already a
@@ -316,11 +317,53 @@ TypeId TypeInterner::qualified(TypeId inner, std::int64_t addBits) {
     // material type. Idempotent AND order-independent by construction:
     // `qualified(qualified(T,A),B) == qualified(T, A|B)`. `volatile (volatile T)`
     // ≡ `volatile T` (C 6.7.3p5) falls out — the union of equal masks is unchanged.
+    // P66: the TYPE-LEVEL alignment travels the SAME strip→merge→re-intern path, so
+    // `volatile A8` keeps A8's alignment and `qualified(typeAligned(T,8), V)` and
+    // `typeAligned(qualified(T,V), 8)` are the SAME TypeId.
+    //
+    // ★★★ P66 (lane `ag`) — THE ALIGNMENT MERGE IS **REPLACE-ON-NON-ZERO**, NOT
+    // MAX, AND THE TWO HALVES OF THAT SENTENCE ARE SEPARATELY LOAD-BEARING.
+    // ⚠ THIS LINE READ `std::max(typeAlignOverride(inner), addAlign)` WITH A
+    // COMMENT SAYING "a second, weaker request cannot lower what a first one
+    // raised — the rule `explicitAlign` already uses on the composite side". The
+    // borrowed precedent was the error: `explicitAlign` is the WHOLE-COMPOSITE
+    // channel, and ✔MEASURED 2026-09-09 on gcc 13.3.0, clang 18.1.3, mingw-w64
+    // gcc 13.2.0 and aarch64-linux-gnu-gcc 13.3.0, each probed separately on its
+    // own TU, that channel really is increase-only —
+    // `struct __attribute__((aligned(1))) S { int a; };` keeps `_Alignof` 4 on
+    // all four. The TYPE-LEVEL channel is NOT: `typedef A8 A2
+    // __attribute__((aligned(2)));` gives A8 = 8 and **A2 = 2** on all four.
+    // A rule lifted from one axis onto another is
+    // [[feedback-a-template-generalizes-code-not-the-measurement]]; the
+    // measurement belongs to the axis it was taken on.
+    // ★ THE NON-ZERO GUARD IS WHAT KEEPS `volatile A8` AT 8. `volatileQualified`
+    // and `atomicQualified` reach here with `addAlign == 0` — "I am not asking
+    // about alignment", never "I am asking for zero" — so a zero request
+    // PRESERVES what the skin carries. Dropping that guard would erase an
+    // alignment on every qualified alias, silently, which is a strictly worse
+    // defect than the one this line closes.
+    // ⓘ CONSEQUENCE, STATED RATHER THAN LEFT TO BE REDISCOVERED: the QUALIFIER
+    // MASK is still order-independent (a union of equal masks is unchanged), but
+    // two ALIGNMENT requests are now LAST-WRITER-WINS. That is the correct
+    // reading of a re-alias chain — the outer alias is what the program is
+    // declaring — and it is the answer all four references give.
     std::int64_t const merged = qualifierBits(inner) | addBits;
+    std::uint32_t const mergedAlign =
+        addAlign != 0u ? addAlign : typeAlignOverride(inner);
     TypeId const base = materialId_(inner);
-    if (merged == 0) return base;  // no codegen-affecting qualifier ⇒ no skin
+    // No codegen-affecting qualifier AND no alignment request ⇒ no skin.
+    if (merged == 0 && mergedAlign == 0) return base;
     std::array<TypeId, 1> const ops{base};
-    std::array<std::int64_t, 1> const sc{merged};
+    // ★ THE SCALAR COUNT IS THE COMPATIBILITY HINGE. A skin with no alignment keeps
+    // its ONE-scalar record, so every qualifier type that existed before P66 hashes
+    // and interns BYTE-IDENTICALLY and no TypeId moved. The second slot appears only
+    // when an alignment is actually requested.
+    if (mergedAlign == 0) {
+        std::array<std::int64_t, 1> const sc{merged};
+        return internContent(TypeKind::VolatileQual, {}, ops, sc, {});
+    }
+    std::array<std::int64_t, 2> const sc{
+        merged, static_cast<std::int64_t>(mergedAlign)};
     return internContent(TypeKind::VolatileQual, {}, ops, sc, {});
 }
 
@@ -330,6 +373,10 @@ TypeId TypeInterner::volatileQualified(TypeId inner) {
 
 TypeId TypeInterner::atomicQualified(TypeId inner) {
     return qualified(inner, static_cast<std::int64_t>(QualBit::Atomic));
+}
+
+TypeId TypeInterner::typeAligned(TypeId inner, std::uint32_t bytes) {
+    return qualified(inner, 0, bytes);
 }
 
 TypeId TypeInterner::materialId_(TypeId id) const {
@@ -348,6 +395,17 @@ TypeId TypeInterner::stripVolatile(TypeId id) const {
     return materialId_(id);
 }
 
+TypeId TypeInterner::layoutRoot(TypeId id) const {
+    // Like `materialId_`, but STOPS at a skin that carries a type-level alignment:
+    // that skin is not transparent to LAYOUT, it is the whole answer. Reads `arena_`
+    // / `operandPool_` directly for the same reason `materialId_` does.
+    while (id.valid() && arena_.at(id).kind == TypeKind::VolatileQual
+           && typeAlignOverride(id) == 0) {
+        id = operandPool_[arena_.at(id).operandStart];
+    }
+    return id;
+}
+
 std::int64_t TypeInterner::qualifierBits(TypeId id) const {
     // RAW read of the qualifier mask in scalar slot 0 — NOT the transparent
     // `scalars()`, which redirects THROUGH the skin to the inner type's scalars.
@@ -355,15 +413,32 @@ std::int64_t TypeInterner::qualifierBits(TypeId id) const {
     if (!id.valid()) return 0;
     TypeRecord const& rec = arena_.at(id);
     if (rec.kind != TypeKind::VolatileQual) return 0;
-    // A real qualifier ALWAYS carries exactly one nonzero-mask scalar (the sole
-    // producer `qualified` never mints a skin with a zero/absent mask — a zero mask
-    // returns the material type, no skin). A VolatileQual with no scalar is a corrupt
-    // invariant; FAIL LOUD rather than silently return 0 — a silent 0 would make
-    // `isVolatileQualified`/`isAtomicQualified` false, DROPPING the qualifier, which
-    // is the exact silent-miscompile class this refactor exists to prevent.
+    // ⚠ P66 RETIRED HALF OF THIS INVARIANT IN PLACE, because the sentence that used
+    // to stand here went FALSE rather than stale and a false premise under a fatal is
+    // worse than no comment. It read: "A real qualifier ALWAYS carries exactly one
+    // nonzero-mask scalar (the sole producer `qualified` never mints a skin with a
+    // zero/absent mask — a zero mask returns the material type, no skin)." Since the
+    // skin also carries a TYPE-LEVEL ALIGNMENT, `qualified(int, 0, 8)` is a
+    // legitimate record whose mask IS zero, and returning 0 for it is CORRECT —
+    // `isVolatileQualified`/`isAtomicQualified` must be false on an alignment-only
+    // decoration. What survives untouched is the condition below: no producer can
+    // mint a skin with NO scalar at all, so that remains a corrupt invariant and
+    // still FAILS LOUD rather than silently returning 0 and dropping a qualifier.
     if (rec.scalarCount == 0)
         latticeFatal("qualifierBits: VolatileQual record has no mask scalar");
     return scalarPool_[rec.scalarStart];
+}
+
+std::uint32_t TypeInterner::typeAlignOverride(TypeId id) const {
+    // RAW read of the type-level alignment in scalar slot 1, for the same reason
+    // `qualifierBits` reads slot 0 raw. A one-scalar skin is a pre-P66 qualifier and
+    // carries no alignment — absence is 0, never a fatal, because EVERY qualifier
+    // record minted before this channel existed is legitimately in that shape.
+    if (!id.valid()) return 0;
+    TypeRecord const& rec = arena_.at(id);
+    if (rec.kind != TypeKind::VolatileQual) return 0;
+    if (rec.scalarCount < 2) return 0;
+    return static_cast<std::uint32_t>(scalarPool_[rec.scalarStart + 1]);
 }
 
 bool TypeInterner::isVolatileQualified(TypeId id) const {

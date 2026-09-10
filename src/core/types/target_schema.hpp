@@ -710,14 +710,26 @@ struct DSS_EXPORT TargetRegisterClassOps {
 // signalling NaN's quiet bit (0x7fff…a55a → 0xffff…a55a; 0x7fff…0033 →
 // 0xffff…0033) — a pure sign-bit flip, so the difference from the references is
 // a peephole, not a semantic one.
+// ⓘ THE FOUR `from_i*`/`from_u*` ROWS (LD-7, D-TARGET-ENCODING-WIDTH-GUARD)
+// ARE THE INTEGER-SOURCE DIRECTION, and they are FOUR rather than two because
+// the helper libgcc exports differs on BOTH axes of the source: its WIDTH
+// (`__float{s,d}itf` = 32-bit / 64-bit) and its SIGNEDNESS (`__floatun*`).
+// Collapsing any pair would still lower, still call a defined symbol and
+// still return a plausible number — a 64-bit source through `__floatsitf`
+// reads half the value, and an unsigned one through `__floatditf` reads
+// every value at or above 2^63 as negative. ✔MEASURED 2026-09-09 that both
+// aarch64 references emit exactly one `bl` per spelling, all four distinct,
+// probed separately (aarch64-linux-gnu-gcc 13.3.0 at −O0 and −O2, clang
+// 18.1.3 --target=aarch64-linux-gnu at −O2).
 enum class WideFloatOp : std::uint8_t {
     Add = 0, Sub = 1, Mul = 2, Div = 3, ToInt32 = 4, FromFloat64 = 5,
     CmpLt = 6, CmpLe = 7, CmpGt = 8, CmpGe = 9, CmpEq = 10, CmpNe = 11,
     Neg = 12, ToUInt32 = 13, ToInt64 = 14, ToFloat64 = 15, ToFloat32 = 16,
-    FromFloat32 = 17,
+    FromFloat32 = 17, ToUInt64 = 18, FromInt32 = 19, FromUInt32 = 20,
+    FromInt64 = 21, FromUInt64 = 22,
 };
-inline constexpr std::size_t kWideFloatOpCount = 18;
-inline constexpr EnumNameTable<WideFloatOp, 18> kWideFloatOpTable{{{
+inline constexpr std::size_t kWideFloatOpCount = 23;
+inline constexpr EnumNameTable<WideFloatOp, 23> kWideFloatOpTable{{{
     { WideFloatOp::Add, "add" }, { WideFloatOp::Sub, "sub" },
     { WideFloatOp::Mul, "mul" }, { WideFloatOp::Div, "div" },
     { WideFloatOp::ToInt32, "to_i32" }, { WideFloatOp::FromFloat64, "from_f64" },
@@ -728,6 +740,11 @@ inline constexpr EnumNameTable<WideFloatOp, 18> kWideFloatOpTable{{{
     { WideFloatOp::ToInt64, "to_i64" }, { WideFloatOp::ToFloat64, "to_f64" },
     { WideFloatOp::ToFloat32, "to_f32" },
     { WideFloatOp::FromFloat32, "from_f32" },
+    { WideFloatOp::ToUInt64, "to_u64" },
+    { WideFloatOp::FromInt32, "from_i32" },
+    { WideFloatOp::FromUInt32, "from_u32" },
+    { WideFloatOp::FromInt64, "from_i64" },
+    { WideFloatOp::FromUInt64, "from_u64" },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate

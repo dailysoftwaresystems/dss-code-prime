@@ -9778,14 +9778,31 @@ TEST(MirToLir, F80ToIntegerPicksTheTruncatingStoreWidthTheResultNeeds) {
     }
 }
 
-TEST(MirToLir, F80UnsignedSixtyFourBitConversionStaysWalledLoud) {
-    // ⛔ THE STATED BOUNDARY, pinned so it cannot drift into a silent answer.
-    // `(unsigned long long)ld` has NO x87 realization: above 2^63 both
-    // references COMPARE against 2^63, subtract, convert, and flip the result's
-    // top bit — a BRANCHING sequence this straight-line lowerer cannot emit. It
-    // must therefore keep failing loud, naming this anchor, rather than reuse
-    // the signed 64-bit store (which would return a negative number for every
-    // value above 2^63).
+TEST(MirToLir, F80UnsignedSixtyFourBitConversionIsTheBiasedSelectInOrder) {
+    // ⚠ THIS TEST REPLACES A WALL PIN. Until P66 the arm here asserted that
+    // `(unsigned long double)ld` must NOT lower, on the row's premise that
+    // above 2^63 "both references COMPARE against 2^63, subtract, convert and
+    // flip the result's top bit — a BRANCHING sequence this straight-line
+    // lowerer cannot emit". ✔THE PREMISE WAS MEASURED FALSE: clang 18.1.3's own
+    // x87 expansion is branchless (`fucomi`/`setbe`/`fldz`/`fcmovbe`, only gcc
+    // branches), and DSS's realization is branchless WITHOUT even a conditional
+    // move — the same truncate-both-and-select algebra x86_64.target.json
+    // already declares for `fp_to_ui` from an F64 source.
+    //
+    // ★ THE ORDER IS THE PIN, not the multiset. Every instruction below is one
+    // this file already sees elsewhere; what makes them a CORRECT conversion is
+    // the sequence:
+    //
+    //   fld_m80 [src] ; fisttp_m64        the DIRECT truncation → lo
+    //   fld_m80 [src] ; fld_m64 [bias]    the source, then the BIAS on top
+    //   fsubp                             st1 − st0 = src − bias
+    //   fisttp_m64                        the BIASED truncation → hi
+    //
+    // Transpose the two pushes and `fsubp` computes bias − src, which is a pure
+    // reordering no arity, type or width check can see and which quietly
+    // negates the whole upper range. Swap the two truncations and the mask is
+    // taken from the biased result instead of the direct one, which makes every
+    // value BELOW 2^63 wrong instead. Both are pinned absolutely, by position.
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
@@ -9794,12 +9811,129 @@ TEST(MirToLir, F80UnsignedSixtyFourBitConversionStaysWalledLoud) {
                                          ::dss::MirOpcode::FPToUI);
     ::dss::DiagnosticReporter rep;
     auto result = ::dss::lowerToLir(m, **target, interner, rep);
-    EXPECT_FALSE(result.ok)
-        << "a 64-bit unsigned conversion from long double must NOT lower";
-    EXPECT_TRUE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
-        << "and it must wall at the encoded-width gate";
-    EXPECT_TRUE(sawAnchor(rep, "MIR FPToUI (source)"))
-        << "at the FPToUI-source reach of it";
+    ASSERT_TRUE(result.ok)
+        << "a 64-bit unsigned conversion from long double must lower: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        << "no width wall may fire any more";
+
+    // The x87 sub-sequence, in order and complete.
+    ::dss::LirBlockId const bb =
+        result.lir.funcBlockAt(result.lir.funcAt(0), 0);
+    std::vector<std::string> x87;
+    for (std::uint32_t i = 0; i < result.lir.blockInstCount(bb); ++i) {
+        auto const* info =
+            (*target)->opcodeInfo(result.lir.instOpcode(
+                result.lir.blockInstAt(bb, i)));
+        if (info == nullptr) continue;
+        if (info->mnemonic.rfind("f", 0) == 0)
+            x87.emplace_back(info->mnemonic);
+    }
+    std::vector<std::string> const want{"fld_m80", "fisttp_m64", "fld_m80",
+                                        "fld_m64", "fsubp", "fisttp_m64"};
+    EXPECT_EQ(x87, want)
+        << "the x87 sequence must be exactly the direct truncation, then the "
+           "source, then the bias, then the subtraction, then the biased "
+           "truncation — in that order";
+
+    // The narrower truncating store must NOT appear: `unsigned long long`
+    // reaches 2^64-1 and a 32-bit store answers with the indefinite.
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "fisttp_m32"), 0)
+        << "a 32-bit truncating store cannot hold this range";
+    // The integer tail: the range mask and the two-op recombine.
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "shr_a"), 1)
+        << "the range mask is an ARITHMETIC shift of the direct result — a "
+           "logical one yields 0 or 1 and selects nothing";
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "and"), 1);
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "or"), 1);
+    // Every 64-bit step really is 64 bits. A width-32 shift or reload would
+    // discard the whole upper half of the answer with no diagnostic.
+    for (char const* mn : {"shr_a", "and", "or"}) {
+        auto const w = widthsOfMnemonic(result.lir, **target, mn);
+        ASSERT_EQ(w.size(), 1u) << mn;
+        EXPECT_EQ(w[0], 64u) << mn << " must operate on the whole 64-bit value";
+    }
+}
+
+TEST(MirToLir, F80UnsignedSixtyFourBitMaskComesFromTheDirectTruncation) {
+    // The DIRECTION arm, separate from the order arm above because the order
+    // arm reads only mnemonics and a mis-WIRED select emits the same six.
+    //
+    // `mask = lo >>a 63` is all-ones EXACTLY when the DIRECT truncation went to
+    // the integer indefinite. Take the mask from the BIASED result instead and
+    // the sequence still lowers, still has one shift and one and/or, and
+    // returns a plausible number that is wrong for every input below 2^63.
+    // So the shift's source register is pinned to be the FIRST slot reload —
+    // the one emitted before any `fld_m64` — absolutely, not relatively.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatConvert(interner, ::dss::TypeKind::F80,
+                                         ::dss::TypeKind::U64,
+                                         ::dss::MirOpcode::FPToUI);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    auto const loadOp  = (*target)->opcodeByMnemonic("load");
+    auto const biasOp  = (*target)->opcodeByMnemonic("fld_m64");
+    auto const shiftOp = (*target)->opcodeByMnemonic("shr_a");
+    ASSERT_TRUE(loadOp.has_value() && biasOp.has_value()
+                && shiftOp.has_value());
+    ::dss::LirBlockId const bb =
+        result.lir.funcBlockAt(result.lir.funcAt(0), 0);
+    std::optional<::dss::LirReg> firstReload;   // the DIRECT truncation's value
+    bool                         seenBias = false;
+    std::optional<::dss::LirReg> shiftSrc;
+    for (std::uint32_t i = 0; i < result.lir.blockInstCount(bb); ++i) {
+        auto const inst = result.lir.blockInstAt(bb, i);
+        auto const op   = result.lir.instOpcode(inst);
+        if (op == *biasOp) { seenBias = true; continue; }
+        if (op == *loadOp && !seenBias && !firstReload.has_value())
+            firstReload = result.lir.instResult(inst);
+        if (op == *shiftOp) {
+            auto const ops = result.lir.instOperands(inst);
+            ASSERT_FALSE(ops.empty());
+            shiftSrc = ops[0].reg;
+        }
+    }
+    ASSERT_TRUE(firstReload.has_value())
+        << "the direct truncation must reload its slot before the bias is "
+           "pushed";
+    ASSERT_TRUE(shiftSrc.has_value()) << "the range mask must exist";
+    EXPECT_EQ(*shiftSrc, *firstReload)
+        << "the range mask must be an arithmetic shift of the DIRECT "
+           "truncation — taking it from the biased one inverts which range the "
+           "select trusts, silently";
+}
+
+TEST(MirToLir, F80UnsignedSixtyFourBitBiasIsTwoToTheSixtyThirdInBinary64) {
+    // THE CONSTANT IS THE SILENT HALF. A wrong bias leaves the sequence
+    // lowering, the order pin green and the direction pin green, and produces a
+    // wrong answer ONLY above 2^63 — the range the previous witness could not
+    // even compile. It must be exactly 0x43E0000000000000, the binary64
+    // encoding of 2^63, which is also the constant the target's own F64
+    // `fp_to_ui` lowering sequence names for the identical purpose.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatConvert(interner, ::dss::TypeKind::F80,
+                                         ::dss::TypeKind::U64,
+                                         ::dss::MirOpcode::FPToUI);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    bool found = false;
+    for (std::size_t i = 0; i < result.lir.literalPool().size(); ++i) {
+        auto const& v =
+            result.lir.literalPool().at(static_cast<std::uint32_t>(i));
+        if (auto const* u = std::get_if<std::uint64_t>(&v.value))
+            if (*u == 0x43E0000000000000ULL) found = true;
+    }
+    EXPECT_TRUE(found)
+        << "the biased arm must subtract exactly 2^63; any other constant is "
+           "wrong only above 2^63 and silent below it";
 }
 
 TEST(MirToLir, F128ConversionsCallTheHelperBothReferencesEmit) {
@@ -9819,9 +9953,17 @@ TEST(MirToLir, F128ConversionsCallTheHelperBothReferencesEmit) {
         ::dss::MirOpcode op;
         char const*      helper;
     };
-    std::array<Case, 6> const cases{{
+    std::array<Case, 7> const cases{{
         {::dss::TypeKind::F128, ::dss::TypeKind::U32,
          ::dss::MirOpcode::FPToUI,  "__fixunstfsi"},
+        // P66: the LAST conversion of the surface. ⚠ IT IS NOT `__fixtfdi`
+        // AND THE DIFFERENCE IS SILENT — ✔MEASURED under qemu-aarch64 that
+        // `__fixtfdi` SATURATES to 0x7FFFFFFFFFFFFFFF for every value at or
+        // above 2^63, so routing the unsigned 64-bit cast through it would
+        // lower, run, and answer the whole upper half of the range with one
+        // wrong constant. Both aarch64 references call `__fixunstfdi`.
+        {::dss::TypeKind::F128, ::dss::TypeKind::U64,
+         ::dss::MirOpcode::FPToUI,  "__fixunstfdi"},
         {::dss::TypeKind::F128, ::dss::TypeKind::I64,
          ::dss::MirOpcode::FPToSI,  "__fixtfdi"},
         {::dss::TypeKind::F128, ::dss::TypeKind::F64,
@@ -9862,6 +10004,591 @@ TEST(MirToLir, F128ConversionsCallTheHelperBothReferencesEmit) {
             << "the negate helper — deliberately a CALL where both references "
                "flip the sign bit inline, because the inline form would put a "
                "binary128's sign-bit BYTE OFFSET in the shared lowerer";
+    }
+}
+
+TEST(MirToLir, F128UnsignedSixtyFourBitConversionFailsLoudWithoutItsConfigRow) {
+    // RED-ON-DISABLE, the agnosticism condition, in the REMOVE direction
+    // ([[feedback-a-fixture-must-synthesize-the-negative]]): the SAME cast
+    // against x86_64, which declares F128 (it is a legal TypeKind there) but
+    // carries NO wideFloatSoftcalls table at all, must FAIL LOUD rather than
+    // reach for a helper nobody declared. This is what proves the arm is gated
+    // on the PRESENCE of the `to_u64` row and not on the target's identity.
+    //
+    // ⓘ It also proves the two axes really are separate realizations: x86_64 is
+    // the target whose F80 arm ships the biased select, and an F128 value there
+    // still walls.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    EXPECT_EQ((*target)->wideFloatSoftcall(::dss::WideFloatOp::ToUInt64),
+              nullptr)
+        << "x86_64 must declare NO binary128 to_u64 row (the premise)";
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatConvert(interner, ::dss::TypeKind::F128,
+                                         ::dss::TypeKind::U64,
+                                         ::dss::MirOpcode::FPToUI);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    EXPECT_FALSE(result.ok)
+        << "an F128 unsigned 64-bit conversion on a target with no row must "
+           "fail loud, not silently take some other helper";
+    EXPECT_TRUE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        << "the fall-through must hit the encoded-width gate";
+    EXPECT_TRUE(sawAnchor(rep, "MIR FPToUI (source)"))
+        << "at the FPToUI-source reach of it";
+}
+
+// ══ LD-7 (D-TARGET-ENCODING-WIDTH-GUARD): INTEGER → `long double` ═══════════
+//
+// The last direction of the surface. ★ WHY "IT LOWERS" IS AGAIN NOT ENOUGH,
+// per arm — none of these faults when it is wrong:
+//   (a) `fild` IS NOT `fld`, and at 32 bits they are DB /0 against D9 /0 — the
+//       same /digit, the same operand shape, one opcode byte apart. An `fld`
+//       where an `fild` was meant reinterprets the integer's BITS as a float
+//       (the integer 5 becomes 7e-45).
+//   (b) THE UNSIGNED-32 RANGE. `fild m32` reads its four bytes SIGNED, so every
+//       `unsigned` at or above 2^31 arrives NEGATIVE unless the value is
+//       zero-extended into a 64-bit slot first — the exact mirror of the
+//       `(unsigned)ld` narrowing arm one direction over.
+//   (c) THE UNSIGNED-64 SPLIT. `2·(u>>1) + (u&1)` is exact in a 64-bit
+//       significand and has four independent ways to be silently wrong: the
+//       shift's KIND, the shift's SOURCE, the mask's VALUE, and WHICH slot each
+//       of the three pushes reads.
+//   (d) THE ieee128 HELPER SET. `__float{,un}{s,d}itf` differ on BOTH axes of
+//       the source; collapsing any pair still calls a defined symbol.
+
+TEST(MirToLir, IntToF80UsesTheWidthExactIntegerLoad) {
+    // The three straight arms plus the split's own mnemonic budget. Each case
+    // pins the `fild` form it MUST use, the one it must NOT (they differ in one
+    // opcode byte), that no `fld_m32`/`fld_m64` appears at all (hazard (a) —
+    // those read the same bytes as a FLOAT), the spill store's own WIDTH, and
+    // whether a register widening happened.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    struct Case {
+        ::dss::TypeKind  src;
+        ::dss::MirOpcode op;
+        char const*      form;      // the fild width this must use
+        char const*      formNot;
+        int              fildCount; // the split pushes three times
+        int              zexts;     // register widenings expected
+        unsigned         storeBits; // the spill store's own width
+        char const*      why;
+    };
+    std::array<Case, 4> const cases{{
+        {::dss::TypeKind::I32, ::dss::MirOpcode::SIToFP,
+         "fild_m32", "fild_m64", 1, 0, 32,
+         "a signed 32-bit source IS what `fild m32` reads; widening it would "
+         "cost an instruction and change nothing"},
+        {::dss::TypeKind::U32, ::dss::MirOpcode::UIToFP,
+         "fild_m64", "fild_m32", 1, 1, 64,
+         "an `unsigned` at or above 2^31 read through the SIGNED 32-bit form "
+         "arrives negative — it must be zero-extended in a REGISTER and read "
+         "back out of a 64-bit slot"},
+        {::dss::TypeKind::I64, ::dss::MirOpcode::SIToFP,
+         "fild_m64", "fild_m32", 1, 0, 64,
+         "a 64-bit signed source is one instruction"},
+        {::dss::TypeKind::U64, ::dss::MirOpcode::UIToFP,
+         "fild_m64", "fild_m32", 3, 0, 64,
+         "the exact split pushes the halved slot twice and the low bit once; "
+         "it needs no widening because both halves are already below 2^63"},
+    }};
+    for (auto const& c : cases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildWideFloatConvert(interner, c.src,
+                                             ::dss::TypeKind::F80, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << c.form << ": the conversion must lower: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+            << c.form << ": no width wall may fire any more";
+        EXPECT_EQ(countLirMnemonic(result.lir, **target, c.form), c.fildCount)
+            << c.form << ": " << c.why;
+        EXPECT_EQ(countLirMnemonic(result.lir, **target, c.formNot), 0)
+            << c.formNot << " must NOT appear — it differs from " << c.form
+            << " in ONE opcode byte and reads the wrong number of bytes with "
+               "no diagnostic anywhere";
+        for (char const* fld : {"fld_m32", "fld_m64"}) {
+            EXPECT_EQ(countLirMnemonic(result.lir, **target, fld), 0)
+                << fld << " must NOT appear: it reads the SAME bytes as a "
+                          "FLOAT, so an integer 5 would become 7e-45 — and it "
+                          "is one opcode byte from the fild form";
+        }
+        EXPECT_EQ(countLirMnemonic(result.lir, **target, "zext"), c.zexts)
+            << c.form << ": " << c.why;
+        // TWO pop-stores and ONE push of an m80: the conversion writes the
+        // value's own 16-byte home, and this fixture's `*pr = …` then copies
+        // that home to the caller's (`fld_m80 [home]; fstp_m80 [pr]`, the
+        // shared wide-float home copy). Counting them pins BOTH that the
+        // conversion pops its stack exactly once and that nothing else pushed.
+        EXPECT_EQ(countLirMnemonic(result.lir, **target, "fstp_m80"), 2)
+            << c.form << ": one pop-store into the value's home, one for the "
+                         "store to the destination";
+        EXPECT_EQ(countLirMnemonic(result.lir, **target, "fld_m80"), 1)
+            << c.form << ": the ONLY m80 push is the home copy's — the "
+                         "conversion itself pushes an INTEGER, never a float";
+        // The spill store's width. A width-64 store into the 4-byte slot writes
+        // past it; a width-32 store into the 8-byte slot leaves the upper half
+        // of the quadword `fild_m64` reads UNINITIALIZED. Both are silent.
+        auto const stores = widthsOfMnemonic(result.lir, **target, "store");
+        ASSERT_FALSE(stores.empty())
+            << c.form << ": the integer must reach memory — the x87 stack has "
+                         "no path from the integer register file";
+        EXPECT_EQ(stores[0], c.storeBits)
+            << c.form << ": the spill store must be the SLOT's width";
+    }
+}
+
+TEST(MirToLir, UInt64ToF80IsTheExactSplitInOrder) {
+    // ★ THE ORDER IS THE PIN, not the multiset. `2·half + odd` and
+    // `2·odd + half` emit exactly the same six instructions.
+    //
+    //   fild_m64 [half] ; fild_m64 [half] ; faddp    the doubling
+    //   fild_m64 [odd]  ; faddp                      the low bit back
+    //   fstp_m80 [home]
+    //
+    // and the x87 stack must start and end EMPTY (three pushes, two combining
+    // pops, one pop-store), which is the LD-1 model's invariant — leak one and
+    // the eight-deep stack overflows inside three conversions.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatConvert(interner, ::dss::TypeKind::U64,
+                                         ::dss::TypeKind::F80,
+                                         ::dss::MirOpcode::UIToFP);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "a 64-bit unsigned source must convert to long double: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    ::dss::LirBlockId const bb =
+        result.lir.funcBlockAt(result.lir.funcAt(0), 0);
+    std::vector<std::string> x87;
+    for (std::uint32_t i = 0; i < result.lir.blockInstCount(bb); ++i) {
+        auto const* info =
+            (*target)->opcodeInfo(result.lir.instOpcode(
+                result.lir.blockInstAt(bb, i)));
+        if (info == nullptr) continue;
+        if (info->mnemonic.rfind("f", 0) != 0) continue;
+        x87.emplace_back(info->mnemonic);
+        // The conversion ENDS at its own pop-store; what follows in this
+        // fixture is the shared wide-float home copy for `*pr = …`, which is
+        // `lowerStore`'s shape and not this sequence's. Counted below rather
+        // than spelled here, so a change over there reds the count and not the
+        // ORDER pin.
+        if (info->mnemonic == "fstp_m80") break;
+    }
+    std::vector<std::string> const want{"fild_m64", "fild_m64", "faddp",
+                                        "fild_m64", "faddp", "fstp_m80"};
+    EXPECT_EQ(x87, want)
+        << "the x87 sequence must be exactly: push the halved value twice, add "
+           "them, push the low bit, add it, store — in that order";
+    // Nothing else pushed, and the two combining pops plus the store-pop leave
+    // the eight-deep stack exactly as they found it.
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "fild_m64"), 3);
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "faddp"), 2);
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "fsubp"), 0)
+        << "the split ADDS: a subtraction here is the biased-select algebra of "
+           "the OPPOSITE direction, which does not travel";
+}
+
+TEST(MirToLir, UInt64ToF80DoublesTheHalvedSlotAndNotTheLowBitOne) {
+    // The WIRING arm, separate from the order arm above because the order arm
+    // reads only mnemonics: `2·odd + half` emits the identical six. So the
+    // first two pushes are pinned to read the SAME address and the third a
+    // DIFFERENT one, and the third's address is pinned to be the slot the
+    // low-bit `and` was stored through — absolutely, not relatively.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatConvert(interner, ::dss::TypeKind::U64,
+                                         ::dss::TypeKind::F80,
+                                         ::dss::MirOpcode::UIToFP);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
+    auto const fildOp  = (*target)->opcodeByMnemonic("fild_m64");
+    auto const storeOp = (*target)->opcodeByMnemonic("store");
+    auto const andOp   = (*target)->opcodeByMnemonic("and");
+    ASSERT_TRUE(fildOp.has_value() && storeOp.has_value() && andOp.has_value());
+    ::dss::LirBlockId const bb =
+        result.lir.funcBlockAt(result.lir.funcAt(0), 0);
+    std::vector<::dss::LirReg> fildAddrs;
+    std::optional<::dss::LirReg> andResult;
+    std::optional<::dss::LirReg> lowBitSlot;   // the slot `and`'s value went to
+    for (std::uint32_t i = 0; i < result.lir.blockInstCount(bb); ++i) {
+        auto const inst = result.lir.blockInstAt(bb, i);
+        auto const op   = result.lir.instOpcode(inst);
+        if (op == *andOp) { andResult = result.lir.instResult(inst); continue; }
+        if (op == *storeOp && andResult.has_value()) {
+            auto const ops = result.lir.instOperands(inst);
+            ASSERT_GE(ops.size(), 2u);
+            if (ops[0].reg == *andResult) lowBitSlot = ops[1].reg;
+            continue;
+        }
+        if (op == *fildOp) {
+            auto const ops = result.lir.instOperands(inst);
+            ASSERT_FALSE(ops.empty());
+            fildAddrs.push_back(ops[0].reg);
+        }
+    }
+    ASSERT_EQ(fildAddrs.size(), 3u) << "three integer pushes";
+    ASSERT_TRUE(lowBitSlot.has_value())
+        << "the masked low bit must be spilled to a slot of its own";
+    EXPECT_EQ(fildAddrs[0], fildAddrs[1])
+        << "the doubling must add the HALVED value to ITSELF — two different "
+           "slots there would be adding two different numbers";
+    EXPECT_NE(fildAddrs[0], fildAddrs[2])
+        << "the third push must NOT re-read the halved slot: that computes "
+           "3·half and is wrong for every odd input";
+    EXPECT_EQ(fildAddrs[2], *lowBitSlot)
+        << "the third push must read the LOW-BIT slot — reading the halved one "
+           "there, or transposing the two, emits the identical six mnemonics "
+           "and returns a plausible wrong number";
+}
+
+TEST(MirToLir, UInt64ToF80HalvesLogicallyAndMasksExactlyTheLowBit) {
+    // THE TWO SILENT SCALARS. Both leave the order pin green, the wiring pin
+    // green, and the sequence lowering:
+    //   * an ARITHMETIC shift replicates the sign bit, so every value at or
+    //     above 2^63 is read by `fild m64` as NEGATIVE — ✔MEASURED on real
+    //     silicon that the arithmetic variant answers −9223372036854763463
+    //     where 9223372036854788153 was wanted;
+    //   * a mask other than 1 keeps bits the doubling already carried, which is
+    //     wrong only for inputs whose low bits are set.
+    // Both are pinned by VALUE, and the shift's source is pinned to be the
+    // conversion's own source (the same register the mask reads).
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatConvert(interner, ::dss::TypeKind::U64,
+                                         ::dss::TypeKind::F80,
+                                         ::dss::MirOpcode::UIToFP);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "shr_l"), 1)
+        << "exactly one halving";
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "shr_a"), 0)
+        << "the halving must be LOGICAL: an arithmetic shift replicates the "
+           "sign bit and every value at or above 2^63 is then read negative";
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "and"), 1);
+    for (char const* mn : {"shr_l", "and"}) {
+        auto const w = widthsOfMnemonic(result.lir, **target, mn);
+        ASSERT_EQ(w.size(), 1u) << mn;
+        EXPECT_EQ(w[0], 64u)
+            << mn << " must operate on the whole 64-bit value — a width-32 arm "
+                     "discards the half of the range this split exists for";
+    }
+    auto const shiftOp = (*target)->opcodeByMnemonic("shr_l");
+    auto const andOp   = (*target)->opcodeByMnemonic("and");
+    auto const movOp   = (*target)->opcodeByMnemonic("mov");
+    ASSERT_TRUE(shiftOp.has_value() && andOp.has_value() && movOp.has_value());
+    ::dss::LirBlockId const bb =
+        result.lir.funcBlockAt(result.lir.funcAt(0), 0);
+    std::optional<::dss::LirReg> shiftSrc, shiftAmt, andSrc, maskReg;
+    std::optional<std::int32_t>  maskImm;
+    std::vector<std::pair<::dss::LirReg, std::int32_t>> movImms;
+    for (std::uint32_t i = 0; i < result.lir.blockInstCount(bb); ++i) {
+        auto const inst = result.lir.blockInstAt(bb, i);
+        auto const op   = result.lir.instOpcode(inst);
+        auto const ops  = result.lir.instOperands(inst);
+        if (op == *movOp && ops.size() == 1
+            && ops[0].kind == ::dss::LirOperandKind::ImmInt) {
+            movImms.emplace_back(result.lir.instResult(inst), ops[0].immInt32);
+        } else if (op == *shiftOp) {
+            ASSERT_GE(ops.size(), 2u);
+            shiftSrc = ops[0].reg;
+            if (ops[1].kind == ::dss::LirOperandKind::ImmInt)
+                EXPECT_EQ(ops[1].immInt32, 1)
+                    << "the halving must be by ONE: any other amount makes "
+                       "2·(u>>k) + (u&1) something other than u";
+            else
+                shiftAmt = ops[1].reg;
+        } else if (op == *andOp) {
+            ASSERT_GE(ops.size(), 2u);
+            andSrc  = ops[0].reg;
+            maskReg = ops[1].reg;
+        }
+    }
+    ASSERT_TRUE(shiftSrc.has_value() && andSrc.has_value()
+                && maskReg.has_value());
+    EXPECT_EQ(*shiftSrc, *andSrc)
+        << "the halving and the low-bit mask must read the SAME value — the "
+           "conversion's own source";
+    for (auto const& [r, v] : movImms) {
+        if (r == *maskReg) maskImm = v;
+        if (shiftAmt.has_value() && r == *shiftAmt)
+            EXPECT_EQ(v, 1) << "the halving must be by ONE";
+    }
+    ASSERT_TRUE(maskImm.has_value())
+        << "the low-bit mask must be a materialized immediate";
+    EXPECT_EQ(*maskImm, 1)
+        << "the mask must be exactly 1: a wider one keeps bits the doubling "
+           "already carried and is wrong only for inputs with low bits set";
+}
+
+TEST(MirToLir, IntToF128CallsTheHelperBothReferencesEmit) {
+    // The binary128 half. FOUR helpers, not two: `__float{,un}{s,d}itf` differ
+    // on BOTH axes of the source — its width AND its signedness — and any
+    // collapse still lowers, still calls a DEFINED libgcc symbol and still
+    // returns a plausible number. A 64-bit source through `__floatsitf` reads
+    // half the value; an unsigned one through `__floatditf` reads every value
+    // at or above 2^63 as negative. ✔MEASURED 2026-09-09 that both aarch64
+    // references emit exactly one `bl` per spelling, all four distinct
+    // (aarch64-linux-gnu-gcc 13.3.0 at −O0/−O2, clang 18.1.3
+    // --target=aarch64-linux-gnu at −O2, probed separately), and that all four
+    // are DEFINED text exports of /usr/aarch64-linux-gnu/lib/libgcc_s.so.1
+    // (`nm -D`) — which matters because DSS EAGER-IMPORTS every symbol it names.
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    struct Case {
+        ::dss::TypeKind  src;
+        ::dss::MirOpcode op;
+        char const*      helper;
+        unsigned         argBits;   // the marshal move's own width
+    };
+    std::array<Case, 4> const cases{{
+        {::dss::TypeKind::I32, ::dss::MirOpcode::SIToFP, "__floatsitf",   32},
+        {::dss::TypeKind::U32, ::dss::MirOpcode::UIToFP, "__floatunsitf", 32},
+        {::dss::TypeKind::I64, ::dss::MirOpcode::SIToFP, "__floatditf",   64},
+        {::dss::TypeKind::U64, ::dss::MirOpcode::UIToFP, "__floatunditf", 64},
+    }};
+    for (auto const& c : cases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildWideFloatConvert(interner, c.src,
+                                             ::dss::TypeKind::F128, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = lowerF128Arm64(m, **target, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << c.helper << ": the conversion must lower to the softcall: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+            << c.helper << ": no width wall may fire";
+        ASSERT_EQ(result.externImports.size(), 1u)
+            << c.helper << ": exactly one helper may be imported";
+        EXPECT_EQ(result.externImports[0].mangledName, c.helper)
+            << c.helper << ": wrong helper for this conversion";
+        // ⚠ AND THE ARGUMENT IS MARSHALLED AT ITS OWN WIDTH. AAPCS64 §5.4.2
+        // leaves the bits above a 32-bit argument unspecified, so a `w`-form
+        // move is what makes `__floatsitf`'s `int` argument mean what it says;
+        // the 64-bit form would hand the helper whatever the register held.
+        // Read as the LAST `mov` before the call — the marshal, positionally,
+        // rather than "the first mov in the module", which is a different
+        // question that happens to have the same answer today.
+        auto const callOp = (*target)->opcodeByMnemonic("call");
+        ASSERT_TRUE(callOp.has_value());
+        ::dss::LirBlockId const bb =
+            result.lir.funcBlockAt(result.lir.funcAt(0), 0);
+        auto const movOp = (*target)->opcodeByMnemonic("mov");
+        ASSERT_TRUE(movOp.has_value());
+        std::optional<unsigned> marshalBits;
+        for (std::uint32_t i = 0; i < result.lir.blockInstCount(bb); ++i) {
+            auto const inst = result.lir.blockInstAt(bb, i);
+            auto const op   = result.lir.instOpcode(inst);
+            if (op == *movOp)
+                marshalBits = ::dss::lirInstWidthBits(result.lir.instFlags(inst));
+            if (op == *callOp) break;
+        }
+        ASSERT_TRUE(marshalBits.has_value())
+            << c.helper << ": the source must be moved into the ABI arg "
+                           "register before the call";
+        EXPECT_EQ(*marshalBits, c.argBits)
+            << c.helper << ": the marshal must be the SOURCE type's own width";
+    }
+}
+
+TEST(MirToLir, IntToF128FailsLoudWithoutItsConfigRow) {
+    // RED-ON-DISABLE, the agnosticism condition, in the REMOVE direction: the
+    // SAME conversions against x86_64, which declares F128 as a legal TypeKind
+    // but carries NO `wideFloatSoftcalls` table at all, must FAIL LOUD rather
+    // than reach for a helper nobody declared. This is what proves the arm is
+    // gated on the PRESENCE of the row and never on the target's identity —
+    // and x86_64 is precisely the target whose F80 arm DOES ship an inline
+    // realization, so the two axes really are separate.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    for (auto const wop : {::dss::WideFloatOp::FromInt32,
+                           ::dss::WideFloatOp::FromUInt32,
+                           ::dss::WideFloatOp::FromInt64,
+                           ::dss::WideFloatOp::FromUInt64}) {
+        EXPECT_EQ((*target)->wideFloatSoftcall(wop), nullptr)
+            << "x86_64 must declare NO binary128 integer-source row (premise)";
+    }
+    struct Case { ::dss::TypeKind src; ::dss::MirOpcode op; char const* name; };
+    std::array<Case, 4> const cases{{
+        {::dss::TypeKind::I32, ::dss::MirOpcode::SIToFP, "SIToFP"},
+        {::dss::TypeKind::U32, ::dss::MirOpcode::UIToFP, "UIToFP"},
+        {::dss::TypeKind::I64, ::dss::MirOpcode::SIToFP, "SIToFP"},
+        {::dss::TypeKind::U64, ::dss::MirOpcode::UIToFP, "UIToFP"},
+    }};
+    for (auto const& c : cases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildWideFloatConvert(interner, c.src,
+                                             ::dss::TypeKind::F128, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        EXPECT_FALSE(result.ok)
+            << c.name << ": an integer→F128 conversion on a target with no row "
+                         "must fail loud, not silently take some other helper";
+        EXPECT_TRUE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+            << c.name << ": the fall-through must hit the encoded-width gate";
+    }
+}
+
+TEST(MirToLir, LongDoubleToSubNativeIntegerUsesTheRegisterWidthNotTheMemoryOne) {
+    // ⚠⚠ THE ROW'S OWN DELEGATION FOR THIS WAS REFUTED BY MEASUREMENT, and the
+    // arm is written to make that refutation permanent. Until P66 the three
+    // long-double→integer dispatches asked `memAccessWidthFlags` for the
+    // RESULT's width — a question about how many BYTES an object of that type
+    // OCCUPIES — so an `unsigned char` result answered 8 and a `short` 16,
+    // widths no arm has, and `(short)ld` / `(unsigned char)ld` walled on BOTH
+    // long-double axes. The row's Closing-work cell delegated that to
+    // [[D-CSUBSET-SUBNATIVE-ALU-FORMS]]; ✔MEASURED at de1e83ef that
+    // `(unsigned char)someDouble`, `(short)someDouble`, `(signed char)someDouble`,
+    // `(unsigned char)someFloat` and `(unsigned char)someInt` ALL compiled rc 0
+    // on the same target, so the sub-native integer FORM was never missing.
+    //
+    // A conversion RESULT is a register-resident VALUE, and this pipeline holds
+    // a sub-native integer PROMOTED in a 32-bit register with its low bits
+    // significant (C 6.3.1.1); the narrowing realizes at the width-exact STORE.
+    // So every sub-native result must take the SAME realization the 32-bit one
+    // takes, and this arm pins that by EQUALITY of shape rather than by
+    // restating the shape — a future change to the 32-bit arm drags the
+    // sub-native ones with it or reds here.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    struct Case { ::dss::TypeKind dst; ::dss::MirOpcode op; char const* why; };
+    std::array<Case, 3> const signedCases{{
+        {::dss::TypeKind::I32, ::dss::MirOpcode::FPToSI, "the 32-bit REFERENCE"},
+        {::dss::TypeKind::I16, ::dss::MirOpcode::FPToSI, "`(short)ld`"},
+        {::dss::TypeKind::I8,  ::dss::MirOpcode::FPToSI, "`(signed char)ld`"},
+    }};
+    std::vector<std::pair<int, int>> signedShapes;   // (fisttp_m32, fisttp_m64)
+    for (auto const& c : signedCases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m =
+            buildWideFloatConvert(interner, ::dss::TypeKind::F80, c.dst, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << c.why << " must lower: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+            << c.why << ": no width wall may fire";
+        signedShapes.emplace_back(
+            countLirMnemonic(result.lir, **target, "fisttp_m32"),
+            countLirMnemonic(result.lir, **target, "fisttp_m64"));
+        auto const loads = widthsOfMnemonic(result.lir, **target, "load");
+        ASSERT_FALSE(loads.empty()) << c.why;
+        EXPECT_EQ(loads[0], 32u)
+            << c.why << ": the reload must be the REGISTER width (32), never "
+                        "the type's byte size — an 8- or 16-bit reload of the "
+                        "slot is a byte-order assumption AND a width no form has";
+    }
+    EXPECT_EQ(signedShapes[1], signedShapes[0])
+        << "`(short)ld` must take the SAME x87 realization as `(int)ld`";
+    EXPECT_EQ(signedShapes[2], signedShapes[0])
+        << "`(signed char)ld` must take the SAME x87 realization as `(int)ld`";
+
+    std::array<Case, 3> const unsignedCases{{
+        {::dss::TypeKind::U32, ::dss::MirOpcode::FPToUI, "the 32-bit REFERENCE"},
+        {::dss::TypeKind::U16, ::dss::MirOpcode::FPToUI, "`(unsigned short)ld`"},
+        {::dss::TypeKind::U8,  ::dss::MirOpcode::FPToUI, "`(unsigned char)ld`"},
+    }};
+    std::vector<std::tuple<int, int, int>> unsignedShapes;
+    for (auto const& c : unsignedCases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m =
+            buildWideFloatConvert(interner, ::dss::TypeKind::F80, c.dst, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << c.why << " must lower: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+            << c.why << ": no width wall may fire";
+        unsignedShapes.emplace_back(
+            countLirMnemonic(result.lir, **target, "fisttp_m64"),
+            countLirMnemonic(result.lir, **target, "fisttp_m32"),
+            countLirMnemonic(result.lir, **target, "trunc"));
+    }
+    EXPECT_EQ(unsignedShapes[1], unsignedShapes[0])
+        << "`(unsigned short)ld` must take the SAME realization as "
+           "`(unsigned)ld` — the SIGNED 64-bit truncating store plus a REGISTER "
+           "narrowing, because an unsigned range does not fit the signed store "
+           "one size down";
+    EXPECT_EQ(unsignedShapes[2], unsignedShapes[0])
+        << "`(unsigned char)ld` likewise";
+
+    // And the ieee128 axis reaches the SAME helper the 32-bit result does — a
+    // sub-native result is not a narrower libgcc call, it is the 32-bit call
+    // with the value left promoted in its register.
+    auto a64 = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(a64.has_value());
+    struct F128Case { ::dss::TypeKind dst; ::dss::MirOpcode op; char const* h; };
+    std::array<F128Case, 6> const f128{{
+        {::dss::TypeKind::I32, ::dss::MirOpcode::FPToSI, "__fixtfsi"},
+        {::dss::TypeKind::I16, ::dss::MirOpcode::FPToSI, "__fixtfsi"},
+        {::dss::TypeKind::I8,  ::dss::MirOpcode::FPToSI, "__fixtfsi"},
+        {::dss::TypeKind::U32, ::dss::MirOpcode::FPToUI, "__fixunstfsi"},
+        {::dss::TypeKind::U16, ::dss::MirOpcode::FPToUI, "__fixunstfsi"},
+        {::dss::TypeKind::U8,  ::dss::MirOpcode::FPToUI, "__fixunstfsi"},
+    }};
+    for (auto const& c : f128) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildWideFloatConvert(interner, ::dss::TypeKind::F128,
+                                             c.dst, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = lowerF128Arm64(m, **a64, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << c.h << ": a sub-native F128 conversion must lower: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        ASSERT_EQ(result.externImports.size(), 1u);
+        EXPECT_EQ(result.externImports[0].mangledName, c.h)
+            << "a sub-native result takes the 32-bit helper, not a narrower one";
+    }
+}
+
+TEST(MirToLir, SubNativeIntegerSourceToLongDoubleFailsLoudOnBothAxes) {
+    // The SOURCE-WIDTH wall, and it is ONE sentence for both axes because what
+    // is missing is the sub-native integer FORM and not a float width: the x87
+    // integer loads shipped here start at 32 bits and libgcc's binary128
+    // helpers take no narrower source either. Inventing a promotion in the
+    // lowerer would be this tier answering a front-end question.
+    // ⓘ It also proves the F80/F128 dispatch does not swallow a width it
+    // cannot serve — a silent 4-byte read of a 2-byte value.
+    struct Axis { char const* target; ::dss::TypeKind dst; };
+    std::array<Axis, 2> const axes{{
+        {"x86_64", ::dss::TypeKind::F80},
+        {"arm64",  ::dss::TypeKind::F128},
+    }};
+    struct Case { ::dss::TypeKind src; ::dss::MirOpcode op; };
+    std::array<Case, 4> const cases{{
+        {::dss::TypeKind::I16, ::dss::MirOpcode::SIToFP},
+        {::dss::TypeKind::U16, ::dss::MirOpcode::UIToFP},
+        {::dss::TypeKind::I8,  ::dss::MirOpcode::SIToFP},
+        {::dss::TypeKind::U8,  ::dss::MirOpcode::UIToFP},
+    }};
+    for (auto const& a : axes) {
+        auto target = ::dss::TargetSchema::loadShipped(a.target);
+        ASSERT_TRUE(target.has_value());
+        for (auto const& c : cases) {
+            ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+            ::dss::Mir m = buildWideFloatConvert(interner, c.src, a.dst, c.op);
+            ::dss::DiagnosticReporter rep;
+            auto result = ::dss::lowerToLir(m, **target, interner, rep);
+            EXPECT_FALSE(result.ok)
+                << a.target << ": a sub-native integer source must fail loud";
+            EXPECT_TRUE(sawAnchor(rep, "D-CSUBSET-SUBNATIVE-ALU-FORMS"))
+                << a.target << ": the refusal must name the anchor that OWNS "
+                               "the missing sub-native form";
+            EXPECT_TRUE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+                << a.target << ": and the gate a reader greps for";
+        }
     }
 }
 

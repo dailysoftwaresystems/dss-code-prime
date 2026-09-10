@@ -18,6 +18,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // D-PERF-4-CU-PARALLELISM: forward-declare the substrate executor so the
@@ -78,6 +79,44 @@ class IGitRunner;
 // that could not say which config. One function, one wording, so they cannot
 // drift into two renderings of one fact.
 DSS_EXPORT void reportConfigRootProvenance(std::ostream& err);
+
+// ── hirArtifactRoundTripFailure — DOES THIS `.dsshir` READ BACK? ─────────────
+//
+// ★★★ THE ONE PREDICATE BEHIND `--emit-hir`'s rc-0 PROMISE. Returns an EMPTY
+// string iff `artifact` parses through `parseHir` with no Error diagnostic AND
+// re-emits BYTE FOR BYTE; otherwise a human-readable reason naming where and
+// how the two halves of the codec disagreed. Pure and side-effect free: it
+// allocates a fresh interner, touches no global state, and reports nothing to
+// any caller's reporter — every diagnostic it collects comes back inside the
+// returned string, because a caller that succeeds must be able to say nothing
+// at all.
+//
+// ⚠⚠ IT IS A RE-EMIT AND A BYTE COMPARE, NEVER MERELY A PARSE, AND THE
+// DIFFERENCE IS THE WHOLE REASON THIS FUNCTION EXISTS.
+// D-HIR-TEXT-NODE-WALK-RECURSES-PER-LEVEL-ON-BOTH-HALVES-AND-THREE-SPELLINGS-DO-NOT-READ-BACK
+// found three shipped writer spellings the shipped reader could not read, and
+// the WORST of them — a `lit float` past 2^64, read back as 0.0 — parsed
+// perfectly cleanly and set `HirParseResult::ok`. Every "does it parse?" check
+// in this repository passed it. Byte identity is the only predicate that can
+// see a value the reader reconstructed DIFFERENTLY, because it compares the
+// reader's reconstruction against the writer's intent one token at a time.
+//
+// ★★ WHY IT IS A NAMED FUNCTION AND NOT A BLOCK INSIDE THE MODE. A check
+// embedded in `emitHirText` can only be reached by compiling a program whose
+// HIR this build cannot serialize — which, when the codec is correct, is no
+// program at all, so the refusal path would ship with no way to demonstrate it
+// ever fires. As a function it takes an ARTIFACT, so a test can hand it a
+// synthetic one carrying an unreadable spelling and watch it refuse BY NAME.
+// A guard that has never been shown to fail is exactly the vacuous pass this
+// project keeps paying for.
+//
+// ⓘ Expects CANONICAL text — what `emitHir` just produced. The grammar is
+// whitespace-insignificant on read, so a hand-reformatted artifact re-emits
+// canonically and is reported as a difference. That is correct for the callers
+// there are (both check freshly written output) and is what makes the compare
+// exact rather than approximate.
+[[nodiscard]] DSS_EXPORT std::string
+hirArtifactRoundTripFailure(std::string_view artifact);
 
 class DSS_EXPORT Program {
 public:
@@ -197,13 +236,32 @@ public:
     /// `.dsshir` text. Then STOP — no MIR, no codegen, no link, no object.
     ///
     /// Returns 0 IF AND ONLY IF DSS accepted the source AND the artifact was
-    /// written in full; non-zero means DSS rejected the input (or the write
-    /// failed) and said why on `err`. ★ That equivalence is the deliverable,
-    /// not a side effect: the consumer this exists for treats `rc == 0` as
-    /// *"this program is in our accepted set, and here is its HIR"*, so a
-    /// non-zero exit beside a good artifact — which is what HIR emission as a
-    /// `--compile` MODIFIER would produce on a link failure — would make the
-    /// status answer a question nobody asked.
+    /// written in full AND THIS BUILD'S OWN READER TOOK IT BACK BYTE FOR BYTE;
+    /// non-zero means DSS rejected the input, the round trip failed, or the
+    /// write failed, and said why on `err`. ★ That equivalence is the
+    /// deliverable, not a side effect: the consumer this exists for treats
+    /// `rc == 0` as *"this program is in our accepted set, and here is its
+    /// HIR"*, so a non-zero exit beside a good artifact — which is what HIR
+    /// emission as a `--compile` MODIFIER would produce on a link failure —
+    /// would make the status answer a question nobody asked.
+    ///
+    /// ★★ THE NON-ZERO CODE DISCRIMINATES, AND THE DISTINCTION IS THE
+    /// CONSUMER'S NEXT ACTION:
+    ///   * `1` — DSS REJECTED THE SOURCE (or the write failed). Fix the program.
+    ///   * `2` — the front end accepted the source and the writer produced an
+    ///     artifact, but `parseHir` could not read it back, or read it back as
+    ///     a DIFFERENT module (the re-emission differs byte for byte). That is
+    ///     a defect in this compiler's own text codec, never in the input.
+    /// In both cases NOTHING is written, so the binary contract a consumer
+    /// depends on — rc 0 ⇔ a readable artifact exists — is unchanged; `2` is a
+    /// refinement of the non-zero row, not a third state.
+    ///
+    /// ⚠ THE ROUND TRIP IS A RE-EMIT AND A BYTE COMPARE, NEVER MERELY A PARSE.
+    /// A writer spelling the reader mis-reads can still parse CLEAN — a `lit
+    /// float` past 2^64 came back as 0.0 with an empty reporter — so a check
+    /// that asserted only `HirParseResult::ok` would pass the silent half of
+    /// the defect class it exists to catch
+    /// (D-HIR-TEXT-NODE-WALK-RECURSES-PER-LEVEL-ON-BOTH-HALVES-AND-THREE-SPELLINGS-DO-NOT-READ-BACK).
     ///
     /// ⚠ A TRANSLATION UNIT THAT WOULD NOT LINK IS A NORMAL INPUT. A single
     /// function in isolation, a call to an undefined symbol, no `main` — all

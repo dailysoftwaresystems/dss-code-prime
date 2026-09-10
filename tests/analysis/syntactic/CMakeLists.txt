@@ -38,3 +38,13 @@ dss_add_test(NAME analysis/syntactic/test_parser_decl_specifier_order SOURCES te
 # while all three references refuse it. The mutant for red-on-disable is the
 # language DOCUMENT, not an object -- see the file header.
 dss_add_test(NAME analysis/syntactic/test_comma_list_empty_element SOURCES test_comma_list_empty_element.cpp)
+
+# P66 lane `cf` -- WHERE A C23 `[[...]]` ATTRIBUTE SEQUENCE MAY SIT IN A
+# DECLARATION. `static [[maybe_unused]] int m = 1;` compiled at rc 0 with zero
+# bytes on stderr, in TEN positions across five specifier-run rules, while gcc,
+# clang and MSVC all three refuse every one of them; the LEADING position they
+# all three accept had to survive, and so did the GNU `__attribute__` spelling,
+# which gcc and clang admit mid-run. The mutant for red-on-disable is the
+# language DOCUMENT -- see the file header.
+dss_add_test(NAME analysis/syntactic/test_decl_attribute_sequence_position
+             SOURCES test_decl_attribute_sequence_position.cpp)

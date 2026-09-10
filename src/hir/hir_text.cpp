@@ -355,10 +355,10 @@ static_assert([] {
 // (`struct "Node" rec 1 { … }`), but a marker is not a type head and the two
 // positions never collide: the marker is only ever read where a `{`/`packed`/
 // `opaque` may follow a name, the head only ever where a type may begin.
-inline constexpr std::array<std::string_view, 22> kHirTextTypeKeywords{
+inline constexpr std::array<std::string_view, 23> kHirTextTypeKeywords{
     "invalid", "ptr", "ref", "nullable", "optional", "slice", "complex",
-    "volatile", "atomic", "fnptr", "vec", "mat", "arr", "tuple", "struct",
-    "union", "enum", "fn", "ext", "_BitInt", "unsigned", "rec",
+    "volatile", "atomic", "aligned", "fnptr", "vec", "mat", "arr", "tuple",
+    "struct", "union", "enum", "fn", "ext", "_BitInt", "unsigned", "rec",
 };
 DSS_CHECK_KEY_VOCABULARY(kHirTextTypeKeywords);
 
@@ -1150,14 +1150,26 @@ private:
         // bits back into ONE skin on reintern (`atomic<volatile<T>>` → bits{V,A}), so
         // the round-trip is identity. `atomic` outermost is the canonical order (the
         // bitset is order-independent — this only fixes a deterministic spelling).
-        if (in.isVolatileQualified(t) || in.isAtomicQualified(t)) {
+        // ★★ P66 (lane `al`): the SAME argument, one channel over. A TYPE-LEVEL
+        // ALIGNMENT (GNU `aligned(N)` on a typedef) rides the same skin and is
+        // equally invisible to the kind switch, so it must be spelled here too or an
+        // over-aligned alias round-trips to a bare `i32` and the alignment is gone —
+        // write-only, exactly the volatile-drops-in-text gap the qualifier arm closed.
+        // Spelled `aligned<T, N>`, the `arr<T, N>` shape (operand first, scalar
+        // second) rather than a new punctuation. It is the OUTERMOST wrapper because
+        // `parseType` merges every skin back into ONE record regardless of nesting
+        // order, so the order only fixes a deterministic spelling.
+        std::uint32_t const typeAlign = in.typeAlignOverride(t);
+        if (typeAlign != 0 || in.isVolatileQualified(t) || in.isAtomicQualified(t)) {
             bool const atom = in.isAtomicQualified(t);
             bool const vol  = in.isVolatileQualified(t);
+            if (typeAlign != 0) out_ += "aligned<";
             if (atom) out_ += "atomic<";
             if (vol)  out_ += "volatile<";
             std::string closers;
             if (vol)  closers += '>';
             if (atom) closers += '>';
+            if (typeAlign != 0) closers += std::format(", {}>", typeAlign);
             pushText(std::move(closers));
             pushType(in.stripVolatile(t));   // the material type (skin stripped)
             return;
@@ -4949,6 +4961,12 @@ private:
             Vec,        // vec<T, N>
             Mat,        // mat<T, R, C>
             Arr,        // arr<T, N> — a derivation level
+            // P66 (lane `al`): aligned<T, N> — the TYPE-LEVEL alignment skin (GNU
+            // `aligned(N)` on a typedef). NOT a derivation level: it decorates T, it
+            // does not derive from it, so it must NOT touch `qualDepth_` the way
+            // `Arr`/`ptr` do — a decoration that claimed a level would shift the
+            // declarator spine every consumer of this text reconstructs.
+            Aligned,
             Tuple,      // tuple<T, …>
             Struct,     // struct "name" [packed] { T [@off | ~align] [packed], … }
             Union,      // union "name" [packed] { T [packed], … }
@@ -5111,6 +5129,15 @@ private:
         // carries the Atomic bit. Closes the pre-existing volatile-drops-in-text gap too.
         if (kw == "volatile") return wrap1(&TypeInterner::volatileQualified);
         if (kw == "atomic") return wrap1(&TypeInterner::atomicQualified);
+        // P66 (lane `al`): `aligned<T, N>` — the TYPE-LEVEL alignment skin. It takes a
+        // trailing scalar, so it cannot be a `wrap1` (whose builders are all
+        // `TypeId(TypeId)`); it pushes a frame and reads `, N >` on the way out, the
+        // `arr` shape.
+        if (kw == "aligned") {
+            expect(Tk::LAngle, "'<'");
+            stack.push_back(TypeParseFrame{.kind = Kind::Aligned});
+            return false;   // the decorated type comes next, then `, N >`
+        }
         // ★★ C23 `_BitInt(N)` / `unsigned _BitInt(N)` — THE INVERSE OF
         // `appendType`'s BitInt ARM, WHICH HAD NONE.
         //
@@ -5397,6 +5424,32 @@ private:
                 std::int64_t n = takeSignedInt();
                 expect(Tk::RAngle, "'>'");
                 io = interner_.array(io, n);
+                return true;
+            }
+            case Kind::Aligned: {
+                // P66 (lane `al`): the reader half of `appendType`'s `aligned<T, N>`.
+                // `typeAligned` STRIPS -> MERGES -> re-interns ONE skin, so a nested
+                // `aligned<volatile<i32>, 8>` lands as a single record carrying both
+                // the Volatile bit and the alignment, and the round-trip is an
+                // identity rather than a nesting that grows on every hop.
+                // ⚠ P66 (lane `ag`): the merge is REPLACE-ON-NON-ZERO, not MAX — the
+                // sentence above said MAX and that half went false when a
+                // weaker-than-natural request became honorable. It is inert for the
+                // round trip, which never writes a NESTED alignment: `appendType`
+                // emits ONE `aligned<>` frame per skin, so the reader sees at most one
+                // alignment per type. A hand-written `aligned<aligned<i32,8>,2>` now
+                // reads as 2 (the outer request), which is the same last-writer-wins
+                // rule a re-aliased typedef follows.
+                if (!haveOperand) { needHead = true; return false; }
+                expect(Tk::Comma, "','");
+                // UNSIGNED: unlike an array bound there is no negative sentinel here —
+                // an alignment is a power of two in [1, 256], validated at the semantic
+                // tier long before it is written. A negative would be a corrupt
+                // artifact, so let the unsigned reader refuse it rather than silently
+                // wrapping it into a huge alignment.
+                std::uint64_t n = takeInt();
+                expect(Tk::RAngle, "'>'");
+                io = interner_.typeAligned(io, static_cast<std::uint32_t>(n));
                 return true;
             }
             case Kind::Tuple:

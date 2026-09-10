@@ -3106,16 +3106,43 @@ struct Lowerer {
         storeComponent(re, complexCompAddr(dst, 0, cp.elemTy));
         storeComponent(im, complexCompAddr(dst, cp.elemSize, cp.elemTy));
     }
-    // A float constant of the element type — the real->complex construct's imag 0.0.
+    // A float constant of the element type — the real->complex construct's imag 0.0,
+    // and the comparison zero `!x` needs for a float operand.
     // MUST be promoted to an anonymous rodata global (GlobalAddr + Load), NOT a bare
     // MIR Const: register machines have no float-immediate form and the LirLiteralPool
     // has no float encoder path (a bare float Const walls at MIR->LIR — FC2 Part B).
-    // Mirrors the body-float-literal promotion (lowerExprNode Literal arm). F16/F80/
-    // F128 fall through to a bare Const → the LIR width guard walls loud (the long-
-    // double-complex arithmetic deferral, the SAME posture as a source F80 literal).
+    // Mirrors the body-float-literal promotion (lowerExprNode Literal arm).
+    //
+    // ★★ D-TARGET-ENCODING-WIDTH-GUARD (LD-7): F80 AND F128 NOW PROMOTE TOO, and
+    // this gate is the reason `!someLongDouble` did not compile. The width list
+    // here was F64/F32 only, so an F80/F128 zero fell through to a bare Const and
+    // dead-ended at MIR->LIR with `MIR Const %N is a float (FPR-class) literal`
+    // — a diagnostic that names THIS anchor. ⚠⚠ AND A CLOSED ROW SAYS OTHERWISE:
+    // [[D-CSUBSET-LOGICAL-NOT-ON-A-FLOAT-MINTS-A-BARE-FLOAT-CONST]] (P41, CLOSED)
+    // states in its trigger that "`!f`, `!d` and `!ld` compile", because it was
+    // ✔MEASURED on `x86_64:pe64-x86_64-windows-exec` — the ONE axis where
+    // `long double` IS `double`. Its own FIX note is correct that F16/F80/F128
+    // still fall through here; the headline and the body of that row disagree and
+    // the headline is the false half. ✔MEASURED 2026-09-09 at de1e83ef: `!ld` and
+    // `!!ld` refuse rc 1 on BOTH `elf64-x86_64-linux-exec` (F80) and
+    // `elf64-aarch64-linux-exec` (F128) while compiling on pe64, and so do
+    // `long double _Complex z = 2.0L;` and `!z` — three shapes, ONE gate.
+    //
+    // ★ THE PROMOTION ITSELF NEEDED NOTHING NEW: `lowerMirGlobalsToDataItems`
+    // already widens a `double`-armed literal to the 80- or 128-bit data item an
+    // F80/F128 global needs (that is how a source `long double ginit = 3.25L;`
+    // has worked since LD-1), and an F80/F128 Load from a global is exactly the
+    // memory-resident model LD-1/LD-2 built. So this substitutes a WORKING
+    // materialization for a wall rather than inventing one.
+    //
+    // ⓘ F16 STILL FALLS THROUGH, deliberately: it has no encodings at ANY width,
+    // so promoting it would pair it with a wrong-width load. It is also
+    // unreachable — no shipped `.lang.json` declares an `_Float16`/`__fp16`
+    // spelling, so no source program can form the value in the first place.
     [[nodiscard]] MirInstId elementFloatConst(double value, TypeId elemTy) {
         TypeKind const ek = interner.kind(elemTy);
-        if (ek == TypeKind::F64 || ek == TypeKind::F32) {
+        if (ek == TypeKind::F64 || ek == TypeKind::F32
+            || ek == TypeKind::F80 || ek == TypeKind::F128) {
             SymbolId const sym = mintSyntheticGlobalSymbol();
             if (!sym.valid()) return InvalidMirInst;
             MirLiteralValue lit;

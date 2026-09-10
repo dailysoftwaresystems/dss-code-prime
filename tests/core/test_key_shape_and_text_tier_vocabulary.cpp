@@ -1359,8 +1359,13 @@ TEST(TextTierVocabulary, EveryAdvertisedHirTypeKeywordIsRecognizedByTheReader) {
     auto const msg = refusalFor(kBadSpelling);
     ASSERT_FALSE(msg.empty()) << "the type arm must refuse an unknown keyword BY NAME";
     auto const advertised = advertisedIn(msg);
-    // 20 primitive spellings + 21 structural keywords.
-    EXPECT_EQ(advertised.size(), 42u)
+    // 20 primitive spellings + 22 structural keywords.
+    // P66 (lane `al`): 21 -> 22 structural, the new one being `aligned<T, N>` — the
+    // TYPE-LEVEL alignment skin for GNU `aligned(N)` on a typedef. The count moving is
+    // the POINT of this pin: a keyword added to `kHirTextTypeKeywords` and advertised
+    // by the refusal, but with no arm in `parseType`, would be advertised and then
+    // unreadable — which is exactly what the loop below checks for each name.
+    EXPECT_EQ(advertised.size(), 43u)
         << "the advertised type-keyword set changed size.\nmessage:\n  " << msg;
     for (auto const& kw : advertised) {
         SCOPED_TRACE(kw);

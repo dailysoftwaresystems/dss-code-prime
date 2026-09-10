@@ -252,9 +252,12 @@ bool checkKeysAgainst(json const& obj, std::span<std::string_view const> known,
 // its entries appertain to — which is the row this closes. Two readers would be
 // two chances to accept a grain-less entry.
 //
-// SHAPE: `[{ "rule": <name>, "appertainsTo": <grain> }, …]`. Both keys are
-// REQUIRED on every entry and the grain vocabulary is CLOSED
-// (`kAttrAppertainmentTable`).
+// SHAPE: `[{ "rule": <name>, "appertainsTo": <grain>,
+//            "standardSpellingAppertainsTo": <non-conferring grain>? }, …]`.
+// The first two keys are REQUIRED on every entry and the grain vocabulary is
+// CLOSED (`kAttrAppertainmentTable`); the third is OPTIONAL and exists because
+// a DECLARATION-level slot may name a run container holding BOTH attribute
+// spellings — see `AttrRunRule` in semantic_config.hpp for the reference matrix.
 //
 // ⚠ A BARE STRING IS REFUSED, DELIBERATELY, AND THE MESSAGE SAYS WHAT TO WRITE.
 // The tempting compatibility shim — accept a string and assume a grain — is the
@@ -283,8 +286,8 @@ bool checkKeysAgainst(json const& obj, std::span<std::string_view const> known,
 bool readAttrRunRules(json const& arr, RuleInterner const& rules,
                       std::string const& path, std::string_view keyLabel,
                       Collector& coll, std::vector<AttrRunRule>& out) {
-    static constexpr std::array<std::string_view, 2> kEntryKeys{
-        "rule", "appertainsTo"};
+    static constexpr std::array<std::string_view, 3> kEntryKeys{
+        "rule", "appertainsTo", "standardSpellingAppertainsTo"};
     DSS_CHECK_KEY_VOCABULARY(kEntryKeys);
     bool ok = true;
     if (!arr.is_array()) {
@@ -378,7 +381,70 @@ bool readAttrRunRules(json const& arr, RuleInterner const& rules,
             ok = false;
             continue;
         }
-        out.push_back(AttrRunRule{rules.find(rn), rn, *grain});
+        // ★★★ P66
+        // (D-C-THE-END-OF-SPECIFIERS-C23-ATTRIBUTE-CONFERS-ON-A-TYPEDEF-WHERE-NO-REFERENCE-CONFERS)
+        // — THE OPTIONAL PER-SPELLING GRAIN. A slot may name a RUN CONTAINER
+        // that holds BOTH attribute spellings (c's `typedefAttrRun` is
+        // `{repeat {alt: [attrSpec, stdAttr]}}`), and at the end of the
+        // declaration specifiers the references answer differently for the two:
+        // ✔MEASURED, `typedef int [[deprecated]] T; T x;` is IGNORED by gcc and
+        // REFUSED by clang and MSVC, while `typedef int
+        // __attribute__((deprecated)) T; T x;` is HONOURED by gcc and clang
+        // alike. See `AttrRunRule` for the full matrix and the C23 6.7p9
+        // reading behind it. ABSENT ⇒ `appertainsTo` governs both spellings,
+        // which is every existing entry's behaviour unchanged.
+        std::optional<AttrAppertainment> stdGrain;
+        if (e.contains("standardSpellingAppertainsTo")) {
+            if (!e.at("standardSpellingAppertainsTo").is_string()) {
+                coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                          std::format("'{}' entry '{}' declares "
+                                      "'standardSpellingAppertainsTo' as a "
+                                      "non-string; it takes one of {}",
+                                      keyLabel, rn,
+                                      renderAllowedList(
+                                          allNames(kAttrAppertainmentTable))));
+                ok = false;
+                continue;
+            }
+            std::string const stdName =
+                e.at("standardSpellingAppertainsTo").get<std::string>();
+            auto const parsed = attrAppertainmentFromName(stdName);
+            if (!parsed.has_value()) {
+                coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                          std::format("'{}' entry '{}' declares "
+                                      "standardSpellingAppertainsTo '{}', "
+                                      "which is not one of {}",
+                                      keyLabel, rn, stdName,
+                                      renderAllowedList(
+                                          allNames(kAttrAppertainmentTable))));
+                ok = false;
+                continue;
+            }
+            // ⚠ A CONFERRING OVERRIDE IS REFUSED, and the message says why
+            // rather than leaving half a knob wired. `appertainsTo` selects the
+            // SITE a run is folded at; this key changes only what the run
+            // confers once that site is chosen. Naming a grain that DOES confer
+            // would have to move the site as well, which this key cannot do —
+            // so it would silently mean something other than it says.
+            if (appertainmentConfers(*parsed)) {
+                coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                          std::format("'{}' entry '{}' declares "
+                                      "standardSpellingAppertainsTo '{}', a "
+                                      "grain that CONFERS. This key narrows "
+                                      "what the standard spelling confers at "
+                                      "the site 'appertainsTo' already selects; "
+                                      "it cannot move that site, so only a "
+                                      "non-conferring grain ('{}') is "
+                                      "expressible here",
+                                      keyLabel, rn, stdName,
+                                      attrAppertainmentName(
+                                          AttrAppertainment::Type)));
+                ok = false;
+                continue;
+            }
+            stdGrain = *parsed;
+        }
+        out.push_back(AttrRunRule{rules.find(rn), rn, *grain, stdGrain});
     }
     return ok;
 }
@@ -8830,7 +8896,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'semantics.declarators' must be an object of "
                               "declarator role names");
                 } else {
-                    static constexpr std::array<std::string_view, 22>
+                    static constexpr std::array<std::string_view, 23>
                         kDeclaratorKeys{
                             "declaratorRule",     "pointerLayerRule",
                             "pointerToken",       "directRule",
@@ -8873,8 +8939,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             "afterDeclaratorAttrRules",
                             // TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): the
                             // OPTIONAL third list shape — a comma-separated run of
-                            // BARE declarators (no init slot, no attribute run).
+                            // declarator slots with no initializer slot.
                             "plainListRule",
+                            // P66 (lane `ag`): its OPTIONAL per-slot WRAPPER, which
+                            // is what gives a MID-LIST declarator somewhere to carry
+                            // its own after-declarator attribute run.
+                            "plainSlotRule",
                             // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the OPTIONAL rule
                             // carrying an explicit assembler name for a declarator.
                             "asmLabelRule"};
@@ -9035,6 +9105,15 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // language without one behaves exactly as before).
                     readOptionalRuleRole("plainListRule", dc.plainListRule,
                                          dc.plainListRuleName);
+                    // P66 (lane `ag`): the OPTIONAL PER-SLOT WRAPPER of that list —
+                    // absent ⇒ its slots are BARE declarators and every walk behaves
+                    // exactly as it did. Declared INDEPENDENTLY of `plainListRule`
+                    // rather than nested under it: `isDeclaratorSlotWrapper` asks
+                    // only "is this rule a slot", never "which list is it in", and a
+                    // role that is read from one place is a role that cannot be read
+                    // two ways.
+                    readOptionalRuleRole("plainSlotRule", dc.plainSlotRule,
+                                         dc.plainSlotRuleName);
                     // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the OPTIONAL after-declarator
                     // assembler-name rule — absent ⇒ no asm-label surface, every
                     // init-detection scan degrades to its pre-TF-C88 behavior.

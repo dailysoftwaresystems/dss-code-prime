@@ -311,6 +311,17 @@ EXCLUDED_HEADERS = {
     ("destination", "the named gap"),
     ("pr", "branch", "what it is doing", "last update"),
     ("date", "commit", "what shipped", "gate"),
+    # ── P65's §0.2 through-line table (added 2026-09-09, read before adding) ──
+    # D-HARNESS-HANDOFF-PROSE-TABLE-LANDED-AFTER-THE-BALANCE-GATE-RAN.
+    # Three columns of NARRATIVE ABOUT rows that had ALREADY closed: cell 1 names
+    # the row, cells 2-3 say what its instrument reached and what still shipped.
+    # No cell declares a deferral and none carries a status to read -- and the
+    # anchors it names are counted in the registries, so counting them here would
+    # DOUBLE-count them, which is the opposite of the miss this gate guards.
+    # ⚠ It reached HEAD red because the handoff is written at the END of a cycle,
+    # AFTER the balance gate has run: a gate is only as good as the last tree it
+    # saw. The cycle order now runs this gate again after the handoff is rewritten.
+    ("row that read closed", "what it had actually converted", "what still shipped"),
 }
 
 

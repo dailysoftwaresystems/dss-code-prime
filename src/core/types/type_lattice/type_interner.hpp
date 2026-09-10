@@ -196,12 +196,44 @@ public:
     // DROPS a bit: qualifying an already-qualified type preserves what was there (a
     // naive "return inner if already qualified" would silently lose the new bit, e.g.
     // `_Atomic` over `volatile` staying merely volatile — a loss-of-atomicity
-    // miscompile). Wrapping an INVALID id returns InvalidType; a zero mask returns the
-    // material type (no skin). const is NOT a bit (it never affects codegen/layout).
-    TypeId qualified(TypeId inner, std::int64_t addBits);
+    // miscompile). Wrapping an INVALID id returns InvalidType; a zero mask AND a zero
+    // alignment return the material type (no skin). const is NOT a bit (it never
+    // affects codegen/layout).
+    //
+    // ★★ P66 (cycle P66, lane `al`) — `addAlign` GENERALIZES THIS SKIN FROM "QUALIFIER"
+    // TO "TYPE-LEVEL DECORATION THAT CHANGES IDENTITY BUT NOT MATERIAL KIND", which is
+    // what it always was. It is the TYPE's own explicit alignment in bytes (0 = none),
+    // for GNU `__attribute__((aligned(N)))` written on a TYPEDEF — `typedef int
+    // __attribute__((aligned(8))) A8;`. It rides scalar slot 1, and it is EMITTED ONLY
+    // WHEN NON-ZERO so every pre-existing qualifier skin keeps a one-scalar record and
+    // therefore its EXACT content hash and TypeId — the same "GUARDED on non-zero"
+    // discipline `explicitAlign` / `maxFieldAlign` / `fieldPacked` use on the composite
+    // side, and for the same reason (zero churn).
+    // ⚠ A SKIN MAY NOW CARRY A **ZERO** MASK. `qualified(int, 0, 8)` is a legitimate
+    // record with `qualifierBits() == 0`, so `isVolatileQualified` / `isAtomicQualified`
+    // are correctly FALSE on it. Any code that inferred "kind == VolatileQual therefore
+    // some bit is set" is now wrong; `qualifierBits`' own fatal is narrowed to the one
+    // condition that is still impossible (no scalar at all).
+    // ★ WHY A SCALAR ON THIS KIND RATHER THAN A NEW `TypeKind`. A new kind costs six
+    // exhaustive-switch arms (`kTypeKindNameTable`, `isPrimitiveTypeKind`,
+    // `projectRepresentationLevel`, `type_reintern`'s operand-DAG switch,
+    // `hir_text`'s codec pair, `mir_verifier`'s `describeType`) and re-derives a
+    // transparency mechanism that already exists and is already correct. The skin's
+    // whole contract — distinct interned identity, `kind()`/`operands()`/`scalars()`
+    // see-through, one strip chokepoint — is EXACTLY what a type-level alignment needs.
+    // Content identity comes free: `hashContent`/`equalContent` already mix ALL
+    // scalars, so `A8` and `int` are distinct TypeIds without a line of new code.
+    TypeId qualified(TypeId inner, std::int64_t addBits, std::uint32_t addAlign = 0);
     // `volatile T` / `_Atomic T` — thin wrappers over `qualified` setting one bit.
     TypeId volatileQualified(TypeId inner);
     TypeId atomicQualified(TypeId inner);
+    // P66: `T` carrying its OWN explicit alignment of `bytes` (GNU `aligned(N)` on a
+    // typedef). A thin wrapper over `qualified` setting no bit and one alignment.
+    // `bytes == 0` is "no request" and returns the material type unchanged. MAX-folded
+    // with any alignment already on `inner`, so a chained alias
+    // (`typedef A8 B8;`) cannot LOSE the alignment and a re-request cannot nest a
+    // second skin — the same STRIP -> UNION -> RE-INTERN discipline the bitset uses.
+    TypeId typeAligned(TypeId inner, std::uint32_t bytes);
     // The material type under `id`'s qualifier skin (`id` unchanged if none). ONE
     // strip chokepoint for the rare consumer that must look past the skin where the
     // transparent accessors are bypassed (e.g. the layout entry's raw incomplete
@@ -212,7 +244,24 @@ public:
     // The raw QualBit mask on `id`'s OWN record (0 if `id` is not a qualifier skin).
     // Reads the RAW scalar slot directly — NOT the transparent `scalars()`, which sees
     // THROUGH the skin to the inner type's scalars. The single reader of the bitset.
+    // ⚠ Since P66 a skin may carry a ZERO mask (an alignment-only decoration), so a
+    // 0 here does NOT imply "not a skin" — ask `typeAlignOverride` too.
     [[nodiscard]] std::int64_t qualifierBits(TypeId id) const;
+    // P66: the raw TYPE-LEVEL explicit alignment on `id`'s OWN record, in bytes (0 if
+    // none, or if `id` is not a skin). The alignment twin of `qualifierBits`, and like
+    // it a RAW scalar read rather than the transparent `scalars()`.
+    [[nodiscard]] std::uint32_t typeAlignOverride(TypeId id) const;
+    // P66: the id LAYOUT should be memoized and computed under. It strips qualifier
+    // skins exactly like `stripVolatile` EXCEPT that it STOPS at a skin carrying a
+    // type-level alignment, because that skin changes the answer `computeLayout` gives.
+    // ★★ THIS DISTINCTION IS THE WHOLE REASON A STRUCT MEMBER OF AN OVER-ALIGNED ALIAS
+    // COMES OUT RIGHT. `childLayout` and `forEachLayoutDependency` key the layout memo
+    // by this function; had they kept keying by `stripVolatile`, a field of type `A8`
+    // would resolve to `int`'s memo entry and the alias's alignment would be SILENTLY
+    // DROPPED in exactly the composite case gcc and clang both honour (✔MEASURED:
+    // `struct S { char c; A8 v; }` is sizeof 16 / align 8 / offsetof(v) 8 on gcc 13.3.0
+    // and clang 18.1.3, against an undecorated `int v`'s 8 / 4 / 4).
+    [[nodiscard]] TypeId layoutRoot(TypeId id) const;
     // True iff `id`'s OWN record carries the Volatile / Atomic bit (the access-
     // qualifier queries). Read the RAW mask (not the transparent `kind()`), so they
     // answer "is this exact type volatile / atomic-qualified?" — used at the deref /

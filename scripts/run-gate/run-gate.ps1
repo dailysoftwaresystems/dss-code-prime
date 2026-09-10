@@ -729,7 +729,59 @@ try {
     Restore-CplDefault
     exit 2
 }
-$script:RunGateMarkerTime = (Get-Item -LiteralPath $script:RunGateMarker).LastWriteTimeUtc
+$script:RunGateMarkerTime = (Get-Item -LiteralPath $script:RunGateMarker -Force).LastWriteTimeUtc
+$script:RunGateInputsBefore = "$LogPath.inputs-before"
+$script:RunGateInputsAfter  = "$LogPath.inputs-after"
+# ⚠ THE WRAPPER MUST NOT MEASURE ITS OWN BOOKKEEPING — the twin's note applies
+# verbatim: all three files sit beside the CALLER'S log path, nothing stops that
+# path being inside a watched root, and `.inputs-before` exists only in the AFTER
+# snapshot, so an unexcluded run would refuse ITSELF.
+$script:RunGateBookkeepingPrefix = (Split-Path -Leaf $LogPath) + '.inputs-'
+
+# ⚠⚠⚠ WHY THIS IS A BEFORE/AFTER FINGERPRINT AND NOT `LastWriteTimeUtc -gt`.
+# ✔MEASURED 2026-09-09 (P66) on WSL x86_64: CLOCK_REALTIME there steps FORWARD by
+# +24.69 s for ~200 ms out of every ~5 s (4.8% duty cycle) and the excursion
+# REACHES INODE MTIMES — 12 of 60 marker/probe pairs had the probe, created one
+# second AFTER the marker, carrying an mtime 23.70 s EARLIER. Ordering two clock
+# readings taken seconds apart is therefore not sound on a carriage this project
+# gates on, and BOTH twins were shown to fail under one identical mutation (a
+# marker stamped +25 s): `find -newer` returned nothing, and this twin's
+# `LastWriteTimeUtc -gt $markerTime` returned nothing, from the same two inodes.
+# ⇒ this is a SHARED defect in one algorithm, not a divergence between the twins,
+# and it is fixed on both sides in one commit. The full measurement, the duty
+# cycle, and why EQUALITY of a fingerprint with itself is immune to it are in the
+# `.sh` twin's "THE RUN'S INPUTS MUST HOLD STILL" block; not repeated here so the
+# two cannot drift into describing it differently.
+# ⓘ SHA256 rather than MD5: `Get-FileHash -Algorithm MD5` throws under a FIPS
+#   policy, and only self-consistency between two snapshots in one run is
+#   load-bearing, so the stronger algorithm costs nothing worth having.
+#   ✔MEASURED 317 ms over the 1749 files of `examples/`.
+function Get-RunGateInputFingerprint {
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($root in (Get-RunGateAbsInputRoots)) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        foreach ($f in (Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+            if ($f.Name.StartsWith($script:RunGateBookkeepingPrefix)) { continue }
+            $h = Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256 -ErrorAction SilentlyContinue
+            if ($null -ne $h) { $lines.Add("C $($h.Hash) $($f.Length) $($f.FullName)") }
+            # The stamp-order half, differenced against its own pre-run reading:
+            # a file that ALREADY carried a future stamp when the run started is
+            # in both snapshots and cancels, instead of refusing a run it never
+            # touched. See the twin for the measurement that made that real.
+            if ($f.LastWriteTimeUtc -gt $script:RunGateMarkerTime) { $lines.Add("N $($f.FullName)") }
+        }
+    }
+    return @($lines | Sort-Object)
+}
+
+# ★ PROBED BY EXECUTION WITH A KNOWN ANSWER, like the twin's `cksum` probe: the
+# empty marker's SHA256 is a constant, so a hashing path that silently produced
+# nothing would refuse this run rather than emptying every snapshot and passing
+# everything while appearing to run.
+function Test-RunGateHashWorks {
+    $h = Get-FileHash -LiteralPath $script:RunGateMarker -Algorithm SHA256 -ErrorAction SilentlyContinue
+    return ($null -ne $h -and $h.Hash -eq 'E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855')
+}
 
 # ⚠⚠ `-Force` IS LOAD-BEARING, AND WITHOUT IT THIS TWIN IS BLIND OFF WINDOWS.
 # `Get-ChildItem -Recurse` omits HIDDEN entries, and on Linux and macOS "hidden"
@@ -752,16 +804,52 @@ $script:RunGateMarkerTime = (Get-Item -LiteralPath $script:RunGateMarker).LastWr
 #   a subset of the tree, or a synthetic self-test root, is not penalised for it.
 #   The roots are ABSOLUTE (see "AND THE ROOTS ARE THE GATE COMMAND'S TREE"
 #   above), so this walks the tree the gate command reads and not this shell's.
+# ⚠⚠ "I COULD NOT MEASURE" MUST NOT BE SPELLED `held still`, so taking the after
+# snapshot is the CALLER's job and its failure is a REFUSAL, not an empty list.
+# An empty return from here is indistinguishable from "nothing moved", which is
+# the fails-toward-clean answer this whole block exists to be unable to give —
+# and the scan this replaced had exactly that shape. The twin says the same in
+# its `run_gate_diff_inputs` note; both decide it in the outer flow instead.
 function Get-RunGateMovedInputs {
+    $after  = @(Get-Content -LiteralPath $script:RunGateInputsAfter -ErrorAction SilentlyContinue |
+                Where-Object { $_ -ne '' })
+    $before = @(Get-Content -LiteralPath $script:RunGateInputsBefore -ErrorAction SilentlyContinue |
+                Where-Object { $_ -ne '' })
     $moved = @()
-    foreach ($root in (Get-RunGateAbsInputRoots)) {
-        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
-        $moved += Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.LastWriteTimeUtc -gt $script:RunGateMarkerTime } |
-            ForEach-Object { $_.FullName }
+    foreach ($line in (Compare-Object -ReferenceObject $before -DifferenceObject $after)) {
+        $l = $line.InputObject
+        if     ($l -match '^C \S+ \d+ (.+)$') { $moved += $Matches[1] }
+        elseif ($l -match '^N (.+)$')         { $moved += $Matches[1] }
     }
     # Same cap as the .sh twin: the refusal names the class, it is not a manifest.
-    return @($moved | Select-Object -First 20)
+    return @($moved | Sort-Object -Unique | Select-Object -First 20)
+}
+
+# ⚠ THREE REFUSALS, NOT ONE, like the twin: a wrapper that cannot fingerprint the
+# tree cannot vouch for its stillness, and the honest answer is to run NOTHING.
+if (-not (Test-RunGateHashWorks)) {
+    Write-Host "run-gate.ps1: FAIL - Get-FileHash did not return the known SHA256 of an empty file on"
+    Write-Host "  this host, so the input fingerprint this wrapper compares before and after the run"
+    Write-Host "  cannot be taken. Nothing was run."
+    Write-Host "  This refusal is deliberate rather than a skip: an empty fingerprint would make every"
+    Write-Host "    diff empty, and this check would pass everything while appearing to run."
+    Write-Host "  shell   : $(Get-RunGateShellIdentity)"
+    Remove-Item -LiteralPath $script:RunGateMarker -Force -ErrorAction SilentlyContinue
+    Restore-CplDefault
+    exit 2
+}
+try {
+    Set-Content -LiteralPath $script:RunGateInputsBefore -ErrorAction Stop `
+        -Value ((Get-RunGateInputFingerprint) -join [Environment]::NewLine)
+} catch {
+    Write-Host "run-gate.ps1: FAIL - cannot record the pre-run input fingerprint at"
+    Write-Host "  '$($script:RunGateInputsBefore)', so the run could not be proved to have measured a"
+    Write-Host "  still tree. Nothing was run."
+    Write-Host "  This refusal is about that PATH, which sits beside the log path you gave."
+    Write-Host "  shell   : $(Get-RunGateShellIdentity)"
+    Remove-Item -LiteralPath $script:RunGateMarker -Force -ErrorAction SilentlyContinue
+    Restore-CplDefault
+    exit 2
 }
 
 # Redirect ALL streams to the log with `*>` so the native command stays last
@@ -778,8 +866,23 @@ if ($null -eq $rc) {
     $rc = 0
 }
 
-$movedInputs = Get-RunGateMovedInputs
+$snapshotOk = $true
+if (-not (Test-Path -LiteralPath $script:RunGateInputsBefore)) {
+    $snapshotOk = $false
+} else {
+    try {
+        Set-Content -LiteralPath $script:RunGateInputsAfter -ErrorAction Stop `
+            -Value ((Get-RunGateInputFingerprint) -join [Environment]::NewLine)
+    } catch {
+        $snapshotOk = $false
+    }
+    if (-not (Test-Path -LiteralPath $script:RunGateInputsAfter)) { $snapshotOk = $false }
+}
+$movedInputs = @()
+if ($snapshotOk) { $movedInputs = Get-RunGateMovedInputs }
 Remove-Item -LiteralPath $script:RunGateMarker -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $script:RunGateInputsBefore -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $script:RunGateInputsAfter -Force -ErrorAction SilentlyContinue
 
 # ---- POST-RUN: a sibling can start MID-RUN, so the same question is asked again
 Get-RunGateContention
@@ -789,7 +892,9 @@ Add-Content -LiteralPath $LogPath -Value @"
 command : $Command $($CommandArgs -join ' ')
 rc      : $rc
 "@
-if ($movedInputs.Count -gt 0) {
+if (-not $snapshotOk) {
+    Add-Content -LiteralPath $LogPath -Value "inputs  : NOT MEASURED - the post-run fingerprint could not be taken, so this verdict is not evidence"
+} elseif ($movedInputs.Count -gt 0) {
     Add-Content -LiteralPath $LogPath -Value "inputs  : MOVED DURING THE RUN - this verdict is not evidence"
     foreach ($m in $movedInputs) { Add-Content -LiteralPath $LogPath -Value "          $m" }
 } else {
@@ -819,6 +924,21 @@ if (-not $script:RunGateBuildDir) {
 # Checked BEFORE rc, and before the witness: a run whose inputs moved has no
 # verdict to report, and calling it a pass or a failure is the misattribution
 # this block exists to prevent. Exit 3 matches the .sh twin.
+# ⚠ "I could not measure" is checked FIRST OF ALL, for the reason the twin gives:
+# it is the one answer that must never be spelled `held still`.
+if (-not $snapshotOk) {
+    Write-Host "run-gate.ps1: FAIL - THE POST-RUN INPUT FINGERPRINT COULD NOT BE TAKEN, so this run"
+    Write-Host "  cannot be shown to have measured a still tree."
+    Write-Host "  (command exited $rc; that number is NOT being reported as a verdict)."
+    Write-Host "  The PRE-run fingerprint was taken successfully or this run would not have started,"
+    Write-Host "    so something removed or blocked '$($script:RunGateInputsBefore)' or"
+    Write-Host "    '$($script:RunGateInputsAfter)' while the command was running."
+    Write-Host "  Refusing is deliberate. Reading an unmeasurable tree as 'held still' is exactly"
+    Write-Host "    the fails-toward-clean answer this check exists to be unable to give."
+    Write-Host "  (log: $LogPath)"
+    exit 3
+}
+
 if ($movedInputs.Count -gt 0) {
     Write-Host "run-gate.ps1: FAIL - the tree CHANGED UNDER THE RUN, so its result is not evidence"
     Write-Host "  (command exited $rc; that number describes a tree that never existed as a whole)."

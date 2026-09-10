@@ -6305,6 +6305,65 @@ int Program::compileFiles(
         hirTextSink_);
 }
 
+// ── hirArtifactRoundTripFailure ──────────────────────────────────────────────
+// Contract, and the reasoning behind every choice here, in `program.hpp`.
+std::string hirArtifactRoundTripFailure(std::string_view artifact) {
+    // A LOCAL reporter, never a caller's. A successful round trip must be
+    // observable as SILENCE, and `parseHir` is collect-all: handed a caller's
+    // reporter it would leave recovery diagnostics behind on the way to a
+    // verdict the caller already has in the return value.
+    DiagnosticReporter rep;
+    std::string const  text{artifact};
+    auto const parsed = parseHir(text, CompilationUnitId{1}, rep);
+    auto const diags = [&rep] {
+        std::string s;
+        for (auto const& d : rep.all()) {
+            s += "\n  " + std::string{diagnosticCodeName(d.code)} + ": " + d.actual;
+        }
+        return s;
+    };
+    if (!parsed || !parsed->ok) {
+        return "  the artifact did NOT parse back." + diags();
+    }
+    // Every field the parse recovered goes home. The re-emission has to be given
+    // exactly what the first one was given, or a difference would attribute to
+    // the codec what is really a missing input. The mapping is one-to-one with
+    // `HirTextContext` by construction, which is why it is spelled out rather
+    // than defaulted — a field silently left null would weaken the compare into
+    // "the parts we bothered to hand back match".
+    HirTextContext back;
+    back.interner      = &parsed->interner;
+    back.symbolNames   = &parsed->symbolNames;
+    back.literalPool   = &parsed->literalPool;
+    back.inlineAsmPool = &parsed->inlineAsmPool;
+    back.producer      = parsed->producer;
+    back.bufferNames   = &parsed->bufferNames;
+    back.sourceMap     = &parsed->sourceMap;
+    back.ffiMap        = &parsed->ffiMap;
+    back.shaderMap     = &parsed->shaderMap;
+    back.transpileMap  = &parsed->transpileMap;
+    back.diagnosticMap = &parsed->diagnosticMap;
+    std::string const again = emitHir(parsed->hir, back, rep);
+    if (again == text) return {};
+
+    // NAME THE TOKEN THE TWO HALVES DISAGREE ABOUT. "They differ" over a
+    // multi-megabyte artifact is a true statement nobody can act on, so the
+    // report carries the first differing offset and a window of both sides —
+    // which is the production the writer and the reader read differently.
+    std::size_t at = 0;
+    while (at < text.size() && at < again.size() && text[at] == again[at]) ++at;
+    auto const window = [](std::string const& s, std::size_t from) {
+        if (from >= s.size()) return std::string{"<end of artifact>"};
+        return s.substr(from, std::min<std::size_t>(72, s.size() - from));
+    };
+    return "  the artifact parsed, but the module the reader rebuilt re-emits "
+           "DIFFERENTLY — first difference at byte "
+           + std::to_string(at) + " of " + std::to_string(text.size())
+           + " (re-emission is " + std::to_string(again.size()) + " bytes)\n"
+             "  written  : " + window(text, at)
+           + "\n  read back: " + window(again, at) + diags();
+}
+
 int Program::emitHirText(
     const std::vector<std::string>& sourceFiles,
     const std::string& languageName,
@@ -6350,6 +6409,65 @@ int Program::emitHirText(
             << "' although the front end reported success. Nothing was "
                "written.\n";
         return 1;
+    }
+    // ══ THE ARTIFACT MUST READ BACK, AND THAT IS MEASURED HERE, NOT PROMISED ══
+    //
+    // ★★★ `docs/hir-text-format.md` §2.1 SELLS rc 0 AS *"the artifact is
+    // written, complete, AND PARSES BACK"*. Until this block, NOTHING measured
+    // the third clause — the writer ran, the file was written, and whether our
+    // own reader could take it back was a property no run ever asked about.
+    //
+    // ⚠⚠ THE PROMISE WAS FALSE WHEN IT WAS WRITTEN, and by the corpus's own
+    // count. `D-HIR-TEXT-NODE-WALK-RECURSES-PER-LEVEL-ON-BOTH-HALVES-AND-THREE-SPELLINGS-DO-NOT-READ-BACK`
+    // round-tripped the emitted corpus BY HAND and found three writer spellings
+    // the reader could not read — each shipped, each pre-existing, and each
+    // failing in a different way: a VLA bound `arr<T, -2>` ABORTED the reading
+    // process, `goto *<expr>` was refused for a token the lexer did not have,
+    // and a `lit float` past 2^64 came back as 0.0 THROUGH A CLEAN REPORTER. All
+    // three left `--emit-hir` at rc 0.
+    //
+    // ★★ SO THE CHECK IS A RE-EMIT AND A BYTE COMPARE, NEVER MERELY "IT PARSES".
+    // The float defect is the whole argument: it parsed clean, `result->ok` was
+    // true, and the value was silently wrong — a reader-consumer that asserted
+    // only a successful parse would have passed it, and the one that already
+    // existed (`tests/program/test_emit_hir_mode.cpp`, `reparse`) did exactly
+    // that. Byte identity is the only predicate that can see a value the reader
+    // reconstructed DIFFERENTLY, because it compares what the reader rebuilt
+    // against what the writer meant, one token at a time. `emitHir(parseHir(
+    // emitHir(h)))` is the contract `hir_text.hpp` states; this is where the
+    // shipped mode is held to it.
+    //
+    // ⓘ WHY IT IS UNCONDITIONAL AND NOT A FLAG. A check a consumer has to opt
+    // into is a check that is off in the run that matters, and the failure it
+    // catches is not a wrong exit code — it is a file we told a consumer was
+    // good that kills their process on read. ✔The cost is measured rather than
+    // assumed: the front end (preprocess, parse, semantic analysis, lowering)
+    // dominates a `--emit-hir` invocation, and the parse + re-emit of the text
+    // it produced is a small fraction of it. The number is in this cycle's row.
+    //
+    // The predicate is `hirArtifactRoundTripFailure` (program.hpp), which takes
+    // an ARTIFACT rather than living inline here — see there for why that is
+    // what makes the refusal demonstrable at all.
+    //
+    // ★ THE REFUSAL IS ITS OWN EXIT CODE, AND THAT IS A REFINEMENT OF THE
+    // NON-ZERO ROW RATHER THAN A THIRD STATE. The consumer's binary contract is
+    // untouched — rc 0 ⇔ an artifact is written and readable, non-zero ⇔ NOTHING
+    // is written — but 1 and 2 ask the consumer for different actions: 1 is
+    // *"your source was rejected, here is why"*, 2 is *"this compiler produced
+    // an artifact it cannot read; that is our defect, not your program's, and
+    // nothing you change in your source will help"*. A single code would have
+    // made those indistinguishable to any automated consumer, and to this
+    // repo's own corpus gate, which must be able to tell an example the front
+    // end declined from an example whose artifact did not survive the round
+    // trip — otherwise a codec regression would present as a growing skip list
+    // and the gate would report success while measuring less.
+    if (std::string const why = hirArtifactRoundTripFailure(text); !why.empty()) {
+        err << "error: --emit-hir: the artifact for '" << target
+            << "' was produced, but this build's own reader could not take it "
+               "back unchanged. This is a defect in the compiler, not in the "
+               "source. Nothing was written.\n"
+            << why << "\n";
+        return 2;
     }
     // `-` is stdout, the spelling the ASK asked for and the one every
     // filter-shaped tool uses. It is checked against the WHOLE path, never a

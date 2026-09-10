@@ -76,7 +76,7 @@ No platform requires parsing C/C++ headers to reach its window layer. Every one 
 | Target | Metadata | Generator output |
 |---|---|---|
 | Windows | `.winmd` — ECMA-335 tables | COM vtable slot indices, IIDs, method signatures |
-| macOS / iOS | ObjC runtime — `objc_getClass`, `sel_registerName` take **strings** | Direct `objc_msgSend` call sites |
+| macOS / iOS | ObjC runtime — `objc_getClass`, `sel_registerName` take **strings**. ⚠ **NAMES only — this row carries NO type information; see §4.2.1** | Direct `objc_msgSend` call sites |
 | Linux | `wayland.xml`, `xdg-shell.xml` | Interface/opcode tables, message marshalling |
 | Android | `.class` constant pool + descriptors | JNI method IDs, signature strings |
 
@@ -101,6 +101,52 @@ objc_msgSend(...)   // cast to exact signature — mandatory on arm64
 ```
 
 `objc_msgSend` must be cast to the precise call signature at every call site. On arm64 the `_stret` / `_fpret` variants no longer exist, which simplifies emission.
+
+#### 4.2.1 ⚠ THE RUNTIME IS MACHINE-READABLE FOR **NAMES** AND SILENT ON **TYPES**
+
+★ **The one row of §4's table whose metadata does not carry signatures.** `.winmd` has full method
+signatures, Wayland XML declares every argument, `.class` descriptors encode types. A `SEL` is an
+interned string: colon-counting gives arity and **nothing else**. ⇒ **The types must come from a
+fourth source, and that source is not chosen yet.**
+
+`objc_msgSend` is an assembly trampoline — it resolves `(receiver, selector)` and tail-jumps
+**without touching the argument registers**, so whatever the caller left there is what the method
+receives. Its header `id objc_msgSend(id, SEL, ...)` is a fiction of convenience; it is not really
+variadic, and on Apple arm64 variadic arguments go on the **stack** (Apple's deviation from AAPCS64)
+while the callee reads **registers**. Placement is decided by TYPE: integers/pointers → `x0`–`x7`;
+FP → the separate `v0`–`v7` bank; an **HFA** (1–4 members of one FP type, flattened) → consecutive
+`v` registers; other composites > 16 bytes → indirect by pointer; struct return → hidden dest in `x8`.
+
+✔MEASURED 2026-09-09, `clang --target=arm64-apple-macos11 -O1 -S`, with a non-homogeneous 32-byte
+struct as the control:
+
+| spelling | emitted |
+|---|---|
+| cast to the exact signature | `b _objc_msgSend` — a bare tail-branch: arguments are already in place |
+| same call, 32-byte **non**-HFA arg | `ldp q0,q1,[x2]` … `mov x2, sp` — received and passed **by pointer** |
+| through the variadic declaration | `stp d0,d1,[sp]` … `str x8,[sp,#48]` — **every argument spilled** |
+
+⚠⚠ **`CGRect` is an HFA — four doubles in `v0`–`v3`, NOT indirect**, though it is 32 bytes. *"Over 16
+bytes ⇒ by pointer"* holds only for **non**-HFAs. Getting that backwards puts a pointer where the
+callee reads four doubles, and it is the single easiest detail to transcribe wrongly.
+
+**Candidate sources, none chosen (see §17):** (1) a hand-written signature table — small and
+auditable, Layer 1 does five things against a frozen ABI; (2) parsing the real SDK headers —
+self-correcting, but reintroduces the frontend dependency §4 exists to avoid; (3) harvesting
+`method_getTypeEncoding` on a real Mac and checking it in — machine-derived, but a snapshot, and it
+needs a Mac, which conflicts with cross-compiling Mach-O from Linux.
+
+⚠ **(1) is in apparent tension with [[D-FFI-SHIPPED-LIBS-OS-ONLY]]** — a hand-transcribed ABI claim
+drifts silently; real parsing is self-correcting by construction. It is still defensible, but **only
+by explicitly invoking that rule's OS-surface carve-out**: a platform's ABI *is* the contract, and
+AppKit/UIKit are frozen. ⇒ If (1) is chosen, this plan must SAY it is invoking the carve-out, or a
+later reader will correctly read it as the same defect the tcl/zlib work removed.
+
+★★ **Why this is written down instead of left to implementation: a wrong signature does not crash.**
+It puts a double in an integer register, or a pointer where a value belongs — the window opens at
+nonsense coordinates, or memory is corrupted downstream. That is a **silent miscompile**, the one
+failure class this project names unacceptable, and it is the category where *"we will catch it while
+implementing"* is weakest, because nothing goes red on its own.
 
 ### 4.3 Linux specifics
 
@@ -363,6 +409,7 @@ Phases 1–2 together prove the whole architecture. Phase 5 is the only one intr
 | Risk | Severity | Mitigation |
 |---|---|---|
 | Coroutine frame ownership without GC | **High** | Decide with coroutine design (§7.2), not after |
+| ObjC gives names but no types, and a wrong `objc_msgSend` signature is a **silent miscompile**, never a crash | **High** | Choose the fourth type source before Layer 1 emission (§4.2.1, §17) — not during it |
 | DEX + AXML emitters are new backend classes | Medium | Both formats are public and stable |
 | MSVC C++ ABI is undocumented | Medium | Only blocks C++ interop, not GUI (§4) |
 | iOS CMS/ASN.1 implementation cost | Medium | `rcodesign` as bridge; formats are frozen, so write-once |
@@ -658,3 +705,4 @@ Resolution rules:
 2. Colour pipeline target: normalize everything to sRGB (simplest, uniform, gives up wide gamut) or manage P3/HDR per target?
 3. Linux screen-reader support: implement a D-Bus client, or defer AT-SPI2?
 4. Font source: use platform fonts (differs per OS, breaks pixel identity) or ship an embedded font set (uniform, larger binaries, licensing)?
+5. **ObjC type source (§4.2.1):** hand-written signature table, SDK-header parsing, or checked-in `method_getTypeEncoding` harvest? ⚠ Must be settled **before** Layer 1 emits its first `objc_msgSend`; if the table is chosen, the plan must state that it invokes [[D-FFI-SHIPPED-LIBS-OS-ONLY]]'s OS-surface carve-out.

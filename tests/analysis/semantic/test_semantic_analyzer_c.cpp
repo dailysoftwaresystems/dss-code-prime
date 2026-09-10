@@ -12990,13 +12990,43 @@ TEST(SemanticAnalyzerC, AutoFunctionNameDecaysToFunctionPointer) {
     EXPECT_EQ(in.kind(in.operands(f->type)[0]), TypeKind::FnSig);
 }
 
-// C23 6.7.9p2 — exactly ONE declarator.
-TEST(SemanticAnalyzerC, AutoMultiDeclaratorRejected) {
-    auto model = analyzeShipped("c", {
+// ★★ P66 — THIS TEST'S PREMISE WAS REFUTED BY THE STANDARD AND BY MEASUREMENT,
+// AND THE ARM IS INVERTED RATHER THAN DELETED. It asserted "C23 6.7.9p2 —
+// exactly ONE declarator" and pinned `S_AutoRequiresSingleDeclarator` on
+// `auto a = 1, b = 2;`. Three things are wrong with that:
+//   • type inference is C23 **6.7.10**, not 6.7.9 (6.7.9 is Type DEFINITIONS);
+//   • 6.7.10 constrains only the presence of `auto`, never the declarator
+//     COUNT — the count is Annex J.2(78) UNDEFINED BEHAVIOUR, and J.5.12 names
+//     the multi-declarator form a sanctioned COMMON EXTENSION whose recommended
+//     semantics (fn.164) are ISO/IEC 14882's;
+//   • ✔MEASURED 2026-09-09, each reference probed SEPARATELY: clang 18.1.3
+//     `-std=c23` ACCEPTS it silently at `-Wall -Wextra -pedantic` and a linked,
+//     EXECUTED binary gives both objects `int` and the values 1 and 2; gcc
+//     13.3.0 refuses; MSVC ABSTAINS (it reads `auto` as the C89 storage class
+//     over implicit `int`, so its acceptance drops meaning and casts no vote).
+// One WORKING accepting reference makes acceptance REQUIRED. What remains a
+// constraint is that the declarators AGREE on one deduced type, which is what
+// this arm now pins. The full treatment is
+// `tests/analysis/semantic/test_auto_multi_declarator.cpp`.
+TEST(SemanticAnalyzerC, AutoMultiDeclaratorSharesOneDeducedType) {
+    auto accepted = analyzeShipped("c", {
         "int main(void) { auto a = 1, b = 2; return a + b; }\n",
     });
-    EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_AutoRequiresSingleDeclarator), 1u);
+    EXPECT_FALSE(accepted.hasErrors());
+    EXPECT_EQ(countCode(accepted.diagnostics(),
+                        DiagnosticCode::S_AutoRequiresSingleDeclarator), 0u);
+    auto const* a = findSymbolNamed(accepted, "a");
+    auto const* b = findSymbolNamed(accepted, "b");
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    EXPECT_EQ(a->type.v, b->type.v);
+
+    auto disagreeing = analyzeShipped("c", {
+        "int main(void) { auto a = 1, b = 2.5; return (int)b; }\n",
+    });
+    EXPECT_EQ(countCode(disagreeing.diagnostics(),
+                        DiagnosticCode::S_AutoDeclaratorsInferDifferentTypes),
+              1u);
 }
 
 // C23 6.7.9p2 — a PLAIN IDENTIFIER declarator. `auto *p = 0;` (a derived
@@ -13246,7 +13276,12 @@ TEST(SemanticAnalyzerC, AutoFileScopeAndQualifiedStayLoudParseErrors) {
     char const* const rejects[] = {
         "static x = 5;\nint main(void) { return x; }\n",
         "constexpr y = 5;\nint main(void) { return y; }\n",
-        "auto g = 1, h = 2;\nint main(void) { return g + h; }\n",
+        // P66: the multi-declarator COUNT is no longer the violation (C23
+        // 6.7.10 has none; J.2(78) UB, J.5.12 common extension) — clang 18.1.3
+        // accepts `auto g = 1, h = 2;` and DSS now does too. What both
+        // references still refuse, and what keeps this entry doing its job, is
+        // declarators that deduce DIFFERENT types.
+        "auto g = 1, h = 2.5;\nint main(void) { return g + (int)h; }\n",
         "auto *p = 0;\nint main(void) { return p != 0; }\n",
         "auto g;\nint main(void) { return g; }\n",
         // ⚠ P65, lane `pl` — THE `static auto g = 42;` ENTRY THAT STOOD HERE IS
@@ -15446,30 +15481,42 @@ TEST(SemanticAnalyzerC, GnuAlignedZeroIsTheSharedNoOp) {
         << "6.7.5p3: an alignment of zero has NO effect";
 }
 
-// ★ BARE `__attribute__((aligned))` FAILS LOUD. gcc reads it as "the target's
-// maximum useful alignment" — a target-dependent number this engine must not
-// invent. clang ACCEPTS this spelling, so DSS is deliberately stricter here:
-// refusing loudly beats guessing an ABI.
-TEST(SemanticAnalyzerC, GnuAlignedWithNoArgumentFailsLoud) {
+// ★★★ P66 (lane `ag`) — INVERTED, NOT DELETED, AND THE EVIDENCE MOVED FROM A RED
+// TO A NUMBER. This pin was `GnuAlignedWithNoArgumentFailsLoud` and its comment
+// read: "gcc reads it as the target's maximum useful alignment — a
+// target-dependent number this engine must not invent. clang ACCEPTS this
+// spelling, so DSS is deliberately stricter here: refusing loudly beats guessing
+// an ABI." ⚠ THE FIRST HALF WAS RIGHT AND THE CONCLUSION DID NOT FOLLOW: the
+// engine must not INVENT the number, and it does not have to — the TARGET declares
+// it as `aggregateLayout.maxAlignment`, and reading a declared value is the
+// opposite of guessing one. ⚠ The second half was also understated: it is not only
+// clang. ✔MEASURED 2026-09-09, each reference probed SEPARATELY on its own TU with
+// rc read DIRECTLY at `-Wall -Wextra` — gcc 13.3.0, clang 18.1.3, mingw-w64 gcc
+// 13.2.0 and aarch64-linux-gnu-gcc 13.3.0 ALL accept it and ALL give 16 (the `== 8`
+// and `== 32` twins FAIL on all four), on x86_64 AND on aarch64, asserted and
+// EXECUTED. DSS was BELOW the union, loudly, on a construct every implementer
+// accepts. [[D-C-THREE-GNU-ALIGNED-ATTRIBUTE-FORMS-REMAIN-AND-THE-WEAKENING-ONE-IS-SILENT]].
+// ★ A CONFERRED NUMBER IS STRICTLY STRONGER EVIDENCE THAN THE OLD RED: an error
+// count can be satisfied by a diagnostic raised for an unrelated reason, while
+// `explicitAlignment == kAlignasLayout.maxAlignment` can only be satisfied by the
+// value travelling from the target to the symbol.
+TEST(SemanticAnalyzerC, GnuAlignedWithNoArgumentTakesTheTargetMaximum) {
     auto cu = buildShippedUnit("c",
                                { "int bare __attribute__((aligned));\n" });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
-    bool named = false;
-    for (auto const& d : model.diagnostics().all()) {
-        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
-        EXPECT_EQ(d.severity, DiagnosticSeverity::Error);
-        EXPECT_NE(d.actual.find("explicit alignment argument"), std::string::npos)
-            << "the message must say WHY the bare form is refused, got: " << d.actual;
-        named = true;
-    }
-    EXPECT_TRUE(named);
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u)
+        << "every reference accepts the bare form; refusing it was below the union";
+    EXPECT_FALSE(model.hasErrors());
     SymbolRecord const* bare = findSym(model, "bare");
     ASSERT_NE(bare, nullptr);
-    EXPECT_FALSE(bare->explicitAlignment.has_value())
-        << "never guess 'maximum useful alignment'";
+    ASSERT_TRUE(bare->explicitAlignment.has_value());
+    EXPECT_EQ(*bare->explicitAlignment, kAlignasLayout.maxAlignment)
+        << "the bare form is the TARGET's declared maximum useful alignment, READ "
+           "from aggregateLayout.maxAlignment — never a constant, never per-arch "
+           "branching. Compared against the fixture's own declared value so this "
+           "assertion cannot be satisfied by a hard-coded 16.";
 }
 
 // FUNCTIONS stay LOUD (measured cost: 0 of 204 SDK `aligned` sites).
@@ -15486,25 +15533,46 @@ TEST(SemanticAnalyzerC, GnuAlignedOnFunctionFailsLoud) {
     }
 }
 
-// ── ★ THE TYPEDEF RULE (work item 6) ─────────────────────────────────────────
-// A typedef interns to the SAME TypeId as its aliasee, so `explicitAlignment` on
-// a typedef symbol is provably inert — storing it would be the "parses but sets
-// nothing" silent drop. So the request is JUDGED, in three graded arms.
+// ── ★ THE TYPEDEF RULE ───────────────────────────────────────────────────────
+// ~~ "A typedef interns to the SAME TypeId as its aliasee, so `explicitAlignment`
+// on a typedef symbol is provably inert — storing it would be the 'parses but sets
+// nothing' silent drop. So the request is JUDGED, in three graded arms." ~~
+// ★★★ RETIRED IN PLACE BY P66 (lane `al`) — NOT STALE, **FALSE**. The premise was
+// TRUE of the tree it was written against and P66 removed it: an alias carrying an
+// alignment now interns to a DISTINCT TypeId (the type-level alignment skin, the
+// transparent `VolatileQual` record `volatile`/`_Atomic` already ride), so the
+// alignment is no longer inert and the request is HONORED rather than judged.
+// [[D-C-A-GNU-ALIGNED-ATTRIBUTE-ON-A-TYPEDEF-IS-REFUSED-WHILE-BOTH-REFERENCES-HONOUR-IT]].
+// ✔MEASURED 2026-09-09, each reference SEPARATELY, one TU per probe, rc DIRECT:
+// gcc 13.3.0 and clang 18.1.3 both compile `typedef int __attribute__((aligned(8)))
+// A8;` rc 0 with stderr EMPTY at -Wall -Wextra and both CONFER (`_Alignof(A8)` is 8,
+// the `==4` twin FAILS), in BOTH orders; `sizeof(A8)` stays 4; mingw-w64 gcc 13.2.0
+// agrees; MSVC 19.51.36257 abstains on the SPELLING only and confers the same
+// construct through `typedef __declspec(align(8)) int A8;`. Three references, 3-0
+// for conferral — DSS was BELOW the union.
+// The FULL conferral surface is pinned in its own file,
+// tests/analysis/semantic/test_gnu_aligned_typedef_conferral.cpp; what stays HERE is
+// this row's own three-arm shape, inverted where the measurement inverted it.
 
-// ARM 1 — N > natural, layout params AVAILABLE ⇒ FAIL LOUD. The program asked for
-// stricter alignment than the alias can deliver, and we genuinely cannot deliver it.
-TEST(SemanticAnalyzerC, GnuAlignedTypedefStricterThanNaturalFailsLoud) {
+// ARM 1 — N > natural ⇒ **CONFER**. This test asserted the OPPOSITE until P66, and
+// the inversion is the row: the program asks for stricter alignment than the aliasee
+// has, DSS can now represent that, and every reference delivers it.
+TEST(SemanticAnalyzerC, GnuAlignedTypedefStricterThanNaturalIsConferred) {
     auto cu = buildShippedUnit("c",
                                { "typedef int ti __attribute__((aligned(16)));\n" });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_AlignasInvalidContext), 1u)
-        << "aligned(16) on a typedef of int (natural 4) is a REAL drop — say so";
-    for (auto const& d : model.diagnostics().all()) {
-        if (d.code != DiagnosticCode::S_AlignasInvalidContext) continue;
-        EXPECT_NE(d.actual.find("typedef"), std::string::npos) << d.actual;
-    }
+                        DiagnosticCode::S_AlignasInvalidContext), 0u)
+        << "the refusal this test used to demand put DSS below the union: gcc and "
+           "clang both compile this rc 0 SILENT and confer 16";
+    SymbolRecord const* ti = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "ti") ti = &model.symbols()[i];
+    ASSERT_NE(ti, nullptr) << "no symbol named 'ti'";
+    EXPECT_EQ(model.lattice().interner().typeAlignOverride(ti->type), 16u)
+        << "ACCEPTING AND DROPPING would trade a loud refusal for a SILENT wrong "
+           "answer — and a mis-aligned object is a real fault on arm64";
 }
 
 // ARM 2 — N <= natural, layout params AVAILABLE ⇒ accept SILENTLY. The alias
@@ -15596,14 +15664,28 @@ TEST(SemanticAnalyzerC, TypedefUnknownC23AttributeStaysASuppressibleWarning) {
 // ROOT (a) — DECLARATION-DEPTH SLOTS. `typedef int64_t __attribute__((__aligned__(8)))
 // T;` puts the attribute in the typedef's MIDDLE slot — outside `specifierPrefixChild`'s
 // reach, so pre-TF-C73 it was parsed and silently ignored. RED-ON-DISABLE: remove the
-// `declarationAttrSlotRules` loop and the loud typedef judgement disappears.
+// `declarationAttrSlotRules` loop and the slot stops being scanned.
+// ★★ P66 (lane `al`): THE EVIDENCE OF REACHABILITY CHANGED SIDES, AND THE NEW ONE IS
+// STRICTLY STRONGER. This test used to assert `S_AlignasInvalidContext == 1` — it read
+// the REFUSAL as proof the slot was scanned. There is no refusal any more
+// ([[D-C-A-GNU-ALIGNED-ATTRIBUTE-ON-A-TYPEDEF-IS-REFUSED-WHILE-BOTH-REFERENCES-HONOUR-IT]]:
+// gcc, clang and MSVC all CONFER an over-aligned type alias, so DSS does too), and the
+// CONFERRED VALUE is now what proves it. A diagnostic only shows the slot was LOOKED at;
+// a conferred 16 shows the value travelled all the way to the type. An unscanned slot
+// still fails this test — it would confer 0.
 TEST(SemanticAnalyzerC, TypedefMiddleSlotAttributeIsReached) {
     auto cu = buildShippedUnit("c",
                                { "typedef int __attribute__((aligned(16))) T;\n" });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_AlignasInvalidContext), 1u)
+                        DiagnosticCode::S_AlignasInvalidContext), 0u)
+        << "the construct is inside the union now — every reference compiles it";
+    SymbolRecord const* t = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "T") t = &model.symbols()[i];
+    ASSERT_NE(t, nullptr) << "no symbol named 'T'";
+    EXPECT_EQ(model.lattice().interner().typeAlignOverride(t->type), 16u)
         << "the typedef's MIDDLE attribute slot must be a scan root — silently "
            "ignoring it is how the SDK's dominant typedef spelling got dropped";
 }
@@ -15759,25 +15841,41 @@ TEST(SemanticAnalyzerC, CompositeAlignedNonPowerOfTwoFailsLoud) {
     }
 }
 
-// The BARE composite `__attribute__((aligned))` (no argument) means "the target's
-// maximum useful alignment" in gcc — a target-dependent number this engine refuses
-// to invent. It fails LOUD, exactly like the declaration-level bare form, rather
-// than being silently treated as no request at all.
-TEST(SemanticAnalyzerC, CompositeBareAlignedWithNoArgumentFailsLoud) {
+// ★★★ P66 (lane `ag`) — THE COMPOSITE TWIN OF THE DECLARATION-LEVEL PIN ABOVE,
+// INVERTED FOR THE SAME MEASURED REASON AND KEPT AS A SEPARATE CASE BECAUSE IT IS
+// A SEPARATE SITE. It read `CompositeBareAlignedWithNoArgumentFailsLoud` and said
+// gcc's meaning was "a target-dependent number this engine refuses to invent".
+// ✔MEASURED 2026-09-09, each reference separately, rc read directly:
+// `struct __attribute__((aligned)) S { char c; };` is `_Alignof` 16 AND `sizeof` 16
+// on gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and aarch64-linux-gnu-gcc
+// 13.3.0 alike. The number is now READ from `aggregateLayout.maxAlignment` through
+// the ONE shared `targetMaxUsefulAlignment` — the two sites used to hold two copies
+// of the refusal, which is how one construct comes to mean two things depending on
+// where it is written.
+// ⚠ THE TRAILING SURFACE IS THE ONE THIS FIXTURE USES, and it is a different
+// grammar surface from the after-keyword one the sibling pins below exercise; both
+// route through the same composite scan, which is why one call is enough.
+TEST(SemanticAnalyzerC, CompositeBareAlignedTakesTheTargetMaximum) {
     auto cu = buildShippedUnit("c", {
         "struct C { char a; int b; } __attribute__((aligned));\n"
+        "struct C gc;\n"
         "int main(void){ return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, kAlignasLayout);
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
-    for (auto const& d : model.diagnostics().all()) {
-        if (d.code != DiagnosticCode::S_UnknownTypeAttribute) continue;
-        EXPECT_EQ(d.severity, DiagnosticSeverity::Error);
-        EXPECT_NE(d.actual.find("explicit alignment argument"), std::string::npos)
-            << d.actual;
-    }
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u);
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* gc = findSym(model, "gc");
+    ASSERT_NE(gc, nullptr);
+    auto const lay = computeLayout(gc->type, model.lattice().interner(),
+                                   kAlignasLayout, DataModel::Lp64);
+    ASSERT_TRUE(lay.has_value());
+    EXPECT_EQ(lay->align.bytes(), kAlignasLayout.maxAlignment)
+        << "compared against the fixture's OWN declared maximum, so a hard-coded 16 "
+           "in src/ could not satisfy it";
+    EXPECT_EQ(lay->size, kAlignasLayout.maxAlignment)
+        << "and the aggregate is padded up to it, as every reference does";
 }
 
 // ★★ THE MULTI-SURFACE COMPOSITE SCAN (D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION).

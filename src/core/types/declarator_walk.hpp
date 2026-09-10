@@ -59,6 +59,35 @@ template <class View>
 
 } // namespace declarator_walk_detail
 
+// ★★★ P66 (lane `ag`) — "IS THIS RULE A PER-SLOT DECLARATOR WRAPPER?", ASKED IN
+// ONE PLACE. A wrapper is a node that is NOT itself a `declaratorRule` but holds
+// exactly one as a child, plus whatever else that slot's grammar owns: an
+// initializer (`initDeclaratorRule`), a bit-field width (`memberDeclaratorRule`),
+// or an attribute run (`plainSlotRule`). Every walk that meets one must DESCEND to
+// the inner declarator, and the descent is otherwise identical for all three.
+//
+// ⚠ THIS PREDICATE EXISTS BECAUSE THE THIRD WRAPPER WAS THE ONE THAT MADE THE
+// PATTERN A DEFECT SHAPE. The `initDeclarator` / `memberDeclarator` disjunction was
+// written out by hand at SEVEN sites across this header and `semantic_analyzer.cpp`
+// (`declaratorNameNode`, `collectDeclarators`, `declaratorDerivesType`,
+// `declaratorDeclaredType`, `declaratorObjectIsConst`, the const-claim walk and the
+// param-list finder). Adding a third rule to six of seven would have read as a
+// complete fix and would not have been one — the seventh would silently answer a
+// question about the WRAPPER instead of about the declarator inside it, yielding a
+// wrong TYPE rather than a diagnostic ([[feedback-a-partial-fix-reads-as-a-complete-one]]).
+// So the disjunction is stated ONCE and a FOURTH wrapper is a config-only addition.
+//
+// ⓘ It takes a `RuleId` rather than a node: two of the seven sites already have the
+// rule in hand, and a node-taking form would make them re-read it.
+[[nodiscard]] inline bool
+isDeclaratorSlotWrapper(RuleId r, DeclaratorConfig const& dc) noexcept {
+    if (r == dc.initDeclaratorRule) return true;
+    if (dc.memberDeclaratorRule.has_value() && r == *dc.memberDeclaratorRule)
+        return true;
+    if (dc.plainSlotRule.has_value() && r == *dc.plainSlotRule) return true;
+    return false;
+}
+
 // The name-bearing `nameToken` leaf declared by the declarator (or
 // initDeclarator / direct) rooted at `node`, or InvalidNode for an ABSTRACT
 // declarator (no name — legal) and for any node outside the declarator role
@@ -73,18 +102,12 @@ template <class View>
     for (std::size_t step = 0; step < det::kMaxDeclaratorDepth; ++step) {
         if (!cur.valid() || v.kind(cur) != NodeKind::Internal) return {};
         RuleId const r = v.rule(cur);
-        if (r == dc.initDeclaratorRule) {
-            cur = det::firstChildOfRule(v, cur, dc.declaratorRule);
-            continue;
-        }
-        // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): a struct/union member-list
-        // slot wraps ONE declarator (+ its own bitfield suffix). Descend to the
-        // inner declaratorRule, identical to the initDeclaratorRule arm — an
-        // ABSENT inner declarator (the anonymous bit-field `int : 3;`) yields {}
-        // → abstract → no name, the same legal degrade. Guarded on the OPTIONAL
-        // role so a language without member lists never matches here.
-        if (dc.memberDeclaratorRule.has_value()
-            && r == *dc.memberDeclaratorRule) {
+        // EVERY per-slot wrapper descends to its inner declaratorRule, and the
+        // three are one arm because the descent is one descent (P66 lane `ag`;
+        // see `isDeclaratorSlotWrapper`). An ABSENT inner declarator — the
+        // anonymous bit-field `int : 3;` — yields {} → abstract → no name, the
+        // same legal degrade the single-wrapper arms always had.
+        if (isDeclaratorSlotWrapper(r, dc)) {
             cur = det::firstChildOfRule(v, cur, dc.declaratorRule);
             continue;
         }
@@ -147,18 +170,28 @@ void collectDeclarators(View const& v, NodeId node, DeclaratorConfig const& dc,
         }
         return;
     }
-    // TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): a BARE-declarator LIST —
-    // `declarator (',' declarator)*`, no per-slot wrapper. Collect each
-    // `declaratorRule` child (commas skipped), in source order. Structurally
-    // this is the `listRule` arm minus the `initDeclaratorRule` alternative,
-    // kept as its OWN arm rather than folded in because a language may declare
-    // both shapes and they must not alias each other's slot grammar. Guarded on
-    // the OPTIONAL role (a language without it never matches).
+    // TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): the INITIALIZER-FREE
+    // declarator LIST. Collect each slot (commas skipped), in source order.
+    // Structurally this is the `listRule` arm minus the `initDeclaratorRule`
+    // alternative, kept as its OWN arm rather than folded in because a language
+    // may declare both shapes and they must not alias each other's slot grammar.
+    // Guarded on the OPTIONAL role (a language without it never matches).
+    // ★ P66 (lane `ag`): a slot here may be a BARE `declaratorRule` or the
+    // OPTIONAL `plainSlotRule` wrapper — c's typedef list gained one so a
+    // MID-LIST `__attribute__((aligned(8)))` has somewhere to live and reaches
+    // the per-declarator attribute fold with DECLARATOR grain. BOTH spellings
+    // are accepted here rather than one replacing the other: a language that
+    // declares no slot rule keeps exactly the walk it had, and this arm cannot
+    // silently collect nothing if a grammar mixes them.
     if (dc.plainListRule.has_value() && r == *dc.plainListRule) {
         for (NodeId c : v.children(node)) {
             if (!v.isVisible(c)) continue;
             if (v.kind(c) != NodeKind::Internal) continue;
-            if (v.rule(c) == dc.declaratorRule) out.push_back(c);
+            RuleId const cr = v.rule(c);
+            if (cr == dc.declaratorRule
+                || (dc.plainSlotRule.has_value() && cr == *dc.plainSlotRule)) {
+                out.push_back(c);
+            }
         }
         return;
     }
@@ -177,14 +210,11 @@ void collectDeclarators(View const& v, NodeId node, DeclaratorConfig const& dc,
         }
         return;
     }
-    if (r == dc.initDeclaratorRule || r == dc.declaratorRule) {
-        out.push_back(node);
-        return;
-    }
-    // c23: a BARE single-slot member declarator (a one-element list the
-    // grammar may collapse to the slot directly) — push self; the caller's
-    // name/type walk descends it to the inner declarator.
-    if (dc.memberDeclaratorRule.has_value() && r == *dc.memberDeclaratorRule) {
+    // A SINGLE slot handed in directly (a one-element list the grammar may
+    // collapse) — push self; the caller's name/type walk descends it to the
+    // inner declarator. P66 (lane `ag`): the three wrapper roles are one
+    // question again here.
+    if (r == dc.declaratorRule || isDeclaratorSlotWrapper(r, dc)) {
         out.push_back(node);
     }
 }
@@ -256,9 +286,7 @@ template <class View>
     for (std::size_t step = 0; step < det::kMaxDeclaratorDepth; ++step) {
         if (!cur.valid() || v.kind(cur) != NodeKind::Internal) return false;
         RuleId const r = v.rule(cur);
-        if (r == dc.initDeclaratorRule
-            || (dc.memberDeclaratorRule.has_value()
-                && r == *dc.memberDeclaratorRule)) {
+        if (isDeclaratorSlotWrapper(r, dc)) {
             cur = det::firstChildOfRule(v, cur, dc.declaratorRule);
             continue;
         }

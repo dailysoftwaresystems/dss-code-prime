@@ -367,12 +367,20 @@ TEST(FileScopeDeclarationDefinedness, AutoFileScopeTakesItsStorageClass) {
 // the improvement the order-free run buys even where the answer is still "no".
 // ✔MEASURED 2026-09-08 through the shipped CLI (`--compile`), each reference
 // probed SEPARATELY on its own translation unit:
-//   const auto p = 1, q = 2;   DSS error[S_AutoRequiresSingleDeclarator]
-//       — C23 6.7.9p2 admits ONE declarator; gcc 13.3.0 (-std=c2x) REFUSES it
-//         too. ⚠ clang 18.1.3 (-std=c23) ACCEPTS it (`nm`: R p, R q), so this
-//         is a DECIDED divergence inherited from [[D-CSUBSET-AUTO-FILE-SCOPE]]
-//         (its `auto g = 1, h = 2;` arm), not a new one, and it is stated here
-//         rather than left to look like agreement.
+//   const auto p = 1, q = 2.5; DSS error[S_AutoDeclaratorsInferDifferentTypes]
+//       — ★★ P66 REPLACED THIS ARM, AND THE OLD ONE IS WORTH RECORDING. It read
+//         `const auto p = 1, q = 2;` and pinned `S_AutoRequiresSingleDeclarator`
+//         on "C23 6.7.9p2 admits ONE declarator", noting in the same breath that
+//         clang 18.1.3 ACCEPTS it (`nm`: R p, R q) and calling that a DECIDED
+//         divergence. It was not a divergence DSS was entitled to decide: type
+//         inference is C23 **6.7.10** (6.7.9 is Type DEFINITIONS), 6.7.10
+//         constrains only the presence of `auto`, the declarator COUNT is Annex
+//         J.2(78) UNDEFINED BEHAVIOUR, and Annex J.5.12 names the
+//         multi-declarator form a sanctioned COMMON EXTENSION. One WORKING
+//         accepting reference makes it REQUIRED, so DSS now accepts the count
+//         and constrains the AGREEMENT instead — which gcc 13.3.0 AND clang
+//         18.1.3 both refuse (clang: "'auto' deduced as 'int' … and … 'double'").
+//         The arm keeps its shape and its job; only its premise moved.
 //   static auto *p = 0;        DSS error[S_AutoRequiresPlainIdentifier]
 //       — gcc AND clang both REFUSE.
 //   static auto g;             DSS error[S_AutoRequiresInitializer]
@@ -406,7 +414,7 @@ TEST(FileScopeDeclarationDefinedness, AutoFileScopeTakesItsStorageClass) {
 // still non-vacuous four ways over plus the live control that follows it.
 TEST(FileScopeDeclarationDefinedness, SpecifierLedFileScopeAutoIsARefusedResidue) {
     for (char const* const src : {
-             "const auto p = 1, q = 2;\n",
+             "const auto p = 1, q = 2.5;\n",   // P66: the AGREEMENT, not the count
              "static auto *p = 0;\n",
              "static auto g;\n",
              "static x = 5;\n",
@@ -684,7 +692,16 @@ TEST(FileScopeDeclarationDefinedness, AutoFileScopeNegativesStayLoud) {
     for (char const* const src : {
              "auto g;\n",                    // no initializer to infer from
              "extern auto g;\n",             // ditto, and `extern` cannot lead it
-             "auto g = 1, h = 2;\n",         // C23 6.7.9p2: a single declarator
+             // ★★ P66: `auto g = 1, h = 2;` LEFT THIS LIST. The list claims
+             // "every one of them refused by gcc AND clang" and that claim was
+             // FALSE for that entry the day it was written — ✔MEASURED, clang
+             // 18.1.3 (-std=c23) accepts it at file scope, silently even at
+             // -Wall -Wextra -pedantic, and DSS now does too: C23 6.7.10 carries
+             // no declarator-count constraint (J.2(78) UB, J.5.12 common
+             // extension, fn.164 ISO/IEC 14882 semantics). What both references
+             // DO refuse is a declaration whose declarators deduce DIFFERENT
+             // types, so that is the entry now.
+             "auto g = 1, h = 2.5;\n",       // C23 6.7.10 fn.164: ONE deduced type
              "auto f(void) { return 1; }\n", // not a plain identifier
              "auto *p = 0;\n",               // derived declarator
              "static x = 5;\n",              // C89 implicit int is NOT C23 auto

@@ -3847,6 +3847,80 @@ TEST(GrammarSchema, DeclarationAttrSlotRulesBareStringEntryReportsInvalid) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
+// ★★★ P66
+// (D-C-THE-END-OF-SPECIFIERS-C23-ATTRIBUTE-CONFERS-ON-A-TYPEDEF-WHERE-NO-REFERENCE-CONFERS)
+// — THE OPTIONAL PER-SPELLING GRAIN.
+//
+// A DECLARATION-level slot names a RUN CONTAINER, and c's `typedefAttrRun`
+// holds BOTH attribute spellings under one rule name — so `appertainsTo` alone
+// could only be all-or-nothing while the references answer the two spellings
+// differently at the end of the declaration specifiers (✔MEASURED: gcc 13.3.0
+// IGNORES `typedef int [[deprecated]] T;` and HONOURS the `__attribute__` twin;
+// clang 18.1.3 refuses the first and honours the second; MSVC 19.51.36257
+// refuses the first and abstains on the second).
+TEST(GrammarSchema, DeclarationAttrSlotRulesStandardSpellingGrainLoads) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable",
+             "declarationAttrSlotRules": [
+               {"rule": "heads", "appertainsTo": "declaration",
+                "standardSpellingAppertainsTo": "type"},
+               {"rule": "idecl", "appertainsTo": "declarator"}] })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    auto const& d = (*r)->semantics().declarations[0];
+    ASSERT_EQ(d.declarationAttrSlotRules.size(), 2u);
+    EXPECT_EQ(d.declarationAttrSlotRules[0].appertainsTo,
+              AttrAppertainment::Declaration);
+    ASSERT_TRUE(d.declarationAttrSlotRules[0]
+                    .standardSpellingAppertainsTo.has_value());
+    EXPECT_EQ(*d.declarationAttrSlotRules[0].standardSpellingAppertainsTo,
+              AttrAppertainment::Type);
+    // ★ THE ARM THAT KEEPS THE KEY INERT FOR EVERY ENTRY THAT OMITS IT: absent
+    // must be ABSENT, not a default-constructed grain that quietly overrides.
+    EXPECT_FALSE(d.declarationAttrSlotRules[1]
+                     .standardSpellingAppertainsTo.has_value())
+        << "an entry that does not declare the override must carry none — the "
+           "property that makes this key byte-for-byte inert everywhere it is "
+           "not written";
+}
+
+// A grain outside the closed vocabulary, on the override key. Same table, same
+// loud refusal as `appertainsTo` — one vocabulary, two readers, one verdict.
+TEST(GrammarSchema, DeclarationAttrSlotRulesUnknownStandardSpellingGrainReportsInvalid) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable",
+             "declarationAttrSlotRules": [
+               {"rule": "heads", "appertainsTo": "declaration",
+                "standardSpellingAppertainsTo": "whatever"}] })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "the override draws from the SAME closed vocabulary as appertainsTo";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// ★★ A CONFERRING OVERRIDE IS REFUSED, and this is the arm that keeps the key
+// from being half a knob. `appertainsTo` selects the SITE a slot is folded at;
+// the override changes only what the run CONFERS once that site is chosen.
+// `declarator` names a conferring grain, so honouring it would have to move the
+// site too — which this key cannot do. Accepting it and reading it at the
+// declaration site would mean something other than what it says.
+TEST(GrammarSchema, DeclarationAttrSlotRulesConferringStandardSpellingGrainReportsInvalid) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable",
+             "declarationAttrSlotRules": [
+               {"rule": "heads", "appertainsTo": "declaration",
+                "standardSpellingAppertainsTo": "declarator"}] })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "only a NON-CONFERRING grain is expressible here; a conferring one "
+           "would have to move the fold site, which this key cannot do";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
 // The `appertainsTo` key present but naming a grain outside the closed
 // vocabulary. `EnumNameTable::fromName` returning nullopt is what makes this
 // loud rather than silently selecting row 0.

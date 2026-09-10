@@ -14,8 +14,10 @@
 // Clean`, `CommaSeparatorAndAssignTailSurviveTheExpression` and
 // `MultiArgumentIdentifierClauseIsUnchanged` assert only that nothing errored.
 // The first is vacuous in the drop direction ON ITS OWN and is paired with
-// `TypedefRequestStricterThanTheAliasFailsLoud`, which is not; the other two are
-// regression walls whose subject IS "this still compiles clean".
+// `TypedefRequestStricterThanTheAliasIsConferredAsSixteen`, which is not; the other
+// two are regression walls whose subject IS "this still compiles clean".
+// (P66 renamed that pin from `...FailsLoud` when its verdict inverted — see its own
+// comment; it still carries the pair's measurement, now as a NUMBER rather than a red.)
 //
 // The witness is real and is why the row exists: the shipped Xcode SDK's
 // `MacOSX.sdk/usr/include/libkern/OSAtomicDeprecated.h` writes
@@ -35,6 +37,7 @@
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "core/types/diagnostic_budget.hpp"
+#include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_layout.hpp"
 #include "analysis/semantic/semantic_test_fixture.hpp"
 
@@ -203,12 +206,22 @@ TEST(AttributeArgConstExpr, CompositeAlignedTakesAKeywordLedOperand) {
 
 // ── THE TYPEDEF WITNESS, and why its PAIR is the proof ───────────────────────
 
-// The row's literal witness decorates a TYPEDEF. DSS's graded typedef arm accepts
-// a request the alias already satisfies (a proven no-op) and REFUSES one it
-// cannot deliver, because a typedef interns to the same TypeId as its aliasee.
-// The two pins below are one measurement: the second is what proves the operand
-// FOLDED TO 16 rather than being dropped, because a dropped operand produces the
-// silent acceptance of the first.
+// The row's literal witness decorates a TYPEDEF. DSS accepts a request the alias
+// already satisfies (a proven no-op, and nothing is minted for it) and CONFERS one
+// that exceeds it. The two pins below are one measurement: the second is what proves
+// the operand FOLDED TO 16 rather than being dropped, because a dropped operand
+// produces the silent acceptance of the first.
+// ~~ "...and REFUSES one it cannot deliver, because a typedef interns to the same
+// TypeId as its aliasee." ~~ ★★ RETIRED IN PLACE BY P66 (lane `al`) — FALSE, not
+// stale. An over-aligned alias interns to a DISTINCT TypeId now (the type-level
+// alignment skin), so the stricter request is HONORED
+// ([[D-C-A-GNU-ALIGNED-ATTRIBUTE-ON-A-TYPEDEF-IS-REFUSED-WHILE-BOTH-REFERENCES-HONOUR-IT]];
+// gcc, clang and MSVC all confer an over-aligned type alias, so DSS was BELOW the
+// union while it refused). ★ THE PAIR'S DISCRIMINATION IS UNCHANGED AND IS NOW
+// STRONGER: the second pin used to read a REFUSAL as proof the operand folded to 16;
+// it now reads the CONFERRED 16 itself. A dropped or mis-folded operand gives 0 or 8
+// and still fails — and unlike the refusal, this cannot be satisfied by an error
+// raised for some unrelated reason.
 TEST(AttributeArgConstExpr, TypedefWitnessWithASatisfiedRequestCompilesClean) {
     auto model = analyzeC(
         "typedef long long __attribute__((__aligned__((sizeof(long long))))) osint64_t;\n"
@@ -218,15 +231,22 @@ TEST(AttributeArgConstExpr, TypedefWitnessWithASatisfiedRequestCompilesClean) {
            "and gcc/clang/mingw all compile the SDK line clean";
 }
 
-TEST(AttributeArgConstExpr, TypedefRequestStricterThanTheAliasFailsLoud) {
+TEST(AttributeArgConstExpr, TypedefRequestStricterThanTheAliasIsConferredAsSixteen) {
     auto model = analyzeC(
         std::string{kPair}
         + "typedef long long __attribute__((__aligned__((sizeof(struct pair))))) t16;\n"
           "t16 v;\n");
-    EXPECT_GE(countCode(model.diagnostics(),
-                        DiagnosticCode::S_AlignasInvalidContext), 1u)
-        << "16 > the alias's 8, and DSS cannot represent an over-aligned alias — "
-           "this red is what proves the operand folded to 16 instead of vanishing";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 0u)
+        << "P66: an over-aligned alias is representable now and every reference "
+           "compiles this, so the refusal this pin used to demand was below the union";
+    SymbolRecord const* t = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "t16") t = &model.symbols()[i];
+    ASSERT_NE(t, nullptr) << "no symbol named 't16'";
+    EXPECT_EQ(model.lattice().interner().typeAlignOverride(t->type), 16u)
+        << "16 > the alias's natural 8, so the value must be CONFERRED, and this "
+           "exact number is what proves the operand folded to 16 rather than vanishing: a dropped operand mints nothing and reads 0. The sibling pin above is vacuous alone; this is the half that carries the measurement";
 }
 
 // ── THE FAIL-LOUD ARM, with its control ─────────────────────────────────────

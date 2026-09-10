@@ -1473,6 +1473,25 @@ enum class DiagnosticCode : std::uint16_t {
     // correct bytes), NOT the `S_AlignasInvalidContext` posture (a layout
     // constraint whose silence is a miscompile). Do NOT add it to
     // `unsuppressable_codes.cpp`.
+    //
+    // ★★ P66 — A **SECOND** REASON NOW REACHES THIS CODE, AND THAT IS THE
+    // "one code covers every present and future verb" clause above being used
+    // rather than stretched. The first reason is the DECL-KIND one this comment
+    // opens with: the attribute's `appliesTo` set does not admit the kind of
+    // entity being declared. The second is POSITIONAL: the attribute run's
+    // config-declared grain resolves to `type`, so it decorates a TYPE and
+    // there is no entity to attach a fact to at all
+    // (D-C-THE-END-OF-SPECIFIERS-C23-ATTRIBUTE-CONFERS-ON-A-TYPEDEF-WHERE-NO-REFERENCE-CONFERS).
+    // ONE code because it is ONE fact — this attribute was thrown away, and
+    // here is why — and the `actual` text is where the two reasons differ.
+    // A single clause draws exactly ONE report: the positional arm returns
+    // before the clause is recorded for the decl-kind gate.
+    // ⚠ IT IS THE SAME SEVERITY FOR THE SAME MEASURED REASON. gcc 13.3.0 emits
+    // `'deprecated' attribute ignored [-Wattributes]` and exits 0 for every
+    // type-appertaining position probed (✔MEASURED 2026-09-09:
+    // `typedef int [[deprecated]] T;`, `static int [[deprecated]] m = 1;`,
+    // `void f(void) [[deprecated]];`, `int arr[3] [[deprecated]];`), so erroring
+    // would refuse C that a reference compiles — the TF-C77 lesson, again.
     S_AttributeIgnoredForDeclarationKind = 0xE05F,
 
     // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT (TF-C135): a DIRECT call argument
@@ -2335,6 +2354,35 @@ enum class DiagnosticCode : std::uint16_t {
     // `S_FloatLiteralOverflowsToInfinity` negative-pin posture: a pure CONSTRAINT
     // diagnostic, not a silent-miscompile guard. Renders error[S07A].
     S_ArrayParamStarInFunctionDefinition = 0xE07A,
+    // C 6.7.6.3 / C23 6.7.7.4 (P66): the config-declared VARIADIC MARKER is not
+    // the LAST element of a parameter-type-list — `int f(int a, ..., int b);`.
+    // The `.actual` names the marker and the span points AT it. DSS accepted all
+    // of `int f(int a, ..., int b);`, its DEFINITION and the function-pointer
+    // spelling at rc 0 with zero bytes on stderr; ✔MEASURED 2026-09-09, each
+    // reference probed SEPARATELY on its own TU, gcc 13.3.0 `-std=c2x`, clang
+    // 18.1.3 `-std=c23` and MSVC 19.51 `/std:clatest` ALL THREE refuse every one
+    // of those spellings, each pointing at the separator after the marker. Being
+    // ABOVE the union is the defect this code closes.
+    // UNSUPPRESSABLE: the variadic FnSig is built by a CONTAINS scan for the
+    // marker, so a suppressed violation ships a signature that claims the
+    // trailing parameters AND variadic-ness — a call ABI no reference agrees
+    // with, from source no reference compiles, with no diagnostic. Renders
+    // error[S07B].
+    S_VariadicMarkerMustEndParameterList = 0xE07B,
+    // C23 6.7.10 fn.164 (P66): two declarators of ONE initializer-inferred
+    // declaration deduce DIFFERENT types — `auto a = 1, b = 2.5;`. The `.actual`
+    // names both declarators and both deduced types; the span points at the
+    // SECOND (disagreeing) declarator, as clang 18.1.3 does. C23 states no
+    // single-declarator CONSTRAINT: J.2(78) makes the count UNDEFINED BEHAVIOUR
+    // and J.5.12 names multi-declarator inference a COMMON EXTENSION, whose
+    // recommended semantics (fn.164) are ISO/IEC 14882's — ONE deduced type for
+    // the whole declaration. This code is the guard on that ONE type.
+    // UNSUPPRESSABLE for the same seam as the other S_Auto* codes: the inference
+    // arm is the only tier that types these symbols at Pass 1.5, and a
+    // suppressed disagreement would fall through to Pass 2's initializer
+    // backfill and silently give each declarator its OWN type — precisely the
+    // per-declarator meaning no reference implements. Renders error[S07C].
+    S_AutoDeclaratorsInferDifferentTypes = 0xE07C,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

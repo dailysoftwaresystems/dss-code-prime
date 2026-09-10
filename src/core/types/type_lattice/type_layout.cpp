@@ -236,9 +236,16 @@ using LayoutMemo = std::unordered_map<TypeId, std::optional<StructLayout>>;
 // one of them before running a level's body. Were the two ever to drift apart
 // the walk would REFUSE a type it could have laid out — a loud diagnostic at
 // the caller, never a guessed size and never a silent miscompile.
+// ★★ P66 (lane `al`): the memo key is `layoutRoot`, NOT `stripVolatile`. The two
+// differ on exactly one input — a type-level alignment skin (GNU `aligned(N)` on a
+// typedef), which `stripVolatile` would strip and thereby resolve `A8` to `int`'s
+// memo entry, SILENTLY DROPPING the alias's alignment. Keying here (and in
+// `forEachLayoutDependency`, which must AGREE or the walk refuses a type it could
+// lay out) is what makes every consumer of a field/element alignment correct at
+// once, instead of N separate folds at N call sites.
 [[nodiscard]] StructLayout const*
 childLayout(LayoutMemo const& memo, TypeInterner const& interner, TypeId id) {
-    auto const it = memo.find(interner.stripVolatile(id));
+    auto const it = memo.find(interner.layoutRoot(id));
     if (it == memo.end() || !it->second.has_value()) return nullptr;
     return &*it->second;
 }
@@ -266,10 +273,13 @@ void forEachLayoutDependency(TypeInterner const& interner, TypeId id, F&& fn) {
             return;   // every other kind answers from its own record alone
     }
     for (TypeId const c : interner.operands(id)) {
-        fn(interner.stripVolatile(c));
+        // P66: `layoutRoot`, matching `childLayout`'s key exactly — the two are one
+        // decision written twice and MUST NOT drift (a mismatch is a refusal, not a
+        // wrong answer, but it is still a refusal of a type the engine can lay out).
+        fn(interner.layoutRoot(c));
         if (interner.isIncompleteArray(c)) {
             auto const elem = interner.operands(c);
-            if (!elem.empty()) fn(interner.stripVolatile(elem[0]));
+            if (!elem.empty()) fn(interner.layoutRoot(elem[0]));
         }
     }
 }
@@ -927,12 +937,19 @@ namespace {
 // be run in any order the driver likes, exactly once per distinct type, with no
 // host frame per level.
 //
-// `id` arrives ALREADY volatile-stripped (the driver strips at every edge and
-// keys `memo` on the stripped id), so `isIncompleteComposite`/`isIncompleteArray`
-// still see the RAW record kind they need.
+// `id` arrives ALREADY reduced to its LAYOUT ROOT (the driver reduces at every edge
+// and keys `memo` on that id), so `isIncompleteComposite`/`isIncompleteArray` still
+// see the RAW record kind they need.
+// ⚠ P66: "layout root" is NOT "volatile-stripped" any more — a type-level alignment
+// skin survives the reduction, and `id` may therefore BE such a skin. Every arm below
+// is still correct unchanged, because `interner.kind()`/`operands()`/`scalars()` see
+// THROUGH the skin to the material type; the alignment itself is applied by
+// `layoutOne`, the thin wrapper just below this function. Nothing in this body reads
+// it, and nothing in this body should.
 [[nodiscard]] std::optional<StructLayout>
-layoutOne(TypeId id, TypeInterner const& interner,
-          AggregateLayoutParams params, DataModel dm, LayoutMemo const& memo) {
+layoutOneMaterial(TypeId id, TypeInterner const& interner,
+                  AggregateLayoutParams params, DataModel dm,
+                  LayoutMemo const& memo) {
     TypeKind const kind = interner.kind(id);
 
     // D-CSUBSET-SELF-REFERENTIAL-STRUCT: an INCOMPLETE composite (a forward-declared
@@ -1393,6 +1410,69 @@ layoutOne(TypeId id, TypeInterner const& interner,
     }
 }
 
+// ★★ P66 (lane `al`, GNU `__attribute__((aligned(N)))` ON A TYPEDEF): ONE type
+// level, plus the type's OWN explicit alignment. This is the SINGLE site that reads
+// a type-level alignment, and putting it here — rather than at the ~10 places a
+// field's or an element's alignment is folded — is the whole point: every consumer
+// in the compiler reaches an alignment through a `StructLayout::align` that this
+// function produced, so `_Alignof(A8)`, an `A8` global's `dataAlignBytes`, an `A8`
+// local's alloca and a `struct { A8 v; }` member offset all become right together.
+// [[feedback-a-partial-fix-reads-as-a-complete-one]] is the rule being obeyed: N
+// transforms on one value would be N defects, and fixing one would leave the rest
+// wrong DIFFERENTLY rather than obviously.
+//
+// ★ SIZE IS DELIBERATELY UNTOUCHED, and that is measured rather than assumed:
+// ✔MEASURED 2026-09-09, gcc 13.3.0 and clang 18.1.3, `typedef int
+// __attribute__((aligned(8))) A8;` gives `sizeof(A8) == 4` with `_Alignof(A8) == 8`,
+// and BOTH references consequently REFUSE `A8 arr[3]` outright ("alignment of array
+// elements is greater than element size" / "isn't a multiple of its alignment").
+// A fix that rounded the size up to the alignment would silently accept an array
+// no reference accepts and lay it out on a stride neither uses.
+//
+// ★★★ P66 (lane `ag`) — THE OVERRIDE **IS** THE ANSWER; IT DOES NOT MAX WITH THE
+// MATERIAL'S NATURAL ALIGNMENT. ⚠ THIS FOLD WAS `maxAlign(out->align, *a)` UNDER A
+// COMMENT READING "the rule the composite `explicitAlign` channel already uses
+// (C 6.7.5: a request weaker than natural is a no-op)". The cited rule is REAL and
+// it governs a DIFFERENT axis; borrowing it here made DSS silently diverge from
+// every reference that implements the construct.
+// ✔MEASURED 2026-09-09, each reference probed SEPARATELY, one TU per probe, rc read
+// DIRECTLY at `-Wall -Wextra` — gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and
+// aarch64-linux-gnu-gcc 13.3.0, unanimous on every arm:
+//   * `typedef int A2 __attribute__((aligned(2)));` ⇒ `_Alignof(A2)` is **2**, and
+//     the `== 4` twin FAILS, in BOTH orders; `aligned(1)` reaches 1;
+//   * `struct T { char c; A2 v; }` is sizeof **6** / align 2 / offsetof(v) **2**
+//     (the sizeof-8 twin FAILS) — so the divergence is ABI-VISIBLE, not cosmetic,
+//     and ✔EXECUTED: a DSS-built binary of that shape returned 10 where gcc, clang
+//     and aarch64-gcc all returned 42;
+//   * a struct alias, a pointer alias and a chained alias all lower too;
+//   * a RE-ALIAS lowers further — `typedef A8 A2 __attribute__((aligned(2)));` is
+//     A8 = 8, A2 = 2 (the interner's merge carries that half).
+// ⛔ AND THE BOUND, WHICH IS WHY THIS IS NOT "ALIGNMENT BECOMES LOWERABLE": the
+// WHOLE-COMPOSITE channel does NOT lower (`struct __attribute__((aligned(1))) S
+// { int a; };` keeps 4 on all four references, the `== 1` twin FAILING on all
+// four), and neither does a per-MEMBER request. `explicitAlign`'s and
+// `fieldAligns`' MAX folds are CORRECT and are untouched — they live inside
+// `layoutOneMaterial`, below this line, and each has its own pin.
+// ★ SIZE IS STILL DELIBERATELY UNTOUCHED, in BOTH directions: ✔MEASURED,
+// `sizeof(A2)` stays 4 with `_Alignof(A2)` 2, and a lowered STRUCT alias keeps the
+// material's size (8) while aligning at 1. Rounding size to alignment either way
+// would lay out an aggregate on a stride no reference uses.
+[[nodiscard]] std::optional<StructLayout>
+layoutOne(TypeId id, TypeInterner const& interner,
+          AggregateLayoutParams params, DataModel dm, LayoutMemo const& memo) {
+    auto out = layoutOneMaterial(id, interner, params, dm, memo);
+    std::uint32_t const want = interner.typeAlignOverride(id);
+    if (!out.has_value() || want == 0) return out;
+    auto const a = Alignment::fromBytes(want);
+    // Unrepresentable (0 / non-power-of-two / over max) ⇒ FAIL LOUD, exactly as the
+    // member-`alignas` fold does. The semantic tier validates the request long before
+    // it reaches the interner (S_AlignasNotPowerOfTwo / S_AlignasExceedsMax), so this
+    // is an upstream-bug backstop, never a user-reachable path.
+    if (!a) return std::nullopt;
+    out->align = *a;
+    return out;
+}
+
 // ── THE DRIVER: one explicit heap work stack over the by-value type graph ────
 //
 // A post-order DFS with the classic three-colour marking, so it is a walk over a
@@ -1472,7 +1552,15 @@ computeLayout(TypeId id, TypeInterner const& interner,
     // suffice, but `isIncompleteComposite`/`isIncompleteArray` read the RAW record
     // kind.) It is also what makes the memo key canonical: `volatile T` and `T`
     // share one entry instead of being resolved twice.
-    TypeId const root = interner.stripVolatile(id);
+    // ★★ P66 (lane `al`): the reduction is `layoutRoot`, NOT `stripVolatile`, and the
+    // difference is exactly one input — a skin carrying a TYPE-LEVEL ALIGNMENT (GNU
+    // `aligned(N)` on a typedef). `volatile T` still collapses onto `T`'s entry and
+    // every sentence above still holds for it; an over-aligned alias does NOT, because
+    // for that one the skin IS the answer. Stripping it here would have thrown the
+    // alignment away before any arm could see it — the silent-drop this row exists to
+    // kill — and would ALSO have made `A8` and `int` share a memo entry, so the two
+    // would have raced to write one cell with two different alignments.
+    TypeId const root = interner.layoutRoot(id);
 
     // ★ THE FAST PATH IS NOT AN OPTIMISATION FOOTNOTE, IT IS THE COMMON CASE.
     // A type with no layout DEPENDENCIES — every scalar, pointer, enum,

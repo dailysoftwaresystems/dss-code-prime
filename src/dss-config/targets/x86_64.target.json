@@ -4113,7 +4113,7 @@
       }
     },
     {
-      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-5): FISTTP m64int = DD /1 — store st0 with TRUNCATION to a 64-bit integer and pop; the wider sibling of fisttp_m32 above, which explains why FISTTP (SSE3) rather than the fnstcw/fistp/fldcw bracketing BOTH references emit. It serves TWO C casts: `(long long)ld` directly, and `(unsigned)ld`, whose full range [0, 2^32) does NOT fit a signed m32int — a value above 2^31 would store the 0x80000000 integer-indefinite and read back as a wrong answer with no fault — but fits a signed m64int exactly, after which the pipeline's own `trunc` verb takes the low 32 bits in a REGISTER (never by reading half the slot, which would be a byte-order assumption). ✔Byte-verified against GNU as 2.42: `fisttp QWORD PTR [rbx+0x11223344]` = dd 8b 44 33 22 11, against the shipped m32 form's db 8b … — the /1 digit is shared and only the first byte differs. ⓘ `(unsigned long long)ld` is still NOT realized: above 2^63 there is no x87 store form at all, and both references branch on a 2^63 compare to bias the value — a branching sequence this straight-line lowerer cannot emit — so that cast stays fail-loud on BOTH long-double axes rather than shipping on one. result:none + hasSideEffects (writes m64 + pops st0).",
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-5): FISTTP m64int = DD /1 — store st0 with TRUNCATION to a 64-bit integer and pop; the wider sibling of fisttp_m32 above, which explains why FISTTP (SSE3) rather than the fnstcw/fistp/fldcw bracketing BOTH references emit. It serves THREE C casts: `(long long)ld` directly; `(unsigned)ld`, whose full range [0, 2^32) does NOT fit a signed m32int — a value above 2^31 would store the 0x80000000 integer-indefinite and read back as a wrong answer with no fault — but fits a signed m64int exactly, after which the pipeline's own `trunc` verb takes the low 32 bits in a REGISTER (never by reading half the slot, which would be a byte-order assumption); and, since LD-6, `(unsigned long long)ld` through the branchless truncate-both-and-select sequence (this row TWICE, once direct and once biased). ✔Byte-verified against GNU as 2.42: `fisttp QWORD PTR [rbx+0x11223344]` = dd 8b 44 33 22 11, against the shipped m32 form's db 8b … — the /1 digit is shared and only the first byte differs. ⚠ THIS ROW'S COMMENT USED TO STATE A BOUNDARY THAT WAS MEASURED FALSE AND IT IS CORRECTED IN PLACE RATHER THAN DELETED: it said `(unsigned long long)ld` \"is still NOT realized … both references branch on a 2^63 compare … a branching sequence this straight-line lowerer cannot emit\". ✔MEASURED 2026-09-09 (P66): gcc 13.3.0 branches, clang 18.1.3 does NOT, and DSS needs neither — an out-of-range FISTTP writes the integer INDEFINITE with #IA masked, which IS the range predicate, so the select is an arithmetic shift of the direct result. result:none + hasSideEffects (writes m64 + pops st0).",
       "mnemonic": "fisttp_m64", "result": "none",
       "hasSideEffects": true,
       "minOperands": 3, "maxOperands": 3,
@@ -4125,6 +4125,50 @@
           {
             "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
             "template": { "opcode": [221], "modrmRegExt": 1 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-7): FILD m32int = DB /0 — push a SIGNED 32-BIT INTEGER memory operand onto st0, converting it to the stack's 80-bit working format on the way in. ★ THE CONVERSION IS THE MEMORY OPERAND'S, exactly as the WIDENING is for fld_m32/fld_m64 one type over: the x87 stack has ONE working format and no register-to-register conversion instruction, so `long double ld = anInt;` is realized as `mov [slot],r32 ; fild_m32 [slot] ; fstp_m80 [home]`. This row is the DIRECTION-INVERSE sibling of fisttp_m32 — an integer enters the stack exactly the way one leaves it. ✔MEASURED 2026-09-09 that gcc 13.3.0 and clang 18.1.3 both emit `fildl` for an `int` source, probed separately at −O0 and −O2 (at −O2 gcc takes it straight from memory with no spill at all). ⚠⚠ `fild` IS NOT `fld`, AND AT 32 BITS THEY ARE ONE OPCODE BYTE APART AT THE SAME /DIGIT: DB /0 here against fld_m32's D9 /0, with an identical operand shape. An `fld` where an `fild` was meant REINTERPRETS the integer's bits as a binary32 — the integer 5 becomes 7e-45 — a wildly wrong value that does not fault, which is why the two are separate mnemonic slots and why the unit pins read the MNEMONIC rather than the shape. ⓘ AN UNSIGNED 32-BIT SOURCE DOES NOT USE THIS ROW: `fild m32` reads its four bytes SIGNED, so every `unsigned` at or above 2^31 would arrive NEGATIVE; the lowering zero-extends in a REGISTER first and takes fild_m64 instead — the exact mirror of the way `(unsigned)ld` narrows in a register on the way out, and the same two-step shape this target's own SSE `ui_to_fp` sequence uses for its U32 arm. ✔Byte-verified against GNU as 2.42, with fld_m32 / fld_m64 / fisttp_m32 / fisttp_m64 / fld_m80 / fstp_m80 / faddp reproduced by the SAME harness as controls: `fild DWORD PTR [rbx+0x11223344]` = db 83 44 33 22 11. Same base+disp memory operand shape as fld_m80 ([addr-reg, MemBase, MemOffset], modrm.rm.mem → mod=10 + disp32); modrmRegExt=0 = the /0 digit. result:none + hasSideEffects (pushes the implicit x87 stack).",
+      "mnemonic": "fild_m32", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 3, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template": { "opcode": [219], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-7): FILD m64int = DF /5 — the 64-bit sibling of fild_m32, and the row that serves THREE of the four integer→long-double spellings: `long long` directly, `unsigned` after a register zero-extend into an 8-byte slot, and `unsigned long long` through the exact split (this row THREE times — the halved value twice, then the low bit). ✔MEASURED that gcc 13.3.0 and clang 18.1.3 both emit `fildq`/`fildll` for a `long long` source and for a zero-extended `unsigned`, probed separately. ⚠ THE FIRST OPCODE BYTE AND THE /DIGIT BOTH DIFFER FROM ITS 32-BIT SIBLING (DF /5 against DB /0), unlike every other x87 width pair in this file, where only the first byte moves — so a row copied from fild_m32 and edited on one axis only would assemble something else entirely. ⚠ `fild m64` READS ITS QUADWORD SIGNED, which is why `unsigned long long` is NOT one instruction: every value at or above 2^63 would arrive negative. The lowering computes `2·(u>>1) + (u&1)` instead, which is EXACT rather than merely correctly rounded because x87-80 carries a 64-bit significand — no compare, no branch, no conditional move and no constant but the integer 1, where ✔gcc 13.3.0 BRANCHES (`fildq; test; jns; fadd [2^64]`) and clang 18.1.3 indexes a two-entry constant table by the sign bit. ⓘ That is deliberately NOT the identity this target's SSE `ui_to_fp` row declares (a two-halves split recombined with a MULTIPLY by 2^32): binary64's 53-bit significand cannot hold a u64, so there the addition has to be the one correctly-rounded step; x87-80 has room for the whole value. One format's exact-split identity is not another's. ✔Byte-verified against GNU as 2.42 by the same harness and controls as fild_m32: `fild QWORD PTR [rbx+0x11223344]` = df ab 44 33 22 11 (the /5 digit puts 101 in ModR/M.reg → 0xab at mod=10, base=rbx). result:none + hasSideEffects (pushes the implicit x87 stack).",
+      "mnemonic": "fild_m64", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 3, "maxOperands": 3,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "membase", "memoffset"] },
+            "template": { "opcode": [223], "modrmRegExt": 5 },
             "wires":    [
               { "index": 0, "slotKind": "modrm.rm.mem"  },
               { "index": 1, "slotKind": "membase.scale" },

@@ -1831,3 +1831,77 @@ if(DSS_BUILD_TESTS)
     list(LENGTH _dss_p63_guard_tests _dss_p63_guard_count)
     message(STATUS "repo-guard label applied to ${_dss_p63_guard_count} additional test(s) registered after the scan")
 endif()
+
+# ── P66: the package pipeline's release path, and the only thing that can see it ──
+#
+# ⚠ APPENDED AT THE END, for the same reason the P63 block above says: this file
+#   is shared by concurrent lanes, and an append is the one edit that cannot
+#   collide with a sibling's. The `repo-guard` scan ran long before this point,
+#   so the label is applied BY NAME below.
+if(DSS_BUILD_TESTS)
+    # `.github/workflows/pipeline-pkg.yml` gained an artifacts-only mode
+    # (`workflow_dispatch`) that builds and packages the same four legs as the
+    # release path and uploads each as a GitHub Actions artifact, creating and
+    # publishing nothing. It was added by THREE `if:` conditions and one
+    # side-effect-free step — no new job, no moved step, no changed permission —
+    # because the operator ruled on 2026-09-09: *"Ensure the release process will
+    # not be changed. The goal is to ensure it will work"*.
+    #
+    # ★★★ SO THE PROPERTY THE GUARD PINS IS THE RELEASE PATH'S STEP SEQUENCE, as
+    # a literal ordered list of every (job, step) a release push runs, plus which
+    # of them may carry a mode gate. An added job, a deleted step, a reordering,
+    # a step that quietly stops running on a release push — each is a refusal
+    # with its own message. Everything else in the guard hangs off that.
+    #
+    # ★★★ NOTHING ELSE IN THIS REPOSITORY CAN LOOK AT ANY OF IT. The YAML never
+    # runs on any host this suite reaches, and CI cannot test its own trigger
+    # matrix — a run only ever demonstrates the mode it happened to be in.
+    # ✔MEASURED 2026-09-09 with `gh run list --workflow=pipeline-pkg.yml`: that
+    # workflow has TWO runs in its whole history, both `startup_failure` at 0 s
+    # on 2026-07-07 at `b196c336`, where the file still called a reusable
+    # workflow in a PRIVATE repository — so the vendored body has never been
+    # executed at all. For this file, reading is the verification, and this entry
+    # is what makes a reading stick.
+    #
+    # ⛔ AND IT REFUSES THE FORK. The cheapest way to add a mode to a workflow is
+    # to copy the packaging steps into a second job; the sibling pipeline already
+    # carries an open row for that exact class
+    # (D-CI-PR-PIPELINE-IS-VENDORED-AND-ITS-SYNC-IS-UNCHECKED). `cmake --install`
+    # and `tar -czf` are refused here by COUNT, not by review.
+    #
+    # ★ Python, not a `.sh`/`.ps1` pair, for the reason `scripts_index_guard`
+    # gives: the subject is one contract that must not exist twice, so expressing
+    # the guard twice would be the joke it sounds like. STDLIB ONLY — ✔no script
+    # here imports PyYAML and no CI step installs it, so a guard that did would
+    # red on an interpreter's contents rather than on the tree.
+    #
+    # ★★ IT SELF-TESTS ON EVERY RUN: one arm per clause against a MIRROR of the
+    # real file, each asserting ITS OWN message id rather than a non-zero exit, so
+    # this entry cannot pass without also proving every clause can fail. ⚠ THE ARM
+    # COUNT IS NOT WRITTEN HERE ON PURPOSE — the guard PRINTS it every run, and a
+    # count typed into a comment is a measurement with no instrument attached
+    # (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    #
+    # ★★ AND A CLAUSE WITH NO ARM IS ITSELF A REFUSAL. The guard reads its own
+    # source, collects every message id it can emit, and reds if any of them has
+    # no arm asserting it — because a clause whose realistic mutation also trips a
+    # neighbouring byte-pin will otherwise sit unproved forever behind the
+    # neighbour's green. One clause was already in that state when the ratchet was
+    # added. Two further arms exist because an earlier draft refused the CORRECT
+    # file over PROSE (a comment naming `gh release upload`, and one naming
+    # `cmake --install`), and one more because an unanchored mutation rewrote a
+    # comment instead of the key it meant to break — an arm that mutated nothing
+    # and would have gone on passing.
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(
+        NAME pkg_pipeline_modes_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/check-pkg-pipeline/check-pkg-pipeline.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # The label the scan above could no longer apply, applied by name — same
+    # reasoning as the P63 block: an unlabelled guard is not skipped anywhere, it
+    # simply runs on every leg, so the failure direction is "too much testing".
+    set_tests_properties(pkg_pipeline_modes_guard PROPERTIES LABELS "repo-guard")
+    message(STATUS "repo-guard label applied to 1 additional test (pkg_pipeline_modes_guard)")
+endif()

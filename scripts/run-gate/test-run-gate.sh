@@ -2,11 +2,13 @@
 # test-run-gate.sh -- prove BOTH run-gate twins refuse a run whose evidence is
 # spoiled, and that they still pass a run whose evidence is intact.
 #
-# THREE SUBJECTS, one fixture, because they are one contract:
+# FOUR SUBJECTS, one fixture, because they are one contract:
 #   * the SOURCE TREE moving under the run          -> exit 3
 #   * ANOTHER RUN live in the same BUILD DIRECTORY  -> exit 4
 #   * WHICH TREE those roots are read from at all   -> 3 or 0, and which one it
 #     was must be readable from the log ALONE
+#   * whether a file's TIMESTAMP can decide either answer -> it must not, in
+#     EITHER direction, because one carriage's clock is not monotonic
 #
 # ⚠⚠ THE THIRD SUBJECT IS THE ONE WHOSE FAILURE IS SILENT, and that is why it is
 #   proved in BOTH directions rather than only the refusing one. The input roots
@@ -100,7 +102,8 @@
 #     category where twin parity is actually proved, while reporting green for
 #     doing less work.
 #   ★ THE .sh ARMS ARE NEVER ESCAPABLE. A host with no PowerShell still proves the
-#     .sh twin: arms 1, 2, 3, 7, 8, 12, 13 and 14 run everywhere, unconditionally.
+#     .sh twin: arms 1, 2, 3, 7, 8, 12, 13, 14, 18 and 19 run everywhere,
+#     unconditionally.
 #
 # ⚠⚠ THE REACH OF THIS GUARD -- WHERE TWIN PARITY IS ACTUALLY PROVED, AND WHERE IT
 #   IS NOT. ✔MEASURED BY EXECUTION 2026-09-08 on all four hosts this project gates
@@ -109,9 +112,9 @@
 #       WSL x86_64           /usr/bin/pwsh 7.5.4                -> .ps1 arms RUN
 #       macOS arm64          /usr/local/bin/pwsh                -> .ps1 arms RUN
 #       arm64 VPS (ubuntu)   NEITHER spelling present           -> .ps1 arms N/A
-#   ⇒ on the arm64 VPS leg, arms 4, 5, 9, 10, 15 and 16 -- and with them ALL THREE
-#     parity arms, 6, 11 and 17 -- are not proved, and that is PERMANENT rather
-#     than pending:
+#   ⇒ on the arm64 VPS leg, arms 4, 5, 9, 10, 15, 16, 20 and 21 -- and with them
+#     ALL FOUR parity arms, 6, 11, 17 and 22 -- are not proved, and that is
+#     PERMANENT rather than pending:
 #     nothing in this tree installs PowerShell there. A green `run_gate_guard` on
 #     that carriage is evidence about `run-gate.sh` ALONE. The run says so in
 #     words AND in a count of not-applicable arms, so the two cannot be confused.
@@ -583,6 +586,97 @@ else
     na 15-ps1-own-tree-moves     "$PS_ABSENT_WHY -- the .ps1 twin was never shown its OWN tree moving from a foreign cwd"
     na 16-ps1-foreign-tree-moves "$PS_ABSENT_WHY -- the .ps1 twin's foreign-tree CONTROL was not taken"
     na 17-parity                 "$PS_ABSENT_WHY -- arms 13 and 14 still prove the .sh twin reads the gate command's tree, but the twins were NOT compared"
+fi
+
+# ═══ THE FOURTH SUBJECT: A TIMESTAMP THE HOST'S CLOCK GOT WRONG ════════════
+# ⚠⚠⚠ THE THREE SUBJECTS ABOVE CANNOT CATCH THIS CLASS RELIABLY, AND THAT IS WHY
+#   THIS ONE EXISTS. ✔MEASURED 2026-09-09 (P66) on WSL x86_64: CLOCK_REALTIME
+#   there steps FORWARD +24.69 s for ~200 ms out of every ~5 s (4.8% duty cycle)
+#   and the excursion REACHES INODE MTIMES -- 12 of 60 marker/probe pairs had the
+#   probe, created ONE SECOND AFTER the marker, carrying an mtime 23.70 s
+#   EARLIER, and `find -newer` answered EMPTY. Both twins compared stamps for
+#   ORDER, so both went blind, and arm `13-sh-own-tree-moves` came back
+#   `rc=0 (want 3)` on a real gate leg -- while `15-ps1-own-tree-moves` passed in
+#   the SAME run, purely because the other twin's marker missed the excursion.
+# ★★★ SO THE OLDER ARMS DETECT THIS ONLY BY LUCK, AT ROUGHLY 5% PER MARKER, AND A
+#   GUARD THAT REDS 5% OF THE TIME REPORTS GREEN OVER A BROKEN INSTRUMENT THE
+#   OTHER 95%. These arms remove the luck: rather than waiting for the host clock
+#   to misbehave, they reproduce its OBSERVABLE EFFECT with `touch -t`, which is
+#   POSIX and behaves the same on BSD and GNU. Nothing here manipulates a clock,
+#   nothing is host-conditional, and both directions are deterministic on EVERY
+#   carriage -- including the ones whose clocks are perfectly well behaved.
+# ★ THE PAIR IS THE POINT, again. Arms 18/20 are the SILENT direction (a real
+#   change wearing an old timestamp must still be seen); arms 19/21 are the LOUD
+#   one (a file that ALREADY carried a future timestamp before the run started
+#   must NOT refuse a run that never touched it) -- the false refusal the same
+#   clock produces, which the stamp-ordering scan had and no arm covered.
+# ⚠ ITS OWN TREE, because arm 19/21's bystander carries a year-2090 stamp and a
+#   leftover of that shape would silently arm every later arm in another tree.
+TREE_C="${SCRATCH}/gate-tree-c"
+mk_source_tree "$TREE_C"
+BACKDATED="$TREE_C/examples/.probe-backdated.txt"
+BYSTANDER="$TREE_C/examples/.probe-bystander.txt"
+mk_cmake_build_dir "$TREE_C/build/backdated" "$TREE_C" \
+    "sleep 1; echo touched > '$BACKDATED'; touch -t 200001010000 '$BACKDATED'; echo ok"
+mk_cmake_build_dir "$TREE_C/build/bystander" "$TREE_C" "echo ok"
+
+# A file created DURING the run, then stamped into the year 2000 -- exactly what
+# a backward clock step does to a file the run really did write.
+plant_bystander() { echo bystander > "$BYSTANDER"; touch -t 209001010000 "$BYSTANDER"; }
+
+# ---- ARM 18 (sh) THE SILENT DIRECTION: an old stamp must not hide a change ---
+rm -f "$BACKDATED"
+arm 18-sh-backdated-change-refuses 3 bash "$GATE_SH" "$SCRATCH/a18.log" '100% tests passed' \
+    ctest --test-dir "$TREE_C/build/backdated"
+says 18-sh-backdated-change-refuses 'the tree CHANGED UNDER THE RUN'
+says 18-sh-backdated-change-refuses '.probe-backdated.txt'
+rm -f "$BACKDATED"
+
+# ---- ARM 19 (sh) THE LOUD DIRECTION: a future stamp that PREDATES the run -----
+plant_bystander
+arm 19-sh-future-stamped-bystander 0 bash "$GATE_SH" "$SCRATCH/a19.log" '100% tests passed' \
+    ctest --test-dir "$TREE_C/build/bystander"
+says 19-sh-future-stamped-bystander 'run-gate.sh: OK'
+says a19.log 'inputs  : held still' --log
+says_not a19.log '.probe-bystander.txt' --log
+rm -f "$BYSTANDER"
+
+if [ -n "$PS_EXE" ]; then
+    # ---- ARM 20 (ps1) THE SILENT DIRECTION ----------------------------------
+    rm -f "$BACKDATED"
+    arm 20-ps1-backdated-change-refuses 3 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+        -File "$GATE_PS1" "$SCRATCH/a20.log" '100% tests passed' \
+        ctest --test-dir "$TREE_C/build/backdated"
+    says 20-ps1-backdated-change-refuses 'the tree CHANGED UNDER THE RUN'
+    says 20-ps1-backdated-change-refuses '.probe-backdated.txt'
+    rm -f "$BACKDATED"
+
+    # ---- ARM 21 (ps1) THE LOUD DIRECTION ------------------------------------
+    plant_bystander
+    arm 21-ps1-future-stamped-bystander 0 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+        -File "$GATE_PS1" "$SCRATCH/a21.log" '100% tests passed' \
+        ctest --test-dir "$TREE_C/build/bystander"
+    says 21-ps1-future-stamped-bystander 'run-gate.ps1: OK'
+    says a21.log 'inputs  : held still' --log
+    says_not a21.log '.probe-bystander.txt' --log
+    rm -f "$BYSTANDER"
+
+    # ---- ARM 22 TWIN PARITY ON THE FOURTH SUBJECT, IN BOTH DIRECTIONS -------
+    ran
+    bd_sh=$(cat "$SCRATCH/18-sh-backdated-change-refuses.rc")
+    bd_ps=$(cat "$SCRATCH/20-ps1-backdated-change-refuses.rc")
+    by_sh=$(cat "$SCRATCH/19-sh-future-stamped-bystander.rc")
+    by_ps=$(cat "$SCRATCH/21-ps1-future-stamped-bystander.rc")
+    if [ "$bd_sh" = "3" ] && [ "$bd_ps" = "3" ] && [ "$by_sh" = "0" ] && [ "$by_ps" = "0" ]; then
+        echo "  [ok  ] 22-parity  neither twin decides by TIMESTAMP ORDER (backdated change 3/3, future-stamped bystander 0/0)"
+    else
+        echo "  [FAIL] 22-parity  backdated change: .sh=$bd_sh .ps1=$bd_ps (both must be 3); future-stamped bystander: .sh=$by_sh .ps1=$by_ps (both must be 0)"
+        fails=$((fails + 1))
+    fi
+else
+    na 20-ps1-backdated-change-refuses  "$PS_ABSENT_WHY -- the .ps1 twin was never shown a change wearing an old timestamp"
+    na 21-ps1-future-stamped-bystander  "$PS_ABSENT_WHY -- the .ps1 twin's future-stamped-bystander CONTROL was not taken"
+    na 22-parity                        "$PS_ABSENT_WHY -- arms 18 and 19 still prove the .sh twin ignores timestamp order, but the twins were NOT compared"
 fi
 
 # ---- WHAT THIS RUN ACTUALLY PROVED -----------------------------------------

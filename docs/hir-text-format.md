@@ -41,12 +41,44 @@ This is the part to depend on:
 | exit code | meaning |
 |---|---|
 | `0` | DSS **accepted** the source. The artifact is written, complete, and parses back. |
-| non-zero | DSS **rejected** the source (or the write failed). Diagnostics are on **stderr**. **No artifact is written.** |
+| `1` | DSS **rejected** the source (or the write failed). Diagnostics are on **stderr**. **No artifact is written.** |
+| `2` | DSS accepted the source, but the artifact it produced **did not survive a round trip through our own reader**. A compiler defect — please report it. **No artifact is written.** |
 
 There is no third state. In particular there is no "we emitted HIR but something later failed",
 because there *is* no later: that is the reason `--emit-hir` is a mode rather than a modifier on
 `--compile`. As a modifier, a link failure would have produced a non-zero exit standing beside a
 perfectly good artifact, and you could not tell that apart from a rejection.
+
+`2` is not a third state either — it is a **refinement of the non-zero row**, and the binary
+contract is unchanged: **`0` ⇔ a readable artifact exists; non-zero ⇔ nothing was written.** Branch
+on `rc != 0` and you are correct. The split exists because the two ask *you* for different things:
+`1` means fix the program, `2` means the program was fine and we could not serialize it — nothing
+you can change in your source will help, so do not retry, report it.
+
+### 2.1.1 What `parses back` costs, and why it is not optional
+
+Before writing anything, `--emit-hir` **parses its own artifact and re-emits it, and refuses to
+write unless the re-emission is byte-identical.** The third clause of the `0` row is therefore a
+measurement on every invocation rather than a promise.
+
+**It is a re-emit and a byte compare, never merely "it parses"**, and that distinction is load-
+bearing rather than belt-and-braces. A spelling the reader mis-reads can parse perfectly cleanly: a
+`lit float` past 2^64 was read back as `0.0` with **no diagnostic at all**, which every
+"did it parse?" check in this repository passed. Byte identity is the only predicate that can see a
+value the reader reconstructed *differently*, because it compares what the reader rebuilt against
+what the writer meant, one token at a time.
+
+This is not hypothetical. Three shipped writer spellings could not be read back by the shipped
+reader — one **aborted the reading process**, one was refused for a token the lexer did not have,
+and one silently returned the wrong value — and all three exited `0`. They were found by a person
+round-tripping the corpus by hand. Nothing was checking, because the format had a writer, a reader,
+and **no consumer of the reader**.
+
+You pay for it in wall clock, and the amount is small: the front end (preprocess, parse, semantic
+analysis, HIR lowering) dominates the mode, and reading a `.dsshir` back is text work over what it
+just produced. There is **no flag to turn it off**, deliberately — a check a consumer opts into is a
+check that is off in the run that matters, and the failure mode it prevents is not a wrong exit
+code, it is a file we told you was good that kills your process when you read it.
 
 **A translation unit that would not link is a normal input.** A single function in isolation, a call
 to an undefined symbol, no `main` at all — all emit at exit 0. Nothing downstream of HIR runs, so
@@ -287,7 +319,8 @@ a **gap**, and it is marked as one rather than dressed up as a decision:
 |---|---|
 | **enumerator names and values** | `enum "Color"` carries the enum's name, and its underlying width when that diverges from the default (`enum "E" : u8`). It does **not** carry `Red = 0, Green = 1`: enumerators are folded to literals at every use, so the *values* are in the body while the *names* are not. |
 | **`const` and `restrict`** | Not interned — they never affect layout or codegen, so they are not part of type identity and cannot ride a type. (`volatile` and `_Atomic` *are* carried.) |
-| **bit-field widths, `__attribute__((aligned(N)))` on a composite, and a `#pragma pack(N)` cap** | ⚠ Three ABI-relevant layout attributes the type grammar has no spelling for. They are dropped **silently** on a round trip — see §5.2. |
+| **bit-field widths, `__attribute__((aligned(N)))` on a composite, and a `#pragma pack(N)` cap** | ⚠ Three ABI-relevant layout attributes the type grammar has no spelling for. They are dropped **silently** on a round trip — see §5.2. ⚠ **Do not read this row as covering `aligned(N)` on a TYPEDEF** — that one is a *different channel* and it **is** carried, as `aligned<T, N>` (next row). The composite channel (`explicitAlign` on a struct/union definition) is the one still missing a spelling. |
+| **`__attribute__((aligned(N)))` on a *typedef*** | Carried, as **`aligned<T, N>`** — the `arr<T, N>` shape: the decorated type first, the byte count second. Written by cycle P66 (lane `al`), when an over-aligned type alias became representable at all. It rides the same transparent skin as `volatile`/`_Atomic` (one record, distinct interned identity, `kind()`/`operands()`/`scalars()` see through it), so a type carrying both spells as `aligned<volatile<i32>, 8>` and the reader merges them back into **one** record — the round trip is an identity, not a nesting that grows per hop. It is a **decoration, not a derivation level**: it does not touch the declarator spine the way `ptr<…>` and `arr<…>` do. `sizeof` is unaffected (`aligned<i32, 8>` is still 4 bytes wide, aligned 8) — which is why both gcc and clang refuse an *array* of such an alias, and so does DSS. ⚠ **P66 (lane `ag`): `N` may be WEAKER than the decorated type's natural alignment** — `aligned<i32, 2>` is a real, round-trippable type whose layout alignment is 2, because gcc, clang, mingw-w64 gcc and aarch64-gcc all lower a typedef's alignment (measured; the whole-composite channel does *not*, and has no spelling here anyway). So the byte count is the *answer*, not a floor, and a reader must not "correct" it upward. |
 | **aliasing information** | HIR has none. |
 | **undefined behaviour** | Not represented: no poison, no `nsw`/`nuw`, no overflow flags. Constant folding wraps. Integer-overflow soundness is entirely the reader's problem. |
 
@@ -485,8 +518,12 @@ Our own parser is `dss::parseHir` ([`src/hir/hir_text.hpp`](../src/hir/hir_text.
 - rebuilds the symbol names, buffer table, literal pool and per-node side-tables,
 - and runs **`HirVerifier` on load**.
 
-`emitHir(parseHir(emitHir(h)))` is byte-identical, and the whole corpus of checked-in fixtures is
-pinned on that property.
+`emitHir(parseHir(emitHir(h)))` is byte-identical, and the checked-in fixtures are pinned on that
+property — as is **every program in `examples/c`**, each emitted at its own declared target and
+required to parse back and re-emit byte for byte on every run of our test suite. That corpus walk
+exists because the property was previously asserted by nobody: the format had a writer, a reader,
+and no consumer of the reader, which is how three unreadable writer spellings shipped at once
+(§2.1.1). `--emit-hir` now runs the same check on its own output before it writes.
 
 You do not have to use it — the grammar above is the contract, not our implementation — but if you
 do link against us, `parseHir` is the supported entry point and `result->ok` is the verdict.

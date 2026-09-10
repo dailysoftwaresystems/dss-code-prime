@@ -129,6 +129,16 @@ void CompositeIdentityIndex::spine_(TypeInterner const& src, TypeId root,
         }
         if (kind == TypeKind::VolatileQual) {
             mix(h, static_cast<std::uint64_t>(src.qualifierBits(id)));
+            // ★★ P66 (lane `al`): the TYPE-LEVEL ALIGNMENT joins the structural
+            // digest, and it MUST. This spine is what decides whether two CUs'
+            // types are the same type; leaving the alignment out would merge
+            // `typedef int __attribute__((aligned(8))) A8;` and plain `int` onto ONE
+            // host TypeId across a CU boundary and hand one of them the other's
+            // alignment — a silent ABI miscompile, which is precisely the class the
+            // header warns about for every composite channel ("Adding a channel to
+            // `completeComposite` without adding it here reopens exactly the silent
+            // ABI-merge class"). The same sentence is true of this channel.
+            mix(h, static_cast<std::uint64_t>(src.typeAlignOverride(id)));
             pending.push_back(src.stripVolatile(id));   // the material type, next
             continue;
         }
@@ -488,10 +498,19 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
     // `volatileQualified` — the latter sets only the Volatile bit and would DROP an
     // `_Atomic` (or `_Atomic volatile`) qualifier on this cross-CU merge / text
     // round-trip, a silent loss-of-atomicity miscompile.
+    // ★★ P66 (lane `al`): the third argument is the TYPE-LEVEL ALIGNMENT, and it is
+    // here for EXACTLY the reason the paragraph above gives for passing the bitset
+    // rather than calling `volatileQualified` — a builder that carries less than the
+    // record holds DROPS the difference silently on every cross-CU merge and every
+    // text round-trip. `qualified(inner, bits)` would have re-minted an over-aligned
+    // alias as a plain qualifier skin (or as bare `int`, when the mask is 0 and the
+    // alignment was the only thing on the record), which is a silent ABI miscompile
+    // rather than a diagnostic.
     if (kind == TypeKind::VolatileQual) {
         TypeId const inner  = reinternType(src, src.stripVolatile(srcId),
                                            dstHost, remap, index);
-        TypeId const result = dst.qualified(inner, src.qualifierBits(srcId));
+        TypeId const result = dst.qualified(inner, src.qualifierBits(srcId),
+                                            src.typeAlignOverride(srcId));
         remap.emplace(srcId.v, result);
         return result;
     }

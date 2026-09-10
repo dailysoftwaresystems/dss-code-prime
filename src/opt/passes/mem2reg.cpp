@@ -100,12 +100,21 @@ struct PendingIncoming {
 // a PHI, and a kind must be able to do BOTH:
 //
 //   F16   — STILL `None`, and its reason is unrelated to anything below: F16 has no
-//           encodings at ANY width (D-TARGET-ENCODING-WIDTH-GUARD), so neither its
-//           constant nor its phi can be realized. The literal promoter excludes it
-//           for the same reason: pairing it with a wrong-width load or arithmetic
-//           encoding would be silent. ⚠ F16 is NOT waiting on a long-double merge
-//           and must not be swept along with one — it moves here only when the
-//           encoding-width guard itself is answered.
+//           encodings at ANY width, so neither its constant nor its phi can be
+//           realized. The literal promoter excludes it for the same reason:
+//           pairing it with a wrong-width load or arithmetic encoding would be
+//           silent. ⚠ F16 is NOT waiting on a long-double merge and must not be
+//           swept along with one.
+//           ⓘ ITS LIVE OWNER IS [[D-LK4-RODATA-PRODUCER-EXOTIC]] (P2), not
+//           [[D-TARGET-ENCODING-WIDTH-GUARD]], which LD-7 closed in P66 once every
+//           long-double operation lowered on both axes. F16 did not hold that row
+//           open because it is NOT A LIVE REFUSAL OF ANYTHING EXPRESSIBLE:
+//           ✔MEASURED 2026-09-09 that NO shipped `.lang.json` — c, asm, the two
+//           assembly dialects, toy, tsql-subset — declares an `_Float16` or
+//           `__fp16` spelling at all (the seven `f16` matches in `c.lang.json` are
+//           `Utf16CharStart` / `Utf16StringStart` token KINDS), so no source
+//           program can form the value this arm de-promotes. It moves here when a
+//           front end gains the spelling AND that row supplies the rodata arm.
 //   F80 / — ADMITTED 2026-09-03. Their constant always materialized fine (LD-1 /
 //   F128    LD-2 route it through rodata like every other float); what was missing
 //           was the PHI, and `D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE` supplies it: an

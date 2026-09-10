@@ -485,6 +485,11 @@ constexpr MembershipReason kWhyAutoInference{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, the declaration adopts its initializer type and compiles "
     "the very form the constraint forbids"};
+constexpr MembershipReason kWhyVariadicMarkerPosition{
+    MembershipProng::WrongArtifactShipsGreen,
+    "silenced, the variadic FnSig is built by a CONTAINS scan for the marker, "
+    "so the signature claims the trailing parameters AND variadic-ness — a "
+    "call ABI no reference agrees with, from source no reference compiles"};
 constexpr MembershipReason kWhyThreadLocal{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, thread storage lowers wrong: a per-call automatic, a split "
@@ -680,7 +685,7 @@ constexpr MembershipReason kWhyIncludeReentryRefused{
 // they would still be here — with a reason that is false — which is why the row
 // required the argument to be MADE. ✔The explicit extent did its job a SEVENTH
 // time: the count refused the two new rows until this note existed.
-constexpr std::array<UnsuppressableEntry, 172> kUnsuppressableCodes{{
+constexpr std::array<UnsuppressableEntry, 174> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -1556,6 +1561,22 @@ constexpr std::array<UnsuppressableEntry, 172> kUnsuppressableCodes{{
     {DiagnosticCode::S_AutoRequiresPlainIdentifier, kWhyAutoInference},
     {DiagnosticCode::S_AutoRequiresInitializer, kWhyAutoInference},
     {DiagnosticCode::S_AutoInferenceInvalid, kWhyAutoInference},
+    // P66: the FIFTH member of that family, and the one that guards what the
+    // multi-declarator form MEANS rather than whether it is written. C23 states
+    // no single-declarator constraint at all — J.2(78) makes the declarator
+    // COUNT undefined behaviour and J.5.12 names multi-declarator inference a
+    // COMMON EXTENSION whose recommended semantics (6.7.10 fn.164) are ISO/IEC
+    // 14882's: ONE deduced type for the whole declaration. So the count stopped
+    // being the constraint and the AGREEMENT became it. Suppressed, the seam is
+    // the same one the four above cite — the Pass-2 initializer backfill would
+    // give each declarator its OWN type, the one meaning no reference
+    // implements.
+    {DiagnosticCode::S_AutoDeclaratorsInferDifferentTypes, kWhyAutoInference},
+    // P66 (C 6.7.6.3 / C23 6.7.7.4): the variadic marker must END the parameter
+    // list. Its own prong, because the artifact it ships wrong is a SIGNATURE
+    // and not a declaration's type.
+    {DiagnosticCode::S_VariadicMarkerMustEndParameterList,
+     kWhyVariadicMarkerPosition},
     // S_ThreadLocal* (TLS C1, D-CSUBSET-THREAD-LOCAL, C11/C23 6.7.1 + 6.6p9):
     // the five thread-storage constraint violations — thread_local on a
     // function, a block-scope object without static/extern, a same-TU

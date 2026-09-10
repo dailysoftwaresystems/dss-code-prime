@@ -15370,6 +15370,59 @@ TEST(MirLoweringC, LogicalNotOnAFloatComparesAgainstAPromotedZeroNotABareConst) 
         << "each promoted zero is reached through a GlobalAddr";
 }
 
+TEST(MirLoweringC, LogicalNotOnALongDoubleAlsoComparesAgainstAPromotedZero) {
+    // ⚠⚠ THE ARM ABOVE IS A ONE-AXIS MEASUREMENT AND IT WAS READ AS A CLAIM
+    // ABOUT ALL OF THEM. [[D-CSUBSET-LOGICAL-NOT-ON-A-FLOAT-MINTS-A-BARE-FLOAT-CONST]]
+    // (P41, CLOSED) states in its trigger that "`!f`, `!d` and `!ld` compile",
+    // ✔MEASURED on `x86_64:pe64-x86_64-windows-exec` — the ONE axis where
+    // `long double` IS `double`, so `!ld` there is `!d` under another spelling
+    // and the F80/F128 arms were never exercised. That row's own FIX note is
+    // correct that F16/F80/F128 kept falling through; the headline and the body
+    // disagreed, and the headline was the false half.
+    // ✔MEASURED at de1e83ef through the shipped CLI: `!someLongDouble` refused
+    // rc 1 on BOTH `elf64-x86_64-linux-exec` (F80) and `elf64-aarch64-linux-exec`
+    // (F128) with `MIR Const %N is a float (FPR-class) literal at MIR→LIR`, a
+    // diagnostic naming [[D-TARGET-ENCODING-WIDTH-GUARD]] — which is why LD-7
+    // owns it and why this arm names the AXIS in its fixture instead of trusting
+    // a default. [[feedback-one-leg-measurement-is-a-portability-claim]].
+    struct Axis { LongDoubleFormat ldf; char const* why; };
+    std::array<Axis, 2> const axes{{
+        {LongDoubleFormat::X87_80,  "the x87-80 axis (F80)"},
+        {LongDoubleFormat::Ieee128, "the ieee128 axis (F128)"},
+    }};
+    for (auto const& a : axes) {
+        SCOPED_TRACE(a.why);
+        auto L = lowerC(
+            "int f(long double x) { return !x; }\n",
+            "x86_64", "sysv_amd64", DataModel::Lp64, a.ldf);
+        ASSERT_FALSE(L.model.hasErrors());
+        ASSERT_TRUE(L.mir.ok)
+            << "MIR lowering: " << (L.mirReporter.all().empty()
+                ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        auto const cmps = collectOps(m, MirOpcode::FCmpOeq);
+        ASSERT_EQ(cmps.size(), 1u) << "one ordered-equal compare for the `!`";
+        auto const ops = m.instOperands(cmps[0]);
+        ASSERT_EQ(ops.size(), 2u);
+        // The operand's TYPE is the premise: if this fixture handed us an F64
+        // the arm would be a restatement of the test above and would prove
+        // nothing about the axis it names.
+        TypeKind const opK =
+            L.model.lattice().interner().kind(m.instType(ops[0]));
+        EXPECT_TRUE(opK == TypeKind::F80 || opK == TypeKind::F128)
+            << "the fixture must really be on a wide long-double axis, ordinal "
+            << static_cast<unsigned>(opK);
+        EXPECT_EQ(m.instOpcode(ops[1]), MirOpcode::Load)
+            << "the comparison zero must be LOADED from an anonymous rodata "
+               "global on THIS axis too — a bare float Const dead-ends at "
+               "MIR→LIR and refuses the whole function";
+        EXPECT_NE(m.instOpcode(ops[1]), MirOpcode::Const)
+            << "a bare wide-float Const is exactly what LD-7 removes";
+        EXPECT_GE(collectOps(m, MirOpcode::GlobalAddr).size(), 1u)
+            << "the promoted zero is reached through a GlobalAddr";
+    }
+}
+
 // ══ D-CSUBSET-BITINT-PADDING-POLICY-HAS-THREE-OWNERS ═══════════════════════════
 // ★★ THE `_BitInt` PADDING POLICY IS READ FROM ONE OWNER AT *BOTH* WIDTHS.
 //

@@ -651,11 +651,70 @@ attrAppertainmentFromName(std::string_view s) noexcept {
 // One attribute-run rule and the grain its attributes appertain to. The NAME is
 // carried beside the resolved id because every diagnostic about this vocabulary
 // must quote the spelling the config author wrote.
+//
+// ★★★ P66 (D-C-THE-END-OF-SPECIFIERS-C23-ATTRIBUTE-CONFERS-ON-A-TYPEDEF-WHERE-NO-REFERENCE-CONFERS)
+// — WHY A SECOND, OPTIONAL GRAIN, AND WHY IT IS KEYED ON THE **SPELLING**.
+//
+// The comment above `AttrAppertainment` states that "the shape axis is a
+// property of the C23 SPELLING, which is exactly why the value is per-RULE and
+// not language-wide". That is TRUE of `declarators.afterDeclaratorAttrRules`,
+// whose entries name `attrSpec` and `stdAttr` DIRECTLY — there, per-rule IS
+// per-spelling. It is FALSE of `declarationAttrSlotRules`, whose entries name a
+// RUN CONTAINER: c's `typedefAttrRun` is `{repeat {alt: [attrSpec, stdAttr]}}`,
+// one rule name over BOTH spellings, so a single grain had to answer for two
+// positions the references answer differently.
+//
+// ✔MEASURED 2026-09-09, each reference probed SEPARATELY on its own translation
+// unit, for the END-OF-DECLARATION-SPECIFIERS slot of a typedef:
+//   • `typedef int [[deprecated]] T; T x;`   gcc 13.3.0 `-std=c2x` rc 0 with
+//     `'deprecated' attribute ignored [-Wattributes]` and NOTHING at the use ·
+//     clang 18.1.3 `-std=c23` rc 1 `attribute cannot be applied to types` ·
+//     MSVC 19.51.36257 `/std:clatest` rc 2 C2059.            ⇒ NOBODY CONFERS
+//   • `typedef int __attribute__((deprecated)) T; T x;`  gcc AND clang both
+//     warn at the USE (MSVC abstains — it has no such syntax).  ⇒ BOTH CONFER
+// C23 6.7p9 is why: a sequence terminating the declaration specifiers appertains
+// to the TYPE, and 6.7.13.4 / 6.7.13.5 admit `maybe_unused` / `deprecated` on no
+// type — while GNU's own positional rule attaches an `__attribute__` written
+// after the specifiers to the DECLARATION. Same slot, two spellings, two grains.
+//
+// ABSENT ⇒ `appertainsTo` governs BOTH spellings, which is the behaviour every
+// entry had before this key existed and which every entry that omits it keeps
+// byte-for-byte.
+//
+// ⚠ THE VALUE IS RESTRICTED TO A NON-CONFERRING GRAIN AND THE LOADER SAYS SO.
+// The SITE at which a slot is folded is selected from `appertainsTo` (the
+// declaration-level fold takes the `declaration` entries, the per-declarator
+// fold takes the `declarator` ones); this key changes only what the run
+// CONFERS once that site has been chosen. An override naming a CONFERRING
+// grain would have to move the site too, which this key cannot do — so it is a
+// loud load failure rather than a knob whose second half silently does nothing.
 struct DSS_EXPORT AttrRunRule {
     RuleId           rule{};
     std::string      name;
     AttrAppertainment appertainsTo = AttrAppertainment::Declaration;
+    std::optional<AttrAppertainment> standardSpellingAppertainsTo;
 };
+
+// The grain ONE attribute node in a run appertains to, given which SPELLING it
+// is written in. The `resolveAppertainment` sibling for the other axis, and the
+// two compose: spelling first (this), then declarator shape (that).
+[[nodiscard]] constexpr AttrAppertainment
+appertainmentForSpelling(AttrRunRule const& run,
+                         bool isStandardSpelling) noexcept {
+    if (isStandardSpelling && run.standardSpellingAppertainsTo.has_value()) {
+        return *run.standardSpellingAppertainsTo;
+    }
+    return run.appertainsTo;
+}
+
+// "Does a run resolving to this grain confer a fact on a declared entity?"
+// `Type` is the one grain that does not: it is read, its unknown names are still
+// reported, and it has nothing to attach a fact to. Stated ONCE so the loader's
+// restriction above and the scan that acts on it cannot drift apart.
+[[nodiscard]] constexpr bool
+appertainmentConfers(AttrAppertainment a) noexcept {
+    return a != AttrAppertainment::Type;
+}
 
 // The grain a run RESOLVES to once the declarator it follows is known.
 // `declaratorIsTypeDerived` answers "does that declarator derive an array or
@@ -771,18 +830,45 @@ struct DSS_EXPORT DeclaratorConfig {
     std::optional<RuleId> memberDeclaratorRule;
     std::optional<RuleId> memberListRule;
     // TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): the OPTIONAL THIRD list shape —
-    // a comma-separated run of BARE `declaratorRule` nodes, with NO per-slot
-    // wrapper, NO initializer slot and NO attribute run (c's
-    // `typedefDeclaratorList`). `collectDeclarators` yields its `declaratorRule`
-    // children directly. It is a SEPARATE role rather than a second spelling of
-    // `listRule` because the three list shapes carry genuinely different per-slot
-    // grammar and the walk must descend each correctly: `listRule`'s slots own
-    // `= init` + an attribute run, `memberListRule`'s own a bit-field width, and
-    // this one owns neither — which is exactly what keeps `typedef int T = 5;` a
-    // LOUD parse error and keeps a typedef's honored trailing attribute run from
-    // being swallowed by an unhonored per-slot one. `nullopt` ⇒ the language has
-    // no such list (toy/tsql, and c before this) ⇒ zero behavior change.
+    // a comma-separated run of declarator slots with NO INITIALIZER (c's
+    // `typedefDeclaratorList`). It is a SEPARATE role rather than a second
+    // spelling of `listRule` because the three list shapes carry genuinely
+    // different per-slot grammar and the walk must descend each correctly:
+    // `listRule`'s slots own `= init` + an attribute run, `memberListRule`'s own a
+    // bit-field width, and this one owns NO initializer — which is exactly what
+    // keeps `typedef int T = 5;` a LOUD parse error rather than a construct
+    // needing a semantic reject. `nullopt` ⇒ the language has no such list
+    // (toy/tsql, and c before TF-C88) ⇒ zero behavior change.
     std::optional<RuleId> plainListRule;
+    // ★★★ P66 (lane `ag`, closing
+    // [[D-C-THREE-GNU-ALIGNED-ATTRIBUTE-FORMS-REMAIN-AND-THE-WEAKENING-ONE-IS-SILENT]]
+    // form 2): the OPTIONAL PER-SLOT WRAPPER of `plainListRule`. When declared,
+    // each slot of that list is this rule wrapping ONE `declaratorRule` plus
+    // whatever the slot itself owns — for c, an after-declarator
+    // `__attribute__((…))` run.
+    //
+    // ⚠ TF-C88 DELIBERATELY GAVE THIS LIST **NO** PER-SLOT WRAPPER, AND THE REASON
+    // IT GAVE WAS REAL AT THE TIME AND HAS SINCE EXPIRED. Reusing `initDeclarator`
+    // would have let its GREEDY attribute run swallow `typedef u_int64_t T
+    // __attribute__((aligned(8)));` — a SHIPPED, HONORED macOS SDK spelling — into
+    // a position NEITHER honoring channel could then see, turning a working
+    // alignment into a clean compile at the wrong one. What changed is the reader,
+    // not the risk assessment: P56/P66 made the per-declarator run a first-class
+    // scan root with DECLARATOR grain, so a slot run is now read by exactly the
+    // fold that should read it, and for a ONE-declarator list it reaches the SAME
+    // declarator the trailing run reached. The residue TF-C88 named — "a MID-LIST
+    // decoration stays a loud parse error" — is what this role closes.
+    // ✔MEASURED 2026-09-09, gcc 13.3.0 / clang 18.1.3 / mingw-w64 gcc 13.2.0 /
+    // aarch64-linux-gnu-gcc 13.3.0, each separately: `typedef int A
+    // __attribute__((aligned(8))), B;` compiles on all four and confers on **A
+    // alone** (`_Alignof(B) == 8` FAILS on all four).
+    // ★ IT IS DELIBERATELY NARROWER THAN `initDeclarator`'s RUN: c's slot admits
+    // the GNU `attrSpec` ONLY, so the C23 `[[…]]` spelling still reaches
+    // `typedefTrailingAttrRun` and lane `td`'s measured `[[deprecated]]` binding —
+    // the OPPOSITE binding, on B — is untouched by this role. A grammar decides
+    // that; the engine reads whatever the slot holds.
+    // `nullopt` ⇒ the list's slots are BARE declarators, exactly as before.
+    std::optional<RuleId> plainSlotRule;
     // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME — GNU/Clang ASM LABEL, GCC 6.47.5): the OPTIONAL rule carrying an
     // explicit ASSEMBLER NAME for the declarator it follows (`int f(void)
     // __asm("_myname");`). Its payload string REPLACES the symbol's on-binary name
@@ -848,6 +934,7 @@ struct DSS_EXPORT DeclaratorConfig {
     std::string   memberDeclaratorRuleName;   // c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR
     std::string   memberListRuleName;         // c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR
     std::string   plainListRuleName;          // TF-C88 D-CSUBSET-TYPEDEF-MULTI-DECLARATOR
+    std::string   plainSlotRuleName;          // P66 lane `ag` — the list's per-slot wrapper
     std::string   asmLabelRuleName;           // TF-C88 D-CSUBSET-ASM-LABEL-SYMBOL-RENAME
     std::string   directAbstractRuleName;     // c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME
     std::string   variadicMarkerName;

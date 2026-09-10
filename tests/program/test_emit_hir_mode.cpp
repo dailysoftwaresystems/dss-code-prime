@@ -34,6 +34,7 @@
 #include "hir/hir_text.hpp"
 #include "program/cli_args.hpp"
 #include "program/program.hpp"
+#include "repo_root.hpp"   // the seam guard's subject is the source tree
 
 #include <gtest/gtest.h>
 
@@ -567,4 +568,141 @@ TEST(DumpHirKinds, TheFlagIsAModeThatNeedsNeitherLanguageNorTarget) {
                                   const_cast<char**>(clash));
     ASSERT_FALSE(bad.has_value());
     EXPECT_EQ(bad.error().kind, CliArgsError::DuplicateModeFlag);
+}
+
+// ══ THE rc-0 PROMISE IS NOW MEASURED, AND HERE IS THE INSTRUMENT FIRING ══════
+//
+// ★★★ §2.1 OF THE CONSUMER DOC HAS ALWAYS SOLD rc 0 AS *"the artifact is
+// written, complete, AND PARSES BACK"*. Nothing measured the third clause, and
+// the clause was FALSE on the day it was written: three shipped writer
+// spellings could not be read back by the shipped reader
+// (D-HIR-TEXT-NODE-WALK-RECURSES-PER-LEVEL-ON-BOTH-HALVES-AND-THREE-SPELLINGS-DO-NOT-READ-BACK),
+// and every one of them exited 0. `hirArtifactRoundTripFailure` is the
+// predicate that now stands behind the promise, and `Program::emitHirText`
+// refuses with rc 2 rather than writing an artifact that fails it.
+//
+// ⚠ THE ARMS BELOW ARE THE PROOF THAT THE PREDICATE CAN FAIL. A round-trip
+// check never shown to refuse anything is indistinguishable from one that
+// returns "clean" unconditionally — which is exactly why the check takes an
+// ARTIFACT rather than living inside the mode: a test can hand it a synthetic
+// one carrying an unreadable spelling, and no compiler defect is needed to
+// watch it fire.
+
+TEST(HirArtifactRoundTrip, ControlARealArtifactFromTheShippedModeRoundTripsCleanly) {
+    // THE CONTROL, NAMED AND FIRST. Every refusal arm below is only meaningful
+    // if the predicate accepts what the shipped writer actually produces — a
+    // predicate that refused everything would satisfy all three of them.
+    auto const r = emitTo("roundtrip_control",
+                          "struct P { int x; int y; };\n"
+                          "int sum(struct P *p) { return p->x + p->y; }\n"
+                          "int main(void) { struct P p = {1, 2}; return sum(&p); }\n");
+    ASSERT_EQ(r.rc, 0) << r.err;
+    ASSERT_FALSE(r.artifact.empty());
+    EXPECT_EQ(hirArtifactRoundTripFailure(r.artifact), "")
+        << "the shipped mode wrote an artifact its own reader cannot take back";
+}
+
+TEST(HirArtifactRoundTrip, AnArtifactCarryingATokenTheGrammarHasNoRuleForIsRefused) {
+    // The `goto *<expr>` class: the writer spelled a byte the reader's lexer
+    // had no token for at all, and four shipped artifacts were refused by name.
+    // Reproduced synthetically, because that particular hole is now closed.
+    std::string const bad =
+        "dsshir 3\n"
+        "producer \"planted\"\n"
+        "module \"C\" {\n"
+        "  \x01\x02 not a production this grammar has\n"
+        "}\n";
+    std::string const why = hirArtifactRoundTripFailure(bad);
+    ASSERT_FALSE(why.empty()) << "an unreadable artifact was accepted";
+    EXPECT_NE(why.find("did NOT parse back"), std::string::npos) << why;
+}
+
+TEST(HirArtifactRoundTrip,
+     AnArtifactThatParsesWithAnEmptyReporterIsStillRefusedWhenItReEmitsDifferently) {
+    // ★★★ THE ARM THAT JUSTIFIES THE WHOLE DESIGN, AND THE ONE THE CHECK THAT
+    // ALREADY EXISTED WOULD HAVE PASSED. The historical
+    // `lit float 18446744073709551616` parsed CLEAN — `HirParseResult::ok`
+    // true, reporter EMPTY — and handed back 0.0. Its shape is *a literal whose
+    // spelling carries a value the reader cannot preserve*, and that shape is
+    // reproducible with no compiler defect at all: a decimal with more
+    // significant digits than a double can hold parses to exactly 1.0, and this
+    // writer prints 1.0 as `1`.
+    //
+    // So this arm plants that shape and asserts BOTH halves:
+    //   (a) the parse is SILENT — `ok` true, reporter empty — which is
+    //       precisely what a "does it parse?" consumer calls success;
+    //   (b) the round-trip predicate refuses it anyway, on the BYTES.
+    // (a) is not decoration. Without it this arm would merely say "a bad
+    // artifact is refused", where the claim actually being made is the sharper
+    // one: byte identity sees a defect a clean parse cannot.
+    auto const r = emitTo("roundtrip_float_value",
+                          "double one(void) { return 1.0; }\n");
+    ASSERT_EQ(r.rc, 0) << r.err;
+    std::string const needle = "lit float 1 ";
+    ASSERT_NE(r.artifact.find(needle), std::string::npos)
+        << "premise broken: this arm needs the writer to print 1.0 as `1`, so "
+           "that a longer spelling of the same value is a BYTE difference:\n"
+        << r.artifact;
+    std::string planted = r.artifact;
+    planted.replace(planted.find(needle), needle.size(),
+                    "lit float 1.00000000000000000000001 ");
+
+    // (a) THE READER IS PERFECTLY HAPPY WITH IT.
+    DiagnosticReporter rep;
+    auto const parsed = parseHir(planted, CompilationUnitId{1}, rep);
+    ASSERT_TRUE(parsed->ok)
+        << "premise broken: this arm needs a spelling that parses CLEANLY";
+    EXPECT_TRUE(rep.all().empty())
+        << "premise broken: the parse reported something, so the weaker "
+           "'does it parse?' check would have caught this and the byte compare "
+           "would not be carrying the claim this arm makes";
+
+    // (b) AND THE BYTE COMPARE CATCHES IT ANYWAY.
+    std::string const why = hirArtifactRoundTripFailure(planted);
+    ASSERT_FALSE(why.empty())
+        << "a value the reader could not preserve was accepted — this is "
+           "exactly the silent half of the defect class this check exists for";
+    EXPECT_NE(why.find("re-emits"), std::string::npos) << why;
+}
+
+TEST(HirArtifactRoundTrip, TheModeAsksThePredicateAndRefusesWithItsOwnExitCode) {
+    // ⚠⚠ A SEAM GUARD, AND IT IS HERE BECAUSE THE SEAM IS OTHERWISE
+    // UNOBSERVABLE. `emitHirText` reaches its refusal path only for a program
+    // whose HIR this build cannot serialize — and while the codec is correct
+    // there is no such program, so deleting the call would leave every
+    // behavioural arm in this repository GREEN. That is the argument
+    // `test_synth_verify_seam_guard.cpp` makes for the synthesis verifier, and
+    // this is the same answer: pin the CALL structurally.
+    auto const root = dss::test::findRepoRoot();
+    ASSERT_TRUE(root.has_value()) << dss::test::repoRootDiagnostic();
+    fs::path const p = *root / "src" / "program" / "program.cpp";
+    std::ifstream in{p, std::ios::binary};
+    ASSERT_TRUE(in.good())
+        << "cannot read " << p.string()
+        << " — this guard's subject IS the source tree, so an unreadable file "
+           "is a red, never a skip";
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    std::string const code = buf.str();
+
+    // The mode's body, delimited by its own signature and the next definition.
+    std::size_t const from = code.find("int Program::emitHirText(");
+    ASSERT_NE(from, std::string::npos)
+        << "Program::emitHirText is gone or renamed; this guard needs updating "
+           "rather than deleting";
+    std::size_t const to = code.find("\nint Program::", from + 1);
+    ASSERT_NE(to, std::string::npos);
+    std::string const body = code.substr(from, to - from);
+
+    // The CALL — spelled with its open paren, which the prose inside that body
+    // deliberately does not use, so a comment cannot satisfy this guard.
+    EXPECT_NE(body.find("hirArtifactRoundTripFailure("), std::string::npos)
+        << "`--emit-hir` no longer asks whether its own artifact reads back. "
+           "docs/hir-text-format.md 2.1 still promises a consumer that rc 0 "
+           "means it does, and nothing else in this suite can notice, because "
+           "a correct codec produces no artifact that would fail.";
+    EXPECT_NE(body.find("return 2;"), std::string::npos)
+        << "the round-trip refusal no longer has its own exit code, so neither "
+           "a consumer nor this repo's corpus gate can tell a rejected SOURCE "
+           "from an artifact this compiler could not read back";
 }

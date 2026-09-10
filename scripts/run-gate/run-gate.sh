@@ -352,13 +352,60 @@ fi
 # rewrites these roots is a BUILD STEP, not a gate, and does not belong under a
 # wrapper whose whole contract is that its verdict can be trusted.
 #
-# ⓘ MARKER + `find -newer`, not a hash: it needs no hashing tool at all (macOS
-# has `md5`, Linux `md5sum`, and this script runs on both carriages), it is the
-# same technique `scripts/local-build/local-build.sh` uses for the sibling
-# question, and `-newer` is strictly-greater — which is the RIGHT direction here,
-# because the marker is written BEFORE the run and an offending edit lands after.
-# ✔MEASURED cost: 1971 files across the three roots, 0.31 s — against gates that
-# run for a quarter of an hour.
+# ⚠⚠⚠ AND THE FIRST INSTRUMENT FOR IT ASSUMED A MONOTONIC WALL CLOCK, WHICH ONE
+# OF THIS PROJECT'S FOUR CARRIAGES DOES NOT HAVE. The original scan was a marker
+# file plus `find -newer`, and the sentence that justified it — *"`-newer` is
+# strictly-greater, which is the RIGHT direction here, because the marker is
+# written BEFORE the run and an offending edit lands after"* — is true in REAL
+# TIME and false in STAMP ORDER. "Before" and "after" there are two readings of
+# CLOCK_REALTIME taken seconds apart, and comparing them ORDERS them.
+#
+# ✔MEASURED 2026-09-09 (P66) on WSL x86_64, the leg this repository gates every
+# commit on. CLOCK_REALTIME there steps FORWARD by +24.69 s for ~200 ms out of
+# every ~5 s and then snaps back — 29 of 600 samples at a 100 ms cadence, a 4.8%
+# duty cycle — and ✔THE EXCURSION REACHES INODE MTIMES, which is the half that
+# matters and was measured separately: in 12 of 60 marker/probe pairs, a file
+# created ONE SECOND AFTER the marker carried an mtime **23.70 s EARLIER** than
+# it, and `find <root> -type f -newer <marker>` answered EMPTY.
+# ⇒ ~5% of runs on that carriage stamped their marker inside an excursion, and
+# every edit that landed afterwards was INVISIBLE: the wrapper printed
+# `inputs  : held still` over a tree that had moved — the one sentence this
+# block exists to be unable to say wrongly, arriving by a third door.
+# ✔The same host answers 0 inversions in 40 pairs on Windows, which is why this
+# was green there and red here, and is a property of the HOST'S CLOCK rather than
+# of either twin. ✔BOTH twins were shown to fail under the identical mutation (a
+# marker stamped +25 s): `find -newer` returned nothing and the `.ps1` twin's
+# `LastWriteTimeUtc -gt` returned nothing, from the same two inodes.
+#
+# ★★★ SO THE FIX IS TO STOP ORDERING TWO CLOCK READINGS AND START COMPARING TWO
+# READINGS OF THE SAME VALUE. Each snapshot records, per file, `C <crc> <size>
+# <path>` from POSIX `cksum` plus `N <path>` for a file already newer than the
+# marker; the verdict is the SYMMETRIC DIFFERENCE of the before and after
+# snapshots. EQUALITY of a fingerprint with itself cannot be defeated by a clock
+# that steps forward, backward or sideways, because both readings carry the same
+# distortion. The two halves cover each other exactly:
+#   · `C` catches an edit whose stamp the clock hid — the measured defect;
+#   · `N` catches a write that left the bytes unchanged (a `touch`, an identical
+#     rewrite), which content alone cannot see, and is DIFFERENCED against its
+#     own pre-run reading, so a file that already carried a future stamp when the
+#     run started appears in BOTH snapshots and cancels — removing the LOUD
+#     false-refusal direction the same clock produces, which the old scan had.
+# ⇒ strictly more sensitive than `-newer` alone, in both directions.
+#
+# ⓘ `cksum` AND NOT `md5`/`md5sum`: the older note rejected hashing because the
+# tool is spelled differently per carriage (macOS `md5`, Linux `md5sum`) — true,
+# and it overlooked that `cksum` is POSIX and present on all four. ⚠ It does not
+# matter whether two carriages compute the SAME checksum, because the two
+# snapshots being compared are always taken by the SAME binary on the SAME host
+# within one run: only SELF-CONSISTENCY is load-bearing here, which is what makes
+# this portable without a host fork.
+# ★ AND IT IS PROBED BY EXECUTION WITH A KNOWN ANSWER before anything runs
+# (`run_gate_cksum_works`), never by `command -v`: a missing tool would make every
+# snapshot empty, every diff empty, and this guard would refuse nothing while
+# reporting green — the shape of escape this repository has already paid for.
+# ✔MEASURED cost of the whole scheme across 2035 files / 12.8 MB in the three
+# roots: 0.03 s per snapshot under WSL, 0.39 s under Windows Git Bash — against
+# gates that run for a quarter of an hour.
 # ⚠ WHICH TREE those three roots are read from is a SEPARATE question with its own
 # defect and its own measurement, and it is answered where the roots are built —
 # see "AND THE ROOTS ARE THE GATE COMMAND'S TREE, NOT THIS SHELL'S" below. It is
@@ -734,6 +781,16 @@ run_gate_source_tree_why=""
 run_gate_source_tree_miss=""
 run_gate_source_tree_found=""
 run_gate_marker="${log}.inputs-marker"
+run_gate_inputs_before="${log}.inputs-before"
+run_gate_inputs_after="${log}.inputs-after"
+# ⚠ THE WRAPPER MUST NOT MEASURE ITS OWN BOOKKEEPING. All three files above sit
+# beside the LOG PATH THE CALLER CHOSE, and nothing stops that path being inside
+# a watched root. The marker was self-excluding under the old scan (a file is
+# never `-newer` than itself); a snapshot is not, and `.inputs-before` — created
+# after the BEFORE walk and therefore present only in the AFTER one — would have
+# made every such run refuse ITSELF, a new false refusal invented by the fix.
+# ⓘ `-name` matches the basename only, so this cannot reach outside the three.
+run_gate_bookkeeping_glob="${log##*/}.inputs-*"
 
 # CMake's own record of which tree configured this build tree, or nothing — and
 # when nothing, WHY nothing, in `run_gate_source_tree_miss`.
@@ -800,13 +857,50 @@ run_gate_abs_input_roots() {
 # block exists to remove, arriving by a different door.
 # ⓘ A root that does not exist contributes nothing, so a lane worktree carrying a
 # subset of the tree, or a synthetic self-test root, is not penalised for it.
-run_gate_moved_inputs() {
-    [ -f "$run_gate_marker" ] || return 1
+#
+# ★ PROBED BY EXECUTION WITH A KNOWN ANSWER, never by `command -v` — the same
+# ruling, and the same reason, as the fixture's PowerShell probe: a lookup can
+# name a tool that cannot run, and here that would empty every snapshot and make
+# this guard refuse nothing while printing green. The known answer is the BYTE
+# COUNT and not the checksum, deliberately: only self-consistency between two
+# snapshots on one host is load-bearing, so pinning a particular CRC would be a
+# portability claim this file does not need and cannot check on four carriages.
+run_gate_cksum_works() {
+    [ "$(printf dss | cksum 2>/dev/null | awk '{print $2}')" = "3" ]
+}
+
+# ONE fingerprint line per file, plus one per file that ALREADY carries a stamp
+# later than the marker. Sorted, so `comm` can difference two of them.
+#   C <crc> <size> <path>   the bytes — an equality that no clock can distort
+#   N <path>                the stamp order — differenced against its own pre-run
+#                           reading, so a future stamp that predates the run
+#                           cancels instead of refusing it
+run_gate_snapshot_inputs() {
     run_gate_abs_input_roots | while IFS= read -r _rg_root; do
         [ -n "$_rg_root" ] || continue
         [ -d "$_rg_root" ] || continue
-        find "$_rg_root" -type f -newer "$run_gate_marker" 2>/dev/null
-    done | head -20
+        find "$_rg_root" -type f ! -name "$run_gate_bookkeeping_glob" \
+            -exec cksum {} + 2>/dev/null | sed 's/^/C /'
+        find "$_rg_root" -type f ! -name "$run_gate_bookkeeping_glob" \
+            -newer "$run_gate_marker" -print 2>/dev/null | sed 's/^/N /'
+    done | LC_ALL=C sort
+}
+
+# THE DIFF ALONE, over two snapshot files the caller has already proved exist.
+# ⚠⚠ THE AFTER SNAPSHOT IS TAKEN IN THE MAIN SHELL AND NOT HERE, DELIBERATELY.
+# This function's result is read through `$( … )`, which runs in a SUBSHELL, so a
+# failure noticed inside it could not reach the caller through any variable — it
+# could only return EMPTY, and empty means `inputs  : held still`. ⇒ "I could not
+# measure" would print as "nothing moved", which is the fails-toward-clean answer
+# this whole block exists to be unable to give. ⓘ The scan this replaced had the
+# same shape (`[ -f "$run_gate_marker" ] || return 1`): a marker that vanished
+# mid-run read as a still tree. Both doors are closed by deciding it out here.
+run_gate_diff_inputs() {
+    {
+        LC_ALL=C comm -23 "$run_gate_inputs_before" "$run_gate_inputs_after"
+        LC_ALL=C comm -13 "$run_gate_inputs_before" "$run_gate_inputs_after"
+    } 2>/dev/null | sed -e 's/^C [0-9][0-9]* [0-9][0-9]* //' -e 's/^N //' \
+      | LC_ALL=C sort -u | head -20
 }
 # ── PRE-RUN: refuse a contended build directory BEFORE anything starts ──────
 # ⚠ Placed AHEAD of the input marker deliberately, so a refusal here leaves no
@@ -842,11 +936,48 @@ if ! { : > "$run_gate_marker"; } 2>/dev/null; then
     exit 2
 fi
 
+# ⚠ THREE REFUSALS, NOT ONE, and each names what it could not do. A wrapper that
+# cannot fingerprint the tree cannot vouch for its stillness, and the honest
+# answer to that is to run NOTHING — never to run the gate and report a verdict
+# the wrapper knows it cannot stand behind.
+if ! run_gate_cksum_works; then
+    echo "run-gate.sh: FAIL — 'cksum' did not return the byte count of a 3-byte input on this" >&2
+    echo "  host, so the input fingerprint this wrapper compares before and after the run" >&2
+    echo "  cannot be taken. Nothing was run." >&2
+    echo "  cksum is POSIX and is expected on every carriage this project gates on; a host" >&2
+    echo "    without one has a broken environment, and this refusal is deliberate rather" >&2
+    echo "    than a skip: an empty fingerprint would make every diff empty and this check" >&2
+    echo "    would pass everything while appearing to run." >&2
+    echo "  shell   : $(run_gate_shell_identity)" >&2
+    rm -f "$run_gate_marker"
+    exit 2
+fi
+
+if ! run_gate_snapshot_inputs > "$run_gate_inputs_before" 2>/dev/null \
+   || [ ! -f "$run_gate_inputs_before" ]; then
+    echo "run-gate.sh: FAIL — cannot record the pre-run input fingerprint at" >&2
+    echo "  '$run_gate_inputs_before', so the run could not be proved to have measured a" >&2
+    echo "  still tree. Nothing was run." >&2
+    echo "  This refusal is about that PATH, which sits beside the log path you gave." >&2
+    echo "  shell   : $(run_gate_shell_identity)" >&2
+    rm -f "$run_gate_marker"
+    exit 2
+fi
+
 "$@" >>"$log" 2>&1
 rc=$?
 
-run_gate_moved="$(run_gate_moved_inputs)"
-rm -f "$run_gate_marker"
+run_gate_snapshot_ok=1
+if [ ! -f "$run_gate_inputs_before" ]; then
+    run_gate_snapshot_ok=0
+elif ! run_gate_snapshot_inputs > "$run_gate_inputs_after" 2>/dev/null; then
+    run_gate_snapshot_ok=0
+elif [ ! -f "$run_gate_inputs_after" ]; then
+    run_gate_snapshot_ok=0
+fi
+run_gate_moved=""
+[ "$run_gate_snapshot_ok" -eq 1 ] && run_gate_moved="$(run_gate_diff_inputs)"
+rm -f "$run_gate_marker" "$run_gate_inputs_before" "$run_gate_inputs_after"
 
 # ── POST-RUN: a sibling can start MID-RUN, so the same question is asked again ──
 run_gate_scan_contention
@@ -855,7 +986,9 @@ run_gate_scan_contention
     echo "--- run-gate.sh ---"
     echo "command : $*"
     echo "rc      : $rc"
-    if [ -n "$run_gate_moved" ]; then
+    if [ "$run_gate_snapshot_ok" -eq 0 ]; then
+        echo "inputs  : NOT MEASURED — the post-run fingerprint could not be taken, so this verdict is not evidence"
+    elif [ -n "$run_gate_moved" ]; then
         echo "inputs  : MOVED DURING THE RUN — this verdict is not evidence"
         echo "$run_gate_moved" | sed 's/^/          /'
     else
@@ -889,6 +1022,23 @@ run_gate_scan_contention
 # Checked BEFORE rc, and before the witness: a run whose inputs moved has no
 # verdict to report, and saying "the gate failed" or "the gate passed" about it
 # would be the misattribution this block exists to prevent.
+# ⚠ AND "I COULD NOT MEASURE" IS CHECKED FIRST OF ALL, because it is the one
+# answer that must never be spelled `held still`. The pre-run fingerprint already
+# succeeded — this wrapper refused to start otherwise — so reaching here means
+# something removed or blocked the snapshot path WHILE the run was in flight.
+if [ "$run_gate_snapshot_ok" -eq 0 ]; then
+    echo "run-gate.sh: FAIL — THE POST-RUN INPUT FINGERPRINT COULD NOT BE TAKEN, so this run" >&2
+    echo "  cannot be shown to have measured a still tree." >&2
+    echo "  (command exited $rc; that number is NOT being reported as a verdict)." >&2
+    echo "  The PRE-run fingerprint was taken successfully or this run would not have started," >&2
+    echo "    so something removed or blocked '$run_gate_inputs_before' or" >&2
+    echo "    '$run_gate_inputs_after' while the command was running." >&2
+    echo "  ⚠ Refusing is deliberate. Reading an unmeasurable tree as 'held still' is exactly" >&2
+    echo "    the fails-toward-clean answer this check exists to be unable to give." >&2
+    echo "  (log: $log)" >&2
+    exit 3
+fi
+
 if [ -n "$run_gate_moved" ]; then
     echo "run-gate.sh: FAIL — the tree CHANGED UNDER THE RUN, so its result is not evidence" >&2
     echo "  (command exited $rc; that number describes a tree that never existed as a whole)." >&2

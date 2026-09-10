@@ -129,6 +129,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_FloatLiteralOverflowsToInfinity";
         case DiagnosticCode::S_ArrayParamStarInFunctionDefinition:
             return "S_ArrayParamStarInFunctionDefinition";
+        case DiagnosticCode::S_VariadicMarkerMustEndParameterList:
+            return "S_VariadicMarkerMustEndParameterList";
+        case DiagnosticCode::S_AutoDeclaratorsInferDifferentTypes:
+            return "S_AutoDeclaratorsInferDifferentTypes";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";

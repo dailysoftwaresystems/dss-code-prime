@@ -2430,9 +2430,31 @@ constexpr std::string_view kCanonicalTypedefRoles =
 
 // TRAILING (after the declarator) — the real SDK witness
 // `bsm/audit.h`: `typedef u_int64_t au_asflgs_t __attribute__ ((aligned(8)));`
-// The attribute lands in the SECOND `typedefAttrRun`; the first stays empty and
-// `declarator` keeps role-index 2.
-TEST(ParserCSmoke, TypedefTrailingAttributeParsesIntoTheSecondAttrRun) {
+//
+// ★★★ P66 (lane `ag`) — INVERTED, NOT DELETED: THE ATTRIBUTE NOW LANDS IN THE
+// DECLARATOR'S **OWN** SLOT RUN, AND THE ROLE INDICES STILL DO NOT MOVE. This case
+// was `TypedefTrailingAttributeParsesIntoTheSecondAttrRun` and asserted
+// `kids[4] == "rule:attrSpec"`. c's typedef declarator list gained a per-slot
+// wrapper (`typedefDeclaratorSlot`, `semantics.declarators.plainSlotRule`) so a
+// MID-LIST declarator has somewhere to carry its own `__attribute__` run —
+// [[D-C-THREE-GNU-ALIGNED-ATTRIBUTE-FORMS-REMAIN-AND-THE-WEAKENING-ONE-IS-SILENT]]
+// form 2 — and that run is GREEDY, so for a ONE-declarator list it takes this
+// attribute before `typedefTrailingAttrRun` can.
+// ★★ THAT IS A PARSE-SHAPE MOVE WITH NO SEMANTIC MOVE, AND BOTH HALVES ARE PINNED
+// HERE RATHER THAN ONE. Both positions carry DECLARATOR grain and, for a single
+// declarator, they are the SAME declarator — so the honored answer is unchanged.
+// ✔RE-MEASURED: `SemanticAnalyzerC.TypedefSingleDeclaratorIsUnchanged` and
+// `GnuAlignedThreeForms.TheSdkSingleDeclaratorSpellingIsUnchanged` both still give
+// this exact SDK spelling `_Alignof` 8, and `ParserCSmoke.TypedefMidAttributeParses
+// IntoTheFirstAttrRun` (the `libkern/OSAtomicDeprecated.h` shape) is untouched.
+// ⚠ TF-C88 REFUSED TO ADD A PER-SLOT RUN PRECISELY BECAUSE OF THIS FILE'S SUBJECT —
+// it feared a greedy slot run would swallow this shipped spelling into a position
+// NO honoring channel could see. That fear was correct against ITS tree and is
+// answered rather than waived: P56/P66 made the per-declarator run a first-class
+// scan root. THIS CASE IS THE PIN THAT SAYS SO — it asserts the attribute is in the
+// slot AND that the trailing run is empty, so a future change that moves it to a
+// third place has to come through here.
+TEST(ParserCSmoke, TypedefTrailingAttributeParsesIntoTheDeclaratorSlotRun) {
     Tree t = parseC(
         "typedef unsigned long long u_int64_t;\n"
         "typedef u_int64_t       au_asflgs_t __attribute__ ((aligned(8)));\n");
@@ -2452,7 +2474,8 @@ TEST(ParserCSmoke, TypedefTrailingAttributeParsesIntoTheSecondAttrRun) {
     }
     ASSERT_TRUE(attributed.valid());
     EXPECT_EQ(visibleChildRoles(t, attributed), kCanonicalTypedefRoles)
-        << "a trailing decoration must not shift head:0 / declarator:2";
+        << "a trailing decoration must not shift head:0 / declarator:2 — the slot "
+           "wrapper sits INSIDE typedefDeclaratorList, so no index moved";
 
     std::vector<NodeId> kids;
     for (NodeId c : t.children(attributed)) {
@@ -2461,8 +2484,52 @@ TEST(ParserCSmoke, TypedefTrailingAttributeParsesIntoTheSecondAttrRun) {
     ASSERT_EQ(kids.size(), 6u);
     EXPECT_EQ(visibleChildRoles(t, kids[2]), "")
         << "the pre-declarator run must be EMPTY here (and still emit its node)";
-    EXPECT_EQ(visibleChildRoles(t, kids[4]), "rule:attrSpec")
-        << "the trailing __attribute__ must land in the post-declarator run";
+    EXPECT_EQ(visibleChildRoles(t, kids[4]), "")
+        << "the trailing run is now EMPTY: the declarator's own slot run took it";
+    // ...and it is INSIDE the list's slot, which is the half that says WHERE it went
+    // rather than merely where it did not go.
+    EXPECT_EQ(visibleChildRoles(t, kids[3]), "rule:typedefDeclaratorSlot");
+    std::vector<NodeId> slots;
+    for (NodeId c : t.children(kids[3])) {
+        if (!isEmptySpace(t.flags(c))) slots.push_back(c);
+    }
+    ASSERT_EQ(slots.size(), 1u) << "one declarator, one slot";
+    EXPECT_EQ(visibleChildRoles(t, slots[0]), "rule:declarator/rule:attrSpec")
+        << "the slot holds the declarator AND its own attribute run";
+}
+
+// ★★ P66 (lane `ag`): THE SHAPE THIS SLOT EXISTS FOR — a MID-LIST decoration, which
+// was `error[P_UnexpectedToken]` before. ✔MEASURED on gcc 13.3.0, clang 18.1.3,
+// mingw-w64 gcc 13.2.0 and aarch64-linux-gnu-gcc 13.3.0: all four compile it and
+// confer on **A alone**. The conferral half is pinned in
+// `tests/analysis/semantic/test_gnu_aligned_three_forms.cpp`; this case pins that
+// the attribute binds to the FIRST slot in the TREE, which is what makes the
+// conferral possible at all.
+TEST(ParserCSmoke, TypedefMidListAttributeBindsToItsOwnSlot) {
+    Tree t = parseC("typedef int A __attribute__((aligned(8))), B;\n");
+    ASSERT_NE(t.root(), InvalidNode);
+    ASSERT_FALSE(t.diagnostics().hasErrors())
+        << "every reference compiles this: " << firstErrorText(t);
+
+    RuleId const listRule = t.schema().rules().find("typedefDeclaratorList");
+    ASSERT_TRUE(listRule.valid());
+    NodeId list{};
+    for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+        NodeId const id{i};
+        if (t.kind(id) == NodeKind::Internal && t.rule(id).v == listRule.v) list = id;
+    }
+    ASSERT_TRUE(list.valid());
+    std::vector<NodeId> slots;
+    for (NodeId c : t.children(list)) {
+        if (isEmptySpace(t.flags(c))) continue;
+        if (t.kind(c) != NodeKind::Internal) continue;   // skip the Comma token
+        slots.push_back(c);
+    }
+    ASSERT_EQ(slots.size(), 2u) << "two declarators, two slots";
+    EXPECT_EQ(visibleChildRoles(t, slots[0]), "rule:declarator/rule:attrSpec")
+        << "the decorated slot carries the run";
+    EXPECT_EQ(visibleChildRoles(t, slots[1]), "rule:declarator")
+        << "and its SIBLING carries nothing — the binding that must not leak";
 }
 
 // BETWEEN the head and the declarator — the real SDK witness
@@ -3073,17 +3140,49 @@ TEST(ParserCSmoke, UndecoratedMemberEmitsNoLeadingSpecifierPrefix) {
         << "no leading specifier is present, so the optional must emit NOTHING";
 }
 
-// NAMED RESIDUE, pinned so it stays LOUD rather than drifting into a silent
-// mis-parse. `structMemberDeclSpecifier` admits the GNU `attrSpec` only — the
-// C23 `[[…]]` spelling is excluded to keep BracketOpen out of the prefix's
-// FIRST set. The input is valid C23 (clang accepts AND honors it, measured) —
-// this pins DSS's narrower admission, not a claim about the language.
-TEST(ParserCSmoke, LeadingStdAttributeOnAMemberFailsLoud) {
+// ~~ P66 (cycle P66, lane `ca`): THIS ARM IS INVERTED, AND ITS OWN COMMENT SAID
+// WHY THAT WOULD EVENTUALLY HAPPEN. It read: "NAMED RESIDUE, pinned so it stays
+// LOUD rather than drifting into a silent mis-parse. `structMemberDeclSpecifier`
+// admits the GNU `attrSpec` only — the C23 `[[…]]` spelling is excluded to keep
+// BracketOpen out of the prefix's FIRST set. The input is valid C23 (clang
+// accepts AND honors it, measured) — this pins DSS's narrower admission, not a
+// claim about the language." Every clause of that was true when written. What
+// expired is the narrower admission: ✔MEASURED 2026-09-09, each reference probed
+// SEPARATELY on its own TU, gcc 13.3.0 `-std=c2x`, clang 18.1.3 `-std=c23` AND
+// MSVC 19.51.36257 `/std:clatest` ALL THREE accept this input, silently, and
+// C23 6.7.2.1 writes the position into the grammar
+// (`member-declaration: attribute-specifier-sequence_opt specifier-qualifier-list
+// member-declarator-list_opt ;`). The FIRST-set worry it records belongs to the
+// TRAILING member slot, where {BracketOpen} collides with the abstract-array
+// declarator lead; the LEADING slot has no declarator after it. ~~
+//
+// The arm is INVERTED rather than deleted, so the position stays under test:
+// the sequence must parse AND ride the specifier PREFIX, which is what keeps it
+// visible to `scanAttributeSemantics`.
+TEST(ParserCSmoke, LeadingStdAttributeOnAMemberRidesTheSpecifierPrefix) {
     Tree t = parseC("struct S { [[deprecated]] int x; };\n");
     ASSERT_NE(t.root(), InvalidNode);
-    EXPECT_TRUE(t.diagnostics().hasErrors())
-        << "a leading C23 member attribute is residue — it must fail loud, "
-           "never parse into a shape that drops the attribute";
+    ASSERT_FALSE(t.diagnostics().hasErrors())
+        << "gcc, clang and MSVC all three accept this: " << firstErrorText(t);
+
+    NodeId const field = findFirstNodeWithRule(t, "structField");
+    ASSERT_TRUE(field.valid());
+    EXPECT_EQ(visibleChildRoles(t, field), kLeadDecoratedMemberRoles)
+        << "the leading sequence must ride the specifier PREFIX (child 0, "
+           "stripped) — head/declaratorList must not shift";
+
+    NodeId const prefix = findFirstNodeWithRule(t, "structMemberDeclSpecifiers");
+    ASSERT_TRUE(prefix.valid());
+    EXPECT_EQ(t.parent(prefix).v, field.v)
+        << "structMemberDeclSpecifiers must be a DIRECT child of structField — "
+           "that is what specifierPrefix matches";
+    // ★ THE INLINE-SEQUENCE PROPERTY, ASSERTED RATHER THAN ASSUMED: the C23 run
+    // is an inline `{sequence}` and materialises NO wrapper node, so the
+    // `stdAttr` is a DIRECT child of the prefix. The GNU spelling's sibling pin
+    // one page up asserts `rule:structMemberDeclSpecifier` for the same slot —
+    // that branch is untouched, which is what keeps it green.
+    EXPECT_EQ(visibleChildRoles(t, prefix), "rule:stdAttr")
+        << "the leading `[[…]]` run emits no wrapper of its own";
 }
 
 // ── TF-C73: `stdAttrItem`'s argument is now the shared `attrArgs` rule ───────
@@ -3368,6 +3467,29 @@ TEST(ParserCSmoke, MidPositionAttributeParses) {
 // attribute-position question and already needs an engine capability to fix it.
 // Do NOT "repair" it by deleting `stdAttr` from `singleDeclSpecifier`: that
 // would refuse `[[deprecated]] int gv;`, which BOTH references accept.
+//
+// ★★★ P66 CLOSED THE FILE-SCOPE HALF, AND THE LAST PARAGRAPH'S ADVICE WAS
+// EXACTLY RIGHT AND EXACTLY HALF THE ANSWER. `stdAttr` IS now gone from
+// `singleDeclSpecifier` — and `[[deprecated]] int gv;` still parses, because the
+// LEADING position moved to a slot of its own: `declSpecifiers` now begins
+// `{alt: [{sequence:[stdAttr, {repeat stdAttr}]}, singleDeclSpecifier,
+// headQualifier]}` and its tail repeat admits specifiers only. So the C23 6.7
+// shape is written down as C23 writes it — a sequence may LEAD a declaration or
+// END the declaration specifiers, never sit between two of them — and
+// `static [[deprecated]] int sg = 1;`, `_Thread_local [[deprecated]] int tg;`
+// and file-scope `extern [[deprecated]] int dg;` are all refused now, at the
+// `[`, alongside the two lines this test still pins. ⓘ IT NEEDED NO ENGINE
+// CAPABILITY, which corrects the sentence above that expected one: the whole fix
+// is five specifier-run edits in `c.lang.json`.
+// ⚠ THE MODE-2 LINE (`int [[deprecated]] gv;`) IS A DIFFERENT QUESTION AND IS
+// UNTOUCHED — it is the END-of-specifiers position, and the references SPLIT on
+// it: ✔MEASURED 2026-09-09, gcc 13.3.0 `-std=c2x` ACCEPTS it (`warning:
+// 'deprecated' attribute ignored`), clang 18.1.3 refuses it semantically and
+// MSVC 19.51 syntactically. This arm's refusal therefore rests on clang and MSVC
+// against a gcc that accepts, which the disjunction would settle the other way;
+// it is a live Direction-A gap owned by [[D-CSUBSET-ATTRIBUTE-TYPE-POSITION]]
+// and NOT by the P66 mid-run row, and it is said here so the two are not
+// confused.
 TEST(ParserCSmoke, StdAttrStaysRejectedInBothNewSlots) {
     for (char const* src : {
              // mode 1 slot — `externSpecifiers`'s repeat, at the block scope

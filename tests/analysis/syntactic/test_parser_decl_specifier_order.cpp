@@ -168,8 +168,23 @@ TEST(ParserDeclSpecifierOrder, FileScopeQualifierBeforeStorageClass) {
                  "const _Noreturn void nf(void){ while (1) {} }\n");
     expectParses(schema, "const before a GNU attribute",
                  "const __attribute__((unused)) int w = 8;\n");
-    expectParses(schema, "const before a C23 attribute",
-                 "const [[deprecated]] int w2 = 8;\n");
+    // ★★ P66 — THIS ARM WAS AN `expectParses` AND ITS OWN PREMISE WAS FALSE.
+    // `expectParses` says in its message "gcc/clang/MSVC each accept this
+    // spelling", and for THIS spelling none of them does: ✔MEASURED 2026-09-09,
+    // each probed SEPARATELY on its own TU, gcc 13.3.0 `-std=c2x` rc 1
+    // ("expected identifier or '(' before 'int'", 1:22), clang 18.1.3
+    // `-std=c23` rc 1 ("an attribute list cannot appear here", 1:7), MSVC
+    // 19.51.36257 `/std:clatest` rc 2 ("C2059: syntax error: 'attribute
+    // specifier'"). C23 6.7 gives a `[[…]]` sequence two positions in a
+    // declaration — LEADING it, or ENDING the declaration specifiers — and
+    // BETWEEN two specifiers is neither. The GNU spelling one line above IS
+    // accepted by gcc and clang mid-run and stays an `expectParses`; the two
+    // surfaces genuinely differ in where they may appear, which is the whole
+    // content of this pair of lines.
+    expectRefused(schema, "a C23 attribute BETWEEN two declaration specifiers",
+                  "const [[deprecated]] int w2 = 8;\n");
+    expectParses(schema, "a C23 attribute LEADING the declaration",
+                 "[[deprecated]] const int w3 = 8;\n");
     expectParses(schema, "const before static on a FUNCTION definition",
                  "const static int f(void){ return 9; }\n");
     expectParses(schema, "const before static on a function PROTOTYPE",

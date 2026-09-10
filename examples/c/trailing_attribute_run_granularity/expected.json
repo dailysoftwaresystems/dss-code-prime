@@ -4,8 +4,20 @@
   "source": "main.c",
   "exitCode": 42,
   "expectedStdout": "",
-  "$commentExpectWarnings": "The set is EXACT, and every entry below is an ENTITY-conferring spelling. The negatives are the lines that are NOT here and are nonetheless used at runtime: `depArr[0]` at 144:17 and 153:5 (a C23 run after an ARRAY declarator), `depFn()` at 145:5 (after a FUNCTION declarator), `keptSibling` at 146:14 and 156:5 (the undecorated sibling of a trailing-decorated declarator), and `KeptAlias` at 147:5 (the FIRST alias of a trailing-decorated typedef list). Each of those symbols is really referenced, so a missing report is an assertion and not an absence of evidence.",
+  "$commentExpectWarnings": "The set is EXACT PER DECLARED CODE, and every `S_DeprecatedSymbolUsed` entry below is an ENTITY-conferring spelling. The negatives are the lines that are NOT here and are nonetheless used at runtime: `depArr[0]` at 144:17 and 153:5 (a C23 run after an ARRAY declarator), `depFn()` at 145:5 (after a FUNCTION declarator), `keptSibling` at 146:14 and 156:5 (the undecorated sibling of a trailing-decorated declarator), and `KeptAlias` at 147:5 (the FIRST alias of a trailing-decorated typedef list). Each of those symbols is really referenced, so a missing report is an assertion and not an absence of evidence.\n★★ P66 ADDED THE SECOND CODE, AND IT PINS THE OTHER HALF OF THE SAME GRAIN. This file's own comment above records that gcc emits `-Wattributes` \"attribute ignored\" for the two type-appertaining C23 runs while DSS said NOTHING — P56 stopped the conferral and left the drop SILENT, which is a below-the-union drop traded for the above-the-union meaning it removed. DSS now announces it, at the two DECLARATION sites (90:17 and 94:20, the clause spans), through the shared `S_AttributeIgnoredForDeclarationKind`. The two codes together are what make this one artifact assert BOTH directions at BOTH ends: the run confers nothing, AND it is not thrown away in silence. ⚠ The GNU twins two lines down (`gnuArr`, `gnuFn`) must draw NO ignored-attribute report — they confer, and their absence from this set is the assertion that the announcement follows the GRAIN and not the position.",
   "expectWarnings": [
+    {
+      "code": "S_AttributeIgnoredForDeclarationKind",
+      "line": 90,
+      "col": 17,
+      "$comment": "P66: depArr's C23 run appertains to the ARRAY type. gcc says `'deprecated' attribute ignored [-Wattributes]` here and exits 0; clang refuses the program; MSVC C4649. DSS was SILENT until this cycle."
+    },
+    {
+      "code": "S_AttributeIgnoredForDeclarationKind",
+      "line": 94,
+      "col": 20,
+      "$comment": "P66: depFn's C23 run appertains to the FUNCTION type — the construct P56 was opened on. Same three reference verdicts as the line above; the pair is what makes the announcement a property of the GRAIN rather than of one declarator shape."
+    },
     {
       "code": "S_DeprecatedSymbolUsed",
       "line": 131,

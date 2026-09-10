@@ -2494,3 +2494,135 @@ TEST(TypeLayout, ComplexLayoutAndShapePredicates) {
     EXPECT_EQ(regClassForCoreType(TypeKind::Complex), TargetRegClass::GPR);
     EXPECT_EQ(regClassForCoreType(TypeKind::F64),     TargetRegClass::FPR);
 }
+
+// ── P66 (lane `al`): A TYPE-LEVEL ALIGNMENT — GNU `aligned(N)` ON A TYPEDEF ──
+//
+// `typedef int __attribute__((aligned(8))) A8;` must CONFER, not merely be
+// tolerated. Before P66 an over-aligned alias was not REPRESENTABLE at all — a
+// typedef interned to the SAME TypeId as its aliasee — so the semantic tier
+// refused the construct loudly rather than accept it and drop the alignment.
+// It is representable now: `TypeInterner::typeAligned` wraps the aliasee in the
+// SAME transparent skin `volatile`/`_Atomic` ride, carrying the byte count in
+// scalar slot 1, and `computeLayout` folds it into `align` at ONE site.
+//
+// ✔MEASURED 2026-09-09 on gcc 13.3.0 and clang 18.1.3, each probed SEPARATELY:
+// `sizeof(A8) == 4` with `_Alignof(A8) == 8`; `struct S { char c; A8 v; }` is
+// sizeof 16 / align 8 / offsetof(v) 8 against an undecorated `int v`'s 8 / 4 / 4.
+// MSVC 19.51.36257 abstains on the SPELLING only and confers the same way through
+// `typedef __declspec(align(8)) int A8;` (the `__alignof(A8)==8` arm compiles, the
+// `==4` twin fails C2118).
+
+TEST(TypeLayout, TypeLevelAlignmentRaisesAlignAndLeavesSizeAlone) {
+    auto ti = makeInterner(1);
+    TypeId const i   = ti.primitive(TypeKind::I32);
+    TypeId const a8  = ti.typeAligned(i, 8);
+
+    // ★ THE REPRESENTATIONAL CLAIM, and it is the one the old refusal said was
+    // impossible: the alias is a DISTINCT interned type from its aliasee.
+    EXPECT_NE(a8.v, i.v)
+        << "an over-aligned alias that interned to its aliasee's TypeId could not "
+           "carry an alignment at all — that was the whole reason for the refusal "
+           "this test replaces";
+    EXPECT_EQ(ti.typeAlignOverride(a8), 8u);
+    EXPECT_EQ(ti.typeAlignOverride(i), 0u);
+
+    auto const l = layoutOf(a8, ti);
+    EXPECT_EQ(l.align.bytes(), 8u) << "the request must be CONFERRED";
+    EXPECT_EQ(l.size, 4u)
+        << "SIZE MUST NOT MOVE. gcc and clang both keep sizeof(A8) == 4, which is "
+           "exactly why they REFUSE an array of the alias; rounding size up to the "
+           "alignment would accept a program no reference accepts";
+
+    // The skin is TRANSPARENT: every structural consumer still sees `int`.
+    EXPECT_EQ(ti.kind(a8), TypeKind::I32);
+    EXPECT_EQ(ti.stripVolatile(a8).v, i.v);
+    // ...but LAYOUT does not strip it, which is what `layoutRoot` exists to say.
+    EXPECT_EQ(ti.layoutRoot(a8).v, a8.v);
+    EXPECT_EQ(ti.layoutRoot(ti.volatileQualified(i)).v, i.v)
+        << "a PLAIN qualifier skin still collapses onto the material type — the two "
+           "reductions differ on exactly one input";
+}
+
+// ★★★ THE ARM A `computeLayout`-ONLY FIX WOULD FAIL. A struct member's alignment
+// comes out of the layout MEMO, and the memo is keyed by a reduction of the field's
+// TypeId. Keyed by `stripVolatile`, a field of type A8 resolves to `int`'s entry and
+// the alias's alignment is SILENTLY DROPPED — the member lands at 4 and the struct
+// is sizeof 8. Keyed by `layoutRoot` it is correct. This is the pin that separates
+// the two.
+TEST(TypeLayout, TypeLevelAlignmentReachesAStructMemberThroughTheLayoutMemo) {
+    auto ti = makeInterner(1);
+    TypeId const c  = ti.primitive(TypeKind::Char);
+    TypeId const i  = ti.primitive(TypeKind::I32);
+    TypeId const a8 = ti.typeAligned(i, 8);
+
+    std::array<TypeId, 2> const decorated{c, a8};
+    auto const dl = layoutOf(ti.structType("S", decorated), ti);
+    ASSERT_EQ(dl.fieldOffsets.size(), 2u);
+    EXPECT_EQ(dl.fieldOffsets[0], 0u);
+    EXPECT_EQ(dl.fieldOffsets[1], 8u) << "the member must land on the ALIAS's boundary";
+    EXPECT_EQ(dl.size, 16u);
+    EXPECT_EQ(dl.align.bytes(), 8u);
+
+    // THE NAMED CONTROL, in the same test so the discrimination is visible: the
+    // identical struct over the UNDECORATED aliasee. gcc/clang give 8 / 4 / 4, and so
+    // must DSS — otherwise the arm above would pass under a fix that over-aligned
+    // every int.
+    std::array<TypeId, 2> const plain{c, i};
+    auto const pl = layoutOf(ti.structType("P", plain), ti);
+    ASSERT_EQ(pl.fieldOffsets.size(), 2u);
+    EXPECT_EQ(pl.fieldOffsets[1], 4u);
+    EXPECT_EQ(pl.size, 8u);
+    EXPECT_EQ(pl.align.bytes(), 4u);
+}
+
+// The skin MERGES rather than nests, in both orders, and neither channel eats the
+// other. This is what makes `volatile A8` and a chained `typedef A8 B8;` correct
+// without a single extra line at either call site.
+TEST(TypeLayout, TypeLevelAlignmentAndQualifierBitsMergeIntoOneSkin) {
+    auto ti = makeInterner(1);
+    TypeId const i  = ti.primitive(TypeKind::I32);
+    TypeId const va = ti.volatileQualified(ti.typeAligned(i, 8));
+    TypeId const av = ti.typeAligned(ti.volatileQualified(i), 8);
+
+    // ⓘ P66 (lane `ag`): order-independence still holds for a qualifier BESIDE an
+    // alignment (the qualifier wrap carries `addAlign == 0`, so it preserves), and
+    // it is NOT claimed for two ALIGNMENTS — those are last-writer-wins now. The
+    // sentence below is about this pair only.
+    EXPECT_EQ(va.v, av.v) << "order-independent, exactly like the qualifier bitset";
+    EXPECT_TRUE(ti.isVolatileQualified(va));
+    EXPECT_EQ(ti.typeAlignOverride(va), 8u);
+    EXPECT_EQ(layoutOf(va, ti).align.bytes(), 8u);
+    EXPECT_EQ(layoutOf(va, ti).size, 4u);
+
+    // ★★★ P66 (lane `ag`) — INVERTED, NOT DELETED, AND THE EVIDENCE MOVED FROM A
+    // CLAIM TO A NUMBER. This line read `EXPECT_EQ(…typeAligned(typeAligned(i,16),
+    // 4)), 16u)` under the comment "a re-request MAX-folds and cannot LOWER what a
+    // previous one raised". The behaviour was real; the RULE was borrowed from the
+    // whole-composite `explicitAlign` channel, where it is correct, and it is wrong
+    // on this one. ✔MEASURED 2026-09-09, each reference probed SEPARATELY on its
+    // own TU at `-Wall -Wextra` with rc read directly — gcc 13.3.0, clang 18.1.3,
+    // mingw-w64 gcc 13.2.0 and aarch64-linux-gnu-gcc 13.3.0 ALL give
+    // `typedef int A8 __attribute__((aligned(8))); typedef A8 A2
+    // __attribute__((aligned(2)));` an A8 of 8 and an **A2 of 2**. So a re-request
+    // REPLACES: last writer wins, which is what a re-alias means.
+    // ⓘ The `4` here is deliberately WEAKER than the 16 it follows — an
+    // ADD-direction fixture (16 then 32) would read 32 under BOTH rules and prove
+    // nothing ([[feedback-a-fixture-must-synthesize-the-negative]]).
+    EXPECT_EQ(ti.typeAlignOverride(ti.typeAligned(ti.typeAligned(i, 16), 4)), 4u);
+    // ...and the RAISE direction still raises, so "replace" is not "always the
+    // smaller one".
+    EXPECT_EQ(ti.typeAlignOverride(ti.typeAligned(ti.typeAligned(i, 4), 16)), 16u);
+    // ⚠ THE GUARD THAT KEEPS `volatile A8` AT 8: a qualifier wrap reaches
+    // `qualified` with `addAlign == 0`, which means "not asking about alignment"
+    // and must PRESERVE. Without it the replace rule would erase an alignment on
+    // every qualified alias, silently. (The `va`/`av` arms above exercise the same
+    // guard through the public spellings; this one names the value that decides it.)
+    EXPECT_EQ(ti.typeAlignOverride(ti.volatileQualified(ti.typeAligned(i, 8))), 8u);
+    // A zero request is "no request" and must not mint a skin at all — otherwise
+    // every undecorated type would grow a wrapper and every TypeId would move.
+    EXPECT_EQ(ti.typeAligned(i, 0).v, i.v);
+    // An alignment-only skin carries NO qualifier bit. A reader that inferred "this
+    // is a VolatileQual record, therefore some bit is set" is wrong since P66.
+    EXPECT_FALSE(ti.isVolatileQualified(ti.typeAligned(i, 8)));
+    EXPECT_FALSE(ti.isAtomicQualified(ti.typeAligned(i, 8)));
+}

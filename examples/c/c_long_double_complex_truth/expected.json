@@ -1,0 +1,34 @@
+{
+  "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-7, cycle P66): the runtime witness for a `long double _Complex`'s PROMOTED ZERO — the real→complex construct, whose imaginary half IS that zero, and the truthiness spellings that compare against it. ✔MEASURED BEFORE THE CHANGE through the shipped CLI at de1e83ef, one tiny program per shape compiled ALONE: `long double _Complex z = 2.0L;` and `!z` each REFUSED rc 1 on BOTH x86_64:elf64-x86_64-linux-exec (F80) and arm64:elf64-aarch64-linux-exec (F128) with `L_UnsupportedLoweringForOpcode: MIR Const %N is a float (FPR-class) literal at MIR→LIR`, a diagnostic naming THIS anchor, while `z == w` and `z + w` already compiled on both and all four compiled on x86_64:pe64-x86_64-windows-exec, where `long double` IS `double`. So the gap was exactly the promoted zero and nothing else. ★★ ONE GATE, THREE DOORS: C 6.5.3.3p5 makes `!E` exactly `(0 == E)` and C 6.3.1.7 makes a real→complex conversion `(the real value, +0)`; both need a float ZERO of the element type, a register machine has no float-immediate form, so the zero must be promoted to an anonymous rodata global and LOADED. `elementFloatConst` in hir_to_mir.cpp is the ONE owner of that promotion and its width list was F64/F32 only — widening it to admit F80/F128 fixes the two shapes here AND scalar `!someLongDouble` (arm 33 of examples/c/c_long_double_convert) together, and the promotion itself needed nothing new: `lowerMirGlobalsToDataItems` already widens a double-armed literal to the 80-/128-bit data item an F80/F128 global needs, which is how a source `long double g = 3.25L;` has worked since LD-1. ⚠⚠ A CLOSED ROW CLAIMS THIS ALREADY WORKED: [[D-CSUBSET-LOGICAL-NOT-ON-A-FLOAT-MINTS-A-BARE-FLOAT-CONST]] (P41) states in its trigger that \"`!f`, `!d` and `!ld` compile\", ✔MEASURED on pe64 — THE ONE AXIS WHERE `long double` IS `double` — so the F80/F128 arms were never exercised; that row's own FIX note is correct that F16/F80/F128 kept falling through, so its headline and its body disagreed and the headline was the false half ([[feedback-one-leg-measurement-is-a-portability-claim]]). ★ WHY A SEPARATE FILE FROM BOTH OF ITS RELATIVES, and both reasons are MEASURED rather than stylistic: NOT in `c_long_double_convert` because ✔cl.exe 19.51 refuses `__builtin_complex` outright (error C2065 — MSVC has no C99 `_Complex`) and that file's reference oracle rests on MSVC's positive vote for the f64 axis; NOT in `c99_complex_truth` because ✔a ninth arm there would need `acc += 256` and a POSIX exit status is EIGHT BITS — 511 & 0xFF is 255, which is that file's PASSING value, so the arm would have been vacuous on every Linux leg and indistinguishable from a pass (caught by running the references before trusting it). ★★ EVERY ARM IS BUILT SO THAT READING ONLY ONE COMPONENT CHANGES THE ANSWER, the same construction c99_complex_truth uses: g_imOnly=(0,7) is truthy ONLY if the imaginary part is read, and it equals g_reOnly=(5,0) ONLY if one component is ignored; g_fromReal is the construct arm, and a construct that DROPPED the imaginary zero stops comparing equal to the real 2.0L while one that copied the real value into both halves fails against (2,7). Arm 1 is the non-vacuity arm (the values really are distinct before anything below relies on it), arm 5 is the CONTROL arm for the `if`/`while`/`?:`/`&&` positions that already worked (their zero comes from coerceCondition, a different route to the same promotion), and arm 6 keeps ARITHMETIC pinned so a change that fixed the zero by breaking the components would be caught. ⓘ ON THE f64 AXIS (pe64 x86_64, Apple arm64) the element IS `double`, so this file collapses to the shape c99_complex_truth already covers and does NOT discriminate there — it exists for the two WIDE axes, F80 components at offsets {0,16} on x87-80 and F128 on ieee128 — and that is stated rather than implying three-axis coverage the arms cannot deliver. ANTI-FOLD: every complex and every real operand is a MUTABLE GLOBAL written at runtime, so the `release` arm measures real runtime comparisons rather than a constant fold. ✔REFERENCE ORACLE, each probed SEPARATELY and RUN, every one returning 42: WSL gcc 13.3.0 (-O0/-O2), WSL clang 18.1.3 (-O0/-O2) and aarch64-linux-gnu-gcc 13.3.0 under qemu-aarch64 (-O0/-O2). Lowering is pinned in the unit suite by `MirLoweringC.LogicalNotOnALongDoubleAlsoComparesAgainstAPromotedZero`, which names the AXIS in its fixture (LongDoubleFormat::X87_80 and ::Ieee128) and asserts the operand's TypeKind really is F80/F128 before asserting the comparison zero is a Load — the premise the P41 arm never had. exit = 42; each arm returns its own number so a failure names itself.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

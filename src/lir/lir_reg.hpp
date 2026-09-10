@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/target_schema.hpp"   // TargetRegClass (synchrony assert)
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string_view>
@@ -29,6 +30,22 @@ enum class LirRegClass : std::uint8_t {
     VR      = 3,  // vector
     Flags   = 4,  // condition flags (single per arch)
 };
+
+// ── THE CLASS COUNT HAS ONE OWNER, AND IT IS THIS LINE ─────────────────────
+// Every per-class table in the LIR tier is `std::array<T, kLirRegClassCount>`.
+// The count DERIVES from the enum's last entry, so extending `LirRegClass`
+// past `Flags` auto-widens every one of them; the literal lock at each
+// consumer (`static_assert(kLirRegClassCount == 5u)`) is what forces an audit
+// of the code that walks the buckets rather than merely resizing them.
+// ⚠ IT USED TO BE THREE OWNERS: this expression in `lir_regalloc.cpp`'s
+// anonymous namespace, and a bare `5` in each of `lir_rewrite.cpp`'s four
+// per-class arrays. A bare `5` neither widens nor trips the assert, so a sixth
+// class would have left the rewriter's scratch pool, its per-instruction
+// cursor and its used-ordinal table silently one bucket short — the same class
+// of one-bucket shortfall this file's reservation contract exists to make
+// impossible. Published beside the enum it derives from.
+inline constexpr std::size_t kLirRegClassCount =
+    static_cast<std::size_t>(LirRegClass::Flags) + 1u;
 
 // ── THE SPELLINGS HAVE ONE OWNER, AND IT IS `kTargetRegClassTable` ────────
 // D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET.

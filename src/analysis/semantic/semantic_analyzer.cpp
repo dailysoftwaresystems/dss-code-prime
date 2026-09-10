@@ -1364,14 +1364,12 @@ declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
                         NodeId headNode,
                         std::span<RuleId const> opaqueRules = {},
                         std::span<NodeId const> prefixQualifiers = {}) {
-    // Descend a per-slot wrapper (initDeclarator / memberDeclarator) to the
-    // inner declaratorRule — the same descent declaratorDeclaredType uses.
+    // Descend a per-slot wrapper to the inner declaratorRule — the same descent
+    // declaratorDeclaredType uses, through the ONE shared predicate (P66 lane
+    // `ag`; see `isDeclaratorSlotWrapper`).
     NodeId inner = dNode;
     if (dNode.valid() && tree.kind(dNode) == NodeKind::Internal) {
-        RuleId const dr = tree.rule(dNode);
-        if (dr == dc.initDeclaratorRule
-            || (dc.memberDeclaratorRule.has_value()
-                && dr == *dc.memberDeclaratorRule)) {
+        if (isDeclaratorSlotWrapper(tree.rule(dNode), dc)) {
             NodeId const d = declarator_walk_detail::firstChildOfRule(
                 TreeDeclaratorView{tree}, dNode, dc.declaratorRule);
             if (d.valid()) inner = d;
@@ -1704,12 +1702,10 @@ declaratorConstSpine(Tree const& tree, NodeId dNode, NodeId headNode,
             continue;
         }
         // Descend a per-slot wrapper to the inner declaratorRule — the same
-        // descent `declaratorDeclaredType` and `declaratorObjectIsConst` make.
-        NodeId       inner = job.declarator;
-        RuleId const dr    = tree.rule(job.declarator);
-        if (dr == dc.initDeclaratorRule
-            || (dc.memberDeclaratorRule.has_value()
-                && dr == *dc.memberDeclaratorRule)) {
+        // descent `declaratorDeclaredType` and `declaratorObjectIsConst` make,
+        // through the ONE shared predicate (P66 lane `ag`).
+        NodeId inner = job.declarator;
+        if (isDeclaratorSlotWrapper(tree.rule(job.declarator), dc)) {
             NodeId const d = declarator_walk_detail::firstChildOfRule(
                 TreeDeclaratorView{tree}, job.declarator, dc.declaratorRule);
             if (!d.valid()) continue;   // no claim
@@ -1948,10 +1944,9 @@ void collectParamRowNodes(SchemaIndexes const& idx, SemanticConfig const& cfg,
                                             DeclaratorConfig const& dc) {
     if (!dc.fnSuffixParamsRule.has_value()) return {};
     if (!dNode.valid() || tree.kind(dNode) != NodeKind::Internal) return {};
-    NodeId       inner = dNode;
-    RuleId const dr    = tree.rule(dNode);
-    if (dr == dc.initDeclaratorRule
-        || (dc.memberDeclaratorRule.has_value() && dr == *dc.memberDeclaratorRule)) {
+    // P66 (lane `ag`): the ONE shared per-slot-wrapper predicate.
+    NodeId inner = dNode;
+    if (isDeclaratorSlotWrapper(tree.rule(dNode), dc)) {
         inner = declarator_walk_detail::firstChildOfRule(
             TreeDeclaratorView{tree}, dNode, dc.declaratorRule);
     }
@@ -5181,6 +5176,20 @@ declarationNamesNoreturn(SemanticConfig const& cfg, Tree const& tree,
     // language that writes its trailing run before its declarators, and was
     // invisible to the two sibling folds — which is exactly how the three came
     // to disagree about the same position.
+    //
+    // ⚠ P66 — A LIMITATION NAMED RATHER THAN LEFT TO BE REDISCOVERED. This scan
+    // reads a slot WHOLE, and it must: `scanNoreturnSpelling` looks for the
+    // `_Noreturn` KEYWORD as well as an attribute name, and a declaration slot
+    // may be a specifier run that carries one (c's `paramDeclSpecifiers`).
+    // Narrowing it to attribute NODES to honour a per-spelling
+    // `standardSpellingAppertainsTo` would therefore silently stop finding the
+    // keyword — a worse defect than the one it would close. So this fold reads
+    // the slot's DEFAULT `appertainsTo` and ignores the per-spelling override.
+    // ✔MEASURED that it is inert in the shipped config: the only entry carrying
+    // an override is c's `typedefAttrRun`, on a row whose `kind` is `type`, and
+    // both noreturn folds return above on exactly that kind (the gcc-vs-clang
+    // fork this file records two blocks down). A language that puts an override
+    // on a non-type row would need this fold to prune by node instead.
     if (decl.declarationAttrSlotRules.empty()) return out;
     for (NodeId slot : visibleChildren(tree, declNode)) {
         if (tree.kind(slot) != NodeKind::Internal) continue;
@@ -5860,6 +5869,32 @@ void collectAttrNodes(SemanticConfig const& cfg, Tree const& tree, NodeId root,
     }
 }
 
+// ★★★ P66
+// (D-C-THE-END-OF-SPECIFIERS-C23-ATTRIBUTE-CONFERS-ON-A-TYPEDEF-WHERE-NO-REFERENCE-CONFERS)
+// — THE ONE READER OF WHAT A SINGLE ATTRIBUTE NODE APPERTAINS TO, composing
+// BOTH axes the grain vocabulary has:
+//   1. the SPELLING (`appertainmentForSpelling`) — a DECLARATION-level slot may
+//      name a run CONTAINER holding both spellings, and at the end of the
+//      declaration specifiers the references answer differently for the two;
+//   2. the DECLARATOR SHAPE (`resolveAppertainment`) — P56's
+//      `declaratorUnlessTypeDerived`.
+// Composed HERE and nowhere else, because two folds reading this key and
+// disagreeing about what a position MEANS is the defect family both P56 and
+// this row are named for. `declaratorIsTypeDerived` is `false` at a declaration
+// site, where there is no declarator for a run to be relative to — the same
+// pass-through `resolveAppertainment` already gives any non-relative grain.
+[[nodiscard]] AttrAppertainment
+attrNodeAppertainment(SemanticConfig const& cfg, Tree const& tree,
+                      NodeId attrNode, AttrRunRule const& run,
+                      bool declaratorIsTypeDerived) noexcept {
+    bool const isStandardSpelling =
+        cfg.stdAttrRule.valid() && attrNode.valid()
+        && tree.kind(attrNode) == NodeKind::Internal
+        && tree.rule(attrNode).v == cfg.stdAttrRule.v;
+    return resolveAppertainment(appertainmentForSpelling(run, isStandardSpelling),
+                                declaratorIsTypeDerived);
+}
+
 // D-C-ATTRIBUTE-CLAUSE-NAME-ADMITS-ONLY-IDENTIFIER-SO-A-KEYWORD-NAMED-ATTRIBUTE-IS-REFUSED:
 // THE ONE ANSWER to "may this token SPELL an attribute clause name?", shared by
 // every reader below (`collectAttrClauses`'s trailing-clause detector,
@@ -6169,6 +6204,46 @@ extractOneAttrClause(EngineState& s, SemanticConfig const& cfg,
 foldAlignmentOperand(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                      NodeId argNode, NodeId diagNode, ScopeId fromScope);
 
+// ★★★ P66 (lane `ag`) — THE ZERO-ARGUMENT `__attribute__((aligned))`, WHICH IS A
+// TARGET QUANTITY AND IS THEREFORE READ FROM THE TARGET. Bare `aligned` means "the
+// largest alignment ever used for any data type on this machine" (gcc's
+// BIGGEST_ALIGNMENT), and DSS declares exactly that per target as
+// `aggregateLayout.maxAlignment` — the ISA's largest FUNDAMENTAL alignment, the cap
+// `scalarAlign` already applies to every natural alignment. Both shipped targets
+// declare 16, and ✔MEASURED 2026-09-09 the references agree on both of them:
+// `typedef int AM __attribute__((aligned));` gives `_Alignof(AM)` **16** on gcc
+// 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and aarch64-linux-gnu-gcc 13.3.0 (the
+// 8 and 32 twins FAIL on all four), independent of the decorated type, and it is
+// EXECUTED on x86_64 AND on aarch64 under qemu, not merely asserted.
+//
+// ⚠⚠ IT IS **NOT** `maxRequestedAlignment` (2^28), AND CONFUSING THE TWO WOULD
+// SILENTLY GIVE EVERY BARE `aligned` A 256 MiB ALIGNMENT. That key is the ceiling a
+// program may ASK for; this one is the largest the machine itself uses. The
+// `foldAlignmentOperand` ladder below carries the same warning for the same pair.
+//
+// ⓘ NO DECLARED BLOCK ⇒ nullopt ⇒ THE CALLER CONFERS NOTHING AND SAYS NOTHING, and
+// that is the sibling arm's ruling rather than a new one: the LSP calls
+// `dss::analyze(cu)` with NO layout params, so failing loud here would put a red
+// squiggle under a construct that compiles clean from the CLI —
+// CANNOT-DETERMINE MUST NOT BECOME CANNOT-COMPILE. Nothing is miscompiled by the
+// silence: an analysis with no layout params computes no layout at all, so there
+// are no bytes for the missing alignment to be wrong in.
+//
+// ★ ONE function for BOTH callers (the declaration-level Align verb and the
+// composite scan) for the reason `foldAlignmentOperand` is one function for both
+// spellings: a second, "equivalent" read of a target key is how the two come to
+// disagree about what the bare form means depending on where it is written.
+[[nodiscard]] std::optional<std::uint32_t>
+targetMaxUsefulAlignment(EngineState const& s) {
+    if (!s.aggregateLayout.has_value()) return std::nullopt;
+    std::uint32_t const m = s.aggregateLayout->maxAlignment;
+    // The target loader REQUIRES this key and validates it as a power of two in
+    // [1, 256], so a zero here means an unvalidated params block reached the engine.
+    // Answer "cannot determine" rather than confer 0 — a 0 would reach
+    // `Alignment::fromBytes` and fail loud there, one tier further from the cause.
+    return m != 0u ? std::optional<std::uint32_t>{m} : std::nullopt;
+}
+
 // D-CSUBSET-STRICT-ATTRIBUTE-GATE-BLIND-TO-LINKAGE-VOCABULARY — THE MEMBERSHIP
 // HALF. "Does this language MODEL this attribute name AT ALL?", answered over
 // BOTH of the disjoint vocabularies a declaration may legitimately carry:
@@ -6243,11 +6318,38 @@ linkageTierJudgesAttributeNames(SemanticConfig const& cfg,
     return true;
 }
 
+// ★★★ P66
+// (D-C-THE-END-OF-SPECIFIERS-C23-ATTRIBUTE-CONFERS-ON-A-TYPEDEF-WHERE-NO-REFERENCE-CONFERS)
+// — `appertainsToType` SAYS THAT THE CALLER RESOLVED THIS ROOT'S GRAIN TO
+// `Type`, i.e. that the attributes under it decorate a TYPE and therefore
+// confer NOTHING. It is the caller's answer because only the caller knows the
+// run rule and the declarator shape; what happens as a result is decided HERE,
+// once, so the declaration-slot fold and the per-declarator fold cannot end up
+// announcing the drop differently — or one of them not at all.
+//
+// ★★ AND THE DROP IS ANNOUNCED RATHER THAN SILENT, WHICH IS THE HALF A
+// CONFERRAL-ONLY FIX MISSES. ✔MEASURED 2026-09-09, each reference probed
+// SEPARATELY: EVERY reference diagnoses an attribute in this position — gcc
+// 13.3.0 `'deprecated' attribute ignored [-Wattributes]` at rc 0, clang 18.1.3
+// `attribute cannot be applied to types` at rc 1, MSVC 19.51.36257 C2059 /
+// C4649. A DSS that merely stopped conferring would have become the only one of
+// four to accept the construct in SILENCE, trading an above-the-union meaning
+// for a below-the-union drop. ✔MEASURED at the pre-change base, that silence
+// was already half present and unnoticed: `typedef int [[maybe_unused]] T;`
+// compiled rc 0 with ZERO diagnostics, and so did `void f(void) [[deprecated]];`
+// after P56 stopped its conferral.
+//
+// The code is the SHARED `S_AttributeIgnoredForDeclarationKind` — whose own
+// header comment declares it "NAMES NO ATTRIBUTE AND NO EFFECT VERB … one code
+// covers every present and future verb". Two reasons for one fact ("this
+// attribute was thrown away and here is why") under one code, which is what
+// keeps a single clause from drawing two reports.
 void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                             Tree const& tree, NodeId startNode,
                             bool emitUnknown, AttributeSemanticsFacts& out,
                             ScopeId fromScope = {},
-                            DeclarationRule const* owningDecl = nullptr) {
+                            DeclarationRule const* owningDecl = nullptr,
+                            bool appertainsToType = false) {
     if (!startNode.valid()) return;
     if (cfg.attributeEffects.empty()) return;
     if (!cfg.attrSpecRule.valid() && !cfg.stdAttrRule.valid()) return;
@@ -6332,6 +6434,42 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
             }
             return;
         }
+        // ★★★ P66
+        // (D-C-THE-END-OF-SPECIFIERS-C23-ATTRIBUTE-CONFERS-ON-A-TYPEDEF-WHERE-NO-REFERENCE-CONFERS)
+        // — A RUN THAT APPERTAINS TO A TYPE CONFERS NOTHING, AND SAYS SO.
+        //
+        // Placed BELOW the unknown-name arm and ABOVE the decl-kind record, and
+        // both halves of that placement are load-bearing:
+        //   • BELOW, so an UNKNOWN name keeps its own verdict. ✔MEASURED, gcc
+        //     AND clang both report `typedef int [[frobnicate]] T;`
+        //     (`attribute ignored` / `unknown attribute 'frobnicate' ignored`,
+        //     rc 0 on both), so the position must stay typo-checkable; one
+        //     clause draws ONE report, and for an unknown name that report is
+        //     the unknown-name one.
+        //   • ABOVE, so the clause is NOT recorded for the decl-kind gate and
+        //     no effect is folded. ⚠ THE ROW THAT OPENED THIS DEFECT SAID P56's
+        //     type-grain sink "keeps its TF-C93 decl-kind gate firing"; that is
+        //     REFUTED — the gate reads `attrFacts.kindScopedClauses`, and a
+        //     throwaway sink's are discarded, so it never fired for a
+        //     type-grain run. Reporting here is what replaces it, with a reason
+        //     that is actually true of the position.
+        if (appertainsToType) {
+            if (emitUnknown) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_AttributeIgnoredForDeclarationKind;
+                d.severity = DiagnosticSeverity::Warning;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(clauseNode);
+                d.actual   = std::format(
+                    "attribute '{}' is ignored and its effect was discarded: "
+                    "written in this position the attribute run appertains to a "
+                    "TYPE rather than to any declared entity, so there is "
+                    "nothing for it to decorate",
+                    clause->name);
+                s.reporter.report(std::move(d));
+            }
+            return;
+        }
         // ★★ TF-C93 (D-CSUBSET-ATTRIBUTE-IGNORED-FOR-DECL-KIND-SILENT) — RECORD
         // THE CLAUSE FOR THE DECL-KIND GATE, DELIBERATELY **ABOVE** THE SWITCH.
         //
@@ -6375,23 +6513,25 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                 NodeId const operand =
                     attrClauseArgOperand(cfg, tree, clauseNode);
                 if (!operand.valid()) {
-                    // ★ BARE `__attribute__((aligned))` — gcc reads this as "the
-                    // largest alignment useful on this target", a TARGET-dependent
-                    // number this engine has no business inventing (and which is
-                    // exactly the sort of quiet guess that produces a wrong ABI).
-                    // FAIL LOUD instead; the programmer can write the number.
-                    if (emitUnknown) {
-                        ParseDiagnostic d;
-                        d.code     = DiagnosticCode::S_UnknownTypeAttribute;
-                        d.severity = DiagnosticSeverity::Error;
-                        d.buffer   = tree.source().id();
-                        d.span     = tree.span(clauseNode);
-                        d.actual   = std::format(
-                            "attribute '{}' requires an explicit alignment argument "
-                            "(the bare form means the target's maximum useful "
-                            "alignment, which this implementation does not assume)",
-                            clause->name);
-                        s.reporter.report(std::move(d));
+                    // ★★★ P66 (lane `ag`) — BARE `__attribute__((aligned))` IS THE
+                    // TARGET'S DECLARED MAXIMUM, READ FROM THE TARGET.
+                    // ⚠ THIS ARM USED TO FAIL LOUD `S_UnknownTypeAttribute` under a
+                    // comment reading "a TARGET-dependent number this engine has no
+                    // business inventing". THE REASON WAS RIGHT AND THE CONCLUSION
+                    // DID NOT FOLLOW: the engine must not INVENT the number, and it
+                    // does not have to — the target DECLARES it, as
+                    // `aggregateLayout.maxAlignment`, and reading a declared value is
+                    // the opposite of guessing one. Refusing left DSS below the union
+                    // on a construct gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0
+                    // and aarch64-linux-gnu-gcc 13.3.0 all accept — ✔MEASURED, each
+                    // separately, one TU per probe, and EXECUTED on x86_64 and on
+                    // aarch64 under qemu. See `targetMaxUsefulAlignment` for the
+                    // matrix and for why a missing block confers nothing SILENTLY.
+                    // The MAX cross-clause fold below applies to it unchanged, so
+                    // `((aligned(32), aligned))` is 32.
+                    if (auto const m = targetMaxUsefulAlignment(s)) {
+                        if (!out.alignment.has_value() || *m > *out.alignment)
+                            out.alignment = m;
                     }
                     break;
                 }
@@ -6965,23 +7105,23 @@ scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 if (alignRow != nullptr) {
                     NodeId const operand = attrClauseArgOperand(cfg, tree, cl);
                     if (!operand.valid()) {
-                        // ★ BARE `__attribute__((aligned))` on a composite — gcc reads
-                        // it as "the largest alignment useful on this target", a
-                        // TARGET-dependent number this engine has no business
-                        // inventing. FAIL LOUD, exactly as the declaration-level arm
-                        // does; the programmer can write the number.
-                        ParseDiagnostic d;
-                        d.code     = DiagnosticCode::S_UnknownTypeAttribute;
-                        d.severity = DiagnosticSeverity::Error;
-                        d.buffer   = tree.source().id();
-                        d.span     = tree.span(cl);
-                        d.actual   = std::format(
-                            "attribute '{}' requires an explicit alignment argument "
-                            "(the bare form means the target's maximum useful "
-                            "alignment, which this implementation does not assume)",
-                            id);
-                        s.reporter.report(std::move(d));
-                        continue;
+                        // ★★★ P66 (lane `ag`) — THE COMPOSITE ARM OF THE BARE FORM,
+                        // AND IT READS THE SAME DECLARED TARGET QUANTITY THROUGH THE
+                        // SAME ONE FUNCTION. ⚠ It carried its own COPY of the
+                        // fail-loud refusal and of the sentence justifying it, which
+                        // is why the two are now one call: a duplicated policy is how
+                        // one construct comes to mean two things depending on where
+                        // it is written, and this pair had already duplicated the
+                        // refusal once. ✔MEASURED on gcc 13.3.0, clang 18.1.3,
+                        // mingw-w64 gcc 13.2.0 and aarch64-linux-gnu-gcc 13.3.0:
+                        // `struct __attribute__((aligned)) S { char c; };` is align 16
+                        // AND sizeof 16 on all four (16 = both shipped targets'
+                        // declared `aggregateLayout.maxAlignment`).
+                        if (auto const m = targetMaxUsefulAlignment(s)) {
+                            if (!facts.alignment.has_value() || *m > *facts.alignment)
+                                facts.alignment = m;
+                        }
+                        continue;   // honored — never "unknown"
                     }
                     if (auto a = foldAlignmentOperand(s, cfg, tree, operand,
                                                       /*diagNode=*/cl, fromScope)) {
@@ -7810,37 +7950,27 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
     if (!node.valid() || !base.valid()) return InvalidType;
     if (tree.kind(node) != NodeKind::Internal) return InvalidType;
     RuleId const r = tree.rule(node);
-    if (r == dc.initDeclaratorRule) {
-        NodeId const inner = declarator_walk_detail::firstChildOfRule(
-            TreeDeclaratorView{tree}, node, dc.declaratorRule);
-        if (!inner.valid()) return InvalidType;
-        // Transparent wrapper — paramDecay rides through UNCHANGED (the decaying-dim
-        // signal belongs to the wrapped declarator, not this init-declarator shell).
-        return declaratorDeclaredType(s, cfg, tree, inner, base, scope,
-                                      emitOnMiss, allowFlexibleArray,
-                                      allowInitInferredArray, paramDecay,
-                                      typeAliasRow);
-    }
-    // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR) FIX 1: a struct/union member-list
-    // slot wraps ONE declarator (+ its own bitfield suffix). Descend to the
-    // inner declaratorRule and recurse — identical to the initDeclaratorRule arm
-    // above. WITHOUT this arm a `structMemberDeclarator` node falls through to
-    // the `r != dc.declaratorRule` reject below → InvalidType for EVERY field →
-    // the struct never composes (H_TypeUnresolved); the feature (and every
-    // single-declarator struct now routed through the member list) is dead.
+    // EVERY per-slot wrapper is TRANSPARENT here: descend to the inner
+    // declaratorRule and recurse. WITHOUT this arm a slot node falls through to
+    // the `r != dc.declaratorRule` reject below → InvalidType for EVERY slot of
+    // that shape → the struct never composes (H_TypeUnresolved) / the typedef
+    // list mints no types; the feature is dead rather than diagnosed.
     // Each slot takes the head `base` TypeId BY VALUE into the append-only
     // interner, so a per-slot star (`int *a, b;` → Ptr<int> then int) cannot
     // leak across slots — the crux is correct by construction. An ABSENT inner
     // declarator (the anonymous bit-field `int : 3;`) yields InvalidType here,
     // which is fine: the anonymous-field path (~2435) types it from `headTy`,
     // never from this declTy.
-    if (dc.memberDeclaratorRule.has_value()
-        && r == *dc.memberDeclaratorRule) {
+    // ★ paramDecay rides through UNCHANGED — the decaying-dim signal belongs to
+    // the wrapped declarator, not to the shell.
+    // ★★ P66 (lane `ag`): the three wrapper roles were three arms with one body;
+    // they are one arm over `isDeclaratorSlotWrapper` now, so the THIRD
+    // (c's typedef-list slot, which carries a per-declarator attribute run)
+    // could not be added to some sites and missed at others.
+    if (isDeclaratorSlotWrapper(r, dc)) {
         NodeId const inner = declarator_walk_detail::firstChildOfRule(
             TreeDeclaratorView{tree}, node, dc.declaratorRule);
         if (!inner.valid()) return InvalidType;
-        // Transparent wrapper — paramDecay rides through UNCHANGED (a struct member
-        // slot; paramDecay is false here in practice, but stay signal-preserving).
         return declaratorDeclaredType(s, cfg, tree, inner, base, scope,
                                       emitOnMiss, allowFlexibleArray,
                                       allowInitInferredArray, paramDecay,
@@ -8627,6 +8757,114 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
     }
 }
 
+// ── C 6.7.6.3 / C23 6.7.7.4: THE VARIADIC MARKER TERMINATES THE PARAMETER LIST
+//
+// `int f(int a, ..., int b);` — DSS ACCEPTED it at rc 0 with zero bytes on
+// stderr, and so did its DEFINITION, its function-pointer spelling
+// (`int (*p)(int a, ..., int b);`) and the double-marker form
+// (`int f(int a, ..., ...);`). ✔MEASURED 2026-09-09 through the shipped CLI.
+// Each reference probed SEPARATELY on its OWN translation unit: gcc 13.3.0
+// `-std=c2x` rc 1 (`expected ')' before ',' token`), clang 18.1.3 `-std=c23`
+// rc 1 (`expected ')'`), MSVC 19.51.36257 `/std:clatest` rc 2 (`C2760: syntax
+// error: ',' was unexpected here; expected ')'`) — UNANIMOUS refusal of every
+// spelling, each pointing at the separator that follows the marker. DSS was
+// ABOVE the union, which this bar treats exactly as it treats being below it.
+//
+// ★★★ THIS IS A SEMANTIC CHECK AND NOT A GRAMMAR ONE, AND THAT IS A
+// MEASUREMENT RATHER THAN A PREFERENCE. The list rule spells itself
+// `param (separator paramOrEllipsis)*`; the constraint needs the LOOP TO STOP
+// after one particular alternative, which this engine's position table has no
+// way to say. FIVE shapes were written into a PRIVATE config root
+// (`$DSS_CONFIG_ROOT`) and each run through the shipped CLI over one
+// accept/refuse battery — the live document was never touched:
+//   (A) `param (sep param)* {optional: sep ellipsis, speculative:true}`,
+//   (C) the same with the bare separator TOKEN instead of the `listSeparator`
+//       rule, and
+//   (E) the same with no `speculative` flag
+//       → all three are REFUSED AT LOAD, every case in the battery:
+//         `error[C_AmbiguousAlternatives]: at /shapes/paramList: alt branches
+//          share FIRST token 'Comma'`. The repeat's loop entry and the
+//         trailing optional share the separator — the IDENTICAL refusal
+//         `/shapes/listSeparator`'s own `$whyNotTheStandardSpellingComment`
+//         already records for C23's trailing comma.
+//   (B) the loop body wrapped in a one-branch `speculative` alt LOADS and
+//       refuses all six malformed forms — and REGRESSES LEGAL C23:
+//       `int f(int a, ...);` became `error[P_NoAlternativeMatched]: expected
+//       'Identifier', 'BracketOpen', … ` at 1:18, because this engine does not
+//       roll a failed repeat iteration back (the same sentence that comment
+//       records, met again).
+//   (D) `/shapes/enumBody`'s OWN topology — `(sep {optional param,
+//       speculative})*` plus a trailing `{optional ellipsis}` — refuses all
+//       five misplaced-marker forms at the right column and accepts every
+//       legal one, BUT newly ACCEPTS `int f(int a,)`, an illegal trailing
+//       separator all three references refuse. Trading one Direction-B silent
+//       accept for another is not a fix.
+// So the document cannot express it, and it is enforced here — still
+// ENTIRELY out of the document's own vocabulary. The list is whatever rule the
+// config names `declarators.fnSuffixParamsRule` and the marker is whatever
+// token it names `declarators.variadicMarker`; a document declaring neither
+// gets no check, and no language, target or format name appears.
+//
+// ★ SCOPE IS THE NEAREST ENCLOSING LIST, and getting that wrong is the whole
+// hazard: `int g(int (*cb)(int, ...), int n);` is LEGAL — the marker belongs to
+// the nested prototype. The element walk therefore stops at any nested
+// `fnSuffixParamsRule` node rather than at nested DECLARATION rows, because the
+// marker of an inner list does not live inside an inner `param` node (it is a
+// sibling of them) and a decl-row boundary would not have contained it.
+void checkVariadicMarkerTerminatesParamList(EngineState& s,
+                                            SemanticConfig const& cfg,
+                                            Tree const& tree, NodeId node) {
+    if (!cfg.declarators.has_value()) return;
+    DeclaratorConfig const& dc = *cfg.declarators;
+    if (!dc.fnSuffixParamsRule.has_value() || !dc.variadicMarker.has_value())
+        return;
+    if (!node.valid() || tree.kind(node) != NodeKind::Internal
+        || tree.rule(node) != *dc.fnSuffixParamsRule) {
+        return;
+    }
+    // The marker inside ONE list element, never inside a nested list.
+    auto const markerIn = [&](NodeId elem) -> NodeId {
+        std::vector<NodeId> stack{elem};
+        for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+            NodeId const cur = stack.back();
+            stack.pop_back();
+            if (tree.kind(cur) == NodeKind::Token
+                && tree.tokenKind(cur) == *dc.variadicMarker) {
+                return cur;
+            }
+            if (cur.v != elem.v && tree.kind(cur) == NodeKind::Internal
+                && tree.rule(cur) == *dc.fnSuffixParamsRule) {
+                continue;   // a nested prototype owns its own marker
+            }
+            auto const cs = tree.children(cur);
+            for (auto it = cs.rbegin(); it != cs.rend(); ++it) {
+                if (!isEmptySpace(tree.flags(*it))) stack.push_back(*it);
+            }
+        }
+        return {};
+    };
+    NodeId marker{};
+    NodeId after{};
+    for (NodeId c : visibleChildren(tree, node)) {
+        if (tree.kind(c) != NodeKind::Internal) continue;   // separators
+        if (marker.valid()) { after = c; break; }
+        marker = markerIn(c);
+    }
+    if (!marker.valid() || !after.valid()) return;
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::S_VariadicMarkerMustEndParameterList;
+    d.severity = DiagnosticSeverity::Error;
+    d.buffer   = tree.source().id();
+    d.span     = tree.span(marker);
+    d.actual   = std::string{tree.text(marker)};
+    d.related.push_back(RelatedLocation{
+        tree.source().id(),
+        tree.span(after),
+        "this parameter follows it, and nothing may (C 6.7.6.3)",
+    });
+    s.reporter.report(std::move(d));
+}
+
 // ── Pass 1: pre-order — mint decls + push/pop scopes + const marking ───────
 // pass1 PER-NODE work for ONE node — extracted for the iterative driver below
 // (D-PARSE-DEEP-NEST-RECURSION-MEMORY plan 24 Stage 2). PRE-order: resolves this
@@ -8642,6 +8880,17 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 
     if (k == NodeKind::Internal) {
         auto const rule = tree.rule(node);
+
+        // C 6.7.6.3 / C23 6.7.7.4 (P66): the config-declared variadic marker
+        // must END the parameter list. Checked HERE, at the pre-order visit of
+        // EVERY node, because the list rule is reached by several different
+        // resolvers (the shared declarator-suffix FnSig build, the legacy
+        // function-declaration build, and the abstract/function-pointer path
+        // that reaches neither) — ✔MEASURED, `int (*p)(int a, ..., int b);`
+        // was accepted at rc 0 by a path the two named resolvers never see. One
+        // rule-keyed visit covers every list in the tree exactly once, which a
+        // per-resolver check could not claim; see the function's own header.
+        checkVariadicMarkerTerminatesParamList(s, cfg, tree, node);
 
         // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: a dual-mode declaration row
         // (`definesWhenChildRule`) is a DEFINITION at this node ONLY when its body
@@ -9910,7 +10159,61 @@ resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
     if (!cfg.declarators.has_value()) return InvalidType;   // loader invariant
     DeclaratorConfig const& dc = *cfg.declarators;
 
-    // (2) exactly ONE declarator (C23 6.7.9p2).
+    // (2) THE DECLARATOR SET — AT LEAST ONE, AND AS MANY AS THE DECLARATION
+    // WRITES. This used to reject anything but exactly one, citing
+    // "C23 6.7.9p2 … a single declarator". ★★ THAT PREMISE IS REFUTED BY THE
+    // STANDARD'S OWN TEXT, read at the primary source (N3220, the C23 final
+    // working draft): type inference is §6.7.10, not 6.7.9 (6.7.9 is Type
+    // DEFINITIONS — typedef), its ONE Constraint is "A declaration for which the
+    // type is inferred shall contain the storage-class specifier auto", and the
+    // declarator COUNT appears nowhere in it. The count is governed instead by
+    //   • Annex J.2(78): "A declaration for which a type is inferred contains no
+    //     or more than one declarators (6.7.10)" — UNDEFINED BEHAVIOUR, so no
+    //     diagnostic is required and accepting and refusing are BOTH conforming;
+    //   • Annex J.5.12 (Common extensions): "A declaration for which a type is
+    //     inferred (6.7.10) may … have more than one declarator" — the standard
+    //     naming this exact form as a sanctioned extension; and
+    //   • footnote 164: "It is recommended that implementations that accept
+    //     different forms of direct declarators follow the syntax and semantics
+    //     of the corresponding feature in ISO/IEC 14882" — i.e. C++'s `auto`:
+    //     ONE type deduced for the whole declaration, shared by every
+    //     declarator, and a hard error when two declarators disagree.
+    // ✔MEASURED 2026-09-09, each reference probed SEPARATELY on its own TU:
+    //   clang 18.1.3 `-std=c23` ACCEPTS `auto a = 1, b = 2;` at FILE and BLOCK
+    //     scope, and SILENTLY at `-Wall -Wextra -pedantic` (it names the sibling
+    //     `auto *a = &x, b = 2;` a Clang extension via -Wauto-decl-extensions and
+    //     says nothing about this one). A linked, EXECUTED binary proves the
+    //     MEANING and not merely the acceptance: `_Generic` reports `int` for
+    //     both, `sizeof` 4 for both, `int *pa = &a; int *pb = &b;` compile, the
+    //     values are 1 and 2, and file-scope `auto fa = 10, fb = 20;` behaves
+    //     identically — the program exits 33. It REFUSES `auto a = 1, b = 2.5;`
+    //     with "'auto' deduced as 'int' in declaration of 'a' and deduced as
+    //     'double' in declaration of 'b'", which is what PROVES the type is
+    //     shared rather than deduced per declarator.
+    //   gcc 13.3.0 `-std=c2x` REFUSES ("'auto' may only be used with a single
+    //     declarator"), at file and block scope alike.
+    //   MSVC 19.51.36257 `/std:clatest` ABSTAINS rather than voting: it takes the
+    //     SPELLING as the C89 storage class over an implicit `int`, so it accepts
+    //     `auto a = 1, b = 2.5;` SILENTLY (b becomes int) and fails
+    //     `auto a = &x, b = &y; … *a` with C2100 "you cannot dereference an
+    //     operand of type 'int'". It is not answering the C23 question at all,
+    //     and an acceptance that drops meaning casts no vote.
+    // ONE WORKING accepting reference makes the behaviour REQUIRED, and a split
+    // on ACCEPT-vs-REFUSE (never on what a program MEANS — only clang gives this
+    // form a meaning at all) is settled by the disjunction. So DSS accepts, and
+    // reproduces clang's meaning exactly: the shared type below is what the
+    // caller hands to the ORDINARY declarator fold, which applies one head type
+    // to every declarator — the same path a written head takes, no second write
+    // site, and therefore no way for two declarators to end up differing.
+    // ⓘ THE ZERO CASE KEEPS `S_AutoRequiresSingleDeclarator` AND IS NOW ITS ONLY
+    // EMITTER. `initDeclaratorList` is non-nullable, so an empty set can only
+    // mean the row's `declaratorList` role index does not point at the list — a
+    // config-invariant break, reported loud rather than typed as nothing. The
+    // code's NAME is a residue of the retired constraint and is said out loud
+    // here instead of being renamed: a `DiagnosticCode` renders as
+    // `error[S_…]`, so it is published identity, and the ordinal-allocation gate
+    // exists precisely because rewriting a name operators have already seen is
+    // the hazard. The constraint that replaced it has its own code below.
     auto const carrierIdx = decl.declaratorListChild.has_value()
                                 ? decl.declaratorListChild
                                 : decl.declaratorChild;
@@ -9918,16 +10221,21 @@ resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
     if (carrierIdx.has_value() && *carrierIdx < kids.size()) {
         collectDeclarators(tree, kids[*carrierIdx], dc, declarators);
     }
-    if (declarators.size() != 1) {
-        emit(DiagnosticCode::S_AutoRequiresSingleDeclarator,
-             declarators.size() > 1 ? declarators[1] : node,
-             "initializer-inferred declaration declares "
-                 + std::to_string(declarators.size())
-                 + " declarators — exactly one is required (C23 6.7.9p2)");
+    if (declarators.empty()) {
+        emit(DiagnosticCode::S_AutoRequiresSingleDeclarator, node,
+             "initializer-inferred declaration declares no declarators — at "
+             "least one is required: " + snippet(node));
         return InvalidType;
     }
-    NodeId const dNode = declarators[0];
 
+    // Steps (3)–(7) for ONE declarator, run for EVERY declarator of the
+    // declaration. Running the ladder on the first alone and assuming the rest
+    // would be the [[a partial fix reads as a complete one]] shape: each
+    // declarator's own initializer must be resolved for the shared type to MEAN
+    // anything, and each reject must fire at ITS OWN declarator — otherwise
+    // `auto a = 1, b = (void)0;` would deduce `int`, never look at `b`, and
+    // silently type a void-initialized object.
+    auto const inferOneDeclarator = [&](NodeId dNode) -> TypeId {
     // (3) a PLAIN IDENTIFIER declarator: the (init)declarator's inner
     // `declarator` must carry NO pointerLayer, and its `directDeclarator`
     // must be a bare name token — no fnSuffix / arrayDeclSuffix /
@@ -10120,10 +10428,79 @@ resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
         default:
             break;
     }
-    // C23 6.7.9p2: the declared type drops top-level qualifiers (the
+    // C23 6.7.10p2: the declared type drops top-level qualifiers (the
     // typeof_unqual strip; only VolatileQual is interned — const is
     // symbol-level and never set here, the row declares no constMarker).
     return in.stripVolatile(inferred);
+    };   // inferOneDeclarator
+
+    // ONE deduced type for the whole declaration (C23 6.7.10 fn.164 → ISO/IEC
+    // 14882). The first declarator's type is the declaration's; every later one
+    // must agree, and a disagreement is refused AT the declarator that
+    // disagrees, naming both deductions — the shape clang 18.1.3 reports.
+    // ⚠ EQUALITY IS INTERNER IDENTITY, which is the only comparison that is
+    // sound here: `TypeId`s come from `TypeInterner`, so two structurally equal
+    // types are the SAME id and a structural walk would be a second, driftable
+    // answer to a question the interner already answers.
+    TypeInterner& types = s.lattice.interner();
+    // The user-facing spelling of a deduced type, in THE LANGUAGE'S OWN WORDS.
+    // Three tiers, none of them a language-name branch:
+    //   1. the interner's vocabulary tag when the type carries one (a named
+    //      primitive; `vocabularyName` sees THROUGH a qualifier skin, so
+    //      `volatile long` reads `long`);
+    //   2. otherwise the interner's own kind spelling (`I32`, `F64`), with a
+    //      POINTER rendered through its pointee — the one shape where the kind
+    //      alone would print `Ptr` for BOTH disagreeing types and make the
+    //      message say nothing.
+    // ⚠ TIER 2 IS THE COMMON CASE AND NOT THE FALLBACK, because `int`, `short`,
+    // `float`, `double`, `bool`, `void` and plain `char` are DELIBERATELY
+    // anonymous — `TypeSpecifierRule`'s own comment explains why (naming `int`
+    // would make a promoted `char + char` stop matching a declared `int`) — so a
+    // literal-inferred type carries no vocabulary tag and tier 1 misses exactly
+    // the types this diagnostic is most often about.
+    // ⓘ AND THE LANGUAGE'S SOURCE SPELLING IS NOT REACHABLE FROM HERE, which is
+    // worth recording because a field advertises otherwise: `TypeSpecifierRule`
+    // carries `tokenNames`, commented "source spellings, for diagnostics", and
+    // ✔MEASURED it holds TOKEN-KIND names — rendering through it produced
+    // `deduces 'IntKeyword' … and 'DoubleKeyword'`, which is worse than the kind
+    // spelling, not better. The word↔kind table is the GRAMMAR's `keywords`
+    // array and `GrammarSchema` exposes no reverse lookup for it. Kind spellings
+    // are also what every parser refusal in this compiler already prints
+    // (`expected 'EndStatement' … got '('`), so this stays inside the existing
+    // convention rather than inventing a second one from a heuristic.
+    auto const typeText = [&](TypeId t) {
+        auto render = [&](TypeId ty, auto&& self, int depth) -> std::string {
+            if (!ty.valid()) return std::string{"<unresolved type>"};
+            if (std::string_view const v = types.vocabularyName(ty); !v.empty())
+                return std::string{v};
+            TypeKind const k = types.kind(ty);
+            if (depth < 8 && k == TypeKind::Ptr) {
+                auto const ops = types.operands(ty);
+                if (!ops.empty() && ops[0].valid())
+                    return self(ops[0], self, depth + 1) + " *";
+            }
+            if (std::string_view const kn = typeKindNameOrEmpty(k); !kn.empty())
+                return std::string{kn};
+            return std::string{"<unnamed type>"};
+        };
+        return render(t, render, 0);
+    };
+    TypeId const shared = inferOneDeclarator(declarators[0]);
+    if (!shared.valid()) return InvalidType;   // the ladder already emitted
+    for (std::size_t i = 1; i < declarators.size(); ++i) {
+        TypeId const t = inferOneDeclarator(declarators[i]);
+        if (!t.valid()) return InvalidType;    // the ladder already emitted
+        if (t.v == shared.v) continue;
+        emit(DiagnosticCode::S_AutoDeclaratorsInferDifferentTypes,
+             declarators[i],
+             "initializer-inferred declaration deduces '" + typeText(shared)
+                 + "' for '" + snippet(declarators[0]) + "' and '" + typeText(t)
+                 + "' for '" + snippet(declarators[i])
+                 + "' — every declarator of ONE inferred declaration shares ONE "
+                   "deduced type (C23 6.7.10 fn.164)");
+        return InvalidType;
+    }
+    return shared;
 }
 
 // ── Pass 1.5: post-order — resolve declaration types + FnSigs ──────────────
@@ -10378,22 +10755,54 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                     // member loop never consulted a per-declarator slot root —
                     // so the observable bug was a DROP (below the union) on `q`
                     // rather than a leak onto `p`. Both halves are fixed here.
+                    // ★★★ P66
+                    // (D-C-THE-END-OF-SPECIFIERS-C23-ATTRIBUTE-CONFERS-ON-A-TYPEDEF-WHERE-NO-REFERENCE-CONFERS)
+                    // — PER ATTRIBUTE NODE, NOT PER SLOT. A declaration slot
+                    // names a RUN CONTAINER, and c's `typedefAttrRun` holds
+                    // BOTH spellings under one rule name — so the slot's grain
+                    // could only be all-or-nothing while the references answer
+                    // the two spellings differently. Splitting the slot's
+                    // attribute nodes here and resolving each through the
+                    // shared `attrNodeAppertainment` is what makes the
+                    // per-spelling grain readable at a container slot.
+                    // ⓘ ORDER IS UNCHANGED: `collectAttrNodes` is the SAME walk
+                    // `scanAttributeSemantics` ran internally over this slot, so
+                    // the nodes that still confer fold into `declAttrFacts` in
+                    // exactly the order they did before — first-non-empty-wins
+                    // cannot have shifted.
+                    std::vector<NodeId> slotAttrNodes;
                     for (NodeId slot : visibleChildren(tree, node)) {
                         if (tree.kind(slot) != NodeKind::Internal) continue;
-                        bool isSlot = false;
+                        AttrRunRule const* slotRule = nullptr;
                         for (AttrRunRule const& sr : decl.declarationAttrSlotRules) {
                             if (sr.appertainsTo != AttrAppertainment::Declaration) {
                                 continue;
                             }
                             if (tree.rule(slot).v == sr.rule.v) {
-                                isSlot = true;
+                                slotRule = &sr;
                                 break;
                             }
                         }
-                        if (!isSlot) continue;
-                        scanAttributeSemantics(s, cfg, tree, slot,
-                                               /*emitUnknown=*/true, declAttrFacts,
-                                               here, /*owningDecl=*/&decl);
+                        if (slotRule == nullptr) continue;
+                        slotAttrNodes.clear();
+                        collectAttrNodes(cfg, tree, slot, slotAttrNodes);
+                        for (NodeId an : slotAttrNodes) {
+                            bool const toType =
+                                attrNodeAppertainment(
+                                    cfg, tree, an, *slotRule,
+                                    /*declaratorIsTypeDerived=*/false)
+                                == AttrAppertainment::Type;
+                            // The sink is never read; the scan returns before
+                            // folding anything into it. It is explicit rather
+                            // than reusing `declAttrFacts` so a future arm added
+                            // above that return cannot leak into the real facts.
+                            AttributeSemanticsFacts typeGrainSink;
+                            scanAttributeSemantics(
+                                s, cfg, tree, an, /*emitUnknown=*/true,
+                                toType ? typeGrainSink : declAttrFacts, here,
+                                /*owningDecl=*/&decl,
+                                /*appertainsToType=*/toType);
+                        }
                     }
                     bool alignasHandledForDecl = false;
                     bool alignasBitfieldReported = false;
@@ -11410,15 +11819,27 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 // must not mean two different things depending on which
                                 // side of the declarator it is written, and the
                                 // unknown-name verdict is part of what it means.
+                                // ★ P66: the grain now comes from the SHARED
+                                // `attrNodeAppertainment`, which composes the
+                                // spelling axis with this one. Here the two are
+                                // the same question — `afterDeclaratorAttrRules`
+                                // names `attrSpec` and `stdAttr` DIRECTLY, so
+                                // per-rule already IS per-spelling and the
+                                // spelling half is a no-op — but reading one
+                                // helper is what stops this fold and the
+                                // declaration-slot fold above from drifting.
                                 AttributeSemanticsFacts typeGrainSink;
+                                AttrAppertainment const grain =
+                                    attrNodeAppertainment(cfg, tree, ac, *run,
+                                                          derivesTy);
                                 bool const confers =
-                                    resolveAppertainment(run->appertainsTo,
-                                                         derivesTy)
-                                    == AttrAppertainment::Declarator;
+                                    grain == AttrAppertainment::Declarator;
                                 scanAttributeSemantics(
                                     s, cfg, tree, ac, /*emitUnknown=*/true,
                                     confers ? attrFacts : typeGrainSink, here,
-                                    /*owningDecl=*/&decl);
+                                    /*owningDecl=*/&decl,
+                                    /*appertainsToType=*/
+                                    grain == AttrAppertainment::Type);
                             }
                         }
                         // ★★★ P56
@@ -11436,9 +11857,24 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // copy is what keeps `p` clean.
                         if (!declarators.empty()
                             && dNode.v == declarators.back().v) {
+                            // ★ P66: per attribute NODE, for the same reason as
+                            // the declaration-grain loop above — this slot is a
+                            // run container too. c's `typedefTrailingAttrRun`
+                            // declares no per-spelling override and is
+                            // byte-identical under this loop; reading the grain
+                            // through the shared helper here is what keeps a
+                            // future override from being silently unread at one
+                            // of the two container sites.
+                            // ✔MEASURED 2026-09-09 that this slot's answer is
+                            // genuinely different from the post-head one and
+                            // must stay conferring: `typedef int A, B
+                            // [[deprecated]];` warns at a use of **B** and is
+                            // clean at a use of **A** on gcc 13.3.0, clang
+                            // 18.1.3 AND MSVC 19.51.36257 alike.
+                            std::vector<NodeId> trailingAttrNodes;
                             for (NodeId slot : visibleChildren(tree, node)) {
                                 if (tree.kind(slot) != NodeKind::Internal) continue;
-                                bool isTrailingSlot = false;
+                                AttrRunRule const* trailingRule = nullptr;
                                 for (AttrRunRule const& sr :
                                          decl.declarationAttrSlotRules) {
                                     if (sr.appertainsTo
@@ -11446,15 +11882,27 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         continue;
                                     }
                                     if (tree.rule(slot).v == sr.rule.v) {
-                                        isTrailingSlot = true;
+                                        trailingRule = &sr;
                                         break;
                                     }
                                 }
-                                if (!isTrailingSlot) continue;
-                                scanAttributeSemantics(s, cfg, tree, slot,
-                                                       /*emitUnknown=*/true,
-                                                       attrFacts, here,
-                                                       /*owningDecl=*/&decl);
+                                if (trailingRule == nullptr) continue;
+                                trailingAttrNodes.clear();
+                                collectAttrNodes(cfg, tree, slot,
+                                                 trailingAttrNodes);
+                                for (NodeId an : trailingAttrNodes) {
+                                    bool const toType =
+                                        attrNodeAppertainment(
+                                            cfg, tree, an, *trailingRule,
+                                            /*declaratorIsTypeDerived=*/false)
+                                        == AttrAppertainment::Type;
+                                    AttributeSemanticsFacts typeGrainSink;
+                                    scanAttributeSemantics(
+                                        s, cfg, tree, an, /*emitUnknown=*/true,
+                                        toType ? typeGrainSink : attrFacts, here,
+                                        /*owningDecl=*/&decl,
+                                        /*appertainsToType=*/toType);
+                                }
                             }
                         }
                         // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): apply the
@@ -11979,21 +12427,170 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 // __attribute__((aligned(16)));` clean), whereas C11
                                 // `alignas` on a typedef is a CONSTRAINT VIOLATION —
                                 // which is why this arm is a graded judgement and the
-                                // alignas arm is a flat rejection. NOTE the existing
-                                // `"alignas on a typedef"` arm above was MEASURED DEAD
+                                // alignas arm is a flat rejection.
+                                // ⚠⚠ THE SENTENCE THAT USED TO CLOSE THIS PARAGRAPH IS
+                                // RETIRED BY MEASUREMENT, and it is worth naming as a
+                                // second instance of the same failure mode this whole
+                                // block is an instance of. It read: "NOTE the existing
+                                // `alignas on a typedef` arm above was MEASURED DEAD
                                 // (both spellings are P0001 parse errors before they
-                                // reach it); do not cite it as live behavior.
+                                // reach it); do not cite it as live behavior." It was
+                                // TRUE when written and P58 falsified it in the very
+                                // next cycle by admitting `alignasSpec` into
+                                // `typedefDeclSpecifiers` — nothing gated the comment,
+                                // so it kept asserting a dead arm for a live one.
+                                // ✔RE-MEASURED 2026-09-09 (P66) through the shipped
+                                // CLI: `typedef _Alignas(8) int A8;` draws
+                                // `error[S_AlignasInvalidContext]: alignas on a
+                                // typedef` — the arm IS live, it IS the correct
+                                // behaviour (gcc, clang and MSVC C7704 all refuse it),
+                                // and it MUST stay live.
+                                // ★★★ P66 (cycle P66, lane `al`) — THE REFUSAL ABOVE IS
+                                // RETIRED AND THE REQUEST IS NOW **CONFERRED**. Every
+                                // sentence of the paragraph above was TRUE OF THE TREE
+                                // IT WAS WRITTEN AGAINST and its premise has since been
+                                // removed, so it is kept as the record of WHY this was
+                                // hard rather than deleted as if it had been wrong.
+                                //
+                                // What changed is the one clause the whole refusal
+                                // rested on: "a typedef interns to the SAME TypeId as
+                                // its aliasee". It no longer does when an alignment is
+                                // requested. `TypeInterner::typeAligned` wraps the
+                                // aliasee in the TYPE-LEVEL ALIGNMENT SKIN — the same
+                                // transparent `VolatileQual` record `volatile`/`_Atomic`
+                                // ride, carrying the byte count in scalar slot 1 — so
+                                // `A8` and `int` are DISTINCT interned types that share
+                                // a material kind. Writing the alignment is therefore no
+                                // longer provably inert, and the "parses but sets
+                                // nothing" silent drop the old arm feared is now
+                                // impossible in the other direction too: the value is on
+                                // the TYPE, so every use of the alias carries it, not
+                                // merely the declaration that spelled the attribute.
+                                //
+                                // ✔MEASURED 2026-09-09, each reference probed SEPARATELY
+                                // on its own translation unit, rc read DIRECTLY:
+                                //   * gcc 13.3.0 and clang 18.1.3 both compile `typedef
+                                //     int __attribute__((aligned(8))) A8;` rc 0 SILENT at
+                                //     -Wall -Wextra with `_Static_assert(_Alignof(A8) ==
+                                //     8)` PASSING and the `== 4` twin FAILING, in BOTH
+                                //     orders (attribute after the specifiers and before
+                                //     them). An EXECUTED binary places a static and an
+                                //     automatic object of the type on 8 at -O0 and -O2,
+                                //     and `struct S { char c; A8 v; }` is sizeof 16 /
+                                //     _Alignof 8 / offsetof(v) 8.
+                                //   * mingw-w64 gcc 13.2.0 agrees on every arm it was
+                                //     given.
+                                //   * MSVC 19.51.36257 ABSTAINS ON THE SPELLING ONLY —
+                                //     it has no `__attribute__` syntax (C2143). Its vote
+                                //     on the CONSTRUCT is cast through the spelling it
+                                //     implements and is the SAME vote: `typedef
+                                //     __declspec(align(8)) int A8;` compiles rc 0 with
+                                //     `int p[(__alignof(A8)==8)?1:-1]` while the `==4`
+                                //     twin fails C2118. So an over-aligned type ALIAS is
+                                //     conferred by ALL THREE references. Recorded as a
+                                //     measurement; an abstention on a surface spelling
+                                //     is never read as agreement.
+                                // DSS was BELOW the union, refusing a program every
+                                // reference compiles, and it is the SDK-dominant spelling.
+                                //
+                                // ⛔ DO NOT "UNIFY" THIS WITH THE `alignas` ARM ABOVE.
+                                // The two spellings have OPPOSITE correct answers and
+                                // always did: `typedef _Alignas(8) int A8;` is REFUSED by
+                                // gcc, clang AND MSVC (C7704) and by ISO C 6.7.6p2, which
+                                // names `typedef` explicitly — so DSS refuses it, and
+                                // that refusal was RE-MEASURED this cycle and still
+                                // holds ([[D-CSUBSET-ALIGNAS-TYPEDEF-PARAM-PARSE]], P58).
+                                // The two arms are already separate CODE PATHS reaching
+                                // one diagnostic CODE, which is why widening either one
+                                // on CONTEXT would put DSS above the union in the same
+                                // stroke it fixed being below it.
+                                //
+                                // ★★★ P66 (lane `ag`) — A REQUEST **WEAKER** THAN
+                                // NATURAL NOW LOWERS, AND THE GUARD NARROWED FROM
+                                // `want <= natural` TO `want == natural` FOR EXACTLY
+                                // THAT REASON. ⚠ THE PARAGRAPH THAT USED TO STAND HERE
+                                // CALLED THAT DIRECTION "NAMED, MEASURED RESIDUE" and
+                                // said DSS "accepted the weaker request silently before
+                                // and still does". Both halves were TRUE of the tree
+                                // they were written against; the second is now false by
+                                // choice, and the silence was the part this project
+                                // names unacceptable.
+                                // ✔MEASURED 2026-09-09, each reference probed SEPARATELY
+                                // on its own TU, rc read DIRECTLY at `-Wall -Wextra` —
+                                // gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and
+                                // aarch64-linux-gnu-gcc 13.3.0 ALL LOWER: `typedef int
+                                // A2 __attribute__((aligned(2)));` gives `_Alignof(A2)`
+                                // 2 (the `== 4` twin FAILS on all four), `sizeof(A2)`
+                                // stays 4, and `struct T { char c; A2 v; }` is sizeof 6
+                                // / align 2 / offsetof(v) 2. It is ABI-VISIBLE and it
+                                // was SILENT: ✔EXECUTED, a DSS-built binary of that
+                                // shape returned 10 where gcc, clang and aarch64-gcc all
+                                // returned 42. gcc documents this asymmetry itself — on
+                                // a TYPEDEF `aligned` may both increase and decrease,
+                                // on a variable or a composite it may only increase.
+                                // ⓘ MSVC abstains on the SURFACE (`__attribute__` is
+                                // C2061) and, through the spelling it implements, does
+                                // NOT lower (`typedef __declspec(align(2)) int A2;`
+                                // keeps `__alignof` 4). Recorded as a measurement and
+                                // NOT read as a fork: MSVC has no
+                                // `__attribute__((aligned))`, and increase-only is a
+                                // documented property of a DIFFERENT attribute. Three
+                                // implementers, unanimous, one working reference ⇒
+                                // required ([[feedback_the_goal_is_to_work_one_working_reference_2026_08_19]]).
+                                // ⛔ THE BOUND: only the TYPE-LEVEL channel lowers. The
+                                // WHOLE-COMPOSITE `aligned` and the per-MEMBER one do
+                                // NOT — ✔MEASURED, `struct __attribute__((aligned(1)))
+                                // S { int a; };` keeps 4 and a member's `aligned(2)`
+                                // keeps offsetof 4, on all four references — so
+                                // `explicitAlign` and `fieldAligns` keep their MAX folds
+                                // and each has its own pin.
+                                // ★★ BOTH REMAINING CONDITIONS STILL EARN THEIR PLACE:
+                                //  • `s.aggregateLayout.has_value()` — the LSP calls
+                                //    `dss::analyze(cu)` with NO layout params, and the
+                                //    old arm's ruling stands untouched: CANNOT-DETERMINE
+                                //    MUST NOT BECOME CANNOT-COMPILE, and it must not
+                                //    become a DIFFERENT TYPE either. Without params
+                                //    there is no natural alignment to compare against,
+                                //    so nothing is minted and the editor sees exactly
+                                //    what it saw before.
+                                //  • `want == lay->align.bytes()` — a request EQUAL to
+                                //    natural is a proven no-op in BOTH fold directions,
+                                //    so minting a skin for it would buy nothing and COST
+                                //    type identity: `typedef u_int64_t T
+                                //    __attribute__((aligned(8)));` (8 == natural 8, a
+                                //    real spelling out of the macOS SDK) would stop
+                                //    being the same interned type as its aliasee for no
+                                //    observable gain.
+                                //    `SemanticAnalyzerC.TypedefSingleDeclaratorIsUnchanged`
+                                //    is the pin that says so, and it caught exactly
+                                //    this in the AFTER gate of the cycle that wrote
+                                //    the line above;
+                                //    `GnuAlignedThreeForms.ARequestEqualToNaturalStill
+                                //    MintsNoSkin` is the pin that says the `<` half
+                                //    moved and the `==` half did not.
                                 if (declTy.valid() && s.aggregateLayout.has_value()) {
                                     auto const lay = computeLayout(
                                         declTy, s.lattice.interner(),
                                         *s.aggregateLayout, s.dataModel);
-                                    if (lay && want > lay->align.bytes()) {
-                                        reportCtx(std::format(
-                                            "__attribute__((aligned({}))) on a typedef "
-                                            "cannot be honored: the alias resolves to "
-                                            "the same type as its aliasee, whose "
-                                            "alignment is {}",
-                                            want, lay->align.bytes()));
+                                    if (!lay || want == lay->align.bytes()) {
+                                        // Nothing to confer; the alias already delivers
+                                        // exactly this alignment (or we cannot say).
+                                    } else {
+                                    TypeId const alignedTy =
+                                        s.lattice.interner().typeAligned(declTy, want);
+                                    if (alignedTy.valid()) {
+                                        // Overwrite BOTH stamps. The symbol's type is
+                                        // what `resolveTypeNodeImpl` hands out for every
+                                        // later spelling of the alias — the single
+                                        // chokepoint every type position routes through —
+                                        // and `nodeToType` is what the HIR lowering reads
+                                        // for this declarator. Leaving either at the
+                                        // unwrapped type would confer the alignment on
+                                        // only half the consumers, which reads as a
+                                        // complete fix and is not one.
+                                        s.symbols.at(sym).type = alignedTy;
+                                        s.nodeToType.set(nameNode, alignedTy);
+                                    }
                                     }
                                 }
                             } else {

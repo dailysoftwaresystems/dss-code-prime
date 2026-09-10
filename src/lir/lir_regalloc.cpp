@@ -68,8 +68,12 @@ struct RegList {
 // a tail entry (e.g. predicates for SVE) trips here and forces an
 // audit of `buildFreeLists`, the bucket layout, and downstream
 // consumers.
-constexpr std::size_t kLirRegClassCount =
-    static_cast<std::size_t>(LirRegClass::Flags) + 1u;
+// ⓘ `kLirRegClassCount` now lives beside the enum it derives from
+// (`lir_reg.hpp`) — this file used to re-derive it, and `lir_rewrite.cpp`
+// spelled it as a bare `5` four times. The literal lock below is unchanged and
+// is the point of the constant: a tail entry added to `LirRegClass` widens
+// every per-class table automatically and trips HERE, forcing an audit of
+// `buildFreeLists`, the bucket layout, and the downstream consumers.
 using FreeListsByClass = std::array<RegList, kLirRegClassCount>;
 static_assert(kLirRegClassCount == 5u,
               "FreeListsByClass size out of sync with LirRegClass enum; "
@@ -88,6 +92,12 @@ buildFreeLists(TargetSchema const&            schema,
                TargetCallingConvention const& cc,
                std::array<std::uint16_t, kLirRegClassCount> const&
                    reloadReserve,
+               // How many registers the reservation ACTUALLY held back, per
+               // class. An out-parameter rather than a derived quantity
+               // because it is only knowable here: it is `reloadReserve[c]`
+               // capped by the class's non-argument supply, and the whole
+               // point of publishing it is that the cap used to be invisible.
+               std::array<std::uint16_t, kLirRegClassCount>& outAchieved,
                // D-CSUBSET-VLA (C1b): the frame-pointer ordinal to RESERVE (hold out
                // of every allocatable pool) for a function that contains a VLA — it
                // becomes the fixed-frame base. std::nullopt for a non-VLA function
@@ -177,12 +187,65 @@ buildFreeLists(TargetSchema const&            schema,
     // (argGprs/argFprs/indirectResultRegister); no register names, no
     // arch identity. x86_64 SysV non-arg caller-saved GPRs = {rax, r10,
     // r11} = 3 ≥ K (K ≤ the max non-call same-class virtual reg
-    // operand+result count over the shipped opcodes). If a class has
-    // fewer than K non-arg caller-saved registers (ms_x64 FPR has only
-    // xmm4/xmm5 = 2), reserve what EXISTS — under-reserving only weakens
-    // the scratch GUARANTEE (a too-tight function then fails LOUD at the
-    // rewriter backstop, never silently), whereas reserving an arg
-    // register would silently re-open the clobber (see the loop below).
+    // operand+result count over the shipped opcodes).
+    //
+    // ★★★ WHEN THE CALLER-SAVED SUPPLY IS SHORT, THE SHORTFALL COMES OUT OF
+    // THE CALLEE-SAVED LIST — see
+    // D-AS-REGALLOC-SCRATCH-POOL-EXHAUSTED-BY-A-LARGE-FUNCTION-IN-RELEASE.
+    // This paragraph used to say the opposite: *"If a
+    // class has fewer than K non-arg caller-saved registers (ms_x64 FPR has
+    // only xmm4/xmm5 = 2), reserve what EXISTS — under-reserving only weakens
+    // the scratch GUARANTEE"*, and closed with the claim that the case was
+    // *"not reachable on the shipped targets, where K ≤ 3 and every class has
+    // ≥2 non-arg caller-saved registers"*. ⚠ THOSE TWO SENTENCES ARE THE
+    // DEFECT, AND THE SECOND REFUTES THE FIRST IF YOU READ THEM TOGETHER: K ≤ 3
+    // and supply ≥ 2 does not give supply ≥ K. ms_x64's FPR class is exactly
+    // the gap — argFprs = xmm0..xmm3 and callerSaved's FPR half is xmm0..xmm5,
+    // so its non-arg caller-saved supply is {xmm4, xmm5} = 2 against a measured
+    // demand of 3 — and it is the ONLY (class, convention) pair on the four
+    // shipped conventions where supply < demand, which is why the failure
+    // looked like a property of one object format.
+    //
+    // ⚠⚠ "UNDER-RESERVING ONLY WEAKENS THE GUARANTEE" WAS THE PART THAT
+    // MISLED. It is true that the shortfall cannot miscompile — the rewriter
+    // still fails loud. What it does is make the guarantee CONDITIONAL on
+    // something the reservation cannot see: the pool the rewriter actually gets
+    // is the reserved registers PLUS whatever the allocator happened not to
+    // assign, so a short reservation is invisible until a function's pressure
+    // consumes every other register of the class. The refusal then names
+    // register pressure at the instruction that ran out, and the reader has no
+    // path back to a reservation that was one register short at function entry.
+    //
+    // ★ WHY CALLEE-SAVED IS SAFE HERE, AND IT IS NOT A NEW RISK BEING TAKEN.
+    // `pickScratchRegs` (lir_rewrite.cpp) ALREADY harvests every unassigned
+    // ALLOCATABLE register as scratch, callee-saved included — it filters on
+    // the cc lists and on "assigned to a vreg", never on the caller/callee
+    // partition. So a callee-saved spill scratch is the routine case, not the
+    // exception, and what makes it correct is that `collectUsedCalleeSaved`
+    // (lir_callconv.cpp) scans the POST-REWRITE physical instruction stream:
+    // any callee-saved register a reload actually touches is seen there and
+    // saved/restored by the prologue/epilogue. The rule this loop keeps is the
+    // one that is genuinely load-bearing — NEVER an argument register, in
+    // either partition, because an arg register holds an incoming parameter
+    // from entry until its `arg` op materializes it and a reload staged through
+    // it clobbers the parameter before it is read — a SILENT miscompile, and
+    // the one D-AS-REGALLOC-ARG-REGISTER-OCCUPIED closed.
+    //
+    // ⓘ THE COST IS PAID ONLY WHERE THE SHORTFALL IS. Caller-saved is still
+    // drawn first and exhausted before a callee-saved register is touched, so
+    // every (class, convention) pair with enough caller-saved supply — which is
+    // all of them but ms_x64's FPR — builds a byte-identical free list. And a
+    // reserved register that no reload ever uses is simply never written, so it
+    // never enters `collectUsedCalleeSaved` and costs no prologue slot; what it
+    // does cost is one fewer home for a cross-call range of that class.
+    //
+    // ⚠ IF EVEN CALLER-SAVED ∪ CALLEE-SAVED CANNOT REACH K the reservation is
+    // still short, and that stays a fail-loud-at-the-rewriter case rather than
+    // a refusal here: a short reservation does not mean the function will fail,
+    // only that it is no longer guaranteed not to. `reloadReserveAchieved` (see
+    // below) publishes what was reached so the rewriter's diagnostic can name
+    // the shortfall instead of blaming pressure, and so a pin can assert
+    // `achieved >= demand` without pinning any function size.
     std::unordered_set<std::uint16_t> argOrdinals;
     auto absorbArgOrds = [&](std::vector<std::string> const& names) {
         for (auto const& n : names)
@@ -194,38 +257,38 @@ buildFreeLists(TargetSchema const&            schema,
     if (cc.indirectResultRegister.has_value())
         argOrdinals.insert(cc.indirectResultRegister->ordinal);
 
+    // Walk one partition from the END, moving up to `want` NON-ARG registers
+    // out of that free list. Arg/sret ordinals are left in place (still
+    // allocatable) and skipped over — NEVER reserved, in EITHER partition:
+    // they hold incoming params at entry and reserving one re-opens the silent
+    // clobber D-AS-REGALLOC-ARG-REGISTER-OCCUPIED closed. Returns how many it
+    // actually took, which is `want` unless the partition ran out of non-arg
+    // registers.
+    auto const drawReserve = [&argOrdinals](std::vector<std::uint16_t>& from,
+                                            std::size_t want) -> std::size_t {
+        std::size_t taken = 0;
+        std::size_t scan  = from.size();
+        while (taken < want && scan > 0) {
+            --scan;
+            if (argOrdinals.contains(from[scan])) continue;
+            from.erase(from.begin() + static_cast<std::ptrdiff_t>(scan));
+            ++taken;
+        }
+        return taken;
+    };
+
     for (std::size_t c = 0; c < out.size(); ++c) {
         std::size_t const k = static_cast<std::size_t>(reloadReserve[c]);
+        outAchieved[c] = 0;
         if (k == 0) continue;
-        auto& caller = out[c].callerSaved;
-        // Walk from the END, moving up to K reserved NON-ARG registers
-        // out of the free list. Arg/sret ordinals are left in place
-        // (still allocatable) and skipped over — NEVER reserved (they
-        // hold incoming params at entry; reserving one re-opens the
-        // silent clobber). If a class has FEWER than K non-arg caller-
-        // saved registers (e.g. ms_x64 FPR: xmm4/xmm5 are the only non-
-        // arg caller-saved of xmm0..xmm5), reserve what EXISTS and stop.
-        // Under-reserving is SAFE: the reservation only GUARANTEES scratch
-        // availability; a function whose per-instruction reload demand
-        // exceeds the reserved-plus-otherwise-free scratch still fails
-        // LOUD at the rewriter's L_VirtualRegInPostRegalloc backstop
-        // (never a silent miscompile). Callee-saved registers are NOT
-        // drawn for the reservation — pickScratchRegs uses reserved regs
-        // raw (no prologue/epilogue save), so a callee-saved scratch
-        // would clobber the caller's value; caller-saved-only keeps the
-        // transient-reload contract. (Widening the non-call reload
-        // demand past the non-arg caller-saved supply is the deferred
-        // wide-operand concern D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT's
-        // sibling; not reachable on the shipped targets, where K ≤ 3 and
-        // every class has ≥2 non-arg caller-saved registers.)
-        std::size_t reserved = 0;
-        std::size_t scan = caller.size();
-        while (reserved < k && scan > 0) {
-            --scan;
-            if (argOrdinals.contains(caller[scan])) continue;  // never reserve an arg reg
-            caller.erase(caller.begin() + static_cast<std::ptrdiff_t>(scan));
-            ++reserved;
-        }
+        // CALLER-SAVED FIRST — a transient reload through one needs no
+        // prologue slot at all, so a class with enough of them builds exactly
+        // the free list it always did. Only the SHORTFALL reaches callee-saved,
+        // which is what makes `achieved == k` reachable on ms_x64's FPR class
+        // (supply 2, demand 3) without moving any other target's allocation.
+        std::size_t taken = drawReserve(out[c].callerSaved, k);
+        if (taken < k) taken += drawReserve(out[c].calleeSaved, k - taken);
+        outAchieved[c] = static_cast<std::uint16_t>(taken);
     }
 
     return out;
@@ -1826,9 +1889,16 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
     // (pickScratchRegs) also holds the frame pointer out — otherwise it would
     // harvest the reserved-but-unassigned register as a spill scratch.
     out.reservedFramePointer = reservedFramePointer;
+    // D-AS-REGALLOC-SCRATCH-POOL-EXHAUSTED-BY-A-LARGE-FUNCTION-IN-RELEASE: the
+    // demand and what the reservation reached are BOTH published on the
+    // allocation. The rewriter's exhaustion diagnostic reads them so it can say
+    // whether the pool was short because the reservation could not be met or
+    // because pressure consumed everything else — two different defects that
+    // present identically at the instruction that runs out.
+    out.reloadReserveDemand = computeReloadReserve(lir, schema, flow);
     FreeListsByClass free =
-        buildFreeLists(schema, *cc, computeReloadReserve(lir, schema, flow),
-                       reservedFramePointer);
+        buildFreeLists(schema, *cc, out.reloadReserveDemand,
+                       out.reloadReserveAchieved, reservedFramePointer);
     std::vector<std::uint32_t> const callPositions =
         collectCallPositions(lir, schema, flow);
     // Cycle 10q closure of 10p substrate: per-opcode implicit

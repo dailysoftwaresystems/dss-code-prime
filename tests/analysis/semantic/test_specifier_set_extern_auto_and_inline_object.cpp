@@ -367,9 +367,22 @@ TEST(SpecifierSetExternAutoAndInlineObject, ExternAutoKeepsTheInferenceRowsOwnGa
                             DiagnosticCode::S_AutoRequiresPlainIdentifier));
     }
     {
-        auto model = analyzeShipped("c", {"extern auto a = 1, b = 2;\n"});
+        // ★★ P66 — THIS ARM'S CONSTRAINT WAS RETIRED AND THE ARM IS RE-AIMED
+        // RATHER THAN DROPPED, because what it exists to prove (the inference
+        // row's own gates keep firing BY NAME through the `extern` specifier)
+        // is still exactly right. It used to pin `S_AutoRequiresSingleDeclarator`
+        // on `extern auto a = 1, b = 2;`. ✔MEASURED 2026-09-09, each reference
+        // probed SEPARATELY: clang 18.1.3 `-std=c23` ACCEPTS that (rc 0; its
+        // only remark is the orthogonal `-Wextern-initializer`), gcc 13.3.0
+        // refuses, MSVC abstains — and C23 6.7.10 carries no declarator-count
+        // constraint at all (J.2(78) UB, J.5.12 common extension, fn.164
+        // ISO/IEC 14882 semantics). So the count stopped being a gate; what is
+        // still a gate is that the declarators AGREE, and clang refuses the
+        // disagreeing form (rc 1, "'auto' deduced as 'int' … and … 'double'").
+        // Same shape, same claim, a constraint that exists.
+        auto model = analyzeShipped("c", {"extern auto a = 1, b = 2.5;\n"});
         EXPECT_TRUE(hasCode(model.diagnostics(),
-                            DiagnosticCode::S_AutoRequiresSingleDeclarator));
+                            DiagnosticCode::S_AutoDeclaratorsInferDifferentTypes));
     }
 }
 

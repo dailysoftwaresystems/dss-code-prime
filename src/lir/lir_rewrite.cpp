@@ -51,7 +51,7 @@ using dss::report;
 // class" — the rewriter then emits L_VirtualRegInPostRegalloc and
 // bails.
 struct ScratchPerClass {
-    std::array<std::vector<LirReg>, 5> pool{};
+    std::array<std::vector<LirReg>, kLirRegClassCount> pool{};
 };
 
 [[nodiscard]] bool
@@ -110,7 +110,7 @@ pickScratchRegs(TargetSchema const& schema, LirFuncAllocation const& alloc,
     // per-class vectors of global ordinals for the same reason. The only
     // bound is the class index (kLirRegClassCount == 5), which is a true
     // substrate invariant, not a per-target register-count limit.
-    std::array<std::unordered_set<std::uint16_t>, 5> usedOrdinals{};
+    std::array<std::unordered_set<std::uint16_t>, kLirRegClassCount> usedOrdinals{};
     for (auto const& a : alloc.assignments) {
         if (a.vreg.id == 0 || a.isSpilled()) continue;
         LirReg const phys = a.physReg();
@@ -190,7 +190,7 @@ struct ResolvedReg {
 [[nodiscard]] ResolvedReg
 resolveReg(LirReg r, LirFuncAllocation const& alloc,
            ScratchPerClass& scratch,
-           std::array<std::size_t, 5>& cursor,
+           std::array<std::size_t, kLirRegClassCount>& cursor,
            std::span<std::uint16_t const> forbiddenOrdinals = {}) {
     if (!r.valid() || r.isPhysical != 0) return {r, std::nullopt};
     auto const* a = alloc.forVReg(r.id);
@@ -426,6 +426,37 @@ rewriteOneFunc(Lir const&               src,
     }
 
     bool classExhausted = false;
+    // ── WHAT THE EXHAUSTION DIAGNOSTIC IS ALLOWED TO SAY ────────────────────
+    //
+    // ★★★ D-AS-REGALLOC-SCRATCH-POOL-EXHAUSTED-BY-A-LARGE-FUNCTION-IN-RELEASE.
+    // The report used to name the FUNCTION and nothing else, and its wording —
+    // *"register pressure leaves no scratch register for a spilled vreg"* —
+    // asserted a cause it had no way to know. Two different defects reach this
+    // line: a reservation that was already short of this function's demand at
+    // allocation time, and a reservation that was met while pressure consumed
+    // every other register of the class. ⚠ THEY ARE INDISTINGUISHABLE AT THE
+    // INSTRUCTION THAT RUNS OUT, and the first one gets worse as conventions
+    // vary while the second gets worse as functions grow — opposite remedies.
+    // ✔The row this anchor names was opened believing the second and the cause
+    // was the first, which is what these four fields exist to stop repeating.
+    // First exhaustion only: the rest of the function is walked so the rebuild
+    // stays well-formed, but one report per function is what the reader needs.
+    std::optional<LirRegClass> exhaustedClass;
+    std::uint16_t              exhaustedOpcode   = 0;
+    std::size_t                exhaustedPoolSize = 0;
+    std::size_t                exhaustedTaken    = 0;
+    auto const noteExhaustion = [&](LirReg r, std::uint16_t op,
+                                    ScratchPerClass const& pool,
+                                    std::array<std::size_t, kLirRegClassCount>
+                                        const& cur) {
+        classExhausted = true;
+        if (exhaustedClass.has_value()) return;
+        auto const c = static_cast<std::size_t>(r.regClass());
+        exhaustedClass    = r.regClass();
+        exhaustedOpcode   = op;
+        exhaustedPoolSize = c < pool.pool.size() ? pool.pool[c].size() : 0u;
+        exhaustedTaken    = c < cur.size() ? cur[c] : 0u;
+    };
 
     // D-AS-REWRITE-SPILL-SCRATCH-INCOMING-ARG-CLOBBER: the incoming arg-register
     // ordinals that still hold a live parameter. A spill-reload SCRATCH must not
@@ -503,7 +534,7 @@ rewriteOneFunc(Lir const&               src,
             // spilled operands of the same class would otherwise share
             // ONE scratch — earlier loads' values would be lost to
             // later loads' overwrites.
-            std::array<std::size_t, 5> cursor{};
+            std::array<std::size_t, kLirRegClassCount> cursor{};
 
             // Hoisted above the operand loop (FC4 c2): the loop needs
             // `info->isCall` to apply the spilled-callee forbidden-
@@ -621,7 +652,7 @@ rewriteOneFunc(Lir const&               src,
                     auto const rr = resolveReg(o.reg, alloc, scratch,
                                                cursor, forbidden);
                     if (!rr.phys.valid()) {
-                        classExhausted = true;
+                        noteExhaustion(o.reg, op, scratch, cursor);
                         newOps.push_back(o);
                         continue;
                     }
@@ -661,7 +692,7 @@ rewriteOneFunc(Lir const&               src,
                 auto const rr = resolveReg(srcResult, alloc, scratch, cursor,
                                            resultForbidden);
                 if (!rr.phys.valid()) {
-                    classExhausted = true;
+                    noteExhaustion(srcResult, op, scratch, cursor);
                 } else {
                     newResult = rr.phys;
                     pendingStore = rr.spillSlot;
@@ -809,12 +840,40 @@ rewriteOneFunc(Lir const&               src,
     }
 
     if (classExhausted) {
+        auto const cls = exhaustedClass.value_or(LirRegClass::None);
+        auto const ci  = static_cast<std::size_t>(cls);
+        auto const* oi = schema.opcodeInfo(exhaustedOpcode);
+        std::string_view const mnem =
+            oi != nullptr ? std::string_view{oi->mnemonic}
+                          : std::string_view{"<unknown>"};
+        std::uint16_t const demand =
+            ci < alloc.reloadReserveDemand.size()
+                ? alloc.reloadReserveDemand[ci] : 0u;
+        std::uint16_t const achieved =
+            ci < alloc.reloadReserveAchieved.size()
+                ? alloc.reloadReserveAchieved[ci] : 0u;
+        // The two halves of the sentence are the two candidate causes, and the
+        // reader is told which one the numbers support rather than being handed
+        // "register pressure" as an assertion. `achieved < demand` means the
+        // reservation was already short at function entry, whatever this
+        // function's pressure turned out to be.
+        std::string_view const why =
+            achieved < demand
+                ? "the reload-scratch RESERVATION was short before this "
+                  "function was allocated"
+                : "the reservation was met, so register pressure consumed "
+                  "every other register of this class";
         report(reporter, DiagnosticCode::L_VirtualRegInPostRegalloc,
                DiagnosticSeverity::Error,
                std::format("rewriteOneFunc: function {} exhausted the "
-                           "per-class scratch pool — register pressure "
-                           "leaves no scratch register for a spilled vreg",
-                           fn.v));
+                           "per-class scratch pool for register class '{}' at "
+                           "opcode '{}' — the pool held {} register(s) and this "
+                           "instruction had already taken {}; the allocator "
+                           "reserved {} of the {} this function's peak "
+                           "single-instruction reload demand asks for, so {}",
+                           fn.v, lirRegClassName(cls), mnem,
+                           exhaustedPoolSize, exhaustedTaken,
+                           achieved, demand, why));
         return false;
     }
     return true;
