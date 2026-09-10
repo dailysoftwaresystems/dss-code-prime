@@ -801,6 +801,19 @@ pin_confound_supply() { # pin_confound_supply <driver>
   LEG_CONFOUND_GATING[elf64-arm64]="probed"
   LEG_CONFOUND_GATING[unprobedleg]="unprobed"
   LEG_CONFOUNDS[unprobedleg]="'^busy2-'"
+  # ★ THE SECOND GATING STAMP, which the supply ALSO refuses to proceed without.
+  # A row declaring `requiresRunDirectory` is honoured only where THIS RUN measured
+  # the named precondition on THIS LEG'S own run directory, and a PLAN can never
+  # carry that measurement — it is resolved before any run directory exists.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  LEG_RUN_DIR_GATING=()
+  LEG_RUN_DIR_GATING[elf64-x86_64]="not-required"
+  LEG_RUN_DIR_GATING[pe64-x86_64]="not-required"
+  LEG_RUN_DIR_GATING[elf64-arm64]="not-required"
+  LEG_RUN_DIR_GATING[unprobedleg]="not-required"
+  LEG_RUN_DIR_GATING[uncorroboratedleg]="unmeasured"
+  LEG_CONFOUND_GATING[uncorroboratedleg]="probed"
+  LEG_CONFOUNDS[uncorroboratedleg]="'^vtabH-3\\.1$'"
   load_fns "$drv" leg_confound_patterns || return 0
   local -a got=()
   eval "got=($(leg_confound_patterns elf64-x86_64))"
@@ -834,6 +847,19 @@ pin_confound_supply() { # pin_confound_supply <driver>
   ck "an UNPROBED plan REFUSES rather than serving its ungated list" "97" "$rc"
   ck_has "...naming the gating it got" "$out" "confoundGating='unprobed'"
   ck_has "...and how to resolve a measured plan" "$out" "--environment-probes skip"
+  # ★★ AND AN UNCORROBORATED RUN DIRECTORY, the second gate. Silent in the SAME
+  # direction and one step worse: skipping it would EXCUSE `vtabH-3.1` on a host
+  # whose run drive root is clean, i.e. launder a genuine dss regression into
+  # "expected" — and an excused failure is indistinguishable from an absent one.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  out="$(leg_confound_patterns uncorroboratedleg 2>&1)"; rc=$?
+  ck "an UNMEASURED run directory REFUSES rather than serving its uncorroborated list" "97" "$rc"
+  ck_has "...naming the gating it actually got" "$out" "runDirectoryGating='unmeasured'"
+  ck_has "...and the call that would measure it" "$out" "--corroborate-run-dir"
+  # ★ AND THE ALLOWED VALUE REALLY PASSES — a refusal that refused everything
+  # would satisfy the three arms above while breaking every run.
+  eval "got=($(leg_confound_patterns elf64-x86_64))"
+  ck_has "a 'not-required' run-directory gating is ACCEPTED" "${got[*]}" "^walsetlk-"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -900,7 +926,7 @@ pin_confound_supply_stops_the_driver() { # pin_confound_supply_stops_the_driver 
   # the shipped driver's own text.
   {
     printf '%s\n' 'set -Eeuo pipefail'
-    printf '%s\n' 'declare -A LEG_CONFOUNDS=() LEG_CONFOUND_GATING=() LEG_CONFOUND_DECLARED=()'
+    printf '%s\n' 'declare -A LEG_CONFOUNDS=() LEG_CONFOUND_GATING=() LEG_CONFOUND_DECLARED=() LEG_RUN_DIR_GATING=()'
     printf '%s\n' 'DSS_CONFOUNDS=""'
     printf '%s\n' 'die() { printf "DIE: %s\n" "$*" >&2; exit 1; }'
     printf '%s\n' 'info() { :; }'
@@ -908,6 +934,7 @@ pin_confound_supply_stops_the_driver() { # pin_confound_supply_stops_the_driver 
     printf '%s\n' 'leg="${1:?leg}"'
     printf '%s\n' 'LEG_CONFOUNDS[$leg]="'"'"'^busy2-'"'"'"'
     printf '%s\n' 'LEG_CONFOUND_GATING[$leg]="${2:?gating}"'
+    printf '%s\n' 'LEG_RUN_DIR_GATING[$leg]="${3:?run-dir-gating}"'
     printf '%s\n' 'LEG_CONFOUND_DECLARED[$leg]=1'
     printf '%s\n' "$callsite"
     printf '%s\n' 'printf "REACHED-NEXT-STATEMENT size=%d\n" "${#CONFOUND_PATTERNS[@]}"'
@@ -923,7 +950,7 @@ pin_confound_supply_stops_the_driver() { # pin_confound_supply_stops_the_driver 
   # TO START on that host because of it, so the whole sqlite corpus was unreachable
   # on macOS. ★ The re-exec above already found the right shell; `$BASH` is that
   # shell's own path, so the child cannot disagree with the parent about what bash is.
-  out="$("$BASH" "$script" someleg unprobed 2>&1)"; rc=$?
+  out="$("$BASH" "$script" someleg unprobed not-required 2>&1)"; rc=$?
   ck "an UNPROBED plan STOPS THE DRIVER at the real call site (rc)" "1" "$rc"
   ck_has "...having said why" "$out" "confoundGating='unprobed'"
   # ⚠ THROUGH `ck`, not a bare `bad`: `bad` bumps the GLOBAL failure count, which
@@ -933,9 +960,20 @@ pin_confound_supply_stops_the_driver() { # pin_confound_supply_stops_the_driver 
      "$(printf '%s' "$out" | grep -q 'REACHED-NEXT-STATEMENT' && echo yes || echo no)"
   # ── THE NEGATIVE CONTROL: the same script must reach the marker on a
   #    `probed` plan, or the arm above would pass for the wrong reason ──────
-  out="$("$BASH" "$script" someleg probed 2>&1)"; rc=$?
+  out="$("$BASH" "$script" someleg probed not-required 2>&1)"; rc=$?
   ck "a PROBED plan runs on through the call site (rc)" "0" "$rc"
   ck_has "...and reaches the next statement with the leg's pattern" "$out" "REACHED-NEXT-STATEMENT size=1"
+  # ★★ THE SECOND GATE, AT THE SAME REAL CALL SITE. A refusal that only killed a
+  # SUBSHELL would let the driver run the whole corpus on an uncorroborated list
+  # — which is exactly what D-HARNESS-CONFOUND-SUPPLY-REFUSAL-DIES-IN-A-SUBSHELL
+  # measured for the first gate. This is the only place that can prove the process
+  # actually stops, because it spawns a child.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  out="$("$BASH" "$script" someleg probed unmeasured 2>&1)"; rc=$?
+  ck "an UNMEASURED run directory STOPS THE DRIVER at the real call site (rc)" "1" "$rc"
+  ck_has "...having said why" "$out" "runDirectoryGating='unmeasured'"
+  ck "...and the statement AFTER the call site never ran" "no" \
+     "$(printf '%s' "$out" | grep -q 'REACHED-NEXT-STATEMENT' && echo yes || echo no)"
   rm -f "$script"
 }
 

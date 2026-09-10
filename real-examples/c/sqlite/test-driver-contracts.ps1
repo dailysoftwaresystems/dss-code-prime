@@ -537,8 +537,15 @@ function Pin-ConfoundSupply($driver) {
   # the named probe found its defect on THIS machine. 'probed' by default so
   # every assertion below keeps asking what it asked; the refusal gets its own
   # case. [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
-  $mk = { param($label, $c, $g = 'probed') [pscustomobject]@{ label = $label;
-            confounds = $c; confoundGating = $g } }
+  # + `runDirectoryGating`, the SECOND gating, which the supply also refuses to
+  # proceed without: a row declaring `requiresRunDirectory` is honoured only where
+  # THIS RUN measured the named precondition on THIS LEG'S own run directory.
+  # 'not-required' by default so every assertion below keeps asking what it asked;
+  # the refusal gets its own case.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  $mk = { param($label, $c, $g = 'probed', $rdg = 'not-required')
+          [pscustomobject]@{ label = $label; confounds = $c;
+                             confoundGating = $g; runDirectoryGating = $rdg } }
   Ck 'a leg gets ITS OWN declared patterns' '^walsetlk- ^busy2-' `
      ((@(Get-LegConfounds (& $mk 'elf64-x86_64' @('^walsetlk-','^busy2-')))) -join ' ')
   # THE ONE THAT WOULD HAVE CAUGHT IT: same declaration, DIFFERENT label. A
@@ -565,6 +572,21 @@ function Pin-ConfoundSupply($driver) {
   catch { $ungated = "$($_.Exception.Message)" }
   Ck 'an UNPROBED plan REFUSES rather than serving its ungated list' $true ($ungated -match "confoundGating='unprobed'")
   CkHas '...and says how to resolve a measured plan' "$ungated" '--environment-probes skip'
+  # ★★ AND AN UNCORROBORATED RUN DIRECTORY, the second gate, silent in the SAME
+  # direction and one step worse: skipping it would EXCUSE `vtabH-3.1` on a host
+  # whose run drive root is clean, i.e. launder a genuine dss regression into
+  # "expected" — and an excused failure is indistinguishable from an absent one
+  # in the leg verdict.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  $uncorrob = ''
+  try { [void](Get-LegConfounds (& $mk 'pe64-x86_64' @('^vtabH-3\.1$') 'probed' 'unmeasured')) }
+  catch { $uncorrob = "$($_.Exception.Message)" }
+  Ck 'an UNMEASURED run directory REFUSES rather than serving its uncorroborated list' $true ($uncorrob -match "runDirectoryGating='unmeasured'")
+  CkHas '...and names the call that would measure it' "$uncorrob" '--corroborate-run-dir'
+  # ★ AND THE ALLOWED VALUE REALLY PASSES — a refusal that refused everything
+  # would satisfy the two arms above while breaking every run.
+  Ck "a 'measured' run-directory gating is ACCEPTED" '^vtabH-3\.1$' `
+     ((@(Get-LegConfounds (& $mk 'pe64-x86_64' @('^vtabH-3\.1$') 'probed' 'measured'))) -join ' ')
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -601,21 +623,21 @@ function Pin-ConfoundSupplyStopsTheDriver($driver) {
   CkHas 'the extracted call site is the real supply call' $callsite[0] 'Get-LegConfounds $leg'
   $script = Join-Path ([IO.Path]::GetTempPath()) ("dss-confound-callsite-" + [Guid]::NewGuid().ToString('N') + ".ps1")
   $body = @(
-    'param($Gating)',
+    'param($Gating, $RunDirGating)',
     "`$ErrorActionPreference = 'Stop'",
     'function Info($m) { }',
     'function Step($m) { }',
     'function Die($m) { Write-Host "DIE: $m"; exit 1 }',
     '$ConfoundsOverride = $null',
     $region,
-    '$leg = [pscustomobject]@{ label = "someleg"; confounds = @("^busy2-"); confoundGating = $Gating; confoundRows = @(1) }',
+    '$leg = [pscustomobject]@{ label = "someleg"; confounds = @("^busy2-"); confoundGating = $Gating; runDirectoryGating = $RunDirGating; confoundRows = @(1) }',
     '$LegTag = "someleg"',
     $callsite[0],
     'Write-Host "REACHED-NEXT-STATEMENT size=$($Confounds.Count)"'
   ) -join "`n"
   Set-Content -LiteralPath $script -Value $body -Encoding utf8
   # ── THE REFUSAL ARM ──────────────────────────────────────────────────────
-  $out = & $pwshCmd.Source -NoProfile -NonInteractive -File $script 'unprobed' 2>&1 | Out-String
+  $out = & $pwshCmd.Source -NoProfile -NonInteractive -File $script 'unprobed' 'not-required' 2>&1 | Out-String
   $rc = $LASTEXITCODE
   Ck 'an UNPROBED plan STOPS THE DRIVER at the real call site (rc)' 1 $rc
   CkHas '...having said why' $out "confoundGating='unprobed'"
@@ -623,10 +645,21 @@ function Pin-ConfoundSupplyStopsTheDriver($driver) {
      $(if ($out -match 'REACHED-NEXT-STATEMENT') { 'yes' } else { 'no' })
   # ── THE NEGATIVE CONTROL: without it the arm above could pass for any
   #    reason at all, including a script that never ran ──────────────────────
-  $out = & $pwshCmd.Source -NoProfile -NonInteractive -File $script 'probed' 2>&1 | Out-String
+  $out = & $pwshCmd.Source -NoProfile -NonInteractive -File $script 'probed' 'not-required' 2>&1 | Out-String
   $rc = $LASTEXITCODE
   Ck 'a PROBED plan runs on through the call site (rc)' 0 $rc
   CkHas '...and reaches the next statement with the leg pattern' $out 'REACHED-NEXT-STATEMENT size=1'
+  # ★★ THE SECOND GATE, AT THE SAME REAL CALL SITE. A refusal that only THREW
+  # would let the driver run the whole corpus on an uncorroborated list; this is
+  # the one place that can prove the process actually stops, because it spawns a
+  # child.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  $out = & $pwshCmd.Source -NoProfile -NonInteractive -File $script 'probed' 'unmeasured' 2>&1 | Out-String
+  $rc = $LASTEXITCODE
+  Ck 'an UNMEASURED run directory STOPS THE DRIVER at the real call site (rc)' 1 $rc
+  CkHas '...having said why' $out "runDirectoryGating='unmeasured'"
+  Ck '...and the statement AFTER the call site never ran' 'no' `
+     $(if ($out -match 'REACHED-NEXT-STATEMENT') { 'yes' } else { 'no' })
   Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue
 }
 
