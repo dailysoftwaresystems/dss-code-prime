@@ -4049,9 +4049,18 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // format, so it varies by nothing a target or format could decide. It is also
     // the FIRST row of the `counter` kind — the only STATEFUL one — which is why
     // it could not be expressed as a `constant` row.
-    // 20 un-gated, 13 pe-gated, 3 macho-gated = 36.
-    EXPECT_EQ(pms.size(), 36u)
-        << "c declares 20 un-gated + 13 pe-gated + 3 macho-gated predefined macros";
+    // [[D-C-HAS-EXTENSION-CLAIMS-C-ATOMIC-WHILE-THE-GNU-ATOMIC-BUILTINS-DO-NOT-EXIST]]
+    // (P66): +6 UN-GATED rows, `__ATOMIC_RELAXED` .. `__ATOMIC_SEQ_CST`. They are
+    // the operand vocabulary of the GNU `__atomic_*` value-form builtins, and they
+    // are un-gated for the same reason `__GNUC__` is: the numbering is a property
+    // of the LANGUAGE this compiler implements, not of the CPU or the object
+    // format. ✔MEASURED 2026-09-09, gcc 13.3.0 and clang 18.1.3 probed separately:
+    // relaxed=0, consume=1, acquire=2, release=3, acq_rel=4, seq_cst=5 on BOTH,
+    // identical to C11's `memory_order_*`, so the two spellings share ONE
+    // numbering rather than needing a translation.
+    // 26 un-gated, 13 pe-gated, 3 macho-gated = 42.
+    EXPECT_EQ(pms.size(), 42u)
+        << "c declares 26 un-gated + 13 pe-gated + 3 macho-gated predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     std::vector<std::string> machoGatedNames;
@@ -4088,7 +4097,7 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
            "dropping either of the first two makes every `#ifdef __APPLE__` in portable C "
            "take the wrong branch, and dropping __APPLE_CC__ re-closes the "
            "TargetConditionals.h conjunction that gates the whole Darwin ladder";
-    EXPECT_EQ(ungated, 20u)
+    EXPECT_EQ(ungated, 26u)
         << "__COUNTER__ (D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED, the one `counter` "
            "kind) + the 7 C 6.10.8 macros + __BITINT_MAXWIDTH__ (_BitInt C1) + the 3 C23 "
            "__STDC_EMBED_* trichotomy macros (FC17.9(h), D-PP-EMBED) + the 5 TF-C83 "
@@ -4096,7 +4105,12 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
            "__GNUC_PATCHLEVEL__, __clang__) + the 3 TF-C115 __ORDER_* byte-order "
            "vocabulary rows (D-PP-ENDIANNESS-PREDEFINES — measured identical on "
            "every triple INCLUDING the big-endian control, so they are names "
-           "rather than a per-CPU fact and belong here rather than on a target) "
+           "rather than a per-CPU fact and belong here rather than on a target) + "
+           "the 6 __ATOMIC_RELAXED..__ATOMIC_SEQ_CST memory-order constants "
+           "([[D-C-HAS-EXTENSION-CLAIMS-C-ATOMIC-WHILE-THE-GNU-ATOMIC-BUILTINS-DO-NOT-EXIST]], "
+           "P66 — the operand vocabulary of the GNU `__atomic_*` value-form "
+           "builtins, un-gated because the 0..5 numbering is a property of the "
+           "LANGUAGE and not of any CPU or object format) "
            "are un-gated (every format); "
            "__STDC_NO_VLA__ (D-CSUBSET-VLA C1b) + __STDC_NO_THREADS__ (threads.h "
            "complete on all legs) are both REMOVED";

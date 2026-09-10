@@ -28,7 +28,20 @@ genuinely declaration-driven rather than "worked because the host happened to ma
   corpus run would validate a compiler that is not the branch under test, and the results
   section would print that commit as if it were. Set `SRC_DIR=<checkout>` explicitly.
 - **Remote runs must survive the session close**: `setsid nohup … < /dev/null &`, then
-  **verify with `pgrep`**. A launch line that printed is not a process that is running.
+  **verify**. A launch line that printed is not a process that is running.
+  ⚠⚠ **`setsid` DOES NOT EXIST ON macOS** — it is util-linux, not BSD. ✔MEASURED 2026-09-09: this
+  exact prescription died with `bash: line 1: setsid: command not found` on the darwin carriage
+  while the same line worked on the arm64 VPS. ★ It is the `pgrep -c` trap below wearing the other
+  face, in the same paragraph that warns about it: **an idiom this document RECOMMENDS is itself
+  Linux-only.** On macOS use `nohup … < /dev/null > <log> 2>&1 &` (launching from a
+  non-interactive ssh command there is already outside the caller's job table), or `caffeinate -i`
+  if the box may idle-sleep mid-run.
+  ⚠ **AND VERIFY BEHAVIOURALLY, NOT BY ARGV.** ✔MEASURED the same day: a `ps ax -o command |
+  grep -c '[b]uild-and-test.sh'` probe reported **`alive: 2` when the `cd` had failed and NOTHING
+  had launched** — because it matches the ssh command SHELL, whose own argv carries the marker. The
+  bracket keeps grep from matching itself and does nothing about its parent. ⇒ **Ask whether the LOG
+  GREW between two samples.** A process that is running writes; one that never started does not,
+  and no argv can fake it.
   ⚠ **`pgrep -c` DOES NOT EXIST ON macOS, and the failure is silent-by-idiom.** BSD `pgrep`
   has no `-c`; it exits 2 with a usage error, which the customary `|| echo 0` then converts
   into a confident **`alive: 0`**. ✔MEASURED 2026-08-07: this reported a healthy multi-hour

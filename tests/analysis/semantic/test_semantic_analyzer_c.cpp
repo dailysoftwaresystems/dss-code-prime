@@ -80,16 +80,29 @@ TEST(SemanticAnalyzerC, FunctionLocalIntDeclTypedAsI32) {
     // `atomic_compare_exchange_{strong,weak}_explicit` — always-injected
     // intrinsics beside the load/store pair above (the non-`_explicit` spellings
     // are seq_cst MACROS in shippedLibs/stdatomic.json, so they mint no symbol).
+    // [[D-C-HAS-EXTENSION-CLAIMS-C-ATOMIC-WHILE-THE-GNU-ATOMIC-BUILTINS-DO-NOT-EXIST]]
+    // (P66): + the 8 GNU VALUE-FORM atomic builtins — `__atomic_load_n`,
+    // `__atomic_store_n`, `__atomic_exchange_n` and
+    // `__atomic_fetch_{add,sub,or,xor,and}`. ★ They mint 8 NEW symbols while
+    // adding NO new lowering: each binds the SAME `lowering` verb as the C11
+    // `*_explicit` row above it, so this is a second SPELLING of an operation
+    // already counted here, not a new operation. ⚠ The GNU family DSS does not
+    // ship (`__atomic_*_fetch`, `nand`, `compare_exchange_n`, the fences, the
+    // by-address generic tier, the flag tier and the lock-free predicates) mints
+    // NOTHING and must keep refusing — the boundary is pinned by name in
+    // tests/analysis/semantic/test_advertised_capability_is_honoured.cpp.
     // ⚠ The COUNT alone would be satisfied by any 8 arrivals; the roster is what
     // makes it say which, so it moves with the number.
-    ASSERT_EQ(model.symbols().size() - 1, 96u)
+    ASSERT_EQ(model.symbols().size() - 1, 104u)
         << "main + x + __va_list_tag + va_list + __builtin_va_list + __umulh + "
            "_InterlockedCompareExchange + _InterlockedCompareExchange64 + "
            "_ReadWriteBarrier + __sync_synchronize + "
            "_exception_code + _exception_info + the 6 __builtin bit-count "
            "intrinsics + the 56 __builtin_stdc_* <stdbit.h> intrinsics + "
            "atomic_load_explicit + atomic_store_explicit + the 8 atomic RMW "
-           "_explicit accessors + the 4 __builtin_complex/"
+           "_explicit accessors + the 8 GNU value-form __atomic_* builtins "
+           "(__atomic_load_n/store_n/exchange_n + __atomic_fetch_{add,sub,or,xor,and}) "
+           "+ the 4 __builtin_complex/"
            "creal/cimag/conj complex builtins + the 6 byte-swap builtins "
            "(_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 + "
            "__builtin_bswap16/32/64) + __func__ + __FUNCTION__";
@@ -4049,8 +4062,13 @@ TEST(SemanticAnalyzerC, NestedBlocksShadowWithoutRedecl) {
     // cimag/conj, D-CSUBSET-COMPLEX) + the 6 D-CSUBSET-INTRINSIC-BSWAP byte-swap
     // builtins (_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 +
     // __builtin_bswap16/32/64) + the 2 FC17.5 predefined function-name symbols
-    // (__func__ + __FUNCTION__, per function definition — D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
-    EXPECT_EQ(model.symbols().size() - 1, 97u);
+    // (__func__ + __FUNCTION__, per function definition — D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER)
+    // + the 8 GNU value-form __atomic_* builtins (P66,
+    // [[D-C-HAS-EXTENSION-CLAIMS-C-ATOMIC-WHILE-THE-GNU-ATOMIC-BUILTINS-DO-NOT-EXIST]]
+    // — __atomic_load_n/store_n/exchange_n + __atomic_fetch_{add,sub,or,xor,and};
+    // 8 new SYMBOLS binding the SAME lowering verbs as the C11 *_explicit rows,
+    // so a second spelling rather than a new operation).
+    EXPECT_EQ(model.symbols().size() - 1, 105u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -4084,7 +4102,10 @@ TEST(SemanticAnalyzerC, ForwardReferenceWithinBlock) {
     // (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64) — an under-aligned 8-byte `_Atomic`
     // needs the 64-bit compare-exchange, and it minted no new encoding because
     // x86_64's width-64 `lock_cmpxchg` variant already existed.
-    ASSERT_EQ(model.symbols().size() - 1, 96u);
+    // P66 [[D-C-HAS-EXTENSION-CLAIMS-C-ATOMIC-WHILE-THE-GNU-ATOMIC-BUILTINS-DO-NOT-EXIST]]:
+    // +8 for the GNU value-form __atomic_* builtins (a second SPELLING of the
+    // C11 *_explicit operations above — same lowering verbs, no new operation).
+    ASSERT_EQ(model.symbols().size() - 1, 104u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -7090,10 +7111,13 @@ TEST(SemanticAnalyzerC, ValueStarValueStaysExpressionStatement) {
     // D-CSUBSET-COMPLEX) + the 6 D-CSUBSET-INTRINSIC-BSWAP byte-swap builtins
     // (_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 + __builtin_bswap16/32/64) +
     // the 2 FC17.5 predefined function-name symbols (__func__ + __FUNCTION__) — the
-    // multiplication must mint NO symbol.
-    EXPECT_EQ(model.symbols().size() - 1, 97u)
+    // multiplication must mint NO symbol. P66
+    // [[D-C-HAS-EXTENSION-CLAIMS-C-ATOMIC-WHILE-THE-GNU-ATOMIC-BUILTINS-DO-NOT-EXIST]]:
+    // + the 8 GNU value-form __atomic_* builtins, which likewise mint symbols
+    // without minting an operation (they bind the C11 rows' own lowering verbs).
+    EXPECT_EQ(model.symbols().size() - 1, 105u)
         << "main + a + b + __va_list_tag + va_list + __builtin_va_list + "
-           "the 6 intrinsic builtins + "
+           "the 6 intrinsic builtins + the 8 GNU value-form __atomic_* builtins + "
            "the 6 __builtin bit-count intrinsics + the 56 __builtin_stdc_* "
            "<stdbit.h> intrinsics + atomic_load_explicit + atomic_store_explicit + "
            "the 4 __builtin_complex/creal/cimag/conj complex builtins + "

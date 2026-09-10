@@ -424,3 +424,20 @@ dss_add_test(NAME analysis/semantic/test_gnu_aligned_three_forms
              SOURCES test_gnu_aligned_three_forms.cpp)
 target_include_directories(dss_analysis_semantic_test_gnu_aligned_three_forms
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# ★★★ P66 (lane `at`) — THE ADVERTISEMENT GUARD, the instrument half of
+# [[D-C-HAS-EXTENSION-CLAIMS-C-ATOMIC-WHILE-THE-GNU-ATOMIC-BUILTINS-DO-NOT-EXIST]].
+# DSS answered `__has_extension(c_atomic)` = 1 while the GNU `__atomic_*`
+# builtins did not exist, which made the entire real-world corpus unbuildable on
+# all five legs for SIX cycles — every one of them under a fully green unit
+# suite, because nothing in the suite consumed a header that ASKS DSS what it has
+# and then uses the answer. This file closes that blindness generally rather than
+# for `c_atomic`: it enumerates the advertised set out of the loaded schema and
+# requires a COMPILED witness for every member, with the ratchet running both
+# ways (an advertised feature with no witness is red; a witness for a retracted
+# feature is red). Shares `semantic_test_fixture.hpp`, so it needs the tests/
+# include root.
+dss_add_test(NAME analysis/semantic/test_advertised_capability_is_honoured
+             SOURCES test_advertised_capability_is_honoured.cpp)
+target_include_directories(dss_analysis_semantic_test_advertised_capability_is_honoured
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
