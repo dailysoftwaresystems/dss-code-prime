@@ -3544,6 +3544,133 @@ TEST(ShippedLibDescriptor, RealWindowsKernel32FileHeapTimeSignatures) {
     EXPECT_EQ(pointeeKind("MultiByteToWideChar", 4), K::U16) << "LPWSTR dst is wide";
 }
 
+// ★★★ [[D-C-PE64-CORPUS-BLOCKED-BY-AN-UNDECLARED-WIN32-CALL-AND-A-TYPE-DSS-SPLITS-THAT-MINGW-ALIASES]]
+// P66 lane pe — the kernel32 DRIVE surface, which is what the pe64 SQLite
+// corpus was blocked on. `os_win.c` builds the aSyscall row
+// `{ "GetDriveTypeW", (SYSCALL)GetDriveTypeW, 0 }` and then asks
+// `osGetDriveTypeW(zRoot)==DRIVE_REMOTE`; those two names were the ONLY
+// `S_UndeclaredIdentifier` sites in the whole testfixture build.
+//
+// ★ THE SIGNATURE IS NOT A GUESS. Both references spell it the same way and
+// were read separately: Windows SDK 10.0.26100.0 `um/fileapi.h`
+// `WINBASEAPI UINT WINAPI GetDriveTypeW(_In_opt_ LPCWSTR lpRootPathName);` and
+// mingw-w64 `fileapi.h` `WINBASEAPI UINT WINAPI GetDriveTypeW (LPCWSTR ...);`.
+// windows.json's own typedefs make `UINT` a BARE u32 and `LPCWSTR` a ptr<u16>,
+// so the wide-vs-ANSI pointee assert below is the one that catches the
+// interesting regression: an LPCSTR slip would silently hand kernel32 a
+// half-width path.
+//
+// ★ THE WHOLE `DRIVE_*` FAMILY IS PINNED, not just the value the corpus reads.
+// winbase.h defines them as one closed enumeration and the SDK and mingw-w64
+// agree value for value; shipping or pinning only `DRIVE_REMOTE` is the
+// [[feedback-a-partial-fix-reads-as-a-complete-one]] shape, and a wrong value
+// is a SILENT wrong answer rather than a refused compile.
+//
+// The elf arm asserts ABSENCE in both directions — windows.json is
+// `availableObjectFormats:[pe]`, so a POSIX build must grow neither the symbol
+// nor the constants. RED-ON-DISABLE: delete the symbol row → the presence
+// assert fails; change any constant value → the value assert fails; retype
+// `LPCWSTR` → the pointee assert fails.
+TEST(ShippedLibDescriptor, RealWindowsDriveTypeSurface) {
+    fs::path const shippedRoot = shippedLibsRoot();
+    ASSERT_FALSE(shippedRoot.empty())
+        << "could not locate src/dss-config/shippedLibs from cwd";
+    fs::path const winPath = shippedRoot / "windows.json";
+    ASSERT_TRUE(fs::exists(winPath)) << winPath.generic_string();
+
+    struct Expected {
+        std::string_view name;
+        std::int64_t value;
+    };
+    // um/winbase.h, SDK 10.0.26100.0 — and mingw-w64's winbase.h, identical.
+    static constexpr Expected kDriveFamily[] = {
+        {"DRIVE_UNKNOWN", 0},   {"DRIVE_NO_ROOT_DIR", 1},
+        {"DRIVE_REMOVABLE", 2}, {"DRIVE_FIXED", 3},
+        {"DRIVE_REMOTE", 4},    {"DRIVE_CDROM", 5},
+        {"DRIVE_RAMDISK", 6},
+    };
+
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(winPath, interner, typeReg, rep,
+                                             DataModel::Llp64,
+                                             std::string_view{"x86_64"},
+                                             ObjectFormatKind::Pe);
+        ASSERT_TRUE(desc.has_value());
+        ASSERT_FALSE(rep.hasErrors());
+
+        TypeId sig{};
+        for (auto const& s : desc->symbols)
+            if (s.name == "GetDriveTypeW") sig = s.signature;
+        ASSERT_TRUE(sig.valid())
+            << "GetDriveTypeW absent from windows.json symbols — the pe64 "
+               "SQLite corpus cannot compile os_win.c without it";
+        ASSERT_EQ(interner.kind(sig), TypeKind::FnSig);
+        EXPECT_EQ(interner.kind(interner.fnResult(sig)), TypeKind::U32)
+            << "UINT is a BARE u32 in this descriptor's own vocabulary";
+        auto const params = interner.fnParams(sig);
+        ASSERT_EQ(params.size(), 1u) << "GetDriveTypeW(LPCWSTR) is arity 1";
+        ASSERT_EQ(interner.kind(params[0]), TypeKind::Ptr);
+        auto const pointee = interner.operands(params[0]);
+        ASSERT_EQ(pointee.size(), 1u);
+        EXPECT_EQ(interner.kind(pointee[0]), TypeKind::U16)
+            << "LPCWSTR is WIDE — an ANSI slip hands kernel32 a half-width path";
+
+        for (auto const& want : kDriveFamily) {
+            bool found = false;
+            for (auto const& c : desc->constants) {
+                if (c.name != want.name) continue;
+                found = true;
+                EXPECT_EQ(c.value, want.value) << want.name;
+                EXPECT_EQ(interner.kind(c.type), TypeKind::I32)
+                    << want.name
+                    << ": winbase.h spells each as a bare decimal #define, i.e."
+                       " an int constant, exactly as both references do";
+            }
+            EXPECT_TRUE(found) << want.name << " absent from windows.json constants";
+        }
+    }
+
+    // ⚠ THE OFF-pe ARM, AND THE PREMISE IT WAS FIRST WRITTEN ON WAS REFUTED BY
+    // RUNNING IT. This arm read the descriptor with `ObjectFormatKind::Elf` and
+    // asserted the two new rows were ABSENT from the returned lists. They are
+    // NOT: ✔MEASURED — the format argument to `readShippedLibDescriptor`
+    // selects per-target VARIANTS, it does not filter a document by its own
+    // header-level availability, so an elf read of windows.json still hands
+    // back every row it declares. Asserting absence there was a claim about a
+    // gate that lives somewhere else, and it went red the first time it ran.
+    //
+    // The real guarantee is the header-level availability set, and it has ONE
+    // owner — `objectFormatInAvailabilitySet`, the single membership predicate
+    // shared by the semantic `#include` gate, `__has_include` and the macro
+    // splice. Asking THAT is what makes this arm say something the production
+    // path actually enforces: no elf or macho TU can reach this header at all,
+    // so neither the kernel32 import nor the winbase.h constants can leak onto
+    // a POSIX build.
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(winPath, interner, typeReg, rep,
+                                             DataModel::Lp64,
+                                             std::string_view{"x86_64"},
+                                             ObjectFormatKind::Elf);
+        ASSERT_TRUE(desc.has_value());
+        EXPECT_FALSE(objectFormatInAvailabilitySet(desc->availableObjectFormats,
+                                                   ObjectFormatKind::Elf))
+            << "a Win32 header must be unreachable from a POSIX build";
+        EXPECT_FALSE(objectFormatInAvailabilitySet(desc->availableObjectFormats,
+                                                   ObjectFormatKind::MachO))
+            << "a Win32 header must be unreachable from a Mach-O build";
+        EXPECT_TRUE(objectFormatInAvailabilitySet(desc->availableObjectFormats,
+                                                  ObjectFormatKind::Pe))
+            << "the accepting half — without it the two refusals above would be "
+               "satisfied by an availability set that reaches nothing at all";
+    }
+}
+
 // Every descriptor SHIPPED under src/dss-config/shippedLibs/*.json (Model 3: a
 // FLAT, platform-neutral layout — one descriptor per header) must read + decode
 // cleanly: valid JSON, a non-empty `header` that AGREES with the filename stem

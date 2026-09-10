@@ -775,6 +775,81 @@ TEST(ShippedStatTypedSurface, ThePeUnderscoreRowsRefuseTheUserFacingTag) {
         << "the user-facing pe row must still take `struct stat *`";
 }
 
+// ★★★ [[D-C-PE64-CORPUS-BLOCKED-BY-AN-UNDECLARED-WIN32-CALL-AND-A-TYPE-DSS-SPLITS-THAT-MINGW-ALIASES]]
+// P66 lane pe — `struct __stat64` is the SAME TYPE as `struct _stat64` on pe,
+// reached the way both references reach it: a `#define`, not a second record.
+//
+// ⚠ WHAT THIS ROW REFUTED, and it is the reason the test reads the way it does.
+// The row was written expecting that a second struct with identical members
+// "would make this call site compile and would not fix the defect". It does
+// NOT make it compile — and the tree already held the experiment: `sys/stat.json`
+// declared `struct __stat64` beside `struct _stat64` with byte-identical field
+// lists, and `bld/shell.c`'s `_fstat64(_fileno(rv), &x)` over a
+// `struct __stat64 x` still failed `S_TypeMismatch` on `&x`. A descriptor
+// struct interns by NAME plus field types, so two tags are two TypeIds however
+// equal their members are. The duplicate record is gone and the alias replaces
+// it.
+//
+// MEASURED in both reference headers, separately:
+//   mingw-w64 `_mingw_stat64.h`        `#define __stat64 _stat64`
+//   Windows SDK ucrt `sys/stat.h`      `#define __stat64 _stat64  // For legacy compatibility`
+// and the UCRT's own `_fstat64` prototype takes `struct _stat64 *`, so on both
+// references the two spellings are one type through a macro. The descriptor
+// `macros` block is the faithful model of that (a synthetic `#define` spliced
+// before parse, with a format-only `when`), which is why no new config
+// expressiveness was needed.
+//
+// RED-ON-DISABLE: delete the `macros` row → the `__stat64` tag stops existing on
+// pe, arms (a) and (b) fail to resolve it and the `#ifndef` arm fires `#error`.
+// The OVER-REACH arm is (c): `_stat64i32` has the SAME field list on this target
+// and must stay a DIFFERENT tag, so an alias that collapsed every look-alike
+// would satisfy (a) and (b) and be a fresh defect.
+TEST(ShippedStatTypedSurface, ThePeLegacyStat64TagIsTheUcrtTagNotASecondRecord) {
+    // (a) THE CORPUS SHAPE, from sqlite's `bld/shell.c` `openChrSource`.
+    auto const corpus =
+        peC("#include <sys/stat.h>\n"
+            "int main(void){ struct __stat64 x; return _fstat64(0, &x) != 0; }\n");
+    EXPECT_FALSE(hasCode(corpus.diagnostics(), DiagnosticCode::S_TypeMismatch))
+        << "`struct __stat64 *` must reach `_fstat64` — this is the line that "
+           "kept pe64-x86_64 the last poisoned leg of the SQLite matrix";
+    EXPECT_FALSE(corpus.diagnostics().hasErrors());
+
+    // (b) ONE TYPE, so a pointer crosses in BOTH directions with no cast.
+    auto const both =
+        peC("#include <sys/stat.h>\n"
+            "int main(void){ struct __stat64 a; struct _stat64 b;\n"
+            " struct _stat64 *p = &a; struct __stat64 *q = &b;\n"
+            " return (p != 0) + (q != 0); }\n");
+    EXPECT_FALSE(both.diagnostics().hasErrors())
+        << "two look-alike tags would refuse this even with identical members";
+
+    // (c) THE OVER-REACH DETECTOR. `_stat64i32` shares the field list and must
+    // stay a distinct tag — the same claim `ThePeUnderscoreRowsRefuseTheUserFacingTag`
+    // makes about `struct stat`, asked of the alias.
+    auto const distinct =
+        peC("#include <sys/stat.h>\n"
+            "int main(void){ struct __stat64 x; return _stat64i32(\"x\", &x); }\n");
+    EXPECT_TRUE(hasCode(distinct.diagnostics(), DiagnosticCode::S_TypeMismatch))
+        << "the alias must make ONE pair of spellings one type, not collapse "
+           "every UCRT record of the same shape";
+
+    // (d) THE FORMAT GATE, asserted from the preprocessor in both directions —
+    // elf's `struct stat64` is a genuinely different LFS record and must not be
+    // aliased away.
+    auto const onPe = peC("#include <sys/stat.h>\n"
+                          "#ifndef __stat64\n"
+                          "#error the pe legacy alias must be spliced on pe\n"
+                          "#endif\n"
+                          "int main(void){ return 0; }\n");
+    EXPECT_FALSE(onPe.diagnostics().hasErrors());
+    auto const offPe = elfC("#include <sys/stat.h>\n"
+                            "#ifdef __stat64\n"
+                            "#error the pe legacy alias must not reach elf\n"
+                            "#endif\n"
+                            "int main(void){ return 0; }\n");
+    EXPECT_FALSE(offPe.diagnostics().hasErrors());
+}
+
 // The RETURN side, which the corpus example also witnesses by execution — kept
 // here as well so the descriptor set is judged in one place.
 TEST(ShippedStatTypedSurface, ATypedReturnNoLongerAssignsToAnyPointer) {
