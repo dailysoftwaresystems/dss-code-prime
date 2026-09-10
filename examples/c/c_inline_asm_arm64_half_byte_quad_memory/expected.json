@@ -1,0 +1,22 @@
+{
+  "$comment": "D-TARGET-ARM64-HALF-BYTE-QUAD-MEMORY-FORMS-UNDECLARED (cycle P55, lane lq) — the H, B and Q widths of the four scalar SIMD&FP memory opcodes, and the `q0..q31` ALIAS spellings the Q half needs to be nameable, by EXECUTION. ★★★ A COMPILE-ONLY ARM COULD NOT CARRY THIS ROW: the scaled unsigned-offset LDR/STR encodes `imm12 = byteOffset / accessSize`, so an arm that borrowed a neighbour's scale assembles, runs, and reads the WRONG ADDRESS — ✔MEASURED, gas 2.42 and clang 18.1.3 agreeing, `[x1,#16]` is imm12 16 at B, 8 at H, 4 at S, 2 at D and 1 at Q. Every shape here copies a slice out of a byte-DISTINCT source buffer and reads the destination back in C, with the neighbouring bytes asserted still zero so a store that ran at the wrong WIDTH is caught by the byte after it. ★★ THE `q0`/`v0` IDENTITY IS EXECUTED TOO: shape (7) writes the register through its `q` spelling, moves it as a VECTOR (`mov v0.16b, v1.16b`), and stores it through the `q` spelling again — three instructions that agree about which machine register they mean only if the alias resolves to `v` — and it carries `q0` in its CLOBBER list, which is the ordinal half of the same claim. ⚠ The base pointer is moved into a physical register first because this dialect's memory production takes a register NAME inside its brackets (✔MEASURED: a placeholder there is a parse error for the INTEGER control too), so `x9`/`x10` are clobbered. ⚠ Buffers are `volatile` so the release arm still reaches the templates. Exit codes name the failing shape.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

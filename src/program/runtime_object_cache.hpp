@@ -574,12 +574,16 @@ struct DSS_EXPORT DependencyArtifactRequest {
     std::string inputClosureDigest;
 
     // ★ THE ARTIFACT'S BASE NAME — `artifactName.value_or(sourceStem)` — AND IT
-    // DOES TWO JOBS THAT ARE ONE FACT. It names the ENTRY FILE, because
-    // `pruneSupersededSiblings` matches on `<stem>-<index><suffix>` and an entry
-    // outside that shape would be un-prunable; and it is a KEY TERM, because the
-    // name reaches the emitted bytes (archive member names follow it). Two
-    // fields carrying one value would be two owners of it, free to drift into a
-    // cache entry named after one thing and keyed on another.
+    // DOES TWO JOBS THAT ARE ONE FACT. It names the ENTRY FILE, in the
+    // `<stem>-<index><suffix>` shape every entry this cache writes carries; and
+    // it is a KEY TERM, because the name reaches the emitted bytes (archive
+    // member names follow it). Two fields carrying one value would be two owners
+    // of it, free to drift into a cache entry named after one thing and keyed on
+    // another.
+    // ⓘ The shape used to matter for a THIRD reason — an entry outside it was
+    // un-prunable — and that reason is gone with the prune
+    // ([[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]).
+    // The first two stand on their own.
     //
     // `artifactSuffix` is the OBJECT FORMAT's own extension, asked of the format
     // rather than assumed — it was hardcoded `.a` while a shipped runtime
@@ -771,37 +775,75 @@ lookupRuntimeObject(RuntimeObjectKey const& key);
 // already missed in both roots; re-deriving that answer here would be a second
 // owner of the precedence rule, free to drift from the first.
 //
-// ⓘ Pruning of superseded siblings is best-effort and its failure is NOT an
-// error — an open artifact cannot be unlinked on Windows, and the cache's
-// correctness never depends on old entries being gone, only on them being
-// unreachable, which the key-as-path already guarantees.
+// ═══ ⛔ A STORE DELETES NOTHING. IT NEVER WILL. ══════════════════════════════
+// [[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]
 //
-// ── `eviction` — AND IT IS A POLICY, WHICH IS WHY IT IS A PARAMETER AND NOT A
-//    KEY TERM ───────────────────────────────────────────────────────────────
-// Two builds that differ ONLY in this value compile the SAME bytes from the
-// SAME inputs, so putting it in the key document would split one entry into two
-// and make every switch of the policy a cold cache — the "over-invalidation
-// costs one recompile" side of the asymmetry paid for nothing. It decides only
-// what happens to OTHER entries after this one lands.
+// This function used to take a `CacheEviction` policy and, under
+// `PruneSuperseded`, delete every `<stem>-<index><suffix>` in this directory
+// whose index was not the one it just wrote. The premise stated at its call
+// site was *the key-as-path rule already makes a superseded entry UNREACHABLE,
+// so keeping it can never cause one to be served* — true, and about the wrong
+// question. Unreachability was never why deleting was safe.
 //
-// ⚠ IT HAS NO DEFAULT ARGUMENT, DELIBERATELY. A defaulted policy is a decision
-// taken by whoever forgot to state one, and the two call sites genuinely differ:
-// the shipped runtime cache supersedes (one unit has one current object), while
-// a project may need every revision retained.
-enum class CacheEviction {
-    // Storing DELETES the superseded entries sharing this entry's stem in this
-    // directory — the pre-existing, and still the only, behaviour of the
-    // shipped runtime object cache.
-    PruneSuperseded,
-    // Nothing is deleted. Every entry ever written stays addressable, which is
-    // what a workflow alternating between two revisions of one dependency needs:
-    // under pruning each build evicts the other's entry and both stay cold.
-    Retain,
-};
-
+// ★★★ "SUPERSEDED" IS NOT DERIVABLE AT STORE TIME, AND THE ENUMERATION IS
+// EXHAUSTIVE RATHER THAN A JUDGEMENT. A sibling's index differs from mine
+// exactly when some process computed a DIFFERENT key for the same unit. The
+// `.key` document beside it carries the only evidence a store has, and every
+// term in it is either a PATH COMPONENT (so it cannot differ within one
+// directory at all) or the path and digest of an input. Nothing in that
+// document carries a DIRECTION, so *"the previous revision of my tree"* and
+// *"another live build reading a different tree"* are the same observation.
+// ⓘ And they cannot be told apart from outside the document either: the config
+// root is deliberately NOT a key term (see the two-roots corollary above), and
+// `findShippedConfig` resolves it from **cwd and `DSS_CONFIG_ROOT`**, both of
+// which one binary may vary between two runs.
+//
+// ⇒ Every deletion this store could perform was an unproven claim about
+// another process, and the loser of that claim is not a stale file: it is the
+// LINK INPUT of a build in flight. The cache hands out a PATH and the linker
+// opens it much later, so the window is the whole rest of that build.
+// ✔MEASURED 2026-09-10 (cycle P66): two corpus examples went RED inside an
+// otherwise 2172/2174 run with `F_FileOpenFailed` on a `dirent-<index>.a` that
+// a second `dsscp` had deleted between it being named and being opened, once
+// from `--resolve-library` and once from `static-link`.
+//
+// ★★★ AND THE DISK IT BOUGHT WAS **ZERO BYTES**, WHICH IS WHY THIS IS A
+// DELETION AND NOT A NEW POLICY. ✔MEASURED 2026-09-10 over a real
+// `%LOCALAPPDATA%/dsscp/runtime-cache`: 72,301,184 bytes, 1,561 build-stamp
+// roots, 15,906 artifacts — and **15,906 entry families of which every single
+// one held exactly ONE entry**. A perfect prune would have reclaimed 0 bytes,
+// 0.0000% of the cache. The reason is already in this header: the BUILD STAMP
+// is a per-user-root PATH COMPONENT and it moves on every dirty rebuild, so a
+// superseded generation lands in a NEW ROOT rather than beside its predecessor.
+// The prune could therefore only ever reach a same-stamp, same-slug,
+// same-config, DIFFERENT-CONFIG-TREE pair — which is the concurrent case it
+// destroys. Not a trade-off between disk and safety: a liability with no
+// upside.
+//
+// ⚠ WHY NOT THE OBVIOUS ALTERNATIVES, each rejected on something measured
+// rather than on taste:
+//   * hand out an OPEN HANDLE instead of a path — closes the window on Windows
+//     only (an open file cannot be unlinked there); on POSIX the unlink
+//     succeeds and the late consumer still opens BY PATH and still gets
+//     ENOENT. Half a fix on one host.
+//   * serve a hit from a per-build STAGING copy — forbidden by a decision this
+//     tree already measured: `DependencyArtifactRequest::linkInputs` keys on a
+//     link input's PATH, and `resolveShippedRuntimeArchives` points the link at
+//     the DURABLE cache copy precisely so *a hit and a miss link the same FILE*.
+//     A per-run path would make every dependency artifact key per-run.
+//   * re-materialize a vanished entry at the consumer — the consumers are the
+//     eager `--resolve-library` open-probe and `pullStaticArchiveMembers`, and
+//     neither knows this cache exists; teaching them means re-entering the
+//     driver from the linker.
+//   * an mtime, an age threshold or a retry loop — a heuristic where the
+//     question is a fact, and this project does not ship those.
+//
+// ⓘ RECLAIM IS STILL AVAILABLE AND IT IS THE USER'S: the per-user root carries
+// a build-stamp segment for exactly this reason (see `buildStampPathSegment`),
+// so one version's cache is one `rm -rf`. What is gone is a store deleting
+// files it cannot prove are dead.
 [[nodiscard]] DSS_EXPORT std::expected<std::filesystem::path, std::string>
 storeRuntimeObject(RuntimeObjectKey const&        key,
-                   std::span<std::uint8_t const>  bytes,
-                   CacheEviction                  eviction);
+                   std::span<std::uint8_t const>  bytes);
 
 } // namespace dss::runtime

@@ -1,0 +1,34 @@
+{
+  "$comment": "P63 [[D-CSUBSET-ATTRIBUTE-MID-DECLARATOR-POSITION-REFUSED]]: the runtime witness for a GNU attribute run between a struct/union member's TYPE HEAD and its DECLARATOR. MEASURED before this cycle through the shipped CLI as `error[P_UnexpectedToken]: expected 'EndStatement' -- got 'v'`, while gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 all BUILD AND RUN it. $$ THE TWO NEIGHBOURING POSITIONS ARE RETAINED IN THE SAME PROGRAM AS CONTROLS -- LEADING (`structMemberDeclSpecifiers`) and TRAILING (`structMemberAttrList`) -- because DSS already agreed with all three references on both, so a change that moved either would be about something other than the refused position. $$$ THE ROW'S OWN PRESCRIPTION WAS REFUTED BY MEASUREMENT AND THIS EXAMPLE PINS THE TRUE ANSWER: the row said a mid-declarator attribute 'binds to the DECLARATOR it precedes'. A TWO-declarator subject is the only one that can decide it, because the candidate answers give different numbers -- per-declarator a@0 b@1 sizeof 16, per-declaration a@0 b@16 sizeof 32. MEASURED 2026-09-07, gcc 13.3.0 AND clang 18.1.3 AGREEING, with the undecorated control `struct { char a, b; }` = a@0 b@1 sizeof 2 on both: the SECOND declarator is aligned too. The fix is therefore a THIRD reuse of the already-shipped `declAttrRun` rule (`topLevelDecl` and both `varDecl` branches carry it at exactly this position, `appertainsTo: declaration`), not a new per-slot rule -- and the file-scope twin `char __attribute__((aligned(16))) a, b;` aligns BOTH declarators on both references, which is that same slot already shipped. $ THE ALIGNMENT IS ASSERTED AT ITS SINK: every decorated member follows a `char`, so its offset AND the aggregate size move when the request lands; a parse-and-drop leaves them at 1 and 2, and the undecorated `struct plain` control is in the same program so the numbers are attributable to the attribute. $ THE UNION HALF is exercised too: `unionField` is a separate config row and therefore a separate omission. $ THE RESIDUE SENTENCE THAT USED TO END THIS COMMENT IS GONE, AND SO IS THE RESIDUE. It read: 'RESIDUE, named: the MID-LIST position (a declarator other than the first) is a DIFFERENT slot -- gcc REFUSES it, clang accepts it -- and DSS still refuses it, pinned by `SemanticAnalyzerC.MidListMemberAttributeIsStillRefusedLoudly` so the refusal cannot rot into a silent drop.' It was wrong twice over. FIRST, it covered THREE different positions and was accurate about one: the after-a-NON-LAST-declarator spelling is BUILT AND RUN by gcc 13.3.0 AND clang 18.1.3 (2-of-2), and the file-scope after-a-comma spelling by gcc, clang AND mingw-w64 gcc 13.2.0 (3-of-3); only the MEMBER after-a-comma position is the 1-of-4 minority the sentence describes. SECOND, the pin it named asserted the refusal, which makes a union violation THE CONTRACT rather than a stated trade-off -- the class P62 spent a wave removing. All three positions now parse and bind PER-DECLARATOR, that test asserts the acceptance and is renamed `SemanticAnalyzerC.MidListMemberAttributeIsHonoredAndBindsPerDeclarator`, and `examples/c/attribute_declarator_list_positions` is their runtime witness.",
+  "$commentRedOnDisable": "REMOVE direction, executed 2026-09-07: in `src/dss-config/sources/c.lang.json` delete the `\"declAttrRun\"` element from `shapes.structField.sequence` and from `shapes.unionField.sequence`, and restore `declaratorList: 1` on both `semantics.declarations` rows. dsscp rebuilds rc 0 (config is data, so the mutant needs no recompile of the changed TU -- the config file's own md5 moves and returns) and this example FAILS IN BOTH RUNNERS with `error[P_UnexpectedToken]: expected 'EndStatement' -- got 'v'` and NO artifact, while `examples/c/trailing_attribute_run_granularity` -- whose member attributes are all in the TRAILING slot -- stays GREEN as the named control. $$ A SECOND MUTANT WAS RUN AND IT REFUTED THE SENTENCE THAT USED TO SIT HERE, so the correction is recorded rather than the prediction: changing only `appertainsTo` from `declaration` to `declarator` on the new slot leaves THIS EXAMPLE GREEN and every `aligned(...)` pin green with it. Alignment is folded from the declaration node whatever the grain says, so no alignment subject can witness that value. The axis that DOES move is the one P56 established -- `deprecated` conferral -- and `SemanticAnalyzerC.MidDeclaratorMemberAttrSlotConfersOnEveryDeclarator` is the pin that goes red on that mutant (`struct S { int __attribute__((deprecated)) p, q; }` must flag BOTH p and q; the `declarator` grain flags only q), with the trailing-slot negative in the same test as its control. A red-on-disable arm that cannot go red is not an arm.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

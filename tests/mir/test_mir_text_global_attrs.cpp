@@ -253,14 +253,54 @@ TEST(MirTextGlobalAttrs, ANonPowerOfTwoAlignmentIsRefused) {
     EXPECT_TRUE(sawMalformed(rep));
 }
 
-TEST(MirTextGlobalAttrs, AnOverLargeAlignmentIsRefused) {
-    // `MirBuilder::addGlobal` documents a ceiling of 256 and ✔MEASURED does NOT
-    // enforce it — it stores whatever it is handed. The reader is the only
-    // thing between a bad file and the assembler.
+TEST(MirTextGlobalAttrs, AnUnrepresentableAlignmentIsRefused) {
+    // `MirBuilder::addGlobal` ✔MEASURED does NOT enforce anything — it stores
+    // whatever it is handed — so the reader is the only thing between a bad
+    // file and the assembler. What it refuses is the REPRESENTABILITY bound the
+    // `Alignment` newtype owns; 2^31 is the largest power of two it carries, so
+    // 2^32 (spelled here as the decimal the lexer reads) is out of range.
     DiagnosticReporter rep;
-    auto res = parseMir(globalDoc(" [align=512]"), CompilationUnitId{1}, rep);
+    auto res = parseMir(globalDoc(" [align=4294967296]"), CompilationUnitId{1}, rep);
     EXPECT_FALSE(res->ok);
     EXPECT_TRUE(sawMalformed(rep));
+}
+
+TEST(MirTextGlobalAttrs, AZeroAlignmentIsRefusedByItsOwnSentence) {
+    // Alignment 0 is UNDEFINED, not "not a power of two" — and it used to be
+    // folded into the power-of-two refusal, which told a reader to look for a
+    // rounding mistake they had not made.
+    DiagnosticReporter rep;
+    auto res = parseMir(globalDoc(" [align=0]"), CompilationUnitId{1}, rep);
+    EXPECT_FALSE(res->ok);
+    EXPECT_TRUE(sawMalformed(rep));
+}
+
+// ★★ [[D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN]] — THE
+// FIFTH SPELLING OF THE ALIGNMENT CAP, AND THIS TEST ASSERTED THE DEFECT.
+//
+// Until P64 this file pinned `align=512` as REFUSED, because `mir_text.cpp`
+// carried its own hand-written `kMirTextMaxGlobalAlignBytes = 256` — the fifth
+// copy of a number whose other four P63 removed. The reader and its own WRITER
+// disagreed: `emitGlobal` prints `align=N` for whatever N the module carries,
+// UNBOUNDED, and `mir/summary/mir_body_codec.cpp` pairs the two in shipped code,
+// so a module legitimately carrying a 512-byte-aligned global could be written
+// and then not read back. The 256 was a POLICY smuggled into a text reader; the
+// policy ceiling is declared per target as `maxRequestedAlignment` and enforced
+// at the SEMANTIC tier where a refusal carries a source position, and this
+// reader now asks `Alignment` — the type that owns the representable domain.
+//
+// RED-ON-DISABLE: restore the literal (`= 256`) in `mir_text.cpp` → this test
+// goes red on the very value gcc and clang both build and run.
+TEST(MirTextGlobalAttrs, AnAlignmentAboveTheOldFifthHandWrittenCapRoundTrips) {
+    for (std::uint32_t const bytes : {512u, 4096u, 65536u, 1u << 20}) {
+        DiagnosticReporter rep;
+        auto res = parseMir(globalDoc(" [align=" + std::to_string(bytes) + "]"),
+                            CompilationUnitId{1}, rep);
+        ASSERT_TRUE(res->ok) << "align=" << bytes << " must READ BACK: the "
+                                "writer emits it unbounded";
+        ASSERT_EQ(res->mir.moduleGlobalCount(), 1u);
+        EXPECT_EQ(res->mir.globalAlignmentBytes(res->mir.globalAt(0)), bytes);
+    }
 }
 
 TEST(MirTextGlobalAttrs, AWellFormedAttributeListParsesGreen) {

@@ -153,8 +153,9 @@ constexpr std::string_view kPassName = "ConstFold";
 // the pass-specific tryRewrite that performs the fold.
 class ConstFoldPolicy : public MirRebuildPolicy {
 public:
-    ConstFoldPolicy(Mir const& src, TypeInterner const& interner)
-        : src_(src), interner_(interner) {}
+    ConstFoldPolicy(Mir const& src, TypeInterner const& interner,
+                    std::optional<bool> charIsUnsigned)
+        : src_(src), interner_(interner), charIsUnsigned_(charIsUnsigned) {}
 
     [[nodiscard]] std::string_view passName() const noexcept override {
         return kPassName;
@@ -246,6 +247,14 @@ private:
             opts.refuseOnOverflow         = false;
             opts.refuseOnDivByZero        = true;
             opts.refuseOnShiftOutOfRange  = true;
+            // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the row that opened this
+            // work says in as many words that an `EvalOptions`-only fix is a
+            // half-measure BECAUSE this pass carries no target — so the target's
+            // answer is threaded to the pass, and `EvalOptions` is how it reaches
+            // the shared arithmetic. Absent ⇒ a `char`-cored fold refuses and the
+            // instruction is copied verbatim: a missed optimization, never a
+            // wrong constant.
+            opts.charIsUnsigned           = charIsUnsigned_;
             ConstEvalFailure why = ConstEvalFailure::None;
             auto folded = detail::applyBinaryInt(*bok, *a, *b, opts, why);
             if (!folded.has_value()) return std::nullopt;
@@ -275,7 +284,8 @@ private:
             folded.value = std::int64_t{v.value_or(0) != 0 ? 1 : 0};
             return folded;
         }
-        if (auto const ik = detail::intKindInfo(dstKind); ik.has_value()) {
+        if (auto const ik = detail::intKindInfo(dstKind, charIsUnsigned_);
+            ik.has_value()) {
             auto const iv = detail::asInt64(folded);
             if (!iv.has_value()) return std::nullopt;
             folded.core  = dstKind;
@@ -318,6 +328,10 @@ private:
 
     Mir const&          src_;
     TypeInterner const& interner_;
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the ACTIVE (target × object
+    // format)'s plain-`char` signedness, threaded from `compile_pipeline`'s ONE
+    // resolution of `TargetSchema::charIsUnsigned(ObjectFormatKind)`.
+    std::optional<bool> charIsUnsigned_{};
     std::unordered_map<std::uint32_t, HirLiteralValue> constCache_;
     std::size_t         folded_ = 0;
 };
@@ -325,7 +339,8 @@ private:
 } // namespace
 
 ConstFoldResult runConstFold(Mir& mir, TypeInterner const& interner,
-                             DiagnosticReporter& reporter) {
+                             DiagnosticReporter& reporter,
+                             std::optional<bool> charIsUnsigned) {
     ConstFoldResult result{};
     MirBuilder builder;
 
@@ -336,7 +351,7 @@ ConstFoldResult runConstFold(Mir& mir, TypeInterner const& interner,
     }
 
     // Drive the shared rebuilder with the ConstFold policy.
-    ConstFoldPolicy policy{mir, interner};
+    ConstFoldPolicy policy{mir, interner, charIsUnsigned};
     MirFunctionRebuilder rb{mir, builder, policy};
     std::size_t const nf = mir.moduleFuncCount();
     for (std::uint32_t i = 0; i < nf; ++i) {

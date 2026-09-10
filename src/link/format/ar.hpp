@@ -88,11 +88,28 @@ struct DSS_EXPORT ArMemberInput {
     // The member's opaque object bytes (an ELF ET_REL / Mach-O MH_OBJECT /
     // COFF .obj -- the writer never inspects them).
     std::vector<std::uint8_t> objectBytes;
-    // The member's DEFINED, externally-visible symbol names -- exactly the set
-    // a foreign linker resolves an unresolved extern against (the armap union).
+    // The member's DEFINED, EXTERNAL-LINKAGE symbol names -- exactly the set a
+    // foreign linker resolves an unresolved extern against (the armap union).
     // The compile pipeline derives this from `AssembledModule.symbols` filtered
-    // by `isExternallyVisible`. Order is preserved into the armap (per-member,
-    // in the order given). May be empty (a member contributing no armap rows).
+    // by `ObjectSymbolNames::hasExternalLinkage`, which is the SAME predicate
+    // the member object's own `.symtab` used to decide which definitions keep
+    // their real name. Order is preserved into the armap (per-member, in the
+    // order given). May be empty (a member contributing no armap rows).
+    //
+    // ⚠ IT IS *NOT* `isExternallyVisible`, AND THE SUBSTITUTION WAS A LIVE
+    // DEFECT -- D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL. That
+    // predicate folds VISIBILITY into its answer and so returns false for a
+    // `visibility("hidden")` non-static definition, which produced an archive
+    // that contradicted itself: the member defines the symbol under its real
+    // name with STB_GLOBAL while the index omits it, so a foreign `ld` reports
+    // "undefined reference" for exactly the symbol the archive contains. An
+    // armap answers a STATIC-LINK question; dynamic visibility is a different
+    // question asked in a different place (`.dynsym`, the Mach-O export trie).
+    // ✔MEASURED 2026-09-05: GNU ar/nm 2.42 with gcc 13.3.0 (-O0 and -O2) and
+    // clang 18.1.3 all list `visibility("hidden")`, `("internal")` AND
+    // `("protected")` functions in the "/" armap, omit the `static` CONTROL,
+    // and link+run a client that references the hidden one against the archive
+    // alone.
     std::vector<std::string> exportedSymbols;
 };
 

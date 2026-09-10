@@ -259,7 +259,8 @@ TEST(TargetVocabularyProjection, BitFieldStrategyRefusalNamesTheWholeTable) {
 TEST(TargetVocabularyProjection, ScalarAlignmentRefusalNamesTheWholeTable) {
     static constexpr auto kNames = allNames(dss::kScalarAlignmentRuleTable);
     constexpr char const* kIgnore[] = {kBadSpelling, "scalarAlignment",
-                                       "maxAlignment", "bitFieldStrategy"};
+                                       "maxAlignment", "maxRequestedAlignment",
+                                       "bitFieldStrategy"};
     for (char const* t : kTargets) {
         SCOPED_TRACE(t);
         auto r = mutateShippedTargetSchemaDoc(t, [](nlohmann::json& doc) {
@@ -421,7 +422,8 @@ TEST(TargetVocabularyProjection, AggregateLayoutShapeNamesEveryKey) {
     // maxAlignment }` — two of the three keys the block's own
     // `rejectUnknownKeys` accepts.
     static constexpr std::string_view kKeys[] = {
-        "scalarAlignment", "maxAlignment", "bitFieldStrategy"};
+        "scalarAlignment", "maxAlignment", "maxRequestedAlignment",
+        "bitFieldStrategy"};
     // ★ NO declared non-vocabulary quotes at this site, and that is the
     // STRONGEST form of the honesty arm: every `'…'` in the sentence must be a
     // key of the block. An `ignore` entry is a hole, so it is spelled only

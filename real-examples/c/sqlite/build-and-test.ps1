@@ -372,6 +372,21 @@ function Get-LegConfounds($leg) {
   if ($gating -ne 'probed') {
     Die "[$($leg.label)] the resolved leg plan says confoundGating='$gating', not 'probed'. A conditional confound row (``requires: [<environment probe>]``) is honoured ONLY where the named probe MEASURED its defect as PRESENT on THIS machine, and this plan carries no such measurement. 'unprobed' — nothing was measured, so every conditional row is INACTIVE: safe, and not usable, because the withheld excusals surface as GENUINE reds and read as compiler regressions; resolve the plan WITHOUT ``--environment-probes skip`` so harness_legs.py measures. 'injected' — the verdicts were READ FROM A FILE (``--probe-verdicts``), so conditional rows ARE honoured, on evidence this driver cannot vouch for: a verdict captured on another box would excuse a real miscompile HERE, in silence; drop the flag and let it measure. [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]"
   }
+  # ★★ AND WHETHER *THIS LEG'S OWN RUN DIRECTORY* WAS MEASURED, when any row on
+  # it is corroborated against one. The two gatings are SEPARATE fields because
+  # they answer separate questions measured at separate times, and a refusal has
+  # to name which of the two it is refusing.
+  # ANCHOR, ONE LINE, DO NOT WRAP:
+  # D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+  # ⚠ `unmeasured` IS THE VALUE A PLAN ALONE CAN EVER CARRY — a plan is resolved
+  # before any run directory exists — so this refusal is what makes the
+  # corroborator STRUCTURALLY unskippable rather than a convention. A driver that
+  # forgot the call stops here instead of quietly under-excusing, which is the
+  # direction that reads as a compiler regression.
+  $rdGating = if ($null -ne $leg.PSObject.Properties['runDirectoryGating']) { $leg.runDirectoryGating } else { '<unset>' }
+  if ($rdGating -ne 'not-required' -and $rdGating -ne 'measured') {
+    Die "[$($leg.label)] the resolved leg plan says runDirectoryGating='$rdGating', which is neither 'not-required' nor 'measured'. A confound row declaring ``requiresRunDirectory`` is honoured ONLY where THIS RUN measured the named precondition on THIS LEG'S own run directory, and a PLAN can never carry that measurement: it is resolved before any run directory exists. Call harness_legs.py --corroborate-run-dir with this leg's run directory and supply THAT result here. 'unmeasured' is fail-safe (every corroborated row is INACTIVE) and NOT fit to run on: the withheld excusals surface as GENUINE reds and read as compiler regressions. [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]"
+  }
   return @($leg.confounds | Where-Object { $_ })
 }
 # <<< dss:confound-supply <<<
@@ -755,6 +770,52 @@ function Get-LegRunDirPlan($label, $driverRunDir) {
     Die "[$label] harness_legs.py --run-dir-plan exited 0 but did not print the JSON this driver reads ($($_.Exception.Message)). Output was:`n$(($stdout | Select-Object -First 20 | ForEach-Object { "      $_" }) -join "`n")"
   }
 }
+# >>> dss:run-dir-corroborate >>>  (paired in build-and-test.sh)
+# ★★★ A CONFOUND ROW MAY BE CORROBORATED AGAINST *THIS LEG'S OWN RUN DIRECTORY*,
+# AND THE MEASUREMENT IS TAKEN HERE, AFTER THE PLAN, BECAUSE THAT IS THE ONLY
+# MOMENT BOTH FACTS EXIST.
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+#
+# ★★ THE SHAPE IS `matches: build-tu`'s, ONE NAME SPACE OVER: THE ROW ALONE
+# EXCUSES NOTHING. A build-tu row is honoured only where THIS RUN's reference
+# oracle also rejected the named TU; a row declaring `requiresRunDirectory` is
+# honoured only where THIS RUN's measurement of THIS LEG's run directory found
+# the precondition. A row whose precondition measures ABSENT reports itself
+# UNCORROBORATED and excuses nothing — which is also how a row that outlived its
+# host announces itself instead of rotting into furniture.
+#
+# ⚠ IT IS NOT AN `environmentProbes` QUESTION AND CANNOT BE MADE ONE: probe
+# verdicts are filed per KERNEL, sampled ONCE, BEFORE any leg is built, and
+# `--probe-environment` takes no leg and no directory.
+#
+# ★ THE DRIVER DECIDES NOTHING. It hands over the supply it holds and takes back
+# the supply that survived, exactly as it does for `--run-dir-plan` and
+# `--translate-path`. Which rows a measurement withheld is the resolver's answer,
+# in one file, so the two drivers cannot drift into two ledgers — which is
+# D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG, one axis along.
+function Get-LegRunDirCorroboration($label, $driverRunDir, $supplied, $suppliedAbort) {
+  $argv = @('--catalogue', $LegsJson, '--corroborate-run-dir', "$label",
+            '--host-os', $HostOs, '--host-arch', $HostArch,
+            '--driver-run-dir', "$driverRunDir", '--format', 'json')
+  foreach ($p in @($supplied))      { if ($p) { $argv += @('--supplied', "$p") } }
+  foreach ($p in @($suppliedAbort)) { if ($p) { $argv += @('--supplied-abort', "$p") } }
+  try {
+    $out = @(& $python3.Source $LegsPy @argv 2>&1)
+    $rc  = $LASTEXITCODE
+  } catch {
+    $rc = if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }
+    $out = @("$($_.Exception.Message)")
+  }
+  $stdout = @($out | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+  if ($rc -ne 0) {
+    Die "[$label] could not CORROBORATE this leg's confound rows against its own run directory (harness_legs.py --corroborate-run-dir, rc=$rc):`n$(($out | ForEach-Object { "      $_" }) -join "`n")`n      A row declaring ``requiresRunDirectory`` is honoured ONLY where THIS RUN measured the precondition on THIS LEG'S run directory. Continuing without the measurement would either excuse a failure on evidence nobody gathered, or withhold an earned excusal and report it as a compiler regression. [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]"
+  }
+  try { return ($stdout -join "`n") | ConvertFrom-Json } catch {
+    Die "[$label] harness_legs.py --corroborate-run-dir exited 0 but did not print the JSON this driver reads ($($_.Exception.Message)). Output was:`n$(($stdout | Select-Object -First 20 | ForEach-Object { "      $_" }) -join "`n")"
+  }
+}
+# <<< dss:run-dir-corroborate <<<
 # Run one of the resolver's argv PREFIXES. An EMPTY prefix means the launcher
 # shares this driver's filesystem and the caller does the operation natively —
 # that is what `runFilesystem: driver` MEANS, so empty is a real answer and not a
@@ -5657,9 +5718,37 @@ $legLauncher = @($leg.run.launcher)
 # Translated ONCE, here, so a per-segment path is the only other site.
 $legXlate    = "$($leg.run.pathTranslation)"
 $legLaunchFixture = Convert-LaunchPath $legXlate $fixture
+# THE DRIVER-SIDE run directory, CREATED BEFORE THE CONFOUND SUPPLY.
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+# ★★ THE ORDER IS LOAD-BEARING AND IT IS ALSO WHAT build-and-test.sh ALREADY
+# DID: a row corroborated against this leg's run directory cannot be resolved
+# before that directory exists, so the supply is taken AFTER it. It exists on
+# EVERY leg regardless of where the corpus actually runs, because this driver has
+# to be able to WRITE into it: the loadext helper is produced by a process on
+# this machine and can only land where this machine can put a file. For a
+# `driver` filesystem it is also where the fixture runs; for a foreign one it is
+# the staging area the resolver's copy argv reads FROM.
+# [D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS]
+$rundir = Join-Path $legOut 'run'; if (Test-Path $rundir) { Remove-Item -Recurse -Force $rundir }
+New-Item -ItemType Directory -Force -Path $rundir | Out-Null
+# WHERE THE CORPUS RUNS, DECLARED — never "wherever this driver happens to put
+# its build tree". `$legRunDir` is the launcher's own path when the two
+# filesystems differ, and $rundir when they do not; `$legLaunchRun` is empty in
+# the second case, which is how every site below tells the two apart without
+# knowing a single verb name.
+$runDirPlan   = Get-LegRunDirPlan $LegTag $rundir
 # CONFOUNDS ARE PER LEG AND EVERY ONE OF THEM WAS EARNED SOMEWHERE — read from
 # THIS LEG'S OWN DECLARATION (legs.json `confounds`, resolved by harness_legs.py),
 # which is the same declaration build-and-test.sh reads. One ledger, both drivers.
+# ★ AND THEN CORROBORATED against this leg's own run directory, which is what
+# makes a `requiresRunDirectory` row excuse nothing on a host where its
+# precondition does not hold. The resolver decides; this driver hands over the
+# supply it holds and takes back the supply that survived.
+$legRunDirCorroboration = Get-LegRunDirCorroboration $LegTag $rundir @($leg.confounds) @($leg.abortConfounds)
+$leg | Add-Member -NotePropertyName 'confounds' -NotePropertyValue @($legRunDirCorroboration.confounds) -Force
+$leg | Add-Member -NotePropertyName 'abortConfounds' -NotePropertyValue @($legRunDirCorroboration.abortConfounds) -Force
+$leg | Add-Member -NotePropertyName 'runDirectoryGating' -NotePropertyValue "$($legRunDirCorroboration.runDirectoryGating)" -Force
 $Confounds   = @(Get-LegConfounds $leg)
 # The ABORT half of the SAME ledger, read from the same resolved plan. Kept as
 # its own list so a unit-name matcher can never see an `abort-file` pattern and
@@ -5690,6 +5779,11 @@ if ($Confounds.Count) {
 # exactly what a reader of that run needs to know.
 # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
 Write-ConfoundReport $LegTag ($leg.confoundReport -join "`n")
+# ★ AND THE CORROBORATION'S OWN ACCOUNT, generated by the resolver and printed
+# verbatim — the measurement, the directory it was taken on, and every row it
+# withheld or re-earned. An excusal a reader cannot check is not an earned one.
+# [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+Write-ConfoundReport $LegTag "$($legRunDirCorroboration.reportText)"
 # The leg's OWN library directories go on its TARGET's loader search variable so
 # its fixture can load them at run time; TCL_LIBRARY points the Tcl runtime at its
 # script library.
@@ -5731,20 +5825,10 @@ $runEnvPath = Get-LegLoaderSearchPath $leg $legLibDirs
 # red a currently-working tier before the declaration lands, and the per-leg WARN
 # at acquisition time says so out loud every run rather than letting it pass.
 $LegTclLibrary = if ($LegLibs[$LegTag].TclScriptDir) { "$($LegLibs[$LegTag].TclScriptDir)" } else { $TclLibrary }
-# THE DRIVER-SIDE run directory. It exists on EVERY leg regardless of where the
-# corpus actually runs, because this driver has to be able to WRITE into it: the
-# loadext helper is produced by a process on this machine and can only land where
-# this machine can put a file. For a `driver` filesystem it is also where the
-# fixture runs; for a foreign one it is the staging area the resolver's copy argv
-# reads FROM. [D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS]
-$rundir = Join-Path $legOut 'run'; if (Test-Path $rundir) { Remove-Item -Recurse -Force $rundir }
-New-Item -ItemType Directory -Force -Path $rundir | Out-Null
-# WHERE THE CORPUS RUNS, DECLARED — never "wherever this driver happens to put
-# its build tree". `$legRunDir` is the launcher's own path when the two
-# filesystems differ, and $rundir when they do not; `$legLaunchRun` is empty in
-# the second case, which is how every site below tells the two apart without
-# knowing a single verb name.
-$runDirPlan   = Get-LegRunDirPlan $LegTag $rundir
+# The run directory and its plan were resolved ABOVE, before the confound supply,
+# because a row corroborated against this leg's run directory cannot be resolved
+# before that directory exists.
+# [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
 $legRunFs     = "$($runDirPlan.runFilesystem)"
 $legLaunchRun = "$($runDirPlan.launcherPath)"
 $legRunDir    = if ($legLaunchRun) { $legLaunchRun } else { $rundir }

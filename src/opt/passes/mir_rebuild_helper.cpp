@@ -294,10 +294,17 @@ void MirRebuildPolicy::onZeroPhiIncomings(MirInstId oldPhi, MirBlockId oldBlock,
 MirInstId MirFunctionRebuilder::rewriteOperand(MirInstId oldOp) const {
     MirInstId const* const mapped = rewrite_.find(oldOp.v);
     if (mapped == nullptr) {
-        // ★ THE FATAL THAT MOTIVATED THE ROW. This text is identical for all
-        // ~9 policies; `[pass=…]` is the only thing in it that says WHOSE
-        // rebuild died, and last cycle its absence cost a whole `DSS_OPT_TRACE`
-        // run to learn the one word `SimplifyCfg`.
+        // ★ THE FATAL THAT MOTIVATED THE ROW. This text is identical for EVERY
+        // policy; `[pass=…]` is the only thing in it that says WHOSE rebuild
+        // died, and last cycle its absence cost a whole `DSS_OPT_TRACE` run to
+        // learn the one word `SimplifyCfg`.
+        // ⓘ It said `~9 policies` until 2026-09-07 (cycle P63), a SECOND COPY of
+        // the count `mir_rebuild_helper.hpp` states, and both had drifted to two
+        // below the truth. The header's copy is now census-bound and checked; this
+        // one is the UNIVERSAL claim it was always making, which no arithmetic can
+        // invalidate — the same repair
+        // D-TEST-CMAKE-COMMENT-QUOTES-A-CORPUS-COUNT-THE-TEST-IT-REGISTERS-FORBIDS
+        // made. One fact, one owner.
         rebuildFatal(kRebuilderSubject, policy_.passName(),
             std::format("rewriteOperand: old MirInstId v={} has no rewrite "
                         "entry — scan-order violation OR operand referenced a "

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -67,6 +68,60 @@ constexpr std::uint8_t kSttObject  = 1;
 constexpr std::uint8_t kSttFunc    = 2;
 constexpr std::uint8_t kSttSection = 3;
 constexpr std::uint8_t kSttFile    = 4;
+
+// ── THE LINKER-DEFINED GOT BASE SYMBOL ────────────────────────────────────
+//    D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS
+//
+// The SysV gABI reserves this spelling for the symbol A LINKER DEFINES at the
+// base of the global offset table. It is NOT an import: no shared library
+// exports it, and no object can define it.
+//
+// ✔MEASURED (WSL, GNU ld 2.42 / LLVM lld 18.1.3, static non-PIE, with the
+// no-GOT CONTROL beside it):
+//   * ld, on an object whose only GOT contact is `cmpq $0,w@GOTPCREL(%rip)`,
+//     DEFINES it itself — `OBJECT LOCAL` at the GOT base (0x402fe8, the
+//     `.got.plt` base, with `.got` immediately below at 0x402fe0).
+//   * lld resolves it internally on the same input and writes NO `.symtab`
+//     row for it at all.
+//   * CONTROL — the same link of an object with no GOT-using relocation —
+//     emits no `.got` and no such symbol, so its presence is conditional on
+//     GOT use rather than a constant of the target.
+//   * `nm -D /lib/x86_64-linux-gnu/libc.so.6 | grep -c GLOBAL_OFFSET_TABLE`
+//     is ZERO: nothing exports it, so a DT_NEEDED can never satisfy it.
+//
+// ⚠ SO MINTING AN `ExternImport` FOR IT IS WRONG IN TWO DIRECTIONS, AND BOTH
+// WERE SILENT AT LINK TIME. It arrives in a real static-archive member as an
+// UNREFERENCED `NOTYPE GLOBAL UND` entry (✔MEASURED on glibc `exit.o`: it is
+// symtab index 3 and ZERO of the 33 `.rela.text` entries name it), and the UND
+// arm below seeds `isData` TRUE for STT_NOTYPE. That phantom row (a) forces an
+// otherwise fully static-resolvable module down the DYNAMIC walker, whose whole
+// dispatch condition is a non-empty `externImports`, and (b) under any real
+// `libraryPath` would emit a `.dynsym` UND row nothing exports — the image
+// would then fail to LOAD, which is the same failure class the FFI descriptors
+// already carry ("one unexported symbol breaks every binary's load").
+//
+// ★ A REFERENCE TO IT IS ALREADY REFUSED, BY NAME, ONE STEP EARLIER — which is
+// why this arm drops the row instead of adding a second refusal. A real
+// reference travels on R_X86_64_GOTPC32 / GOTPC64 / GOTOFF64 (✔MEASURED:
+// `gcc -c "leaq _GLOBAL_OFFSET_TABLE_(%rip),%rax"` emits wire type 26), and the
+// elf64-x86_64 documents declare wire ids {1, 2, 9, 10} only, so the
+// undeclared-wire-type arm in the relocation pass rejects such an object before
+// any symbol is classified. A second refusal here would be a second place for
+// that wording to drift.
+//
+// ⓘ AND THE SHAPE NO ASSEMBLER EMITS IS COVERED TOO, IN THE SAME DIRECTION: a
+// reference through a DECLARED wire type (a bare `.quad _GLOBAL_OFFSET_TABLE_`,
+// say) still records a relocation whose target no function, data item or import
+// gives an address, so the walker's `K_SymbolUndefined` arm refuses it. Before
+// this skip existed that case was WORSE, not better — the phantom import bound
+// it silently to an import slot.
+//
+// ★ THE SPELLING IS READER-OWNED, on the same stated convention `elf.cpp` uses
+// for `kGotSectionName`: it is not a place a PRODUCER can put anything, because
+// the assembler that produced the object already wrote this exact spelling into
+// its `.symtab`. It is gABI-generic — every ELF architecture uses it — so it
+// carries no arch branch.
+constexpr std::string_view kGotBaseSymbolName = "_GLOBAL_OFFSET_TABLE_";
 
 // st_info / st_other decode (gABI 4.31).
 [[nodiscard]] constexpr std::uint8_t stBind(std::uint8_t info) noexcept { return info >> 4; }
@@ -601,6 +656,12 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // An undefined reference -> an extern import. Unnamed UND slot 0
             // (STN_UNDEF) and any nameless UND entry carry no import identity.
             if (sy.name.empty()) continue;
+            // ... and neither does the LINKER-DEFINED GOT base
+            // (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS): the
+            // linker defines it, nothing exports it, and a reference to it is
+            // already refused by the undeclared-wire-type arm below. The full
+            // measurement is at `kGotBaseSymbolName`.
+            if (sy.name == kGotBaseSymbolName) continue;
             ExternImport ext;
             ext.symbol      = SymbolId{static_cast<std::uint32_t>(i)};
             ext.mangledName = sy.name;
@@ -612,6 +673,21 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // an address-taken extern function and EVERY aarch64 extern call
             // (aarch64 declares no pltNativeId).
             ext.isData      = (stType(sy.info) != kSttFunc);
+            // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the REFERENCE
+            // binding, through the SAME `stbToBinding` every DEFINED symbol in
+            // this reader uses -- ELF spells a weak reference and a weak
+            // definition in the one `st_info` field, so there is nothing extra
+            // to decode. Reading it as Global (what this arm did until the
+            // import row could hold a binding) silently drops the property that
+            // lets the program link with the symbol absent; ✔MEASURED that gcc
+            // 13.3.0 and clang 18.1.3 both emit `NOTYPE WEAK DEFAULT UND` here,
+            // and DSS's own writer now does too, so the round trip closes.
+            // ⚠ A STB_LOCAL undefined symbol is not a shape any producer emits
+            // (an undefined LOCAL names nothing any linker could resolve);
+            // `stbToBinding` maps it to `SymbolBinding::Local`, which the
+            // link-tier fold `strongerReferenceBinding` treats as contributing
+            // nothing rather than as a third kind of reference.
+            ext.binding     = stbToBinding(stBind(sy.info));
             externBySym.emplace(static_cast<std::uint32_t>(i), mod.externImports.size());
             mod.externImports.push_back(std::move(ext));
             continue;

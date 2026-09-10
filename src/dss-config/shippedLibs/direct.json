@@ -3,7 +3,7 @@
   "header": "direct.h",
   "standard": "msvcrt",
   "availableObjectFormats": ["pe"],
-  "library": { "pe": "ucrtbase.dll" },
+  "library": { "pe": { "role": "cLibrary" } },
   "includes": [
     { "header": "dirent.h", "when": { "format": "pe" } }
   ],

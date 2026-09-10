@@ -23,8 +23,12 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>   // std::strtod — the float reader decodes token TEXT
+#include <deque>
 #include <format>
+#include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -34,8 +38,9 @@
 // `.dsshir` text format (HR7) — see hir_text.hpp for the contract. Grammar at a
 // glance (whitespace-insignificant; LF only; canonical formatting below):
 //
-//   file       := "dsshir" INT preamble module
-//   preamble   := ext_kinds? ext_ops? intrinsics? symbols?   (non-empty sections only)
+//   file       := "dsshir" INT "producer" STR preamble module
+//   preamble   := ext_kinds? ext_ops? intrinsics? buffers? symbols?
+//                 (non-empty sections only)
 //   module     := "module" flags? STR "{" decl* "}"
 //   decl       := function | global | type_decl | extern_function
 //               | extern_global | import_group | ext_node | error
@@ -184,17 +189,17 @@ inline constexpr EnumNameTable<HirTextForClause, 4> kHirTextForClauseTable{{{
 DSS_CHECK_ENUM_NAME_TABLE(kHirTextForClauseTable);
 DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextForClauseTable));
 
-// The keyword that OPENS an expression node line. One row per `parseExprInner`
+// The keyword that OPENS an expression node line. One row per `parseExprHead`
 // arm, and it is also what `parseNode` routes on.
 //
 // ★★★ THIS TABLE REPLACED A THIRD COPY OF THE SET, AND THE THIRD COPY WAS
-// ALREADY WRONG. `parseExprInner`'s `if` ladder listed ten keywords, its
+// ALREADY WRONG. The expression reader's `if` ladder listed ten keywords, its
 // `kTypedExprs` array listed thirteen more, and `isExprKeyword` — the ROUTER that
 // decides whether a line is an expression at all — retyped TWENTY of the
 // twenty-three. ✔MEASURED 2026-08-23: the three it omitted are `va_start`,
 // `va_arg` and `va_end`, all three of which `emitNodeLine` writes via
 // `typedCall`. So a `.dsshir` containing a variadic-access node routed to
-// `parseStmtInner` and came back `unknown statement` — a write-only spelling of
+// the statement reader and came back `unknown statement` — a write-only spelling of
 // exactly the class D-MIR-TEXT-ROUND-TRIP-INCOMPLETE-FOR-OPERAND-CARRYING-FORMS
 // names, produced by the retyped-set defect
 // D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET names. One table, and the router,
@@ -267,7 +272,7 @@ static_assert([] {
 }(), "every HirTextExprKw ordinal must have a row (Count_ stays unlisted)");
 
 // The keyword that OPENS a statement / declaration node line — everything
-// `parseNode` does NOT route to `parseExprInner`. Same treatment, same reason:
+// `parseNode` does NOT route to `parseExprHead`. Same treatment, same reason:
 // the ladder's final `malformed` named no accepted set at all.
 enum class HirTextStmtKw : std::uint8_t {
     Block, If, SehTry, While, Do, For, Switch, Case, Default, Label, Goto,
@@ -345,10 +350,15 @@ static_assert([] {
 // inside `struct "N" opaque`, not a head keyword — advertising it would have
 // told an FFI-descriptor author to write a type this decoder refuses. That is the
 // exact drift this row is about, caught inside one cycle of writing the list.
-inline constexpr std::array<std::string_view, 21> kHirTextTypeKeywords{
+// ⓘ `rec` appears here as a TYPE HEAD — the back-reference `rec <H>` that names
+// an enclosing recursive composite. It is also a MARKER after a composite's name
+// (`struct "Node" rec 1 { … }`), but a marker is not a type head and the two
+// positions never collide: the marker is only ever read where a `{`/`packed`/
+// `opaque` may follow a name, the head only ever where a type may begin.
+inline constexpr std::array<std::string_view, 23> kHirTextTypeKeywords{
     "invalid", "ptr", "ref", "nullable", "optional", "slice", "complex",
-    "volatile", "atomic", "fnptr", "vec", "mat", "arr", "tuple", "struct",
-    "union", "enum", "fn", "ext", "_BitInt", "unsigned",
+    "volatile", "atomic", "aligned", "fnptr", "vec", "mat", "arr", "tuple",
+    "struct", "union", "enum", "fn", "ext", "_BitInt", "unsigned", "rec",
 };
 DSS_CHECK_KEY_VOCABULARY(kHirTextTypeKeywords);
 
@@ -780,13 +790,19 @@ public:
         : hir_(hir), ctx_(ctx), reporter_(reporter) {}
 
     [[nodiscard]] std::string run() {
-        if (!hir_.root().valid()) { out_ += "dsshir 1\n"; return std::move(out_); }
+        // ⚠ THE HEADER IS EMITTED ON BOTH ARMS, INCLUDING THE EMPTY-MODULE ONE.
+        // An empty module is still a `.dsshir` file and must still declare which
+        // format it is and who wrote it — a headerless "empty" artifact is one
+        // a reader cannot version-check, which is the exact failure the version
+        // field exists to prevent.
+        if (!hir_.root().valid()) { emitHeader(); return std::move(out_); }
         prepass(hir_.root());
 
-        out_ += "dsshir 1\n";
+        emitHeader();
         emitExtKinds();
         emitExtOps();
         emitIntrinsics();
+        emitBuffers();
         emitSymbols();
 
         HirNodeId const root = hir_.root();
@@ -816,7 +832,66 @@ private:
     std::unordered_map<std::uint32_t, std::uint32_t> preIndex_;   // HirNodeId.v -> pre-order index
     std::unordered_map<std::uint32_t, std::uint32_t> symHandle_;  // SymbolId.v  -> handle (1..N)
     std::vector<std::uint32_t>                       symOrder_;   // SymbolId.v in first-encounter order
+    // ★★★ BUFFER HANDLES ARE ARTIFACT-LOCAL ORDINALS, NEVER THE `BufferId.v`,
+    // AND THAT IS WHAT MAKES THE EMISSION DETERMINISTIC.
+    // ✔MEASURED 2026-09-07: `BufferId` is a PROCESS-GLOBAL MONOTONIC COUNTER, so
+    // compiling one unchanged source twice in one process emitted `buf 321` and
+    // then `buf 344` — a byte difference produced by nothing but how many other
+    // files that process had opened first. Emission determinism (equal input +
+    // equal revision ⇒ equal bytes) is a property a consumer needs in order to
+    // republish a verdict, and the raw id destroys it for free.
+    // ⓘ This is the SAME device `symOrder_`/`symHandle_` already use for symbols
+    // — a positional handle bound in a preamble section, with the handle number
+    // becoming the rebuilt id on parse — applied to the one other CU-ephemeral
+    // identity the file carries. Assigned by SORTED original id, so the
+    // permutation is a function of the module and not of the caller's
+    // collection order.
+    std::unordered_map<std::uint32_t, std::uint32_t> bufHandle_;  // BufferId.v -> handle (1..N)
+    std::set<std::uint32_t>                          bufSeen_;    // every referenced/named BufferId.v
     bool internerWarned_ = false;
+
+    // ★★★ THE COMPOSITES CURRENTLY BEING SPELLED, innermost last — the cycle guard
+    // for `appendType`. `struct S { int v; struct S *next; }` interns a CYCLIC type
+    // graph: the second field is `ptr<struct S>` whose operand is the struct
+    // itself. A structural walk with nothing tracking what it is already inside
+    // re-enters through that field forever. ✔MEASURED 2026-09-02 on exactly that
+    // declaration — the commonest shape in C — `emitHir` died with
+    // STATUS_STACK_OVERFLOW (0xC00000FD), an uncatchable process kill with no
+    // diagnostic at all.
+    // ⚠ NO DEPTH CAP CAN FIX THIS and reaching for one is the trap: the graph has
+    // no bottom, so a cap only chooses how much stack to burn before the same
+    // crash, and it would ALSO refuse legitimately deep acyclic types. The cycle is
+    // the thing to detect. (The operator's standing order against input-
+    // proportional recursion is the general form of this; here the recursion is not
+    // even input-proportional — it is unbounded on a finite input.)
+    // ⓘ A STACK, not a set: a type repeated as a SIBLING (`tuple<T, T>`) is ordinary
+    // sharing and must still spell twice. Only re-entry into an ANCESTOR is a cycle.
+    std::vector<std::uint32_t> compositesOpen_;
+
+    // ★★★ THE RECURSION HANDLE — ARTIFACT-LOCAL, PER-COMPOSITE, NEVER PER-SPELLING.
+    // A composite whose type graph reaches itself is spelled `struct "Node" rec 1
+    // { … }` and the re-entry point spells `rec 1`. The number is assigned the
+    // first time that composite is OPENED, in the order the writer reaches them,
+    // which is the artifact's own textual order — a function of the module alone,
+    // so a re-emission after a round trip reproduces it (the determinism contract
+    // on `emitHir`). It is the same device `symOrder_`/`symHandle_` and
+    // `bufHandle_` already use for the file's other CU-ephemeral identities.
+    //
+    // ⚠⚠ THE ALTERNATIVE — A RELATIVE (De Bruijn `^N`) MARKER — IS WRONG, AND THE
+    // FAILURE IS SILENT. Under `^N`, `struct B`'s spelling depends on where it was
+    // reached from: standing inside a mutually recursive `struct A` it is
+    // `struct "B" {ptr<^2>}`, standing alone it is `struct "B" {ptr<struct "A"
+    // {ptr<^2>}>}`. A parser keying its forward mint on the SPELLING (the textual
+    // extent, the obvious choice) would then rebuild TWO distinct `B`s from one —
+    // splitting a type's identity across a round trip whose BYTES still matched,
+    // because each spelling re-emits to itself. A handle is context-free, so
+    // handle H means one TypeId per artifact and the split cannot happen.
+    std::unordered_map<std::uint32_t, std::uint32_t> recHandle_;   // TypeId.v -> handle (1..N)
+    std::uint32_t                                    nextRecHandle_ = 0;
+    // Memoized `isCyclicComposite`, keyed on the composite's TypeId.v. Only
+    // composites are asked, and each answer is a property of the type graph, which
+    // is immutable for the life of an emission.
+    std::unordered_map<std::uint32_t, bool>          cyclicCache_;
 
     // Emitter-side diagnostic. Defaults to Error: the cases that reach here
     // (non-Module root, an Extension/IntrinsicCall payload the registry doesn't
@@ -847,17 +922,44 @@ private:
     // index (for DiagnosticInfo.origin references) and collects referenced
     // SymbolIds in first-encounter order (their handles). Must visit children in
     // the same order `emitNodeLine` does (children() order) so indices align.
-    void prepass(HirNodeId id) {
-        std::uint32_t const idx = static_cast<std::uint32_t>(preIndex_.size());
-        preIndex_.emplace(id.v, idx);
-        if (carriesSymbol(hir_.kind(id))) {
-            std::uint32_t const sv = hir_.payload(id);
-            if (!symHandle_.contains(sv)) {
-                symOrder_.push_back(sv);
-                symHandle_.emplace(sv, static_cast<std::uint32_t>(symOrder_.size()));
+    //
+    // ★★★ AN EXPLICIT HEAP WORK STACK, NOT HOST RECURSION
+    // (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED,
+    // the operator's ruling of 2026-09-02). This walk called itself once per tree
+    // level and ran BEFORE the emitter proper, so it was the FIRST thing a deep
+    // module met — its frame is merely thinner than the writer's, which is why the
+    // writer's cycle is what a 2000-term chain hit first. A thinner frame is a
+    // margin, not a property: the same input one order of magnitude deeper lands
+    // here instead.
+    // ⓘ Children are pushed in REVERSE so they pop in `children()` order, which is
+    // exactly the order the recursive form visited them in — the pre-order index
+    // every `@diag(origin …)` in the artifact refers to is therefore unchanged,
+    // and that is what keeps the output byte-identical.
+    void prepass(HirNodeId root) {
+        std::vector<HirNodeId> stack;
+        stack.push_back(root);
+        while (!stack.empty()) {
+            HirNodeId const id = stack.back();
+            stack.pop_back();
+            std::uint32_t const idx = static_cast<std::uint32_t>(preIndex_.size());
+            preIndex_.emplace(id.v, idx);
+            if (carriesSymbol(hir_.kind(id))) {
+                std::uint32_t const sv = hir_.payload(id);
+                if (!symHandle_.contains(sv)) {
+                    symOrder_.push_back(sv);
+                    symHandle_.emplace(sv, static_cast<std::uint32_t>(symOrder_.size()));
+                }
             }
+            // Every buffer a `@loc` will name must reach the `buffers` section, or
+            // the annotation points at an ordinal the file does not define.
+            if (ctx_.sourceMap != nullptr) {
+                if (auto const* loc = ctx_.sourceMap->tryGet(id)) {
+                    if (loc->buffer.valid()) bufSeen_.insert(loc->buffer.v);
+                }
+            }
+            auto const kids = hir_.children(id);
+            for (std::size_t i = kids.size(); i-- > 0;) stack.push_back(kids[i]);
         }
-        for (HirNodeId c : hir_.children(id)) prepass(c);
     }
 
     [[nodiscard]] std::string indent(int n) const { return std::string(static_cast<std::size_t>(n) * 2, ' '); }
@@ -888,7 +990,144 @@ private:
     }
 
     // ── type printer (structural; nominal types by interned name) ────────────
-    void appendType(TypeId t) {
+    //
+    // ★★★ AN EXPLICIT HEAP WORK STACK, NOT HOST RECURSION
+    // (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED,
+    // the operator's ruling of 2026-09-02): the same `TypeEmitTask` machine
+    // `mir_text.cpp` adopted in P55, transferred here. `appendType(root)` runs
+    // the tasks; `appendTypeStep` renders ONE type node and pushes whatever
+    // remains — the arms that used to call `appendType` for an operand now
+    // push it. Tasks are pushed in REVERSE so they come back out in text
+    // order, and the output is byte-identical to the recursive form. The
+    // cycle guard's pop is a `CloseComposite` task pushed under everything
+    // the composite renders, which is exactly when the recursive form's
+    // scope-bound `PopGuard` ran.
+    struct TypeEmitTask {
+        enum class Kind : std::uint8_t { Type, Text, CloseComposite };
+        Kind          kind = Kind::Type;
+        TypeId        type{};
+        std::string   text;
+        std::uint32_t tag = 0;   // CloseComposite: the composite being closed
+    };
+
+    // ── isCyclicComposite ────────────────────────────────────────────────────
+    //
+    // Does `root`'s own type graph reach `root` again? That — not "is it a
+    // struct", not "how deep is it" — is the predicate that decides whether a
+    // composite needs a `rec <H>` marker, because it is exactly the condition
+    // under which the structural walk would otherwise re-enter it.
+    //
+    // ★ REACHABILITY FROM `root`, NOT A GENERIC "IS THIS NODE ON SOME CYCLE".
+    // `struct Outer { struct Node *n; }` is NOT recursive even though `Node` is,
+    // and marking it would put a handle on a composite nothing ever refers back
+    // to — noise in the file and a byte difference for a property that is false.
+    //
+    // ⚠ THE WALK NORMALIZES THROUGH THE QUALIFIER SKIN, and that is not a
+    // nicety: `operands()` is qualifier-TRANSPARENT, so walking
+    // `struct S { volatile struct S *next; }` would step from `volatile S`
+    // straight to S's FIELDS and never observe `S` itself — reporting acyclic
+    // for a graph the writer then re-enters. The writer strips the skin before
+    // it re-enters (`pushType(in.stripVolatile(t))`), so the predicate must
+    // compare the same stripped identity or the two disagree.
+    //
+    // No host recursion (the operator's 2026-09-02 standing order): an explicit
+    // heap work stack, and a `seen` set — without which this walk is exactly the
+    // unbounded loop it exists to detect.
+    [[nodiscard]] bool isCyclicComposite(TypeId root) {
+        if (auto const it = cyclicCache_.find(root.v); it != cyclicCache_.end()) return it->second;
+        TypeInterner const& in = *ctx_.interner;
+        bool found = false;
+        std::set<std::uint32_t> seen;
+        std::vector<TypeId>     work;
+        auto pushOperands = [&](TypeId u) {
+            for (TypeId op : std::span<TypeId const>{in.operands(u)}) {
+                if (op.valid()) work.push_back(op);
+            }
+        };
+        pushOperands(root);
+        while (!work.empty()) {
+            TypeId const u = in.stripVolatile(work.back());
+            work.pop_back();
+            if (u.v == root.v) { found = true; break; }
+            if (!seen.insert(u.v).second) continue;
+            pushOperands(u);
+        }
+        cyclicCache_.emplace(root.v, found);
+        return found;
+    }
+
+    // The handle for a composite already known to be recursive, minted on first
+    // open. 1-based, so 0 stays available as "this composite is not recursive".
+    [[nodiscard]] std::uint32_t mintRecHandle(TypeId t) {
+        auto const [it, minted] = recHandle_.try_emplace(t.v, nextRecHandle_ + 1);
+        if (minted) ++nextRecHandle_;
+        return it->second;
+    }
+
+    void appendType(TypeId root) {
+        std::vector<TypeEmitTask> stack;
+        stack.push_back(TypeEmitTask{.kind = TypeEmitTask::Kind::Type, .type = root});
+        while (!stack.empty()) {
+            TypeEmitTask task = std::move(stack.back());
+            stack.pop_back();
+            switch (task.kind) {
+                case TypeEmitTask::Kind::Text:
+                    out_ += task.text;
+                    continue;
+                case TypeEmitTask::Kind::CloseComposite:
+                    // The field list is finished; the composite is no longer an
+                    // ancestor of anything still to render.
+                    if (!compositesOpen_.empty() && compositesOpen_.back() == task.tag) {
+                        compositesOpen_.pop_back();
+                    } else {
+                        // Unreachable by construction (a CloseComposite is pushed
+                        // with, and only with, its own open entry). Fail loud
+                        // rather than silently desynchronize the cycle guard.
+                        report("internal: HIR type emitter's composite open-set "
+                               "desynchronized", DiagnosticSeverity::Error);
+                        compositesOpen_.clear();
+                    }
+                    continue;
+                case TypeEmitTask::Kind::Type:
+                    break;
+            }
+            appendTypeStep(task.type, stack);
+        }
+    }
+
+    // Render ONE type node, pushing whatever remains onto `stack`. Every arm
+    // that used to recurse now pushes; nothing here calls itself.
+    void appendTypeStep(TypeId t, std::vector<TypeEmitTask>& stack) {
+        using Kind = TypeEmitTask::Kind;
+        auto pushText = [&](std::string s) {
+            stack.push_back(TypeEmitTask{.kind = Kind::Text, .text = std::move(s)});
+        };
+        auto pushType = [&](TypeId ty) {
+            stack.push_back(TypeEmitTask{.kind = Kind::Type, .type = ty});
+        };
+        // `ops` rendered comma-separated, then `closer`. Pushed in reverse so it
+        // comes back out in source order.
+        auto pushArgs = [&](std::span<TypeId const> ops, std::string closer) {
+            pushText(std::move(closer));
+            for (std::size_t i = ops.size(); i-- > 0;) {
+                pushType(ops[i]);
+                if (i != 0) pushText(", ");
+            }
+        };
+        // A field list where field `i` is followed by its own marker text, then
+        // `closer` — the struct / union arms' per-field `@off` / `~align` /
+        // ` packed` spellings, kept in text order.
+        auto pushFieldList = [&](std::span<TypeId const> ops,
+                                 auto const& markerFor, std::string closer) {
+            pushText(std::move(closer));
+            for (std::size_t i = ops.size(); i-- > 0;) {
+                std::string marker = markerFor(i);
+                if (!marker.empty()) pushText(std::move(marker));
+                pushType(ops[i]);
+                if (i != 0) pushText(", ");
+            }
+        };
+
         if (!t.valid()) { out_ += "invalid"; return; }
         if (ctx_.interner == nullptr) {
             if (!internerWarned_) {
@@ -911,43 +1150,106 @@ private:
         // bits back into ONE skin on reintern (`atomic<volatile<T>>` → bits{V,A}), so
         // the round-trip is identity. `atomic` outermost is the canonical order (the
         // bitset is order-independent — this only fixes a deterministic spelling).
-        if (in.isVolatileQualified(t) || in.isAtomicQualified(t)) {
+        // ★★ P66 (lane `al`): the SAME argument, one channel over. A TYPE-LEVEL
+        // ALIGNMENT (GNU `aligned(N)` on a typedef) rides the same skin and is
+        // equally invisible to the kind switch, so it must be spelled here too or an
+        // over-aligned alias round-trips to a bare `i32` and the alignment is gone —
+        // write-only, exactly the volatile-drops-in-text gap the qualifier arm closed.
+        // Spelled `aligned<T, N>`, the `arr<T, N>` shape (operand first, scalar
+        // second) rather than a new punctuation. It is the OUTERMOST wrapper because
+        // `parseType` merges every skin back into ONE record regardless of nesting
+        // order, so the order only fixes a deterministic spelling.
+        std::uint32_t const typeAlign = in.typeAlignOverride(t);
+        if (typeAlign != 0 || in.isVolatileQualified(t) || in.isAtomicQualified(t)) {
             bool const atom = in.isAtomicQualified(t);
             bool const vol  = in.isVolatileQualified(t);
+            if (typeAlign != 0) out_ += "aligned<";
             if (atom) out_ += "atomic<";
             if (vol)  out_ += "volatile<";
-            appendType(in.stripVolatile(t));   // the material type (skin stripped)
-            if (vol)  out_ += '>';
-            if (atom) out_ += '>';
+            std::string closers;
+            if (vol)  closers += '>';
+            if (atom) closers += '>';
+            if (typeAlign != 0) closers += std::format(", {}>", typeAlign);
+            pushText(std::move(closers));
+            pushType(in.stripVolatile(t));   // the material type (skin stripped)
             return;
         }
-        auto args = [&](std::span<TypeId const> ops) {
-            bool first = true;
-            for (TypeId o : ops) { if (!first) out_ += ", "; appendType(o); first = false; }
-        };
-        switch (in.kind(t)) {
-            case TypeKind::Ptr:      out_ += "ptr<";      appendType(in.operands(t)[0]); out_ += '>'; return;
-            case TypeKind::Ref:      out_ += "ref<";      appendType(in.operands(t)[0]); out_ += '>'; return;
-            case TypeKind::Nullable: out_ += "nullable<"; appendType(in.operands(t)[0]); out_ += '>'; return;
-            case TypeKind::Optional: out_ += "optional<"; appendType(in.operands(t)[0]); out_ += '>'; return;
-            case TypeKind::Slice:    out_ += "slice<";    appendType(in.operands(t)[0]); out_ += '>'; return;
-            case TypeKind::FnPtr:    out_ += "fnptr<";    appendType(in.operands(t)[0]); out_ += '>'; return;
+        // The cycle guard, applied to the NOMINAL composites only. A cycle can only
+        // close through one of these: a type graph becomes cyclic exactly when a
+        // forward-declared composite is completed with a field that reaches back to
+        // it, and structural kinds (ptr/arr/tuple/…) cannot be forward-declared. So
+        // this is where re-entry is both possible and detectable, and the hot
+        // structural arms pay nothing.
+        //
+        // ★★★ v3: RE-ENTRY IS NOW SPELLED, NOT REFUSED. Until v3 this wrote the
+        // poison `?` and an Error, because the grammar had no back-reference form —
+        // which made `struct Node { struct Node *next; }`, and therefore every
+        // linked list, tree, intrusive container and parent pointer in real C,
+        // unrepresentable. The back-reference is `rec <H>`, where H is the handle
+        // the enclosing composite carries on its own name. The two rejected
+        // alternatives are still rejected and for their original reasons: `opaque`
+        // would reintern a COMPLETE struct as INCOMPLETE (a silent ABI drop), and
+        // re-spelling the bare name would reintern as a DIFFERENT type.
+        TypeKind const kind = in.kind(t);
+        bool const nominal = (kind == TypeKind::Struct || kind == TypeKind::Union);
+        std::uint32_t recH = 0;   // 0 = this composite is not recursive
+        if (nominal) {
+            for (std::uint32_t open : compositesOpen_) {
+                if (open != t.v) continue;
+                auto const it = recHandle_.find(t.v);
+                if (it == recHandle_.end()) {
+                    // Unreachable by construction: a composite can only be RE-ENTERED
+                    // if it reaches itself, which is precisely `isCyclicComposite`, and
+                    // that is what mints the handle when it is opened. If the two ever
+                    // disagree, say so — a bare name here would reintern as a different
+                    // type, which is the silent miscompile this whole arm exists to
+                    // prevent.
+                    report(std::format(
+                               "internal: {} \"{}\" was re-entered by the type writer "
+                               "with no recursion handle — the cyclicity predicate and "
+                               "the open-composite stack disagree; the type is emitted "
+                               "as '?', which is refused on the way back in",
+                               kind == TypeKind::Struct ? "struct" : "union", in.name(t)),
+                           DiagnosticSeverity::Error);
+                    out_ += '?';
+                    return;
+                }
+                out_ += std::format("rec {}", it->second);
+                return;
+            }
+            if (isCyclicComposite(t)) recH = mintRecHandle(t);
+            compositesOpen_.push_back(t.v);
+            // Runs after everything this composite pushes — the recursive form's
+            // scope-bound `PopGuard`, as a task.
+            stack.push_back(TypeEmitTask{.kind = Kind::CloseComposite, .tag = t.v});
+        }
+        switch (kind) {
+            case TypeKind::Ptr:      out_ += "ptr<";      pushArgs(in.operands(t).first(1), ">"); return;
+            case TypeKind::Ref:      out_ += "ref<";      pushArgs(in.operands(t).first(1), ">"); return;
+            case TypeKind::Nullable: out_ += "nullable<"; pushArgs(in.operands(t).first(1), ">"); return;
+            case TypeKind::Optional: out_ += "optional<"; pushArgs(in.operands(t).first(1), ">"); return;
+            case TypeKind::Slice:    out_ += "slice<";    pushArgs(in.operands(t).first(1), ">"); return;
+            case TypeKind::FnPtr:    out_ += "fnptr<";    pushArgs(in.operands(t).first(1), ">"); return;
             case TypeKind::Vector:
-                out_ += "vec<"; appendType(in.operands(t)[0]);
-                out_ += std::format(", {}>", in.scalars(t)[0]); return;
+                out_ += "vec<";
+                pushArgs(in.operands(t).first(1), std::format(", {}>", in.scalars(t)[0]));
+                return;
             case TypeKind::Matrix:
-                out_ += "mat<"; appendType(in.operands(t)[0]);
-                out_ += std::format(", {}, {}>", in.scalars(t)[0], in.scalars(t)[1]); return;
+                out_ += "mat<";
+                pushArgs(in.operands(t).first(1),
+                         std::format(", {}, {}>", in.scalars(t)[0], in.scalars(t)[1]));
+                return;
             // C99 _Complex (D-CSUBSET-COMPLEX, M1): `complex<elem>` — the bidirectional
             // twin of parseType's `complex` keyword. So a `double complex` typedef /
             // the `__builtin_complex` signature spells a genuine Complex type through
             // the shipped-lib text codec.
             case TypeKind::Complex:
-                out_ += "complex<"; appendType(in.operands(t)[0]); out_ += '>'; return;
+                out_ += "complex<"; pushArgs(in.operands(t).first(1), ">"); return;
             case TypeKind::Array:
-                out_ += "arr<"; appendType(in.operands(t)[0]);
-                out_ += std::format(", {}>", in.scalars(t)[0]); return;
-            case TypeKind::Tuple:  out_ += "tuple<"; args(in.operands(t)); out_ += '>'; return;
+                out_ += "arr<";
+                pushArgs(in.operands(t).first(1), std::format(", {}>", in.scalars(t)[0]));
+                return;
+            case TypeKind::Tuple:  out_ += "tuple<"; pushArgs(in.operands(t), ">"); return;
             case TypeKind::Struct: {
                 out_ += "struct "; out_ += quote(in.name(t));
                 // D-FFI-OPAQUE-TAG-HAS-NO-SPELLING: an INCOMPLETE composite has no
@@ -958,6 +1260,14 @@ private:
                 // below exists to prevent, and the marker follows its precedent: a
                 // bare keyword after the name. No braces follow `opaque`.
                 if (in.isIncompleteComposite(t)) { out_ += " opaque"; return; }
+                // v3: the recursion marker, between the name and every layout
+                // marker, so a reader meets the composite's IDENTITY before its
+                // shape — and so the parser can mint the forward id (which the
+                // field list needs in order to close the cycle) before it reads a
+                // single field. An incomplete composite returned above: it has no
+                // field list, so nothing can reach back through it, so `opaque` and
+                // `rec` are mutually exclusive by construction rather than by rule.
+                if (recH != 0) out_ += std::format(" rec {}", recH);
                 // D-CSUBSET-PACKED: emit a ` packed` marker for a packed struct so the
                 // whole-composite packed flag round-trips (else it would reintern
                 // UNPACKED — a silent ABI drop across the text boundary). May combine
@@ -973,33 +1283,64 @@ private:
                 // carries offsets XOR aligns). The `~` marker never collides with the
                 // offset `@`; both round-trip through parseType below.
                 if (in.hasExplicitOffsets(t)) {
-                    auto const ops = in.operands(t);
-                    bool first = true;
-                    for (std::size_t i = 0; i < ops.size(); ++i) {
-                        if (!first) out_ += ", ";
-                        appendType(ops[i]);
+                    pushFieldList(in.operands(t), [&](std::size_t i) {
                         auto const off = in.explicitFieldOffset(t, i);
-                        out_ += std::format(" @{}", off ? *off : 0);
-                        first = false;
-                    }
-                } else if (in.hasExplicitAligns(t)) {
-                    auto const ops = in.operands(t);
-                    bool first = true;
-                    for (std::size_t i = 0; i < ops.size(); ++i) {
-                        if (!first) out_ += ", ";
-                        appendType(ops[i]);
-                        out_ += std::format(" ~{}", in.explicitFieldAlign(t, i));
-                        first = false;
-                    }
+                        return std::format(" @{}", off ? *off : 0);
+                    }, "}");
+                } else if (in.hasExplicitAligns(t) || in.hasFieldPacked(t)) {
+                    // D-CSUBSET-PER-MEMBER-PACKED: a PER-FIELD ` packed` marker — the
+                    // SAME keyword the whole-composite flag uses, one grammar position
+                    // further in, mirroring C's own spelling of the same attribute at
+                    // two grains. It shares this arm with `~<align>` rather than taking
+                    // its own because the two legitimately COMBINE (`int z
+                    // __attribute__((packed, aligned(2)))` is field-align 2, MEASURED),
+                    // and it is emitted ONLY on the fields that carry it, so the
+                    // all-or-none span is recovered on the parse side by "did ANY field
+                    // say packed". Without this the flag would reintern absent across
+                    // the text boundary — the silent ABI drop the composite marker
+                    // above exists to prevent, in the channel where it is HARDEST to
+                    // see (same size, same alignment, one moved offset).
+                    bool const hasA = in.hasExplicitAligns(t);
+                    bool const hasP = in.hasFieldPacked(t);
+                    pushFieldList(in.operands(t), [&](std::size_t i) {
+                        std::string marker;
+                        if (hasA) marker += std::format(" ~{}", in.explicitFieldAlign(t, i));
+                        if (hasP && in.isFieldPacked(t, i)) marker += " packed";
+                        return marker;
+                    }, "}");
                 } else {
-                    args(in.operands(t));
+                    pushArgs(in.operands(t), "}");
                 }
-                out_ += '}'; return;
+                return;
             }
             case TypeKind::Union: {
                 out_ += "union ";  out_ += quote(in.name(t));
+                // ⚠ THE `opaque` MARKER IS NOT A STRUCT-ONLY FACT, and its absence
+                // here was a silent ABI drop of exactly the class
+                // D-FFI-OPAQUE-TAG-HAS-NO-SPELLING closed for the struct arm.
+                // `union U;` used as `union U *p;` is ordinary C and interns an
+                // INCOMPLETE composite; this arm wrote `union "U" {}` for it, which
+                // is a LEGAL COMPLETE ZERO-MEMBER union — so a round trip turned an
+                // opaque tag into a size-0 complete type with no diagnostic
+                // anywhere. `isIncompleteComposite` covers Struct AND Union; the
+                // spelling now does too.
+                if (in.isIncompleteComposite(t)) { out_ += " opaque"; return; }
+                if (recH != 0) out_ += std::format(" rec {}", recH);   // v3 (see struct)
                 if (in.isPacked(t)) out_ += " packed";   // D-CSUBSET-PACKED (see struct)
-                out_ += " {"; args(in.operands(t)); out_ += '}'; return;
+                out_ += " {";
+                // D-CSUBSET-PER-MEMBER-PACKED: the union half of the per-field marker.
+                // A union member can carry the attribute individually and it lowers the
+                // UNION's own alignment when that member was the max contributor
+                // (MEASURED: `union {char a; int z <pk>;}` is 4/_Alignof 1 vs the
+                // control's 4/4) — size-blind, so a dropped flag is invisible.
+                if (in.hasFieldPacked(t)) {
+                    pushFieldList(in.operands(t), [&](std::size_t i) {
+                        return std::string{in.isFieldPacked(t, i) ? " packed" : ""};
+                    }, "}");
+                } else {
+                    pushArgs(in.operands(t), "}");
+                }
+                return;
             }
             // D5.5: enum is nominal-by-name; underlying TypeKind lives in
             // scalars[0]. Round-trip the underlying explicitly when it
@@ -1050,31 +1391,43 @@ private:
                 return;
             }
             case TypeKind::FnSig: {
+                // `fn(P0, P1[, ...]) -> R [cc NAME]`. The trailing calling-
+                // convention run is decided HERE (it reads only this node's
+                // scalars) and carried as a Text task so it lands after the
+                // result type. Reverse execution order: the cc tail, then the
+                // result, then `) -> `, then the variadic marker, then the
+                // parameter list.
                 out_ += "fn(";
                 auto const ps = in.fnParams(t);
-                args(ps);
-                // Emit the variadic marker so a variadic FnSig round-trips through
-                // text (the scalars[1] flag would otherwise be lost on reparse).
-                if (in.fnIsVariadic(t)) { out_ += ps.empty() ? "..." : ", ..."; }
-                out_ += ") -> ";
-                appendType(in.fnResult(t));
+                std::string tail;
                 auto sc = in.scalars(t);
                 if (!sc.empty()) {
                     auto const cc = static_cast<CallConv>(sc[0]);
-                    if (cc != CallConv::CcSysV) { out_ += " cc "; out_ += callConvName(cc); }
+                    if (cc != CallConv::CcSysV) { tail += " cc "; tail += callConvName(cc); }
+                }
+                if (!tail.empty()) pushText(std::move(tail));
+                pushType(in.fnResult(t));
+                pushText(") -> ");
+                // Emit the variadic marker so a variadic FnSig round-trips through
+                // text (the scalars[1] flag would otherwise be lost on reparse).
+                if (in.fnIsVariadic(t)) pushText(ps.empty() ? "..." : ", ...");
+                for (std::size_t i = ps.size(); i-- > 0;) {
+                    pushType(ps[i]);
+                    if (i != 0) pushText(", ");
                 }
                 return;
             }
             case TypeKind::Extension: {
                 out_ += "ext "; out_ += quote(in.name(t)); out_ += " (";
-                args(in.operands(t)); out_ += ')';
+                std::string tail = ")";
                 auto sc = in.scalars(t);
                 if (!sc.empty()) {
-                    out_ += " [";
+                    tail += " [";
                     bool first = true;
-                    for (auto s : sc) { if (!first) out_ += ", "; out_ += std::format("{}", s); first = false; }
-                    out_ += ']';
+                    for (auto s : sc) { if (!first) tail += ", "; tail += std::format("{}", s); first = false; }
+                    tail += ']';
                 }
+                pushArgs(in.operands(t), std::move(tail));
                 return;
             }
             case TypeKind::BitInt: {  // C23 _BitInt(N) (D-CSUBSET-BITINT) — debug dump
@@ -1122,8 +1475,12 @@ private:
         if (ctx_.diagnosticMap) if (auto const* v = ctx_.diagnosticMap->tryGet(id)) sink(fmtDiag(*v));
     }
 
-    [[nodiscard]] static std::string fmtLoc(HirSourceLoc const& v) {
-        return std::format("@loc(buf {}, {}..{})", v.buffer.v, v.span.start(), v.span.end());
+    // ⚠ NOT `static`, and no longer prints `v.buffer.v`: the artifact names the
+    // buffer by its ARTIFACT-LOCAL HANDLE (see `bufHandle_`). Printing the raw
+    // `BufferId` put a process-global counter in the output bytes.
+    [[nodiscard]] std::string fmtLoc(HirSourceLoc const& v) const {
+        return std::format("@loc(buf {}, {}..{})", bufHandleOf(v.buffer),
+                           v.span.start(), v.span.end());
     }
     [[nodiscard]] static std::string fmtFfi(FfiMetadata const& v) {
         std::string s = "@ffi(";
@@ -1183,20 +1540,182 @@ private:
 
     // ── per-node emission ────────────────────────────────────────────────────
 
-    // A node on its own line(s) at `ind`. Used for decls, statements, and the
-    // Extension/Error wildcards. Expression-kind nodes are emitted inline instead.
-    void emitNodeLine(HirNodeId id, int ind) {
-        if (isExprKind(hir_.kind(id))) {
-            emitAttrsBlock(id, ind);
-            out_ += indent(ind);
-            emitExpr(id);
-            out_ += '\n';
-            return;
-        }
-        emitStmtLike(id, ind);
+    // ★★★ THE NODE WALK RUNS ON AN EXPLICIT HEAP WORK STACK, NOT HOST RECURSION
+    // (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED,
+    // the operator's ruling of 2026-09-02) — the same `TypeEmitTask` /
+    // `LiteralEmitTask` machine this file already runs its TYPE and its LITERAL
+    // printers on, finally applied to the walk beside them.
+    //
+    // ⚠⚠ THE ROW ABOVE READS ✅ CLOSED AND THIS WALK SHIPPED RECURSIVE ANYWAY.
+    // That conversion took the two printers and left the node walk they hang off,
+    // which is the shape a partial fix takes when the instrument only measures the
+    // part that was converted. ✔MEASURED 2026-09-08, gdb 14.2 on the mingw-w64
+    // Debug build: `dsscp --emit-hir` on `int main(void){int x=0; return x +1 +1
+    // …;}` with 2000 terms died with STATUS_STACK_OVERFLOW (0xC00000FD), zero
+    // bytes on stderr, no diagnostic — 3333 frames closing a TWO-frame cycle,
+    // `Emitter::emitExpr` → its own `operands` lambda → `emitExpr`, at 616 bytes
+    // per frame (the CFA delta between frames 200 and 400 divided by 200), i.e.
+    // ~1232 bytes per level of expression nesting against a 2 MiB reserve. The
+    // same file went through `--compile` at rc 0, because nothing downstream of
+    // the parser holds a frame per level any more. A left-associative chain is the
+    // shape that finds this: the parser climbs it ITERATIVELY, so it never counts
+    // against `parser.maxExpressionDepth`, yet the HIR it builds is N deep.
+    //
+    // ⚠⚠ AND IT WAS REACHABLE FROM THE REPOSITORY'S OWN SHIPPED CORPUS, not only
+    // from a synthetic chain. ✔MEASURED 2026-09-08 over all 794 `examples/c`
+    // cases: `examples/c/deep_comma_chain_lowers_in_order` — the RUNNABLE WITNESS
+    // that same closed row wrote (P61, lane `ml`) to prove its MIR-tier half costs
+    // heap — exited 0xC00000FD under `--emit-hir` before this conversion and rc 0
+    // after. The row's own example was a live repro of the half the row missed,
+    // and nothing saw it because no test and no examples runner emits `.dsshir`.
+    //
+    // ⓘ ONE STACK FOR THE WHOLE CYCLE, not one per function. `emitNodeLine`,
+    // `emitStmtLike`, `emitExpr`, `emitParam`, `emitCaseArm`, `emitExtOrError` and
+    // the inline-asm operand list called one another in a ring; flattening any
+    // proper subset of a ring leaves the ring. Each is now a `…Step` that renders
+    // ONE node — writing everything up to its first child DIRECTLY, exactly as
+    // before — and pushes what remains. Tasks are pushed in REVERSE so they come
+    // back out in text order, which is what makes the output byte-identical to the
+    // recursive form.
+    struct NodeEmitTask {
+        enum class Kind : std::uint8_t {
+            Node,        // `emitNodeLine`  — a decl / statement / wildcard line
+            Expr,        // `emitExpr`      — an inline expression
+            Param,       // `emitParam`     — a parameter line inside a function
+            CaseArm,     // `emitCaseArm`   — one `case`/`default` dispatch entry
+            AsmOperand,  // one inline-asm operand, `index` selecting which
+            AsmTail,     // an inline-asm descriptor's clobbers / labels / closer
+            Text,        // a precomputed literal run (a closer, a separator)
+        };
+        Kind          kind  = Kind::Node;
+        HirNodeId     id{};
+        int           ind   = 0;   // Node / Param / CaseArm: the indent column
+        std::uint32_t depth = 0;   // HIR tree levels below this emission's root
+        std::uint32_t index = 0;   // AsmOperand: which operand of the descriptor
+        std::string   text;        // Text: the run to append
+    };
+
+    static void pushText(std::vector<NodeEmitTask>& stack, std::string s) {
+        stack.push_back(NodeEmitTask{.kind = NodeEmitTask::Kind::Text, .text = std::move(s)});
+    }
+    static void pushNode(std::vector<NodeEmitTask>& stack, HirNodeId id, int ind,
+                         std::uint32_t depth) {
+        stack.push_back(NodeEmitTask{.kind = NodeEmitTask::Kind::Node, .id = id,
+                                     .ind = ind, .depth = depth});
+    }
+    static void pushExpr(std::vector<NodeEmitTask>& stack, HirNodeId id,
+                         std::uint32_t depth) {
+        stack.push_back(NodeEmitTask{.kind = NodeEmitTask::Kind::Expr, .id = id,
+                                     .depth = depth});
+    }
+    static void pushParam(std::vector<NodeEmitTask>& stack, HirNodeId id, int ind,
+                          std::uint32_t depth) {
+        stack.push_back(NodeEmitTask{.kind = NodeEmitTask::Kind::Param, .id = id,
+                                     .ind = ind, .depth = depth});
+    }
+    static void pushCaseArm(std::vector<NodeEmitTask>& stack, HirNodeId id, int ind,
+                            std::uint32_t depth) {
+        stack.push_back(NodeEmitTask{.kind = NodeEmitTask::Kind::CaseArm, .id = id,
+                                     .ind = ind, .depth = depth});
+    }
+    static void pushAsmOperand(std::vector<NodeEmitTask>& stack, HirNodeId id,
+                               std::uint32_t index, std::uint32_t depth) {
+        stack.push_back(NodeEmitTask{.kind = NodeEmitTask::Kind::AsmOperand, .id = id,
+                                     .depth = depth, .index = index});
+    }
+    static void pushAsmTail(std::vector<NodeEmitTask>& stack, HirNodeId id,
+                            std::uint32_t depth) {
+        stack.push_back(NodeEmitTask{.kind = NodeEmitTask::Kind::AsmTail, .id = id,
+                                     .depth = depth});
     }
 
-    void emitStmtLike(HirNodeId id, int ind) {
+    // Said ONCE per emission, the way the absent-interner warning is: a wide tree
+    // at the limit refuses many nodes for one cause, and repeating the sentence
+    // per node would bury the rest of the report without adding a fact.
+    bool depthRefused_ = false;
+
+    // ★★ THE COUNTER THAT REPLACED THE HOST STACK, FAILING LOUD.
+    // A node past `kHirTextMaxNodeDepth` is refused BY NAME, positioned by the
+    // artifact's OWN coordinate (the pre-order index every `@diag(origin …)`
+    // refers to) plus the source span when a source map is in scope, and its place
+    // in the text gets the `?` poison token this file already uses for a value the
+    // format cannot spell. ⚠ NOT `error`: an `error` node is a LEGAL construct, so
+    // truncating to one would hand a consumer a smaller program that parses
+    // cleanly — the silent-miscompile shape. `?` is refused on the way back in,
+    // and the Error severity is what makes `--emit-hir` exit non-zero.
+    void refuseTooDeep(NodeEmitTask const& task) {
+        if (!depthRefused_) {
+            depthRefused_ = true;
+            std::string where;
+            if (auto const it = preIndex_.find(task.id.v); it != preIndex_.end())
+                where = std::format(" at node #{}", it->second);
+            if (ctx_.sourceMap != nullptr) {
+                if (auto const* loc = ctx_.sourceMap->tryGet(task.id))
+                    where += std::format(" {}", fmtLoc(*loc));
+            }
+            report(std::format(
+                       "module nesting reaches depth {}{}, past the `.dsshir` "
+                       "format's limit of {} levels — the module cannot be "
+                       "spelled; every node at or below that depth is written as "
+                       "the `?` token, which is refused on the way back in",
+                       task.depth, where, kHirTextMaxNodeDepth),
+                   DiagnosticSeverity::Error);
+        }
+        if (task.kind == NodeEmitTask::Kind::Node
+            || task.kind == NodeEmitTask::Kind::Param
+            || task.kind == NodeEmitTask::Kind::CaseArm) {
+            out_ += indent(task.ind);
+            out_ += "?\n";
+        } else {
+            out_ += '?';
+        }
+    }
+
+    // A node on its own line(s) at `ind`. Used for decls, statements, and the
+    // Extension/Error wildcards. Expression-kind nodes are emitted inline instead.
+    //
+    // THE DRIVER — the only entry point, and the only place a stack is created.
+    // `run()` calls it once per module declaration, so `depth` counts levels below
+    // that declaration; every INTERNAL edge that used to re-enter here pushes a
+    // task instead.
+    void emitNodeLine(HirNodeId id, int ind) {
+        std::vector<NodeEmitTask> stack;
+        pushNode(stack, id, ind, 0);
+        while (!stack.empty()) {
+            NodeEmitTask task = std::move(stack.back());
+            stack.pop_back();
+            if (task.kind == NodeEmitTask::Kind::Text) { out_ += task.text; continue; }
+            if (task.depth > kHirTextMaxNodeDepth) { refuseTooDeep(task); continue; }
+            switch (task.kind) {
+                case NodeEmitTask::Kind::Node:       emitNodeLineStep(task, stack); continue;
+                case NodeEmitTask::Kind::Expr:       emitExprStep(task, stack);     continue;
+                case NodeEmitTask::Kind::Param:      emitParamStep(task, stack);    continue;
+                case NodeEmitTask::Kind::CaseArm:    emitCaseArmStep(task, stack);  continue;
+                case NodeEmitTask::Kind::AsmOperand: emitAsmOperandStep(task, stack); continue;
+                case NodeEmitTask::Kind::AsmTail:    emitInlineAsmTailStep(task, stack); continue;
+                case NodeEmitTask::Kind::Text:       break;  // handled above
+            }
+        }
+    }
+
+    void emitNodeLineStep(NodeEmitTask const& task, std::vector<NodeEmitTask>& stack) {
+        HirNodeId const id = task.id;
+        if (isExprKind(hir_.kind(id))) {
+            emitAttrsBlock(id, task.ind);
+            out_ += indent(task.ind);
+            pushText(stack, "\n");
+            // The SAME node, rendered inline — a routing hop, not a tree level, so
+            // the depth is carried across unchanged.
+            pushExpr(stack, id, task.depth);
+            return;
+        }
+        emitStmtLikeStep(task, stack);
+    }
+
+    void emitStmtLikeStep(NodeEmitTask const& task, std::vector<NodeEmitTask>& stack) {
+        HirNodeId const       id    = task.id;
+        int const             ind   = task.ind;
+        std::uint32_t const   depth = task.depth;
         emitAttrsBlock(id, ind);
         out_ += indent(ind);
         HirFlags const f = hir_.flags(id);
@@ -1209,9 +1728,10 @@ private:
                 out_ += std::format(" %{} : ", handleOf(hir_.payload(id)));
                 appendType(hir_.functionSignature(id));
                 out_ += " {\n";
-                for (HirNodeId p : hir_.functionParams(id)) emitParam(p, ind + 1);
-                emitNodeLine(hir_.functionBody(id), ind + 1);
-                out_ += indent(ind); out_ += "}\n";
+                pushText(stack, indent(ind) + "}\n");
+                pushNode(stack, hir_.functionBody(id), ind + 1, depth + 1);
+                auto const ps = hir_.functionParams(id);
+                for (std::size_t i = ps.size(); i-- > 0;) pushParam(stack, ps[i], ind + 1, depth + 1);
                 return;
             }
             case HirKind::ExternFunction: {
@@ -1219,16 +1739,17 @@ private:
                 out_ += std::format(" %{}", handleOf(hir_.payload(id)));
                 if (hir_.externFunctionSignature(id).valid()) { out_ += " : "; appendType(hir_.externFunctionSignature(id)); }
                 out_ += " {\n";
-                for (HirNodeId p : hir_.externFunctionParams(id)) emitParam(p, ind + 1);
-                out_ += indent(ind); out_ += "}\n";
+                pushText(stack, indent(ind) + "}\n");
+                auto const ps = hir_.externFunctionParams(id);
+                for (std::size_t i = ps.size(); i-- > 0;) pushParam(stack, ps[i], ind + 1, depth + 1);
                 return;
             }
             case HirKind::Global: {
                 out_ += stmtKw(HirTextStmtKw::Global); out_ += flagsStr(f);
                 out_ += std::format(" %{} : ", handleOf(hir_.payload(id)));
                 appendType(hir_.globalType(id));
-                if (auto init = hir_.globalInit(id)) { out_ += " = "; emitExpr(*init); }
-                out_ += '\n';
+                pushText(stack, "\n");
+                if (auto init = hir_.globalInit(id)) { out_ += " = "; pushExpr(stack, *init, depth + 1); }
                 return;
             }
             case HirKind::TypeDecl:
@@ -1242,48 +1763,70 @@ private:
                 if (hir_.externGlobalType(id).valid()) { out_ += " : "; appendType(hir_.externGlobalType(id)); }
                 out_ += '\n';
                 return;
-            case HirKind::ImportGroup:
+            case HirKind::ImportGroup: {
                 out_ += stmtKw(HirTextStmtKw::ImportGroup); out_ += flagsStr(f); out_ += " {\n";
-                for (HirNodeId m : hir_.importGroupMembers(id)) emitNodeLine(m, ind + 1);
-                out_ += indent(ind); out_ += "}\n";
+                pushText(stack, indent(ind) + "}\n");
+                auto const ms = hir_.importGroupMembers(id);
+                for (std::size_t i = ms.size(); i-- > 0;) pushNode(stack, ms[i], ind + 1, depth + 1);
                 return;
-            case HirKind::Block:
+            }
+            case HirKind::Block: {
                 out_ += stmtKw(HirTextStmtKw::Block); out_ += flagsStr(f); out_ += " {\n";
-                for (HirNodeId s : hir_.children(id)) emitNodeLine(s, ind + 1);
-                out_ += indent(ind); out_ += "}\n";
+                pushText(stack, indent(ind) + "}\n");
+                auto const ss = hir_.children(id);
+                for (std::size_t i = ss.size(); i-- > 0;) pushNode(stack, ss[i], ind + 1, depth + 1);
                 return;
+            }
             case HirKind::IfStmt: {
                 out_ += stmtKw(HirTextStmtKw::If); out_ += flagsStr(f); out_ += " (";
-                emitExpr(hir_.ifCondition(id)); out_ += ")\n";
-                emitNodeLine(hir_.ifThen(id), ind + 1);
-                if (auto e = hir_.ifElse(id)) { out_ += indent(ind); out_ += "else\n"; emitNodeLine(*e, ind + 1); }
+                if (auto e = hir_.ifElse(id)) {
+                    pushNode(stack, *e, ind + 1, depth + 1);
+                    pushText(stack, indent(ind) + "else\n");
+                }
+                pushNode(stack, hir_.ifThen(id), ind + 1, depth + 1);
+                pushText(stack, ")\n");
+                pushExpr(stack, hir_.ifCondition(id), depth + 1);
                 return;
             }
             case HirKind::SehTryExcept:
                 // c115 SEH: `seh_try` <tryBody> `seh_except (` filter `)` <handler>.
                 out_ += stmtKw(HirTextStmtKw::SehTry); out_ += flagsStr(f); out_ += '\n';
-                emitNodeLine(hir_.sehTryBody(id), ind + 1);
-                out_ += indent(ind); out_ += "seh_except (";
-                emitExpr(hir_.sehTryFilter(id)); out_ += ")\n";
-                emitNodeLine(hir_.sehTryHandler(id), ind + 1);
+                pushNode(stack, hir_.sehTryHandler(id), ind + 1, depth + 1);
+                pushText(stack, ")\n");
+                pushExpr(stack, hir_.sehTryFilter(id), depth + 1);
+                pushText(stack, indent(ind) + "seh_except (");
+                pushNode(stack, hir_.sehTryBody(id), ind + 1, depth + 1);
                 return;
             case HirKind::WhileStmt:
                 out_ += stmtKw(HirTextStmtKw::While); out_ += flagsStr(f); out_ += " (";
-                emitExpr(*hir_.loopCondition(id)); out_ += ")\n";
-                emitNodeLine(hir_.loopBody(id), ind + 1);
+                pushNode(stack, hir_.loopBody(id), ind + 1, depth + 1);
+                pushText(stack, ")\n");
+                pushExpr(stack, *hir_.loopCondition(id), depth + 1);
                 return;
             case HirKind::DoWhileStmt:
                 out_ += stmtKw(HirTextStmtKw::Do); out_ += flagsStr(f); out_ += "\n";
-                emitNodeLine(hir_.loopBody(id), ind + 1);
-                out_ += indent(ind); out_ += "while ("; emitExpr(*hir_.loopCondition(id)); out_ += ")\n";
+                pushText(stack, ")\n");
+                pushExpr(stack, *hir_.loopCondition(id), depth + 1);
+                pushText(stack, indent(ind) + "while (");
+                pushNode(stack, hir_.loopBody(id), ind + 1, depth + 1);
                 return;
             case HirKind::ForStmt: {
                 out_ += stmtKw(HirTextStmtKw::For); out_ += flagsStr(f); out_ += " {\n";
-                if (auto i = hir_.forInit(id))   { out_ += indent(ind + 1); out_ += "init:\n";   emitNodeLine(*i, ind + 2); }
-                if (auto c = hir_.loopCondition(id)) { out_ += indent(ind + 1); out_ += "cond:\n"; emitNodeLine(*c, ind + 2); }
-                if (auto u = hir_.forUpdate(id)) { out_ += indent(ind + 1); out_ += "update:\n"; emitNodeLine(*u, ind + 2); }
-                out_ += indent(ind + 1); out_ += "body:\n"; emitNodeLine(hir_.loopBody(id), ind + 2);
-                out_ += indent(ind); out_ += "}\n";
+                pushText(stack, indent(ind) + "}\n");
+                pushNode(stack, hir_.loopBody(id), ind + 2, depth + 1);
+                pushText(stack, indent(ind + 1) + "body:\n");
+                if (auto u = hir_.forUpdate(id)) {
+                    pushNode(stack, *u, ind + 2, depth + 1);
+                    pushText(stack, indent(ind + 1) + "update:\n");
+                }
+                if (auto c = hir_.loopCondition(id)) {
+                    pushNode(stack, *c, ind + 2, depth + 1);
+                    pushText(stack, indent(ind + 1) + "cond:\n");
+                }
+                if (auto i = hir_.forInit(id)) {
+                    pushNode(stack, *i, ind + 2, depth + 1);
+                    pushText(stack, indent(ind + 1) + "init:\n");
+                }
                 return;
             }
             case HirKind::SwitchStmt: {
@@ -1291,11 +1834,12 @@ private:
                 // default L<ord> }`. The body Block carries the case/default markers
                 // inline; the dispatch arms map each case value to its marker ordinal.
                 out_ += stmtKw(HirTextStmtKw::Switch); out_ += flagsStr(f); out_ += " (";
-                emitExpr(hir_.switchDiscriminant(id)); out_ += ") {\n";
-                out_ += indent(ind + 1); out_ += "body:\n";
-                emitNodeLine(hir_.switchBody(id), ind + 2);
-                for (HirNodeId arm : hir_.switchArms(id)) emitCaseArm(arm, ind + 1);
-                out_ += indent(ind); out_ += "}\n";
+                pushText(stack, indent(ind) + "}\n");
+                auto const arms = hir_.switchArms(id);
+                for (std::size_t i = arms.size(); i-- > 0;) pushCaseArm(stack, arms[i], ind + 1, depth + 1);
+                pushNode(stack, hir_.switchBody(id), ind + 2, depth + 1);
+                pushText(stack, ") {\n" + indent(ind + 1) + "body:\n");
+                pushExpr(stack, hir_.switchDiscriminant(id), depth + 1);
                 return;
             }
             case HirKind::BreakStmt: {
@@ -1310,20 +1854,27 @@ private:
             }
             case HirKind::ReturnStmt:
                 out_ += stmtKw(HirTextStmtKw::Return); out_ += flagsStr(f);
-                if (auto v = hir_.returnValue(id)) { out_ += ' '; emitExpr(*v); }
-                out_ += '\n'; return;
+                pushText(stack, "\n");
+                if (auto v = hir_.returnValue(id)) { out_ += ' '; pushExpr(stack, *v, depth + 1); }
+                return;
             case HirKind::ExprStmt:
-                out_ += stmtKw(HirTextStmtKw::Expr); out_ += flagsStr(f); out_ += ' '; emitExpr(hir_.exprStmtExpr(id)); out_ += '\n';
+                out_ += stmtKw(HirTextStmtKw::Expr); out_ += flagsStr(f); out_ += ' ';
+                pushText(stack, "\n");
+                pushExpr(stack, hir_.exprStmtExpr(id), depth + 1);
                 return;
             case HirKind::VarDecl:
                 out_ += stmtKw(HirTextStmtKw::Var); out_ += flagsStr(f);
                 out_ += std::format(" %{} : ", handleOf(hir_.payload(id)));
                 appendType(hir_.varDeclType(id));
-                if (auto init = hir_.varDeclInit(id)) { out_ += " = "; emitExpr(*init); }
-                out_ += '\n'; return;
+                pushText(stack, "\n");
+                if (auto init = hir_.varDeclInit(id)) { out_ += " = "; pushExpr(stack, *init, depth + 1); }
+                return;
             case HirKind::AssignStmt:
                 out_ += stmtKw(HirTextStmtKw::Assign); out_ += flagsStr(f); out_ += ' ';
-                emitExpr(hir_.assignTarget(id)); out_ += " = "; emitExpr(hir_.assignValue(id)); out_ += '\n';
+                pushText(stack, "\n");
+                pushExpr(stack, hir_.assignValue(id), depth + 1);
+                pushText(stack, " = ");
+                pushExpr(stack, hir_.assignTarget(id), depth + 1);
                 return;
             case HirKind::Unreachable:
                 out_ += stmtKw(HirTextStmtKw::Unreachable); out_ += flagsStr(f); out_ += '\n'; return;
@@ -1333,15 +1884,22 @@ private:
             case HirKind::LabelStmt:
                 out_ += stmtKw(HirTextStmtKw::Label); out_ += flagsStr(f);
                 out_ += std::format(" L{}:\n", hir_.labelOrdinal(id));
-                emitNodeLine(hir_.labelBody(id), ind + 1);
+                pushNode(stack, hir_.labelBody(id), ind + 1, depth + 1);
                 return;
             case HirKind::IndirectGotoStmt:
                 out_ += stmtKw(HirTextStmtKw::Goto); out_ += flagsStr(f); out_ += " *";
-                emitExpr(hir_.indirectGotoTarget(id)); out_ += '\n'; return;
+                pushText(stack, "\n");
+                pushExpr(stack, hir_.indirectGotoTarget(id), depth + 1);
+                return;
             case HirKind::InlineAsm:
-                emitInlineAsm(id, f); return;
+                emitInlineAsmStep(id, f, depth, stack); return;
             case HirKind::Error: case HirKind::Extension:
-                emitExtOrError(id, /*inlineForm=*/false, ind); out_ += '\n'; return;
+                // ⓘ The trailing newline is pushed FIRST so it lands UNDER whatever
+                // the wildcard's body pushes — the step's own prefix is written
+                // directly and therefore still precedes both.
+                pushText(stack, "\n");
+                emitExtOrErrorStep(id, /*inlineForm=*/false, ind, depth, stack);
+                return;
 
             // ── every EXPRESSION kind, plus the two arms that render elsewhere ──
             // ★ `emitNodeLine` routes expression kinds to `emitExpr` before this
@@ -1411,7 +1969,20 @@ private:
     // `lit` without its value still says `lit`, whereas an asm statement
     // rendered without its operands would read as a bare barrier, which is a
     // DIFFERENT PROGRAM.
-    void emitInlineAsm(HirNodeId id, HirFlags f) {
+    //
+    // ★★ THE OPERAND LIST IS THREE STEPS, NOT ONE, AND THAT IS THE RECURSION
+    // EDGE THIS FILE WOULD OTHERWISE HAVE KEPT. An operand's VALUE is an
+    // expression, and an expression can carry a `seq` whose statements carry
+    // another `inline_asm` — so `emitInlineAsm` → `emitExpr` → … → `emitInlineAsm`
+    // is a cycle, and a cycle flattens only when EVERY edge sits on the one stack.
+    // The head writes the template and the flag words; `AsmOperand` renders ONE
+    // operand's prefix and pushes its value plus the NEXT operand; `AsmTail`
+    // renders the clobbers, the labels and the closer once every value is out.
+    // ⓘ Splitting it this way, rather than precomputing the whole tail as text,
+    // is what keeps the DIAGNOSTIC order identical too: the operand-kind refusal
+    // and the label-count refusal are still reported in the positions they were.
+    void emitInlineAsmStep(HirNodeId id, HirFlags f, std::uint32_t depth,
+                           std::vector<NodeEmitTask>& stack) {
         std::uint32_t const handle = hir_.payload(id);
         out_ += stmtKw(HirTextStmtKw::InlineAsm);
         out_ += flagsStr(f);
@@ -1438,7 +2009,6 @@ private:
         // of the way (the next keyword added would re-open it).
         // The braces are omitted when there is nothing to put in them, so the
         // commonest form -- a plain basic template -- stays a one-token tail.
-        auto const kids = hir_.children(id);
         // !! THIS PREDICATE ENUMERATES EVERY FIELD, and a new field left out of
         // it is not a cosmetic miss: with nothing else set, the whole brace
         // group is skipped and that field is dropped from the text with no
@@ -1451,95 +2021,123 @@ private:
                              || !d.clobbers.empty() || !d.labelOrdinals.empty()
                              || !d.labelSpellings.empty();
         if (!anyTail) { out_ += '\n'; return; }
-        // One operand's / one label's spelling list, or nothing at all when it
-        // has none (a language whose sigil role is declared `null`).
-        auto const emitSpells = [&](std::vector<std::string> const& spellings) {
-            if (spellings.empty()) return;
-            out_ += " spells (";
-            for (std::size_t i = 0; i < spellings.size(); ++i) {
-                out_ += (i == 0 ? " " : ", ");
-                out_ += quote(spellings[i]);
-            }
-            out_ += " )";
-        };
         out_ += " {";
         if (d.isExtended)             out_ += " extended";
         if (d.isGoto)                 out_ += " goto";
         if (d.clobbersMemory)         out_ += " mem";
         if (d.clobbersConditionCodes) out_ += " cc";
+        // The clobbers / labels / closer run AFTER every operand value, so they go
+        // on the stack UNDER the operand list.
+        pushAsmTail(stack, id, depth);
         if (!d.operands.empty()) {
             out_ += std::format(" outputs {} operands (", d.outputCount);
-            for (std::size_t i = 0; i < d.operands.size(); ++i) {
-                auto const& op = d.operands[i];
-                out_ += (i == 0 ? " " : ", ");
-                out_ += quote(op.constraint.raw);
-                if (!op.symbolicName.empty()) {
-                    out_ += " ["; out_ += op.symbolicName; out_ += ']';
-                }
-                emitSpells(op.spellings);
-                if (op.regClassResolved)
-                    out_ += std::format(" class {}", op.regClass);
-                if (!op.fixedRegister.empty()) {
-                    out_ += " pin "; out_ += quote(op.fixedRegister);
-                }
-                // ── D-HIR-TEXT-INLINE-ASM-OPERAND-KIND-DROPPED-IN-TRANSIT ──
-                //
-                // ★★★ THE THIRD ARM OF THE RESOLUTION, AND IT MUST TRAVEL OR THE
-                // ROUND TRIP RE-CREATES THE VERY DEFECT THE PIPELINE JUST FIXED.
-                // A constraint letter binds one of THREE things
-                // (`TargetAsmConstraint::binds`), and the two lines above carry
-                // only two of them. A form-bound letter — `"m"` → `membase`,
-                // `"i"` → `imm32` — sets `operandKindResolved` and NOTHING else,
-                // so a descriptor written without this clause reads back with
-                // `!regClassResolved && !operandKindResolved`: byte-identical to
-                // *"no target was in scope"*. `hir_to_mir` then refuses the
-                // operand saying the letter *"was never bound to a processor"* —
-                // a refusal whose stated reason is FALSE, which sends the reader
-                // to fix a config that is already correct. That is
-                // D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED,
-                // reproduced one tier over by a serialization gap.
-                //
-                // ★ SPELLED BY NAME, NOT BY ORDINAL, and that is a deliberate
-                // departure from the `class {}` line above it. `OperandKindFilter`
-                // is an OPEN-ENDED enum by its own docblock (*"future Imm8/Imm16/
-                // Imm64 join as distinct filters"*), so an inserted enumerator
-                // silently retargets every ordinal a stored `.dsshir` ever wrote,
-                // and an out-of-range ordinal has no failure arm at all. A name
-                // has one, and it is the table the whole pipeline already reads
-                // (`kOperandKindFilterTable`) — no new vocabulary.
-                // ⚠ `nameOrEmpty`, never `name()`: `OperandKindFilter::Reg` is 0,
-                // so `name()`'s row-0 fallback would render an out-of-range value
-                // as `reg` — the plausible wrong answer instead of the loud one.
-                if (op.operandKindResolved) {
-                    auto const kind = static_cast<OperandKindFilter>(op.operandKind);
-                    std::string_view const spelling =
-                        kOperandKindFilterTable.nameOrEmpty(kind);
-                    if (spelling.empty()) {
-                        report(std::format(
-                                   "inline-asm operand carries operand-kind ordinal "
-                                   "{}, which no `OperandKindFilter` row spells - it "
-                                   "cannot be written to `.dsshir`; accepted: {}",
-                                   op.operandKind,
-                                   detail::renderAllowedList(
-                                       allNames(kOperandKindFilterTable))),
-                               DiagnosticSeverity::Error);
-                    } else {
-                        out_ += " operand_kind "; out_ += spelling;
-                    }
-                }
-                out_ += " -> ";
-                // The operand's VALUE is child i - the descriptor and the child
-                // list are index-aligned by construction, and `HirVerifier`'s
-                // `checkInlineAsm` is what keeps them so.
-                if (i < kids.size()) { emitExpr(kids[i]); }
-                else {
-                    report("inline-asm descriptor declares more operands than the "
-                           "node has children", DiagnosticSeverity::Error);
-                    out_ += stmtKw(HirTextStmtKw::Error);
-                }
-            }
-            out_ += " )";
+            pushText(stack, " )");
+            pushAsmOperand(stack, id, 0, depth);
         }
+    }
+
+    // One operand's / one label's spelling list, or nothing at all when it
+    // has none (a language whose sigil role is declared `null`).
+    void appendAsmSpells(std::vector<std::string> const& spellings) {
+        if (spellings.empty()) return;
+        out_ += " spells (";
+        for (std::size_t i = 0; i < spellings.size(); ++i) {
+            out_ += (i == 0 ? " " : ", ");
+            out_ += quote(spellings[i]);
+        }
+        out_ += " )";
+    }
+
+    // Operand `task.index` of the inline-asm descriptor on `task.id`: its prefix
+    // is written here, its VALUE is pushed as an ordinary expression, and the
+    // operand after it is pushed UNDER that value so the list stays in order.
+    void emitAsmOperandStep(NodeEmitTask const& task, std::vector<NodeEmitTask>& stack) {
+        HirNodeId const id = task.id;
+        auto const& d    = ctx_.inlineAsmPool->at(hir_.payload(id));
+        auto const  kids = hir_.children(id);
+        std::size_t const i = task.index;
+        auto const& op = d.operands[i];
+        out_ += (i == 0 ? " " : ", ");
+        out_ += quote(op.constraint.raw);
+        if (!op.symbolicName.empty()) {
+            out_ += " ["; out_ += op.symbolicName; out_ += ']';
+        }
+        appendAsmSpells(op.spellings);
+        if (op.regClassResolved)
+            out_ += std::format(" class {}", op.regClass);
+        if (!op.fixedRegister.empty()) {
+            out_ += " pin "; out_ += quote(op.fixedRegister);
+        }
+        // ── D-HIR-TEXT-INLINE-ASM-OPERAND-KIND-DROPPED-IN-TRANSIT ──
+        //
+        // ★★★ THE THIRD ARM OF THE RESOLUTION, AND IT MUST TRAVEL OR THE
+        // ROUND TRIP RE-CREATES THE VERY DEFECT THE PIPELINE JUST FIXED.
+        // A constraint letter binds one of THREE things
+        // (`TargetAsmConstraint::binds`), and the two lines above carry
+        // only two of them. A form-bound letter — `"m"` → `membase`,
+        // `"i"` → `imm32` — sets `operandKindResolved` and NOTHING else,
+        // so a descriptor written without this clause reads back with
+        // `!regClassResolved && !operandKindResolved`: byte-identical to
+        // *"no target was in scope"*. `hir_to_mir` then refuses the
+        // operand saying the letter *"was never bound to a processor"* —
+        // a refusal whose stated reason is FALSE, which sends the reader
+        // to fix a config that is already correct. That is
+        // D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED,
+        // reproduced one tier over by a serialization gap.
+        //
+        // ★ SPELLED BY NAME, NOT BY ORDINAL, and that is a deliberate
+        // departure from the `class {}` line above it. `OperandKindFilter`
+        // is an OPEN-ENDED enum by its own docblock (*"future Imm8/Imm16/
+        // Imm64 join as distinct filters"*), so an inserted enumerator
+        // silently retargets every ordinal a stored `.dsshir` ever wrote,
+        // and an out-of-range ordinal has no failure arm at all. A name
+        // has one, and it is the table the whole pipeline already reads
+        // (`kOperandKindFilterTable`) — no new vocabulary.
+        // ⚠ `nameOrEmpty`, never `name()`: `OperandKindFilter::Reg` is 0,
+        // so `name()`'s row-0 fallback would render an out-of-range value
+        // as `reg` — the plausible wrong answer instead of the loud one.
+        if (op.operandKindResolved) {
+            auto const kind = static_cast<OperandKindFilter>(op.operandKind);
+            std::string_view const spelling =
+                kOperandKindFilterTable.nameOrEmpty(kind);
+            if (spelling.empty()) {
+                report(std::format(
+                           "inline-asm operand carries operand-kind ordinal "
+                           "{}, which no `OperandKindFilter` row spells - it "
+                           "cannot be written to `.dsshir`; accepted: {}",
+                           op.operandKind,
+                           detail::renderAllowedList(
+                               allNames(kOperandKindFilterTable))),
+                       DiagnosticSeverity::Error);
+            } else {
+                out_ += " operand_kind "; out_ += spelling;
+            }
+        }
+        out_ += " -> ";
+        // The operand's VALUE is child i - the descriptor and the child
+        // list are index-aligned by construction, and `HirVerifier`'s
+        // `checkInlineAsm` is what keeps them so.
+        // ⓘ THE NEXT OPERAND IS PUSHED FIRST so it sits UNDER this value:
+        // the list resumes only once the value is fully rendered, which is
+        // exactly when the recursive `emitExpr` call used to return.
+        if (i + 1 < d.operands.size())
+            pushAsmOperand(stack, id, static_cast<std::uint32_t>(i + 1),
+                           task.depth);
+        if (i < kids.size()) { pushExpr(stack, kids[i], task.depth + 1); }
+        else {
+            report("inline-asm descriptor declares more operands than the "
+                   "node has children", DiagnosticSeverity::Error);
+            out_ += stmtKw(HirTextStmtKw::Error);
+        }
+    }
+
+    // The descriptor's clobbers, its labels and the closing brace — everything
+    // after the LAST operand value, which is why it is a task of its own rather
+    // than text precomputed by the head.
+    void emitInlineAsmTailStep(NodeEmitTask const& task,
+                               std::vector<NodeEmitTask>& stack) {
+        (void)stack;   // the tail carries no child nodes — text and reports only
+        auto const& d = ctx_.inlineAsmPool->at(hir_.payload(task.id));
         if (!d.clobbers.empty()) {
             out_ += " clobbers (";
             for (std::size_t i = 0; i < d.clobbers.size(); ++i) {
@@ -1572,7 +2170,7 @@ private:
                     out_ += std::format("L{}", d.labelOrdinals[i]);
                 else
                     out_ += "error";
-                if (i < d.labelSpellings.size()) emitSpells(d.labelSpellings[i]);
+                if (i < d.labelSpellings.size()) appendAsmSpells(d.labelSpellings[i]);
             }
             out_ += " )";
         }
@@ -1580,34 +2178,42 @@ private:
     }
 
     // A parameter VarDecl inside a (extern)function body.
-    void emitParam(HirNodeId id, int ind) {
+    void emitParamStep(NodeEmitTask const& task, std::vector<NodeEmitTask>& stack) {
+        HirNodeId const id  = task.id;
+        int const       ind = task.ind;
         emitAttrsBlock(id, ind);
         out_ += indent(ind);
         out_ += stmtKw(HirTextStmtKw::Param); out_ += flagsStr(hir_.flags(id));
         out_ += std::format(" %{} : ", handleOf(hir_.payload(id)));
         appendType(hir_.varDeclType(id));
-        if (auto init = hir_.varDeclInit(id)) { out_ += " = "; emitExpr(*init); }
-        out_ += '\n';
+        pushText(stack, "\n");
+        if (auto init = hir_.varDeclInit(id)) {
+            out_ += " = ";
+            pushExpr(stack, *init, task.depth + 1);
+        }
     }
 
     // c60 (Design I-A): a dispatch entry — `case <value> L<ord>` / `default L<ord>`.
     // The arm carries no body (the body lives on the SwitchStmt); `L<ord>` is the
     // ordinal of the case's synthetic LabelStmt marker inside that body.
-    void emitCaseArm(HirNodeId id, int ind) {
+    void emitCaseArmStep(NodeEmitTask const& task, std::vector<NodeEmitTask>& stack) {
+        HirNodeId const id  = task.id;
+        int const       ind = task.ind;
         emitAttrsBlock(id, ind);
         out_ += indent(ind);
+        pushText(stack, std::format(" L{}\n", hir_.caseArmLabelOrdinal(id)));
         if (hir_.caseArmIsDefault(id)) {
             out_ += stmtKw(HirTextStmtKw::Default); out_ += flagsStr(hir_.flags(id));
         } else {
             out_ += stmtKw(HirTextStmtKw::Case); out_ += flagsStr(hir_.flags(id)); out_ += ' ';
-            emitExpr(*hir_.caseArmValue(id));
+            pushExpr(stack, *hir_.caseArmValue(id), task.depth + 1);
         }
-        out_ += std::format(" L{}\n", hir_.caseArmLabelOrdinal(id));
     }
 
     // The `ext_node`/`error` wildcard form. Inline form (no indent/newline, for
     // expression position) vs block form (own line); both share the body shape.
-    void emitExtOrError(HirNodeId id, bool inlineForm, int ind) {
+    void emitExtOrErrorStep(HirNodeId id, bool inlineForm, int ind, std::uint32_t depth,
+                            std::vector<NodeEmitTask>& stack) {
         HirFlags const f = hir_.flags(id);
         if (hir_.kind(id) == HirKind::Extension) {
             std::string_view name = "?";
@@ -1624,21 +2230,30 @@ private:
         if (!kids.empty()) {
             out_ += " {\n";
             int const childInd = inlineForm ? ind : ind + 1;
-            for (HirNodeId c : kids) emitNodeLine(c, childInd);
-            out_ += indent(inlineForm ? 0 : ind); out_ += "}";
+            pushText(stack, indent(inlineForm ? 0 : ind) + "}");
+            for (std::size_t i = kids.size(); i-- > 0;) pushNode(stack, kids[i], childInd, depth + 1);
         }
     }
 
     // An expression, inline (no leading indent / trailing newline). Children in
     // comma-separated parens.
-    void emitExpr(HirNodeId id) {
+    void emitExprStep(NodeEmitTask const& task, std::vector<NodeEmitTask>& stack) {
+        HirNodeId const     id    = task.id;
+        std::uint32_t const depth = task.depth;
         out_ += attrsInline(id);
         HirFlags const f = hir_.flags(id);
+        // ⚠ EVERY ARM THAT USES THIS ENDS WITH IT, and that is a precondition, not
+        // a coincidence: the operands are PUSHED, so anything an arm wrote after
+        // calling it would land in the text BEFORE them. `)` therefore travels as
+        // a task rather than a trailing write, and the operands go on in reverse
+        // so they come back out in order.
         auto operands = [&](std::span<HirNodeId const> kids) {
             out_ += '(';
-            bool first = true;
-            for (HirNodeId k : kids) { if (!first) out_ += ", "; emitExpr(k); first = false; }
-            out_ += ')';
+            pushText(stack, ")");
+            for (std::size_t i = kids.size(); i-- > 0;) {
+                pushExpr(stack, kids[i], depth + 1);
+                if (i != 0) pushText(stack, ", ");
+            }
         };
         // ★★★ THE KEYWORD IS NOT A PARAMETER ANY MORE — IT IS PROJECTED FROM THE
         // NODE'S OWN KIND through `exprKwForKind`, so no arm can write a spelling
@@ -1737,13 +2352,16 @@ private:
                 // result (last child) is the yielded value. Mirrors the
                 // inline-brace form `error`/`ext_node` use.
                 typed(); out_ += " {\n";
-                for (HirNodeId s : hir_.seqExprStmts(id)) emitNodeLine(s, 1);
-                out_ += indent(1); out_ += "yield "; emitExpr(hir_.seqExprResult(id));
-                out_ += "\n}"; return;
+                pushText(stack, "\n}");
+                pushExpr(stack, hir_.seqExprResult(id), depth + 1);
+                pushText(stack, indent(1) + "yield ");
+                auto const ss = hir_.seqExprStmts(id);
+                for (std::size_t i = ss.size(); i-- > 0;) pushNode(stack, ss[i], 1, depth + 1);
+                return;
             }
             case HirKind::TypeRef:    typed(); return;
             case HirKind::Error: case HirKind::Extension:
-                emitExtOrError(id, /*inlineForm=*/true, 0); return;
+                emitExtOrErrorStep(id, /*inlineForm=*/true, 0, depth, stack); return;
 
             // ── NOT an expression: reached only when a caller mis-routes ──
             // ★ SPELLED OUT RATHER THAN LEFT TO `default:`, and that is the
@@ -1782,7 +2400,70 @@ private:
     // reconstructs the exact arm: `none` / `bool true` / `int -7` / `uint 42` /
     // `float 3.14` / `str "hi"`. Floats use std::format's shortest round-trip
     // repr (to_chars); strings use the same escaped-quote form as symbol names.
-    void appendLiteralValue(HirLiteralValue const& v) {
+    //
+    // ★★★ THE AGGREGATE ARM RUNS ON AN EXPLICIT HEAP WORK STACK, NOT HOST
+    // RECURSION (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED)
+    // — the `LiteralEmitTask` machine `mir_text.cpp`'s `appendLiteral` adopted
+    // in P55, transferred here. `appendLiteralValue(root)` runs the tasks;
+    // `appendLiteralValueStep` renders ONE value and, for an aggregate, pushes
+    // its fields (each followed by its own `: <core>` task) in reverse so they
+    // come back out in text order. Byte-identical to the recursive form.
+    struct LiteralEmitTask {
+        enum class Kind : std::uint8_t { Value, FieldCore, Text };
+        Kind                   kind = Kind::Value;
+        HirLiteralValue const* lit  = nullptr;
+        std::string            text;
+    };
+
+    void appendLiteralValue(HirLiteralValue const& root) {
+        std::vector<LiteralEmitTask> stack;
+        stack.push_back(LiteralEmitTask{.kind = LiteralEmitTask::Kind::Value, .lit = &root});
+        while (!stack.empty()) {
+            LiteralEmitTask task = std::move(stack.back());
+            stack.pop_back();
+            switch (task.kind) {
+                case LiteralEmitTask::Kind::Text:
+                    out_ += task.text;
+                    continue;
+                case LiteralEmitTask::Kind::FieldCore:
+                    appendAggregateFieldCore(*task.lit);
+                    continue;
+                case LiteralEmitTask::Kind::Value:
+                    break;
+            }
+            appendLiteralValueStep(*task.lit, stack);
+        }
+    }
+
+    // The ` : <core>` every aggregate FIELD carries (the top-level value does
+    // not — see the aggregate arm below for why).
+    void appendAggregateFieldCore(HirLiteralValue const& f) {
+        out_ += " : ";
+        // ⚠ `literalCoreName`, NOT `primName`: a NESTED aggregate field's
+        // own core is `Struct`/`Union`/`Array`, which the type-keyword
+        // table deliberately omits. ✔MEASURED while writing the nesting
+        // pin — a `primName`-only writer rendered the inner aggregate's
+        // core as `?` and the round trip refused its own output.
+        std::string_view const core = literalCoreName(f.core);
+        if (core.empty()) {
+            // Same discipline as the enum-underlying arm: name the kind
+            // that has no spelling rather than emitting a plausible one.
+            report(std::format(
+                "aggregate literal field has core TypeKind ordinal {}, "
+                "which this format has no spelling for; rendered as '?', "
+                "which the reader REFUSES — accepted: {}",
+                static_cast<std::uint32_t>(f.core), literalCoreAccepted()),
+                DiagnosticSeverity::Error);
+            out_ += '?';
+        } else {
+            out_ += core;
+        }
+    }
+
+    // Render ONE literal value. An aggregate pushes its fields; nothing
+    // recurses.
+    void appendLiteralValueStep(HirLiteralValue const& v,
+                                std::vector<LiteralEmitTask>& stack) {
         if (std::holds_alternative<std::monostate>(v.value)) { out_ += "none"; return; }
         if (auto const* b = std::get_if<bool>(&v.value)) {
             out_ += *b ? "bool true" : "bool false"; return;
@@ -1856,33 +2537,18 @@ private:
         // is the failure mode hardest to see from the text alone.
         if (auto const* agg = std::get_if<HirAggregateValue>(&v.value)) {
             out_ += "agg {";
-            bool first = true;
-            for (HirLiteralValue const& f : agg->fields) {
-                if (!first) out_ += ", ";
-                appendLiteralValue(f);
-                out_ += " : ";
-                // ⚠ `literalCoreName`, NOT `primName`: a NESTED aggregate field's
-                // own core is `Struct`/`Union`/`Array`, which the type-keyword
-                // table deliberately omits. ✔MEASURED while writing the nesting
-                // pin — a `primName`-only writer rendered the inner aggregate's
-                // core as `?` and the round trip refused its own output.
-                std::string_view const core = literalCoreName(f.core);
-                if (core.empty()) {
-                    // Same discipline as the enum-underlying arm: name the kind
-                    // that has no spelling rather than emitting a plausible one.
-                    report(std::format(
-                        "aggregate literal field has core TypeKind ordinal {}, "
-                        "which this format has no spelling for; rendered as '?', "
-                        "which the reader REFUSES — accepted: {}",
-                        static_cast<std::uint32_t>(f.core), literalCoreAccepted()),
-                        DiagnosticSeverity::Error);
-                    out_ += '?';
-                } else {
-                    out_ += core;
+            // Reverse execution order: the closing brace, then each field's
+            // `: <core>` tail, the field itself, and the separator before it.
+            using Kind = LiteralEmitTask::Kind;
+            stack.push_back(LiteralEmitTask{.kind = Kind::Text, .text = "}"});
+            auto const& fields = agg->fields;
+            for (std::size_t i = fields.size(); i-- > 0;) {
+                stack.push_back(LiteralEmitTask{.kind = Kind::FieldCore, .lit = &fields[i]});
+                stack.push_back(LiteralEmitTask{.kind = Kind::Value, .lit = &fields[i]});
+                if (i != 0) {
+                    stack.push_back(LiteralEmitTask{.kind = Kind::Text, .text = ", "});
                 }
-                first = false;
             }
-            out_ += '}';
             return;
         }
         // ★ THE MARKER STAYS, AND IT IS NOT DEAD CODE. Every arm above returns, so
@@ -1951,6 +2617,70 @@ private:
         }
         out_ += "}\n";
     }
+    // `dsshir <version>` + the mandatory `producer` line. Both are unconditional
+    // — see the empty-module note in `run`.
+    void emitHeader() {
+        out_ += std::format("dsshir {}\n", kHirTextFormatVersion);
+        out_ += "producer ";
+        out_ += quote(ctx_.producer);
+        out_ += '\n';
+    }
+    // BufferId.v → source name, for the `@loc(buf N, …)` ordinals. SORTED BY ID
+    // rather than emitted in the caller's order: the driver collects these from
+    // a compilation unit whose buffer order is an implementation detail, and the
+    // emission-determinism contract on `emitHir` is a promise this function
+    // keeps, not one it delegates. Sorting is idempotent, so a re-emit of a
+    // parsed file reproduces the same bytes.
+    void emitBuffers() {
+        // Every buffer the caller NAMED joins every buffer a `@loc` REFERENCES.
+        // Naming without referencing is legitimate context (the origin file of a
+        // preprocessed unit); referencing without naming would be an unresolvable
+        // ordinal, so it gets a row with an empty name rather than no row.
+        if (ctx_.bufferNames) {
+            for (auto const& b : *ctx_.bufferNames) {
+                if (b.buffer != 0) bufSeen_.insert(b.buffer);
+            }
+        }
+        if (bufSeen_.empty()) return;
+        // `bufSeen_` is an ORDERED set, so the handle assignment is a pure
+        // function of which buffers the module uses — see `bufHandle_`.
+        for (std::uint32_t id : bufSeen_) {
+            bufHandle_.emplace(id, static_cast<std::uint32_t>(bufHandle_.size() + 1));
+        }
+        out_ += "buffers {\n";
+        for (std::uint32_t id : bufSeen_) {
+            HirTextBufferName const* named = nullptr;
+            if (ctx_.bufferNames) {
+                for (auto const& b : *ctx_.bufferNames) {
+                    if (b.buffer == id) { named = &b; break; }
+                }
+            }
+            // `buf <handle> STR` — the SAME `buf` keyword `@loc(buf N, …)` uses,
+            // so the section and the annotations that read it are spelled with
+            // one vocabulary rather than two that have to be kept in step.
+            out_ += std::format("  buf {} ", bufHandle_.at(id));
+            out_ += quote(named ? std::string_view{named->name} : std::string_view{});
+            // The synthesized-buffer marker, itself renumbered: an origin
+            // pointing at a raw `BufferId` would reintroduce exactly the
+            // process-global leak the handles remove.
+            if (named && named->synthesizedMainOrigin != 0) {
+                auto const it = bufHandle_.find(named->synthesizedMainOrigin);
+                out_ += std::format(" synthesized from {}",
+                                    it == bufHandle_.end() ? bufHandle_.at(id)
+                                                           : it->second);
+            }
+            out_ += '\n';
+        }
+        out_ += "}\n";
+    }
+    // A `@loc`'s buffer, as the artifact-local handle. A buffer the prepass never
+    // saw cannot happen (the prepass walks the same source map this renders), so
+    // an absent entry is an internal inconsistency — reported as handle 0, which
+    // the reader refuses, rather than silently emitting a raw process id.
+    [[nodiscard]] std::uint32_t bufHandleOf(BufferId b) const {
+        auto const it = bufHandle_.find(b.v);
+        return it == bufHandle_.end() ? 0u : it->second;
+    }
     void emitSymbols() {
         if (symOrder_.empty()) return;
         out_ += "symbols {\n";
@@ -1970,6 +2700,63 @@ std::string emitHir(Hir const& hir, HirTextContext const& ctx, DiagnosticReporte
     return Emitter{hir, ctx, reporter}.run();
 }
 
+std::string renderHirKindInventory(std::string_view producer) {
+    std::string out;
+    // Its own tiny versioned header, for the reason the artifact has one: a
+    // consumer generating a build-time coverage table from this must be able to
+    // tell that the SHAPE of the report changed, not only its contents.
+    out += "dsshir-kinds 1\n";
+    out += std::format("dsshir-format-version {}\n", kHirTextFormatVersion);
+    out += "producer ";
+    out += quote(producer);
+    out += '\n';
+    out += std::format("core-kind-count {}\n",
+                       static_cast<std::size_t>(HirKind::Count_));
+    // ⚠ THE LOOP IS OVER `Count_`, NOT OVER THE TABLE'S ROWS, and the two are
+    // held equal by a static_assert in `hir_node.hpp`. Iterating the table would
+    // report whatever it happens to contain; iterating the enum reports what the
+    // compiler HAS, which is the question a coverage table asks. A kind with no
+    // row would render an empty name here — and it cannot exist, because that
+    // same assert fails the build first.
+    for (std::size_t i = 0; i < static_cast<std::size_t>(HirKind::Count_); ++i) {
+        auto const k = static_cast<HirKind>(i);
+        out += "kind ";
+        out += quote(hirKindName(k));
+        if (auto const kw = exprKwForKind(k)) {
+            out += " position expr keyword ";
+            out += quote(kHirTextExprKwTable.name(*kw));
+        } else {
+            // NOT "position stmt": `Module` is neither, and `Error`/`Extension`
+            // do render inline in an expression while owning STATEMENT keywords.
+            // "non-expr" is the property this file can actually decide — it is
+            // exactly `isExprKind`'s complement — and naming it that way keeps
+            // the report from claiming a classification the writer does not make.
+            out += " position non-expr";
+        }
+        out += requiresValidType(k) ? " typed yes" : " typed no";
+        out += carriesSymbol(k)     ? " symbol yes" : " symbol no";
+        out += '\n';
+    }
+    // The statement-keyword VOCABULARY, published as a set rather than as a
+    // kind→keyword map, because on this side it is not a function: a `VarDecl`
+    // spells `var` or `param` by POSITION and a `CaseArm` spells `case` or
+    // `default` by CONTENT (see `stmtKw`'s docblock). A map would have to pick
+    // one and be wrong at the other site.
+    out += std::format("stmt-keyword-count {}\n", kHirTextStmtKwTable.rows.size());
+    for (auto const& row : kHirTextStmtKwTable.rows) {
+        out += "stmt-keyword ";
+        out += quote(row.second);
+        out += '\n';
+    }
+    // Where the OPEN half begins. A registry-minted extension kind takes an id
+    // from here up and is named in the artifact's own `ext_kinds` preamble, so a
+    // consumer that has covered every core kind above still has to handle the
+    // extension case — by name, from the file, not from this list.
+    out += std::format("extension-kind-base {}\n",
+                       static_cast<std::uint32_t>(kFirstHirExtensionKind));
+    return out;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Parser
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1980,6 +2767,18 @@ enum class Tk : std::uint8_t {
     Eof, Unknown, Ident, Int, Float, Str,
     LBrace, RBrace, LParen, RParen, LAngle, RAngle, LBrack, RBrack,
     Colon, Comma, Percent, Hash, Equal, Arrow, Minus, DotDot, Ellipsis, At, Tilde,
+    // ★★ `*` — THE COMPUTED-GOTO TARGET MARKER, AND ITS ABSENCE MADE `goto *expr`
+    // A WRITE-ONLY SPELLING. `emitStmtLike`'s `IndirectGotoStmt` arm has written
+    // `goto [flags] *<expr>` since D-CSUBSET-COMPUTED-GOTO landed; this lexer had
+    // no `*` at all, so the byte fell through to `Tk::Unknown` and the reader's
+    // `goto` arm — which knew only the `L<ord>` form — refused with
+    // "expected a label ordinal 'L<n>'". ✔MEASURED 2026-09-08 over the emitted
+    // `examples/c` corpus: FOUR shipped artifacts (`computed_goto`,
+    // `computed_goto_inline_host`, `computed_goto_inline_multiblock_host`,
+    // `label_address_static_table`) could not be read back at all. Exactly the
+    // class D-HIR-TEXT-WRITER-SPELLS-KEYWORDS-THE-READER-HAS-NO-ROW-FOR names,
+    // one production further in: not a missing keyword this time, a missing TOKEN.
+    Star,
 };
 
 struct Tok {
@@ -2029,6 +2828,7 @@ private:
             case '#': cur_.kind = Tk::Hash; return;
             case '@': cur_.kind = Tk::At; return;
             case '~': cur_.kind = Tk::Tilde; return;
+            case '*': cur_.kind = Tk::Star; return;   // `goto *<expr>` — see Tk::Star
             case '=': cur_.kind = Tk::Equal; return;
             case '-':
                 if (p_ < s_.size() && s_[p_] == '>') { ++p_; cur_.kind = Tk::Arrow; }
@@ -2170,6 +2970,8 @@ public:
     TypeInterner&           interner_;
     TypeRegistry&           typeReg_;
     std::vector<std::string> symbolNames_;     // SymbolId.v -> name; slot 0 unused
+    std::string              producer_;        // the mandatory `producer` header value
+    std::vector<HirTextBufferName> bufferNames_;  // the optional `buffers` section
 
     std::vector<std::pair<HirNodeId, HirSourceLoc>>   pLoc_;
     std::vector<std::pair<HirNodeId, FfiMetadata>>    pFfi_;
@@ -2191,13 +2993,38 @@ public:
         if (!acceptKeyword("dsshir")) { malformed("expected 'dsshir' header"); return InvalidHirNode; }
         if (lex_.peek().kind != Tk::Int) { malformed("expected format version"); return InvalidHirNode; }
         std::uint64_t const version = lex_.take().num;
-        if (version != 1) {
+        if (version != kHirTextFormatVersion) {
             ParseDiagnostic d; d.code = DiagnosticCode::H_TextVersionMismatch;
             d.severity = DiagnosticSeverity::Error;
-            d.actual = std::format("dsshir format version {} (this build understands 1)", version);
+            d.actual = std::format(
+                "dsshir format version {} (this build understands {}). "
+                "Re-emit the artifact with this compiler; the format grows while "
+                "the language surface grows, and reading it under the wrong "
+                "grammar would produce a confident wrong answer rather than an "
+                "error",
+                version, kHirTextFormatVersion);
             reporter_.report(std::move(d));
             return InvalidHirNode;
         }
+        // ★ THE PRODUCER LINE IS MANDATORY AND ITS ABSENCE IS FATAL, not a
+        // defaulted-to-empty field. An artifact nobody can attribute to a
+        // compiler revision cannot have a verdict published against it — that is
+        // the whole reason the field exists — and a reader that silently
+        // substituted "" would turn "I do not know who wrote this" into "nobody
+        // claims to have written this", which reads the same and means something
+        // else. An EMPTY VALUE (`producer ""`) is legal and IS that first
+        // statement, said explicitly.
+        if (!acceptKeyword("producer")) {
+            malformed("expected the mandatory 'producer' header line after the "
+                      "format version (spell it `producer \"\"` for an "
+                      "artifact with no compiler revision to name)");
+            return InvalidHirNode;
+        }
+        if (lex_.peek().kind != Tk::Str) {
+            malformed("'producer' requires a quoted revision string");
+            return InvalidHirNode;
+        }
+        producer_ = takeStr();
         parsePreamble();
         return parseModule();
     }
@@ -2254,6 +3081,43 @@ private:
     // empty on the module path). Storage owned by the caller.
     std::span<NamedTypeBinding const> namedTypes_;
     std::uint32_t preCounter_ = 0;
+
+    // ── v3: THE RECURSIVE-COMPOSITE OPEN STACK ───────────────────────────────
+    //
+    // `struct "Node" rec 1 {i32, ptr<rec 1>}` — the forward id for handle 1 must
+    // exist BEFORE the field list is read, because a field IS the thing that
+    // closes the cycle. `forwardComposite` is exactly that primitive (the
+    // semantic analyzer's self-referential path already uses it), so the head arm
+    // mints and pushes here and the field arm resolves `rec 1` off this stack.
+    //
+    // ★★ WHY THE FORWARD KEY IS THE HANDLE AND NOT THE CONTENT. Every other
+    // composite on this path derives its `declSiteKey` from its FIELD CONTENT, so
+    // two identical spellings collapse to one TypeId. A cyclic composite cannot:
+    // its content contains its own key. The handle is the artifact's own
+    // context-free name for that composite, so keying on it gives the SAME
+    // property — handle H is one TypeId per file, every mention of it lands on
+    // that id — without the circularity. ⚠ The obvious alternative (hash the
+    // composite's textual EXTENT) is wrong and fails SILENTLY: mutually recursive
+    // `A`/`B` spell `B` differently depending on whether it was reached standing
+    // inside `A` or standing alone, so a text-keyed reader rebuilds TWO `B`s from
+    // one while the round-tripped BYTES still match.
+    //
+    // ⓘ CLEARED AT EVERY `parseType` ENTRY, and that is the strict reading: the
+    // writer only ever emits a back-reference to an ANCESTOR within the same type
+    // expression, so a `rec H` that resolves to a composite closed earlier in the
+    // file would be text this writer cannot reproduce — the round trip would
+    // break silently. Refusing it is the fail-loud half.
+    struct RecOpen { std::uint64_t handle; TypeId type; };
+    std::vector<RecOpen> recOpen_;
+
+    // The `declSiteKey` key space for a recursion handle. Bit 60, beside the
+    // sibling text-tier spaces already in this file (bit 62 whole-composite
+    // packed, bit 61 per-field packed) and clear of `contentDeclSiteKey`'s bit 63
+    // — so a handle-keyed composite can never collide with a content-keyed one,
+    // nor with a semantic decl-site key.
+    [[nodiscard]] static std::uint64_t recDeclSiteKey(std::uint64_t handle) {
+        return handle | (std::uint64_t{1} << 60);
+    }
 
     // ── P44: THE QUALIFICATION SIDE CHANNEL (type-text path only) ────────────
     //
@@ -2365,12 +3229,65 @@ private:
         }
         malformed("expected integer"); return 0;
     }
+    // ★★ THE SIGNED FORM, AND ITS ABSENCE WAS A ROUND TRIP THIS FORMAT COULD NOT
+    // CLOSE — ON A SHIPPED CORPUS EXAMPLE, WITH A PROCESS ABORT.
+    //
+    // `arr<T, N>`, `vec<T, N>` and `mat<T, R, C>` print `TypeInterner::scalars()`
+    // VERBATIM, and that span is `std::int64_t`. A C99 VLA's bound is interned as
+    // the sentinel **-2**, so the writer spells `arr<i32, -2>` — and this reader
+    // read it with the bare `takeInt()`, which accepts only a `Tk::Int` and never
+    // the `Tk::Minus` in front of it. It reported "expected integer", built
+    // `arr<i32, 0>`, and then met the `2` that was still in the stream.
+    // ✔MEASURED 2026-09-08 by round-tripping every artifact `emitHir` produced for
+    // `examples/c` (720 files): `c99_vla_fixed_array_arg` did not merely fail to
+    // reload — it ABORTED the process, `dss::substrate fatal: TypeInterner::get:
+    // TypeId out of range`. A raw kill, not a refusal, on a file this compiler had
+    // just written itself.
+    //
+    // ⓘ THE RULE THIS RESTORES: a reader accepts exactly what its writer can
+    // print. Three sibling arms read one printed form and only the `ext` scalar
+    // list — which had its own inline `accept(Tk::Minus)` — got it right; the `lit
+    // int` and `addr` arms had it right too. Four readers of one form, two of them
+    // wrong, which is why it is a NAMED helper now instead of a fourth copy.
+    // ⓘ The negation is done in the UNSIGNED domain (forming -INT64_MIN as a
+    // signed operation is UB); the two's-complement cast back is well-defined in
+    // C++20 — the same device the `lit int` arm already used.
+    [[nodiscard]] std::int64_t takeSignedInt() {
+        bool const neg = accept(Tk::Minus);
+        std::uint64_t const u = takeInt();
+        return neg ? static_cast<std::int64_t>(0u - u) : static_cast<std::int64_t>(u);
+    }
     // A float value accepts Float (`3.14`), Int (`42` — a whole-valued double
     // std::format rendered without a point), and the `inf`/`nan` idents
     // std::format emits for non-finite doubles (so synthetic HIR round-trips).
     [[nodiscard]] double takeFloat() {
         if (peekIs(Tk::Float)) return lex_.take().dnum;
-        if (peekIs(Tk::Int))   return static_cast<double>(lex_.take().num);
+        // ★★★ THE INT ARM DECODES THE TOKEN'S TEXT, NOT THE LEXER'S `uint64`
+        // ACCUMULATOR, AND THAT DIFFERENCE WAS A SILENT VALUE CORRUPTION.
+        //
+        // `std::format`'s shortest round-trip rendering of a whole-valued double
+        // carries neither a point nor an exponent, so `18446744073709551616`
+        // (2^64, an ordinary `(double)UINT64_MAX + 1` in C) lexes as `Tk::Int` —
+        // and 2^64 does not fit a `std::uint64_t`. The accumulator wrapped to 0,
+        // `overflow` was set and this arm read `.num` WITHOUT LOOKING AT IT, so
+        // `lit float 18446744073709551616` came back as `lit float 0` with a
+        // CLEAN reporter. ✔MEASURED 2026-09-08 round-tripping the emitted
+        // `examples/c` corpus: `unsigned_float_conversion_full_range` was the one
+        // artifact of 720 whose re-emit differed, and it differed by that value.
+        // A refused file is recoverable; a file that reads back as a different
+        // program with nothing reported is the shape the whole fail-loud rule
+        // exists to forbid.
+        //
+        // ⓘ `strtod` ON THE TEXT IS EXACT FOR EVERY VALUE THIS WRITER PRINTS —
+        // it is the same call the lexer already makes for the `Tk::Float` form —
+        // and it agrees with the old `static_cast<double>(num)` on every value
+        // that DID fit, so no in-range spelling moves. The overflow flag is not
+        // consulted because there is nothing left to overflow: the width that
+        // was too small is no longer in the path.
+        if (peekIs(Tk::Int)) {
+            Tok const t = lex_.take();
+            return std::strtod(t.text.c_str(), nullptr);
+        }
         if (peekIs(Tk::Ident)) {
             std::string const& t = lex_.peek().text;
             if (t == "inf") { lex_.take(); return std::numeric_limits<double>::infinity(); }
@@ -2379,7 +3296,81 @@ private:
         malformed("expected float"); return 0.0;
     }
     // Parse a tagged inline literal value (the `lit <tag> <value>` form).
+    //
+    // ★★★ THE AGGREGATE ARM IS A FRAME ON AN EXPLICIT HEAP STACK, NOT HOST
+    // RECURSION (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED)
+    // — the twin of `mir_text.cpp`'s `parseLiteral` (P56). The `agg` arm was
+    // this reader's only self-call, and its depth follows the brace nesting of
+    // an UNTRUSTED `.dsshir` initializer. `parseLiteralValueHead` reads one
+    // tagged value: every scalar arm (and every refusal) completes there; the
+    // `agg` arm pushes a frame whose fields arrive one head at a time, each
+    // followed by its `: <core>`, and the frame reduces at its `}`. Token
+    // appetite on every path is the recursive form's, verbatim.
+    struct LiteralParseFrame {
+        HirAggregateValue agg;
+    };
+
     [[nodiscard]] HirLiteralValue parseLiteralValue() {
+        std::vector<LiteralParseFrame> stack;
+        HirLiteralValue done;
+        bool needHead   = true;
+        bool haveResult = false;
+        for (;;) {
+            if (needHead) {
+                needHead   = false;
+                haveResult = parseLiteralValueHead(stack, done);
+            }
+            if (stack.empty()) return done;
+            HirAggregateValue& agg = stack.back().agg;
+            if (haveResult) {
+                haveResult = false;
+                // ⚠ THE PER-FIELD `: <core>` IS PARSED HERE AND NOWHERE ELSE. The
+                // top-level `literalCoreFor` recomputation works off the node's type
+                // annotation, which a nested field does not have; dropping the core
+                // here would make every element of a folded aggregate come back
+                // `Void` while the re-emitted text still matched byte for byte.
+                expect(Tk::Colon, "':'");
+                std::string const core = takeIdent();
+                // Resolved through BOTH owning tables, and refused by name with
+                // the union as the accepted set — the twin of `mir_text.cpp`'s
+                // `literalCoreFromName` / `literalCoreAccepted` pair.
+                if (auto const k = literalCoreFromName(core); k.has_value()) {
+                    done.core = *k;
+                } else {
+                    malformed(std::format(
+                        "unknown aggregate literal field core '{}' — accepted: {}",
+                        core, literalCoreAccepted()));
+                }
+                agg.fields.push_back(std::move(done));
+                done = HirLiteralValue{};
+            }
+            // The recursive loop, verbatim: another field only while the next
+            // token is neither `}` nor EOF, a comma is required between fields,
+            // and a comma followed by `}` ends the list.
+            if (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
+                if (!agg.fields.empty() && !accept(Tk::Comma)) {
+                    // no comma → the list is over (the recursive `break`)
+                } else if (peekIs(Tk::RBrace)) {
+                    // trailing comma → over
+                } else {
+                    needHead = true;
+                    continue;
+                }
+            }
+            expect(Tk::RBrace, "'}'");
+            HirLiteralValue lv;
+            lv.value = std::move(agg);
+            stack.pop_back();
+            done       = std::move(lv);
+            haveResult = true;
+        }
+    }
+
+    // Read ONE tagged value. Returns true when `out` holds a COMPLETE value
+    // (every scalar arm, and every refusal); false when an `agg` frame was
+    // pushed and its fields are still to come.
+    [[nodiscard]] bool parseLiteralValueHead(std::vector<LiteralParseFrame>& stack,
+                                             HirLiteralValue& out) {
         HirLiteralValue v;
         std::string const tag = takeIdent();
         if (tag == "none") { /* monostate */ }
@@ -2436,35 +3427,11 @@ private:
             // D-HIR-TEXT-WRITER-DROPS-THE-AGGREGATE-LITERAL-ARM: the inverse of
             // `appendLiteralValue`'s aggregate arm, and the SAME syntax
             // `mir_text.cpp`'s `parseLiteral` reads — `agg { <field>, … }`, each
-            // field a tagged value followed by `: <core>`.
-            //
-            // ⚠ THE PER-FIELD `: <core>` IS PARSED HERE AND NOWHERE ELSE. The
-            // top-level `literalCoreFor` recomputation works off the node's type
-            // annotation, which a nested field does not have; dropping the core
-            // here would make every element of a folded aggregate come back
-            // `Void` while the re-emitted text still matched byte for byte.
+            // field a tagged value followed by `: <core>`. The fields are read by
+            // the driver above, one head at a time, into the frame pushed here.
             expect(Tk::LBrace, "'{'");
-            HirAggregateValue agg;
-            while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
-                if (!agg.fields.empty() && !accept(Tk::Comma)) break;
-                if (peekIs(Tk::RBrace)) break;
-                HirLiteralValue f = parseLiteralValue();
-                expect(Tk::Colon, "':'");
-                std::string const core = takeIdent();
-                // Resolved through BOTH owning tables, and refused by name with
-                // the union as the accepted set — the twin of `mir_text.cpp`'s
-                // `literalCoreFromName` / `literalCoreAccepted` pair.
-                if (auto const k = literalCoreFromName(core); k.has_value()) {
-                    f.core = *k;
-                } else {
-                    malformed(std::format(
-                        "unknown aggregate literal field core '{}' — accepted: {}",
-                        core, literalCoreAccepted()));
-                }
-                agg.fields.push_back(std::move(f));
-            }
-            expect(Tk::RBrace, "'}'");
-            v.value = std::move(agg);
+            stack.push_back(LiteralParseFrame{});
+            return false;   // the fields come next
         }
         else if (tag == kHirTextUnspelledAggregateTag) {
             // The writer's own marker for a value it could not serialize. Refused
@@ -2486,7 +3453,8 @@ private:
                 kHirTextUnspelledAggregateTag));
         }
         else malformed(std::format("unknown literal value tag '{}'", tag));
-        return v;
+        out = std::move(v);
+        return true;
     }
     // The pool `core` for a parsed value: a string literal's element core is the
     // ELEMENT of its `Array<core,N+1>` node type — Char for a narrow `"…"`, but
@@ -2553,6 +3521,7 @@ private:
             if (acceptKeyword("ext_kinds")) parseExtKinds();
             else if (acceptKeyword("ext_ops")) parseExtOps();
             else if (acceptKeyword("intrinsics")) parseIntrinsics();
+            else if (acceptKeyword("buffers")) parseBuffers();
             else if (acceptKeyword("symbols")) parseSymbols();
             else break;
         }
@@ -2596,6 +3565,34 @@ private:
             std::string lang = takeStr();
             HirIntrinsicId id = builder_.intrinsicRegistry().registerIntrinsic(name, lang);
             intrinsicByName_.emplace(std::move(name), id);
+            if (cursorOff() == off) lex_.take();  // progress guard
+        }
+        expect(Tk::RBrace, "'}'");
+    }
+    // `buffers { buf 3 "main.c" … }` — the BufferId.v → source-name bindings the
+    // `@loc(buf N, …)` annotations resolve against. Order is PRESERVED as read
+    // (the emitter is what sorts), so a re-emit reproduces the source bytes.
+    void parseBuffers() {
+        expect(Tk::LBrace, "'{'");
+        while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
+            std::uint32_t const off = cursorOff();
+            if (!acceptKeyword("buf")) malformed("expected 'buf'");
+            std::uint64_t const id = takeInt();
+            std::string name = takeStr();
+            std::uint64_t origin = 0;
+            if (acceptKeyword("synthesized")) {
+                // The marker's origin is REQUIRED, not optional: a buffer known
+                // to be synthesized but with no origin recorded is exactly the
+                // half-fact that would let a reader treat it as an ordinary
+                // file again.
+                if (!acceptKeyword("from")) {
+                    malformed("expected 'from' after 'synthesized'");
+                }
+                origin = takeInt();
+            }
+            bufferNames_.push_back(
+                HirTextBufferName{static_cast<std::uint32_t>(id), std::move(name),
+                                  static_cast<std::uint32_t>(origin)});
             if (cursorOff() == off) lex_.take();  // progress guard
         }
         expect(Tk::RBrace, "'}'");
@@ -2809,45 +3806,212 @@ private:
 
     // ⚠ THIS WAS A HAND-RETYPED COPY OF THE EXPRESSION KEYWORD SET, AND IT WAS
     // ALREADY SHORT BY THREE. It listed twenty of the twenty-three keywords
-    // `parseExprInner` handles, omitting `va_start` / `va_arg` / `va_end` — all
+    // `parseExprHead` handles, omitting `va_start` / `va_arg` / `va_end` — all
     // three of which the writer emits — so a `.dsshir` carrying a variadic-access
-    // node was routed to `parseStmtInner` and refused as an unknown statement. The
+    // node was routed to `parseStmtHead` and refused as an unknown statement. The
     // router now asks the same table the dispatch and the refusal read.
     [[nodiscard]] static bool isExprKeyword(std::string_view kw) {
         return kHirTextExprKwTable.fromName(kw).has_value();
     }
 
-    // Parse any node (decl/stmt/expr/wildcard). Handles attrs + pre-order index.
-    HirNodeId parseNode() {
-        PendingAttrs attrs = parseAttrs();
-        std::uint32_t const idx = preCounter_++;
-        std::string_view kw = peekIs(Tk::Ident) ? std::string_view{lex_.peek().text} : std::string_view{};
-        HirNodeId id = isExprKeyword(kw) ? parseExprInner() : parseStmtInner();
-        recordIndex(idx, id);
-        applyAttrs(id, std::move(attrs));
-        return id;
+    // ── nodes: THE READER, ON AN EXPLICIT HEAP STACK ──────────────────────────
+    //
+    // ★★★ AN EXPLICIT HEAP WORK STACK, NOT HOST RECURSION
+    // (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED,
+    // the operator's ruling of 2026-09-02). `parseNode` called itself once per
+    // nested node — every operand in a paren list, every statement in a brace
+    // body, an `if`'s three arms, a `seq`'s statements and its yielded value — so
+    // its host-stack depth followed the nesting of an UNTRUSTED `.dsshir`, and
+    // `parseHir` is a `DSS_EXPORT`ed entry point, not a private helper.
+    //
+    // ✔MEASURED 2026-09-08 through `ctest` on the ordinary gtest main thread
+    // (~1 MiB), mingw-w64 g++ 13.2 Debug, by bisecting a writer-produced artifact:
+    // **700 levels parse clean, 800 SEGFAULT**. The WRITER's own limit is
+    // `kHirTextMaxNodeDepth` (262144), so before this conversion the two halves of
+    // one codec disagreed by a factor of ~350: `emitHir` would happily spell an
+    // artifact that killed the process on the way back in. A round trip is this
+    // format's whole contract, so that gap was not a reader bug beside a writer
+    // fix — it was the same defect, unconverted.
+    //
+    // ⓘ THE SHAPE IS THE ONE THIS FILE ALREADY USES TWICE — `parseType`'s
+    // `TypeParseFrame` and `parseLiteralValue`'s `LiteralParseFrame`: a HEAD that
+    // reads one production up to its first child and either COMPLETES (a leaf) or
+    // pushes a frame, and an ADVANCE that takes a finished child, resumes the
+    // frame's token appetite exactly where the recursive call returned, and either
+    // asks for another child or reduces. Every side effect the recursive arm
+    // performed BEFORE its call is performed by the head; every one it performed
+    // AFTER is performed by the advance — including `recordIndex`/`applyAttrs`,
+    // which ran after the inner parse and so run at REDUCE. Token appetite on
+    // every path, malformed input included, is the recursive form's verbatim.
+    //
+    // ⚠ THE PROGRESS GUARDS TRAVEL WITH THEIR LOOPS. Four productions force-skip a
+    // stuck token when an iteration leaves the cursor unmoved (the `BraceNodes`
+    // frame, `seq`'s statement list, `switch`'s arm list, `for`'s clause list); the
+    // offset each compares against is captured BEFORE the iteration begins, so it
+    // is frame state (`loopOff`), not a local — a collect-all parse that could
+    // spin is the one failure mode worse than a refusal.
+    enum class NodeParseStep : std::uint8_t {
+        Completed,   // `done` holds a finished node
+        WantChild,   // a frame was pushed (or resumed); read another head
+    };
+
+    // One suspended node production.
+    //
+    // ⚠ THE STACK IS A `std::deque`, NOT A `std::vector`: the frame is fat, and a
+    // vector re-moves every live frame on each doubling — a frame move is five
+    // `std::optional`s of string- and vector-carrying attribute structs. A deque
+    // never reallocates, so each frame is moved exactly once. The interface used
+    // is the same four operations either container offers.
+    // ⚠ STATED AS A PROPERTY, NOT AS A FIX, BECAUSE THE MEASUREMENT REFUTED THE
+    // FIX I EXPECTED. ✔MEASURED 2026-09-08: the depth-limit pin took 14.4 s with a
+    // vector and **14.4 s with a deque** — the reallocation was not the cost at
+    // all. The cost was the ~262k `malformed` reports the old recover-through
+    // behaviour emitted, and the `depthExceeded_` abandon path below is what took
+    // that pin to 0.9 s. Keep the deque for the property; do not credit it with
+    // the number.
+    //
+    // ⓘ THE FRAME IS FAT ON PURPOSE, AND THAT IS THE TRADE THE RULING ASKS FOR.
+    // It carries what the recursive form kept in a host frame — the pending
+    // attributes, the pre-order index, the children so far — so the cost per level
+    // is comparable; what changed is WHERE it lives. Heap is bounded and
+    // reportable (`kHirTextMaxNodeDepth` below), a 1 MiB thread is neither.
+    struct NodeParseFrame {
+        enum class Kind : std::uint8_t {
+            ParenOperands,  // `kw … ( a , b , … )` — every operand-carrying expr
+            SeqBody,        // `seq : T { <stmts> yield <expr> }`
+            BraceNodes,     // `{ n … }` — block / import_group / ext_node / error
+                            //   / function / extern_function
+            If, Seh, While, Do, For, Switch,
+            CaseArm, Label, Return, ExprStmt, Assign, VarLike, Global,
+            IndirectGoto,   // `goto *<expr>` — the computed-goto target
+            AsmOperands,    // an inline-asm descriptor's operand list
+        };
+        Kind          kind    = Kind::ParenOperands;
+        std::uint8_t  phase   = 0;      // which child slot is awaited
+        HirFlags      flags   = HirFlags::None;
+        HirKind       nodeKind = HirKind::Error;   // ParenOperands / BraceNodes target
+        TypeId        type{};
+        std::uint32_t payload = 0;      // op payload / ext kind id / label ordinal
+        std::uint32_t sym     = 0;      // symbol handle (var / global / function)
+        std::uint64_t raw     = 0;      // builtincall lowering ordinal, validated at reduce
+        std::string   name;             // intrinsic name, resolved at reduce
+        std::vector<HirNodeId> kids;
+        std::uint32_t loopOff = 0;      // list loops: the progress guard's offset
+        // `for`'s four clause slots and the role currently being read.
+        std::optional<HirNodeId> forInit, forCond, forUpdate, forBody;
+        std::string              forRole;
+        // Inline asm: the descriptor being assembled and the operand whose VALUE
+        // is currently being read. Held indirectly so a frame that is not an asm
+        // frame — which is every frame in a deep artifact — costs two pointers.
+        std::unique_ptr<HirInlineAsmDescriptor> asmDesc;
+        std::unique_ptr<HirInlineAsmOperand>    asmOp;
+        // The node's own identity bookkeeping, taken by the head and applied at
+        // reduce because that is when the recursive form applied it.
+        std::uint32_t preIdx = 0;
+        PendingAttrs  attrs;
+    };
+
+    // ★★ PAST THE LIMIT THE FILE IS ABANDONED, NOT RECOVERED THROUGH, AND THAT
+    // IS A MEASUREMENT. ✔MEASURED 2026-09-08: without this flag one over-deep file
+    // produced ~262k `malformed` reports — every suspended frame in turn failing
+    // its own `)` — and took **14.4 s** to refuse what the first frame had already
+    // decided in the first millisecond. The depth limit is not a recoverable error
+    // at one node; it is a statement about the WHOLE artifact. So it is said ONCE,
+    // the input is drained, and `parseHir` reports the file refused. ⚠ The
+    // refusal is still LOUD — an Error-severity `H_TextMalformed` naming the limit
+    // — which is what `parseHir`'s `ok` reads; abandoning changes how much is said,
+    // never whether anything is.
+    bool depthExceeded_ = false;
+
+    // Drop every suspended frame and consume the rest of the input, so the module
+    // loop above sees `Eof` and stops instead of re-entering on a text this reader
+    // has already refused.
+    HirNodeId abandonPastDepthLimit(std::deque<NodeParseFrame>& stack) {
+        stack.clear();
+        while (!peekIs(Tk::Eof)) lex_.take();
+        return builder_.addLeaf(HirKind::Error);
     }
 
-    [[nodiscard]] std::vector<HirNodeId> parseParenOperands() {
-        std::vector<HirNodeId> kids;
-        expect(Tk::LParen, "'('");
-        while (!peekIs(Tk::RParen) && !peekIs(Tk::Eof)) {
-            kids.push_back(parseNode());
-            if (!accept(Tk::Comma)) break;
+    // Parse any node (decl/stmt/expr/wildcard). Handles attrs + pre-order index.
+    // THE DRIVER — the only entry point, and the only place a stack is created.
+    HirNodeId parseNode() {
+        std::deque<NodeParseFrame> stack;
+        HirNodeId     done{};
+        NodeParseStep step = NodeParseStep::WantChild;
+        for (;;) {
+            if (depthExceeded_) return abandonPastDepthLimit(stack);
+            if (step == NodeParseStep::WantChild) {
+                step = parseNodeHead(stack, done);
+                continue;
+            }
+            if (stack.empty()) return done;
+            step = advanceNodeFrame(stack, done);
         }
-        expect(Tk::RParen, "')'");
-        return kids;
     }
-    [[nodiscard]] std::vector<HirNodeId> parseBraceNodes() {
-        std::vector<HirNodeId> kids;
-        expect(Tk::LBrace, "'{'");
-        while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
-            std::uint32_t const off = cursorOff();
-            kids.push_back(parseNode());
-            if (cursorOff() == off) lex_.take();  // progress guard
+
+    // Reduce: the node is built, so its index and attributes are applied — the two
+    // statements that used to sit after the recursive `parseExprInner` /
+    // `parseStmtInner` call.
+    NodeParseStep completeNode(HirNodeId id, std::uint32_t idx, PendingAttrs&& attrs,
+                               HirNodeId& done) {
+        recordIndex(idx, id);
+        applyAttrs(id, std::move(attrs));
+        done = id;
+        return NodeParseStep::Completed;
+    }
+
+    NodeParseStep pushFrame(std::deque<NodeParseFrame>& stack, NodeParseFrame&& f) {
+        stack.push_back(std::move(f));
+        return NodeParseStep::WantChild;
+    }
+
+    // Read ONE node's head. Either the whole node (a leaf) or its opening tokens
+    // plus a frame.
+    NodeParseStep parseNodeHead(std::deque<NodeParseFrame>& stack, HirNodeId& done) {
+        PendingAttrs attrs = parseAttrs();
+        std::uint32_t const idx = preCounter_++;
+        // ★★ THE COUNTER THAT REPLACED THE HOST STACK, ON THE READING SIDE, AND
+        // IT IS THE SAME NUMBER THE WRITER ENFORCES. A file deeper than the format
+        // admits is refused BY NAME rather than growing the work stack without
+        // bound on input nobody in this process wrote.
+        if (stack.size() >= kHirTextMaxNodeDepth) {
+            malformed(std::format(
+                "node nesting reaches depth {}, past the `.dsshir` format's limit "
+                "of {} levels — the file is refused rather than read",
+                stack.size(), kHirTextMaxNodeDepth));
+            depthExceeded_ = true;
+            return completeNode(builder_.addLeaf(HirKind::Error), idx, std::move(attrs), done);
         }
-        expect(Tk::RBrace, "'}'");
-        return kids;
+        std::string_view kw = peekIs(Tk::Ident) ? std::string_view{lex_.peek().text}
+                                                : std::string_view{};
+        return isExprKeyword(kw) ? parseExprHead(stack, done, idx, std::move(attrs))
+                                 : parseStmtHead(stack, done, idx, std::move(attrs));
+    }
+
+    // `( a , b , … )`. The head consumes `(` and decides whether there is a first
+    // operand; the empty list completes here, exactly where the recursive
+    // `parseParenOperands` would have returned an empty vector.
+    NodeParseStep openParenOperands(std::deque<NodeParseFrame>& stack, HirNodeId& done,
+                                    NodeParseFrame&& f) {
+        expect(Tk::LParen, "'('");
+        if (peekIs(Tk::RParen) || peekIs(Tk::Eof)) {
+            expect(Tk::RParen, "')'");
+            return reduceParenOperands(f, done);
+        }
+        return pushFrame(stack, std::move(f));
+    }
+
+    // `{ n n n }`. Same split, and the same progress guard the recursive
+    // `parseBraceNodes` carried.
+    NodeParseStep openBraceNodes(std::deque<NodeParseFrame>& stack, HirNodeId& done,
+                                 NodeParseFrame&& f) {
+        expect(Tk::LBrace, "'{'");
+        if (peekIs(Tk::RBrace) || peekIs(Tk::Eof)) {
+            expect(Tk::RBrace, "'}'");
+            return reduceBraceNodes(f, done);
+        }
+        f.loopOff = cursorOff();
+        return pushFrame(stack, std::move(f));
     }
 
     [[nodiscard]] std::uint32_t parseSymHandle() {
@@ -2860,7 +4024,8 @@ private:
     [[nodiscard]] TypeId parseTypeAnnot() { expect(Tk::Colon, "':'"); return parseType(); }
 
     // ── expressions ──────────────────────────────────────────────────────────
-    HirNodeId parseExprInner() {
+    NodeParseStep parseExprHead(std::deque<NodeParseFrame>& stack, HirNodeId& done,
+                                std::uint32_t idx, PendingAttrs&& attrs) {
         std::string kw = takeIdent();
         HirFlags flags = parseFlags();
         auto const which = kHirTextExprKwTable.fromName(kw);
@@ -2869,21 +4034,27 @@ private:
             // (`isExprKeyword`) and this dispatch now consult the SAME table, so a
             // keyword that got here resolved there — which is the property that
             // fixed the `va_*` routing hole in the first place. It stays because
-            // `parseExprInner` is a production, not a private helper of one
-            // caller, and a production that can be reached with an unknown keyword
-            // must say what it accepts rather than fall through building an Error
-            // node in silence (D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET).
+            // this is a production, not a private helper of one caller, and a
+            // production that can be reached with an unknown keyword must say what
+            // it accepts rather than fall through building an Error node in
+            // silence (D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET).
             malformed(std::format("unknown expression '{}' — accepted: {}", kw,
                                   detail::renderAllowedList(allNames(kHirTextExprKwTable))));
-            return builder_.addLeaf(HirKind::Error, InvalidType, 0, flags);
+            return completeNode(builder_.addLeaf(HirKind::Error, InvalidType, 0, flags),
+                                idx, std::move(attrs), done);
         }
         // The `kw : type (operands...)` family — mirror of the emitter's
         // `typedCall`. Payload is always 0; arity is enforced later by the
         // verifier.
         auto typedCall = [&](HirKind kind) {
-            TypeId t = parseTypeAnnot();
-            auto ops = parseParenOperands();
-            return builder_.addParent(kind, ops, t, 0, flags);
+            NodeParseFrame f;
+            f.kind     = NodeParseFrame::Kind::ParenOperands;
+            f.nodeKind = kind;
+            f.flags    = flags;
+            f.type     = parseTypeAnnot();
+            f.preIdx   = idx;
+            f.attrs    = std::move(attrs);
+            return openParenOperands(stack, done, std::move(f));
         };
         // ⓘ `-Werror=switch` IS THE PAIRING GUARD. A row added to
         // `kHirTextExprKwTable` with no arm here fails the build, which is the
@@ -2895,25 +4066,30 @@ private:
                 if (accept(Tk::Hash)) {   // bare index form: `lit #N : type` (no pool)
                     std::uint32_t const i = static_cast<std::uint32_t>(takeInt());
                     TypeId t = parseTypeAnnot();
-                    return builder_.makeLiteral(t, i, flags);
+                    return completeNode(builder_.makeLiteral(t, i, flags), idx,
+                                        std::move(attrs), done);
                 }
                 // value form: `lit <tagged-value> : type` — rebuild the pool entry.
                 HirLiteralValue v = parseLiteralValue();
                 TypeId t = parseTypeAnnot();
                 v.core = literalCoreFor(t, v);
-                std::uint32_t const idx = pLiterals_.add(std::move(v));
-                return builder_.makeLiteral(t, idx, flags);
+                std::uint32_t const pidx = pLiterals_.add(std::move(v));
+                return completeNode(builder_.makeLiteral(t, pidx, flags), idx,
+                                    std::move(attrs), done);
             }
             case HirTextExprKw::Ref: {
                 std::uint32_t h = parseSymHandle(); TypeId t = parseTypeAnnot();
-                return builder_.makeRef(t, h, flags);
+                return completeNode(builder_.makeRef(t, h, flags), idx, std::move(attrs), done);
             }
             case HirTextExprKw::Call: {
-                TypeId t = parseTypeAnnot(); auto kids = parseParenOperands();
-                if (kids.empty()) { malformed("call needs a callee"); return builder_.addLeaf(HirKind::Error, t, 0, flags); }
-                HirNodeId callee = kids.front();
-                std::vector<HirNodeId> args(kids.begin() + 1, kids.end());
-                return builder_.makeCall(callee, args, t, flags);
+                NodeParseFrame f;
+                f.kind     = NodeParseFrame::Kind::ParenOperands;
+                f.nodeKind = HirKind::Call;
+                f.flags    = flags;
+                f.type     = parseTypeAnnot();
+                f.preIdx   = idx;
+                f.attrs    = std::move(attrs);
+                return openParenOperands(stack, done, std::move(f));
             }
             case HirTextExprKw::BuiltinCall: {
                 // c103 (D-CSUBSET-INTRINSIC-UMULH): `builtincall #<lowering> :
@@ -2934,22 +4110,18 @@ private:
                 // "no lowering" sentinel — so it renders empty here and is
                 // refused, which is right: a `BuiltinCall` node exists precisely
                 // because the builtin HAS a lowering.
+                // ⓘ The validation runs at REDUCE, which is where the recursive
+                // arm ran it: after the operands, not before.
                 expect(Tk::Hash, "'#' before a builtincall lowering ordinal");
-                std::uint64_t const raw = takeInt();
-                TypeId t = parseTypeAnnot();
-                auto kids = parseParenOperands();
-                if (raw > 0xFFFFu
-                    || builtinLoweringName(
-                           static_cast<BuiltinLowering>(
-                               static_cast<std::uint16_t>(raw))).empty()) {
-                    malformed(std::format(
-                        "builtincall lowering ordinal {} names no BuiltinLowering "
-                        "this build defines - accepted: {}", raw,
-                        detail::renderAllowedList(allNames(kBuiltinLoweringTable))));
-                    return builder_.addLeaf(HirKind::Error, t, 0, flags);
-                }
-                return builder_.addParent(HirKind::BuiltinCall, kids, t,
-                                          static_cast<std::uint32_t>(raw), flags);
+                NodeParseFrame f;
+                f.kind     = NodeParseFrame::Kind::ParenOperands;
+                f.nodeKind = HirKind::BuiltinCall;
+                f.flags    = flags;
+                f.raw      = takeInt();
+                f.type     = parseTypeAnnot();
+                f.preIdx   = idx;
+                f.attrs    = std::move(attrs);
+                return openParenOperands(stack, done, std::move(f));
             }
             case HirTextExprKw::LabelAddr: {
                 // D-CSUBSET-COMPUTED-GOTO: `labeladdr L<n> : <type>` — a LEAF
@@ -2958,52 +4130,72 @@ private:
                 // `parseLabelOrdinal` production so the three cannot disagree.
                 std::uint32_t const ord = parseLabelOrdinal();
                 TypeId t = parseTypeAnnot();
-                return builder_.makeLabelAddressOf(ord, t, flags);
+                return completeNode(builder_.makeLabelAddressOf(ord, t, flags), idx,
+                                    std::move(attrs), done);
             }
             case HirTextExprKw::Intrinsic: {
-                std::string name = takeStr(); TypeId t = parseTypeAnnot();
-                auto kids = parseParenOperands();
-                auto it = intrinsicByName_.find(name);
-                std::uint32_t iid = 0;
-                if (it != intrinsicByName_.end()) iid = it->second.v;
-                else unknownName(std::format("intrinsic \"{}\" not declared", name));
-                return builder_.makeIntrinsicCall(iid, kids, t, flags);
+                // ⓘ The name is resolved at REDUCE, not here: the recursive arm
+                // looked it up AFTER `parseParenOperands`, so an undeclared
+                // intrinsic's `unknownName` still lands after its operands'
+                // diagnostics and the report order is unchanged.
+                NodeParseFrame f;
+                f.kind     = NodeParseFrame::Kind::ParenOperands;
+                f.nodeKind = HirKind::IntrinsicCall;
+                f.flags    = flags;
+                f.name     = takeStr();
+                f.type     = parseTypeAnnot();
+                f.preIdx   = idx;
+                f.attrs    = std::move(attrs);
+                return openParenOperands(stack, done, std::move(f));
             }
             case HirTextExprKw::BinOp:
             case HirTextExprKw::UnOp: {
+                NodeParseFrame f;
+                f.kind     = NodeParseFrame::Kind::ParenOperands;
+                f.nodeKind = (*which == HirTextExprKw::BinOp) ? HirKind::BinaryOp
+                                                              : HirKind::UnaryOp;
+                f.flags    = flags;
                 std::uint32_t payload = 0; (void)parseOp(payload);
-                TypeId t = parseTypeAnnot(); auto kids = parseParenOperands();
-                return builder_.addParent(
-                    (*which == HirTextExprKw::BinOp) ? HirKind::BinaryOp : HirKind::UnaryOp,
-                    kids, t, payload, flags);
+                f.payload  = payload;
+                f.type     = parseTypeAnnot();
+                f.preIdx   = idx;
+                f.attrs    = std::move(attrs);
+                return openParenOperands(stack, done, std::move(f));
             }
-            case HirTextExprKw::Member: {
-                expect(Tk::Hash, "'#'"); std::uint32_t fi = static_cast<std::uint32_t>(takeInt());
-                TypeId t = parseTypeAnnot(); auto k = parseParenOperands();
-                return builder_.addParent(HirKind::MemberAccess, k, t, fi, flags);
-            }
+            case HirTextExprKw::Member:
             case HirTextExprKw::Swizzle: {
-                expect(Tk::Hash, "'#'"); std::uint32_t m = static_cast<std::uint32_t>(takeInt());
-                TypeId t = parseTypeAnnot(); auto k = parseParenOperands();
-                return builder_.addParent(HirKind::Swizzle, k, t, m, flags);
+                expect(Tk::Hash, "'#'");
+                NodeParseFrame f;
+                f.kind     = NodeParseFrame::Kind::ParenOperands;
+                f.nodeKind = (*which == HirTextExprKw::Member) ? HirKind::MemberAccess
+                                                               : HirKind::Swizzle;
+                f.flags    = flags;
+                f.payload  = static_cast<std::uint32_t>(takeInt());
+                f.type     = parseTypeAnnot();
+                f.preIdx   = idx;
+                f.attrs    = std::move(attrs);
+                return openParenOperands(stack, done, std::move(f));
             }
             case HirTextExprKw::TypeRef: {
-                TypeId t = parseTypeAnnot(); return builder_.makeTypeRef(t, flags);
+                TypeId t = parseTypeAnnot();
+                return completeNode(builder_.makeTypeRef(t, flags), idx, std::move(attrs), done);
             }
             case HirTextExprKw::Seq: {
                 // seq : type { <stmt-lines> yield <resultExpr> }
-                TypeId t = parseTypeAnnot();
+                NodeParseFrame f;
+                f.kind   = NodeParseFrame::Kind::SeqBody;
+                f.flags  = flags;
+                f.type   = parseTypeAnnot();
+                f.preIdx = idx;
+                f.attrs  = std::move(attrs);
                 expect(Tk::LBrace, "'{'");
-                std::vector<HirNodeId> stmts;
-                while (!peekKeyword("yield") && !peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
-                    std::uint32_t const off = cursorOff();
-                    stmts.push_back(parseNode());
-                    if (cursorOff() == off) lex_.take();   // progress guard
+                if (!peekKeyword("yield") && !peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
+                    f.loopOff = cursorOff();
+                    return pushFrame(stack, std::move(f));   // phase 0: statements
                 }
                 if (!acceptKeyword("yield")) malformed("seq body needs a 'yield <expr>'");
-                HirNodeId result = parseNode();
-                expect(Tk::RBrace, "'}'");
-                return builder_.makeSeqExpr(stmts, result, t, flags);
+                f.phase = 1;                                  // phase 1: the result
+                return pushFrame(stack, std::move(f));
             }
             case HirTextExprKw::Cast:       return typedCall(HirKind::Cast);
             case HirTextExprKw::Index:      return typedCall(HirKind::Index);
@@ -3028,7 +4220,8 @@ private:
         // Unreachable: `-Werror=switch` proves the switch is total over the enum,
         // and `fromName` cannot return a value outside it.
         malformed(std::format("unknown expression '{}'", kw));
-        return builder_.addLeaf(HirKind::Error, InvalidType, 0, flags);
+        return completeNode(builder_.addLeaf(HirKind::Error, InvalidType, 0, flags), idx,
+                            std::move(attrs), done);
     }
 
     // Parse an op name into a node payload (core HirOpKind or registered HirOpId).
@@ -3053,8 +4246,12 @@ private:
     }
 
     // ── statements / decls / wildcards ────────────────────────────────────────
-    HirNodeId parseStmtInner() {
-        if (!peekIs(Tk::Ident)) { malformed("expected a statement"); return builder_.addLeaf(HirKind::Error); }
+    NodeParseStep parseStmtHead(std::deque<NodeParseFrame>& stack, HirNodeId& done,
+                                std::uint32_t idx, PendingAttrs&& attrs) {
+        if (!peekIs(Tk::Ident)) {
+            malformed("expected a statement");
+            return completeNode(builder_.addLeaf(HirKind::Error), idx, std::move(attrs), done);
+        }
         std::string kw = takeIdent();
         HirFlags flags = parseFlags();
         auto const which = kHirTextStmtKwTable.fromName(kw);
@@ -3074,126 +4271,183 @@ private:
                 "expressions: {}", kw,
                 detail::renderAllowedList(allNames(kHirTextStmtKwTable)),
                 detail::renderAllowedList(allNames(kHirTextExprKwTable))));
-            return builder_.addLeaf(HirKind::Error, InvalidType, 0, flags);
+            return completeNode(builder_.addLeaf(HirKind::Error, InvalidType, 0, flags),
+                                idx, std::move(attrs), done);
         }
+        NodeParseFrame f;
+        f.flags  = flags;
+        f.preIdx = idx;
+        f.attrs  = std::move(attrs);
         // ⓘ `-Werror=switch` is the pairing guard: a row in
         // `kHirTextStmtKwTable` with no arm here fails the build.
         switch (*which) {
-            case HirTextStmtKw::Block: { auto k = parseBraceNodes(); return builder_.makeBlock(k, flags); }
-            case HirTextStmtKw::If: {
-                expect(Tk::LParen, "'('"); HirNodeId cond = parseNode(); expect(Tk::RParen, "')'");
-                HirNodeId then = parseNode();
-                std::optional<HirNodeId> els;
-                if (acceptKeyword("else")) els = parseNode();
-                return builder_.makeIfStmt(cond, then, els, flags);
-            }
-            case HirTextStmtKw::SehTry: {
+            case HirTextStmtKw::Block:
+                f.kind = NodeParseFrame::Kind::BraceNodes; f.nodeKind = HirKind::Block;
+                return openBraceNodes(stack, done, std::move(f));
+            case HirTextStmtKw::If:
+                expect(Tk::LParen, "'('");
+                f.kind = NodeParseFrame::Kind::If;
+                return pushFrame(stack, std::move(f));            // phase 0: the condition
+            case HirTextStmtKw::SehTry:
                 // c115 SEH round-trip: `seh_try` <tryBody> `seh_except (` filter `)`
                 // <handler> — mirrors the writer arm exactly.
-                HirNodeId tryBody = parseNode();
-                if (!acceptKeyword("seh_except")) malformed("expected 'seh_except'");
-                expect(Tk::LParen, "'('"); HirNodeId filter = parseNode(); expect(Tk::RParen, "')'");
-                HirNodeId handler = parseNode();
-                return builder_.makeSehTryExcept(tryBody, filter, handler, flags);
+                f.kind = NodeParseFrame::Kind::Seh;
+                return pushFrame(stack, std::move(f));            // phase 0: the try body
+            case HirTextStmtKw::While:
+                expect(Tk::LParen, "'('");
+                f.kind = NodeParseFrame::Kind::While;
+                return pushFrame(stack, std::move(f));            // phase 0: the condition
+            case HirTextStmtKw::Do:
+                f.kind = NodeParseFrame::Kind::Do;
+                return pushFrame(stack, std::move(f));            // phase 0: the body
+            case HirTextStmtKw::For: {
+                expect(Tk::LBrace, "'{'");
+                f.kind = NodeParseFrame::Kind::For;
+                if (peekIs(Tk::RBrace) || peekIs(Tk::Eof)) {
+                    expect(Tk::RBrace, "'}'");
+                    return reduceFor(f, done);
+                }
+                f.loopOff = cursorOff();
+                f.forRole = takeIdent();
+                expect(Tk::Colon, "':'");
+                return pushFrame(stack, std::move(f));
             }
-            case HirTextStmtKw::While: {
-                expect(Tk::LParen, "'('"); HirNodeId cond = parseNode(); expect(Tk::RParen, "')'");
-                HirNodeId body = parseNode();
-                return builder_.makeWhileStmt(cond, body, flags);
-            }
-            case HirTextStmtKw::Do: {
-                HirNodeId body = parseNode();
-                if (!acceptKeyword("while")) malformed("expected 'while'");
-                expect(Tk::LParen, "'('"); HirNodeId cond = parseNode(); expect(Tk::RParen, "')'");
-                return builder_.makeDoWhileStmt(body, cond, flags);
-            }
-            case HirTextStmtKw::For: return parseFor(flags);
-            case HirTextStmtKw::Switch: {
+            case HirTextStmtKw::Switch:
                 // c60 (Design I-A): `switch (disc) { body: <block> case v L<ord> ...
                 // default L<ord> }` — the body Block then the dispatch arms.
-                expect(Tk::LParen, "'('"); HirNodeId disc = parseNode(); expect(Tk::RParen, "')'");
-                expect(Tk::LBrace, "'{'");
-                if (!acceptKeyword("body")) malformed("expected 'body:' in switch");
-                expect(Tk::Colon, "':'");
-                HirNodeId body = parseNode();
-                std::vector<HirNodeId> arms;
-                while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
-                    std::uint32_t const off = cursorOff();
-                    arms.push_back(parseNode());
-                    if (cursorOff() == off) lex_.take();
-                }
-                expect(Tk::RBrace, "'}'");
-                return builder_.makeSwitchStmt(disc, body, arms, flags);
-            }
-            case HirTextStmtKw::Case: {
-                HirNodeId v = parseNode(); std::uint32_t ord = parseLabelOrdinal();
-                return builder_.makeCaseArm(v, ord, flags);
-            }
+                expect(Tk::LParen, "'('");
+                f.kind = NodeParseFrame::Kind::Switch;
+                return pushFrame(stack, std::move(f));            // phase 0: the discriminant
+            case HirTextStmtKw::Case:
+                f.kind = NodeParseFrame::Kind::CaseArm;
+                return pushFrame(stack, std::move(f));            // phase 0: the case value
             case HirTextStmtKw::Default: {
                 std::uint32_t ord = parseLabelOrdinal();
-                return builder_.makeCaseArm(std::nullopt, ord, flags);
+                return completeNode(builder_.makeCaseArm(std::nullopt, ord, flags), idx,
+                                    std::move(f.attrs), done);
             }
             // c60 (Design I-A): `label L<ord>:` <body> and `goto L<ord>` / `goto *expr`
             // (the switch body's case markers render as `label` statements, so the
             // round-trip parser must read them).
-            case HirTextStmtKw::Label: {
-                std::uint32_t ord = parseLabelOrdinal();
+            case HirTextStmtKw::Label:
+                f.kind    = NodeParseFrame::Kind::Label;
+                f.payload = parseLabelOrdinal();
                 expect(Tk::Colon, "':'");
-                HirNodeId body = parseNode();
-                return builder_.makeLabelStmt(ord, body, flags);
-            }
-            case HirTextStmtKw::Goto: {   // `goto L<ord>` (the plain label form)
+                return pushFrame(stack, std::move(f));            // phase 0: the body
+            case HirTextStmtKw::Goto: {
+                // TWO forms under one keyword, exactly as the writer spells them:
+                // `goto L<ord>` (the plain label form) and `goto *<expr>` (the
+                // computed-goto form, D-CSUBSET-COMPUTED-GOTO). The second had no
+                // arm here at all — see `Tk::Star` for what that cost.
+                if (accept(Tk::Star)) {
+                    f.kind = NodeParseFrame::Kind::IndirectGoto;
+                    return pushFrame(stack, std::move(f));   // phase 0: the target
+                }
                 std::uint32_t ord = parseLabelOrdinal();
-                return builder_.makeGotoStmt(ord, flags);
+                return completeNode(builder_.makeGotoStmt(ord, flags), idx,
+                                    std::move(f.attrs), done);
             }
             case HirTextStmtKw::Break: {
                 std::uint32_t d = peekIs(Tk::Int) ? static_cast<std::uint32_t>(takeInt()) : 0u;
-                return builder_.makeBreak(d, flags);
+                return completeNode(builder_.makeBreak(d, flags), idx, std::move(f.attrs), done);
             }
             case HirTextStmtKw::Continue: {
                 std::uint32_t d = peekIs(Tk::Int) ? static_cast<std::uint32_t>(takeInt()) : 0u;
-                return builder_.makeContinue(d, flags);
+                return completeNode(builder_.makeContinue(d, flags), idx, std::move(f.attrs), done);
             }
             // FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template asm barrier — a bare
             // `inline_asm` leaf (mirrors the writer arm; no payload in cycle-1).
-            case HirTextStmtKw::InlineAsm: return parseInlineAsm(flags);
-            case HirTextStmtKw::Return: {
+            case HirTextStmtKw::InlineAsm: return parseInlineAsmHead(stack, done, std::move(f));
+            case HirTextStmtKw::Return:
                 // A return value may carry inline attributes (`return @loc(...) expr`).
                 // A value-less `return` is always block-terminal (nothing may follow
                 // it — checkBlockTermination), so a leading `@` here unambiguously
                 // introduces an attributed value, never the next statement's attrs.
-                if (peekIs(Tk::At) || startsExpr()) { HirNodeId v = parseNode(); return builder_.makeReturn(v, flags); }
-                return builder_.makeReturn(std::nullopt, flags);
-            }
-            case HirTextStmtKw::Expr: { HirNodeId e = parseNode(); return builder_.makeExprStmt(e, flags); }
+                if (peekIs(Tk::At) || startsExpr()) {
+                    f.kind = NodeParseFrame::Kind::Return;
+                    return pushFrame(stack, std::move(f));
+                }
+                return completeNode(builder_.makeReturn(std::nullopt, flags), idx,
+                                    std::move(f.attrs), done);
+            case HirTextStmtKw::Expr:
+                f.kind = NodeParseFrame::Kind::ExprStmt;
+                return pushFrame(stack, std::move(f));
             case HirTextStmtKw::Var:
-            case HirTextStmtKw::Param: return parseVarLike(flags);
-            case HirTextStmtKw::Assign: {
-                HirNodeId tgt = parseNode(); expect(Tk::Equal, "'='"); HirNodeId val = parseNode();
-                return builder_.makeAssignStmt(tgt, val, flags);
+            case HirTextStmtKw::Param: {
+                f.kind = NodeParseFrame::Kind::VarLike;
+                f.sym  = parseSymHandle();
+                f.type = parseTypeAnnot();
+                if (accept(Tk::Equal)) return pushFrame(stack, std::move(f));
+                return completeNode(builder_.makeVarDecl(f.type, f.sym, std::nullopt, flags),
+                                    idx, std::move(f.attrs), done);
             }
+            case HirTextStmtKw::Assign:
+                f.kind = NodeParseFrame::Kind::Assign;
+                return pushFrame(stack, std::move(f));            // phase 0: the target
             case HirTextStmtKw::Unreachable:
-                return builder_.addLeaf(HirKind::Unreachable, InvalidType, 0, flags);
-            case HirTextStmtKw::Function:       return parseFunction(flags);
-            case HirTextStmtKw::ExternFunction: return parseExternFunction(flags);
+                return completeNode(builder_.addLeaf(HirKind::Unreachable, InvalidType, 0, flags),
+                                    idx, std::move(f.attrs), done);
+            case HirTextStmtKw::Function:
+                f.kind     = NodeParseFrame::Kind::BraceNodes;
+                f.nodeKind = HirKind::Function;
+                f.sym      = parseSymHandle();
+                f.type     = parseTypeAnnot();
+                return openBraceNodes(stack, done, std::move(f));
+            case HirTextStmtKw::ExternFunction:
+                f.kind     = NodeParseFrame::Kind::BraceNodes;
+                f.nodeKind = HirKind::ExternFunction;
+                f.sym      = parseSymHandle();
+                f.type     = accept(Tk::Colon) ? parseType() : InvalidType;
+                return openBraceNodes(stack, done, std::move(f));
             case HirTextStmtKw::Global: {
-                std::uint32_t sym = parseSymHandle(); TypeId t = parseTypeAnnot();
-                std::optional<HirNodeId> init;
-                if (accept(Tk::Equal)) init = parseNode();
-                return builder_.makeGlobal(t, sym, init, flags);
+                f.kind = NodeParseFrame::Kind::Global;
+                f.sym  = parseSymHandle();
+                f.type = parseTypeAnnot();
+                if (accept(Tk::Equal)) return pushFrame(stack, std::move(f));
+                return completeNode(builder_.makeGlobal(f.type, f.sym, std::nullopt, flags),
+                                    idx, std::move(f.attrs), done);
             }
             case HirTextStmtKw::TypeDecl: {
                 std::uint32_t sym = parseSymHandle(); TypeId t = parseTypeAnnot();
-                return builder_.makeTypeDecl(t, sym, flags);
+                return completeNode(builder_.makeTypeDecl(t, sym, flags), idx,
+                                    std::move(f.attrs), done);
             }
             case HirTextStmtKw::ExternGlobal: {
                 std::uint32_t sym = parseSymHandle();
                 TypeId t = accept(Tk::Colon) ? parseType() : InvalidType;
-                return builder_.makeExternGlobal(t, sym, flags);
+                return completeNode(builder_.makeExternGlobal(t, sym, flags), idx,
+                                    std::move(f.attrs), done);
             }
-            case HirTextStmtKw::ImportGroup: { auto m = parseBraceNodes(); return builder_.makeImportGroup(m, flags); }
-            case HirTextStmtKw::ExtNode: return parseExtNode(flags);
-            case HirTextStmtKw::Error:   return parseErrorNode(flags);
+            case HirTextStmtKw::ImportGroup:
+                f.kind = NodeParseFrame::Kind::BraceNodes; f.nodeKind = HirKind::ImportGroup;
+                return openBraceNodes(stack, done, std::move(f));
+            case HirTextStmtKw::ExtNode: {
+                std::string name = takeStr();
+                auto it = extKindByName_.find(name);
+                std::uint32_t payload = 0;
+                if (it != extKindByName_.end()) payload = it->second.v;
+                else unknownName(std::format("extension kind \"{}\" not declared", name));
+                TypeId t = accept(Tk::Colon) ? parseType() : InvalidType;
+                if (peekIs(Tk::LBrace)) {
+                    f.kind = NodeParseFrame::Kind::BraceNodes;
+                    f.nodeKind = HirKind::Extension;
+                    f.type = t; f.payload = payload;
+                    return openBraceNodes(stack, done, std::move(f));
+                }
+                return completeNode(builder_.addLeaf(HirKind::Extension, t, payload, flags),
+                                    idx, std::move(f.attrs), done);
+            }
+            case HirTextStmtKw::Error: {
+                TypeId t = accept(Tk::Colon) ? parseType() : InvalidType;
+                if (peekIs(Tk::LBrace)) {
+                    f.kind = NodeParseFrame::Kind::BraceNodes;
+                    f.nodeKind = HirKind::Error;
+                    f.type = t;
+                    return openBraceNodes(stack, done, std::move(f));
+                }
+                return completeNode(builder_.addLeaf(HirKind::Error, t, 0, flags), idx,
+                                    std::move(f.attrs), done);
+            }
             // Unlisted sentinel — see the expression switch's arm for why it is
             // an arm rather than a `default:`.
             case HirTextStmtKw::Count_: break;
@@ -3201,7 +4455,8 @@ private:
         // Unreachable: `-Werror=switch` proves the switch is total over the enum,
         // and `fromName` cannot return a value outside it.
         malformed(std::format("unknown statement '{}'", kw));
-        return builder_.addLeaf(HirKind::Error, InvalidType, 0, flags);
+        return completeNode(builder_.addLeaf(HirKind::Error, InvalidType, 0, flags), idx,
+                            std::move(f.attrs), done);
     }
 
     [[nodiscard]] bool startsExpr() {
@@ -3209,142 +4464,456 @@ private:
         return isExprKeyword(lex_.peek().text);
     }
 
+    // ── the reductions ───────────────────────────────────────────────────────
+    //
+    // Each takes a frame whose children are complete and performs exactly the
+    // builder call, and exactly the refusals, the recursive arm performed on the
+    // way out.
+    NodeParseStep reduceParenOperands(NodeParseFrame& f, HirNodeId& done) {
+        switch (f.nodeKind) {
+            case HirKind::Call: {
+                if (f.kids.empty()) {
+                    malformed("call needs a callee");
+                    return completeNode(builder_.addLeaf(HirKind::Error, f.type, 0, f.flags),
+                                        f.preIdx, std::move(f.attrs), done);
+                }
+                HirNodeId callee = f.kids.front();
+                std::vector<HirNodeId> args(f.kids.begin() + 1, f.kids.end());
+                return completeNode(builder_.makeCall(callee, args, f.type, f.flags),
+                                    f.preIdx, std::move(f.attrs), done);
+            }
+            case HirKind::BuiltinCall: {
+                if (f.raw > 0xFFFFu
+                    || builtinLoweringName(
+                           static_cast<BuiltinLowering>(
+                               static_cast<std::uint16_t>(f.raw))).empty()) {
+                    malformed(std::format(
+                        "builtincall lowering ordinal {} names no BuiltinLowering "
+                        "this build defines - accepted: {}", f.raw,
+                        detail::renderAllowedList(allNames(kBuiltinLoweringTable))));
+                    return completeNode(builder_.addLeaf(HirKind::Error, f.type, 0, f.flags),
+                                        f.preIdx, std::move(f.attrs), done);
+                }
+                return completeNode(
+                    builder_.addParent(HirKind::BuiltinCall, f.kids, f.type,
+                                       static_cast<std::uint32_t>(f.raw), f.flags),
+                    f.preIdx, std::move(f.attrs), done);
+            }
+            case HirKind::IntrinsicCall: {
+                auto it = intrinsicByName_.find(f.name);
+                std::uint32_t iid = 0;
+                if (it != intrinsicByName_.end()) iid = it->second.v;
+                else unknownName(std::format("intrinsic \"{}\" not declared", f.name));
+                return completeNode(builder_.makeIntrinsicCall(iid, f.kids, f.type, f.flags),
+                                    f.preIdx, std::move(f.attrs), done);
+            }
+            default:
+                return completeNode(
+                    builder_.addParent(f.nodeKind, f.kids, f.type, f.payload, f.flags),
+                    f.preIdx, std::move(f.attrs), done);
+        }
+    }
+
+    NodeParseStep reduceBraceNodes(NodeParseFrame& f, HirNodeId& done) {
+        switch (f.nodeKind) {
+            case HirKind::Block:
+                return completeNode(builder_.makeBlock(f.kids, f.flags), f.preIdx,
+                                    std::move(f.attrs), done);
+            case HirKind::ImportGroup:
+                return completeNode(builder_.makeImportGroup(f.kids, f.flags), f.preIdx,
+                                    std::move(f.attrs), done);
+            case HirKind::Extension:
+                return completeNode(
+                    builder_.addParent(HirKind::Extension, f.kids, f.type, f.payload, f.flags),
+                    f.preIdx, std::move(f.attrs), done);
+            case HirKind::Function: {
+                if (f.kids.empty()) {
+                    malformed("function has no body");
+                    return completeNode(builder_.addLeaf(HirKind::Error, f.type, f.sym, f.flags),
+                                        f.preIdx, std::move(f.attrs), done);
+                }
+                HirNodeId body = f.kids.back();
+                std::vector<HirNodeId> params(f.kids.begin(), f.kids.end() - 1);
+                return completeNode(builder_.makeFunction(f.type, f.sym, params, body, f.flags),
+                                    f.preIdx, std::move(f.attrs), done);
+            }
+            case HirKind::ExternFunction:
+                return completeNode(builder_.makeExternFunction(f.type, f.sym, f.kids, f.flags),
+                                    f.preIdx, std::move(f.attrs), done);
+            default:
+                return completeNode(
+                    builder_.addParent(HirKind::Error, f.kids, f.type, 0, f.flags),
+                    f.preIdx, std::move(f.attrs), done);
+        }
+    }
+
+    NodeParseStep reduceFor(NodeParseFrame& f, HirNodeId& done) {
+        if (!f.forBody) {
+            malformed("for is missing a body");
+            f.forBody = builder_.addLeaf(HirKind::Error);
+        }
+        return completeNode(
+            builder_.makeForStmt(f.forInit, f.forCond, f.forUpdate, *f.forBody, f.flags),
+            f.preIdx, std::move(f.attrs), done);
+    }
+
+    // ── the resume half ──────────────────────────────────────────────────────
+    //
+    // `done` holds the child the top frame was waiting for. Consume exactly the
+    // tokens the recursive arm consumed after its call returned, then either ask
+    // for the next child or reduce.
+    NodeParseStep advanceNodeFrame(std::deque<NodeParseFrame>& stack, HirNodeId& done) {
+        NodeParseFrame& f = stack.back();
+        HirNodeId const child = done;
+        auto const finish = [&](NodeParseStep step) {
+            if (step == NodeParseStep::Completed) stack.pop_back();
+            return step;
+        };
+        switch (f.kind) {
+            case NodeParseFrame::Kind::ParenOperands:
+                f.kids.push_back(child);
+                if (!accept(Tk::Comma) || peekIs(Tk::RParen) || peekIs(Tk::Eof)) {
+                    expect(Tk::RParen, "')'");
+                    return finish(reduceParenOperands(f, done));
+                }
+                return NodeParseStep::WantChild;
+            case NodeParseFrame::Kind::BraceNodes:
+                f.kids.push_back(child);
+                if (cursorOff() == f.loopOff) lex_.take();   // progress guard
+                if (peekIs(Tk::RBrace) || peekIs(Tk::Eof)) {
+                    expect(Tk::RBrace, "'}'");
+                    return finish(reduceBraceNodes(f, done));
+                }
+                f.loopOff = cursorOff();
+                return NodeParseStep::WantChild;
+            case NodeParseFrame::Kind::SeqBody:
+                if (f.phase == 0) {
+                    f.kids.push_back(child);
+                    if (cursorOff() == f.loopOff) lex_.take();   // progress guard
+                    if (!peekKeyword("yield") && !peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
+                        f.loopOff = cursorOff();
+                        return NodeParseStep::WantChild;
+                    }
+                    if (!acceptKeyword("yield")) malformed("seq body needs a 'yield <expr>'");
+                    f.phase = 1;
+                    return NodeParseStep::WantChild;            // the yielded value
+                }
+                expect(Tk::RBrace, "'}'");
+                return finish(completeNode(builder_.makeSeqExpr(f.kids, child, f.type, f.flags),
+                                           f.preIdx, std::move(f.attrs), done));
+            case NodeParseFrame::Kind::If:
+                if (f.phase == 0) {
+                    expect(Tk::RParen, "')'");
+                    f.kids.push_back(child);                    // the condition
+                    f.phase = 1;
+                    return NodeParseStep::WantChild;
+                }
+                if (f.phase == 1) {
+                    f.kids.push_back(child);                    // the then arm
+                    if (acceptKeyword("else")) { f.phase = 2; return NodeParseStep::WantChild; }
+                    return finish(completeNode(
+                        builder_.makeIfStmt(f.kids[0], f.kids[1], std::nullopt, f.flags),
+                        f.preIdx, std::move(f.attrs), done));
+                }
+                return finish(completeNode(
+                    builder_.makeIfStmt(f.kids[0], f.kids[1], child, f.flags),
+                    f.preIdx, std::move(f.attrs), done));
+            case NodeParseFrame::Kind::Seh:
+                if (f.phase == 0) {
+                    f.kids.push_back(child);                    // the try body
+                    if (!acceptKeyword("seh_except")) malformed("expected 'seh_except'");
+                    expect(Tk::LParen, "'('");
+                    f.phase = 1;
+                    return NodeParseStep::WantChild;
+                }
+                if (f.phase == 1) {
+                    expect(Tk::RParen, "')'");
+                    f.kids.push_back(child);                    // the filter
+                    f.phase = 2;
+                    return NodeParseStep::WantChild;
+                }
+                return finish(completeNode(
+                    builder_.makeSehTryExcept(f.kids[0], f.kids[1], child, f.flags),
+                    f.preIdx, std::move(f.attrs), done));
+            case NodeParseFrame::Kind::While:
+                if (f.phase == 0) {
+                    expect(Tk::RParen, "')'");
+                    f.kids.push_back(child);                    // the condition
+                    f.phase = 1;
+                    return NodeParseStep::WantChild;
+                }
+                return finish(completeNode(builder_.makeWhileStmt(f.kids[0], child, f.flags),
+                                           f.preIdx, std::move(f.attrs), done));
+            case NodeParseFrame::Kind::Do:
+                if (f.phase == 0) {
+                    f.kids.push_back(child);                    // the body
+                    if (!acceptKeyword("while")) malformed("expected 'while'");
+                    expect(Tk::LParen, "'('");
+                    f.phase = 1;
+                    return NodeParseStep::WantChild;
+                }
+                expect(Tk::RParen, "')'");
+                return finish(completeNode(builder_.makeDoWhileStmt(f.kids[0], child, f.flags),
+                                           f.preIdx, std::move(f.attrs), done));
+            case NodeParseFrame::Kind::For: {
+                // D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET: keyed on
+                // `kHirTextForClauseTable`, so the refusal names the four roles and a
+                // new row cannot be added without a dispatch arm (`-Werror=switch`).
+                auto const role = kHirTextForClauseTable.fromName(f.forRole);
+                if (!role.has_value()) {
+                    malformed(std::format(
+                        "unknown for-clause '{}' — accepted: {}", f.forRole,
+                        detail::renderAllowedList(allNames(kHirTextForClauseTable))));
+                } else {
+                    switch (*role) {
+                        case HirTextForClause::Init:   f.forInit   = child; break;
+                        case HirTextForClause::Cond:   f.forCond   = child; break;
+                        case HirTextForClause::Update: f.forUpdate = child; break;
+                        case HirTextForClause::Body:   f.forBody   = child; break;
+                    }
+                }
+                if (cursorOff() == f.loopOff) lex_.take();      // progress guard
+                if (peekIs(Tk::RBrace) || peekIs(Tk::Eof)) {
+                    expect(Tk::RBrace, "'}'");
+                    return finish(reduceFor(f, done));
+                }
+                f.loopOff = cursorOff();
+                f.forRole = takeIdent();
+                expect(Tk::Colon, "':'");
+                return NodeParseStep::WantChild;
+            }
+            case NodeParseFrame::Kind::Switch:
+                if (f.phase == 0) {
+                    expect(Tk::RParen, "')'");
+                    expect(Tk::LBrace, "'{'");
+                    if (!acceptKeyword("body")) malformed("expected 'body:' in switch");
+                    expect(Tk::Colon, "':'");
+                    f.kids.push_back(child);                    // the discriminant
+                    f.phase = 1;
+                    return NodeParseStep::WantChild;
+                }
+                if (f.phase == 1) {
+                    f.kids.push_back(child);                    // the body block
+                    f.phase = 2;
+                    if (peekIs(Tk::RBrace) || peekIs(Tk::Eof)) {
+                        expect(Tk::RBrace, "'}'");
+                        return finish(completeNode(
+                            builder_.makeSwitchStmt(f.kids[0], f.kids[1], std::span<HirNodeId const>{}, f.flags),
+                            f.preIdx, std::move(f.attrs), done));
+                    }
+                    f.loopOff = cursorOff();
+                    return NodeParseStep::WantChild;
+                }
+                f.kids.push_back(child);                        // one dispatch arm
+                if (cursorOff() == f.loopOff) lex_.take();
+                if (peekIs(Tk::RBrace) || peekIs(Tk::Eof)) {
+                    expect(Tk::RBrace, "'}'");
+                    return finish(completeNode(
+                        builder_.makeSwitchStmt(
+                            f.kids[0], f.kids[1],
+                            std::span<HirNodeId const>{f.kids}.subspan(2), f.flags),
+                        f.preIdx, std::move(f.attrs), done));
+                }
+                f.loopOff = cursorOff();
+                return NodeParseStep::WantChild;
+            case NodeParseFrame::Kind::CaseArm: {
+                std::uint32_t ord = parseLabelOrdinal();
+                return finish(completeNode(builder_.makeCaseArm(child, ord, f.flags),
+                                           f.preIdx, std::move(f.attrs), done));
+            }
+            case NodeParseFrame::Kind::Label:
+                return finish(completeNode(builder_.makeLabelStmt(f.payload, child, f.flags),
+                                           f.preIdx, std::move(f.attrs), done));
+            case NodeParseFrame::Kind::Return:
+                return finish(completeNode(builder_.makeReturn(child, f.flags),
+                                           f.preIdx, std::move(f.attrs), done));
+            case NodeParseFrame::Kind::ExprStmt:
+                return finish(completeNode(builder_.makeExprStmt(child, f.flags),
+                                           f.preIdx, std::move(f.attrs), done));
+            case NodeParseFrame::Kind::IndirectGoto:
+                return finish(completeNode(builder_.makeIndirectGotoStmt(child, f.flags),
+                                           f.preIdx, std::move(f.attrs), done));
+            case NodeParseFrame::Kind::Assign:
+                if (f.phase == 0) {
+                    f.kids.push_back(child);                    // the target
+                    expect(Tk::Equal, "'='");
+                    f.phase = 1;
+                    return NodeParseStep::WantChild;
+                }
+                return finish(completeNode(builder_.makeAssignStmt(f.kids[0], child, f.flags),
+                                           f.preIdx, std::move(f.attrs), done));
+            case NodeParseFrame::Kind::VarLike:
+                return finish(completeNode(builder_.makeVarDecl(f.type, f.sym, child, f.flags),
+                                           f.preIdx, std::move(f.attrs), done));
+            case NodeParseFrame::Kind::Global:
+                return finish(completeNode(builder_.makeGlobal(f.type, f.sym, child, f.flags),
+                                           f.preIdx, std::move(f.attrs), done));
+            case NodeParseFrame::Kind::AsmOperands:
+                f.kids.push_back(child);                        // this operand's value
+                f.asmDesc->operands.push_back(std::move(*f.asmOp));
+                if (accept(Tk::Comma)) {
+                    f.asmOp = std::make_unique<HirInlineAsmOperand>();
+                    parseAsmOperandFields(*f.asmOp, *f.asmDesc);
+                    expect(Tk::Arrow, "'->' before an inline-asm operand value");
+                    return NodeParseStep::WantChild;
+                }
+                expect(Tk::RParen, "')'");
+                return finish(finishInlineAsm(f, done));
+        }
+        // Unreachable: `-Werror=switch` proves the switch is total over the enum.
+        malformed("internal: `.dsshir` node reader reached a frame kind with no arm");
+        return finish(completeNode(builder_.addLeaf(HirKind::Error), f.preIdx,
+                                   std::move(f.attrs), done));
+    }
+
     // Inline-asm P5: the inverse of `emitInlineAsm`. Three forms, matching the
     // writer exactly:
     //   `inline_asm`                 - the bare barrier (payload 0, no children)
-    //   `inline_asm #<n>`            - the opaque handle the writer falls back to
-    //                                  when it had no pool; carried through
-    //                                  VERBATIM so a pool-less round trip is
-    //                                  still byte-identical
-    //   `inline_asm "tmpl" ...`      - a full descriptor, re-added to THIS parse's
-    //                                  pool (handle re-minted in tree order)
+    //   `inline_asm #<handle>`       - the unresolved-handle fallback
+    //   `inline_asm "tpl" [{ … }]`   - a descriptor, rebuilt into the pool
     //
-    // * SECTION ORDER IS FIXED AND THE PARSE IS ORDER-DEPENDENT, deliberately:
-    // the writer emits one canonical order, so accepting a permuted input would
-    // admit text `emitHir` can never produce and quietly break the
-    // emit(parse(emit)) identity the format's contract rests on.
-    [[nodiscard]] HirNodeId parseInlineAsm(HirFlags flags) {
+    // ⚠ THE OPERAND LIST IS WHERE THIS PRODUCTION RE-ENTERS `parseNode`, so it is
+    // split head/resume like every other list: the head reads the descriptor down
+    // to the FIRST operand's `->`, and `advanceNodeFrame`'s `AsmOperands` arm
+    // resumes after each value.
+    NodeParseStep parseInlineAsmHead(std::deque<NodeParseFrame>& stack, HirNodeId& done,
+                                     NodeParseFrame&& f) {
+        HirFlags const flags = f.flags;
         if (accept(Tk::Hash)) {
             auto const raw = takeInt();
-            return builder_.addLeaf(HirKind::InlineAsm, InvalidType,
-                                    static_cast<std::uint32_t>(raw), flags);
+            return completeNode(builder_.addLeaf(HirKind::InlineAsm, InvalidType,
+                                                 static_cast<std::uint32_t>(raw), flags),
+                                f.preIdx, std::move(f.attrs), done);
         }
         if (!peekIs(Tk::Str)) {
-            return builder_.addLeaf(HirKind::InlineAsm, InvalidType,
-                                    kNoInlineAsmDescriptor, flags);
+            return completeNode(builder_.addLeaf(HirKind::InlineAsm, InvalidType,
+                                                 kNoInlineAsmDescriptor, flags),
+                                f.preIdx, std::move(f.attrs), done);
         }
-        HirInlineAsmDescriptor d;
-        d.templateText = takeStr();
-        std::vector<HirNodeId> children;
+        f.kind    = NodeParseFrame::Kind::AsmOperands;
+        f.asmDesc = std::make_unique<HirInlineAsmDescriptor>();
+        f.asmDesc->templateText = takeStr();
         // No brace => a bare template with no flags and no sections. See the
         // writer for why the tail is braced at all (`goto` is a statement
         // keyword and this lexer is newline-blind).
         if (!accept(Tk::LBrace)) {
-            std::uint32_t const bare = pInlineAsm_.add(std::move(d));
-            return builder_.addLeaf(HirKind::InlineAsm, InvalidType, bare, flags);
+            std::uint32_t const bare = pInlineAsm_.add(std::move(*f.asmDesc));
+            return completeNode(builder_.addLeaf(HirKind::InlineAsm, InvalidType, bare, flags),
+                                f.preIdx, std::move(f.attrs), done);
         }
-        if (acceptKeyword("extended")) d.isExtended             = true;
-        if (acceptKeyword("goto"))     d.isGoto                 = true;
-        if (acceptKeyword("mem"))      d.clobbersMemory         = true;
-        if (acceptKeyword("cc"))       d.clobbersConditionCodes = true;
-
-        // The inverse of the writer's `emitSpells`. Absent group => an empty
-        // spelling list, which is the same state the writer renders as nothing:
-        // the round trip is closed in both directions, and a language whose
-        // sigil role is `null` stays distinguishable from one whose spellings
-        // were dropped only because `HirVerifier` asserts the label sizes.
-        auto const parseSpells = [&]() -> std::vector<std::string> {
-            std::vector<std::string> out;
-            if (!acceptKeyword("spells")) return out;
-            expect(Tk::LParen, "'('");
-            do { out.push_back(takeStr()); } while (accept(Tk::Comma));
-            expect(Tk::RParen, "')'");
-            return out;
-        };
+        if (acceptKeyword("extended")) f.asmDesc->isExtended             = true;
+        if (acceptKeyword("goto"))     f.asmDesc->isGoto                 = true;
+        if (acceptKeyword("mem"))      f.asmDesc->clobbersMemory         = true;
+        if (acceptKeyword("cc"))       f.asmDesc->clobbersConditionCodes = true;
 
         if (acceptKeyword("outputs")) {
-            d.outputCount = static_cast<std::uint32_t>(takeInt());
+            f.asmDesc->outputCount = static_cast<std::uint32_t>(takeInt());
             if (!acceptKeyword("operands")) {
                 malformed("expected 'operands (' after 'outputs <n>'");
-                return builder_.addLeaf(HirKind::InlineAsm, InvalidType,
-                                        kNoInlineAsmDescriptor, flags);
+                return completeNode(builder_.addLeaf(HirKind::InlineAsm, InvalidType,
+                                                     kNoInlineAsmDescriptor, flags),
+                                    f.preIdx, std::move(f.attrs), done);
             }
             expect(Tk::LParen, "'('");
-            do {
-                HirInlineAsmOperand op;
-                // The RAW constraint is what the source wrote; re-splitting it
-                // through the SAME `parseAsmConstraint` the front end used is
-                // what keeps the modifier flags from becoming a second source of
-                // truth that a hand-edited `.dsshir` could contradict.
-                auto const parsed = parseAsmConstraint(takeStr());
-                if (!parsed.ok())
-                    malformed("inline-asm operand constraint does not parse: "
-                              + std::string{asmConstraintDefectDescription(parsed.defect)});
-                op.constraint = parsed.value;
-                op.isOutput   = d.operands.size() < d.outputCount;
-                if (accept(Tk::LBrack)) {
-                    op.symbolicName = takeIdent();
-                    expect(Tk::RBrack, "']'");
-                }
-                op.spellings = parseSpells();
-                // ── D-HIR-TEXT-INLINE-ASM-REGISTER-CLASS-ORDINAL-IS-UNVALIDATED ──
-                //
-                // ⚠ THE ORDINAL IS VALIDATED, NOT CAST — the same hole
-                // D-MIR-TEXT-DIAG-CODE-CAST-IS-UNVALIDATED names one production
-                // over, found while adding the sibling clause below. This read
-                // `static_cast<std::uint8_t>(takeInt())` straight onto the wire,
-                // so `class 200` loaded CLEAN and handed every consumer a
-                // `TargetRegClass` with no row — and `bindAsmOperand`'s only
-                // guard is `cls == None`, which a garbage ordinal passes. The
-                // ordinal STAYS the wire form (that is the writer's shape and a
-                // spelling change would break stored goldens); what changes is
-                // that a value the enum does not define is now refused by name.
-                if (acceptKeyword("class")) {
-                    std::uint64_t const raw = takeInt();
-                    if (raw > 0xFFu
-                        || kTargetRegClassTable
-                               .nameOrEmpty(static_cast<TargetRegClass>(
-                                   static_cast<std::uint8_t>(raw)))
-                               .empty()) {
-                        malformed(std::format(
-                            "inline-asm operand register class {} names no "
-                            "TargetRegClass this build defines - accepted "
-                            "ordinals spell: {}", raw,
-                            detail::renderAllowedList(
-                                allNames(kTargetRegClassTable))));
-                    } else {
-                        op.regClassResolved = true;
-                        op.regClass = static_cast<std::uint8_t>(raw);
-                    }
-                }
-                if (acceptKeyword("pin")) op.fixedRegister = takeStr();
-                // The inverse of the writer's `operand_kind` clause. ABSENT means
-                // "the letter did not resolve to a form", which is a real state
-                // (`binds` names exactly one arm) and NOT the same as a dropped
-                // field — which is precisely why the writer emits the clause at
-                // all (D-HIR-TEXT-INLINE-ASM-OPERAND-KIND-DROPPED-IN-TRANSIT).
-                // ★ AN UNKNOWN SPELLING IS REFUSED, NAMING THE ACCEPTED SET —
-                // the same treatment the `class` ordinal just above now gets,
-                // arrived at from the two opposite directions the format uses.
-                if (acceptKeyword("operand_kind")) {
-                    std::string const kind = takeIdent();
-                    if (auto const which = operandKindFilterFromName(kind)) {
-                        op.operandKindResolved = true;
-                        op.operandKind = static_cast<std::uint8_t>(*which);
-                    } else {
-                        malformed(std::format(
-                            "unknown inline-asm operand kind '{}' - accepted: {}",
-                            kind,
-                            detail::renderAllowedList(
-                                allNames(kOperandKindFilterTable))));
-                    }
-                }
-                expect(Tk::Arrow, "'->' before an inline-asm operand value");
-                children.push_back(parseNode());
-                d.operands.push_back(std::move(op));
-            } while (accept(Tk::Comma));
-            expect(Tk::RParen, "')'");
+            f.asmOp = std::make_unique<HirInlineAsmOperand>();
+            parseAsmOperandFields(*f.asmOp, *f.asmDesc);
+            expect(Tk::Arrow, "'->' before an inline-asm operand value");
+            return pushFrame(stack, std::move(f));
         }
+        return finishInlineAsm(f, done);
+    }
+
+    // The inverse of the writer's `appendAsmSpells`. Absent group => an empty
+    // spelling list, which is the same state the writer renders as nothing:
+    // the round trip is closed in both directions, and a language whose
+    // sigil role is `null` stays distinguishable from one whose spellings
+    // were dropped only because `HirVerifier` asserts the label sizes.
+    [[nodiscard]] std::vector<std::string> parseAsmSpells() {
+        std::vector<std::string> out;
+        if (!acceptKeyword("spells")) return out;
+        expect(Tk::LParen, "'('");
+        do { out.push_back(takeStr()); } while (accept(Tk::Comma));
+        expect(Tk::RParen, "')'");
+        return out;
+    }
+
+    // Everything of one operand EXCEPT its value: the constraint, the symbolic
+    // name, the spellings, the register class, the pin and the operand kind.
+    void parseAsmOperandFields(HirInlineAsmOperand& op, HirInlineAsmDescriptor const& d) {
+        // The RAW constraint is what the source wrote; re-splitting it
+        // through the SAME `parseAsmConstraint` the front end used is
+        // what keeps the modifier flags from becoming a second source of
+        // truth that a hand-edited `.dsshir` could contradict.
+        auto const parsed = parseAsmConstraint(takeStr());
+        if (!parsed.ok())
+            malformed("inline-asm operand constraint does not parse: "
+                      + std::string{asmConstraintDefectDescription(parsed.defect)});
+        op.constraint = parsed.value;
+        op.isOutput   = d.operands.size() < d.outputCount;
+        if (accept(Tk::LBrack)) {
+            op.symbolicName = takeIdent();
+            expect(Tk::RBrack, "']'");
+        }
+        op.spellings = parseAsmSpells();
+        // ── D-HIR-TEXT-INLINE-ASM-REGISTER-CLASS-ORDINAL-IS-UNVALIDATED ──
+        //
+        // ⚠ THE ORDINAL IS VALIDATED, NOT CAST — the same hole
+        // D-MIR-TEXT-DIAG-CODE-CAST-IS-UNVALIDATED names one production
+        // over, found while adding the sibling clause below. This read
+        // `static_cast<std::uint8_t>(takeInt())` straight onto the wire,
+        // so `class 200` loaded CLEAN and handed every consumer a
+        // `TargetRegClass` with no row — and `bindAsmOperand`'s only
+        // guard is `cls == None`, which a garbage ordinal passes. The
+        // ordinal STAYS the wire form (that is the writer's shape and a
+        // spelling change would break stored goldens); what changes is
+        // that a value the enum does not define is now refused by name.
+        if (acceptKeyword("class")) {
+            std::uint64_t const raw = takeInt();
+            if (raw > 0xFFu
+                || kTargetRegClassTable
+                       .nameOrEmpty(static_cast<TargetRegClass>(
+                           static_cast<std::uint8_t>(raw)))
+                       .empty()) {
+                malformed(std::format(
+                    "inline-asm operand register class {} names no "
+                    "TargetRegClass this build defines - accepted "
+                    "ordinals spell: {}", raw,
+                    detail::renderAllowedList(
+                        allNames(kTargetRegClassTable))));
+            } else {
+                op.regClassResolved = true;
+                op.regClass = static_cast<std::uint8_t>(raw);
+            }
+        }
+        if (acceptKeyword("pin")) op.fixedRegister = takeStr();
+        // The inverse of the writer's `operand_kind` clause. ABSENT means
+        // "the letter did not resolve to a form", which is a real state
+        // (`binds` names exactly one arm) and NOT the same as a dropped
+        // field — which is precisely why the writer emits the clause at
+        // all (D-HIR-TEXT-INLINE-ASM-OPERAND-KIND-DROPPED-IN-TRANSIT).
+        // ★ AN UNKNOWN SPELLING IS REFUSED, NAMING THE ACCEPTED SET —
+        // the same treatment the `class` ordinal just above now gets,
+        // arrived at from the two opposite directions the format uses.
+        if (acceptKeyword("operand_kind")) {
+            std::string const kind = takeIdent();
+            if (auto const which = operandKindFilterFromName(kind)) {
+                op.operandKindResolved = true;
+                op.operandKind = static_cast<std::uint8_t>(*which);
+            } else {
+                malformed(std::format(
+                    "unknown inline-asm operand kind '{}' - accepted: {}",
+                    kind,
+                    detail::renderAllowedList(
+                        allNames(kOperandKindFilterTable))));
+            }
+        }
+    }
+
+    // The descriptor's clobbers, its labels, the closing brace, and the node —
+    // everything after the operand list, shared by the no-operands head path and
+    // the resume path.
+    NodeParseStep finishInlineAsm(NodeParseFrame& f, HirNodeId& done) {
+        HirInlineAsmDescriptor& d = *f.asmDesc;
         if (acceptKeyword("clobbers")) {
             expect(Tk::LParen, "'('");
             do { d.clobbers.push_back(takeStr()); } while (accept(Tk::Comma));
@@ -3357,103 +4926,125 @@ private:
             // make them drift — the same lockstep the lowering uses.
             do {
                 d.labelOrdinals.push_back(parseLabelOrdinal());
-                d.labelSpellings.push_back(parseSpells());
+                d.labelSpellings.push_back(parseAsmSpells());
             } while (accept(Tk::Comma));
             expect(Tk::RParen, "')'");
         }
         expect(Tk::RBrace, "'}' closing the inline-asm descriptor");
         std::uint32_t const handle = pInlineAsm_.add(std::move(d));
-        return builder_.addParent(HirKind::InlineAsm, children, InvalidType,
-                                  handle, flags);
+        return completeNode(builder_.addParent(HirKind::InlineAsm, f.kids, InvalidType,
+                                               handle, f.flags),
+                            f.preIdx, std::move(f.attrs), done);
     }
 
-    HirNodeId parseVarLike(HirFlags flags) {
-        std::uint32_t sym = parseSymHandle();
-        TypeId t = parseTypeAnnot();
-        std::optional<HirNodeId> init;
-        if (accept(Tk::Equal)) init = parseNode();
-        return builder_.makeVarDecl(t, sym, init, flags);
-    }
+    // ── types: THE READER, ON AN EXPLICIT HEAP STACK ──────────────────────────
+    //
+    // ★★★ (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED,
+    // the operator's ruling of 2026-09-02.) `parseType` used to call itself once
+    // per structural level — every `ptr<`, `arr<`, `fn(` parameter, `struct {`
+    // field — so its host-stack depth followed the nesting of an UNTRUSTED
+    // `.dsshir` type text, and of every shipped FFI descriptor's signature, which
+    // `parseTypeFromText` decodes through this production. This is the twin of
+    // `mir_text.cpp`'s P56 conversion, with one thing that reader does not carry:
+    // the P44 QUALIFICATION side channel (`qualDepth_`, `qualPush` / `qualPop`,
+    // the `fn` arm's top-level claim). Every side effect the recursive arm
+    // performed BEFORE its self-call is performed by `parseTypeHead` when the
+    // frame is pushed, and every one it performed AFTER is performed by
+    // `advanceTypeFrame` when the operand arrives — so the claim a text yields
+    // is the same claim, bit for bit, and the token appetite of every refusal
+    // (which tokens a malformed input does and does not consume) is unchanged.
+    struct TypeParseFrame {
+        enum class Kind : std::uint8_t {
+            QualWrap,   // const<T> / restrict<T> — hands T back unchanged
+            Wrap1,      // ptr / ref / nullable / optional / slice / complex / volatile / atomic
+            FnPtr,      // fnptr<T> — refused after its operand, as before
+            Vec,        // vec<T, N>
+            Mat,        // mat<T, R, C>
+            Arr,        // arr<T, N> — a derivation level
+            // P66 (lane `al`): aligned<T, N> — the TYPE-LEVEL alignment skin (GNU
+            // `aligned(N)` on a typedef). NOT a derivation level: it decorates T, it
+            // does not derive from it, so it must NOT touch `qualDepth_` the way
+            // `Arr`/`ptr` do — a decoration that claimed a level would shift the
+            // declarator spine every consumer of this text reconstructs.
+            Aligned,
+            Tuple,      // tuple<T, …>
+            Struct,     // struct "name" [packed] { T [@off | ~align] [packed], … }
+            Union,      // union "name" [packed] { T [packed], … }
+            Fn,         // fn(P, …[, ...]) -> R [cc X]
+            Ext         // ext "name" (T, …) [s, …]
+        } kind;
+        // Wrap1: the interner constructor and whether it is a C derivation level.
+        TypeId (TypeInterner::*wrap)(TypeId) = nullptr;
+        bool addsLevel = false;
+        // Composite / Ext / Tuple / Fn: the name and the operands read so far.
+        std::string         name;
+        bool                packed = false;   // Struct / Union: the whole-composite marker
+        // v3: the `rec <H>` marker's handle (0 = not a recursive composite) and the
+        // forward id minted for it before the field list was read.
+        std::uint64_t       recHandle = 0;
+        TypeId              recForward{};
+        std::vector<TypeId> ops;
+        // Struct: the per-field markers, all-or-none as before.
+        std::vector<std::uint64_t> offs;
+        std::vector<std::uint32_t> aligns;
+        std::vector<std::uint8_t>  fieldPacked;
+        std::size_t nWithOff = 0, nWithAlign = 0, nFieldPacked = 0;
+        // Fn: the qualification bookkeeping the recursive arm held in locals.
+        bool          qualTopSig    = false;
+        std::uint8_t  qualFnLevel   = 0;
+        bool          isVariadic    = false;
+        bool          readingResult = false;
+        std::vector<std::optional<QualifierSpine>> paramSpines;
+        std::optional<QualFrame> pendingQual;   // the frame around the operand in flight
+        enum class ResultMode : std::uint8_t { Plain, Top, Nested } resultMode = ResultMode::Plain;
+    };
 
-    HirNodeId parseFor(HirFlags flags) {
-        expect(Tk::LBrace, "'{'");
-        std::optional<HirNodeId> init, cond, update, body;
-        while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
-            std::uint32_t const off = cursorOff();
-            std::string role = takeIdent();
-            expect(Tk::Colon, "':'");
-            HirNodeId n = parseNode();
-            // D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET: keyed on
-            // `kHirTextForClauseTable`, so the refusal names the four roles and a
-            // new row cannot be added without a dispatch arm (`-Werror=switch`).
-            auto const which = kHirTextForClauseTable.fromName(role);
-            if (!which.has_value()) {
-                malformed(std::format(
-                    "unknown for-clause '{}' — accepted: {}", role,
-                    detail::renderAllowedList(allNames(kHirTextForClauseTable))));
-            } else {
-                switch (*which) {
-                    case HirTextForClause::Init:   init   = n; break;
-                    case HirTextForClause::Cond:   cond   = n; break;
-                    case HirTextForClause::Update: update = n; break;
-                    case HirTextForClause::Body:   body   = n; break;
-                }
-            }
-            if (cursorOff() == off) lex_.take();  // progress guard
-        }
-        expect(Tk::RBrace, "'}'");
-        if (!body) { malformed("for is missing a body"); body = builder_.addLeaf(HirKind::Error); }
-        return builder_.makeForStmt(init, cond, update, *body, flags);
-    }
-
-    HirNodeId parseFunction(HirFlags flags) {
-        std::uint32_t sym = parseSymHandle();
-        TypeId sig = parseTypeAnnot();
-        auto kids = parseBraceNodes();
-        if (kids.empty()) { malformed("function has no body"); return builder_.addLeaf(HirKind::Error, sig, sym, flags); }
-        HirNodeId body = kids.back();
-        std::vector<HirNodeId> params(kids.begin(), kids.end() - 1);
-        return builder_.makeFunction(sig, sym, params, body, flags);
-    }
-    HirNodeId parseExternFunction(HirFlags flags) {
-        std::uint32_t sym = parseSymHandle();
-        TypeId sig = accept(Tk::Colon) ? parseType() : InvalidType;
-        auto params = parseBraceNodes();
-        return builder_.makeExternFunction(sig, sym, params, flags);
-    }
-    HirNodeId parseExtNode(HirFlags flags) {
-        std::string name = takeStr();
-        auto it = extKindByName_.find(name);
-        std::uint32_t payload = 0;
-        if (it != extKindByName_.end()) payload = it->second.v;
-        else unknownName(std::format("extension kind \"{}\" not declared", name));
-        TypeId t = accept(Tk::Colon) ? parseType() : InvalidType;
-        if (peekIs(Tk::LBrace)) { auto kids = parseBraceNodes(); return builder_.addParent(HirKind::Extension, kids, t, payload, flags); }
-        return builder_.addLeaf(HirKind::Extension, t, payload, flags);
-    }
-    HirNodeId parseErrorNode(HirFlags flags) {
-        TypeId t = accept(Tk::Colon) ? parseType() : InvalidType;
-        if (peekIs(Tk::LBrace)) { auto kids = parseBraceNodes(); return builder_.addParent(HirKind::Error, kids, t, 0, flags); }
-        return builder_.addLeaf(HirKind::Error, t, 0, flags);
-    }
-
-    // ── types ─────────────────────────────────────────────────────────────────
-    [[nodiscard]] std::vector<TypeId> parseTypeListUntil(Tk close) {
-        std::vector<TypeId> ts;
-        while (!peekIs(close) && !peekIs(Tk::Eof)) {
-            ts.push_back(parseType());
-            if (!accept(Tk::Comma)) break;
-        }
-        return ts;
-    }
+    // Parse a structural type. Grammar mirrors `appendType`. NOTHING here calls
+    // itself: `parseTypeHead` either completes a leaf or pushes a frame, and
+    // `advanceTypeFrame` either asks for the next operand or reduces the frame.
     [[nodiscard]] TypeId parseType() {
+        std::vector<TypeParseFrame> stack;
+        // v3: back-references resolve WITHIN one type expression only — see
+        // `recOpen_`. A leftover from a previous (possibly malformed) expression
+        // would let `rec H` bind to a composite that is not an ancestor here, and
+        // the re-emission would then spell that composite in FULL: a round trip
+        // that silently changes bytes. Clearing is the cheap half of refusing it.
+        recOpen_.clear();
+        TypeId done       = InvalidType;
+        bool   needHead   = true;    // read a fresh type head from the lexer
+        bool   haveResult = false;   // `done` is a finished type awaiting delivery
+        for (;;) {
+            if (needHead) {
+                needHead   = false;
+                haveResult = parseTypeHead(stack, done);
+            }
+            if (stack.empty()) return done;
+            bool const delivering = haveResult;
+            haveResult = false;
+            // `advanceTypeFrame` either sets `needHead` (asks for the next
+            // operand) or returns true (the frame reduced into `done`).
+            if (advanceTypeFrame(stack.back(), delivering, done, needHead)) {
+                stack.pop_back();
+                haveResult = true;
+            }
+        }
+    }
+
+    // Read ONE type head. Returns true when `out` holds a COMPLETE type (a
+    // primitive, a leaf composite, a bound name, or a refusal); false when a
+    // frame was pushed and its operands are still to come. Every arm is the
+    // recursive body's arm verbatim up to the point where it used to call
+    // `parseType`.
+    [[nodiscard]] bool parseTypeHead(std::vector<TypeParseFrame>& stack, TypeId& out) {
+        using Kind = TypeParseFrame::Kind;
+        out = InvalidType;
         // P44: the DEEPEST point this chain reaches is the base, and the base's
         // depth is what makes `levels`. Recorded here rather than at each leaf
         // arm, so a leaf added later cannot forget to count itself.
         if (qualArmed_ && qualDepth_ > qualMaxDepth_) qualMaxDepth_ = qualDepth_;
-        if (!peekIs(Tk::Ident)) { malformed("expected a type"); return InvalidType; }
+        if (!peekIs(Tk::Ident)) { malformed("expected a type"); return true; }
         std::string kw = lex_.take().text;
-        if (kw == "invalid") return InvalidType;
+        if (kw == "invalid") return true;
         // ★★ P44 — THE QUALIFIER SPELLING, AND IT RETURNS ITS OPERAND UNCHANGED.
         // `const<T>` / `restrict<T>` record a bit at the CURRENT derivation level
         // and hand back T's own TypeId: neither qualifier is interned, so there
@@ -3473,7 +5064,7 @@ private:
                           "signature) only — it has no HIR-module rendering, "
                           "because neither qualifier is interned and the printer "
                           "could not emit it back");
-                return InvalidType;
+                return true;
             }
             expect(Tk::LAngle, "'<'");
             qualSawQualifier_ = true;
@@ -3483,9 +5074,9 @@ private:
             } else {
                 qualModelled_ = false;
             }
-            TypeId const e = parseType();   // SAME depth — not a derivation level
-            expect(Tk::RAngle, "'>'");
-            return e;
+            // The operand comes next, at the SAME depth — not a derivation level.
+            stack.push_back(TypeParseFrame{.kind = Kind::QualWrap});
+            return false;
         }
         if (auto p = primFromName(kw)) {
             // D-LANG-TYPE-IDENTITY-VOCABULARY: an OPTIONAL quoted VOCABULARY TAG
@@ -3498,22 +5089,26 @@ private:
             // the text round-trip silently re-collapses it onto the anonymous
             // type — and an FFI descriptor's pointer parameter would reject the
             // very C type it models (`ptr<u64>` vs a user's `unsigned long long*`).
-            if (peekIs(Tk::Str)) return interner_.primitive(*p, lex_.take().text);
-            return interner_.primitive(*p);
+            out = peekIs(Tk::Str) ? interner_.primitive(*p, lex_.take().text)
+                                  : interner_.primitive(*p);
+            return true;
         }
         // P44: `addsLevel` says whether this constructor is a DERIVATION LEVEL in
         // the C sense — the thing a `QualifierSpine` counts. `ptr` is; a qualifier
         // skin is not. `modelled` says whether the constructor can appear in a C
         // declarator chain AT ALL: the four non-C ones below clear the flag so the
         // frame yields NO CLAIM instead of a spine whose level count is a guess.
+        // The pre-operand half of the old `wrap1` runs here; the post-operand
+        // half (`--qualDepth_`, the `>`, the constructor) runs when the operand
+        // arrives, in `advanceTypeFrame`'s Wrap1 arm.
         auto wrap1 = [&](TypeId (TypeInterner::*fn)(TypeId), bool addsLevel = false,
-                         bool modelled = true) -> TypeId {
+                         bool modelled = true) -> bool {
             expect(Tk::LAngle, "'<'");
             if (!modelled) qualModelled_ = false;
             if (addsLevel) ++qualDepth_;
-            TypeId e = parseType();
-            if (addsLevel) --qualDepth_;
-            expect(Tk::RAngle, "'>'"); return (interner_.*fn)(e);
+            stack.push_back(TypeParseFrame{.kind = Kind::Wrap1, .wrap = fn,
+                                           .addsLevel = addsLevel});
+            return false;   // its ONE operand comes next
         };
         if (kw == "ptr") return wrap1(&TypeInterner::pointer, /*addsLevel=*/true);
         if (kw == "ref") return wrap1(&TypeInterner::reference, false, /*modelled=*/false);
@@ -3534,6 +5129,15 @@ private:
         // carries the Atomic bit. Closes the pre-existing volatile-drops-in-text gap too.
         if (kw == "volatile") return wrap1(&TypeInterner::volatileQualified);
         if (kw == "atomic") return wrap1(&TypeInterner::atomicQualified);
+        // P66 (lane `al`): `aligned<T, N>` — the TYPE-LEVEL alignment skin. It takes a
+        // trailing scalar, so it cannot be a `wrap1` (whose builders are all
+        // `TypeId(TypeId)`); it pushes a frame and reads `, N >` on the way out, the
+        // `arr` shape.
+        if (kw == "aligned") {
+            expect(Tk::LAngle, "'<'");
+            stack.push_back(TypeParseFrame{.kind = Kind::Aligned});
+            return false;   // the decorated type comes next, then `, N >`
+        }
         // ★★ C23 `_BitInt(N)` / `unsigned _BitInt(N)` — THE INVERSE OF
         // `appendType`'s BitInt ARM, WHICH HAD NONE.
         //
@@ -3558,32 +5162,90 @@ private:
                 malformed("expected '_BitInt' after 'unsigned' — 'unsigned' is not "
                           "a type keyword on its own in this format (an unsigned "
                           "primitive is spelled by its own name, e.g. 'u32')");
-                return InvalidType;
+                return true;
             }
             expect(Tk::LParen, "'('");
-            auto const width = static_cast<std::int64_t>(takeInt());
+            // ⚠ THE FOURTH READER OF A VERBATIM-PRINTED `std::int64_t`, and it is
+            // handled DIFFERENTLY from the three dimension arms on purpose.
+            // `bitIntWidth()` is also `std::int64_t`, so a bare `takeInt()` here
+            // desynchronizes the stream on a `-` exactly as the `arr` arm did; the
+            // signed read fixes that. But a width is a COUNT with no sentinel — no
+            // interner state spells a negative one — so a negative is refused BY
+            // NAME here rather than handed to `bitInt`, where it would be a size
+            // this tier had invented. Passing through is right for a bound that
+            // HAS a sentinel (`arr`); refusing is right for one that does not.
+            auto const width = takeSignedInt();
             expect(Tk::RParen, "')'");
-            return interner_.bitInt(width, isSigned);
+            if (width <= 0) {
+                malformed(std::format(
+                    "_BitInt width {} is not positive — a width is a count and no "
+                    "interned `_BitInt` spells a non-positive one, so this names no "
+                    "type", width));
+                out = InvalidType;
+                return true;
+            }
+            out = interner_.bitInt(width, isSigned);
+            return true;
         }
-        if (kw == "fnptr") { expect(Tk::LAngle, "'<'"); (void)parseType(); expect(Tk::RAngle, "'>'");
-            malformed("fnptr<> is not constructible in this interner"); return InvalidType; }
-        if (kw == "vec") { expect(Tk::LAngle, "'<'"); qualModelled_ = false; TypeId e = parseType(); expect(Tk::Comma, "','");
-            std::int64_t n = static_cast<std::int64_t>(takeInt()); expect(Tk::RAngle, "'>'");
-            return interner_.vector(e, n); }
-        if (kw == "mat") { expect(Tk::LAngle, "'<'"); qualModelled_ = false; TypeId e = parseType(); expect(Tk::Comma, "','");
-            std::int64_t r = static_cast<std::int64_t>(takeInt()); expect(Tk::Comma, "','");
-            std::int64_t c = static_cast<std::int64_t>(takeInt()); expect(Tk::RAngle, "'>'");
-            return interner_.matrix(e, r, c); }
-        if (kw == "arr") { expect(Tk::LAngle, "'<'");
+        if (kw == "fnptr") {
+            expect(Tk::LAngle, "'<'");
+            stack.push_back(TypeParseFrame{.kind = Kind::FnPtr});
+            return false;   // the operand is read, then the form is refused as before
+        }
+        if (kw == "vec") {
+            expect(Tk::LAngle, "'<'"); qualModelled_ = false;
+            stack.push_back(TypeParseFrame{.kind = Kind::Vec});
+            return false;   // the element type comes next, then `, N >`
+        }
+        if (kw == "mat") {
+            expect(Tk::LAngle, "'<'"); qualModelled_ = false;
+            stack.push_back(TypeParseFrame{.kind = Kind::Mat});
+            return false;   // the element type comes next, then `, R, C >`
+        }
+        if (kw == "arr") {
+            expect(Tk::LAngle, "'<'");
             // P44: an array IS a derivation level, and it sits OUTSIDE the stars
             // in `declaratorDeclaredType`'s fold — the same placement the
             // semantic spine walk gives it.
-            ++qualDepth_; TypeId e = parseType(); --qualDepth_; expect(Tk::Comma, "','");
-            std::int64_t n = static_cast<std::int64_t>(takeInt()); expect(Tk::RAngle, "'>'");
-            return interner_.array(e, n); }
-        if (kw == "tuple") { expect(Tk::LAngle, "'<'"); auto ts = parseTypeListUntil(Tk::RAngle); expect(Tk::RAngle, "'>'");
-            return interner_.tuple(ts); }
-        if (kw == "struct") { std::string name = takeStr();
+            ++qualDepth_;
+            stack.push_back(TypeParseFrame{.kind = Kind::Arr});
+            return false;   // the element type comes next, then `, N >`
+        }
+        if (kw == "tuple") {
+            expect(Tk::LAngle, "'<'");
+            stack.push_back(TypeParseFrame{.kind = Kind::Tuple});
+            return false;   // a (possibly empty) operand list comes next
+        }
+        // v3: THE BACK-REFERENCE. `rec <H>` in TYPE position names the enclosing
+        // recursive composite carrying handle H — the only spelling of a cyclic
+        // type this grammar has, and the reason `struct Node { struct Node *next; }`
+        // can be written down at all.
+        //
+        // ⚠ IT MUST NAME A COMPOSITE THAT IS CURRENTLY OPEN, not merely one seen
+        // before. A back-reference to a CLOSED composite would parse into a type the
+        // writer would then re-spell IN FULL (it is not an ancestor of that
+        // position), so the artifact would round-trip to different bytes with
+        // nothing reporting it. Refusing here is what keeps
+        // `emitHir(parseHir(emitHir(h)))` an identity rather than a hope.
+        if (kw == "rec") {
+            std::uint64_t const h = takeInt();
+            for (std::size_t i = recOpen_.size(); i-- > 0;) {   // innermost first
+                if (recOpen_[i].handle == h) { out = recOpen_[i].type; return true; }
+            }
+            std::string open;
+            for (RecOpen const& e : recOpen_) {
+                if (!open.empty()) open += ", ";
+                open += std::to_string(e.handle);
+            }
+            malformed(std::format(
+                "`rec {}` names no ENCLOSING recursive composite — a back-reference "
+                "resolves only against the composites open at this point{}",
+                h, open.empty() ? std::string{"; none is open here"}
+                                : (" (open: " + open + ")")));
+            return true;
+        }
+        if (kw == "struct") {
+            std::string name = takeStr();
             // D-FFI-OPAQUE-TAG-HAS-NO-SPELLING: the appendType twin. `opaque` marks an
             // INCOMPLETE composite and is TERMINAL -- no `{}` follows, because an
             // incomplete type has no field list (as distinct from `{}`, which is a
@@ -3592,107 +5254,41 @@ private:
             // ONE type, which is the same canonicalization the complete-at-once path
             // gets by deriving its key from field content. The semantic analyzer's
             // self-referential path still passes a real decl-site key.
-            if (acceptKeyword("opaque"))
-                return interner_.forwardComposite(TypeKind::Struct, name, 0);
+            if (acceptKeyword("opaque")) {
+                out = interner_.forwardComposite(TypeKind::Struct, name, 0);
+                return true;
+            }
+            std::uint64_t const recH = takeRecMarker();
             // D-CSUBSET-PACKED: an optional ` packed` marker after the name (before the
             // `{`) round-trips the whole-composite packed flag. Routed through
-            // forwardComposite + completeComposite below (the structType convenience
-            // overloads don't carry packed).
+            // forwardComposite + completeComposite in `finishStructType` (the
+            // structType convenience overloads don't carry packed).
             bool const packed = acceptKeyword("packed");
             expect(Tk::LBrace, "'{'");
-            // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): each field is a type optionally
-            // followed by `@<byteOffset>` (an explicit overlapping layout).
-            // D-CSUBSET-MEMBER-ALIGNAS: OR by `~<align>` (a member-alignas override).
-            // Each marker is all-or-none, and the two are MUTUALLY EXCLUSIVE (a struct
-            // carries offsets XOR aligns) — a mix is malformed. A field-local loop
-            // (NOT parseTypeListUntil) so `@`/`~` are consumed here, never by node-
-            // attribute logic (types are never parsed where those tokens are also
-            // legal, so no ambiguity).
-            std::vector<TypeId>        ts;
-            std::vector<std::uint64_t> offs;
-            std::vector<std::uint32_t> aligns;
-            std::size_t                nWithOff   = 0;
-            std::size_t                nWithAlign = 0;
-            while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
-                ts.push_back(parseType());
-                if (accept(Tk::At)) {
-                    offs.push_back(takeInt()); aligns.push_back(0); ++nWithOff;
-                } else if (accept(Tk::Tilde)) {
-                    aligns.push_back(static_cast<std::uint32_t>(takeInt()));
-                    offs.push_back(0); ++nWithAlign;
-                } else {
-                    offs.push_back(0); aligns.push_back(0);
-                }
-                if (!accept(Tk::Comma)) break;
+            TypeParseFrame f{.kind = Kind::Struct, .name = std::move(name),
+                             .packed = packed, .recHandle = recH};
+            if (recH != 0) f.recForward = openRecComposite(TypeKind::Struct, f.name, recH);
+            stack.push_back(std::move(f));
+            return false;   // the field list comes next
+        }
+        if (kw == "union") {
+            std::string name = takeStr();
+            // The union half of D-FFI-OPAQUE-TAG-HAS-NO-SPELLING — see the writer's
+            // union arm for what its absence was costing (an incomplete `union U;`
+            // read back as a COMPLETE zero-member union).
+            if (acceptKeyword("opaque")) {
+                out = interner_.forwardComposite(TypeKind::Union, name, 0);
+                return true;
             }
-            expect(Tk::RBrace, "'}'");
-            if (nWithOff != 0 && nWithAlign != 0) {
-                malformed("struct fields cannot mix explicit offsets (@) and "
-                          "member aligns (~)");
-                return InvalidType;
-            }
-            std::span<std::int64_t const> const noWidths{};
-            // D-CSUBSET-PACKED: a packed struct routes through forwardComposite +
-            // completeComposite (structType doesn't carry packed). A content-derived
-            // declSiteKey keeps identical packed spellings canonical; bit 62 marks the
-            // packed hir-text key space (distinct from contentDeclSiteKey's bit 63) so a
-            // packed `S` and a non-packed `S` never collapse. packed + explicit offsets
-            // is impossible (completeComposite rejects the pair) → malformed here.
-            auto internPacked = [&](std::span<std::uint32_t const> al) -> TypeId {
-                std::uint64_t key = 1469598103934665603ull;
-                for (char ch : name)
-                    key = (key ^ static_cast<std::uint8_t>(ch)) * 1099511628211ull;
-                for (TypeId f : ts) key = (key ^ f.v) * 1099511628211ull;
-                // F-4 symmetry: fold the member aligns into the forward key,
-                // mirroring contentDeclSiteKey (type_lattice.cpp) which includes
-                // fieldAligns. An empty span (internPacked({})) → empty loop → key
-                // BYTE-IDENTICAL to before (zero churn for align-free packed structs);
-                // two same-name+fields packed structs differing ONLY in member aligns
-                // now get DISTINCT forward keys instead of colliding on the forward id.
-                for (std::uint32_t a : al) key = (key ^ a) * 1099511628211ull;
-                key |= (std::uint64_t{1} << 62);
-                TypeId const fwd =
-                    interner_.forwardComposite(TypeKind::Struct, name, key);
-                std::span<std::uint64_t const> const noOffs{};
-                interner_.completeComposite(fwd, ts, /*packed=*/true, noWidths,
-                                            noOffs, al);
-                return fwd;
-            };
-            if (nWithOff == 0 && nWithAlign == 0) {
-                if (packed) return internPacked({});
-                return interner_.structType(name, ts);
-            }
-            if (nWithAlign != 0) {
-                if (nWithAlign != ts.size()) {
-                    malformed("struct member aligns must be all-or-none");
-                    return InvalidType;
-                }
-                if (packed) return internPacked(aligns);
-                std::span<std::uint64_t const> const noOffs{};
-                return interner_.structType(name, ts, noWidths, noOffs, aligns);
-            }
-            if (packed) {
-                malformed("a packed struct cannot carry explicit field offsets (@)");
-                return InvalidType;
-            }
-            if (nWithOff != ts.size()) {
-                malformed("struct field offsets must be all-or-none");
-                return InvalidType;
-            }
-            return interner_.structType(name, ts, noWidths, offs); }
-        if (kw == "union") { std::string name = takeStr();
+            std::uint64_t const recH = takeRecMarker();
             bool const packed = acceptKeyword("packed");   // D-CSUBSET-PACKED
             expect(Tk::LBrace, "'{'");
-            auto ts = parseTypeListUntil(Tk::RBrace); expect(Tk::RBrace, "'}'");
-            if (!packed) return interner_.unionType(name, ts);
-            std::uint64_t key = 1469598103934665603ull;
-            for (char ch : name)
-                key = (key ^ static_cast<std::uint8_t>(ch)) * 1099511628211ull;
-            for (TypeId f : ts) key = (key ^ f.v) * 1099511628211ull;
-            key |= (std::uint64_t{1} << 62);
-            TypeId const fwd = interner_.forwardComposite(TypeKind::Union, name, key);
-            interner_.completeComposite(fwd, ts, /*packed=*/true);
-            return fwd; }
+            TypeParseFrame f{.kind = Kind::Union, .name = std::move(name),
+                             .packed = packed, .recHandle = recH};
+            if (recH != 0) f.recForward = openRecComposite(TypeKind::Union, f.name, recH);
+            stack.push_back(std::move(f));
+            return false;   // the member list comes next
+        }
         // D5.5: `enum "Name"` with optional `: <underlyingOrdinal>`. Enumerator
         // names live in the SemanticModel symbol table, not the type record;
         // only the nominal name + underlying TypeKind round-trip here.
@@ -3720,11 +5316,13 @@ private:
                 underlying = orMalformed(kHirTextPrimTable, n,
                                          "enum underlying type", TypeKind::I32);
             }
-            return interner_.enumType(name, underlying); }
+            out = interner_.enumType(name, underlying);
+            return true;
+        }
         if (kw == "fn") {
-            // Param list, handled here (not via parseTypeListUntil) so a trailing
-            // `...` variadic marker is accepted as the last "param" instead of
-            // tripping parseType's "expected a type". Shapes: `fn()`, `fn(i32)`,
+            // Param list, handled by the Fn frame so a trailing `...` variadic
+            // marker is accepted as the last "param" instead of tripping the
+            // head's "expected a type". Shapes: `fn()`, `fn(i32)`,
             // `fn(ptr<char>, i32, ...)` (variadic), `fn(...)` (variadic, no fixed).
             // ★★ P44 — ONE SYNTAX, TWO PLACES IN A QUALIFICATION CLAIM, AND THE
             // DISCRIMINATOR IS THE DEPTH. At depth 0 this `fn` IS the signature
@@ -3737,67 +5335,21 @@ private:
             // as the deeper levels of the SAME spine, which is the placement the
             // declarator ordering rule `ctors(D') ++ suffixes(D) ++ reverse(L(D))`
             // produces. The two sides model it identically or they cannot compare.
-            bool const qualTopSig =
-                qualArmed_ && qualDepth_ == 0 && !qualTopFilled_;
-            auto const qualFnLevel = static_cast<std::uint8_t>(qualDepth_);
+            // Both facts are decided HERE, at the same moment the recursive arm
+            // decided them, and carried on the frame.
+            TypeParseFrame f{.kind = Kind::Fn};
+            f.qualTopSig  = qualArmed_ && qualDepth_ == 0 && !qualTopFilled_;
+            f.qualFnLevel = static_cast<std::uint8_t>(qualDepth_);
             expect(Tk::LParen, "'('");
-            std::vector<TypeId> params;
-            std::vector<std::optional<QualifierSpine>> paramSpines;
-            bool isVariadic = false;
-            while (!peekIs(Tk::RParen) && !peekIs(Tk::Eof)) {
-                if (accept(Tk::Ellipsis)) { isVariadic = true; break; }   // `...` only valid trailing
-                QualFrame f = qualPush();
-                params.push_back(parseType());
-                paramSpines.push_back(qualPop(std::move(f)));
-                if (!accept(Tk::Comma)) break;
-            }
-            expect(Tk::RParen, "')'");
-            expect(Tk::Arrow, "'->'");
-            TypeId result = InvalidType;
-            if (qualTopSig) {
-                QualFrame f = qualPush();
-                result = parseType();
-                auto resultSpine = qualPop(std::move(f));
-                qualTop_.result = std::move(resultSpine);
-                qualTop_.params = std::move(paramSpines);
-                qualTopFilled_  = true;
-            } else {
-                if (qualArmed_) {
-                    auto claim = std::make_shared<DeclaredQualification>();
-                    claim->params = std::move(paramSpines);
-                    if (!claim->empty() && qualFnLevel < 63) {
-                        qualFnParams_.emplace_back(
-                            qualFnLevel,
-                            std::shared_ptr<DeclaredQualification const>(
-                                std::move(claim)));
-                    }
-                    ++qualDepth_;
-                    result = parseType();
-                    --qualDepth_;
-                } else {
-                    result = parseType();
-                }
-            }
-            CallConv cc = CallConv::CcSysV;
-            if (acceptKeyword("cc")) { std::string n = takeIdent(); cc = orMalformed(kCallConvTable, n, "calling convention", CallConv::CcSysV); }
-            return interner_.fnSig(params, result, cc, isVariadic);
+            stack.push_back(std::move(f));
+            return false;   // the parameter list comes next, then `-> R`
         }
         if (kw == "ext") {
             qualModelled_ = false;   // P44: not a C derivation chain — make no claim
             std::string name = takeStr();
-            expect(Tk::LParen, "'('"); auto args = parseTypeListUntil(Tk::RParen); expect(Tk::RParen, "')'");
-            std::vector<std::int64_t> scalars;
-            if (accept(Tk::LBrack)) {
-                while (!peekIs(Tk::RBrack) && !peekIs(Tk::Eof)) {
-                    bool neg = accept(Tk::Minus);
-                    std::int64_t v = static_cast<std::int64_t>(takeInt());
-                    scalars.push_back(neg ? -v : v);
-                    if (!accept(Tk::Comma)) break;
-                }
-                expect(Tk::RBrack, "']'");
-            }
-            TypeKindId kindId = typeReg_.registerExtension(name, {});
-            return interner_.extension(kindId, name, args, scalars);
+            expect(Tk::LParen, "'('");
+            stack.push_back(TypeParseFrame{.kind = Kind::Ext, .name = std::move(name)});
+            return false;   // the operand list comes next, then `) [s, …]`
         }
         // c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): caller-supplied named-type
         // bindings — the LAST resort before the unknown-type reject, so a
@@ -3805,7 +5357,7 @@ private:
         // bound but INVALID TypeId falls through to the reject (never a
         // silent InvalidType success).
         for (NamedTypeBinding const& nb : namedTypes_) {
-            if (nb.name == kw && nb.type.valid()) return nb.type;
+            if (nb.name == kw && nb.type.valid()) { out = nb.type; return true; }
         }
         // D-TEXT-TIER-REFUSALS-NAME-NO-ACCEPTED-SET: this named nothing at all —
         // on the production that decodes every shipped FFI descriptor's type
@@ -3813,7 +5365,536 @@ private:
         // descriptor and has no other way to learn what the decoder takes.
         malformed(std::format("unknown type '{}' — accepted: {}", kw,
                               typeKeywordsAccepted()));
-        return InvalidType;
+        return true;
+    }
+
+    // Continue the top frame. `haveOperand` says `io` carries an operand the
+    // head just produced; on return true the frame REDUCED and `io` holds its
+    // type (the caller pops it); otherwise `needHead` was set and the caller
+    // reads the next operand. Each arm is the recursive arm's tail verbatim —
+    // including which tokens a refusal does and does not consume, and every
+    // side effect on the qualification channel.
+    [[nodiscard]] bool advanceTypeFrame(TypeParseFrame& f, bool haveOperand,
+                                        TypeId& io, bool& needHead) {
+        using Kind = TypeParseFrame::Kind;
+        switch (f.kind) {
+            case Kind::QualWrap:
+                if (!haveOperand) { needHead = true; return false; }
+                expect(Tk::RAngle, "'>'");
+                return true;   // `io` is the operand: a qualifier hands T back unchanged
+            case Kind::Wrap1:
+                if (!haveOperand) { needHead = true; return false; }
+                if (f.addsLevel) --qualDepth_;
+                expect(Tk::RAngle, "'>'");
+                io = (interner_.*f.wrap)(io);
+                return true;
+            case Kind::FnPtr:
+                if (!haveOperand) { needHead = true; return false; }
+                expect(Tk::RAngle, "'>'");
+                malformed("fnptr<> is not constructible in this interner");
+                io = InvalidType;
+                return true;
+            case Kind::Vec: {
+                if (!haveOperand) { needHead = true; return false; }
+                expect(Tk::Comma, "','");
+                std::int64_t n = takeSignedInt();
+                expect(Tk::RAngle, "'>'");
+                io = interner_.vector(io, n);
+                return true;
+            }
+            case Kind::Mat: {
+                if (!haveOperand) { needHead = true; return false; }
+                expect(Tk::Comma, "','");
+                std::int64_t r = takeSignedInt();
+                expect(Tk::Comma, "','");
+                std::int64_t c = takeSignedInt();
+                expect(Tk::RAngle, "'>'");
+                io = interner_.matrix(io, r, c);
+                return true;
+            }
+            case Kind::Arr: {
+                if (!haveOperand) { needHead = true; return false; }
+                --qualDepth_;
+                expect(Tk::Comma, "','");
+                // ⚠ SIGNED, because a C99 VLA's bound is interned as -2 and the
+                // writer prints it verbatim — see `takeSignedInt`. The value is
+                // passed THROUGH rather than validated: what the interner holds is
+                // what the artifact must reproduce, and the sentinel is a value
+                // this tier has no business reinterpreting.
+                std::int64_t n = takeSignedInt();
+                expect(Tk::RAngle, "'>'");
+                io = interner_.array(io, n);
+                return true;
+            }
+            case Kind::Aligned: {
+                // P66 (lane `al`): the reader half of `appendType`'s `aligned<T, N>`.
+                // `typeAligned` STRIPS -> MERGES -> re-interns ONE skin, so a nested
+                // `aligned<volatile<i32>, 8>` lands as a single record carrying both
+                // the Volatile bit and the alignment, and the round-trip is an
+                // identity rather than a nesting that grows on every hop.
+                // ⚠ P66 (lane `ag`): the merge is REPLACE-ON-NON-ZERO, not MAX — the
+                // sentence above said MAX and that half went false when a
+                // weaker-than-natural request became honorable. It is inert for the
+                // round trip, which never writes a NESTED alignment: `appendType`
+                // emits ONE `aligned<>` frame per skin, so the reader sees at most one
+                // alignment per type. A hand-written `aligned<aligned<i32,8>,2>` now
+                // reads as 2 (the outer request), which is the same last-writer-wins
+                // rule a re-aliased typedef follows.
+                if (!haveOperand) { needHead = true; return false; }
+                expect(Tk::Comma, "','");
+                // UNSIGNED: unlike an array bound there is no negative sentinel here —
+                // an alignment is a power of two in [1, 256], validated at the semantic
+                // tier long before it is written. A negative would be a corrupt
+                // artifact, so let the unsigned reader refuse it rather than silently
+                // wrapping it into a huge alignment.
+                std::uint64_t n = takeInt();
+                expect(Tk::RAngle, "'>'");
+                io = interner_.typeAligned(io, static_cast<std::uint32_t>(n));
+                return true;
+            }
+            case Kind::Tuple:
+                // The old `parseTypeListUntil(RAngle)` loop: another operand only
+                // while the next token is neither `>` nor EOF, and a missing comma
+                // ends the list.
+                if (haveOperand) {
+                    f.ops.push_back(io);
+                    if (!accept(Tk::Comma)) return finishTupleType(f, io);
+                }
+                if (!peekIs(Tk::RAngle) && !peekIs(Tk::Eof)) { needHead = true; return false; }
+                return finishTupleType(f, io);
+            case Kind::Struct:
+                // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): each field is a type
+                // optionally followed by `@<byteOffset>` (an explicit overlapping
+                // layout). D-CSUBSET-MEMBER-ALIGNAS: OR by `~<align>` (a member-alignas
+                // override). Each marker is all-or-none, and the two are MUTUALLY
+                // EXCLUSIVE (a struct carries offsets XOR aligns) — a mix is malformed.
+                // Field-local (NOT a generic list) so `@`/`~` are consumed here, never
+                // by node-attribute logic (types are never parsed where those tokens
+                // are also legal, so no ambiguity).
+                if (haveOperand) {
+                    f.ops.push_back(io);
+                    if (accept(Tk::At)) {
+                        f.offs.push_back(takeInt()); f.aligns.push_back(0); ++f.nWithOff;
+                    } else if (accept(Tk::Tilde)) {
+                        f.aligns.push_back(static_cast<std::uint32_t>(takeInt()));
+                        f.offs.push_back(0); ++f.nWithAlign;
+                    } else {
+                        f.offs.push_back(0); f.aligns.push_back(0);
+                    }
+                    // D-CSUBSET-PER-MEMBER-PACKED: the per-field marker comes AFTER
+                    // any `~<align>`, matching the emitter, and is independent of it:
+                    // a field may carry both. `nFieldPacked` counts them so an
+                    // ALL-ZERO span is never built — that would fork the TypeId of
+                    // every struct that has no per-member packed at all.
+                    if (acceptKeyword("packed")) {
+                        f.fieldPacked.push_back(1u); ++f.nFieldPacked;
+                    } else {
+                        f.fieldPacked.push_back(0u);
+                    }
+                    if (!accept(Tk::Comma)) return finishStructType(f, io);
+                }
+                if (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) { needHead = true; return false; }
+                return finishStructType(f, io);
+            case Kind::Union:
+                // D-CSUBSET-PER-MEMBER-PACKED: a member-local loop, so a trailing
+                // ` packed` keyword on a member is consumed HERE — the struct arm's
+                // shape, for the same reason.
+                if (haveOperand) {
+                    f.ops.push_back(io);
+                    if (acceptKeyword("packed")) {
+                        f.fieldPacked.push_back(1u); ++f.nFieldPacked;
+                    } else {
+                        f.fieldPacked.push_back(0u);
+                    }
+                    if (!accept(Tk::Comma)) return finishUnionType(f, io);
+                }
+                if (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) { needHead = true; return false; }
+                return finishUnionType(f, io);
+            case Kind::Fn:
+                if (!f.readingResult) {
+                    if (haveOperand) {
+                        f.ops.push_back(io);
+                        f.paramSpines.push_back(qualPop(std::move(*f.pendingQual)));
+                        f.pendingQual.reset();
+                        if (!accept(Tk::Comma)) return beginFnResult(f, needHead);
+                    }
+                    if (!peekIs(Tk::RParen) && !peekIs(Tk::Eof)) {
+                        if (accept(Tk::Ellipsis)) {   // `...` only valid trailing
+                            f.isVariadic = true;
+                            return beginFnResult(f, needHead);
+                        }
+                        f.pendingQual = qualPush();
+                        needHead = true;
+                        return false;
+                    }
+                    return beginFnResult(f, needHead);
+                }
+                if (!haveOperand) { needHead = true; return false; }
+                switch (f.resultMode) {
+                    case TypeParseFrame::ResultMode::Top: {
+                        auto resultSpine = qualPop(std::move(*f.pendingQual));
+                        f.pendingQual.reset();
+                        qualTop_.result = std::move(resultSpine);
+                        qualTop_.params = std::move(f.paramSpines);
+                        qualTopFilled_  = true;
+                        break;
+                    }
+                    case TypeParseFrame::ResultMode::Nested:
+                        --qualDepth_;
+                        break;
+                    case TypeParseFrame::ResultMode::Plain:
+                        break;
+                }
+                {
+                    CallConv cc = CallConv::CcSysV;
+                    if (acceptKeyword("cc")) {
+                        std::string n = takeIdent();
+                        cc = orMalformed(kCallConvTable, n, "calling convention",
+                                         CallConv::CcSysV);
+                    }
+                    io = interner_.fnSig(f.ops, io, cc, f.isVariadic);
+                }
+                return true;
+            case Kind::Ext:
+                if (haveOperand) {
+                    f.ops.push_back(io);
+                    if (!accept(Tk::Comma)) return finishExtType(f, io);
+                }
+                if (!peekIs(Tk::RParen) && !peekIs(Tk::Eof)) { needHead = true; return false; }
+                return finishExtType(f, io);
+        }
+        io = InvalidType;
+        return true;
+    }
+
+    // The Fn frame's parameter list is complete: `) -> `, then set up the
+    // result's qualification frame exactly as the recursive arm did before its
+    // result `parseType` — the top-level signature opens a fresh spine, a nested
+    // function type records its parameter claim at its level and descends one.
+    [[nodiscard]] bool beginFnResult(TypeParseFrame& f, bool& needHead) {
+        expect(Tk::RParen, "')'");
+        expect(Tk::Arrow, "'->'");
+        if (f.qualTopSig) {
+            f.pendingQual = qualPush();
+            f.resultMode  = TypeParseFrame::ResultMode::Top;
+        } else if (qualArmed_) {
+            auto claim = std::make_shared<DeclaredQualification>();
+            claim->params = std::move(f.paramSpines);
+            if (!claim->empty() && f.qualFnLevel < 63) {
+                qualFnParams_.emplace_back(
+                    f.qualFnLevel,
+                    std::shared_ptr<DeclaredQualification const>(std::move(claim)));
+            }
+            ++qualDepth_;
+            f.resultMode = TypeParseFrame::ResultMode::Nested;
+        } else {
+            f.resultMode = TypeParseFrame::ResultMode::Plain;
+        }
+        f.readingResult = true;
+        needHead        = true;
+        return false;
+    }
+
+    [[nodiscard]] bool finishTupleType(TypeParseFrame& f, TypeId& out) {
+        expect(Tk::RAngle, "'>'");
+        out = interner_.tuple(f.ops);
+        return true;
+    }
+
+    [[nodiscard]] bool finishExtType(TypeParseFrame& f, TypeId& out) {
+        expect(Tk::RParen, "')'");
+        std::vector<std::int64_t> scalars;
+        if (accept(Tk::LBrack)) {
+            while (!peekIs(Tk::RBrack) && !peekIs(Tk::Eof)) {
+                bool neg = accept(Tk::Minus);
+                std::int64_t v = static_cast<std::int64_t>(takeInt());
+                scalars.push_back(neg ? -v : v);
+                if (!accept(Tk::Comma)) break;
+            }
+            expect(Tk::RBrack, "']'");
+        }
+        TypeKindId kindId = typeReg_.registerExtension(f.name, {});
+        out = interner_.extension(kindId, f.name, f.ops, scalars);
+        return true;
+    }
+
+    // ── v3: the recursive-composite helpers, shared by the struct and union arms ──
+
+    // The optional ` rec <H>` marker between a composite's name and its layout
+    // markers. 0 when absent. ⚠ `rec 0` is REFUSED rather than read as "absent":
+    // 0 is this parser's own not-recursive sentinel, so a file that spells it was
+    // written by something that disagrees with this grammar, and quietly agreeing
+    // with it would drop the marker.
+    [[nodiscard]] std::uint64_t takeRecMarker() {
+        if (!acceptKeyword("rec")) return 0;
+        std::uint64_t const h = takeInt();
+        if (h == 0) {
+            malformed("`rec 0` is not a recursion handle — handles are 1-based, and "
+                      "0 is the writer's marker-absent value");
+            return 0;
+        }
+        return h;
+    }
+
+    // Mint the forward id for handle `h` and open it, so the field list about to
+    // be read can close the cycle through `rec <h>`.
+    [[nodiscard]] TypeId openRecComposite(TypeKind kind, std::string_view name,
+                                          std::uint64_t h) {
+        for (RecOpen const& e : recOpen_) {
+            if (e.handle != h) continue;
+            malformed(std::format(
+                "recursion handle {} is already open — a handle names ONE composite "
+                "per artifact, so re-opening it inside itself is not a shape this "
+                "writer produces", h));
+            break;
+        }
+        TypeId const fwd = interner_.forwardComposite(kind, name, recDeclSiteKey(h));
+        recOpen_.push_back(RecOpen{h, fwd});   // pushed even on the refusal, so the
+        return fwd;                            // frame's own close stays balanced
+    }
+
+    void closeRecComposite(std::uint64_t h) {
+        if (!recOpen_.empty() && recOpen_.back().handle == h) { recOpen_.pop_back(); return; }
+        // Unreachable by construction: one frame opens and the same frame closes.
+        // Fail loud rather than leave a stale entry a later `rec` could bind to.
+        malformed("internal: the HIR type reader's recursive-composite open stack "
+                  "desynchronized");
+        recOpen_.clear();
+    }
+
+    // Does an ALREADY-COMPLETE forward composite agree, in every channel this
+    // grammar spells, with the fields just read for it?
+    //
+    // ⚠⚠ THIS EXISTS SO A MALFORMED FILE CANNOT ABORT THE PROCESS.
+    // `completeComposite` treats a CONFLICTING re-completion as a caller bug and
+    // aborts loud — right for a compiler pass that owns its own types, wrong for a
+    // reader of text it did not write. A handle spelled twice with different
+    // content is exactly that conflict, so it is refused HERE as a positioned
+    // diagnostic and never reaches the abort. An IDENTICAL re-completion is the
+    // ordinary case (a composite spelled at two use sites) and is simply skipped.
+    [[nodiscard]] bool recCompletionAgrees(TypeId fwd, std::span<TypeId const> ts,
+                                           bool packed,
+                                           std::span<std::uint64_t const> offs,
+                                           std::span<std::uint32_t const> aligns,
+                                           std::span<std::uint8_t const> fp) const {
+        std::span<TypeId const> const have{interner_.operands(fwd)};
+        if (have.size() != ts.size()) return false;
+        for (std::size_t i = 0; i < ts.size(); ++i) if (have[i].v != ts[i].v) return false;
+        if (interner_.isPacked(fwd) != packed) return false;
+        if (interner_.hasExplicitOffsets(fwd) != !offs.empty()) return false;
+        for (std::size_t i = 0; i < offs.size(); ++i) {
+            auto const o = interner_.explicitFieldOffset(fwd, i);
+            if (!o.has_value() || *o != offs[i]) return false;
+        }
+        if (interner_.hasExplicitAligns(fwd) != !aligns.empty()) return false;
+        for (std::size_t i = 0; i < aligns.size(); ++i) {
+            if (interner_.explicitFieldAlign(fwd, i) != aligns[i]) return false;
+        }
+        if (interner_.hasFieldPacked(fwd) != !fp.empty()) return false;
+        for (std::size_t i = 0; i < fp.size(); ++i) {
+            if (interner_.isFieldPacked(fwd, i) != (fp[i] != 0)) return false;
+        }
+        return true;
+    }
+
+    // Attach the fields just read to the forward id `f` opened for its `rec`
+    // handle, and close the handle. `out` is the forward id on success and
+    // InvalidType on a refusal, never a half-built composite.
+    void completeRecComposite(TypeParseFrame& f, std::span<TypeId const> ts,
+                              std::span<std::uint64_t const> offs,
+                              std::span<std::uint32_t const> aligns,
+                              std::span<std::uint8_t const> fp, TypeId& out) {
+        closeRecComposite(f.recHandle);
+        if (!f.recForward.valid()) { out = InvalidType; return; }
+        std::span<std::int64_t const> const noWidths{};
+        if (interner_.isIncompleteComposite(f.recForward)) {
+            interner_.completeComposite(f.recForward, ts, f.packed, noWidths, offs, aligns,
+                                        /*explicitAlign=*/0, /*maxFieldAlign=*/0, fp);
+        } else if (!recCompletionAgrees(f.recForward, ts, f.packed, offs, aligns, fp)) {
+            malformed(std::format(
+                "recursion handle {} was spelled twice with DIFFERENT content — a "
+                "handle names one composite per artifact, so the two spellings "
+                "describe two different types under one name", f.recHandle));
+            out = InvalidType;
+            return;
+        }
+        out = f.recForward;
+    }
+
+    // The struct arm's tail, verbatim, over the frame's accumulated fields.
+    [[nodiscard]] bool finishStructType(TypeParseFrame& f, TypeId& out) {
+        std::string const&               name        = f.name;
+        std::vector<TypeId> const&       ts          = f.ops;
+        std::vector<std::uint64_t> const& offs       = f.offs;
+        std::vector<std::uint32_t> const& aligns     = f.aligns;
+        std::vector<std::uint8_t> const& fieldPacked = f.fieldPacked;
+        std::size_t const nWithOff     = f.nWithOff;
+        std::size_t const nWithAlign   = f.nWithAlign;
+        std::size_t const nFieldPacked = f.nFieldPacked;
+        bool const        packed       = f.packed;
+        out = InvalidType;
+        expect(Tk::RBrace, "'}'");
+        if (nWithOff != 0 && nWithAlign != 0) {
+            malformed("struct fields cannot mix explicit offsets (@) and "
+                      "member aligns (~)");
+            return true;
+        }
+        // D-CSUBSET-PER-MEMBER-PACKED: explicit offsets place fields wholesale, so
+        // a per-field packed is as contradictory with them as the whole-composite
+        // flag is — `completeComposite` aborts on the pair, so refuse it HERE with
+        // a text-level diagnostic rather than letting malformed input abort.
+        if (nFieldPacked != 0 && nWithOff != 0) {
+            malformed("a struct field cannot be both packed and carry an explicit "
+                      "offset (@)");
+            return true;
+        }
+        // ⓘ THE ALL-OR-NONE AND EXCLUSIVITY CHECKS ARE HOISTED HERE so the `rec`
+        // completion below and the ladder further down share ONE owner of the rule
+        // — the alternative was a second copy of five refusals on the recursive
+        // path, which is how two readers of one grammar start disagreeing. Their
+        // relative order is unchanged, so which message a given malformed input
+        // gets is unchanged too.
+        if (nWithAlign != 0 && nWithAlign != ts.size()) {
+            malformed("struct member aligns must be all-or-none");
+            return true;
+        }
+        if (nWithOff != 0) {
+            if (packed) {
+                malformed("a packed struct cannot carry explicit field offsets (@)");
+                return true;
+            }
+            if (nWithOff != ts.size()) {
+                malformed("struct field offsets must be all-or-none");
+                return true;
+            }
+        }
+        std::span<std::uint8_t const> const fpSpan =
+            nFieldPacked == 0 ? std::span<std::uint8_t const>{}
+                              : std::span<std::uint8_t const>{fieldPacked};
+        std::span<std::int64_t const> const noWidths{};
+        // v3: a RECURSIVE composite was already forward-minted at its `rec` marker
+        // (the field list needed its id to exist), so it completes rather than
+        // interns — and it takes every layout channel this grammar spells, so the
+        // recursive path is not a narrower one.
+        if (f.recHandle != 0) {
+            completeRecComposite(
+                f, ts,
+                nWithOff == 0 ? std::span<std::uint64_t const>{}
+                              : std::span<std::uint64_t const>{offs},
+                nWithAlign == 0 ? std::span<std::uint32_t const>{}
+                                : std::span<std::uint32_t const>{aligns},
+                fpSpan, out);
+            return true;
+        }
+        // D-CSUBSET-PACKED: a packed struct routes through forwardComposite +
+        // completeComposite (structType doesn't carry packed). A content-derived
+        // declSiteKey keeps identical packed spellings canonical; bit 62 marks the
+        // packed hir-text key space (distinct from contentDeclSiteKey's bit 63) so a
+        // packed `S` and a non-packed `S` never collapse. packed + explicit offsets
+        // is impossible (completeComposite rejects the pair) → malformed here.
+        auto internPacked = [&](std::span<std::uint32_t const> al) -> TypeId {
+            std::uint64_t key = 1469598103934665603ull;
+            for (char ch : name)
+                key = (key ^ static_cast<std::uint8_t>(ch)) * 1099511628211ull;
+            for (TypeId fld : ts) key = (key ^ fld.v) * 1099511628211ull;
+            // F-4 symmetry: fold the member aligns into the forward key,
+            // mirroring contentDeclSiteKey (type_lattice.cpp) which includes
+            // fieldAligns. An empty span (internPacked({})) → empty loop → key
+            // BYTE-IDENTICAL to before (zero churn for align-free packed structs);
+            // two same-name+fields packed structs differing ONLY in member aligns
+            // now get DISTINCT forward keys instead of colliding on the forward id.
+            for (std::uint32_t a : al) key = (key ^ a) * 1099511628211ull;
+            // D-CSUBSET-PER-MEMBER-PACKED: fold the per-field flags into the
+            // forward key too, for the reason the aligns fold exists — two
+            // same-name+fields composites differing ONLY in which member is packed
+            // must get DISTINCT forward ids instead of colliding. An empty span
+            // leaves the key BYTE-IDENTICAL (zero churn).
+            for (std::uint8_t p : fpSpan) key = (key ^ p) * 1099511628211ull;
+            key |= (std::uint64_t{1} << 62);
+            TypeId const fwd =
+                interner_.forwardComposite(TypeKind::Struct, name, key);
+            std::span<std::uint64_t const> const noOffs{};
+            interner_.completeComposite(fwd, ts, /*packed=*/true, noWidths,
+                                        noOffs, al, /*explicitAlign=*/0,
+                                        /*maxFieldAlign=*/0, fpSpan);
+            return fwd;
+        };
+        // D-CSUBSET-PER-MEMBER-PACKED: an UNPACKED composite carrying per-field
+        // flags needs the same forward+complete route the whole-composite flag
+        // needs, because no `structType` overload shorter than the 8-arg one
+        // carries them. Keyed like `internPacked` but in a DISTINCT key space
+        // (bit 61), so `struct "S" { i32 packed }` and `struct "S" packed { i32 }`
+        // — different layouts — can never collapse onto one forward id.
+        auto internFieldPacked = [&](std::span<std::uint32_t const> al) -> TypeId {
+            std::uint64_t key = 1469598103934665603ull;
+            for (char ch : name)
+                key = (key ^ static_cast<std::uint8_t>(ch)) * 1099511628211ull;
+            for (TypeId fld : ts) key = (key ^ fld.v) * 1099511628211ull;
+            for (std::uint32_t a : al) key = (key ^ a) * 1099511628211ull;
+            for (std::uint8_t p : fpSpan) key = (key ^ p) * 1099511628211ull;
+            key |= (std::uint64_t{1} << 61);
+            TypeId const fwd =
+                interner_.forwardComposite(TypeKind::Struct, name, key);
+            std::span<std::uint64_t const> const noOffs{};
+            interner_.completeComposite(fwd, ts, /*packed=*/false, noWidths,
+                                        noOffs, al, /*explicitAlign=*/0,
+                                        /*maxFieldAlign=*/0, fpSpan);
+            return fwd;
+        };
+        if (nWithOff == 0 && nWithAlign == 0) {
+            if (packed) { out = internPacked({}); return true; }
+            if (nFieldPacked != 0) { out = internFieldPacked({}); return true; }
+            out = interner_.structType(name, ts);
+            return true;
+        }
+        if (nWithAlign != 0) {   // count + packed exclusivity checked above
+            if (packed) { out = internPacked(aligns); return true; }
+            if (nFieldPacked != 0) { out = internFieldPacked(aligns); return true; }
+            std::span<std::uint64_t const> const noOffs{};
+            out = interner_.structType(name, ts, noWidths, noOffs, aligns);
+            return true;
+        }
+        out = interner_.structType(name, ts, noWidths, offs);
+        return true;
+    }
+
+    // The union arm's tail, verbatim, over the frame's accumulated members.
+    [[nodiscard]] bool finishUnionType(TypeParseFrame& f, TypeId& out) {
+        std::string const&         name         = f.name;
+        std::vector<TypeId> const& ts           = f.ops;
+        std::size_t const          nFieldPacked = f.nFieldPacked;
+        bool const                 packed       = f.packed;
+        expect(Tk::RBrace, "'}'");
+        std::span<std::uint8_t const> const fpSpan =
+            nFieldPacked == 0 ? std::span<std::uint8_t const>{}
+                              : std::span<std::uint8_t const>{f.fieldPacked};
+        // v3: a recursive union completes its forward id — the struct arm's shape,
+        // for the struct arm's reason. A union carries neither explicit offsets nor
+        // member aligns in this grammar, so those two channels are empty here.
+        if (f.recHandle != 0) {
+            completeRecComposite(f, ts, std::span<std::uint64_t const>{},
+                                 std::span<std::uint32_t const>{}, fpSpan, out);
+            return true;
+        }
+        if (!packed && nFieldPacked == 0) { out = interner_.unionType(name, ts); return true; }
+        std::uint64_t key = 1469598103934665603ull;
+        for (char ch : name)
+            key = (key ^ static_cast<std::uint8_t>(ch)) * 1099511628211ull;
+        for (TypeId fld : ts) key = (key ^ fld.v) * 1099511628211ull;
+        for (std::uint8_t p : fpSpan) key = (key ^ p) * 1099511628211ull;
+        // Bit 62 is the whole-composite packed key space; bit 61 the per-field one
+        // — a union packed as a whole and a union with one packed member are
+        // different layouts and must never collapse onto one forward id.
+        key |= (std::uint64_t{1} << (packed ? 62 : 61));
+        TypeId const fwd = interner_.forwardComposite(TypeKind::Union, name, key);
+        std::span<std::int64_t const>  const noW{};
+        std::span<std::uint64_t const> const noO{};
+        std::span<std::uint32_t const> const noA{};
+        interner_.completeComposite(fwd, ts, packed, noW, noO, noA,
+                                    /*explicitAlign=*/0, /*maxFieldAlign=*/0,
+                                    fpSpan);
+        out = fwd;
+        return true;
     }
 };
 
@@ -3833,6 +5914,12 @@ std::unique_ptr<HirParseResult> parseHir(std::string_view text, CompilationUnitI
         auto res = std::make_unique<HirParseResult>(
             std::move(parser.builder_).finish(empty),
             std::move(*parser.ownedInterner_), std::move(parser.symbolNames_));
+        // Carried even on the fatal path: a caller diagnosing a refused artifact
+        // wants to know WHICH producer wrote it, and on a version mismatch that
+        // is the single most useful fact available. Empty when the failure came
+        // before the header was read at all.
+        res->producer    = std::move(parser.producer_);
+        res->bufferNames = std::move(parser.bufferNames_);
         res->ok = false;
         return res;
     }
@@ -3840,6 +5927,8 @@ std::unique_ptr<HirParseResult> parseHir(std::string_view text, CompilationUnitI
     Hir hir = std::move(parser.builder_).finish(root);
     auto res = std::make_unique<HirParseResult>(
         std::move(hir), std::move(*parser.ownedInterner_), std::move(parser.symbolNames_));
+    res->producer    = std::move(parser.producer_);
+    res->bufferNames = std::move(parser.bufferNames_);
 
     // Hand back the rebuilt literal pool (empty if the source used `#index`).
     res->literalPool = std::move(parser.pLiterals_);

@@ -2,6 +2,7 @@
 #include "link/format/object_format_backends.hpp"
 
 #include "core/cpp_invariants.hpp"  // arithmetic-right-shift assert
+#include "core/crypto/sha256.hpp"  // build-id derivation (content hash)
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/symbol_attrs.hpp"  // isExternallyVisible (ET_DYN exports)
 #include "link/format/byte_emit.hpp"
@@ -16,9 +17,11 @@
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -66,6 +69,13 @@ constexpr std::uint32_t EV_CURRENT = 1;
 constexpr std::uint8_t STB_LOCAL  = 0;
 constexpr std::uint8_t STB_GLOBAL = 1;
 constexpr std::uint8_t STB_WEAK   = 2;  // ET_DYN weak exports (c150)
+
+// Elf64_Sym.st_other visibility (gABI 4.18), the low two bits. A SEPARATE axis
+// from st_info's binding nibble -- D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL.
+constexpr std::uint8_t STV_DEFAULT   = 0;
+constexpr std::uint8_t STV_INTERNAL  = 1;
+constexpr std::uint8_t STV_HIDDEN    = 2;
+constexpr std::uint8_t STV_PROTECTED = 3;
 constexpr std::uint8_t STT_NOTYPE = 0;
 constexpr std::uint8_t STT_OBJECT = 1;  // data object (vs a function)
 constexpr std::uint8_t STT_FUNC   = 2;
@@ -94,6 +104,34 @@ constexpr std::uint16_t SHN_UNDEF = 0;
     return STB_GLOBAL;  // unreachable: SymbolBinding is a closed 3-value enum
 }
 
+// ── st_other: the VISIBILITY axis, which is NOT the binding axis ──────────
+//    D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL
+//
+// gABI 4.18 puts visibility in `st_other`'s low two bits, entirely separate
+// from `st_info`'s binding nibble, and ELF represents all four values
+// natively, so this mapping is TOTAL and LOSSLESS — the ELF vocabulary for the
+// shared `ObjectSymbolNames::definedVisibility` decision, exactly as
+// `stbForBinding` above is the ELF vocabulary for `definedBinding`. The two
+// are separate functions because they answer separate questions: collapsing
+// them (emitting a hidden symbol as STB_LOCAL) is the defect this anchor names.
+//
+// ✔MEASURED 2026-09-05, gcc 13.3.0 `-O0 -c`, ONE object carrying all three
+// visibilities plus two CONTROLS: `FUNC GLOBAL HIDDEN` / `FUNC GLOBAL
+// INTERNAL` / `FUNC GLOBAL PROTECTED`, beside `FUNC LOCAL DEFAULT` for a
+// `static` and `FUNC GLOBAL DEFAULT` for a plain extern-linkage function.
+// The final-image tier agrees: gcc AND clang both keep a CALLED hidden
+// function `FUNC GLOBAL HIDDEN` in a linked `-no-pie` executable's `.symtab`
+// on x86_64 and aarch64, at -O0 and -O2.
+[[nodiscard]] constexpr std::uint8_t stvForVisibility(SymbolVisibility v) noexcept {
+    switch (v) {
+        case SymbolVisibility::Default:   return STV_DEFAULT;
+        case SymbolVisibility::Internal:  return STV_INTERNAL;
+        case SymbolVisibility::Hidden:    return STV_HIDDEN;
+        case SymbolVisibility::Protected: return STV_PROTECTED;
+    }
+    return STV_DEFAULT;  // unreachable: SymbolVisibility is a closed 4-value enum
+}
+
 
 // Elf64 sh_type / sh_flags (gABI 4.7-4.8) — used by the dynamic
 // walker (cycle 2b.2). Named to match `<elf.h>`; type-design #2
@@ -108,6 +146,56 @@ constexpr std::uint32_t SHT_DYNSYM   = 11;
 constexpr std::uint64_t SHF_WRITE     = 1;
 constexpr std::uint64_t SHF_ALLOC     = 2;
 constexpr std::uint64_t SHF_EXECINSTR = 4;
+
+// ── The static image's OWN GOT ─────────────────────────────────────────────
+//    D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS
+//
+// `.got` is WRITER-OWNED — no `.format.json` row, like `.plt` / `.rela.dyn` in
+// the dynamic walker. A producer cannot place anything in it: every slot is
+// minted by the linker for a relocation that names one, so there is nothing
+// for a schema author to decide. ✔MEASURED: no shipped document under
+// `src/dss-config/` DECLARES a `.got` section row — the name appears there only
+// inside `$comment` prose describing the dynamic walker's GOT, never as a row a
+// loader reads.
+//
+// ⚠ THIS SENTENCE USED TO READ *"zero `.got` hits under `src/dss-config/`"* AND
+// THAT GREP RETURNS FOUR. The intended claim was always the structural one
+// above and it is TRUE; the sentence stating it was a self-documenting COUNT
+// that was already false when it was typed
+// (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED, one
+// tier earlier: false at the moment of typing). The claim is stated
+// structurally rather than as a figure because it is not a line count over a
+// named file set — the four prose hits are exactly what such a count would
+// report — so there is nothing here for the source census to bind.
+constexpr std::string_view kGotSectionName = ".got";
+// Slot width. ELF64 throughout this walker (`Elf64_Ehdr`, `Elf64_Shdr`), and
+// the dynamic walker's `.got` uses the same 8.
+constexpr std::uint64_t kGotSlotBytes = 8;
+
+// ── `.note.gnu.build-id` ───────────────────────────────────────────────────
+//    D-LK-ELF-EMITS-NO-BUILD-ID-NOTE
+//
+// The gABI note record is `n_namesz / n_descsz / n_type` (three LE u32s), then
+// the owner name padded to 4, then the descriptor padded to 4. The GNU
+// build-id note's owner is "GNU\0" and its type is NT_GNU_BUILD_ID.
+constexpr std::uint32_t NT_GNU_BUILD_ID = 3;
+// Spelled as BYTES, not as a string literal: `"GNU\0"` makes gcc warn
+// `null character(s) preserved in literal`, and a warning on a deliberate
+// wire constant is noise that trains a reader to skip warnings.
+constexpr std::array<std::uint8_t, 4> kBuildIdOwner{{'G', 'N', 'U', 0}};
+constexpr std::uint32_t kBuildIdOwnerBytes = 4;   // "GNU\0", already 4-aligned
+// ★ THE DESCRIPTOR IS A FULL SHA-256 AND ITS LENGTH SAYS SO. The note format
+// fixes no descriptor size — GNU ld writes 20 bytes for `--build-id=sha1` (its
+// default, ✔MEASURED: `n_descsz` 0x14 on gcc 13.3.0 and clang 18.1.3 images),
+// 16 for `md5`, and any length at all for `--build-id=0x<hex>` — and every
+// consumer treats it as opaque bytes. DSS hashes with `dss::crypto::sha256`,
+// the NIST-vector-verified digest this repository already owns, so it publishes
+// all 32 rather than truncating to claim a width it did not compute. (Mach-O's
+// LC_UUID truncates only because its payload field IS 16 bytes wide.)
+constexpr std::uint32_t kBuildIdDescBytes = 32;
+// Byte offset of the descriptor inside the note body: the 12-byte header plus
+// the 4-byte owner name.
+constexpr std::size_t kBuildIdDescOffset = 12 + 4;
 
 // Elf64 p_type / p_flags (gABI Fig. 5-2).
 constexpr std::uint32_t PT_LOAD    = 1;
@@ -502,6 +590,46 @@ inline void appendBytes(std::vector<std::uint8_t>& out,
          std::to_string(machine) + " has no PLT stub emitter — "
          "caller's machine-guard should have rejected this.");
     return false;
+}
+
+// The `.note.gnu.build-id` body with a ZEROED descriptor — the shape both image
+// walkers emit, built in ONE place so the two can never disagree about the wire
+// record. `stampBuildIdNote` fills the descriptor once the image is complete.
+[[nodiscard]] std::vector<std::uint8_t> makeBuildIdNoteBody() {
+    std::vector<std::uint8_t> note;
+    appendU32LE(note, kBuildIdOwnerBytes);   // n_namesz ("GNU\0")
+    appendU32LE(note, kBuildIdDescBytes);    // n_descsz
+    appendU32LE(note, NT_GNU_BUILD_ID);      // n_type
+    note.insert(note.end(), kBuildIdOwner.begin(), kBuildIdOwner.end());
+    note.insert(note.end(), kBuildIdDescBytes, std::uint8_t{0});
+    return note;
+}
+
+// Derive the image's build id FROM ITS OWN CONTENT and write it into the
+// descriptor the note body reserved. `bytes` must already hold every byte of
+// the finished image, so the caller calls this LAST.
+//
+// ★★ WHY CONTENT-DERIVED AND NEVER RANDOM, and this is a repository invariant
+// rather than a preference: several corpus examples compare a `--config=release`
+// artifact BYTE-FOR-BYTE, and a random id would make every such artifact differ
+// from itself. ✔MEASURED 2026-09-07 that the references derive it from content
+// too — gcc 13.3.0 built the same source twice to two paths and stamped
+// `df4a8b78d56207b6df0e681bb4c1b48d54f6d124` both times, clang 18.1.3 stamped
+// `49138c0b580bd392b24f1d5ca445d45b51f1788e` both times, and a one-character
+// source change moved gcc's to `703e81b32e5595635a80b3f9186895a42dcb51ab`.
+//
+// ★ THE DESCRIPTOR IS INSIDE THE HASHED REGION AND IS ZERO WHEN IT IS HASHED,
+// so the derivation is a FIXED POINT rather than a self-reference: stamping
+// cannot change the digest that produced it. Identical to `stampImageUuid`'s
+// arrangement in the Mach-O walker, which is the precedent this follows.
+void stampBuildIdNote(std::vector<std::uint8_t>& bytes,
+                      std::size_t                noteOffset) {
+    auto const digest = dss::crypto::sha256(
+        std::span<std::uint8_t const>{bytes.data(), bytes.size()});
+    std::size_t const descAt = noteOffset + kBuildIdDescOffset;
+    for (std::size_t i = 0; i < kBuildIdDescBytes; ++i) {
+        bytes[descAt + i] = digest[i];
+    }
 }
 
 void writeSectionHeader(std::vector<std::uint8_t>& out, SectionHeader const& h) {
@@ -1187,6 +1315,28 @@ encodeElfExecDynamic(
     // (D-CSUBSET-THREAD-LOCAL: `.tdata` right before `.data` matches the
     // file layout — its bytes physically open PT_LOAD #2; `.tbss` (NOBITS,
     // no file bytes) sits beside its template, the gcc pairing.)
+    // ── `.note.gnu.build-id` (D-LK-ELF-EMITS-NO-BUILD-ID-NOTE) ───────────
+    //
+    // The DYNAMIC arm emits the same content-derived identity the static arm
+    // does, from the SAME declared `note` row and the SAME body builder. It has
+    // to: `elf::encode` routes a format to THIS walker the moment the module
+    // carries an extern import, so a document whose freestanding programs got a
+    // build id and whose libc-using ones did not would be one document with two
+    // behaviours — the silent-inconsistency class, not a scope boundary.
+    //
+    // ⚠ THE HEADER GOES LAST, AFTER `.shstrtab`, WHILE THE BYTES GO INSIDE
+    // PT_LOAD #1. Appending the row leaves every `IDX_*` and `e_shstrndx`
+    // exactly where they were, so an image whose format declares no note row is
+    // byte-identical to before; ELF does not require section headers to be in
+    // address order, and this table already is not (`.symtab` and friends carry
+    // sh_addr 0 ahead of nothing).
+    auto const* secNoteDyn = fmt.sectionByKind(SectionKind::Note);
+    bool const hasBuildIdDyn = (secNoteDyn != nullptr);
+    std::vector<std::uint8_t> const buildIdNoteDyn =
+        hasBuildIdDyn ? makeBuildIdNoteBody() : std::vector<std::uint8_t>{};
+    std::uint64_t const buildIdAlignDyn =
+        hasBuildIdDyn ? std::max<std::uint64_t>(secNoteDyn->addrAlign, 1u) : 1u;
+
     std::uint16_t idxCursor = 0;
     auto nextIdx = [&]() { return idxCursor++; };
     std::uint16_t const IDX_NULL   = nextIdx();  (void)IDX_NULL;
@@ -1239,6 +1389,11 @@ encodeElfExecDynamic(
     std::uint16_t const IDX_SYMTAB = nextIdx();  (void)IDX_SYMTAB;
     std::uint16_t const IDX_STRTAB = nextIdx();
     std::uint16_t const IDX_SHSTRTAB = nextIdx();
+    // `.note.gnu.build-id` LAST — see the declaration above for why the header
+    // is appended here while its bytes live in PT_LOAD #1.
+    std::uint16_t const IDX_NOTE =
+        hasBuildIdDyn ? nextIdx() : std::uint16_t{0};
+    (void)IDX_NOTE;
     std::uint16_t const kNumSections = idxCursor;
 
     // ── (b.7) ET_DYN export set (c150, D-LK1-4) ─────────────────
@@ -1416,6 +1571,50 @@ encodeElfExecDynamic(
         appendDynsymEntry(ex.nameOff, ex.info, SHN_UNDEF, 0, ex.size);
     }
 
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING — the STATIC-INITIALIZER
+    // half of the ADDRESS residual, and the ONE table that carries it.
+    //
+    // A data slot initialized with the address of one of THIS artifact's own
+    // PREEMPTIBLE definitions must be filled by the LOADER, not baked here. The
+    // apply below writes S + A into the slot and the RELATIVE row makes the
+    // loader add the slide — which materializes THIS image's body for a name the
+    // loader may resolve elsewhere. The lowering already routes the CODE form of
+    // the same address through a loader-resolved slot, so leaving the
+    // INITIALIZER form baked gives ONE identifier TWO addresses INSIDE ONE
+    // ARTIFACT: `tbl[0] == code_w()` answers FALSE inside the library that wrote
+    // both, a C 6.2.2p2 identity break nothing diagnoses. ✔MEASURED exactly
+    // that, on a real loader, before this map existed.
+    //
+    // The row emitted instead is gcc's and clang's shape, MEASURED in one `.so`
+    // from one source with the `static` sibling as the in-object CONTROL:
+    // `R_X86_64_64 w + 0` / `R_X86_64_64 st + 0` over a ZEROED slot for the two
+    // preemptible entries, and a bare `R_X86_64_RELATIVE` left alone for the
+    // `static` one. The index named is the DEFINED EXPORT's — the same entry
+    // whose `st_value` this image publishes — so ld.so's global-scope lookup
+    // decides the winner exactly as it does for the code form.
+    //
+    // WHICH definitions qualify is NOT decided here: `collectPreemptibleDefinitions`
+    // asks the ONE owner (`definitionIsPreemptible`) against this format's
+    // DECLARED `preemptibleDefinitionBindings`. Absent (every exec / PIE
+    // flavour, every relocatable, every PE) ⇒ an EMPTY set ⇒ this map is empty
+    // and every byte below is unchanged. On a non-dyn flavour `dynExports` is
+    // empty as well, so the map is empty from both directions.
+    //
+    // The value is the index into `dynExports` (never a pointer into it, and
+    // never a copied name): the row's `.dynsym` index and its name both come
+    // from the ONE export record, so they cannot disagree.
+    std::unordered_map<SymbolId, std::size_t> preemptibleDefExportIdx;
+    {
+        std::unordered_set<SymbolId> const preemptibleDefs =
+            link::format::collectPreemptibleDefinitions(
+                module, fmt.preemptibleDefinitionBindings());
+        preemptibleDefExportIdx.reserve(preemptibleDefs.size());
+        for (std::size_t i = 0; i < dynExports.size(); ++i) {
+            if (!preemptibleDefs.contains(dynExports[i].sym)) continue;
+            preemptibleDefExportIdx.emplace(dynExports[i].sym, i);
+        }
+    }
+
     // ── (f) .hash body (DT_HASH single-bucket)
     //
     // ONE bucket whose chain threads EVERY dynsym entry (imports AND
@@ -1561,10 +1760,17 @@ encodeElfExecDynamic(
     // to the layout's max item alignment (gABI sh_addralign). Empty when
     // the module has no rodata → zero-size section, `.plt` follows `.text`
     // directly (byte-identical to the pre-rodata image).
+    //
+    // The alignment is applied to the ADDRESS and the file offset derived from
+    // it (`imageOffsetForAlignedVa`), not the other way round: `baseImageVa` is
+    // only `pageAlign`-aligned, so aligning the OFFSET would satisfy any
+    // stronger request — an over-aligned `const` object — only by the accident
+    // of the base. See the helper for the measurement.
     std::uint64_t const rodataAlignDyn =
         hasRodataDyn ? rodataDynLayout.maxAlign : 1;
     std::uint64_t const rodataOff =
-        hasRodataDyn ? alignUp(textOff + text.size(), rodataAlignDyn)
+        hasRodataDyn ? link::format::imageOffsetForAlignedVa(
+                           baseImageVa, textOff + text.size(), rodataAlignDyn)
                      : textOff + text.size();
     std::uint64_t const rodataVa  = baseImageVa + rodataOff;
     std::uint64_t const rodataSz  = rodataDyn.size();
@@ -1581,17 +1787,15 @@ encodeElfExecDynamic(
     // `.dynsym` exactly as `.symtab`'s is, and then VERIFIED with the same
     // predicate — the two tables share Elf64_Sym's layout and the gABI's
     // local-before-global rule, so they get one implementation, not two.
-    // It was the literal `1` until this cycle: true today (only STN_UNDEF is
-    // local) and the last boundary constant of exactly the class this change
-    // set out to derive, sitting outside the `.symtab` checker's reach.
-    std::uint32_t firstNonLocalDynsymIdx =
-        static_cast<std::uint32_t>(dynsym.size() / 24);
-    for (std::size_t i = 0; i < dynsym.size() / 24; ++i) {
-        if ((dynsym[i * 24 + 4] >> 4) != STB_LOCAL) {
-            firstNonLocalDynsymIdx = static_cast<std::uint32_t>(i);
-            break;
-        }
-    }
+    // It was the literal `1` until D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB
+    // derived it: true today (only STN_UNDEF is local) and the last boundary
+    // constant of exactly the class that change set out to derive, sitting
+    // outside the `.symtab` checker's reach. The scan it grew here is now the
+    // SHARED `elfSymtabFirstNonLocal`, so this is one implementation rather
+    // than a third open-coded copy
+    // (D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL).
+    std::uint32_t const firstNonLocalDynsymIdx =
+        link::format::elfSymtabFirstNonLocal(dynsym);
     if (std::string const breach = link::format::elfSymtabPartitionBreach(
             dynsym, firstNonLocalDynsymIdx);
         !breach.empty()) {
@@ -1657,7 +1861,7 @@ encodeElfExecDynamic(
     // stores a pointer ONE INDIRECTION OFF — ✔MEASURED as a SILENT
     // miscompile (`static = 0x403240` = the slot; `runtime = 0x7f..d58` = the
     // object) before this counter existed.
-    // The ET_DYN arm already solved it (its `externAddrBySlotVa` fold below
+    // The ET_DYN arm already solved it (its `loaderResolvedSlotByVa` fold below
     // emits a SYMBOL-BASED absolute reloc and ZEROES the slot, letting ld.so
     // write the real address — gcc's own PIE shape, `R_X86_64_64 environ`).
     // The exec arm gets the SAME rows; the PREDICATE is stated as a reason, not
@@ -1673,8 +1877,27 @@ encodeElfExecDynamic(
     for (std::size_t i = 0; i < numExterns; ++i) {
         externIdxBySym.emplace(module.externImports[i].symbol, i);
     }
+    // ★★ TWO REASONS a data slot needs a SYMBOL-based row instead of the
+    // baked/RELATIVE path, stated as reasons rather than flavours:
+    //
+    //  (1) the target is an EXTERN whose address is not a link-time constant in
+    //      THIS image — always for a DATA import (got-indirect binds at load),
+    //      and for any extern in a SLID image (a base-relative stub VA cannot be
+    //      baked absolutely);
+    //  (2) the target is one of THIS artifact's own PREEMPTIBLE DEFINITIONS
+    //      (D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING, the
+    //      static-initializer half) — this image HAS a link-time address for it,
+    //      and using it is precisely the defect: the loader may resolve the name
+    //      to another image's definition, and the code form of the same address
+    //      already goes through the loader. `preemptibleDefExportIdx` is empty
+    //      unless the format DECLARES the binding set, so this arm adds nothing
+    //      to any format that does not.
+    //
+    // The two are mutually exclusive by construction: an extern SymbolId that
+    // collided with an intra-module definition is refused above.
     auto const dataItemRelocNeedsSymbolRow =
         [&](Relocation const& rel) -> bool {
+        if (preemptibleDefExportIdx.contains(rel.target)) return true;
         auto const it = externIdxBySym.find(rel.target);
         if (it == externIdxBySym.end()) return false;        // internal target
         return isDyn || module.externImports[it->second].isData;
@@ -1702,7 +1925,14 @@ encodeElfExecDynamic(
         hasEhFrame ? alignUp(ehFrameOff + ehFrameSz, 4) : ehFrameOff;
     std::uint64_t const ehFrameHdrVa = baseImageVa + ehFrameHdrOff;
 
-    std::uint64_t const ptLoad1End = ehFrameHdrOff + ehFrameHdrSz;
+    // `.note.gnu.build-id` closes PT_LOAD #1 when the format declares it — it is
+    // SHF_ALLOC and read-only, so it belongs in the same segment `.rodata` and
+    // the unwind tables do (D-LK-ELF-EMITS-NO-BUILD-ID-NOTE).
+    std::uint64_t const noteOffDyn =
+        hasBuildIdDyn ? alignUp(ehFrameHdrOff + ehFrameHdrSz, buildIdAlignDyn)
+                      : (ehFrameHdrOff + ehFrameHdrSz);
+    std::uint64_t const noteVaDyn = baseImageVa + noteOffDyn;
+    std::uint64_t const ptLoad1End = noteOffDyn + buildIdNoteDyn.size();
 
     // PT_LOAD #2 (R+W) — page-aligned in both file + VA. Holds the WRITABLE
     // sections: `.data` (file-backed, mutable initialized globals —
@@ -1730,11 +1960,19 @@ encodeElfExecDynamic(
     // alignments (each layout.maxAlign already folds its schema floor).
     // HIGH-1(b): glibc computes each thread's block base as an
     // alignUp(..., p_align)-adjusted address — the link-time tpoffs
-    // below are only valid when tdataVa ≡ 0 (mod tlsAlign). tdataOff is
-    // alignUp(page-aligned ptLoad2Start, tlsAlign), so that holds
-    // whenever tlsAlign ≤ pageAlign; a stricter-than-page TLS alignment
-    // has no shipped producer (alignas caps at 256) but would silently
-    // break the congruence — fail loud instead.
+    // below are only valid when tdataVa ≡ 0 (mod tlsAlign). `tdataOff`
+    // is chosen ADDRESS-FIRST (`imageOffsetForAlignedVa`), so that holds
+    // for any tlsAlign; the refusal below stays because PT_LOAD #2's
+    // p_align is `pageAlign`, and a TLS block asking for more than the
+    // segment's own mapping granularity is a promise this image cannot
+    // keep. A stricter-than-page TLS alignment has no shipped producer
+    // (alignas caps at 256) — fail loud rather than emit it.
+    // ⚠ The earlier form of this note reasoned that `alignUp` on the
+    // page-aligned `ptLoad2Start` was sufficient. It was — but only
+    // because `baseImageVa` is itself pageAlign-aligned, which is the
+    // unstated premise that placed `.data` 4096 bytes off its requested
+    // 8192 boundary on `elf64-aarch64-linux-exec`
+    // (D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET).
     std::uint64_t tlsAlignAcc = 1;
     if (hasTdataDyn) tlsAlignAcc = std::max(tlsAlignAcc, tdataDynLayout.maxAlign);
     if (hasTbssDyn)  tlsAlignAcc = std::max(tlsAlignAcc, tbssDynLayout.maxAlign);
@@ -1753,7 +1991,9 @@ encodeElfExecDynamic(
         return {};
     }
     std::uint64_t const tdataOff =
-        hasTls ? alignUp(ptLoad2Start, tlsAlign) : ptLoad2Start;
+        hasTls ? link::format::imageOffsetForAlignedVa(baseImageVa,
+                                                       ptLoad2Start, tlsAlign)
+               : ptLoad2Start;
     std::uint64_t const tdataVa   = baseImageVa + tdataOff;
     std::uint64_t const tdataSpan = tdataDynLayout.spanSize;  // 0 if none
     // The per-thread block: tdata template bytes, then the tbss zero-fill
@@ -1777,8 +2017,16 @@ encodeElfExecDynamic(
         hasTls ? tdataOff + tdataSpan : ptLoad2Start;
     std::uint64_t const dataAlignDyn =
         hasDataDyn ? dataDynLayout.maxAlign : 1;
+    // ★ ADDRESS-FIRST (D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET).
+    // `.bss` two blocks down aligns its VA directly and was always right; `.data`
+    // aligned its FILE OFFSET and inherited whatever alignment `baseImageVa`
+    // happened to have. That asymmetry — same image, same walker, one section
+    // right and one wrong — is the whole defect, and closing it means the two
+    // now decide the same thing the same way.
     std::uint64_t const dataOff =
-        hasDataDyn ? alignUp(rwFileCursor, dataAlignDyn) : rwFileCursor;
+        hasDataDyn ? link::format::imageOffsetForAlignedVa(
+                         baseImageVa, rwFileCursor, dataAlignDyn)
+                   : rwFileCursor;
     std::uint64_t const dataVa  = baseImageVa + dataOff;
     std::uint64_t const dataSz  = dataDynLayout.spanSize;
 
@@ -1955,19 +2203,26 @@ encodeElfExecDynamic(
     // Non-loaded .symtab / .strtab / .shstrtab + SHT.
     std::vector<std::uint8_t> symtab;
     StringTable strtab;
+    // `other` is st_other (the VISIBILITY axis, gABI 4.18) — a PARAMETER, not
+    // a hardcoded 0, since D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL:
+    // a hidden symbol is STB_GLOBAL + STV_HIDDEN, so the record cannot state
+    // its linkage without both fields. The ET_REL writer's `appendSym` has
+    // carried an `other` parameter all along; this arm hardcoding 0 beside it
+    // is the same one-writer-knows-better drift `stbForBinding` exists to stop.
     auto appendSymtabEntry = [&](std::uint32_t nameOff,
                                   std::uint8_t info,
+                                  std::uint8_t other,
                                   std::uint16_t shndx,
                                   std::uint64_t value,
                                   std::uint64_t size) {
         appendU32LE(symtab, nameOff);
         appendU8(symtab, info);
-        appendU8(symtab, 0);
+        appendU8(symtab, other);
         appendU16LE(symtab, shndx);
         appendU64LE(symtab, value);
         appendU64LE(symtab, size);
     };
-    appendSymtabEntry(0, 0, 0, 0, 0);                  // STN_UNDEF
+    appendSymtabEntry(0, 0, 0, 0, 0, 0);               // STN_UNDEF
     // shndx = IDX_TEXT (c150 — computed, not the pre-dyn literal 2:
     // the ET_DYN image has no `.interp`, shifting `.text` to 1).
     // st_value = `.text`'s LOAD ADDRESS, not 0. gABI 4.18 makes st_value a
@@ -1985,17 +2240,8 @@ encodeElfExecDynamic(
     // address is a lie is not. The row is kept because the ET_REL arm needs it
     // at a fixed index (`kTextSectionSymIdx`, every `.rela.eh_frame` FDE names
     // it) and one shape across both arms is what keeps that index honest.
-    appendSymtabEntry(0, makeStInfo(STB_LOCAL, STT_SECTION),
+    appendSymtabEntry(0, makeStInfo(STB_LOCAL, STT_SECTION), STV_DEFAULT,
                       IDX_TEXT, textVa, 0);
-    // `.symtab.sh_info` = the first non-LOCAL index = the count of the LOCAL
-    // prefix. DERIVED from the bytes just emitted rather than written as a
-    // literal `2`: every symbol appended below is non-local, so the two are
-    // equal today, but a literal encodes an assumption about the emission
-    // ABOVE it that nothing rechecks — and this arm is where the ordering
-    // hazard lives (see `elfSymtabPartitionBreach`, called once the table is
-    // complete).
-    std::uint32_t const firstNonLocal =
-        static_cast<std::uint32_t>(symtab.size() / 24);
     // Real DECLARED function names in the FINAL IMAGE's `.symtab`, from the
     // format-neutral `module.symbols` carrier through the shared
     // `ObjectSymbolNames` owner — the SAME table the (b.7) `.dynsym` export set
@@ -2013,12 +2259,42 @@ encodeElfExecDynamic(
     // nameless — here that is the linker-injected `_start` trampoline, which is
     // functions[0] and carries no `ModuleSymbol` row. See `imageName`'s docblock.
     //
-    // ★ THE BINDING IS DELIBERATELY UNCHANGED (STB_GLOBAL for every function,
-    // which is also why the derived `firstNonLocal` above comes out at 2). gcc
-    // emits a static as STB_LOCAL, and matching that is a REAL improvement — but
-    // it would move statics into a local-first prefix, so it is its own change
-    // with its own witness, not a silent rider on the names:
-    // D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL.
+    // ★ THE BINDING AND THE VISIBILITY ARE THE TWO FORMAT-NEUTRAL
+    // `ObjectSymbolNames` DECISIONS, mapped through this file's `stbForBinding`
+    // and `stvForVisibility` exactly as the ET_REL writer maps them — there is
+    // no ELF-private notion of "local", and the image tier differs from the
+    // object tier in the NAME it prints for a Local (`imageName` above) and in
+    // nothing else. D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL: this loop
+    // hardcoded STB_GLOBAL, so a `static` went out under its real name with a
+    // linkage that misdescribes it, and `sh_info` never moved off 2 because
+    // nothing local ever followed the section symbol.
+    // ✔MEASURED 2026-09-05 (Ubuntu 24.04, binutils 2.42) over the source shape
+    // `examples/c/macho_static_fn_image/main.c` carries (two statics reached
+    // through a const function-pointer table, beside an exported helper and
+    // `main`): gcc 13.3.0 emits `static_helper` and `other_static` as
+    // `FUNC LOCAL` on x86_64 (`.symtab` #12/#13 at -O0, #4/#5 at -O2, under
+    // `sh_info` 20) and on aarch64 (#56/#57 under 68, #42/#43 under 69), clang
+    // 18.1.3 the same (#12/#13 under 20) — while the CONTROL, the ordinary
+    // extern-linkage `global_helper`/`main` in the SAME image, stays
+    // `FUNC GLOBAL` past the boundary in every one of those runs.
+    // ★ AND `st_other` CARRIES THE SECOND AXIS
+    // (D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL): a
+    // `visibility("hidden")` function has EXTERNAL LINKAGE and stays
+    // STB_GLOBAL here, stating its invisibility to other images in STV_HIDDEN
+    // rather than by pretending to be internal-linkage. ✔MEASURED the same
+    // day, gcc AND clang, linked `-no-pie` execs on both ports at -O0 and -O2:
+    // a CALLED hidden function is `FUNC GLOBAL HIDDEN`.
+    //
+    // ★ WHY THE ORDER CHANGES WITH IT. ELF requires every STB_LOCAL symbol to
+    // PRECEDE `sh_info`, so a Local record must sort into a local-first prefix
+    // or the section header lies about where the locals end — and a
+    // mis-partitioned `.symtab` is invisible to DSS's own reader (it refuses
+    // anything but ET_REL and never consults this `sh_info`) while `ld`,
+    // `readelf`, `nm` and `gdb` all silently mis-partition. Hence two ordered
+    // passes rather than one loop, `firstNonLocal` read back off the emitted
+    // records (`elfSymtabFirstNonLocal`) rather than snapshotted between them,
+    // and `elfSymtabPartitionBreach` over the finished table as the belt.
+    // Within a band the order stays `module.functions` order.
     //
     // ── EVERY name bound to the atom, not just the canonical one ───────────
     // D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB, IMAGE tier. One
@@ -2043,24 +2319,49 @@ encodeElfExecDynamic(
     // `__attribute__((weak, alias("strong_fn")))`) needs nothing special. It is
     // emitted at the canonical's shndx / st_value / st_size — one address, one
     // extent; a zero-size alias would invite a dead-strip.
+    // ⚠ THE ALIAS ROWS BELONG TO THE NON-LOCAL PASS, NEVER BESIDE THEIR
+    // CANONICAL. `definedAliases` yields only EXTERNAL-LINKAGE rows
+    // (`hasExternalLinkage` — named, binding not Local), so every alias is
+    // Global or Weak whatever its VISIBILITY; a canonical may be Local (a
+    // `static`) while its alias is not, and emitting the alias inline would put
+    // a non-local symbol inside the local prefix. They still follow their
+    // canonical in file order, because the local pass runs first.
+    // ⚠ "External LINKAGE", not "externally visible": since
+    // D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL swapped that
+    // predicate, a Global/Weak + Hidden/Internal alias QUALIFIES where it used
+    // to be dropped — so this pass emits strictly MORE rows than it did, each
+    // stating its own visibility through `stvForVisibility(alias->visibility)`.
+    // That widening is a `.symtab` record count change, so it is pinned by the
+    // exact-sequence matrix rather than argued for here.
     link::format::ObjectSymbolNames const imgNames{module};
-    for (std::size_t i = 0; i < module.functions.size(); ++i) {
-        auto const& fn = module.functions[i];
-        std::string const name = imgNames.imageName(fn.symbol, "sym_");
-        std::uint32_t const nameOff = strtab.add(name);
-        std::uint64_t const symVa   = textVa + funcTextStart[i];
-        appendSymtabEntry(nameOff,
-                          makeStInfo(STB_GLOBAL, STT_FUNC),
-                          IDX_TEXT,
-                          symVa,
-                          fn.bytes.size());
-        for (ModuleSymbol const* alias : imgNames.definedAliases(fn.symbol)) {
-            appendSymtabEntry(strtab.add(alias->name),
-                              makeStInfo(stbForBinding(alias->binding),
-                                         STT_FUNC),
-                              IDX_TEXT, symVa, fn.bytes.size());
+    for (bool const localPass : {true, false}) {
+        for (std::size_t i = 0; i < module.functions.size(); ++i) {
+            auto const&         fn      = module.functions[i];
+            std::uint64_t const symVa   = textVa + funcTextStart[i];
+            SymbolBinding const binding = imgNames.definedBinding(fn.symbol);
+            if ((binding == SymbolBinding::Local) == localPass) {
+                appendSymtabEntry(
+                    strtab.add(imgNames.imageName(fn.symbol, "sym_")),
+                    makeStInfo(stbForBinding(binding), STT_FUNC),
+                    stvForVisibility(imgNames.definedVisibility(fn.symbol)),
+                    IDX_TEXT, symVa, fn.bytes.size());
+            }
+            if (localPass) continue;
+            for (ModuleSymbol const* alias : imgNames.definedAliases(fn.symbol)) {
+                appendSymtabEntry(strtab.add(alias->name),
+                                  makeStInfo(stbForBinding(alias->binding),
+                                             STT_FUNC),
+                                  stvForVisibility(alias->visibility),
+                                  IDX_TEXT, symVa, fn.bytes.size());
+            }
         }
     }
+    // `.symtab.sh_info` = the first non-LOCAL index = the length of the LOCAL
+    // prefix, read back off the records this table actually holds rather than
+    // snapshotted from where the local pass ended — see
+    // `elfSymtabFirstNonLocal`.
+    std::uint32_t const firstNonLocal =
+        link::format::elfSymtabFirstNonLocal(symtab);
     // The finished partition, checked rather than assumed — see
     // `elfSymtabPartitionBreach`. The alias pass above is the one emission here
     // that is not driven by a binding-ordered walk, so this is where a future
@@ -2073,7 +2374,8 @@ encodeElfExecDynamic(
              "is malformed — " + breach
                  + ". ELF requires every STB_LOCAL symbol to precede sh_info; "
                    "emitting this image would silently mis-partition in ld, "
-                   "readelf, nm and gdb.");
+                   "readelf, nm and gdb "
+                   "(D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL).");
         return {};
     }
 
@@ -2132,6 +2434,11 @@ encodeElfExecDynamic(
     auto const shsSymtab   = shstrtab.add(".symtab");
     auto const shsStrtab   = shstrtab.add(".strtab");
     auto const shsShStrtab = shstrtab.add(".shstrtab");
+    // Added ONLY when the format declares the row, so an image without one
+    // keeps its `.shstrtab` byte-for-byte (the same discipline `.gnu.version`
+    // follows two adds up).
+    std::uint32_t const shsNoteDyn =
+        hasBuildIdDyn ? shstrtab.add(std::string{secNoteDyn->name}) : 0u;
 
     std::uint64_t const symtabOff = alignUp(ptLoad2End, 8);
     std::uint64_t const symtabSz  = symtab.size();
@@ -2284,6 +2591,30 @@ encodeElfExecDynamic(
                  "silently bypass dyld resolution.");
             return {};
         }
+        // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING (the ADDRESS
+        // half): an import may carry a SECOND symbol naming the slot that
+        // holds its loader-resolved ADDRESS. Its VA is the GOT slot this
+        // writer already mints for the import — the one `.rela.dyn` fills
+        // with `R_*_GLOB_DAT` — so the answer is the SAME expression the
+        // data arm above uses, and NO new section, slot or relocation is
+        // created. It exists because the FUNCTION arm's `symbolVa` is the
+        // PLT STUB: correct for a call, and not the function's address.
+        // (A data import's own VA already IS the slot, so a slot symbol on
+        // one is redundant rather than wrong, and lands on the same VA.)
+        SymbolId const slotSym = module.externImports[i].addressSlotSymbol;
+        if (slotSym.valid()) {
+            std::uint64_t const slotVa = gotVa + gotSlotIndexFor(i) * 8;
+            if (!symbolVa.emplace(slotSym, slotVa).second) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::string{"elf::encodeElfExecDynamic: the address "
+                                 "slot symbol #"} +
+                     std::to_string(slotSym.v) + " of extern '" +
+                     module.externImports[i].mangledName +
+                     "' collides with another symbol's VA — the slot names "
+                     "one loader-resolved address and cannot be shared.");
+                return {};
+            }
+        }
     }
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols (the `&&label`
     // block-address `lea`s) get their interior-block VAs before relocation
@@ -2420,7 +2751,19 @@ encodeElfExecDynamic(
     // invariant below is unchanged. The abs64 native id comes from the
     // reloc's own format row (machine-agnostic — R_AARCH64_ABS64 on an
     // aarch64 dyn schema).
-    struct ExternAddrSite {
+    //
+    // ★★ AND THE SECOND REASON, WHICH IS WHY THIS IS NOT AN "extern" TABLE:
+    // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING's static-initializer half.
+    // A slot naming one of THIS artifact's PREEMPTIBLE DEFINITIONS takes the
+    // very same row — a symbol-based absolute reloc over a zeroed slot — for a
+    // DIFFERENT reason: this image HAS a link-time address for the name and
+    // must not use it, because the loader may award the name to another image.
+    // Both reasons produce ONE shape, so they share ONE site record; the
+    // predicate above states which reason admitted a given site, and the
+    // collection below picks the `.dynsym` entry each reason names (the UNDEF
+    // import row for an extern, this image's own DEFINED export row for a
+    // preemptible definition — gcc's and clang's choice, MEASURED).
+    struct LoaderResolvedSlotSite {
         std::uint32_t dynsymIdx = 0;
         std::uint32_t nativeId  = 0;
         std::int64_t  addend    = 0;
@@ -2429,7 +2772,8 @@ encodeElfExecDynamic(
     // `dataItemRelocNeedsSymbolRow` above states WHY a site qualifies), because
     // the exec arm needs exactly these rows for its extern-DATA sites since the
     // copy-relocation deletion — see the sizing comment at `relaDynSz`.
-    std::unordered_map<std::uint64_t, ExternAddrSite> externAddrBySlotVa;
+    std::unordered_map<std::uint64_t, LoaderResolvedSlotSite>
+        loaderResolvedSlotByVa;
     // ★ AND THE SAME SITES IN LAYOUT ORDER. The dyn arm emits by walking
     // `relativeSiteVas` (a vector) and LOOKING UP the map, so its row order is
     // deterministic; the exec arm has no such vector and must not iterate the
@@ -2437,39 +2781,59 @@ encodeElfExecDynamic(
     // runs of the same input, i.e. a non-reproducible image. This vector is
     // filled in data-item/relocation order, the same walk the layout-time
     // counter above uses, so sizing and emission agree by construction.
-    std::vector<std::pair<std::uint64_t, ExternAddrSite>> externAddrSitesInOrder;
+    std::vector<std::pair<std::uint64_t, LoaderResolvedSlotSite>>
+        loaderResolvedSlotsInOrder;
     if (hasDataDyn) {
         for (std::size_t j = 0; j < dataDynLayout.itemIndices.size(); ++j) {
             AssembledData const& di =
                 module.dataItems[dataDynLayout.itemIndices[j]];
             for (auto const& rel : di.relocations) {
                 if (!dataItemRelocNeedsSymbolRow(rel)) continue;
-                std::size_t const extIdx = externIdxBySym.at(rel.target);
+                // Which `.dynsym` entry the row must name, and under which of
+                // the predicate's two reasons. A PREEMPTIBLE DEFINITION names
+                // its own DEFINED export entry (gcc's and clang's shape); an
+                // EXTERN names its UNDEF import entry.
+                auto const preemptIt = preemptibleDefExportIdx.find(rel.target);
+                bool const targetIsPreemptibleDef =
+                    preemptIt != preemptibleDefExportIdx.end();
+                std::uint32_t          rowDynsymIdx = 0;
+                std::string_view       rowName;
+                if (targetIsPreemptibleDef) {
+                    rowDynsymIdx = dynExports[preemptIt->second].dynsymIdx;
+                    rowName      = dynExports[preemptIt->second].name;
+                } else {
+                    std::size_t const extIdx = externIdxBySym.at(rel.target);
+                    rowDynsymIdx = dynsymIdx[extIdx];
+                    rowName      = module.externImports[extIdx].mangledName;
+                }
                 auto const* fmtReloc = fmt.relocationByKind(rel.kind);
                 if (fmtReloc == nullptr) {
                     emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                          std::format(
                              "elf::encodeElfExecDynamic: data-item "
-                             "relocation kind {} targeting extern '{}' is not "
+                             "relocation kind {} targeting {} '{}' is not "
                              "declared by object format '{}' - cannot emit "
                              "the symbol-based absolute reloc.",
                              rel.kind.v,
-                             module.externImports[extIdx].mangledName,
-                             fmt.name()));
+                             targetIsPreemptibleDef ? "preemptible definition"
+                                                    : "extern",
+                             rowName, fmt.name()));
                     return {};
                 }
                 std::uint64_t const slotVa = dataVa
                     + dataDynLayout.itemOffsets[j]
                     + static_cast<std::uint64_t>(rel.offset);
-                ExternAddrSite const site{dynsymIdx[extIdx],
-                                          fmtReloc->nativeId, rel.addend};
+                LoaderResolvedSlotSite const site{
+                    rowDynsymIdx, fmtReloc->nativeId, rel.addend};
                 auto const [it, inserted] =
-                    externAddrBySlotVa.insert_or_assign(slotVa, site);
+                    loaderResolvedSlotByVa.insert_or_assign(slotVa, site);
                 (void)it;
                 // Two relocations naming the SAME slot would otherwise emit two
                 // rows for one 8 bytes while the map kept one — the count
                 // cross-check below would catch it, but say why here.
-                if (inserted) externAddrSitesInOrder.emplace_back(slotVa, site);
+                if (inserted) {
+                    loaderResolvedSlotsInOrder.emplace_back(slotVa, site);
+                }
             }
         }
     }
@@ -2485,6 +2849,27 @@ encodeElfExecDynamic(
             for (auto const& rel :
                  module.dataItems[rodataDynLayout.itemIndices[j]].relocations) {
                 if (!dataItemRelocNeedsSymbolRow(rel)) continue;
+                // The predicate's OTHER reason (a preemptible definition of
+                // this artifact) cannot reach here: this arm is `!isDyn`, where
+                // `dynExports` is empty and so `preemptibleDefExportIdx` is
+                // empty too. Named rather than assumed — reading the extern
+                // table for a non-extern target would THROW, and the guard
+                // below turns that into a loud diagnostic if the invariant ever
+                // moves.
+                auto const rodataExtIt = externIdxBySym.find(rel.target);
+                if (rodataExtIt == externIdxBySym.end()) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format(
+                             "elf::encodeElfExecDynamic: a READ-ONLY "
+                             "(`.rodata`) data item holds a load-time-resolved "
+                             "address for symbol #{}, which is not an extern "
+                             "import -- a preemptible DEFINITION reached the "
+                             "exec-flavour read-only path, where this image "
+                             "publishes no dynamic export to name. "
+                             "D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING.",
+                             rel.target.v));
+                    return {};
+                }
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                      std::format(
                          "elf::encodeElfExecDynamic: a READ-ONLY (`.rodata`) "
@@ -2499,7 +2884,7 @@ encodeElfExecDynamic(
                          "WRITABLE storage (drop a `const`, or let it be "
                          "relro) so the loader can fix it up. "
                          "D-LK-ELF-COPY-RELOC-CLAIMS-ONE-NAME-OF-AN-ALIAS-SET.",
-                         module.externImports[externIdxBySym.at(rel.target)]
+                         module.externImports[rodataExtIt->second]
                              .mangledName));
                 return {};
             }
@@ -2520,18 +2905,22 @@ encodeElfExecDynamic(
         }
         for (std::uint64_t const siteVa : relativeSiteVas) {
             std::uint64_t const slotOff = siteVa - dataVa;
-            // Extern-targeted slot: symbol-based row + zeroed slot (the
-            // apply's slot/stub VA is UNDONE — the review-fold above).
-            if (auto const extSite = externAddrBySlotVa.find(siteVa);
-                extSite != externAddrBySlotVa.end()) {
+            // A slot the LOADER must fill — an extern, or one of this
+            // artifact's own preemptible definitions: symbol-based row over a
+            // ZEROED slot, undoing the apply's baked value (the review-fold
+            // above states both reasons). The `static`/hidden sibling of a
+            // preemptible definition never lands here, so it keeps the RELATIVE
+            // row below — the in-object CONTROL both references emit.
+            if (auto const loaderSite = loaderResolvedSlotByVa.find(siteVa);
+                loaderSite != loaderResolvedSlotByVa.end()) {
                 for (int b = 0; b < 8; ++b) {
                     dataDynLayout.bytes[static_cast<std::size_t>(
                         slotOff + static_cast<std::uint64_t>(b))] = 0;
                 }
                 appendU64LE(relaDyn, siteVa);
-                appendU64LE(relaDyn, makeRelaInfo(extSite->second.dynsymIdx,
-                                                  extSite->second.nativeId));
-                appendI64LE(relaDyn, extSite->second.addend);
+                appendU64LE(relaDyn, makeRelaInfo(loaderSite->second.dynsymIdx,
+                                                  loaderSite->second.nativeId));
+                appendI64LE(relaDyn, loaderSite->second.addend);
                 continue;
             }
             std::uint64_t addend = 0;
@@ -2557,7 +2946,7 @@ encodeElfExecDynamic(
         // was counted but not emitted (or vice versa) cannot slip through as a
         // wrong DT_RELASZ.
         std::size_t emitted = 0;
-        for (auto const& [siteVa, site] : externAddrSitesInOrder) {
+        for (auto const& [siteVa, site] : loaderResolvedSlotsInOrder) {
             std::uint64_t const slotOff = siteVa - dataVa;
             for (int b = 0; b < 8; ++b) {
                 dataDynLayout.bytes[static_cast<std::size_t>(
@@ -2704,10 +3093,25 @@ encodeElfExecDynamic(
         appendPhdrEntry(PT_INTERP,  PF_R,        interpOff,    interpVa,
                         interp.size(), interp.size(), 1);
     }
+    // The LOAD-TIME half of
+    // D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET: a
+    // PT_LOAD's `p_align` is the granularity the loader slides a base-relative
+    // image on, so it must cover the strongest member the segment maps or an
+    // over-aligned object loses at LOAD what the placement above got right.
+    // The rule (and the measurement behind it) lives in the shared
+    // `segmentAlignForImageBase` — ONE owner, because this walker and the
+    // static one below would otherwise drift about what a segment claims.
+    auto segmentAlign = [&](std::uint64_t strongestMember) {
+        return link::format::segmentAlignForImageBase(baseImageVa, pageAlign,
+                                                      strongestMember);
+    };
     // PT_LOAD #1 R+X — Ehdr + PHT + [.interp] + .text + .plt + .dynsym
     //                  + .dynstr + .hash + .rela.dyn
     appendPhdrEntry(PT_LOAD,    PF_X | PF_R, 0,            baseImageVa,
-                    ptLoad1End,    ptLoad1End,    pageAlign);
+                    ptLoad1End,    ptLoad1End,
+                    segmentAlign(std::max({secText.addrAlign,
+                                           rodataAlignDyn,
+                                           buildIdAlignDyn})));
     // PT_LOAD #2 R+W — [.tdata] + [.data] + .got + .dynamic + [.bss].
     // p_filesz covers the file-backed sections (INCLUDING the `.tdata`
     // template bytes at the segment head — they must be mapped for the
@@ -2717,7 +3121,9 @@ encodeElfExecDynamic(
     // the per-thread copies live in loader-allocated TLS blocks
     // sized by PT_TLS p_memsz, not in this segment). D-LK4-DATA-PRODUCER.
     appendPhdrEntry(PT_LOAD,    PF_W | PF_R, ptLoad2Start, ptLoad2VaStart,
-                    ptLoad2FileSize, ptLoad2MemSize, pageAlign);
+                    ptLoad2FileSize, ptLoad2MemSize,
+                    segmentAlign(std::max({tlsAlign, dataAlignDyn,
+                                           bssAlignDyn, kGotSlotBytes})));
     appendPhdrEntry(PT_DYNAMIC, PF_W | PF_R, dynamicOff,   dynamicVa,
                     dynamicSz,     dynamicSz,     8);
     // PT_TLS (D-CSUBSET-THREAD-LOCAL, audit fold HIGH-2) — present ONLY
@@ -2767,6 +3173,9 @@ encodeElfExecDynamic(
     if (hasEhFrame) {
         padToOffset(bytes, ehFrameOff);    appendBytes(bytes, ehFrameOpt->bytes);
         padToOffset(bytes, ehFrameHdrOff); appendBytes(bytes, ehFrameHdr);
+    }
+    if (hasBuildIdDyn) {
+        padToOffset(bytes, noteOffDyn);   appendBytes(bytes, buildIdNoteDyn);
     }
     padToOffset(bytes, ptLoad2Start);                                // PT_LOAD #2 boundary
     // `.tdata` (thread-local template) opens PT_LOAD #2 (D-CSUBSET-THREAD-LOCAL)
@@ -2949,6 +3358,18 @@ encodeElfExecDynamic(
     writeSectionHeader(bytes, SectionHeader{
         .name_offset = shsShStrtab, .type = SHT_STRTAB,
         .offset = shstrtabOff, .size = shstrtabSz, .addr_align = 1});
+    // `.note.gnu.build-id` (D-LK-ELF-EMITS-NO-BUILD-ID-NOTE) — sh_type /
+    // sh_flags / sh_addralign come from the DECLARED row, never hardcoded here,
+    // so the document that decides the note exists also decides how it is
+    // mapped.
+    if (hasBuildIdDyn) {
+        writeSectionHeader(bytes, SectionHeader{
+            .name_offset = shsNoteDyn, .type = secNoteDyn->type,
+            .flags = secNoteDyn->flags, .addr = noteVaDyn,
+            .offset = noteOffDyn, .size = buildIdNoteDyn.size(),
+            .addr_align = secNoteDyn->addrAlign,
+            .entry_size = secNoteDyn->entrySize});
+    }
 
     // ── (p) Fill in Elf64_Ehdr ─────────────────────────────────
     //
@@ -3003,6 +3424,13 @@ encodeElfExecDynamic(
     appendU16LE(ehdr, kNumSections);
     appendU16LE(ehdr, IDX_SHSTRTAB);
     std::memcpy(bytes.data(), ehdr.data(), kEhdrSize);
+
+    // D-LK-ELF-EMITS-NO-BUILD-ID-NOTE: derive the identity from the FINISHED
+    // image, after the Ehdr is written back, so nothing the loader maps is
+    // outside what the id covers.
+    if (hasBuildIdDyn) {
+        stampBuildIdNote(bytes, static_cast<std::size_t>(noteOffDyn));
+    }
 
     return bytes;
 }
@@ -3396,7 +3824,18 @@ encode(AssembledModule const&    module,
     // executable carries stack policy in a PT_GNU_STACK program header, not a
     // section). `secNote` may be null; the peek never fails loud.
     auto const* secNote = fmt.sectionByKind(SectionKind::Note);
-    bool const hasNote  = !isExec && (secNote != nullptr);
+    // D-LK-ELF-EMITS-NO-BUILD-ID-NOTE: the SAME declared `note` row carries a
+    // DIFFERENT note per artifact flavour, which is why this is one row and not
+    // two. An ET_REL object's note is the EMPTY `.note.GNU-stack` marker above;
+    // an IMAGE's is `.note.gnu.build-id`, a content-derived identity a debugger,
+    // a core dump and debuginfod key on — and neither flavour wants the other's.
+    // ✔MEASURED 2026-09-07 (WSL Ubuntu 24.04): `gcc -c` and `clang -c` emit NO
+    // build-id note on a `.o` (0 in both), while `gcc`/`clang` at DEFAULT flags
+    // emit one on every exec and `.so`. Still SCHEMA-DRIVEN + graceful: a format
+    // that declares no `note` row emits neither, which is the `--build-id=none`
+    // arm of the reference (the CONTROL that proves presence is per-link POLICY:
+    // 3 NOTE sections become 2).
+    bool const hasNote  = (secNote != nullptr);
     // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: ET_REL now EMITS dataItems (a
     // global → `.rodata`/`.data`/`.bss` + a section-relative `.symtab` symbol +
     // `.rela.text` relocs). The deferred cases still fail loud upstream: an
@@ -3573,11 +4012,29 @@ encode(AssembledModule const&    module,
     // the rodata section's addralign (D-LK1-ELF-EXEC-DATA-SECTIONS).
     // Computed HERE (now that `text.size()` is known) so it is in
     // scope for BOTH the symbolVa map below AND the file-layout pass
-    // further down. The file-offset congruence (rodata-from-text on
-    // disk == rodata-from-text in VA) is asserted at layout time.
+    // further down. The file offset the layout pass gives it is DERIVED
+    // from this address, so the two cannot disagree.
+    //
+    // ⚠ THE ROUND-UP IS APPLIED TO THE ADDRESS, NOT TO THE DELTA
+    // (D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET).
+    // `textVa + alignUp(text.size(), A)` aligns the DISTANCE FROM `.text`,
+    // which lands on a multiple of `A` only when `textVa` already is — and
+    // `.text`'s VA is DECLARED per format, so whether an over-aligned `const`
+    // is placed correctly used to depend on which document was loaded:
+    // ✔MEASURED, `elf64-x86_64-linux-exec` declares 0x401000 (NOT a multiple of
+    // 8192) while `elf64-aarch64-linux-exec` declares 0x400000 (which is). The
+    // form below is right for every declared base.
+    //
+    // ⚠ AND IT IS AN IMAGE ADDRESS, so it is computed only for an image. An
+    // ET_REL section is UNBOUND — the linker that consumes the object chooses
+    // where it goes — and this walker writes `sh_addr = 0` there. Evaluating
+    // the address anyway produced a discarded, plausible-looking number; the
+    // writable half of the same chain did it with an alignment the relocatable
+    // documents do not declare, which is the defect this gate's twin below
+    // closes.
     std::uint64_t const rodataSectionVa =
-        hasRodata
-            ? secText->virtualAddress + alignUp(text.size(), rodataAlign)
+        (isExec && hasRodata)
+            ? alignUp(secText->virtualAddress + text.size(), rodataAlign)
             : 0;
 
     // Writable data segment (R+W PT_LOAD #2) for `.data` + `.bss` —
@@ -3592,19 +4049,120 @@ encode(AssembledModule const&    module,
     std::uint64_t const bssAlign  = hasBss ? bssLayout.maxAlign : 1;
     std::uint64_t const dataSize  = dataLayout.spanSize;
     std::uint64_t const bssSize   = bssLayout.spanSize;
-    bool const hasWritableSeg = hasData || hasBss;
-    // End of the read-only VA span (text + optional rodata).
-    std::uint64_t const roSpanEndVa =
+
+    // ── `.note.gnu.build-id` body (image flavour only) ────────────────────
+    //    D-LK-ELF-EMITS-NO-BUILD-ID-NOTE
+    //
+    // An `Elf64_Nhdr` (three LE u32s) + the 4-byte "GNU\0" owner name +
+    // the descriptor, each padded to 4. The descriptor is emitted ZEROED and
+    // stamped from the finished image's own bytes at the very end of this
+    // function (`stampBuildIdNote`) — the same fixed-point arrangement Mach-O's
+    // `stampImageUuid` uses, and for the same reason: the payload sits INSIDE
+    // the hashed region and is zero while it is hashed, so stamping cannot
+    // change the digest that produced it.
+    bool const hasBuildId = isExec && hasNote;
+    std::vector<std::uint8_t> const buildIdNote =
+        hasBuildId ? makeBuildIdNoteBody() : std::vector<std::uint8_t>{};
+    std::uint64_t const buildIdAlign =
+        hasBuildId ? std::max<std::uint64_t>(secNote->addrAlign, 1u) : 1u;
+    // The note closes the READ-ONLY span: it is SHF_ALLOC and immutable, so it
+    // rides PT_LOAD #1 beside `.rodata` rather than opening a second segment.
+    std::uint64_t const roDataEndVa =
         hasRodata ? rodataSectionVa + rodataBytes.size()
                   : secText->virtualAddress + text.size();
+    std::uint64_t const buildIdSectionVa =
+        hasBuildId ? alignUp(roDataEndVa, buildIdAlign) : 0;
+
+    // ── `.got` — the GOT-slot table this image mints for itself ───────────
+    //    D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS
+    //
+    // One pointer-sized slot per symbol a GOT-SLOT-RELATIVE relocation names
+    // (`planGotSlotSymbols`), in first-reference order. A foreign
+    // static-archive member reaches this: glibc's `exit.o` carries
+    // `cmpq $0x0,sym@GOTPCREL(%rip)` against two weak-undefined symbols, and
+    // the whole meaning of that idiom is the CONTENT of the slot.
+    //
+    // ★ IN A STATIC, NON-PIE IMAGE A SLOT IS A LINK-TIME CONSTANT. There is no
+    // loader to write it and no `.rela.dyn` to describe it: the writer stores
+    // the target's resolved VA and the image is final. That is what separates
+    // this from the ET_DYN `.got`, whose slots are filled by ld.so through
+    // GLOB_DAT.
+    //
+    // ★ THE NAME IS WRITER-OWNED, like `.plt` / `.rela.dyn` in the dynamic
+    // walker — because the section is not a place a PRODUCER can put anything.
+    // ✔MEASURED: no shipped document declares a `.got` section row; the write-up
+    // and the correction of this sentence's earlier COUNT form live at
+    // `kGotSectionName`.
+    std::vector<SymbolId> const gotSlotSymbols =
+        isExec ? link::format::planGotSlotSymbols(module, targetSchema)
+               : std::vector<SymbolId>{};
+    bool const hasGot = !gotSlotSymbols.empty();
+    std::uint64_t const gotSize =
+        static_cast<std::uint64_t>(gotSlotSymbols.size()) * kGotSlotBytes;
+
+    bool const hasWritableSeg = hasData || hasBss || hasGot;
+    // End of the read-only VA span (text + optional rodata + optional note).
+    std::uint64_t const roSpanEndVa =
+        hasBuildId ? buildIdSectionVa + buildIdNote.size() : roDataEndVa;
+    // ★★ THE WHOLE WRITABLE-SEGMENT VA CHAIN IS IMAGE-ONLY, AND SAYING SO IS
+    // THE FIX —
+    // D-LINK-ELF-STATIC-EXEC-VA-CHAIN-ROUNDS-TO-AN-UNDECLARED-PAGE.
+    // An ET_REL object has no segments and no addresses, and this chain used to
+    // be evaluated on that path anyway. Its first step rounds to
+    // `fmt.elf().pageAlign`, which the RELOCATABLE and STATICLIB documents
+    // declare NOWHERE — so the alignment arrived as 0, and `alignUp(v, 0)`
+    // returns 0 for every `v` (the mask computes `~(0 - 1)` = 0 and erases the
+    // value). ✔MEASURED with a temporary `std::source_location` parameter on
+    // `alignUp`: 37 such calls across the whole suite, every one from this
+    // function, every one `a = 0`, and NO other violating caller in any walker.
+    //
+    // ⚠ "IT COLLAPSES TO 0, WHICH IS WHAT AN ET_REL SECTION WANTS" IS ONLY HALF
+    // TRUE, AND THE OTHER HALF IS WHAT CHOSE THE FIX. ✔MEASURED on a real `.o`
+    // (`examples/c/alignment_overaligned_static_placed` through
+    // `elf64-x86_64-linux`): `writableSegVa` and `dataSectionVa` did collapse to
+    // 0, but `bssSectionVa` came out **24576**, because it is measured from
+    // `dataSectionVa + dataSize` and not from the collapsed page. What kept that
+    // harmless is not the arithmetic: it is that every consumer of these four
+    // values sits inside this function's `if (isExec)` block and every `sh_addr`
+    // they reach is written `isExec ? va : 0`.
+    //
+    // ⚠ THE OTHER CANDIDATE FIX WAS BUILT, MEASURED SIDE BY SIDE, AND REJECTED.
+    // Clamping the call — `alignUp(roSpanEndVa, std::max<std::uint64_t>(1,
+    // pageAlignStatic))` — defines the ill-formed call away instead of removing
+    // it, and on that same `.o` it turns ONE meaningless non-zero address into
+    // THREE (seg 2838, data 8192, bss 32768). Gating removes the call outright:
+    // `isExec` means the document describes an image, and `elf_backend`'s
+    // validate() refuses an ET_EXEC or ET_DYN document that declares no
+    // `elf.pageAlign` and refuses any `pageAlign` that is not a positive power
+    // of two — so the argument is guaranteed at the DOCUMENT boundary, which is
+    // what lets `detail::alignUp` carry its precondition assert.
     std::uint64_t const writableSegVa =
-        hasWritableSeg ? alignUp(roSpanEndVa, pageAlignStatic) : 0;
+        (isExec && hasWritableSeg) ? alignUp(roSpanEndVa, pageAlignStatic) : 0;
     std::uint64_t const dataSectionVa =
-        hasData ? alignUp(writableSegVa, dataAlign) : 0;
+        (isExec && hasData) ? alignUp(writableSegVa, dataAlign) : 0;
+    // `.got` sits between `.data` and `.bss`: file-backed like `.data` (its
+    // slots carry resolved VAs, not zeroes), and BEFORE `.bss` because `.bss`
+    // must stay last so PT_LOAD #2's p_memsz tail is the only thing past
+    // p_filesz.
+    std::uint64_t const gotSectionVa =
+        (isExec && hasGot)
+            ? alignUp((hasData ? dataSectionVa + dataSize : writableSegVa),
+                      kGotSlotBytes)
+            : 0;
     std::uint64_t const bssSectionVa =
-        hasBss ? alignUp((hasData ? dataSectionVa + dataSize : writableSegVa),
-                         bssAlign)
-               : 0;
+        (isExec && hasBss)
+            ? alignUp((hasGot    ? gotSectionVa + gotSize
+                       : hasData ? dataSectionVa + dataSize
+                                 : writableSegVa),
+                      bssAlign)
+            : 0;
+
+    // `.got` body + the slot-address map, declared OUT here because the
+    // section layout below needs the bytes and the `isExec` block below needs
+    // to fill them (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS).
+    std::vector<std::uint8_t> gotBytes;
+    gotBytes.reserve(static_cast<std::size_t>(gotSize));
+    std::unordered_map<SymbolId, std::uint64_t> gotSlotVa;
 
     // ── ET_EXEC: apply intra-module relocations in-place ───────
     //
@@ -3669,10 +4227,34 @@ encode(AssembledModule const&    module,
                 "elf::encode (ET_EXEC)", reporter)) {
             return {};
         }
+        // D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: fill the
+        // `.got` slots planned above, now that `symbolVa` is complete, and hand
+        // the applier the slot ADDRESSES in their own map. The two maps are
+        // deliberately separate: ✔MEASURED on the real glibc `exit.o`, both
+        // `__call_tls_dtors` and `_IO_cleanup` are the target of a GOTPCREL AND
+        // of a PLT32 in the SAME member, so one symbol needs its slot's address
+        // at one site and its own address at another.
+        for (SymbolId const slotSym : gotSlotSymbols) {
+            auto const symIt = symbolVa.find(slotSym);
+            if (symIt == symbolVa.end()) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::string{"elf::encode (ET_EXEC): a GOT-slot-relative "
+                                 "relocation names symbol #"}
+                         + std::to_string(slotSym.v)
+                         + ", which no function, data item or import gives an "
+                           "address — the slot would hold a fabricated value "
+                           "and every load through it would read the wrong "
+                           "object "
+                           "(D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS).");
+                return {};
+            }
+            gotSlotVa.emplace(slotSym, gotSectionVa + gotBytes.size());
+            appendU64LE(gotBytes, symIt->second);
+        }
         if (!link::format::applyExecRelocations(
                 text, module, funcTextStart, symbolVa,
                 targetSchema, secText->virtualAddress,
-                "elf::encode (ET_EXEC)", reporter)) {
+                "elf::encode (ET_EXEC)", reporter, &gotSlotVa)) {
             return {};
         }
         // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): `.data` now carries reloc-
@@ -3700,8 +4282,10 @@ encode(AssembledModule const&    module,
     // boundary] → externally-visible defined funcs + DATA (GLOBAL/WEAK,
     // STT_FUNC/STT_OBJECT, D-LK-OBJECT-DATA-SECTION-RELOCATABLE) → undefined
     // extern symbols (GLOBAL, SHN_UNDEF). `.symtab.sh_info` = index of first
-    // non-LOCAL symbol. Per-symbol binding is `objNames.definedBinding` (name +
-    // binding kept in lockstep); ET_EXEC forces GLOBAL (final image, unchanged).
+    // non-LOCAL symbol, read back off the finished records. Per-symbol binding
+    // is `objNames.definedBinding` for BOTH tiers — an ET_EXEC image no longer
+    // forces GLOBAL (D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL), so its
+    // statics and its nameless entry trampoline sit in the local prefix too.
     //
     // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: the data-section header indices,
     // computed HERE (before the symtab) so a data symbol's `st_shndx` names its
@@ -3722,7 +4306,7 @@ encode(AssembledModule const&    module,
     std::uint16_t const IDX_BSS    =
         hasBss ? static_cast<std::uint16_t>(
                      2u + (hasRodata ? 1u : 0u) + (hasData ? 1u : 0u)
-                     + (hasRelRo ? 1u : 0u))
+                     + (hasRelRo ? 1u : 0u) + (hasGot ? 1u : 0u))
                : 0u;
 
     StringTable strtab;
@@ -3859,9 +4443,19 @@ encode(AssembledModule const&    module,
     // multi-TU link (`ld: multiple definition`); DSS's own linker keys by
     // (cuId,SymbolId) and was unaffected.
     //
-    // ET_EXEC is a FINAL image (no foreign re-link), so it keeps its GLOBAL
-    // binding UNCHANGED (`definedFuncBinding` forces Global). Only the ET_REL
-    // `.o` (the foreign-linker input) carries the real per-symbol binding;
+    // ★ BOTH TIERS NOW READ THAT ONE DECISION, and the `isExec ? Global : …`
+    // override that used to sit in front of it is gone
+    // (D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL). It made a final image
+    // describe every `static` as STB_GLOBAL — not an ABI leak (an image's
+    // `.symtab` resolves nothing, and the ET_DYN export set is separately
+    // `isExternallyVisible`-gated) but a description every debugger, profiler
+    // and crash reporter reads, and one no reference agrees with: ✔MEASURED
+    // 2026-09-05, gcc 13.3.0 and clang 18.1.3 both emit a `static` `FUNC LOCAL`
+    // inside the prefix `sh_info` names, on x86_64 and aarch64, at -O0 and -O2,
+    // with the ordinary extern-linkage functions of the SAME image staying
+    // `FUNC GLOBAL` as the control. The image tier still differs from the `.o`
+    // tier in the NAME (`imageName` keeps a `static`'s declared name where
+    // `definedName` carves it), which is the whole of the difference.
     // ET_EXEC emits no DATA symbols here at all (`addDataSymbolVas` handles
     // those, and it emits none — D-LINK-ELF-IMAGE-NO-DATA-SYMBOLS-IN-SYMTAB).
     //
@@ -3879,9 +4473,9 @@ encode(AssembledModule const&    module,
     // dormant regardless.) A comment that recorded a coupling the code did not
     // have is what kept this defect alive. See
     // D-LINK-ELF-EXEC-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS.
-    auto definedFuncBinding = [&](SymbolId id) -> SymbolBinding {
-        return isExec ? SymbolBinding::Global : objNames.definedBinding(id);
-    };
+    // No local wrapper: every site below calls `objNames.definedBinding`
+    // DIRECTLY, so there is no place left for an ELF-private notion of "local"
+    // to grow back. The tier difference lives in the NAME, above.
 
     // ── ALIAS SITES — D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB ──
     //
@@ -3896,8 +4490,17 @@ encode(AssembledModule const&    module,
     // may be Local (a `static` carved to `sym_<id>`) while an alias of it is
     // Global — emitting the alias beside its canonical would put a non-local
     // symbol before sh_info, which makes the section's own header lie about
-    // where the locals end. `definedAliases` only yields externally-visible
-    // rows, so every alias belongs to the GLOBAL pass and is emitted there.
+    // where the locals end. `definedAliases` only yields EXTERNAL-LINKAGE rows
+    // (`hasExternalLinkage`, which rejects `SymbolBinding::Local` and asks
+    // nothing about visibility), so every alias belongs to the GLOBAL pass and
+    // is emitted there.
+    // ⚠ NOT "externally visible" — D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL
+    // replaced that predicate, and the replacement WIDENED this set: a
+    // Global/Weak alias carrying Hidden or Internal visibility now qualifies
+    // and is emitted here with its own `st_other`, where before it was dropped
+    // from the table entirely. It is still non-local, so the banding argument
+    // above is unaffected — but the record COUNT moved, which is why the pins
+    // assert an exact sequence rather than a membership test.
     struct AliasSite {
         SymbolId      symId{};
         std::uint16_t shndx = 0;
@@ -3915,10 +4518,15 @@ encode(AssembledModule const&    module,
     //     named function INCLUDING a `static` (a debugger wants that frame named,
     //     and nothing re-links an image so it cannot collide), `sym_<id>` only for
     //     the genuinely nameless — here the linker-injected entry trampoline.
-    //   * RELOCATABLE `.o` → `definedName`: externally-visible names only, since
+    //   * RELOCATABLE `.o` → `definedName`: EXTERNAL-LINKAGE names only, since
     //     these names ARE a foreign linker's resolution keys and a real-named
     //     static would collide across TUs
-    //     (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION).
+    //     (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION). ⚠ That
+    //     predicate is `hasExternalLinkage`, NOT `isExternallyVisible`: a
+    //     `visibility("hidden")` function has external linkage (a static link
+    //     resolves it by name) and only its DYNAMIC export is suppressed, so it
+    //     keeps its real name here and states the suppression in `st_other` —
+    //     D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL.
     // `isExec` is an artifact-KIND question answered by the loaded schema
     // (`id.objectType`), not a format/target/language identity test.
     auto emitFuncSym = [&](FuncSymRecord const& f) {
@@ -3932,8 +4540,10 @@ encode(AssembledModule const&    module,
         // `symtabValueBase`.
         std::uint64_t const stValue = symtabValueBase + f.valueInText;
         appendSym(nameOff,
-                  makeStInfo(stbForBinding(definedFuncBinding(f.symId)), STT_FUNC),
-                  0, /*shndx=.text*/ 1, stValue, f.size);
+                  makeStInfo(stbForBinding(objNames.definedBinding(f.symId)),
+                             STT_FUNC),
+                  stvForVisibility(objNames.definedVisibility(f.symId)),
+                  /*shndx=.text*/ 1, stValue, f.size);
         symIdxBySymbol.emplace(f.symId, idx);
         aliasSites.push_back({f.symId, /*shndx=*/1, stValue, f.size,
                               STT_FUNC});
@@ -3978,7 +4588,9 @@ encode(AssembledModule const&    module,
                 std::uint32_t const idx =
                     static_cast<std::uint32_t>(symtab.size() / 24);
                 appendSym(nameOff, makeStInfo(stbForBinding(bind), STT_OBJECT),
-                          0, sectionIdx, layout.itemOffsets[j],
+                          stvForVisibility(
+                              objNames.definedVisibility(di.symbol)),
+                          sectionIdx, layout.itemOffsets[j],
                           di.sizeInSection());
                 symIdxBySymbol.emplace(di.symbol, idx);
                 aliasSites.push_back({di.symbol, sectionIdx,
@@ -3990,7 +4602,8 @@ encode(AssembledModule const&    module,
     // ── LOCAL pass — static/synthesized funcs + data (Local binding). The
     //    block symbols emitted above are also Local and already sit here. ──
     for (auto const& f : funcSyms)
-        if (definedFuncBinding(f.symId) == SymbolBinding::Local) emitFuncSym(f);
+        if (objNames.definedBinding(f.symId) == SymbolBinding::Local)
+            emitFuncSym(f);
     if (!isExec) {
         if (hasRodata) emitDataSyms(rodataLayout, IDX_RODATA, /*wantLocal=*/true);
         if (hasData)   emitDataSyms(dataLayout,   IDX_DATA,   /*wantLocal=*/true);
@@ -3998,16 +4611,13 @@ encode(AssembledModule const&    module,
         if (hasBss)    emitDataSyms(bssLayout,    IDX_BSS,    /*wantLocal=*/true);
     }
 
-    // `.symtab.sh_info` = index of the first non-LOCAL symbol = the count of
-    // the LOCAL prefix (UNDEF + STT_SECTION + block symbols + the now-Local
-    // static/synthesized funcs + data emitted in the pass above).
-    std::uint32_t const firstNonLocalSymIdx =
-        static_cast<std::uint32_t>(symtab.size() / 24);
-
-    // ── GLOBAL pass — externally-visible (Global/Weak) funcs + data, after
-    //    sh_info. For ET_EXEC every func is here (binding forced Global). ──
+    // ── GLOBAL pass — externally-visible (Global/Weak) funcs + data, after the
+    //    sh_info boundary. An ET_EXEC image reaches here too: since
+    //    D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL its statics are Local
+    //    like the `.o`'s, so the two passes are no longer a no-op there. ──
     for (auto const& f : funcSyms)
-        if (definedFuncBinding(f.symId) != SymbolBinding::Local) emitFuncSym(f);
+        if (objNames.definedBinding(f.symId) != SymbolBinding::Local)
+            emitFuncSym(f);
     if (!isExec) {
         if (hasRodata) emitDataSyms(rodataLayout, IDX_RODATA, /*wantLocal=*/false);
         if (hasData)   emitDataSyms(dataLayout,   IDX_DATA,   /*wantLocal=*/false);
@@ -4039,7 +4649,8 @@ encode(AssembledModule const&    module,
             std::uint32_t const aliasNameOff = strtab.add(alias->name);
             appendSym(aliasNameOff,
                       makeStInfo(stbForBinding(alias->binding), site.type),
-                      0, site.shndx, site.value, site.size);
+                      stvForVisibility(alias->visibility),
+                      site.shndx, site.value, site.size);
         }
     }
 
@@ -4064,8 +4675,23 @@ encode(AssembledModule const&    module,
             std::uint32_t const nameOff = strtab.add(symName);
             std::uint32_t const idx =
                 static_cast<std::uint32_t>(symtab.size() / 24);
-            appendSym(nameOff, makeStInfo(STB_GLOBAL, STT_NOTYPE), 0,
-                      SHN_UNDEF, 0, 0);
+            // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the import's
+            // REFERENCE binding, through the SAME `stbForBinding` that maps a
+            // DEFINED symbol's binding a few loops up — ELF spells a weak
+            // reference and a weak definition in the one `st_info` field, so
+            // there is nothing extra to encode and no second mapping to keep in
+            // step. `externBinding` returns Global for every import that is not
+            // annotated and for the `sym_<id>` fallback, so this line is
+            // byte-identical to the STB_GLOBAL it replaces on every module that
+            // carries no weak import.
+            // ✔MEASURED: gcc 13.3.0 and clang 18.1.3 both emit `NOTYPE WEAK
+            // DEFAULT UND ea` here for `extern int ea __attribute__((weak));`,
+            // and both LINK and RUN a program that tests it for null with no
+            // definition present (exit 42, the null branch).
+            appendSym(nameOff,
+                      makeStInfo(stbForBinding(objNames.externBinding(rel.target)),
+                                 STT_NOTYPE),
+                      0, SHN_UNDEF, 0, 0);
             symIdxBySymbol.emplace(rel.target, idx);
         };
         for (auto const& fn : module.functions)
@@ -4074,10 +4700,19 @@ encode(AssembledModule const&    module,
             for (auto const& rel : di.relocations) emitExternForReloc(rel);
     }
 
+    // `.symtab.sh_info` = index of the first non-LOCAL symbol = the length of
+    // the LOCAL prefix (UNDEF + STT_SECTION + block symbols + the Local
+    // static/synthesized funcs + data). Read back off the finished records
+    // rather than snapshotted between the two passes: the alias pass and the
+    // extern pass both append after them, so a positional snapshot would be a
+    // claim about where the writer stood, not about where the locals end.
+    // D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL.
+    std::uint32_t const firstNonLocalSymIdx =
+        link::format::elfSymtabFirstNonLocal(symtab);
     // The finished partition, checked rather than assumed — see
-    // `elfSymtabPartitionBreach`. `firstNonLocalSymIdx` was snapshotted between the
-    // LOCAL and GLOBAL passes; the alias pass and the extern pass both append
-    // AFTER it, so this is the guard that keeps those two honest.
+    // `elfSymtabPartitionBreach`. The boundary above is derived, so this is
+    // what still refuses a LOCAL row appended after a non-local one (the shape
+    // the alias pass and the extern pass make reachable).
     if (std::string const breach = link::format::elfSymtabPartitionBreach(
             symtab, firstNonLocalSymIdx);
         !breach.empty()) {
@@ -4086,7 +4721,8 @@ encode(AssembledModule const&    module,
                  + breach
                  + ". ELF requires every STB_LOCAL symbol to precede sh_info; "
                    "emitting this object would silently mis-partition in ld, "
-                   "readelf, nm and gdb.");
+                   "readelf, nm and gdb "
+                   "(D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL).");
         return {};
     }
 
@@ -4326,6 +4962,7 @@ encode(AssembledModule const&    module,
     SectionHeader hRodata{};
     SectionHeader hData{};
     SectionHeader hBss{};
+    SectionHeader hGot{};          // .got (ET_EXEC) — GOT-slot table
     SectionHeader hRelRo{};        // c145: .data.rel.ro (ET_REL)
     SectionHeader hRela{};
     SectionHeader hRelaData{};     // c145: .rela.data (ET_REL)
@@ -4379,6 +5016,9 @@ encode(AssembledModule const&    module,
     }
     if (hasBss) {
         hBss.name_offset   = shstrtab.add(secBss->name);
+    }
+    if (hasGot) {
+        hGot.name_offset   = shstrtab.add(std::string{kGotSectionName});
     }
     if (secRela != nullptr) {
         hRela.name_offset  = shstrtab.add(secRela->name);
@@ -4440,6 +5080,9 @@ encode(AssembledModule const&    module,
     if (hasRodata) { (void)nextIdxS(); }
     if (hasData)   { (void)nextIdxS(); }
     if (hasRelRo)  { (void)nextIdxS(); }           // .data.rel.ro (ET_REL) c145
+    if (hasGot)    { (void)nextIdxS(); }           // .got (ET_EXEC) — before
+                                                   // `.bss`, matching the VA
+                                                   // order and the push order
     if (hasBss)    { (void)nextIdxS(); }
     if (!isExec) { (void)nextIdxS(); }            // .rela.text slot (ET_REL)
     // c145: `.rela.data` / `.rela.data.rel.ro` follow `.rela.text` (ET_REL only,
@@ -4500,6 +5143,20 @@ encode(AssembledModule const&    module,
         hBss.entry_size  = secBss->entrySize;
         hBss.size        = bssSize;
         hBss.addr        = isExec ? bssSectionVa : 0;  // ET_REL: unbound
+    }
+    // `.got` (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS) —
+    // SHT_PROGBITS + SHF_ALLOC|SHF_WRITE with an 8-byte entry size, the shape
+    // `readelf -S` shows for a real static image's GOT. The values here are
+    // WRITER-OWNED rather than schema rows for the same reason the name is: a
+    // producer cannot put anything in this section, so there is nothing for a
+    // `.format.json` author to decide.
+    if (hasGot) {
+        hGot.type        = SHT_PROGBITS;
+        hGot.flags       = SHF_ALLOC | SHF_WRITE;
+        hGot.addr_align  = kGotSlotBytes;
+        hGot.entry_size  = kGotSlotBytes;
+        hGot.size        = gotSize;
+        hGot.addr        = gotSectionVa;
     }
     // `.data.rel.ro` section header (D-LK-RELRO-CONST-DATA-RELOCATABLE, c145).
     // sh_type / sh_flags from the SCHEMA ROW (SHT_PROGBITS + SHF_ALLOC|SHF_WRITE,
@@ -4570,16 +5227,23 @@ encode(AssembledModule const&    module,
     hShStrtab.entry_size = secShStrtab->entrySize;
     hShStrtab.size       = shstrtab.size();
 
-    // `.note.GNU-stack` — empty (size 0) SHT_PROGBITS with sh_flags=0 (NO
-    // SHF_EXECINSTR): its mere presence tells `ld` the object needs no
-    // executable stack. type/flags/align all from the schema row (not
-    // hardcoded), matching `.section .note.GNU-stack,"",@progbits`.
+    // The `note` row — ONE declared row, a DIFFERENT note per artifact flavour
+    // (D-LK-ELF-EMITS-NO-BUILD-ID-NOTE), with type/flags/align read from the
+    // schema in BOTH cases rather than hardcoded here:
+    //   * ET_REL  → `.note.GNU-stack`, EMPTY (size 0) SHT_PROGBITS with
+    //     sh_flags=0 (NO SHF_EXECINSTR); its mere presence tells `ld` the object
+    //     needs no executable stack, matching
+    //     `.section .note.GNU-stack,"",@progbits`. No VA — it is not mapped.
+    //   * ET_EXEC → `.note.gnu.build-id`, a real SHT_NOTE body at a real VA
+    //     inside PT_LOAD #1. `buildIdNote` is EMPTY unless `hasBuildId`, so the
+    //     one expression below spells both sizes without a branch.
     if (hasNote) {
         hNote.type       = secNote->type;
         hNote.flags      = secNote->flags;
         hNote.addr_align = std::max<std::uint64_t>(1, secNote->addrAlign);
         hNote.entry_size = secNote->entrySize;
-        hNote.size       = 0;
+        hNote.size       = buildIdNote.size();
+        hNote.addr       = hasBuildId ? buildIdSectionVa : 0;
     }
     // `.eh_frame`: SHT_PROGBITS + SHF_ALLOC, addralign = the DWARF record
     // alignment (`buildEhFrame` pads every CIE/FDE to the address size, and a
@@ -4629,12 +5293,32 @@ encode(AssembledModule const&    module,
                   + symtab.size() + strtab.size() + shstrtab.size() + 7 * 64);
     bytes.resize(kEhdrSize + phtSize);  // placeholder; rewritten below
 
+    // The image's verbatim-mapping delta: `va == imageBaseVa + fileOffset` for
+    // every ALLOCATED section of an ET_EXEC image. DERIVED from `.text`'s
+    // emitted file offset immediately below rather than assumed from
+    // `pageAlign`, so it stays true even if the Ehdr + PHT ever grow past a
+    // page. Unused (and zero) on the ET_REL arm, which has no addresses at all.
+    std::uint64_t imageBaseVa = 0;
+
     // Single layout lambda — `vector<uint8_t> const&` decays to
     // `span<uint8_t const>` so both the in-memory section bodies
     // (text / relaText / symtab) and the StringTable views share
     // one code path.
-    auto layoutSection = [&](SectionHeader& h, std::span<std::uint8_t const> body) {
-        if (h.addr_align > 1) padTo(bytes, h.addr_align);
+    //
+    // `allocVa`, when given, is the ADDRESS the writer already chose for an
+    // allocated exec section; the file offset is then whatever that address
+    // implies (`va - imageBaseVa`), never an independently rounded cursor.
+    // ⚠ ROUNDING THE FILE CURSOR TO `sh_addralign` INSTEAD agrees with the
+    // chosen address only while `imageBaseVa` is itself a multiple of that
+    // alignment — the accident that decided, per DECLARED `.text` VA, whether
+    // an over-aligned object landed where it asked
+    // (D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET). A
+    // section with no address (ET_REL, and the non-allocated tables) keeps the
+    // plain alignment pad, which is the whole and correct rule there.
+    auto layoutSection = [&](SectionHeader& h, std::span<std::uint8_t const> body,
+                             std::optional<std::uint64_t> allocVa = std::nullopt) {
+        if (allocVa.has_value()) padToOffset(bytes, *allocVa - imageBaseVa);
+        else if (h.addr_align > 1) padTo(bytes, h.addr_align);
         h.offset = bytes.size();
         bytes.insert(bytes.end(), body.begin(), body.end());
     };
@@ -4652,20 +5336,68 @@ encode(AssembledModule const&    module,
     std::uint64_t const pageAlign = fmt.elf().pageAlign;
     if (isExec) padTo(bytes, pageAlign);
     layoutSection(hText, text);
+    // `.text` is placed; the image's constant VA<->file delta is now KNOWN, and
+    // every allocated section below is written at the offset its chosen ADDRESS
+    // implies (see `layoutSection`'s `allocVa`). Derived rather than assumed:
+    // the alternative, `secText->virtualAddress - pageAlign`, silently becomes
+    // wrong the day the Ehdr + program headers outgrow one page.
+    //
+    // ⚠ BUT THE BASE MUST EXIST FIRST, AND UNTIL P65 NOTHING SAID SO —
+    // D-LINK-ELF-STATIC-IMAGE-BASE-UNDERFLOWS-BELOW-ITS-OWN-HEADERS.
+    // `.text`'s VA is DECLARED per document and its file offset is what this
+    // pass just emitted; a document that puts `.text` BELOW the headers makes
+    // the subtraction WRAP. ★ AND THE WRAP CANCELS, which is why it is silent:
+    // every allocated section is then written at `va - imageBaseVa`, i.e.
+    // `va - textVa + textOff`, an ordinary small offset, so `.rodata`'s file/VA
+    // congruence guard below PASSES and the object looks well formed. What does
+    // not survive is the PT_LOAD: `p_vaddr` is the declared sub-header VA while
+    // `p_offset` is a whole page, so the kernel's
+    // `p_vaddr % p_align == p_offset % p_align` rule breaks and execve() answers
+    // ENOEXEC with nothing said by the toolchain. ✔MEASURED with this guard
+    // removed, on BOTH shipped exec documents: `.text` VA 0x800 emits a clean
+    // image, zero diagnostics, whose PT_LOAD #0 maps file offset 0x1000 at
+    // address 0x800 with p_align 0x1000.
+    //
+    // ⚠ THE SHAPE MATTERS, AND THE FIRST DRAFT OF THIS PARAGRAPH GOT IT WRONG:
+    // it said every congruence guard below passes. ✔MEASURED — they do not. A
+    // module WITH writable data is caught further down by the `.data` belt
+    // (`textVa(2048) + fileDelta(4096) != dataSectionVa(4096)`), which refuses
+    // the build but names `.data` rather than the base that underflowed. It is
+    // the TEXT-ONLY image that reaches no belt at all and ships. So this guard's
+    // unique value is that shape, and it also turns the other one from a
+    // misdirected refusal into an accurate one.
+    //
+    // validate() rejects only `virtualAddress == 0`, so this is reachable from a
+    // document it accepts, and `encodeElfExecDynamic` has refused the same shape
+    // since it was written ("baseImageVa would underflow") while this walker had
+    // no belt at all. Stated against the offset actually emitted rather than
+    // against `pageAlign`, for the same reason the subtraction itself is.
+    if (isExec && secText->virtualAddress < hText.offset) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("elf::encode (ET_EXEC): .text virtualAddress ({:#x}) "
+                         "is below the file offset this image gives it ({:#x}) "
+                         "— the image base would UNDERFLOW. Every allocated "
+                         "section would still be written at a sane-looking "
+                         "offset (the two wraps cancel), but the PT_LOAD would "
+                         "break the kernel's p_vaddr/p_offset page congruence "
+                         "and execve() would answer ENOEXEC with no diagnostic. "
+                         "The format document must leave room below `.text` for "
+                         "the Ehdr and the program headers. D-LK6-3.",
+                         secText->virtualAddress, hText.offset));
+        return {};
+    }
+    if (isExec) imageBaseVa = secText->virtualAddress - hText.offset;
     // `.rodata` immediately after `.text` (D-LK1-ELF-EXEC-DATA-SECTIONS).
-    // The on-disk rodata-from-text delta MUST equal the
-    // VA rodata-from-text delta so the single PT_LOAD's file<->mem
-    // mapping is congruent: hText.offset is page-aligned (already
-    // rodataAlign-aligned since rodataAlign | pageAlign for the
-    // shipped 8|4096 case), and layoutSection pads rodata to
-    // rodataAlign — so `hRodata.offset - hText.offset ==
-    // alignUp(text.size(), rodataAlign)`, matching the early
-    // `rodataSectionVa`. Defend that congruence with a fail-loud
-    // guard (a non-divisor rodataAlign or future layout change would
-    // otherwise silently desync VA from file offset → the loader
-    // maps the wrong bytes at the global's runtime address).
+    // The on-disk rodata-from-text delta MUST equal the VA rodata-from-text
+    // delta so the single PT_LOAD's file<->mem mapping is congruent. That now
+    // holds BY CONSTRUCTION — the offset is computed from `rodataSectionVa` —
+    // and the fail-loud guard below is kept as the belt on that construction
+    // (a desync would make the loader map the wrong bytes at the global's
+    // runtime address, and nothing downstream would notice).
     if (hasRodata) {
-        layoutSection(hRodata, rodataBytes);
+        layoutSection(hRodata, rodataBytes,
+                      isExec ? std::optional<std::uint64_t>{rodataSectionVa}
+                             : std::nullopt);
         // ET_REL has no VA — the file/VA congruence check (a PT_LOAD invariant)
         // is exec-only. D-LK-OBJECT-DATA-SECTION-RELOCATABLE.
         if (isExec) {
@@ -4684,6 +5416,24 @@ encode(AssembledModule const&    module,
             }
         }
     }
+    // `.note.gnu.build-id` closes PT_LOAD #1, after `.rodata`
+    // (D-LK-ELF-EMITS-NO-BUILD-ID-NOTE). Same file/VA congruence guard as
+    // `.rodata`: the note is SHF_ALLOC, so a desync would make the loader map
+    // the wrong bytes at the address `readelf -n` reads the build id from.
+    if (hasBuildId) {
+        layoutSection(hNote, buildIdNote, buildIdSectionVa);
+        std::uint64_t const noteFileDelta = hNote.offset - hText.offset;
+        if (secText->virtualAddress + noteFileDelta != buildIdSectionVa) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("elf::encode (ET_EXEC): .note.gnu.build-id "
+                             "file/VA congruence broken — textVa({}) + "
+                             "fileDelta({}) != buildIdSectionVa({}). "
+                             "D-LK-ELF-EMITS-NO-BUILD-ID-NOTE.",
+                             secText->virtualAddress, noteFileDelta,
+                             buildIdSectionVa));
+            return {};
+        }
+    }
     // `.data` + `.bss` (D-LK4-DATA-PRODUCER) — the WRITABLE segment, page-
     // aligned above the read-only sections so they form a SEPARATE R+W PT_LOAD
     // (W^X). `.data` is file-backed; `.bss` consumes NO file bytes (its sh_offset
@@ -4695,7 +5445,9 @@ encode(AssembledModule const&    module,
         padTo(bytes, pageAlign);   // PT_LOAD #2 page boundary (file + VA)
     }
     if (hasData) {
-        layoutSection(hData, dataLayout.bytes);
+        layoutSection(hData, dataLayout.bytes,
+                      isExec ? std::optional<std::uint64_t>{dataSectionVa}
+                             : std::nullopt);
         if (isExec) {   // exec-only file/VA congruence (PT_LOAD invariant)
             std::uint64_t const fileDelta = hData.offset - hText.offset;
             if (secText->virtualAddress + fileDelta != dataSectionVa) {
@@ -4715,6 +5467,26 @@ encode(AssembledModule const&    module,
     if (hasRelRo) {
         layoutSection(hRelRo, relroLayout.bytes);
     }
+    // `.got` — file-backed, right after `.data`, before the zero-fill `.bss`
+    // tail. ET_EXEC only, and its file/VA congruence is asserted like `.data`'s
+    // (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS).
+    if (hasGot) {
+        layoutSection(hGot, gotBytes, gotSectionVa);
+        std::uint64_t const gotFileDelta = hGot.offset - hText.offset;
+        if (secText->virtualAddress + gotFileDelta != gotSectionVa) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("elf::encode (ET_EXEC): .got file/VA congruence "
+                             "broken — textVa({}) + fileDelta({}) != "
+                             "gotSectionVa({}). Every GOT-slot-relative "
+                             "displacement was computed against the VA, so a "
+                             "desync makes each one load from the wrong file "
+                             "bytes. "
+                             "D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS.",
+                             secText->virtualAddress, gotFileDelta,
+                             gotSectionVa));
+            return {};
+        }
+    }
     if (hasBss) {
         // NOBITS: record sh_offset at the current cursor (conventional — points
         // just past .data) WITHOUT appending bytes; sh_size is the zero-fill
@@ -4732,7 +5504,14 @@ encode(AssembledModule const&    module,
     // `.note.GNU-stack` last — a zero-length body, so it just records a valid
     // sh_offset (no bytes appended). Keeping it after .shstrtab is what leaves
     // every existing section index + e_shstrndx untouched.
-    if (hasNote) layoutSection(hNote, std::span<std::uint8_t const>{});
+    // ⚠ ET_REL ONLY. An IMAGE's note is `.note.gnu.build-id`, whose bytes were
+    // already placed inside PT_LOAD #1 above — a SHF_ALLOC section laid out here
+    // would sit past `.shstrtab`, outside every loadable segment, and the
+    // loader would never map the identity the note exists to publish. Only the
+    // header slot is shared between the two flavours; the placement is not.
+    if (hasNote && !isExec) {
+        layoutSection(hNote, std::span<std::uint8_t const>{});
+    }
     // `.eh_frame` + `.rela.eh_frame` last, matching the index cursor above.
     if (hasEhFrame) {
         layoutSection(hEhFrame, ehFrameOpt->bytes);
@@ -4764,6 +5543,8 @@ encode(AssembledModule const&    module,
     if (hasData) headers.push_back(&hData);
     // `.data.rel.ro` (c145) between `.data` and `.bss` (ET_REL only).
     if (hasRelRo) headers.push_back(&hRelRo);
+    // `.got` before `.bss` — MUST match the cursor above and the VA order.
+    if (hasGot) headers.push_back(&hGot);
     if (hasBss) headers.push_back(&hBss);
     if (!isExec) headers.push_back(&hRela);
     // `.rela.data` / `.rela.data.rel.ro` (c145) after `.rela.text` (ET_REL only).
@@ -4889,7 +5670,7 @@ encode(AssembledModule const&    module,
         phdr.reserve(kPtLoadCount * kProgramHeaderSize);
         auto appendPhdr = [&](std::uint32_t pFlags, std::uint64_t pOffset,
                                std::uint64_t pVaddr, std::uint64_t pFilesz,
-                               std::uint64_t pMemsz) {
+                               std::uint64_t pMemsz, std::uint64_t pAlign) {
             appendU32LE(phdr, 1);             // p_type = PT_LOAD
             appendU32LE(phdr, pFlags);
             appendU64LE(phdr, pOffset);
@@ -4897,7 +5678,17 @@ encode(AssembledModule const&    module,
             appendU64LE(phdr, pVaddr);        // p_paddr
             appendU64LE(phdr, pFilesz);
             appendU64LE(phdr, pMemsz);
-            appendU64LE(phdr, pageAlign);     // p_align (kernel congruence)
+            appendU64LE(phdr, pAlign);        // p_align (kernel congruence)
+        };
+        // The granularity each segment PROMISES — the SAME shared rule the
+        // dynamic walker uses, deliberately not a second copy. This walker
+        // emits fixed-address ET_EXEC only, where the bound the rule applies
+        // costs nothing; it is here so the two walkers cannot come to disagree
+        // about what a segment claims.
+        // D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET.
+        auto segmentAlign = [&](std::uint64_t strongestMember) {
+            return link::format::segmentAlignForImageBase(imageBaseVa, pageAlign,
+                                                          strongestMember);
         };
         // PT_LOAD #1 (R+X) covers `.text` and — when present — `.rodata`
         // (D-LK1-ELF-EXEC-DATA-SECTIONS). Both are contiguous on disk + VA
@@ -4906,11 +5697,15 @@ encode(AssembledModule const&    module,
         // = R+X (W^X preserved). Span derived from the on-disk extent.
         std::uint32_t pFlags1 = shFlagsToPFlags(secText->flags);
         if (hasRodata) pFlags1 |= shFlagsToPFlags(secRodata->flags);
+        if (hasBuildId) pFlags1 |= shFlagsToPFlags(secNote->flags);
         std::uint64_t const seg1ByteLen =
-            hasRodata ? (hRodata.offset + rodataBytes.size() - hText.offset)
-                      : text.size();
+            hasBuildId ? (hNote.offset + buildIdNote.size() - hText.offset)
+            : hasRodata ? (hRodata.offset + rodataBytes.size() - hText.offset)
+                        : text.size();
         appendPhdr(pFlags1, hText.offset, secText->virtualAddress,
-                   seg1ByteLen, seg1ByteLen);
+                   seg1ByteLen, seg1ByteLen,
+                   segmentAlign(std::max({hText.addr_align, rodataAlign,
+                                          buildIdAlign})));
         // PT_LOAD #2 (R+W) covers `.data` (file-backed) + `.bss` (zero-fill).
         // p_flags = OR of .data/.bss sh_flags → R+W. p_filesz spans the file-
         // backed `.data`; p_memsz additionally covers `.bss` so the loader
@@ -4919,18 +5714,48 @@ encode(AssembledModule const&    module,
             std::uint32_t pFlags2 = 0;
             if (hasData) pFlags2 |= shFlagsToPFlags(secData->flags);
             if (hasBss)  pFlags2 |= shFlagsToPFlags(secBss->flags);
+            // `.got` is SHF_ALLOC|SHF_WRITE by construction (it is not a schema
+            // row), so it contributes R+W exactly as `.data` does.
+            if (hasGot)  pFlags2 |= shFlagsToPFlags(SHF_ALLOC | SHF_WRITE);
             std::uint64_t const seg2Off =
-                hasData ? hData.offset : hBss.offset;
-            std::uint64_t const seg2Va = writableSegVa;
-            std::uint64_t const seg2FileSz =
-                hasData ? (hData.offset + dataSize - seg2Off) : 0;
+                hasData ? hData.offset : (hasGot ? hGot.offset : hBss.offset);
+            // ⚠ THE SEGMENT'S ADDRESS IS DERIVED FROM ITS FILE OFFSET, not
+            // taken as `writableSegVa`. The loader maps `file[p_offset …]` at
+            // `p_vaddr`, so the two must differ by the image's one delta — and
+            // `.data`'s offset is now the one its (possibly over-aligned)
+            // ADDRESS implies, which can sit above the page-aligned segment
+            // start. Taking `writableSegVa` there would map `.data`'s bytes one
+            // or more pages BELOW the address every symbol and relocation names,
+            // silently. Identical to `writableSegVa` whenever no member asks for
+            // more than a page, which is why no ordinary image moves.
+            // D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET.
+            std::uint64_t const seg2Va = imageBaseVa + seg2Off;
+            // p_filesz spans every FILE-BACKED member (`.data` then `.got`);
+            // `.bss` adds none.
+            std::uint64_t const seg2FileEnd =
+                hasGot    ? (hGot.offset + gotSize)
+                : hasData ? (hData.offset + dataSize)
+                          : seg2Off;
+            std::uint64_t const seg2FileSz = seg2FileEnd - seg2Off;
             std::uint64_t const seg2MemEnd =
-                hasBss ? (bssSectionVa + bssSize)
-                       : (dataSectionVa + dataSize);
+                hasBss    ? (bssSectionVa + bssSize)
+                : hasGot  ? (gotSectionVa + gotSize)
+                          : (dataSectionVa + dataSize);
             std::uint64_t const seg2MemSz = seg2MemEnd - seg2Va;
-            appendPhdr(pFlags2, seg2Off, seg2Va, seg2FileSz, seg2MemSz);
+            appendPhdr(pFlags2, seg2Off, seg2Va, seg2FileSz, seg2MemSz,
+                       segmentAlign(std::max({dataAlign, bssAlign,
+                                              kGotSlotBytes})));
         }
         std::memcpy(bytes.data() + kEhdrSize, phdr.data(), phdr.size());
+    }
+
+    // D-LK-ELF-EMITS-NO-BUILD-ID-NOTE: derive the identity from the FINISHED
+    // image and stamp it into the descriptor reserved above. LAST, after the
+    // program headers are written back, so every byte the loader maps is
+    // covered — an id that omitted the segment table would not change when the
+    // layout did.
+    if (hasBuildId) {
+        stampBuildIdNote(bytes, static_cast<std::size_t>(hNote.offset));
     }
 
     return bytes;

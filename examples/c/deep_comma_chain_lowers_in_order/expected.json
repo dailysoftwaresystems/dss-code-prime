@@ -1,0 +1,37 @@
+{
+  "$comment": "D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED (P61, lane ml): the RUNNABLE half of the MIR tier's conversion. `main.c` carries a 1000-element comma chain, the identical arithmetic as 1000 sibling statements in one block, 600 `*&` pairs, 200 nested `__builtin_popcount` calls and a 300-element AGGREGATE-typed comma — the four shapes whose lowering in `src/mir/lowering/hir_to_mir.cpp` moved from host call frames to one shared heap work-stack this cycle. ★★ WHAT IT PROVES IS ORDER, WHICH IS THE HALF A FLATTENING BREAKS SILENTLY: the elements ALTERNATE `a *= M` and `a -= K` (500 of each) with M and K varying, and multiplication does not commute with subtraction, so swapping ANY two adjacent elements changes the answer, so a work-stack rewrite that drained the side-effect statements out of order, dropped one or ran one twice would still compile, still link and still exit — with a different number. The comma chain is additionally checked against the SAME arithmetic written as sibling statements, which reaches MIR through a DIFFERENT driver (a `Block` frame's child cursor rather than the value driver's `SeqExpr` statement pump), so this is a differential test rather than a golden: the two agree only if the comma machine runs its statements in source order. exit 42 = 12 (the two machines agree) + 10 (and on the RIGHT value, not merely a consistent one) + 8 (`*&` collapses to the pointer) + 6 (the builtin nest reaches its fixed point) + 6 (the aggregate comma yields its tail). ANTI-FOLD: the accumulator starts from a MUTABLE GLOBAL and the `*&` chain walks a MUTABLE GLOBAL pointer, so no front-end arm can fold either away and report green without having lowered it. ⓘ HONEST SCOPE, stated rather than implied: this file does NOT exercise the ceiling that moved. `dsscp` builds every CU inside a 64 MiB worker (`substrate::kDeepRecursionStackBytes`), so the pre-P61 lowering accepted these depths through the CLI too; the ceiling is pinned IN PROCESS on a 256 KiB bounded stack by `tests/mir/test_deep_nesting_costs_heap.cpp`, which is where a regression to host recursion goes red under the gate's own toolchain. The 1000-element chain is ~3x the depth at which the pre-P61 lowering died on an ORDINARY 1 MiB thread (✔MEASURED 320 rc 0 / 340 stack death, gdb-attributed to a seven-frame `lowerDiscardedExpr` → `lowerOneDiscardedExpr` → `lowerExpr` → `runExprDriver` → `lowerStmt` → `enterStmt` → `lowerStmtNode` cycle), which is the budget a library embedder or the LSP gets — neither goes through the CLI's large-stack worker. ✔REFERENCE ORACLE, each probed SEPARATELY on this exact file: gcc 13.3.0 (WSL) compiles and RUNS it to 42 at -O0 and -O2; clang 18.1.3 compiles and RUNS it to 42 at -O0 and -O2; mingw-w64 gcc 13.2.0 compiles and RUNS it to 42 at -O0 and -O2; MSVC 19.51.36252 compiles it (`cl /c /std:c17`). All four accept it, so it is a legal program DSS must accept and must give this answer for. The `release` arm additionally proves the result survives Mem2Reg/CSE/LICM/DCE with the same exit code. ⚠ MARGIN TO THE LOUD REFUSAL, ✔MEASURED on THIS element shape rather than interpolated: through `dsscp` a chain of this shape compiles at 1000 and at 1150 (rc 0) and is REFUSED LOUD at 1175 and above with a positioned `P_SpeculationBudgetExhausted` naming `parser.speculationBudgetFactor`. So the shipped 1000 sits about 15% under a COMPILE REFUSAL, not a stack death — a shrink of the parser's per-alternative token budget, or of the O(depth) builder/schema-walker checkpoint that holds it down, flips this example from exit 42 to a refusal. That is a stated, measured dependency, not a hidden one.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

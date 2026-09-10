@@ -17,6 +17,7 @@
 #include "core/substrate/thread_pool.hpp"  // IExecutor (the thin-LTO stage's optional pool)
 #include "core/types/type_lattice/type_interner.hpp"  // TypeInterner (optimizeModule arg)
 #include "core/types/type_lattice/type_lattice.hpp"  // TypeLattice (CuMirModule::importedHost)
+#include "hir/lowering/cst_to_hir.hpp"  // CstToHirResult (CuHirModule member, held by unique_ptr)
 #include "link/image_request.hpp"  // ImageRequest (linkAndWrite per-program knobs)
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly arg)
@@ -91,9 +92,17 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // compiles anything.
 //
 // ★★ AND THE CLASSIFICATION IS PER **ROUTE**, NOT PER ENTRY POINT. The driver
-// reaches `linkAndWriteWithStaticArchives` by THREE routes (the `encode` tier,
-// the N==1 sole CU, the N>1 merge) and `optimizeModule` by THREE (archive
-// member, N==1, merged). Each is a separate argument list a later edit can
+// reaches `linkAndWriteWithStaticArchives` by
+// <!--census:source:program.staticArchiveLinkRoutes-->4 routes (the `encode`
+// tier, the N==1 sole CU, the N>1 merge, and the archive-member link) and
+// `optimizeModule` by THREE (archive member, N==1, merged).
+// ⚠ This said THREE until P63. The fourth route was a real call site the prose
+// never absorbed — and the miscount is instructive, because the argument this
+// very paragraph makes is that ROUTES are what a later edit changes
+// independently. It undercounted the thing it was arguing about. The figure is
+// now census-bound and matched on the CALL form, never the bare name: this file
+// mentions the function five times in prose, so a name-only count returns nine.
+// Each route is a separate argument list a later edit can
 // change independently — which is exactly how a parameter ends up threaded to
 // two call sites out of three. A pin on one route says NOTHING about the
 // others, so every citation below names its route.
@@ -110,14 +119,41 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // 21. ✔RE-MEASURED: that command returns 22, because THIS COMMENT contains the
 // very token it counts — the citation went stale the moment it landed, inside
 // its own cycle, which is the same failure mode as citing a line number. Anchor
-// the pattern to the START of a declaration line and no prose can pollute it,
-// because every line in this block opens with a slash pair:
-//     grep -cE '^(struct |\[\[nodiscard\]\] )?DSS_EXPORT' <this header>  = 21
-// — EIGHTEEN exported functions plus three exported structs (`CuMirModule`,
-// `EntryCandidate`, `ResolvedEntry`). Driver call-site counts below come from a
-// COMMENT-STRIPPED scan of `src/program/program.cpp` — 21 call sites over 13 of
-// the 18 entry points. A raw grep over-counts there too: `linkAndWrite`
-// "appears" twice and both occurrences are prose.
+// the pattern to the START of a declaration line and no prose can pollute it.
+//
+// ⚠⚠ AND THAT WAS STILL NOT ENOUGH. THE RE-ANCHORED INSTRUMENT WENT STALE BY SIX.
+// ✔MEASURED 2026-09-07 (cycle P63): the anchored count had been 21 here while the
+// tree said 27, and this block carried SEVEN false figures at once — the total,
+// both halves of the split, an `isArArchiveFile` driver call that is 0 and not 1,
+// "THREE routes" that are four, and a manifest ratio wrong in both terms. Nothing
+// in the paragraph above is wrong; the author reasoned correctly, fixed the real
+// pollution bug, and explained it — **and the number rotted anyway, because a
+// figure in a comment has no instrument attached.** ★ Care is not the missing
+// ingredient. A COMPARISON is. The figures below now carry
+// `<!--census:source:<key>-->` markers bound to `scripts/check-doc-census/source-census.json`,
+// so `doc_census_guard` re-derives them on every ctest run and a drift is a RED
+// rather than a discovery. The PATTERN lives in that document, not here — a
+// pattern quoted in prose is prose, and rots exactly like the number did:
+//     <!--census:source:program.exportedDecls-->30 exported declarations
+// — <!--census:source:program.exportedFunctions-->25 exported functions plus
+// <!--census:source:program.exportedStructs-->5 exported structs (`CuMirModule`,
+// `CuHirModule`, `EntryCandidate`, `ResolvedEntry`, `ResolveLibraryPartition`).
+//
+// ⚠ THE CALL-SITE FIGURES BELOW ARE **NOT** MACHINE-CHECKED, and that is stated
+// rather than left to be assumed from the markers above. Driver call-site counts
+// come from a COMMENT-STRIPPED scan of `src/program/program.cpp` — 29 call sites
+// over 19 of the 25 entry points — and neither is expressible as a census CLAIM,
+// which binds one integer to one line-count: "19 of 25" is a DISTINCT count and
+// the ratio further down is a RATIO. They were corrected by hand in P63 and
+// again in P64 and are unguarded. A raw grep over-counts there too:
+// `linkAndWrite` "appears" twice and both occurrences are prose.
+//
+// ★ THE P64 CORRECTION IS THE POINT THE PARAGRAPH ABOVE ARGUES, HAPPENING AGAIN.
+// `--write` moved the three MARKED figures (28→30 decls, 24→25 functions, 4→5
+// structs) and could not have moved either sentence around them: the STRUCT
+// ENUMERATION had gone one name short (`CuHirModule` was missing while the count
+// beside it was already repaired to 5), and the unmarked call-site pair was
+// stale. A number is repairable by a script; the claim it sits in is not.
 //
 // ── A. NO DRIVER SEAM — `program.cpp` never calls these ────────────────────
 // `effectiveLongDoubleFormat`, `compileSingleUnit`, `assembleUnit`,
@@ -160,6 +196,22 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 //   rdi/rsi under SysV. ⚠ Windows-only, and it takes `compileFiles` — the N==1
 //   route. See section D for the merged route.
 //
+// `buildCuHir` (1: `--emit-hir`'s stage stop inside `compileOneTarget`) — the
+//   SAME (target × format × callingConventionIndex) triple `buildCuMir` gets, and
+//   for the same reason: HIR is TARGET-DEPENDENT, so a mis-supply here does not
+//   fail loud — it emits a well-formed artifact describing a DIFFERENT program.
+//   ✔MEASURED: one source, two data models — `long` renders `i64 "long"` under
+//   LP64 and `i32 "long"` under LLP64, and a narrowing initializer carries an
+//   explicit `Cast` NODE on the first and NO node at all on the second (the
+//   identity retag). The node SET moves, not merely the spelling.
+//   PINNED by `program/test_emit_hir_mode` — one arm emits the same source for
+//   both targets and asserts the cast node is present on one and ABSENT on the
+//   other, which no single-target arm could distinguish from "types print
+//   differently". Its `diagBudget` parameter is deliberately a `DiagnosticBudget`
+//   rather than the whole `CompileOptions`: every other field of that bag
+//   describes the LOWER half, and narrowing the parameter makes a future
+//   lower-half option impossible to silently ignore on this route.
+//
 // `optimizeModule` (3) — `stage` is STRUCTURAL knowledge of WHICH call site this
 //   is, and nothing downstream can check it; `externImports` is DEFAULTED `= {}`.
 //   PINNED per route: archive member by `program/test_static_link`
@@ -199,8 +251,16 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 //   `program/test_driver_argument_supply`
 //   `DriverArgumentSupply.MergedMultiCuRouteSuppliesTheFormatsEntryVerbs`.
 //
-// `isArArchiveFile` (1) — the supply risk is the driver not making the CALL, so
-//   a `.a` on `--resolve-library` goes to the dynamic export reader. PINNED by
+// `isArArchiveFile` (**0** — ⚠ this said "1" until P63, and 0 is not a smaller
+//   number, it is a DIFFERENT CLAIM: `program.cpp` never calls this predicate, so
+//   the entry belongs with section A's no-driver-seam group and the "(1)" was
+//   asserting a seam that does not exist. ⓘ Left unbound by the census on
+//   purpose — every occurrence of the name in that file is PROSE, and the source
+//   provider counts matching lines without stripping comments, so a marker here
+//   would bind to 3 and be confidently wrong. An instrument that cannot express a
+//   claim must not be pointed at it) — the supply risk is precisely the driver
+//   not making the CALL, so a `.a` on `--resolve-library` goes to the dynamic
+//   export reader. PINNED by
 //   `program/test_static_link` `StaticLink.DriverStaticLinkBuildsSelfContainedExec`
 //   (`StaticLink.ArMagicDispatchByBytesNotExtension` is the UNIT half — it calls
 //   this predicate directly and cannot see the driver skipping it).
@@ -313,13 +373,23 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // allocation outcome, it belongs here in place of the run.
 //
 // ── AND WHAT THE MERGED ROUTE COSTS TO REACH AT ALL ────────────────────────
-// ✔MEASURED — by walking `examples/` for directories carrying an
-// `expected.json` and counting their `.c`/`.s` files — the merged route is
-// reachable ONLY through `Program::compileUnits` with ≥2 sources, and 22 of 613
-// shipped corpus example manifests have ≥2 such sources, so the corpus
-// exercises it about 3.6% as often as the single-CU route. (An earlier
-// spelling of this line said "22 of 614" with no instrument named; the
-// numerator reproduces, the denominator does not — hence the instrument.)
+// ✔MEASURED — the merged route is reachable ONLY through
+// `Program::compileUnits` with ≥2 sources, and
+// <!--census:examples:top.sources-->30 of the
+// <!--census:examples:manifests-->833 shipped corpus example manifests declare a
+// multi-source `sources` array, so the corpus exercises it roughly 3% as often
+// as the single-CU route.
+// ⚠ THE RATIO IS THE ONE FIGURE HERE THAT IS **NOT** MACHINE-CHECKED — a census
+// CLAIM binds one integer to one count, and a percentage is neither. It is left
+// deliberately coarse ("roughly 3%") so that it cannot be precisely wrong; the
+// two integers it is derived from ARE bound, so a reader can recompute it.
+// ★ THIS LINE HAS NOW BEEN WRONG THREE TIMES, EACH TIME MORE CAREFULLY. It began
+// as "22 of 614" with no instrument; a later cycle named an ad-hoc walk and made
+// it "22 of 613"; ✔P63 measured that BOTH numerator and denominator had drifted
+// again. The repair is not a fourth hand count — it is deleting the bespoke walk
+// in favour of the corpus census that already ships, so the figure is derived by
+// the same instrument that derives every other corpus number in this repository
+// and is compared on every ctest run.
 // That ratio is why this route accumulated the gaps, and why
 // each pin above builds its own 2-CU program rather than reusing a fixture: a
 // pin that quietly lost its second source would keep passing while testing the
@@ -447,7 +517,70 @@ struct CompileOptions {
     explicit CompileOptions(DiagnosticBudget b) noexcept : diagBudget(b) {}
     CompileOptions() = delete;
 
+    // ── `--emit-hir`: THE STAGE STOP ────────────────────────────────────────
+    //
+    // Non-null ⇒ `compileOneTarget` runs the front end to HIR, RENDERS the
+    // `.dsshir` text into this buffer, and RETURNS. No FFI resolution, no MIR,
+    // no optimizer, no codegen, no link, no object file, no artifact.
+    // Null on every compiling build, which is every build but `--emit-hir`'s.
+    //
+    // ★ A BUFFER, NOT A PATH OR A STREAM, AND THE CHOICE IS DELIBERATE. Where
+    // the artifact goes — a file, stdout, a test's `std::string` — is the
+    // DRIVER's policy, and `compileOneTarget` has no business opening files it
+    // was not already opening. Handing back the bytes keeps the one thing this
+    // seam knows (what the HIR of this unit is) separate from the one thing it
+    // does not (where the operator wants it), and it is what makes the whole
+    // path exercisable in-process without a filesystem.
+    //
+    // ⚠ THIS IS NOT A "COMPILE AND ALSO DUMP HIR" MODIFIER, and it must never
+    // become one. The CLI surface is a MODE (`--emit-hir`, mutually exclusive
+    // with `--compile`) precisely so that `rc == 0` means *"DSS accepted this
+    // source and the artifact is written"* and nothing else. A modifier would
+    // reintroduce the state the mode exists to remove: a non-zero exit standing
+    // beside a perfectly good artifact because a LATER stage — one with nothing
+    // to do with HIR — failed.
+    std::string* emitHirText = nullptr;
+
     DiagnosticBudget diagBudget;
+
+    // ── [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: PLAIN `char`'s SIGN, FOR
+    //    THIS (target x object format) ─────────────────────────────────────────
+    // `TargetSchema::charIsUnsigned(ObjectFormatKind)` -- the ONE accessor, on
+    // the ONE owner, with the format kind REQUIRED so no caller can take the
+    // processor half alone (the same arm64 CPU is unsigned under GNU/Linux and
+    // signed under Darwin). Resolved once by the driver, per target spec, and
+    // relayed from here; NEVER re-derived downstream.
+    //
+    // It rides `CompileOptions` rather than a parameter because its consumer is
+    // the MIR OPTIMIZER, which carries neither a target nor a format of its own
+    // -- the very reason the row this closes calls an `EvalOptions`-only fix a
+    // half-measure. `optimizeModule` reads it here and hands it to
+    // `opt::optimize` -> `ConstFold`, where `intKindInfo`'s `Char` row lives.
+    //
+    // ⚠ `nullopt` MEANS "NOT SUPPLIED" AND NOT "SIGNED": a `char`-typed fold
+    // then refuses (the instruction is copied verbatim -- a missed fold, never a
+    // wrong constant). A `false` default would have been right on three shipped
+    // legs and a silent wrong answer on the fourth.
+    std::optional<bool> charIsUnsigned{};
+
+    // ── ★★ [[D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING]]: WHICH OF THIS
+    //    ARTIFACT'S OWN DEFINITIONS ITS LOADER MAY REPLACE ──────────────────
+    // The active object format's `preemptibleDefinitionBindings`, verbatim.
+    // Relayed to `opt::optimize` and from there to the Inlining pass, which
+    // must not splice a body the loader may not run: in a shared library the
+    // local body of a default-visibility definition is not necessarily the one
+    // that executes, so inlining it bakes in the wrong answer exactly as
+    // inlining a WEAK body does.
+    //
+    // It rides `CompileOptions` for the SAME reason `charIsUnsigned` above
+    // does, and the reason is worth restating rather than referring to: the MIR
+    // OPTIMIZER carries neither a target nor a format of its own. Read once
+    // from the format at the driver and relayed from here; NEVER re-derived
+    // downstream.
+    //
+    // EMPTY (every format that declares no preemptible binding) leaves the
+    // Inlining pass byte-identical.
+    std::vector<SymbolBinding> preemptibleDefinitionBindings{};
 
     // Selects the default optimizer pipeline when `pipelineOverride`
     // is null. Resolved via `resolvePipelineName` (a constexpr table
@@ -692,6 +825,25 @@ struct DSS_EXPORT CuMirModule {
     // selects the right call-site opcode. nullopt iff the format declared
     // none — MIR→LIR then fails loud on any extern call.
     std::optional<ExternCallDispatch> externCallDispatch;
+    // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55): the
+    // DECLARED narrowing of WHICH symbol bindings that dispatch reaches
+    // through the import slot, captured here for the SAME reason as
+    // `externCallDispatch` — the LOWER half sees only this struct. EMPTY = the
+    // format declares no narrowing, i.e. every import (the unqualified meaning
+    // `indirect-slot` has always carried). The RULE that reads it has one
+    // owner, `ObjectFormatSchema::externRefTakesImportSlot`, which the linker
+    // calls directly; what travels here is the declared DATA.
+    std::vector<SymbolBinding> indirectSlotBindings;
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the active object
+    // format's DECLARED set of definition bindings this artifact's LOADER may
+    // replace with another image's body, captured here for the SAME reason as
+    // `externCallDispatch` above — the LOWER half sees only this struct. Empty
+    // (every format that does not declare the key) = nothing is preemptible and
+    // every module-internal call stays the direct branch it has always been.
+    // The RULE that reads it has one owner,
+    // `ObjectFormatSchema::definitionIsPreemptible`; what travels here is the
+    // declared DATA.
+    std::vector<SymbolBinding> preemptibleDefinitionBindings;
     // D-LK-EXTERN-DATA-IMPORT (c117): the active object format's extern-DATA
     // binding model (got-indirect / copy-relocation), captured here for the
     // SAME reason as `externCallDispatch` — the LOWER half (which sees only
@@ -863,6 +1015,56 @@ buildCuMir(CompilationUnit const&         cu,
            DiagnosticReporter&            reporter,
            CompileOptions const&          opts);
 
+// ── The front half's front half: everything up to and including HIR ──────────
+//
+// What `buildCuMir` produces before it has lowered anything to MIR: the
+// `SemanticModel` (which owns the type interner every downstream reader needs)
+// and the `CstToHirResult` (the module, its literal / inline-asm pools, and the
+// per-node side-tables lowering populated — `sourceMap` among them).
+//
+// Move-only, because both members are: `SemanticModel` is move-only and
+// `CstToHirResult` is neither copyable NOR movable, which is why it travels
+// behind a `unique_ptr` — its side-table maps bind to `&hir` inside itself, so
+// the object's ADDRESS is load-bearing and only a heap allocation keeps it
+// stable across a return.
+struct DSS_EXPORT CuHirModule {
+    SemanticModel                   model;
+    std::unique_ptr<CstToHirResult> hir;
+    // FC12b: the RESOLVED calling convention's whole `vaListLayout` block, or
+    // nullopt when the CC declares no variadic-callee ABI. Carried out of the
+    // front half rather than re-resolved by the lower half, because resolving
+    // the same fact twice is how two halves of one compile come to disagree.
+    std::optional<VaListLayout>     vaListLayout;
+};
+
+// Run semantic analysis and CST→HIR for ONE compilation unit against ONE
+// (target × format × calling convention), and STOP. Returns nullopt on any
+// front-half tier failure, with diagnostics on `reporter` — exactly
+// `buildCuMir`'s contract for the same two stages, because it IS those two
+// stages (see the implementation's docblock: `buildCuMir` calls this).
+//
+// ★ THE STOP IS THE PRODUCT. `--emit-hir` needs the HIR of a translation unit
+// that may not LINK — a single function in isolation is a normal input — so it
+// must not run, and must not require, FFI resolution / MIR / codegen / link.
+// Routing it through `buildCuMir` and discarding the tail would make HIR
+// emission conditional on stages that have nothing to do with HIR.
+//
+// ⚠ HIR IS TARGET-DEPENDENT, so this takes the same target/format/CC triple
+// `buildCuMir` does and is not a target-free operation. The data model decides
+// integer widths (and therefore which conversions are identity retags),
+// `long double`'s format, aggregate layout and the bit-field ABI; all four are
+// visible in the emitted text.
+//
+// Runs on the deep worker stack (D-PARSE-DEEP-FRONTEND-STACK) like `buildCuMir`.
+[[nodiscard]] DSS_EXPORT std::optional<CuHirModule>
+buildCuHir(CompilationUnit const&         cu,
+           GrammarSchema const&           grammar,
+           TargetSchema const&            target,
+           ObjectFormatSchema const&      format,
+           std::uint16_t                  callingConventionIndex,
+           DiagnosticBudget               diagBudget,
+           DiagnosticReporter&            reporter);
+
 // Run the configured optimizer pipeline over `mir` in place. Resolves the pipeline
 // the same way `buildCuMir` always did: an explicit `opts.pipelineOverride` (the
 // examples_runner's differential-verify arm + unit tests) takes precedence, else the
@@ -915,6 +1117,25 @@ optimizeModule(Mir&                  mir,
                // because a body surviving either optimize reaches codegen.
                std::span<ExternImport const> externImports = {});
 
+// The POST-SYNTHESIS MIR verify, run by BOTH driver seams — `buildCuMir`'s LOWER
+// half here and `Program::compileOneTarget` on the merge path — immediately
+// after the LAST synthesis pass (`synthesizeSehFunclets`). Returns true iff the
+// module verifies; on failure `MirVerifier` has already reported the specific
+// broken invariant and this adds one `I_VerifierFailure` naming the synthesis
+// TIER, so a reader knows a synthesized body produced it rather than the
+// optimizer or the front end.
+//
+// ★ ONE FUNCTION, NOT A BLOCK COPIED INTO EACH DRIVER, and that is deliberate:
+// [[D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY]] exists because the two
+// seams can silently come to check different things, and a hand-copied block is
+// exactly how that happens. With one definition the only remaining degree of
+// freedom is WHERE each seam calls it — which is what the source-order guard in
+// `tests/program` pins. See the definition for the coverage hole this closed.
+[[nodiscard]] DSS_EXPORT bool
+verifySynthesizedModule(Mir const&          mir,
+                        TypeInterner const& interner,
+                        DiagnosticReporter& reporter);
+
 // LOWER half: MIR → LIR → liveness → regalloc → rewrite → legalize → callconv →
 // assemble → symbol-table populate → user-entry scan. Consumes the `CuMirModule`
 // (its `externImports` are MOVED into MIR→LIR; its `mir` + `model` are read). Returns
@@ -948,7 +1169,22 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::optional<SehPersonality> const& sehPersonality,
                      std::string_view                  formatName,
                      std::string_view                  wideFloatSoftcallLibrary,
-                     DiagnosticReporter&               reporter);
+                     DiagnosticReporter&               reporter,
+                     // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics-runtime
+                     // block (the image owning the GENERIC `__atomic_load`/
+                     // `__atomic_store` entries + their already-mangled names for
+                     // this format). Threaded into MIR→LIR exactly like
+                     // `wideFloatSoftcallLibrary` above, and read off the schema at
+                     // the call site for the same reason. nullopt = this format
+                     // supplies none: an under-aligned `_Atomic` access then refuses
+                     // LOUD under a `traps` target (arm64 — the native LDAR/STLR pair
+                     // is a MEASURED SIGBUS) and keeps the native form under
+                     // `losesAtomicity` (x86_64, where it is what gcc ships). TRAILING
+                     // + DEFAULTED, the same positional-safe shape every format fact
+                     // on `lowerToLir` already takes, so a fixture that builds a raw
+                     // `CuMirModule` states "no format declared" by saying nothing.
+                     std::optional<AtomicsRuntime> const& atomicsRuntime =
+                         std::nullopt);
 
 // ── D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: PROGRAM-ENTRY RESOLUTION ───────────────
 //
@@ -1071,7 +1307,41 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // softcall runtime library, pre-resolved in program.cpp
                       // (no ObjectFormatKind in scope in the merge lower body).
                       std::optional<std::string> wideFloatSoftcallLibrary,
-                      DiagnosticReporter&  reporter);
+                      DiagnosticReporter&  reporter,
+                      // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's
+                      // atomics-runtime block, pre-resolved in program.cpp for
+                      // the same reason the softcall library above is (no
+                      // ObjectFormatKind in scope in the merge lower body).
+                      // Trailing + defaulted, like every format fact on
+                      // `lowerToLir`.
+                      std::optional<AtomicsRuntime> atomicsRuntime =
+                          std::nullopt,
+                      // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT
+                      // (P55): the format's DECLARED narrowing of WHICH symbol
+                      // bindings the `indirect-slot` dispatch above reaches
+                      // through the import slot, pre-resolved in program.cpp
+                      // for the same reason the two facts above are.
+                      // ⚠ NOT DEFAULTED-AND-FORGOTTEN AT THE CALL SITE: the
+                      // merge path emits `.obj`s too, and a merged module that
+                      // silently lost the narrowing would carry the
+                      // unnarrowed cost while its format document said
+                      // otherwise — and, worse, its call sites would disagree
+                      // with the linker's slot pass, which reads the format
+                      // directly. Defaulted only so the positional tail stays
+                      // additive; program.cpp passes it.
+                      std::vector<SymbolBinding> indirectSlotBindings = {},
+                      // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
+                      // the format's DECLARED set of definition bindings
+                      // this artifact's LOADER may replace with another
+                      // image's body, pre-resolved in program.cpp for the
+                      // same reason the facts above are. Empty = nothing is
+                      // preemptible. ⚠ PASSED AT THE CALL SITE, NOT LEFT TO
+                      // THE DEFAULT, for the reason the narrowing above
+                      // states one level sharper: a merged module lowered
+                      // without it emits the DIRECT branch that is the
+                      // whole defect, and nothing downstream can tell that
+                      // branch from a legitimately module-private one.
+                      std::vector<SymbolBinding> preemptibleDefinitionBindings = {});
 
 // Link N assembled CUs into one image + commit to `outPath` (the shared half of
 // `compileSingleUnit`). N==1 is the v1 single-CU path; N>1 triggers the linker's

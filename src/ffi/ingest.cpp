@@ -9,6 +9,11 @@
 // magic-byte table and the reader tier's one kind->F_* emit path rather than
 // re-stating either (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL).
 #include "ffi/binary_readers/reader_common.hpp"
+// `readArArchive`: the ONE parser of the `ar` container shape. The archive arm
+// of the boundary guard needs member OFFSETS, and re-deriving them here would
+// be a second owner of the container format -- the exact duplication the FF1
+// dispatch was built to avoid.
+#include "ffi/binary_readers/ar_reader.hpp"
 #include "ffi/mangling/c_mangle.hpp"
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/hir_node.hpp"
@@ -18,6 +23,9 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <ios>
+#include <iterator>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -108,53 +116,407 @@ objectFormatKindOfGuess(FormatGuess g) noexcept {
     return std::nullopt;
 }
 
-// Classify the file WITHOUT reading it and WITHOUT reporting anything: the
-// leading bytes are all `guessFormat` consumes (8 for `ar`, 4 for ELF/Mach-O,
-// 2 for PE). Every failure -- cannot open, short, empty -- returns `nullopt`
-// and defers to `readImports`, which opens the same path two lines later and
-// reports F_FileOpenFailed / F_FileEmpty with its own wording. A SILENT probe
-// whose failures are handled loud by the very next call is exactly the contract
-// `isArArchiveFile` (program/compile_pipeline.cpp) already runs on this same
-// flag's inputs; duplicating the open-failure diagnostic here would double-
-// report one broken path.
-[[nodiscard]] static std::optional<ObjectFormatKind>
-peekObjectFormatKind(std::filesystem::path const& libraryPath) {
-    std::ifstream in(libraryPath, std::ios::binary);
-    if (!in) return std::nullopt;
-    std::uint8_t buf[8] = {};
-    in.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(sizeof(buf)));
-    auto const got = static_cast<std::size_t>(in.gcount());
-    if (got == 0u) return std::nullopt;
-    return objectFormatKindOfGuess(
-        guessFormat(std::span<std::uint8_t const>{buf, got}));
+// ── THE FORMAT'S OWN ARCHITECTURE DECLARATION, off the SCHEMA ───────────────
+//
+// D-FFI-RESOLVE-LIBRARY-DOES-NOT-CHECK-THE-LIBRARY-ARCH. The right-hand side of
+// the architecture comparison, and the exact mirror of
+// `objectFormatKindOfGuess` above: a pure TRANSLATION from one closed enum to
+// the field of the schema that speaks that kind's vocabulary. It selects a
+// FIELD, never a behaviour — every arm returns a number of the same type, and
+// the one consumer compares it for EQUALITY against a number of the same
+// vocabulary decoded from the library's own header. Swap the kinds and the
+// behaviour is byte-identical, which is the test P44 ruled this file's sibling
+// exempt on (see the block above `objectFormatKindOfGuess`).
+//
+// The values are DECLARED DATA in the format JSON (`elf.machine`,
+// `pe.machine`, `macho.cputype`) -- ✔MEASURED: all 22 shipped documents of
+// those three kinds declare a non-zero code AND a `targetArch`, so the guard is
+// armed on every format this repository ships. Deliberately NO
+// "0 means undeclared" escape: a format document that failed to declare its
+// architecture would then DISARM this guard for every library it is ever handed,
+// silently and with nothing to notice -- an escape that every input triggers is
+// not a guard. Left unescaped, such a document instead rejects loud with a
+// message naming a nonsense `0`, discoverable at the first build.
+//
+// `nullopt` reaches no live path from the one caller: the kinds have ALREADY
+// been proven equal there, and `objectFormatKindOfGuess` only ever produces
+// Elf / Pe / MachO. The arms exist so `-Werror=switch` forces a sixth object
+// format to answer the question rather than inherit a default.
+[[nodiscard]] static std::optional<std::uint32_t>
+declaredArchitectureCode(ObjectFormatSchema const& format) noexcept {
+    switch (format.kind()) {
+        case ObjectFormatKind::Elf:     return format.elf().machine;
+        case ObjectFormatKind::Pe:      return format.pe().machine;
+        case ObjectFormatKind::MachO:   return format.macho().cputype;
+        case ObjectFormatKind::Wasm:
+        case ObjectFormatKind::Spirv:
+        case ObjectFormatKind::Unknown: return std::nullopt;
+    }
+    return std::nullopt;
 }
 
-// ★ THE COMPARISON ITSELF — the SINGLE owner of "is this library's format the
-// one this build emits", and of the sentence that says it isn't. Doc + rationale
-// on the declaration in `ingest.hpp`.
+// What to CALL the architecture a format emits for, in a message an operator
+// has to act on. `targetArch` is the `.target.json` NAME and is the word the
+// operator types on the command line, so it is preferred; `name()` is the
+// format document's own name and is always present, so it is the fallback that
+// keeps the sentence readable if a document ever omits the optional key. Two
+// DECLARED names, never a derived spelling.
+[[nodiscard]] static std::string_view
+architectureLabel(ObjectFormatSchema const& format) noexcept {
+    return format.targetArch().empty() ? format.name() : format.targetArch();
+}
+
+// What a `--resolve-library` input DECLARES ABOUT ITSELF, read from its header
+// and from nothing else. Both members are `nullopt` for an input that names no
+// such thing -- see the four sources of that on `objectFormatKindOfGuess` and
+// on `architectureFieldOf` (binary_readers/reader_common.hpp) -- and both are
+// `nullopt` for a file that cannot be opened or is too short to classify.
+struct PeekedLibraryIdentity {
+    std::optional<ObjectFormatKind> kind;
+    std::optional<std::uint32_t>    architectureCode;
+    // The FORMAT'S OWN name for the field `architectureCode` came out of
+    // (`e_machine` / `Machine` / `cputype`), so the refusal can tell the
+    // operator which header field to go and look at. Empty iff the code is.
+    std::string_view                architectureFieldName;
+    // An `ar` CONTAINER answers `nullopt` to both questions above and is still
+    // not "nothing to check" -- its MEMBERS answer both. Carried as its own
+    // flag rather than inferred from the two `nullopt`s, because an unopenable
+    // file and a truncated one produce the same two `nullopt`s and must NOT be
+    // walked as archives.
+    bool                            isArContainer = false;
+};
+
+// Classify the file WITHOUT reading it and WITHOUT reporting anything: a
+// 64-byte header prefix is all `guessFormat` and `architectureFieldOf` consume
+// between them (see `kArchitectureLeadBytes`). Every failure -- cannot open,
+// short, empty -- returns an EMPTY identity and defers to `readImports`, which
+// opens the same path two lines later and reports F_FileOpenFailed /
+// F_FileEmpty with its own wording. A SILENT probe whose failures are handled
+// loud by the very next call is exactly the contract `isArArchiveFile`
+// (program/compile_pipeline.cpp) already runs on this same flag's inputs;
+// duplicating the open-failure diagnostic here would double-report one broken
+// path.
+//
+// ⚠ THE ARCHITECTURE FIELD IS NOT ALWAYS IN THE PREFIX. PE keeps its COFF
+// header at an arbitrary file offset named by `e_lfanew`, so the prefix
+// LOCATES the field and the stream then SEEKS to it. A seek or read that fails
+// leaves the code `nullopt` -- the same defer-to-`readImports` posture, since a
+// file whose own header offset points past its end is a structural fault that
+// tier reports in full.
+[[nodiscard]] static PeekedLibraryIdentity
+peekLibraryIdentity(std::filesystem::path const& libraryPath) {
+    PeekedLibraryIdentity out;
+    std::ifstream in(libraryPath, std::ios::binary);
+    if (!in) return out;
+    std::uint8_t buf[kArchitectureLeadBytes] = {};
+    in.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(sizeof(buf)));
+    auto const got = static_cast<std::size_t>(in.gcount());
+    if (got == 0u) return out;
+    std::span<std::uint8_t const> const lead{buf, got};
+    auto const guess = guessFormat(lead);
+    out.kind          = objectFormatKindOfGuess(guess);
+    out.isArContainer = guess == FormatGuess::Ar;
+
+    auto const field = architectureFieldOf(guess, lead);
+    if (!field.has_value()) return out;
+    // ⚠ NOT A DEAD BRANCH, unlike an overflow test on the offset SUM: PE's
+    // `e_lfanew` is operator-supplied bytes, so `field->offset` can exceed what
+    // a `streamoff` can express on a host with a 32-bit `streamoff`, and
+    // seeking with a truncated value would read a small, plausible, WRONG
+    // location instead of failing.
+    if (field->offset
+            > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+        return out;
+    }
+    std::uint8_t fieldBytes[4] = {};
+    in.clear();   // the prefix read may have hit EOF on a short file
+    in.seekg(static_cast<std::streamoff>(field->offset), std::ios::beg);
+    if (!in) return out;
+    in.read(reinterpret_cast<char*>(fieldBytes),
+            static_cast<std::streamsize>(field->width));
+    if (static_cast<std::size_t>(in.gcount()) != field->width) return out;
+    out.architectureCode =
+        decodeArchitectureCode(std::span<std::uint8_t const>{fieldBytes,
+                                                             field->width},
+                               *field);
+    out.architectureFieldName = field->fieldName;
+    return out;
+}
+
+// The identity a set of bytes ALREADY IN MEMORY declares -- the archive-member
+// twin of `peekLibraryIdentity`, which has to seek. Same table, same decode,
+// no second opinion: a member is an object file like any other, it is simply
+// reached through a container instead of through a path.
+[[nodiscard]] static PeekedLibraryIdentity
+identityOfBytes(std::span<std::uint8_t const> bytes) noexcept {
+    PeekedLibraryIdentity out;
+    if (bytes.empty()) return out;
+    auto const lead =
+        bytes.subspan(0, std::min<std::size_t>(bytes.size(),
+                                               kArchitectureLeadBytes));
+    auto const guess = guessFormat(lead);
+    out.kind          = objectFormatKindOfGuess(guess);
+    out.isArContainer = guess == FormatGuess::Ar;
+    auto const field = architectureFieldOf(guess, lead);
+    if (!field.has_value()) return out;
+    if (field->offset > bytes.size()
+        || bytes.size() - field->offset < field->width) {
+        return out;   // the field is not inside this member's payload
+    }
+    out.architectureCode = decodeArchitectureCode(
+        bytes.subspan(static_cast<std::size_t>(field->offset), field->width),
+        *field);
+    out.architectureFieldName = field->fieldName;
+    return out;
+}
+
+// ★ THE COMPARISON ITSELF — the SINGLE owner of "can this input serve the
+// image this build emits", and of the two sentences that say it cannot. Doc +
+// rationale on the declaration in `ingest.hpp`.
+//
+// TWO tests, in this order, because the second is only meaningful once the
+// first has passed: an ELF `e_machine` and a Mach-O `cputype` are numbers in
+// DIFFERENT vocabularies, so comparing them across formats would be arithmetic
+// on unrelated units. Once the kinds agree, both sides speak one vocabulary and
+// the comparison is an equality like the first one.
+//
+// ⓘ IT TAKES THE INPUT'S SPELLING AND ITS NOUN RATHER THAN A PATH, so the
+// SAME two sentences serve a file (`'libfoo.so'`, "library") and an archive
+// MEMBER (`'libfoo.a(bar.o)'`, "archive member") without either being restated.
+// A second copy of a refusal is how two arms of one guard come to disagree
+// about what they say -- the shape `partitionResolveLibraries`' own report
+// closure already exists to prevent.
+[[nodiscard]] static std::optional<BinaryReadError>
+compareIdentityAgainstFormat(std::string_view             inputSpelling,
+                             std::string_view             inputNoun,
+                             PeekedLibraryIdentity const& detected,
+                             ObjectFormatSchema const&    format,
+                             DiagnosticReporter&          reporter) {
+    if (!detected.kind.has_value()) return std::nullopt;
+    if (*detected.kind != format.kind()) {
+        // Message shape mirrors `elf::readRelocatableObject`'s wrong-schema
+        // refusal (link/format/elf_object_reader.cpp): name the input, name what
+        // it IS, name what was needed, and say what to do. Every format spelling
+        // comes from the closed `kObjectFormatKindTable` or from the schema --
+        // never a literal.
+        return emitAndReturn(
+            BinaryReadErrorKind::UnsupportedFormat,
+            std::format(
+                "--resolve-library '{0}': this file's object format is {1}, but the "
+                "build emits object format '{2}' (kind {3}) -- a {1} {4} cannot "
+                "satisfy a {3} link, and binding its exports would record an import "
+                "the loader can never resolve. Point --resolve-library at the {3} "
+                "build of this library, or build for a {1} target.",
+                inputSpelling,
+                objectFormatKindName(*detected.kind),
+                format.name(),
+                objectFormatKindName(format.kind()),
+                inputNoun),
+            reporter);
+    }
+
+    // ── RIGHT FORMAT, WRONG CPU ────────────────────────────────────────────
+    // D-FFI-RESOLVE-LIBRARY-DOES-NOT-CHECK-THE-LIBRARY-ARCH, the other axis of
+    // the same boundary. ✔MEASURED before the guard existed: an x86_64 `.so`
+    // handed to an aarch64 ELF build produced rc=0 with ZERO diagnostics and an
+    // aarch64 artefact whose DT_NEEDED names that x86_64 library; the mirror
+    // direction and the Mach-O pair (an x86_64 `.dylib` into an arm64 build)
+    // behaved identically. No decoration rule, no format rule and no symbol
+    // lookup can see this -- one library's export NAMES are usually the other's
+    // -- so the artefact ships and dies at LOAD, which is the silent shape the
+    // sibling format guard exists to convert into a compile-time error.
+    if (!detected.architectureCode.has_value()) return std::nullopt;
+    auto const wanted = declaredArchitectureCode(format);
+    if (!wanted.has_value() || *wanted == *detected.architectureCode) {
+        return std::nullopt;
+    }
+    // Same four obligations as the format message -- name the input, what it IS,
+    // what was needed, what to do -- plus the FIELD each number came out of, so
+    // the operator can confirm the verdict against the file itself. Both codes
+    // are printed in hex AND decimal because the three formats' own references
+    // disagree about which they use (`EM_AARCH64 183`, `IMAGE_FILE_MACHINE_ARM64
+    // 0xAA64`, `CPU_TYPE_ARM64 0x0100000C`).
+    return emitAndReturn(
+        BinaryReadErrorKind::UnsupportedFormat,
+        std::format(
+            "--resolve-library '{0}': this {1} {7} declares {2} 0x{3:X} ({3}), "
+            "but the build emits '{4}' for architecture '{5}', whose {1} images "
+            "declare {2} 0x{6:X} ({6}) -- an input built for a different CPU "
+            "cannot satisfy this link, and binding it would record a "
+            "dependency the loader can never resolve. Point "
+            "--resolve-library at the '{5}' build of this library, or build for "
+            "the architecture this library was built for.",
+            inputSpelling,
+            objectFormatKindName(*detected.kind),
+            detected.architectureFieldName,
+            *detected.architectureCode,
+            format.name(),
+            architectureLabel(format),
+            *wanted,
+            inputNoun),
+        reporter);
+}
+
+// ── THE CONTAINER ARM: an `ar` archive is checked THROUGH ITS MEMBERS ───────
+//
+// D-FFI-RESOLVE-LIBRARY-DOES-NOT-CHECK-THE-LIBRARY-ARCH and its sibling
+// D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL both stopped at the
+// container, on the reasoning that its MEMBERS carry the architecture "and are
+// checked where their bytes are in hand". ⚠ THAT SENTENCE WAS FALSE, and it was
+// false on BOTH axes: `partitionResolveLibraries` (program/compile_pipeline.cpp)
+// routes archives and relocatable objects OUT of `resolveLibraries` before the
+// per-CU build, so the only tier that compared anything against the target
+// never saw them, and nothing downstream compared them either --
+// `elf_backend`'s `looksLikeRelocatableObject` states that `e_machine` IS
+// DELIBERATELY NOT CHECKED, `macho_backend` says the same for `cputype`, and
+// `elf_object_reader` has no machine comparison at all.
+//
+// ✔MEASURED at the cycle base, shipped CLI, no externs in the TU so no member
+// is ever pulled:
+//   x86_64 `.a`  -> arm64:elf64-aarch64-linux-exec  rc=0, ZERO diagnostics,
+//                   artefact emitted with e_machine 183
+//   arm64  `.a`  -> x86_64:elf64-x86_64-linux-exec  rc=0, ZERO diagnostics,
+//                   artefact emitted with e_machine 62
+//   PE `.lib`    -> x86_64:elf64-x86_64-linux-exec  rc=0, ZERO diagnostics
+// With an extern that DOES pull a member the build fails, but on
+// `K_UnwindRuleUnrepresentable` naming register 'x16' -- a DWARF CFI complaint
+// that happens to fire, never an architecture check, and it says nothing an
+// operator can act on.
+//
+// ★ SO THE MEMBERS ARE CHECKED HERE, WHERE THEIR BYTES ARE IN HAND, and the
+// sentence is now true. The container itself still declares nothing -- that
+// delegation was always right -- but "declares nothing" is not "cannot be
+// checked": an archive is a list of objects, each of which answers both
+// questions through the SAME table a standalone file does (`identityOfBytes`).
+// ⓘ EVERY member, not the first: a mixed-architecture archive is expressible
+// (`lipo`-style universal archives are built exactly that way), and a
+// first-member check would pass one and mis-link the rest.
+// ⓘ The refusal names the member in the linker's own `archive(member)`
+// notation -- the same spelling `readAr` already uses for `libraryPath` -- so
+// the operator can run `ar t` and see the file the message is about.
+[[nodiscard]] static std::optional<BinaryReadError>
+checkArchiveMembersMatchTargetFormat(std::filesystem::path const& archivePath,
+                                     ObjectFormatSchema const&    format,
+                                     DiagnosticReporter&          reporter) {
+    // ⚠ A SILENT PARSE. Everything that can go wrong reading the container --
+    // unopenable, truncated, a corrupt member header -- returns "no objection"
+    // and leaves the report to the tier that MERGES the archive, which reads
+    // the same bytes with the same reader and reports structural faults in
+    // full. Reporting here as well would double-report one broken archive; the
+    // contract is `peekLibraryIdentity`'s, one tier up.
+    std::ifstream in(archivePath, std::ios::binary);
+    if (!in) return std::nullopt;
+    std::vector<std::uint8_t> const bytes{
+        std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    if (bytes.empty()) return std::nullopt;
+
+    DiagnosticReporter quiet;   // the parse's own diagnostics are not ours
+    auto const archive = readArArchive(
+        std::span<std::uint8_t const>{bytes}, archivePath.generic_string(),
+        quiet);
+    if (!archive.has_value()) return std::nullopt;
+
+    bool anyMemberIsOurs = false;
+    for (auto const& member : archive->members) {
+        if (member.dataOffset > bytes.size()
+            || bytes.size() - member.dataOffset < member.size) {
+            continue;   // structurally impossible; the merge tier reports it
+        }
+        auto const payload = std::span<std::uint8_t const>{bytes}.subspan(
+            static_cast<std::size_t>(member.dataOffset),
+            static_cast<std::size_t>(member.size));
+        if (format.looksLikeRelocatableObject(payload)) anyMemberIsOurs = true;
+        auto rejected = compareIdentityAgainstFormat(
+            std::format("{0}({1})", core::genericSpelling(archivePath),
+                        member.name),
+            "archive member", identityOfBytes(payload), format, reporter);
+        if (rejected.has_value()) return rejected;
+    }
+
+    // ── THE MEMBER WHOSE MAGIC NAMES NOTHING ───────────────────────────────
+    //
+    // ⚠ THE LOOP ABOVE CANNOT SEE A COFF OBJECT, and that is not an oversight
+    // of this function: a COFF relocatable object has NO magic. Its header
+    // opens with `Machine`, a number only a format DOCUMENT can say is
+    // recognisable, so `guessFormat` classifies it `Unknown` and the
+    // comparison correctly declines to guess. ✔MEASURED: before this arm, a PE
+    // `.lib` handed to `x86_64:elf64-x86_64-linux-exec` built rc=0 with ZERO
+    // diagnostics -- the FORMAT axis, silent, for exactly the input class the
+    // per-member magic cannot classify.
+    //
+    // ★ THE FORMAT ITSELF ANSWERS IT, and this is the only tier that can ask:
+    // `looksLikeRelocatableObject` IS "an object this document could have
+    // written", declared per format (the ELF arm checks class + encoding +
+    // ET_REL, the PE arm checks `Machine` + a zero optional-header size, the
+    // Mach-O arm checks the thin magic of its own width + MH_OBJECT). Adding a
+    // magic-free COFF arm to `guessFormat` instead would put a format's
+    // private layout into the shared classifier and still could not tell one
+    // machine from another.
+    //
+    // ⓘ AND IT IS ASKED OF THE ARCHIVE, NEVER OF A MEMBER, which is what keeps
+    // it from false-refusing. A real archive may carry members no DSS reader
+    // consumes -- LTO bitcode, resources, a toolchain's own bookkeeping --
+    // beside perfectly good objects, and refusing per member would reject that
+    // archive for carrying something it is entitled to carry. What cannot be
+    // right is an archive in which NOT ONE member is an object this build
+    // could read: a `--resolve-library` archive exists to be MERGED, so such a
+    // container can contribute nothing and its symbols will go unresolved with
+    // no earlier signal. An archive with NO members at all is legal and empty
+    // of claims, so it is left alone.
+    if (!archive->members.empty() && !anyMemberIsOurs) {
+        return emitAndReturn(
+            BinaryReadErrorKind::UnsupportedFormat,
+            std::format(
+                "--resolve-library '{0}': not one of this archive's {1} "
+                "member(s) is a relocatable object this build could have "
+                "produced -- the build emits object format '{2}' (kind {3}), "
+                "and the first member is '{4}'. A `--resolve-library` archive "
+                "is MERGED into the image, so an archive holding nothing this "
+                "link can read contributes nothing and leaves every symbol it "
+                "was named for unresolved. Point --resolve-library at the {3} "
+                "build of this library.",
+                core::genericSpelling(archivePath),
+                archive->members.size(),
+                format.name(),
+                objectFormatKindName(format.kind()),
+                archive->members.front().name),
+            reporter);
+    }
+    return std::nullopt;
+}
+
 std::optional<BinaryReadError>
 checkLibraryMatchesTargetFormat(std::filesystem::path const& libraryPath,
                                 ObjectFormatSchema const&    format,
                                 DiagnosticReporter&          reporter) {
-    auto const detected = peekObjectFormatKind(libraryPath);
-    if (!detected.has_value() || *detected == format.kind()) return std::nullopt;
-    // Message shape mirrors `elf::readRelocatableObject`'s wrong-schema refusal
-    // (link/format/elf_object_reader.cpp): name the input, name what it IS, name
-    // what was needed, and say what to do. Every format spelling comes from the
-    // closed `kObjectFormatKindTable` or from the schema -- never a literal.
-    return emitAndReturn(
-        BinaryReadErrorKind::UnsupportedFormat,
-        std::format(
-            "--resolve-library '{0}': this file's object format is {1}, but the "
-            "build emits object format '{2}' (kind {3}) -- a {1} library cannot "
-            "satisfy a {3} link, and binding its exports would record an import "
-            "the loader can never resolve. Point --resolve-library at the {3} "
-            "build of this library, or build for a {1} target.",
-            core::genericSpelling(libraryPath),
-            objectFormatKindName(*detected),
-            format.name(),
-            objectFormatKindName(format.kind())),
-        reporter);
+    auto const detected = peekLibraryIdentity(libraryPath);
+    if (detected.isArContainer) {
+        return checkArchiveMembersMatchTargetFormat(libraryPath, format,
+                                                    reporter);
+    }
+    return compareIdentityAgainstFormat(core::genericSpelling(libraryPath),
+                                        "library", detected, format, reporter);
+}
+
+// The MERGED inputs' arm of the same boundary. Doc + the measurement live on
+// the declaration in `ingest.hpp`.
+bool checkMergedLibraryInputsMatchTargetFormat(
+        std::span<std::filesystem::path const> archives,
+        std::span<std::filesystem::path const> objects,
+        ObjectFormatSchema const&              format,
+        DiagnosticReporter&                    reporter) {
+    bool ok = true;
+    // ⚠ NO EARLY RETURN. An operator who named three wrong-architecture inputs
+    // is told about three of them, not shown one and left to re-run twice; the
+    // sibling probe in `compile_pipeline`'s step 2.5-pre takes the same posture
+    // over the dynamic partition for the same reason.
+    for (auto const& path : archives) {
+        if (checkLibraryMatchesTargetFormat(path, format, reporter)) ok = false;
+    }
+    for (auto const& path : objects) {
+        if (checkLibraryMatchesTargetFormat(path, format, reporter)) ok = false;
+    }
+    return ok;
 }
 
 // The target-aware read. Doc + rationale live on the declaration in
@@ -635,9 +997,11 @@ ingest(std::span<IngestionSource const> sources,
             }
         }
         // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker (parity
-        // with the FF5 source-decl path). Eager imports flow through
-        // `synthesizeFfiFromSourceDecls`, not this binary-reader path — but an
-        // eager ExternDeclRef routed here must not silently drop the field.
+        // with the FF5 source-decl path). No producer reaching this stage sets it
+        // today ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]] retired the one that did), but
+        // this is a CONDUIT: dropping a caller's stated value here would be a
+        // stage silently overriding its input, which is how a bit goes missing one
+        // layer below where it was set.
         meta.isEagerImport = ext.isEagerImport;
         // The raw OBSERVED embedded soname of the binary that was READ.
         // Populated now that the FF1 readers extract it; `ExternImport` carries
@@ -790,9 +1154,11 @@ synthesizeFfiFromSourceDecls(
         // reader. Rides to the MIR ExternImport → the ELF writer's
         // .gnu.version_r. Empty (the default) ⇒ unversioned.
         meta.version = std::string{ext.version};
-        // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker (producer
-        // C shipped-descriptor imports) to the MIR ExternImport → the linker's
-        // reference gate, which keeps an eager row even when unreferenced.
+        // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker verbatim to
+        // the MIR ExternImport → the linker's reference gate, which keeps an eager
+        // row even when unreferenced. Shipped-descriptor rows (producer C) stopped
+        // setting it in P57 ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]); this stage still
+        // carries whatever its caller declared and decides nothing.
         meta.isEagerImport = ext.isEagerImport;
         // `soname` left empty — same convention as `ingest()`.
 

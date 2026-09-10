@@ -9,13 +9,19 @@
 #include "core/types/config_path_walk.hpp"
 #include "core/types/parse_diagnostic.hpp"
 
+#include <algorithm>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <sstream>
+#include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 
 // ── PIN (D-CORE-JSON-LEAKS-INTO-TWO-PUBLIC-HEADERS) ─────────────────────────
@@ -132,6 +138,20 @@ ObjectFormatSchema::loadFromFile(std::filesystem::path const& path) {
     // resolved by the caller through `loadShipped`, each one its own load with
     // its own digest, so nothing is folded in behind this document's back.
     //
+    // ⚠⚠ AND THAT CLAIM IS AN INVARIANT THIS FILE MUST KEEP, NOT A DESCRIPTION
+    // OF TODAY (D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE).
+    // The flavour-family role scan reads every sibling `.format.json`, and its
+    // first cut cached the result in a `mutable` member of the instance stored
+    // BELOW — which folds 23 other documents into an entry keyed on this one's
+    // bytes, i.e. exactly the stale-hit shape `config_document_memo.hpp` names a
+    // SILENT MISCOMPILE. It is now assembled per CALLER
+    // (`FormatRuntimeLibraryRoleResolver`, whose lifetime is one binding
+    // operation) and the instance holds nothing derived from a sibling.
+    // ⇒ ANY future member whose value depends on a file other than this one must
+    // either be recorded here as a `ConfigDocumentDependency` or not live on the
+    // instance at all. `sourceDirectory_` is neither: it is a function of the
+    // memo LABEL, which is already half the key.
+    //
     // ⓘ The miss path digests these bytes twice (once here for the key, once
     // inside `loadFromText` for `contentDigest()`) — bounded to the cold path,
     // and 🧠DERIVED from the ✔MEASURED Debug digest rate (14.5 ns/byte) at well
@@ -153,6 +173,14 @@ ObjectFormatSchema::loadFromFile(std::filesystem::path const& path) {
     // ⚠ Stored only on the SUCCESS path — a failed load produced diagnostics and
     // no schema, and the loader's own refusal already reports it every time.
     if (schema) {
+        // The document's OWN directory, for the flavour-family scan. Recorded
+        // here rather than resolved from the ambient shipped root at question
+        // time: a schema's siblings are the documents beside IT, and a build
+        // that changes `DSS_CONFIG_ROOT` after loading a format must not have
+        // that format's family answered out of a different tree.
+        (*schema)->sourceDirectory_ =
+            path.has_parent_path() ? path.parent_path().generic_string()
+                                   : std::string{};
         detail::ConfigDocumentMemo<ObjectFormatSchema>::store(
             label, std::move(digest),
             std::vector<detail::ConfigDocumentDependency>{}, *schema);
@@ -167,6 +195,127 @@ ObjectFormatSchema::loadShipped(std::string_view name) {
                                    DiagnosticCode::C_InvalidFormatName});
     if (!path) return std::unexpected(std::move(path).error());
     return loadFromFile(*path);
+}
+
+// ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE:
+//    the flavour FAMILY's role table, assembled from the shipped siblings ──
+//
+// A shipped-library descriptor names a runtime role PER OBJECT-FORMAT KIND
+// (`{"pe": {"role": "cLibrary"}}`), while this tier writes the role table per
+// FLAVOUR and only where one of the flavour's own blocks names the role — a
+// `-dll` or `-staticlib` document declares no `cLibrary`, and the loader
+// would refuse one as inert config. So the flavours that do not declare a role
+// answer it from the ones that do, and the ones that do must agree: the rule
+// `EveryFlavourOfAFormatKindNamesOneProviderPerRole` pins at test time is
+// enforced here at build time, on the same population.
+namespace {
+
+[[nodiscard]] std::string providerSpelling(RuntimeLibraryBinding const& row) {
+    return row.source.empty() ? ("image '" + row.image + "'")
+                              : ("shipped source '" + row.source + "'");
+}
+
+} // namespace
+
+// Every shipped flavour of this document's kind EXCEPT its namesake, merged. The
+// scan is TOTAL and sorted by filename for the two reasons
+// `runtime::resolveArchiveSiblingFormat` gives: agreement cannot be proven by
+// a scan that stops early, and a disagreement message must not read
+// differently on NTFS (sorted) and ext4 (hash-ordered). The namesake is
+// skipped because the MEMBER is that flavour for this build — a
+// `loadFromText` mutant of `…-exec` supersedes the shipped `…-exec`, and a
+// shipped member simply meets itself.
+std::expected<RuntimeLibraryTable, std::string>
+ObjectFormatSchema::assembleFlavourRuntimeLibraries() const {
+    ObjectFormatSchema const& member = *this;
+    // THIS document's own directory, or — for a `loadFromText` schema, which
+    // came from no directory at all — the ambient shipped one. The fallback is
+    // the mutant case and only the mutant case: a document read from disk always
+    // answers out of the tree it was read from.
+    std::optional<std::filesystem::path> dir;
+    if (!sourceDirectory_.empty()) dir = std::filesystem::path{sourceDirectory_};
+    else                           dir = findShippedConfigDir("object-formats");
+    if (!dir) {
+        return std::unexpected(std::format(
+            "the shipped object-format directory (src/dss-config/object-formats) "
+            "could not be located, so the flavour family of object format '{}' "
+            "cannot be assembled",
+            member.name()));
+    }
+    std::error_code ec;
+    std::vector<std::filesystem::path> documents;
+    for (std::filesystem::directory_iterator it{*dir, ec}, end; it != end;
+         it.increment(ec)) {
+        if (ec) break;
+        std::error_code typeEc;
+        if (!it->is_regular_file(typeEc) || typeEc) continue;
+        if (!it->path().filename().string().ends_with(".format.json")) continue;
+        documents.push_back(it->path());
+    }
+    if (ec) {
+        return std::unexpected(std::format(
+            "the scan of object-format directory '{}' was interrupted after "
+            "PARTIAL enumeration ({}); a partial scan cannot prove the flavour "
+            "family of '{}' agrees, so it is refused",
+            dir->generic_string(), ec.message(), member.name()));
+    }
+    std::sort(documents.begin(), documents.end(),
+              [](std::filesystem::path const& a, std::filesystem::path const& b) {
+                  return a.filename().string() < b.filename().string();
+              });
+
+    RuntimeLibraryTable      merged;
+    std::vector<std::string> declaredBy;   // parallel to `merged.bindings`
+    for (auto const& document : documents) {
+        auto loaded = ObjectFormatSchema::loadFromFile(document);
+        if (!loaded.has_value()) {
+            // A document that cannot be read is a REFUSAL, never a skip: it
+            // could have declared the very role this family is asked for, and
+            // skipping it would answer from whichever siblings happened to load.
+            std::string detail;
+            for (auto const& diag : loaded.error()) {
+                if (!detail.empty()) detail += "; ";
+                detail += diag.message;
+            }
+            return std::unexpected(std::format(
+                "object-format document '{}' failed to load while assembling "
+                "the flavour family of '{}': {}. The scan must be TOTAL — a "
+                "document that cannot be read could have declared a role this "
+                "family is asked for",
+                document.generic_string(), member.name(), detail));
+        }
+        ObjectFormatSchema const& candidate = **loaded;
+        if (candidate.kind() != member.kind()) continue;
+        if (candidate.name() == member.name()) continue;
+        for (auto const& row : candidate.runtimeLibraries().bindings) {
+            auto const* const existing = merged.rowForRole(row.role);
+            if (existing == nullptr) {
+                merged.bindings.push_back(row);
+                declaredBy.push_back(std::string{candidate.name()});
+                continue;
+            }
+            if (existing->image == row.image && existing->source == row.source) {
+                continue;
+            }
+            auto const at = static_cast<std::size_t>(
+                existing - merged.bindings.data());
+            // The family is named by its MEMBER, never by a kind spelling: this
+            // tier asks a document what it declares and does not render format
+            // identity (`ObjectFormatBackendRegistry.SchemaTierDoesNotCompareFormatIdentity`).
+            return std::unexpected(std::format(
+                "the flavour family of object format '{}' declares "
+                "runtime-library role '{}' with two different providers across "
+                "its documents: {} in '{}', {} in '{}'. Who plays a runtime role "
+                "is a property of the format FAMILY, and a shipped-library "
+                "descriptor names the role per family; which flavour a build "
+                "happens to select must not decide which image it imports, so "
+                "the disagreement is refused rather than resolved by scan order",
+                member.name(), runtimeLibraryRoleName(row.role),
+                providerSpelling(*existing), declaredBy[at],
+                providerSpelling(row), candidate.name()));
+        }
+    }
+    return merged;
 }
 
 // ── The one reverse map (D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS) ──
@@ -539,6 +688,96 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                          "DECLARED.",
                          detail::renderAllowedList(
                              allNames(kWeakDefinitionDialectTable), " or ")));
+    }
+
+    // ── D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET: a
+    //    PRESENT `objectImportSlot` block must name a prefix ──────────────
+    //
+    // The SHAPE rule only, for the same reason the `weakDefinition` arm above
+    // states its own: presence is the declaration, so absence is not an error
+    // here. What IS an error is a block that is present and empty — the slot
+    // would then be published under the IMPORTED SYMBOL'S OWN NAME, which the
+    // final linker reads as this object DEFINING the name it is importing.
+    //
+    // ⚠ THE PAIRING RULE — that a relocatable format declaring
+    // `dataImportBinding` MUST declare this block, and that an IMAGE format
+    // must NOT — is enforced at the LINKER and deliberately not here. It reads
+    // `isImageFlavor()`, which is a BACKEND question (`ObjectFormatSchema`),
+    // and `validate()` runs on the DATA. Stating half of it here from the
+    // `container` field would be a second, weaker spelling of one rule, which
+    // is the drift shape this file's own `cSymbolDecoration` history records.
+    if (objectImportSlot.has_value() && objectImportSlot->symbolPrefix.empty()) {
+        fail("/objectImportSlot/symbolPrefix",
+             "'objectImportSlot' is present but declares an empty "
+             "'symbolPrefix' — a DECLARED block must state the name the "
+             "object-carried data-import slot is published under. An empty "
+             "prefix publishes the slot under the IMPORT'S OWN name, so the "
+             "object would DEFINE the symbol it is importing. Omit the block "
+             "entirely to declare that this format carries no slot. "
+             "D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET.");
+    }
+
+    // ── D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT:
+    //    a narrowing needs something to narrow ────────────────────────────
+    //
+    // `indirectSlotBindings` says WHICH imports the `indirect-slot` dispatch
+    // applies to. Under any other dispatch NO import takes the slot, so the
+    // list would name a rule nothing consults — config that reads as a
+    // capability and is not one, the D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE
+    // shape. Refused rather than ignored, because the direction of the
+    // mistake is the dangerous one: a format author who narrows the wrong key
+    // gets an object that still carries the unnarrowed cost and a document
+    // that says otherwise.
+    //
+    // ⓘ BOTH KEYS ARE IN `data`, so unlike the `objectImportSlot` pairing rule
+    // above this one belongs HERE rather than at the linker: it needs no
+    // `isImageFlavor()` backend question. The IMAGE side is covered without a
+    // second rule — no image format declares `indirect-slot` (their walkers
+    // point an extern's VA at a callable thunk), so this arm already refuses
+    // the narrowing on every one of them.
+    if (!indirectSlotBindings.empty()
+        && externCallDispatch != ExternCallDispatch::IndirectSlot) {
+        fail("/indirectSlotBindings",
+             std::string{"'indirectSlotBindings' narrows which imports take "
+                         "the import-slot shape, but this format declares "}
+                 + (externCallDispatch.has_value()
+                        ? std::string{"'externCallDispatch: "}
+                              + std::string{externCallDispatchName(
+                                    *externCallDispatch)} + "'"
+                        : std::string{"no 'externCallDispatch'"})
+                 + ", under which no extern reference takes a slot at all — "
+                   "so the list narrows nothing and no consumer reads it. "
+                   "Declare 'externCallDispatch: "
+                 + std::string{externCallDispatchName(
+                       ExternCallDispatch::IndirectSlot)}
+                 + "' too, or remove the narrowing. "
+                   "D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT.");
+    }
+
+    // ── D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
+    //    a preemptible definition needs a shape to be REACHED by ───────────
+    //
+    // `preemptibleDefinitionBindings` says the loader may replace one of this
+    // artifact's own definitions, so a reference made INSIDE the artifact must
+    // go through the loader rather than branch to the local body. The reference
+    // that replaces the direct branch is an ordinary loader-resolved call, and
+    // WHAT SHAPE that call takes is `externCallDispatch`'s answer. A format
+    // that declares preemption but no dispatch has declared a rule whose
+    // consumer cannot act: MIR→LIR would have to pick a call shape blind, and
+    // picking the wrong one is a SIGSEGV, not a slow path
+    // (see `externCallUsesIndirectShape`'s docblock). Refused at LOAD, where
+    // the document that made the claim can still be named.
+    if (!preemptibleDefinitionBindings.empty()
+        && !externCallDispatch.has_value()) {
+        fail("/preemptibleDefinitionBindings",
+             "'preemptibleDefinitionBindings' declares that this artifact's "
+             "own definitions may be replaced by the loader, so a reference "
+             "made inside the artifact must be resolved by the loader instead "
+             "of branching to the local body — but this format declares no "
+             "'externCallDispatch', so there is no declared shape for that "
+             "reference and MIR->LIR cannot emit one. Declare "
+             "'externCallDispatch' too, or remove the preemption list. "
+             "D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING.");
     }
 
     // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): container rules ──
@@ -1082,6 +1321,13 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                               librarySynthesis->libraryPath,
                               "/librarySynthesis"});
         }
+        // D-CSUBSET-PACKED-ATOMIC-MEMBER: the fifth role-naming spine block.
+        if (atomicsRuntime.has_value()
+            && atomicsRuntime->role != RuntimeLibraryRole::None) {
+            claims.push_back({atomicsRuntime->role,
+                              atomicsRuntime->libraryPath,
+                              "/atomicsRuntime"});
+        }
         for (auto const& c : claims) {
             auto const image = runtimeLibraries.imageForRole(c.role);
             if (!image.has_value()) {
@@ -1237,5 +1483,171 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
 }
 
 } // namespace detail
+
+// ── D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ───────
+//
+// The placeholder scanner and the substitution, in ONE pass so the two cannot
+// disagree about what a placeholder is. See the header for why the vocabulary
+// is closed and why an unknown spelling is a refusal rather than a pass-through.
+
+namespace {
+
+// The SIGIL. Every one of these in a declared identity must open a well-formed
+// placeholder — see `resolveArtifactIdentity` and the header's ★ note on why
+// the scan keys on the sigil alone rather than on the two-character `${`.
+constexpr char kPlaceholderSigil = '$';
+
+// The opening delimiter. The closing one is a single `}`, so a placeholder
+// cannot nest and the scan needs no depth counter.
+constexpr std::string_view kPlaceholderOpen = "${";
+
+// The closed vocabulary, spelled ONCE. `kArtifactFileNamePlaceholder` in the
+// header is `kPlaceholderOpen + kArtifactFileNameKey + '}'`, and the static
+// assertion below refuses a future edit that lets the two drift.
+constexpr std::string_view kArtifactFileNameKey = "artifactFileName";
+
+// ⓘ These compare STRINGS, not lengths. The first draft asserted only that the
+// sizes matched, under a message claiming "must be the same string" — a comment
+// stating a property its own check could not see, which is the failure class
+// this project files as a defect. C++23 gives `string_view` a constexpr `==`.
+static_assert(kArtifactFileNamePlaceholder.size()
+                  == kPlaceholderOpen.size() + kArtifactFileNameKey.size() + 1u,
+              "the exported placeholder spelling and the key this TU "
+              "substitutes must be the same string");
+static_assert(kArtifactFileNamePlaceholder.substr(0, kPlaceholderOpen.size())
+                  == kPlaceholderOpen,
+              "the exported placeholder must open with the delimiter this TU "
+              "scans for");
+static_assert(kArtifactFileNamePlaceholder.substr(kPlaceholderOpen.size(),
+                                                  kArtifactFileNameKey.size())
+                  == kArtifactFileNameKey,
+              "the exported placeholder must name the key this TU substitutes");
+static_assert(kArtifactFileNamePlaceholder.back() == '}',
+              "the exported placeholder must be closed");
+static_assert(kPlaceholderOpen.front() == kPlaceholderSigil,
+              "the sigil the scan keys on must be the delimiter's first "
+              "character, or a well-formed placeholder would not be found");
+
+// ★ THE NEAR-MISS RULE, HALF TWO. A vocabulary key spelled with NO sigil at
+// all — `{artifactFileName}` — is the one wrong guess the sigil scan cannot
+// see, because there is nothing in it to scan. So a literal run of the
+// identity that CONTAINS a key name is refused too: an author who typed the
+// key meant the substitution, whatever dialect they reached for.
+// ⚠ This is deliberately over-broad by one absurd case — an artifact honestly
+// named `artifactFileName.dylib` is refused. That trade is the whole point of
+// the row: a false positive here is a loud diagnostic at document load that
+// says exactly what to write, and a false negative is a binary shipping an
+// identity nobody meant, discovered by a loader on someone else's machine.
+[[nodiscard]] bool literalRunNamesAKey(std::string_view run) noexcept {
+    return run.find(kArtifactFileNameKey) != std::string_view::npos;
+}
+
+} // namespace
+
+bool declaresArtifactIdentityPlaceholder(
+        std::string_view declaredIdentity) noexcept {
+    return declaredIdentity.find(kPlaceholderSigil) != std::string_view::npos;
+}
+
+std::expected<std::string, std::string>
+resolveArtifactIdentity(std::string_view declaredIdentity,
+                        std::string_view artifactFileName) {
+    // ── The literal run that precedes the next sigil (or the tail). Refused
+    // when it names a key with no sigil; appended to the output otherwise.
+    auto takeLiteralRun =
+        [&](std::string_view run) -> std::expected<std::string, std::string> {
+        if (literalRunNamesAKey(run)) {
+            return std::unexpected(std::format(
+                "the declared identity '{}' spells the placeholder key '{}' "
+                "outside a placeholder. Every substitution in this vocabulary "
+                "is written '{}' — `{{{}}}`, `$({})` and `${}` are other "
+                "dialects' spellings and mean nothing here, so they would ship "
+                "as the artifact's LITERAL runtime identity. Write '{}' if you "
+                "meant the substitution.",
+                declaredIdentity, kArtifactFileNameKey,
+                kArtifactFileNamePlaceholder, kArtifactFileNameKey,
+                kArtifactFileNameKey, kArtifactFileNameKey,
+                kArtifactFileNamePlaceholder));
+        }
+        return std::string{run};
+    };
+
+    std::string out;
+    out.reserve(declaredIdentity.size());
+    std::size_t cursor = 0;
+    while (cursor < declaredIdentity.size()) {
+        std::size_t const open =
+            declaredIdentity.find(kPlaceholderSigil, cursor);
+        if (open == std::string_view::npos) {
+            auto tail = takeLiteralRun(declaredIdentity.substr(cursor));
+            if (!tail.has_value()) {
+                return std::unexpected(std::move(tail).error());
+            }
+            out.append(*tail);
+            break;
+        }
+        auto run = takeLiteralRun(declaredIdentity.substr(cursor, open - cursor));
+        if (!run.has_value()) {
+            return std::unexpected(std::move(run).error());
+        }
+        out.append(*run);
+        // ★ THE NEAR-MISS RULE, HALF ONE. The scan keys on the SIGIL, not on
+        // the two-character `${`, so every OTHER dialect's spelling is a
+        // refusal instead of a silent pass-through: `$(NAME)` is Make's and
+        // `$NAME` is sh's — the two likeliest wrong guesses — and a stray or
+        // trailing `$` is a typo. All of them used to ship rc 0 with the
+        // author's mistake embedded verbatim in the binary's identity.
+        if (declaredIdentity.substr(open, kPlaceholderOpen.size())
+            != kPlaceholderOpen) {
+            return std::unexpected(std::format(
+                "the declared identity '{}' carries a '{}' that does not open "
+                "'{}'. In this vocabulary the '{}' is a SUBSTITUTION SIGIL and "
+                "nothing else: there is no literal '{}' and no other dialect's "
+                "spelling, because a '{}' passed through verbatim ships inside "
+                "the artifact's runtime identity and is discovered by a loader "
+                "rather than by this build. Write '{}', or remove the '{}'.",
+                declaredIdentity, kPlaceholderSigil, kPlaceholderOpen,
+                kPlaceholderSigil, kPlaceholderSigil, kPlaceholderSigil,
+                kArtifactFileNamePlaceholder, kPlaceholderSigil));
+        }
+        std::size_t const close = declaredIdentity.find('}', open);
+        if (close == std::string_view::npos) {
+            return std::unexpected(std::format(
+                "the declared identity '{}' opens a placeholder with '{}' that "
+                "is never closed by a '}}'. An identity is embedded in the "
+                "emitted artifact verbatim, so an unterminated placeholder "
+                "would ship as literal text and be discovered by a loader "
+                "rather than by this build. Close it, or remove the '{}'.",
+                declaredIdentity, kPlaceholderOpen, kPlaceholderOpen));
+        }
+        std::string_view const key = declaredIdentity.substr(
+            open + kPlaceholderOpen.size(),
+            close - open - kPlaceholderOpen.size());
+        if (key != kArtifactFileNameKey) {
+            return std::unexpected(std::format(
+                "the declared identity '{}' names the placeholder '${{{}}}', "
+                "which is not one this substrate can answer. The vocabulary is "
+                "closed and holds exactly: '{}'. An unknown spelling is refused "
+                "rather than passed through, because a passed-through typo "
+                "ships as the artifact's literal runtime identity.",
+                declaredIdentity, key, kArtifactFileNamePlaceholder));
+        }
+        if (artifactFileName.empty()) {
+            return std::unexpected(std::format(
+                "the declared identity '{}' is a function of the artifact being "
+                "produced, but this emission was given no artifact file name to "
+                "resolve '{}' against. There is deliberately NO fallback: "
+                "substituting a fixed name here is exactly the defect this "
+                "declaration replaced — every artifact of one format then "
+                "claims one runtime identity, and a program that loads two of "
+                "them gets one. Supply the artifact file name on the image "
+                "request, or declare a literal identity.",
+                declaredIdentity, kArtifactFileNamePlaceholder));
+        }
+        out.append(artifactFileName);
+        cursor = close + 1u;
+    }
+    return out;
+}
 
 } // namespace dss

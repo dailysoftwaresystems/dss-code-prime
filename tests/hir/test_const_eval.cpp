@@ -81,9 +81,29 @@ struct Rig {
     }
 };
 
-ConstEvalResult eval(Rig& r, HirNodeId expr) {
+// [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the fixture STATES a plain-`char`
+// signedness instead of inheriting one. `intKindInfo`'s `Char` row is the one row
+// that is not a property of C — C 6.2.5p15 leaves it implementation-defined and
+// the TARGET declares it — so with no answer supplied the engine refuses to fold
+// a `char` at all rather than picking a sign. Every fixture in this file that
+// touches `TypeKind::Char` therefore says which target it is speaking for; SIGNED
+// (`charIsUnsigned = false`) is x86_64 under every object format, arm64 x macho,
+// and what these fixtures were implicitly written against.
+//
+// ⚠ WHY THIS TIER REFUSES ON AN ABSENT FACT WHILE THE CST TIER ONLY REFUSES WHEN
+// THE VALUE MAKES IT OBSERVABLE. The CST const-expr engine is reachable from
+// callers that genuinely have no target — the LSP and the FFI header parser —
+// so refusing every `(char)` cast there would be a real capability loss for a
+// question that usually has one answer. This engine is entered only by a real
+// compile, and `compile_pipeline` threads the resolved answer unconditionally;
+// the only way to arrive here without one is a hand-built fixture, which should
+// say what it means.
+ConstEvalResult eval(Rig& r, HirNodeId expr,
+                     std::optional<bool> charIsUnsigned = false) {
     Hir hir = r.finishWith(expr);
-    return evaluateConstant(hir, r.interner, r.literals, expr);
+    EvalOptions opts;
+    opts.charIsUnsigned = charIsUnsigned;
+    return evaluateConstant(hir, r.interner, r.literals, expr, {}, opts);
 }
 
 } // namespace
@@ -1883,29 +1903,34 @@ namespace {
 TEST(ConstEvalUnsignedModular, OperationDomainIsTheUsualArithmeticConversions) {
     // Two u32 operands -> u32. This is `bitIntUac`'s "both standard" arm, which
     // carried the comment "dead in practice" until this row made it live.
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: `intOpDomain` reads
+    // `intKindInfo`, whose `Char` row is the one row a TARGET declares rather
+    // than the standard; every operand here is a standard kind, so the answer is
+    // the same under either, and the fixture states SIGNED (x86_64, arm64 x
+    // macho) rather than leaving it unstated.
     auto d = detail::intOpDomain(HirOpKind::Sub, lit(TypeKind::U32, 0),
-                                 lit(TypeKind::U32, 1));
+                                 lit(TypeKind::U32, 1), /*charIsUnsigned=*/false);
     ASSERT_TRUE(d.has_value());
     EXPECT_EQ(d->bits, 32);
     EXPECT_FALSE(d->isSigned);
     // Mixed sign at equal rank -> UNSIGNED wins (C 6.3.1.8). This is what makes
     // `-1 == 0xffffffffu` true.
     d = detail::intOpDomain(HirOpKind::Eq, lit(TypeKind::I32, -1),
-                            lit(TypeKind::U32, 0xffffffff));
+                            lit(TypeKind::U32, 0xffffffff), false);
     ASSERT_TRUE(d.has_value());
     EXPECT_FALSE(d->isSigned) << "mixed sign at equal rank must convert to unsigned";
     // C 6.3.1.1 promotion: a sub-int operand promotes to signed int, so an
     // unsigned char pair yields a SIGNED domain -- clang and gcc agree, and a
     // fix that made this unsigned would be wrong in the other direction.
     d = detail::intOpDomain(HirOpKind::Sub, lit(TypeKind::U8, 0),
-                            lit(TypeKind::U8, 1));
+                            lit(TypeKind::U8, 1), false);
     ASSERT_TRUE(d.has_value());
     EXPECT_EQ(d->bits, 32);
     EXPECT_TRUE(d->isSigned) << "u8 promotes to int; the result is signed";
     // C 6.5.7p3: a shift's type is the PROMOTED LEFT operand, never the UAC of
     // both -- so a u64 count must not drag a u32 left operand to 64 bits.
     d = detail::intOpDomain(HirOpKind::Shl, lit(TypeKind::U32, 1),
-                            lit(TypeKind::U64, 1));
+                            lit(TypeKind::U64, 1), false);
     ASSERT_TRUE(d.has_value());
     EXPECT_EQ(d->bits, 32);
     EXPECT_FALSE(d->isSigned);

@@ -277,8 +277,19 @@ bool synthesizeStdioShim(
     }
 
     // Resolve a UCRT core by NAME against the module's existing imports. These are
-    // ORDINARY stdio.json symbol rows (user decision) — NOT minted here — so the
-    // eager-import law has already proven each is a real export of the bound library.
+    // ORDINARY stdio.json symbol rows (user decision) — NOT minted here.
+    // ⚠ THE PROOF THAT EACH IS A REAL EXPORT CHANGED ON 2026-09-03 AND THIS COMMENT
+    // NAMED THE OLD ONE. It used to read "the eager-import law has already proven
+    // each is a real export of the bound library", and that law is gone:
+    // [[D-FFI-DESCRIPTOR-EAGER-IMPORT]] made a descriptor symbol NON-eager by
+    // default, so a declared-but-unreferenced core is now DROPPED rather than
+    // bound. What still holds the guarantee is narrower and worth stating exactly:
+    // the shim BODIES this pass emits CALL these cores, so every core reachable
+    // from a synthesized recipe carries a relocation and survives the linker's
+    // reference gate on its own merit. ✔MEASURED: a pe64 image still imports the
+    // three `__stdio_common_v*` cores after the flip, where its elf and Mach-O
+    // siblings import none — because the shim bodies reference them and nothing
+    // else does.
     // An absent name means stdio.json declared a `synthesize` row without its core: a
     // descriptor/pass drift, and exactly the kind of gap that would otherwise produce a
     // silently-undefined shim.

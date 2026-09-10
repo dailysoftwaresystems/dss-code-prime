@@ -210,6 +210,17 @@ target_link_libraries(dss_link_test_macho_object_reader
 # fuzz, the corruption red-pins (nonzero SizeOfOptionalHeader, unknown reloc
 # nativeId, out-of-range SymbolTableIndex, out-of-range SectionNumber), non-PE
 # schema fail-loud, and the DTYPE_FUNCTION extern isData inference.
+# D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET — the
+# FOREIGN-LINKER half of the object-carried data-import slot. `test_pe_writer`
+# owns the byte pins (which relocation names which symbol); only link.exe,
+# mingw `ld` and a RUN can show that the object LINKS and takes the right
+# branch, and the defect was invisible to every DSS-internal instrument (the
+# DSS-linked PE exec returned 42 throughout). Compiles through the production
+# driver, hence the `program` surface — the same reach `ffi/test_pe_abort_
+# behavior_binding` takes for the same reason.
+dss_add_test(NAME link/test_pe_object_data_import_slot
+             SOURCES test_pe_object_data_import_slot.cpp)
+
 dss_add_test(NAME link/test_coff_object_reader SOURCES test_coff_object_reader.cpp)
 # The emission-alias pin splices ONE extra `relocations[]` row into a shipped
 # `.format.json`, deriving the aliased wire id and a free `kind` FROM the
@@ -303,6 +314,16 @@ dss_add_test(NAME link/test_runtime_library_roles
              SOURCES test_runtime_library_roles.cpp)
 target_link_libraries(dss_link_test_runtime_library_roles
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE — the
+# CROSS-TIER half of the role table: the `shippedLibs/*.json` descriptors spell
+# the SAME images as literals, and nothing forced the two tiers to agree. Lives
+# under tests/link rather than tests/ffi because it loads format documents
+# through `ObjectFormatSchema::loadShipped` (their own loader, never a raw read
+# of a key the link tier owns) — the layering split tests/ffi deliberately
+# keeps. Needs no json link: both sides are read through their real loaders.
+dss_add_test(NAME link/test_descriptor_library_role_agreement
+             SOURCES test_descriptor_library_role_agreement.cpp)
 
 # D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO (Mach-O half) — the
 # `__TEXT,__eh_frame` writer. The DWARF encoder (test_dwarf_cfi) was complete
@@ -398,6 +419,18 @@ target_link_libraries(dss_link_test_extern_dispatch_and_block_shape_projection
 # the cwd unless `DSS_CONFIG_ROOT` is set, and only `dss_add_test` sets it.
 dss_add_test(NAME link/test_weak_definition_dialect
              SOURCES test_weak_definition_dialect.cpp)
+
+# D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the WEAK extern IMPORT --
+# a reference that may legally resolve to NOTHING. Asserts the SYMBOL TABLE on
+# all three formats (ELF STB_WEAK, Mach-O N_WEAK_REF, COFF WEAK_EXTERNAL plus an
+# absolute value-0 fallback), each beside its GLOBAL control in the same object,
+# plus the write/read round trip and the cross-CU strongest-wins fold. The RUN
+# witness for the resolve-to-null case is examples/c/weak_extern_import_null;
+# asserting the link SUCCEEDS is exactly what hid this defect for a year.
+# MUST run through ctest, never a bare .exe: the shipped-config resolver walks
+# the cwd unless `DSS_CONFIG_ROOT` is set, and only `dss_add_test` sets it.
+dss_add_test(NAME link/test_weak_reference_binding
+             SOURCES test_weak_reference_binding.cpp)
 target_link_libraries(dss_link_test_weak_definition_dialect
                       PRIVATE nlohmann_json::nlohmann_json)
 
@@ -476,3 +509,162 @@ dss_add_test(NAME link/test_intrasection_baked_call
 # APPENDED, never interleaved -- this file is append-only by lane convention.
 dss_add_test(NAME link/test_artifact_withheld_after_error
              SOURCES test_artifact_withheld_after_error.cpp)
+
+# D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT: both Mach-O IMAGE nlist builders
+# stamped `N_SECT|N_EXT` on EVERY defined function, so a `static` reached the
+# image under its real name with the EXTERNAL bit set and LC_DYSYMTAB published
+# `nlocalsym 0`; ld64 emits it `N_SECT` with no `N_EXT`, FIRST in the table,
+# under `ilocalsym 0 nlocalsym 1 iextdefsym 1` (✔MEASURED 2026-09-04 on Apple
+# Silicon, Apple clang 21.0.0 / ld-1267). Pins, over both ports x all three
+# image arms -- five of those six cells reach the bands, the arm64 STATIC cell
+# pinning the D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION refusal instead, each
+# port DECLARING which it expects so the coverage cannot empty itself:
+# the binding through the shared `definedNType`, the locals-first
+# band order, the six LC_DYSYMTAB fields exactly, every indirect-symbol index
+# still naming the import it named before, and the `machoDysymtabBandBreach`
+# predicate's every refusal arm — plus the same shape through the REAL
+# pipeline (the entry trampoline is the second Local), so the corpus example
+# `examples/c/macho_static_fn_image` and this pin describe one artifact.
+dss_add_test(NAME link/test_macho_image_symtab_bands
+             SOURCES test_macho_image_symtab_bands.cpp)
+
+# D-LINK-MACHO-OBJECT-SYMTAB-MISALIGNED: the MH_OBJECT writer packed its
+# trailer (the `__text` / `__data` / relro relocation tables and the nlist_64)
+# hard against the file-backed section span, so `symoff` landed wherever the
+# section bytes ended — ✔MEASURED ≡ 3/4/6/7 mod 8 on 12 of 21 base objects,
+# and ≡ 0 on every `.o` Apple clang writes. Harmless to dyld (no __LINKEDIT
+# on a relocatable) and Apple `cc` linked + ran the misaligned objects, which
+# is why the fix carries its OWN witness (an Apple `cc` link + RUN of the
+# changed objects and a byte-diff showing every moved byte is an offset field
+# or zero padding, recorded in the row) and these pins: each trailer table
+# starts 8-aligned at the first aligned offset after its predecessor, the gaps
+# are zero, the sizes are exact, and DSS's own reader walks the published
+# offsets — over modules whose raw span end is deliberately NOT aligned.
+dss_add_test(NAME link/test_macho_object_trailer_alignment
+             SOURCES test_macho_object_trailer_alignment.cpp)
+
+# D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL +
+# D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL: the ELF `.symtab`'s TWO
+# linkage axes, pinned together because ONE shared decision produces both.
+# Both IMAGE `.symtab` builders stamped STB_GLOBAL on EVERY defined function,
+# so a `static` reached the image under its real name with a linkage that
+# misdescribes it and `.symtab.sh_info` never moved off 2; and the shared
+# `ObjectSymbolNames` predicate answered a LINKAGE question with
+# `isExternallyVisible` (a question about other IMAGES), so a called
+# `visibility("hidden")` function came out STB_LOCAL on every writer and lost
+# its NAME at the ET_REL tier as well. ✔MEASURED 2026-09-05 (Ubuntu 24.04,
+# binutils 2.42 / llvm 18), each reference probed separately with CONTROLS in
+# the same artifact: gcc 13.3.0 and clang 18.1.3 emit a `static` `FUNC LOCAL
+# DEFAULT` inside the prefix `sh_info` names and a called hidden function
+# `FUNC GLOBAL HIDDEN` past it, in a linked exec on x86_64 and aarch64 at -O0
+# and -O2 and in a `.o`, while the ordinary extern-linkage CONTROLS of the same
+# artifact stay `FUNC GLOBAL DEFAULT`. Pins, over both ports x all three image
+# arms (static ET_EXEC, dynamic exec, ET_DYN shared object) plus the ET_REL
+# tier of the same module, each arm DECLARING its `sh_info` and whether it
+# carries or exports a `.dynsym` so a cell cannot silently stop covering the
+# builder it names: the exact `.symtab` sequence of names, st_info AND
+# st_other; the locals-first order, with a LOCAL CANONICAL CARRYING A GLOBAL
+# ALIAS as the only row that can tell an interleaved alias emission from a
+# banded one; the published `sh_info` against the arm's own absolute; and the
+# `.dynsym` export set still refusing both the `static` and the hidden symbol.
+# Plus the `-staticlib` ARCHIVE INDEX, a SECOND statement about the same
+# definitions that was built from the OTHER predicate (an armap omitting a name
+# its own member defines makes a foreign `ld` report "undefined reference" for a
+# symbol the archive contains); and the same shapes through the REAL pipeline
+# over two corpus sources that are themselves RUN witnesses on the linux legs
+# (`examples/c/macho_static_fn_image` and
+# `examples/c/gnu_attribute_linkage_positions_crosscu`), so the run and the
+# structural pin describe ONE artifact.
+dss_add_test(NAME link/test_elf_image_symtab_partition
+             SOURCES test_elf_image_symtab_partition.cpp)
+
+# D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the DECLARATION half of the
+# routing — `preemptibleDefinitionBindings`, which names the definitions of its
+# own that an artifact's LOADER may replace. Its own target because EVERY
+# failure mode of this key is silent in the SAME direction (the routing quietly
+# does not happen and the artifact looks fine), so the loader's refusals — empty
+# array, unknown spelling, `local`, a duplicate, and the missing
+# `externCallDispatch` pairing — are the only thing between a typo and the
+# divergence coming back.
+dss_add_test(NAME link/test_preemptible_definition_declaration
+             SOURCES test_preemptible_definition_declaration.cpp)
+
+# D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: the relocation
+# VOCABULARY of the ELF relocatable-object reader, measured on REAL members of a
+# REAL distro glibc `libc.a` (embedded as golden fixtures) rather than on a
+# synthesised object -- a DSS-emitted object is written by the same table the
+# reader reads back, so it can never carry a wire type DSS has not declared and
+# can never exercise this. Its own target because the three properties it pins
+# pull in opposite directions (the guard REFUSES an undeclared type, one more
+# declared row makes a real member READ, and that row must not make the guard
+# permissive) and a shared binary would let one of them go vacuous unnoticed.
+dss_add_test(NAME link/test_glibc_relocation_vocabulary
+             SOURCES test_glibc_relocation_vocabulary.cpp)
+# Splices ONE extra `relocations[]` row into the SHIPPED target + format documents,
+# deriving the free `kind` FROM the document rather than hardcoding it -- hence the
+# json link, the same pattern the COFF reader pin above uses.
+target_link_libraries(dss_link_test_glibc_relocation_vocabulary
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: the RESOLUTION
+# half. The vocabulary target above proves a REAL glibc `libc.a` member READS;
+# this one proves the read module LINKS -- the static ET_EXEC walker mints a
+# `.got`, every GOT-slot-relative site is patched to name a slot inside it, and
+# each slot holds the target's link-time address. Its own target because its
+# three arms are a closure, a CONTROL that the section is minted on demand
+# rather than always, and the guard that a still-undeclared wire type is STILL
+# refused -- folding them into a shared binary is how one of the three goes
+# vacuous without anyone noticing.
+dss_add_test(NAME link/test_glibc_gotpcrel_resolution
+             SOURCES test_glibc_gotpcrel_resolution.cpp)
+
+# D-LK-ELF-EMITS-NO-BUILD-ID-NOTE: the ELF image's `.note.gnu.build-id` -- its
+# wire record, the fixed-point content derivation, reproducibility, distinctness,
+# and the `--build-id=none` CONTROL (a document derived from the shipped one with
+# the `note` row REMOVED emits no note at all). Its own target because the
+# control derives a SECOND format document at run time, which needs the json
+# link -- the same pattern the glibc vocabulary target above uses -- and because
+# a build id that is present but not content-derived, or content-derived but not
+# reproducible, are different defects that a shared binary would let hide behind
+# one another.
+dss_add_test(NAME link/test_elf_build_id_note
+             SOURCES test_elf_build_id_note.cpp)
+target_link_libraries(dss_link_test_elf_build_id_note
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET: an ELF image's
+# allocated sections must sit on the alignment their own headers declare, on BOTH
+# shipped ports and BOTH image arms. Its own target because the two ports' declared
+# bases make the luck run in OPPOSITE directions (0x400000 divides 8192, 0x401000
+# does not), so a cell that passes proves nothing about its sibling -- exactly the
+# way a single-port pin called half of this fixed.
+dss_add_test(NAME link/test_elf_image_overaligned_section_placement
+             SOURCES test_elf_image_overaligned_section_placement.cpp)
+
+# D-LINK-MACHO-IMAGE-OVERALIGNED-STATIC-IS-A-LOAD-TIME-COIN-FLIP: the Mach-O half
+# of the ELF over-alignment row. Two halves in one target because they are two
+# answers to ONE question and separating them would let a reader take the
+# refutation for the whole finding: the LOAD-TIME half is a real defect (Mach-O's
+# segment_command_64 has no p_align equivalent, so an above-page static is a coin
+# flip on dyld's slide and is now refused at image.segmentPageSize), while the
+# ADDRESS-vs-OFFSET half was already fail-loud here and is pinned through a
+# DERIVED document, since every shipped darwin base divides every admitted
+# alignment and no shipped document can reach the mechanism. Its own target
+# because the derived-document arm needs the json link, as the build-id sibling
+# above does.
+dss_add_test(NAME link/test_macho_image_overaligned_section_placement
+             SOURCES test_macho_image_overaligned_section_placement.cpp)
+target_link_libraries(dss_link_test_macho_image_overaligned_section_placement
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LINK-ELF-STATIC-EXEC-VA-CHAIN-ROUNDS-TO-AN-UNDECLARED-PAGE +
+# D-LINK-ELF-STATIC-IMAGE-BASE-UNDERFLOWS-BELOW-ITS-OWN-HEADERS: what the static
+# ELF layout does with the two document values its VA chain reads -- an absent
+# `elf.pageAlign` (the relocatable and staticlib documents declare none) and a
+# `.text` virtualAddress standing below the headers the image emits. Its own
+# target because the second half needs a DERIVED document, so it carries the
+# json link the shipped-document tests do not.
+dss_add_test(NAME link/test_elf_static_va_chain_document_boundaries
+             SOURCES test_elf_static_va_chain_document_boundaries.cpp)
+target_link_libraries(dss_link_test_elf_static_va_chain_document_boundaries
+                      PRIVATE nlohmann_json::nlohmann_json)

@@ -17,6 +17,7 @@
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"  // TypeLattice (fresh merge host)
 #include "ffi/abi/abi_catalog.hpp"
+#include "ffi/ingest.hpp"  // checkMergedLibraryInputsMatchTargetFormat — the boundary check for the MERGED --resolve-library partitions (D-FFI-RESOLVE-LIBRARY-DOES-NOT-CHECK-THE-LIBRARY-ARCH)
 #include "ffi/mangling/c_mangle.hpp"  // applyCMangling — the cross-CU merge-key mangling (D-LK-MACHO-CROSSCU-MANGLE-MERGE-KEY)
 #include "ffi/shipped_lib_descriptor.hpp"  // isKnownSynthesizeRecipe (FC17.9a threads-shim vocab)
 #include "link/object_format_schema.hpp"
@@ -30,6 +31,20 @@
 #include "program/build_scripts.hpp"  // runBuildScripts — the manifest's pre/post build hooks
 #include "program/cli_args.hpp"
 #include "program/compile_pipeline.hpp"
+#include "hir/hir_text.hpp"  // `--emit-hir` / `--dump-hir-kinds`: emitHir, HirTextContext, renderHirKindInventory
+// ⚠ SECOND INCLUDER OF THE BUILD STAMP, AND THE HEADER CALLS THAT A REVIEW-STOP
+// — so here is the reason, stated where the next reader meets it.
+// `runtime_object_cache.cpp` was the only one, because the stamp identifies the
+// COMPILER and the only question that had was "may this cached object be
+// reused". `--emit-hir` asks the same question in the other direction: an
+// artifact a consumer publishes a verdict against must name the compiler that
+// produced it, or the verdict is not re-derivable by anyone. `DSS_PROJECT_VERSION`
+// cannot serve — the stamp's own docblock records that a whole release's worth of
+// codegen changes share one version string.
+// ⓘ It is included from a `.cpp`, not from a header, so the recompile-on-every-
+// dirty-edit hazard the warning is about does not spread: `program` already opts
+// in via `dss_use_build_stamp(program)`, so no CMake edge is added either.
+#include "program/dss_build_stamp.hpp"  // runtime::kBuildStamp — the `producer` field
 #include "program/cross_validate_language_target.hpp"
 #include "program/cross_validate_target_format.hpp"
 #include "program/dependency_resolver.hpp"  // AP6: `dependsOn` resolution
@@ -299,6 +314,36 @@ void reportArtifactWritten(std::string const& targetSpec,
               << artifactPathForReport(core::normalizeKeepingRoot(abs))
               << '\n';
 }
+
+} // namespace
+
+// ★★★ THE INVOCATION'S CONFIG PROVENANCE — the SAY-SO half of
+// [[D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE]].
+//
+// ★ A REPORT LINE, NEVER A DIAGNOSTIC, AND THE REASON IS BEHAVIOURAL RATHER
+// THAN STYLISTIC. A `Warning` here would be promoted to an ERROR by
+// `--warnings-as-errors` — so a build that is legitimately run against another
+// tree (which is what `DSS_CONFIG_ROOT` is FOR) would start FAILING because the
+// compiler got better at explaining itself. That is the "fail-more" this row
+// explicitly forbids. An `Info` diagnostic avoids that but is droppable through
+// the three gates in `DiagnosticReporter::report` (`--suppress`, the per-code
+// cap, the global cap), and an attribution line that can vanish is one that
+// cannot be relied on when attribution is exactly what is in doubt. The
+// `dsscp: ` report line above makes the same trade for the same reason.
+//
+// ★ IT SAYS NOTHING IN THE ORDINARY CASE. `configRootProvenanceNote()` is
+// engaged on exactly two surprises — the cwd walk answered a tree that is not
+// this compiler's own, or `$DSS_CONFIG_ROOT` was set and IGNORED — so an
+// in-tree build, every `dss_add_test` entry (whose override RESOLVES) and every
+// installed invocation stay byte-identical. ✔MEASURED: the full ctest gate is
+// unchanged by this line.
+void reportConfigRootProvenance(std::ostream& err) {
+    if (auto note = configRootProvenanceNote()) {
+        err << "dsscp: " << *note << '\n';
+    }
+}
+
+namespace {
 
 // Emit a driver-tier D_* diagnostic. Wraps `dss::report` so all
 // driver-side fail-loud sites take the same shape (Error severity,
@@ -586,30 +631,17 @@ void recordJobBatch(JobBatchRecord rec) {
 // codebase rejects everywhere.
 struct ArtifactCacheTicket {
     dss::runtime::RuntimeObjectKey key;
-    dss::runtime::CacheEviction    eviction;
 };
 
-// The manifest's eviction vocabulary → the store's.
-//
-// ★ A `switch` WITH NO `default`, NOT A TERNARY, AND THAT IS THE POINT. The
-// ternary this replaced mapped `Retain` to `Retain` and EVERYTHING ELSE to
-// `PruneSuperseded`, so a third manifest token would have silently acquired
-// pruning semantics nobody wrote — the "enumerate the members, never the
-// complement" trap this repo has paid for before. With no `default` arm, adding
-// an enumerator is a COMPILE error at exactly the site that must decide.
-[[nodiscard]] dss::runtime::CacheEviction
-storeEvictionFor(DependencyArtifactCacheEviction manifestPolicy) noexcept {
-    switch (manifestPolicy) {
-        case DependencyArtifactCacheEviction::PruneSuperseded:
-            return dss::runtime::CacheEviction::PruneSuperseded;
-        case DependencyArtifactCacheEviction::Retain:
-            return dss::runtime::CacheEviction::Retain;
-    }
-    // Unreachable for every declared enumerator; present because a value
-    // outside the enumeration is undefined behaviour rather than a case, and
-    // the pruning arm is the one that DELETES files.
-    return dss::runtime::CacheEviction::Retain;
-}
+// ⓘ A `storeEvictionFor` mapping the manifest's eviction vocabulary onto the
+// store's stood here, and the ticket carried its result. Both are gone with the
+// policy itself
+// ([[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]):
+// the store no longer deletes anything, so there is no second behaviour for a
+// manifest to select between. ★ The ticket is deliberately kept as a struct
+// rather than collapsed to a bare key — it is what `compileOneTarget` receives,
+// and a named type is where the next thing a target must carry to participate
+// in the cache will land.
 
 // Consult the cache for `ticket` and, on a VERIFIED hit, place the cached bytes
 // at `outPath`.
@@ -911,6 +943,139 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     std::uint16_t const ccIndex = static_cast<std::uint16_t>(
         std::distance(span.data(), abi->cc));
 
+    // ── `--emit-hir`: run the front end to HIR, render it, and STOP ─────────
+    //
+    // Placed HERE and not one line earlier: the emission is TARGET-DEPENDENT
+    // through this very triple. `abi`/`ccIndex` above resolve the calling
+    // convention whose `vaListLayout` sizes a `va_list`, `**formatR` supplies
+    // the data model that decides integer widths (and therefore which
+    // conversions survive as explicit `cast` nodes rather than collapsing to
+    // identity retags), and `**targetR` supplies aggregate layout. HIR emitted
+    // without them would be HIR for a different program.
+    //
+    // Placed here and not one line LATER, either: everything below is about
+    // WHERE AN IMAGE GOES, and this mode emits no image.
+    if (compileOpts.emitHirText != nullptr) {
+        // ★ ONE MODULE PER ARTIFACT. `--emit-hir` routes through `compileFiles`,
+        // which builds ONE compilation unit from its whole file list (the CU5
+        // multi-file-single-CU shape), so `cus` holds exactly one unit — and one
+        // `.dsshir` file holds exactly one module. An empty `cus` is the
+        // all-object-input shape, which has no front end to run and therefore
+        // no HIR: refused by name rather than silently producing an empty
+        // artifact that would read as "this program has no code in it".
+        if (cus.size() != 1) {
+            emitDriver(reporter, DiagnosticCode::D_EmptyInput,
+                       std::format(
+                           "--emit-hir needs exactly ONE translation unit to "
+                           "emit, and this build produced {}. A `.dsshir` file "
+                           "holds one module; pre-assembled object inputs have "
+                           "no front end and contribute none.",
+                           cus.size()));
+            return std::nullopt;
+        }
+        auto const hirEntry = reporter.errorCount();
+        auto front = buildCuHir(cus[0], grammar, **targetR, **formatR, ccIndex,
+                                compileOpts.diagBudget, reporter);
+        if (!front) {
+            // `buildCuHir` reports every front-half failure itself; a null with
+            // a clean reporter would be the silent-refusal archetype, so it is
+            // named the same way the `buildCuMir` path names it.
+            if (reporter.errorCount() == hirEntry) {
+                emitDriver(reporter, DiagnosticCode::D_CompileUnitNullNoDiagnostic,
+                           "the front end (buildCuHir) returned no HIR and "
+                           "emitted no diagnostic");
+            }
+            return std::nullopt;
+        }
+        HirTextContext hirCtx;
+        hirCtx.interner = &front->model.lattice().interner();
+        // The SOURCE-LEVEL names, from the semantic model's own symbol table.
+        // Without them every `%N` in the artifact is an ordinal a reader cannot
+        // report a property about — "the parameter x", not "%2".
+        std::vector<std::string> hirSymbolNames;
+        hirSymbolNames.reserve(front->model.symbols().size());
+        for (auto const& s : front->model.symbols()) hirSymbolNames.push_back(s.name);
+        hirCtx.symbolNames = &hirSymbolNames;
+        hirCtx.literalPool   = &front->hir->literalPool;
+        hirCtx.inlineAsmPool = &front->hir->inlineAsmPool;
+        // Source spans, and the buffer→name table that makes them resolvable
+        // OUTSIDE this process. Supplied together, always: `BufferId` is a
+        // process-global counter, so `@loc(buf 7, …)` without the table names
+        // nothing a reader can act on.
+        hirCtx.sourceMap = &front->hir->sourceMap;
+        std::vector<HirTextBufferName> hirBufferNames;
+        auto const noteBuffer = [&hirBufferNames, &cu = cus[0]](
+                                    BufferId id, std::string_view name) {
+            if (!id.valid()) return;
+            for (auto const& b : hirBufferNames) {
+                if (b.buffer == id.v) return;
+            }
+            // ⚠ A SYNTHESIZED PREPROCESSOR BUFFER IS CONSTRUCTED WITH THE MAIN
+            // SOURCE'S NAME, so `name` alone cannot tell the two apart and a
+            // reader would index the real file with offsets that belong to the
+            // preprocessed text. `isSynthesizedPreprocessorBuffer` is the CU's
+            // own discriminator — the same one its diagnostic-position refusal
+            // uses — so the artifact says which it is instead of leaving the
+            // reader to guess from a name that is deliberately identical.
+            std::uint32_t origin = 0;
+            if (cu.isSynthesizedPreprocessorBuffer(id)) {
+                BufferId const main = cu.mainOriginForSynth(id);
+                origin = main.valid() ? main.v : id.v;
+            }
+            hirBufferNames.push_back(
+                HirTextBufferName{id.v, std::string{name}, origin});
+        };
+        for (auto const& tree : cus[0].trees()) {
+            SourceBuffer const& buf = tree.source();
+            noteBuffer(buf.id(), buf.name());
+        }
+        for (auto const& b : cus[0].auxiliaryBuffers()) {
+            if (b) noteBuffer(b->id(), b->name());
+        }
+        hirCtx.bufferNames = &hirBufferNames;
+        // WHO COMPILED THIS. The one fact the artifact cannot derive and the one
+        // a consumer needs to make a published verdict re-derivable by anyone
+        // else. `kBuildStamp` is version + commit + a digest of any dirt.
+        hirCtx.producer = runtime::kBuildStamp;
+
+        *compileOpts.emitHirText = emitHir(front->hir->hir, hirCtx, reporter);
+        // THE EMITTER'S OWN ERRORS ARE FATAL, and that is the contract this mode
+        // sells. `emitHir` reports Error severity exactly when it has written
+        // something the reader will REFUSE — the `?` poison token. Returning rc 0
+        // beside such a file would hand a consumer an artifact that cannot be
+        // parsed, which is worse than refusing: they would meet it later, out of
+        // context, against a file we told them was good. See
+        // docs/hir-text-format.md §2.1, which states the contract to consumers.
+        // ⓘ The example this comment used to name — a cyclic composite,
+        // `struct S { struct S *next; }` — is NO LONGER one: format v3 gave the
+        // type grammar a back-reference (`rec <H>`), so lists and trees emit
+        // normally (P64 lane `cy`). The GATE is unchanged and still needed: a
+        // shape this codec cannot spell must never reach a consumer as a file.
+        //
+        // ⚠⚠ THIS LINE IS NOT THE SOLE OWNER OF THAT OUTCOME, AND SAYING SO IS
+        // THE POINT. ✔MEASURED 2026-09-07 (P64 lane `hx`, red-on-disable arm A5):
+        // deleting it left every arm GREEN. `runCusToTargets` already gates on
+        // the per-target scratch (`if (!artifact || scratch.hasErrors()) exitCode
+        // = 1; else artifactsOut[i] = …`), and the emitter reports into exactly
+        // that reporter — so the run still exits non-zero, the artifact slot
+        // still stays disengaged, and `Program::emitHirText` still writes
+        // nothing. There is no observable difference.
+        // ⇒ It is KEPT because it is this file's established shape for a failed
+        // tier (`if (!cuMirSlots[0]) … return std::nullopt;` two stages down) and
+        // because failing where the fact is known beats relying on a gate in
+        // another function. It is NOT kept as a pin: the behaviour's pin lives in
+        // `tests/program/test_emit_hir_mode.cpp`
+        // (`RejectedSourceExitsNonZeroAndWritesNothing`), which the pre-existing
+        // gate carries on its own. Do not cite this line as red-on-disable
+        // evidence — it has none.
+        if (reporter.errorCount() != hirEntry) return std::nullopt;
+        // The `path` this returns is the DRIVER's to decide (it may be stdout),
+        // so the artifact path is reported as the source stem — the caller
+        // overwrites it with the real destination. Non-nullopt is the success
+        // signal; nothing downstream of `--emit-hir` reads the value.
+        return fs::path{sourceStem};
+    }
+
     // Output path convention (cycle 2 v1; plan 6 owns the
     // authoritative artifact-profile-driven scheme). The artifact base
     // `<name>` = `artifactName.value_or(sourceStem)` (a project manifest's
@@ -1152,6 +1317,34 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     auto resolveLibs = partitionResolveLibraries(
         std::span<ResolveLibrarySpec const>{compileOpts.resolveLibraries},
         **formatR, reporter);
+
+    // ── D-FFI-RESOLVE-LIBRARY-DOES-NOT-CHECK-THE-LIBRARY-ARCH: THE TWO
+    //    PARTITIONS THE EAGER PROBE CANNOT SEE ────
+    //
+    // `compile_pipeline`'s step 2.5-pre validates every `--resolve-library`
+    // entry against the target's object format AND architecture -- but it runs
+    // over `perCuOpts.resolveLibraries`, which is the DYNAMIC residual the
+    // partition above just produced. The archives and the relocatable objects
+    // were removed one statement ago and reached NO boundary check at all.
+    // ✔MEASURED at the cycle base: an x86_64 `.a` fed to
+    // `arm64:elf64-aarch64-linux-exec` built rc=0 with ZERO diagnostics and
+    // emitted an aarch64 image; so did a PE `.lib` fed to an ELF build.
+    //
+    // ★ THIS SITE OWNS THE FEED, NOT THE COMPARISON. The sentence, the codes
+    // and the member walk all live in `ffi::checkLibraryMatchesTargetFormat`,
+    // the same single author the dynamic probe asks -- one chokepoint reached
+    // from three places, never a second guard written beside it. It runs HERE
+    // because this is the only scope where the three partitions are all in
+    // hand, and BEFORE the per-CU build because a wrong-architecture input
+    // must fail on the first TU rather than on whichever one later happens to
+    // reference it.
+    if (!ffi::checkMergedLibraryInputsMatchTargetFormat(
+            std::span<std::filesystem::path const>{resolveLibs.staticArchives},
+            std::span<std::filesystem::path const>{resolveLibs.objectInputs},
+            **formatR, reporter)) {
+        return std::nullopt;   // reported loud there
+    }
+
     std::vector<std::filesystem::path> staticArchives =
         std::move(resolveLibs.staticArchives);
     CompileOptions perCuOpts = compileOpts;
@@ -1504,7 +1697,10 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                 (*formatR)->sehPersonality(), (*formatR)->name(),
                 cuMirs[i].target->wideFloatSoftcallLibrary(
                     (*formatR)->kind()),
-                reporter);
+                reporter,
+                // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics-runtime
+                // block, read off the schema here exactly as sehPersonality is.
+                (*formatR)->atomicsRuntime());
             if (!mod) return std::nullopt;  // back-half tier failure already reported
             members.push_back(std::move(*mod));
             // Member file name: THIS CU's own source stem (see the block above),
@@ -1789,7 +1985,9 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             cuMirs[0], (*formatR)->processArgs(), (*formatR)->entryVerbs(),
             (*formatR)->sehPersonality(), (*formatR)->name(),
             cuMirs[0].target->wideFloatSoftcallLibrary((*formatR)->kind()),
-            reporter);
+            reporter,
+            // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics-runtime block.
+            (*formatR)->atomicsRuntime());
         if (!mod) {              // back-half tier failure already reported via `reporter`
             emitNullNoDiagnostic("back-half lower (lowerCuMirToAssembly)");
             return std::nullopt;
@@ -2221,6 +2419,20 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         return std::nullopt;  // unsupported SEH shape (c116b frontier) — fail-loud reported.
     }
 
+    // ══ VERIFY THE POST-SYNTHESIS MODULE ═════════════════════════════════════
+    //
+    // [[D-MIR-SYNTH-PASSES-UNVERIFIED-ON-SINGLE-CU-PATH]]: a NEW verify on this
+    // seam, not a moved one. `optimizeModule` above verifies after every pass IT
+    // runs — but it runs BEFORE `synthesizeSehFunclets`, so on the merge path the
+    // SEH pass's output was the one module state nothing ever checked. The
+    // single-CU seam in `compile_pipeline.cpp` calls the same function at the same
+    // point relative to the same pass; keeping the two AGREEING is what
+    // [[D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY]] exists to protect,
+    // and `SynthVerifySeamGuard` is what reds when one of them moves.
+    if (!verifySynthesizedModule(merged->mir, merged->host.interner(), reporter)) {
+        return std::nullopt;  // the broken invariant + the tier are both reported.
+    }
+
     // D-FFI-EXTERN-CALL-DISPATCH: the merged module compiles to ONE
     // (target, format); pass that format's extern-call shape so MIR→LIR
     // selects the right call-site opcode for any surviving extern import.
@@ -2255,7 +2467,33 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
                                      (*formatR)->tlsAccess(),
                                      std::move(sehScopes),
                                      std::move(wideFloatSoftcallLibrary),
-                                     reporter);
+                                     reporter,
+                                     // D-CSUBSET-PACKED-ATOMIC-MEMBER: the
+                                     // format's atomics-runtime block.
+                                     (*formatR)->atomicsRuntime(),
+                                     // P55, anchor
+                                     // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT:
+                                     // the format's
+                                     // narrowing of WHICH bindings the
+                                     // `indirect-slot` dispatch above reaches
+                                     // through the import slot. Passed here
+                                     // and not left to the default because the
+                                     // merge path emits `.obj`s too, and the
+                                     // linker's slot pass reads the format
+                                     // DIRECTLY — a merged module lowered
+                                     // without the narrowing would disagree
+                                     // with it symbol for symbol.
+                                     (*formatR)->indirectSlotBindings(),
+                                     // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
+                                     // WHICH of this artifact's OWN
+                                     // definitions its loader may replace.
+                                     // Passed here for the same reason the
+                                     // narrowing above is: a merged module
+                                     // lowered without it would branch to
+                                     // its own body for a name the loader
+                                     // has already given the process a
+                                     // different answer for.
+                                     (*formatR)->preemptibleDefinitionBindings());
     if (!mod) return std::nullopt;  // back-half tier failure already reported via `reporter`
     // c165 (D-LK-STATIC-LINK): the merged whole-program client module links
     // against any `ar` static archives named on `--resolve-library` the same way
@@ -2344,6 +2582,16 @@ struct CuBuildKey {
     // the key's rule ("everything that changes the preprocessed source") true
     // by construction rather than by an argument a reader has to reconstruct.
     HeaderNameMatching              headerNameMatching = kDefaultHeaderNameMatching;
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the TARGET's declared plain-
+    // `char` signedness, resolved for THIS object format
+    // (`TargetSchema::charIsUnsigned(ObjectFormatKind)`). It belongs in the key
+    // on the same principle `headerNameMatching` above does — it changes the
+    // preprocessed token stream (`#if 'ÿ' < 0` takes the opposite arm under
+    // it), so a CU built under one value must never be reused under another.
+    // Like that member it is in practice a function of the target/format names
+    // already here and adds no extra builds; carrying it keeps the key's rule
+    // ("everything that changes the preprocessed source") true by construction.
+    std::optional<bool>             charIsUnsigned{};
     // ★★★ D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: the SOURCE LANGUAGE this
     // target's CU is parsed under. `--language asm-x86_64-att` for every
     // target when the caller named one; the TARGET's own
@@ -2391,6 +2639,9 @@ struct CuBuildKey {
         if (format != o.format) return format < o.format;
         if (headerNameMatching != o.headerNameMatching) {
             return headerNameMatching < o.headerNameMatching;
+        }
+        if (charIsUnsigned != o.charIsUnsigned) {
+            return charIsUnsigned < o.charIsUnsigned;
         }
         return languageName < o.languageName;
     }
@@ -3143,8 +3394,7 @@ void storeBuiltArtifactInCache(ArtifactCacheTicket const& ticket,
         return;
     }
     auto const stored = dss::runtime::storeRuntimeObject(
-        ticket.key, std::span<std::uint8_t const>{bytes->data(), bytes->size()},
-        ticket.eviction);
+        ticket.key, std::span<std::uint8_t const>{bytes->data(), bytes->size()});
     if (!stored.has_value()) reportDriverNote(stored.error());
 }
 
@@ -3471,14 +3721,44 @@ buildDependencyArtifactKey(
     // forever. See `gCompilingShippedRuntimeUnit`.
     if (gCompilingShippedRuntimeUnit) return archives;
 
-    auto const descriptorDir = findShippedConfigDir("shippedLibs");
-    if (!descriptorDir) return archives;   // no corpus ⇒ nothing realized
+    // ⚠⚠ THE DESCRIPTOR CORPUS IS ONE OF **TWO** DECLARERS SINCE
+    // D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64, SO ITS ABSENCE IS NO LONGER
+    // "NOTHING REALIZED" — and the sentence that said so was still here.
+    // ✔MEASURED by reading the shipped documents: all four pe64 formats realize
+    // `runtime/platform/src/atomic.c` from their own `runtimeLibraries` table
+    // and NO descriptor names it. A `return archives` keyed on `shippedLibs/`
+    // alone therefore made a FORMAT-declared runtime body depend on the
+    // presence of an UNRELATED directory: an installed tree carrying
+    // `object-formats/` but no `shippedLibs/` dropped every format-declared
+    // body silently, right here, before the declarer was ever consulted.
+    // ⓘ THE REACHABLE CONSEQUENCE TODAY IS NARROW AND IS STATED RATHER THAN
+    // INFLATED: `atomic.c` itself `#include`s `<stddef.h>`/`<stdint.h>`/
+    // `<stdlib.h>`, which ARE descriptors, so on a tree with no `shippedLibs/`
+    // that unit could not compile either and the build fails either way — what
+    // changes is WHERE. The silent drop is a real hole for the next
+    // format-declared body that needs no shipped header (a `libgcc`-shaped
+    // helper, a target-specific `memcpy`): it would have vanished here and
+    // surfaced as an unresolved symbol at the final link, attributed to the
+    // linker rather than to the missing corpus. Each declarer is now asked
+    // independently, and only a tree with NEITHER directory short-circuits.
+    auto const descriptorDir    = findShippedConfigDir("shippedLibs");
+    // ── THE ARCHIVE SIBLING's directory, hoisted so `configRoot` has a second
+    // derivation when the descriptor corpus is absent. The refusal that reads
+    // it stays where it is, below `claims.empty()`, so a build that realizes
+    // nothing still never demands this directory.
+    auto const objectFormatsDir = findShippedConfigDir("object-formats");
+    if (!descriptorDir && !objectFormatsDir) return archives;
 
     // `findShippedConfigDir` returns `<configRoot>/<sub>`, so the root is its
     // parent. Derived rather than re-walked: two walks could answer with two
     // different trees on a host that has more than one checkout, which is the
-    // D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE shape.
-    fs::path const    configRoot = descriptorDir->parent_path();
+    // D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE shape. ⚠ EITHER shipped
+    // subdirectory yields the SAME root by construction — `findShippedConfigDir`
+    // resolves both against one config set — so preferring one is a choice of
+    // spelling, not of tree.
+    fs::path const    configRoot = descriptorDir
+                                     ? descriptorDir->parent_path()
+                                     : objectFormatsDir->parent_path();
     // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES (the residual half): the
     // kind is READ OFF THE FORMAT HANDLE this function already holds, rather
     // than accepted as a second parameter beside it. The old signature took
@@ -3488,8 +3768,77 @@ buildDependencyArtifactKey(
     // that this function needed is gone with the parameter.
     std::string const formatKey{objectFormatKindName(buildFormat.kind())};
 
-    auto const claims = attributeShippedRuntimeUnits(configRoot, *descriptorDir,
-                                                     formatKey, rep);
+    std::vector<ShippedRuntimeClaim> claims;
+    if (descriptorDir) {
+        claims = attributeShippedRuntimeUnits(configRoot, *descriptorDir,
+                                              formatKey, rep);
+    }
+
+    // ── D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64: THE SECOND KIND OF DECLARER ────
+    //
+    // A shipped-lib DESCRIPTOR declares a realization for a symbol a PROGRAM
+    // names through a header. That mechanism cannot reach a symbol the COMPILER
+    // MINTS — an under-aligned `_Atomic` access lowers to `__atomic_load` with
+    // no user `#include` anywhere — so the FORMAT declares those, in the same
+    // `runtimeLibraries` table that already answers "who plays this runtime
+    // role", with `source` where the other rows say `image`.
+    //
+    // ★ THE TWO KINDS MEET HERE AND NOWHERE ELSE. Below this point a claim is a
+    // claim: same resolution, same language dispatch, same cache key, same
+    // nested build, same archive on the link line. Adding a THIRD declarer would
+    // add rows to this list and nothing else.
+    //
+    // ⚠ THE DECLARING DOCUMENT IS THE FORMAT'S OWN FILE, and it is attributed
+    // rather than left empty for the reason the descriptor case states: the
+    // declaring document's CONTENT is part of the runtime object cache key, and
+    // `computeRuntimeObjectKey` refuses an empty declarer set.
+    //
+    // ⚠⚠ AND A SOURCE BOTH TIERS NAME IS **ONE** BUILD-GRAPH EDGE WITH **TWO**
+    // DECLARERS — never two claims. Appending unconditionally would have queued
+    // the same unit twice, and the two entries would then differ only in their
+    // declarer sets, so they would compute two DIFFERENT cache keys for one
+    // byte-identical object and race to write the same archive. That is the
+    // merge `readShippedSourcesForFormat` already performs one tier down for a
+    // descriptor's own default-vs-per-symbol maps ("a source named twice is ONE
+    // build-graph edge — the merge and the dedup are the same operation over a
+    // set of PATHS"); the rule does not stop being true because the second
+    // declarer is a different KIND of document. Not reachable from the shipped
+    // corpus today (✔MEASURED: no descriptor names `runtime/platform/src/
+    // atomic.c`, and the four pe64 documents are its only declarers) — which is
+    // exactly why it is written down rather than left to be discovered by
+    // whichever future descriptor first claims a body a format also names.
+    {
+        auto const realized = buildFormat.runtimeLibraries().realizedSources();
+        if (!realized.empty()) {
+            fs::path const formatDoc = configRoot / "object-formats"
+                                     / (std::string{buildFormat.name()}
+                                        + ".format.json");
+            std::error_code relEc;
+            fs::path const  rel = fs::relative(formatDoc, configRoot, relEc);
+            std::string const spelling =
+                (relEc || rel.empty()) ? core::genericSpelling(formatDoc)
+                                       : rel.generic_string();
+            for (auto const& source : realized) {
+                auto const existing =
+                    std::find_if(claims.begin(), claims.end(),
+                                 [&](ShippedRuntimeClaim const& c) {
+                                     return c.source == source;
+                                 });
+                if (existing != claims.end()) {
+                    if (std::find(existing->descriptors.begin(),
+                                  existing->descriptors.end(), spelling)
+                        == existing->descriptors.end()) {
+                        existing->descriptors.push_back(spelling);
+                    }
+                    continue;
+                }
+                claims.push_back(
+                    ShippedRuntimeClaim{source,
+                                        std::vector<std::string>{spelling}});
+            }
+        }
+    }
+
     if (claims.empty()) return archives;
 
     // ── THE ARCHIVE SIBLING: the format that WRITES the bytes ────────────────
@@ -3497,7 +3846,9 @@ buildDependencyArtifactKey(
     // refuses on 0 or >1 rather than taking a first match — `directory_iterator`
     // is sorted on NTFS and hash-ordered on ext4, so first-match would let the
     // filesystem decide which format compiled the runtime.
-    auto const objectFormatsDir = findShippedConfigDir("object-formats");
+    // ⓘ The directory itself was resolved at the top of this function, where
+    // `configRoot` needs it as its second derivation; the REFUSAL stays here so
+    // a build that realizes nothing never demands the directory at all.
     if (!objectFormatsDir) {
         emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
                    "shipped-source realization: object format '" + formatKey
@@ -3805,15 +4156,16 @@ buildDependencyArtifactKey(
                   "the next build will compile it again.");
             continue;
         }
-        // ⓘ `PruneSuperseded` STATED rather than defaulted, and it is this
-        // site's pre-existing behaviour written down: ONE shipped unit has ONE
-        // current object per (target, config), so an entry a rebuild supersedes
-        // is dead weight. The policy is a parameter because the OTHER subject
-        // class — a project's dependency artifacts — legitimately wants the
-        // opposite; see `CacheEviction`.
+        // ⓘ THIS SITE USED TO STATE `CacheEviction::PruneSuperseded`, on the
+        // reasoning that ONE shipped unit has ONE current object per
+        // (target, config) so a superseded entry is dead weight. The first half
+        // is true and the conclusion did not follow: an entry with another index
+        // is *the previous build in this tree* or *a concurrent build reading a
+        // different tree*, and a store cannot tell those apart. See
+        // `storeRuntimeObject` in `runtime_object_cache.hpp`.
+        // [[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]
         auto const stored = dss::runtime::storeRuntimeObject(
-            *key, std::span<std::uint8_t const>{bytes->data(), bytes->size()},
-            dss::runtime::CacheEviction::PruneSuperseded);
+            *key, std::span<std::uint8_t const>{bytes->data(), bytes->size()});
         if (!stored.has_value()) {
             reportDriverNote(stored.error());
             continue;
@@ -3898,7 +4250,19 @@ int runCusToTargets(
     // the `Program` knob. nullopt (every CLI build, every root project build,
     // every dependency under a manifest that declares none) ⇒ no consult, no
     // store, byte-identical behaviour.
-    std::optional<DependencyArtifactCacheConfig> const& artifactCachePolicy) {
+    std::optional<DependencyArtifactCacheConfig> const& artifactCachePolicy,
+    // `--emit-hir`: non-null ⇒ every target's `compileOneTarget` stops after
+    // HIR and renders the `.dsshir` text into this buffer instead of compiling
+    // (see `CompileOptions::emitHirText`, which is what this becomes). Null on
+    // every compiling build. It is threaded rather than stamped on a global for
+    // the reason every other per-build knob here is: this function is the one
+    // place a target's `CompileOptions` is assembled, so a knob that reaches
+    // `compileOneTarget` reaches it from here or not at all.
+    //
+    // ⓘ The mode admits exactly one `--target`, so one buffer is one artifact;
+    // the CLI refuses the N-target spelling (`AmbiguousEmitHirTarget`) rather
+    // than letting N modules overwrite each other here.
+    std::string* emitHirTextSink = nullptr) {
     // ── TF-C74 (a): resolve every target — and every object format — BEFORE
     //    the CU build ───────────────────────────────────────────────────────
     //
@@ -4301,6 +4665,16 @@ int runCusToTargets(
             // the identity branch the agnosticism bar forbids).
             key.headerNameMatching =
                 formatByName.at(key.formatName)->headerNameMatching();
+            // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: ask the TARGET — the one
+            // owner — passing the active object-format KIND, which its accessor
+            // requires precisely so no caller can take the processor half alone
+            // (the same arm64 CPU is unsigned under GNU/Linux and signed under
+            // Darwin). No arch name is compared and no format schema
+            // contributes.
+            if (key.format.has_value()) {
+                key.charIsUnsigned =
+                    targetByName.at(key.targetName)->charIsUnsigned(*key.format);
+            }
         }
         keyPerTarget.push_back(key);
         if (cuByKey.find(key) == cuByKey.end()) {
@@ -4508,7 +4882,29 @@ int runCusToTargets(
         scratchCfg.dedupWindow    = 0;
         DiagnosticReporter scratch{scratchCfg};
         CompileOptions compileOpts{DiagnosticBudget{rep.config()}};
+        compileOpts.emitHirText      = emitHirTextSink;  // `--emit-hir` stage stop
         compileOpts.config           = config;
+        // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: this target's plain-`char`
+        // sign, for the MIR optimizer's `ConstFold` (which carries no target
+        // and no format of its own). `keyPerTarget[i]` already holds the ONE
+        // reading made above, from `TargetSchema::charIsUnsigned(kind)`; taking
+        // it from there rather than re-asking is the whole point — a second
+        // derivation site is what this row exists to remove.
+        compileOpts.charIsUnsigned   = keyPerTarget[i].charIsUnsigned;
+        // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: WHICH of this
+        // artifact's OWN definitions its loader may replace. Read off the
+        // FORMAT (the owner), relayed through `CompileOptions` to the MIR
+        // optimizer, which carries no format of its own. Without it the
+        // Inlining pass splices away exactly the calls MIR→LIR is routing
+        // through the loader, and the release arm answers differently from the
+        // debug arm of the same source.
+        {
+            auto const fmtIt = formatByName.find(keyPerTarget[i].formatName);
+            if (fmtIt != formatByName.end() && fmtIt->second != nullptr) {
+                compileOpts.preemptibleDefinitionBindings =
+                    fmtIt->second->preemptibleDefinitionBindings();
+            }
+        }
         compileOpts.pipelineOverride = pipelineOverride;
         compileOpts.ltoMode = ltoMode == LtoModeArg::Thin
                                   ? CompileOptions::LtoMode::Thin
@@ -4668,9 +5064,7 @@ int runCusToTargets(
                                "dependency artifact cache: the target spec does "
                                "not parse, so no key can be composed."});
             if (key.has_value()) {
-                cacheTicket = ArtifactCacheTicket{
-                    std::move(*key),
-                    storeEvictionFor(artifactCachePolicy->eviction)};
+                cacheTicket = ArtifactCacheTicket{std::move(*key)};
             } else {
                 // ⚠ LOUD, AND NOT FATAL. A key that cannot be COMPUTED means
                 // the optimization is unavailable for this target — not that
@@ -4915,8 +5309,24 @@ int Program::run(int argc, char* argv[]) {
         std::cout << cliHelpText();
         return 0;
     }
+    // WHICH CONFIG TREE THIS INVOCATION WILL READ, but only when the answer is
+    // a surprise — see `reportConfigRootProvenance`. Placed AFTER `--help`
+    // (which consults no config and must keep printing exactly its text) and
+    // BEFORE every mode that does, so one site covers the whole dispatch fork.
+    reportConfigRootProvenance(std::cerr);
     if (args.lspMode) {
         return runLspMode(args);
+    }
+    // `--dump-hir-kinds`: an inventory of THIS BINARY's node set. Answered here,
+    // beside `--lsp` and ahead of the reporter/config stamping below, because it
+    // reads no config, resolves no target and compiles nothing — the same reason
+    // `--dump-predefined-macros` is answered ahead of `Program` entirely. It
+    // stays inside `Program::run` rather than moving to `main` only because it
+    // needs no earlier position than this: nothing above it can change the
+    // answer.
+    if (args.dumpHirKinds) {
+        std::cout << renderHirKindInventory(runtime::kBuildStamp);
+        return 0;
     }
     // Build the diagnostic policy config BEFORE the dispatch fork —
     // every CLI-routed entry point (compileProject, transpile,
@@ -5002,6 +5412,14 @@ int Program::run(int argc, char* argv[]) {
     // an escaping exception was never going to unwind through here anyway.
     auto const timedRunStart = std::chrono::steady_clock::now();
     int const  dispatchRc    = [&]() -> int {
+    if (args.emitHirPath.has_value()) {
+        // `parseCliArgs` has already guaranteed non-empty files and EXACTLY ONE
+        // `--target` for this mode, so the indexing is a consequence of the
+        // parser's contract rather than an assumption made here.
+        return emitHirText(args.emitHirFiles, args.languageName,
+                           args.targets.front(), *args.emitHirPath,
+                           std::cout, std::cerr, cfg);
+    }
     if (args.projectPath.has_value()) {
         return compileProject(*args.projectPath, cfg);
     }
@@ -5826,6 +6244,9 @@ int Program::compileFiles(
                 // D-PP-HEADER-CASE-INSENSITIVE-PE: the format FILE's own
                 // header-name case rule (NOT derived from the format kind).
                 builder.setHeaderNameMatching(key.headerNameMatching);
+                // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the target's
+                // plain-`char` sign, for the `#if` ICE fold.
+                builder.setCharIsUnsigned(key.charIsUnsigned);
                 // TF-C74: the active target's per-architecture identity macros.
                 builder.setTargetPredefinedMacros(
                     {targetPredefines.begin(), targetPredefines.end()});
@@ -5861,7 +6282,207 @@ int Program::compileFiles(
         // the cross-build artifact cache policy. nullopt on every CLI build and
         // on every ROOT project build; engaged only on a DEPENDENCY sub-build,
         // where `Resolver::buildNode_` stamped the ROOT manifest's policy on.
-        dependencyArtifactCache_);
+        dependencyArtifactCache_,
+        // `--emit-hir`'s stage stop, or null. `compileFiles` is the ONE entry
+        // point it routes through, because one `.dsshir` holds one module and
+        // this is the entry that builds one compilation unit from its whole file
+        // list (`compileUnits` makes one unit PER FILE, which is N modules).
+        hirTextSink_);
+}
+
+// ── hirArtifactRoundTripFailure ──────────────────────────────────────────────
+// Contract, and the reasoning behind every choice here, in `program.hpp`.
+std::string hirArtifactRoundTripFailure(std::string_view artifact) {
+    // A LOCAL reporter, never a caller's. A successful round trip must be
+    // observable as SILENCE, and `parseHir` is collect-all: handed a caller's
+    // reporter it would leave recovery diagnostics behind on the way to a
+    // verdict the caller already has in the return value.
+    DiagnosticReporter rep;
+    std::string const  text{artifact};
+    auto const parsed = parseHir(text, CompilationUnitId{1}, rep);
+    auto const diags = [&rep] {
+        std::string s;
+        for (auto const& d : rep.all()) {
+            s += "\n  " + std::string{diagnosticCodeName(d.code)} + ": " + d.actual;
+        }
+        return s;
+    };
+    if (!parsed || !parsed->ok) {
+        return "  the artifact did NOT parse back." + diags();
+    }
+    // Every field the parse recovered goes home. The re-emission has to be given
+    // exactly what the first one was given, or a difference would attribute to
+    // the codec what is really a missing input. The mapping is one-to-one with
+    // `HirTextContext` by construction, which is why it is spelled out rather
+    // than defaulted — a field silently left null would weaken the compare into
+    // "the parts we bothered to hand back match".
+    HirTextContext back;
+    back.interner      = &parsed->interner;
+    back.symbolNames   = &parsed->symbolNames;
+    back.literalPool   = &parsed->literalPool;
+    back.inlineAsmPool = &parsed->inlineAsmPool;
+    back.producer      = parsed->producer;
+    back.bufferNames   = &parsed->bufferNames;
+    back.sourceMap     = &parsed->sourceMap;
+    back.ffiMap        = &parsed->ffiMap;
+    back.shaderMap     = &parsed->shaderMap;
+    back.transpileMap  = &parsed->transpileMap;
+    back.diagnosticMap = &parsed->diagnosticMap;
+    std::string const again = emitHir(parsed->hir, back, rep);
+    if (again == text) return {};
+
+    // NAME THE TOKEN THE TWO HALVES DISAGREE ABOUT. "They differ" over a
+    // multi-megabyte artifact is a true statement nobody can act on, so the
+    // report carries the first differing offset and a window of both sides —
+    // which is the production the writer and the reader read differently.
+    std::size_t at = 0;
+    while (at < text.size() && at < again.size() && text[at] == again[at]) ++at;
+    auto const window = [](std::string const& s, std::size_t from) {
+        if (from >= s.size()) return std::string{"<end of artifact>"};
+        return s.substr(from, std::min<std::size_t>(72, s.size() - from));
+    };
+    return "  the artifact parsed, but the module the reader rebuilt re-emits "
+           "DIFFERENTLY — first difference at byte "
+           + std::to_string(at) + " of " + std::to_string(text.size())
+           + " (re-emission is " + std::to_string(again.size()) + " bytes)\n"
+             "  written  : " + window(text, at)
+           + "\n  read back: " + window(again, at) + diags();
+}
+
+int Program::emitHirText(
+    const std::vector<std::string>& sourceFiles,
+    const std::string& languageName,
+    const std::string& target,
+    const std::string& path,
+    std::ostream& out,
+    std::ostream& err,
+    DiagnosticReporter::Config const& reporterConfig
+) {
+    std::string text;
+    // ★ SCOPE-BOUND, AND RESTORED ON EVERY EXIT INCLUDING AN EXCEPTION. The
+    // sink is the one piece of state that turns a compiling entry point into a
+    // non-compiling one, so a leaked engagement would make the NEXT
+    // `compileFiles` on this `Program` silently emit HIR and link nothing.
+    // Leaving it engaged is not a state any caller could diagnose from the
+    // outside, which is exactly why it is not left to a `return` path.
+    struct SinkGuard {
+        std::string*& slot;
+        ~SinkGuard() { slot = nullptr; }
+    } const guard{hirTextSink_};
+    hirTextSink_ = &text;
+
+    // One target, one unit, one module — the mode's whole shape. `compileFiles`
+    // builds ONE compilation unit from the file list, and `parseCliArgs` has
+    // already refused a second `--target` (`AmbiguousEmitHirTarget`), so this is
+    // the single-artifact case by construction rather than by convention.
+    DiagnosticReporter rep = buildReporter(reporterConfig);
+    int const rc = compileFiles(sourceFiles, languageName,
+                                std::vector<std::string>{target}, rep);
+    if (rc != 0) {
+        // The front end already put its diagnostics on stderr through
+        // `compileFiles`'s own drain. Nothing is written, and that is the
+        // contract: rc != 0 ⇔ DSS rejected the input ⇒ no artifact.
+        return rc;
+    }
+    // ⚠ A ZERO EXIT WITH AN EMPTY BUFFER WOULD BE THE SILENT-SUCCESS ARCHETYPE:
+    // the caller writes an empty file and reads it as "this translation unit
+    // has no code". Every emission carries at least the `dsshir`/`producer`
+    // header, so empty here means the stop never ran — a routing defect, not an
+    // empty program.
+    if (text.empty()) {
+        err << "error: --emit-hir produced no artifact for '" << target
+            << "' although the front end reported success. Nothing was "
+               "written.\n";
+        return 1;
+    }
+    // ══ THE ARTIFACT MUST READ BACK, AND THAT IS MEASURED HERE, NOT PROMISED ══
+    //
+    // ★★★ `docs/hir-text-format.md` §2.1 SELLS rc 0 AS *"the artifact is
+    // written, complete, AND PARSES BACK"*. Until this block, NOTHING measured
+    // the third clause — the writer ran, the file was written, and whether our
+    // own reader could take it back was a property no run ever asked about.
+    //
+    // ⚠⚠ THE PROMISE WAS FALSE WHEN IT WAS WRITTEN, and by the corpus's own
+    // count. `D-HIR-TEXT-NODE-WALK-RECURSES-PER-LEVEL-ON-BOTH-HALVES-AND-THREE-SPELLINGS-DO-NOT-READ-BACK`
+    // round-tripped the emitted corpus BY HAND and found three writer spellings
+    // the reader could not read — each shipped, each pre-existing, and each
+    // failing in a different way: a VLA bound `arr<T, -2>` ABORTED the reading
+    // process, `goto *<expr>` was refused for a token the lexer did not have,
+    // and a `lit float` past 2^64 came back as 0.0 THROUGH A CLEAN REPORTER. All
+    // three left `--emit-hir` at rc 0.
+    //
+    // ★★ SO THE CHECK IS A RE-EMIT AND A BYTE COMPARE, NEVER MERELY "IT PARSES".
+    // The float defect is the whole argument: it parsed clean, `result->ok` was
+    // true, and the value was silently wrong — a reader-consumer that asserted
+    // only a successful parse would have passed it, and the one that already
+    // existed (`tests/program/test_emit_hir_mode.cpp`, `reparse`) did exactly
+    // that. Byte identity is the only predicate that can see a value the reader
+    // reconstructed DIFFERENTLY, because it compares what the reader rebuilt
+    // against what the writer meant, one token at a time. `emitHir(parseHir(
+    // emitHir(h)))` is the contract `hir_text.hpp` states; this is where the
+    // shipped mode is held to it.
+    //
+    // ⓘ WHY IT IS UNCONDITIONAL AND NOT A FLAG. A check a consumer has to opt
+    // into is a check that is off in the run that matters, and the failure it
+    // catches is not a wrong exit code — it is a file we told a consumer was
+    // good that kills their process on read. ✔The cost is measured rather than
+    // assumed: the front end (preprocess, parse, semantic analysis, lowering)
+    // dominates a `--emit-hir` invocation, and the parse + re-emit of the text
+    // it produced is a small fraction of it. The number is in this cycle's row.
+    //
+    // The predicate is `hirArtifactRoundTripFailure` (program.hpp), which takes
+    // an ARTIFACT rather than living inline here — see there for why that is
+    // what makes the refusal demonstrable at all.
+    //
+    // ★ THE REFUSAL IS ITS OWN EXIT CODE, AND THAT IS A REFINEMENT OF THE
+    // NON-ZERO ROW RATHER THAN A THIRD STATE. The consumer's binary contract is
+    // untouched — rc 0 ⇔ an artifact is written and readable, non-zero ⇔ NOTHING
+    // is written — but 1 and 2 ask the consumer for different actions: 1 is
+    // *"your source was rejected, here is why"*, 2 is *"this compiler produced
+    // an artifact it cannot read; that is our defect, not your program's, and
+    // nothing you change in your source will help"*. A single code would have
+    // made those indistinguishable to any automated consumer, and to this
+    // repo's own corpus gate, which must be able to tell an example the front
+    // end declined from an example whose artifact did not survive the round
+    // trip — otherwise a codec regression would present as a growing skip list
+    // and the gate would report success while measuring less.
+    if (std::string const why = hirArtifactRoundTripFailure(text); !why.empty()) {
+        err << "error: --emit-hir: the artifact for '" << target
+            << "' was produced, but this build's own reader could not take it "
+               "back unchanged. This is a defect in the compiler, not in the "
+               "source. Nothing was written.\n"
+            << why << "\n";
+        return 2;
+    }
+    // `-` is stdout, the spelling the ASK asked for and the one every
+    // filter-shaped tool uses. It is checked against the WHOLE path, never a
+    // prefix: a real file may legitimately be named `-something`.
+    if (path == "-") {
+        out << text;
+        if (!out) {
+            err << "error: --emit-hir: writing the artifact to standard output "
+                   "failed.\n";
+            return 1;
+        }
+        return 0;
+    }
+    // Binary mode, so the LF-only artifact stays LF on Windows. A `.dsshir` is
+    // compared byte-for-byte by its consumers (and by this repo's goldens), so a
+    // host-dependent line ending would make the same compiler produce two
+    // different files for one input.
+    std::ofstream o{fs::path{path}, std::ios::binary | std::ios::trunc};
+    if (!o) {
+        err << "error: --emit-hir: could not open '" << path
+            << "' for writing.\n";
+        return 1;
+    }
+    o.write(text.data(), static_cast<std::streamsize>(text.size()));
+    o.close();
+    if (!o) {
+        err << "error: --emit-hir: writing '" << path << "' failed.\n";
+        return 1;
+    }
+    return 0;
 }
 
 int Program::compileUnits(
@@ -6005,6 +6626,9 @@ int Program::compileUnits(
                     // D-PP-HEADER-CASE-INSENSITIVE-PE: the format FILE's own
                     // header-name case rule (NOT derived from the format kind).
                     builder.setHeaderNameMatching(key.headerNameMatching);
+                    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the target's
+                    // plain-`char` sign, for the `#if` ICE fold.
+                    builder.setCharIsUnsigned(key.charIsUnsigned);
                     // TF-C74: the active target's per-architecture identity macros.
                     builder.setTargetPredefinedMacros(
                         {targetPredefines.begin(), targetPredefines.end()});

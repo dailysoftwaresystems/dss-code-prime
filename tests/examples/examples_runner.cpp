@@ -468,6 +468,17 @@ struct ExampleManifest {
     // line:col). Mutually exclusive with the run path: no binary is
     // spawned and `exitCode` is not required.
     std::vector<ExpectedDiagnostic> expectDiagnostics;
+    // P54 lane `fw`: the THIRD thing a manifest can say. `expectDiagnostics`
+    // asserts a REFUSAL; `exitCode` asserts a program that BUILT AND RAN;
+    // `expectWarnings` asserts both at once — the compile SUCCEEDS, the artifact
+    // is still built and run and checked exactly as any other entry, AND the
+    // named codes were emitted at Warning severity at the declared positions.
+    // That is the shape of every accept-and-report boundary this repo has
+    // (`S_UnknownAttribute`, `S_ConstViolation` on a const bit-field,
+    // `S_FloatLiteralOverflowsToInfinity`), and until now no single entry could
+    // hold both halves of it. NOT mutually exclusive with `exitCode` — it
+    // REQUIRES it, because the program still runs.
+    std::vector<ExpectedDiagnostic> expectWarnings;
 };
 
 // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171) + nested extension: parse ONE
@@ -758,6 +769,77 @@ validateOptimizationObservable(ExampleManifest const& m, fs::path const& path) {
     return true;
 }
 
+// Parse ONE array of diagnostic expectations. `expectDiagnostics` (the refusal
+// set) and `expectWarnings` (the accept-and-report set) declare the IDENTICAL
+// entry shape and differ only in the verdict their presence selects, so the
+// entry parse lives here once. `keyName` is only ever used in the messages; the
+// key LITERALS stay at the caller's `contains(` / `.at(` sites so the
+// cross-runner vocabulary pin can still see them. Returns false (ADD_FAILURE
+// already fired) on any malformed field.
+[[nodiscard]] bool
+parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
+                             fs::path const& path,
+                             std::vector<ExpectedDiagnostic>& out) {
+    if (!arr.is_array() || arr.empty()) {
+        ADD_FAILURE() << "manifest " << path.generic_string()
+                      << " '" << keyName << "' must be a non-empty array";
+        return false;
+    }
+    for (auto const& d : arr) {
+        if (!d.is_object()
+            || !d.contains("code") || !d.at("code").is_string()
+            || !d.contains("line") || !d.at("line").is_number_unsigned()
+            || !d.contains("col")  || !d.at("col").is_number_unsigned()) {
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " each " << keyName << " entry needs string 'code'"
+                             " + unsigned 'line' + unsigned 'col'";
+            return false;
+        }
+        ExpectedDiagnostic ed;
+        ed.code = d.at("code").get<std::string>();
+        ed.line = d.at("line").get<std::uint32_t>();
+        ed.col  = d.at("col").get<std::uint32_t>();
+        // #4: optional — a span-less-tier diagnostic is matched by code only.
+        if (d.contains("positioned")) {
+            if (!d.at("positioned").is_boolean()) {
+                ADD_FAILURE() << "manifest " << path.generic_string()
+                              << " " << keyName
+                              << " 'positioned' must be a boolean";
+                return false;
+            }
+            ed.positioned = d.at("positioned").get<bool>();
+        }
+        // The CLOSED per-entry key set — the fourth and last of this
+        // vocabulary's closed sets (top level, target, dependsOn entry,
+        // here). Included for CONSISTENCY rather than to stop a live
+        // silent-disarm, and the distinction is worth recording: `code`,
+        // `line` and `col` are REQUIRED, so a typo in one already fails
+        // loud above, and `positioned` defaults to TRUE (the strict
+        // reading), so a typo'd `positioned` leaves the STRONGER assertion
+        // standing and reds rather than passing. This is the one scope
+        // whose gap failed safe — but an expectation the runner does not
+        // read is still an assertion that never fires, and a rule applied
+        // at three of four levels is a rule an author cannot rely on.
+        for (auto const& [k, unusedV] : d.items()) {
+            (void)unusedV;
+            if (k == "code" || k == "line" || k == "col"
+                || k == "positioned" || k.starts_with("$")) {
+                continue;
+            }
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " " << keyName << " entry '" << ed.code
+                          << "' declares unknown key '" << k
+                          << "' — the runner reads code / line / col /"
+                             " positioned (plus $comment keys). An"
+                             " expectation the runner does not read is an"
+                             " assertion that never fires.";
+            return false;
+        }
+        out.push_back(std::move(ed));
+    }
+    return true;
+}
+
 [[nodiscard]] ExampleManifest readManifest(fs::path const& path) {
     std::ifstream in(path);
     if (!in) {
@@ -855,76 +937,53 @@ validateOptimizationObservable(ExampleManifest const& m, fs::path const& path) {
     // V2-4 Part C: parse the expect-error diagnostics FIRST — their
     // presence makes this an error manifest, which relaxes the exitCode
     // requirement (no binary is produced or run).
-    if (j.contains("expectDiagnostics")) {
-        if (!j.at("expectDiagnostics").is_array() || j.at("expectDiagnostics").empty()) {
-            ADD_FAILURE() << "manifest " << path.generic_string()
-                          << " 'expectDiagnostics' must be a non-empty array";
-            return m;
-        }
-        for (auto const& d : j.at("expectDiagnostics")) {
-            if (!d.is_object()
-                || !d.contains("code") || !d.at("code").is_string()
-                || !d.contains("line") || !d.at("line").is_number_unsigned()
-                || !d.contains("col")  || !d.at("col").is_number_unsigned()) {
-                ADD_FAILURE() << "manifest " << path.generic_string()
-                              << " each expectDiagnostics entry needs string 'code'"
-                                 " + unsigned 'line' + unsigned 'col'";
-                return m;
-            }
-            ExpectedDiagnostic ed;
-            ed.code = d.at("code").get<std::string>();
-            ed.line = d.at("line").get<std::uint32_t>();
-            ed.col  = d.at("col").get<std::uint32_t>();
-            // #4: optional — a span-less-tier diagnostic is matched by code only.
-            if (d.contains("positioned")) {
-                if (!d.at("positioned").is_boolean()) {
-                    ADD_FAILURE() << "manifest " << path.generic_string()
-                                  << " expectDiagnostics 'positioned' must be a boolean";
-                    return m;
-                }
-                ed.positioned = d.at("positioned").get<bool>();
-            }
-            // The CLOSED per-entry key set — the fourth and last of this
-            // vocabulary's closed sets (top level, target, dependsOn entry,
-            // here). Included for CONSISTENCY rather than to stop a live
-            // silent-disarm, and the distinction is worth recording: `code`,
-            // `line` and `col` are REQUIRED, so a typo in one already fails
-            // loud above, and `positioned` defaults to TRUE (the strict
-            // reading), so a typo'd `positioned` leaves the STRONGER assertion
-            // standing and reds rather than passing. This is the one scope
-            // whose gap failed safe — but an expectation the runner does not
-            // read is still an assertion that never fires, and a rule applied
-            // at three of four levels is a rule an author cannot rely on.
-            for (auto const& [k, unusedV] : d.items()) {
-                (void)unusedV;
-                if (k == "code" || k == "line" || k == "col"
-                    || k == "positioned" || k.starts_with("$")) {
-                    continue;
-                }
-                ADD_FAILURE() << "manifest " << path.generic_string()
-                              << " expectDiagnostics entry '" << ed.code
-                              << "' declares unknown key '" << k
-                              << "' — the runner reads code / line / col /"
-                                 " positioned (plus $comment keys). An"
-                                 " expectation the runner does not read is an"
-                                 " assertion that never fires.";
-                return m;
-            }
-            m.expectDiagnostics.push_back(std::move(ed));
-        }
+    //
+    // ★ ONE PARSER, TWO KEYS (P54 lane `fw`). `expectWarnings` declares the same
+    // ENTRY shape as `expectDiagnostics` and differs only in the verdict its
+    // presence selects, so the entry parse is a helper both call rather than a
+    // second verbatim copy. The KEY LITERALS stay at the `contains(` / `.at(`
+    // call sites on purpose: the cross-runner vocabulary pin harvests manifest
+    // key strings from exactly those accessor spellings, and hiding one behind a
+    // variable would leave the pin passing while it could no longer see the key.
+    if (j.contains("expectDiagnostics")
+        && !parseExpectedDiagnosticArray(j.at("expectDiagnostics"),
+                                         "expectDiagnostics", path,
+                                         m.expectDiagnostics)) {
+        return m;
+    }
+    if (j.contains("expectWarnings")
+        && !parseExpectedDiagnosticArray(j.at("expectWarnings"),
+                                         "expectWarnings", path,
+                                         m.expectWarnings)) {
+        return m;
+    }
+    // An entry cannot be both a REFUSAL and an accept-and-report: the first
+    // never builds an artifact and the second asserts over one.
+    if (!m.expectDiagnostics.empty() && !m.expectWarnings.empty()) {
+        ADD_FAILURE() << "manifest " << path.generic_string()
+                      << " declares BOTH 'expectDiagnostics' and"
+                         " 'expectWarnings'. The first asserts the compile was"
+                         " REJECTED and never runs the artifact; the second"
+                         " asserts it SUCCEEDED and still reported. Declare the"
+                         " codes that must refuse in the first and the codes"
+                         " that must warn in the second, in two entries.";
+        return m;
     }
     // PROJECT MODE has no expect-error branch, and saying so LOUDLY is the
     // point: `runErrorTarget` reads `m.sources.front()`, which a project
     // manifest never populates. Rejecting the combination in the PARSER means
     // the unsupported shape is named where the author can fix it, rather than
-    // reaching an assertion on an empty vector.
-    if (m.project.has_value() && !m.expectDiagnostics.empty()) {
+    // reaching an assertion on an empty vector. `expectWarnings` resolves its
+    // positions through the same single named source and is refused for the
+    // same reason.
+    if (m.project.has_value()
+        && (!m.expectDiagnostics.empty() || !m.expectWarnings.empty())) {
         ADD_FAILURE() << "manifest " << path.generic_string()
-                      << " declares BOTH 'project' and 'expectDiagnostics'."
-                         " The expect-error path compiles a single named source"
-                         " so a diagnostic's offset maps unambiguously; a"
+                      << " declares BOTH 'project' and a diagnostic expectation."
+                         " Those paths compile a single named source so a"
+                         " diagnostic's offset maps unambiguously; a"
                          " project build has no such source. Implement the"
-                         " project-mode expect-error path in BOTH runners"
+                         " project-mode diagnostic path in BOTH runners"
                          " before declaring this pair.";
         return m;
     }
@@ -1203,6 +1262,7 @@ validateOptimizationObservable(ExampleManifest const& m, fs::path const& path) {
             || k == "project" || k == "exitCode" || k == "expectedStdout"
             || k == "targets" || k == "optimizedPipelines"
             || k == "optimizationObservable" || k == "expectDiagnostics"
+            || k == "expectWarnings"
             || k.starts_with("$")) {
             continue;
         }
@@ -1211,10 +1271,30 @@ validateOptimizationObservable(ExampleManifest const& m, fs::path const& path) {
                       << "' — the runner reads language / source / sources /"
                          " project / exitCode / expectedStdout / targets /"
                          " optimizedPipelines / optimizationObservable /"
-                         " expectDiagnostics (plus $comment keys). An"
-                         " expectation the runner does not read is an assertion"
-                         " that never fires.";
+                         " expectDiagnostics / expectWarnings (plus $comment"
+                         " keys). An expectation the runner does not read is an"
+                         " assertion that never fires.";
         return m;
+    }
+    // ★ SINGLE-SOURCE ONLY WHERE POSITIONS ARE ASSERTED — the same rule
+    // `runErrorTarget` states for `expectDiagnostics`, and for the same reason:
+    // a span offset is resolved through ONE `SourceBuffer`, so a POSITIONED
+    // expectation needs exactly one source file. Declared here rather than at
+    // the assertion because a manifest defect belongs where the author can fix
+    // it, and because `expectWarnings` is checked on the RUN path, where an
+    // early return would silently skip the arm instead of reddening it.
+    {
+        bool anyPositioned = false;
+        for (auto const& e : m.expectWarnings) anyPositioned |= e.positioned;
+        if (anyPositioned && m.sources.size() != 1u) {
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " declares a POSITIONED 'expectWarnings' entry with "
+                          << m.sources.size()
+                          << " sources — one buffer, so a span offset maps to"
+                             " exactly one file. Declare every code"
+                             " `positioned:false` to use two or more sources.";
+            return m;
+        }
     }
     return m;
 }
@@ -2229,6 +2309,94 @@ compileAndRunArm(fs::path const& exampleDir,
     if (rc != 0 || rep.errorCount() != 0u) {
         armResult.verdict = ArmVerdict::Poisoned;
         return armResult;
+    }
+
+    // ★★★ `expectWarnings` — A DIAGNOSTIC ASSERTION ON A COMPILE THAT SUCCEEDS.
+    //
+    // Until P54 the corpus could say "this must be REFUSED, with these codes at
+    // these positions" (`expectDiagnostics` → `runErrorTarget`) and it could say
+    // "this must BUILD and RUN and exit 42" — and it could not say the third
+    // thing, which is what a warning IS: this must build, and run, and also have
+    // said something. `examples/c/const_bitfield_write_warns` documented the gap
+    // in its own manifest and split its claim across two instruments because
+    // neither could hold both halves. This is that key.
+    //
+    // ⚠ IT IS NOT WHOLE-SET EQUALITY, and the difference from the expect-error
+    // path is deliberate. `runErrorTarget` compares the ENTIRE rendered
+    // diagnostic set, which it can afford because a refused compile emits
+    // nothing incidental. A SUCCEEDING compile does — a `release` arm can emit
+    // `X_OptFixpointTruncated`, an honest report from the pass-schedule fixpoint
+    // (`examples/c/staticlib_alignas_carry` records exactly that) — and an entry
+    // that reddened because an unrelated advisory appeared would teach authors
+    // to stop declaring warnings at all. So the assertion is EXACT over the
+    // DECLARED CODES and silent about every other: for each code named in
+    // `expectWarnings`, the set of positions at which it was emitted must equal
+    // the declared set, no more and no fewer. A missing warning, a duplicated
+    // one, and one that moved are all red.
+    //
+    // ★ SEVERITY IS ASSERTED, and it is the load-bearing half. `rc == 0` and
+    // `errorCount() == 0` above already say the program was BUILT; requiring
+    // each matched diagnostic to be `Warning` is what makes this entry a pin on
+    // the accept-and-report boundary rather than on the mere presence of text.
+    if (!m.expectWarnings.empty()) {
+        std::set<std::string> declaredCodes;
+        std::set<std::string> codeOnly;
+        for (auto const& e : m.expectWarnings) {
+            declaredCodes.insert(e.code);
+            if (!e.positioned) codeOnly.insert(e.code);
+        }
+        auto const render = [&codeOnly](std::string_view code,
+                                        std::uint32_t line, std::uint32_t col) {
+            std::string s(code);
+            if (codeOnly.count(s) != 0) return s;
+            s += ' ';
+            s += std::to_string(line);
+            s += ':';
+            s += std::to_string(col);
+            return s;
+        };
+        // Positions resolve through the SAME `SourceBuffer::lineCol` the
+        // compiler used, read from the scratch copy that was actually compiled.
+        std::ifstream in(srcPaths.front(), std::ios::binary);
+        std::string const srcBytes{std::istreambuf_iterator<char>(in),
+                                   std::istreambuf_iterator<char>()};
+        auto const srcBuf = SourceBuffer::fromString(srcBytes, m.sources.front());
+
+        std::vector<std::string> actual;
+        for (auto const& d : rep.all()) {
+            std::string const name{diagnosticCodeName(d.code)};
+            if (declaredCodes.count(name) == 0) continue;
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning)
+                << "example " << exampleDir.generic_string() << " arm="
+                << armLabel << ": " << name
+                << " is declared in `expectWarnings` but was emitted at"
+                   " severity " << static_cast<int>(d.severity)
+                << ". `expectWarnings` asserts a compile that SUCCEEDS and still"
+                   " reports; a code that turns into an Error belongs in"
+                   " `expectDiagnostics`.";
+            if (codeOnly.count(name) != 0) {
+                actual.push_back(render(name, 0, 0));
+                continue;
+            }
+            auto const lc = srcBuf->lineCol(d.span.start());
+            actual.push_back(render(name, lc.line, lc.column));
+        }
+        std::vector<std::string> expected;
+        expected.reserve(m.expectWarnings.size());
+        for (auto const& e : m.expectWarnings) {
+            expected.push_back(render(e.code, e.line, e.col));
+        }
+        std::sort(actual.begin(), actual.end());
+        std::sort(expected.begin(), expected.end());
+        EXPECT_EQ(actual, expected)
+            << "example " << exampleDir.generic_string()
+            << " spec=" << t.spec << " arm=" << armLabel
+            << ": the declared warning codes were not emitted exactly where"
+               " declared. All diagnostics:" << diagDump.str();
+        if (actual != expected) {
+            armResult.verdict = ArmVerdict::Poisoned;
+            return armResult;
+        }
     }
 
     // D-AP2-OUTPUT-ROUTING: a PROJECT build forces `setPerFormatOutputSubdir(true)`

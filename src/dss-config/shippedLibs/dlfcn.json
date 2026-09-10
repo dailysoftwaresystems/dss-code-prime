@@ -3,7 +3,7 @@
   "header": "dlfcn.h",
   "standard": "posix",
   "availableObjectFormats": ["elf", "macho"],
-  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "library": { "elf": { "role": "cLibrary" }, "macho": { "role": "cLibrary" } },
   "symbols": [
     { "name": "dlopen",  "signature": "fn(ptr<const<char>>, i32) -> ptr<void>",  "kind": "function", "linkage": "external" },
     { "name": "dlsym",   "signature": "fn(ptr<void>, ptr<const<char>>) -> ptr<void>", "kind": "function", "linkage": "external" },

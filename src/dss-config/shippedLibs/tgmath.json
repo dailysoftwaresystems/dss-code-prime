@@ -3,7 +3,7 @@
   "header": "tgmath.h",
   "standard": "c99",
   "availableObjectFormats": ["elf", "pe", "macho"],
-  "library": { "pe": "ucrtbase.dll", "elf": "libm.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "library": { "pe": { "role": "cLibrary" }, "elf": "libm.so.6", "macho": { "role": "cLibrary" } },
   "macros": [
     { "name": "sqrt", "params": ["x"], "replacement": "_Generic((x), float: sqrtf((float)(x)), double _Complex: csqrt((x)), float _Complex: csqrt((x)), default: sqrt((x)))" },
     { "name": "sin", "params": ["x"], "replacement": "_Generic((x), float: sinf((float)(x)), double _Complex: csin((x)), float _Complex: csin((x)), default: sin((x)))" },

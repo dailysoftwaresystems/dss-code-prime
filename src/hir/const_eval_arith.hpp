@@ -17,6 +17,9 @@
 // with policy applied.
 
 #include "core/types/bit_int_value.hpp"
+#include "core/types/number_decode.hpp"   // FloatKindInfo / narrowToFloatWidth /
+                                          // decodeFloatLiteralAtKind live beside the
+                                          // decoders they are the width half of
 #include "core/types/wide_float_value.hpp"   // LD-3: F80/F128 target-precision fold kernel
 #include "core/types/type_lattice/core_type.hpp"
 #include "hir/const_eval.hpp"
@@ -262,30 +265,6 @@ applyUnaryInt(HirOpKind op, HirLiteralValue const& inner) {
     }
 }
 
-// Per-float-kind host-backing info: `bits` is the format's width; `hostBacked`
-// says whether the host `double` can carry the EXACT value (F16/F32 narrow
-// losslessly through `narrowToFloatWidth`; F64 is identity). F80/F128 are NOT
-// host-backed — no soft-float engine exists for them, so const-eval refuses
-// (fold + conversion) rather than bake a binary64-rounded value. Defined ABOVE
-// the applyUnary/BinaryFloat folds, which gate on it (FC17.9(e),
-// D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION).
-struct FloatKindInfo {
-    int  bits;
-    bool hostBacked;
-};
-[[nodiscard]] inline std::optional<FloatKindInfo> floatKindInfo(TypeKind k) noexcept {
-    switch (k) {
-        case TypeKind::F16:  return FloatKindInfo{16,  true};
-        case TypeKind::F32:  return FloatKindInfo{32,  true};
-        case TypeKind::F64:  return FloatKindInfo{64,  true};
-        // F80 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): NOT host-backed —
-        // the host `double` cannot represent an 80-bit-mantissa value, so
-        // folding at binary64 would bake a silently-rounded constant.
-        case TypeKind::F80:  return FloatKindInfo{80,  false};
-        case TypeKind::F128: return FloatKindInfo{128, false};
-        default: return std::nullopt;
-    }
-}
 
 // FC17.9(e) → LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): does the
 // operand's core refuse host-double folding? A non-host-backed float kind folded
@@ -385,7 +364,30 @@ struct IntKindInfo {
     int  bits;
     bool isSigned;
 };
-[[nodiscard]] inline std::optional<IntKindInfo> intKindInfo(TypeKind k) noexcept {
+// ── THE (width, signedness) OF A STANDARD INTEGER CORE ──────────────────────
+// [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]. Every row here is a property of C
+// and of the data model DSS ships — EXCEPT `Char`, whose sign C 6.2.5p15 leaves
+// implementation-defined and which the TARGET declares in its one
+// `charIsUnsigned` key (resolved per object format:
+// `TargetSchema::charIsUnsigned(ObjectFormatKind)`). That is why the fact is a
+// REQUIRED parameter and not a defaulted one: a default is a second place the
+// answer is decided, and it is decided in silence.
+//
+// ⚠ THE `Char` ROW USED TO READ `{32, false}` AND BOTH FIELDS WERE WRONG.
+// 32 bits made `(char)300` fold to 300 instead of 44 (✔MEASURED: DSS 45 vs
+// gcc 13.3.0 / clang 18.1.3 / aarch64-linux-gnu-gcc 13.3.0 all 42 on
+// `static int g = (char)300; g == 44`), and the WIDTH bug MASKED the sign bug
+// because a value that survives un-truncated is identical under both readings.
+// `char` is 8 bits in every data model DSS ships, so the width is unconditional;
+// only the sign asks the target.
+//
+// ★ ABSENT FACT ⇒ `nullopt` ⇒ REFUSE, and that costs no new failure channel:
+// every caller already treats `nullopt` as "not a foldable integer kind" and
+// fails loud. A tier that has not been handed the target's answer therefore
+// cannot fold a `char` at all, rather than folding it as whichever sign the
+// author of that tier happened to assume.
+[[nodiscard]] inline std::optional<IntKindInfo>
+intKindInfo(TypeKind k, std::optional<bool> charIsUnsigned) noexcept {
     switch (k) {
         case TypeKind::Bool: return IntKindInfo{1,   false};
         case TypeKind::I8:   return IntKindInfo{8,   true};
@@ -395,7 +397,9 @@ struct IntKindInfo {
         case TypeKind::U16:  return IntKindInfo{16,  false};
         case TypeKind::I32:  return IntKindInfo{32,  true};
         case TypeKind::U32:  return IntKindInfo{32,  false};
-        case TypeKind::Char: return IntKindInfo{32,  false};
+        case TypeKind::Char:
+            if (!charIsUnsigned.has_value()) return std::nullopt;
+            return IntKindInfo{8, !*charIsUnsigned};
         case TypeKind::I64:  return IntKindInfo{64,  true};
         case TypeKind::U64:  return IntKindInfo{64,  false};
         case TypeKind::I128: return IntKindInfo{128, true};
@@ -443,6 +447,174 @@ struct IntKindInfo {
     return static_cast<std::int64_t>(masked);
 }
 
+// ── C 6.3.1.4p1: FLOAT → INTEGER, ONE LAW FOR BOTH WALKERS ─────────────────
+// [[D-C-FLOAT-CAST-DOES-NOT-FOLD-IN-A-CONSTANT-EXPRESSION]]. The conversion
+// used to be spelled out ONCE — inside the HIR walker's `combineCast` — and not
+// at all in the CST walker, so `(int)1.5` folded in a global initializer and was
+// refused in an array bound. Three total functions now carry the whole rule, and
+// both walkers call them: the CST arm cannot drift from the HIR arm because
+// there is only one arithmetic left to drift.
+//
+// ⚠ THE RANGE TEST RUNS IN THE FLOAT DOMAIN, AT THE TARGET'S OWN WIDTH, and that
+// is not a style choice. The HIR arm used to truncate into an `int64_t` FIRST and
+// range-check second, so every target inherited int64's ceiling: ✔MEASURED,
+// `_Static_assert((unsigned long long)1.8446744e19 > 0, "")` — accepted by gcc
+// 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51, probed separately —
+// was refused by DSS purely because 1.8446744e19 exceeds INT64_MAX, though it is
+// comfortably inside `unsigned long long`.
+
+// C 6.3.1.4p2, the other direction: an INTEGER source widening to a float.
+// ⚠ THE SOURCE'S SIGNEDNESS IS CARRIED BY ITS CORE, NEVER BY WHICH VARIANT ARM
+// HOLDS IT. The CST integer leaf stores every literal in the `int64_t` arm
+// whatever its declared type, so `18446744073709551615ULL` arrives as -1 under a
+// U64 core; reading the bits without asking the core folds
+// `(double)18446744073709551615ULL` to -1.0, and asking `asInt64` instead refuses
+// it outright. ✔MEASURED, gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC
+// 19.51 all fold it to 2^64 and all four accept `!= -1.0`. nullopt when the value
+// has no 64-bit rendering at all (a wide `_BitInt` / `__int128`), which the
+// callers turn into a loud refusal rather than a rounded guess.
+[[nodiscard]] inline std::optional<double>
+integerConstantAsDouble(HirLiteralValue const& v,
+                        std::optional<bool> charIsUnsigned) noexcept {
+    if (auto const* uv = std::get_if<std::uint64_t>(&v.value)) {
+        return static_cast<double>(*uv);
+    }
+    auto const bits = asIntBits(v);
+    if (!bits.has_value()) return std::nullopt;
+    bool isUnsigned = false;
+    if (auto const* bv = std::get_if<BitIntValue>(&v.value)) {
+        isUnsigned = !bv->isSigned();
+    } else if (auto const si = intKindInfo(v.core, charIsUnsigned); si.has_value()) {
+        isUnsigned = !si->isSigned;
+    }
+    return isUnsigned ? static_cast<double>(static_cast<std::uint64_t>(*bits))
+                      : static_cast<double>(*bits);
+}
+
+// The integral part of a folded float, toward zero, as an EXACT double.
+// nullopt for NaN / ±inf (C 6.3.1.4p1 gives them no integral part) and for a
+// non-`double` arm — an F80/F128 `WideFloatValue` truncates at ITS OWN precision
+// through `WideFloatValue::toInt64`, never by way of a host double (narrowing
+// first would move the 2^63 boundary and flip a sign).
+//
+// ⓘ THE NaN/inf ARM IS DEFENSIVE, NOT COVERED, AND SAYING SO IS THE POINT.
+// ✔MEASURED: neither route to an infinity in a C constant expression reaches
+// here today — `__builtin_inf()` is an undeclared identifier in the shipped `c`
+// front end (S_UndeclaredIdentifier, so a test written on it would refuse for the
+// wrong reason), and an overflowing decimal literal is not decodable either
+// (`_Static_assert(1e400 > 0.0, "")` is already not a constant one tier earlier).
+// A pin on this arm would therefore be VACUOUS in both spellings, which is why
+// there is none; the arm stays because the day either route opens, truncating a
+// NaN must not become a number.
+[[nodiscard]] inline std::optional<double>
+truncateFloatTowardZero(HirLiteralValue const& v) noexcept {
+    if (!isFloatValue(v)) return std::nullopt;
+    auto const dv = asDouble(v);
+    if (!dv.has_value()) return std::nullopt;          // the WideFloatValue arm
+    if (std::isnan(*dv) || std::isinf(*dv)) return std::nullopt;
+    return (*dv >= 0.0) ? std::floor(*dv) : std::ceil(*dv);
+}
+
+// Does an already-truncated integral value fit an integer target of
+// (`width`, `isSigned`)? C 6.3.1.4p1 makes the conversion UNDEFINED when it does
+// not, and the references do not agree on what they produce then — ✔MEASURED,
+// `(int)1e30` is INT_MAX on gcc/clang/mingw and 0 on MSVC 19.51; `(char)300.5` is
+// 127 on the three gcc/clang toolchains and 44 on MSVC. So the answer to "does it
+// fit" decides between folding and refusing, never between two candidate values.
+//
+// The bounds are built with `ldexp`, so each is a power of two and therefore
+// EXACT as a double at every width. The upper bound is EXCLUSIVE for that reason:
+// `2^(W-1) - 1` is not representable for W = 64, and writing it would round UP to
+// 2^63 and admit a value that does not fit. `t` is integral, so `t < 2^(W-1)` is
+// exactly `t <= 2^(W-1) - 1`. At widths past 1024 `ldexp` saturates to +inf and
+// every finite `t` fits — which is the right answer for a `_BitInt` that wide.
+[[nodiscard]] inline bool
+truncatedFitsIntWidth(double t, std::uint32_t width, bool isSigned) noexcept {
+    if (width == 0) return false;
+    int const w = static_cast<int>(width);
+    if (isSigned) {
+        return t >= -std::ldexp(1.0, w - 1) && t < std::ldexp(1.0, w - 1);
+    }
+    return t >= 0.0 && t < std::ldexp(1.0, w);
+}
+
+// Build a `BitIntValue` of (`width`, `isSigned`) from an integral double that
+// `truncatedFitsIntWidth` has already admitted. For the WIDE targets — `__int128`
+// and `_BitInt(N > 64)` — this is the only exact route: `(__int128)1e30` has no
+// int64 rendering at all, so a bridge through `asInt64` refuses a conversion gcc
+// 13.3.0 and clang 18.1.3 both fold (✔MEASURED).
+//
+// EXACTNESS: a finite double is `mant * 2^(e-53)` with `mant` a 53-bit integer,
+// which `frexp`/`ldexp` recover with no rounding. When the exponent is negative
+// the value is integral only if those low bits are zero, so the shift-right
+// discards nothing.
+//
+// ⓘ THE ONE INTERMEDIATE THAT LOOKS WRONG AND IS NOT. The magnitude is built at
+// the TARGET's (width, isSigned) before being negated, and for a signed target
+// the single magnitude `2^(W-1)` does not fit that positive range — it lands on
+// the bit pattern that reads as `-2^(W-1)`. Negating it at width W is itself, and
+// `-2^(W-1)` is exactly the value being converted, so the answer is right. Every
+// other admitted magnitude is strictly below `2^(W-1)` and represents itself,
+// because `truncatedFitsIntWidth` — which the caller must have run — admits a
+// signed target only over `[-2^(W-1), 2^(W-1))`. Pinned by
+// `_Static_assert((int)-2147483648.0 == -2147483647-1, "")`.
+[[nodiscard]] inline BitIntValue
+bitIntFromIntegralDouble(double t, std::uint32_t width, bool isSigned) {
+    bool const isNeg = t < 0.0;
+    double const mag = isNeg ? -t : t;
+    if (mag == 0.0) return BitIntValue::fromU64(0, width, isSigned);
+    int e = 0;
+    double const m = std::frexp(mag, &e);                     // mag = m * 2^e
+    std::uint64_t mant = static_cast<std::uint64_t>(std::ldexp(m, 53));
+    int shift = e - 53;
+    if (shift < 0) { mant >>= static_cast<unsigned>(-shift); shift = 0; }
+    BitIntValue out = BitIntValue::fromU64(mant, width, isSigned);
+    if (shift > 0) {
+        out = BitIntValue::shiftLeft(out, static_cast<std::uint64_t>(shift),
+                                     width, isSigned);
+    }
+    if (isNeg) out = BitIntValue::neg(out, width, isSigned);
+    return out;
+}
+
+// C 6.3.1.4p1 for a FLOAT source landing on an integer target too wide for the
+// int64/uint64 literal arms — `_BitInt(N)`, `__int128`, `unsigned __int128`.
+// Called by BOTH walkers' cast arms.
+//   * `nullopt`                     — the source is not a float; the caller's own
+//                                     integer path applies, untouched.
+//   * engaged, `value` disengaged   — a float source that cannot convert: float
+//                                     folding is off, or the value is NaN / ±inf,
+//                                     or its truncation is outside the target's
+//                                     range (all undefined per 6.3.1.4p1).
+//   * engaged, `value` engaged      — the converted value.
+struct WideFloatCastOutcome {
+    std::optional<BitIntValue> value{};
+};
+[[nodiscard]] inline std::optional<WideFloatCastOutcome>
+floatToWideIntTarget(HirLiteralValue const& src, std::uint32_t width, bool isSigned,
+                     EvalOptions const& options) {
+    // An F80/F128 source keeps the route it already had — truncation at the
+    // operand's OWN precision via `WideFloatValue::toInt64`, never a narrowing to
+    // a host double first (the 2^63 boundary would move and a sign could flip).
+    // Its int64 ceiling is deliberately left in place: nothing measured needs it
+    // lifted, and lifting it would mean inventing a wide soft-float truncation no
+    // reference disagreement is pushing on.
+    if (auto const* wf = std::get_if<WideFloatValue>(&src.value)) {
+        if (!options.allowFloat) return WideFloatCastOutcome{};
+        auto const iv = wf->toInt64();
+        if (!iv.has_value()) return WideFloatCastOutcome{};
+        double const t = static_cast<double>(*iv);
+        if (static_cast<std::int64_t>(t) != *iv) return WideFloatCastOutcome{};
+        if (!truncatedFitsIntWidth(t, width, isSigned)) return WideFloatCastOutcome{};
+        return WideFloatCastOutcome{bitIntFromIntegralDouble(t, width, isSigned)};
+    }
+    if (!isFloatValue(src)) return std::nullopt;          // not a float at all
+    if (!options.allowFloat) return WideFloatCastOutcome{};
+    auto const t = truncateFloatTowardZero(src);
+    if (!t.has_value()) return WideFloatCastOutcome{};    // NaN / ±inf
+    if (!truncatedFitsIntWidth(*t, width, isSigned)) return WideFloatCastOutcome{};
+    return WideFloatCastOutcome{bitIntFromIntegralDouble(*t, width, isSigned)};
+}
 
 // True for the two 128-bit standard integer kinds — the widths that are STANDARD
 // (not bit-precise) yet still too wide for the int64/uint64 literal arms, so they
@@ -484,7 +656,8 @@ struct BitIntOperandType { std::uint32_t width; bool isSigned; bool isBitPrecise
 // (the modular reduction), `promoteBitIntOperand` (C 6.3.1.8) and
 // `intKindFromWidth`. Nothing here is a private `Int*` verb set.
 [[nodiscard]] inline std::optional<BitIntOperandType>
-bitIntOperandType(HirLiteralValue const& v) noexcept;
+bitIntOperandType(HirLiteralValue const& v,
+                  std::optional<bool> charIsUnsigned) noexcept;
 [[nodiscard]] inline BitIntOperandType
 promoteBitIntOperand(BitIntOperandType t) noexcept;
 [[nodiscard]] inline BitIntOperandType
@@ -506,14 +679,15 @@ intKindFromWidth(std::uint32_t width, bool isSigned) noexcept;
 // so a 128-bit domain cannot be expressed and MUST NOT be silently truncated
 // (D-CSUBSET-INT128-CONSTFOLD-WIDE routes those through the bignum instead).
 [[nodiscard]] inline std::optional<IntKindInfo>
-intOpDomain(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b) noexcept {
-    auto at = bitIntOperandType(a);
+intOpDomain(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b,
+            std::optional<bool> charIsUnsigned) noexcept {
+    auto at = bitIntOperandType(a, charIsUnsigned);
     if (!at.has_value() || at->isBitPrecise) return std::nullopt;
     BitIntOperandType rt{};
     if (isShiftOp(op)) {
         rt = promoteBitIntOperand(*at);          // C 6.5.7p3
     } else {
-        auto bt = bitIntOperandType(b);
+        auto bt = bitIntOperandType(b, charIsUnsigned);
         if (!bt.has_value() || bt->isBitPrecise) return std::nullopt;
         rt = bitIntUac(*at, *bt);                // C 6.3.1.8
     }
@@ -528,12 +702,25 @@ applyBinaryInt(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b,
     auto av64 = asIntBits(a);
     auto bv64 = asIntBits(b);
     if (!av64.has_value() || !bv64.has_value()) return std::nullopt;
+    // ── [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: A `char` OPERAND WITH NO
+    // TARGET ANSWER IS A REFUSAL, NOT A FALLTHROUGH. `intOpDomain` nullopts for
+    // it (via `intKindInfo`'s Char row), and the `dom.has_value()` fallthrough
+    // below would then evaluate the pair in the HOST's signed int64 domain —
+    // which is a perfectly plausible ANSWER and therefore the dangerous one.
+    // Named here rather than left to fall out, because the fallthrough is
+    // correct for every OTHER reason `dom` can be absent (`_BitInt`, 128-bit)
+    // and this one reason must not ride along with them.
+    if ((a.core == TypeKind::Char || b.core == TypeKind::Char)
+        && !opts.charIsUnsigned.has_value()) {
+        outFailure = ConstEvalFailure::UnsupportedTypeKind;
+        return std::nullopt;
+    }
     // ── CONVERT TO THE OPERATION'S TYPE (C 6.3.1.3p2 -- modular, ALWAYS
     // defined, never an overflow). `wrapToIntTarget` is identity at width 64,
     // where the int64 payload is already the right bit pattern; below 64 it
     // masks and re-extends. `dom` absent = a `_BitInt`/128-bit/non-integer pair
     // that this int64 path does not own, so the historical behaviour stands.
-    auto const dom = intOpDomain(op, a, b);
+    auto const dom = intOpDomain(op, a, b, opts.charIsUnsigned);
     std::int64_t const av = dom.has_value() ? wrapToIntTarget(*av64, *dom) : *av64;
     // The RHS of a shift keeps its own value: it is a COUNT, not an operand of
     // the result type (C 6.5.7p3), and the range check below reads it directly.
@@ -753,104 +940,6 @@ applyBinaryFloat(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& 
         || k == TypeKind::F64 || k == TypeKind::F80 || k == TypeKind::F128;
 }
 
-// Soft-float narrow `double → IEEE 754 binary16 → double`. Produces the
-// closest representable half-precision value of `dv`, then widens back
-// to `double` losslessly. NaN / ±inf preserved; round-to-nearest-even.
-[[nodiscard]] inline double narrowToHalf(double dv) noexcept {
-    float const fv = static_cast<float>(dv);
-    std::uint32_t bits;
-    static_assert(sizeof(float) == sizeof(std::uint32_t));
-    std::memcpy(&bits, &fv, sizeof(bits));
-    std::uint32_t const sign     = (bits >> 31) & 0x1u;
-    std::uint32_t const exp32    = (bits >> 23) & 0xFFu;
-    std::uint32_t const mant32   =  bits        & 0x7FFFFFu;
-    std::uint16_t half;
-    if (exp32 == 0xFFu) {
-        half = static_cast<std::uint16_t>((sign << 15) | (0x1Fu << 10) |
-            (mant32 != 0 ? (mant32 >> 13) | 0x200u : 0u));
-    } else if (exp32 == 0) {
-        half = static_cast<std::uint16_t>(sign << 15);
-    } else {
-        int const e = static_cast<int>(exp32) - 127 + 15;
-        if (e >= 0x1F) {
-            half = static_cast<std::uint16_t>((sign << 15) | (0x1Fu << 10));
-        } else if (e <= 0) {
-            std::uint32_t const mant = mant32 | 0x800000u;
-            int const shift = 14 - e;
-            if (shift >= 25) {
-                half = static_cast<std::uint16_t>(sign << 15);
-            } else {
-                std::uint32_t const rounded = mant >> shift;
-                std::uint32_t const rem     = mant & ((1u << shift) - 1u);
-                std::uint32_t const half_lsb = 1u << (shift - 1);
-                std::uint32_t out = rounded;
-                if (rem > half_lsb || (rem == half_lsb && (rounded & 1u))) {
-                    out += 1;
-                }
-                half = static_cast<std::uint16_t>((sign << 15) | (out & 0x3FFu));
-            }
-        } else {
-            std::uint32_t const mant = mant32;
-            std::uint32_t const rounded = mant >> 13;
-            std::uint32_t const rem     = mant & 0x1FFFu;
-            std::uint32_t const half_lsb = 0x1000u;
-            std::uint32_t out = rounded;
-            if (rem > half_lsb || (rem == half_lsb && (rounded & 1u))) {
-                out += 1;
-                if (out == 0x400u) {
-                    out = 0;
-                    if (e + 1 >= 0x1F) {
-                        half = static_cast<std::uint16_t>((sign << 15) | (0x1Fu << 10));
-                        goto done;
-                    }
-                    half = static_cast<std::uint16_t>(
-                        (sign << 15) | (static_cast<std::uint32_t>(e + 1) << 10));
-                    goto done;
-                }
-            }
-            half = static_cast<std::uint16_t>(
-                (sign << 15) | (static_cast<std::uint32_t>(e) << 10) | (out & 0x3FFu));
-        }
-    }
-done:
-    std::uint32_t const wsign = (static_cast<std::uint32_t>(half) >> 15) & 0x1u;
-    std::uint32_t const wexp  = (static_cast<std::uint32_t>(half) >> 10) & 0x1Fu;
-    std::uint32_t const wmant =  static_cast<std::uint32_t>(half)        & 0x3FFu;
-    std::uint32_t wbits;
-    if (wexp == 0x1Fu) {
-        wbits = (wsign << 31) | (0xFFu << 23) | (wmant << 13);
-    } else if (wexp == 0) {
-        if (wmant == 0) {
-            wbits = wsign << 31;
-        } else {
-            std::uint32_t m = wmant;
-            int e = -1;
-            while ((m & 0x400u) == 0) { m <<= 1; --e; }
-            m &= 0x3FFu;
-            wbits = (wsign << 31) |
-                    (static_cast<std::uint32_t>(127 - 14 + e + 1) << 23) |
-                    (m << 13);
-        }
-    } else {
-        wbits = (wsign << 31) |
-                (static_cast<std::uint32_t>(static_cast<int>(wexp) - 15 + 127) << 23) |
-                (wmant << 13);
-    }
-    float fout;
-    std::memcpy(&fout, &wbits, sizeof(fout));
-    return static_cast<double>(fout);
-}
-
-// (FloatKindInfo + floatKindInfo moved ABOVE the applyUnary/BinaryFloat folds
-// — FC17.9(e): the folds gate on hostBacked.)
-
-[[nodiscard]] inline double narrowToFloatWidth(double dv, int bits) noexcept {
-    switch (bits) {
-        case 16: return narrowToHalf(dv);
-        case 32: return static_cast<double>(static_cast<float>(dv));
-        default: return dv;
-    }
-}
 
 [[nodiscard]] inline bool intToFloatIsLossless(std::int64_t iv, int targetBits) noexcept {
     double const widened = static_cast<double>(iv);
@@ -874,7 +963,8 @@ done:
 
 
 [[nodiscard]] inline std::optional<BitIntOperandType>
-bitIntOperandType(HirLiteralValue const& v) noexcept {
+bitIntOperandType(HirLiteralValue const& v,
+                  std::optional<bool> charIsUnsigned) noexcept {
     // D-CSUBSET-INT128-CONSTFOLD (TF-C94): `core` is consulted BEFORE the variant
     // arm, because after this cycle the two no longer determine each other. A
     // folded 128-bit STANDARD value rides the `BitIntValue` payload (nothing
@@ -893,7 +983,7 @@ bitIntOperandType(HirLiteralValue const& v) noexcept {
     if (std::holds_alternative<std::int64_t>(v.value)
         || std::holds_alternative<std::uint64_t>(v.value)
         || std::holds_alternative<bool>(v.value)) {
-        if (auto ik = intKindInfo(v.core); ik.has_value()) {
+        if (auto ik = intKindInfo(v.core, charIsUnsigned); ik.has_value()) {
             return BitIntOperandType{static_cast<std::uint32_t>(ik->bits),
                                      ik->isSigned, false};
         }
@@ -904,9 +994,10 @@ bitIntOperandType(HirLiteralValue const& v) noexcept {
 // The operand as a `BitIntValue` at its OWN (width, signed) — a bignum arm passes
 // through; a standard arm converts at its `core` width. nullopt for a non-integer.
 [[nodiscard]] inline std::optional<BitIntValue>
-asBitIntValue(HirLiteralValue const& v) noexcept {
+asBitIntValue(HirLiteralValue const& v,
+              std::optional<bool> charIsUnsigned) noexcept {
     if (auto const* bv = std::get_if<BitIntValue>(&v.value)) return *bv;
-    auto ot = bitIntOperandType(v);
+    auto ot = bitIntOperandType(v, charIsUnsigned);
     if (!ot.has_value()) return std::nullopt;
     if (auto const* i = std::get_if<std::int64_t>(&v.value))
         return BitIntValue::fromI64(*i, ot->width, ot->isSigned);
@@ -1011,7 +1102,8 @@ struct BitIntBinaryFold {
     ConstEvalFailure failure = ConstEvalFailure::None;
 };
 [[nodiscard]] inline BitIntBinaryFold
-foldBitIntBinary(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b) {
+foldBitIntBinary(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b,
+                 std::optional<bool> charIsUnsigned) {
     // D-CSUBSET-INT128-CONSTFOLD (TF-C94): entry is by "does this fold need MORE
     // than 64 bits?", not by "is a `BitIntValue` variant present?". The old
     // variant-only predicate was the reason a PURE 128-bit fold silently wrapped
@@ -1030,10 +1122,10 @@ foldBitIntBinary(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& 
     BitIntBinaryFold r;
     if (!aBit && !bBit) return r;    // not a wide fold — caller's normal path
     r.applies = true;
-    auto at = bitIntOperandType(a);
-    auto bt = bitIntOperandType(b);
-    auto av = asBitIntValue(a);
-    auto bv = asBitIntValue(b);
+    auto at = bitIntOperandType(a, charIsUnsigned);
+    auto bt = bitIntOperandType(b, charIsUnsigned);
+    auto av = asBitIntValue(a, charIsUnsigned);
+    auto bv = asBitIntValue(b, charIsUnsigned);
     if (!at || !bt || !av || !bv) {
         r.failure = ConstEvalFailure::UnsupportedTypeKind;   // a non-integer operand
         return r;
@@ -1103,7 +1195,8 @@ struct BitIntUnaryFold {
     ConstEvalFailure failure = ConstEvalFailure::None;
 };
 [[nodiscard]] inline BitIntUnaryFold
-foldBitIntUnary(HirOpKind op, HirLiteralValue const& inner) {
+foldBitIntUnary(HirOpKind op, HirLiteralValue const& inner,
+                std::optional<bool> charIsUnsigned) {
     BitIntUnaryFold r;
     // D-CSUBSET-INT128-CONSTFOLD (TF-C94): the binary entry's twin — enter for a
     // 128-bit STANDARD operand too, not only for a `BitIntValue` variant, or
@@ -1117,8 +1210,8 @@ foldBitIntUnary(HirOpKind op, HirLiteralValue const& inner) {
         return r;                   // not a wide operand — caller's normal path
     }
     r.applies = true;
-    auto ot = bitIntOperandType(inner);
-    auto bv = asBitIntValue(inner);
+    auto ot = bitIntOperandType(inner, charIsUnsigned);
+    auto bv = asBitIntValue(inner, charIsUnsigned);
     if (!ot.has_value() || !bv.has_value()) {
         r.failure = ConstEvalFailure::UnsupportedTypeKind;   // a non-integer operand
         return r;

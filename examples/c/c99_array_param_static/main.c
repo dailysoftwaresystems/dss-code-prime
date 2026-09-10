@@ -39,9 +39,26 @@ int firstc(int a[const 3]) { return a[0]; }
 // `int a[const static 3]`: the qualifier + static combo — decays to `int *a`.
 int sumcs(int a[const static 3]) { return a[0] + a[1] + a[2]; }
 
-// `int a[*]`: the bare unspecified-size prototype-form VLA-parameter marker — decays to `int *a`
+// `int a[*]`: the bare unspecified-size PROTOTYPE-form VLA-parameter marker — decays to `int *a`
 // and indexes through the decayed pointer exactly like a plain pointer parameter.
-int gstar(int a[*]) { return a[0] + a[1] + a[2]; }
+//
+// ⚠⚠ THIS USED TO BE SPELLED `int gstar(int a[*]) { … }` — ONE declarator, `[*]` ON THE
+// DEFINITION — AND THAT PROGRAM IS ILL-FORMED C. The row that shipped it
+// (D-CSUBSET-VLA-PARAM-STAR, closed 2026-07-14) taught DSS to PARSE and decay `[*]` and never
+// asked WHERE C allows it. C 6.7.6.3p12 permits `[*]` only where the function declarator is
+// NOT part of a definition of that function, because a definition's parameters have block
+// scope (C 6.2.1p4) and the body needs the bound the `*` withholds.
+// ✔MEASURED 2026-09-03, each reference probed SEPARATELY: gcc 13.3.0 refuses (`'[*]' not
+// allowed in other than function prototype scope`) and clang 18.1.3 refuses (`variable length
+// array must be bound in function definition`); MSVC abstains (no C99 VLA at all, `C2059` on
+// the token). So this example's own runtime witness for `[*]` was a program neither working
+// reference will compile — ⇒ **a runnable witness proves the feature runs, never that the
+// program is legal**, and only probing the references answers the second question.
+// It is now spelled the way C intends and the way this feature is actually used: the
+// PROTOTYPE carries `[*]`, the DEFINITION spells a real bound. The decay under test is
+// unchanged — `gstar` still takes `int *` and still indexes through it.
+int gstar(int a[*]);
+int gstar(int a[3]) { return a[0] + a[1] + a[2]; }
 
 int main(void) {
     int x[3];

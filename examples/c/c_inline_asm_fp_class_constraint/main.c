@@ -32,13 +32,18 @@
  * to a floating-point register — the vacuous-green shape this project has
  * paid for before.
  *
- * ⚠ WHY THE TEMPLATES SAY `nop` AND NOT `fadd`. The bytes an FP instruction
- * would need are declared in `arm64.target.json`, but the aarch64 gas DIALECT
- * (`asm-arm64-gas.lang.json`) spells no FP mnemonic — ✔MEASURED, 51
- * instructions and not one of them floating. That is the aarch64 twin of the
- * gap `c_inline_asm_x86_sse_operands` records for x86-64, it is a DIALECT
- * vocabulary gap rather than anything about the constraint, and it is out of
- * this example's scope. What is in scope is that the operand BINDS, is
+ * ⚠ WHY THE TEMPLATES SAY `nop` AND NOT `fadd`. This paragraph SAID the
+ * aarch64 gas dialect spells no FP mnemonic (✔MEASURED at the time, 51
+ * instructions, not one floating) — the aarch64 twin of the gap
+ * `c_inline_asm_x86_sse_operands` records for x86-64. That WAS the reason and
+ * it EXPIRED in P54: `asm-arm64-gas.lang.json` now declares 58 instructions,
+ * seven of them floating (`fadd fsub fmul fdiv fneg fcmp fmov`), under
+ * D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME, and
+ * `c_inline_asm_arm64_fp_operands` executes them. ★ THE `nop` TEMPLATES STAY
+ * ANYWAY, now for a BETTER reason than the one that expired: this example's
+ * subject is that the CONSTRAINT binds and allocates, and a `nop` template
+ * cannot pass by accident through an instruction that would have moved the
+ * value regardless. What is in scope is that the operand BINDS, is
  * ALLOCATED a register of the right file, survives a call, and comes back with
  * its value intact — all four of which `nop` templates can witness and none of
  * which could be witnessed at all before.

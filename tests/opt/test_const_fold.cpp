@@ -85,8 +85,27 @@ ReturnOperandInspect inspectReturnOperand(Mir const& mir) {
     MirFuncId const fn = mir.funcAt(0);
     MirBlockId const entry = mir.funcEntry(fn);
     std::uint32_t const n = mir.blockInstCount(entry);
+    // ⚠ EVERY GIVE-UP PATH BELOW RECORDS A FAILURE FIRST. This helper returns a
+    // value, so `ASSERT_*` (which expands to `return;`) will not compile here,
+    // and a bare early return would trade the crash for a VACUOUS PASS — the
+    // defensive shape [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]] warns about.
+    if (n == 0) {
+        ADD_FAILURE() << "the rebuilt entry block is EMPTY — it has no "
+                         "terminator to read a return operand from";
+        return r;
+    }
+    // The terminator is located POSITIONALLY, so a rebuild that reordered or
+    // dropped an instruction can leave a Phi here — and `instOperands` ABORTS on
+    // a Phi, which would kill this binary on precisely the rebuild regression
+    // this fixture exists to report.
     MirInstId const term = mir.blockInstAt(entry, n - 1);
-    auto const ops = mir.instOperands(term);
+    auto const opsOpt = mir.tryInstOperands(term);
+    if (!opsOpt.has_value()) {
+        ADD_FAILURE() << "the rebuilt entry block's last instruction is a Phi, "
+                         "not a terminator — the rebuild reordered the block";
+        return r;
+    }
+    auto const ops = *opsOpt;
     if (ops.empty()) return r;
     MirInstId const operand = ops[0];
     r.op = mir.instOpcode(operand);

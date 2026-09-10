@@ -980,6 +980,49 @@ decodeScalarLiteralBits(MirLiteralValue const& v, TypeKind k) noexcept {
 // one site. The arithmetic is host-endian-independent (shifts of a `std::uint64_t`),
 // so nothing here is host-keyed.
 //
+// ── The specific-cause carrier threaded through the static-data encoder ──
+//
+// D-DIAG-OVERLAP-REFUSAL-CODE-NOT-DISCRIMINATING (P65). This was a bare
+// `std::string& why`, and that is exactly why every cause this encoder knows
+// reached the user under ONE `DiagnosticCode`: prose carries no identity a
+// consumer can filter, triage or grep on, so the render arms in
+// `lowerMirGlobalsToDataItems` had nothing to key `emit` on but a constant. The
+// messages discriminated; the code did not. A cause now travels WITH the code
+// it belongs to, and the render arms ask the cause rather than deciding for it.
+//
+// ⚠ WHY ONE STRUCT AND NOT A SECOND OUT-PARAM. A `DiagnosticCode&` beside the
+// `std::string&` is two values that must move together through three functions
+// and every refusal in them; the first arm that sets one without the other
+// files a cause under the wrong code SILENTLY. That is a wrong-answer failure,
+// the class this file walls everywhere else. `set` is the ONLY writer and it
+// writes both, so the pair cannot drift apart.
+//
+// ⓘ FIRST WRITER WINS, AND IT IS THE INNERMOST ONE. Every refusal path returns
+// `false`/`nullopt` immediately after recording, and no caller records over a
+// failed callee — so the cause that reaches the user is the one raised closest
+// to the leaf that could not be encoded, which is the specific one.
+struct EncodeFailure {
+    // `None` + empty text ⇔ no specific cause was recorded. That state is REAL
+    // and is what the callers' generic enumerating text exists for: several
+    // refusal paths here are structural `return false`s that genuinely share
+    // one cause and would gain nothing from prose of their own.
+    DiagnosticCode code = DiagnosticCode::None;
+    std::string    text;
+
+    void set(DiagnosticCode c, std::string t) {
+        code = c;
+        text = std::move(t);
+    }
+    [[nodiscard]] bool empty() const noexcept { return text.empty(); }
+    // The code this cause renders under. Both halves of the caller's choice —
+    // which text, which code — are answered from the SAME predicate, so a
+    // future arm cannot render specific prose under the generic code or the
+    // reverse.
+    [[nodiscard]] DiagnosticCode codeOr(DiagnosticCode fallback) const noexcept {
+        return empty() ? fallback : code;
+    }
+};
+
 // ★ FAIL LOUD, NEVER TRUNCATE. Every refusal writes `why`. The load-bearing one is
 // the extension check: the bytes ABOVE the container are re-derived and must equal
 // the value's extension byte, so a value that genuinely does not fit its declared
@@ -993,22 +1036,24 @@ decodeScalarLiteralBits(MirLiteralValue const& v, TypeKind k) noexcept {
 // or a literal in no integer arm.
 [[nodiscard]] std::optional<BitIntValue>
 bitIntLiteralValue(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
-                   std::string& why) {
+                   EncodeFailure& why) {
     // `bitIntWidth`/`bitIntIsSigned` ABORT on a non-BitInt (deliberately — that
     // abort is the backstop for a missed gate), so the kind check is the contract,
     // not a defensive nicety.
     if (!ty.valid() || in.kind(ty) != TypeKind::BitInt) {
-        why = "the `_BitInt` value normalizer was reached with a non-`_BitInt` "
-              "type (D-CSUBSET-BITINT-DATA-GLOBAL)";
+        why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                "the `_BitInt` value normalizer was reached with a non-`_BitInt` "
+                "type (D-CSUBSET-BITINT-DATA-GLOBAL)");
         return std::nullopt;
     }
     std::int64_t const n     = in.bitIntWidth(ty);
     bool const         signd = in.bitIntIsSigned(ty);
     if (n <= 0 || n > static_cast<std::int64_t>(kBitIntMaxWidth)) {
-        why = std::format("`_BitInt({})` has a width outside [1,{}] — a malformed "
-                          "interned record; refusing rather than guessing a "
-                          "container (D-CSUBSET-BITINT-DATA-GLOBAL)",
-                          n, kBitIntMaxWidth);
+        why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                std::format("`_BitInt({})` has a width outside [1,{}] — a malformed "
+                            "interned record; refusing rather than guessing a "
+                            "container (D-CSUBSET-BITINT-DATA-GLOBAL)",
+                            n, kBitIntMaxWidth));
         return std::nullopt;
     }
     // ⓘ THE FOUR INTEGER LITERAL ARMS ARE ALL REAL AND NONE IMPLIES ANOTHER — the
@@ -1026,9 +1071,10 @@ bitIntLiteralValue(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
     else if (auto const* b = std::get_if<bool>(&v.value))
         src = BitIntValue::fromU64(*b ? 1u : 0u, 1u, /*isSigned=*/false);
     if (!src.has_value()) {
-        why = std::format("`_BitInt({})` has an initializer in no integer literal "
-                          "arm — refusing rather than emitting a fabricated image "
-                          "(D-CSUBSET-BITINT-DATA-GLOBAL)", n);
+        why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                std::format("`_BitInt({})` has an initializer in no integer literal "
+                            "arm — refusing rather than emitting a fabricated image "
+                            "(D-CSUBSET-BITINT-DATA-GLOBAL)", n));
         return std::nullopt;
     }
     // C 6.3.1.3 conversion of the folded value to the DECLARED (N, signedness).
@@ -1042,7 +1088,7 @@ bitIntLiteralValue(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
 
 [[nodiscard]] std::optional<std::vector<std::uint8_t>>
 encodeBitIntImage(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
-                  DataModel dm, std::string& why) {
+                  DataModel dm, EncodeFailure& why) {
     auto const valOpt = bitIntLiteralValue(v, in, ty, why);
     if (!valOpt.has_value()) return std::nullopt;   // `why` already written
     BitIntValue const& val   = *valOpt;
@@ -1059,18 +1105,20 @@ encodeBitIntImage(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
     // re-derived here: a second ladder is a second ABI.
     auto const wOpt = sizeOfScalarOrBitInt(in, ty, dm);
     if (!wOpt.has_value() || *wOpt == 0) {
-        why = std::format("`_BitInt({})` has no computable container size "
-                          "(D-CSUBSET-BITINT-DATA-GLOBAL)", n);
+        why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                std::format("`_BitInt({})` has no computable container size "
+                            "(D-CSUBSET-BITINT-DATA-GLOBAL)", n));
         return std::nullopt;
     }
     std::size_t const width     = static_cast<std::size_t>(*wOpt);
     auto const&       limbs     = val.limbs();
     std::size_t const limbBytes = limbs.size() * 8u;
     if (limbs.empty() || width > limbBytes) {
-        why = std::format("`_BitInt({})` reserves {} container bytes but its wrapped "
-                          "value carries only {} — refusing rather than emitting a "
-                          "SHORT image (D-CSUBSET-BITINT-DATA-GLOBAL)",
-                          n, width, limbBytes);
+        why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                std::format("`_BitInt({})` reserves {} container bytes but its wrapped "
+                            "value carries only {} — refusing rather than emitting a "
+                            "SHORT image (D-CSUBSET-BITINT-DATA-GLOBAL)",
+                            n, width, limbBytes));
         return std::nullopt;
     }
     // ★ WALL, NEVER TRUNCATE. Bits at and above `width*8` are outside the container
@@ -1088,12 +1136,13 @@ encodeBitIntImage(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
         auto const byte =
             static_cast<std::uint8_t>((limbs[j / 8u] >> ((j % 8u) * 8u)) & 0xFFu);
         if (byte != ext) {
-            why = std::format("`_BitInt({})` value byte {} lies above its {}-byte "
-                              "container and is 0x{:02x}, not the 0x{:02x} "
-                              "extension — emitting the container would DROP value "
-                              "bits, so the image is refused rather than truncated "
-                              "(D-CSUBSET-BITINT-DATA-GLOBAL)",
-                              n, j, width, byte, ext);
+            why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                    std::format("`_BitInt({})` value byte {} lies above its {}-byte "
+                                "container and is 0x{:02x}, not the 0x{:02x} "
+                                "extension — emitting the container would DROP value "
+                                "bits, so the image is refused rather than truncated "
+                                "(D-CSUBSET-BITINT-DATA-GLOBAL)",
+                                n, j, width, byte, ext));
             return std::nullopt;
         }
     }
@@ -1107,9 +1156,10 @@ encodeBitIntImage(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
         remaining -= take;
     }
     if (out.size() != width) {
-        why = std::format("`_BitInt({})` encoded to {} bytes but its container "
-                          "reserves {} — the encoder and the layout disagree "
-                          "(D-CSUBSET-BITINT-DATA-GLOBAL)", n, out.size(), width);
+        why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                std::format("`_BitInt({})` encoded to {} bytes but its container "
+                            "reserves {} — the encoder and the layout disagree "
+                            "(D-CSUBSET-BITINT-DATA-GLOBAL)", n, out.size(), width));
         return std::nullopt;
     }
     return out;
@@ -1192,7 +1242,7 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
                      DataModel dm, std::vector<std::uint8_t>& buf,
                      std::uint64_t base, std::vector<Relocation>& relocs,
                      std::optional<RelocationKind> absPtrRelocKind,
-                     std::string& why) {
+                     EncodeFailure&           why) {
     // D-CSUBSET-ENUM-GLOBAL-CODEGEN: an ENUM-typed member/element is a scalar
     // leaf whose representation is its UNDERLYING integer's — the member of a
     // `struct S { enum E e; }`, an element of `enum E a[2] = {A,B}`, the first
@@ -1235,18 +1285,68 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         // remedy is specific and actionable, so it is stated in the SAME words the
         // MIR twin uses (hir_to_mir.cpp `lowerAggregateInitIntoSlot`) — one rule,
         // one wording, whichever tier the user's declaration happens to hit.
-        if (compositeFieldsOverlap(ty, in, lp, dm)) {
+        //
+        // ★ D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-BITFIELDS — BIT-FIELD-FIRST
+        // ORDERING, THE SAME ONE `lowerAggregateInitIntoSlot` ALREADY HAS. The
+        // layout is hoisted ABOVE the gate (it was computed two lines below anyway)
+        // so the gate is asked ONLY of a composite with no bit-fields. That is not a
+        // way around a truthful predicate — it is the routing this arm always owed:
+        // a full-width positional write of ANY bit-field member clobbers its
+        // co-resident neighbours whatever the overlap answer is, which is why the
+        // packing loop below exists and why it must OWN every bit-field composite.
+        // `bitFields` non-empty ⇔ the composite has a bit-field (the layout
+        // authority's invariant), and it is the exact analogue of the MIR twin's
+        // `hasBitfieldMember` test.
+        //
+        // ⓘ WHAT THE ORDER BUYS: with the gate asked only when `bitFields` is empty,
+        // a `true` can only have come from the EXPLICIT-OFFSET channel — so the
+        // refusal text below stays accurate now that `compositeFieldsOverlap` also
+        // answers `true` for bit-field composites. Hoisting the layout also means an
+        // UN-SIZEABLE aggregate fails loud on its own cause here rather than through
+        // the gate's conservative `true`, which would have named the wrong reason.
+        //
+        // ★ D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-UNIONS: A UNION IS ROUTED PAST
+        // THIS GATE, the exact twin of the route `hir_to_mir.cpp`'s
+        // `lowerAggregateInitIntoSlot` takes, and for the same reason. Once
+        // `compositeFieldsOverlap` tells the truth it answers `true` for every union
+        // with two or more sizeable members — they all sit at byte 0. But this gate
+        // asks whether a POSITIONAL member-wise write would clobber a sibling, and a
+        // union initializer names exactly ONE member (C 6.7.9p17), so the walk below
+        // performs exactly one encode at `fieldOffsets[0] == 0` into a `buf` the
+        // caller pre-zeroed to the layout size. Nothing can be lost. Without this
+        // route the truthful predicate would refuse `static union U u = {1};`, which
+        // gcc, clang and MSVC all accept.
+        //
+        // ⚠ THE ONE-CHILD PREMISE IS ASSERTED, NOT ASSUMED — see the MIR twin's note
+        // for the three-guarantee measurement (both HIR producers plus
+        // `HirVerifier::checkConstructAggregate`). All three live upstream of the
+        // literal pool this encoder reads, and none of them runs here, so the
+        // refusal is expected never to fire and is kept anyway: skipping the gate for
+        // unions would otherwise silently GRANT the clobber the gate exists to
+        // refuse, in the DATA SECTION, where the second member's bytes overwrite the
+        // first's at the same offset with nothing to observe it.
+        auto const lay = computeLayout(ty, in, lp, dm);
+        if (!lay.has_value()) return false;
+        bool const isUnion = (k == TypeKind::Union);
+        if (isUnion && agg.fields.size() > 1) {
+            why.set(DiagnosticCode::K_OverlappingStaticInitUnsupported,
+                    "static initialization of a union supplied more than one member — "
+                    "a union initializer names exactly one member (C 6.7.9p17), and the "
+                    "union route past the overlapping-members gate is valid only for "
+                    "that single write");
+            return false;
+        }
+        if (!isUnion && lay->bitFields.empty() && compositeFieldsOverlap(ty, in, lp, dm)) {
             if (!isAllZeroMirLiteral(v)) {
-                why = "static initialization of an overlapping explicit-offset "
-                      "struct is unsupported — its members share bytes; assign "
-                      "the members individually (an ALL-ZERO initializer `{0}` / "
-                      "`{}` IS supported — D-MIR-OVERLAP-STRUCT-ZERO-INIT)";
+                why.set(DiagnosticCode::K_OverlappingStaticInitUnsupported,
+                        "static initialization of an overlapping explicit-offset "
+                        "struct is unsupported — its members share bytes; assign "
+                        "the members individually (an ALL-ZERO initializer `{0}` / "
+                        "`{}` IS supported — D-MIR-OVERLAP-STRUCT-ZERO-INIT)");
                 return false;
             }
             return true;
         }
-        auto const  lay = computeLayout(ty, in, lp, dm);
-        if (!lay.has_value()) return false;
         auto const ops = in.operands(ty);
         if (ops.size() != lay->fieldOffsets.size()) return false;
         if (agg.fields.size() > ops.size()) return false;   // too many inits → fail loud
@@ -1288,11 +1388,12 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
             // bit-field, whose allocation unit is its 16-byte-or-wider container.
             // A width this packer cannot encode WALLS; it never emits.
             if (p.bitWidth > 64u || p.unitBytes > 8u) {
-                why = "a bit-field wider than 64 bits (or in an allocation unit "
-                      "wider than 8 bytes) cannot be packed by the u64 static "
-                      "initializer packer — refusing rather than emitting bits it "
-                      "would silently drop or repeat "
-                      "(D-CSUBSET-BITINT-DATA-GLOBAL)";
+                why.set(DiagnosticCode::K_NoMatchingObjectFormat,
+                        "a bit-field wider than 64 bits (or in an allocation unit "
+                        "wider than 8 bytes) cannot be packed by the u64 static "
+                        "initializer packer — refusing rather than emitting bits it "
+                        "would silently drop or repeat "
+                        "(D-CSUBSET-BITINT-DATA-GLOBAL)");
                 return false;
             }
             // D-CSUBSET-ENUM-BITFIELD: an enum-typed bit-field decodes at its
@@ -1365,10 +1466,11 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
     // and it FAILS LOUD rather than writing the first two and dropping the rest.
     if (k == TypeKind::Complex) {
         if (!std::holds_alternative<MirAggregateValue>(v.value)) {
-            why = "a `_Complex` static initializer must arrive as a two-component "
-                  "aggregate value (real, imaginary) — a scalar leaf cannot carry "
-                  "both components "
-                  "(D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE)";
+            why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                    "a `_Complex` static initializer must arrive as a two-component "
+                    "aggregate value (real, imaginary) — a scalar leaf cannot carry "
+                    "both components "
+                    "(D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE)");
             return false;
         }
         auto const& agg = std::get<MirAggregateValue>(v.value);
@@ -1378,9 +1480,10 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         auto const   elemLay = computeLayout(elem, in, lp, dm);
         if (!elemLay.has_value()) return false;
         if (agg.fields.size() > 2) {
-            why = "a `_Complex` static initializer carries more than two components "
-                  "— refusing rather than dropping the extras "
-                  "(D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE)";
+            why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                    "a `_Complex` static initializer carries more than two components "
+                    "— refusing rather than dropping the extras "
+                    "(D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE)");
             return false;
         }
         for (std::size_t i = 0; i < agg.fields.size(); ++i)
@@ -1495,9 +1598,10 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         auto const img = encodeBitIntImage(v, in, ty, dm, why);
         if (!img.has_value()) return false;              // `why` already written
         if (base + img->size() > buf.size()) {
-            why = "a `_BitInt` member's image overruns the aggregate's laid-out "
-                  "extent — the encoder and the layout disagree "
-                  "(D-CSUBSET-BITINT-DATA-GLOBAL)";
+            why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                    "a `_BitInt` member's image overruns the aggregate's laid-out "
+                    "extent — the encoder and the layout disagree "
+                    "(D-CSUBSET-BITINT-DATA-GLOBAL)");
             return false;
         }
         for (std::size_t j = 0; j < img->size(); ++j) buf[base + j] = (*img)[j];
@@ -1531,6 +1635,28 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                            DataModel                            dataModel,
                            DiagnosticReporter&                  reporter,
                            std::optional<RelocationKind>        absPtrRelocKind) {
+    // ★ WHICH CODE AN ARM HERE GETS, AND THE AXIS THAT DECIDES IT
+    // (D-DIAG-OVERLAP-REFUSAL-CODE-NOT-DISCRIMINATING, P65). Every arm in this
+    // function used to pass `K_NoMatchingObjectFormat`, so the prose
+    // discriminated and the CODE — the only stable surface a consumer can
+    // triage, filter or grep on — did not. The axis is WHO MUST CHANGE
+    // SOMETHING, because that is what a reader of the code alone needs to know:
+    //   * `K_OverlappingStaticInitUnsupported` — the USER edits the
+    //     initializer. Raised inside `encodeAggregateValue`, never here, and it
+    //     reaches this lambda through `EncodeFailure::codeOr`.
+    //   * `K_StaticDataEncoderInvariantBreach` — NOBODY can: two parts of this
+    //     compiler that must agree have drifted. Passed directly by the arms
+    //     that detect a byte-count or record disagreement, and raised inside
+    //     the encoder for the rest.
+    //   * `K_NoMatchingObjectFormat` — the residual, and a STATED set rather
+    //     than a leftover: this producer has no byte encoding for the global
+    //     because a declared capability or an implemented lowering is missing
+    //     (no `aggregateLayout`, no abs64 reloc, a runtime initializer, an
+    //     un-sizeable or non-primitive type, a bit-field the u64 packer does
+    //     not implement). One rule, one remediation KIND — change the target,
+    //     the config, or wait for the shape.
+    // ⚠ AN ARM ADDED HERE MUST PICK ITS SIDE ON THAT AXIS, not copy its
+    // neighbour: the neighbour's code is right for the neighbour's cause.
     auto emit = [&](DiagnosticCode code, std::string msg) {
         ParseDiagnostic d;
         d.code     = code;
@@ -1913,15 +2039,24 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // the recursion writes only the provided leaves.
             d.bytes.assign(static_cast<std::size_t>(lay->size), 0u);
             // A1 (audit fold): `why` carries the SPECIFIC cause when the encoder
-            // knows one (today: the overlapping explicit-offset refusal). Prefer
-            // it verbatim; fall back to the enumerating text only for the arms
-            // that genuinely share it — a diagnostic that names a cause the user
-            // does not have is worse than one that names a set they do.
-            std::string why;
+            // knows one. Prefer it verbatim; fall back to the enumerating text
+            // only for the arms that genuinely share it — a diagnostic that
+            // names a cause the user does not have is worse than one that names
+            // a set they do.
+            // ⚠ THIS COMMENT USED TO SAY "today: the overlapping explicit-offset
+            // refusal", SINGULAR, AND THAT HAD GONE FALSE: the encoder records a
+            // cause on THIRTEEN paths now, across this function's recursion and
+            // both `_BitInt` helpers. The count is not restated here — it would
+            // rot the same way — but the shape is: `why` is a MANY-writer
+            // channel, so the code it renders under must come from the writer
+            // and not from this arm
+            // (D-DIAG-OVERLAP-REFUSAL-CODE-NOT-DISCRIMINATING). `codeOr` is
+            // that hand-off.
+            EncodeFailure why;
             if (!encodeAggregateValue(ty, v, interner, *aggregateLayout,
                                       dataModel, d.bytes, 0, d.relocations,
                                       absPtrRelocKind, why)) {
-                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                emit(why.codeOr(DiagnosticCode::K_NoMatchingObjectFormat),
                      why.empty()
                          ? std::format("lowerMirGlobalsToDataItems: global "
                                        "SymbolId={{ {} }} aggregate initializer "
@@ -1934,7 +2069,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                          : std::format("lowerMirGlobalsToDataItems: global "
                                        "SymbolId={{ {} }} {} "
                                        "(D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL).",
-                                       sym.v, why));
+                                       sym.v, why.text));
                 continue;
             }
             // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): an aggregate that
@@ -2038,7 +2173,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             } else if (auto const* bo = std::get_if<bool>(&v.value)) {
                 lo = *bo ? 1ull : 0ull;
             } else {
-                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
                      std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} "
                                  "has a 128-bit integer type (TypeKind={}) but its "
                                  "initializer is in no integer literal arm — refusing "
@@ -2054,7 +2189,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // image, so it fails loud rather than shipping a short/long record.
             auto const w128 = scalarByteSize(k, dataModel);
             if (!w128.has_value() || d.bytes.size() - before != *w128) {
-                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
                      std::format("lowerMirGlobalsToDataItems: 128-bit global "
                                  "SymbolId={{ {} }} encoded to {} bytes but "
                                  "scalarByteSize reserves {} — the 128-bit encoder "
@@ -2097,12 +2232,18 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // the image the producer actually built: a disagreement is a wrong record, so
         // it refuses rather than shipping a short or long item.
         if (k == TypeKind::BitInt) {
-            std::string why;
-            auto const  img = encodeBitIntImage(v, interner, ty, dataModel, why);
+            EncodeFailure why;
+            auto const    img = encodeBitIntImage(v, interner, ty, dataModel, why);
             if (!img.has_value()) {
-                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                // `encodeBitIntImage` writes a cause on EVERY refusal path, so the
+                // fallback here is unreachable-by-construction rather than a real
+                // arm — it is spelled anyway because `codeOr` is the one place both
+                // halves of the choice are made, and a future path that forgets to
+                // record must land on the shared code, never on a specific one it
+                // did not earn.
+                emit(why.codeOr(DiagnosticCode::K_NoMatchingObjectFormat),
                      std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} "
-                                 "— {}.", sym.v, why));
+                                 "— {}.", sym.v, why.text));
                 continue;
             }
             if (!aggregateLayout.has_value()) {
@@ -2118,7 +2259,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             }
             auto const lay = computeLayout(ty, interner, *aggregateLayout, dataModel);
             if (!lay.has_value() || lay->size != img->size()) {
-                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
                      std::format("lowerMirGlobalsToDataItems: `_BitInt` global "
                                  "SymbolId={{ {} }} encoded to {} bytes but the "
                                  "layout engine reserves {} — the `_BitInt` encoder "
@@ -2173,7 +2314,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                 std::size_t const before = d.bytes.size();
                 appendWideFloatBits(d.bytes, *wf);
                 if (d.bytes.size() - before != *widthOpt) {
-                    emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                    emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
                          std::format("lowerMirGlobalsToDataItems: F80 folded global "
                                      "SymbolId={{ {} }} packed to {} bytes but "
                                      "scalarByteSize reserves {} — the wide-float "
@@ -2190,7 +2331,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                 std::size_t const before = d.bytes.size();
                 appendF80Extended(d.bytes, *dv);
                 if (d.bytes.size() - before != *widthOpt) {
-                    emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                    emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
                          std::format("lowerMirGlobalsToDataItems: F80 global "
                                      "SymbolId={{ {} }} widened to {} bytes but "
                                      "scalarByteSize reserves {} — the x87 "
@@ -2228,7 +2369,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                 std::size_t const before = d.bytes.size();
                 appendWideFloatBits(d.bytes, *wf);
                 if (d.bytes.size() - before != *widthOpt) {
-                    emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                    emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
                          std::format("lowerMirGlobalsToDataItems: F128 folded global "
                                      "SymbolId={{ {} }} packed to {} bytes but "
                                      "scalarByteSize reserves {} — the wide-float "
@@ -2245,7 +2386,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                 std::size_t const before = d.bytes.size();
                 appendF128(d.bytes, *dv);
                 if (d.bytes.size() - before != *widthOpt) {
-                    emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                    emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
                          std::format("lowerMirGlobalsToDataItems: F128 global "
                                      "SymbolId={{ {} }} widened to {} bytes but "
                                      "scalarByteSize reserves {} — the binary128 "
@@ -2286,7 +2427,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                                  "FLOAT).",
                                  sym.v, static_cast<int>(k)));
             } else {
-                emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
                      std::format("lowerMirGlobalsToDataItems: global "
                                  "SymbolId={{ {} }} has a literal "
                                  "value of an unhandled variant arm "

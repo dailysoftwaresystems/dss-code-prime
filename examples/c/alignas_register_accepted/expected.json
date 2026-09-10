@@ -1,0 +1,33 @@
+{
+  "$comment": "C23 6.7.6 (P58, [[D-CSUBSET-ALIGNAS-REGISTER-CONTEXT]]): an alignment specifier on an object declared `register` is ACCEPTED and the program RUNS; exit = 42 (20 + 22, one from each specifier ORDER, since C declaration specifiers are unordered). ★★ THIS FILE EXISTS TO KEEP A REFUTATION FROM BEING RE-BROKEN. The row asked for `S_AlignasInvalidContext` on `register alignas(16) int x;`, reading C11 6.7.5p2 / C23 6.7.6p2, which does name `register`. But the bar is a DISJUNCTION, and ✔MEASURED 2026-09-03 with each reference probed SEPARATELY: MSVC 19.51 ACCEPTS `register _Alignas(16) int x = 0;` at /std:c11, /std:c17 and /std:clatest, rc 0, SILENT at /W4, in BOTH specifier orders, and APPLIES the alignment (`int p[__alignof(x)==16?1:-1]` compiles, its `==4` twin fails C2118, against a control pair that discriminates); and gcc 13.3.0 AND clang 18.1.3 BOTH accept `register __attribute__((aligned(16))) int x = 0;` clean at -Wall -Wextra. All three references accept the request on a register object in a spelling they implement — only the ISO spelling is refused by gcc and clang. A split on ACCEPT-vs-REFUSE is settled by the disjunction (operator, 2026-08-28), so DSS must accept, which it already did (`register` is an ignored storage kind in c.lang.json and the object gets an ordinary honored frame slot). The row asked for a REGRESSION; this file turns that regression red. ⚠ WHAT THIS FILE DOES NOT WITNESS, STATED RATHER THAN IMPLIED: it does not check the alignment at RUN TIME, and NO example can. Observing an object's alignment needs its ADDRESS, and `&x` on a register-qualified object is a constraint violation every reference enforces — ✔MEASURED, MSVC refuses it with C2103, and gcc/clang refuse it too (C 6.5.3.2p1). A file that took the address would be a program NO reference compiles, which is precisely the non-witness P57 paid a cycle for. The alignment itself is pinned one tier down, where no oracle is needed, by `SemanticAnalyzerC.RegisterAlignasIsAcceptedAndStored` (the validated override reaches `SymbolRecord.explicitAlignment` as 16) and `…RegisterAlignasIsOrderIndependent`; it was also ✔MEASURED end to end off-corpus, with the register case's OWN negative control rather than a borrowed one: a DSS-only build of `register alignas(16) int x; ... &x % 16` exits 42 in debug AND release, while the byte-identical shape with `register int x` and NO alignment request exits 7 in both — so the 42 is discrimination, not a frame that happened to be aligned. This file pins the half only a running program can: DSS still COMPILES it and it still RUNS. ★ THE REFERENCE ORACLE IS MSVC AND IT WAS RUN, NOT ASSUMED: `cl /std:c17 /Od`, `cl /std:c17 /O2` and `cl /std:clatest /O2` (with /D\"alignas=_Alignas\", the spelling MSVC implements — MSVC has no C23 `alignas` keyword in C and its abstention on that SPELLING is recorded as an abstention, never as agreement) all BUILD this file and the binary EXITS 42. RED-ON-DISABLE, MEASURED through the shipped CLI: add the `register` arm the row asked for to the alignas context ladder in semantic_analyzer.cpp and this file stops COMPILING (error[S_AlignasInvalidContext]) — it stops exiting 42. Data-model-independent; one exit code across all four targets including the shipped release pipeline.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

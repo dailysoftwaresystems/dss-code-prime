@@ -1,0 +1,34 @@
+{
+  "$comment": "P53 (D-C-EXTERN-MUST-LEAD-THE-DECLARATION-SPECIFIERS, the half that CLOSED): `_Noreturn` beside `extern`. ✔MEASURED at P53's base through the shipped CLI, `extern _Noreturn void die(int);` was `error[P_NoAlternativeMatched] … got '_Noreturn'` -- the keyword was absent from the run `externSpecifiers` already carried `inline` and both thread-local spellings in; gcc 13.3.0 `-std=c2x`, clang 18.1.3 `-std=c23` and MSVC 19.51 `/std:clatest`, each probed SEPARATELY 2026-09-02, all accept it. ★★ THE PIN IS THAT THE SPECIFIER IS HONORED, NOT THAT THE LINE PARSES: this is the `noreturn_function` shape routed through the OTHER declaration rule, so `compute` -- a non-void function whose only non-return path calls `die` -- fails return completeness with NO binary if the attribute does not reach SymbolRecord.isNoreturn. A grammar-only fix produces exactly that failure, which is why the witness is a RUNNING program (main -> compute(0) -> die(42) -> exit(42)) rather than a clean parse. ⚠ THE MIRROR ORDER `_Noreturn extern void die(int);` IS STILL REFUSED, DELIBERATELY: it is valid C and all three references accept it, but admitting any specifier BEFORE `extern` puts those tokens into FIRST(externDecl), which defeats the LL(k) predictive prune (a nullable lead makes `computePredictivePrefixes` record nothing) and cliffs every `inline` function definition longer than four statements on the 128-token speculative-probe budget -- ✔MEASURED in P53 by bisecting body size, green at 0/1/2/4 statements and red from 8 upward. That half of the row stays OPEN with the one viable design named. RED-ON-DISABLE (REMOVE direction), ✔EXERCISED P53: delete `NoreturnKeyword` from the `externSpecifiers` run in `src/dss-config/sources/c.lang.json` and this example FAILS IN BOTH RUNNERS while `noreturn_function` -- whose prototype carries no `extern` -- stays green.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

@@ -38,8 +38,15 @@
 // before asserting the digests differ.
 //
 // STORE / LOOKUP. Miss-then-hit, idempotent re-store, no temp file left
-// behind, superseded siblings pruned, and — the isolation control — a store
-// under a DIFFERENT key leaving the first artifact untouched at its own path.
+// behind, and — since
+// [[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]] —
+// the property that replaced *superseded siblings pruned*: a store DELETES
+// NOTHING. Two cases carry it, and they are different claims. One moves a REAL
+// key (an edited descriptor) and requires the older entry to survive AND still
+// serve its own bytes; the other plants six near-miss neighbours plus a
+// well-formed foreign sibling of our own stem and requires every one of them to
+// be byte-untouched, so that a LOOSER prune reintroduced later is caught by the
+// same case as the exact one that was removed.
 //
 // ROOTS / READ-THROUGH. The two-root resolution: the override's precedence over
 // every platform default, the platform chain itself, compiler identity in the
@@ -1052,7 +1059,7 @@ TEST(RuntimeObjectCacheStore, LookupMissesBeforeStoreAndHitsAfter) {
     EXPECT_FALSE(lookupExpectingNoRefusal(*key).has_value())
         << "a cold cache reported a hit.";
 
-    auto const stored = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
+    auto const stored = storeRuntimeObject(*key, kBytesA);
     ASSERT_TRUE(stored.has_value()) << stored.error();
     EXPECT_EQ(stored->generic_string(), key->userArtifactPath.generic_string());
 
@@ -1086,11 +1093,11 @@ TEST(RuntimeObjectCacheStore, StoringTheSameKeyTwiceSucceedsAndLeavesOneFile) {
     auto const key = computeRuntimeObjectKey(makeRequest(scratch.path()));
     ASSERT_TRUE(key.has_value()) << key.error();
 
-    auto const first = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
+    auto const first = storeRuntimeObject(*key, kBytesA);
     ASSERT_TRUE(first.has_value()) << first.error();
 
     // "Already exists" is SUCCESS, not a conflict: same key ⇒ same bytes.
-    auto const second = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
+    auto const second = storeRuntimeObject(*key, kBytesA);
     ASSERT_TRUE(second.has_value())
         << "re-storing an identical key reported a conflict: " << second.error();
     EXPECT_EQ(second->generic_string(), key->userArtifactPath.generic_string());
@@ -1117,8 +1124,8 @@ TEST(RuntimeObjectCacheStore, StoreUnderADifferentKeyLeavesTheFirstArtifact) {
     ASSERT_NE(debugKey->userArtifactPath.generic_string(),
               releaseKey->userArtifactPath.generic_string());
 
-    ASSERT_TRUE(storeRuntimeObject(*debugKey, kBytesA, CacheEviction::PruneSuperseded).has_value());
-    ASSERT_TRUE(storeRuntimeObject(*releaseKey, kBytesB, CacheEviction::PruneSuperseded).has_value());
+    ASSERT_TRUE(storeRuntimeObject(*debugKey, kBytesA).has_value());
+    ASSERT_TRUE(storeRuntimeObject(*releaseKey, kBytesB).has_value());
 
     EXPECT_TRUE(fs::is_regular_file(debugKey->userArtifactPath))
         << "storing a second key destroyed the first artifact.";
@@ -1132,17 +1139,25 @@ TEST(RuntimeObjectCacheStore, StoreUnderADifferentKeyLeavesTheFirstArtifact) {
     EXPECT_EQ(readFile(releaseKey->userArtifactPath).size(), kBytesB.size());
 }
 
-TEST(RuntimeObjectCacheStore, StoringASupersedingKeyPrunesTheStaleSibling) {
-    // Same directory, same unit stem, DIFFERENT digest — the shape pruning is
-    // for. The superseded artifact is already unreachable (nothing computes
-    // its key); pruning is what stops the directory growing forever.
+// ★★★ THE NEGATIVE PIN FOR
+// [[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]],
+// AND IT IS THE INVERSE OF THE CASE THAT STOOD HERE.
+// `StoringASupersedingKeyPrunesTheStaleSibling` required the older entry to be
+// GONE. What it called *superseded* is *the live link input of a build already
+// holding that path* whenever the two keys were computed by two processes
+// rather than by one process twice, and a store cannot tell those apart — see
+// `storeRuntimeObject` in the header. ⇒ Reinstate the prune and this goes RED.
+TEST(RuntimeObjectCacheStore, StoringASupersedingKeyLeavesTheOlderEntryIntact) {
+    // Same directory, same unit stem, DIFFERENT digest — the shape the prune
+    // used to fire on, constructed the way a real key moves (an edited
+    // descriptor) rather than by planting a file.
     ScratchDir scratch{Location::Temp, "roc-store-prune"};
     ASSERT_NO_FATAL_FAILURE(layDownConfigRoot(scratch.path(), kDescriptorV1));
     ScopedUserCacheRoot userRoot{scratch.path() / "uc"};
 
     auto const staleKey = computeRuntimeObjectKey(makeRequest(scratch.path()));
     ASSERT_TRUE(staleKey.has_value()) << staleKey.error();
-    ASSERT_TRUE(storeRuntimeObject(*staleKey, kBytesA, CacheEviction::PruneSuperseded).has_value());
+    ASSERT_TRUE(storeRuntimeObject(*staleKey, kBytesA).has_value());
     ASSERT_TRUE(fs::is_regular_file(staleKey->userArtifactPath));
 
     ASSERT_NO_FATAL_FAILURE(
@@ -1159,35 +1174,55 @@ TEST(RuntimeObjectCacheStore, StoringASupersedingKeyPrunesTheStaleSibling) {
         runtimeKeyDocumentPath(staleKey->userArtifactPath);
     ASSERT_TRUE(fs::is_regular_file(staleDocument));
 
-    ASSERT_TRUE(storeRuntimeObject(*freshKey, kBytesB, CacheEviction::PruneSuperseded).has_value());
+    ASSERT_TRUE(storeRuntimeObject(*freshKey, kBytesB).has_value());
 
     EXPECT_TRUE(fs::is_regular_file(freshKey->userArtifactPath));
-    EXPECT_FALSE(fs::exists(staleKey->userArtifactPath))
-        << "the superseded artifact was not pruned.";
-    // ★ AND ITS KEY DOCUMENT WENT WITH IT. A prune that took only the `.a`
-    // would leave the directory growing a `.key` per revision forever, and the
-    // orphan would then be the only trace of a key nobody can compute.
-    EXPECT_FALSE(fs::exists(staleDocument))
-        << "the superseded entry's key document was left behind.";
-    EXPECT_EQ(countEntries(freshKey->userArtifactPath.parent_path()), 2u);
-    EXPECT_FALSE(lookupExpectingNoRefusal(*staleKey).has_value());
+    EXPECT_TRUE(fs::is_regular_file(staleKey->userArtifactPath))
+        << "the older ARTIFACT was deleted. That is the file a concurrent "
+           "build opens after the cache handed it the path, and this store has "
+           "no evidence that no such build exists: "
+        << staleKey->userArtifactPath.generic_string();
+    // ★ AND ITS KEY DOCUMENT WITH IT — an artifact whose sidecar is gone is
+    // WORSE than a deleted one: `lookupRuntimeObject` REFUSES it, so the entry
+    // stops being merely stale and starts failing builds.
+    EXPECT_TRUE(fs::is_regular_file(staleDocument))
+        << "the older entry's key document was deleted, which turns a live "
+           "entry into one that refuses every lookup.";
+    EXPECT_EQ(countEntries(freshKey->userArtifactPath.parent_path()), 4u)
+        << "two complete entries — two artifacts and two key documents — must "
+           "be present.";
+    // ★ AND THE OLDER ENTRY IS STILL SERVABLE, which is the property the file
+    // existing only implies. A process that computes the older key — one
+    // reading the tree as it was — must still get its own bytes.
+    auto const stillThere = lookupExpectingNoRefusal(*staleKey);
+    ASSERT_TRUE(stillThere.has_value())
+        << "the older entry no longer verifies against its own key";
+    EXPECT_EQ(readFile(*stillThere).size(), kBytesA.size())
+        << "the older entry must still hold ITS OWN bytes";
 }
 
-TEST(RuntimeObjectCacheStore, PruningMatchesExactlyAndLeavesEveryNearMissAlone) {
-    // ⛔ THE MATCHER DELETES FILES, so it is pinned on the near misses rather
-    // than on the happy case. Every neighbour below differs from a prunable
-    // name in EXACTLY ONE way, and each one is a shape a loosened matcher
-    // actually produces:
+TEST(RuntimeObjectCacheStore, AStoreTouchesNothingElseInItsDirectory) {
+    // ⛔ THIS CASE USED TO PIN THE MATCHER THAT DELETED FILES — every neighbour
+    // below differs from a prunable name in EXACTLY ONE way, and the case
+    // asserted that a WELL-FORMED superseded sibling of our own stem was
+    // removed while the near misses survived. The matcher is gone
+    // ([[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]])
+    // and the fixture is KEPT, with its verdict inverted: the interesting
+    // neighbour is now the one that used to be the control.
     //
-    //   * a DIFFERENT unit whose stem starts with ours — the prefix-glob bug
-    //     (`unit-*.a` deletes `unit-extra-…`, which is not ours to delete);
+    // ★ WHY KEEP THE NEAR MISSES AT ALL, now that nothing matches anything. A
+    // reinstated prune will not come back as the same matcher — it will come
+    // back as *"a safer prune"*, and every one of these shapes is a thing some
+    // looser rule deletes. A case holding only the well-formed sibling would go
+    // red for the exact prune that was removed and green for a sloppier one.
+    //
+    //   * a DIFFERENT unit whose stem starts with ours — the prefix-glob bug;
     //   * an index of the right length in the WRONG ALPHABET (`0`, `1` and `8`
-    //     are not in RFC 4648's base32) — what an `[a-z0-9]` check waves
-    //     through, and what a stray hex-named leftover looks like;
-    //   * an UPPERCASE index — the shape a case-insensitive filesystem can hand
-    //     back, and the one a `tolower`-happy matcher would delete;
+    //     are not in RFC 4648's base32);
+    //   * an UPPERCASE index — what a case-insensitive filesystem hands back;
     //   * a 15-character index — one short, i.e. a truncation;
-    //   * the right shape with an unrelated SUFFIX (`.o`).
+    //   * the right shape with an unrelated SUFFIX (`.o`);
+    //   * and OUR stem with a well-formed FOREIGN index — a second live entry.
     ScratchDir scratch{Location::Temp, "roc-store-stems"};
     ASSERT_NO_FATAL_FAILURE(layDownConfigRoot(scratch.path(), kDescriptorV1));
     ScopedUserCacheRoot userRoot{scratch.path() / "uc"};
@@ -1204,13 +1239,18 @@ TEST(RuntimeObjectCacheStore, PruningMatchesExactlyAndLeavesEveryNearMissAlone) 
         directory / ("unit-extra-" + other + ".a"),
         directory / ("unit-extra-" + other + ".key"),
         directory / ("unit-" + std::string(16u, '0') + ".a"),
-        // ⚠ `C` AND NOT `B`, AND THE REASON IS THIS CHANGE'S WHOLE POINT: on a
+        // ⚠ `C` AND NOT `B`, AND THE REASON SURVIVES THE PRUNE: on a
         // case-insensitive filesystem `unit-BBBB….a` and the `unit-bbbb….a`
-        // control below are ONE FILE, so the case would destroy its own
-        // fixture on Windows and macOS while passing on Linux.
+        // entry below are ONE FILE, so the case would destroy its own fixture
+        // on Windows and macOS while passing on Linux.
         directory / ("unit-" + std::string(16u, 'C') + ".a"),
         directory / ("unit-" + std::string(15u, 'b') + ".a"),
         directory / ("unit-" + other + ".o"),
+        // ★ THE ONE THAT MATTERS, and it is deliberately last in the list and
+        // first in the argument: OUR stem, OUR suffix, a well-formed index
+        // that is not ours. The removed prune deleted exactly this, and this
+        // is the file a concurrent build is holding the path to.
+        directory / ("unit-" + other + ".a"),
     };
     for (fs::path const& neighbour : neighbours) {
         ASSERT_NO_FATAL_FAILURE(writeFile(neighbour, "not mine\n"));
@@ -1218,26 +1258,24 @@ TEST(RuntimeObjectCacheStore, PruningMatchesExactlyAndLeavesEveryNearMissAlone) 
             << neighbour.generic_string();
     }
 
-    // The CONTROL that keeps the case from passing because pruning did nothing
-    // at all: a WELL-FORMED superseded sibling of OUR stem, which must go.
-    fs::path const prunable = directory / ("unit-" + other + ".a");
-    ASSERT_NO_FATAL_FAILURE(writeFile(prunable, "superseded\n"));
+    ASSERT_TRUE(storeRuntimeObject(*key, kBytesA).has_value());
 
-    ASSERT_TRUE(storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded).has_value());
-
-    EXPECT_FALSE(fs::exists(prunable))
-        << "nothing was pruned at all, so the near misses below survived for "
-           "the wrong reason: "
-        << prunable.generic_string();
     for (fs::path const& neighbour : neighbours) {
         EXPECT_TRUE(fs::is_regular_file(neighbour))
-            << "pruning deleted a file that is NOT this unit's artifact: "
+            << "the store deleted a file in its directory: "
+            << neighbour.generic_string();
+        EXPECT_EQ(readFile(neighbour), std::string{"not mine\n"})
+            << "the store rewrote a file in its directory: "
             << neighbour.generic_string();
     }
+    // ★ THE POSITIVE CONTROL. Every assertion above is satisfied by a store
+    // that did nothing at all, so the entry this call was FOR must be present
+    // and complete — otherwise this case passes on a broken store.
     EXPECT_TRUE(fs::is_regular_file(key->userArtifactPath));
     EXPECT_TRUE(
         fs::is_regular_file(runtimeKeyDocumentPath(key->userArtifactPath)));
-    // 6 survivors + our artifact + our key document.
+    EXPECT_EQ(readFile(key->userArtifactPath).size(), kBytesA.size());
+    // 7 survivors + our artifact + our key document.
     EXPECT_EQ(countEntries(directory), neighbours.size() + 2u);
 }
 
@@ -1513,7 +1551,7 @@ TEST(RuntimeObjectCacheReadThrough, StoreLandsOnlyInThePerUserRootAndLeavesTheSh
     fs::path const userDocument =
         runtimeKeyDocumentPath(key->userArtifactPath);
 
-    auto const stored = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
+    auto const stored = storeRuntimeObject(*key, kBytesA);
     ASSERT_TRUE(stored.has_value()) << stored.error();
 
     // It landed in the PER-USER root — BOTH files…
@@ -1561,7 +1599,7 @@ TEST(RuntimeObjectCacheReadThrough, ShippedRootWinsWhenBothRootsHoldTheSameKey) 
     auto const key = computeRuntimeObjectKey(makeRequest(scratch.path()));
     ASSERT_TRUE(key.has_value()) << key.error();
 
-    ASSERT_TRUE(storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded).has_value());
+    ASSERT_TRUE(storeRuntimeObject(*key, kBytesA).has_value());
     // The SAME key document in both roots — the artifacts differ only because
     // the fixture is deliberately impossible; the entries are still THIS key's,
     // so neither root may refuse.
@@ -1610,7 +1648,7 @@ TEST(RuntimeObjectCacheStore, UnwritablePerUserRootRefusesAndNamesRootsAndOverri
         << "the override did not resolve, so this case would be exercising the "
            "NO-ROOT arm instead of the UNWRITABLE one.";
 
-    auto const stored = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
+    auto const stored = storeRuntimeObject(*key, kBytesA);
     ASSERT_FALSE(stored.has_value())
         << "an unwritable per-user root was accepted — the miss was compiled "
            "and silently discarded, which is the one outcome this refusal "
@@ -1680,7 +1718,7 @@ TEST(RuntimeObjectCacheStore, NoWritableRootAtAllRefusesAndNamesEveryCandidate) 
     ASSERT_TRUE(fs::remove(runtimeKeyDocumentPath(key->shippedArtifactPath)));
     ASSERT_FALSE(lookupExpectingNoRefusal(*key).has_value());
 
-    auto const stored = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
+    auto const stored = storeRuntimeObject(*key, kBytesA);
     ASSERT_FALSE(stored.has_value())
         << "a store with nowhere to write reported SUCCESS — the artifact was "
            "discarded and every later build would recompile it in silence.";
@@ -1730,7 +1768,7 @@ TEST(RuntimeObjectCacheKeyDocument, AMissingKeyDocumentBesideAnArtifactRefuses) 
 
     auto const key = computeRuntimeObjectKey(makeRequest(scratch.path()));
     ASSERT_TRUE(key.has_value()) << key.error();
-    ASSERT_TRUE(storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded).has_value());
+    ASSERT_TRUE(storeRuntimeObject(*key, kBytesA).has_value());
 
     fs::path const document = runtimeKeyDocumentPath(key->userArtifactPath);
     ASSERT_TRUE(fs::is_regular_file(document));
@@ -1798,7 +1836,7 @@ TEST(RuntimeObjectCacheKeyDocument, ACollidingIndexWithADifferentKeyIsNotServed)
     // This is the arm a "treat it as a miss" design cannot get right: a miss
     // returns to a store whose rule is `already exists ⇒ same bytes`, so the
     // foreign artifact would come straight back as a success.
-    auto const stored = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
+    auto const stored = storeRuntimeObject(*key, kBytesA);
     ASSERT_FALSE(stored.has_value())
         << "the store wrote over a DIFFERENT key's entry, or accepted it as "
            "its own: "
@@ -1830,7 +1868,7 @@ TEST(RuntimeObjectCacheKeyDocument, AShippedCollisionRefusesRatherThanFallingThr
     ASSERT_TRUE(other.has_value()) << other.error();
 
     // A PERFECTLY GOOD per-user entry — the copy a fall-through would return.
-    ASSERT_TRUE(storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded).has_value());
+    ASSERT_TRUE(storeRuntimeObject(*key, kBytesA).has_value());
     ASSERT_TRUE(lookupExpectingNoRefusal(*key).has_value());
 
     ASSERT_NO_FATAL_FAILURE(layDownEntry(key->shippedArtifactPath,
@@ -1875,7 +1913,7 @@ TEST(RuntimeObjectCacheKeyDocument, AnInterruptedStoreLeavesAKeyDocumentAndNotAn
     EXPECT_FALSE(found->has_value());
 
     // …and the next store completes it.
-    auto const stored = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
+    auto const stored = storeRuntimeObject(*key, kBytesA);
     ASSERT_TRUE(stored.has_value()) << stored.error();
     auto const hit = lookupExpectingNoRefusal(*key);
     ASSERT_TRUE(hit.has_value());
@@ -1909,7 +1947,7 @@ TEST(RuntimeObjectCacheKeyDocument, TheArtifactIsNotWrittenWhenTheKeyDocumentCan
         << "the blocker is the SUBJECT of this case; without it the store "
            "would simply succeed.";
 
-    auto const stored = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
+    auto const stored = storeRuntimeObject(*key, kBytesA);
     ASSERT_FALSE(stored.has_value())
         << "the store reported success though its key document could not be "
            "written: "
@@ -2021,7 +2059,7 @@ TEST(RuntimeObjectCachePathBudget, AnOverlongNameRefusesNamingThePathAndItsLengt
     key.userArtifactPath  = real->userArtifactPath.parent_path()
                          / (longStem + "-" + key.pathDigest + ".a");
 
-    auto const stored = storeRuntimeObject(key, kBytesA, CacheEviction::PruneSuperseded);
+    auto const stored = storeRuntimeObject(key, kBytesA);
     ASSERT_FALSE(stored.has_value())
         << "a 400-character filename component was written; this host does not "
            "enforce the name limit the case assumes: "
@@ -2215,7 +2253,7 @@ TEST(RuntimeObjectCacheStore, TempClaimStepsOverPlantedDanglingCandidates) {
         }
     }
 
-    auto const stored = storeRuntimeObject(*key, kBytesA, CacheEviction::PruneSuperseded);
+    auto const stored = storeRuntimeObject(*key, kBytesA);
     ASSERT_TRUE(stored.has_value())
         << "the store refused outright — the loop must STEP OVER occupied "
            "candidate names, not exhaust itself on them: " << stored.error();

@@ -1,0 +1,63 @@
+{
+  "$comment": "D-FFI-RESOLVE-LIBRARY-DOES-NOT-CHECK-THE-LIBRARY-ARCH: the corpus-tier POSITIVE half of the `--resolve-library` boundary check, on FOUR target specs. Each target's `dependsOn` builds `dsslib.c` (exporting dss_dyn_answer) into a DYNAMIC library FOR THAT TARGET -- a `.dll` on pe64, a `.so` on both elf64 targets, a `.dylib` on macho64 -- and then builds `main.c` (extern dss_dyn_answer) RESOLVING against it. That is the path `compile_pipeline`'s step 2.5-pre walks: the EAGER, unconditional probe that compares the named library's own object format and architecture against the image this build emits. ★ WHAT IT ADDS OVER `staticlib_resolve_roundtrip`, WHICH IS NOT A NAMING DIFFERENCE: an `ar` archive is PARTITIONED OUT of `resolveLibraries` and merged at link, so the staticlib example never reaches that probe at all; before this entry NO corpus example built a `-dyn`/`-dll`/`-dylib` as a `dependsOn` artifact, so the probe's happy path had ZERO corpus coverage on every target. ⚠ WHY THE POSITIVE HALF IS WHAT NEEDS COVERING, and why the absence of a refusal-shaped sibling is a fact about the runners rather than a choice: an expect-error manifest cannot stage a `--resolve-library` input at all -- `runErrorTarget` in tests/examples/examples_runner.cpp carries none of setResolveLibraries / dependsOn / prebuiltLibraries, and integrated_tests' dependsOn loop opens with `if (!m.expectDiagnostics.empty()) continue;` -- and a manifest declaring both `expectDiagnostics` and `optimizedPipelines` has its arms parsed and then silently discarded until [[D-TEST-EXAMPLES-OPTIMIZED-ARM-DROPPED-ON-DIAGNOSTIC-MANIFEST]] closes. The NEGATIVE half therefore lives in tests/program/test_ffi_resolve_library.cpp (suites FfiResolveLibraryWrongFormat and FfiResolveLibraryWrongArchitecture, cross-fed in both directions on ELF, Mach-O, archives and relocatable objects). ★★ A POSITIVE EXAMPLE DOES NOT RED ON THE GUARD BEING ADDED -- it reds on the guard being WRONG: a mis-located field, a number read at the wrong offset or in the wrong byte order, a false refusal on a matched pairing. All three are failure modes this change introduces and all three red here, on real DSS-built inputs, with nothing synthetic. The PE arm is the ONLY end-to-end exercise anywhere of the `e_lfanew` SEEK: PE keeps its COFF header at a file offset the DOS stub names, so locating `Machine` requires a read past the lead window that neither ELF (fixed offset 18) nor Mach-O (fixed offset 4) needs. RUNTIME, and why exactly one arm declares a `runOn`: an exec that imports from a dynamic library needs the loader to FIND that library at run time. On Windows the DLL sits beside the exe in the arm's own output directory and the loader searches there, so the pe64 arm RUNS and asserts exit 42 -- ✔MEASURED (shipped CLI, Windows host, cwd = the output directory): exit 42 at both configurations. The elf64 arms would need LD_LIBRARY_PATH or an rpath the runners do not set, and the macho64 arm would need an LC_RPATH; both are runner capabilities that do not exist, so those three arms are `runOn: []` -- COMPILE-ONLY, which is what this example needs from them, since the boundary check is a BUILD-time event. `staticlib_file_local_atoms` already mixes an empty `runOn` with non-empty siblings, so the shape is not new. ⚠ NOTE FOR WHOEVER GIVES THE RUNNERS A LIBRARY-PATH CAPABILITY: turning the three build-only arms into running ones is a strict improvement here and the exitCode is already correct for them. `optimizedPipelines`: the `release` arm carries NO `mustDifferFromBaseline`, and that is measured rather than conservative -- ✔MEASURED (shipped CLI, Windows host, comparing debug vs release BYTE-wise): all four EXECUTABLES are byte-IDENTICAL between the two configurations while all four LIBRARIES differ, because main.c is deliberately thin. So the arm-level key would red on a true state of affairs; the assertion that actually bites is `mustDifferFromBaseline: true` on each `dependsOn` entry, which compares THE PREREQUISITE'S OWN IMAGE and is therefore the only form that asserts the LIBRARY was compiled through the arm's pipeline. Do not re-quote a byte count from this note as a pin: what is asserted is the DIFFERENCE, never a size. Leg-by-leg results are NOT recorded here -- whoever runs the legs writes them.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "x86_64:pe64-x86_64-windows-dll",
+          "artifact": "dsslib.dll",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "x86_64:elf64-x86_64-linux-dyn",
+          "artifact": "dsslib.so",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "arm64:elf64-aarch64-linux-dyn",
+          "artifact": "dsslib.so",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "arm64:macho64-arm64-darwin-dylib",
+          "artifact": "dsslib.dylib",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -1,0 +1,100 @@
+{
+  "$comment": [
+    "THE SOURCE CENSUS DECLARATION -- the `source:` provider of `check-doc-census`.",
+    "",
+    "★★★ THE PATTERN LIVES HERE, NEVER IN THE COMMENT IT CHECKS. A figure written in a",
+    "source comment is a measurement with NO INSTRUMENT ATTACHED: the reader cannot",
+    "re-derive it and no guard can check it, so it decays silently in the direction of",
+    "looking authoritative -- which is what",
+    "D-TEST-CMAKE-COMMENT-QUOTES-A-CORPUS-COUNT-THE-TEST-IT-REGISTERS-FORBIDS says.",
+    "The obvious repair -- write the grep next to the number -- fails for the same",
+    "reason the number does: a pattern quoted in prose is prose. So the pattern is DATA,",
+    "here, keyed by the census key the comment's marker names, and the comment carries",
+    "only the marker and the figure. Re-deriving is then a command anyone can run, and",
+    "`ctest` runs it on every gate.",
+    "",
+    "★ EVERY KEY DECLARES `files` (repo-relative glob patterns, `**` recursive) and",
+    "`matchingLines` (a Python regex). The value is the number of LINES matching that",
+    "regex across the de-duplicated union of the matched files. `$comment` is free text",
+    "and is ignored.",
+    "",
+    "⚠ A `files` pattern that matches NOTHING is a REFUSAL, never a zero. A glob that",
+    "silently stops matching -- a directory renamed, a file moved -- would otherwise",
+    "report 0 and any comment that had rotted to 0 would agree with it. That is the",
+    "fails-toward-clean direction this project refuses in a guard."
+  ],
+  "keys": {
+    "opt.mirRebuildPolicies": {
+      "$comment": [
+        "Concrete `MirRebuildPolicy` subclasses -- the per-pass policies that drive the",
+        "one shared MIR rebuild substrate. Bound by the header's comment, which uses the",
+        "count to argue that a rebuilder fatal unable to name its pass is unattributable.",
+        "★ It is counted here because on 2026-09-07 TWO comments stated it (the header's",
+        "and the .cpp's), both said `~9`, and both had drifted two below the truth. The",
+        ".cpp's copy was replaced by the universal claim it was always making, so the",
+        "number now has ONE owner and that owner is checked.",
+        "The base class itself declares no inheritance, so it cannot match."
+      ],
+      "files": ["src/**/*.cpp", "src/**/*.hpp"],
+      "matchingLines": "public\\s+MirRebuildPolicy\\b"
+    },
+    "program.exportedDecls": {
+      "$comment": [
+        "Exported declarations in `compile_pipeline.hpp` -- the header's own map of what",
+        "it publishes, used there to argue which entry points a driver can reach.",
+        "",
+        "★★ THIS KEY EXISTS BECAUSE THAT COMMENT BLOCK IS THE WORKED EXAMPLE OF THE WHOLE",
+        "DEFECT. It is a paragraph-long meditation on going stale: its author noticed the",
+        "FIRST spelling of this instrument counted the very comment that quoted it, moved",
+        "the pattern to a line anchor so no prose could pollute it, and wrote down why.",
+        "The re-anchored instrument then went stale by SIX anyway, unnoticed, across at",
+        "least four cycles -- because nothing machine-checked it. ✔MEASURED 2026-09-07:",
+        "the block carried SEVEN false figures at once. Care did not fix it and care will",
+        "not fix it; only a comparison run by ctest does.",
+        "",
+        "⚠ TWO OF THE SEVEN ARE STILL NOT BOUND, deliberately and not by oversight:",
+        "\"13 of the 18 entry points\" is a DISTINCT count (call sites over entry points",
+        "reached), and \"3.6%\" is a RATIO. A CLAIM binds an integer, so neither is",
+        "expressible here. They were corrected by hand and remain unguarded -- stated so",
+        "the next reader does not mistake the marked figures' green for whole-block",
+        "coverage."
+      ],
+      "files": ["src/program/compile_pipeline.hpp"],
+      "matchingLines": "^(struct |\\[\\[nodiscard\\]\\] )?DSS_EXPORT"
+    },
+    "program.exportedStructs": {
+      "$comment": [
+        "The exported STRUCTS alone. Split from the total because the header states both,",
+        "and a single figure cannot catch a struct becoming a function or the reverse --",
+        "the two must sum to `program.exportedDecls` and each is checked on its own."
+      ],
+      "files": ["src/program/compile_pipeline.hpp"],
+      "matchingLines": "^struct DSS_EXPORT"
+    },
+    "program.exportedFunctions": {
+      "$comment": [
+        "The exported FUNCTIONS alone -- every exported declaration line that does not",
+        "open with `struct`. Together with `program.exportedStructs` this partitions",
+        "`program.exportedDecls`, so a drift in either half is caught even when the total",
+        "happens not to move."
+      ],
+      "files": ["src/program/compile_pipeline.hpp"],
+      "matchingLines": "^(\\[\\[nodiscard\\]\\] )?DSS_EXPORT"
+    },
+    "program.staticArchiveLinkRoutes": {
+      "$comment": [
+        "CALL sites of `linkAndWriteWithStaticArchives` in the driver -- each one a",
+        "separate argument list a later edit can change on its own, which is the header's",
+        "whole argument for classifying per ROUTE rather than per entry point.",
+        "",
+        "★ MATCHED ON THE CALL FORM, NEVER THE BARE NAME. `program.cpp` mentions this",
+        "function five times in PROSE; a name-only count returns nine and the header's own",
+        "text warns about exactly that over-count for a sibling symbol. ✔MEASURED",
+        "2026-09-07: the comment said THREE routes and there are four -- the fourth is a",
+        "real call site the prose never absorbed."
+      ],
+      "files": ["src/program/program.cpp"],
+      "matchingLines": "reported\\(linkAndWriteWithStaticArchives\\("
+    }
+  }
+}

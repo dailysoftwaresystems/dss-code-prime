@@ -21,8 +21,43 @@ SchemaWalker::SchemaWalker(std::shared_ptr<GrammarSchema const> schema,
     : schema_(std::move(schema))
     , onDesync_(std::move(onDesync)) {}
 
-SchemaWalker::SchemaWalker(SchemaWalker&&) noexcept            = default;
-SchemaWalker& SchemaWalker::operator=(SchemaWalker&&) noexcept = default;
+SchemaWalker::SchemaWalker(SchemaWalker&& other) noexcept
+    : schema_(std::move(other.schema_))
+    , onDesync_(std::move(other.onDesync_))
+    , cursor_(other.cursor_)
+    , frames_(std::move(other.frames_))
+    , wrapDepth_(other.wrapDepth_)
+    , cursorDesynced_(other.cursorDesynced_) {
+    if (other.liveMarks_ != 0) {
+        fatal("dss::SchemaWalker: move-constructed while a Snapshot is "
+              "still outstanding — the Snapshot's back-pointer would aim "
+              "at the moved-from walker");
+    }
+}
+
+SchemaWalker& SchemaWalker::operator=(SchemaWalker&& other) noexcept {
+    if (this == &other) return *this;
+    if (liveMarks_ != 0 || other.liveMarks_ != 0) {
+        fatal("dss::SchemaWalker: move-assigned while a Snapshot is still "
+              "outstanding — the Snapshot's back-pointer would aim at a "
+              "walker whose state has been replaced");
+    }
+    schema_         = std::move(other.schema_);
+    onDesync_       = std::move(other.onDesync_);
+    cursor_         = other.cursor_;
+    frames_         = std::move(other.frames_);
+    wrapDepth_      = other.wrapDepth_;
+    cursorDesynced_ = other.cursorDesynced_;
+    return *this;
+}
+
+SchemaWalker::~SchemaWalker() noexcept {
+    if (liveMarks_ != 0) {
+        fatal("dss::SchemaWalker: destroyed while a Snapshot is still "
+              "outstanding — that Snapshot's destructor would retire its "
+              "mark against freed memory");
+    }
+}
 
 void SchemaWalker::enterRule(RuleId rule) {
     if (!rule.valid()) {
@@ -36,7 +71,6 @@ void SchemaWalker::enterRule(RuleId rule) {
         const auto routed = schema_->routeToRuleLeaf(savedParent, rule);
         if (routed.valid()) savedParent = routed;
     }
-    cursorStack_.push_back(savedParent);
     // Per-frame wrap accounting (plan 05 sub-cycle B): the Pratt
     // walker's `wrapLastChildExprFrame` enters auto-interned wrapper
     // rules (binary / unary / postfix / ternary) for structural
@@ -48,7 +82,13 @@ void SchemaWalker::enterRule(RuleId rule) {
     // `leaveRule` know whether to decrement, and `wrapDepth_` keeps
     // `noteDesync_`'s suppression check O(1).
     bool const isWrap = schema_->isAutoInternedWrapperRule(rule);
-    wrapFrameFlags_.push_back(isWrap);
+    // The running wrap count travels IN the frame so `wrapDepth_` can be
+    // checked against the stack in O(1) after a speculative rewind — see
+    // `assertWrapDepthMatchesFrames_`.
+    frames_.push(WalkerFrame{.parent          = savedParent,
+                             .isWrap          = isWrap,
+                             .wrapsAtAndBelow = stackWrapDepth_()
+                                                + (isWrap ? 1u : 0u)});
     if (isWrap) ++wrapDepth_;
     cursor_ = schema_->enterRule(rule);
     // enterRule on a registered rule always returns a valid cursor.
@@ -57,26 +97,25 @@ void SchemaWalker::enterRule(RuleId rule) {
 
 void SchemaWalker::leaveRule(SourceSpan span,
                              std::optional<RuleId> rule) noexcept {
-    if (cursorStack_.empty()) {
+    if (frames_.empty()) {
         fatal("dss::SchemaWalker::leaveRule: parent stack underflow — "
               "consumer's frame guard must validate balance before "
               "calling the walker (TreeBuilder uses P_BuilderInvariant)");
     }
-    SchemaCursor savedParent = cursorStack_.back();
-    cursorStack_.pop_back();
-    // The wrap-flag pop / depth decrement is INTENTIONALLY deferred
-    // until AFTER `noteDesync_` on every exit path. A leave-time
-    // valid→invalid cursor transition that occurs while leaving a
-    // wrap frame is structurally caused BY the wrap (the schema's
-    // routeToRuleLeaf doesn't model wrappers, so leaving one back to
-    // the parent's "after wrap" position has no valid graph edge).
-    // Keeping the wrap flag in `wrapFrameFlags_` AND `wrapDepth_`
-    // elevated through `noteDesync_` lets the suppression check see
-    // the wrap responsible for the leave-time transition. The
-    // decrement runs at every exit (early-return + main path) so the
-    // depth stays balanced with the `enterRule` increment.
-    bool const leavingWrap =
-        !wrapFrameFlags_.empty() && wrapFrameFlags_.back();
+    WalkerFrame const leaving = frames_.back();
+    SchemaCursor savedParent  = leaving.parent;
+    frames_.pop();
+    // The wrap-depth decrement is INTENTIONALLY deferred until AFTER
+    // `noteDesync_` on every exit path. A leave-time valid→invalid cursor
+    // transition that occurs while leaving a wrap frame is structurally
+    // caused BY the wrap (the schema's routeToRuleLeaf doesn't model
+    // wrappers, so leaving one back to the parent's "after wrap" position
+    // has no valid graph edge). Keeping `wrapDepth_` elevated through
+    // `noteDesync_` lets the suppression check see the wrap responsible
+    // for the leave-time transition. The decrement runs at every exit
+    // (early-return + main path) so the depth stays balanced with the
+    // `enterRule` increment.
+    bool const leavingWrap = leaving.isWrap;
     if (!savedParent.valid()) {
         // The parent was pushed invalid via routeToRuleLeaf when no
         // route through AltChoice positions led to the entered rule
@@ -90,16 +129,15 @@ void SchemaWalker::leaveRule(SourceSpan span,
         // valid→invalid signal here would double-count + over-fire
         // the diagnostic. The latch is one-shot per walker for
         // exactly this reason: the FIRST desync signal is the
-        // load-bearing one. Pop the wrap state for balance.
+        // load-bearing one. The frame is already popped; only the wrap
+        // depth is left to rebalance.
         cursor_ = SchemaCursor{};
-        if (!wrapFrameFlags_.empty()) wrapFrameFlags_.pop_back();
         if (leavingWrap) --wrapDepth_;
         return;
     }
     const bool wasValid = savedParent.valid();
     cursor_ = schema_->leaveRule(savedParent);
     noteDesync_(wasValid, cursor_.valid(), span, rule);
-    if (!wrapFrameFlags_.empty()) wrapFrameFlags_.pop_back();
     if (leavingWrap) --wrapDepth_;
 }
 
@@ -154,21 +192,64 @@ RuleId SchemaWalker::slotRuleRef() const noexcept {
     return schema_->slotRuleRef(cursor_);
 }
 
-SchemaWalker::Snapshot::Snapshot(GrammarSchema const*      schemaPtr,
-                                 SchemaCursor              cursor,
-                                 std::vector<SchemaCursor> cursorStack,
-                                 std::vector<bool>         wrapFrameFlags,
-                                 std::uint32_t             wrapDepth,
-                                 bool                      cursorDesynced) noexcept
-    : schemaPtr_(schemaPtr)
+SchemaWalker::Snapshot::Snapshot(SchemaWalker*        owner,
+                                 GrammarSchema const* schemaPtr,
+                                 FrameStack::Mark     mark,
+                                 SchemaCursor         cursor,
+                                 std::uint32_t        wrapDepth,
+                                 bool                 cursorDesynced) noexcept
+    : owner_(owner)
+    , schemaPtr_(schemaPtr)
+    , mark_(mark)
     , cursor_(cursor)
-    , cursorStack_(std::move(cursorStack))
-    , wrapFrameFlags_(std::move(wrapFrameFlags))
     , wrapDepth_(wrapDepth)
     , cursorDesynced_(cursorDesynced) {}
 
-SchemaWalker::Snapshot SchemaWalker::snapshot() const {
-    return Snapshot{schema_.get(), cursor_, cursorStack_, wrapFrameFlags_,
+SchemaWalker::Snapshot::Snapshot(Snapshot&& other) noexcept
+    : owner_(other.owner_)
+    , schemaPtr_(other.schemaPtr_)
+    , mark_(other.mark_)
+    , cursor_(other.cursor_)
+    , wrapDepth_(other.wrapDepth_)
+    , cursorDesynced_(other.cursorDesynced_) {
+    other.owner_ = nullptr;   // exactly one owner retires the mark
+}
+
+SchemaWalker::Snapshot&
+SchemaWalker::Snapshot::operator=(Snapshot&& other) noexcept {
+    if (this == &other) return *this;
+    // Overwriting a live mark retires it first: the state it named is
+    // unreachable from here on, and leaking the count would pin the undo
+    // journal open for the rest of the parse.
+    if (owner_ != nullptr) owner_->releaseMark_();
+    owner_          = other.owner_;
+    schemaPtr_      = other.schemaPtr_;
+    mark_           = other.mark_;
+    cursor_         = other.cursor_;
+    wrapDepth_      = other.wrapDepth_;
+    cursorDesynced_ = other.cursorDesynced_;
+    other.owner_    = nullptr;
+    return *this;
+}
+
+SchemaWalker::Snapshot::~Snapshot() noexcept {
+    if (owner_ != nullptr) owner_->releaseMark_();
+}
+
+void SchemaWalker::assertWrapDepthMatchesFrames_(char const* where) const noexcept {
+    if (wrapDepth_ == stackWrapDepth_()) return;
+    std::fprintf(stderr,
+                 "dss::SchemaWalker::%s: wrapDepth_ (%u) disagrees with the "
+                 "frame stack's wrap count (%u) — the desync-latch "
+                 "suppression would fire on the wrong frames\n",
+                 where, wrapDepth_, stackWrapDepth_());
+    std::abort();
+}
+
+SchemaWalker::Snapshot SchemaWalker::snapshot() {
+    assertWrapDepthMatchesFrames_("snapshot");
+    ++liveMarks_;
+    return Snapshot{this, schema_.get(), frames_.mark(), cursor_,
                     wrapDepth_, cursorDesynced_};
 }
 
@@ -178,21 +259,40 @@ void SchemaWalker::restore(Snapshot snap) {
               "different walker (schema pointer mismatch) — restoring "
               "would index the wrong schema's position table");
     }
-    // Invariant guard: `wrapFrameFlags_` mirrors `cursorStack_` 1:1
-    // at all times. A snapshot with mismatched lengths is impossible
-    // through the private ctor, but make the contract observable —
-    // matches the fail-loud discipline applied to every other walker
-    // invariant (`enterRule(InvalidRule)`, `leaveRule` underflow,
-    // cross-walker restore).
-    if (snap.wrapFrameFlags_.size() != snap.cursorStack_.size()) {
-        fatal("dss::SchemaWalker::restore: snapshot wrapFrameFlags / "
-              "cursorStack size mismatch — invariant violated");
+    // A Snapshot is a MARK into THIS walker's undo journal, so restoring
+    // one into a sibling walker over the same schema would rewind against
+    // a journal that never recorded those frames. The old VALUE shape
+    // permitted it; nothing in production ever did it, and it was unsound
+    // on its face because the cursor stack mirrors the CONSUMER's frames
+    // 1:1 — installing another consumer's stack desynchronizes ours.
+    if (snap.owner_ != this) {
+        fatal("dss::SchemaWalker::restore: snapshot belongs to a different "
+              "walker instance — a snapshot marks a position in ITS OWN "
+              "walker's undo journal and is not transferable");
     }
+    frames_.rewindTo(snap.mark_);
     cursor_          = snap.cursor_;
-    cursorStack_     = std::move(snap.cursorStack_);
-    wrapFrameFlags_  = std::move(snap.wrapFrameFlags_);
     wrapDepth_       = snap.wrapDepth_;
     cursorDesynced_  = snap.cursorDesynced_;
+    // ★ THE FRAME STACK CAME BACK FROM THE UNDO JOURNAL AND `wrapDepth_`
+    // CAME BACK FROM A SCALAR IN THE SNAPSHOT — two restores, and until this
+    // line nothing related them. The old rendition kept the wrap flags in a
+    // vector parallel to the cursor stack and checked their LENGTHS agreed
+    // here; folding the flag into the frame made that check meaningless and
+    // silently retired it. This is the same guard aimed at what is actually
+    // restored separately now, and it is O(1) because the frame carries the
+    // running count.
+    assertWrapDepthMatchesFrames_("restore");
+    // `snap` is by value: its destructor retires the mark, which drops the
+    // journal once this was the last one outstanding.
+}
+
+void SchemaWalker::releaseMark_() noexcept {
+    if (liveMarks_ == 0) {
+        fatal("dss::SchemaWalker: mark retired more times than it was "
+              "taken — a Snapshot released its mark twice");
+    }
+    if (--liveMarks_ == 0) frames_.discardJournal();
 }
 
 void SchemaWalker::noteDesync_(bool wasValid, bool nowValid,

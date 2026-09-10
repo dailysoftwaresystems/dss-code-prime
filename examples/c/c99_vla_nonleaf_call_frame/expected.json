@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-VLA-NONLEAF-CALL-FRAME: a function holding a VLA OBJECT that ALSO MAKES CALLS — the shape `L_VlaNonLeafFrameUnsupported` refused outright until this cycle ('C1b supports a LEAF VLA only'). The frame model keeps the outgoing-args area at [SP+0..outgoingArgAreaSize) where it TRAVELS WITH SP, and lifts every dynamic object above it: a captured stack watermark means `SP + outgoingArgAreaSize`. ✔MEASURED against the pe64 ORACLE — mingw-w64 gcc 13.2.0 compiles the same shape to `sub %rax,%rsp ; lea 0x50(%rsp),%rax` where 0x50 == 32 (Win64 shadow) + 6*8 (the stacked args) == outgoingArgAreaSize; DSS now emits `sub %r8,%rsp ; mov %rsp,%r15 ; add $0x50,%r15` — the same placement. EVERY CALL HERE IS 12 ARGUMENTS WIDE ON PURPOSE: that overflows ms_x64's 4 argument GPRs (8 stacked over a 32-byte shadow), sysv_amd64's 6 and aapcs64's 8, so the caller genuinely writes stack arguments; and the VLA is 32 ints = 128 bytes, wider than every one of those outgoing areas. ⚠ THE DISCRIMINATING PROPERTY IS THAT THE VLA IS RE-READ **AFTER** THE CALL — a version that passes the array's own elements as the arguments reads them all BEFORE the stores that would corrupt them and stays green with the frame model removed. `loop_scope` covers the other half, a block-scope VLA in a loop (StackSave/StackRestore): the restore must undo the same watermark bias or the next iteration's outgoing-argument stores climb into the enclosing frame's saved-register/spill area. `poke` proves the object's ADDRESS is right in the callee direction too. `overaligned_element` covers the residue case: FIVE stacked arguments make the bias 32 + 5*8 = 72, so the captured base is 8 mod 16 rather than 0, and a 32-aligned element must still land 32-aligned — the arm that would catch a bias that quietly broke the VLA lowering's alignment headroom. exitCode 42; returns 1..6, 10..12, 20..22, 30, 40, 41 and 50..55 are strict in-program pins. The `release` arm proves the placement survives the full optimizer.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

@@ -1232,14 +1232,26 @@ TEST(Program_CompileFiles, CrossValidateRejectsMachineMismatch) {
 // behavior. Without this pin a regression dropping `<< d.contextPrefix`
 // from drainDiagnosticsToStderr would silently re-open the multi-
 // target stderr skew (operators could no longer tell which target
-// produced each line). Uses `extern int x = 5;` because it parses
-// cleanly (parse errors come from a CU-level shared reporter that
+// produced each line). Uses a BLOCK-SCOPE `extern int x = 5;` because it
+// parses cleanly (parse errors come from a CU-level shared reporter that
 // is NOT routed through mergeWithTargetContext); the H_Extern* error
 // fires in the per-target loop and IS prefixed.
+//
+// ★ P65: the fixture was FILE-scope `extern int x = 5;` and this test merely
+// USED it as a convenient per-target error — the subject is the contextPrefix
+// render, not the construct. [[D-C-FILE-SCOPE-EXTERN-WITH-INITIALIZER-IS-A-DEFINITION]]
+// made that spelling a well-formed DEFINITION (C 6.9.2p1), so it stopped
+// failing and the test went red. The replacement had to keep the property the
+// old input was chosen FOR — a diagnostic that parses cleanly and fires inside
+// the per-target loop — so it is the same code one scope down (C 6.7.11p5,
+// which all three references also refuse), not an arbitrary substitute: a
+// CU-level failure would take the un-prefixed path and make the assertion
+// vacuous.
 TEST(Program_CompileFiles, StderrIncludesTargetContextPrefixOnPerTargetError) {
     ScratchDir scratch{Location::InsideRepo, "program"};
     auto const src = writeCSource(
-        scratch.path(), "ext_init.c", "extern int x = 5;\n");
+        scratch.path(), "ext_init.c",
+        "int f(void) { extern int x = 5; return x; }\n");
     scratch.useAsCwd();
     Program prog;
     testing::internal::CaptureStderr();
@@ -1785,10 +1797,20 @@ TEST(Program_Transpile, SuppressedPlanNotLandedStillReturnsNonZero) {
 // emitter, which doesn't exist in the c path today.
 // Anchored as D-H1-SUPPRESSIBLE-PER-TARGET-PIN (trigger: first
 // suppressible code that fires reliably on the per-target path).
+// ★★ P65 — RE-POINTED, AND THIS ONE'S SUBJECT IS THE CODE ITSELF, which is why
+// it could NOT take a different failure. The claim is that
+// `H_ExternHasInitializer` specifically stays visible through the whole
+// post-CLI pipeline under `--suppress` of that exact code; swapping in another
+// diagnostic would have moved the test to a different code's membership and
+// left this one unpinned. The construct moved to BLOCK scope — the only scope
+// where the code still fires after
+// [[D-C-FILE-SCOPE-EXTERN-WITH-INITIALIZER-IS-A-DEFINITION]] — and nothing else
+// about the test changed.
 TEST(Program_CompileFiles, SuppressedHExternHasInitializerStillReturnsNonZero) {
     ScratchDir scratch{Location::InsideRepo, "program"};
     auto const src = writeCSource(
-        scratch.path(), "ext_init.c", "extern int x = 5;\n");
+        scratch.path(), "ext_init.c",
+        "int f(void) { extern int x = 5; return x; }\n");
     scratch.useAsCwd();
     Program prog;
     DiagnosticReporter::Config cfg;
@@ -1798,6 +1820,79 @@ TEST(Program_CompileFiles, SuppressedHExternHasInitializerStillReturnsNonZero) {
                                 {"x86_64:elf64-x86_64-linux"},
                                 cfg),
               1);
+}
+
+// ── [[D-C-FILE-SCOPE-EXTERN-INITIALIZER-EMITS-NO-REDUNDANCY-WARNING]] (P65) ──
+//
+// THE END-TO-END HALF of the redundancy advisory, and the pair below is the
+// whole decision written as behaviour rather than as a comment. The HIR-tier
+// arms in `tests/hir/test_hir_lowering_c.cpp`
+// (`FileScopeExternInitializerWarnsThatExternIsRedundant`) pin the emit; these
+// pin what an OPERATOR sees, which is the thing the row was actually about — a
+// user who compiles this program was being told nothing at all.
+//
+// ✔MEASURED 2026-09-08, each reference probed SEPARATELY on its own translation
+// unit: gcc 13.3.0 `-std=c2x -c` rc=0 warning "'x' initialized and declared
+// 'extern'"; clang 18.1.3 `-std=c23 -c` rc=0 warning `-Wextern-initializer`;
+// MSVC 19.51.36252 `/std:c17` AND `/std:clatest` rc=0 SILENT, even at `/Wall`.
+// So the union does not require a diagnostic and DSS's is a decision — made
+// because ✔MEASURED, the same declaration in a header included by two
+// translation units compiles clean and then fails the LINK with "multiple
+// definition", rc=1, on gcc AND clang.
+TEST(Program_CompileFiles, FileScopeExternInitializerWarnsAndStillSucceeds) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSource(
+        scratch.path(), "ext_init_fs.c", "extern int x = 5;\n");
+    scratch.useAsCwd();
+    Program prog;
+    testing::internal::CaptureStderr();
+    int const rc = prog.compileFiles({src.generic_string()},
+                                     "c",
+                                     {"x86_64:elf64-x86_64-linux"});
+    auto const stderrOut = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(rc, 0)
+        << "C 6.9.2p1 makes this a definition and all three references accept "
+           "it — a warning must not fail the build; got stderr:\n" << stderrOut;
+    EXPECT_NE(stderrOut.find("warning[H_ExternRedundantOnDefinition]"),
+              std::string::npos)
+        << "the advisory must REACH the operator, rendered at Warning severity "
+           "by the driver drain — silence here is the state this row closed; "
+           "got stderr:\n" << stderrOut;
+}
+
+// ★ THE SUPPRESSIBILITY HALF, AND IT IS AN ASSERTION ON THE MEMBERSHIP
+// DECISION, not a convenience. `H_ExternRedundantOnDefinition` is deliberately
+// NOT in `kUnsuppressableCodes`: neither prong reaches it, because silencing it
+// neither fails a build with nothing said (the build SUCCEEDS, and is meant to)
+// nor ships a wrong artifact green (the Global, its initializer and its linkage
+// are emitted identically either way). Its unsuppressable sibling
+// `H_ExternHasInitializer` sits one scope away, so an inherited membership was
+// the easy wrong answer — this arm is what would go red if someone later added
+// the code to that table, since an unsuppressable code answers `--suppress`
+// with `D_SuppressRequestIgnored` and reports anyway.
+TEST(Program_CompileFiles, FileScopeExternRedundancyWarningIsSuppressible) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSource(
+        scratch.path(), "ext_init_fs.c", "extern int x = 5;\n");
+    scratch.useAsCwd();
+    Program prog;
+    DiagnosticReporter::Config cfg;
+    cfg.policy.suppress.insert(DiagnosticCode::H_ExternRedundantOnDefinition);
+    testing::internal::CaptureStderr();
+    int const rc = prog.compileFiles({src.generic_string()},
+                                     "c",
+                                     {"x86_64:elf64-x86_64-linux"},
+                                     cfg);
+    auto const stderrOut = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(rc, 0);
+    EXPECT_EQ(stderrOut.find("H_ExternRedundantOnDefinition"),
+              std::string::npos)
+        << "an advisory whose silencing changes no byte of the artifact must "
+           "honour --suppress; got stderr:\n" << stderrOut;
+    EXPECT_EQ(stderrOut.find("D_SuppressRequestIgnored"), std::string::npos)
+        << "a D_SuppressRequestIgnored here would mean the code had been added "
+           "to kUnsuppressableCodes by inheritance from H_ExternHasInitializer; "
+           "got stderr:\n" << stderrOut;
 }
 
 // ── compileDirectory ──────────────────────────────────────────

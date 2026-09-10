@@ -97,6 +97,12 @@ constexpr std::uint8_t IMAGE_SYM_CLASS_STATIC = 3;
 constexpr std::uint8_t IMAGE_SYM_CLASS_WEAK_EXTERNAL = 105;
 // IMAGE_SECTION_NUMBER specials
 constexpr std::int16_t IMAGE_SYM_UNDEFINED = 0;
+// IMAGE_SYM_ABSOLUTE(-1): "The symbol has an absolute (non-relocatable) value
+// and is not an address." PE/COFF 5.4.2. It is the section number the weak
+// external's FALLBACK symbol carries, and with Value 0 that fallback IS the
+// null address a weak reference resolves to when nothing defines the name.
+// D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE.
+constexpr std::int16_t IMAGE_SYM_ABSOLUTE  = -1;
 // IMAGE_SYM_TYPE_*
 constexpr std::uint16_t IMAGE_SYM_DTYPE_FUNCTION = 0x20;
 
@@ -2062,14 +2068,51 @@ encode(AssembledModule const&    module,
     // type=0; cl.exe / link.exe treat a type-0 undefined symbol as either.
     std::vector<SymbolId> externSyms;
     std::unordered_set<SymbolId> externSeen;
-    auto noteExternTarget = [&](SymbolId target) {
+    // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the name of the FIRST
+    // defined symbol whose relocation named each extern. A weak import's
+    // synthesized fallback is named after it — clang's scheme
+    // (`.weak.<import>.default.<referencing function>`). Empty for an extern
+    // reached only from an unwind record, which is the personality handler and
+    // is never weak.
+    //
+    // ⚠ THE ORIGINAL SENTENCE HERE ENDED "…so two objects that weak-import ONE
+    // name do not both publish a fallback under the same symbol", and that
+    // consequence NO LONGER FOLLOWS on a format carrying import slots
+    // (D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET for DATA,
+    // and since P54 D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET
+    // for FUNCTION imports as well, under an `indirect-slot` dispatch —
+    // ✔MEASURED, the weak function fixture publishes
+    // `.weak.maybe.default..refptr.maybe` by the identical route). The
+    // premise moved out from under it: with a slot in place NO function
+    // references the import any more — the SLOT does — so the first referrer is
+    // `.refptr.<import>`, which is derived from the import's own name and is
+    // therefore the SAME in every object that imports it. The scheme is
+    // unchanged and still clang's; what changed is who the referrer is.
+    // ✔MEASURED 2026-09-02 rather than reasoned about, because the shared name
+    // is exactly the shape that would break at a linker: TWO DSS objects both
+    // weak-importing `ea`, each publishing `.weak.ea.default..refptr.ea` as an
+    // ABSOLUTE value-0 EXTERNAL, link and RUN under link.exe 14.51, mingw ld
+    // 13.2.0 AND lld-link — all three, no duplicate-symbol diagnostic, both
+    // null branches taken (rc 52). Identical absolute definitions of one name
+    // are folded, the way the `/ALTERNATENAME` shape this record belongs to
+    // always has been. The uniqueness is therefore not load-bearing here, and
+    // inventing entropy to restore a property nothing checks would trade a
+    // measured fact for an arbitrary name.
+    std::unordered_map<SymbolId, std::string> externFirstReferrer;
+    auto noteExternTarget = [&](SymbolId target, std::string_view referrer = {}) {
         if (symIdxBySymbol.contains(target)) return;   // defined
-        if (externSeen.insert(target).second) externSyms.push_back(target);
+        if (externSeen.insert(target).second) {
+            externSyms.push_back(target);
+            if (!referrer.empty())
+                externFirstReferrer.emplace(target, std::string{referrer});
+        }
     };
     for (auto const& fn : module.functions)
-        for (auto const& rel : fn.relocations) noteExternTarget(rel.target);
+        for (auto const& rel : fn.relocations)
+            noteExternTarget(rel.target, objNames.definedName(fn.symbol, "sym_"));
     for (auto const& di : module.dataItems)
-        for (auto const& rel : di.relocations) noteExternTarget(rel.target);
+        for (auto const& rel : di.relocations)
+            noteExternTarget(rel.target, objNames.definedName(di.symbol, "sym_"));
     // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO: an unwind table names symbols
     // too, and one of them is normally an EXTERN. A `__try`'s UNWIND_INFO
     // carries the personality handler's RVA (`__C_specific_handler`, which no
@@ -2084,16 +2127,106 @@ encode(AssembledModule const&    module,
     std::unordered_map<SymbolId, bool> externIsData;
     for (auto const& imp : module.externImports)
         externIsData.emplace(imp.symbol, imp.isData);
+    // ── D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE (the PE arm) ─────
+    //
+    // A WEAK reference — `extern int ea __attribute__((weak));` — is a name that
+    // MAY legally resolve to nothing, in which case its address is 0. COFF
+    // spells it as IMAGE_SYM_CLASS_WEAK_EXTERNAL + Auxiliary Format 3 whose
+    // TagIndex names a FALLBACK symbol, and making that fallback an ABSOLUTE
+    // symbol of value 0 is what turns "not found" into "address 0" rather than
+    // into a link error. It is the SAME mechanism `appendAliasEntries` uses for
+    // a weak ALIAS one loop up, pointed at a different kind of default: an alias
+    // defers to a body in this object, a weak import defers to nothing at all.
+    //
+    // ⚠⚠ THE ROW THIS CLOSES INHERITED A CLAIM THAT PE "HAS NO DIRECT
+    // EQUIVALENT" AND MUST THEREFORE FAIL LOUD. That was its author's INFERENCE
+    // and it is REFUTED. ✔MEASURED 2026-09-02, the property named before the
+    // result was read (an object whose symbol is weak AND a program that LINKS
+    // with no definition and RUNS taking the null branch):
+    //   * clang 18.1.3 `--target=x86_64-w64-windows-gnu` AND
+    //     `--target=x86_64-pc-windows-msvc` both emit `ea` as
+    //     `StorageClass: WeakExternal (0x69)`, `Section: IMAGE_SYM_UNDEFINED`,
+    //     aux `Search: Alias (0x3)` naming an ABSOLUTE value-0 default;
+    //     mingw ld links that object with NO definition (rc 0) and the PE
+    //     executable RUNS to exit 42 — the null branch — while the same object
+    //     linked WITH a definition returns 7.
+    //   * mingw-w64 gcc 13.2.0 ACCEPTS the attribute and then emits a PLAIN
+    //     `scl 2` UNDEF, and its link FAILS ("undefined reference to `ea'"). It
+    //     is therefore NOT a working reference for this construct and casts no
+    //     vote for its own output — "it compiled" is not "the weak import
+    //     works". MSVC has no source spelling for a weak import and abstains.
+    //   ⇒ one working reference makes the behaviour REQUIRED (bar §A.3b), so PE
+    //     takes the same route as ELF and Mach-O and there is no asymmetry left
+    //     to declare.
+    //
+    // ★★ THE FALLBACK IS EXTERNAL AND IS NAMED AFTER THE FIRST SYMBOL THAT
+    // REFERENCES THE IMPORT — clang's scheme, followed exactly, AFTER A CHEAPER
+    // DEVIATION WAS TRIED AND MEASURED WRONG.
+    //
+    // The deviation was IMAGE_SYM_CLASS_STATIC with a name derived from the
+    // import alone (`.weak.ea.default`). The reasoning was sound on its face: a
+    // MODULE-PRIVATE fallback cannot collide when two objects weak-import one
+    // name, whereas an EXTERNAL one named for the symbol alone could — and this
+    // writer mints one record per imported SYMBOL, not per referencing function
+    // as clang does. It even survived two checks: mingw ld links it and the
+    // binary RUNS to the null branch, and clang's own object with its fallback's
+    // storage class patched 2→3 does too.
+    // ⚠⚠ ✔MEASURED AGAINST THE THIRD LINKER, WHICH IS THE ONE THAT SAW IT:
+    // `link.exe` 14.51 refuses such an object outright — `LNK1235: corrupt or
+    // invalid COFF symbol table` — while the SAME DSS object with only the
+    // fallback's class flipped back to EXTERNAL gets past it. A DSS pe object
+    // with NO weak import links and runs under link.exe (rc 42), so the refusal
+    // is attributable to this record and to nothing else. PE/COFF 5.5.3 does not
+    // spell the requirement out, and two working linkers said nothing; the third
+    // is what made "a defensible choice" into a measured one.
+    // ⇒ EXTERNAL, and uniqueness comes from the referrer's name exactly as it
+    // does for clang. The `.`-led prefix cannot collide with a source symbol —
+    // no C identifier begins with `.`, and the same convention already carries
+    // every section symbol in this table.
     for (auto const& e : externSyms) {
         auto const it = externIsData.find(e);
         bool const isFunction = (it != externIsData.end()) && !it->second;
-        CoffSymEntry ent;
-        ent.name          = objNames.externName(e, "sym_");
-        ent.sectionNumber = IMAGE_SYM_UNDEFINED;
-        ent.type          = isFunction
+        std::string       name    = objNames.externName(e, "sym_");
+        SymbolBinding const binding = objNames.externBinding(e);
+        std::uint16_t const dtype = isFunction
                                 ? static_cast<std::uint16_t>(
                                       IMAGE_SYM_DTYPE_FUNCTION)
                                 : std::uint16_t{0};
+        if (binding == SymbolBinding::Weak) {
+            // The fallback first, so its index is known when the weak external
+            // that names it is built — no back-patching, and no window in which
+            // a TagIndex points at a record that does not exist yet.
+            CoffSymEntry def;
+            def.name          = ".weak." + name + ".default";
+            if (auto const rit = externFirstReferrer.find(e);
+                rit != externFirstReferrer.end()) {
+                def.name += "." + rit->second;
+            }
+            def.value         = 0;
+            def.sectionNumber = IMAGE_SYM_ABSOLUTE;
+            def.type          = 0;
+            def.storageClass  = IMAGE_SYM_CLASS_EXTERNAL;
+            std::uint32_t const defIdx = appendEntry(std::move(def));
+
+            CoffSymEntry ent;
+            ent.name                   = std::move(name);
+            ent.value                  = 0;
+            ent.sectionNumber          = IMAGE_SYM_UNDEFINED;
+            ent.type                   = dtype;
+            ent.storageClass           = IMAGE_SYM_CLASS_WEAK_EXTERNAL;
+            ent.hasWeakExternAux       = true;
+            ent.auxWeakTagIndex        = defIdx;
+            // The same Characteristics the alias arm uses, and for the same
+            // MEASURED reason recorded at the constant: 3 is the only value
+            // under which link.exe resolves a weak external at all.
+            ent.auxWeakCharacteristics = IMAGE_WEAK_EXTERN_SEARCH_ALIAS;
+            symIdxBySymbol.emplace(e, appendEntry(std::move(ent)));
+            continue;
+        }
+        CoffSymEntry ent;
+        ent.name          = std::move(name);
+        ent.sectionNumber = IMAGE_SYM_UNDEFINED;
+        ent.type          = dtype;
         ent.storageClass  = IMAGE_SYM_CLASS_EXTERNAL;
         symIdxBySymbol.emplace(e, appendEntry(std::move(ent)));
     }
@@ -3266,32 +3399,73 @@ encodeExec(AssembledModule const&    module,
     // starting at its aligned base. `SizeOfZeroFill` = the block memsz beyond
     // the template. A tbss item's secrel (registered below) is
     // `tbssBlockBase + itemOffset`, landing in that zero-fill tail.
-    // ── D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN (audit FOLD-1): fail loud on an
-    // OVER-ALIGNED thread-local. The Windows x64 loader allocates each
-    // thread's static-TLS block at only MEMORY_ALLOCATION_ALIGNMENT (16 bytes
-    // = 2*sizeof(void*)), and IMAGE_TLS_DIRECTORY64 carries NO block-base-
-    // alignment field to request more — so a var whose alignment exceeds 16
-    // would be SILENTLY under-aligned in every thread's copy (a SIMD / atomic
-    // thread_local relying on it is UB). ELF's PT_TLS p_align honors any
-    // alignment (the C1/C2 `_Alignas(32) thread_local` witnesses run green),
-    // so this gate is PE-format-LOCAL — the format writer's own ABI knowledge,
-    // never a shared-substrate branch. Alignments <= 16 (every normal scalar /
-    // pointer / small aggregate, incl. `_Alignas(16)`) pass; the gate bites
-    // ONLY explicit over-alignment.
-    constexpr std::uint64_t kPeX64TlsBlockBaseAlign = 16;  // MEMORY_ALLOCATION_ALIGNMENT
+    // ── D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN: an over-aligned thread-local is
+    // PLACED, and the ceiling is what PE/COFF can ENCODE ──────────────────
+    //
+    // ⚠ WHAT STOOD HERE REFUSED EVERY `thread_local` ABOVE 16 BYTES, on the
+    // premise that *"the Windows x64 loader guarantees only
+    // MEMORY_ALLOCATION_ALIGNMENT static-TLS block-base alignment and
+    // IMAGE_TLS_DIRECTORY64 has no field to request more"*. ✔BOTH HALVES ARE
+    // REFUTED BY MEASUREMENT (P64):
+    //
+    //  (1) THE FIELD EXISTS. `IMAGE_TLS_DIRECTORY64.Characteristics` is a
+    //      union — Windows SDK 10.0.26100.0 `um/winnt.h` declares it over
+    //      `{ Reserved0 : 20; Alignment : 4; Reserved1 : 8; }`, the ordinary
+    //      `IMAGE_SCN_ALIGN_*` nibble at bits 20..23. (mingw-w64's own
+    //      `winnt.h` still declares a bare `DWORD`, which is how the field
+    //      came to be believed absent.) The directory-patching block below —
+    //      the one that writes StartAddressOfRawData / EndAddressOfRawData /
+    //      AddressOfIndex — now sets that nibble from `tlsMaxAlign`.
+    //  (2) THE LOADER HONOURS IT. ✔MEASURED with a DISCRIMINATOR, not a
+    //      correlation: one MSVC-linked image carrying seven 4096-aligned
+    //      `__declspec(thread)` objects RUNS 42 with every address `% 4096 ==
+    //      0` on the main thread AND on a second `CreateThread` thread; the
+    //      SAME FILE with ONLY this nibble rewritten 4096 → 16, nothing else
+    //      touched, RUNS 50 — `t1 mod 4096 = 720`, misaligned. Same template,
+    //      same block size, same code bytes.
+    //
+    // ★ THE REAL CEILING IS 8192, AND IT IS PE/COFF's WIRE LIMIT rather than a
+    // policy: the ALIGN field is FOUR BITS, and `IMAGE_SCN_ALIGN_8192BYTES`
+    // (nibble 14) is its largest defined value — in a section header and in
+    // this directory alike. BOTH PE references land on exactly that number and
+    // say so by name: mingw-w64 gcc 13.2.0 refuses 16384 with *"requested
+    // alignment '16384' exceeds object file maximum 8192"* (thread-local AND
+    // static), and MSVC 19.51 refuses `__declspec(align(16384))` as
+    // `error C2345`. Below it, both BUILD and RUN: ✔a multi-object probe (four
+    // over-aligned `tbss` objects and three `tdata` ones, separated by
+    // odd-sized fillers so none can be right by luck) returns 42 at 8/16/32/64/
+    // 4096/8192 on both compilers, addresses asserted at run time on two
+    // threads.
+    //
+    // ⓘ The number is NOT read from the format document, deliberately, and this
+    // is the same species as the `checkU32Span` wire guard a few lines below: a
+    // document declaring 16384 would not raise this ceiling, it would state a
+    // falsehood about what the container can hold. Format-LOCAL wire knowledge
+    // belongs in the format writer; it is per-TARGET *policy* that belongs in
+    // config, and that ceiling (`AggregateLayoutParams::maxRequestedAlignment`)
+    // is declared and enforced elsewhere.
+    constexpr std::uint64_t kPeCoffMaxEncodableAlign = 8192;  // IMAGE_SCN_ALIGN_8192BYTES
+    // What the loader gives a TLS block with no request on it — the value the
+    // withdrawn refusal treated as a hard ceiling. It is a FLOOR, and the
+    // directory writer below uses it as one.
+    constexpr std::uint64_t kPeX64TlsDefaultBlockAlign = 16;  // MEMORY_ALLOCATION_ALIGNMENT
     std::uint64_t tlsMaxAlign = 1;
     if (hasTdata) tlsMaxAlign = std::max(tlsMaxAlign, tdataLayout.maxAlign);
     if (hasTbss)  tlsMaxAlign = std::max(tlsMaxAlign, tbssLayout.maxAlign);
-    if (hasTls && tlsMaxAlign > kPeX64TlsBlockBaseAlign) {
+    if (hasTls && tlsMaxAlign > kPeCoffMaxEncodableAlign) {
         emit(reporter, DiagnosticCode::K_ThreadLocalOveralignedForFormat,
              std::format(
                  "pe::encodeExec: a thread-local object requires {}-byte "
-                 "alignment, but the Windows x64 loader guarantees only "
-                 "{}-byte (MEMORY_ALLOCATION_ALIGNMENT) static-TLS block-base "
-                 "alignment and IMAGE_TLS_DIRECTORY64 has no field to request "
-                 "more — the per-thread copy would be silently under-aligned "
+                 "alignment, but IMAGE_TLS_DIRECTORY64.Characteristics encodes "
+                 "the per-thread block's base alignment in a FOUR-BIT "
+                 "IMAGE_SCN_ALIGN_* field whose largest value is {} bytes — a "
+                 "stricter request cannot be expressed, and the loader would "
+                 "silently under-align every thread's copy. Lower the request "
+                 "to {} or less (both PE references stop at the same value: "
+                 "mingw-w64 gcc says \"exceeds object file maximum 8192\", "
+                 "MSVC says error C2345) "
                  "(D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN).",
-                 tlsMaxAlign, kPeX64TlsBlockBaseAlign));
+                 tlsMaxAlign, kPeCoffMaxEncodableAlign, kPeCoffMaxEncodableAlign));
         return {};
     }
     std::uint64_t const tdataSpan = tdataLayout.spanSize;   // 0 if none
@@ -3312,18 +3486,18 @@ encodeExec(AssembledModule const&    module,
         /*allowItemRelocations=*/true);
     if (!rdataLayoutOpt.has_value()) return {};
     auto& rdataDataLayout = *rdataLayoutOpt;
-    auto const dataLayoutOpt = link::format::buildExecDataSection(
+    auto dataLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Data,
         /*alignFloor=*/1, "pe::encodeExec", reporter,
         /*allowItemRelocations=*/true);
     if (!dataLayoutOpt.has_value()) return {};
-    auto const& dataDataLayout = *dataLayoutOpt;
-    auto const bssLayoutOpt = link::format::buildExecDataSection(
+    auto& dataDataLayout = *dataLayoutOpt;
+    auto bssLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Bss,
         /*alignFloor=*/1, "pe::encodeExec", reporter,
         /*allowItemRelocations=*/true);
     if (!bssLayoutOpt.has_value()) return {};
-    auto const& bssDataLayout = *bssLayoutOpt;
+    auto& bssDataLayout = *bssLayoutOpt;
     // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a CONST global carrying LOAD-TIME
     // relocations (a const function-pointer table — sqlite os_win.c aSyscall[])
     // lands in `relro`. In the PE32+ image we FOLD it into read-only `.rdata`
@@ -3342,6 +3516,146 @@ encodeExec(AssembledModule const&    module,
     bool const hasRdata = !rdataDataLayout.empty();
     bool const hasData  = !dataDataLayout.empty();
     bool const hasBss   = !bssDataLayout.empty();
+    // ── D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN (static twin, P63 residue):
+    //    a STATICALLY ALLOCATED over-aligned object is PLACED, not refused ──
+    //
+    // ⚠ WHAT STOOD HERE REFUSED ANY STATIC STRICTER THAN THE DOCUMENT'S
+    // `sectionAlignment` (4096 on every shipped `pe64-*` document), and named
+    // raising that key as the remedy. ✔THE REMEDY IS REFUTED BY THE REFERENCE:
+    // `pedump` on a mingw-w64-linked image carrying eight 8192-aligned statics
+    // shows `SectionAlignment` UNCHANGED at 0x1000, no section header carrying
+    // an ALIGN nibble, `.bss` at RVA 0x13000 (so its base 0x140013000 is ≡ 4096
+    // mod 8192 — the SECTION is not over-aligned at all), and every object
+    // inside it nonetheless ≡ 0 mod 8192. ⇒ `ld` PADS WITHIN THE SECTION.
+    // Raising `sectionAlignment` would double the VA granularity of every image
+    // this document describes and still would not generalise — and following
+    // the old message verbatim hit a SECOND refusal, because PE/COFF §3.4 also
+    // requires every non-zero `sections[].virtualAddress` to be a multiple of
+    // the new value.
+    //
+    // ★ SO THIS WRITER DOES WHAT THE REFERENCE DOES: `alignSectionHeadToItems`
+    // below inserts a LEADING PAD in each data section so that
+    // `imageBase + sectionRva + pad ≡ 0 (mod maxAlign)`, after which every item
+    // offset (already a multiple of its own alignment, by construction in
+    // `buildExecDataSection`) lands on a correctly aligned VA. Sections stay
+    // CONTIGUOUS and `SectionAlignment` is untouched.
+    //
+    // ⚠ THE SILENT MISCOMPILE THIS REPLACES IS REAL AND WAS MEASURED (P63):
+    // with neither the gate nor the padding, a module with four
+    // `aligned(8192)` statics behind odd-sized fillers built rc 0 and returned
+    // 50 at run time — the FIRST object failing its own `address % 8192` check.
+    // One object at a section head can be right BY LUCK, which is why the
+    // runtime witness carries several.
+    //
+    // What remains refused is what PE/COFF cannot ENCODE — the same 8192
+    // four-bit `IMAGE_SCN_ALIGN_*` ceiling the thread-local gate above explains
+    // in full, and the same number both PE references stop at by name.
+    {
+        std::uint64_t staticMaxAlign = 1;
+        if (hasRdata) staticMaxAlign = std::max(staticMaxAlign, rdataDataLayout.maxAlign);
+        if (hasData)  staticMaxAlign = std::max(staticMaxAlign, dataDataLayout.maxAlign);
+        if (hasBss)   staticMaxAlign = std::max(staticMaxAlign, bssDataLayout.maxAlign);
+        if (staticMaxAlign > kPeCoffMaxEncodableAlign) {
+            emit(reporter, DiagnosticCode::K_StaticObjectOveralignedForFormat,
+                 std::format(
+                     "pe::encodeExec: a statically allocated object requires "
+                     "{}-byte alignment, but PE/COFF encodes an object's "
+                     "alignment in a FOUR-BIT IMAGE_SCN_ALIGN_* field whose "
+                     "largest value is {} bytes — a stricter request cannot be "
+                     "expressed in this container, so the object would be "
+                     "placed MISALIGNED with no other sign. Lower the request "
+                     "to {} or less (both PE references stop at the same value: "
+                     "mingw-w64 gcc says \"exceeds object file maximum 8192\", "
+                     "MSVC says error C2345) "
+                     "(D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN).",
+                     staticMaxAlign, kPeCoffMaxEncodableAlign,
+                     kPeCoffMaxEncodableAlign));
+            return {};
+        }
+        // ── The PLACEMENT, and why it is a forward pass rather than a rule ──
+        //
+        // A data section's head pad depends on where that section BEGINS, and
+        // where it begins depends on how much the sections before it grew. So
+        // the pads are computed in the SAME order the RVA chain assigns them
+        // (`.text` → `.rdata` → `.data` → `.bss`), each one from the cursor the
+        // previous pad already moved. `.tls` is deliberately absent: its items
+        // are offsets into a block the LOADER allocates, whose base alignment
+        // rides the directory's own nibble, so a pad there would shift every
+        // thread-local for nothing.
+        //
+        // The pad is 0 whenever `maxAlign <= sectionAlignment`, which is every
+        // ordinary program — the cursor is always section-aligned and a valid
+        // PE's `imageBase` is a multiple of 64 KiB, so the running VA is
+        // already 4096-aligned and byte-identity for such an image is
+        // preserved.
+        //
+        // ★ WHY A LINK-TIME CONGRUENCE SURVIVES TO RUN TIME, WHICH IS THE ONLY
+        // THING THAT MAKES THIS SOUND UNDER ASLR: the image carries
+        // DYNAMIC_BASE, so the loader may place it somewhere else entirely —
+        // but it relocates at the Windows 64 KiB ALLOCATION GRANULARITY, and
+        // every alignment this gate admits divides 65536. The slide is
+        // therefore a multiple of `want`, so `(base + slide) + rva + pad` keeps
+        // the congruence computed here.
+        //
+        // ⚠ THAT PARAGRAPH USED TO BE AN ARGUMENT AND IS NOW A MEASUREMENT,
+        // because the sibling format got the same argument wrong. ✔MEASURED
+        // (P65): `GetSystemInfo` on this host reports
+        // `dwAllocationGranularity = 65536` beside `dwPageSize = 4096` — the
+        // two are DIFFERENT numbers and only the larger one bounds an image
+        // relocation, which is the entire reason PE survives what Mach-O does
+        // not. `65536 % 8192 == 0`, and 8192 is the ceiling above. ✔AND THE
+        // OUTCOME, not only the mechanism: the shipped multi-object subject
+        // `examples/c/alignment_overaligned_static_placed` returns 42 TWENTY
+        // TIMES OUT OF TWENTY from an image whose header carries
+        // DllCharacteristics 0x8160 (DYNAMIC_BASE | HIGH_ENTROPY_VA). Twenty
+        // runs because the failure being ruled out is a coin flip on the
+        // loader's choice, and one run of a coin flip is not a measurement.
+        //
+        // ★★ THE CONTRAST THAT MAKES THIS WORTH STATING HERE:
+        // [[D-LINK-MACHO-IMAGE-OVERALIGNED-STATIC-IS-A-LOAD-TIME-COIN-FLIP]] is
+        // the same question answered the other way. Mach-O has no allocation
+        // granularity above its page and no segment alignment field, so dyld's
+        // slide destroys any above-page request and the Mach-O writer must
+        // REFUSE at `image.segmentPageSize`. PE places what Mach-O refuses, and
+        // the difference is a documented OS constant rather than a policy.
+        //
+        // ⓘ That also means the arithmetic is
+        // correct for ANY declared `imageBase`, aligned or not — the pad is
+        // solved against the actual VA rather than assumed away. ⚠ AND THAT IS
+        // THE PROPERTY WITH NO PIN OF ITS OWN, stated so it is not rediscovered
+        // the hard way: every shipped `imageBase` (0x140000000, 0x180000000) is
+        // a multiple of 65536 and therefore of every encodable alignment, so
+        // solving the pad against the RVA ALONE would be green on the whole
+        // corpus — and that is precisely the shape of the ELF defect
+        // [[D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET]],
+        // where a DECLARED address silently decided whether an object landed
+        // where it asked. `vaCursor` starts from `oh.imageBase` for that reason
+        // and must keep doing so.
+        auto const alignSectionHeadToItems =
+            [&](link::format::ExecDataSectionLayout& layout, bool present,
+                bool fileBacked, std::uint64_t& vaCursor) {
+                if (!present) return;
+                std::uint64_t const want = layout.maxAlign;
+                std::uint64_t const pad =
+                    want <= 1 ? 0u : ((want - (vaCursor % want)) % want);
+                if (pad != 0) {
+                    for (auto& off : layout.itemOffsets) off += pad;
+                    layout.spanSize += pad;
+                    if (fileBacked) {
+                        layout.bytes.insert(layout.bytes.begin(),
+                                            static_cast<std::size_t>(pad),
+                                            std::uint8_t{0});
+                    }
+                }
+                vaCursor += alignUp(layout.spanSize, sectionAlignE);
+            };
+        std::uint64_t vaCursor = oh.imageBase
+                                 + static_cast<std::uint64_t>(secText.virtualAddress)
+                                 + textVirtualSizeE;
+        alignSectionHeadToItems(rdataDataLayout, hasRdata, /*fileBacked=*/true, vaCursor);
+        alignSectionHeadToItems(dataDataLayout,  hasData,  /*fileBacked=*/true, vaCursor);
+        alignSectionHeadToItems(bssDataLayout,   hasBss,   /*fileBacked=*/false, vaCursor);
+    }
     // u32 overflow guard (PE/COFF SizeOfImage / virtualSize / sizeOfRawData are
     // u32 wire fields). A producer that lands > 4 GiB in any section would
     // silently truncate at the narrowing casts below; surface it loud.
@@ -4620,7 +4934,34 @@ encodeExec(AssembledModule const&    module,
         putTlsU64(dirOff + 16, idxVa);                     // AddressOfIndex
         putTlsU64(dirOff + 24, 0);                         // AddressOfCallBacks = 0
         putTlsU32(dirOff + 32, 0);                         // SizeOfZeroFill = 0
-        putTlsU32(dirOff + 36, 0);                         // Characteristics = 0
+        // ── D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN: the per-thread BLOCK's base
+        // alignment, and the ONLY place a PE image can ask for it.
+        // `Characteristics` is an `IMAGE_SCN_ALIGN_*` nibble at bits 20..23
+        // (the Windows SDK's `winnt.h` spells the union out; mingw-w64's still
+        // declares a bare DWORD, which is how the field came to be believed
+        // absent). Value `k` means 2^(k-1) bytes, so 16 → 5 and 8192 → 14. The
+        // gate in the layout section above has already refused anything the
+        // nibble cannot hold, and ✔the loader-side discriminator that proves
+        // this field is load-bearing is written up there in full.
+        //
+        // ★ ZERO BELOW 16, AND THAT IS A DECISION RATHER THAN A GAP. Zero means
+        // *"unspecified — take the platform default"*, and that default IS the
+        // 16-byte MEMORY_ALLOCATION_ALIGNMENT every ordinary thread-local
+        // already relies on. Asking for LESS than the default would be a
+        // downgrade dressed as precision (a module whose strictest thread-local
+        // is a 4-byte int would be requesting a 4-byte block base); asking for
+        // EXACTLY the default would change the bytes of every TLS image this
+        // project has ever emitted to say what the loader already does. So the
+        // field moves only when a thread-local genuinely asks for more than the
+        // platform gives — which keeps byte-identity for every existing program
+        // and makes this write, when it happens, mean something.
+        if (tlsMaxAlign > kPeX64TlsDefaultBlockAlign) {
+            std::uint32_t alignNibble = 1;                 // 2^0 = 1 byte
+            for (std::uint64_t a = 1; a < tlsMaxAlign; a <<= 1) ++alignNibble;
+            putTlsU32(dirOff + 36, alignNibble << 20);     // Characteristics
+        } else {
+            putTlsU32(dirOff + 36, 0);                     // platform default
+        }
         // The 3 VA-field SITE RVAs (Start/End/AddressOfIndex) — NOT callbacks.
         std::uint32_t const dirRvaBase =
             tlsRva + static_cast<std::uint32_t>(tlsDirOffset);

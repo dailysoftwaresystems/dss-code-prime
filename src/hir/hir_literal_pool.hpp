@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>   // std::pair — the iterative copy's (source, destination) work list
 #include <variant>
 #include <vector>
 
@@ -49,6 +50,35 @@ struct HirLiteralValue;
 // the time anything constructs or reads an aggregate value.
 struct HirAggregateValue {
     std::vector<HirLiteralValue> fields;
+
+    // ★★★ THE TEARDOWN IS PART OF THE WALK, AND IT WAS THE ONE WALK NOBODY
+    // WROTE — D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED
+    // (the HIR twin of D-MIR-LITERAL-VALUE-TEARDOWN-RECURSES-PER-AGGREGATE-LEVEL).
+    //
+    // Every explicit walk over this tree runs on a heap work stack, but
+    // DESTRUCTION is a walk too, and the compiler generated it:
+    // `~HirLiteralValue → ~variant → ~HirAggregateValue → ~vector →
+    // ~HirLiteralValue`, ONE host frame chain per brace level, uncapped, on
+    // whatever thread happens to drop the value. ✔MEASURED 2026-09-04 (P60,
+    // lane `rc`): under MSVC 19.51 Debug that chain is NINETEEN frames of about
+    // 60 bytes each — ~1160 bytes per aggregate level — and
+    // `LayoutLeverage.NestedStructGlobalInitLowersOnAnOrdinaryThread` (a
+    // 1000-level global initializer) died of stack overflow INSIDE THIS
+    // DESTRUCTOR at ~878 levels, gdb-attributed frame by frame; under mingw-w64
+    // g++ 13.2 the same value is torn down between 1000 and 4000 levels. The
+    // fix is the one `mir/mir_literal_pool.hpp` already carries, transferred
+    // verbatim, because it belongs to the header that owns the TYPE: fixing it
+    // here fixes it for every consumer at once.
+    //
+    // The rule of five is spelled out because a user-provided destructor
+    // SUPPRESSES the implicit move operations, and falling back to copies would
+    // replace a deep destructor with a deep COPY — the same defect, slower.
+    HirAggregateValue();
+    HirAggregateValue(HirAggregateValue const&);
+    HirAggregateValue(HirAggregateValue&&) noexcept;
+    HirAggregateValue& operator=(HirAggregateValue const&);
+    HirAggregateValue& operator=(HirAggregateValue&&) noexcept;
+    ~HirAggregateValue();
 };
 
 // Address constant (plan p19 c43 — D-CSUBSET-ADDRESS-CONSTANT-FOLD / Option A).
@@ -127,6 +157,83 @@ struct HirLiteralValue {
                  HirAggregateValue, HirAddressValue, BitIntValue, WideFloatValue> value;
     TypeKind core = TypeKind::Void;
 };
+
+// ── HirAggregateValue's SPECIAL MEMBERS, out of line because they need
+//    `HirLiteralValue` COMPLETE ─────────────────────────────────────────────
+// The default constructor and the two MOVES are the compiler's own — a move
+// steals the field vector's buffer, O(1) per level. The DESTRUCTOR and the
+// two COPIES differ, and each differs only in HOW it reaches the nodes, never
+// in what it destroys or what it copies.
+inline HirAggregateValue::HirAggregateValue()                                   = default;
+inline HirAggregateValue::HirAggregateValue(HirAggregateValue&&) noexcept       = default;
+inline HirAggregateValue&
+HirAggregateValue::operator=(HirAggregateValue&&) noexcept                       = default;
+
+// ★★★ THE COPY IS A WALK TOO, AND THE DEFAULTED ONE RECURSED EXACTLY AS THE
+// DESTRUCTOR DID. `= default` copies the vector, which copy-constructs every
+// `HirLiteralValue`, whose variant copy-constructs the nested
+// `HirAggregateValue` — one host frame chain per brace level. ✔MEASURED on
+// the MIR twin (`mir_literal_pool.hpp`, same cycle): a 1000-level literal's
+// copy overflowed a 1 MB stack under MSVC Debug the moment the teardown
+// stopped being the first walk to do so. Same explicit work list here: each
+// destination level's field vector is reserved to its final size BEFORE any
+// pointer into it is taken, so the (source, destination) pairs stay valid
+// while their children are still queued.
+inline HirAggregateValue::HirAggregateValue(HirAggregateValue const& other) {
+    std::vector<std::pair<HirAggregateValue const*, HirAggregateValue*>> pending;
+    pending.emplace_back(&other, this);
+    while (!pending.empty()) {
+        auto const [src, dst] = pending.back();
+        pending.pop_back();
+        dst->fields.reserve(src->fields.size());   // no reallocation below
+        for (HirLiteralValue const& f : src->fields) {
+            HirLiteralValue& d = dst->fields.emplace_back();
+            d.core = f.core;
+            if (auto const* agg = std::get_if<HirAggregateValue>(&f.value)) {
+                // An EMPTY aggregate now; its fields are copied when its pair
+                // comes off the list — never by this constructor recursing.
+                d.value.emplace<HirAggregateValue>();
+                pending.emplace_back(agg, &std::get<HirAggregateValue>(d.value));
+            } else {
+                d.value = f.value;   // a scalar arm: the variant copies a leaf
+            }
+        }
+    }
+}
+
+// Copy-and-swap over the iterative copy above and the O(1) move; the value
+// being replaced is torn down by the iterative destructor.
+inline HirAggregateValue&
+HirAggregateValue::operator=(HirAggregateValue const& other) {
+    if (this != &other) {
+        HirAggregateValue copy{other};
+        *this = std::move(copy);
+    }
+    return *this;
+}
+
+// Destroy the whole subtree with an explicit heap work list: lift each level's
+// children OUT before the level is dropped, so every `HirLiteralValue` that
+// actually runs its destructor holds an EMPTY aggregate and costs O(1) frames.
+// The nested `~HirAggregateValue` those empty values run re-enters this body
+// exactly once and returns immediately — bounded depth 2, not depth N.
+inline HirAggregateValue::~HirAggregateValue() {
+    if (fields.empty()) return;   // the common case, and the recursion's base
+    std::vector<HirLiteralValue> pending;
+    pending.swap(fields);
+    while (!pending.empty()) {
+        HirLiteralValue cur = std::move(pending.back());
+        pending.pop_back();
+        if (auto* agg = std::get_if<HirAggregateValue>(&cur.value)) {
+            for (auto& f : agg->fields) pending.push_back(std::move(f));
+            // Dropping the moved-from elements here costs nothing: a moved-from
+            // `HirLiteralValue` holding an aggregate holds a moved-from (empty)
+            // vector, so its destructor takes the `fields.empty()` early return.
+            agg->fields.clear();
+        }
+        // `cur` dies here owning at most an EMPTY aggregate.
+    }
+}
 
 class DSS_EXPORT HirLiteralPool {
 public:

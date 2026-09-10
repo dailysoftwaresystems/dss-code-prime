@@ -199,10 +199,13 @@ NodeId TreeBuilder::emit_(detail::Node n) {
 
 bool TreeBuilder::attachToCurrentFrame_(NodeId id) {
     if (open_.empty()) return false;
-    pendingChildren_.push_back(id);
+    pendingChildren_.push(id);
     // Backpatch parent on the just-emitted node so HasError propagation
     // can walk via the stored parent link rather than the open-frame stack
     // (frames may have already closed by the time a deep error fires).
+    // `id` was emitted by THIS call's caller, so it is above every live
+    // checkpoint's `nodesSize` and a rollback discards the node whole —
+    // no undo record is owed.
     arena_.at(id).parent = open_.back().id;
     return true;
 }
@@ -212,7 +215,29 @@ bool TreeBuilder::attachToCurrentFrame_(NodeId id) {
 [[nodiscard]] std::span<NodeId const> TreeBuilder::topFramePendingChildren_() const noexcept {
     if (open_.empty()) return {};
     auto const start = open_.back().pendingStart;
-    return std::span<NodeId const>{pendingChildren_}.subspan(start);
+    return pendingChildren_.span().subspan(start);
+}
+
+void TreeBuilder::recordNodeWrite_(NodeId id) {
+    // Nothing to preserve when no rollback can ask for it.
+    if (checkpointStack_.empty()) return;
+    // A node at or above the INNERMOST live checkpoint's `nodesSize` is
+    // discarded whole by any rollback that could reach it (an outer
+    // checkpoint's `nodesSize` is never larger), so its pre-write value is
+    // never wanted. Recording it anyway would put a 40-byte node copy on
+    // every ordinary frame close inside speculation.
+    if (id.v >= checkpointStack_.back().second.nodesSize) return;
+    nodeWrites_.record(id, arena_.at(id));
+}
+
+void TreeBuilder::discardTrailsIfIdle_() noexcept {
+    if (!checkpointStack_.empty()) return;
+    pendingChildren_.discardJournal();
+    open_.discardJournal();
+    scopes_.discardJournal();
+    closedCookies_.discardJournal();
+    nodeWrites_.discardJournal();
+    childIndex_.discardJournal();
 }
 
 void TreeBuilder::emitDiagnostic_(ParseDiagnostic d) {
@@ -317,7 +342,7 @@ TreeBuilder::OpenScope TreeBuilder::open(RuleId rule) & {
         // now, while parent is still open. closeFrame_ flushes the
         // parent's pending range into childIndex_; without this push the
         // subtree would vanish from the tree.
-        pendingChildren_.push_back(id);
+        pendingChildren_.push(id);
     }
 
     // Wraparound is theoretical (4B opens in one build), but it would
@@ -327,7 +352,7 @@ TreeBuilder::OpenScope TreeBuilder::open(RuleId rule) & {
     const std::uint32_t cookie = nextCookie_++;
     // The new frame owns pendingChildren_ from this point forward.
     const auto pendingStart = static_cast<std::uint32_t>(pendingChildren_.size());
-    open_.push_back(Frame{
+    open_.push(Frame{
         .id           = id,
         .rule         = rule,
         .openerSpan   = opener,
@@ -370,7 +395,7 @@ TreeBuilder::OpenScope TreeBuilder::wrapLastChildInFrame(RuleId rule) & {
     // node and its descendants stay put — we're only moving the
     // parent's pointer.
     const NodeId childToWrap = pendingChildren_.back();
-    pendingChildren_.pop_back();
+    pendingChildren_.pop();
 
     // Open the new wrapper frame the normal way. `open()` allocates
     // the wrapper's Internal node, attaches it as a pending child of
@@ -385,7 +410,7 @@ TreeBuilder::OpenScope TreeBuilder::wrapLastChildInFrame(RuleId rule) & {
     try {
         guard = open(rule);
     } catch (...) {
-        pendingChildren_.push_back(childToWrap);
+        pendingChildren_.push(childToWrap);
         throw;
     }
     if (open_.empty()) {
@@ -393,7 +418,7 @@ TreeBuilder::OpenScope TreeBuilder::wrapLastChildInFrame(RuleId rule) & {
         // unreachable from here because `finished_` is gated at the
         // top of this method and `open()`'s only no-op path is the
         // `finished_` check. Kept for symmetry with the catch above.
-        pendingChildren_.push_back(childToWrap);
+        pendingChildren_.push(childToWrap);
         return guard;
     }
 
@@ -401,16 +426,27 @@ TreeBuilder::OpenScope TreeBuilder::wrapLastChildInFrame(RuleId rule) & {
     // children region is now `[wrapper.pendingStart, current size)` =
     // `[childToWrap]` — the load-bearing post-condition the rest of
     // this function (parent fixup + span anchor) depends on.
-    pendingChildren_.push_back(childToWrap);
+    pendingChildren_.push(childToWrap);
 
     // Fix up the wrapped child's parent pointer and the wrapper's
     // span so subsequent span rollup is sensible. The wrapper now
     // starts where the wrapped subtree starts.
+    //
+    // ⚠ `childToWrap` is the ALREADY-BUILT left operand, so inside a
+    // speculative branch it routinely predates the checkpoint and this
+    // write outlives the rollback's `truncateTo`. Journal it: without the
+    // record, a rolled-back wrap leaves the operand's `parent` naming the
+    // wrapper node id the truncation just destroyed.
+    recordNodeWrite_(childToWrap);
     arena_.at(childToWrap).parent = open_.back().id;
     const auto childSpan = arena_.at(childToWrap).span;
-    open_.back().openerSpan = SourceSpan::empty(childSpan.start());
-    arena_.at(open_.back().id).span =
-        SourceSpan::empty(childSpan.start());
+    // The wrapper frame and its node were both minted by the `open()`
+    // above, so neither needs a record — but the frame's opener span is an
+    // IN-PLACE stack write, which the trail has to see.
+    Frame wrapper = open_.back();
+    wrapper.openerSpan = SourceSpan::empty(childSpan.start());
+    open_.assignBack(wrapper);
+    arena_.at(wrapper.id).span = SourceSpan::empty(childSpan.start());
 
     return guard;
 }
@@ -420,8 +456,7 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
     // cascade-close or by finish(). The OpenScope guard is calling
     // close() after its frame is gone — quietly accept and reclaim the
     // tracking slot.
-    if (auto it = closedCookies_.find(cookie); it != closedCookies_.end()) {
-        closedCookies_.erase(it);
+    if (closedCookies_.erase(cookie)) {
         return;
     }
     if (open_.empty()) {
@@ -458,7 +493,19 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
     // closed frame is finalized normally — children flushed, span rolled
     // up, HasError percolated from any erroring child.
     while (true) {
-        Frame& fr = open_.back();
+        // A VALUE, not a reference into the stack: the frame is popped
+        // below and its fields are read after the pop. (The reference form
+        // was a use-after-pop_back of the dead back slot — MSVC-release
+        // read the stale-but-intact bytes by luck and passed; libstdc++/
+        // libc++ and any ASan build abort. `TrailedStack` returns by value
+        // and makes that mistake unspellable.)
+        Frame const fr = open_.back();
+        // The frame's node is written IN PLACE below (span rollup,
+        // HasError, firstChild, childCount). A speculative branch is
+        // allowed to close a frame that OPENED BEFORE its checkpoint —
+        // in LIFO order that is not even diagnosed — and those writes
+        // survive `truncateTo`, so journal the displaced node first.
+        recordNodeWrite_(fr.id);
         detail::Node& node = arena_.at(fr.id);
 
         // Flush this frame's pending range to childIndex_ contiguously.
@@ -469,7 +516,7 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
         const auto pendEnd    = static_cast<std::uint32_t>(pendingChildren_.size());
         for (std::uint32_t i = fr.pendingStart; i < pendEnd; ++i) {
             NodeId child = pendingChildren_[i];
-            childIndex_.push_back(child);
+            childIndex_.push(child);
             // Roll the span up from this child onto our node.
             node.span = SourceSpan::join(node.span, arena_.at(child).span);
             // OR-reduce HasError. The attach paths already propagated
@@ -481,7 +528,7 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
             }
         }
         const auto childCount = pendEnd - fr.pendingStart;
-        pendingChildren_.resize(fr.pendingStart);
+        pendingChildren_.truncate(fr.pendingStart);
         node.firstChild = firstChild;
         node.childCount = childCount;
 
@@ -492,14 +539,9 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
             // Record the cookie so that future call is a clean no-op.
             closedCookies_.insert(fr.cookie);
         }
-        // `fr` is a reference into `open_`; snapshot the two fields read
-        // after the pop BEFORE removing the frame. Reading `fr.openerSpan` /
-        // `fr.rule` after `open_.pop_back()` is a use-after-pop_back of the
-        // dead back slot (UB — MSVC-release reads the stale-but-intact bytes
-        // by luck and passes; libstdc++/libc++ and any ASan build abort).
         auto const openerSpan = fr.openerSpan;
         auto const rule       = fr.rule;
-        open_.pop_back();
+        open_.pop();
         // Invariant: walker_.depth() == open_.size() at every
         // open/close boundary. leaveRule on a non-RuleLeaf saved
         // cursor returns invalid and trips the walker's desync
@@ -994,7 +1036,7 @@ void TreeBuilder::pushScope(ScopeKind kind) {
         addBuilderInvariant_("pushScope after finish()", SourceSpan::empty(0));
         return;
     }
-    scopes_.push_back(kind);
+    scopes_.push(kind);
 }
 
 void TreeBuilder::popScope() {
@@ -1016,7 +1058,7 @@ void TreeBuilder::popScope() {
         addBuilderInvariant_("popScope on empty scope stack", at);
         return;
     }
-    scopes_.pop_back();
+    scopes_.pop();
 }
 
 ScopeKind TreeBuilder::currentScope() const noexcept {
@@ -1024,7 +1066,7 @@ ScopeKind TreeBuilder::currentScope() const noexcept {
 }
 
 std::span<ScopeKind const> TreeBuilder::scopeStack() const noexcept {
-    return scopes_;
+    return scopes_.span();
 }
 
 RuleId TreeBuilder::currentRule() const noexcept {
@@ -1066,7 +1108,7 @@ std::span<NodeId const> TreeBuilder::nodeChildren(NodeId id) const {
         || n.childCount > childIndex_.size() - n.firstChild) {
         tbFatal("TreeBuilder::nodeChildren: child range out of bounds");
     }
-    return std::span<NodeId const>{childIndex_}.subspan(n.firstChild,
+    return childIndex_.span().subspan(n.firstChild,
                                                         n.childCount);
 }
 
@@ -1113,14 +1155,14 @@ Tree TreeBuilder::finish() && {
         ancestors.reserve(open_.size());
 
         while (!open_.empty()) {
-            Frame& fr = open_.back();
+            Frame const fr = open_.back();
             detail::Node miss{};
             miss.kind   = NodeKind::Error;
             miss.flags  = NodeFlags::Missing | NodeFlags::Synthetic | NodeFlags::HasError;
             miss.span   = eofSpan;
             miss.parent = fr.id;
             const NodeId mid = emit_(miss);
-            pendingChildren_.push_back(mid);
+            pendingChildren_.push(mid);
 
             // Each frame's diagnostic gets the same EOF span but a
             // distinct ruleContext — the reporter's dedup hash includes
@@ -1181,7 +1223,7 @@ Tree TreeBuilder::finish() && {
         td.root        = InvalidNode;
     } else {
         td.arena       = std::move(arena_).finish();  // freeze: ArenaBuilder → ArenaContainer
-        td.childIndex  = std::move(childIndex_);
+        td.childIndex  = std::move(childIndex_).take();
         td.root        = NodeId{1, treeId_.v};  // first real node = the root open()
     }
 
@@ -1210,15 +1252,19 @@ TreeBuilder::Checkpoint TreeBuilder::checkpoint() {
         return Checkpoint{this, kNoOpCheckpointId};
     }
 
+    // Every line below is O(1): two container sizes, five trail marks, the
+    // walker's own mark, two scalars, and the reporter's window-bounded
+    // token. Nothing is proportional to `open_.size()`.
     CheckpointSnapshot snap;
     snap.nodesSize                  = arena_.size();
-    snap.childIndexSize             = childIndex_.size();
-    snap.pendingChildrenSize        = pendingChildren_.size();
-    snap.openFrames                 = open_;
-    snap.scopes                     = scopes_;
+    snap.childIndex                 = childIndex_.mark();
+    snap.pendingChildren            = pendingChildren_.mark();
+    snap.openFrames                 = open_.mark();
+    snap.scopes                     = scopes_.mark();
+    snap.closedCookies              = closedCookies_.mark();
+    snap.nodeWrites                 = nodeWrites_.mark();
     snap.walker                     = walker_.snapshot();
     snap.nextCookie                 = nextCookie_;
-    snap.closedCookies              = closedCookies_;
     snap.maxSpeculationDepthReached = maxSpeculationDepthReached_;
     snap.reporterSnap               = reporter_->snapshotForRollback();
 
@@ -1241,15 +1287,36 @@ void TreeBuilder::rollback(Checkpoint&& cp) noexcept {
     cp.builder_ = nullptr;
 }
 
+// Locate the entry owning `id`. Returns `checkpointStack_.end()` when the id
+// is stale or was never this builder's.
+//
+// ★ BINARY, NOT LINEAR, AND THE REASON IS THE SAME ONE THE REST OF THIS FILE
+// SERVES. Ids come from a monotonically increasing counter and entries are
+// only ever APPENDED or erased as a SUFFIX, so `checkpointStack_` is sorted by
+// id at all times — an invariant this file already relies on and now states.
+// A linear scan was fine while the cap was 64; with the cap free to follow
+// the reference compilers' depth, one scan per commit/rollback over D live
+// checkpoints is another Θ(D²), which is precisely the shape this lane
+// removed everywhere else.
+//
+// (Index ARITHMETIC against the stack's size is still wrong, and that is why
+// the search exists at all: `commitToId_` truncates from the middle on an
+// inner-commit-then-outer-rollback sequence, so "each entry owns its id" is
+// the only stable invariant.)
+std::vector<std::pair<std::uint32_t, TreeBuilder::CheckpointSnapshot>>::iterator
+TreeBuilder::findCheckpoint_(std::uint32_t id) noexcept {
+    auto it = std::ranges::lower_bound(
+        checkpointStack_, id, {},
+        [](auto const& e) { return e.first; });
+    if (it == checkpointStack_.end() || it->first != id) {
+        return checkpointStack_.end();
+    }
+    return it;
+}
+
 void TreeBuilder::commitToId_(std::uint32_t id) noexcept {
     if (id == kNoOpCheckpointId) return;
-    // Linear search by id (depth ≤ maxSpeculationDepth, typically ≤ 64
-    // — trivially fast and cache-friendly vs. a hashmap). The invariant
-    // is "each snapshot owns its id"; index arithmetic against the
-    // stack's size silently breaks on inner-commit-then-outer-rollback
-    // sequences, so we search instead.
-    auto it = std::ranges::find_if(checkpointStack_,
-        [id](auto const& e) { return e.first == id; });
+    auto it = findCheckpoint_(id);
     if (it == checkpointStack_.end()) {
         // Stale id — either already finalized or never belonged to
         // this builder. Caller bug; surface it loudly.
@@ -1269,12 +1336,12 @@ void TreeBuilder::commitToId_(std::uint32_t id) noexcept {
             SourceSpan::empty(0));
     }
     checkpointStack_.erase(it, checkpointStack_.end());
+    discardTrailsIfIdle_();
 }
 
 void TreeBuilder::rollbackToId_(std::uint32_t id) noexcept {
     if (id == kNoOpCheckpointId) return;
-    auto it = std::ranges::find_if(checkpointStack_,
-        [id](auto const& e) { return e.first == id; });
+    auto it = findCheckpoint_(id);
     if (it == checkpointStack_.end()) {
         addBuilderInvariant_(
             std::format("rollback() with stale or unknown Checkpoint id {}", id),
@@ -1289,18 +1356,29 @@ void TreeBuilder::rollbackToId_(std::uint32_t id) noexcept {
     CheckpointSnapshot snap = std::move(it->second);
     checkpointStack_.erase(it, checkpointStack_.end());
 
-    // Restore in topological order: arena first, then dependent vectors,
-    // then the cursor/scope/cookie state, then the reporter.
+    // ⚠ ORDER IS LOAD-BEARING IN EXACTLY ONE PLACE: the displaced-node
+    // replay runs BEFORE `truncateTo`. Every record names a node that
+    // existed when it was written and the arena has only grown since, so
+    // replaying first is always in-bounds; replaying after an OUTER
+    // rollback's truncation would address a node that truncation had just
+    // destroyed. (The records that survive an outer truncation are exactly
+    // the ones below its `nodesSize`, so nothing is lost by re-installing
+    // them and then dropping the tail.)
+    nodeWrites_.rewindTo(snap.nodeWrites,
+                         [this](NodeId id, detail::Node const& displaced) {
+                             arena_.at(id) = displaced;
+                         });
     arena_.truncateTo(snap.nodesSize);
-    childIndex_.resize(snap.childIndexSize);
-    pendingChildren_.resize(snap.pendingChildrenSize);
-    open_                       = std::move(snap.openFrames);
-    scopes_                     = std::move(snap.scopes);
+    childIndex_.rewindTo(snap.childIndex);
+    pendingChildren_.rewindTo(snap.pendingChildren);
+    open_.rewindTo(snap.openFrames);
+    scopes_.rewindTo(snap.scopes);
     walker_.restore(std::move(*snap.walker));
     nextCookie_                 = snap.nextCookie;
-    closedCookies_              = std::move(snap.closedCookies);
+    closedCookies_.rewindTo(snap.closedCookies);
     maxSpeculationDepthReached_ = snap.maxSpeculationDepthReached;
     reporter_->truncateTo(snap.reporterSnap);
+    discardTrailsIfIdle_();
 }
 
 } // namespace dss

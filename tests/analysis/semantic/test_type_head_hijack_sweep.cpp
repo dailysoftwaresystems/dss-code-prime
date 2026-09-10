@@ -97,9 +97,15 @@ void expectResolvedLong(SemanticModel const& m, std::string_view name,
 // ASSERTION IS NEVER READ AS AN OVERSIGHT. `__attribute__((aligned(N)))` on a
 // TYPEDEF draws `S_AlignasInvalidContext` from DSS — "the alias resolves to the
 // same type as its aliasee" — in the MID and TRAILING slots. That refusal is
-// DELIBERATE, PRE-EXISTING and already carried by its own row
-// ([[D-CSUBSET-ALIGNAS-TYPEDEF-PARAM-PARSE]], ⏳ gated: C11/C23 6.7.5p2 makes an
-// alignment specifier on a typedef a constraint violation). ✔MEASURED through
+// DELIBERATE, PRE-EXISTING and carried by its own row
+// ([[D-CSUBSET-ALIGNAS-TYPEDEF-PARAM-PARSE]] — ⚠ P58: that row is CLOSED as of
+// 2026-09-03 and is NO LONGER GATED, so the "⏳ gated" this line used to carry is
+// retired; the refusal itself is unchanged and is now the shipped answer for the ISO
+// `typedef alignas(16) int T;` spelling too. C11 6.7.5p2 / C23 **6.7.6**p2 — the C23
+// number, which this line also had wrong, since C23's 6.7.5 is Function specifiers —
+// makes an alignment specifier on a typedef a constraint violation, and gcc, clang,
+// mingw-w64 gcc AND MSVC all refuse it, ✔MEASURED 2026-09-03 each
+// separately). ✔MEASURED through
 // the shipped CLI at `x86_64:elf64-x86_64-linux-exec`, at the pre-change tree
 // and after. It is a different question from this row's, so these pins assert
 // what THIS row owns — the resolved TYPE, and the absence of the ambiguous-head
@@ -272,7 +278,14 @@ TEST(TypeHeadHijackSweep, CastTypeRefFamilyMeasuresTheDecoratedTypedef) {
     // `sizeof(long)` (8) vs `sizeof(int)` (4) under LP64 — folded into an array
     // dimension, the established sizeof-folding probe. `may_alias` (not
     // `aligned`) so the whole unit compiles clean and `!hasErrors()` is a real
-    // assertion rather than one masked by the gated alignas-on-typedef row.
+    // assertion rather than one masked by the alignas-on-typedef refusal.
+    // ⓘ P58: that refusal used to be described here as "gated". It is not gated any
+    // more — [[D-CSUBSET-ALIGNAS-TYPEDEF-PARAM-PARSE]] closed 2026-09-03 and the
+    // refusal is now the SHIPPED answer for the ISO spelling too (`typedef
+    // alignas(16) int T;` draws `S_AlignasInvalidContext` rather than a parse error).
+    // The reason `may_alias` is used here is UNCHANGED and is the load-bearing half:
+    // an `aligned` decoration on a typedef is refused, so it would mask this
+    // assertion. Only the word describing the row's status was stale.
     //
     // ⓘ The `_Generic` arm measures `sizeof` of the SELECTED ASSOCIATION'S TYPE
     // rather than a `_Generic` yielding an integer directly: ✔MEASURED through

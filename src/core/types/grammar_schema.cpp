@@ -401,6 +401,16 @@ LoadResult<std::shared_ptr<GrammarSchema>> GrammarSchema::loadFromText(
     }();
     if (schema) {
         (*schema)->contentDigest_ = digest;
+        // ── WHERE THE DOCUMENT CAME FROM, VERBATIM ─────────────────────────
+        // See `configDocumentOrigin()`. Stored beside the stem below because
+        // the two answer different questions off one input: the stem is the
+        // document's NAME (a key term, config-root-relative and stable across
+        // machines), this is its LOCATION (a prose term), and the location is
+        // the half that says WHICH TREE answered.
+        // ⓘ Neither derived from the stem nor conditional on it: a load whose
+        // label is not a `.lang.json` still has an origin worth naming, and an
+        // empty stem beside a populated origin is the honest pair for it.
+        (*schema)->documentOrigin_ = std::string{sourceLabel};
         // ── THE CONFIG NAME, DERIVED FROM THE DOCUMENT'S OWN FILENAME ──────
         // ★ From the PATH and not from the entry point: `loadShipped(name)`
         // knows the stem but `loadFromFile(path)` does not go through it, and

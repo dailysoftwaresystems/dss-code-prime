@@ -29,3 +29,13 @@ dss_add_test(NAME opt/test_mir_rebuild_helper SOURCES test_mir_rebuild_helper.cp
 # let site 4 go missing in the first place.
 dss_add_test(NAME opt/test_inline_asm_rebuild_carriage
              SOURCES test_inline_asm_rebuild_carriage.cpp)
+
+# D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the OPTIMIZER half of inline
+# gate rule 2. The row's call-site routing sends a shared library's call to its
+# own preemptible definition through the LOADER; a splice that removed the call
+# first would defeat it in the RELEASE ARM ONLY, which is exactly what was
+# MEASURED before this gate arm existed. Its own target because the decision is
+# a matrix — the over-refusal directions (a hidden callee, an undeclared format)
+# cost every helper a call for a replacement that cannot happen.
+dss_add_test(NAME opt/test_preemptible_definition_not_inlined
+             SOURCES test_preemptible_definition_not_inlined.cpp)

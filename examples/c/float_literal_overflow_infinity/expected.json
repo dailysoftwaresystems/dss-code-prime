@@ -1,0 +1,48 @@
+{
+  "$comment": "D-C-FLOAT-LITERAL-OVERFLOW-REFUSED-INSTEAD-OF-YIELDING-INFINITY: a floating literal too large for its type compiles and carries the infinity the references emit. Every literal in main.c except the controls was a HARD COMPILE ERROR before this fix — `error[H_UnsupportedLoweringForKind]: literal '1e400' is out of range / undecodable`, ✔MEASURED 2026-09-02 — because both decoder doors treated an overflow as a value they could not produce. ISO C never asked for that: C23 5.2.5.3.3¶19 and Annex F.2.2¶1 extend a type's representable RANGE to every real number once its infinities are representable, so the correctly-rounded value of `1e400` IS +∞, the nearest representable value exactly as 0x3FB999999999999A is 0.1's. ★★ THE REFERENCES SPLIT 3–1 ON ACCEPTANCE, ✔MEASURED 2026-09-02 with each invoked SEPARATELY: gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 accept every literal here (warning -Woverflow / -Wliteral-range) and all three emit the SAME bytes; MSVC 19.51.36252 refuses each with `error C2177: constant too big`. An accept-vs-refuse split is what the disjunction governs, and one working reference makes the behaviour REQUIRED. ★ THE FILE READS BYTES, NOT 'it compiles': a compile-only pin cannot tell +∞ from a saturation to DBL_MAX or from a value truncated on the way to the pool, which is the exact failure mode this direction risks. ⚠ THE BOUNDARY IS PINNED FROM BOTH SIDES ONE ULP APART — DBL_MAX must stay DBL_MAX while 1.7976931348623159e308 becomes +∞ — because that pair is the only check separating 'accepts overflow' from 'stopped checking range'. ⓘ `1e40f` is the one literal here that ALREADY compiled: DSS emitted 7f800000 for it silently, since 1e40 is an ordinary double and the overflow happened later in the F32 narrowing — so the fix removed an inconsistency rather than introducing acceptance, and that line proves the F32 side did not move. ⓘ The long-double half carries an AXIS PROBE (sizeof, then where 1.0L keeps its exponent field — never a host or arch ifdef) because `long double` is binary64 on two legs, x87-80 on one and binary128 on one; `double` and `float` need none. exit = 42; any other code names the failing check.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "$commentExpectWarnings": "★★ THE SECOND HALF OF THE CLAIM, ADDED P54 (lane `fw`) TOGETHER WITH THE `expectWarnings` KEY ITSELF. The byte checks below prove the VALUE is the correctly-rounded infinity; these prove the compiler SAID SO. The operator ruled the range report must exist, and the measurement behind that ruling is the one fact this entry could not otherwise carry: ✔MEASURED 2026-09-02, each reference invoked SEPARATELY, DEFAULT and STRICT columns — gcc 13.3.0 warns `floating constant exceeds range of 'double' [-Woverflow]` (error under -Werror), clang 18.1.3 warns `magnitude of floating-point constant too large for type 'double'; maximum is 1.7976931348623157E+308 [-Wliteral-range]`, mingw-w64 gcc 13.2.0 emits gcc's text verbatim, and MSVC 19.51.36252 REFUSES outright with `error C2177: constant too big` at every flag level. NOT ONE MEMBER OF THE UNION ACCEPTS THIS SILENTLY, so silence — the posture this example shipped with hours earlier — was the one posture no reference takes. Warning is the only severity at-or-above the union's floor and not above its ceiling, and `--warnings-as-errors` then reproduces `-Werror` (and MSVC's unconditional refusal) for anyone who wants it. ⚠ ELEVEN warnings, and the count and every position are AXIS-INDEPENDENT — ✔MEASURED identical on all four targets, i.e. across all three shipped `long double` axes (f64 on pe64 and macho-arm64, x87-80 on elf64-x86_64, ieee128 on elf64-aarch64), because `1e5000L` is past the ceiling of all three. The five CONTROLS (d_max, d_ordinary, f_max, f_ordinary, ld_one) draw nothing, and that is asserted too: the key's assertion is EXACT over the declared code, so a twelfth warning of this code anywhere in the file is a red. ⓘ A literal that is finite on ONE axis and not another (`1e400L`) is deliberately NOT in this file — it would make the expected set target-dependent, and the axis behaviour is pinned instead by SemanticAnalyzerC.LongDoubleLiteralOverflowFollowsTheDeclaredAxis.",
+  "expectWarnings": [
+    {"code": "S_FloatLiteralOverflowsToInfinity", "line": 44, "col": 30, "$comment": "d_over = 1e400 — the literal the row was filed on"},
+    {"code": "S_FloatLiteralOverflowsToInfinity", "line": 48, "col": 35, "$comment": "d_neg_over — the caret is on the CONSTANT, not the unary minus"},
+    {"code": "S_FloatLiteralOverflowsToInfinity", "line": 51, "col": 29, "$comment": "d_309 — the first power of ten past DBL_MAX"},
+    {"code": "S_FloatLiteralOverflowsToInfinity", "line": 55, "col": 35, "$comment": "d_just_over — ONE ULP past DBL_MAX; d_max on line 65 must stay silent"},
+    {"code": "S_FloatLiteralOverflowsToInfinity", "line": 58, "col": 38, "$comment": "d_hex_over — a hex float through the same door"},
+    {"code": "S_FloatLiteralOverflowsToInfinity", "line": 59, "col": 39, "$comment": "d_neg_hex_over"},
+    {"code": "S_FloatLiteralOverflowsToInfinity", "line": 75, "col": 33, "$comment": "f_over = 1e40f — the NARROWING door: finite as a double, +inf as a float"},
+    {"code": "S_FloatLiteralOverflowsToInfinity", "line": 76, "col": 34, "$comment": "f_neg_over"},
+    {"code": "S_FloatLiteralOverflowsToInfinity", "line": 80, "col": 36, "$comment": "f_double_over = 1e400f — overflows double on the way to float"},
+    {"code": "S_FloatLiteralOverflowsToInfinity", "line": 81, "col": 36, "$comment": "f_hex_over"},
+    {"code": "S_FloatLiteralOverflowsToInfinity", "line": 90, "col": 36, "$comment": "ld_over = 1e5000L — the WIDE door, past every axis's ceiling"}
+  ],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

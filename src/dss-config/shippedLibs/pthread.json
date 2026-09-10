@@ -3,7 +3,7 @@
   "header": "pthread.h",
   "standard": "posix",
   "availableObjectFormats": ["elf", "macho"],
-  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "library": { "elf": { "role": "cLibrary" }, "macho": { "role": "cLibrary" } },
   "symbols": [
     { "name": "pthread_mutex_init",     "signature": "fn(ptr<void>, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
     { "name": "pthread_mutex_destroy",  "signature": "fn(ptr<void>) -> i32",            "kind": "function", "linkage": "external" },

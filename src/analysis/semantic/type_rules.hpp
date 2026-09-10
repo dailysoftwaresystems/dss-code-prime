@@ -115,6 +115,67 @@ namespace detail::type_rules {
     return a.valid() && b.valid() && a.v == b.v;
 }
 
+// C 6.7.6.2p6 array-type COMPATIBILITY, and it is the one array question interner
+// identity cannot answer (D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT):
+//
+//   "For two array types to be compatible, both shall have compatible element types,
+//    and if both size specifiers are present, and are integer constant expressions,
+//    then both size specifiers shall have the same constant value."
+//
+// A VLA's size specifier is NOT an integer constant expression, so a `[n]` level and
+// a `[K]` level are COMPATIBLE — C makes the mismatch UNDEFINED BEHAVIOUR only if the
+// two bounds evaluate unequal at RUNTIME, which is a callee-side obligation, not a
+// translation-time one. DSS interns the VLA bound as the `kVlaLength` sentinel, so
+// `array(int,2)` and `vlaArray(int)` are DISTINCT TypeIds and every identity compare
+// answers "incompatible" — STRICTER than C, and it rejected valid programs that
+// gcc 13.3.0 and clang 18.1.3 both compile AND RUN (✔MEASURED 2026-09-03, three
+// shapes, each `-std=c17` and `-std=c2x`, binaries executed: a fixed `int b[2][2]`
+// argument to an `int (*)[n]` parameter; `p = q` fixed-row → VLA-row; `r = p`
+// VLA-row → fixed-row. MSVC ABSTAINS on all three — it implements no C99 VLA at all
+// and stops at `error C2057: expected constant expression` on the bound itself — so
+// it casts no vote, and the disjunction `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` decides
+// on the two references that WORK).
+//
+// The predicate walks the array spine pairwise and admits a level whose lengths
+// differ ONLY when at least one side is the VLA sentinel; two DIFFERENT constants
+// stay a loud mismatch (`int (*)[2]` vs `int (*)[3]` is still `S_TypeMismatch`), and
+// so does any element-type difference below the spine. Non-array levels must be
+// interner-IDENTICAL, so this can never launder a `Ptr<int>`/`Ptr<float>` pair.
+//
+// Agnosticism: UNGATED, for the reason `isArithmetic`'s BitInt arm states — a
+// `kVlaLength` scalar only ever exists in a schema that declares a runtime array
+// bound, so in every other language no type reaches this predicate with a sentinel
+// level and it answers exactly what `sameType` already answered.
+//
+// Terminates: each step takes `operands[0]` of an Array and the interned operand DAG
+// is acyclic; the guard is belt-and-braces, matching `declaredTypeDerivesFromAliasHead`.
+[[nodiscard]] inline bool vlaCompatibleArrayTypes(TypeInterner const& interner,
+                                                  TypeId a, TypeId b) {
+    if (!a.valid() || !b.valid()) return false;
+    for (int guard = 0; guard < 4096; ++guard) {
+        if (a == b) return true;
+        if (interner.kind(a) != TypeKind::Array
+            || interner.kind(b) != TypeKind::Array) {
+            return false;
+        }
+        auto const aLen = interner.scalars(a);
+        auto const bLen = interner.scalars(b);
+        if (aLen.empty() || bLen.empty()) return false;
+        // Both bounds are integer constant expressions and they DIFFER → C says
+        // incompatible. Only a VLA level (a non-ICE bound) may straddle.
+        if (aLen[0] != bLen[0]
+            && aLen[0] != kVlaLength && bLen[0] != kVlaLength) {
+            return false;
+        }
+        auto const aElem = interner.operands(a);
+        auto const bElem = interner.operands(b);
+        if (aElem.empty() || bElem.empty()) return false;   // shapeless — malformed
+        a = aElem[0];
+        b = bElem[0];
+    }
+    return false;
+}
+
 // rhs assignable into lhs?
 //   InvalidType on either side → true (cascade suppression).
 //   Identical → true.
@@ -654,6 +715,23 @@ namespace detail::type_rules {
             if (lhsElem[0] == rhsElem[0]) {
                 return true;
             }
+            // D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT (C 6.7.6.2p6): the decayed
+            // pointee is an ARRAY on both sides and the two differ ONLY in a VLA
+            // vs constant bound — `int b[2][2]` (rows `int[2]`) handed to an
+            // `int (*)[n]` parameter, and the mirror. `vlaCompatibleArrayTypes`
+            // is the C compatibility relation the interner's identity compare
+            // above cannot express; two DIFFERENT constant bounds still fall
+            // through to the loud mismatch. The decay itself is unchanged — the
+            // HIR `coerce()` synthetic decay node this branch licenses takes the
+            // address of the first element either way, so admitting it introduces
+            // no new lowering: only the ACCEPTANCE moves.
+            // ⚠ The callee keeps the runtime bound it was passed, so a caller
+            // whose constant row length disagrees with the callee's `n` is C's
+            // own UNDEFINED BEHAVIOUR (6.7.6.2p6 second sentence), NOT a DSS
+            // miscompile — the same contract gcc and clang ship.
+            if (vlaCompatibleArrayTypes(interner, lhsElem[0], rhsElem[0])) {
+                return true;
+            }
             // c50 (D-CSUBSET-ARRAY-DECAY-TO-VOID-PTR): array → void*. An array
             // decays to a pointer-to-element (C 6.3.2.1p3), which then converts
             // to void* (C 6.3.2.3p1) — composing the two existing conversions for
@@ -748,6 +826,21 @@ namespace detail::type_rules {
             // access through the lhs's stripped pointee — never a miscompile.)
             if (interner.stripVolatile(lhsElem[0])
                 == interner.stripVolatile(rhsElem[0])) {
+                return true;
+            }
+            // D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT (C 6.7.6.2p6 + 6.5.16.1): two
+            // POINTERS whose pointees are compatible array types — `int (*p)[n];
+            // int (*q)[2]; p = q;` and the reverse `r = p`. This is the SAME
+            // compatibility relation the array-decay arm above admits, at the
+            // shape it takes once the array has already decayed, and the row that
+            // named only the decay UNDERCOUNTED: ✔MEASURED 2026-09-03, DSS
+            // refused all THREE shapes with `S_TypeMismatch` while gcc 13.3.0 and
+            // clang 18.1.3 compiled and RAN all three. Volatile is stripped first
+            // so a pointee qualifier difference composes with the bound
+            // difference exactly as it does for an identical pointee.
+            if (vlaCompatibleArrayTypes(interner,
+                                        interner.stripVolatile(lhsElem[0]),
+                                        interner.stripVolatile(rhsElem[0]))) {
                 return true;
             }
             bool const lhsIsVoidPtr =
@@ -1120,15 +1213,123 @@ derefResultType(TypeInterner const& interner, TypeId operand) noexcept {
     return InvalidType;
 }
 
-// `Index` (`a[i]`): the element type of the base — an Array/Ptr/Slice (each
-// stores its element as operand[0]); any other base → InvalidType.
+// Is `t` a type `[]` can index — a CONTAINER that stores its element in
+// operand[0]? Array (C 6.3.2.1p3 decays it in this value context), Ptr and
+// Slice. A degenerate elementless container is NOT one: there is no element to
+// name, and calling it a container would hand the caller `operands()[0]` on an
+// empty span.
+[[nodiscard]] inline bool
+isIndexContainerType(TypeInterner const& interner, TypeId t) noexcept {
+    if (!t.valid()) return false;
+    TypeKind const k = interner.kind(t);
+    return (k == TypeKind::Array || k == TypeKind::Ptr || k == TypeKind::Slice)
+        && !interner.operands(t).empty();
+}
+
+// ★★★ WHICH OPERAND OF `a[b]` IS THE CONTAINER — the ONE place that question is
+// answered, for every tier. D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE.
+//
+// C 6.5.3.2p1 defines `E1[E2]` as `*((E1)+(E2))` and states the constraint
+// SYMMETRICALLY — "one operand shall be a pointer to a complete object type,
+// the other shall have integer type" — naming neither position. Addition is
+// commutative, so `2[p]`, `i[p]` and `e[data]` are exactly as legal as their
+// `p[…]` spellings, and gcc 13.3.0, clang 18.1.3 and MSVC 19.51 all compile and
+// RUN every one of them (✔MEASURED separately, 2026-09-02).
+//
+// ⚠ THE BASE-FIRST PROBE ORDER IS LOAD-BEARING, NOT STYLE. Trying `base` first
+// makes every shape that works today take the IDENTICAL arm it took before, so
+// admitting the reversed spelling cannot move `p[e]`.
+//
+// ⚠ `Ambiguous` (BOTH operands are containers, e.g. `p[q]`) is NOT "pick one".
+// The constraint requires the other operand to have INTEGER type, so two
+// containers satisfies no reading of it; picking the base silently indexed one
+// pointer by another and then aborted deep in the type lattice
+// (✔MEASURED at this cycle's base: `int *p, *q; p[q]` killed the process with
+// `TypeInterner::primitive: TypeKind Ptr is not a LEAF kind` and NO
+// user-facing diagnostic). The caller owes a loud refusal.
+enum class IndexContainerOperand : std::uint8_t {
+    Base,        // `a` in `a[b]` — the spelling C programs almost always use
+    Subscript,   // `b` in `a[b]` — the commuted spelling
+    Ambiguous,   // both are containers: no operand can be the integer one
+    Neither      // neither is: nothing to index
+};
+
+// ★★ THE OTHER HALF OF 6.5.3.2p1: "the other shall have INTEGER type". True iff
+// `t` is a type that provably CANNOT be one — the C-taxonomy COMPLEMENT of
+// "integer type", expressed in lattice kinds: floating, void, and the aggregate
+// / function kinds. Pointer and array are deliberately absent because a
+// container operand is already answered by `indexContainerOperand`
+// (`p[q]` is Ambiguous, not "q is not an integer").
+//
+// ⚠ IT ASKS "DEFINITELY NOT", NOT "NOT DEFINITELY", AND THE DIRECTION IS THE
+// DECISION. An accept-list of integer kinds would have to enumerate Bool, Char,
+// Byte, Enum, BitInt and both rank ladders, and one omission there REFUSES A
+// CORRECT PROGRAM — the defect this whole row is about. A refuse-list can only
+// ever leave a shape behaving as it does today. The kinds it does not judge —
+// Vector, Matrix, Ref, FnPtr, Nullable, Optional, Slice, Param, Bind, Extension
+// — are not C types at all, and this law is shared with every language the
+// engine loads, so a C constraint must not decide them.
+//
+// ✔MEASURED at P53's base, all through the shipped CLI: `double x; p[x]` and its
+// commuted twin reached the ASSEMBLER and were refused there as a register-CLASS
+// mismatch (`A_NoMatchingEncodingVariant` on `mul`/`lea`, naming xmm3) — loud,
+// but naming a machine fact for a source constraint; `struct S s; p[s]` and
+// `p[g]` for a function `g` ABORTED THE PROCESS (exit 0xC0000409) with no
+// `error[…]` line at all. gcc 13.3.0 and clang 18.1.3 refuse all four at the
+// user's own token with "array subscript is not an integer", while `char`,
+// `_Bool`, `enum`, `long` and `unsigned char` indices compile and run.
+[[nodiscard]] inline bool
+isDefinitelyNotIndexInteger(TypeInterner const& interner, TypeId t) noexcept {
+    if (!t.valid()) return false;                 // cascade — judge nothing
+    TypeKind const k = interner.kind(t);
+    if (detail::type_rules::floatRank(k) != 0) return true;
+    switch (k) {
+        case TypeKind::Void:
+        case TypeKind::Struct:
+        case TypeKind::Union:
+        case TypeKind::Tuple:
+        case TypeKind::FnSig:
+            return true;
+        default:
+            return false;
+    }
+}
+
+[[nodiscard]] inline IndexContainerOperand
+indexContainerOperand(TypeInterner const& interner, TypeId base,
+                      TypeId subscript) noexcept {
+    bool const baseIsContainer = isIndexContainerType(interner, base);
+    bool const subIsContainer  = isIndexContainerType(interner, subscript);
+    if (baseIsContainer && subIsContainer) return IndexContainerOperand::Ambiguous;
+    if (baseIsContainer) return IndexContainerOperand::Base;
+    if (subIsContainer)  return IndexContainerOperand::Subscript;
+    return IndexContainerOperand::Neither;
+}
+
+// `Index` (`a[b]`): the element type of whichever operand is the container.
+// Ambiguous / Neither → InvalidType (cascade-suppress; the CST→HIR tier refuses
+// loud at the site that still knows the SOURCE construct, which is why this law
+// stays a pure derivation and reports nothing itself).
+//
+// ⚠ BOTH operand types are required. Passing only the base was the defect: it
+// assumed the base is the pointer instead of ASKING which operand is, and BOTH
+// tiers did it — the CST→HIR `combineIndex` and this file's own caller in the
+// semantic-tier `subtreeType`. One value, two transforms
+// ([[feedback-a-partial-fix-reads-as-a-complete-one]]): fixing only the lowering
+// left `sizeof(i[p])` refusing and `_Generic(i[p], double: …)` silently
+// selecting `default` (✔MEASURED, both, at this cycle's base).
 [[nodiscard]] inline TypeId
-indexResultType(TypeInterner const& interner, TypeId base) noexcept {
-    if (!base.valid()) return InvalidType;
-    TypeKind const bk = interner.kind(base);
-    if ((bk == TypeKind::Array || bk == TypeKind::Ptr || bk == TypeKind::Slice)
-        && !interner.operands(base).empty())
-        return interner.operands(base)[0];
+indexResultType(TypeInterner const& interner, TypeId base,
+                TypeId subscript) noexcept {
+    switch (indexContainerOperand(interner, base, subscript)) {
+        case IndexContainerOperand::Base:
+            return interner.operands(base)[0];
+        case IndexContainerOperand::Subscript:
+            return interner.operands(subscript)[0];
+        case IndexContainerOperand::Ambiguous:
+        case IndexContainerOperand::Neither:
+            break;
+    }
     return InvalidType;
 }
 

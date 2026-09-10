@@ -1,4 +1,5 @@
-dsshir 1
+dsshir 3
+producer ""
 symbols {
   %1 "add"
   %2 "a"

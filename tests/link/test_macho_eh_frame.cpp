@@ -67,6 +67,18 @@
 #include <string_view>
 #include <vector>
 
+// ── D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ────────
+//
+// The cases below drive `macho::encode` DIRECTLY, so nothing supplied the
+// per-EMISSION artifact identity that an MH_DYLIB document's
+// `image.installName` now names through `${artifactFileName}`. A real build
+// states it in `linkAndWrite` from the path it is about to write; a writer unit
+// test writes no file, so it states it here. Omitting it is not a smaller test
+// — it is the REFUSAL arm, and that arm has its own named case rather than
+// being asserted by accident in every unrelated one.
+constexpr char const* kFixtureArtifactFileName = "fixture.dylib";
+
+
 using namespace dss;
 using dss::macho::test::findSection;
 using dss::macho::test::findSegment;
@@ -203,7 +215,8 @@ struct Encoded {
     AssembledModule mod = makeModule(target, withCfi);
     DiagnosticReporter rep;
     Encoded out;
-    out.bytes = macho::encode(mod, target, fmt, rep);
+    out.bytes = macho::encode(mod, target, fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
     EXPECT_EQ(rep.errorCount(), 0u);
     auto const* sec = fmt.sectionByKind(SectionKind::Text);
     if (sec != nullptr) out.textSectionVa = sec->virtualAddress;
@@ -648,7 +661,8 @@ TEST(MachOEhFrame, TargetWithoutDwarfNumberingStillLinksAModuleWithoutCfi) {
     {   // No CFI anywhere ⇒ must link clean and emit no section.
         AssembledModule mod = makeModule(**shipped, /*withCfi=*/false);
         DiagnosticReporter rep;
-        auto const bytes = macho::encode(mod, **plain, **fmt, rep);
+        auto const bytes = macho::encode(mod, **plain, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         EXPECT_EQ(rep.errorCount(), 0u)
             << "a target's missing DWARF numbering must not block linking a "
                "module that has no call-frame information to describe"
@@ -660,7 +674,8 @@ TEST(MachOEhFrame, TargetWithoutDwarfNumberingStillLinksAModuleWithoutCfi) {
     {   // CFI present ⇒ must REFUSE, loudly, rather than drop the table.
         AssembledModule mod = makeModule(**shipped, /*withCfi=*/true);
         DiagnosticReporter rep;
-        auto const bytes = macho::encode(mod, **plain, **fmt, rep);
+        auto const bytes = macho::encode(mod, **plain, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         EXPECT_GT(rep.errorCount(), 0u)
             << "a module WITH call-frame information on a target that "
                "declares no DWARF numbering must fail loud, never silently "
@@ -747,7 +762,8 @@ TEST(MachOTextSectionAlign, EveryArmWritesLog2OfTheSchemasByteCount) {
             mod = makeModule(**target, /*withCfi=*/false);
         }
         DiagnosticReporter rep;
-        auto const bytes = macho::encode(mod, **target, **fmt, rep);
+        auto const bytes = macho::encode(mod, **target, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         ASSERT_EQ(rep.errorCount(), 0u);
         ASSERT_FALSE(bytes.empty());
 
@@ -817,7 +833,8 @@ TEST(MachOTextSectionAlign, NonPowerOfTwoTextAlignFailsLoud) {
 
     AssembledModule mod = makeModule(**target, /*withCfi=*/false);
     DiagnosticReporter rep;
-    auto const bytes = macho::encode(mod, **target, **fmt, rep);
+    auto const bytes = macho::encode(mod, **target, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
     EXPECT_TRUE(bytes.empty());
     ASSERT_GT(rep.errorCount(), 0u);
     bool named = false;
@@ -896,7 +913,8 @@ TEST(MachOTextSectionAlign, DylibIMAGESWriteLog2NotJustTheirSchemas) {
                                            SymbolVisibility::Default});
 
         DiagnosticReporter rep;
-        auto const bytes = macho::encode(mod, **target, **fmt, rep);
+        auto const bytes = macho::encode(mod, **target, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         // The diagnostics are SPELLED OUT on failure: an encode that refuses
         // for an unrelated reason would otherwise read as an align defect.
         std::string why;
@@ -922,12 +940,21 @@ TEST(MachOTextSectionAlign, TheSTATICExecArmWritesLog2Too) {
     // ★ THE MODULE CARRIES NO EXTERN IMPORTS, AND THAT IS THE WHOLE POINT:
     // `macho::encode` routes on `externImports.empty()`, so this is the only
     // shape that reaches `encodeExec`. The synthetic schema is used rather than
-    // a shipped one because every shipped Darwin exec document declares a
-    // non-zero `image.codeSignatureSize`, and `macho::encode` REFUSES that
-    // combination outright (the static arm emits no __LINKEDIT to host the
-    // signature) — so the static arm is unreachable from a shipped exec schema
-    // by construction, and saying so here is cheaper than the next reader
-    // re-deriving it.
+    // a shipped one because every shipped Darwin exec document requests a code
+    // signature, and `macho::encode` REFUSES that combination outright (the
+    // static arm emits no __LINKEDIT to host the signature) — so the static arm
+    // is unreachable from a shipped exec schema by construction, and saying so
+    // here is cheaper than the next reader re-deriving it.
+    //
+    // ⚠ CORRECTED under D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM. This
+    // sentence used to say the shipped documents declare "a non-zero
+    // `image.codeSignatureSize`". ✔MEASURED: not one of them does — they
+    // declare `image.codeSignature`, the ad-hoc block. The CONCLUSION was right
+    // and had been right all along; the REASON was false, and it was false in
+    // the exact direction that mattered, because the gate it described tested
+    // `codeSignatureSize` alone and therefore did NOT refuse the shipped
+    // documents. A comment stating a premise no instrument checks is how a
+    // guard gets believed for a rule it does not enforce.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadFromText(execSchemaJson());
@@ -943,7 +970,8 @@ TEST(MachOTextSectionAlign, TheSTATICExecArmWritesLog2Too) {
     ASSERT_TRUE(mod.externImports.empty());
 
     DiagnosticReporter rep;
-    auto const bytes = macho::encode(mod, **target, **fmt, rep);
+    auto const bytes = macho::encode(mod, **target, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 

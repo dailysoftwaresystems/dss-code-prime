@@ -217,8 +217,13 @@ lowerOneFunc(Lir const& src, LirFuncId fn, TargetSchema const& schema,
                                    argRegionIdx));
                         return false;
                     }
+                    // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the carrier states
+                    // its datum's own alignment; the cursor clamps it by the CC's
+                    // declared cap. 0 (unstated) floors at the slot = the classic
+                    // flat stride.
                     std::uint32_t const aggOffset =
-                        stackCursor.placeNamedAggregate(aggBytes);
+                        stackCursor.placeNamedAggregate(
+                            aggBytes, ops[k + 1].byValueAggAlign());
                     keepOps.push_back(argOp);         // the temp's address Reg
                     keepOps.push_back(ops[k + 1]);    // size + exhaust class
                     keepOps.push_back(LirOperand::makeMemOffset(

@@ -855,11 +855,28 @@ TEST(FfiResolveLibraryRoundTrip, MissingResolveLibraryPathFailsLoudEvenWithNoExt
 // `kFormatLegs`.
 //
 // The library identity is STATED via `--resolve-library <path>=<name>`
-// (D-FFI-DECLARED-IMPORT-NAME) rather than left to the binary's embedded
-// identity, because the shipped Mach-O dylib schema declares a single
-// `installName` ("@rpath/libdss.dylib") that BOTH stand-ins would inherit —
-// two libraries collapsing to one recorded name would make the Mach-O leg
-// pass for a reason unrelated to the defect.
+// (D-FFI-DECLARED-IMPORT-NAME), which exercises PRECEDENCE LEVEL 1 — a
+// declared name beats a binary's embedded identity — and that is the level
+// this case is for. It deliberately does NOT reach level 2 (the embedded
+// identity), and the reason is worth the sentence:
+//
+// ⚠⚠ THIS COMMENT ONCE JUSTIFIED THE `=name` FORM BY THE DEFECT IT WAS
+// ROUTING AROUND, AND SHIPPED GREEN. It read: the shipped Mach-O dylib schema
+// "declares a single `installName` ("@rpath/libdss.dylib") that BOTH stand-ins
+// would inherit — two libraries collapsing to one recorded name would make the
+// Mach-O leg pass for a reason unrelated to the defect." That was TRUE, it was
+// the whole shape of
+// D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT, and this
+// pin — the driver-tier one meant to catch exactly that class — SAW it, NAMED
+// it, and stepped one precedence level up to stay green. A pin that documents
+// its own blindness and ships is worse than a narrow one: it proves someone
+// looked. See D-HARNESS-A-PIN-MAY-NOT-ROUTE-AROUND-THE-DEFECT-IT-DOCUMENTS.
+// ⇒ No shipped document declares a constant identity any more, and level 2 is
+//   now pinned on its own by `program/test_macho_install_name_identity`, which
+//   drives this same driver with BARE PATHS and asserts each dylib's own
+//   LC_ID_DYLIB differs before asserting both dependency entries. Keep the
+//   `=name` form HERE: with level 2 pinned elsewhere, the two cases cover the
+//   two precedence levels instead of both covering one.
 TEST(FfiResolveLibraryRoundTrip, EveryResolvedLibraryReachesTheEmittedDependencyTable) {
     struct TwoLibLeg {
         char const* label;
@@ -2087,4 +2104,575 @@ TEST(FfiResolveLibraryDeclaredImportName, WarningsAsErrorsPromotesTheUnrecordabl
     EXPECT_EQ(severityForCode(
                   strictRep, DiagnosticCode::F_DeclaredImportNameNotRecordable),
               DiagnosticSeverity::Error);
+}
+
+// == D-FFI-RESOLVE-LIBRARY-DOES-NOT-CHECK-THE-LIBRARY-ARCH ==================
+//
+// The OTHER AXIS of the boundary its sibling
+// [[D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL]] closed above:
+// right object format, WRONG CPU. Both rows are one missing comparison at one
+// place -- the reader already knows what it read and never compared it to the
+// target -- so the check is an EXTENSION of that row's chokepoint,
+// `ffi::checkLibraryMatchesTargetFormat`, and every site that validates a
+// `--resolve-library` entry inherits it with no new wiring.
+//
+// MEASURED BEFORE THE GUARD EXISTED, on the shipped CLI at the cycle base:
+//
+//   elf64 x86_64 `.so`   -> arm64:elf64-aarch64-linux-exec   rc=0, ZERO diagnostics
+//   elf64 arm64  `.so`   -> x86_64:elf64-x86_64-linux-exec   rc=0, ZERO diagnostics
+//   macho64 x86_64 dylib -> arm64:macho64-arm64-darwin-exec  rc=0, ZERO diagnostics
+//
+// and in each case an artefact WAS produced whose own header carried the
+// target's architecture while its dependency table recorded the foreign-CPU
+// library. That is a load-time death with no build-time signal, and the row's
+// "it happened to be harmless because the symbol NAMES are identical across
+// slices" is exactly why nothing else can catch it: matching names are the NORM
+// across architectures, so no symbol lookup, no decoration rule and no format
+// rule ever objects.
+//
+// The row's closing note ("do it in the same change as the format check") was
+// STALE when this lane received it -- that change landed 2026-08-14 -- so this
+// is the same remedy applied one cycle later to the chokepoint it built, which
+// is what the note was protecting against: ONE validation step, not two.
+
+namespace {
+
+// ELF is one of the two object formats this repository ships documents for on
+// TWO architectures, which is what makes the cross-feed expressible at all.
+// Mach-O ships two as well (test 2); PE ships only x86_64, so no PE arch PAIR
+// exists to build -- the guard is written format-blind and covers it the day
+// one lands.
+constexpr char const* kElfArm64Dyn      = "arm64:elf64-aarch64-linux-dyn";
+constexpr char const* kElfArm64Exec     = "arm64:elf64-aarch64-linux-exec";
+constexpr char const* kElfX86Staticlib  = "x86_64:elf64-x86_64-linux-staticlib";
+constexpr char const* kMachoX86Dylib    = "x86_64:macho64-x86_64-darwin-dylib";
+constexpr char const* kMachoArm64Dylib  = "arm64:macho64-arm64-darwin-dylib";
+constexpr char const* kMachoArm64Exec   = "arm64:macho64-arm64-darwin-exec";
+constexpr char const* kMachoX86Exec     = "x86_64:macho64-x86_64-darwin-exec";
+// The MERGED partitions' fixtures: the two other arms of
+// `partitionResolveLibraries`, on both ELF architectures and on both Mach-O
+// ones. The bare `<base>` format name IS the relocatable-object document --
+// `-exec` / `-dyn` / `-staticlib` are its image siblings.
+constexpr char const* kElfArm64Staticlib =
+    "arm64:elf64-aarch64-linux-staticlib";
+constexpr char const* kElfX86Object       = "x86_64:elf64-x86_64-linux";
+constexpr char const* kElfArm64Object     = "arm64:elf64-aarch64-linux";
+constexpr char const* kMachoX86Staticlib =
+    "x86_64:macho64-x86_64-darwin-staticlib";
+constexpr char const* kMachoArm64Staticlib =
+    "arm64:macho64-arm64-darwin-staticlib";
+constexpr char const* kPeStaticlib = "x86_64:pe64-x86_64-windows-staticlib";
+
+// Build the SAME one-function source for TWO architectures of ONE object
+// format, in one scratch dir. DSS is a cross-compiler with no external
+// toolchain, so this runs on every host and nothing is executed.
+struct CrossArchLibraries {
+    fs::path x86;
+    fs::path arm64;
+};
+[[nodiscard]] CrossArchLibraries
+buildCrossArchLibraries(fs::path const& dir, std::string_view x86Target,
+                        std::string_view arm64Target,
+                        std::string_view artifactName) {
+    auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
+    DiagnosticReporter x86Rep;
+    EXPECT_EQ(buildOne(dir / "x86", {}, libSrc.string(),
+                       std::string{x86Target}, x86Rep), 0)
+        << "DSS must build the x86_64 stand-in library"
+        << (x86Rep.all().empty() ? "" : "\n" + x86Rep.all().front().actual);
+    DiagnosticReporter armRep;
+    EXPECT_EQ(buildOne(dir / "arm64", {}, libSrc.string(),
+                       std::string{arm64Target}, armRep), 0)
+        << "DSS must build the arm64 stand-in library"
+        << (armRep.all().empty() ? "" : "\n" + armRep.all().front().actual);
+    return {dir / "x86" / std::string{artifactName},
+            dir / "arm64" / std::string{artifactName}};
+}
+
+// Asserting that BOTH architectures of one format expose the SAME spelling is
+// what proves the decoration gate and the symbol-absent check are out of the
+// picture before a single cross-feed is attempted.
+void expectSameExportSpelling(fs::path const& a, fs::path const& b,
+                              std::string_view symbol) {
+    EXPECT_TRUE(libraryExposesName(a, symbol))
+        << a.generic_string() << " must expose " << symbol;
+    EXPECT_TRUE(libraryExposesName(b, symbol))
+        << b.generic_string() << " must expose " << symbol;
+}
+
+}  // namespace
+
+// -- (1) THE DECISIVE PIN: elf x86_64 <-> elf arm64, BOTH DIRECTIONS --------
+//
+// The two negative arms are the case measured silent above. The two positive
+// arms are what stops a blanket-reject regression from passing: the SAME
+// source, the SAME libraries, matched up correctly, must still build clean.
+//
+// The assertion that `F_MangleMissingExpectedPrefix` is ABSENT is load-bearing
+// rather than decorative -- together with the identical-spelling precondition
+// it proves the refusal came from the ARCHITECTURE comparison and not from a
+// naming accident. So is the assertion that the FORMAT sentence is absent: both
+// sides are elf, so a message about object formats would mean the pin is
+// measuring its sibling guard instead of this one.
+//
+// -- RED-ON-DISABLE (see the lane report) ----------------------------------
+// In `ffi::checkLibraryMatchesTargetFormat` (src/ffi/ingest.cpp) delete the
+// architecture clause -- return `std::nullopt` where the two codes are
+// compared -- and both negative arms build CLEAN (rc 0),
+// `F_UnsupportedBinaryFormat` never appears, and the emitted aarch64 image
+// records a DT_NEEDED naming an x86_64 library. That is the silent load-time
+// death this pin exists to prevent, and it is the state MEASURED at the cycle
+// base.
+TEST(FfiResolveLibraryWrongArchitecture,
+     ElfCrossArchFeedingIsRefusedInBothDirections) {
+    ScratchDir scratch{Location::InsideRepo, "ffi-wrong-arch-elf"};
+    auto const dir  = scratch.path();
+    auto const libs = buildCrossArchLibraries(dir, kElfDyn, kElfArm64Dyn,
+                                              "dsslib.so");
+    ASSERT_TRUE(fs::exists(libs.x86))   << libs.x86.string();
+    ASSERT_TRUE(fs::exists(libs.arm64)) << libs.arm64.string();
+
+    // THE PRECONDITION THAT MAKES THIS THE RIGHT PAIR: one object format on
+    // both sides (so the FORMAT guard cannot account for any refusal) and one
+    // export spelling on both sides (so no naming rule can).
+    expectSameExportSpelling(libs.x86, libs.arm64, "dss_lib_answer");
+
+    auto const mainSrc = writeSrc(dir, "main.c", kMainSrc);
+
+    // -- NEGATIVE A: an x86_64 `.so` handed to an aarch64 build -------------
+    {
+        DiagnosticReporter rep;
+        int const rc = buildOne(dir / "out-x86-into-arm64", {libs.x86},
+                                mainSrc.string(), kElfArm64Exec, rep);
+        EXPECT_NE(rc, 0)
+            << "an x86_64 shared object cannot serve an aarch64 link -- "
+               "accepting it binds every extern and records a DT_NEEDED on a "
+               "library the aarch64 loader will refuse";
+        ASSERT_GE(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 1u)
+            << "the refusal must be the ARCHITECTURE check";
+        EXPECT_EQ(countCode(rep, DiagnosticCode::F_MangleMissingExpectedPrefix),
+                  0u)
+            << "both libraries are elf and spell the symbol identically -- if "
+               "this fires, the pin is measuring a naming accident";
+        auto const msg =
+            messageForCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat);
+        EXPECT_NE(msg.find("dsslib.so"), std::string::npos)
+            << "the message must NAME the library; got: " << msg;
+        EXPECT_NE(msg.find("e_machine 0x3E (62)"), std::string::npos)
+            << "...what the FILE declares, field and value; got: " << msg;
+        EXPECT_NE(msg.find("e_machine 0xB7 (183)"), std::string::npos)
+            << "...and what the target needs; got: " << msg;
+        EXPECT_NE(msg.find("'arm64'"), std::string::npos)
+            << "...named by the architecture the operator types; got: " << msg;
+        EXPECT_EQ(msg.find("object format is"), std::string::npos)
+            << "this must NOT be the format message -- both sides are elf; "
+               "got: " << msg;
+        EXPECT_FALSE(fs::exists(dir / "out-x86-into-arm64" / "main"))
+            << "a refused build must emit no artifact";
+    }
+
+    // -- NEGATIVE B: the mirror direction -----------------------------------
+    {
+        DiagnosticReporter rep;
+        int const rc = buildOne(dir / "out-arm64-into-x86", {libs.arm64},
+                                mainSrc.string(), kElfExec, rep);
+        EXPECT_NE(rc, 0)
+            << "and the mirror direction, which nothing else separates either";
+        ASSERT_GE(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 1u);
+        EXPECT_EQ(countCode(rep, DiagnosticCode::F_MangleMissingExpectedPrefix),
+                  0u);
+        auto const msg =
+            messageForCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat);
+        EXPECT_NE(msg.find("e_machine 0xB7 (183)"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("e_machine 0x3E (62)"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("'x86_64'"), std::string::npos) << msg;
+    }
+
+    // -- POSITIVE CONTROLS: the matched pairings still build ----------------
+    {
+        DiagnosticReporter rep;
+        EXPECT_EQ(buildOne(dir / "out-x86-ok", {libs.x86}, mainSrc.string(),
+                           kElfExec, rep), 0)
+            << "the guard must not reject the pairing it exists to protect"
+            << (rep.all().empty() ? "" : "\n" + rep.all().front().actual);
+        EXPECT_EQ(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 0u);
+    }
+    {
+        DiagnosticReporter rep;
+        EXPECT_EQ(buildOne(dir / "out-arm64-ok", {libs.arm64}, mainSrc.string(),
+                           kElfArm64Exec, rep), 0)
+            << (rep.all().empty() ? "" : rep.all().front().actual);
+        EXPECT_EQ(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 0u);
+    }
+}
+
+// -- (2) THE SECOND OBJECT FORMAT -- a DIFFERENT header field entirely ------
+//
+// ELF keeps its architecture in a u16 `e_machine` at a fixed offset; Mach-O
+// keeps it in a u32 `cputype` at a different one. A guard that had learned only
+// ELF's field would pass test (1) and leave Mach-O exactly as silent as it was
+// measured. Both libraries here are Mach-O and both decorate the symbol with a
+// leading underscore, so once again neither the format guard nor the decoration
+// gate can account for any refusal.
+TEST(FfiResolveLibraryWrongArchitecture,
+     MachOCrossArchFeedingIsRefusedInBothDirections) {
+    ScratchDir scratch{Location::InsideRepo, "ffi-wrong-arch-macho"};
+    auto const dir  = scratch.path();
+    auto const libs = buildCrossArchLibraries(dir, kMachoX86Dylib,
+                                              kMachoArm64Dylib, "dsslib.dylib");
+    ASSERT_TRUE(fs::exists(libs.x86))   << libs.x86.string();
+    ASSERT_TRUE(fs::exists(libs.arm64)) << libs.arm64.string();
+    expectSameExportSpelling(libs.x86, libs.arm64, "_dss_lib_answer");
+
+    auto const mainSrc = writeSrc(dir, "main.c", kMainSrc);
+    {
+        DiagnosticReporter rep;
+        EXPECT_NE(buildOne(dir / "out-x86-into-arm64", {libs.x86},
+                           mainSrc.string(), kMachoArm64Exec, rep), 0);
+        ASSERT_GE(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 1u);
+        auto const msg =
+            messageForCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat);
+        EXPECT_NE(msg.find("cputype 0x1000007 (16777223)"), std::string::npos)
+            << "CPU_TYPE_X86_64, off the file; got: " << msg;
+        EXPECT_NE(msg.find("cputype 0x100000C (16777228)"), std::string::npos)
+            << "CPU_TYPE_ARM64, off the format document; got: " << msg;
+        EXPECT_EQ(msg.find("e_machine"), std::string::npos)
+            << "the message must name MACH-O's field, not ELF's; got: " << msg;
+    }
+    {
+        DiagnosticReporter rep;
+        EXPECT_NE(buildOne(dir / "out-arm64-into-x86", {libs.arm64},
+                           mainSrc.string(), kMachoX86Exec, rep), 0);
+        ASSERT_GE(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 1u);
+    }
+    // POSITIVE CONTROL, one per direction.
+    {
+        DiagnosticReporter rep;
+        EXPECT_EQ(buildOne(dir / "out-arm64-ok", {libs.arm64}, mainSrc.string(),
+                           kMachoArm64Exec, rep), 0)
+            << (rep.all().empty() ? "" : rep.all().front().actual);
+        EXPECT_EQ(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 0u);
+    }
+    {
+        DiagnosticReporter rep;
+        EXPECT_EQ(buildOne(dir / "out-x86-ok", {libs.x86}, mainSrc.string(),
+                           kMachoX86Exec, rep), 0)
+            << (rep.all().empty() ? "" : rep.all().front().actual);
+        EXPECT_EQ(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 0u);
+    }
+}
+
+// -- (3) THE SECOND BINDER -- the `encode` / `.s` tier ----------------------
+//
+// `bindAsmExternImports` reaches FF1 DIRECTLY, with no `ingest()` in between,
+// and this unit never enters `buildCuMir`, so the eager step-2.5-pre probe
+// cannot account for the refusal either: the only thing that can report here is
+// the binder's own call into `ffi::readImportsForTargetFormat`. Exactly the
+// funnel its format sibling proves, asserted for the architecture clause so a
+// check added to one binder alone cannot pass.
+TEST(FfiResolveLibraryWrongArchitecture,
+     EncodeTierAsmBinderRefusesTheWrongArchitecture) {
+    ScratchDir scratch{Location::InsideRepo, "ffi-wrong-arch-asm"};
+    auto const dir = scratch.path();
+    auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
+    DiagnosticReporter libRep;
+    ASSERT_EQ(buildOne(dir / "arm64", {}, libSrc.string(), kElfArm64Dyn, libRep),
+              0);
+    auto const armLib = dir / "arm64" / "dsslib.so";
+    ASSERT_TRUE(libraryExposesName(armLib, "dss_lib_answer"));
+
+    auto const asmSrc = writeBinaryFile(dir, "callit.s", kAsmCallsLibAnswer);
+
+    DiagnosticReporter rep;
+    Program prog;
+    prog.setOutputDir(dir / "out-asm");
+    prog.setResolveLibraries(std::vector<fs::path>{armLib});
+    int const rc = prog.compileFiles({asmSrc.generic_string()},
+                                     std::string{kAttLanguage},
+                                     {std::string{kElfExec}}, rep);
+    EXPECT_NE(rc, 0)
+        << "the encode-tier binder must refuse an aarch64 library on an x86_64 "
+           "target exactly as the C path does -- two binders, one rule";
+    ASSERT_GE(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 1u)
+        << "...and by the ARCHITECTURE check, reached through the shared "
+           "chokepoint";
+    auto const msg =
+        messageForCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat);
+    EXPECT_NE(msg.find("dsslib.so"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("e_machine 0xB7 (183)"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("'x86_64'"), std::string::npos) << msg;
+}
+
+// -- (4) THE UNCONDITIONAL ARM -- a TU that routes NOTHING to the reader ----
+//
+// `int main(void){ return 7; }` declares no extern, so nothing reaches
+// `ingest()` and the read chokepoint is never called. Since AP6 fills these
+// entries MACHINE-side (`Program::setResolveLibraryAdditionsByTarget`, one
+// artifact per target), a mis-ARCHED artifact is precisely the machine mistake
+// that must be caught on the first TU compiled rather than on whichever one
+// later happens to call into it.
+TEST(FfiResolveLibraryWrongArchitecture,
+     WrongArchitectureIsRefusedEvenWithNoExternsAtAll) {
+    ScratchDir scratch{Location::InsideRepo, "ffi-wrong-arch-noextern"};
+    auto const dir = scratch.path();
+    auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
+    DiagnosticReporter libRep;
+    ASSERT_EQ(buildOne(dir / "arm64", {}, libSrc.string(), kElfArm64Dyn, libRep),
+              0);
+    auto const armLib = dir / "arm64" / "dsslib.so";
+
+    auto const mainSrc = writeSrc(dir, "noextern.c", kNoExternSrc);
+    DiagnosticReporter rep;
+    int const rc = buildOne(dir / "out-noextern", {armLib}, mainSrc.string(),
+                            kElfExec, rep);
+    EXPECT_NE(rc, 0)
+        << "a --resolve-library entry of the wrong architecture must fail the "
+           "build whether or not this TU references anything in it";
+    ASSERT_GE(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 1u);
+    auto const msg =
+        messageForCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat);
+    EXPECT_NE(msg.find("e_machine 0xB7 (183)"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("e_machine 0x3E (62)"), std::string::npos) << msg;
+
+    // The matched pairing of the same shape stays green -- the unconditional
+    // probe must not turn every extern-free TU into a build failure.
+    DiagnosticReporter okRep;
+    EXPECT_EQ(buildOne(dir / "out-noextern-ok", {armLib}, mainSrc.string(),
+                       kElfArm64Exec, okRep), 0)
+        << (okRep.all().empty() ? "" : okRep.all().front().actual);
+}
+
+// == THE MERGED PARTITIONS: AN ARCHIVE AND A RELOCATABLE OBJECT ============
+//
+// ★★★ WHY THESE EXIST AS THEIR OWN GROUP, AND WHAT THEY REPLACE. The first
+// rendition of this suite asserted only that a MATCHED `ar` archive still
+// linked clean, under the name `ArArchivesDelegateRatherThanBeingArch-
+// Checked`, on the reasoning that "an `ar` CONTAINER declares no architecture
+// (its MEMBERS do, and they are checked where their bytes are in hand)".
+//
+// ⚠ THE SECOND HALF OF THAT SENTENCE WAS FALSE, ON BOTH AXES, and the arm was
+// structurally unable to see it: it asserted only the matched case, so the
+// unmatched one was never built. `partitionResolveLibraries`
+// (program/compile_pipeline.cpp) removes `ar` archives and relocatable objects
+// from `resolveLibraries` BEFORE the per-CU build, so the eager probe in step
+// 2.5-pre -- the only tier that compared anything against the target -- never
+// saw either of them, and nothing downstream compared them either
+// (`elf_backend` states that `e_machine` IS DELIBERATELY NOT CHECKED,
+// `macho_backend` says the same for `cputype`, `elf_object_reader` has no
+// machine comparison at all).
+//
+// ✔MEASURED at the cycle base, shipped CLI, a TU with NO externs so no member
+// is ever pulled:
+//   x86_64 `.a`  -> arm64:elf64-aarch64-linux-exec   rc=0, ZERO diagnostics,
+//                   aarch64 artefact emitted (e_machine 183)
+//   arm64  `.a`  -> x86_64:elf64-x86_64-linux-exec   rc=0, ZERO diagnostics
+//   x86_64 `.o`  -> arm64:elf64-aarch64-linux-exec   rc=0, ZERO diagnostics
+//   PE `.lib`    -> x86_64:elf64-x86_64-linux-exec   rc=0, ZERO diagnostics
+// With an extern that DOES pull a member the build fails -- on
+// `K_UnwindRuleUnrepresentable` naming register 'x16', a DWARF CFI complaint
+// that happens to fire. That is not an architecture check and it tells the
+// operator nothing they can act on.
+//
+// The remedy is the SAME chokepoint, fed from the site that owns the
+// partition (`compileOneTarget` in program/program.cpp), never a second guard:
+// `ffi::checkMergedLibraryInputsMatchTargetFormat` puts both merged lists
+// through `ffi::checkLibraryMatchesTargetFormat`, which walks an archive's
+// members and compares each with the same two clauses a standalone file gets.
+//
+// -- RED-ON-DISABLE (see the lane report) ----------------------------------
+// Delete the `checkMergedLibraryInputsMatchTargetFormat` call in
+// `compileOneTarget` and every negative arm below builds CLEAN (rc 0) with
+// zero `F_UnsupportedBinaryFormat`, which is the state measured at the base.
+
+// -- (5) THE ARCHIVE, BOTH DIRECTIONS, ON THE ARCHITECTURE AXIS ------------
+//
+// The member is named in the linker's own `archive(member)` notation, so the
+// assertion on that spelling is what proves the walk reached a MEMBER rather
+// than guessing from the container's global magic.
+TEST(FfiResolveLibraryWrongArchitecture,
+     ArArchiveMembersAreArchCheckedInBothDirections) {
+    ScratchDir scratch{Location::InsideRepo, "ffi-wrong-arch-ar"};
+    auto const dir  = scratch.path();
+    auto const libs = buildCrossArchLibraries(dir, kElfX86Staticlib,
+                                              kElfArm64Staticlib, "dsslib.a");
+    ASSERT_TRUE(isArArchiveFile(libs.x86))
+        << "precondition: the fixture must really be an ar container, or this "
+           "arm is exercising the wrong dispatch";
+    ASSERT_TRUE(isArArchiveFile(libs.arm64));
+
+    // A TU with NO externs: nothing pulls a member, which is exactly the shape
+    // that was silent. A pin written with an extern would have been satisfied
+    // by the DWARF accident instead of by this guard.
+    auto const mainSrc = writeSrc(dir, "noextern.c", kNoExternSrc);
+
+    DiagnosticReporter intoArm;
+    EXPECT_NE(buildOne(dir / "out-x86-into-arm", {libs.x86}, mainSrc.string(),
+                       kElfArm64Exec, intoArm), 0)
+        << "an x86_64 static archive cannot be merged into an aarch64 image";
+    ASSERT_GE(countCode(intoArm, DiagnosticCode::F_UnsupportedBinaryFormat), 1u);
+    auto const intoArmMsg =
+        messageForCode(intoArm, DiagnosticCode::F_UnsupportedBinaryFormat);
+    EXPECT_NE(intoArmMsg.find("dsslib.a(dsslib.o)"), std::string::npos)
+        << "the refusal must name the MEMBER, in the linker's own notation: "
+        << intoArmMsg;
+    EXPECT_NE(intoArmMsg.find("e_machine 0x3E (62)"), std::string::npos)
+        << intoArmMsg;
+    EXPECT_NE(intoArmMsg.find("e_machine 0xB7 (183)"), std::string::npos)
+        << intoArmMsg;
+
+    DiagnosticReporter intoX86;
+    EXPECT_NE(buildOne(dir / "out-arm-into-x86", {libs.arm64}, mainSrc.string(),
+                       kElfExec, intoX86), 0)
+        << "and the mirror direction, so the pin cannot pass on one ordering";
+    ASSERT_GE(countCode(intoX86, DiagnosticCode::F_UnsupportedBinaryFormat), 1u);
+
+    // -- THE CONTROLS. Both matched pairings must still link clean; without
+    // them "everything is refused now" would read identically to this pin.
+    DiagnosticReporter okX86;
+    EXPECT_EQ(buildOne(dir / "out-x86-ok", {libs.x86}, mainSrc.string(),
+                       kElfExec, okX86), 0)
+        << (okX86.all().empty() ? "" : okX86.all().front().actual);
+    EXPECT_EQ(countCode(okX86, DiagnosticCode::F_UnsupportedBinaryFormat), 0u);
+    DiagnosticReporter okArm;
+    EXPECT_EQ(buildOne(dir / "out-arm-ok", {libs.arm64}, mainSrc.string(),
+                       kElfArm64Exec, okArm), 0)
+        << (okArm.all().empty() ? "" : okArm.all().front().actual);
+    EXPECT_EQ(countCode(okArm, DiagnosticCode::F_UnsupportedBinaryFormat), 0u);
+}
+
+// -- (6) THE OTHER MERGED PARTITION: A RELOCATABLE OBJECT ------------------
+//
+// `partitionResolveLibraries` has THREE arms and the archive is only one of
+// them. A relocatable object named on `--resolve-library` is merged as an
+// object input, on a different list, and was silent for the same reason.
+TEST(FfiResolveLibraryWrongArchitecture,
+     RelocatableObjectInputsAreArchCheckedInBothDirections) {
+    ScratchDir scratch{Location::InsideRepo, "ffi-wrong-arch-obj"};
+    auto const dir  = scratch.path();
+    auto const libs = buildCrossArchLibraries(dir, kElfX86Object,
+                                              kElfArm64Object, "dsslib.o");
+    auto const mainSrc = writeSrc(dir, "noextern.c", kNoExternSrc);
+
+    DiagnosticReporter intoArm;
+    EXPECT_NE(buildOne(dir / "out-x86-into-arm", {libs.x86}, mainSrc.string(),
+                       kElfArm64Exec, intoArm), 0)
+        << "an x86_64 relocatable object cannot be merged into an aarch64 image";
+    ASSERT_GE(countCode(intoArm, DiagnosticCode::F_UnsupportedBinaryFormat), 1u);
+    auto const msg =
+        messageForCode(intoArm, DiagnosticCode::F_UnsupportedBinaryFormat);
+    EXPECT_NE(msg.find("e_machine 0x3E (62)"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("e_machine 0xB7 (183)"), std::string::npos) << msg;
+    EXPECT_EQ(msg.find("archive member"), std::string::npos)
+        << "an object input is not an archive member and must not be described "
+           "as one: " << msg;
+
+    DiagnosticReporter intoX86;
+    EXPECT_NE(buildOne(dir / "out-arm-into-x86", {libs.arm64}, mainSrc.string(),
+                       kElfExec, intoX86), 0);
+    ASSERT_GE(countCode(intoX86, DiagnosticCode::F_UnsupportedBinaryFormat), 1u);
+
+    DiagnosticReporter okX86;
+    EXPECT_EQ(buildOne(dir / "out-x86-ok", {libs.x86}, mainSrc.string(),
+                       kElfExec, okX86), 0)
+        << (okX86.all().empty() ? "" : okX86.all().front().actual);
+    DiagnosticReporter okArm;
+    EXPECT_EQ(buildOne(dir / "out-arm-ok", {libs.arm64}, mainSrc.string(),
+                       kElfArm64Exec, okArm), 0)
+        << (okArm.all().empty() ? "" : okArm.all().front().actual);
+}
+
+// -- (7) THE MACH-O ARCHIVE PAIR ------------------------------------------
+//
+// Mach-O is the second format shipping documents for two architectures, and it
+// locates its architecture in a DIFFERENT field at a DIFFERENT offset. Without
+// this arm, an ELF-only rendition of the member walk would pass.
+TEST(FfiResolveLibraryWrongArchitecture,
+     MachOArchiveMembersAreArchCheckedInBothDirections) {
+    ScratchDir scratch{Location::InsideRepo, "ffi-wrong-arch-macho-ar"};
+    auto const dir  = scratch.path();
+    auto const libs = buildCrossArchLibraries(dir, kMachoX86Staticlib,
+                                              kMachoArm64Staticlib, "dsslib.a");
+    auto const mainSrc = writeSrc(dir, "noextern.c", kNoExternSrc);
+
+    DiagnosticReporter intoArm;
+    EXPECT_NE(buildOne(dir / "out-x86-into-arm", {libs.x86}, mainSrc.string(),
+                       kMachoArm64Exec, intoArm), 0);
+    ASSERT_GE(countCode(intoArm, DiagnosticCode::F_UnsupportedBinaryFormat), 1u);
+    auto const msg =
+        messageForCode(intoArm, DiagnosticCode::F_UnsupportedBinaryFormat);
+    EXPECT_NE(msg.find("cputype"), std::string::npos)
+        << "Mach-O names its own field, never ELF's: " << msg;
+    EXPECT_NE(msg.find("dsslib.a(dsslib.o)"), std::string::npos) << msg;
+
+    DiagnosticReporter intoX86;
+    EXPECT_NE(buildOne(dir / "out-arm-into-x86", {libs.arm64}, mainSrc.string(),
+                       kMachoX86Exec, intoX86), 0);
+    ASSERT_GE(countCode(intoX86, DiagnosticCode::F_UnsupportedBinaryFormat), 1u);
+
+    DiagnosticReporter okArm;
+    EXPECT_EQ(buildOne(dir / "out-arm-ok", {libs.arm64}, mainSrc.string(),
+                       kMachoArm64Exec, okArm), 0)
+        << (okArm.all().empty() ? "" : okArm.all().front().actual);
+}
+
+// -- (8) THE FORMAT AXIS THROUGH A CONTAINER WHOSE MEMBERS HAVE NO MAGIC ---
+//
+// ★ THE CASE THE PER-MEMBER COMPARISON CANNOT REACH, and the reason the
+// archive arm asks the FORMAT as well. A COFF relocatable object has no magic
+// -- its header opens with `Machine` -- so `ffi::guessFormat` classifies a PE
+// `.lib`'s members `Unknown` and the comparison correctly declines to guess.
+// ✔MEASURED at the cycle base: a PE `.lib` handed to an ELF build produced
+// rc=0 with ZERO diagnostics on BOTH ELF architectures. The answer comes from
+// `ObjectFormatSchema::looksLikeRelocatableObject` -- "an object THIS document
+// could have written", which is the only place that fact is declared.
+//
+// The `.dll` CONTROL is what makes this a statement about containers rather
+// than about PE: the same code, built as a dynamic library, has an `MZ` header
+// and was already refused by the per-file clause.
+TEST(FfiResolveLibraryWrongFormat, PeArchiveIntoAnElfBuildIsRefused) {
+    ScratchDir scratch{Location::InsideRepo, "ffi-wrong-format-pe-ar"};
+    auto const dir = scratch.path();
+    auto const libSrc = writeSrc(dir, "dsslib.c", kLibSrc);
+    DiagnosticReporter libRep;
+    ASSERT_EQ(buildOne(dir / "pe", {}, libSrc.string(), kPeStaticlib, libRep), 0)
+        << (libRep.all().empty() ? "" : libRep.all().front().actual);
+    auto const peArchive = dir / "pe" / "dsslib.lib";
+    ASSERT_TRUE(isArArchiveFile(peArchive))
+        << "precondition: a COFF .lib really is an `ar` container";
+
+    auto const mainSrc = writeSrc(dir, "noextern.c", kNoExternSrc);
+    DiagnosticReporter rep;
+    EXPECT_NE(buildOne(dir / "out", {peArchive}, mainSrc.string(), kElfExec,
+                       rep), 0)
+        << "a COFF archive cannot be merged into an ELF image";
+    ASSERT_GE(countCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat), 1u);
+    auto const msg =
+        messageForCode(rep, DiagnosticCode::F_UnsupportedBinaryFormat);
+    EXPECT_NE(msg.find("not one of this archive's"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("dsslib.obj"), std::string::npos)
+        << "the refusal names a member so the operator can check it: " << msg;
+
+    // CONTROL A: the matched PE pairing must still link.
+    DiagnosticReporter okRep;
+    EXPECT_EQ(buildOne(dir / "out-ok", {peArchive}, mainSrc.string(), kPeExec,
+                       okRep), 0)
+        << (okRep.all().empty() ? "" : okRep.all().front().actual);
+    EXPECT_EQ(countCode(okRep, DiagnosticCode::F_UnsupportedBinaryFormat), 0u);
+
+    // CONTROL B: an EMPTY archive claims nothing and must NOT be refused --
+    // the guard says "not one member is ours", and zero members make no such
+    // claim. Without this the arm would be satisfied by a blanket reject.
+    auto const emptyArchive = dir / "empty.a";
+    {
+        std::ofstream out(emptyArchive, std::ios::binary);
+        out << "!<arch>\n";
+    }
+    ASSERT_TRUE(isArArchiveFile(emptyArchive));
+    DiagnosticReporter emptyRep;
+    EXPECT_EQ(buildOne(dir / "out-empty", {emptyArchive}, mainSrc.string(),
+                       kElfExec, emptyRep), 0)
+        << "an empty archive is legal and contributes nothing to refuse"
+        << (emptyRep.all().empty() ? "" : "\n" + emptyRep.all().front().actual);
+    EXPECT_EQ(countCode(emptyRep, DiagnosticCode::F_UnsupportedBinaryFormat),
+              0u);
 }

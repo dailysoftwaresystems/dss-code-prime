@@ -72,6 +72,7 @@ import platform
 import re
 import shlex
 import shutil
+import stat
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1473,6 +1474,14 @@ def confound_scope_run_modes(scope):
 # measurement adds a verb here — a vocabulary extension, exactly like
 # RUN_FILESYSTEMS / PATH_TRANSLATIONS / ENV_TRANSFERS — and the lint then refuses
 # any registry entry naming a verb this table does not have.
+# ★ THE ANCHOR AS A NAMED CONSTANT, so a diagnostic can cite it without a
+# message ever wrapping it. A wrapped id does not fail: it READS as a citation,
+# no grep for the whole id returns it, and neither anchor guard can count it —
+# which is why `wrapped_anchor_ids_guard` exists and why its ceiling only ever
+# comes DOWN.
+# ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+ANCHOR_RUN_DIR_PRECONDITION = (
+    "D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION")
 PROBE_VERDICTS = ("present", "absent", "indeterminate")
 
 
@@ -1798,6 +1807,315 @@ def probe_verb(name):
             "verdict already says out loud)."
             % (name, ", ".join(sorted(ENVIRONMENT_PROBE_VERBS))))
     return spec
+
+
+# ── THE SECOND REGISTRY: A PRECONDITION OF *THIS LEG'S RUN DIRECTORY* ───────
+#
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+#
+# ★★★ IT IS A SECOND REGISTRY BECAUSE THE FIRST ONE STRUCTURALLY CANNOT ASK THIS
+# QUESTION, AND THE REASON IS TIMING, NOT VOCABULARY. An `environmentProbes`
+# verdict is filed PER KERNEL, sampled ONCE, BEFORE any leg is built, by a
+# `--probe-environment` that takes no leg and no directory — that shape is
+# deliberate and it is what makes ONE 20 s clock sample serve both ELF legs. A
+# precondition of the RUN DIRECTORY is the opposite shape on every axis: it is a
+# per-leg, POST-PLAN fact, because `runFilesystem` plus the driver's chosen run
+# directory are what decide which filesystem is even being asked about. Folding
+# the two into one registry would put two incompatible timings behind one key,
+# and nothing reading that key could tell which of them it was holding.
+#
+# ★★ WHAT THIS BUYS, AND IT IS THE `matches: build-tu` PROPERTY ONE NAME SPACE
+# OVER: A ROW ALONE EXCUSES NOTHING. A `build-tu` row names WHICH translation
+# unit and the run's own reference oracle says WHETHER; a row here names WHICH
+# precondition and the run's own measurement of its own run directory says
+# WHETHER. A row whose precondition measures ABSENT is reported UNCORROBORATED
+# and excuses nothing — which is also how a row that has outlived its host
+# announces itself instead of rotting into furniture.
+#
+# ⛔ AND IT IS WHY `requires: []` WAS REFUSED FOR THE ROW THAT PRODUCED THIS.
+# `requires: []` is the claim "this excusal depends on nothing this harness can
+# measure". For `vtabH-3.1` that claim is FALSE: the excusal depends on which
+# entries sit at the root of the run drive, which this harness can measure and
+# now does. On a host with a clean root the row must DECLINE, so a genuine dss
+# regression reddening that name still lands on dss.
+#
+# ⚠ THE ERROR ASYMMETRY IS THE SAME ONE `$environmentProbesComment` states, and
+# every path here is biased toward ABSENT. A false ABSENT un-excuses an
+# environment failure: noisy, investigated, safe. A false PRESENT silently
+# excuses a real miscompile. So an entry that cannot be read, a directory that
+# does not exist, a kernel that cannot be entered — every one of them is ABSENT
+# or INDETERMINATE, never PRESENT, and INDETERMINATE is honoured as ABSENT by the
+# same probe_verdict_honours the first registry uses.
+def _measure_run_dir_root_listing_filter(run_dir):
+    """(verdict, why, evidence) for one run directory.
+
+    THE QUESTION, stated once so no reader has to re-derive it from Tcl: does the
+    ROOT of the filesystem this run directory lives on hold an entry that the
+    corpus's own root listing DROPS while `fstree` KEEPS?
+
+    ★ IT IS A PROPERTY OF THE FILESYSTEM, NOT OF THE HOST, and there is no host
+    branch in it. The root is `os.path.splitdrive` + `os.sep` — the platform's
+    own path module answering about its own paths, which is correct on a
+    drive-letter filesystem and on a single-rooted one without either being
+    named. The two attribute arms are read through `getattr(st,
+    'st_file_attributes', 0)`: a filesystem that has no such attribute simply
+    never matches that arm, and the dot-prefix arm is true everywhere.
+
+    ⓘ WHY THE DOLLAR FILTER IS APPLIED HERE TOO. `fstree` selects `path NOT GLOB
+    '*$*'` and the caller drops the same names from its expectation, so an entry
+    carrying a dollar sign is removed from BOTH sides and can never produce a
+    divergence. Counting one would make this measurement answer PRESENT on a host
+    whose only unusual root entries are `$Recycle.Bin` and `$WinREAgent` — i.e.
+    it would excuse the failure on a machine where the mechanism cannot fire.
+
+    ⚠ WHAT THIS MEASURES AND WHAT IT DOES NOT, stated because a reader deciding
+    whether to trust an amnesty needs it before the code:
+      MEASURES — whether the divergence's PRECONDITION holds on this run's own
+                 run directory, on this run, at classification time.
+      DOES NOT — constrain the failure's own TEXT the way `abortDiagnostic`
+                 does. The unit ledger both drivers keep carries failing test
+                 NAMES and not their expected/got pairs, so there is nothing to
+                 constrain against without a second capture in two drivers. The
+                 boundary is narrow in practice and it is named rather than
+                 implied: where this precondition holds, `vtabH-3.1` compares a
+                 filtered list against an unfiltered one and cannot pass under
+                 ANY compiler, so the name carries no signal about dss to lose."""
+    absolute = os.path.abspath(run_dir or "")
+    drive, _rest = os.path.splitdrive(absolute)
+    root = (drive + os.sep) if drive else os.sep
+    if not run_dir:
+        return ("indeterminate",
+                "no run directory was supplied, so there is no filesystem to "
+                "ask about; honoured as ABSENT", {"root": ""})
+    if not os.path.isdir(absolute):
+        return ("indeterminate",
+                "the run directory %s does not exist, so the filesystem it "
+                "would live on is not established; honoured as ABSENT"
+                % absolute, {"root": root, "runDirectory": absolute})
+    try:
+        names = sorted(os.listdir(root))
+    except OSError as exc:                                       # noqa: BLE001
+        return ("indeterminate",
+                "the root %s could not be listed (%s: %s); honoured as ABSENT"
+                % (root, type(exc).__name__, exc), {"root": root})
+    dropped, unreadable = [], []
+    for name in names:
+        # Removed from BOTH sides by the dollar filter -> never a divergence.
+        if "$" in name:
+            continue
+        if name.startswith("."):
+            dropped.append(name)
+            continue
+        try:
+            attrs = getattr(
+                os.stat(os.path.join(root, name), follow_symlinks=False),
+                "st_file_attributes", 0)
+        except OSError as exc:                                   # noqa: BLE001
+            # Biased toward ABSENT: an entry we could not classify is NOT counted
+            # as a divergence source, and the fact that it existed is reported.
+            unreadable.append("%s (%s)" % (name, type(exc).__name__))
+            continue
+        if attrs & (stat.FILE_ATTRIBUTE_HIDDEN | stat.FILE_ATTRIBUTE_SYSTEM):
+            dropped.append(name)
+    evidence = {"root": root, "runDirectory": absolute,
+                "entriesAtRoot": len(names), "dropped": dropped,
+                "unreadable": unreadable}
+    if not dropped:
+        return ("absent",
+                "%d entry/entries at %s and NONE of them is dot-prefixed, hidden "
+                "or system without a dollar sign, so the corpus's own root "
+                "listing and `fstree` enumerate the same set here%s"
+                % (len(names), root,
+                   "" if not unreadable else
+                   " (%d entry/entries could not be classified and were NOT "
+                   "counted: %s)" % (len(unreadable), ", ".join(unreadable))),
+                evidence)
+    return ("present",
+            "%d of %d entry/entries at %s are dropped by the corpus's own root "
+            "listing (dot-prefixed, hidden or system) and kept by `fstree` "
+            "(no dollar sign): %s%s"
+            % (len(dropped), len(names), root, ", ".join(dropped),
+               "" if not unreadable else
+               "; %d further entry/entries could not be classified and were NOT "
+               "counted: %s" % (len(unreadable), ", ".join(unreadable))),
+            evidence)
+
+
+# ★ THE ENGINE HAS NO PRECONDITION-NAME BRANCH, exactly as ENVIRONMENT_PROBE_VERBS
+# has no probe-name branch: a registry entry names a VERB, the engine looks the
+# verb up here and calls its `measure`. A second precondition of the same KIND
+# needs no code; a new KIND of measurement adds a verb here.
+# ⛔ AND THIS VERB TAKES NO `config`, DELIBERATELY. Its filter mirrors an upstream
+# test's own filter, so a config that could widen it is a guard that gets re-cut
+# to fit whatever case is in front of it — the cost this project has already paid
+# twice (D-TEST-PE64-CONFOUND-PIN-WEAKENED-BY-ITS-OWN-SUBJECT). Changing what is
+# measured here is a code change with a red-on-disable arm, never a catalogue
+# edit.
+RUN_DIRECTORY_PRECONDITION_VERBS = {
+    "root-entry-dropped-by-listing-filter": {
+        "measure": _measure_run_dir_root_listing_filter,
+        "asks": "does the ROOT of the filesystem this leg's run directory lives "
+                "on hold an entry that is dot-prefixed, hidden or system and "
+                "carries no dollar sign — i.e. one the corpus's own root listing "
+                "DROPS while `fstree` KEEPS?",
+    },
+}
+
+
+def run_directory_preconditions(catalogue_doc):
+    """The declared second registry, or {} — and `{}` is legal for the same
+    reason `environmentProbes` may be empty: a catalogue in which no row is
+    conditional on its run directory needs none. A row naming an entry this
+    registry does not declare is refused by the lint, so an empty registry cannot
+    silently disable a gate."""
+    got = catalogue_doc.get("runDirectoryPreconditions", {})
+    if not isinstance(got, dict):
+        raise LegError("`runDirectoryPreconditions` must be an object, got %r"
+                       % type(got).__name__)
+    return got
+
+
+def run_directory_precondition_verb(name):
+    """The declared verb's spec, or a LegError — never a permissive default, for
+    the same reason probe_verb() has none."""
+    spec = RUN_DIRECTORY_PRECONDITION_VERBS.get(name)
+    if spec is None:
+        raise LegError(
+            "unknown run-directory precondition verb %r (known: %s). A verb IS "
+            "the measured procedure; there is no default, because the only "
+            "candidates for one are 'assume the precondition holds' (which "
+            "excuses real compiler defects) and 'assume it does not' (which is "
+            "what an ABSENT verdict already says out loud)."
+            % (name, ", ".join(sorted(RUN_DIRECTORY_PRECONDITION_VERBS))))
+    return spec
+
+
+def row_run_directory_requirements(row):
+    """One confound row's run-directory requirements, defaulted to [] and CHECKED.
+
+    ⓘ WHY THIS ONE IS DEFAULTED WHILE `requires` IS MANDATORY, asked and answered
+    rather than copied: `requires` is mandatory because it is the FIRST and only
+    place a row author is made to state whether the excusal is conditional at all,
+    and `scope: any` is what a missing answer used to mean. That question is now
+    asked once, on every row, and cannot be skipped. This field is a SECOND axis
+    of the same already-compulsory question, so making it mandatory would add 29
+    lines of `[]` to the catalogue and buy a second prompt for a question the
+    author has already answered. What it does buy is checked instead: the lint
+    refuses a name this catalogue does not declare, refuses a registry entry no
+    row requires (dead config reads as coverage), and refuses a row that declares
+    BOTH axes at once — a combination whose honouring rule nobody has written."""
+    got = row.get("requiresRunDirectory", [])
+    if not isinstance(got, list):
+        raise LegError(
+            "confound %r declares `requiresRunDirectory` %r — it must be a LIST "
+            "of names declared in `runDirectoryPreconditions`, and the ordinary "
+            "answer is to omit it. A scalar cannot be gated on."
+            % (row.get("pattern"), got))
+    return list(got)
+
+
+def leg_run_directory_requirements(leg):
+    """Every run-directory precondition any row on this leg requires, sorted.
+
+    `[]` is the ordinary answer and it is what makes the gating `not-required`,
+    which is the ONLY value besides `measured` a driver will run a corpus on."""
+    names = set()
+    for row in leg.get("confounds", []):
+        names.update(row_run_directory_requirements(row))
+    return sorted(names)
+
+
+RUN_DIR_GATINGS = ("not-required", "unmeasured", "measured")
+RUN_DIR_GATE_KEYS = ("gating", "needed", "verdicts", "runDirectory")
+
+
+def run_directory_gate(leg, verdicts=None, run_dir=""):
+    """What a leg's rows may be gated on, and whether anything measured it.
+
+    Three gatings, and a driver accepts exactly two of them:
+      `not-required`  no row on this leg names a precondition. Nothing to
+                      measure; the supply is what the plan already said.
+      `unmeasured`    rows DO name one and no measurement was handed in. Every
+                      such row is INACTIVE — fail-safe, and NOT fit to run on,
+                      for the same reason `confoundGating: unprobed` is not: the
+                      withheld excusals surface as GENUINE reds that read as
+                      compiler regressions. Both drivers REFUSE it, which is what
+                      makes a driver that forgot to corroborate fail LOUD instead
+                      of quietly under-excusing.
+      `measured`      this run measured its own run directory, per leg."""
+    needed = leg_run_directory_requirements(leg)
+    if not needed:
+        gating = "not-required"
+    elif verdicts is None:
+        gating = "unmeasured"
+    else:
+        gating = "measured"
+    return {"gating": gating, "needed": needed,
+            "verdicts": None if verdicts is None else dict(verdicts),
+            "runDirectory": run_dir}
+
+
+def _checked_run_dir_gate(gate, who):
+    """The one place a consumer asserts it was handed a GATE and not a raw
+    verdict map — the twin of _checked_probe_gate, and named `who` for the same
+    reason: the refusal has to say which consumer was miscalled."""
+    if gate is None:
+        return None
+    if not isinstance(gate, dict) or any(k not in gate for k in RUN_DIR_GATE_KEYS):
+        raise LegError(
+            "%s was handed %r instead of the object run_directory_gate() returns "
+            "(fields: %s). A consumer reading a raw verdict map would honour a "
+            "row without knowing whether anything measured it. [%s]"
+            % (who, sorted(gate) if isinstance(gate, dict) else
+               type(gate).__name__, ", ".join(RUN_DIR_GATE_KEYS),
+               ANCHOR_RUN_DIR_PRECONDITION))
+    if gate["gating"] not in RUN_DIR_GATINGS:
+        raise LegError(
+            "%s was handed run-directory gating %r (known: %s)."
+            % (who, gate["gating"], ", ".join(RUN_DIR_GATINGS)))
+    return gate
+
+
+def measure_run_directory_preconditions(catalogue_doc, names, run_dir):
+    """{name: {verdict, why, verb, evidence, anchor}} — THIS filesystem
+    answering, in the process that is on it.
+
+    ⚠ THE CALLER OWNS "WHICH PROCESS". This function measures the directory it is
+    given with the tools of the interpreter it is running in, and that is correct
+    ONLY where the two are on the same filesystem. `corroborate_run_directory`
+    is what decides that, from the leg's declared `runFilesystem`, and re-enters
+    another kernel through the SAME `kernelEntryArgv` an environment probe uses
+    when they differ."""
+    registry = run_directory_preconditions(catalogue_doc)
+    out = {}
+    for name in sorted(names):
+        spec = registry.get(name)
+        if spec is None:
+            raise LegError(
+                "run-directory precondition %r is not declared by this "
+                "catalogue (declared: %s). An undeclared precondition cannot be "
+                "measured, so the row naming it would be honoured on nothing."
+                % (name, ", ".join(sorted(registry)) or "<none>"))
+        verb = spec.get("verb", "")
+        impl = run_directory_precondition_verb(verb)
+        try:
+            verdict, why, evidence = impl["measure"](run_dir)
+        except LegError:
+            raise
+        except Exception as exc:                             # noqa: BLE001
+            verdict, why, evidence = ("indeterminate",
+                                      "precondition verb '%s' raised %s: %s"
+                                      % (verb, type(exc).__name__, exc), {})
+        if verdict not in PROBE_VERDICTS:
+            raise LegError(
+                "run-directory precondition '%s' (verb '%s') answered %r, which "
+                "is not one of %s. A precondition that invents a verdict cannot "
+                "be gated on." % (name, verb, verdict, ", ".join(PROBE_VERDICTS)))
+        out[name] = {"verdict": verdict, "why": why, "verb": verb,
+                     "evidence": evidence, "anchor": spec.get("anchor", ""),
+                     "source": PROBE_SOURCE_MEASURED}
+    return out
 
 
 # ── WHERE A VERDICT CAME FROM ───────────────────────────────────────────────
@@ -2420,7 +2738,12 @@ def kernel_probe_argv(fs_verb, script, catalogue, only, translator=None):
 # Popen, twin-parity self-test infrastructure), `dss_supports_import_name`
 # (already bounded at 60 s, and it decodes bytes itself) and the
 # `--build-reference-oracle` compile (bounded by nothing on purpose: it builds
-# a whole reference fixture). None of those runs during `--plan`, so none can
+# a whole reference fixture) and `corroborate_run_directory` (the per-leg
+# run-directory measurement, which enters a foreign filesystem's kernel
+# through the SAME door and takes RESOLVER_SPAWN_BUDGET_SECONDS, since it
+# samples nothing and only lists one directory
+# [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]).
+# None of those runs during `--plan`, so none can
 # hang it; a claim here that this were the only spawn would be false.
 #
 # ⚠ (1) A DEADLINE IS COMPULSORY. There is no unbounded call to make by accident:
@@ -2910,9 +3233,68 @@ def _checked_probe_gate(gate, who):
     return gate
 
 
-def leg_confound_decisions(leg, gate):
+def run_directory_row_verdict(label, pattern, rd_requires, rd_gate):
+    """(active, reason) for ONE row against the run-directory gate — the ONE
+    owner of that decision.
+
+    ★ EXTRACTED RATHER THAN INLINED, and the reason is this project's own
+    canonical bug one axis along: `leg_confound_decisions` decides it for the
+    plan and `corroborate_run_directory` decides it for the run, and two copies
+    of "is this row corroborated" would be exactly
+    D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG with a new subject.
+
+    ⚠ A MISSING VERDICT RAISES; IT IS NEVER READ AS ABSENT. "The measurement did
+    not reach this resolution" is a transport defect, and the two ways of
+    guessing are 'present' (excuses a real miscompile in silence) and 'absent'
+    (which is what an unmeasured gate already says, in words, on its own
+    branch).
+    [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+    """
+    rd_gate = _checked_run_dir_gate(rd_gate, "run_directory_row_verdict")
+    if rd_gate is None or rd_gate["verdicts"] is None:
+        return (False,
+                "requires run-directory precondition(s) %s, and NOTHING MEASURED "
+                "this run's own run directory for this resolution. A "
+                "corroborated row is never honoured on an unmeasured directory: "
+                "it excuses nothing here and a failure matching it is reported "
+                "as GENUINE." % ", ".join(rd_requires))
+    blocking, holding = [], []
+    for nm in rd_requires:
+        got = rd_gate["verdicts"].get(nm)
+        if got is None:
+            raise LegError(
+                "leg '%s': confound %r requires run-directory precondition '%s', "
+                "and this run carries NO verdict for it. That is a transport "
+                "defect between the measurement and this resolution, not a "
+                "directory without the precondition — and guessing either way is "
+                "the whole hazard: guess 'present' and a real miscompile is "
+                "excused in silence." % (label, pattern, nm))
+        said = "%s: %s (%s)" % (nm, got["verdict"], got.get("why", ""))
+        (holding if probe_verdict_honours(got["verdict"]) else
+         blocking).append(said)
+    where = rd_gate["runDirectory"] or "<unstated>"
+    if blocking:
+        return (False,
+                "UNCORROBORATED on this run's own run directory (%s): %s. The "
+                "row excuses NOTHING here and a failure matching this pattern "
+                "will be reported as GENUINE." % (where, "; ".join(blocking)))
+    return (True,
+            "CORROBORATED by this run's own measurement of its run directory "
+            "(%s): %s. The row alone excuses nothing; this run re-earned it."
+            % (where, "; ".join(holding)))
+
+
+def leg_confound_decisions(leg, gate, rd_gate=None):
     """[{pattern, wire, active, reason, requires, scope}] — every declared row,
     WITH ITS VERDICT, in declaration order.
+
+    `rd_gate` is what run_directory_gate() returned for THIS LEG, or None. None
+    and gating `unmeasured` mean the SAME thing and take the SAME branch — no
+    measurement of this run's own run directory reached this resolution — so
+    every row that names a precondition is INACTIVE. That is the fail-safe
+    direction and it is deliberately the DEFAULT, because a caller that forgot
+    to measure must under-excuse (noisy) and never over-excuse (silent).
+    [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
 
     ★ EVERY ROW APPEARS, active or not. An inactive row that vanished from this
     list would be indistinguishable from a row nobody declared, and "which rows
@@ -2933,6 +3315,7 @@ def leg_confound_decisions(leg, gate):
     filed beside that outcome has already been forced to `indeterminate`, so it
     honours nothing and the rows go INACTIVE."""
     gate = _checked_probe_gate(gate, "leg_confound_decisions")
+    rd_gate = _checked_run_dir_gate(rd_gate, "leg_confound_decisions")
     probe_verdicts = gate["verdicts"]
     label = leg.get("label", "<unlabelled>")
     if "confounds" not in leg:
@@ -2964,10 +3347,12 @@ def leg_confound_decisions(leg, gate):
                 % (scope, gate["runMode"], scope, "/".join(scope_modes),
                    "NOT IN FORCE HERE" if scoped_out else "IN FORCE here"))
 
+        rd_requires = row_run_directory_requirements(row)
+
         def _decision(active, reason, _requires=(), _pattern=pattern, _wire=wire,
                       _scope=scope, _scoped_out=scoped_out,
                       _clause=scope_clause, _matches=confound_match_kind(row),
-                      _row=row):
+                      _row=row, _rd_requires=tuple(rd_requires)):
             """One row's verdict. `active` stays the SUPPLY question — is this
             pattern handed to the matcher — and `scopedOut` is the separate,
             separately-reported question of whether the matcher can apply it on
@@ -2976,6 +3361,7 @@ def leg_confound_decisions(leg, gate):
             return {"pattern": _pattern, "wire": _wire, "scope": _scope,
                     "requires": list(_requires), "active": active,
                     "matches": _matches, "row": _row,
+                    "requiresRunDirectory": list(_rd_requires),
                     "scopedOut": _scoped_out, "reason": reason + _clause}
 
         requires = list(row.get("requires", []))
@@ -2989,6 +3375,33 @@ def leg_confound_decisions(leg, gate):
                 "a machine that has never been shown to have the defect. "
                 "[D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]"
                 % (label, pattern))
+        # ── THE RUN-DIRECTORY GATE, EVALUATED FIRST ─────────────────────────
+        # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+        # ★ FIRST, AND NOT ARBITRARILY: this is the CORROBORATOR, the thing that
+        # makes such a row excuse nothing on its own. A row that fails it is
+        # INACTIVE whatever any other axis says, so evaluating it first is what
+        # keeps the REASON a reader sees the one that actually decided the row.
+        # ⛔ AND THE TWO AXES ARE REFUSED TOGETHER *HERE*, not only in the lint.
+        # This branch returns without consulting `requires`, so a row carrying
+        # both would be honoured on the run-directory axis ALONE — the WIDER
+        # direction, decided by an omission. A rule nobody has written must fail
+        # loud, not pick the more permissive of two readings.
+        if rd_requires and requires:
+            raise LegError(
+                "leg '%s': confound %r declares BOTH `requires` (%s) and "
+                "`requiresRunDirectory` (%s). Those are two gating axes measured "
+                "at two different times — one per KERNEL before any leg is built, "
+                "one per LEG after its run directory exists — and no rule has "
+                "been written for how they compose. Write the rule before writing "
+                "the row. [%s]"
+                % (label, pattern, ", ".join(requires),
+                   ", ".join(rd_requires), ANCHOR_RUN_DIR_PRECONDITION))
+        if rd_requires:
+            rd_active, rd_reason = run_directory_row_verdict(
+                label, pattern, rd_requires, rd_gate)
+            out.append(_decision(rd_active, rd_reason))
+            continue
+
         if not requires:
             # ⚠ THE WORD "unconditional" IS RESERVED FOR A ROW THAT REALLY IS ONE.
             # A row carrying a `scope` is conditional on the RUN MODE, so saying
@@ -3053,18 +3466,18 @@ def leg_confound_decisions(leg, gate):
     return out
 
 
-def leg_confounds(leg, gate):
+def leg_confounds(leg, gate, rd_gate=None):
     """This leg's HONOURED confound patterns, in wire form (`emulated:^re`).
 
     The gate is applied HERE, once, in the one place both drivers read from — so
     a probe cannot be honoured by one driver and not the other, which is the same
     per-driver asymmetry D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG was
     about, one axis along."""
-    return [d["wire"] for d in leg_confound_decisions(leg, gate)
+    return [d["wire"] for d in leg_confound_decisions(leg, gate, rd_gate)
             if d["active"] and d["matches"] == "unit"]
 
 
-def leg_abort_confounds(leg, gate):
+def leg_abort_confounds(leg, gate, rd_gate=None):
     """This leg's HONOURED ABORT patterns, in wire form — the same ledger, read
     through the other match kind. Separate ACCESSOR, not a separate list: the
     rows live beside every other confound and are earned by the same lint.
@@ -3072,7 +3485,7 @@ def leg_abort_confounds(leg, gate):
     A UNIT matcher must never see these and an ABORT matcher must never see the
     unit rows, or a row written for one name space would silently excuse a
     failure in the other."""
-    return [d["wire"] for d in leg_confound_decisions(leg, gate)
+    return [d["wire"] for d in leg_confound_decisions(leg, gate, rd_gate)
             if d["active"] and d["matches"] == "abort-file"]
 
 
@@ -3193,7 +3606,7 @@ def classify_abort_decisions(decisions, label, abort_name, diagnostic):
                   % (label, abort_name))
 
 
-def confound_report_lines(label, decisions, gate):
+def confound_report_lines(label, decisions, gate, rd_gate=None):
     """THE LINES BOTH DRIVERS PRINT, generated ONCE here.
 
     ★★ `earnedOn` FAILED BECAUSE IT IS PROSE NOTHING READS. A probe result
@@ -3214,6 +3627,7 @@ def confound_report_lines(label, decisions, gate):
     what the probe MEASURED, whether that measurement was APPLIED to this leg, and
     whether it was MEASURED HERE at all or read from a file."""
     gate = _checked_probe_gate(gate, "confound_report_lines")
+    rd_gate = _checked_run_dir_gate(rd_gate, "confound_report_lines")
     probe_verdicts = gate["verdicts"]
     lines = []
     used = sorted({nm for d in decisions for nm in d["requires"]})
@@ -3270,6 +3684,37 @@ def confound_report_lines(label, decisions, gate):
                 "reported as GENUINE. That is the safe direction and not a clean "
                 "bill: it is the absence of a measurement, never a measurement of "
                 "absence." % (label, gate["kernel"], gate["why"]))
+    # ── THE SECOND REGISTRY'S ACCOUNT, BESIDE THE FIRST ONE'S ───────────────
+    # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+    # ★ PRINTED WHATEVER THE ANSWER IS, INCLUDING "no row needs one". A reader
+    # counting the excusal set has to be able to tell "nothing on this leg is
+    # corroborator-gated" from "something is and nobody measured it" — those are
+    # opposite facts, and an account that prints only the interesting one makes
+    # them share a silence.
+    rd_used = sorted({nm for d in decisions
+                      for nm in d.get("requiresRunDirectory", [])})
+    if not rd_used:
+        lines.append("[%s] run-directory preconditions: NONE REQUIRED - no "
+                     "declared confound row on this leg is corroborated against "
+                     "this run's own run directory" % label)
+    elif rd_gate is None or rd_gate["verdicts"] is None:
+        lines.append(
+            "[%s] run-directory preconditions: NOT MEASURED for this resolution, "
+            "so all %d corroborated row(s) are INACTIVE. That is fail-safe and "
+            "NOT fit to run a corpus on: the withheld excusals surface as GENUINE "
+            "reds that read as compiler regressions." % (label, len(rd_used)))
+    else:
+        lines.append(
+            "[%s] run-directory preconditions: measured on THIS LEG'S OWN run "
+            "directory %s, after the plan, because `runFilesystem` plus that "
+            "directory are what decide the filesystem being asked about"
+            % (label, _ascii_snippet(rd_gate["runDirectory"] or "<unstated>", 200)))
+        for nm in rd_used:
+            got = rd_gate["verdicts"].get(nm, {})
+            lines.append(
+                "[%s] run-directory precondition %s = %s   [%s: %s]"
+                % (label, nm, str(got.get("verdict", "?")).upper(),
+                   got.get("verb", "?"), _ascii_snippet(got.get("why", ""), 600)))
     active = [d for d in decisions if d["active"]]
     inactive = [d for d in decisions if not d["active"]]
     lines.append("[%s] confound rows ACTIVE (%d of %d): %s"
@@ -7495,7 +7940,15 @@ def plan_leg(leg, host_os, host_arch, available, kernel_measurements=None):
     # precisely what the decision function used not to have.
     # [D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE]
     gate = probe_gate(kernel_measurements, run)
-    decisions = leg_confound_decisions(leg, gate)
+    # ★ THE RUN-DIRECTORY GATE IS NECESSARILY UNMEASURED AT PLAN TIME, and that
+    # is the point rather than a limitation: a plan is resolved before any leg's
+    # run directory exists, so a row corroborated against one is INACTIVE here
+    # and the plan says `runDirectoryGating: unmeasured` out loud. Both drivers
+    # REFUSE that value, which is what makes a driver that forgot to corroborate
+    # stop instead of quietly under-excusing.
+    # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+    rd_gate = run_directory_gate(leg)
+    decisions = leg_confound_decisions(leg, gate, rd_gate)
 
     return {
         "label": leg["label"],
@@ -7547,7 +8000,16 @@ def plan_leg(leg, host_os, host_arch, available, kernel_measurements=None):
         "confoundRows": [dict(r) for r in leg.get("confounds", [])],
         "confoundDecisions": decisions,
         "confoundGating": gate["gating"],
-        "confoundReport": confound_report_lines(leg["label"], decisions, gate),
+        # ★ THE SECOND GATING, ITS OWN FIELD — never folded into `confoundGating`.
+        # They answer different questions, are measured at different times, and a
+        # driver's refusal has to name which of the two it is refusing.
+        # `not-required` and `measured` are the two a driver may run on;
+        # `unmeasured` is the one a plan alone can ever carry.
+        # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+        "runDirectoryRequirements": list(rd_gate["needed"]),
+        "runDirectoryGating": rd_gate["gating"],
+        "confoundReport": confound_report_lines(leg["label"], decisions, gate,
+                                                rd_gate),
         "run": run,
     }
 
@@ -7790,6 +8252,340 @@ def run_dir_plan(leg, host_os, host_arch, available, driver_run_dir):
     }
 
 
+# ── CORROBORATING A ROW AGAINST *THIS LEG'S OWN RUN DIRECTORY* ───────────
+#
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+#
+# ★★ THE SECOND HALF OF THE MECHANISM, AND IT IS A POST-PLAN CALLBACK EXACTLY
+# LIKE `--run-dir-plan`. A driver resolves the plan once, creates its run
+# directory, and then calls BACK into this resolver with (leg, run directory) —
+# which is the only moment both facts exist. The driver hands over the supply it
+# holds and takes back the supply it may use; it never decides which rows the
+# measurement withheld, for the same reason it never decides which filesystem a
+# launcher lives in.
+#
+# ⚠ AND THE SUPPLY GOES THROUGH RATHER THAN BEING RE-DERIVED, deliberately.
+# Re-resolving the whole leg here would have to re-measure the environment
+# probes (20 s per kernel, per leg) or read them from a file — and reading them
+# from a file is `--probe-verdicts`, which stamps the plan `injected` precisely
+# so no driver runs a corpus on it. Filtering the list the plan already gated is
+# the composition that adds a measurement without weakening the one beside it.
+# ⓘ A SUPPLIED PATTERN THAT MATCHES NO ROW PASSES THROUGH UNCHANGED AND IS SAID
+# SO OUT LOUD: that is the operator override (`DSS_CONFOUNDS`), which is an
+# operator stating intent for this run, not a catalogue row inheriting one.
+def run_dir_probe_argv(fs_verb, script, catalogue, run_dir, names,
+                       translator=None):
+    """The argv that measures `names` against `run_dir` IN THE KERNEL THAT
+    FILESYSTEM BELONGS TO, or [] when that kernel is this process's own.
+
+    ★ THE SAME DOOR AN ENVIRONMENT PROBE USES, and not a second one:
+    `kernelEntryArgv` / `kernelProbeInterpreter` / `kernelEntryPathTranslation`
+    are read from the SAME RUN_FILESYSTEMS entry. A launcher whose filesystem is
+    not this process's is also, by that table's own coherence rule, a launcher
+    whose kernel is not this process's — so a second entry mechanism here could
+    only ever agree or be wrong.
+
+    ⚠ `run_dir` IS ALREADY SPELLED IN THAT NAMESPACE (launcher_run_dir returned
+    it) and is therefore NOT translated. The SCRIPT and the CATALOGUE live on
+    this driver's filesystem and are."""
+    spec = run_filesystem(fs_verb)
+    entry = list(spec["kernelEntryArgv"])
+    if not entry:
+        return []
+    interp = spec["kernelProbeInterpreter"]
+    if not interp:
+        raise LegError(
+            "runFilesystem %r declares a kernelEntryArgv (%s) but no "
+            "`kernelProbeInterpreter`. Entering a kernel and having nothing "
+            "there to run this script with are two different failures, and a "
+            "verb that states one without the other cannot report either."
+            % (fs_verb, " ".join(entry)))
+    xlate = spec["kernelEntryPathTranslation"]
+    argv = entry + [interp, translate_path(xlate, script, translator),
+                    "--measure-run-dir", run_dir,
+                    "--catalogue", translate_path(xlate, catalogue, translator)]
+    for name in sorted(names):
+        argv += ["--precondition", name]
+    return argv
+
+
+def parse_run_dir_probe_output(text, catalogue_doc, names, where):
+    """The child's JSON, VALIDATED — never trusted because it parsed.
+
+    The same discipline parse_kernel_probe_output applies to a kernel's answer:
+    a name we did not ask for, a verdict outside the closed set, or a name we
+    asked for and did not get back are each a NAMED refusal here rather than a
+    KeyError three frames deeper in the thing that decides an excusal."""
+    if not (text or "").strip():
+        raise LegError("%s printed nothing" % where)
+    try:
+        got = json.loads(text)
+    except ValueError as exc:
+        raise LegError("%s did not answer with JSON (%s). First 200 bytes: %r"
+                       % (where, exc, (text or "")[:200]))
+    if not isinstance(got, dict):
+        raise LegError("%s answered with %s, not the object --measure-run-dir "
+                       "prints" % (where, type(got).__name__))
+    declared = run_directory_preconditions(catalogue_doc)
+    out = {}
+    for name in sorted(got):
+        entry = got[name]
+        if name not in declared:
+            raise LegError(
+                "%s answered for %r, which this catalogue's "
+                "`runDirectoryPreconditions` does not declare (declared: %s)."
+                % (where, name, ", ".join(sorted(declared)) or "<none>"))
+        if not isinstance(entry, dict) or "verdict" not in entry:
+            raise LegError(
+                "%s answered for '%s' with %r, not an object carrying a "
+                "`verdict`." % (where, name, entry))
+        if entry["verdict"] not in PROBE_VERDICTS:
+            raise LegError(
+                "%s answered verdict %r for '%s' (known: %s)."
+                % (where, entry["verdict"], name, ", ".join(PROBE_VERDICTS)))
+        out[name] = dict(entry)
+    missing = [n for n in names if n not in out]
+    if missing:
+        raise LegError(
+            "%s answered for %s but was asked for %s. A filesystem that skipped "
+            "a precondition has not measured it, and the absent name would "
+            "raise as a transport defect at the row that requires it."
+            % (where, ", ".join(sorted(out)) or "<nothing>", ", ".join(missing)))
+    return out
+
+
+def _indeterminate_run_dir_verdicts(catalogue_doc, names, why):
+    """The answer for a filesystem that could not be asked: one INDETERMINATE per
+    precondition, carrying the failure as its evidence.
+
+    ★ THE ENTRIES EXIST RATHER THAN BEING OMITTED, exactly as they do for an
+    unreachable kernel: a missing verdict for a required precondition is a LOUD
+    transport defect at the row and must stay one, so a filesystem we could not
+    reach files INDETERMINATE (honoured as ABSENT) instead of stopping the run."""
+    declared = run_directory_preconditions(catalogue_doc)
+    return {nm: {"verdict": "indeterminate", "why": why,
+                 "verb": declared.get(nm, {}).get("verb", ""),
+                 "evidence": {},
+                 "anchor": declared.get(nm, {}).get("anchor", ""),
+                 "source": PROBE_SOURCE_MEASURED}
+            for nm in names}
+
+
+def corroborated_supply(leg, label, supplied, supplied_abort, rd_gate):
+    """THE SUPPLY THIS RUN MAY USE, as a PURE function of the rows and the gate.
+
+    Separated from `corroborate_run_directory` because that one MEASURES a real
+    filesystem and a self-test cannot drive it deterministically on every host,
+    while this — the part that decides what the matcher is handed — is exactly
+    what a defect hid in. [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+
+    ★★ IT OWNS ITS OWN ROWS COMPLETELY; IT DOES NOT MERELY SUBTRACT. A plan is
+    resolved BEFORE any run directory exists, so it withholds EVERY corroborated
+    row (the fail-safe direction) and such a row is therefore ABSENT from
+    `supplied`. A corroborator that only subtracted could never put a re-earned
+    row back — and it printed `confound row CORROBORATED` over a supply that did
+    not contain the pattern, an ACCOUNT CONTRADICTING THE DECISION BESIDE IT,
+    which is the same defect D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST
+    records one axis along. ✔MEASURED in the P66 matrix run before the fix: the
+    pe64 leg reported `confound patterns in force (3)` on the line above
+    `confound row CORROBORATED: ^vtabH-3\\.1$`.
+
+    ⚠ THE NAME SPACES STAY SEPARATE. A re-added row goes back into the matcher
+    its `matches` kind names and nowhere else: one ledger, never one name space.
+    """
+    withheld, corroborated = [], []
+    by_wire, rd_wires = {}, set()
+    for row in leg.get("confounds", []):
+        scope = row.get("scope", "")
+        wire = (confound_scope_prefix(scope) if scope else "") + row["pattern"]
+        by_wire[wire] = row
+        rd_requires = row_run_directory_requirements(row)
+        if not rd_requires:
+            continue
+        rd_wires.add(wire)
+        active, reason = run_directory_row_verdict(label, row["pattern"],
+                                                   rd_requires, rd_gate)
+        (corroborated if active else withheld).append(
+            {"wire": wire, "reason": reason,
+             "matches": confound_match_kind(row),
+             "requiresRunDirectory": list(rd_requires)})
+    base_unit = [p for p in supplied if p not in rd_wires]
+    base_abort = [p for p in supplied_abort if p not in rd_wires]
+    # WIRES, not row objects: `readded` is one name and must have one shape,
+    # or a reader has to know which caller it came through.
+    readded = [c["wire"] for c in corroborated
+               if c["wire"] not in base_unit and c["wire"] not in base_abort]
+    return {
+        "withheld": withheld,
+        "corroborated": corroborated,
+        "readded": readded,
+        # A supplied pattern matching NO catalogue row is the OPERATOR override
+        # (DSS_CONFOUNDS): an operator stating intent for this run, never a row
+        # inheriting one. It passes through and the report says so.
+        "passthrough": [p for p in supplied if p not in by_wire],
+        "confounds": base_unit + [c["wire"] for c in corroborated
+                                  if c["matches"] == "unit"
+                                  and c["wire"] not in base_unit],
+        "abortConfounds": base_abort + [c["wire"] for c in corroborated
+                                        if c["matches"] == "abort-file"
+                                        and c["wire"] not in base_abort],
+    }
+
+
+def corroborate_run_directory(leg, host_os, host_arch, available,
+                              driver_run_dir, supplied, supplied_abort,
+                              catalogue_doc, script=None, catalogue=CATALOGUE,
+                              runner=None, translator=None):
+    """WHICH OF THE SUPPLIED PATTERNS THIS RUN'S OWN RUN DIRECTORY CORROBORATES.
+
+    Returns the object both drivers read: the measured verdicts, the surviving
+    unit and abort supplies, what was WITHHELD and why, the gating a driver must
+    check, and the report lines it prints verbatim.
+
+    ⚠ EVERY FAILURE PATH LANDS ON INDETERMINATE VERDICTS, never on a raise. A
+    filesystem this harness could not ask about must un-excuse (noisy, safe), and
+    it must not take the leg's whole account down with it — the harness has to
+    survive an environment it cannot measure."""
+    if script is None:
+        script = os.path.abspath(__file__)
+    if runner is None:
+        runner = _run_kernel_probe
+    plan = run_dir_plan(leg, host_os, host_arch, available, driver_run_dir)
+    label = plan["leg"]
+    fs_verb = plan["runFilesystem"]
+    effective = plan["launcherPath"] or plan["driverPath"]
+    needed = leg_run_directory_requirements(leg)
+    outcome, why = "", ""
+    if not needed:
+        # `not-required` is a real answer, and it is the common one. It is NOT
+        # spelled as an empty measurement: a driver has to be able to tell "no
+        # row here is corroborator-gated" from "one is and nothing measured it".
+        rd_gate = run_directory_gate(leg, verdicts=None, run_dir=effective)
+        outcome, why = ("not-required",
+                        "no confound row on this leg names a run-directory "
+                        "precondition, so nothing was measured")
+        verdicts = {}
+    else:
+        argv = []
+        try:
+            argv = run_dir_probe_argv(fs_verb, script, catalogue, effective,
+                                      needed, translator)
+        except LegError as exc:
+            verdicts = _indeterminate_run_dir_verdicts(
+                catalogue_doc, needed,
+                "the filesystem of run directory %s could not even be addressed: "
+                "%s" % (effective, exc))
+            outcome, why = "unreachable", _ascii_snippet("%s" % exc, 400)
+        else:
+            if not argv:
+                verdicts = measure_run_directory_preconditions(
+                    catalogue_doc, needed, effective)
+                outcome, why = ("in-process",
+                                "measured by THIS process, which is on that "
+                                "filesystem (runFilesystem '%s')" % fs_verb)
+            else:
+                where = ("the run-directory measurement in filesystem '%s' "
+                         "(`%s`)" % (fs_verb, " ".join(argv)))
+                try:
+                    rc, sout, serr = runner(argv,
+                                            RESOLVER_SPAWN_BUDGET_SECONDS)
+                except OSError as exc:                       # noqa: BLE001
+                    rc, sout, serr = 127, "", "%s" % exc
+                if rc != 0:
+                    said = (serr or "").strip() or (sout or "").strip()
+                    verdicts = _indeterminate_run_dir_verdicts(
+                        catalogue_doc, needed,
+                        _ascii_snippet("%s exited %s%s"
+                                       % (where, rc, (" - " + said) if said
+                                          else " and said nothing"), 400))
+                    outcome, why = "unreachable", _ascii_snippet(
+                        "%s exited %s" % (where, rc), 400)
+                else:
+                    try:
+                        verdicts = parse_run_dir_probe_output(
+                            sout, catalogue_doc, needed, where)
+                        outcome, why = ("entered",
+                                        _ascii_snippet("measured inside '%s' by "
+                                                       "`%s`" % (fs_verb,
+                                                                 " ".join(argv)),
+                                                       400))
+                    except LegError as exc:
+                        verdicts = _indeterminate_run_dir_verdicts(
+                            catalogue_doc, needed, _ascii_snippet("%s" % exc, 400))
+                        outcome, why = "unreachable", _ascii_snippet("%s" % exc,
+                                                                     400)
+        rd_gate = run_directory_gate(leg, verdicts=verdicts, run_dir=effective)
+    supply = corroborated_supply(leg, label, supplied, supplied_abort, rd_gate)
+    withheld = supply["withheld"]
+    corroborated = supply["corroborated"]
+    passthrough = supply["passthrough"]
+    readded = supply["readded"]
+    out_unit = supply["confounds"]
+    out_abort = supply["abortConfounds"]
+    lines = ["[%s] run-directory corroboration: %s - %s"
+             % (label, outcome or "<unstated>", why)]
+    lines.append("[%s] run directory measured: %s (runFilesystem '%s')"
+                 % (label, effective, fs_verb))
+    for nm in sorted(verdicts):
+        got = verdicts[nm]
+        lines.append("[%s] run-directory precondition %s = %s   [%s: %s]"
+                     % (label, nm, str(got.get("verdict", "?")).upper(),
+                        got.get("verb", "?"),
+                        _ascii_snippet(got.get("why", ""), 600)))
+    for w in withheld:
+        lines.append("[%s] confound row WITHHELD by the run-directory "
+                     "measurement: %s - %s" % (label, w["wire"], w["reason"]))
+    for w in corroborated:
+        lines.append("[%s] confound row CORROBORATED: %s - %s"
+                     % (label, w["wire"], w["reason"]))
+    # ★ AND WHAT THE SUPPLY ACTUALLY BECAME, so the account cannot claim a row was
+    # re-earned while the matcher never sees it.
+    lines.append(
+        "[%s] run-directory corroboration re-added %d row(s) the plan withheld "
+        "for want of a measurement (%s); the supply handed to the matcher is now "
+        "%d unit pattern(s) and %d abort pattern(s)"
+        % (label, len(readded),
+           " ".join(readded) or "<none>",
+           len(out_unit), len(out_abort)))
+    if passthrough:
+        lines.append(
+            "[%s] %d supplied pattern(s) match NO catalogue row on this leg and "
+            "pass through uncorroborated (this is the operator override stating "
+            "intent for this run, not a row inheriting one): %s"
+            % (label, len(passthrough), " ".join(passthrough)))
+    for line in lines:
+        bad = [c for c in line if ord(c) > 126]
+        if bad:
+            raise LegError(
+                "run-directory corroboration report line is not ASCII (%r in "
+                "%r). These lines cross into a bash variable and a PowerShell "
+                "string through two different readers and are compared BYTE FOR "
+                "BYTE by the twin-parity proof." % ("".join(bad), line))
+    return {
+        "leg": label,
+        "runFilesystem": fs_verb,
+        "runDirectory": effective,
+        "driverRunDir": driver_run_dir,
+        "outcome": outcome,
+        "why": why,
+        "runDirectoryRequirements": list(needed),
+        "runDirectoryGating": rd_gate["gating"],
+        "verdicts": verdicts,
+        "withheld": withheld,
+        "corroborated": corroborated,
+        "confounds": out_unit,
+        "abortConfounds": out_abort,
+        "readded": list(readded),
+        "report": lines,
+        # The SAME lines as one newline-joined block, because print_confound_report
+        # and Write-ConfoundReport both take a BLOCK: a driver that had to
+        # reassemble a list would be the second place deciding how the account is
+        # spelled, and the two would drift.
+        "reportText": "\n".join(lines),
+    }
+
+
 # ── Emitters ────────────────────────────────────────────────────────────────
 
 def emit_sh(resolved):
@@ -7860,6 +8656,14 @@ def emit_sh(resolved):
         # as a compiler regression, which is the mirror of the defect this gate
         # exists to remove. [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
         put("LEG_CONFOUND_GATING", leg.get("confoundGating", ""))
+        # ★ TRANSPORTED, NOT RE-DERIVED — the same argument LEG_RUN_FIDELITY
+        # carries: the .ps1 reads the JSON plan and sees these fields directly, so
+        # a gating only one driver could see would be a capability only one driver
+        # could honour, which is this project's canonical silent harness bug.
+        # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+        put("LEG_RUN_DIR_GATING", leg.get("runDirectoryGating", ""))
+        put("LEG_RUN_DIR_REQUIREMENTS",
+            " ".join(q(x) for x in leg.get("runDirectoryRequirements", [])))
         # ★ HOW MANY ROWS THE CATALOGUE DECLARED FOR THIS LEG, so an EMPTY supply
         # can be told from a catalogue that declares nothing. Both drivers used to
         # infer the second from the first: "this leg's catalogue entry declares
@@ -8299,6 +9103,40 @@ def lint(path=CATALOGUE):
                     "that says ABSENT on a defective machine merely produces "
                     "noisy reds somebody then investigates."
                     % (pname, verb, key, got, floor))
+    # ── THE RUN-DIRECTORY PRECONDITION REGISTRY (the SECOND one) ─────────
+    # ANCHOR, ONE LINE, DO NOT WRAP:
+    # D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+    # Linted BEFORE the legs for the same reason the probe registry is: every
+    # corroborated row names an entry here, and a broken registry would report as
+    # N broken rows.
+    rd_registry = {}
+    rd_required_by = {}
+    try:
+        rd_registry = run_directory_preconditions(load_catalogue_doc(path))
+    except LegError as exc:
+        findings.append("runDirectoryPreconditions: %s" % exc)
+    except (OSError, ValueError) as exc:
+        findings.append("runDirectoryPreconditions could not be read from %s: %s"
+                        % (path, exc))
+    for rname in sorted(rd_registry):
+        entry = rd_registry[rname]
+        if not isinstance(entry, dict):
+            findings.append("runDirectoryPreconditions['%s'] must be an object, "
+                            "got %r" % (rname, type(entry).__name__))
+            continue
+        for k in PROBE_DECLARATION_KEYS:
+            v = entry.get(k, "")
+            if not isinstance(v, str) or not v.strip():
+                findings.append(
+                    "runDirectoryPreconditions['%s'] declares no '%s'. A "
+                    "precondition decides whether a failing test is excused, so "
+                    "it states what it MEASURES, what a PRESENT verdict would "
+                    "mean, and which anchor holds the long form (required: %s)."
+                    % (rname, k, ", ".join(PROBE_DECLARATION_KEYS)))
+        try:
+            run_directory_precondition_verb(entry.get("verb", ""))
+        except LegError as exc:
+            findings.append("runDirectoryPreconditions['%s']: %s" % (rname, exc))
     seen_labels, seen_specs = {}, {}
     # (targetArch, hostOs, hostArch) -> set of launcher spellings. One triple
     # must have ONE vocabulary, for the same reason lintDeclaredEmulators gives:
@@ -8555,6 +9393,41 @@ def lint(path=CATALOGUE):
                                 "nothing — the exact state `scope: any` was in."
                                 % (label, pat, nm,
                                    ", ".join(sorted(registry)) or "<none>"))
+                # ── `requiresRunDirectory`: THE SECOND REGISTRY ─────────────
+                # ANCHOR, ONE LINE, DO NOT WRAP:
+                # D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+                try:
+                    rd_reqs = row_run_directory_requirements(row)
+                except LegError as exc:
+                    rd_reqs = []
+                    findings.append("leg '%s': %s" % (label, exc))
+                for nm in rd_reqs:
+                    if nm not in rd_registry:
+                        findings.append(
+                            "leg '%s': confound %r requires run-directory "
+                            "precondition %r, which `runDirectoryPreconditions` "
+                            "does not declare (declared: %s). An undeclared "
+                            "precondition cannot be measured, so the row would "
+                            "be corroborated by nothing — which is the state "
+                            "`requires: []` was refused for on this very row."
+                            % (label, pat, nm,
+                               ", ".join(sorted(rd_registry)) or "<none>"))
+                    else:
+                        rd_required_by.setdefault(nm, []).append(
+                            "%s:%s" % (label, pat))
+                if rd_reqs and isinstance(reqs, list) and reqs:
+                    # Refused in the ENGINE too (leg_confound_decisions raises);
+                    # said here as well so a catalogue author is told at lint
+                    # time rather than at the first run that reaches the leg.
+                    findings.append(
+                        "leg '%s': confound %r declares BOTH `requires` (%s) and "
+                        "`requiresRunDirectory` (%s). Those are two gating axes "
+                        "measured at two different times — one per KERNEL before "
+                        "any leg is built, one per LEG after its run directory "
+                        "exists — and no rule has been written for how they "
+                        "compose."
+                        % (label, pat, ", ".join(str(x) for x in reqs),
+                           ", ".join(rd_reqs)))
                 # ── `scope`: LEGACY, and it must name its blocker ───────────
                 if "scope" in row:
                     scope = row.get("scope", "")
@@ -8861,6 +9734,21 @@ def lint(path=CATALOGUE):
         configure_stages(legs)
     except LegError as exc:
         findings.append("%s" % exc)
+    # ★★ A DECLARED PRECONDITION NO ROW REQUIRES IS DEAD CONFIG, AND DEAD CONFIG
+    # READS AS COVERAGE. This is the arm that makes `requiresRunDirectory` safe
+    # to DEFAULT to []: the field may be omitted, but a registry entry that ends
+    # up gating nothing is refused, so the mechanism cannot quietly stop being
+    # attached to the row it was written for.
+    # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+    for rname in sorted(rd_registry):
+        if not rd_required_by.get(rname):
+            findings.append(
+                "runDirectoryPreconditions['%s'] is declared and NO confound row "
+                "requires it. An unused precondition is measured by nothing and "
+                "gates nothing while reading as an earned mechanism — either the "
+                "row that needs it lost its `requiresRunDirectory`, or the entry "
+                "outlived its row and should be deleted the way `copy-relocation` "
+                "was." % rname)
     for key, spellings in sorted(vocab.items()):
         if len(spellings) > 1:
             findings.append("(targetArch=%s, hostOs=%s, hostArch=%s) has %d "
@@ -8976,6 +9864,24 @@ DSS_REGIONS = {
     # (attribute_build_failure) and pinned by the self-test, so what the drivers
     # can still get wrong is asking at all, which is exactly what these verify.
     "build-attribution": {
+        "drivers": ["build-and-test.sh", "build-and-test.ps1"],
+        "verifiers": ["test-confound-scope.sh", "test-confound-scope.ps1"]},
+    # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+    # BOTH DRIVERS, and `mirror` deliberately NOT claimed — the same judgement
+    # build-attribution records. The two halves are the same CAPABILITY in two
+    # languages, not the same text, and they read the resolver's answer through
+    # genuinely different transports (the .ps1 out of a JSON object, the .sh
+    # through `run_dir_field` into flattened arrays), so a differential case
+    # would have to re-type one side's data in a shape it never receives.
+    # ★ WHAT IS ENFORCED HERE IS THE PAIRING, and it is the whole reason this row
+    # exists: a driver that failed to corroborate would either refuse to run (the
+    # gating check) or, if that check were ever removed, excuse a failure on a
+    # host where the precondition does not hold — and the two drivers would
+    # render different verdicts on the same tree, which is this project's
+    # canonical silent harness bug. The DECISION is single-implementation in this
+    # module (corroborate_run_directory / run_directory_row_verdict) and pinned by
+    # the self-test, so what a driver can still get wrong is asking at all.
+    "run-dir-corroborate": {
         "drivers": ["build-and-test.sh", "build-and-test.ps1"],
         "verifiers": ["test-confound-scope.sh", "test-confound-scope.ps1"]},
     # [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
@@ -13879,6 +14785,194 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           not any(r.get("scope") == "any"
                   for l in legs for r in l["confounds"]))
 
+    # ── THE SECOND REGISTRY: A ROW CORROBORATED AGAINST ITS RUN DIRECTORY ───
+    # ANCHOR, ONE LINE, DO NOT WRAP:
+    # D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+    #
+    # ★★★ EVERY ARM BELOW SYNTHESIZES THE *NEGATIVE* AND CARRIES A CONTROL. An arm
+    # proving the row EXCUSES is worth much less than one proving it DECLINES:
+    # "excuses" is also what a gate that is simply switched off does, and the
+    # whole point of this mechanism is the direction where it must REFUSE. So the
+    # subject row is asserted ABSENT from the supply while a sibling row on the
+    # same leg is asserted PRESENT in it — a gate that dropped everything, or
+    # dropped nothing, fails one of the two halves.
+    _rd_leg = leg_by_label(legs, "pe64-x86_64", path)
+    _rd_subject = "^vtabH-3\\.1$"
+    _rd_control = "^sessionnoact-4\\.3$"
+    _rd_name = "run-dir-root-listing-filter-drops-an-entry"
+    _rd_gate_probes = _gate(_probes_present, _launched_same)
+
+    def _rd_verdicts(verdict):
+        return {_rd_name: {"verdict": verdict, "why": "self-test fixture",
+                           "verb": "root-entry-dropped-by-listing-filter",
+                           "evidence": {}, "anchor": "",
+                           "source": PROBE_SOURCE_MEASURED}}
+
+    def _rd_supply(verdict, run_dir="/fixture/run"):
+        rd = (None if verdict is None else
+              run_directory_gate(_rd_leg, _rd_verdicts(verdict), run_dir))
+        return set(leg_confounds(_rd_leg, _rd_gate_probes, rd))
+
+    check("the shipped catalogue declares vtabH-3.1 as a CORROBORATED row",
+          any(r["pattern"] == "^vtabH-3\\.1$"
+              and _rd_name in row_run_directory_requirements(r)
+              for r in _rd_leg["confounds"]),
+          "the row this mechanism exists for must be the row that uses it")
+    # ★ THE DEFAULT IS THE FAIL-SAFE DIRECTION, and it is asserted rather than
+    # assumed: a caller that took no measurement must under-excuse.
+    check("with NO run-directory gate at all the corroborated row is WITHHELD",
+          _rd_subject not in _rd_supply(None),
+          "an unmeasured directory must never honour a corroborated row")
+    check("...and the CONTROL row on the same leg is untouched",
+          _rd_control in _rd_supply(None),
+          "a gate that drops everything is not a gate, it is an outage")
+    check("an ABSENT precondition WITHHOLDS the corroborated row",
+          _rd_subject not in _rd_supply("absent"))
+    check("...with the CONTROL row still supplied",
+          _rd_control in _rd_supply("absent"))
+    # INDETERMINATE is honoured as ABSENT — "we could not measure" must never read
+    # as a clean bill and must never excuse.
+    check("an INDETERMINATE precondition WITHHOLDS it too, honoured as ABSENT",
+          _rd_subject not in _rd_supply("indeterminate"))
+    check("...with the CONTROL row still supplied",
+          _rd_control in _rd_supply("indeterminate"))
+    # And the one positive arm, which only means something beside the four above.
+    check("a PRESENT precondition supplies the corroborated row",
+          _rd_subject in _rd_supply("present"))
+    # ⚠ A MISSING VERDICT IS A TRANSPORT DEFECT AND RAISES. Reading it as absent
+    # would be safe and WRONG: it would hide a broken measurement path behind a
+    # noisy red nobody traces back.
+    check("a gate carrying NO verdict for the required precondition RAISES",
+          _raises(lambda: leg_confounds(
+              _rd_leg, _rd_gate_probes,
+              run_directory_gate(_rd_leg, {}, "/fixture/run"))))
+    check("a raw verdict map handed in place of a GATE is refused by name",
+          _raises(lambda: leg_confounds(_rd_leg, _rd_gate_probes,
+                                        _rd_verdicts("present"))))
+    # ★ THE GATINGS, which are what both drivers refuse on.
+    check("a leg with a corroborated row and no measurement is `unmeasured`",
+          run_directory_gate(_rd_leg)["gating"] == "unmeasured")
+    check("...and `measured` once a verdict map is supplied",
+          run_directory_gate(_rd_leg, _rd_verdicts("present"),
+                             "/x")["gating"] == "measured")
+    check("a leg whose rows name no precondition is `not-required`",
+          run_directory_gate(leg_by_label(legs, "macho64-arm64", path)
+                             )["gating"] == "not-required",
+          "`not-required` is a real answer and must not be spelled as an empty "
+          "measurement: a driver has to tell 'nothing here is corroborator-gated' "
+          "from 'something is and nobody measured it'")
+    # ★ THE ACCOUNT SAYS WHICH OF THE THREE IT IS, in words, on every leg.
+    _rd_dec_none = leg_confound_decisions(_rd_leg, _rd_gate_probes, None)
+    _rd_rep_none = confound_report_lines("pe64-x86_64", _rd_dec_none,
+                                         _rd_gate_probes, None)
+    check("the report says the preconditions were NOT MEASURED when they were not",
+          any("NOT MEASURED for this resolution" in l for l in _rd_rep_none),
+          "got %r" % _rd_rep_none[:6])
+    _rd_gate_abs = run_directory_gate(_rd_leg, _rd_verdicts("absent"), "/fx")
+    _rd_rep_abs = confound_report_lines(
+        "pe64-x86_64",
+        leg_confound_decisions(_rd_leg, _rd_gate_probes, _rd_gate_abs),
+        _rd_gate_probes, _rd_gate_abs)
+    check("the report names the row UNCORROBORATED rather than merely inactive",
+          any("UNCORROBORATED" in l for l in _rd_rep_abs),
+          "a row silently dropped is indistinguishable from a row nobody wrote")
+    _rd_rep_ok = confound_report_lines(
+        "macho64-arm64",
+        leg_confound_decisions(leg_by_label(legs, "macho64-arm64", path),
+                               _rd_gate_probes, None),
+        _rd_gate_probes, None)
+    check("a leg with no corroborated row says NONE REQUIRED out loud",
+          any("run-directory preconditions: NONE REQUIRED" in l
+              for l in _rd_rep_ok))
+    # ⚠ TWO GATING AXES ON ONE ROW IS A RULE NOBODY HAS WRITTEN, so it fails LOUD
+    # in the ENGINE rather than picking the more permissive of two readings.
+    _rd_both = json.loads(json.dumps(_rd_leg))
+    for _r in _rd_both["confounds"]:
+        if _r["pattern"] == "^vtabH-3\\.1$":
+            _r["requires"] = ["clock-realtime-steps"]
+    check("a row declaring BOTH gating axes RAISES in the engine",
+          _raises(lambda: leg_confounds(
+              _rd_both, _rd_gate_probes,
+              run_directory_gate(_rd_both, _rd_verdicts("present"), "/x"))),
+          "honouring it on the run-directory axis alone would be the WIDER "
+          "reading chosen by an omission")
+
+    def _rd_drop_requirement(d):
+        for l in d["legs"]:
+            for r in l.get("confounds", []):
+                r.pop("requiresRunDirectory", None)
+    check("stripping the last `requiresRunDirectory` is a lint finding",
+          _lint_with_mutated_catalogue(_rd_drop_requirement,
+                                       "and NO confound row requires it"),
+          "this is what makes the DEFAULTED field safe: the registry entry cannot "
+          "quietly stop being attached to the row it was written for")
+
+    def _rd_undeclared(d):
+        for r in d["legs"][2]["confounds"]:
+            if r["pattern"] == "^vtabH-3\\.1$":
+                r["requiresRunDirectory"] = ["no-such-precondition"]
+    check("a `requiresRunDirectory` naming an undeclared precondition is a "
+          "lint finding",
+          _lint_with_mutated_catalogue(_rd_undeclared, "does not declare"),
+          "an undeclared precondition cannot be measured, so the row would be "
+          "corroborated by nothing")
+
+    def _rd_bad_verb(d):
+        d["runDirectoryPreconditions"][_rd_name]["verb"] = "not-a-verb"
+    check("a precondition naming a verb this engine does not have is a lint "
+          "finding",
+          _lint_with_mutated_catalogue(_rd_bad_verb, "unknown run-directory"))
+
+    # ── THE SUPPLY, WHICH IS WHERE A DEFECT ACTUALLY HID ─────────────────
+    # ★★★ THE ARM THAT WOULD HAVE CAUGHT IT, AND IT DID NOT EXIST. ✔MEASURED in
+    # the P66 matrix run: `corroborate_run_directory` only SUBTRACTED from the
+    # plan's supply, so a row the plan had withheld for want of a measurement
+    # could never be put back — the pe64 leg printed `confound patterns in force
+    # (3)` and, on the next line, `confound row CORROBORATED: ^vtabH-3\.1$`. Every
+    # arm above passed over that, because they all read DECISIONS and none read
+    # the SUPPLY the matcher is handed.
+    _rd_plan_supply = [p for p in _rd_supply(None)]   # what a PLAN can produce
+    check("a PLAN cannot supply a corroborated row (it has no run directory)",
+          _rd_subject not in _rd_plan_supply)
+    _rd_out = corroborated_supply(_rd_leg, "pe64-x86_64", _rd_plan_supply, [],
+                                  run_directory_gate(_rd_leg,
+                                                     _rd_verdicts("present"),
+                                                     "/fixture/run"))
+    check("...and the CORROBORATOR ADDS IT BACK, rather than only subtracting",
+          _rd_subject in _rd_out["confounds"],
+          "an account that says CORROBORATED over a supply the matcher never "
+          "receives is an account contradicting the decision beside it; got %r"
+          % (_rd_out["confounds"],))
+    check("...and says so, naming the re-added row",
+          _rd_out["readded"] == [_rd_subject],
+          "got %r" % (_rd_out["readded"],))
+    check("...while the CONTROL rows the plan supplied are still there",
+          _rd_control in _rd_out["confounds"])
+    _rd_off = corroborated_supply(_rd_leg, "pe64-x86_64", _rd_plan_supply, [],
+                                  run_directory_gate(_rd_leg,
+                                                     _rd_verdicts("absent"),
+                                                     "/fixture/run"))
+    check("an ABSENT precondition leaves the row OUT of the supply",
+          _rd_subject not in _rd_off["confounds"]
+          and _rd_off["readded"] == []
+          and [w["wire"] for w in _rd_off["withheld"]] == [_rd_subject],
+          "got confounds=%r withheld=%r"
+          % (_rd_off["confounds"], [w["wire"] for w in _rd_off["withheld"]]))
+    check("...with the CONTROL row still supplied",
+          _rd_control in _rd_off["confounds"])
+    # ⚠ A RE-ADDED ROW GOES BACK INTO ITS OWN NAME SPACE AND NOWHERE ELSE.
+    check("a re-added UNIT row never reaches the ABORT supply",
+          _rd_subject not in _rd_out["abortConfounds"],
+          "one ledger, never one name space")
+    # ★ AN OPERATOR PATTERN THAT MATCHES NO ROW PASSES THROUGH AND IS NAMED.
+    _rd_op = corroborated_supply(_rd_leg, "pe64-x86_64", ["^operator-1"], [],
+                                 run_directory_gate(_rd_leg,
+                                                    _rd_verdicts("present"),
+                                                    "/fixture/run"))
+    check("an operator pattern matching no row passes through, and is named",
+          "^operator-1" in _rd_op["confounds"]
+          and _rd_op["passthrough"] == ["^operator-1"])
+
     # ── the staged-header plan ───────────────────────────────────────────────
     # HOST-INVARIANT for exactly the reason the build set is: which zlib header a
     # leg compiles against is a fact about that leg's TARGET. If this ever starts
@@ -13995,8 +15089,19 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("the sh emitter names every leg", all(lbl in sh for lbl in labels))
     statements = sh_statements(sh)
     check("the sh emitter emitted one statement per leg field",
-          len(statements) == 1 + len(labels) * 37,
+          len(statements) == 1 + len(labels) * 39,
           "got %d statements for %d legs" % (len(statements), len(labels)))
+    # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+    # ★★ THE SAME TRANSPORT ARGUMENT AS run FIDELITY, one axis along. The .ps1
+    # reads `runDirectoryGating` out of the JSON plan and needs nothing; the .sh
+    # reads ONLY these flattened arrays, so a gating that never reached them
+    # would leave the corroborator REFUSED by one driver and silently skipped by
+    # the other — a capability in one driver and not the other is this project's
+    # canonical silent harness bug, and it is the exact failure mode this row's
+    # scope clause names.
+    check("the sh emitter carries THIS LEG'S run-directory GATING, so the .sh "
+          "refuses an uncorroborated plan on the same fact the .ps1 refuses on",
+          "LEG_RUN_DIR_GATING[" in sh and "LEG_RUN_DIR_REQUIREMENTS[" in sh)
     # [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
     # ★★ THE TRANSPORT IS THE WHOLE RISK HERE. The .ps1 reads `run.fidelity` out
     # of the JSON plan and needs nothing; the .sh reads ONLY these flattened
@@ -14086,7 +15191,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     _none_sh = emit_sh(plan("linux", "x86_64", set(), path))
     _none_statements = _statements_or_why(_none_sh)
     check("the sh emitter emits assignments only on a launchers-NONE plan too",
-          len(_none_statements) == 1 + len(labels) * 37
+          len(_none_statements) == 1 + len(labels) * 39
           and all(ASSIGNMENT_RE.match(s) for s in _none_statements),
           "got %d statements, %r"
           % (len(_none_statements),
@@ -15765,6 +16870,40 @@ def main(argv=None):
     p.add_argument("--driver-run-dir", default="", metavar="DIR",
                    help="this driver's OWN run directory for the leg, as this "
                         "driver spells it (--run-dir-plan)")
+    # ── the SECOND registry: a precondition of THIS LEG'S RUN DIRECTORY ────
+    # ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+    # D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+    p.add_argument("--corroborate-run-dir", default=None, metavar="LABEL",
+                   help="measure this leg's declared `runDirectoryPreconditions` "
+                        "against THIS RUN's own run directory and return the "
+                        "confound supply that survives it. Needs "
+                        "--driver-run-dir; takes the supply the plan gave the "
+                        "driver as --supplied / --supplied-abort. JSON on "
+                        "stdout. This is the per-leg, POST-PLAN callback an "
+                        "environment probe structurally cannot be: probe "
+                        "verdicts are filed per KERNEL, before any leg is "
+                        "built, and --probe-environment takes no leg and no "
+                        "directory")
+    p.add_argument("--supplied", action="append", default=None, metavar="WIRE",
+                   help="one confound pattern the driver currently holds for "
+                        "this leg, in wire form (--corroborate-run-dir). "
+                        "Repeatable. A pattern matching no catalogue row passes "
+                        "through and is reported as an operator override")
+    p.add_argument("--supplied-abort", action="append", default=None,
+                   metavar="WIRE",
+                   help="the same, for the ABORT half of the ledger "
+                        "(--corroborate-run-dir). Repeatable")
+    p.add_argument("--measure-run-dir", default=None, metavar="DIR",
+                   help="MEASURE the named `--precondition`s against this "
+                        "directory and print {name: verdict} as JSON. The "
+                        "in-process-only instrument --corroborate-run-dir "
+                        "re-enters this script with when the run directory "
+                        "lives on another filesystem; also runnable by hand, "
+                        "byte for byte, by an operator")
+    p.add_argument("--precondition", action="append", default=None,
+                   metavar="NAME",
+                   help="restrict --measure-run-dir to these declared "
+                        "preconditions. Repeatable")
     # ── what a launcher needs BEYOND its own argv[0] ────────────────────────
     p.add_argument("--check-launcher", default=None, metavar="LABEL",
                    help="EXECUTE this leg's declared launcher prerequisites on "
@@ -15813,6 +16952,7 @@ def main(argv=None):
             or args.classify_abort or args.attribute_build
             or args.loadext_builder or args.tcl_coherence
             or args.run_filesystems or args.run_fidelities or args.run_dir_plan
+            or args.corroborate_run_dir or args.measure_run_dir
             or args.stage_build or args.check_launcher or args.identify_binary
             or args.launcher_for_target
             or args.registry_controls or args.check_regions
@@ -15842,6 +16982,16 @@ def main(argv=None):
                 "run directory is DERIVED from this driver's own so that two "
                 "checkouts cannot collide in one shared /tmp, and inventing one "
                 "here would make the answer depend on who asked")
+    if args.corroborate_run_dir and not args.driver_run_dir:
+        # The measurement's whole subject is WHICH DIRECTORY, so a defaulted one
+        # would answer a question about a directory nobody chose — in the
+        # direction that excuses a failure on the strength of the wrong
+        # filesystem's contents.
+        # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+        p.error("--corroborate-run-dir requires --driver-run-dir <dir>: the "
+                "precondition is a property of the filesystem THIS LEG'S RUN "
+                "DIRECTORY lives on, and there is no default directory whose "
+                "contents would mean anything")
     if (args.translate_path or args.assert_translated) and not args.path_translation:
         p.error("--translate-path / --assert-translated require "
                 "--path-translation <verb> — the namespace is the launcher's "
@@ -16218,6 +17368,19 @@ def main(argv=None):
                                    args.driver_run_dir), sys.stdout, indent=2)
             sys.stdout.write("\n")
             return 0
+        # ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+        # D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+        if args.corroborate_run_dir:
+            legs = load_catalogue(args.catalogue)
+            leg = leg_by_label(legs, args.corroborate_run_dir,
+                               "--corroborate-run-dir")
+            json.dump(corroborate_run_directory(
+                leg, host_os, host_arch, available, args.driver_run_dir,
+                list(args.supplied or []), list(args.supplied_abort or []),
+                load_catalogue_doc(args.catalogue), catalogue=args.catalogue),
+                sys.stdout, indent=2)
+            sys.stdout.write("\n")
+            return 0
         if args.check_launcher:
             legs = load_catalogue(args.catalogue)
             leg = leg_by_label(legs, args.check_launcher, "--check-launcher")
@@ -16280,6 +17443,29 @@ def main(argv=None):
         # the budget printed is the budget of THIS code path and cannot describe
         # a different invocation than the one that runs. A separate arm computing
         # `only` its own way would be the two-derivations defect one flag along.
+        # ★ THE IN-PROCESS-ONLY INSTRUMENT, and it is what makes recursion
+        # structurally impossible rather than merely unlikely: this arm measures
+        # WHERE IT IS and never orchestrates. Same shape as --probe-environment.
+        # ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
+        # D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+        if args.measure_run_dir:
+            doc = load_catalogue_doc(args.catalogue)
+            declared = run_directory_preconditions(doc)
+            names = (list(args.precondition) if args.precondition is not None
+                     else sorted(declared))
+            unknown = [n for n in names if n not in declared]
+            if unknown:
+                raise LegError(
+                    "--precondition names %s, which the catalogue's "
+                    "`runDirectoryPreconditions` registry does not declare "
+                    "(declared: %s). An undeclared precondition cannot be "
+                    "measured."
+                    % (", ".join(sorted(unknown)),
+                       ", ".join(sorted(declared)) or "<none>"))
+            json.dump(measure_run_directory_preconditions(
+                doc, names, args.measure_run_dir), sys.stdout, indent=2)
+            sys.stdout.write("\n")
+            return 0
         if args.probe_environment or args.print_probe_budget:
             if args.probe_environment and args.print_probe_budget:
                 # One PRICES the measurement, the other PERFORMS it. Answering

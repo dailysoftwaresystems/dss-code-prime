@@ -152,6 +152,33 @@ INVENTORY: dict[str, int] = {
 _ABORT = re.compile(r'\b(?:std::)?abort\s*\(')
 
 
+def _is_digit_separator(out: list, text: str, i: int) -> bool:
+    """Is the `'` at text[i] a C++14 DIGIT SEPARATOR rather than a char-literal quote?
+
+    ★ THE TEST IS "WHAT TOKEN AM I INSIDE", NOT "WHAT CHARACTER IS NEXT TO ME", and
+    the difference is the whole correctness of it. Walk BACK over the emitted code
+    across the token characters a numeric literal can contain -- digits, hex letters,
+    an exponent's letters, and earlier separators -- and ask what that token STARTS
+    with. A run starting with a DIGIT is a numeric literal, so the quote separates
+    digits. Anything else is a char literal.
+
+    ⚠ THE NAIVE TEST -- "alphanumeric on both sides" -- IS WRONG, AND WRONG ON REAL
+    CODE: it reads the PREFIXED char literals `L'a'`, `u'a'`, `U'a'` and `u8'a'` as
+    separators, because `L` and `8` are alphanumeric too. Asking for the token's
+    FIRST character excludes every one of them (`L`, `u`, `U` are not digits) while
+    still accepting `0x1'F`, `1'000'000` and `20'001`.
+
+    ⓘ `u8'a'` is the case that makes the walk-back need to cross letters as well as
+    digits: stopping at the first non-digit would find `8` and call it numeric.
+    """
+    if i + 1 >= len(text) or not (text[i + 1].isalnum() or text[i + 1] == '_'):
+        return False            # a separator must sit BETWEEN digits
+    j = len(out) - 1
+    while j >= 0 and (out[j].isalnum() or out[j] == "'"):
+        j -= 1
+    return j + 1 < len(out) and out[j + 1].isdigit()
+
+
 def strip_comments_and_strings(text: str) -> str:
     """Blank out //, /* */, "..." and '...' so only real code remains.
 
@@ -172,6 +199,20 @@ def strip_comments_and_strings(text: str) -> str:
                 out.append('\n' if text[i] == '\n' else ' ')
                 i += 1
             i += 2
+        elif c == "'" and _is_digit_separator(out, text, i):
+            # ★★ A C++14 DIGIT SEPARATOR IS NOT A QUOTE, AND READING IT AS ONE
+            # BLANKS CODE. ✔MEASURED 2026-09-02 (P54, found by lane `ov`):
+            # `std::string(20'001, '3')` turned `wall_clock_in_tests_guard` RED
+            # while `std::string(20001, '3')` — same value, same line — stayed
+            # green. The separator's quote opened a "char literal" that ran to
+            # the quote before `3`, so `'001, '` was blanked away.
+            #
+            # ⚠ THE REPORTED DIRECTION WAS "FAILS TOWARD NOISY". IT IS BOTH.
+            # The span that gets blanked is REAL CODE, so a violation sitting
+            # inside it is ERASED before the scan ever sees it — this can hide a
+            # finding, not merely invent one. NINE guards share this function.
+            out.append(c)
+            i += 1
         elif c in '"\'':
             quote = c
             # Raw string literals R"delim( ... )delim" — the payload can contain
@@ -392,6 +433,28 @@ def _selftest() -> int:
         ('// comment\nstd::abort();',                         True,  'comment then real'),
         ('/* c */ abort(); // trailing',                      True,  'block, real, trailing'),
         ('std::string k = "a"; abort();',                     True,  'string then real'),
+        # ★★ C++14 DIGIT SEPARATORS. The first arm is the MEASURED regression
+        # (P54, lane `ov`): read as a quote, the separator opens a char literal
+        # that runs to the quote before `3` and BLANKS `'001, '` -- real code.
+        # The second arm is the direction the original report missed: the blanked
+        # span can CONTAIN the violation, so this fails toward clean as well as
+        # toward noisy. Nine guards share this stripper.
+        ("std::string s(20'001, '3'); abort();",              True,  'digit sep + real call'),
+        # ⚠ ONE separator, deliberately, and the count is the whole arm. With an
+        # EVEN number (`1'000'000`) the mis-paired quotes re-pair and the call
+        # survives by accident -- that spelling passed over the live mutant and
+        # discriminated NOTHING. An ODD count leaves the quote unclosed, so the
+        # blanking runs to end of text and ERASES the `abort()` behind it.
+        ("if (n > 20'001) { abort(); }",                      True,  'ODD sep count cannot hide a call'),
+        ("auto c = 20'001; // abort()",                       False, 'sep, then only a comment'),
+        # ⚠ THE PREFIXED CHAR LITERALS, which a naive "alphanumeric on both
+        # sides" test misreads as separators -- `L`, `u`, `U`, `8` are all
+        # alphanumeric. Each payload holds a decoy that must STAY blanked.
+        ("auto c = L'a'; /* abort() */",                       False, "L'a' is a char literal"),
+        ("auto c = u8'a'; // abort()",                         False, "u8'a' is a char literal"),
+        ("auto c = U'a'; auto d = u'b'; // abort()",           False, "U'a'/u'b' are char literals"),
+        ("char q = '\\''; abort();",                          True,  'escaped quote then real'),
+        ("auto h = 0x1'Fu; abort();",                         True,  'hex literal separator'),
     ]
     bad = 0
     for src, expect, label in cases:

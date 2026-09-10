@@ -38,13 +38,27 @@
 //      — catches a FULL revert (macro back, symbol row gone): with no symbol row
 //      there is nothing to import and the name vanishes from `.idata`.
 //   2. THE DESCRIPTOR (`RealStdlibJsonBindsSetAbortBehaviorHonestly`) — catches
-//      the PARTIAL revert the image axis is blind to. Restoring ONLY the macro
-//      while the symbol row stays leaves the eager import in place (DSS imports
-//      every DECLARED shipped extern whether or not it is called), so the image
-//      still looks correct while every CALL SITE silently expands to `(0u)`.
-//      MEASURED, not assumed: that mutation was applied to the real tree and the
-//      emitted image still carried the import. Saying "the structural pin covers
-//      it" would have been false.
+//      the PARTIAL revert: restoring ONLY the macro while the symbol row stays,
+//      so every CALL SITE silently expands to `(0u)`.
+//
+//      ⚠⚠ THIS PARAGRAPH USED TO SAY THE IMAGE AXIS WAS BLIND TO THAT MUTATION,
+//      AND CARRIED A MEASUREMENT SAYING SO. IT WAS TRUE AND IS NOT ANY MORE. Under
+//      the retired eager-import law a declared row was imported whether or not
+//      anything called it, so the image still carried `_set_abort_behavior` after
+//      the macro came back and axis 1 stayed green. ✔RE-MEASURED 2026-09-03 under
+//      referenced-only import ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]), the mutation
+//      applied to a real config tree and the pe64 image walked for its imports:
+//          CONTROL (shipped config)   ucrtbase.dll: _set_abort_behavior, exit
+//          MUTANT  (macro restored)   ucrtbase.dll: exit
+//      The macro shadows every call site, so NOTHING references the row, so the
+//      import is DROPPED — and axis 1 reds on the mutation too.
+//
+//      ⇒ AXIS 2 IS NOT REDUNDANT, and the reason is worth keeping straight: it is
+//      the only STATIC check. It refuses the dishonest descriptor without building
+//      anything, names WHICH key lies, and holds for symbols no test program in the
+//      corpus happens to call — where axis 1 can only report an import that is not
+//      there and cannot say why. What is gone is the claim that axis 1 CANNOT see
+//      this; do not restore it.
 //
 // ⚠ NEVER ASSERT AN IMPORT *COUNT*. The pins below ask for a NAME. An aggregate
 // count over a table with ~60 entries goes inert the first time an unrelated
@@ -307,7 +321,7 @@ nlohmann::json const kNoRows = nlohmann::json::array();
         findings.emplace_back(
             std::string{"`macros` still declares "} + kSymbol
             + " — a macro SHADOWS the symbol row at every call site, so the "
-              "eager import stays in the emitted image while the call expands "
+              "declared binding becomes unreachable and every call expands "
               "to a no-op. The no-op was honest only while library.pe was "
               "msvcrt.dll; under UCRT it is a silent WER-suppression gap whose "
               "failure mode is a HANG.");
@@ -337,9 +351,10 @@ nlohmann::json const kNoRows = nlohmann::json::array();
             findings.emplace_back(
                 std::string{kSymbol}
                 + " is not gated availableObjectFormats [\"pe\"] — this is a "
-                  "pe/UCRT spelling with no elf or macho export, and DSS eagerly "
-                  "imports every DECLARED extern, so widening the gate breaks the "
-                  "LOAD of every binary that includes <stdlib.h> on that format.");
+                  "pe/UCRT spelling with no elf or macho export, so widening the "
+                  "gate breaks the LOAD of every binary that REFERENCES it on that "
+                  "format (every one that merely included <stdlib.h>, before "
+                  "referenced-only import).");
         }
     }
 
@@ -485,9 +500,13 @@ TEST(PeAbortBehaviorBinding, EmittedPe64ImageImportsSetAbortBehaviorFromUcrtbase
 
 // THE NEGATIVE CONTROL for the matcher above. Without it, a `peImportedSymbols-
 // From` that answered "present" for any input would keep axis 1 green forever.
-// It also pins the AVAILABILITY behaviour that makes the eager-import law safe:
-// the name reaches the import table because <stdlib.h> was included, not because
-// every pe image gets it.
+// It also pins the AVAILABILITY behaviour that keeps a per-header symbol OUT of an
+// image that never asked for it: the name reaches the import table because
+// <stdlib.h> was included, not because every pe image gets it. ⓘ Since P57 that is
+// the WEAKER of the two gates the name passes — [[D-FFI-DESCRIPTOR-EAGER-IMPORT]]
+// made imports referenced-only, so a symbol now needs BOTH its header and a
+// reference. This control asserts the header half, which is the half a descriptor
+// edit can break.
 TEST(PeAbortBehaviorBinding, Pe64ImageWithoutStdlibDoesNotImportSetAbortBehavior) {
     ScratchDir scratch{Location::InsideRepo, "pe-abort-behavior"};
     auto const dir = scratch.path();
@@ -637,8 +656,8 @@ TEST(PeAbortBehaviorBinding, DescriptorAuditRejectsEveryDishonestShape) {
              d["constants"][1]["variants"][0]["value"] = 4;
              return d;
          }},
-        // A GATE widened: eager import on a format with no such export ⇒ the
-        // LOAD of every <stdlib.h> binary breaks (0xC0000139 / exit 127).
+        // A GATE widened: an import on a format with no such export ⇒ the LOAD
+        // of every binary that REFERENCES it breaks (0xC0000139 / exit 127).
         {"the symbol gate widened past pe", "availableObjectFormats",
          [](nlohmann::json d) {
              d["symbols"][0]["availableObjectFormats"] =

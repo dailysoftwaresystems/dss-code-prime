@@ -160,8 +160,9 @@ recordedImportIdentity(std::string_view declaredImportName,
                        std::string_view readerLibraryPath);
 
 // ★★★ THE TARGET-AWARE READ — the ONE place a `--resolve-library` binary's own
-// object format is compared against the format the build is emitting.
-// (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL, TF-C116.)
+// object format AND ARCHITECTURE are compared against the image the build is
+// emitting. (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL, TF-C116;
+// D-FFI-RESOLVE-LIBRARY-DOES-NOT-CHECK-THE-LIBRARY-ARCH, TF-C117.)
 //
 // ── WHY A GUARD IS NEEDED AT ALL, AND WHY THE OLD ONE WAS AN ACCIDENT ───────
 // ✔MEASURED (the row's own probe P5): feeding a PE `.dll` to `--resolve-library`
@@ -187,13 +188,34 @@ recordedImportIdentity(std::string_view declaredImportName,
 // function, two callers. Neither binder may call `ffi::readImports` for a
 // `--resolve-library` input; both call this.
 //
-// ── AGNOSTIC BY CONSTRUCTION ────────────────────────────────────────────────
-// Both sides of the comparison are DECLARED DATA in closed vocabularies. The
-// left is `ffi::guessFormat` — the FF1 dispatcher's own magic-byte classifier,
-// the facility the row observed "the reader ALREADY knows the format it
-// detected". The right is `ObjectFormatSchema::kind()`, resolved from the
-// format JSON's backend. Nothing here compares a format NAME, an extension, or
-// a target string; adding a fourth object format adds one row to one table.
+// ── AND THE SECOND AXIS: RIGHT FORMAT, WRONG CPU ────────────────────────────
+// D-FFI-RESOLVE-LIBRARY-DOES-NOT-CHECK-THE-LIBRARY-ARCH is the SAME boundary
+// and the same missing comparison — the reader already knows what it read and
+// never compared it to the target — so it is the same function rather than a
+// second guard bolted alongside, which is exactly what that row asked for.
+// ⚠ THE ROW'S OWN CLOSING NOTE SAYS TO LAND IT "IN THE SAME CHANGE AS THE
+// FORMAT CHECK"; that change landed in 2026-08-14 and this is therefore an
+// EXTENSION OF THE CHOKEPOINT IT BUILT, which is the same remedy one cycle
+// later. ✔MEASURED before the guard existed, and it is strictly worse than the
+// row's "happens to be harmless": an x86_64 `.so` handed to an aarch64 ELF
+// build produced rc=0 with ZERO diagnostics and an aarch64 artefact recording
+// `DT_NEEDED` on that x86_64 library; the mirror direction and the Mach-O pair
+// (x86_64 `.dylib` into an arm64 build) behaved identically. The names match
+// across architectures far more often than they differ, so no symbol lookup,
+// no decoration rule and no format rule can catch it — the artefact ships and
+// dies at LOAD.
+//
+// ── AGNOSTIC BY CONSTRUCTION, ON BOTH AXES ──────────────────────────────────
+// Every side of both comparisons is DECLARED DATA in a closed vocabulary. The
+// format's left is `ffi::guessFormat` — the FF1 dispatcher's own magic-byte
+// classifier, the facility the row observed "the reader ALREADY knows the
+// format it detected"; its right is `ObjectFormatSchema::kind()`, resolved from
+// the format JSON's backend. The architecture's left is the number at the
+// offset `ffi::architectureFieldOf` locates in that same header; its right is
+// the format JSON's own `elf.machine` / `pe.machine` / `macho.cputype`.
+// Nothing here compares a format NAME, an extension, an arch NAME or a target
+// string; adding a fourth object format adds one row to each of two tables, and
+// `-Werror=switch` makes an omission a build error rather than a silent gap.
 //
 // Behaviour, in order:
 //   * The file's magic classifies to an object-format kind that DIFFERS from
@@ -201,6 +223,23 @@ recordedImportIdentity(std::string_view declaredImportName,
 //     ELF/COFF/Mach-O relocatable readers already use for "this input is not
 //     the format this consumer needs"), naming the path, what the file IS, and
 //     what the target needs. Nothing is read.
+//   * The kinds AGREE but the header's architecture code differs from the one
+//     the format document declares → REJECT LOUD with the same code, naming the
+//     path, the header FIELD each number came from, both values, and the
+//     architecture to go and fetch instead. ⓘ ONE code for two messages
+//     deliberately: the remediation surface is identical — "point
+//     --resolve-library at the right build of this library" — and the project
+//     splits codes by REMEDIATION, not by which clause of one guard fired.
+//     Suppressing it changes nothing about safety: this function returns the
+//     structured rejection whether or not the diagnostic is shown, so the
+//     library is still not read and the externs still die loud at link
+//     (✔MEASURED with `--suppress=F_UnsupportedBinaryFormat`).
+//   * Kinds agree and the architecture is not knowable → delegate. A `ar`
+//     CONTAINER declares neither (its MEMBERS declare both); a Mach-O FAT file
+//     holds one cputype PER SLICE and no single one; a 32-bit Mach-O keeps its
+//     cputype WITHOUT the CPU_ARCH_ABI64 bit, so answering would report "wrong
+//     architecture" for a file whose real defect is that FF1 does not read
+//     32-bit Mach-O, and D-FF1-MACHO-32 already says that precisely.
 //   * Kinds agree, or the magic classifies to no single object format (an `ar`
 //     CONTAINER, or unrecognised bytes) → delegate verbatim to `readImports`,
 //     which keeps every existing failure mode and message intact (FileEmpty,
@@ -221,14 +260,25 @@ readImportsForTargetFormat(std::filesystem::path const& libraryPath,
                            ObjectFormatSchema const&    format,
                            DiagnosticReporter&          reporter);
 
-// The COMPARISON on its own, extracted so that the sentence above has exactly
-// ONE author no matter how many places need to make it.
+// The COMPARISON on its own, extracted so that the sentences above have exactly
+// ONE author no matter how many places need to make them.
 //
-// `nullopt` = NO OBJECTION: the formats agree, or the leading bytes name no
-// single object format (an `ar` container, unrecognised bytes, an unopenable or
-// empty file — all deferred, see above). Engaged = REJECTED, with
+// `nullopt` = NO OBJECTION: the format AND the architecture agree, or the
+// leading bytes name no single object format / no single architecture (a Mach-O
+// universal or 32-bit file, unrecognised bytes, an unopenable or empty file —
+// all deferred, see above). Engaged = REJECTED, with
 // `F_UnsupportedBinaryFormat` ALREADY REPORTED; the returned `BinaryReadError`
 // carries the same detail for a caller that propagates a structured error.
+//
+// ⓘ AN `ar` CONTAINER IS NOT DEFERRED — it is checked THROUGH ITS MEMBERS. The
+// container's own global magic declares neither a format nor an architecture,
+// but each member declares both, so the archive is opened and every member is
+// put through the same comparison, the refusal naming the member in the
+// linker's `archive(member)` notation. See the block on
+// `checkArchiveMembersMatchTargetFormat` in ingest.cpp for the measurement that
+// forced it: the earlier "its members are checked where their bytes are in
+// hand" was FALSE, on both axes, because the partition routes archives past
+// every tier that compares anything.
 //
 // ★ WHY THIS IS SEPARATE FROM THE READ, rather than the read being the only
 // door. `compile_pipeline`'s step 2.5-pre runs an EAGER, UNCONDITIONAL probe
@@ -244,6 +294,36 @@ readImportsForTargetFormat(std::filesystem::path const& libraryPath,
 checkLibraryMatchesTargetFormat(std::filesystem::path const& libraryPath,
                                 ObjectFormatSchema const&    format,
                                 DiagnosticReporter&          reporter);
+
+// ★★★ THE SAME BOUNDARY, FOR THE INPUTS THAT NEVER REACH THE PROBE ─────────
+//
+// `--resolve-library` has THREE kinds of input and only one of them stays on
+// the path `compile_pipeline`'s step 2.5-pre walks. `partitionResolveLibraries`
+// splits the flag's entries by MAGIC BYTES into `ar` archives (merged at link),
+// relocatable objects (merged as objects) and the DYNAMIC residual, and only
+// the residual becomes `perCuOpts.resolveLibraries` — so the eager probe is
+// unconditional over the DYNAMIC subset and blind to the other two.
+//
+// ⚠ ✔MEASURED at the cycle base, shipped CLI: an x86_64 `.a` handed to
+// `arm64:elf64-aarch64-linux-exec` (and the mirror, and a PE `.lib` handed to
+// an ELF build) produced rc=0 with ZERO diagnostics and an emitted artefact.
+// A member actually pulled fails, but on `K_UnwindRuleUnrepresentable` naming
+// a register — a DWARF CFI accident, not a boundary check, and silent whenever
+// the TU references nothing in the archive.
+//
+// So the two MERGED lists get the same validation as the dynamic one, through
+// the same function, and this is the ONE call the site that owns the partition
+// makes. `false` = at least one input was REJECTED and reported (the caller
+// stops the build); `true` = every input may serve this image. Nothing is read
+// beyond what the comparison needs, and every input is reported rather than
+// only the first — an operator who named three wrong-architecture inputs
+// should not have to re-run three times.
+[[nodiscard]] DSS_EXPORT bool
+checkMergedLibraryInputsMatchTargetFormat(
+    std::span<std::filesystem::path const> archives,
+    std::span<std::filesystem::path const> objects,
+    ObjectFormatSchema const&              format,
+    DiagnosticReporter&                    reporter);
 
 struct DSS_EXPORT CHeaderSource {
     std::filesystem::path path;
@@ -296,11 +376,18 @@ struct DSS_EXPORT ExternDeclRef {
     // descriptor reader. Empty ⇒ unversioned. A plain string (already resolved,
     // not a per-format map), threaded verbatim to FfiMetadata.version.
     std::string_view version{};
-    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: TRUE ⇒ an EAGER shipped-descriptor
-    // import (producer C). Threaded verbatim to `FfiMetadata.isEagerImport` by
-    // the FFI synthesize/ingest stages so the eager law rides to the linker's
-    // reference gate (an eager row is kept even when unreferenced). INVARIANT:
-    // isEagerImport ⟹ library-bound. Non-eager (producers A/B) leaves it false.
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: TRUE ⇒ an EAGER import — one the
+    // linker's reference gate keeps even when no relocation references it.
+    // Threaded verbatim to `FfiMetadata.isEagerImport` by the FFI
+    // synthesize/ingest stages, which are CONDUITS and never decide it.
+    // ⚠ NO PRODUCER REACHING THIS STAGE SETS IT SINCE P57. It used to be TRUE for
+    // every shipped-descriptor import (producer C) — the retired eager-import law
+    // [[D-FFI-DESCRIPTOR-EAGER-IMPORT]] — and descriptor rows are now non-eager
+    // like producers A and B. The one remaining eager producer in the tree is the
+    // SEH personality, which is minted at the MIR tier and never travels this
+    // path. The field stays because EAGER is still a representable and meaningful
+    // property: "referenced by something the reloc-based gate cannot see".
+    // INVARIANT: isEagerImport ⟹ library-bound.
     bool isEagerImport = false;
     // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): the EXPLICIT assembler name
     // this extern was

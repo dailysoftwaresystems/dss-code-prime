@@ -1,0 +1,34 @@
+{
+  "$comment": "P63 [[D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN]]: the AUTOMATIC-STORAGE (stack local) arm of the raised alignment ceiling. $$ IT EXISTS BECAUSE THE TREE HAD NO WITNESS FOR THIS TIER AT ALL, AND THAT ABSENCE IS WHY A FOURTH HAND-WRITTEN COPY OF THE OLD 256 CAP SURVIVED THE CYCLE THAT REMOVED THE OTHER THREE. `alignment_page_request` covers the TYPE and the STATIC object; neither enters the MIR verifier, where a local's alignment travels on the Alloca's secondary payload. A grep of `tests/` and `examples/` for any `_Alignas`/`aligned` above 256 on an automatic object returned NOTHING before this example. $$$ MEASURED BEFORE THE FIX, through the shipped CLI, both spellings, `--config=debug` AND `--config=release`, on `x86_64:pe64-x86_64-windows-exec` and identically on `x86_64:elf64-x86_64-linux-exec` (so it is format-generic, not a PE artefact): 16 and 256 BUILD 0 / RUN 42, while 512, 1024, 4096 and 65536 ALL gave `error[I_AllocaAlignmentNotPowerOfTwo]: ... mir inst #1: alloca alignment payload N is not a power of two in [1, 256]`. $ THE REGRESSION THIS PINS AGAINST IS NOT ONLY THE REFUSAL BUT ITS SHAPE: at the cycle's base commit the same subject gave a POSITIONED `error[S_AlignasExceedsMax]` with a `-->` source line; after the ceiling was raised everywhere EXCEPT here it became an INTERNAL `I_*` code naming a MIR instruction index with NO position line. A user writing `_Alignas(4096)` on a local got a compiler-internal message instead of a positioned one -- strictly worse than before the cycle. $$ THE REFERENCES, each probed SEPARATELY, BUILD **and** RUN: mingw-w64 gcc 13.2.0's AUTOMATIC arms are BUILD 0 / RUN 42 at 4096, 8192, 16384 AND 65536 -- note that the PE object-file ceiling which DOES bind a STATIC there (8192, `alignment of 'g' is greater than maximum object file alignment 8192`) does NOT bind a stack local on the very same compiler with the same flags, which is what proves the two ceilings are different quantities at different tiers. gcc 13.3.0 and clang 18.1.3 run locals green through 2^20. Three references build and run what DSS refused. $ THE POLICY CEILING IS UNAFFECTED AND STILL POSITIONED: `_Alignas(536870912)` (2^29, above the target's declared `aggregateLayout.maxRequestedAlignment` of 2^28) still draws `error[S_AlignasExceedsMax]` WITH a `-->` line on a local, and `_Alignas(100)` still draws `S_AlignasNotPowerOfTwo`. The verifier now asks `Alignment::fromBytes` for the REPRESENTABLE domain instead of restating a POLICY number it did not own.",
+  "$commentRedOnDisable": "REMOVE direction, executed 2026-09-07. In `src/mir/mir_verifier.cpp`'s `MirOpcode::Alloca` arm, restore the hand-written literal: `if (a != 0 && !Alignment::fromBytes(a).has_value())` becomes `if (a != 0 && ((a & (a - 1)) != 0 || a > 256))`. This is a C++ TU, so the arm asserts build rc 0, the SOURCE md5 MOVED and RETURNED, and the mutated TU's `.obj` md5 MOVED and RETURNED (a moved object md5 is what proves RECOMPILATION; without it the run may be reading a stale binary). Restore with `cp` + `touch`, NEVER `mv` -- an `mv` preserves the backup's older mtime, ninja then skips the rebuild, and the previous arm's mutant binary leaks into the next arm. $$ UNDER THE MUTANT this example FAILS IN BOTH RUNNERS with `error[I_AllocaAlignmentNotPowerOfTwo] ... payload 512 is not a power of two in [1, 256]` and NO artifact, while the named CONTROL `examples/c/alignment_page_request` -- whose subjects are a TYPE and a STATIC, neither of which reaches the Alloca arm -- stays GREEN. That control is what makes the arm attributable: 'everything went red' would be equally consistent with a broken build. $ The 16 and 256 arms inside this program are the second control: they are below the restored literal and must keep passing, so a mutant that broke frame layout outright would look different from one that restored the cap.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

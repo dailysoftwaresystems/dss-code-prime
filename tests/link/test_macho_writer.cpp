@@ -37,12 +37,15 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -167,6 +170,24 @@ struct Loaded {
 // the field) and any non-Mach-O format passed here route through
 // untouched, and no library-flavored walker ever sees an override it
 // would rightly reject.
+// ── D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ──
+//
+// ★ AND IT NOW CARRIES A SECOND CONTRACT, for the same reason and in the same
+// place. Every shipped darwin document declares its ad-hoc code-signature
+// identity as a FUNCTION of the artifact, so an emission that cannot name the
+// file it is producing is REFUSED — deliberately, with no fallback. A direct
+// writer call is exactly such an emission: it has no output path. So the ONE
+// helper states a name once, and every byte-level pin in this file inherits it
+// rather than 30-odd call sites each learning the rule separately (~31 cases
+// across three files went red the moment the declaration landed, all with the
+// identical diagnostic).
+//
+// ⚠ THE NAME IS DELIBERATELY NOT "a.out" OR ANYTHING PLAUSIBLE. It appears
+// verbatim in the CodeDirectory of every image these pins emit, so a byte
+// comparison that accidentally depends on it should read as this fixture's
+// name and not as something a real build might produce.
+constexpr char const* kWriterPinArtifactFileName = "dss_writer_pin_artifact";
+
 [[nodiscard]] std::vector<std::uint8_t>
 encodeUntrampolined(AssembledModule&          module,
                     TargetSchema const&       target,
@@ -175,7 +196,9 @@ encodeUntrampolined(AssembledModule&          module,
     if (format.processExit().has_value()) {
         module.imageEntryOverride = 0u;
     }
-    return macho::encode(module, target, format, reporter);
+    return macho::encode(
+        module, target, format, reporter,
+        dss::ImageRequest{.artifactFileName = kWriterPinArtifactFileName});
 }
 
 } // namespace
@@ -1340,11 +1363,13 @@ TEST(MachOWriter, Arm64ObjectRodataItemEmitsConstSectionAndDataSymbol) {
     EXPECT_EQ(bytes[321], 'i');
     EXPECT_EQ(bytes[322], 0u);
 
-    // LC_SYMTAB @288: symoff = 312 + 11 (no relocs), nsyms = 2.
+    // LC_SYMTAB @288: the file-backed span ends at 312 + 11 = 323 (no relocs)
+    // and the symtab starts at the first 8-aligned offset after it, 328 —
+    // D-LINK-MACHO-OBJECT-SYMTAB-MISALIGNED (pre-fix it was packed at 323).
     std::uint32_t const symoff = readU32LE(bytes, 296);
     std::uint32_t const nsyms  = readU32LE(bytes, 300);
     std::uint32_t const stroff = readU32LE(bytes, 304);
-    EXPECT_EQ(symoff, 323u);
+    EXPECT_EQ(symoff, 328u);
     ASSERT_EQ(nsyms, 2u);
     // nlist[1] = the data symbol: real name, N_SECT|N_EXT, n_sect=2,
     // n_value = the FLAT address 8.
@@ -1714,8 +1739,10 @@ TEST(MachOWriter, Arm64ObjectBssItemIsZeroFillWithVmsizeButNoFileBytes) {
     EXPECT_EQ(readU64LE(bytes, 224), 4u);    // size = reservedSize
     EXPECT_EQ(readU32LE(bytes, 232), 0u);    // offset = 0 (S_ZEROFILL)
     EXPECT_EQ(readU32LE(bytes, 248), 1u);    // flags = S_ZEROFILL (schema)
-    // symtab directly after text bytes (312 + 4) — bss stored nothing.
-    EXPECT_EQ(readU32LE(bytes, 296), 316u);
+    // The file-backed span ends after the text bytes (312 + 4 = 316) — bss
+    // stored nothing — and the symtab starts at the first 8-aligned offset
+    // after it, 320 (D-LINK-MACHO-OBJECT-SYMTAB-MISALIGNED).
+    EXPECT_EQ(readU32LE(bytes, 296), 320u);
     // The bss symbol's n_value is its flat address.
     std::uint32_t const symoff = readU32LE(bytes, 296);
     EXPECT_EQ(bytes[symoff + 16 + 5], 2u);
@@ -1742,12 +1769,14 @@ TEST(MachOWriter, Arm64ObjectDataFreeModuleKeepsSingleSectionLayout) {
     EXPECT_EQ(readU64LE(bytes, 64), 4u);     // vmsize = text only
     EXPECT_EQ(readU64LE(bytes, 72), 232u);   // fileoff = 32 + 72 + 80 + 24 + 24
     EXPECT_EQ(readU64LE(bytes, 80), 4u);     // filesize = text only
-    // LC_SYMTAB at 208; symtab right after text (232 + 4); strtab after
-    // the single 16-byte nlist.
+    // LC_SYMTAB at 208; the span ends after the text (232 + 4 = 236) and the
+    // symtab starts at the first 8-aligned offset after it, 240
+    // (D-LINK-MACHO-OBJECT-SYMTAB-MISALIGNED); strtab right after the single
+    // 16-byte nlist.
     EXPECT_EQ(readU32LE(bytes, 208), 0x02u);
-    EXPECT_EQ(readU32LE(bytes, 216), 236u);  // symoff
+    EXPECT_EQ(readU32LE(bytes, 216), 240u);  // symoff
     EXPECT_EQ(readU32LE(bytes, 220), 1u);    // nsyms
-    EXPECT_EQ(readU32LE(bytes, 224), 252u);  // stroff
+    EXPECT_EQ(readU32LE(bytes, 224), 256u);  // stroff
 }
 
 // (5) The shipped arm64 object format declares the four data-section rows
@@ -2275,6 +2304,39 @@ namespace {
     }
     return out;
 }
+
+// ── The STATIC exec arm needs an UNSIGNED exec schema ────────────
+//
+// D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM. `encodeExec` — the static
+// arm, taken when `externImports` is empty — builds no __LINKEDIT, so it can
+// host no LC_CODE_SIGNATURE under ANY schema, and `macho::encode` now REFUSES
+// a zero-extern module whenever the format requests a signature by either key
+// rather than encoding it and dropping the request in silence. Every shipped
+// Darwin exec document requests one, so the static arm is unreachable from a
+// shipped exec schema BY CONSTRUCTION — the same conclusion `test_macho_eh_
+// frame.cpp` `MachOTextSectionAlign.TheSTATICExecArmWritesLog2Too` already
+// reached and solved the same way.
+//
+// The static-arm tests below therefore drive the shipped x86_64 exec document
+// MINUS its signature request, supplied by the SHARED fixture in
+// `macho_test_support.hpp` (which cross-checks itself field-by-field against
+// the shipped document, so it cannot drift out from under these pins). They
+// used to drive the shipped document itself, asserting `errorCount() == 0`,
+// which is exactly how ten of them stayed green over a silently dropped
+// signature.
+[[nodiscard]] Loaded loadStaticExec() {
+    Loaded out;
+    auto t = TargetSchema::loadShipped("x86_64");
+    if (!t.has_value()) {
+        ADD_FAILURE() << "loadShipped(x86_64) failed";
+        for (auto const& d : t.error()) ADD_FAILURE() << "  " << d.message;
+        return out;
+    }
+    out.target = std::move(t).value();
+    out.format = dss::macho::test::loadUnsignedExec(
+        "macho64-x86_64-darwin-exec");
+    return out;
+}
 } // namespace
 
 TEST(MachOExecFormatJson, ShippedFileLoadsCleanly) {
@@ -2290,7 +2352,7 @@ TEST(MachOExecFormatJson, ShippedFileLoadsCleanly) {
 }
 
 TEST(MachOExecWriter, MachHeaderFiletypeEqualsMhExecute) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
@@ -2303,7 +2365,7 @@ TEST(MachOExecWriter, MachHeaderFiletypeEqualsMhExecute) {
 }
 
 TEST(MachOExecWriter, PageZeroSegmentEmittedFirst) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
@@ -2321,7 +2383,7 @@ TEST(MachOExecWriter, PageZeroSegmentEmittedFirst) {
 }
 
 TEST(MachOExecWriter, LcMainEntryOffPointsToFirstFunction) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     // 2 functions: f[0] is some prelude (0x90 NOP + 0xC3 ret), f[1] is the entry.
     AssembledModule mod;
     mod.expectedFuncCount = 2;
@@ -2619,7 +2681,8 @@ TEST(MachOExecWriter, IntraModuleBranchAppliedByteForByte) {
     // Branch (rel32, kind 1) from fn[0] to fn[1].
     // sectionVa = pageZeroSize + 0x1000 = 0x100001000.
     // P = sectionVa + 1, S = sectionVa + 6, A = 0 → value = 1.
-    auto loaded = loadShippedExec();
+    // Static arm (no externImports) ⇒ the unsigned fixture.
+    auto loaded = loadStaticExec();
     AssembledModule mod;
     mod.expectedFuncCount = 2;
     AssembledFunction f0;
@@ -2666,7 +2729,7 @@ TEST(MachOExecWriter, IntraModuleBranchAppliedByteForByte) {
 }
 
 TEST(MachOExecWriter, ExternTargetFailsLoudAsUndefined) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod;
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
@@ -2893,7 +2956,7 @@ TEST(MachOExecFormatJsonValidate, MissingDylinkerPathRejected) {
 }
 
 TEST(MachOExecWriter, EmptyTextFailsLoud) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod;
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
@@ -2906,7 +2969,7 @@ TEST(MachOExecWriter, EmptyTextFailsLoud) {
 }
 
 TEST(MachOExecWriter, RelocOffsetPastFunctionBytesFailsLoud) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod;
     mod.expectedFuncCount = 2;
     AssembledFunction f0;
@@ -2938,7 +3001,7 @@ TEST(MachOExecWriter, TextSegmentVmaddrEqualsPageZeroEnd) {
     // dyld rejects both). The walker computes it; a future
     // refactor that drifts this would silently produce a non-
     // loadable image.
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
@@ -2979,7 +3042,7 @@ TEST(MachOExecWriter, LcLoadDylibStructurePinnedByteForByte) {
     // refactor changes the field layout, dyld silently looks for
     // the path at the wrong offset, fails to find libSystem, and
     // the process never starts. Pin the layout byte-for-byte.
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
@@ -3041,7 +3104,7 @@ TEST(IsImageFlavorAccessor, ConsistentAcrossThreeFormats) {
 }
 
 TEST(MachOExecWriter, DisplacementOverflowFailsLoud) {
-    auto loaded = loadShippedExec();
+    auto loaded = loadStaticExec();
     AssembledModule mod;
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
@@ -3581,9 +3644,89 @@ loadChainedFixupsExecFormat() {
                      "/usr/lib/libSystem.B.dylib"});
     return mod;
 }
+// A second fixture whose image has ONE MORE SEGMENT than the one above: a
+// writable global forces __DATA between __DATA_CONST and __LINKEDIT. It is
+// the CONTROL for the seg_count pins — without it, "seg_count is 4" is
+// equally consistent with "the writer emits the constant 4", which is the
+// shape of the defect D-LK6-14-CHAINED-STARTS-SEG-COUNT-MISDECLARED names.
+// (It mirrors the ld64 measurement, which used exactly this pair: the same
+// program with and without a writable global, giving seg_count 4 then 5.)
+[[nodiscard]] std::shared_ptr<ObjectFormatSchema const>
+loadChainedFixupsExecFormatWithData() {
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+  "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
+      "format": {"name":"macho-cfx-integration-data","kind":"macho"},
+      "entryPoint": "",
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
+      "entryCallingConvention": "sysv_amd64",
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+        "useChainedFixups": true
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392},
+        {"kind":"data","name":"__data","segment":"__DATA","type":0,"flags":0,"addrAlign":8,"entrySize":0,"virtualAddress":0}
+      ],
+      "relocations":[
+        {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
+        {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
+        {"name":"X86_64_RELOC_UNSIGNED_4","kind":3,"nativeId":33554432}
+      ]
+    })");
+    if (!fmt.has_value()) return nullptr;
+    return *fmt;
+}
+[[nodiscard]] AssembledModule chainedFixupsTestModuleWithData() {
+    AssembledModule mod = chainedFixupsTestModule();
+    AssembledData d;
+    d.symbol    = SymbolId{7};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {1, 0, 0, 0};
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{7}, "_g_mutable",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    return mod;
+}
 // LC_DYLD_CHAINED_FIXUPS = 0x80000034 (LC_REQ_DYLD bit set).
 constexpr std::uint32_t kLcDyldChainedFixups = 0x80000034u;
 constexpr std::uint32_t kLcDyldInfoOnly      = 0x80000022u;
+constexpr std::uint32_t kLcSegment64         = 0x19u;
+
+// The LC_SEGMENT_64 names of an emitted image, in load-command order. The
+// index of a name in this vector IS the segment ordinal that dyld's fixup
+// tables address, so the seg_count pins can check the payload against the
+// image's ACTUAL segments rather than against a number typed twice.
+[[nodiscard]] std::vector<std::string>
+segmentNamesOf(std::vector<std::uint8_t> const& bytes) {
+    std::vector<std::string> names;
+    if (bytes.size() < 32) return names;
+    std::uint32_t const ncmds = readU32LE(bytes, 16);
+    std::size_t off = 32;
+    for (std::uint32_t i = 0; i < ncmds && off + 8 <= bytes.size(); ++i) {
+        std::uint32_t const cmd     = readU32LE(bytes, off);
+        std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
+        if (cmdsize == 0) break;
+        if (cmd == kLcSegment64 && off + 24 <= bytes.size()) {
+            char const* p = reinterpret_cast<char const*>(&bytes[off + 8]);
+            names.emplace_back(p, std::find(p, p + 16, '\0'));
+        }
+        off += cmdsize;
+    }
+    return names;
+}
 } // namespace
 
 TEST(MachOExecWriter, ChainedFixupsLcPresent) {
@@ -3704,19 +3847,112 @@ TEST(MachOExecWriter, ChainedFixupsSymbolsPoolContainsExternName) {
            "→ payload pool flow";
 }
 
-// 8aabc04 audit fold (test-analyzer + test-analyzer-dim-2 HIGH):
-// pin LC_DYSYMTAB stays emitted on the chained path. The companion
-// D-LK6-14-INTEGRATION-GOT-SLOTS will drop it together with __got
-// slot bitfield population — a premature regression that drops
-// LC_DYSYMTAB here would produce structurally broken chained
-// binaries with no failing test.
-// D-LK6-14-INTEGRATION-GOT-SLOTS closed: LC_DYSYMTAB is DROPPED on
-// the chained-fixups path (chained pointers in __got encode the
-// import ordinal directly via DYLD_CHAINED_PTR_64 bits [0..23], so
-// the indirect symbol table is redundant). The prior pin (which
-// pinned PRESENCE during the substrate window) is now inverted.
-TEST(MachOExecWriter, ChainedFixupsDropsLcDysymtab) {
-    constexpr std::uint32_t kLcDysymtab = 0x0Bu;
+// ⚠⚠ THIS PIN HAS BEEN INVERTED TWICE, AND THE HISTORY IS THE POINT.
+// 8aabc04 pinned LC_DYSYMTAB PRESENT on the chained path during the substrate
+// window. D-LK6-14-INTEGRATION-GOT-SLOTS then inverted it to ABSENT, on the
+// premise that a chained pointer carries its import ordinal in
+// DYLD_CHAINED_PTR_64 bits so the indirect symbol table is redundant.
+// [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]] refutes
+// that premise and this pin returns to PRESENT — with the CONTENT checked, not
+// only the command, because presence alone was what the first version pinned
+// and it could not have caught a command over an empty or stale region.
+//
+// ★ WHY IT IS NOT A MATTER OF TASTE. `dyld_info -fixups` SIGSEGVs on an image
+// without it (`other_tools::SymbolicatedImage::addStubSymbols()` reads the
+// indirect symbol table unconditionally to name __stubs/__got slots), while
+// dyld LOADS AND RUNS that same image — so nothing at runtime, and no exit
+// code, can see this. ✔MEASURED against ld64 on Apple Silicon with the arm
+// that discriminates: one program, `cc` versus `cc -Wl,-no_fixup_chains`, and
+// LC_DYSYMTAB + the whole indirect table are IDENTICAL across the two.
+namespace {
+constexpr std::uint32_t kLcDysymtabCmd = 0x0Bu;
+// nlist_64: n_strx(4) n_type(1) n_sect(1) n_desc(2) n_value(8).
+constexpr std::size_t   kNlist64Bytes  = 16;
+constexpr std::uint8_t  kNTypeUndefExt = 0x01;  // N_UNDF | N_EXT
+
+// The LEGACY (LC_DYLD_INFO_ONLY) twin of `loadChainedFixupsExecFormat` —
+// character-for-character the same document with `image.useChainedFixups`
+// absent (it defaults to false). ONE owner, because it is the CONTROL arm for
+// every chained-vs-legacy comparison below and two copies of a control that
+// must differ in exactly one key is how a control quietly stops discriminating.
+[[nodiscard]] std::shared_ptr<ObjectFormatSchema const>
+loadLegacyBindingExecFormat() {
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+  "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
+      "format": {"name":"macho-legacy-for-delta","kind":"macho"},
+      "entryPoint": "",
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
+      "entryCallingConvention": "sysv_amd64",
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"]
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ],
+      "relocations":[
+        {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
+        {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
+        {"name":"X86_64_RELOC_UNSIGNED_4","kind":3,"nativeId":33554432}
+      ]
+    })");
+    if (!fmt.has_value()) return nullptr;
+    return *fmt;
+}
+
+// Every indirect-symbol entry of an emitted image, resolved through the nlist
+// and string table the image really carries, as (entryIndex → symbol name).
+// A raw index vector would let a wrong-but-in-range index pass; following it
+// into the table is what makes a mis-bound slot visible.
+[[nodiscard]] std::vector<std::string>
+indirectSymbolNamesOf(std::vector<std::uint8_t> const& bytes) {
+    std::vector<std::string> names;
+    auto const symtabOff = dss::macho::test::findLoadCommand(bytes, 0x02u);
+    auto const dysymOff  = dss::macho::test::findLoadCommand(bytes,
+                                                             kLcDysymtabCmd);
+    if (!symtabOff.has_value() || !dysymOff.has_value()) return names;
+    std::size_t const st = static_cast<std::size_t>(*symtabOff);
+    std::size_t const dy = static_cast<std::size_t>(*dysymOff);
+    std::uint32_t const symoff  = readU32LE(bytes, st + 8);
+    std::uint32_t const nsyms   = readU32LE(bytes, st + 12);
+    std::uint32_t const stroff  = readU32LE(bytes, st + 16);
+    std::uint32_t const indOff  = readU32LE(bytes, dy + 8 + 12 * 4);
+    std::uint32_t const indCount = readU32LE(bytes, dy + 8 + 13 * 4);
+    for (std::uint32_t k = 0; k < indCount; ++k) {
+        std::size_t const at = static_cast<std::size_t>(indOff) + 4u * k;
+        if (at + 4 > bytes.size()) { names.emplace_back("<past EOF>"); continue; }
+        std::uint32_t const idx = readU32LE(bytes, at);
+        if (idx >= nsyms) { names.emplace_back("<out of range>"); continue; }
+        std::size_t const rec =
+            static_cast<std::size_t>(symoff) + kNlist64Bytes * idx;
+        if (rec + kNlist64Bytes > bytes.size()) {
+            names.emplace_back("<record past EOF>"); continue;
+        }
+        if (bytes[rec + 4] != kNTypeUndefExt) {
+            names.emplace_back("<not N_UNDF|N_EXT>"); continue;
+        }
+        std::size_t p = static_cast<std::size_t>(stroff)
+                        + static_cast<std::size_t>(readU32LE(bytes, rec));
+        std::string name;
+        for (; p < bytes.size() && bytes[p] != 0u; ++p)
+            name.push_back(static_cast<char>(bytes[p]));
+        names.push_back(std::move(name));
+    }
+    return names;
+}
+} // namespace
+
+TEST(MachOExecWriter, ChainedFixupsKeepsLcDysymtabOverARealIndirectTable) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = loadChainedFixupsExecFormat();
@@ -3725,15 +3961,220 @@ TEST(MachOExecWriter, ChainedFixupsDropsLcDysymtab) {
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, **target, *fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
-    EXPECT_FALSE(
-        dss::macho::test::findLoadCommand(bytes, kLcDysymtab).has_value())
-        << "LC_DYSYMTAB MUST be absent on the chained-fixups path — "
-           "D-LK6-14-INTEGRATION-GOT-SLOTS closed: chained pointers "
-           "in __got encode the import ordinal directly so the "
-           "indirect symbol table is redundant. A regression that "
-           "re-emits LC_DYSYMTAB here would produce dyld-rejected "
-           "binaries because ncmds/sizeofcmds arithmetic accounts "
-           "for the absence.";
+    auto const dysymOff =
+        dss::macho::test::findLoadCommand(bytes, kLcDysymtabCmd);
+    ASSERT_TRUE(dysymOff.has_value())
+        << "LC_DYSYMTAB MUST be emitted on the chained-fixups path — "
+           "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO. "
+           "ld64 emits it on ITS chained path (measured against its own "
+           "-no_fixup_chains control), and Apple's `dyld_info -fixups` "
+           "dereferences the indirect symbol table it names without checking "
+           "for it, so an image without one CRASHES the reader while still "
+           "loading and running.";
+    std::size_t const dy = static_cast<std::size_t>(*dysymOff);
+    // The command must be the full dysymtab_command, not a stub: cmdsize 80.
+    EXPECT_EQ(readU32LE(bytes, dy + 4), 80u)
+        << "LC_DYSYMTAB cmdsize must be the whole 80-byte dysymtab_command";
+    // ONE function extern → one __stubs entry + one __got entry.
+    EXPECT_EQ(readU32LE(bytes, dy + 8 + 13 * 4), 2u)
+        << "nindirectsyms must be numFuncExterns + numExterns (1 + 1 here) — "
+           "the same two-band table ld64's chained image carries. Anchored "
+           "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO.";
+    std::uint32_t const indOff = readU32LE(bytes, dy + 8 + 12 * 4);
+    EXPECT_NE(indOff, 0u)
+        << "indirectsymoff must name the region, not 0 — a command over no "
+           "region is exactly what the reader walks off the end of";
+    EXPECT_EQ(indOff % 8u, 0u)
+        << "the indirect-symbol region rides the 8-byte __LINKEDIT blob "
+           "chain (D-LINK-MACHO-LINKEDIT-SYMTAB-MISALIGNED)";
+    // Follow every entry into the table it indexes. Both bands name the one
+    // undefined extern the fixture imports.
+    EXPECT_EQ(indirectSymbolNamesOf(bytes),
+              (std::vector<std::string>{"_printf", "_printf"}))
+        << "each indirect entry must resolve to an N_UNDF|N_EXT nlist record "
+           "for the extern its slot binds — __stubs band first, then __got, "
+           "which is the order the two reserved1 origins address";
+}
+
+// The CONTROL for the pin above, and it is what makes that pin a statement
+// about the CHAINED path rather than about the writer in general: the LEGACY
+// fixture — same module, same program, only `image.useChainedFixups` moving —
+// must produce the SAME table. Without this arm, "the chained image has an
+// indirect table" is equally consistent with "every image gets one no matter
+// what", which is true and says nothing about the defect. It is the direct
+// analogue of the `cc` vs `cc -Wl,-no_fixup_chains` arm measured on ld64.
+TEST(MachOExecWriter, LegacyPathCarriesTheSameIndirectTableAsTheChainedPath) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmtChained = loadChainedFixupsExecFormat();
+    ASSERT_NE(fmtChained, nullptr);
+    auto fmtLegacy = loadLegacyBindingExecFormat();
+    ASSERT_NE(fmtLegacy, nullptr);
+    auto mod = chainedFixupsTestModule();
+    DiagnosticReporter rep;
+    auto chained = encodeUntrampolined(mod, **target, *fmtChained, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    auto legacy = encodeUntrampolined(mod, **target, *fmtLegacy, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    auto const dyChained =
+        dss::macho::test::findLoadCommand(chained, kLcDysymtabCmd);
+    auto const dyLegacy =
+        dss::macho::test::findLoadCommand(legacy, kLcDysymtabCmd);
+    ASSERT_TRUE(dyChained.has_value());
+    ASSERT_TRUE(dyLegacy.has_value());
+    // The six band fields plus nindirectsyms are the binding-path-independent
+    // half of the command; only the two file OFFSETS legitimately differ
+    // (the two paths lay different-sized blobs ahead of the region).
+    for (std::size_t f : {0u, 1u, 2u, 3u, 4u, 5u, 13u}) {
+        EXPECT_EQ(readU32LE(chained, static_cast<std::size_t>(*dyChained) + 8
+                                         + 4 * f),
+                  readU32LE(legacy, static_cast<std::size_t>(*dyLegacy) + 8
+                                        + 4 * f))
+            << "LC_DYSYMTAB field #" << f << " must not depend on which "
+               "binding encoding the image uses — the fixup encoding and the "
+               "symbol-table description are orthogonal, exactly as they are "
+               "in ld64's two arms. Anchored "
+               "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO.";
+    }
+    EXPECT_EQ(indirectSymbolNamesOf(chained), indirectSymbolNamesOf(legacy))
+        << "the indirect symbol table must be the same on both paths. Anchored "
+           "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO.";
+    EXPECT_FALSE(indirectSymbolNamesOf(legacy).empty())
+        << "the control arm must itself be non-empty, or the equality above "
+           "is two empty vectors agreeing";
+}
+
+namespace {
+// The ONE extern ORDERING that discriminates the __stubs band's compaction, and
+// until this fixture existed the whole tree lacked it.
+//
+// ★ WHY IT HAD TO BE BUILT RATHER THAN FOUND. The __stubs band pushes
+// `numDefs + funcExternIdxs[j]` — the compaction that skips DATA externs
+// (D-LK-MACHO-DATA-EXTERN-DEAD-STUB). ✔MEASURED: every hand-written Mach-O
+// image fixture in the tree puts its DATA extern AFTER its function externs
+// (`MachOExecWriter.DataExternGetsGotSlotButNoStub` is the only one with an
+// `isData` extern at all, and its data extern sits at index 1), so
+// `funcExternIdxs[j] == j` in all of them and a `j`-for-`funcExternIdxs[j]`
+// mutant is BYTE-IDENTICAL everywhere. The ELF side already orders `dataExt`
+// before `fnExt` in `tests/link/test_elf_dyn_writer.cpp`; the Mach-O side did
+// not, so the compaction was unpinned by CONTENT. Putting the data extern
+// FIRST makes `funcExternIdxs == {1}` while `j` is 0, and the two expressions
+// finally disagree.
+//
+// ⚠ THE PRODUCTION BELT CANNOT COVER THIS, and that is structural rather than
+// an omission to file: `machoIndirectSymbolBreach` checks that each index is in
+// range and lands on an `N_UNDF|N_EXT` record. A compaction slip lands on
+// ANOTHER undefined extern, so it passes — and the belt cannot be strengthened
+// to catch it, because an undefined nlist_64 record carries no function/data
+// distinction (n_sect is 0, n_desc holds the dylib ordinal) and re-deriving the
+// band from the same `funcExternIdxs` the loop used would be the `x == x`
+// tautology that header's own docblock exists to warn against. So the check
+// belongs HERE, over the emitted bytes, where the expected names are written
+// down independently of the arithmetic that produced them.
+// The two binding arms for that fixture, from ONE document text with ONE key
+// toggled. A data import needs `dataImportBinding` declared — the walker
+// refuses without it (D-LK-EXTERN-DATA-IMPORT), which is why neither existing
+// exec fixture can carry this module — and writing the document twice is how a
+// control that must differ in exactly one key quietly stops differing in
+// exactly one key.
+[[nodiscard]] std::shared_ptr<ObjectFormatSchema const>
+loadDataImportExecFormat(bool useChainedFixups) {
+    std::string text = R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"macho-data-import-order","kind":"macho"},
+      "entryPoint": "",
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
+        "importMangledName": "_exit" },
+      "entryCallingConvention": "sysv_amd64",
+      "dataImportBinding": "got-indirect",
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"]__CHAINED__
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ],
+      "relocations":[
+        {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
+        {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
+        {"name":"X86_64_RELOC_UNSIGNED_4","kind":3,"nativeId":33554432}
+      ]
+    })";
+    auto const at = text.find("__CHAINED__");
+    text.replace(at, std::strlen("__CHAINED__"),
+                 useChainedFixups ? ",\n        \"useChainedFixups\": true"
+                                  : "");
+    auto fmt = ObjectFormatSchema::loadFromText(text);
+    if (!fmt.has_value()) return nullptr;
+    return *fmt;
+}
+
+[[nodiscard]] AssembledModule dataExternBeforeFunctionExternModule() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};  // CALL rel32 _f ; RET
+    Relocation rel;
+    rel.offset = 1; rel.target = SymbolId{99};
+    rel.kind = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    // ORDER IS THE WHOLE POINT: the DATA extern is index 0, the FUNCTION extern
+    // index 1. Reverse them and this fixture stops discriminating.
+    ExternImport dataExt{SymbolId{98}, "_d", "/usr/lib/libSystem.B.dylib"};
+    dataExt.isData = true;
+    mod.externImports.push_back(std::move(dataExt));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_f", "/usr/lib/libSystem.B.dylib"});
+    return mod;
+}
+} // namespace
+
+TEST(MachOExecWriter, StubsBandSkipsDataExternWhenItSortsBeforeTheFunction) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmtChained = loadDataImportExecFormat(true);
+    ASSERT_NE(fmtChained, nullptr);
+    auto fmtLegacy = loadDataImportExecFormat(false);
+    ASSERT_NE(fmtLegacy, nullptr);
+    auto mod = dataExternBeforeFunctionExternModule();
+    DiagnosticReporter rep;
+    auto chained = encodeUntrampolined(mod, **target, *fmtChained, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    auto legacy = encodeUntrampolined(mod, **target, *fmtLegacy, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    // ONE function extern → a one-entry __stubs band naming `_f`; then the
+    // __got band, one entry per extern in externImports order, `_d` then `_f`.
+    // A band that read `j` instead of `funcExternIdxs[j]` would name `_d` in
+    // the stub slot — a call to `_f` entering the data import's address.
+    std::vector<std::string> const expected{"_f", "_d", "_f"};
+    EXPECT_EQ(indirectSymbolNamesOf(chained), expected)
+        << "the __stubs band must name the FUNCTION extern even though a DATA "
+           "extern sorts ahead of it — the compaction of "
+           "D-LK-MACHO-DATA-EXTERN-DEAD-STUB, checked by CONTENT. Anchored "
+           "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO.";
+    EXPECT_EQ(indirectSymbolNamesOf(legacy), expected)
+        << "and identically on the legacy binding path — the compaction is a "
+           "property of the extern list, not of the fixup encoding. Anchored "
+           "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO.";
+    // Non-vacuity: the expectation above is only a check if the fixture really
+    // does place a DATA extern ahead of a FUNCTION extern, which is what makes
+    // `funcExternIdxs[0]` (1) differ from `j` (0).
+    ASSERT_EQ(mod.externImports.size(), 2u);
+    EXPECT_TRUE(mod.externImports[0].isData)
+        << "extern #0 must be the DATA one, or this fixture is a duplicate of "
+           "every other Mach-O image fixture and discriminates nothing";
+    EXPECT_FALSE(mod.externImports[1].isData);
 }
 
 // D-LK6-14-INTEGRATION-GOT-SLOTS pin: each __got slot must hold a
@@ -3790,10 +4231,18 @@ TEST(MachOExecWriter, ChainedFixupsGotSlotsHaveBindBitfield) {
     }
     ASSERT_TRUE(dataConstFileOff.has_value())
         << "__DATA_CONST LC_SEGMENT_64 must be present";
-    // D-LK6-14-INTEGRATION-GOT-SLOTS: __got section_64.reserved1
-    // MUST be 0 on the chained path (was numExterns on legacy as
-    // an indirect-symtab index; on chained the indirect symtab is
-    // dropped so the reference becomes invalid). section_64 starts
+    // ⚠ __got section_64.reserved1 IS THE __got BAND'S ORIGIN IN THE INDIRECT
+    // SYMBOL TABLE, ON BOTH BINDING PATHS —
+    // [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]].
+    // D-LK6-14-INTEGRATION-GOT-SLOTS zeroed it on the chained path because it
+    // had dropped the table the index points into; with the table back, a zero
+    // here would make every __got slot claim the __stubs band's entries and be
+    // named after the wrong symbol by `otool -Iv`, `dyld_info` and `nm`. The
+    // fixture imports TWO function externs, so the __stubs band is [0,2) and
+    // __got starts at 2 — a value that moves with the fixture rather than a
+    // constant, which is what makes it a check. ✔MEASURED: ld64's chained arm
+    // and its -no_fixup_chains control publish the same pair.
+    // section_64 starts
     // at segment_command_64 + 72 (cmd(4)+cmdsize(4)+segname[16]
     // +vmaddr(8)+vmsize(8)+fileoff(8)+filesize(8)+maxprot(4)
     // +initprot(4)+nsects(4)+flags(4)); reserved1 within
@@ -3809,10 +4258,22 @@ TEST(MachOExecWriter, ChainedFixupsGotSlotsHaveBindBitfield) {
         << "expected __got at section[0] of __DATA_CONST — a sibling "
            "section reshape would silently shift offsets and read "
            "the wrong section's reserved1.";
-    EXPECT_EQ(readU32LE(bytes, sect0Off + 68), 0u)
-        << "section_64.__got.reserved1 must be 0 on the chained path "
-           "(was numExterns as indirect-symtab index on legacy; the "
-           "indirect symtab is gone so the reference would be stale)";
+    EXPECT_EQ(readU32LE(bytes, sect0Off + 68), 2u)
+        << "section_64.__got.reserved1 must be the __got band's origin in the "
+           "indirect symbol table — numFuncExterns, which is 2 for this "
+           "fixture's two function externs — on the CHAINED path as much as "
+           "the legacy one. A 0 here re-aims every __got slot at the __stubs "
+           "band's entries. Anchored "
+           "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO.";
+    // And the table those origins address must really carry the four entries
+    // the two bands claim: __stubs [0,2) then __got [2,4), each naming the
+    // undefined extern its slot binds.
+    EXPECT_EQ(indirectSymbolNamesOf(bytes),
+              (std::vector<std::string>{"_a", "_b", "_a", "_b"}))
+        << "two bands of two, in stub-then-got order — a reserved1 that is "
+           "right over a table that is wrong would still mis-name every slot. "
+           "Anchored "
+           "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO.";
     // Read slot[0] and slot[1] (8 bytes each).
     std::uint64_t const slot0 = readU64LE(bytes, *dataConstFileOff);
     std::uint64_t const slot1 = readU64LE(bytes, *dataConstFileOff + 8);
@@ -3859,17 +4320,56 @@ TEST(MachOExecWriter, ChainedFixupsPayloadHasStartsInSegment) {
         readU32LE(bytes, *lcOff + 8);
     // starts_offset is at payload+4 (header field).
     std::uint32_t const startsOff = readU32LE(bytes, dataoff + 4);
-    // starts_in_image: seg_count (u32) at startsOff, seg_info_offset[0]
-    // (u32) at startsOff+4.
-    EXPECT_EQ(readU32LE(bytes, dataoff + startsOff), 1u)
-        << "seg_count must be 1 (single __DATA_CONST segment)";
-    std::uint32_t const segInfoOffset =
-        readU32LE(bytes, dataoff + startsOff + 4);
-    EXPECT_EQ(segInfoOffset, 8u)
-        << "seg_info_offset[0] must be 8 (immediately after the "
-           "starts_in_image header); a regression dropping segInfo "
-           "would leave this 0 (substrate behavior) and dyld would "
-           "see 'no chains in segment'";
+    // ── D-LK6-14-CHAINED-STARTS-SEG-COUNT-MISDECLARED ──────────────────
+    // `dyld_chained_starts_in_image` is a table INDEXED BY SEGMENT, so
+    // `seg_count` is the image's LC_SEGMENT_64 count and the table carries
+    // one entry per segment — the chained segment's alone non-zero.
+    // ⚠ THIS CELL PINNED THE DEFECT: it asserted `seg_count == 1` with the
+    // justification "single __DATA_CONST segment", over an image that has
+    // four segments and that Apple's own reader refused with `chained
+    // fixups, seg_count does not match number of segments`.
+    // The expected values are DERIVED from the emitted image below, never
+    // typed as constants — a layout change that adds or drops a segment
+    // moves the pin with it instead of falsifying it.
+    std::vector<std::string> const segs = segmentNamesOf(bytes);
+    ASSERT_EQ(segs.size(), 4u)
+        << "this fixture's image is __PAGEZERO/__TEXT/__DATA_CONST/"
+           "__LINKEDIT; the pins below read the payload against it";
+    auto const dataConstIt =
+        std::find(segs.begin(), segs.end(), std::string{"__DATA_CONST"});
+    ASSERT_NE(dataConstIt, segs.end()) << "__DATA_CONST carries the __got";
+    auto const dataConstIdx = static_cast<std::uint32_t>(
+        std::distance(segs.begin(), dataConstIt));
+    EXPECT_EQ(readU32LE(bytes, dataoff + startsOff),
+              static_cast<std::uint32_t>(segs.size()))
+        << "seg_count must equal the image's LC_SEGMENT_64 count — "
+           "D-LK6-14-CHAINED-STARTS-SEG-COUNT-MISDECLARED";
+    // Table length is 4 + 4 × seg_count; the struct offset is that rounded
+    // up to 8 (`_Alignof(dyld_chained_starts_in_segment)` is 8, and ld64
+    // was measured writing exactly this on real Apple Silicon).
+    constexpr std::size_t kAlign =
+        ::dss::macho::detail::kDyldChainedRegionAlign;
+    std::size_t const tableSize = 4u + 4u * segs.size();
+    std::uint32_t const expectedSegInfoOffset = static_cast<std::uint32_t>(
+        ((tableSize + kAlign - 1u) / kAlign) * kAlign);
+    std::uint32_t segInfoOffset = 0;
+    for (std::uint32_t i = 0; i < segs.size(); ++i) {
+        std::uint32_t const entry =
+            readU32LE(bytes, dataoff + startsOff + 4 + 4 * i);
+        if (i == dataConstIdx) {
+            segInfoOffset = entry;
+            EXPECT_EQ(entry, expectedSegInfoOffset)
+                << "seg_info_offset[" << i << "] (" << segs[i] << ") must "
+                   "point at the starts_in_segment struct; a regression "
+                   "dropping segInfo would leave this 0 and dyld would see "
+                   "'no chains in segment'";
+        } else {
+            EXPECT_EQ(entry, 0u)
+                << "seg_info_offset[" << i << "] (" << segs[i] << ") must be "
+                   "0 — only __DATA_CONST carries chains";
+        }
+    }
+    ASSERT_EQ(segInfoOffset, expectedSegInfoOffset);
     // dyld_chained_starts_in_segment at startsOff + 8:
     //   [ 0.. 3] size           [ 4.. 5] page_size
     //   [ 6.. 7] pointer_format [ 8..15] segment_offset
@@ -3904,6 +4404,55 @@ TEST(MachOExecWriter, ChainedFixupsPayloadHasStartsInSegment) {
            "0 of the page — __got starts at __DATA_CONST start)";
 }
 
+// D-LK6-14-CHAINED-STARTS-SEG-COUNT-MISDECLARED — the CONTROL arm.
+// The same program plus one writable global gains a __DATA segment, and the
+// payload must follow it: seg_count 5, the table one entry wider, and the
+// chained entry at __DATA_CONST's NEW ordinal. Without this arm, the pin
+// above is equally consistent with a writer that emits the constant 4 — and
+// emitting a constant is precisely the defect. It reproduces the shape of
+// the ld64 measurement (a four-segment exec and its five-segment twin).
+TEST(MachOExecWriter, ChainedFixupsStartsInImageTracksTheImageSegmentCount) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = loadChainedFixupsExecFormatWithData();
+    ASSERT_NE(fmt, nullptr);
+    auto mod = chainedFixupsTestModuleWithData();
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, **target, *fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    std::vector<std::string> const segs = segmentNamesOf(bytes);
+    ASSERT_EQ(segs.size(), 5u)
+        << "a writable global adds __DATA: __PAGEZERO/__TEXT/__DATA_CONST/"
+           "__DATA/__LINKEDIT";
+    auto const dataConstIt =
+        std::find(segs.begin(), segs.end(), std::string{"__DATA_CONST"});
+    ASSERT_NE(dataConstIt, segs.end());
+    auto const dataConstIdx = static_cast<std::uint32_t>(
+        std::distance(segs.begin(), dataConstIt));
+
+    auto const lcOff =
+        dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups);
+    ASSERT_TRUE(lcOff.has_value());
+    std::uint32_t const dataoff   = readU32LE(bytes, *lcOff + 8);
+    std::uint32_t const startsOff = readU32LE(bytes, dataoff + 4);
+    EXPECT_EQ(readU32LE(bytes, dataoff + startsOff), 5u)
+        << "seg_count must be 5 here and 4 for the __DATA-free twin — the "
+           "value TRACKS the image, it is not a constant — "
+           "D-LK6-14-CHAINED-STARTS-SEG-COUNT-MISDECLARED";
+    // 4 + 4×5 = 24, already 8-aligned, so no padding this time. The twin's
+    // table ends at 20 and pads to 24: the two arms exercise BOTH parities
+    // of the alignment, which is the same pair ld64 was measured on.
+    EXPECT_EQ(readU32LE(bytes, dataoff + startsOff + 4 + 4 * dataConstIdx),
+              24u)
+        << "seg_info_offset[__DATA_CONST] = the 24-byte table, 8-aligned";
+    for (std::uint32_t i = 0; i < segs.size(); ++i) {
+        if (i == dataConstIdx) continue;
+        EXPECT_EQ(readU32LE(bytes, dataoff + startsOff + 4 + 4 * i), 0u)
+            << "seg_info_offset[" << i << "] (" << segs[i] << ") must be 0";
+    }
+}
+
 // D-LK6-14-SIZEOFCMDS-DELTA-PIN: chained path's sizeofcmds must be
 // exactly `kDysymtabCommandSize` (80) less than legacy path's (since
 // LC_DYSYMTAB is dropped on chained). Pins the ncmds/sizeofcmds
@@ -3911,44 +4460,15 @@ TEST(MachOExecWriter, ChainedFixupsPayloadHasStartsInSegment) {
 TEST(MachOExecWriter, ChainedFixupsSizeofcmdsDelta) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
-    // Legacy fixture (useChainedFixups absent → defaults to false).
-    // Its entry cluster mirrors the chained fixture's — required by
-    // validate() on an MH_EXECUTE schema (D-LK10-ENTRY 2.13) and
-    // IDENTICAL on both sides, so the sizeofcmds delta pinned below
-    // isolates exactly the LC_DYLD_INFO_ONLY/LC_DYSYMTAB swap.
-    auto fmtLegacy = ObjectFormatSchema::loadFromText(R"({
-      "dssObjectFormatVersion": 1,
-      "cSymbolDecoration": { "scheme": "leading-underscore" },
-      "cCallingConvention": { "convention": "sysv_amd64" },
-      "outputExtension": ".dylib",
-  "dataModel": "LP64",
-  "headerNameMatching": "case-sensitive",
-      "format": {"name":"macho-legacy-for-delta","kind":"macho"},
-      "entryPoint": "",
-      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
-      "entryVerbs": ["none","argc-argv"],
-      "processExit": { "mechanism": "by-name-import", "role": "cLibrary",
-        "importMangledName": "_exit" },
-      "entryCallingConvention": "sysv_amd64",
-      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
-      "image": {
-        "pageZeroSize": 4294967296,
-        "dylinkerPath": "/usr/lib/dyld",
-        "loadDylibs": ["/usr/lib/libSystem.B.dylib"]
-      },
-      "sections":[
-        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
-      ],
-      "relocations":[
-        {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
-        {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
-        {"name":"X86_64_RELOC_UNSIGNED_4","kind":3,"nativeId":33554432}
-      ]
-    })");
-    ASSERT_TRUE(fmtLegacy.has_value());
+    // The legacy fixture's entry cluster mirrors the chained one's — required
+    // by validate() on an MH_EXECUTE schema (D-LK10-ENTRY 2.13) and IDENTICAL
+    // on both sides, so the delta pinned below isolates exactly the
+    // LC_DYLD_INFO_ONLY ↔ LC_DYLD_CHAINED_FIXUPS swap.
+    auto fmtLegacy = loadLegacyBindingExecFormat();
+    ASSERT_NE(fmtLegacy, nullptr);
     auto mod = chainedFixupsTestModule();
     DiagnosticReporter rep;
-    auto bytesLegacy = encodeUntrampolined(mod, **target, **fmtLegacy, rep);
+    auto bytesLegacy = encodeUntrampolined(mod, **target, *fmtLegacy, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     auto fmtChained = loadChainedFixupsExecFormat();
     ASSERT_NE(fmtChained, nullptr);
@@ -3959,13 +4479,40 @@ TEST(MachOExecWriter, ChainedFixupsSizeofcmdsDelta) {
         readU32LE(bytesLegacy, 20);
     std::uint32_t const sizeofcmdsChained =
         readU32LE(bytesChained, 20);
-    // Delta = LC_DYLD_INFO_ONLY (48) - LC_DYLD_CHAINED_FIXUPS (16)
-    //       + LC_DYSYMTAB (80, dropped on chained) = 112.
-    EXPECT_EQ(sizeofcmdsLegacy - sizeofcmdsChained, 112u)
-        << "sizeofcmds delta: legacy emits LC_DYLD_INFO_ONLY (48) + "
-           "LC_DYSYMTAB (80) = 128; chained emits LC_DYLD_CHAINED_"
-           "FIXUPS (16) only = 16; delta = 112. Regression in any "
-           "arm of the ternary or in the LC sizes would shift this.";
+    // ⚠ THE DELTA HAS A THIRD TERM, AND IT IS ZERO ONLY BECAUSE OF THIS
+    // FIXTURE. In full it is
+    //     LC_DYLD_INFO_ONLY (48) − LC_DYLD_CHAINED_FIXUPS (16)
+    //       − LC_DYLD_EXPORTS_TRIE (16, chained-only)
+    // because the writer emits LC_DYLD_EXPORTS_TRIE when `useChainedFixups`
+    // AND the export-trie blob is non-empty, while the legacy arm carries its
+    // trie inside LC_DYLD_INFO_ONLY's own export fields at no extra command.
+    // This module defines no weak symbol and the schema's filetype is
+    // `execute`, so the exec arm builds NO trie, the third term is 0 and the
+    // delta is 32. Grow this fixture a weak definition and it becomes 16 — so
+    // the premise is ASSERTED below rather than left as a comment, because a
+    // silent 32 → 16 would read as a regression in the two commands this cell
+    // is actually about.
+    constexpr std::uint32_t kLcDyldExportsTrie = 0x80000033u;
+    ASSERT_FALSE(dss::macho::test::findLoadCommand(bytesChained,
+                                                   kLcDyldExportsTrie)
+                     .has_value())
+        << "this fixture must define no exported trie terminal — the 32 below "
+           "is the two-command delta only while LC_DYLD_EXPORTS_TRIE is absent "
+           "from the chained arm";
+    // Delta = LC_DYLD_INFO_ONLY (48) - LC_DYLD_CHAINED_FIXUPS (16) = 32.
+    // ⚠ IT WAS 112 UNTIL
+    // [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]], and
+    // the missing 80 was LC_DYSYMTAB — a command the chained arm dropped and
+    // ld64 does not. This cell is the arithmetic half of that closure: the
+    // ONLY load command the two paths differ by is now the binding command
+    // itself, which is what "orthogonal" means when written as a number.
+    EXPECT_EQ(sizeofcmdsLegacy - sizeofcmdsChained, 32u)
+        << "sizeofcmds delta: legacy emits LC_DYLD_INFO_ONLY (48), chained "
+           "emits LC_DYLD_CHAINED_FIXUPS (16); both emit LC_SYMTAB and "
+           "LC_DYSYMTAB, so the delta is 32. A regression that drops "
+           "LC_DYSYMTAB from the chained arm again would read 112 here. "
+           "Anchored "
+           "D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO.";
 }
 
 // D-LK6-14-MULTI-PAGE-GOT guard pin (2ba0489 audit fold, test-
@@ -5089,4 +5636,1828 @@ TEST(MachOTlvWriter, NoThreadLocalEmitsNoThreadSectionsSqliteDormant) {
     // closure pin — it goes red if the TLV bit is ever made unconditional.
     EXPECT_EQ(readU32LE(bytes, 24) & 0x00800000u, 0u)
         << "no-TLS image must NOT set MH_HAS_TLV_DESCRIPTORS";
+}
+
+// ══ D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ═══════
+//
+// The install name IS the dylib's runtime identity — the string a client
+// records at link time and dyld resolves at load — so a fixed string in shared
+// config gives every artifact of that format ONE identity. ✔MEASURED before the
+// fix, through the real driver: two distinct DSS-built dylibs both named on
+// `--resolve-library` produced rc 0, ZERO diagnostics, and an executable
+// recording ONE `LC_LOAD_DYLIB @rpath/libdss.dylib`, while the ELF control on
+// the identical shape recorded TWO correct `DT_NEEDED` entries.
+//
+// ★ THESE ARE THE WRITER-TIER ARMS: that the shipped documents DECLARE the
+// artifact-keyed shape, that two emissions differing ONLY in artifact name
+// produce DIFFERENT LC_ID_DYLIB bytes, and that an emission which cannot name
+// its artifact is REFUSED rather than given a fabricated identity. The
+// end-to-end arm — that the RECORDER then tells the two libraries apart
+// WITHOUT being handed a stated import name — is a driver question and lives in
+// `tests/program/test_macho_install_name_identity.cpp`.
+
+namespace {
+
+struct DylibLeg {
+    char const* label;
+    char const* target;
+    char const* format;
+};
+
+// ⚠ ONE PHYSICAL LINE, AND THAT IS A RULE RATHER THAN A FORMATTING CHOICE. An
+// anchor id split across two string-literal fragments still COMPILES and still
+// MATCHES at run time, so nothing here would fail — but every grep in the
+// project, `anchor_registry_guard` included, then sees the first fragment as a
+// whole id and MINTS one that does not exist. ✔MEASURED in this very file: the
+// wrapped form made `anchor_registry_guard` report TWO unresolved ids where one
+// row was missing — the real one, and a phantom ending at the wrap point.
+// ⚠ AND THE FIX HAS THE SAME TRAP ON ITS OTHER SIDE: naming that phantom here,
+// even inside prose explaining it, MINTS IT AGAIN. ✔MEASURED — the first draft
+// of this very comment quoted it and the guard reported it a second time. Talk
+// about the truncation; never spell one.
+constexpr char const* kInstallNameAnchorId = "D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT";
+
+// Both shipped darwin dylib documents, because a declaration fixed on one port
+// and forgotten on the other is exactly the asymmetry this suite exists to
+// notice.
+constexpr DylibLeg kDylibLegs[] = {
+    {"arm64",  "arm64",  "macho64-arm64-darwin-dylib"},
+    {"x86_64", "x86_64", "macho64-x86_64-darwin-dylib"},
+};
+
+// The LC_ID_DYLIB payload of an emitted image, or nullopt when the command is
+// absent. Reads the command's own `lc_str` offset rather than assuming 24, so a
+// future wire-shape change fails as a MISSING NAME rather than as garbage.
+[[nodiscard]] std::optional<std::string>
+readIdDylibName(std::span<std::uint8_t const> bytes) {
+    constexpr std::uint32_t kLcIdDylibCmd = 0x0Du;
+    auto const at = dss::macho::test::findLoadCommand(bytes, kLcIdDylibCmd);
+    if (!at.has_value()) return std::nullopt;
+    std::uint32_t const nameOff = readU32LE(bytes, *at + 8);
+    if (*at + nameOff >= bytes.size()) return std::nullopt;
+    return std::string(reinterpret_cast<char const*>(&bytes[*at + nameOff]));
+}
+
+// A minimal exportable dylib module: one externally-visible function, which is
+// all the export trie needs and all these arms care about.
+[[nodiscard]] AssembledModule makeInstallNameDylibModule() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};   // arm64 `ret`; opaque bytes here
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_dss_add",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    return mod;
+}
+
+} // namespace
+
+TEST(MachoDylibInstallName, ShippedDocumentsDeclareTheArtifactNotAConstant) {
+    for (auto const& leg : kDylibLegs) {
+        SCOPED_TRACE(leg.label);
+        auto fmt = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(fmt.has_value());
+        auto const declared = (*fmt)->machoImage().installName;
+        // The placeholder must be PRESENT. A document that declared a literal
+        // would emit one identity for every artifact, which is the defect.
+        EXPECT_TRUE(dss::declaresArtifactIdentityPlaceholder(declared))
+            << "the shipped '" << leg.format << "' document declares '"
+            << declared << "', which is a CONSTANT: every dylib this format "
+               "produces would embed that one LC_ID_DYLIB, and a program "
+               "loading two of them would resolve the name once and lose the "
+               "second library's symbols";
+        EXPECT_NE(declared.find(dss::kArtifactFileNamePlaceholder),
+                  std::string::npos)
+            << "declared '" << declared << "'";
+        // ...and the replaced constant must not have survived anywhere in it.
+        EXPECT_EQ(declared.find("libdss.dylib"), std::string::npos)
+            << "the replaced constant is still present in '" << declared << "'";
+    }
+}
+
+TEST(MachoDylibInstallName, TwoArtifactsOfOneFormatGetDifferentIdentities) {
+    for (auto const& leg : kDylibLegs) {
+        SCOPED_TRACE(leg.label);
+        auto target = TargetSchema::loadShipped(leg.target);
+        auto fmt    = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(target.has_value());
+        ASSERT_TRUE(fmt.has_value());
+
+        // The SAME module and the SAME format, twice — the only difference is
+        // the artifact being produced. Anything shared between the two
+        // emissions (a constant, a field cached on the memoized schema)
+        // collapses them, which is precisely what shipped before.
+        DiagnosticReporter repA;
+        auto const bytesA = dss::macho::encode(
+            makeInstallNameDylibModule(), **target, **fmt, repA,
+            dss::ImageRequest{.artifactFileName = "alpha.dylib"});
+        for (auto const& d : repA.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(repA.errorCount(), 0u);
+
+        DiagnosticReporter repB;
+        auto const bytesB = dss::macho::encode(
+            makeInstallNameDylibModule(), **target, **fmt, repB,
+            dss::ImageRequest{.artifactFileName = "beta_longer.dylib"});
+        for (auto const& d : repB.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(repB.errorCount(), 0u);
+
+        auto const nameA = readIdDylibName(bytesA);
+        auto const nameB = readIdDylibName(bytesB);
+        ASSERT_TRUE(nameA.has_value());
+        ASSERT_TRUE(nameB.has_value());
+        EXPECT_EQ(*nameA, "@rpath/alpha.dylib");
+        EXPECT_EQ(*nameB, "@rpath/beta_longer.dylib");
+        EXPECT_NE(*nameA, *nameB)
+            << "two artifacts of one format embedded the SAME LC_ID_DYLIB";
+        // ★ THE SIZE, NOT ONLY THE PAYLOAD. The command is SIZED once and
+        // EMITTED once, from two reads of the same declaration, so a resolution
+        // done twice (or a size taken from the unresolved template) desyncs
+        // `cmdsize` from its payload. The two names differ in length by more
+        // than the 8-byte command alignment, so the two `cmdsize` values must
+        // differ too — and each must be large enough to hold its own
+        // NUL-terminated name past the `lc_str` offset.
+        // ⚠ NOT the total image size: ✔MEASURED that both images come out at
+        // 8474 bytes, because __LINKEDIT padding absorbs a name-length change.
+        // A whole-image size comparison LOOKS like this property and is not it.
+        constexpr std::uint32_t kLcIdDylibCmd = 0x0Du;
+        auto const atA = dss::macho::test::findLoadCommand(bytesA, kLcIdDylibCmd);
+        auto const atB = dss::macho::test::findLoadCommand(bytesB, kLcIdDylibCmd);
+        ASSERT_TRUE(atA.has_value());
+        ASSERT_TRUE(atB.has_value());
+        std::uint32_t const sizeA = readU32LE(bytesA, *atA + 4);
+        std::uint32_t const sizeB = readU32LE(bytesB, *atB + 4);
+        EXPECT_NE(sizeA, sizeB)
+            << "one LC_ID_DYLIB cmdsize served two identities of different "
+               "lengths — the size did not follow the resolved name";
+        EXPECT_GE(sizeA, readU32LE(bytesA, *atA + 8) + nameA->size() + 1u);
+        EXPECT_GE(sizeB, readU32LE(bytesB, *atB + 8) + nameB->size() + 1u);
+    }
+}
+
+TEST(MachoDylibInstallName, AnEmissionThatCannotNameItsArtifactIsRefused) {
+    for (auto const& leg : kDylibLegs) {
+        SCOPED_TRACE(leg.label);
+        auto target = TargetSchema::loadShipped(leg.target);
+        auto fmt    = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(target.has_value());
+        ASSERT_TRUE(fmt.has_value());
+
+        // No artifact name on the request. There is deliberately no fallback:
+        // substituting anything fixed here rebuilds the collapse.
+        DiagnosticReporter rep;
+        auto const bytes =
+            dss::macho::encode(makeInstallNameDylibModule(), **target, **fmt,
+                               rep, dss::ImageRequest{});
+        EXPECT_TRUE(bytes.empty())
+            << "an image was emitted despite an unresolvable identity";
+        ASSERT_GT(rep.errorCount(), 0u)
+            << "silently emitting SOME identity is the defect, not the fix";
+        bool named = false;
+        for (auto const& d : rep.all()) {
+            if (d.code == DiagnosticCode::K_WalkerInputContractViolation
+                && d.actual.find("image.installName") != std::string::npos
+                && d.actual.find(kInstallNameAnchorId) != std::string::npos) {
+                named = true;
+            }
+        }
+        EXPECT_TRUE(named)
+            << "the refusal must name its key AND its anchor; got: "
+            << diagSummary(rep);
+    }
+}
+
+TEST(MachoDylibInstallName, AnUnknownPlaceholderIsRefusedRatherThanShipped) {
+    // A mis-spelled placeholder is a property of the DOCUMENT, so it fails
+    // where the document is read. Passed through, it would ship as literal text
+    // inside a binary's runtime identity and be discovered by a loader.
+    auto const misspelled =
+        dss::resolveArtifactIdentity("@rpath/${artifcatFileName}", "a.dylib");
+    ASSERT_FALSE(misspelled.has_value());
+    EXPECT_NE(misspelled.error().find("artifcatFileName"), std::string::npos)
+        << misspelled.error();
+
+    // An unterminated placeholder is the other half of the same rule.
+    auto const unterminated =
+        dss::resolveArtifactIdentity("@rpath/${artifactFileName", "a.dylib");
+    EXPECT_FALSE(unterminated.has_value());
+
+    // CONTROL, in the same arm so "everything is refused" cannot pass for the
+    // property: a LITERAL identity carries no placeholder and resolves to
+    // ITSELF, with or without an artifact name — which is also why a dylib that
+    // genuinely wants a fixed identity (ld64's own `-install_name`) still can.
+    auto const literal =
+        dss::resolveArtifactIdentity("@rpath/libfixed.dylib", "");
+    ASSERT_TRUE(literal.has_value());
+    EXPECT_EQ(*literal, "@rpath/libfixed.dylib");
+
+    // ...and the document LOADER refuses the mis-spelling at its SOURCE, so a
+    // mis-spelled placeholder can never reach a walker at all.
+    auto const rejected = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"typo-dylib","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "dylib", "flags": 0 },
+      "image": { "pageZeroSize": 0, "segmentPageSize": 4096,
+                 "installName": "@rpath/${artifcatFileName}",
+                 "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_FALSE(rejected.has_value())
+        << "a document naming an unknown placeholder loaded cleanly";
+    EXPECT_EQ(countAtPath(rejected, "/image/installName"), 1u)
+        << rejectSummary(rejected);
+
+    // CONTROL, byte-identical but for the spelling: it LOADS. Without it,
+    // "the document was rejected" is equally consistent with "this fixture is
+    // rejected for some unrelated reason".
+    auto const accepted = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"typo-dylib","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "dylib", "flags": 0 },
+      "image": { "pageZeroSize": 0, "segmentPageSize": 4096,
+                 "installName": "@rpath/${artifactFileName}",
+                 "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })");
+    EXPECT_TRUE(accepted.has_value()) << rejectSummary(accepted);
+}
+
+// ★★★ THE NEAR-MISS TABLE — every spelling an author might reach for, PINNED
+// IN BOTH DIRECTIONS, because the first cut of this vocabulary closed only over
+// the two-character `${` and SIX other spellings shipped silently.
+//
+// ✔MEASURED end to end through `dsscp.exe` with a copied `DSS_CONFIG_ROOT`
+// whose arm64 darwin dylib document carried each spelling in turn (cycle P62,
+// lane `mo` remediation, after an independent review found four of the six):
+//
+//   @rpath/$(artifactFileName)   → rc 0, LC_ID_DYLIB '@rpath/$(artifactFileName)'
+//   @rpath/$artifactFileName     → rc 0, LC_ID_DYLIB '@rpath/$artifactFileName'
+//   @rpath/$ {artifactFileName}  → rc 0, LC_ID_DYLIB '@rpath/$ {artifactFileName}'
+//   @rpath/$${artifactFileName}  → rc 0, LC_ID_DYLIB '@rpath/$probe.dylib'
+//   @rpath/a$b.dylib             → rc 0, LC_ID_DYLIB '@rpath/a$b.dylib'
+//   @rpath/${artifactFileName}$  → rc 0, LC_ID_DYLIB '@rpath/probe.dylib$'
+//   @rpath/{artifactFileName}    → rc 0, LC_ID_DYLIB '@rpath/{artifactFileName}'
+//
+// `$(NAME)` is Make's and the shell's spelling and `$NAME` is sh's — the two
+// likeliest wrong guesses — and each one gave EVERY artifact of that format ONE
+// literal identity: precisely the collapse
+// D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT exists to
+// end, reachable by a plausible typo, with rc 0 and zero diagnostics.
+//
+// ⚠ AND THE PROSE CLAIMED OTHERWISE. The header's "★ THE PLACEHOLDER IS A
+// CLOSED VOCABULARY, AND AN UNKNOWN ONE IS A REFUSAL" and this row's own
+// trigger cell were both TRUE for one typo class and FALSE for these. A comment
+// stating a guarantee the code does not provide is an unfiled defect.
+//
+// ⇒ The rule is now: every `$` must open a well-formed `${key}` from the closed
+//   set, AND a key name must not appear outside a placeholder. The ACCEPT rows
+//   below are what makes this a table rather than a blanket refusal — without
+//   them "everything is rejected" would pass.
+TEST(MachoDylibInstallName, EveryNearMissSpellingOfThePlaceholderIsRefused) {
+    struct Row {
+        std::string_view declared;
+        // nullopt = must be REFUSED; a value = must resolve to exactly this.
+        std::optional<std::string_view> resolved;
+        std::string_view why;
+    };
+    constexpr std::string_view kArtifact = "probe.dylib";
+    const Row rows[] = {
+        // ── ACCEPT. The vocabulary still works, and a literal is still legal.
+        {"@rpath/${artifactFileName}", "@rpath/probe.dylib",
+         "the declared spelling, which both shipped documents use"},
+        {"@rpath/${artifactFileName}.${artifactFileName}",
+         "@rpath/probe.dylib.probe.dylib",
+         "two placeholders in one identity — the scan is a loop, not a "
+         "single-shot replace"},
+        {"@rpath/libfixed.dylib", "@rpath/libfixed.dylib",
+         "a literal identity is an explicit, config-visible choice "
+         "(ld64's -install_name), not a code fallback"},
+        {"", "", "an empty declaration resolves to itself; the REQUIRED check "
+                 "belongs to validate(), not to the resolver"},
+        // ── REFUSE, `${...}`-shaped: the class the first cut already caught.
+        {"@rpath/${artifcatFileName}", std::nullopt, "a typo INSIDE the braces"},
+        {"@rpath/${artifactFileName", std::nullopt, "unterminated"},
+        {"@rpath/${}", std::nullopt, "empty key"},
+        {"@rpath/${ artifactFileName }", std::nullopt, "padded key"},
+        {"@rpath/${${artifactFileName}}", std::nullopt, "nested"},
+        // ── REFUSE, OTHER DIALECTS. The six that used to ship.
+        {"@rpath/$(artifactFileName)", std::nullopt,
+         "Make's and the shell's spelling — the likeliest wrong guess"},
+        {"@rpath/$artifactFileName", std::nullopt, "sh's spelling"},
+        {"@rpath/$ {artifactFileName}", std::nullopt, "a space after the sigil"},
+        {"@rpath/$${artifactFileName}", std::nullopt,
+         "the shell's ESCAPE guess; it used to resolve to '@rpath/$probe.dylib'"},
+        {"@rpath/a$b.dylib", std::nullopt, "a stray sigil in the middle"},
+        {"@rpath/${artifactFileName}$", std::nullopt,
+         "a stray sigil AFTER a good placeholder — the half-right case"},
+        {"@rpath/{artifactFileName}", std::nullopt,
+         "the key with NO sigil at all: the sigil scan has nothing to see, so "
+         "the key-outside-a-placeholder rule is what catches it"},
+    };
+    for (auto const& row : rows) {
+        SCOPED_TRACE(std::string{row.declared} + "  — " + std::string{row.why});
+        auto const got = dss::resolveArtifactIdentity(row.declared, kArtifact);
+        if (row.resolved.has_value()) {
+            ASSERT_TRUE(got.has_value())
+                << "a legal identity was refused: " << got.error();
+            EXPECT_EQ(*got, *row.resolved);
+        } else {
+            ASSERT_FALSE(got.has_value())
+                << "SHIPPED as the artifact's literal runtime identity: '"
+                << *got << "'";
+            // The refusal must be about THIS key, not a generic parse moan —
+            // a message that does not name the subject cannot be acted on.
+            EXPECT_NE(got.error().find(row.declared), std::string::npos)
+                << "the refusal does not quote the declared identity: "
+                << got.error();
+        }
+    }
+}
+
+// The same table, one level up: a DOCUMENT carrying a near-miss must fail at
+// LOAD. Without this the rule would hold in a helper nobody is obliged to call,
+// and the sigil check lives in the schema tier precisely so every format key
+// that ever adopts the vocabulary inherits it rather than re-implementing it.
+TEST(MachoDylibInstallName, ANearMissSpellingIsRefusedAtDocumentLoad) {
+    auto docWith = [](std::string_view installName) {
+        return std::string{R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"nearmiss-dylib","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "dylib", "flags": 0 },
+      "image": { "pageZeroSize": 0, "segmentPageSize": 4096,
+                 "installName": ")"} + std::string{installName} + R"(",
+                 "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })";
+    };
+    constexpr std::string_view kNearMisses[] = {
+        "@rpath/$(artifactFileName)",
+        "@rpath/$artifactFileName",
+        "@rpath/{artifactFileName}",
+        "@rpath/${artifactFileName}$",
+    };
+    for (auto const& spelling : kNearMisses) {
+        SCOPED_TRACE(std::string{spelling});
+        auto const rejected = ObjectFormatSchema::loadFromText(docWith(spelling));
+        ASSERT_FALSE(rejected.has_value())
+            << "the document loaded, so this spelling reaches a binary";
+        EXPECT_EQ(countAtPath(rejected, "/image/installName"), 1u)
+            << rejectSummary(rejected);
+    }
+    // CONTROL, same fixture, correct spelling: it LOADS. Without it, "rejected"
+    // is equally consistent with "this fixture is broken".
+    auto const accepted = ObjectFormatSchema::loadFromText(
+        docWith("@rpath/${artifactFileName}"));
+    EXPECT_TRUE(accepted.has_value()) << rejectSummary(accepted);
+}
+
+// ══ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING — the Mach-O realization ══
+//
+// A shared library's call to its OWN preemptible definition must be resolved by
+// the LOADER, not branched to the local body: dyld coalesces weak definitions
+// across images, so another image may win the name, and a library that took the
+// direct branch answers one identifier differently from every other image in
+// the process — silently. ✔MEASURED cycle P61 on Apple Silicon: a DSS-built
+// dylib returned rc 1 (its own body) where the ld64-built one from identical
+// source returned rc 2 (the consumer's).
+//
+// ★ THE ENCODING IS A SECOND STREAM, NOT A SPECIAL ORDINAL, and that had to be
+// measured rather than read off `<mach-o/loader.h>`. ✔MEASURED 2026-09-06 on
+// the operator's Apple Silicon host (macOS 25.6.0, Apple clang 21.0.0 /
+// ld-1267): built the modern way ld64 emits LC_DYLD_CHAINED_FIXUPS and
+// `dyld_info -fixups` prints `bind <weak-def-coalesce>/_w`; asked for the
+// legacy shape DSS's shipped dylib document actually emits
+// (`-Wl,-no_fixup_chains`) the SAME source gives `bind_size 0` and
+// `weak_bind_size 16`, whose whole content is the byte string this suite pins.
+// The weak stream carries NO dylib ordinal at all — which IS the coalescing
+// scope: dyld searches every loaded image instead of one named library.
+//
+// The CONTROLS from that same probe, all built by one clang from one shape: a
+// dylib's call to its own STRONG GLOBAL and to a `static` each stayed a DIRECT
+// `bl` with an empty weak stream. That is why the Mach-O preemptible set is
+// `["weak"]` and a strict subset of ELF's, and it is pinned as a declaration in
+// `link/test_preemptible_definition_declaration`.
+//
+// ⛔ NOT PINNED HERE, because no writer test can: the divergence itself needs a
+// RIVAL definition in a second image. That run was taken on real hardware — a
+// DSS-built dylib under an Apple-clang executable defining a rival weak body
+// returned rc 2, against the ld64-built control's rc 2 in the same session.
+//
+// ⚠⚠ AND THE RUN'S "RELEASE" ARM WAS VACUOUS, WHICH IS RECORDED RATHER THAN
+// QUIETLY DROPPED. It was first reported as "rc 2 in debug AND release". An
+// independent review MEASURED that the two files pushed to the Apple Silicon
+// host had the SAME md5: the witness source was so small that `--config=release`
+// transformed nothing, so one measurement was reported twice. The hardware run
+// therefore witnesses ONE configuration, not two.
+// ✔RE-MEASURED here on a subject with real optimizer work
+// (`examples/c/two_dynlibs_distinct_identity/dssalpha.c`, whose weak definition
+// runs a loop over an inlinable helper), arm64 darwin dylib through the same
+// `build/mo` binaries:
+//     debug   md5 3d98c766b00abd95f219c42ffa29f4b3
+//     release md5 dc3d0968ca775b409b136564e823404d   ← the bytes DO differ
+//     both: LC_ID_DYLIB '@rpath/dssalpha.dylib', weak stream (24 bytes)
+//           405f616c7068615f7765616b5f7061727400517100900000 — IDENTICAL,
+//           and `_alpha_answer`'s BL lands INSIDE __TEXT.__stubs in both.
+//     (debug carries a second, DIRECT BL to the `static` helper; release
+//      inlines it away — which is the proof the release arm did real work.)
+// ⇒ The ROUTING survives release; the RUN witness covers one configuration.
+//   Two claims, separately sourced, because one of them was not measured.
+
+namespace {
+
+// The exact bytes Apple's ld64 emits for one coalescing-scope reference to
+// `_w`, taken from the legacy-shape probe above and reproduced here as the
+// oracle. Read: SET_SYMBOL_TRAILING_FLAGS_IMM(0) "_w"\0 | SET_TYPE_IMM(POINTER)
+// | SET_SEGMENT_AND_OFFSET_ULEB(segment 1 == __DATA_CONST) + 0 | DO_BIND.
+constexpr std::uint8_t kLd64WeakBindEntryForW[] = {
+    0x40, 0x5F, 0x77, 0x00, 0x51, 0x71, 0x00, 0x90,
+};
+
+// The LC_DYLD_INFO_ONLY (off, size) pair for one of the five streams, by field
+// index: 0 rebase, 1 bind, 2 weak, 3 lazy, 4 export.
+[[nodiscard]] std::optional<std::pair<std::uint32_t, std::uint32_t>>
+dyldInfoStream(std::span<std::uint8_t const> bytes, unsigned field) {
+    constexpr std::uint32_t kLcDyldInfoOnly = 0x80000022u;
+    auto const at = dss::macho::test::findLoadCommand(bytes, kLcDyldInfoOnly);
+    if (!at.has_value()) return std::nullopt;
+    return std::pair{readU32LE(bytes, *at + 8 + field * 8),
+                     readU32LE(bytes, *at + 12 + field * 8)};
+}
+
+// A dylib module whose ONLY import is the coalescing-scope reference the engine
+// mints for a call to this artifact's own preemptible definition: an empty
+// `libraryPath` (there is no library to name — the winner may be any image) and
+// `isPreemptionReference` set. The definition itself is in the module, exported
+// WEAK, which is what makes the reference resolvable at all.
+[[nodiscard]] AssembledModule makeCoalescingScopeModule() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_w",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+    ExternImport ref{SymbolId{2}, "_w", ""};
+    ref.isPreemptionReference = true;
+    ref.binding = SymbolBinding::Weak;
+    mod.externImports.push_back(std::move(ref));
+    return mod;
+}
+
+// The CONTROL module: the same shape with an ORDINARY named-library import in
+// place of the coalescing-scope one. Everything else is identical, so a
+// difference between the two is attributable to the one field that differs.
+[[nodiscard]] AssembledModule makeNamedImportModule() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_w",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+    mod.externImports.push_back(
+        ExternImport{SymbolId{2}, "_w", "/usr/lib/libSystem.B.dylib"});
+    return mod;
+}
+
+} // namespace
+
+TEST(MachoCoalescingScopeReference, WeakBindStreamMatchesLd64ByteForByte) {
+    for (auto const& leg : kDylibLegs) {
+        SCOPED_TRACE(leg.label);
+        auto target = TargetSchema::loadShipped(leg.target);
+        auto fmt    = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(target.has_value());
+        ASSERT_TRUE(fmt.has_value());
+
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(
+            makeCoalescingScopeModule(), **target, **fmt, rep,
+            dss::ImageRequest{.artifactFileName = "libcoalesce.dylib"});
+        for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(rep.errorCount(), 0u);
+        ASSERT_FALSE(bytes.empty());
+
+        auto const weak = dyldInfoStream(bytes, 2);
+        ASSERT_TRUE(weak.has_value())
+            << "no LC_DYLD_INFO_ONLY — the legacy arm is the one this format "
+               "declares (no image.useChainedFixups)";
+        ASSERT_GE(weak->second, sizeof kLd64WeakBindEntryForW)
+            << "weak_bind_size " << weak->second << " is too small to hold one "
+               "entry: the coalescing-scope reference was not encoded, so the "
+               "call reaches this artifact's own body and disagrees with every "
+               "other image in the process";
+        ASSERT_LE(weak->first + weak->second, bytes.size());
+        for (std::size_t i = 0; i < sizeof kLd64WeakBindEntryForW; ++i) {
+            EXPECT_EQ(bytes[weak->first + i], kLd64WeakBindEntryForW[i])
+                << "weak-bind byte " << i << " differs from ld64's";
+        }
+        // Terminated, then padded — dyld reads the stream byte-by-byte.
+        EXPECT_EQ(bytes[weak->first + sizeof kLd64WeakBindEntryForW], 0u)
+            << "the stream must be terminated with BIND_OPCODE_DONE";
+
+        // ★ AND IT MUST NOT ALSO BE IN THE REGULAR BIND STREAM. A row in both
+        // would name a dylib ordinal for a reference that has no library —
+        // `dylibOrdinal` misses an empty path and returns 0, which is
+        // BIND_SPECIAL_DYLIB_SELF, i.e. "bind to this image's own definition":
+        // the defect, re-encoded, and invisible to a test that only asked
+        // whether the weak stream was non-empty.
+        auto const bind = dyldInfoStream(bytes, 1);
+        ASSERT_TRUE(bind.has_value());
+        bool namedInRegularStream = false;
+        for (std::uint32_t i = 0; i + 2 < bind->second; ++i) {
+            if (bytes[bind->first + i] == 0x40u
+                && bytes[bind->first + i + 1] == '_'
+                && bytes[bind->first + i + 2] == 'w') {
+                namedInRegularStream = true;
+            }
+        }
+        EXPECT_FALSE(namedInRegularStream)
+            << "'_w' appears in the ORDINARY bind stream too, where dyld would "
+               "resolve it against a named dylib ordinal";
+
+        // The header must advertise the contract, or dyld runs no coalescing
+        // pass for this image at all (MH_WEAK_DEFINES | MH_BINDS_TO_WEAK).
+        EXPECT_EQ(readU32LE(bytes, 24) & 0x00018000u, 0x00018000u)
+            << "flags 0x" << std::hex << readU32LE(bytes, 24);
+    }
+}
+
+TEST(MachoCoalescingScopeReference, AnOrdinaryNamedImportLeavesTheWeakStreamEmpty) {
+    // THE CONTROL. Without it, "the weak stream held our entry" is equally
+    // consistent with "this walker puts every import in the weak stream" — and
+    // an image that weak-bound its libc imports would be resolved from the
+    // coalescing scope instead of from libSystem.
+    for (auto const& leg : kDylibLegs) {
+        SCOPED_TRACE(leg.label);
+        auto target = TargetSchema::loadShipped(leg.target);
+        auto fmt    = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(target.has_value());
+        ASSERT_TRUE(fmt.has_value());
+
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(
+            makeNamedImportModule(), **target, **fmt, rep,
+            dss::ImageRequest{.artifactFileName = "libnamed.dylib"});
+        for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(rep.errorCount(), 0u);
+
+        auto const weak = dyldInfoStream(bytes, 2);
+        ASSERT_TRUE(weak.has_value());
+        EXPECT_EQ(weak->second, 0u)
+            << "an ordinary named-library import reached the weak-bind stream";
+        EXPECT_EQ(weak->first, 0u)
+            << "an empty stream must report offset 0, as ld64's does";
+
+        // ...and it IS in the regular stream, so the control is not passing by
+        // emitting nothing at all.
+        auto const bind = dyldInfoStream(bytes, 1);
+        ASSERT_TRUE(bind.has_value());
+        EXPECT_GT(bind->second, 0u)
+            << "the named import vanished from BOTH streams";
+    }
+}
+
+// ══ THE CHAINED-FIXUPS RAIL — the second spelling, previously UNWITNESSED ════
+//
+// ⚠⚠ WHY THIS BLOCK EXISTS, stated plainly because it is the finding that
+// bought it. The coalescing-scope encoding ships on TWO rails: the legacy
+// LC_DYLD_INFO_ONLY weak-bind stream (pinned above, byte-identical to ld64's)
+// and LC_DYLD_CHAINED_FIXUPS, where the same meaning is the SPECIAL ORDINAL
+// BIND_SPECIAL_DYLIB_WEAK_LOOKUP (-3) that `dyld_info -fixups` renders
+// `<weak-def-coalesce>`. An independent review of this lane MEASURED that the
+// chained arm was code only: no shipped document sets `image.useChainedFixups`
+// (it defaults false), no test combined it with a preemption reference, and the
+// red-on-disable script mutated the legacy arm alone — so **changing the -3 to
+// any other value, or deleting the chained branch outright, would have stayed
+// green**. Shipping an unexercised arm of a fix is shipping an unmeasured
+// claim.
+//
+// ⓘ NOT reachable from a shipped configuration today, and pinned anyway: an
+// author writing their own darwin dylib document with `useChainedFixups: true`
+// reaches it, and this substrate's whole premise is that a `.format.json` IS
+// the compiler's behaviour.
+
+namespace {
+
+// A darwin DYLIB document on the chained rail. Deliberately the shipped dylib
+// shape plus `image.useChainedFixups` and the `weakDefinition` dialect every
+// shipped Mach-O image document declares — without the dialect block the export
+// gate refuses first and these cells would be probing that refusal instead of
+// the import row (the "fixture that answers an adjacent question" shape).
+[[nodiscard]] std::string chainedDylibJson() {
+    return R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "apple_arm64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "weakDefinition": { "dialect": "symbol-flag" },
+      "externCallDispatch": "direct-plt",
+      "preemptibleDefinitionBindings": ["weak"],
+      "format": {"name":"chained-coalesce-dylib","kind":"macho"},
+      "macho": { "cputype": 16777228, "cpusubtype": 0, "filetype": "dylib", "flags": 1048709 },
+      "image": { "useChainedFixups": true, "segmentPageSize": 16384,
+                 "installName": "@rpath/${artifactFileName}",
+                 "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":16384}]
+    })";
+}
+
+// The packed DYLD_CHAINED_IMPORT rows of an emitted image, in payload order.
+// Format 1 is flat: bits [0..7] lib_ordinal (SIGNED 8-bit), bit [8] weak_import,
+// bits [9..31] name_offset.
+[[nodiscard]] std::vector<std::int8_t>
+chainedImportOrdinals(std::vector<std::uint8_t> const& bytes) {
+    std::vector<std::int8_t> out;
+    auto const lc =
+        dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups);
+    if (!lc.has_value()) return out;
+    std::uint32_t const dataOff = readU32LE(bytes, *lc + 8);
+    std::uint32_t const importsOff = readU32LE(bytes, dataOff + 8);
+    std::uint32_t const importsCount = readU32LE(bytes, dataOff + 16);
+    for (std::uint32_t i = 0; i < importsCount; ++i) {
+        std::uint32_t const packed =
+            readU32LE(bytes, dataOff + importsOff + i * 4u);
+        out.push_back(static_cast<std::int8_t>(packed & 0xFFu));
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(MachoCoalescingScopeReference,
+     ChainedFixupsEncodeTheSpecialCoalesceOrdinal) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(chainedDylibJson());
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+
+    DiagnosticReporter rep;
+    auto const bytes = dss::macho::encode(
+        makeCoalescingScopeModule(), **target, **fmt, rep,
+        dss::ImageRequest{.artifactFileName = "libchained.dylib"});
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    // The rail itself, asserted before what rides on it: a chained image has
+    // NO LC_DYLD_INFO_ONLY, so reading a weak stream here would read nothing.
+    EXPECT_TRUE(
+        dss::macho::test::findLoadCommand(bytes, kLcDyldChainedFixups)
+            .has_value())
+        << "the document asked for the chained rail and did not get it";
+    EXPECT_FALSE(dss::macho::test::findLoadCommand(bytes, kLcDyldInfoOnly)
+                     .has_value());
+
+    auto const ordinals = chainedImportOrdinals(bytes);
+    ASSERT_EQ(ordinals.size(), 1u) << "one import, one row";
+    // -3 == BIND_SPECIAL_DYLIB_WEAK_LOOKUP. ⚠ 0 is BIND_SPECIAL_DYLIB_SELF,
+    // which is what `dylibOrdinal("")` returns when the branch is removed —
+    // the defect, re-encoded — so the assertion names the wrong value it is
+    // guarding against rather than only the right one.
+    EXPECT_EQ(ordinals[0], -3)
+        << "expected BIND_SPECIAL_DYLIB_WEAK_LOOKUP (-3); got "
+        << static_cast<int>(ordinals[0])
+        << (ordinals[0] == 0
+                ? " == BIND_SPECIAL_DYLIB_SELF, i.e. bound to this image's own "
+                  "definition — the defect this anchor closed"
+                : "");
+
+    EXPECT_EQ(readU32LE(bytes, 24) & 0x00018000u, 0x00018000u)
+        << "MH_WEAK_DEFINES | MH_BINDS_TO_WEAK must be set on the chained rail "
+           "too, or dyld runs no coalescing pass and the -3 is inert";
+}
+
+TEST(MachoCoalescingScopeReference,
+     ChainedFixupsGiveAnOrdinaryImportItsNamedLibraryOrdinal) {
+    // THE CONTROL for the cell above, and it is not decorative: without it
+    // "the import row said -3" is equally consistent with "this walker writes
+    // -3 into every chained import", which would send an image's libc calls
+    // through the coalescing scope instead of libSystem.
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(chainedDylibJson());
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+
+    DiagnosticReporter rep;
+    auto const bytes = dss::macho::encode(
+        makeNamedImportModule(), **target, **fmt, rep,
+        dss::ImageRequest{.artifactFileName = "libchainednamed.dylib"});
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    auto const ordinals = chainedImportOrdinals(bytes);
+    ASSERT_EQ(ordinals.size(), 1u);
+    EXPECT_EQ(ordinals[0], 1)
+        << "an ordinary import must name its LC_LOAD_DYLIB index (1-based), "
+           "not the coalescing scope";
+}
+
+// The inert-stream guard, on the rail that did not have one. The legacy arm
+// refuses a coalescing-scope reference in an image publishing no weak
+// definition, because the header bits are derived from the export trie and an
+// unadvertised stream is silently ignored by dyld. That guard used to ask
+// `!dyldWeakBindBlob.empty()` — a property of the LEGACY BUFFER, so the chained
+// rail, whose header bits come from the very same count, inherited nothing.
+TEST(MachoCoalescingScopeReference, AnInertCoalescingReferenceIsRefusedOnBothRails) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+
+    // The module: a coalescing-scope reference whose definition is exported
+    // GLOBAL, so `numWeakExports` is zero and MH_WEAK_DEFINES would be unset.
+    auto inertModule = [] {
+        AssembledModule mod = makeCoalescingScopeModule();
+        mod.symbols.clear();
+        mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_w",
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+        return mod;
+    };
+
+    struct Rail {
+        char const* label;
+        bool        chained;
+    };
+    const Rail rails[] = {{"legacy LC_DYLD_INFO_ONLY", false},
+                          {"LC_DYLD_CHAINED_FIXUPS", true}};
+    for (auto const& rail : rails) {
+        SCOPED_TRACE(rail.label);
+        auto fmt = rail.chained
+                       ? ObjectFormatSchema::loadFromText(chainedDylibJson())
+                       : ObjectFormatSchema::loadShipped(
+                             "macho64-arm64-darwin-dylib");
+        ASSERT_TRUE(fmt.has_value());
+
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(
+            inertModule(), **target, **fmt, rep,
+            dss::ImageRequest{.artifactFileName = "libinert.dylib"});
+        EXPECT_TRUE(bytes.empty())
+            << "an image shipped whose coalescing reference dyld would ignore";
+        ASSERT_GT(rep.errorCount(), 0u);
+        bool named = false;
+        for (auto const& d : rep.all()) {
+            if (d.actual.find("MH_WEAK_DEFINES") != std::string::npos
+                && d.actual.find("D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING")
+                       != std::string::npos) {
+                named = true;
+            }
+        }
+        EXPECT_TRUE(named)
+            << "the refusal must name the header bits and its anchor; got: "
+            << diagSummary(rep);
+    }
+
+    // CONTROL: the SAME module with the definition exported WEAK encodes fine
+    // on both rails. Without it, "both rails refused" is equally consistent
+    // with "this fixture cannot be encoded at all".
+    for (auto const& rail : rails) {
+        SCOPED_TRACE(std::string{rail.label} + " CONTROL");
+        auto fmt = rail.chained
+                       ? ObjectFormatSchema::loadFromText(chainedDylibJson())
+                       : ObjectFormatSchema::loadShipped(
+                             "macho64-arm64-darwin-dylib");
+        ASSERT_TRUE(fmt.has_value());
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(
+            makeCoalescingScopeModule(), **target, **fmt, rep,
+            dss::ImageRequest{.artifactFileName = "libweak.dylib"});
+        EXPECT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+        EXPECT_FALSE(bytes.empty());
+    }
+}
+
+// ── THE ADDRESS HALF IS REFUSED, NOT MIS-ENCODED ────────────────────────────
+//
+// Taking the ADDRESS of a preemptible definition inside the same image routes
+// through the __DATA extern-address bind path, which resolves a row's dylib
+// ordinal from its `libraryPath`. A coalescing-scope reference has none, and
+// `dylibOrdinal("")` misses and returns 0 == BIND_SPECIAL_DYLIB_SELF — "bind to
+// this image's own definition", the defect re-encoded on the data side.
+//
+// ⓘ UNREACHABLE from the current pipeline (MIR→LIR's `lowerCall` is the only
+// minter of preemption references, and none of them reaches a data relocation),
+// and pinned anyway: this anchor's own closing work names the address-taken
+// case as the next half, so the site is naked for the work that arrives next.
+// The walker REFUSES rather than guessing an encoding — the call-site stream
+// was pinned byte-for-byte against ld64 before it shipped, and the data-side
+// one owes the same probe first.
+TEST(MachoCoalescingScopeReference, TakingTheAddressOfAPreemptibleDefinitionIsRefused) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-dylib");
+    ASSERT_TRUE(target.has_value());
+    ASSERT_TRUE(fmt.has_value());
+
+    // One weak definition, one coalescing-scope reference to it, and a __DATA
+    // slot whose abs64 relocation TARGETS that reference.
+    auto addressTakingModule = [](bool viaPreemptionReference) {
+        AssembledModule mod;
+        mod.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};
+        mod.functions.push_back(std::move(fn));
+        mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_w",
+                                           SymbolBinding::Weak,
+                                           SymbolVisibility::Default});
+        ExternImport ref{SymbolId{2}, "_w", ""};
+        if (viaPreemptionReference) {
+            ref.isPreemptionReference = true;
+            ref.binding = SymbolBinding::Weak;
+        } else {
+            // The CONTROL's import is an ORDINARY named one, which is the only
+            // field that differs between the two arms.
+            ref.mangledName = "_puts";
+            ref.libraryPath = "/usr/lib/libSystem.B.dylib";
+        }
+        mod.externImports.push_back(std::move(ref));
+        AssembledData slot;
+        slot.symbol    = SymbolId{5};
+        slot.section   = DataSectionKind::Data;
+        slot.bytes     = std::vector<std::uint8_t>(8, 0);
+        slot.alignment = Alignment::of<8>();
+        Relocation rel;
+        rel.offset = 0;
+        rel.target = SymbolId{2};
+        rel.kind   = RelocationKind{4};   // abs64
+        rel.addend = 0;
+        slot.relocations.push_back(rel);
+        mod.dataItems.push_back(std::move(slot));
+        mod.symbols.push_back(ModuleSymbol{SymbolId{5}, "_slot",
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+        return mod;
+    };
+
+    DiagnosticReporter rep;
+    auto const bytes = dss::macho::encode(
+        addressTakingModule(true), **target, **fmt, rep,
+        dss::ImageRequest{.artifactFileName = "libaddr.dylib"});
+    EXPECT_TRUE(bytes.empty())
+        << "an image shipped whose data slot binds a coalescing-scope "
+           "reference through the ordinary stream";
+    ASSERT_GT(rep.errorCount(), 0u)
+        << "silently emitting BIND_SPECIAL_DYLIB_SELF is the defect, not the "
+           "fix";
+    bool named = false;
+    for (auto const& d : rep.all()) {
+        if (d.actual.find("coalescing-scope") != std::string::npos
+            && d.actual.find("D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING")
+                   != std::string::npos) {
+            named = true;
+        }
+    }
+    EXPECT_TRUE(named)
+        << "the refusal must name what it refused and its anchor; got: "
+        << diagSummary(rep);
+
+    // CONTROL: the same shape with an ORDINARY named import in the slot
+    // encodes cleanly. Without it, "the emission was refused" is equally
+    // consistent with "this walker cannot bind a data slot at all" — which is
+    // the very capability D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR shipped.
+    DiagnosticReporter ctlRep;
+    auto const ctlBytes = dss::macho::encode(
+        addressTakingModule(false), **target, **fmt, ctlRep,
+        dss::ImageRequest{.artifactFileName = "libaddrctl.dylib"});
+    EXPECT_EQ(ctlRep.errorCount(), 0u) << diagSummary(ctlRep);
+    EXPECT_FALSE(ctlBytes.empty());
+}
+
+// ══ D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ══════
+//
+// `image.codeSignature.identifier` is the CodeDirectory's `identOffset`
+// payload — the artifact's CODE IDENTITY. Every shipped darwin document
+// declared a CONSTANT (`com.dss.dylib` on both dylib documents; a name taken
+// from ONE example on each exec document), so every artifact a format ever
+// produced answered to one identity.
+//
+// ★★ THE MEASUREMENT, because this row is NOT the install-name row wearing a
+// different key and the difference is the whole point. ✔MEASURED on Apple
+// Silicon (macOS 26.6.2, ld-1267), FOUR arms driven by one instrument: two DSS
+// dylibs sharing `com.dss.dylib`; the SAME two DSS dylibs with distinct
+// identifiers and nothing else changed; an ld64 + `codesign -s -` pair with its
+// default identifiers; and — the decisive control — an ld64+codesign pair
+// FORCED to the shared identifier.
+//   * NOTHING about loading is affected. Both `dlopen` (distinct handles,
+//     distinct `dladdr` files), both link into one executable and answer
+//     correctly, `codesign --verify` returns 0 on each, and the same bytes at
+//     two paths yield two images. The MECHANISM is that an ad-hoc DESIGNATED
+//     REQUIREMENT is CDHASH-keyed — `codesign -d -r-` prints
+//     `designated => cdhash H"..."` on DSS and ld64 artifacts alike — so the
+//     identifier never reaches dyld's load path.
+//   * WHAT IS AFFECTED is identity-based requirement matching. A requirement
+//     `identifier "com.dss.dylib"` written for the FIRST library ACCEPTS the
+//     SECOND (rc 0 both), where the same requirement over DISTINCT identifiers
+//     REFUSES (rc 3) and a cdhash requirement over those SAME two files
+//     REFUSES. The forced-shared ld64 arm behaves identically to the DSS one,
+//     which is what says the EMITTER is right and the DECLARATION was wrong.
+//   * Apple's own `codesign -s -` derives the identifier per artifact, from the
+//     output's leaf name plus its `LC_UUID` (`alpha-55554944<uuid>`), so the
+//     reference never produces one identity for two artifacts by itself.
+// ⇒ Not a load failure, and not harmless: two artifacts answering to one code
+// identity, which is the only thing a constant in shared config can produce.
+//
+// ★ THESE ARMS ARE THE WRITER TIER. All FOUR shipped darwin documents are
+// checked for the DECLARATION, because a key fixed on one port and forgotten on
+// another is the asymmetry this suite exists to notice; the EMISSION arms drive
+// the two dylib documents, whose module fixture this file already owns.
+
+namespace {
+
+struct CodeSignatureLeg {
+    char const* label;
+    char const* target;
+    char const* format;
+    char const* replacedConstant;   // must NOT survive in the declaration
+    bool        emissionArm;        // this file owns a module the doc accepts
+};
+
+// ⚠ ONE PHYSICAL LINE — a wrapped anchor id compiles, matches at run time, and
+// makes every grep (this project's registry guard included) see the first
+// fragment as a whole id, MINTING one that does not exist.
+constexpr char const* kCodeSignatureIdentityAnchorId = "D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT";
+
+constexpr CodeSignatureLeg kCodeSignatureLegs[] = {
+    {"arm64 dylib",  "arm64",  "macho64-arm64-darwin-dylib",  "com.dss.dylib", true},
+    {"x86_64 dylib", "x86_64", "macho64-x86_64-darwin-dylib", "com.dss.dylib", true},
+    {"arm64 exec",   "arm64",  "macho64-arm64-darwin-exec",   "com.dss.macho_arm64_exit", false},
+    {"x86_64 exec",  "x86_64", "macho64-x86_64-darwin-exec",  "com.dss.macho_x86_64_darwin_exec", false},
+};
+
+// The SuperBlob / CodeDirectory headers are BIG-endian; the Mach-O around them
+// is little-endian. Spelled here rather than reused from a sibling TU because
+// these arms must not depend on another test binary's fixtures.
+[[nodiscard]] std::uint32_t readCsU32BE(std::span<std::uint8_t const> b,
+                                        std::size_t off) {
+    return (static_cast<std::uint32_t>(b[off]) << 24)
+         | (static_cast<std::uint32_t>(b[off + 1]) << 16)
+         | (static_cast<std::uint32_t>(b[off + 2]) << 8)
+         | static_cast<std::uint32_t>(b[off + 3]);
+}
+
+struct EmittedSignature {
+    std::string   identifier;    // the CodeDirectory ident C-string
+    std::uint32_t dataOff{};     // LC_CODE_SIGNATURE.dataoff
+    std::uint32_t dataSize{};    // LC_CODE_SIGNATURE.datasize
+    std::uint32_t superBlobLen{};
+};
+
+// Read the identity DSS actually EMITTED, by walking the emitted bytes:
+// LC_CODE_SIGNATURE -> SuperBlob -> BlobIndex[0] -> CodeDirectory.identOffset.
+// Every offset is PARSED, never assumed, so a wire-shape change fails as a
+// missing signature rather than as a plausible wrong string.
+[[nodiscard]] std::optional<EmittedSignature>
+readEmittedSignature(std::span<std::uint8_t const> bytes) {
+    constexpr std::uint32_t kLcCodeSignatureCmd = 0x1Du;
+    auto const at = dss::macho::test::findLoadCommand(bytes, kLcCodeSignatureCmd);
+    if (!at.has_value()) return std::nullopt;
+    EmittedSignature out;
+    out.dataOff  = readU32LE(bytes, *at + 8);
+    out.dataSize = readU32LE(bytes, *at + 12);
+    if (static_cast<std::size_t>(out.dataOff) + 20u > bytes.size())
+        return std::nullopt;
+    if (readCsU32BE(bytes, out.dataOff) != 0xFADE0CC0u) return std::nullopt;
+    out.superBlobLen = readCsU32BE(bytes, out.dataOff + 4);
+    std::size_t const cd = out.dataOff + readCsU32BE(bytes, out.dataOff + 16);
+    if (cd + 24u > bytes.size()) return std::nullopt;
+    if (readCsU32BE(bytes, cd) != 0xFADE0C02u) return std::nullopt;
+    std::size_t const identAt = cd + readCsU32BE(bytes, cd + 20);
+    if (identAt >= bytes.size()) return std::nullopt;
+    out.identifier = std::string(
+        reinterpret_cast<char const*>(bytes.data() + identAt));
+    return out;
+}
+
+} // namespace
+
+TEST(MachoCodeSignatureIdentity, ShippedDocumentsDeclareTheArtifactNotAConstant) {
+    for (auto const& leg : kCodeSignatureLegs) {
+        SCOPED_TRACE(leg.label);
+        auto fmt = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(fmt.has_value());
+        auto const& cs = (*fmt)->machoImage().codeSignature;
+        ASSERT_TRUE(cs.has_value())
+            << "this document stopped requesting an ad-hoc signature, which "
+               "would make every arm below vacuously green";
+        EXPECT_TRUE(dss::declaresArtifactIdentityPlaceholder(cs->identifier))
+            << "the shipped '" << leg.format << "' document declares '"
+            << cs->identifier << "', which is a CONSTANT: every artifact this "
+               "format produces would carry that one code identity, and a code "
+               "requirement naming it could not tell two of them apart";
+        EXPECT_NE(cs->identifier.find(dss::kArtifactFileNamePlaceholder),
+                  std::string::npos)
+            << "declared '" << cs->identifier << "'";
+        EXPECT_EQ(cs->identifier.find(leg.replacedConstant), std::string::npos)
+            << "the replaced constant '" << leg.replacedConstant
+            << "' is still present in '" << cs->identifier << "'";
+    }
+}
+
+TEST(MachoCodeSignatureIdentity, TwoArtifactsOfOneFormatGetDifferentIdentifiers) {
+    // The SUBJECT. Two emissions of the SAME module through the SAME format
+    // differing ONLY in the artifact being produced. Anything shared between
+    // them — a constant in the document, a value cached on the memoized schema
+    // — collapses them, which is exactly what shipped before.
+    for (auto const& leg : kCodeSignatureLegs) {
+        if (!leg.emissionArm) continue;
+        SCOPED_TRACE(leg.label);
+        auto target = TargetSchema::loadShipped(leg.target);
+        auto fmt    = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(target.has_value());
+        ASSERT_TRUE(fmt.has_value());
+
+        DiagnosticReporter repA;
+        auto const bytesA = dss::macho::encode(
+            makeInstallNameDylibModule(), **target, **fmt, repA,
+            dss::ImageRequest{.artifactFileName = "alpha.dylib"});
+        for (auto const& d : repA.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(repA.errorCount(), 0u);
+
+        DiagnosticReporter repB;
+        auto const bytesB = dss::macho::encode(
+            makeInstallNameDylibModule(), **target, **fmt, repB,
+            dss::ImageRequest{.artifactFileName = "beta_much_longer.dylib"});
+        for (auto const& d : repB.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(repB.errorCount(), 0u);
+
+        auto const sigA = readEmittedSignature(bytesA);
+        auto const sigB = readEmittedSignature(bytesB);
+        ASSERT_TRUE(sigA.has_value()) << "no parsable ad-hoc signature emitted";
+        ASSERT_TRUE(sigB.has_value()) << "no parsable ad-hoc signature emitted";
+
+        // The identity in the EMITTED BYTES, not the declaration.
+        EXPECT_EQ(sigA->identifier, "com.dss.alpha.dylib");
+        EXPECT_EQ(sigB->identifier, "com.dss.beta_much_longer.dylib");
+        EXPECT_NE(sigA->identifier, sigB->identifier)
+            << "two artifacts of one format embedded the SAME CodeDirectory "
+               "identifier — a code requirement naming it accepts both, which "
+               "is the defect this row closed";
+
+        // ★ THE RESERVATION FOLLOWS THE RESOLVED NAME, NOT THE DECLARATION.
+        // The identifier is read TWICE by the walker — once to SIZE the
+        // reservation (`adHocCodeSignatureSize`) and once to BUILD the blob —
+        // so a size taken from the unresolved template, or a second
+        // independent resolution, desyncs the two. The two names differ in
+        // length, so the two signatures must differ in length too.
+        EXPECT_NE(sigA->dataSize, sigB->dataSize)
+            << "one reservation size served two identifiers of different "
+               "lengths — the size did not follow the RESOLVED identity";
+        // ...and each SuperBlob must fill its own reservation exactly. The
+        // walker's own invariant says so; this asserts it from the bytes.
+        EXPECT_EQ(sigA->superBlobLen, sigA->dataSize);
+        EXPECT_EQ(sigB->superBlobLen, sigB->dataSize);
+        EXPECT_EQ(sigA->dataOff + sigA->dataSize, bytesA.size());
+        EXPECT_EQ(sigB->dataOff + sigB->dataSize, bytesB.size());
+    }
+}
+
+TEST(MachoCodeSignatureIdentity, AnEmissionThatCannotNameItsArtifactIsRefused) {
+    // ⚠ THIS ARM DOES NOT USE A SHIPPED DOCUMENT, AND THE REASON IS A DEFECT
+    // IT FOUND IN ITS OWN FIRST DRAFT. Every shipped dylib document declares
+    // BOTH `installName` and `codeSignature.identifier` through the
+    // placeholder, and the walker resolves the install name FIRST and returns
+    // on failure — so a nameless emission against a shipped document refuses
+    // citing the INSTALL NAME and never reaches this key at all. ✔MEASURED:
+    // the first draft asserted this key's diagnostic against the shipped
+    // arm64/x86_64 dylib documents and read back the install-name refusal, on
+    // both legs. An arm that can only ever see its sibling's diagnostic is not
+    // a pin on this one; it would have gone green the day the ORDER changed.
+    // So the fixture declares a LITERAL install name and leaves only the
+    // code-signature identity unresolvable, which isolates the key under test.
+    auto const fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"csid-refusal-dylib","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "dylib", "flags": 0 },
+      "image": { "pageZeroSize": 0, "segmentPageSize": 4096,
+                 "installName": "@rpath/libliteral.dylib",
+                 "codeSignature": {"kind":"adhoc","hashAlgorithm":"sha256","pageSize":4096,"identifier":"com.dss.${artifactFileName}"},
+                 "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+
+    // No artifact name on the request. There is deliberately no fallback:
+    // substituting anything fixed rebuilds the shared identity.
+    DiagnosticReporter rep;
+    auto const bytes =
+        dss::macho::encode(makeInstallNameDylibModule(), **target,
+                           **fmt, rep, dss::ImageRequest{});
+    EXPECT_TRUE(bytes.empty())
+        << "an image was emitted despite an unresolvable code identity";
+    ASSERT_GT(rep.errorCount(), 0u)
+        << "silently signing under SOME identity is the defect, not the fix";
+    bool named = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_WalkerInputContractViolation
+            && d.actual.find("image.codeSignature.identifier")
+                   != std::string::npos
+            && d.actual.find(kCodeSignatureIdentityAnchorId)
+                   != std::string::npos) {
+            named = true;
+        }
+    }
+    EXPECT_TRUE(named)
+        << "the refusal must name its key AND its anchor; got: "
+        << diagSummary(rep);
+
+    // CONTROL, the same document with the artifact NAMED: it encodes cleanly.
+    // Without it, "the emission was refused" is equally consistent with "this
+    // fixture cannot encode at all", and the arm would prove nothing.
+    DiagnosticReporter ctlRep;
+    auto const ctlBytes =
+        dss::macho::encode(makeInstallNameDylibModule(), **target, **fmt,
+                           ctlRep,
+                           dss::ImageRequest{.artifactFileName = "named.dylib"});
+    EXPECT_EQ(ctlRep.errorCount(), 0u) << diagSummary(ctlRep);
+    EXPECT_FALSE(ctlBytes.empty());
+    auto const ctlSig = readEmittedSignature(ctlBytes);
+    ASSERT_TRUE(ctlSig.has_value());
+    EXPECT_EQ(ctlSig->identifier, "com.dss.named.dylib");
+}
+
+TEST(MachoCodeSignatureIdentity, ANearMissSpellingIsRefusedAtDocumentLoad) {
+    // The vocabulary is CLOSED and is the SAME one `image.installName` uses —
+    // one resolver, one key set. A mis-spelled placeholder is a property of the
+    // DOCUMENT, so it must fail where the document is read; passed through it
+    // would ship as literal text inside a binary's code identity.
+    // ⚠ A CUSTOM RAW-STRING DELIMITER, and it is not a style choice. The
+    // spelling under test is `$(artifactFileName)`, whose `)"` ENDS a default
+    // `R"( … )"` literal in the middle of the JSON — it compiled as garbage
+    // with "missing terminating \" character" rather than as this fixture.
+    // The two CONTROL documents below keep the default delimiter, which is
+    // itself the tell that only this one contains the sequence.
+    auto const rejected = ObjectFormatSchema::loadFromText(R"JSON({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"csid-dylib","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "dylib", "flags": 0 },
+      "image": { "pageZeroSize": 0, "segmentPageSize": 4096,
+                 "installName": "@rpath/${artifactFileName}",
+                 "codeSignature": {"kind":"adhoc","hashAlgorithm":"sha256","pageSize":4096,"identifier":"com.dss.$(artifactFileName)"},
+                 "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })JSON");
+    ASSERT_FALSE(rejected.has_value())
+        << "a document spelling the placeholder `$( )` loaded cleanly";
+    EXPECT_EQ(countAtPath(rejected, "/image/codeSignature/identifier"), 1u)
+        << rejectSummary(rejected);
+
+    // CONTROL, byte-identical but for that one spelling: it LOADS. Without it,
+    // "the document was rejected" is equally consistent with "this fixture is
+    // rejected for some unrelated reason", and the arm would prove nothing.
+    auto const accepted = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"csid-dylib","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "dylib", "flags": 0 },
+      "image": { "pageZeroSize": 0, "segmentPageSize": 4096,
+                 "installName": "@rpath/${artifactFileName}",
+                 "codeSignature": {"kind":"adhoc","hashAlgorithm":"sha256","pageSize":4096,"identifier":"com.dss.${artifactFileName}"},
+                 "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })");
+    EXPECT_TRUE(accepted.has_value()) << rejectSummary(accepted);
+
+    // SECOND CONTROL, the other direction: a LITERAL identity carries no
+    // placeholder and stays legal, so a document that genuinely wants a fixed
+    // ident (what `codesign -i` gives) still loads. "Everything with a `$` is
+    // refused" and "everything is refused" are different claims.
+    auto const literal = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": ".dylib",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-sensitive",
+      "format": {"name":"csid-dylib","kind":"macho"},
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "dylib", "flags": 0 },
+      "image": { "pageZeroSize": 0, "segmentPageSize": 4096,
+                 "installName": "@rpath/${artifactFileName}",
+                 "codeSignature": {"kind":"adhoc","hashAlgorithm":"sha256","pageSize":4096,"identifier":"com.dss.fixed"},
+                 "loadDylibs": ["/usr/lib/libSystem.B.dylib"] },
+      "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })");
+    EXPECT_TRUE(literal.has_value()) << rejectSummary(literal);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING — THE MACH-O ADDRESS HALF
+//
+// An import may carry a SECOND, module-local symbol (`addressSlotSymbol`) whose
+// VA is the slot holding its LOADER-RESOLVED ADDRESS. Under `direct-plt` — which
+// BOTH shipped darwin dylib documents declare — the import's own VA is the
+// `__stubs` STUB, and a pointer to a stub is not the function's address: two
+// images asked for `&w` would answer with two different pointers for one
+// identifier (C 6.2.2p2). These pins assert the walker binds that symbol to the
+// `__got` slot AND NOT to the stub, because "it resolved to something" is
+// equally consistent with resolving to the stub, which is the wrong answer this
+// exists to exclude.
+//
+// ✔The ENCODING is measured, not generalized: `clang -dynamiclib` on Apple
+// Silicon (macOS 26.6.2, Apple clang 21.0.0, ld-1267) lowers `return w;` inside
+// a dylib to `adrp` + `ldr` of a `__DATA_CONST __got` slot carrying
+// `bind <weak-def-coalesce>/_w`, with a STRONG-global and a `static` sibling
+// both staying a direct `adrp`+`add` and all four DYLD bands empty.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// section_64.addr lives at offset 32 in the 80-byte record.
+[[nodiscard]] std::optional<std::uint64_t>
+sectionAddr(std::span<std::uint8_t const> bytes,
+            std::string_view segment, std::string_view section) {
+    auto const at = dss::macho::test::findSection(bytes, segment, section);
+    if (!at.has_value()) return std::nullopt;
+    return readU64LE(bytes, *at + 32);
+}
+
+// The coalescing-scope module with the ADDRESS half wired: the preemption
+// reference carries an `addressSlotSymbol`, and a `__DATA` slot's abs64
+// relocation names THAT symbol, so the emitted 8 bytes ARE the VA the walker
+// resolved it to. `withOrdinarySibling` appends a SECOND, ordinary named import
+// that ALSO carries an address slot — the CONTROL that makes the assertion
+// non-vacuous: if the walker wrote one constant (the `__got` base) into every
+// address slot, the two would be equal instead of one slot apart.
+[[nodiscard]] AssembledModule
+makeAddressSlotModule(bool withOrdinarySibling, RelocationKind abs64) {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_w",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+    ExternImport ref{SymbolId{2}, "_w", ""};
+    ref.isPreemptionReference = true;
+    ref.binding               = SymbolBinding::Weak;
+    ref.addressSlotSymbol     = SymbolId{3};
+    mod.externImports.push_back(std::move(ref));
+
+    auto addSlot = [&mod, abs64](SymbolId slotSym, SymbolId target,
+                                 char const* name) {
+        AssembledData slot;
+        slot.symbol    = slotSym;
+        slot.section   = DataSectionKind::Data;
+        slot.bytes     = std::vector<std::uint8_t>(8, 0);
+        slot.alignment = Alignment::of<8>();
+        Relocation rel;
+        rel.offset = 0;
+        rel.target = target;
+        rel.kind   = abs64;
+        rel.addend = 0;
+        slot.relocations.push_back(rel);
+        mod.dataItems.push_back(std::move(slot));
+        mod.symbols.push_back(ModuleSymbol{slotSym, name,
+                                           SymbolBinding::Global,
+                                           SymbolVisibility::Default});
+    };
+    addSlot(SymbolId{10}, SymbolId{3}, "_slot_w");
+
+    if (withOrdinarySibling) {
+        ExternImport other{SymbolId{4}, "_puts",
+                           "/usr/lib/libSystem.B.dylib"};
+        other.addressSlotSymbol = SymbolId{5};
+        mod.externImports.push_back(std::move(other));
+        addSlot(SymbolId{11}, SymbolId{5}, "_slot_puts");
+    }
+    return mod;
+}
+
+// The value of a named __DATA item's 8 emitted bytes. Both items are 8 bytes
+// with 8-byte alignment and are laid out in `dataItems` order, so the offset is
+// the section's file offset plus the item index times 8.
+[[nodiscard]] std::optional<std::uint64_t>
+dataSlotValue(std::span<std::uint8_t const> bytes, std::size_t itemIndex) {
+    auto const at = dss::macho::test::findSection(bytes, "__DATA", "__data");
+    if (!at.has_value()) return std::nullopt;
+    std::uint32_t const fileOff = readU32LE(bytes, *at + 48);  // section_64.offset
+    std::size_t const slot = static_cast<std::size_t>(fileOff) + itemIndex * 8u;
+    if (slot + 8 > bytes.size()) return std::nullopt;
+    return readU64LE(bytes, slot);
+}
+
+} // namespace
+
+TEST(MachoCoalescingScopeReference,
+     TheAddressSlotSymbolResolvesToTheGotSlotAndNotToTheStub) {
+    for (auto const& leg : kDylibLegs) {
+        SCOPED_TRACE(leg.label);
+        auto target = TargetSchema::loadShipped(leg.target);
+        auto fmt    = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(target.has_value());
+        ASSERT_TRUE(fmt.has_value());
+
+        auto const* abs64 = (*target)->relocationByName("abs64");
+        ASSERT_NE(abs64, nullptr)
+            << leg.label << ": this target declares no `abs64` "
+               "relocation — the relocation VOCABULARY is per-TARGET and "
+               "the two darwin ports disagree on the row NUMBER (a "
+               "hard-coded 4 is `tls-tpoff32` on x86_64, width 4, and the "
+               "walker refuses it — measured, not guessed)";
+
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(
+            makeAddressSlotModule(false, abs64->kind), **target, **fmt, rep,
+            dss::ImageRequest{.artifactFileName = "libaddrslot.dylib"});
+        for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(rep.errorCount(), 0u);
+        ASSERT_FALSE(bytes.empty())
+            << "the walker refused an import carrying an address slot symbol — "
+               "before this half shipped it had nothing bound to it, so the "
+               "relocation naming it was unresolvable";
+
+        auto const gotVa   = sectionAddr(bytes, "__DATA_CONST", "__got");
+        auto const stubsVa = sectionAddr(bytes, "__TEXT", "__stubs");
+        ASSERT_TRUE(gotVa.has_value());
+        ASSERT_TRUE(stubsVa.has_value());
+        auto const resolved = dataSlotValue(bytes, 0);
+        ASSERT_TRUE(resolved.has_value());
+
+        // THE ANSWER: the slot's own VA — the entry dyld weak-binds to the
+        // coalescing winner, whose CONTENT is the function's address.
+        EXPECT_EQ(*resolved, *gotVa)
+            << "the address slot resolved to 0x" << std::hex << *resolved
+            << " but the __got slot is at 0x" << *gotVa;
+        // THE WRONG ANSWER, excluded by name: the __stubs stub. A pointer to a
+        // call thunk is not the function's address, and comparing it against
+        // the same name taken in another image answers false.
+        EXPECT_NE(*resolved, *stubsVa)
+            << "the address slot resolved to the __stubs STUB — correct for a "
+               "call, and not the function's address";
+    }
+}
+
+TEST(MachoCoalescingScopeReference,
+     EachImportsAddressSlotIsItsOwnGotEntryNotOneConstant) {
+    // THE CONTROL for the pin above. Without it, "the address slot equals the
+    // __got base" is equally consistent with "the walker writes the __got base
+    // into every address slot it sees" — which would give two imports ONE
+    // address, the same class of defect one tier over.
+    for (auto const& leg : kDylibLegs) {
+        SCOPED_TRACE(leg.label);
+        auto target = TargetSchema::loadShipped(leg.target);
+        auto fmt    = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(target.has_value());
+        ASSERT_TRUE(fmt.has_value());
+
+        auto const* abs64 = (*target)->relocationByName("abs64");
+        ASSERT_NE(abs64, nullptr)
+            << leg.label << ": this target declares no `abs64` "
+               "relocation — the relocation VOCABULARY is per-TARGET and "
+               "the two darwin ports disagree on the row NUMBER (a "
+               "hard-coded 4 is `tls-tpoff32` on x86_64, width 4, and the "
+               "walker refuses it — measured, not guessed)";
+
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(
+            makeAddressSlotModule(true, abs64->kind), **target, **fmt, rep,
+            dss::ImageRequest{.artifactFileName = "libaddrslot2.dylib"});
+        for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(rep.errorCount(), 0u);
+        ASSERT_FALSE(bytes.empty());
+
+        auto const gotVa = sectionAddr(bytes, "__DATA_CONST", "__got");
+        ASSERT_TRUE(gotVa.has_value());
+        auto const first  = dataSlotValue(bytes, 0);
+        auto const second = dataSlotValue(bytes, 1);
+        ASSERT_TRUE(first.has_value());
+        ASSERT_TRUE(second.has_value());
+
+        EXPECT_EQ(*first, *gotVa);
+        EXPECT_EQ(*second, *gotVa + 8u)
+            << "the second import's address slot is not its OWN __got entry: "
+               "slot0=0x" << std::hex << *first << " slot1=0x" << *second;
+        EXPECT_NE(*first, *second)
+            << "two imports were given ONE address slot";
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D-LK-MACHO-EMITS-NO-LC-UUID
+//
+// ✔MEASURED on Apple Silicon (macOS 26.6.2, ld-1267): dyld prints `<no uuid>`
+// for a DSS image against a real UUID for the ld64 control, which defeats crash
+// symbolication (`atos` and a `dSYM` bundle match a binary to its symbols BY
+// uuid). ✔MEASURED in the same run that ld64 gives a LINKED image (filetype 2
+// and 6) a uuid and a RELOCATABLE object (filetype 1, `-c` and `-r` alike) NONE,
+// and that its uuid is derived from the image CONTENT: an executable relinked
+// to the same path kept its uuid, a dylib linked under two different output
+// names got two, and a one-character source change moved it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+constexpr std::uint32_t kLcUuidCmd = 0x1Bu;
+
+[[nodiscard]] std::optional<std::array<std::uint8_t, 16>>
+imageUuid(std::span<std::uint8_t const> bytes) {
+    auto const at = dss::macho::test::findLoadCommand(bytes, kLcUuidCmd);
+    if (!at.has_value()) return std::nullopt;
+    if (*at + 24 > bytes.size()) return std::nullopt;
+    std::array<std::uint8_t, 16> out{};
+    for (std::size_t i = 0; i < 16; ++i) out[i] = bytes[*at + 8 + i];
+    return out;
+}
+
+[[nodiscard]] bool allZero(std::array<std::uint8_t, 16> const& u) {
+    return std::all_of(u.begin(), u.end(),
+                       [](std::uint8_t b) { return b == 0; });
+}
+
+} // namespace
+
+TEST(MachoImageUuid, EveryLinkedImageCarriesANonZeroUuid) {
+    for (auto const& leg : kDylibLegs) {
+        SCOPED_TRACE(leg.label);
+        auto target = TargetSchema::loadShipped(leg.target);
+        auto fmt    = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(target.has_value());
+        ASSERT_TRUE(fmt.has_value());
+
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(
+            makeCoalescingScopeModule(), **target, **fmt, rep,
+            dss::ImageRequest{.artifactFileName = "libuuid.dylib"});
+        for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(rep.errorCount(), 0u);
+        ASSERT_FALSE(bytes.empty());
+
+        auto const uuid = imageUuid(bytes);
+        ASSERT_TRUE(uuid.has_value())
+            << "no LC_UUID: dyld reports a missing uuid for this image and no "
+               "crash log can be symbolicated against it";
+        EXPECT_FALSE(allZero(*uuid))
+            << "the LC_UUID payload is still the emission placeholder — the "
+               "command shipped but the derivation never ran";
+        // The command must declare its own 24-byte wire size, or dyld's
+        // load-command walk desyncs on the NEXT command rather than on this one.
+        auto const at = dss::macho::test::findLoadCommand(bytes, kLcUuidCmd);
+        ASSERT_TRUE(at.has_value());
+        EXPECT_EQ(readU32LE(bytes, *at + 4), 24u);
+    }
+}
+
+TEST(MachoImageUuid, TheUuidIsDerivedFromContentSoOneArtifactRebuiltAgrees) {
+    // The reproducible-build half. Several corpus examples compare a
+    // `--config=release` artifact BYTE-FOR-BYTE, so a random uuid would make
+    // every such artifact differ from itself.
+    for (auto const& leg : kDylibLegs) {
+        SCOPED_TRACE(leg.label);
+        auto target = TargetSchema::loadShipped(leg.target);
+        auto fmt    = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(target.has_value());
+        ASSERT_TRUE(fmt.has_value());
+
+        DiagnosticReporter repA;
+        auto const first = dss::macho::encode(
+            makeCoalescingScopeModule(), **target, **fmt, repA,
+            dss::ImageRequest{.artifactFileName = "libsame.dylib"});
+        DiagnosticReporter repB;
+        auto const second = dss::macho::encode(
+            makeCoalescingScopeModule(), **target, **fmt, repB,
+            dss::ImageRequest{.artifactFileName = "libsame.dylib"});
+        ASSERT_EQ(repA.errorCount(), 0u);
+        ASSERT_EQ(repB.errorCount(), 0u);
+        ASSERT_FALSE(first.empty());
+
+        auto const uA = imageUuid(first);
+        auto const uB = imageUuid(second);
+        ASSERT_TRUE(uA.has_value());
+        ASSERT_TRUE(uB.has_value());
+        EXPECT_EQ(*uA, *uB) << "one artifact rebuilt got two identities";
+        EXPECT_EQ(first, second)
+            << "the whole image is not reproducible, so the uuid cannot be "
+               "either — the two claims stand or fall together";
+    }
+}
+
+TEST(MachoImageUuid, TwoDistinctArtifactsGetDistinctUuids) {
+    // ★ The failure mode this excludes is the one P62 closed TWICE on this same
+    // writer — `image.installName` and `codeSignature.identifier` were each ONE
+    // constant for every artifact a format ever produced. A uuid is not a
+    // template, but a uuid that never varies is the same defect wearing a
+    // different key.
+    auto target = TargetSchema::loadShipped("arm64");
+    auto fmt    = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-dylib");
+    ASSERT_TRUE(target.has_value());
+    ASSERT_TRUE(fmt.has_value());
+
+    DiagnosticReporter repA;
+    auto const a = dss::macho::encode(
+        makeCoalescingScopeModule(), **target, **fmt, repA,
+        dss::ImageRequest{.artifactFileName = "libalpha.dylib"});
+    DiagnosticReporter repB;
+    auto const b = dss::macho::encode(
+        makeCoalescingScopeModule(), **target, **fmt, repB,
+        dss::ImageRequest{.artifactFileName = "libbeta.dylib"});
+    ASSERT_EQ(repA.errorCount(), 0u);
+    ASSERT_EQ(repB.errorCount(), 0u);
+    ASSERT_FALSE(a.empty());
+    ASSERT_FALSE(b.empty());
+
+    auto const uA = imageUuid(a);
+    auto const uB = imageUuid(b);
+    ASSERT_TRUE(uA.has_value());
+    ASSERT_TRUE(uB.has_value());
+    // The two artifacts differ ONLY in their per-artifact identity (the
+    // LC_ID_DYLIB install name), which is genuinely part of the content — the
+    // same reason ld64 gives two differently-named dylibs two uuids.
+    EXPECT_NE(a, b) << "the two artifacts are byte-identical, so this case "
+                       "would prove nothing about the uuid";
+    EXPECT_NE(*uA, *uB)
+        << "two different artifacts answer to ONE identity — the defect "
+           "D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT "
+           "and its codesign sibling both were, on this same writer";
+}
+
+TEST(MachoImageUuid, PresenceFollowsTheFormatDocumentAndNotTheFiletype) {
+    // D-LK-MACHO-EMITS-NO-LC-UUID increment 2/2 — the pin that makes the key a
+    // DECLARATION rather than ceremony. It has to fail in BOTH directions, so
+    // it asserts the declaring documents emit the command AND that a document
+    // withholding it emits none. Without the second arm an emitter that ignored
+    // the key entirely would stay green.
+    //
+    // ✔MEASURED on Apple Silicon (ld-1267) that this is the reference's own
+    // shape: `-Wl,-no_uuid` removes the command from a filetype-2 exec and a
+    // filetype-6 dylib alike, with a plain rebuild as the CONTROL carrying one
+    // again — so presence is per-link POLICY, not a property of the filetype.
+    struct Row {
+        char const* target;
+        char const* format;
+        bool        declares;
+    };
+    // The MH_OBJECT rows are the negative arm and they are REAL shipped
+    // documents, not a synthetic mutant: no relocatable flavour declares the
+    // key, matching `clang -c`, which emits no LC_UUID.
+    constexpr Row kRows[] = {
+        {"arm64",  "macho64-arm64-darwin-dylib",      true},
+        {"x86_64", "macho64-x86_64-darwin-dylib",     true},
+        {"arm64",  "macho64-arm64-darwin",            false},
+        {"x86_64", "macho64-x86_64-darwin",           false},
+        {"arm64",  "macho64-arm64-darwin-staticlib",  false},
+        {"x86_64", "macho64-x86_64-darwin-staticlib", false},
+    };
+    for (auto const& row : kRows) {
+        SCOPED_TRACE(row.format);
+        auto fmt = ObjectFormatSchema::loadShipped(row.format);
+        ASSERT_TRUE(fmt.has_value());
+        // The DECLARATION half — read straight off the loaded schema, so a
+        // loader that silently dropped the key reds here rather than surviving
+        // as a byte coincidence downstream.
+        EXPECT_EQ((*fmt)->machoImage().uuid.has_value(), row.declares);
+        if (row.declares) {
+            EXPECT_EQ((*fmt)->machoImage().uuid->derivation,
+                      dss::MachOUuid::Derivation::ContentHash);
+        }
+    }
+    // The EMISSION half, on the two flavours this test can drive end-to-end.
+    for (auto const& leg : kDylibLegs) {
+        SCOPED_TRACE(leg.label);
+        auto target = TargetSchema::loadShipped(leg.target);
+        auto fmt    = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(target.has_value());
+        ASSERT_TRUE(fmt.has_value());
+        ASSERT_TRUE((*fmt)->machoImage().uuid.has_value())
+            << "this leg is the POSITIVE arm and its document must declare the "
+               "key, or the emission assertion below proves nothing";
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(
+            makeCoalescingScopeModule(), **target, **fmt, rep,
+            dss::ImageRequest{.artifactFileName = "libdecl.dylib"});
+        ASSERT_EQ(rep.errorCount(), 0u);
+        ASSERT_FALSE(bytes.empty());
+        EXPECT_TRUE(imageUuid(bytes).has_value())
+            << "the document declares image.uuid and the writer emitted no "
+               "LC_UUID — the declaration is not being read";
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING — THE STATIC-INITIALIZER FORM
+// ON THE MACH-O RAIL.
+//
+// `int (*p)(void) = w;` at FILE SCOPE. Before this fold the walker baked this
+// artifact's OWN body VA into the slot and queued a REBASE, so `p` inside the
+// library and `&w` in the image that actually won the name were two pointers
+// for one identifier — rc 0, nothing diagnosed. ✔MEASURED that DSS did exactly
+// that on a real arm64 darwin dylib built by this compiler (`rebase 8 =
+// 1121005100000000`, `weak_bind 0`), and ✔MEASURED what ld64 emits for the same
+// source on Apple Silicon (macOS 26.6.2, ld-1267): the SAME rebase PLUS
+// `weak_bind 16 = 405f7732005171009000…`, i.e. `<weak-def-coalesce>/_w2` on the
+// `__DATA __data` slot. So the fix ADDS the bind and KEEPS the rebase, which is
+// byte-for-byte the reference's legacy shape.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// A dylib module whose __DATA slot is INITIALIZED with the address of one of
+// its own definitions. `weakDefinition` selects the one field that decides the
+// answer: a WEAK, default-visibility definition is in the format's declared
+// preemptible set and must be loader-resolved; a `static`-equivalent (hidden)
+// one is in no image's dynamic export set, so no loader can replace it and the
+// slot must stay a plain rebase.
+[[nodiscard]] AssembledModule
+makeDefinitionAddressInitializerModule(bool weakDefinition,
+                                       RelocationKind abs64) {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{
+        SymbolId{1}, "_w",
+        weakDefinition ? SymbolBinding::Weak : SymbolBinding::Global,
+        weakDefinition ? SymbolVisibility::Default
+                       : SymbolVisibility::Hidden});
+    // A second, genuinely weak export so the CONTROL arm still publishes a weak
+    // definition — otherwise "the weak stream is empty" would be equally
+    // consistent with "this image has no coalescing surface at all", which is a
+    // different fact.
+    AssembledFunction other;
+    other.symbol = SymbolId{2};
+    other.bytes  = {0xC0, 0x03, 0x5F, 0xD6};
+    mod.functions.push_back(std::move(other));
+    mod.expectedFuncCount = 2;
+    mod.symbols.push_back(ModuleSymbol{SymbolId{2}, "_wother",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+
+    AssembledData slot;
+    slot.symbol    = SymbolId{6};
+    slot.section   = DataSectionKind::Data;
+    slot.bytes     = std::vector<std::uint8_t>(8, 0);
+    slot.alignment = Alignment::of<8>();
+    Relocation rel;
+    rel.offset = 0;
+    rel.target = SymbolId{1};          // the DEFINITION, not an import
+    rel.kind   = abs64;
+    rel.addend = 0;
+    slot.relocations.push_back(rel);
+    mod.dataItems.push_back(std::move(slot));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{6}, "_p",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    return mod;
+}
+
+// Does the weak-bind stream carry a SET_SYMBOL_TRAILING_FLAGS_IMM entry for
+// this exact NUL-terminated name?
+[[nodiscard]] bool weakStreamNames(std::span<std::uint8_t const> bytes,
+                                   std::string_view name) {
+    auto const weak = dyldInfoStream(bytes, 2);
+    if (!weak.has_value() || weak->second == 0) return false;
+    for (std::uint32_t i = 0; i + 1 + name.size() + 1 <= weak->second; ++i) {
+        if (bytes[weak->first + i] != 0x40u) continue;
+        bool match = true;
+        for (std::size_t k = 0; k < name.size(); ++k) {
+            if (bytes[weak->first + i + 1 + k]
+                != static_cast<std::uint8_t>(name[k])) { match = false; break; }
+        }
+        if (match && bytes[weak->first + i + 1 + name.size()] == 0u) return true;
+    }
+    return false;
+}
+
+} // namespace
+
+TEST(MachoCoalescingScopeReference,
+     AStaticInitializerNamingAPreemptibleDefinitionIsLoaderResolved) {
+    for (auto const& leg : kDylibLegs) {
+        SCOPED_TRACE(leg.label);
+        auto target = TargetSchema::loadShipped(leg.target);
+        auto fmt    = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(target.has_value());
+        ASSERT_TRUE(fmt.has_value());
+
+        auto const* abs64 = (*target)->relocationByName("abs64");
+        ASSERT_NE(abs64, nullptr)
+            << leg.label << ": this target declares no `abs64` "
+               "relocation — the relocation VOCABULARY is per-TARGET and "
+               "the two darwin ports disagree on the row NUMBER (a "
+               "hard-coded 4 is `tls-tpoff32` on x86_64, width 4, and the "
+               "walker refuses it — measured, not guessed)";
+
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(
+            makeDefinitionAddressInitializerModule(true, abs64->kind),
+            **target, **fmt, rep,
+            dss::ImageRequest{.artifactFileName = "libinit.dylib"});
+        for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(rep.errorCount(), 0u);
+        ASSERT_FALSE(bytes.empty());
+
+        EXPECT_TRUE(weakStreamNames(bytes, "_w"))
+            << "the __DATA slot initialized with the address of this image's "
+               "own WEAK definition carries no coalescing-scope bind — the "
+               "loader slides the local body's address instead, so `p` inside "
+               "this library and `&w` in the image that won the name are two "
+               "pointers for one identifier";
+        // ld64 keeps the REBASE as well, and so must this: it leaves this
+        // artifact's own callable body in the slot as the value a loader that
+        // ran no coalescing pass would see.
+        auto const rebase = dyldInfoStream(bytes, 0);
+        ASSERT_TRUE(rebase.has_value());
+        EXPECT_GT(rebase->second, 0u)
+            << "the rebase entry was dropped; ld64 emits BOTH for this source";
+        // And it must NOT be in the ORDINARY bind stream, which names a dylib
+        // ordinal a coalescing-scope reference does not have — `dylibOrdinal`
+        // misses and returns 0 == BIND_SPECIAL_DYLIB_SELF, i.e. "this image's
+        // own definition": the defect, re-encoded.
+        auto const bind = dyldInfoStream(bytes, 1);
+        ASSERT_TRUE(bind.has_value());
+        bool inOrdinary = false;
+        for (std::uint32_t i = 0; i + 2 < bind->second; ++i) {
+            if (bytes[bind->first + i] == 0x40u
+                && bytes[bind->first + i + 1] == '_'
+                && bytes[bind->first + i + 2] == 'w') inOrdinary = true;
+        }
+        EXPECT_FALSE(inOrdinary)
+            << "the definition address appears in the ORDINARY bind stream";
+    }
+}
+
+TEST(MachoCoalescingScopeReference,
+     AStaticInitializerNamingAnUnpreemptibleDefinitionStaysARebase) {
+    // THE CONTROL, and it is the DISCRIMINATOR rather than a smoke test: the
+    // two arms differ in ONE field (the definition's binding + visibility), the
+    // image still publishes a weak definition in both, and only the preemptible
+    // arm may reach the weak stream. Without it, "the weak stream named _w" is
+    // equally consistent with "this walker weak-binds every data slot", which
+    // would send every `&static_helper` through the loader.
+    for (auto const& leg : kDylibLegs) {
+        SCOPED_TRACE(leg.label);
+        auto target = TargetSchema::loadShipped(leg.target);
+        auto fmt    = ObjectFormatSchema::loadShipped(leg.format);
+        ASSERT_TRUE(target.has_value());
+        ASSERT_TRUE(fmt.has_value());
+
+        auto const* abs64 = (*target)->relocationByName("abs64");
+        ASSERT_NE(abs64, nullptr)
+            << leg.label << ": this target declares no `abs64` "
+               "relocation — the relocation VOCABULARY is per-TARGET and "
+               "the two darwin ports disagree on the row NUMBER (a "
+               "hard-coded 4 is `tls-tpoff32` on x86_64, width 4, and the "
+               "walker refuses it — measured, not guessed)";
+
+        DiagnosticReporter rep;
+        auto const bytes = dss::macho::encode(
+            makeDefinitionAddressInitializerModule(false, abs64->kind),
+            **target, **fmt, rep,
+            dss::ImageRequest{.artifactFileName = "libinitctl.dylib"});
+        for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+        ASSERT_EQ(rep.errorCount(), 0u);
+        ASSERT_FALSE(bytes.empty());
+
+        EXPECT_FALSE(weakStreamNames(bytes, "_w"))
+            << "a HIDDEN definition — in no image's dynamic export set, so no "
+               "loader can replace it under any format — was routed through "
+               "the coalescing scope anyway";
+        auto const rebase = dyldInfoStream(bytes, 0);
+        ASSERT_TRUE(rebase.has_value());
+        EXPECT_GT(rebase->second, 0u)
+            << "the slot lost its rebase, so a PIE/dylib slide leaves the "
+               "stored pointer unbiased";
+    }
 }

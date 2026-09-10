@@ -112,6 +112,39 @@ void DiagnosticReporter::truncateTo(Snapshot const& snap) {
     droppedByCap_   = snap.droppedByCap;
     capMarkerIndex_ = snap.capMarkerIndex;
     elided_         = snap.elided;
+
+    // ★★★ AND THE MARKERS' PROSE, WHICH A SIZE RESTORE CANNOT REACH.
+    //
+    // `noteCapDrop_` and `rewriteElisionMarker_` rewrite `all_[i].actual` IN
+    // PLACE, and `i` is the index the marker was MINTED at — which is below
+    // `snap.allSize` whenever the marker predates the checkpoint. So a
+    // speculative branch that elided a few more diagnostics of a code whose
+    // marker was already standing left, after rollback, a marker whose
+    // sentence named the BRANCH's counts while `elided_` / `droppedByCap_`
+    // were correctly restored to the pre-branch ones. The stream then told an
+    // operator that N diagnostics were hidden when the ledger said M — a
+    // rolled-back branch changing the compiler's OUTPUT, which is the whole
+    // property the checkpoint exists to deny. Same shape as the two in-place
+    // writes the builder's undo journal covers, one layer up, and it is
+    // PROSE-ONLY only in the sense that no node moved: the number an operator
+    // acts on was wrong.
+    //
+    // ⓘ NOT SNAPSHOTTED — RE-DERIVED. Both sentences are pure functions of
+    // (`cfg_`, the restored ledger), so re-rendering them from the state this
+    // function has just put back is EXACT, and it keeps `Snapshot` free of a
+    // string per elided code. That matters: one Snapshot is taken per live
+    // speculative probe, so anything stored here is paid `maxSpeculationDepth`
+    // times over.
+    //
+    // Bounded by the number of DISTINCT codes that have elided, exactly like
+    // the `elided_` copy on the line above — nothing here follows the parse's
+    // depth. Every index is in range by construction: the snapshot was taken
+    // when `all_.size() == snap.allSize`, every marker index in it was valid
+    // then, and `all_` is only ever appended to or truncated from the end.
+    if (hitCap_) rewriteCapMarker_();
+    for (auto const& entry : elided_) {
+        rewriteElisionMarker_(entry.first);
+    }
 }
 
 void DiagnosticReporter::reanchorFrom(std::size_t      from,
@@ -258,6 +291,16 @@ std::uint64_t hashKey(ParseDiagnostic const& d) noexcept {
 
 void DiagnosticReporter::noteCapDrop_() {
     ++droppedByCap_;
+    rewriteCapMarker_();
+}
+
+// Split out of `noteCapDrop_` so `truncateTo` can re-derive the marker's
+// sentence after a rollback restores `droppedByCap_` — the sentence is a pure
+// function of (`cfg_`, `droppedByCap_`), and re-rendering it is what keeps a
+// rolled-back branch from leaving its own count standing in the stream. The
+// two callers are the only ones there can be: the drop that changes the count,
+// and the rollback that changes it back.
+void DiagnosticReporter::rewriteCapMarker_() {
     if (capMarkerIndex_ >= all_.size()) {
         capMarkerFatal(capMarkerIndex_, all_.size());
     }

@@ -319,9 +319,17 @@ hashLookup(std::vector<std::uint8_t> const& b, std::vector<Shdr> const& secs,
     rel.addend = 0;
     tab.relocations.push_back(rel);
     mod.dataItems.push_back(std::move(tab));
+    // ⚠ HIDDEN, and the visibility is the whole point of this fixture now.
+    // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: a `.so` slot holding the
+    // address of a DEFAULT-visibility global is NOT a link-time constant — both
+    // references emit a symbol-based row there so the loader picks the winner.
+    // The RELATIVE emission this fixture exists to pin is what a slot targeting
+    // a definition NO loader can replace takes, and `hidden` is that subject.
+    // Leaving it `default` made this test assert the divergence as if it were
+    // the contract.
     mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "dss_dispatch",
                                        SymbolBinding::Global,
-                                       SymbolVisibility::Default});
+                                       SymbolVisibility::Hidden});
     mod.symbols.push_back(ModuleSymbol{SymbolId{5}, "tab",
                                        SymbolBinding::Global,
                                        SymbolVisibility::Default});
@@ -756,9 +764,14 @@ TEST(ElfDynWriter, ExternAddressDataSlotEmitsSymbolBasedAbs64NotRelative) {
     fn.symbol = SymbolId{1};
     fn.bytes  = {0xC3};
     mod.functions.push_back(std::move(fn));
+    // ⚠ HIDDEN, so the third slot really is the INTERNAL CONTROL this test says
+    // it is. A DEFAULT-visibility global in a `.so` is PREEMPTIBLE, and its
+    // address slot now takes the loader-resolved row too
+    // (D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING) — which would make the
+    // control indistinguishable from the two extern subjects beside it.
     mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "dss_fn",
                                        SymbolBinding::Global,
-                                       SymbolVisibility::Default});
+                                       SymbolVisibility::Hidden});
     ExternImport dataExt;                       // `stdout` shape
     dataExt.symbol      = SymbolId{80};
     dataExt.mangledName = "stdout";
@@ -1531,9 +1544,13 @@ namespace {
     rel.addend = 0;
     tab.relocations.push_back(rel);
     mod.dataItems.push_back(std::move(tab));
+    // ⚠ HIDDEN — the x86_64 sibling's reason, verbatim: a DEFAULT-visibility
+    // global's address inside a `.so` takes the loader-resolved row, so the
+    // subject of a RELATIVE-emission pin must be a definition no loader can
+    // replace (D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING).
     mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "dss_dispatch",
                                        SymbolBinding::Global,
-                                       SymbolVisibility::Default});
+                                       SymbolVisibility::Hidden});
     mod.symbols.push_back(ModuleSymbol{SymbolId{5}, "tab",
                                        SymbolBinding::Global,
                                        SymbolVisibility::Default});
@@ -1663,4 +1680,324 @@ TEST(ElfPieWriterArm64, HeaderPinsEtDynDf1PieInterpNonZeroEntry) {
     ASSERT_TRUE(flags1.has_value());
     EXPECT_EQ(*flags1, kDf1Now | kDf1Pie)
         << "DT_FLAGS_1 must be NOW | PIE (0x08000001)";
+}
+
+// ★★ [[D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING]], the ADDRESS half — the
+// REALIZATION, pinned at the tier that assigns the VA.
+//
+// A preemption reference has TWO addressable facets under `direct-plt`, and
+// confusing them is the whole defect: the reference's own VA is the PLT STUB
+// (right for a call, and NOT the function's address), while its ADDRESS SLOT
+// symbol names the `.got` entry `.rela.dyn` fills with `R_*_GLOB_DAT` — the
+// value ld.so resolves from the global scope, which is what `&w` must be.
+// ✔MEASURED 2026-09-05: gcc 13.3.0 and clang 18.1.3 both materialize `&wk` and
+// `&st` inside a `.so` by LOADING exactly that slot, while a `static` sibling in
+// the SAME object is a bare `lea`.
+//
+// This is the arm that goes RED if `encodeElfExecDynamic` stops binding
+// `ExternImport::addressSlotSymbol`: the lea's relocation then names a symbol
+// with no VA. It reads the RESOLVED displacement out of the emitted bytes rather
+// than trusting the table, and it asserts the target is the GOT slot AND NOT the
+// PLT stub — because "it resolved to something" is equally consistent with
+// resolving to the stub, which is the wrong answer this exists to exclude.
+TEST(ElfDynWriter, PreemptionAddressSlotResolvesToTheGotSlotNotThePltStub) {
+    auto loaded = loadShippedDyn();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    // lea rax,[rip+disp32]; ret — the address lowering's slot-address load,
+    // reloc'd to the preemption reference's ADDRESS SLOT (kind 1 = pc-rel32).
+    fn.bytes = {0x48, 0x8D, 0x05, 0, 0, 0, 0, 0xC3};
+    Relocation rel;
+    rel.offset = 3;
+    rel.target = SymbolId{78};        // the SLOT, not the reference
+    rel.kind   = RelocationKind{1};
+    // kind 1's P is the END of the 4-byte field (the next instruction), so a
+    // plain `lea` of the symbol carries NO addend — the -4 the classic
+    // S + A - P spelling would need is already in this writer's P.
+    rel.addend = 0;
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    ExternImport imp;
+    imp.symbol                = SymbolId{77};
+    imp.mangledName           = "w";
+    imp.libraryPath           = "";   // the loader's GLOBAL scope
+    imp.isData                = false;
+    imp.isPreemptionReference = true;
+    imp.addressSlotSymbol     = SymbolId{78};
+    mod.externImports.push_back(std::move(imp));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "lib_addr_w",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    auto const secs = readSections(bytes);
+    Shdr const* text = findSection(secs, ".text");
+    Shdr const* got  = findSection(secs, ".got");
+    Shdr const* plt  = findSection(secs, ".plt");
+    ASSERT_NE(text, nullptr);
+    ASSERT_NE(got, nullptr);
+    ASSERT_NE(plt, nullptr);
+    EXPECT_EQ(got->size, 8u) << "one GOT slot for the reference";
+    EXPECT_EQ(plt->size, 6u) << "and one PLT stub beside it — the OTHER facet";
+    // Resolve the rip-relative displacement out of the emitted text.
+    auto const disp = static_cast<std::int32_t>(
+        readU32LE(bytes, text->offset + 3));
+    std::uint64_t const nextInsn = text->addr + 7;   // lea is 7 bytes
+    std::uint64_t const targetVa =
+        static_cast<std::uint64_t>(static_cast<std::int64_t>(nextInsn) + disp);
+    EXPECT_EQ(targetVa, got->addr)
+        << "the ADDRESS of a preemptible definition is the CONTENT of the "
+           "loader-filled GOT slot, so the lea must name the slot";
+    EXPECT_NE(targetVa, plt->addr)
+        << "a pointer to the PLT stub is not the function's address — that is "
+           "the divergence this slot exists to remove";
+    // And the slot really is the one ld.so writes: GLOB_DAT against `w`.
+    auto const rela = readRelaDyn(bytes, secs);
+    ASSERT_EQ(rela.size(), 1u);
+    EXPECT_EQ(rela[0].type, kRGlobDat);
+    EXPECT_EQ(rela[0].offset, got->addr);
+    auto const syms = readDynsyms(bytes, secs);
+    ASSERT_LT(rela[0].sym, syms.size());
+    EXPECT_EQ(syms[rela[0].sym].name, "w");
+    EXPECT_EQ(syms[rela[0].sym].shndx, 0u) << "resolved by the loader, UNDEF here";
+}
+
+// ★★ [[D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING]], the ADDRESS half in a
+// STATIC INITIALIZER — the residual the CODE-side fix left behind, and why
+// leaving it was not safe.
+//
+// The lowering routes the CODE form of `&w` through the loader-resolved slot.
+// A `fp tbl[] = { &w, ... }` initializer never reaches that lowering: it is a
+// data slot the image writer fills, and the writer had a link-time address for
+// `w` (this library's own body) and used it. The two forms then disagree INSIDE
+// ONE ARTIFACT — `tbl[0] == code_w()` answers FALSE in the library that wrote
+// both, a C 6.2.2p2 identity break nothing diagnoses. ✔MEASURED on a real
+// loader: before this arm, a DSS `.so` returned `lib_self_consistent=0` (neither
+// form agreeing) against a gcc-built control's 3, from one source in one run.
+//
+// ✔MEASURED, the shape both references emit (gcc 13.3.0 and clang 18.1.3, one
+// `.so` from `fp tbl[3] = { &w, &st, &sf }`, `-O1 -shared -fPIC`, with `sf`
+// `static` as the IN-OBJECT control): `R_X86_64_64 w + 0` and `R_X86_64_64 st`
+// over ZEROED slots, and a bare `R_X86_64_RELATIVE` left on `&sf`. The row names
+// the DEFINED export entry, so ld.so's global-scope lookup picks the winner.
+//
+// This module is the writer-tier twin of that source: `w` weak + default, `st`
+// global + default, `sf` LOCAL — and the assertions are three-sided, because
+// "two abs64 rows appeared" is equally consistent with routing EVERYTHING.
+TEST(ElfDynWriter, PreemptibleDefinitionAddressInAStaticInitializerIsLoaderResolved) {
+    auto loaded = loadShippedDyn();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 3;
+    for (std::uint32_t i = 1; i <= 3; ++i) {
+        AssembledFunction fn;
+        fn.symbol = SymbolId{i};
+        fn.bytes  = {0xC3};
+        mod.functions.push_back(std::move(fn));
+    }
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "w",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{2}, "st",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{3}, "sf",
+                                       SymbolBinding::Local,
+                                       SymbolVisibility::Default});
+    AssembledData tab;                          // fp tbl[3] = { &w, &st, &sf }
+    tab.symbol    = SymbolId{5};
+    tab.section   = DataSectionKind::Data;
+    tab.bytes     = std::vector<std::uint8_t>(24, 0);
+    tab.alignment = Alignment::of<8>();
+    tab.relocations.push_back(Relocation{0u,  SymbolId{1},
+                                         RelocationKind{2}, /*addend=*/0});
+    tab.relocations.push_back(Relocation{8u,  SymbolId{2},
+                                         RelocationKind{2}, /*addend=*/0});
+    tab.relocations.push_back(Relocation{16u, SymbolId{3},
+                                         RelocationKind{2}, /*addend=*/0});
+    mod.dataItems.push_back(std::move(tab));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{5}, "tbl",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    auto const secs = readSections(bytes);
+    auto const rela = readRelaDyn(bytes, secs);
+    auto const syms = readDynsyms(bytes, secs);
+    Shdr const* data = findSection(secs, ".data");
+    ASSERT_NE(data, nullptr);
+
+    std::vector<RelaRow> abs64Rows, relativeRows;
+    for (auto const& r : rela) {
+        if (r.type == kRAbs64) abs64Rows.push_back(r);
+        if (r.type == kRRelative) relativeRows.push_back(r);
+    }
+    ASSERT_EQ(abs64Rows.size(), 2u)
+        << "exactly the two PREEMPTIBLE entries take a symbol-based row";
+    ASSERT_EQ(relativeRows.size(), 1u)
+        << "and the `static` sibling keeps its bare RELATIVE row — the "
+           "in-object control both references emit";
+    std::uint64_t const slotW  = data->addr + 0;
+    std::uint64_t const slotSt = data->addr + 8;
+    std::uint64_t const slotSf = data->addr + 16;
+    EXPECT_EQ(abs64Rows[0].offset, slotW);
+    EXPECT_EQ(abs64Rows[1].offset, slotSt);
+    EXPECT_EQ(relativeRows[0].offset, slotSf);
+    EXPECT_EQ(abs64Rows[0].addend, 0);
+    EXPECT_EQ(abs64Rows[1].addend, 0);
+    // The rows name THIS IMAGE'S OWN DEFINED EXPORTS by name, and those entries
+    // are DEFINED (st_shndx != 0) — which is what separates them from the UNDEF
+    // import rows the CALL half's GLOB_DAT slots use. Asserted by NAME, so a
+    // row that resolved to "some symbol" cannot pass.
+    ASSERT_LT(abs64Rows[0].sym, syms.size());
+    ASSERT_LT(abs64Rows[1].sym, syms.size());
+    EXPECT_EQ(syms[abs64Rows[0].sym].name, "w");
+    EXPECT_EQ(syms[abs64Rows[1].sym].name, "st");
+    EXPECT_NE(syms[abs64Rows[0].sym].shndx, 0u)
+        << "the row names this image's own DEFINED export, gcc's choice";
+    EXPECT_NE(syms[abs64Rows[1].sym].shndx, 0u);
+    // And the slot BYTES: zeroed for the loader on the two preemptible entries,
+    // prelinked on the static one. A non-zero preemptible slot is the baked
+    // local-body address this test exists to exclude.
+    auto slotBytes = [&](std::uint64_t va) {
+        return readU64LE(bytes, data->offset + (va - data->addr));
+    };
+    EXPECT_EQ(slotBytes(slotW), 0u)
+        << "ld.so writes the winner here; a baked value is the divergence";
+    EXPECT_EQ(slotBytes(slotSt), 0u);
+    EXPECT_EQ(slotBytes(slotSf),
+              static_cast<std::uint64_t>(relativeRows[0].addend))
+        << "the static entry keeps the prelinked RELATIVE convention";
+}
+
+// ★ THE CONTROL, and it is the arm that must stay GREEN when the fix above is
+// deleted. The declaration is what admits a definition to the loader-resolved
+// path, so a format that declares NOTHING must leave EVERY static-initializer
+// entry on the RELATIVE path — including a `global`+`default` one, which IS a
+// member of the dyn format's declared set.
+//
+// The instrument is a REAL SHIPPED DOCUMENT that lacks the key, never a
+// synthesized one: `elf64-x86_64-linux-pie` is ET_DYN (so it emits the RELATIVE
+// rows this asserts) and declares no `preemptibleDefinitionBindings`, because a
+// main executable is always its own winner. Removing the key from the DYN
+// document is the direction that would throw here; adding one to a fixture is
+// the direction that stays green while the shipped config loses the feature.
+TEST(ElfDynWriter, NoDeclarationLeavesEveryStaticInitializerEntryRelative) {
+    auto loaded = loadShippedPie();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    ASSERT_TRUE(loaded.format->preemptibleDefinitionBindings().empty())
+        << "the PIE document must declare no preemptible bindings — that "
+           "absence IS this control";
+    AssembledModule mod = makeReturn42UserModule();   // `main`, global+default
+    AssembledFunction w;                               // a WEAK sibling beside it
+    w.symbol = SymbolId{2};
+    w.bytes  = {0xC3};
+    mod.functions.push_back(std::move(w));
+    mod.expectedFuncCount = 2;
+    // A multi-function module must NAME its entry — the trampoline refuses to
+    // guess (it used to pick functions[0] and silently call the wrong body).
+    mod.userEntrySymbol = SymbolId{1};
+    mod.symbols.push_back(ModuleSymbol{SymbolId{2}, "w",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+    AssembledData tab;                                 // fp tbl[2] = {&main,&w}
+    tab.symbol    = SymbolId{5};
+    tab.section   = DataSectionKind::Data;
+    tab.bytes     = std::vector<std::uint8_t>(16, 0);
+    tab.alignment = Alignment::of<8>();
+    tab.relocations.push_back(Relocation{0u, SymbolId{1},
+                                         RelocationKind{2}, /*addend=*/0});
+    tab.relocations.push_back(Relocation{8u, SymbolId{2},
+                                         RelocationKind{2}, /*addend=*/0});
+    mod.dataItems.push_back(std::move(tab));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{5}, "tbl",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    // Through the LINKER, because a PIE needs its `_start` trampoline
+    // prepended — the same path every other PIE arm in this file takes.
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
+    std::string diagText;   // so a red arm says WHICH refusal, not just a count
+    for (auto const& d : rep.all()) diagText += d.actual + "\n";
+    ASSERT_EQ(rep.errorCount(), 0u) << diagText;
+    ASSERT_TRUE(image.ok());
+    auto const& bytes = image.bytes;
+    ASSERT_FALSE(bytes.empty());
+    auto const secs = readSections(bytes);
+    auto const rela = readRelaDyn(bytes, secs);
+    Shdr const* data = findSection(secs, ".data");
+    ASSERT_NE(data, nullptr);
+    std::size_t abs64Count = 0, relativeCount = 0;
+    for (auto const& r : rela) {
+        if (r.type == kRAbs64) ++abs64Count;
+        if (r.type == kRRelative) ++relativeCount;
+    }
+    EXPECT_EQ(abs64Count, 0u)
+        << "no declaration, no symbol-based row — not one, for any binding";
+    EXPECT_EQ(relativeCount, 2u)
+        << "both entries stay on the self-relative path";
+    auto slotBytes = [&](std::uint64_t va) {
+        return readU64LE(bytes, data->offset + (va - data->addr));
+    };
+    EXPECT_NE(slotBytes(data->addr + 0), 0u)
+        << "and the slots stay PRELINKED, never zeroed for a loader lookup";
+    EXPECT_NE(slotBytes(data->addr + 8), 0u);
+}
+
+// ★ THE OTHER HALF OF THE DISCRIMINATOR, asked on the DYN format itself: a
+// definition the loader cannot see keeps its RELATIVE row even where the
+// declaration IS present. `definitionIsPreemptible` asks VISIBILITY first and
+// universally, so `hidden` is refused by the engine rather than by the document
+// — this arm is what proves the engine half is wired here, and it stays GREEN
+// under the REMOVE mutant (everything relative is the mutant's own answer).
+TEST(ElfDynWriter, AHiddenDefinitionsStaticInitializerEntryStaysRelative) {
+    auto loaded = loadShippedDyn();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    ASSERT_FALSE(loaded.format->preemptibleDefinitionBindings().empty())
+        << "the DYN document DOES declare the set — so a RELATIVE row below is "
+           "the visibility rule refusing, not an absent declaration";
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "h",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Hidden});
+    AssembledData tab;
+    tab.symbol    = SymbolId{5};
+    tab.section   = DataSectionKind::Data;
+    tab.bytes     = std::vector<std::uint8_t>(8, 0);
+    tab.alignment = Alignment::of<8>();
+    tab.relocations.push_back(Relocation{0u, SymbolId{1},
+                                         RelocationKind{2}, /*addend=*/0});
+    mod.dataItems.push_back(std::move(tab));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{5}, "tbl",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    auto const secs = readSections(bytes);
+    auto const rela = readRelaDyn(bytes, secs);
+    std::size_t abs64Count = 0, relativeCount = 0;
+    for (auto const& r : rela) {
+        if (r.type == kRAbs64) ++abs64Count;
+        if (r.type == kRRelative) ++relativeCount;
+    }
+    EXPECT_EQ(abs64Count, 0u)
+        << "no loader can replace a hidden definition, so nothing is routed";
+    EXPECT_EQ(relativeCount, 1u);
 }

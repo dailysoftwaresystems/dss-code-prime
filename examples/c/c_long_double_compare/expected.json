@@ -1,0 +1,34 @@
+{
+  "$comment": "D-TARGET-ENCODING-WIDTH-GUARD (LD-3): the runtime witness for COMPARING two `long double` values, on every long-double axis. ✔MEASURED BEFORE THE CHANGE, through the shipped CLI at 01642ee3: this source's first comparison REFUSED with `L_UnsupportedLoweringForOpcode` — \"MIR FCmp operand: float TypeKind ordinal 14 is not lowerable ... only F64 and F32 have scalar float encodings this cycle\" — on x86_64:elf64-x86_64-linux-exec (F80), and the identical refusal at ordinal 15 (F128) on arm64:elf64-aarch64-linux-exec; the baseline was FAIL LOUD with no binary, never a wrong answer, and the diagnostic NAMED this anchor. The f64 axis (pe64 x86_64, macOS arm64), where `long double` IS `double`, already ran every arm. TWO REALIZATIONS: on the x87-80 axis an INLINE `fld_m80 [rhs]; fld_m80 [lhs]; fucomip; fstp_st0` whose EFLAGS are UCOMISD's bit for bit, so the whole FC3.5 predicate machinery applies unchanged; on the ieee128 axis a CALL to one of six config'd libgcc helpers (__lttf2/__letf2/__gttf2/__getf2/__eqtf2/__netf2, one per C operator) followed by a WIDTH-32 integer compare of its `int` result against zero. ★★ WHAT EACH ARM MEASURES, because a long-double program that compiles and returns 42 proves NO FAULT and nothing about whether the comparison was CORRECT — a compare lowering does not crash when it is wrong, it returns the opposite answer: arms 1-6 DIRECTION, every relational operator over an ASYMMETRIC pair in BOTH directions (on the x87 axis FUCOMIP compares ST(0) against ST(1), so the LEFT operand must be pushed LAST — the REVERSE of the arithmetic sequence's order — and swapping those two pushes inverts every relational operator with nothing in the pipeline able to notice); arms 7-9 the EQUALITY BOUNDARY, where `<=`/`>=` must be true and `<` false on equal operands, which is where a wrong condition-code nibble diverges from a merely wrong direction; arms 10-13 `==`/`!=` both ways, the COMPOSED two-setcc tail on x86 and the mixed single/composed tail on arm64; arms 14-16 WIDTH, and they are why this file does not simply compare 1.5 with 2.5 — any comparison whose operands differ in their first few mantissa bits survives being narrowed to `double` and so witnesses nothing about the type's real precision. Arms 14-15 discover the ULP OF 1.0 at runtime using the compiler's own long-double compare (self-calibrating, so exact on all three axes without <float.h>, which DSS does not ship: 2^-52 where long double is double, 2^-63 on x87, 2^-112 on binary128), and arm 16 breaks their circularity — a UNIFORM narrowing would make 14-15 pass by simply stopping the loop early — by CROSS-CHECKING the comparison's answer against long-double ARITHMETIC, which is full-width by construction (LD-1/LD-2). Under a double-precision compare on the x87 axis the two disagree and arm 16 fires. ⓘ ARM 14's LOOP IS ALSO THE x87 STACK-BALANCE ARM: its condition is a long-double comparison evaluated once per mantissa bit (64 times on x87), the x87 register stack is EIGHT deep and each compare pushes TWO operands, so leaking either the FUCOMIP pop or the `fstp st(0)` cleanup overflows it by the eighth iteration and every later result is an indefinite NaN — a straight-line witness would never reach the leak. ANTI-FOLD: every operand and every branch condition is read from a MUTABLE GLOBAL, so release cannot constant-fold a comparison away and leave the lowering untested; the release arm measures the same comparisons through Mem2Reg-promoted values (the long-double locals become real phis across the loop's back edge) rather than through memory traffic. ✔REFERENCE ORACLE, each probed SEPARATELY and every one returning 42: WSL gcc 13.3.0 (-O0/-O2), WSL clang 18.1.3 (-O0/-O2), mingw-w64 gcc 13.2.0 native (-O0/-O2), aarch64-linux-gnu-gcc 13.3.0 under qemu-aarch64 (-O0/-O2); MSVC 19.44 compiles it clean at /std:c17 (an ABSTENTION on the 80-bit width — it maps `long double` to `double` — but a positive vote on the construct). Lowering is pinned in the unit suite by the six MirToLir F80Compare*/F128Compare* tests in tests/lir/test_mir_to_lir.cpp, including the two ABSOLUTE push-direction arms and the F128 width-32 arm. exit = 42; each arm returns its own number so a failure names itself.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

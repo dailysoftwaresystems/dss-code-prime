@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <optional>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -221,7 +222,13 @@ TEST(Mir, BuildsAndReadsAStraightLineFunction) {
 
     // instruction tier — the fused value model
     EXPECT_EQ(m.instOpcode(arg), MirOpcode::Arg);
-    EXPECT_EQ(m.argIndex(arg), 0u);                  // typed payload accessor
+    // ⚠ `tryArgIndex`, not `argIndex` — and the reason applies to every `try*`
+    // in this file [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]]. The line above is
+    // an `EXPECT`, which RECORDS a failure and falls through; the aborting
+    // reader would then kill this whole binary on exactly the regression the
+    // pair was written to report, costing every sibling case its verdict. The
+    // twin reports `nullopt`, so the mismatch fails HERE, by name, twice.
+    EXPECT_EQ(m.tryArgIndex(arg), 0u);               // typed payload accessor
     EXPECT_EQ(m.instOpcode(c), MirOpcode::Const);
     EXPECT_EQ(m.instType(sum), kI32);
     // reverse lookup: every instruction maps back to its block
@@ -233,7 +240,9 @@ TEST(Mir, BuildsAndReadsAStraightLineFunction) {
     EXPECT_EQ(sumOps[1], c);
 
     // literal pool — the const carries its decoded value (via typed accessor)
-    auto const& lit = m.literalValue(m.constLiteralIndex(c));
+    auto const litIdx = m.tryConstLiteralIndex(c);
+    ASSERT_TRUE(litIdx.has_value()) << "entry[1] is no longer a Const";
+    auto const& lit = m.literalValue(*litIdx);
     EXPECT_EQ(lit.core, TypeKind::I32);
     ASSERT_TRUE(std::holds_alternative<std::int64_t>(lit.value));
     EXPECT_EQ(std::get<std::int64_t>(lit.value), 5);
@@ -280,12 +289,13 @@ TEST(Mir, BuildsADiamondWithCondBrAndPhi) {
     EXPECT_EQ(m.blockSuccessors(elseB)[0], join);
     // join phi has both incomings
     EXPECT_EQ(m.instOpcode(phi), MirOpcode::Phi);
-    auto const inc = m.phiIncomings(phi);
-    ASSERT_EQ(inc.size(), 2u);
-    EXPECT_EQ(inc[0].value, x);
-    EXPECT_EQ(inc[0].pred, thenB);
-    EXPECT_EQ(inc[1].value, y);
-    EXPECT_EQ(inc[1].pred, elseB);
+    auto const inc = m.tryPhiIncomings(phi);   // non-fatal on a non-Phi
+    ASSERT_TRUE(inc.has_value()) << "the join's first instruction is not a Phi";
+    ASSERT_EQ(inc->size(), 2u);
+    EXPECT_EQ((*inc)[0].value, x);
+    EXPECT_EQ((*inc)[0].pred, thenB);
+    EXPECT_EQ((*inc)[1].value, y);
+    EXPECT_EQ((*inc)[1].pred, elseB);
 }
 
 // Phi incomings may be backpatched after the predecessor blocks are filled
@@ -545,6 +555,57 @@ TEST(MirDeathTest, AddInstRejectsValueOriginOpcodes) {
     // Const has a dedicated builder (addConst) so its payload is always a real
     // literal-pool index; addInst must refuse to spell it.
     EXPECT_DEATH({ (void)b.addInst(MirOpcode::Const, {}, kI32, 0); }, "dedicated builder");
+}
+
+// D-MIR-ADDINST-ADMITS-BLOCKADDRESS-WITH-A-FORWARDED-BLOCK-ID: the same refusal for
+// `BlockAddress`, which is the SAME structural hazard as `InlineAsm` and was the
+// only member of the class left undefended. Its payload is a TARGET BLOCK ID, and
+// every verbatim-copy site renumbers blocks, so a site that forwards `instPayload`
+// instead of calling `addBlockAddress` points `&&label` at the wrong block. That
+// failed SILENTLY — an ACCESS_VIOLATION at run time, measured as mutant A of
+// D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST — while its twin `IndirectBr`,
+// being a terminator, hit a cloner's fatal `default:` and aborted by name.
+//
+// RED-ON-DISABLE: drop `|| opcode == MirOpcode::BlockAddress` from `addInst`'s
+// dedicated-builder refusal and the EXPECT_DEATH below stops dying.
+TEST(MirDeathTest, AddInstRejectsBlockAddress) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    MirBuilder b;
+    b.addFunction(kFnSig, SymbolId{1});
+    MirBlockId e = b.createBlock();
+    b.beginBlock(e);
+    // `1` is a plausible-looking block id, which is the point: forwarding a raw
+    // payload is exactly what a copy site does, and it is indistinguishable from a
+    // correct one at the call site.
+    EXPECT_DEATH({ (void)b.addInst(MirOpcode::BlockAddress, {}, kI32, 1); },
+                 "dedicated builder");
+}
+
+// THE OTHER HALF OF THE REFUSAL, and the half a refusal-only test cannot see: the
+// SANCTIONED route must still work. A guard that reds the legitimate construction
+// path is not a fix, so this pins that `addBlockAddress` still builds the opcode,
+// still stamps the target block into the payload, and still marks that block
+// address-taken — the property `Mir::isBlockAddressTaken` derives and on which
+// SimplifyCfg's fold guard and IndirectBr's successor set both rest.
+TEST(Mir, AddBlockAddressRemainsTheSanctionedRoute) {
+    MirBuilder b;
+    b.addFunction(kFnSig, SymbolId{1});
+    MirBlockId const entry  = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const target = b.createBlock();
+    b.beginBlock(entry);
+    MirInstId const ba = b.addBlockAddress(target, kI32);
+    b.addBr(target);
+    b.beginBlock(target);
+    MirLiteralValue z; z.value = std::int64_t{0}; z.core = TypeKind::I32;
+    b.addReturn(b.addConst(z, kI32));
+    Mir m = std::move(b).finish();
+
+    EXPECT_EQ(m.instOpcode(ba), MirOpcode::BlockAddress);
+    auto const baTarget = m.tryBlockAddressTarget(ba);
+    ASSERT_TRUE(baTarget.has_value()) << "the address-of node is not a BlockAddress";
+    EXPECT_EQ(baTarget->v, target.v);
+    EXPECT_TRUE(m.isBlockAddressTaken(target));
+    EXPECT_FALSE(m.isBlockAddressTaken(entry));
 }
 
 TEST(MirDeathTest, BranchToBlockOfAnotherFunctionAborts) {
@@ -937,8 +998,15 @@ TEST(Mir, AggregatePathOperandsCarryCorrectValues) {
 
     auto const ops = m.instOperands(xv);
     ASSERT_EQ(ops.size(), 3u);
-    auto const& lit0 = m.literalValue(m.constLiteralIndex(ops[1]));
-    auto const& lit1 = m.literalValue(m.constLiteralIndex(ops[2]));
+    // The path operands are Consts by ExtractValue's contract — but "by
+    // contract" is what a regression breaks, and the aborting readers would
+    // answer that break with a dead binary rather than a named failure.
+    auto const p0 = m.tryConstLiteralIndex(ops[1]);
+    auto const p1 = m.tryConstLiteralIndex(ops[2]);
+    ASSERT_TRUE(p0.has_value() && p1.has_value())
+        << "ExtractValue's path operands must both be Const";
+    auto const& lit0 = m.literalValue(*p0);
+    auto const& lit1 = m.literalValue(*p1);
     ASSERT_TRUE(std::holds_alternative<std::int64_t>(lit0.value));
     ASSERT_TRUE(std::holds_alternative<std::int64_t>(lit1.value));
     EXPECT_EQ(std::get<std::int64_t>(lit0.value), 3);

@@ -464,6 +464,47 @@ struct AsmInstructionSpelling {
     // resolved against `TargetSchema::opcodeByMnemonic` at lowering time (the
     // opcode table lives in `.target.json`, which `core` cannot see here).
     std::vector<std::string> opcodeNames;
+    // ★★★ OPTIONAL — "`opcodeNames` IS A **RANKED** LIST OF ENCODINGS OF ONE
+    // OPERATION, NOT A SET OF ALTERNATIVE INSTRUCTIONS."
+    // [[D-ASM-ARM64-LDR-TO-LDUR-CONVENIENCE-ALIAS-REFUSED]], 2026-09-03.
+    //
+    // ★★ WHAT IT CHANGES, AND IT IS EXACTLY ONE THING. `electOpcode` normally
+    // REFUSES when two candidates accept the same operands, because "two
+    // opcodes that both fit means the dialect row cannot say which instruction
+    // the programmer wrote, and picking the first would be a coin flip baked
+    // into config order". That objection is sound and stays the DEFAULT. This
+    // key states the case in which it does not apply: when the candidates are
+    // encodings of ONE operation, the programmer did not choose between them —
+    // they wrote a spelling that denotes the operation — and the assembler is
+    // entitled to pick, in the order the dialect ranks them.
+    //
+    // ★★★ IT IS A MEASURED PROPERTY OF THE REFERENCE, NOT A CONVENIENCE.
+    // ✔MEASURED 2026-09-03, gas 2.42 and clang 18.1.3 probed SEPARATELY,
+    // agreeing on every cell and NEITHER warning: `ldr h0,[x1,#2]` assembles to
+    // the SCALED 0x7D400420 while `ldr h0,[x1,#1]` assembles to the UNSCALED
+    // 0x7C401020 — one spelling, two encodings, scaled preferred where both
+    // fit. The same holds at every width, in both directions (`str`), and on
+    // the integer file (`ldr x0,[x1,#1]` = 0xF8401020 = `ldur x0,[x1,#1]`).
+    //
+    // ⚠⚠ THE RANK IS NOT A LICENCE TO ENCODE THE WRONG THING, AND THE REASON
+    // IS THAT THE GUARDS STILL DECIDE. A candidate is reached only if its own
+    // `encoding.variants[].guard` accepts the operands, so the ordering can
+    // only ever choose among candidates that ALL encode correctly. What makes
+    // that true here is `guard.immMultipleOf`: without it a scaled variant
+    // matches an offset its encoder then refuses, and the ranking would hand
+    // the operation to a form that cannot carry it. The two keys are one
+    // mechanism and neither is safe alone.
+    //
+    // ⚠ AND IT NEVER WIDENS WHAT IS ACCEPTED. A value no candidate can encode
+    // is still refused, by the last candidate's own encoder — ✔MEASURED that
+    // both references refuse it too (`ldr h0,[x1,#257]`, outside imm9 and not
+    // a multiple of 2, is `Error: immediate offset out of range` in gas and
+    // `index must be an integer in range [-256, 255]` in clang).
+    //
+    // ⓘ FALSE IS THE NORMAL STATE: every pre-existing row keeps the ambiguity
+    // refusal, which is what a row naming two genuinely different instructions
+    // needs.
+    bool                     opcodesAreRankedEncodings = false;
     // ★★★ OPTIONAL, BECAUSE WHERE THE WIDTH IS WRITTEN IS A DIALECT FACT.
     // ✔MEASURED 2026-08-13 against a real arm64 dialect: AT&T puts the width in
     // the MNEMONIC SUFFIX (`movq` / `movl` — same registers, different width),
@@ -514,6 +555,35 @@ struct AsmInstructionSpelling {
     // width with no source width states half a fact, and the half it omits is
     // the one the LIR instruction carries. The loader refuses it.
     std::optional<std::uint32_t> destWidth;
+    // ★★★ OPTIONAL — "THIS SPELLING HAS TWO WIDTHS AND THE **REGISTERS** STATE
+    // BOTH." D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME.
+    //
+    // The third point of the same triangle `width` and `destWidth` already
+    // define. `width` absent already means *derive the operation width from the
+    // operands*; this says the same thing about the DESTINATION width, which
+    // `destWidth` (a number) can only ever state one of.
+    //
+    // ★★ WHY A SPELLING NEEDS IT. A conversion mnemonic is ONE spelling over N
+    // width pairs: aarch64 `fcvtzs` is four instructions (Wd|Xd × Sn|Dn), all
+    // four accepted by gas 2.42 and clang 18.1.3 (✔MEASURED, they agree on
+    // every one), and `fcvt` is two (Sd,Dn and Dd,Sn). A `width`+`destWidth`
+    // row fixes ONE pair, and four rows sharing a spelling are refused at load
+    // — correctly, since `rowsAreSelectorDisjoint` cannot prove them separable.
+    // With this key the dialect declares the spelling ONCE and the operands
+    // decide, exactly as they already do for `add x0,x1,x2` vs `add w0,w1,w2`.
+    //
+    // ⚠ IT IS NOT "SKIP THE WIDTH CHECKS". The SOURCES must still agree with
+    // each other (`sourceRegisterWidth` refuses `fcvtzs x0, s1, d2` as loudly
+    // as `dataRegisterWidth` refuses `movl %rax,%ecx`), and the destination
+    // width is not dropped: it becomes the `ElectedDestination` election routes
+    // on, AND the number `variantHonorsDeclaredDestWidth` refuses a silent
+    // variant over. The one property released is that the two ENDS agree —
+    // which is the single property a conversion is defined by not having.
+    //
+    // ⚠ MUTUALLY EXCLUSIVE WITH `destWidth` AND WITH `width`: each of those
+    // STATES a number this key says the operands state, and a row asserting
+    // both would have two owners for one fact. The loader refuses the pair.
+    bool                         destWidthFromOperands = false;
     // OPTIONAL: the `TargetCondCode` spelling this mnemonic carries (`je` →
     // `"eq"`, arm64 `b.eq` → `"eq"`). EMPTY means the row declares none.
     //
@@ -892,6 +962,99 @@ struct DSS_EXPORT AssemblyConfig {
             if (m.lexeme == lexeme) return &m;
         }
         return nullptr;
+    }
+
+    // ★★★ A LANE ARRANGEMENT IS A WIDTH VIEW SPELLED AS A SUFFIX.
+    // D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME, gap 3.
+    //
+    // `v1.8b` and `v1.16b` name the SAME register at two widths — 8 byte lanes
+    // is 64 bits, 16 is 128 — which is exactly what `d1` and `s1` say about the
+    // same file with a different spelling. So an arrangement is not a new
+    // concept: it is `AsmTemplateModifier`'s fact written on the other side of
+    // the name, and it lands in the same field (`regWidthBits`) through the
+    // same override.
+    //
+    // ★★ THE `suffix` CARRIES ITS OWN SEPARATOR (`".8b"`, never `"8b"` plus a
+    // declared `"."`), and that is deliberate: the engine then never spells a
+    // separator byte, never asks whether a dialect has one, and a dialect whose
+    // arrangement is written some other way declares that other way whole.
+    //
+    // ⚠ `registerClass` IS REQUIRED, unlike a width-view letter's. An
+    // arrangement names LANES OF A VECTOR REGISTER; there is no such thing as
+    // an unscoped one, and an unscoped row would apply `.16b` to a GPR, whose
+    // election would then fail one tier later with a message about banks.
+    //
+    // ⚠⚠ AND IT IS ONE VOCABULARY OVER TWO LEXICAL SURFACES, WHICH IS THE
+    // MEASURED SHAPE RATHER THAN A CHOICE. ✔MEASURED 2026-09-02: with
+    // `identifierClass.extraContinue` declaring `.`, a `.s`-written `v1.8b` is
+    // ONE `Identifier` token, while a template's `%0.16b` is FIVE tokens
+    // (placeholder sigil, index, the dot, `16`, `b`) because an identifier
+    // cannot START on a digit. The two surfaces therefore need different
+    // GRAMMAR — the shared core's `asmTemplateArrangement` exists for the
+    // second — but they need only ONE table, because both reduce to a
+    // concatenated spelling that ends with a declared suffix.
+    // ★★★ AND IT IS **NOT** ONLY A WIDTH — THAT WAS THE UNDER-SPECIFICATION
+    // [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]] IS NAMED FOR.
+    //
+    // The paragraph above is true and was never the whole truth: `.8b`, `.4h`,
+    // `.2s` and `.1d` are all SIXTY-FOUR BITS and are four DIFFERENT operand
+    // shapes, and `v1.8b` differs from `d1` in a way no width can state — one
+    // names lanes, the other names the register whole. A row carrying only
+    // `widthBits` therefore collapses two distinctions the machine makes:
+    //
+    //   * ARRANGED vs SCALAR. ✔MEASURED 2026-09-02 at the P54 base, both
+    //     directions and both surfaces: `cnt d0, d1` compiled and emitted
+    //     `cnt v0.8b, v1.8b`, and — the direction nobody had measured —
+    //     `fadd v0.8b, v1.8b, v2.8b` compiled and emitted `fadd d0, d1, d2`
+    //     (0x1E622820), a SCALAR DOUBLE ADD for a byte-lane spelling, with
+    //     rc=0 and no diagnostic. gas 2.42 and clang 18.1.3 REJECT both.
+    //   * ONE LANE SIZE vs ANOTHER at the same width. ✔MEASURED, and it is the
+    //     one gas/clang disagreement in this family: `mov v0.4h, v1.4h` is
+    //     refused by gas 2.42 and accepted by clang 18.1.3 as 0x0EA11C20 — the
+    //     same word as `.8b`, because the ORR alias is bitwise and its lane
+    //     size reaches no bit. On lane-SENSITIVE arithmetic the same suffix is
+    //     load-bearing (`addv h0, v1.4h` = 0x0E71B820 against `addv b0, v1.8b`
+    //     = 0x0E31B820), so a table that cannot tell `.4h` from `.8b` cannot
+    //     hold both facts.
+    //
+    // ⇒ `laneBits` is REQUIRED, and the loader derives nothing from it that it
+    // does not also check: `widthBits % laneBits == 0` is the lane COUNT, and a
+    // row failing it is refused at load rather than electing something at a
+    // width that happens to match.
+    struct AsmRegisterArrangement {
+        std::string   suffix;         // as declared, WITH its separator (".8b")
+        std::uint32_t widthBits = 0;  // lanes x lane width, in bits
+        // The width of ONE lane, in bits — `.8b` and `.16b` are both 8. Never
+        // 0 on a loaded row: 0 is the sentinel the ENGINE uses downstream for
+        // "this operand was written with no arrangement at all", so a declared
+        // row carrying it would make an arranged operand indistinguishable
+        // from a scalar one.
+        std::uint32_t laneBits  = 0;
+        std::string   registerClass;  // required; a TargetRegClass name
+    };
+    std::vector<AsmRegisterArrangement> registerArrangements;
+
+    // The declared arrangement `written` ENDS WITH, or nullptr. ⚠ LONGEST
+    // MATCH, so a dialect declaring both `.b` and `.16b` cannot have the
+    // shorter one silently win on `v0.16b` — the same maximal-munch rule the
+    // tokenizer applies to lexemes, restated because this lookup is not the
+    // tokenizer's.
+    // ⚠ EXACT BYTES, never folded by `spellingCase`: an arrangement is part of
+    // a register SPELLING, and `registerLookupKey` folds the whole spelling
+    // afterwards on a dialect that folds.
+    [[nodiscard]] AsmRegisterArrangement const*
+    arrangementSuffixOf(std::string_view written) const noexcept {
+        AsmRegisterArrangement const* best = nullptr;
+        for (auto const& a : registerArrangements) {
+            if (a.suffix.size() >= written.size()) continue;
+            if (written.substr(written.size() - a.suffix.size()) != a.suffix) {
+                continue;
+            }
+            if (best == nullptr || a.suffix.size() > best->suffix.size()) {
+                best = &a;
+            }
+        }
+        return best;
     }
 
     // Indexed by `static_cast<std::size_t>(AsmOperandRole)`. Every role is

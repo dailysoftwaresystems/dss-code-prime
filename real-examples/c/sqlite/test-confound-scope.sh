@@ -125,7 +125,12 @@ fails='writecrash-1.1.1 walsetlk-2.1.3 zipfile-25.0 sometest-9.9'
 # a pass over work it did not do.
 # ★ ADDING AN ASSERTION WITHOUT BUMPING THIS NUMBER FAILS ON THE VERY NEXT RUN,
 # by design. One line to update, against an instrument that would otherwise lie.
-TOTAL_ASSERTIONS=158     # 20 classifier + 14 provenance helpers + 12 Step-2 gate
+TOTAL_ASSERTIONS=170     # 20 classifier + 14 provenance helpers + 12 Step-2 gate
+                         # + 3 RUN-DIRECTORY CORROBORATION, this driver, x2 with
+                         #   the .ps1-gated pairing block = 6 (region marker, the
+                         #   --corroborate-run-dir call, and the runDirectoryGating
+                         #   refusal that makes forgetting the call fatal)
+                         #   [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
                          # +6 (2026-09-01): the identity-triple JOIN in both
                          # drivers, and what each hands --reference-target
                          # [D-HARNESS-ORACLE-CLASSIFIER-READS-AN-IDENTITY-TRIPLE-WITH-THE-LEG-SPEC-READERS]
@@ -794,6 +799,26 @@ check "the .sh marks the smoke-target-identity region" "dss:smoke-targets"   "$S
 # claim is only true if this file reads the sentinel BY NAME.
 check "the .sh marks the build-attribution region" "dss:build-attribution" "$SHTXT"
 check "the .sh ASKS whose build failure it is"     "--attribute-build"     "$SHCODE"
+# [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+# ★★ THE CORROBORATOR IS THE THING THAT MAKES A `requiresRunDirectory` ROW EXCUSE
+# NOTHING ON A HOST WHERE ITS PRECONDITION DOES NOT HOLD. A driver that stopped
+# asking would excuse `vtabH-3.1` on a clean-rooted machine — i.e. would hide a
+# genuine dss regression — and that is INVISIBLE in the leg verdict, because an
+# excused failure and an absent failure read the same. So: the region marker, the
+# CALL itself, and the GATING REFUSAL that makes forgetting the call fatal rather
+# than quiet.
+check "the .sh marks the run-directory corroboration region" "dss:run-dir-corroborate" "$SHTXT"
+# ★★ THE NEEDLE IS THE ARGUMENT AS THE ARGV SPELLS IT, NEVER THE BARE OPTION
+# NAME. —MEASURED while writing: the bare name occurs three times in this
+# driver (a region comment, the refusal text, the argv), so a mutant that renamed
+# the ARGV entry left a bare-name pin GREEN. Two claims, two needles: the argv
+# names the verb, and the leg loop CALLS the function.
+check "the .sh's argv really names the corroboration verb" \
+      '--corroborate-run-dir "$leg"' "$SHCODE"
+check "...and the .sh leg loop CALLS it with this leg's run directory" \
+      'leg_run_dir_corroboration "$leg" "$rundir"' "$SHCODE"
+check "the .sh REFUSES a plan whose run-directory gating was never measured" \
+      "runDirectoryGating" "$SHCODE"
 # [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
 check "the .sh marks the run-fidelity selector region" "dss:run-fidelity-select" "$SHTXT"
 check "the .sh honours DSS_RUN_FIDELITY"               "DSS_RUN_FIDELITY"        "$SHCODE"
@@ -827,8 +852,8 @@ check "the .sh hands the oracle STATUS to the oracle REPORT, not only to the att
 # and not the other, and THIS is the assertion that keeps it that way.
 PS1="$(dirname "$SH")/build-and-test.ps1"
 if [ ! -f "$PS1" ]; then
-  echo "  SKIP build-and-test.ps1 not found beside the .sh — 49 pairing assertions not run"
-  skip=$((skip+49))
+  echo "  SKIP build-and-test.ps1 not found beside the .sh — 52 pairing assertions not run"
+  skip=$((skip+53))
 else
   PS1TXT="$(cat "$PS1")"
   # Same comment-stripped view as $SHCODE above, and for the same measured reason.
@@ -840,6 +865,16 @@ else
   # drivers render DIFFERENT verdicts on the same tree — and the missing side is
   # invisible, because a leg that is poisoned for the wrong reason still looks
   # poisoned. [D-HARNESS-BUILD-FAILURE-HAS-NO-PER-TU-ATTRIBUTION]
+  # ★★ THE SAME PAIRING, one axis along: a capability in one driver and not the
+  # other is this project's canonical silent harness bug, and here the missing
+  # side would silently EXCUSE a failure on a host that never earned it.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  check "the .ps1 marks the run-directory corroboration region too" "dss:run-dir-corroborate" "$PS1TXT"
+  check "the .ps1's argv really names the corroboration verb too" \
+        "'--corroborate-run-dir', \"\$label\"" "$PS1CODE"
+  check "...and the .ps1 leg loop CALLS it with this leg's run directory" \
+        'Get-LegRunDirCorroboration $LegTag $rundir' "$PS1CODE"
+  check "the .ps1 REFUSES an unmeasured run-directory gating too"   "runDirectoryGating"      "$PS1CODE"
   check "the .ps1 marks the build-attribution region too" "dss:build-attribution" "$PS1TXT"
   check "the .ps1 ASKS whose build failure it is too"     "--attribute-build"     "$PS1CODE"
   check "...and supplies the oracle STATUS too"           "--oracle-status"       "$PS1CODE"
@@ -1020,7 +1055,7 @@ if [ -z "$SUPPLY" ]; then
   fail=$((fail+1))
   # The 8 assertions below cannot run; count them so the accounting invariant
   # cannot be satisfied by silently losing them.
-  skip=$((skip+8))
+  skip=$((skip+12))
 else
   declare -A LEG_CONFOUNDS=(
     [elf64-x86_64]="'^walsetlk-' '^busy2-' '^zipfile-25\\.0\$'"
@@ -1040,7 +1075,24 @@ else
     [pe64-x86_64]="probed"
     [elf64-arm64]="probed"
     [unprobedleg]="unprobed"
+    [uncorroboratedleg]="probed"
   )
+  # ★ THE SECOND GATING STAMP. The supply ALSO refuses a plan whose RUN-DIRECTORY
+  # gating was never measured: a row declaring `requiresRunDirectory` is honoured
+  # only where THIS RUN measured the named precondition on THIS LEG'S own run
+  # directory, and a PLAN can never carry that measurement — it is resolved
+  # before any run directory exists. `not-required` is the honest answer for a
+  # fixture leg whose rows name no precondition, plus ONE leg left `unmeasured` so
+  # the refusal itself is exercised.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  declare -A LEG_RUN_DIR_GATING=(
+    [elf64-x86_64]="not-required"
+    [pe64-x86_64]="not-required"
+    [elf64-arm64]="not-required"
+    [unprobedleg]="not-required"
+    [uncorroboratedleg]="unmeasured"
+  )
+  LEG_CONFOUNDS[uncorroboratedleg]="'^vtabH-3\\.1\$'"
   DSS_CONFOUNDS=""
   # `die` stubbed so the shipped refusal is a CATCHABLE outcome: the last two
   # assertions are about the driver REFUSING, and a refusal that killed this
@@ -1105,6 +1157,21 @@ else
   SUPOUT="$(leg_confound_patterns unprobedleg 2>&1)"; SUPRC=$?
   check_eq "an UNPROBED plan REFUSES rather than serving its ungated list" "97" "$SUPRC"
   check "...naming the gating it actually got" "confoundGating='unprobed'" "$SUPOUT"
+  # ★★ THE SECOND GATE'S REFUSAL, failing in the SAME silent direction: a driver
+  # that skipped the corroboration and served the plan's ungated list would excuse
+  # `vtabH-3.1` on a host whose run drive root is clean — a genuine dss regression
+  # laundered into "expected". `unmeasured` is the only value a PLAN can ever
+  # carry, so refusing it is what makes the call unskippable rather than a
+  # convention somebody has to remember.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  SUPOUT="$(leg_confound_patterns uncorroboratedleg 2>&1)"; SUPRC=$?
+  check_eq "an UNMEASURED run directory REFUSES rather than serving its uncorroborated list" "97" "$SUPRC"
+  check "...naming the gating it actually got" "runDirectoryGating='unmeasured'" "$SUPOUT"
+  check "...and the call that would measure it" "--corroborate-run-dir" "$SUPOUT"
+  # ★ AND THE ALLOWED VALUE REALLY PASSES — a refusal that refused everything
+  # would satisfy the three arms above while breaking every run.
+  eval "SUP=($(leg_confound_patterns elf64-x86_64))"
+  check "a 'not-required' run-directory gating is ACCEPTED" "^walsetlk-" "${SUP[*]}"
   unset -f die
 fi
 

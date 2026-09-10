@@ -172,12 +172,12 @@ TEST(AppleStackArgPacking, NamedAggregatesKeepWholeSlotsOnBothConventions) {
     // one that keeps Apple's aggregate placement identical to AAPCS64's.
     for (auto const* cc : {t.apple, t.aapcs64}) {
         StackArgCursor small{*cc, kSlot};
-        EXPECT_EQ(small.placeNamedAggregate(3), 0u) << cc->name;
+        EXPECT_EQ(small.placeNamedAggregate(3, /*aggAlign=*/0), 0u) << cc->name;
         EXPECT_EQ(small.placeNamedScalar(4).byteOffset, 8u)
             << cc->name << ": a scalar after a 3-byte stacked aggregate sits at "
                            "+8 — the aggregate owns a whole slot";
         StackArgCursor big{*cc, kSlot};
-        EXPECT_EQ(big.placeNamedAggregate(12), 0u) << cc->name;
+        EXPECT_EQ(big.placeNamedAggregate(12, /*aggAlign=*/0), 0u) << cc->name;
         EXPECT_EQ(big.placeNamedScalar(4).byteOffset, 16u)
             << cc->name << ": a 12-byte aggregate rounds to TWO slots";
     }

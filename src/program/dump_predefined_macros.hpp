@@ -164,6 +164,25 @@ struct DSS_EXPORT PredefinedMacroDumpRequest {
     // by `splitUserDefine` at render time — the same function the preprocessor's
     // `<command-line>` prologue uses.
     std::span<std::string const> userDefines;
+
+    // ★★ WHICH `src/dss-config` ANSWERED — the config root the LANGUAGE document
+    // was actually loaded out of:
+    // [[D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE]].
+    // This is the surface that makes the resolved root inspectable
+    // WITHOUT provoking an error: `--dump-predefined-macros` is already the
+    // instrument that answers "what did you resolve for this triple", so the
+    // tree it resolved it from belongs on the same line rather than behind a
+    // flag of its own.
+    //
+    // ★ SUPPLIED BY THE CALLER FROM `GrammarSchema::configDocumentOrigin()`,
+    // never re-resolved here. A second walk would answer "which tree would I
+    // find NOW" instead of "which tree said this", and the whole defect is that
+    // those two can differ without a word.
+    //
+    // EMPTY is a legal state (a language built from text has no document) and
+    // renders as `<none>` rather than being omitted — a MISSING field would be
+    // read as an older build, while `<none>` is a fact.
+    std::string_view configRoot;
 };
 
 // Render ONE triple's effective set.

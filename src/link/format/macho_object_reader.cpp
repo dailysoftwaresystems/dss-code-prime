@@ -106,6 +106,22 @@ static_assert(kNDescWeakDef != kNDescNoDeadStrip
               && kNDescWeakDef != kNDescAltEntry,
               "N_WEAK_DEF (0x0080) is a distinct n_desc bit from "
               "N_NO_DEAD_STRIP (0x0020) and N_ALT_ENTRY (0x0200)");
+// N_WEAK_REF -- "symbol is weak referenced" in Apple's own header, and the READ
+// half of D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE. It rides an
+// UNDEFINED (N_UNDF) symbol and says the image may be built and run with nothing
+// defining it, in which case its address is 0 — a different fact from
+// N_WEAK_DEF's "several images may define this, keep one", on a different kind
+// of symbol, in the same field. Lifting it is what makes a weak IMPORT survive a
+// DSS write/read round trip instead of coming back as a strong one, which would
+// turn a program that legally runs with the symbol absent into a link error.
+// ✔MEASURED 2026-09-02: clang 18.1.3 emits `(undefined) weak external _ea` for
+// `extern int ea __attribute__((weak));` and its nlist reads n_desc=0x0040,
+// which is what DSS's own writer now emits for the same source.
+constexpr std::uint16_t kNDescWeakRef     = 0x0040u;  // N_WEAK_REF
+static_assert(kNDescWeakRef != kNDescWeakDef,
+              "N_WEAK_REF (0x0040) and N_WEAK_DEF (0x0080) are different "
+              "n_desc bits -- reading one as the other would turn a weak "
+              "REFERENCE into a weak DEFINITION of nothing");
 static_assert(kNDescAltEntry != kNDescNoDeadStrip,
               "N_ALT_ENTRY (0x0200) and N_NO_DEAD_STRIP (0x0020) are different "
               "bits -- confusing them silently drops a `used` static function's "
@@ -640,6 +656,14 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             // and force to false (function) ONLY when a CALL/BRANCH-class
             // reloc targets it (step 7) -- the agnostic function signal.
             ext.isData      = true;
+            // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the REFERENCE
+            // binding, lifted from the one n_desc bit that carries it. Reading
+            // it as Global -- which is what this arm did until the import row
+            // could hold a binding at all -- silently drops the property that
+            // lets the program link with the symbol absent.
+            ext.binding     = (s.desc & kNDescWeakRef) != 0u
+                                  ? SymbolBinding::Weak
+                                  : SymbolBinding::Global;
             externBySym.emplace(i, mod.externImports.size());
             mod.externImports.push_back(std::move(ext));
             continue;

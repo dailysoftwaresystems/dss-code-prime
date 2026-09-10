@@ -176,6 +176,12 @@ dss_add_test(NAME core/type_lattice/test_type_interner SOURCES type_lattice/test
 dss_add_test(NAME core/type_lattice/test_type_registry SOURCES type_lattice/test_type_registry.cpp)
 dss_add_test(NAME core/type_lattice/test_type_reintern SOURCES type_lattice/test_type_reintern.cpp)
 dss_add_test(NAME core/test_type_layout                SOURCES test_type_layout.cpp)
+# P55 lane `tl` — "depth costs heap, not host call frames", the TYPE/const-eval
+# tier (D-CORE-TYPE-LAYOUT-AND-HIR-CONST-EVAL-RECURSE-PER-LEVEL). Its OWN binary
+# because a red here is a STACK OVERFLOW, which kills the process and would take
+# every sibling test in a shared executable down unattributably with it.
+dss_add_test(NAME core/test_deep_type_layout_costs_heap
+             SOURCES test_deep_type_layout_costs_heap.cpp)
 dss_add_test(NAME core/test_aggregate_abi              SOURCES test_aggregate_abi.cpp)
 # D-CSUBSET-BITFIELD-ABI-EXACT: the CI cross-compile-COMPARE witness — builds the
 # struct battery with the host's NATIVE C compiler (cl.exe / gcc / clang) and
@@ -187,6 +193,16 @@ dss_add_test(NAME core/test_bitfield_abi_conformance   SOURCES test_bitfield_abi
 # gcc/clang `__attribute__((packed))`) and asserts dss's computeLayout(packed) is
 # byte-identical (sizeof + per-field offsetof). Skips when no toolchain.
 dss_add_test(NAME core/test_packed_abi_conformance     SOURCES test_packed_abi_conformance.cpp)
+# D-CSUBSET-PER-MEMBER-PACKED: the PER-FIELD packed channel — GNU `packed` on ONE
+# member-declarator, which packs that member and leaves the aggregate's own size and
+# alignment alone. Every golden is transcribed from a four-arm measurement (gcc 13.3.0
+# and clang 18.1.3, each on x86_64 AND aarch64-under-qemu; mingw-w64 gcc 13.2.0 agrees
+# on the non-bit-field shapes; MSVC 19.51 implements no `__attribute__` and ABSTAINS).
+# ⚠ Several pins are SIZE-BLIND by construction — the headline shape has the same
+# sizeof AND the same _Alignof with and without the attribute, and only one field
+# offset moves — so they assert offsets, never sizes alone.
+dss_add_test(NAME core/test_per_member_packed_layout
+             SOURCES test_per_member_packed_layout.cpp)
 
 # D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET — the two sites of
 # the class that live OUTSIDE a config loader.
@@ -386,3 +402,31 @@ dss_add_test(NAME core/test_config_document_parse
              SOURCES test_config_document_parse.cpp)
 target_link_libraries(dss_core_test_config_document_parse
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# P61 lane ck -- the speculative checkpoint stopped costing O(depth).
+# * `test_speculation_trail` unit-tests the undo journal itself, including the
+#   claim a naive implementation gets wrong: a push needs no record, and a
+#   reverse-chronological replay of the SUPERSEDED values is exact.
+# * `test_checkpoint_identity` is the one that protects the compiler -- it
+#   builds each tree twice, plainly and through a rolled-back speculative
+#   excursion, and compares the two finished trees node for node. It went RED
+#   against the pre-trail rendition on two real holes (the pending-children
+#   staging area restored by SIZE, and an in-place `parent` write on a node
+#   older than the checkpoint).
+# * `test_checkpoint_cost` pins the complexity claim on BOTH axes: wall time as
+#   a RATIO ACROSS DEPTHS (allocated bytes measured in-process reports a flat
+#   zero -- the engine is a DLL and Windows has no symbol interposition), and
+#   PEAK RESIDENT SET, read from a CHILD PROCESS so a regression that restored
+#   the O(depth) copy and merely made it fast still reds.
+dss_add_test(NAME core/test_speculation_trail
+             SOURCES test_speculation_trail.cpp)
+dss_add_test(NAME core/test_checkpoint_identity
+             SOURCES test_checkpoint_identity.cpp)
+dss_add_test(NAME core/test_checkpoint_cost
+             SOURCES test_checkpoint_cost.cpp)
+# The memory arm of `test_checkpoint_cost` reads a child process's peak working
+# set. On Windows that is `GetProcessMemoryInfo`; POSIX uses `getrusage`, which
+# needs no extra library.
+if(WIN32)
+    target_link_libraries(dss_core_test_checkpoint_cost PRIVATE psapi)
+endif()

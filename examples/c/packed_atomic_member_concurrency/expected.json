@@ -1,0 +1,17 @@
+{
+  "$comment": "D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64 — the CONCURRENCY witness for the generic atomics runtime, and the half its sibling `packed_atomic_member` structurally cannot see. That example proves the ROUND TRIP through an under-aligned `_Atomic` member, which is a TRUE answer to a narrower question: it stays green over an implementation that lost atomicity entirely, and the PRE-fix binary returned the same exit code. What matters is whether each update was INDIVISIBLE, and one thread can never observe that. ★★ THE OBJECT IS PLACED TO STRADDLE A CACHE LINE ON PURPOSE: a plain misaligned 4-byte access on x86-64 is atomic in practice while the bytes sit inside ONE line, so a witness that did not force the split would be green over a broken runtime. `Arena` is 64-byte aligned with 61 bytes of padding, putting the `_Atomic unsigned` at byte 62 — its four bytes span the boundary at 64. ★ THE DETECTOR IS THE VALUE SET, NOT A TIMING ASSUMPTION: every stored value has all four bytes EQUAL, so a mixed value can only come from a split read or write, and a correct implementation cannot produce one under ANY interleaving. ★ THE NEIGHBOUR ARM IS THE PROPERTY A TEAR TEST CANNOT SEE: C11 6.5.1p2 makes the adjacent plain `char c` a distinct memory location updatable concurrently, so an implementation that served the store by read-modify-writing the containing 8-byte block would pass every tear check and still be wrong. A third thread hammers `c` throughout and its byte must survive. ⚠ FOLD-RESISTANT: the values cross real thread boundaries and the object is `_Atomic`, so the `release` arm runs the same route as the baseline. exit = 7 (round trip) + 11 (never torn) + 24 (neighbour survived) = 42; each arm returns its OWN failure code so a red names the property that broke.",
+  "$legComment": "★ EVERY LEG RUNS THE SAME SOURCE THROUGH A DIFFERENT PROVIDER OF THE SAME ROLE, WHICH IS THE POINT OF THE ROLE TABLE. On pe64 the `atomicsRuntime` role resolves to `source: runtime/platform/src/atomic.c` — DSS'S OWN BODY, compiled by DSS for this target and pulled out of the shipped runtime archive by name. On elf64 it resolves to the image `libatomic.so.1` and on macho64 to `/usr/lib/libSystem.B.dylib`, both the PLATFORM's own runtime. The aarch64 legs deliberately keep the platform's, because there the only correct route is an address-hashed lock table and a lock table arbitrates only between its own users — a private one would NOT interoperate with a gcc-built translation unit touching the same object. ⚠ THE arm64 qemu LEG IS STRUCTURALLY BLIND TO THE UNALIGNED-ATOMIC CLASS (P53: one md5-identical binary exits 42 under qemu and dies rc 135 Bus error on native aarch64), so its green is a CODEGEN witness here, never a safety one.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

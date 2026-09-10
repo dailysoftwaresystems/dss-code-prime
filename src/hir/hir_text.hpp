@@ -10,6 +10,7 @@
 #include "hir/hir_inline_asm.hpp"                   // HirInlineAsmPool (inline-asm descriptors)
 #include "hir/hir_literal_pool.hpp"                 // HirLiteralPool (literal values)
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <span>
@@ -45,11 +46,151 @@
 //   - The five per-node side-tables (source-loc / ffi / shader / transpile / diag)
 //     live OUTSIDE the `Hir`, so emit takes them by pointer and parse hands them
 //     back, bound to the rebuilt module.
+//   - The FORMAT VERSION and the PRODUCER REVISION head the file (`dsshir 3`,
+//     `producer "…"`). Both are MANDATORY on read: a file that opens any other
+//     way is refused, never guessed at. The version is a constant of this build
+//     (`kHirTextFormatVersion`); the producer is supplied by the caller, because
+//     `hir` cannot see who is compiling.
+//   - BUFFER NAMES (`buffers { buf 3 "main.c" }`) resolve the `@loc(buf N, …)`
+//     handles a source-map emission writes. Like symbol names, they are not in
+//     the `Hir`; unlike symbol names, they are not derivable from it at all —
+//     `BufferId` is a process-global counter, so a file WITHOUT this section has
+//     spans no outside reader can attribute to a file. ⚠ The `N` in both places
+//     is an ARTIFACT-LOCAL HANDLE the emitter assigns, never the `BufferId` —
+//     see `HirTextBufferName::buffer`.
+//
+// ★★ THE SELF-CONTAINMENT RULE, STATED ONCE. A reader holding ONLY the bytes
+// must be able to reconstruct every type and every name the module references,
+// with no side channel. That is why types render STRUCTURALLY (a `struct`
+// spells its fields, its offsets and its packing inline, not an id), why names
+// travel in `symbols`, and why buffers travel in `buffers`.
+//
+// ★★★ v3: A CYCLIC COMPOSITE IS SPELLED, NOT REFUSED — `struct S { struct S
+// *next; }`, the ordinary linked list, and every tree, intrusive container and
+// parent pointer in real C. A composite whose own type graph reaches itself
+// carries a `rec <H>` marker after its name, and the re-entry point spells
+// `rec <H>` in type position instead of expanding forever:
+//
+//     struct "Node" rec 1 {i32, ptr<rec 1>}
+//
+// ⚠⚠ THE HANDLE IS PER-COMPOSITE AND ARTIFACT-GLOBAL, NEVER PER-SPELLING, AND
+// THAT IS THE WHOLE CORRECTNESS ARGUMENT. A relative (De Bruijn `^N`) marker
+// would have made ONE type's spelling depend on WHERE it was reached from —
+// mutually recursive `A`/`B` spell `B` one way standing inside `A` and another
+// way standing alone — so a content-keyed reader would rebuild TWO `B`s from
+// one, splitting a type's identity across a round trip whose BYTES still
+// matched. The handle is the same device `symbols`/`%N` and `buffers`/`buf N`
+// already use for the file's other CU-ephemeral identities, and it is what the
+// parser keys its forward mint on, so handle H ⇒ exactly one TypeId per file.
+// ⓘ `opaque` remains a DIFFERENT and non-overlapping marker: it says the
+// composite is INCOMPLETE (no field list at all), and an incomplete composite
+// has no fields to close a cycle through, so `rec` and `opaque` never co-occur.
 
 namespace dss {
 
 class DiagnosticReporter;
 class TypeRegistry;
+
+// ── The format version, and why it is a NUMBER on the artifact's face ─────────
+//
+// Every `.dsshir` opens with `dsshir <N>` and `parseHir` REFUSES any `N` this
+// build does not understand (`H_TextVersionMismatch`, Error, no recovery). The
+// refusal is the whole point of the field: this format GROWS while the language
+// surface grows, and a reader that cannot tell it changed reads the new bytes
+// under the old grammar and derives a confident wrong answer. A refusal costs a
+// rebuild; a silent misread costs a true statement about the wrong program.
+//
+// ⚠ THE VERSION IS BUMPED BY ANY CHANGE A v(N-1) READER WOULD MISREAD, which
+// includes ADDING a required construct — not only removing or re-spelling one.
+// v2 added the mandatory `producer` header line and the optional `buffers`
+// preamble section; a v1 reader meeting a v2 file would take `producer` for the
+// start of the module and fail somewhere unhelpful, so the bump is not
+// optional.
+// v3 added the `rec <H>` composite marker and the `rec <H>` type head (the
+// back-reference that lets a CYCLIC composite be spelled at all). A v2 reader
+// meeting `struct "Node" rec 1 {i32, ptr<rec 1>}` would refuse the marker as a
+// stray token — which is the correct outcome and exactly why the number moves:
+// the alternative is a reader that skips what it does not recognise and rebuilds
+// a `Node` with no `next`.
+inline constexpr std::uint32_t kHirTextFormatVersion = 3;
+
+// ── kHirTextMaxNodeDepth — THE FORMAT'S DECLARED NESTING LIMIT ────────────────
+//
+// ★★★ THE NESTING LIMIT SURVIVES AS A COUNTER, IT IS NO LONGER THE HOST STACK
+// (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED, the
+// operator's ruling of 2026-09-02). The node walk on both sides of this codec
+// used to be host recursion with no cap of any kind, so "how deep may a module
+// be" was answered by whichever thread happened to be running the emitter —
+// ✔MEASURED 2026-09-08: `dsscp --emit-hir` died of STATUS_STACK_OVERFLOW
+// (0xC00000FD) with ZERO bytes on stderr and no diagnostic on a flat
+// `x +1 +1 …` chain of 2000 terms, while `--compile` took the same file at rc 0.
+// The walk is now an explicit heap work stack, and the limit it lost is
+// reinstated HERE, as a number, in the header where the format's other declared
+// constants live.
+//
+// ⚠ IT IS A LIMIT OF THE FORMAT, NOT OF THE WRITER, AND THAT IS WHY IT IS PUBLIC.
+// A writer that spelled a module deeper than its own reader accepts would ship an
+// artifact that cannot be read back — a round trip that fails at the consumer
+// rather than here. Both halves read this one constant, so the two cannot drift.
+//
+// WHY THIS VALUE, stated rather than assumed:
+//   * FROM BELOW — it must exceed the deepest HIR the front end can hand the
+//     writer, or `--emit-hir` would refuse programs `--compile` compiles. The c
+//     grammar declares `parser.maxExpressionDepth` 16384 (its own semantic cap on
+//     nesting), and ✔MEASURED 2026-09-08 a flat 8000-term chain — which does NOT
+//     count against that cap, because a left-associative chain climbs
+//     iteratively — compiles at rc 0 and yields an ~8000-deep HIR. This bound is
+//     16x the declared cap and 32x that measured chain.
+//   * FROM ABOVE — the walk's cost is now HEAP, so the bound is what makes that
+//     heap finite. At most three live tasks per level at ~56 bytes each puts the
+//     emitter's worst case at the bound near 44 MiB, which is bounded and
+//     reportable, where an uncapped walk is neither.
+// A module past it is REFUSED BY NAME with an Error diagnostic and the `?` poison
+// token — never a truncation that would read back as a smaller, valid program.
+inline constexpr std::uint32_t kHirTextMaxNodeDepth = 262144;
+
+// ── HirTextBufferName ─────────────────────────────────────────────────────────
+//
+// One buffer → source-name binding, as it travels in the file's `buffers`
+// preamble section. A node's `@loc(buf 3, 120..131)` names buffer 3; without
+// this section a reader holding ONLY the text cannot say which file that is,
+// because `BufferId` is a process-global monotonic counter with no meaning
+// outside the process that minted it. Emitting the pair is what turns a span
+// from "node 37" into "main.c, bytes 120..131".
+//
+// ⚠⚠ `buffer` MEANS DIFFERENT THINGS ON THE TWO SIDES, AND THAT ASYMMETRY IS THE
+// WHOLE RENUMBERING. On EMIT the caller fills it with the real `BufferId.v` it
+// holds — it has nothing else — and the emitter maps that to an ARTIFACT-LOCAL
+// HANDLE (1..N over the buffers this module uses, by sorted id) which is what
+// the bytes carry, here and in every `@loc`. On PARSE it comes back as that
+// HANDLE, because the handle IS the rebuilt `BufferId` — the same device
+// `symbols`/`%N` already uses for symbols. So emit → parse → emit is the
+// identity and no process-global counter ever reaches the file; feeding a parsed
+// vector straight back into `HirTextContext` is correct, and is what the
+// round-trip tests do.
+struct DSS_EXPORT HirTextBufferName {
+    std::uint32_t buffer = 0;   // emit: the caller's BufferId.v · parse: the artifact handle
+    std::string   name;         // the buffer's own `SourceBuffer::name()`
+
+    // ★★ NON-ZERO ⇒ THIS BUFFER IS THE PREPROCESSOR'S SYNTHESIZED TEXT, AND ITS
+    // OFFSETS BELONG TO NO FILE ANYONE CAN OPEN. The value is the MAIN ORIGIN
+    // buffer the synthesis started from. Zero ⇒ an ordinary source buffer whose
+    // offsets index the named file directly.
+    //
+    // ⚠⚠ WITHOUT THIS FIELD THE SECTION WOULD BE A CONFIDENT LIE, and the reason
+    // is the one that makes this defect class survive review: a synthesized
+    // buffer is CONSTRUCTED WITH THE MAIN SOURCE'S NAME. So `buf 23 "main.c"`
+    // beside `@loc(buf 23, 443..473)` reads as "bytes 443..473 of main.c" — a
+    // plausible offset into a real file, shifted by the predefine prologue and
+    // by one line per `-D`, and by a whole header's worth for anything spliced
+    // in from an `#include`. ✔MEASURED through the CLI on a 140-byte source:
+    // the spans landed at offsets 443..621. A reader indexing the file with them
+    // would state a property "at" text that is not the text it read.
+    //
+    // ⓘ A language with no preprocess pass produces no synthesized buffer, so
+    // every entry is zero there and the spans index the file directly.
+    std::uint32_t synthesizedMainOrigin = 0;
+};
 
 // ── HirTextContext ────────────────────────────────────────────────────────────
 //
@@ -85,6 +226,32 @@ struct DSS_EXPORT HirTextContext {
     // form AND reports a diagnostic rather than degrading quietly.
     HirInlineAsmPool const* inlineAsmPool = nullptr;
 
+    // THE COMPILER REVISION THAT PRODUCED THIS ARTIFACT, written verbatim into
+    // the mandatory `producer "<…>"` header line.
+    //
+    // ★ IT IS AN INPUT, NOT A CONSTANT, AND THAT IS FORCED BOTH WAYS. `hir` sits
+    // BELOW `program` in the layering, so it cannot reach the build stamp
+    // (`program/dss_build_stamp.hpp`) that names this compiler; and it must not,
+    // because the identity of the producer is the DRIVER's fact, not the
+    // format's. Making it an input also keeps the checked-in goldens stable —
+    // they emit with no producer, so a commit does not rewrite five fixtures.
+    //
+    // EMPTY renders as `producer ""`, which is a POSITIVE statement — *"this
+    // file is not attributed to a compiler revision"* — and never an absent
+    // field: absence is malformed on read. Every artifact the shipped driver
+    // writes carries a real stamp (`--emit-hir` supplies `dss::runtime::
+    // kBuildStamp`); the empty form is for hand-built modules and unit tests.
+    std::string_view producer{};
+
+    // BufferId.v → source name, for the `buffers` preamble section. Null or
+    // empty ⇒ the section is omitted, and any `@loc(buf N, …)` the side-table
+    // below produces names a buffer the reader cannot resolve. Supply it
+    // whenever `sourceMap` is supplied. Entries are emitted SORTED BY BUFFER ID
+    // regardless of the order given, so the emission is deterministic for a
+    // caller whose own collection order is not (see the determinism contract on
+    // `emitHir`).
+    std::vector<HirTextBufferName> const* bufferNames = nullptr;
+
     // The five side-tables to serialize. Null = nothing of that kind is emitted.
     HirSourceMap     const* sourceMap     = nullptr;
     HirFfiMap        const* ffiMap        = nullptr;
@@ -98,8 +265,45 @@ struct DSS_EXPORT HirTextContext {
 // round-trip. Internal-consistency problems (a typed node with no interner to
 // decode it) are reported into `reporter` (Warning) and rendered as `?`; the call
 // never aborts and never throws.
+//
+// ★ DETERMINISM IS A CONTRACT, not an observed property: equal `(hir, ctx)` ⇒
+// byte-identical output, on every host and every run. Nothing here reads a
+// clock, a path, an address or an unordered container's iteration order —
+// symbol handles are assigned in PRE-ORDER of first encounter, and the one
+// caller-supplied collection whose order is not the caller's business
+// (`bufferNames`) is sorted here rather than trusted. A caller that needs the
+// emission to move when the compiler moves puts that in `ctx.producer`, where
+// it is visible, rather than getting it by accident.
 [[nodiscard]] DSS_EXPORT std::string emitHir(Hir const& hir, HirTextContext const& ctx,
                                              DiagnosticReporter& reporter);
+
+// ── renderHirKindInventory ────────────────────────────────────────────────────
+//
+// This build's HIR node-kind inventory, as machine-readable text: every core
+// `HirKind` it can emit, whether the writer spells it in EXPRESSION position and
+// with which `.dsshir` keyword, whether it must carry a resolved type, and
+// whether it carries a symbol id — plus the statement-keyword vocabulary and the
+// extension-kind base. `producer` heads the output for the same reason it heads
+// an artifact: an inventory nobody can attribute to a compiler revision cannot
+// be compared against anything.
+//
+// ★★ IT LIVES HERE, BESIDE THE WRITER, AND THAT IS THE WHOLE VALUE. Every field
+// is projected from the SAME tables the emitter and the parser dispatch on
+// (`kHirKindTable`, `exprKwForKind`/`isExprKind`, `kHirTextStmtKwTable`,
+// `requiresValidType`), so the published inventory cannot describe a compiler
+// other than the one that would write the file. An inventory maintained beside
+// the CLI would be a hand-kept second copy — and a coverage table that has
+// drifted from the real node set is worse than none, because a consumer trusts
+// it to be exhaustive.
+//
+// ⓘ ARITY IS NOT REPORTED, and the omission is deliberate rather than pending:
+// it is not a static property of a kind in this IR. A `Call` has one callee plus
+// N arguments, a `Block` has N statements, a `ConstructAggregate` has one slot
+// per field. Publishing a number would mean publishing a wrong one for every
+// variadic kind, so the inventory publishes the SHAPE FACTS that are constant
+// (position, typed-ness, symbol-carrying) and leaves child counts to the text
+// itself, which spells them.
+[[nodiscard]] DSS_EXPORT std::string renderHirKindInventory(std::string_view producer);
 
 // ── HirParseResult ────────────────────────────────────────────────────────────
 //
@@ -115,6 +319,15 @@ struct DSS_EXPORT HirParseResult {
     Hir                      hir;
     TypeInterner             interner;
     std::vector<std::string> symbolNames;   // SymbolId.v → name; slot 0 unused
+
+    // The `producer "<…>"` header line's value, verbatim. EMPTY means the file
+    // said `producer ""` (an unattributed artifact) — it never means the field
+    // was missing, because a missing field is a fatal parse error. Feed it back
+    // into `HirTextContext::producer` to reproduce the source bytes.
+    std::string              producer;
+    // The `buffers` preamble, in file order. Empty when the section was absent.
+    // Feed it back into `HirTextContext::bufferNames` to reproduce the bytes.
+    std::vector<HirTextBufferName> bufferNames;
 
     HirSourceMap     sourceMap;
     HirFfiMap        ffiMap;

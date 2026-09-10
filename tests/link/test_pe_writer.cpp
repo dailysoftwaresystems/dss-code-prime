@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -98,6 +99,27 @@ findExecSectionVirtualSize(std::vector<std::uint8_t> const& img,
             if (static_cast<char>(img[h + b]) != name[b]) { eq = false; break; }
         }
         if (eq) return readU32LE(img, h + 8);
+    }
+    return 0u;
+}
+
+// D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN (P64): a section's SizeOfRawData (section
+// header +16) — the FILE extent, which is what bounds a search through the
+// emitted bytes. Misc.VirtualSize above is page-rounded and can reach past the
+// section's own raw data into the next one's, so a scan bounded by IT could
+// match a neighbour's bytes and report a placement the writer never made.
+// Returns 0 if absent (the caller asserts).
+[[nodiscard]] std::uint32_t
+findExecSectionRawSize(std::vector<std::uint8_t> const& img,
+                       std::array<char, 8> const&       name) {
+    std::uint16_t const n = readU16LE(img, 0x86);
+    for (std::uint16_t i = 0; i < n; ++i) {
+        std::size_t const h = 0x188u + static_cast<std::size_t>(i) * 40u;
+        bool eq = true;
+        for (std::size_t b = 0; b < 8; ++b) {
+            if (static_cast<char>(img[h + b]) != name[b]) { eq = false; break; }
+        }
+        if (eq) return readU32LE(img, h + 16);
     }
     return 0u;
 }
@@ -996,8 +1018,15 @@ namespace {
 // A minimal but COMPLETE pe `.obj` schema whose only variable is the
 // `weakDefinition` row. `weakDefinitionRow` is spliced verbatim and must end in
 // a comma when non-empty.
+// ⓘ `carriesRelro` (P54) adds the ONE extra pair a schema needs before a slot
+// can actually be MINTED into it: the `relro` section row + its
+// `supportedDataSections` entry. Defaulted OFF so every pre-existing caller
+// produces a byte-identical document — those arms are refusals that never
+// reach the data-section gate, and a schema that suddenly accepted relro would
+// change what they are testing.
 [[nodiscard]] std::string peObjSchemaJson(char const* formatName,
-                                          char const* weakDefinitionRow) {
+                                          char const* weakDefinitionRow,
+                                          bool carriesRelro = false) {
     std::string json = R"({
       "$comment": "Synthetic pe .obj schema for D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED. Complete except for the one row under test, so a refusal can only be about that row.",
       "dssObjectFormatVersion": 1,
@@ -1012,9 +1041,18 @@ namespace {
       "pe": { "machine": 34404, "characteristics": 0 },
       )";
     json += weakDefinitionRow;
+    if (carriesRelro) {
+        json += R"("supportedDataSections": ["relro"],
+      )";
+    }
     json += R"(
       "sections": [
-        {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0}
+        {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0})";
+    if (carriesRelro) {
+        json += R"(,
+        {"kind":"relro","name":".rdata","type":1073741888,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0})";
+    }
+    json += R"(
       ],
       "relocations": [
         {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
@@ -2160,7 +2198,23 @@ TEST(PeFormatJson, ObjDeclaresDataSectionRowsAndExternDispatch) {
     ASSERT_TRUE(fmt.externCallDispatch().has_value())
         << "pe64-x86_64-windows (.obj) must declare externCallDispatch "
            "so extern calls lower (D-LK-OBJECT-EXTERN-CALL-RELOCATABLE)";
-    EXPECT_EQ(*fmt.externCallDispatch(), ExternCallDispatch::DirectPlt);
+    // ⚠ THIS PINNED `DirectPlt` UNTIL P54 AND THE OLD VALUE WAS NOT WRONG —
+    // it went UNLINKABLE. D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET
+    // ✔MEASURED that link.exe 14.51 refuses a direct `call rel32` to a WEAK
+    // extern (`LNK2016: absolute symbol used as target of REL32 relocation` —
+    // a COFF weak external's fallback is an absolute value-0 symbol), and
+    // refuses mingw-w64 gcc's own object for the same relocation, while clang
+    // 18.1.3 routes the call through `.refptr.<name>` on both windows triples
+    // and link.exe links THAT. `indirect-slot` makes the call site
+    // `call *[rip+sym]` and the slot pass retargets it to the carried
+    // `.refptr.` COMDAT. The pairing this creates is asserted here too,
+    // because with the dispatch declared and the slot spelling missing the
+    // linker refuses the format outright.
+    EXPECT_EQ(*fmt.externCallDispatch(), ExternCallDispatch::IndirectSlot);
+    EXPECT_TRUE(fmt.objectImportSlot().has_value())
+        << "`indirect-slot` in a RELOCATABLE format presumes a slot the "
+           "object carries itself; without `objectImportSlot` every extern "
+           "call would deref the import's own address";
 
     auto const* rodata = fmt.sectionByKind(SectionKind::Rodata);
     ASSERT_NE(rodata, nullptr);
@@ -3034,6 +3088,93 @@ TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
     EXPECT_EQ(img[u + 13], 0x32u) << "ALLOC_SMALL | (slots-1)=3";
 }
 
+TEST(PeExecWriter, VlaFramePointerCaptureEmitsSetFpregSoTheFrameIsDescribable) {
+    // D-CSUBSET-VLA-WIN64-UNWIND. A pe64 function with a variable-length array
+    // captures a FRAME POINTER after its fixed prologue and then moves RSP by a
+    // RUNTIME amount. Win64 has NO unwind opcode for a dynamic allocation — the
+    // FRAME REGISTER is the whole mechanism: `UWOP_SET_FPREG` tells the unwinder
+    // to recover RSP from that register instead of by summing the ALLOC codes, and
+    // after it the dynamic `sub rsp,<size>` needs no description at all.
+    //
+    // ✔THE ORACLE, probed on this machine: mingw-w64 gcc 13.2.0 emits, for a VLA
+    // function that calls, exactly `01 0b 04 45` + `0b 03` (SET_FPREG) + the fixed
+    // prologue's PUSH/ALLOC codes and NOTHING for its `sub %rax,%rsp`. DSS emits
+    // the same shape with FrameOffset 0 (its capture is `FP <- SP`, so the frame
+    // register holds the value the offsets were measured against).
+    //
+    // The producer side is `lir_callconv`'s `DefCfaRegister` op at the `sp_copy`
+    // that captures the frame pointer; this pin is the CONSUMER side — that the
+    // pe64 writer turns that rule into the two bytes the OS reads.
+    //
+    // ⚠ RED-ON-DISABLE, ✔MEASURED: suppress the `kUwopSetFpReg` push in
+    // `buildFunctionUnwindInfo`'s `DefCfaRegister` arm and this test fails on THREE
+    // independent bytes (CountOfCodes 4→3, FrameRegister 5→0, and the missing code
+    // pair). The same mutation makes a real Windows walk out of such a frame
+    // reconstruct RSP from the FAULTING rsp and hand back Rip 0 — the walk half of
+    // this row, exercised by `examples/c/c99_vla_win64_unwind_walk`.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    // sub rsp,0x20 (7 B) ; mov [rsp+0],rbp (8 B) ; mov rbp,rsp (3 B) ; ret
+    // — the fixed prologue, the frame-pointer save, the capture. Only the FIRST
+    // byte is inspected by the builder's prologue-shape guard; the rest is opaque.
+    fn.bytes = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00,
+                0x48, 0x89, 0xAC, 0x24, 0x00, 0x00, 0x00, 0x00,
+                0x48, 0x8B, 0xEC,
+                0xC3};
+    CfiFunction cfi;
+    cfi.codeLength    = 19;
+    cfi.initial       = CfiInitialState{/*cfaRegister=*/4, /*cfaOffset=*/8,
+                                        /*returnAddressAtCfaOffset=*/-8,
+                                        /*returnAddressRegister=*/std::nullopt};
+    cfi.prologueEndPc = 18;
+    cfi.ops = {
+        // CFA = RSP + 40 once `sub rsp,0x20` retires (8 pushed by the CALL + 32).
+        CfiOp{7,  CfiOpKind::DefCfaOffset,   CfiRegRef{},            CfiRegRef{},  40},
+        // rbp saved at [RSP+0] == CFA-40.
+        CfiOp{15, CfiOpKind::RegAtCfaOffset, CfiRegRef::physical(5), CfiRegRef{}, -40},
+        // THE SUBJECT: the CFA base becomes rbp, at the same offset — which is what
+        // lets everything after this point survive a runtime-moved RSP.
+        CfiOp{18, CfiOpKind::DefCfaRegister, CfiRegRef::physical(5), CfiRegRef{},   0},
+    };
+    fn.cfi = std::move(cfi);
+    mod.functions.push_back(std::move(fn));
+
+    DiagnosticReporter rep;
+    auto img = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(img.empty());
+
+    auto const [xdataRva, xdataPtr] =
+        findExecSection(img, {'.', 'x', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(xdataRva, 0u) << ".xdata section must exist";
+
+    std::size_t const u = xdataPtr;
+    EXPECT_EQ(img[u + 0], 0x01u) << "Version=1, Flags=0";
+    EXPECT_EQ(img[u + 1], 18u)   << "SizeOfProlog (past the FP capture)";
+    // SET_FPREG(1) + SAVE_NONVOL(2) + ALLOC_SMALL(1) = 4 nodes. Without the
+    // SET_FPREG this reads 3 — the first of the three bytes that go red.
+    EXPECT_EQ(img[u + 2], 4u)    << "CountOfCodes incl. UWOP_SET_FPREG";
+    // FrameRegister = rbp's HARDWARE encoding in the low nibble; FrameOffset = 0
+    // in the high nibble, because the capture is FP <- SP. Zero here means "no
+    // frame register at all", which is precisely the undescribable state.
+    EXPECT_EQ(img[u + 3], 0x05u) << "FrameRegister=rbp(5), FrameOffset=0";
+    // Codes DESCEND by CodeOffset: SET_FPREG(18), rbp SAVE_NONVOL(15), ALLOC(7).
+    EXPECT_EQ(img[u + 4], 18u)   << "SET_FPREG CodeOffset";
+    EXPECT_EQ(img[u + 5], 0x03u) << "UWOP_SET_FPREG, op-info 0";
+    EXPECT_EQ(img[u + 6], 15u)   << "rbp CodeOffset";
+    EXPECT_EQ(img[u + 7], 0x54u) << "rbp SAVE_NONVOL | reg=5";
+    EXPECT_EQ(readU16LE(img, u + 8), 0u) << "rbp at frame base + 0";
+    EXPECT_EQ(img[u + 10], 7u)    << "ALLOC CodeOffset";
+    EXPECT_EQ(img[u + 11], 0x32u) << "ALLOC_SMALL | (slots-1)=3";
+}
+
 TEST(PeExecWriter, FunctionUnwindInfoStackProbePrologueUsesFixedAllocLen) {
     // D-WIN64-PDATA-XDATA-UNWIND + D-WIN64-LARGE-FRAME-STACK-PROBE. A pe64
     // function whose frame exceeds one guard page emits the inline page-probe
@@ -3900,15 +4041,33 @@ TEST(PeExecTls, FunctionTlsKindRelocTargetingNonTlsSymbolFailsLoud) {
     EXPECT_TRUE(saw) << "a tls-kind reloc against a non-tls symbol fails loud";
 }
 
-TEST(PeExecTls, OveralignedThreadLocalFailsLoud) {
-    // ★ D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN (audit FOLD-1), RED-on-disable:
-    // an `_Alignas(32) thread_local` var can't be honored on PE/x64 — the
-    // Windows loader guarantees only 16-byte (MEMORY_ALLOCATION_ALIGNMENT)
-    // static-TLS block-base alignment and IMAGE_TLS_DIRECTORY64 has no field
-    // to request more. The writer MUST fail loud
-    // (K_ThreadLocalOveralignedForFormat 0x8016) rather than silently
-    // under-align every thread's copy. Disable the pe.cpp gate → this
-    // compiles clean = the silent miscompile (the red).
+// ── D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN (P64) ─────────────────────────────────
+//
+// ⚠⚠ WHAT USED TO BE PINNED HERE WAS THE DIVERGENCE, NOT THE CONTRACT. The test
+// that stood in this slot asserted that an `_Alignas(32) thread_local` is
+// REFUSED on pe64, on the premise that the Windows loader guarantees only
+// MEMORY_ALLOCATION_ALIGNMENT and that IMAGE_TLS_DIRECTORY64 "has no field to
+// request more". ✔BOTH HALVES ARE REFUTED BY MEASUREMENT:
+//
+//   * THE FIELD EXISTS. `Characteristics` is a union in the Windows SDK's own
+//     `winnt.h` — `{ Reserved0 : 20; Alignment : 4; Reserved1 : 8; }`, the
+//     ordinary IMAGE_SCN_ALIGN_* nibble.
+//   * THE LOADER HONOURS IT, and the evidence is a DISCRIMINATOR rather than a
+//     correlation: one MSVC-linked image carrying seven 4096-aligned
+//     `__declspec(thread)` objects RAN 42 with every address `% 4096 == 0` on
+//     the main thread and on a `CreateThread` worker; the SAME FILE with ONLY
+//     that nibble rewritten 4096 → 16 RAN 50 (`t1 mod 4096 = 720`). Same
+//     template, same block size, same code bytes.
+//   * THE REFERENCES BUILD AND RUN IT. MSVC 19.51 (native Windows TLS) returns
+//     42 at 8, 16 (control), 32, 64, 4096 and — with `/link /ALIGN:8192` — 8192;
+//     mingw-w64 gcc 13.2.0 returns 42 across the same range.
+//
+// ★ WHAT SURVIVES IS THE CEILING THE CONTAINER IMPOSES: a FOUR-BIT field tops
+// out at IMAGE_SCN_ALIGN_8192BYTES, and BOTH references stop at exactly 8192 by
+// name (gcc "requested alignment '16384' exceeds object file maximum 8192";
+// MSVC `error C2345`). So the refusal moved from 16 to 16384-and-up, which is
+// inside the union rather than above it.
+TEST(PeExecTls, ThreadLocalPastTheEncodableCeilingFailsLoud) {
     auto loaded = loadShippedExec();
     ASSERT_TRUE(loaded.target && loaded.format);
     AssembledModule mod;
@@ -3917,25 +4076,282 @@ TEST(PeExecTls, OveralignedThreadLocalFailsLoud) {
     fn.symbol = SymbolId{1};
     fn.bytes  = {0xC3};
     mod.functions.push_back(std::move(fn));
-    mod.dataItems.push_back(makeTdataItem(42, {1, 0, 0, 0}, 32));  // _Alignas(32)
+    mod.dataItems.push_back(makeTdataItem(42, {1, 0, 0, 0}, 16384));
 
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
+    EXPECT_TRUE(bytes.empty()) << "no artifact may be written";
     bool saw = false;
     for (auto const& diag : rep.all())
         if (diag.code == DiagnosticCode::K_ThreadLocalOveralignedForFormat)
             saw = true;
     EXPECT_TRUE(saw)
-        << "an over-aligned (>16) thread-local must fail loud on pe64 — "
-           "the loader cannot guarantee the per-thread block alignment";
+        << "16384 exceeds the four-bit IMAGE_SCN_ALIGN_* field's largest value "
+           "(8192), so the block-base request cannot be expressed — both PE "
+           "references refuse the same value by name";
+}
+
+// The BOUNDARY, and the arm that makes the refusal above a statement about what
+// the CONTAINER holds rather than about over-alignment in general: 8192 is the
+// largest value the nibble encodes, and it must COMPILE. This is the arm that
+// goes red if anyone re-tightens the ceiling toward the withdrawn 16.
+TEST(PeExecTls, ThreadLocalAtTheEncodableCeilingCompilesClean) {
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    mod.dataItems.push_back(makeTdataItem(42, {1, 0, 0, 0}, 8192));
+
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& diag : rep.all())
+        EXPECT_NE(diag.code, DiagnosticCode::K_ThreadLocalOveralignedForFormat)
+            << "8192 IS encodable (IMAGE_SCN_ALIGN_8192BYTES) — the gate is `>`";
+    EXPECT_FALSE(bytes.empty())
+        << "an 8192-aligned thread-local must still emit an image; both PE "
+           "references build AND run this value";
+}
+
+// ★★ THE BYTE-LEVEL PIN, and it is the one that would have caught the original
+// defect. Accepting an over-aligned thread-local is worthless — strictly worse
+// than the old refusal — unless the image ASKS the loader for the alignment,
+// and the only place it can ask is this nibble. Two arms, because a single
+// value cannot tell "the writer computed it" from "the writer hardcoded it".
+TEST(PeExecTls, DirectoryCharacteristicsCarryTheBlockBaseAlignment) {
+    auto const nibbleFor = [](std::uint32_t align) -> std::uint32_t {
+        auto loaded = loadShippedExec();
+        EXPECT_TRUE(loaded.target && loaded.format);
+        AssembledModule mod;
+        mod.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        fn.bytes  = {0xC3};
+        mod.functions.push_back(std::move(fn));
+        mod.dataItems.push_back(makeTdataItem(42, {7, 0, 0, 0}, align));
+        DiagnosticReporter rep;
+        auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+        EXPECT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+        EXPECT_FALSE(bytes.empty());
+        if (bytes.empty()) return 0xFFFFFFFFu;
+        // DataDirectory[9] (TLS) RVA is at 0x150; map it back through the
+        // `.tls` section header to a file offset, then read Characteristics at
+        // directory + 36.
+        std::uint32_t const dirRva = readU32LE(bytes, 0x150);
+        auto const tls = findExecSection(bytes, {'.', 't', 'l', 's', 0, 0, 0, 0});
+        EXPECT_NE(tls.first, 0u);
+        std::size_t const dirOff = tls.second + (dirRva - tls.first);
+        return (readU32LE(bytes, dirOff + 36) & 0x00F00000u) >> 20;
+    };
+    // 2^(k-1) bytes: 4096 → 13, 8192 → 14. Two DIFFERENT values, so the arm
+    // fails on a constant as loudly as on a dropped write.
+    EXPECT_EQ(nibbleFor(4096), 13u)
+        << "IMAGE_SCN_ALIGN_4096BYTES — the loader allocates every thread's "
+           "block on that boundary";
+    EXPECT_EQ(nibbleFor(8192), 14u) << "IMAGE_SCN_ALIGN_8192BYTES";
+    // ★ AND THE FLOOR: at or below the platform's own 16-byte guarantee the
+    // field stays ZERO ("unspecified — take the default"). Requesting LESS than
+    // the default would be a downgrade, and requesting exactly it would rewrite
+    // the bytes of every TLS image this project has ever emitted to say what
+    // the loader already does.
+    EXPECT_EQ(nibbleFor(4), 0u)  << "below the default: unspecified";
+    EXPECT_EQ(nibbleFor(16), 0u) << "AT the default: still unspecified";
+}
+
+// ── D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN, static twin (P64) ────────────────────
+//
+// The ORDINARY-STORAGE twin of the thread-local arms above, and it sits here
+// rather than beside the semantic alignment pins on purpose: this is a FORMAT
+// ceiling, not a type one.
+//
+// ⚠⚠ THE OLD BOUND WAS THE FORMAT DOCUMENT'S DECLARED `SectionAlignment` (4096),
+// AND IT WAS WRONG IN BOTH DIRECTIONS. It refused 8192 statics that BOTH PE
+// references build and RUN (✔MEASURED, multi-object subject, runtime address
+// asserted: mingw-w64 gcc 13.2.0 → 42; MSVC 19.51 with `/link /ALIGN:8192` →
+// 42) — and its stated remedy, raise `optionalHeader.sectionAlignment`, is not
+// what the reference does: ✔`pedump` on the mingw-linked image shows
+// SectionAlignment UNCHANGED at 0x1000, `.bss` based at an RVA that is ≡ 4096
+// mod 8192, and the objects inside it nonetheless ≡ 0 mod 8192. `ld` PADS WITHIN
+// THE SECTION, and `pe::encodeExec` now does the same.
+//
+// ✔THE MISCOMPILE THE GATE STILL PREVENTS IS REAL (P63, measured with neither
+// gate nor padding): four `aligned(8192)` statics behind odd-sized fillers built
+// rc 0 and the FIRST one failed its own `address % 8192` check at run time. One
+// object at a section head can be right BY LUCK — a single-object probe returned
+// 42 at the same value — which is why the witnesses carry several.
+//
+// ★ WHAT SURVIVES IS THE CONTAINER'S OWN LIMIT: PE/COFF spells an object's
+// alignment in a FOUR-BIT IMAGE_SCN_ALIGN_* field, largest value 8192, and both
+// references stop at exactly that by name (gcc "requested alignment '16384'
+// exceeds object file maximum 8192"; MSVC `error C2345`). ★★ AND THE CONTROLS
+// SAY IT IS ABOUT STORAGE, NOT ABOUT ALIGNMENT: the same compiler at the same
+// value BUILDS AND RUNS the request on a TYPE and on an AUTOMATIC object — which
+// is why this gate must never migrate into the semantic ladder, where it would
+// refuse `aligned(65536)` types that every reference runs.
+TEST(PeExecData, StaticObjectPastTheEncodableCeilingFailsLoud) {
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {1, 0, 0, 0};
+    d.alignment = Alignment::ofRuntimePow2(16384);  // one step past the nibble
+    mod.dataItems.push_back(std::move(d));
+
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty()) << "no artifact may be written";
+    bool saw = false;
+    for (auto const& diag : rep.all())
+        if (diag.code == DiagnosticCode::K_StaticObjectOveralignedForFormat)
+            saw = true;
+    EXPECT_TRUE(saw)
+        << "16384 cannot be encoded in PE/COFF's four-bit alignment field, so "
+           "the object could only be placed misaligned — both PE references "
+           "refuse the same value by name";
+}
+
+// The BOUNDARY: 8192 is the largest encodable value and it must COMPILE. This is
+// the arm that goes red if anyone re-ties the ceiling to `SectionAlignment`.
+TEST(PeExecData, StaticObjectAtTheEncodableCeilingCompilesClean) {
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {1, 0, 0, 0};
+    d.alignment = Alignment::ofRuntimePow2(8192);
+    mod.dataItems.push_back(std::move(d));
+
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& diag : rep.all())
+        EXPECT_NE(diag.code, DiagnosticCode::K_StaticObjectOveralignedForFormat)
+            << "8192 is encodable — the gate is `>`, and it is not tied to "
+               "the document's SectionAlignment any more";
+    EXPECT_FALSE(bytes.empty())
+        << "an 8192-aligned static must still emit an image; both PE references "
+           "build AND run this value";
+}
+
+// ★★ THE PLACEMENT PIN, and it is the one that makes acceptance worth having.
+// Accepting an 8192 static and then putting it wherever the section base falls
+// is strictly worse than the old refusal, so this arm reads the EMITTED IMAGE
+// and computes each object's virtual address the way the loader will:
+// `imageBase + sectionRva + offsetInSection`. The offsets are FOUND by searching
+// the raw section bytes for each object's own marker rather than recomputed from
+// the layout rule, so the arm cannot agree with the writer by sharing its
+// arithmetic. Two over-aligned objects, separated by an ODD-sized filler, so the
+// second one is provably not at the section head.
+TEST(PeExecData, OveralignedStaticsLandOnAlignedVirtualAddresses) {
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    auto const dataItem = [](std::uint32_t sym, std::vector<std::uint8_t> b,
+                             std::uint32_t align) {
+        AssembledData d;
+        d.symbol    = SymbolId{sym};
+        d.section   = DataSectionKind::Data;
+        d.bytes     = std::move(b);
+        d.alignment = Alignment::ofRuntimePow2(align);
+        return d;
+    };
+    // ⚠⚠ THIS `.rdata` ITEM IS THE WHOLE ARM, AND ITS ABSENCE MADE THE ARM
+    // VACUOUS. ✔MEASURED: with only `.data` present, the section chains to RVA
+    // 0x2000 and `imageBase + 0x2000` is ALREADY 8192-aligned, so the head pad
+    // is zero and this test passed IDENTICALLY with the padding pass deleted —
+    // a red-on-disable run reddened the corpus example and left this arm GREEN.
+    // One `.rdata` item takes a whole page (VirtualSize is section-aligned), so
+    // `.data` moves to 0x3000 and its base VA becomes ≡ 4096 mod 8192: the pad
+    // is now the only thing that can put these objects on 8192. The arm asserts
+    // that below, so it can never silently become vacuous again.
+    AssembledData ro;
+    ro.symbol    = SymbolId{41};
+    ro.section   = DataSectionKind::Rodata;
+    ro.bytes     = {0xC1, 0xC2, 0xC3, 0xC4};
+    ro.alignment = Alignment::ofRuntimePow2(4);
+    mod.dataItems.push_back(std::move(ro));
+    // Distinctive 4-byte markers so the search cannot latch onto padding.
+    mod.dataItems.push_back(dataItem(42, {0xA1, 0xA2, 0xA3, 0xA4}, 8192));
+    mod.dataItems.push_back(dataItem(43, {9, 9, 9, 9, 9, 9, 9}, 1));   // odd filler
+    mod.dataItems.push_back(dataItem(44, {0xB1, 0xB2, 0xB3, 0xB4}, 8192));
+
+    DiagnosticReporter rep;
+    auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    ASSERT_FALSE(bytes.empty());
+
+    constexpr std::uint64_t kImageBase = 0x140000000ull;
+    auto const dataSec = findExecSection(bytes, {'.', 'd', 'a', 't', 'a', 0, 0, 0});
+    ASSERT_NE(dataSec.first, 0u) << ".data must exist";
+    // ★ NON-VACUITY, ASSERTED RATHER THAN ARRANGED AND FORGOTTEN: the section
+    // this arm reads must NOT already begin on an 8192 boundary, or the head
+    // pad would be zero and the two checks below would hold with the padding
+    // pass deleted. If a future change to the section chain moves `.data` back
+    // onto a boundary, THIS is the line that says so.
+    ASSERT_NE((kImageBase + dataSec.first) % 8192ull, 0ull)
+        << ".data's own base is 8192-aligned, so this arm proves nothing about "
+           "the head pad — give the module another section ahead of `.data`";
+    std::uint32_t const dataRawSize =
+        findExecSectionRawSize(bytes, {'.', 'd', 'a', 't', 'a', 0, 0, 0});
+    ASSERT_GT(dataRawSize, 0u);
+
+    auto const findMarker =
+        [&](std::array<std::uint8_t, 4> const& m) -> std::optional<std::uint64_t> {
+        for (std::uint32_t o = 0; o + 4 <= dataRawSize; ++o) {
+            std::size_t const f = dataSec.second + o;
+            if (f + 4 > bytes.size()) break;
+            if (bytes[f] == m[0] && bytes[f + 1] == m[1]
+                && bytes[f + 2] == m[2] && bytes[f + 3] == m[3])
+                return static_cast<std::uint64_t>(o);
+        }
+        return std::nullopt;
+    };
+    auto const offA = findMarker({0xA1, 0xA2, 0xA3, 0xA4});
+    auto const offB = findMarker({0xB1, 0xB2, 0xB3, 0xB4});
+    ASSERT_TRUE(offA.has_value()) << "the first over-aligned item's bytes";
+    ASSERT_TRUE(offB.has_value()) << "the second over-aligned item's bytes";
+    EXPECT_NE(*offA, *offB) << "two distinct objects";
+
+    std::uint64_t const vaA = kImageBase + dataSec.first + *offA;
+    std::uint64_t const vaB = kImageBase + dataSec.first + *offB;
+    EXPECT_EQ(vaA % 8192ull, 0ull)
+        << "the FIRST 8192-aligned static's load address; .data's own base is "
+           "only SectionAlignment-aligned, so this holds only because the "
+           "writer pads the section head";
+    EXPECT_EQ(vaB % 8192ull, 0ull)
+        << "the SECOND one — past an odd-sized filler, so it cannot be right "
+           "by sitting at the section head";
 }
 
 TEST(PeExecTls, SixteenByteAlignedThreadLocalCompilesClean) {
-    // Boundary pin: alignment EXACTLY 16 (== the loader's guarantee) is the
-    // largest that passes — the gate is `> 16`, not `>= 16`. Every normal
-    // scalar / pointer / small aggregate thread_local (align <= 16) stays
-    // green; only explicit over-alignment bites.
+    // The ORDINARY case, and the reason it keeps its own arm after the ceiling
+    // moved: 16 is the platform's own block-base guarantee, so this is the
+    // alignment every normal scalar / pointer / small aggregate thread_local
+    // asks for. It compiles clean, it emits `.tls`, and (pinned separately in
+    // `DirectoryCharacteristicsCarryTheBlockBaseAlignment`) it leaves the
+    // directory's alignment nibble at zero — byte-identical to what this writer
+    // has always emitted. What changed in P64 is only what happens ABOVE it.
     auto loaded = loadShippedExec();
     ASSERT_TRUE(loaded.target && loaded.format);
     AssembledModule mod;
@@ -4088,6 +4504,55 @@ TEST(PeExecFormatJsonValidate, NonPow2SectionAlignmentRejected) {
     EXPECT_EQ(countWithMessage(r, "must be a positive power-of-two"), 1u)
         << rejectSummary(r);
     EXPECT_EQ(countAtPath(r, "/processExit"), 0u) << rejectSummary(r);
+}
+
+// ── The `fileAlignment` twin of the rule above, and the ONE member of the
+//    `alignUp` precondition's distributed enforcement that nothing pinned ──
+//
+// `detail::alignUp` in `src/link/format/byte_emit.hpp` is the power-of-two
+// BITMASK `(v + a - 1) & ~(a - 1)`, and `pe::encodeExec` feeds it
+// `optionalHeader.fileAlignment` at every section's raw-data pointer. A
+// non-power-of-two there does not fail: `alignUp(600, 600)` returns 512, so
+// SizeOfHeaders and every PointerToRawData come out at offsets that overlap the
+// data they claim to start, and the image is built around them silently.
+//
+// ⚠ THIS TEST IS THE HALF THAT WAS MISSING, NOT A NEW RULE. validate() has
+// refused this since the key landed; the SIBLING key (`sectionAlignment`) is
+// pinned directly above, and `image.segmentPageSize`'s identical guard is pinned
+// in `test_macho_arm64_exit`. `fileAlignment`'s was the only one of the three
+// with no test, so a refactor could have dropped it and left every suite green
+// — which is exactly the shape that lets a silent-wrong-answer path reopen.
+// (P65, alongside the correction of `alignUp`'s own contract comment, which had
+// claimed for the life of the function that a non-power-of-two was "handled with
+// the modulo-cycle form".)
+TEST(PeExecFormatJsonValidate, NonPow2FileAlignmentRejected) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "none" },
+      "cCallingConvention": { "convention": "ms_x64" },
+      "outputExtension": ".exe",
+  "dataModel": "LP64",
+  "headerNameMatching": "case-sensitive",
+      "format": {"name":"odd-file-align","kind":"pe"},
+      "$entryClusterComment": "Entry cluster + pe.characteristics: verbatim from the shipped pe64-x86_64-windows-exec.format.json. Present so this fixture is rejected ONLY for the defect it pins -- see the block comment above these tests.",
+      "runtimeLibraries": [{"role":"cLibrary","image":"ucrtbase.dll"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "exit" },
+      "entryCallingConvention": "ms_x64",
+      "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
+      "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 600, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
+      "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_FALSE(r.has_value());
+    // MEASURED sole-reason pin, the same discipline as the sibling above: 600 is
+    // chosen so it violates EXACTLY ONE rule -- it is inside PE/COFF's
+    // [512, 65536] window and below the 4096 sectionAlignment, so neither the
+    // range rule nor the ordering rule fires. One error, and it is this one.
+    EXPECT_EQ(errorCount(r), 1u) << rejectSummary(r);
+    EXPECT_EQ(countAtPath(r, "/optionalHeader/fileAlignment"), 1u)
+        << rejectSummary(r);
+    EXPECT_EQ(countWithMessage(r, "'fileAlignment' must be a positive"), 1u)
+        << rejectSummary(r);
 }
 
 // ── New tests folded from 7-agent review of LK2 cycle 2 ────────
@@ -5071,7 +5536,16 @@ namespace {
         d.bytes = {'x'};
     }
     mod.dataItems.push_back(std::move(d));
-    return linker::link(mod, target, fmt, rep);
+    // D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT:
+    // the darwin legs' shipped documents declare their ad-hoc code-signature
+    // identity as a FUNCTION of the artifact, and an emission that cannot
+    // name the file it produces is REFUSED with no fallback. The name is a
+    // FACT the driver supplies on every emission, never a knob, so stating it
+    // here is right for EVERY leg -- a format declaring no placeholder
+    // ignores it.
+    return linker::link(
+        mod, target, fmt, rep,
+        dss::ImageRequest{.artifactFileName = "rodata_probe"});
 }
 } // namespace
 
@@ -6348,4 +6822,596 @@ TEST(PeObjWriter, AWeakFunctionsUnwindTablesAreComdatsAssociativeToItsBody) {
             << name << "'s associated section must be the weak function's own "
                        "COMDAT `.text`, not section 1";
     }
+}
+
+// ══ D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET ══
+//
+// A pe64 RELOCATABLE object routes an extern DATA import's ADDRESS through a
+// slot the object CARRIES — `.refptr.<name>`, a select-any COMDAT in the relro
+// `.rdata` holding one IMAGE_REL_AMD64_ADDR64 against the import — and the code
+// names the SLOT, never the import. The defect was a direct
+// IMAGE_REL_AMD64_REL32 against the import: unreachable when a weak external
+// resolves to its ABSOLUTE value-0 default, which link.exe refuses (LNK2016)
+// and which mingw ld and lld-link TRUNCATE with no diagnostic at all.
+//
+// ★ THESE ARE STRUCTURAL PINS ON EMITTED BYTES. The runtime half — three
+// foreign linkers consuming a DSS object and RUNNING it — lives in
+// `tests/link/test_pe_object_data_import_slot.cpp`, because no byte pin can
+// show that a linker accepts the record and no foreign link can show WHICH
+// relocation carried it. Both tiers are required; neither substitutes.
+
+namespace {
+
+// A module shaped like what MIR->LIR emits for `&ea` under a got-indirect
+// binding: a `lea` of the import's slot (rel32 patch site) followed by a
+// pointer-size deref. The BYTES are inert here — this arm tests relocation
+// routing, not encoding — but the relocation KIND is the load-bearing half:
+// `RelocationKind{1}` is x86_64's `rel32` row, the PC-RELATIVE one, which is
+// the exact predicate the slot pass keys on.
+// D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55): the function
+// extern's BINDING is now a parameter, because it is what decides the shape
+// under a NARROWED `indirect-slot` format. `Weak` reproduces the P54 subject
+// exactly (`callee` was Global-by-default then, and the format was unnarrowed,
+// so every import took the slot); `Global` is the case the narrowing exists
+// for. One module shape serves both so the two answers are read off ONE
+// object, never off two fixtures that could drift apart.
+[[nodiscard]] AssembledModule
+dataImportModule(bool alsoCallAFunctionExtern,
+                 SymbolBinding fnBinding = SymbolBinding::Weak,
+                 bool alsoCallASecondFunctionExtern = false,
+                 SymbolBinding fn2Binding = SymbolBinding::Global) {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes.assign(32u, 0x90u);
+    Relocation lea;
+    lea.offset = 3;
+    lea.target = SymbolId{50};   // the DATA import
+    lea.kind   = RelocationKind{1};
+    fn.relocations.push_back(lea);
+    if (alsoCallAFunctionExtern) {
+        Relocation call;
+        call.offset = 20;
+        call.target = SymbolId{51};   // the FUNCTION import
+        call.kind   = RelocationKind{1};
+        fn.relocations.push_back(call);
+    }
+    if (alsoCallASecondFunctionExtern) {
+        Relocation call2;
+        call2.offset = 26;
+        call2.target = SymbolId{52};  // the SECOND FUNCTION import
+        call2.kind   = RelocationKind{1};
+        fn.relocations.push_back(call2);
+    }
+    mod.functions.push_back(std::move(fn));
+
+    ModuleSymbol fnSym;
+    fnSym.symbol = SymbolId{1};
+    fnSym.name   = "usesea";
+    mod.symbols.push_back(std::move(fnSym));
+
+    ExternImport data;
+    data.symbol      = SymbolId{50};
+    data.mangledName = "ea";
+    data.libraryPath = "somelib.dll";
+    data.isData      = true;
+    mod.externImports.push_back(std::move(data));
+    if (alsoCallAFunctionExtern) {
+        ExternImport fnImp;
+        fnImp.symbol      = SymbolId{51};
+        fnImp.mangledName = "callee";
+        fnImp.libraryPath = "somelib.dll";
+        fnImp.isData      = false;
+        fnImp.binding     = fnBinding;
+        mod.externImports.push_back(std::move(fnImp));
+    }
+    if (alsoCallASecondFunctionExtern) {
+        ExternImport fnImp2;
+        fnImp2.symbol      = SymbolId{52};
+        fnImp2.mangledName = "callee2";
+        fnImp2.libraryPath = "somelib.dll";
+        fnImp2.isData      = false;
+        fnImp2.binding     = fn2Binding;
+        mod.externImports.push_back(std::move(fnImp2));
+    }
+    return mod;
+}
+
+// The relocation whose patch site is `va`, in `sec`'s table.
+[[nodiscard]] std::optional<ObjReloc>
+relocAt(std::vector<std::uint8_t> const& obj, ObjSectionHeader const& sec,
+        std::uint32_t va) {
+    for (auto const& r : peObjRelocations(obj, sec)) {
+        if (r.virtualAddress == va) return r;
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
+TEST(PeObjDataImportSlot, DataExternCodeReferenceNamesTheCarriedComdatSlot) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    // The pairing this row installs, asserted on the SHIPPED document rather
+    // than assumed: if either key is dropped the rest of this test is testing
+    // something else, and its `.text` assertion would then fail for a reason
+    // that reads nothing like "the config lost a key".
+    ASSERT_TRUE(loaded.format->dataImportBinding().has_value());
+    ASSERT_TRUE(loaded.format->objectImportSlot().has_value());
+    EXPECT_EQ(loaded.format->objectImportSlot()->symbolPrefix, ".refptr.");
+
+    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/false);
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    auto const& obj = image.bytes;
+    ASSERT_FALSE(obj.empty());
+
+    auto const secs = peObjSections(obj);
+    auto const* text = findSection(secs, ".text");
+    ASSERT_NE(text, nullptr);
+
+    // (1) THE CODE NAMES THE SLOT. Type AND target, not merely a count: a
+    //     REL32 is the shape the defect had too, so the type alone would pass
+    //     over it — what changed is WHICH SYMBOL it points at.
+    auto const codeRel = relocAt(obj, *text, 3u);
+    ASSERT_TRUE(codeRel.has_value()) << "no `.text` relocation at the lea site";
+    constexpr std::uint16_t kImageRelAmd64Rel32 = 4;
+    EXPECT_EQ(codeRel->type, kImageRelAmd64Rel32);
+    EXPECT_EQ(peObjSymbolName(obj, codeRel->symbolTableIndex), ".refptr.ea")
+        << "the code must reach the import through the carried slot; naming "
+           "`ea` directly is the defect (a rel32 cannot reach an ABSOLUTE "
+           "target, which is what a weak external's default is)"
+        << symTableDump(obj);
+
+    // (2) THE SLOT EXISTS, IS A SELECT-ANY COMDAT, AND CARRIES THE ABSOLUTE
+    //     FIXUP THE FINAL LINKER FILLS. Without the ADDR64 the slot is a
+    //     permanent null pointer and every `&ea` reads 0 even when a
+    //     definition IS linked — a silent wrong answer in the OTHER
+    //     direction, which is why the fixup is pinned by type and target too.
+    ObjSectionHeader const* slotSec = nullptr;
+    for (auto const& s : secs) {
+        if (s.name == ".rdata" && s.numberOfRelocations == 1u) slotSec = &s;
+    }
+    ASSERT_NE(slotSec, nullptr) << "no reloc-bearing `.rdata` section";
+    constexpr std::uint32_t kScnLnkComdatMask = 0x00001000u;
+    EXPECT_NE(slotSec->characteristics & kScnLnkComdatMask, 0u)
+        << "the slot must be a COMDAT: two objects importing one name both "
+           "define `.refptr.ea`, and only a COMDAT lets the final linker keep "
+           "one instead of refusing the pair";
+    EXPECT_EQ(slotSec->sizeOfRawData, 8u) << "the slot is one LLP64 pointer";
+    auto const aux = peObjSectionDefAux(obj, ".rdata");
+    ASSERT_TRUE(aux.has_value());
+    EXPECT_EQ(aux->selection, 2u) << "IMAGE_COMDAT_SELECT_ANY";
+    auto const fill = relocAt(obj, *slotSec, 0u);
+    ASSERT_TRUE(fill.has_value());
+    constexpr std::uint16_t kImageRelAmd64Addr64 = 1;
+    EXPECT_EQ(fill->type, kImageRelAmd64Addr64);
+    EXPECT_EQ(peObjSymbolName(obj, fill->symbolTableIndex), "ea")
+        << "the SLOT is what names the import" << symTableDump(obj);
+
+    // (3) The import is still an UNDEFINED external — the slot is an extra
+    //     indirection, never a substitute for importing the name.
+    EXPECT_TRUE(peObjHasUndefinedSymbol(obj, "ea")) << symTableDump(obj);
+}
+
+TEST(PeObjDataImportSlot, AFunctionExternReachesItsImportThroughASlotToo) {
+    // D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET (P54).
+    // ⚠ THIS TEST USED TO ASSERT THE OPPOSITE — "a FUNCTION import's reference
+    // must stay direct" — and it was RIGHT while the shipped `.obj` format
+    // declared `externCallDispatch: direct-plt`. ✔MEASURED 2026-09-02 that the
+    // direct form is UNLINKABLE for a weak import: link.exe 14.51 answers
+    // `LNK2016: absolute symbol 'maybe' used as target of REL32 relocation`
+    // for the CALL as well as for the address (and refuses mingw gcc's own
+    // object for exactly that one relocation), while clang 18.1.3 routes BOTH
+    // through `.refptr.maybe` on both windows triples and link.exe links that.
+    // The format now declares `indirect-slot`, so the call site is
+    // `call *[rip+sym]` and every pc-relative extern reference in it is a slot
+    // read. The DISCRIMINATOR the old assertion protected has not been dropped
+    // — it moved to `AFunctionExternKeepsItsDirectReferenceUnderDirectPlt`
+    // below, where the dispatch is what decides rather than the symbol class.
+    // ★★ P55 (D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT) MADE
+    // THE FUNCTION IMPORT'S BINDING EXPLICIT HERE AND CHANGED NO ASSERTION.
+    // It was Global-by-default and took the slot only because the dispatch was
+    // then unnarrowed — i.e. this test was passing for a reason one step wider
+    // than the defect it pins. `Weak` is the binding the row is actually about
+    // (an ABSOLUTE value-0 resolution no rel32 reaches), so the subject now
+    // says so; the STRONG answer is the new sibling below.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    ASSERT_EQ(loaded.format->externCallDispatch(),
+              ExternCallDispatch::IndirectSlot)
+        << "the shipped pe64 `.obj` format must declare `indirect-slot`; with "
+           "`direct-plt` the rest of this test is about a different object";
+    ASSERT_TRUE(loaded.format->externRefTakesImportSlot(SymbolBinding::Weak))
+        << "the shipped pe64 `.obj` format must route a WEAK import through "
+           "the slot — that is the P0 this file exists for, and a narrowing "
+           "that excluded `weak` would make every assertion below vacuous";
+    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/true,
+                                           SymbolBinding::Weak);
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    auto const& obj = image.bytes;
+    ASSERT_FALSE(obj.empty());
+    auto const secs = peObjSections(obj);
+    auto const* text = findSection(secs, ".text");
+    ASSERT_NE(text, nullptr);
+
+    auto const dataRel = relocAt(obj, *text, 3u);
+    auto const callRel = relocAt(obj, *text, 20u);
+    ASSERT_TRUE(dataRel.has_value() && callRel.has_value());
+    EXPECT_EQ(peObjSymbolName(obj, dataRel->symbolTableIndex), ".refptr.ea");
+    EXPECT_EQ(peObjSymbolName(obj, callRel->symbolTableIndex), ".refptr.callee")
+        << "under `indirect-slot` the call site DEREFERENCES the slot, so its "
+           "relocation must name the slot; naming `callee` directly is the "
+           "shape link.exe answers with LNK2016 when the import is weak"
+        << symTableDump(obj);
+    // TWO carried slots now — one per referenced import.
+    std::size_t slotSections = 0;
+    for (auto const& s : secs) {
+        if (s.name == ".rdata" && s.numberOfRelocations == 1u) ++slotSections;
+    }
+    EXPECT_EQ(slotSections, 2u)
+        << "one carried slot per referenced import, data AND function"
+        << symTableDump(obj);
+    EXPECT_TRUE(peObjHasUndefinedSymbol(obj, "callee")) << symTableDump(obj);
+}
+
+TEST(PeObjDataImportSlot, AStrongFunctionExternKeepsItsDirectReferenceOnTheShippedObjFormat) {
+    // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55) — THE
+    // NARROWING, ON THE SHIPPED DOCUMENT, WITH BOTH ANSWERS IN ONE OBJECT.
+    //
+    // Two FUNCTION imports differing ONLY in binding: `callee` weak, `callee2`
+    // strong. The weak one must reach its import through the carried slot (the
+    // P0 that must not regress); the strong one must keep a plain direct
+    // reference. A pass that read the FORMAT instead of the SYMBOL cannot
+    // produce this object at all — it gives two slots or none.
+    //
+    // ✔MEASURED 2026-09-02 that this is what every reference emits, each
+    // probed separately with `weak` the only variable: clang 18.1.3 on BOTH
+    // `--target=x86_64-pc-windows-msvc` and `--target=x86_64-w64-windows-gnu`,
+    // and mingw-w64 gcc 13.2.0, all emit `.rdata$.refptr.maybe` for a WEAK
+    // extern function and NO `.refptr` section at all for a STRONG one.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    // The narrowing this test is about, asserted on the SHIPPED document
+    // rather than assumed — if the key is dropped the object below still
+    // links, still runs, and this test would then be reading a different
+    // decision while reporting on this one.
+    ASSERT_FALSE(loaded.format->indirectSlotBindings().empty())
+        << "the shipped pe64 `.obj` format must DECLARE `indirectSlotBindings`; "
+           "with the key absent `indirect-slot` is unnarrowed and every import "
+           "takes the slot, which is the state this row ended";
+    ASSERT_TRUE(loaded.format->externRefTakesImportSlot(SymbolBinding::Weak));
+    ASSERT_FALSE(loaded.format->externRefTakesImportSlot(SymbolBinding::Global));
+
+    AssembledModule mod =
+        dataImportModule(/*alsoCallAFunctionExtern=*/true, SymbolBinding::Weak,
+                         /*alsoCallASecondFunctionExtern=*/true,
+                         SymbolBinding::Global);
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    auto const& obj = image.bytes;
+    ASSERT_FALSE(obj.empty());
+    auto const secs = peObjSections(obj);
+    auto const* text = findSection(secs, ".text");
+    ASSERT_NE(text, nullptr);
+
+    auto const weakCall   = relocAt(obj, *text, 20u);
+    auto const strongCall = relocAt(obj, *text, 26u);
+    ASSERT_TRUE(weakCall.has_value() && strongCall.has_value());
+    EXPECT_EQ(peObjSymbolName(obj, weakCall->symbolTableIndex), ".refptr.callee")
+        << "the WEAK import still reaches its identity through the carried "
+           "slot — narrowing must not touch the case the P0 was about"
+        << symTableDump(obj);
+    EXPECT_EQ(peObjSymbolName(obj, strongCall->symbolTableIndex), "callee2")
+        << "a STRONG undefined has no absolute resolution — the final link "
+           "finds a definition or fails — so its reference is representable "
+           "pc-relative and must stay direct. Retargeting it would cost an "
+           "8-byte COMDAT and a load per call for nothing"
+        << symTableDump(obj);
+    // TWO slots, not three: the DATA import (unconditional, its own reason)
+    // and the WEAK function. The strong function gets none.
+    std::size_t slotSections = 0;
+    for (auto const& s : secs) {
+        if (s.name == ".rdata" && s.numberOfRelocations == 1u) ++slotSections;
+    }
+    EXPECT_EQ(slotSections, 2u)
+        << "one slot for the DATA import and one for the WEAK function — an "
+           "unnarrowed dispatch would mint three" << symTableDump(obj);
+    EXPECT_TRUE(peObjHasUndefinedSymbol(obj, "callee2")) << symTableDump(obj);
+}
+
+TEST(PeObjDataImportSlot, AFunctionExternKeepsItsDirectReferenceUnderDirectPlt) {
+    // THE DISCRIMINATOR, RE-BASED ON THE FACT THAT ACTUALLY DECIDES IT. A slot
+    // pass that retargeted every import under a `direct-plt` format would point
+    // a plain `call rel32` at a pointer slot, and the call would execute the
+    // pointer's bytes. That is not a hypothetical shape: it is what every ELF
+    // and Mach-O relocatable format declares, and what this pe `.obj` format
+    // itself declared until P54. The two references live in ONE function so a
+    // single object shows both answers, and neither can be produced by a pass
+    // that simply did nothing.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-direct-plt-keeps-calls-direct",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "externCallDispatch": "direct-plt",
+                           "dataImportBinding": "got-indirect",
+                           "objectImportSlot": { "symbolPrefix": ".refptr." },)",
+                        /*carriesRelro=*/true),
+        "synthetic");
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+
+    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/true);
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    auto const& obj = image.bytes;
+    ASSERT_FALSE(obj.empty());
+    auto const secs = peObjSections(obj);
+    auto const* text = findSection(secs, ".text");
+    ASSERT_NE(text, nullptr);
+
+    auto const dataRel = relocAt(obj, *text, 3u);
+    auto const callRel = relocAt(obj, *text, 20u);
+    ASSERT_TRUE(dataRel.has_value() && callRel.has_value());
+    EXPECT_EQ(peObjSymbolName(obj, dataRel->symbolTableIndex), ".refptr.ea")
+        << "the DATA half is unchanged by the dispatch" << symTableDump(obj);
+    EXPECT_EQ(peObjSymbolName(obj, callRel->symbolTableIndex), "callee")
+        << "under `direct-plt` MIR→LIR emitted a plain `call rel32`, so this "
+           "pass must leave it alone — retargeting it would call the slot"
+        << symTableDump(obj);
+    std::size_t slotSections = 0;
+    for (auto const& s : secs) {
+        if (s.name == ".rdata" && s.numberOfRelocations == 1u) ++slotSections;
+    }
+    EXPECT_EQ(slotSections, 1u)
+        << "one carried slot, for the DATA import only" << symTableDump(obj);
+}
+
+TEST(PeObjDataImportSlot, IndirectSlotDispatchWithNoSlotSpellingFailsLoud) {
+    // THE THIRD PAIRING RULE (P54). `indirect-slot` tells MIR→LIR that every
+    // extern call DEREFERENCES a pointer slot. A relocatable artifact has no
+    // import walker to mint one, so without `objectImportSlot` every call
+    // would read the import's own address as if it were a pointer — a SILENT
+    // wrong call target, which is why this is a refusal and not a fallback.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-indirect-slot-without-slot",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "externCallDispatch": "indirect-slot",
+                           "dataImportBinding": "got-indirect",)"),
+        "synthetic");
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+
+    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/true);
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, **target, **fmt, rep);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a relocatable format declaring indirect-slot dispatch with no slot "
+           "spelling must be refused: the code already derefs a slot the "
+           "object would not carry";
+    EXPECT_TRUE(image.bytes.empty()) << diagSummary(rep);
+}
+
+TEST(PeObjDataImportSlot, AnAbsoluteDataInitializerReferenceIsNotRetargeted) {
+    // `int *p = &ea;` reaches the object as an ABSOLUTE 64-bit relocation in a
+    // DATA ITEM, which represents an absolute-0 target perfectly well and is
+    // already correct. Pointing it at the slot would store the SLOT'S address
+    // where the program asked for the object's — off by exactly the one
+    // indirection this row is about, in the opposite direction. The pass keys
+    // on PC-RELATIVE for that reason, and this is the pin that says so.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/false);
+    AssembledData ptr;
+    ptr.symbol  = SymbolId{9};
+    ptr.section = DataSectionKind::Data;
+    ptr.bytes.assign(8u, 0u);
+    ptr.alignment = Alignment::ofRuntimePow2(8u);
+    Relocation abs;
+    abs.offset = 0;
+    abs.target = SymbolId{50};
+    abs.kind   = RelocationKind{2};   // x86_64 `abs64`
+    ptr.relocations.push_back(abs);
+    mod.dataItems.push_back(std::move(ptr));
+    ModuleSymbol ptrSym;
+    ptrSym.symbol = SymbolId{9};
+    ptrSym.name   = "p";
+    mod.symbols.push_back(std::move(ptrSym));
+
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    auto const& obj = image.bytes;
+    ASSERT_FALSE(obj.empty());
+    auto const secs = peObjSections(obj);
+    auto const* data = findSection(secs, ".data");
+    ASSERT_NE(data, nullptr);
+    auto const rel = relocAt(obj, *data, 0u);
+    ASSERT_TRUE(rel.has_value());
+    EXPECT_EQ(peObjSymbolName(obj, rel->symbolTableIndex), "ea")
+        << "a static initializer's absolute reference must keep naming the "
+           "IMPORT — it can hold an absolute-0 target, so it never met the "
+           "defect, and retargeting it would store the slot's address"
+        << symTableDump(obj);
+}
+
+// ── THE PAIRING RULE, BOTH DIRECTIONS ──────────────────────────────────
+//
+// `dataImportBinding` and `objectImportSlot` are ONE decision spelled in two
+// keys — WHETHER an extern data address is loaded from a slot, and WHAT the
+// object publishes the carried slot as — and on a RELOCATABLE format neither
+// is usable without the other. Declaring only the binding leaves MIR->LIR
+// emitting a deref of a slot that is never minted; declaring only the spelling
+// publishes a name nothing ever routes through. Both fail LOUD at the linker,
+// which is the tier that can see `isImageFlavor()` (a backend question the
+// schema's own `validate()` cannot ask).
+//
+// ★ AN IMAGE FORMAT IS NOT AFFECTED BY EITHER ARM and does not need a third:
+// its import walker owns the slot, so the pass returns before reading a key.
+// That is asserted by every existing pe64-exec test staying green rather than
+// restated here as a fourth case that could pass vacuously.
+TEST(PeObjDataImportSlot, RelocatableBindingWithNoSlotSpellingFailsLoud) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-binding-without-slot",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "dataImportBinding": "got-indirect",)"),
+        "synthetic");
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+
+    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/false);
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, **target, **fmt, rep);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a relocatable format declaring the binding with no slot spelling "
+           "must be refused: the code already derefs a slot the object would "
+           "not carry";
+    EXPECT_TRUE(image.bytes.empty()) << diagSummary(rep);
+}
+
+TEST(PeObjDataImportSlot, SlotSpellingWithNoBindingFailsLoud) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-slot-without-binding",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "objectImportSlot": { "symbolPrefix": ".refptr." },)"),
+        "synthetic");
+    ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
+
+    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/false);
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, **target, **fmt, rep);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a slot spelling with no binding is config that reads as a "
+           "capability and is not one — nothing is ever routed through it";
+    EXPECT_TRUE(image.bytes.empty()) << diagSummary(rep);
+}
+
+// ══ D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT: the four ways
+//    the narrowing key can be wrong, each refused AT LOAD ══
+//
+// ★ WHY ALL FOUR ARE REFUSALS RATHER THAN TOLERATED SHAPES: every failure mode
+// of this key widens the dispatch back to the state the key exists to narrow,
+// and a widening reads as "correct but slower" at every tier downstream. There
+// is no arm where a reader would notice, so the loader is the only place that
+// can.
+
+TEST(PeObjDataImportSlot, IndirectSlotBindingsWithoutIndirectSlotDispatchIsRefusedAtLoad) {
+    // A narrowing needs something to narrow. Under `direct-plt` NO import
+    // takes a slot, so the list names a rule nothing consults — the
+    // D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE shape, and the dangerous
+    // direction of it: a format author who narrows the wrong key gets an
+    // object that still carries the unnarrowed cost and a document that says
+    // otherwise.
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-narrowing-without-dispatch",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "externCallDispatch": "direct-plt",
+                           "indirectSlotBindings": ["weak"],
+                           "dataImportBinding": "got-indirect",
+                           "objectImportSlot": { "symbolPrefix": ".refptr." },)"),
+        "synthetic");
+    ASSERT_FALSE(fmt.has_value());
+    EXPECT_EQ(countAtPath(fmt, "/indirectSlotBindings"), 1u) << rejectSummary(fmt);
+}
+
+TEST(PeObjDataImportSlot, AnEmptyIndirectSlotBindingsListIsRefusedAtLoad) {
+    // An empty list would mean NO import takes the slot — a silent
+    // CANCELLATION of `indirect-slot`, not a narrowing of it, and the exact
+    // shape that would quietly reopen the P0 this file exists for.
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-empty-narrowing",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "externCallDispatch": "indirect-slot",
+                           "indirectSlotBindings": [],
+                           "dataImportBinding": "got-indirect",
+                           "objectImportSlot": { "symbolPrefix": ".refptr." },)"),
+        "synthetic");
+    ASSERT_FALSE(fmt.has_value());
+    EXPECT_EQ(countAtPath(fmt, "/indirectSlotBindings"), 1u) << rejectSummary(fmt);
+}
+
+TEST(PeObjDataImportSlot, LocalInIndirectSlotBindingsIsRefusedAtLoad) {
+    // `local` is not a representable IMPORT binding — an import is by
+    // construction a name the object does NOT define, and no format spells an
+    // undefined LOCAL symbol — so naming it declares a member that can never
+    // match. The refusal lives here because nothing downstream can tell a
+    // never-matching member from a correctly-narrow one.
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-local-narrowing",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "externCallDispatch": "indirect-slot",
+                           "indirectSlotBindings": ["weak", "local"],
+                           "dataImportBinding": "got-indirect",
+                           "objectImportSlot": { "symbolPrefix": ".refptr." },)"),
+        "synthetic");
+    ASSERT_FALSE(fmt.has_value());
+    EXPECT_EQ(countAtPath(fmt, "/indirectSlotBindings/1"), 1u) << rejectSummary(fmt);
+}
+
+TEST(PeObjDataImportSlot, AnUnknownOrDuplicateBindingSpellingIsRefusedAtLoad) {
+    // A typo must not fall through to an unnarrowed dispatch, and a repeated
+    // member is an authoring mistake this loader has no reason to guess about
+    // — the `entryVerbs` discipline, one key over.
+    auto typo = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-narrowing-typo",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "externCallDispatch": "indirect-slot",
+                           "indirectSlotBindings": ["weakish"],
+                           "dataImportBinding": "got-indirect",
+                           "objectImportSlot": { "symbolPrefix": ".refptr." },)"),
+        "synthetic");
+    ASSERT_FALSE(typo.has_value());
+    EXPECT_EQ(countAtPath(typo, "/indirectSlotBindings/0"), 1u) << rejectSummary(typo);
+
+    auto dupe = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-narrowing-dupe",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "externCallDispatch": "indirect-slot",
+                           "indirectSlotBindings": ["weak", "weak"],
+                           "dataImportBinding": "got-indirect",
+                           "objectImportSlot": { "symbolPrefix": ".refptr." },)"),
+        "synthetic");
+    ASSERT_FALSE(dupe.has_value());
+    EXPECT_EQ(countAtPath(dupe, "/indirectSlotBindings/1"), 1u) << rejectSummary(dupe);
+}
+
+TEST(PeObjDataImportSlot, TheTwoRelocatablePe64DocumentsDeclareTheSameNarrowing) {
+    // The `.obj` and the `.lib` are the SAME relocatable artifact reaching the
+    // SAME foreign linkers; an archive member that took a different shape from
+    // a lone object would be a defect nobody would look for. The staticlib
+    // document says it is hand-kept in sync with its sibling — this is the
+    // assertion that makes that a fact rather than a discipline.
+    auto obj = ObjectFormatSchema::loadShipped("pe64-x86_64-windows");
+    auto lib = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-staticlib");
+    ASSERT_TRUE(obj.has_value() && lib.has_value());
+    EXPECT_EQ((*obj)->externCallDispatch(), (*lib)->externCallDispatch());
+    EXPECT_EQ((*obj)->indirectSlotBindings(), (*lib)->indirectSlotBindings());
+    EXPECT_FALSE((*obj)->indirectSlotBindings().empty())
+        << "both must DECLARE the narrowing; two empty lists agree vacuously";
+}
+
+TEST(PeObjDataImportSlot, AnEmptySlotPrefixIsRefusedAtLoad) {
+    // The SHAPE rule, which is validate()'s half. An empty prefix publishes the
+    // slot under the IMPORT'S OWN name, so the object would DEFINE the symbol
+    // it is importing — a duplicate definition at the final link, or worse a
+    // self-referential slot that resolves to itself.
+    auto fmt = ObjectFormatSchema::loadFromText(
+        peObjSchemaJson("pe-obj-empty-slot-prefix",
+                        R"("weakDefinition": { "dialect": "comdat" },
+                           "dataImportBinding": "got-indirect",
+                           "objectImportSlot": { "symbolPrefix": "" },)"),
+        "synthetic");
+    ASSERT_FALSE(fmt.has_value());
+    EXPECT_EQ(countAtPath(fmt, "/objectImportSlot/symbolPrefix"), 1u)
+        << rejectSummary(fmt);
 }

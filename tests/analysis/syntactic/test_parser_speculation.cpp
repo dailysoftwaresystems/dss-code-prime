@@ -1295,3 +1295,163 @@ TEST(ParserSpeculation, SpeculativeInlineRepeatSeqAltComposes) {
     EXPECT_EQ(countNodesByRule(t, "caseNum"), 1u);
     EXPECT_EQ(countNodesByRule(t, "caseStar"), 1u);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// ★★★ THE FINAL-CANDIDATE DIRECT DESCENT (P65,
+// [[D-C-FILE-SCOPE-INFERRED-AUTO-MUST-LEAD-THE-DECLARATION-SPECIFIERS]])
+//
+// When an OUTERMOST speculative alt is down to its last candidate and that
+// candidate is the alt's declared-last STRUCTURAL one, the parser DESCENDS into
+// it instead of probing it. That is not a new reading: it is the reading
+// `finishFailedSpeculation_`'s fallback REPLAY already ran non-speculatively
+// once the probe failed. Collapsing the two removes a whole parse of the same
+// rule from the same token — and, more importantly, removes the probe's TOKEN
+// BUDGET from a reading the parser was going to take anyway. Before it, a
+// construct larger than the budget was abandoned, the latched ceiling was
+// REPORTED, and the replay then parsed the construct correctly while the
+// compile still exited 1: a loud refusal of a program the references accept.
+//
+// The two schemas below are synthetic on purpose — the mechanism is in the
+// shared parser, not in c, and a fixture written in C tokens would not say so.
+// The c-tier witnesses live in
+// tests/analysis/semantic/test_file_scope_declaration_definedness.cpp.
+constexpr std::string_view kFinalCandidateSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "FinalCandidate", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "A":  [{ "kind": "AKind" }],
+    "B":  [{ "kind": "BKind" }],
+    "C":  [{ "kind": "CKind" }],
+    "N":  [{ "kind": "Num" }],
+    ";":  [{ "kind": "Semi" }]
+  },
+  "shapes": {
+    "root":  { "sequence": [{ "repeat": "stmt" }] },
+    "stmt":  { "alt": ["shortCase", "unboundedCase"], "speculative": true },
+    "shortCase":     { "sequence": ["AKind", { "repeat": "CKind" }, "Semi"] },
+    "unboundedCase": { "sequence": ["AKind", "CKind", { "repeat": "Num" }, "Semi"] }
+  }
+})JSON";
+
+// `A C N…N ;` with FAR more `N`s than the probe budget (no declared lookahead
+// ⇒ k = 8, so the budget is 8 × `ParserConfig::speculationBudgetFactor` 16 =
+// 128 tokens). `shortCase` fast-fails at the first `N`; `unboundedCase` is then
+// the last candidate AND the declared-last structural one, so it is descended
+// into with no budget.
+//
+// ⚠ NEITHER BRANCH IS PRUNED, AND THE SCHEMA IS BUILT THAT WAY DELIBERATELY —
+// each enters on a variable-width element (`{repeat}` / a repeat one token in),
+// so `predictivePrefixLen` is 1 and 2 respectively and the LL(k) prune has
+// nothing to separate them with. Without that, the prune would leave ONE
+// candidate and the pre-existing `candidates.size() == 1` unique-production
+// descent would carry this input, making the arm vacuous.
+TEST(ParserSpeculation, FinalCandidateIsDescendedIntoRatherThanProbed) {
+    std::string manyNums;                      // 300 `N`s ≫ the 128 budget
+    for (int i = 0; i < 300; ++i) manyNums += "N ";
+    Tree t = parseWithSchema(kFinalCandidateSchema, "A C " + manyNums + ";");
+
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "the alt's fallback reading must be reached by DESCENT, so no probe "
+           "budget applies to it";
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_SpeculationBudgetExhausted), 0u);
+    EXPECT_EQ(countNodesByRule(t, "unboundedCase"), 1u);
+
+    // CONTROL 1 — the DECLARED ORDER is untouched: an input both branches
+    // accept still commits to the FIRST one, so the descent cannot be passing
+    // by hijacking the choice.
+    Tree first = parseWithSchema(kFinalCandidateSchema, "A C ;");
+    EXPECT_FALSE(first.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(first, "shortCase"), 1u);
+    EXPECT_EQ(countNodesByRule(first, "unboundedCase"), 0u);
+
+    // CONTROL 2 — the two branches really do compete: a SHORT input only the
+    // second branch matches still reaches it, by probe, well inside the budget.
+    Tree second = parseWithSchema(kFinalCandidateSchema, "A C N ;");
+    EXPECT_FALSE(second.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(second, "unboundedCase"), 1u);
+}
+
+// THE DIAGNOSTIC-QUALITY HALF, which is the property most at risk: on a genuine
+// syntax error the descended branch must say exactly what the REPLAY said. It
+// is the same rule parsed non-speculatively from the same token, so the answer
+// must be identical — no opaque `P_BacktrackFailed`, and the branch's own
+// precise complaint. ✔MEASURED before and after the change on this input and on
+// twenty real C syntax errors through the shipped CLI: byte-identical stderr.
+TEST(ParserSpeculation, FinalCandidateDescentKeepsTheReplaysDiagnostics) {
+    // `A C N N` — `unboundedCase` matches until EOF arrives where `;` is due.
+    Tree t = parseWithSchema(kFinalCandidateSchema, "A C N N");
+
+    ASSERT_NE(t.root(), InvalidNode) << "must RECOVER, never abort";
+    EXPECT_TRUE(t.diagnostics().hasErrors())
+        << "a genuinely malformed input must still be refused, loudly";
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_BacktrackFailed), 0u)
+        << "the descended branch owns the diagnostics exactly as the replay "
+           "did — an opaque backtrack failure means the fallback reading was "
+           "lost";
+    EXPECT_GE(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_MissingRequiredChild), 1u)
+        << "the branch's own complaint about the missing `;` must survive";
+}
+
+// ★★★ THE GATE, AND IT IS WHAT KEEPS THE DESCENT FROM BEING A NEW BEHAVIOUR.
+// The descent fires only when the last SURVIVING candidate is also the
+// declared-last STRUCTURAL one — the rule the fallback would have replayed.
+// When the prune has removed the structural-last branch, the last survivor is a
+// DIFFERENT rule, and descending into it would replace the fallback reading's
+// diagnostics with another branch's. That happens in real grammars: on `(int)`
+// c's `operand` prunes `parenExpr`, so the last survivor is `castExpr` while
+// the fallback reading stays `parenExpr` — which is also why the shipped
+// speculation ceilings are still reachable on a cast chain.
+//
+// Here `fallbackCase` is declared LAST and is PRUNED at offset 1 (its prefix
+// admits only `B` there), so `unboundedCase` is the last survivor but not the
+// fallback reading. The gate therefore refuses the descent, `unboundedCase` is
+// probed, and its 300 `N`s blow the 4 × 16 = 64-token budget exactly as before
+// the change. ⚠ THIS ARM PINS A REFUSAL ON PURPOSE: removing the gate makes
+// this input parse clean, which is a nicer outcome for THIS program and a
+// silent change of diagnostic owner for every program that fails.
+constexpr std::string_view kFallbackReadingGateSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "FallbackGate", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "A":  [{ "kind": "AKind" }],
+    "B":  [{ "kind": "BKind" }],
+    "C":  [{ "kind": "CKind" }],
+    "N":  [{ "kind": "Num" }],
+    ";":  [{ "kind": "Semi" }]
+  },
+  "shapes": {
+    "root":  { "sequence": [{ "repeat": "stmt" }] },
+    "stmt":  { "alt": ["ambiguousCase", "unboundedCase", "fallbackCase"],
+               "speculative": true, "lookahead": 4 },
+    "ambiguousCase": { "sequence": ["AKind", { "repeat": "CKind" }, "BKind"] },
+    "unboundedCase": { "sequence": ["AKind", "CKind", { "repeat": "Num" }, "Semi"] },
+    "fallbackCase":  { "sequence": ["AKind", "BKind", "Semi"] }
+  }
+})JSON";
+
+TEST(ParserSpeculation, FinalCandidateDescentIsGatedOnTheFallbackReading) {
+    std::string manyNums;                      // 300 `N`s ≫ the 64 budget
+    for (int i = 0; i < 300; ++i) manyNums += "N ";
+    Tree t = parseWithSchema(kFallbackReadingGateSchema, "A C " + manyNums + ";");
+
+    ASSERT_NE(t.root(), InvalidNode) << "must RECOVER, never abort";
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_SpeculationBudgetExhausted), 1u)
+        << "the last SURVIVING candidate is not the declared-last STRUCTURAL "
+           "one here, so it keeps its budget and the ceiling still reports by "
+           "name";
+
+    // CONTROL — the same alt on an input INSIDE the budget parses clean, so the
+    // arm above is measuring the budget rather than a broken schema.
+    Tree ok = parseWithSchema(kFallbackReadingGateSchema, "A C N N ;");
+    EXPECT_FALSE(ok.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(ok, "unboundedCase"), 1u);
+}

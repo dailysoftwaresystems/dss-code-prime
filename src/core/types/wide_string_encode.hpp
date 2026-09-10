@@ -35,8 +35,9 @@ namespace dss {
 // Why a wide-string encode failed. Each maps to a caller diagnostic; the code
 // unit count / bytes are NOT produced on failure (no guessed size).
 enum class WideEncodeError : std::uint8_t {
-    IllFormedUtf8,      // the raw body is not valid UTF-8 (truncated / stray continuation)
-    CodepointTooLarge,  // a decoded code point exceeds U+10FFFF (not a Unicode scalar value)
+    IllFormedUtf8,       // the raw body is not valid UTF-8 (truncated / stray continuation)
+    CodepointTooLarge,   // a decoded code point exceeds U+10FFFF (not a Unicode scalar value)
+    EscapeValueTooWide,  // a `\x`/octal escape names a value wider than one code unit
 };
 
 // Decode `bytes` (raw UTF-8, escapes ALREADY resolved by the byte decoder) into
@@ -76,13 +77,28 @@ decodeUtf8ToCodepoints(std::string_view bytes, std::vector<char32_t>& out) {
     return std::nullopt;
 }
 
+// One code unit's byte width for element `core` (U16→2, U32/I32→4, U8/Char→1).
+// The stride the semantic array-count → byte-size conversion uses when a caller
+// has the code-unit count and needs the flat byte length — and the width every
+// escape-value range check is taken against (`8 * elementByteWidth(core)` bits).
+// ⚠ Declared HERE, above its first use, rather than beside the encoder: the
+// character path needs it too.
+[[nodiscard]] inline std::uint32_t elementByteWidth(TypeKind core) noexcept {
+    switch (core) {
+        case TypeKind::U16:              return 2;
+        case TypeKind::U32:
+        case TypeKind::I32:              return 4;
+        default:                         return 1;   // U8 / Char
+    }
+}
+
 // C11/C23 6.4.4.4 — why a wide/UTF CHARACTER constant could not be lowered to a
 // single code unit of its element. Each maps to a caller diagnostic; the value is
 // NOT produced on failure (no guessed code unit).
 enum class WideCharError : std::uint8_t {
-    MalformedEscape,      // a `\`-escape in the body is malformed / unknown / out of range
+    MalformedEscape,      // a `\`-escape in the body is malformed / unknown
     InvalidUniversalName, // a `\u`/`\U` (6.4.3) with too few hex digits, a surrogate half, or > U+10FFFF
-    ByteEscapeInWide,     // a `\x`/octal escape in a wide/UTF char (escape-value-as-code-unit is deferred)
+    EscapeValueTooWide,   // a `\x`/octal escape names a value wider than the element's code unit
     IllFormedUtf8,        // the escape-decoded body is not well-formed UTF-8
     NotSingleCodepoint,   // the body decodes to 0 (empty `L''`) or >1 (multi-char `L'ab'`) code points
     Utf8UnitOutOfRange,   // a `u8'…'` code point exceeds U+007F (one UTF-8 code unit = ASCII)
@@ -106,12 +122,24 @@ enum class WideCharError : std::uint8_t {
 //
 // A `\u`/`\U` universal character name (6.4.3) resolves to a code point in the
 // shared byte decoder (canonical UTF-8, surrogate/>U+10FFFF rejected there) and is
-// UTF-8-decoded back here — so `u'é'` works exactly like the raw `u'é'`. A
-// `\x`/octal byte escape names a raw code-unit VALUE, not a code point; assembling
-// that value directly (`u'\xFFFF'` → one 0xFFFF unit) is deferred
-// (D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE), so a `\x`/octal in a wide/UTF char now
-// FAILS LOUD (ByteEscapeInWide) rather than the old silent UTF-8-collapse (e.g.
-// `u'\xC3\xA9'` → one wrong 0x00E9 unit). The narrow `'…'` path keeps `\x`/octal.
+// UTF-8-decoded back here — so `u'é'` works exactly like the raw `u'é'`.
+//
+// ★★★ A `\x`/octal byte escape names a raw code-unit VALUE, not a code point, and
+// is now ASSEMBLED DIRECTLY (D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE closed):
+// `u'\xFFFF'` is one 0xFFFF unit, `U'\xFFFFFFFF'` is one 0xFFFFFFFF unit — both
+// ✔MEASURED identical on gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC
+// 19.51. A body that is EXACTLY ONE escape takes that escape's value as the unit
+// and returns BEFORE the UTF-8 / Unicode path, which is precisely what lets
+// `U'\xFFFFFFFF'` (past U+10FFFF) and `u'\xD800'` (a lone surrogate) work while
+// the UCN spellings of the same numbers stay refused. The previous behaviour —
+// refusing every byte escape (`ByteEscapeInWide`) — was itself a repair of an
+// older SILENT collapse (`u'\xC3\xA9'` → one wrong 0x00E9 unit), and neither the
+// collapse nor the blanket refusal returns: what remains fail-loud is an escape
+// too WIDE for the element, which names the width and the value.
+//
+// ⚠ An escape MIXED with other characters (`u'a\xFF'`) is still NotSingleCodepoint
+// — a character constant denotes one unit, and only a whole-body escape can be
+// that unit. The narrow `'…'` path does not route here at all.
 [[nodiscard]] inline std::optional<char32_t>
 decodeWideCharCodepoint(std::string_view body, TypeKind elementCore,
                         WideCharError* err = nullptr) {
@@ -125,7 +153,15 @@ decodeWideCharCodepoint(std::string_view body, TypeKind elementCore,
         return fail(oc.error == EscapeDecodeError::InvalidUniversalName
                         ? WideCharError::InvalidUniversalName
                         : WideCharError::MalformedEscape);
-    if (oc.usedByteEscape) return fail(WideCharError::ByteEscapeInWide);
+    // A whole-body byte escape IS the code unit. `escaped.size() == 1` with one
+    // recorded escape means the placeholder byte is the entire decoded body, so
+    // nothing else contributes and the raw value stands on its own.
+    if (oc.escapeUnits.size() == 1 && escaped.size() == 1) {
+        std::uint32_t const bits = 8 * elementByteWidth(elementCore);
+        if (firstEscapeValueTooWide(oc, bits)) return fail(WideCharError::EscapeValueTooWide);
+        return static_cast<char32_t>(oc.escapeUnits.front().value);
+    }
+    if (oc.usedByteEscape) return fail(WideCharError::NotSingleCodepoint);
     std::vector<char32_t> cps;
     if (auto e = decodeUtf8ToCodepoints(escaped, cps)) {
         // A code point past U+10FFFF is an unrepresentable VALUE; every other
@@ -208,43 +244,85 @@ encodeCodepoint(char32_t cp, TypeKind core, std::string& out) {
     }
 }
 
-// One code unit's byte width for element `core` (U16→2, U32/I32→4, U8/Char→1).
-// The stride the semantic array-count → byte-size conversion uses when a caller
-// has the code-unit count and needs the flat byte length.
-[[nodiscard]] inline std::uint32_t elementByteWidth(TypeKind core) noexcept {
-    switch (core) {
-        case TypeKind::U16:              return 2;
-        case TypeKind::U32:
-        case TypeKind::I32:              return 4;
-        default:                         return 1;   // U8 / Char
-    }
-}
-
 // Result of encoding a whole (escape-decoded) body under a non-narrow core.
 struct WideEncodeResult {
     std::string   bytes;        // the encoded code units (LE), no trailing NUL
     std::uint64_t codeUnits;    // number of ELEMENT-width units (Array length = this + 1)
 };
 
+// Append the raw value `v` as ONE code unit of `width` bytes, little-endian.
+// Deliberately NOT `encodeCodepoint`: a `\x`/octal escape names a raw CODE UNIT,
+// so it must not be UTF-8-expanded under U8, surrogate-paired under U16, or
+// checked against U+10FFFF / the surrogate range at all.
+inline void appendRawCodeUnit(std::uint64_t v, std::uint32_t width, std::string& out) {
+    for (std::uint32_t b = 0; b < width; ++b) {
+        out.push_back(static_cast<char>(static_cast<unsigned char>((v >> (8 * b)) & 0xFFu)));
+    }
+}
+
 // Decode `escaped` (bytes after `\`-escape resolution) as UTF-8 and re-encode
 // into `core`, returning the encoded bytes + code-unit count, or the first error.
 // This is THE shared path: the semantic typer takes `.codeUnits` for the array
 // length, the HIR lowerer takes `.bytes` for the literal — one computation.
+//
+// ★★★ `esc` IS WHAT MAKES A BYTE ESCAPE MEAN A CODE UNIT (both anchors of the
+// P55 pair). Without it this routine sees only bytes, so `u"\xC3\xA9"` — two
+// escapes naming units 0xC3 and 0xA9 — reaches the UTF-8 decoder as the two-byte
+// sequence `C3 A9` and COLLAPSES into ONE 0x00E9 unit. That silent collapse is
+// the defect D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE was opened for, and the
+// fail-loud refusal that replaced it is what this parameter finally lets us
+// remove. With `esc`, the buffer is walked in RUNS delimited by the recorded
+// escape offsets: an ordinary run is UTF-8-decoded and re-encoded exactly as
+// before, and each escape contributes its RAW value as one unit, with NO Unicode
+// validation — which is what `u"\xD800"` (one lone-surrogate unit on all four
+// references, while `u"\uD800"` is refused by all four) and `U"\xFFFFFFFF"` (one
+// unit past U+10FFFF on all four) require.
+//
+// ⚠ A null `esc` keeps the pure-UTF-8 reading, which is correct ONLY for a body
+// with no byte escapes. A caller that has an outcome MUST pass it; a caller that
+// does not must have refused byte escapes upstream.
+//
+// ⚠ An escape too wide for the element is EscapeValueTooWide — a refusal, never
+// a truncation. gcc/mingw truncate `u"\x1FFFF"` to 0xFFFF with a warning while
+// clang and MSVC refuse; a reference that only accepts by narrowing the value is
+// not one that WORKS, so the union over what works refuses.
 [[nodiscard]] inline std::optional<WideEncodeError>
-encodeWideString(std::string_view escaped, TypeKind core, WideEncodeResult& out) {
-    std::vector<char32_t> cps;
-    if (auto err = decodeUtf8ToCodepoints(escaped, cps)) return err;
+encodeWideString(std::string_view escaped, TypeKind core, WideEncodeResult& out,
+                 EscapeDecodeOutcome const* esc = nullptr) {
     out.bytes.clear();
+    out.codeUnits = 0;
     std::uint32_t const width = elementByteWidth(core);
-    std::size_t const before = out.bytes.size();
-    for (char32_t cp : cps) {
-        if (auto err = encodeCodepoint(cp, core, out.bytes)) return err;
+    std::vector<char32_t> cps;
+
+    // One run of ordinary (escape-free) bytes: UTF-8-decode, then re-encode into
+    // the element width — the pre-existing behaviour, unchanged.
+    auto const flushRun = [&](std::size_t from, std::size_t to)
+        -> std::optional<WideEncodeError> {
+        if (from >= to) return std::nullopt;
+        if (auto err = decodeUtf8ToCodepoints(escaped.substr(from, to - from), cps)) return err;
+        for (char32_t cp : cps) {
+            std::size_t const before = out.bytes.size();
+            if (auto err = encodeCodepoint(cp, core, out.bytes)) return err;
+            out.codeUnits += static_cast<std::uint64_t>((out.bytes.size() - before) / width);
+        }
+        return std::nullopt;
+    };
+
+    std::size_t at = 0;
+    if (esc != nullptr) {
+        std::uint64_t const limit =
+            width >= 8 ? ~std::uint64_t{0} : ((std::uint64_t{1} << (8 * width)) - 1u);
+        for (EscapeValueUnit const& u : esc->escapeUnits) {
+            // `escapeUnits` is in source order and each entry owns exactly one
+            // placeholder byte, so the runs partition the buffer.
+            if (auto err = flushRun(at, u.byteOffset)) return err;
+            if (u.value > limit) return WideEncodeError::EscapeValueTooWide;
+            appendRawCodeUnit(u.value, width, out.bytes);
+            ++out.codeUnits;
+            at = u.byteOffset + 1;   // step over the placeholder byte
+        }
     }
-    // Byte length is always a whole multiple of the element width (each unit is
-    // `width` bytes); the code-unit count is that quotient. For U8 the "unit" is
-    // one byte so this is exactly the encoded length.
-    std::size_t const encoded = out.bytes.size() - before;
-    out.codeUnits = static_cast<std::uint64_t>(encoded / width);
+    if (auto err = flushRun(at, escaped.size())) return err;
     return std::nullopt;
 }
 

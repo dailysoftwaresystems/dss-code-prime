@@ -1,8 +1,12 @@
 // D-CSUBSET-VLA C3: MULTI-DIMENSIONAL variable-length arrays run with a RUNTIME inner
 // stride. `int a[n][m]` steps a row index by the decl-frozen row byte size (m*sizeof
 // (int)); every §B-included shape RUNS on all 3 legs. `volatile` seeds defeat constant
-// folding so the dims are genuinely runtime. main is a LEAF (no calls) — the C1b VLA
-// frame-model scope. Each `return k` (1..20) is a strict in-program pin; only all-pass
+// folding so the dims are genuinely runtime. main is a LEAF (no calls). ⚠ THAT USED TO
+// BE FORCED — "the C1b VLA frame-model scope" was leaf-only — and since 2026-09-04
+// (P59) it is a CHOICE: the non-leaf VLA frame model shipped and
+// D-CSUBSET-VLA-NONLEAF-CALL-FRAME is CLOSED. Staying leaf keeps this example's
+// subject independent of that model, which has its own witness in
+// examples/c/c99_vla_nonleaf_call_frame. Each `return k` (1..20) is a strict in-program pin; only all-pass
 // reaches 42. The KEY correctness witness is the OFF-DIAGONAL write a[1][0] vs a[0][1]
 // (distinct cells) — a level/order swap in the stride math would alias/transpose them.
 int main(void) {

@@ -7,13 +7,21 @@
 //
 //   * ★★★ THE NEGATIVE THAT MATTERS. `zext`, `sext`, `trunc`, `not` and
 //     `neg` with their result register EQUAL to their only operand register
-//     are NOT deleted. ✔MEASURED over the 585 dumping examples of
-//     `examples/c/**` (2026-08-25): 12021 instructions at post-callconv have
-//     result == their sole operand, and only 5575 are the class MOVE — the
-//     other 6446 are live computation. On x86-64 `mov` (64-bit), `trunc` and
-//     `zext` are three DIFFERENT LIR opcodes whose bytes all disassemble as
-//     `mov`, so a mnemonic-text or byte-pattern rule deletes all three. The
-//     runtime half of this pin is `examples/c/lir_peephole_self_ops`.
+//     are NOT deleted. ✔RE-MEASURED 2026-09-02 over `examples/c/**` at
+//     release (714 sources; 665 arm64 / 669 x86_64 dumping), by
+//     `lir_pass_util::censusIdentityClassMoves`: at post-callconv 7861 (arm64)
+//     / 8279 (x86_64) instructions have result == their sole operand, and only
+//     37 / 39 are the class MOVE — everything else is live computation. On
+//     x86-64 `mov` (64-bit), `trunc` and `zext` are three DIFFERENT LIR opcodes
+//     whose bytes all disassemble as `mov`, so a mnemonic-text or byte-pattern
+//     rule deletes all three. The runtime half of this pin is
+//     `examples/c/lir_peephole_self_ops`.
+//     ⚠ THE FIGURES HERE READ "12021 … only 5575 are the class MOVE"
+//     (2026-08-25) until the census existed. The class-MOVE half had fallen by
+//     two orders of magnitude in between and nothing re-derived it —
+//     D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT. The
+//     margin is now pinned as an inequality, not a remembered ratio, in
+//     `test_lir_identity_copy_stage_attribution.cpp`.
 //
 //   * THE WIDTH GUARD. A NARROW copy into the same register is not an
 //     identity: an x86-64 32-bit `mov` zeroes the upper half of the

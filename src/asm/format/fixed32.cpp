@@ -225,6 +225,32 @@ bool encode(Lir const&                  lir,
         asm_elect::selectEncodingVariant(*info, instOps, instWidth,
                                          instMemDest);
     if (selected == nullptr) {
+        // ★★★ NAME THE AXIS THAT ACTUALLY LOST.
+        // [[D-ASM-ARM64-LDR-TO-LDUR-CONVENIENCE-ALIAS-REFUSED]]
+        // A variant eliminated by its VALUE guard fits this instruction's
+        // shape and width perfectly, so the sentence below would say the one
+        // thing that is not true and drop the one datum that matters. When the
+        // value was the sole cause, the refusal says which value and against
+        // which declared bound, and carries `A_ImmediateOperandOutOfRange` —
+        // the code that describes it — rather than the no-variant code.
+        // ⚠ THIS IS THE SAME REFUSAL, NOT A NEW ACCEPTANCE: nothing encodes on
+        // this path either way. What changes is only what the reader is told,
+        // and it restores the precision the slot handlers used to supply
+        // before the guards began eliminating the variant one step earlier.
+        if (auto const* nearMiss = walker_util::variantRejectedOnValueOnly(
+                *info, instOps, instWidth, instMemDest)) {
+            auto const value = walker_util::variantValueOperand(
+                instOps, nearMiss->operandKinds);
+            if (value.has_value()) {
+                report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': memory offset {}",
+                                   info->mnemonic,
+                                   walker_util::describeValueAxisRejection(
+                                       *nearMiss, *value)));
+                return false;
+            }
+        }
         report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                DiagnosticSeverity::Error,
                std::format("opcode '{}': no encoding variant matches "

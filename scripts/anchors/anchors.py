@@ -303,7 +303,7 @@ def render_full(row):
 
 # ────────────────────────────────── writing ───────────────────────────────────
 
-def make_cell(text):
+def make_cell(text, field="cell"):
     """One field -> one cell body. The three ways a hand-written cell breaks a row.
 
     1. NEWLINES ARE COLLAPSED. A row is ONE physical line; a wrapped anchor id does not
@@ -321,8 +321,38 @@ def make_cell(text):
     it, raw text containing a literal backslash before a pipe emits an UNESCAPED
     separator, which is the exact silent column-shift this function exists to prevent.
     Correctness on the declared input beats safety on an input that never arrives.
+
+    ⚠⚠ ✔MEASURED 2026-09-02 (P54): THAT INPUT ARRIVES, AND HAS FOR MONTHS. The sentence
+    above was true about the DESIGN and false about the WORLD -- 35 pipes across 14 rows
+    were already stored with a doubled backslash, so those cells render `\\|` where their
+    author wrote `|`: `mtx_plain \\| mtx_recursive`, `awk -F"\\|"`, `[ -x "$LW" ] \\|\\|
+    ...`, a regex alternation, a PowerShell `\\| Out-Host`, a three-way enum. TWO callers
+    produce it and NEITHER is detectable downstream -- an author who PRE-ESCAPES a pipe
+    not knowing this function escapes for them, and a lane that reads the RAW TABLE LINE
+    with grep/sed instead of `read-anchor --json` and hands the escaped form back. The
+    second COMPOUNDS: every re-close adds one more backslash, forever.
+
+    ★ THE FIX IS NOT IDEMPOTENCE -- that is still the wrong contract, for the reason
+    above. It is to REFUSE the violating input HERE, at the one place that can still tell
+    a pre-escaped pipe from a deliberate one, because after this function returns the two
+    are the same bytes. A cell that genuinely wants to SHOW a backslash before a pipe
+    (~1000 rows hold one plausible candidate) spells the pipe `[|]` or says it in words:
+    that cost falls on one author, where the silent corruption fell on every reader of 14
+    rows.
     """
     flat = " ".join(str(text).split())
+    if "\\|" in flat:
+        at = flat.find("\\|")
+        raise Refused(
+            "the %s cell's value contains a backslash immediately before a pipe. This "
+            "function escapes pipes FOR you, so a pre-escaped pipe is stored DOUBLED and "
+            "renders as a stray backslash to every reader. Two causes: (1) you escaped it "
+            "by hand -- write the plain pipe; (2) you read the cell from the RAW TABLE "
+            "LINE with grep/sed -- read it with `read-anchor --json`, whose fields come "
+            "back already un-escaped, or the escape deepens on every re-close. To DISPLAY "
+            "a backslash before a pipe deliberately, spell the pipe `[|]`.\n"
+            "  at char %d: ...%s..."
+            % (field, at, flat[max(0, at - 60):at + 60]))
     return " %s " % flat.replace("|", "\\|") if flat else " "
 
 
@@ -382,8 +412,9 @@ def make_row(anchor, priority, status, trigger, closing="", cross_refs="", minti
     row = "|" + "|".join([" `%s` " % anchor,
                           " %s " % normalise_priority(priority),
                           " %s " % normalise_status(status),
-                          make_cell(trigger), make_cell(closing),
-                          make_cell(cross_refs)]) + "|"
+                          make_cell(trigger, "Trigger"),
+                          make_cell(closing, "Closing work"),
+                          make_cell(cross_refs, "Cross-refs")]) + "|"
     # Self-check the product against the reader that will consume it, rather than
     # trusting the assembly above. Cheap, and the only thing that would catch a future
     # edit to `make_cell` that reintroduced a separator.
@@ -395,6 +426,40 @@ def make_row(anchor, priority, status, trigger, closing="", cross_refs="", minti
     if bal.row_name(cells[C_ANCHOR]) != anchor:
         raise Refused("assembled row reads back as %r, not %r"
                       % (bal.row_name(cells[C_ANCHOR]), anchor))
+    # ★★ AND THE VERDICT MUST NOT BE STATED TWICE, DIFFERENTLY. Since the six-cell shape
+    # landed, `Status` carries the verdict and `Trigger` still opens with glyph-led prose
+    # -- two cells stating one fact, so they can disagree. `check-anchor-balance` ARM 6
+    # refuses that AFTER the fact; nothing refused it at the moment of writing.
+    # ✔MEASURED 2026-09-08: three rows minted through this writer in P64 carried
+    # `Status = closed` beside a Trigger opening with the bare word CLOSED and no closure
+    # mark, and ARM 6 failed on all three at HEAD. `is_closed` is a LEADING-POSITION test,
+    # so "says CLOSED in words" is not the same fact as "reads CLOSED", and only the gate
+    # knew that. ⇒ Asked here through `bal.is_closed` on the SPLIT-BACK cells, which is
+    # byte-for-byte the question the gate will ask, so the writer and the gate cannot
+    # drift apart about what a contradiction is.
+    # ⚠ NO ESCAPE, deliberately: a row is allowed to disagree with itself in exactly zero
+    # cases, and an opt-out here would be taken by every row that trips it -- the failure
+    # this project already measured when a guard's escape was satisfied by every subject.
+    # ⓘ It bites ONLY the closed-vs-not axis, the same axis ARM 6 owns; OPEN-vs-GATED is
+    # ARM 7's, is a differential, and is not decidable from one row in isolation.
+    if str(trigger).strip() and bal.is_closed(cells[C_STATUS]) != bal.is_closed(
+            cells[C_TRIGGER]):
+        raise Refused(
+            "the Status column and the Trigger prose state DIFFERENT verdicts.\n"
+            "  Status : %s  -> reads %s\n"
+            "  Trigger: %s -> reads %s\n"
+            "  A verdict is one fact and this row states it twice. `is_closed` is a "
+            "LEADING-POSITION test, so a Trigger that says CLOSED in words but does not "
+            "OPEN with the closure mark reads as NOT CLOSED -- which is what "
+            "`check-anchor-balance` ARM 6 will report on this row the moment it lands. "
+            "Lead the Trigger with the mark the Status column carries (the archive spells "
+            "it `%s **CLOSED <date> (<cycle>, lane `<x>`)** - ...`), or set the status the "
+            "prose actually means."
+            % (" ".join(cells[C_STATUS].split()),
+               "CLOSED" if bal.is_closed(cells[C_STATUS]) else "NOT CLOSED",
+               " ".join(cells[C_TRIGGER].split())[:56],
+               "CLOSED" if bal.is_closed(cells[C_TRIGGER]) else "NOT CLOSED",
+               bal.CLOSED_MARK))
     return row
 
 
@@ -844,12 +909,40 @@ def self_test():
         "(3) a priority outside P0..P5 is REFUSED")
     pin("controlled vocabulary" in (refuse(make_row, CC_, "P1", "wibble", "t") or ""),
         "(4) a status outside the three-value vocabulary is REFUSED")
-    r = make_row(CC_, "P0", "closed", "verdict | with a raw pipe", "a\nb", "")
+    # ⓘ The Trigger leads with the closure mark because the STATUS is closed, and the
+    # split-verdict refusal below now requires the two to agree. That is incidental to
+    # what THIS arm measures -- the pipe and the newline -- and weakens none of it.
+    r = make_row(CC_, "P0", "closed", "✅ **CLOSED** verdict | with a raw pipe",
+                 "a\nb", "")
     c = bal.split_row(r)
     pin(len(c) == 8 and "with a raw pipe" in c[C_TRIGGER]
         and c[C_CLOSING].strip() == "a b" and bal.is_closed(c[C_STATUS]),
         "(5) a raw pipe is ESCAPED and a newline COLLAPSED -- neither can add a column "
         "or wrap an id", "cells=%d" % (len(c) - 2))
+    # ── (5b..5f) THE VERDICT STATED TWICE ────────────────────────────────────
+    # ✔The negative is the case that actually shipped: P64 minted three rows through
+    # this writer with `Status = closed` and a Trigger opening with the bare WORD
+    # CLOSED, and `check-anchor-balance` ARM 6 failed on all three at HEAD. Both
+    # directions are pinned because only one of them had ever occurred, and the three
+    # CONTROLS are here so a refusal that fired on everything could not produce this
+    # transcript -- including (5f), which proves the rule is the CLOSED axis and not
+    # "the two cells must match".
+    pin("DIFFERENT verdicts" in (refuse(make_row, CC_, "P1", "closed",
+                                        "CLOSED 2026-09-07 -- says it in words") or ""),
+        "(5b) status CLOSED + a Trigger that says CLOSED in WORDS but carries no "
+        "closure mark is REFUSED -- the exact row shape that reached HEAD in P64")
+    pin("DIFFERENT verdicts" in (refuse(make_row, CC_, "P1", "open",
+                                        "✅ **CLOSED** -- but the column says open") or ""),
+        "(5c) ... and the OTHER direction too, a closed-looking prose under an OPEN "
+        "column, which no row has done yet and which hides finished work")
+    pin(refuse(make_row, CC_, "P1", "closed", "✅ **CLOSED 2026-09-08** -- agreed") is None,
+        "(5d) CONTROL: closed + closure-marked prose is ACCEPTED")
+    pin(refuse(make_row, CC_, "P1", "open", "🟠 **OPEN** -- agreed") is None,
+        "(5e) CONTROL: open + open-marked prose is ACCEPTED")
+    pin(refuse(make_row, CC_, "P1", "gated", "🟠 **OPEN -- TRIGGER-GATED**") is None,
+        "(5f) CONTROL: GATED beside OPEN prose is ACCEPTED HERE -- this arm owns the "
+        "CLOSED axis only; the open-vs-gated skew is ARM 7's differential and is not "
+        "decidable from one row in isolation")
     # ★ THE ROUND TRIP AS A PROPERTY, not as an escape spelling: read a cell back out,
     # feed it straight in again, and the cell must be identical. That is exactly what
     # `set-anchor` does to every field it was not asked to change.
@@ -860,7 +953,24 @@ def self_test():
         and _rt[C_TRIGGER].strip() == "a | b",
         "(6) a cell READ from a row and written straight back is IDENTICAL -- the round "
         "trip `set-anchor` depends on", "got=%r" % _rt2[C_TRIGGER])
-    pin(bal.split_row(make_row(CC_, "P1", "done", "t"))[C_STATUS].strip()
+    # ★ AND THE OTHER ROUND TRIP -- THE ONE THAT SILENTLY CORRUPTED 14 ROWS. Pin (6)
+    # reads the cell through `split_row`, which UN-escapes. A caller who instead reads
+    # the RAW TABLE LINE (grep/sed) gets `a \| b`, and writing that back stores `a \\| b`
+    # -- one more backslash on every re-close. An author who pre-escapes by hand hands
+    # over the identical bytes. Neither is distinguishable after `make_cell` returns, so
+    # it is refused before.
+    _pre = refuse(make_row, CC_, "P1", "open", "a \\| b") or ""
+    pin("backslash immediately before a pipe" in _pre and "read-anchor --json" in _pre,
+        "(6b) a PRE-ESCAPED pipe is REFUSED, and the message names the door that returns "
+        "un-escaped fields", "got=%r" % _pre[:80])
+    pin(refuse(make_row, CC_, "P1", "open", "t", "c \\| d") is not None
+        and refuse(make_row, CC_, "P1", "open", "t", "", "x \\| y") is not None,
+        "(6c) ...in EVERY prose cell, not only the Trigger -- the corruption was found in "
+        "all three")
+    pin("[|]" in _pre,
+        "(6d) ...and it names the spelling for a cell that WANTS to show a backslash "
+        "before a pipe, so the refusal is not a dead end")
+    pin(bal.split_row(make_row(CC_, "P1", "done", "✅ **CLOSED** t"))[C_STATUS].strip()
         == STATUS["closed"],
         "(7) `done` is accepted as a spelling of `closed` -- the operator's own word")
 
@@ -912,7 +1022,7 @@ def self_test():
         pin(msg is not None and "already has a row" in msg,
             "(14) --insert over an EXISTING row is REFUSED")
         msg = refuse(place_row, tmp, "done", B_,
-                     make_row(B_, "P1", "closed", "t"), True, report=quiet)
+                     make_row(B_, "P1", "closed", "✅ **CLOSED** t"), True, report=quiet)
         pin(msg is not None and "must be one of" in msg,
             "(15) the archive is never declared as a destination -- it is DERIVED")
 
@@ -959,7 +1069,7 @@ def self_test():
         box(tmp)
         before = io.open(os.path.join(tmp, REL["production"]), encoding="utf-8").read()
         place_row(tmp, "production", B_,
-                  make_row(B_, "P1", "closed", "t"), write=False, report=quiet)
+                  make_row(B_, "P1", "closed", "✅ **CLOSED** t"), write=False, report=quiet)
         pin(io.open(os.path.join(tmp, REL["production"]), encoding="utf-8").read()
             == before, "(24) a dry run writes nothing at all")
 
@@ -981,7 +1091,7 @@ def self_test():
 
         globals()["_rewrite"] = _fail_after_first
         try:
-            place_row(tmp, "production", B_, make_row(B_, "P1", "closed", "t"),
+            place_row(tmp, "production", B_, make_row(B_, "P1", "closed", "✅ **CLOSED** t"),
                       write=True, report=quiet)
         except IOError:
             pass

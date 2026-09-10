@@ -134,6 +134,26 @@ takeFound(HeaderSearchResult const& r, OnAmbiguous&& onAmbiguous) {
 // working directory.
 [[nodiscard]] DSS_EXPORT bool isRootedPath(std::filesystem::path const& p);
 
+// ── THE CONTAINMENT PREDICATE FOR A CONFIG-ROOT-RELATIVE SOURCE PATH ──────
+//
+// TRUE iff `spelling` could reach OUTSIDE `src/dss-config/` once joined to it:
+// empty, rooted (see `isRootedPath` above), containing a backslash, or carrying
+// a `.` / `..` component. Config declares these paths, so a `..` or an absolute
+// spelling would let a document name an arbitrary file on the host; both are
+// refused HERE rather than at the filesystem, which is the same containment
+// posture `findShippedConfig` takes on a logical name.
+//
+// ★★ ONE PREDICATE, TWO DECLARERS, AND THAT IS WHY IT LIVES HERE. A shipped-lib
+// descriptor's `realization.<format>.source` and an object format's
+// `runtimeLibraries[].source` (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64) name files
+// in the SAME tree, compiled by the SAME driver seam, and a second copy of a
+// SECURITY check is the shape that rots: this exact check already lost its
+// UNC hole once —
+// [[D-PATH-MULTI-SEPARATOR-ROOT-COLLAPSED-BY-STDLIB-PATH-TRANSFORMS]]
+// — and a duplicate would have kept it in one of the two readers.
+[[nodiscard]] DSS_EXPORT bool
+shippedConfigRelativePathEscapes(std::string_view spelling);
+
 // Resolve ONE relative name inside ONE directory under `matching`. This is the
 // atom every search below is built from, exposed because the preprocessor's
 // quote-include search adds its own per-candidate `is_regular_file` filter and

@@ -2278,6 +2278,79 @@ TEST(GrammarSchema, AttributeArgRuleUnknownShapeReportsInvalid) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
 }
 
+// ── P62 [[D-CSUBSET-ATTRIBUTE-ARG-CONSTANT-EXPRESSION]]: the OPTIONAL
+//    `attributeSemantics.attributeArgExprRule` key ──────────────────────────
+//
+// The key names the CONSTANT-EXPRESSION shape inside an attribute argument, and
+// its whole job is to be the STOP of `attrClauseArgOperand`'s sole-Internal-child
+// descent: without it that descent walks past the operand, through `sizeofExpr`
+// into `sizeofType` and on into `castTypeRef`, and hands the const-evaluator a
+// TYPE REFERENCE where the program wrote an expression.
+//
+// ⚠⚠ THESE FOUR PINS EXIST BECAUSE THE KEY SHIPPED WITH NONE, ONE ROW AFTER THE
+// SIBLING THAT LEARNED THE LESSON. `attributeArgRule` above carries three pins
+// under a comment saying in as many words that they exist because
+// D-CONFIG-ATTRIBUTE-ARG-RULE-DOCUMENTED-BUT-UNIMPLEMENTED was opened over a key
+// with "no loader key, no field, no consumer, NO TEST" while two shipped
+// `$comment`s asserted the mechanism in the present tense — and that row is STILL
+// 🟠 OPEN. `grep -rn "attributeArgExprRule" tests/` returned NOTHING when this
+// key landed, beside a very large shipped `$comment` asserting its behaviour and
+// a live engine consumer. Same shape, one key along.
+
+// PRESENT + VALID: the key loads and reaches `SemanticConfig`.
+TEST(GrammarSchema, AttributeArgExprRuleLoadsWhenPresent) {
+    auto const cfg = attributeSemanticsSchemaWith(
+        R"("attributeArgRule": "stdAttr", "attributeArgExprRule": "attrSpec",)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    EXPECT_EQ((*r)->semantics().attributeArgExprRuleName, "attrSpec");
+    EXPECT_TRUE((*r)->semantics().attributeArgExprRule.valid());
+}
+
+// ABSENT: still loads, and the rule stays INVALID — the pre-P62 state, in which
+// the descent is exactly the depth-agnostic wrapper walk it always was. Every
+// language that declares an attribute surface with no constant-expression
+// argument grammar depends on this staying optional.
+TEST(GrammarSchema, AttributeArgExprRuleIsOptional) {
+    auto r = GrammarSchema::loadFromText(attributeSemanticsSchemaWith(""));
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    EXPECT_FALSE((*r)->semantics().attributeArgExprRule.valid());
+    EXPECT_TRUE((*r)->semantics().attributeArgExprRuleName.empty());
+}
+
+// PRESENT but naming a shape that does not exist → C_UnknownShape, LOUD.
+// ★ Optional must not mean forgiving: a typo'd name that merely left the id
+// invalid would silently restore the "descend into the type reference" defect the
+// key exists to stop, and the load would report success.
+TEST(GrammarSchema, AttributeArgExprRuleUnknownShapeReportsInvalid) {
+    auto const cfg = attributeSemanticsSchemaWith(
+        R"("attributeArgRule": "stdAttr",
+            "attributeArgExprRule": "attrArgConstExprTypo",)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "an attributeArgExprRule naming a nonexistent shape must fail the "
+           "load, not leave the descent stop silently unset";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// ★ THE DEPENDENCY ARM, and it is the one a copy of the sibling's three pins
+// would have missed. The descent this key steers only ever RUNS from an
+// `attributeArgRule` node, so declaring the expression rule WITHOUT the argument
+// rule is dead config that reads as configured — C_InvalidSemantics, not a key
+// that quietly does nothing. (The reverse — an argument rule with no expression
+// rule — is the legitimate pre-P62 state and is the pin above.)
+TEST(GrammarSchema, AttributeArgExprRuleWithoutTheArgRuleReportsInvalid) {
+    auto const cfg = attributeSemanticsSchemaWith(
+        R"("attributeArgExprRule": "attrSpec",)");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "an expression rule with no argument rule is dead config and must "
+           "fail the load rather than load clean and steer nothing";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
 // (The shipped-config regression wall for this vocabulary lives at the end
 // of the file, next to the helper that locates c.lang.json.)
 
@@ -2400,6 +2473,15 @@ TEST(GrammarSchema, AttributeEffectUnknownVerbListsExactlyTheAcceptedSet) {
                                            "noInline", "alwaysInline",
                                            "noSanitizeThread",
                                            "runBeforeEntry", "runAfterEntry",
+                                           // P58 (D-CSUBSET-PER-MEMBER-PACKED):
+                                           // GNU `packed` on ONE struct/union
+                                           // member-declarator. ✔This roster CAUGHT
+                                           // the verb's arrival — the message is
+                                           // DERIVED from the loader's arms and went
+                                           // to 11 while this list said 10, which is
+                                           // exactly the drift the count guard below
+                                           // exists to find.
+                                           "packField",
                                            "none"};
     // The message under test.
     auto const bad = attrVocabSchema(
@@ -3349,7 +3431,7 @@ TEST(GrammarSchema, DeclarationAttrSlotRulesDuplicateReportsInvalid) {
     auto const cfg = attrVocabSchema(
         kConsistentEffects,
         R"("linkageSpecifierIgnoredNames": ["deprecated"],
-           "declarationAttrSlotRules": ["attrSpec", "attrSpec"],)", "");
+           "declarationAttrSlotRules": [{"rule": "attrSpec", "appertainsTo": "declaration"}, {"rule": "attrSpec", "appertainsTo": "declarator"}],)", "");
     auto r = GrammarSchema::loadFromText(cfg);
     ASSERT_FALSE(r.has_value())
         << "a repeated attribute-slot rule must fail the load — the scan would "
@@ -3377,7 +3459,7 @@ TEST(GrammarSchema, DeclarationAttrSlotRulesDistinctEntriesLoad) {
     auto const cfg = attrVocabSchema(
         kConsistentEffects,
         R"("linkageSpecifierIgnoredNames": ["deprecated"],
-           "declarationAttrSlotRules": ["attrSpec", "stdAttr"],)", "");
+           "declarationAttrSlotRules": [{"rule": "attrSpec", "appertainsTo": "declaration"}, {"rule": "stdAttr", "appertainsTo": "declarator"}],)", "");
     auto r = GrammarSchema::loadFromText(cfg);
     ASSERT_TRUE(r.has_value()) << errorDiags(r.error());
     EXPECT_EQ((*r)->semantics().declarations[0]
@@ -3722,18 +3804,167 @@ TEST(GrammarSchema, DeclarationAttrSlotRulesLoad) {
     auto const cfg = inferSchemaWithDeclRow(
         R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
              "kind": "variable",
-             "declarationAttrSlotRules": ["heads", "idecl"] })");
+             "declarationAttrSlotRules": [{"rule": "heads", "appertainsTo": "declaration"},{"rule": "idecl", "appertainsTo": "declarator"}] })");
     auto r = GrammarSchema::loadFromText(cfg);
     ASSERT_TRUE(r.has_value())
         << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
     ASSERT_EQ((*r)->semantics().declarations.size(), 1u);
     auto const& d = (*r)->semantics().declarations[0];
     ASSERT_EQ(d.declarationAttrSlotRules.size(), 2u);
-    EXPECT_TRUE(d.declarationAttrSlotRules[0].valid());
-    EXPECT_TRUE(d.declarationAttrSlotRules[1].valid());
-    ASSERT_EQ(d.declarationAttrSlotRuleNames.size(), 2u);
-    EXPECT_EQ(d.declarationAttrSlotRuleNames[0], "heads");
-    EXPECT_EQ(d.declarationAttrSlotRuleNames[1], "idecl");
+    EXPECT_TRUE(d.declarationAttrSlotRules[0].rule.valid());
+    EXPECT_TRUE(d.declarationAttrSlotRules[1].rule.valid());
+    EXPECT_EQ(d.declarationAttrSlotRules[0].name, "heads");
+    EXPECT_EQ(d.declarationAttrSlotRules[1].name, "idecl");
+    // P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+    // the GRAIN is what the entry is for, and it must survive the load
+    // DISTINCTLY per entry — one list carrying two grains is the shape the whole
+    // row exists to make expressible.
+    EXPECT_EQ(d.declarationAttrSlotRules[0].appertainsTo,
+              AttrAppertainment::Declaration);
+    EXPECT_EQ(d.declarationAttrSlotRules[1].appertainsTo,
+              AttrAppertainment::Declarator);
+}
+
+// ★★★ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY) —
+// A GRAIN-LESS ENTRY FAILS THE LOAD, AND THIS IS THE ARM THAT MATTERS.
+//
+// The tempting compatibility shim is to accept the old bare-string spelling and
+// assume a grain. There is no safe grain to assume: `declaration` is right for a
+// run written BEFORE the declarator list and wrong for one written after it, and
+// being wrong THAT way leaks the last declarator's attributes onto its siblings
+// — for `noreturn` that ELIDES A REAL RETURN PATH. So the key has no default and
+// the omission is loud.
+TEST(GrammarSchema, DeclarationAttrSlotRulesBareStringEntryReportsInvalid) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable",
+             "declarationAttrSlotRules": ["heads"] })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a BARE rule-name string must fail the load — there is no safe "
+           "default grain, so an entry that does not state one cannot be given "
+           "a reading";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// ★★★ P66
+// (D-C-THE-END-OF-SPECIFIERS-C23-ATTRIBUTE-CONFERS-ON-A-TYPEDEF-WHERE-NO-REFERENCE-CONFERS)
+// — THE OPTIONAL PER-SPELLING GRAIN.
+//
+// A DECLARATION-level slot names a RUN CONTAINER, and c's `typedefAttrRun`
+// holds BOTH attribute spellings under one rule name — so `appertainsTo` alone
+// could only be all-or-nothing while the references answer the two spellings
+// differently at the end of the declaration specifiers (✔MEASURED: gcc 13.3.0
+// IGNORES `typedef int [[deprecated]] T;` and HONOURS the `__attribute__` twin;
+// clang 18.1.3 refuses the first and honours the second; MSVC 19.51.36257
+// refuses the first and abstains on the second).
+TEST(GrammarSchema, DeclarationAttrSlotRulesStandardSpellingGrainLoads) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable",
+             "declarationAttrSlotRules": [
+               {"rule": "heads", "appertainsTo": "declaration",
+                "standardSpellingAppertainsTo": "type"},
+               {"rule": "idecl", "appertainsTo": "declarator"}] })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    auto const& d = (*r)->semantics().declarations[0];
+    ASSERT_EQ(d.declarationAttrSlotRules.size(), 2u);
+    EXPECT_EQ(d.declarationAttrSlotRules[0].appertainsTo,
+              AttrAppertainment::Declaration);
+    ASSERT_TRUE(d.declarationAttrSlotRules[0]
+                    .standardSpellingAppertainsTo.has_value());
+    EXPECT_EQ(*d.declarationAttrSlotRules[0].standardSpellingAppertainsTo,
+              AttrAppertainment::Type);
+    // ★ THE ARM THAT KEEPS THE KEY INERT FOR EVERY ENTRY THAT OMITS IT: absent
+    // must be ABSENT, not a default-constructed grain that quietly overrides.
+    EXPECT_FALSE(d.declarationAttrSlotRules[1]
+                     .standardSpellingAppertainsTo.has_value())
+        << "an entry that does not declare the override must carry none — the "
+           "property that makes this key byte-for-byte inert everywhere it is "
+           "not written";
+}
+
+// A grain outside the closed vocabulary, on the override key. Same table, same
+// loud refusal as `appertainsTo` — one vocabulary, two readers, one verdict.
+TEST(GrammarSchema, DeclarationAttrSlotRulesUnknownStandardSpellingGrainReportsInvalid) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable",
+             "declarationAttrSlotRules": [
+               {"rule": "heads", "appertainsTo": "declaration",
+                "standardSpellingAppertainsTo": "whatever"}] })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "the override draws from the SAME closed vocabulary as appertainsTo";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// ★★ A CONFERRING OVERRIDE IS REFUSED, and this is the arm that keeps the key
+// from being half a knob. `appertainsTo` selects the SITE a slot is folded at;
+// the override changes only what the run CONFERS once that site is chosen.
+// `declarator` names a conferring grain, so honouring it would have to move the
+// site too — which this key cannot do. Accepting it and reading it at the
+// declaration site would mean something other than what it says.
+TEST(GrammarSchema, DeclarationAttrSlotRulesConferringStandardSpellingGrainReportsInvalid) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable",
+             "declarationAttrSlotRules": [
+               {"rule": "heads", "appertainsTo": "declaration",
+                "standardSpellingAppertainsTo": "declarator"}] })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "only a NON-CONFERRING grain is expressible here; a conferring one "
+           "would have to move the fold site, which this key cannot do";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// The `appertainsTo` key present but naming a grain outside the closed
+// vocabulary. `EnumNameTable::fromName` returning nullopt is what makes this
+// loud rather than silently selecting row 0.
+TEST(GrammarSchema, DeclarationAttrSlotRulesUnknownGrainReportsInvalid) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable",
+             "declarationAttrSlotRules": [
+               {"rule": "heads", "appertainsTo": "whatever"}] })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "an appertainsTo outside the closed vocabulary must fail the load";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// An entry object MISSING `appertainsTo` entirely — distinct from the bare
+// string above, because a reader that only validated the object SHAPE would let
+// this through and leave the grain default-constructed.
+TEST(GrammarSchema, DeclarationAttrSlotRulesMissingGrainReportsInvalid) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable",
+             "declarationAttrSlotRules": [{"rule": "heads"}] })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "an entry with no 'appertainsTo' must fail the load rather than "
+           "leave the grain default-constructed";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// A typo'd ENTRY key (`appertainsToo`) is rejected by the entry's own closed
+// vocabulary — the same discriminator the declaration row itself carries. Both
+// halves fire here: the unknown key AND the resulting missing grain.
+TEST(GrammarSchema, DeclarationAttrSlotRulesTypoedEntryKeyReportsInvalid) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable",
+             "declarationAttrSlotRules": [
+               {"rule": "heads", "appertainsToo": "declaration"}] })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value())
+        << "a typo on the grain key must fail the load, not read as an entry "
+           "with no grain";
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
 // ★ THE REASON THE KEY IS NAME-BASED. An unknown rule NAME fails the load.
@@ -3746,13 +3977,23 @@ TEST(GrammarSchema, DeclarationAttrSlotRulesUnknownNameReportsInvalid) {
     auto const cfg = inferSchemaWithDeclRow(
         R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
              "kind": "variable",
-             "declarationAttrSlotRules": ["heads", "attrRunTypo"] })");
+             "declarationAttrSlotRules": [{"rule": "heads", "appertainsTo": "declaration"},{"rule": "attrRunTypo", "appertainsTo": "declaration"}] })");
     auto r = GrammarSchema::loadFromText(cfg);
     ASSERT_FALSE(r.has_value())
         << "an attribute slot naming a nonexistent shape must fail the load — "
            "a silently-unresolved slot is exactly the failure mode the "
            "name-based design exists to rule out";
-    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    // ⓘ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY)
+    // UNIFIED THE CODE, and the change is deliberate rather than incidental.
+    // This arm used to expect C_InvalidSemantics while the sibling key that
+    // describes the same thing (`declarators.afterDeclaratorAttrRules`) emitted
+    // C_UnknownShape for the identical mistake — two keys, one meaning, two
+    // codes. Both keys now go through ONE reader, and the code it uses is the
+    // loader-wide one for a name that resolves to no shape (`directiveRule`,
+    // `referenceParents`, `specifierPrefix` all emit C_UnknownShape). What this
+    // test exists to protect — that the load FAILS rather than silently leaving
+    // the slot unresolved — is asserted above and is unchanged.
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
 }
 
 // A non-array value → C_InvalidSemantics (never coerced to a one-element list).
@@ -3767,7 +4008,7 @@ TEST(GrammarSchema, DeclarationAttrSlotRulesNonArrayReportsInvalid) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
-// A non-string ELEMENT is rejected too — the array type check alone would let
+// A non-object ELEMENT is rejected too — the array type check alone would let
 // `[0]` through, which is precisely the indexed spelling this key rejects.
 TEST(GrammarSchema, DeclarationAttrSlotRulesNonStringEntryReportsInvalid) {
     auto const cfg = inferSchemaWithDeclRow(

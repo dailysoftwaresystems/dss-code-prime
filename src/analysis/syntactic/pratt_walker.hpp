@@ -17,13 +17,21 @@ class Parser;
 //   - On entry the parser has NOT opened a frame for `exprRule`; the
 //     walker opens its own frame (and any wrapper frames for binary /
 //     unary / postfix wrappers).
-//   - On return the parser's frame stack must be balanced with entry
-//     (the walker pushed and popped its own frames cleanly).
+//   - On return the parser's frame stack is EITHER balanced with entry
+//     (the walker parsed the whole expression and popped its own frames
+//     cleanly) OR the walker has pushed work onto the parser's expression
+//     work-stack (`Parser::Impl::exprWorkStack`) that the parser's own
+//     driver steps to completion — the shipped `DefaultPrattWalker` does
+//     the latter since P60, so that no nesting level of an expression
+//     ever holds a host frame
+//     (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED).
+//     In both cases the frame that was open at entry is closed by the time
+//     the pushed work has drained.
 //   - Forward-progress invariant (inherited from the parser's main
-//     loop): the walker must consume at least one token OR emit a
-//     `P_*` diagnostic + advance the token stream before returning.
+//     loop): the walk must consume at least one token OR emit a
+//     `P_*` diagnostic + advance the token stream before it completes.
 //   - Watchdog re-baseline is the parser's responsibility — it
-//     re-snapshots (cursor, tokPos, depth) after the walker returns.
+//     re-snapshots (cursor, tokPos, depth) on its next dispatch step.
 //
 // `exprRule` is the rule whose body declared `expr`; `minPrec` is the
 // floor precedence for operator climbing (the schema's

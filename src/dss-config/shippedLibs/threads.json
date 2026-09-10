@@ -4,7 +4,7 @@
   "header": "threads.h",
   "standard": "c11",
   "availableObjectFormats": ["elf", "pe", "macho"],
-  "library": { "elf": "libc.so.6", "pe": "kernel32.dll", "macho": "/usr/lib/libSystem.B.dylib" },
+  "library": { "elf": { "role": "cLibrary" }, "pe": { "role": "systemPrimitives" }, "macho": { "role": "cLibrary" } },
   "symbols": [
     { "name": "mtx_init",      "signature": "fn(ptr<void>, i32) -> i32", "availableObjectFormats": ["pe"], "synthesize": "mtx_init" },
     { "name": "mtx_init",      "signature": "fn(ptr<void>, i32) -> i32", "availableObjectFormats": ["elf"] },

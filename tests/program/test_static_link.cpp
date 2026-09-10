@@ -753,9 +753,16 @@ TEST(StaticLink, MachOPullResolvesReferenceAndMergeStripsImport) {
     combined.push_back(*mainMod);
     combined.push_back(std::move((*pulled)[0]));
     DiagnosticReporter linkRep;
+    // D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT: the
+    // darwin exec document declares its ad-hoc code-signature identity as a
+    // FUNCTION of the artifact, and an emission that cannot name the file it
+    // produces is REFUSED with no fallback. The name is a FACT the driver
+    // supplies on every emission, never a knob, so a leg whose format declares
+    // no placeholder simply ignores it.
     auto image = linker::link(
         std::span<AssembledModule const>{combined.data(), combined.size()},
-        *s.target, *s.exec, linkRep);
+        *s.target, *s.exec, linkRep,
+        dss::ImageRequest{.artifactFileName = "static_pull_probe"});
     EXPECT_EQ(linkRep.errorCount(), 0u) << "merged Mach-O static link must be clean";
     EXPECT_TRUE(image.ok());
     EXPECT_FALSE(std::any_of(image.externImportNames.begin(),
@@ -1933,9 +1940,16 @@ void expectArchiveMemberRebindsLibraryImport(Schemas const& s,
     combined.push_back(*mainMod);
     combined.push_back((*pulled)[0]);
     DiagnosticReporter linkRep;
+    // D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT: the
+    // darwin exec document declares its ad-hoc code-signature identity as a
+    // FUNCTION of the artifact, and an emission that cannot name the file it
+    // produces is REFUSED with no fallback. The name is a FACT the driver
+    // supplies on every emission, never a knob, so a leg whose format declares
+    // no placeholder simply ignores it.
     auto image = linker::link(
         std::span<AssembledModule const>{combined.data(), combined.size()},
-        *s.target, *s.exec, linkRep);
+        *s.target, *s.exec, linkRep,
+        dss::ImageRequest{.artifactFileName = "archive_member_probe"});
     EXPECT_EQ(countCode(linkRep, DiagnosticCode::K_SymbolUndefined), 0u)
         << familyLabel
         << ": a library call inside an archive member is not an undefined symbol";
@@ -2342,9 +2356,16 @@ void expectArchiveMemberBindsAnOperatorNamedLibrary(
     combined.push_back(*mainMod);
     combined.push_back((*pulled)[0]);
     DiagnosticReporter linkRep;
+    // D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT: the
+    // darwin exec document declares its ad-hoc code-signature identity as a
+    // FUNCTION of the artifact, and an emission that cannot name the file it
+    // produces is REFUSED with no fallback. The name is a FACT the driver
+    // supplies on every emission, never a knob, so a leg whose format declares
+    // no placeholder simply ignores it.
     auto image = linker::link(
         std::span<AssembledModule const>{combined.data(), combined.size()},
-        *s.target, *s.exec, linkRep);
+        *s.target, *s.exec, linkRep,
+        dss::ImageRequest{.artifactFileName = "archive_resolve_probe"});
     EXPECT_EQ(linkRep.errorCount(), 0u) << familyLabel << ": link must be clean";
     EXPECT_TRUE(image.ok()) << familyLabel;
 }

@@ -1,0 +1,28 @@
+{
+  "$comment": "D-LK-ELF-EMITS-NO-BUILD-ID-NOTE: the RUNTIME witness for the ELF image identity. The binary opens ITSELF (/proc/self/exe), walks its own section header table by NAME, finds `.note.gnu.build-id`, and validates the record it finds: SHT_NOTE + SHF_ALLOC, n_namesz 4, n_type NT_GNU_BUILD_ID (3), owner 'GNU\\0', a non-empty descriptor that is NOT all zero. Nothing is a compile-time constant -- every number is read back out of the file the linker wrote -- so removing the note, mis-sizing it, or leaving the descriptor unstamped each turns 42 into a DISTINCT non-42 code (1..16, listed in main.c). ELF ONLY, and the targets say so: /proc/self/exe is a Linux fact and the Mach-O identity is LC_UUID, which has its own witness. Both a NON-PIE exec and a PIE arm run, because they reach two DIFFERENT walkers (elf::encode's static ET_EXEC arm and encodeElfExecDynamic) from the same declaration -- one document with two behaviours is exactly what this pair refuses.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-pie",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true}
+  ]
+}

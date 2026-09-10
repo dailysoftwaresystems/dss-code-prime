@@ -184,13 +184,26 @@ inline constexpr std::uint8_t kLirInstFlagOutgoingArgsPlaced = 0x20;
 // same limit blocks every future vector operation and not just those 121
 // copies. The flags byte had two spare bits; this takes one.
 //
-// *** IT IS DECLARED, NOT STAMPED. No shipped lowering sets it yet: the FPR
-// class moves on both shipped targets (`movaps`, `fmov`) declare encoding
-// variants with NO width guard, so they elect correctly at any width and have
-// no reason to state one. The day a real 128-bit operation needs the width to
-// elect its variant, it says so and every width-comparing consumer -- the
-// peephole included -- starts agreeing with no edit, because they all compare
-// DECLARED vocabulary rather than special-casing a class.
+// *** IT IS NOW STAMPED, AND THE SENTENCE HERE THAT SAID OTHERWISE WENT STALE
+// WITHOUT MOVING. This block used to read *"No shipped lowering sets it yet"*,
+// which was true when it was written and false from
+// D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM onward: arm64's
+// SIMD&FP memory verbs gained width-128 variants (the deleted `fldur_q`/
+// `fstur_q` bytes) and `mir_to_lir`'s binary128 marshalling passes this flag
+// EXPLICITLY at six sites, because without it eight of the sixteen bytes would
+// move. ⚠ A CONSUMER MUST THEREFORE READ 128 AS A REAL ANSWER, not as an
+// unreachable arm.
+//
+// ⚠⚠ AND THE INFERENCE THAT SENTENCE INVITED IS THE ONE
+// D-LIR-COPY-COALESCING-ASKS-THE-REGISTERS-WIDTH-NOT-THE-VALUES CLOSED: because
+// the FPR class moves (`movaps`, `fmov`) declare variants with no width guard,
+// they elect correctly at any width and have no reason to STATE one -- so every
+// FP copy carries flags 0, which this file decodes as 64. A consumer comparing
+// that against a 16-byte register width concludes "narrower than its register"
+// about an instruction that is nothing of the kind. The width field answers
+// "which variant does this elect", never "how many bits of the destination
+// register does this write"; a consumer needing the second question must ask it
+// of the VALUE (`lirMaxStatedAccessWidthBits`), not of the register.
 inline constexpr std::uint8_t kLirInstFlagWidth128 = 0x40;
 
 // The instruction's operation width in bits, derived from its flags.
@@ -468,13 +481,34 @@ struct LirOperand {
     // `exhaust` (D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS): the arg-register
     // class lir_callconv exhausts after placing this stacked aggregate (0 none/backfill,
     // 1 GPR, 2 FPR) — SysV passes 0, AAPCS64 passes the straddling aggregate's class.
+    //
+    // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: `align` is the carried datum's OWN
+    // byte alignment, or 0 = NOT STATED. It rides `argNaturalBytes`, the padding
+    // byte a `Reg` operand uses for its natural size and which a `ByValueStackAgg`
+    // has always left at 0 — the same per-kind repurposing `byValueAggExhaust` and
+    // `spillSlotClass` already do, so `LirOperand` stays 8 bytes (asserted above).
+    // ⚠ 0 IS A REAL ANSWER, NOT A FAILURE: the cursor floors an unstated alignment
+    // at the slot, which is the classic flat stride, so a producer that cannot
+    // compute an alignment gets exactly the pre-existing placement rather than a
+    // guess. What it may NOT do is state a WRONG one — see
+    // `MirToLir::byValueCarrierAlignment`, which fails loud rather than guessing
+    // for a datum whose alignment it cannot derive AND whose CC would honour it.
     [[nodiscard]] static constexpr LirOperand
-    makeByValueStackAgg(std::uint32_t bytes, std::uint8_t exhaust = 0) noexcept {
+    makeByValueStackAgg(std::uint32_t bytes, std::uint8_t exhaust = 0,
+                        std::uint8_t align = 0) noexcept {
         LirOperand o{};
         o.kind             = LirOperandKind::ByValueStackAgg;
         o.byValueAggExhaust = exhaust;
+        o.argNaturalBytes  = align;
         o.byValueAggBytes  = bytes;
         return o;
+    }
+    // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the carried datum's own alignment
+    // (0 = not stated). Named so no walk reads `argNaturalBytes` off a marker and
+    // has to remember what that byte means on THIS kind.
+    [[nodiscard]] constexpr std::uint32_t byValueAggAlign() const noexcept {
+        return kind == LirOperandKind::ByValueStackAgg
+                   ? static_cast<std::uint32_t>(argNaturalBytes) : 0u;
     }
     // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a spilled register-passed call-arg
     // reference — its stack slot (`slotV` = LirSpillSlot.v) + its register class

@@ -340,29 +340,158 @@ TEST(LirCallconv, VlaLeafFunctionMaterializesFramePointerModel) {
         << "a VLA function must emit sp_copy (FP capture/restore)";
 }
 
-// D-CSUBSET-VLA-NONLEAF-CALL-FRAME (C1b LEAF gate): a VLA function that ALSO makes
-// a call FAILS LOUD — the non-leaf VLA frame model (outgoing args under a moved SP)
-// is not built. RED-ON-DISABLE: drop the leaf gate -> a non-leaf VLA silently emits
-// call args INSIDE the VLA region (an ABI break).
-TEST(LirCallconv, VlaNonLeafFunctionWithCallFailsLoud) {
+// ── D-CSUBSET-VLA-NONLEAF-CALL-FRAME: the non-leaf VLA frame model ─────────────
+//
+// ⚠ THIS PIN WAS DELIBERATELY INVERTED. It read `VlaNonLeafFunctionWithCallFailsLoud`
+// and asserted `EXPECT_FALSE(result.ok())` — the C1b LEAF gate. That gate is gone:
+// a VLA function may now make calls, with the outgoing-args area TRAVELLING WITH SP
+// at [SP+0..outgoingArgAreaSize) and every dynamic object lifted above it, so a
+// captured stack watermark means `SP + outgoingArgAreaSize`. The two sibling gates
+// (`usesVaStart`, `isSehParent`) below are UNCHANGED and still fail loud.
+//
+// The property under test is the BIAS, not merely that the pass succeeds: a pass
+// that succeeded and captured a bare SP would place the VLA object exactly on top of
+// the outgoing-args area — the silent stack miscompile the old gate existed to
+// prevent. `biasAfterWatermarkCapture` reads the immediate of the `add` the pass
+// emits after each body `sp_copy dst,SP`, so the assertion is on the emitted value.
+//
+// ✔The ORACLE for the number: mingw-w64 gcc 13.2.0 compiles the same shape to
+// `sub %rax,%rsp ; lea 0x50(%rsp),%rax` for a callee with six stacked arguments —
+// 0x50 == 32 (ms_x64 shadow) + 6*8, i.e. exactly `outgoingArgAreaSize`.
+
+// The immediates of every `add dst, imm` that IMMEDIATELY follows a body watermark
+// capture (`sp_copy dst, SP` with dst != SP) in the given output function. Empty
+// when the pass emitted no bias at all — which is the correct answer for a frame
+// whose outgoing-args area is zero-width.
+[[nodiscard]] inline std::vector<std::int64_t>
+biasAfterWatermarkCapture(Lir const& lir, TargetSchema const& schema,
+                          std::uint32_t funcIndex, std::uint16_t spOrdinal) {
+    std::vector<std::int64_t> out;
+    auto const spCopy = schema.opcodeByMnemonic("sp_copy");
+    auto const addOp  = schema.opcodeByMnemonic("add");
+    if (!spCopy.has_value() || !addOp.has_value()) return out;
+    LirFuncId const fn = lir.funcAt(funcIndex);
+    for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+        LirBlockId const blk = lir.funcBlockAt(fn, bi);
+        std::uint32_t const n = lir.blockInstCount(blk);
+        for (std::uint32_t i = 0; i + 1 < n; ++i) {
+            LirInstId const cap = lir.blockInstAt(blk, i);
+            if (lir.instOpcode(cap) != *spCopy) continue;
+            auto const capOps = lir.instOperands(cap);
+            LirReg const dst = lir.instResult(cap);
+            // A body watermark capture: reads SP, writes something else. The
+            // prologue's FP<-SP capture also matches (it is the fixed-frame base and
+            // is emitted by the pass itself, unbiased by construction) — the caller
+            // distinguishes by COUNT, since a leaf VLA has exactly that one.
+            if (capOps.empty() || capOps[0].kind != LirOperandKind::Reg
+                || capOps[0].reg.isPhysical == 0
+                || capOps[0].reg.id != spOrdinal) continue;
+            if (dst.isPhysical == 0 || dst.id == spOrdinal) continue;
+            LirInstId const nxt = lir.blockInstAt(blk, i + 1);
+            if (lir.instOpcode(nxt) != *addOp) continue;
+            auto const addOps = lir.instOperands(nxt);
+            if (addOps.size() < 2 || addOps[0].kind != LirOperandKind::Reg
+                || addOps[0].reg.id != dst.id
+                || addOps[1].kind != LirOperandKind::ImmInt) continue;
+            out.push_back(addOps[1].immInt32);
+        }
+    }
+    return out;
+}
+
+TEST(LirCallconv, VlaNonLeafFunctionWithCallBiasesTheWatermarkByTheOutgoingArea) {
+    // ccIndex=1 = ms_x64: shadowSpaceBytes=32, so this cc has a NON-ZERO outgoing
+    // area even for a register-only call — and the ten-parameter callee adds six
+    // stacked arguments on top, which is what exercises the frame-base verifier's
+    // outgoing-args escape (those stores are legitimately SP-relative).
     auto bundle = lowerThroughRewrite(
-        "int g(int x) { return x * 2; }\n"
-        "int f(int n) { int a[n]; return g(n) + a[0]; }\n");
+        "int g(int a,int b,int c,int d,int e,int f2,int g2,int h,int i,int j)"
+        " { return a+b+c+d+e+f2+g2+h+i+j; }\n"
+        "int f(int n) { int a[n];"
+        " return g(n,1,2,3,4,5,6,7,8,9) + a[0]; }\n",
+        /*ccIndex=*/1);
     ASSERT_TRUE(bundle.lowered.lir.ok);
     ASSERT_TRUE(bundle.rewritten.ok);
     DiagnosticReporter ccRep;
     auto result = materializeCallingConvention(bundle.rewritten.lir,
                                                *bundle.lowered.target,
                                                bundle.alloc, ccRep);
-    EXPECT_FALSE(result.ok())
-        << "a VLA function that makes a call must fail the callconv pass";
-    bool sawNonLeaf = false;
+    ASSERT_TRUE(result.ok())
+        << "a VLA function that makes a call must now materialize: "
+        << (ccRep.all().empty() ? "" : ccRep.all()[0].actual);
     for (auto const& d : ccRep.all()) {
-        if (d.code == DiagnosticCode::L_VlaNonLeafFrameUnsupported)
-            sawNonLeaf = true;
+        EXPECT_NE(d.code, DiagnosticCode::L_VlaNonLeafFrameUnsupported)
+            << "the non-leaf VLA gate must be gone, not re-worded";
     }
-    EXPECT_TRUE(sawNonLeaf)
-        << "a non-leaf VLA must surface L_VlaNonLeafFrameUnsupported";
+    auto const* cc = bundle.lowered.target->callingConvention(1);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_STREQ(cc->name.c_str(), "ms_x64");
+    ASSERT_TRUE(cc->stackPointer.has_value());
+
+    // Locate the VLA function in the OUTPUT by its surviving `sub_sp_reg`.
+    auto const subSpReg = bundle.lowered.target->opcodeByMnemonic("sub_sp_reg");
+    ASSERT_TRUE(subSpReg.has_value());
+    std::optional<std::uint32_t> vlaIndex;
+    for (std::uint32_t i = 0; i < result.lir.moduleFuncCount(); ++i) {
+        LirFuncId const fn = result.lir.funcAt(i);
+        for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const blk = result.lir.funcBlockAt(fn, bi);
+            for (std::uint32_t k = 0; k < result.lir.blockInstCount(blk); ++k) {
+                if (result.lir.instOpcode(result.lir.blockInstAt(blk, k))
+                    == *subSpReg) { vlaIndex = i; break; }
+            }
+        }
+    }
+    ASSERT_TRUE(vlaIndex.has_value()) << "the VLA function survived to the output";
+    FrameLayout const* layout = result.forFuncByIndex(*vlaIndex);
+    ASSERT_NE(layout, nullptr);
+    // The precondition the whole test rests on: this frame HAS an outgoing area.
+    // Without it the assertion below would be vacuously satisfiable by zero.
+    EXPECT_GE(layout->outgoingArgAreaSize, 32u)
+        << "ms_x64 reserves at least the 32-byte shadow space in a calling frame";
+
+    auto const biases = biasAfterWatermarkCapture(
+        result.lir, *bundle.lowered.target, *vlaIndex,
+        cc->stackPointer->ordinal);
+    // A VLA-declaring scope emits BOTH a scope-entry watermark (`StackSave`) and
+    // the VLA base capture, and under this model they mean the same thing — so the
+    // count is "at least one" and the load-bearing assertion is that EVERY one of
+    // them carries the SAME, exact bias. A capture the pass forgot shows up here as
+    // a missing entry, not as a wrong value.
+    ASSERT_FALSE(biases.empty())
+        << "the VLA base capture must be biased past the outgoing-args area";
+    for (std::int64_t const bias : biases) {
+        EXPECT_EQ(bias, static_cast<std::int64_t>(layout->outgoingArgAreaSize))
+            << "a captured stack watermark must sit exactly outgoingArgAreaSize "
+               "above SP — the placement mingw-w64 gcc emits for the same shape";
+    }
+}
+
+// The DIRECTIONAL control for the pin above (a fixture must synthesize the
+// NEGATIVE): a LEAF VLA has NO outgoing-args area, so its watermark capture must
+// carry NO bias and its emitted code must be byte-identical to before this frame
+// model existed. A bias applied unconditionally would place every leaf VLA object
+// somewhere other than the stack pointer it just moved.
+TEST(LirCallconv, VlaLeafFunctionWatermarkCarriesNoBias) {
+    auto bundle = lowerThroughRewrite("int f(int n) { int a[n]; return a[0]; }",
+                                      /*ccIndex=*/1);
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(result.perFunc.size(), 1u);
+    auto const* cc = bundle.lowered.target->callingConvention(1);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->stackPointer.has_value());
+    EXPECT_EQ(result.perFunc[0].outgoingArgAreaSize, 0u)
+        << "a leaf function reserves no outgoing-args area on any cc";
+    EXPECT_TRUE(biasAfterWatermarkCapture(result.lir, *bundle.lowered.target, 0,
+                                          cc->stackPointer->ordinal).empty())
+        << "a leaf VLA's captured base IS the moved stack pointer — biasing it "
+           "would move every leaf VLA object off its own allocation";
 }
 
 // D-CSUBSET-VLA-NONLEAF-CALL-FRAME (C1b LEAF gate, va-arm): a VLA function that ALSO
@@ -397,11 +526,17 @@ TEST(LirCallconv, VlaVariadicFunctionWithVaStartFailsLoud) {
 }
 
 // D-CSUBSET-VLA-WIN64-UNWIND (C1b): a VLA function that is a SEH PARENT (guards a
-// __try, so it emits `.pdata`/`.xdata` unwind info) FAILS LOUD — its runtime-moved
-// frame is not describable by the static unwind info, so an exception unwinding
-// through it (even from a trapping NON-CALL op, which leaves hasCalls=false) would
-// mis-walk the stack. Synthesize the SEH binding by naming the VLA function as a
-// __try parent in the sehFuncletParents span. RED-ON-DISABLE for the SEH gate.
+// __try, so it emits `.pdata`/`.xdata` unwind info) FAILS LOUD. ⚠ THE REASON WAS
+// RESTATED IN P59 AND THE OLD ONE WAS FALSE: this comment used to say the
+// runtime-moved frame "is not describable by the static unwind info". It is —
+// ✔MEASURED: the frame-pointer capture emits `UWOP_SET_FPREG` (frame register rbp,
+// offset 0) and a real Windows exception unwinds through such a frame correctly. What
+// is unproven is the SEH FUNCLET path for a parent that establishes a frame register:
+// a filter funclet reaches parent slots through the ESTABLISHER FRAME, which then
+// becomes the frame register rather than the post-prologue stack pointer. The gate
+// stands on THAT, and it still catches the trapping-NON-CALL case (hasCalls=false).
+// Synthesize the SEH binding by naming the VLA function as a __try parent in the
+// sehFuncletParents span. RED-ON-DISABLE for the SEH gate.
 TEST(LirCallconv, VlaSehParentFunctionFailsLoud) {
     // VLA function FIRST so it is the lower-indexed "parent" (the funclet-after-parent
     // module-order invariant the sehFuncletParents resolution assumes).

@@ -3,7 +3,7 @@
   "header": "errno.h",
   "standard": "posix",
   "availableObjectFormats": ["elf", "macho", "pe"],
-  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib", "pe": "ucrtbase.dll" },
+  "library": { "elf": { "role": "cLibrary" }, "macho": { "role": "cLibrary" }, "pe": { "role": "cLibrary" } },
   "symbols": [
     { "name": "__errno_location", "signature": "fn() -> ptr<i32>", "kind": "function", "linkage": "external", "availableObjectFormats": ["elf"] },
     { "name": "__error",          "signature": "fn() -> ptr<i32>", "kind": "function", "linkage": "external", "availableObjectFormats": ["macho"] },

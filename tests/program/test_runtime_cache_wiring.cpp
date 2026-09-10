@@ -149,8 +149,23 @@ struct Subject {
     std::string              formatKey;   // "pe" / "elf" / … — from the corpus
     std::string              target;
     std::string              format;
-    std::vector<std::string> units;       // config-root-relative sources
+    std::vector<std::string> units;       // DESCRIPTOR-declared, config-root-relative
+    // ★★ P54 lane `la` (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64): THE SECOND KIND OF
+    // DECLARER, KEPT AS A SEPARATE LIST RATHER THAN APPENDED TO `units`. An object
+    // format's `runtimeLibraries[].source` realizes a body for a role whose entry
+    // points the COMPILER MINTS, so there is no descriptor row to hang it off —
+    // and several cases below take `units.front()` and then look for the
+    // DESCRIPTOR that declares it. Folding the two lists together would hand those
+    // cases a unit no descriptor can declare (and `atomic.c` sorts BEFORE
+    // `dirent.c`, so it would land exactly on `front()`), turning a correct
+    // mechanism into a false red about the descriptor corpus. Only the arithmetic
+    // that counts what the DRIVER materialises needs the union — that is what
+    // `materialisedUnitCount()` is for, and it is the only place the two are added.
+    std::vector<std::string> formatUnits;
     [[nodiscard]] std::string spec() const { return target + ":" + format; }
+    [[nodiscard]] std::size_t materialisedUnitCount() const {
+        return units.size() + formatUnits.size();
+    }
 };
 
 // The FIRST realizing pair, over the real trees. First in a SORTED walk, so the
@@ -180,7 +195,9 @@ struct Subject {
                 DiagnosticReporter pairing;   // ordinary mismatch, not an event
                 if (!crossValidateTargetFormat(**target, **format, pairing))
                     continue;
-                return Subject{key, targetName, formatName, units};
+                return Subject{key, targetName, formatName, units,
+                               (*format)->runtimeLibraries()
+                                   .realizedSources()};
             }
         }
     }
@@ -403,9 +420,10 @@ TEST(RuntimeCacheWiring, AnUnchangedRebuildHitsAndDoesNotRecompileTheRuntime) {
     // each realized unit costs a 1-CU nested build, i.e. exactly two optimize
     // invocations, so a corpus of N units makes the cold build 2N dearer. A
     // wiring that silently compiled only SOME of them would land short here.
-    EXPECT_EQ(cold - warm1, 2u * subject->units.size())
+    EXPECT_EQ(cold - warm1, 2u * subject->materialisedUnitCount())
         << "a cold build cost " << (cold - warm1)
-        << " extra optimize invocation(s) over " << subject->units.size()
+        << " extra optimize invocation(s) over "
+        << subject->materialisedUnitCount()
         << " realized unit(s); two per unit is what one nested single-CU "
            "archive build costs, so a different number means the driver "
            "materialised a different set of units than the corpus declares";

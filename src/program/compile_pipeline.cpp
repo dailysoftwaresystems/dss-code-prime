@@ -12,16 +12,18 @@
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: BUILD half on a large stack
 #include "core/substrate/mint_monotonic_id.hpp"  // c165: fresh per-member CompilationUnitId (static pull)
 #include "core/types/config_path_walk.hpp"  // findShippedConfigDir -- the ONE shipped-config discovery precedence
+#include "core/types/object_format_kind.hpp"  // RuntimeLibraryRoleResolver (D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE)
 #include "core/substrate/phase_timers.hpp"      // c97: per-phase --time accumulation
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"  // encode-tier extern binder's scratch lattice
 #include "ffi/abi/abi_catalog.hpp"  // resolveAbi (encode-tier va_list shape, per active ABI)
-#include "ffi/binary_reader.hpp"  // readImports (encode-tier --resolve-library binder)
+#include "ffi/binary_reader.hpp"  // the FF1 reader vocabulary (BinaryReadError / ImportSurface). ⚠ NOT `readImports`: no --resolve-library input is read through the bare reader from here — the encode-tier binder calls ffi::readImportsForTargetFormat (ingest.hpp) so the format+architecture boundary check cannot be bypassed (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL)
 #include "ffi/binary_readers/ar_reader.hpp"  // c165: readArArchive (static-pull member index)
 #include "ffi/ingest.hpp"
 #include "ffi/mangling/c_mangle.hpp"  // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: applyCMangling
 #include "ffi/shipped_lib_descriptor.hpp"  // c162: collectShippedExternSymbolNames
-#include "core/types/symbol_attrs.hpp"  // isExternallyVisible (armap export filter, c163)
+#include "core/types/symbol_attrs.hpp"  // isExternallyVisible (dynamic-export questions)
+#include "link/format/object_symbol_names.hpp"  // hasExternalLinkage -- the ONE static-resolution predicate (armap + static pull)
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "link/format/ar.hpp"  // writeArArchive (D-LK-STATIC-ARCHIVE-WRITER, c163)
@@ -271,8 +273,54 @@ bool optimizeModule(Mir&                  mir,
         }
     }
     auto const optResult = ::dss::opt::optimize(
-        mir, target, interner, *effectivePipeline, reporter, externImports);
+        mir, target, interner, *effectivePipeline, reporter, externImports,
+        // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the driver's ONE resolution
+        // of the target's plain-`char` sign, relayed to `ConstFold`.
+        opts.charIsUnsigned,
+        // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: relayed to the
+        // Inlining leaf's gate rule 2 (its load-time half).
+        opts.preemptibleDefinitionBindings);
     return optResult.ok && tierClean(reporter, optEntry);
+}
+
+// ══ VERIFY THE POST-SYNTHESIS MODULE — ONE DEFINITION, BOTH DRIVER SEAMS ═════
+//
+// ★ THE HOLE THIS CLOSES, AND HOW IT WAS FOUND (UCRT-P4). TF-C112 advertised MIR
+// call-site signature checking as covering "wrong arity at every hand-built call
+// in every synthesis pass". MEASURED that it did not: a 3-parameter
+// `int main(int, char**, char**)` compiled rc=0 while the synthesized startup
+// called it with TWO arguments. The verifier's arity rule
+// (`I_CallSignatureMismatch`) is fully CAPABLE of catching that — it reads the
+// callee's FnSig straight off the `GlobalAddr`'s own type, needs no definition
+// and no symbol table — so the defect was pure COVERAGE: the last verify on the
+// single-CU path happened inside `optimizeModule` during the BUILD half, and
+// every synthesis pass ran afterwards, unverified.
+//
+// ★★ WHY IT IS A FUNCTION AND NOT A BLOCK AT EACH SEAM.
+// [[D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY]] is open precisely
+// because the two driver seams drifted into doing different things with the same
+// passes. Two hand-copied verify blocks are that drift's mechanism: each carries
+// its own message, its own pass list, and its own chance of being edited alone.
+// One definition makes "the two seams verify the same thing" true by
+// construction, and leaves exactly one thing for a test to police — the POSITION
+// of each call, which `SynthVerifySeamGuard` reads out of these two files.
+bool verifySynthesizedModule(Mir const&          mir,
+                             TypeInterner const& interner,
+                             DiagnosticReporter& reporter) {
+    MirVerifier verifier{mir, &interner};
+    if (verifier.verify(reporter)) return true;
+    // The verifier has already reported the specific broken invariant (with the
+    // offending instruction); this names the TIER.
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::I_VerifierFailure;
+    d.severity = DiagnosticSeverity::Error;
+    d.actual   = "the module failed MIR verification AFTER the synthesis passes "
+                 "(entry realization / threads shim / stdio shim / SEH funclet "
+                 "synthesis) — a synthesized body broke a structural, SSA or "
+                 "call-signature invariant. This is a compiler defect, never a "
+                 "program error.";
+    reporter.report(std::move(d));
+    return false;
 }
 
 // BUILD half (Cycle 24): semantic analysis → HIR → FFI synthesis → MIR → optimize for
@@ -317,6 +365,55 @@ std::optional<CuMirModule> buildCuMir(CompilationUnit const&        cu,
         });
 }
 
+// ★★ THE FRONT HALF OF THE FRONT HALF — semantic analysis + CST→HIR, and
+// NOTHING below HIR. This is literally `buildCuMirImpl`'s steps 1 and 2, moved
+// out because a SECOND caller now has to stop here: `--emit-hir` asks for the
+// HIR of a translation unit and must not run — must not even REQUIRE — FFI
+// resolution, MIR lowering, codegen or a link.
+//
+// ⚠ IT IS AN EXTRACTION, NOT A COPY, AND THAT IS THE POINT. A parallel
+// "just analyze and lower" path in the driver would become a SECOND OWNER of
+// the data-model / aggregate-layout / va-list-strategy threading below, and the
+// two would drift on the first target axis either one gained — a divergence
+// that shows up as HIR describing a different program from the one the compiler
+// compiles. There is ONE front end; a caller chooses where to STOP in it, never
+// which one to run.
+//
+// ★ IT TAKES A `DiagnosticBudget`, NOT A `CompileOptions`. The budget is the
+// only field of the options bag the front half reads; every other field
+// describes the lower half. Narrowing the parameter is what makes it impossible
+// for a future lower-half option to be silently ignored on this path — it
+// cannot be passed here at all.
+//
+// ⓘ NOT wrapped in `callOnLargeStack`: both callers already run on the deep
+// worker stack (`buildCuMir` wraps `buildCuMirImpl`; `buildCuHir` below wraps
+// this), and nesting a 64 MiB worker inside a 64 MiB worker buys nothing.
+static std::optional<CuHirModule> buildCuHirImpl(
+                                      CompilationUnit const&        cu,
+                                      GrammarSchema const&          grammar,
+                                      TargetSchema const&           target,
+                                      ObjectFormatSchema const&     format,
+                                      std::uint16_t                 callingConventionIndex,
+                                      DiagnosticBudget              diagBudget,
+                                      DiagnosticReporter&           reporter);
+
+std::optional<CuHirModule> buildCuHir(CompilationUnit const&        cu,
+                                      GrammarSchema const&          grammar,
+                                      TargetSchema const&           target,
+                                      ObjectFormatSchema const&     format,
+                                      std::uint16_t                 callingConventionIndex,
+                                      DiagnosticBudget              diagBudget,
+                                      DiagnosticReporter&           reporter) {
+    // D-PARSE-DEEP-FRONTEND-STACK: the same reserve and the same reason as
+    // `buildCuMir` — `analyze` and `lowerToHir` are the two stages that
+    // motivated it, and they are the two stages this function runs.
+    return substrate::callOnLargeStack(
+        substrate::kDeepRecursionStackBytes, [&] {
+            return buildCuHirImpl(cu, grammar, target, format,
+                                  callingConventionIndex, diagBudget, reporter);
+        });
+}
+
 static std::optional<CuMirModule> buildCuMirImpl(
                                       CompilationUnit const&        cu,
                                       GrammarSchema const&          grammar,
@@ -325,115 +422,30 @@ static std::optional<CuMirModule> buildCuMirImpl(
                                       std::uint16_t                 callingConventionIndex,
                                       DiagnosticReporter&           reporter,
                                       CompileOptions const&         opts) {
-    // Take a CU pointer matching `analyze()`'s shared_ptr signature.
-    // The CU is borrowed (caller owns); we re-wrap as a shared_ptr
-    // with a null deleter so `analyze`'s ref-counting contract is
-    // satisfied without taking ownership of the caller's CU.
-    // `analyze` only reads from the CU; the temporary shared_ptr
-    // owns nothing beyond the call.
-    auto borrowed = std::shared_ptr<CompilationUnit const>(
-        &cu, [](CompilationUnit const*) noexcept {});
-
-    // 1. Semantic analysis. `analyze` accumulates into the model's
-    //    OWN reporter; drain into the caller's so operator-visible
-    //    stderr sees the S_* family. Without this drain, a semantic
-    //    error (e.g. S_UndeclaredIdentifier) silently aborts the
-    //    pipeline with no diagnostic surfacing. (code-reviewer F1
-    //    fold + post-fold-1 architect: routed through the hoisted
-    //    `copyDiagnostics` helper to eliminate the inline-drain
-    //    duplicate.)
-    auto const semEntry = reporter.errorCount();
-    // FC3 c1: thread the FORMAT's declared data model (its REQUIRED
-    // `dataModel` field) into the per-(CU × target) analysis — the
-    // single source for every width-dependent resolution downstream
-    // (builtinTypes/typeSpecifiers `coreByDataModel`, the integer-
-    // literal ladder, descriptor `signatureByDataModel`). The HIR
-    // lowering reads the SAME value back off the SemanticModel.
-    // FC6 deferral-close: also thread the target's aggregate-layout params so a
-    // `sizeof` in an array-dimension const-expression (`int a[sizeof(T)]`) folds
-    // through the same `computeLayout` engine MIR uses — `nullopt` when the
-    // target declared no block (the fold then fails loud, never a wrong size).
-    // D-CSUBSET-BITFIELD-ABI-EXACT: overlay the FORMAT-resolved bit-field strategy
-    // onto the target's params (the strategy is OS/format-determined; the target
-    // supplies only the alignment rule). A `sizeof` over a bit-field struct in an
-    // array dimension then folds with the byte-ABI-exact layout.
-    auto const effectiveBfStrategy = effectiveBitFieldStrategy(target, format);
-    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: resolved beside the strategy and
-    // overlaid at the SAME three consumer sites, because the two axes are read by one
-    // packer and a site that got one without the other would lay out to a mixture of
-    // two ABIs.
+    // Steps 1 + 2 — semantic analysis and CST→HIR — are `buildCuHirImpl`; see
+    // its docblock for why they are their own function. Called through the
+    // un-wrapped Impl because `buildCuMir` already put this call on the deep
+    // worker stack.
+    auto front = buildCuHirImpl(cu, grammar, target, format,
+                                callingConventionIndex, opts.diagBudget, reporter);
+    if (!front) return std::nullopt;
+    SemanticModel&                    model           = front->model;
+    std::unique_ptr<CstToHirResult>&  hir             = front->hir;
+    std::optional<VaListLayout> const analyzeVaLayout = front->vaListLayout;
+    // The two FORMAT-resolved aggregate axes, read back from their ONE owner
+    // rather than carried across the seam: `buildCuHirImpl` calls the same two
+    // functions for the analysis-side overlay, and both are pure functions of
+    // (target, format), so a second call cannot disagree with the first.
+    auto const effectiveBfStrategy     = effectiveBitFieldStrategy(target, format);
     auto const effectiveUnnamedBfAlign =
         effectiveUnnamedBitFieldAlignment(target, format);
-    std::optional<AggregateLayoutParams> analyzeLayout;
-    if (target.aggregateLayoutLoaded()) {
-        analyzeLayout = target.aggregateLayout();
-        analyzeLayout->bitFieldStrategy = effectiveBfStrategy;
-        analyzeLayout->unnamedBitFieldAlignment = effectiveUnnamedBfAlign;
-    }
-    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-2): capture the RESOLVED CC's
-    // WHOLE `vaListLayout` block. Read from the SAME resolved CC the MirLoweringConfig
-    // reads its `vaListLayout` from (below); `nullopt` when the CC declares no
-    // variadic-callee ABI.
-    //
-    // TWO consumers, each taking the part it needs from this ONE lookup:
-    //   * the semantic `va_list`-type injection wants only `.strategy`, to size the `ap`
-    //     local per ABI (SysV __va_list_tag[1]=24B vs Win64 char*=8B). `nullopt` there ⇒
-    //     the SysV-family default, which is inert (a CC with no vaListLayout has no
-    //     variadic-callee surface at all).
-    //   * D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): `synthesizeStdioShim`, across the MIR/LIR
-    //     seam, needs the WHOLE block — `.variadicUsesOverflowBase` is what selects its
-    //     va leaf, and reading only `.strategy` there was a latent silent miscompile (see
-    //     `CuMirModule::vaListLayout`). Same resolved CC, resolved ONCE.
-    std::optional<VaListLayout> analyzeVaLayout;
-    if (auto const* cc = target.callingConvention(callingConventionIndex);
-        cc != nullptr && cc->vaListLayout.has_value()) {
-        analyzeVaLayout = *cc->vaListLayout;
-    }
-    std::optional<VaListStrategy> const analyzeVaStrategy =
-        analyzeVaLayout.has_value() ? std::optional<VaListStrategy>{analyzeVaLayout->strategy}
-                                    : std::nullopt;
-    // c97: sequential per-phase scoping via optional emplace — emplace
-    // destroys the prior Scope (closing its accumulation window) BEFORE
-    // opening the next, and any early return closes the live one.
+    // c97: sequential per-phase scoping via optional emplace — see the identical
+    // declaration in `buildCuHirImpl`, which owns the Semantic and LowerHir
+    // windows. This one owns every window from HIR→MIR down, and it is a
+    // SEPARATE optional rather than a threaded one because a Scope must not
+    // outlive the function whose phases it measures: `buildCuHirImpl` closes its
+    // last window (`phase.reset()`) before it returns, so the two never overlap.
     std::optional<substrate::PhaseTimers::Scope> phase;
-    phase.emplace(substrate::CompilePhase::Semantic);
-    auto model = analyze(
-        // D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE: the operator's
-        // budget, carried on `opts` from `rep` -- NOT `reporter.config()`, which
-        // is the relaxed per-target scratch.
-        std::move(borrowed), opts.diagBudget,
-        format.dataModel(), analyzeLayout, analyzeVaStrategy,
-        format.kind(),       // c8: the active object-format → per-target availability gate
-        target.name(),       // plan 25: the active arch → per-target shipped-struct variant selector
-        // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the format-resolved `long double`
-        // axis — drives the coreByLongDoubleFormat row overrides; None (wasm/
-        // spirv) leaves `long double` rows unrealized (loud on use).
-        effectiveLongDoubleFormat(target, format),
-        // ★ Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): THE ACTIVE TARGET.
-        // Without it `analyze` runs with `target == nullptr`, and its two
-        // target-dependent asm checks — `S_InlineAsmConstraintLetterUndeclared`
-        // (0xE065) and `S_InlineAsmClobberUnknown` (0xE068) — correctly decline
-        // to guess and DO NOT RUN. ✔MEASURED before this argument existed: a
-        // `"=Zq"` constraint and a `"notaregister"` clobber BOTH compiled to a
-        // clean `.o` at rc=0 through this very pipeline. A diagnostic that fires
-        // only in a unit test that passes its own schema is not a shipped
-        // diagnostic. `target` is the driver's own long-lived schema and
-        // outlives `model`, which is the lifetime the parameter requires.
-        &target);
-    phase.reset();
-    copyDiagnostics(model.diagnostics(), reporter);
-    if (model.hasErrors() || !tierClean(reporter, semEntry)) {
-        return std::nullopt;
-    }
-
-    // 2. CST → HIR.
-    auto const hirEntry = reporter.errorCount();
-    phase.emplace(substrate::CompilePhase::LowerHir);
-    auto hir = lowerToHir(model, reporter);
-    phase.reset();
-    if (!hir || !hir->ok || !tierClean(reporter, hirEntry)) {
-        return std::nullopt;
-    }
 
     // 2.5-pre. c162 (D-FF1-READER-CONSUMER) EAGER path validation: a
     //      `--resolve-library <path>` names a binary the build is pointed
@@ -983,6 +995,14 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // D-FFI-EXTERN-CALL-DISPATCH: capture the active format's extern-call
         // shape now (the LOWER half sees only this struct, not the format).
         format.externCallDispatch(),
+        // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55):
+        // and the narrowing of WHICH bindings that dispatch applies to,
+        // for the same reason.
+        format.indirectSlotBindings(),
+        // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: and WHICH of this
+        // artifact's OWN definitions its loader may replace, for the same
+        // reason — the LOWER half never sees the format.
+        format.preemptibleDefinitionBindings(),
         // D-LK-EXTERN-DATA-IMPORT (c117): capture the format's extern-DATA
         // binding model now, for the same reason (the LOWER half's MIR→LIR
         // GlobalAddr lowering selects got-indirect deref vs a direct lea).
@@ -1032,6 +1052,142 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // could not tell from a genuine declaration. Consulted only if a stdio recipe appears.
     cuMir.vaListLayout = analyzeVaLayout;
     return cuMir;
+}
+
+static std::optional<CuHirModule> buildCuHirImpl(
+                                      CompilationUnit const&        cu,
+                                      GrammarSchema const&          grammar,
+                                      TargetSchema const&           target,
+                                      ObjectFormatSchema const&     format,
+                                      std::uint16_t                 callingConventionIndex,
+                                      DiagnosticBudget              diagBudget,
+                                      DiagnosticReporter&           reporter) {
+    // Take a CU pointer matching `analyze()`'s shared_ptr signature.
+    // The CU is borrowed (caller owns); we re-wrap as a shared_ptr
+    // with a null deleter so `analyze`'s ref-counting contract is
+    // satisfied without taking ownership of the caller's CU.
+    // `analyze` only reads from the CU; the temporary shared_ptr
+    // owns nothing beyond the call.
+    auto borrowed = std::shared_ptr<CompilationUnit const>(
+        &cu, [](CompilationUnit const*) noexcept {});
+
+    // 1. Semantic analysis. `analyze` accumulates into the model's
+    //    OWN reporter; drain into the caller's so operator-visible
+    //    stderr sees the S_* family. Without this drain, a semantic
+    //    error (e.g. S_UndeclaredIdentifier) silently aborts the
+    //    pipeline with no diagnostic surfacing. (code-reviewer F1
+    //    fold + post-fold-1 architect: routed through the hoisted
+    //    `copyDiagnostics` helper to eliminate the inline-drain
+    //    duplicate.)
+    auto const semEntry = reporter.errorCount();
+    // FC3 c1: thread the FORMAT's declared data model (its REQUIRED
+    // `dataModel` field) into the per-(CU × target) analysis — the
+    // single source for every width-dependent resolution downstream
+    // (builtinTypes/typeSpecifiers `coreByDataModel`, the integer-
+    // literal ladder, descriptor `signatureByDataModel`). The HIR
+    // lowering reads the SAME value back off the SemanticModel.
+    // FC6 deferral-close: also thread the target's aggregate-layout params so a
+    // `sizeof` in an array-dimension const-expression (`int a[sizeof(T)]`) folds
+    // through the same `computeLayout` engine MIR uses — `nullopt` when the
+    // target declared no block (the fold then fails loud, never a wrong size).
+    // D-CSUBSET-BITFIELD-ABI-EXACT: overlay the FORMAT-resolved bit-field strategy
+    // onto the target's params (the strategy is OS/format-determined; the target
+    // supplies only the alignment rule). A `sizeof` over a bit-field struct in an
+    // array dimension then folds with the byte-ABI-exact layout.
+    auto const effectiveBfStrategy = effectiveBitFieldStrategy(target, format);
+    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: resolved beside the strategy and
+    // overlaid at the SAME three consumer sites, because the two axes are read by one
+    // packer and a site that got one without the other would lay out to a mixture of
+    // two ABIs.
+    auto const effectiveUnnamedBfAlign =
+        effectiveUnnamedBitFieldAlignment(target, format);
+    std::optional<AggregateLayoutParams> analyzeLayout;
+    if (target.aggregateLayoutLoaded()) {
+        analyzeLayout = target.aggregateLayout();
+        analyzeLayout->bitFieldStrategy = effectiveBfStrategy;
+        analyzeLayout->unnamedBitFieldAlignment = effectiveUnnamedBfAlign;
+    }
+    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-2): capture the RESOLVED CC's
+    // WHOLE `vaListLayout` block. Read from the SAME resolved CC the MirLoweringConfig
+    // reads its `vaListLayout` from (below); `nullopt` when the CC declares no
+    // variadic-callee ABI.
+    //
+    // TWO consumers, each taking the part it needs from this ONE lookup:
+    //   * the semantic `va_list`-type injection wants only `.strategy`, to size the `ap`
+    //     local per ABI (SysV __va_list_tag[1]=24B vs Win64 char*=8B). `nullopt` there ⇒
+    //     the SysV-family default, which is inert (a CC with no vaListLayout has no
+    //     variadic-callee surface at all).
+    //   * D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): `synthesizeStdioShim`, across the MIR/LIR
+    //     seam, needs the WHOLE block — `.variadicUsesOverflowBase` is what selects its
+    //     va leaf, and reading only `.strategy` there was a latent silent miscompile (see
+    //     `CuMirModule::vaListLayout`). Same resolved CC, resolved ONCE.
+    std::optional<VaListLayout> analyzeVaLayout;
+    if (auto const* cc = target.callingConvention(callingConventionIndex);
+        cc != nullptr && cc->vaListLayout.has_value()) {
+        analyzeVaLayout = *cc->vaListLayout;
+    }
+    std::optional<VaListStrategy> const analyzeVaStrategy =
+        analyzeVaLayout.has_value() ? std::optional<VaListStrategy>{analyzeVaLayout->strategy}
+                                    : std::nullopt;
+    // c97: sequential per-phase scoping via optional emplace — emplace
+    // destroys the prior Scope (closing its accumulation window) BEFORE
+    // opening the next, and any early return closes the live one.
+    std::optional<substrate::PhaseTimers::Scope> phase;
+    phase.emplace(substrate::CompilePhase::Semantic);
+    // D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: this
+    // producer BINDS imports, so it answers descriptor role entries — from the
+    // active format's own row, or its shipped flavour family's.
+    FormatRuntimeLibraryRoleResolver const roleResolver{format};
+    auto model = analyze(
+        // D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE: the operator's
+        // budget, carried on `opts` from `rep` -- NOT `reporter.config()`, which
+        // is the relaxed per-target scratch.
+        std::move(borrowed), diagBudget,
+        format.dataModel(), analyzeLayout, analyzeVaStrategy,
+        format.kind(),       // c8: the active object-format → per-target availability gate
+        target.name(),       // plan 25: the active arch → per-target shipped-struct variant selector
+        // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the format-resolved `long double`
+        // axis — drives the coreByLongDoubleFormat row overrides; None (wasm/
+        // spirv) leaves `long double` rows unrealized (loud on use).
+        effectiveLongDoubleFormat(target, format),
+        // ★ Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): THE ACTIVE TARGET.
+        // Without it `analyze` runs with `target == nullptr`, and its two
+        // target-dependent asm checks — `S_InlineAsmConstraintLetterUndeclared`
+        // (0xE065) and `S_InlineAsmClobberUnknown` (0xE068) — correctly decline
+        // to guess and DO NOT RUN. ✔MEASURED before this argument existed: a
+        // `"=Zq"` constraint and a `"notaregister"` clobber BOTH compiled to a
+        // clean `.o` at rc=0 through this very pipeline. A diagnostic that fires
+        // only in a unit test that passes its own schema is not a shipped
+        // diagnostic. `target` is the driver's own long-lived schema and
+        // outlives `model`, which is the lifetime the parameter requires.
+        &target,
+        // The standard deep-recursion reserve (the `0` sentinel) — spelled only
+        // because the resolver behind it is positional.
+        /*deepRecursionReserveBytes=*/0,
+        // Consulted during analysis only, never republished by the model, so a
+        // reference to a local outlives every read of it.
+        &roleResolver);
+    phase.reset();
+    copyDiagnostics(model.diagnostics(), reporter);
+    if (model.hasErrors() || !tierClean(reporter, semEntry)) {
+        return std::nullopt;
+    }
+
+    // 2. CST → HIR.
+    auto const hirEntry = reporter.errorCount();
+    phase.emplace(substrate::CompilePhase::LowerHir);
+    auto hir = lowerToHir(model, reporter);
+    phase.reset();
+    if (!hir || !hir->ok || !tierClean(reporter, hirEntry)) {
+        return std::nullopt;
+    }
+
+    // Both products of the front half, plus the ONE derived fact the lower half
+    // still needs from step 1 (`analyzeVaLayout` — resolved from the same CC the
+    // MIR lowering config reads, so resolving it twice could disagree).
+    return CuHirModule{.model        = std::move(model),
+                       .hir          = std::move(hir),
+                       .vaListLayout = analyzeVaLayout};
 }
 
 // LOWER half body (Cycle 25, Stage C): MIR → LIR → liveness → regalloc → rewrite →
@@ -1127,7 +1283,69 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          // this leg has no F128 softcall binding; an F128 softcall
                          // then fails loud). Resolved per-leg by each wrapper.
                          std::optional<std::string>                  wideFloatSoftcallLibrary,
+                         // D-CSUBSET-PACKED-ATOMIC-MEMBER: the active format's
+                         // atomics-runtime block, threaded into MIR→LIR exactly
+                         // like the F128 softcall library above (nullopt = this
+                         // format supplies none; an under-aligned `_Atomic`
+                         // access then refuses loud under a `traps` target and
+                         // keeps the native form under `losesAtomicity`).
+                         std::optional<AtomicsRuntime>               atomicsRuntime,
+                         // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT
+                         // (P55): the format's DECLARED narrowing of which
+                         // symbol bindings the `indirect-slot` dispatch reaches
+                         // through the import slot. Empty = unnarrowed (every
+                         // import). Threaded into MIR→LIR exactly like the
+                         // dispatch itself, and read there ONLY under it.
+                         std::vector<SymbolBinding>                  indirectSlotBindings,
+                         // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
+                         // the format's DECLARED set of definition bindings
+                         // this artifact's LOADER may replace with another
+                         // image's body. Empty = nothing is preemptible and
+                         // every module-internal call stays a direct branch.
+                         // Threaded into MIR→LIR exactly like the narrowing
+                         // above; the NAMES the routing needs are built from
+                         // `nameOf` right below, not threaded from the caller.
+                         std::vector<SymbolBinding>                  preemptibleDefinitionBindings,
                          DiagnosticReporter&                         reporter) {
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the on-binary names
+    // MIR→LIR needs to MINT a loader-resolved reference for a preemptible
+    // definition. Built HERE because this is where names live — `nameOf` is
+    // this function's own parameter, and the IRs deliberately stay numeric (the
+    // same reason `assembled.symbols` is built from `nameOf` below rather than
+    // threaded through MIR/LIR). Built ONLY when the format declared a
+    // preemptible binding, so every other leg pays one branch and no walk.
+    std::vector<DefinedSymbolName> definedSymbolNames;
+    if (!preemptibleDefinitionBindings.empty()) {
+        definedSymbolNames.reserve(mir.moduleFuncCount());
+        for (std::uint32_t fi = 0; fi < mir.moduleFuncCount(); ++fi) {
+            MirFuncId const fid = mir.funcAt(fi);
+            SymbolId const  sym = mir.funcSymbol(fid);
+            std::string     nm  = nameOf(sym);
+            // "" = a compiler-SYNTHESIZED symbol with no declared name (the
+            // same skip `appendSym` makes below, for the same reason): it is
+            // module-private by construction, never published, so no loader can
+            // preempt it and no name is needed.
+            if (nm.empty()) continue;
+            definedSymbolNames.push_back(
+                DefinedSymbolName{sym, std::move(nm)});
+        }
+        // ★★ THE ADDRESS HALF: module GLOBALS too. ✔MEASURED 2026-09-05 that
+        // gcc 13.3.0 and clang 18.1.3 materialize `&exported_data` inside a
+        // `.so` through the SAME `R_X86_64_GLOB_DAT` GOT slot they use for
+        // `&exported_function`, weak and strong global alike, with the `static`
+        // and `visibility("hidden")` siblings in the same object left a bare
+        // `lea` — so a data definition the loader can see is preemptible on
+        // exactly the terms a function definition is, and the reference minted
+        // for it is looked up by the same kind of name.
+        for (std::size_t gi = 0; gi < mir.moduleGlobalCount(); ++gi) {
+            MirGlobalId const gid = mir.globalAt(static_cast<std::uint32_t>(gi));
+            SymbolId const    sym = mir.globalSymbol(gid);
+            std::string       nm  = nameOf(sym);
+            if (nm.empty()) continue;   // synthesized: no loader name
+            definedSymbolNames.push_back(
+                DefinedSymbolName{sym, std::move(nm)});
+        }
+    }
     // 4. MIR → LIR (vreg-based). Extern imports propagate through.
     // D-FFI-EXTERN-CALL-DISPATCH: the active format's extern-call shape
     // selects the call-site opcode (indirect-slot → call_indirect_via_extern;
@@ -1147,7 +1365,24 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                           std::move(wideFloatSoftcallLibrary),
                           // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52):
                           // trailing param on lowerToLir (positional-safe).
-                          externAddrBinding);
+                          externAddrBinding,
+                          // D-CSUBSET-CHAR-SIGNEDNESS-LATENT-SUBSTRATE-SITES:
+                          // not threaded on this route (the frontend promotes
+                          // first) — stated rather than defaulted so the
+                          // positional slot below is visible.
+                          std::nullopt,
+                          // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's
+                          // atomics runtime.
+                          std::move(atomicsRuntime),
+                          // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT
+                          // (P55): the format's declared slot-binding
+                          // narrowing.
+                          std::move(indirectSlotBindings),
+                          // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
+                          // the format's declared preemptible-definition
+                          // bindings, and the names the routing mints with.
+                          std::move(preemptibleDefinitionBindings),
+                          std::move(definedSymbolNames));
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -1257,8 +1492,23 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // 8b. LIR PEEPHOLE (plan 22 OPT8) -- delete the register-to-register
     //     copies the allocator left redundant. See `lir_peephole.hpp` for
     //     why it runs HERE and not after callconv: callconv mints ZERO
-    //     additional identity copies (MEASURED 5575 at both stages over
-    //     `examples/c/**`) and its `perFuncCfi` is keyed BY `LirInstId`,
+    //     additional identity class moves, and its `perFuncCfi` is keyed BY
+    //     `LirInstId`,
+    //     ⚠ CORRECTED 2026-09-02 (P53,
+    //     D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT).
+    //     This repeated `lir_peephole.hpp`'s evidence verbatim -- "MEASURED
+    //     5575 at both stages" -- and that evidence could not support the
+    //     claim. post-rewrite and post-callconv were the only two dump stages
+    //     that existed, and THREE passes sit between them: 2addr synthesizes
+    //     class moves, the peephole DELETES members of exactly the counted
+    //     population, and callconv is the subject. An equal count across that
+    //     span is a NET, and a net of zero is equally consistent with the
+    //     peephole deleting N while callconv mints N. The CONCLUSION survives
+    //     -- re-measured per pass at the two boundaries that now exist,
+    //     callconv is +0 in every bucket on both targets -- but a figure is
+    //     quoted here no longer, because a count in a comment is a measurement
+    //     with no instrument attached. Re-derive it with the census the row
+    //     built.
     //     so a rebuild downstream of it would renumber every CFI row's
     //     subject -- an unwind table that loads clean and walks into the
     //     wrong frame.
@@ -1905,7 +2155,8 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::optional<SehPersonality> const& sehPersonality,
                      std::string_view                  formatName,
                      std::string_view                  wideFloatSoftcallLibrary,
-                     DiagnosticReporter&               reporter) {
+                     DiagnosticReporter&               reporter,
+                     std::optional<AtomicsRuntime> const& atomicsRuntime) {
     SemanticModel&       model   = cuMir.model;
     GrammarSchema const& grammar = *cuMir.grammar;
 
@@ -2013,53 +2264,6 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         return std::nullopt;  // recipe/helper-import/va-strategy mismatch — reported.
     }
 
-    // ══ VERIFY THE POST-SYNTHESIS MODULE (UCRT-P4) ═══════════════════════════
-    //
-    // ★ THE HOLE THIS CLOSES, AND HOW IT WAS FOUND. TF-C112 advertised MIR
-    // call-site signature checking as covering "wrong arity at every hand-built
-    // call in every synthesis pass". MEASURED that it did not: a 3-parameter
-    // `int main(int, char**, char**)` compiled rc=0 while the synthesized startup
-    // called it with TWO arguments. The verifier's arity rule
-    // (`I_CallSignatureMismatch`) is fully CAPABLE of catching that — it reads the
-    // callee's FnSig straight off the `GlobalAddr`'s own type, needs no definition
-    // and no symbol table — so the defect was pure COVERAGE: on the single-CU path
-    // the LAST verify happens inside `optimizeModule` during the BUILD half, and
-    // every synthesis pass runs afterwards in this LOWER half, unverified.
-    //
-    // ★ POSITION IS THE WHOLE DESIGN, and it MIRRORS THE MERGED PATH EXACTLY.
-    // On the N>1 path `program.cpp` runs `realizeEntryShape` → threads → stdio and
-    // THEN `optimizeModule`, whose verify covers all three; `synthesizeSehFunclets`
-    // runs after it and is uncovered there too. Placing this verify at the same
-    // point makes the two seams AGREE on what is verified instead of one silently
-    // checking less than the other (`D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY`).
-    //
-    // ⚠ IT DELIBERATELY PRECEDES `synthesizeSehFunclets`, AND THAT RESIDUE IS
-    // STATED, NOT HIDDEN. That pass RELAYOUTS parent blocks to make each `__try`
-    // body PC-contiguous and does not re-derive the StructCf markers the verifier
-    // compares (its three siblings all do, at their own sites). Verifying after it
-    // would therefore red on the marker equality and the layout-position rules for
-    // reasons that are the PASS's to fix, inside `src/mir/merge/`. Extending
-    // coverage over the SEH pass is its own change; what must not happen is this
-    // verify being dropped because that one is harder.
-    {
-        MirVerifier verifier{cuMir.mir, &model.lattice().interner()};
-        if (!verifier.verify(reporter)) {
-            // The verifier already reported the specific broken invariant (with the
-            // offending instruction); this names the TIER so the reader knows a
-            // SYNTHESIS pass produced it rather than the optimizer or the front end.
-            ParseDiagnostic d;
-            d.code     = DiagnosticCode::I_VerifierFailure;
-            d.severity = DiagnosticSeverity::Error;
-            d.actual   = "the module failed MIR verification AFTER the synthesis "
-                         "passes (entry realization / threads shim / stdio shim) — "
-                         "a synthesized body broke a structural, SSA or call-"
-                         "signature invariant. This is a compiler defect, never a "
-                         "program error.";
-            reporter.report(std::move(d));
-            return std::nullopt;
-        }
-    }
-
     // c116 (D-WIN64-SEH-FUNCLETS): synthesize the SEH filter funclets + record the
     // scope ranges (post-optimize; the CU is already optimized here). Trigger =
     // presence of SehTryBegin — a no-op fast-return for the overwhelming majority
@@ -2076,6 +2280,44 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                                sehScopes, reporter)) {
         return std::nullopt;  // unsupported SEH shape (c116b frontier) / no declared
                               // personality — fail-loud.
+    }
+
+    // ══ VERIFY THE POST-SYNTHESIS MODULE ═════════════════════════════════════
+    //
+    // ★ POSITION IS THE WHOLE DESIGN, and it MIRRORS THE MERGE PATH EXACTLY —
+    // `program.cpp` calls the SAME function at the SAME point relative to the
+    // SAME pass, so neither seam can silently verify less than the other
+    // ([[D-MIR-SYNTH-SHIM-SEAM-OPTIMIZE-PLACEMENT-ASYMMETRY]]). The coverage hole
+    // this closes is documented on `verifySynthesizedModule` itself.
+    //
+    // ⚠ IT USED TO PRECEDE `synthesizeSehFunclets`, AND THE CAVEAT THAT SAID SO
+    // IS REPLACED HERE BECAUSE IT WAS MEASURED FALSE — a stale caveat claiming a
+    // hole that does not exist is its own defect. It read: that pass relayouts
+    // parent blocks to make each `__try` body PC-contiguous "and does not
+    // re-derive the StructCf markers the verifier compares", so verifying behind
+    // it "would red on the marker equality and the layout-position rules".
+    // ✔MEASURED 2026-09-07 (cycle P63), landing this move with that re-derivation
+    // deliberately ABSENT: it does NOT red — `mir/test_mir_merge` and every
+    // `examples/c/seh_*` arm stayed green. `deriveStructCfMarkers` is a function
+    // of the CFG (predecessors, RPO, dominators, post-dominators) and the
+    // relayout REORDERS blocks without adding, removing or repointing one edge.
+    // The claim came from a grep — three sibling passes call
+    // `rederiveStructCfMarkers` and this one did not — that was never run.
+    //
+    // ⓘ The residue is not zero, it is NARROWER than the caveat said, and it is
+    // fixed where it belongs. Rules 4 and 5 of the derivation iterate in FUNCTION
+    // BLOCK ORDER with a first-claim-wins rule, so a block two CondBr heads would
+    // label differently IS order-sensitive; `synthesizeSehFunclets` now re-derives
+    // for exactly that case, and its own call site carries the measurement. This
+    // verify does not depend on that fix — the ordering constraint the row
+    // imposed on this change was measured false — but the fix is what keeps this
+    // verify from turning a latent marker desync into a compile refusal.
+    //
+    // What must NOT happen is this verify moving back in front of that pass
+    // because some future pass is harder to verify behind. `SynthVerifySeamGuard`
+    // reds if it does.
+    if (!verifySynthesizedModule(cuMir.mir, model.lattice().interner(), reporter)) {
+        return std::nullopt;  // the broken invariant + the tier are both reported.
     }
 
     // `nameOf`: SymbolId → the on-binary symbol name = the declared name run
@@ -2135,7 +2377,9 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         cuMir.externCallDispatch, cuMir.dataImportBinding,
         cuMir.externAddrBinding,
         cuMir.tlsAccess,
-        std::move(sehScopes), std::move(wideFloatSoftcallLibraryOpt), reporter);
+        std::move(sehScopes), std::move(wideFloatSoftcallLibraryOpt),
+        atomicsRuntime, cuMir.indirectSlotBindings,
+        cuMir.preemptibleDefinitionBindings, reporter);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -2176,7 +2420,14 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // merge path resolves it near **formatR, exactly as
                       // externCallDispatch is pre-resolved there).
                       std::optional<std::string> wideFloatSoftcallLibrary,
-                      DiagnosticReporter& reporter) {
+                      DiagnosticReporter& reporter,
+                      std::optional<AtomicsRuntime> atomicsRuntime,
+                      std::vector<SymbolBinding> indirectSlotBindings,
+                      // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
+                      // the format's declared preemptible-definition
+                      // bindings, pre-resolved one level up in program.cpp
+                      // (same shape as `indirectSlotBindings` above).
+                      std::vector<SymbolBinding> preemptibleDefinitionBindings) {
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
     // A synthesized / nameless merged symbol is absent from the map → "" → skipped
     // by the LK11a symbol-table populate (module-private), exactly as in the CU path.
@@ -2191,7 +2442,9 @@ lowerMergedToAssembly(MergedMirModule&    merged,
         dataModel, bitFieldStrategy, unnamedBitFieldAlignment,
         callingConventionIndex, cuId,
         externCallDispatch, dataImportBinding, externAddrBinding, tlsAccess,
-        std::move(sehScopes), std::move(wideFloatSoftcallLibrary), reporter);
+        std::move(sehScopes), std::move(wideFloatSoftcallLibrary),
+        std::move(atomicsRuntime), std::move(indirectSlotBindings),
+        std::move(preemptibleDefinitionBindings), reporter);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU
@@ -2206,7 +2459,22 @@ bool linkAndWrite(std::span<AssembledModule const> modules,
     // c97: link phase — resolution + byte emission + image write.
     substrate::PhaseTimers::Scope linkPhase{substrate::CompilePhase::Link};
     auto const linkEntry = reporter.errorCount();
-    auto image = linker::link(modules, target, format, reporter, request);
+    // ── D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ──
+    //
+    // THE ONE PLACE THAT HOLDS BOTH HALVES, which is why the identity is bound
+    // here. A format document may declare an identity string that is a FUNCTION
+    // of the artifact being produced (a Mach-O dylib's LC_ID_DYLIB install
+    // name); the DOCUMENT states the shape and only this frame knows the file
+    // being written. The schema cannot carry it: `ObjectFormatSchema` is
+    // move-only and the driver hands the same memoized instance to every
+    // artifact of a format in one build — precisely the artifacts that must
+    // differ — so it rides the per-emission request instead.
+    // ⓘ The archive path below passes `request` through unchanged: an `ar`
+    // member is a relocatable object with no image identity to bind.
+    ImageRequest emissionRequest = request;
+    emissionRequest.artifactFileName = outPath.filename().string();
+    auto image = linker::link(modules, target, format, reporter,
+                              emissionRequest);
     if (!image.ok() || !tierClean(reporter, linkEntry)) {
         return false;
     }
@@ -2317,6 +2585,11 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
     if (onBinaryNames.empty()) return out;
 
     auto const scheme = format.cSymbolDecoration().scheme;
+    // D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: this
+    // oracle's rows become `ExternImport.libraryPath`, so it answers descriptor
+    // role entries exactly as the C front half does — one resolver shape, one
+    // family answer, on every path a symbol reaches the linker by.
+    FormatRuntimeLibraryRoleResolver const roleResolver{format};
 
     // The oracle interns each row's declared signature, so it needs a lattice.
     // Neither of this file's on-binary-name producers has a `SemanticModel` (the
@@ -2415,7 +2688,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
         auto const realized = ffi::realizeShippedExternSymbols(
             forwardRequest, lattice.interner(), lattice.registry(), reporter,
             format.dataModel(), std::optional<std::string_view>{target.name()},
-            format.kind(), namedTypes);
+            format.kind(), namedTypes, &roleResolver);
         if (!realized.has_value()) return std::nullopt;   // corpus not located
         for (std::size_t i = 0; i < onBinaryNames.size(); ++i) {
             if (canonicalOf[i].empty()) continue;
@@ -2466,7 +2739,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
     auto const wholeCorpus = ffi::realizeShippedExternSymbols(
         everyName, lattice.interner(), lattice.registry(), reporter,
         format.dataModel(), std::optional<std::string_view>{target.name()},
-        format.kind(), namedTypes);
+        format.kind(), namedTypes, &roleResolver);
     if (!wholeCorpus.has_value()) return std::nullopt;   // corpus not located
 
     // on-binary name -> the row realizing to it. A SECOND row claiming one name
@@ -2938,9 +3211,24 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
 
     // Names already satisfied by a DEFINITION (every client module, then each
     // pulled member). A worklist name that is already defined is never pulled
-    // again. Only externally-visible definitions can satisfy a cross-module
-    // reference (the same filter the c163 armap writer applies), so Local defs
-    // are excluded.
+    // again. Only EXTERNAL-LINKAGE definitions can satisfy a cross-module
+    // reference (`hasExternalLinkage`, the same filter the c163 armap writer
+    // applies), so Local defs are excluded.
+    //
+    // ⚠ THIS PREDICATE AND THE ARMAP WRITER'S MUST MOVE TOGETHER, and the
+    // reason is not symmetry for its own sake —
+    // D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL. Both were
+    // `isExternallyVisible`, which folds VISIBILITY into a question about
+    // LINKAGE and so calls a `visibility("hidden")` non-static definition
+    // false. Fixing only the WRITER would have created a defect that did not
+    // exist before: a DSS-written archive would then index `vis_hidden`, so a
+    // client module that ALREADY defines `vis_hidden` would no longer suppress
+    // the pull (its own definition never entering `definedNames`) and the link
+    // would merge two definitions of one symbol. ✔MEASURED against gcc 13.3.0
+    // + binutils 2.42 and clang 18.1.3: a hidden definition inside an archive
+    // member DOES satisfy a cross-module reference (`gcc use.o libhid.a` links
+    // rc 0 and runs), which is the whole reason the writer indexes it — so the
+    // resolver must agree that it is satisfied.
     // ⚠ EVERY module in `clientModules`, not merely the compiled one -- see the
     // header's plural note
     // (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION). A
@@ -2950,8 +3238,7 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
     std::unordered_set<std::string> definedNames;
     for (auto const& clientModule : clientModules) {
         for (auto const& ms : clientModule.symbols) {
-            if (!ms.name.empty()
-                && isExternallyVisible(ms.binding, ms.visibility)) {
+            if (link::format::ObjectSymbolNames::hasExternalLinkage(ms)) {
                 definedNames.insert(ms.name);
             }
         }
@@ -3004,11 +3291,17 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
                                     archivePaths[ai], member.name, reporter);
         if (!member_mod) return std::nullopt;   // member-read fail-loud
 
-        // A pulled member's externally-visible definitions satisfy later
-        // worklist names; its OWN unresolved externs feed the next pass -- the
-        // transitive lazy-pull (a member referencing another member).
+        // A pulled member's EXTERNAL-LINKAGE definitions satisfy later worklist
+        // names; its OWN unresolved externs feed the next pass -- the
+        // transitive lazy-pull (a member referencing another member). Same
+        // predicate as the client scan above and as the armap writer, for the
+        // reason stated there
+        // (D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL): a member that
+        // defines a hidden non-static function HAS satisfied that name, and a
+        // resolver that disagreed with the index it just searched would pull a
+        // second member defining the same symbol.
         for (auto const& ms : member_mod->symbols) {
-            if (!ms.name.empty() && isExternallyVisible(ms.binding, ms.visibility)) {
+            if (link::format::ObjectSymbolNames::hasExternalLinkage(ms)) {
                 definedNames.insert(ms.name);
             }
         }
@@ -3406,9 +3699,35 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
     }
 
     // Link each module INDEPENDENTLY to its own `.o` bytes (a 1-element link,
-    // never the cross-CU merge) + collect its DEFINED externally-visible
-    // symbols for the armap (the same on-binary names the object writer put in
-    // the member's symbol table).
+    // never the cross-CU merge) + collect its DEFINED EXTERNAL-LINKAGE symbols
+    // for the armap (the same on-binary names the object writer put in the
+    // member's symbol table).
+    //
+    // ★★ THE FILTER MUST BE THE SAME ONE THE MEMBER OBJECT'S `.symtab` USED,
+    // AND FOR A WHILE IT WAS NOT — D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL.
+    // The member `.o` names its defined symbols through
+    // `ObjectSymbolNames::definedName`, gated by `hasExternalLinkage`; this
+    // index used `isExternallyVisible`, which additionally folds VISIBILITY in
+    // and therefore answers false for a `visibility("hidden")` non-static
+    // definition. The two disagreeing produces an archive that CONTRADICTS
+    // ITSELF: the member defines `vis_hidden` under its real name with
+    // STB_GLOBAL, and the index the foreign linker actually searches omits it,
+    // so `ld` reports "undefined reference to vis_hidden" for exactly the
+    // symbol the object provides. An armap is a STATIC-LINK resolution index,
+    // which is the `hasExternalLinkage` question; `isExternallyVisible` asks
+    // about DYNAMIC visibility and stays where that is what is being asked.
+    //
+    // ✔MEASURED 2026-09-05, each reference probed SEPARATELY, with CONTROLS in
+    // the SAME member object (a `static`, which must be ABSENT, and a plain
+    // extern-linkage function, which must be PRESENT — without them "hidden is
+    // indexed" is equally consistent with "this `ar` indexes everything"):
+    // gcc 13.3.0 + GNU ar/nm 2.42 at -O0 and -O2, and clang 18.1.3, ALL put
+    // `vis_hidden`, `vis_internal` AND `vis_protected` in the `.a`'s "/" armap
+    // while omitting the `static`; `gcc use.o libhid.a -o prog` then resolves
+    // `vis_hidden` from the archive, links rc 0 and RUNS to 42, whereas the
+    // CONTROL link that asks for the `static` name fails "undefined reference
+    // to `static_local'". So the reference behaviour is the widened set, on
+    // both toolchains, with the boundary held at Local.
     std::vector<link::format::ArMemberInput> members;
     members.reserve(modules.size());
     for (std::size_t i = 0; i < modules.size(); ++i) {
@@ -3424,7 +3743,7 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
         }
         std::vector<std::string> exported;
         for (ModuleSymbol const& ms : modules[i].symbols) {
-            if (isExternallyVisible(ms.binding, ms.visibility) && !ms.name.empty()) {
+            if (link::format::ObjectSymbolNames::hasExternalLinkage(ms)) {
                 exported.push_back(ms.name);
             }
         }
@@ -3497,7 +3816,10 @@ assembleUnit(CompilationUnit const&        cu,
     return lowerCuMirToAssembly(
         *cuMir, format.processArgs(), format.entryVerbs(),
         format.sehPersonality(), format.name(),
-        target.wideFloatSoftcallLibrary(format.kind()), reporter);
+        target.wideFloatSoftcallLibrary(format.kind()), reporter,
+        // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics runtime, read
+        // off the schema here exactly as `sehPersonality` above is.
+        format.atomicsRuntime());
 }
 
 namespace {

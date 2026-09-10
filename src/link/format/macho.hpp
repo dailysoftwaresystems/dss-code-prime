@@ -4,6 +4,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
+#include "link/image_request.hpp"      // ImageRequest — the per-EMISSION facts
 #include "link/object_format_schema.hpp"
 
 #include <cstdint>
@@ -44,10 +45,54 @@
 
 namespace dss::macho {
 
+// ── The ONE spelling of "does this image request a code signature?" ──
+//
+// D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM. A Mach-O image asks
+// for a signature through EITHER of two INDEPENDENT schema keys, and
+// they are alternatives rather than a pair:
+//
+//   * `image.codeSignatureSize` — the legacy placeholder reservation.
+//     N zero bytes at the tail of __LINKEDIT plus an LC_CODE_SIGNATURE
+//     pointing at them, awaiting a post-link fill.
+//   * `image.codeSignature` — the ad-hoc block. The walker BUILDS a
+//     real CodeDirectory + SuperBlob and DERIVES the reservation length
+//     from it (`adHocCodeSignatureSize`), so no hand-typed size is
+//     wanted alongside — `macho_backend`'s validate() refuses the pair.
+//
+// Every site that must know WHETHER a signature was requested therefore
+// has to read BOTH fields. Three sites once spelled that disjunction by
+// hand and two of them spelled it `codeSignatureSize != 0` alone, so a
+// format whose only request is the ad-hoc block slipped past both and
+// had its signature dropped on the static exec arm with NO diagnostic —
+// a build that reports success and a binary AMFI refuses at load. One
+// named predicate is the fix that a fourth site cannot be born wrong
+// against; hand-spelling the disjunction again is the defect returning.
+//
+// ⚠ THIS ANSWERS PRESENCE, NEVER FLAVOUR. `encodeExecDynamic` chooses
+// between the derived ad-hoc blob and the zero-filled placeholder at
+// `codeSigReserveSize` and at the fill, and both correctly test
+// `codeSignature.has_value()` ALONE. Routing those through this
+// predicate would make a legacy placeholder request try to build an
+// ad-hoc blob out of an absent block — a regression, not a tidy-up.
+[[nodiscard]] constexpr bool
+requestsCodeSignature(MachOImage const& im) noexcept {
+    return im.codeSignatureSize != 0 || im.codeSignature.has_value();
+}
+
+// ── D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ───────
+//
+// `request` carries the per-EMISSION facts the format document cannot state —
+// today the one that matters here is `artifactFileName`, which an MH_DYLIB
+// document's `image.installName` may name through the `${artifactFileName}`
+// placeholder. It DEFAULTS to `{}` so every existing direct caller compiles
+// unchanged; a caller that omits it while the schema's identity names the
+// artifact is REFUSED loud (`K_WalkerInputContractViolation`) rather than
+// given a fabricated identity — see `resolveArtifactIdentity`.
 [[nodiscard]] DSS_EXPORT std::vector<std::uint8_t>
 encode(AssembledModule const&    module,
        TargetSchema const&       targetSchema,
        ObjectFormatSchema const& objectFormatSchema,
-       DiagnosticReporter&       reporter);
+       DiagnosticReporter&       reporter,
+       ImageRequest const&       request = {});
 
 } // namespace dss::macho

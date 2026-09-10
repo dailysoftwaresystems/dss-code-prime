@@ -1,0 +1,36 @@
+{
+  "$comment": "C 6.7p2 (D-CSUBSET-DECL-QUALIFIER-BEFORE-STORAGE-CLASS, P65 + residue (2) of D-CSUBSET-DECL-GRAMMAR-LOW-RESIDUES): the declaration specifiers are an UNORDERED set, so a TYPE QUALIFIER may be written BEFORE the storage-class specifiers. Every declaration here writes the qualifier first — `const static int`, `volatile static int`, `const register int`, `const typedef int`, `static const inline`, `const auto` — each of which was `error[P_NoAlternativeMatched] … got 'static'` (or the equivalent) before this cycle, and each of which gcc 13.3.0 (-std=c2x), clang 18.1.3 (-std=c23) and MSVC 19.51.36252 accept and RUN, probed SEPARATELY one translation unit at a time. THE EXAMPLE TESTS MEANING, NOT PARSING: a leading qualifier lands in the declaration's specifier PREFIX (the subtree every positional consumer STRIPS) instead of in the type head, so each arm gates on a RUNTIME consequence — internal linkage, a real volatile load/store the release pipeline cannot fold, block-scope STATIC STORAGE DURATION proved by two calls returning 1 then 2, a working typedef alias, and a mutable pointer to const. exit = 42. RED-ON-DISABLE (REMOVE direction): delete \"headQualifier\" from the trailing {repeat} of `declSpecifiers` and from both alternatives of `localDeclSpecifiers` in c.lang.json — every declaration becomes a loud parse error and the example never links.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

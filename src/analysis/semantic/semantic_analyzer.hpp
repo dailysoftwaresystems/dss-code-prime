@@ -131,6 +131,23 @@ analyze(std::shared_ptr<CompilationUnit const> cu,
         // stack per nesting level), so they complete on a bounded reserve where
         // a would-be per-level RECURSION would overflow it (the deep-nest
         // regression pins do exactly this).
-        std::size_t deepRecursionReserveBytes = 0);
+        std::size_t deepRecursionReserveBytes = 0,
+        // D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE:
+        // who answers a shipped descriptor's `library` entry that names a
+        // runtime ROLE (`{"pe": {"role": "cLibrary"}}`) for the active format
+        // family. Threaded verbatim to the three ffi reads this tier performs
+        // (the `#include` path, the bare-prototype realization, the recipe
+        // companion surface) — the same question-answering shape as `target`
+        // above: this tier never learns which document answered.
+        //
+        // ⚠ `nullptr` (the default, and every direct-API / LSP / header-parser
+        // caller) means THIS CALLER BINDS NO IMPORT: a role entry is validated
+        // and recorded but yields no image — the same UNBOUND arm an omitted
+        // format key already states — and nothing downstream of a caller
+        // without a link ever reads that image. The driver ALWAYS passes one
+        // (`buildCuMir`), and with one in hand an unanswerable role REFUSES
+        // the read rather than binding a guess. Non-owning; must outlive the
+        // call (it is consulted only during analysis, never republished).
+        RuntimeLibraryRoleResolver const* roleResolver = nullptr);
 
 } // namespace dss

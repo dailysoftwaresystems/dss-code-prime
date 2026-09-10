@@ -1,0 +1,35 @@
+{
+  "$comment": "D-CSUBSET-ATOMIC-RMW: runtime witness for the C11/C23 §7.17.7 read-modify-write family across the legs, RUN on BOTH the baseline (debug) AND the `release` (shippedPipeline) arm. 21 distinct non-42 exits cover fetch_add/_sub/_or/_and/_xor (each checking BOTH the OLD value returned and the value left stored — returning `new` would still exit 42 on some arms alone), atomic_exchange, compare_exchange_strong in BOTH outcomes (including the failure path writing the OBSERVED value back through `expected`, the half a positional pass-through silently drops), compare_exchange_weak, and the explicit-order spellings. The family is a HIR→MIR composition over the already-shipped MirOpcode::AtomicCas — NO new MIR op, NO new mnemonic slot — so the two realizations it must agree across are x86-64 `lock cmpxchg` (one locked op) and arm64's REAL CFG LL/SC retry loop over ldaxr/stlxr. An x86-only witness would say nothing about the exclusive-pair path where D-LIR-LLSC-SPILL-EXCLUSION's hazard lives, which is why every leg runs. ANTI-FOLD: every object is a mutable global (runtime-opaque); the atomic ops carry hasSideEffects + opcodeClobbersMemory so the `release` arm proves the family survives Mem2Reg/CSE/LICM/DCE/Inlining un-elided (an elided RMW → a wrong exit). exit = 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

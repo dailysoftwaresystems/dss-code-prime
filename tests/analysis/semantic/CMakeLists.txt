@@ -247,3 +247,197 @@ dss_add_test(NAME analysis/semantic/test_generic_selection_constant_expression
              SOURCES test_generic_selection_constant_expression.cpp)
 target_include_directories(dss_analysis_semantic_test_generic_selection_constant_expression
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P62 lane ae: [[D-CSUBSET-ATTRIBUTE-ARG-CONSTANT-EXPRESSION]] — a KEYWORD-LED
+# constant expression as an attribute argument (`aligned(sizeof(T))`,
+# `aligned(_Alignof(T))`), the shape the shipped Xcode SDK's
+# OSAtomicDeprecated.h writes and `attrArgItem` could not match because `sizeof`
+# and `_Alignof` are KEYWORDS. Every pin asserts the STORED ALIGNMENT rather than
+# a clean parse, because "it stopped erroring" and "it works" are different
+# claims and only the second closes the row. It also owns the two halves an
+# example structurally cannot show: the un-foldable operand's LOUD refusal beside
+# its foldable control (an accepted-then-dropped alignment is a silent
+# miscompile), and the symmetry of the operator-expression residue in both
+# directions. Shares `semantic_test_fixture.hpp`, so it needs the tests/ include
+# root for the same reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_attribute_arg_const_expr
+             SOURCES test_attribute_arg_const_expr.cpp)
+target_include_directories(dss_analysis_semantic_test_attribute_arg_const_expr
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P65 [[D-CSUBSET-DECL-QUALIFIER-BEFORE-STORAGE-CLASS]]: a type qualifier written
+# BEFORE the storage-class specifiers (C 6.7p2 order-free declaration specifiers)
+# lands in the STRIPPED specifier prefix, so this file pins that it still MEANS
+# what the same token means one slot to the right -- the const verdict, the
+# volatile/_Atomic type skin, and the C 6.7.1p2 refusals in every order. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root.
+dss_add_test(NAME analysis/semantic/test_decl_specifier_order
+             SOURCES test_decl_specifier_order.cpp)
+target_include_directories(dss_analysis_semantic_test_decl_specifier_order
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P65 [[D-CSUBSET-BLOCK-SCOPE-STORAGE-CLASS-EXCLUSIVITY-UNSTATED]]: C23 6.7.2p2
+# at BLOCK scope and in a FOR-INIT -- the two declaration rows the file-scope
+# twin never covered, where DSS compiled eight specifier pairs that gcc, clang
+# and MSVC each refuse. Every refusal arm here is paired with a live ACCEPTANCE
+# twin, because the `auto` bullet ("may appear with all the others except
+# typedef") makes the tempting flat-group fix refuse programs a reference RUNS;
+# the axis that decides `auto` is 6.7.2p4's "if the type is to be inferred",
+# i.e. WHICH declaration row matched. Shares `semantic_test_fixture.hpp`, so it
+# needs the tests/ include root for the same reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_block_scope_storage_class_exclusivity
+             SOURCES test_block_scope_storage_class_exclusivity.cpp)
+target_include_directories(dss_analysis_semantic_test_block_scope_storage_class_exclusivity
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P65 lane `fs` -- FILE-SCOPE declaration DEFINEDNESS: what a file-scope
+# declaration DEFINES on the two axes where DSS sat below the reference union.
+# `extern int x = 0;` at file scope is a DEFINITION (C 6.9.2p1) that all three
+# references accept, while the same spelling at BLOCK scope stays a loud refusal
+# (C 6.7.11p5) that all three also make; and [[D-CSUBSET-AUTO-FILE-SCOPE]]'s
+# C23 6.7.9 inference now has a top-level rule, whose branch ORDER against the
+# unbounded file-scope declaration class is pinned here. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root for the same
+# reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_file_scope_declaration_definedness
+             SOURCES test_file_scope_declaration_definedness.cpp)
+target_include_directories(dss_analysis_semantic_test_file_scope_declaration_definedness
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P65 lane `sp` -- TWO SPECIFIER-**SET** QUESTIONS ON A FILE-SCOPE DECLARATION,
+# as distinct from the ORDER question its `test_decl_specifier_order` and
+# `test_file_scope_declaration_definedness` siblings own: which specifiers the
+# set may CONTAIN. `extern auto g = 1;` and `auto extern g = 1;` were refused
+# IDENTICALLY, so no reordering could reach them -- C23 6.7.2p2 admits `auto`
+# beside every storage-class specifier but `typedef`, and both working
+# references accept with -pedantic-errors clean. The `inline`-on-an-object half
+# is the paired DECIDED DIVERGENCE: gcc accepts and emits a BYTE-IDENTICAL
+# object, clang and MSVC refuse on point, so the loud refusal stays. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root for the same
+# reason its siblings do.
+dss_add_test(NAME analysis/semantic/test_specifier_set_extern_auto_and_inline_object
+             SOURCES test_specifier_set_extern_auto_and_inline_object.cpp)
+target_include_directories(dss_analysis_semantic_test_specifier_set_extern_auto_and_inline_object
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P66 lane `cf` -- ONE INFERRED DECLARATION, MANY DECLARATORS, ONE DEDUCED TYPE.
+# `auto a = 1, b = 2;` was refused `S_AutoRequiresSingleDeclarator` on a program
+# clang 18.1.3 compiles and RUNS; C23 states no such constraint (type inference
+# is 6.7.10, its declarator COUNT is J.2(78) undefined behaviour, and J.5.12
+# names the multi-declarator form a COMMON extension whose recommended semantics
+# per fn.164 are ISO/IEC 14882's: ONE deduced type for the whole declaration).
+# The count stopped being the constraint and the AGREEMENT became it. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root.
+dss_add_test(NAME analysis/semantic/test_auto_multi_declarator
+             SOURCES test_auto_multi_declarator.cpp)
+target_include_directories(dss_analysis_semantic_test_auto_multi_declarator
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P66 lane `cf` -- THE VARIADIC MARKER TERMINATES THE PARAMETER LIST
+# (C 6.7.6.3 / C23 6.7.7.4). `int f(int a, ..., int b);` compiled at rc 0 with
+# zero bytes on stderr, in the declaration, definition, function-pointer and
+# double-marker spellings, while gcc, clang and MSVC all three refuse every one
+# of them. The check is at `pass1Node`, keyed on the document's own
+# `fnSuffixParamsRule` / `variadicMarker`, because the list is reached by three
+# different resolvers and the function-pointer path reaches neither named one.
+# See the file header for the FIVE grammar shapes measured before settling on
+# the semantic tier. Shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_variadic_marker_position
+             SOURCES test_variadic_marker_position.cpp)
+target_include_directories(dss_analysis_semantic_test_variadic_marker_position
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P66 lane `ca` -- THE BARE-ELLIPSIS PARAMETER LIST (C23 6.7.7.1). `int f(...);`
+# was `P_NoAlternativeMatched … got '('` at 1:6 -- the list never opened --
+# while gcc 13.3.0 `-std=c2x` and clang 18.1.3 `-std=c23` both accept it
+# silently and RUN it (MSVC 19.51.36257 refuses, C2143). C23 gives
+# `parameter-type-list` three productions and DSS carried two; the third is a
+# function VARIADIC WITH ZERO NAMED PARAMETERS, and it pairs with the C23
+# one-argument `va_start(ap)`. The arms pin acceptance, the VARIADIC flag (via
+# S_ArgCountMismatch and its discriminating `(void)` control), and that neither
+# `int f(..., int b);` nor `int f(int a, ..., int b);` became legal. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root.
+dss_add_test(NAME analysis/semantic/test_bare_ellipsis_parameter_list
+             SOURCES test_bare_ellipsis_parameter_list.cpp)
+target_include_directories(dss_analysis_semantic_test_bare_ellipsis_parameter_list
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P66 lane `ca` -- THE LEADING C23 `[[…]]` SEQUENCE ON A STRUCT/UNION MEMBER
+# (C23 6.7.2.1). `struct S { [[maybe_unused]] int a; };` was
+# `P_NoAlternativeMatched … got '['` while gcc 13.3.0, clang 18.1.3 AND MSVC
+# 19.51.36257 all three accept it silently -- unanimous. The member prefix
+# carried `extensionRun`/`alignasSpec`/`attrSpec` and no `stdAttr` at all. The
+# arms pin acceptance in both composites, that a following specifier is still
+# HONOURED (`_Alignof == 16`, with its failing control), that the run REACHES
+# the attribute scan (S_UnknownAttribute, with its quiet control), and that the
+# orderings all three references refuse stay refused. Shares
+# `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_struct_member_leading_std_attribute
+             SOURCES test_struct_member_leading_std_attribute.cpp)
+target_include_directories(dss_analysis_semantic_test_struct_member_leading_std_attribute
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P66 lane `td` -- WHAT AN ATTRIBUTE RUN AT THE END OF THE DECLARATION
+# SPECIFIERS *CONFERS* (C23 6.7p9). `typedef int [[deprecated]] T; T x;` drew
+# S_DeprecatedSymbolUsed at the use of `T` -- a meaning NO reference confers
+# (gcc 13.3.0 ignores it with -Wattributes at rc 0, clang 18.1.3 and MSVC
+# 19.51.36257 refuse the declaration), while the GNU twin in the SAME slot is
+# HONOURED by gcc and clang. One slot, two spellings, two grains. The arms pin
+# the non-conferral, the GNU discriminating control, the three positions that
+# must keep conferring (leading, the trailing typedef run, the composite lead),
+# that the drop is ANNOUNCED rather than silent and not doubled, that the run is
+# still SCANNED (S_UnknownAttribute, with its quiet control), and the sibling
+# type-derived declarator position the same grain governs. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root.
+dss_add_test(NAME analysis/semantic/test_end_of_specifiers_attribute_conferral
+             SOURCES test_end_of_specifiers_attribute_conferral.cpp)
+target_include_directories(dss_analysis_semantic_test_end_of_specifiers_attribute_conferral
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P66 (lane `al`) [[D-C-A-GNU-ALIGNED-ATTRIBUTE-ON-A-TYPEDEF-IS-REFUSED-WHILE-BOTH-REFERENCES-HONOUR-IT]],
+# CLOSED: GNU `aligned(N)` on a typedef is ACCEPTED AND CONFERRED. The ISO
+# `alignas` spelling on the SAME position is the OPPOSITE verdict and is
+# [[D-CSUBSET-ALIGNAS-TYPEDEF-PARAM-PARSE]] (P58, likewise CLOSED — every
+# reference refuses it and DSS delivers that refusal); the two are pinned in one
+# file so a context-keyed "fix" cannot pass both.
+# ⓘ P66 (lane `ag`): this comment previously attributed the ISO refusal to the
+# GNU row it cites, which read as a live blocker on a row `al` had just closed —
+# `stale_refusal_citations_guard` found it, correctly, and the fix is to name the
+# row that actually governs each half rather than to soften the guard.
+# Shares `semantic_test_fixture.hpp`, so it needs the tests/ include root.
+dss_add_test(NAME analysis/semantic/test_gnu_aligned_typedef_conferral
+             SOURCES test_gnu_aligned_typedef_conferral.cpp)
+target_include_directories(dss_analysis_semantic_test_gnu_aligned_typedef_conferral
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# ★★ P66 (lane `ag`) — THE THREE REMAINING GNU `aligned` FORMS, closing
+# [[D-C-THREE-GNU-ALIGNED-ATTRIBUTE-FORMS-REMAIN-AND-THE-WEAKENING-ONE-IS-SILENT]]:
+# (1) a request WEAKER than natural LOWERS the alias (it was silently kept at
+# natural, an ABI divergence from every reference that implements the construct);
+# (2) a MID-LIST typedef declarator carries its own run and confers on ITSELF
+# ALONE; (3) the ZERO-ARGUMENT form is the TARGET's declared maximum useful
+# alignment, READ from `aggregateLayout.maxAlignment`. Three INDEPENDENT defects,
+# so three disjoint red sets — pinned in one file beside the controls that BOUND
+# each one (the whole-composite and per-member channels do NOT lower, and the
+# cross-clause fold is unmoved). Shares `semantic_test_fixture.hpp`.
+dss_add_test(NAME analysis/semantic/test_gnu_aligned_three_forms
+             SOURCES test_gnu_aligned_three_forms.cpp)
+target_include_directories(dss_analysis_semantic_test_gnu_aligned_three_forms
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# ★★★ P66 (lane `at`) — THE ADVERTISEMENT GUARD, the instrument half of
+# [[D-C-HAS-EXTENSION-CLAIMS-C-ATOMIC-WHILE-THE-GNU-ATOMIC-BUILTINS-DO-NOT-EXIST]].
+# DSS answered `__has_extension(c_atomic)` = 1 while the GNU `__atomic_*`
+# builtins did not exist, which made the entire real-world corpus unbuildable on
+# all five legs for SIX cycles — every one of them under a fully green unit
+# suite, because nothing in the suite consumed a header that ASKS DSS what it has
+# and then uses the answer. This file closes that blindness generally rather than
+# for `c_atomic`: it enumerates the advertised set out of the loaded schema and
+# requires a COMPILED witness for every member, with the ratchet running both
+# ways (an advertised feature with no witness is red; a witness for a retracted
+# feature is red). Shares `semantic_test_fixture.hpp`, so it needs the tests/
+# include root.
+dss_add_test(NAME analysis/semantic/test_advertised_capability_is_honoured
+             SOURCES test_advertised_capability_is_honoured.cpp)
+target_include_directories(dss_analysis_semantic_test_advertised_capability_is_honoured
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

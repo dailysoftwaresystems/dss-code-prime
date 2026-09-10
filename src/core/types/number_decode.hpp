@@ -7,9 +7,14 @@
 // rule is interpreted identically wherever a literal is evaluated.
 
 #include "core/types/number_style.hpp"
+#include "core/types/wide_float_value.hpp"   // WideFloatValue (the F80/F128 target-precision arm)
 
+#include <algorithm>
+#include <bit>
 #include <cctype>
 #include <cerrno>
+#include <cmath>      // std::fabs, HUGE_VAL (detecting strtod's OVERFLOW) and
+                      // std::copysign (normalizing it to a TRUE signed infinity)
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -62,6 +67,49 @@ digitValue(char c) noexcept {
     if (c >= 'a' && c <= 'z') return static_cast<std::uint64_t>(10 + (c - 'a'));
     if (c >= 'A' && c <= 'Z') return static_cast<std::uint64_t>(10 + (c - 'A'));
     return std::nullopt;
+}
+
+// ★★ D-C-DECODEFLOAT-TREATS-UNDERFLOW-AS-FATAL: did the `strtod` call that
+// produced `d`, and left `savedErrno` behind, OVERFLOW?
+//
+// ⚠ WHAT THIS PREDICATE IS FOR CHANGED UNDER IT, and the sentence that used to
+// stand here — "that is the ONE of `ERANGE`'s two meanings that is a refusal" —
+// is now FALSE. Neither meaning is a refusal since
+// D-C-FLOAT-LITERAL-OVERFLOW-REFUSED-INSTEAD-OF-YIELDING-INFINITY. The overflow
+// case is no longer SELECTED FOR REJECTION; it is selected for NORMALIZATION,
+// and the predicate is load-bearing for a reason the old framing hid:
+// C23 7.12¶6 makes `HUGE_VAL` a positive `double` constant, NOT necessarily an
+// infinity — only F.10¶2 pins it to one, and only on an IEC 60559
+// implementation. A host whose `strtod` reports overflow with a large FINITE
+// `HUGE_VAL` would otherwise hand back that finite value as though the source
+// had named it: a silent wrong answer, and the only one this direction can
+// produce. Knowing the call overflowed is what lets `decodeFloat` return a TRUE
+// signed infinity instead of whatever the libc happened to return.
+//
+// C23 7.24.1.5 hands the SAME errno to two OPPOSITE outcomes and separates them
+// by the RETURNED VALUE, never by the errno:
+//   ¶12 overflow  — "plus or minus HUGE_VAL … is returned", errno = ERANGE.
+//   ¶13 underflow — "a value whose magnitude is no greater than the smallest
+//                    normalized positive number in the return type".
+// So an errno read on its own cannot tell them apart, and reading it as a single
+// verdict is what refused every binary64 SUBNORMAL literal.
+//
+// ⚠ THE ERRNO IS THE WEAKER HALF OF THE PAIR AND MUST NOT BE THE DECIDING ONE.
+// ¶13 makes ERANGE-on-underflow IMPLEMENTATION-DEFINED, and that is not
+// theoretical: ✔MEASURED 2026-09-02 on ONE Windows host, two `strtod`
+// implementations disagreed about `1e-320` — mingw-w64 gcc 13.2.0's C `strtod`
+// left errno 0 while the same toolchain's C++ `std::strtod` set ERANGE (glibc
+// sets it too). Keying the verdict on the VALUE makes it a property of IEEE-754,
+// which every host agrees on, instead of a property of the host's libc.
+//
+// ⓘ `>= HUGE_VAL` rather than `std::isinf`: `HUGE_VAL` is what ¶12 names, and on
+// a hypothetical host where it is not infinity an `isinf` test would miss the
+// overflow entirely — which is precisely the host the normalization above
+// exists for. A NaN answers false to `>=`, so a `strtod("nan")` — which sets no
+// ERANGE anyway — is untouched.
+[[nodiscard]] inline bool
+strtodOverflowed(int savedErrno, double d) noexcept {
+    return savedErrno == ERANGE && std::fabs(d) >= HUGE_VAL;
 }
 
 // An integer literal's text after the ONE normalization every reader of one
@@ -141,6 +189,357 @@ normalizeIntegerLiteral(std::string_view text, NumberStyle const* ns) {
     }
     out.digits.erase(0, bestLen);
     return out;
+}
+
+// ★ THE ONE FLOAT-LITERAL BODY NORMALIZATION — strip ONE trailing declared float
+// suffix, then strip digit separators. Shared by `decodeFloat` (host `double` via
+// strtod) and `decodeFloatWide` (target-precision), so the two can never disagree
+// about WHICH CHARACTERS are the number: the integer side's
+// `normalizeIntegerLiteral` discipline, applied to the float side after
+// D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION gave it a second reader.
+[[nodiscard]] inline std::string
+floatLiteralBody(std::string_view text, NumberStyle const* ns) {
+    std::string_view body = text;
+    if (ns != nullptr) {
+        body = stripTrailingSuffix(body, ns->floatSuffixes);
+    }
+    std::string s;
+    s.reserve(body.size());
+    char const sep = (ns && ns->digitSeparator) ? *ns->digitSeparator : '\0';
+    for (char c : body) {
+        if (sep != '\0' && c == sep) continue;
+        s += c;
+    }
+    return s;
+}
+
+// ── D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION: the arbitrary-precision
+// substrate the TARGET-precision float decoder evaluates a literal in ──────────
+//
+// A float literal is an EXACT rational, and rounding it correctly at 64/113
+// significand bits means evaluating it exactly first. These are the smallest
+// magnitude primitives that permits: little-endian 64-bit limbs, always at least
+// one limb, no sign (the literal's sign is carried separately).
+//
+// ⚠ NOT `BitIntValue` and not `WideFloatValue`'s 256-bit register: both are
+// FIXED-WIDTH by design (a `_BitInt` has a declared width; the soft-float
+// register is exactly 256 bits with ≥143 guard bits). A decimal literal's
+// numerator and its power-of-ten denominator are unbounded — `1e-4000L` needs a
+// 13288-bit denominator — so the intermediate has to grow. The RESULT lands back
+// in `WideFloatValue`'s register the moment it is normalized, and every rounding
+// decision is taken there.
+using FloatMag = std::vector<std::uint64_t>;
+
+[[nodiscard]] inline int magBitLength(FloatMag const& m) noexcept {
+    for (std::size_t i = m.size(); i-- > 0;) {
+        if (m[i] != 0)
+            return static_cast<int>(i) * 64 + 64 - std::countl_zero(m[i]);
+    }
+    return 0;
+}
+[[nodiscard]] inline bool magIsZero(FloatMag const& m) noexcept {
+    for (std::uint64_t w : m) if (w != 0) return false;
+    return true;
+}
+[[nodiscard]] inline bool magGetBit(FloatMag const& m, int bit) noexcept {
+    if (bit < 0) return false;
+    std::size_t const w = static_cast<std::size_t>(bit) >> 6;
+    if (w >= m.size()) return false;
+    return ((m[w] >> (bit & 63)) & 1u) != 0;
+}
+// Any 1 bit strictly below `pos` — the sticky the round-to-nearest-even
+// decision needs when a normalization shifts bits off the bottom.
+[[nodiscard]] inline bool magAnyBitBelow(FloatMag const& m, int pos) noexcept {
+    if (pos <= 0) return false;
+    std::size_t const fullWords = static_cast<std::size_t>(pos) >> 6;
+    for (std::size_t i = 0; i < fullWords && i < m.size(); ++i) {
+        if (m[i] != 0) return true;
+    }
+    int const rem = pos & 63;
+    if (rem != 0 && fullWords < m.size()) {
+        std::uint64_t const mask = (std::uint64_t{1} << rem) - 1u;
+        if ((m[fullWords] & mask) != 0) return true;
+    }
+    return false;
+}
+// m = m·mul + add. The 64×64 → 128 product goes through 32-bit halves — the
+// `decodeBigInteger` / `BitIntValue::mul64` / `WideFloatValue::mul64` portability
+// discipline (no `__int128`, no `_umul128`).
+inline void magMulAddSmall(FloatMag& m, std::uint64_t mul, std::uint64_t add) {
+    std::uint64_t carry = add;
+    for (std::uint64_t& w : m) {
+        std::uint64_t const a  = w;
+        std::uint64_t const aL = a & 0xFFFFFFFFull,   aH = a >> 32;
+        std::uint64_t const bL = mul & 0xFFFFFFFFull, bH = mul >> 32;
+        std::uint64_t const ll = aL * bL, lh = aL * bH, hl = aH * bL, hh = aH * bH;
+        std::uint64_t const cross = (ll >> 32) + (lh & 0xFFFFFFFFull) + (hl & 0xFFFFFFFFull);
+        std::uint64_t const lo    = (ll & 0xFFFFFFFFull) | (cross << 32);
+        std::uint64_t       hi    = hh + (lh >> 32) + (hl >> 32) + (cross >> 32);
+        std::uint64_t const s     = lo + carry;
+        hi += (s < lo) ? 1u : 0u;
+        w     = s;
+        carry = hi;
+    }
+    if (carry != 0) m.push_back(carry);
+}
+// m <<= k, EXACTLY (the magnitude grows; nothing is ever shifted out).
+inline void magShiftLeft(FloatMag& m, int k) {
+    if (k <= 0) return;
+    std::size_t const ws  = static_cast<std::size_t>(k) >> 6;
+    int const         bs  = k & 63;
+    std::size_t const old = m.size();
+    m.resize(old + ws + 1, 0);
+    for (std::size_t i = m.size(); i-- > 0;) {
+        std::uint64_t const lo  = (i >= ws       && (i - ws)     < old) ? m[i - ws]     : 0u;
+        std::uint64_t const hiw = (i >= ws + 1u  && (i - ws - 1) < old) ? m[i - ws - 1] : 0u;
+        m[i] = (bs == 0) ? lo : ((lo << bs) | (hiw >> (64 - bs)));
+    }
+}
+[[nodiscard]] inline int magCompare(FloatMag const& a, FloatMag const& b) noexcept {
+    std::size_t const n = std::max(a.size(), b.size());
+    for (std::size_t i = n; i-- > 0;) {
+        std::uint64_t const av = (i < a.size()) ? a[i] : 0u;
+        std::uint64_t const bv = (i < b.size()) ? b[i] : 0u;
+        if (av != bv) return (av > bv) ? 1 : -1;
+    }
+    return 0;
+}
+inline void magSubFrom(FloatMag& a, FloatMag const& b) noexcept {   // a -= b (requires a >= b)
+    std::uint64_t borrow = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        std::uint64_t const bv = (i < b.size()) ? b[i] : 0u;
+        std::uint64_t const d1 = a[i] - bv;    std::uint64_t const b1 = (a[i] < bv) ? 1u : 0u;
+        std::uint64_t const d2 = d1 - borrow;  std::uint64_t const b2 = (d1 < borrow) ? 1u : 0u;
+        a[i] = d2; borrow = b1 + b2;
+    }
+}
+// Q = floor(N / D), R = N mod D. Bit-at-a-time from the top — `WideFloatValue::
+// div`'s shape (no host divide of a multi-word value, nothing to get wrong about
+// a normalization step). D must be nonzero; here it is always a power of ten.
+inline void magDivMod(FloatMag const& N, FloatMag const& D, FloatMag& Q, FloatMag& R) {
+    int const nb = magBitLength(N);
+    Q.assign(N.size() + 1, 0);
+    R.assign(D.size() + 1, 0);
+    for (int i = nb - 1; i >= 0; --i) {
+        std::uint64_t carry = magGetBit(N, i) ? 1u : 0u;     // R = (R << 1) | N[i]
+        for (std::uint64_t& w : R) {
+            std::uint64_t const nc = w >> 63;
+            w = (w << 1) | carry;
+            carry = nc;
+        }
+        if (magCompare(R, D) >= 0) {
+            magSubFrom(R, D);
+            Q[static_cast<std::size_t>(i) >> 6] |= (std::uint64_t{1} << (i & 63));
+        }
+    }
+}
+// The 256-bit window of `m` whose LOW bit is `lowBit`. A NEGATIVE `lowBit` reads
+// `m` as if it had been shifted LEFT by -lowBit (which is exact, since the window
+// then covers every bit m has). Written as 256 bit tests rather than a word-wise
+// funnel shift: it is called ONCE per literal, and a funnel shift with a signed,
+// possibly-negative distance is exactly where an off-by-one hides.
+inline void magExtract256(FloatMag const& m, int lowBit, std::uint64_t (&W)[4]) noexcept {
+    W[0] = W[1] = W[2] = W[3] = 0;
+    for (int b = 0; b < 256; ++b) {
+        if (magGetBit(m, lowBit + b)) W[b >> 6] |= (std::uint64_t{1} << (b & 63));
+    }
+}
+
+inline constexpr std::uint64_t kPow10[20] = {
+    1ull, 10ull, 100ull, 1000ull, 10000ull, 100000ull, 1000000ull, 10000000ull,
+    100000000ull, 1000000000ull, 10000000000ull, 100000000000ull,
+    1000000000000ull, 10000000000000ull, 100000000000000ull, 1000000000000000ull,
+    10000000000000000ull, 100000000000000000ull, 1000000000000000000ull,
+    10000000000000000000ull,
+};
+inline constexpr std::uint64_t kPow16[16] = {
+    1ull, 0x10ull, 0x100ull, 0x1000ull, 0x10000ull, 0x100000ull, 0x1000000ull,
+    0x10000000ull, 0x100000000ull, 0x1000000000ull, 0x10000000000ull,
+    0x100000000000ull, 0x1000000000000ull, 0x10000000000000ull,
+    0x100000000000000ull, 0x1000000000000000ull,
+};
+
+inline void magMulPow10(FloatMag& m, long long k) {
+    while (k >= 19) { magMulAddSmall(m, kPow10[19], 0); k -= 19; }
+    if (k > 0) magMulAddSmall(m, kPow10[static_cast<std::size_t>(k)], 0);
+}
+
+// The digit string as an exact magnitude. Chunked (19 decimal / 15 hex digits per
+// multiply-accumulate, the widest that stays inside a `std::uint64_t`) so a long
+// literal costs a bignum step per chunk rather than per digit. The digit MAP is
+// `digitValue`, shared with every other decoder in this header.
+[[nodiscard]] inline FloatMag digitsToMag(std::string_view digits, unsigned base) {
+    FloatMag m{0};
+    std::size_t const chunk = (base == 16) ? 15u : 19u;
+    for (std::size_t i = 0; i < digits.size();) {
+        std::size_t const take = std::min(chunk, digits.size() - i);
+        std::uint64_t acc = 0;
+        for (std::size_t j = 0; j < take; ++j) {
+            acc = acc * base + digitValue(digits[i + j]).value_or(0);
+        }
+        magMulAddSmall(m, (base == 16) ? kPow16[take] : kPow10[take], acc);
+        i += take;
+    }
+    return m;
+}
+
+// A floating constant's exact shape, as this header's own grammar reads it:
+//   decimal: digits(base 10) · 10^(exponent − pointShift)
+//   hex:     digits(base 16) · 2^(exponent − 4·pointShift)
+struct FloatLiteralParts {
+    bool        sign       = false;
+    bool        hex        = false;
+    std::string digits;                 // integer digits ∥ fraction digits
+    long long   pointShift = 0;         // how many of them followed the radix point
+    long long   exponent   = 0;         // the explicit e/E (decimal) or p/P (binary) exponent
+};
+
+// Parse EXACTLY the floating-constant grammar `std::strtod` accepts, and consume
+// the WHOLE body or fail. Matching strtod's shape is deliberate: `decodeFloat`'s
+// standing contract is that a body strtod cannot fully parse degrades LOUDLY
+// through ok=false, and the target-precision decoder must draw the accept/refuse
+// line in the same place — otherwise the `long double` axis would accept or
+// refuse literals the `double` axis does not, purely by which decoder ran.
+[[nodiscard]] inline bool
+parseFloatLiteralBody(std::string_view s, FloatLiteralParts& out) {
+    std::size_t i = 0;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) { out.sign = (s[i] == '-'); ++i; }
+    auto isDec = [](char c) { return c >= '0' && c <= '9'; };
+    auto isHex = [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    };
+    out.hex = (i + 1 < s.size() && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X'));
+    if (out.hex) i += 2;
+
+    std::size_t nDigits = 0;
+    bool seenPoint = false;
+    for (; i < s.size(); ++i) {
+        char const c = s[i];
+        if (c == '.') {
+            if (seenPoint) return false;
+            seenPoint = true;
+            continue;
+        }
+        if (out.hex ? isHex(c) : isDec(c)) {
+            out.digits += c;
+            ++nDigits;
+            if (seenPoint) ++out.pointShift;
+            continue;
+        }
+        break;
+    }
+    if (nDigits == 0) return false;      // "", ".", "0x", "0x." — no digits at all
+
+    // The exponent. Mandatory in ISO C's hex-float grammar, but strtod accepts a
+    // hex float without one (as 2^0), so this decoder does too — the accept/refuse
+    // line is strtod's, per the note above.
+    if (i < s.size()) {
+        char const e = s[i];
+        bool const marker = out.hex ? (e == 'p' || e == 'P') : (e == 'e' || e == 'E');
+        if (!marker) return false;       // a trailing character the grammar has no place for
+        ++i;
+        bool negExp = false;
+        if (i < s.size() && (s[i] == '+' || s[i] == '-')) { negExp = (s[i] == '-'); ++i; }
+        if (i >= s.size() || !isDec(s[i])) return false;   // marker with no digits
+        long long acc = 0;
+        for (; i < s.size() && isDec(s[i]); ++i) {
+            if (acc < 1'000'000'000LL) acc = acc * 10 + (s[i] - '0');   // saturating: the
+        }                                                              // magnitude band
+        out.exponent = negExp ? -acc : acc;                            // refuses either way
+    }
+    return i == s.size();
+}
+
+// Round the EXACT value `N · 2^scale2` (N a nonzero magnitude) to `kind`, ONCE,
+// through `WideFloatValue`'s round-to-nearest-even chokepoint. `ok` is set on a
+// value the target format can CARRY — every finite normal, and (since
+// D-C-FLOAT-LITERAL-OVERFLOW-REFUSED-INSTEAD-OF-YIELDING-INFINITY) the signed
+// infinity an overflow correctly rounds to. An underflow to subnormal still
+// leaves it false.
+//
+// ★ THE TWO DIRECTIONS ARE NOT SYMMETRIC AND ARE OWNED BY DIFFERENT ROWS.
+// OVERFLOW is this header's and is closed: `roundNormal` already RETURNS
+// `infinity(k, sign)` above `kMaxExp` — the value was being computed correctly
+// and then thrown away by an `isInfinity()` test here, which is why the fix is a
+// deletion. It also removes a contradiction inside one class: `WideFloatValue`'s
+// own header states "Overflow → infinity (IN scope)" for add/sub/mul/div, and
+// ✔MEASURED 2026-09-02 WITH THIS DISCARD STILL IN PLACE, `static const long
+// double v = 1e3000L * 1e3000L;` compiled and emitted the x87-80 +infinity
+// (`00 00 00 00 00 00 00 80 ff 7f`) while the LITERAL `1e5000L` was refused
+// `out of range / undecodable`. The fold reaches `roundNormal` directly; only
+// the literal was routed through the discard.
+//
+// ⚠ THE FIRST VERSION OF THAT MEASUREMENT USED `1e2000L * 1e2000L` AND WAS
+// WRONG — it is 1e4000, and x87-80 and binary128 both top out near 1.19e4932,
+// so nothing overflowed and the probe went red over correct behaviour. Recorded
+// because the same arithmetic slip would make `1e4000L` look like an overflow
+// in a future reader's head: it is FINITE on both wide axes and is pinned as
+// such in `LargeFiniteWideValuesAreUnmovedByTheOverflowChange`.
+// UNDERFLOW is NOT this header's: D-CSUBSET-LONG-DOUBLE-CONSTFOLD-SUBNORMAL-RESULT
+// carries the wide subnormal question for literals and fold RESULTS together —
+// `roundNormal` returns nullopt below `kMinExp` and the two must be decided in
+// one place, so nothing here touches it.
+//
+// ⚠ THE MAGNITUDE SHORT-CIRCUIT SPLITS FOR THE SAME REASON. It used to refuse
+// BOTH ends with one `return std::nullopt`; a pre-filter must not render a
+// verdict the real path would not, so the positive end now yields the same
+// infinity `roundNormal` would have and only the negative end still refuses.
+[[nodiscard]] inline std::optional<WideFloatValue>
+roundExactInteger(FloatMag const& N, long long scale2, TypeKind kind, bool sign, bool& ok) {
+    int const h = magBitLength(N);
+    if (h == 0) { ok = true; return WideFloatValue::zero(kind, sign); }
+    // Normalize the top 256 bits into the working register: bit 255 becomes N's
+    // leading bit, so value = (W / 2^255) · 2^(h − 1 + scale2).
+    int const  lowBit = h - 256;                              // negative ⇒ a left shift
+    bool const sticky = magAnyBitBelow(N, lowBit);
+    std::uint64_t W[4];
+    magExtract256(N, lowBit, W);
+    long long const expLL = static_cast<long long>(h) - 1 + scale2;
+    if (expLL > 100000) { ok = true; return WideFloatValue::infinity(kind, sign); }
+    if (expLL < -100000) return std::nullopt;   // underflow — the sibling row's
+    auto v = WideFloatValue::fromExactBinary(kind, sign,
+                                             static_cast<std::int32_t>(expLL), W, sticky);
+    if (!v.has_value()) return std::nullopt;    // subnormal result — the sibling row's
+    ok = true;
+    return v;                                   // an overflow arrives here as ±∞
+}
+
+// Round the EXACT value `M / 10^den10` (M nonzero, den10 > 0) to `kind`.
+//
+// ★ THE SCALE IS CHOSEN SO THE QUOTIENT IS ALWAYS 258 OR 259 BITS, which is the
+// whole trick: 256 bits fill the working register and the two or three below it
+// fall into the sticky, so no rounding-deciding bit can be lost before
+// `fromExactBinary` sees it — and the division REMAINDER is folded in as well, so
+// a decimal that merely LOOKS like a tie at 256 bits is correctly known not to be
+// one. Everything is exact up to that single rounding.
+[[nodiscard]] inline std::optional<WideFloatValue>
+roundExactQuotient(FloatMag const& M, long long den10, TypeKind kind, bool sign, bool& ok) {
+    FloatMag den{1};
+    magMulPow10(den, den10);
+    int const bm = magBitLength(M), bd = magBitLength(den);
+    long long const s = 258LL + bd - bm;
+    FloatMag N = M, D = den;
+    if (s >= 0) magShiftLeft(N, static_cast<int>(s));
+    else        magShiftLeft(D, static_cast<int>(-s));
+    FloatMag Q, R;
+    magDivMod(N, D, Q, R);
+    int const h = magBitLength(Q);
+    if (h < 256) return std::nullopt;      // unreachable by construction — fail loud, not round
+    int const  lowBit = h - 256;
+    bool const sticky = magAnyBitBelow(Q, lowBit) || !magIsZero(R);
+    std::uint64_t W[4];
+    magExtract256(Q, lowBit, W);
+    long long const expLL = static_cast<long long>(h) - 1 - s;
+    // The same overflow/underflow split as `roundExactInteger` — and reachable
+    // here too: a quotient overflows whenever the digit string itself carries the
+    // magnitude, e.g. `1e4940L` spelled with a fractional part.
+    if (expLL > 100000) { ok = true; return WideFloatValue::infinity(kind, sign); }
+    if (expLL < -100000) return std::nullopt;   // underflow — the sibling row's
+    auto v = WideFloatValue::fromExactBinary(kind, sign,
+                                             static_cast<std::int32_t>(expLL), W, sticky);
+    if (!v.has_value()) return std::nullopt;    // subnormal result — the sibling row's
+    ok = true;
+    return v;                                   // an overflow arrives here as ±∞
 }
 
 }  // namespace detail
@@ -291,31 +690,496 @@ decodeBigInteger(std::string_view text, NumberStyle const* ns) {
 // strip-anywhere behavior turns `FloatHexMantissaFDigitIsNotStripped`
 // red at 8.0 ≠ 15.5.)
 //
-// `ok` reports whether strtod consumed the WHOLE body in-range (audit
-// fold, FC1c2: prefix-consumption is not enough — a non-strtod-shaped
-// exotic config like `1.5^3` would otherwise return 1.5 with the
-// `^3` silently dropped, a truncated value masquerading as success).
+// `ok` reports whether strtod consumed the WHOLE body (audit fold,
+// FC1c2: prefix-consumption is not enough — a non-strtod-shaped exotic
+// config like `1.5^3` would otherwise return 1.5 with the `^3`
+// silently dropped, a truncated value masquerading as success).
 // The caller owns the diagnostic: any config whose token text strtod
 // cannot FULLY parse degrades LOUDLY through ok=false — never a
 // silent zero, never a silently truncated value.
+//
+// ⚠ IT NO LONGER REPORTS ANYTHING ABOUT RANGE, and this sentence used to say
+// "consumed the WHOLE body IN-RANGE". Both range verdicts have since moved out
+// of `ok`: D-C-DECODEFLOAT-TREATS-UNDERFLOW-AS-FATAL took underflow, and
+// D-C-FLOAT-LITERAL-OVERFLOW-REFUSED-INSTEAD-OF-YIELDING-INFINITY took overflow.
+// On this door `ok` is now purely a GRAMMAR verdict.
+//
+// ★★ D-C-DECODEFLOAT-TREATS-UNDERFLOW-AS-FATAL. This used to end
+// `&& errno != ERANGE`, which read ONE errno as ONE verdict and so refused
+// UNDERFLOW alongside OVERFLOW. An underflowed decimal is not an error at all:
+// it is an ordinary representable binary64 value (a subnormal, or a signed zero
+// once it falls below half the smallest subnormal), and the
+// `detail::strtodOverflowed` predicate above separates the two exactly as
+// C23 7.24.1.5 does — by the returned VALUE. ✔MEASURED 2026-09-02 that this was a real refusal of
+// correct programs: `static const double v = 1e-320;` failed with
+// `error[H_UnsupportedLoweringForKind]: literal '1e-320' is out of range /
+// undecodable`, while gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC
+// 19.51.36252 all accept it and emit the SAME eight bytes, `e8 07 00 00 00 00
+// 00 00` — MSVC without even a warning at /W4.
+//
+// ★★ D-C-FLOAT-LITERAL-OVERFLOW-REFUSED-INSTEAD-OF-YIELDING-INFINITY. The
+// OTHER half of the same errno, closed one cycle-slice later. This used to end
+// `&& !detail::strtodOverflowed(...)`, so a literal too large for binary64 was
+// a hard compile error: `static const double v = 1e400;` failed with
+// `error[H_UnsupportedLoweringForKind]: literal '1e400' is out of range /
+// undecodable` (✔MEASURED 2026-09-02 at x86_64:pe64-x86_64-windows-exec), and
+// so did `1e309`, `0x1p+99999`, and `1.7976931348623159e308` — one ulp past
+// DBL_MAX.
+//
+// ★ THE STANDARD DOES NOT ASK FOR THAT REFUSAL. C23 5.2.5.3.3¶19 and Annex
+// F.2.2¶1 extend a type's representable RANGE to every real number once the
+// type's infinities are representable, so on an IEC 60559 implementation
+// `1e400` is not out of range and is not a constraint violation: it is a value
+// whose correctly-rounded result is +∞, exactly as 0.1's is 0x3FB999999999999A.
+// Rounding a literal to the nearest representable value is what this decoder
+// does for EVERY literal; infinity is simply the nearest one here.
+//
+// ✔MEASURED 2026-09-02, each reference probed SEPARATELY, and they SPLIT
+// 3–1 on ACCEPTANCE: gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 all
+// accept `1e400` (warning `-Woverflow` / `-Wliteral-range`) and emit
+// `7ff0000000000000` — the same eight bytes on all three; MSVC 19.51.36252
+// refuses it (`error C2177: constant too big`). An accept-vs-refuse split is
+// exactly what the DISJUNCTION governs, and one working reference makes the
+// behaviour REQUIRED, so DSS accepts. `-1e400` → `fff0000000000000`,
+// `1e40f` → `7f800000`, `0x1p+99999` → `7ff0000000000000`, all three
+// references agreeing byte-for-byte.
+//
+// ★★ AND THE REFUSAL WAS NEVER EVEN CONSISTENT WITH DSS'S OWN F32 DOOR.
+// ✔MEASURED 2026-09-02: `static const float v = 1e40f;` COMPILED before this
+// change and emitted `7f800000` — a silent, correct +∞ — because `1e40` is a
+// perfectly ordinary `double` here and the overflow happens later, in the F32
+// narrowing (`hir_to_mir`, the `TypeKind::F32` round-trip). So DSS already
+// produced the reference bytes for a `float` literal that overflows `float`,
+// while refusing the identical question one type up. This change does not
+// introduce accept-and-produce-infinity; it removes the inconsistency.
+//
+// ⚠ WHAT FAIL-LOUD STILL MEANS HERE, because the word is doing real work. The
+// loud refusals are unchanged and all three are about NOT KNOWING the answer,
+// never about disliking it: a body `strtod` cannot FULLY consume (`1.5^3`),
+// an empty body, and — on the wide sibling — a literal with more significant
+// digits than the exact kernel will decide (`kMaxSignificantDigits`). None of
+// those has a correctly-rounded value to return. An overflow does.
+//
+// ⚠ THIS BLOCK USED TO END "ⓘ NO WARNING IS RAISED, and that is a decision, not
+// an omission", listing three reasons. THE OPERATOR OVERRULED THAT DECISION and
+// the warning now exists as `S_FloatLiteralOverflowsToInfinity` — see its entry
+// in `parse_diagnostic.hpp` for the four-reference DEFAULT/STRICT measurement
+// that settled it, of which the decisive half is that NOT ONE reference accepts
+// an overflowing float literal silently (three warn, MSVC refuses), so silence
+// was the one posture no member of the union takes.
+//
+// ⓘ THE THREE REASONS WERE NOT WRONG; TWO OF THEM ARE ANSWERED HERE AND ONE
+// STANDS. (1) The span problem is answered structurally rather than by giving
+// this decoder a location: the decode REPORTS the range event in its returned
+// VALUE (an infinity, which no float literal can spell) and the SEMANTIC tier,
+// which owns the token's span, raises the diagnostic — see
+// `decodeFloatLiteralAtKind` at the bottom of this header. This decoder stays a
+// pure function with an unchanged signature, and the descriptor reader in
+// `shipped_lib_descriptor.cpp` therefore cannot emit a source diagnostic because
+// it has no span to emit one with, not because it remembers not to. (2) A new
+// code was minted, in the S band, beside the integer sibling. (3) STANDS AND IS
+// NOW DOCUMENTED RATHER THAN AVOIDED: `--warnings-as-errors` does promote this
+// to an Error and does restore the refusal behind that flag — which is exactly
+// what `-Werror` does on gcc and clang, and what MSVC does unconditionally.
+//
+// ⓘ THE UNDERFLOW HALF DELIBERATELY STAYS SILENT, and it is not an oversight
+// carried over: ✔MEASURED that MSVC 19.51.36252 accepts `1e-330` SILENTLY at
+// `/W4 /WX` while gcc/clang/mingw warn, so unlike the overflow case a silent
+// accept IS a reference posture. `S_FloatLiteralOverflowsToInfinity`'s comment
+// carries the full argument.
 [[nodiscard]] inline double
 decodeFloat(std::string_view text, NumberStyle const* ns, bool& ok) {
-    std::string_view body = text;
-    if (ns != nullptr) {
-        body = detail::stripTrailingSuffix(body, ns->floatSuffixes);
-    }
-    std::string s;
-    s.reserve(body.size());
-    char const sep = (ns && ns->digitSeparator) ? *ns->digitSeparator : '\0';
-    for (char c : body) {
-        if (sep != '\0' && c == sep) continue;
-        s += c;
-    }
+    std::string const s = detail::floatLiteralBody(text, ns);
     errno = 0;
     char* end = nullptr;
-    double const d = std::strtod(s.c_str(), &end);
-    ok = (end == s.c_str() + s.size()) && !s.empty() && errno != ERANGE;
+    double d = std::strtod(s.c_str(), &end);
+    int const savedErrno = errno;
+    ok = (end == s.c_str() + s.size()) && !s.empty();
+    if (ok && detail::strtodOverflowed(savedErrno, d)) {
+        d = std::copysign(std::numeric_limits<double>::infinity(), d);
+    }
     return d;
+}
+
+// ★★ THE TARGET FLOAT WIDTHS, AND THE NARROWING TO ONE OF THEM.
+//
+// MOVED HERE from `hir/const_eval_arith.hpp` (P54 lane `fw`). They answer "what
+// is this value at the target's float width", which is the second half of the
+// question the decoders above answer the first half of — and while they lived
+// under `hir/` no core caller could reach them, so every phase that decoded a
+// float literal had to write the dispatch out again. It had been written out
+// TWICE (`cst_to_hir.cpp`'s literal leaf and `cst_const_eval.cpp`'s), and
+// D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION's own comment already names
+// that as a hazard: "two leaves decode float literals, so fixing one would leave
+// the other wrong differently". `decodeFloatLiteralAtKind` below is now the ONE
+// dispatch and all three tiers route through it.
+//
+// The names and the `dss::detail` namespace are UNCHANGED, so every existing
+// `using detail::narrowToFloatWidth;` / `using detail::floatKindInfo;` keeps
+// resolving; `const_eval_arith.hpp` includes this header and re-exports nothing.
+// The namespace is REOPENED here rather than the block being spliced back up
+// beside the bignum kernel, because these four read as the preamble to
+// `decodeFloatLiteralAtKind` at the bottom of this file and belong beside it.
+namespace detail {
+
+// Per-float-kind host-backing info: `bits` is the format's width; `hostBacked`
+// says whether the host `double` can carry the EXACT value (F16/F32 narrow
+// losslessly through `narrowToFloatWidth`; F64 is identity). F80/F128 are NOT
+// host-backed — no soft-float engine exists for them, so const-eval refuses
+// (fold + conversion) rather than bake a binary64-rounded value (FC17.9(e),
+// D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION).
+//
+// ⚠ THIS COMMENT USED TO END "Defined ABOVE the applyUnary/BinaryFloat folds,
+// which gate on it" — a placement claim that stopped being true when the block
+// moved here, since those folds are in `hir/const_eval_arith.hpp` and this
+// header knows nothing about them. The GATING is unchanged and still real; only
+// the sentence about where the definition sits was falsified, and it is deleted
+// rather than reworded because a header cannot honestly assert its own position
+// relative to a file that includes it.
+struct FloatKindInfo {
+    int  bits;
+    bool hostBacked;
+};
+[[nodiscard]] inline std::optional<FloatKindInfo> floatKindInfo(TypeKind k) noexcept {
+    switch (k) {
+        case TypeKind::F16:  return FloatKindInfo{16,  true};
+        case TypeKind::F32:  return FloatKindInfo{32,  true};
+        case TypeKind::F64:  return FloatKindInfo{64,  true};
+        // F80 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): NOT host-backed —
+        // the host `double` cannot represent an 80-bit-mantissa value, so
+        // folding at binary64 would bake a silently-rounded constant.
+        case TypeKind::F80:  return FloatKindInfo{80,  false};
+        case TypeKind::F128: return FloatKindInfo{128, false};
+        default: return std::nullopt;
+    }
+}
+
+// Soft-float narrow `double → IEEE 754 binary16 → double`. Produces the
+// closest representable half-precision value of `dv`, then widens back
+// to `double` losslessly. NaN / ±inf preserved; round-to-nearest-even.
+[[nodiscard]] inline double narrowToHalf(double dv) noexcept {
+    float const fv = static_cast<float>(dv);
+    std::uint32_t bits;
+    static_assert(sizeof(float) == sizeof(std::uint32_t));
+    std::memcpy(&bits, &fv, sizeof(bits));
+    std::uint32_t const sign     = (bits >> 31) & 0x1u;
+    std::uint32_t const exp32    = (bits >> 23) & 0xFFu;
+    std::uint32_t const mant32   =  bits        & 0x7FFFFFu;
+    std::uint16_t half;
+    if (exp32 == 0xFFu) {
+        half = static_cast<std::uint16_t>((sign << 15) | (0x1Fu << 10) |
+            (mant32 != 0 ? (mant32 >> 13) | 0x200u : 0u));
+    } else if (exp32 == 0) {
+        half = static_cast<std::uint16_t>(sign << 15);
+    } else {
+        int const e = static_cast<int>(exp32) - 127 + 15;
+        if (e >= 0x1F) {
+            half = static_cast<std::uint16_t>((sign << 15) | (0x1Fu << 10));
+        } else if (e <= 0) {
+            std::uint32_t const mant = mant32 | 0x800000u;
+            int const shift = 14 - e;
+            if (shift >= 25) {
+                half = static_cast<std::uint16_t>(sign << 15);
+            } else {
+                std::uint32_t const rounded = mant >> shift;
+                std::uint32_t const rem     = mant & ((1u << shift) - 1u);
+                std::uint32_t const half_lsb = 1u << (shift - 1);
+                std::uint32_t out = rounded;
+                if (rem > half_lsb || (rem == half_lsb && (rounded & 1u))) {
+                    out += 1;
+                }
+                half = static_cast<std::uint16_t>((sign << 15) | (out & 0x3FFu));
+            }
+        } else {
+            std::uint32_t const mant = mant32;
+            std::uint32_t const rounded = mant >> 13;
+            std::uint32_t const rem     = mant & 0x1FFFu;
+            std::uint32_t const half_lsb = 0x1000u;
+            std::uint32_t out = rounded;
+            if (rem > half_lsb || (rem == half_lsb && (rounded & 1u))) {
+                out += 1;
+                if (out == 0x400u) {
+                    out = 0;
+                    if (e + 1 >= 0x1F) {
+                        half = static_cast<std::uint16_t>((sign << 15) | (0x1Fu << 10));
+                        goto done;
+                    }
+                    half = static_cast<std::uint16_t>(
+                        (sign << 15) | (static_cast<std::uint32_t>(e + 1) << 10));
+                    goto done;
+                }
+            }
+            half = static_cast<std::uint16_t>(
+                (sign << 15) | (static_cast<std::uint32_t>(e) << 10) | (out & 0x3FFu));
+        }
+    }
+done:
+    std::uint32_t const wsign = (static_cast<std::uint32_t>(half) >> 15) & 0x1u;
+    std::uint32_t const wexp  = (static_cast<std::uint32_t>(half) >> 10) & 0x1Fu;
+    std::uint32_t const wmant =  static_cast<std::uint32_t>(half)        & 0x3FFu;
+    std::uint32_t wbits;
+    if (wexp == 0x1Fu) {
+        wbits = (wsign << 31) | (0xFFu << 23) | (wmant << 13);
+    } else if (wexp == 0) {
+        if (wmant == 0) {
+            wbits = wsign << 31;
+        } else {
+            std::uint32_t m = wmant;
+            int e = -1;
+            while ((m & 0x400u) == 0) { m <<= 1; --e; }
+            m &= 0x3FFu;
+            wbits = (wsign << 31) |
+                    (static_cast<std::uint32_t>(127 - 14 + e + 1) << 23) |
+                    (m << 13);
+        }
+    } else {
+        wbits = (wsign << 31) |
+                (static_cast<std::uint32_t>(static_cast<int>(wexp) - 15 + 127) << 23) |
+                (wmant << 13);
+    }
+    float fout;
+    std::memcpy(&fout, &wbits, sizeof(fout));
+    return static_cast<double>(fout);
+}
+
+// ROUND `dv` to the target's float WIDTH and widen back. F64 (and any width
+// this switch does not name) is identity; F32 goes through the host `float`;
+// F16 through the soft-float half above. Every producer of a float value at a
+// narrower-than-double kind must run this or it stores 53 significant bits
+// under a 24-bit core — a silently WRONG value, not a rounding nicety
+// (D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION).
+[[nodiscard]] inline double narrowToFloatWidth(double dv, int bits) noexcept {
+    switch (bits) {
+        case 16: return narrowToHalf(dv);
+        case 32: return static_cast<double>(static_cast<float>(dv));
+        default: return dv;
+    }
+}
+
+}  // namespace detail
+
+// ★★ D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION: decode a float literal's
+// text at the TARGET's mantissa width, not the host's.
+//
+// THE DEFECT THIS CLOSES. `decodeFloat` above routes every float literal —
+// `long double` included — through `std::strtod`, whose result is a host
+// `double`. An l-suffixed literal needing more than 53 mantissa bits therefore
+// arrives at the literal LEAF already rounded to binary64, BEFORE any fold:
+// LD-3 then folds arithmetic at true 64/113-bit precision over inputs that are
+// only binary64-precise, and an unfolded leaf is widened EXACTLY from a value
+// that was already wrong. ✔MEASURED at the emitted bytes, `const long double
+// g = 0.1L;` on elf64-x86_64: DSS `00 d0 cc cc cc cc cc cc fb 3f` against gcc
+// 13.3.0 AND clang 18.1.3 `cd cc cc cc cc cc cc cc fb 3f` — the low ELEVEN bits
+// of the significand zeroed, the signature of a binary64 value widened. On
+// elf64-aarch64 (binary128) the low SIXTY are zero. A whole number or a
+// power-of-two denominator (`20.0L`, `0.5L`) is exact in binary64 and so was
+// never affected, which is why the corpus did not catch it.
+//
+// ⚠ WHY NOT `strtold`. It yields the HOST's long double — 80-bit on Linux/x86,
+// 64-bit under MSVC, 128-bit on aarch64 hosts — so the compiler's OUTPUT would
+// depend on where the compiler was BUILT, and a cross-compile to the x87-80 axis
+// from an MSVC host would silently emit binary64 values. The width here comes
+// from `kind`, which the caller resolved through the config-driven float-literal
+// ladder (`typeFloatLiteral` → `coreByLongDoubleFormat` → the FORMAT's declared
+// `longDoubleFormat` axis) — a closed `TypeKind`, never a host `#ifdef` and
+// never an arch/format name. ✔MEASURED that the axis really does diverge: MSVC
+// 14.51.36231 puts EIGHT bytes in `long double` and decodes `0.1L` to
+// `9a 99 99 99 99 99 99 3f`, identical to `double`.
+//
+// THE METHOD. The literal is an EXACT rational — decimal digits `M` times a
+// power of ten, or hex digits times a power of two — so it is evaluated exactly
+// in arbitrary precision and rounded ONCE, at the target's significand width,
+// through `WideFloatValue::fromExactBinary` (the SAME round-to-nearest-even
+// chokepoint add/sub/mul/div use; no second rounding implementation lives here).
+// A power of ten in the DENOMINATOR is handled by an exact long division whose
+// remainder becomes the sticky bit, so a decimal that is not a true tie can
+// never be mistaken for one.
+//
+// `ok` keeps `decodeFloat`'s GRAMMAR contract exactly: false ⇐ a body this
+// grammar cannot FULLY consume, a kind the wide-float kernel does not realize,
+// a literal carrying more significant digits than the exact kernel will decide
+// (`kMaxSignificantDigits` — a WORK bound, not a range verdict), or an underflow
+// to subnormal. Never a silent zero, never a silently truncated value. The
+// caller owns the diagnostic.
+//
+// ⚠ THE RANGE HALF IS ONLY PARTLY SHARED WITH `decodeFloat`, and this comment
+// has now been wrong in BOTH directions, which is worth leaving on the record.
+// It first said the two doors drew "the same edges strtod's ERANGE refuses";
+// D-C-DECODEFLOAT-TREATS-UNDERFLOW-AS-FATAL made that false by accepting
+// binary64 subnormals on the `double` door alone. It then said the range verdict
+// was not shared at all, which
+// D-C-FLOAT-LITERAL-OVERFLOW-REFUSED-INSTEAD-OF-YIELDING-INFINITY has made false
+// again in the other direction. The TRUE statement, as of that row: OVERFLOW is
+// shared and both doors now yield the correctly-rounded signed infinity;
+// UNDERFLOW is NOT, because binary64 subnormals are ordinary values while the
+// wide subnormal question — literal and fold RESULT together — is
+// D-CSUBSET-LONG-DOUBLE-CONSTFOLD-SUBNORMAL-RESULT's and still open. What is
+// shared unconditionally, and must stay shared, is the ACCEPT/REFUSE line on the
+// literal's SHAPE: `parseFloatLiteralBody` matches strtod's grammar so no
+// literal is parseable on one axis and unparseable on the other.
+//
+// ⚠ THAT LAST SENTENCE IS TRUE OF EVERY *LITERAL* AND NOT OF EVERY STRING, and
+// the qualification is added here (P54 lane `fw`) because a new caller —
+// `decodeFloatLiteralAtKind` — now takes the `kind` as a parameter and so makes
+// the two doors comparable on one body. `strtod` accepts the bare words `inf` /
+// `infinity` / `nan`; this grammar has no word form and refuses them. They are
+// the ONLY bodies on which the doors disagree, and no float literal can be
+// spelled that way (a pp-number begins with a digit or a `.`), so nothing that
+// decodes a literal can observe it. Measured and pinned in
+// `NumberDecodeAtKind.AnInfinityFromALITERALCanOnlyBeAnOverflow` rather than
+// left as an unstated exception to a universal sentence.
+[[nodiscard]] inline std::optional<WideFloatValue>
+decodeFloatWide(std::string_view text, NumberStyle const* ns, TypeKind kind, bool& ok) {
+    ok = false;
+    if (!WideFloatValue::isSupportedKind(kind)) return std::nullopt;
+
+    std::string const           body = detail::floatLiteralBody(text, ns);
+    detail::FloatLiteralParts   p;
+    if (!detail::parseFloatLiteralBody(body, p)) return std::nullopt;
+
+    // Leading zeros do not change the value and must go before the digit count
+    // becomes a magnitude estimate. `pointShift` counts digits AFTER the point
+    // and is unaffected by the strip (`0.001` → digits "1", pointShift 3).
+    std::size_t const firstSig = p.digits.find_first_not_of('0');
+    if (firstSig == std::string::npos) {          // every digit a zero
+        ok = true;
+        return WideFloatValue::zero(kind, p.sign);
+    }
+    p.digits.erase(0, firstSig);
+
+    if (p.hex) {
+        // Exact by construction: H · 2^(pexp − 4·fracHexDigits). No power of ten,
+        // so no division and no magnitude short-circuit is needed — the binary
+        // exponent only ADDS to the result exponent.
+        detail::FloatMag const H = detail::digitsToMag(p.digits, 16);
+        return detail::roundExactInteger(H, p.exponent - 4 * p.pointShift,
+                                         kind, p.sign, ok);
+    }
+
+    long long const scale  = p.exponent - p.pointShift;     // value = M · 10^scale
+    long long const decade = scale + static_cast<long long>(p.digits.size());
+    // 10^(decade−1) ≤ |value| < 10^decade. The F80/F128 NORMAL range is
+    // [2^-16382, 2^16384) ≈ [3.4e-4932, 1.2e4932), so a decade outside ±5000 is
+    // decidably out of range — DECIDED here rather than built as a multi-million-
+    // bit integer first. Inside the band the exact path runs and `roundNormal`
+    // renders the real verdict.
+    //
+    // ⚠ A PRE-FILTER MUST GIVE THE ANSWER THE REAL PATH WOULD, and the two ends
+    // of this band no longer give the same one
+    // (D-C-FLOAT-LITERAL-OVERFLOW-REFUSED-INSTEAD-OF-YIELDING-INFINITY): above
+    // the band the correctly-rounded value IS the signed infinity, so saying
+    // "undecodable" there would refuse `1e5000L` while `1e4940L` — which is
+    // inside the band, is BUILT exactly, and reaches the same `roundNormal`
+    // overflow — decodes to that infinity. (`1e4940L`, not `1e4000L`: both wide
+    // formats carry a 15-bit exponent and top out near 1.19e4932, so `1e4000L`
+    // is an ordinary FINITE value and would prove nothing here.) The
+    // low end still refuses, because the subnormal question is
+    // D-CSUBSET-LONG-DOUBLE-CONSTFOLD-SUBNORMAL-RESULT's and is still OPEN.
+    constexpr long long kDecadeBand = 5000;
+    if (decade > kDecadeBand) { ok = true; return WideFloatValue::infinity(kind, p.sign); }
+    if (decade < -kDecadeBand) return std::nullopt;
+    // ⚠ A DIGIT COUNT IS ALSO A WORK BOUND. Truncating significant digits is NOT
+    // safe near an exact tie (the kept prefix can BE the tie while the true value
+    // is below it), so the digits are all kept and the absurd case is refused
+    // LOUDLY instead — never silently rounded from a prefix. The band above then
+    // bounds the denominator too (10^(digits+5000)).
+    constexpr std::size_t kMaxSignificantDigits = 20000;
+    if (p.digits.size() > kMaxSignificantDigits) return std::nullopt;
+
+    detail::FloatMag M = detail::digitsToMag(p.digits, 10);
+    if (scale >= 0) {
+        detail::magMulPow10(M, scale);                       // exact integer
+        return detail::roundExactInteger(M, 0, kind, p.sign, ok);
+    }
+    return detail::roundExactQuotient(M, -scale, kind, p.sign, ok);
+}
+
+// ★★★ THE ONE FLOAT-LITERAL DECODE, AT THE TYPE THE LITERAL LADDER RESOLVED.
+//
+// Two doors and a narrowing were being dispatched between at every phase that
+// turns a float literal's text into a value, and the dispatch was written out
+// LONGHAND at each of them: the wide door when `WideFloatValue` realizes the
+// kind, otherwise `decodeFloat` plus `narrowToFloatWidth` at the kind's own
+// width. `cst_to_hir.cpp`'s literal leaf and `cst_const_eval.cpp`'s leaf each
+// carried a copy, and D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION's own
+// comment already named the hazard in so many words — "two leaves decode float
+// literals, so fixing one would leave the other wrong differently". A third
+// caller (the semantic tier's range warning,
+// D-C-FLOAT-LITERAL-OVERFLOW-REFUSED-INSTEAD-OF-YIELDING-INFINITY) would have
+// made three copies of one policy, so the policy moved here instead and all
+// three route through it. [[feedback-a-partial-fix-reads-as-a-complete-one]].
+//
+// ★★ IT REPORTS THE RANGE EVENT IN THE VALUE, NOT IN AN OUT-PARAMETER, and that
+// is the same discipline C23 7.24.1.5 uses on `strtod` itself: ¶12 and ¶13 hand
+// the SAME errno to overflow and underflow and separate them by the RETURNED
+// VALUE. A float LITERAL's correctly-rounded value can be an infinity ONLY by
+// overflowing, because C has no way to SPELL an infinity as a floating constant:
+// a pp-number must begin with a digit or a `.`, so the tokenizer never
+// classifies `inf` as a float literal, and a word glued to digits (`1inf`) fails
+// the whole-body consumption check and comes back `ok == false`.
+//
+// ⚠ THAT IS A PROPERTY OF THE CALLER HAVING A LITERAL, NOT OF THIS FUNCTION IN
+// ISOLATION, and saying so is the difference between a stated boundary and an
+// assumption waiting to go false. `strtod` accepts the bare words `inf` /
+// `infinity` / `nan`, so a DIRECT call with one of those strings decodes on the
+// host-backed door (and is refused by the wide one, whose grammar has no word
+// form — the single body for which the two doors disagree). No literal can
+// reach it, and the ONE non-literal caller of `decodeFloat`
+// (`shipped_lib_descriptor.cpp`) matches its own infinity tokens first and then
+// refuses ANY infinity the decoder returns. Pinned in
+// `NumberDecodeAtKind.AnInfinityFromALITERALCanOnlyBeAnOverflow`.
+//
+// So `roundedToInfinity()` needs nothing the decoders do not already compute,
+// and leaves both decoders PURE functions with unchanged signatures. The caller
+// that owns a source span raises the diagnostic; a caller with no span (the
+// shipped-descriptor reader) has no span to raise one with.
+struct FloatLiteralDecode {
+    // GRAMMAR + realizability verdict, exactly `decodeFloat`'s / `decodeFloatWide`'s:
+    // false ⇔ a body the float grammar cannot fully consume, an empty body, a
+    // kind the wide kernel does not realize, a literal past the work bound, or
+    // an underflow the wide door still refuses. NEVER a range verdict on the
+    // overflow side — an overflow decodes, to the signed infinity.
+    bool ok = false;
+    // Set ⇔ the kind is one `WideFloatValue` realizes (F80 / F128). The two
+    // arms are exclusive and the caller stores whichever is populated.
+    std::optional<WideFloatValue> wide{};
+    // The host-backed arm, ALREADY NARROWED to the kind's own width (F64 is
+    // identity). Meaningless unless `ok && !wide.has_value()`.
+    double narrow = 0.0;
+
+    // Did the correct rounding land on an infinity the source text did not name?
+    [[nodiscard]] bool roundedToInfinity() const noexcept {
+        if (!ok) return false;
+        return wide.has_value() ? wide->isInfinity() : std::isinf(narrow);
+    }
+};
+
+[[nodiscard]] inline FloatLiteralDecode
+decodeFloatLiteralAtKind(std::string_view text, NumberStyle const* ns, TypeKind kind) {
+    FloatLiteralDecode out;
+    if (WideFloatValue::isSupportedKind(kind)) {
+        bool wideOk = false;
+        auto wf = decodeFloatWide(text, ns, kind, wideOk);
+        if (!wideOk || !wf.has_value()) return out;    // `ok` stays false
+        out.wide = *wf;
+        out.ok   = true;
+        return out;
+    }
+    bool decodeOk = false;
+    double const d = decodeFloat(text, ns, decodeOk);
+    if (!decodeOk) return out;
+    // ★ NARROW TO THE KIND'S OWN WIDTH. `decodeFloat` answers in a host `double`
+    // whatever the ladder resolved, so an F32 (or F16) literal would otherwise
+    // carry 53 significant bits under a 24-bit core and every downstream fold
+    // would answer as if `0.1f` were `0.1` — ✔MEASURED that gcc 13.3.0, clang
+    // 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51 all accept
+    // `_Static_assert(0.1f != 0.1, "")`, i.e. all four say the widened `0.1f` is
+    // a DIFFERENT value. A kind with no width entry keeps the host double, which
+    // is what the two former call sites did.
+    auto const info = detail::floatKindInfo(kind);
+    out.narrow = info.has_value() ? detail::narrowToFloatWidth(d, info->bits) : d;
+    out.ok     = true;
+    return out;
 }
 
 } // namespace dss

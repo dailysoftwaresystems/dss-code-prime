@@ -498,11 +498,18 @@ TEST(TextTierVocabulary, CoreTypeRefusalNamesEverySpellingTheLoaderAccepts) {
         20, "semantics.builtinTypes[0].core");
 }
 
-// The `builtinFunctions[].lowering` refusal — thirty verbs, and it named none.
+// The `builtinFunctions[].lowering` refusal — a closed set of verbs, and it
+// named none of them until the table made them enumerable.
+// ⚠ P64 (D-CSUBSET-ATOMIC-RMW) grew the set 30 → 37 with the seven
+// read-modify-write verbs. The count is STATED, not derived, and it guards ONE
+// direction: a SILENT SHRINK. Everything else in the helper walks whatever the
+// message says, so a projection that lost half its rows would still satisfy
+// every loop — which is why this number moves deliberately with the table and
+// is not softened into a `>=`.
 TEST(TextTierVocabulary, BuiltinLoweringRefusalNamesEveryVerbTheLoaderAccepts) {
     expectEveryAdvertisedValueIsAccepted(
         "c", "/semantics/builtinFunctions/0/lowering",
-        "unknown builtin lowering", 30, "semantics.builtinFunctions[0].lowering");
+        "unknown builtin lowering", 37, "semantics.builtinFunctions[0].lowering");
 }
 
 // ★★ THE `.dsshir` ATTRIBUTE VOCABULARIES. Six sets that each used to exist
@@ -512,22 +519,22 @@ TEST(TextTierVocabulary, BuiltinLoweringRefusalNamesEveryVerbTheLoaderAccepts) {
 TEST(TextTierVocabulary, EveryHirAttributeRefusalAdvertisesExactlyWhatItAccepts) {
     constexpr HirAttrVocabulary kVocabularies[] = {
         {"ffi linkage",
-         "dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(link ",
+         "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(link ",
          ")\n  extern_global %1 : i32\n}\n", "unknown ffi linkage", 3},
         {"ffi visibility",
-         "dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(vis ",
+         "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(vis ",
          ")\n  extern_global %1 : i32\n}\n", "unknown ffi visibility", 3},
         {"shader stage",
-         "dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(stage ",
+         "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(stage ",
          ")\n  extern_global %1 : i32\n}\n", "unknown shader stage", 7},
         {"shader builtin",
-         "dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(builtin ",
+         "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(builtin ",
          ")\n  extern_global %1 : i32\n}\n", "unknown shader builtin", 12},
         {"transpile idiom",
-         "dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @transpile(idiom ",
+         "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @transpile(idiom ",
          ")\n  extern_global %1 : i32\n}\n", "unknown transpile idiom", 6},
         {"diag recovery",
-         "dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @diag(code 0, recovery ",
+         "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @diag(code 0, recovery ",
          ")\n  extern_global %1 : i32\n}\n", "unknown diag recovery", 4},
     };
 
@@ -1168,7 +1175,7 @@ TEST(TextTierVocabulary, MirBitIntAndWideFloatLiteralsRoundTripThroughText) {
 // constant in the reader's translation unit, so the two ends cannot drift.
 TEST(TextTierVocabulary, TheUnspelledAggregateLiteralMarkerIsRefusedByName) {
     auto const text =
-        std::string{"dsshir 1\n"
+        std::string{"dsshir 3\nproducer \"\"\n"
                     "symbols { %1 \"g\" }\n"
                     "module [] \"probe\" {\n"
                     "  global %1 : i32 = lit unspelled_aggregate : i32\n"
@@ -1212,7 +1219,7 @@ namespace {
 
 // A `.dsshir` module whose single function body is `bodyLine`.
 [[nodiscard]] std::string hirBody(std::string_view bodyLine) {
-    return std::string{"dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+    return std::string{"dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
                        "  function %1 : fn() -> void {\n    block {\n      "}
          + std::string{bodyLine} + "\n      return\n    }\n  }\n}\n";
 }
@@ -1352,8 +1359,13 @@ TEST(TextTierVocabulary, EveryAdvertisedHirTypeKeywordIsRecognizedByTheReader) {
     auto const msg = refusalFor(kBadSpelling);
     ASSERT_FALSE(msg.empty()) << "the type arm must refuse an unknown keyword BY NAME";
     auto const advertised = advertisedIn(msg);
-    // 20 primitive spellings + 21 structural keywords.
-    EXPECT_EQ(advertised.size(), 41u)
+    // 20 primitive spellings + 22 structural keywords.
+    // P66 (lane `al`): 21 -> 22 structural, the new one being `aligned<T, N>` — the
+    // TYPE-LEVEL alignment skin for GNU `aligned(N)` on a typedef. The count moving is
+    // the POINT of this pin: a keyword added to `kHirTextTypeKeywords` and advertised
+    // by the refusal, but with no arm in `parseType`, would be advertised and then
+    // unreadable — which is exactly what the loop below checks for each name.
+    EXPECT_EQ(advertised.size(), 43u)
         << "the advertised type-keyword set changed size.\nmessage:\n  " << msg;
     for (auto const& kw : advertised) {
         SCOPED_TRACE(kw);

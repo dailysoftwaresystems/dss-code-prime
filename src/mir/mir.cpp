@@ -297,6 +297,82 @@ MirAsmDescriptor const& Mir::asmDescriptor(MirInstId id) const {
     return asmDescriptorPool_.at(asmDescriptorIndex(id));
 }
 
+// ── `try*` — the non-fatal twins [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]] ──
+//
+// ★★★ EVERY TWIN TESTS THE OPCODE AND THEN DELEGATES TO ITS ABORTING SIBLING —
+// it never decodes `payload` itself, and that is the load-bearing property, not
+// a shortcut. Each of these payloads is an ENCODING (`arg_payload` packs an
+// ordinal and a position into one word; `return_piece_payload` packs an ordinal
+// and a register class), and a twin that re-spelled the decode would be a second
+// copy free to drift from the first. It would drift SILENTLY and in the worst
+// direction: the aborting form is what `src/` reads, so a divergence would make
+// the tests agree with themselves about a value the compiler never sees. By
+// construction here, a `try*` that returns a value returns the SAME value its
+// sibling would have, or the sibling aborts and so does it.
+//
+// ⚠ `instOpcode` still routes through `instArena_.at`, so a stale, out-of-range
+// or CROSS-MODULE id aborts in the twin exactly as it does in the sibling. The
+// only thing softened is the opcode mismatch.
+std::optional<std::uint32_t> Mir::tryArgIndex(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::Arg) return std::nullopt;
+    return argIndex(id);
+}
+std::optional<std::uint32_t> Mir::tryArgPosition(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::Arg) return std::nullopt;
+    return argPosition(id);
+}
+std::optional<std::uint32_t> Mir::tryConstLiteralIndex(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::Const) return std::nullopt;
+    return constLiteralIndex(id);
+}
+std::optional<SymbolId> Mir::tryGlobalAddrSymbol(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::GlobalAddr) return std::nullopt;
+    return globalAddrSymbol(id);
+}
+std::optional<MirBlockId> Mir::tryBlockAddressTarget(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::BlockAddress) return std::nullopt;
+    return blockAddressTarget(id);
+}
+std::optional<SymbolId> Mir::tryBlockAddressExportSymbol(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::BlockAddressExport) return std::nullopt;
+    return blockAddressExportSymbol(id);
+}
+std::optional<std::uint32_t> Mir::tryIntrinsicId(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::IntrinsicCall) return std::nullopt;
+    return intrinsicId(id);
+}
+std::optional<std::uint32_t> Mir::tryReturnPieceOrdinal(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::ReturnPiece) return std::nullopt;
+    return returnPieceOrdinal(id);
+}
+std::optional<TargetRegClass> Mir::tryReturnPieceRegClass(MirInstId id) const {
+    if (instOpcode(id) != MirOpcode::ReturnPiece) return std::nullopt;
+    return returnPieceRegClass(id);
+}
+std::optional<std::uint32_t> Mir::tryAsmDescriptorIndex(MirInstId id) const {
+    // The two-arm test its sibling makes, asked the same way round: "is this an
+    // asm block", not "is it the non-terminator one".
+    MirOpcode const op = instOpcode(id);
+    if (op != MirOpcode::InlineAsm && op != MirOpcode::InlineAsmGoto) return std::nullopt;
+    return asmDescriptorIndex(id);
+}
+MirAsmDescriptor const* Mir::tryAsmDescriptor(MirInstId id) const {
+    MirOpcode const op = instOpcode(id);
+    if (op != MirOpcode::InlineAsm && op != MirOpcode::InlineAsmGoto) return nullptr;
+    return &asmDescriptor(id);
+}
+std::optional<std::span<MirInstId const>> Mir::tryInstOperands(MirInstId id) const {
+    // The descriptor flag is the sibling's own source of truth for which pool a
+    // node's operand range addresses — asked here rather than re-listing opcodes,
+    // so a second pool-bearing opcode generalises to both forms at once.
+    if (opcodeInfo(instOpcode(id)).usesPhiPool) return std::nullopt;
+    return instOperands(id);
+}
+std::optional<std::span<MirPhiIncoming const>> Mir::tryPhiIncomings(MirInstId id) const {
+    if (!opcodeInfo(instOpcode(id)).usesPhiPool) return std::nullopt;
+    return phiIncomings(id);
+}
+
 MirFuncId Mir::blockFunc(MirBlockId id) const {
     return MirFuncId{blockArena_.at(id).func, this->id().v};
 }
@@ -719,26 +795,72 @@ MirInstId MirBuilder::addInst(MirOpcode opcode, std::span<MirInstId const> opera
     // Const's payload is always a real literal-pool index, etc.); reject them here
     // so the only way to spell them is the safe path.
     //
-    // *** `InlineAsm` IS IN THIS LIST AS A STRUCTURAL BACKSTOP, NOT FOR SYMMETRY.
-    // Its payload indexes the module's `MirAsmDescriptorPool`, and MIR is copied
-    // by FOUR live verbatim-copy sites that forward `instPayload` into a module
-    // whose pool is EMPTY (`opt/passes/mir_rebuild_helper.cpp`,
-    // `opt/passes/inlining.cpp` x2, and `mir/merge/mir_merge.cpp`'s cross-CU
-    // `FunctionCloner`). Forwarding the index there would name the wrong
-    // descriptor -- i.e. drop the clobber list -- with nothing to observe it.
-    // Refusing the opcode here makes a copy site that forgot `addInlineAsm`
+    // *** `InlineAsm` AND `BlockAddress` ARE IN THIS LIST AS A STRUCTURAL
+    // BACKSTOP, NOT FOR SYMMETRY. Each carries in `payload` an id that means
+    // something DIFFERENT in the destination of a copy, and MIR is copied
+    // verbatim by sites that forward `instPayload` into exactly such a
+    // destination:
+    //   * `InlineAsm`'s payload indexes the module's `MirAsmDescriptorPool`, and
+    //     a copy target's pool starts EMPTY -- forwarding the index names the
+    //     wrong descriptor, i.e. DROPS the clobber list, with nothing to observe
+    //     it.
+    //   * `BlockAddress`'s payload is the TARGET BLOCK ID, and every copy site
+    //     RENUMBERS blocks -- forwarding it points `&&label` at the wrong or an
+    //     elided block.
+    // Refusing both here makes a copy site that forgot its dedicated-builder arm
     // ABORT. This cannot be forgotten, because forgetting it does not compile
-    // away -- it aborts on the first asm block that reaches that site.
+    // away -- it aborts on the first asm block / label address that reaches it.
     //
-    // ⚠ AND THE FOURTH SITE IS WHY THE COUNT IS WRITTEN OUT RATHER THAN LEFT
-    // VAGUE. This comment said "three" and named only the three OPTIMIZER sites
-    // from the day the opcode landed until 2026-08-17, when the cross-CU merge --
-    // which is neither an optimizer pass nor reachable from a single-TU build --
-    // aborted a 2-TU sqlite build on four legs. The refusal did its job (a loud
-    // abort, not a silent dropped clobber list), but the census beside it was
-    // already wrong. A NEW copy site must be added to this list, and to
-    // `tests/opt/test_inline_asm_rebuild_carriage.cpp` + `tests/mir/
-    // test_mir_merge.cpp`, which drive each site ALONE.
+    // ★ WHY `BlockAddress` IS HERE AT ALL, AND WHY IT WAS NOT: the two opcodes
+    // are the SAME hazard and only one of them was defended, so the twin defects
+    // failed in OPPOSITE directions. ✔MEASURED at
+    // D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST: that row's red-on-disable
+    // mutant A removed the caller-side `BlockAddress` arm and the result was a
+    // stale address and an ACCESS_VIOLATION at RUN TIME -- a silent miscompile;
+    // its mutant B removed the `IndirectBr` terminator arm, hit a cloner's fatal
+    // `default:`, and aborted cleanly BY NAME. One class fails loud, its twin
+    // failed silent, for want of an entry in this list.
+    //
+    // ⚠⚠ THE SITE CENSUS BELOW IS WRITTEN OUT BECAUSE IT HAS BEEN WRONG TWICE,
+    // AND THE SECOND TIME NOBODY IN THE CHAIN COUNTED. It said "three" and named
+    // only the three OPTIMIZER sites from the day `InlineAsm` landed until
+    // 2026-08-17, when the cross-CU merge -- neither an optimizer pass nor
+    // reachable from a single-TU build -- aborted a 2-TU sqlite build on four
+    // legs. It then said "FOUR" until 2026-09-02, and there were SIX: the
+    // sentence was quoted forward from here into a row's closing note, from
+    // there into a lane brief, and from there into the lane that finally
+    // ENUMERATED instead of quoting. A census in a fail-loud mechanism's own
+    // documentation is exactly the kind of claim that goes stale silently --
+    // nothing gates it, so it is spelled out per site, each with the reason it
+    // is safe, and a NEW copy site must be added here:
+    //
+    //   1. `opt/passes/mir_rebuild_helper.cpp` `MirFunctionRebuilder::emitValue`
+    //      -- has its own `BlockAddress` arm (re-maps through `blockMap_`).
+    //   2. `opt/passes/inlining.cpp` `MultiBlockInliner::emitCallerInst`
+    //      -- has its own `BlockAddress` arm (re-maps through `blockMap_`).
+    //   3. `opt/passes/inlining.cpp` `emitCalleeInst`
+    //      -- has NO arm. Safe because `inlineLegalityGate` REFUSES a callee
+    //         containing a `BlockAddress`, so no such instruction is ever routed
+    //         here. That is safety by ROUTING, which this refusal converts into
+    //         safety by CONSTRUCTION: change the gate and the site aborts.
+    //   4. `mir/merge/mir_merge.cpp` `FunctionCloner::emitValue`
+    //      -- has its own `BlockAddress` arm (re-maps through `mapBlock`).
+    //   5. `opt/passes/licm.cpp`'s preheader hoist
+    //      -- has NO arm. Excluded at `isLicmCandidateOpcode`, which lists
+    //         `BlockAddress` beside `Const`/`Arg`/`GlobalAddr` as a leaf value
+    //         origin with a dedicated builder.
+    //   6. `mir/merge/synth_seh_funclets.cpp`'s SEH-filter cloner
+    //      -- has an arm that REPORTS a refusal. Before 2026-09-02 it had
+    //         neither an arm nor anything else standing in the way: a
+    //         `BlockAddress` in a `__except(...)` filter expression was cloned
+    //         verbatim into a funclet whose blocks are entirely different ones.
+    //
+    // (`BlockAddressExport` is deliberately NOT in this list even though it too
+    // has a dedicated builder. Its payload is a SymbolId, which is stable across
+    // a same-module rebuild, so sites 1/2/3/5 copy it verbatim and are RIGHT to;
+    // only the cross-CU merge renumbers symbols, and site 4 has an explicit arm
+    // for it. Refusing it here would red four correct paths -- the census is
+    // per-PAYLOAD-KIND, not per-dedicated-builder.)
     // (`InlineAsmGoto` is a TERMINATOR, so the terminator refusal above already
     // catches it at `addInst`; its dedicated builders are `addInlineAsmGoto` for
     // the ORIGINAL emit and `cloneInlineAsmGoto` for every copy site. A copy site
@@ -747,11 +869,12 @@ MirInstId MirBuilder::addInst(MirOpcode opcode, std::span<MirInstId const> opera
     // also a fatal.)
     if (opcode == MirOpcode::Arg || opcode == MirOpcode::Const
         || opcode == MirOpcode::GlobalAddr || opcode == MirOpcode::InlineAsm
+        || opcode == MirOpcode::BlockAddress
         || opcode == MirOpcode::Invalid) {
         std::fprintf(stderr,
                      "dss::MirBuilder fatal: addInst: opcode '%.*s' has a dedicated builder "
-                     "(addArg/addConst/addGlobalAddr/addInlineAsm); do not build it via "
-                     "addInst\n",
+                     "(addArg/addConst/addGlobalAddr/addBlockAddress/addInlineAsm); do not "
+                     "build it via addInst\n",
                      static_cast<int>(info.mnemonic.size()), info.mnemonic.data());
         std::abort();
     }

@@ -196,12 +196,44 @@ public:
     // DROPS a bit: qualifying an already-qualified type preserves what was there (a
     // naive "return inner if already qualified" would silently lose the new bit, e.g.
     // `_Atomic` over `volatile` staying merely volatile — a loss-of-atomicity
-    // miscompile). Wrapping an INVALID id returns InvalidType; a zero mask returns the
-    // material type (no skin). const is NOT a bit (it never affects codegen/layout).
-    TypeId qualified(TypeId inner, std::int64_t addBits);
+    // miscompile). Wrapping an INVALID id returns InvalidType; a zero mask AND a zero
+    // alignment return the material type (no skin). const is NOT a bit (it never
+    // affects codegen/layout).
+    //
+    // ★★ P66 (cycle P66, lane `al`) — `addAlign` GENERALIZES THIS SKIN FROM "QUALIFIER"
+    // TO "TYPE-LEVEL DECORATION THAT CHANGES IDENTITY BUT NOT MATERIAL KIND", which is
+    // what it always was. It is the TYPE's own explicit alignment in bytes (0 = none),
+    // for GNU `__attribute__((aligned(N)))` written on a TYPEDEF — `typedef int
+    // __attribute__((aligned(8))) A8;`. It rides scalar slot 1, and it is EMITTED ONLY
+    // WHEN NON-ZERO so every pre-existing qualifier skin keeps a one-scalar record and
+    // therefore its EXACT content hash and TypeId — the same "GUARDED on non-zero"
+    // discipline `explicitAlign` / `maxFieldAlign` / `fieldPacked` use on the composite
+    // side, and for the same reason (zero churn).
+    // ⚠ A SKIN MAY NOW CARRY A **ZERO** MASK. `qualified(int, 0, 8)` is a legitimate
+    // record with `qualifierBits() == 0`, so `isVolatileQualified` / `isAtomicQualified`
+    // are correctly FALSE on it. Any code that inferred "kind == VolatileQual therefore
+    // some bit is set" is now wrong; `qualifierBits`' own fatal is narrowed to the one
+    // condition that is still impossible (no scalar at all).
+    // ★ WHY A SCALAR ON THIS KIND RATHER THAN A NEW `TypeKind`. A new kind costs six
+    // exhaustive-switch arms (`kTypeKindNameTable`, `isPrimitiveTypeKind`,
+    // `projectRepresentationLevel`, `type_reintern`'s operand-DAG switch,
+    // `hir_text`'s codec pair, `mir_verifier`'s `describeType`) and re-derives a
+    // transparency mechanism that already exists and is already correct. The skin's
+    // whole contract — distinct interned identity, `kind()`/`operands()`/`scalars()`
+    // see-through, one strip chokepoint — is EXACTLY what a type-level alignment needs.
+    // Content identity comes free: `hashContent`/`equalContent` already mix ALL
+    // scalars, so `A8` and `int` are distinct TypeIds without a line of new code.
+    TypeId qualified(TypeId inner, std::int64_t addBits, std::uint32_t addAlign = 0);
     // `volatile T` / `_Atomic T` — thin wrappers over `qualified` setting one bit.
     TypeId volatileQualified(TypeId inner);
     TypeId atomicQualified(TypeId inner);
+    // P66: `T` carrying its OWN explicit alignment of `bytes` (GNU `aligned(N)` on a
+    // typedef). A thin wrapper over `qualified` setting no bit and one alignment.
+    // `bytes == 0` is "no request" and returns the material type unchanged. MAX-folded
+    // with any alignment already on `inner`, so a chained alias
+    // (`typedef A8 B8;`) cannot LOSE the alignment and a re-request cannot nest a
+    // second skin — the same STRIP -> UNION -> RE-INTERN discipline the bitset uses.
+    TypeId typeAligned(TypeId inner, std::uint32_t bytes);
     // The material type under `id`'s qualifier skin (`id` unchanged if none). ONE
     // strip chokepoint for the rare consumer that must look past the skin where the
     // transparent accessors are bypassed (e.g. the layout entry's raw incomplete
@@ -212,7 +244,24 @@ public:
     // The raw QualBit mask on `id`'s OWN record (0 if `id` is not a qualifier skin).
     // Reads the RAW scalar slot directly — NOT the transparent `scalars()`, which sees
     // THROUGH the skin to the inner type's scalars. The single reader of the bitset.
+    // ⚠ Since P66 a skin may carry a ZERO mask (an alignment-only decoration), so a
+    // 0 here does NOT imply "not a skin" — ask `typeAlignOverride` too.
     [[nodiscard]] std::int64_t qualifierBits(TypeId id) const;
+    // P66: the raw TYPE-LEVEL explicit alignment on `id`'s OWN record, in bytes (0 if
+    // none, or if `id` is not a skin). The alignment twin of `qualifierBits`, and like
+    // it a RAW scalar read rather than the transparent `scalars()`.
+    [[nodiscard]] std::uint32_t typeAlignOverride(TypeId id) const;
+    // P66: the id LAYOUT should be memoized and computed under. It strips qualifier
+    // skins exactly like `stripVolatile` EXCEPT that it STOPS at a skin carrying a
+    // type-level alignment, because that skin changes the answer `computeLayout` gives.
+    // ★★ THIS DISTINCTION IS THE WHOLE REASON A STRUCT MEMBER OF AN OVER-ALIGNED ALIAS
+    // COMES OUT RIGHT. `childLayout` and `forEachLayoutDependency` key the layout memo
+    // by this function; had they kept keying by `stripVolatile`, a field of type `A8`
+    // would resolve to `int`'s memo entry and the alias's alignment would be SILENTLY
+    // DROPPED in exactly the composite case gcc and clang both honour (✔MEASURED:
+    // `struct S { char c; A8 v; }` is sizeof 16 / align 8 / offsetof(v) 8 on gcc 13.3.0
+    // and clang 18.1.3, against an undecorated `int v`'s 8 / 4 / 4).
+    [[nodiscard]] TypeId layoutRoot(TypeId id) const;
     // True iff `id`'s OWN record carries the Volatile / Atomic bit (the access-
     // qualifier queries). Read the RAW mask (not the transparent `kind()`), so they
     // answer "is this exact type volatile / atomic-qualified?" — used at the deref /
@@ -327,12 +376,45 @@ public:
     // same three runtime/test checks: an unrepresentable value aborts loud here, a
     // re-completion that CHANGES it aborts as a conflicting re-completion, and it
     // is part of the content identity so it survives a reintern round-trip.
+    // D-CSUBSET-PER-MEMBER-PACKED: `fieldPacked` is the PER-FIELD packed channel —
+    // GNU `struct S { char a; int z __attribute__((packed)); };`, where the attribute
+    // sits on ONE member-declarator and lowers THAT field's baseline alignment to 1
+    // while leaving its siblings, and the aggregate's own alignment, alone.
+    // `fieldPacked[i]` is 1 iff field i is individually packed, 0 otherwise; the span
+    // is ALL-fields-or-EMPTY (a partial set is a caller bug, exactly like
+    // `fieldAligns`), and EMPTY is every composite that existed before this channel —
+    // it enters `contentDeclSiteKey` GUARDED on non-empty, so those keep their EXACT
+    // declSiteKey and there is zero TypeId churn.
+    //
+    // ★ IT IS A SEPARATE CHANNEL FROM ALL THREE OF ITS NEIGHBOURS, AND EACH REASON IS
+    // A MEASUREMENT, not a taxonomy:
+    //   • NOT `fieldAligns`, which is RAISE-only (`max(natural, override)`). Storing 1
+    //     there is a NO-OP on every field whose natural alignment exceeds 1 — i.e. on
+    //     every field this attribute is ever written on.
+    //   • NOT the whole-composite `packed`, because the two are DISTINGUISHABLE:
+    //     ✔MEASURED gcc 13.3.0 + clang 18.1.3, x86_64 AND aarch64,
+    //     `struct { char a; int z <packed>; double d; }` is sizeof 16 / _Alignof 8
+    //     with z@1, while the whole-composite spelling of the same fields is sizeof 13
+    //     / _Alignof 1 with z@1 d@5. A per-member packed does NOT lower the
+    //     AGGREGATE's alignment; it lowers one FIELD's, and the aggregate's alignment
+    //     is then the ordinary MAX-fold over the EFFECTIVE member alignments.
+    //   • NOT `maxFieldAlign` (`#pragma pack(N)`), which is per-COMPOSITE. It is that
+    //     channel's per-FIELD dual, and like the composite `packed` it WINS over a
+    //     surrounding cap: ✔MEASURED under `#pragma pack(4)`,
+    //     `struct { char a; long long z <packed>; }` is 9/1 z@1 where the undecorated
+    //     control is 12/4 z@4.
+    // Both `packed` spellings meet at the ONE clamp `clampedBaselineAlign`, so the
+    // layout engine gains a per-field INPUT rather than a second algorithm.
+    //
+    // packed + explicit offsets is contradictory for the same reason the composite
+    // flag is (offsets place fields wholesale) → fail loud at completion.
     void completeComposite(TypeId id, std::span<TypeId const> fields, bool packed,
                            std::span<std::int64_t const> fieldBitWidths = {},
                            std::span<std::uint64_t const> fieldOffsets = {},
                            std::span<std::uint32_t const> fieldAligns = {},
                            std::uint32_t explicitAlign = 0,
-                           std::uint32_t maxFieldAlign = 0);
+                           std::uint32_t maxFieldAlign = 0,
+                           std::span<std::uint8_t const> fieldPacked = {});
     // True iff `id` is a Struct/Union that was forward-minted but NOT yet completed.
     // An EXPLICIT flag, NOT "operands empty": `struct E {}` is a LEGAL COMPLETE
     // zero-field struct (size 0). A non-composite kind is never incomplete here.
@@ -416,6 +498,21 @@ public:
                       std::span<std::uint64_t const> fieldOffsets,
                       std::span<std::uint32_t const> fieldAligns,
                       std::uint32_t explicitAlign, std::uint32_t maxFieldAlign);
+    // D-CSUBSET-PER-MEMBER-PACKED: the complete-at-once path for a struct carrying
+    // PER-FIELD packed flags (GNU `int z __attribute__((packed));` on one member).
+    // `fieldPacked` is part of the struct's CONTENT identity for the same reason
+    // every other layout channel is: the same fields with and without a per-member
+    // packed lay out to different OFFSETS — and, on the shape that matters most,
+    // to the SAME SIZE (`{char a; int z; double d;}` is 16 bytes either way, with z
+    // at 1 or at 4), so aliasing them onto one TypeId would be a layout miscompile
+    // that no size check could ever notice. An EMPTY span routes exactly like the
+    // 7-arg overload (byte-identical declSiteKey, zero TypeId churn).
+    TypeId structType(std::string_view name, std::span<TypeId const> fields,
+                      std::span<std::int64_t const> fieldBitWidths,
+                      std::span<std::uint64_t const> fieldOffsets,
+                      std::span<std::uint32_t const> fieldAligns,
+                      std::uint32_t explicitAlign, std::uint32_t maxFieldAlign,
+                      std::span<std::uint8_t const> fieldPacked);
     // True iff `id` is a Struct carrying c107 explicit field offsets (non-empty
     // `fieldOffsets`). Struct/Union only; false for every naturally-laid-out composite.
     [[nodiscard]] bool hasExplicitOffsets(TypeId id) const;
@@ -436,6 +533,23 @@ public:
     // ordinary (padded) composite. Mirrors `hasExplicitAligns`. The layout engine
     // reads it to seed the per-field baseline alignment to 1.
     [[nodiscard]] bool isPacked(TypeId id) const;
+    // D-CSUBSET-PER-MEMBER-PACKED: true iff `id` is a Struct/Union carrying PER-FIELD
+    // packed flags (non-empty `fieldPacked`). The O(1) gate the layout engine tests
+    // before paying for a per-field query, exactly as `hasExplicitAligns` gates
+    // `explicitFieldAlign`. Struct/Union only; false for every composite that carries
+    // no per-member packed — which is every composite that predates this channel.
+    [[nodiscard]] bool hasFieldPacked(TypeId id) const;
+    // D-CSUBSET-PER-MEMBER-PACKED: true iff FIELD `i` of `id` is individually packed.
+    // False for every field of a composite interned with no per-field flags, and for
+    // an out-of-range `i` — the same absent-means-ordinary contract
+    // `explicitFieldAlign` has, so a caller that forgets the `hasFieldPacked` gate
+    // gets the UNPACKED (padded) answer rather than an abort. ⚠ This is deliberately
+    // the SAFE direction only for a READER: dropping the flag yields the layout the
+    // compiler produced before the channel existed, which is the layout every other
+    // consumer already agrees with. It is the WRITER — `completeComposite` — that
+    // must never lose it, which is why the span is part of the content identity and
+    // survives the reintern round trip.
+    [[nodiscard]] bool isFieldPacked(TypeId id, std::size_t i) const;
     // TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack(N)` member-alignment CAP
     // this composite was defined under, in bytes; 0 = no cap (every composite
     // before this cycle, and every one defined outside a pack region). The layout
@@ -610,6 +724,18 @@ public:
     [[nodiscard]] TypeId commonType(TypeId a, TypeId b);
 
 private:
+    // ONE level of `representationType`, with the children's projections handed
+    // in rather than computed by a recursive call — the body that used to BE
+    // `representationType`. Split out so the walk over the type graph can be an
+    // explicit heap work stack instead of one host frame per type level
+    // (D-TYPEINTERNER-REPRESENTATIONTYPE-RECURSES-PER-TYPE-LEVEL-UNCAPPED); the
+    // `-Werror=switch` no-`default:` backstop lives in THIS function now.
+    // A source id absent from `projected` answers identity, which is the
+    // conservative direction: an unprojected `nullptr_t` is refused loudly at
+    // MIR (`I_NullptrTypeInMir`), never silently mistyped.
+    [[nodiscard]] TypeId projectRepresentationLevel(
+        TypeId id, std::unordered_map<TypeId, TypeId> const& projected);
+
     TypeId internContent(TypeKind kind, TypeKindId extensionKind,
                          std::span<TypeId const> operands,
                          std::span<std::int64_t const> scalars,
@@ -722,6 +848,17 @@ private:
         // composite hashes byte-identically (it enters `contentDeclSiteKey`
         // GUARDED on non-zero, exactly like offsets/aligns/explicitAlign).
         std::uint32_t             maxFieldAlign = 0;
+        // D-CSUBSET-PER-MEMBER-PACKED: per-FIELD packed flags (1 = this field's
+        // baseline alignment is 1), for GNU `__attribute__((packed))` written on ONE
+        // member declarator. The per-FIELD dual of the per-COMPOSITE `packed` above
+        // and of `maxFieldAlign`; a SEPARATE channel from `fieldAligns`, which RAISES
+        // and so cannot express a lowering at all. `std::uint8_t` rather than `bool`
+        // because a `std::vector<bool>` has no contiguous storage and therefore no
+        // `std::span` — the interface every other per-field channel here uses.
+        // EMPTY = no member is individually packed (every composite before this
+        // channel → byte-identical TypeId; it enters `contentDeclSiteKey` GUARDED on
+        // non-empty, exactly like offsets/aligns).
+        std::vector<std::uint8_t> fieldPacked;
         std::uint64_t             declSiteKey = 0;   // the nominal-identity discriminator
         bool                      complete    = false;
     };

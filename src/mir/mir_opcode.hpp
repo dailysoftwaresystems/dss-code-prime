@@ -65,8 +65,14 @@ enum class MirOpcode : std::uint16_t {
     // function at two call sites would leave TWO exports carrying ONE symbol and
     // naming DIFFERENT blocks — one symbol, two definitions. It cannot happen,
     // because the mandatory `BlockAddress` operand is exactly what the inliner
-    // already refuses to inline (`functionHasComputedGoto`). Naming the block
-    // directly from this instruction would have removed that refusal's trigger.
+    // refuses to inline. Naming the block directly from this instruction would
+    // have removed that refusal's trigger.
+    // ⚠ CORRECTED 2026-09-02 (P53, D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST):
+    // this named `functionHasComputedGoto`, which HAS BEEN DELETED. The invariant
+    // is intact and the reasoning above is unchanged — but the refusal that
+    // carries it is the CALLEE-side `inlineLegalityGate`, not the caller-side
+    // routing guard that used to share the name. The deleted guard asked whether
+    // the HOST contains a computed goto, which was never what protects this.
     BlockAddressExport,
 
     // ── integer arithmetic ──

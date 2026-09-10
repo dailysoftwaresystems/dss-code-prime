@@ -13,6 +13,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>   // P55: the spelling-blind walk's visited-pair set
+#include <utility>
 #include <vector>
 
 // ── THE ONE FUNCTION-REDECLARATION COMPATIBILITY ORACLE ───────────────────────
@@ -148,43 +150,94 @@ namespace detail::redecl {
 // one symbol. Reaching this point means the ids already differed, so the answer
 // is no.
 //
-// Bounded depth rather than a visited-set: a self-referential composite
-// (`struct N { struct N *next; }`) is NOMINAL and terminates at the arm above, so
-// the only way to spend depth is a genuine derivation chain. The cap turns a
-// corrupt type graph into a "not compatible" answer instead of a hang.
+// ★★★ P55 — AN EXPLICIT HEAP WORK STACK AND A VISITED SET, WITH **NO DEPTH CAP
+// AT ALL**, AND THE CAP THIS REPLACES WAS A WRONG ANSWER RATHER THAN A LIMIT
+// ([[D-SEMANTIC-DEPTH-CAPS-TRUNCATE-INTO-TWO-WRONG-ANSWERS]]).
+//
+// The old body recursed per derivation level and answered `depth > 16 ⇒ NOT
+// COMPATIBLE`. That is not a refusal a user can see and work around — it is a
+// FABRICATED verdict: this predicate's `false` becomes
+// `S_IncompatibleRedeclaration` at the caller, so a perfectly legal declaration
+// past the cap was REJECTED. ✔MEASURED at this cycle's HEAD, through the real
+// CLI on `x86_64:elf64-x86_64-linux-exec`, against a shipped-library descriptor
+// whose parameter is an N-level pointer chain and a source declaration of the
+// SAME function spelled `long` where the row spells `i64`: N=16 compiles clean,
+// **N=17 is refused** with "parameter 1 has a different type". ✔All four
+// references, probed SEPARATELY, ACCEPT the equivalent 63-level program (gcc
+// 13.3.0 `-std=c2x`, clang 18.1.3 `-std=c23`, mingw-w64 gcc 13.2.0, MSVC
+// 19.51.36252 `/std:clatest`, each `-pedantic-errors` where it has one), so the
+// cap put DSS BELOW THE UNION with no workaround available to the user at all.
+//
+// ⚠ RAISING 16 TO A BIGGER NUMBER WOULD HAVE MOVED THE WRONG ANSWER, NOT REMOVED
+// IT. The walk is now iterative over a heap `std::vector`, so host stack depth is
+// no longer a function of the input (the operator's 2026-09-02 no-recursion
+// ruling), and it TERMINATES ON ANY GRAPH — including a cyclic one — because a
+// pair is walked at most once.
+//
+// ★ WHY THE VISITED SET IS THE RIGHT TERMINATION ARGUMENT AND A DEPTH COUNTER IS
+// NOT. Re-entering a pair means the two types are related to themselves the same
+// way one level down, which is precisely the co-inductive "assume equal, refute
+// on a difference" answer that structural equivalence of recursive types is
+// DEFINED by — so `continue` here is the CORRECT verdict, not a truncation. It
+// doubles as memoization: a type graph that SHARES a deep subtree (`fn(T, T, T)`)
+// is walked once per distinct pair rather than once per occurrence.
+//
+// ⚠ A NOMINAL type still short-circuits above, so the set is normally never
+// touched: `std::unordered_set` allocates nothing until its first insert, and the
+// two early-outs answer the overwhelmingly common case before that.
 [[nodiscard]] inline bool spellingBlindCompatible(TypeInterner const& in, TypeId a,
-                                                  TypeId b, int depth = 0) {
+                                                  TypeId b) {
     if (!a.valid() || !b.valid()) return false;
     if (a.v == b.v) return true;
-    if (depth > 16) return false;
-    TypeKind const ka = in.kind(a);
-    if (ka != in.kind(b)) return false;
-    switch (ka) {
-        case TypeKind::Struct:
-        case TypeKind::Union:
-        case TypeKind::Enum:
-        case TypeKind::Extension:
-            return false;   // nominal — identity already answered
-        default:
-            break;
+
+    // The pairs still to compare. LIFO, pushed in reverse so operands come back
+    // out in source order and the FIRST difference found is the shallowest,
+    // leftmost one — the same one the recursion used to report.
+    std::vector<std::pair<TypeId, TypeId>> work;
+    work.emplace_back(a, b);
+    // The pairs already ASSUMED equal. Ordered — (x,y) and (y,x) are different
+    // keys — which costs one extra entry on a symmetric walk and keeps the key
+    // exactly the pair that was pushed.
+    std::unordered_set<std::uint64_t> assumedEqual;
+
+    while (!work.empty()) {
+        auto const [x, y] = work.back();
+        work.pop_back();
+        if (!x.valid() || !y.valid()) return false;
+        if (x.v == y.v) continue;
+        if (!assumedEqual
+                 .insert((static_cast<std::uint64_t>(x.v) << 32) | y.v)
+                 .second)
+            continue;
+        TypeKind const kx = in.kind(x);
+        if (kx != in.kind(y)) return false;
+        switch (kx) {
+            case TypeKind::Struct:
+            case TypeKind::Union:
+            case TypeKind::Enum:
+            case TypeKind::Extension:
+                return false;   // nominal — identity already answered
+            default:
+                break;
+        }
+        // The qualifier skin IS part of the type here (a `volatile` pointee is a
+        // different type from a plain one), unlike in `sameRepresentation` where
+        // it is transparent because it changes no bits.
+        if (in.isVolatileQualified(x) != in.isVolatileQualified(y)) return false;
+        if (in.isAtomicQualified(x) != in.isAtomicQualified(y)) return false;
+        {
+            auto const scX = in.scalars(x);
+            auto const scY = in.scalars(y);
+            if (scX.size() != scY.size()) return false;
+            for (std::size_t i = 0; i < scX.size(); ++i)
+                if (scX[i] != scY[i]) return false;
+        }
+        auto const opsX = in.operands(x);
+        auto const opsY = in.operands(y);
+        if (opsX.size() != opsY.size()) return false;
+        for (std::size_t i = opsX.size(); i-- > 0;)
+            work.emplace_back(opsX[i], opsY[i]);
     }
-    // The qualifier skin IS part of the type here (a `volatile` pointee is a
-    // different type from a plain one), unlike in `sameRepresentation` where it is
-    // transparent because it changes no bits.
-    if (in.isVolatileQualified(a) != in.isVolatileQualified(b)) return false;
-    if (in.isAtomicQualified(a) != in.isAtomicQualified(b)) return false;
-    {
-        auto const scA = in.scalars(a);
-        auto const scB = in.scalars(b);
-        if (scA.size() != scB.size()) return false;
-        for (std::size_t i = 0; i < scA.size(); ++i)
-            if (scA[i] != scB[i]) return false;
-    }
-    auto const opsA = in.operands(a);
-    auto const opsB = in.operands(b);
-    if (opsA.size() != opsB.size()) return false;
-    for (std::size_t i = 0; i < opsA.size(); ++i)
-        if (!spellingBlindCompatible(in, opsA[i], opsB[i], depth + 1)) return false;
     return true;
 }
 

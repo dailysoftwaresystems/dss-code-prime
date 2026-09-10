@@ -456,6 +456,7 @@ declare -A LEG_SPEC=() LEG_FORMAT=() LEG_ARCH=() \
            LEG_RUN_FILESYSTEM=() LEG_CONFOUNDS=() LEG_ABORT_CONFOUNDS=() \
            LEG_RUN_LAUNCH=() \
            LEG_CONFOUND_GATING=() LEG_CONFOUND_REPORT=() \
+           LEG_RUN_DIR_GATING=() LEG_RUN_DIR_REQUIREMENTS=() \
            LEG_CONFOUND_DECLARED=() \
            LEG_RECIPE_TRANSFORM=() LEG_HEADER_STAGE_KEY=() LEG_ZCONF_GUARDS=() \
            LEG_CONFIG_STAGE_KEY=() LEG_CONFIGURE_ANSWERS=() \
@@ -1272,6 +1273,57 @@ leg_run_dir_plan() {           # leg_run_dir_plan <leg> <driver-rundir>  -> JSON
       never assumed — and the assumption is what put a Linux sqlite corpus onto DrvFs."
   printf '%s\n' "$out"
 }
+# >>> dss:run-dir-corroborate >>>  (paired in build-and-test.ps1)
+# ★★★ A CONFOUND ROW MAY BE CORROBORATED AGAINST *THIS LEG'S OWN RUN DIRECTORY*,
+# AND THE MEASUREMENT IS TAKEN AFTER THE PLAN, BECAUSE THAT IS THE ONLY MOMENT
+# BOTH FACTS EXIST.
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+#
+# ★★ THE SHAPE IS `matches: build-tu`'s, ONE NAME SPACE OVER: THE ROW ALONE
+# EXCUSES NOTHING. A build-tu row is honoured only where THIS RUN's reference
+# oracle also rejected the named TU; a row declaring `requiresRunDirectory` is
+# honoured only where THIS RUN's measurement of THIS LEG's run directory found
+# the precondition. A row whose precondition measures ABSENT reports itself
+# UNCORROBORATED and excuses nothing.
+#
+# ⚠ IT IS NOT AN `environmentProbes` QUESTION AND CANNOT BE MADE ONE: probe
+# verdicts are filed per KERNEL, sampled ONCE, BEFORE any leg is built, and
+# `--probe-environment` takes no leg and no directory.
+#
+# ★ THIS DRIVER DECIDES NOTHING. It hands over the supply it holds and takes
+# back the supply that survived, exactly as it does for `--run-dir-plan`. Which
+# rows a measurement withheld is the resolver's answer, in one file, so the two
+# drivers cannot drift into two ledgers — one axis along from
+# D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG.
+#
+# ⚠ THE SUPPLY IS READ FROM THE SAME GLOBAL ARRAYS leg_confound_patterns READS,
+# deliberately: this driver has exactly one per-leg record of the plan, and a
+# second copy passed by argument would be a second thing to keep in step.
+leg_run_dir_corroboration() {  # leg_run_dir_corroboration <leg> <driver-rundir>
+  local leg="$1" driver_run_dir="$2"
+  local -a supplied=() supplied_abort=()
+  eval "supplied=(${LEG_CONFOUNDS[$leg]:-})"
+  eval "supplied_abort=(${LEG_ABORT_CONFOUNDS[$leg]:-})"
+  local -a argv=(--catalogue "$LEG_CATALOGUE" --corroborate-run-dir "$leg"
+                 --host-os "$HOST_OS" --host-arch "$HOST_ARCH"
+                 --driver-run-dir "$driver_run_dir" --format json)
+  local p
+  for p in "${supplied[@]:-}";       do [[ -n "$p" ]] && argv+=(--supplied "$p"); done
+  for p in "${supplied_abort[@]:-}"; do [[ -n "$p" ]] && argv+=(--supplied-abort "$p"); done
+  local out rc
+  # rc DIRECTLY off python3, never after a pipe.
+  if out="$(python3 "$LEG_RESOLVER" "${argv[@]}" 2>&1)"; then rc=0; else rc=$?; fi
+  [[ $rc -eq 0 && -n "${out//[[:space:]]/}" ]] || die "[$leg] could not CORROBORATE this leg's confound rows against its own run directory (harness_legs.py --corroborate-run-dir, rc=$rc):
+      ${out:-<no diagnostic>}
+      A row declaring \`requiresRunDirectory\` is honoured ONLY where THIS RUN measured the
+      precondition on THIS LEG'S own run directory. Continuing without the measurement would
+      either excuse a failure on evidence nobody gathered, or withhold an earned excusal and
+      report it as a compiler regression.
+      [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]"
+  printf '%s\n' "$out"
+}
+# <<< dss:run-dir-corroborate <<<
 # One field out of that JSON. A LIST field (the argv prefixes, the launcher argv)
 # comes back shlex-quoted and space-joined so the caller `eval`s it into an array
 # — the same transport `emit_sh` uses for LEG_LAUNCH, and for the same reason: a
@@ -5935,6 +5987,25 @@ leg_confound_patterns() {   # leg_confound_patterns <leg>  -> shlex-quoted words
         honoured, on evidence gathered somewhere this driver cannot vouch for. A verdict captured on
         another box would excuse a real miscompile HERE, in silence. Drop the flag and let it measure.
       [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]"
+  # ★★ AND WHETHER *THIS LEG'S OWN RUN DIRECTORY* WAS MEASURED, when any row on
+  # it is corroborated against one. Its OWN field, never folded into
+  # LEG_CONFOUND_GATING: the two answer separate questions measured at separate
+  # times, and a refusal has to name which of the two it is refusing.
+  # ANCHOR, ONE LINE, DO NOT WRAP:
+  # D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+  # ⚠ `unmeasured` IS THE VALUE A PLAN ALONE CAN EVER CARRY — a plan is resolved
+  # before any run directory exists — so this refusal is what makes the
+  # corroborator STRUCTURALLY unskippable rather than a convention. A driver that
+  # forgot the call stops here instead of quietly under-excusing, which is the
+  # direction that reads as a compiler regression.
+  [[ "${LEG_RUN_DIR_GATING[$leg]:-}" == 'not-required' || "${LEG_RUN_DIR_GATING[$leg]:-}" == 'measured' ]] || die "[$leg] the resolved leg plan says runDirectoryGating='${LEG_RUN_DIR_GATING[$leg]:-<unset>}', which is neither 'not-required' nor 'measured'.
+      A confound row declaring \`requiresRunDirectory\` is honoured ONLY where THIS RUN measured
+      the named precondition on THIS LEG'S own run directory, and a PLAN can never carry that
+      measurement: it is resolved before any run directory exists. Call harness_legs.py
+      --corroborate-run-dir with this leg's run directory and supply THAT result here.
+      'unmeasured' is fail-safe (every corroborated row is INACTIVE) and NOT fit to run on: the
+      withheld excusals surface as GENUINE reds and read as compiler regressions.
+      [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]"
   printf '%s' "${LEG_CONFOUNDS[$leg]}"
 }
 # <<< dss:confound-supply <<<
@@ -6502,6 +6573,20 @@ for leg in "${LEG_ORDER[@]}"; do
     fi
     info "[$leg] loadext helper carried into the launcher's filesystem -> $leg_launch_run/$SQLITE_TESTDIR_SUBDIR/$(basename "$STAGE_STAGED")"
   fi
+  # ★ CORROBORATED AGAINST THIS LEG'S OWN RUN DIRECTORY FIRST, which by now
+  # exists. A row declaring `requiresRunDirectory` excuses nothing on a host
+  # where its precondition does not hold, and the resolver — not this driver —
+  # decides which rows the measurement withheld.
+  # ANCHOR, ONE LINE, DO NOT WRAP:
+  # D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+  # ⚠ A PLAIN ASSIGNMENT, for the same reason the supply below uses one: `die`
+  # is `exit 1`, which exits the SUBSHELL a command substitution runs in, and
+  # bash does not propagate a failed substitution inside a non-assignment
+  # command. [D-HARNESS-CONFOUND-SUPPLY-REFUSAL-DIES-IN-A-SUBSHELL]
+  RUN_DIR_CORROBORATION="$(leg_run_dir_corroboration "$leg" "$rundir")"
+  LEG_CONFOUNDS["$leg"]="$(run_dir_field "$RUN_DIR_CORROBORATION" confounds)"
+  LEG_ABORT_CONFOUNDS["$leg"]="$(run_dir_field "$RUN_DIR_CORROBORATION" abortConfounds)"
+  LEG_RUN_DIR_GATING["$leg"]="$(run_dir_field "$RUN_DIR_CORROBORATION" runDirectoryGating)"
   # THE CONFOUNDS FOR THIS LEG — read from the leg's OWN declaration (legs.json
   # `confounds`, resolved by harness_legs.py), which is the same declaration
   # build-and-test.ps1 reads. ONE ledger, both drivers.
@@ -6537,6 +6622,11 @@ for leg in "${LEG_ORDER[@]}"; do
   # exactly what a reader of that run needs to know.
   # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
   print_confound_report "$leg" "${LEG_CONFOUND_REPORT[$leg]:-}"
+  # ★ AND THE CORROBORATION'S OWN ACCOUNT, generated by the resolver and printed
+  # verbatim — the measurement, the directory it was taken on, and every row it
+  # withheld or re-earned. An excusal a reader cannot check is not an earned one.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  print_confound_report "$leg" "$(run_dir_field "$RUN_DIR_CORROBORATION" reportText)"
   runlog="$OUT_DIR/$leg/corpus.log"
   ledger="$OUT_DIR/$leg/corpus-units.txt"
   # scratch lives in the leg's OUT dir — NEVER in the sqlite clone (the .sh runs the

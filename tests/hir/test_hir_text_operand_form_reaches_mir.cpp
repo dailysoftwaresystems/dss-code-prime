@@ -86,7 +86,7 @@ constexpr std::string_view kResolvedToNothingPrefix =
 [[nodiscard]] std::string moduleWithFormBoundOperand(std::string_view letter,
                                                      std::string_view form) {
     return std::string(
-               "dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+               "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
                "  function %1 : fn() -> void {\n    block {\n"
                "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"")
          + std::string(letter) + "\" spells ( \"%0\" ) operand_kind "
@@ -151,7 +151,7 @@ TEST(HirTextOperandForm, MemoryFormReachesTheMirLoweringWithItsBindingIntact) {
 // outright would leave the whole file green.
 TEST(HirTextOperandForm, AnOperandThatResolvedToNothingIsStillRefusedByThatName) {
     std::string const text =
-        "dsshir 1\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"i\" "
         "spells ( \"%0\" ) -> lit int 7 : i32 ) }\n"

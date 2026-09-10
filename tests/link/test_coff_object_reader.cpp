@@ -2334,13 +2334,26 @@ TEST(CoffWeakExternal, SectionBackedDefaultBindsTheWeakNameToThatBody) {
         << "two functions -- the shared body and `caller` -- never three";
 }
 
-// -- (b) A NON-section-backed default: fail loud, and name the missing fact ---
+// -- (b) A NON-section-backed default: a WEAK UNDEFINED REFERENCE, read as one -
 //
-// gcc's encoding of a weak UNDEFINED reference: the default is an ABSOLUTE
-// symbol of value 0, so an unresolved reference tests as 0. DSS's link tier
-// cannot carry that -- ExternImport declares no binding on ANY format -- so the
-// reader REFUSES rather than silently promoting the name to a strong extern.
-TEST(CoffWeakExternal, AbsoluteDefaultIsAWeakUndefinedReferenceAndFailsLoud) {
+// The encoding of a weak UNDEFINED reference: the default is an ABSOLUTE symbol
+// of value 0, so an unresolved reference tests as 0. ✔MEASURED that both mingw
+// gcc 13.2.0 (function form) and clang 18.1.3 (both windows triples, data and
+// function) emit exactly this shape, and that a program linked from it with NO
+// definition present RUNS and takes the null branch.
+//
+// ★★ THIS PIN USED TO ASSERT A REFUSAL, AND THE SENTENCE THAT JUSTIFIED IT HAS
+// EXPIRED RATHER THAN BEEN WRONG. It read: "DSS's link tier cannot carry that --
+// ExternImport declares no binding on ANY format -- so the reader REFUSES rather
+// than silently promoting the name to a strong extern." Every clause was TRUE
+// when written, and refusing WAS the right answer while the carrier was missing:
+// the alternative was a silent weak->strong downgrade. The carrier landed with
+// [[D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE]] -- `ExternImport::binding`
+// exists, all three writers spell it, and an image link resolves an unbound weak
+// reference to a null import slot -- so continuing to refuse would mean refusing
+// a shape DSS's own PE writer now emits. The pin therefore FLIPS to asserting
+// the read, which is what its own comment said would happen.
+TEST(CoffWeakExternal, AbsoluteDefaultIsAWeakUndefinedReferenceAndIsReadAsOne) {
     auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(loaded.target && loaded.format);
 
@@ -2354,12 +2367,27 @@ TEST(CoffWeakExternal, AbsoluteDefaultIsAWeakUndefinedReferenceAndFailsLoud) {
 
     DiagnosticReporter rep;
     auto got = pe::readRelocatableObject(obj, *loaded.target, *loaded.format, rep);
-    EXPECT_FALSE(got.has_value());
-    EXPECT_TRUE(sawCode(rep, DiagnosticCode::F_CorruptedBinary));
-    EXPECT_TRUE(sawDetail(rep, "WEAK UNDEFINED REFERENCE"))
-        << "the diagnostic must name the construct, not just refuse";
-    EXPECT_TRUE(sawDetail(rep, "D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE"))
-        << "and it must point at the row that owns the missing carrier";
+    ASSERT_TRUE(got.has_value())
+        << "a weak undefined reference is a shape DSS both emits and models; "
+           "errs=" << rep.errorCount();
+    ASSERT_TRUE(hasExternNamed(*got, "maybe"))
+        << "it is an IMPORT -- a name this object references and does not define";
+    for (auto const& e : got->externImports) {
+        if (e.mangledName != "maybe") continue;
+        EXPECT_EQ(e.binding, SymbolBinding::Weak)
+            << "reading it Global is a SILENT weak->strong downgrade: the one "
+               "property that makes the reference weak -- that it may legally "
+               "resolve to nothing -- would be lost with no diagnostic, and a "
+               "re-emitted object would demand a symbol the original did not.";
+    }
+    // The ABSOLUTE fallback is NOT re-exported as a symbol of its own: PE/COFF
+    // 5.5.3 makes it the thing to use INSTEAD when sym1 is absent, and when it
+    // is an absolute 0 the answer it supplies is "nothing" -- which the binding
+    // already says in the format-neutral vocabulary. Carrying the producer's
+    // private `.weak.<n>` spelling forward would re-export a name that denotes
+    // no object.
+    EXPECT_FALSE(hasExternNamed(*got, "Wabs"))
+        << "the fallback is the ANSWER to the weak reference, not a second import";
 }
 
 // -- (c) THE PIN THAT KEEPS THE DISPATCH TOTAL -------------------------------
@@ -2781,12 +2809,42 @@ TEST(CoffWeakExternalNative, RealMingwWeakAliasBindsBothNamesToOneBody) {
 #endif
 }
 
-// A REAL mingw weak UNDEFINED REFERENCE -- the half DSS's symbol model cannot
-// yet carry. It must be REFUSED with a diagnostic naming the missing fact, not
-// read as a strong extern. ⚠ THIS TEST RECORDS A GAP, NOT A CAPABILITY: gcc and
-// clang both LINK this construct and let the reference test as zero. When the
-// carrier lands, this pin flips to asserting the link succeeds.
-TEST(CoffWeakExternalNative, RealMingwWeakUndefinedReferenceIsRefusedNotDowngraded) {
+// A REAL mingw weak UNDEFINED REFERENCE, read back as one.
+//
+// ★★ THIS PIN ALSO FLIPPED, ON ITS OWN STATED CONDITION. It read: "⚠ THIS TEST
+// RECORDS A GAP, NOT A CAPABILITY: gcc and clang both LINK this construct and
+// let the reference test as zero. When the carrier lands, this pin flips to
+// asserting the link succeeds." The carrier landed
+// ([[D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE]]).
+//
+// ⚠ AND A PREMISE IN THE OLD COMMENT WAS NARROWER THAN IT SOUNDED. "gcc and
+// clang both LINK this construct" is TRUE OF A FUNCTION and FALSE OF A DATA
+// OBJECT under mingw gcc. ✔MEASURED 2026-09-02, a 2x2 over {data, function} x
+// {leading attribute, after-declarator attribute}, so the variable is isolated:
+// mingw gcc 13.2.0 emits `scl 105` + an ABSOLUTE `.weak.<n>` default for the
+// FUNCTION form (link rc 0, run rc 42) at BOTH attribute positions, and a PLAIN
+// `scl 2` UNDEF for the DATA form at BOTH (ld: "undefined reference to `ea'").
+// clang 18.1.3 emits the weak external for BOTH forms and BOTH windows triples.
+// The fixture below is the FUNCTION form, which is the half gcc gets right.
+//
+// ⚠⚠ AND THE OBJECT STILL DOES NOT READ — FOR A DIFFERENT, PRE-EXISTING REASON
+// THAT THIS PIN NOW NAMES INSTEAD OF HIDING. Flipping the weak arm exposed it:
+// mingw routes the address of `maybe` through a COMDAT indirection section
+// `.rdata$.refptr.maybe`, whose LONG name the reader surfaces unresolved as
+// `/15`, and the section-kind gate refuses a body it cannot classify. ✔MEASURED
+// through the CLI at this tree: `dsscp --compile wu.o --target
+// x86_64:pe64-x86_64-windows` reports exactly ONE diagnostic — "defined symbol
+// '.refptr.maybe' lives in section '/15' which resolves to no known code/data
+// section kind" — and NOT the weak-reference refusal that used to accompany it.
+// That gate is a LOUD refusal of a whole object, never a silent drop, and it is
+// nothing to do with weakness: it fires on any mingw object using `.refptr`.
+// ★ SO THIS TEST ASSERTS THE PROPERTY IT OWNS AND PINS THE BLOCKER SEPARATELY.
+// The weak-arm assertion is NOT vacuous — that diagnostic WAS being emitted for
+// this exact fixture until the carrier landed. The blocker assertion is what
+// keeps the pair honest: the day `.refptr` is classified, it goes RED and forces
+// this test to flip to asserting the read, rather than quietly staying green
+// over a refusal nobody re-examined.
+TEST(CoffWeakExternalNative, RealMingwWeakUndefinedReferenceNoLongerRefusesOnWeakness) {
 #if !defined(_WIN32)
     GTEST_SKIP() << "compiles a mingw-gcc COFF object; Windows only";
 #else
@@ -2805,10 +2863,29 @@ TEST(CoffWeakExternalNative, RealMingwWeakUndefinedReferenceIsRefusedNotDowngrad
     DiagnosticReporter rep;
     auto got = pe::readRelocatableObject(readFile(obj), *loaded.target,
                                          *loaded.format, rep);
+    // (1) THE PROPERTY THIS ROW OWNS: the weak-undefined-reference arm no longer
+    // refuses. It DID refuse this exact fixture until `ExternImport` could carry
+    // a binding, so this assertion has a red history and is not vacuous.
+    EXPECT_FALSE(sawDetail(rep, "WEAK UNDEFINED REFERENCE"))
+        << "the reader must no longer refuse a weak undefined reference for being "
+           "one: the fact it could not represent -- an import binding -- now "
+           "exists, and refusing would mean refusing a shape DSS itself emits.";
+    EXPECT_FALSE(sawDetail(rep, "D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE"))
+        << "and it must no longer cite the row that has been closed by carrying "
+           "the missing fact";
+
+    // (2) THE REMAINING BLOCKER, PINNED BY NAME so it cannot be mistaken for the
+    // one above. When this goes red because `.refptr` gained a section kind, this
+    // test must FLIP to asserting the read and the import's Weak binding -- the
+    // same flip its own two predecessors made.
     EXPECT_FALSE(got.has_value())
-        << "reading it green would mean the weak flag was silently dropped";
-    EXPECT_TRUE(sawDetail(rep, "WEAK UNDEFINED REFERENCE"));
-    EXPECT_TRUE(sawDetail(rep, "D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE"));
+        << "if a mingw `.refptr` object now reads, delete this expectation and "
+           "assert `externImports` carries `maybe` with SymbolBinding::Weak";
+    EXPECT_TRUE(sawDetail(rep, "no known code/data section kind"))
+        << "the ONLY refusal left on this object must be the section-kind gate on "
+           "mingw's `.rdata$.refptr.<name>` COMDAT indirection -- a pre-existing "
+           "limitation that fires on any object using `.refptr`, weak or not, and "
+           "is a loud refusal of the whole object rather than a silent drop.";
 #endif
 }
 

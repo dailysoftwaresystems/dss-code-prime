@@ -28,7 +28,7 @@ function Warn($m) { "      WARN: $m" }
 # host's "OK (N assertions)". This file now has a skippable block of its own, so it
 # inherits the same hazard and the same cure.
 # ★ ADDING AN ASSERTION WITHOUT BUMPING THIS NUMBER FAILS ON THE VERY NEXT RUN.
-$TotalAssertions = 117    # 11 classifier + 18 checkout-provenance + 9 loadext rc contract (python-gated)
+$TotalAssertions = 128    # 11 classifier + 18 checkout-provenance + 9 loadext rc contract (python-gated)
                           # +6 (2026-09-01): the identity-triple JOIN in both
                           # drivers, and what each hands --reference-target
                           # [D-HARNESS-ORACLE-CLASSIFIER-READS-AN-IDENTITY-TRIPLE-WITH-THE-LEG-SPEC-READERS]
@@ -501,6 +501,28 @@ Check "the .sh marks it too"                            ($shTxt  -match 'dss:smo
 # leg poisoned for the wrong reason still looks poisoned.
 Check "the .ps1 marks the build-attribution region"     ($ps1Txt -match 'dss:build-attribution')
 Check "the .sh marks it too"                            ($shTxt  -match 'dss:build-attribution')
+# [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+# ★★ Same discipline, and the failure direction here is the dangerous one: a
+# driver that stopped corroborating would EXCUSE `vtabH-3.1` on a host whose run
+# drive root is clean — hiding a genuine dss regression — and an excused failure
+# is indistinguishable from an absent one in the leg verdict. So the region
+# marker, the CALL, and the GATING REFUSAL that makes forgetting the call fatal.
+Check "the .ps1 marks the run-directory corroboration region" ($ps1Txt -match 'dss:run-dir-corroborate')
+Check "the .sh marks it too"                                  ($shTxt  -match 'dss:run-dir-corroborate')
+# ★★ THE NEEDLE IS THE ARGUMENT AS THE ARGV SPELLS IT, NEVER THE BARE OPTION
+# NAME, and this pin was WEAKER until a mutant proved it. —MEASURED while
+# writing: `--corroborate-run-dir` occurs FOUR times in the .ps1 (a region
+# comment, this driver's refusal text, the help-facing prose, the argv), so a
+# mutation that renamed the ARGV entry left the bare-name pin GREEN — a pin
+# whose witness is not unique in its own subject, exactly as the oracle-status
+# pin a few lines up records for the same reason. Two claims, two needles: the
+# argv really names the verb, and the CALL SITE really invokes the function.
+Check "the .ps1's argv really names the corroboration verb" ($ps1Code -match [regex]::Escape("'--corroborate-run-dir', ""`$label"""))
+Check "...and the leg loop CALLS it with this leg's run directory" ($ps1Code -match [regex]::Escape('Get-LegRunDirCorroboration $LegTag $rundir'))
+Check "the .sh's argv really names the corroboration verb" ($shCode -match [regex]::Escape('--corroborate-run-dir "$leg"'))
+Check "...and the .sh leg loop CALLS it with this leg's run directory" ($shCode -match [regex]::Escape('leg_run_dir_corroboration "$leg" "$rundir"'))
+Check "the .ps1 REFUSES an unmeasured run-directory gating"   ($ps1Code -match 'runDirectoryGating')
+Check "the .sh refuses it too"                                ($shCode  -match 'runDirectoryGating')
 Check "the .ps1 ASKS whose build failure it is"         ($ps1Code -match '--attribute-build')
 Check "the .sh asks it too"                             ($shCode  -match '--attribute-build')
 # ★ AND BOTH HAND OVER THE ORACLE'S STATUS, not just its log: a log left behind by
@@ -642,7 +664,7 @@ if (-not $supStart -or -not $supEnd) {
   $fail++
   # The 6 assertions below cannot run; count them so the accounting invariant
   # cannot be satisfied by silently losing them.
-  $skip += 8
+  $skip += 11
 } else {
   Invoke-Expression (($lines[($supStart-1)..($supEnd-1)]) -join "`n")
   "extracted $($supEnd - $supStart + 1) supply lines from the shipped script"
@@ -655,9 +677,18 @@ if (-not $supStart -or -not $supEnd) {
   # as GENUINE reds and read as compiler regressions. Defaulted to 'probed' here so
   # every assertion above keeps asking what it asked; the refusal gets its own leg.
   # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
-  function New-PinLeg($label, $confounds, $gating = 'probed') {
+  # + `runDirectoryGating`, the SECOND gating, which the supply also refuses to
+  # proceed without. A row declaring `requiresRunDirectory` is honoured only where
+  # THIS RUN measured the named precondition on THIS LEG'S own run directory, and
+  # a PLAN can never carry that measurement. `not-required` is the default here —
+  # the honest answer for a fixture leg whose rows name no precondition — so
+  # every assertion above keeps asking what it asked; the refusal gets its own leg.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  function New-PinLeg($label, $confounds, $gating = 'probed',
+                      $runDirGating = 'not-required') {
     return [pscustomobject]@{ label = $label; confounds = $confounds;
-                              confoundGating = $gating }
+                              confoundGating = $gating;
+                              runDirectoryGating = $runDirGating }
   }
   $ConfoundsOverride = $null
   $earned = @(Get-LegConfounds (New-PinLeg 'elf64-x86_64' @('^walsetlk-','^busy2-','^zipfile-25\.0$')))
@@ -696,6 +727,20 @@ if (-not $supStart -or -not $supEnd) {
   catch { $ungated = "$($_.Exception.Message)" }
   Check "an UNPROBED plan REFUSES rather than serving its ungated list" ($ungated -match "confoundGating='unprobed'")
   Check "...and says how to resolve a measured plan" ($ungated -match '--environment-probes skip')
+  # ★★ THE SECOND GATE'S REFUSAL, and it fails in the SAME silent direction: a
+  # driver that skipped the corroboration and served the plan's ungated list would
+  # excuse `vtabH-3.1` on a host whose run drive root is clean, which is a genuine
+  # dss regression laundered into "expected". `unmeasured` is the only value a
+  # PLAN can ever carry, so refusing it is what makes the call unskippable.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  $uncorrob = ''
+  try { [void](Get-LegConfounds (New-PinLeg 'pe64-x86_64' @('^vtabH-3\.1$') 'probed' 'unmeasured')) }
+  catch { $uncorrob = "$($_.Exception.Message)" }
+  Check "an UNMEASURED run directory REFUSES rather than serving its uncorroborated list" ($uncorrob -match "runDirectoryGating='unmeasured'")
+  Check "...and names the call that would measure it" ($uncorrob -match '--corroborate-run-dir')
+  # ★ AND THE ALLOWED VALUE REALLY PASSES — a refusal that refused everything
+  # would satisfy the two arms above while breaking every run.
+  Check "a 'measured' run-directory gating is ACCEPTED" (@(Get-LegConfounds (New-PinLeg 'pe64-x86_64' @('^vtabH-3\.1$') 'probed' 'measured')) -contains '^vtabH-3\.1$')
 }
 
 ""

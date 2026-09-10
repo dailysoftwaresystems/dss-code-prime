@@ -5,7 +5,10 @@
 // The LK11b merge's cross-CU REFERENCE resolution is keyed on the format's
 // DECLARED `externCallDispatch` (config, never format identity):
 //
-//   * `direct-plt` (every shipped format) / undeclared → the reference retargets
+//   * `direct-plt` (every shipped IMAGE format; it was every shipped format
+//     until P54 pointed the two RELOCATABLE pe formats at `indirect-slot` —
+//     D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET) /
+//     undeclared → the reference retargets
 //     DIRECTLY to the sibling definition's merged id. Pre-c154 the merge
 //     unconditionally minted a GOT-like RODATA thunk slot and retargeted the
 //     DIRECT call site into the slot's DATA bytes — the linked exec SIGSEGV'd
@@ -230,8 +233,10 @@ struct Loaded {
 }
 
 // The shipped ELF dyn format's JSON text with `externCallDispatch` flipped to
-// `indirect-slot` — the indirect-dispatch variant no shipped format declares
-// (all ship `direct-plt`), used to pin the thunk-slot arm.
+// `indirect-slot` — the indirect-dispatch variant no shipped IMAGE format
+// declares (they all ship `direct-plt`; since P54 the two RELOCATABLE pe
+// formats declare `indirect-slot`, which is why this says IMAGE and no longer
+// says "no shipped format"), used to pin the thunk-slot arm.
 [[nodiscard]] std::shared_ptr<ObjectFormatSchema> loadIndirectSlotDynVariant() {
     auto path = findShippedConfig({"elf64-x86_64-linux-dyn", "object-formats",
                                    ".format.json", "object format",
@@ -492,9 +497,17 @@ TEST(CrossCuLinkFormats, DirectPltLinksCleanOnAllFourShippedImageFormats) {
         ASSERT_TRUE(loaded.target && loaded.format);
         auto mods = makeCrossCuPair(leg.arm64, leg.withEntry);
         DiagnosticReporter rep;
+        // D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT:
+        // the darwin legs' shipped documents declare their ad-hoc code-signature
+        // identity as a FUNCTION of the artifact, and an emission that cannot
+        // name the file it produces is REFUSED with no fallback. The name is a
+        // FACT the driver supplies on every emission, never a knob, so stating it
+        // here is right for EVERY leg -- a format declaring no placeholder
+        // ignores it.
         auto image = linker::link(
             std::span<AssembledModule const>{mods.data(), mods.size()},
-            *loaded.target, *loaded.format, rep);
+            *loaded.target, *loaded.format, rep,
+            dss::ImageRequest{.artifactFileName = "crosscu_probe"});
         EXPECT_FALSE(rep.hasErrors())
             << "cross-CU direct bind must link clean; first diagnostic: "
             << (rep.all().empty() ? "" : rep.all().front().actual);
@@ -593,6 +606,20 @@ TEST(CrossCuLinkFormats, IndirectSlotDynMintsRelRoThunkSlotWithRelativeRow) {
     ASSERT_NE(format, nullptr);
     auto mods = makeCrossCuPair(/*arm64=*/false, /*withEntry=*/false,
                                 /*indirectSite=*/true);
+    // ⚠ THE CALLEE IS MADE HIDDEN, and the visibility is what keeps this test
+    // about the THUNK SLOT. D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: in
+    // a `.so` whose format declares a preemptible binding set — and this
+    // variant inherits the shipped dyn document's — a data slot holding the
+    // address of a DEFAULT-visibility global is resolved by the LOADER, so it
+    // takes a symbol-based row and its bytes are zeroed. That is the right
+    // answer for such a callee and the wrong subject for a pin about the
+    // prelinked RELATIVE convention. `hidden` is a definition no loader can
+    // replace, so the slot legitimately stays prelinked; cross-CU resolution is
+    // keyed on BINDING (non-Local), not visibility, so the merge is unchanged.
+    ASSERT_EQ(mods.size(), 2u);
+    ASSERT_EQ(mods[1].symbols.size(), 1u);
+    ASSERT_EQ(mods[1].symbols[0].name, "crossfn");
+    mods[1].symbols[0].visibility = SymbolVisibility::Hidden;
     DiagnosticReporter rep;
     auto image = linker::link(
         std::span<AssembledModule const>{mods.data(), mods.size()},

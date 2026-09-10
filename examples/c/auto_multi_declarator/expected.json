@@ -1,0 +1,33 @@
+{
+  "$comment": "P66 (C23 6.7.10, Annex J.2(78) + J.5.12, footnote 164): ONE initializer-inferred declaration, MANY declarators, ONE deduced type. DSS REFUSED every declaration in this file at the pre-change HEAD — `error[S_AutoRequiresSingleDeclarator]: initializer-inferred declaration declares 2 declarators — exactly one is required (C23 6.7.9p2)` — on programs clang 18.1.3 compiles and RUNS, so DSS was BELOW the union. ★★ THE REFUSAL'S PREMISE WAS THE STANDARD AND THE STANDARD REFUTES IT: type inference is C23 §6.7.10 (6.7.9 is Type DEFINITIONS — every in-tree citation of '6.7.9' for inference is off by one section), §6.7.10's ONE Constraint is that the declaration contain `auto`, the declarator COUNT is Annex J.2(78) UNDEFINED BEHAVIOUR (no diagnostic required, so accepting and refusing are BOTH conforming), Annex J.5.12 lists 'may … have more than one declarator' as a named COMMON EXTENSION, and footnote 164 recommends that an implementation accepting a wider form follow ISO/IEC 14882 — ONE type deduced for the whole declaration, shared by every declarator, hard error when two disagree. ✔MEASURED 2026-09-09, each reference probed SEPARATELY on its own TU: clang 18.1.3 `-std=c23` ACCEPTS at file AND block scope, SILENTLY at `-Wall -Wextra -pedantic` (it names the sibling `auto *a = &x, b = 2;` a Clang extension via -Wauto-decl-extensions and says nothing about this form), and a linked EXECUTED binary gives both objects `int`, `sizeof` 4, `_Generic` int, binds `int *` to each and returns the written values; it REFUSES `auto a = 1, b = 2.5;` naming BOTH deductions, which is what proves the type is shared rather than per-declarator. gcc 13.3.0 `-std=c2x` REFUSES. MSVC 19.51.36257 ABSTAINS rather than voting — it takes the SPELLING as the C89 storage class over an implicit `int`, accepting `auto a = 1, b = 2.5;` silently (b truncates to int) and failing `auto a = &x; *a` with C2100 'you cannot dereference an operand of type int'; an acceptance that drops meaning casts no vote. ONE WORKING accepting reference makes the behaviour REQUIRED. ★ THE REFERENCE ORACLE FOR THIS FILE IS clang AND IT WAS RUN, NOT ASSUMED: `clang -std=c23 -Wall -Wextra -pedantic` compiles it silently and the binary EXITS 42, and so does `clang -std=c23 -O2`. gcc refuses the file, which is exactly why clang is the oracle here — an example only DSS accepts is not a witness, it is a second copy of the bug. ★★ EVERY CLAIM HAS A RUNTIME CONSEQUENCE, which is what separates 'accepted' from 'means the right thing': the shared type must be a POINTER for `p[1] + q[2]` to index the backing array (a per-declarator int would not index), must be 8 bytes wide for `sizeof w + sizeof v` to be 16, and must be `int` for `int *pa = &a;` and `int *pb = &b;` to bind — so an implementation that accepted the declaration and typed only the FIRST declarator, or gave each its own type, changes the exit code rather than passing quietly. RED-ON-DISABLE, MEASURED through the shipped CLI: put the count gate back in `resolveAutoInferredDeclaration` (`if (declarators.size() != 1)`) and this file does not COMPILE — it stops exiting 42. Data-model-independent; one exit code across all four targets including the shipped release pipeline.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

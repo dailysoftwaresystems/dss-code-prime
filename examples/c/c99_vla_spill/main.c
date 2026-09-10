@@ -7,7 +7,9 @@
 // garbage below the array OR clobber the array's own elements. The exit code then
 // flips. Both are the #1 silent-miscompile the SP->FP fixed-frame base-switch
 // closes; this example is the runtime guard (the byte pins + the static completeness
-// verifier are the others). LEAF (no calls), so it is in C1b frame-model scope.
+// verifier are the others). LEAF (no calls). ⚠ That was once the WHOLE of "C1b
+// frame-model scope"; the leaf-only boundary is GONE since 2026-09-04 (P59)
+// (D-CSUBSET-VLA-NONLEAF-CALL-FRAME, CLOSED). Still a leaf, now by choice.
 //
 // base == 0, so s_k == k+1;  sum(s0..s25) = 1+2+...+26 = 351.  a[5] == 5.
 // Exit code MUST be 351 + 5 - 314 = 42.

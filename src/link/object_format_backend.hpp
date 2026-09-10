@@ -339,6 +339,27 @@ public:
     virtual void validateIdentity(detail::ObjectFormatData const& d,
                                   SchemaProblemSink const&        fail) const = 0;
 
+    // ── D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING ──────────────────
+    //
+    // Can THIS backend's walker actually encode a reference that the LOADER
+    // resolves from its GLOBAL COALESCING SCOPE — an import bound to no named
+    // library, whose winner may be any image in the process including this one?
+    //
+    // ★ IT IS A WALKER CAPABILITY, WHICH IS WHY IT LIVES HERE AND NOT IN A
+    // `.format.json`. `preemptibleDefinitionBindings` is the DECLARATION that
+    // such references must be minted for this format; whether the bytes can
+    // then be written is a property of the CODE that writes them, and a
+    // document cannot truthfully answer it. Same split, and the same reason, as
+    // `weakDefinitionDialects()` above: the loader refuses a document declaring
+    // a dialect its own backend does not write.
+    //
+    // ★ DEFAULT FALSE, DELIBERATELY. A backend that gains the declaration
+    // without gaining the encoder keeps the LOUD REFUSAL rather than silently
+    // emitting the direct branch — which compiles, links, loads and answers the
+    // wrong question. Overriding this is the act of claiming the bytes exist.
+    [[nodiscard]] virtual bool
+    realizesCoalescingScopeReferences() const noexcept { return false; }
+
     // ── Emit ────────────────────────────────────────────────────────────
 
     // Encode a linked module into this format's bytes. Replaces the 6-arm

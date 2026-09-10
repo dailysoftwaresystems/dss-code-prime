@@ -19,6 +19,7 @@
 #include <expected>
 #include <filesystem>
 #include <memory>
+#include <mutex>          // std::once_flag — the role resolver's one-shot family assembly
 #include <optional>
 #include <span>
 #include <string>
@@ -614,7 +615,9 @@ struct DSS_EXPORT MachODylibRef {
 // CodeDirectory carries the CS_ADHOC flag and dyld trusts the embedded
 // page hashes alone. The reservation SIZE is DERIVED from this block
 // (`adHocCodeSignatureSize`), so a hand-typed `codeSignatureSize` is not
-// needed when `codeSignature` is set.
+// merely unnecessary when `codeSignature` is set -- declaring BOTH is
+// REFUSED at load. Anchored at
+// D-LK-MACHO-CODESIGN-SIZE-SILENTLY-OVERRIDDEN-BY-ADHOC.
 //
 // The two enums are closed (one variant each today) so a typo in the
 // JSON fails loud at load (mirrors `ExternCallDispatch`'s closed-enum
@@ -662,6 +665,69 @@ kMachOCodeSignatureHashAlgoTable{{{
 // spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
 // would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
 DSS_CHECK_ENUM_NAME_TABLE(kMachOCodeSignatureHashAlgoTable);
+
+// LC_UUID (`uuid_command`). The image's identity — a 16-byte payload the
+// debugger, `dsymutil`, the crash reporter and `dyld_info` key on.
+//
+// ★★ WHY THIS IS A DECLARATION AND NOT A CONSTANT IN THE WRITER. It was
+// emitted unconditionally from `macho::encodeExec` / `encodeExecDynamic` when
+// D-LK-MACHO-EMITS-NO-LC-UUID first closed, on the argument that "a UUID
+// identifies a LINKED image, so adding a knob would invent a choice the
+// reference does not offer". ✔MEASURED 2026-09-07 on Apple Silicon (macOS
+// 26.6.2, Apple clang 21.0.0, `ld` PROJECT:ld-1267) that the reference DOES
+// offer it, on two axes:
+//   * `-no_uuid` — "Do not generate an LC_UUID load command in the output
+//     file" (man ld). Measured: it removes the command from BOTH a filetype-2
+//     exec and a filetype-6 dylib, with a plain rebuild immediately after as
+//     the CONTROL, which carries one again at the byte-identical payload — so
+//     the absence is the FLAG and not a build-to-build accident.
+//   * `-random_uuid` — "By default the linker generates the UUID of the output
+//     file based on a hash of the output file's content"; the flag substitutes
+//     a random one (measured: RFC variant-4 nibble, against the default's 3).
+// ⇒ presence and derivation are per-link POLICY in the reference, exactly as
+// signing (`-adhoc_codesign`) and platform (`-platform_version`) are — and
+// those two ARE declared here, as `codeSignature` and `buildVersion`.
+//
+// ★ THE DISCRIMINATOR, so this does not read as "declare everything". The
+// commands this writer emits from code — LC_SYMTAB, LC_DYSYMTAB and the
+// structural LC_SEGMENT_64s — have NO ld64 presence knob: ✔MEASURED, `-S` and
+// `-x` are CONTENT knobs that leave both commands standing, and `man ld` names
+// no load command at all except LC_UUID and LC_ID_DYLIB. The rule this file
+// follows is therefore *declare what the reference makes a policy*, and LC_UUID
+// was on the wrong side of it. (D-LK-MACHO-EMITS-NO-LC-UUID, second increment.)
+//
+// Absent → no LC_UUID, byte-identical to the pre-LC_UUID layout, which is also
+// what every MH_OBJECT flavour wants (`clang -c` emits none — measured in the
+// same run). `derivation` is a CLOSED vocabulary with one enumerator: DSS
+// derives the payload from content and will not offer a random one, because
+// several corpus examples compare a `--config=release` artifact byte-for-byte
+// and a random UUID makes every such artifact differ from itself. A document
+// asking for anything else fails loud at load rather than silently getting the
+// content hash.
+struct DSS_EXPORT MachOUuid {
+    enum class Derivation : std::uint8_t {
+        // SHA-256 over the image with the payload zeroed, truncated to 16
+        // bytes, RFC 9562 version-8 nibble + variant `10`. See
+        // `stampImageUuid` for the fixed-point argument.
+        ContentHash = 1,
+    };
+    Derivation derivation = Derivation::ContentHash;
+};
+
+inline constexpr EnumNameTable<MachOUuid::Derivation, 1>
+kMachOUuidDerivationTable{{{
+    { MachOUuid::Derivation::ContentHash, "content-hash" },
+}}};
+
+// Well-formedness of the table itself: no empty spelling, no duplicate
+// spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
+// would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
+DSS_CHECK_ENUM_NAME_TABLE(kMachOUuidDerivationTable);
+
+[[nodiscard]] constexpr std::optional<MachOUuid::Derivation>
+machoUuidDerivationFromName(std::string_view s) noexcept {
+    return kMachOUuidDerivationTable.fromName(s);
+}
 
 [[nodiscard]] constexpr std::optional<MachOCodeSignature::Kind>
 machoCodeSignatureKindFromName(std::string_view s) noexcept {
@@ -874,22 +940,54 @@ struct DSS_EXPORT MachOImage {
     std::vector<MachODylibRef> loadDylibs; // each → LC_LOAD_DYLIB
     // D-LK3-3 (c153): the MH_DYLIB LC_ID_DYLIB install name — the
     // identity a CLIENT records at link time and dyld resolves at its
-    // load (`@rpath/libdss.dylib` is the modern convention). REQUIRED
-    // non-empty on a Dylib schema and REJECTED on every other filetype
-    // (dead config there): every ld64-produced MH_DYLIB carries an
-    // LC_ID_DYLIB, and dyld's two-level-namespace client binding keys
-    // on it — emitting a dylib without one is an unverifiable-without-
-    // a-Mac corner this substrate does not ship. Config-driven + honest
-    // (the c150 DT_SONAME discipline): the walker NEVER derives the
-    // name from the output file name (it emits bytes and does not know
-    // it), and an unset field fails loud at validate() rather than
-    // silently inventing an identity. The shipped
-    // `macho64-arm64-darwin-dylib` schema declares a generic default
-    // (the same shipped-schema-identity concession as
-    // `codeSignature.identifier`); a differently-named artifact
-    // overrides via its own format JSON. Not needed for plain
-    // dlopen-by-path (dyld keys that on the path), but clients that
-    // LINK against the dylib record this string verbatim.
+    // load (`@rpath/${artifactFileName}` is what both shipped darwin
+    // dylib documents declare). REQUIRED non-empty on a Dylib schema
+    // and REJECTED on every other filetype (dead config there): every
+    // ld64-produced MH_DYLIB carries an LC_ID_DYLIB, and dyld's
+    // two-level-namespace client binding keys on it — emitting a dylib
+    // without one is an unverifiable-without-a-Mac corner this
+    // substrate does not ship. An unset field fails loud at validate()
+    // rather than silently inventing an identity.
+    //
+    // ⓘ THE ADJACENT QUESTION THIS ROW DID NOT SETTLE IS NOW SETTLED,
+    // and the pointer is kept because the ANSWER is the part worth
+    // reading. This block used to say `codeSignature.identifier` was
+    // still ONE constant per format and that whether it mattered "is
+    // NOT MEASURED and cannot be measured off a Mac". It was measured
+    // on a Mac, and it did matter — see
+    // D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT
+    // and the `codeSignature` field's own docblock below. ⚠ THE PROBE
+    // THIS BLOCK RECORDED WAS NOT SUFFICIENT AS WRITTEN — it named a
+    // DSS pair against "an ld64+codesign control", which varies the
+    // identifier AND the whole signature producer at once, so a passing
+    // result would have been equally consistent with "the identifier is
+    // harmless" and "DSS's signature is ignored". The run that settled
+    // it added the two arms that isolate the variable: the same DSS
+    // bytes with DISTINCT identifiers, and Apple's own toolchain FORCED
+    // to the shared one.
+    //
+    // ⚠ THIS COMMENT USED TO SAY, AS THE DISCIPLINE THAT KEPT THE FIELD
+    // HONEST, that "the walker NEVER derives the name from the output
+    // file name (it emits bytes and does not know it)", and that the
+    // shipped schema declares "a generic default … the same
+    // shipped-schema-identity concession as `codeSignature.identifier`".
+    // Both are now FALSE, and the second was the defect wearing a
+    // discipline's clothes: a single generic default meant every dylib
+    // DSS ever produced embedded ONE identity, so two of them loaded
+    // into one program collapsed to one. See
+    // D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT
+    // and `kArtifactFileNamePlaceholder` at the end of this header. The
+    // walker now RESOLVES the declared identity against the artifact
+    // named on the `ImageRequest`, so it does know which file it is
+    // producing — and a document may still declare a literal, which is
+    // then an explicit, config-visible choice (ld64's `-install_name`)
+    // rather than a code fallback. There is NO fallback: an emission
+    // that cannot name its artifact against a placeholder-bearing
+    // declaration is refused, never quietly given a constant.
+    //
+    // Not needed for plain dlopen-by-path (dyld keys that on the path),
+    // but clients that LINK against the dylib record this string
+    // verbatim.
     std::string   installName;
     // Eager-vs-lazy dynamic-binding choice (parallel to
     // `ElfIdentity.bindNow` — same semantic across ELF + Mach-O).
@@ -922,12 +1020,58 @@ struct DSS_EXPORT MachOImage {
     std::uint32_t codeSignatureSize = 0;
     // Ad-hoc code-signature FILL request (D-LK7-ADHOC-CODESIGN-MACHO
     // increment 2/2). When set, the walker DERIVES the reservation size
-    // from this block (via `adHocCodeSignatureSize`) — overriding any
-    // hand-typed `codeSignatureSize` — and writes a real CodeDirectory +
-    // SuperBlob into the reserved region instead of zeroes. When unset,
+    // from this block (via `adHocCodeSignatureSize`) and writes a real
+    // CodeDirectory + SuperBlob into the reserved region instead of
+    // zeroes. ⚠ It does NOT override a hand-typed `codeSignatureSize`
+    // any more: a document declaring BOTH keys is refused at load, so
+    // the encoder sees exactly one state instead of an invisible
+    // precedence rule. Anchored at
+    // D-LK-MACHO-CODESIGN-SIZE-SILENTLY-OVERRIDDEN-BY-ADHOC.
+    // When unset,
     // the legacy `codeSignatureSize`-only placeholder path (zero-fill)
     // is preserved unchanged. validate() rejects this block on a
     // MH_OBJECT (like the rest of the image block).
+    //
+    // ── D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ──
+    //
+    // ★ `identifier` NAMES THE ARTIFACT, through the SAME closed
+    // `${...}` vocabulary `installName` uses — one resolver, one
+    // vocabulary, and `kArtifactFileNamePlaceholder` at the end of this
+    // header is its only key. All four shipped darwin documents declare
+    // `com.dss.${artifactFileName}`; each used to declare a constant,
+    // so every artifact a format ever produced answered to one code
+    // identity.
+    //
+    // ★★ WHAT THE MEASUREMENT SAID, because "harmless" and "broken" are
+    // BOTH wrong here and the distinction is the whole finding. Four
+    // arms on Apple Silicon (macOS 26.6.2, ld-1267): two DSS dylibs
+    // sharing an identifier; the same two with distinct ones; an
+    // ld64+`codesign -s -` pair; and Apple's own pair FORCED to the
+    // shared identifier. NOTHING about loading is affected — both
+    // `dlopen`, both link into one executable, each resolves to its own
+    // file under `dladdr`, `codesign --verify` returns 0 on each — and
+    // the mechanism is that an ad-hoc DESIGNATED REQUIREMENT is
+    // CDHASH-keyed (`codesign -d -r-` prints `designated => cdhash
+    // H"…"` on both producers), so the identifier never reaches dyld's
+    // load path. What IS affected is identity-based requirement
+    // matching: a requirement `identifier "com.dss.dylib"` written for
+    // the first library ACCEPTS the second, where the same requirement
+    // over distinct identifiers REFUSES and a cdhash requirement over
+    // those same two files REFUSES. Apple's own ad-hoc signing derives
+    // the identifier per artifact (leaf name + LC_UUID), so the
+    // reference never produces one identity for two artifacts by
+    // itself. ⇒ not a load failure, and not harmless: two artifacts
+    // answering to one code identity, which is the only thing a
+    // constant in shared config can ever produce.
+    //
+    // ⚠ THE WALKER RESOLVES THIS ONCE INTO A LOCAL and reads that local
+    // twice — the reservation size (`adHocCodeSignatureSize`) and the
+    // blob (`buildAdHocCodeSignature`). Resolving twice is how a
+    // reservation stops matching its payload; the substrate invariant
+    // downstream would then fail loud on a defect one local prevents
+    // outright. There is no fallback: an emission that cannot name its
+    // artifact against a placeholder-bearing declaration is refused,
+    // because substituting something fixed IS the defect.
     std::optional<MachOCodeSignature> codeSignature;
     // LC_BUILD_VERSION platform / min-OS / SDK (D-LK10-ENTRY-MACHO-EXIT).
     // When set, BOTH Mach-O exec walkers emit a `build_version_command`
@@ -936,6 +1080,12 @@ struct DSS_EXPORT MachOImage {
     // (byte-identical to every pre-arm64 / MH_OBJECT schema). validate()
     // rejects this block on a MH_OBJECT (like the rest of the image).
     std::optional<MachOBuildVersion> buildVersion;
+    // LC_UUID (D-LK-MACHO-EMITS-NO-LC-UUID). When set, both Mach-O IMAGE
+    // walkers emit a `uuid_command` and stamp its payload from the image's own
+    // content. Absent → no LC_UUID, which is what every MH_OBJECT flavour
+    // wants. See `MachOUuid` for the reference measurement that made this a
+    // declaration rather than an unconditional emission.
+    std::optional<MachOUuid> uuid;
     // Modern dyld binding format (Xcode 12+ / macOS 12+). When
     // `true`, the walker emits `LC_DYLD_CHAINED_FIXUPS` (0x80000034)
     // pointing at a `dyld_chained_fixups_header` + chained-pointer
@@ -1487,6 +1637,19 @@ struct DSS_EXPORT ObjectFormatData {
     // `SehPersonality` for what two literals in `src/mir` this deletes.
     std::optional<SehPersonality> sehPersonality;
 
+    // ── D-CSUBSET-PACKED-ATOMIC-MEMBER: the atomics-runtime declaration ────
+    //
+    // OPTIONAL top-level `"atomicsRuntime"` block (`{"role": …,
+    // "loadMangledName": …, "storeMangledName": …}`). The GENERIC C11 atomics
+    // entry points an UNDER-ALIGNED `_Atomic` scalar access lowers to a CALL
+    // of. `std::nullopt` = this format supplies NO atomics runtime, which is
+    // NOT a silent default: what happens then is the TARGET's
+    // `underAlignedAtomicForm` answer — a `traps` target refuses the access
+    // loud (emitting the native form would be a guaranteed SIGBUS), a
+    // `losesAtomicity` target keeps the native form (the reference-exact
+    // choice where no runtime image exists, MEASURED: pe64 has none).
+    std::optional<AtomicsRuntime> atomicsRuntime;
+
     // ── UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): the REALIZED
     //    ENTRY-VERB set ─────────────────────────────────────────────
     //
@@ -1565,6 +1728,108 @@ struct DSS_EXPORT ObjectFormatData {
     // unknown VALUE still fails loud at load (the loader's enum check).
     std::optional<ExternCallDispatch> externCallDispatch;
 
+    // ── D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT:
+    //     WHICH imports `externCallDispatch` applies to ───────────────
+    //
+    // The symbol BINDINGS whose extern references take the `indirect-slot`
+    // shape. EMPTY (the key absent) = EVERY import, which is the unqualified
+    // meaning `indirect-slot` has always carried and what every format
+    // declaring it meant before this key existed.
+    //
+    // ★ WHY THIS IS A SECOND KEY AND NOT A THIRD `ExternCallDispatch` VALUE.
+    // `externCallDispatch` answers WHAT THE INDIRECT SHAPE IS for this format
+    // (deref a pointer slot vs. branch to a linker-synthesized stub). This key
+    // answers WHICH REFERENCES NEED IT. Those are orthogonal questions, and
+    // folding them into one enum would need a new member per (shape × scope)
+    // pair. The existing keys are all keyed by REFERENCE KIND —
+    // `externCallDispatch` for calls, `dataImportBinding` for data reads,
+    // `externAddrBinding` for address materialization; this one is keyed by
+    // the SYMBOL's binding, an axis none of them can express.
+    //
+    // ★★ WHY THE AXIS IS `SymbolBinding` AND NOT SOMETHING PE-SHAPED. A
+    // pc-relative code relocation can only name a target that will have a
+    // SECTION and an address. A WEAK undefined symbol may legally resolve to
+    // NOTHING, which COFF spells as an ABSOLUTE value-0 symbol — and no
+    // 32-bit displacement from a 0x140000000 image base reaches an absolute.
+    // A GLOBAL undefined symbol has no such resolution: the link either finds
+    // a definition or fails. So the question "can this reference be
+    // pc-relative here" is a question about the BINDING, in the same agnostic
+    // `SymbolBinding` vocabulary `ExternImport::binding` and
+    // `ModuleSymbol::binding` already speak. ✔MEASURED 2026-09-02 that all
+    // three references narrow on exactly this axis for FUNCTIONS, each probed
+    // separately with `weak` as the only variable: clang 18.1.3 emits
+    // `.rdata$.refptr.maybe` + two `REL32 .refptr.maybe` for a WEAK extern
+    // function and NO `.refptr` section at all for a STRONG one, on BOTH
+    // `--target=x86_64-pc-windows-msvc` AND `--target=x86_64-w64-windows-gnu`;
+    // mingw-w64 gcc 13.2.0 likewise emits `.refptr.maybe` only for the weak
+    // one. (Their DATA answer differs — see `dataImportBinding` below, which
+    // this key deliberately does NOT narrow, because the unconditional data
+    // slot has its own measured reason: `ld` refuses a direct rel32 against a
+    // symbol it must AUTO-IMPORT from a DLL.)
+    //
+    // ⚠ `SymbolBinding::Local` is REFUSED in this list at load: no format
+    // spells an undefined LOCAL symbol, so no import can ever carry it
+    // (`collectExterns` refuses one at the declaration's own span), and a
+    // list member that can never match is config that reads as a capability
+    // and is not one — the D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE shape.
+    //
+    // Read through `externRefSlotBindings()` / `externRefTakesImportSlot()`
+    // below, which are the ONE owner of the rule; no consumer re-derives it.
+    std::vector<SymbolBinding> indirectSlotBindings;
+
+    // ── D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING ────────────
+    //
+    // WHICH of THIS ARTIFACT'S OWN externally-visible definitions the artifact's
+    // LOADER may replace with another image's definition of the same name — so a
+    // reference made from INSIDE the artifact must be resolved by the loader
+    // rather than bound statically to the local body. The sibling question to
+    // `indirectSlotBindings` above, one step over: that key narrows which
+    // IMPORTS take a slot, this one names which DEFINITIONS cannot be reached
+    // directly. Same `SymbolBinding` vocabulary, same "empty means absent" rule.
+    //
+    // ⚠ ABSENCE IS "NOTHING IS PREEMPTIBLE", NOT "UNNARROWED" — the OPPOSITE
+    // default from `indirectSlotBindings`, and deliberately so. An empty
+    // `indirectSlotBindings` under an `indirect-slot` dispatch means the key
+    // adds no narrowing to a shape the format ALREADY declared; here there is
+    // no outer declaration to narrow, so an absent key can only mean "this
+    // format declares no preemption", which is the pre-existing behaviour
+    // BYTE-IDENTICALLY. Every relocatable object, every static library, and
+    // every main-executable flavour leaves it absent.
+    //
+    // ★★ WHY IT IS A PER-FORMAT SET AND NOT ONE RULE — ✔MEASURED 2026-09-05,
+    // and the two ecosystems give DIFFERENT answers to the same question:
+    //   * ELF: gcc 13.3.0 AND clang 18.1.3 route a shared object's own call to
+    //     its own definition through the PLT for a WEAK definition AND for a
+    //     STRONG global one alike (`call <w@plt>`, `call <st@plt>` in one
+    //     `.so`), because the ELF search scope puts the executable first and any
+    //     default-visibility definition in a library is therefore interposable.
+    //     The CONTROL in the SAME object: a `static` callee and a
+    //     `visibility("hidden")` callee are both DIRECT. The CONTROL in the same
+    //     ecosystem: an EXECUTABLE (`-pie` and `-no-pie`) binds BOTH its weak and
+    //     its strong self-calls directly, because the executable is always its
+    //     own winner. So ELF declares `["global", "weak"]` on its `.so` flavour
+    //     and nothing anywhere else.
+    //   * Mach-O: dyld's two-level namespace binds a STRONG dylib definition
+    //     locally and coalesces only WEAK ones (✔MEASURED on Apple Silicon in
+    //     cycle P61: the same source, weak → the consumer's answer, strong → the
+    //     dylib's own). So a Mach-O dylib's set is `["weak"]` — a STRICT SUBSET
+    //     of ELF's, which is exactly why this cannot be one hard-coded rule.
+    //   * PE: Windows has no symbol interposition; a DLL's internal call is
+    //     always its own. Absent.
+    //
+    // ⚠ VISIBILITY IS A PRECONDITION AND IS **NOT** IN THIS LIST. A `local`
+    // symbol, and any symbol whose visibility is not `default`, is absent from
+    // every image's dynamic export set, so NO loader can preempt it under ANY
+    // format — that is a universal fact, not a per-format declaration, and
+    // putting it in config would be a key whose only legal value is the one the
+    // engine must apply anyway. `SymbolBinding::Local` is REFUSED in this list
+    // at load for the same reason `indirectSlotBindings` refuses it: a member
+    // that can never match reads as a capability and is not one.
+    //
+    // Read through `definitionIsPreemptible()` below — the ONE owner of the
+    // rule, exactly as `externRefTakesImportSlot` is for its key.
+    std::vector<SymbolBinding> preemptibleDefinitionBindings;
+
     // ── D-LK-EXTERN-DATA-IMPORT: extern-DATA import binding model ───
     //
     // How an imported library DATA OBJECT (libc `stdout`) is bound
@@ -1614,6 +1879,53 @@ struct DSS_EXPORT ObjectFormatData {
     // loud at load (the closed-enum check — the externCallDispatch /
     // dataImportBinding discipline).
     std::optional<ExternAddrBinding> externAddrBinding;
+
+    // ── D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET:
+    //     the OBJECT-CARRIED realization of `dataImportBinding` ───────
+    //
+    // `dataImportBinding: "got-indirect"` says an extern DATA object's
+    // address is LOADED from a pointer slot rather than computed. On an
+    // IMAGE the slot is built by the import walker (the PE IAT entry, the
+    // ELF `.got`, the Mach-O `__got`) and nothing else is needed. A
+    // RELOCATABLE artifact has NO import walker: the same declared model
+    // can only be realized by the object CARRYING the slot itself, as a
+    // pointer-sized item holding an absolute relocation against the
+    // imported name that the FINAL linker fills.
+    //
+    // This block is that realization's DIALECT SPELLING — the symbol-name
+    // prefix the carried slot is published under — and it exists for the
+    // same reason `weakDefinition.dialect` does: the mechanism is an
+    // engine decision, the SPELLING is a per-ecosystem fact, and a
+    // spelling hardcoded in a walker is a format-identity branch wearing a
+    // string literal. It is NOT a second decision about WHETHER to
+    // indirect: that stays `dataImportBinding`'s, and the two are locked
+    // together at the linker (a relocatable format declaring the binding
+    // with no slot spelling FAILS LOUD there, and a format declaring the
+    // spelling without the binding likewise).
+    //
+    // ✔MEASURED 2026-09-02, why the prefix is `.refptr.` on PE/COFF and why
+    // matching the reference spelling is worth declaring rather than
+    // inventing: clang 18.1.3 emits `.refptr.<name>` for BOTH windows
+    // triples, and mingw-w64 gcc 13.2.0 emits it for every PE data extern.
+    // The slot is a COMDAT, so a DSS object and a clang object that import
+    // one name publish the SAME key and the final linker folds them into
+    // ONE slot; a private prefix would silently produce two.
+    //
+    // `std::nullopt` = the format declares no carried-slot spelling — the
+    // correct state for every IMAGE flavour (its walker owns the slot) and
+    // for a relocatable flavour that declares no `dataImportBinding` at all
+    // (its extern data addresses are computed directly, which is what
+    // cl.exe emits and what every ELF/Mach-O relocatable flavour does).
+    struct ObjectImportSlotInfo {
+        // The symbol-name prefix; the slot for import `ea` is published as
+        // `<symbolPrefix>ea`. Required non-empty when the block is present
+        // (validate()-enforced): an empty prefix would publish the slot
+        // under the IMPORT'S OWN NAME, which is a duplicate-symbol error at
+        // the final linker in the best case and a self-referential slot in
+        // the worst.
+        std::string symbolPrefix;
+    };
+    std::optional<ObjectImportSlotInfo> objectImportSlot;
 
     // ── D-CSUBSET-THREAD-LOCAL (TLS C1): thread-local access block ──
     //
@@ -1702,12 +2014,17 @@ struct DSS_EXPORT ObjectFormatData {
     // Declared by every format whose walker arm CONSULTS it, and by no other:
     // the pe object + staticlib documents (the COFF `.obj` writer), all ten ELF
     // documents (`elf::encode`, whose alias pass reaches `stbForBinding` on
-    // every flavor), and the four Mach-O OBJECT/staticlib documents
-    // (`macho::encode`'s MH_OBJECT arm). The Mach-O IMAGE documents, the pe
-    // IMAGE documents, wasm and spirv declare NOTHING, because their walkers
-    // encode no weak definition — a key nobody reads drifts silently while
-    // reading as authoritative, which is worse than no key at all
+    // every flavor), and all EIGHT Mach-O documents (`macho::encode` asks once
+    // above its filetype dispatch, so the MH_OBJECT, MH_EXECUTE and MH_DYLIB
+    // arms all reach it). The pe IMAGE documents, wasm and spirv declare
+    // NOTHING, because their walkers encode no weak definition — a key nobody
+    // reads drifts silently while reading as authoritative, which is worse than
+    // no key at all
     // ([[D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS]]).
+    // ⓘ The four Mach-O IMAGE documents were in the second list until
+    // [[D-LK3-DYLIB-WEAK-EXPORT]] closed, because their walker refused a weak
+    // definition rather than state part of what an image needs; it states all
+    // of it now, so they moved to the first.
     std::optional<WeakDefinition> weakDefinition;
 
     // ── D-LK2-RODATA closure: producer-data-section capability set ──
@@ -2258,11 +2575,55 @@ public:
     [[nodiscard]] RuntimeLibraryTable const& runtimeLibraries() const noexcept {
         return d_.runtimeLibraries;
     }
+
+    // ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ──
+    // The role table of the SHIPPED FLAVOURS OF THIS KIND — the half of a
+    // descriptor's `{"role": …}` answer this document does not declare itself,
+    // this document standing in for its shipped namesake (a `loadFromText`
+    // mutant of `…-exec` supersedes the shipped `…-exec`). Assembled by the same
+    // total, memoized scan of `object-formats/` that
+    // `runtime::resolveArchiveSiblingFormat` runs, over the directory THIS
+    // document was loaded from (`loadFromText` has none, so the ambient shipped
+    // directory answers — the mutant case, and the only one).
+    // The error arm is the family failing to ASSEMBLE — the directory not
+    // located, a sibling that does not load, or two siblings naming different
+    // providers (an image against a shipped source, or two images) — and it is
+    // never resolved by iteration order.
+    // ★ WHY NOT A ROW ON EVERY FLAVOUR. The loader refuses a `runtimeLibraries`
+    // row no block of the document names (inert config), and it is right to: an
+    // archive cannot record an image at all, so a `cLibrary` row on a
+    // `-staticlib` document could change no output. The family fact is written
+    // where a block needs it and reached from here by the flavours that do not.
+    //
+    // ⚠⚠ IT ASSEMBLES ON EVERY CALL, ON PURPOSE, AND THE CACHING BELONGS TO THE
+    // CALLER — `FormatRuntimeLibraryRoleResolver` below is the one that holds it.
+    // ✔The first cut cached the assembled family in a `mutable` member of THIS
+    // class, and this class is MEMOIZED: `loadFromFile` stores each instance in
+    // the content-addressed `ConfigDocumentMemo` with an EMPTY dependency ledger,
+    // justified by "a built schema is a pure function of this document's own
+    // bytes". A member folding TWENTY-THREE SIBLING DOCUMENTS into the instance
+    // makes that claim false — the memo key covers this document's bytes and says
+    // nothing about theirs, so a sibling edited in-process would be served from a
+    // cache keyed on bytes that did not change. `config_document_memo.hpp` calls
+    // exactly that shape "a SILENT MISCOMPILE, not a stale cache entry". A
+    // resolver, by contrast, lives for ONE binding operation — the same lifetime
+    // `resolveArchiveSiblingFormat` and `Resolver::shippedFormats_` give their own
+    // total scans — so its cache cannot outlive the state it was derived from.
+    [[nodiscard]] std::expected<RuntimeLibraryTable, std::string>
+    assembleFlavourRuntimeLibraries() const;
+
     // The format's unwinder-personality declaration, or nullopt if it declares
     // none. `synthesizeSehFunclets` fails loud on a resolved SEH region under a
     // nullopt personality — never a silently-assumed handler/image pair.
     [[nodiscard]] std::optional<SehPersonality> const&
     sehPersonality() const noexcept { return d_.sehPersonality; }
+    // D-CSUBSET-PACKED-ATOMIC-MEMBER: the format's atomics-runtime declaration,
+    // or nullopt if it supplies none. Threaded into `lowerToLir` as an
+    // already-resolved VALUE (the `wideFloatSoftcallLibrary` pattern): the
+    // under-aligned `_Atomic` arm mints its extern import against it, and a
+    // `traps` target reaching a nullopt fails loud naming this key.
+    [[nodiscard]] std::optional<AtomicsRuntime> const&
+    atomicsRuntime() const noexcept { return d_.atomicsRuntime; }
     // The program-entry materialization VERBS this format realizes. Non-empty on
     // every exec-flavored format, empty on every other (both directions
     // load-enforced), so EMPTY is the engine's "this build needs no program
@@ -2292,6 +2653,96 @@ public:
         return d_.externCallDispatch;
     }
 
+    // ── D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT ──
+    //
+    // THE ONE OWNER OF "WHICH EXTERN REFERENCES TAKE THE IMPORT SLOT". Two
+    // tiers must agree symbol for symbol — MIR→LIR decides the emitted SHAPE
+    // (deref-the-slot vs. direct) and the linker decides WHICH imports get a
+    // slot minted and which relocations are retargeted — and a rule spelled
+    // twice is a rule that drifts (the reason `strongerReferenceBinding` and
+    // `stricterDuplicateMatch` exist one tier down). So the rule lives HERE,
+    // once, and both tiers consume the ANSWER: the linker calls
+    // `externRefTakesImportSlot` directly, MIR→LIR is threaded the list.
+    //
+    // The rule, in full — and this function is the only place it is written:
+    //   * dispatch != `indirect-slot`  → NO binding takes the slot.
+    //   * `indirect-slot`, no narrowing declared → EVERY binding does (the
+    //     unqualified meaning the key has always carried).
+    //   * `indirect-slot` + `indirectSlotBindings` → exactly those.
+    // Allocation-free on purpose: the linker asks it once per extern import,
+    // and a slot pass over a sqlite-scale object asks it hundreds of times.
+    [[nodiscard]] bool
+    externRefTakesImportSlot(SymbolBinding binding) const noexcept {
+        if (d_.externCallDispatch != ExternCallDispatch::IndirectSlot) {
+            return false;
+        }
+        if (d_.indirectSlotBindings.empty()) return true;  // unnarrowed
+        for (auto const b : d_.indirectSlotBindings) {
+            if (b == binding) return true;
+        }
+        return false;
+    }
+
+    // The same answer as a SET, for readers and diagnostics — DERIVED from the
+    // predicate above rather than re-deciding, so the two can never disagree,
+    // and PROJECTED over the vocabulary table rather than naming its members:
+    // a spelled-out `{Local, Global, Weak}` would be a second owner of the
+    // closed set and would silently omit a member added later
+    // (D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET).
+    [[nodiscard]] std::vector<SymbolBinding>
+    externRefSlotBindings() const {
+        std::vector<SymbolBinding> out;
+        for (auto const& r : kSymbolBindingTable.rows) {
+            if (externRefTakesImportSlot(r.first)) out.push_back(r.first);
+        }
+        return out;
+    }
+
+    // The DECLARED narrowing list, verbatim (empty = the key is absent).
+    // Threaded to MIR→LIR by the driver, and read by `validate()`'s pairing
+    // rules. Consumers asking "does THIS import take the slot" want
+    // `externRefTakesImportSlot` above, never this.
+    [[nodiscard]] std::vector<SymbolBinding> const&
+    indirectSlotBindings() const noexcept {
+        return d_.indirectSlotBindings;
+    }
+
+    // ── D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING ───────────
+    //
+    // THE ONE OWNER OF "MAY THIS ARTIFACT'S LOADER REPLACE THIS DEFINITION".
+    // Both tiers that must agree symbol for symbol read THIS: MIR→LIR decides
+    // whether the reference is emitted through the loader-resolved indirection,
+    // and the linker decides whether the matching import row survives to the
+    // walker. A rule spelled twice is a rule that drifts — the reason
+    // `externRefTakesImportSlot` above is written exactly once, one level over.
+    //
+    // The rule, in full:
+    //   * a non-`default` visibility (hidden / protected / internal) is NEVER
+    //     preemptible — it is not in any image's dynamic export set, so no
+    //     loader can see it, under any format. Asked FIRST, so a format that
+    //     over-declares still cannot reach a hidden body.
+    //   * no `preemptibleDefinitionBindings` declared → NOTHING is preemptible
+    //     (the absent-key default; the pre-change behaviour byte-identically).
+    //   * declared → exactly the listed bindings.
+    // `SymbolBinding::Local` never reaches the list (refused at load) and would
+    // fail the visibility test in any case — a module-private symbol is not
+    // externally visible, so the two guards agree rather than overlap.
+    [[nodiscard]] bool
+    definitionIsPreemptible(SymbolBinding binding,
+                            SymbolVisibility visibility) const noexcept {
+        return ::dss::definitionIsPreemptible(
+            binding, visibility, d_.preemptibleDefinitionBindings);
+    }
+
+    // The DECLARED list, verbatim (empty = the key is absent). Threaded to
+    // MIR→LIR by the driver and read by `validate()`'s pairing rules; a
+    // consumer asking "is THIS definition preemptible" wants the predicate
+    // above, never this.
+    [[nodiscard]] std::vector<SymbolBinding> const&
+    preemptibleDefinitionBindings() const noexcept {
+        return d_.preemptibleDefinitionBindings;
+    }
+
     // ── D-LK-EXTERN-DATA-IMPORT accessor ─────────────────────────
     // The format's extern-DATA import binding model
     // (`got-indirect`), or nullopt if the format declared none.
@@ -2312,6 +2763,18 @@ public:
     [[nodiscard]] std::optional<ExternAddrBinding>
     externAddrBinding() const noexcept {
         return d_.externAddrBinding;
+    }
+
+    // ── D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET
+    //     accessor ──────────────────────────────────────────────────
+    // The symbol-name spelling of an OBJECT-CARRIED data-import slot, or
+    // nullopt if this format carries none. Read by the linker when it must
+    // realize a declared `dataImportBinding` inside a RELOCATABLE artifact,
+    // which has no import walker to build the slot for it.
+    [[nodiscard]]
+    std::optional<detail::ObjectFormatData::ObjectImportSlotInfo> const&
+    objectImportSlot() const noexcept {
+        return d_.objectImportSlot;
     }
 
     // ── D-CSUBSET-THREAD-LOCAL accessor (TLS C1) ─────────────────
@@ -2412,7 +2875,163 @@ private:
     // needed); every other construction path leaves it empty on purpose.
     std::string contentDigest_;
 
+    // The DIRECTORY this document was read from, written ONLY by `loadFromFile`
+    // (also a static member of this class) and empty for every other
+    // construction path. It is the population `assembleFlavourRuntimeLibraries`
+    // scans, so a document's flavour family is ITS OWN siblings rather than
+    // whichever directory the ambient `DSS_CONFIG_ROOT` names at the moment the
+    // question is asked. ⓘ It is a function of the memo LABEL (the resolved
+    // path), which is already half the memo key, so recording it changes nothing
+    // about the instance's purity.
+    std::string sourceDirectory_;
+
     detail::ObjectFormatData d_;
 };
+
+// ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ────
+//
+// THE ONE ADAPTER from a format schema to the core `RuntimeLibraryRoleResolver`
+// seam a shipped-descriptor read asks. Every producer of an `ExternImport` in
+// the driver builds one over the ACTIVE format (the C front half and the
+// on-binary-name oracle), and the corpus guard in `tests/link/` builds one over
+// each shipped flavour — a second adapter would be a second reading of which
+// row answers, which is the drift this row exists to end.
+//
+// ★ IT IS ALSO WHERE THE FLAVOUR-FAMILY SCAN IS CACHED, and that is a lifetime
+// decision, not a convenience. One resolver serves ONE binding operation — a
+// `buildCuMir` of one CU, one on-binary-name oracle call, one guard arm — so its
+// cache is derived from the directory as it is NOW and dies with the operation.
+// The schema it adapts is MEMOIZED for the process, which is exactly why the
+// scan may not be cached there (see `assembleFlavourRuntimeLibraries`).
+// ★ LAZY. An `-exec`/`-pie` build, whose own table declares `cLibrary`, answers
+// from `runtimeLibraries()` and NEVER scans; a `-dll`/`-dyn`/`-dylib`/
+// `-staticlib`/bare build scans once per resolver (the 24 sibling BUILDS are
+// still memo hits after the first, so a second resolver in the same process
+// re-reads and re-digests, and rebuilds nothing).
+// ⓘ `std::once_flag`, not a bare bool: `rowForRole` is `const` on an interface
+// callers hold as a pointer, so a producer that shares one resolver across the
+// driver's per-TU threads must not race on the lazy fill. It also makes the
+// class non-copyable, which is what a resolver should be — it is an ADAPTER
+// over a reference, always constructed at the site that uses it.
+class DSS_EXPORT FormatRuntimeLibraryRoleResolver final
+    : public RuntimeLibraryRoleResolver {
+public:
+    explicit FormatRuntimeLibraryRoleResolver(ObjectFormatSchema const& format) noexcept
+        : format_(format), kindName_(objectFormatKindName(format.kind())) {}
+
+    [[nodiscard]] std::string_view formatKindName() const noexcept override {
+        return kindName_;
+    }
+
+    [[nodiscard]] RuntimeLibraryBinding const*
+    rowForRole(RuntimeLibraryRole role, std::string& refusal) const override {
+        // The ACTIVE document first: the row its own spine blocks already
+        // resolve against, so the build is self-consistent and no scan happens.
+        if (auto const* const own = format_.runtimeLibraries().rowForRole(role))
+            return own;
+        std::call_once(familyOnce_, [this] {
+            family_ = format_.assembleFlavourRuntimeLibraries();
+        });
+        if (!family_.has_value()) {
+            refusal = family_.error();
+            return nullptr;
+        }
+        return family_->rowForRole(role);
+    }
+
+private:
+    ObjectFormatSchema const& format_;
+    std::string_view          kindName_;
+    // The siblings, assembled at most once per resolver. `std::expected` so an
+    // assembly REFUSAL is remembered as a refusal rather than re-attempted (and
+    // re-reported) per role. The default-constructed value is never read: the
+    // `call_once` above always writes it first.
+    mutable std::once_flag                                   familyOnce_;
+    mutable std::expected<RuntimeLibraryTable, std::string>  family_;
+};
+
+// ── D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ───────
+//
+// ★★★ THE ARTIFACT-IDENTITY PLACEHOLDER — the vocabulary that lets a format
+// document declare an identity string which is a FUNCTION OF THE ARTIFACT
+// BEING PRODUCED rather than one constant every artifact of that format
+// inherits.
+//
+// WHY IT HAD TO EXIST. A shipped `.format.json` states what is true of EVERY
+// image in that format, and an image's own RUNTIME IDENTITY — the Mach-O
+// LC_ID_DYLIB install name a client records and dyld later resolves — is not
+// such a fact: it is true of exactly ONE output. The two shipped darwin dylib
+// documents declared the literal `@rpath/libdss.dylib`, so every dylib DSS has
+// ever produced embedded the same identity. ✔MEASURED (cycle P62, lane `ff`'s
+// reproducer, re-run in this lane): two distinct DSS-built dylibs both named on
+// `--resolve-library` produced rc 0, ZERO diagnostics, and an executable
+// recording ONE `LC_LOAD_DYLIB @rpath/libdss.dylib` — the second library's
+// symbols simply absent at load — where the ELF control on the identical shape
+// recorded TWO correct `DT_NEEDED` entries. The recorder was right (it PREFERS
+// a binary's own embedded identity over its basename, which is what makes a
+// cross-compilation stand-in work); the two binaries were genuinely
+// indistinguishable, because the config said they were the same library.
+//
+// ★ THE PLACEHOLDER IS A CLOSED VOCABULARY, AND AN UNKNOWN ONE IS A REFUSAL.
+// `${artifactFileName}` is the whole set today. A `${...}` spelling that is not
+// in the set is REFUSED rather than passed through verbatim: a typo that
+// shipped as a literal would embed `${artifcatFileName}` in a binary's identity
+// and be discovered by a loader, months later, on someone else's machine.
+//
+// ★★ AND THE CLOSURE IS OVER THE SIGIL, NOT OVER `${`. This is the correction
+// that matters, and it was bought with a measurement. The first cut of this
+// vocabulary scanned for the two-character `${`, so `${...}` typos were refused
+// and EVERY OTHER DIALECT'S SPELLING SHIPPED SILENTLY. ✔MEASURED end to end
+// through the CLI against a hand-edited darwin dylib document (cycle P62, lane
+// `mo` remediation): `$(artifactFileName)` — Make's and shell's spelling —
+// `$artifactFileName` — sh's — `$ {artifactFileName}`, `$${artifactFileName}`,
+// a stray `a$b`, and a trailing `$` after a GOOD placeholder all produced rc 0,
+// zero diagnostics, and an artifact whose LC_ID_DYLIB was the author's mistake
+// verbatim. SIX spellings, every one of them the exact collapse this row
+// exists to end, reachable by a plausible typo. So:
+//   1. every `$` must open a well-formed `${key}` whose key is in the set —
+//      there is deliberately NO literal `$` and NO escape (`$$` is refused
+//      today, which leaves it free to MEAN a literal `$` later should a real
+//      use ever appear; widening a refusal is always available, narrowing an
+//      acceptance is not), and
+//   2. a key name spelled with NO sigil at all — `{artifactFileName}` — is
+//      refused as well, since the sigil scan has nothing to see there and an
+//      author who typed the key meant the substitution.
+// ⚠ Rule 2 is over-broad by one absurd case (an artifact honestly named
+// `artifactFileName.dylib`). Deliberate: the false positive is a loud
+// document-load diagnostic naming the fix, the false negative is a binary
+// shipping an identity nobody meant.
+//
+// ★ AND THERE IS NO FALLBACK, DELIBERATELY. A document whose identity names the
+// artifact and an emission that cannot say which artifact it is producing is a
+// contradiction, and the ONLY quiet way out of it is to substitute a constant —
+// which is the defect this vocabulary exists to end. The caller gets a refusal
+// REASON and fails loud in its own voice.
+//
+// ⓘ Returns a REASON rather than emitting a diagnostic because the schema tier
+// owns no diagnostic code: the WALKER that could not honour the declaration is
+// the tier that must name itself, its key path and its anchor. Same shape as
+// `assembleFlavourRuntimeLibraries` above.
+inline constexpr std::string_view kArtifactFileNamePlaceholder =
+    "${artifactFileName}";
+
+// True iff `declaredIdentity` carries the placeholder SIGIL `$` at all. On any
+// identity this substrate ACCEPTS the sigil and a well-formed known placeholder
+// coincide (rule 1 above), so this is exactly "does this identity depend on the
+// artifact being produced?" — the question a caller deciding whether an
+// emission owes an artifact name is really asking. A caller that must PRODUCE
+// the identity calls `resolveArtifactIdentity` and reads its refusal, which is
+// strictly more informative.
+[[nodiscard]] DSS_EXPORT bool
+declaresArtifactIdentityPlaceholder(std::string_view declaredIdentity) noexcept;
+
+// The declared identity with every placeholder replaced by the corresponding
+// fact about the artifact being produced. `artifactFileName` is the FILE NAME
+// (no directory) of the output this emission writes; EMPTY means the caller
+// could not say, which is a refusal whenever a placeholder is present and a
+// no-op when none is.
+[[nodiscard]] DSS_EXPORT std::expected<std::string, std::string>
+resolveArtifactIdentity(std::string_view declaredIdentity,
+                        std::string_view artifactFileName);
 
 } // namespace dss

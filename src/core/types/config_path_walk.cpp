@@ -46,6 +46,19 @@
 #    error "DSS_INSTALL_CONFIG_RELDIR is not defined — cmake/DssInstall.cmake must compute it and src/core/CMakeLists.txt must forward it (see the top-level CMakeLists.txt)."
 #endif
 
+// The SOURCE TREE this compiler was built from — see `src/core/CMakeLists.txt`
+// for the wireup and for why it is a comparison operand and never a lookup arm.
+//
+// Undefined => the build is BROKEN, loudly, here and now, exactly as the two
+// definitions above are. A default would ship a compiler whose foreign-tree
+// report can never fire, and a report that cannot fire reads identically to a
+// tree that was never foreign — i.e. this row restored with its own instrument
+// agreeing:
+// [[D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE]]
+#ifndef DSS_BUILD_SOURCE_DIR
+#    error "DSS_BUILD_SOURCE_DIR is not defined — src/core/CMakeLists.txt must forward ${CMAKE_SOURCE_DIR} (see the D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE block there)."
+#endif
+
 namespace dss {
 
 namespace {
@@ -180,6 +193,28 @@ std::optional<std::string> repoTreeVersionSkew(fs::path const& treeRoot) {
 // mixed-tree variant of the skew above, and it would be invisible.
 struct Resolution {
     std::optional<fs::path>  hit;        // engaged => resolved
+    // WHICH ARM produced `hit`. Set at the hit and nowhere else, so it cannot
+    // disagree with the path beside it — a caller that re-derived the arm from
+    // the path would be answering an adjacent question (a `$DSS_CONFIG_ROOT`
+    // pointed at the cwd's own ancestor is indistinguishable by path alone).
+    std::optional<ConfigRootArm> arm;
+    // `$DSS_CONFIG_ROOT` was SET and non-empty and its composed candidate did
+    // not probe, so the arms below answered instead. Carries the value as the
+    // operator spelled it.
+    //
+    // ★★ THE FALL-THROUGH IS CORRECT AND STAYS; ITS SILENCE IS WHAT DID NOT.
+    // A stale override never worsens discovery, which is why it falls through —
+    // but an EXPLICIT instruction that was ignored without a word is the same
+    // invisible-outcome class this file's provenance block is about, and it has
+    // already cost a measured 5x false regression: the speedtest1 benchmark's
+    // pin was one directory too deep, missed in silence, fell through to the
+    // cwd walk it existed to prevent, and a `/mnt/c` working directory turned
+    // every shipped-descriptor canonicalisation into a 9P round trip —
+    // 213.50 s at 13% CPU against 15.16 s at 90%, same binary, only the cwd
+    // moving. That row fixed its own pin and recorded the remaining half as
+    // *"a production question, raised rather than taken"*:
+    // [[D-BENCH-CONFIG-ROOT-PIN-IS-ONE-LEVEL-TOO-DEEP-AND-SILENTLY-DOES-NOTHING]]
+    std::optional<std::string> ignoredOverride;
     std::optional<std::string> refusal;  // engaged => stop, and say this
     std::vector<std::string> tried;      // every candidate, in order, for the diagnostic
 };
@@ -255,8 +290,12 @@ Resolution resolveByPrecedence(std::string_view                             subd
                     return out;
                 }
                 out.hit = candidate;
+                out.arm = ConfigRootArm::EnvOverride;
                 return out;
             }
+            // SET, and it did not answer. Recorded, not acted on — the arms
+            // below still run exactly as they always have. See the field.
+            out.ignoredOverride = std::string{envRoot};
         }
 
         // ── 2. the installed layout, and it is AUTHORITATIVE once found ──────
@@ -269,6 +308,7 @@ Resolution resolveByPrecedence(std::string_view                             subd
                     // No version check: the probed path was composed FROM this
                     // binary's own version, so reaching it IS the agreement.
                     out.hit = candidate;
+                    out.arm = ConfigRootArm::InstalledLayout;
                     return out;
                 }
                 // The tree is this binary's own and it does not have the item.
@@ -303,6 +343,11 @@ Resolution resolveByPrecedence(std::string_view                             subd
                 return out;
             }
             out.hit = candidate;
+            // ⓘ Also the arm an engaged `startPath` reports: that caller named
+            // a tree and walked from it, which is discovery from somewhere the
+            // CALLER chose — the same class as discovery from the cwd, and the
+            // one arm whose outcome can be a surprise.
+            out.arm = ConfigRootArm::CwdWalk;
             return out;
         }
         fs::path const parent = here.parent_path();
@@ -509,6 +554,113 @@ std::vector<std::filesystem::path> resolveSystemDirs(GrammarSchema const& gramma
         ec.clear();
     }
     return out;
+}
+
+// ── WHICH TREE ANSWERED — see the header block for the measured defect ───────
+
+std::string_view configRootArmLabel(ConfigRootArm arm) noexcept {
+    switch (arm) {
+        case ConfigRootArm::EnvOverride:
+            return "$DSS_CONFIG_ROOT";
+        case ConfigRootArm::InstalledLayout:
+            return "the installed layout beside this executable";
+        case ConfigRootArm::CwdWalk:
+            return "walking up from the working directory";
+    }
+    // No default label. The switch is total over the enum, and a `default:`
+    // would silently absorb a fourth arm added later — the arm whose meaning
+    // nobody stopped to decide is exactly the one a report must not guess at.
+    return "an unlabelled arm — configRootArmLabel is out of date";
+}
+
+std::optional<std::filesystem::path>
+configRootOfShippedDocument(std::filesystem::path const& document) {
+    // Strip the LEAF and the SUBDIR — exactly the two components `compose`
+    // appends — and refuse to answer if either strip has nothing to take. An
+    // `<inline>` label has no parent at all, and a bare `x.lang.json` has one;
+    // both would otherwise yield an empty or a relative "root" that names a
+    // directory nobody read.
+    fs::path const subdir = document.parent_path();
+    if (subdir.empty()) return std::nullopt;
+    fs::path const root = subdir.parent_path();
+    if (root.empty()) return std::nullopt;
+    return root;
+}
+
+std::string_view buildSourceDir() {
+    return DSS_BUILD_SOURCE_DIR;
+}
+
+std::optional<ResolvedConfigRoot> resolveShippedConfigRoot() {
+    // Empty subdir AND empty leaf => `compose` yields the config root itself,
+    // so this is the SAME precedence, the same arms and the same order as the
+    // two lookups above rather than a private walk that could drift from them.
+    auto const r = resolveByPrecedence(/*subdir=*/{}, /*leaf=*/{},
+                                       /*startPath=*/std::nullopt,
+                                       &probeIsDirectory);
+    // A version-skewed tree is not a root this compiler will use, so it is not
+    // a root to report — `findShippedConfig` refuses it by name, with both
+    // versions and the tree, before anything gets that far.
+    if (r.refusal.has_value() || !r.hit.has_value() || !r.arm.has_value()) {
+        return std::nullopt;
+    }
+    return ResolvedConfigRoot{*r.hit, *r.arm, r.ignoredOverride};
+}
+
+std::optional<std::string>
+configRootProvenanceNoteFor(ResolvedConfigRoot const&    resolved,
+                            std::filesystem::path const& buildTree) {
+    fs::path const  mine = repoShapedConfigRoot(buildTree);
+    std::error_code ec;
+    // A FOREIGN TREE — only the walk can produce one. The other two arms are
+    // silent by design: `$DSS_CONFIG_ROOT` that ANSWERED is the operator naming
+    // the tree, and the installed layout composes this binary's own version
+    // into the path. Tested in this order because the filesystem question is
+    // only worth asking for the walk.
+    //
+    // `equivalent`, never a string compare: a lane worktree reached through a
+    // junction, a mapped drive and a `..`-bearing spelling are all one
+    // directory, and a spelling-based answer would report a foreign tree where
+    // there is none. `ec` => one side is absent; the resolved root was just
+    // probed, so the absent side is the BUILD tree — a relocated binary, which
+    // genuinely is answering out of someone else's tree.
+    bool const foreign = resolved.arm == ConfigRootArm::CwdWalk
+                      && !(fs::equivalent(resolved.root, mine, ec) && !ec);
+
+    if (!foreign && !resolved.ignoredOverride.has_value()) return std::nullopt;
+
+    std::string note;
+    // ★ THE IGNORED OVERRIDE COMES FIRST WHEN BOTH HOLD, because it is the
+    // CAUSE and the foreign tree is the CONSEQUENCE — a reader told "you are in
+    // the wrong tree" first would go looking at their working directory, which
+    // is not the thing they got wrong.
+    if (resolved.ignoredOverride.has_value()) {
+        note += "DSS_CONFIG_ROOT is set to '" + *resolved.ignoredOverride
+              + "', which holds no "
+              + core::genericSpelling(
+                    repoShapedConfigRoot(fs::path{*resolved.ignoredOverride}))
+              + " — the override was IGNORED (it must name the directory that "
+                "CONTAINS src/dss-config, not that directory itself). ";
+    }
+    note += "config root " + core::genericSpelling(resolved.root)
+          + " (found by " + std::string{configRootArmLabel(resolved.arm)} + ")";
+    note += foreign
+                ? " is NOT this compiler's own " + core::genericSpelling(mine)
+                      + " — every language, target, format and assembly-dialect "
+                        "answer comes from that tree, so an edit made in this "
+                        "one is invisible here. Set DSS_CONFIG_ROOT to choose "
+                        "deliberately."
+                : " answered instead.";
+    return note;
+}
+
+std::optional<std::string> configRootProvenanceNote() {
+    auto const resolved = resolveShippedConfigRoot();
+    // No root at all: nothing to attribute, and the miss is `findShippedConfig`'s
+    // to report — it already lists every path it tried, which is strictly more
+    // than this sentence could say.
+    if (!resolved.has_value()) return std::nullopt;
+    return configRootProvenanceNoteFor(*resolved, fs::path{buildSourceDir()});
 }
 
 } // namespace dss

@@ -26,6 +26,14 @@ dss_add_test(NAME program/test_include_dirs
              SOURCES test_include_dirs.cpp)
 dss_add_test(NAME program/test_system_dirs_cwd_independent
              SOURCES test_system_dirs_cwd_independent.cpp)
+
+# D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE: a binary built from tree A
+# and run with a cwd inside tree B answers out of TREE B, and said nothing about
+# it. Driver tier because the subject is what ONE INVOCATION reports — the
+# arm-by-arm behaviour of the note lives in tests/core/test_config_path_walk.cpp,
+# and a unit test there could not observe either CLI entry point.
+dss_add_test(NAME program/test_config_root_attribution
+             SOURCES test_config_root_attribution.cpp)
 dss_add_test(NAME program/test_input_resolver
              SOURCES test_input_resolver.cpp)
 dss_add_test(NAME program/test_cross_validate_target_format
@@ -431,3 +439,99 @@ dss_add_test(NAME program/test_dependency_artifact_cache
 # APPENDED, never interleaved -- this file is append-only by lane convention.
 dss_add_test(NAME program/test_failed_build_writes_no_artifact
              SOURCES test_failed_build_writes_no_artifact.cpp)
+
+# ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE (P60 lane `dl2`)
+# The DRIVER's half of the descriptor role form: the image the LINKER RECEIVES
+# follows the format's role row. Runs `buildCuMir` over the REAL shipped corpus
+# with a `loadFromText` mutant whose `cLibrary` row is repointed, reads the
+# `externImports[].libraryPath` rows the linker is handed, and LINKS the module to
+# read the emitted image's own dependency table (the shared PE/ELF extractors in
+# `tests/test_support/image_dependency_table.hpp`): the role-bound imports FOLLOW,
+# `math.json`'s `libm.so.6` literal and windows.json's `systemPrimitives` import do
+# NOT. Also the FAMILY path (`-dll`/`-dyn`/`-dylib`/`-staticlib`, whose own tables
+# declare no `cLibrary`), the family's disagreement refusal on a doctored copy of
+# the shipped tree under `DSS_CONFIG_ROOT`, and the driver-level refusals of a
+# realized or undeclared role. HOST-INDEPENDENT: nothing is run.
+#
+# APPENDED, never interleaved -- this file is append-only by lane convention.
+dss_add_test(NAME program/test_descriptor_role_follows_the_table
+             SOURCES test_descriptor_role_follows_the_table.cpp)
+
+# D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT: the DRIVER
+# tier of "every resolved library reaches the emitted dependency table", with
+# the identity left UNSTATED so the recorder must read each binary's own
+# embedded one -- the precedence level the collapse lived on, and the level both
+# existing pins bypassed (one tests the writer; the other states the identity on
+# purpose, to keep its Mach-O leg from passing for the wrong reason).
+# HOST-INDEPENDENT: nothing is run, the subject is the emitted bytes.
+#
+# APPENDED, never interleaved -- this file is append-only by lane convention.
+dss_add_test(NAME program/test_macho_install_name_identity
+             SOURCES test_macho_install_name_identity.cpp)
+
+# D-MIR-SYNTH-PASSES-UNVERIFIED-ON-SINGLE-CU-PATH (P63 lane `sh`): the ORDER half
+# of that closure. Once the SEH pass re-derives its own StructCfMarkers, a correct
+# compiler is silent whether the post-synthesis verify runs before it, after it, or
+# not at all -- the placement is only observable on the NEXT defect. So the pin is
+# structural: at BOTH driver seams the `verifySynthesizedModule` call must FOLLOW
+# the `synthesizeSehFunclets` call, and each must appear exactly once.
+# HOST-INDEPENDENT: nothing is compiled and nothing is run.
+#
+# APPENDED, never interleaved -- this file is append-only by lane convention.
+dss_add_test(NAME program/test_synth_verify_seam_guard
+             SOURCES test_synth_verify_seam_guard.cpp)
+
+# D-MIR-SYNTH-PASSES-UNVERIFIED-ON-SINGLE-CU-PATH (P63 remediation): the
+# BEHAVIOURAL half of the same closure. The seam guard above pins WHERE
+# `verifySynthesizedModule` is called; nothing pinned what it DOES -- measured in
+# P63's review, the function shipped with zero callers anywhere under tests/, so
+# its `I_VerifierFailure` tier diagnostic and the pass list inside it had no pin
+# at all. This calls it directly: a control arm (well-formed module verifies,
+# reports nothing) and a broken arm (one falsified StructCfMarker on a reachable
+# non-entry block) that must be REFUSED naming BOTH the broken rule
+# (I_StructCfMismatch) and the synthesis TIER (I_VerifierFailure).
+# HOST-INDEPENDENT: nothing is compiled and nothing is run.
+#
+# APPENDED, never interleaved -- this file is append-only by lane convention.
+dss_add_test(NAME program/test_synth_verify_failure_path
+             SOURCES test_synth_verify_failure_path.cpp)
+
+# `--emit-hir <path>` + `--dump-hir-kinds` (P64 lane `hx`): the HIR of a
+# translation unit as a FILE, for a consumer outside this repository. `emitHir`
+# shipped with ZERO product callers, so every property such a consumer depends on
+# -- self-contained types, source-level names, a version and producer on the
+# artifact's face, rc 0 <=> an artifact was written, and emission for a TU that
+# would NOT LINK -- was true only by accident and untestable from outside the
+# process that emitted it. Every arm here reads the artifact BACK through
+# `parseHir` (which runs `HirVerifier` on load) rather than inspecting the
+# in-process `Hir`, because that is the only thing a reader holding the bytes can
+# do. HOST-INDEPENDENT: the front end runs; nothing is codegen'd, linked or run.
+#
+# APPENDED, never interleaved -- this file is append-only by lane convention.
+dss_add_test(NAME program/test_emit_hir_mode
+             SOURCES test_emit_hir_mode.cpp)
+
+# D-HIR-TEXT-NODE-WALK-RECURSES-PER-LEVEL-ON-BOTH-HALVES-AND-THREE-SPELLINGS-DO-NOT-READ-BACK
+# left one thing NAMED and unfixed: nothing in `src/` outside the tests called
+# `parseHir`, so the `.dsshir` reader shipped as a `DSS_EXPORT` for consumers with
+# no run of any kind feeding it what our own writer produces. That is why THREE
+# shipped writer spellings could be unreadable at once -- one ABORTED the reading
+# process, one was refused for a token the lexer lacked, and one came back as 0.0
+# through a CLEAN reporter -- and all three were found by a person round-tripping
+# the corpus by hand. This entry is that walk, standing where the person stood:
+# every `examples/c` case is emitted at its OWN first declared target and the
+# artifact must parse back AND re-emit BYTE FOR BYTE. A decline by the front end
+# is counted and printed rather than dropped, and the emitted count is FLOORED, so
+# the walk cannot rot into measuring nothing; a NEGATIVE CONTROL fires the
+# predicate on a known-unreadable artifact before any example is walked.
+# HOST-INDEPENDENT: the front end runs for every case; nothing is codegen'd,
+# assembled, linked or executed.
+#
+# APPENDED, never interleaved -- this file is append-only by lane convention.
+dss_add_test(NAME program/test_emit_hir_round_trips_every_example
+             SOURCES test_emit_hir_round_trips_every_example.cpp)
+# The corpus manifests are JSON, and this walk needs two fields out of each:
+# the source list and the first declared target. Same nlohmann consumer as the
+# runtime-cache wiring case above.
+target_link_libraries(dss_program_test_emit_hir_round_trips_every_example
+                      PRIVATE nlohmann_json::nlohmann_json)

@@ -41,8 +41,11 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <variant>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -420,7 +423,7 @@ TEST(MirToLir, UnsignedDivisionLowersToXorPlusDivNotCqoIDiv) {
 // VALUE was wanted — off by one indirection, a silent miscompile. Always-on
 // structural guard for the macho stdout/stderr codegen (runtime witness =
 // the `stdio_stream_objects` macho arm). RED-ON-DISABLE: drop the
-// externDataGotSymbols_ membership (bare lea) → 1 memory access; keep the
+// slotIndirectAddrSymbols_ membership (bare lea) → 1 memory access; keep the
 // fold (not suppressed) → the pair folds to ONE riprel load, 0 MemBase.
 TEST(MirToLir, GotIndirectExternDataGlobalAddrEmitsLeaThenDeref) {
     TypeInterner interner{CompilationUnitId{1}};
@@ -478,6 +481,146 @@ TEST(MirToLir, GotIndirectExternDataGlobalAddrEmitsLeaThenDeref) {
         << "a got-indirect data extern needs the __got DEREF load (the object "
            "address) BEFORE the C-level load (the object value) — two base-reg "
            "memory accesses; a bare lea gives 1, a folded riprel load gives 0.";
+}
+
+// D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET (P54): under an
+// `indirect-slot` format the extern's symbolVa IS a pointer slot — that is what
+// makes `call_indirect_via_extern` (FF 15, deref the slot) the correct call
+// shape there — so an extern FUNCTION's ADDRESS-as-a-VALUE must come from the
+// SAME slot: lea-of-slot + a pointer deref. A bare lea hands the program the
+// SLOT's address, which is the shape the pe64 exec document recorded as
+// "`indirect-slot` MISCOMPILES an address-taken import" (sqlite os_win.c
+// aSyscall[] then called through it into data), and which link.exe answers with
+// LNK2016 on a relocatable object because the slot symbol it names is a weak
+// external's ABSOLUTE value-0 default.
+//
+// BOTH DIRECTIONS IN ONE TEST, and the second is the load-bearing one: the same
+// module under `direct-plt` (every image format, where the walker points a
+// function extern's VA at a CALLABLE THUNK) must keep the BARE lea. A change
+// that routed every extern function address through a slot would pass the first
+// assertion and fail this one, which is exactly the regression lane `wi`
+// measured — a program that linked clean and segfaulted.
+// RED-ON-DISABLE: drop the `externCallDispatch == IndirectSlot` arm that
+// populates `slotIndirectAddrSymbols_` → the indirect-slot arm emits a bare lea,
+// 0 memory accesses, direction 1 fails.
+TEST(MirToLir, IndirectSlotExternFunctionAddressValueDerefsTheSlot) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const ptrT = interner.pointer(interner.primitive(TypeKind::Void));
+    // `void* f(void) { return &maybe; }` — GlobalAddr(maybe) used as a VALUE.
+    // Its sole use is the Return, so neither fold fires and the address arm of
+    // `lowerGlobalAddr` is what answers.
+    TypeId const callerSig =
+        interner.fnSig(std::span<TypeId const>{}, ptrT, CallConv::CcSysV);
+    SymbolId const fnSym{200};
+    auto buildMir = [&] {
+        MirBuilder mb;
+        mb.addFunction(callerSig, SymbolId{100});
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(entry);
+        MirInstId const ga = mb.addGlobalAddr(fnSym, ptrT);
+        mb.addReturn(ga);
+        return std::move(mb).finish();
+    };
+
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    std::vector<dss::ExternImport> externs;
+    dss::ExternImport ei;
+    ei.symbol      = fnSym;
+    ei.mangledName = "maybe";
+    ei.isData      = false;   // A FUNCTION import — the whole point.
+    externs.push_back(ei);
+
+    // Count the base-register memory accesses reachable from the GlobalAddr:
+    // the slot deref is one, a bare lea is none.
+    auto memAccessCount = [](Lir const& lir) {
+        LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+        int n = 0;
+        for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+            for (auto const& op : lir.instOperands(lir.blockInstAt(bb, i))) {
+                if (op.kind == LirOperandKind::MemBase) { ++n; break; }
+            }
+        }
+        return n;
+    };
+
+    // (1) indirect-slot ⇒ lea-of-slot + DEREF.
+    {
+        Mir mir = buildMir();
+        DiagnosticReporter rep;
+        auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+                               ExternCallDispatch::IndirectSlot,
+                               DataImportBinding::GotIndirect);
+        ASSERT_TRUE(lirR.ok);
+        EXPECT_GE(memAccessCount(lirR.lir), 1)
+            << "under `indirect-slot` the extern's VA is a POINTER SLOT, so "
+               "`&maybe` must LOAD it; a bare lea yields the slot's own "
+               "address — the miscompile link.exe answers with LNK2016 and "
+               "mingw ld truncates silently.";
+    }
+    // (2) direct-plt ⇒ the BARE lea, byte-identical to before this row.
+    {
+        Mir mir = buildMir();
+        DiagnosticReporter rep;
+        auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+                               ExternCallDispatch::DirectPlt,
+                               DataImportBinding::GotIndirect);
+        ASSERT_TRUE(lirR.ok);
+        EXPECT_EQ(memAccessCount(lirR.lir), 0)
+            << "under `direct-plt` the walker binds a function extern's VA to "
+               "a CALLABLE THUNK, so `&maybe` IS that address and a deref "
+               "would read the jump stub's bytes. The got-indirect DATA "
+               "binding must not widen to functions on an image.";
+    }
+    // (3) D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55):
+    //     indirect-slot NARROWED to `weak` ⇒ this GLOBAL import's address is
+    //     the BARE lea again. The address arm and the call arm read ONE set,
+    //     so this is the same decision `NarrowedIndirectSlotKeepsAStrong
+    //     ExternCallDirect` pins at the call site — asserted at BOTH ends
+    //     because a fix applied at one is the partial fix that reads as a
+    //     complete one, and because only the pair keeps the linker's slot
+    //     pass agreeing with the emitted code symbol for symbol.
+    {
+        Mir mir = buildMir();
+        DiagnosticReporter rep;
+        auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+                               ExternCallDispatch::IndirectSlot,
+                               DataImportBinding::GotIndirect,
+                               /*tlsAccess=*/std::nullopt,
+                               /*sehScopes=*/{},
+                               /*wideFloatSoftcallLibrary=*/std::nullopt,
+                               /*externAddrBinding=*/std::nullopt,
+                               /*charIsUnsigned=*/std::nullopt,
+                               /*atomicsRuntime=*/std::nullopt,
+                               std::vector<SymbolBinding>{SymbolBinding::Weak});
+        ASSERT_TRUE(lirR.ok);
+        EXPECT_EQ(memAccessCount(lirR.lir), 0)
+            << "`maybe` is a GLOBAL import and the format narrows the slot to "
+               "`weak`, so its address is a plain pc-relative reference — the "
+               "shape clang and mingw gcc both emit for a strong extern.";
+    }
+    // (4) The same narrowing with the import declared WEAK: back to the deref.
+    //     `weak` is the ONLY variable between (3) and (4).
+    {
+        Mir mir = buildMir();
+        DiagnosticReporter rep;
+        std::vector<dss::ExternImport> weakExterns = externs;
+        weakExterns[0].binding = SymbolBinding::Weak;
+        auto lirR = lowerToLir(mir, **target, interner, rep, weakExterns,
+                               ExternCallDispatch::IndirectSlot,
+                               DataImportBinding::GotIndirect,
+                               /*tlsAccess=*/std::nullopt,
+                               /*sehScopes=*/{},
+                               /*wideFloatSoftcallLibrary=*/std::nullopt,
+                               /*externAddrBinding=*/std::nullopt,
+                               /*charIsUnsigned=*/std::nullopt,
+                               /*atomicsRuntime=*/std::nullopt,
+                               std::vector<SymbolBinding>{SymbolBinding::Weak});
+        ASSERT_TRUE(lirR.ok);
+        EXPECT_GE(memAccessCount(lirR.lir), 1)
+            << "a WEAK import under the same narrowing must still LOAD its "
+               "slot — the P0 case, and the one the narrowing must not touch.";
+    }
 }
 
 // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): under a `got` extern-address
@@ -4233,7 +4376,16 @@ struct ExternCallLowering {
 lowerStdExternFixture(::dss::TargetSchema const& sch,
                       std::optional<::dss::ExternCallDispatch> dispatch,
                       ::dss::DiagnosticReporter& rep,
-                      ::dss::CallConv cc = ::dss::CallConv::CcMS64) {
+                      ::dss::CallConv cc = ::dss::CallConv::CcMS64,
+                      // D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT
+                      // (P55): the extern's BINDING and the format's declared
+                      // narrowing — the two facts that now decide the shape
+                      // together with the dispatch. The defaults reproduce the
+                      // pre-P55 fixture exactly (a Global import under an
+                      // unnarrowed dispatch), so every pin above is unchanged.
+                      ::dss::SymbolBinding binding =
+                          ::dss::SymbolBinding::Global,
+                      std::vector<::dss::SymbolBinding> narrowing = {}) {
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
     auto const i32  = interner.primitive(::dss::TypeKind::I32);
     auto const ptrT = interner.pointer(interner.primitive(::dss::TypeKind::Void));
@@ -4279,10 +4431,19 @@ lowerStdExternFixture(::dss::TargetSchema const& sch,
     ext.symbol      = ::dss::SymbolId{kExternSym};
     ext.mangledName = "extern_fn";
     ext.libraryPath = "fictional.lib";
+    ext.binding     = binding;
     std::vector<::dss::ExternImport> externImports{ext};
 
     ExternCallLowering out{
-        ::dss::lowerToLir(m, sch, interner, rep, externImports, dispatch),
+        ::dss::lowerToLir(m, sch, interner, rep, externImports, dispatch,
+                          /*dataImportBinding=*/std::nullopt,
+                          /*tlsAccess=*/std::nullopt,
+                          /*sehScopes=*/{},
+                          /*wideFloatSoftcallLibrary=*/std::nullopt,
+                          /*externAddrBinding=*/std::nullopt,
+                          /*charIsUnsigned=*/std::nullopt,
+                          /*atomicsRuntime=*/std::nullopt,
+                          std::move(narrowing)),
         0u, 0u};
     auto const callOp         = sch.opcodeByMnemonic("call");
     auto const callIndirectOp = sch.opcodeByMnemonic("call_indirect_via_extern");
@@ -4374,6 +4535,82 @@ TEST(MirToLir, IndirectSlotWithoutOpcodeFailsLoud) {
            "NOT lower cleanly";
     EXPECT_GT(rep.errorCount(), 0u)
         << "the indirect-slot-missing-opcode guard must fire";
+}
+
+// ── D-LK-PE-OBJECT-STRONG-EXTERN-PAYS-THE-WEAK-IMPORTS-SLOT (P55) ─────
+//
+// THE CALL SITE'S SHAPE IS NOW A PER-SYMBOL QUESTION. Until P55 `lowerCall`
+// read the format-level dispatch, which was right while `indirect-slot`
+// reached every import and became a MISCOMPILE the moment it reached only
+// some: the linker mints a slot for exactly the imports this lowerer derefs,
+// so a call shaped by the FORMAT and a slot minted for the SYMBOL would
+// disagree — an `FF 15` through a slot nobody minted (reading the import's
+// own address as a pointer) or an `E8` retargeted at slot bytes.
+//
+// The pair below is the SAME fixture under the SAME dispatch and the SAME
+// narrowing, with the IMPORT'S BINDING as the only variable. A lowering that
+// read the format could not produce both answers at all.
+TEST(MirToLir, NarrowedIndirectSlotKeepsAStrongExternCallDirect) {
+    // ✔MEASURED 2026-09-02 that this is the reference shape: clang 18.1.3 on
+    // BOTH `--target=x86_64-pc-windows-msvc` and `--target=x86_64-w64-windows-gnu`,
+    // and mingw-w64 gcc 13.2.0, all emit a plain direct `REL32 <name>` and NO
+    // `.refptr` section for a STRONG extern function. RED-on-disable: restore
+    // the format-level `externCallUsesIndirectShape` read in `lowerCall` and
+    // this becomes externCalls==1.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const lowered = lowerStdExternFixture(
+        **target, ::dss::ExternCallDispatch::IndirectSlot, rep,
+        ::dss::CallConv::CcMS64, ::dss::SymbolBinding::Global,
+        std::vector<::dss::SymbolBinding>{::dss::SymbolBinding::Weak});
+    ASSERT_TRUE(lowered.result.ok) << "errorCount=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(lowered.externCalls, 0u)
+        << "a STRONG undefined has no absolute resolution — the final link "
+           "finds a definition or fails — so the reference is representable "
+           "pc-relative and must NOT pay a slot deref";
+    EXPECT_EQ(lowered.directCalls, 2u)
+        << "both the extern and the internal call use the plain `call` opcode";
+}
+
+TEST(MirToLir, NarrowedIndirectSlotStillDerefsTheSlotForAWeakExternCall) {
+    // The half that MUST NOT regress: the P0 is about a WEAK import, whose
+    // COFF fallback is an ABSOLUTE value-0 symbol no rel32 reaches. Same
+    // fixture, same narrowing, binding the ONLY variable.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const lowered = lowerStdExternFixture(
+        **target, ::dss::ExternCallDispatch::IndirectSlot, rep,
+        ::dss::CallConv::CcMS64, ::dss::SymbolBinding::Weak,
+        std::vector<::dss::SymbolBinding>{::dss::SymbolBinding::Weak});
+    ASSERT_TRUE(lowered.result.ok) << "errorCount=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(lowered.externCalls, 1u)
+        << "the weak extern call must still DEREFERENCE the carried slot — "
+           "link.exe 14.51 answers LNK2016 on the direct form and mingw ld "
+           "truncates it to 0x100000000 with no diagnostic";
+    EXPECT_EQ(lowered.directCalls, 1u)
+        << "only the module-internal call is direct";
+}
+
+TEST(MirToLir, AnUnnarrowedIndirectSlotStillReachesEveryImport) {
+    // The BACK-COMPAT arm, stated rather than assumed: an EMPTY narrowing is
+    // the unqualified meaning `indirect-slot` carried before the key existed,
+    // so a STRONG import still takes the slot there. Every format that does
+    // not declare the key depends on this, and it is the one direction a
+    // reader would not think to check.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::DiagnosticReporter rep;
+    auto const lowered = lowerStdExternFixture(
+        **target, ::dss::ExternCallDispatch::IndirectSlot, rep,
+        ::dss::CallConv::CcMS64, ::dss::SymbolBinding::Global,
+        /*narrowing=*/{});
+    ASSERT_TRUE(lowered.result.ok) << "errorCount=" << rep.errorCount();
+    EXPECT_EQ(lowered.externCalls, 1u)
+        << "with no narrowing declared, EVERY import takes the slot";
 }
 
 TEST(MirToLir, NoExternImportsAllCallsLowerAsDirectCall) {
@@ -5648,17 +5885,21 @@ TEST(MirToLir, F80ReturnOperandLowersToFld80BeforeBareRet) {
         << "a long-double return leaves the value in st0 — the ret has no reg operand";
 }
 
-// D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE (LD-1 x87 review fix): an F80 phi — a
-// `long double` crossing a control-flow JOIN (`cond ? a : b`) — must WALL LOUD,
-// NOT miscompile. The memory-resident F80 model makes an F80 SSA value a
-// GPR-held address; without the prepassAllocatePhis F80/F128 wall the phi is
-// allocated FPR-class and the edge-move emits a class-inconsistent `fld [xmm]`
-// (the silent miscompile the review caught). This builds the SAME diamond CFG
-// that lowers cleanly for an F64 phi (see the FprPhi test above) but with F80,
-// consuming the phi via an in-function FPToSI + int return so the ONLY F80 site
-// is the phi itself. Red-on-disable: removing the F80/F128 wall makes lowerToLir
-// SUCCEED (the miscompile).
-TEST(MirToLir, F80PhiControlMergeWallsFailLoud) {
+// D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE: INVERTED from the LD-1 x87-review WALL.
+// An F80 phi — a `long double` crossing a control-flow JOIN (`cond ? a : b`) —
+// now LOWERS, to a MEMORY-HOME merge. The memory-resident F80 model makes an F80
+// SSA value a GPR-held address, so the phi gets a frame home of its own and each
+// edge copies the 80-bit datum into it with fld_m80/fstp_m80; the FPR-class
+// edge-move the generic path would mint (`fld [xmm]`) was the class-inconsistent
+// silent miscompile the 2026-07-18 review caught, and it is still never emitted.
+// This builds the SAME diamond CFG that lowers cleanly for an F64 phi (see the
+// FprPhi test above) but with F80, consuming the phi via an in-function FPToSI +
+// int return so the ONLY F80 site is the phi itself.
+//
+// Red-on-disable: restore the `prepassAllocatePhis` F80/F128 refusal (or delete
+// the memPairs half of `emitPhiMovesForEdge`) → `lowerToLir` fails / the copies
+// vanish.
+TEST(MirToLir, F80PhiControlMergeLowersToMemoryHomeCopy) {
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto const& sch = **target;
@@ -5709,21 +5950,184 @@ TEST(MirToLir, F80PhiControlMergeWallsFailLoud) {
 
     ::dss::DiagnosticReporter rep;
     auto const result = ::dss::lowerToLir(m, sch, interner, rep);
-    EXPECT_FALSE(result.ok)
-        << "an F80 phi (long double control-flow merge) must WALL loud, not "
-           "miscompile — the SAME diamond that lowers for an F64 phi must fail "
-           "for F80 (memory-resident: the phi would mint a class-inconsistent "
-           "fld [xmm])";
-    bool sawMerge = false;
+    ASSERT_TRUE(result.ok)
+        << "an F80 phi (long double control-flow merge) must LOWER to the "
+           "memory-home merge — the SAME diamond that lowers for an F64 phi: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
     for (auto const& d : rep.all()) {
-        if (d.actual.find("control-flow merge") != std::string::npos
-            || d.actual.find("CONTROL-MERGE") != std::string::npos) {
-            sawMerge = true;
-            break;
+        EXPECT_EQ(d.actual.find("control-flow merge"), std::string::npos)
+            << "the control-merge WALL must be gone: " << d.actual;
+    }
+    // The merge is memory, not registers: TWO 16-byte homes are reserved (the
+    // phi's own + its per-edge staging slot) and each of the two edges copies the
+    // datum in with an fld_m80/fstp_m80 PAIR (stage, then write the home) — four
+    // copies over the whole function. NO fpr move ever names the phi.
+    Lir const& lir = result.lir;
+    ASSERT_EQ(lir.moduleFuncCount(), 1u);
+    ::dss::LirFuncId const fn = lir.funcAt(0);
+    auto const allocaOp = sch.opcodeByMnemonic("alloca");
+    auto const fldOp    = sch.opcodeByMnemonic("fld_m80");
+    auto const fstpOp   = sch.opcodeByMnemonic("fstp_m80");
+    ASSERT_TRUE(allocaOp.has_value() && fldOp.has_value() && fstpOp.has_value());
+    std::uint32_t allocas = 0;
+    std::uint32_t copies  = 0;
+    std::uint32_t entryLeadingAllocas = 0;
+    std::uint32_t const bc = lir.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < bc; ++bi) {
+        ::dss::LirBlockId const blk = lir.funcBlockAt(fn, bi);
+        std::uint32_t const ic = lir.blockInstCount(blk);
+        for (std::uint32_t ii = 0; ii < ic; ++ii) {
+            LirInstId const inst = lir.blockInstAt(blk, ii);
+            std::uint16_t const op = lir.instOpcode(inst);
+            // ⓘ COUNT THE 16-BYTE HOMES, NOT EVERY ALLOCA. This function also
+            // consumes the phi with an FPToSI, and `lowerF80ToSI` reserves a
+            // 4-byte scratch of its own for the `fisttp_m32` — a real alloca
+            // belonging to a different mechanism, in a different block.
+            if (op == *allocaOp && lir.instPayload(inst) == 16u) {
+                ++allocas;
+                // The reservations must LEAD the entry block — the placement is
+                // correctness, not tidiness: lir_callconv assigns frame offsets by
+                // a blocks-then-insts walk while the lowering counts them in
+                // emission order, and the phi edge copies live in split blocks
+                // that are appended AFTER every pre-created block.
+                if (bi == 0 && ii == entryLeadingAllocas) ++entryLeadingAllocas;
+            }
+            if (op == *fstpOp && ii > 0
+                && lir.instOpcode(lir.blockInstAt(blk, ii - 1)) == *fldOp)
+                ++copies;
         }
     }
-    EXPECT_TRUE(sawMerge)
-        << "the F80 phi wall must fire with the control-merge diagnostic";
+    EXPECT_EQ(allocas, 2u)
+        << "one 16-byte home for the phi + one per-edge staging home";
+    EXPECT_EQ(entryLeadingAllocas, 2u)
+        << "both reservations must be the LEADING instructions of the entry "
+           "block, or the callconv frame-slot scan and the lowering's own "
+           "scan-order counter disagree";
+    EXPECT_EQ(copies, 4u)
+        << "two edges x (stage the incoming, then write the phi home) — each an "
+           "fld_m80 immediately followed by an fstp_m80";
+}
+
+// D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE — THE LOST-COPY PIN, and it is the one
+// property of this merge that a "returns the right answer" example cannot see.
+//
+// Two long doubles that SWAP across a loop back edge:
+//
+//   header:  p1 = phi [a, entry], [p2, header]
+//            p2 = phi [b, entry], [p1, header]
+//
+// A direct memory merge would emit `home(p1) <- home(p2) ; home(p2) <- home(p1)`
+// on the back edge and hand p2 the value p1 had ALREADY been overwritten with —
+// the memory twin of the register half's lost-copy problem, which is why the
+// register half stages every incoming into a temp first. The memory half must
+// stage too: EVERY incoming is copied into that phi's own staging slot BEFORE
+// ANY phi home is written.
+//
+// The pin reads the frame-slot indices off the `lea_frame_slot` payloads, so it
+// asserts the ORDER of the writes, not merely their count. Reservation order is
+// (p1.home=0, p1.staging=1, p2.home=2, p2.staging=3), so every block that
+// performs this edge's copies must write slots 1,3 (stage both) and only THEN
+// 0,2 (write both homes).
+//
+// Red-on-disable: make `emitPhiMovesForEdge`'s memory half copy incoming→home
+// directly (drop the staging pass) → the write order becomes 0,2 and this fails
+// while the arithmetic tests stay green.
+TEST(MirToLir, F80PhiSwapOnABackEdgeStagesEveryIncomingBeforeAnyHomeWrite) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f80    = interner.primitive(::dss::TypeKind::F80);
+    auto const i32    = interner.primitive(::dss::TypeKind::I32);
+    auto const boolT  = interner.primitive(::dss::TypeKind::Bool);
+    auto const ptrF80 = interner.pointer(f80);
+    std::array<::dss::TypeId, 3> params{boolT, ptrF80, ptrF80};
+    auto const fnSig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const entry  = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    ::dss::MirBlockId const header = mb.createBlock(::dss::StructCfMarker::LoopHeader);
+    ::dss::MirBlockId const exitB  = mb.createBlock(::dss::StructCfMarker::LoopExit);
+    mb.beginBlock(entry);
+    ::dss::MirInstId const cond = mb.addArg(0, boolT);
+    ::dss::MirInstId const pa   = mb.addArg(1, ptrF80);
+    ::dss::MirInstId const pb   = mb.addArg(2, ptrF80);
+    std::array<::dss::MirInstId, 1> laOps{pa};
+    ::dss::MirInstId const a = mb.addInst(::dss::MirOpcode::Load, laOps, f80);
+    std::array<::dss::MirInstId, 1> lbOps{pb};
+    ::dss::MirInstId const b = mb.addInst(::dss::MirOpcode::Load, lbOps, f80);
+    mb.addBr(header);
+    mb.beginBlock(header);
+    ::dss::MirInstId const p1 = mb.addPhi(f80);
+    ::dss::MirInstId const p2 = mb.addPhi(f80);
+    mb.addPhiIncoming(p1, ::dss::MirPhiIncoming{a,  entry});
+    mb.addPhiIncoming(p1, ::dss::MirPhiIncoming{p2, header});
+    mb.addPhiIncoming(p2, ::dss::MirPhiIncoming{b,  entry});
+    mb.addPhiIncoming(p2, ::dss::MirPhiIncoming{p1, header});
+    mb.addCondBr(cond, header, exitB);
+    mb.beginBlock(exitB);
+    std::array<::dss::MirInstId, 1> cvtOps{p1};
+    ::dss::MirInstId const asInt = mb.addInst(::dss::MirOpcode::FPToSI, cvtOps, i32);
+    mb.addReturn(asInt);
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "two swapping long-double phis on a back edge must lower: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& lir = result.lir;
+    ASSERT_EQ(lir.moduleFuncCount(), 1u);
+    ::dss::LirFuncId const fn = lir.funcAt(0);
+    auto const leaOp    = sch.opcodeByMnemonic("lea_frame_slot");
+    auto const fstpOp   = sch.opcodeByMnemonic("fstp_m80");
+    auto const allocaOp = sch.opcodeByMnemonic("alloca");
+    ASSERT_TRUE(leaOp.has_value() && fstpOp.has_value() && allocaOp.has_value());
+    // vreg -> the frame slot index its `lea_frame_slot` materialized.
+    std::unordered_map<std::uint32_t, std::uint32_t> slotOfVreg;
+    std::uint32_t allocas = 0;
+    std::uint32_t const bc = lir.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < bc; ++bi) {
+        ::dss::LirBlockId const blk = lir.funcBlockAt(fn, bi);
+        for (std::uint32_t ii = 0; ii < lir.blockInstCount(blk); ++ii) {
+            LirInstId const inst = lir.blockInstAt(blk, ii);
+            // 16-byte homes only — the FPToSI in the exit block reserves its
+            // own 4-byte `fisttp_m32` scratch, a different mechanism.
+            if (lir.instOpcode(inst) == *allocaOp
+                && lir.instPayload(inst) == 16u) ++allocas;
+            if (lir.instOpcode(inst) != *leaOp) continue;
+            LirReg const r = lir.instResult(inst);
+            if (r.valid()) slotOfVreg[r.id] = lir.instPayload(inst);
+        }
+    }
+    EXPECT_EQ(allocas, 4u)
+        << "two long-double phis: a home + a staging slot each";
+    // Every block that writes long-double homes must write the two STAGING slots
+    // (1 and 3) before the two HOME slots (0 and 2).
+    std::uint32_t blocksWithCopies = 0;
+    for (std::uint32_t bi = 0; bi < bc; ++bi) {
+        ::dss::LirBlockId const blk = lir.funcBlockAt(fn, bi);
+        std::vector<std::uint32_t> writeOrder;
+        for (std::uint32_t ii = 0; ii < lir.blockInstCount(blk); ++ii) {
+            LirInstId const inst = lir.blockInstAt(blk, ii);
+            if (lir.instOpcode(inst) != *fstpOp) continue;
+            auto const ops = lir.instOperands(inst);
+            ASSERT_FALSE(ops.empty());
+            ASSERT_EQ(ops[0].kind, LirOperandKind::Reg);
+            auto const it = slotOfVreg.find(ops[0].reg.id);
+            ASSERT_NE(it, slotOfVreg.end())
+                << "an fstp_m80 destination must be a rematerialized frame slot";
+            writeOrder.push_back(it->second);
+        }
+        if (writeOrder.empty()) continue;
+        ++blocksWithCopies;
+        std::vector<std::uint32_t> const expected{1u, 3u, 0u, 2u};
+        EXPECT_EQ(writeOrder, expected)
+            << "both incomings must be STAGED (slots 1 and 3) before either phi "
+               "home (slots 0 and 2) is written — otherwise the swap loses a copy";
+    }
+    EXPECT_EQ(blocksWithCopies, 2u)
+        << "the entry edge (inline) and the back edge (its own split block)";
 }
 
 // ══ D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): F80 arithmetic LOWERS to the fixed
@@ -6629,11 +7033,14 @@ TEST(MirToLir, LongDoubleUserCallComposesWithSoftcall) {
         << "the user call to `add` (symbol 2) must be present alongside the softcall";
 }
 
-TEST(MirToLir, F128PhiControlMergeWallsFailLoud) {
-    // The F128 twin of F80PhiControlMergeWallsFailLoud: an F128 phi (a `long
-    // double` crossing a control-flow join) must WALL loud in prepassAllocatePhis
-    // (the generic F80||F128 wall), even with the softcall config active — the
-    // softcall realizes straight-line arithmetic, not a memory-home phi merge.
+TEST(MirToLir, F128PhiControlMergeLowersToMemoryHomeCopy) {
+    // The F128 twin of F80PhiControlMergeLowersToMemoryHomeCopy: an F128 phi (a
+    // `long double` crossing a control-flow join) LOWERS through the same
+    // memory-home merge, but its per-edge copy is the TWO-WORD GPR copy F128
+    // stores use (there is no x87 stack on arm64) — the one place the shared
+    // `emitWideFloatHomeCopy` verb differs by TypeKind, and it differs by
+    // TypeKind alone, never by arch identity.
+    // Red-on-disable: restore the `prepassAllocatePhis` F80/F128 refusal.
     auto target = ::dss::TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
@@ -6673,18 +7080,60 @@ TEST(MirToLir, F128PhiControlMergeWallsFailLoud) {
 
     ::dss::DiagnosticReporter rep;
     auto const result = lowerF128Arm64(m, **target, interner, rep);
-    EXPECT_FALSE(result.ok)
-        << "an F128 phi (long double control-flow merge) must WALL loud";
-    bool sawMerge = false;
+    ASSERT_TRUE(result.ok)
+        << "an F128 phi (long double control-flow merge) must LOWER: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
     for (auto const& d : rep.all()) {
-        if (d.actual.find("control-flow merge") != std::string::npos
-            || d.actual.find("CONTROL-MERGE") != std::string::npos) {
-            sawMerge = true;
-            break;
+        EXPECT_EQ(d.actual.find("control-flow merge"), std::string::npos)
+            << "the control-merge WALL must be gone: " << d.actual;
+    }
+    Lir const& lir = result.lir;
+    ASSERT_EQ(lir.moduleFuncCount(), 1u);
+    ::dss::LirFuncId const fn = lir.funcAt(0);
+    auto const allocaOp = (*target)->opcodeByMnemonic("alloca");
+    auto const leaOp    = (*target)->opcodeByMnemonic("lea_frame_slot");
+    auto const storeOp  = (*target)->opcodeByMnemonic("store");
+    ASSERT_TRUE(allocaOp.has_value() && leaOp.has_value() && storeOp.has_value());
+    std::unordered_set<std::uint32_t> frameSlotAddrVregs;
+    std::uint32_t allocas = 0;
+    std::uint32_t entryLeadingAllocas = 0;
+    std::uint32_t const bc = lir.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < bc; ++bi) {
+        ::dss::LirBlockId const blk = lir.funcBlockAt(fn, bi);
+        std::uint32_t const ic = lir.blockInstCount(blk);
+        for (std::uint32_t ii = 0; ii < ic; ++ii) {
+            LirInstId const inst = lir.blockInstAt(blk, ii);
+            if (lir.instOpcode(inst) == *leaOp && lir.instResult(inst).valid())
+                frameSlotAddrVregs.insert(lir.instResult(inst).id);
+            if (lir.instOpcode(inst) != *allocaOp
+                || lir.instPayload(inst) != 16u) continue;
+            ++allocas;
+            if (bi == 0 && ii == entryLeadingAllocas) ++entryLeadingAllocas;
         }
     }
-    EXPECT_TRUE(sawMerge)
-        << "the F128 phi wall must fire with the control-merge diagnostic";
+    EXPECT_EQ(allocas, 2u)
+        << "one 16-byte home for the phi + one per-edge staging home";
+    EXPECT_EQ(entryLeadingAllocas, 2u)
+        << "both reservations must LEAD the entry block (the callconv frame-slot "
+           "scan walks blocks-then-insts; the lowering counts in emission order)";
+    // The copies themselves: each edge stages the incoming then writes the home,
+    // and each of those is a TWO-WORD GPR copy (offsets 0 and 8 — there is no
+    // x87 stack here). 2 edges x 2 steps x 2 words = 8 stores through a
+    // rematerialized frame-slot address.
+    std::uint32_t frameStores = 0;
+    for (std::uint32_t bi = 0; bi < bc; ++bi) {
+        ::dss::LirBlockId const blk = lir.funcBlockAt(fn, bi);
+        for (std::uint32_t ii = 0; ii < lir.blockInstCount(blk); ++ii) {
+            LirInstId const inst = lir.blockInstAt(blk, ii);
+            if (lir.instOpcode(inst) != *storeOp) continue;
+            auto const ops = lir.instOperands(inst);
+            if (ops.size() < 2 || ops[1].kind != LirOperandKind::Reg) continue;
+            if (frameSlotAddrVregs.count(ops[1].reg.id) != 0) ++frameStores;
+        }
+    }
+    EXPECT_EQ(frameStores, 8u)
+        << "two edges x (stage the incoming, then write the phi home) x two "
+           "8-byte words of the binary128 datum";
 }
 
 TEST(MirToLir, F128StoreLowersToGprPairCopy) {
@@ -8194,4 +8643,2223 @@ TEST(MirToLir, Int128MemoryAccessFailsLoud) {
         << "the 128-bit width refusal must carry its OWN anchor — the generic "
            "32-bit-ALU-forms message shares the same DiagnosticCode, so an "
            "error-count assertion alone would not be red-on-disable";
+}
+
+// ── D-CSUBSET-PACKED-ATOMIC-MEMBER: the UNDER-ALIGNED `_Atomic` arm ────────
+//
+// ★★ THESE ARE THE PINS THAT ARE VISIBLE ON EVERY HOST, and that matters more
+// here than anywhere else in this file. The DEFECT — an `_Atomic int` at byte
+// offset 1 of a packed struct emitting the inline `stlr`/`ldar` pair — is a
+// `rc 135, Bus error` on NATIVE aarch64 and exits 42 everywhere DSS's gate
+// actually runs: qemu-user does not enforce the LDAR/STLR alignment check, and
+// x86-64 tolerates the misaligned access outright. So the RUNTIME witness lives
+// off-corpus on real hardware, and what is pinned HERE is the EMITTED FORM,
+// which every leg can see.
+//
+// Each pin carries its own CONTROL — the naturally-aligned access of the same
+// type, which must keep the native instruction. Without it a "fix" that routed
+// EVERY `_Atomic` access through the runtime would pass every fault test.
+namespace {
+
+// The lvalue's provable alignment travels on `payload2` (hir_to_mir's
+// `atomicAlignPayload`). 1 = the packed-member case, 4 = naturally aligned.
+[[nodiscard]] Mir buildAtomicLoadFnMirAligned(std::uint32_t provableAlign,
+                                              TypeInterner& interner) {
+    TypeId const i32  = interner.primitive(TypeKind::I32);
+    TypeId const i32p = interner.pointer(i32);
+    TypeId const params[] = {i32p};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const ptr = mb.addArg(0, i32p);
+    MirInstId const loadOps[] = {ptr};
+    MirInstId const v = mb.addInst(MirOpcode::AtomicLoad, loadOps, i32,
+                                   /*payload=*/5, MirInstFlags::None,
+                                   provableAlign);
+    mb.addReturn(v);
+    return std::move(mb).finish();
+}
+
+[[nodiscard]] Mir buildAtomicStoreFnMirAligned(std::uint32_t provableAlign,
+                                               TypeInterner& interner) {
+    TypeId const i32  = interner.primitive(TypeKind::I32);
+    TypeId const i32p = interner.pointer(i32);
+    TypeId const params[] = {i32p, i32};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const ptr = mb.addArg(0, i32p);
+    MirInstId const val = mb.addArg(1, i32);
+    MirInstId const storeOps[] = {val, ptr};
+    (void)mb.addInst(MirOpcode::AtomicStore, storeOps, InvalidType,
+                     /*payload=*/5, MirInstFlags::None, provableAlign);
+    mb.addReturn(val);
+    return std::move(mb).finish();
+}
+
+// The elf spelling of the two GENERIC entries + the image that owns them, as
+// `elf64-aarch64-linux-exec.format.json` declares them.
+[[nodiscard]] dss::AtomicsRuntime elfAtomicsRuntime() {
+    dss::AtomicsRuntime ar;
+    ar.role             = dss::RuntimeLibraryRole::AtomicsRuntime;
+    ar.libraryPath      = "libatomic.so.1";
+    ar.loadMangledName  = "__atomic_load";
+    ar.storeMangledName = "__atomic_store";
+    return ar;
+}
+
+}  // namespace
+
+TEST(MirToLirPackedAtomic, UnderAlignedStoreCallsTheAtomicsRuntimeNotStlr) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ASSERT_EQ((*target)->underAlignedAtomicForm(),
+              dss::UnderAlignedAtomicForm::Traps)
+        << "arm64 must declare `atomics.underAlignedNativeForm: traps` — its "
+           "inline STLR/LDAR pair is a MEASURED rc 135 SIGBUS on real hardware";
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/1, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                           ExternCallDispatch::DirectPlt, std::nullopt,
+                           std::nullopt, {}, std::nullopt, std::nullopt,
+                           std::nullopt, elfAtomicsRuntime());
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 0)
+        << "RED-ON-DISABLE: an UNDER-ALIGNED atomic store must NOT emit the "
+           "native STLR — that instruction faults on this access.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "call"), 1)
+        << "it must be one call to the format's generic atomics entry.";
+    bool bound = false;
+    for (auto const& e : lirR.externImports) {
+        if (e.mangledName == "__atomic_store") {
+            bound = true;
+            EXPECT_EQ(e.libraryPath, "libatomic.so.1")
+                << "the minted import must bind the image the FORMAT declared, "
+                   "never a literal in the lowerer";
+            EXPECT_TRUE(e.version.empty())
+                << "unversioned, so the image DEFAULT version binds "
+                   "(MEASURED: the entries export @@LIBATOMIC_1.0)";
+            EXPECT_FALSE(e.isData);
+        }
+    }
+    EXPECT_TRUE(bound) << "the lowerer must MINT the `__atomic_store` import";
+}
+
+TEST(MirToLirPackedAtomic, NaturallyAlignedStoreKeepsTheNativeStlr) {
+    // THE CONTROL. Same target, same runtime declared, same opcode — only the
+    // provable alignment differs. A fix that routed every `_Atomic` access
+    // through the runtime would pass the sibling above and red here.
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/4, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                           ExternCallDispatch::DirectPlt, std::nullopt,
+                           std::nullopt, {}, std::nullopt, std::nullopt,
+                           std::nullopt, elfAtomicsRuntime());
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 1)
+        << "a naturally-aligned atomic store keeps the native STLR.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "call"), 0)
+        << "RED-ON-DISABLE: it must NOT pay for a libcall it does not need.";
+    EXPECT_TRUE(lirR.externImports.empty())
+        << "no atomics import may be minted for an aligned access.";
+}
+
+TEST(MirToLirPackedAtomic, UnderAlignedLoadCallsTheAtomicsRuntimeNotLdar) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicLoadFnMirAligned(/*provableAlign=*/1, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                           ExternCallDispatch::DirectPlt, std::nullopt,
+                           std::nullopt, {}, std::nullopt, std::nullopt,
+                           std::nullopt, elfAtomicsRuntime());
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load_acquire"), 0)
+        << "RED-ON-DISABLE: an UNDER-ALIGNED atomic load must NOT emit LDAR.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "call"), 1);
+    bool bound = false;
+    for (auto const& e : lirR.externImports) {
+        if (e.mangledName == "__atomic_load") bound = true;
+    }
+    EXPECT_TRUE(bound) << "the lowerer must MINT the `__atomic_load` import";
+}
+
+TEST(MirToLirPackedAtomic, NaturallyAlignedLoadKeepsTheNativeLdar) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicLoadFnMirAligned(/*provableAlign=*/4, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                           ExternCallDispatch::DirectPlt, std::nullopt,
+                           std::nullopt, {}, std::nullopt, std::nullopt,
+                           std::nullopt, elfAtomicsRuntime());
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load_acquire"), 1);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "call"), 0);
+}
+
+TEST(MirToLirPackedAtomic, UnknownAlignmentKeepsTheNativeFormByteForByte) {
+    // `payload2 == 0` is the "could not derive an alignment" sentinel. It must
+    // read as ALIGNED, so a producer that never learned to stamp leaves output
+    // byte-identical to before this arm existed rather than silently changing
+    // every atomic in the program.
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/0, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                           ExternCallDispatch::DirectPlt, std::nullopt,
+                           std::nullopt, {}, std::nullopt, std::nullopt,
+                           std::nullopt, elfAtomicsRuntime());
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 1);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "call"), 0);
+}
+
+TEST(MirToLirPackedAtomic, TrapsTargetWithNoAtomicsRuntimeRefusesLoud) {
+    // The native form here is a CERTAIN fault, so emitting it is a silent
+    // miscompile. No runtime declared ⇒ REFUSE, naming the config key.
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/1, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                           ExternCallDispatch::DirectPlt, std::nullopt,
+                           std::nullopt, {}, std::nullopt, std::nullopt,
+                           std::nullopt, std::nullopt);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "RED-ON-DISABLE: a `traps` target with no atomics runtime must "
+           "refuse the access, never emit an instruction known to fault.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 0)
+        << "and it must not emit the faulting form on the way out.";
+}
+
+TEST(MirToLirPackedAtomic,
+     LosesAtomicityTargetWithNoRuntimeKeepsTheNativeFormRatherThanRefusing) {
+    // The `losesAtomicity` + NO-IMAGE arm of `atomicLoweringFor`: keep the native
+    // form rather than refuse. Refusing would be BELOW the
+    // (gcc ∪ clang ∪ MSVC) ∪ ISO C union — a new conformance defect manufactured
+    // by the fix for another one — because gcc's inline pair is ACCEPTED and does
+    // not fault on a `losesAtomicity` processor.
+    //
+    // ⚠⚠ P54 CHANGED THIS TEST'S EXEMPLAR, NOT ITS SUBJECT, AND THE OLD EXEMPLAR
+    // IS RECORDED HERE RATHER THAN DELETED BECAUSE THE WAY IT EXPIRED IS THE
+    // LESSON. It used to open "THIS IS THE pe64 ARM ... UCRT exports no
+    // `__atomic_*` symbol and there is no PE atomics image to name, so this is
+    // not a hypothetical arm — it is every Windows build." The first clause is
+    // still true; the second was inferred from it rather than measured, and
+    // ✔MEASURED 2026-09-02 (P54) it is FALSE — mingw-w64's `libatomic-1.dll`
+    // exports `__atomic_load` (ord 55) and `__atomic_store` (ord 71), so all four
+    // pe64 flavours now declare the role and take the libcall like every other
+    // shipped format. What survives is the LOWERING RULE this test actually pins,
+    // which no shipped format's config can reach around: any format that declares
+    // no atomics image (wasm32, spirv, or a future one) must keep the native form
+    // under `losesAtomicity` instead of refusing. The arm is still live; it is no
+    // longer WINDOWS that exercises it.
+    //
+    // ⓘ The `atomicsRuntime = std::nullopt` below is therefore now a SYNTHETIC
+    // no-image format rather than a stand-in for a shipped one, and that is
+    // deliberate — pinning the rule at the tier that decides it, not at whichever
+    // config happens to exercise it this cycle
+    // ([[feedback-a-rows-premise-has-a-shelf-life]]).
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ASSERT_EQ((*target)->underAlignedAtomicForm(),
+              dss::UnderAlignedAtomicForm::LosesAtomicity);
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/1, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                           ExternCallDispatch::IndirectSlot, std::nullopt,
+                           std::nullopt, {}, std::nullopt, std::nullopt,
+                           std::nullopt, std::nullopt);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "RED-ON-DISABLE: refusing here would put DSS below the reference "
+           "union on the one shipped format with no atomics image.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 1)
+        << "the native xchg stands — it is what gcc emits, and it runs.";
+}
+
+TEST(MirToLirPackedAtomic, LosesAtomicityTargetWithARuntimeStillTakesTheLibcall) {
+    // The other half of the same rule: where an image DOES exist (elf64/macho64
+    // on x86_64), the ruling is to use it — clang emits `callq __atomic_store@PLT`
+    // for this lvalue on x86-64 too, and gcc's paired plain `movl` is not
+    // architecturally atomic across a cache line.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/1, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                           ExternCallDispatch::DirectPlt, std::nullopt,
+                           std::nullopt, {}, std::nullopt, std::nullopt,
+                           std::nullopt, elfAtomicsRuntime());
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 0);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "call"), 1);
+}
+
+// ★★ D-CSUBSET-PACKED-ATOMIC-MEMBER (P54): the pe64 arm, driven by the SHIPPED
+// config rather than a hand-built AtomicsRuntime.
+//
+// The two tests above pin the RULE with synthetic inputs; this one pins that the
+// shipped Windows format actually reaches it. Both halves matter and only the
+// pair is meaningful — the synthetic tests would stay green if every pe64
+// `.format.json` lost its `atomicsRuntime` block tomorrow, which is exactly the
+// state this row was REOPENED to fix.
+//
+// ⚠ EVERY ASSERTION BELOW IS AN EMITTED-FORM CLAIM, NOT AN ATOMICITY CLAIM. No
+// unit test on any host can observe atomicity; what it CAN observe is which of
+// the two routes was taken, and the route is what the reference union decides.
+// The atomicity itself comes from what the RUNTIME does, not from a count of
+// mnemonics ([[feedback-an-instrument-that-answers-an-adjacent-question]]) — and
+// it now has its own EXECUTION witness in
+// `examples/c/packed_atomic_member_concurrency`, where threads race an object
+// deliberately straddling a cache line and a torn value is observable.
+//
+// ⚠⚠ THE SENTENCE THAT USED TO SIT HERE — "the runtime property comes from
+// libatomic's lock-table dispatch" — IS REFUTED AND IS KEPT AS THE CORRECTION
+// RATHER THAN DELETED. ✔MEASURED 2026-09-02 (P54 lane `la`) by disassembling
+// `libatomic.so.1.2.0`: on x86-64 the generic entries do NOT take a lock for an
+// under-aligned access that fits inside an aligned block — `__atomic_load` does
+// a plain aligned 8-byte read and extracts, `__atomic_store` runs a
+// `lock cmpxchg` loop over the containing block — and the lock is reached only
+// for a straddling object or a size above 16. And on pe64 the provider is no
+// longer libatomic at all: it is DSS's own `runtime/platform/src/atomic.c`
+// (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64), which serves n = 4 and n = 8 with a
+// width-native `lock`-prefixed RMW and takes no lock in any case.
+TEST(MirToLirPackedAtomic, ShippedPe64FormatRoutesTheUnderAlignedAccessToTheRuntime) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(fmt.has_value())
+        << "the shipped pe64 exec format must load";
+    auto const& ar = (*fmt)->atomicsRuntime();
+    ASSERT_TRUE(ar.has_value())
+        << "pe64-x86_64-windows-exec must declare an `atomicsRuntime` block — "
+           "without one an under-aligned _Atomic silently keeps gcc's plain "
+           "`movl` load, which is not atomic across a cache line.";
+
+    // (a) UNDER-ALIGNED -> the runtime call, and NO native atomic instruction.
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/1, interner);
+        DiagnosticReporter rep;
+        std::vector<dss::ExternImport> noExterns;
+        auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                               ExternCallDispatch::DirectPlt, std::nullopt,
+                               std::nullopt, {}, std::nullopt, std::nullopt,
+                               std::nullopt, ar);
+        ASSERT_TRUE(lirR.ok);
+        EXPECT_EQ(rep.errorCount(), 0u)
+            << "declaring the image must not turn an accepted construct into a "
+               "refusal — that would be the conformance defect the P53 arm "
+               "correctly refused to manufacture.";
+        EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 0)
+            << "RED-ON-DISABLE: the native xchg must NOT stand once a Windows "
+               "atomics image is declared.";
+        EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "call"), 1)
+            << "the generic __atomic_store must be called exactly once.";
+
+        // ★★ P54 lane `la` — THE MINTED EXTERN MUST CARRY NO LIBRARY, AND THIS
+        // IS THE ASSERTION THAT SEPARATES "DSS SHIPS THE BODY" FROM "DSS IMPORTS
+        // IT FROM A DLL". An EMPTY `libraryPath` is the `noLibraryBinding` shape
+        // (the same one `dirent`/`unistd` realizations use): the linker resolves
+        // it out of the shipped runtime archive by the ordinary unresolved-symbol
+        // pull. A regression that put an image back here would compile, link and
+        // RUN — against an external `libatomic-1.dll` that is not in-box on
+        // Windows — so nothing else in this file would notice.
+        ASSERT_EQ(lirR.externImports.size(), 1u)
+            << "exactly one atomics extern must be minted";
+        EXPECT_EQ(lirR.externImports[0].mangledName, "__atomic_store");
+        EXPECT_EQ(lirR.externImports[0].libraryPath, "")
+            << "the pe64 atomicsRuntime role is REALIZED from a shipped source, "
+               "so the minted extern must be unbound and resolve out of the "
+               "shipped runtime archive — a non-empty library here is the "
+               "external-DLL dependency P54 removed.";
+    }
+
+    // (b) THE ALIGNED CONTROL — the half a fault-only or route-only test cannot
+    // see. A "fix" routing EVERY `_Atomic` access through the runtime would pass
+    // (a) and still be wrong ([[feedback-a-partial-fix-reads-as-a-complete-one]]).
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        Mir mir = buildAtomicStoreFnMirAligned(/*provableAlign=*/4, interner);
+        DiagnosticReporter rep;
+        std::vector<dss::ExternImport> noExterns;
+        auto lirR = lowerToLir(mir, **target, interner, rep, noExterns,
+                               ExternCallDispatch::DirectPlt, std::nullopt,
+                               std::nullopt, {}, std::nullopt, std::nullopt,
+                               std::nullopt, ar);
+        ASSERT_TRUE(lirR.ok);
+        EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 1)
+            << "a naturally-aligned atomic store must KEEP the native xchg on "
+               "Windows — declaring the runtime must not pessimise it.";
+        EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "call"), 0)
+            << "and it must not call the runtime at all.";
+    }
+}
+
+// ══ D-TARGET-ENCODING-WIDTH-GUARD (LD-3): `long double` COMPARISON ═════════
+//
+// The third consumer of the LD memory-resident model, after LD-1's x87
+// arithmetic and LD-2's binary128 softcalls. Until this landed, the ONE thing a
+// program could not do with a `long double` was compare two of them: every
+// FCmp whose operands were F80 or F128 hit `requireEncodedFloatWidth`'s
+// "MIR FCmp operand" arm and failed loud naming this anchor. The refusal was
+// reachable from ordinary C — `examples/c/c_long_double_control_merge` is bent
+// around it — and all four references compile and RUN the construct.
+//
+// TWO REALIZATIONS, ONE TAIL, and which applies is decided by TypeKind alone
+// (each width forms solely on its own longDoubleFormat axis):
+//
+//   * F80 (the x87-80 axis: elf/macho x86_64) — an INLINE four-instruction
+//     sequence `fld_m80 [rhs]; fld_m80 [lhs]; fucomip; fstp_st0`. FUCOMIP
+//     reports into EFLAGS with UCOMISD's exact ZF/PF/CF pattern, so the whole
+//     FC3.5 predicate machinery (floatCmpPlan, the Olt/Ole swap, the composed
+//     two-setcc shapes, the fused jcc) applies UNCHANGED.
+//   * F128 (the ieee128 axis: elf arm64) — a CALL to a config'd libgcc helper,
+//     one per C operator, then an INTEGER compare of its int32 result against
+//     zero. No float flags are involved at all.
+//
+// ★ WHY A "IT COMPILES AND RETURNS 42" ARM WOULD NOT BE ENOUGH. The failure
+// mode of a compare lowering is not a fault, it is an INVERTED ANSWER, and both
+// ways to get one are silent:
+//   (a) the x87 PUSH ORDER — FUCOMIP compares ST(0) against ST(1), so the LEFT
+//       side must be pushed LAST, the REVERSE of `lowerF80Arith`'s order. Get
+//       it backwards and every relational operator inverts, with no arity, type
+//       or width check able to see it. The two direction arms below pin it
+//       ABSOLUTELY (against the `arg` opcodes' own result registers), not
+//       merely relative to each other — a globally reversed push order would
+//       satisfy a relative pin.
+//   (b) the F128 compare WIDTH — the helper returns a C `int` and AAPCS64
+//       leaves the upper 32 bits of the result register unspecified, so a
+//       width-64 compare could take the sign from garbage.
+
+namespace {
+
+// `_Bool f(long double* pa, long double* pb) { return *pa OP *pb; }` for a
+// memory-resident wide float. Pointer params (so the two `arg` opcodes give
+// each operand's address an IDENTIFIABLE register) + F80/F128 Loads, which
+// address-propagate — so the compare's operand registers ARE the arg registers.
+[[nodiscard]] ::dss::Mir
+buildWideFloatCompare(::dss::TypeInterner& interner, ::dss::TypeKind kind,
+                      ::dss::MirOpcode pred) {
+    auto const wide  = interner.primitive(kind);
+    auto const ptrT  = interner.pointer(wide);
+    auto const boolT = interner.primitive(::dss::TypeKind::Bool);
+    std::array<::dss::TypeId, 2> params{ptrT, ptrT};
+    auto const sig = interner.fnSig(params, boolT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const pa = mb.addArg(0, ptrT);
+    ::dss::MirInstId const pb = mb.addArg(1, ptrT);
+    std::array<::dss::MirInstId, 1> laOps{pa};
+    ::dss::MirInstId const va = mb.addInst(::dss::MirOpcode::Load, laOps, wide);
+    std::array<::dss::MirInstId, 1> lbOps{pb};
+    ::dss::MirInstId const vb = mb.addInst(::dss::MirOpcode::Load, lbOps, wide);
+    std::array<::dss::MirInstId, 2> cmpOps{va, vb};
+    ::dss::MirInstId const c = mb.addInst(pred, cmpOps, boolT);
+    mb.addReturn(c);
+    return std::move(mb).finish();
+}
+
+// The same comparison CONSUMED BY A BRANCH — the path `lowerCondBr`'s fusion
+// arm takes, and the second place the width gate reaches an FCmp operand.
+[[nodiscard]] ::dss::Mir
+buildWideFloatCompareBranch(::dss::TypeInterner& interner, ::dss::TypeKind kind,
+                            ::dss::MirOpcode pred) {
+    auto const wide  = interner.primitive(kind);
+    auto const ptrT  = interner.pointer(wide);
+    auto const i32   = interner.primitive(::dss::TypeKind::I32);
+    auto const boolT = interner.primitive(::dss::TypeKind::Bool);
+    std::array<::dss::TypeId, 2> params{ptrT, ptrT};
+    auto const sig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const entry =
+        mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    ::dss::MirBlockId const thenB = mb.createBlock(::dss::StructCfMarker::IfThen);
+    ::dss::MirBlockId const elseB = mb.createBlock(::dss::StructCfMarker::IfElse);
+    mb.beginBlock(entry);
+    ::dss::MirInstId const pa = mb.addArg(0, ptrT);
+    ::dss::MirInstId const pb = mb.addArg(1, ptrT);
+    std::array<::dss::MirInstId, 1> laOps{pa};
+    ::dss::MirInstId const va = mb.addInst(::dss::MirOpcode::Load, laOps, wide);
+    std::array<::dss::MirInstId, 1> lbOps{pb};
+    ::dss::MirInstId const vb = mb.addInst(::dss::MirOpcode::Load, lbOps, wide);
+    std::array<::dss::MirInstId, 2> cmpOps{va, vb};
+    ::dss::MirInstId const c = mb.addInst(pred, cmpOps, boolT);
+    mb.addCondBr(c, thenB, elseB);
+    ::dss::MirLiteralValue lv42;
+    lv42.value = static_cast<std::int64_t>(42);
+    lv42.core  = ::dss::TypeKind::I32;
+    ::dss::MirLiteralValue lv7;
+    lv7.value = static_cast<std::int64_t>(7);
+    lv7.core  = ::dss::TypeKind::I32;
+    mb.beginBlock(thenB);
+    mb.addReturn(mb.addConst(lv42, i32));
+    mb.beginBlock(elseB);
+    mb.addReturn(mb.addConst(lv7, i32));
+    return std::move(mb).finish();
+}
+
+// The result register of the `arg` instruction carrying payload `index`.
+[[nodiscard]] ::dss::LirReg
+argRegister(::dss::Lir const& lir, ::dss::LirBlockId bb, std::uint16_t argOp,
+            std::uint32_t index) {
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const id = lir.blockInstAt(bb, i);
+        if (lir.instOpcode(id) == argOp && lir.instPayload(id) == index) {
+            return lir.instResult(id);
+        }
+    }
+    return ::dss::LirReg{};
+}
+
+// Index of the first instruction in `bb` with opcode `op`, else nullopt.
+[[nodiscard]] std::optional<std::uint32_t>
+firstIndexOfOpcode(::dss::Lir const& lir, ::dss::LirBlockId bb,
+                   std::uint16_t op) {
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        if (lir.instOpcode(lir.blockInstAt(bb, i)) == op) return i;
+    }
+    return std::nullopt;
+}
+
+// The x87 compare shape: the ADDRESSES of the two `fld_m80` pushes in EMITTED
+// order, plus the `fucomip`'s index. nullopt unless the four instructions are
+// exactly fld_m80; fld_m80; fucomip; fstp_st0 and contiguous.
+struct X87CompareShape {
+    ::dss::LirReg firstPush{};   // pushed FIRST  → ends up in ST(1)
+    ::dss::LirReg secondPush{};  // pushed SECOND → ends up in ST(0)
+    std::uint32_t fucomipIdx = 0;
+};
+// `at` names WHICH compare to describe. A fused branch block holds TWO — the
+// one `lowerFCmp` emitted to materialize the Bool, and the one `lowerCondBr`
+// re-emitted for the jcc to read — and the fused test must describe the second,
+// not merely the first one it trips over.
+[[nodiscard]] std::optional<X87CompareShape>
+x87CompareShape(::dss::Lir const& lir, ::dss::LirBlockId bb,
+                ::dss::TargetSchema const& sch,
+                std::optional<std::uint32_t> at = std::nullopt) {
+    auto const fldOp     = sch.opcodeByMnemonic("fld_m80");
+    auto const fucomipOp = sch.opcodeByMnemonic("fucomip");
+    auto const fstpSt0Op = sch.opcodeByMnemonic("fstp_st0");
+    if (!fldOp.has_value() || !fucomipOp.has_value()
+        || !fstpSt0Op.has_value()) {
+        return std::nullopt;
+    }
+    auto const idx = at.has_value() ? at
+                                    : firstIndexOfOpcode(lir, bb, *fucomipOp);
+    if (!idx.has_value() || *idx < 2) return std::nullopt;
+    if (lir.instOpcode(lir.blockInstAt(bb, *idx)) != *fucomipOp) {
+        return std::nullopt;
+    }
+    if (*idx + 1 >= lir.blockInstCount(bb)) return std::nullopt;
+    auto const push1 = lir.blockInstAt(bb, *idx - 2);
+    auto const push2 = lir.blockInstAt(bb, *idx - 1);
+    if (lir.instOpcode(push1) != *fldOp || lir.instOpcode(push2) != *fldOp) {
+        return std::nullopt;
+    }
+    if (lir.instOpcode(lir.blockInstAt(bb, *idx + 1)) != *fstpSt0Op) {
+        return std::nullopt;
+    }
+    auto const o1 = lir.instOperands(push1);
+    auto const o2 = lir.instOperands(push2);
+    if (o1.empty() || o2.empty()) return std::nullopt;
+    if (o1[0].kind != ::dss::LirOperandKind::Reg
+        || o2[0].kind != ::dss::LirOperandKind::Reg) {
+        return std::nullopt;
+    }
+    return X87CompareShape{o1[0].reg, o2[0].reg, *idx};
+}
+
+// Index of the LAST instruction in `bb` with opcode `op` at or before `limit`.
+[[nodiscard]] std::optional<std::uint32_t>
+lastIndexOfOpcodeBefore(::dss::Lir const& lir, ::dss::LirBlockId bb,
+                        std::uint16_t op, std::uint32_t limit) {
+    std::optional<std::uint32_t> found;
+    for (std::uint32_t i = 0; i < limit && i < lir.blockInstCount(bb); ++i) {
+        if (lir.instOpcode(lir.blockInstAt(bb, i)) == op) found = i;
+    }
+    return found;
+}
+
+// Every setcc payload emitted in `bb`, in order.
+[[nodiscard]] std::vector<std::uint32_t>
+setccPayloads(::dss::Lir const& lir, ::dss::LirBlockId bb,
+              std::uint16_t setccOp) {
+    std::vector<std::uint32_t> out;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const id = lir.blockInstAt(bb, i);
+        if (lir.instOpcode(id) == setccOp) out.push_back(lir.instPayload(id));
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(MirToLir, F80CompareLowersToX87SequenceAndPushesTheLeftOperandLast) {
+    // The POSITIVE half: an F80 FCmp no longer walls, and it lowers to the
+    // exact four-instruction x87 compare plus the setcc/zext tail every other
+    // compare in the compiler already uses.
+    //
+    // THE DIRECTION ARM IS THE LOAD-BEARING ONE. `FCmpOgt(*pa, *pb)` takes no
+    // operand swap, so the left side is `*pa` and FUCOMIP needs it in ST(0) —
+    // pushed SECOND. Pinned ABSOLUTELY against the `arg` opcodes' own result
+    // registers, so it distinguishes the right order from the reversed one.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatCompare(interner, ::dss::TypeKind::F80,
+                                         ::dss::MirOpcode::FCmpOgt);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "an F80 comparison must lower on the x87-80 axis: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        << "the FCmp-operand width wall must NOT fire for F80 any more "
+           "(red-on-disable: revert the emitFloatCompare F80 arm and it does)";
+
+    Lir const& lir = result.lir;
+    ASSERT_EQ(lir.moduleFuncCount(), 1u);
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    auto const shape = x87CompareShape(lir, bb, **target);
+    ASSERT_TRUE(shape.has_value())
+        << "the F80 compare must emit exactly fld_m80; fld_m80; fucomip; "
+           "fstp_st0, contiguously";
+    auto const argOp = (*target)->opcodeByMnemonic("arg");
+    ASSERT_TRUE(argOp.has_value());
+    LirReg const pa = argRegister(lir, bb, *argOp, 0);
+    LirReg const pb = argRegister(lir, bb, *argOp, 1);
+    ASSERT_TRUE(pa.valid() && pb.valid());
+    EXPECT_EQ(shape->firstPush, pb)
+        << "Ogt takes no swap, so the RIGHT operand is pushed first (into ST(1))";
+    EXPECT_EQ(shape->secondPush, pa)
+        << "and the LEFT operand is pushed LAST, into ST(0) — FUCOMIP compares "
+           "ST(0) against ST(1), so reversing this inverts the operator with no "
+           "diagnostic anywhere";
+    auto const setccOp = (*target)->opcodeByMnemonic("setcc");
+    ASSERT_TRUE(setccOp.has_value());
+    auto const payloads = setccPayloads(lir, bb, *setccOp);
+    ASSERT_EQ(payloads.size(), 1u) << "Ogt is a single-cc predicate on x86";
+    EXPECT_EQ(payloads[0],
+              static_cast<std::uint32_t>(::dss::TargetCondCode::Fogt))
+        << "the x87 flags ARE UCOMISD's, so the FLOAT condition code applies "
+           "unchanged — an integer nibble here would be a NaN miscompile";
+}
+
+TEST(MirToLir, F80CompareSwapCanonicalizationReversesThePushOrder) {
+    // The other half of the direction pin, and the one proving the swap
+    // survives the new realization: `FCmpOlt(a,b)` is canonicalized to
+    // `Fogt(b,a)`, so the emitted compare's left side is `*pb` and IT must be
+    // pushed last — the exact mirror of the Ogt arm. A lowering that ignored
+    // `plan.swapOperands` for F80 would pass the shape arm, pass the Ogt arm,
+    // and invert every `<` in the language.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatCompare(interner, ::dss::TypeKind::F80,
+                                         ::dss::MirOpcode::FCmpOlt);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& lir = result.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    auto const shape = x87CompareShape(lir, bb, **target);
+    ASSERT_TRUE(shape.has_value());
+    auto const argOp = (*target)->opcodeByMnemonic("arg");
+    ASSERT_TRUE(argOp.has_value());
+    LirReg const pa = argRegister(lir, bb, *argOp, 0);
+    LirReg const pb = argRegister(lir, bb, *argOp, 1);
+    ASSERT_TRUE(pa.valid() && pb.valid());
+    EXPECT_EQ(shape->firstPush, pa)
+        << "Olt swaps, so the source-LEFT operand is pushed FIRST";
+    EXPECT_EQ(shape->secondPush, pb)
+        << "and the swapped left side (*pb) is the one that lands in ST(0)";
+}
+
+TEST(MirToLir, F80CompareFusesIntoTheConditionalBranch) {
+    // An F80 compare CONSUMED BY A BRANCH takes the fused arm like any other
+    // single-cc float predicate: the x87 sequence is re-emitted at the branch
+    // and the jcc reads its flags directly. This is the SECOND reach of the
+    // width gate ("MIR FCmp operand (fused)"); un-walling only the
+    // materializing one would be a partial fix that reads as a complete one,
+    // and `if (a < b)` is the commonest shape in real code.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatCompareBranch(interner, ::dss::TypeKind::F80,
+                                               ::dss::MirOpcode::FCmpOgt);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "an F80 compare feeding a branch must lower: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        << "neither FCmp reach of the width gate may fire for F80";
+    Lir const& lir = result.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    auto const jccOp = (*target)->opcodeByMnemonic("jcc");
+    auto const fucomipOp = (*target)->opcodeByMnemonic("fucomip");
+    ASSERT_TRUE(jccOp.has_value() && fucomipOp.has_value());
+    auto const jccIdx = firstIndexOfOpcode(lir, bb, *jccOp);
+    ASSERT_TRUE(jccIdx.has_value()) << "the block must terminate in a jcc";
+    // THE compare the branch reads is the LAST one before the jcc, not the
+    // first one in the block: `lowerFCmp` already emitted its own (whose setcc
+    // this fused path leaves dead — D-LIR-SETCC-DEAD-AFTER-FUSION), and
+    // describing that one instead would leave the fused emit unpinned.
+    auto const fusedIdx =
+        lastIndexOfOpcodeBefore(lir, bb, *fucomipOp, *jccIdx);
+    ASSERT_TRUE(fusedIdx.has_value())
+        << "the fused branch must emit an x87 compare before its jcc";
+    auto const shape = x87CompareShape(lir, bb, **target, fusedIdx);
+    ASSERT_TRUE(shape.has_value())
+        << "the fused branch's compare must be the full fld_m80; fld_m80; "
+           "fucomip; fstp_st0 sequence";
+    EXPECT_GT(*jccIdx, shape->fucomipIdx)
+        << "the jcc must read the flags the fucomip set";
+    EXPECT_EQ(lir.instPayload(lir.blockInstAt(bb, *jccIdx)),
+              static_cast<std::uint32_t>(::dss::TargetCondCode::Fogt))
+        << "fused, so the jcc carries the FLOAT condition directly";
+    // ★ AND THE FUSED EMIT NEEDS ITS OWN DIRECTION ARM. ✔MEASURED: the M4
+    // red-on-disable mutant (transposing the two pushes in `emitF80Compare`)
+    // left this test GREEN while both materializing-path direction arms went
+    // red — it pinned the SHAPE of the fused compare and not its ORDER, so a
+    // fused-only inversion could have slipped through. Same absolute anchor as
+    // the other two arms: Ogt takes no swap, so the RIGHT operand is pushed
+    // first and the LEFT one lands in ST(0).
+    auto const argOp = (*target)->opcodeByMnemonic("arg");
+    ASSERT_TRUE(argOp.has_value());
+    LirReg const pa = argRegister(lir, bb, *argOp, 0);
+    LirReg const pb = argRegister(lir, bb, *argOp, 1);
+    ASSERT_TRUE(pa.valid() && pb.valid());
+    EXPECT_EQ(shape->firstPush, pb)
+        << "the fused compare pushes the RIGHT operand first";
+    EXPECT_EQ(shape->secondPush, pa)
+        << "and the LEFT operand last, into ST(0) — the same direction the "
+           "materializing path uses, pinned separately because the fused path "
+           "emits its own compare";
+}
+
+TEST(MirToLir, F128CompareLowersToSoftcallAndWidth32IntegerCompare) {
+    // The binary128 half, all six C comparison operators. Each names its OWN
+    // libgcc helper — the mapping both aarch64 references were measured
+    // emitting — and finishes on the SIGNED INTEGER nibble for that operator,
+    // because once the helper has returned there is no float left to compare.
+    //
+    // ⚠ THE WIDTH ARM IS THE SILENT-MISCOMPILE GUARD. The helper returns a C
+    // `int`; AAPCS64 leaves the upper 32 bits of the result register
+    // unspecified, so a width-64 compare could read a garbage sign bit and
+    // decide the predicate at random. Both references emit `cmp w0, 0`.
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const callOp  = (*target)->opcodeByMnemonic("call");
+    auto const cmpOp   = (*target)->opcodeByMnemonic("cmp");
+    auto const setccOp = (*target)->opcodeByMnemonic("setcc");
+    ASSERT_TRUE(callOp.has_value() && cmpOp.has_value()
+                && setccOp.has_value());
+    struct Case {
+        ::dss::MirOpcode      pred;
+        char const*           helper;
+        ::dss::TargetCondCode cc;
+    };
+    std::array<Case, 6> const cases{{
+        {::dss::MirOpcode::FCmpOlt, "__lttf2", ::dss::TargetCondCode::Slt},
+        {::dss::MirOpcode::FCmpOle, "__letf2", ::dss::TargetCondCode::Sle},
+        {::dss::MirOpcode::FCmpOgt, "__gttf2", ::dss::TargetCondCode::Sgt},
+        {::dss::MirOpcode::FCmpOge, "__getf2", ::dss::TargetCondCode::Sge},
+        {::dss::MirOpcode::FCmpOeq, "__eqtf2", ::dss::TargetCondCode::Eq},
+        {::dss::MirOpcode::FCmpUne, "__netf2", ::dss::TargetCondCode::Ne},
+    }};
+    for (auto const& c : cases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m =
+            buildWideFloatCompare(interner, ::dss::TypeKind::F128, c.pred);
+        ::dss::DiagnosticReporter rep;
+        auto result = lowerF128Arm64(m, **target, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << c.helper << ": an F128 comparison must lower to the softcall: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+            << c.helper << ": the FCmp-operand width wall must not fire";
+        // THIS predicate's helper, and no other one: a mapping that collapsed
+        // several operators onto one helper would still lower and still return
+        // a plausible answer, so the extern set is pinned exactly.
+        ASSERT_EQ(result.externImports.size(), 1u)
+            << c.helper << ": exactly one comparison helper may be imported";
+        EXPECT_EQ(result.externImports[0].mangledName, c.helper)
+            << c.helper << ": wrong helper for this predicate";
+        std::uint32_t const helperSym = result.externImports[0].symbol.v;
+
+        Lir const& lir = result.lir;
+        LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+        auto const callIdx = findCallToSymbol(lir, bb, *callOp, helperSym);
+        ASSERT_TRUE(callIdx.has_value())
+            << c.helper << ": call site not found";
+        // …followed by the integer compare of its result against zero.
+        std::optional<std::uint32_t> cmpIdx;
+        for (std::uint32_t i = *callIdx + 1; i < lir.blockInstCount(bb); ++i) {
+            if (lir.instOpcode(lir.blockInstAt(bb, i)) == *cmpOp) {
+                cmpIdx = i;
+                break;
+            }
+        }
+        ASSERT_TRUE(cmpIdx.has_value())
+            << c.helper << ": the helper's result must be compared to zero";
+        auto const cmpInst = lir.blockInstAt(bb, *cmpIdx);
+        auto const cmpOperands = lir.instOperands(cmpInst);
+        ASSERT_EQ(cmpOperands.size(), 2u) << c.helper;
+        EXPECT_EQ(cmpOperands[1].kind, ::dss::LirOperandKind::ImmInt)
+            << c.helper;
+        EXPECT_EQ(cmpOperands[1].immInt32, 0) << c.helper;
+        EXPECT_EQ(lirInstWidthBits(lir.instFlags(cmpInst)), 32u)
+            << c.helper
+            << ": the helper returns an `int` and AAPCS64 leaves the upper 32 "
+               "bits of the result register unspecified — a width-64 compare "
+               "could take the sign from garbage";
+        // …and the SIGNED integer condition this operator names.
+        auto const payloads = setccPayloads(lir, bb, *setccOp);
+        ASSERT_EQ(payloads.size(), 1u)
+            << c.helper
+            << ": one setcc — the helper already folded the unordered case, so "
+               "no Ford/Fuo composition is needed";
+        EXPECT_EQ(payloads[0], static_cast<std::uint32_t>(c.cc))
+            << c.helper << ": wrong condition code for this predicate";
+    }
+}
+
+TEST(MirToLir, F128CompareFailsLoudWithoutConfigRow) {
+    // RED-ON-DISABLE, the agnosticism condition: the SAME F128 comparison
+    // against x86_64 — which declares F128 but has NO wideFloatSoftcalls rows —
+    // must FAIL LOUD through the width gate, not lower. This is what proves the
+    // comparison path is gated on the PRESENCE of a config row rather than on
+    // the target's identity; delete the `if (wideFloatSoftcall(...))` guard in
+    // lowerFCmp and this reds.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    EXPECT_EQ((*target)->wideFloatSoftcall(::dss::WideFloatOp::CmpLt), nullptr)
+        << "x86_64 must declare NO F128 comparison row (the premise)";
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatCompare(interner, ::dss::TypeKind::F128,
+                                         ::dss::MirOpcode::FCmpOlt);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    EXPECT_FALSE(result.ok)
+        << "an F128 comparison on a target with no comparison row must fail "
+           "loud, not silently take the softcall path";
+    EXPECT_TRUE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        << "the fall-through must hit the encoded-width gate";
+    EXPECT_TRUE(sawAnchor(rep, "MIR FCmp operand"))
+        << "and it must be the FCmp-operand reach of it that fires";
+}
+
+TEST(MirToLir, F128CompareFeedingABranchCallsTheHelperExactlyOnce) {
+    // The DELIBERATE non-fusion, a cost pin rather than a capability gap.
+    // Fusion RE-EMITS the flag-producing compare at the branch; for F128 that
+    // compare is a CALL, so fusing would invoke the helper a SECOND time for
+    // one source-level comparison and drop a call between the block's code and
+    // its terminator. F128 therefore takes the non-fused arm — the same one a
+    // composed float predicate takes — branching on the Bool `lowerFCmp`
+    // already materialized.
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatCompareBranch(interner, ::dss::TypeKind::F128,
+                                               ::dss::MirOpcode::FCmpOlt);
+    ::dss::DiagnosticReporter rep;
+    auto result = lowerF128Arm64(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "an F128 compare feeding a branch must lower: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        << "neither FCmp reach of the width gate may fire for F128";
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "call"), 1)
+        << "the comparison helper must be called ONCE — a fused re-emit would "
+           "call it twice for one source-level comparison";
+}
+
+// ══ D-TARGET-ENCODING-WIDTH-GUARD (LD-5): `long double` NEGATE + CONVERSIONS ═
+//
+// The fourth and last consumer of the LD memory-resident model. Until this
+// landed, SEVEN operations over a `long double` still hit
+// `requireEncodedFloatWidth` and failed loud naming this anchor — ✔MEASURED at
+// b1f31420 through the shipped CLI, one program per operation compiled ALONE:
+// `-ld` (FNeg, both axes), `(unsigned)ld` (FPToUI, both), `(double)ld` and
+// `(float)ld` (FPTrunc, both), `(long double)someFloat` (FPExt, both),
+// `(long double)someDouble` (FPExt, x87 only) and `(long long)ld` (FPToSI,
+// arm64; the x87 side said `MIR opcode '<deferred>'` instead).
+//
+// TWO REALIZATIONS, decided by TypeKind alone:
+//
+//   * F80 (the x87-80 axis: elf/macho x86_64) — an INLINE memory sequence. The
+//     x87 register stack has ONE working format and no register-to-register
+//     conversion instruction, so EVERY format change happens in the memory
+//     operand of a load or a store: `fld_m32`/`fld_m64` widen on the way in,
+//     `fstp_m32`/`fstp_m64` round on the way out, `fisttp_m64` truncates to an
+//     integer, and `fchs` is the whole of negate.
+//   * F128 (the ieee128 axis: elf arm64) — a CALL to a config'd libgcc helper,
+//     gated on the PRESENCE of its `wideFloatSoftcalls[]` row.
+//
+// ★ WHY "IT LOWERS" IS NOT ENOUGH, per operation. None of these faults when it
+// is wrong; each returns a plausible number:
+//   (a) THE ONE-BYTE PAIRS. `fld m32`/`fld m64` differ only in the first
+//       opcode byte (D9 vs DD), and so do `fstp m32`/`fstp m64`. A swapped
+//       pair reads four bytes of an eight-byte slot — a wildly wrong value,
+//       but not a fault. The width arms below pin each mnemonic against the
+//       NARROW TYPE, so a swap reds.
+//   (b) THE UNSIGNED RANGE. `(unsigned)ld` must store through the SIGNED
+//       64-bit truncating form: the 32-bit form writes the 0x80000000
+//       integer-indefinite for every value at or above 2^31.
+//   (c) THE AAPCS64 RESULT WIDTH. `__fixunstfsi` returns a C `unsigned int`
+//       and AAPCS64 §6.8.2 leaves the bits ABOVE a return type's width
+//       UNSPECIFIED, so the capture must be the W-form move.
+namespace {
+
+// `void f(WIDE* pa, WIDE* pr) { *pr = -(*pa); }` — memory-resident throughout.
+[[nodiscard]] ::dss::Mir
+buildWideFloatNeg(::dss::TypeInterner& interner, ::dss::TypeKind kind) {
+    auto const wide  = interner.primitive(kind);
+    auto const ptrT  = interner.pointer(wide);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    std::array<::dss::TypeId, 2> params{ptrT, ptrT};
+    auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const pa = mb.addArg(0, ptrT);
+    ::dss::MirInstId const pr = mb.addArg(1, ptrT);
+    std::array<::dss::MirInstId, 1> laOps{pa};
+    ::dss::MirInstId const va = mb.addInst(::dss::MirOpcode::Load, laOps, wide);
+    std::array<::dss::MirInstId, 1> negOps{va};
+    ::dss::MirInstId const r =
+        mb.addInst(::dss::MirOpcode::FNeg, negOps, wide);
+    std::array<::dss::MirInstId, 2> stOps{r, pr};
+    (void)mb.addInst(::dss::MirOpcode::Store, stOps, ::dss::InvalidType);
+    mb.addReturn(std::nullopt);
+    return std::move(mb).finish();
+}
+
+// `void f(SRC* pa, DST* pr) { *pr = (DST)(*pa); }` — one conversion, alone, so
+// no other refusal can mask the one under test.
+[[nodiscard]] ::dss::Mir
+buildWideFloatConvert(::dss::TypeInterner& interner, ::dss::TypeKind srcK,
+                      ::dss::TypeKind dstK, ::dss::MirOpcode op) {
+    auto const srcT  = interner.primitive(srcK);
+    auto const dstT  = interner.primitive(dstK);
+    auto const pSrcT = interner.pointer(srcT);
+    auto const pDstT = interner.pointer(dstT);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    std::array<::dss::TypeId, 2> params{pSrcT, pDstT};
+    auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const pa = mb.addArg(0, pSrcT);
+    ::dss::MirInstId const pr = mb.addArg(1, pDstT);
+    std::array<::dss::MirInstId, 1> laOps{pa};
+    ::dss::MirInstId const v = mb.addInst(::dss::MirOpcode::Load, laOps, srcT);
+    std::array<::dss::MirInstId, 1> cvOps{v};
+    ::dss::MirInstId const r = mb.addInst(op, cvOps, dstT);
+    std::array<::dss::MirInstId, 2> stOps{r, pr};
+    (void)mb.addInst(::dss::MirOpcode::Store, stOps, ::dss::InvalidType);
+    mb.addReturn(std::nullopt);
+    return std::move(mb).finish();
+}
+
+// Index of the first instruction in `bb` whose mnemonic is `mnemonic`, or
+// nullopt. (Mnemonic rather than opcode id so the arms below read as the
+// assembly they pin.)
+[[nodiscard]] std::optional<std::uint32_t>
+firstIndexOfMnemonic(::dss::Lir const& lir, ::dss::LirBlockId bb,
+                     ::dss::TargetSchema const& sch,
+                     std::string_view mnemonic) {
+    auto const op = sch.opcodeByMnemonic(mnemonic);
+    if (!op.has_value()) return std::nullopt;
+    return firstIndexOfOpcode(lir, bb, *op);
+}
+
+}  // namespace
+
+TEST(MirToLir, F80NegLowersToTheX87SignFlipSequence) {
+    // The POSITIVE half: `-someLongDouble` no longer walls, and it lowers to
+    // exactly `fld_m80 [src]; fchs; fstp_m80 [home]` — THREE instructions,
+    // CONTIGUOUS, one push and one pop, so the x87 stack starts and ends empty
+    // (the LD-1 model's invariant; leak the pop and eight negates overflow it).
+    //
+    // The source-address arm is what distinguishes a real negate from a
+    // lowering that flipped the WRONG operand: the `fld_m80` must read the
+    // `arg` opcode's own result register.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatNeg(interner, ::dss::TypeKind::F80);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "an F80 negate must lower on the x87-80 axis: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        << "the FNeg width wall must NOT fire for F80 any more (red-on-disable: "
+           "remove the lowerFNeg F80 arm and it does)";
+
+    Lir const& lir = result.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    auto const fchsIdx = firstIndexOfMnemonic(lir, bb, **target, "fchs");
+    ASSERT_TRUE(fchsIdx.has_value()) << "the negate must use FCHS";
+    ASSERT_GE(*fchsIdx, 1u);
+    ASSERT_LT(*fchsIdx + 1, lir.blockInstCount(bb));
+    auto const fldOp  = (*target)->opcodeByMnemonic("fld_m80");
+    auto const fstpOp = (*target)->opcodeByMnemonic("fstp_m80");
+    ASSERT_TRUE(fldOp.has_value() && fstpOp.has_value());
+    auto const push = lir.blockInstAt(bb, *fchsIdx - 1);
+    auto const pop  = lir.blockInstAt(bb, *fchsIdx + 1);
+    EXPECT_EQ(lir.instOpcode(push), *fldOp)
+        << "FCHS must be immediately preceded by the m80 push";
+    EXPECT_EQ(lir.instOpcode(pop), *fstpOp)
+        << "and immediately followed by the m80 pop-store — leaking that pop "
+           "overflows the eight-deep x87 stack on the eighth negate";
+    // Exactly one of each per sequence: a second push (or a missing pop)
+    // unbalances the stack, which no type or arity check downstream can see.
+    // Two of each here — the negate's own pair, and the Store's home copy.
+    EXPECT_EQ(countLirMnemonic(lir, **target, "fld_m80"), 2)
+        << "one push for the negate, one for the Store's home copy";
+    EXPECT_EQ(countLirMnemonic(lir, **target, "fstp_m80"), 2)
+        << "and one pop for each — the sequence must be balanced";
+    auto const argOp = (*target)->opcodeByMnemonic("arg");
+    ASSERT_TRUE(argOp.has_value());
+    LirReg const pa = argRegister(lir, bb, *argOp, 0);
+    ASSERT_TRUE(pa.valid());
+    auto const pushOps = lir.instOperands(push);
+    ASSERT_FALSE(pushOps.empty());
+    EXPECT_EQ(pushOps[0].reg, pa)
+        << "the negate must read the SOURCE operand's own home address";
+}
+
+TEST(MirToLir, F80FloatConversionsPickTheWidthExactX87MemoryForm) {
+    // ⚠ THE ONE-BYTE ARM. `fld m32`/`fld m64` differ only in the first opcode
+    // byte (D9 vs DD), and so do `fstp m32`/`fstp m64`. Every one of the four
+    // conversions below is therefore pinned to the mnemonic its NARROW type
+    // names — a swapped pair still lowers, still assembles and still runs, and
+    // reads or writes four bytes of an eight-byte datum.
+    //
+    // The SSE half is pinned too: the narrow value moves through a frame slot
+    // with the class's own load/store at the narrow type's width, so a
+    // width-blind (64-bit) movsd of a `float` slot would red here as well.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    struct Case {
+        ::dss::TypeKind  src;
+        ::dss::TypeKind  dst;
+        ::dss::MirOpcode op;
+        char const*      x87;     // the x87 memory form this must use
+        char const*      x87Not;  // and the sibling it must NOT
+        unsigned         sseWidth;
+    };
+    std::array<Case, 4> const cases{{
+        {::dss::TypeKind::F80, ::dss::TypeKind::F64,
+         ::dss::MirOpcode::FPTrunc, "fstp_m64", "fstp_m32", 64},
+        {::dss::TypeKind::F80, ::dss::TypeKind::F32,
+         ::dss::MirOpcode::FPTrunc, "fstp_m32", "fstp_m64", 32},
+        {::dss::TypeKind::F64, ::dss::TypeKind::F80,
+         ::dss::MirOpcode::FPExt,   "fld_m64",  "fld_m32",  64},
+        {::dss::TypeKind::F32, ::dss::TypeKind::F80,
+         ::dss::MirOpcode::FPExt,   "fld_m32",  "fld_m64",  32},
+    }};
+    for (auto const& c : cases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildWideFloatConvert(interner, c.src, c.dst, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << c.x87 << ": the conversion must lower: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+            << c.x87 << ": no width wall may fire";
+        EXPECT_EQ(countLirMnemonic(result.lir, **target, c.x87), 1)
+            << c.x87 << ": exactly one width-exact x87 memory op";
+        EXPECT_EQ(countLirMnemonic(result.lir, **target, c.x87Not), 0)
+            << c.x87Not << " must NOT appear — it differs from " << c.x87
+            << " in ONE opcode byte and would touch the wrong number of bytes "
+               "with no diagnostic anywhere";
+        // The SSE side of the slot round-trip, at the narrow type's width.
+        auto const sseWidths = widthsOfMnemonic(
+            result.lir, **target,
+            c.op == ::dss::MirOpcode::FPTrunc ? "movsd_load" : "movsd_store");
+        ASSERT_FALSE(sseWidths.empty())
+            << c.x87 << ": the narrow value must move through a frame slot";
+        EXPECT_EQ(sseWidths[0], c.sseWidth)
+            << c.x87 << ": the SSE access must be the narrow type's own width "
+                        "(movss vs movsd), not the width default";
+    }
+}
+
+TEST(MirToLir, F80ToIntegerPicksTheTruncatingStoreWidthTheResultNeeds) {
+    // The three integer conversions, and the arm that matters is the UNSIGNED
+    // one: `(unsigned)ld` must go through the SIGNED 64-BIT truncating store
+    // and narrow afterwards. `unsigned int`'s range reaches 2^32-1, which the
+    // 32-bit form cannot hold — it would write the 0x80000000 integer-
+    // indefinite for every value at or above 2^31 and read it back with no
+    // fault at all.
+    //
+    // ⚠ AND THE NARROWING IS DONE IN A REGISTER, NOT BY READING HALF THE SLOT.
+    // A four-byte reload of the eight-byte slot would take the LOW half only on
+    // a little-endian target — a byte-order fact this shared lowerer must not
+    // hold. The `trunc` verb (x86 `mov r32,r32`) says the same thing about
+    // registers, where there is no byte order to be wrong about, so the
+    // unsigned arm pins that a `trunc` is present and the signed ones pin that
+    // it is not.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    struct Case {
+        ::dss::TypeKind  dst;
+        ::dss::MirOpcode op;
+        char const*      form;      // the fisttp width this must use
+        char const*      formNot;
+        int              truncs;    // register narrowings expected
+        unsigned         reload;    // the GPR reload's own width
+    };
+    std::array<Case, 3> const cases{{
+        {::dss::TypeKind::I32, ::dss::MirOpcode::FPToSI,
+         "fisttp_m32", "fisttp_m64", 0, 32},
+        {::dss::TypeKind::I64, ::dss::MirOpcode::FPToSI,
+         "fisttp_m64", "fisttp_m32", 0, 64},
+        {::dss::TypeKind::U32, ::dss::MirOpcode::FPToUI,
+         "fisttp_m64", "fisttp_m32", 1, 64},
+    }};
+    for (auto const& c : cases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m =
+            buildWideFloatConvert(interner, ::dss::TypeKind::F80, c.dst, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << c.form << ": the conversion must lower: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_EQ(countLirMnemonic(result.lir, **target, c.form), 1)
+            << c.form << ": exactly one truncating store, at this width";
+        EXPECT_EQ(countLirMnemonic(result.lir, **target, c.formNot), 0)
+            << c.formNot << " must NOT appear: the 32-bit form cannot hold an "
+                            "`unsigned int` at or above 2^31, and the 64-bit "
+                            "form mis-sizes a signed 32-bit result";
+        EXPECT_EQ(countLirMnemonic(result.lir, **target, "trunc"), c.truncs)
+            << c.form << ": the unsigned arm narrows in a REGISTER (and only "
+                         "it does) — reading half the slot would be a byte-"
+                         "order assumption";
+        auto const loads = widthsOfMnemonic(result.lir, **target, "load");
+        ASSERT_FALSE(loads.empty()) << c.form << ": the slot must be reloaded";
+        EXPECT_EQ(loads[0], c.reload)
+            << c.form << ": the reload must match the STORE's width, not the "
+                         "result type's";
+    }
+}
+
+TEST(MirToLir, F80UnsignedSixtyFourBitConversionIsTheBiasedSelectInOrder) {
+    // ⚠ THIS TEST REPLACES A WALL PIN. Until P66 the arm here asserted that
+    // `(unsigned long double)ld` must NOT lower, on the row's premise that
+    // above 2^63 "both references COMPARE against 2^63, subtract, convert and
+    // flip the result's top bit — a BRANCHING sequence this straight-line
+    // lowerer cannot emit". ✔THE PREMISE WAS MEASURED FALSE: clang 18.1.3's own
+    // x87 expansion is branchless (`fucomi`/`setbe`/`fldz`/`fcmovbe`, only gcc
+    // branches), and DSS's realization is branchless WITHOUT even a conditional
+    // move — the same truncate-both-and-select algebra x86_64.target.json
+    // already declares for `fp_to_ui` from an F64 source.
+    //
+    // ★ THE ORDER IS THE PIN, not the multiset. Every instruction below is one
+    // this file already sees elsewhere; what makes them a CORRECT conversion is
+    // the sequence:
+    //
+    //   fld_m80 [src] ; fisttp_m64        the DIRECT truncation → lo
+    //   fld_m80 [src] ; fld_m64 [bias]    the source, then the BIAS on top
+    //   fsubp                             st1 − st0 = src − bias
+    //   fisttp_m64                        the BIASED truncation → hi
+    //
+    // Transpose the two pushes and `fsubp` computes bias − src, which is a pure
+    // reordering no arity, type or width check can see and which quietly
+    // negates the whole upper range. Swap the two truncations and the mask is
+    // taken from the biased result instead of the direct one, which makes every
+    // value BELOW 2^63 wrong instead. Both are pinned absolutely, by position.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatConvert(interner, ::dss::TypeKind::F80,
+                                         ::dss::TypeKind::U64,
+                                         ::dss::MirOpcode::FPToUI);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "a 64-bit unsigned conversion from long double must lower: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        << "no width wall may fire any more";
+
+    // The x87 sub-sequence, in order and complete.
+    ::dss::LirBlockId const bb =
+        result.lir.funcBlockAt(result.lir.funcAt(0), 0);
+    std::vector<std::string> x87;
+    for (std::uint32_t i = 0; i < result.lir.blockInstCount(bb); ++i) {
+        auto const* info =
+            (*target)->opcodeInfo(result.lir.instOpcode(
+                result.lir.blockInstAt(bb, i)));
+        if (info == nullptr) continue;
+        if (info->mnemonic.rfind("f", 0) == 0)
+            x87.emplace_back(info->mnemonic);
+    }
+    std::vector<std::string> const want{"fld_m80", "fisttp_m64", "fld_m80",
+                                        "fld_m64", "fsubp", "fisttp_m64"};
+    EXPECT_EQ(x87, want)
+        << "the x87 sequence must be exactly the direct truncation, then the "
+           "source, then the bias, then the subtraction, then the biased "
+           "truncation — in that order";
+
+    // The narrower truncating store must NOT appear: `unsigned long long`
+    // reaches 2^64-1 and a 32-bit store answers with the indefinite.
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "fisttp_m32"), 0)
+        << "a 32-bit truncating store cannot hold this range";
+    // The integer tail: the range mask and the two-op recombine.
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "shr_a"), 1)
+        << "the range mask is an ARITHMETIC shift of the direct result — a "
+           "logical one yields 0 or 1 and selects nothing";
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "and"), 1);
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "or"), 1);
+    // Every 64-bit step really is 64 bits. A width-32 shift or reload would
+    // discard the whole upper half of the answer with no diagnostic.
+    for (char const* mn : {"shr_a", "and", "or"}) {
+        auto const w = widthsOfMnemonic(result.lir, **target, mn);
+        ASSERT_EQ(w.size(), 1u) << mn;
+        EXPECT_EQ(w[0], 64u) << mn << " must operate on the whole 64-bit value";
+    }
+}
+
+TEST(MirToLir, F80UnsignedSixtyFourBitMaskComesFromTheDirectTruncation) {
+    // The DIRECTION arm, separate from the order arm above because the order
+    // arm reads only mnemonics and a mis-WIRED select emits the same six.
+    //
+    // `mask = lo >>a 63` is all-ones EXACTLY when the DIRECT truncation went to
+    // the integer indefinite. Take the mask from the BIASED result instead and
+    // the sequence still lowers, still has one shift and one and/or, and
+    // returns a plausible number that is wrong for every input below 2^63.
+    // So the shift's source register is pinned to be the FIRST slot reload —
+    // the one emitted before any `fld_m64` — absolutely, not relatively.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatConvert(interner, ::dss::TypeKind::F80,
+                                         ::dss::TypeKind::U64,
+                                         ::dss::MirOpcode::FPToUI);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    auto const loadOp  = (*target)->opcodeByMnemonic("load");
+    auto const biasOp  = (*target)->opcodeByMnemonic("fld_m64");
+    auto const shiftOp = (*target)->opcodeByMnemonic("shr_a");
+    ASSERT_TRUE(loadOp.has_value() && biasOp.has_value()
+                && shiftOp.has_value());
+    ::dss::LirBlockId const bb =
+        result.lir.funcBlockAt(result.lir.funcAt(0), 0);
+    std::optional<::dss::LirReg> firstReload;   // the DIRECT truncation's value
+    bool                         seenBias = false;
+    std::optional<::dss::LirReg> shiftSrc;
+    for (std::uint32_t i = 0; i < result.lir.blockInstCount(bb); ++i) {
+        auto const inst = result.lir.blockInstAt(bb, i);
+        auto const op   = result.lir.instOpcode(inst);
+        if (op == *biasOp) { seenBias = true; continue; }
+        if (op == *loadOp && !seenBias && !firstReload.has_value())
+            firstReload = result.lir.instResult(inst);
+        if (op == *shiftOp) {
+            auto const ops = result.lir.instOperands(inst);
+            ASSERT_FALSE(ops.empty());
+            shiftSrc = ops[0].reg;
+        }
+    }
+    ASSERT_TRUE(firstReload.has_value())
+        << "the direct truncation must reload its slot before the bias is "
+           "pushed";
+    ASSERT_TRUE(shiftSrc.has_value()) << "the range mask must exist";
+    EXPECT_EQ(*shiftSrc, *firstReload)
+        << "the range mask must be an arithmetic shift of the DIRECT "
+           "truncation — taking it from the biased one inverts which range the "
+           "select trusts, silently";
+}
+
+TEST(MirToLir, F80UnsignedSixtyFourBitBiasIsTwoToTheSixtyThirdInBinary64) {
+    // THE CONSTANT IS THE SILENT HALF. A wrong bias leaves the sequence
+    // lowering, the order pin green and the direction pin green, and produces a
+    // wrong answer ONLY above 2^63 — the range the previous witness could not
+    // even compile. It must be exactly 0x43E0000000000000, the binary64
+    // encoding of 2^63, which is also the constant the target's own F64
+    // `fp_to_ui` lowering sequence names for the identical purpose.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatConvert(interner, ::dss::TypeKind::F80,
+                                         ::dss::TypeKind::U64,
+                                         ::dss::MirOpcode::FPToUI);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    bool found = false;
+    for (std::size_t i = 0; i < result.lir.literalPool().size(); ++i) {
+        auto const& v =
+            result.lir.literalPool().at(static_cast<std::uint32_t>(i));
+        if (auto const* u = std::get_if<std::uint64_t>(&v.value))
+            if (*u == 0x43E0000000000000ULL) found = true;
+    }
+    EXPECT_TRUE(found)
+        << "the biased arm must subtract exactly 2^63; any other constant is "
+           "wrong only above 2^63 and silent below it";
+}
+
+TEST(MirToLir, F128ConversionsCallTheHelperBothReferencesEmit) {
+    // The binary128 half. Each conversion names its OWN libgcc helper — the
+    // mapping both aarch64 references were measured emitting, probed
+    // separately — so a table that collapsed two conversions onto one helper
+    // would still lower and still return a plausible number.
+    //
+    // The extern set is pinned EXACTLY (size 1) for the same reason: DSS
+    // EAGER-IMPORTS every symbol a descriptor lists, so an extra name is not
+    // merely untidy, it can break the LOAD of every binary built from this CU.
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    struct Case {
+        ::dss::TypeKind  src;
+        ::dss::TypeKind  dst;
+        ::dss::MirOpcode op;
+        char const*      helper;
+    };
+    std::array<Case, 7> const cases{{
+        {::dss::TypeKind::F128, ::dss::TypeKind::U32,
+         ::dss::MirOpcode::FPToUI,  "__fixunstfsi"},
+        // P66: the LAST conversion of the surface. ⚠ IT IS NOT `__fixtfdi`
+        // AND THE DIFFERENCE IS SILENT — ✔MEASURED under qemu-aarch64 that
+        // `__fixtfdi` SATURATES to 0x7FFFFFFFFFFFFFFF for every value at or
+        // above 2^63, so routing the unsigned 64-bit cast through it would
+        // lower, run, and answer the whole upper half of the range with one
+        // wrong constant. Both aarch64 references call `__fixunstfdi`.
+        {::dss::TypeKind::F128, ::dss::TypeKind::U64,
+         ::dss::MirOpcode::FPToUI,  "__fixunstfdi"},
+        {::dss::TypeKind::F128, ::dss::TypeKind::I64,
+         ::dss::MirOpcode::FPToSI,  "__fixtfdi"},
+        {::dss::TypeKind::F128, ::dss::TypeKind::F64,
+         ::dss::MirOpcode::FPTrunc, "__trunctfdf2"},
+        {::dss::TypeKind::F128, ::dss::TypeKind::F32,
+         ::dss::MirOpcode::FPTrunc, "__trunctfsf2"},
+        {::dss::TypeKind::F32,  ::dss::TypeKind::F128,
+         ::dss::MirOpcode::FPExt,   "__extendsftf2"},
+        {::dss::TypeKind::F64,  ::dss::TypeKind::F128,
+         ::dss::MirOpcode::FPExt,   "__extenddftf2"},
+    }};
+    for (auto const& c : cases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildWideFloatConvert(interner, c.src, c.dst, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = lowerF128Arm64(m, **target, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << c.helper << ": the conversion must lower to the softcall: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+            << c.helper << ": no width wall may fire";
+        ASSERT_EQ(result.externImports.size(), 1u)
+            << c.helper << ": exactly one helper may be imported";
+        EXPECT_EQ(result.externImports[0].mangledName, c.helper)
+            << c.helper << ": wrong helper for this conversion";
+    }
+    // And NEGATE, which is not a conversion but takes the same path.
+    {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildWideFloatNeg(interner, ::dss::TypeKind::F128);
+        ::dss::DiagnosticReporter rep;
+        auto result = lowerF128Arm64(m, **target, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << "__negtf2: an F128 negate must lower: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        ASSERT_EQ(result.externImports.size(), 1u);
+        EXPECT_EQ(result.externImports[0].mangledName, "__negtf2")
+            << "the negate helper — deliberately a CALL where both references "
+               "flip the sign bit inline, because the inline form would put a "
+               "binary128's sign-bit BYTE OFFSET in the shared lowerer";
+    }
+}
+
+TEST(MirToLir, F128UnsignedSixtyFourBitConversionFailsLoudWithoutItsConfigRow) {
+    // RED-ON-DISABLE, the agnosticism condition, in the REMOVE direction
+    // ([[feedback-a-fixture-must-synthesize-the-negative]]): the SAME cast
+    // against x86_64, which declares F128 (it is a legal TypeKind there) but
+    // carries NO wideFloatSoftcalls table at all, must FAIL LOUD rather than
+    // reach for a helper nobody declared. This is what proves the arm is gated
+    // on the PRESENCE of the `to_u64` row and not on the target's identity.
+    //
+    // ⓘ It also proves the two axes really are separate realizations: x86_64 is
+    // the target whose F80 arm ships the biased select, and an F128 value there
+    // still walls.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    EXPECT_EQ((*target)->wideFloatSoftcall(::dss::WideFloatOp::ToUInt64),
+              nullptr)
+        << "x86_64 must declare NO binary128 to_u64 row (the premise)";
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatConvert(interner, ::dss::TypeKind::F128,
+                                         ::dss::TypeKind::U64,
+                                         ::dss::MirOpcode::FPToUI);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    EXPECT_FALSE(result.ok)
+        << "an F128 unsigned 64-bit conversion on a target with no row must "
+           "fail loud, not silently take some other helper";
+    EXPECT_TRUE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        << "the fall-through must hit the encoded-width gate";
+    EXPECT_TRUE(sawAnchor(rep, "MIR FPToUI (source)"))
+        << "at the FPToUI-source reach of it";
+}
+
+// ══ LD-7 (D-TARGET-ENCODING-WIDTH-GUARD): INTEGER → `long double` ═══════════
+//
+// The last direction of the surface. ★ WHY "IT LOWERS" IS AGAIN NOT ENOUGH,
+// per arm — none of these faults when it is wrong:
+//   (a) `fild` IS NOT `fld`, and at 32 bits they are DB /0 against D9 /0 — the
+//       same /digit, the same operand shape, one opcode byte apart. An `fld`
+//       where an `fild` was meant reinterprets the integer's BITS as a float
+//       (the integer 5 becomes 7e-45).
+//   (b) THE UNSIGNED-32 RANGE. `fild m32` reads its four bytes SIGNED, so every
+//       `unsigned` at or above 2^31 arrives NEGATIVE unless the value is
+//       zero-extended into a 64-bit slot first — the exact mirror of the
+//       `(unsigned)ld` narrowing arm one direction over.
+//   (c) THE UNSIGNED-64 SPLIT. `2·(u>>1) + (u&1)` is exact in a 64-bit
+//       significand and has four independent ways to be silently wrong: the
+//       shift's KIND, the shift's SOURCE, the mask's VALUE, and WHICH slot each
+//       of the three pushes reads.
+//   (d) THE ieee128 HELPER SET. `__float{,un}{s,d}itf` differ on BOTH axes of
+//       the source; collapsing any pair still calls a defined symbol.
+
+TEST(MirToLir, IntToF80UsesTheWidthExactIntegerLoad) {
+    // The three straight arms plus the split's own mnemonic budget. Each case
+    // pins the `fild` form it MUST use, the one it must NOT (they differ in one
+    // opcode byte), that no `fld_m32`/`fld_m64` appears at all (hazard (a) —
+    // those read the same bytes as a FLOAT), the spill store's own WIDTH, and
+    // whether a register widening happened.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    struct Case {
+        ::dss::TypeKind  src;
+        ::dss::MirOpcode op;
+        char const*      form;      // the fild width this must use
+        char const*      formNot;
+        int              fildCount; // the split pushes three times
+        int              zexts;     // register widenings expected
+        unsigned         storeBits; // the spill store's own width
+        char const*      why;
+    };
+    std::array<Case, 4> const cases{{
+        {::dss::TypeKind::I32, ::dss::MirOpcode::SIToFP,
+         "fild_m32", "fild_m64", 1, 0, 32,
+         "a signed 32-bit source IS what `fild m32` reads; widening it would "
+         "cost an instruction and change nothing"},
+        {::dss::TypeKind::U32, ::dss::MirOpcode::UIToFP,
+         "fild_m64", "fild_m32", 1, 1, 64,
+         "an `unsigned` at or above 2^31 read through the SIGNED 32-bit form "
+         "arrives negative — it must be zero-extended in a REGISTER and read "
+         "back out of a 64-bit slot"},
+        {::dss::TypeKind::I64, ::dss::MirOpcode::SIToFP,
+         "fild_m64", "fild_m32", 1, 0, 64,
+         "a 64-bit signed source is one instruction"},
+        {::dss::TypeKind::U64, ::dss::MirOpcode::UIToFP,
+         "fild_m64", "fild_m32", 3, 0, 64,
+         "the exact split pushes the halved slot twice and the low bit once; "
+         "it needs no widening because both halves are already below 2^63"},
+    }};
+    for (auto const& c : cases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildWideFloatConvert(interner, c.src,
+                                             ::dss::TypeKind::F80, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << c.form << ": the conversion must lower: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+            << c.form << ": no width wall may fire any more";
+        EXPECT_EQ(countLirMnemonic(result.lir, **target, c.form), c.fildCount)
+            << c.form << ": " << c.why;
+        EXPECT_EQ(countLirMnemonic(result.lir, **target, c.formNot), 0)
+            << c.formNot << " must NOT appear — it differs from " << c.form
+            << " in ONE opcode byte and reads the wrong number of bytes with "
+               "no diagnostic anywhere";
+        for (char const* fld : {"fld_m32", "fld_m64"}) {
+            EXPECT_EQ(countLirMnemonic(result.lir, **target, fld), 0)
+                << fld << " must NOT appear: it reads the SAME bytes as a "
+                          "FLOAT, so an integer 5 would become 7e-45 — and it "
+                          "is one opcode byte from the fild form";
+        }
+        EXPECT_EQ(countLirMnemonic(result.lir, **target, "zext"), c.zexts)
+            << c.form << ": " << c.why;
+        // TWO pop-stores and ONE push of an m80: the conversion writes the
+        // value's own 16-byte home, and this fixture's `*pr = …` then copies
+        // that home to the caller's (`fld_m80 [home]; fstp_m80 [pr]`, the
+        // shared wide-float home copy). Counting them pins BOTH that the
+        // conversion pops its stack exactly once and that nothing else pushed.
+        EXPECT_EQ(countLirMnemonic(result.lir, **target, "fstp_m80"), 2)
+            << c.form << ": one pop-store into the value's home, one for the "
+                         "store to the destination";
+        EXPECT_EQ(countLirMnemonic(result.lir, **target, "fld_m80"), 1)
+            << c.form << ": the ONLY m80 push is the home copy's — the "
+                         "conversion itself pushes an INTEGER, never a float";
+        // The spill store's width. A width-64 store into the 4-byte slot writes
+        // past it; a width-32 store into the 8-byte slot leaves the upper half
+        // of the quadword `fild_m64` reads UNINITIALIZED. Both are silent.
+        auto const stores = widthsOfMnemonic(result.lir, **target, "store");
+        ASSERT_FALSE(stores.empty())
+            << c.form << ": the integer must reach memory — the x87 stack has "
+                         "no path from the integer register file";
+        EXPECT_EQ(stores[0], c.storeBits)
+            << c.form << ": the spill store must be the SLOT's width";
+    }
+}
+
+TEST(MirToLir, UInt64ToF80IsTheExactSplitInOrder) {
+    // ★ THE ORDER IS THE PIN, not the multiset. `2·half + odd` and
+    // `2·odd + half` emit exactly the same six instructions.
+    //
+    //   fild_m64 [half] ; fild_m64 [half] ; faddp    the doubling
+    //   fild_m64 [odd]  ; faddp                      the low bit back
+    //   fstp_m80 [home]
+    //
+    // and the x87 stack must start and end EMPTY (three pushes, two combining
+    // pops, one pop-store), which is the LD-1 model's invariant — leak one and
+    // the eight-deep stack overflows inside three conversions.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatConvert(interner, ::dss::TypeKind::U64,
+                                         ::dss::TypeKind::F80,
+                                         ::dss::MirOpcode::UIToFP);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok)
+        << "a 64-bit unsigned source must convert to long double: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    ::dss::LirBlockId const bb =
+        result.lir.funcBlockAt(result.lir.funcAt(0), 0);
+    std::vector<std::string> x87;
+    for (std::uint32_t i = 0; i < result.lir.blockInstCount(bb); ++i) {
+        auto const* info =
+            (*target)->opcodeInfo(result.lir.instOpcode(
+                result.lir.blockInstAt(bb, i)));
+        if (info == nullptr) continue;
+        if (info->mnemonic.rfind("f", 0) != 0) continue;
+        x87.emplace_back(info->mnemonic);
+        // The conversion ENDS at its own pop-store; what follows in this
+        // fixture is the shared wide-float home copy for `*pr = …`, which is
+        // `lowerStore`'s shape and not this sequence's. Counted below rather
+        // than spelled here, so a change over there reds the count and not the
+        // ORDER pin.
+        if (info->mnemonic == "fstp_m80") break;
+    }
+    std::vector<std::string> const want{"fild_m64", "fild_m64", "faddp",
+                                        "fild_m64", "faddp", "fstp_m80"};
+    EXPECT_EQ(x87, want)
+        << "the x87 sequence must be exactly: push the halved value twice, add "
+           "them, push the low bit, add it, store — in that order";
+    // Nothing else pushed, and the two combining pops plus the store-pop leave
+    // the eight-deep stack exactly as they found it.
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "fild_m64"), 3);
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "faddp"), 2);
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "fsubp"), 0)
+        << "the split ADDS: a subtraction here is the biased-select algebra of "
+           "the OPPOSITE direction, which does not travel";
+}
+
+TEST(MirToLir, UInt64ToF80DoublesTheHalvedSlotAndNotTheLowBitOne) {
+    // The WIRING arm, separate from the order arm above because the order arm
+    // reads only mnemonics: `2·odd + half` emits the identical six. So the
+    // first two pushes are pinned to read the SAME address and the third a
+    // DIFFERENT one, and the third's address is pinned to be the slot the
+    // low-bit `and` was stored through — absolutely, not relatively.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatConvert(interner, ::dss::TypeKind::U64,
+                                         ::dss::TypeKind::F80,
+                                         ::dss::MirOpcode::UIToFP);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
+    auto const fildOp  = (*target)->opcodeByMnemonic("fild_m64");
+    auto const storeOp = (*target)->opcodeByMnemonic("store");
+    auto const andOp   = (*target)->opcodeByMnemonic("and");
+    ASSERT_TRUE(fildOp.has_value() && storeOp.has_value() && andOp.has_value());
+    ::dss::LirBlockId const bb =
+        result.lir.funcBlockAt(result.lir.funcAt(0), 0);
+    std::vector<::dss::LirReg> fildAddrs;
+    std::optional<::dss::LirReg> andResult;
+    std::optional<::dss::LirReg> lowBitSlot;   // the slot `and`'s value went to
+    for (std::uint32_t i = 0; i < result.lir.blockInstCount(bb); ++i) {
+        auto const inst = result.lir.blockInstAt(bb, i);
+        auto const op   = result.lir.instOpcode(inst);
+        if (op == *andOp) { andResult = result.lir.instResult(inst); continue; }
+        if (op == *storeOp && andResult.has_value()) {
+            auto const ops = result.lir.instOperands(inst);
+            ASSERT_GE(ops.size(), 2u);
+            if (ops[0].reg == *andResult) lowBitSlot = ops[1].reg;
+            continue;
+        }
+        if (op == *fildOp) {
+            auto const ops = result.lir.instOperands(inst);
+            ASSERT_FALSE(ops.empty());
+            fildAddrs.push_back(ops[0].reg);
+        }
+    }
+    ASSERT_EQ(fildAddrs.size(), 3u) << "three integer pushes";
+    ASSERT_TRUE(lowBitSlot.has_value())
+        << "the masked low bit must be spilled to a slot of its own";
+    EXPECT_EQ(fildAddrs[0], fildAddrs[1])
+        << "the doubling must add the HALVED value to ITSELF — two different "
+           "slots there would be adding two different numbers";
+    EXPECT_NE(fildAddrs[0], fildAddrs[2])
+        << "the third push must NOT re-read the halved slot: that computes "
+           "3·half and is wrong for every odd input";
+    EXPECT_EQ(fildAddrs[2], *lowBitSlot)
+        << "the third push must read the LOW-BIT slot — reading the halved one "
+           "there, or transposing the two, emits the identical six mnemonics "
+           "and returns a plausible wrong number";
+}
+
+TEST(MirToLir, UInt64ToF80HalvesLogicallyAndMasksExactlyTheLowBit) {
+    // THE TWO SILENT SCALARS. Both leave the order pin green, the wiring pin
+    // green, and the sequence lowering:
+    //   * an ARITHMETIC shift replicates the sign bit, so every value at or
+    //     above 2^63 is read by `fild m64` as NEGATIVE — ✔MEASURED on real
+    //     silicon that the arithmetic variant answers −9223372036854763463
+    //     where 9223372036854788153 was wanted;
+    //   * a mask other than 1 keeps bits the doubling already carried, which is
+    //     wrong only for inputs whose low bits are set.
+    // Both are pinned by VALUE, and the shift's source is pinned to be the
+    // conversion's own source (the same register the mask reads).
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir m = buildWideFloatConvert(interner, ::dss::TypeKind::U64,
+                                         ::dss::TypeKind::F80,
+                                         ::dss::MirOpcode::UIToFP);
+    ::dss::DiagnosticReporter rep;
+    auto result = ::dss::lowerToLir(m, **target, interner, rep);
+    ASSERT_TRUE(result.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "shr_l"), 1)
+        << "exactly one halving";
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "shr_a"), 0)
+        << "the halving must be LOGICAL: an arithmetic shift replicates the "
+           "sign bit and every value at or above 2^63 is then read negative";
+    EXPECT_EQ(countLirMnemonic(result.lir, **target, "and"), 1);
+    for (char const* mn : {"shr_l", "and"}) {
+        auto const w = widthsOfMnemonic(result.lir, **target, mn);
+        ASSERT_EQ(w.size(), 1u) << mn;
+        EXPECT_EQ(w[0], 64u)
+            << mn << " must operate on the whole 64-bit value — a width-32 arm "
+                     "discards the half of the range this split exists for";
+    }
+    auto const shiftOp = (*target)->opcodeByMnemonic("shr_l");
+    auto const andOp   = (*target)->opcodeByMnemonic("and");
+    auto const movOp   = (*target)->opcodeByMnemonic("mov");
+    ASSERT_TRUE(shiftOp.has_value() && andOp.has_value() && movOp.has_value());
+    ::dss::LirBlockId const bb =
+        result.lir.funcBlockAt(result.lir.funcAt(0), 0);
+    std::optional<::dss::LirReg> shiftSrc, shiftAmt, andSrc, maskReg;
+    std::optional<std::int32_t>  maskImm;
+    std::vector<std::pair<::dss::LirReg, std::int32_t>> movImms;
+    for (std::uint32_t i = 0; i < result.lir.blockInstCount(bb); ++i) {
+        auto const inst = result.lir.blockInstAt(bb, i);
+        auto const op   = result.lir.instOpcode(inst);
+        auto const ops  = result.lir.instOperands(inst);
+        if (op == *movOp && ops.size() == 1
+            && ops[0].kind == ::dss::LirOperandKind::ImmInt) {
+            movImms.emplace_back(result.lir.instResult(inst), ops[0].immInt32);
+        } else if (op == *shiftOp) {
+            ASSERT_GE(ops.size(), 2u);
+            shiftSrc = ops[0].reg;
+            if (ops[1].kind == ::dss::LirOperandKind::ImmInt)
+                EXPECT_EQ(ops[1].immInt32, 1)
+                    << "the halving must be by ONE: any other amount makes "
+                       "2·(u>>k) + (u&1) something other than u";
+            else
+                shiftAmt = ops[1].reg;
+        } else if (op == *andOp) {
+            ASSERT_GE(ops.size(), 2u);
+            andSrc  = ops[0].reg;
+            maskReg = ops[1].reg;
+        }
+    }
+    ASSERT_TRUE(shiftSrc.has_value() && andSrc.has_value()
+                && maskReg.has_value());
+    EXPECT_EQ(*shiftSrc, *andSrc)
+        << "the halving and the low-bit mask must read the SAME value — the "
+           "conversion's own source";
+    for (auto const& [r, v] : movImms) {
+        if (r == *maskReg) maskImm = v;
+        if (shiftAmt.has_value() && r == *shiftAmt)
+            EXPECT_EQ(v, 1) << "the halving must be by ONE";
+    }
+    ASSERT_TRUE(maskImm.has_value())
+        << "the low-bit mask must be a materialized immediate";
+    EXPECT_EQ(*maskImm, 1)
+        << "the mask must be exactly 1: a wider one keeps bits the doubling "
+           "already carried and is wrong only for inputs with low bits set";
+}
+
+TEST(MirToLir, IntToF128CallsTheHelperBothReferencesEmit) {
+    // The binary128 half. FOUR helpers, not two: `__float{,un}{s,d}itf` differ
+    // on BOTH axes of the source — its width AND its signedness — and any
+    // collapse still lowers, still calls a DEFINED libgcc symbol and still
+    // returns a plausible number. A 64-bit source through `__floatsitf` reads
+    // half the value; an unsigned one through `__floatditf` reads every value
+    // at or above 2^63 as negative. ✔MEASURED 2026-09-09 that both aarch64
+    // references emit exactly one `bl` per spelling, all four distinct
+    // (aarch64-linux-gnu-gcc 13.3.0 at −O0/−O2, clang 18.1.3
+    // --target=aarch64-linux-gnu at −O2, probed separately), and that all four
+    // are DEFINED text exports of /usr/aarch64-linux-gnu/lib/libgcc_s.so.1
+    // (`nm -D`) — which matters because DSS EAGER-IMPORTS every symbol it names.
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    struct Case {
+        ::dss::TypeKind  src;
+        ::dss::MirOpcode op;
+        char const*      helper;
+        unsigned         argBits;   // the marshal move's own width
+    };
+    std::array<Case, 4> const cases{{
+        {::dss::TypeKind::I32, ::dss::MirOpcode::SIToFP, "__floatsitf",   32},
+        {::dss::TypeKind::U32, ::dss::MirOpcode::UIToFP, "__floatunsitf", 32},
+        {::dss::TypeKind::I64, ::dss::MirOpcode::SIToFP, "__floatditf",   64},
+        {::dss::TypeKind::U64, ::dss::MirOpcode::UIToFP, "__floatunditf", 64},
+    }};
+    for (auto const& c : cases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildWideFloatConvert(interner, c.src,
+                                             ::dss::TypeKind::F128, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = lowerF128Arm64(m, **target, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << c.helper << ": the conversion must lower to the softcall: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+            << c.helper << ": no width wall may fire";
+        ASSERT_EQ(result.externImports.size(), 1u)
+            << c.helper << ": exactly one helper may be imported";
+        EXPECT_EQ(result.externImports[0].mangledName, c.helper)
+            << c.helper << ": wrong helper for this conversion";
+        // ⚠ AND THE ARGUMENT IS MARSHALLED AT ITS OWN WIDTH. AAPCS64 §5.4.2
+        // leaves the bits above a 32-bit argument unspecified, so a `w`-form
+        // move is what makes `__floatsitf`'s `int` argument mean what it says;
+        // the 64-bit form would hand the helper whatever the register held.
+        // Read as the LAST `mov` before the call — the marshal, positionally,
+        // rather than "the first mov in the module", which is a different
+        // question that happens to have the same answer today.
+        auto const callOp = (*target)->opcodeByMnemonic("call");
+        ASSERT_TRUE(callOp.has_value());
+        ::dss::LirBlockId const bb =
+            result.lir.funcBlockAt(result.lir.funcAt(0), 0);
+        auto const movOp = (*target)->opcodeByMnemonic("mov");
+        ASSERT_TRUE(movOp.has_value());
+        std::optional<unsigned> marshalBits;
+        for (std::uint32_t i = 0; i < result.lir.blockInstCount(bb); ++i) {
+            auto const inst = result.lir.blockInstAt(bb, i);
+            auto const op   = result.lir.instOpcode(inst);
+            if (op == *movOp)
+                marshalBits = ::dss::lirInstWidthBits(result.lir.instFlags(inst));
+            if (op == *callOp) break;
+        }
+        ASSERT_TRUE(marshalBits.has_value())
+            << c.helper << ": the source must be moved into the ABI arg "
+                           "register before the call";
+        EXPECT_EQ(*marshalBits, c.argBits)
+            << c.helper << ": the marshal must be the SOURCE type's own width";
+    }
+}
+
+TEST(MirToLir, IntToF128FailsLoudWithoutItsConfigRow) {
+    // RED-ON-DISABLE, the agnosticism condition, in the REMOVE direction: the
+    // SAME conversions against x86_64, which declares F128 as a legal TypeKind
+    // but carries NO `wideFloatSoftcalls` table at all, must FAIL LOUD rather
+    // than reach for a helper nobody declared. This is what proves the arm is
+    // gated on the PRESENCE of the row and never on the target's identity —
+    // and x86_64 is precisely the target whose F80 arm DOES ship an inline
+    // realization, so the two axes really are separate.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    for (auto const wop : {::dss::WideFloatOp::FromInt32,
+                           ::dss::WideFloatOp::FromUInt32,
+                           ::dss::WideFloatOp::FromInt64,
+                           ::dss::WideFloatOp::FromUInt64}) {
+        EXPECT_EQ((*target)->wideFloatSoftcall(wop), nullptr)
+            << "x86_64 must declare NO binary128 integer-source row (premise)";
+    }
+    struct Case { ::dss::TypeKind src; ::dss::MirOpcode op; char const* name; };
+    std::array<Case, 4> const cases{{
+        {::dss::TypeKind::I32, ::dss::MirOpcode::SIToFP, "SIToFP"},
+        {::dss::TypeKind::U32, ::dss::MirOpcode::UIToFP, "UIToFP"},
+        {::dss::TypeKind::I64, ::dss::MirOpcode::SIToFP, "SIToFP"},
+        {::dss::TypeKind::U64, ::dss::MirOpcode::UIToFP, "UIToFP"},
+    }};
+    for (auto const& c : cases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildWideFloatConvert(interner, c.src,
+                                             ::dss::TypeKind::F128, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        EXPECT_FALSE(result.ok)
+            << c.name << ": an integer→F128 conversion on a target with no row "
+                         "must fail loud, not silently take some other helper";
+        EXPECT_TRUE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+            << c.name << ": the fall-through must hit the encoded-width gate";
+    }
+}
+
+TEST(MirToLir, LongDoubleToSubNativeIntegerUsesTheRegisterWidthNotTheMemoryOne) {
+    // ⚠⚠ THE ROW'S OWN DELEGATION FOR THIS WAS REFUTED BY MEASUREMENT, and the
+    // arm is written to make that refutation permanent. Until P66 the three
+    // long-double→integer dispatches asked `memAccessWidthFlags` for the
+    // RESULT's width — a question about how many BYTES an object of that type
+    // OCCUPIES — so an `unsigned char` result answered 8 and a `short` 16,
+    // widths no arm has, and `(short)ld` / `(unsigned char)ld` walled on BOTH
+    // long-double axes. The row's Closing-work cell delegated that to
+    // [[D-CSUBSET-SUBNATIVE-ALU-FORMS]]; ✔MEASURED at de1e83ef that
+    // `(unsigned char)someDouble`, `(short)someDouble`, `(signed char)someDouble`,
+    // `(unsigned char)someFloat` and `(unsigned char)someInt` ALL compiled rc 0
+    // on the same target, so the sub-native integer FORM was never missing.
+    //
+    // A conversion RESULT is a register-resident VALUE, and this pipeline holds
+    // a sub-native integer PROMOTED in a 32-bit register with its low bits
+    // significant (C 6.3.1.1); the narrowing realizes at the width-exact STORE.
+    // So every sub-native result must take the SAME realization the 32-bit one
+    // takes, and this arm pins that by EQUALITY of shape rather than by
+    // restating the shape — a future change to the 32-bit arm drags the
+    // sub-native ones with it or reds here.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    struct Case { ::dss::TypeKind dst; ::dss::MirOpcode op; char const* why; };
+    std::array<Case, 3> const signedCases{{
+        {::dss::TypeKind::I32, ::dss::MirOpcode::FPToSI, "the 32-bit REFERENCE"},
+        {::dss::TypeKind::I16, ::dss::MirOpcode::FPToSI, "`(short)ld`"},
+        {::dss::TypeKind::I8,  ::dss::MirOpcode::FPToSI, "`(signed char)ld`"},
+    }};
+    std::vector<std::pair<int, int>> signedShapes;   // (fisttp_m32, fisttp_m64)
+    for (auto const& c : signedCases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m =
+            buildWideFloatConvert(interner, ::dss::TypeKind::F80, c.dst, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << c.why << " must lower: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+            << c.why << ": no width wall may fire";
+        signedShapes.emplace_back(
+            countLirMnemonic(result.lir, **target, "fisttp_m32"),
+            countLirMnemonic(result.lir, **target, "fisttp_m64"));
+        auto const loads = widthsOfMnemonic(result.lir, **target, "load");
+        ASSERT_FALSE(loads.empty()) << c.why;
+        EXPECT_EQ(loads[0], 32u)
+            << c.why << ": the reload must be the REGISTER width (32), never "
+                        "the type's byte size — an 8- or 16-bit reload of the "
+                        "slot is a byte-order assumption AND a width no form has";
+    }
+    EXPECT_EQ(signedShapes[1], signedShapes[0])
+        << "`(short)ld` must take the SAME x87 realization as `(int)ld`";
+    EXPECT_EQ(signedShapes[2], signedShapes[0])
+        << "`(signed char)ld` must take the SAME x87 realization as `(int)ld`";
+
+    std::array<Case, 3> const unsignedCases{{
+        {::dss::TypeKind::U32, ::dss::MirOpcode::FPToUI, "the 32-bit REFERENCE"},
+        {::dss::TypeKind::U16, ::dss::MirOpcode::FPToUI, "`(unsigned short)ld`"},
+        {::dss::TypeKind::U8,  ::dss::MirOpcode::FPToUI, "`(unsigned char)ld`"},
+    }};
+    std::vector<std::tuple<int, int, int>> unsignedShapes;
+    for (auto const& c : unsignedCases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m =
+            buildWideFloatConvert(interner, ::dss::TypeKind::F80, c.dst, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << c.why << " must lower: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        EXPECT_FALSE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+            << c.why << ": no width wall may fire";
+        unsignedShapes.emplace_back(
+            countLirMnemonic(result.lir, **target, "fisttp_m64"),
+            countLirMnemonic(result.lir, **target, "fisttp_m32"),
+            countLirMnemonic(result.lir, **target, "trunc"));
+    }
+    EXPECT_EQ(unsignedShapes[1], unsignedShapes[0])
+        << "`(unsigned short)ld` must take the SAME realization as "
+           "`(unsigned)ld` — the SIGNED 64-bit truncating store plus a REGISTER "
+           "narrowing, because an unsigned range does not fit the signed store "
+           "one size down";
+    EXPECT_EQ(unsignedShapes[2], unsignedShapes[0])
+        << "`(unsigned char)ld` likewise";
+
+    // And the ieee128 axis reaches the SAME helper the 32-bit result does — a
+    // sub-native result is not a narrower libgcc call, it is the 32-bit call
+    // with the value left promoted in its register.
+    auto a64 = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(a64.has_value());
+    struct F128Case { ::dss::TypeKind dst; ::dss::MirOpcode op; char const* h; };
+    std::array<F128Case, 6> const f128{{
+        {::dss::TypeKind::I32, ::dss::MirOpcode::FPToSI, "__fixtfsi"},
+        {::dss::TypeKind::I16, ::dss::MirOpcode::FPToSI, "__fixtfsi"},
+        {::dss::TypeKind::I8,  ::dss::MirOpcode::FPToSI, "__fixtfsi"},
+        {::dss::TypeKind::U32, ::dss::MirOpcode::FPToUI, "__fixunstfsi"},
+        {::dss::TypeKind::U16, ::dss::MirOpcode::FPToUI, "__fixunstfsi"},
+        {::dss::TypeKind::U8,  ::dss::MirOpcode::FPToUI, "__fixunstfsi"},
+    }};
+    for (auto const& c : f128) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildWideFloatConvert(interner, ::dss::TypeKind::F128,
+                                             c.dst, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = lowerF128Arm64(m, **a64, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << c.h << ": a sub-native F128 conversion must lower: "
+            << (rep.all().empty() ? "" : rep.all()[0].actual);
+        ASSERT_EQ(result.externImports.size(), 1u);
+        EXPECT_EQ(result.externImports[0].mangledName, c.h)
+            << "a sub-native result takes the 32-bit helper, not a narrower one";
+    }
+}
+
+TEST(MirToLir, SubNativeIntegerSourceToLongDoubleFailsLoudOnBothAxes) {
+    // The SOURCE-WIDTH wall, and it is ONE sentence for both axes because what
+    // is missing is the sub-native integer FORM and not a float width: the x87
+    // integer loads shipped here start at 32 bits and libgcc's binary128
+    // helpers take no narrower source either. Inventing a promotion in the
+    // lowerer would be this tier answering a front-end question.
+    // ⓘ It also proves the F80/F128 dispatch does not swallow a width it
+    // cannot serve — a silent 4-byte read of a 2-byte value.
+    struct Axis { char const* target; ::dss::TypeKind dst; };
+    std::array<Axis, 2> const axes{{
+        {"x86_64", ::dss::TypeKind::F80},
+        {"arm64",  ::dss::TypeKind::F128},
+    }};
+    struct Case { ::dss::TypeKind src; ::dss::MirOpcode op; };
+    std::array<Case, 4> const cases{{
+        {::dss::TypeKind::I16, ::dss::MirOpcode::SIToFP},
+        {::dss::TypeKind::U16, ::dss::MirOpcode::UIToFP},
+        {::dss::TypeKind::I8,  ::dss::MirOpcode::SIToFP},
+        {::dss::TypeKind::U8,  ::dss::MirOpcode::UIToFP},
+    }};
+    for (auto const& a : axes) {
+        auto target = ::dss::TargetSchema::loadShipped(a.target);
+        ASSERT_TRUE(target.has_value());
+        for (auto const& c : cases) {
+            ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+            ::dss::Mir m = buildWideFloatConvert(interner, c.src, a.dst, c.op);
+            ::dss::DiagnosticReporter rep;
+            auto result = ::dss::lowerToLir(m, **target, interner, rep);
+            EXPECT_FALSE(result.ok)
+                << a.target << ": a sub-native integer source must fail loud";
+            EXPECT_TRUE(sawAnchor(rep, "D-CSUBSET-SUBNATIVE-ALU-FORMS"))
+                << a.target << ": the refusal must name the anchor that OWNS "
+                               "the missing sub-native form";
+            EXPECT_TRUE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+                << a.target << ": and the gate a reader greps for";
+        }
+    }
+}
+
+TEST(MirToLir, F128NarrowResultsAreCapturedAtTheirOwnWidth) {
+    // ⚠⚠ THE AAPCS64 RESULT-WIDTH ARM, and it is the one silent-miscompile
+    // guard on this axis. AAPCS64 §6.8.2 leaves the bits ABOVE a return type's
+    // own width UNSPECIFIED, so a width-blind (64-bit) capture of a helper that
+    // returns `unsigned int` propagates whatever the helper left in bits 63:32,
+    // and a D-form capture of one that returns `float` names a register view
+    // the ABI does not use. Both references emit the narrow form.
+    //
+    // ✔The width-32 election is what makes `mov w_d, w0` (ORR Wd,WZR,Wm,
+    // sf=0 = 0x2A0003E0) rather than `mov x_d, x0` (0xAA0003E0) — the W-form
+    // ZEROES bits 63:32, which is exactly the guarantee the ABI withholds.
+    auto target = ::dss::TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    struct Case {
+        ::dss::TypeKind  dst;
+        ::dss::MirOpcode op;
+        char const*      mnemonic;   // the capture MOVE's mnemonic
+        unsigned         width;
+        char const*      why;
+    };
+    std::array<Case, 4> const cases{{
+        {::dss::TypeKind::U32, ::dss::MirOpcode::FPToUI, "mov",  32,
+         "__fixunstfsi returns `unsigned int`"},
+        {::dss::TypeKind::I64, ::dss::MirOpcode::FPToSI, "mov",  64,
+         "__fixtfdi returns `long long` — the full register IS the value"},
+        {::dss::TypeKind::F32, ::dss::MirOpcode::FPTrunc, "fmov", 32,
+         "__trunctfsf2 returns `float` (s0), not a double"},
+        {::dss::TypeKind::F64, ::dss::MirOpcode::FPTrunc, "fmov", 64,
+         "__trunctfdf2 returns `double` (d0)"},
+    }};
+    for (auto const& c : cases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildWideFloatConvert(interner, ::dss::TypeKind::F128,
+                                             c.dst, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = lowerF128Arm64(m, **target, interner, rep);
+        ASSERT_TRUE(result.ok)
+            << c.why << ": " << (rep.all().empty() ? "" : rep.all()[0].actual);
+        auto const widths =
+            widthsOfMnemonic(result.lir, **target, c.mnemonic);
+        ASSERT_FALSE(widths.empty())
+            << c.why << ": the physical result register must be captured";
+        EXPECT_EQ(widths[0], c.width)
+            << c.why
+            << ": the capture must state the RESULT TYPE's width — AAPCS64 "
+               "leaves everything above it unspecified";
+    }
+    // The MARSHAL direction of the same rule: `__extendsftf2` takes a `float`
+    // in s0, so the move INTO the physical arg register is the S-form.
+    {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildWideFloatConvert(interner, ::dss::TypeKind::F32,
+                                             ::dss::TypeKind::F128,
+                                             ::dss::MirOpcode::FPExt);
+        ::dss::DiagnosticReporter rep;
+        auto result = lowerF128Arm64(m, **target, interner, rep);
+        ASSERT_TRUE(result.ok);
+        auto const widths = widthsOfMnemonic(result.lir, **target, "fmov");
+        ASSERT_FALSE(widths.empty());
+        EXPECT_EQ(widths[0], 32u)
+            << "a `float` argument marshals through s0, not d0 — the width was "
+               "blind here while `from_f64` was the only consumer";
+    }
+}
+
+TEST(MirToLir, F128ConversionsFailLoudWithoutConfigRow) {
+    // RED-ON-DISABLE, the agnosticism condition: the SAME conversions against
+    // x86_64 — which declares F128 but has NO wideFloatSoftcalls rows — must
+    // FAIL LOUD through the width gate rather than lower. This is what proves
+    // every arm added this cycle is gated on the PRESENCE of a config row and
+    // not on the target's identity; delete any `if (wideFloatSoftcall(...))`
+    // guard and the matching case here reds.
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    for (auto const op : {::dss::WideFloatOp::Neg, ::dss::WideFloatOp::ToUInt32,
+                          ::dss::WideFloatOp::ToInt64,
+                          ::dss::WideFloatOp::ToFloat64,
+                          ::dss::WideFloatOp::ToFloat32,
+                          ::dss::WideFloatOp::FromFloat32}) {
+        EXPECT_EQ((*target)->wideFloatSoftcall(op), nullptr)
+            << "x86_64 must declare NO F128 softcall row (the premise)";
+    }
+    struct Case {
+        ::dss::TypeKind  src;
+        ::dss::TypeKind  dst;
+        ::dss::MirOpcode op;
+        char const*      arm;
+    };
+    std::array<Case, 5> const cases{{
+        {::dss::TypeKind::F128, ::dss::TypeKind::U32,
+         ::dss::MirOpcode::FPToUI,  "MIR FPToUI (source)"},
+        {::dss::TypeKind::F128, ::dss::TypeKind::I64,
+         ::dss::MirOpcode::FPToSI,  "MIR FPToSI (source)"},
+        {::dss::TypeKind::F128, ::dss::TypeKind::F64,
+         ::dss::MirOpcode::FPTrunc, "MIR FPTrunc (source)"},
+        {::dss::TypeKind::F128, ::dss::TypeKind::F32,
+         ::dss::MirOpcode::FPTrunc, "MIR FPTrunc (source)"},
+        {::dss::TypeKind::F32,  ::dss::TypeKind::F128,
+         ::dss::MirOpcode::FPExt,   "MIR FPExt (result)"},
+    }};
+    for (auto const& c : cases) {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildWideFloatConvert(interner, c.src, c.dst, c.op);
+        ::dss::DiagnosticReporter rep;
+        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        EXPECT_FALSE(result.ok)
+            << c.arm << ": an F128 conversion on a target with no row must "
+                        "fail loud, not silently take the softcall path";
+        EXPECT_TRUE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+            << c.arm << ": the fall-through must hit the encoded-width gate";
+        EXPECT_TRUE(sawAnchor(rep, c.arm))
+            << c.arm << ": and it must be THIS reach of it that fires";
+    }
+    // Negate too — a different verb, the same gating condition.
+    {
+        ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+        ::dss::Mir m = buildWideFloatNeg(interner, ::dss::TypeKind::F128);
+        ::dss::DiagnosticReporter rep;
+        auto result = ::dss::lowerToLir(m, **target, interner, rep);
+        EXPECT_FALSE(result.ok)
+            << "an F128 negate with no `neg` row must fail loud";
+        EXPECT_TRUE(sawAnchor(rep, "MIR FNeg"))
+            << "at the FNeg reach of the width gate";
+    }
+}
+
+// ── P64 REMEDIATION: the sub-word compare-exchange's TWO COMPARES ────────────
+//
+// ⛔ THE DEFECT THIS PINS WAS A SILENT WRONG ANSWER ON A PATH THAT USED TO
+// REFUSE LOUDLY. A compare-exchange decides equality twice — once in
+// `mir_to_lir`'s `lowerAtomicCas` (does the exchange COMMIT?) and once at the
+// MIR tier's `ICmpEq` (what `_Bool` does the caller see, and is the failure
+// write-back taken?). The first cut of the sub-word CAS surface widened the LIR
+// compare to the CONTAINER width and justified it by enumerating the producers
+// of a sub-word value ("always zero-extended"). ✔MEASURED FALSE: a materialized
+// NEGATIVE constant arrives SIGN-extended, so on arm64 `--config=release` an
+// `_Atomic signed char` CAS against `-1` compared `0x000000FF` against
+// `0xFFFFFFFF`, skipped the `stlxr`, and then reported SUCCESS from the other
+// compare. Before that widening the same site was refused
+// `A_NoMatchingEncodingVariant` (arm64 declares `cmp` at 32/64 only).
+//
+// The fix narrows BOTH compare operands to the object's own width with the
+// target's declared `zext` verb, so the container-width compare IS the
+// object-width compare and cannot disagree with the MIR tier. THIS TEST COUNTS
+// THAT NARROWING, in the REMOVE direction: delete it and the count is 0; narrow
+// only one operand and it is 1. The CONTROL is the same shape at a NATIVE width,
+// where no narrowing is needed and the count must stay 0 — without it, "the
+// count is 2" is equally consistent with "this target zexts everything".
+namespace {
+
+// Every block of every function, unlike `countLirMnemonic` (block 0 of fn 0) —
+// `lowerAtomicCas`'s LL/SC realization is a THREE-BLOCK loop, so a block-0-only
+// count would report 0 for the very instructions this test is about.
+[[nodiscard]] int countLirMnemonicWholeFn(::dss::Lir const& lir,
+                                          ::dss::TargetSchema const& sch,
+                                          std::string_view mnemonic,
+                                          std::optional<std::uint8_t> flags) {
+    auto const want = sch.opcodeByMnemonic(mnemonic);
+    if (!want.has_value()) return 0;
+    int n = 0;
+    for (std::uint32_t f = 0;
+         f < static_cast<std::uint32_t>(lir.moduleFuncCount()); ++f) {
+        auto const fn = lir.funcAt(f);
+        for (std::uint32_t b = 0; b < lir.funcBlockCount(fn); ++b) {
+            auto const bb = lir.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+                auto const inst = lir.blockInstAt(bb, i);
+                if (lir.instOpcode(inst) != *want) continue;
+                if (flags.has_value() && lir.instFlags(inst) != *flags) continue;
+                ++n;
+            }
+        }
+    }
+    return n;
+}
+
+// THROWS rather than `std::abort()`s (`no_abort_in_tests_guard`): an abort takes
+// the whole binary down and every sibling test with it, while GoogleTest reports
+// a throw as a failure of the ONE test that could not get its target.
+[[nodiscard]] std::shared_ptr<::dss::TargetSchema> arm64Target() {
+    auto t = ::dss::TargetSchema::loadShipped("arm64");
+    if (!t) throw std::runtime_error("TargetSchema::loadShipped(\"arm64\") failed");
+    return *t;
+}
+
+}  // namespace
+
+TEST(MirToLirAtomicCas, SubWordCompareNarrowsBOTHOperandsToTheObjectWidth) {
+    struct Arm {
+        char const* objectType;
+        char const* expectedType;
+        std::uint8_t widthFlag;
+        int          wantZext;
+        char const*  why;
+    };
+    // `-1` / `-300` are MATERIALIZED NEGATIVE constants — the producer the
+    // refuted enumeration omitted, and the only one that makes a raw
+    // container-width compare answer differently from an object-width one.
+    std::array<Arm, 3> const arms{{
+        {"signed char", "signed char", ::dss::kLirInstFlagWidth8,  2,
+         "a byte object must narrow observed AND comparand (uxtb, uxtb)"},
+        {"short",       "short",       ::dss::kLirInstFlagWidth16, 2,
+         "a half object must narrow observed AND comparand (uxth, uxth)"},
+        {"int",         "int",         ::dss::kLirInstFlagWidth8,  0,
+         "CONTROL: a native-width object needs NO narrowing — the register IS "
+         "the object, so a non-zero count here would mean the pin is measuring "
+         "something other than the sub-word rule"},
+    }};
+    for (auto const& a : arms) {
+        std::string const src = std::string(
+            "_Atomic ") + a.objectType + " g;\n"
+            "int main(void) {\n"
+            "    " + a.expectedType + " e = -1;\n"
+            "    return atomic_compare_exchange_strong_explicit(&g, &e, -2, 5, 5);\n"
+            "}\n";
+        auto target = arm64Target();
+        auto lowered = lowerCToLir(src, target);
+        ASSERT_TRUE(lowered.lir.ok)
+            << a.objectType << ": the sub-word CAS must LOWER — a refusal here "
+                               "means this pin stopped measuring its subject";
+        // The realization under test really is the LL/SC one (a target that
+        // lowered a single-op `lock cmpxchg` would need no narrowing at all).
+        EXPECT_GE(countLirMnemonicWholeFn(lowered.lir.lir, *target, "ldaxr",
+                                          std::nullopt), 1)
+            << a.objectType << ": expected the arm64 LL/SC CAS realization";
+        EXPECT_EQ(countLirMnemonicWholeFn(lowered.lir.lir, *target, "zext",
+                                          a.widthFlag),
+                  a.wantZext)
+            << a.objectType << ": " << a.why;
+    }
+}
+
+// ── P64: C §7.17.1p6's `M` — an atomic POINTER RMW is SCALED, not byte-wise ──
+//
+// §7.17.1p6: "For atomic integer types, M is C. For atomic pointer types, M is
+// ptrdiff_t." §7.17.7.5 replaces the object with "the result of the computation
+// applied to the value pointed to by object and the given operand", and `add`'s
+// computation is the `+` OPERATOR — pointer + ptrdiff_t is C 6.5.6 arithmetic,
+// SCALED by the element size. ⚠ The references SPLIT on this (✔MEASURED: gcc
+// 13.3.0 unscaled, clang 18.1.3 scaled, both accepting) and the standard TEXT
+// settles it against gcc, which is why this is implemented rather than paused
+// on as a fork.
+//
+// The pin is the SCALE, not the acceptance: an element size of 4 must produce a
+// `mul`/shift-by-2 step or a folded stride, and the two arms below use element
+// sizes 4 and 8 so a byte-wise implementation cannot satisfy both. The
+// CONTROL is a `char` element, whose stride is 1 and where scaled and unscaled
+// coincide — it must still compile, proving the arm is not simply refusing.
+TEST(MirToLirAtomicRmw, AtomicPointerFetchAddScalesByTheElementSize) {
+    struct Arm { char const* elem; int stride; };
+    std::array<Arm, 3> const arms{{{"int", 4}, {"long long", 8}, {"char", 1}}};
+    for (auto const& a : arms) {
+        std::string const src = std::string(
+            a.elem) + " buf[8];\n"
+            + a.elem + " * _Atomic gp;\n"
+            "int main(void) {\n"
+            "    atomic_store_explicit(&gp, &buf[0], 5);\n"
+            "    atomic_fetch_add_explicit(&gp, 2, 5);\n"
+            "    return 0;\n"
+            "}\n";
+        auto target = arm64Target();
+        auto lowered = lowerCToLir(src, target);
+        EXPECT_TRUE(lowered.lir.ok)
+            << a.elem << "*: an atomic pointer fetch_add must lower — C "
+                         "§7.17.1p6 gives it a ptrdiff_t operand, and refusing "
+                         "it is below the (gcc ∪ clang) ∪ ISO C union";
+        EXPECT_FALSE(lowered.model.hasErrors())
+            << a.elem << "*: and the SEMANTIC tier must accept it too — the "
+                         "operand parameter is `ptrdiff_t`, not the pointee";
+    }
 }

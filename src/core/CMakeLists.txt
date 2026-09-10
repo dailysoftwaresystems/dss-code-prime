@@ -79,6 +79,25 @@ target_compile_definitions(core PRIVATE DSS_SHARED_BUILD DSS_BUILDING_DLL)
 # BUILD rather than silently predefining a wrong identity.
 target_compile_definitions(core PRIVATE DSS_PROJECT_VERSION="${DSS_VERSION}")
 
+# D-PROGRAM-CONFIG-DIR-WALK-RESOLVES-A-FOREIGN-TREE — the SOURCE TREE this
+# compiler was built from, so `config_path_walk.cpp` can say when the cwd walk
+# answered out of a DIFFERENT one. The row's own closing work names this
+# mechanism ("the build already knows its own source dir; bake the equivalent
+# for the CLI") and `DSS_TEST_REPO_ROOT` (tests/CMakeLists.txt) is the same
+# forward for the test tier.
+#
+# ⚠ IT IS NOT A CONFIG-LOOKUP ARM AND MUST NEVER BECOME ONE. The resolver's
+# precedence is unchanged; this value is only ever COMPARED against the root a
+# real lookup returned. Adding it as a fourth candidate would give an installed
+# compiler a path on the BUILDER's machine to probe, which is the version-skew
+# class the precedence's ordering exists to prevent.
+#
+# Undefined => the build is BROKEN, loudly, at the `#error` in the resolver —
+# the same wireup discipline `DSS_PROJECT_VERSION` above and
+# `DSS_INSTALL_CONFIG_RELDIR` (cmake/DssInstall.cmake) use. A default would ship
+# a compiler that silently never reports a foreign tree, which is the defect.
+target_compile_definitions(core PRIVATE DSS_BUILD_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
 # nlohmann/json is PRIVATE: the include path is a build requirement of `core`'s
 # own sources, NOT a usage requirement re-exported to consumers.
 #

@@ -90,89 +90,198 @@ template <typename Source>
 // `ifElse(id) -> optional`, `switchArms(id) -> span`,
 // `switchBody(id) -> HirNodeId`, `caseArmIsDefault(id) -> bool`. Both
 // `Hir` and `HirBuilder` satisfy this interface.
+//
+// ★★★ AN EXPLICIT HEAP WORK STACK, NOT HOST RECURSION
+// (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED,
+// the operator's ruling of 2026-09-02). This predicate used to call itself once
+// per nested statement level — a block's every child, an if's two arms, a
+// `__try`'s body and handler, a switch's body — with no cap of any kind, and it
+// runs INSIDE `lowerToHir`, so its depth followed the user's statement nesting.
+// ✔MEASURED 2026-09-04 (P60, lane `rc`), gdb-attributed on the MSVC 19.51 Debug
+// build: `HirToMirSehDeepNesting.NestedTryExceptRegionsCostHeapNotCallFrames`
+// (2000 nested `__try`) died of stack overflow in a 2-frame `pathTerminates`
+// self-cycle at 368 bytes per frame — 736 bytes per region level, ~1380 levels
+// of a 1 MB stack — while under mingw-w64 g++ the same site was the wall at
+// ~8000 levels. Each level is now a `Frame` on a `std::vector`; a leaf answers
+// in place and a compound statement pushes one frame and resumes when its
+// child's verdict arrives. The verdicts are combined exactly as the recursion
+// combined them (the `&&` short-circuits are the `phase` transitions), so the
+// answer is byte-identical; only the host-stack cost changed.
 template <typename Source>
-[[nodiscard]] bool pathTerminates(Source const& src, HirNodeId id) {
-    switch (src.kind(id)) {
-        case HirKind::ReturnStmt:
-        case HirKind::Unreachable:
-            return true;
-        // FC5: `goto` unconditionally transfers control — it never falls through,
-        // so a block ending in `goto` definitely leaves. This is sound for the
-        // fall-off-end invariant: if the goto's target leads nowhere, THAT block's
-        // own structural check catches the fall-off (matches the break/continue +
-        // infinite-loop-as-Unreachable treatment). A LabelStmt is transparent —
-        // it terminates iff its labeled statement does (so `end: return 0;` as a
-        // function's last statement still terminates).
-        case HirKind::GotoStmt:
-        // D-CSUBSET-COMPUTED-GOTO: `goto *expr;` also transfers unconditionally —
-        // it never falls through (same fall-off-end soundness as plain goto).
-        case HirKind::IndirectGotoStmt:
-            return true;
-        case HirKind::Block:
-        case HirKind::LabelStmt: {
-            // D-CSUBSET-BLOCK-TERMINATION-LAST-REACHABLE: a block terminates
-            // (control never falls off its end) iff the position AFTER its last
-            // statement is unreachable. Walk forward tracking reachability: a
-            // (recursively) terminating statement makes subsequent positions
-            // unreachable (so trailing DEAD code after a real terminator — a
-            // `MACRO(...);` null statement, `return x; stmt();` — no longer
-            // spuriously reads as fall-through; this is exactly the dead code
-            // `checkBlockTermination` warns unreachable, so the two rules now
-            // agree). SOUNDNESS: a `goto` can re-enter a label ANYWHERE,
-            // including nested inside a dead-tail child, so a child whose SUBTREE
-            // CONTAINS a label re-establishes reachability (else `{ if(x) goto L;
-            // return 0; if(x){ L: ; } }` — a genuine fall-through — would be
-            // wrongly accepted). The `!reachable` gate confines the subtree scan
-            // to the rare dead region.
-            auto kids = src.children(id);
-            if (kids.empty()) return false;
-            bool reachable = true;
-            for (HirNodeId child : kids) {
-                if (!reachable && subtreeContainsLabel(src, child)) reachable = true;
-                if (reachable && pathTerminates(src, child)) reachable = false;
+[[nodiscard]] bool pathTerminates(Source const& src, HirNodeId root) {
+    // One compound statement whose verdict is still being assembled.
+    struct Frame {
+        enum class Kind : std::uint8_t { Block, If, Seh, Switch };
+        HirNodeId   id;
+        Kind        kind;
+        // Block: index of the child whose verdict is awaited / next to visit,
+        // and the running reachability. If / Seh: `phase` 0 = the first arm's
+        // verdict is awaited, 1 = the second's.
+        std::size_t next      = 0;
+        bool        reachable = true;
+        bool        awaiting  = false;   // Block: a child's verdict is in flight
+        std::uint8_t phase    = 0;
+    };
+    std::vector<Frame> stack;
+    // The statement to evaluate next, when one is pending; `verdict` carries the
+    // result of the LAST completed evaluation up to the frame that asked for it.
+    HirNodeId pending     = root;
+    bool      havePending = true;
+    bool      verdict     = false;
+    for (;;) {
+        if (havePending) {
+            HirNodeId const id = pending;
+            havePending = false;
+            switch (src.kind(id)) {
+                case HirKind::ReturnStmt:
+                case HirKind::Unreachable:
+                    verdict = true;
+                    break;
+                // FC5: `goto` unconditionally transfers control — it never falls
+                // through, so a block ending in `goto` definitely leaves. This is
+                // sound for the fall-off-end invariant: if the goto's target leads
+                // nowhere, THAT block's own structural check catches the fall-off
+                // (matches the break/continue + infinite-loop-as-Unreachable
+                // treatment). A LabelStmt is transparent — it terminates iff its
+                // labeled statement does (so `end: return 0;` as a function's last
+                // statement still terminates).
+                case HirKind::GotoStmt:
+                // D-CSUBSET-COMPUTED-GOTO: `goto *expr;` also transfers
+                // unconditionally — it never falls through (same fall-off-end
+                // soundness as plain goto).
+                case HirKind::IndirectGotoStmt:
+                    verdict = true;
+                    break;
+                case HirKind::Block:
+                case HirKind::LabelStmt: {
+                    // D-CSUBSET-BLOCK-TERMINATION-LAST-REACHABLE: a block
+                    // terminates (control never falls off its end) iff the position
+                    // AFTER its last statement is unreachable. The frame walks the
+                    // children forward tracking reachability (see the Block arm of
+                    // the frame step below).
+                    if (src.children(id).empty()) { verdict = false; break; }
+                    stack.push_back(Frame{.id = id, .kind = Frame::Kind::Block});
+                    continue;   // the frame step visits the first child
+                }
+                case HirKind::IfStmt: {
+                    auto elseB = src.ifElse(id);
+                    if (!elseB.has_value()) { verdict = false; break; }
+                    stack.push_back(Frame{.id = id, .kind = Frame::Kind::If});
+                    pending     = src.ifThen(id);
+                    havePending = true;
+                    continue;
+                }
+                case HirKind::SehTryExcept: {
+                    // c115 SEH: like an if/else — the __try statement terminates on
+                    // all paths iff BOTH the guarded body AND the handler do (control
+                    // leaves via the guarded body's normal exit OR, on a fault, via
+                    // the handler). With the option-(C) early-exit rule the guarded
+                    // body's only non-fall-through terminator is an infinite loop
+                    // (wrapped as Unreachable); the common case (body falls through)
+                    // is non-terminating, so a `return` MUST follow the __try —
+                    // exactly sqlite. Uses children() ([tryBody, filter, handler]) to
+                    // stay within the template's Source interface (HirBuilder lacks
+                    // the seh* accessors).
+                    auto kids = src.children(id);
+                    if (kids.size() != 3) { verdict = false; break; }
+                    stack.push_back(Frame{.id = id, .kind = Frame::Kind::Seh});
+                    pending     = kids[0];
+                    havePending = true;
+                    continue;
+                }
+                case HirKind::SwitchStmt: {
+                    // c60 (Design I-A): a switch terminates on all paths iff (a) it
+                    // has a `default:` arm — so the discriminant always lands inside
+                    // the body rather than skipping past to the join — AND (b) the
+                    // flat body Block terminates (its last statement, through
+                    // transparent case markers, ends in a Return/Unreachable/goto and
+                    // nothing falls off the end). Fall-through is straight-line in
+                    // the flat body, so the per-arm termination the old grouped shape
+                    // checked reduces to the body Block's own termination (MORE
+                    // accurate: `case A: foo(); default: return;` now correctly
+                    // terminates via fall-through, where the grouped form did not).
+                    bool hasDefault = false;
+                    bool malformed  = false;
+                    for (HirNodeId arm : src.switchArms(id)) {
+                        if (src.kind(arm) != HirKind::CaseArm) { malformed = true; break; }
+                        if (src.caseArmIsDefault(arm)) hasDefault = true;
+                    }
+                    if (malformed || !hasDefault) { verdict = false; break; }
+                    stack.push_back(Frame{.id = id, .kind = Frame::Kind::Switch});
+                    pending     = src.switchBody(id);
+                    havePending = true;
+                    continue;
+                }
+                default:
+                    verdict = false;
+                    break;
             }
-            return !reachable;
         }
-        case HirKind::IfStmt: {
-            auto elseB = src.ifElse(id);
-            return elseB.has_value()
-                && pathTerminates(src, src.ifThen(id))
-                && pathTerminates(src, *elseB);
-        }
-        case HirKind::SehTryExcept: {
-            // c115 SEH: like an if/else — the __try statement terminates on all
-            // paths iff BOTH the guarded body AND the handler do (control leaves
-            // via the guarded body's normal exit OR, on a fault, via the
-            // handler). With the option-(C) early-exit rule the guarded body's
-            // only non-fall-through terminator is an infinite loop (wrapped as
-            // Unreachable); the common case (body falls through) is non-
-            // terminating, so a `return` MUST follow the __try — exactly sqlite.
-            // Uses children() ([tryBody, filter, handler]) to stay within the
-            // template's Source interface (HirBuilder lacks the seh* accessors).
-            auto kids = src.children(id);
-            return kids.size() == 3
-                && pathTerminates(src, kids[0])
-                && pathTerminates(src, kids[2]);
-        }
-        case HirKind::SwitchStmt: {
-            // c60 (Design I-A): a switch terminates on all paths iff (a) it has a
-            // `default:` arm — so the discriminant always lands inside the body
-            // rather than skipping past to the join — AND (b) the flat body Block
-            // terminates (its last statement, through transparent case markers,
-            // ends in a Return/Unreachable/goto and nothing falls off the end).
-            // Fall-through is straight-line in the flat body, so the per-arm
-            // termination the old grouped shape checked reduces to the body Block's
-            // own termination (MORE accurate: `case A: foo(); default: return;` now
-            // correctly terminates via fall-through, where the grouped form did not).
-            bool hasDefault = false;
-            for (HirNodeId arm : src.switchArms(id)) {
-                if (src.kind(arm) != HirKind::CaseArm) return false;
-                if (src.caseArmIsDefault(arm)) hasDefault = true;
+        // Deliver `verdict` to the frame that asked, or answer the root.
+        if (stack.empty()) return verdict;
+        Frame& f = stack.back();
+        switch (f.kind) {
+            case Frame::Kind::Block: {
+                auto kids = src.children(f.id);
+                if (f.awaiting) {
+                    // A reachable child's verdict arrived: a terminating statement
+                    // makes the positions after it unreachable (so trailing DEAD
+                    // code after a real terminator — a `MACRO(...);` null
+                    // statement, `return x; stmt();` — no longer spuriously reads
+                    // as fall-through; this is exactly the dead code
+                    // `checkBlockTermination` warns unreachable, so the two rules
+                    // agree).
+                    f.awaiting = false;
+                    if (verdict) f.reachable = false;
+                    ++f.next;
+                }
+                while (f.next < kids.size()) {
+                    HirNodeId const child = kids[f.next];
+                    // SOUNDNESS: a `goto` can re-enter a label ANYWHERE, including
+                    // nested inside a dead-tail child, so a child whose SUBTREE
+                    // CONTAINS a label re-establishes reachability (else `{ if(x)
+                    // goto L; return 0; if(x){ L: ; } }` — a genuine fall-through —
+                    // would be wrongly accepted). The `!reachable` gate confines
+                    // the subtree scan to the rare dead region.
+                    if (!f.reachable && subtreeContainsLabel(src, child)) {
+                        f.reachable = true;
+                    }
+                    if (f.reachable) {
+                        // Ask for this child's verdict (a compound child pushes its
+                        // own frame above this one; a leaf answers on the next turn).
+                        f.awaiting  = true;
+                        pending     = child;
+                        havePending = true;
+                        break;
+                    }
+                    ++f.next;   // an unreachable child is not evaluated
+                }
+                if (f.awaiting) continue;
+                verdict = !f.reachable;
+                stack.pop_back();
+                continue;
             }
-            return hasDefault && pathTerminates(src, src.switchBody(id));
+            case Frame::Kind::If:
+            case Frame::Kind::Seh: {
+                // `first && second`, short-circuited exactly as the recursion was:
+                // a non-terminating first arm answers false without visiting the
+                // second.
+                if (f.phase == 0) {
+                    if (!verdict) { stack.pop_back(); continue; }   // verdict stays false
+                    f.phase     = 1;
+                    pending     = (f.kind == Frame::Kind::If)
+                                      ? *src.ifElse(f.id)
+                                      : src.children(f.id)[2];
+                    havePending = true;
+                    continue;
+                }
+                stack.pop_back();   // `verdict` is the second arm's, the answer
+                continue;
+            }
+            case Frame::Kind::Switch:
+                stack.pop_back();   // `hasDefault` was already true; the body decides
+                continue;
         }
-        default:
-            return false;
     }
 }
 

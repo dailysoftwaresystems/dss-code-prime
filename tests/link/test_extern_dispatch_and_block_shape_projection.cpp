@@ -28,6 +28,14 @@
 // (✔MEASURED 2026-08-20: all 22 object-format documents declare `direct-plt`
 // and not one declares `indirect-slot`). That was corrected earlier this cycle;
 // the retyped SPELLINGS were the separate half, and are what these pins hold.
+// ⓘ AND THE CORRECTION'S OWN COUNT HAS SINCE EXPIRED, which is the same shape
+// one turn later: D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET
+// (P54) made `pe64-x86_64-windows` and `-staticlib` declare `indirect-slot`,
+// because ✔MEASURED link.exe refuses a direct `call rel32` to a WEAK extern
+// (LNK2016 — a COFF weak external's fallback is an ABSOLUTE value-0 symbol).
+// The sentence above is kept as the record of what was true on 2026-08-20; the
+// live fact is that TWO relocatable pe formats declare `indirect-slot` and every
+// IMAGE format still declares `direct-plt`.
 //
 // ★★ WHAT EACH PIN ASSERTS:
 //   (A) CORPUS EXERCISE — the shipped format documents really declare these
@@ -367,7 +375,13 @@ TEST(LinkVocabularyProjection, TlsAccessShapeNamesEveryKey) {
 }
 
 TEST(LinkVocabularyProjection, RuntimeLibraryRowShapeNamesEveryKey) {
-    static constexpr std::string_view kKeys[] = {"role", "image"};
+    // ★ P54 lane `la` (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64): the row's second
+    // cell became a CHOICE — `image` (import the entries from a platform image)
+    // XOR `source` (DSS ships and compiles the body). This literal is the RATCHET
+    // half of that: it must be restated whenever the row's key set moves, so a
+    // key added to the loader without being added here reds rather than passing
+    // quietly, and a message quoting a key the loader does not accept reds too.
+    static constexpr std::string_view kKeys[] = {"role", "image", "source"};
     constexpr char const* kIgnore[] = {"runtimeLibraries"};
     // The ROW arm: a non-object entry inside a well-formed array.
     auto doc = shippedFormatDoc(kElfExecFormat);

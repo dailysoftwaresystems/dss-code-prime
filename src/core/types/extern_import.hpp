@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/strong_ids.hpp"
+#include "core/types/symbol_attrs.hpp"  // SymbolBinding
 
 #include <cstdint>
 #include <string>
@@ -106,14 +107,26 @@ struct DSS_EXPORT ExternImport {
     // Meaningless (stays empty) on formats that carry no symbol versioning
     // (PE/Mach-O ignore it). Rides the LK11 merge's whole-row copy for free.
     std::string   version;
-    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: TRUE ⇒ an EAGER import — a shipped-
-    // library descriptor symbol (a `#include`d library export) DSS binds even
-    // when UNREFERENCED (the D-FFI-DESCRIPTOR-EAGER-IMPORT invariant). The
-    // linker's reference gate (`rejectOrDropUnreferencedExterns`) KEEPS an eager
-    // row unconditionally; a NON-eager import (a source `extern` decl / bare-
-    // proto synthesis) survives ONLY when a relocation references it — gcc's
+    // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: TRUE ⇒ an EAGER import — one DSS binds
+    // even when UNREFERENCED. The linker's reference gate
+    // (`rejectOrDropUnreferencedExterns`) KEEPS an eager row unconditionally; a
+    // NON-eager import survives ONLY when a relocation references it — gcc's
     // "an unused extern declaration emits no import" rule, now uniform across
-    // library-bound AND no-library rows. Set at HIR→MIR from
+    // library-bound AND no-library rows.
+    //
+    // ⚠ THIS COMMENT NAMED A `#include`d DESCRIPTOR SYMBOL AS *THE* EAGER CASE
+    // UNTIL 2026-09-03, AND THAT IS NOW EXACTLY BACKWARDS.
+    // [[D-FFI-DESCRIPTOR-EAGER-IMPORT]] closed by flipping
+    // `ShippedExternSymbol::eagerImport` to FALSE by default, so an ordinary
+    // `#include <stdio.h>` symbol is now the commonest NON-eager row. ✔The
+    // measurement that forced it: C23 7.1.4p2 entitles a program to hand-declare
+    // a library function instead of including its header and calls the two
+    // EQUIVALENT — yet the hand-declared spelling imported 3 symbols where the
+    // `#include` spelling imported 86, and the LOADER sees the difference. The
+    // flag survives because a descriptor row may still opt IN per symbol
+    // (`shippedSourcePath` rows, the UCRT shim-core companions), which is what
+    // it was always for.
+    // Set at HIR→MIR from
     // `FfiMetadata.isEagerImport`; rides the MIR merge's whole-row copy, and the
     // merge OR-COMBINES it when it collapses two rows — an eager `#include`d
     // symbol plus a hand-written non-eager `extern` yields an EAGER surviving
@@ -171,6 +184,107 @@ struct DSS_EXPORT ExternImport {
     // library); the flag never rides an unbound row. FALSE for every non-
     // descriptor producer (the format-AGNOSTIC default — no arch/format branch).
     bool          isEagerImport = false;
+    // ★★ D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the REFERENCE binding
+    // this import carries onto the wire — the import-side companion of
+    // `ModuleSymbol::binding`, in the SAME agnostic `SymbolBinding` vocabulary so
+    // the two sides of one symbol are never described in two languages.
+    //
+    // `Global` (the default, and every import until one is annotated) ⇒ a STRONG
+    // reference: the symbol MUST be resolved, and nothing resolving it is a link
+    // error. `Weak` ⇒ the reference MAY legally resolve to NOTHING, in which case
+    // its address is 0 — which is the whole purpose of the construct (`extern int
+    // ea __attribute__((weak)); … if (&ea)`), and the ONE property that
+    // distinguishes it. Set at HIR→MIR's `collectExterns` from the declaration's
+    // `HirLinkageMap` entry, exactly as `isThreadLocal` is set from
+    // `HirThreadLocalMap` at the same site.
+    //
+    // ★ WHY THIS FIELD EXISTS AT ALL, because the attribute was already
+    // understood without it. `weak` on an extern IMPORT reached the HIR linkage
+    // map and STOPPED: HIR→MIR consumed `linkageMap` for function DEFINITIONS and
+    // GLOBALS only, so the bit was parsed, recorded, and dropped one layer below
+    // where it was recorded. The emitted object then marked the undefined symbol
+    // STRONG on all three formats (✔MEASURED at HEAD 2026-09-02: ELF `NOTYPE
+    // GLOBAL UND`, Mach-O `(undefined) external`, COFF `StorageClass: External`),
+    // and a DSS-linked image refused the program outright with `K_SymbolUndefined`
+    // where gcc and clang link it and run it to the null branch.
+    //
+    // ⚠ `Local` IS NOT A REPRESENTABLE IMPORT BINDING and never rides this field.
+    // An import is by construction a name this object does NOT define, and
+    // module-private is the one thing such a name cannot be — no format spells an
+    // undefined LOCAL symbol, and emitting one would make the reference
+    // unresolvable by any linker. `collectExterns` REFUSES it at the source span
+    // rather than folding it to Global, so a language whose config maps some
+    // specifier to `Local` on an extern declaration fails loud at the tier that
+    // can still name the declaration.
+    //
+    // ★ THE MERGE COMBINE IS STRONGEST-WINS, NOT OR-COMBINE. Where two CUs import
+    // one identity (the `ffiImportKey` / `dedupKey` triple) and disagree, the
+    // surviving row binds `Global`: a strong reference anywhere in the program
+    // makes the symbol REQUIRED, which is what C says and what gcc/clang do.
+    // Order-INDEPENDENT, like `isEagerImport`'s OR — and, unlike `isData`, a
+    // disagreement here is a DEFINED fold rather than a conflict, because the two
+    // rows describe the same object bound the same way and differ only in whether
+    // this TU could do without it.
+    SymbolBinding binding = SymbolBinding::Global;
+
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: this row is NOT a
+    // foreign name. It is a reference to a symbol THIS ARTIFACT ITSELF DEFINES,
+    // routed through the loader on purpose because the active format declares
+    // that definition PREEMPTIBLE (`preemptibleDefinitionBindings`) — the
+    // loader may hand the whole process a different image's body for that name,
+    // and an image that branched to its own body would then disagree with every
+    // other image in the process about what one identifier means. `false` for
+    // every other producer, so a module that mints none is unchanged.
+    //
+    // ★ WHY IT IS A DECLARED FLAG AND NOT INFERRED FROM `libraryPath.empty()`
+    // PLUS A NAME MATCH. Two folds in the link tier collapse an import onto a
+    // definition of the same NAME — `resolveCrossCuSymbols` (which then makes
+    // `mergeModules` strip the row) and, one tier down, `mergeCuMirs` — and
+    // both are RIGHT for an ordinary import: a sibling CU's definition really
+    // does shadow the library fallback, and binding it directly is both correct
+    // and cheaper. For THIS row the same fold is the exact defect being closed,
+    // reintroduced by the linker after the lowering removed it. Re-deriving
+    // "is this that kind of row" from a name match would make two owners of one
+    // fact, and the one that got it wrong would fail SILENTLY — back to one
+    // process holding two answers. The producer knows; it says so here.
+    //
+    // ⚠ THE ROW IS STILL A REAL IMPORT ON THE WIRE. It publishes an undefined
+    // dynamic symbol and takes the format's ordinary loader-resolved slot (ELF:
+    // an SHN_UNDEF `.dynsym` entry + a PLT stub + a GOT slot + its `.rela.dyn`
+    // GLOB_DAT; the shape ld emits for the same source). Nothing downstream
+    // needs a second mechanism — only permission not to fold it away.
+    bool isPreemptionReference = false;
+
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING, THE ADDRESS HALF: a
+    // SECOND, module-local SymbolId bound by the format walker to the VA of the
+    // SLOT that holds this import's loader-resolved ADDRESS. Invalid (the
+    // default) on every import that does not need one, so a producer that mints
+    // none leaves every tier byte-identical.
+    //
+    // ★ WHY A SECOND SYMBOL AND NOT A SECOND ROW. One dynamic symbol is one
+    // import — `dedupKey` says so and the `isData` conflict enforces it — so a
+    // name that is both CALLED and ADDRESSED inside one artifact cannot be two
+    // rows. What differs between the two uses is not the symbol but WHICH of the
+    // import's realizations the reference wants:
+    //   * the CALL wants the entry the format's `externCallDispatch` names — a
+    //     PLT stub under `direct-plt`, the slot itself under `indirect-slot`;
+    //   * the ADDRESS wants the SLOT's CONTENT, always, because a pointer to a
+    //     call thunk is not the function's address and comparing it against the
+    //     same name taken in another image would answer false (C 6.2.2p2 gives
+    //     one identifier one object/function across the program).
+    // Under `indirect-slot` the two coincide — `symbol` IS the slot — and the
+    // field stays invalid; under `direct-plt` they are two different VAs of one
+    // import, and this is the second one. The precedent is
+    // `AssembledFunction::blockSymbols`: a row carrying extra module-local
+    // symbols the walker gives VAs, remapped through the merge exactly the same
+    // way (D-LINK-MERGE-DOES-NOT-REMAP-BLOCK-SYMBOLS is what happens when that
+    // remap is skipped).
+    //
+    // ⚠ A walker that does not bind it FAILS LOUD rather than mis-binding: the
+    // symbol is declared in the compound index, so a relocation naming a VA the
+    // walker never assigned is a resolution error at link, never a zero address
+    // at run.
+    SymbolId addressSlotSymbol{};
 };
 
 } // namespace dss
