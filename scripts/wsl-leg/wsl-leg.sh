@@ -151,7 +151,7 @@ refuse_inert() {   # <flag> <why this mode cannot honour it>
     die "--mode $MODE never reads '$1' ($2). Refused rather than ignored: a flag that is silently dropped is how a leg runs a different thing than the operator asked for and still reports green."
 }
 if [[ $GAVE_TREE -eq 1 && "$MODE" != "build" ]]; then
-    refuse_inert '--tree' "this mode's build directory is fixed -- full builds build/dbg, arm-strict builds build/arm-strict, guards builds nothing"
+    refuse_inert '--tree' "this mode's build directory is DERIVED, not chosen -- full names it for --build-type (Debug=build/dbg, Release=build/rel, ...), arm-strict builds build/arm-strict, guards builds nothing"
 fi
 if [[ $GAVE_BUILD_TYPE -eq 1 && "$MODE" == "guards" ]]; then
     refuse_inert '--build-type' 'guards runs no configure and no build'
@@ -357,7 +357,20 @@ elif [[ "$MODE" == "build" ]]; then
     BUILD="build/$TREE"
     CONFIGURE_EXTRA=""
 else
-    BUILD="build/dbg"
+    # ★ THE TREE NAME FOLLOWS THE BUILD TYPE, as `remote-leg.sh` already does.
+    # ⚠ This used to be a hardcoded `build/dbg` for every `--build-type`, so
+    # `--mode full --build-type Release` built RELEASE into a directory named
+    # `dbg` AND clobbered the Debug tree — a mislabel that outlives the run and
+    # that the next reader inherits as fact. The operator's 2026-09-14 ruling
+    # made a Release leg an ordinary part of every round, which is what turned a
+    # latent naming lie into a live one.
+    case "$BUILD_TYPE" in
+        Debug)          BUILD="build/dbg" ;;
+        Release)        BUILD="build/rel" ;;
+        RelWithDebInfo) BUILD="build/relwithdebinfo" ;;
+        MinSizeRel)     BUILD="build/minsizerel" ;;
+        *) die "unknown --build-type '$BUILD_TYPE' (Debug | Release | RelWithDebInfo | MinSizeRel)" ;;
+    esac
     CONFIGURE_EXTRA=""
 fi
 
