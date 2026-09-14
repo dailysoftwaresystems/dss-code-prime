@@ -6680,6 +6680,32 @@ def launcher_for(leg, host_os, host_arch):
     return None
 
 
+def run_host_operating_systems(leg):
+    """Every host OS from which this leg could EVER be RUN, or None when the
+    catalogue declares no bound.
+
+    ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-THE-TWO-MACHO-LEGS-CARRY-NO-CONFOUND-ROWS-BECAUSE-ONLY-ONE-HOST-EVER-RUNS-THEM
+
+    It is the union of `runOn` (the host OSes that run it NATIVELY) and the
+    `hostOs` of every declared launcher (the ones that run it THROUGH something).
+    ⚠ A CAPABILITY, NOT A PERMISSION, and derived from the leg alone — no host is
+    consulted, which is what keeps it on the right side of `$noHostKeyingComment`.
+
+    ⚠ A `hostOs: "*"` LAUNCHER MAKES THE ANSWER UNBOUNDED, AND THAT IS `None`
+    RATHER THAN A BIG SET: the catalogue declares no ceiling in that case, and a
+    caller asking "is this leg reachable from exactly one carriage" must get NO
+    for an unbounded leg, never a yes derived from however many names happen to
+    appear. ✔MEASURED: no leg declares a wildcard today, so this branch is the
+    one that exists for the leg that will."""
+    hosts = set(leg.get("runOn", []))
+    for entry in leg.get("launchers", []):
+        want_os = entry.get("hostOs", "*")
+        if want_os == "*":
+            return None
+        hosts.add(want_os)
+    return hosts
+
+
 def launcher_available(command, available):
     """Is the launcher's argv[0] usable? `available` is None to consult PATH, or
     an explicit set (tests pin it so a plan is reproducible on any machine)."""
@@ -7911,6 +7937,56 @@ def plan_leg(leg, host_os, host_arch, available, kernel_measurements=None):
             run["detail"] = ("runOn=[%s] excludes host OS %s and no launcher is "
                              "declared for (%s, %s)"
                              % (",".join(run_on), host_os, host_os, host_arch))
+
+    # ★★★ A SKIP THAT NOBODY ELSE COVERS SAYS SO, ONCE, WHERE THE SKIP IS PRINTED.
+    # ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-THE-TWO-MACHO-LEGS-CARRY-NO-CONFOUND-ROWS-BECAUSE-ONLY-ONE-HOST-EVER-RUNS-THEM
+    #
+    # THE DEFECT, IN ONE CLAUSE: `skipped-by-runOn` is CORRECT PER HOST and SILENT
+    # about the GLOBAL fact behind it. On Windows and on Linux the two mach-o legs
+    # report a clean structural skip, which reads exactly like "some other host in
+    # the matrix covers this" — and for the ELF and PE legs it IS that, because
+    # every one of them is reachable from at least two host OSes. For a leg whose
+    # RUN verdicts exist on a SINGLE carriage it is the opposite: the skip is the
+    # whole story, and nothing else will see what this host cannot.
+    # ✔MEASURED CONSEQUENCE, and it is why this sentence exists rather than a
+    # standalone report line: `^scanstatus-5\.1\.2$` entered this catalogue on
+    # 2026-08-27 and reached elf64-arm64 and pe64-x86_64 on 2026-09-01, while the
+    # two mach-o legs' previous corpus run was 2026-08-07. It sat undeclared on
+    # them for 18 days, every Windows and Linux run printing `skipped-by-runOn`
+    # beside it, and surfaced only as a RED on the one machine that can execute a
+    # Mach-O.
+    #
+    # ★★ WHY IT RIDES `detail` AND IS NOT A SUMMARY LINE OF ITS OWN. Two reasons,
+    # both measured rather than preferred:
+    #   (a) ONE OWNER, BOTH DRIVERS. `run["detail"]` is already flattened to
+    #       `LEG_RUN_DETAIL` for build-and-test.sh and to `$leg.run.detail` for
+    #       build-and-test.ps1, and both print it on the skip path. A new report
+    #       line would have to be written into two drivers, which is this
+    #       project's canonical silent harness bug — the thing this file exists to
+    #       prevent, not to re-introduce.
+    #   (b) IT IS DIRECTIONAL, AND A BANNER WOULD NOT BE. This fires only on a
+    #       host that CANNOT run the leg; on the Mac the leg runs and the reader
+    #       gets a verdict instead. A global "these legs are single-carriage" line
+    #       would print identically on every run forever, which is how the
+    #       `oracle : <path>` line came to read as a control it was not.
+    # ⚠ NOT HOST-KEYED: the single-carriage FACT is derived from the leg's own
+    # `runOn` and `launchers` and nothing else. The host appears only as the
+    # occasion for printing it, which is the same role it already plays in every
+    # `detail` string above.
+    if run["mode"] == "skip":
+        carriages = run_host_operating_systems(leg)
+        if carriages is not None and len(carriages) == 1:
+            declared = leg.get("launchers", [])
+            run["detail"] += (
+                ". ★ AND NO OTHER HOST IN THIS MATRIX COVERS IT: '%s' can be RUN "
+                "only on a %s host — runOn=[%s], and %s — so this skip is not "
+                "picked up elsewhere: every RUN verdict this leg will ever have "
+                "comes from a SINGLE carriage, and a confound earned while that "
+                "carriage is away cannot reach it until the carriage runs again"
+                % (leg["label"], sorted(carriages)[0], ",".join(run_on),
+                   ("no launcher is declared at all" if not declared else
+                    "all %d declared launcher(s) are for a %s host"
+                    % (len(declared), sorted(carriages)[0]))))
 
     build = dict(leg.get("build", {}))
     libs = dict(build.get("libraries", {}))
@@ -11956,6 +12032,45 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                   got == want, "expected %r, got %r (mode=%r)"
                   % (want, got, run["mode"]))
 
+    # ── A SKIP NOBODY ELSE COVERS SAYS SO, AND ONLY THAT KIND OF SKIP DOES ──────
+    # ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-THE-TWO-MACHO-LEGS-CARRY-NO-CONFOUND-ROWS-BECAUSE-ONLY-ONE-HOST-EVER-RUNS-THEM
+    # ★★ BOTH ARMS ARE THE POINT, AND THE SECOND IS THE ONE THAT KEEPS THE FIRST
+    # WORTH READING: a note that also rode the ELF and PE skips would print on
+    # nearly every leg of every run and become furniture, which is exactly how the
+    # old `oracle : <path>` line came to read as a control it was not. So the
+    # single-carriage note MUST appear on the two mach-o legs' skips and MUST NOT
+    # appear on any other leg's — deleting the note reddens the first arm, and
+    # widening it to every skip reddens the second.
+    # ⓘ DERIVED FROM THE CATALOGUE, NOT FROM THIS TABLE: `run_host_operating_systems`
+    # reads runOn + launchers, so a leg that gains a second carriage stops carrying
+    # the note without anyone editing this test — and the RUN_ORACLE above is the
+    # friction that makes such a change deliberate.
+    _carriages = {l["label"]: run_host_operating_systems(l)
+                  for l in load_catalogue(path)}
+    _single = {lbl for lbl, hosts in _carriages.items()
+               if hosts is not None and len(hosts) == 1}
+    check("exactly the two mach-o legs are reachable from ONE host OS",
+          _single == {"macho64-arm64", "macho64-x86_64"},
+          "derived from runOn + launchers; got %r" % sorted(_single))
+    _note = "NO OTHER HOST IN THIS MATRIX COVERS IT"
+    for host in SELF_TEST_HOSTS:
+        resolved = plan(host[0], host[1], every, path)
+        for leg in resolved["legs"]:
+            run = leg["run"]
+            if run["mode"] != "skip":
+                check("a leg that RUNS here carries no single-carriage note "
+                      "(%s/%s %s)" % (host[0], host[1], leg["label"]),
+                      _note not in run["detail"],
+                      "the note is for a reader who got NO verdict; got %r"
+                      % run["detail"])
+                continue
+            want_note = leg["label"] in _single
+            check("the single-carriage note is %s on a skip (%s/%s %s)"
+                  % ("PRESENT" if want_note else "ABSENT",
+                     host[0], host[1], leg["label"]),
+                  (_note in run["detail"]) == want_note,
+                  "single-carriage=%r detail=%r" % (want_note, run["detail"]))
+
     # An UNAVAILABLE launcher must degrade to the environmental skip and to
     # nothing else — in particular it must not change the build set (asserted
     # above) and must not silently become a structural skip, which strict mode
@@ -12792,30 +12907,89 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # [D-HARNESS-CORPUS-ORACLE-SEEKS-A-COMPILER-WHEN-A-BUILT-REFERENCE-IS-ALREADY-STAGED]
     # ★★ `scanstatus-5.1.2` was run to ground in P42 and DISCHARGED BY HAND, so
     # every run since re-reported it UNCLASSIFIED — the confound-catalogue form of
-    # [[feedback-apply-the-row-when-the-lane-reports]]. It is declared on the THREE
-    # legs whose corpus.log at this tree shows the failure and on NEITHER macho leg,
-    # which ran smoke only and have observed nothing. ⚠ BOTH ARMS ARE THE POINT:
-    # deleting the row from legs.json reddens the first, and PRE-PROPAGATING it to a
-    # leg that never ran it reddens the second — which is the exact discipline the
-    # `sessionnoact-4.3` rows celebrate a leg for obeying.
+    # [[feedback-apply-the-row-when-the-lane-reports]].
+    # ★★★ IT IS NOW DECLARED ON ALL FIVE LEGS, AND THE SET CHANGED BECAUSE A
+    # MEASUREMENT CHANGED, NOT BECAUSE A PIN WAS IN THE WAY
+    # [D-HARNESS-THE-TWO-MACHO-LEGS-CARRY-NO-CONFOUND-ROWS-BECAUSE-ONLY-ONE-HOST-EVER-RUNS-THEM].
+    # This pin used to read "the THREE legs that RAN it", and its own comment said
+    # the macho legs "ran smoke only and have observed nothing". ✔That premise
+    # expired on 2026-09-14, when macOS ran the full `veryquick` corpus on both
+    # macho legs and each failed this test — and each then EARNED its row with a
+    # macOS compiler control of its own (a native arm64 clang `reference-testfixture`
+    # for macho64-arm64; a purpose-built `clang -arch x86_64` fixture for
+    # macho64-x86_64), pair md5 a85badaf8dad8486e0c9a2aa0b2a34b2 on both, identical
+    # to the gcc control's. THE PIN GOING RED IS WHAT MADE THAT VISIBLE; it was
+    # updated by re-deriving the fact, never by softening the instrument.
+    # ⚠ AND THE SECOND ARM MOVED RATHER THAN BEING DELETED, because on this pattern
+    # it had gone VACUOUS: with every leg carrying the row, "NOT pre-propagated to a
+    # leg that has not observed it" quantifies over the EMPTY set and refuses
+    # nothing — [[feedback-an-escape-every-row-triggers-disarms-the-guard]]. It now
+    # rides `^date-2\.4c$`, which legs.json declares on elf64-x86_64 ALONE and
+    # labels "DELIBERATELY NOT PROPAGATED TO ANY OTHER LEG", so the arm still
+    # REACHES its refusal on four legs. ✔That single-leg status is a measurement,
+    # not an assumption: `date-2.4c` was observed PASSING on both macho legs in the
+    # 2026-09-14 run.
     _scan = "^scanstatus-5\\.1\\.2$"
     _scan_legs = {l["label"] for l in legs
                   if any(r["pattern"] == _scan for r in l["confounds"])}
-    check("the scanstatus attribution is declared on the three legs that RAN it",
-          _scan_legs == {"elf64-x86_64", "elf64-arm64", "pe64-x86_64"},
+    check("the scanstatus attribution is declared on every leg that RAN it",
+          _scan_legs == {"elf64-x86_64", "elf64-arm64", "pe64-x86_64",
+                         "macho64-arm64", "macho64-x86_64"},
           "got %r" % sorted(_scan_legs))
     check("...and reaches each of those legs' ACTIVE set, not merely the file",
           all(_scan in _sets[lbl] for lbl in _scan_legs),
           "a row that never reaches the supply excuses nothing; got %r"
           % {lbl: sorted(_sets[lbl]) for lbl in sorted(_scan_legs)})
-    check("...and is NOT pre-propagated to a leg that has not observed it",
-          not any(_scan in _sets[l["label"]] for l in legs
-                  if l["label"] not in _scan_legs),
-          "an unearned excusal is the one direction that can hide a miscompile")
     check("...and every one of those rows shows its work",
           all(row.get(k, "").strip()
               for l in legs for row in l["confounds"]
               if row["pattern"] == _scan for k in CONFOUND_PROVENANCE_KEYS))
+    _date = "^date-2\\.4c$"
+    _date_legs = {l["label"] for l in legs
+                  if any(r["pattern"] == _date for r in l["confounds"])}
+    check("a single-leg row is NOT pre-propagated to a leg that has not observed it",
+          _date_legs == {"elf64-x86_64"}
+          and not any(_date in _sets[l["label"]] for l in legs
+                      if l["label"] != "elf64-x86_64"),
+          "an unearned excusal is the one direction that can hide a miscompile; "
+          "`date-2.4c` is declared on elf64-x86_64 ALONE and PASSES elsewhere. "
+          "got %r" % sorted(_date_legs))
+    # ★★★ THE "EARNED PER LEG, NEVER PASTED ACROSS" DISCIPLINE, MADE CHECKABLE.
+    # [D-HARNESS-THE-TWO-MACHO-LEGS-CARRY-NO-CONFOUND-ROWS-BECAUSE-ONLY-ONE-HOST-EVER-RUNS-THEM]
+    # Every consumer of this catalogue rests on the claim that a pattern appearing
+    # on N legs carries N SEPARATE provenances. Prose cannot enforce that and the
+    # existing lint cannot either — it checks that `earnedOn` is non-empty, which a
+    # copy-paste satisfies perfectly. Two legs sharing a BYTE-IDENTICAL `earnedOn`
+    # for one pattern is the machine-visible signature of the paste, and it is the
+    # one shape this file's own rules forbid outright.
+    # ⚠ THE GUARD IS CHECKED AGAINST A SYNTHESIZED NEGATIVE, IN THE DIRECTION THAT
+    # MATTERS [[feedback-a-fixture-must-synthesize-the-negative]]: the fixture below
+    # CORRUPTS a real row by copying one leg's provenance onto another and asserts
+    # the detector fires. An ADD-direction fixture would pass while the real
+    # catalogue rotted.
+    def _pasted_provenances(all_legs):
+        """(pattern, legA, legB) for every pair of legs whose row for one pattern
+        carries a byte-identical `earnedOn`. Empty is the healthy answer."""
+        seen, pasted = {}, []
+        for leg_doc in all_legs:
+            for row in leg_doc.get("confounds", []):
+                key = (row["pattern"], row.get("earnedOn", ""))
+                if key in seen:
+                    pasted.append((row["pattern"], seen[key], leg_doc["label"]))
+                seen[key] = leg_doc["label"]
+        return pasted
+    check("no two legs share a pattern's provenance verbatim",
+          _pasted_provenances(legs) == [],
+          "a byte-identical `earnedOn` on two legs is a PASTED row: the excusal on "
+          "the second leg was never earned there. got %r"
+          % _pasted_provenances(legs))
+    _paste_fixture = [
+        {"label": "leg-a", "confounds": [{"pattern": _scan, "earnedOn": "X"}]},
+        {"label": "leg-b", "confounds": [{"pattern": _scan, "earnedOn": "X"}]}]
+    check("...and the detector REACHES that refusal on a synthesized paste",
+          _pasted_provenances(_paste_fixture) == [(_scan, "leg-a", "leg-b")],
+          "a guard that cannot go red over a deliberate paste is furniture; got %r"
+          % _pasted_provenances(_paste_fixture))
     _pe_leg_for_oracle = leg_by_label(legs, "pe64-x86_64", path)
     # ── THE PER-LEG ATTRIBUTION ORACLE ──────────────────────────────────────
     # [D-HARNESS-PE64-HAS-NO-SAME-PLATFORM-ORACLE] The defect was an OUTPUT LINE:
