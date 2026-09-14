@@ -50,227 +50,209 @@ below is IN it.
 
 ---
 
-**Last updated:** 2026-09-10 — cycles **P14 … P66**. ⛔ **P66 IS NOT FINISHED — its exit gate was interrupted at the operator's request. §0.0 lists exactly what is owed; read it before anything else.**
+**Last updated:** 2026-09-14 — cycles **P14 … P66**. ✅ **P66 IS COMPLETE.** Every exit criterion the operator set is met and the tree is clean; the only remaining step is the operator's merge of PR #57, and the next cycle branches from `main`. §0.0 has the state.
 
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
 
-## §0.0 — ⛔ THE CYCLE IS **NOT** DONE. START HERE, IN THIS ORDER.
+## §0.0 — STATE: P66 IS COMPLETE AND THE PR IS WAITING ON THE OPERATOR'S MERGE
 
-✔**MEASURED 2026-09-10.** P66 ran in two halves. The first half (twelve lanes, commit `976326d6`)
-is archived below. **The second half is an EXIT GATE that was interrupted mid-run at the operator's
-request**, and this section is the only thing standing between the next session and a wrong
-assumption.
-
-**Where it stopped:** HEAD is `b529a90a`, pushed. Windows and WSL units are GREEN on it. **The macOS
-and arm64-VPS unit legs were RUNNING ON `b529a90a` AND WERE DELIBERATELY ABORTED MID-`ctest`.**
-Nothing is broken; they are simply unfinished.
-
-| # | what is owed | state |
-|---|---|---|
-| 1 | **arm64 VPS units** on HEAD — `wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage arm64-vps` | ⛔ ABORTED mid-ctest |
-| 2 | **macOS arm64 units** on HEAD — same script, `--carriage macos` | ⛔ ABORTED mid-ctest |
-| 3 | **sqlite `veryquick` on ALL FOUR hosts** from the MAIN TREE — `real-examples/c/sqlite/build-and-test.ps1` (Windows) / `.sh` (WSL, macOS, VPS) | ⛔ NOT RUN on HEAD |
-| 4 | **`benchmark-speedtest1.{ps1,sh}`** — the operator asked for it explicitly, *after* the veryquick tier | ⛔ NOT RUN |
-| 5 | **README figures** — the standing regime's third commit | ⛔ NOT DONE |
-| 6 | **Re-run `check-anchor-balance` AFTER this file is rewritten** — the balance gate runs BEFORE the handoff lands, so a handoff can break it | ⛔ owed every time |
-| 7 | ⛔ **HARD STOP for the operator's merge call on PR #57.** The merge is never ours. The next cycle branches from `main`. | — |
-
-⚠ **STEPS 1 AND 2 WILL RESUME FAST**: both hosts were already past configure+build and INSIDE
-ctest when killed, so their `build/dbg` and ccache are warm.
-⚠ **BUT `leg-tree restore` NEVER RAN** — it fires from a trap in the driver, and the driver was
-killed. Both remote clones are left SYNCED AND DIRTY at `b529a90a`. That self-heals: `leg-tree
-prepare` fetches, checks out and cleans before syncing. **Do not "tidy" them by hand, and never
-`git reset`/`clean` on a gate host outside that verb.**
-⚠ **Windows and WSL SHARE ONE sqlite CLONE and the harness LOCKS it** (`SQLITE_WSL_DIR` on the
-`.ps1`, `SQLITE_DIR` on the `.sh`, same default `$HOME/src/sqlite` inside WSL). Run those two
-SERIALLY. macOS and the VPS are independent hosts and run in parallel with anything.
-⚠ Both sqlite drivers default to `veryquick` + `release`. **Invoke them BARE.** `DSS_TIER_EXCLUDES`
-must stay EMPTY — both halves declare it and any use is reported as a coverage hole.
-
-### The facts, re-derivable
+✔**MEASURED 2026-09-14.** Every exit criterion the operator set is met. **Nothing is owed on this
+branch.** The one thing left is not ours: the merge.
 
 | fact | value | how to re-derive |
 |---|---|---|
-| branch | `feature/c23-conformance-burndown-6`, PR #57 | `git status -sb` |
-| HEAD | ⚠ **not named in this table** — the commit carrying this file moves HEAD past any sha it could state | `git log --oneline -8` |
-| the cycle's BASE, for every delta below | **`de1e83ef`** — it does not move when this file is edited | `git log --oneline` |
+| branch | `feature/c23-conformance-burndown-6`, **PR #57**, 39 commits over `7f452a5f` | `git status -sb` · `git rev-list --count 7f452a5f..HEAD` |
+| HEAD | ⚠ **not named here** — the commit carrying this table moves HEAD past any sha it could state | `git log --oneline -8` |
+| the cycle's BASE | **`de1e83ef`** — it does not move when this file is edited | `git log --oneline` |
 | registry OPEN | **445** = production **258** + harness **187** (the sum IS the cross-check) | `python scripts/check-anchor-balance/check-anchor-balance.py --breakdown --denominator registry` |
 | total OPEN | **786** = registry 445 + plans 341 | same command |
-| lane worktrees | **none** — all sixteen removed and VERIFIED absent | `git worktree list` |
-| tree | clean at the commit carrying this file | `git status --short` |
+| lane worktrees | **none** — all twenty-one removed and VERIFIED absent | `git worktree list` |
+| tree | clean | `git status --short` |
 
-⚠ **THE PER-BUCKET SUM HAS A TRAP AND IT CAUGHT ME.** A naive `grep '^| \`D-'` over the two working
-registries returns **454**, not 445. The extra 8 are an **ALLOWLIST table** in the harness registry
-(`| Pattern | Reason |`, code-internal pins) whose first cell also starts with a backticked `D-`.
-`check-anchor-balance` counts by TABLE HEADER SHAPE and excludes it correctly. **Count only rows
-under the `| Anchor | Priority | Status | Trigger | Closing work | Cross-refs |` header.**
+⚠ **THE PER-BUCKET SUM HAS A TRAP.** A naive `grep '^| \`D-'` returns **454**, not 445: the harness
+registry carries an 8-row **ALLOWLIST** table (`| Pattern | Reason |`) whose first cell also starts
+with a backticked `D-`. `check-anchor-balance` counts by TABLE HEADER SHAPE and excludes it
+correctly. **Count only rows under the `| Anchor | Priority | Status | Trigger | Closing work |
+Cross-refs |` header.**
 
-## §0.1 — WHAT THE EXIT HALF DID (four lanes, five commits)
+### ⛔ THE ONLY REMAINING STEP, AND IT IS NOT OURS
 
-| commit | lane | what |
-|---|---|---|
-| `8a35c093` | `at` | the GNU atomic builtins — 100% config, **zero engine lines** |
-| `3a0267ba` | `rc` | the dependency cache stopped deleting a concurrent run's live artifact; `run-gate` learned to see the machine; the wrapped-id guard stopped being blinded by a closing quote |
-| `f7c0e631` | `pe` | pe64 stopped being the last poisoned leg |
-| `b529a90a` | `cc` | a confound excusal that must be EARNED PER RUN, not asserted once in a file |
+**The operator merges PR #57. The next cycle branches from `main`, not from this branch.** The
+`/loop` is not over at the merge — the registries outlive the PR and the standing order carries into
+the new branch unchanged.
 
-✔**REAL, whole cycle: 21 rows closed, 0 left open** (15 in the first half, 6 in the exit).
+**Operator's stated order for the next PR, 2026-09-14:** *"next PR we'll keep acting on production
+anchors, then on -j4 and our optimizer"*. ⇒ **Production anchors FIRST**, then the two perf axes
+§0.5 records with their measurements.
+
+## §0.1 — P66 RAN IN TWO HALVES AND TWENTY-ONE LANES
+
+The first half is twelve lanes of C conformance and harness work (archived in the TIMELINE entry for
+`976326d6`). The exit gate then ran the real-world corpus for the first time since P59 — **and it
+did not build, on any leg** — which opened a second half of nine more lanes: `at`, `rc`, `pe`, `cc`,
+`ci`, `mh`, `hw`, `cu`, plus the orchestrator's own.
+
+✔**REAL, whole cycle: 29 rows closed, 0 left open.**
 ✔**COUNTED by `check-anchor-balance --base de1e83ef`: 1 closed, 0 opened, net −1** (registry
-446 → 445). ⚠ They differ because **20 of the 21 were minted AND closed inside the cycle** and are
-invisible from BOTH bases — the instrument working as designed
+446 → 445). ⚠ They differ because all but one row was minted AND closed inside the cycle, invisible
+from BOTH bases — the instrument working as designed
 ([[feedback-the-gate-cannot-see-a-row-born-in-the-cycle]]). **Report both; never soften it.**
 
-## §0.2 — ★★★ THE THROUGH-LINE OF THE EXIT: **THE SUITE WAS GREEN BECAUSE IT COULD NOT SEE**
+## §0.2 — ★★★ THE THROUGH-LINE: **A RULE THAT WAS TRUE — OF THE THING NEXT DOOR**
 
-The first half found *the rule a defect cited was true — of the thing next door*. The exit found the
-same shape one level up, in the INSTRUMENTS:
+The first half found it in the CODE: six defects whose cited rule was true of an adjacent subject.
+**The second half found the identical shape in the INSTRUMENTS, seven more times**, and that is the
+part worth carrying:
 
-| the instrument | said | could not see | the cost |
+| the instrument | its rule was true of | it was applied to | the cost |
 |---|---|---|---|
-| the unit suite, **2174/2174**, for six cycles | the compiler is correct | that nothing in it consumes a header which ASKS the compiler what it supports and then USES the answer | `__has_extension(c_atomic)` answered 1 while `__atomic_load_n` did not exist — **the whole real-world corpus, 5 legs of 5 POISONED, since P59** |
-| `run-gate`'s `contended: no` | this run was alone in its build directory | the rest of the MACHINE — the shared per-user cache lives outside both `srctree` and `builddir` | two corpus examples red on `F_FileOpenFailed`, both green re-run alone |
-| the cache's *"a superseded entry is UNREACHABLE"* | nothing can serve the entry I am deleting | a CONCURRENT process with different inputs computing exactly that key | a prune that reclaimed **0 bytes** and deleted live artifacts |
-| lane `at`'s own gate, **2177/2177** | this tree is clean | the row the lane was writing — the fold skips `.plans/`, so it gated a tree without it | a `path:line` citation shipped past `plan_citations_guard` |
-| twenty red-on-disable arms on the confound corroborator | the decision is right | **the SUPPLY** — a plan WITHHOLDS corroborated rows, and a corroborator that only SUBTRACTED could never put one back | the matrix printed `CORROBORATED` and `units: FAIL` in the same run; only the matrix caught it |
+| the unit suite, 2174/2174 for six cycles | everything it compiles | a header that ASKS the compiler what it supports | `__has_extension(c_atomic)` = 1 with no `__atomic_*` — **the whole corpus, 5 legs of 5 POISONED since P59** |
+| the cache's *"a superseded entry is UNREACHABLE"* | the PREVIOUS build in this tree | a CONCURRENT run with different inputs | a prune reclaiming **0 bytes** that deleted live artifacts |
+| `check-ninja-deps`'s *"`#deps 0` is never legitimate"* | **gcc**, which lists the source itself | **MSVC**, whose `/showIncludes` reports headers ONLY | a red CI leg for ~10 days |
+| run-gate's *"`comm` names the image"* | **Linux** | **macOS**, where `ps -eo comm=` is a truncated ABSOLUTE PATH (650/662 rows carry `/`) | the `compilers:` line could never fire there |
+| a confound row earned on the ELF legs | the leg it was earned on | two macho legs no host but macOS can RUN | an 18-day coverage lag, surfacing as a red |
+| `emulated:^win32longpath-1\.3$` | a failing TEST | a whole FILE that aborts and reports no test | 3 unit groups silently not reached |
+| arm 24 of the run-gate fixture | a stand-in that outlives the gate | a CI runner ~3× slower, where the gate outlives the stand-in | the same red, twice, looking like a real defect |
 
-⇒ **A green is a claim about what the instrument LOOKED AT.** Before believing one, ask what it
-could not have seen. ★ The counter-example that held all cycle is arithmetic, not judgement: remote
-legs run `-LE repo-guard`, so their total must be the Windows total minus exactly **31**, and WSL's
-is Windows minus **1**. A leg that had not synced could not land on those numbers.
+⇒ **Before trusting a rule a guard cites, ask which TOOLCHAIN, which PLATFORM, and which HOST it was
+measured on.** ★ The counter-example that held all cycle is arithmetic, not judgement: remote legs
+run `-LE repo-guard` so their total is Windows − **31**, and WSL's is Windows − **1**. A leg that had
+not synced could not land on those numbers.
 
-## §0.3 — WHAT LANDED IN THE EXIT (production)
+## §0.3 — WHAT LANDED (production)
 
-- **The GNU atomic builtins** (`at`). DSS advertised `c_atomic` through `__has_extension` and
-  shipped none of `__atomic_load_n` / `__atomic_store_n` / `__ATOMIC_*`. Fixed **100% in config** —
-  8 builtin rows + 6 constants in `c.lang.json`, zero engine lines, because every new row binds a
-  `lowering` verb the C11 `atomic_*_explicit` rows already bind.
-  ★ A hazard no brief named: GNU `__atomic_fetch_add(&intptr, 1, o)` advances **one byte** on gcc
-  AND clang while DSS's `atomic_fetch_add` SCALES by `sizeof(*p)`. The five fetch rows therefore
-  DECLINE `pointerDifferenceParams`, so a pointer object refuses loudly instead of stepping wrong.
-  ⓘ A new guard, `test_advertised_capability_is_honoured`, enumerates the advertised set from the
-  loaded schema and requires a COMPILED witness per member, ratcheting both ways.
+- **The GNU atomic builtins** (`at`) — DSS advertised `c_atomic` and shipped none of
+  `__atomic_load_n`/`store_n`/`__ATOMIC_*`. **100% config, zero engine lines**: 8 builtin rows + 6
+  constants in `c.lang.json`, each binding a `lowering` verb the C11 `atomic_*_explicit` rows already
+  bind. ★ GNU `__atomic_fetch_add(&intptr, 1, o)` advances **one byte** on gcc AND clang while DSS's
+  `atomic_fetch_add` SCALES — so the five fetch rows DECLINE `pointerDifferenceParams` and a pointer
+  object refuses loudly instead of stepping wrong.
 - **The dependency cache stopped deleting a concurrent run's live artifact** (`rc`). ✔The census
-  that decided it: 15,906 entry families in a real cache, **every one holding exactly ONE entry** —
-  a perfect prune reclaims **0 bytes**, because the build stamp is a DIRECTORY component. Its only
-  reachable subject was the case it destroyed. The store now deletes nothing; `CacheEviction` is
-  WITHDRAWN, and a manifest naming `eviction` is refused *with the reason*, ahead of the unknown-key
-  check, because `has unknown member` reads as a typo.
-- **pe64 stopped being the last poisoned leg** (`pe`). `GetDriveTypeW` + the whole seven-member
-  `DRIVE_*` family declared; `__stat64` given a pe-gated `"replacement": "_stat64"` in the
-  descriptor's `macros` block — exactly what mingw AND the UCRT do.
-  ★ Gap 1's boundary was **measured EMPTY**: all 60 `(SYSCALL)X` operands in `os_win.c` enumerated,
-  52 declared, 7 of the remaining 8 behind guards this configuration leaves off. Those 7 stay
-  unshipped for the **eager-import law** — `UuidCreate` is in rpcrt4.dll, not kernel32.
+  that decided it: 15,906 entry families, **every one holding exactly ONE entry** — a perfect prune
+  reclaims **0 bytes**, because the build stamp is a DIRECTORY component. The store now deletes
+  nothing and `CacheEviction` is WITHDRAWN, refused *with its reason* ahead of the unknown-key check.
+- **pe64 stopped being the last poisoned leg** (`pe`) — `GetDriveTypeW` + the seven-member `DRIVE_*`
+  family, and `__stat64` given a pe-gated `"replacement": "_stat64"` in the descriptor's `macros`
+  block, which is exactly what mingw AND the UCRT do. ★ Gap 1's boundary was **measured EMPTY**: all
+  60 `(SYSCALL)X` operands enumerated, 52 declared, 7 of the remaining 8 behind guards this config
+  leaves off — and those 7 stay unshipped for the **eager-import law**, not for scope.
 
-## §0.4 — WHAT LANDED IN THE EXIT (harness)
+## §0.4 — WHAT LANDED (harness)
 
-- **`run-gate` learned to see the machine** (`rc`): a `compilers:` line on every run, discriminated
-  by DESCENT bounded in BOTH directions (this shell plus ancestors up to the outermost build-tool
-  ancestor — "any ancestor" disarms it). It **REPORTS rather than refuses**, because refusing would
-  refuse every four-lane gate. `contended: no` was judged correctly scoped and narrowed anyway:
-  *true and over-readable* is worse than false. Self-test 24 → 29 arms.
-- **`check-wrapped-anchor-ids` stopped requiring a wrapped line to END in `-`** (`rc`) — a closing
-  quote blinded it. Widening it surfaced **74 wrap sites across 32 files**, correcting the P29 row's
-  *"ZERO wrapped ids, ceiling set EMPTY"*. Recorded as `--baseline` DEBT, not un-wrapped.
-- **The confound catalogue gained a per-run corroborator** (`cc`): a second registry
-  `runDirectoryPreconditions` + a per-row `requiresRunDirectory`, measured per (leg, run directory)
-  AFTER the plan. The forcing function is what makes it survive — a plan stamps such a leg
-  `runDirectoryGating: unmeasured` and both drivers refuse anything but `not-required`/`measured`,
-  so a driver that forgets to call it STOPS. ⚠ The row's own qualifying-entry count was already
-  stale when the lane read it (TEN, naming a different set; `Config.Msi` is new) — **the qualifying
-  set moves with the machine, which is the argument against any list a catalogue could carry.**
+- **A confound excusal must now be EARNED PER RUN** (`cc`): a second registry
+  `runDirectoryPreconditions` measured per (leg, run directory) AFTER the plan, with a forcing
+  function — a plan stamps `runDirectoryGating: unmeasured` and both drivers refuse anything but
+  `not-required`/`measured`, so a driver that forgets to call it STOPS.
+- **`run-gate` learned to see the machine, then learned to remember it** (`rc`, then `cu`): a
+  `compilers:` line discriminated by DESCENT bounded in both directions; then the discovery that the
+  gate **samples twice and was discarding the first sample**, so a compiler it HAD seen that exited
+  mid-run printed `none`. Now a union across samples, with `contended:` given the same accounting.
+- **Two CI legs that had been red for ~10 days** (`ci`) — an MSVC depfile fact read as a gcc one, and
+  a guard that runs on exactly one local host. Ships `scripts/check-ci-legs/`, which reads job
+  METADATA (it does not expire with the logs) and separates a REAL FAILURE from a BUDGET OVERRUN by
+  **duration**.
+- **The macho legs' confound coverage** (`mh`), earned with a five-way md5 control; **three wine
+  aborts with three different upstream causes** (`hw`), plus the coverage marker that was about to go
+  blind; **`wsl-leg.sh` naming every tree `dbg`** whatever the `--build-type`.
 
-## §0.5 — WHAT P67 INHERITS
+## §0.5 — WHAT P67 INHERITS, IN THE OPERATOR'S OWN ORDER
 
-0. ⛔ **EVERYTHING IN §0.0. That is the priority and it is not optional.**
-1. ⚠ **TWO repo guards each failed ONCE in the first half, unreproduced, no mechanism.** Kept
-   because two in one session reads as noise until the third. ✔`wrapped_anchor_ids_guard` failed at
-   **0.14 s** — far too fast to have scanned 3364 files — then passed five times.
-   ✔`plan_citations_guard` failed once inside a `-j 6` full suite, then passed directly and in three
-   subset runs and a full WSL leg. ⓘ **Two hypotheses were RAISED AND REFUTED**: the self-test does
-   NOT mutate the live inventory (it isolates via `mkdtemp` + `copytree`), and the ratchet was NOT
-   silently raised. ⇒ **If a third appears, the first task is a REPRODUCTION under `-j 6`, not a fix.**
-2. **The stale-blocker census** — `python scripts/check-stale-blockers/check-stale-blockers.py
-   --production --band P1`. Carried from P65 and NOT worked in P66.
-3. **`D-CSUBSET-DECL-GRAMMAR-LOW-RESIDUES` residue (2)'s remaining axis** — storage-class AFTER the
-   type. Its old remedy is REFUTED in the row; the corrected design is written there.
-4. **The omega contract's last partial**: `@loc` spans in preprocessor-synthesized coordinates, and
+0. ⛔ **PRODUCTION ANCHORS FIRST** — operator, 2026-09-14. 258 open.
+1. **`-j4` build scaling.** ✔MEASURED 2026-09-14 (`benchmark-speedtest1`, Windows, 32 CPUs, SQLite
+   `speedtest1.c` + 103 full-source TUs, upstream `6f1110c`): DSS `-j1` **27.71 s** BEATS gcc's
+   28.45 s, but `-j4` is **12.49 s against gcc's 7.38 s** — DSS scales **2.2×** where gcc scales
+   **3.9×**. ⓘ The driver states the asymmetry rather than hiding it: DSS compiles every CU in ONE
+   process on a thread pool; gcc and MSVC run N concurrent `-c` processes plus a link. **That
+   difference IS the architecture under measurement.**
+2. **The optimizer.** Same run: DSS `speedtest1 --size 25` **4.255 s** against gcc **3.838 s**
+   (+11%) and MSVC **3.299 s** (+29%). ⚠ **Not a regression claim** — there is no prior speedtest1
+   run at this commit to compare against, and the README's four-host table is stamped 2026-08-28 and
+   was deliberately NOT updated from a single fresh host.
+3. ⚠ **`linux-clang-asan` PASSES at 69–98.9% of its 6600 s CI budget** and its own revisit trigger
+   has fired (6525 s against the workflow's stated ~45 min). **Raising the cap is the forbidden
+   workaround; cutting the suite is an operator decision.** `scripts/check-ci-legs/` now warns above
+   80%.
+4. ⚠ **Artefact retention is 3 days, not the `retention-days: 7` the workflow asks for** — a
+   repository setting silently overrides it. Not a lane's to change.
+5. **The stale-blocker census** — `python scripts/check-stale-blockers/check-stale-blockers.py
+   --production --band P1`. Carried from P65, NOT worked in P66.
+6. **`D-CSUBSET-DECL-GRAMMAR-LOW-RESIDUES` residue (2)** — storage-class AFTER the type. Its old
+   remedy is REFUTED in the row; the corrected design is written there.
+7. **The omega contract's last partial** — `@loc` spans in preprocessor-synthesized coordinates, and
    enumerator NAMES not travelling in `.dsshir`.
-5. ⚠ **`X_OptFixpointTruncated` fires throughout a release build of real code** — *"the pipeline
-   stopped because it ran out of iterations, NOT because it converged"*. Both fixpoint rows
-   (`D-OPT-FIXPOINT-CONVERGENCE-IS-COMPUTED-AND-DISCARDED`,
-   `D-OPT-INLINING-FIXPOINT-TRUNCATES-BEFORE-CONVERGING`) are CLOSED, so the warning is the fix
-   REPORTING rather than a regression — but **nobody has measured what a converged pipeline would
-   emit.** ⓘ Noticed in the pe64 corpus logs and recorded rather than filed, because *"a warning
-   fires"* is not yet a defect claim.
-6. ⓘ **PR #57's title still reads "cycles P53–P63"** while the PR now spans **P45–P66**. Retitling
-   is the operator's call; it was offered and not answered.
+8. ⓘ **PR #57's title still reads "cycles P53–P63"** while it spans P45–P66. Offered twice, never
+   answered; it is the operator's call.
 
-## §0.6 — WHAT THE ORCHESTRATOR GOT WRONG IN THE EXIT
+## §0.6 — WHAT THE ORCHESTRATOR GOT WRONG
 
-1. ⚠⚠ **I piped a live launcher into `tail -40`.** `tail` cannot emit until its input ENDS, so a
-   running remote launch showed **0 bytes for its entire run**; I read that as wedged and killed it.
-   The pipe would have eaten the exit code too — the rule this project keeps re-paying for.
-   ⇒ **Redirect a long-running command to a FILE and sample the file.**
-2. **I read a 40-byte log carrying `setsid: command not found` as a fresh failure.** It was the
-   PREVIOUS NIGHT's log — proved by `mtime Sep 9 23:02` against a host clock of `2026-09-10T09:02Z`,
-   plus `ps` = 0. ⇒ **A log that is not growing may be a log nobody wrote to. Check its AGE before
-   its content.**
-3. **Both briefs I wrote for the exit had their premises REFUTED by the lane that measured them, and
-   both refutations were right.** `rc` proved a plain parallel build CANNOT hit the cache race (C is
-   the only shipped language reaching that cache) and that the prune reclaimed zero bytes. `pe`
-   proved a second identical struct does NOT make the call site compile — a descriptor struct interns
-   by NAME + field types, and `sys/stat.json` already had one. **The tree held the disproof the whole
-   time.** ⇒ A brief's premise carries its author's confidence, not their measurement.
-4. **My row applier took ONE bucket per LANE.** A lane returned one production row and one harness
-   row, and a single `--<bucket>` would have filed the OPEN one where no queue in this project ever
-   looks. Fixed: **an existing row keeps its own bucket; only a NEW row needs one declared.**
-5. **A typo in a log path killed a leg launch silently** (rc 1, no log, no run). An `ls` was the only
-   reason it surfaced. Launches now assert the log directory exists first.
-6. ⓘ **`land-lane.sh` deleted 601 lines of a lane's findings** minutes after the row citing them
-   landed. It now copies `findings.md` out BEFORE removal — and earned that on the very next lane.
-7. ⓘ **My per-bucket registry count was wrong before it reached this file** — see §0.0's allowlist
-   trap. The sum rule caught it, which is exactly what it is for.
+1. ⚠⚠ **THREE OF MY OWN INSTRUMENTS ANSWERED AN ADJACENT QUESTION, ALL IN ONE CYCLE, ALL FAILING
+   TOWARD CLEAN.** I piped a LIVE launcher into `tail -40` (which cannot emit until EOF, so a running
+   launch showed **0 bytes** and I killed it). I read a 40-byte log as a fresh failure when its mtime
+   was **ten hours old**. And twice I reported a "silent failure with no message" when the error was
+   at **LINE 1** — stderr is unbuffered and lands first, stdout is block-buffered and flushes after.
+   ⇒ **On a redirected run, `head` the log before you `tail` it. Check a log's AGE before its
+   content. Never pipe a long-running command into `tail`.**
+2. **Every brief I wrote in the second half had its premise refuted by the lane that measured it, and
+   every refutation was right.** A plain parallel build cannot hit the cache race; the prune
+   reclaimed zero bytes; a second identical struct does NOT make the call site compile; the macho
+   legs DID carry confound rows; the catalogue ALREADY had `matches: abort-file`; the UNKNOWN state
+   was ALREADY shipped and CI could read the process table all along. ⇒ **A brief's premise carries
+   its author's confidence, not their measurement.**
+3. **I told the operator CI had been red for "ten days and ~20 commits".** Every run HAD failed, but
+   the ones before `de1e83ef` failed at `label-check` with `run-tests` **SKIPPED**. The matrix ran
+   **six** times. ⇒ **A `gh run list` conclusion is not evidence about the tree.**
+4. **I over-corrected the operator's CI ruling into "a cycle must not consult CI".** Consulting is
+   FREE and always was right; **RUNNING** is what is expensive and label-gated.
+5. **My row applier took one bucket per LANE** (a mixed pair would have filed the open row where no
+   queue looks) and **silently overrode a lane's deliberate priority correction**. Both fixed.
+6. **I edited `.claude/skills/dss-cycle/SKILL.md` while a lane held it** — `lane-fold` REFUSED the
+   fold and named the drift. The guard worked; the sequencing was mine.
 
-## §0.7 — THE GATE THIS COMMIT CARRIES, AND WHAT IT DOES **NOT**
+## §0.7 — THE GATE THIS COMMIT CARRIES
 
-✔**MEASURED on the settled tree at `b529a90a`, all lanes folded, all worktrees removed.**
+★★★ **THE OPERATOR'S 2026-09-14 RULING, SATISFIED FOR THE FIRST TIME: `{Debug, Release} × FOUR
+LEGS` — EIGHT RUNS.** ✔All taken at `bead9f69`, every one `inputs: held still`.
 
-| leg | result |
+| leg | Debug | Release |
+|---|---|---|
+| Windows | **2179/2179** | **2179/2179** (MSVC — the CI configuration) |
+| WSL x86_64 | **2178/2178** + arm-ledger `6 verified (6 ran), 0 poisoned` | **2178/2178** |
+| macOS arm64 | **2148/2148** | **2148/2148** |
+| arm64 VPS | **2148/2148** | **2148/2148** |
+
+⚠ `run-gate.sh` REFUSES a parallel `ctest` from Git Bash (rc 4, NOT a verdict) — measured in P64 to
+die at 8, 83, 271 and 612 of 2131 under MSYS with zero tests reporting failure. **Use the `.ps1`
+twin on Windows.**
+
+### sqlite `veryquick`, ALL FOUR HOSTS, **0 POISONED ON EVERY ONE**
+
+Upstream `7936c5107f`. ★ It read **0 verified / 5 POISONED** at the start of this exit — the corpus
+did not build at all — so every leg building is new this cycle.
+
+| host | verdict |
 |---|---|
-| Windows (`build/dbg`, `-j 6`) | ✔**2179/2179 rc 0** on HEAD, `inputs: held still`, `compilers: none outside this gate's own process tree`, all 31 repo guards |
-| WSL x86_64 | ✔**2178/2178 rc 0** on HEAD, `inputs: held still`, + arm-ledger witness `6 verified (6 ran), 0 poisoned` |
-| macOS arm64 | ⛔ **ABORTED mid-ctest on HEAD.** Last completed run was **2148/2148 rc 0 at `f7c0e631`**, one commit back — and that commit differs from HEAD by HARNESS FILES ONLY, no `src/` |
-| arm64 VPS | ⛔ **ABORTED mid-ctest on HEAD.** Last completed run was **2148/2148 rc 0 at `f7c0e631`**, same caveat |
+| Windows | **GREEN, exit 0** — 3 verified, 2 structural skips |
+| WSL x86_64 | **rc 0** — 3 verified, 2 structural skips; pe64 carries `[NOT FULL COVERAGE: 3 unit group(s) NOT REACHED]` |
+| macOS arm64 | **rc 0** — both Mach-O legs GREEN, `confound rows ACTIVE (5 of 5)` |
+| arm64 VPS | **GREEN** — 2 verified, 3 structural skips |
 
-⚠ **DO NOT REPORT THIS CYCLE AS FOUR-LEG GREEN.** Two legs are green on HEAD and two on its parent.
-The parent-to-HEAD diff is `real-examples/c/sqlite/**` plus two registry files and touches no `src/`,
-so the COMPILER is byte-identical — but *"the compiler did not change"* is an inference, and this
-project's own rule is that a green is a claim about the tree the instrument actually looked at.
-**Re-run them.**
+### `benchmark-speedtest1` — ONE leg, by operator decision
 
-⚠ **`run-gate.sh` REFUSES a parallel `ctest` from Git Bash (rc 4, which is NOT a verdict)** —
-✔measured in P64: the run dies at 8, 83, 271 and 612 of 2131 under MSYS with ZERO tests reporting
-failure. Use the `.ps1` twin on Windows.
+Windows only, 2026-09-14 (*"just 1 leg is good for now"*). Figures in §0.5. ⚠ The three POSIX hosts
+were launched and **refused at preflight**, loudly and correctly: each wants a `build/bench-rel` tree
+it does not have. ⓘ The README's four-host table is stamped **2026-08-28** and was deliberately left
+alone — mixing one fresh host into a four-host claim would falsify the sentence above it.
 
-### The sqlite matrix — what is known, and from WHERE
+### ⚠ CI — read it, never trigger it
 
-✔**MEASURED by lane `cc` in its own worktree, at HEAD's content:**
-
-```
-legs : 3 verified (3 ran, 0 expect-error), 2 skipped [structural: 2 by-runOn], 0 poisoned (of 5)
-elf64-x86_64  units: PASS (8 errors out of 394809 tests; 8 known confounds)
-elf64-arm64   units: PASS (6 errors out of 394813 tests; 6 known confounds)
-pe64-x86_64   units: PASS (3 errors out of 394466 tests; 3 known confounds)
-[OK] sqlite harness GREEN — EXIT CODE 0
-```
-
-⚠⚠ **THAT RUN WAS TAKEN IN A LANE WORKTREE, NOT THE MAIN TREE, AND ONLY ON THE WINDOWS HOST.** It is
-strong evidence and it is NOT step 3. **The matrix owed by §0.0 is four hosts from the main tree.**
-★ For scale, the same matrix read **0 verified, 0 skipped, 5 POISONED of 5** at the start of this
-exit — the corpus did not build at all on any leg — so every leg building is new this cycle.
+At `f0a52d3a` the `windows-msvc-release` leg was RED on `run_gate_guard`; `bead9f69` carries the fix
+and **both formerly-red tests pass locally in the MSVC Release configuration CI runs**
+(`build/ninja-deps-freshness` 0.22 s, `run_gate_guard` 133.47 s). **That is evidence, not proof** —
+the CI runner is ~3× slower and the original failure was speed-dependent, though the fix removed the
+timing dependence rather than tuning around it. ⛔ **Only the operator enables `Run Pipes`.** Never
+label, re-run or push to re-trigger CI.
 
 ---
 
