@@ -407,6 +407,12 @@ $script:RunGateUnreadable     = 0
 $script:RunGateTableOk        = $false
 $script:RunGateRelativeMatch  = $false
 $script:RunGateContentionNote = ''
+# The two samples of the machine-wide subject, kept whole. See the block above
+# Save-RunGateContentionSample, and its twin above run_gate_sample_contention.
+$script:RunGateForeignBefore  = @()
+$script:RunGateForeignAfter   = @()
+$script:RunGateTableOkBefore  = $false
+$script:RunGateTableOkAfter   = $false
 
 function Test-RunGateIsWindows {
     if (Test-Path variable:IsWindows) { return [bool]$IsWindows }
@@ -563,7 +569,6 @@ function Get-RunGateContention {
     $script:RunGateTableOk       = $false
     $script:RunGateRelativeMatch = $false
     $script:RunGateForeign       = @()
-    $script:RunGateForeignCount  = 0
     # [!] NO EARLY RETURN ON AN UNNAMED BUILD DIRECTORY. This function answers
     # TWO questions and only the first has the build directory as its subject.
     $table = Get-RunGateProcessTable
@@ -617,8 +622,14 @@ function Get-RunGateContention {
             $d++
         }
         if ($ours) { continue }
-        $script:RunGateForeignCount++
-        $script:RunGateForeign += "          $($r.ProcId)`t$($script:RunGateCompilerImage)`t$($r.CmdLine)"
+        # [!] STRUCTURED, not a pre-formatted line: the union below folds the two
+        # samples BY PID, so the pid has to survive as a field. The twin's rows
+        # are TAB-separated for the same reason.
+        $script:RunGateForeign += [PSCustomObject]@{
+            ProcId  = $r.ProcId
+            Image   = $script:RunGateCompilerImage
+            CmdLine = $r.CmdLine
+        }
     }
 
     if (-not $script:RunGateBuildDir) { return }
@@ -638,6 +649,76 @@ function Get-RunGateContention {
             $script:RunGateContenders += "      pid $($r.ProcId)  $img  named it as '$raw'"
             $script:RunGateContenders += "        $($r.CmdLine)"
         }
+    }
+}
+
+# ★★★ THE MACHINE-WIDE SUBJECT IS SAMPLED TWICE, AND THE LINE REPORTS BOTH.
+# D-SCRIPT-RUN-GATE-COMPILERS-LINE-REPORTS-NONE-WHEN-IT-COULD-NOT-READ-THE-PROCESS-TABLE
+#
+# [!] THE FIRST SAMPLE USED TO BE THROWN AWAY. The scan runs before the command
+# and again after it; the second call overwrote the foreign list, so a compiler
+# this gate HAD SEEN at the start and that exited before the end was reported as
+# `compilers: none`. => *I saw one during this run* rendered as *the machine was
+# clean* - the same sentence this subject exists to be unable to say wrongly.
+#
+# ★ AND THE DISCARDED CASE IS THE WORST ONE THIS LINE HAS.
+# D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT is
+# exactly a second `dsscp` that ran DURING a gate, deleted a cache entry the run
+# had been handed the path to, and EXITED.
+#
+# +MEASURED 2026-09-14: a stub planted before the gate and outlived by it (gate
+# 13.74 s against an 8 s stub) produced `compilers: none` from a host whose
+# process table reads FINE.
+#
+# ★ That is also what the CI `windows-msvc-release` leg was printing - MEASURED
+# from its own log, where the arm next door printed `compilers: none outside`, a
+# sentence unreachable without a table. (i) INFERRED (that host cannot be logged
+# into): it hit the .sh twin and not this one because the .sh twin SPAWNS
+# `powershell` twice while this one calls Get-CimInstance IN-PROCESS - 3.58 s
+# against 2.29 s per gate, on a leg that runs 2.3x slower. A wall-clock
+# asymmetry between the twins, read for a cycle as a capability difference.
+#
+# (i) BOTH SAMPLES ARE KEPT WHOLE rather than accumulated in place, because the
+# report needs to say WHICH sample saw each process: *alongside you the whole
+# time* and *ran while you worked and exited* are different facts about your
+# verdict.
+function Save-RunGateContentionSample([string]$When) {
+    Get-RunGateContention
+    # [!] The recording lives HERE and not at the end of the scan: that function
+    # has three early returns, and a capture written after them would silently
+    # skip exactly the samples whose answer this line is about.
+    if ($When -eq 'before') {
+        $script:RunGateForeignBefore = $script:RunGateForeign
+        $script:RunGateTableOkBefore = $script:RunGateTableOk
+    } else {
+        $script:RunGateForeignAfter = $script:RunGateForeign
+        $script:RunGateTableOkAfter = $script:RunGateTableOk
+    }
+}
+
+# The union of the two samples, one entry per pid, carrying WHEN it was seen.
+# Twin of run_gate_foreign_union.
+function Get-RunGateForeignUnion {
+    $seen  = @{}
+    $order = @()
+    $rows  = @{}
+    $samples = @(
+        @{ Tag = 'B'; Rows = $script:RunGateForeignBefore },
+        @{ Tag = 'A'; Rows = $script:RunGateForeignAfter }
+    )
+    foreach ($sample in $samples) {
+        foreach ($r in @($sample.Rows)) {
+            if (-not $r) { continue }
+            if (-not $rows.ContainsKey($r.ProcId)) { $order += $r.ProcId; $rows[$r.ProcId] = $r }
+            $seen[$r.ProcId] = [string]$seen[$r.ProcId] + $sample.Tag
+        }
+    }
+    foreach ($p in $order) {
+        $sawIn = [string]$seen[$p]
+        $when = if ($sawIn.Contains('B') -and $sawIn.Contains('A')) { 'throughout this run' }
+                elseif ($sawIn.Contains('B'))                       { 'when this run STARTED' }
+                else                                                { 'when this run ENDED' }
+        [PSCustomObject]@{ ProcId = $p; Image = $rows[$p].Image; When = $when; CmdLine = $rows[$p].CmdLine }
     }
 }
 
@@ -788,7 +869,7 @@ if ($__rawBuildDir) {
     $script:RunGateBuildDir    = Get-RunGateNormDir $script:RunGateAbsBuildDir
 }
 Set-RunGateInputRoots
-Get-RunGateContention
+Save-RunGateContentionSample 'before'
 if ($script:RunGateContenders.Count -gt 0) {
     Add-Content -LiteralPath $LogPath -Value @"
 --- run-gate.ps1 ---
@@ -969,7 +1050,7 @@ Remove-Item -LiteralPath $script:RunGateInputsBefore -Force -ErrorAction Silentl
 Remove-Item -LiteralPath $script:RunGateInputsAfter -Force -ErrorAction SilentlyContinue
 
 # ---- POST-RUN: a sibling can start MID-RUN, so the same question is asked again
-Get-RunGateContention
+Save-RunGateContentionSample 'after'
 
 Add-Content -LiteralPath $LogPath -Value @"
 --- run-gate.ps1 ---
@@ -991,6 +1072,10 @@ if (-not $snapshotOk) {
 Add-Content -LiteralPath $LogPath -Value "srctree : $($script:RunGateSourceTree)"
 Add-Content -LiteralPath $LogPath -Value "          decided by: $($script:RunGateSourceTreeWhy)"
 foreach ($r in (Get-RunGateAbsInputRoots)) { Add-Content -LiteralPath $LogPath -Value "watched : $r" }
+# HOW MANY OF THE RUN'S TWO SAMPLES ACTUALLY READ A PROCESS TABLE. Both lines
+# below are claims about a scan, and neither may assert more than the scans it
+# got - computed once so the two cannot answer differently.
+$samplesRead = [int]$script:RunGateTableOkBefore + [int]$script:RunGateTableOkAfter
 if (-not $script:RunGateBuildDir) {
     Add-Content -LiteralPath $LogPath -Value "builddir: none named by this command - the contention check had no subject"
 } else {
@@ -998,16 +1083,27 @@ if (-not $script:RunGateBuildDir) {
     if ($script:RunGateContenders.Count -gt 0) {
         Add-Content -LiteralPath $LogPath -Value "contended: YES, ANOTHER RUN WAS LIVE IN IT - this verdict is not evidence"
         foreach ($l in $script:RunGateContenders) { Add-Content -LiteralPath $LogPath -Value $l }
-    } elseif ($script:RunGateTableOk) {
+    } elseif ($samplesRead -eq 0) {
+        Add-Content -LiteralPath $LogPath -Value "contended: UNKNOWN - no process table could be read on this host (0 of this run's 2 samples), so nothing was ruled out"
+    } else {
         # [!] THE WORDING IS NARROWED, AND THE OLD ONE WAS NOT WRONG - IT WAS
         # OVER-READ, WHICH IS WORSE. It said "this run was alone in it", and
         # "it" is the BUILD DIRECTORY, which was true of the run that took two
         # false reds from a second compiler. A line that is true and invites the
         # wrong conclusion costs more than one that is false, because nobody
         # re-checks it.
-        Add-Content -LiteralPath $LogPath -Value "contended: no - no other build-tool run named THIS BUILD DIRECTORY ($($script:RunGateUnreadable) candidate process(es) had no readable command line and could not be judged). [!] This says NOTHING about the rest of the machine; see 'compilers:' below."
-    } else {
-        Add-Content -LiteralPath $LogPath -Value "contended: UNKNOWN - no process table could be read on this host, so nothing was ruled out"
+        #
+        # [!] AND IT COUNTS ITS SAMPLES FOR THE SAME REASON THE `compilers:`
+        # LINE BELOW DOES. This used to read the LAST scan's table flag alone,
+        # so a run whose pre-run scan could not look - the scan whose whole job
+        # is to refuse BEFORE anything executes - still printed a flat
+        # `contended: no`. That is this row's defect one line up.
+        # D-SCRIPT-RUN-GATE-COMPILERS-LINE-REPORTS-NONE-WHEN-IT-COULD-NOT-READ-THE-PROCESS-TABLE
+        if ($samplesRead -lt 2) {
+            Add-Content -LiteralPath $LogPath -Value "contended: no - no other build-tool run named THIS BUILD DIRECTORY ($($script:RunGateUnreadable) candidate process(es) had no readable command line and could not be judged), but only $samplesRead of this run's 2 samples could read a process table at all, so the other one ruled nothing out. [!] This says NOTHING about the rest of the machine; see 'compilers:' below."
+        } else {
+            Add-Content -LiteralPath $LogPath -Value "contended: no - no other build-tool run named THIS BUILD DIRECTORY ($($script:RunGateUnreadable) candidate process(es) had no readable command line and could not be judged). [!] This says NOTHING about the rest of the machine; see 'compilers:' below."
+        }
     }
 }
 # ★★★ THE MACHINE-WIDE SUBJECT, ON EVERY RUN, GREEN OR NOT, AND WITH OR WITHOUT
@@ -1022,13 +1118,28 @@ if (-not $script:RunGateBuildDir) {
 # under us), and refusing on it would refuse EVERY gate of a project whose own
 # working rule is up to four lanes building in parallel - a refusal that fires
 # on every honest run, which is exactly as useless as an escape that does.
-if (-not $script:RunGateTableOk) {
-    Add-Content -LiteralPath $LogPath -Value "compilers: UNKNOWN - no process table could be read on this host"
-} elseif ($script:RunGateForeignCount -eq 0) {
-    Add-Content -LiteralPath $LogPath -Value "compilers: none outside this gate's own process tree"
+#
+# ★★★ THREE STATES, AND THE THIRD IS NOT SPELLED AS A PASS. `none` and
+# `UNKNOWN` are different answers and the second is not an answer at all: a
+# reader skimming for `compilers: none` must MISS the blind case, and a reader
+# skimming for `compilers:` must land on something that says so. The sample
+# count is printed with every one of them, because "I looked twice" and "I
+# looked once and could not look the second time" are not the same evidence.
+$union = @(Get-RunGateForeignUnion)
+if ($samplesRead -eq 0) {
+    Add-Content -LiteralPath $LogPath -Value "compilers: UNKNOWN - NO PROCESS TABLE COULD BE READ on this host (0 of this run's 2 samples), so no other compiler was ruled out"
+} elseif ($union.Count -eq 0) {
+    if ($samplesRead -lt 2) {
+        Add-Content -LiteralPath $LogPath -Value "compilers: none outside this gate's own process tree - but only $samplesRead of this run's 2 samples could read a process table, so the other one ruled nothing out"
+    } else {
+        Add-Content -LiteralPath $LogPath -Value "compilers: none outside this gate's own process tree, in either of this run's 2 samples"
+    }
 } else {
-    Add-Content -LiteralPath $LogPath -Value "compilers: $($script:RunGateForeignCount) live '$($script:RunGateCompilerImage)' process(es) OUTSIDE this gate's process tree - they share this user's compiler caches with this run, which are NOT under srctree or builddir"
-    foreach ($l in $script:RunGateForeign) { Add-Content -LiteralPath $LogPath -Value $l }
+    Add-Content -LiteralPath $LogPath -Value "compilers: $($union.Count) '$($script:RunGateCompilerImage)' process(es) ran OUTSIDE this gate's process tree DURING this run - they share this user's compiler caches with this run, which are NOT under srctree or builddir"
+    foreach ($u in $union) {
+        Add-Content -LiteralPath $LogPath -Value "          pid $($u.ProcId)  $($u.Image)  seen $($u.When)"
+        Add-Content -LiteralPath $LogPath -Value "            $($u.CmdLine)"
+    }
 }
 
 # Checked BEFORE rc, and before the witness: a run whose inputs moved has no

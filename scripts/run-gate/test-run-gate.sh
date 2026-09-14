@@ -441,6 +441,62 @@ says a1.log 'builddir: none named by this command' --log
 says a1.log "srctree : $SANDBOX_SPELT" --log
 says a1.log "watched : $SANDBOX_SPELT/examples" --log
 
+# ---- ARM 0c THE HOST'S THIRD STATE, MEASURED RATHER THAN LOOKED UP ----------
+#
+# ★★★ WHICH `compilers:` ANSWER IS CORRECT IS A PROPERTY OF THE HOST.
+# [[D-SCRIPT-RUN-GATE-COMPILERS-LINE-REPORTS-NONE-WHEN-IT-COULD-NOT-READ-THE-PROCESS-TABLE]]
+# On a host that can enumerate processes, the compiler arms below demand the
+# stand-in be NAMED. On one that cannot, NO correct implementation can name it
+# and the only honest answer is `UNKNOWN`; arm 24 as first written demanded the
+# name unconditionally and was therefore UNSATISFIABLE on such a host.
+#
+# ⚠ THE BRANCH IS NOT AN ESCAPE, AND THE TEST OF THAT IS WHETHER THE DEFECT
+# COULD PASS EITHER SIDE. `compilers: none` with a live foreign compiler is
+# refused on BOTH sides, so neither branch is satisfiable by the thing this
+# subject is about. [[feedback-an-escape-every-row-triggers-disarms-the-guard]]
+#
+# ⓘ READ OUT OF `a1.log` — the control arm's own log, already written — rather
+# than from a `command -v powershell` here. A second implementation of the
+# subject's own lookup could disagree with the subject's, and a fixture that
+# branches on its own opinion of the host instead of the host's answer is this
+# very row's defect, re-introduced in the instrument that is supposed to catch it.
+TABLE_STATE=""
+if   logtext "$SCRATCH/a1.log" | grep -qF 'compilers: UNKNOWN'; then TABLE_STATE=blind
+elif logtext "$SCRATCH/a1.log" | grep -qF 'compilers:';         then TABLE_STATE=readable
+fi
+ran
+if [ -n "$TABLE_STATE" ]; then
+    echo "  [ok  ] 0-probe-table-state   this host's run-gate reports its process table as $TABLE_STATE (MEASURED from a1.log, not looked up)"
+else
+    echo "  [FAIL] 0-probe-table-state   a1.log carries NO 'compilers:' line at all, so every compiler arm below has no host state to branch on"
+    fails=$((fails + 1))
+fi
+
+# An INDEPENDENT reading of whether the stand-in is on this machine. ⚠ Used only
+# to DIAGNOSE a failure, never to excuse one: a precondition measured with the
+# instrument under test proves nothing, and an arm that skips itself when its
+# own subject looks absent is the vacuous skip this file exists to refuse.
+stub_live_count() {
+    if run_gate_host_is_windows; then ps -W 2>/dev/null | grep -c 'dsscp' || true
+    else                              ps -A 2>/dev/null | grep -c 'dsscp' || true
+    fi
+}
+
+# The compiler arms' shared assertion set, so the two twins and the two
+# subjects cannot drift into demanding different things of the same line.
+# ⚠ `compilers: none` is refused FIRST and on every host — that is the
+# invariant; everything after it is what the host makes checkable.
+says_named_or_unknown() {  # <log-basename> [when-phrase]
+    says_not "$1" 'compilers: none' --log
+    if [ "$TABLE_STATE" = readable ]; then
+        says "$1" "OUTSIDE this gate's process tree" --log
+        says "$1" 'dsscp' --log
+        if [ -n "${2:-}" ]; then says "$1" "$2" --log; fi
+    else
+        says "$1" 'compilers: UNKNOWN' --log
+    fi
+}
+
 # ---- ARM 2 (sh) THE DEFECT: an input root is edited DURING the run ----------
 rm -f "$PROBE_REL"
 arm 2-sh-moved 3 bash "$GATE_SH" "$SCRATCH/a2.log" 'HELLO' \
@@ -804,20 +860,56 @@ if [ -n "$STUB" ]; then
 
     # ---- ARM 24 (sh) THE DEFECT: A COMPILER OUTSIDE THIS GATE'S TREE --------
     plant_foreign_compiler 12
+    a24_live_before=$(stub_live_count)
     arm 24-sh-foreign-compiler 0 bash "$GATE_SH" "$SCRATCH/a24.log" 'HELLO' \
         bash -c 'echo HELLO'
+    a24_live_after=$(stub_live_count)
     says 24-sh-foreign-compiler 'run-gate.sh: OK'
-    says_not a24.log 'compilers: none' --log
-    says a24.log "OUTSIDE this gate's process tree" --log
-    says a24.log 'dsscp' --log
+    says_named_or_unknown a24.log
     # ⚠ AND IT MUST NOT HAVE BECOME A REFUSAL. The line is an OBSERVATION: the
     # mechanism that made a second compiler destroy a verdict is gone, and
     # refusing here would refuse every gate of a project that runs four lanes in
     # parallel by design. rc 0 above is that claim; this is it said out loud.
     says_not 24-sh-foreign-compiler 'FAIL'
+
+    # ---- ARM 28 (sh) THE COMPILER THAT EXITS *DURING* THE RUN ---------------
+    #
+    # ★★★ THIS IS THE ARM THAT WOULD HAVE CAUGHT THE CI FAILURE LOCALLY, and
+    # the red-on-disable half of the union:
+    # [[D-SCRIPT-RUN-GATE-COMPILERS-LINE-REPORTS-NONE-WHEN-IT-COULD-NOT-READ-THE-PROCESS-TABLE]]
+    #
+    # ⚠ ARM 24 ALONE IS SATISFIED BY A SUBJECT THAT ONLY EVER READS ITS LAST
+    # SAMPLE, and it is ALSO satisfied by a gate that simply finished before its
+    # stand-in did. The arm was measuring the GATE'S WALL CLOCK.
+    # ✔MEASURED 2026-09-14 on this host with the subject unmodified: a 13.74 s
+    # gate against an 8 s stand-in printed `compilers: none` with all three of
+    # arm 24's assertions red and `27-parity .sh reported=0 .ps1 reported=1` —
+    # the `windows-msvc-release` signature exactly, from a healthy subject.
+    # ⓘ INFERRED, not measured, for the CI host itself, which cannot be logged
+    # into: the `.sh` gate costs 3.58 s here against the `.ps1` twin's 2.29 s
+    # because it SPAWNS `powershell` twice where the twin calls Get-CimInstance
+    # in-process, and that leg runs this fixture 2.3x slower (253–259 s vs
+    # 109.4 s). What IS measured there is that the twin READ the table: arm 23's
+    # `compilers: none outside` cannot be printed otherwise.
+    #
+    # ⇒ HERE THE STAND-IN IS *DELIBERATELY* OUTLIVED: 3 s against a command that
+    # sleeps 5. It is alive for the pre-run sample and certainly gone for the
+    # post-run one, so only a subject that reports the UNION of both samples can
+    # pass — and a compiler that ran during the gate and exited is the exact
+    # shape of [[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]],
+    # the defect this whole line was added for.
+    plant_foreign_compiler 3
+    arm 28-sh-compiler-exits-midrun 0 bash "$GATE_SH" "$SCRATCH/a28.log" 'HELLO' \
+        bash -c 'sleep 5; echo HELLO'
+    says 28-sh-compiler-exits-midrun 'run-gate.sh: OK'
+    says_named_or_unknown a28.log 'seen when this run STARTED'
+    says_not 28-sh-compiler-exits-midrun 'FAIL'
 else
-    na 23-sh-descendant-compiler "$STUB_ABSENT_WHY"
-    na 24-sh-foreign-compiler    "$STUB_ABSENT_WHY"
+    na 23-sh-descendant-compiler     "$STUB_ABSENT_WHY"
+    na 24-sh-foreign-compiler        "$STUB_ABSENT_WHY"
+    na 28-sh-compiler-exits-midrun   "$STUB_ABSENT_WHY"
+    a24_live_before=0
+    a24_live_after=0
 fi
 
 if [ -n "$PS_EXE" ] && [ -n "$STUB" ]; then
@@ -827,8 +919,7 @@ if [ -n "$PS_EXE" ] && [ -n "$STUB" ]; then
         -File "$GATE_PS1" "$SCRATCH/a25.log" 'HELLO' \
         "$PS_EXE" -NoProfile -Command "Write-Output HELLO"
     says 25-ps1-foreign-compiler 'run-gate.ps1: OK'
-    says_not a25.log 'compilers: none' --log
-    says a25.log "OUTSIDE this gate's process tree" --log
+    says_named_or_unknown a25.log
 
     # ---- ARM 26 (ps1) THE CONTROL, i.e. THE ESCAPE IS DIRECTIONAL ----------
     # ⚠ WITHOUT THIS THE TWIN COULD SIMPLY ALWAYS REPORT. Arm 25 alone is
@@ -852,16 +943,61 @@ if [ -n "$PS_EXE" ] && [ -n "$STUB" ]; then
         echo "  [ok  ] 27-parity  both twins REPORTED a foreign compiler and both still exited 0"
     else
         echo "  [FAIL] 27-parity  .sh reported=$sh_saw rc=$sh_rc, .ps1 reported=$ps_saw rc=$ps_rc (both must report, both must exit 0)"
+        # ★ THE DIAGNOSIS THE CI FAILURE DID NOT CARRY. These four lines alone
+        # were read for a whole cycle as "the .sh twin cannot see the process
+        # table", and the SAME four lines are produced by a stand-in that simply
+        # died before the twin's slower second scan — ✔MEASURED, on a subject
+        # with nothing wrong with it. The reading below separates the two, it is
+        # taken with a DIFFERENT instrument from the subject's, and it only ever
+        # explains a failure — it never excuses one.
+        echo "         stand-in live count around arm 24: before=$a24_live_before after=$a24_live_after"
+        echo "         (before>0 and after=0 means the GATE OUTLIVED THE STAND-IN, so the"
+        echo "          subject's two samples disagreed; that is a union defect in run-gate,"
+        echo "          not a blindness one. before=0 means the stand-in never started.)"
+        fails=$((fails + 1))
+    fi
+
+    # ---- ARM 29 (ps1) THE COMPILER THAT EXITS *DURING* THE RUN -------------
+    # The twin of arm 28. ⚠ A capability in one twin and not the other is this
+    # project's canonical silent harness bug, and the union is a capability.
+    plant_foreign_compiler 3
+    arm 29-ps1-compiler-exits-midrun 0 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+        -File "$GATE_PS1" "$SCRATCH/a29.log" 'HELLO' \
+        "$PS_EXE" -NoProfile -Command "Start-Sleep -Seconds 5; Write-Output HELLO"
+    says 29-ps1-compiler-exits-midrun 'run-gate.ps1: OK'
+    says_named_or_unknown a29.log 'seen when this run STARTED'
+
+    # ---- ARM 30 TWIN PARITY ON THE UNION -----------------------------------
+    # ⚠ ARM 27 CANNOT COVER THIS. It compares the twins on a compiler that was
+    # alive for BOTH samples, which a last-sample-wins subject also reports. The
+    # parity that broke on CI is the one over a compiler alive for only ONE.
+    ran
+    sh_u=$(logtext "$SCRATCH/a28.log" | grep -c "OUTSIDE this gate's process tree" || true)
+    ps_u=$(logtext "$SCRATCH/a29.log" | grep -c "OUTSIDE this gate's process tree" || true)
+    sh_urc=$(cat "$SCRATCH/28-sh-compiler-exits-midrun.rc")
+    ps_urc=$(cat "$SCRATCH/29-ps1-compiler-exits-midrun.rc")
+    if [ "$TABLE_STATE" = blind ]; then
+        sh_u=$(logtext "$SCRATCH/a28.log" | grep -c 'compilers: UNKNOWN' || true)
+        ps_u=$(logtext "$SCRATCH/a29.log" | grep -c 'compilers: UNKNOWN' || true)
+    fi
+    if [ "$sh_u" -ge 1 ] && [ "$ps_u" -ge 1 ] && [ "$sh_urc" = "0" ] && [ "$ps_urc" = "0" ]; then
+        echo "  [ok  ] 30-parity-union  both twins reported the SAME state ($TABLE_STATE) for a compiler that exited mid-run, and both still exited 0"
+    else
+        echo "  [FAIL] 30-parity-union  host=$TABLE_STATE .sh reported=$sh_u rc=$sh_urc, .ps1 reported=$ps_u rc=$ps_urc (both must report the same state, both must exit 0)"
         fails=$((fails + 1))
     fi
 elif [ -z "$STUB" ]; then
-    na 25-ps1-foreign-compiler "$STUB_ABSENT_WHY"
-    na 26-ps1-no-compiler      "$STUB_ABSENT_WHY"
-    na 27-parity               "$STUB_ABSENT_WHY -- the twins were NOT compared on the fifth subject"
+    na 25-ps1-foreign-compiler       "$STUB_ABSENT_WHY"
+    na 26-ps1-no-compiler            "$STUB_ABSENT_WHY"
+    na 27-parity                     "$STUB_ABSENT_WHY -- the twins were NOT compared on the fifth subject"
+    na 29-ps1-compiler-exits-midrun  "$STUB_ABSENT_WHY"
+    na 30-parity-union               "$STUB_ABSENT_WHY -- the twins were NOT compared on the two-sample union"
 else
-    na 25-ps1-foreign-compiler "$PS_ABSENT_WHY -- the .ps1 twin was never shown a foreign compiler"
-    na 26-ps1-no-compiler      "$PS_ABSENT_WHY -- the .ps1 twin's no-compiler CONTROL was not taken"
-    na 27-parity               "$PS_ABSENT_WHY -- arms 23 and 24 still prove the .sh twin, but the twins were NOT compared"
+    na 25-ps1-foreign-compiler       "$PS_ABSENT_WHY -- the .ps1 twin was never shown a foreign compiler"
+    na 26-ps1-no-compiler            "$PS_ABSENT_WHY -- the .ps1 twin's no-compiler CONTROL was not taken"
+    na 27-parity                     "$PS_ABSENT_WHY -- arms 23 and 24 still prove the .sh twin, but the twins were NOT compared"
+    na 29-ps1-compiler-exits-midrun  "$PS_ABSENT_WHY -- the .ps1 twin was never shown a compiler that exits mid-run"
+    na 30-parity-union               "$PS_ABSENT_WHY -- arm 28 still proves the .sh twin's union, but the twins were NOT compared on it"
 fi
 
 # ---- WHAT THIS RUN ACTUALLY PROVED -----------------------------------------

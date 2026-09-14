@@ -756,10 +756,10 @@ run_gate_foreign_from_table() {   # <own-pid-list>
 # The refusal text, shared by the pre-run and post-run arms so the two cannot
 # drift into describing the same fact differently.
 run_gate_contenders="" ; run_gate_unreadable=0 ; run_gate_table_ok=0 ; run_gate_relative_match=0
-run_gate_foreign="" ; run_gate_foreign_count=0
+run_gate_foreign=""
 run_gate_scan_contention() {   # sets run_gate_contenders / run_gate_unreadable / run_gate_table_ok / run_gate_foreign
     run_gate_contenders=""; run_gate_unreadable=0; run_gate_table_ok=0; run_gate_relative_match=0
-    run_gate_foreign=""; run_gate_foreign_count=0
+    run_gate_foreign=""
     # ⚠ NO EARLY RETURN ON AN UNNAMED BUILD DIRECTORY ANY MORE. This function
     # now answers TWO questions, and only the first one has the build directory
     # as its subject; `run-gate.sh <log> <witness> bash -c …` names no build
@@ -809,9 +809,6 @@ run_gate_scan_contention() {   # sets run_gate_contenders / run_gate_unreadable 
     # THE MACHINE-WIDE SUBJECT. Asked whether or not a build directory was
     # named, and never fatal — see the footer for why.
     run_gate_foreign="$(printf '%s\n' "$_rg_tbl" | run_gate_foreign_from_table "$_rg_own")"
-    if [ -n "$run_gate_foreign" ]; then
-        run_gate_foreign_count="$(printf '%s\n' "$run_gate_foreign" | grep -c . || true)"
-    fi
 
     [ -n "$run_gate_build_dir" ] || return 0
 
@@ -834,6 +831,91 @@ run_gate_scan_contention() {   # sets run_gate_contenders / run_gate_unreadable 
     done <<EOF
 $_rg_cands
 EOF
+}
+
+# ★★★ THE MACHINE-WIDE SUBJECT IS SAMPLED TWICE, AND THE LINE REPORTS BOTH.
+# [[D-SCRIPT-RUN-GATE-COMPILERS-LINE-REPORTS-NONE-WHEN-IT-COULD-NOT-READ-THE-PROCESS-TABLE]]
+#
+# ⚠ THE FIRST SAMPLE USED TO BE THROWN AWAY. The scan runs before the command
+# and again after it; the second call overwrote `run_gate_foreign`, so a
+# compiler this gate HAD SEEN at the start and that exited before the end was
+# reported as `compilers: none`. ⇒ *I saw one during this run* rendered as *the
+# machine was clean* — the same sentence this whole subject exists to be unable
+# to say wrongly, one door over from the blind case below.
+#
+# ★ AND THE DISCARDED CASE IS THE WORST ONE THIS LINE HAS.
+# [[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]] is
+# exactly a second `dsscp` that ran DURING a gate, deleted a cache entry the run
+# had been handed the path to, and EXITED. A last-sample-wins rule cannot report
+# the one shape the line was added for.
+#
+# ✔MEASURED 2026-09-14 on this Windows host, subject unmodified, a stub planted
+# before the gate and outlived by it: gate wall clock 13.74 s against an 8 s
+# stub -> alive at the pre-run scan, gone at the post-run scan ->
+# `compilers: none outside this gate's own process tree`. The control with a
+# 40 s stub named the process.
+#
+# ★ THAT IS ALSO WHAT THE CI `windows-msvc-release` LEG WAS PRINTING, ON A HOST
+# WHOSE PROCESS TABLE READS FINE — ✔MEASURED from its own log, where the arm
+# next door printed `compilers: none outside`, a sentence unreachable without a
+# table. ⓘ INFERRED (that host cannot be logged into): the `.sh` twin SPAWNS
+# `powershell` twice, ~1.0 s each here, while the `.ps1` twin calls
+# `Get-CimInstance` IN-PROCESS and pays that zero times — 3.58 s against 2.29 s
+# per gate here, on a leg that runs 2.3x slower. A wall-clock asymmetry between
+# the twins, read for a cycle as a capability difference.
+#
+# ⓘ BOTH SAMPLES ARE KEPT WHOLE rather than accumulated in place, because the
+# report needs to say WHICH sample saw each process: *alongside you the whole
+# time* and *ran while you worked and exited* are different facts about your
+# verdict, and collapsing them loses the one that explains a mid-run red.
+run_gate_foreign_before="" ; run_gate_table_ok_before=0
+run_gate_foreign_after=""  ; run_gate_table_ok_after=0
+run_gate_sample_contention() {   # <before|after> — scan, then RECORD that sample
+    run_gate_scan_contention
+    # ⚠ The recording lives HERE and not at the end of the scan: that function
+    # has three early returns (no table, empty table, no build directory), and a
+    # capture written after them would silently skip exactly the samples whose
+    # answer this line is about.
+    if [ "$1" = before ]; then
+        run_gate_foreign_before="$run_gate_foreign"
+        run_gate_table_ok_before="$run_gate_table_ok"
+    else
+        run_gate_foreign_after="$run_gate_foreign"
+        run_gate_table_ok_after="$run_gate_table_ok"
+    fi
+}
+
+# The union of the two samples, one row per pid:
+#   pid <TAB> image <TAB> when-it-was-seen <TAB> command-line
+# ⓘ awk does the folding rather than a shell loop, and it also writes the sample
+# tag as a LEADING column so nothing has to be escaped. `sed` is deliberately
+# NOT used to write that column — BSD sed does not honour `\t` in a replacement,
+# so on the darwin carriage the tag and the pid would arrive FUSED into one
+# field and every row would fold under its own key.
+run_gate_tag_foreign_rows() {   # <tag> — stdin: pid <TAB> image <TAB> cmdline
+    awk -F'\t' -v tag="$1" '$1 != "" { print tag "\t" $0 }'
+}
+run_gate_foreign_union() {
+    {
+        [ -n "$run_gate_foreign_before" ] && printf '%s\n' "$run_gate_foreign_before" | run_gate_tag_foreign_rows B
+        [ -n "$run_gate_foreign_after"  ] && printf '%s\n' "$run_gate_foreign_after"  | run_gate_tag_foreign_rows A
+        :
+    } | awk -F'\t' '
+        {
+            pid = $2
+            if (pid == "") next
+            if (!(pid in seen)) { order[++k] = pid; img[pid] = $3; cl[pid] = $4 }
+            seen[pid] = seen[pid] $1
+        }
+        END {
+            for (i = 1; i <= k; i++) {
+                p = order[i]
+                if (index(seen[p], "B") && index(seen[p], "A")) w = "throughout this run"
+                else if (index(seen[p], "B"))                   w = "when this run STARTED"
+                else                                            w = "when this run ENDED"
+                printf "%s\t%s\t%s\t%s\n", p, img[p], w, cl[p]
+            }
+        }'
 }
 
 run_gate_refuse_contention() {   # <when>
@@ -1074,7 +1156,7 @@ if run_gate_raw_build_dir="$(run_gate_dir_named_by_argv "$@")"; then
     run_gate_build_dir="$(run_gate_norm_dir "$run_gate_abs_build_dir")"
 fi
 run_gate_decide_input_roots
-run_gate_scan_contention
+run_gate_sample_contention before
 if [ -n "$run_gate_contenders" ]; then
     {
         echo "--- run-gate.sh ---"
@@ -1139,7 +1221,7 @@ run_gate_moved=""
 rm -f "$run_gate_marker" "$run_gate_inputs_before" "$run_gate_inputs_after"
 
 # ── POST-RUN: a sibling can start MID-RUN, so the same question is asked again ──
-run_gate_scan_contention
+run_gate_sample_contention after
 
 {
     echo "--- run-gate.sh ---"
@@ -1162,6 +1244,10 @@ run_gate_scan_contention
     echo "srctree : $run_gate_source_tree"
     echo "          decided by: $run_gate_source_tree_why"
     run_gate_abs_input_roots | sed 's/^/watched : /'
+    # HOW MANY OF THE RUN'S TWO SAMPLES ACTUALLY READ A PROCESS TABLE. Both
+    # lines below are claims about a scan, and neither may assert more than the
+    # scans it got — computed once here so the two cannot answer differently.
+    run_gate_samples_read=$((run_gate_table_ok_before + run_gate_table_ok_after))
     if [ -z "$run_gate_build_dir" ]; then
         echo "builddir: none named by this command — the contention check had no subject"
     else
@@ -1169,7 +1255,9 @@ run_gate_scan_contention
         if [ -n "$run_gate_contenders" ]; then
             echo "contended: YES, ANOTHER RUN WAS LIVE IN IT — this verdict is not evidence"
             printf '%s' "$run_gate_contenders"
-        elif [ "$run_gate_table_ok" -eq 1 ]; then
+        elif [ "$run_gate_samples_read" -eq 0 ]; then
+            echo "contended: UNKNOWN — no process table could be read on this host (0 of this run's 2 samples), so nothing was ruled out"
+        else
             # ⚠ THE WORDING IS NARROWED, AND THE OLD ONE WAS NOT WRONG — IT WAS
             # OVER-READ, WHICH IS WORSE. It said "this run was alone in it", and
             # "it" is the BUILD DIRECTORY, which was true of the run that took
@@ -1177,9 +1265,20 @@ run_gate_scan_contention
             # invites the wrong conclusion costs more than one that is false,
             # because nobody re-checks it. The subject is now named in the
             # sentence, and the machine-wide subject has a line of its own.
-            echo "contended: no — no other build-tool run named THIS BUILD DIRECTORY ($run_gate_unreadable candidate process(es) had no readable command line and could not be judged). ⚠ This says NOTHING about the rest of the machine; see 'compilers:' below."
-        else
-            echo "contended: UNKNOWN — no process table could be read on this host, so nothing was ruled out"
+            #
+            # ⚠ AND IT COUNTS ITS SAMPLES FOR THE SAME REASON THE `compilers:`
+            # LINE BELOW DOES. This used to read the LAST scan's `table_ok`
+            # alone, so a run whose pre-run scan could not look — the scan whose
+            # whole job is to refuse BEFORE anything executes — still printed a
+            # flat `contended: no`. That is this row's defect one line up, and
+            # leaving it there while fixing the sibling would repeat the exact
+            # mistake the row was opened for.
+            # [[D-SCRIPT-RUN-GATE-COMPILERS-LINE-REPORTS-NONE-WHEN-IT-COULD-NOT-READ-THE-PROCESS-TABLE]]
+            if [ "$run_gate_samples_read" -lt 2 ]; then
+                echo "contended: no — no other build-tool run named THIS BUILD DIRECTORY ($run_gate_unreadable candidate process(es) had no readable command line and could not be judged), but only $run_gate_samples_read of this run's 2 samples could read a process table at all, so the other one ruled nothing out. ⚠ This says NOTHING about the rest of the machine; see 'compilers:' below."
+            else
+                echo "contended: no — no other build-tool run named THIS BUILD DIRECTORY ($run_gate_unreadable candidate process(es) had no readable command line and could not be judged). ⚠ This says NOTHING about the rest of the machine; see 'compilers:' below."
+            fi
         fi
     fi
     # ★★★ THE MACHINE-WIDE SUBJECT, ON EVERY RUN, GREEN OR NOT, AND WITH OR
@@ -1196,13 +1295,29 @@ run_gate_scan_contention
     # exactly as useless as an escape that does.
     # ⇒ The line exists so that the NEXT unexplained red has this fact in its
     # log instead of needing an operator to remember they had a shell open.
-    if [ "$run_gate_table_ok" -ne 1 ]; then
-        echo "compilers: UNKNOWN — no process table could be read on this host"
-    elif [ "$run_gate_foreign_count" -eq 0 ]; then
-        echo "compilers: none outside this gate's own process tree"
+    #
+    # ★★★ THREE STATES, AND THE THIRD IS NOT SPELLED AS A PASS. `none` and
+    # `UNKNOWN` are different answers and the second one is not an answer at
+    # all: a reader skimming for `compilers: none` must miss the blind case, and
+    # a reader skimming for `compilers:` must land on something that says so.
+    # The sample count is printed with every one of them, because "I looked
+    # twice" and "I looked once and could not look the second time" are not the
+    # same evidence for the same sentence.
+    run_gate_union="$(run_gate_foreign_union)"
+    run_gate_union_count=0
+    [ -n "$run_gate_union" ] && run_gate_union_count="$(printf '%s\n' "$run_gate_union" | grep -c . || true)"
+    if [ "$run_gate_samples_read" -eq 0 ]; then
+        echo "compilers: UNKNOWN — NO PROCESS TABLE COULD BE READ on this host (0 of this run's 2 samples), so no other compiler was ruled out"
+    elif [ "$run_gate_union_count" -eq 0 ]; then
+        if [ "$run_gate_samples_read" -lt 2 ]; then
+            echo "compilers: none outside this gate's own process tree — but only $run_gate_samples_read of this run's 2 samples could read a process table, so the other one ruled nothing out"
+        else
+            echo "compilers: none outside this gate's own process tree, in either of this run's 2 samples"
+        fi
     else
-        echo "compilers: $run_gate_foreign_count live '$run_gate_compiler_image' process(es) OUTSIDE this gate's process tree — they share this user's compiler caches with this run, which are NOT under srctree or builddir"
-        printf '%s\n' "$run_gate_foreign" | sed 's/^/          /'
+        echo "compilers: $run_gate_union_count '$run_gate_compiler_image' process(es) ran OUTSIDE this gate's process tree DURING this run — they share this user's compiler caches with this run, which are NOT under srctree or builddir"
+        printf '%s\n' "$run_gate_union" |
+            awk -F'\t' '$1 != "" { printf "          pid %s  %s  seen %s\n            %s\n", $1, $2, $3, $4 }'
     fi
     [ -n "$run_gate_contention_note" ] && echo "$run_gate_contention_note"
 } >> "$log"
