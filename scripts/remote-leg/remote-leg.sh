@@ -70,6 +70,7 @@
 # Usage:
 #   wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage macos
 #   wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage arm64-vps
+#   wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage macos --build-type Release
 #   wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage macos --mode sync-only
 #   wsl.exe -e bash scripts/remote-leg/remote-leg.sh --carriage macos -R 'link/.*'
 # (Inside a WSL shell, drop the `wsl.exe -e` and invoke `bash ...` directly.)
@@ -104,6 +105,7 @@ FILTER=""
 JOBS="${DSS_REMOTE_LEG_JOBS:-}"
 REMOTE_ENV=""
 FORCE_LOCK=0
+BUILD_TYPE="Debug"
 
 die() { printf '\n[X] remote-leg: %s\n' "$*" >&2; exit 1; }
 say() { printf '\n=== %s ===\n' "$*"; }
@@ -124,6 +126,7 @@ while [[ $# -gt 0 ]]; do
         --mode)     MODE="${2:?--mode needs a value}"; shift 2 ;;
         -R)         FILTER="${2:?-R needs a value}"; shift 2 ;;
         -j)         JOBS="${2:?-j needs a value}"; shift 2 ;;
+        --build-type) BUILD_TYPE="${2:?--build-type needs a value}"; shift 2 ;;
         --force-lock) FORCE_LOCK=1; shift ;;
         -h|--help)
             awk 'NR==1 && /^#!/ {next} /^# PURPOSE:/ {next} /^#/ || /^[[:space:]]*$/ {print; next} {exit}' "$0"
@@ -162,6 +165,29 @@ esac
 case "$MODE" in
     full|sync-only|test-only) ;;
     *) die "unknown --mode '$MODE' (full | sync-only | test-only)" ;;
+esac
+
+# ── THE BUILD TYPE, AND THE TREE NAME THAT GOES WITH IT ─────────────────────
+# ★★★ THIS USED TO BE A CONSTANT, AND THE CONSTANT WAS WHY NO CARRIAGE COULD RUN
+# A RELEASE LEG AT ALL. [[D-CI-TWO-RELEASE-LEGS-HAVE-BEEN-RED-FOR-TEN-DAYS-WHILE-EVERY-LOCAL-LEG-WAS-GREEN]]
+# — CI runs four of its five legs at Release and this driver could only ever build
+# Debug, so the lane that had to reproduce a Release leg on the Mac wrote a one-off
+# script instead of using the tool that exists. That is the workaround this
+# repository's standing rule forbids ("use the script that exists, and FIX it rather
+# than routing around it"), and the fix is this flag.
+# ★ THE TREE NAME FOLLOWS THE TYPE, never the other way round: `build/dbg` for Debug,
+# `build/rel` for Release, `build/<lowercased type>` otherwise. A Release build
+# dropped into `build/dbg` would silently answer the Windows driver's
+# newest-Release-tree discovery with a tree named for the opposite configuration —
+# the exact confusion `local-build`'s own established-name table exists to prevent.
+# ⚠ REFUSED, not defaulted: an unknown type is a REFUSAL, because a typo that
+# silently became Debug would produce a leg reporting a configuration it did not run.
+case "$BUILD_TYPE" in
+    Debug)          BUILD="build/dbg" ;;
+    Release)        BUILD="build/rel" ;;
+    RelWithDebInfo) BUILD="build/relwithdebinfo" ;;
+    MinSizeRel)     BUILD="build/minsizerel" ;;
+    *) die "unknown --build-type '$BUILD_TYPE' (Debug | Release | RelWithDebInfo | MinSizeRel)" ;;
 esac
 
 carriage() { bash "$CARRIAGE_SH" "$@"; }
@@ -440,7 +466,8 @@ fi
 # CLEAN, always, for the same reason wsl-leg builds clean: rsync -a PRESERVES
 # MTIMES, so an incremental build over a pushed tree can silently skip the very
 # file the leg exists to exercise.
-BUILD="build/dbg"
+# ⓘ `BUILD` and `BUILD_TYPE` are decided together, up beside the argument parser —
+# see the block there for why the tree name has to follow the type.
 
 # ★★ ccache — THE CLEAN BUILD IS CORRECT AND ONLY ITS COST WAS EVER THE PROBLEM.
 # `rm -rf $BUILD` above stays: a synced tree carries the SOURCE's mtimes, so an
@@ -471,9 +498,9 @@ else
     printf '         One line on that host:  sudo apt-get install -y ccache\n'
 fi
 if [[ "$MODE" == "full" ]]; then
-    say "clean configure + build ($BUILD) on $CARRIAGE"
+    say "clean configure + build ($BUILD, $BUILD_TYPE) on $CARRIAGE"
     # ONE argument: see the ssh-quoting note in the header.
-    carriage "${REMOTE_ENV}cd $REMOTE_DIR && rm -rf $BUILD && cmake -S . -B $BUILD -G Ninja -DCMAKE_BUILD_TYPE=Debug -DDSS_BUILD_TESTS=ON$CACHE_ARGS > /tmp/remote-leg-configure.log 2>&1 || { tail -25 /tmp/remote-leg-configure.log; exit 20; }" \
+    carriage "${REMOTE_ENV}cd $REMOTE_DIR && rm -rf $BUILD && cmake -S . -B $BUILD -G Ninja -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DDSS_BUILD_TESTS=ON$CACHE_ARGS > /tmp/remote-leg-configure.log 2>&1 || { tail -25 /tmp/remote-leg-configure.log; exit 20; }" \
         || die "configure failed on $CARRIAGE (rc=$?)"
     carriage "${REMOTE_ENV}cd $REMOTE_DIR && cmake --build $BUILD --parallel ${DSS_JOBS:-6} > /tmp/remote-leg-build.log 2>&1 || { tail -30 /tmp/remote-leg-build.log; exit 21; }; tail -1 /tmp/remote-leg-build.log" \
         || die "build failed on $CARRIAGE (rc=$?)"
@@ -481,7 +508,14 @@ fi
 
 # ── test, through run-gate so a silent no-run cannot report success ──────────
 say "ctest on $CARRIAGE${FILTER:+ (-R $FILTER)}"
+# ⚠ THE LOG NAME CARRIES THE BUILD TYPE. With `--build-type` the same carriage can
+# now produce a Debug leg and a Release leg, and one filename for both would let a
+# reader take the wrong configuration's transcript for this run's — the same
+# confusion the tree-name rule above exists to prevent, one level out. Debug keeps
+# the historical name so every existing citation of `build/remote-leg-<carriage>.log`
+# still resolves.
 LOG="build/remote-leg-$CARRIAGE.log"
+[[ "$BUILD_TYPE" == "Debug" ]] || LOG="build/remote-leg-$CARRIAGE-$(printf %s "$BUILD_TYPE" | tr "[:upper:]" "[:lower:]").log"
 ctest_cmd="${REMOTE_ENV}cd $REMOTE_DIR && ctest --test-dir $BUILD --output-on-failure"
 [[ -n "$JOBS"   ]] && ctest_cmd="$ctest_cmd -j $JOBS"
 [[ -n "$FILTER" ]] && ctest_cmd="$ctest_cmd -R '$FILTER'"

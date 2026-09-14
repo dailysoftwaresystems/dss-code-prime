@@ -516,9 +516,82 @@ the only durable answer.
 running to force a boundary. The boundary is where the set *finishes*; the rule sets the CADENCE of
 committing, it does not add a new reason to pause. Work already in flight continues to completion.
 
-⚠ **AND IT DOES NOT WEAKEN THE GATE.** "Green" here means the same four-leg gate every commit
-already owes — this ruling changes HOW OFTEN that gate runs and a commit lands, never what the gate
-consists of. A set that cannot go green does not get committed because a boundary arrived.
+⚠ **AND IT DOES NOT WEAKEN THE GATE.** "Green" here means the gate every commit already owes —
+this ruling changes HOW OFTEN that gate runs and a commit lands, never what the gate consists of.
+A set that cannot go green does not get committed because a boundary arrived.
+⇒ ★ **AND WHAT IT CONSISTS OF IS NOW EIGHT RUNS, NOT FOUR** — see the next section.
+
+## ★★★★ THE END-OF-ROUND GATE IS `{Debug, Release} × FOUR LEGS` — **EIGHT RUNS** — operator ruling 2026-09-14
+
+> *"dss-cycle skill does not work aligned with CI because it's expensive. We enable 'Run Pipes' when
+> about to merge the PR to ensure it's green. We should run the debug and release units in all legs
+> at least once in the end of every dss cycle round of 4 lanes."*
+
+**At the end of every round of four lanes, the gate is EIGHT runs, not four:**
+
+|  | Windows | WSL x86_64 | macOS arm64 | arm64 VPS |
+|---|---|---|---|---|
+| **Debug** | ✔ | ✔ | ✔ | ✔ |
+| **Release** | ✔ | ✔ | ✔ | ✔ |
+
+★ **"At least once in the end of every round" is the cadence.** A lane iterating on its own tree uses
+whichever build type it is working in; what this ruling fixes is what a ROUND owes before its commit
+is called green. ⚠ **Report eight numbers with their build type beside each** — a four-number gate
+line is now an incomplete gate that reads as complete.
+ⓘ `scripts/remote-leg/remote-leg.sh --build-type Release` takes the remote half; the tree name
+follows the type and an unknown type refuses.
+
+### ⚠⚠ CI IS EXPENSIVE TO **RUN** AND FREE TO **READ** — AND THE TWO RULES ARE OPPOSITE
+
+- ⛔ **NEVER make CI run.** The Pipeline workflow is `pull_request`-triggered and gated on a
+  **`Run Pipes` label the operator enables only when a PR is about to merge**; there is no
+  `workflow_dispatch`. Never add, remove or toggle that label, never push to re-trigger a run, and
+  never touch the PR to obtain a green. **A cycle therefore cannot DEPEND on CI having run** — most
+  commits have no verdict at all, which is exactly why the eight-run local gate above is what a
+  round owes.
+- ✅ **ALWAYS read whatever verdict already exists.** Reading costs nothing, and step 0 now does it
+  with `scripts/check-ci-legs/`. A red leg is a HARD STOP on *proceeding*, never on *fixing*.
+
+★ **This corrects a framing I first wrote into a row, and the correction is the point.** I filed
+*"no step of `/dss-cycle` reads CI at all"* as though the READING were the defect, and then
+over-corrected to *"a cycle must not consult CI"*. **Both were wrong.** Consulting is free and was
+always right; what is expensive is *running*, and what was actually broken is that **the local gate
+covered ONE build type while reporting as though it covered the configuration space.**
+
+### ✔THE MEASUREMENT THAT PRODUCED THE RULING — AND THE THREE CORRECTIONS IT TOOK
+
+2026-09-14, PR #57: two legs red at HEAD, the failing step `Test` in both —
+`run-tests (windows-msvc-release, …, Release, …)` and `run-tests (macos-clang-release, …, Release, …)` —
+while the local four-leg Debug gate was **2179 / 2178 / 2148 / 2148 GREEN on that exact commit.**
+
+⚠ **Three things I asserted about it were WRONG, and each is a reusable trap:**
+1. ✗ *"Every run failed for ten days and ~20 commits."* Every run DID fail, but the runs before
+   `de1e83ef` failed at **`label-check`** with `run-tests` **SKIPPED**. **The matrix has executed
+   SIX times on this branch, not twenty**, and `windows-msvc-release` was last GREEN at `3d226255`
+   (2026-09-02). ⇒ **`gh run list` conclusions are not evidence about the tree** — a run can be red
+   without the tests having run at all.
+2. ✗ *"The logs expired, so only a local reproduction can attribute it."* Half true. Logs expire
+   (HTTP 410; artefacts report `expired: true` after **three** days, not the `retention-days: 7` the
+   workflow asks for — a repository setting silently overrides it). **But job METADATA does not**,
+   and a Test step's DURATION separates a real failure from a `--stop-time` budget overrun by
+   itself: an overrun cannot take less than `ctest_budget_min`. ✔The worst red Test step here was
+   **829 s against a 3000 s budget (27.6%)**. **No budget was ever near its cap; none was touched.**
+3. ✗ *"These are Release-only failures, so a local Release leg would catch them."* **Neither was
+   Release-dependent at all**, and a Release leg would have caught NEITHER:
+   - Windows was `ninja-deps-freshness`. `check-ninja-deps.py` scopes its premise to `deps = gcc`
+     (*"gcc lists the source itself"*) and then applies it unscoped; **`deps = msvc` parses
+     `/showIncludes`, which reports headers ONLY**, so `#deps 0` is CORRECT for a TU with no
+     `#include`. The local Windows gate is **MinGW GCC**, so the fact is invisible to it in *every*
+     build type.
+   - macOS was `run_gate_guard`, proved **build-type independent** by running it from the repo root
+     with no build tree at all. It is invisible locally because the three INDIRECT legs run
+     `-LE repo-guard`, so **31 guard tests run on exactly one local host and on all five CI legs.**
+
+★★★ **THE SHAPE IS THIS CYCLE'S OWN THROUGH-LINE, TWICE MORE: THE RULE A DEFECT CITED WAS TRUE — OF
+THE THING NEXT DOOR.** *"`#deps 0` is never legitimate"* is true of **gcc** and false of **MSVC**.
+*"`comm` names the image"* is true on **Linux** and false on **macOS**, where `ps -eo comm=` yields a
+truncated ABSOLUTE PATH (✔650/662 rows contain `/`; Linux control 0/39). ⇒ Before trusting a rule a
+guard cites, ask **which toolchain, and which platform, it was measured on.**
 
 ## ★★★ A LANE WORKTREE LIVES INSIDE THE REPO, AT `.worktrees/<short-name>` — operator ruling 2026-08-26
 
@@ -668,6 +741,31 @@ hand-typing every edit or reading every subsystem.
    recommended three times in this project's history. Establish a green
    baseline (`cmake --build build`, then full `ctest`). **A red baseline with no WIP-repair context
    is itself a pause gate** — present it; do not silently "fix it".
+
+   ★★★ **AND READ CI. NO STEP OF THIS SKILL USED TO, AND TWO LEGS STAYED RED FOR SIX MATRIX RUNS.**
+   [[D-CI-TWO-RELEASE-LEGS-HAVE-BEEN-RED-FOR-TEN-DAYS-WHILE-EVERY-LOCAL-LEG-WAS-GREEN]].
+   ✔MEASURED 2026-09-14: the PR's Pipeline had been red on **every** run that executed the matrix,
+   with two legs failing at `Test` while the four-leg local gate was 2179/2178/2148/2148 GREEN at
+   the very same commit — because **no configuration either red leg runs in is one the local gate
+   builds.** The operator had to point at it.
+
+       bash scripts/check-ci-legs/check-ci-legs.sh --branch <this branch>
+       pwsh -NoProfile -File scripts/check-ci-legs/check-ci-legs.ps1 -Branch <this branch>
+
+   - **A red leg is a HARD STOP the cycle reads before picking work**, and it is a FIX, so no other
+     hard stop applies to repairing it (see *Hard stops* below). It goes in front of §0.1.
+   - ⛔ **Never label, re-run, or push to re-trigger CI.** That is the operator's call. Read the
+     verdict; reproduce the leg LOCALLY.
+   - ⚠ **THE EVIDENCE HAS A THREE-DAY SHELF LIFE.** `gh run view --log-failed` answers **HTTP 410**
+     on an expired run and the uploaded `test-logs-*` artefacts report `expired: true` after
+     **three** days, not the `retention-days: 7` the workflow asks for — a repository setting
+     silently overrides it. The instrument above reads job METADATA, which does not expire with the
+     logs; a cycle that waits for the next red will be diagnosing it without logs.
+   - ⚠ **`gh run list` alone is not evidence about the tree.** A run that failed at `label-check`
+     has `run-tests` **skipped** and says nothing; the instrument reports that case by name.
+   - ⚠ **A failed `Test` step is TWO hypotheses with opposite remedies** — a real failure, or a
+     ctest `--stop-time` budget overrun. The instrument separates them by DURATION. **A real
+     failure is FIXED. A budget is never raised to hide a suite that got slower.**
 1. **Pick the next priority** from §0.1, top-to-bottom. An explicit argument overrides the auto-pick
    but is still subject to the bar, the pause gate, and the hard-stop checks. If §0.1 is dry, promote
    an *eligible* anchor (unconditional, or trigger already fired) into §0.1, then pick it.
@@ -1175,6 +1273,15 @@ opening the inter-procedural *arc*, not about every line in `src/opt/`.
 - **Correctness-critical anchors** (silent-miscompile class) — the closing cycle MUST ship a negative
   miscompile-pin that breaks iff the transform mis-fires. If the pin cannot be constructed, STOP and
   bring a decision brief. Never ship on review alone.
+- ★★★ **A RED CI LEG — read at step 0 with `scripts/check-ci-legs/`.** It stops the cycle from
+  picking new work until it is diagnosed, and since repairing it is a FIX, **no other hard stop
+  applies to the repair itself**. ⛔ The stop is on *proceeding past it*, never on fixing it, and
+  **never** on touching the operator's PR: do not label, re-run or push to re-trigger CI.
+  ⚠ **The local gate cannot substitute for it, and assuming otherwise is the defect.** ✔MEASURED
+  2026-09-14: the two legs that were red run in configurations **no local leg builds** — the local
+  Windows gate is **MinGW GCC**, so every `deps = msvc` fact is invisible to it, and the three
+  INDIRECT legs (WSL, macOS, arm64 VPS) skip `-L repo-guard` entirely, so 31 guard tests run on
+  exactly one local host and on all five CI legs.
 
 ## Stop-command handling
 

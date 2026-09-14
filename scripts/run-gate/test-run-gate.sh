@@ -216,13 +216,49 @@ if _rg_sleep="$(command -v sleep 2>/dev/null)" && [ -x "$_rg_sleep" ]; then
     if run_gate_host_is_windows; then STUB="$SCRATCH/bin/dsscp.exe"; else STUB="$SCRATCH/bin/dsscp"; fi
     if cp "$_rg_sleep" "$STUB" 2>/dev/null; then
         chmod +x "$STUB" 2>/dev/null || true
+        # ★★★ macOS SIGKILLS A COPY OF A PLATFORM BINARY, AND THAT KILLED THIS
+        # WHOLE SUBJECT ON ONE HOST WHILE READING AS A DEFECT IN THE DETECTOR.
+        # [D-TEST-RUN-GATE-STUB-IS-A-COPY-OF-A-PLATFORM-BINARY-AND-MACOS-KILLS-IT]
+        # ✔MEASURED 2026-09-14 on the macOS carriage, three constructions launched
+        # exactly as `plant_foreign_compiler` launches one and checked BEHAVIOURALLY
+        # two seconds later:
+        #   · plain `cp /bin/sleep …/dsscp`            -> alive_after_2s = 0  (killed)
+        #   · the same copy + `codesign --force -s -`  -> alive_after_2s = 1
+        #   · `ln -s /bin/sleep …/dsscp`               -> alive_after_2s = 1
+        # `codesign -dv` on the plain copy still reports `Identifier=com.apple.sleep`:
+        # /bin/sleep is a PLATFORM binary whose code identity lives in the system
+        # trust cache, so a copy off the system volume satisfies nothing and AMFI
+        # kills it. ⇒ ad-hoc sign the copy. It is the COPY that is signed, so the
+        # stub keeps its own path as argv[0] — a symlink would exec the real
+        # `/bin/sleep` and is the weaker fixture for a subject about image names.
+        # ⚠ THE FAILURE THIS COST: with the stub dead, arm 23's ctest returned 8
+        # (`busy` reported "Subprocess killed" at 1.11 s of its 8 s) and arms 24/25
+        # scanned a machine with no live stub on it, so all SEVEN of the subject's
+        # assertions failed — on macOS, on every leg that runs repo-guards, since
+        # the arms landed. None of those failures was about run-gate.
+        if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
+            codesign --force --sign - "$STUB" >/dev/null 2>&1 || true
+        fi
         STUB_W="$STUB"
         if command -v cygpath >/dev/null 2>&1; then STUB_W="$(cygpath -m "$STUB")"; fi
+        # ★★ AND IT IS PROVED TO RUN, not assumed to. A stand-in that cannot start
+        # makes every arm below assert against an empty machine and PASS or FAIL for
+        # a reason that is not the subject's — the shape this file exists to refuse.
+        # A stub that will not run is treated as ABSENT, which routes to the `na`
+        # arms and says so out loud.
+        if ! "$STUB" 0 >/dev/null 2>&1; then
+            STUB=""
+            STUB_W=""
+            _rg_stub_unrunnable=1
+        fi
     else
         STUB=""
     fi
 fi
 STUB_ABSENT_WHY="no 'sleep' binary could be copied to a stand-in named after the compiler, so no live-compiler subject could be created on this host"
+if [ "${_rg_stub_unrunnable:-0}" = "1" ]; then
+    STUB_ABSENT_WHY="a stand-in named after the compiler was copied but WOULD NOT RUN on this host (on macOS a copy of a platform binary is SIGKILLed by AMFI unless ad-hoc signed, and \`codesign\` was absent or refused), so no live-compiler subject could be created"
+fi
 
 # A stand-in compiler with NO RESOLVABLE ANCESTRY — the shape a compiler started
 # from another terminal has, as seen from here.

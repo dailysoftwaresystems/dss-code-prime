@@ -499,19 +499,28 @@ function Get-RunGateProcessTable {
                     ParentId  = [int]$_.ParentProcessId
                     Image     = [string]$_.Name
                     CmdLine   = [string]$_.CommandLine
+                    Argv0     = [string]$_.Name   # CIM Name is already a bare image name
                 } })
         } catch { return @() }
     }
-    # The twin's POSIX instrument, so the two agree off Windows as well.
+    # The twin's POSIX instrument, so the two agree off Windows as well — INCLUDING
+    # the two image spellings. See the note above run_gate_process_table in
+    # run-gate.sh: on macOS `comm` is an absolute path truncated to the column
+    # width, so a bare-name comparison against it can never match
+    # (D-SCRIPT-RUN-GATE-MATCHES-AN-IMAGE-AGAINST-A-COMM-COLUMN-THAT-IS-A-TRUNCATED-PATH-ON-MACOS).
+    # Both spellings are basenamed here and EITHER may match downstream.
     try {
         return @(& ps -eo 'pid=,ppid=,comm=,args=' 2>$null | ForEach-Object {
             $f = ($_ -replace '^\s+', '') -split '\s+', 4
             if ($f.Count -lt 3) { return }
+            $cl = if ($f.Count -ge 4) { [string]$f[3] } else { '' }
+            $a0 = if ($cl) { ($cl -split '[ \t]', 2)[0] } else { '' }
             [PSCustomObject]@{
                 ProcId   = [int]$f[0]
                 ParentId = [int]$f[1]
-                Image    = [string]$f[2]
-                CmdLine  = if ($f.Count -ge 4) { [string]$f[3] } else { '' }
+                Image    = [string]($f[2] -replace '^.*/', '')
+                CmdLine  = $cl
+                Argv0    = [string]($a0 -replace '^.*/', '')
             } })
     } catch { return @() }
 }
@@ -583,7 +592,8 @@ function Get-RunGateContention {
     while ($walk -and $depth -lt 24) {
         $exclude[$walk] = $true
         if (-not $byId.ContainsKey($walk)) { break }
-        if ($script:RunGateBuildTools -contains (Get-RunGateImageKey $byId[$walk].Image)) {
+        if (($script:RunGateBuildTools -contains (Get-RunGateImageKey $byId[$walk].Image)) -or
+            ($script:RunGateBuildTools -contains (Get-RunGateImageKey $byId[$walk].Argv0))) {
             foreach ($c in $chain) { $own[$c] = $true }
         }
         $walk = $byId[$walk].ParentId
@@ -594,7 +604,11 @@ function Get-RunGateContention {
     # THE MACHINE-WIDE SUBJECT. Asked whether or not a build directory was
     # named, and never fatal - see the footer for why.
     foreach ($r in $table) {
-        if ((Get-RunGateImageKey $r.Image) -ne $script:RunGateCompilerImage) { continue }
+        # EITHER spelling. On macOS only Argv0 can ever match; matching either can
+        # only ADD a detection, so no host loses one. Twin of the `key()` pair in
+        # run_gate_foreign_from_table.
+        if ((Get-RunGateImageKey $r.Image) -ne $script:RunGateCompilerImage -and
+            (Get-RunGateImageKey $r.Argv0) -ne $script:RunGateCompilerImage) { continue }
         $a = $r.ProcId; $d = 0; $ours = $false
         while ($a -and $d -lt 24) {
             if ($own.ContainsKey($a)) { $ours = $true; break }
@@ -604,14 +618,17 @@ function Get-RunGateContention {
         }
         if ($ours) { continue }
         $script:RunGateForeignCount++
-        $script:RunGateForeign += "          $($r.ProcId)`t$($r.Image)`t$($r.CmdLine)"
+        $script:RunGateForeign += "          $($r.ProcId)`t$($script:RunGateCompilerImage)`t$($r.CmdLine)"
     }
 
     if (-not $script:RunGateBuildDir) { return }
 
     foreach ($r in $table) {
         $img = Get-RunGateImageKey $r.Image
-        if ($script:RunGateBuildTools -notcontains $img) { continue }
+        if ($script:RunGateBuildTools -notcontains $img) {
+            $img = Get-RunGateImageKey $r.Argv0
+            if ($script:RunGateBuildTools -notcontains $img) { continue }
+        }
         if (-not $r.CmdLine) { $script:RunGateUnreadable++; continue }
         if ($exclude.ContainsKey($r.ProcId)) { continue }
         foreach ($raw in (Get-RunGateDirsInTokens $img (Split-RunGateCommandLine $r.CmdLine))) {

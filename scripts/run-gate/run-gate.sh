@@ -586,7 +586,34 @@ run_gate_dir_named_by_argv() {   # <argv...>
     return 1
 }
 
-# pid <TAB> ppid <TAB> image <TAB> command-line, one row per live process.
+# pid <TAB> ppid <TAB> image <TAB> command-line <TAB> argv0-image, one row per
+# live process. TWO spellings of the image, and that is the whole point of the
+# fifth column.
+#
+# ★★★ `comm` IS NOT AN IMAGE NAME ON macOS, AND THE CHECKS BUILT ON IT WERE
+# STRUCTURALLY BLIND THERE. [D-SCRIPT-RUN-GATE-MATCHES-AN-IMAGE-AGAINST-A-COMM-COLUMN-THAT-IS-A-TRUNCATED-PATH-ON-MACOS]
+# ✔MEASURED 2026-09-14 on the macOS carriage, `ps -eo pid=,ppid=,comm=,args=`:
+#     77728     1 /tmp/dss-ci-stub /tmp/dss-ci-stubprobe/dsscp_signed 9
+#     1         0 /sbin/launchd    /sbin/launchd
+# `comm` there is an ABSOLUTE PATH, truncated to the column width (16 chars when
+# it is not the last column) — **650 of 662 rows contained a `/`**. The Linux
+# control, same command under WSL: `systemd`, `init`, **0 of 39 rows with a `/`**.
+# So `tolower(comm) == "dsscp"` cannot be true on macOS for any process, ever,
+# and both subjects built on it — the foreign-compiler line AND the build-tool
+# contention scan — answered "none" on that host no matter what was running.
+# That is the shape [[feedback-an-escape-every-row-triggers-disarms-the-guard]]
+# names from the other side: a check that reaches its refusal on no input at all.
+#
+# ⇒ The image is now matched against BOTH the basename of `comm` AND the basename
+# of `argv[0]` (the first token of the command line). ⚠ BOTH, never one: matching
+# either can only ever ADD a detection, so no host can lose one, and the
+# fail-toward-REPORTING direction is the one this subject already chose (the
+# fixture's orphaned stub is deliberately read as foreign). argv[0] is the
+# spelling that survives on macOS, because `args` is not truncated; `comm` stays
+# because it is the spelling a process that rewrote its own argv still answers to.
+# ⓘ Windows is unchanged in substance: CIM `Name` is already a bare image name, so
+# it fills both columns and the matcher sees exactly what it saw before.
+#
 # ✔MEASURED cost on this workstation: `powershell -NoProfile -NonInteractive`
 # with the CIM query below returns 534 rows in 741–1086 ms (median 780 ms); the
 # same query from an ALREADY-RUNNING PowerShell is 341 ms, so the spawn is most
@@ -600,10 +627,17 @@ run_gate_process_table() {
             if command -v "$_rg_c" >/dev/null 2>&1; then _rg_pssh="$_rg_c"; break; fi
         done
         [ -n "$_rg_pssh" ] || return 1
-        "$_rg_pssh" -NoProfile -NonInteractive -Command '$ErrorActionPreference="SilentlyContinue"; Get-CimInstance Win32_Process | ForEach-Object { $_.ProcessId.ToString() + "`t" + $_.ParentProcessId.ToString() + "`t" + $_.Name + "`t" + ($_.CommandLine -replace "`t", " ") }' 2>/dev/null | tr -d '\r'
+        "$_rg_pssh" -NoProfile -NonInteractive -Command '$ErrorActionPreference="SilentlyContinue"; Get-CimInstance Win32_Process | ForEach-Object { $_.ProcessId.ToString() + "`t" + $_.ParentProcessId.ToString() + "`t" + $_.Name + "`t" + ($_.CommandLine -replace "`t", " ") + "`t" + $_.Name }' 2>/dev/null | tr -d '\r'
     else
         ps -eo pid=,ppid=,comm=,args= 2>/dev/null |
-            awk '{ p=$1; q=$2; c=$3; $1=""; $2=""; $3=""; sub(/^[ \t]+/, ""); printf "%s\t%s\t%s\t%s\n", p, q, c, $0 }'
+            awk '{
+                p=$1; q=$2; c=$3; $1=""; $2=""; $3=""; sub(/^[ \t]+/, "")
+                cl=$0
+                a0=cl; sub(/[ \t].*$/, "", a0)   # argv[0], whole-path
+                sub(/^.*\//, "", a0)             # ... basenamed
+                sub(/^.*\//, "", c)              # comm, basenamed
+                printf "%s\t%s\t%s\t%s\t%s\n", p, q, c, cl, a0
+            }'
     fi
 }
 
@@ -638,10 +672,17 @@ run_gate_candidates_from_table() {
             if (cur != "") T[++n] = cur
             return n
         }
+        # The image key of one spelling: lowered, `.exe` dropped. Both the `comm`
+        # basename and the argv[0] basename are run through it and EITHER may
+        # match — see the two-spellings note above run_gate_process_table.
+        function key(s) { s = tolower(s); sub(/\.exe$/, "", s); return s }
         {
-            pid = $1; img = tolower($3); cl = $4
-            sub(/\.exe$/, "", img)
-            if (index(tools, " " img " ") == 0) next
+            pid = $1; cl = $4
+            img = key($3); alt = key($5)
+            if (index(tools, " " img " ") == 0) {
+                if (index(tools, " " alt " ") == 0) next
+                img = alt
+            }
             if (cl == "") { print "UNREADABLE\t" pid "\t" img; next }
             n = tokenize(cl)
             for (i = 1; i <= n; i++) {
@@ -684,13 +725,18 @@ run_gate_candidates_from_table() {
 # on a table this file already measured at 534 rows.
 run_gate_foreign_from_table() {   # <own-pid-list>
     awk -F'\t' -v own="$1" -v want="$run_gate_compiler_image" '
+        function key(s) { s = tolower(s); sub(/\.exe$/, "", s); return s }
         BEGIN { n = split(own, o, " "); for (i = 1; i <= n; i++) if (o[i] != "") OWN[o[i]] = 1 }
-        { par[$1] = $2; nm[$1] = $3; cl[$1] = $4; order[++k] = $1 }
+        { par[$1] = $2; nm[$1] = $3; cl[$1] = $4; a0[$1] = $5; order[++k] = $1 }
         END {
             for (i = 1; i <= k; i++) {
                 p = order[i]
-                m = tolower(nm[p]); sub(/\.exe$/, "", m)
-                if (m != want) continue
+                # EITHER spelling — the comm basename or the argv[0] basename.
+                # On macOS only the second one can ever match; see the note
+                # above run_gate_process_table.
+                m = key(nm[p])
+                if (m != want && key(a0[p]) != want) continue
+                m = want
                 a = p; d = 0; ours = 0
                 while (a != "" && d < 24) {
                     if (a in OWN) { ours = 1; break }
@@ -698,7 +744,11 @@ run_gate_foreign_from_table() {   # <own-pid-list>
                     a = par[a]; d++
                 }
                 if (ours) continue
-                print p "\t" nm[p] "\t" cl[p]
+                # ⚠ `m`, not `nm[p]`: on macOS the comm column is a truncated
+                # PATH, so printing it here would name the process by a string
+                # the reader cannot grep for. The command line beside it carries
+                # the whole truth.
+                print p "\t" m "\t" cl[p]
             }
         }'
 }
@@ -735,10 +785,19 @@ run_gate_scan_contention() {   # sets run_gate_contenders / run_gate_unreadable 
         while [ -n "$_rg_walk" ] && [ "$_rg_depth" -lt 24 ]; do
             _rg_exclude="$_rg_exclude $_rg_walk"
             _rg_chain="$_rg_chain $_rg_walk"
+            # BOTH spellings again — an ancestor `ctest` on macOS is `comm`ed as a
+            # truncated path, and an ancestor that is not recognised as a build
+            # tool narrows `own`, which makes this gate's OWN children read as
+            # foreign. Same two columns, same rule, third site.
             _rg_aimg="$(printf '%s\n' "$_rg_tbl" | awk -F'\t' -v p="$_rg_walk" '$1 == p { print tolower($3); exit }')"
             _rg_aimg="${_rg_aimg%.exe}"
+            _rg_aalt="$(printf '%s\n' "$_rg_tbl" | awk -F'\t' -v p="$_rg_walk" '$1 == p { print tolower($5); exit }')"
+            _rg_aalt="${_rg_aalt%.exe}"
             case " $run_gate_build_tools " in
                 *" $_rg_aimg "*) _rg_own="$_rg_chain" ;;
+                *) case " $run_gate_build_tools " in
+                       *" $_rg_aalt "*) _rg_own="$_rg_chain" ;;
+                   esac ;;
             esac
             _rg_walk="$(printf '%s\n' "$_rg_tbl" | awk -F'\t' -v p="$_rg_walk" '$1 == p { print $2; exit }')"
             _rg_depth=$((_rg_depth + 1))

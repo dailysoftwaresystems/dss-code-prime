@@ -63,6 +63,7 @@ the other in the same commit.
 | **`check-anchor-balance`** | `check-anchor-balance.py` | refuse a cycle that ends with more OPEN deferral-registry rows than it began. |
 | **`check-anchor-registry`** | `check-anchor-registry.ps1`, `check-anchor-registry.sh` | refuse a `D-*` anchor cited in a scanned root that resolves to no registry row, and refuse a markdown table row whose unescaped pipes would silently drop cells. |
 | **`check-carriage-paths`** | `check-carriage-paths.py` | refuse a carriage script whose repository path disagrees with the project's own declared name. |
+| **`check-ci-legs`** | `check-ci-legs.ps1`, `check-ci-legs.sh` | read the PR's CI verdict per leg from job METADATA, which outlives the logs, and separate a real test failure from a budget overrun. |
 | **`check-diagnostic-codes`** | `check-diagnostic-codes.py` | refuse a duplicate, implicitly-numbered, or newly-uncovered `DiagnosticCode` ordinal. |
 | **`check-doc-census`** | `check-doc-census.py`, `source-census.py` | refuse a documented figure that a census refutes, in prose or in a source comment, and repair it in place. |
 | **`check-enum-name-table-guards`** | `check-enum-name-table-guards.py` | refuse an `EnumNameTable` vocabulary declared in `src/` without a `DSS_CHECK_ENUM_NAME_TABLE` well-formedness assert. |
