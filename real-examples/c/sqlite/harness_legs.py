@@ -4042,19 +4042,109 @@ def parse_binary_identity(identity, who):
 # implement it and print the target triple on a single line.
 # ✔MEASURED 2026-08-05: gcc -> `x86_64-linux-gnu` (WSL) and `x86_64-w64-mingw32`
 # (Windows/Strawberry), aarch64-linux-gnu-gcc -> `aarch64-linux-gnu`.
-# ⚠ Apple clang is DOCUMENTED, NOT MEASURED — this project's Mac was asleep and
-# unreachable when this landed, and waking a personal machine needs the operator.
+# ✔ APPLE CLANG IS NOW MEASURED, IN BOTH DIRECTIONS, and this note is corrected
+# here rather than quietly dropped. It used to read "⚠ Apple clang is DOCUMENTED,
+# NOT MEASURED — this project's Mac was asleep and unreachable when this landed".
+# ✔MEASURED 2026-09-14 on the operator's Mac (Darwin 25.6.0 arm64, macOS 26.6.2):
+# `/usr/bin/clang -dumpmachine` -> `arm64-apple-darwin25.6.0`, which this probe
+# ACCEPTS for macho64-arm64 and correctly REFUSES for macho64-x86_64; and
+# `/usr/bin/clang -arch x86_64 -dumpmachine` -> `x86_64-apple-darwin25.6.0`,
+# which it accepts for macho64-x86_64. The refusal direction is the one that was
+# never exercised before, and it is the one that matters.
 # If a Mac ever rejects its own `clang` here, the diagnostic names this exact
 # probe and the leg degrades to `skipped-build-input-missing` (loud, and STILL
 # BUILT) — never to a silently wrong-target helper, which is the outcome that
 # reads as a DSS miscompile.
 CC_TARGET_MACHINE_FLAG = "-dumpmachine"
 
+# ── A CANDIDATE IS AN ARGV, NOT A NAME ──────────────────────────────────────
+#
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-TARGETCC-BARE-NAME-HIDES-A-MULTI-TARGET-COMPILER-FROM-EVERY-LEG-BUT-ITS-DEFAULT
+#
+# ★★ THE DEFECT WAS ONE LINE OF VOCABULARY, NOT A MISSING CAPABILITY. A
+# `targetCc.candidates` entry used to be a BARE NAME, so a compiler whose target
+# is selected by a FLAG could only ever be accepted for its DEFAULT target. On an
+# Apple Silicon Mac ONE clang serves macho64-arm64 and was refused by
+# macho64-x86_64 — correctly, given what it was asked — and that leg lost its
+# oracle, its loadext CONTROL arm, and any future same-platform control, silently
+# and behind a message that read like a host limitation. ✔MEASURED 2026-09-14:
+# `clang -arch x86_64` on that very machine builds a running x86_64 Mach-O.
+#
+# ★ AND IT IS NOT macho-SHAPED, which is the argument for fixing the VOCABULARY
+# rather than the one leg: the same shape hides `clang --target=…`, `gcc -m32`,
+# and every multi-target toolchain from every leg but one.
+#
+# ⚠ THE QUESTION IS STILL ASKED EXACTLY ONE WAY. `cc_machine_argv` appends the
+# same `-dumpmachine` to whatever argv the candidate names, so an argv candidate
+# buys no exemption from the probe — a compiler that answers the WRONG triple is
+# refused whether it was spelled as a name or as an argv. That refusal is the
+# whole value of the check the candidate list passes through.
+def cc_argv(cc):
+    """A candidate — a bare NAME or an ARGV LIST — as argv. Never a shell string.
+
+    PURE, and it REFUSES rather than coercing: an empty list, a non-string
+    member, or an empty argv[0] would each produce a spawn nobody declared, and
+    the failure would land hours later as a wrong-target helper. The lint refuses
+    the same shapes in the catalogue; this refuses them at the point of use, so a
+    value arriving from anywhere else cannot slip past."""
+    if isinstance(cc, str):
+        items = [cc]
+    elif isinstance(cc, (list, tuple)):
+        items = list(cc)
+    else:
+        raise LegError(
+            "targetCc candidate %r is neither a name nor an argv list. A "
+            "candidate is either a string (`\"clang\"`) or a non-empty list of "
+            "strings (`[\"clang\", \"-arch\", \"x86_64\"]`); anything else cannot "
+            "be spawned and must not be guessed at." % (cc,))
+    if not items:
+        raise LegError(
+            "targetCc candidate is an EMPTY argv list. An empty candidate names "
+            "no compiler, so it can neither be found on PATH nor probed — it "
+            "would sit in the list reading as a declared fallback while being "
+            "unreachable.")
+    for item in items:
+        if not isinstance(item, str) or not item.strip():
+            raise LegError(
+                "targetCc candidate %r has a member %r that is not a non-empty "
+                "string. Every argv member is passed to the compiler verbatim; a "
+                "blank or non-string one would change the command in a way "
+                "nobody declared." % (cc, item))
+    return items
+
+
+def cc_display(cc):
+    """One candidate as a single readable token for a diagnostic or a ledger
+    line. NEVER fed back to a shell — it exists so a rejection can NAME what was
+    tried, and an argv candidate must read as the argv it is."""
+    return " ".join(cc_argv(cc))
+
+
+# The wire form `--resolve-target-cc` prints and `--reference-cc` accepts: TAB
+# separated, because a compiler PATH can contain spaces and neither driver may
+# re-derive a field. The TRIPLE is always the LAST field on the resolver's line
+# and the argv is everything before it, so a bare-name candidate produces exactly
+# the `<cc>\t<triple>` line both drivers have always read — the generalisation
+# costs the common case nothing. ⚠ TAB and not JSON deliberately: `IFS=$'\t' read
+# -r -a` in bash and `-split "`t"` in PowerShell each consume it with no parser,
+# and a JSON array would have made one of the two shells re-parse.
+TARGET_CC_WIRE_SEPARATOR = "\t"
+
+
+def cc_argv_from_wire(value):
+    """An argv that arrived over the TAB wire. "" means "no compiler", which is
+    a real and expected answer (the control arm is optional by construction)."""
+    if isinstance(value, (list, tuple)):
+        return cc_argv(value)
+    parts = [p for p in (value or "").split(TARGET_CC_WIRE_SEPARATOR) if p.strip()]
+    return cc_argv(parts) if parts else []
+
 
 def cc_machine_argv(cc):
     """The argv that asks a compiler what it targets. Named ONCE, here, so the
     two drivers cannot come to ask the question two different ways."""
-    return [cc, CC_TARGET_MACHINE_FLAG]
+    return cc_argv(cc) + [CC_TARGET_MACHINE_FLAG]
 
 
 def machine_target_os(token):
@@ -4129,20 +4219,28 @@ def _run_machine_probe(argv):
 
 def resolve_target_cc(leg, runner=None, which=None):
     """The FIRST declared candidate that is BOTH present and proves it targets
-    this leg. Returns (cc, machine, rejections) with cc == "" when none does.
+    this leg. Returns (argv, machine, rejections) with argv == [] when none does.
 
     ★ AN UNVERIFIABLE CANDIDATE IS REFUSED, NOT ASSUMED. A compiler whose
     `-dumpmachine` fails cannot say what it produces, and "accept it anyway" is
     precisely the silent fallback that cost a run above. The refusal is loud, it
-    names the probe, and it costs the leg its RUN — never its BUILD."""
+    names the probe, and it costs the leg its RUN — never its BUILD.
+
+    ★★ THE ANSWER IS AN ARGV, NOT A NAME.
+    [D-HARNESS-TARGETCC-BARE-NAME-HIDES-A-MULTI-TARGET-COMPILER-FROM-EVERY-LEG-BUT-ITS-DEFAULT]
+    `which` still resolves argv[0] alone — only the program is looked up — while
+    the probe and every consumer receive the WHOLE argv, so a compiler that needs
+    a flag to name its target is asked the same one question as any other."""
     runner = runner or _run_machine_probe
     which = which or shutil.which
     spec = leg.get("spec", "")
     rejections = []
     for cc in leg.get("build", {}).get("targetCc", {}).get("candidates", []):
-        found = which(cc)
+        cc_args = cc_argv(cc)
+        shown = cc_display(cc)
+        found = which(cc_args[0])
         if not found:
-            rejections.append("%s: not on PATH" % cc)
+            rejections.append("%s: not on PATH" % shown)
             continue
         argv = cc_machine_argv(cc)
         rc, out = runner(argv)
@@ -4150,15 +4248,15 @@ def resolve_target_cc(leg, runner=None, which=None):
             rejections.append(
                 "%s (%s): `%s` exited %d, so it cannot state its target; REFUSED "
                 "rather than assumed — output: %r"
-                % (cc, found, " ".join(argv), rc, (out or "").strip()[:200]))
+                % (shown, found, " ".join(argv), rc, (out or "").strip()[:200]))
             continue
         ok, why = machine_matches_spec(out, spec)
         if not ok:
-            rejections.append("%s (%s): %s" % (cc, found, why))
+            rejections.append("%s (%s): %s" % (shown, found, why))
             continue
-        return (cc, ((out or "").strip().splitlines() or [""])[0].strip(),
+        return (cc_args, ((out or "").strip().splitlines() or [""])[0].strip(),
                 rejections)
-    return ("", "", rejections)
+    return ([], "", rejections)
 
 
 # ── THE ATTRIBUTION ORACLE, PER LEG ─────────────────────────────────────────
@@ -4445,7 +4543,7 @@ def reference_oracle_argv(cc, manifest, output, link_flags):
     system libraries (`-lm`, `-ldl`, `-lpthread` on a POSIX target; nothing on a
     Windows one, where mingw links them itself). It is a property of the target,
     declared per leg, never sniffed from the host."""
-    argv = [cc, "-o", output]
+    argv = cc_argv(cc) + ["-o", output]
     for d in manifest.get("defines", []):
         argv.append("-D%s" % d)
     for inc in manifest.get("includes", []):
@@ -5132,7 +5230,7 @@ def loadext_helper_reference_argv(leg, cc, source, include_dirs, out_path):
     `stage_loadext_extension` has always made, kept identical on purpose: a
     control whose command changed at the same time as the thing it controls is
     not a control."""
-    argv = [cc] + list(leg.get("build", {}).get("sharedLibFlags", []))
+    argv = cc_argv(cc) + list(leg.get("build", {}).get("sharedLibFlags", []))
     for d in include_dirs:
         argv.append("-I%s" % d)
     argv += ["-o", out_path, source]
@@ -6200,11 +6298,17 @@ def build_loadext_helper(leg, dss, sqlite_src, sqlite_bld, dest_dir, work_dir,
 
     # ── the reference arm — the CONTROL, only where it exists ────────────────
     def _reference_arm():
-        arm = {"builder": "reference", "available": bool(reference_cc),
+        # ARGV, NOT A NAME. `reference_cc` arrives over the TAB wire that
+        # `--resolve-target-cc` prints, so a multi-target compiler reaches this
+        # arm with the flag that selects its target still attached.
+        # [D-HARNESS-TARGETCC-BARE-NAME-HIDES-A-MULTI-TARGET-COMPILER-FROM-EVERY-LEG-BUT-ITS-DEFAULT]
+        reference_argv = cc_argv_from_wire(reference_cc)
+        arm = {"builder": "reference", "available": bool(reference_argv),
                "ok": False, "rc": None, "argv": [], "log": "", "artifact": "",
-               "bytes": 0, "errors": [], "cc": reference_cc,
+               "bytes": 0, "errors": [],
+               "cc": cc_display(reference_argv) if reference_argv else "",
                "machine": reference_machine, "why": ""}
-        if not reference_cc:
+        if not reference_argv:
             arm["why"] = (
                 "no declared targetCc candidate on this machine both EXISTS and "
                 "proves (via `%s`) that it targets %s. That is the ENTIRE reason "
@@ -6217,8 +6321,8 @@ def build_loadext_helper(leg, dss, sqlite_src, sqlite_bld, dest_dir, work_dir,
         os.makedirs(outdir, exist_ok=True)
         dst = _fwd(os.path.join(outdir, name))
         log_path = _fwd(os.path.join(work_dir, "loadext-helper-reference.log"))
-        argv = loadext_helper_reference_argv(leg, reference_cc, source, includes,
-                                             dst)
+        argv = loadext_helper_reference_argv(leg, reference_argv, source,
+                                             includes, dst)
         arm["argv"] = argv
         rc, out = runner(argv)
         arm["rc"] = rc
@@ -6231,7 +6335,7 @@ def build_loadext_helper(leg, dss, sqlite_src, sqlite_bld, dest_dir, work_dir,
         if rc != 0:
             arm["errors"] = [l for l in (out or "").splitlines() if l.strip()][:8]
             arm["why"] = ("`%s` exited %d; first line: %s"
-                          % (reference_cc, rc,
+                          % (cc_display(reference_argv), rc,
                              arm["errors"][0] if arm["errors"] else "<empty log>"))
             return arm
         if not os.path.isfile(dst):
@@ -6308,7 +6412,9 @@ def build_loadext_helper(leg, dss, sqlite_src, sqlite_bld, dest_dir, work_dir,
     report["detail"] = ("%s, built for %s by %s%s — verified: %s"
                         % (name, shared_lib_spec(leg), primary["builder"],
                            (" (%s, which reports '%s')"
-                            % (reference_cc, reference_machine or "<unrecorded>"))
+                            % (cc_display(cc_argv_from_wire(reference_cc))
+                               if reference_cc else "<none>",
+                               reference_machine or "<unrecorded>"))
                            if primary["builder"] == "reference" else "",
                            why))
     # THE CROSS-CHECK LINE. Reported on every outcome so a build log always
@@ -8783,7 +8889,12 @@ def emit_sh(resolved):
         put("LEG_SHARED_LIB_FORMAT", b.get("sharedLibFormat", ""))
         put("LEG_SHARED_LIB_SPEC",
             "%s:%s" % (leg["targetArch"], b.get("sharedLibFormat", "")))
-        put("LEG_CC_CANDIDATES", " ".join(b.get("targetCc", {}).get("candidates", [])))
+        # ", " and not " ": a candidate may itself BE an argv (`clang -arch
+        # x86_64`), so a space-joined list would read as one long command line.
+        # [D-HARNESS-TARGETCC-BARE-NAME-HIDES-A-MULTI-TARGET-COMPILER-FROM-EVERY-LEG-BUT-ITS-DEFAULT]
+        put("LEG_CC_CANDIDATES",
+            ", ".join(cc_display(c)
+                      for c in b.get("targetCc", {}).get("candidates", [])))
         put("LEG_CC_PKG", b.get("targetCc", {}).get("package", ""))
         # The FILE NAME sqlite's own test/loadext.test looks for on THIS leg's
         # target (see LOADEXT_HELPER_NAME_BY_TARGET_OS). Emitted so the driver
@@ -9729,6 +9840,19 @@ def lint(path=CATALOGUE):
                             "the leg declares no CONTROL compiler, so a loadext-* "
                             "red on it can never be cross-checked against a "
                             "reference build" % label)
+        # ── EVERY CANDIDATE IS A NAME OR A NON-EMPTY ARGV OF NON-EMPTY STRINGS ──
+        # ANCHOR, ONE LINE, DO NOT WRAP:
+        # D-HARNESS-TARGETCC-BARE-NAME-HIDES-A-MULTI-TARGET-COMPILER-FROM-EVERY-LEG-BUT-ITS-DEFAULT
+        # Refused HERE as well as at the point of use, and refused with the same
+        # strictness `launchers[].command` already gets: a malformed candidate
+        # does not fail until a leg tries to spawn it, which on this harness is
+        # hours in, and the failure then reads as "this host has no cross
+        # compiler" — an ordinary, expected, costless condition.
+        for cand in build.get("targetCc", {}).get("candidates", []) or []:
+            try:
+                cc_argv(cand)
+            except LegError as exc:
+                findings.append("leg '%s': %s" % (label, exc))
         if not build.get("sharedLibFlags"):
             findings.append("leg '%s': no sharedLibFlags" % label)
         # ── the object format the helper is EMITTED in ────────────────────────
@@ -10100,6 +10224,16 @@ MIRROR_PAIRS = [
     {"sh": "resolve_abort_file", "ps1": "Resolve-AbortFile",
      "differential": "resolve-abort-file"},
     {"sh": "files_after", "ps1": "Get-FilesAfter", "differential": "files-after"},
+    {"sh": "not_reached", "ps1": "Add-NotReached", "differential": "",
+     "why": "a two-line RECORDER, not a function with an answer: it appends one "
+            "description to the driver's NOT-REACHED list and its attribution to "
+            "the parallel list, and exists ONLY so the two can never desync by "
+            "index. There is no value to compare — a differential case would "
+            "re-implement the append in a harness and assert the harness. What it "
+            "protects is asserted where it is CONSUMED instead: the coverage "
+            "verdict block, which fails a leg for any NOT-REACHED group no EARNED "
+            "abort accounts for. "
+            "[D-HARNESS-PE64-UNDER-WINE-ABORTS-THREE-TEST-FILES-THAT-PASS-NATIVELY-ON-WINDOWS]"},
     {"sh": "our_fixture_pids", "ps1": "Get-OurFixtureProcesses", "differential": "",
      "why": "enumerates live processes; driving it differentially would mean "
             "spawning processes for the two shells to find and kill."},
@@ -13292,8 +13426,21 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("a zero-byte log yields no diagnostic at all",
           abort_diagnostic_text("") == ""
           and abort_diagnostic_text("nolock-5.1... Ok\n") == "")
-    _row2, _why2 = classify_abort(_pe, _pe_gate, "veryquick/symlink2.test",
-                                  _diag)
+    # ⚠ THE EXEMPLAR HERE IS A FILE WITH NO ROW AT ALL, AND IT HAS BEEN MOVED
+    # ONCE. It used to be `veryquick/symlink2.test`, which acquired an earned row
+    # on 2026-09-14 — after which this arm would still have passed, but for the
+    # DIFFERENT reason tested one arm above (a diagnostic that does not match),
+    # silently becoming a duplicate and leaving "no row at all" with no witness.
+    # A pin whose subject stops being its subject is not a pin.
+    # [D-HARNESS-PE64-UNDER-WINE-ABORTS-THREE-TEST-FILES-THAT-PASS-NATIVELY-ON-WINDOWS]
+    _unearned_file = "veryquick/misc1.test"
+    check("the UNEARNED exemplar really has no row on this leg",
+          not any(re.search(r["pattern"], _unearned_file)
+                  for r in _pe["confounds"]
+                  if confound_match_kind(r) == "abort-file"),
+          "this arm proves 'no row matched'; if the exemplar ever acquires a row "
+          "the arm keeps passing for the wrong reason — pick another file")
+    _row2, _why2 = classify_abort(_pe, _pe_gate, _unearned_file, _diag)
     check("an UNEARNED abort is REFUSED, so it still fails the leg",
           _row2 is None, "it matched %r, which would silence an unproven abort"
                          % (_row2 and _row2["pattern"]))
@@ -13303,6 +13450,83 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("the abort pattern is matched against `perm/file`, not the file alone",
           _row3 is None,
           "a row earned under one permutation must not excuse another")
+    # ── THE THREE WINE ABORTS: EARNED TOGETHER, SCOPED TO THE LAUNCHED RUN ───
+    # ANCHOR, ONE LINE, DO NOT WRAP:
+    # D-HARNESS-PE64-UNDER-WINE-ABORTS-THREE-TEST-FILES-THAT-PASS-NATIVELY-ON-WINDOWS
+    #
+    # ★★ THREE FILES, THREE DIFFERENT CAUSES — which is exactly why the matrix
+    # below drives EVERY pattern against EVERY diagnostic. One row matching a
+    # sibling's failure would excuse a LOCATION, which is the defect the
+    # conjunction exists to prevent wearing a third costume, and these three are
+    # the likeliest place for it: same leg, same runtime, same anchor, all three
+    # landing in one commit.
+    # ★★★ AND THE SECOND HALF IS THE ONE THAT MATTERS: each row must REFUSE to
+    # fire on a NATIVE run. These aborts do not happen on real Windows — the same
+    # dss-built fixture passes all three there — so an unscoped row would excuse
+    # a future GENUINE abort on the platform that actually proves this leg.
+    # The fixtures are the REAL fatal tails, trimmed only of the per-host absolute
+    # paths, and laid out as a real aborted segment log is (passing tests first,
+    # fatal tail last) so abort_diagnostic_text is exercised rather than bypassed.
+    _wine_logs = {
+        "veryquick/symlink2.test":
+            "symlink.test-sharedcachesetting... Ok\n"
+            "Page-cache used:      now          0  max         13\n"
+            "testfixture.exe: Z:\\sqlite\\test\\lnk212.sym: File Not Found\n"
+            "    while executing\n"
+            '"exec -- $::env(ComSpec) /c del [file nativename $link]"\n'
+            '    (procedure "deleteWin32Symlink" line 2)\n',
+        "veryquick/win32lock.test":
+            "win32lock-1.2-3000-ok... Ok\n"
+            "win32lock-1.2-3025-ok... Ok\n"
+            "testfixture.exe: busy\n"
+            "    while executing\n"
+            '"lock_win32_file test.db 0 $::delay1"\n',
+        "veryquick/win32longpath.test":
+            "win32longpath-1.7.1f... Ok\n"
+            "04a8:err:virtual:virtual_setup_exception stack overflow 2112 bytes\n"
+            "testfixture.exe: error deleting "
+            '"\\\\?\\Z:\\run\\XXX\\YYY\\test.db": permission denied\n'
+            "    while executing\n"
+            '"file delete -force $fileName"\n',
+    }
+    _wine_names = sorted(_wine_logs)
+    _pe_native_gate = _gate(_probes_present, _same_kernel)
+    for _wn in _wine_names:
+        _wd = abort_diagnostic_text(_wine_logs[_wn])
+        check("the wine abort %s produces a fatal tail, not a passing line" % _wn,
+              _wd and "... Ok" not in _wd, "got %r" % _wd)
+        _wr, _ww = classify_abort(_pe, _pe_gate, _wn, _wd)
+        check("%s is EARNED on a LAUNCHED run and arrives with its provenance"
+              % _wn,
+              _wr is not None
+              and all(_wr["row"].get(k, "").strip()
+                      for k in CONFOUND_PROVENANCE_KEYS),
+              "row=%r why=%s" % (_wr and _wr["pattern"], _ww))
+        _nr, _nw = classify_abort(_pe, _pe_native_gate, _wn, _wd)
+        check("...and is SCOPED OUT on a NATIVE run, where it does not happen"
+              " (%s)" % _wn,
+              _nr is None,
+              "an `emulated:` abort row that fired natively would excuse a "
+              "GENUINE abort on real Windows — the platform this leg is proved "
+              "on. it matched %r; why=%s" % (_nr and _nr["pattern"], _nw))
+        for _wo in _wine_names:
+            if _wo == _wn:
+                continue
+            _xr, _xw = classify_abort(_pe, _pe_gate, _wn,
+                                      abort_diagnostic_text(_wine_logs[_wo]))
+            check("%s does NOT excuse %s's diagnostic" % (_wn, _wo),
+                  _xr is None,
+                  "the three aborts have three different causes; a row that "
+                  "matched a sibling's failure text would be excusing a "
+                  "location. it matched %r; why=%s"
+                  % (_xr and _xr["pattern"], _xw))
+        check("%s is supplied to the abort matcher WITH its `emulated:` scope"
+              % _wn,
+              _wr is not None and _wr["wire"].startswith("emulated:")
+              and _wr["wire"] in _pe_abort,
+              "a scoped pattern that reached the driver bare would excuse this "
+              "abort on the native Windows leg; wire=%r abort rows = %r"
+              % (_wr and _wr["wire"], _pe_abort))
     # Every abort row must CARRY the field the lint demands — asserted here too,
     # because the lint proves the catalogue is well-formed and this proves the
     # matcher is actually given something to conjoin with.
@@ -14944,14 +15168,43 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           "without this the axis becomes an inert alternative the next row reaches "
           "for, which is how a proxy gets re-cut to fit each new case")
     # ── THE MIGRATION OFF `scope`, ASSERTED SO IT CANNOT SILENTLY REGROW ─────
+    # ⚠ THIS LIST GREW ONCE, ON 2026-09-14, FROM TWO TO FIVE — recorded here
+    # rather than quietly re-pinned, because a ratchet that is re-cut whenever it
+    # fires asserts nothing. WHAT GREW AND WHY:
+    # [D-HARNESS-PE64-UNDER-WINE-ABORTS-THREE-TEST-FILES-THAT-PASS-NATIVELY-ON-WINDOWS]
+    # three `matches: abort-file` rows landed on pe64-x86_64 for aborts that
+    # happen ONLY under wine and NOT on native Windows, and they carry the SAME
+    # blocker as `^win32longpath-1\.3$` — which one of them is literally the
+    # downstream consequence of. The blocker is unchanged and is still named in
+    # every row: the mechanism is a CAPABILITY OF THE LAUNCHER (does its cmd.exe
+    # implement mklink; are byte-range locks mandatory; is an open past MAX_PATH
+    # refused), and `environmentProbes` runs once per KERNEL before any leg is
+    # built and takes no leg, so it cannot ask a per-launcher question.
+    # ★ WHAT THE PIN PROTECTS IS UNCHANGED AND STILL PROTECTED: a row may not
+    # reach for `scope` INSTEAD OF a probe it could have used. Membership is still
+    # exact, so a SIXTH row fails this arm and has to argue its case here.
     _scoped = [(l["label"], r["pattern"]) for l in legs for r in l["confounds"]
                if "scope" in r]
-    check("only the two rows with a NAMED blocker remain on the legacy `scope` axis",
+    check("only rows with a NAMED blocker remain on the legacy `scope` axis",
           sorted(_scoped) == [("elf64-arm64", "^writecrash-"),
+                              ("pe64-x86_64", "^veryquick/symlink2\\.test$"),
+                              ("pe64-x86_64", "^veryquick/win32lock\\.test$"),
+                              ("pe64-x86_64", "^veryquick/win32longpath\\.test$"),
                               ("pe64-x86_64", "^win32longpath-1\\.3$")],
           "the axis retires when the last row leaves it. A NEW row on `scope` is "
           "either a migration that was not done or a proxy being reached for; got %r"
           % sorted(_scoped))
+    # ★ AND THE AXIS IS NOW ALSO PINNED IN THE DIRECTION THAT COSTS: every row on
+    # it is `emulated`, i.e. every one of them claims "excused ONLY on a run that
+    # goes through a declared launcher". A row scoped `native` here would be
+    # claiming the opposite, and `native` is a scope no row has ever needed.
+    check("every legacy `scope` row is scoped `emulated`, never `native`",
+          all(r.get("scope") == "emulated"
+              for l in legs for r in l["confounds"] if "scope" in r),
+          "a `native`-scoped row would excuse a failure on the platform that "
+          "PROVES its leg, which is the one direction this axis must not take; "
+          "got %r" % [(l["label"], r["pattern"], r.get("scope"))
+                      for l in legs for r in l["confounds"] if "scope" in r])
     check("every surviving `scope` row NAMES what blocks its migration",
           all(r.get("scopeLegacyBlocker", "").strip()
               for l in legs for r in l["confounds"] if "scope" in r))
@@ -15725,7 +15978,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                                    "cc": "x86_64-linux-gnu\n"})
     cc, machine, rej = resolve_target_cc(_pe, runner=_r, which=_w)
     check("★ THE MEASURED FAILURE, REPRODUCED: a Linux host gcc is NOT accepted "
-          "for the pe64 leg", cc == "",
+          "for the pe64 leg", cc == [],
           "accepted %r (%s) — this is the fallback that produced "
           "'relocation R_X86_64_PC32 ... recompile with -fPIC' and killed a run "
           "after two legs had gone green" % (cc, machine))
@@ -15738,7 +15991,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     _w, _r = _host({"gcc"}, {"gcc": "x86_64-w64-mingw32\n"})
     cc, machine, _ = resolve_target_cc(_pe, runner=_r, which=_w)
     check("a WINDOWS host's bare `gcc` IS the pe64 leg's compiler",
-          (cc, machine) == ("gcc", "x86_64-w64-mingw32"),
+          (cc, machine) == (["gcc"], "x86_64-w64-mingw32"),
           "got %r/%r — deleting 'gcc' from the candidates would host-lock this "
           "leg in the other direction" % (cc, machine))
 
@@ -15747,26 +16000,138 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                     "gcc": "x86_64-linux-gnu\n"})
     cc, _, _ = resolve_target_cc(_pe, runner=_r, which=_w)
     check("the cross-compiler wins when both are present",
-          cc == "x86_64-w64-mingw32-gcc", "got %r" % cc)
+          cc == ["x86_64-w64-mingw32-gcc"], "got %r" % cc)
 
     _w, _r = _host({"cc", "gcc", "clang"}, {"cc": "aarch64-linux-gnu\n",
                                             "gcc": "aarch64-linux-gnu\n",
                                             "clang": "aarch64-linux-gnu\n"})
     cc, _, _ = resolve_target_cc(_elf64, runner=_r, which=_w)
     check("an arm64 Linux host's native cc is NOT accepted for the x86_64 leg",
-          cc == "",
+          cc == [],
           "D-HARNESS-ARM64-LEG-HOST-ARCH-HELPER-SO — got %r" % cc)
 
     _w, _r = _host({"cc"}, {})   # present, but the probe fails
     cc, _, rej = resolve_target_cc(_elf64, runner=_r, which=_w)
     check("a compiler that cannot STATE its target is refused, not assumed",
-          cc == "" and any("cannot state its target" in r for r in rej),
+          cc == [] and any("cannot state its target" in r for r in rej),
           "rejections=%r" % (rej,))
 
     _w, _r = _host(set(), {})
     cc, _, rej = resolve_target_cc(_elf64, runner=_r, which=_w)
     check("nothing on PATH is a refusal that says so",
-          cc == "" and all("not on PATH" in r for r in rej), "%r" % (rej,))
+          cc == [] and all("not on PATH" in r for r in rej), "%r" % (rej,))
+
+    # ── A CANDIDATE MAY BE AN ARGV, AND IT BUYS NO EXEMPTION FROM THE PROBE ──
+    # ANCHOR, ONE LINE, DO NOT WRAP:
+    # D-HARNESS-TARGETCC-BARE-NAME-HIDES-A-MULTI-TARGET-COMPILER-FROM-EVERY-LEG-BUT-ITS-DEFAULT
+    #
+    # ★★★ THE NEGATIVE IS THE ARM THAT MATTERS AND IT IS SYNTHESIZED, NOT
+    # DESCRIBED. The value of this vocabulary is worthless if it also lets a
+    # WRONG-TARGET compiler in, so the stub below answers by the FLAGS: the same
+    # program prints one triple bare and another with `-arch x86_64`, exactly as
+    # the measured Mac does. An implementation that probed only argv[0] would
+    # fail the ACCEPT arm; one that stopped comparing the answer against the
+    # leg's spec would fail the REFUSE arm. Neither can pass by accident.
+    _macho64 = leg_by_label(legs, "macho64-x86_64", path)
+    _macho_arm = leg_by_label(legs, "macho64-arm64", path)
+
+    def _flag_host(present, by_flags):
+        """(which, runner) for a host whose compiler answers BY ITS FLAGS.
+
+        `by_flags` is keyed on the probe argv joined with a space, so a stub that
+        ignored the flags could not satisfy it — which is the whole point."""
+        return ((lambda cc: ("/usr/bin/" + cc) if cc in present else None),
+                (lambda argv: (0, by_flags[" ".join(argv)])
+                              if " ".join(argv) in by_flags
+                              else (1, "unrecognised option")))
+
+    _apple = {"clang -dumpmachine": "arm64-apple-darwin25.6.0\n",
+              "clang -arch x86_64 -dumpmachine": "x86_64-apple-darwin25.6.0\n",
+              "cc -dumpmachine": "arm64-apple-darwin25.6.0\n"}
+    _w, _r = _flag_host({"clang", "cc"}, _apple)
+    cc, machine, rej = resolve_target_cc(_macho64, runner=_r, which=_w)
+    check("✔THE MEASURED MAC, REPRODUCED: an ARGV candidate reaches the target a "
+          "bare name cannot",
+          cc == ["clang", "-arch", "x86_64"]
+          and machine == "x86_64-apple-darwin25.6.0",
+          "got %r/%r — an implementation that probed only argv[0] would see "
+          "this clang's DEFAULT arm64 triple and refuse the leg its oracle, "
+          "which is the defect this row is about" % (cc, machine))
+    check("...and the SAME compiler still serves its own default leg by NAME",
+          resolve_target_cc(_macho_arm, runner=_r, which=_w)[0] == ["clang"],
+          "the argv candidate must not displace the bare name on the leg the "
+          "bare name is correct for")
+    # ★★★ THE REFUSAL. An argv that selects the WRONG target is refused exactly
+    # as a bare name would be — asserted with the SAME stub, one leg along.
+    _w_bad, _r_bad = _flag_host(
+        {"clang"}, {"clang -dumpmachine": "arm64-apple-darwin25.6.0\n",
+                    "clang -arch x86_64 -dumpmachine": "arm64-apple-darwin25.6.0\n"})
+    cc, _, rej = resolve_target_cc(_macho64, runner=_r_bad, which=_w_bad)
+    check("★ an ARGV candidate whose probe answers the WRONG triple is REFUSED",
+          cc == [],
+          "an argv that bought an exemption from -dumpmachine would stage a "
+          "wrong-target helper and false-red every loadext-* unit; got %r" % (cc,))
+    check("...and the rejection NAMES THE WHOLE ARGV, not just the program",
+          any("clang -arch x86_64" in r for r in rej),
+          "a ladder that printed `clang` three times cannot be acted on; %r"
+          % (rej,))
+    # `which` resolves the PROGRAM; the probe receives the WHOLE argv.
+    _w_gone, _r_gone = _flag_host(set(), {})
+    _, _, rej = resolve_target_cc(_macho64, runner=_r_gone, which=_w_gone)
+    check("an argv candidate whose PROGRAM is absent is 'not on PATH', by argv",
+          any(r.startswith("clang -arch x86_64: not on PATH") for r in rej),
+          "%r" % (rej,))
+    check("the target question is asked ONE way, of the WHOLE argv",
+          cc_machine_argv(["clang", "-arch", "x86_64"])
+          == ["clang", "-arch", "x86_64", CC_TARGET_MACHINE_FLAG]
+          and cc_machine_argv("gcc") == ["gcc", CC_TARGET_MACHINE_FLAG])
+    # The two consumers take argv, not a name — asserted on CONTENT, because a
+    # dropped flag is a different compiler and would read as a codegen difference.
+    check("the oracle build argv carries the candidate's OWN flags",
+          reference_oracle_argv(["clang", "-arch", "x86_64"],
+                                {"sources": ["/a.c"]}, "/out/ref", [])
+          == ["clang", "-arch", "x86_64", "-o", "/out/ref", "/a.c"])
+    check("the loadext CONTROL argv carries them too",
+          loadext_helper_reference_argv(
+              {"build": {"sharedLibFlags": ["-shared"]}},
+              ["clang", "-arch", "x86_64"], "/s.c", [], "/o.dylib")
+          == ["clang", "-arch", "x86_64", "-shared", "-o", "/o.dylib", "/s.c"])
+    # ── THE WIRE: one line, TAB separated, TRIPLE LAST ──────────────────────
+    check("the wire round-trips an argv candidate",
+          cc_argv_from_wire(TARGET_CC_WIRE_SEPARATOR.join(
+              ["clang", "-arch", "x86_64"])) == ["clang", "-arch", "x86_64"])
+    check("...and a bare name is byte-identical to the old contract",
+          TARGET_CC_WIRE_SEPARATOR.join(["gcc"] + ["x86_64-w64-mingw32"])
+          == "gcc\tx86_64-w64-mingw32")
+    check("an EMPTY wire means 'no control compiler', not a malformed one",
+          cc_argv_from_wire("") == [] and cc_argv_from_wire(None) == [])
+    # ── THE SHAPES cc_argv REFUSES, and the lint refuses them too ───────────
+    check("cc_argv REFUSES an empty argv list", _raises(lambda: cc_argv([])))
+    check("cc_argv REFUSES a blank or non-string member",
+          _raises(lambda: cc_argv(["clang", ""]))
+          and _raises(lambda: cc_argv(["clang", 3])))
+    check("cc_argv REFUSES a shape that is neither a name nor an argv",
+          _raises(lambda: cc_argv({"cc": "clang"})) and _raises(lambda: cc_argv(None)))
+
+    def _empty_candidate(d):
+        d["legs"][4]["build"]["targetCc"]["candidates"] = [[]]
+    check("an EMPTY argv candidate in the catalogue is a lint finding",
+          _lint_with_mutated_catalogue(_empty_candidate, "EMPTY argv list"),
+          "a candidate nobody can spawn would sit in the list reading as a "
+          "declared fallback")
+
+    def _blank_member(d):
+        d["legs"][4]["build"]["targetCc"]["candidates"] = [["clang", ""]]
+    check("a BLANK argv member in the catalogue is a lint finding",
+          _lint_with_mutated_catalogue(_blank_member, "not a non-empty string"))
+    # The shipped catalogue, asserted so the ordering cannot silently invert.
+    check("macho64-x86_64 declares its ARGV candidate FIRST and keeps the names",
+          _macho64["build"]["targetCc"]["candidates"]
+          == [["clang", "-arch", "x86_64"], "clang", "cc"],
+          "the bare names must survive: on a real x86_64 Mac `clang` IS this "
+          "leg's compiler with no flag, and deleting them would host-lock the "
+          "leg in the other direction [D-HARNESS-CROSS-HOST-ANY-TARGET]; got %r"
+          % (_macho64["build"]["targetCc"]["candidates"],))
 
     # ── the helper extension's name is a TARGET fact ─────────────────────────
     for leg in legs:
@@ -16772,8 +17137,13 @@ def main(argv=None):
                    help="pick LABEL's target C compiler — the FIRST declared "
                         "targetCc candidate that is on PATH AND proves, via "
                         "`" + CC_TARGET_MACHINE_FLAG + "`, that it targets this "
-                        "leg. Prints '<cc>\\t<triple>' on stdout; the per-"
-                        "candidate ladder always goes to stderr. Exits 3 when "
+                        "leg. Prints the compiler's ARGV then its TRIPLE, TAB "
+                        "separated, on one stdout line: the triple is always the "
+                        "LAST field and the argv is everything before it, so a "
+                        "bare-name candidate still prints '<cc>\\t<triple>' and a "
+                        "multi-target one prints 'clang\\t-arch\\tx86_64\\t<triple>' "
+                        "[D-HARNESS-TARGETCC-BARE-NAME-HIDES-A-MULTI-TARGET-COMPILER-FROM-EVERY-LEG-BUT-ITS-DEFAULT]. "
+                        "The per-candidate ladder always goes to stderr. Exits 3 when "
                         "none qualifies — a candidate that cannot state its "
                         "target is REFUSED, never assumed, because the compiler "
                         "builds this leg's dlopen()ed loadext helper and a "
@@ -17278,7 +17648,14 @@ def main(argv=None):
                     % (leg.get("label"), leg.get("spec"), leg.get("spec"),
                        loadext_helper_name(leg) or "loadext helper"))
                 return 3
-            sys.stdout.write("%s\t%s\n" % (cc, machine))
+            # ARGV FIELDS, THEN THE TRIPLE, TAB separated — the triple is always
+            # LAST, so both drivers take it off the end and keep everything
+            # before it as the compiler's argv. A bare-name candidate prints
+            # exactly the `<cc><TAB><triple>` line this contract has always had,
+            # so the generalisation costs the common case nothing.
+            # [D-HARNESS-TARGETCC-BARE-NAME-HIDES-A-MULTI-TARGET-COMPILER-FROM-EVERY-LEG-BUT-ITS-DEFAULT]
+            sys.stdout.write(
+                TARGET_CC_WIRE_SEPARATOR.join(list(cc) + [machine]) + "\n")
             return 0
         if args.oracle_report:
             leg = leg_by_label(load_catalogue(args.catalogue),
@@ -17351,7 +17728,8 @@ def main(argv=None):
             built = proc.returncode == 0 and os.path.isfile(oracle_output)
             report = {"status": "built" if built else "build-failed",
                       "leg": leg.get("label"), "spec": leg.get("spec"),
-                      "cc": cc, "triple": machine, "rc": proc.returncode,
+                      "cc": cc_display(cc), "ccArgv": list(cc),
+                      "triple": machine, "rc": proc.returncode,
                       "path": oracle_output if built else "",
                       "log": args.oracle_log, "sources": len(manifest.get("sources", [])),
                       "rejections": rejections}
@@ -17363,7 +17741,8 @@ def main(argv=None):
                 sys.stderr.write(
                     "the same-platform oracle for leg '%s' did NOT build (%s "
                     "exited %d). The leg reports NO ORACLE; read %s.\n"
-                    % (leg.get("label"), cc, proc.returncode, args.oracle_log))
+                    % (leg.get("label"), cc_display(cc), proc.returncode,
+                       args.oracle_log))
                 return 3
             return 0
         if args.loadext_builder:

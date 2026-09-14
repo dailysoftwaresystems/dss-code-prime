@@ -4567,6 +4567,24 @@ function Get-FilesAfter($corpusFiles, $boundary) {
   return $out
 }
 
+# ── RECORD A NOT-REACHED GROUP, WITH ITS ATTRIBUTION ─────────────────────────
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-PE64-UNDER-WINE-ABORTS-THREE-TEST-FILES-THAT-PASS-NATIVELY-ON-WINDOWS
+#
+# ★ ONE DOOR, so $notReached and $notReachedAbort can never desync by index. A
+# second bare `+=` that forgot its twin would shift every later attribution by one
+# and hand an EARNED abort somebody else's coverage hole — silently, and in the
+# direction that under-reports. Twin of not_reached() in build-and-test.sh.
+# -Abort: the abort (`perm/file`) this group is the direct consequence of, or ''
+#   when no abort accounts for it. ⚠ ONLY the remainder of the file an abort died
+#   in is ever attributed; an exhausted resume budget or a skipped permutation is
+#   a coverage hole in its own right and a proven-not-ours abort does not buy it.
+function Add-NotReached {
+  param([AllowEmptyString()][string]$Abort, [string]$Description)
+  $script:notReached      += $Description
+  $script:notReachedAbort += $Abort
+}
+
 # ── process hygiene ──────────────────────────────────────────────────────────
 # Scoped to OUR EXACT fixture binary path — never to the image name. A developer's
 # own testfixture.exe, or one belonging to a different checkout, is never touched.
@@ -5662,13 +5680,26 @@ function Resolve-LoadextHelper {
 $LegControlCc = @{}
 foreach ($leg in $RunnableLegs) {
   $lbl = $leg.label
-  $LegControlCc[$lbl] = @{ Cc = ''; Machine = '' }
+  $LegControlCc[$lbl] = @{ Cc = ''; Shown = ''; Machine = '' }
   $ccOut = & $python3.Source $LegsPy '--resolve-target-cc' $lbl 2>&1
   if ($LASTEXITCODE -eq 0) {
     $parts = ("$ccOut" -split "`t")
     if ($parts.Count -ge 2) {
-      $LegControlCc[$lbl] = @{ Cc = $parts[0].Trim(); Machine = $parts[1].Trim() }
-      Info "[$lbl] control cc: $($parts[0].Trim()) - it reports '$($parts[1].Trim())', which is $($leg.spec)'s arch+OS (asked, not assumed)"
+      # ANCHOR, ONE LINE, DO NOT WRAP:
+      # D-HARNESS-TARGETCC-BARE-NAME-HIDES-A-MULTI-TARGET-COMPILER-FROM-EVERY-LEG-BUT-ITS-DEFAULT
+      # ★ THE TRIPLE IS THE LAST FIELD; THE COMPILER IS EVERYTHING BEFORE IT. A
+      # candidate may be an ARGV (`clang -arch x86_64`), because a compiler whose
+      # target is chosen by a FLAG was otherwise invisible to every leg but its
+      # default. `.Cc` keeps the argv STILL TAB-JOINED — the resolver's own wire
+      # shape, handed to `-ReferenceCc` verbatim and never interpolated as a
+      # command here; `.Shown` is the readable form, for messages only.
+      # For a bare-name candidate this is byte-identical to the two-field line
+      # this driver has always read. Twin of the same split in build-and-test.sh.
+      $ccArgv = @($parts[0..($parts.Count - 2)] | ForEach-Object { $_.Trim() })
+      $LegControlCc[$lbl] = @{ Cc      = ($ccArgv -join "`t")
+                               Shown   = ($ccArgv -join ' ')
+                               Machine = $parts[-1].Trim() }
+      Info "[$lbl] control cc: $($ccArgv -join ' ') - it reports '$($parts[-1].Trim())', which is $($leg.spec)'s arch+OS (asked, not assumed)"
     } else {
       # ★ THE THIRD OUTCOME, WHICH USED TO FIRE NEITHER BRANCH AND SAY NOTHING.
       # rc=0 is the resolver's "I FOUND one" answer, and its contract is a single
@@ -5682,7 +5713,7 @@ foreach ($leg in $RunnableLegs) {
       # it would be the reverse defect. It is a NAMED, LOUD verdict with the bytes
       # quoted, consistent with the `default {}` arm of Resolve-LoadextHelper
       # above, which likewise refuses an unrecognised shape instead of assuming.
-      Warn "[$lbl] --resolve-target-cc exited 0 but did not answer in the declared <cc><TAB><machine> shape - got $($parts.Count) field(s): [$ccOut]. Treating this leg as having NO control compiler, and saying so: an rc=0 that will not parse is a RESOLVER defect, not the ordinary 'this host has no cross-compiler' case reported below. The loadext helper is still built by DSS; only the cross-check is lost."
+      Warn "[$lbl] --resolve-target-cc exited 0 but did not answer in the declared <argv>TAB...TAB<machine> shape (at least two TAB-separated fields, the machine triple LAST) - got $($parts.Count) field(s): [$ccOut]. Treating this leg as having NO control compiler, and saying so: an rc=0 that will not parse is a RESOLVER defect, not the ordinary 'this host has no cross-compiler' case reported below. The loadext helper is still built by DSS; only the cross-check is lost."
     }
   } else {
     Info "[$lbl] no CONTROL compiler on this host - the loadext helper will be built by DSS for $($leg.build.sharedLibFormat), which needs nothing from this machine."
@@ -5936,6 +5967,16 @@ $segments   = @(@{ Kind = 'tier'; Args = (Get-SegmentArgs $legXlate $TestFile @(
 $results    = @()          # one Read-CorpusSegment record per segment actually run
 $aborts     = @()          # one record per abort — these NEVER disappear from the verdict
 $notReached = @()          # units we can prove were never given a chance
+# ── WHICH ABORT, IF ANY, ACCOUNTS FOR EACH NOT-REACHED GROUP ─────────────────
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-PE64-UNDER-WINE-ABORTS-THREE-TEST-FILES-THAT-PASS-NATIVELY-ON-WINDOWS
+# Parallel to $notReached by INDEX. Holds the abort name (`perm/file`) for the
+# one group an abort is known to have taken down — the REMAINDER of the file it
+# died in — and '' for every other coverage hole. An EARNED abort may account for
+# its own remainder and NOTHING ELSE: a proven-not-ours abort does not buy amnesty
+# for an exhausted resume budget or a skipped permutation.
+# Twin of NOT_REACHED_ABORT in build-and-test.sh.
+$notReachedAbort = @()
 $hygiene    = @()          # leftover/killed fixture processes — never silent
 foreach ($k in $legRec.PreflightKills) { $hygiene += $k }
 if ($LockStolen) { $hygiene += "took over a STALE run lock left by $LockStolen" }
@@ -6070,7 +6111,7 @@ while ($si -lt $segments.Count) {
     if ($res.GaveUp) {
       $lastF = if ($res.Completed.Count) { $res.Completed[$res.Completed.Count - 1] } else { '(none)' }
       Warn "[$LegTag] segment $si stopped EARLY at the --maxerror cap (`*** Giving up...`) — this is NOT full coverage"
-      $notReached += "every file after $lastF in '$($seg.Label)' — the fixture hit its --maxerror cap and finalised early (raise it with --maxerror=N)"
+      Add-NotReached '' "every file after $lastF in '$($seg.Label)' — the fixture hit its --maxerror cap and finalised early (raise it with --maxerror=N)"
     }
     continue
   }
@@ -6132,7 +6173,7 @@ while ($si -lt $segments.Count) {
     Warn "        $zeroSig"
     Info "      first lines of that log ($logSize):"
     Get-Content $log -TotalCount 6 | ForEach-Object { Info "        $_" }
-    $notReached += "EVERY unit of the '$(if ($seg.Perm) { $seg.Perm } else { $Tier })' corpus — the fixture never completed a single file. PRECONDITION FAILURE: $zeroSig"
+    Add-NotReached '' "EVERY unit of the '$(if ($seg.Perm) { $seg.Perm } else { $Tier })' corpus — the fixture never completed a single file. PRECONDITION FAILURE: $zeroSig"
     break
   }
   # Carried to the NEXT segment so the comparison above has something to compare
@@ -6204,27 +6245,27 @@ while ($si -lt $segments.Count) {
     # the file got as far as a do_test. symlink2.test died before its first one,
     # so the last name in that log belonged to the PREVIOUS file — which is
     # exactly the confusion the old wording invited.
-    $notReached += "the REMAINDER of $abortFile under permutation '$(if ($perm) { $perm } else { '?' })' ($(if ($abortSource) { $abortSource } else { 'source unrecorded' }); last test emitted: $(if ($res.LastTest) { $res.LastTest } else { 'none' }))"
+    Add-NotReached "$(if ($perm) { $perm } else { '?' })/$abortFile" "the REMAINDER of $abortFile under permutation '$(if ($perm) { $perm } else { '?' })' ($(if ($abortSource) { $abortSource } else { 'source unrecorded' }); last test emitted: $(if ($res.LastTest) { $res.LastTest } else { 'none' }))"
   } else {
     $what = if ($forced) { "the resume boundary was FORCED to $(if ($boundary) { $boundary } else { 'the end of the corpus' }), so that one file may have been skipped without a verdict" }
             else { "the next segment resumes from $(if ($boundary) { $boundary } else { 'the end of the corpus' }) and will RE-ATTEMPT it" }
     # The traceback frame, when there was one, goes IN the report even though it
     # did not resolve: "the log named nothing" and "the log named something that
     # is not in this corpus" are different facts and the reader needs the second.
-    $notReached += "the UNNAMED file that aborted under permutation '$(if ($perm) { $perm } else { '?' })' after $(if ($lastDone) { $lastDone } else { 'the start of the permutation' }) — the log named no resolvable corpus file (last test: $(if ($res.LastTest) { $res.LastTest } else { 'none' }); traceback frame: $(if ($blamed) { $blamed } else { 'none' })); $what"
+    Add-NotReached '' "the UNNAMED file that aborted under permutation '$(if ($perm) { $perm } else { '?' })' after $(if ($lastDone) { $lastDone } else { 'the start of the permutation' }) — the log named no resolvable corpus file (last test: $(if ($res.LastTest) { $res.LastTest } else { 'none' }); traceback frame: $(if ($blamed) { $blamed } else { 'none' })); $what"
   }
   Get-Content $log -Tail 6 | ForEach-Object { Info "      $_" }
 
   if (-not $boundary) { Warn "[$LegTag] the abort is at the END of the corpus file list — nothing left to resume."; continue }
   if (-not $perm) {
     Warn "[$LegTag] CANNOT RESUME — the aborting permutation could not be determined from the log."
-    $notReached += "every unit after $boundary — no resume was possible (permutation undetermined; see $log)"
+    Add-NotReached '' "every unit after $boundary — no resume was possible (permutation undetermined; see $log)"
     continue
   }
   $permIdx = $TierPerms.IndexOf($perm)
   if ($resumes -ge $MaxResumes) {
     Warn "[$LegTag] RESUME BUDGET EXHAUSTED ($MaxResumes) — stopping. Raise DSS_MAX_RESUMES to go further."
-    $notReached += "every unit after $boundary in '$perm'" + $(if ($permIdx -ge 0 -and $permIdx -lt $TierPerms.Count - 1) { " and every permutation after '$perm' ($($TierPerms[($permIdx + 1)..($TierPerms.Count - 1)] -join ' '))" } else { '' }) + " — resume budget ($MaxResumes) exhausted"
+    Add-NotReached '' ("every unit after $boundary in '$perm'" + $(if ($permIdx -ge 0 -and $permIdx -lt $TierPerms.Count - 1) { " and every permutation after '$perm' ($($TierPerms[($permIdx + 1)..($TierPerms.Count - 1)] -join ' '))" } else { '' }) + " — resume budget ($MaxResumes) exhausted")
     continue
   }
   # (a) the rest of the aborting permutation, via sqlite's own file-selection hook.
@@ -6238,7 +6279,7 @@ while ($si -lt $segments.Count) {
   if ($seg.Kind -ne 'perm') {
     if ($permIdx -lt 0) {
       Warn "[$LegTag] permutation '$perm' is not named by $([System.IO.Path]::GetFileName($TestFile)) — cannot continue the tier past it."
-      $notReached += "every permutation after '$perm' in $([System.IO.Path]::GetFileName($TestFile)) — '$perm' is not one of its run_test_suite entries"
+      Add-NotReached '' "every permutation after '$perm' in $([System.IO.Path]::GetFileName($TestFile)) — '$perm' is not one of its run_test_suite entries"
     } elseif ($permIdx -lt $TierPerms.Count - 1) {
       $next = $TierPerms[$permIdx + 1]
       $tail += @{ Kind = 'tier'; Args = (Get-SegmentArgs $legXlate $TestFile @("--start=${next}:")); Patterns = @(); Perm = $next
@@ -6533,9 +6574,37 @@ if ($hygiene.Count) {
   foreach ($h in $hygiene) { Warn "[$LegTag] HYGIENE: $h" }
 }
 # A NOT-REACHED unit is a coverage hole even when nothing failed — never silent.
-if ($notReached.Count -and -not $aborts.Count) {
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-PE64-UNDER-WINE-ABORTS-THREE-TEST-FILES-THAT-PASS-NATIVELY-ON-WINDOWS
+#
+# ⛔ THIS GUARD USED TO READ `-not $aborts.Count`, AND IT WENT BLIND THE DAY AN
+# ABORT COULD BE EARNED. That condition was written when ANY abort meant FAIL, so
+# the abort branch above already carried the NOT-REACHED text and this arm only
+# had to cover the no-abort case. Once `matches: abort-file` let a leg pass WITH
+# aborts, a leg whose aborts were all earned landed in the PASS branch, skipped
+# this arm because $aborts was non-empty, and reported `PASS` with no word about
+# the whole test files that never finished. ✔MEASURED 2026-09-14: that is exactly
+# what the pe64 leg under wine would have reported the moment its three abort rows
+# landed. An excused abort stops COUNTING against dss; it never stops being a
+# coverage hole.
+#
+# ★ AND THE ACCOUNTING IS PER GROUP, NOT PER LEG. An EARNED abort accounts for
+# exactly ONE thing — the remainder of the file it died in — and nothing else: an
+# exhausted resume budget or a skipped permutation is its own hole and still fails
+# the leg, even on a run whose every abort was proven not ours.
+# Twin of the same block in build-and-test.sh.
+if ($notReached.Count -and -not $abortsUnearned.Count) {
+  $covUnaccounted = 0
+  for ($ni = 0; $ni -lt $notReached.Count; $ni++) {
+    $owner = if ($ni -lt $notReachedAbort.Count) { $notReachedAbort[$ni] } else { '' }
+    if (-not $owner -or $abortsEarned -notcontains $owner) { $covUnaccounted++ }
+  }
   $unitVerdict += "  [NOT FULL COVERAGE: $($notReached.Count) unit group(s) NOT REACHED — see $Ledger]"
-  $unitFail = $true
+  if ($covUnaccounted -gt 0) {
+    $unitFail = $true
+  } else {
+    Info "[$LegTag] the $($notReached.Count) NOT-REACHED group(s) are each the remainder of a PROVEN-not-DSS abort, so they do not fail this leg — they are still a coverage hole and are named below."
+  }
   foreach ($n in $notReached) { Warn "[$LegTag] NOT REACHED: $n" }
 }
 # The exclusion rides along on EVERY verdict — pass and fail alike — so a GREEN

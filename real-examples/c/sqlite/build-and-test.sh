@@ -469,7 +469,12 @@ declare -A LEG_SPEC=() LEG_FORMAT=() LEG_ARCH=() \
 # its VERDICT — one name from the closed vocabulary in
 # tests/test_support/arm_verdict_ledger.hpp, with a reason. Empty verdict = "still
 # in flight"; Step 9 refuses to let any declared leg end that way.
-declare -A LEG_CC=() LEG_CC_MACHINE=() LEG_TCL_LIB=() LEG_Z_LIB=() LEG_VERDICT=() LEG_VERDICT_DETAIL=()
+# ⓘ LEG_CC holds the compiler's ARGV, TAB-joined — the resolver's own wire shape —
+# and LEG_CC_SHOWN the same argv space-joined FOR MESSAGES ONLY. A candidate may
+# be an argv (`clang -arch x86_64`), so the two must not be confused: one is
+# handed to `--reference-cc` verbatim, the other is never fed to anything.
+# [D-HARNESS-TARGETCC-BARE-NAME-HIDES-A-MULTI-TARGET-COMPILER-FROM-EVERY-LEG-BUT-ITS-DEFAULT]
+declare -A LEG_CC=() LEG_CC_SHOWN=() LEG_CC_MACHINE=() LEG_TCL_LIB=() LEG_Z_LIB=() LEG_VERDICT=() LEG_VERDICT_DETAIL=()
 # EVERY leg that resolved a libtcl, INCLUDING one whose zlib did not — the Tcl
 # header/library coherence check (Step 6) is about a version skew, and a leg that
 # found its Tcl can witness one whether or not it is buildable. LEG_TCL_LIB above
@@ -4060,7 +4065,7 @@ resolve_leg_target_cc() {       # resolve_leg_target_cc <leg>  -> 0 + LEG_CC set
   # trap the resolver call below documents.
   if ! _err="$(mktemp)"; then
     LEG_CC_WHY="mktemp could not create a temp file for the target-cc probe's stderr (TMPDIR='${TMPDIR:-<unset>}'), so the candidate ladder was never captured and no compiler could be resolved for this leg"
-    unset "LEG_CC[$leg]"
+    unset "LEG_CC[$leg]" "LEG_CC_SHOWN[$leg]"
     return 5
   fi
   # rc DIRECTLY off python3, never after a pipe, and the `if` keeps errexit out
@@ -4083,13 +4088,39 @@ resolve_leg_target_cc() {       # resolve_leg_target_cc <leg>  -> 0 + LEG_CC set
   # Flattened to one line: it becomes a ledger DETAIL, which Step 9 prints per leg.
   LEG_CC_WHY="$(tr '\n' ' ' < "$_err" 2>/dev/null || true)"; rm -f "$_err"
   [[ "$_rc" -eq 0 ]] || return "$_rc"
-  # `<cc>\t<triple>` — TAB-separated for the same reason acq_field is: neither
-  # field may be re-derived here, and a compiler PATH can contain spaces.
-  LEG_CC["$leg"]="${_out%%$'\t'*}"
-  LEG_CC_MACHINE["$leg"]="${_out#*$'\t'}"
+  # `<argv0>\t…\t<argvN>\t<triple>` — TAB-separated for the same reason acq_field
+  # is: no field may be re-derived here, and a compiler PATH can contain spaces.
+  # ANCHOR, ONE LINE, DO NOT WRAP:
+  # D-HARNESS-TARGETCC-BARE-NAME-HIDES-A-MULTI-TARGET-COMPILER-FROM-EVERY-LEG-BUT-ITS-DEFAULT
+  # ★ THE TRIPLE IS THE LAST FIELD AND THE COMPILER IS EVERYTHING BEFORE IT. A
+  # candidate may be an ARGV (`clang -arch x86_64`), because a compiler whose
+  # target is chosen by a FLAG was otherwise invisible to every leg but its
+  # default. LEG_CC therefore holds the argv STILL TAB-JOINED — bash associative
+  # arrays cannot hold arrays — and it is handed to `--reference-cc` verbatim, in
+  # exactly the shape the resolver splits. It is NEVER interpolated as a command
+  # here; LEG_CC_SHOWN is the readable form and is for messages only.
+  # ⓘ For a bare-name candidate this is byte-identical to the two-field line this
+  # driver has always read.
+  local -a _cc_fields=()
+  IFS=$'\t' read -r -a _cc_fields <<< "$_out"
+  if [[ ${#_cc_fields[@]} -lt 2 ]]; then
+    LEG_CC_WHY="the resolver exited 0 but did not answer in the declared <argv>TAB…TAB<triple> shape (got ${#_cc_fields[@]} field(s): '$_out')"
+    unset "LEG_CC[$leg]" "LEG_CC_SHOWN[$leg]"; return 4
+  fi
+  # ⓘ `${arr[-1]}` READS on bash 4.2+, which this driver's declared bash 4+ floor
+  # covers, but `unset 'arr[-1]'` needs 4.3 — so the REMOVAL spells the index out.
+  # Both name the same element; only the second spelling is version-fussy.
+  LEG_CC_MACHINE["$leg"]="${_cc_fields[-1]}"
+  unset "_cc_fields[$(( ${#_cc_fields[@]} - 1 ))]"
+  # ⓘ `${arr[*]}` joins with the FIRST CHARACTER OF IFS, and IFS is the DEFAULT
+  # here: the `IFS=$'\t'` above is a PREFIX assignment and applied to `read`
+  # alone. So LEG_CC_SHOWN comes out space-joined while LEG_CC keeps its tabs —
+  # which is the difference between the two, and it is not an accident.
+  LEG_CC["$leg"]="$(printf '%s\t' "${_cc_fields[@]}")"; LEG_CC["$leg"]="${LEG_CC[$leg]%$'\t'}"
+  LEG_CC_SHOWN["$leg"]="${_cc_fields[*]}"
   [[ -n "${LEG_CC[$leg]}" ]] || {
     LEG_CC_WHY="the resolver exited 0 but named no compiler (output: '$_out')"
-    unset "LEG_CC[$leg]"; return 4
+    unset "LEG_CC[$leg]" "LEG_CC_SHOWN[$leg]"; return 4
   }
   return 0
 }
@@ -4147,7 +4178,7 @@ for leg in "${LEG_ORDER[@]}"; do
     [[ -z "${LEG_CC_WHY// /}" ]] || info "      the resolver's ladder: ${LEG_CC_WHY}"
     continue
   fi
-  info "[$leg] control cc: ${LEG_CC[$leg]} — it reports '${LEG_CC_MACHINE[$leg]}', which is ${LEG_SPEC[$leg]}'s arch+OS (asked, not assumed)"
+  info "[$leg] control cc: ${LEG_CC_SHOWN[$leg]} — it reports '${LEG_CC_MACHINE[$leg]}', which is ${LEG_SPEC[$leg]}'s arch+OS (asked, not assumed)"
   [[ -z "${LEG_CC_WHY// /}" ]] || info "      candidates passed over: ${LEG_CC_WHY}"
 done
 
@@ -4497,6 +4528,24 @@ resolve_abort_file() {         # resolve_abort_file <name-or-path> <corpus-list-
       }
       if (best>0 && (best>bi || (best==bi && L>bl))) { bi=best; bl=L; bf=f } }
     END { if (bf!="") print bf }' "$2"
+}
+
+# ── RECORD A NOT-REACHED GROUP, WITH ITS ATTRIBUTION ─────────────────────────
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-PE64-UNDER-WINE-ABORTS-THREE-TEST-FILES-THAT-PASS-NATIVELY-ON-WINDOWS
+#
+# ★ ONE DOOR, so NOT_REACHED and NOT_REACHED_ABORT can never desync by index. A
+# second bare `NOT_REACHED+=` that forgot its twin would shift every later
+# attribution by one and hand an EARNED abort somebody else's coverage hole —
+# silently, and in the direction that under-reports.
+# $1  the abort (`perm/file`) this group is the direct consequence of, or "" when
+#     no abort accounts for it. ⚠ ONLY the remainder of the file an abort died in
+#     is ever attributed: an exhausted resume budget or a skipped permutation is a
+#     coverage hole in its own right and a proven-not-ours abort does not buy it.
+# $2  the human description that goes in the ledger.
+not_reached() {                # not_reached <abort-name-or-empty> <description>
+  NOT_REACHED+=("$2")
+  NOT_REACHED_ABORT+=("$1")
 }
 # Every corpus basename byte-wise AFTER <boundary> — the SQLITE_TEST_PATTERN_LIST
 # superset sqlite intersects with the permutation's own -files.
@@ -6663,6 +6712,16 @@ for leg in "${LEG_ORDER[@]}"; do
   US=$'\x1f'
   SEGQ=("tier${US}${US}$DSS_TIER.test${US}${US}${LAUNCH_TIER_SCRIPT}${US}")
   declare -a SEG_LOGS=() SEG_LABELS=() SEG_RCS=() SEG_COUNTS=() ABORTS=() ABORT_LOGS=() ABORT_ROWS=() NOT_REACHED=() HYGIENE=() CALIBRATION=()
+  # ── WHICH ABORT, IF ANY, ACCOUNTS FOR EACH NOT-REACHED GROUP ───────────────
+  # ANCHOR, ONE LINE, DO NOT WRAP:
+  # D-HARNESS-PE64-UNDER-WINE-ABORTS-THREE-TEST-FILES-THAT-PASS-NATIVELY-ON-WINDOWS
+  # Parallel to NOT_REACHED by INDEX. Holds the abort name (`perm/file`) for the
+  # one group an abort is known to have taken down — the REMAINDER of the file it
+  # died in — and "" for every other coverage hole. An EARNED abort may account
+  # for its own remainder and NOTHING ELSE: a proven-not-ours abort does not buy
+  # amnesty for an exhausted resume budget or a skipped permutation.
+  # Twin of $notReachedAbort in build-and-test.ps1.
+  declare -a NOT_REACHED_ABORT=()
   sum_tests=0; sum_errors=0; n_summarised=0; der_tests=0; der_errors=0; n_derived=0
   # Carry Step 7's pre-flight kills into this leg's hygiene record, then sweep again:
   # a leftover fixture holds file handles (the abort class this engine exists for IS
@@ -6799,7 +6858,7 @@ for leg in "${LEG_ORDER[@]}"; do
       # summary, so it would otherwise read as a full run. Say so instead.
       if [[ -n "$s_gaveup" ]]; then
         warn "[$leg] segment $seg_i stopped EARLY at the --maxerror cap ('*** Giving up...') — this is NOT full coverage"
-        NOT_REACHED+=("every file after ${s_done:-(none)} in '$s_label' — the fixture hit its --maxerror cap and finalised early (raise it with --maxerror=N)")
+        not_reached "" "every file after ${s_done:-(none)} in '$s_label' — the fixture hit its --maxerror cap and finalised early (raise it with --maxerror=N)"
       fi
       continue
     fi
@@ -6858,7 +6917,7 @@ for leg in "${LEG_ORDER[@]}"; do
       warn "        $s_zero_sig"
       info "      first lines of that log ($_sz):"
       head -6 "$seglog" 2>/dev/null | sed 's/^/        /'
-      NOT_REACHED+=("EVERY unit of the '${s_perm:-$DSS_TIER}' corpus — the fixture never completed a single file. PRECONDITION FAILURE: $s_zero_sig")
+      not_reached "" "EVERY unit of the '${s_perm:-$DSS_TIER}' corpus — the fixture never completed a single file. PRECONDITION FAILURE: $s_zero_sig"
       break
     fi
     # Carried to the NEXT segment so the comparison above has something to compare
@@ -6940,7 +6999,7 @@ for leg in "${LEG_ORDER[@]}"; do
       # when the file got as far as a do_test. symlink2.test died before its
       # first one, so the last name in that log belonged to the PREVIOUS file —
       # which is exactly the confusion the old wording invited.
-      NOT_REACHED+=("the REMAINDER of $abort_file under permutation '${perm:-?}' (${abort_source:-source unrecorded}; last test emitted: ${s_last:-none})")
+      not_reached "${perm:-?}/$abort_file" "the REMAINDER of $abort_file under permutation '${perm:-?}' (${abort_source:-source unrecorded}; last test emitted: ${s_last:-none})"
     else
       if [[ "$forced" == 1 ]]; then
         what="the resume boundary was FORCED to ${boundary:-the end of the corpus}, so that one file may have been skipped without a verdict"
@@ -6950,7 +7009,7 @@ for leg in "${LEG_ORDER[@]}"; do
       # The traceback frame, when there was one, goes IN the report even though it
       # did not resolve: "the log named nothing" and "the log named something that
       # is not in this corpus" are different facts and the reader needs the second.
-      NOT_REACHED+=("the UNNAMED file that aborted under permutation '${perm:-?}' after ${s_done:-the start of the permutation} — the log named no resolvable corpus file (last test: ${s_last:-none}; traceback frame: ${s_blame:-none}); $what")
+      not_reached "" "the UNNAMED file that aborted under permutation '${perm:-?}' after ${s_done:-the start of the permutation} — the log named no resolvable corpus file (last test: ${s_last:-none}; traceback frame: ${s_blame:-none}); $what"
     fi
     tail -6 "$seglog" 2>/dev/null | sed 's/^/      /'
 
@@ -6959,7 +7018,7 @@ for leg in "${LEG_ORDER[@]}"; do
     fi
     if [[ -z "$perm" ]]; then
       warn "[$leg] CANNOT RESUME — the aborting permutation could not be determined from the log."
-      NOT_REACHED+=("every unit after $boundary — no resume was possible (permutation undetermined; see $seglog)"); continue
+      not_reached "" "every unit after $boundary — no resume was possible (permutation undetermined; see $seglog)"; continue
     fi
     perm_idx=-1
     for ((k = 0; k < ${#TIER_PERMS[@]}; k++)); do [[ "${TIER_PERMS[$k]}" == "$perm" ]] && { perm_idx=$k; break; }; done
@@ -6967,7 +7026,7 @@ for leg in "${LEG_ORDER[@]}"; do
       warn "[$leg] RESUME BUDGET EXHAUSTED ($DSS_MAX_RESUMES) — stopping. Raise DSS_MAX_RESUMES to go further."
       rest=""
       [[ $perm_idx -ge 0 && $perm_idx -lt $((${#TIER_PERMS[@]} - 1)) ]] && rest=" and every permutation after '$perm' (${TIER_PERMS[*]:$((perm_idx + 1))})"
-      NOT_REACHED+=("every unit after $boundary in '$perm'$rest — resume budget ($DSS_MAX_RESUMES) exhausted"); continue
+      not_reached "" "every unit after $boundary in '$perm'$rest — resume budget ($DSS_MAX_RESUMES) exhausted"; continue
     fi
     # (a) the rest of the aborting permutation, via sqlite's own file-selection hook.
     resumes=$((resumes + 1)); last_boundary="$boundary"
@@ -6980,7 +7039,7 @@ for leg in "${LEG_ORDER[@]}"; do
     if [[ "$s_kind" != "perm" ]]; then
       if [[ $perm_idx -lt 0 ]]; then
         warn "[$leg] permutation '$perm' is not named by ${TEST_FILE##*/} — cannot continue the tier past it."
-        NOT_REACHED+=("every permutation after '$perm' in ${TEST_FILE##*/} — '$perm' is not one of its run_test_suite entries")
+        not_reached "" "every permutation after '$perm' in ${TEST_FILE##*/} — '$perm' is not one of its run_test_suite entries"
       elif [[ $perm_idx -lt $((${#TIER_PERMS[@]} - 1)) ]]; then
         nextperm="${TIER_PERMS[$((perm_idx + 1))]}"
         TAIL_SEGS+=("tier${US}${nextperm}${US}${TEST_FILE##*/} --start=${nextperm}:${US}${US}${LAUNCH_TIER_SCRIPT}${US}--start=${nextperm}:")
@@ -7330,9 +7389,41 @@ for leg in "${LEG_ORDER[@]}"; do
     for h in "${HYGIENE[@]}"; do warn "[$leg] HYGIENE: $h"; done
   fi
   # A NOT-REACHED unit is a coverage hole even when nothing failed — never silent.
-  if [[ ${#NOT_REACHED[@]} -gt 0 && ${#ABORTS[@]} -eq 0 ]]; then
+  # ANCHOR, ONE LINE, DO NOT WRAP:
+  # D-HARNESS-PE64-UNDER-WINE-ABORTS-THREE-TEST-FILES-THAT-PASS-NATIVELY-ON-WINDOWS
+  #
+  # ⛔ THIS GUARD USED TO READ `${#ABORTS[@]} -eq 0`, AND IT WENT BLIND THE DAY AN
+  # ABORT COULD BE EARNED. That condition was written when ANY abort meant FAIL,
+  # so the abort branch above already carried the NOT-REACHED text and this arm
+  # only had to cover the no-abort case. Once `matches: abort-file` let a leg pass
+  # WITH aborts, a leg whose aborts were all earned landed in the PASS branch,
+  # skipped this arm because ABORTS was non-empty, and reported `PASS` with no
+  # word about the whole test files that never finished. ✔MEASURED 2026-09-14:
+  # that is exactly what the pe64 leg under wine would have reported the moment
+  # its three abort rows landed. An excused abort stops COUNTING against dss; it
+  # never stops being a coverage hole.
+  #
+  # ★ AND THE ACCOUNTING IS PER GROUP, NOT PER LEG. An EARNED abort accounts for
+  # exactly ONE thing — the remainder of the file it died in — and nothing else:
+  # an exhausted resume budget or a skipped permutation is its own hole and still
+  # fails the leg, even on a run whose every abort was proven not ours.
+  if [[ ${#NOT_REACHED[@]} -gt 0 && ${#ABORTS_UNEARNED[@]} -eq 0 ]]; then
+    _cov_unaccounted=0
+    for _ni in "${!NOT_REACHED[@]}"; do
+      _owner="${NOT_REACHED_ABORT[$_ni]:-}"; _acct=0
+      if [[ -n "$_owner" ]]; then
+        for _e in ${ABORTS_EARNED[@]+"${ABORTS_EARNED[@]}"}; do
+          [[ "$_e" == "$_owner" ]] && { _acct=1; break; }
+        done
+      fi
+      [[ $_acct -eq 1 ]] || _cov_unaccounted=$((_cov_unaccounted + 1))
+    done
     UNIT_VERDICT["$leg"]="${UNIT_VERDICT[$leg]}  [NOT FULL COVERAGE: ${#NOT_REACHED[@]} unit group(s) NOT REACHED — see $ledger]"
-    UNIT_FAILS=$((UNIT_FAILS + 1))
+    if [[ $_cov_unaccounted -gt 0 ]]; then
+      UNIT_FAILS=$((UNIT_FAILS + 1))
+    else
+      info "[$leg] the ${#NOT_REACHED[@]} NOT-REACHED group(s) are each the remainder of a PROVEN-not-DSS abort, so they do not fail this leg — they are still a coverage hole and are named below."
+    fi
     for n in "${NOT_REACHED[@]}"; do warn "[$leg] NOT REACHED: $n"; done
   fi
   LEG_SEGMENTS["$leg"]="$nseg"; LEG_RESUMES["$leg"]="$resumes"
@@ -7350,7 +7441,7 @@ for leg in "${LEG_ORDER[@]}"; do
   # "we never tested it".
   LEG_VERDICT["$leg"]="ran"
   LEG_VERDICT_DETAIL["$leg"]="${UNIT_VERDICT[$leg]:-<no unit verdict recorded>}"
-  unset real confound ABORTS ABORT_ROWS NOT_REACHED HYGIENE CALIBRATION SEG_LOGS SEG_LABELS SEG_RCS SEG_COUNTS TIER_PERMS TIER_PREFIXES
+  unset real confound ABORTS ABORT_ROWS NOT_REACHED NOT_REACHED_ABORT HYGIENE CALIBRATION SEG_LOGS SEG_LABELS SEG_RCS SEG_COUNTS TIER_PERMS TIER_PREFIXES
 done
 
 # ── Step 9 — results ─────────────────────────────────────────────────────────
