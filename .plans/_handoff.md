@@ -50,7 +50,7 @@ below is IN it.
 
 ---
 
-**Last updated:** 2026-09-14 — cycles **P14 … P66**. ⛔ **P66 IS NOT COMPLETE — PR #57's CI IS RED.** The `run_gate_guard` red is fixed (`090f090e`); a second, unrelated red — `packed_atomic_member_concurrency` timing out on `windows-msvc-release` — is a P0 production row that lane `bl` is working. §0.0's first block says what is owed; the block after it overstates the state.
+**Last updated:** 2026-09-15 — cycles **P14 … P66**. ⛔ **P66 IS NOT COMPLETE.** PR #57's CI is GREEN at `090f090e`, which fixed the `run_gate_guard` red. But the run before it exposed a second defect that does not reproduce on every runner — `packed_atomic_member_concurrency` stalling a `windows-msvc-release` runner — and it is a P0 production row that lane `bl` is working. §0.0's first block says what is owed; the block after it overstates the state.
 
 ---
 
@@ -58,12 +58,12 @@ below is IN it.
 
 ## §0.0 — STATE
 
-⛔ **P66 IS STILL NOT COMPLETE — PR #57's CI IS RED FOR A SECOND, UNRELATED REASON. Read this block first; the block below it that says the cycle is complete is FALSE.**
+⛔ **P66 IS STILL NOT COMPLETE — CI IS GREEN AT `090f090e`, BUT A SECOND DEFECT CI EXPOSED IS STILL OPEN. Read this block first; the block below it that says the cycle is complete is FALSE.**
 
-✔MEASURED 2026-09-14. Two CI reds, two different defects:
+✔MEASURED 2026-09-14 and 2026-09-15. Two CI reds, two different defects:
 
-1. **`run_gate_guard` at `87175a7a` — FIXED in `090f090e` (pushed).** Lane `rt` closed `D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY`: the fixture raced fixed-lifetime stand-ins against the gate's sampling, and both twins followed recycled parent pids. CI has not yet been observed on `090f090e`.
-2. **`packed_atomic_member_concurrency` at `b3e006a8` — OPEN, P0 production.** `run_gate_guard` PASSED on that run. `windows-msvc-release` failed because the DSS-built pe64 witness exceeded the runners' 5000 ms child limit three times in one job. The tests running beside it were a median 3.97× and 3.54× slower in its two windows, while the run as a whole was faster than the green one (median 0.65×).
+1. **`run_gate_guard` at `87175a7a` — FIXED in `090f090e` (pushed).** Lane `rt` closed `D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY`: the fixture raced fixed-lifetime stand-ins against the gate's sampling, and both twins followed recycled parent pids. ✔**CI GREEN on `090f090e`** (Pipeline run 34921813148): all five test legs; `windows-msvc-release` 2179/2179, `run_gate_guard` Passed in 257.23 s.
+2. **`packed_atomic_member_concurrency` at `b3e006a8` — OPEN, P0 production.** `run_gate_guard` PASSED on that run. `windows-msvc-release` failed because the DSS-built pe64 witness exceeded the runners' 5000 ms child limit three times in one job. The tests running beside it were a median 3.97× and 3.54× slower in its two windows, while the run as a whole was faster than the green one (median 0.65×). ✔The same witness bytes PASSED on `090f090e`'s runner (2.14 s and 2.66 s; that run totalled 863.62 s, like the earlier green run's 871.20 s, against the red run's 656.35 s). ⚠ So a green CI run does NOT mean it is fixed: a later run can go red on it again until the runtime changes.
    `D-C-ATOMICS-RUNTIME-PE64-BUS-LOCKS-EVERY-ACCESS-TO-A-CACHE-LINE-STRADDLING-OBJECT`
    🧠 The mechanism is INFERRED, not measured: the witness makes every access a split lock (a bus lock), and that runner's host likely throttles bus locks. The local gate cannot see it — this workstation's CPU reports no bus-lock detection.
 
