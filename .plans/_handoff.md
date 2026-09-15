@@ -50,7 +50,7 @@ below is IN it.
 
 ---
 
-**Last updated:** 2026-09-14 — cycles **P14 … P66**. ⛔ **P66 IS NOT COMPLETE — PR #57's CI WENT RED AFTER THE EXIT WAS WRITTEN UP.** `windows-msvc-release` failed `run_gate_guard` at `87175a7a`; a P0 harness row is OPEN and lane `rt` is working it. §0.0's first block says what is owed; the block after it overstates the state.
+**Last updated:** 2026-09-14 — cycles **P14 … P66**. ⛔ **P66 IS NOT COMPLETE — PR #57's CI IS RED.** The `run_gate_guard` red is fixed (`090f090e`); a second, unrelated red — `packed_atomic_member_concurrency` timing out on `windows-msvc-release` — is a P0 production row that lane `bl` is working. §0.0's first block says what is owed; the block after it overstates the state.
 
 ---
 
@@ -58,20 +58,23 @@ below is IN it.
 
 ## §0.0 — STATE
 
-⛔ **SUPERSEDED THE SAME DAY — PR #57's CI WENT RED AFTER THE BLOCK BELOW WAS WRITTEN. Read this first; everything below it that says the cycle is complete is FALSE.**
+⛔ **P66 IS STILL NOT COMPLETE — PR #57's CI IS RED FOR A SECOND, UNRELATED REASON. Read this block first; the block below it that says the cycle is complete is FALSE.**
 
-✔MEASURED 2026-09-14, PR #57 run 34902431890, job 104171431676, at `87175a7a`: `windows-msvc-release` failed `run_gate_guard`, 1 of 2179. Arm `28-sh-compiler-exits-midrun` printed `compilers: none` and did not say `seen when this run STARTED`, while its `.ps1` twin (arm 29) saw the same kind of stand-in at start; `30-parity-union` is red. Every other CI leg is green on that commit, and the guard is green locally in the identical MSVC Release configuration.
+✔MEASURED 2026-09-14. Two CI reds, two different defects:
+
+1. **`run_gate_guard` at `87175a7a` — FIXED in `090f090e` (pushed).** Lane `rt` closed `D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY`: the fixture raced fixed-lifetime stand-ins against the gate's sampling, and both twins followed recycled parent pids. CI has not yet been observed on `090f090e`.
+2. **`packed_atomic_member_concurrency` at `b3e006a8` — OPEN, P0 production.** `run_gate_guard` PASSED on that run. `windows-msvc-release` failed because the DSS-built pe64 witness exceeded the runners' 5000 ms child limit three times in one job. The tests running beside it were a median 3.97× and 3.54× slower in its two windows, while the run as a whole was faster than the green one (median 0.65×).
+   `D-C-ATOMICS-RUNTIME-PE64-BUS-LOCKS-EVERY-ACCESS-TO-A-CACHE-LINE-STRADDLING-OBJECT`
+   🧠 The mechanism is INFERRED, not measured: the witness makes every access a split lock (a bus lock), and that runner's host likely throttles bus locks. The local gate cannot see it — this workstation's CPU reports no bus-lock detection.
 
 **Owed, in order:**
 
-1. Lane `rt` (`.worktrees/rt`, seeded at `34cfbb68`) closes this P0:
-   `D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY`
-   Two candidates, both to be MEASURED: the fixture races fixed-lifetime stand-ins against the gate's sampling latency (closed twice before by moving a sleep number, 12 s then 3 s, never by removing the race); and a stale `ParentProcessId` after PID reuse, which neither twin guards because neither process table carries a creation time. ⛔ No timing number may be the remedy.
-2. Fold `rt`, apply its row, and re-take the eight-run gate `{Debug, Release} × four legs` on the resulting tree.
-3. The operator re-runs CI. `Run Pipes` is theirs alone — never label, re-run or push to trigger it.
+1. Lane `bl` (`.worktrees/bl`) measures the mechanism and, if it is confirmed, fixes the pe64 atomics runtime at root. ⛔ Not the remedy: a longer child limit, fewer rounds, a moved object, an excluded or flaky-marked example. ⚠ The fix reverses a stated P54 design choice; if it would change what a valid program observes, it goes to the operator first.
+2. Fold `bl`, apply its row, and take the eight-run gate `{Debug, Release} × four legs` on the resulting tree.
+3. Push. With `Run Pipes` on, CI runs by itself — read the finished run's failing test NAMES before concluding anything from it.
 4. Only then the merge.
 
-⚠ One harness row has been opened since the table below was measured — re-derive the counts with `check-anchor-balance`; do not read them off it.
+⚠ Rows have been opened and closed since the table below was measured — re-derive every count with `check-anchor-balance`; do not read them off it.
 
 ### What was written as the exit state, before the red (kept, not deleted)
 
