@@ -1,12 +1,13 @@
 rule:root
   rule:topLevel
-    rule:externDecl
-      rule:externSpecifiers
-        tok:"extern"
-      rule:typeRefAllowingStruct
-        rule:typeBaseAllowingStruct
-          rule:typeSpecifierSeq
-            tok:"int"
+    rule:topLevelDecl
+      rule:declSpecifiers
+        rule:singleDeclSpecifier
+          tok:"extern"
+      rule:topLevelHead
+        rule:typeSpecifierSeq
+          tok:"int"
+      rule:declAttrRun
       rule:initDeclaratorList
         rule:initDeclarator
           rule:declarator
@@ -23,7 +24,7 @@ rule:root
                       rule:directDeclarator
                         tok:"fmt"
                 tok:")"
-      rule:externDeclTail
+      rule:topLevelDeclTail
         tok:";"
   rule:topLevel
     rule:topLevelDecl

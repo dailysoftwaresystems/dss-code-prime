@@ -1,0 +1,22 @@
+{
+  "$comment": "D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME, arm64 half (P54, lane ad) — the aarch64 mirror of what `c_inline_asm_x86_sse_operands` witnesses for x86-64. ★★★ THE DEFECT, BY EXECUTION: `arm64.target.json` declares `asmConstraints` letter `w` ⇒ register class `fpr`, and `asm-arm64-gas.lang.json` declared NO instruction able to name that class — ✔MEASURED at the CLI, 51 instruction rows covering 29 of the target's 87 opcodes, with ALL TWENTY FP/SIMD opcodes unspelled, so `__asm__(\"nop\" : \"+w\"(r))` over a double compiled rc=0 while `__asm__(\"fadd %d0, %d1, %d2\" : \"=w\"(r) : \"w\"(a), \"w\"(b))` died `A_AsmTextUnsupported … unknown mnemonic 'fadd'`. Seven rows now ship (51 -> 58; coverage 29 -> 36) and this file reads their ARITHMETIC back through the constraint. ★★ A COMPILE-ONLY ARM WOULD BE VACUOUS: the failure mode replaced is a LOUD refusal, so a build-only check passes the moment any row exists under those names. Only execution separates *the operand reached a floating-point register and the instruction ran* from *a row exists*. ★★★ THE SINGLE-PRECISION SHAPES ARE THE WIDTH-AXIS DISCRIMINATOR AND THE REASON THIS IS NOT THE DOUBLE SHAPES TWICE: no dialect row declares a `width`, so the REGISTER VIEW in the template is the only thing choosing between ftype=01 (0x1E602800) and ftype=00 (0x1E202800), and shape 9 pins it on a value where the two widths MUST disagree — 2^24 + 1 rounds back to 2^24 in binary32 and is exact in binary64, with shape 10 asserting that disagreement so shape 9 cannot be proving nothing. ★ SHAPES 11-14 bind BOTH register files in one template: `fcmp` writes NZCV (its target `result` is `none`, so both written operands are inputs) and a GPR-class `cset` reads it over the shared `TargetCondCode` vocabulary. ⚠ NO `fmov` SHAPE IS LOAD-BEARING HERE AND THAT IS MEASURED, NOT AN OVERSIGHT: an inline-asm `fmov %d0, %d1` — like the GPR `mov %x0, %x1` — reaches the binary as NOTHING, because copy coalescing puts source and destination in one register and `classifyIdentityClassMove` deletes the full-width identity move. Correct for a copy, and it means an `fmov` shape would go green over a row never read; the `fmov` row's BYTES are pinned in tests/asm/test_asm_arm64_fp_dialect_rows.cpp instead. ⚠ `volatile` seeds are load-bearing: the release arm must still reach the templates. ⚠ ARM64 SPECS ONLY — the subject is one dialect's instruction table, and a target-agnostic arm would assert nothing about it. Exit codes name the failing shape.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

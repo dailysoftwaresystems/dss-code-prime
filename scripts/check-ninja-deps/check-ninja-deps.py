@@ -89,7 +89,7 @@ described `check()`, which skipped. One code path, one fix, and it is in
 and the legitimate one is visible in the command line that requested it.
 
 Usage:
-    python scripts/check-ninja-deps/check-ninja-deps.py [build-dir ...]     # default: build/dbg, else build-dbg
+    python scripts/check-ninja-deps/check-ninja-deps.py [build-dir ...]     # default: build/dbg, else build-dbg, in THIS script's tree
     python scripts/check-ninja-deps/check-ninja-deps.py --allow-non-ninja <dir>
     python scripts/check-ninja-deps/check-ninja-deps.py --self-test
 
@@ -107,6 +107,8 @@ Exit: 0 clean · 1 dep-less objects found · 2 the instrument could not run
 `--allow-non-ninja` was not passed).
 """
 
+import importlib.util
+import os
 import re
 import subprocess
 import sys
@@ -167,6 +169,149 @@ def parse(text):
 
 def allowed(obj):
     return any(obj.endswith(suffix) for suffix in ALLOWLIST)
+
+
+# ── the `deps = msvc` half, and why the allowlist still stays empty ──────────
+# ★★★ THE THIRD CLAUSE'S MEASUREMENT WAS TAKEN ON ONE DEPFILE FLAVOUR AND READ AS
+# A FACT ABOUT ALL OF THEM — D-GATE-NINJA-DEPS-READS-A-GCC-DEPFILE-FACT-AS-A-FACT-ABOUT-EVERY-NINJA-TREE.
+# The docstring above says it in its own words: *"A C file with ZERO `#include`
+# directives, compiled through a `deps = gcc` rule, records `#deps 1` — gcc lists
+# the source itself."* That is TRUE, and it is true OF `deps = gcc`. Ninja's
+# `deps = msvc` flavour parses `/showIncludes`, which reports HEADERS ONLY — the
+# source is never listed — so a TU with no `#include` of its own records `#deps 0`
+# and that record is CORRECT.
+#
+# ✔MEASURED 2026-09-14 on a clean MSVC 19.51 Release tree of this repo
+# (`deps = msvc`, `msvc_deps_prefix = Note: including file:`): 2 of 669 objects at
+# `#deps 0` — `src/core/…/rule_id.cpp.obj` (the source has ZERO `#include`
+# directives) and `tests/…/dss_test_pch.dir/test_support/pch_stub.cpp.obj` (a
+# `static_assert` and nothing else). BOTH were DELETED and rebuilt ALONE at
+# `ninja -j 1` with nothing else running, and BOTH came back `#deps 0 … (VALID)`.
+# So this is structural, not the concurrency defect this tool was written for, and
+# the tool's own printed FIX ("delete the listed objects and rebuild") was measured
+# to do nothing. ⇒ It had been failing `windows-msvc-release` — the matrix's ONLY
+# MSVC leg — on every CI run since the ctest entry landed, while every gcc/clang
+# leg stayed green, because the premise only ever held for them.
+#
+# ★★ THE REPAIR IS A CHECKED PROPERTY, NOT A PATH ALLOWLIST, and the allowlist
+# above stays EMPTY. On a `deps = msvc` tree a zero record is excused ONLY for an
+# object whose own source carries no `#include` directive at all — read out of the
+# source, per object, every run. An msvc object whose source DOES include
+# something and records zero is still a hard FAIL: that is the lost record this
+# tool exists to catch, and it is still caught.
+# ★ AND THE ESCAPE IS DIRECTIONAL: on a `deps = gcc` tree this arm is UNREACHABLE,
+# because `#deps 0` cannot occur there — so nothing is weakened on four of the five
+# CI legs, and the fifth stops reporting a defect its tree does not contain.
+# ⓘ THE PCH IS NOT A HOLE. `rule_id.cpp.obj`'s ninja edge carries
+# `| …/cmake_pch.hxx …/cmake_pch.cxx.pch` as EXPLICIT implicit inputs, so ninja
+# rebuilds it when the PCH moves from the BUILD GRAPH, never from `.ninja_deps`.
+# A zero deps record cannot cost that rebuild. ✔Read out of the generated
+# `build.ninja` at the same commit.
+_NINJA_INCLUDE = re.compile(r"^\s*(?:include|subninja)\s+(.+?)\s*$")
+_NINJA_DEPS_MODE = re.compile(r"^\s*deps\s*=\s*(\w+)\s*$")
+_INCLUDE_DIRECTIVE = re.compile(r"^\s*#\s*include\b")
+
+
+def _ninja_unescape(tok):
+    """Ninja escapes `$:`, `$ ` and `$$` in paths. Undo exactly those three."""
+    out, i = [], 0
+    while i < len(tok):
+        if tok[i] == "$" and i + 1 < len(tok):
+            out.append(tok[i + 1])
+            i += 2
+        else:
+            out.append(tok[i])
+            i += 1
+    return "".join(out)
+
+
+def _ninja_manifest_text(build_dir):
+    """`build.ninja` plus the files it includes/subninjas, ONE level down.
+
+    One level is enough and is stated rather than assumed: CMake's Ninja generator
+    emits `CMakeFiles/rules.ninja` (which carries every `deps =` line) and per-dir
+    `build.ninja` files from the top manifest, and nothing deeper is needed to
+    answer either question this function is asked.
+    """
+    d = Path(build_dir)
+    top = d / "build.ninja"
+    try:
+        text = top.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    parts = [text]
+    for line in text.splitlines():
+        m = _NINJA_INCLUDE.match(line)
+        if not m:
+            continue
+        sub = d / _ninja_unescape(m.group(1))
+        try:
+            parts.append(sub.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+    return "\n".join(parts)
+
+
+def deps_modes(manifest_text):
+    """The set of `deps = <flavour>` values this manifest declares."""
+    return {m.group(1) for m in
+            (_NINJA_DEPS_MODE.match(line) for line in manifest_text.splitlines()) if m}
+
+
+def _sep(p):
+    """One spelling for a path key.
+
+    ⚠ NOT COSMETIC, and it cost a round: on Windows `ninja -t deps` prints object
+    paths with FORWARD slashes (`src/core/CMakeFiles/…`) while the generated
+    `build.ninja` writes the same object with BACKslashes. Keyed raw, every lookup
+    missed, every zero-dep object looked like one whose source could not be named,
+    and the repair reported exactly the failure it had just fixed. ✔MEASURED on the
+    MSVC tree, first run after the arm landed.
+    """
+    return p.replace("\\", "/")
+
+
+def object_sources(manifest_text):
+    """object path -> first explicit input of its `build` edge (the source).
+
+    Keyed on the separator-normalised spelling, so the `ninja -t deps` side and
+    the `build.ninja` side cannot disagree — see `_sep`.
+    """
+    sources = {}
+    for line in manifest_text.splitlines():
+        if not line.startswith("build "):
+            continue
+        head, sep, rest = line[len("build "):].partition(": ")
+        if not sep:
+            continue
+        # outputs before ": ", then `RULE input input… | implicit… || order…`
+        outs = [_ninja_unescape(t) for t in head.split(" ") if t]
+        tail = rest.split(" ")
+        ins = []
+        for tok in tail[1:]:
+            if tok in ("|", "||"):
+                break
+            if tok:
+                ins.append(_ninja_unescape(tok))
+        if not ins:
+            continue
+        for o in outs:
+            sources.setdefault(_sep(o), ins[0])
+    return sources
+
+
+def source_has_include(path):
+    """True when the file carries a `#include` directive — or cannot be read.
+
+    ⚠ UNREADABLE READS AS *HAS INCLUDES*, deliberately: the caller uses this only
+    to EXCUSE a zero record, so the direction of any doubt must be to refuse the
+    excuse and fail loud.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return any(_INCLUDE_DIRECTIVE.match(line) for line in fh)
+    except OSError:
+        return True
 
 
 def target_verdict(build_dir, allow_non_ninja):
@@ -230,6 +375,29 @@ def check(build_dir, allow_non_ninja=False):
         return 2
 
     flagged = [o for o in empty if not allowed(o)]
+
+    # ── the `deps = msvc` arm (see the block above `_NINJA_INCLUDE`) ──────────
+    # Reached ONLY when the manifest declares `deps = msvc` AND something was
+    # flagged, so a gcc tree pays nothing and can never enter it.
+    msvc_excused = []
+    if flagged:
+        manifest = _ninja_manifest_text(build_dir)
+        modes = deps_modes(manifest)
+        if "msvc" in modes and "gcc" not in modes:
+            srcs = object_sources(manifest)
+            still = []
+            for o in flagged:
+                src = srcs.get(_sep(o))
+                if src is None:
+                    still.append(o)          # cannot name its source -> fail loud
+                    continue
+                p = src if os.path.isabs(src) else os.path.join(build_dir, src)
+                if source_has_include(p):
+                    still.append(o)
+                else:
+                    msvc_excused.append((o, src))
+            flagged = still
+
     if flagged:
         print(f"ninja-deps: FAIL {build_dir} -- {len(flagged)} of {total} objects "
               f"have ZERO recorded header deps. Ninja will NOT rebuild these when a "
@@ -247,9 +415,18 @@ def check(build_dir, allow_non_ninja=False):
               "rather than a hopeful one.")
         return 1
 
-    skipped = len(empty) - len(flagged)
+    skipped = len(empty) - len(flagged) - len(msvc_excused)
     note = f" ({skipped} allowlisted)" if skipped else ""
+    # ★ THE EXCUSAL IS SAID OUT LOUD, per object, with the reason and the source it
+    # was read from. An excusal nobody can see is the silent skip this file refuses
+    # everywhere else.
+    if msvc_excused:
+        note += (f" ({len(msvc_excused)} excused: `deps = msvc` records HEADERS ONLY, "
+                 "and these sources carry no `#include` directive, so a zero record is "
+                 "the correct record)")
     print(f"ninja-deps: OK {build_dir} -- {total} objects, all carry header deps{note}")
+    for o, src in msvc_excused[:40]:
+        print(f"    excused: {o}  <- {src}")
     return 0
 
 
@@ -333,18 +510,94 @@ def self_test():
         verdict_case("... and a reported SKIP only when it was ASKED for",
                      empty, True, "skip", 0, "--allow-non-ninja was passed")
         verdict_case("a real ninja tree is RUN", ninja, False, "run", 0, "")
+
+        # ── the `deps = msvc` excusal, pinned in BOTH directions ─────────────
+        # ★ Written as a REMOVE-direction fixture: the manifest below is the one a
+        # real MSVC tree emits, and each case removes the property that earns the
+        # excusal rather than adding one that grants it
+        # ([[feedback-a-fixture-must-synthesize-the-negative]]).
+        msvc_dir = Path(_tmp) / "msvctree"
+        (msvc_dir / "src").mkdir(parents=True)
+        (msvc_dir / "src" / "no_includes.cpp").write_text(
+            '// a comment that merely SAYS #include, which is not a directive\n'
+            'static_assert(true, "x");\n', encoding="utf-8")
+        (msvc_dir / "src" / "has_includes.cpp").write_text(
+            "#include <vector>\nint f();\n", encoding="utf-8")
+        (msvc_dir / "build.ninja").write_text(
+            "include rules.ninja\n"
+            "build a.obj: CXX src/no_includes.cpp | pch.hxx || order\n"
+            "build b.obj: CXX src/has_includes.cpp\n", encoding="utf-8")
+        (msvc_dir / "rules.ninja").write_text(
+            "rule CXX\n  command = cl\n  deps = msvc\n", encoding="utf-8")
+
+        def msvc_case(name, objs, want_flagged, want_excused):
+            m = _ninja_manifest_text(str(msvc_dir))
+            if deps_modes(m) != {"msvc"}:
+                fails.append(f"{name}: deps_modes read {deps_modes(m)!r}, want {{'msvc'}}")
+            srcs = object_sources(m)
+            flagged, excused = [], []
+            for o in objs:
+                s = srcs.get(_sep(o))
+                if s is None or source_has_include(str(msvc_dir / s)):
+                    flagged.append(o)
+                else:
+                    excused.append(o)
+            if flagged != want_flagged or excused != want_excused:
+                fails.append(f"{name}: flagged={flagged!r} excused={excused!r}, "
+                             f"want flagged={want_flagged!r} excused={want_excused!r}")
+
+        msvc_case("an msvc zero-dep TU with NO #include is excused",
+                  ["a.obj"], [], ["a.obj"])
+        msvc_case("an msvc zero-dep TU that DOES #include still FAILS",
+                  ["b.obj"], ["b.obj"], [])
+        msvc_case("an object the manifest cannot name a source for still FAILS",
+                  ["ghost.obj"], ["ghost.obj"], [])
+        # THE DIRECTIONAL HALF: a gcc manifest must not reach the arm at all.
+        gcc_dir = Path(_tmp) / "gcctree"
+        gcc_dir.mkdir()
+        (gcc_dir / "build.ninja").write_text(
+            "rule CXX\n  command = g++\n  deps = gcc\n"
+            "build a.o: CXX src/no_includes.cpp\n", encoding="utf-8")
+        if "msvc" in deps_modes(_ninja_manifest_text(str(gcc_dir))):
+            fails.append("a gcc manifest was read as declaring deps = msvc")
+        # AND A MIXED TREE IS NOT AN MSVC TREE: the guard keeps its full strength
+        # wherever any gcc-flavoured rule is present.
+        (gcc_dir / "build.ninja").write_text(
+            "rule CXX\n  command = g++\n  deps = gcc\n"
+            "rule RC\n  command = rc\n  deps = msvc\n", encoding="utf-8")
+        _mixed = deps_modes(_ninja_manifest_text(str(gcc_dir)))
+        if not ("msvc" in _mixed and "gcc" in _mixed):
+            fails.append(f"a mixed manifest read as {_mixed!r}, want both flavours")
     finally:
         import shutil as _shutil
         _shutil.rmtree(_tmp, ignore_errors=True)
         if Path(_tmp).exists():
             fails.append("self-test temp tree was not removed")
 
+    # ── THE DEFAULT TREE IS THE ONE THIS FILE LIVES IN; AN EXPLICIT ONE STILL WINS ──
+    # Arms, oracle and synthesized negatives are owned by scripts/owning-tree/owning-tree.py.
+    # The resolver pinned is `default_build_dir()` itself, its `build/dbg` or `build-dbg`
+    # tail taken off -- so reverting the default to a cwd-relative path reddens here.
+    def _default_tree():
+        d = os.path.realpath(default_build_dir())
+        for tail in (os.path.join("build", "dbg"), "build-dbg"):
+            if d.endswith(os.sep + tail):
+                return d[:-len(tail) - 1]
+        return d
+    for ok, why, detail in _owning_tree().root_arms(_default_tree, (SystemExit,), False,
+                                                    __file__):
+        if not ok:
+            fails.append(f"default build tree: {why} [{detail}]")
+    if build_dirs(["x/explicit-tree", "--allow-non-ninja"]) != ["x/explicit-tree"]:
+        fails.append("an EXPLICIT build-tree argument did not win over the default")
+
     if fails:
         print("ninja-deps self-test: FAIL")
         for f in fails:
             print("   ", f)
         return 1
-    print(f"ninja-deps self-test: OK (7 parser cases, 5 target-verdict cases)")
+    print("ninja-deps self-test: OK (7 parser cases, 5 target-verdict cases, "
+          "5 deps=msvc excusal cases, 3 default-tree cases, 1 explicit-tree case)")
     return 0
 
 
@@ -363,9 +616,57 @@ def default_build_dir():
     the auto-pick landed on the right path and the tool then said nothing about
     it. `target_verdict` is where the claim became true
     (D-GATE-NINJA-DEPS-EXITS-ZERO-ON-A-DIRECTORY-THAT-DOES-NOT-EXIST).
+    ⚠ BOTH CANDIDATES WERE RELATIVE TO THE CALLER'S CWD until P66, so the default named
+    whichever tree the process happened to start in. ✔MEASURED 2026-09-15: run by path
+    from inside a different repository holding an empty `build/dbg`, it probed THAT
+    directory ("exists but has no build.ninja") instead of this tree's. Both are now
+    resolved under the tree this file lives in (scripts/owning-tree/owning-tree.py); an
+    explicit directory argument still wins, taken relative to the caller as typed.
     """
-    return "build/dbg" if Path("build/dbg").is_dir() else (
-        "build-dbg" if Path("build-dbg").is_dir() else "build/dbg")
+    root = repo_root()
+    dbg = os.path.join(root, "build", "dbg")
+    flat = os.path.join(root, "build-dbg")
+    return dbg if os.path.isdir(dbg) else (flat if os.path.isdir(flat) else dbg)
+
+
+_OWNING_TREE = None
+
+
+def _owning_tree():
+    """`scripts/owning-tree/owning-tree.py` -- the one owner of "which tree is this file in?".
+
+    Loaded by path from this file's sibling directory (a hyphen is not a module name). It
+    FAILS LOUD when absent rather than falling back to a local walk: a second copy of the
+    answer is the drift that owner exists to end.
+    """
+    global _OWNING_TREE
+    if _OWNING_TREE is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            print("ninja-deps: FATAL -- cannot find %s; this tool's root is resolved there "
+                  "and nowhere else, so the check did NOT run." % path)
+            sys.exit(2)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OWNING_TREE = mod
+    return _OWNING_TREE
+
+
+def repo_root():
+    """The tree THIS FILE lives in -- see scripts/owning-tree/owning-tree.py."""
+    ot = _owning_tree()
+    try:
+        return ot.resolve(__file__)
+    except ot.Refusal as exc:
+        print("ninja-deps: FATAL -- %s; the check did NOT run." % exc)
+        sys.exit(2)
+
+
+def build_dirs(argv):
+    """The build trees to check: every positional argument as typed, else this tree's default."""
+    return [a for a in argv if not a.startswith("-")] or [default_build_dir()]
 
 
 def main(argv):
@@ -379,7 +680,7 @@ def main(argv):
               % " ".join(unknown))
         return 2
     allow_non_ninja = "--allow-non-ninja" in argv
-    dirs = [a for a in argv if not a.startswith("-")] or [default_build_dir()]
+    dirs = build_dirs(argv)
     worst = 0
     for d in dirs:
         worst = max(worst, check(d, allow_non_ninja))

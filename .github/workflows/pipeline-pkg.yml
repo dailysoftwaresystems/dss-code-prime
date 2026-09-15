@@ -4,12 +4,18 @@ name: Package
 # `cpp-app-pkg.yml@v2`: a PUBLIC repository cannot call a reusable workflow that
 # lives in a private/internal repository, so the logic is vendored here. Keep in
 # sync with dailysoftwaresystems/DSS.DevOps. Settings baked from the former caller
-# inputs: run-macos + run-linux-arm64 ON, artifact-paths = bin, cmake-version =
+# inputs: run-macos + run-linux-arm64 ON, artifact-paths = '.', cmake-version =
 # latest, artifact-name = dsscp — the release-tarball brand AND the CLI command
 # name, which as of P32 (2026-08-24) are the same string: the CMake targets, the
 # executable, the shared library and the config tree under share/dsscp/ all carry it.
 # The repo/project deliberately stays dss-code-prime, so project name != command name
 # by design, like Ziglang/`zig`.
+#
+# ⚠ `artifact-paths` read `bin` in the line above until 2026-09-09, and had been
+# wrong since the `Stage install set` step landed: the packaging step tars `.` out
+# of the STAGED PREFIX TREE, not `bin` out of the build dir. A comment whose
+# premise outlived its measurement, corrected here and nowhere else — no step
+# changed.
 #
 # The tarball name and the executable name were out of sync until that rename landed,
 # and the consequence is kept rather than deleted because it is evidence for a rule:
@@ -19,12 +25,77 @@ name: Package
 # suite (D-PKG-PUBLISH-PATH-NAMES-THE-POST-RENAME-BINARY).
 #
 # Flow (immutable-release-safe): create a DRAFT release, build the shippable
-# artifact on each platform leg in parallel and attach it to the draft, then
-# publish once every leg has succeeded. A failed leg leaves the release a draft.
+# artifact on each platform leg in parallel, PERSIST it as a run artifact and
+# then attach it to the draft, then verify the draft carries one tarball per
+# matrix leg and publish once every leg has succeeded. A failed leg, or a short
+# asset set, leaves the release a draft.
+#
+# ── TWO MODES, ONE UNCHANGED RELEASE PATH ────────────────────────────────────
+# `mode=release` — a push to release/{beta,stable}, i.e. the flow described
+#   immediately above, and it is EXACTLY that flow: same jobs, same order, same
+#   `needs:` edges, same App token in both token-bearing jobs, same token'd
+#   checkout, same `insteadOf` rewrite, same workflow-level `contents: write`,
+#   same `finalize-release` body. Nothing about a release run changed.
+# `mode=artifacts` — a `workflow_dispatch` on any ref. The SAME jobs and the SAME
+#   steps run, minus exactly three things, each an `if:` on a step or a job:
+#   the draft creation, the `gh release upload`, and `finalize-release`. No
+#   release is resolved, created, attached to or published, and NO TAG IS EVER
+#   CUT. The tarballs come out as GitHub Actions artifacts, which the release
+#   path already uploads too.
+#
+# ⛔ THE MODE IS THREE `if:` CONDITIONS, NEVER A SECOND COPY OF ANYTHING. Adding a
+# mode to a workflow is cheapest by forking the packaging steps into a second job,
+# and a forked copy is two owners of one shape — the drift this repository already
+# carries an open row about for the sibling pipeline
+# (D-CI-PR-PIPELINE-IS-VENDORED-AND-ITS-SYNC-IS-UNCHECKED). `pkg_pipeline_modes_guard`
+# (`scripts/check-pkg-pipeline/`) refuses a tree where that stops being true, and
+# pins the release path's job and step sequence besides.
+#
+# ── THE RELEASE PATH: WHAT WAS FROZEN, AND WHAT WAS THEN AUTHORISED ─────────
+# The two modes above were added under operator, 2026-09-09: *"Ensure the release
+# process will not be changed. The goal is to ensure it will work"*, and under
+# that ruling every step that ran on a release push still ran, in the same job, in
+# the same order, with the same token and the same permission — the three `if:`
+# conditions all evaluate TRUE on a release push and the one added step
+# (`Decide mode`) makes no network call and mutates nothing.
+#
+# ★ THAT FREEZE WAS THEN LIFTED, EXPLICITLY, the same day: *"for this one … you
+# close based on your genuine analysis. If this fails after it I'll tell me and
+# you'll rework on this. So please, close once you really thinks it will work"*.
+# Under that authorisation, cycle P66 lane `rp` made THREE changes to the release
+# path and nothing else — each is commented at its own site:
+#   (1) `actions/upload-artifact` now runs BEFORE `gh release upload`, so a
+#       transient failure of the release upload no longer destroys the only copy
+#       of a ~90-minute build.
+#   (2) `finalize-release` now ASSERTS the draft carries one tarball per matrix
+#       leg before flipping `--draft=false`, counting against `build-matrix`'s own
+#       `leg-count` output rather than a literal.
+#   (3) `if-no-files-found: error` on the artifact upload, because `warn` — the
+#       action's default — is a green run that shipped nothing.
+# ⚠ Everything else about a release push is still what it was: same jobs, same
+# `needs:` edges, same App token in all three token-bearing jobs, same token'd
+# checkout, same `insteadOf`, same workflow-level `contents: write`, no per-job
+# `permissions:`, no new job, and no fork of the packaging body.
+#
+# ⓘ ✔MEASURED 2026-09-09 via `gh run list --workflow=pipeline-pkg.yml`: this
+# workflow has TWO runs in its entire history, both `startup_failure` at 0 s on
+# 2026-07-07, both from the pre-vendoring revision that still said
+# `uses: dailysoftwaresystems/DSS.DevOps/...@v2` — the private-reusable refusal the
+# vendoring exists to fix. The vendored body has therefore NEVER been executed by
+# GitHub. `workflow_dispatch` is the only way to exercise it that does not require
+# cutting a release first.
 
 on:
   push:
     branches: ["release/beta", "release/stable"]
+
+  # Artifacts-only mode. NO INPUTS ON PURPOSE: an input that could turn a dispatch
+  # into a release would let a feature branch cut one, and publishing is out of
+  # scope. The ref is chosen by `gh workflow run --ref`, which is the whole knob
+  # this needs. ⚠ GitHub only offers this trigger once the workflow file carrying
+  # it exists on the DEFAULT branch — a dispatch of a branch-only version is
+  # refused with `workflow does not have workflow_dispatch trigger`.
+  workflow_dispatch:
 
 concurrency:
   group: pkg-${{ github.ref }}
@@ -41,11 +112,34 @@ jobs:
   resolve-version:
     runs-on: ${{ 'ubuntu-latest' }}
     outputs:
+      mode: ${{ steps.mode.outputs.mode }}
       version: ${{ steps.v.outputs.version }}
       channel: ${{ steps.v.outputs.channel }}
       tag: ${{ steps.v.outputs.tag }}
       artifact-name: ${{ steps.v.outputs.artifact_name }}
     steps:
+      # ★ THE ONE PLACE THAT DECIDES WHICH MODE THIS RUN IS. Every gate in this
+      # file reads this output (or `needs.resolve-version.outputs.mode`) and none
+      # re-derives it from `github.event_name`: two spellings of one decision are
+      # two things that can disagree, and the disagreement here would be `a
+      # dispatch tried to cut a release`.
+      #
+      # ⓘ THE ONLY STEP ADDED TO THE RELEASE PATH. It makes no network call, reads
+      # no secret, needs no working tree and mutates nothing — it writes one job
+      # output. `push` is the only event this workflow's `on:` block maps to
+      # release, and that trigger names release/{beta,stable} and nothing else, so
+      # on every run that cuts a release this step's answer is `release`.
+      - name: Decide mode
+        id: mode
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            mode=release
+          else
+            mode=artifacts
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "event=$GITHUB_EVENT_NAME -> mode=$mode"
+
       - name: Generate GitHub App token
         id: app-token
         uses: actions/create-github-app-token@v3
@@ -63,6 +157,7 @@ jobs:
         id: v
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          MODE: ${{ steps.mode.outputs.mode }}
           VERSION_FILE: ${{ 'VERSION' }}
           TAG_PREFIX: ${{ 'v' }}
           ARTIFACT_NAME_INPUT: ${{ 'dsscp' }}
@@ -79,46 +174,82 @@ jobs:
             exit 1
           fi
 
-          branch="${GITHUB_REF##*/}"
-          channel="${branch#release/}"
-          case "$channel" in
-            beta|stable) ;;
-            *) echo "::error::Unsupported branch '$branch'. Expected release/{beta,stable}."; exit 1 ;;
-          esac
-
-          if [ "$channel" = "stable" ]; then
-            tag="${TAG_PREFIX}${raw}"
-          else
-            tag="${TAG_PREFIX}${raw}-${channel}"
-          fi
-
           # Artifact base name: explicit input wins, else the repo name.
           artifact_name="$ARTIFACT_NAME_INPUT"
           if [ -z "$artifact_name" ]; then
             artifact_name="${GITHUB_REPOSITORY##*/}"
           fi
 
-          # Capture output so a genuine "release not found" (absent -> safe to
-          # create) is told apart from a transient auth/5xx/network error,
-          # which must fail closed rather than race ahead and create a duplicate.
-          if out=$(gh release view "$tag" 2>&1); then
-            echo "::error::Release $tag already exists (published or draft). Bump $VERSION_FILE or delete the draft before re-running."
-            exit 1
-          elif ! grep -qiE 'release not found|HTTP 404' <<<"$out"; then
-            echo "::error::Could not verify whether $tag exists (treating as fatal): $out"
-            exit 1
+          if [ "$MODE" = "artifacts" ]; then
+            # ★ WHAT IDENTIFIES AN ARTIFACT THAT IS NOT A RELEASE. The project
+            # version is DECLARED in $VERSION_FILE and read above -- not invented
+            # here -- and the commit is appended as SemVer BUILD METADATA (`+`,
+            # SemVer clause 10): same version line, not a release, identified by
+            # the commit it came from. Build metadata is ignored for version
+            # precedence, carries no `v` prefix, and NO TAG IS EVER CREATED, so
+            # it cannot be mistaken for one. An artifact nobody can trace back to
+            # a commit is not a deliverable.
+            #
+            # ⛔ NO `gh release view` HERE, AND THAT IS THE POINT: this arm makes
+            # no API call at all, so an artifacts-only run cannot fail on the
+            # state of a release, and cannot touch one.
+            channel=""
+            tag=""
+            version="${raw}+${GITHUB_SHA:0:7}"
+          else
+            # ⛔ EVERY LINE OF THIS ARM IS THE PRE-2026-09-09 BODY, INDENTED. It is
+            # what a push to release/{beta,stable} has always run, in the same
+            # order, and it must stay that way: the mode exists to leave this
+            # untouched, not to improve it.
+            branch="${GITHUB_REF##*/}"
+            channel="${branch#release/}"
+            case "$channel" in
+              beta|stable) ;;
+              *) echo "::error::Unsupported branch '$branch'. Expected release/{beta,stable}."; exit 1 ;;
+            esac
+
+            if [ "$channel" = "stable" ]; then
+              tag="${TAG_PREFIX}${raw}"
+            else
+              tag="${TAG_PREFIX}${raw}-${channel}"
+            fi
+
+            # The release tarball carries the bare declared version, exactly as
+            # before this file grew a second mode.
+            version="$raw"
+
+            # Capture output so a genuine "release not found" (absent -> safe to
+            # create) is told apart from a transient auth/5xx/network error,
+            # which must fail closed rather than race ahead and create a duplicate.
+            if out=$(gh release view "$tag" 2>&1); then
+              echo "::error::Release $tag already exists (published or draft). Bump $VERSION_FILE or delete the draft before re-running."
+              exit 1
+            elif ! grep -qiE 'release not found|HTTP 404' <<<"$out"; then
+              echo "::error::Could not verify whether $tag exists (treating as fatal): $out"
+              exit 1
+            fi
           fi
 
           {
-            echo "version=$raw"
+            echo "version=$version"
             echo "channel=$channel"
             echo "tag=$tag"
             echo "artifact_name=$artifact_name"
           } >> "$GITHUB_OUTPUT"
 
-          echo "Resolved: tag=$tag channel=$channel version=$raw artifact=$artifact_name"
+          # ⚠ THE BASE LINE, WITH `$raw` SPELLED `$version`. In release mode the two
+          # are the same string, so a release run's log is byte-identical; in
+          # artifacts mode `$raw` would have printed the version WITHOUT the commit
+          # it was actually built from. The mode itself is already in the log --
+          # the `Decide mode` step above echoes it -- so it is not repeated here.
+          echo "Resolved: tag=$tag channel=$channel version=$version artifact=$artifact_name"
 
+      # ⛔ MODE-CONDITIONAL, AND STILL THE SAME STEP IN THE SAME JOB. On a push
+      # this `if:` is TRUE, so the release path runs it exactly where it always
+      # ran, with the same token and the same body. Moving it to a job of its own
+      # would have been a change to the release process.
       - name: Create draft release
+        if: ${{ steps.mode.outputs.mode == 'release' }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TAG: ${{ steps.v.outputs.tag }}
@@ -160,6 +291,13 @@ jobs:
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
       empty: ${{ steps.set.outputs.empty }}
+      # ★ HOW MANY TARBALLS A COMPLETE RELEASE CARRIES, PUBLISHED BY THE ONE JOB
+      # THAT KNOWS. `finalize-release` asserts the draft's asset set against this
+      # before publishing. It is an OUTPUT rather than a literal `4` in two files
+      # because a leg added or removed below must move the expectation with it —
+      # a literal would keep a five-leg release passing a four-asset check, which
+      # is the silent half of the defect the assertion exists to close.
+      leg-count: ${{ steps.set.outputs.leg_count }}
     steps:
       - id: set
         run: |
@@ -177,6 +315,17 @@ jobs:
             legs=$(echo "$legs" | jq -c '. + [{"name":"linux-arm64","os":"ubuntu-24.04-arm","cc":"gcc-13","cxx":"g++-13","platform":"linux-arm64"}]')
           fi
           echo "matrix={\"include\":$legs}" >> "$GITHUB_OUTPUT"
+
+          # Counted from the array actually built above, never written down
+          # twice. FAIL LOUD rather than emitting an empty output: an unset
+          # leg_count reaches finalize-release as "I cannot tell you what to
+          # expect", and an assertion with no expectation is not an assertion.
+          if ! leg_count=$(echo "$legs" | jq 'length'); then
+            echo "::error::could not count the build legs; refusing to hand finalize-release an unverifiable expectation."
+            exit 1
+          fi
+          echo "leg_count=$leg_count" >> "$GITHUB_OUTPUT"
+
           if [ "$legs" = "[]" ]; then
             echo "empty=true" >> "$GITHUB_OUTPUT"
             echo "::warning::All build legs are disabled; the release will publish tag-only with no artifacts."
@@ -356,16 +505,71 @@ jobs:
           fi
           echo "Built $(basename "$archive") ($(wc -c < "$archive") bytes, ${files} files)."
 
-      - name: Attach artifact to draft release
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          TAG: ${{ needs.resolve-version.outputs.tag }}
-        run: gh release upload "$TAG" dist/*.tar.gz --clobber
-
+      # ── THE DURABLE COPY, AND IT IS TAKEN FIRST ──────────────────────────
+      # ⛔ THIS STEP MUST STAY AHEAD OF THE RELEASE UPLOAD BELOW; the order IS
+      # the fix. Steps in a job run in file order, and a failed step without
+      # `continue-on-error` stops every step after it — so whichever of these
+      # two runs first is the one whose product survives the other's failure.
+      # Until 2026-09-09 the release upload ran first: a 5xx or a network blip
+      # on `gh release upload` failed the leg, `actions/upload-artifact` never
+      # ran, the runner was torn down, and the ONLY copy of a build carrying
+      # `timeout-minutes: 90` was gone. Re-running meant rebuilding.
+      #
+      # ★ WHAT THE NEW ORDER BUYS, AND WHAT IT DELIBERATELY DOES NOT CHANGE.
+      # If the release upload below now fails, the leg STILL fails,
+      # `needs.build-artifact.result` is still not `success`, and
+      # `finalize-release` still refuses to publish and leaves the draft alone —
+      # the release's safety is untouched.
+      #
+      # ⚠ AND THE RECOVERY IS STATED EXACTLY, BECAUSE THE LOOSE VERSION OF IT IS
+      # WRONG: GitHub re-runs a whole JOB, never a single step, so *re-running
+      # this leg* costs the ~90 minutes again in either order. What the durable
+      # copy buys is the path that does NOT rebuild —
+      #     gh run download <run-id> --name <leg>-<version> --dir /tmp/a
+      #     gh release upload <tag> /tmp/a/*.tar.gz --clobber
+      # then re-run `finalize-release`, whose asset-set assertion re-reads the
+      # release and now finds the full set. In the OLD order that path did not
+      # exist at all: the only copy of the tarball died with the runner.
+      #
+      # And in the other direction, if THIS step fails the release upload never
+      # runs, so a release can never receive an asset whose durable copy was not
+      # taken. ✔ The swap is safe because the two steps are INDEPENDENT: neither
+      # reads the other's outputs, both only READ the `dist/*.tar.gz` that
+      # `Package artifact` produced before both, and neither mutates it.
+      #
+      # ⚠ `if: always()` ON THIS STEP WAS THE REJECTED ALTERNATIVE: it keeps the
+      # bad order AND uploads after a FAILED `Package artifact`, which is a
+      # green-looking artifact list holding a broken tarball.
+      #
+      # `if-no-files-found: error` because the action's default is `warn`, and a
+      # warning is a green run that shipped nothing. `Package artifact` above
+      # already refuses an archive with zero regular files so this glob cannot
+      # legitimately be empty — but this step is now the LAST line of defence
+      # for the durable copy, and a fail-open default is not one.
+      # (D-PKG-RELEASE-PATH-DEFECTS-THIS-CYCLE-MAY-NOT-FIX, items 1 and 3.)
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}-${{ needs.resolve-version.outputs.version }}
           path: ${{ '.' }}/dist/*.tar.gz
+          if-no-files-found: error
+
+      # ⛔ MODE-CONDITIONAL, AND THE ONLY MODE GATE IN THIS JOB. `build-artifact`
+      # itself stays mode-BLIND — same `if:`, same matrix, same steps, same App
+      # token, same token'd checkout, same `insteadOf` — so both modes build and
+      # package through one body and an artifacts run is a true rehearsal of the
+      # release build rather than a different one.
+      #
+      # ⛔ THIS UPLOAD STAYS INSIDE THE LEG. Moving it to a job of its own is what
+      # makes a failed upload stop failing the run, and `finalize-release`'s
+      # asset-set assertion is a SECOND line of defence, never a replacement for
+      # this one: the two catch different things, and the assertion alone would
+      # let a leg go green having attached nothing.
+      - name: Attach artifact to draft release
+        if: ${{ needs.resolve-version.outputs.mode == 'release' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ needs.resolve-version.outputs.tag }}
+        run: gh release upload "$TAG" dist/*.tar.gz --clobber
 
   # Publishes the draft once every build leg has succeeded. If any leg failed
   # or was cancelled, the release is left as a draft and this job fails, so the
@@ -373,7 +577,17 @@ jobs:
   # disabled) publishes tag-only.
   finalize-release:
     needs: [resolve-version, build-matrix, build-artifact]
-    if: ${{ always() && needs.resolve-version.result == 'success' }}
+    # ★ THE ADDED CONJUNCT IS TAUTOLOGICALLY TRUE ON A RELEASE PUSH, so this job's
+    # `if:` has the same value it always had there, and its body is untouched.
+    # PROOF: the conjunct is only ever reached when `resolve-version.result ==
+    # 'success'` (the existing conjunct short-circuits otherwise, exactly as
+    # before); a successful `resolve-version` ran `Decide mode` to completion,
+    # since a failed step fails the job; and on a `push` that step writes
+    # `mode=release`. ⇒ TRUE whenever the base expression was TRUE.
+    # It is here because without it an artifacts-only run would reach
+    # `gh release edit "" --draft=false` and end RED with nothing to publish —
+    # a mode that always fails is not a mode.
+    if: ${{ always() && needs.resolve-version.result == 'success' && needs.resolve-version.outputs.mode == 'release' }}
     runs-on: ${{ 'ubuntu-latest' }}
     steps:
       - name: Generate GitHub App token
@@ -396,6 +610,10 @@ jobs:
           REL_TAG: ${{ needs.resolve-version.outputs.tag }}
           MATRIX_EMPTY: ${{ needs.build-matrix.outputs.empty }}
           BUILD_RESULT: ${{ needs.build-artifact.result }}
+          # How many tarballs a complete release carries, from the job that built
+          # the matrix. `build-matrix` is already in this job's `needs:`, so this
+          # adds no edge to the graph.
+          LEG_COUNT: ${{ needs.build-matrix.outputs.leg-count }}
         run: |
           # build-artifact is a matrix job: its result is 'success' only if
           # every leg succeeded (fail-fast:false → one failed leg makes it
@@ -406,6 +624,57 @@ jobs:
           if [ "$MATRIX_EMPTY" != "true" ] && [ "$BUILD_RESULT" != "success" ]; then
             echo "::error::A build leg did not succeed (build-artifact=$BUILD_RESULT). Leaving $REL_TAG as a draft."
             exit 1
+          fi
+
+          # ── ASSET-SET ASSERTION ────────────────────────────────────────────
+          # ⛔ THE LAST CHECK BEFORE AN IRREVERSIBLE ACT, and it is POSITIVE: the
+          # check above reads job RESULTS, which is a statement about what ran,
+          # not about what is attached. Until 2026-09-09 nothing in this job ever
+          # looked at the release itself — the invariant "a published release
+          # carries one tarball per leg" was held ONLY by the in-band
+          # `gh release upload`, so any future edit that moved that upload out of
+          # the build leg would have removed the invariant silently.
+          # (D-PKG-RELEASE-PATH-DEFECTS-THIS-CYCLE-MAY-NOT-FIX, item 2.)
+          #
+          # ⚠ FAIL CLOSED, AND TELL THE TWO FAILURES APART — the same discipline
+          # as the `gh release view "$tag"` probe in `resolve-version`. A short
+          # count and a broken API call are DIFFERENT errors: treating a 5xx as
+          # "no assets" turns a transient into a refused release with a
+          # misleading message, and treating it as "fine" is not an assertion at
+          # all. Both exit 1; only the message differs, and the message is what a
+          # human acts on.
+          #
+          # ⚠ THIS DELIBERATELY DOES NOT REUSE THE `gh release download` BELOW.
+          # That download is non-fatal on purpose because SHA256SUMS is a
+          # convenience; making it fatal would change what a checksum failure
+          # costs. This probe is a separate, cheap, metadata-only read.
+          #
+          # `--jq` is `gh`'s own built-in engine (as in the `--json body --jq
+          # .body` read in `resolve-version`), so this needs no external `jq` and
+          # adds no dependency to this job.
+          if [ "$MATRIX_EMPTY" != "true" ]; then
+            case "$LEG_COUNT" in
+              ''|*[!0-9]*)
+                echo "::error::build-matrix did not publish a usable leg count (got '$LEG_COUNT'). Refusing to publish $REL_TAG without knowing how many assets to expect."
+                exit 1 ;;
+            esac
+
+            if ! asset_count=$(gh release view "$REL_TAG" --json assets \
+                 --jq '[.assets[].name | select(endswith(".tar.gz"))] | length' 2>&1); then
+              echo "::error::Could not read $REL_TAG's asset list to verify it (treating as fatal): $asset_count"
+              exit 1
+            fi
+            case "$asset_count" in
+              ''|*[!0-9]*)
+                echo "::error::Unreadable asset count for $REL_TAG (treating as fatal): '$asset_count'"
+                exit 1 ;;
+            esac
+
+            if [ "$asset_count" -ne "$LEG_COUNT" ]; then
+              echo "::error::$REL_TAG carries $asset_count tarball asset(s) but the build matrix declared $LEG_COUNT leg(s). Leaving $REL_TAG as a draft."
+              exit 1
+            fi
+            echo "Asset set verified: $asset_count tarball(s) attached for $LEG_COUNT leg(s)."
           fi
 
           # Attach a SHA256SUMS manifest before publishing — end users verify their

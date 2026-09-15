@@ -3,7 +3,7 @@
   "header": "setjmp.h",
   "standard": "c11",
   "availableObjectFormats": ["elf", "pe", "macho"],
-  "library": { "elf": "libc.so.6", "pe": "ucrtbase.dll", "macho": "/usr/lib/libSystem.B.dylib" },
+  "library": { "elf": { "role": "cLibrary" }, "pe": { "role": "cLibrary" }, "macho": { "role": "cLibrary" } },
   "symbols": [
     { "name": "setjmp",  "signature": "fn(ptr<void>) -> i32",            "returnsTwice": true, "availableObjectFormats": ["elf", "macho"] },
     { "name": "_setjmp", "signature": "fn(ptr<void>, ptr<void>) -> i32", "returnsTwice": true, "availableObjectFormats": ["pe"], "linkName": "__intrinsic_setjmp" },

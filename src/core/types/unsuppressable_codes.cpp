@@ -322,10 +322,48 @@ constexpr MembershipReason kWhyLinkerImage{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, errorCount() reads zero while the image on disk is "
     "refused, empty, missing or truncated"};
+constexpr MembershipReason kWhyOveralignedForFormat{
+    MembershipProng::BuildFailsWithNothingSaid,
+    "silenced, the format walker still refuses the image (it returns no bytes) "
+    "but the build then fails with nothing said about the one thing that could "
+    "be changed -- the alignment asked for, or the format document's declared "
+    "section alignment"};
 constexpr MembershipReason kWhyNoMatchingObjectFormat{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, the linker dispatches the wrong format walker and writes a "
     "corrupted artifact"};
+// D-DIAG-OVERLAP-REFUSAL-CODE-NOT-DISCRIMINATING (P65). The two static-data
+// producer codes split out of `K_NoMatchingObjectFormat`.
+// ⚠⚠ THE PARENT'S RATIONALE DOES NOT TRANSFER, AND INHERITING IT WOULD HAVE
+// PUT A FALSE SENTENCE IN THIS TABLE. `kWhyNoMatchingObjectFormat` above says
+// "the linker dispatches the wrong format walker" — that is the LINKER's
+// walker-dispatch invariant, and neither of these codes can reach it: both fire
+// from the static-DATA producer, upstream of any walker, and no walker choice
+// depends on them. Membership is therefore re-derived from these codes' OWN
+// control flow, MEASURED in `lowerMirGlobalsToDataItems`: every site that emits
+// either code is followed by `continue`, which skips the `out.push_back` that
+// ends the per-global loop body. So the refused global contributes NO
+// `AssembledData` at all. Silenced, `errorCount()` reads zero and the artifact
+// is written with that object's bytes ABSENT — the symbol resolves to nothing
+// (a load-time failure in the user's process, not a build failure) or another
+// producer's zero span makes it read as all-zero instead of its initializer.
+// That is prong 1 established on this tier's own mechanism.
+constexpr MembershipReason kWhyOverlappingStaticInit{
+    MembershipProng::WrongArtifactShipsGreen,
+    "silenced, the static object whose overlapping members could not be "
+    "encoded contributes no data item at all, and the build reports success "
+    "with the object's initializer bytes missing from the artifact"};
+// The invariant-breach code carries a SECOND, independent reason on top of the
+// dropped-data-item mechanism above: it reports a COMPILER DEFECT. Suppressing
+// a report that two parts of this compiler disagree is never a legitimate user
+// action — there is no source or config change it could accompany — and this
+// project already holds that class deafening by construction
+// (`D_SynthRecipeFamilyUnknown`, `X_OptReturnFalseWithoutDiagnostic`).
+constexpr MembershipReason kWhyStaticDataEncoderInvariant{
+    MembershipProng::WrongArtifactShipsGreen,
+    "silenced, a byte-count or record disagreement inside the static-data "
+    "encoder drops the global's data item and ships a green build whose "
+    "artifact is missing bytes only this compiler's own defect explains"};
 constexpr MembershipReason kWhyFormatLacksImportSupport{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, an extern goes unresolved in a dynamic image whose format "
@@ -427,10 +465,6 @@ constexpr MembershipReason kWhySilentConstraint{
     MembershipProng::BuildFailsWithNothingSaid,
     "the build already fails on this constraint violation; silenced, it "
     "fails with ZERO diagnostics shown and no statement of why"};
-constexpr MembershipReason kWhyPackedBitfield{
-    MembershipProng::WrongArtifactShipsGreen,
-    "silenced, a packed struct carrying a bit-field is laid out padded "
-    "instead, the wrong ABI"};
 constexpr MembershipReason kWhyNullptrOperand{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, nullptr lowers through the integer-0 null constant and "
@@ -451,6 +485,11 @@ constexpr MembershipReason kWhyAutoInference{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, the declaration adopts its initializer type and compiles "
     "the very form the constraint forbids"};
+constexpr MembershipReason kWhyVariadicMarkerPosition{
+    MembershipProng::WrongArtifactShipsGreen,
+    "silenced, the variadic FnSig is built by a CONTAINS scan for the marker, "
+    "so the signature claims the trailing parameters AND variadic-ness — a "
+    "call ABI no reference agrees with, from source no reference compiles"};
 constexpr MembershipReason kWhyThreadLocal{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, thread storage lowers wrong: a per-call automatic, a split "
@@ -550,10 +589,17 @@ constexpr MembershipReason kWhyAsmLabel{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, the intended symbol name is not restored: a C-mangled or "
     "synthetic name ships and the build stays green all the way to link"};
+// ⚠ THE STATED REASON WAS RESTATED IN P59 (2026-09-04) BECAUSE THIS CODE'S
+// SUBJECT NARROWED TO ONE NAME. It used to read "silenced, __has_include(<h>)
+// answers 0 while #include <h> still splices the header, so the guard and the
+// include disagree" — true of the conditional-inclusion operators, which this
+// code no longer refuses (an operator ruling made their posture DATA, at at
+// most a warning, matching all four references). MEMBERSHIP is still right, on
+// the same prong, for the name that remains.
 constexpr MembershipReason kWhyOperatorNameNotDefinable{
     MembershipProng::WrongArtifactShipsGreen,
-    "silenced, __has_include(<h>) answers 0 while #include <h> still "
-    "splices the header, so the guard and the include disagree"};
+    "silenced, a program may redefine `defined` and every #if in every header "
+    "it reaches then means something the author did not write"};
 
 // ★★★ THE TWO CODES D-DIAG-UNSUPPRESSABLE-FAMILY-UNDECIDED WAS FILED ABOUT.
 //
@@ -620,7 +666,26 @@ constexpr MembershipReason kWhyIncludeReentryRefused{
 // face": within the preprocessor's own codes, `#pragma` failures were
 // unsuppressable while `#include` failures were not. ✔The explicit extent did
 // its job a FIFTH time.
-constexpr std::array<UnsuppressableEntry, 169> kUnsuppressableCodes{{
+// ⓘ EXTENT 169 → 168 (2026-09-02, cycle P53, D-CSUBSET-PACKED-BITFIELD-INTERACTION):
+// `S_PackedBitfieldUnsupported` (0xE032) LEAVES — the first DEPARTURE this extent
+// has recorded, every previous move having been an arrival. Its code is retired
+// (packed + a bit-field is supported now), and an unemittable code cannot be
+// suppressed. ✔The explicit extent did its job a SIXTH time, in the other
+// direction: the three well-formedness `static_assert`s fired on the `None` slot
+// the removal left behind, so shrinking the table could not be forgotten.
+// ⓘ EXTENT 170 → 172 (2026-09-08, cycle P65,
+// D-DIAG-OVERLAP-REFUSAL-CODE-NOT-DISCRIMINATING):
+// `K_OverlappingStaticInitUnsupported` (0x8025) and
+// `K_StaticDataEncoderInvariantBreach` (0x8026) join, both on prong (1). They
+// are the two causes split OUT of `K_NoMatchingObjectFormat` in the static-data
+// producer, and their membership is the one thing about them that could not be
+// inherited: the parent's rationale is the LINKER's walker-dispatch invariant,
+// which neither of these can reach. The argument is re-derived from their own
+// control flow beside each `kWhy*` below. ⚠ Had they been added by inheritance
+// they would still be here — with a reason that is false — which is why the row
+// required the argument to be MADE. ✔The explicit extent did its job a SEVENTH
+// time: the count refused the two new rows until this note existed.
+constexpr std::array<UnsuppressableEntry, 174> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -799,8 +864,12 @@ constexpr std::array<UnsuppressableEntry, 169> kUnsuppressableCodes{{
     // guard and the family split that feeds each synth pass. Suppressed, the
     // recipe would fall out of BOTH passes and the shim symbol would go
     // undefined with no diagnostic — a silently-undefined function that
-    // breaks the binary's LOAD at user runtime (the eager-import law's
-    // failure mode), not the build. It also replaces both seams' former
+    // breaks the binary's LOAD at user runtime, not the build. (This named
+    // that as "the eager-import law's failure mode" until 2026-09-03; the law
+    // is retired — [[D-FFI-DESCRIPTOR-EAGER-IMPORT]] — but the failure mode is
+    // NOT, because a shim body that calls the missing core references it, so
+    // the import is kept and the load still fails. The reason to be
+    // unsuppressible is unchanged.) It also replaces both seams' former
     // borrow of the linker-band `K_NoMatchingObjectFormat`, itself a member
     // below — so this entry PRESERVES the non-suppressible property rather
     // than granting a new one.
@@ -970,14 +1039,18 @@ constexpr std::array<UnsuppressableEntry, 169> kUnsuppressableCodes{{
     // fails the gate via errorCount.
     {DiagnosticCode::H_Utf8CharLiteralOutOfRange, kWhyWideLiteral},
     {DiagnosticCode::H_WideCharValueUnrepresentable, kWhyWideLiteral},
-    // H_InvalidUniversalCharacterName (C11/C23 6.4.3, Cycle C) + H_WideByteEscapeUnsupported
-    // (6.4.5, D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE): a malformed/invalid `\u`/`\U`
-    // universal character name, and a `\x`/octal byte escape in a wide/UTF literal.
-    // Same silent-miscompile class as the wide/UTF codes above — suppressing either
-    // would let a wrong/CESU-8/collapsed code unit ship green. Both emit an Error HIR
-    // node + fail the gate via errorCount.
+    // H_InvalidUniversalCharacterName (C11/C23 6.4.3, Cycle C) + H_EscapeValueExceedsCodeUnit
+    // (6.4.4.4 / 6.4.5, the P55 pair): a malformed/invalid `\u`/`\U` universal character
+    // name, and a `\x`/octal escape whose VALUE does not fit one code unit of the
+    // literal's element. Same silent-miscompile class as the wide/UTF codes above —
+    // suppressing either would let a wrong/CESU-8/collapsed code unit ship green.
+    // ★ The second one is unsuppressable for a MEASURED reason, not a symmetric one:
+    // the behaviour it replaced was gcc/mingw's silent truncation, so a suppressed
+    // H_EscapeValueExceedsCodeUnit would not merely hide a message — it would hand back
+    // exactly the wrong unit the P55 pair was opened to stop (`"\x100"` → a NUL,
+    // `u"\x1FFFF"` → 0xFFFF). Both emit an Error HIR node + fail the gate via errorCount.
     {DiagnosticCode::H_InvalidUniversalCharacterName, kWhyWideLiteral},
-    {DiagnosticCode::H_WideByteEscapeUnsupported, kWhyWideLiteral},
+    {DiagnosticCode::H_EscapeValueExceedsCodeUnit, kWhyWideLiteral},
     // H_ConflictingStringLiteralPrefixes (C11/C23 6.4.5p5, Cycle D): a run of adjacent
     // string literals mixing TWO DIFFERENT non-narrow encoding prefixes (`u"a" U"b"`).
     // It is a silent-failure REASON code (like S_GenericSelectionNoMatch below): on the
@@ -1103,7 +1176,24 @@ constexpr std::array<UnsuppressableEntry, 169> kUnsuppressableCodes{{
     // K_WalkerInputContractViolation — walker received malformed input
     //   from the linker driver (suppressing → upstream corruption
     //   propagates downstream silently)
+    // P63 (D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN): the two
+    // OVER-ALIGNED-FOR-THIS-FORMAT gates. Each aborts the walker (`return {}`),
+    // so silencing one cannot ship a wrong artifact -- it makes the build fail
+    // with NOTHING said, which is the table's second prong. The static gate is
+    // new this cycle; its TLS twin was already shipped and already unprotected,
+    // and adding one without the other would have left the pair meaning two
+    // different things by which cycle wrote it.
+    {DiagnosticCode::K_StaticObjectOveralignedForFormat, kWhyOveralignedForFormat},
+    {DiagnosticCode::K_ThreadLocalOveralignedForFormat, kWhyOveralignedForFormat},
     {DiagnosticCode::K_NoMatchingObjectFormat, kWhyNoMatchingObjectFormat},
+    // P65 (D-DIAG-OVERLAP-REFUSAL-CODE-NOT-DISCRIMINATING): the two static-data
+    // producer codes. They are NOT here because their former parent is — the
+    // argument for each is written at its `kWhy*` above and rests on the
+    // dropped-`AssembledData` mechanism, not on inheritance.
+    {DiagnosticCode::K_OverlappingStaticInitUnsupported,
+     kWhyOverlappingStaticInit},
+    {DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+     kWhyStaticDataEncoderInvariant},
     {DiagnosticCode::K_FormatLacksImportSupport, kWhyFormatLacksImportSupport},
     {DiagnosticCode::K_RelocationKindMismatch, kWhyRelocationKindMismatch},
     {DiagnosticCode::K_WalkerInputContractViolation, kWhyWalkerInputContract},
@@ -1398,17 +1488,17 @@ constexpr std::array<UnsuppressableEntry, 169> kUnsuppressableCodes{{
     {DiagnosticCode::S_AlignasWeakerThanNatural, kWhySilentConstraint},
     {DiagnosticCode::S_AlignasInvalidContext, kWhySilentConstraint},
     {DiagnosticCode::S_AlignasNonConstant, kWhySilentConstraint},
-    // S_PackedBitfieldUnsupported (FC16, D-CSUBSET-PACKED, 2026-07-08): a `packed`
-    // struct/union that ALSO carries a bit-field member — an UNSUPPORTED combination
-    // (bit-granular packed packing is a distinct, deferred algorithm). Unlike the
-    // S_Alignas* constraint violations above, suppressing THIS would ship WRONG BYTES:
-    // the layout engine's nullopt belt fails the type out on the packed+bitfield path,
-    // so a suppressed diagnostic would leave the composite to be laid out padded (the
-    // wrong ABI). Closed here so a packed bit-field struct is never silently mislaid.
-    // (S_UnknownTypeAttribute is deliberately NOT a member — it mirrors the suppressible
-    // H_UnknownLinkageSpecifier typo diagnostic, and the build still fails via
-    // hasErrors when it fires unsuppressed.)
-    {DiagnosticCode::S_PackedBitfieldUnsupported, kWhyPackedBitfield},
+    // S_PackedBitfieldUnsupported (0xE032) IS DELIBERATELY ABSENT, and its absence is
+    // the point. It was a member from 2026-07-08 until
+    // D-CSUBSET-PACKED-BITFIELD-INTERACTION
+    // retired the code: `packed` + a bit-field is SUPPORTED now (the same
+    // two per-ABI packers `#pragma pack(N)` uses), so nothing emits it. An unemittable
+    // code cannot be suppressed, and leaving it listed is exactly what made 0xE04E
+    // read as load-bearing for a month after ITS retirement — de-list at retirement,
+    // in the same change, every time.
+    // (S_UnknownTypeAttribute is deliberately NOT a member either — it mirrors the
+    // suppressible H_UnknownLinkageSpecifier typo diagnostic, and the build still
+    // fails via hasErrors when it fires unsuppressed.)
     // S_NullptrInvalidOperand (FC17, D-CSUBSET-NULLPTR): `nullptr` used as an
     // invalid operator operand (`nullptr + 1`, `nullptr < p`, `-nullptr`). Unlike a
     // plain type mismatch, suppressing THIS would ship a SILENT MISCOMPILE: the HIR
@@ -1424,7 +1514,7 @@ constexpr std::array<UnsuppressableEntry, 169> kUnsuppressableCodes{{
     // a suppressed invalid-underlying would silently lay the enum out at the default
     // int width/signedness instead of failing, and a suppressed out-of-range value
     // would be truncated/wrapped into the underlying type — a wrong constant. Same
-    // silent-miscompile-guard class as S_PackedBitfieldUnsupported above. (The
+    // silent-miscompile-guard class as the S_Alignas* entries above. (The
     // default-int enum path never emits either, so unsuppressing changes nothing
     // for existing enums.)
     {DiagnosticCode::S_InvalidEnumUnderlyingType, kWhyEnumUnderlying},
@@ -1471,6 +1561,22 @@ constexpr std::array<UnsuppressableEntry, 169> kUnsuppressableCodes{{
     {DiagnosticCode::S_AutoRequiresPlainIdentifier, kWhyAutoInference},
     {DiagnosticCode::S_AutoRequiresInitializer, kWhyAutoInference},
     {DiagnosticCode::S_AutoInferenceInvalid, kWhyAutoInference},
+    // P66: the FIFTH member of that family, and the one that guards what the
+    // multi-declarator form MEANS rather than whether it is written. C23 states
+    // no single-declarator constraint at all — J.2(78) makes the declarator
+    // COUNT undefined behaviour and J.5.12 names multi-declarator inference a
+    // COMMON EXTENSION whose recommended semantics (6.7.10 fn.164) are ISO/IEC
+    // 14882's: ONE deduced type for the whole declaration. So the count stopped
+    // being the constraint and the AGREEMENT became it. Suppressed, the seam is
+    // the same one the four above cite — the Pass-2 initializer backfill would
+    // give each declarator its OWN type, the one meaning no reference
+    // implements.
+    {DiagnosticCode::S_AutoDeclaratorsInferDifferentTypes, kWhyAutoInference},
+    // P66 (C 6.7.6.3 / C23 6.7.7.4): the variadic marker must END the parameter
+    // list. Its own prong, because the artifact it ships wrong is a SIGNATURE
+    // and not a declaration's type.
+    {DiagnosticCode::S_VariadicMarkerMustEndParameterList,
+     kWhyVariadicMarkerPosition},
     // S_ThreadLocal* (TLS C1, D-CSUBSET-THREAD-LOCAL, C11/C23 6.7.1 + 6.6p9):
     // the five thread-storage constraint violations — thread_local on a
     // function, a block-scope object without static/extern, a same-TU

@@ -1106,9 +1106,19 @@ TEST(TargetSubRegisters, NoSubRegisterAppearsInAnyCallingConventionList) {
         for (auto const& r : schema.registers()) {
             if (r.subOf.empty()) continue;
             ++subOfRows;
-            // Resolves, and to a STRICTLY WIDER register of the SAME class —
-            // a typo'd parent would otherwise load fine and alias the wrong
-            // machine register.
+            // Resolves, and to a STRICTLY WIDER register of the SAME class.
+            // ⚠ THE CLAUSE THAT USED TO FOLLOW — *a typo'd parent would
+            // otherwise load fine and alias the wrong machine register* — WENT
+            // FALSE ON 2026-09-02 (cycle P55, lane lq): it does NOT load fine
+            // any more. `TargetSchemaData::validate()` now refuses a same-width
+            // or wrong-class or wrong-encoding `subOf` at LOAD, which is what
+            // makes `TargetRegisterInfo::aliases` the one way to say "same
+            // register, second spelling". ✔MEASURED that the sentence was
+            // describing this test and nothing else until then: a hand-authored
+            // target with a same-width `subOf` loaded clean at the P55 base.
+            // These three EXPECTs are therefore the shipped-config CONTROL for
+            // that rule, not the rule itself — the negatives that prove it
+            // fires are in `test_asm_arm64_memory_dialect_rows.cpp`.
             auto const parent = schema.registerByName(r.subOf);
             ASSERT_TRUE(parent.has_value()) << r.name << " -> " << r.subOf;
             auto const* pinfo = schema.registerInfo(*parent);

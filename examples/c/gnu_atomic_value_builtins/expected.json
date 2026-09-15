@@ -1,0 +1,35 @@
+{
+  "$comment": "[[D-C-HAS-EXTENSION-CLAIMS-C-ATOMIC-WHILE-THE-GNU-ATOMIC-BUILTINS-DO-NOT-EXIST]]: runtime witness for the GNU `__atomic_*` VALUE-FORM builtins (c.lang.json semantics.builtinFunctions — __atomic_load_n / __atomic_store_n / __atomic_exchange_n / __atomic_fetch_{add,sub,or,xor,and}), each a second SPELLING of a lowering verb the C11 atomic_*_explicit rows already bind. ★★ THE POINT OF THE EXAMPLE IS 'TOOK EFFECT', NOT 'COMPILED': the defect it closes was an advertisement the compiler could not honour, and the naive repair (declare the names so the TU parses) would leave every compile-only instrument green while the atomics did nothing. So every arm reads its result back out of MEMORY, and arm 6 DISCARDS two results outright so that only the STORE can be observed — an optimizer that treats a `__atomic_store_n`/`__atomic_fetch_add` as pure and drops it loses 40 from the accumulator, which is why the `release` arm below is load-bearing rather than decorative. Arm 5 passes a NON-CONSTANT memory order (a volatile int), the property `foldAtomicOrder` answers with seq_cst — over-fencing, C11-legal — and the one a compiler could fail while passing every other arm. Arms 7 exercise unsigned char and long long objects, so the ONE `genericPointee` declaration is proven to serve widths on both sides of `int`. ⚠ THE EXIT CODE IS MEASURED, NOT AUTHORED: ✔gcc 13.3.0 and clang 18.1.3, probed SEPARATELY at -O0 AND -O2 (four runs), all four exit 81 — the accumulator is 2842 and 2842 % 251 = 81, with 251 prime so no two per-arm contributions cancel in the modulus.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 81,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

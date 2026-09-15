@@ -26,8 +26,8 @@
 // HYPOTHETICAL — that table's own docblock records the fix's sweep as 232
 // Mach-O-visible descriptor functions on 2026-08-05; ✔RE-MEASURED 2026-08-25 the
 // same sweep is 277, and ✔RE-MEASURED 2026-08-31 it is 288. Whatever the exact
-// delta, ~45 symbols entered the eager-import set with no one asking the platform
-// what it calls them, and the ten-row list could not have noticed.
+// delta, ~45 symbols entered the Mach-O IMPORT surface with no one asking the
+// platform what it calls them, and the ten-row list could not have noticed.
 // ★ THE 2026-08-31 STEP IS THE MECHANISM WORKING RATHER THAN DRIFTING, and it is
 // worth the sentence because it is the only entry in that series that is: the
 // eleven <tgmath.h> complex imports (cabs cacos casin catan ccos cexp clog cpow
@@ -465,8 +465,8 @@ TEST(DarwinLinkNameOracle, EveryMachOImportedFunctionHasAMeasuredRow) {
             << "shippedLibs/" << f.descriptor << " declares `" << f.symbol
             << "` as a Mach-O import, and NOTHING has ever asked a real Darwin "
                "compiler what it calls that identifier.\n"
-               "  DSS eager-imports every declared function, and a WRONG-but-"
-               "EXISTING spelling links clean, loads clean, and misbinds "
+               "  A WRONG-but-EXISTING spelling links clean, loads clean, and "
+               "misbinds "
                "silently (see this file's header: that is how `fstat` returned "
                "st_size 0 and sqlite called every database malformed).\n"
                "  MEASURE IT on a real Mac, per arch:\n"

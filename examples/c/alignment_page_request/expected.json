@@ -1,0 +1,34 @@
+{
+  "$comment": "P63 [[D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN]]: the runtime witness that a PAGE-ALIGNED request is honored end to end. Before this cycle every construct in main.c was `error[S_AlignasExceedsMax]` -- the requestable ceiling was a hardcoded 256 in the semantic ladder, hand-copied into `Alignment::fromBytes` and again into the interner's `representableCompositeAlign`, three owners of one fact. It is now DECLARED, per target, as `aggregateLayout.maxRequestedAlignment` (268435456 on both shipped targets). $$ THE REFERENCE TABLE, each probed SEPARATELY, BUILD **and** RUN with the exit code asserted, subject `struct __attribute__((aligned(N))) big { char c; };` and its `_Alignas(N)` twin, CONTROL arm N=16 green throughout: gcc 13.3.0 and clang 18.1.3 both RUN 42 at N = 512, 1024, 4096, 8192, 16384, 65536, 2^20 and 2^28; gcc refuses 2^29 BY NAME (\"requested alignment '536870912' exceeds maximum 268435456\") and clang at 2^29 BUILDS and then answers with an `_Alignof` that disagrees with the request, so it casts no vote there under \"the union is over what WORKS, not what is ACCEPTED\". aarch64-linux-gnu-gcc 13.3.0 and mingw-w64 gcc 13.2.0 give gcc's SAME 2^28, which is why the key is a TARGET fact. $ WHY IT RUNS RATHER THAN COMPILES: the OLD failure was a loud refusal (nothing was ever miscompiled, which is exactly why every gate stayed green over it), and the NEW failure mode is the opposite -- an alignment accepted and then not applied is SILENT. So the exit code is derived from the ADDRESSES the linker chose and from the real field offsets, never from a constant: 4096 appears only as the request. $ THE SINK IS ASSERTED, not the absence of an error: each decorated member follows a `char`, so its offset AND the aggregate size both move when the request lands (0/4096/8192 vs the parse-and-drop 0/1/2). $ NOT EXERCISED HERE, deliberately: the SECOND and narrower per-FORMAT ceiling on a statically allocated object (what the image can PLACE it at). On PE that is the document's declared `SectionAlignment`, 4096, so this example sits AT that boundary on every shipped format and above none -- a request above it is refused by name with `K_StaticObjectOveralignedForFormat`, pinned by its own unit test.",
+  "$commentRedOnDisable": "REMOVE direction, executed 2026-09-07: in `src/analysis/semantic/semantic_analyzer.cpp` `foldAlignmentOperand`, delete the declared-ceiling arm and restore the literal `if (uv > 256u)`. Build rc 0, source md5 moved and returned, the mutated TU's .obj md5 moved and returned; this example then FAILS IN BOTH RUNNERS with `error[S_AlignasExceedsMax]` and NO artifact, while `examples/c/alignas_member` (whose alignments are all <= 256) stays GREEN as the named control. The dual mutant -- restoring `a > 256u` in `representableCompositeAlign` (`src/core/types/type_lattice/type_lattice.cpp`) while leaving the ladder raised -- ABORTS the compiler with `latticeFatal: completeComposite: the whole-composite explicit alignment ...`, which is how the third hand-written copy of the cap was found in the first place.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

@@ -98,14 +98,17 @@ constexpr char const* kBadSpelling = "zzNotAWeakDefinitionDialectSpelling";
 // are the SHIPPED JSON ON DISK and this hand-written table; nothing keeps them
 // in step but a human editing both, which is exactly the coupling being pinned.
 //
-// ⚠ 16 ROWS, NOT 24, AND THE EIGHT ABSENCES ARE THE DESIGN.
-//   * the four Mach-O IMAGE documents (exec / dylib × 2 arches) — their walker
-//     REFUSES a weak definition (`refuseWeakImageAlias`: N_WEAK_DEF on an image
-//     needs MH_WEAK_DEFINES in the mach header, D-LK3-DYLIB-WEAK-EXPORT), so it
-//     never asks;
+// ⚠ 20 ROWS, NOT 24, AND THE FOUR ABSENCES ARE THE DESIGN.
 //   * the two pe IMAGE documents (exec / dll) — the COMDAT encoder is the `.obj`
 //     arm only;
 //   * spirv and wasm — no walker there writes a weak definition in any spelling.
+// ★ IT WAS 16 UNTIL [[D-LK3-DYLIB-WEAK-EXPORT]] CLOSED, and the four rows that
+// arrived are the four Mach-O IMAGE documents (exec / dylib × 2 arches). Their
+// walker used to REFUSE a weak definition outright, so it never asked and a
+// declaration would have been a key nobody reads; it now encodes one —
+// N_WEAK_DEF through the same `definedNDesc`, plus an export-trie terminal and
+// content-derived header bits — and `macho::encode` asks the question ONCE
+// above its filetype dispatch, for every arm.
 // A key nobody reads drifts silently while reading as authoritative, which is
 // worse than no key at all; that is the whole reason
 // [[D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED]] landed with two rows and not
@@ -130,11 +133,17 @@ consultingFormats() {
         { "elf64-x86_64-linux-exec",         WeakDefinitionDialect::SymbolBinding },
         { "elf64-x86_64-linux-pie",          WeakDefinitionDialect::SymbolBinding },
         { "elf64-x86_64-linux-staticlib",    WeakDefinitionDialect::SymbolBinding },
-        // `macho::encode`'s MH_OBJECT arm — N_WEAK_DEF in `n_desc`. OBJECT and
-        // staticlib only; see the absence note above.
+        // `macho::encode` — N_WEAK_DEF in `n_desc` through `definedNDesc`.
+        // EVERY Mach-O flavor since D-LK3-DYLIB-WEAK-EXPORT closed: the gate
+        // sits ABOVE the filetype dispatch, so the MH_OBJECT, MH_EXECUTE and
+        // MH_DYLIB arms all reach it — the ELF shape one file over.
         { "macho64-arm64-darwin",            WeakDefinitionDialect::SymbolFlag    },
+        { "macho64-arm64-darwin-dylib",      WeakDefinitionDialect::SymbolFlag    },
+        { "macho64-arm64-darwin-exec",       WeakDefinitionDialect::SymbolFlag    },
         { "macho64-arm64-darwin-staticlib",  WeakDefinitionDialect::SymbolFlag    },
         { "macho64-x86_64-darwin",           WeakDefinitionDialect::SymbolFlag    },
+        { "macho64-x86_64-darwin-dylib",     WeakDefinitionDialect::SymbolFlag    },
+        { "macho64-x86_64-darwin-exec",      WeakDefinitionDialect::SymbolFlag    },
         { "macho64-x86_64-darwin-staticlib", WeakDefinitionDialect::SymbolFlag    },
     };
     return kRows;
@@ -326,7 +335,7 @@ TEST(WeakDefinitionDialect, ShippedDeclarationsAreOnlyWhereAWriterConsultsThem) 
         << "the shipped object-format corpus should be ~24 documents";
     // …and so is the expectation. An emptied table would make the set
     // comparison below pass against a corpus that declares the key NOWHERE.
-    ASSERT_EQ(consultingFormats().size(), 16u)
+    ASSERT_EQ(consultingFormats().size(), 20u)
         << "the hand-written consulting-format table has been emptied or "
            "half-edited — every arm here would then assert nothing";
 
@@ -457,7 +466,7 @@ TEST(WeakDefinitionDialect, EveryShippedDeclarationIsSpelledByItsOwnBackend) {
                "document";
         ++checked;
     }
-    EXPECT_EQ(checked, 16u) << "the loop must have run over every consulting "
+    EXPECT_EQ(checked, 20u) << "the loop must have run over every consulting "
                                "format, not a truncated list";
 }
 

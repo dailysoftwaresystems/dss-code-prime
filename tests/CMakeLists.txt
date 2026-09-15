@@ -258,12 +258,23 @@ add_subdirectory(conformance)
 # orders) would sail straight through. Kept apart, that case is a configure-time
 # FATAL_ERROR; MEASURED by forcing the divisor to 10 with clean flags, which fails
 # the configure with rc=1 rather than quietly registering repeat=2.
-string(TOUPPER "${CMAKE_BUILD_TYPE}" _dss_build_type_upper)
+#
+# ★ THE OBSERVATION IS READ FROM ITS ONE OWNER, `cmake/DssBuildClass.cmake`, not
+# tested here (D-TEST-INTEGRATED-RUNNER-HANGS-BEFORE-CREATING-ITS-EX-DIRECTORY). This
+# block used to carry its own sanitizer test over CMAKE_CXX_FLAGS and its build-type
+# variant while the ctest budgets carried a second one over more flags, and the two
+# agreed only because of how CI passes its flags. That module also stops the
+# configure if the answer moves between this reader and a later one, and it is
+# included HERE, by its first reader, so the root CMakeLists.txt needs no second edit.
+# The observation is published so `ctest/entry-budgets` can refuse one that
+# disagrees with the class.
+include("${CMAKE_SOURCE_DIR}/cmake/DssBuildClass.cmake")
+dss_build_class(_dss_build_class READER "tests/CMakeLists.txt shuffle-arm")
 set(DSS_SHUFFLE_SANITIZED OFF)
-if ("${CMAKE_CXX_FLAGS}" MATCHES "[-/]fsanitize="
-        OR "${CMAKE_CXX_FLAGS_${_dss_build_type_upper}}" MATCHES "[-/]fsanitize=")
+if (_dss_build_class STREQUAL "sanitized")
     set(DSS_SHUFFLE_SANITIZED ON)
 endif()
+set_property(GLOBAL PROPERTY DSS_SHUFFLE_SANITIZED "${DSS_SHUFFLE_SANITIZED}")
 
 set(DSS_SHUFFLE_REPEAT_DIVISOR 1)
 if (DSS_SHUFFLE_SANITIZED)
@@ -292,8 +303,8 @@ function(dss_add_shuffle_arm)
     if (NOT DSS_SHUFFLE_SANITIZED AND NOT repeat EQUAL DSS_REPEAT)
         message(FATAL_ERROR
             "dss_add_shuffle_arm(${DSS_NAME}): this build is NOT instrumented "
-            "(no [-/]fsanitize= in CMAKE_CXX_FLAGS or CMAKE_CXX_FLAGS_"
-            "${_dss_build_type_upper}), yet the repeat count was reduced "
+            "(its class is '${_dss_build_class}', per cmake/DssBuildClass.cmake), "
+            "yet the repeat count was reduced "
             "${DSS_REPEAT} -> ${repeat} by divisor ${DSS_SHUFFLE_REPEAT_DIVISOR}. "
             "That silently drops test orders this leg is the only one sampling.")
     endif()

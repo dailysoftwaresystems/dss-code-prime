@@ -8,13 +8,23 @@
  * routing fix, sent `main` through the `MultiBlockInliner` whose hand-rolled
  * caller-host emit copies a BlockAddress's block-id payload verbatim (a stale id
  * after the host's blocks are renumbered = SILENT MISCOMPILE) and aborts on the
- * IndirectBr terminator (no arm). The fix routes a computed-goto host to the
- * single-block rebuilder (which remaps both correctly); `adjust` simply stays a
- * call (not inlined into the computed-goto host — the named follow-up covers
- * full multi-block inlining into such a host).
+ * IndirectBr terminator (no arm).
  *
- * RED-ON-DISABLE: remove the `!functionHasComputedGoto(mir, f)` guard at the
- * inlining routing and this example crashes/miscompiles under `--config=release`.
+ * ⚠ UPDATED 2026-09-02 (P53, D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST).
+ * THIS PARAGRAPH USED TO SAY `adjust` "simply stays a call, not inlined into the
+ * computed-goto host", and it is no longer true — that sentence described the
+ * ROUTING WORKAROUND, not the behaviour. The workaround is gone: the
+ * `MultiBlockInliner` now has its own `BlockAddress` arm (payload remapped via
+ * `blockMap_`) and `IndirectBr` arm (successors remapped), so a multi-block
+ * callee IS inlined into a computed-goto host, and `functionHasComputedGoto` —
+ * the guard this comment named — has been deleted along with its half of the
+ * `singleBlockOnly` condition. ✔MEASURED: this example now inlines.
+ *
+ * RED-ON-DISABLE: delete the `BlockAddress` arm from
+ * `MultiBlockInliner::emitCallerInst` and this example's release arm exits with
+ * an ACCESS_VIOLATION instead of 11; delete the `IndirectBr` arm from
+ * `emitTerminator` and it aborts on an unhandled terminator opcode. ✔Both
+ * MEASURED. The stale routing guard is NOT the disable knob any more.
  *
  * acc starts at 1; prog = {add5, dbl, add5, halt}; adjust(x) = x>100 ? x-50 : x+3.
  *   pc0 add5: acc = adjust(1)  = 4   (1<=100 -> 1+3)

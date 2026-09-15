@@ -1,0 +1,34 @@
+{
+  "$comment": "P63 [[D-CSUBSET-ATTRIBUTE-MID-DECLARATOR-POSITION-REFUSED]]: the runtime witness for the THREE DECLARATOR-LIST attribute positions DSS refused. MEASURED before this change through the shipped CLI: `struct s { char a __attribute__((aligned(16))), b; }` and `struct s { char a, __attribute__((aligned(16))) b; }` both gave `error[P_UnexpectedToken]`, and the file-scope `char a, __attribute__((aligned(16))) b;` gave `error[P_NoAlternativeMatched]: expected 'Identifier', 'ParenOpen', 'StarOp' or 'BracketOpen' -- got '__attribute__'`. $$ THE REFERENCE VOTES, each probed SEPARATELY, BUILD **and** RUN, undecorated control green in every cell: the AFTER-A-NON-LAST-DECLARATOR position is BUILT AND RUN by gcc 13.3.0 AND clang 18.1.3, agreeing on the layout -- a clean 2-of-2. The FILE-SCOPE AFTER-A-COMMA position is BUILT AND RUN by gcc, clang AND mingw-w64 gcc 13.2.0 -- 3-of-3, every reference that speaks `__attribute__` at all. The MEMBER AFTER-A-COMMA position is a minority-of-one: clang BUILDS, RUNS, AND LANDS THE ALIGNMENT AT THE SINK (a static asserting `&g.b % 16 == 0` and `offsetof(b) % 16 == 0` at RUN TIME returns 42), while gcc, mingw-w64 gcc and MSVC (in its own `__declspec(align(N))` spelling, C2143) refuse -- and under `DSS = (gcc union clang union MSVC) union ISO C`, the union over what WORKS, one working reference makes the construct REQUIRED. gcc's refusal is member-list-LOCAL, not positional: it BUILDS AND RUNS the identical spelling at file scope. $$$ THE BINDING IS PER-DECLARATOR, AND A TWO-DECLARATOR SUBJECT CANNOT SHOW IT -- WHICH IS WHY EVERY SUBJECT HERE HAS THREE. With only `a` and `b`, `char a, __attr__ b;` gives a@0 b@16 sizeof 32 whether the attribute binds to `b` alone or to the whole declaration; the candidates coincide and the probe passes either way. MEASURED 2026-09-07 with three: clang gives a=0 b=16 **c=17** sizeof 32, and the file-scope twin puts `fc` at `&fb + 1` on gcc AND clang. Declaration grain would have put `c` at 32 and sizeof at 48 -- a SILENT WRONG LAYOUT from a rule that parses and runs. $ THE LEADING POSITION IS THE CONTRAST AND IS RETAINED AS A CONTROL: it IS per-declaration (a=0 b=16 c=32 sizeof 48 on both references), it was already shipped, and keeping it in the same program is what makes the other numbers attributable to POSITION rather than to the scan. The TRAILING-on-the-last-declarator and undecorated controls are here for the same reason. $ THE UNION HALF is exercised too: `unionField` is a separate config row and therefore a separate omission. $ NO RESIDUE IS CLAIMED FOR THE GNU SPELLING: all three refused positions now parse and bind. The C23 `[[...]]` spelling in these positions stays a LOUD positioned refusal, because FIRST(stdAttr) = {BracketOpen} is also FIRST(declarator)'s abstract-array lead -- the config loader refuses the schema outright (`C_AmbiguousAlternatives`), exactly as it already does for the leading `declAttrRun` slot.",
+  "$commentRedOnDisable": "REMOVE direction, executed 2026-09-07. THREE independent arms, one per position, each with a named CONTROL that stays green. (A) delete `{ \"repeat\": \"attrSpec\" }` from `shapes.initDeclarator.sequence` -> this example FAILS IN BOTH RUNNERS with `error[P_NoAlternativeMatched] ... got '__attribute__'` on the file-scope `char fa, __attribute__((aligned(16))) fb, fc;` and NO artifact, while `examples/c/attribute_mid_declarator_member` -- whose attributes are all in the LEADING member slot -- stays GREEN. (B) delete `{ \"repeat\": \"attrSpec\" }` from `shapes.structMemberDeclarator.sequence` -> `error[P_UnexpectedToken]` on `struct after_comma`, same control green. (C) move `{ \"optional\": \"structMemberAttrList\" }` back out of `shapes.structMemberDeclarator` and onto `shapes.structField`/`shapes.unionField` -> `error[P_UnexpectedToken] ... got ','` on `struct after_declarator`, because a run parked on the FIELD can only ever reach the LAST declarator. $$ THE CONFIG IS DATA, so a mutant needs no recompile of a changed TU -- the assertion that carries the arm is that `c.lang.json`'s own md5 MOVED and RETURNED, and that the restore is done with `cp` + `touch` and never `mv` (an `mv` preserves the backup's older mtime, ninja then skips the rebuild, and the previous arm's binary leaks into the next one -- MEASURED in this cycle, it reddened a following arm's control). $$$ A GRAIN MUTANT IS NOT AVAILABLE ON THIS SUBJECT AND THE REASON IS RECORDED RATHER THAN GUESSED: flipping the new slots' `appertainsTo` cannot be expressed here, because these runs are read through `semantics.declarators.afterDeclaratorAttrRules`, whose `attrSpec` entry is SHARED with the already-shipped after-declarator position -- changing it would move both. The grain is witnessed instead by the NUMBERS in this program: `c` at 17 rather than 32, and `fc` at `&fb + 1`, are only reachable at declarator grain.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

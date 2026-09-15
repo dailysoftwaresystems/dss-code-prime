@@ -1424,9 +1424,15 @@ TEST(ElfExecWriter, PtLoadHeaderHasReadExecutePermsAndPageAlign) {
     // p_vaddr / p_paddr @ +16, +24 = 0x401000
     EXPECT_EQ(readU64LE(bytes, 64 + 16), 0x401000u);
     EXPECT_EQ(readU64LE(bytes, 64 + 24), 0x401000u);
-    // p_filesz / p_memsz @ +32, +40 = 3 (text length)
-    EXPECT_EQ(readU64LE(bytes, 64 + 32), 3u);
-    EXPECT_EQ(readU64LE(bytes, 64 + 40), 3u);
+    // p_filesz / p_memsz @ +32, +40 — the segment closes on
+    // `.note.gnu.build-id`, which this format now declares
+    // (D-LK-ELF-EMITS-NO-BUILD-ID-NOTE): 3 bytes of `.text`, padded to the
+    // note's 4-byte addralign, then the 48-byte note (12-byte Nhdr + "GNU\0"
+    // + a 32-byte SHA-256 descriptor) = 52. The note is SHF_ALLOC in both
+    // references, so it MUST be inside a PT_LOAD — an unmapped identity is
+    // invisible to the crash reporter that reads it.
+    EXPECT_EQ(readU64LE(bytes, 64 + 32), 52u);
+    EXPECT_EQ(readU64LE(bytes, 64 + 40), 52u);
     // p_align @ +48 = 0x1000 (4KB page, kernel-required)
     EXPECT_EQ(readU64LE(bytes, 64 + 48), 0x1000u);
 }
@@ -1459,9 +1465,13 @@ TEST(ElfExecWriter, RelaTextSlotDroppedForExec) {
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
-    // e_shnum @ +60 = 5 in ET_EXEC mode.
-    EXPECT_EQ(readU16LE(bytes, 60), 5u);
-    // e_shstrndx @ +62 = 4 in ET_EXEC mode.
+    // e_shnum @ +60 = 6 in ET_EXEC mode: NULL, .text, .symtab, .strtab,
+    // .shstrtab, and `.note.gnu.build-id` APPENDED LAST
+    // (D-LK-ELF-EMITS-NO-BUILD-ID-NOTE). Appending is what keeps every index
+    // below — and e_shstrndx — exactly where they were.
+    EXPECT_EQ(readU16LE(bytes, 60), 6u);
+    // e_shstrndx @ +62 = 4 in ET_EXEC mode — UNMOVED by the appended note,
+    // which is the property the append order exists to preserve.
     EXPECT_EQ(readU16LE(bytes, 62), 4u);
     // Section index 2 in ET_EXEC is .symtab (SHT_SYMTAB = 2), not
     // SHT_NULL — verify by reading sh_type @ +4 within the header.
@@ -2631,8 +2641,13 @@ TEST(ElfExecWriter, RodataExtendsSinglePtLoadAndStaysReadExecute) {
     ASSERT_NE(roOff, 0u);
     std::uint64_t const rodataFileOff = readU64LE(bytes, roOff + 24);
     std::uint64_t const rodataFileEnd = rodataFileOff + 4u;
-    EXPECT_EQ(pFilesz, rodataFileEnd - pOffset)
-        << "p_filesz must span .text through end of .rodata";
+    // `.note.gnu.build-id` now closes this segment, after `.rodata`
+    // (D-LK-ELF-EMITS-NO-BUILD-ID-NOTE): padded to its 4-byte addralign, then
+    // 48 bytes (12-byte Nhdr + "GNU\0" + a 32-byte SHA-256 descriptor).
+    std::uint64_t const noteFileEnd = ((rodataFileEnd + 3u) & ~std::uint64_t{3})
+                                      + 48u;
+    EXPECT_EQ(pFilesz, noteFileEnd - pOffset)
+        << "p_filesz must span .text through end of the build-id note";
     EXPECT_EQ(pMemsz, pFilesz)
         << "p_memsz == p_filesz (no BSS this cycle)";
 }
@@ -2683,9 +2698,15 @@ TEST(ElfExecWriter, NoDataItemsEmitsNoRodataByteIdenticalToBaseline) {
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
-    // 5 sections (NULL, .text, .symtab, .strtab, .shstrtab) — NO
-    // .rodata. Same count the RelaTextSlotDroppedForExec pin asserts.
-    EXPECT_EQ(readU16LE(bytes, 60), 5u);
+    // 6 sections (NULL, .text, .symtab, .strtab, .shstrtab, and the appended
+    // `.note.gnu.build-id`) — NO .rodata, which is what this pin is about.
+    // Same count the RelaTextSlotDroppedForExec pin asserts.
+    // ⚠ THE BASELINE THIS TEST NAMES IS THE RODATA GATE, NOT THE WHOLE IMAGE:
+    // the note is present because the format DECLARES the row
+    // (D-LK-ELF-EMITS-NO-BUILD-ID-NOTE), and the scan below still proves no
+    // SHF_ALLOC-only PROGBITS section exists — a note is SHT_NOTE, so it
+    // cannot satisfy that scan and cannot mask a stray `.rodata`.
+    EXPECT_EQ(readU16LE(bytes, 60), 6u);
     // No SHT_PROGBITS+SHF_ALLOC header other than .text (which has
     // SHF_ALLOC|SHF_EXECINSTR = 6, not 2) — scan confirms zero
     // SHF_ALLOC-only PROGBITS sections.
@@ -3045,8 +3066,13 @@ TEST(ElfExecWriter, ElfExecMultipleRodataItemsLayoutWithAlignmentPadding) {
     std::uint64_t const pOffset = readU64LE(bytes, 64 + 8);
     std::uint64_t const pFilesz = readU64LE(bytes, 64 + 32);
     std::uint64_t const rodataFileEnd = roFileOff + 32u;
-    EXPECT_EQ(pFilesz, rodataFileEnd - pOffset)
-        << "p_filesz spans .text through end of both rodata items";
+    // ...and then the appended `.note.gnu.build-id`, 4-byte aligned + 48 bytes
+    // (D-LK-ELF-EMITS-NO-BUILD-ID-NOTE).
+    std::uint64_t const noteFileEnd = ((rodataFileEnd + 3u) & ~std::uint64_t{3})
+                                      + 48u;
+    EXPECT_EQ(pFilesz, noteFileEnd - pOffset)
+        << "p_filesz spans .text through end of both rodata items and the "
+           "build-id note that closes the segment";
 }
 
 TEST(ElfExecWriter, ElfExecAnonymousRodataItemsDoNotCollide) {
@@ -4166,7 +4192,11 @@ TEST(ElfImageSymbolNames,
         // only that `sh_info` agrees with wherever the locals happen to end. The
         // derivation's FAILURE arm — an entry appended on the wrong side — is
         // unreachable from any module and is driven directly over hand-built
-        // tables in `ElfSymtabPartition.EveryBreachArmFiresAndNamesTheOffender`.
+        // tables in `ElfSymtabPartition.EveryBreachArmFiresAndNamesTheOffender`
+        // (the four breach arms) and `ElfSymtabPartition.HoldsOnAWellFormedTable`
+        // (the well-formed, all-local, all-global and empty arms of both the
+        // breach predicate and the boundary reader). Those two are THE place
+        // the predicate pair is driven; no third pin restates them.
         if (dynamicArm) {
             int const dynsymIdx = findSectionByName(bytes, ".dynsym");
             ASSERT_GE(dynsymIdx, 0) << label;
@@ -4238,10 +4268,25 @@ TEST(ElfImageSymbolNames,
             << label
             << ": the `.text` section symbol's st_value must be the section's "
                "load address in an image";
-        EXPECT_EQ(shInfo, 2u)
+        // The third local is fn #9 — the fixture's nameless
+        // trampoline-shaped symbol, which `definedBinding` resolves to Local
+        // and which this arm therefore emits STB_LOCAL since
+        // D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL closed. It sits at
+        // index 2, ahead of the canonical, because the local pass runs first.
+        // This literal was `2` while every image function was forced GLOBAL,
+        // and it is exactly the assumption that anchor existed to falsify.
+        ASSERT_GE(nsyms, 3u) << label;
+        EXPECT_EQ(infoAt(2), 0x02u)
             << label
-            << ": and those two are the ONLY locals in these images - a third "
-               "would mean the alias pass had run inside the LOCAL region";
+            << ": symbol #2 must be the nameless (trampoline-shaped) function, "
+               "STB_LOCAL|STT_FUNC";
+        EXPECT_EQ(nameAt(2), "sym_9")
+            << label << ": ...and it keeps the `sym_<id>` fallback name";
+        EXPECT_EQ(shInfo, 3u)
+            << label
+            << ": and those three are the ONLY locals in these images - a "
+               "fourth would mean the alias pass had run inside the LOCAL "
+               "region";
     };
 
     for (auto const& port : ports) {
@@ -4289,6 +4334,25 @@ TEST(ElfSymtabPartition, HoldsOnAWellFormedTable) {
     EXPECT_EQ(dss::link::format::elfSymtabPartitionBreach(allGlobal, 0), "");
     std::vector<std::uint8_t> const empty;
     EXPECT_EQ(dss::link::format::elfSymtabPartitionBreach(empty, 0), "");
+
+    // ── ...and the boundary READER both writers publish `sh_info` from ─────
+    //    D-LINK-ELF-IMAGE-STATIC-FN-EMITTED-STB-GLOBAL replaced three
+    //    POSITIONAL snapshots (each a statement about where the writer stood,
+    //    not about where the locals end) with `elfSymtabFirstNonLocal`. It is
+    //    the SAME decision this test already drives, over the SAME hand-built
+    //    tables, so it is extended here rather than given a third pin of its
+    //    own. The arm that matters is the LAST one: a bare search loop returns
+    //    0 for a table with no non-local record, which would publish a
+    //    `sh_info` of 0 for a module of nothing but statics — the exact
+    //    all-local shape the ET_REL writer reaches.
+    EXPECT_EQ(dss::link::format::elfSymtabFirstNonLocal(t), 2u)
+        << "two locals, then a global: the boundary is 2";
+    EXPECT_EQ(dss::link::format::elfSymtabFirstNonLocal(allLocal), 2u)
+        << "a table with NO non-local record has its boundary at the END, not "
+           "at 0";
+    EXPECT_EQ(dss::link::format::elfSymtabFirstNonLocal(allGlobal), 0u);
+    EXPECT_EQ(dss::link::format::elfSymtabFirstNonLocal(empty), 0u)
+        << "an empty table: no records, so nothing can sit on either side";
 }
 
 TEST(ElfSymtabPartition, EveryBreachArmFiresAndNamesTheOffender) {

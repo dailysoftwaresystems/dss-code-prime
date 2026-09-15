@@ -1,0 +1,33 @@
+{
+  "$comment": "C23 6.7.6 (P58, [[D-CSUBSET-ALIGNAS-TYPEDEF-PARAM-PARSE]], the PARAMETER half): an alignment specifier on a FUNCTION PARAMETER is ACCEPTED and HONORED — the parameter's frame slot lands on the requested 16-byte boundary at run time, so `((uintptr_t)&x % 16) == 0` gates the exit and exit = 42. ★★ THE ROW ASKED FOR THE OPPOSITE. It wanted `S_AlignasInvalidContext` here, reading C11 6.7.5p2. Measuring the references inverted it, and this file is the runnable half of that refutation. ✔MEASURED 2026-09-03, each reference probed SEPARATELY, both spellings, every -std each compiler accepts: gcc 13.3.0 REFUSES ('alignment specified for parameter'); clang 18.1.3 refuses the ISO spelling but ACCEPTS AND HONORS the GNU one (`__attribute__((aligned(16)))` on a parameter -> `__alignof__(x)==16`, the discriminating `==4` twin fails 'negative size'); MSVC 19.51 ACCEPTS `_Alignas(16)` on a parameter at /std:c11, /std:c17 and /std:clatest, rc 0, SILENT at /W4, and HONORS it (the `__alignof(x)==16?1:-1` arm compiles while `==4` fails C2118, and an EXECUTED binary reports the address 16-aligned at /Od and /O2). A split on ACCEPT-vs-REFUSE is settled by the DISJUNCTION (operator, 2026-08-28), so one working accepting reference makes acceptance REQUIRED — emitting the row's diagnostic would have put DSS BELOW the union on a program MSVC compiles. ⚠ The row also mis-cited the clause: in C23 the alignment specifier is 6.7.6, not 6.7.5 (6.7.5 in C23 is Function specifiers), and C23 6.7.6p2 DROPPED the word `parameter` that C11 6.7.5p2 named explicitly. ★ THE REFERENCE ORACLE FOR THIS FILE IS MSVC AND IT WAS RUN, NOT ASSUMED — `cl /std:c17 /Od`, `cl /std:c17 /O2` and `cl /std:clatest /O2` (with /D\"alignas=_Alignas\", the spelling MSVC implements) all BUILD it and the binary EXITS 42. gcc and clang refuse the file, which is exactly why MSVC is the oracle here: an example only DSS accepts is not a witness, it is a second copy of the bug (P57's lesson, paid for by `c99_array_param_static`). ★★ AND THE ORACLE REFUTED TWO ARMS OF THE FIRST DRAFT, which is why they are not here: (a) a negative control demanding an UNDECORATED parameter's address be NOT 16-aligned — `cl /Od` aligned it anyway (exit 8); 'not aligned' is not a guaranteed property of any ABI and cannot be an assertion. Under DSS it IS discrimination, ✔MEASURED through the shipped CLI at x86_64:pe64-x86_64-windows-exec: an undecorated int parameter's address is NOT 16-aligned in debug OR release (probe exits 7, not 42) — a fact about DSS's frame layout, stated rather than demanded. (b) an arm demanding the request on a SECOND parameter — MSVC returned 9 at /Od and /O2 alike, and a focused positional probe (only/first/second in one binary) gives MSVC mask 5: it delivers in parameter slot 0 and SILENTLY DROPS in slot 1. That does not weaken the acceptance verdict and DSS does not copy the drop: clang honors EVERY position in the GNU spelling (same three probes, mask 7 at -O0 and -O2), DSS honors every position (✔MEASURED, a second parameter is 16-aligned in debug and release), and `SemanticAnalyzerC.AlignasOnASecondParameterDoesNotLeakToItsSiblings` pins it at the semantic tier where no oracle is needed. 'A quality split is not a meaning fork: match the one that WORKS.' RED-ON-DISABLE, MEASURED through the shipped CLI: remove `alignasSpec` from `paramDeclSpecifier`'s alt in c.lang.json and this file does not COMPILE (error[P_NoAlternativeMatched]) — it stops exiting 42. Admitted-but-value-dropped would exit 7. Data-model-independent; one exit code across all four targets including the shipped release pipeline.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

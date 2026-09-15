@@ -302,19 +302,41 @@ TEST(FfiCHeaderParser, ErrorStructAtSetForHeaderHasNonExternDecl) {
     EXPECT_GT(rowsOrErr.error().at.span.length(), 0u);
 }
 
+// ★★ P65 — THE FIXTURE MOVED SCOPE; THE SUBJECT NEVER MOVED AT ALL.
+//
+// This test's subject is the FF2 boundary's LOCUS FORWARDING: when the c front
+// end rejects a header at LOWERING, the wrap kind (`HeaderParseFailed`) is the
+// same whether or not a span exists, so the fold mirrors the first reported
+// Error's span into `HeaderReadError::at`. `extern int x = 5;` was never the
+// subject — it was a CONVENIENT guaranteed lowering failure that carries a span.
+//
+// [[D-C-FILE-SCOPE-EXTERN-WITH-INITIALIZER-IS-A-DEFINITION]] took that
+// convenience away: at FILE scope the construct is now a definition (C 6.9.2p1),
+// so it lowers CLEANLY to a `Global` and the walker's `HirKind::Global` arm
+// returns `HeaderHasNonExternDecl` — a different kind, produced by
+// `emitAndReturn` on a different code path, already covered by
+// `ErrorStructAtSetForHeaderHasNonExternDecl` above. That is why this test went
+// red, and why substituting just any failure would have made it vacuous:
+// `HeaderHasNonExternDecl` never reaches the `!loweringResult->ok` wrap this
+// test exists to pin, and a span-LESS failure would satisfy the kind assertion
+// while asserting nothing about the locus.
+//
+// The replacement keeps the SAME code, the SAME tier and the SAME wrap: the
+// refusal survives one scope down, where C 6.7.11p5 makes an initializer on a
+// block-scope declaration of an identifier with linkage a constraint violation
+// (gcc, clang and MSVC all refuse it). The header now carries a function body,
+// which is deliberate and not a hazard: `HeaderHasFunctionBody` is decided in
+// the post-lowering decl walk, which a failed lowering never reaches — and the
+// kind assertion below is what would catch it if that ordering ever changed.
 TEST(FfiCHeaderParser, ErrorStructAtSetOnLoweringFailure) {
-    // Post-fold #7 silent-failure F2: D-FF2-3's H_ExternHasInitializer
-    // is emitted by lowering, then wrapped as HeaderParseFailed at the
-    // FF2 boundary. Without the F2 fold, the wrap dropped the locus —
-    // the LSP consumer would see HeaderReadError::at absent despite a
-    // span-bearing diagnostic in the reporter. Pin that the wrap now
-    // forwards the first reported Error's span into the struct.
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
-        "extern int x = 5;\n",
+        "int f(void) { extern int x = 5; return x; }\n",
         "<test>", "libc.so.6", rep);
     ASSERT_FALSE(rowsOrErr.has_value());
-    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderParseFailed);
+    EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderParseFailed)
+        << "the LOWERING wrap, not the decl walk's HeaderHasFunctionBody — a "
+           "lowering that failed never reaches the walk";
     EXPECT_TRUE(rowsOrErr.error().at.isPresent())
         << "HeaderReadError::at must mirror the underlying lowering "
            "diagnostic's span — F2 fold contract";
@@ -328,9 +350,9 @@ TEST(FfiCHeaderParser, FirstReportedErrorSpanBoundedToCurrentCall) {
     // subspan(errStart) bound, file #2's HeaderReadError.at would
     // inherit file #1's leftover span on the shared reporter.
     //
-    // Both calls below take the SAME lowering-failure path
-    // (`extern int = ...;`) on the shared reporter; both calls'
-    // diagnostics have spans. Pre-fix, call 2's scan starting at
+    // Both calls below take the SAME lowering-failure path (a BLOCK-scope
+    // `extern` with an initializer, C 6.7.11p5) on the shared reporter; both
+    // calls' diagnostics have spans. Pre-fix, call 2's scan starting at
     // index 0 would return call 1's H_ExternHasInitializer span
     // (in <call1>'s buffer). With the subspan bound, call 2's
     // `at` correctly points into <call2>'s buffer.
@@ -339,10 +361,17 @@ TEST(FfiCHeaderParser, FirstReportedErrorSpanBoundedToCurrentCall) {
     // for call 2, which short-circuits BEFORE the F2 scan — it pinned
     // a contract that was already true pre-fix. The current shape
     // genuinely regression-blocks the subspan(errStart) bound.
+    //
+    // ★ P65: the two fixtures moved from FILE to BLOCK scope for the reason
+    // written out on `ErrorStructAtSetOnLoweringFailure` above — at file scope
+    // the construct is now a DEFINITION (C 6.9.2p1) that lowers cleanly, so it
+    // stopped being a lowering failure at all. The property under test is
+    // untouched: what this needs from its input is only that BOTH calls fail at
+    // LOWERING and BOTH carry a span, in two DIFFERENT buffers.
     DiagnosticReporter rep;
 
     auto first = readCHeaderFromText(
-        "extern int x = 5;\n",
+        "int f(void) { extern int x = 5; return x; }\n",
         "<call1>", "libc.so.6", rep);
     ASSERT_FALSE(first.has_value());
     ASSERT_TRUE(first.error().at.isPresent())
@@ -352,7 +381,7 @@ TEST(FfiCHeaderParser, FirstReportedErrorSpanBoundedToCurrentCall) {
     // Call 2 on the SAME reporter, also a lowering-fail with span,
     // but in a DIFFERENT buffer.
     auto second = readCHeaderFromText(
-        "extern int y = 7;\n",
+        "int g(void) { extern int y = 7; return y; }\n",
         "<call2>", "libc.so.6", rep);
     ASSERT_FALSE(second.has_value());
     EXPECT_EQ(second.error().kind, HeaderReadErrorKind::HeaderParseFailed);

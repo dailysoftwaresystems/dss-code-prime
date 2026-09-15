@@ -96,8 +96,13 @@ class DiagnosticReporter;
 // descriptor row, its core's symbol row, and a runtime witness — never ahead of them.
 //
 // The six reach the UCRT through three cores + one accessor, every one of them an
-// ORDINARY `stdio.json` pe symbol row (so the eager-import law has already proven each is
-// a real `ucrtbase.dll` export):
+// ORDINARY `stdio.json` pe symbol row.
+// ⚠ WHAT PROVES EACH IS A REAL `ucrtbase.dll` EXPORT CHANGED ON 2026-09-03. This said
+// "the eager-import law has already proven" it; [[D-FFI-DESCRIPTOR-EAGER-IMPORT]] retired
+// that law, so an unreferenced descriptor symbol is now dropped instead of bound. The
+// surviving guarantee is that the shim BODIES call these cores, so each carries a
+// relocation and passes the linker's reference gate on its own merit — a narrower claim
+// than the old one, and the one that is actually true:
 //   printf   -> __stdio_common_vfprintf(0, __acrt_iob_func(1), fmt, NULL, ap)
 //   fprintf  -> __stdio_common_vfprintf(0, stream, fmt, NULL, ap)
 //   vfprintf -> __stdio_common_vfprintf(0, stream, fmt, NULL, ap)   [ap is a real param]
@@ -112,8 +117,13 @@ class DiagnosticReporter;
 // (ordinal 117) and `__stdio_common_vsnprintf_s` (115) and NOTHING between them. The `_s`
 // twin is a DIFFERENT function (extra `_MaxCount`, secure-CRT validation), not a spelling
 // variant, so it is not a substitute either. Naming a nonexistent core in a descriptor row
-// would break EVERY pe binary's LOAD with 0xC0000139 under the eager-import law — the exact
-// failure the advice to use that name was trying to prevent. The real UCRT does the same
+// would break EVERY pe binary that REACHES it with a LOAD failure of 0xC0000139 — and note
+// that hazard NARROWED on 2026-09-03: under the retired eager-import law
+// ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]) a bad name in the descriptor broke every pe binary
+// whether or not it called the function, because the row was bound regardless. Now only a
+// binary whose shim body actually references the core imports it, so the blast radius is
+// the callers rather than the world. Still the exact failure the advice to use that name
+// was trying to prevent, and still a reason to refuse it. The real UCRT does the same
 // thing this pass does: in SDK 10.0.26100.0 `ucrt/stdio.h`, `snprintf` calls `vsnprintf`,
 // whose body is one `__stdio_common_vsprintf` call differing from
 // `sprintf`'s only in the two arguments that matter — the `_Options` bit and a REAL

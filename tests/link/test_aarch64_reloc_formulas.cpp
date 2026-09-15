@@ -67,7 +67,13 @@ Patched applyOneReloc(std::shared_ptr<TargetSchema const> tgt,
                       std::uint64_t symbolVa,
                       std::int64_t  addend,
                       std::uint64_t patchSectionVa,
-                      std::uint64_t funcOffset) {
+                      std::uint64_t funcOffset,
+                      // D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS:
+                      // the GOT slot the image minted for the target, or 0 for
+                      // "this image minted none" — which is what every caller
+                      // but the GOTPCREL pair means, and what the walkers that
+                      // synthesize no GOT pass.
+                      std::uint64_t gotSlotVa = 0) {
     Patched out;
     out.text.resize(funcOffset + 4);
     // assembler emitted base inst at funcOffset (LE)
@@ -92,9 +98,12 @@ Patched applyOneReloc(std::shared_ptr<TargetSchema const> tgt,
     std::unordered_map<SymbolId, std::uint64_t> symbolVaMap{{SymbolId{2}, symbolVa}};
 
     DiagnosticReporter rep;
+    std::unordered_map<SymbolId, std::uint64_t> gotMap;
+    if (gotSlotVa != 0) gotMap.emplace(SymbolId{2}, gotSlotVa);
     out.ok = applyExecRelocations(
         out.text, mod, funcTextStart, symbolVaMap,
-        *tgt, patchSectionVa, "test", rep);
+        *tgt, patchSectionVa, "test", rep,
+        gotSlotVa != 0 ? &gotMap : nullptr);
     return out;
 }
 
@@ -118,6 +127,9 @@ TEST(RelocFormulaKind, NameRoundTrip) {
     // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the GOT-address pair.
     EXPECT_EQ(relocFormulaName(RelocFormulaKind::Aarch64AdrGotPage),    "aarch64_adr_got_page");
     EXPECT_EQ(relocFormulaName(RelocFormulaKind::Aarch64Ld64GotLo12),   "aarch64_ld64_got_lo12");
+    // D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: the x86_64
+    // GOT-slot-relative reference a real glibc archive member carries.
+    EXPECT_EQ(relocFormulaName(RelocFormulaKind::X86_64GotPcRel),       "x86_64_gotpcrel");
 
     EXPECT_EQ(parseRelocFormulaKind("linear"),                   RelocFormulaKind::Linear);
     EXPECT_EQ(parseRelocFormulaKind("aarch64_call26"),           RelocFormulaKind::Aarch64Call26);
@@ -126,6 +138,7 @@ TEST(RelocFormulaKind, NameRoundTrip) {
     EXPECT_EQ(parseRelocFormulaKind("aarch64_tprel_add_hi12"),   RelocFormulaKind::Aarch64TprelAddHi12);
     EXPECT_EQ(parseRelocFormulaKind("aarch64_adr_got_page"),     RelocFormulaKind::Aarch64AdrGotPage);
     EXPECT_EQ(parseRelocFormulaKind("aarch64_ld64_got_lo12"),    RelocFormulaKind::Aarch64Ld64GotLo12);
+    EXPECT_EQ(parseRelocFormulaKind("x86_64_gotpcrel"),          RelocFormulaKind::X86_64GotPcRel);
     EXPECT_EQ(parseRelocFormulaKind("nonsense"),                 std::nullopt);
     EXPECT_EQ(parseRelocFormulaKind(""),                         std::nullopt);
 }
@@ -156,6 +169,78 @@ TEST(Aarch64GotAddr, ApplyFailsLoudLd64GotLo12) {
     auto p = applyOneReloc(tgt, 0xF9400000u, 0x400000, 0, 0x400000, 0);
     EXPECT_FALSE(p.ok)
         << "DSS must NOT apply an arm64 GOT-lo12 reloc — it is foreign-linked.";
+}
+
+// D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: the x86_64
+// GOT-slot-relative reference. `symbolVa` holds the SYMBOL's address; the
+// relocation names the SLOT that holds it, so the kernel reads a SECOND map —
+// `gotSlotVa`, which the walker fills while it lays the `.got` out.
+//
+// ⚠ THE TWO MAPS ARE A MEASUREMENT. ✔MEASURED on the real glibc `exit.o`
+// (`/usr/lib/x86_64-linux-gnu/libc.a`), `__call_tls_dtors` is the target of a
+// GOTPCREL at `.rela.text` 0x1b AND of a PLT32 at 0x294 — one symbol needing
+// its slot's address at one site and its own address at another, which a single
+// map cannot express.
+//
+// The pair below is the whole contract: WITH a slot the reference resolves
+// through it; WITHOUT one it REFUSES rather than falling back to `symbolVa`,
+// because writing `S + A − P` would emit a DIRECT reference where an INDIRECT
+// one was meant. Every plain-GOTPCREL site in that member is
+// `cmpq $0x0,sym@GOTPCREL(%rip)` — a weak-undefined NULL check — so the
+// fabricated value would be the reference site's own address, never zero, and
+// the branch would take the wrong arm forever.
+TEST(X86_64GotPcRel, ResolvesThroughTheSlotTheImageMinted) {
+    auto tgt = loadOneRelocTarget("x86_64_gotpcrel");
+    ASSERT_NE(tgt, nullptr);
+    auto const* tri = tgt->relocationInfo(RelocationKind{1});
+    ASSERT_NE(tri, nullptr);
+    EXPECT_EQ(tri->formulaKind, RelocFormulaKind::X86_64GotPcRel);
+    // Patch site at VA 0x400000; the slot at 0x404020; the addend a real
+    // `cmpq $0x0,sym@GOTPCREL(%rip)` site carries. value = slot + A - P.
+    constexpr std::uint64_t kSlot = 0x404020;
+    constexpr std::uint64_t kSite = 0x400000;
+    auto p = applyOneReloc(tgt, 0u, /*symbolVa=*/0x401234, -5, kSite, 0, kSlot);
+    ASSERT_TRUE(p.ok)
+        << "a GOT-slot-relative reference must RESOLVE once the image mints the "
+           "slot it names";
+    auto const written = static_cast<std::int32_t>(readInst(p.text, 0));
+    EXPECT_EQ(written, static_cast<std::int32_t>(
+                           static_cast<std::int64_t>(kSlot) - 5
+                           - static_cast<std::int64_t>(kSite)))
+        << "the displacement must reach the SLOT, not the symbol — a value "
+           "computed from symbolVa (0x401234) would load from the object "
+           "itself and the `cmpq $0x0` idiom would compare the wrong bytes";
+}
+
+TEST(X86_64GotPcRel, ApplyFailsLoudRatherThanFabricatingADirectReference) {
+    auto tgt = loadOneRelocTarget("x86_64_gotpcrel");
+    ASSERT_NE(tgt, nullptr);
+    auto const* tri = tgt->relocationInfo(RelocationKind{1});
+    ASSERT_NE(tri, nullptr);
+    EXPECT_EQ(tri->formulaKind, RelocFormulaKind::X86_64GotPcRel);
+    // No slot map — the state every walker that mints no GOT is in.
+    auto p = applyOneReloc(tgt, 0u, 0x400000, -5, 0x400000, 0);
+    EXPECT_FALSE(p.ok)
+        << "DSS must NOT fabricate a direct pc-relative displacement for a "
+           "GOT-slot-relative reference it has no slot for.";
+    // Non-vacuous CONTROL: the SAME module + the SAME addend under a Linear
+    // 32-bit pc-relative row is applied happily. So the refusal is a property
+    // of the FORMULA KIND, not of the fixture (an empty text buffer, a missing
+    // symbol VA, or an out-of-range value would refuse under both).
+    auto linR = TargetSchema::loadFromText(R"({
+      "dssTargetVersion": 1,
+      "target": {"name":"x86_64_test_control"},
+      "relocations":[
+        { "name": "control_pcrel32", "kind": 1, "formula": "linear",
+          "pcRelative": true, "addendBias": 0, "widthBytes": 4 }
+      ],
+      "opcodes":[ {"mnemonic":"invalid","result":"none"} ]
+    })");
+    ASSERT_TRUE(linR.has_value());
+    auto q = applyOneReloc(*linR, 0u, 0x400000, -5, 0x400000, 0);
+    EXPECT_TRUE(q.ok)
+        << "control: the Linear arm applies this exact fixture — so the "
+           "GOTPCREL refusal above is about the formula, not the setup.";
 }
 
 // TF-C52 loader coherence: a GOT-address formula is non-Linear, so
@@ -646,6 +731,12 @@ TEST(ShippedX86_64Target, LinearRoundTripsAllRows) {
 }
 
 // architect Q2 post-fold #1: acceptedRelocFormulaList contains every variant.
+//
+// ⚠ A TEST NAMED "AllVariants" MUST ACTUALLY NAME THEM ALL. When P63 added
+// `x86_64_gotpcrel` this case kept passing while covering 7 of 8 — its exact-string
+// sibling below was extended correctly, so nothing was uncovered, but THIS name went
+// false. A name is a claim like any other figure in this repository, and it rots the
+// same way: by OMISSION, silently, on the day something is added beside it.
 TEST(RelocFormulaKind, AcceptedListContainsAllVariants) {
     auto const list = acceptedRelocFormulaList();
     EXPECT_NE(list.find("'linear'"),                   std::string::npos);
@@ -655,6 +746,7 @@ TEST(RelocFormulaKind, AcceptedListContainsAllVariants) {
     EXPECT_NE(list.find("'aarch64_tprel_add_hi12'"),   std::string::npos);
     EXPECT_NE(list.find("'aarch64_adr_got_page'"),     std::string::npos);
     EXPECT_NE(list.find("'aarch64_ld64_got_lo12'"),    std::string::npos);
+    EXPECT_NE(list.find("'x86_64_gotpcrel'"),          std::string::npos);
 }
 
 // ── Post-fold #2 (second 7-agent audit) ──────────────────────
@@ -667,7 +759,7 @@ TEST(RelocFormulaKind, AcceptedListIsCommaSpaceQuotedExactly) {
               "'linear', 'aarch64_call26', "
               "'aarch64_adr_prel_pg_hi21', 'aarch64_add_abs_lo12', "
               "'aarch64_tprel_add_hi12', 'aarch64_adr_got_page', "
-              "'aarch64_ld64_got_lo12'");
+              "'aarch64_ld64_got_lo12', 'x86_64_gotpcrel'");
 }
 
 // pr-test-analyzer Rating 7: whitespace tolerance pinned as reject

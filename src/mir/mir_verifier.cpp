@@ -1,5 +1,7 @@
 #include "mir/mir_verifier.hpp"
 
+#include "core/types/alignment.hpp"   // P63: the Alloca arm asks THIS type for its
+                                     // representable domain instead of restating it
 #include "core/types/call_payload.hpp"   // TF-C112: hasIndirectResult (sret prepend)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -416,17 +418,38 @@ void MirVerifier::checkStructuralInvariants(DiagnosticReporter& reporter) const 
         if (op == MirOpcode::Alloca) {
             // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: the Alloca's secondary payload
             // is the local's EFFECTIVE alignment in bytes (0 = no over-alignment
-            // recorded). A non-zero value MUST be a power of two ≤ 256 (the
-            // `Alignment` newtype cap) — the frame layout places each alloca on
-            // this boundary, so a dropped/garbled value (a rebuild/merge site
-            // zeroing or corrupting payload2) would mis-align the slot. Fail loud
-            // here rather than silently mis-place the stack local.
+            // recorded). A non-zero value MUST be REPRESENTABLE as an
+            // `Alignment` — the frame layout places each alloca on this
+            // boundary, so a dropped/garbled value (a rebuild/merge site zeroing
+            // or corrupting payload2) would mis-align the slot. Fail loud here
+            // rather than silently mis-place the stack local.
+            //
+            // ⚠⚠ THIS ARM SPELLED THE CAP BY HAND AS `a > 256` UNTIL P63
+            // ([[D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN]]),
+            // AND THE HAND-WRITTEN COPY OUTLIVED THE THING IT COPIED. Its
+            // comment called 256 "the `Alignment` newtype cap"; that cap is a
+            // REPRESENTABILITY bound and is now `Alignment::kMaxBytes`, while the
+            // POLICY ceiling — how large an alignment a program may ASK for — is
+            // declared per target as `maxRequestedAlignment` and enforced at the
+            // SEMANTIC tier, where a refusal carries a source position. ✔MEASURED
+            // 2026-09-07: with the literal still here, `_Alignas(4096) char
+            // buf[4096];` inside a function died on THIS check — an INTERNAL
+            // `I_*` code naming a MIR instruction index, with no `-->` position
+            // line — while gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 all
+            // BUILD AND RUN it. The frame layout was already correct: asking the
+            // newtype instead of restating its old domain is the whole fix, and
+            // `_Alignas(512/4096/65536)` locals then BUILD 0 and RUN 42 with
+            // `&buf[0] % N == 0` asserted at run time.
+            // ★ THE RULE THIS ARM NOW OBEYS: a verifier bound is ASKED OF THE
+            // TYPE THAT OWNS THE DOMAIN, never re-stated. A restated bound cannot
+            // be moved by moving its owner, so it silently becomes the tighter of
+            // the two and turns a positioned user diagnostic into an internal one.
             std::uint32_t const a = mir_.instPayload2(id);
-            if (a != 0 && ((a & (a - 1)) != 0 || a > 256)) {
+            if (a != 0 && !Alignment::fromBytes(a).has_value()) {
                 reportInst(reporter,
                     DiagnosticCode::I_AllocaAlignmentNotPowerOfTwo, id,
                     std::format("alloca alignment payload {} is not a power of "
-                                "two in [1, 256]", a));
+                                "two in [1, {}]", a, Alignment::kMaxBytes));
             }
             // VLA C1a (D-CSUBSET-VLA): the runtime-sized-Alloca invariant. A VLA
             // alloca (its pointee `isVlaArray`) MUST carry exactly ONE operand (the

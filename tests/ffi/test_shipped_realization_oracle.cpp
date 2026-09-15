@@ -69,6 +69,7 @@
 #include "core/types/type_lattice/type_registry.hpp"
 #include "diagnostic_count.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
+#include "fixture_role_resolver.hpp"   // the ONE test-side runtimeLibraries stand-in
 #include "repo_root.hpp"
 #include "scoped_env.hpp"
 #include "scratch_dir.hpp"
@@ -123,6 +124,18 @@ struct OracleRun {
     bool located = false;        // the oracle found a corpus at all
 };
 
+// D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: the
+// shipped descriptors name their C-library image by ROLE (`{"role":
+// "cLibrary"}`), and the driver's oracle always carries a resolver over the
+// active format, so this fixture carries one too. Without it the real-corpus
+// arms would see NO pe image in `memory.json` AND none in `string.json` — an
+// agreement about nothing — and the REMOVE-direction mutant below would have
+// nothing to disagree with. The synthetic corpora spell literals and never
+// consult it. The table is the ONE test-side fixture
+// (`fixture_role_resolver.hpp`), which also says why it is a fixture and not a
+// second owner of the image identity.
+using dss::ffi_test::FixtureRoleResolver;
+
 // Ask the oracle about `names`, with `treeRoot` installed as `DSS_CONFIG_ROOT`.
 // The interner/registry are per-call: two calls must never share an interner, or
 // the SECOND corpus's types would be answered out of the FIRST's identity map.
@@ -140,9 +153,10 @@ struct OracleRun {
     std::array<NamedTypeBinding, 1> const named{
         NamedTypeBinding{"va_list",
                          interner.pointer(interner.primitive(TypeKind::Void))}};
+    FixtureRoleResolver const roles{fmt};
     auto const realized = realizeShippedExternSymbols(
         names, interner, typeReg, rep, dm,
-        std::optional<std::string_view>{"x86_64"}, fmt, named);
+        std::optional<std::string_view>{"x86_64"}, fmt, named, &roles);
     OracleRun out;
     out.conflicts =
         countCode(rep, DiagnosticCode::F_ShippedCorpusInvariantBroken);

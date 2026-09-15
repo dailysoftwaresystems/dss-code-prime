@@ -1,0 +1,55 @@
+{
+  "$comment": "TWO DSS-BUILT DYNAMIC LIBRARIES IN ONE PROGRAM, and one of them calls its own WEAK definition. Covers [[D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT]] and the Mach-O half of [[D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING]]. WHY IT IS NEW RATHER THAN A VARIANT OF `dynlib_resolve_roundtrip`: that entry carries exactly ONE dependency per arm, and nothing anywhere in the shipped corpus built TWO dynamic libraries into one program. A single library cannot notice a defect whose entire shape is 'two artifacts of one format claim ONE identity' -- which is what the two darwin dylib documents used to guarantee by declaring the literal install name `@rpath/libdss.dylib` for every dylib DSS would ever emit (MEASURED before the fix: rc 0, ZERO diagnostics, ONE LC_LOAD_DYLIB recorded, the second library's symbols simply absent at load, against an ELF control that recorded two correct DT_NEEDED entries). And `dssalpha.c` calls its OWN WEAK definition from inside the library, a shape both darwin dylib targets REFUSED outright by name until the Mach-O walker learned the LC_DYLD_INFO_ONLY weak-bind stream -- so this entry reds if that realization ever regresses to a refusal, on every format at once. WHAT IT DOES NOT WITNESS, stated so it is not read as more than it is: the coalescing DIVERGENCE needs a RIVAL definition in a second image, which one corpus process cannot stage; that run was taken by hand on the operator's Apple Silicon host (DSS dylib under an Apple-clang executable defining a rival weak body -> rc 2, against the ld64-built control's rc 2, where DSS returned rc 1 in cycle P61). ⚠ THAT HARDWARE RUN COVERS ONE CONFIGURATION AND WAS FIRST REPORTED AS TWO: its 'release' arm shipped a file byte-identical to the debug one, because the tiny witness source gave the release pipeline nothing to transform. The release half is carried at the BYTE level on THIS entry's own `dssalpha.c`, whose release artifact genuinely differs (md5 3d98c766b00abd95f219c42ffa29f4b3 debug vs dc3d0968ca775b409b136564e823404d release, arm64 darwin dylib) while its weak-bind stream and its __stubs-routed self-call stay identical across both -- which is what `mustDifferFromBaseline` on the dependency is for. The byte-level identity property is pinned by `program/test_macho_install_name_identity`. RUN SCOPE: the pe64 arm RUNS on windows -- the loader finds a `.dll` beside the executable, so no rpath is needed. The elf and macho arms are BUILD-ONLY (`runOn: []`), the same choice and the same reason as `dynlib_resolve_roundtrip`: DSS emits no LC_RPATH / DT_RUNPATH, so a `.so` or `.dylib` recorded as `@rpath/...` or by basename has no search path the runner can place it on. Marking them runnable would produce a load failure that says nothing about this entry's subject.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "dependsOn": [
+        { "sources": ["dssalpha.c"], "spec": "x86_64:pe64-x86_64-windows-dll",
+          "artifact": "dssalpha.dll", "mustDifferFromBaseline": true },
+        { "sources": ["dssbeta.c"], "spec": "x86_64:pe64-x86_64-windows-dll",
+          "artifact": "dssbeta.dll", "mustDifferFromBaseline": true }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [],
+      "dependsOn": [
+        { "sources": ["dssalpha.c"], "spec": "x86_64:elf64-x86_64-linux-dyn",
+          "artifact": "dssalpha.so", "mustDifferFromBaseline": true },
+        { "sources": ["dssbeta.c"], "spec": "x86_64:elf64-x86_64-linux-dyn",
+          "artifact": "dssbeta.so", "mustDifferFromBaseline": true }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [],
+      "dependsOn": [
+        { "sources": ["dssalpha.c"], "spec": "arm64:elf64-aarch64-linux-dyn",
+          "artifact": "dssalpha.so", "mustDifferFromBaseline": true },
+        { "sources": ["dssbeta.c"], "spec": "arm64:elf64-aarch64-linux-dyn",
+          "artifact": "dssbeta.so", "mustDifferFromBaseline": true }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [],
+      "dependsOn": [
+        { "sources": ["dssalpha.c"], "spec": "arm64:macho64-arm64-darwin-dylib",
+          "artifact": "dssalpha.dylib", "mustDifferFromBaseline": true },
+        { "sources": ["dssbeta.c"], "spec": "arm64:macho64-arm64-darwin-dylib",
+          "artifact": "dssbeta.dylib", "mustDifferFromBaseline": true }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

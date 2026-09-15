@@ -104,6 +104,92 @@ function Write-LocalBuildIoFailure([string]$LogPath) {
     Write-Host "  full log: $LogPath"
 }
 
+# ★★★ A NON-ZERO BUILD THAT PRINTED NO DIAGNOSTIC AT ALL IS ITS OWN CLASS, AND IT
+# IS NOT A SOURCE DEFECT. Measured 2026-09-05 (P62 lane `dy`): editing a source
+# file while ninja was already running in the same tree cost TWO WHOLE BUILDS, each
+# ending rc=1 with a log that stopped mid-compile and named no error. At the exit
+# code that is indistinguishable from a real compile failure. The I/O classifier
+# above cannot see it: that one keys on a diagnostic of a particular SHAPE, and
+# this class prints no diagnostic to key on.
+# ★★ DEFINED BY THE COMPLEMENT, never by enumerating the shapes a silent failure
+# takes -- there is nothing to enumerate. "A diagnostic was printed" is the
+# positive vocabulary; its absence is the class, so a shape nobody has thought of
+# yet counts as SILENT, which fails toward reading the log rather than trusting it.
+# ! THE COLON (or the MSVC code) IS LOAD-BEARING. This repository ships
+# `src/core/error/` and a `test_artifact_withheld_after_error` target whose names
+# appear in an ordinary ninja PROGRESS line on every build; matching a bare `error`
+# would blind the guard in exactly the tree it protects.
+$script:LocalBuildDiagnosticRe =
+    '(^|[^a-zA-Z0-9_])[Ee]rror:|fatal error|[Ee]rror [A-Z]+[0-9]{4}|undefined reference'
+
+function Test-LocalBuildNoDiagnostic([string]$LogPath) {
+    if (-not (Test-Path -LiteralPath $LogPath)) { return $true }
+    foreach ($line in Get-Content -LiteralPath $LogPath) {
+        if ($line -match $script:LocalBuildDiagnosticRe) { return $false }
+    }
+    return $true
+}
+
+function Get-LocalBuildSourcesTouchedSince([string]$MarkerPath) {
+    if (-not (Test-Path -LiteralPath $MarkerPath)) { return @() }
+    $since = (Get-Item -LiteralPath $MarkerPath).LastWriteTimeUtc
+    @('src', 'tests') |
+        Where-Object { Test-Path -LiteralPath $_ } |
+        ForEach-Object { Get-ChildItem -LiteralPath $_ -Recurse -File -ErrorAction SilentlyContinue } |
+        Where-Object { $_.LastWriteTimeUtc -gt $since } |
+        Select-Object -First 20 |
+        ForEach-Object { $_.FullName }
+}
+
+# ! THREE STATES, NOT TWO, AND THE THIRD IS WHY THIS HELPER EXISTS. "no file is
+# newer than the marker" and "there is no marker, so nothing was compared" are
+# different facts, and collapsing them makes the report assert a RULING-OUT it
+# never performed -- the instrument answering an adjacent question, failing toward
+# clean. That defect was live in the .sh twin until its own message arm printed the
+# text; it is written correctly here from the start because of that.
+function Get-LocalBuildTouchedVerdict([string]$MarkerPath) {
+    if (-not (Test-Path -LiteralPath $MarkerPath)) { return 'unchecked' }
+    if (@(Get-LocalBuildSourcesTouchedSince $MarkerPath).Count -gt 0) { return 'moved' }
+    return 'clean'
+}
+
+function Write-LocalBuildNoDiagnostic([string]$LogPath, [string]$MarkerPath) {
+    Write-Host "local-build.ps1: FAIL - THE BUILD EXITED NON-ZERO AND PRINTED NO DIAGNOSTIC."
+    Write-Host "  No line in the log matches any shape our toolchains emit for an error."
+    Write-Host "  [!] THIS IS NOT EVIDENCE OF A SOURCE DEFECT. Do NOT start 'fixing' the last"
+    Write-Host "      file the log happened to name - that file is where the log STOPPED, which"
+    Write-Host "      is not where anything went wrong."
+    $failed = @(Get-Content -LiteralPath $LogPath -ErrorAction SilentlyContinue |
+                Where-Object { $_ -like 'FAILED: *' } | Select-Object -First 3)
+    if ($failed.Count -gt 0) {
+        Write-Host "  ninja named a failed target, so a command died without saying why:"
+        $failed | ForEach-Object { Write-Host "    $_" }
+    } else {
+        Write-Host "  ninja named NO failed target - the log simply ends. The build process"
+        Write-Host "    itself went away (killed, or its input changed underneath it)."
+    }
+    switch (Get-LocalBuildTouchedVerdict $MarkerPath) {
+        'moved' {
+            Write-Host "  * MEASURED: these source files CHANGED WHILE THIS BUILD WAS RUNNING -"
+            Write-Host "    this is the known cause, and re-running the build is the whole remedy:"
+            Get-LocalBuildSourcesTouchedSince $MarkerPath | ForEach-Object { Write-Host "    $_" }
+        }
+        'clean' {
+            Write-Host "  * MEASURED: no file under src/ or tests/ changed while the build ran, so"
+            Write-Host "    the edit-under-ninja cause is RULED OUT here. Re-run once; if it recurs"
+            Write-Host "    at the same point, say so in the row rather than retrying a third time."
+        }
+        default {
+            Write-Host "  [!] NOT MEASURED: no build-start marker, so nothing was compared and the"
+            Write-Host "      edit-under-ninja cause is neither shown nor ruled out. This is what an"
+            Write-Host "      absent marker means - it is NOT a clean bill of health."
+        }
+    }
+    Write-Host "  [!] If this happened during a RED-ON-DISABLE arm, that arm measured NOTHING -"
+    Write-Host "      a build that never completed is not evidence about your change."
+    Write-Host "  full log: $LogPath"
+}
+
 if ($SelfTest) {
     # The arm is EXERCISED, not read - the same four arms the .sh twin runs.
     $stDir = Join-Path ([System.IO.Path]::GetTempPath()) ("lb-selftest-" + [System.Guid]::NewGuid().ToString('N'))
@@ -173,10 +259,91 @@ if ($SelfTest) {
         } else {
             Write-Host "self-test arm 4 MESSAGE                 incomplete: $msg"; $stFail = 1
         }
+        # Arms 7..14 are the SILENT half - the same arms, in the same order, as the
+        # .sh twin. Twin parity here is about the ARM-BY-ARM VERDICTS, which is how
+        # this pair has been proven twice before.
+        $silent = Join-Path $stDir 'silent.log'
+        Set-Content -LiteralPath $silent -Value @(
+            '[412/1180] Building CXX object src/hir/CMakeFiles/dss_hir.dir/hir_builder.cpp.obj',
+            '[413/1180] Building CXX object src/mir/CMakeFiles/dss_mir.dir/hir_to_mir.cpp.obj')
+        if (Test-LocalBuildNoDiagnostic $silent) {
+            Write-Host 'self-test arm 7 SILENT-STOP             classified as expected'
+        } else {
+            Write-Host 'self-test arm 7 SILENT-STOP             NOT classified - blind to the silent half'; $stFail = 1
+        }
+        # * THE ARM THIS CLASSIFIER EXISTS TO SURVIVE. Both paths ship in this
+        # repository and appear in an ordinary progress line on EVERY build.
+        $silentErr = Join-Path $stDir 'silent-errorpath.log'
+        Set-Content -LiteralPath $silentErr -Value @(
+            '[7/9] Building CXX object src/core/CMakeFiles/dss_core.dir/error/reporter.cpp.obj',
+            '[8/9] Building CXX object tests/link/CMakeFiles/x.dir/test_artifact_withheld_after_error.cpp.obj')
+        if (Test-LocalBuildNoDiagnostic $silentErr) {
+            Write-Host 'self-test arm 8 SILENT-ON-ERROR-PATH    classified as expected'
+        } else {
+            Write-Host 'self-test arm 8 SILENT-ON-ERROR-PATH    NOT classified - a FILE NAME fooled it'; $stFail = 1
+        }
+        if (Test-LocalBuildNoDiagnostic $real) {
+            Write-Host 'self-test arm 9 REAL-COMPILE-ERROR      misclassified - it would HIDE a real defect'; $stFail = 1
+        } else {
+            Write-Host 'self-test arm 9 REAL-COMPILE-ERROR      left alone as expected'
+        }
+        $msvc = Join-Path $stDir 'msvc.log'
+        Set-Content -LiteralPath $msvc -Value @(
+            "src${at}mir${at}x.cpp(42): error C2065: 'q': undeclared identifier")
+        $ldundef = Join-Path $stDir 'ldundef.log'
+        Set-Content -LiteralPath $ldundef -Value @(
+            "/usr/bin/ld: x.o: in function ``main':",
+            "x.c:(.text+0x9): undefined reference to ``helper'")
+        if ((Test-LocalBuildNoDiagnostic $msvc) -or (Test-LocalBuildNoDiagnostic $ldundef)) {
+            Write-Host 'self-test arm 10 MSVC-AND-LD-DIAGNOSTIC misclassified - a vendor spelling is missing'; $stFail = 1
+        } else {
+            Write-Host 'self-test arm 10 MSVC-AND-LD-DIAGNOSTIC left alone as expected'
+        }
+        $msg = (Write-LocalBuildNoDiagnostic $silent (Join-Path $stDir 'no-such-marker') 6>&1 | Out-String)
+        if ($msg -match 'PRINTED NO DIAGNOSTIC' -and $msg -match 'NOT EVIDENCE OF A SOURCE DEFECT' -and $msg -match 'RED-ON-DISABLE') {
+            Write-Host 'self-test arm 11 MESSAGE                names the class, the mis-fix hazard and the red-on-disable hazard'
+        } else {
+            Write-Host "self-test arm 11 MESSAGE                incomplete: $msg"; $stFail = 1
+        }
+        # Arms 12..14 drive all THREE verdicts. An absent marker means nothing was
+        # compared, which is a different sentence from "nothing changed".
+        if ((Get-LocalBuildTouchedVerdict (Join-Path $stDir 'absent-marker')) -eq 'unchecked') {
+            Write-Host 'self-test arm 12 VERDICT-UNCHECKED     no marker reported as NOT MEASURED'
+        } else {
+            Write-Host 'self-test arm 12 VERDICT-UNCHECKED     a missing marker did not report as unchecked'; $stFail = 1
+        }
+        $stMarker = Join-Path $stDir 'marker'
+        Set-Content -LiteralPath $stMarker -Value '' -NoNewline
+        if ((Get-LocalBuildTouchedVerdict $stMarker) -eq 'clean') {
+            Write-Host 'self-test arm 13 VERDICT-CLEAN         nothing newer than the marker reported as clean'
+        } else {
+            Write-Host 'self-test arm 13 VERDICT-CLEAN         a quiet tree did not report as clean'; $stFail = 1
+        }
+        # ! THE POSITIVE VERDICT NEEDS A DETERMINISTIC GAP, AND WRITE-ORDER DOES NOT
+        # PROVIDE ONE: a marker and a probe written back-to-back get mtimes equal to
+        # the nanosecond on this host, and the comparison is strictly-greater. The
+        # marker is back-dated HERE, in the fixture, for that reason alone.
+        # ★★ PRODUCTION DELIBERATELY DOES NOT BACK-DATE - a marker aged even one
+        # second would flag the file the caller had just edited before starting the
+        # build, which is the ordinary workflow, so the report would fire on every
+        # failed build and mean nothing.
+        $stProbe = Join-Path 'tests' '.local-build-selftest-probe'
+        Set-Content -LiteralPath $stMarker -Value '' -NoNewline
+        (Get-Item -LiteralPath $stMarker).LastWriteTimeUtc = [datetime]::new(2000, 1, 1, 0, 0, 0, [System.DateTimeKind]::Utc)
+        Set-Content -LiteralPath $stProbe -Value 'probe'
+        try {
+            if ((Get-LocalBuildTouchedVerdict $stMarker) -eq 'moved') {
+                Write-Host 'self-test arm 14 VERDICT-MOVED         a file changed after the marker was seen'
+            } else {
+                Write-Host 'self-test arm 14 VERDICT-MOVED         a CHANGED FILE WAS MISSED - the measurement is blind'; $stFail = 1
+            }
+        } finally {
+            Remove-Item -LiteralPath $stProbe -Force -ErrorAction SilentlyContinue
+        }
     } finally {
         Remove-Item -LiteralPath $stDir -Recurse -Force -ErrorAction SilentlyContinue
     }
-    if ($stFail -eq 0) { Write-Host 'local-build: self-test OK - 6 arms, both directions exercised.' }
+    if ($stFail -eq 0) { Write-Host 'local-build: self-test OK - 14 arms, both directions exercised.' }
     exit $stFail
 }
 
@@ -254,6 +421,12 @@ if ($Configure -or -not (Test-Path (Join-Path $buildDir 'build.ninja'))) {
 # Tee so the console still streams while a copy stays scannable. $LASTEXITCODE
 # after a native command piped to Tee-Object is the NATIVE command's.
 $buildLog = Join-Path $buildDir '.local-build-last.log'
+# Stamped the instant BEFORE the build starts, so "newer than this" is exactly
+# "changed while ninja was running". Written unconditionally: a marker left over
+# from a previous run would date the wrong build and turn the one measurement the
+# no-diagnostic reporter makes into a fabrication.
+$buildMarker = Join-Path $buildDir '.local-build-started'
+Set-Content -LiteralPath $buildMarker -Value '' -NoNewline
 # ★★★ OPERATOR RULING 2026-08-25: "never use all CPUS, the idea is to keep build + tests + run always at 4 cpus", AMENDED same-day to "make it 6 cores, not 4, everywhere".
 # A bare `cmake --build` hands off to ninja, whose default is ALL CORES.
 $dssJobs = if ($env:DSS_JOBS) { $env:DSS_JOBS } else { '6' }
@@ -262,6 +435,15 @@ $buildRc = $LASTEXITCODE
 if ($buildRc -ne 0 -and (Test-LocalBuildToolchainIoFailure $buildLog)) {
     Write-LocalBuildIoFailure $buildLog
     exit 9
+}
+# ! ORDER IS DELIBERATE: the I/O classifier runs FIRST because an I/O failure DOES
+# print a diagnostic (`fatal error: error writing to ...`), so it is a strictly more
+# specific class. Reaching here means the build failed having printed nothing any
+# toolchain would call an error. Its OWN exit code, distinct from both 9 and a real
+# compiler's rc, so a caller can tell "nothing was measured" from "your code is wrong".
+if ($buildRc -ne 0 -and (Test-LocalBuildNoDiagnostic $buildLog)) {
+    Write-LocalBuildNoDiagnostic $buildLog $buildMarker
+    exit 10
 }
 if ($buildRc -ne 0) { exit $buildRc }
 

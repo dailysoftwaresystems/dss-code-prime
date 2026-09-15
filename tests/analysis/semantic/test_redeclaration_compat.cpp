@@ -704,3 +704,197 @@ TEST(RedeclarationCompat, FunctionPointerQualifierAcceptsWhatBothReferencesAccep
                "accept:\n" << src << "  first error: " << firstMessage(model);
     }
 }
+
+// ══ 4. P55 — THE TWO DEPTH CAPS THAT TRUNCATED INTO WRONG ANSWERS ════════════
+//
+// [[D-SEMANTIC-DEPTH-CAPS-TRUNCATE-INTO-TWO-WRONG-ANSWERS]]. Both walks that
+// answer this file's question stopped at a hard-coded depth and said nothing
+// about it, and a cap that TRUNCATES SILENTLY changes the ANSWER where a cap that
+// FAILS LOUD would only cost a user a program they can see was rejected:
+//
+//   ① `declaratorConstSpine` truncated at `depth > 16` (nested parenthesized
+//      declarators) and at `nestDepth >= 4` (nested function-pointer parameters).
+//      Truncating means "no claim", so the oracle stopped judging the qualifier
+//      axis and the C23 6.7.6.1p2 diagnostic VANISHED — the ill-formed program
+//      compiled clean.
+//   ② `spellingBlindCompatible` truncated at `depth > 16` and returned NOT
+//      COMPATIBLE, which the callers turn into `S_IncompatibleRedeclaration` — a
+//      FABRICATED error on LEGAL code, with no workaround available at all.
+//
+// ✔THE BITE DEPTHS ARE MEASURED, not read off the constants: through the real
+// CLI at the pre-fix HEAD, ① lost the diagnostic from 17 nested parens and from 5
+// nesting levels of function-pointer parameters (16 and 4 were still reported),
+// and ② fabricated the error from 17 pointer levels against a shipped-descriptor
+// row (16 was accepted).
+//
+// ✔THE REFERENCE MATRIX, each probed SEPARATELY. For ①: gcc 13.3.0
+// (`-std=c2x -pedantic-errors`), clang 18.1.3 (`-std=c23 -pedantic-errors`) and
+// mingw-w64 gcc 13.2.0 report `conflicting types` at 17, 24 and 100 parens and at
+// 5 nesting levels; MSVC 19.51.36252 (`/std:clatest`) reports `warning C4028`.
+// Every reference diagnoses. For ②: all four ACCEPT a 63-level pointer parameter
+// declared twice identically, so the fabricated refusal was BELOW THE UNION.
+//
+// ⚠ ISO C23 5.2.4.1 obliges an implementation to support **63 nesting levels of
+// parenthesized declarators within a full declarator**, so ①'s 16 was under the
+// standard's own floor as well as under the union.
+
+// ── ② at the oracle, the tier where the fabrication happened ─────────────────
+//
+// A descriptor states a REPRESENTATION (`i64`) and a C declaration carries the C
+// SPELLING's identity (`long`), so the platform mode must walk to the leaves to
+// answer — which is exactly what the cap stopped it doing. The chain is walked at
+// 17 (one past the old cap) and at 512, which is deeper than any tree-based walk
+// would have survived on the ordinary ~1 MiB thread and is the point of the
+// conversion to a heap work stack.
+//
+// RED-ON-DISABLE: restore `if (depth > 16) return false;` in
+// `spellingBlindCompatible` and both `EXPECT_TRUE`s below become
+// `ParameterType` divergences.
+TEST(RedeclarationCompat, PlatformModeSpellingBlindnessSurvivesDepth) {
+    TypeInterner in = makeInterner();
+    TypeId const bare  = in.primitive(TypeKind::I64);
+    TypeId const named = in.primitive(TypeKind::I64, "long");
+    ASSERT_NE(bare.v, named.v) << "vocabulary identity is what this test is about";
+    TypeId const i32 = in.primitive(TypeKind::I32);
+
+    for (int const depth : {17, 512}) {
+        TypeId chainBare  = bare;
+        TypeId chainNamed = named;
+        TypeId chainWrong = i32;   // the NEGATIVE control, same depth
+        for (int i = 0; i < depth; ++i) {
+            chainBare  = in.pointer(chainBare);
+            chainNamed = in.pointer(chainNamed);
+            chainWrong = in.pointer(chainWrong);
+        }
+        TypeId const fnNamed = in.fnSig(std::vector<TypeId>{chainNamed}, i32,
+                                        CallConv::CcSysV);
+        TypeId const fnBare  = in.fnSig(std::vector<TypeId>{chainBare}, i32,
+                                        CallConv::CcSysV);
+        TypeId const fnWrong = in.fnSig(std::vector<TypeId>{chainWrong}, i32,
+                                        CallConv::CcSysV);
+        EXPECT_TRUE(compat(in, fnNamed, fnBare,
+                           LeafComparison::PlatformVocabulary)
+                        .compatible())
+            << "a " << depth << "-level pointer chain over one representation is "
+               "ONE type; refusing it fabricates an error on legal code";
+        // ★ THE CONTROL, AND IT IS THE HALF THAT MATTERS: removing the cap must
+        // not turn the walk into "compatible with everything". A WIDTH difference
+        // at the same depth is still a real divergence.
+        EXPECT_EQ(compat(in, fnNamed, fnWrong,
+                         LeafComparison::PlatformVocabulary).axis,
+                  RedeclarationDivergence::ParameterType)
+            << "an i64 chain and an i32 chain are different types at depth "
+            << depth;
+    }
+}
+
+// ── ① through the real `c` schema: the diagnostic must survive DEPTH ─────────
+//
+// Each pair differs ONLY in a pointee `const`, which C23 6.7.6.1p2 makes part of
+// the type. `d16`/`d17` and `n4`/`n5` straddle the two removed caps EXACTLY, so
+// this is a boundary pin and not a "deep enough, probably" one: before P55 the
+// 16 and 4 rows were reported and the 17 and 5 rows were not.
+//
+// RED-ON-DISABLE: restore `depth > 16` in the group-chain descent and the `d17`
+// and `d24` rows go silent; restore `nestDepth >= 4` in the nested-parameter arm
+// and the `n5` and `n6` rows go silent. Either way this test names which one.
+TEST(RedeclarationCompat, PointeeQualifierDiagnosticSurvivesDeclaratorDepth) {
+    struct Row { char const* label; std::string src; };
+    auto parens = [](int n, char const* qual) {
+        return std::string{"extern void h("} + qual + "char *"
+               + std::string(static_cast<std::size_t>(n), '(') + "*"
+               + std::string(static_cast<std::size_t>(n), ')') + ");\n";
+    };
+    auto tower = [](int n, char const* qual) {
+        std::string t = std::string{qual} + "char *";
+        for (int i = 0; i < n; ++i) t = "void (*)(" + t + ")";
+        return "extern void h(" + t + ");\n";
+    };
+    std::vector<Row> rows;
+    for (int const n : {16, 17, 24})
+        rows.push_back({"parens", parens(n, "const ") + parens(n, "")
+                                      + "int main(void){return 0;}\n"});
+    for (int const n : {4, 5, 6})
+        rows.push_back({"fn-nesting", tower(n, "const ") + tower(n, "")
+                                          + "int main(void){return 0;}\n"});
+    for (auto const& row : rows) {
+        auto model = analyzeC(row.src);
+        EXPECT_TRUE(hasCode(model.diagnostics(),
+                            DiagnosticCode::S_IncompatibleRedeclaration))
+            << "dropped the C23 6.7.6.1p2 diagnostic every reference emits ("
+            << row.label << "):\n" << row.src;
+    }
+}
+
+// ★★★ THE OVER-REFUSAL CONTROL, AND IT IS WHAT SEPARATES "THE CAPS ARE GONE"
+// FROM "THE WALK NOW MISPLACES A LEVEL". A qualifier spine that got the ordering
+// wrong at depth would REFUSE these — the one outcome this oracle may never
+// produce — and would still pass the test above. Same shapes, identically
+// qualified on both sides: one legal declaration written twice.
+// ✔ACCEPTED by gcc 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC
+// 19.51.36252, each probed separately.
+TEST(RedeclarationCompat, DeepDeclaratorsThatAgreeStayAccepted) {
+    auto parens = [](int n) {
+        return std::string{"extern void h(const char *"}
+               + std::string(static_cast<std::size_t>(n), '(') + "*"
+               + std::string(static_cast<std::size_t>(n), ')') + ");\n";
+    };
+    auto tower = [](int n) {
+        std::string t = "const char *";
+        for (int i = 0; i < n; ++i) t = "void (*)(" + t + ")";
+        return "extern void h(" + t + ");\n";
+    };
+    std::vector<std::string> srcs;
+    for (int const n : {16, 17, 24})
+        srcs.push_back(parens(n) + parens(n) + "int main(void){return 0;}\n");
+    for (int const n : {4, 5, 6})
+        srcs.push_back(tower(n) + tower(n) + "int main(void){return 0;}\n");
+    // ★ AND THE TOP-LEVEL MASK MUST STILL APPLY AT DEPTH: 6.7.6.3p15 drops the
+    // INNER function's own parameter top-level qualifier exactly as it drops the
+    // outer one's, so these two spell ONE type five levels down.
+    {
+        std::string a = "char *const";
+        std::string b = "char *";
+        for (int i = 0; i < 5; ++i) {
+            a = "void (*)(" + a + ")";
+            b = "void (*)(" + b + ")";
+        }
+        srcs.push_back("extern void h(" + a + ");\nextern void h(" + b
+                       + ");\nint main(void){return 0;}\n");
+    }
+    for (auto const& src : srcs) {
+        auto model = analyzeC(src);
+        EXPECT_FALSE(model.hasErrors())
+            << "refused a deep redeclaration all four references accept:\n"
+            << src << "  first error: " << firstMessage(model);
+    }
+}
+
+// ⚠ THE ONE CEILING THAT SURVIVES, PINNED AS A RESIDUE RATHER THAN LEFT
+// UNRECORDED. `QualifierSpine` states its levels in a 64-bit positional bitset,
+// so a derivation chain deeper than that cannot be SPELLED and the walk makes NO
+// CLAIM — a possibly missed diagnostic, never a refused legal program. That is a
+// REPRESENTATIONAL bound, not a walk cap, and it is deliberately NOT loud:
+// erroring would refuse a 63-star declaration ✔all four references accept.
+// ✔MEASURED: the diagnostic is raised at 62 pointer levels and dropped from 63
+// (`levels = N + 1`). This test asserts BOTH halves so the boundary cannot move
+// silently in either direction — closing the residue means widening the claim's
+// representation together with its other two producers (`hir/hir_text.cpp` and
+// the `ffi/` descriptor reader) and will red this test by design.
+TEST(RedeclarationCompat, TheSixtyThreeLevelBitsetBoundIsAMissedDiagnosticNotARefusal) {
+    auto pair = [](int n) {
+        std::string const stars(static_cast<std::size_t>(n), '*');
+        return "extern void h(const char " + stars + ");\nextern void h(char "
+               + stars + ");\nint main(void){return 0;}\n";
+    };
+    auto below = analyzeC(pair(62));
+    EXPECT_TRUE(hasCode(below.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration))
+        << "62 levels still fit the bitset and must still be judged";
+    auto above = analyzeC(pair(63));
+    EXPECT_FALSE(above.hasErrors())
+        << "past the bitset the claim is ABSENT, which is a missed diagnostic — "
+           "it must never become a refusal: " << firstMessage(above);
+    EXPECT_FALSE(hasCode(above.diagnostics(),
+                         DiagnosticCode::S_IncompatibleRedeclaration));
+}

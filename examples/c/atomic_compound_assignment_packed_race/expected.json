@@ -1,0 +1,17 @@
+{
+  "$comment": "D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE: the THREADED witness for an UNDER-ALIGNED `_Atomic` object — a packed member whose four bytes straddle a cache line, reached through a `struct Packed *` so its provable alignment stays 1. Its accesses go through the object format's generic atomics runtime, and a compound assignment on it used to be a runtime LOAD then a separate runtime STORE (MEASURED by disassembly at caf053eb) that lost updates like the aligned forms. It is now the shared AtomicCas retry loop whose COMMIT goes through the runtime's generic `__atomic_compare_exchange`, under the SAME arbiter as its load — the entry clang 18 and Apple clang 21 both call for this lvalue. ★ EXACT VALUES, NEVER TIMING: `+= 1` and `++` → 2N each, `*= 3` → 3^(2N) mod 2^32, plus the single-threaded yields of postfix (old), prefix (new) and compound (new) through the runtime-routed loop, and the neighbour `char` surviving. Each arm returns its own code on failure. exit = 42.",
+  "$legComment": "★ EACH LEG REACHES THE SAME ROLE THROUGH A DIFFERENT PROVIDER. elf64 → `libatomic.so.1` (MEASURED: exports `__atomic_compare_exchange@@LIBATOMIC_1.0` on both Linux legs); macho64 → `/usr/lib/libSystem.B.dylib` (MEASURED on arm64 macOS 26.6.2: Apple clang 21 links `___atomic_compare_exchange (from libSystem)` and runs); pe64 → DSS's own `runtime/platform/src/atomic.c`, whose compare-exchange entry and whose format-document key are the fold of the P66 lanes that own those files. ⚠ THE arm64 qemu LEG IS BLIND TO THE UNALIGNED-ATOMIC FAULT CLASS (P53), so its green is a lost-update witness here, never an alignment-safety one.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

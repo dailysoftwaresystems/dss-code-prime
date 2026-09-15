@@ -177,6 +177,34 @@ decodeSoleStub(std::vector<std::uint8_t> const& bytes) {
     return d;
 }
 
+// ── D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ──
+//
+// ★ THE ONE DOOR THIS FILE NEVER HAD, added because it now needs one.
+// `image.codeSignature.identifier` on the shipped arm64-darwin-exec document
+// is a FUNCTION of the artifact, and an emission that cannot name the file it
+// produces is REFUSED with no fallback. These are byte-level WRITER pins: they
+// drive `macho::encode` directly and so have no output path, which is exactly
+// the emission the walker refuses.
+//
+// ⚠ THE ALTERNATIVE WAS STATING THE NAME AT ELEVEN CALL SITES, and that is the
+// duplication that breeds the missed site — the sibling writer files
+// (`test_macho_writer.cpp`, `test_codesign_placeholder.cpp`) each already route
+// every direct call through ONE helper for the untrampolined-entry contract,
+// for the identical reason. This file had eleven bare calls instead, and all
+// eleven went red together; routing them through one door means a pin added
+// later inherits both contracts for free rather than rediscovering them.
+constexpr char const* kArm64ExitPinArtifactFileName = "dss_arm64_exit_pin_artifact";
+
+[[nodiscard]] std::vector<std::uint8_t>
+encodeWithArtifactName(AssembledModule const&    mod,
+                       TargetSchema const&       target,
+                       ObjectFormatSchema const& fmt,
+                       DiagnosticReporter&       reporter) {
+    return macho::encode(
+        mod, target, fmt, reporter,
+        dss::ImageRequest{.artifactFileName = kArm64ExitPinArtifactFileName});
+}
+
 } // namespace
 
 // ── The shipped arm64-darwin-exec format JSON loads cleanly ──────────
@@ -237,7 +265,7 @@ TEST(MachOArm64Exit, StubEmitsAdrpLdrBrThroughGot) {
 
     AssembledModule mod = makeArm64DynamicModule();
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *target, *fmt, rep);
+    auto bytes = encodeWithArtifactName(mod, *target, *fmt, rep);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
@@ -293,7 +321,7 @@ TEST(MachOArm64Exit, StubSizeIsTwelveAndStubsVaIsInstructionAligned) {
 
     AssembledModule mod = makeArm64DynamicModule();
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *target, *fmt, rep);
+    auto bytes = encodeWithArtifactName(mod, *target, *fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
 
     auto decoded = decodeSoleStub(bytes);
@@ -362,7 +390,7 @@ TEST(MachOArm64Exit, TrampolineEmitsDirectBlForExitImport) {
 
     // The whole module must then encode to a Mach-O without error — the
     // trampoline's BL→_exit-stub is a coherent direct-plt call site.
-    auto bytes = macho::encode(mod, *target, *fmt, rep);
+    auto bytes = encodeWithArtifactName(mod, *target, *fmt, rep);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     EXPECT_EQ(rep.errorCount(), 0u);
     EXPECT_FALSE(bytes.empty());
@@ -446,7 +474,7 @@ TEST(MachOArm64Exit, IndirectSlotDispatchOnMachOFailsLoud) {
     mod.imageEntryOverride = 0u;
 
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *target, *fmt, rep);
+    auto bytes = encodeWithArtifactName(mod, *target, *fmt, rep);
     EXPECT_GT(rep.errorCount(), 0u)
         << "indirect-slot on a symbolVa→stub Mach-O must fail loud";
     EXPECT_TRUE(bytes.empty());
@@ -462,7 +490,7 @@ TEST(MachOArm64Exit, AdHocCodeSignatureSuperBlobWellFormed) {
 
     AssembledModule mod = makeArm64DynamicModule();
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *target, *fmt, rep);
+    auto bytes = encodeWithArtifactName(mod, *target, *fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
 
@@ -522,7 +550,7 @@ TEST(MachOArm64Exit, Arm64SegmentsAre16KAligned) {
 
     AssembledModule mod = makeArm64DynamicModule();
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *target, *fmt, rep);
+    auto bytes = encodeWithArtifactName(mod, *target, *fmt, rep);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
@@ -567,7 +595,7 @@ TEST(MachOArm64Exit, Arm64ExecEmitsBuildVersionMacOs) {
 
     AssembledModule mod = makeArm64DynamicModule();
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *target, *fmt, rep);
+    auto bytes = encodeWithArtifactName(mod, *target, *fmt, rep);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
@@ -920,7 +948,7 @@ TEST(MachOArm64Exit, MachoArm64ConstSectionFollowsStubsWithComputedVa) {
 
     AssembledModule mod = makeArm64ModuleWithConst(CodeReloc::None);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *target, *fmt, rep);
+    auto bytes = encodeWithArtifactName(mod, *target, *fmt, rep);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());
@@ -972,7 +1000,7 @@ TEST(MachOArm64Exit, MachoArm64ConstDataSymbolEntersSymbolVaAndPatchesCode) {
     // symbolVa entry would either fail loud or encode a different page.
     AssembledModule mod = makeArm64ModuleWithConst(CodeReloc::AdrpPage);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *target, *fmt, rep);
+    auto bytes = encodeWithArtifactName(mod, *target, *fmt, rep);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u)
         << "an ADRP code reloc into the __const data symbol must resolve "
@@ -1040,7 +1068,7 @@ TEST(MachOArm64Exit, MachoArm64ConstAdrpAddLeaHighVaResolvesLowTwelve) {
 
     AssembledModule mod = makeArm64ModuleWithConst(CodeReloc::AdrpAdd);
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *target, *fmt, rep);
+    auto bytes = encodeWithArtifactName(mod, *target, *fmt, rep);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u)
         << "ADRP+ADD lea into a >4 GiB __const VA must RESOLVE: the ADD "
@@ -1085,7 +1113,7 @@ TEST(MachOArm64Exit, MachoArm64NoDataItemsByteIdenticalToBaseline) {
     // section — proving an empty dataItems leaves the output unchanged.
     AssembledModule mod = makeArm64DynamicModule();
     DiagnosticReporter rep;
-    auto bytes = macho::encode(mod, *target, *fmt, rep);
+    auto bytes = encodeWithArtifactName(mod, *target, *fmt, rep);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     ASSERT_EQ(rep.errorCount(), 0u);
     ASSERT_FALSE(bytes.empty());

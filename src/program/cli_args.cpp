@@ -161,6 +161,8 @@ std::string_view cliArgsErrorName(CliArgsError e) noexcept {
         case CliArgsError::InvalidMaxDiagnostics: return "InvalidMaxDiagnostics";
         case CliArgsError::InvalidMaxPerCode:     return "InvalidMaxPerCode";
         case CliArgsError::InvalidLto:           return "InvalidLto";
+        case CliArgsError::AmbiguousEmitHirTarget:
+            return "AmbiguousEmitHirTarget";
     }
     return "Unknown";
 }
@@ -183,6 +185,9 @@ std::string cliHelpText() {
         "  dsscp --project <file.dss-project.json>\n"
         "  dsscp --dump-predefined-macros --language <name> "
             "--target <spec>\n"
+        "  dsscp --emit-hir <path> [--language <name>] "
+            "--target <spec> <file>...\n"
+        "  dsscp --dump-hir-kinds\n"
         "  dsscp --lsp [--schema-dir=<path>]\n"
         "  dsscp --help\n"
         "\n"
@@ -210,6 +215,25 @@ std::string cliHelpText() {
             "offset-derived kind (line/file) and a function-like macro have "
             "no single value and say so rather than print a fabricated one. "
             "There is no `-dM` alias.\n"
+        // The consumer-facing HIR surface. Discoverability matters here for the
+        // same reason it does above: an out-of-repo reader cannot be expected to
+        // find a capability by reading `hir_text.hpp`.
+        "  --emit-hir <path>      run the front end for ONE translation unit "
+            "and write its HIR as `.dsshir` text to <path> (`-` = stdout), "
+            "then STOP — no MIR, no codegen, no link, no object file. Source "
+            "files follow as positional arguments. Requires exactly one "
+            "--target (HIR is target-dependent); --language is optional, as "
+            "for --compile. Exit 0 means DSS accepted the source and the "
+            "artifact is written; non-zero means DSS rejected it and said why "
+            "on stderr. A translation unit that would not LINK is a normal "
+            "input. See docs/hir-text-format.md.\n"
+        "  --dump-hir-kinds       print this build's HIR node-kind inventory "
+            "(every core `HirKind` name it can emit, with its arity class, "
+            "plus the producer revision) and exit without compiling. Needs "
+            "neither --language nor --target: the core node set is a property "
+            "of the compiler, not of a program. For a consumer whose HIR "
+            "reader must refuse an uncovered construct BY NAME at build time "
+            "rather than skip it at run time.\n"
         "\n"
         "Common compile / transpile options:\n"
         "  --language <name>      source-language schema name "
@@ -359,7 +383,9 @@ std::string cliHelpText() {
         "  dsscp --compile boot.s "
             "--target x86_64:elf64-x86_64-linux "
             "--target arm64:elf64-aarch64-linux   (no --language: each "
-            "target picks its own assembly dialect)\n";
+            "target picks its own assembly dialect)\n"
+        "  dsscp --emit-hir out.dsshir --language c "
+            "--target x86_64:elf64-x86_64-linux foo.c\n";
     return text;
 }
 
@@ -375,7 +401,7 @@ parseCliArgs(int argc, char* argv[]) {
     // a DuplicateModeFlag too (e.g. `--compile a.c --compile b.c`
     // — the user should write `--compile a.c b.c`).
     enum class Mode : std::uint8_t { None, Compile, Transpile, Directory, Project, Lsp,
-                                     DumpPredefinedMacros };
+                                     DumpPredefinedMacros, EmitHir, DumpHirKinds };
     Mode mode = Mode::None;
     auto const setMode = [&](Mode m, std::string_view flag)
             -> std::expected<void, CliArgsErrorInfo> {
@@ -389,7 +415,8 @@ parseCliArgs(int argc, char* argv[]) {
                     : " conflicts with an earlier mode flag — "
                       "exactly one of --compile / --transpile / "
                       "--directory / --project / --lsp / "
-                      "--dump-predefined-macros may be "
+                      "--dump-predefined-macros / --emit-hir / "
+                      "--dump-hir-kinds may be "
                       "specified")));
         }
         mode = m;
@@ -508,6 +535,40 @@ parseCliArgs(int argc, char* argv[]) {
             }
             out.dumpPredefinedMacros = true;
             continue;
+        }
+
+        // ── HIR node-kind inventory (a MODE: prints, compiles nothing) ──
+        if (a == "--dump-hir-kinds") {
+            if (auto e = setMode(Mode::DumpHirKinds, "--dump-hir-kinds"); !e) {
+                return std::unexpected(e.error());
+            }
+            out.dumpHirKinds = true;
+            continue;
+        }
+
+        // ── HIR emission (a MODE: stops after HIR, links nothing) ──
+        //
+        // The VALUE is the destination, and the TU's sources are the trailing
+        // positionals — so `--emit-hir out.dsshir --target … foo.c` reads left
+        // to right the way the operator wrote it. `consumePositionals` is NOT
+        // used (it would swallow the source list into the destination), which is
+        // why the bare-positional arm below has to know about this mode.
+        {
+            auto m = valueFlag(a, i, "--emit-hir");
+            if (!m) return std::unexpected(m.error());
+            if (m->has_value()) {
+                if (auto e = setMode(Mode::EmitHir, "--emit-hir"); !e) {
+                    return std::unexpected(e.error());
+                }
+                if ((*m)->empty()) {
+                    return std::unexpected(make_error(
+                        CliArgsError::EmptyFilename,
+                        "--emit-hir requires a destination path (or '-' for "
+                        "stdout)"));
+                }
+                out.emitHirPath = std::move(**m);
+                continue;
+            }
         }
 
         // ── LSP ─────────────────────────────────────────────────
@@ -983,6 +1044,20 @@ parseCliArgs(int argc, char* argv[]) {
                   "e.g. --target=x86_64:elf64-x86_64-linux)"));
         }
 
+        // `--emit-hir <path>` takes its DESTINATION as a value, so the TU's
+        // sources arrive here as bare positionals — anywhere after the flag,
+        // including after `--target`. Accepted only in that mode; every other
+        // mode keeps the refusal below.
+        if (mode == Mode::EmitHir) {
+            if (a.empty()) {
+                return std::unexpected(make_error(
+                    CliArgsError::EmptyFilename,
+                    "--emit-hir: empty source file name"));
+            }
+            out.emitHirFiles.emplace_back(a);
+            continue;
+        }
+
         // Bare positional (post-flag) — distinct from UnknownFlag:
         // remediation is "move this token to follow --compile/
         // --transpile/--directory", NOT "spell the flag right"
@@ -1028,8 +1103,10 @@ parseCliArgs(int argc, char* argv[]) {
             CliArgsError::NoModeSelected,
             "--stack-reserve requests a field in an emitted IMAGE, so it is "
             "only meaningful for a mode that produces one (--compile / "
-            "--directory / --project). Transpile emits source and --lsp "
-            "emits nothing, so the request would be silently discarded."));
+            "--directory / --project). Transpile emits source, --emit-hir "
+            "stops at HIR and emits no image at all, and --lsp / "
+            "--dump-predefined-macros / --dump-hir-kinds emit nothing, so the "
+            "request would be silently discarded."));
     }
     // AP6: `--force-git-cache` acts on a `.dss-project.json`'s `dependsOn`
     // list, which ONLY `--project` reads. Every other mode has no manifest at
@@ -1096,7 +1173,14 @@ parseCliArgs(int argc, char* argv[]) {
     // warning is the very thing that does not exist. Refusing at parse time is
     // the only fail-loud option available, which is why the sibling flags
     // already do it.
-    if (mode == Mode::Lsp || mode == Mode::DumpPredefinedMacros) {
+    //   * `--dump-hir-kinds` joins them on the SAME argument, not as a third
+    //     special case: it prints an inventory of this binary's node kinds and
+    //     builds no reporter either. ⚠ `--emit-hir` is deliberately NOT here —
+    //     it runs the whole front end, `Program::run` builds the run-wide
+    //     reporter before the dispatch fork, and every one of these flags
+    //     genuinely applies to the diagnostics a rejected source produces.
+    if (mode == Mode::Lsp || mode == Mode::DumpPredefinedMacros
+     || mode == Mode::DumpHirKinds) {
         std::string offenders;
         auto const note = [&offenders](std::string_view flag) {
             if (!offenders.empty()) offenders += ", ";
@@ -1112,10 +1196,10 @@ parseCliArgs(int argc, char* argv[]) {
                 offenders
                 + " configures the DiagnosticReporter a COMPILE builds, so it "
                   "is only meaningful for a mode that compiles (--compile / "
-                  "--transpile / --directory / --project). --lsp serves its "
-                  "own per-request diagnostics and --dump-predefined-macros "
-                  "uses no reporter at all, so the request would be silently "
-                  "discarded."));
+                  "--transpile / --directory / --project / --emit-hir). --lsp "
+                  "serves its own per-request diagnostics, and "
+                  "--dump-predefined-macros / --dump-hir-kinds use no reporter "
+                  "at all, so the request would be silently discarded."));
         }
     }
     if (out.helpMode || out.lspMode) {
@@ -1157,7 +1241,8 @@ parseCliArgs(int argc, char* argv[]) {
                 "mode-specific options were supplied but no mode flag "
                 "was selected — pick exactly one of --compile / "
                 "--transpile / --directory / --project / --lsp / "
-                "--dump-predefined-macros, or pass --help for usage"));
+                "--dump-predefined-macros / --emit-hir / --dump-hir-kinds, "
+                "or pass --help for usage"));
         }
         // No-arg invocation is allowed — falls back to the "ready"
         // message at the dispatch level.
@@ -1201,8 +1286,38 @@ parseCliArgs(int argc, char* argv[]) {
     // about which language's predefined macros to print. Defaulting either to
     // the assembly dialect would produce a confidently wrong answer where
     // there is currently a precise error.
+    // `--dump-hir-kinds` asks about THIS BINARY's node set, which does not vary
+    // with source language, CPU or object format — so it is answered before the
+    // language/target requirements below, not exempted from them one at a time.
+    // Requiring a triple would be demanding an answer to a question nobody asked
+    // and would make the inventory unobtainable without inventing a target.
+    if (mode == Mode::DumpHirKinds) {
+        return out;
+    }
+    // `--emit-hir` requires files and EXACTLY ONE target; `--language` is
+    // optional on the same footing as `--compile` (see `languageOptional`).
+    if (mode == Mode::EmitHir) {
+        if (out.emitHirFiles.empty()) {
+            return std::unexpected(make_error(
+                CliArgsError::EmptyFileList,
+                "--emit-hir <path> requires at least one source file "
+                "(e.g. dsscp --emit-hir out.dsshir --language c "
+                "--target x86_64:elf64-x86_64-linux foo.c)"));
+        }
+        if (out.targets.size() > 1) {
+            return std::unexpected(make_error(
+                CliArgsError::AmbiguousEmitHirTarget,
+                "--emit-hir takes exactly ONE --target: HIR is "
+                "TARGET-DEPENDENT (the data model decides integer widths and "
+                "therefore which conversions are explicit casts, plus the "
+                "long-double format, aggregate layout and the bit-field ABI), "
+                "and one --emit-hir <path> names one file. Run it once per "
+                "target, to a different path each time."));
+        }
+    }
     bool const languageOptional =
-        mode == Mode::Compile || mode == Mode::Directory;
+        mode == Mode::Compile || mode == Mode::Directory
+     || mode == Mode::EmitHir;
     if (out.languageName.empty() && !languageOptional) {
         return std::unexpected(make_error(
             CliArgsError::MissingLanguage,
@@ -1215,8 +1330,8 @@ parseCliArgs(int argc, char* argv[]) {
         return std::unexpected(make_error(
             CliArgsError::EmptyTargetList,
             "at least one --target <spec> is required for compile / "
-            "transpile / directory / dump-predefined-macros mode (e.g. "
-            "--target x86_64:elf64-x86_64-linux)"));
+            "transpile / directory / dump-predefined-macros / emit-hir mode "
+            "(e.g. --target x86_64:elf64-x86_64-linux)"));
     }
     if (mode == Mode::Compile && out.sourceFiles.empty()) {
         return std::unexpected(make_error(

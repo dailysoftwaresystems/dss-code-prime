@@ -141,6 +141,40 @@ public:
         return fromUint64(mag, sign, k);
     }
 
+    // ★ D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION: build a NORMAL value
+    // from an EXACT binary value that does not fit this kind's significand,
+    // rounding ONCE through the SAME round-to-nearest-even chokepoint add / sub
+    // / mul / div use. The literal DECODER is the first caller: a decimal (or
+    // hex-float) literal is an exact rational, and turning it into an F80/F128
+    // value is precisely "round this exact number at the target's precision".
+    //
+    // ⚠ WHY THIS IS THE PUBLIC SURFACE AND NOT A DECODER-LOCAL COPY OF THE
+    // ROUNDING. `roundNormal` is the file's stated single rounding surface
+    // ("written ONCE"); a second guard/round/sticky + tie-to-even + carry-out
+    // renormalization implementation living in `number_decode.hpp` would be the
+    // highest-risk surface duplicated, and the two would then have to agree on
+    // every tie forever. `fromDouble`/`fromUint64` need no rounding because they
+    // are EXACT by construction; this one is the inexact door.
+    //
+    // `reg` is the 256-bit working register (reg[3] most significant) holding
+    // the exact significand NORMALIZED so its integer bit is bit 255; the value
+    // is (-1)^sign · (reg / 2^255) · 2^exp2. `residualBelowRegister` folds in any
+    // nonzero remainder that fell off the bottom of the register (a division's
+    // leftover, a truncated tail) — it feeds the sticky, so a tie that is not a
+    // true tie rounds up rather than to even. A register that is NOT normalized
+    // is a caller bug and returns nullopt (fail loud) rather than rounding a
+    // value it was not given. Overflow → inf; subnormal result → nullopt, the
+    // same verdicts add/sub/mul/div carry.
+    [[nodiscard]] static std::optional<WideFloatValue>
+    fromExactBinary(TypeKind k, bool sign, std::int32_t exp2,
+                    std::uint64_t const (&reg)[4],
+                    bool residualBelowRegister) noexcept {
+        if (!isSupportedKind(k)) return std::nullopt;
+        std::uint64_t W[4] = {reg[0], reg[1], reg[2], reg[3]};
+        if (!getBit(W, 255)) return std::nullopt;   // un-normalized register
+        return roundNormal(k, sign, exp2, W, residualBelowRegister);
+    }
+
     [[nodiscard]] bool isZero()     const noexcept { return class_ == Class::Zero; }
     [[nodiscard]] bool isNaN()      const noexcept { return class_ == Class::NaN; }
     [[nodiscard]] bool isInfinity() const noexcept { return class_ == Class::Infinity; }

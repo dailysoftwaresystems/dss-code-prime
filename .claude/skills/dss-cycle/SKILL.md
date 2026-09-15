@@ -63,6 +63,62 @@ a valid program MEANS ⇒ **that is an architectural fork: PAUSE and ask.**
 ⇒ **Record the refusal cost in the row**, or a later cycle applying the disjunction by reflex will
 "fix" it back. This ruling is exactly that shape.
 
+### ★★★★ THE UNION IS OVER WHAT **WORKS**, NOT ONLY OVER WHAT IS ACCEPTED — operator ruling 2026-09-02
+
+> *"our own readme says: `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C`. We are meant to be the best of our
+> references. Everything that works in one of the vertices, must work here. That's it, so the
+> tiebreaker is not clang, is whether one of the references make it work or not."*
+> … *"Last resort is check against iso C, since our goal is to work if any references work."*
+> … **"We always aim to work, to have quality."**
+
+**THERE IS NO PRIVILEGED REFERENCE. THERE IS NO TIEBREAKER VERTEX.** ⚠ This section previously said
+"clang breaks the tie" and that was WRONG — a general rule mistaken for a special case, corrected by
+the operator the same day it was written. Clang was named in the ruling as *an example of who to ask
+for another opinion*, not as an arbiter. **The union already decides it.**
+
+**The rule, and it is the one the README has always stated:** the union is taken over references
+that **WORK**, not merely over references that ACCEPT. Acceptance is the weaker reading — a
+reference can accept a program and then emit code that faults, tears, or silently drops the meaning.
+⇒ **If ANY vertex compiles a correct construct AND the result WORKS, DSS must work too**, whichever
+vertex that turns out to be. A vertex that accepts-but-does-not-work casts no vote for its own
+output; it is simply not a working reference for that construct.
+
+| the split is about | what governs |
+|---|---|
+| **ACCEPT vs REFUSE** | the union — any reference that accepts a correct construct makes it REQUIRED |
+| **QUALITY — one reference WORKS and another silently does not** | **the union again, read over WORKING**: match the one that works, whichever it is |
+| **What a valid program MEANS**, both readings defensible and both working | an architectural fork — **PAUSE and ask** |
+
+⚠ **A quality split is NOT a meaning fork, and must not be escalated as one.** A meaning fork is two
+defensible readings of the same program (`#pragma once` content-keyed vs identity-keyed) where both
+implementations deliver their own reading correctly. A QUALITY split has a right answer: the
+references agree on what the program means and one of them fails to deliver it. **Measure which one
+works and match it.**
+
+✔**THE CASE THAT PRODUCED THIS, and it corrected a call I had already escalated.** A packed
+`_Atomic int` at offset 1 on x86_64: clang emits the generic `__atomic_load`/`__atomic_store`
+libcall, **gcc INLINES**, MSVC abstains (refusing `_Atomic` even aligned). I read that as 1–1 with
+no tiebreaker and asked the operator. It never was a tie: gcc's `LOCK`-prefixed store IS atomic,
+but its paired plain `movl` LOAD is not when the 4-byte access spans a cache line, so **gcc's route
+silently loses atomicity** — strictly worse than the arm64 case, where the same shape SIGBUSes
+loudly. gcc is therefore not a working reference here, clang is, and the union settles it with no
+adjudication needed.
+
+★★ **AND THE MEASUREMENT NEEDS A CONTROL, OR IT IS NOT ONE.** ✔MEASURED `clang 18.1.3 -O1 -S`:
+`x86_64-pc-windows-msvc`, `x86_64-w64-windows-gnu` and `x86_64-pc-linux-gnu` **all three** emit the
+libcall for the under-aligned member — and **the naturally-aligned control emits NO libcall and an
+inline `xchgl` on all three.** Without that control, "clang emits a libcall" is equally consistent
+with *"this target lowers all atomics through libcalls"*, which would say nothing about alignment.
+⇒ **Probe the DEFECTIVE case and the HEALTHY case, on every target you intend to rule for.**
+
+⚠ **A reference's output is not evidence of the property you care about until you NAME the
+property.** *"DSS runs rc 42 on x86_64"* proved **no fault**; it did not prove **atomicity**. Two
+different questions, and only one of them was the row's subject. ⇒ State which property you are
+measuring before you read the result.
+
+⇒ **Record in the row WHICH reference was the working one and on what measurement**, so a later
+cycle applying the union by reflex over ACCEPTANCE cannot quietly revert it to the majority answer.
+
 ## ★★★ PRODUCTION ANCHORS ARE THE PRIORITY, ALWAYS — operator ruling 2026-08-25
 
 > *"the priority is always production anchors. ALWAYS. harness we fix as we need when we face the
@@ -144,6 +200,26 @@ scripts/anchors/read-anchors.sh  --lint                       # every row a read
 every grep, and it MINTS a false id), an unescaped `|` (silently adds a column) and a wrong cell
 count are all inexpressible. `set-anchor` is the ordinary way to close a row: it patches only the
 fields you name, preserves the rest byte-for-byte, and performs the move.
+
+⚠⚠ **AND NEVER HAND-*READ* ONE EITHER — `read-anchor <ID> --json` IS THE ONLY WAY TO GET A CELL'S
+VALUE.** A lane that preserves a row's existing evidence must first read it, and reading it with
+`grep`/`sed`/`awk` off the raw table line returns the STORED form, not the value: storage escapes
+every `|` as `\|`, and handing that back escapes it again. ✔MEASURED 2026-09-02 (P54): **35 pipes
+across 14 rows** had already been stored doubled and rendered a stray backslash where their author
+wrote a bar — a C `||`, a shell `||`, `awk -F"|"`, a regex alternation. Two callers produce it and
+neither was detectable downstream: an author PRE-ESCAPING by hand, and the raw-line read, which
+**compounds — one more backslash on every re-close**.
+- `make_cell` now REFUSES a pre-escaped pipe (self-test arms 6b–6d), so a raw-line read no longer
+  corrupts quietly, it FAILS on you. To display a backslash before a bar deliberately, spell the
+  bar `[|]`.
+- ★ **THE CONTROL IS THE LESSON.** The writer's pre-existing round-trip pin stayed GREEN through
+  all of it, because it reads its cell through the un-escaping path — it could not see the class it
+  was there to protect. 35 pipes rotted under a passing self-test. **When a pin and the defect it
+  guards share a helper, the pin is testing the helper, not the property.**
+- ⓘ It surfaced only because a lane's preserved cell was compared against the registry's CURRENT
+  text instead of trusting the lane's own *"preserved byte-for-byte"* claim. **A lane's report is a
+  claim about the text it READ** — and if the orchestrator edited the row after briefing the lane,
+  a faithful lane silently reverts that edit. Verify the prefix, every time.
 
 **How the ruling binds this loop, clause by clause:**
 
@@ -440,9 +516,82 @@ the only durable answer.
 running to force a boundary. The boundary is where the set *finishes*; the rule sets the CADENCE of
 committing, it does not add a new reason to pause. Work already in flight continues to completion.
 
-⚠ **AND IT DOES NOT WEAKEN THE GATE.** "Green" here means the same four-leg gate every commit
-already owes — this ruling changes HOW OFTEN that gate runs and a commit lands, never what the gate
-consists of. A set that cannot go green does not get committed because a boundary arrived.
+⚠ **AND IT DOES NOT WEAKEN THE GATE.** "Green" here means the gate every commit already owes —
+this ruling changes HOW OFTEN that gate runs and a commit lands, never what the gate consists of.
+A set that cannot go green does not get committed because a boundary arrived.
+⇒ ★ **AND WHAT IT CONSISTS OF IS NOW EIGHT RUNS, NOT FOUR** — see the next section.
+
+## ★★★★ THE END-OF-ROUND GATE IS `{Debug, Release} × FOUR LEGS` — **EIGHT RUNS** — operator ruling 2026-09-14
+
+> *"dss-cycle skill does not work aligned with CI because it's expensive. We enable 'Run Pipes' when
+> about to merge the PR to ensure it's green. We should run the debug and release units in all legs
+> at least once in the end of every dss cycle round of 4 lanes."*
+
+**At the end of every round of four lanes, the gate is EIGHT runs, not four:**
+
+|  | Windows | WSL x86_64 | macOS arm64 | arm64 VPS |
+|---|---|---|---|---|
+| **Debug** | ✔ | ✔ | ✔ | ✔ |
+| **Release** | ✔ | ✔ | ✔ | ✔ |
+
+★ **"At least once in the end of every round" is the cadence.** A lane iterating on its own tree uses
+whichever build type it is working in; what this ruling fixes is what a ROUND owes before its commit
+is called green. ⚠ **Report eight numbers with their build type beside each** — a four-number gate
+line is now an incomplete gate that reads as complete.
+ⓘ `scripts/remote-leg/remote-leg.sh --build-type Release` takes the remote half; the tree name
+follows the type and an unknown type refuses.
+
+### ⚠⚠ CI IS EXPENSIVE TO **RUN** AND FREE TO **READ** — AND THE TWO RULES ARE OPPOSITE
+
+- ⛔ **NEVER make CI run.** The Pipeline workflow is `pull_request`-triggered and gated on a
+  **`Run Pipes` label the operator enables only when a PR is about to merge**; there is no
+  `workflow_dispatch`. Never add, remove or toggle that label, never push to re-trigger a run, and
+  never touch the PR to obtain a green. **A cycle therefore cannot DEPEND on CI having run** — most
+  commits have no verdict at all, which is exactly why the eight-run local gate above is what a
+  round owes.
+- ✅ **ALWAYS read whatever verdict already exists.** Reading costs nothing, and step 0 now does it
+  with `scripts/check-ci-legs/`. A red leg is a HARD STOP on *proceeding*, never on *fixing*.
+
+★ **This corrects a framing I first wrote into a row, and the correction is the point.** I filed
+*"no step of `/dss-cycle` reads CI at all"* as though the READING were the defect, and then
+over-corrected to *"a cycle must not consult CI"*. **Both were wrong.** Consulting is free and was
+always right; what is expensive is *running*, and what was actually broken is that **the local gate
+covered ONE build type while reporting as though it covered the configuration space.**
+
+### ✔THE MEASUREMENT THAT PRODUCED THE RULING — AND THE THREE CORRECTIONS IT TOOK
+
+2026-09-14, PR #57: two legs red at HEAD, the failing step `Test` in both —
+`run-tests (windows-msvc-release, …, Release, …)` and `run-tests (macos-clang-release, …, Release, …)` —
+while the local four-leg Debug gate was **2179 / 2178 / 2148 / 2148 GREEN on that exact commit.**
+
+⚠ **Three things I asserted about it were WRONG, and each is a reusable trap:**
+1. ✗ *"Every run failed for ten days and ~20 commits."* Every run DID fail, but the runs before
+   `de1e83ef` failed at **`label-check`** with `run-tests` **SKIPPED**. **The matrix has executed
+   SIX times on this branch, not twenty**, and `windows-msvc-release` was last GREEN at `3d226255`
+   (2026-09-02). ⇒ **`gh run list` conclusions are not evidence about the tree** — a run can be red
+   without the tests having run at all.
+2. ✗ *"The logs expired, so only a local reproduction can attribute it."* Half true. Logs expire
+   (HTTP 410; artefacts report `expired: true` after **three** days, not the `retention-days: 7` the
+   workflow asks for — a repository setting silently overrides it). **But job METADATA does not**,
+   and a Test step's DURATION separates a real failure from a `--stop-time` budget overrun by
+   itself: an overrun cannot take less than `ctest_budget_min`. ✔The worst red Test step here was
+   **829 s against a 3000 s budget (27.6%)**. **No budget was ever near its cap; none was touched.**
+3. ✗ *"These are Release-only failures, so a local Release leg would catch them."* **Neither was
+   Release-dependent at all**, and a Release leg would have caught NEITHER:
+   - Windows was `ninja-deps-freshness`. `check-ninja-deps.py` scopes its premise to `deps = gcc`
+     (*"gcc lists the source itself"*) and then applies it unscoped; **`deps = msvc` parses
+     `/showIncludes`, which reports headers ONLY**, so `#deps 0` is CORRECT for a TU with no
+     `#include`. The local Windows gate is **MinGW GCC**, so the fact is invisible to it in *every*
+     build type.
+   - macOS was `run_gate_guard`, proved **build-type independent** by running it from the repo root
+     with no build tree at all. It is invisible locally because the three INDIRECT legs run
+     `-LE repo-guard`, so **31 guard tests run on exactly one local host and on all five CI legs.**
+
+★★★ **THE SHAPE IS THIS CYCLE'S OWN THROUGH-LINE, TWICE MORE: THE RULE A DEFECT CITED WAS TRUE — OF
+THE THING NEXT DOOR.** *"`#deps 0` is never legitimate"* is true of **gcc** and false of **MSVC**.
+*"`comm` names the image"* is true on **Linux** and false on **macOS**, where `ps -eo comm=` yields a
+truncated ABSOLUTE PATH (✔650/662 rows contain `/`; Linux control 0/39). ⇒ Before trusting a rule a
+guard cites, ask **which toolchain, and which platform, it was measured on.**
 
 ## ★★★ A LANE WORKTREE LIVES INSIDE THE REPO, AT `.worktrees/<short-name>` — operator ruling 2026-08-26
 
@@ -592,6 +741,31 @@ hand-typing every edit or reading every subsystem.
    recommended three times in this project's history. Establish a green
    baseline (`cmake --build build`, then full `ctest`). **A red baseline with no WIP-repair context
    is itself a pause gate** — present it; do not silently "fix it".
+
+   ★★★ **AND READ CI. NO STEP OF THIS SKILL USED TO, AND TWO LEGS STAYED RED FOR SIX MATRIX RUNS.**
+   [[D-CI-TWO-RELEASE-LEGS-HAVE-BEEN-RED-FOR-TEN-DAYS-WHILE-EVERY-LOCAL-LEG-WAS-GREEN]].
+   ✔MEASURED 2026-09-14: the PR's Pipeline had been red on **every** run that executed the matrix,
+   with two legs failing at `Test` while the four-leg local gate was 2179/2178/2148/2148 GREEN at
+   the very same commit — because **no configuration either red leg runs in is one the local gate
+   builds.** The operator had to point at it.
+
+       bash scripts/check-ci-legs/check-ci-legs.sh --branch <this branch>
+       pwsh -NoProfile -File scripts/check-ci-legs/check-ci-legs.ps1 -Branch <this branch>
+
+   - **A red leg is a HARD STOP the cycle reads before picking work**, and it is a FIX, so no other
+     hard stop applies to repairing it (see *Hard stops* below). It goes in front of §0.1.
+   - ⛔ **Never label, re-run, or push to re-trigger CI.** That is the operator's call. Read the
+     verdict; reproduce the leg LOCALLY.
+   - ⚠ **THE EVIDENCE HAS A THREE-DAY SHELF LIFE.** `gh run view --log-failed` answers **HTTP 410**
+     on an expired run and the uploaded `test-logs-*` artefacts report `expired: true` after
+     **three** days, not the `retention-days: 7` the workflow asks for — a repository setting
+     silently overrides it. The instrument above reads job METADATA, which does not expire with the
+     logs; a cycle that waits for the next red will be diagnosing it without logs.
+   - ⚠ **`gh run list` alone is not evidence about the tree.** A run that failed at `label-check`
+     has `run-tests` **skipped** and says nothing; the instrument reports that case by name.
+   - ⚠ **A failed `Test` step is TWO hypotheses with opposite remedies** — a real failure, or a
+     ctest `--stop-time` budget overrun. The instrument separates them by DURATION. **A real
+     failure is FIXED. A budget is never raised to hide a suite that got slower.**
 1. **Pick the next priority** from §0.1, top-to-bottom. An explicit argument overrides the auto-pick
    but is still subject to the bar, the pause gate, and the hard-stop checks. If §0.1 is dry, promote
    an *eligible* anchor (unconditional, or trigger already fired) into §0.1, then pick it.
@@ -1099,6 +1273,15 @@ opening the inter-procedural *arc*, not about every line in `src/opt/`.
 - **Correctness-critical anchors** (silent-miscompile class) — the closing cycle MUST ship a negative
   miscompile-pin that breaks iff the transform mis-fires. If the pin cannot be constructed, STOP and
   bring a decision brief. Never ship on review alone.
+- ★★★ **A RED CI LEG — read at step 0 with `scripts/check-ci-legs/`.** It stops the cycle from
+  picking new work until it is diagnosed, and since repairing it is a FIX, **no other hard stop
+  applies to the repair itself**. ⛔ The stop is on *proceeding past it*, never on fixing it, and
+  **never** on touching the operator's PR: do not label, re-run or push to re-trigger CI.
+  ⚠ **The local gate cannot substitute for it, and assuming otherwise is the defect.** ✔MEASURED
+  2026-09-14: the two legs that were red run in configurations **no local leg builds** — the local
+  Windows gate is **MinGW GCC**, so every `deps = msvc` fact is invisible to it, and the three
+  INDIRECT legs (WSL, macOS, arm64 VPS) skip `-L repo-guard` entirely, so 31 guard tests run on
+  exactly one local host and on all five CI legs.
 
 ## Stop-command handling
 

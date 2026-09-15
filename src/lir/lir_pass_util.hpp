@@ -8,7 +8,10 @@
 #include "lir/lir_node.hpp"
 #include "lir/lir_reg.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -238,5 +241,119 @@ incomingArgRegister(TargetSchema const&            schema,
                     TargetCallingConvention const& cc,
                     LirRegClass                    resultClass,
                     std::uint32_t                  payload);
+
+// ── THE IDENTITY-CLASS-MOVE QUESTION, WITH ONE OWNER ────────────────────
+// D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT.
+//
+// "Is this instruction the declared register-to-register MOVE for its
+// result's register class, copying a physical register into ITSELF?" is
+// asked by TWO consumers that must never disagree:
+//
+//   (a) `lir_peephole`'s RULE R1, which DELETES the instruction; and
+//   (b) `censusIdentityClassMoves` below, which COUNTS the population and
+//       R1's refusals so a stage-to-stage claim about it can be re-measured
+//       instead of re-quoted.
+//
+// ★★★ THE CENSUS EXISTS BECAUSE THE CLAIM IT CHECKS WAS ONCE UNFALSIFIABLE.
+// `lir_peephole.hpp` asserted "`materializeCallingConvention` mints exactly
+// ZERO identity copies" on the evidence "5575 at post-rewrite and 5575 at
+// post-callconv". Those are the only two LIR dump stages that existed, and
+// THREE passes sit between them (`legalizeTwoAddress`, `runLirPeephole`,
+// `materializeCallingConvention`) — one of which deletes members of exactly
+// this population. An equal count across that span is a NET, and a net of
+// zero is not a per-pass zero. A second lane later measured a non-zero
+// residue at post-callconv and could not tell which pass minted it, which is
+// the whole cost of a claim whose instrument answers an adjacent question.
+//
+// ⚠ AND A MNEMONIC SWEEP OF THE TEXT DUMP CANNOT ANSWER IT EITHER. The dump
+// prints `opcodeInfo(..)->mnemonic`, which carries no width and no register
+// class, while R1's verdict turns on BOTH (a class move NARROWER than the
+// register it names is a truncation with a zero-extending side effect, not a
+// no-op). Counting the string "mov" therefore over-counts the population it
+// is trying to attribute. This classifier is the schema-driven answer, and
+// the pass that acts on it and the census that reports it are the same code.
+enum class IdentityClassMoveVerdict : std::uint8_t {
+    // Not a member of the population: not the class MOVE opcode, or not
+    // physical-register-into-itself, or a terminator (never a copy, and
+    // deleting one leaves the block unterminated).
+    NotIdentityClassMove = 0,
+    // In the population, and R1 deletes it.
+    Deletable,
+    // In the population; R1 refuses because the opcode declares a side
+    // effect or an implicit register read/clobber — an observable this rule
+    // cannot reason about from the operands.
+    RefusedSideEffects,
+    // In the population; R1 refuses because the target declares no width for
+    // the named register (a schema the pass will not guess about).
+    RefusedUndeclaredRegisterWidth,
+    // In the population; R1 refuses because the copy is NARROWER than the
+    // register it names, so it writes bits it did not read.
+    RefusedNarrowerThanRegister,
+    // In the population; R1 refuses because the instruction is the only
+    // namer of a per-instruction register-constraint pool entry, and
+    // deleting it would orphan the entry (`L_SideStructureReferenceLost`).
+    RefusedNamesConstraintPoolEntry,
+};
+
+// Per-pass cache of "which opcode is this register class's declared
+// register-to-register MOVE". Lazily resolved, and ABSENCE IS A VALUE: a
+// class with no declared `move` resolves to an empty inner optional and is
+// re-asked never. Held by the caller so a whole-module walk resolves each
+// class once.
+//
+// ⚠ ABSENCE IS SILENT HERE, AND THAT IS THE CORRECT ARM FOR BOTH CONSUMERS.
+// A class with no declared `move` means no copy is recognized for it, so
+// nothing is deleted and nothing is counted — the fail-safe.
+// `lir_2addr_legalize` reports the same absence as an Error because it is
+// trying to EMIT the instruction and cannot; a cleanup that finds nothing to
+// clean, and a census that counts nothing, have nothing to report.
+class DSS_EXPORT ClassMoveOpcodeCache {
+  public:
+    [[nodiscard]] std::optional<std::uint16_t>
+    resolve(TargetSchema const& schema, LirRegClass cls);
+
+  private:
+    // One slot per `LirRegClass` envelope value (None, GPR, FPR, VR, Flags).
+    std::array<std::optional<std::optional<std::uint16_t>>, 5> byClass_{};
+};
+
+[[nodiscard]] DSS_EXPORT IdentityClassMoveVerdict
+classifyIdentityClassMove(Lir const& lir, LirInstId inst,
+                          TargetSchema const&    schema,
+                          ClassMoveOpcodeCache&  cache);
+
+// Module-wide census of the identity-class-move population, split by R1's
+// verdict. `population` is the sum of the five verdict buckets, so an
+// attribution never silently loses a member.
+//
+// ★ READ IT AT A STAGE BOUNDARY AND SUBTRACT. `dumpLirFuncs` prints this on
+// every STAGE header line, so `post-rewrite → post-legalize → post-peephole
+// → post-callconv` attributes each pass's contribution to each bucket
+// SEPARATELY. That is the instrument the "callconv mints zero" claim never
+// had.
+struct IdentityClassMoveCensus {
+    std::size_t population                      = 0;
+    std::size_t deletable                       = 0;
+    std::size_t refusedSideEffects              = 0;
+    std::size_t refusedUndeclaredRegisterWidth  = 0;
+    std::size_t refusedNarrowerThanRegister     = 0;
+    std::size_t refusedNamesConstraintPoolEntry = 0;
+    // ★ THE SUPERSET R1 IS NOT ALLOWED TO BE. Every instruction whose SOLE
+    // operand is a register equal to its result register, whatever its opcode
+    // — `zext`, `sext`, `trunc`, `not`, `neg`, `shl`, the class move, and the
+    // rest. A rule shaped "result == its only operand ⇒ delete" would take
+    // this whole number; R1 takes only the `deletable` slice of it, and the
+    // MARGIN between them is the correctness argument for asking the schema
+    // which opcode is the class copy. `population` is always ≤ this.
+    //
+    // ⚠ IT IS COUNTED HERE FOR THE SAME REASON THE REST IS: the docblock's
+    // statement of that margin was a pair of hand-carried numbers that went
+    // stale the moment the coalescer changed the population, and nothing
+    // re-derived them.
+    std::size_t selfReferentialSingleOperand    = 0;
+};
+
+[[nodiscard]] DSS_EXPORT IdentityClassMoveCensus
+censusIdentityClassMoves(Lir const& lir, TargetSchema const& schema);
 
 } // namespace dss::lir_pass_util

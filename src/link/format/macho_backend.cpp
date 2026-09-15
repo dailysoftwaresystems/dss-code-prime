@@ -57,12 +57,17 @@ char const* const kMachOBlocks[] = { "macho", "image" };
 // alongside an ordinary N_SECT|N_EXT binding — never as a binding value of its
 // own, which is what separates `symbol-flag` from ELF's `symbol-binding`.
 //
-// ⚠ THIS IS THE WALKER'S CAPABILITY, NOT EVERY MACH-O DOCUMENT'S. Only the
-// MH_OBJECT arm encodes one; the image arms REFUSE a weak definition outright
-// (`refuseWeakImageAlias` — N_WEAK_DEF on an image needs MH_WEAK_DEFINES in
-// the mach header, D-LK3-DYLIB-WEAK-EXPORT), which is why the exec/dylib
-// documents declare no dialect at all. Per-format declaration is the schema's
-// question; this answers only "can this walker spell it".
+// ⚠ THIS IS THE WALKER'S CAPABILITY, NOT EVERY MACH-O DOCUMENT'S — and the
+// two answers stopped differing when [[D-LK3-DYLIB-WEAK-EXPORT]] closed. This
+// note used to read "only the MH_OBJECT arm encodes one; the image arms REFUSE
+// a weak definition outright, which is why the exec/dylib documents declare no
+// dialect at all"; that was true while the image arms could state only part of
+// what an image needs (N_WEAK_DEF without the export-trie terminal or the
+// MH_WEAK_DEFINES header bit). They now state all of it, `macho::encode` asks
+// the dialect question ABOVE its filetype dispatch, and all EIGHT Mach-O
+// documents declare `symbol-flag`. The distinction the sentence draws still
+// stands in general: per-format declaration is the schema's question; this
+// answers only "can this walker spell it".
 constexpr WeakDefinitionDialect kMachOWeakDialects[] = {
     WeakDefinitionDialect::SymbolFlag,
 };
@@ -445,7 +450,8 @@ public:
                                   "/image/installName",
                                   "'installName' must be a string (the "
                                   "LC_ID_DYLIB name a client links "
-                                  "against, e.g. '@rpath/libdss.dylib' -- "
+                                  "against, e.g. "
+                                  "'@rpath/${artifactFileName}' -- "
                                   "MH_DYLIB only)");
                     } else {
                         data.machoImage.installName =
@@ -542,6 +548,64 @@ public:
                     } else {
                         data.machoImage.useChainedFixups =
                             im.at("useChainedFixups").get<bool>();
+                    }
+                }
+                // D-LK-MACHO-EMITS-NO-LC-UUID (increment 2/2) — the image's
+                // LC_UUID. Optional nested object; ABSENT = no LC_UUID, which
+                // is what every MH_OBJECT flavour wants and what `clang -c`
+                // emits. Present = the walker emits a `uuid_command` and
+                // stamps the payload from the image's own content. Declared
+                // rather than unconditional because the reference exposes it
+                // as a per-link policy on both axes (`-no_uuid`,
+                // `-random_uuid`) — the measurement, and the discriminator
+                // that keeps this from meaning "declare every load command",
+                // are in `MachOUuid`'s docblock. `derivation` is a CLOSED
+                // vocabulary: a typo fails loud here rather than silently
+                // getting the content hash.
+                if (im.contains("uuid")) {
+                    auto const& uu = im.at("uuid");
+                    if (!uu.is_object()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/image/uuid",
+                                  "'uuid' must be an object {derivation}");
+                    } else {
+                        MachOUuid uid;
+                        bool ok = true;
+                        // derivation (closed enum; default "content-hash").
+                        if (uu.contains("derivation")) {
+                            if (!uu.at("derivation").is_string()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          "/image/uuid/derivation",
+                                          "'derivation' must be a string "
+                                          "(\"content-hash\")");
+                                ok = false;
+                            } else {
+                                auto const s = uu.at("derivation")
+                                                   .get<std::string>();
+                                auto const d =
+                                    machoUuidDerivationFromName(s);
+                                if (!d.has_value()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_MalformedJson,
+                                        "/image/uuid/derivation",
+                                        std::format("unknown uuid derivation "
+                                                    "'{}' — accepted: "
+                                                    "\"content-hash\" "
+                                                    "(SHA-256 over the image "
+                                                    "with the payload zeroed; "
+                                                    "ld64's -random_uuid has "
+                                                    "no DSS equivalent, "
+                                                    "because a random UUID "
+                                                    "makes a release artifact "
+                                                    "differ from itself).",
+                                                    s));
+                                    ok = false;
+                                } else {
+                                    uid.derivation = *d;
+                                }
+                            }
+                        }
+                        if (ok) data.machoImage.uuid = uid;
                     }
                 }
                 // D-LK7-ADHOC-CODESIGN-MACHO (increment 2/2) — ad-hoc
@@ -668,13 +732,25 @@ public:
                             }
                         }
                         // identifier (non-empty; required).
+                        //
+                        // ⚠ THIS DIAGNOSTIC USED TO SAY "the kernel keys the
+                        // signature on it". ✔MEASURED FALSE on Apple Silicon
+                        // (macOS 26.6.2): `codesign -d -r-` reports the ad-hoc
+                        // designated requirement as `cdhash H"…"` on BOTH DSS-
+                        // and ld64-produced artifacts, so the identifier does
+                        // not feed the requirement the loader checks. What it
+                        // DOES key is identity-based matching — a requirement
+                        // `identifier "X"` accepts every artifact carrying X.
+                        // D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT.
                         if (!cs.contains("identifier")) {
                             coll.emit(DiagnosticCode::C_MalformedJson,
                                       "/image/codeSignature/identifier",
                                       "'identifier' is required and must be "
                                       "a non-empty string (the CodeDirectory "
-                                      "identOffset payload; the kernel keys "
-                                      "the signature on it).");
+                                      "identOffset payload -- the artifact's "
+                                      "code identity, which a code requirement "
+                                      "can match on, e.g. "
+                                      "'com.dss.${artifactFileName}').");
                             ok = false;
                         } else if (!cs.at("identifier").is_string()
                                 || cs.at("identifier").get<std::string>()
@@ -687,6 +763,29 @@ public:
                         } else {
                             sig.identifier =
                                 cs.at("identifier").get<std::string>();
+                            // ── D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ──
+                            //
+                            // The identity may be a FUNCTION of the artifact,
+                            // spelled with the SAME closed `${...}` vocabulary
+                            // `image.installName` uses — one resolver, one
+                            // vocabulary, no second spelling to drift. Shape is
+                            // checked HERE, at LOAD, for the same reason it is
+                            // for the install name: a mis-spelled placeholder is
+                            // a property of the DOCUMENT, and left to the walker
+                            // it would surface only once someone signed
+                            // something. The stand-in name separates the
+                            // ANSWERABLE cases (unknown key, unterminated
+                            // placeholder) from the one that is legitimate here
+                            // and not at emission — no artifact name yet.
+                            auto const shape = resolveArtifactIdentity(
+                                sig.identifier, "a.dylib");
+                            if (!shape.has_value()) {
+                                coll.emit(
+                                    DiagnosticCode::C_MalformedJson,
+                                    "/image/codeSignature/identifier",
+                                    shape.error());
+                                ok = false;
+                            }
                         }
                         if (ok) {
                             data.machoImage.codeSignature = std::move(sig);
@@ -1004,14 +1103,21 @@ public:
             // The message keeps naming ONLY the rejected keys, so it stays a
             // true statement of what fired rather than a list that has to be
             // read against an exception.
+            // The two signature keys are folded into the ONE
+            // `requestsCodeSignature` predicate rather than re-spelled
+            // here: three hand-written copies of that disjunction are
+            // how D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM was
+            // born, and this disjunction is where a fourth would go
+            // unnoticed longest — an over-narrow term inside a nine-way
+            // `||` fails toward ACCEPTING a config, silently, with no
+            // arm of its own to read.
             bool const anySet = mi.pageZeroSize != 0
                 || mi.segmentPageSize != kDefaultMachoSegmentPageSize
                 || !mi.dylinkerPath.empty()
                 || !mi.loadDylibs.empty()
                 || !mi.installName.empty()
                 || !mi.bindNow
-                || mi.codeSignatureSize != 0
-                || mi.codeSignature.has_value();
+                || dss::macho::requestsCodeSignature(mi);
             if (anySet) {
                 fail("/image",
                      "Mach-O MH_OBJECT format must NOT declare an "
@@ -1091,17 +1197,41 @@ public:
             // D-LK3-3: the LC_ID_DYLIB install name — REQUIRED on a
             // dylib (every ld64-produced MH_DYLIB carries one; clients
             // record it at link time), dead config anywhere else. The
-            // walker never derives it from the output file name
-            // (config-driven + honest — the c150 DT_SONAME
-            // discipline), so an unset field must fail HERE, not
-            // silently emit an identity-less dylib.
+            // walker fills exactly the placeholders this document
+            // DECLARES and invents nothing when it declares none (the
+            // c150 DT_SONAME discipline is about not INVENTING an
+            // identity silently, not about refusing to know which
+            // artifact is being written —
+            // D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT),
+            // so an unset field must fail HERE, not silently emit an
+            // identity-less dylib.
             if (isDylibImage && mi.installName.empty()) {
                 fail("/image/installName",
                      "Mach-O MH_DYLIB requires non-empty "
                      "'image.installName' (the LC_ID_DYLIB name a "
                      "client links against, e.g. "
-                     "'@rpath/libdss.dylib'). The walker never derives "
-                     "it from the output file name (D-LK3-3).");
+                     "'@rpath/${artifactFileName}'). The walker fills "
+                     "only the placeholders this document DECLARES and "
+                     "invents nothing when it declares none (D-LK3-3).");
+            }
+            // ── D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ──
+            //
+            // The identity may be a FUNCTION of the artifact, spelled with the
+            // closed `${...}` vocabulary. Its shape is checked HERE, at LOAD,
+            // and not only at emission: a mis-spelled placeholder is a property
+            // of the DOCUMENT, so the document is where it must fail. Left to
+            // the walker it would surface once someone built a dylib, and left
+            // unchecked entirely it would ship as literal text inside a
+            // binary's runtime identity. `resolveArtifactIdentity` is asked with
+            // a stand-in name so the ANSWERABLE cases (unknown key, unterminated
+            // placeholder) separate cleanly from the one case that is legitimate
+            // here and not at emission — no artifact name yet.
+            if (isDylibImage && !mi.installName.empty()) {
+                auto const shape = resolveArtifactIdentity(
+                    mi.installName, "a.dylib");
+                if (!shape.has_value()) {
+                    fail("/image/installName", shape.error());
+                }
             }
             if (!isDylibImage && !mi.installName.empty()) {
                 fail("/image/installName",
@@ -1218,6 +1348,42 @@ public:
                                  "alignment).",
                                  mi.codeSignatureSize));
             }
+            // ── D-LK-MACHO-CODESIGN-SIZE-SILENTLY-OVERRIDDEN-BY-ADHOC
+            //
+            // The two signature keys are ALTERNATIVES, never a pair.
+            // `codeSignature` makes the walker DERIVE the reservation
+            // from the blob it is about to build — via
+            // `adHocCodeSignatureSize`, over the same codeLimit /
+            // pageSize / identifier the fill uses — and the fill then
+            // asserts the built blob occupies that reservation
+            // EXACTLY. A hand-typed
+            // `codeSignatureSize` declared alongside can therefore
+            // never be honoured — the walker read past it in silence,
+            // which is a declared config key with no effect and no
+            // diagnostic. That is the failure the derivation exists to
+            // prevent, so the pair is refused HERE, at the reader,
+            // rather than resolved by precedence in the encoder: it is
+            // a schema-consistency question answerable with no module
+            // in hand, and refusing at load is what puts a JSON pointer
+            // in front of the person who typed the key. Normalising
+            // (clearing the size) would be the same silent drop wearing
+            // a tidier name.
+            if (mi.codeSignature.has_value() && mi.codeSignatureSize != 0) {
+                fail("/image/codeSignatureSize",
+                     std::format("'image.codeSignatureSize' ({}) is "
+                                 "declared alongside "
+                                 "'image.codeSignature'. The two are "
+                                 "alternatives: with an ad-hoc block "
+                                 "present the reservation length is "
+                                 "DERIVED from the blob the walker "
+                                 "builds, so this value can never take "
+                                 "effect. Remove "
+                                 "'image.codeSignatureSize' to sign "
+                                 "ad-hoc, or remove "
+                                 "'image.codeSignature' to reserve a "
+                                 "placeholder for a post-link fill.",
+                                 mi.codeSignatureSize));
+            }
             // ── Mach-O MH_DYLIB shape rules — c153, D-LK3-3 (the
             // Mach-O mirror of the ELF ET_DYN `.so` block + the PE Dll
             // block). A DSS `.dylib` ships entry-less — NO LC_MAIN, no
@@ -1293,28 +1459,55 @@ public:
                                      "entry (no LC_MAIN; D-LK3-3).",
                                      entryPoint));
                 }
-                // The dylib arm emits its EXPORT TRIE through the
-                // legacy LC_DYLD_INFO_ONLY export_off field; the
-                // chained-fixups path would need the separate
-                // LC_DYLD_EXPORTS_TRIE load command, which is not
-                // implemented — reject the combination loud rather
-                // than emit a dylib whose exports dyld never finds
-                // (D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE).
-                if (mi.useChainedFixups) {
-                    fail("/image/useChainedFixups",
-                         "'useChainedFixups' = true is not supported "
-                         "on a Mach-O MH_DYLIB schema -- the dylib "
-                         "export trie is emitted through the legacy "
-                         "LC_DYLD_INFO_ONLY export_off field; the "
-                         "chained-fixups path would need the separate "
-                         "LC_DYLD_EXPORTS_TRIE load command "
-                         "(D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE). "
-                         "Set 'useChainedFixups' = false.");
-                }
+                // ── D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE: THE REFUSAL
+                //    THAT USED TO STAND HERE IS GONE, BECAUSE THE
+                //    CAPABILITY IT NAMED NOW EXISTS.
+                //
+                // It rejected `useChainedFixups: true` on a Mach-O MH_DYLIB
+                // schema, and its stated reason was that the export trie is
+                // emitted through the legacy LC_DYLD_INFO_ONLY.export_off
+                // field while the chained path needs the separate
+                // LC_DYLD_EXPORTS_TRIE, "which is not implemented". The
+                // writer emits LC_DYLD_EXPORTS_TRIE now, for BOTH image
+                // flavors (it is keyed on a non-empty trie, never on the
+                // filetype), so the reason was false and the refusal had
+                // become an asymmetry with no argument behind it: the EXEC
+                // flavor was never refused this key, and both flavors reach
+                // the same writer.
+                //
+                // ⚠ A REFUSAL WHOSE STATED REASON HAS GONE FALSE IS NOT A
+                // CONSERVATIVE DEFAULT — it is a capability hole that reads
+                // as a decision. Deleting it is the whole remedy; nothing
+                // takes its place, and the DATA half the anchor also named
+                // stays refused LOUD one tier down, at the site that owns it
+                // (`encodeExecDynamic`'s chained-fixups DATA-fixup guard,
+                // D-LK6-14), where the exec meets exactly the same wall.
+                //
+                // ✔MEASURED before the deletion, not after: with the gate
+                // lifted, an MH_DYLIB schema declaring `useChainedFixups`
+                // encodes with zero diagnostics, carries
+                // LC_DYLD_CHAINED_FIXUPS and NO LC_DYLD_INFO_ONLY, and its
+                // weak definition is walkable in the trie named by
+                // LC_DYLD_EXPORTS_TRIE, carrying the weak-definition export
+                // flag and the two mach-header coalescing bits. Pinned in
+                // the `MachoChainedFixupsExportTrie` suite, one cell per
+                // image flavor — no identifier is wrapped across a line
+                // here, because a wrapped name is invisible to every grep
+                // that would come looking for it.
             }
         }
         }
     }
+
+    // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: YES, since the walker
+    // learned the LC_DYLD_INFO_ONLY *weak bind* stream (`appendWeakBindEntry`
+    // in `macho.cpp`) and the chained-fixups `BIND_SPECIAL_DYLIB_WEAK_LOOKUP`
+    // ordinal. Both encode "resolve from the loader's coalescing scope", which
+    // is what dyld calls `<weak-def-coalesce>`; before they existed this
+    // returned the base class's false and the linker refused such a module by
+    // name rather than shipping a silent wrong answer.
+    [[nodiscard]] bool
+    realizesCoalescingScopeReferences() const noexcept override { return true; }
 
     [[nodiscard]] std::vector<std::uint8_t>
     encode(AssembledModule const&    module,
@@ -1322,9 +1515,14 @@ public:
            ObjectFormatSchema const& objectFormatSchema,
            DiagnosticReporter&       reporter,
            ImageRequest const&       request) const override {
-        (void)request;  // no declared vehicle — see stackReserveVehicles()
+        // D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT:
+        // the request is FORWARDED now rather than discarded. It still declares
+        // no stack-reserve VEHICLE (see stackReserveVehicles(), which is what
+        // the old `(void)request` was about), but it carries the per-EMISSION
+        // artifact identity an MH_DYLIB's `image.installName` may name — and a
+        // walker that never saw it could only answer with a constant.
         return macho::encode(module, targetSchema, objectFormatSchema,
-                             reporter);
+                             reporter, request);
     }
 
     // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: the read counterpart of

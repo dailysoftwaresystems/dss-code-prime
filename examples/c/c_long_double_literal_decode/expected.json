@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION: an `l`-suffixed long-double literal is decoded at the TARGET's mantissa width, not the host's. Before this, `decodeFloat` routed EVERY float literal through `std::strtod` into a host `double`, so a literal needing more than 53 mantissa bits arrived at the literal LEAF already binary64-rounded, BEFORE any fold — LD-3 then folded arithmetic at true 64/113-bit precision over inputs that were only binary64-precise. ★ THE EXAMPLE READS BYTES, NOT VALUES, because the defect was a wrong number that was wrong CONSISTENTLY: every comparison of one DSS-decoded literal against another agreed with itself, which is why `20.0L`/`0.5L` (exact in binary64) never caught it. Every expected pattern here was ✔MEASURED from a reference compiler's own emitted static initializer, 2026-09-02: gcc 13.3.0 AND clang 18.1.3 for x87-80 (`cd cc cc cc cc cc cc cc fb 3f` for 0.1L, where DSS used to emit `00 d0 cc cc cc cc cc cc fb 3f`), aarch64-linux-gnu-gcc 13.3.0 for binary128 (`9a 99 x12 fb 3f`, where DSS used to emit `00 00 00 00 00 00 00 a0 99 99 99 99 99 99 fb 3f`), and cl.exe 14.51.36231 for the f64 axis (`9a 99 99 99 99 99 b9 3f`, sizeof(long double) == 8 — the reason the width must come from the FORMAT's declared longDoubleFormat axis and never a host facility like `strtold`). The half-way constants are EXACT midpoints between adjacent normals, so only round-to-nearest-EVEN settles them: the even-neighbour tie rounds DOWN, the odd-neighbour tie rounds UP, and both are pinned per axis. The axis itself is discovered from the VALUES (sizeof, then where 1.0L keeps its exponent field) — never a host `#ifdef` or an arch name. exit = 42 on all four axes; any other code names the failing check.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

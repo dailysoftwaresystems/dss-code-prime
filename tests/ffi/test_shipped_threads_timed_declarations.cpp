@@ -27,10 +27,14 @@
 //      kernel32/ucrtbase nor libSystem exports a C11 `thrd_*`, so those two
 //      formats get a compiler-synthesized body, while glibc exports all four and
 //      elf binds them directly. ⚠ AND THE TAG IS LOAD-BEARING FOR LOADABILITY,
-//      not merely for correctness: DSS eagerly imports every UNTAGGED shipped
-//      extern, so dropping the tag turns the row into an import of a name
-//      kernel32 does not export and the produced .exe dies at LOAD with
+//      not merely for correctness: dropping it turns the row into an ordinary
+//      import of a name kernel32 does not export AND removes the body that would
+//      have answered the call, so a `thrd_*` user's .exe dies at LOAD with
 //      STATUS_ENTRYPOINT_NOT_FOUND — ✔MEASURED as this row's mutant B below.
+//      ⓘ It used to kill every binary that merely INCLUDED the header, because a
+//      descriptor row was imported whether referenced or not; P57 retired that
+//      ([[D-FFI-DESCRIPTOR-EAGER-IMPORT]]). The user-facing failure is unchanged —
+//      a caller cannot avoid referencing what it calls.
 //  (3) The SIGNATURES, by interned identity against a reference vocabulary this
 //      file owns. `thrd_equal` takes thrd_t BY VALUE and thrd_t is `ptr<void>` (a
 //      HANDLE) on pe against `u64` on elf/macho, so its pe row MUST differ — the
@@ -202,9 +206,9 @@ void expectDeclared(Reading& r, std::string_view name, std::string_view formatNa
         EXPECT_EQ(rows[0]->synthesize, std::string{name})
             << where << ": `" << name << "` must carry a `synthesize` tag equal to "
             << "its own name. Losing it does not merely lose the recipe — the row "
-            << "becomes an eager import of a name the platform library does not "
-            << "export, and EVERY binary built against this descriptor fails to "
-            << "LOAD (D-FFI-DESCRIPTOR-EAGER-IMPORT)";
+            << "becomes an ordinary import of a name the platform library does not "
+            << "export, with no synthesized body left to answer the call, so every "
+            << "binary that USES it fails to LOAD";
         EXPECT_TRUE(ffi::isKnownSynthesizeRecipe(rows[0]->synthesize))
             << where << ": `" << name << "`'s recipe id is not in the closed "
             << "vocabulary the loader guards with";
@@ -215,8 +219,9 @@ void expectDeclared(Reading& r, std::string_view name, std::string_view formatNa
     } else {
         EXPECT_TRUE(rows[0]->synthesize.empty())
             << where << ": `" << name << "` is a DIRECT libc import on this format "
-            << "(glibc exports all four; thrd_sleep is a WEAK definition, which the "
-            << "eager-import law permits) — a tag here would suppress the import and "
+            << "(glibc exports all four; thrd_sleep is a WEAK DEFINITION, which is "
+            << "still a resolvable dynamic export and so binds like any other) — a "
+            << "tag here would suppress the import and "
             << "synthesize a body over the wrong primitive family";
     }
 
@@ -332,8 +337,9 @@ void writeJson(fs::path const& p, nlohmann::json const& doc) {
 }
 
 // MUTANT B — DELETE only the `synthesize` KEY from the four rows gated to `fmt`,
-// leaving the rows themselves. This is the eager-import breach: the row survives
-// as a plain external import of a name the platform library does not export.
+// leaving the rows themselves. The row survives as a plain external import of a
+// name the platform library does not export, and the body that would have
+// answered the call is gone with the tag.
 [[nodiscard]] std::size_t dropSynthesizeKeyFor(fs::path const& treeRoot, char const* fmt) {
     fs::path const p = treeRoot / "shippedLibs" / fs::path{std::string{kThreadsJson}};
     auto            doc = readJson(p);
@@ -423,7 +429,9 @@ TEST(ShippedThreadsTimed, DroppingThePeRowsIsSeen) {
 // MUTANT B, pe — the rows SURVIVE but lose their `synthesize` key. This is the
 // exact state that produced STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139) from a
 // cleanly-compiled .exe while this row was being written: the descriptor still
-// declares the name, DSS still eagerly imports it, and kernel32 does not export it.
+// declares the name, DSS imports it for anything that calls it, and kernel32 does
+// not export it. (When it was written, the import came whether or not anything
+// called it — [[D-FFI-DESCRIPTOR-EAGER-IMPORT]], retired in P57.)
 TEST(ShippedThreadsTimed, DroppingOnlyTheSynthesizeKeyIsSeen) {
     auto const cfg = dss::test::findConfigRoot();
     ASSERT_TRUE(cfg.has_value());

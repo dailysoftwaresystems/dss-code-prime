@@ -40,8 +40,8 @@
 // above `ap`, so `ap`'s overrun would land in `av`. Every object is re-verified after
 // every other object has been fully written.
 //
-// main is a LEAF (no calls) — a VLA function that calls anything is separately refused
-// (L_VlaNonLeafFrameUnsupported, D-CSUBSET-VLA-NONLEAF-CALL-FRAME), so a sink call would
+// main is a LEAF (no calls). It USED TO SAY a VLA function that calls anything is
+// separately refused (L_VlaNonLeafFrameUnsupported). ⚠ THAT REFUSAL IS GONE since 2026-09-04 (P59): the non-leaf VLA frame model shipped and `D-CSUBSET-VLA-NONLEAF-CALL-FRAME` is CLOSED. `main` here is STILL a leaf, but now by CHOICE rather than by force -- a leaf keeps this example's own subject independent of the frame model, which has its own witness in `examples/c/c99_vla_nonleaf_call_frame`. A sink call would
 // measure THAT refusal instead of this capability. `volatile` defeats const-folding so
 // the bounds are genuinely runtime. Each `return k` is a strict in-program pin.
 //

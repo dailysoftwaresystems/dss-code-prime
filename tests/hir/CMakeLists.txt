@@ -17,6 +17,15 @@ dss_add_test(NAME hir/test_hir_verifier      SOURCES test_hir_verifier.cpp)
 dss_add_test(NAME hir/test_const_eval        SOURCES test_const_eval.cpp)
 dss_add_test(NAME hir/test_hir_text          SOURCES test_hir_text.cpp)
 dss_add_test(NAME hir/test_hir_lowering_c SOURCES test_hir_lowering_c.cpp)
+# D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION. Separate from
+# test_hir_lowering_c.cpp because that file's fixture deliberately pins the
+# long-double axis at `None` ("moving it would silently re-point every one of
+# this file's fixtures at a different ABI"), and this pin's whole subject is what
+# a DECLARED axis does to the literal leaf. It also answers the question the
+# Windows leg cannot answer by running the corpus example, whose x87-80 and
+# ieee128 arms are BUILT but never EXECUTED there.
+dss_add_test(NAME hir/test_hir_long_double_literal_decode
+             SOURCES test_hir_long_double_literal_decode.cpp)
 dss_add_test(NAME hir/test_hir_lowering_toy   SOURCES test_hir_lowering_toy.cpp)
 dss_add_test(NAME hir/test_hir_lowering_generic   SOURCES test_hir_lowering_generic.cpp)
 dss_add_test(NAME hir/test_hir_lowering_tsql  SOURCES test_hir_lowering_tsql.cpp)
@@ -68,3 +77,19 @@ add_dependencies(dss_hir_test_torn_shipped_config_reds_not_crashes
 # unconsumed substrate's misses are latent by definition).
 dss_add_test(NAME hir/test_type_representation_projection
              SOURCES test_type_representation_projection.cpp)
+
+# ── D-COMPILER-INPUT-PROPORTIONAL-RECURSION residue, front-end half (P55 `hs`) ──
+# TWO files, and the split is the point.
+#
+# `test_frontend_deep_nesting_probe` is the stage-selectable MEASUREMENT
+# instrument: idle (skipped) unless `DSS_HS_PROBE_KIND` is set, so it costs the
+# ordinary gate one skip and lets a ceiling be walked without a rebuild.
+#
+# `test_frontend_deep_nesting_costs_heap` holds the PINS, and it is its own
+# binary on purpose: when one of them reds it reds by exhausting the stack — the
+# process dies with no `[  FAILED  ]` line and no case name, the unattributable
+# signature that must not be allowed to take a sibling test's verdict with it.
+dss_add_test(NAME hir/test_frontend_deep_nesting_probe
+             SOURCES test_frontend_deep_nesting_probe.cpp)
+dss_add_test(NAME hir/test_frontend_deep_nesting_costs_heap
+             SOURCES test_frontend_deep_nesting_costs_heap.cpp)

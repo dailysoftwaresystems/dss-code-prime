@@ -43,7 +43,7 @@
  * RED-ON-DISABLE: restore the guard to refuse every overlapping brace-init and
  * the pe + macho compiles fail — blocks (1)–(4) with
  * error[H_UnsupportedLoweringForKind] "brace-initialization of an overlapping
- * explicit-offset struct", block (5) with error[K_NoMatchingObjectFormat]
+ * explicit-offset struct", block (5) with error[K_OverlappingStaticInitUnsupported]
  * "static initialization of an overlapping explicit-offset struct". */
 
 #ifdef _WIN32

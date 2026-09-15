@@ -225,21 +225,47 @@ with open(report, "w", encoding="utf-8", newline="\n") as fh:
 '''
 
 
-def repo_root():
-    """The checkout root, asked of git rather than derived from `__file__`.
+_OWNING_TREE = None
 
-    Same reasoning as the sibling guards: a script's own depth under the repo is
-    exactly the fact that changed when `tools/` was merged into `scripts/`.
+
+def _owning_tree():
+    """`scripts/owning-tree/owning-tree.py` -- the one owner of "which tree is this file in?".
+
+    Loaded by path from this file's sibling directory (a hyphen is not a module name). It
+    FAILS LOUD when absent rather than falling back to a local walk: a second copy of the
+    answer is the drift that owner exists to end.
     """
+    global _OWNING_TREE
+    if _OWNING_TREE is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise Collapse("cannot find %s -- this guard's root is resolved there and "
+                           "nowhere else" % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OWNING_TREE = mod
+    return _OWNING_TREE
+
+
+def repo_root():
+    """The tree THIS FILE lives in -- never the tree the caller's shell is standing in.
+
+    ⚠ This was a bare `git rev-parse --show-toplevel`, chosen over `__file__` because a
+    script's depth under the repo changed when `tools/` was merged into `scripts/`. The
+    walk in `scripts/owning-tree/owning-tree.py` keeps that property -- it does not count
+    `..` -- and drops the defect: git answered from the CALLER's cwd. ✔MEASURED
+    2026-09-15 (P66): run by path with its cwd inside a different repository, this
+    guard collapsed on a directory only THAT repository lacks; from a directory inside no
+    repository it would not run at all. (Its old "pass the repo root as an argument"
+    advice was never true: `main` refuses every positional argument.)
+    """
+    ot = _owning_tree()
     try:
-        p = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                           capture_output=True, text=True, check=False)
-    except OSError as exc:
-        raise Collapse("cannot run git (%s). Pass the repo root as an argument "
-                       "instead." % exc)
-    if p.returncode != 0:
-        raise Collapse("not inside a git checkout: " + (p.stderr or "").strip())
-    return p.stdout.strip()
+        return ot.resolve(__file__)
+    except ot.Refusal as exc:
+        raise Collapse(str(exc))
 
 
 def load_scripts_index(path=None):
@@ -545,7 +571,7 @@ def _arm(results, label, got, expect_code, says=None, not_says=None):
 # D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS names, reached by subtraction
 # instead of by short-circuit. ⚠ Raising this number is not a formality: it is the
 # claim that the arms you added actually RUN.
-EXPECTED_ARMS = 21
+EXPECTED_ARMS = 24
 
 
 def self_test():
@@ -677,6 +703,11 @@ def self_test():
              (io.open(inv_path, "rb").read() == _before, ""), True)
     finally:
         shutil.rmtree(box, ignore_errors=True)
+
+    # -- the root is the tree THIS FILE lives in, whatever the caller's cwd ------
+    # Arms, oracle and synthesized negatives are owned by scripts/owning-tree/owning-tree.py.
+    for ok, label, detail in _owning_tree().root_arms(repo_root, (Collapse,), False, __file__):
+        results.append((ok, "R  " + label, detail, ""))
 
     bad = [r for r in results if not r[0]]
     for ok, label, detail, text in results:

@@ -107,6 +107,49 @@ EXIT_VIOLATION = 1
 EXIT_USAGE = 2
 EXIT_COLLAPSE = 2
 
+_OWNING_TREE = None
+
+
+def _owning_tree():
+    """`scripts/owning-tree/owning-tree.py` -- the owner of asking git WITHOUT the caller's git environment.
+
+    Loaded by path from this file's sibling directory (a hyphen is not a module name), and
+    FAILS LOUD when absent: the rule it owns must not be spelled a second time here.
+    """
+    global _OWNING_TREE
+    if _OWNING_TREE is None:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise Collapse("cannot find %s -- this guard asks git through it and nowhere else"
+                           % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OWNING_TREE = mod
+    return _OWNING_TREE
+
+
+def _remove_box(path):
+    """Remove one of the self-test's temp boxes -- git's READ-ONLY object files included -- or RAISE.
+
+    ★★ A BOX THAT CANNOT BE REMOVED IS A LOUD FAILURE, NEVER A SILENT LEAK. ✔MEASURED 2026-09-15
+    (P66 lane ge): every cleanup here was `shutil.rmtree(box, ignore_errors=True)`. One self-test
+    run in an empty private temp root said "self-test OK", rc=0, and left `csp-<random>/` behind
+    holding exactly one file, `repo/.git/objects/03/8f10bb...` with the READ-ONLY attribute -- the
+    blob arm 16's `git add` writes, which Windows refuses to unlink -- and `ignore_errors` swallowed
+    both failures (the repository box's and the outer box's). %TEMP% held 920 such `csp-*` boxes,
+    created 2026-08-26 to 2026-09-15.
+    ⇒ removal goes through the owner that clears a read-only bit and retries
+    (`owning-tree.remove_tree`), and a box still on disk afterwards RAISES `Collapse` naming it.
+    Arm 25 pins the refusal (the owner's "not gone" injected); arm 26 pins that a run leaves none.
+    """
+    if not _owning_tree().remove_tree(path):
+        raise Collapse("the self-test could not remove its own temp box %s -- a box left behind is "
+                       "a leak, not a pass" % path)
+
+
 SCAN_FLOOR = 15
 
 # ★★ ONE ANSWER TO "IS THIS FILE OURS", AND IT IS `.gitignore`. The only name skipped
@@ -502,9 +545,14 @@ def _git_ignored(root, paths, runner=None):
     run = runner or subprocess.run
     payload = "\0".join(os.path.relpath(p, root).replace("\\", "/") for p in paths)
     try:
+        # ★ `env=` IS LOAD-BEARING. ✔MEASURED 2026-09-15 (P66 lane rr): under another
+        # repository's exported GIT_INDEX_FILE, or its GIT_DIR, this query counted a TRACKED
+        # script under an ignored pattern as ignored -- git consulted THAT repository's index --
+        # so the scan skipped it. The rule, and why, are in scripts/owning-tree/owning-tree.py.
         proc = run(["git", "-C", root, "check-ignore", "-z", "--stdin"],
                    input=payload.encode("utf-8"),
-                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                   env=_owning_tree().git_environment())
     except (OSError, ValueError) as exc:
         raise Collapse("cannot ask git what is ignored under %s (%s); refusing to scan"
                        " a tree whose ignored files it cannot identify" % (root, exc))
@@ -632,7 +680,6 @@ def _line_of_case(body):
 # ── the self-test: red-on-disable for the instrument itself ──────────────────
 def selftest(out=sys.stdout):
     """Every red arm asserts the MESSAGE of the refusal it names, never just a code."""
-    import shutil
     import tempfile
 
     arms = 0
@@ -811,7 +858,7 @@ def selftest(out=sys.stdout):
         rc = check(hook_tree, floor=3, out=buf)
         assert rc == EXIT_OK and "OK (3 shell scripts" in buf.getvalue(), buf.getvalue()
         assert "pre-commit.sh" not in buf.getvalue(), buf.getvalue()
-        shutil.rmtree(hook_tree, ignore_errors=True)
+        _remove_box(hook_tree)
         arms += 1
 
         # arm 15 -- A GITIGNORED FILE IS NOT SCANNED, AND THE SAME FILE UNIGNORED IS.
@@ -892,7 +939,7 @@ def selftest(out=sys.stdout):
         else:
             raise AssertionError("a failing check-ignore must raise Collapse")
         arms += 1
-        shutil.rmtree(git_tree, ignore_errors=True)
+        _remove_box(git_tree)
 
         # arm 18 -- `build/` IS NOT SPECIAL; `.gitignore` IS. A directory this guard
         # used to hard-skip by NAME is walked like any other when nothing ignores it,
@@ -905,7 +952,7 @@ def selftest(out=sys.stdout):
             f.write("declare -A m=()\n")
         rc, msg = run()
         assert rc == EXIT_VIOLATION and "scripts/build/deep.sh" in msg, (rc, msg)
-        shutil.rmtree(deep, ignore_errors=True)
+        _remove_box(deep)
         arms += 1
 
         # arm 19 -- A BARE `case` WORD IS NOT A `case` STATEMENT. `$(echo case)` puts
@@ -956,8 +1003,88 @@ def selftest(out=sys.stdout):
         rc, msg = run()
         assert rc == EXIT_OK and "OK (7 shell scripts" in msg, (rc, msg)
         arms += 1
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+
+        # arm 24 -- A CALLER'S GIT ENVIRONMENT DOES NOT DECIDE WHAT IS IGNORED.
+        # ✔MEASURED 2026-09-15 (P66 lane rr): under another repository's GIT_INDEX_FILE or
+        # GIT_DIR, `_git_ignored` counted a TRACKED script under an ignored pattern as ignored,
+        # so the scan would have skipped it. A synthetic repository holds one such script and
+        # one genuinely ignored one; each steered negative is proven by a bare git first.
+        ot = _owning_tree()
+        env_tree = os.path.join(tmp, "envrepo")
+        for rel, body in ((".gitignore", "forced/\nscratch/\n"),
+                          ("forced/kept.sh", "#!/bin/sh\necho kept\n"),
+                          ("scratch/copy.sh", "#!/bin/sh\necho copy\n")):
+            full = os.path.join(env_tree, *rel.split("/"))
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with io.open(full, "w", encoding="utf-8", newline="") as f:
+                f.write(body)
+        ot.run_git(["init", "-q", env_tree], capture_output=True)
+        ot.run_git(["-C", env_tree, "add", "-f", ".gitignore", "forced/kept.sh"],
+                   capture_output=True)
+        candidates = [os.path.join(env_tree, "forced", "kept.sh"),
+                      os.path.join(env_tree, "scratch", "copy.sh")]
+        clean = _git_ignored(env_tree, candidates)
+        assert clean == {os.path.normpath(candidates[1])}, clean
+        with ot.steering() as steer:
+            for name in ("GIT_INDEX_FILE", "GIT_DIR"):
+                one = {name: steer[name]}
+                neg = subprocess.run(["git", "-C", env_tree, "check-ignore", "-z", "--stdin"],
+                                     input=b"forced/kept.sh\0scratch/copy.sh",
+                                     capture_output=True, env=ot.git_environment(one))
+                assert "forced/kept.sh" in neg.stdout.decode("utf-8", "replace").split("\0"), \
+                    ("the steered negative never materialised", name, neg.returncode,
+                     neg.stderr)
+                with ot.caller_environment(one):
+                    steered = _git_ignored(env_tree, candidates)
+                assert steered == clean, (name, steered, clean)
+        _remove_box(env_tree)
+        arms += 1
+
+        # arm 25 -- A BOX THE OWNER CANNOT REMOVE IS A LOUD FAILURE NAMING IT, NEVER A LEAK.
+        # The owner's "not gone" answer is INJECTED. What makes a real box unremovable is a
+        # property of the host (git's read-only objects on Windows; nothing at all for a POSIX
+        # root), so this arm pins the REFUSAL itself on every host, and arm 26 pins the removal
+        # of this run's real box. The box must still be there afterwards -- the injection
+        # removed nothing -- and is then removed for real.
+        doomed = os.path.join(tmp, "doomed")
+        os.makedirs(doomed)
+        real_remove = ot.remove_tree
+        ot.remove_tree = lambda _path: False
+        try:
+            try:
+                _remove_box(doomed)
+                said = None
+            except Collapse as exc:
+                said = str(exc)
+        finally:
+            ot.remove_tree = real_remove
+        assert said is not None and doomed in said and "leak" in said, \
+            ("arm 25: a box the owner could not remove did NOT fail loudly", said)
+        assert os.path.isdir(doomed), "arm 25: the injected refusal was not a refusal: %s" % doomed
+        _remove_box(doomed)
+        arms += 1
+    except BaseException:
+        # An arm's own failure is the verdict and propagates untouched. The box goes with it when
+        # the owner can remove it; when it cannot, the leak is NAMED beside the failure.
+        if not _owning_tree().remove_tree(tmp):
+            print("check-shell-portability: the failing self-test ALSO left its temp box behind: %s"
+                  % tmp, file=out)
+        raise
+
+    # arm 26 -- A RUN LEAVES NONE OF ITS OWN BOXES BEHIND. ✔MEASURED before this arm existed: one
+    # run said "self-test OK", rc=0, and left `csp-*/repo/.git/objects/03/...` behind, read-only
+    # (see `_remove_box`). ⚠ By this point every earlier sub-box is gone, so the box would hold
+    # nothing a bare `rmtree` could fail on; a REAL loose object is written into it first, so this
+    # removal meets exactly what leaked -- on a host where git's objects resist unlinking.
+    final_objects = os.path.join(tmp, "final-objects")
+    os.makedirs(final_objects)
+    with io.open(os.path.join(final_objects, "blob.txt"), "w", encoding="utf-8", newline="") as f:
+        f.write("a loose object git writes read-only\n")
+    _owning_tree().run_git(["init", "-q", final_objects], capture_output=True)
+    _owning_tree().run_git(["-C", final_objects, "add", "blob.txt"], capture_output=True)
+    _remove_box(tmp)
+    assert not os.path.exists(tmp), "arm 26: the self-test's own temp box is still on disk: %s" % tmp
+    arms += 1
 
     print("check-shell-portability: self-test OK - %d arms exercised, every red arm asserting"
           " the MESSAGE of the refusal it names; this guard is PROVEN able to fail." % arms,
@@ -1015,9 +1142,11 @@ def main(argv):
     root = repo_root()
     if "--list" in argv[1:]:
         return report(root)
-    if "--selftest" in argv[1:]:
-        return selftest()
     try:
+        # A self-test run on its own reports a structural failure the same way -- a temp box it
+        # could not remove (`_remove_box`) is a FAIL with a message, never a traceback or a pass.
+        if "--selftest" in argv[1:]:
+            return selftest()
         # star star THE NO-ARGUMENT FORM -- the one ctest uses -- VERIFIES THE REAL TREE
         # AND THEN PROVES IT CAN FAIL, in that order. Same shape as check-scripts-index
         # and for the same reason: an entry that only verified would pass identically

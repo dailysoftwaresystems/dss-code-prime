@@ -57,7 +57,49 @@ a document.
 ```bash
 bash scripts/lane-worktree/lane-worktree.sh add k        # -> <repo>/.worktrees/k
 bash scripts/lane-worktree/lane-worktree.sh remove k     # removes AND prunes
+python scripts/lane-fold/lane-fold.py land k harness --apply   # the way a FINISHED lane leaves
 ```
+
+⚠ **`remove` REFUSES (exit 8) a worktree that still carries the lane's work** — by its own
+`git status`, a tracked modification or an untracked file that is not ignored (seeded paths
+included); or a commit its HEAD holds that no ref of the repository reaches, asked at the repository
+root as `git rev-list <HEAD> --not --glob=refs/*` (removing the worktree would orphan that commit,
+and gc would delete it) — until it is told `--discard-work` (`-DiscardWork`), which names every path
+and commit it discards. It cannot tell folded work from unfolded work; `lane-fold.py land` can,
+builds that flag only from its own "nothing left to fold" measurement, and refuses a lane whose HEAD
+left its base: past the recorded base, or, for a format-1 manifest that records none, holding such a
+commit.
+
+⚠ **`remove` REFUSES (exit 7) a worktree whose evidence roots, `scratchpad/` AND `.temp/`, hold
+any file**, until it is told `--preserve-to <dir>` or `--discard-evidence` (`-PreserveTo` /
+`-DiscardEvidence` in PowerShell). ✔MEASURED P66: the gate used to count `scratchpad/` only, while
+every live lane kept its evidence under `.temp/<lane>-scratch/`, so it counted zero for all of them.
+A preserve refuses a destination inside the worktree or one already holding a same-named file with
+other bytes, and re-reads every file at the destination. `--discard-scratchpad` is retired and refused.
+
+★ **A finished lane is LANDED, never removed by hand:** `lane-fold.py land <lane> <production|harness>`
+folds it, applies its `row/` cells through the row writer all-or-nothing and re-reads each row, checks
+nothing is left to fold, keeps the whole evidence set under `.worktrees/.evidence/<lane>-<stamp>/`,
+and only then removes the worktree. Without `--apply` it is a dry run; a stopped landing can be re-run.
+
+⚠ **THE THREE LANE VERBS RESOLVE THEIR TREE FROM THE SCRIPT'S OWN LOCATION, NOT FROM YOUR
+`cwd` — SINCE P53, AND THE INVOCATIONS ABOVE ARE UNCHANGED.** `lane-worktree.sh`,
+`lane-worktree.ps1` and `lane-fold.py` each carried a bare `git rev-parse --show-toplevel`, so
+every path they derived was rooted at whichever repository the CALLER happened to be standing
+in. ✔MEASURED in P52 it silently redirected a whole guard run at another repository, and
+✔MEASURED again in P53 it hit the ORCHESTRATOR live: a shell that had drifted into
+`.worktrees/io` made `lane-fold fold io --apply` resolve `…/.worktrees/io/.worktrees/io`.
+⇒ **Closed by [[D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED]].** Each verb now anchors on its
+own file through the owner for its language (`leg_tree_owning_root` in `scripts/leg-tree/`,
+`Get-RepoTreeOwningRoot` in `scripts/repo-tree/`), and every one accepts an explicit
+**`--repo <path>`** (`-Repo` in PowerShell) for a caller that genuinely means another tree.
+
+⚠ **DO NOT "IMPROVE" THIS INTO "the tree that owns `.worktrees/`".** The orchestrator proposed
+exactly that in P53 and the lane REFUTED it by measurement: from inside `.worktrees/lw`, the
+main-checkout answer resolves `remove io` onto a LIVE SIBLING LANE'S uncommitted work, where the
+script-anchored answer resolves to a path that does not exist and refuses. It is also wrong for a
+submodule, where `--git-common-dir` names `<super>/.git/modules/<child>` — rooting a removal
+*inside* `.git`. The blast radius inverts; the row's original predicate was right.
 
 ⚠ **THE MAX_PATH BUDGET IS NOW SPENT, NOT SLACK — AND THIS IS THE ONE THING TO CARRY FROM H.0a.**
 Moving from a 10-char root into the repository root costs **46 characters** of the MAX_PATH budget

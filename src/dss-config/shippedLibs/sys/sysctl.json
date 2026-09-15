@@ -4,7 +4,7 @@
   "standard": "darwin",
   "availableObjectFormats": ["macho"],
   "library": {
-    "macho": "/usr/lib/libSystem.B.dylib"
+    "macho": { "role": "cLibrary" }
   },
   "symbols": [
     { "name": "sysctl",       "signature": "fn(ptr<i32>, u32, ptr<void>, ptr<u64>, ptr<void>, u64) -> i32", "kind": "function", "linkage": "external", "availableObjectFormats": ["macho"] },

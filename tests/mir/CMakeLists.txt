@@ -125,3 +125,20 @@ dss_add_test(NAME mir/test_mir_text_unsealed_block
 # disagree three ways, so pe must keep NOT growing a recursion guard.
 dss_add_test(NAME mir/test_synth_threads_mtx_type
              SOURCES test_synth_threads_mtx_type.cpp)
+
+# P55 lane `rc` — "depth costs heap, not host call frames". Its OWN binary
+# because a red here is a STACK OVERFLOW, which kills the process and would take
+# every sibling test in a shared executable down unattributably with it.
+dss_add_test(NAME mir/test_deep_nesting_costs_heap
+             SOURCES test_deep_nesting_costs_heap.cpp)
+
+# D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE — the `try*` non-fatal twins of the typed
+# payload readers, plus the two guards that keep them test-only and keep the twin
+# set from falling behind `mir.cpp`. Its OWN binary for the same reason
+# test_mir_inline_asm has one: it carries DEATH tests, which gtest runs by forking
+# the whole executable — and here they are load-bearing rather than incidental.
+# They drive each ABORTING sibling over the very instruction its twin answered
+# with nullopt, so the pair is the before/after of one identical call and the
+# nullopt arm cannot be green for a reason unrelated to the abort.
+dss_add_test(NAME mir/test_mir_try_accessors
+             SOURCES test_mir_try_accessors.cpp)

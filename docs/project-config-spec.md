@@ -29,9 +29,8 @@
                          "runOn": ["linux", "darwin"] }],
   "dependsOn":        [{ "path": "../libfoo" }],        // optional — prerequisite projects, RESOLVED and composed in (§2.6)
   "dependencyArtifactCache": {                          // optional — cross-BUILD dependency artifact cache; see §2.8
-    "enabled": true,                                    //   all three members REQUIRED when the object is present
-    "rootOverrideVariable": "MY_DSS_CACHE_DIR",         //   NAMES the env var that overrides the location
-    "eviction": "prune-superseded" },                   //   or "retain"
+    "enabled": true,                                    //   both members REQUIRED when the object is present
+    "rootOverrideVariable": "MY_DSS_CACHE_DIR" },       //   NAMES the env var that overrides the location
 
   "$comment":         "prose — every `$`-prefixed key is documentation (§2.7)"
 }
@@ -59,7 +58,7 @@ delegates to the existing compile path — routing by source **count** (§5).
 | `preBuildScripts` | no | array of `{"run","runOn"}` objects | Commands run **before** the build. `run` is an **argv vector**, spawned directly — never a shell. See §2.5. |
 | `postBuildScripts` | no | array of `{"run","runOn"}` objects | Commands run **after** a build that **succeeded**. Same entry shape as `preBuildScripts`. See §2.5. |
 | `dependsOn` | no | array of `{"path"}` **or** `{"git","ref"?}` objects | Prerequisite projects, **resolved recursively** and folded into this build by the composition verb the *dependency's* `artifactProfile` declares (§3). See §2.6. |
-| `dependencyArtifactCache` | no | object with **all three** of `enabled` (boolean), `rootOverrideVariable` (non-empty string), `eviction` (`"prune-superseded"` \| `"retain"`) | The cross-**build** content-addressed cache for **dependency** artifacts. Read off the **root** manifest only — a dependency's own copy is never read, the same ruling as its `targets[]` (§2.6) and its `output`. Absent ⇒ no cache: nothing is looked up and nothing is written. See §2.8. |
+| `dependencyArtifactCache` | no | object with **both** of `enabled` (boolean) and `rootOverrideVariable` (non-empty string) | The cross-**build** content-addressed cache for **dependency** artifacts. Read off the **root** manifest only — a dependency's own copy is never read, the same ruling as its `targets[]` (§2.6) and its `output`. Absent ⇒ no cache: nothing is looked up and nothing is written. See §2.8. |
 
 **The three flag arrays mirror the CLI flags and *merge* with them.** Each is **optional** and defaults to
 empty; an **absent** field and a **present-but-empty `[]`** both mean "no entries" (no error). A present value
@@ -677,8 +676,7 @@ store that lets the second build **serve** a dependency's artifact instead of re
 ```jsonc
 "dependencyArtifactCache": {
   "enabled": true,
-  "rootOverrideVariable": "MY_DSS_CACHE_DIR",
-  "eviction": "prune-superseded"
+  "rootOverrideVariable": "MY_DSS_CACHE_DIR"
 }
 ```
 
@@ -690,16 +688,28 @@ store that lets the second build **serve** a dependency's artifact instead of re
 - **★ It caches DEPENDENCY artifacts, not the root's own.** The root build is the thing the operator
   is running: its artifact is the deliverable they will inspect and its sources are the ones being
   edited. A prerequisite nobody is editing is the shape a content-addressed cache serves well.
-- **All three members are required when the object is present**, and the degenerate spelling
+- **Both members are required when the object is present**, and the degenerate spelling
   **rejects** rather than aliasing: `{"enabled": false}` alone would mean exactly what *omitting the
   key* means, said less clearly, and a cache whose location override is unnamed is environment
   sniffing with an extra step.
 - **`rootOverrideVariable` NAMES an environment variable — the loader never reads one.** Its value,
   when set and non-empty, wins outright over every per-user platform default
   (`%LOCALAPPDATA%`, `$XDG_CACHE_HOME`, `$HOME/.cache`) and is taken **verbatim**.
-- **`eviction`** — `"prune-superseded"` keeps one current entry per artifact name in a directory
-  (bounded disk); `"retain"` keeps every entry, which is what a branch-switching or bisecting
-  workflow needs, since under pruning two alternating revisions evict each other and both stay cold.
+- **⛔ `eviction` IS WITHDRAWN, and a manifest that still names it is REFUSED.** It took
+  `"prune-superseded"` (keep one current entry per artifact name in a directory) or `"retain"`
+  (keep every entry). The first is not implementable: the entry a store would delete as *superseded*
+  is indistinguishable from the **live link input of a build running right now** — the cache hands
+  out a **path** and the linker opens it much later — and a store has no evidence about another
+  process. ✔MEASURED, two corpus examples went red on a deleted cache entry inside an otherwise
+  green suite. ✔MEASURED again on the disk side, over a real 72 MB cache: **15,906 entry families,
+  every one holding exactly one entry**, so a perfect prune would have reclaimed **0 bytes** — the
+  compiler's build stamp is a directory component, so a superseded generation lands in a *different
+  root* and was never reachable to delete. Retaining is now simply how the cache behaves, the
+  branch-switching workflow `"retain"` existed for is the default, and the member is gone rather
+  than reduced to one legal value. **Reclaim a cache by deleting its root directory** — the root
+  carries a per-compiler-version segment so one version's cache is one `rm -rf`. The refusal names
+  the member and this reason, rather than reporting an unknown key.
+  ([[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]])
 - **What the key covers.** The **union of every compilation unit's textual input closure**
   (`CompilationUnit::inputDigest()` — which is why a quote-`#include`d header that appears in **no**
   `sources[]` still moves the key), the target spec, the object format and its archive-writing

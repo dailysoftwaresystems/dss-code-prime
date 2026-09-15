@@ -3,8 +3,62 @@
   "header": "stdatomic.h",
   "standard": "c11",
   "availableObjectFormats": ["elf", "pe", "macho"],
+  "$objectTypedefsComment": "D-CSUBSET-ATOMIC-MONOMORPH-I32: the C11/C23 §7.17.6 atomic OBJECT typedefs. Each is a genuinely `_Atomic`-qualified typedef (the codec spelling `atomic<T>` → interner.atomicQualified(T), M1 in hir_text.cpp) — NOT a plain alias — so a bare `atomic_long x; x = 5;` lowers to AtomicStore/AtomicLoad through the SAME emitScalarLoad/Store chokepoint a raw `_Atomic long` uses, at the DECLARED width. The rows whose C spelling is data-model-dependent (`long`, `unsigned long`, and the four `_t` aliases) use the per-target `variants` form with the EXACT `when` triples stdint.json/stddef.json already use for `int64_t`/`intptr_t`/`size_t`/`ptrdiff_t` — the identity tag is what makes an LP64/elf `long` distinct from an LP64/macho `long long` at the same width, and re-deriving that here instead of copying it would be a second owner of one fact. ⚠ THE WHOLE SET IS ONLY REACHABLE BECAUSE THE ACCESSORS ARE DECLARED TYPE-GENERIC (c.lang.json `genericPointee`): before that, these rows would have produced typedefs no accessor in the header could accept, which is a worse outcome than not declaring them.",
   "typedefs": [
-    { "name": "atomic_int", "type": "atomic<i32>" }
+    { "name": "atomic_bool",   "type": "atomic<bool>" },
+    { "name": "atomic_char",   "type": "atomic<i8 \"char\">" },
+    { "name": "atomic_schar",  "type": "atomic<i8 \"signed char\">" },
+    { "name": "atomic_uchar",  "type": "atomic<u8 \"unsigned char\">" },
+    { "name": "atomic_short",  "type": "atomic<i16 \"short\">" },
+    { "name": "atomic_ushort", "type": "atomic<u16 \"unsigned short\">" },
+    { "name": "atomic_int",    "type": "atomic<i32>" },
+    { "name": "atomic_uint",   "type": "atomic<u32 \"unsigned int\">" },
+    { "name": "atomic_llong",  "type": "atomic<i64 \"long long\">" },
+    { "name": "atomic_ullong", "type": "atomic<u64 \"unsigned long long\">" },
+    { "name": "atomic_long", "variants": [
+      { "when": { "dataModel": "LP64",  "format": "elf"   }, "type": "atomic<i64 \"long\">" },
+      { "when": { "dataModel": "LP64",  "format": "macho" }, "type": "atomic<i64 \"long\">" },
+      { "when": { "dataModel": "LLP64", "format": "pe"    }, "type": "atomic<i32 \"long\">" }
+    ] },
+    { "name": "atomic_ulong", "variants": [
+      { "when": { "dataModel": "LP64",  "format": "elf"   }, "type": "atomic<u64 \"unsigned long\">" },
+      { "when": { "dataModel": "LP64",  "format": "macho" }, "type": "atomic<u64 \"unsigned long\">" },
+      { "when": { "dataModel": "LLP64", "format": "pe"    }, "type": "atomic<u32 \"unsigned long\">" }
+    ] },
+    { "name": "atomic_intptr_t", "variants": [
+      { "when": { "dataModel": "LP64",  "format": "elf"   }, "type": "atomic<i64 \"long\">" },
+      { "when": { "dataModel": "LP64",  "format": "macho" }, "type": "atomic<i64 \"long\">" },
+      { "when": { "dataModel": "LLP64", "format": "pe"    }, "type": "atomic<i64 \"long long\">" }
+    ] },
+    { "name": "atomic_uintptr_t", "variants": [
+      { "when": { "dataModel": "LP64",  "format": "elf"   }, "type": "atomic<u64 \"unsigned long\">" },
+      { "when": { "dataModel": "LP64",  "format": "macho" }, "type": "atomic<u64 \"unsigned long\">" },
+      { "when": { "dataModel": "LLP64", "format": "pe"    }, "type": "atomic<u64 \"unsigned long long\">" }
+    ] },
+    { "name": "atomic_size_t", "variants": [
+      { "when": { "dataModel": "LP64",  "format": "elf"   }, "type": "atomic<u64 \"unsigned long\">" },
+      { "when": { "dataModel": "LP64",  "format": "macho" }, "type": "atomic<u64 \"unsigned long\">" },
+      { "when": { "dataModel": "LLP64", "format": "pe"    }, "type": "atomic<u64 \"unsigned long long\">" }
+    ] },
+    { "name": "atomic_ptrdiff_t", "variants": [
+      { "when": { "dataModel": "LP64",  "format": "elf"   }, "type": "atomic<i64 \"long\">" },
+      { "when": { "dataModel": "LP64",  "format": "macho" }, "type": "atomic<i64 \"long\">" },
+      { "when": { "dataModel": "LLP64", "format": "pe"    }, "type": "atomic<i64 \"long long\">" }
+    ] }
+  ],
+  "$rmwMacrosComment": "D-CSUBSET-ATOMIC-RMW: the C11/C23 §7.17.7 read-modify-write family's USER-FACING spellings. C defines each non-`_explicit` form as exactly its `_explicit` twin at `memory_order_seq_cst` (§7.17.7.1p2 and the per-op paragraphs that follow), and that is what these macros say — the seq_cst default lives HERE, once, in the header that owns the surface, and never as a second default baked into the engine. The `_explicit` twins are always-injected compiler intrinsics declared in c.lang.json `builtinFunctions` (the `_InterlockedCompareExchange` precedent: a non-linkable op, shadow-able by a user decl, so NO `library`/`symbols` block and available on every object format). ⓘ `memory_order_seq_cst` is `preprocessorVisible: false` — correct and deliberate: these replacements are TOKENS, and the name resolves later as the shipped `constants` symbol, which cst_to_hir const-folds to the literal 5 the MIR payload wants. A preprocessor-visible constant would additionally let `#if memory_order_seq_cst` see it, which C does not sanction.",
+  "macros": [
+    { "$comment": "D-CSUBSET-ATOMIC-MONOMORPH-I32: the GENERIC (non-`_explicit`) accessors, C11/C23 §7.17.7.1-§7.17.7.3. `atomic_load`/`atomic_store` are their `_explicit` twins at seq_cst. `atomic_init` (C23 §7.17.2.1; C11 numbered it §7.17.2.2 — C23 removed `ATOMIC_VAR_INIT` and the section moved up) is spelled as an ASSIGNMENT THROUGH THE POINTER, and in DSS that assignment IS an atomic seq_cst store: this file's own $comment below states that a bare `atomic_int x; x = 5;` lowers to AtomicStore. ★★ THE SENTENCE THAT USED TO STAND HERE SAID THE OPPOSITE — that the replacement was 'DELIBERATELY a PLAIN assignment and NOT an atomic store' — and it was FALSE the day it was written: ✔MEASURED, `atomic_init(&a,5)` and `atomic_store(&b,5)` emit the BYTE-IDENTICAL `xchg` on x86_64. It is recorded rather than deleted because a comment that describes a decision the code does not implement is the artifact a future maintainer trusts. ★ THE STRONGER FORM IS CONFORMING, which is why the COMMENT moved and the lowering did not: §7.17.2.1p2 requires only that the object be initialized to `value`, and p3 says concurrent access during initialization 'constitutes a data race' — a warning to the PROGRAM, not a licence the implementation must exercise, so no conforming program can observe the extra fence. ⚠ The plain form is also not reachable from here: a macro replacement expands to an ordinary assignment EXPRESSION, and the `AtomicInitExempt` flag the verifier honours is stamped by the DECLARATION-INITIALIZER path (`_Atomic int x = 5;`), which this spelling never enters. Making `atomic_init` emit an unfenced store would take a real builtin with its own lowering; that is an OPTIMISATION, not a conformance gap, and nothing here claims otherwise.", "name": "atomic_load",  "params": ["object"], "replacement": "atomic_load_explicit(object, memory_order_seq_cst)" },
+    { "name": "atomic_store", "params": ["object", "desired"], "replacement": "atomic_store_explicit(object, desired, memory_order_seq_cst)" },
+    { "name": "atomic_init",  "params": ["object", "value"], "replacement": "((void)(*(object) = (value)))" },
+    { "name": "atomic_fetch_add", "params": ["object", "operand"], "replacement": "atomic_fetch_add_explicit(object, operand, memory_order_seq_cst)" },
+    { "name": "atomic_fetch_sub", "params": ["object", "operand"], "replacement": "atomic_fetch_sub_explicit(object, operand, memory_order_seq_cst)" },
+    { "name": "atomic_fetch_or",  "params": ["object", "operand"], "replacement": "atomic_fetch_or_explicit(object, operand, memory_order_seq_cst)" },
+    { "name": "atomic_fetch_xor", "params": ["object", "operand"], "replacement": "atomic_fetch_xor_explicit(object, operand, memory_order_seq_cst)" },
+    { "name": "atomic_fetch_and", "params": ["object", "operand"], "replacement": "atomic_fetch_and_explicit(object, operand, memory_order_seq_cst)" },
+    { "name": "atomic_exchange",  "params": ["object", "desired"], "replacement": "atomic_exchange_explicit(object, desired, memory_order_seq_cst)" },
+    { "name": "atomic_compare_exchange_strong", "params": ["object", "expected", "desired"], "replacement": "atomic_compare_exchange_strong_explicit(object, expected, desired, memory_order_seq_cst, memory_order_seq_cst)" },
+    { "name": "atomic_compare_exchange_weak",   "params": ["object", "expected", "desired"], "replacement": "atomic_compare_exchange_weak_explicit(object, expected, desired, memory_order_seq_cst, memory_order_seq_cst)" }
   ],
   "constants": [
     { "name": "memory_order_relaxed", "value": 0, "type": "i32", "preprocessorVisible": false },

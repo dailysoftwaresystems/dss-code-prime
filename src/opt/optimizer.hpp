@@ -501,12 +501,40 @@ struct OptResult {
 // convenient: an omitted table leaves the module exactly as the pipeline left it.
 // The real front end always passes its table, so the only way to reach an
 // unstripped inline definition is to build one by hand and then not declare it.
+// [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: `charIsUnsigned` is the ACTIVE
+// (target x object format)'s answer for plain `char` -- resolved ONCE by the
+// compile pipeline through `TargetSchema::charIsUnsigned(ObjectFormatKind)` and
+// relayed, never re-derived here. It exists as a separate argument rather than
+// being read off `target` because the accessor REQUIRES the object format kind,
+// which the optimizer does not carry: the same arm64 processor is unsigned under
+// GNU/Linux and signed under Darwin, so a target-only reading would be a coin
+// flip. Reaches `ConstFold`, whose `intKindInfo`/`normalizeToType` need it.
+// `nullopt` (every hand-built MIR fixture) makes a `char` fold refuse rather
+// than pick a sign -- a missed fold, never a wrong constant.
 [[nodiscard]] DSS_EXPORT OptResult optimize(Mir& mir,
                                             TargetSchema const& target,
                                             TypeInterner const& interner,
                                             OptPipeline const& pipeline,
                                             DiagnosticReporter& reporter,
                                             std::span<ExternImport const>
-                                                externImports = {});
+                                                externImports = {},
+                                            std::optional<bool>
+                                                charIsUnsigned = std::nullopt,
+                                            // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING:
+                                            // the ACTIVE object format's DECLARED
+                                            // set of definition bindings this
+                                            // artifact's LOADER may replace with
+                                            // another image's body. Relayed to the
+                                            // Inlining leaf, which must not splice a
+                                            // body the loader may not run — the
+                                            // load-time half of gate rule 2. It
+                                            // rides a parameter for the SAME reason
+                                            // `charIsUnsigned` does: the MIR
+                                            // optimizer carries neither a target nor
+                                            // a format of its own. EMPTY (every
+                                            // format that declares none) leaves
+                                            // inlining byte-identical.
+                                            std::span<SymbolBinding const>
+                                                preemptibleDefinitionBindings = {});
 
 } // namespace dss::opt

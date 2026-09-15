@@ -177,6 +177,14 @@ struct Run {
     return out;
 }
 
+// The emitted stream, for a failure message that says what was produced rather
+// than only what was expected.
+[[nodiscard]] std::string hex(std::vector<std::uint8_t> const& b) {
+    std::string out;
+    for (auto const v : b) out += std::format("{:02X} ", v);
+    return out;
+}
+
 [[nodiscard]] std::unique_ptr<Run>
 runOn(std::shared_ptr<GrammarSchema> dialect,
       std::shared_ptr<TargetSchema>  target,
@@ -273,20 +281,72 @@ TEST(AsmClassScopedModifiers, EveryFpLetterParsesAndPassesTheClassCheckOnAnFpOpe
     }
 }
 
-// The `q` letter states 128 bits — the one width whose consumption the
+// The `q` letter states 128 bits, and the message naming 128 is what proves
+// the letter's declared width arrived — a letter that silently decayed to 64
+// would sail through on the `mov` this template writes.
+//
+// ⚠⚠ THE TIER THAT REFUSES IT MOVED ON 2026-09-02, AND SO DID THE SPELLING
+// THIS ARM LOOKS FOR. It used to read *the one width whose consumption the
 // pipeline refuses today, BY NAME, at the template translator's width-flag
-// map. The message naming 128 is what proves the letter's declared width
-// arrived, since a letter that silently decayed to 64 would sail through.
+// map*, and looked for `"128 bits"`. That map gained a `case 128:` in cycle
+// P54 (D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME),
+// because `arm64.target.json` grew width-128 SIMD arms and a lane arrangement
+// can now reach them — so 128 is a width the translator carries.
+//
+// ⚠⚠ AND THEN THE SECOND HALF OF THAT REPLACEMENT WENT FALSE THE SAME DAY,
+// WHICH IS THE FINDING RATHER THAN AN INCONVENIENCE. It read: *no arm64
+// mnemonic takes a 128-bit operand through a `q` VIEW LETTER. The two 128-bit
+// forms that exist are SIMD and are written with a lane ARRANGEMENT (`%0.16b`),
+// so `%q0` still elects nothing.* That is a distinction THE ENGINE CANNOT MAKE:
+// an arrangement is applied as a WIDTH and a CLASS and the suffix is then gone,
+// so `%0.16b` and `%q0` reach `electOpcode` as the SAME query (fpr, 128). The
+// sentence was true only while no width-128 variant existed on a spelling a
+// view letter could reach, and it stopped being true the hour lane `av`
+// declared the SIMD register move
+// (D-ASM-ARM64-GAS-SPELLS-NO-ROUNDING-MODE-OR-VECTOR-MOVE). The whole class is
+// anchored at [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]] — DSS
+// now accepts `mov q0, q1`, which GNU as 2.42 and clang 18.1.3 both REJECT.
+//
+// ⚠⚠ AND THE PARAGRAPH ABOVE PREDICTED ITS OWN THIRD REPLACEMENT, WHICH
+// LANDED ON 2026-09-02 (cycle P54, lane `ae`). It says the `%0.16b` / `%q0`
+// collapse *is a distinction THE ENGINE CANNOT MAKE*. The engine makes it now:
+// an arrangement carries its LANE WIDTH into election and the target says, per
+// field, whether that field reads its register as a vector of lanes
+// ([[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]]). `move_bytes` reads
+// lanes on both ends, a `q` VIEW LETTER states none, and `mov q0, q1` is
+// therefore refused here exactly as GNU as 2.42 and clang 18.1.3 refuse it.
+//
+// ★ WHAT THIS ARM ACTUALLY OWNS IS THE LETTER'S WIDTH, and it is still measured
+// in BYTES rather than in a message — over a width-128 instruction that is
+// genuinely SCALAR, which is what a view letter names. ✔MEASURED, gas 2.42 and
+// clang 18.1.3 agreeing: `ldr q0, [x1, #16]` = 0x3DC00420 against the 64-bit
+// `ldr d0, [x1, #16]` = 0xFD400820. The binding width is 64 throughout, so ONLY
+// the letter can produce the 128, and a letter that silently decayed to 64
+// would elect `fldr_u`'s D arm and emit the second word.
 TEST(AsmClassScopedModifiers, TheQLetterStatesTheFullVectorWidth) {
-    auto const r = run(kArm, "mov %q0, %q1\n",
-                       {{"%0", "v0", LirRegClass::FPR, 64},
-                        {"%1", "v1", LirRegClass::FPR, 64}});
+    auto const r = run(kArm, "ldr %q0, [x1, #16]\n",
+                       {{"%0", "v0", LirRegClass::FPR, 64}});
     ASSERT_TRUE(r->parsed) << messages(*r);
-    EXPECT_FALSE(r->ok)
-        << "a 128-bit operation elected a variant — no shipped arm64 mnemonic "
-           "declares one";
-    EXPECT_NE(messages(*r).find("128 bits"), std::string::npos)
-        << "the refusal must name the letter's width: " << messages(*r);
+    ASSERT_TRUE(r->ok) << messages(*r);
+    ASSERT_GE(r->bytes.size(), 4u) << hex(r->bytes);
+    auto const word = static_cast<std::uint32_t>(r->bytes[0])
+                    | (static_cast<std::uint32_t>(r->bytes[1]) << 8)
+                    | (static_cast<std::uint32_t>(r->bytes[2]) << 16)
+                    | (static_cast<std::uint32_t>(r->bytes[3]) << 24);
+    EXPECT_EQ(word, 0x3DC00420u)
+        << "the `q` letter must state 128 and elect LDR Qt; 0xFD400820 would "
+           "mean it decayed to the 64-bit view: " << hex(r->bytes);
+
+    // ★ AND THE SPELLING THIS ARM USED TO DRIVE IS NOW REFUSED — the letter
+    // still answers 128, and 128 on `move_bytes` is a LANE form no view letter
+    // names. Both references refuse `mov q0, q1` (✔MEASURED).
+    auto const laneForm = run(kArm, "mov %q0, %q1\n",
+                              {{"%0", "v0", LirRegClass::FPR, 64},
+                               {"%1", "v1", LirRegClass::FPR, 64}});
+    ASSERT_TRUE(laneForm->parsed) << messages(*laneForm);
+    EXPECT_FALSE(laneForm->ok)
+        << "`mov q0, q1` assembled, and gas 2.42 and clang 18.1.3 both REJECT "
+           "it";
 }
 
 // ══ R8: A GPR LETTER ON AN FP OPERAND IS REFUSED NAMING THE FP LETTERS ════

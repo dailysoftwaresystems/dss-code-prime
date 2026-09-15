@@ -105,3 +105,38 @@ target_include_directories(
 # directly rather than through a preprocess run.
 dss_add_test(NAME analysis/preprocess/test_skipped_group_not_otherwise_processed
              SOURCES test_skipped_group_not_otherwise_processed.cpp)
+
+# [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]: the include PRE-SCAN's macro state IS
+# the authoritative `MacroExpander`, hosted as an oracle — so the guard that
+# decides whether a quote-`#include` is spliced is evaluated by the same engine
+# that will re-evaluate it authoritatively, and a function-like macro in that
+# guard no longer turns legal C into a hard refusal. A separate binary rather
+# than more cases in test_preprocessor.cpp because every arm here needs a REAL
+# HEADER ON DISK reached through an InsideRepo ScratchDir made the process cwd —
+# a quote-include resolution is not observable any other way — while that file's
+# fixtures preprocess in-memory buffers with no include path at all. Same split,
+# same reason, as test_pragma_once_include_dedup beside it.
+dss_add_test(NAME analysis/preprocess/test_prescan_macro_oracle
+             SOURCES test_prescan_macro_oracle.cpp)
+target_include_directories(
+    dss_analysis_preprocess_test_prescan_macro_oracle
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# [[D-CSUBSET-COMPILER-FEATURE-QUERY-OPERATORS]]: the feature-query operator
+# family (`__has_attribute` / `__has_builtin` / `__has_feature` /
+# `__has_extension`, against the three C23 conditional-inclusion operators that
+# ARE implemented) pinned as ONE enumeration — visibility tracks implementation,
+# the portable `#ifndef` shim still installs, an UNDECLARED capability answers 0
+# rather than 1, the `#define` refusal covers exactly the C23 6.10.10p2 names,
+# and an unshimmed query fails LOUD instead of answering 0 in silence. A separate
+# binary rather than more cases in test_preprocessor.cpp because those five are
+# halves of a single invariant whose JOINT reading is the guard — split across a
+# 10k-line file, a later cycle can satisfy one and break another unnoticed — and
+# because the pre-scan arm needs a real header on disk reached through an
+# InsideRepo ScratchDir made the process cwd, which that file's in-memory
+# fixtures cannot express. Same split, same reason, as test_prescan_macro_oracle.
+dss_add_test(NAME analysis/preprocess/test_feature_query_operator_family
+             SOURCES test_feature_query_operator_family.cpp)
+target_include_directories(
+    dss_analysis_preprocess_test_feature_query_operator_family
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests)

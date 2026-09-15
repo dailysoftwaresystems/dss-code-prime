@@ -1,6 +1,7 @@
 #include "link/format/macho.hpp"
 #include "link/format/object_format_backends.hpp"
 
+#include "core/crypto/sha256.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
 #include "link/format/dwarf_cfi.hpp"
@@ -9,6 +10,7 @@
 #include "link/format/interior_block_symbol_va.hpp"
 #include "link/format/macho_chained_fixups.hpp"
 #include "link/format/macho_indirect_symbols.hpp"
+#include "link/format/macho_symtab_bands.hpp"
 #include "core/types/config_key_vocabulary.hpp"
 #include "core/types/enum_name_table.hpp"
 #include "link/format/macho_codesign.hpp"
@@ -142,6 +144,17 @@ constexpr std::int32_t  kVmProtRwx    = 7;   // R|W|X
 constexpr std::uint8_t N_EXT  = 0x01;
 constexpr std::uint8_t N_UNDF = 0x00;
 constexpr std::uint8_t N_SECT = 0x0E;
+// N_PEXT ("private extern") is Mach-O's WHOLE visibility axis: a symbol that
+// has external linkage (so a static link resolves it by name) but that no
+// other IMAGE may see. It is the Mach-O spelling of ELF's STV_HIDDEN, and the
+// READ side already lifts it (`macho_object_reader.cpp`'s `machoVisibility`
+// maps it to `SymbolVisibility::Hidden`) -- this is the WRITE side of that same
+// bit. D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL.
+constexpr std::uint8_t N_PEXT = 0x10;
+static_assert((N_PEXT & N_EXT) == 0,
+              "N_PEXT (0x10) and N_EXT (0x01) are independent n_type bits -- a "
+              "private extern sets BOTH, and folding them would publish a "
+              "hidden symbol as an ordinary export");
 
 // nlist_64.n_desc bits (<mach-o/nlist.h>). N_ALT_ENTRY declares a defined
 // symbol to be an ALTERNATE ENTRY POINT into the atom that precedes it rather
@@ -181,6 +194,28 @@ constexpr std::uint16_t N_ALT_ENTRY = 0x0200;
 // flags. Setting MH_WEAK_DEFINES on an MH_OBJECT would state a fact about a
 // linked image that this file is not, and no reference encoder does it.
 constexpr std::uint16_t N_WEAK_DEF  = 0x0080;
+// N_WEAK_REF declares an UNDEFINED symbol to be a weak REFERENCE: the image may
+// be built and run with nothing defining it, in which case its address is 0.
+// It is the whole of Mach-O's weak-IMPORT machinery at the relocatable tier --
+// a different fact from N_WEAK_DEF above, on a different symbol (an N_UNDF one),
+// and the two are adjacent bits in the SAME field, which is exactly why they are
+// declared side by side here rather than one of them being introduced at its use
+// site. D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE.
+//
+// ⓘ 0x0040, and the value is not guessed: `<mach-o/nlist.h>` from the installed
+// MacOSX.sdk gives `#define N_WEAK_REF 0x0040 /* symbol is weak referenced */`
+// immediately above the N_WEAK_DEF line already quoted at that constant, and the
+// same header is what fixed 0x0080 there.
+// ✔MEASURED 2026-09-02, clang 18.1.3 `--target=arm64-apple-macos` on
+// `extern int ea __attribute__((weak)); int main(void){ if (&ea) return ea;
+// return 42; }`: `llvm-nm -m` reads `(undefined) weak external _ea`, where DSS
+// before this change read `(undefined) external _ea` with `Flags [ (0x0) ]`.
+constexpr std::uint16_t N_WEAK_REF  = 0x0040;
+static_assert(N_WEAK_REF != N_WEAK_DEF,
+              "N_WEAK_REF (0x0040) and N_WEAK_DEF (0x0080) are different "
+              "n_desc bits -- conflating them would publish a weak REFERENCE "
+              "as a weak DEFINITION of nothing, and an undefined symbol "
+              "carrying N_WEAK_DEF is not a shape any reference encoder emits");
 static_assert(N_WEAK_DEF != N_ALT_ENTRY,
               "N_WEAK_DEF (0x0080) and N_ALT_ENTRY (0x0200) are different "
               "n_desc bits -- conflating them would mark every weak "
@@ -242,6 +277,93 @@ void appendNlist64(std::vector<std::uint8_t>& out, std::uint32_t nStrx,
     out.insert(out.end(), rec.begin(), rec.end());
 }
 
+// ── The n_type / n_desc of a DEFINED symbol, from ONE binding decision ─
+//
+// D-LK-OBJECT-WEAK-DEF-RELOCATABLE. A WEAK DEFINITION is `N_SECT|N_EXT`
+// with N_WEAK_DEF set in n_desc — that bit IS the mechanism at the
+// relocatable tier, and the ONE shared, format-neutral `definedBinding`
+// decision is what selects it, so no `if(format)` leaks into the substrate:
+// each writer maps the same `SymbolBinding` to its own vocabulary (COFF
+// spells the same fact as a COMDAT select-any section; ELF as STB_WEAK).
+//
+// The n_desc bits for a DEFINED symbol, given its binding. Kept as one
+// function rather than open-coded at the function and data sites, because
+// those two sites drifting apart is precisely the defect
+// D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION was.
+[[nodiscard]] constexpr std::uint16_t
+definedNDesc(SymbolBinding binding) noexcept {
+    return binding == SymbolBinding::Weak ? N_WEAK_DEF : std::uint16_t{0};
+}
+// The n_type for a DEFINED symbol, given the SAME binding `definedNDesc`
+// reads -- the N_EXT half of the one decision whose n_desc half sits above.
+// ONE mapping, EVERY call site (the MH_OBJECT function, data and alias rows,
+// and BOTH image arms' defined bands), for the reason `definedNDesc` is one
+// function: the ELF writer states the identical fact through
+// `stbForBinding`, and open-coded ternaries are how the name/binding pair
+// drifts (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION was
+// exactly that drift, and D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT was the
+// image tier hardcoding `N_SECT|N_EXT` beside a mapping that already knew
+// better). File-scope, so the image arms cannot grow a private copy.
+//
+// ★★ IT READS BOTH AXES, because Mach-O spells them in the SAME field.
+// D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL: a symbol with external
+// linkage that no other IMAGE may see is `N_SECT|N_EXT|N_PEXT`, and the
+// "no other image may see it" question is exactly `isExternallyVisible` over
+// the (binding, visibility) pair -- the same shared predicate the `.dynsym` /
+// export-trie gates use, kept here rather than a Mach-O-private visibility
+// enum. ✔MEASURED 2026-09-05, clang 18.1.3 `-target arm64-apple-macos11 -c
+// -O0`, ONE object carrying all three visibilities plus two CONTROLS
+// (`llvm-nm -m`): `visibility("hidden")` and `("internal")` are BOTH `private
+// external`; `("protected")` is a plain `external`; the `static` CONTROL is
+// `non-external`; the plain extern-linkage CONTROL is `external`. So the bit
+// is set for exactly the pairs `isExternallyVisible` calls false, and
+// `protected` -- which that predicate calls externally visible -- correctly
+// gets no bit, matching clang without a fourth enumerator anywhere in Mach-O.
+[[nodiscard]] constexpr std::uint8_t
+definedNType(SymbolBinding binding, SymbolVisibility visibility) noexcept {
+    if (binding == SymbolBinding::Local) return N_SECT;
+    return isExternallyVisible(binding, visibility)
+               ? static_cast<std::uint8_t>(N_SECT | N_EXT)
+               : static_cast<std::uint8_t>(N_SECT | N_EXT | N_PEXT);
+}
+
+// ── A PRIVATE EXTERN DOES NOT SURVIVE INTO AN IMAGE ───────────────────────
+//    D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL
+//
+// N_PEXT is a RELOCATABLE-tier statement — "external now, make me local when
+// you build the image" — and ld64 performs exactly that conversion. So the
+// image arms fold a private extern to `SymbolBinding::Local` BEFORE choosing
+// its band and its n_type: it lands in the LOCAL band as a bare `N_SECT`,
+// keeping its real name (`imageName` never carved it), and it is absent from
+// the export set (which `isExternallyVisible` already gates). An N_PEXT record
+// in the externally-defined band would additionally be REFUSED by
+// `machoDysymtabBandBreach`, and rightly — the bands are read by index range.
+//
+// ✔MEASURED 2026-09-05 on the operator's Mac (Apple clang 21.0.0 + its ld64),
+// one source, CONTROLS in the same artifact, `nm -m`:
+//   * the `.o`: `_vis_lead` is `private external`; the `static` CONTROL is
+//     `non-external`; the plain extern-linkage CONTROLS are `external`.
+//   * the linked exec at -O0 AND -O2, and a `-dynamiclib`: `_vis_lead` reads
+//     `non-external (was a private external)` -- ld64's own wording for this
+//     fold -- while every CONTROL keeps the class it had.
+//   * `nm -gU` over the dylib lists `_main`, `_plain_global`, `_use` and NOT
+//     `_vis_lead`, so the export set agrees.
+//
+// ★ THIS IS THE `imageName`/`definedName` TIER SPLIT ONE FIELD OVER, not a
+// format branch: the question a FINAL image's symbol table answers is "may
+// another image see this", which is `isExternallyVisible` -- the same shared
+// predicate the export trie uses. The relocatable tier answers a different
+// question (what a static link may resolve by name) and therefore keeps the
+// full two-axis fact. ELF legitimately differs here and does NOT fold: gcc and
+// clang both keep a called hidden function `FUNC GLOBAL HIDDEN` in a linked
+// executable's `.symtab`, because ELF's `st_other` can still say `HIDDEN`
+// where Mach-O's n_type has nowhere to put it.
+[[nodiscard]] constexpr SymbolBinding
+imageDefinedBinding(SymbolBinding binding, SymbolVisibility visibility) noexcept {
+    return isExternallyVisible(binding, visibility) ? binding
+                                                    : SymbolBinding::Local;
+}
+
 // ── Fixed-width name field (16 chars, NUL-padded) ──────────────
 
 void appendName16(std::vector<std::uint8_t>& out, std::string_view name) {
@@ -274,9 +396,25 @@ constexpr std::uint32_t LC_LOAD_DYLIB     = 0x0C;
 constexpr std::uint32_t LC_ID_DYLIB       = 0x0D;
 constexpr std::uint32_t LC_DYLD_INFO_ONLY      = 0x80000022u;  // |= LC_REQ_DYLD
 constexpr std::uint32_t LC_DYLD_CHAINED_FIXUPS = 0x80000034u;  // |= LC_REQ_DYLD — D-LK6-14
+// LC_DYLD_EXPORTS_TRIE — the export trie's OWN linkedit_data_command, used
+// when LC_DYLD_INFO_ONLY is absent because the image binds through chained
+// fixups. ✔MEASURED 2026-09-05 against the installed MacOSX.sdk on Apple
+// Silicon: `#define LC_DYLD_EXPORTS_TRIE (0x33 | LC_REQ_DYLD)` with the
+// comment "used with linkedit_data_command, payload is trie" — the value and
+// the shape both read off Apple's own header rather than recalled.
+// D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE.
+constexpr std::uint32_t LC_DYLD_EXPORTS_TRIE   = 0x80000033u;  // |= LC_REQ_DYLD
 constexpr std::uint32_t LC_DYSYMTAB            = 0x0B;
 constexpr std::uint32_t LC_CODE_SIGNATURE = 0x1D;
 constexpr std::uint32_t LC_BUILD_VERSION  = 0x32;  // build_version_command
+// ── D-LK-MACHO-EMITS-NO-LC-UUID ──
+// `uuid_command` (<mach-o/loader.h>): cmd / cmdsize / uuid[16] = 24 bytes.
+// The image's IDENTITY — what a crash reporter, a `dSYM` bundle and `atos` match
+// a binary against its symbols by. dyld's own diagnostic prints `<no uuid>` for
+// an image that carries none, which is where this defect was measured.
+constexpr std::uint32_t LC_UUID           = 0x1Bu;
+constexpr std::size_t   kUuidCommandSize  = 24;
+constexpr std::size_t   kUuidPayloadSize  = 16;
 // linkedit_data_command shape (16 bytes): cmd / cmdsize / dataoff /
 // datasize. Both LC_CODE_SIGNATURE and LC_DYLD_CHAINED_FIXUPS use
 // this exact layout — the alias documents the shared shape so
@@ -298,6 +436,11 @@ constexpr std::size_t   kBuildVersionCommandSize = 24;
 static_assert(kCodeSigCommandSize == kLinkeditDataCommandSize,
               "linkedit_data_command shape is wire-frozen at 16 bytes; "
               "both LC_CODE_SIGNATURE and LC_DYLD_CHAINED_FIXUPS use it.");
+// LC_DYLD_EXPORTS_TRIE is the THIRD user of the same wire shape (✔MEASURED
+// off <mach-o/loader.h>: "used with linkedit_data_command, payload is trie").
+// It reuses `kLinkeditDataCommandSize` rather than minting a fourth name —
+// the constant already carries the shape's docblock, and a per-LC alias for
+// a shape three commands share is where the sizes start to drift.
 constexpr std::uint64_t kLoadCmdAlign     = 8;  // pad LCs to 8 bytes
 // D-LINK-MACHO-LINKEDIT-SYMTAB-MISALIGNED: every blob inside a FINAL IMAGE's
 // __LINKEDIT must START on a pointer-sized boundary — 8 on every 64-bit
@@ -314,6 +457,22 @@ constexpr std::uint64_t kLoadCmdAlign     = 8;  // pad LCs to 8 bytes
 // the writer — the cursor arithmetic and the byte emission — and the two are
 // cross-checked loud (see `linkeditOverrunBlob` in encodeExecDynamic).
 constexpr std::uint64_t kLinkeditBlobAlign = 8;
+// D-LINK-MACHO-OBJECT-SYMTAB-MISALIGNED: the same rule, one tier down. An
+// MH_OBJECT carries no __LINKEDIT, so dyld's validator never runs on it and
+// the misalignment was ✔MEASURED HARMLESS (Apple `cc` links and RUNS a DSS
+// `.o` whose `symoff` is ≡ 4 mod 8) — but the tables are the same records:
+// relocation_info is 8 bytes, nlist_64 carries an 8-byte `n_value`, and
+// every `.o` Apple's own toolchain writes starts each of them on an
+// address-sized boundary (✔MEASURED 2026-09-04, Apple clang 21.0.0: `symoff`
+// 696 and 624 on two arm64 objects, both ≡ 0 mod 8). The MH_OBJECT writer
+// used to pack `textRelocOffset` / `dataRelocOffset` / `relroRelocOffset` /
+// `symtabOffset` hard against the file-backed section span, so the first
+// table landed wherever the section bytes ended. ONE constant for the whole
+// trailer chain, for the reason `kLinkeditBlobAlign` is one: a laxer rule
+// for one table is how the next table appended to the chain re-opens this.
+// The string table alone needs 1 and follows a 16-byte-record table, so it
+// is aligned for free and takes no step.
+constexpr std::uint64_t kObjectTrailerAlign = kMachO64AddressSize;
 
 // Emit one `build_version_command` (LC_BUILD_VERSION, 24 bytes, ntools=0)
 // — the SINGLE chokepoint shared by both the static (encodeExec) and
@@ -330,6 +489,81 @@ void appendBuildVersionCommand(std::vector<std::uint8_t>& out,
     appendU32LE(out, bv.minOs);
     appendU32LE(out, bv.sdk);
     appendU32LE(out, 0u);  // ntools = 0 (no trailing build_tool_version)
+}
+
+// ── D-LK-MACHO-EMITS-NO-LC-UUID ─────────────────────────────────────────────
+//
+// Append the `uuid_command` with a ZEROED payload and return the byte offset of
+// those 16 payload bytes inside `out`, so the caller can stamp the derived value
+// once the whole image exists. Emitting the command EARLY (with the payload
+// deferred) is what keeps `ncmds`, `sizeofcmds` and every file offset derived
+// from them final: a command appended after layout would move the very bytes it
+// is supposed to identify.
+//
+// Shared by the static (`encodeExec`) and dynamic (`encodeExecDynamic`) arms,
+// for the reason `appendBuildVersionCommand` is: one wire layout, one writer.
+// ⚠ NOT emitted by `encodeRelocatable`, and that is a MEASURED distinction, not
+// an omission — see `stampImageUuid`.
+[[nodiscard]] std::size_t
+appendUuidCommandPlaceholder(std::vector<std::uint8_t>& out) {
+    appendU32LE(out, LC_UUID);
+    appendU32LE(out, static_cast<std::uint32_t>(kUuidCommandSize));
+    std::size_t const payloadOffset = out.size();
+    out.insert(out.end(), kUuidPayloadSize, std::uint8_t{0});
+    return payloadOffset;
+}
+
+// Derive the image's UUID FROM ITS OWN CONTENT and write it into the payload
+// `appendUuidCommandPlaceholder` reserved. `bytes` must already hold every byte
+// that will be signed — the caller calls this LAST, and before the signature.
+//
+// ★★ WHY CONTENT-DERIVED AND NEVER RANDOM. Several corpus examples compare a
+// `--config=release` artifact BYTE-FOR-BYTE, and a random UUID would make every
+// such artifact differ from itself. ✔MEASURED 2026-09-07 on Apple Silicon
+// (macOS 26.6.2, Apple clang 21.0.0, ld-1267) that this is also what the
+// reference does, and the measurement is over CONTENT rather than over "the
+// same source": one executable relinked to the SAME output path kept its UUID
+// (`b6ad2afd1823345fa56aff70fc7d363a` both times) even though the whole-file
+// md5 moved — the bytes that moved are the ad-hoc signature, which the UUID
+// hash does not cover — while a dylib linked to two DIFFERENT output names got
+// two different UUIDs, because LC_ID_DYLIB embeds the output leaf name and so
+// the CONTENT genuinely differs. A one-character source change moved it too.
+//
+// ★ THE PAYLOAD IS INSIDE THE HASHED REGION AND IS ZERO WHEN IT IS HASHED, so
+// the derivation is a fixed point rather than a self-reference: stamping cannot
+// change the digest that produced it. That is ld64's arrangement as well (it
+// excludes the uuid field and the signature from what it hashes).
+//
+// ⚠ THE DIGEST IS SHA-256 AND THE VERSION NIBBLE SAYS SO. ld64 stamps RFC 4122
+// version 3 (✔MEASURED: byte[6] high nibble is 3 on every ld64 image probed,
+// with the RFC variant bits `10` in byte[8]) because ld64 hashes with MD5. DSS
+// hashes with `dss::crypto::sha256` — the NIST-vector-verified digest this
+// repository already owns and the one the ad-hoc CodeDirectory uses — so it
+// stamps RFC 9562 version 8 (`custom`) rather than claiming a version 3 it did
+// not compute. Nothing on the platform parses the version: dyld, `codesign`,
+// `dyld_info` and `otool` all treat the field as 16 opaque bytes, and that was
+// ✔MEASURED on hardware rather than assumed.
+//
+// ⚠ LINKED IMAGES ONLY. ✔MEASURED on the same host: `clang -c` (filetype 1) and
+// `clang -r` (filetype 1) produce NO LC_UUID, while the executable (filetype 2)
+// and the dylib (filetype 6) both carry one. A UUID identifies a LINKED image
+// to a crash reporter; a relocatable object is never loaded and never appears in
+// a backtrace. `encodeRelocatable` therefore emits none, and stays byte-
+// identical to before this change.
+void stampImageUuid(std::vector<std::uint8_t>& bytes,
+                    std::size_t                payloadOffset,
+                    std::size_t                hashedLength) {
+    auto const digest = dss::crypto::sha256(
+        std::span<std::uint8_t const>{bytes.data(), hashedLength});
+    for (std::size_t i = 0; i < kUuidPayloadSize; ++i) {
+        bytes[payloadOffset + i] = digest[i];
+    }
+    // RFC 9562 §5.8: version 8 (custom) in the high nibble of octet 6, and the
+    // `10` variant in the two high bits of octet 8.
+    bytes[payloadOffset + 6] =
+        static_cast<std::uint8_t>((bytes[payloadOffset + 6] & 0x0Fu) | 0x80u);
+    bytes[payloadOffset + 8] =
+        static_cast<std::uint8_t>((bytes[payloadOffset + 8] & 0x3Fu) | 0x80u);
 }
 
 // section_64.flags (S_*) — <mach-o/loader.h>
@@ -362,6 +596,46 @@ constexpr std::uint32_t S_THREAD_LOCAL_VARIABLES   = 0x13;
 // `_tlv_bootstrap_error`→abort on native execution). clang sets this bit iff the
 // image has thread-locals; this writer ORs it into the header flags when hasTls.
 constexpr std::uint32_t MH_HAS_TLV_DESCRIPTORS     = 0x00800000u;
+
+// ── THE TWO HEADER BITS OF A MACH-O *IMAGE*'S WEAK-DEFINITION MACHINERY ────
+//    D-LK3-DYLIB-WEAK-EXPORT.
+//
+// An MH_OBJECT states a weak definition with N_WEAK_DEF alone and touches no
+// header flag (see that constant's docblock): ld64 resolves it at STATIC-LINK
+// time. A final linked IMAGE is different — dyld coalesces weak definitions
+// ACROSS images at LOAD time, and it only does so for an image whose header
+// says to. These bits are that statement, and like MH_HAS_TLV_DESCRIPTORS
+// above they are CONTENT-DERIVED per module, never copied from the schema's
+// `MachOIdentity::flags` and never a config switch.
+//
+// ✔MEASURED 2026-09-05 on the operator's Apple Silicon host (macOS 26.6.2
+// 25G83, Apple clang 21.0.0 / ld-1267, arm64), values read from the installed
+// MacOSX.sdk `<mach-o/loader.h>`: `MH_WEAK_DEFINES 0x8000`,
+// `MH_BINDS_TO_WEAK 0x10000`.
+//
+// ★★ BOTH BITS COME FROM *ONE* FACT — THE IMAGE CONTAINS A WEAK DEFINITION —
+// AND THAT IS A MEASUREMENT, NOT AN ECONOMY. The obvious reading of the second
+// bit's name ("uses weak symbols") is that it tracks REFERENCES, so an image
+// that defines a weak function without calling it would carry only the first.
+// ✔MEASURED FALSE, three arms of one probe against one weak-free control, all
+// four built from the same source by the same clang:
+//   * no weak anything            -> flags 0x00200085, weak_bind_size 0
+//   * weak def, REFERENCED        -> flags 0x00218085, weak_bind_size 16
+//   * weak def, NEVER referenced  -> flags 0x00218085, weak_bind_size 0
+// ld64 sets both bits on the DEFINITION and leaves the weak-bind STREAM to the
+// references, so an empty stream under a set MH_BINDS_TO_WEAK is the reference
+// encoder's own shipped shape, not a half-written one. That third row is what
+// makes this writer's answer complete rather than approximate: DSS binds a
+// locally-defined symbol statically (its call sites are direct branches
+// resolved against `symbolVa`, never a `__got` slot), so it emits no weak-bind
+// entries at all — exactly the third row, which is a shape ld64 ships.
+constexpr std::uint32_t MH_WEAK_DEFINES            = 0x00008000u;
+constexpr std::uint32_t MH_BINDS_TO_WEAK           = 0x00010000u;
+static_assert(MH_WEAK_DEFINES != MH_BINDS_TO_WEAK,
+              "MH_WEAK_DEFINES (0x8000) and MH_BINDS_TO_WEAK (0x10000) are "
+              "different mach_header_64.flags bits -- conflating them would "
+              "advertise half of the coalescing contract");
+
 // Each `tlv_descriptor` is 3 native words (thunk / key / offset).
 constexpr std::uint64_t kTlvDescriptorSize         = 24;
 // The on-disk symbol every TLV descriptor's word0 binds to: the libSystem
@@ -400,6 +674,29 @@ constexpr std::uint8_t BIND_OPCODE_SET_ADDEND_SLEB                = 0x60;
 constexpr std::uint8_t BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB    = 0x70;
 constexpr std::uint8_t BIND_OPCODE_DO_BIND                        = 0x90;
 constexpr std::uint8_t BIND_TYPE_POINTER                          = 1;
+
+// ── D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING ────────────────────────
+//
+// `BIND_SPECIAL_DYLIB_WEAK_LOOKUP` (<mach-o/loader.h>): the CHAINED-fixups
+// spelling of "resolve this name from the loader's weak-definition coalescing
+// scope" — every loaded image, not one named dylib. `dyld_info -fixups`
+// renders it `<weak-def-coalesce>`.
+//
+// ⚠ IT IS THE CHAINED SPELLING ONLY, AND THAT DISTINCTION IS MEASURED, not
+// inferred from the header. ✔MEASURED 2026-09-06 on Apple Silicon (macOS
+// 25.6.0, Apple clang 21.0.0 / ld-1267): a dylib calling its own weak
+// definition, built the modern way, carries LC_DYLD_CHAINED_FIXUPS and
+// `dyld_info -fixups` prints `__DATA_CONST __got 0x4000 bind
+// <weak-def-coalesce>/_w`. The SAME source built `-Wl,-no_fixup_chains`
+// carries LC_DYLD_INFO_ONLY with `bind_size 0` and `weak_bind_size 16` — the
+// reference moves to a SEPARATE STREAM that carries NO ordinal at all, because
+// the weak stream *is* the coalescing scope. So a legacy image does not get a
+// special ordinal; it gets `appendWeakBindEntry` below. Conflating the two
+// would emit an ordinal opcode into a stream that has no ordinal field.
+//
+// The field is a SIGNED 8-bit `lib_ordinal` in `dyld_chained_import`; -3 is
+// its value there.
+constexpr std::int8_t kBindSpecialDylibWeakLookup = -3;
 
 // dyld REBASE opcodes (<mach-o/loader.h>) — the legacy LC_DYLD_INFO_ONLY
 // rebase stream. A PIE image (MH_PIE) is mapped at a random slide; dyld must
@@ -646,6 +943,42 @@ appendULEB128(std::vector<std::uint8_t>& out, std::uint64_t v) {
     } while (v != 0);
 }
 
+// ── D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING ────────────────────────
+//
+// ONE entry of the LC_DYLD_INFO_ONLY *weak bind* stream: the legacy encoding of
+// "resolve `symbol` from the loader's coalescing scope and store the winner in
+// this slot". Byte-for-byte the shape Apple's ld64 emits — ✔MEASURED on Apple
+// Silicon, `clang -dynamiclib -Wl,-no_fixup_chains` over a dylib calling its
+// own weak definition, whose whole 16-byte weak stream reads
+// `40 5f 77 00 51 71 00 90 00 …` = these four opcodes plus DONE and padding.
+//
+// ★ THERE IS NO DYLIB ORDINAL HERE, AND ITS ABSENCE IS THE MECHANISM. Every
+// entry of the REGULAR bind stream opens with SET_DYLIB_ORDINAL, naming the one
+// library dyld must ask; a weak-stream entry names none, so dyld searches every
+// image that publishes a weak definition of that name and writes the winner.
+// That is exactly the question a call inside a dylib to its own preemptible
+// definition has to ask, and the reason this could not be expressed as another
+// ordinal in the stream the walker already had.
+//
+// The caller terminates the stream with BIND_OPCODE_DONE once, after the last
+// entry — DONE per entry would end the stream at the first one.
+inline void
+appendWeakBindEntry(std::vector<std::uint8_t>& out,
+                    std::string_view symbol,
+                    std::uint32_t segmentIndex,
+                    std::uint64_t segmentOffset) {
+    out.push_back(static_cast<std::uint8_t>(
+        BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | 0));
+    for (char c : symbol) out.push_back(static_cast<std::uint8_t>(c));
+    out.push_back(0);   // NUL terminator
+    out.push_back(static_cast<std::uint8_t>(
+        BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER));
+    out.push_back(static_cast<std::uint8_t>(
+        BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (segmentIndex & 0x0Fu)));
+    appendULEB128(out, segmentOffset);
+    out.push_back(BIND_OPCODE_DO_BIND);
+}
+
 // SLEB128 encoder — BIND_OPCODE_SET_ADDEND_SLEB carries a SIGNED
 // addend (c153, the extern-addr data-slot bind arm).
 inline void
@@ -685,7 +1018,8 @@ appendSLEB128(std::vector<std::uint8_t>& out, std::int64_t v) {
 // where `imageOffset` is the exported symbol's VA minus the image's
 // mach_header VA (== __TEXT.vmaddr; 0 for the base-0 dylib layout)
 // and `flags` = EXPORT_SYMBOL_FLAGS_KIND_REGULAR (0) for both code
-// and data exports.
+// and data exports, OR'd with EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION
+// when the export is a WEAK definition (see that constant).
 //
 // The trie MUST be a real prefix (radix) trie — a flat root listing
 // full-name edges is INVALID whenever one export name is a strict
@@ -697,6 +1031,17 @@ appendSLEB128(std::vector<std::uint8_t>& out, std::int64_t v) {
 // edges share a first byte — the property that makes dyld's greedy
 // first-match walk deterministic. Children are emitted sorted by edge
 // so the bytes are deterministic (ld64 sorts too).
+// The trie terminal's half of a Mach-O image's weak-definition machinery
+// (D-LK3-DYLIB-WEAK-EXPORT). dyld's coalescing pass reads the EXPORT TRIE, not
+// the nlist, so this bit — not N_WEAK_DEF — is what makes one of several
+// definitions of a name collapse to one at load time.
+// ✔MEASURED 2026-09-05 from the installed MacOSX.sdk `<mach-o/loader.h>`:
+// `EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION 0x04`, which sits ABOVE the two-bit
+// EXPORT_SYMBOL_FLAGS_KIND_MASK (0x03) this writer leaves at
+// EXPORT_SYMBOL_FLAGS_KIND_REGULAR (0) — so the two OR together with no
+// overlap, and `dyld_info -exports` renders the result `<name> [weak-def]`.
+constexpr std::uint64_t EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION = 0x04;
+
 struct ExportTrieNode {
     bool          terminal    = false;
     std::uint64_t flags       = 0;   // EXPORT_SYMBOL_FLAGS_* (0=regular)
@@ -872,55 +1217,235 @@ encodeExportTrie(std::vector<ExportTrieNode>& nodes,
 
 namespace {
 
-// ── A WEAK DEFINITION CANNOT BE STATED ON A MACH-O *IMAGE* NLIST ──────────
+// ── A MACH-O *IMAGE* STATES A WEAK DEFINITION WITH FOUR FACTS, NOT ONE ────
 //
-// D-LK3-DYLIB-WEAK-EXPORT, extended from the dylib export trie to BOTH image
-// nlist arms. The two arms used to answer this question differently and by
-// accident: the dylib was covered because the export trie refuses a WEAK
-// `ModuleSymbol` row before the nlist is ever built, while a DYNAMIC EXEC
-// builds no trie -- so a weak ALIAS reached the nlist and was written
-// `N_SECT|N_EXT`, n_desc 0, i.e. SILENTLY STRONG. One answer now, given by
-// both arms.
+// D-LK3-DYLIB-WEAK-EXPORT, CLOSED here and in the two sites this docblock
+// names. An MH_OBJECT says "weak" with N_WEAK_DEF alone and touches no header
+// flag, because ld64 resolves it at STATIC-LINK time. A final linked IMAGE
+// says it with FOUR facts, because dyld coalesces ACROSS images at LOAD time
+// and each fact is read by a different consumer:
+//   (1) `N_WEAK_DEF` in n_desc               — `nm`, `strip`, `lldb`, ld64
+//       (emitted through the shared `definedNDesc`, in `appendImageDefinedBands`);
+//   (2) `EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION` on the export-trie terminal
+//       — DYLD'S COALESCING PASS, which reads the trie and never the nlist;
+//   (3) `MH_WEAK_DEFINES | MH_BINDS_TO_WEAK` in the mach header — dyld's
+//       decision to run that pass on this image at all;
+//   (4) the weak-bind stream — the image's OWN references to the coalesced
+//       symbol, and ONLY those (see the MH_WEAK_DEFINES docblock: a weak
+//       definition that the image never routes through a `__got` slot ships
+//       under ld64 with both header bits and an EMPTY weak-bind stream, which
+//       is exactly the shape this writer produces).
+// Emitting (1) alone would state a fact no loader acts on; emitting NONE of
+// them — which is what the exec arms did for a weak canonical — published the
+// definition as STRONG and silently changed cross-image coalescing. The dylib
+// arm did not publish it at all: it REFUSED, because half the machinery is
+// the one outcome worse than none.
 //
-// ★ WHY REFUSE RATHER THAN EMIT N_WEAK_DEF, and the argument is a measurement
-// that is already in this file. The OBJECT tier emits N_WEAK_DEF freely and
-// deliberately touches no header flag (see the N_WEAK_DEF constant's docblock)
-// -- because an MH_OBJECT's weak definition is resolved by ld64 at STATIC-LINK
-// time. An IMAGE's is not: dyld coalesces weak definitions ACROSS images, and
-// the header must say so. ✔MEASURED there on real Apple Silicon: the linked
-// exec built from a weak `.o` reads header flags `0x00218085` while its
-// weak-free control reads `0x00200085` -- the difference is MH_WEAK_DEFINES
-// (0x8000), which `<mach-o/loader.h>` documents as a property of "the final
-// linked image". These writers copy `MachOIdentity::flags` verbatim from the
-// schema and never set that bit, so emitting N_WEAK_DEF here would state HALF
-// the fact -- a weak definition no loader was told to coalesce. Emitting it
-// strong instead silently changes cross-image coalescing semantics, which is
-// the exact outcome D-LK3-DYLIB-WEAK-EXPORT exists to prevent. So the honest
-// answer is the loud one, and it names the anchor that has to close before the
-// capability can exist.
+// ★ WHAT THE REFUSAL WAS HIDING, checked before it was deleted rather than
+// after (the `asm goto` precedent: a refusal can mask a second defect). It
+// stood in front of the ALIAS rows only, and the sweep behind it found the
+// second half: `appendImageDefinedBands` wrote a hard-coded `/*n_desc=*/0`
+// into EVERY image nlist record, canonical and alias alike, so
+// `definedNDesc`'s answer — the one shared, format-neutral binding decision
+// the MH_OBJECT arm has read since D-LK-OBJECT-WEAK-DEF-RELOCATABLE — never
+// reached the image tier at all. The refusal made that unobservable on the
+// alias rows and left it live on the canonicals. Both are fixed by passing
+// the shared answer through; the band builder spells no `0` there any more.
 //
-// ⚠ SCOPE, STATED RATHER THAN IMPLIED: this covers the ALIAS rows. A weak
-// CANONICAL reaching an exec arm has the identical silent downgrade and is NOT
-// refused here -- that is the pre-existing reach of
-// D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT (the image tier drops the
-// canonical's binding by design), and widening it would newly refuse inputs a
-// macOS corpus leg may be compiling green today, which no gate reachable from
-// this host can witness. That is a decision to take with the leg in view, not
-// a rider on an alias fix.
-[[nodiscard]] inline bool
-refuseWeakImageAlias(ModuleSymbol const& alias, char const* where,
-                     DiagnosticReporter& reporter) {
-    if (alias.binding != SymbolBinding::Weak) return true;
+// ★ WHY THE CAPABILITY AND NOT A WIDER REFUSAL, which is the choice the
+// previous cycle deliberately left open. ✔MEASURED 2026-09-04 and re-confirmed
+// 2026-09-05: of the 9 corpus examples defining a weak function, exactly ONE
+// carries a weak canonical as far as the image writer —
+// `examples/c/attributes_syntax` (`_weak_helper`) — and it is BUILT for
+// `arm64:macho64-arm64-darwin-exec` on every host and RUNS on darwin (rc 42),
+// while Apple clang/ld64 build and run the same source. Widening the refusal
+// would have traded a working program for a loud one, which the bar forbids;
+// the remedy for a half-stated fact is to state the other half.
+//
+// ⚠ WHAT THIS WRITER STILL DOES DIFFERENTLY FROM ld64, STATED BECAUSE IT IS
+// MEASURED AND BOUNDED. ld64 routes an image's OWN references to a weak
+// definition through a `__got` slot (`dyld_info -fixups` renders it
+// `bind <weak-def-coalesce>/_weak_helper`) so the referring image also sees
+// the coalesced winner; DSS binds a locally-defined symbol statically, so its
+// references see its own body. For an EXECUTABLE the two agree by
+// construction — dyld's coalescing gives the main executable's definition
+// priority, so an exec is always its own winner (✔MEASURED: with the exec's
+// call routed through the GOT, the answer was the exec's definition whether
+// the loaded dylib's rival definition was weak or strong). For a DYLIB they
+// can differ: ld64's dylib re-reads the winner, DSS's keeps its own body.
+// That is a property of DSS's CALL LOWERING, not of the four facts above, and
+// it does not make any of them a half-truth — every OTHER image in the process
+// resolves against this one's published weak definition either way.
+// ⚠ IT IS ALSO A DEFECT WITH ITS OWN ROW, NOT A NOTE:
+// [[D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING]]. In one process a
+// DSS-built dylib's internal call and every other image's call can then reach
+// TWO DIFFERENT BODIES of one symbol, silently. The remedy is in call
+// lowering (route a call to an externally-visible WEAK definition through the
+// indirection the format already has), not here — a writer cannot decide what
+// a call was lowered to. Recorded rather than left in this comment, because a
+// comment explaining a divergence is an unfiled defect.
+
+// ── THE IMAGE nlist's DEFINED BANDS, built ONCE for both image arms ────────
+//
+// D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT. Both image arms used to stamp
+// `N_SECT|N_EXT` on EVERY defined function, so a `static` went out under its
+// real name (D-LINK-MACHO-IMAGE-SYMBOL-NAMES-REPLACED-BY-SYNTHETIC-IDS) with
+// the EXTERNAL bit set, where Apple's ld64 emits it `N_SECT` with no `N_EXT`.
+// ✔MEASURED 2026-09-04 on Apple Silicon (Apple clang 21.0.0, ld-1267, macOS
+// 25.6.0): for `static int static_helper(...)` in a linked MH_EXECUTE,
+// `nm -m -p` reads `(__TEXT,__text) non-external _static_helper` as the FIRST
+// record and LC_DYSYMTAB reads `ilocalsym 0 nlocalsym 1 iextdefsym 1`; the
+// same program through this writer read `external _static_helper` under
+// `nlocalsym 0`. ⚠ NOT an ABI leak — dyld resolves `dlsym` through the export
+// trie, which has its own `isExternallyVisible` gate — but `nm`, `strip`,
+// `lldb` and the crash reporter read the nlist, and each was told a `static`
+// was exported.
+//
+// The binding is the ONE format-neutral `definedBinding` decision — the same
+// one the MH_OBJECT writer and both ELF writers read — mapped through the
+// file-scope `definedNType` exactly as the MH_OBJECT arm maps it: a Local
+// definition (a `static`, the nameless linker-injected trampoline, a
+// synthesized symbol) is `N_SECT`; an externally visible one `N_SECT|N_EXT`.
+// No Mach-O-private notion of "local" is introduced; the image tier differs
+// from the object tier ONLY in the NAME it prints for a Local (`imageName`
+// keeps the declared name — see its docblock), never in the binding.
+//
+// ★ WHY THE ORDER CHANGES TOO, and why this could not ride on the name fix.
+// LC_DYSYMTAB describes the table as three CONTIGUOUS bands read by INDEX
+// RANGE — locals, then externally defined, then undefined — so a Local record
+// must sort FIRST or `ilocalsym`/`nlocalsym` cannot name it. The bands are
+// emitted here in that order: one pass appends every Local canonical, a
+// second every image-external canonical followed by its alias rows (an
+// alias has external linkage by `definedAliases`' own predicate, so unless it
+// is a PRIVATE extern -- folded to Local by `imageDefinedBinding` -- it can
+// only belong to the second band, and it follows its canonical either way.
+// The undefined band is
+// the caller's; only the dynamic arm has one. Within a band the order is
+// `module.functions` order, deliberately NOT ld64's by-name sort: every
+// `__stubs`/`__got` indirect-symbol index is `numDefs + <extern index>`, and
+// a sort that permuted the undefined band would silently re-bind every stub.
+// `numLocals` is READ BACK off the bytes the first pass wrote, never
+// predicted, for the reason `numDefs` is (encodeExecDynamic step (j)), and
+// the finished table is checked against the bands it publishes through
+// `machoDysymtabBandBreach` in both arms.
+//
+// ★ AND THE n_desc COMES FROM THE SAME DECISION AS THE n_type
+// (D-LK3-DYLIB-WEAK-EXPORT). A WEAK definition — canonical or alias — is
+// `N_SECT|N_EXT` with N_WEAK_DEF set in n_desc, which is what
+// `definedNType`/`definedNDesc` have answered for the MH_OBJECT arm since
+// D-LK-OBJECT-WEAK-DEF-RELOCATABLE; this builder used to take the first half
+// and write a literal `0` for the second, which published every weak image
+// definition STRONG. Both halves of the one shared answer are passed through
+// now, so no Mach-O-private notion of "weak" exists at this tier and the two
+// image arms cannot drift from the object arm. The header bits and the
+// export-trie terminal that COMPLETE the statement are the callers' — see the
+// MH_WEAK_DEFINES docblock and the EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION one.
+//
+// ⓘ NO FAILURE MODE, AND THE SIGNATURE SAYS SO. This used to return `bool`
+// and take `where`/`reporter` for the one refusal it hosted; with the weak
+// alias now ENCODED rather than refused, every input reaches a record, so the
+// `bool` would be a value no caller could ever see false and two parameters
+// nothing reads. `void` is the honest type — a caller must not be given a
+// check to write that can never fire.
+//
+// On return `numLocals` holds the local band's length and `nlistBytes` every
+// defined record in band order.
+void
+appendImageDefinedBands(AssembledModule const&                  module,
+                        link::format::ObjectSymbolNames const& imgNames,
+                        std::uint64_t                           sectionVa,
+                        std::span<std::uint64_t const>          funcTextStart,
+                        StringTable& strtab,
+                        std::vector<std::uint8_t>& nlistBytes,
+                        std::uint32_t& numLocals) {
+    auto appendDefined = [&](std::string const& symName,
+                             SymbolBinding binding, SymbolVisibility visibility,
+                             std::uint64_t valueVa) {
+        appendNlist64(nlistBytes, strtab.add(symName),
+                      definedNType(binding, visibility),
+                      /*n_sect=*/1, definedNDesc(binding),
+                      /*n_value=*/valueVa);  // n_value = runtime VA
+    };
+    for (bool const localPass : {true, false}) {
+        for (std::size_t i = 0; i < module.functions.size(); ++i) {
+            auto const&            fn    = module.functions[i];
+            std::uint64_t const    symVa = sectionVa + funcTextStart[i];
+            SymbolVisibility const vis   =
+                imgNames.definedVisibility(fn.symbol);
+            // `imageDefinedBinding`, not `definedBinding` raw: a private
+            // extern is folded to Local for an IMAGE, exactly as ld64 folds it
+            // (D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL). The fold
+            // decides the BAND as well as the n_type, so the two cannot
+            // disagree and the band belt below has nothing to catch.
+            SymbolBinding const binding =
+                imageDefinedBinding(imgNames.definedBinding(fn.symbol), vis);
+            if ((binding == SymbolBinding::Local) == localPass) {
+                appendDefined(imgNames.imageName(fn.symbol, "_sym_"), binding,
+                              vis, symVa);
+            }
+            // An ALIAS takes the SAME fold on ITS OWN pair, so a hidden alias
+            // of an exported canonical lands in the local band rather than
+            // putting an N_PEXT record past `numLocals`.
+            for (ModuleSymbol const* alias :
+                 imgNames.definedAliases(fn.symbol)) {
+                SymbolBinding const aliasBinding =
+                    imageDefinedBinding(alias->binding, alias->visibility);
+                if ((aliasBinding == SymbolBinding::Local) != localPass)
+                    continue;
+                appendDefined(alias->name, aliasBinding,
+                              alias->visibility, symVa);
+            }
+        }
+        if (localPass) {
+            numLocals =
+                static_cast<std::uint32_t>(nlistBytes.size() / kNlist64Size);
+        }
+    }
+}
+
+// The band belt shared by both image arms: the table that was actually
+// written must agree with the six LC_DYSYMTAB fields it publishes (or, on
+// the static arm, WOULD publish — that arm emits no LC_DYSYMTAB, but lays the
+// table out in band order all the same, and checking it there keeps the two
+// arms from drifting). `machoDysymtabBandBreach` holds the argument.
+[[nodiscard]] bool
+imageBandsAgree(std::span<std::uint8_t const> nlistBytes,
+                link::format::MachoDysymtabBands const& bands,
+                char const* where, DiagnosticReporter& reporter) {
+    std::string const breach =
+        link::format::machoDysymtabBandBreach(nlistBytes, bands);
+    if (breach.empty()) return true;
     emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-         std::format(
-             "{}: alias '{}' is a WEAK definition, and a Mach-O IMAGE cannot "
-             "state that: N_WEAK_DEF needs MH_WEAK_DEFINES in the mach header "
-             "for dyld to coalesce it, and this writer copies the schema's "
-             "header flags verbatim (D-LK3-DYLIB-WEAK-EXPORT). Emitting it "
-             "N_SECT|N_EXT instead would publish it as a STRONG definition and "
-             "silently change cross-image coalescing.",
-             where, alias.name));
+         std::format("{}: the nlist_64 table does not agree with the "
+                     "LC_DYSYMTAB bands it publishes — {}. A conforming reader "
+                     "walks the bands by index range and would misdescribe "
+                     "every symbol on the wrong side of a boundary "
+                     "(D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT).",
+                     where, breach));
     return false;
+}
+
+// Names the schema key(s) through which a signature was ACTUALLY
+// requested, for the two refusals that fire on the static exec arm.
+// D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM: the message those
+// two sites used to carry hard-coded `'image.codeSignatureSize' is
+// non-zero`, which was a FALSE statement for an ad-hoc-only schema —
+// the reader would go looking for a key the format does not declare.
+// A diagnostic that names the wrong key is not fail-loud, it is fail-
+// misleading, so the key set is derived from the same fields
+// `requestsCodeSignature` reads. Precondition: only called when that
+// predicate is true, so the result is never empty.
+[[nodiscard]] std::string
+codeSignatureRequestKeys(MachOImage const& im) {
+    std::string keys;
+    if (im.codeSignature.has_value()) {
+        keys = "'image.codeSignature'";
+    }
+    if (im.codeSignatureSize != 0) {
+        if (!keys.empty()) keys += " and ";
+        keys += "a non-zero 'image.codeSignatureSize'";
+    }
+    return keys;
 }
 
 [[nodiscard]] std::vector<std::uint8_t>
@@ -934,14 +1459,16 @@ encodeExecDynamic(AssembledModule const&    module,
                   TargetSchema const&       targetSchema,
                   ObjectFormatSchema const& fmt,
                   ObjectFormatSectionInfo const& secText,
-                  DiagnosticReporter&       reporter);
+                  DiagnosticReporter&       reporter,
+                  ImageRequest const&       request);
 } // namespace
 
 std::vector<std::uint8_t>
 encode(AssembledModule const&    module,
        TargetSchema const&       targetSchema,
        ObjectFormatSchema const& objectFormatSchema,
-       DiagnosticReporter&       reporter) {
+       DiagnosticReporter&       reporter,
+       ImageRequest const&       request) {
     auto const& fmt = objectFormatSchema;
     // ── SELF-GUARD (D-LINK-…-KIND-IDENTITY-BRANCHES, TF-C125) ──────────
     //
@@ -988,6 +1515,41 @@ encode(AssembledModule const&    module,
         requireSection(fmt, SectionKind::Text, "Mach-O writer", reporter);
     if (!secText) return {};
 
+    // ── D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS ──
+    //    ASK THE CONFIG BEFORE SPELLING A WEAK DEFINITION.
+    //
+    // `definedNDesc` sets N_WEAK_DEF (0x0080) in `n_desc` — the Mach-O spelling
+    // of a weak definition, and the `symbol-flag` dialect. Until this gate
+    // landed the writer did so UNCONDITIONALLY, deciding a per-FORMAT fact
+    // inside the walker while the config key that owns that fact sat unread on
+    // two pe documents. A key the writer does not read drifts silently while
+    // reading as authoritative, which is the defect
+    // [[D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED]] exists to prevent.
+    //
+    // ★★ IT ASKS ONCE, FOR EVERY ARM — AND THAT IS A CHANGE THIS CYCLE MADE
+    // RATHER THAN THE SHAPE IT INHERITED. The gate used to sit BELOW the
+    // filetype dispatch, so only the MH_OBJECT arm reached it, and the
+    // asymmetry was correct while it lasted: the image arms REFUSED a weak
+    // definition outright, so a dialect declared on an exec/dylib document
+    // would have been a key nobody reads. [[D-LK3-DYLIB-WEAK-EXPORT]] closing
+    // makes both image arms ENCODE one, so both now owe the same question, and
+    // the honest place to ask it is above the dispatch — exactly as
+    // `elf::encode` asks it once for ET_REL, ET_EXEC, ET_PIE and ET_DYN alike.
+    // ⚠ THIS MAKES `weakDefinition` A REQUIRED DECLARATION ON THE FOUR MACH-O
+    // IMAGE DOCUMENTS (`macho64-{arm64,x86_64}-darwin-{exec,dylib}`), whose
+    // dialect is `symbol-flag` like their MH_OBJECT siblings'. The refusal
+    // below names the document and the block to add, so the remedy travels
+    // with the failure.
+    //
+    // ★ SCAN FIRST, ASK SECOND: `requireWeakDefinitionDialect` only asks the
+    // schema when the module actually carries a weak definition, so a format
+    // that never meets one is still never required to answer.
+    if (!link::format::requireWeakDefinitionDialect(
+            module, fmt, WeakDefinitionDialect::SymbolFlag,
+            "macho::encode", reporter)) {
+        return {};
+    }
+
     // Dispatch between MH_OBJECT (cycle 1), MH_EXECUTE (cycle 2) and
     // MH_DYLIB (c153, D-LK3-3) based on the schema's declared
     // filetype (closed enum — the loader rejects anything else). The
@@ -1012,7 +1574,7 @@ encode(AssembledModule const&    module,
             return {};
         }
         return encodeExecDynamic(module, targetSchema, fmt,
-                                 *secText, reporter);
+                                 *secText, reporter, request);
     }
     if (fmt.macho().filetype == MachOObjectType::Execute) {
         // LK7 codesign-placeholder gate (silent-failure HIGH fold,
@@ -1023,25 +1585,41 @@ encode(AssembledModule const&    module,
         // the CD blob must be mmap-able via a segment. Force the
         // dynamic path (which DOES carry __LINKEDIT) whenever a
         // codesign reservation is requested. Empty `externImports`
-        // with `codeSignatureSize > 0` is currently a no-realistic-
+        // with a signature request is currently a no-realistic-
         // use-case combination (a signed binary that imports nothing
         // is degenerate); when first observed in practice, the
         // dynamic-path arm will widen — anchored D-LK7-1 at plan 14
-        // §3.1.
-        if (fmt.machoImage().codeSignatureSize != 0
+        // §3.1. Until it does, REFUSING is the whole contract: an
+        // image whose declared signature cannot be honoured must not
+        // be emitted unsigned and called a success.
+        //
+        // ★ D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM. This
+        // gate used to test `codeSignatureSize != 0` ALONE, so an
+        // ad-hoc-only schema — which is what EVERY shipped Darwin exec
+        // and dylib document actually declares — walked straight past
+        // it into `encodeExec`, an arm that emits no __LINKEDIT and
+        // therefore no LC_CODE_SIGNATURE under any schema. The request
+        // was dropped with no diagnostic: a green build and a binary
+        // AMFI refuses at load. It reads BOTH keys now, through the one
+        // `requestsCodeSignature` predicate the belt in `encodeExec`
+        // and `emitCodeSig` in `encodeExecDynamic` also read, so the
+        // three cannot drift apart again.
+        if (requestsCodeSignature(fmt.machoImage())
          && module.externImports.empty()) {
             emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-                 "macho::encode: 'image.codeSignatureSize' is "
-                 "non-zero but the module has no externImports — "
-                 "the static encodeExec path emits no __LINKEDIT "
-                 "segment, so the LC_CODE_SIGNATURE reservation "
-                 "would land outside any LC_SEGMENT_64 and the "
-                 "kernel `cs_validate_range` would reject the "
-                 "binary at exec time. Add at least one extern "
-                 "import (which routes through encodeExecDynamic + "
-                 "synthesizes __LINKEDIT) OR clear "
-                 "'codeSignatureSize'. Anchored at plan 14 §3.1 "
-                 "D-LK7-1 (static-path __LINKEDIT synthesis).");
+                 std::format(
+                     "macho::encode: the object format requests a code "
+                     "signature ({}) but the module has no "
+                     "externImports — the static encodeExec path emits "
+                     "no __LINKEDIT segment, so the LC_CODE_SIGNATURE "
+                     "reservation would land outside any LC_SEGMENT_64 "
+                     "and the kernel `cs_validate_range` would reject "
+                     "the binary at exec time. Add at least one extern "
+                     "import (which routes through encodeExecDynamic + "
+                     "synthesizes __LINKEDIT) OR drop the signature "
+                     "request from the format. Anchored at plan 14 §3.1 "
+                     "D-LK7-1 (static-path __LINKEDIT synthesis).",
+                     codeSignatureRequestKeys(fmt.machoImage())));
             return {};
         }
         if (!module.externImports.empty()) {
@@ -1057,39 +1635,9 @@ encode(AssembledModule const&    module,
                 return {};
             }
             return encodeExecDynamic(module, targetSchema, fmt,
-                                     *secText, reporter);
+                                     *secText, reporter, request);
         }
         return encodeExec(module, targetSchema, fmt, *secText, reporter);
-    }
-
-    // ── D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS ──
-    //    ASK THE CONFIG BEFORE SPELLING A WEAK DEFINITION.
-    //
-    // `definedNDesc` below sets N_WEAK_DEF (0x0080) in `n_desc` — the Mach-O
-    // spelling of a weak definition, and the `symbol-flag` dialect. Until this
-    // gate landed it did so UNCONDITIONALLY, deciding a per-FORMAT fact inside
-    // the walker while the config key that owns that fact sat unread on two pe
-    // documents. A key the writer does not read drifts silently while reading
-    // as authoritative, which is the defect
-    // [[D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED]] exists to prevent — so
-    // the declaration and this consultation land together, never one first.
-    //
-    // ★★ THE GATE IS ON THE MH_OBJECT ARM ONLY, AND THE ASYMMETRY IS THE POINT
-    // RATHER THAN AN OMISSION. The image arms (MH_EXECUTE / MH_DYLIB) never
-    // ENCODE a weak definition: `refuseWeakImageAlias` refuses a weak alias
-    // outright, because N_WEAK_DEF on an image needs MH_WEAK_DEFINES in the
-    // mach header and these writers copy the schema's flags verbatim
-    // (D-LK3-DYLIB-WEAK-EXPORT). A dialect declared on an exec/dylib document
-    // would therefore be a key NOBODY READS — precisely the drift this row
-    // exists to close — so those four documents deliberately declare none, and
-    // the shipped-scope pin asserts that rather than remembering it.
-    //
-    // ★ SCAN FIRST, ASK SECOND: `requireWeakDefinitionDialect` only asks the
-    // schema when the module actually carries a weak definition.
-    if (!link::format::requireWeakDefinitionDialect(
-            module, fmt, WeakDefinitionDialect::SymbolFlag,
-            "macho::encode (MH_OBJECT)", reporter)) {
-        return {};
     }
 
     // NOTE: the MH_OBJECT path does not APPLY relocations (the assembler
@@ -1673,31 +2221,22 @@ encode(AssembledModule const&    module,
     constexpr std::uint8_t kTextSectionNumber = 1;
 
 
-    // D-LK-OBJECT-WEAK-DEF-RELOCATABLE. A WEAK DEFINITION is `N_SECT|N_EXT`
-    // with N_WEAK_DEF set in n_desc — that bit IS the mechanism at this tier,
-    // and the ONE shared, format-neutral `definedBinding` decision is what
-    // selects it, so no `if(format)` leaks into the substrate: each writer
-    // maps the same `SymbolBinding` to its own vocabulary (COFF spells the
-    // same fact as a COMDAT select-any section; ELF as STB_WEAK).
+    // The n_type / n_desc of a DEFINED symbol are the file-scope
+    // `definedNType` / `definedNDesc` pair (docblock beside `appendNlist64`):
+    // ONE mapping from the shared `SymbolBinding` decision, read by the
+    // function, data and alias sites below AND by both image arms.
     //
-    // The n_desc bits for a DEFINED symbol, given its binding. Kept as one
-    // function rather than open-coded at the function and data sites, because
-    // those two sites drifting apart is precisely the defect
-    // D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION was.
-    auto definedNDesc = [&](SymbolBinding binding) -> std::uint16_t {
-        return binding == SymbolBinding::Weak ? N_WEAK_DEF : std::uint16_t{0};
-    };
-    // The n_type for a DEFINED symbol, given the SAME binding `definedNDesc`
-    // reads -- the N_EXT half of the one decision whose n_desc half sits above.
-    // ONE mapping, THREE call sites (functions, data items, alias rows), for the
-    // reason `definedNDesc` is one function: the ELF writer states the identical
-    // fact through `stbForBinding`, and three open-coded ternaries is how the
-    // name/binding pair drifts (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION
-    // was exactly that drift).
-    auto definedNType = [&](SymbolBinding binding) -> std::uint8_t {
-        return binding == SymbolBinding::Local
-                   ? N_SECT
-                   : static_cast<std::uint8_t>(N_SECT | N_EXT);
+    // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE — the UNDEFINED twin of
+    // `definedNDesc`, reading the same `SymbolBinding` vocabulary from
+    // `ObjectSymbolNames::externBinding` that `definedNDesc` reads from
+    // `definedBinding`. It is a SEPARATE function and not a widened
+    // `definedNDesc` because the two answer different questions about different
+    // symbols and disagree on the bit: a weak DEFINITION takes N_WEAK_DEF on an
+    // N_SECT symbol, a weak REFERENCE takes N_WEAK_REF on an N_UNDF one. Folding
+    // them would make each caller responsible for remembering which side it is
+    // on, and the failure would be silent in both directions.
+    auto externNDesc = [&](SymbolBinding binding) -> std::uint16_t {
+        return binding == SymbolBinding::Weak ? N_WEAK_REF : std::uint16_t{0};
     };
 
     // ── ALIAS ROWS — D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB ──
@@ -1728,7 +2267,7 @@ encode(AssembledModule const&    module,
     // would be a false statement in the format's own vocabulary.
     // ⚠ THE BINDING RANGE HERE IS NARROWER THAN `definedNType`'s DOMAIN, and
     // saying so is the point. `definedAliases` admits only rows that pass
-    // `isExternallyVisible`, whose first clause rejects `SymbolBinding::Local`
+    // `hasExternalLinkage`, whose second clause rejects `SymbolBinding::Local`
     // -- so no alias reaching this loop can be Local, and this site never takes
     // the mapping's Local arm. It is written through the shared mapping anyway
     // rather than as a local ternary: an open-coded `Local ? N_SECT : ...` here
@@ -1743,7 +2282,8 @@ encode(AssembledModule const&    module,
                                  std::uint64_t nValue) {
         for (ModuleSymbol const* alias : objNames.definedAliases(id)) {
             std::uint32_t const aliasNameOff = strtab.add(alias->name);
-            appendNlist(aliasNameOff, definedNType(alias->binding), nSect,
+            appendNlist(aliasNameOff,
+                        definedNType(alias->binding, alias->visibility), nSect,
                         definedNDesc(alias->binding), nValue);
         }
     };
@@ -1752,7 +2292,9 @@ encode(AssembledModule const&    module,
     // coupled to the NAME (D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION,
     // TF-C54): a static/synthesized `_sym_<id>` def is Local → bare
     // N_SECT (NO N_EXT), so a sibling `.o`'s unrelated `_sym_<id>` can never
-    // bind to it at a FOREIGN link; an externally-visible def keeps N_SECT|N_EXT.
+    // bind to it at a FOREIGN link; an external-linkage def keeps N_SECT|N_EXT,
+    // plus N_PEXT when its visibility hides it from other images
+    // (D-LK-OBJECT-GLOBAL-HIDDEN-VISIBILITY-EMITTED-LOCAL).
     // A Mach-O RELOCATABLE object carries no LC_DYSYMTAB (no local/extern range
     // split to keep in sync — see the symtab-order note above), so the emission
     // order is unchanged; only the N_EXT bit flips. A WEAK def keeps
@@ -1769,7 +2311,10 @@ encode(AssembledModule const&    module,
         std::string const symName = objNames.definedName(f.symId, "_sym_");
         SymbolBinding const binding = objNames.definedBinding(f.symId);
         std::uint32_t const nameOff = strtab.add(symName);
-        appendNlist(nameOff, definedNType(binding), kTextSectionNumber,
+        appendNlist(nameOff,
+                    definedNType(binding,
+                                 objNames.definedVisibility(f.symId)),
+                    kTextSectionNumber,
                     definedNDesc(binding), f.valueInText);
         appendAliasNlists(f.symId, kTextSectionNumber, f.valueInText);
     }
@@ -1831,7 +2376,10 @@ encode(AssembledModule const&    module,
         std::string const symName = objNames.definedName(d.symId, "_sym_");
         SymbolBinding const binding = objNames.definedBinding(d.symId);
         std::uint32_t const nameOff = strtab.add(symName);
-        appendNlist(nameOff, definedNType(binding), d.sectOrdinal,
+        appendNlist(nameOff,
+                    definedNType(binding,
+                                 objNames.definedVisibility(d.symId)),
+                    d.sectOrdinal,
                     definedNDesc(binding), d.flatAddr);
         appendAliasNlists(d.symId, d.sectOrdinal, d.flatAddr);
     }
@@ -1846,10 +2394,16 @@ encode(AssembledModule const&    module,
     for (auto const& e : externSyms) {
         std::string const symName = objNames.externName(e, "_sym_");
         std::uint32_t const nameOff = strtab.add(symName);
+        // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the n_desc half of
+        // this record now carries the import's REFERENCE binding, read through
+        // the `externName`/`externBinding` lockstep pair rather than hardcoded —
+        // the same name-and-binding coupling the DEFINED loops above use. Zero
+        // for every import that is not annotated, so an object with no weak
+        // import is byte-identical to the hardcoded 0 this replaces.
         appendNlist(nameOff,
                     static_cast<std::uint8_t>(N_UNDF | N_EXT),
                     /*n_sect=*/0,
-                    /*n_desc=*/0,
+                    externNDesc(objNames.externBinding(e)),
                     /*n_value=*/0);
     }
 
@@ -1959,16 +2513,28 @@ encode(AssembledModule const&    module,
     // Relocation tables follow ALL file-backed section bytes (__text's
     // first, then each reloc-bearing data section's — the same order the
     // section_64 records are emitted). A no-reloc table keeps reloff = 0.
-    std::uint64_t relocCursor = textRawOffset + fileBackedSpan;
+    //
+    // D-LINK-MACHO-OBJECT-SYMTAB-MISALIGNED: every table in the trailer
+    // STARTS on a `kObjectTrailerAlign` boundary (see that constant). The
+    // cursor is aligned before EACH table rather than once before the first:
+    // the three relocation tables are whole records of 8 and the nlist of 16,
+    // so today the later steps are no-ops, but a rule stated once per table
+    // is a rule the next table appended to this chain inherits. The SIZES
+    // stay exact — only the STARTS move — so every load command keeps
+    // reporting the true payload length and the pad bytes belong to nobody.
+    // The emission below pads to these same offsets through `seekTo`, and
+    // the two views are cross-checked loud there.
+    std::uint64_t relocCursor =
+        alignUp(textRawOffset + fileBackedSpan, kObjectTrailerAlign);
     std::uint64_t const textRelocOffset =
         textRelocCount > 0 ? relocCursor : 0;
-    relocCursor += textRelocs.size();
+    relocCursor = alignUp(relocCursor + textRelocs.size(), kObjectTrailerAlign);
     std::uint64_t const dataRelocOffset =
         dataRelocCount > 0 ? relocCursor : 0;
-    relocCursor += dataRelocs.size();
+    relocCursor = alignUp(relocCursor + dataRelocs.size(), kObjectTrailerAlign);
     std::uint64_t const relroRelocOffset =
         relroRelocCount > 0 ? relocCursor : 0;
-    relocCursor += relroRelocs.size();
+    relocCursor = alignUp(relocCursor + relroRelocs.size(), kObjectTrailerAlign);
 
     std::uint64_t const symtabOffset = relocCursor;
     std::uint64_t const stringTableOffset =
@@ -2131,15 +2697,52 @@ encode(AssembledModule const&    module,
 
     // section data (text + padded file-backed data sections)
     bytes.insert(bytes.end(), sectionData.begin(), sectionData.end());
-    // relocation tables (__text, then data, then relro)
-    bytes.insert(bytes.end(), textRelocs.begin(), textRelocs.end());
-    bytes.insert(bytes.end(), dataRelocs.begin(), dataRelocs.end());
-    bytes.insert(bytes.end(), relroRelocs.begin(), relroRelocs.end());
+
+    // D-LINK-MACHO-OBJECT-SYMTAB-MISALIGNED: the trailer tables are emitted
+    // by APPENDING, while the load commands above already published each
+    // table's file offset from the aligned cursor arithmetic. `seekTo` is the
+    // one place the two views are reconciled: it writes the alignment gap the
+    // cursors reserved, and REFUSES an overrun (stream already past the
+    // offset a load command published) instead of silently shipping a `.o`
+    // whose `reloff`/`symoff` point into the middle of the previous table —
+    // the image tier's `seekTo` in `encodeExecDynamic` is the precedent.
+    auto seekTo = [&](std::uint64_t off, char const* tableName) -> bool {
+        if (bytes.size() > off) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("macho::encode (MH_OBJECT): trailer emission "
+                             "overran the '{}' cursor — the stream was "
+                             "already at {} when that table's published file "
+                             "offset {} was reached; a reader following the "
+                             "load command would read the previous table's "
+                             "bytes (substrate invariant violation, "
+                             "D-LINK-MACHO-OBJECT-SYMTAB-MISALIGNED).",
+                             tableName, bytes.size(), off));
+            return false;
+        }
+        while (bytes.size() < off) bytes.push_back(0);
+        return true;
+    };
+    // relocation tables (__text, then data, then relro), each at its
+    // published offset; an absent table published reloff 0 and is skipped.
+    if (textRelocCount > 0) {
+        if (!seekTo(textRelocOffset, "__text relocations")) return {};
+        bytes.insert(bytes.end(), textRelocs.begin(), textRelocs.end());
+    }
+    if (dataRelocCount > 0) {
+        if (!seekTo(dataRelocOffset, "__data relocations")) return {};
+        bytes.insert(bytes.end(), dataRelocs.begin(), dataRelocs.end());
+    }
+    if (relroRelocCount > 0) {
+        if (!seekTo(relroRelocOffset, "relro relocations")) return {};
+        bytes.insert(bytes.end(), relroRelocs.begin(), relroRelocs.end());
+    }
 
     // symbol table
+    if (!seekTo(symtabOffset, "symbol table")) return {};
     bytes.insert(bytes.end(), nlistBytes.begin(), nlistBytes.end());
 
     // string table
+    if (!seekTo(stringTableOffset, "string table")) return {};
     auto strtabBytes = std::move(strtab).release();
     bytes.insert(bytes.end(), strtabBytes.begin(), strtabBytes.end());
 
@@ -2217,6 +2820,54 @@ encodeExec(AssembledModule const&    module,
     std::uint32_t textAlignLog2 = 0;
     if (!sectionAlignLog2(secText.addrAlign, "macho::encodeExec", "text",
                           reporter, textAlignLog2)) {
+        return {};
+    }
+
+    // ── A WEAK DEFINITION NEEDS AN EXPORT TRIE, AND THIS ARM HAS NOWHERE TO
+    //    PUT ONE. D-LK7-1 (static-path __LINKEDIT synthesis) is the gap.
+    //
+    // [[D-LK3-DYLIB-WEAK-EXPORT]] closed on the arms that emit __LINKEDIT: an
+    // image states a weak definition with N_WEAK_DEF **and** an
+    // EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION trie terminal **and** the
+    // MH_WEAK_DEFINES/MH_BINDS_TO_WEAK header bits, and dyld's coalescing pass
+    // reads the TRIE. This arm emits no __LINKEDIT segment at all — its symtab
+    // sits at the file tail OUTSIDE every LC_SEGMENT_64, which is the same
+    // structural gap that makes an LC_CODE_SIGNATURE unhostable here — so an
+    // export trie written on this path would be bytes dyld can never map.
+    // Emitting the nlist bit alone would publish a weak definition no loader
+    // was told to coalesce; emitting it strong is the silent downgrade the
+    // closed row is about. So this one path refuses, and it names the
+    // capability that is actually missing rather than the one that now exists.
+    //
+    // ⓘ NO SHIPPED FORMAT REACHES IT. Every Mach-O image document requests a
+    // code signature, and `macho::encode` routes a signature request with no
+    // externImports to a refusal and one WITH externImports to
+    // `encodeExecDynamic` — so this arm is reachable only from a schema built
+    // without one. That is why the refusal costs no working program, which is
+    // the test the previous cycle applied before declining to widen the other
+    // refusal (`examples/c/attributes_syntax` runs on darwin through the
+    // DYNAMIC arm, and still does).
+    //
+    // ⓘ THE MESSAGE NAMES NO SYMBOL, DELIBERATELY. The predicate that decides
+    // this — `moduleDefinesWeakSymbol` — classifies a weak CANONICAL and a
+    // weak ALIAS across functions and data items; the naive "first
+    // `SymbolBinding::Weak` row in `module.symbols`" would be a SECOND owner
+    // of that classification and would name the wrong symbol wherever the two
+    // disagreed (a weak row on an extern, say). A diagnostic naming the wrong
+    // symbol is fail-misleading, and this arm is reachable from no shipped
+    // document, so the remedy sentence carries the whole message instead.
+    if (link::format::moduleDefinesWeakSymbol(module)) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             "macho::encodeExec: this module defines a WEAK symbol, and the "
+             "static (no-extern) Mach-O image path emits no __LINKEDIT "
+             "segment — so it can host no export trie, and dyld's weak-"
+             "definition coalescing reads the export trie, not the nlist. "
+             "Emitting N_WEAK_DEF here without a trie terminal and the "
+             "MH_WEAK_DEFINES header bit would publish a weak definition no "
+             "loader was told to coalesce. Route through the dynamic path "
+             "(any extern import, or a format that requests a code "
+             "signature), which emits the whole machinery. Anchored at plan "
+             "14 §3.1 D-LK7-1 (static-path __LINKEDIT synthesis).");
         return {};
     }
 
@@ -2326,24 +2977,38 @@ encodeExec(AssembledModule const&    module,
     // ── (e) Layout constants ──────────────────────────────────
     //
     // ncmds = 2 (__PAGEZERO + __TEXT) + 1 (LC_LOAD_DYLINKER)
-    //       + 1 (LC_MAIN) + N (LC_LOAD_DYLIB) + 1 (LC_SYMTAB).
+    //       + 1 (LC_MAIN) + N (LC_LOAD_DYLIB) + 1 (LC_SYMTAB)
+    //       + [1 (LC_UUID) when emitUuid],
+    // in that emission order, and `sizeofcmds` below carries one term per
+    // entry of that same list. ⚠ This enumeration is the ONLY prose copy of a
+    // number the code derives; it went stale the moment LC_UUID was added and
+    // was caught only by review (D-LK-MACHO-EMITS-NO-LC-UUID). If you add a
+    // load command, both lists and both expressions move together.
     constexpr std::size_t kSegCmdPageZeroSize = kSegmentCommand64Size;
     constexpr std::size_t kSegCmdTextSize     =
         kSegmentCommand64Size + kSection64Size;  // 1 section: __text
     constexpr std::size_t kLcMainSize         = 24;
 
-    // LK7 codesign reservation is unreachable here — the dispatch
-    // in `encode()` gates `codeSignatureSize > 0` to the dynamic
-    // path (anchored D-LK7-1 for static-path __LINKEDIT synthesis).
-    // Keeping a defensive assertion so a future refactor that
-    // bypasses the gate fails loud rather than silently emitting
-    // an unsignable binary.
-    if (im.codeSignatureSize != 0) {
+    // LK7 codesign reservation is unreachable here — the dispatch in
+    // `encode()` refuses a signature request on this arm (anchored
+    // D-LK7-1 for static-path __LINKEDIT synthesis). Keeping a
+    // defensive assertion so a future refactor that bypasses the gate
+    // fails loud rather than silently emitting an unsignable binary.
+    //
+    // ★ D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM. The belt read
+    // `codeSignatureSize != 0` alone, so it was blind to exactly the
+    // requests the gate above was blind to — a belt that shares its
+    // gate's blind spot is not defence in depth, it is the same defect
+    // written twice. Both now read `requestsCodeSignature`, the ONE
+    // predicate; there is no second spelling left to drift.
+    if (requestsCodeSignature(im)) {
         emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-             "macho::encodeExec: invariant violation — the dispatch "
-             "gate in macho::encode should have rejected non-zero "
-             "codeSignatureSize on the static path. Anchored at "
-             "plan 14 §3.1 D-LK7-1.");
+             std::format(
+                 "macho::encodeExec: invariant violation — the dispatch "
+                 "gate in macho::encode should have rejected the code-"
+                 "signature request ({}) on the static path. Anchored "
+                 "at plan 14 §3.1 D-LK7-1.",
+                 codeSignatureRequestKeys(im)));
         return {};
     }
     // LC_BUILD_VERSION is emitted only on the dynamic exec path
@@ -2364,11 +3029,22 @@ encodeExec(AssembledModule const&    module,
              "D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION.");
         return {};
     }
+    // The trailing LC_UUID term — D-LK-MACHO-EMITS-NO-LC-UUID. Keyed on the
+    // format document exactly as LC_BUILD_VERSION and LC_CODE_SIGNATURE are,
+    // because ✔MEASURED on Apple Silicon the reference exposes this command's
+    // presence AND its derivation as per-link policy (`-no_uuid`,
+    // `-random_uuid`) while offering no such knob over LC_SYMTAB or
+    // LC_DYSYMTAB, which this writer accordingly emits from code. The
+    // measurement and that discriminator live in `MachOUuid`'s docblock.
+    // `encodeRelocatable` is left alone: no MH_OBJECT document declares the
+    // key, matching `clang -c`.
+    bool const emitUuid = im.uuid.has_value();
     std::uint32_t const ncmds = static_cast<std::uint32_t>(
-        2u + 1u + 1u + im.loadDylibs.size() + 1u);
+        2u + 1u + 1u + im.loadDylibs.size() + 1u + (emitUuid ? 1u : 0u));
     std::size_t const sizeofcmds =
         kSegCmdPageZeroSize + kSegCmdTextSize + dylinkerCmdSize
-        + kLcMainSize + totalDylibCmdSize + kSymtabCommandSize;
+        + kLcMainSize + totalDylibCmdSize + kSymtabCommandSize
+        + (emitUuid ? kUuidCommandSize : 0u);
 
     // ── (f) Build nlist_64 + string table — defined symbols only.
     //       (Extern dyld symbols flow through the encodeExecDynamic
@@ -2387,12 +3063,12 @@ encodeExec(AssembledModule const&    module,
     // trampoline, which is functions[0] and carries no `ModuleSymbol` row.
     // See `imageName`'s docblock for why the two tiers legitimately differ.
     //
-    // ★ THE BINDING IS DELIBERATELY UNCHANGED (N_SECT|N_EXT for every defined
-    // function). clang marks a `static` N_SECT with NO N_EXT, and matching that
-    // is a real improvement — but it also re-shapes LC_DYSYMTAB's
-    // ilocalsym/iextdefsym bands, so it is its own change with its own witness
-    // rather than a silent rider on the names:
-    // D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT.
+    // ★ THE BINDING FOLLOWS `definedBinding`, THE ORDER FOLLOWS THE BANDS —
+    // D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT, closed in
+    // `appendImageDefinedBands` (its docblock holds the measurement and the
+    // ordering argument). This arm publishes no LC_DYSYMTAB, yet lays the
+    // table out locals-first exactly as the dynamic arm does, through the
+    // same builder, so the two cannot drift.
     //
     // ── EVERY name bound to the atom, not just the canonical one ───────────
     // D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB, IMAGE tier. One
@@ -2402,37 +3078,29 @@ encodeExec(AssembledModule const&    module,
     // first-row-wins because one nlist entry needs exactly one answer, so every
     // later name was dropped from the image. The alias is emitted at the
     // canonical's n_sect / n_value — one address, which is what an alias IS —
-    // and with the SAME N_SECT|N_EXT type as the canonical, because on this
-    // format the image's per-symbol binding question is already owned by
-    // D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT; giving an alias a binding the
-    // canonical does not get would be a second, undeclared answer to it.
+    // with its OWN binding mapped through the same `definedNType`, which for
+    // an alias (external-linkage by `definedAliases`' predicate) is normally
+    // `N_SECT|N_EXT`: the externally-defined band, right after its canonical.
     link::format::ObjectSymbolNames const imgNames{module};
     StringTable strtab;
     std::vector<std::uint8_t> nlistBytes;
-    auto appendDefinedNlist = [&](std::string const& symName,
-                                  std::uint64_t      valueVa) {
-        appendNlist64(nlistBytes, strtab.add(symName),
-                      static_cast<std::uint8_t>(N_SECT | N_EXT),
-                      /*n_sect=*/1, /*n_desc=*/0,
-                      /*n_value=*/valueVa);  // n_value = runtime VA
-    };
-    for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
-        auto const&         fn      = module.functions[fi];
-        std::uint64_t const symVa   = sectionVa + funcTextStart[fi];
-        appendDefinedNlist(imgNames.imageName(fn.symbol, "_sym_"), symVa);
-        for (ModuleSymbol const* alias : imgNames.definedAliases(fn.symbol)) {
-            if (!refuseWeakImageAlias(*alias, "macho::encodeExec", reporter)) {
-                return {};
-            }
-            appendDefinedNlist(alias->name, symVa);
-        }
-    }
+    std::uint32_t numLocals = 0;
+    appendImageDefinedBands(module, imgNames, sectionVa, funcTextStart, strtab,
+                            nlistBytes, numLocals);
     // DERIVED from the band that was actually emitted, never predicted from
     // `module.functions.size()`: LC_SYMTAB.nsyms and the file-size arithmetic
     // below both read it, and a count that disagrees with the bytes makes ld64
     // and `nm` walk off the end of the table.
     std::uint32_t const numberOfSymbols =
         static_cast<std::uint32_t>(nlistBytes.size() / kNlist64Size);
+    if (!imageBandsAgree(nlistBytes,
+                         {/*ilocalsym=*/0, numLocals,
+                          /*iextdefsym=*/numLocals,
+                          /*nextdefsym=*/numberOfSymbols - numLocals,
+                          /*iundefsym=*/numberOfSymbols, /*nundefsym=*/0},
+                         "macho::encodeExec", reporter)) {
+        return {};
+    }
 
     std::size_t const headerAndCmds = kMachHeader64Size + sizeofcmds;
 
@@ -2610,6 +3278,12 @@ encodeExec(AssembledModule const&    module,
     appendU32LE(bytes, static_cast<std::uint32_t>(stringTableOffset));
     appendU32LE(bytes, static_cast<std::uint32_t>(stringTableSize));
 
+    // LC_UUID (payload deferred) — D-LK-MACHO-EMITS-NO-LC-UUID.
+    std::optional<std::size_t> uuidPayloadOffset;
+    if (emitUuid) {
+        uuidPayloadOffset = appendUuidCommandPlaceholder(bytes);
+    }
+
     // Sanity-check that we emitted exactly sizeofcmds bytes of load
     // commands after the mach header. A mismatch silently corrupts
     // dyld's load-command parser; surface it.
@@ -2634,6 +3308,14 @@ encodeExec(AssembledModule const&    module,
     auto strtabBytes = std::move(strtab).release();
     bytes.insert(bytes.end(), strtabBytes.begin(), strtabBytes.end());
 
+    // D-LK-MACHO-EMITS-NO-LC-UUID: derive the identity from the FINAL content.
+    // This arm emits no code signature (the dispatch refuses one — see the
+    // `requestsCodeSignature` belt above), so the whole image is the hashed
+    // region and there is no ordering constraint to honour beyond "last".
+    if (uuidPayloadOffset.has_value()) {
+        stampImageUuid(bytes, *uuidPayloadOffset, bytes.size());
+    }
+
     return bytes;
 }
 
@@ -2645,22 +3327,39 @@ encodeExec(AssembledModule const&    module,
 // dynamic MH_EXECUTE that PT-LOAD's into dyld + binds extern imports
 // eagerly at startup via the immediate `LC_DYLD_INFO_ONLY.bind_off`
 // opcode stream (parallel to ELF cycle 2b.2's `DF_1_NOW` + GLOB_DAT
-// stance — `lazy_bind_off` stays zero). ARM64-darwin chained-fixups
-// path anchored at D-LK6-14 (separate cycle — requires its own JSON
-// + LC_DYLD_CHAINED_FIXUPS structure walker).
+// stance — `lazy_bind_off` stays zero). The ARM64-darwin chained-fixups
+// path (D-LK6-14) has SHIPPED and rides this same writer, keyed on the
+// schema flag `image.useChainedFixups`: it emits LC_DYLD_CHAINED_FIXUPS
+// where the legacy path emits LC_DYLD_INFO_ONLY, and needs the separate
+// LC_DYLD_EXPORTS_TRIE because the trie fields live in the command it
+// replaced (D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE).
 //
-// Layout:
+// Layout — this list is the emission ORDER, and `[optional]` marks a
+// command emitted only under the predicate named beside it. ⚠ It duplicates
+// nothing the code derives; the two authoritative counts are the `ncmds` and
+// `sizeofcmds` expressions further down, whose own enumerating comments must
+// move with this one. A stale list here reads as a spec.
 //   [mach_header_64]                                                  (32)
-//   [LC_SEGMENT_64 __PAGEZERO]                                        (72)
-//   [LC_SEGMENT_64 __TEXT + section_64{__text, __stubs}]              (72 + 80*2)
-//   [LC_SEGMENT_64 __DATA_CONST + section_64{__got}]                  (72 + 80)
+//   [LC_SEGMENT_64 __PAGEZERO]                  optional: hasPageZero  (72)
+//   [LC_SEGMENT_64 __TEXT + section_64{__text, __stubs, [__const]}]
+//   [LC_SEGMENT_64 __DATA_CONST + section_64{__got}]
+//                                            optional: hasDataConstSeg
+//   [LC_SEGMENT_64 __DATA + section_64 per role present: initialized data,
+//    thread-local vars/data/bss, zero-fill — every NAME from the schema]
+//                                                optional: hasDataSeg
 //   [LC_SEGMENT_64 __LINKEDIT]                                        (72)
-//   [LC_DYLD_INFO_ONLY]                                               (48)
-//   [LC_LOAD_DYLINKER]                                                (~24)
-//   [LC_MAIN]                                                         (24)
-//   [LC_LOAD_DYLIB[N]]                                                (~32 each)
+//   [LC_BUILD_VERSION]                     optional: emitBuildVersion  (24)
+//   [LC_ID_DYLIB]                                    optional: isDylib
+//   [LC_DYLD_CHAINED_FIXUPS]                 when useChainedFixups     (16)
+//   [LC_DYLD_EXPORTS_TRIE]              optional: emitExportsTrieCmd   (16)
+//   [LC_DYLD_INFO_ONLY]                      when !useChainedFixups    (48)
+//   [LC_LOAD_DYLINKER]                        optional: emitDylinker (~24)
+//   [LC_MAIN]                                       optional: !isDylib (24)
+//   [LC_LOAD_DYLIB[N]]                                        (~32 each)
 //   [LC_SYMTAB]                                                       (24)
 //   [LC_DYSYMTAB]                                                     (80)
+//   [LC_UUID]                                    optional: emitUuid    (24)
+//   [LC_CODE_SIGNATURE]                      optional: emitCodeSig     (16)
 //   [pad to page]
 //   [__text bytes (intra-mod relocs applied; extern rel32 → __stubs)]
 //   [__stubs bytes (6 B each: FF 25 disp32 → __got slot)]
@@ -2697,7 +3396,8 @@ encodeExecDynamic(AssembledModule const&    module,
                   TargetSchema const&       targetSchema,
                   ObjectFormatSchema const& fmt,
                   ObjectFormatSectionInfo const& secText,
-                  DiagnosticReporter&       reporter) {
+                  DiagnosticReporter&       reporter,
+                  ImageRequest const&       request) {
     auto const& id = fmt.macho();
     auto const& im = fmt.machoImage();
     // `section_64.align` is a log2 exponent; the schema row is raw bytes.
@@ -2749,6 +3449,95 @@ encodeExecDynamic(AssembledModule const&    module,
              "no LC_MAIN; validate() rejects such a schema "
              "(D-LK3-3).");
         return {};
+    }
+    // ── D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ──
+    //
+    // THE INSTALL NAME, RESOLVED ONCE, HERE, BEFORE ANY LAYOUT WORK.
+    //
+    // `image.installName` is what a client records at link time and dyld
+    // resolves at load, so it is the DYLIB'S RUNTIME IDENTITY — and an identity
+    // that is a fixed string in shared config is one identity for every artifact
+    // the format ever produces. ✔MEASURED: two distinct DSS-built dylibs both
+    // named on `--resolve-library` produced rc 0, ZERO diagnostics, and an
+    // executable recording ONE `LC_LOAD_DYLIB` — the second library's symbols
+    // absent at load — while the ELF control on the identical shape recorded
+    // two correct `DT_NEEDED` entries. The document now declares the identity as
+    // a function of the artifact (`${artifactFileName}`), which is also what
+    // ld64 does when no `-install_name` is given: the output path.
+    //
+    // ★ RESOLVED ONCE INTO A LOCAL, and that is load-bearing rather than tidy.
+    // The name is read TWICE below — once to SIZE the LC_ID_DYLIB command and
+    // once to EMIT its bytes — and two independent resolutions of one string is
+    // exactly how a `cmdsize` stops matching its payload. Everything downstream
+    // reads `resolvedInstallName`; `im.installName` is the DECLARATION and is
+    // not emitted anywhere.
+    //
+    // ★ AND THE REFUSAL IS THE POINT. A declaration naming the artifact plus an
+    // emission that cannot say which artifact it is producing has exactly one
+    // quiet resolution — substitute something fixed — and that IS the defect.
+    // So it fails loud, naming the key, the declaration and the anchor.
+    std::string resolvedInstallName;
+    if (isDylib) {
+        auto resolved = resolveArtifactIdentity(im.installName,
+                                                request.artifactFileName);
+        if (!resolved.has_value()) {
+            emit(reporter, DiagnosticCode::K_WalkerInputContractViolation,
+                 std::format(
+                     "macho::encodeExecDynamic: cannot resolve this MH_DYLIB's "
+                     "LC_ID_DYLIB identity from 'image.installName'. {} "
+                     "D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT.",
+                     resolved.error()));
+            return {};
+        }
+        resolvedInstallName = std::move(*resolved);
+    }
+    // ── D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ──
+    //
+    // THE AD-HOC CODE-SIGNATURE IDENTIFIER, RESOLVED THE SAME WAY AND IN THE
+    // SAME PLACE, because it is the same defect on a second key.
+    //
+    // `codeSignature.identifier` is the CodeDirectory's `identOffset` payload —
+    // the artifact's CODE IDENTITY. A fixed string in shared config gives every
+    // artifact a format ever produces one identity. ✔MEASURED on Apple Silicon
+    // (macOS 26.6.2, ld-1267): two DSS dylibs sharing `com.dss.dylib` LOAD, LINK
+    // and RESOLVE correctly — the ad-hoc designated requirement is CDHASH-keyed,
+    // so the identifier does not reach dyld's load path — but a code requirement
+    // `identifier "com.dss.dylib"` written for the FIRST library ACCEPTS the
+    // SECOND (rc 0 both), where the same requirement over distinct identifiers
+    // REFUSES (rc 3) and a cdhash requirement over the SAME two files REFUSES.
+    // Apple's own `codesign -s -` derives the identifier per artifact, from the
+    // output's leaf name plus its LC_UUID. So the shipped constant is not a load
+    // failure; it is two different artifacts answering to one code identity, and
+    // the reference never produces that shape by itself.
+    //
+    // ★ RESOLVED ONCE INTO A LOCAL, and load-bearing for the same reason as the
+    // install name above — the identifier is read TWICE below, once to SIZE the
+    // signature reservation (`adHocCodeSignatureSize`) and once to BUILD the
+    // blob (`buildAdHocCodeSignature`). Two independent resolutions of one
+    // string is exactly how a reservation stops matching its payload; the
+    // substrate invariant downstream would then fail loud on a defect this
+    // resolution prevents outright.
+    //
+    // ★ AND THE REFUSAL IS THE POINT, exactly as for the install name: a
+    // declaration naming the artifact plus an emission that cannot say which
+    // artifact it is producing has one quiet resolution — substitute something
+    // fixed — and that IS the defect.
+    std::string resolvedCodeSignatureIdentifier;
+    if (im.codeSignature.has_value()) {
+        auto resolvedIdentifier =
+            resolveArtifactIdentity(im.codeSignature->identifier,
+                                    request.artifactFileName);
+        if (!resolvedIdentifier.has_value()) {
+            emit(reporter, DiagnosticCode::K_WalkerInputContractViolation,
+                 std::format(
+                     "macho::encodeExecDynamic: cannot resolve this image's "
+                     "ad-hoc code-signature identity from "
+                     "'image.codeSignature.identifier'. {} "
+                     "D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT.",
+                     resolvedIdentifier.error()));
+            return {};
+        }
+        resolvedCodeSignatureIdentifier = std::move(*resolvedIdentifier);
     }
     // D-LK6-14 substrate: the useChainedFixups guard now fires at
     // outer `encode()` (covers both encodeExec + encodeExecDynamic
@@ -2855,13 +3644,28 @@ encodeExecDynamic(AssembledModule const&    module,
     // ── (b) Group externs by library (preserve declaration order)
     std::vector<std::string> libraryOrder;
     std::unordered_map<std::string, std::uint32_t> libOrdinal;
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: a COALESCING-SCOPE
+    // reference is skipped here, and it is the only import that may be. Every
+    // other Mach-O import binds against a NAMED dylib ordinal, so an empty
+    // `libraryPath` is a defect; THIS row's emptiness is its meaning — the
+    // winner may be ANY image in the process, including this one, so there is
+    // no dylib to name. Grouping it would mint a nameless library, and the
+    // guard below would then refuse the very row the format asked for.
+    std::size_t numScopeExterns = 0;
     for (auto const& ext : module.externImports) {
+        if (ext.isPreemptionReference) { ++numScopeExterns; continue; }
         if (libOrdinal.emplace(ext.libraryPath,
                 static_cast<std::uint32_t>(libraryOrder.size())).second) {
             libraryOrder.push_back(ext.libraryPath);
         }
     }
     std::size_t const numLibs = libraryOrder.size();
+    // The imports that still owe a NAMED library. `numExterns` counts every
+    // row, so the guard below has to ask about this subset or a module whose
+    // ONLY imports are coalescing-scope references reads as "externs declared
+    // but every libraryPath is empty" — the exact false report this row
+    // replaced on the refusal side.
+    std::size_t const numNamedExterns = numExterns - numScopeExterns;
     // Gated on numExterns: a zero-extern DYLIB legitimately groups
     // zero libraries (its LC_LOAD_DYLIB rows come from
     // image.loadDylibs regardless). With externs present the guard
@@ -2869,7 +3673,7 @@ encodeExecDynamic(AssembledModule const&    module,
     // against a NAMED dylib ordinal (allowsUndefinedImports() is
     // false for both image flavors, so a library-less referenced
     // extern was already rejected upstream; this is the belt).
-    if (numExterns > 0 && numLibs == 0) {
+    if (numNamedExterns > 0 && numLibs == 0) {
         emit(reporter, DiagnosticCode::K_SymbolUndefined,
              "macho::encodeExecDynamic: " +
              std::to_string(numExterns) +
@@ -3224,9 +4028,27 @@ encodeExecDynamic(AssembledModule const&    module,
     // thread-local requiring > 16-byte alignment. Reuses the format-generic
     // K_ThreadLocalOveralignedForFormat (0x8016, C3). Mach-O CAN express a
     // section align, but whether dyld over-aligns the per-thread TLV block
-    // base beyond malloc's 16 is UNVERIFIABLE without a Mac — conservative +
-    // consistent with the PE leg, never a silent under-align. A normal
-    // scalar/pointer/small aggregate (incl. _Alignas(16)) passes.
+    // base beyond malloc's 16 was UNVERIFIABLE without a Mac — conservative,
+    // never a silent under-align. A normal scalar/pointer/small aggregate
+    // (incl. _Alignas(16)) passes.
+    //
+    // ⚠⚠ THIS BOUND'S SECOND JUSTIFICATION IS GONE. It read "conservative +
+    // consistent with the PE leg", and ✔P64 moved the PE leg from 16 to 8192 on
+    // a measurement: `IMAGE_TLS_DIRECTORY64.Characteristics` carries a 4-bit
+    // alignment nibble, and the Windows loader HONOURS it — proved by a
+    // discriminator rather than a correlation, one image run twice with only that
+    // nibble edited (4096 → 42, 16 → 50, back to 4096 → md5 restored and 42
+    // again). ⇒ "Consistent with PE" now argues for raising this, not for keeping
+    // it, so it is deleted rather than left to be read as support.
+    //
+    // ★ WHAT SURVIVES IS THE HONEST HALF, AND IT IS STILL SUFFICIENT ON ITS OWN:
+    // nobody has measured what dyld does above 16. That is a question about a
+    // LOADER, and this project answers those by running on the real one — macOS
+    // is up. Until someone does, the refusal stands because it is UNMEASURED, not
+    // because a sibling format used to agree with it.
+    // ⇒ [[D-CSUBSET-THREAD-LOCAL-MACHO-OVERALIGN]] carries the same stale
+    // justification twice in its own trigger; it must now stand on dyld's
+    // behaviour or fall.
     constexpr std::uint64_t kMachoTlvBlockBaseAlign = 16;
     std::uint64_t tlsMaxAlign = 1;
     if (hasTdata) tlsMaxAlign = std::max(tlsMaxAlign, tdataLayout.maxAlign);
@@ -3313,6 +4135,83 @@ encodeExecDynamic(AssembledModule const&    module,
     bool const hasConst = !constLayout.empty();
     bool const hasData  = !dataLayout.empty();
     bool const hasBss   = !bssLayout.empty();
+    // ── D-LINK-MACHO-IMAGE-OVERALIGNED-STATIC-IS-A-LOAD-TIME-COIN-FLIP:
+    //    a STATIC stronger than the image's own mapping granularity cannot be
+    //    honoured by ANY Mach-O image, so it is REFUSED, never shipped ────────
+    //
+    // ★★ WHY MACH-O NEEDS A CEILING WHERE ELF NEEDED A PROMISE. An ELF PT_LOAD
+    // carries `p_align`, so the ELF row
+    // [[D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET]] could
+    // close its load-time half by RAISING a segment's declared granularity
+    // until it covered the strongest member the segment maps.
+    // `segment_command_64` HAS NO SUCH FIELD — `section_64.align` is read by the
+    // STATIC LINKER, never by dyld — and every darwin image this writer emits is
+    // base-relative (MH_PIE exec, MH_DYLIB), so its final address is the
+    // link-time one plus a slide dyld chooses at a multiple of the VM page size.
+    // An object asking for more than a page therefore keeps the address chosen
+    // here and LOSES its alignment at load, on roughly half of all runs, with
+    // nothing in the image recording that it happened.
+    //
+    // ✔MEASURED ON THE REFERENCE — Apple Silicon, macOS 26.6.2, Apple clang
+    // 21.0.0, ld PROJECT:ld-1267 — each port probed SEPARATELY on one source,
+    // BUILD **and** RUN, twenty runs per cell because one run decides nothing
+    // about a coin flip:
+    //   * arm64 (page 16384): align 16 / 4096 / 16384 return 42 twenty times out
+    //     of twenty. align 32768 makes ld64 WARN "reducing alignment of section
+    //     __DATA,__data from 0x8000 to 0x4000 because it exceeds segment maximum
+    //     alignment", and the program then returns 50 or 54 BY RUN — never 42.
+    //   * x86_64 (page 4096): align 4096 returns 42. align 8192 draws the SAME
+    //     warning with the numbers 0x2000 -> 0x1000, and flickers 50/52 by run.
+    // ⇒ THE CAP TRACKS THE PAGE AND THE REFERENCE NAMES IT: 0x4000 on the 16 KiB
+    // port, 0x1000 on the 4 KiB one — a page, not a constant.
+    // `-Wl,-segalign,0x8000` does not lift it: ld64 refuses the link outright
+    // with "chained fixups, page_size not 4KB or 16KB in segment #2".
+    //
+    // ★ SO NO REFERENCE MAKES AN ABOVE-PAGE STATIC *WORK* ON MACH-O, and under
+    // `DSS = (gcc union clang union MSVC)` the union is over what WORKS: a
+    // reference that accepts a request and then ships a program wrong half the
+    // time casts no vote. DSS is one notch stricter than ld64 deliberately —
+    // ld64 warns and continues; this project does not ship a warning where the
+    // outcome is a silent, non-deterministic miscompile.
+    //
+    // ⚠ WHAT STOOD HERE WAS NOTHING AT ALL. The thread-local ceiling above is
+    // the only alignment gate this walker had; a STATIC was placed at whatever
+    // it asked for and the coin flip shipped without even ld64's warning.
+    //
+    // ⓘ THE NUMBER IS READ FROM THE DOCUMENT, never from the architecture:
+    // `image.segmentPageSize` is the same key every LC_SEGMENT_64 vmaddr/fileoff
+    // is already rounded to, so the ceiling and the granularity it protects
+    // cannot drift apart, and there is no format or cputype test here.
+    //
+    // ⚠ `__bss` IS INCLUDED THOUGH IT STORES NO FILE BYTES. Its VA is slid
+    // exactly like a file-backed section's, so a zero-fill static is as exposed
+    // as an initialized one. The ELF row's `.bss` arm was the half that had
+    // always been RIGHT, and the reason was that ELF could raise `p_align` — so
+    // that asymmetry does NOT carry over, and assuming it did is how this gate
+    // would have been written to cover half the sections.
+    {
+        std::uint64_t staticMaxAlign = 1;
+        if (hasConst) staticMaxAlign = std::max(staticMaxAlign, constLayout.maxAlign);
+        if (hasData)  staticMaxAlign = std::max(staticMaxAlign, dataLayout.maxAlign);
+        if (hasBss)   staticMaxAlign = std::max(staticMaxAlign, bssLayout.maxAlign);
+        if (staticMaxAlign > kPageSize) {
+            emit(reporter, DiagnosticCode::K_StaticObjectOveralignedForFormat,
+                 std::format(
+                     "macho::encodeExecDynamic: a statically allocated object "
+                     "requires {}-byte alignment, but this image's mapping "
+                     "granularity is {} bytes ('image.segmentPageSize') and "
+                     "Mach-O's segment_command_64 carries NO alignment field — "
+                     "dyld slides a base-relative image by a multiple of that "
+                     "page size, so the object would be correctly aligned on "
+                     "some runs and misaligned on others with no diagnostic. "
+                     "Lower the request to {} or less (ld64 stops at the same "
+                     "number, reducing the section alignment to the page and "
+                     "warning \"exceeds segment maximum alignment\") "
+                     "(D-LINK-MACHO-IMAGE-OVERALIGNED-STATIC-IS-A-LOAD-TIME-COIN-FLIP).",
+                     staticMaxAlign, kPageSize, kPageSize));
+            return {};
+        }
+    }
     // TLS C4: the three __thread_* sections also live in __DATA, so any
     // thread-local forces the writable segment even with no ordinary globals.
     bool const hasDataSeg = hasData || hasBss || hasTls;   // needs __DATA
@@ -3441,6 +4340,68 @@ encodeExecDynamic(AssembledModule const&    module,
                  std::to_string(module.externImports[i].symbol.v) +
                  " collides with another symbol — caller must give each "
                  "extern a unique SymbolId.");
+            return {};
+        }
+    }
+    // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING (THE ADDRESS HALF) —
+    // the Mach-O realization, and it is the SAME slot the weak-bind stream
+    // already targets, made NAMEABLE.
+    //
+    // An import may carry a SECOND, module-local symbol
+    // (`ExternImport::addressSlotSymbol`) whose VA is the slot holding this
+    // import's LOADER-RESOLVED ADDRESS. It exists because under `direct-plt`
+    // the import's own `symbolVa` is the `__stubs` STUB — correct for a CALL,
+    // and NOT the function's address: two images asked for `&w` would answer
+    // with two different pointers for one identifier (C 6.2.2p2 gives one
+    // identifier one function across the whole program). The ADDRESS wants the
+    // slot's CONTENT, which is what `lowerGlobalAddr`'s lea-of-slot + deref
+    // reads.
+    //
+    // ✔MEASURED 2026-09-07 on the operator's Apple Silicon host (macOS 26.6.2 /
+    // Darwin 25.6.0, Apple clang 21.0.0 (clang-2100.1.1.101), ld-1267) — the
+    // probe P62 deliberately did NOT run, because carrying the CALL-form
+    // measurement onto an address-taken definition would have been a template
+    // claiming a probe it never ran. `clang -dynamiclib` over
+    //     __attribute__((weak)) int w(void) { return 1; }
+    //     int (*take_w(void))(void) { return w; }
+    // emits `__DATA_CONST __got 0x4000 bind <weak-def-coalesce>/_w` and lowers
+    // the address-take to `adrp x0, __got@page` + `ldr x0, [x0]` — a LOAD of
+    // the slot, not an `add` of a local body. Built `-Wl,-no_fixup_chains` the
+    // same source gives bind_size 0 and weak_bind_size 16, bytes
+    // `40 5f 77 00 51 71 00 90 00` = SET_SYMBOL_TRAILING_FLAGS_IMM(0) "_w"\0 |
+    // SET_TYPE_IMM(BIND_TYPE_POINTER) | SET_SEGMENT_AND_OFFSET_ULEB(seg 1 ==
+    // __DATA_CONST)+0 | DO_BIND | DONE — the SAME stream shape the CALL form
+    // was pinned against, with NO dylib ordinal in it. TWO CONTROLS from the
+    // same clang in the same run make that non-vacuous: a STRONG-global and a
+    // `static` definition addressed the same way both stay DIRECT (`adrp`+`add`)
+    // with all four DYLD bands EMPTY, which is also why the Mach-O preemptible
+    // set is `["weak"]` and a strict subset of ELF's.
+    //
+    // ⇒ NOTHING NEW IS EMITTED HERE. The `__got` slot at index `i` already
+    // exists for this import and is already bound to the coalescing winner —
+    // `appendWeakBindEntry` on the legacy rail, `lib_ordinal` -3 on the chained
+    // one. What was missing is that the slot had NO NAME, so the address-take
+    // had nothing to load. The VA is therefore the SAME expression the DATA-
+    // extern arm above uses, and it is bound in the SAME place: after the __got
+    // start VA is known and BEFORE `applyExecRelocations`, so the code
+    // relocation resolves through the shared kernel.
+    //
+    // (A DATA import's own VA already IS its slot, so a slot symbol on one
+    // lands on the same VA — redundant rather than wrong. The ELF sibling in
+    // `elf.cpp`'s `encodeElfExecDynamic` says the same and computes the same.)
+    for (std::size_t i = 0; i < numExterns; ++i) {
+        SymbolId const slotSym = module.externImports[i].addressSlotSymbol;
+        if (!slotSym.valid()) continue;
+        std::uint64_t const slotVa =
+            gotVaStart + static_cast<std::uint64_t>(i) * kGotSlotSize;
+        if (!symbolVa.emplace(slotSym, slotVa).second) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::format(
+                     "macho::encodeExecDynamic: the address slot symbol #{} of "
+                     "extern '{}' collides with another symbol's VA — the slot "
+                     "names one loader-resolved address and cannot be shared. "
+                     "D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING.",
+                     slotSym.v, module.externImports[i].mangledName));
             return {};
         }
     }
@@ -3593,16 +4554,62 @@ encodeExecDynamic(AssembledModule const&    module,
     // on the base-0 dylib); symbolVa is COMPLETE here (functions,
     // data, bss, interior blocks), so a lookup miss is a producer-
     // contract breach — fail loud, the c150 "names neither" mirror.
-    // A WEAK export fails loud: Mach-O weak-definition semantics
-    // need EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION + the MH_WEAK_DEFINES
-    // header bit + weak-bind machinery this cycle does not ship
-    // (D-LK3-DYLIB-WEAK-EXPORT) — silently exporting it strong
-    // would change cross-image coalescing semantics.
-    // The exec arm builds NO exports (exportTrieBlob stays empty and
-    // LC_DYLD_INFO's export fields stay 0/0) — byte-identical, the
-    // mandatory control.
+    // A WEAK export carries EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION on its
+    // terminal (D-LK3-DYLIB-WEAK-EXPORT): that bit, not N_WEAK_DEF, is
+    // what dyld's coalescing pass reads, and it is set from the SAME
+    // `SymbolBinding` the nlist band reads through `definedNDesc`.
+    //
+    // ★★ THE EXEC ARM NOW BUILDS A TRIE TOO — FOR ITS WEAK DEFINITIONS,
+    // AND ONLY THOSE. It used to build none at all (`exportTrieBlob`
+    // stayed empty and LC_DYLD_INFO's export fields 0/0), which meant a
+    // weak definition in an executable was published with no coalescing
+    // surface whatsoever — the silent downgrade this row exists to
+    // close. ⚠ THE NARROWING IS DELIBERATE AND THE ALTERNATIVE WAS
+    // MEASURED: ld64's executable trie carries EVERY externally-visible
+    // definition, FUNCTIONS AND DATA ALIKE, plus a symbol DSS's image
+    // writer does not synthesize at all (✔MEASURED 2026-09-05 on Apple
+    // Silicon, Apple clang 21.0.0 / ld-1267: a weak-free control exec's
+    // trie reads `__mh_execute_header`, `_data_global`, `_helper`,
+    // `_main`; adding one weak definition adds `_weak_one [weak-def]`
+    // and changes nothing else). Publishing an
+    // executable's whole defined set is an ABI-SURFACE decision — it is
+    // what `dlsym(RTLD_DEFAULT, …)` and a `-undefined dynamic_lookup`
+    // client would then find in the main image — and this row does not
+    // settle it; coalescing needs the weak terminals and nothing else.
+    // A DYLIB is the opposite case and keeps the whole set: its exports
+    // ARE its ABI.
+    // ⚠ AND THE SCOPE IS A POLICY IN CODE WITH NO CONFIG KEY, WHICH IS
+    // ITSELF A ROW: [[D-LK3-EXEC-EXPORT-SCOPE-NOT-CONFIG-DRIVEN]]. The
+    // `isDylib` test below decides an EXPORT-SURFACE question from the
+    // filetype, where the bar wants the vocabulary in the `.format.json`
+    // (an `image.exportScope`-shaped key each image document declares).
+    // It is not WRONG today — it is what makes a weak-free exec byte-
+    // identical to its pre-change self — but it is a format fact living
+    // in the walker, and the row carries the design plus the ld64
+    // measurement so the next cycle lands the key in one piece rather
+    // than as a required field discovered by every hand-written Mach-O
+    // image fixture at once.
+    //
+    // ⓘ An exec with no weak definition therefore still emits ZERO
+    // export bytes and 0/0 export fields — byte-identical to before,
+    // the mandatory control.
     std::vector<std::uint8_t> exportTrieBlob;
-    if (isDylib) {
+    // Weak-def terminals actually PUBLISHED. The mach header's
+    // MH_WEAK_DEFINES/MH_BINDS_TO_WEAK bits are derived from this and
+    // not from "the module contains a weak row", so the header can only
+    // advertise a coalescing surface this trie really carries.
+    std::size_t numWeakExports = 0;
+    if (isDylib || link::format::moduleDefinesWeakSymbol(module)) {
+        // ⚠ THE THREE PRODUCER-CONTRACT REFUSALS BELOW ARE REACHABLE FROM
+        // BOTH FLAVORS NOW, so they name the flavor they actually fired on
+        // instead of the `(MH_DYLIB)` they were written under. A diagnostic
+        // that names the wrong arm sends the reader to the wrong writer —
+        // the D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM lesson one
+        // tier down (a message naming the wrong key is fail-misleading).
+        char const* const exportWhere =
+            isDylib ? "macho::encodeExecDynamic (MH_DYLIB export trie)"
+                    : "macho::encodeExecDynamic (MH_EXECUTE weak-def "
+                      "export trie)";
         std::vector<ExportTrieNode> trie;
         trie.push_back(ExportTrieNode{});   // root
         // Classify each export row against the DEFINITION tables
@@ -3636,24 +4643,15 @@ encodeExecDynamic(AssembledModule const&    module,
         for (auto const& ms : module.symbols) {
             if (ms.name.empty()) continue;
             if (!isExternallyVisible(ms.binding, ms.visibility)) continue;
-            if (ms.binding == SymbolBinding::Weak) {
-                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                     std::format(
-                         "macho::encodeExecDynamic (MH_DYLIB): symbol "
-                         "'{}' is a WEAK definition -- Mach-O weak "
-                         "exports need EXPORT_SYMBOL_FLAGS_WEAK_"
-                         "DEFINITION + MH_WEAK_DEFINES + weak-bind "
-                         "machinery not yet shipped "
-                         "(D-LK3-DYLIB-WEAK-EXPORT); exporting it "
-                         "strong would silently change cross-image "
-                         "coalescing semantics.",
-                         ms.name));
-                return {};
-            }
+            bool const isWeakDefinition =
+                ms.binding == SymbolBinding::Weak;
+            // The exec arm publishes its WEAK definitions and nothing
+            // else — see the narrowing note above.
+            if (!isDylib && !isWeakDefinition) continue;
             if (externSyms.contains(ms.symbol.v)) {
                 emit(reporter, DiagnosticCode::K_SymbolUndefined,
                      std::format(
-                         "macho::encodeExecDynamic (MH_DYLIB): "
+                         "{}: "
                          "ModuleSymbol '{}' (SymbolId #{}) names an "
                          "EXTERN IMPORT -- exporting it would place "
                          "the image-local indirection cell (__stubs "
@@ -3661,46 +4659,52 @@ encodeExecDynamic(AssembledModule const&    module,
                          "dlsym would return that cell instead of the "
                          "real symbol (producer contract: ModuleSymbol "
                          "rows describe DEFINITIONS only).",
-                         ms.name, ms.symbol.v));
+                         exportWhere, ms.name, ms.symbol.v));
                 return {};
             }
             if (!definedFuncSyms.contains(ms.symbol.v)
                 && !definedDataSyms.contains(ms.symbol.v)) {
                 emit(reporter, DiagnosticCode::K_SymbolUndefined,
                      std::format(
-                         "macho::encodeExecDynamic (MH_DYLIB): "
+                         "{}: "
                          "ModuleSymbol '{}' (SymbolId #{}) names "
                          "neither a defined function nor a data item "
                          "-- the export trie cannot place it (producer "
                          "contract: one ModuleSymbol row per DEFINED "
                          "function/global).",
-                         ms.name, ms.symbol.v));
+                         exportWhere, ms.name, ms.symbol.v));
                 return {};
             }
             auto const vaIt = symbolVa.find(ms.symbol);
             if (vaIt == symbolVa.end()) {
                 emit(reporter, DiagnosticCode::K_SymbolUndefined,
                      std::format(
-                         "macho::encodeExecDynamic (MH_DYLIB): defined "
+                         "{}: defined "
                          "symbol '{}' (SymbolId #{}) has no resolved "
                          "VA -- the definition tables and symbolVa "
                          "disagree (substrate invariant violation).",
-                         ms.name, ms.symbol.v));
+                         exportWhere, ms.name, ms.symbol.v));
                 return {};
             }
             // flags = EXPORT_SYMBOL_FLAGS_KIND_REGULAR (0) — code and
-            // data exports share the kind; imageOffset is relative to
+            // data exports share the kind — OR'd with
+            // EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION for a WEAK definition
+            // (D-LK3-DYLIB-WEAK-EXPORT); imageOffset is relative to
             // the mach header (== __TEXT.vmaddr == im.pageZeroSize).
-            if (!insertExport(trie, ms.name, /*flags=*/0,
+            std::uint64_t const exportFlags =
+                isWeakDefinition ? EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION
+                                 : std::uint64_t{0};
+            if (isWeakDefinition) ++numWeakExports;
+            if (!insertExport(trie, ms.name, exportFlags,
                               vaIt->second - im.pageZeroSize)) {
                 emit(reporter, DiagnosticCode::K_DuplicateDataSymbol,
                      std::format(
-                         "macho::encodeExecDynamic (MH_DYLIB): export "
+                         "{}: export "
                          "name '{}' inserted twice into the export "
                          "trie -- two externally-visible definitions "
                          "share one name (the cross-CU merge should "
                          "have collapsed or rejected them).",
-                         ms.name));
+                         exportWhere, ms.name));
                 return {};
             }
             ++numExports;
@@ -3717,8 +4721,15 @@ encodeExecDynamic(AssembledModule const&    module,
             }
         }
         // Zero exports leave the blob EMPTY — LC_DYLD_INFO_ONLY then
-        // carries export_off = export_size = 0, a legal dylib whose
-        // dlsym lookups all miss (nothing externally visible).
+        // carries export_off = export_size = 0 (and the chained arm emits
+        // no LC_DYLD_EXPORTS_TRIE at all: same convention, one command
+        // lower down), a legal dylib whose
+        // dlsym lookups all miss (nothing externally visible), and the
+        // pre-existing exec bytes for a module whose only weak rows are
+        // hidden (`moduleDefinesWeakSymbol` counts a hidden weak
+        // definition, `isExternallyVisible` refuses to export one —
+        // which is why the header bits below read `numWeakExports` and
+        // not that predicate).
     }
 
     // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): patch each symbol-address global
@@ -3826,8 +4837,135 @@ encodeExecDynamic(AssembledModule const&    module,
                     return {};
                 }
                 dataRebaseSiteVas.erase(siteIt);
+                // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING, THE
+                // ADDRESS HALF — REFUSED HERE RATHER THAN MIS-ENCODED BELOW.
+                // Both extern-address bind emitters (the legacy opcode loop
+                // over this list, and the chained path's own guard) resolve a
+                // row's dylib ordinal from `libraryPath`. A coalescing-scope
+                // reference has NO library by construction, so `dylibOrdinal`
+                // would miss and hand back 0 == BIND_SPECIAL_DYLIB_SELF — "bind
+                // to THIS image's own definition", which is the exact defect
+                // this anchor closed on the CALL side, silently re-encoded on
+                // the DATA side.
+                // ⓘ UNREACHABLE TODAY and refused anyway: MIR→LIR's `lowerCall`
+                // and `lowerGlobalAddr` are the only minters of preemption
+                // references, and neither puts one in a DATA relocation.
+                // ⚠ THE FORECAST THIS COMMENT USED TO CARRY IS ✔MEASURED FALSE
+                // (P63) AND IS CORRECTED RATHER THAN QUIETLY DROPPED, because a
+                // wrong forecast at a backstop is what sends the next lane to
+                // the wrong file. It said the ADDRESS half "will arrive HERE".
+                // It does not: `lowerGlobalAddr` mints a SECOND symbol
+                // (`ExternImport::addressSlotSymbol`) and emits a lea-of-slot +
+                // deref in CODE, so the address half arrives at the __got
+                // symbolVa binding above — a code relocation through
+                // `applyExecRelocations` — and never at a data-item one. That
+                // half has SHIPPED and this refusal never fired for it.
+                // ⇒ THE REFUSAL STAYS, as a backstop and not as a placeholder:
+                // `dylibOrdinal("")` returns 0 == BIND_SPECIAL_DYLIB_SELF, so a
+                // producer that ever DID route a coalescing-scope reference
+                // into a data relocation would get "bind to this image's own
+                // definition" with rc 0 — the fails-to-WRONG-ANSWER direction,
+                // which is the one that must never be left naked. Deleting a
+                // loud refusal because its forecast was wrong would trade a
+                // measured guard for a measured hole.
+                // ⓘ The STATIC-INITIALIZER form (`int (*p)(void) = w;`) is a
+                // different shape and is handled below, on the DEFINITION side,
+                // by the `collectPreemptibleDefinitions` fold — it never
+                // produces an extern-targeted row and so never reaches here.
+                if (module.externImports[extIt->second].isPreemptionReference) {
+                    emit(reporter,
+                         DiagnosticCode::K_WalkerInputContractViolation,
+                         std::format(
+                             "macho::encodeExecDynamic: __DATA slot VA 0x{:x} "
+                             "takes the ADDRESS of '{}', a coalescing-scope "
+                             "(preemptible) definition. This walker encodes "
+                             "such references only at CALL sites, where the "
+                             "LC_DYLD_INFO_ONLY weak-bind stream carries them; "
+                             "a data slot is bound through the ordinary stream, "
+                             "which names a dylib ordinal that a "
+                             "coalescing-scope reference does not have. "
+                             "Emitting it there would bind the slot to this "
+                             "image's own definition and disagree with every "
+                             "other image in the process. "
+                             "D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING.",
+                             slotVa,
+                             module.externImports[extIt->second].mangledName));
+                    return {};
+                }
                 externAddrBindSites.push_back(
                     ExternAddrBindSite{slotVa, extIt->second, rel.addend});
+            }
+        }
+    }
+
+    // ── ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING ───────────────────
+    //    THE STATIC-INITIALIZER FORM, ON THE MACH-O RAIL.
+    //
+    // `int (*p)(void) = w;` at FILE SCOPE, inside an image whose format
+    // declares `w`'s binding PREEMPTIBLE. `applyDataItemRelocations` has just
+    // baked this artifact's OWN body VA into the slot and the site is queued for
+    // a REBASE — so the loader slides the local address and `p` inside the
+    // library disagrees with `&w` in the image that actually won the name. One
+    // identifier, two functions, rc 0, nothing diagnosed (C 6.2.2p2).
+    //
+    // ✔MEASURED THAT DSS DID EXACTLY THAT before this fold, on a real arm64
+    // darwin dylib built by this compiler: `rebase 8 = 1121005100000000`,
+    // `weak_bind 0`. And ✔MEASURED what ld64 emits for the same source on Apple
+    // Silicon (macOS 26.6.2, Apple clang 21.0.0, ld-1267): chained
+    // `__DATA __data 0x4000 bind <weak-def-coalesce>/_w2`, and under
+    // `-Wl,-no_fixup_chains` the SAME `rebase 8 1121005100000000` DSS already
+    // emits PLUS `weak_bind 16 = 405f7732005171009000…`.
+    //
+    // ⇒ SO THE FIX IS TO ADD THE WEAK BIND AND KEEP THE REBASE, which makes the
+    // legacy stream byte-for-byte ld64's. The rebase is not redundant belt: it
+    // leaves the artifact's own body in the slot as the value a loader that ran
+    // no coalescing pass would see, which is what the reference itself ships.
+    // (This is the OPPOSITE decision from the extern-address fold above, and
+    // deliberately: there the baked value is an image-local INDIRECTION CELL,
+    // meaningless if the bind never lands, so zeroing it is right. Here it is a
+    // real, callable definition — this image's own answer.)
+    //
+    // WHICH definitions qualify is NOT decided here: the format-neutral
+    // `collectPreemptibleDefinitions` asks the ONE owner
+    // (`definitionIsPreemptible`) against this format's DECLARED
+    // `preemptibleDefinitionBindings` — `["weak"]` on the two darwin dylib
+    // documents, absent on every exec/relocatable flavour, where the set is
+    // empty and every byte below is unchanged. The same selector `elf.cpp` uses,
+    // so the two writers cannot drift on WHICH; only the ENCODING is per format
+    // (a `.rela.dyn` symbol row there, a weak bind here).
+    //
+    // The bind NAME comes from the same `module.symbols` row the export trie
+    // publishes, so what dyld is asked to resolve and what this image exports
+    // cannot disagree.
+    struct PreemptibleDefBindSite {
+        std::uint64_t slotVa = 0;
+        std::string   name;
+        std::int64_t  addend = 0;
+    };
+    std::vector<PreemptibleDefBindSite> preemptibleDefBindSites;
+    if (hasData) {
+        std::unordered_set<SymbolId> const preemptibleDefs =
+            link::format::collectPreemptibleDefinitions(
+                module, fmt.preemptibleDefinitionBindings());
+        if (!preemptibleDefs.empty()) {
+            std::unordered_map<SymbolId, std::string> preemptibleDefName;
+            preemptibleDefName.reserve(preemptibleDefs.size());
+            for (auto const& ms : module.symbols) {
+                if (!preemptibleDefs.contains(ms.symbol)) continue;
+                preemptibleDefName.emplace(ms.symbol, ms.name);
+            }
+            for (std::size_t j = 0; j < dataLayout.itemIndices.size(); ++j) {
+                auto const& di = module.dataItems[dataLayout.itemIndices[j]];
+                for (auto const& rel : di.relocations) {
+                    auto const nameIt = preemptibleDefName.find(rel.target);
+                    if (nameIt == preemptibleDefName.end()) continue;
+                    std::uint64_t const slotVa = dataSecVa
+                        + dataLayout.itemOffsets[j]
+                        + static_cast<std::uint64_t>(rel.offset);
+                    preemptibleDefBindSites.push_back(
+                        PreemptibleDefBindSite{slotVa, nameIt->second,
+                                               rel.addend});
+                }
             }
         }
     }
@@ -3919,6 +5057,46 @@ encodeExecDynamic(AssembledModule const&    module,
     // library resolves to ITS ordinal (not libSystem's) — each import's
     // BIND_OPCODE_SET_DYLIB_ORDINAL then targets the dylib that actually
     // exports it.
+    // ⚠⚠ THE MISS VALUE IS 0, AND 0 IS NOT "NOT FOUND" ON THE WIRE — it is
+    // SELF_LIBRARY_ORDINAL / BIND_SPECIAL_DYLIB_SELF, a MEANINGFUL ordinal that
+    // says "this image's own definition". So this helper fails toward a WRONG
+    // ANSWER rather than toward an error, and its call sites must be sorted by
+    // the direction each one fails in
+    // (D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING).
+    //
+    // ★ AND THE SORTING IS NOT UNIFORM — ✔MEASURED P63, correcting the
+    // assumption that this is simply a hole to plug. There are FIVE call sites
+    // and THREE kinds among them; 0 means something different in each:
+    //   * THE BIND STREAMS (the chained-import loop, the legacy bind loop, the
+    //     extern-address bind loop). A coalescing-scope reference has NO library
+    //     by construction, and binding it to ordinal 0 there would tell dyld to
+    //     resolve the slot from THIS image — the exact defect this anchor
+    //     closed. Every one of those sites therefore asks `isPreemptionReference`
+    //     BEFORE calling this, and the data-slot fold above REFUSES the shape
+    //     outright rather than reaching the call at all.
+    //   * THE `nlist_64` UND ROWS below, where 0 is CORRECT and must stay: a
+    //     coalescing-scope import is not resolved from a named library, so
+    //     SELF_LIBRARY_ORDINAL is precisely what its `n_desc` should carry, and
+    //     the real resolution comes from the weak-bind stream. Making this
+    //     helper fail loud on a miss would REFUSE the shape that is shipped and
+    //     run-witnessed on Apple Silicon.
+    //   * THE TLV BOOTSTRAP BIND, which asks for `kTlvBootstrapLibrary` by name.
+    //     Here 0 means the library is genuinely ABSENT from `image.loadDylibs`,
+    //     which is neither correct nor guardable beforehand — so that site tests
+    //     the result and emits `K_SymbolUndefined` rather than binding it.
+    //     ⓘ This third kind was MISSING from the enumeration above when the
+    //     enumeration first shipped (it said "two kinds", over four of the five
+    //     sites), and it was the omitted one that best ILLUSTRATES the rule the
+    //     paragraph below states — it is the call site that hardens itself.
+    //     A taxonomy that drops its own clearest example is the same defect class
+    //     this file's `ncmds` enumerations carried: these comments rot by
+    //     OMISSION, never by arithmetic.
+    // ⇒ Do not "harden" this by returning an error. Harden the CALL SITES, and
+    // only the ones whose failure direction is wrong.
+    //
+    // A path that is genuinely absent is unreachable: `emittedDylibs` is the
+    // schema list UNION every referenced library, so every non-empty
+    // `libraryPath` is in it by construction.
     auto dylibOrdinal = [&](std::string const& path)
                           -> std::uint32_t {
         for (std::size_t i = 0; i < emittedDylibs.size(); ++i) {
@@ -3926,7 +5104,7 @@ encodeExecDynamic(AssembledModule const&    module,
                 return static_cast<std::uint32_t>(i + 1);
             }
         }
-        return 0;  // unreachable — every libraryOrder entry is in emittedDylibs
+        return 0;  // SELF_LIBRARY_ORDINAL — see the docblock above
     };
 
     // ── (i) Build dyld-binding bytes ─────────────────────────────
@@ -3937,14 +5115,22 @@ encodeExecDynamic(AssembledModule const&    module,
     // is what lands in __LINKEDIT at `dyldBindOff`; the load-command
     // emission below picks the matching LC.
     //
-    // D-LK6-14-INTEGRATION-PAYLOAD (this commit): the chained-fixups
-    // arm calls `dss::macho::detail::buildChainedFixupsPayload` and
-    // emits LC_DYLD_CHAINED_FIXUPS pointing at the result. __got
-    // slots remain zero-initialized — D-LK6-14-INTEGRATION-GOT-SLOTS
-    // is the companion fold that populates them as
-    // DYLD_CHAINED_PTR_64 bitfields + drops LC_DYSYMTAB.
+    // D-LK6-14-INTEGRATION-PAYLOAD: the chained-fixups arm calls
+    // `dss::macho::detail::buildChainedFixupsPayload` and emits
+    // LC_DYLD_CHAINED_FIXUPS pointing at the result;
+    // D-LK6-14-INTEGRATION-GOT-SLOTS is the companion fold that
+    // populates the __got slots as DYLD_CHAINED_PTR_64 bitfields.
+    // ⚠ That fold ALSO dropped LC_DYSYMTAB, and
+    // [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]]
+    // put it back: the two commands are ORTHOGONAL, exactly as they
+    // are in ld64's own chained output.
     bool const useChainedFixups = im.useChainedFixups;
     std::vector<std::uint8_t> dyldBindBlob;
+    // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the SECOND opcode stream,
+    // LC_DYLD_INFO_ONLY.weak_bind_off. Empty unless this module carries a
+    // coalescing-scope reference, and an empty stream is reported as 0/0 —
+    // so every image that had none is byte-identical to before.
+    std::vector<std::uint8_t> dyldWeakBindBlob;
     // `chainedImports` is built in section (i) for the chained path
     // and consumed AFTER layout (section l.5 below) when
     // `segmentOffset = gotVa - im.pageZeroSize` is known (per Apple
@@ -3989,6 +5175,18 @@ encodeExecDynamic(AssembledModule const&    module,
         }
         chainedImports.reserve(numExterns);
         for (auto const& ext : module.externImports) {
+            // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the chained
+            // encoding of "resolve from the loader's coalescing scope" is the
+            // SPECIAL ordinal BIND_SPECIAL_DYLIB_WEAK_LOOKUP (-3), which
+            // `dyld_info -fixups` renders `<weak-def-coalesce>`. Asked BEFORE
+            // `dylibOrdinal`, whose miss value is 0 == BIND_SPECIAL_DYLIB_SELF
+            // — a DIFFERENT special ordinal that would bind the slot to this
+            // image's own definition and reintroduce the defect silently.
+            if (ext.isPreemptionReference) {
+                chainedImports.push_back({ext.mangledName,
+                                          kBindSpecialDylibWeakLookup, false});
+                continue;
+            }
             std::uint32_t const ord = dylibOrdinal(ext.libraryPath);
             // DYLD_CHAINED_IMPORT.lib_ordinal is a SIGNED 8-bit field.
             // Ordinals 1..127 are valid; > 127 is architecturally
@@ -4039,6 +5237,34 @@ encodeExecDynamic(AssembledModule const&    module,
         // cross-check below fails loud if the actual order desyncs.
         for (std::size_t i = 0; i < numExterns; ++i) {
             auto const& ext = module.externImports[i];
+            // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING — THE LEGACY
+            // REALIZATION, and it is a DIFFERENT STREAM, not a different
+            // ordinal.
+            //
+            // ✔MEASURED 2026-09-06 on the operator's Apple Silicon host (macOS
+            // 25.6.0, Apple clang 21.0.0 / ld-1267), `clang -dynamiclib
+            // -Wl,-no_fixup_chains` over
+            // `__attribute__((weak)) int w(void){return 1;}
+            //  int from_dylib(void){return w();}`:
+            //     bind_size 0, weak_bind_size 16,
+            //     weak bytes = 40 5f 77 00 51 71 00 90 00 …
+            //   = SET_SYMBOL_TRAILING_FLAGS_IMM(0) "_w"\0
+            //   | SET_TYPE_IMM(BIND_TYPE_POINTER)
+            //   | SET_SEGMENT_AND_OFFSET_ULEB(seg 1 == __DATA_CONST) +0
+            //   | DO_BIND | DONE
+            // — NO dylib ordinal appears at all, which is the whole point: the
+            // weak stream IS the coalescing scope, so dyld searches every
+            // loaded image rather than one named library. The CONTROLS in the
+            // same probe, built by the same clang from the same shape: a
+            // STRONG global callee and a `static` callee each disassemble to a
+            // DIRECT `bl` with weak_bind_size 0 — which is why the Mach-O
+            // preemptible set is `["weak"]` and a strict subset of ELF's.
+            if (ext.isPreemptionReference) {
+                appendWeakBindEntry(dyldWeakBindBlob, ext.mangledName,
+                                    segIdxDataConst,
+                                    static_cast<std::uint64_t>(i) * kGotSlotSize);
+                continue;
+            }
             std::uint32_t const ord = dylibOrdinal(ext.libraryPath);
             if (ord <= 0x0F) {
                 dyldBindBlob.push_back(static_cast<std::uint8_t>(
@@ -4161,11 +5387,45 @@ encodeExecDynamic(AssembledModule const&    module,
                 dyldBindBlob.push_back(BIND_OPCODE_DO_BIND);
             }
         }
+        // ── ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING, THE
+        //    STATIC-INITIALIZER FORM: one COALESCING-SCOPE bind per __DATA slot
+        //    that initializes to the address of one of THIS image's own
+        //    preemptible definitions (the sites collected in section (e.5)).
+        //
+        //    It goes in the WEAK stream, not this one, for the reason the call
+        //    form does: the weak stream carries NO dylib ordinal, which is
+        //    precisely what makes dyld search every loaded image for the
+        //    coalescing winner instead of one named library. Emitted AFTER the
+        //    call-form entries so the interpreter's addend register — which
+        //    starts 0 and which nothing before this touches — is only moved by
+        //    a site that actually needs it (`&tbl[2]` of a weak array; a
+        //    function address never carries one).
+        {
+            std::int64_t runningWeakAddend = 0;
+            for (auto const& site : preemptibleDefBindSites) {
+                if (site.addend != runningWeakAddend) {
+                    dyldWeakBindBlob.push_back(BIND_OPCODE_SET_ADDEND_SLEB);
+                    appendSLEB128(dyldWeakBindBlob, site.addend);
+                    runningWeakAddend = site.addend;
+                }
+                appendWeakBindEntry(dyldWeakBindBlob, site.name, segIdxData,
+                                    site.slotVa - dataSegVaEarly);
+            }
+        }
         dyldBindBlob.push_back(BIND_OPCODE_DONE);
         // dyld parses the bind stream byte-by-byte; pad to 8 for
         // load-command alignment downstream.
         while (dyldBindBlob.size() % kLoadCmdAlign != 0)
             dyldBindBlob.push_back(0);
+        // The coalescing-scope stream is terminated and padded the SAME way,
+        // and only when it has content — an image with no such reference emits
+        // a zero-length weak stream and byte-identical bytes to before
+        // (D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING).
+        if (!dyldWeakBindBlob.empty()) {
+            dyldWeakBindBlob.push_back(BIND_OPCODE_DONE);
+            while (dyldWeakBindBlob.size() % kLoadCmdAlign != 0)
+                dyldWeakBindBlob.push_back(0);
+        }
     }
 
     // ── (k) Build nlist_64 + string table: defined symbols first,
@@ -4221,14 +5481,29 @@ encodeExecDynamic(AssembledModule const&    module,
     // `dlsym(handle, "lib_static_helper")` stays NULL after this change while
     // `dlsym(handle, "dss_lib_entry")` resolves and calls correctly.
     //
-    // NOTE: exported DATA globals appear in the trie only — the dynamic arm's
-    // nlist carries functions + undefined externs (extending it is a
-    // numDefs/LC_DYSYMTAB re-shape deferred until a consumer needs `nm`
-    // visibility for data; dlsym works today via the trie).
+    // ⚠ EXPORTED DATA GLOBALS APPEAR IN THE TRIE ONLY, AND THAT IS A ROW:
+    // [[D-LINK-MACHO-IMAGE-NO-DATA-SYMBOLS-IN-SYMTAB]]. The nlist carries
+    // functions + undefined externs, because `appendImageDefinedBands` walks
+    // `module.functions` and there is no `module.dataItems` loop — so NO
+    // defined data symbol has ever reached a Mach-O IMAGE nlist. ✔MEASURED
+    // 2026-09-05 on the DSS-built `examples/c/macho_weak_def_image` darwin
+    // exec: `_weak_bias` (a defined data global) is `[weak-def]` in
+    // `dyld_info -exports` and ABSENT from `nm -m`, while ld64's own exec
+    // nlist carries its data symbols. ★ SCOPED: dyld, `dlsym` and ld64-as-
+    // consumer read the TRIE, which is correct — the cost is `nm` / `lldb` /
+    // `strip` / crash symbolication, a misdescription rather than a linkage
+    // defect. Extending it is a numDefs/LC_DYSYMTAB band re-shape that must
+    // also answer each item's `n_sect` ordinal; the exact ELF sibling
+    // [[D-LINK-ELF-IMAGE-NO-DATA-SYMBOLS-IN-SYMTAB]] is open with the same
+    // shape, and the two want ONE design, not two forks.
     //
-    // ★ THE BINDING IS DELIBERATELY UNCHANGED (N_SECT|N_EXT for every defined
-    // function) — see the static arm's matching note and
-    // D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT.
+    // ★ THE BINDING FOLLOWS `definedBinding`, THE ORDER FOLLOWS THE BANDS —
+    // D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT, closed in
+    // `appendImageDefinedBands` (its docblock holds the measurement and the
+    // ordering argument). `numLocals` is what LC_DYSYMTAB's `nlocalsym` /
+    // `iextdefsym` publish below, and `numDefs` keeps its meaning of "every
+    // defined record precedes the undefined band", so no
+    // `numDefs + <extern index>` coordinate moves.
     //
     // ── EVERY name bound to the atom, not just the canonical one ───────────
     // D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB, IMAGE tier. One
@@ -4240,31 +5515,16 @@ encodeExecDynamic(AssembledModule const&    module,
     // image: the export trie above walks `module.symbols` directly, so `dlsym`
     // resolved BOTH names while `nm`, `lldb` and the crash reporter saw only
     // one. The alias goes in at the canonical's n_sect / n_value (one address,
-    // which is what an alias IS) with the SAME N_SECT|N_EXT the canonical gets —
-    // this format's image-tier binding question is owned by
-    // D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT, and giving an alias a binding
-    // its canonical does not get would be a second, undeclared answer to it.
+    // which is what an alias IS) with its OWN binding through the same
+    // `definedNType` — always `N_SECT|N_EXT` for an alias, which
+    // `definedAliases` admits only when externally visible — in the
+    // externally-defined band right after its canonical.
     link::format::ObjectSymbolNames const imgNames{module};
     StringTable strtab;
     std::vector<std::uint8_t> nlistBytes;
-    auto appendDefinedNlist = [&](std::string const& symName,
-                                  std::uint64_t      valueVa) {
-        appendNlist64(nlistBytes, strtab.add(symName),
-                      static_cast<std::uint8_t>(N_SECT | N_EXT),
-                      /*n_sect=*/1, /*n_desc=*/0, /*n_value=*/valueVa);
-    };
-    for (std::size_t i = 0; i < module.functions.size(); ++i) {
-        auto const&         fn    = module.functions[i];
-        std::uint64_t const symVa = sectionVa + funcTextStart[i];
-        appendDefinedNlist(imgNames.imageName(fn.symbol, "_sym_"), symVa);
-        for (ModuleSymbol const* alias : imgNames.definedAliases(fn.symbol)) {
-            if (!refuseWeakImageAlias(*alias, "macho::encodeExecDynamic",
-                                      reporter)) {
-                return {};
-            }
-            appendDefinedNlist(alias->name, symVa);
-        }
-    }
+    std::uint32_t numLocals = 0;
+    appendImageDefinedBands(module, imgNames, sectionVa, funcTextStart, strtab,
+                            nlistBytes, numLocals);
 
     // ── (j) Indirect symbols table: one u32 per stub slot + one u32 per __got
     //       slot, each the index into nlist_64 of the matching undefined
@@ -4274,23 +5534,77 @@ encodeExecDynamic(AssembledModule const&    module,
     //       [numDefs .. numDefs + numExterns) by construction.
     std::uint32_t const numDefs =
         static_cast<std::uint32_t>(nlistBytes.size() / kNlist64Size);
+    //
+    // ⚠⚠ THE TABLE IS BUILT ON BOTH PATHS, AND THE "REDUNDANT ON CHAINED"
+    // PREMISE THAT ONCE SKIPPED IT IS REFUTED —
+    // [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]].
+    // D-LK6-14-INTEGRATION-GOT-SLOTS (a prose-only id — it names the second
+    // half of D-LK6-14-INTEGRATION-PAYLOAD's fold and never had a registry row
+    // of its own, so it is deliberately NOT written as a `[[...]]` link that
+    // would resolve nowhere) dropped this construction, the
+    // LC_DYSYMTAB that publishes it and the __LINKEDIT region that holds it
+    // whenever `useChainedFixups` was set, reasoning that a chained pointer in
+    // __got encodes its import ordinal directly so nothing needs the indirect
+    // symbol table. ★ THAT IS TRUE FOR BINDING AND FALSE FOR TOOLING, and the
+    // difference is not cosmetic: `dyld_info -fixups` SIGSEGVs
+    // (EXC_BAD_ACCESS, KERN_INVALID_ADDRESS at 0x0, top frame
+    // `other_tools::SymbolicatedImage::addStubSymbols()`) on an image that
+    // omits it, because that routine names __stubs/__got slots THROUGH this
+    // table and dereferences it unconditionally. ⚠ dyld itself LOADS AND RUNS
+    // the image either way (rc 42 on both), so no exit code and no green suite
+    // can see this — only a reader of the artifact can.
+    //
+    // ✔MEASURED on Apple Silicon (macOS 26.6.2, Apple clang 21.0.0 / ld-1267),
+    // ONE program linked TWICE with only the fixup encoding moving — `cc` for
+    // the chained arm, `cc -Wl,-no_fixup_chains` for the CONTROL. Without that
+    // control "ld64 emits LC_DYSYMTAB" is equally consistent with "ld64 always
+    // does", which is not the question; the question is whether its CHAINED arm
+    // keeps it. It does, and the SHAPE is identical: LC_DYSYMTAB present on
+    // both, `__stubs.reserved1` 0 and `__got.reserved1` 1 on both, one indirect
+    // entry per stub then one per __got slot on both, each naming an UNDEFINED
+    // external symbol.
+    //
+    // ⚠ WHAT IS *NOT* IDENTICAL IS THE CONTENT, and saying "only the
+    // __la_symbol_ptr entry disappears" would be FALSE — two of ld64's three
+    // legacy entries move. Legacy: `[_puts (stubs), dyld_stub_binder (got),
+    // _puts (la_symbol_ptr)]`. Chained: `[_puts (stubs), _puts (got)]`. So the
+    // chained arm drops the `__la_symbol_ptr` entry WITH its section, AND its
+    // `__got` entry names the REAL import where the legacy arm's names
+    // `dyld_stub_binder` — because lazy binding is what needs that helper and
+    // a chained image has no lazy binding. ⇒ ld64's own two arms differ in the
+    // __got band's SYMBOL; they do not differ in whether the table exists or in
+    // where the two bands begin.
+    //
+    // ★ DSS HAS NEITHER MOVING PART, which is why the shape below is the same
+    // on both of ITS paths: the writer emits no `__la_symbol_ptr` section and
+    // synthesizes no `dyld_stub_binder` (it has no lazy-binding stub helper at
+    // all), so its two bands name real externs whichever binding encoding is
+    // selected. ⇒ the shape below is already ld64's shape; it was the SKIP that
+    // was wrong, so the skip is gone rather than a second chained-only shape
+    // being invented.
+    //
+    // ★★ THE DISCRIMINATOR THAT SAYS *WHY*, on the reference's OWN bytes, and
+    // it is kept because "DSS reads clean now" alone is consistent with some
+    // other difference having helped. Take ld64's chained exec, rewrite ONLY
+    // its LC_DYSYMTAB as an equally-sized ignorable LC_SOURCE_VERSION so every
+    // later byte offset is unchanged, re-sign, and `dyld_info -fixups`
+    // SIGSEGVs on it (rc 139) — while the SAME copy re-signed WITHOUT the
+    // patch reads fine (rc 0), which is what rules the re-sign step out. Both
+    // patched arms still RUN (rc 42). ⓘ `otool -Iv` survives and says the
+    // quiet part: "entries extends past the end of the indirect symbol table",
+    // "reserved1 field greater than the table size" — the two `reserved1`
+    // origins below are what it is complaining about.
     std::vector<std::uint32_t> indirectSyms;
-    if (!useChainedFixups) {
-        // D-LK6-14-INTEGRATION-GOT-SLOTS: chained pointers in __got
-        // encode the import ordinal directly, so the indirect symbol
-        // table is redundant. Skip construction (and the matching
-        // LC_DYSYMTAB + __LINKEDIT emission below) on chained path.
-        indirectSyms.reserve(numFuncExterns + numExterns);
-        // __stubs band: one entry per FUNCTION extern (compacted — a DATA extern
-        // has no stub, D-LK-MACHO-DATA-EXTERN-DEAD-STUB), the func extern's
-        // undefined-symbol index. Order MATCHES the stub-emit loop (funcExternIdxs).
-        for (std::size_t j = 0; j < numFuncExterns; ++j)
-            indirectSyms.push_back(
-                numDefs + static_cast<std::uint32_t>(funcExternIdxs[j]));
-        // __got band: one entry per extern (LOCKSTEP with the __got slots).
-        for (std::size_t i = 0; i < numExterns; ++i)
-            indirectSyms.push_back(numDefs + static_cast<std::uint32_t>(i));
-    }
+    indirectSyms.reserve(numFuncExterns + numExterns);
+    // __stubs band: one entry per FUNCTION extern (compacted — a DATA extern
+    // has no stub, D-LK-MACHO-DATA-EXTERN-DEAD-STUB), the func extern's
+    // undefined-symbol index. Order MATCHES the stub-emit loop (funcExternIdxs).
+    for (std::size_t j = 0; j < numFuncExterns; ++j)
+        indirectSyms.push_back(
+            numDefs + static_cast<std::uint32_t>(funcExternIdxs[j]));
+    // __got band: one entry per extern (LOCKSTEP with the __got slots).
+    for (std::size_t i = 0; i < numExterns; ++i)
+        indirectSyms.push_back(numDefs + static_cast<std::uint32_t>(i));
 
     for (std::size_t i = 0; i < numExterns; ++i) {
         auto const& ext = module.externImports[i];
@@ -4306,6 +5620,18 @@ encodeExecDynamic(AssembledModule const&    module,
     // LC_SYMTAB.nsyms — read back off the emitted bytes, like `numDefs`.
     std::uint32_t const numberOfSymbols =
         static_cast<std::uint32_t>(nlistBytes.size() / kNlist64Size);
+    // The band belt: the three bands LC_DYSYMTAB publishes below must tile the
+    // table that was really written, every record carrying the n_type its
+    // band promises (D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT).
+    if (!imageBandsAgree(nlistBytes,
+                         {/*ilocalsym=*/0, numLocals,
+                          /*iextdefsym=*/numLocals,
+                          /*nextdefsym=*/numDefs - numLocals,
+                          /*iundefsym=*/numDefs,
+                          /*nundefsym=*/static_cast<std::uint32_t>(numExterns)},
+                         "macho::encodeExecDynamic", reporter)) {
+        return {};
+    }
 
     // ── THE BELT, and it compares two INDEPENDENTLY produced things ────────
     //
@@ -4398,8 +5724,11 @@ encodeExecDynamic(AssembledModule const&    module,
     std::size_t const dylinkerCmdSizeActual =
         emitDylinker ? dylinkerCmdSize : 0u;
     std::size_t const lcMainSizeActual = isDylib ? 0u : kLcMainSize;
+    // ⚠ `resolvedInstallName`, NEVER `im.installName` — the declaration may
+    // name the artifact, and a size computed from the unresolved template would
+    // disagree with the bytes the emission writes.
     std::size_t const idDylibCmdSize =
-        isDylib ? commandSizeWithPath(24, im.installName) : 0u;
+        isDylib ? commandSizeWithPath(24, resolvedInstallName) : 0u;
 
     // LK7: when `codeSignatureSize > 0` OR an ad-hoc `codeSignature`
     // block is present, append LC_CODE_SIGNATURE (16-byte
@@ -4416,21 +5745,71 @@ encodeExecDynamic(AssembledModule const&    module,
     // file offset) is not known until the __LINKEDIT layout completes,
     // so the derivation happens at the `codeSigReserveSize` assignment
     // further down (after `codeSigFileOff`). Here we only decide
-    // whether to emit the load command at all.
-    bool const emitCodeSig =
-        im.codeSignatureSize != 0 || im.codeSignature.has_value();
+    // whether to emit the load command at all — the PRESENCE question,
+    // asked through the one `requestsCodeSignature` predicate the two
+    // static-arm refusals also ask. This site was the only one of the
+    // three that spelled the disjunction correctly by hand; it now
+    // spells it once, in the header, where the other two read it too.
+    // D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM
+    bool const emitCodeSig = requestsCodeSignature(im);
     // LC_BUILD_VERSION (platform/min-OS) is emitted iff the schema
     // declares `image.buildVersion` — required for the image to load on
     // macOS 11+ / Apple Silicon (D-LK10-ENTRY-MACHO-EXIT).
     bool const emitBuildVersion = im.buildVersion.has_value();
+    // LC_UUID is emitted iff the schema declares `image.uuid` — the same
+    // presence-by-declaration shape as the two commands above, and for the
+    // same reason: ✔MEASURED, the reference makes it a per-link policy
+    // (`-no_uuid` / `-random_uuid`) while offering no such knob over LC_SYMTAB
+    // or LC_DYSYMTAB. See `MachOUuid`'s docblock for the measurement, its
+    // control, and the discriminator. D-LK-MACHO-EMITS-NO-LC-UUID.
+    bool const emitUuid = im.uuid.has_value();
+    // ── THE EXPORT TRIE NEEDS ITS OWN LOAD COMMAND ON THE CHAINED PATH ────
+    //
+    // D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE. `exportOff`/`exportSize` are
+    // FIELDS OF LC_DYLD_INFO_ONLY, and the chained-fixups arm emits
+    // LC_DYLD_CHAINED_FIXUPS INSTEAD of it — so with `useChainedFixups=true`
+    // the trie bytes still landed in __LINKEDIT while NO load command named
+    // them, and dyld (which reaches the trie only through a load command)
+    // found ZERO exports. ⚠ THAT TURNED INTO A LIE THE MOMENT THE EXEC ARM
+    // STARTED BUILDING A TRIE (D-LK3-DYLIB-WEAK-EXPORT, this cycle): the
+    // header would still ship MH_WEAK_DEFINES | MH_BINDS_TO_WEAK — those bits
+    // are derived from `numWeakExports`, which counts terminals the trie
+    // carries — over a trie no consumer can reach, i.e. a weak definition
+    // silently strong again UNDER A HEADER ASSERTING THE OPPOSITE. A silent
+    // downgrade is the defect this cycle exists to close; re-opening it one
+    // schema key away is not a narrower version of it.
+    //
+    // ★ EMITTED, NOT REFUSED, and the choice is deliberate. The sibling
+    // chained-fixups hole one section down (DATA rebase/bind sites) REFUSES
+    // loud because the missing piece is a whole encoding this writer does not
+    // have — DYLD_CHAINED_PTR_64 bitfields for arbitrary DATA sites. Here the
+    // missing piece is a SIXTEEN-BYTE linkedit_data_command over a blob that
+    // is already built, already aligned and already in __LINKEDIT at
+    // `exportOff`: a refusal would spend a capability hole to buy nothing.
+    // It also closes the hole for the DYLIB flavor the anchor was opened for,
+    // whose `validate()` refusal (`MachoDylibFormatJsonValidate.
+    // ChainedFixupsRejected`) cites this anchor and stays in place for the
+    // OTHER half the anchor names — the DATA-fixup chained encodings.
+    //
+    // ⓘ Gated on a NON-EMPTY trie, not on `useChainedFixups` alone, so an
+    // image with nothing to export emits no command over a zero-length blob —
+    // the same "0/0 means no exports" convention the legacy arm follows.
+    bool const emitExportsTrieCmd = useChainedFixups && !exportTrieBlob.empty();
     // ncmds = segments + LC_DYLD_{INFO_ONLY|CHAINED_FIXUPS}
+    //       + [LC_DYLD_EXPORTS_TRIE when emitExportsTrieCmd]
     //       + [LC_LOAD_DYLINKER] + [LC_MAIN] + [LC_ID_DYLIB]
     //       + N × LC_LOAD_DYLIB
-    //       + LC_SYMTAB + (LC_DYSYMTAB when !useChainedFixups —
-    //       D-LK6-14-INTEGRATION-GOT-SLOTS drops it because chained
-    //       pointers in __got encode the import ordinal directly, so
-    //       the indirect symbol table is redundant) + LC_CODE_SIGNATURE
-    //       when emitCodeSig + LC_BUILD_VERSION when emitBuildVersion.
+    //       + LC_SYMTAB + LC_DYSYMTAB (UNCONDITIONAL — ld64 emits it on
+    //       the chained path too, ✔MEASURED with the -no_fixup_chains
+    //       control; see the indirect-symbol construction above and
+    //       [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]])
+    //       + LC_CODE_SIGNATURE when emitCodeSig
+    //       + LC_UUID when emitUuid (see `stampImageUuid` and
+    //       D-LK-MACHO-EMITS-NO-LC-UUID)
+    //       + LC_BUILD_VERSION when emitBuildVersion.
+    // ⚠ This enumeration and the `sizeofcmds` term list below are the only
+    // prose copies of numbers the two expressions derive; keep all four in
+    // step. The LC_UUID line was missing here until review caught it.
     // Segment count: __TEXT + __LINKEDIT = 2, plus __PAGEZERO
     // (exec-flavor only), __DATA_CONST (externs present), __DATA
     // (writable globals — D-LK4-DATA-PRODUCER).
@@ -4439,13 +5818,17 @@ encodeExecDynamic(AssembledModule const&    module,
         + (hasDataConstSeg ? 1u : 0u)
         + (hasDataSeg ? 1u : 0u);
     std::uint32_t const ncmds = static_cast<std::uint32_t>(
-        segCount + 1u
-        + (emitDylinker ? 1u : 0u)
+        segCount
+        + 1u                           // LC_DYLD_{INFO_ONLY|CHAINED_FIXUPS}
+        + (emitDylinker ? 1u : 0u)     // LC_LOAD_DYLINKER
         + (isDylib ? 1u : 0u)          // LC_ID_DYLIB
         + (isDylib ? 0u : 1u)          // LC_MAIN
-        + emittedDylibs.size() + 1u    // N × LC_LOAD_DYLIB (schema ∪ referenced)
-        + (useChainedFixups ? 0u : 1u)
+        + emittedDylibs.size()         // N × LC_LOAD_DYLIB (schema ∪ referenced)
+        + 1u                           // LC_SYMTAB
+        + 1u                           // LC_DYSYMTAB (both binding paths)
+        + (emitExportsTrieCmd ? 1u : 0u)
         + (emitCodeSig ? 1u : 0u)
+        + (emitUuid ? 1u : 0u)         // LC_UUID — D-LK-MACHO-EMITS-NO-LC-UUID
         + (emitBuildVersion ? 1u : 0u));
     // sizeofcmds: LC_DYLD_CHAINED_FIXUPS is 16 bytes (linkedit_data_
     // command shape — same as LC_CODE_SIGNATURE); LC_DYLD_INFO_ONLY
@@ -4457,9 +5840,10 @@ encodeExecDynamic(AssembledModule const&    module,
         segCmdPageZeroActual + kSegCmdTextSize + segCmdDataConstActual +
         kSegCmdDataSize + kSegCmdLinkeditSize + dyldBindCmdSize +
         dylinkerCmdSizeActual + lcMainSizeActual + idDylibCmdSize +
-        totalDylibCmdSize + kSymtabCommandSize +
-        (useChainedFixups ? 0u : kDysymtabCommandSize) +
+        totalDylibCmdSize + kSymtabCommandSize + kDysymtabCommandSize +
+        (emitExportsTrieCmd ? kLinkeditDataCommandSize : 0u) +
         (emitCodeSig ? kCodeSigCommandSize : 0u) +
+        (emitUuid ? kUuidCommandSize : 0u) +  // D-LK-MACHO-EMITS-NO-LC-UUID
         (emitBuildVersion ? kBuildVersionCommandSize : 0u);
     std::size_t const headerAndCmds = kMachHeader64Size + sizeofcmds;
 
@@ -4469,6 +5853,73 @@ encodeExecDynamic(AssembledModule const&    module,
     std::uint64_t const stubsFileOff = textFileOff + textFileSize;
     std::uint64_t const stubsFileSize =
         static_cast<std::uint64_t>(numFuncExterns) * stubSize;
+
+    // ── WHY THIS LATE CHAIN MAY ROUND A FILE OFFSET WHERE `elf.cpp` MAY NOT,
+    //    i.e. the OTHER half of the ELF over-alignment question, MEASURED ────
+    //
+    // [[D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET]] is a
+    // shipped, measured defect whose mechanism is exactly the shape below: an
+    // exec image's allocated sections satisfy `va == base + fileOffset`, and
+    // rounding the OFFSET to a section's alignment yields an aligned ADDRESS
+    // only when the base already is — so a request stronger than the base's own
+    // alignment is silently downgraded, and WHICH happens is decided by a number
+    // typed into a `.format.json`. That row's Cross-refs says this writer "was
+    // not read for either half". It has been, and the answer is NOT the ELF one.
+    //
+    // ★ FACT 1 — THE DELTA IS `image.pageZeroSize`, EXACTLY. Every allocated
+    // section here satisfies `addr == (sectionVa - textFileOff) + offset`, and
+    // `textSegmentVaMatchesFileOff` above requires
+    // `__text.virtualAddress - pageZeroSize == textFileOff`, so that delta IS
+    // `pageZeroSize`. Nothing else can be.
+    //
+    // ★ FACT 2 — THE KERNEL ALREADY FORCES THAT DELTA TO BE A MULTIPLE OF THE
+    // PAGE. `__TEXT.vmaddr` IS `pageZeroSize` and `__TEXT.fileoff` is 0, and the
+    // mmap rule is `vmaddr % segmentPageSize == fileoff % segmentPageSize`; a
+    // `pageZeroSize` that is not a multiple of the page maps `__TEXT` at the
+    // wrong address and the kernel refuses the image with EBADMACHO. So the
+    // delta divides the page on every image that can LOAD AT ALL.
+    //
+    // ★ FACT 3 — AND NO REQUEST CAN EXCEED THE PAGE, because the gate above
+    // refuses one. Composing the three: every admitted alignment is a power of
+    // two dividing `segmentPageSize`, which divides the delta, so
+    // `alignUp(offset, A) + delta == alignUp(offset + delta, A)` — rounding the
+    // offset and rounding the address are THE SAME EXPRESSION here. That is a
+    // proof, not an observation, and it is why this chain is left alone.
+    //
+    // ⚠⚠ SO THE ELF REMEDY WAS MEASURED AND REJECTED FOR THIS WRITER, and the
+    // reason is worth more than the conclusion. Routing the four SECTION offsets
+    // below through the shared `imageOffsetForAlignedVa` was written and then
+    // reverted: it changes no byte of any loadable image (Fact 3), and the only
+    // input that distinguishes it is a document whose `pageZeroSize` does not
+    // divide the page — an image the kernel refuses whatever this code does.
+    // Worse, it would have been a PARTIAL adoption that reads as a complete one:
+    // the four SEGMENT boundaries (`gotFileOff`, `dataSegFileOff` and the two
+    // page-rounded spans) round file offsets too and CANNOT be converted, since
+    // an address-aligned segment start with a non-congruent file offset is
+    // precisely what EBADMACHO names. A reader would have been left believing
+    // this writer is address-first when half of it structurally cannot be.
+    //
+    // ★★ WHAT WAS NEVER SILENT HERE, WHICH IS THE REAL DIFFERENCE FROM ELF: the
+    // EARLY chain (far above) rounds ADDRESSES and binds symbolVa before the
+    // relocation kernel runs; this LATE chain rounds offsets; and four fail-loud
+    // congruence guards (`__const`, `__eh_frame`, `__got`, `__DATA`) compare the
+    // two derivations and REFUSE the image when they disagree. ELF had no such
+    // comparison, which is why its divergence shipped as a misplaced object and
+    // this one cannot. ✔MEASURED with a derived document whose `pageZeroSize`
+    // sits BELOW the page: the `__got` guard fires and the image is withheld.
+    //
+    // ⚠ THE ONE GAP THIS LEAVES, AND IT IS NOT IN THIS FILE: Fact 2 is a KERNEL
+    // rule that `macho_backend`'s validate() does not check. It requires
+    // `image.pageZeroSize` to be a POWER OF TWO — its own comment says the
+    // purpose is "so that __TEXT.vmaddr (= pageZeroSize) preserves the kernel's
+    // mmap congruence" — but a power of two BELOW `segmentPageSize` satisfies
+    // the check and breaks the rule, and the neighbouring `__text.virtualAddress`
+    // check measures the offset WITHIN the segment rather than the segment's own
+    // address, so it does not catch it either. Every shipped document declares
+    // 0x100000000 or 0 and is far clear of it; the missing predicate is
+    // `pageZeroSize % segmentPageSize == 0`, and its owner is validate(), where
+    // the message can name the document key.
+    // (D-LINK-MACHO-IMAGE-OVERALIGNED-STATIC-IS-A-LOAD-TIME-COIN-FLIP.)
 
     // __TEXT,__const file offset — H1-aligned above __stubs, inside the
     // same __TEXT segment (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror). Because
@@ -4695,16 +6146,22 @@ encodeExecDynamic(AssembledModule const&    module,
     // (useChainedFixups=false), so this never fires for them; fail loud
     // rather than drop the fixups silently if it is enabled.
     if (useChainedFixups
-        && (!dataRebaseSiteVas.empty() || !externAddrBindSites.empty())) {
+        && (!dataRebaseSiteVas.empty() || !externAddrBindSites.empty()
+            || !preemptibleDefBindSites.empty())) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
              std::format("macho::encodeExecDynamic: {} symbol-address rebase "
-                         "site(s) + {} extern-addr bind site(s) in __DATA, but "
+                         "site(s) + {} extern-addr bind site(s) + {} "
+                         "coalescing-scope definition-address site(s) in "
+                         "__DATA, but "
                          "the chained-fixups path (image.useChainedFixups=true) "
                          "does not yet emit DATA fixups (D-LK6-14). Use the "
                          "legacy LC_DYLD_INFO_ONLY path "
-                         "(useChainedFixups=false).",
+                         "(useChainedFixups=false). "
+                         "D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING for "
+                         "the third count.",
                          dataRebaseSiteVas.size(),
-                         externAddrBindSites.size()));
+                         externAddrBindSites.size(),
+                         preemptibleDefBindSites.size()));
         return {};
     }
     std::vector<std::uint8_t> dyldRebaseBlob;
@@ -4789,7 +6246,31 @@ encodeExecDynamic(AssembledModule const&    module,
                              kPageSize));
             return {};
         }
+        // D-LK6-14-CHAINED-STARTS-SEG-COUNT-MISDECLARED: the payload's
+        // `dyld_chained_starts_in_image` is INDEXED BY SEGMENT, so it needs
+        // the image's segment count and the ordinal of the segment that
+        // carries the chains. Both are already computed above and used for
+        // other purposes — `segCount` sizes `ncmds`, and `segIdxDataConst` is
+        // the index the __got bind opcodes address — so this passes existing
+        // facts down rather than deriving new ones, and neither can drift
+        // silently: a wrong `segCount` makes `ncmds` wrong and dyld refuses
+        // the image outright, and `segIdxDataConst` is cross-checked against
+        // the ACTUAL __DATA_CONST emission ordinal at the load-command loop
+        // below (the c153 F3 fold), which fails loud on a divergence.
+        if (segIdxDataConst >= segCount) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("macho::encodeExecDynamic: chained-fixups "
+                             "__DATA_CONST is segment index {} but the image "
+                             "declares only {} segments — the "
+                             "dyld_chained_starts_in_image table would have "
+                             "no entry for the segment that carries the "
+                             "chains, and dyld would bind nothing. Anchored "
+                             "D-LK6-14-CHAINED-STARTS-SEG-COUNT-MISDECLARED.",
+                             segIdxDataConst, segCount));
+            return {};
+        }
         dss::macho::detail::ChainedSegInfo segInfo;
+        segInfo.segmentIndex  = segIdxDataConst;
         // segment_offset is the VM offset from __TEXT to __DATA_CONST.
         // __TEXT.vmaddr = im.pageZeroSize (by convention);
         // __DATA_CONST.vmaddr = gotVa (since __got is the only
@@ -4801,7 +6282,7 @@ encodeExecDynamic(AssembledModule const&    module,
         // (which is at byte 0 of __DATA_CONST). page_starts[0] = 0.
         segInfo.pageStarts.push_back(0u);
         dyldBindBlob = dss::macho::detail::buildChainedFixupsPayload(
-            chainedImports, &segInfo);
+            chainedImports, segCount, &segInfo);
         // Pad to 8-byte load-command alignment per Apple convention.
         while (dyldBindBlob.size() % kLoadCmdAlign != 0)
             dyldBindBlob.push_back(0);
@@ -4874,8 +6355,17 @@ encodeExecDynamic(AssembledModule const&    module,
     std::uint64_t const bindOff =
         alignUp(rebaseOff + rebaseSize, kLinkeditBlobAlign);
     std::uint64_t const bindSize = dyldBindBlob.size();
-    std::uint64_t const exportOff =
+    // D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the weak-bind stream sits
+    // between the regular bind stream and the export trie, which is the order
+    // `dyld_info_command` itself declares its fields in and the order ld64
+    // writes them. Zero-length when absent, so every cursor after it is
+    // unmoved and an image without a coalescing-scope reference is
+    // byte-identical to before.
+    std::uint64_t const weakBindOff =
         alignUp(bindOff + bindSize, kLinkeditBlobAlign);
+    std::uint64_t const weakBindSize = dyldWeakBindBlob.size();
+    std::uint64_t const exportOff =
+        alignUp(weakBindOff + weakBindSize, kLinkeditBlobAlign);
     std::uint64_t const exportSize = exportTrieBlob.size();
     std::uint64_t const indirectSymtabOff =
         alignUp(exportOff + exportSize, kLinkeditBlobAlign);
@@ -4951,16 +6441,79 @@ encodeExecDynamic(AssembledModule const&    module,
     // == the CodeDirectory `codeLimit` (everything before the signature
     // is hashed), and was just proven to fit in u32. For the legacy
     // placeholder path it stays the schema's `codeSignatureSize`.
+    //
+    // ⚠ This is a FLAVOUR question, not the presence question, and the
+    // bare `codeSignature.has_value()` is therefore CORRECT here — do
+    // not "unify" it with `requestsCodeSignature` (see that predicate's
+    // docblock in macho.hpp). Reached only when `emitCodeSig`, so
+    // exactly one of the two arms is live.
     std::uint32_t const codeSigReserveSize =
         im.codeSignature.has_value()
             ? dss::macho::detail::adHocCodeSignatureSize(
                   static_cast<std::uint32_t>(codeSigFileOff),
                   im.codeSignature->pageSize,
-                  im.codeSignature->identifier)
+                  // The RESOLVED identity, never `im.codeSignature->identifier`
+                  // — the declaration's length is not the emitted length once a
+                  // placeholder is in play, and this figure IS the reservation
+                  // the blob must fill exactly
+                  // (D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT).
+                  resolvedCodeSignatureIdentifier)
             : im.codeSignatureSize;
     std::uint64_t const linkeditFileSize = emitCodeSig
         ? ((codeSigFileOff + codeSigReserveSize) - linkeditFileOff)
         : ((strtabOff + strtabSize) - linkeditFileOff);
+
+    // ── D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING ────────────────────
+    //
+    // A weak-bind stream is INERT unless the header says MH_BINDS_TO_WEAK, and
+    // an inert stream is the silent wrong answer this whole change exists to
+    // end: dyld would run no coalescing pass, the `__got` slot would keep
+    // whatever it was given, and the build would report success. The bit is
+    // CONTENT-DERIVED from `numWeakExports` below, and today the two always
+    // agree by construction — a coalescing-scope reference names a definition
+    // in THIS module whose binding the format declared preemptible, and the
+    // only binding any Mach-O document declares is `weak`, so the module
+    // necessarily exports one.
+    //
+    // ★ IT IS ASSERTED ANYWAY, because "agree by construction" is a claim about
+    // TWO documents that can be edited apart. A darwin document that ever
+    // declared `global` preemptible would mint a reference to a strong
+    // definition, leave `numWeakExports` at zero, and ship an image whose weak
+    // stream dyld ignores. Refusing names both halves; the alternative is a
+    // divergence with no diagnostic anywhere.
+    //
+    // ⚠ THE CONDITION ASKS THE MODULE, NOT ONE RAIL'S BUFFER. It read
+    // `!dyldWeakBindBlob.empty()` until this cycle's remediation, and that blob
+    // is filled ONLY by the legacy LC_DYLD_INFO_ONLY arm — so a document with
+    // `image.useChainedFixups` got no inert-stream guard at all, though its
+    // header bits come from the very same `numWeakExports` and would be just
+    // as absent. `numScopeExterns` counts the module's coalescing-scope imports
+    // and is therefore rail-independent: on the legacy path it is equivalent to
+    // the old test by construction, and on the chained path it is the check
+    // that was missing. Same failure class as the guard itself — a condition
+    // true of the instrument rather than of the subject.
+    // ★ AND IT REACHES THE STATIC-INITIALIZER FORM TOO (P63). That form mints no
+    // extern row at all — it is a DATA relocation naming one of this module's
+    // OWN definitions — so `numScopeExterns` alone was blind to it, exactly as
+    // the legacy buffer was blind to the chained rail one cycle earlier. Same
+    // failure class again: a condition true of one PRODUCER rather than of the
+    // property. The two counts together are "does this image ask dyld to
+    // coalesce anything", which is what the header bit has to agree with.
+    if ((numScopeExterns > 0 || !preemptibleDefBindSites.empty())
+        && numWeakExports == 0) {
+        emit(reporter, DiagnosticCode::K_WalkerInputContractViolation,
+             "macho::encodeExecDynamic: this image carries a coalescing-scope "
+             "reference but publishes NO weak definition, so its mach_header "
+             "would not set MH_WEAK_DEFINES | MH_BINDS_TO_WEAK and dyld would "
+             "run no coalescing pass at all — the reference would be inert on "
+             "either fixup rail and the slot would silently keep a "
+             "non-coalesced value. This combination is reachable only from a "
+             "format document that declares a binding preemptible which its "
+             "own exports do not carry; align "
+             "'preemptibleDefinitionBindings' with what this loader actually "
+             "coalesces. D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING.");
+        return {};
+    }
 
     // Segment VAs:
     std::uint64_t const textSegVmaddr = im.pageZeroSize;
@@ -5003,14 +6556,19 @@ encodeExecDynamic(AssembledModule const&    module,
     // Indirect-symtab reserved1 indices: __stubs uses [0..numFuncExterns) —
     // one entry per FUNCTION extern (a DATA extern has no stub,
     // D-LK-MACHO-DATA-EXTERN-DEAD-STUB) — and __got uses
-    // [numFuncExterns .. numFuncExterns + numExterns). On the chained-fixups
-    // path the indirect symbol table is absent; reserved1 = 0 for both
-    // sections (D-LK6-14-INTEGRATION-GOT-SLOTS — chained pointers in __got
-    // encode the ordinal directly).
+    // [numFuncExterns .. numFuncExterns + numExterns).
+    //
+    // ⚠ BOTH BINDING PATHS, and the chained arm used to zero them —
+    // [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]]. A
+    // `reserved1` on an `S_SYMBOL_STUBS` / `S_NON_LAZY_SYMBOL_POINTERS`
+    // section is that section's ORIGIN in the indirect symbol table, so
+    // zeroing __got's makes its slots claim the __stubs band's entries — the
+    // wrong symbol named for every __got slot, in a table Apple's inspectors
+    // read. ✔MEASURED: ld64's chained arm and its `-no_fixup_chains` control
+    // publish the SAME pair (0 and 1 for one function extern).
     constexpr std::uint32_t kStubsReserved1 = 0;
-    std::uint32_t const kGotReserved1 = useChainedFixups
-        ? 0u
-        : static_cast<std::uint32_t>(numFuncExterns);
+    std::uint32_t const kGotReserved1 =
+        static_cast<std::uint32_t>(numFuncExterns);
 
     // ── (m) Emit bytes ───────────────────────────────────────────
     std::vector<std::uint8_t> bytes;
@@ -5028,7 +6586,19 @@ encodeExecDynamic(AssembledModule const&    module,
     // descriptor word0 to tlv_get_addr (matches clang, which sets the bit only
     // for TLS-bearing images). The base flags come from the format JSON; the
     // per-module TLV bit is content-derived (hasTls), never a format identity.
-    appendU32LE(bytes, id.flags | (hasTls ? MH_HAS_TLV_DESCRIPTORS : 0u));
+    //
+    // D-LK3-DYLIB-WEAK-EXPORT rides the SAME rule, deliberately at the same
+    // site: MH_WEAK_DEFINES | MH_BINDS_TO_WEAK iff this image actually
+    // PUBLISHED a weak-definition terminal in its export trie
+    // (`numWeakExports`), so the header cannot advertise a coalescing surface
+    // the trie does not carry, and neither bit is ever a format identity or a
+    // schema flag. See the MH_WEAK_DEFINES docblock for why BOTH bits come
+    // from the definition rather than one of them from the references — that
+    // is ld64's measured behaviour, not an economy.
+    std::uint32_t const weakDefinitionHeaderBits =
+        numWeakExports > 0 ? (MH_WEAK_DEFINES | MH_BINDS_TO_WEAK) : 0u;
+    appendU32LE(bytes, id.flags | (hasTls ? MH_HAS_TLV_DESCRIPTORS : 0u)
+                           | weakDefinitionHeaderBits);
     appendU32LE(bytes, 0);
 
     // TLS C4 (audit FOLD-1): count the segments emitted BEFORE __DATA so the
@@ -5389,7 +6959,7 @@ encodeExecDynamic(AssembledModule const&    module,
         appendU32LE(bytes, 0);    // timestamp
         appendU32LE(bytes, 0);    // current_version
         appendU32LE(bytes, 0);    // compatibility_version
-        for (char c : im.installName)
+        for (char c : resolvedInstallName)
             appendU8(bytes, static_cast<std::uint8_t>(c));
         appendU8(bytes, 0);
         while (bytes.size() - cmdStart < idDylibCmdSize) appendU8(bytes, 0);
@@ -5400,11 +6970,27 @@ encodeExecDynamic(AssembledModule const&    module,
         // The 16-byte linkedit_data_command points at the
         // buildChainedFixupsPayload blob in __LINKEDIT. Companion
         // D-LK6-14-INTEGRATION-GOT-SLOTS populates __got slots with
-        // DYLD_CHAINED_PTR_64 bitfields + drops LC_DYSYMTAB below.
+        // DYLD_CHAINED_PTR_64 bitfields. LC_DYSYMTAB below is emitted
+        // BESIDE this command, not instead of it —
+        // [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]].
         appendU32LE(bytes, LC_DYLD_CHAINED_FIXUPS);
         appendU32LE(bytes, static_cast<std::uint32_t>(kLinkeditDataCommandSize));
         appendU32LE(bytes, static_cast<std::uint32_t>(bindOff));
         appendU32LE(bytes, static_cast<std::uint32_t>(bindSize));
+        // LC_DYLD_EXPORTS_TRIE — the export trie's own load command, over the
+        // SAME `exportOff`/`exportSize` blob the legacy arm publishes through
+        // LC_DYLD_INFO_ONLY's export fields (see `emitExportsTrieCmd` for why
+        // this is emitted and not refused). One blob, one pair of cursors,
+        // two spellings of the command that names it — so the trie can never
+        // be laid down without a reader, which is the shape
+        // D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE names.
+        if (emitExportsTrieCmd) {
+            appendU32LE(bytes, LC_DYLD_EXPORTS_TRIE);
+            appendU32LE(bytes,
+                        static_cast<std::uint32_t>(kLinkeditDataCommandSize));
+            appendU32LE(bytes, static_cast<std::uint32_t>(exportOff));
+            appendU32LE(bytes, static_cast<std::uint32_t>(exportSize));
+        }
     } else {
         // LC_DYLD_INFO_ONLY (legacy opcode-stream binding).
         appendU32LE(bytes, LC_DYLD_INFO_ONLY);
@@ -5415,7 +7001,12 @@ encodeExecDynamic(AssembledModule const&    module,
         appendU32LE(bytes, static_cast<std::uint32_t>(rebaseSize));
         appendU32LE(bytes, static_cast<std::uint32_t>(bindOff));
         appendU32LE(bytes, static_cast<std::uint32_t>(bindSize));
-        appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // weak_bind
+        // weak_bind — D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING. 0/0
+        // when the module carries no coalescing-scope reference, which is
+        // every image DSS emitted before this landed.
+        appendU32LE(bytes,
+                    static_cast<std::uint32_t>(weakBindSize ? weakBindOff : 0));
+        appendU32LE(bytes, static_cast<std::uint32_t>(weakBindSize));
         appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // lazy_bind (eager — 0)
         // export_off/export_size — the c153 MH_DYLIB EXPORT TRIE.
         // Zero on the exec arm and on an exportless dylib (dyld
@@ -5477,33 +7068,51 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, static_cast<std::uint32_t>(strtabOff));
     appendU32LE(bytes, static_cast<std::uint32_t>(strtabSize));
 
-    if (!useChainedFixups) {
-        // LC_DYSYMTAB (indirect symbol table for __stubs/__got).
-        // D-LK6-14-INTEGRATION-GOT-SLOTS CLOSED: chained fixups make
-        // this LC redundant — the chained pointers in __got encode
-        // the import ordinal directly via DYLD_CHAINED_PTR_64 row
-        // bits[0..23]. The entire block is skipped on chained path
-        // (the ncmds/sizeofcmds arithmetic above accounts for the
-        // absence). Indirect-symtab byte emission below is similarly
-        // skipped.
-        appendU32LE(bytes, LC_DYSYMTAB);
-        appendU32LE(bytes, static_cast<std::uint32_t>(kDysymtabCommandSize));
-        appendU32LE(bytes, 0);                    // ilocalsym
-        appendU32LE(bytes, 0);                    // nlocalsym
-        appendU32LE(bytes, 0);                    // iextdefsym
-        appendU32LE(bytes, numDefs);              // nextdefsym
-        appendU32LE(bytes, numDefs);              // iundefsym
-        appendU32LE(bytes,
-                    static_cast<std::uint32_t>(numExterns));  // nundefsym
-        appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // toc
-        appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // modtab
-        appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // extrefsym
-        appendU32LE(bytes,
-                    static_cast<std::uint32_t>(indirectSymtabOff));
-        appendU32LE(bytes,
-                    static_cast<std::uint32_t>(indirectSyms.size()));
-        appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // extrel
-        appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // locrel
+    // LC_DYSYMTAB (indirect symbol table for __stubs/__got) — emitted on BOTH
+    // binding paths. D-LK6-14-INTEGRATION-GOT-SLOTS skipped the whole block
+    // whenever `useChainedFixups` was set, on the premise that a chained
+    // pointer carries its import ordinal in DYLD_CHAINED_PTR_64 row bits and so
+    // needs no indirect symbol table.
+    // [[D-LK6-14-CHAINED-PATH-DROPS-LC-DYSYMTAB-AND-CRASHES-DYLD-INFO]]
+    // REFUTES it: redundant for BINDING, load-bearing for TOOLING — see the
+    // indirect-symbol construction above for the crash and for the ld64
+    // measurement (with its `-no_fixup_chains` control) that fixed this shape.
+    appendU32LE(bytes, LC_DYSYMTAB);
+    appendU32LE(bytes, static_cast<std::uint32_t>(kDysymtabCommandSize));
+    // The three bands `appendImageDefinedBands` laid the table out in:
+    // [0, numLocals) local, [numLocals, numDefs) externally defined,
+    // [numDefs, numDefs + numExterns) undefined — the coordinates the
+    // band belt above checked (D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT).
+    appendU32LE(bytes, 0);                    // ilocalsym
+    appendU32LE(bytes, numLocals);            // nlocalsym
+    appendU32LE(bytes, numLocals);            // iextdefsym
+    appendU32LE(bytes, numDefs - numLocals);  // nextdefsym
+    appendU32LE(bytes, numDefs);              // iundefsym
+    appendU32LE(bytes,
+                static_cast<std::uint32_t>(numExterns));  // nundefsym
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // toc
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // modtab
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // extrefsym
+    appendU32LE(bytes,
+                static_cast<std::uint32_t>(indirectSymtabOff));
+    appendU32LE(bytes,
+                static_cast<std::uint32_t>(indirectSyms.size()));
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // extrel
+    appendU32LE(bytes, 0); appendU32LE(bytes, 0);  // locrel
+
+    // ── D-LK-MACHO-EMITS-NO-LC-UUID ──
+    // The image's identity command, with a ZEROED payload; `stampImageUuid`
+    // below fills it once every byte that will be hashed exists. Emitted BEFORE
+    // LC_CODE_SIGNATURE so the signature's reservation (and the whole
+    // __LINKEDIT chain hanging off `sizeofcmds`) is computed with this command
+    // already counted — the CodeDirectory's page hashes cover the load
+    // commands, and ✔MEASURED on Apple Silicon that they cover THIS one: one
+    // flipped uuid byte makes `codesign --verify` report "code or signature
+    // have been modified". Emitted iff the format document declares
+    // `image.uuid` — see `emitUuid` above.
+    std::optional<std::size_t> uuidPayloadOffset;
+    if (emitUuid) {
+        uuidPayloadOffset = appendUuidCommandPlaceholder(bytes);
     }
 
     // LK7: LC_CODE_SIGNATURE placeholder. linkedit_data_command =
@@ -5650,6 +7259,11 @@ encodeExecDynamic(AssembledModule const&    module,
     seekTo(bindOff, useChainedFixups ? "chained fixups" : "bind opcodes");
     bytes.insert(bytes.end(), dyldBindBlob.begin(), dyldBindBlob.end());
 
+    // __LINKEDIT: the coalescing-scope (weak) bind stream. Zero bytes when
+    // the module carries no such reference (D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING).
+    seekTo(weakBindOff, "weak bind opcodes");
+    bytes.insert(bytes.end(), dyldWeakBindBlob.begin(), dyldWeakBindBlob.end());
+
     // __LINKEDIT: the c153 MH_DYLIB export trie at exportOff (empty on
     // the exec arm / an exportless dylib — zero bytes inserted).
     seekTo(exportOff, "exports trie");
@@ -5685,6 +7299,28 @@ encodeExecDynamic(AssembledModule const&    module,
         // of the reservation).
         seekTo(codeSigFileOff, "code signature");
         if (!linkeditCursorsAgree()) return {};
+    }
+
+    // ── D-LK-MACHO-EMITS-NO-LC-UUID ──
+    // ⚠ ORDER IS LOAD-BEARING AND MEASURED, NOT ARGUED. Every byte the image
+    // will carry now exists and nothing after this point changes one, so the
+    // digest below is over the FINAL content; and it is taken BEFORE the
+    // signature is built, because the CodeDirectory's page hashes cover the
+    // load commands (✔MEASURED on Apple Silicon: one flipped uuid byte in a
+    // `codesign -s -` dylib turns `codesign --verify` into "invalid signature
+    // (code or signature have been modified)"). Stamping after would produce an
+    // image that verifies nowhere. When `emitCodeSig`, `bytes.size()` is
+    // exactly `codeSigFileOff` here — the same region the CodeDirectory signs.
+    if (uuidPayloadOffset.has_value()) {
+        stampImageUuid(bytes, *uuidPayloadOffset, bytes.size());
+    }
+
+    if (emitCodeSig) {
+        // ⚠ FLAVOUR again, not presence: `emitCodeSig` already said a
+        // signature was requested; this picks the real ad-hoc blob over
+        // the legacy zero-fill. `requestsCodeSignature` must NOT be
+        // substituted here — it would send a placeholder-only schema
+        // into the builder with no block to build from.
         if (im.codeSignature.has_value()) {
             // Build the real ad-hoc CodeDirectory + SuperBlob over the
             // signed bytes and write it into the reservation. execSeg
@@ -5700,7 +7336,11 @@ encodeExecDynamic(AssembledModule const&    module,
                                                   codeSigFileOff},
                     static_cast<std::uint32_t>(codeSigFileOff),
                     im.codeSignature->pageSize,
-                    im.codeSignature->identifier,
+                    // The SAME resolved local the reservation was sized from —
+                    // one resolution feeding both reads, so the two cannot
+                    // disagree
+                    // (D-LK-MACHO-CODESIGN-IDENTIFIER-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT).
+                    resolvedCodeSignatureIdentifier,
                     textSegFileSize,
                     isDylib
                         ? dss::macho::detail::kCsExecSegFlagsNone

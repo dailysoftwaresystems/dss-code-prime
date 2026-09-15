@@ -78,8 +78,21 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
+
+// ── D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT ────────
+//
+// The cases below drive `macho::encode` DIRECTLY, so nothing supplied the
+// per-EMISSION artifact identity that an MH_DYLIB document's
+// `image.installName` now names through `${artifactFileName}`. A real build
+// states it in `linkAndWrite` from the path it is about to write; a writer unit
+// test writes no file, so it states it here. Omitting it is not a smaller test
+// — it is the REFUSAL arm, and that arm has its own named case rather than
+// being asserted by accident in every unrelated one.
+constexpr char const* kFixtureArtifactFileName = "fixture.dylib";
+
 
 using namespace dss;
 using dss::link_format::test::countAtPath;
@@ -317,6 +330,126 @@ struct DyldInfoView {
     return out;
 }
 
+// ── The export trie's OTHER load command ─────────────────────────
+// LC_DYLD_EXPORTS_TRIE (0x33 | LC_REQ_DYLD) — ✔MEASURED off the installed
+// MacOSX.sdk <mach-o/loader.h>, "used with linkedit_data_command, payload is
+// trie". An image that binds through chained fixups carries NO
+// LC_DYLD_INFO_ONLY, so this is the only command that can name its trie.
+// linkedit_data_command: cmd(0) cmdsize(4) dataoff(8) datasize(12).
+constexpr std::uint32_t kLcDyldExportsTrie   = 0x80000033u;
+constexpr std::uint32_t kLcDyldChainedFixups = 0x80000034u;
+
+struct LinkeditDataView {
+    std::uint32_t cmdsize = 0, dataOff = 0, dataSize = 0;
+    bool          found   = false;
+};
+
+[[nodiscard]] LinkeditDataView
+readLinkeditData(std::vector<std::uint8_t> const& b, std::uint32_t cmd) {
+    LinkeditDataView out;
+    auto const lc = findLoadCommand(b, cmd);
+    if (!lc) return out;
+    out.cmdsize  = readU32LE(b, *lc + 4);
+    out.dataOff  = readU32LE(b, *lc + 8);
+    out.dataSize = readU32LE(b, *lc + 12);
+    out.found    = true;
+    return out;
+}
+
+// A chained-fixups MH_EXECUTE format. Deliberately the SHIPPED x86_64 exec
+// shape plus `image.useChainedFixups`, and it declares `weakDefinition`
+// because every shipped Mach-O image document does since
+// [[D-LK3-DYLIB-WEAK-EXPORT]] — without the block the DIALECT gate refuses
+// first and the cell below would be probing that refusal instead of the
+// trie's load command (the "fixture that answers an adjacent question"
+// shape `loadUnsignedExec`'s docblock names).
+[[nodiscard]] std::shared_ptr<ObjectFormatSchema const>
+loadChainedFixupsWeakExecFormat() {
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "cSymbolDecoration": { "scheme": "leading-underscore" },
+      "cCallingConvention": { "convention": "sysv_amd64" },
+      "outputExtension": "",
+      "dataModel": "LP64",
+      "headerNameMatching": "case-insensitive",
+      "weakDefinition": { "dialect": "symbol-flag" },
+      "format": {"name":"macho-cfx-weak-exec","kind":"macho"},
+      "runtimeLibraries": [{"role":"cLibrary","image":"/usr/lib/libSystem.B.dylib"}],
+      "entryVerbs": ["none","argc-argv"],
+      "processExit": { "mechanism": "by-name-import", "role": "cLibrary", "importMangledName": "_exit" },
+      "entryCallingConvention": "sysv_amd64",
+      "entryPoint": "",
+      "macho": { "cputype": 16777223, "cpusubtype": 3, "filetype": "execute", "flags": 2097285 },
+      "image": {
+        "pageZeroSize": 4294967296,
+        "dylinkerPath": "/usr/lib/dyld",
+        "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+        "useChainedFixups": true
+      },
+      "sections":[
+        {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
+      ],
+      "relocations":[
+        {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
+        {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
+        {"name":"X86_64_RELOC_UNSIGNED_4","kind":3,"nativeId":33554432}
+      ]
+    })");
+    if (!fmt.has_value()) {
+        for (auto const& d : fmt.error()) ADD_FAILURE() << "  " << d.message;
+        return nullptr;
+    }
+    return *fmt;
+}
+
+// One x86_64 exec module, one defined function under `binding`, one extern
+// (the chained-fixups path needs an import to have a payload at all).
+[[nodiscard]] AssembledModule chainedFixupsWeakModule(SymbolBinding binding) {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction f7;
+    f7.symbol = SymbolId{7};
+    f7.bytes  = {0xC3};
+    mod.functions.push_back(std::move(f7));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{7}, "_cfx_def", binding,
+                                       SymbolVisibility::Default});
+    ExternImport imp;
+    imp.symbol      = SymbolId{99};
+    imp.mangledName = "_puts";
+    imp.libraryPath = "/usr/lib/libSystem.B.dylib";
+    mod.externImports.push_back(std::move(imp));
+    mod.imageEntryOverride = std::size_t{0};
+    return mod;
+}
+
+// The n_desc field of the nlist_64 record naming `symbol`, or nullopt when the
+// image carries no such record. The weak-definition bit N_WEAK_DEF (0x0080)
+// lives here, and reading it back off the EMITTED BYTES rather than trusting
+// the writer's own `definedNDesc` is what makes the pin an independent
+// measurement. nlist_64: n_strx(4) n_type(1) n_sect(1) n_desc(2) n_value(8).
+[[nodiscard]] std::optional<std::uint16_t>
+imageNlistDesc(std::vector<std::uint8_t> const& bytes, std::string_view symbol) {
+    auto const lc = findLoadCommand(bytes, /*LC_SYMTAB=*/0x02u);
+    if (!lc) return std::nullopt;
+    std::uint32_t const symOff = readU32LE(bytes, *lc + 8);
+    std::uint32_t const nsyms  = readU32LE(bytes, *lc + 12);
+    std::uint32_t const strOff = readU32LE(bytes, *lc + 16);
+    for (std::uint32_t i = 0; i < nsyms; ++i) {
+        std::size_t const rec = static_cast<std::size_t>(symOff) + i * 16u;
+        if (rec + 16 > bytes.size()) break;
+        std::size_t q = static_cast<std::size_t>(strOff) + readU32LE(bytes, rec);
+        std::string name;
+        while (q < bytes.size() && bytes[q] != 0)
+            name.push_back(static_cast<char>(bytes[q++]));
+        if (name != symbol) continue;
+        return static_cast<std::uint16_t>(
+            static_cast<std::uint16_t>(bytes[rec + 6])
+            | static_cast<std::uint16_t>(
+                  static_cast<std::uint16_t>(bytes[rec + 7]) << 8));
+    }
+    return std::nullopt;
+}
+
 // ── The dyld export-trie walk (MachOLoaded::trieWalk's algorithm,
 //    re-implemented HERE so the test consumes the emitted bytes the
 //    way dlsym does): at each node, read the terminal payload if the
@@ -519,7 +652,8 @@ decodeRebaseStream(std::span<std::uint8_t const> stream) {
 encodeDylib(AssembledModule const& mod, Loaded const& loaded) {
     DiagnosticReporter rep;
     auto bytes =
-        dss::macho::encode(mod, *loaded.target, *loaded.format, rep);
+        dss::macho::encode(mod, *loaded.target, *loaded.format, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
     EXPECT_EQ(rep.errorCount(), 0u);
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     EXPECT_FALSE(bytes.empty());
@@ -539,8 +673,14 @@ TEST(MachoDylibFormatJson, ShippedFileLoadsCleanly) {
     EXPECT_EQ(loaded.format->macho().cputype, 0x0100000Cu);
     EXPECT_EQ(loaded.format->machoImage().pageZeroSize, 0u);
     EXPECT_TRUE(loaded.format->machoImage().dylinkerPath.empty());
+    // D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT: the
+    // DECLARATION, not the emitted identity. It was the literal
+    // `@rpath/libdss.dylib` and every DSS-built dylib inherited it; it is now a
+    // function of the artifact. The emitted bytes are pinned separately in
+    // `MachoDylibInstallName` (tests/link/test_macho_writer.cpp), which is
+    // where the SUBSTITUTION and its refusal arm belong.
     EXPECT_EQ(loaded.format->machoImage().installName,
-              "@rpath/libdss.dylib");
+              "@rpath/${artifactFileName}");
 }
 
 TEST(MachoDylibFormatPolicy, ImageFlavorTrueUndefinedImportsFalse) {
@@ -595,7 +735,10 @@ TEST(MachoDylibWriter, HeaderPinsDylibShape) {
     EXPECT_EQ(readU32LE(bytes, *idLc + 8), 24u);   // lc_str offset
     std::string const name(
         reinterpret_cast<char const*>(&bytes[*idLc + 24]));
-    EXPECT_EQ(name, "@rpath/libdss.dylib");
+    // D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT: the
+    // EMITTED identity is now the document's declared shape with this
+    // emission's artifact substituted, so it tracks the fixture name above.
+    EXPECT_EQ(name, std::string{"@rpath/"} + kFixtureArtifactFileName);
 
     // NO LC_MAIN, NO LC_LOAD_DYLINKER, NO __PAGEZERO.
     EXPECT_FALSE(findLoadCommand(bytes, kLcMain).has_value());
@@ -1004,16 +1147,102 @@ TEST(MachoDylibWriter, CodeSignatureExecSegFlagsZeroOnDylib) {
 
 // ── (6) Fail-loud belts ──────────────────────────────────────────
 
-TEST(MachoDylibWriter, WeakExportFailsLoud) {
+// ── [[D-LK3-DYLIB-WEAK-EXPORT]] ─ A WEAK DYLIB EXPORT, ALL FOUR FACTS ─────
+//
+// This test used to assert the OPPOSITE (`WeakExportFailsLoud`): the walker
+// refused a weak export because emitting the nlist bit alone would publish a
+// weak definition no loader was told to coalesce. The capability now exists,
+// so the pin is inverted — and it asserts all four facts at once, because
+// three of four is the shape the refusal existed to prevent.
+//
+// ★ THE CONTROL IS THE SAME MODULE WITH A GLOBAL BINDING, run through the same
+// encoder in the same test. Without it, "the trie terminal carries 0x04" is
+// equally consistent with "this writer stamps 0x04 on every terminal", and
+// "the header reads 0x...18085" with "that is just what this schema declares".
+//
+// ✔MEASURED 2026-09-05 on the operator's Apple Silicon host (macOS 26.6.2,
+// Apple clang 21.0.0 / ld-1267) against the identical source: a dylib defining
+// `__attribute__((weak)) int w(void)` reads header flags `0x00118085`,
+// `nm -m` `weak external _w`, `dyld_info -exports` `_w [weak-def]`; the
+// strong-definition control reads `0x00100085`, `external _w`, `_w`. The delta
+// is exactly MH_WEAK_DEFINES | MH_BINDS_TO_WEAK, which is what this asserts.
+TEST(MachoDylibWriter, WeakExportCarriesAllFourWeakDefinitionFacts) {
     auto loaded = loadShippedDylib();
     ASSERT_TRUE(loaded.target && loaded.format);
-    AssembledModule mod = makeExportModule();
-    mod.symbols[0].binding = SymbolBinding::Weak;
-    DiagnosticReporter rep;
-    auto img = dss::macho::encode(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(img.empty());
-    EXPECT_GT(rep.errorCount(), 0u);
-    EXPECT_TRUE(sawDiagnosticContaining(rep, "D-LK3-DYLIB-WEAK-EXPORT"));
+
+    // `makeExportModule`'s symbols[0] is the exported function row.
+    auto encodeWith = [&](SymbolBinding binding) {
+        AssembledModule mod = makeExportModule();
+        mod.symbols[0].binding = binding;
+        DiagnosticReporter rep;
+        auto img = dss::macho::encode(mod, *loaded.target, *loaded.format, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
+        std::string diags;
+        for (auto const& d : rep.all()) diags += d.actual + "\n";
+        return std::tuple{std::move(img), rep.errorCount(), diags,
+                          std::string{mod.symbols[0].name}};
+    };
+
+    auto const [weakImg, weakErrs, weakDiags, name] =
+        encodeWith(SymbolBinding::Weak);
+    ASSERT_EQ(weakErrs, 0u) << weakDiags;
+    ASSERT_FALSE(weakImg.empty());
+    auto const [strongImg, strongErrs, strongDiags, name2] =
+        encodeWith(SymbolBinding::Global);
+    ASSERT_EQ(strongErrs, 0u) << strongDiags;
+    ASSERT_FALSE(strongImg.empty());
+    ASSERT_EQ(name, name2);
+
+    // (1) nlist n_desc carries N_WEAK_DEF (0x0080) — and the control does not.
+    EXPECT_EQ(imageNlistDesc(weakImg, name), std::optional<std::uint16_t>{0x0080})
+        << "a weak dylib definition must be `weak external` in nlist";
+    EXPECT_EQ(imageNlistDesc(strongImg, name), std::optional<std::uint16_t>{0})
+        << "CONTROL: the same definition, GLOBAL, must carry no n_desc bit";
+
+    // (2) the export-trie terminal carries EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.
+    auto const wInfo = readDyldInfo(weakImg);
+    auto const sInfo = readDyldInfo(strongImg);
+    ASSERT_TRUE(wInfo.found && sInfo.found);
+    ASSERT_GT(wInfo.exportSize, 0u);
+    ASSERT_GT(sInfo.exportSize, 0u);
+    std::span<std::uint8_t const> const weakAll(weakImg);
+    std::span<std::uint8_t const> const strongAll(strongImg);
+    auto const wHit = trieWalk(
+        weakAll.subspan(wInfo.exportOff, wInfo.exportSize), name);
+    auto const sHit = trieWalk(
+        strongAll.subspan(sInfo.exportOff, sInfo.exportSize), name);
+    ASSERT_TRUE(wHit.has_value()) << name << " missing from the weak trie";
+    ASSERT_TRUE(sHit.has_value()) << name << " missing from the control trie";
+    // ⚠ THE WHOLE FLAGS WORD, NOT A MASK OF IT. A masked read
+    // (`flags & 0x04`) stays green while the writer also sets
+    // EXPORT_SYMBOL_FLAGS_REEXPORT (0x08) or _STUB_AND_RESOLVER (0x10) —
+    // either of which retargets the terminal at a DIFFERENT symbol or a
+    // resolver function, so a green mask would be asserting the coalescing
+    // bit on an export that no longer names this definition. The kind
+    // nibble must read KIND_REGULAR (0x00) too: KIND_THREAD_LOCAL (0x01)
+    // and KIND_ABSOLUTE (0x02) change what dyld does with the address.
+    // Values ✔MEASURED off the installed MacOSX.sdk <mach-o/loader.h>.
+    // The header assertion below is exact for the same reason; a test that
+    // is exact about one fact and masked about its twin is exact by accident.
+    EXPECT_EQ(wHit->flags, 0x04u)
+        << "dyld coalesces on the TRIE terminal, not the nlist — and the "
+           "terminal must carry EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION and "
+           "NOTHING ELSE (kind REGULAR, no reexport, no stub-and-resolver)";
+    EXPECT_EQ(sHit->flags, 0u)
+        << "CONTROL: a global export is KIND_REGULAR with no flag at all";
+    EXPECT_EQ(wHit->address, sHit->address)
+        << "the weak marking must not move the exported address";
+
+    // (3) the mach header advertises the coalescing surface — both bits, from
+    //     the one fact (see the MH_WEAK_DEFINES docblock in macho.cpp).
+    std::uint32_t const weakFlags   = readU32LE(weakImg, 24);
+    std::uint32_t const strongFlags = readU32LE(strongImg, 24);
+    EXPECT_EQ(weakFlags & 0x00008000u, 0x00008000u) << "MH_WEAK_DEFINES";
+    EXPECT_EQ(weakFlags & 0x00010000u, 0x00010000u) << "MH_BINDS_TO_WEAK";
+    EXPECT_EQ(strongFlags & 0x00018000u, 0u)
+        << "CONTROL: a weak-free image must carry neither bit";
+    EXPECT_EQ(weakFlags & ~0x00018000u, strongFlags)
+        << "the two bits are the ONLY header difference the binding makes";
 }
 
 TEST(MachoDylibWriter, ModuleSymbolNamingExternImportFailsLoud) {
@@ -1037,7 +1266,8 @@ TEST(MachoDylibWriter, ModuleSymbolNamingExternImportFailsLoud) {
                                        SymbolBinding::Global,
                                        SymbolVisibility::Default});
     DiagnosticReporter rep;
-    auto img = dss::macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = dss::macho::encode(mod, *loaded.target, *loaded.format, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
     EXPECT_TRUE(img.empty());
     EXPECT_GT(rep.errorCount(), 0u);
     EXPECT_TRUE(sawDiagnosticContaining(rep, "EXTERN IMPORT"));
@@ -1053,7 +1283,8 @@ TEST(MachoDylibWriter, ImageEntryOverrideFailsLoud) {
     AssembledModule mod = makeExportModule();
     mod.imageEntryOverride = 0u;
     DiagnosticReporter rep;
-    auto img = dss::macho::encode(mod, *loaded.target, *loaded.format, rep);
+    auto img = dss::macho::encode(mod, *loaded.target, *loaded.format, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
     EXPECT_TRUE(img.empty());
     EXPECT_GT(rep.errorCount(), 0u);
     EXPECT_TRUE(sawDiagnosticContaining(rep, "imageEntryOverride"));
@@ -1092,7 +1323,12 @@ TEST(MachoDylibWriter, ThreadLocalDylibLinksAndCarriesTLV) {
                                        SymbolBinding::Global,
                                        SymbolVisibility::Default});
     DiagnosticReporter rep;
-    auto img = linker::link(mod, *loaded.target, *loaded.format, rep);
+    // The artifact identity rides the image request through `linker::link`
+    // exactly as a real build's `linkAndWrite` supplies it
+    // (D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT).
+    auto img = linker::link(mod, *loaded.target, *loaded.format, rep,
+                            dss::ImageRequest{
+                                .artifactFileName = kFixtureArtifactFileName});
     for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
     // Links CLEAN — the pre-walker gate now ADMITS tdata/tbss (the old
     // rejection was the absence this row existed for).
@@ -1200,13 +1436,24 @@ TEST(MachoDylibFormatJsonValidate, TextVaMustEqualSegmentPageSize) {
     ASSERT_FALSE(r.has_value());
 }
 
-TEST(MachoDylibFormatJsonValidate, ChainedFixupsRejected) {
-    // The dylib export trie rides LC_DYLD_INFO_ONLY.export_off; the
-    // chained-fixups path would need LC_DYLD_EXPORTS_TRIE
-    // (D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE).
+TEST(MachoDylibFormatJsonValidate, ChainedFixupsAccepted) {
+    // ⚠ THIS PIN IS THE INVERSE OF THE ONE IT REPLACES, AND THE INVERSION IS
+    // THE POINT. It used to assert that `useChainedFixups: true` was REFUSED
+    // on an MH_DYLIB schema, because "the dylib export trie rides
+    // LC_DYLD_INFO_ONLY.export_off; the chained-fixups path would need
+    // LC_DYLD_EXPORTS_TRIE" — which is now emitted, for BOTH image flavors,
+    // keyed on a non-empty trie rather than on the filetype. A refusal whose
+    // stated reason has gone false is a capability hole that reads as a
+    // decision, and the EXEC flavor was never refused this key, so the
+    // asymmetry had no argument left. D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE.
     auto r = ObjectFormatSchema::loadFromText(
         dylibJsonWith("", R"("useChainedFixups": true,)"));
-    ASSERT_FALSE(r.has_value());
+    ASSERT_TRUE(r.has_value())
+        << "an MH_DYLIB schema may declare chained fixups now that its export "
+           "trie has a load command; the image-level pin is "
+           "MachoChainedFixupsExportTrie.DylibPublishesItsExportTrieThroughIts"
+           "OwnLoadCommand";
+    EXPECT_TRUE((*r)->machoImage().useChainedFixups);
 }
 
 TEST(MachoDylibFormatJsonValidate, InstallNameOnExecRejected) {
@@ -1352,7 +1599,10 @@ TEST(MachoDylibWriterX86_64, HeaderPinsDylibShape) {
     EXPECT_EQ(readU32LE(bytes, *idLc + 8), 24u);   // lc_str offset
     std::string const name(
         reinterpret_cast<char const*>(&bytes[*idLc + 24]));
-    EXPECT_EQ(name, "@rpath/libdss.dylib");
+    // D-LK-MACHO-DYLIB-INSTALL-NAME-IS-ONE-CONSTANT-FOR-EVERY-ARTIFACT: the
+    // EMITTED identity is now the document's declared shape with this
+    // emission's artifact substituted, so it tracks the fixture name above.
+    EXPECT_EQ(name, std::string{"@rpath/"} + kFixtureArtifactFileName);
 
     // NO LC_MAIN, NO LC_LOAD_DYLINKER, NO __PAGEZERO (a dylib is
     // base-0; dyld slides the whole image).
@@ -1503,9 +1753,25 @@ TEST(MachoImageSymbolNames,
 
         auto target = TargetSchema::loadShipped(port.targetName);
         ASSERT_TRUE(target.has_value()) << label;
-        auto fmt = ObjectFormatSchema::loadShipped(
-            isDylibCell ? port.dylibFormat : port.execFormat);
+        // ★ THE STATIC CELL DRIVES AN *UNSIGNED* COUNTERPART OF THE SHIPPED
+        // exec document — D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM.
+        // `encodeExec` builds no __LINKEDIT and can host no LC_CODE_SIGNATURE,
+        // so `macho::encode` REFUSES a zero-extern module against a format
+        // that requests one. EVERY shipped Darwin exec document requests one,
+        // which would turn this cell into a test of that refusal and delete
+        // every assertion it was written to make. The shared fixture is the
+        // shipped document minus the signature and NOTHING else -- in
+        // particular the arm64 one KEEPS `image.buildVersion`, so the
+        // D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION branch below still fires on
+        // that port exactly as it did before, and this file remains the only
+        // place that boundary is pinned by EXECUTION.
+        using FmtLoad = LoadResult<std::shared_ptr<ObjectFormatSchema>>;
+        auto fmt = (arm == ImageArm::StaticExec)
+            ? FmtLoad{dss::macho::test::loadUnsignedExec(port.execFormat)}
+            : ObjectFormatSchema::loadShipped(
+                  isDylibCell ? port.dylibFormat : port.execFormat);
         ASSERT_TRUE(fmt.has_value()) << label;
+        ASSERT_NE(*fmt, nullptr) << label;
 
         AssembledModule mod;
         mod.expectedFuncCount = 3;
@@ -1580,7 +1846,8 @@ TEST(MachoImageSymbolNames,
             && (*fmt)->machoImage().buildVersion.has_value();
 
         DiagnosticReporter rep;
-        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep);
+        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         std::string diags;
         for (auto const& d : rep.all()) diags += d.actual + "\n";
 
@@ -1871,7 +2138,8 @@ TEST(MachoImageLinkeditAlignment,
         if (!isDylibCell) mod.imageEntryOverride = std::size_t{0};
 
         DiagnosticReporter rep;
-        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep);
+        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         std::string diags;
         for (auto const& d : rep.all()) diags += d.actual + "\n";
         ASSERT_EQ(rep.errorCount(), 0u) << label << "\n" << diags;
@@ -2035,9 +2303,25 @@ TEST(MachoImageSymbolNames,
 
         auto target = TargetSchema::loadShipped(port.targetName);
         ASSERT_TRUE(target.has_value()) << label;
-        auto fmt = ObjectFormatSchema::loadShipped(
-            isDylibCell ? port.dylibFormat : port.execFormat);
+        // ★ THE STATIC CELL DRIVES AN *UNSIGNED* COUNTERPART OF THE SHIPPED
+        // exec document — D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM.
+        // `encodeExec` builds no __LINKEDIT and can host no LC_CODE_SIGNATURE,
+        // so `macho::encode` REFUSES a zero-extern module against a format
+        // that requests one. EVERY shipped Darwin exec document requests one,
+        // which would turn this cell into a test of that refusal and delete
+        // every assertion it was written to make. The shared fixture is the
+        // shipped document minus the signature and NOTHING else -- in
+        // particular the arm64 one KEEPS `image.buildVersion`, so the
+        // D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION branch below still fires on
+        // that port exactly as it did before, and this file remains the only
+        // place that boundary is pinned by EXECUTION.
+        using FmtLoad = LoadResult<std::shared_ptr<ObjectFormatSchema>>;
+        auto fmt = (arm == ImageArm::StaticExec)
+            ? FmtLoad{dss::macho::test::loadUnsignedExec(port.execFormat)}
+            : ObjectFormatSchema::loadShipped(
+                  isDylibCell ? port.dylibFormat : port.execFormat);
         ASSERT_TRUE(fmt.has_value()) << label;
+        ASSERT_NE(*fmt, nullptr) << label;
 
         AssembledModule mod;
         mod.expectedFuncCount = 2;
@@ -2086,7 +2370,8 @@ TEST(MachoImageSymbolNames,
             && (*fmt)->machoImage().buildVersion.has_value();
 
         DiagnosticReporter rep;
-        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep);
+        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         std::string diags;
         for (auto const& d : rep.all()) diags += d.actual + "\n";
 
@@ -2154,9 +2439,13 @@ TEST(MachoImageSymbolNames,
             << label
             << ": n_value must be the function's runtime VA — an alias pair "
                "agreeing at 0 would satisfy the equality while naming nothing";
-        // N_SECT|N_EXT on both: this format's image-tier binding question is
-        // owned by D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT, and an alias
-        // must not become a second, undeclared answer to it.
+        // N_SECT|N_EXT on both: canonical and alias are both GLOBAL rows, and
+        // the image tier now maps every defined symbol's binding through the
+        // same `definedNType` the object tier uses
+        // (D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT), so an externally
+        // visible alias of an externally visible canonical carries the same
+        // n_type — the LOCAL half of that mapping is pinned by
+        // tests/link/test_macho_image_symtab_bands.cpp.
         EXPECT_EQ(typeAt(*canonIdx), 0x0Fu) << label;
         EXPECT_EQ(typeAt(*aliasIdx), 0x0Fu)
             << label << ": the alias is a DEFINED symbol in this section, like "
@@ -2172,6 +2461,8 @@ TEST(MachoImageSymbolNames,
             return;
         }
         ASSERT_TRUE(dysymLc.has_value()) << label;
+        std::uint32_t const ilocalsym     = readU32LE(bytes, *dysymLc + 8);
+        std::uint32_t const nlocalsym     = readU32LE(bytes, *dysymLc + 12);
         std::uint32_t const iextdefsym    = readU32LE(bytes, *dysymLc + 16);
         std::uint32_t const nextdefsym    = readU32LE(bytes, *dysymLc + 20);
         std::uint32_t const iundefsym     = readU32LE(bytes, *dysymLc + 24);
@@ -2179,26 +2470,47 @@ TEST(MachoImageSymbolNames,
         std::uint32_t const indirectsymoff = readU32LE(bytes, *dysymLc + 56);
         std::uint32_t const nindirectsyms  = readU32LE(bytes, *dysymLc + 60);
 
-        // The bands must TILE the table: [0, nextdefsym) defined, then
-        // [iundefsym, +nundefsym) undefined, ending exactly at nsyms. An alias
-        // that grew the defined band without moving the boundary shows up here
-        // as a defined symbol sitting inside the undefined band.
-        EXPECT_EQ(iextdefsym, 0u) << label;
-        EXPECT_EQ(iundefsym, nextdefsym)
+        // The bands must TILE the table: [0, nlocalsym) local, then
+        // [iextdefsym, +nextdefsym) externally defined, then
+        // [iundefsym, +nundefsym) undefined, ending exactly at nsyms. fn #9
+        // carries no `ModuleSymbol` row, so `definedBinding` says Local and it
+        // is the ONE local record here, sorted FIRST
+        // (D-LINK-MACHO-IMAGE-STATIC-FN-EMITTED-N-EXT). An alias that grew
+        // the defined band without moving the boundary shows up here as a
+        // defined symbol sitting inside the undefined band.
+        EXPECT_EQ(ilocalsym, 0u) << label;
+        EXPECT_EQ(nlocalsym, 1u)
+            << label << ": fn #9 (no declared name) is the one Local record";
+        EXPECT_EQ(iextdefsym, nlocalsym)
             << label
-            << ": the undefined band must start exactly where the defined band "
-               "ends";
-        EXPECT_EQ(nextdefsym + nundefsym, nsyms)
-            << label << ": the two bands must tile LC_SYMTAB.nsyms exactly";
-        EXPECT_LT(*aliasIdx, nextdefsym)
+            << ": the externally-defined band must start exactly where the "
+               "local band ends";
+        EXPECT_EQ(iundefsym, iextdefsym + nextdefsym)
+            << label
+            << ": the undefined band must start exactly where the "
+               "externally-defined band ends";
+        EXPECT_EQ(iundefsym + nundefsym, nsyms)
+            << label << ": the three bands must tile LC_SYMTAB.nsyms exactly";
+        EXPECT_GE(*canonIdx, iextdefsym)
+            << label << ": a GLOBAL canonical sits in the externally-defined "
+                        "band, never among the locals";
+        EXPECT_GE(*aliasIdx, iextdefsym)
+            << label << ": an alias is externally visible by construction and "
+                        "sits in the externally-defined band";
+        EXPECT_LT(*aliasIdx, iundefsym)
             << label
             << ": the alias is a DEFINED symbol and must sit inside the defined "
-               "band — if it spilled past `nextdefsym`, every indirect-symbol "
+               "band — if it spilled past `iundefsym`, every indirect-symbol "
                "index would be short by one";
-        for (std::uint32_t i = 0; i < nextdefsym; ++i) {
+        for (std::uint32_t i = 0; i < nlocalsym; ++i) {
+            EXPECT_EQ(typeAt(i), 0x0Eu)
+                << label << ": nlist #" << i
+                << " sits in the LOCAL band but is not bare N_SECT";
+        }
+        for (std::uint32_t i = iextdefsym; i < iundefsym; ++i) {
             EXPECT_EQ(typeAt(i), 0x0Fu)
                 << label << ": nlist #" << i
-                << " sits in the DEFINED band but is not N_SECT|N_EXT";
+                << " sits in the EXTERNALLY-DEFINED band but is not N_SECT|N_EXT";
         }
         for (std::uint32_t i = iundefsym; i < nsyms; ++i) {
             EXPECT_EQ(typeAt(i), 0x01u)
@@ -2312,23 +2624,30 @@ TEST(MachoIndirectSymbols, EveryBreachArmFiresAndNamesTheOffender) {
     EXPECT_NE(b3.find("16-byte records"), std::string::npos) << b3;
 }
 
-// ── A WEAK ALIAS IS REFUSED ON EVERY MACH-O IMAGE ARM ──────────────────────
+// ── A WEAK ALIAS ON EVERY MACH-O IMAGE ARM ─────────────────────────────────
 //
-// D-LK3-DYLIB-WEAK-EXPORT. Before this, the two image arms answered the same
-// question differently and by accident: the DYLIB was covered because the
-// export trie refuses a WEAK `ModuleSymbol` row before the nlist is built,
-// while a DYNAMIC EXEC builds no trie — so a weak alias reached the nlist and
-// went out `N_SECT|N_EXT`, n_desc 0, i.e. SILENTLY STRONG. The ELF image arm
-// carries the same alias's WEAK binding faithfully through `stbForBinding`, so
-// the two formats disagreed about the same input with no rule saying why.
+// [[D-LK3-DYLIB-WEAK-EXPORT]]. This matrix used to assert that every image arm
+// REFUSED a weak alias, and the refusal was the honest answer while the writer
+// could state only one of the four facts an image needs. It now states all of
+// them, so the same matrix asserts the ENCODING — with the SAME cell-by-cell
+// GLOBAL control, which is what makes each verdict mean "because it is weak"
+// rather than "because it is an alias".
 //
-// The answer is the loud one and the reason is measured, not chosen: N_WEAK_DEF
-// on an IMAGE needs MH_WEAK_DEFINES in the mach header for dyld to coalesce it
-// (✔MEASURED on Apple Silicon in this file's own N_WEAK_DEF docblock — the
-// linked exec reads flags 0x00218085 against a weak-free control's 0x00200085),
-// and these writers copy the schema's header flags verbatim. Emitting the bit
-// would state half the fact; emitting it strong changes cross-image coalescing.
-TEST(MachoImageWeakAlias, EveryImageArmRefusesAWeakAliasAndNamesIt) {
+// ★ THE STATIC ARM IS THE ONE CELL THAT STILL REFUSES, AND FOR A DIFFERENT
+// REASON, WHICH IS WHY IT ASSERTS A DIFFERENT MESSAGE. `encodeExec` emits no
+// __LINKEDIT segment, so it can host no export trie — and dyld's coalescing
+// pass reads the trie, never the nlist. The missing capability there is
+// __LINKEDIT synthesis (D-LK7-1), not weak definitions, so the cell asserts
+// the message names THAT: a refusal citing a closed row sends the next reader
+// to fix an engine gap that no longer exists.
+//
+// ✔MEASURED 2026-09-05, Apple Silicon (macOS 26.6.2, Apple clang 21.0.0 /
+// ld-1267), the reference shape every non-static cell here reproduces: a weak
+// definition reads `weak external` in `nm -m`, `[weak-def]` in
+// `dyld_info -exports`, and header flags `0x00218085` against the weak-free
+// control's `0x00200085` — a delta of exactly
+// MH_WEAK_DEFINES | MH_BINDS_TO_WEAK.
+TEST(MachoImageWeakAlias, EveryImageArmPublishesAWeakAliasAsAWeakDefinition) {
     std::vector<MachoPortSpec> const ports{
         {"arm64", "arm64",
          "macho64-arm64-darwin-exec", "macho64-arm64-darwin-dylib",
@@ -2340,20 +2659,36 @@ TEST(MachoImageWeakAlias, EveryImageArmRefusesAWeakAliasAndNamesIt) {
 
     auto runCell = [](MachoPortSpec const& port, ImageArm arm,
                       SymbolBinding aliasBinding) -> void {
-        bool const wantRefusal = aliasBinding == SymbolBinding::Weak;
+        bool const aliasIsWeak = aliasBinding == SymbolBinding::Weak;
         char const* const armLabel =
             arm == ImageArm::StaticExec  ? " [static exec arm]"
           : arm == ImageArm::DynamicExec ? " [dynamic exec arm]"
                                          : " [dylib arm]";
         std::string const label = std::string{port.label} + armLabel
-                                  + (wantRefusal ? " weak" : " global CONTROL");
+                                  + (aliasIsWeak ? " weak" : " global CONTROL");
         bool const isDylibCell = arm == ImageArm::Dylib;
 
         auto target = TargetSchema::loadShipped(port.targetName);
         ASSERT_TRUE(target.has_value()) << label;
-        auto fmt = ObjectFormatSchema::loadShipped(
-            isDylibCell ? port.dylibFormat : port.execFormat);
+        // ★ THE STATIC CELL DRIVES AN *UNSIGNED* COUNTERPART OF THE SHIPPED
+        // exec document — D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM.
+        // `encodeExec` builds no __LINKEDIT and can host no LC_CODE_SIGNATURE,
+        // so `macho::encode` REFUSES a zero-extern module against a format
+        // that requests one. EVERY shipped Darwin exec document requests one,
+        // which would turn this cell into a test of that refusal and delete
+        // every assertion it was written to make. The shared fixture is the
+        // shipped document minus the signature and NOTHING else -- in
+        // particular the arm64 one KEEPS `image.buildVersion`, so the
+        // D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION branch below still fires on
+        // that port exactly as it did before, and this file remains the only
+        // place that boundary is pinned by EXECUTION.
+        using FmtLoad = LoadResult<std::shared_ptr<ObjectFormatSchema>>;
+        auto fmt = (arm == ImageArm::StaticExec)
+            ? FmtLoad{dss::macho::test::loadUnsignedExec(port.execFormat)}
+            : ObjectFormatSchema::loadShipped(
+                  isDylibCell ? port.dylibFormat : port.execFormat);
         ASSERT_TRUE(fmt.has_value()) << label;
+        ASSERT_NE(*fmt, nullptr) << label;
 
         AssembledModule mod;
         mod.expectedFuncCount = 1;
@@ -2385,41 +2720,89 @@ TEST(MachoImageWeakAlias, EveryImageArmRefusesAWeakAliasAndNamesIt) {
         }
 
         DiagnosticReporter rep;
-        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep);
+        auto const bytes = dss::macho::encode(mod, **target, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         std::string diags;
         for (auto const& d : rep.all()) diags += d.actual + "\n";
 
-        if (!wantRefusal) {
-            // THE CONTROL, and it is what makes the refusal mean "weak" rather
-            // than "alias": the identical module with a GLOBAL second name must
-            // encode cleanly and carry both names.
-            ASSERT_EQ(rep.errorCount(), 0u) << label << "\n" << diags;
-            ASSERT_FALSE(bytes.empty()) << label;
-            auto const names = imageNlistNames(bytes);
-            EXPECT_NE(std::find(names.begin(), names.end(), "_wk_alias_name"),
-                      names.end())
-                << label << ": a GLOBAL alias must still be emitted";
+        // ── THE STATIC ARM: still a refusal, and a DIFFERENT one ──────────
+        // No __LINKEDIT ⇒ no export trie ⇒ nowhere to publish the coalescing
+        // surface. It must name D-LK7-1 (the __LINKEDIT gap) and NOT the row
+        // this cycle closed.
+        if (arm == ImageArm::StaticExec && aliasIsWeak) {
+            EXPECT_TRUE(bytes.empty())
+                << label << ": the static arm cannot host an export trie";
+            EXPECT_GT(rep.errorCount(), 0u) << label;
+            EXPECT_TRUE(sawDiagnosticContaining(rep, "D-LK7-1"))
+                << label
+                << ": the refusal must name the capability that is actually "
+                   "missing (__LINKEDIT synthesis)\n" << diags;
+            EXPECT_TRUE(sawDiagnosticContaining(rep, "__LINKEDIT")) << diags;
             return;
         }
 
-        EXPECT_TRUE(bytes.empty())
+        // Every other cell ENCODES, weak or global. The two differ only in the
+        // three facts below.
+        ASSERT_EQ(rep.errorCount(), 0u) << label << "\n" << diags;
+        ASSERT_FALSE(bytes.empty()) << label;
+        auto const names = imageNlistNames(bytes);
+        EXPECT_NE(std::find(names.begin(), names.end(), "_wk_alias_name"),
+                  names.end())
+            << label << ": the alias must be emitted whatever its binding";
+
+        // (1) nlist n_desc. N_WEAK_DEF (0x0080) on the weak cell, 0 on the
+        //     GLOBAL control, and the CANONICAL row (Global in both cells) is
+        //     read too so "the writer stamps the bit on everything" cannot
+        //     pass as a green.
+        std::uint16_t const wantDesc = aliasIsWeak ? 0x0080u : 0x0000u;
+        EXPECT_EQ(imageNlistDesc(bytes, "_wk_alias_name"),
+                  std::optional<std::uint16_t>{wantDesc})
+            << label << ": the alias's n_desc";
+        EXPECT_EQ(imageNlistDesc(bytes, "_wk_canonical"),
+                  std::optional<std::uint16_t>{0u})
+            << label << ": the GLOBAL canonical must carry no n_desc bit";
+
+        // (2) the mach header's two coalescing bits, from the one fact.
+        std::uint32_t const flags = readU32LE(bytes, 24);
+        EXPECT_EQ(flags & 0x00018000u, aliasIsWeak ? 0x00018000u : 0u)
+            << label << ": MH_WEAK_DEFINES | MH_BINDS_TO_WEAK";
+
+        // (3) the export trie. The DYLIB publishes its whole defined set, so
+        //     the control cell has a terminal too and the difference is the
+        //     0x04 FLAG. The dynamic EXEC publishes weak definitions ONLY, so
+        //     its control cell has no trie at all — which is the pre-change
+        //     byte shape and the reason that narrowing is safe.
+        // The static arm emits no LC_DYLD_INFO_ONLY at all — that absence IS
+        // why its weak cell refuses, and it is asserted there. Only its GLOBAL
+        // control reaches this far.
+        if (arm == ImageArm::StaticExec) {
+            EXPECT_FALSE(readDyldInfo(bytes).found)
+                << label
+                << ": the static arm hosts no LC_DYLD_INFO_ONLY — if it grew "
+                   "one, its weak refusal is stale";
+            return;
+        }
+        auto const info = readDyldInfo(bytes);
+        ASSERT_TRUE(info.found) << label;
+        if (!aliasIsWeak && !isDylibCell) {
+            EXPECT_EQ(info.exportSize, 0u)
+                << label
+                << ": a weak-free exec must still emit ZERO export bytes";
+            return;
+        }
+        ASSERT_GT(info.exportSize, 0u) << label;
+        std::span<std::uint8_t const> const all(bytes);
+        auto const hit = trieWalk(
+            all.subspan(info.exportOff, info.exportSize), "_wk_alias_name");
+        ASSERT_TRUE(hit.has_value())
+            << label << ": the alias must be a trie terminal";
+        // Exact, not masked — see the same argument in
+        // `WeakExportCarriesAllFourWeakDefinitionFacts`: a masked read stays
+        // green under EXPORT_SYMBOL_FLAGS_REEXPORT / _STUB_AND_RESOLVER, and
+        // either would point the terminal somewhere other than this alias.
+        EXPECT_EQ(hit->flags, aliasIsWeak ? 0x04u : 0u)
             << label
-            << ": a weak alias must NOT be emitted - N_SECT|N_EXT would publish "
-               "it as a STRONG definition and silently change cross-image "
-               "coalescing";
-        EXPECT_GT(rep.errorCount(), 0u) << label;
-        EXPECT_TRUE(sawDiagnosticContaining(rep, "D-LK3-DYLIB-WEAK-EXPORT"))
-            << label
-            << ": the refusal must NAME the anchor that has to close before the "
-               "capability can exist\n" << diags;
-        // On the EXEC arms the refusal is the new one and it must name the
-        // offending symbol. The DYLIB arm is refused earlier by the export
-        // trie, whose message names the symbol too but through a different
-        // sentence - so the shared assertion is the symbol NAME, which both owe.
-        EXPECT_TRUE(sawDiagnosticContaining(rep, "_wk_alias_name")
-                    || sawDiagnosticContaining(rep, "_wk_canonical"))
-            << label << ": the refusal must name the symbol it refused\n"
-            << diags;
+            << ": EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION and nothing else";
     };
 
     for (auto const& port : ports) {
@@ -2429,6 +2812,266 @@ TEST(MachoImageWeakAlias, EveryImageArmRefusesAWeakAliasAndNamesIt) {
             runCell(port, arm, SymbolBinding::Global);
         }
     }
+}
+
+// ── D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE: THE TRIE MUST HAVE A READER ────
+//
+// `exportOff`/`exportSize` are FIELDS OF LC_DYLD_INFO_ONLY, and an image with
+// `image.useChainedFixups` emits LC_DYLD_CHAINED_FIXUPS INSTEAD of it. Before
+// this pin the trie bytes were written into __LINKEDIT while NO load command
+// named them, so dyld — which reaches a trie only through a load command —
+// found ZERO exports.
+//
+// ★ WHY IT BECAME A LIE RATHER THAN A GAP. The mach header's
+// MH_WEAK_DEFINES | MH_BINDS_TO_WEAK are derived from `numWeakExports`, the
+// count of terminals the TRIE carries. With the trie orphaned, the image
+// shipped both bits over a coalescing surface no consumer can reach: a weak
+// definition silently strong again UNDER A HEADER ASSERTING THE OPPOSITE.
+// That is the exact failure [[D-LK3-DYLIB-WEAK-EXPORT]] closed, re-entered
+// through one schema key.
+//
+// ✔MEASURED 2026-09-05 on Apple Silicon (Apple clang 21.0.0, ld-1267, macOS
+// 26.6.2) — THE PAIRING IS ld64's OWN SHAPE, not a DSS invention: a plainly
+// linked `cc -o x x.c` executable already carries LC_DYLD_CHAINED_FIXUPS +
+// LC_DYLD_EXPORTS_TRIE and NO LC_DYLD_INFO_ONLY, and an explicit
+// `-Wl,-fixup_chains` build is identical (`cmdsize 16`, dataoff/datasize over
+// the trie). Both list `_weak_one [weak-def]` under `dyld_info -exports`.
+//
+// The CONTROL is the same module GLOBAL: an exec publishes weak definitions
+// only, so it then has no trie at all and must emit no command — asserted, so
+// "the writer emits the LC unconditionally" cannot pass as a green.
+TEST(MachoChainedFixupsExportTrie, WeakExecPublishesItsTrieThroughItsOwnLoadCommand) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = loadChainedFixupsWeakExecFormat();
+    ASSERT_NE(fmt, nullptr);
+
+    auto encodeWith = [&](SymbolBinding binding) {
+        auto mod = chainedFixupsWeakModule(binding);
+        DiagnosticReporter rep;
+        auto img = dss::macho::encode(mod, **target, *fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
+        std::string diags;
+        for (auto const& d : rep.all()) diags += d.actual + "\n";
+        return std::tuple{std::move(img), rep.errorCount(), diags};
+    };
+
+    auto const [weakImg, weakErrs, weakDiags] = encodeWith(SymbolBinding::Weak);
+    ASSERT_EQ(weakErrs, 0u) << weakDiags;
+    ASSERT_FALSE(weakImg.empty());
+
+    // The arm really is the chained one, and the legacy command really is
+    // absent — without both, this test would be pinning the legacy path.
+    EXPECT_TRUE(findLoadCommand(weakImg, kLcDyldChainedFixups).has_value())
+        << "fixture must exercise the chained-fixups arm";
+    EXPECT_FALSE(readDyldInfo(weakImg).found)
+        << "LC_DYLD_INFO_ONLY and LC_DYLD_CHAINED_FIXUPS are mutually "
+           "exclusive — if both appear, `exportOff` has a second publisher "
+           "and this pin is measuring the wrong one";
+
+    auto const trieCmd = readLinkeditData(weakImg, kLcDyldExportsTrie);
+    ASSERT_TRUE(trieCmd.found)
+        << "a chained-fixups image carrying a weak definition MUST name its "
+           "export trie through LC_DYLD_EXPORTS_TRIE — otherwise the header's "
+           "MH_WEAK_DEFINES|MH_BINDS_TO_WEAK advertise a surface dyld cannot "
+           "reach (D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE)";
+    EXPECT_EQ(trieCmd.cmdsize, 16u)
+        << "linkedit_data_command: cmd+cmdsize+dataoff+datasize";
+    ASSERT_GT(trieCmd.dataSize, 0u);
+    ASSERT_LE(static_cast<std::uint64_t>(trieCmd.dataOff) +
+                  static_cast<std::uint64_t>(trieCmd.dataSize),
+              weakImg.size())
+        << "the command must point INSIDE the emitted image";
+
+    // The blob it names must be the real trie, walked with dyld's own
+    // algorithm — a command pointing at plausible bytes is the failure mode
+    // a presence-only assertion cannot see.
+    std::span<std::uint8_t const> const all(weakImg);
+    auto const hit = trieWalk(all.subspan(trieCmd.dataOff, trieCmd.dataSize),
+                              "_cfx_def");
+    ASSERT_TRUE(hit.has_value())
+        << "LC_DYLD_EXPORTS_TRIE must name the EXPORT TRIE, not some other "
+           "__LINKEDIT blob";
+    EXPECT_EQ(hit->flags, 0x04u)
+        << "EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION and nothing else";
+
+    // And the header's claim is now backed by a reachable terminal.
+    std::uint32_t const weakFlags = readU32LE(weakImg, 24);
+    EXPECT_EQ(weakFlags & 0x00018000u, 0x00018000u)
+        << "MH_WEAK_DEFINES | MH_BINDS_TO_WEAK";
+
+    // ── CONTROL: the same module, GLOBAL. No weak definition ⇒ an exec
+    //    publishes nothing ⇒ empty trie ⇒ NO LC_DYLD_EXPORTS_TRIE and no
+    //    header bits. This is what makes the assertion above about THIS
+    //    module's weak definition rather than about the writer's habits.
+    auto const [globalImg, globalErrs, globalDiags] =
+        encodeWith(SymbolBinding::Global);
+    ASSERT_EQ(globalErrs, 0u) << globalDiags;
+    ASSERT_FALSE(globalImg.empty());
+    EXPECT_TRUE(findLoadCommand(globalImg, kLcDyldChainedFixups).has_value());
+    EXPECT_FALSE(readLinkeditData(globalImg, kLcDyldExportsTrie).found)
+        << "CONTROL: an empty trie gets no load command — the 0/0 convention "
+           "the legacy arm follows, one command lower down";
+    EXPECT_EQ(readU32LE(globalImg, 24) & 0x00018000u, 0u)
+        << "CONTROL: a weak-free image carries neither coalescing bit";
+}
+
+// The DYLIB half of the same fact. The exec cell above narrows its trie to
+// weak definitions; a dylib publishes its WHOLE externally-visible set, so
+// this cell also proves the load command is keyed on the TRIE (non-empty),
+// never on the filetype — one emitter, two flavors, no second policy.
+//
+// ⚠ THIS COMBINATION USED TO BE REFUSED BY `validate()`, and the refusal's
+// stated reason — "LC_DYLD_EXPORTS_TRIE ... is not implemented" — is what
+// this cycle made false. ✔MEASURED with the gate lifted BEFORE deleting it:
+// zero diagnostics, a walkable weak terminal, both header bits.
+TEST(MachoChainedFixupsExportTrie,
+     DylibPublishesItsExportTrieThroughItsOwnLoadCommand) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(
+        dylibJsonWith(R"("weakDefinition": { "dialect": "symbol-flag" },)",
+                      R"("useChainedFixups": true,)"));
+    ASSERT_TRUE(fmt.has_value())
+        << "the MH_DYLIB chained-fixups refusal is gone; if this schema stops "
+           "loading, the capability was re-closed without this pin noticing";
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction f7;
+    f7.symbol = SymbolId{7};
+    f7.bytes  = {0xC0, 0x03, 0x5F, 0xD6};   // arm64 `ret`
+    mod.functions.push_back(std::move(f7));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{7}, "_dss_add",
+                                       SymbolBinding::Weak,
+                                       SymbolVisibility::Default});
+    // The chained-fixups payload needs an import to describe.
+    ExternImport imp;
+    imp.symbol      = SymbolId{99};
+    imp.mangledName = "_puts";
+    imp.libraryPath = "/usr/lib/libSystem.B.dylib";
+    mod.externImports.push_back(std::move(imp));
+
+    DiagnosticReporter rep;
+    auto const img = dss::macho::encode(mod, **target, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
+    std::string diags;
+    for (auto const& d : rep.all()) diags += d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u) << diags;
+    ASSERT_FALSE(img.empty()) << diags;
+
+    EXPECT_TRUE(findLoadCommand(img, kLcDyldChainedFixups).has_value());
+    EXPECT_FALSE(readDyldInfo(img).found)
+        << "the legacy command must be absent — otherwise `exportOff` has a "
+           "second publisher and this cell measures the wrong one";
+
+    auto const trieCmd = readLinkeditData(img, kLcDyldExportsTrie);
+    ASSERT_TRUE(trieCmd.found)
+        << "a chained-fixups dylib must name its export trie "
+           "(D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE)";
+    EXPECT_EQ(trieCmd.cmdsize, 16u);
+    ASSERT_GT(trieCmd.dataSize, 0u);
+    ASSERT_LE(static_cast<std::uint64_t>(trieCmd.dataOff) +
+                  static_cast<std::uint64_t>(trieCmd.dataSize),
+              img.size());
+
+    std::span<std::uint8_t const> const all(img);
+    auto const hit =
+        trieWalk(all.subspan(trieCmd.dataOff, trieCmd.dataSize), "_dss_add");
+    ASSERT_TRUE(hit.has_value())
+        << "the command must name the EXPORT TRIE, not another blob";
+    EXPECT_EQ(hit->flags, 0x04u)
+        << "EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION and nothing else";
+    EXPECT_EQ(readU32LE(img, 24) & 0x00018000u, 0x00018000u)
+        << "MH_WEAK_DEFINES | MH_BINDS_TO_WEAK over a reachable terminal";
+}
+
+// ── A HIDDEN WEAK DEFINITION PUBLISHES NONE OF THE FOUR FACTS ─────────────
+//
+// ⚠ ✔MEASURED, AND IT REFUTES THE READING THIS CELL WAS WRITTEN TO CONFIRM.
+// The expectation was "fact (1) alone" — N_WEAK_DEF in the nlist, no trie
+// terminal, no header bits — on the reasoning that `moduleDefinesWeakSymbol`
+// classifies the BINDING while `isExternallyVisible` gates only the EXPORT.
+// The image actually publishes NOTHING: `ObjectSymbolNames::definedBinding`
+// runs the same `!name.empty() && isExternallyVisible(...)` predicate its
+// naming companion runs (the NAME<->BINDING LOCKSTEP its docblock names), so
+// a Hidden symbol reaches `definedNDesc` as `SymbolBinding::Local` and the
+// weakness is gone one tier ABOVE the Mach-O spelling. n_desc reads 0.
+//
+// ★ That is the RIGHT answer and it is worth pinning as one: a hidden
+// definition cannot be coalesced by anybody, so stating N_WEAK_DEF for it
+// would be the nlist claiming a property no consumer can act on — the same
+// half-stated shape [[D-LK3-DYLIB-WEAK-EXPORT]] closed, pointing the other
+// way. All four facts absent, from ONE decision, in the shared substrate
+// both artifact tiers read.
+//
+// ⚠ ASSERTS n_desc AND THE PUBLISHED SURFACE, NEVER n_type. A concurrent
+// VISIBILITY axis is adding N_PEXT to `definedNType`; N_PEXT is an n_type
+// bit, so this cell stays true across that change by construction rather
+// than by luck. ⓘ It also records what that axis will have to reckon with:
+// the BINDING a hidden symbol arrives with here is already `Local`, so a
+// visibility-derived n_type bit must be read off the VISIBILITY, not
+// recovered from the binding.
+TEST(MachoDylibWriter, HiddenWeakDefinitionPublishesNoCoalescingSurface) {
+    auto loaded = loadShippedDylib();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    auto encodeWith = [&](SymbolVisibility vis) {
+        AssembledModule mod = makeExportModule();
+        mod.symbols[0].binding    = SymbolBinding::Weak;
+        mod.symbols[0].visibility = vis;
+        DiagnosticReporter rep;
+        auto img = dss::macho::encode(mod, *loaded.target, *loaded.format, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
+        std::string diags;
+        for (auto const& d : rep.all()) diags += d.actual + "\n";
+        return std::tuple{std::move(img), rep.errorCount(), diags,
+                          std::string{mod.symbols[0].name}};
+    };
+
+    auto const [hiddenImg, hiddenErrs, hiddenDiags, name] =
+        encodeWith(SymbolVisibility::Hidden);
+    ASSERT_EQ(hiddenErrs, 0u) << hiddenDiags;
+    ASSERT_FALSE(hiddenImg.empty());
+
+    // (1) the nlist does NOT state the weakness — the record exists (under
+    //     its declared name, `imageName`'s wider predicate) but arrives with
+    //     the binding already folded to Local, so n_desc is clean.
+    EXPECT_EQ(imageNlistDesc(hiddenImg, name),
+              std::optional<std::uint16_t>{0x0000u})
+        << "a hidden definition is Local by the time the Mach-O spelling is "
+           "chosen, so N_WEAK_DEF must not be stamped on it";
+
+    // (2) no trie terminal.
+    auto const info = readDyldInfo(hiddenImg);
+    ASSERT_TRUE(info.found);
+    if (info.exportSize > 0u) {
+        std::span<std::uint8_t const> const all(hiddenImg);
+        EXPECT_FALSE(
+            trieWalk(all.subspan(info.exportOff, info.exportSize), name)
+                .has_value())
+            << "a hidden definition must not be exportable";
+    }
+
+    // (3) no header bits — the surface is empty, so nothing is advertised.
+    EXPECT_EQ(readU32LE(hiddenImg, 24) & 0x00018000u, 0u)
+        << "MH_WEAK_DEFINES|MH_BINDS_TO_WEAK must follow the PUBLISHED "
+           "terminals, not the module's weak rows";
+
+    // CONTROL: the same symbol at DEFAULT visibility does get all of it —
+    // without this arm, "no bits" is equally consistent with "this fixture
+    // never produces bits".
+    auto const [defaultImg, defaultErrs, defaultDiags, name2] =
+        encodeWith(SymbolVisibility::Default);
+    ASSERT_EQ(defaultErrs, 0u) << defaultDiags;
+    ASSERT_EQ(name, name2);
+    EXPECT_EQ(readU32LE(defaultImg, 24) & 0x00018000u, 0x00018000u)
+        << "CONTROL: the visible twin advertises the surface";
+    EXPECT_EQ(imageNlistDesc(defaultImg, name),
+              std::optional<std::uint16_t>{0x0080u})
+        << "CONTROL: the visible twin IS weak in the nlist — without this, "
+           "the hidden cell's clean n_desc is equally consistent with the "
+           "writer never stamping N_WEAK_DEF at all";
 }
 
 // ── D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET ────────────
@@ -2470,7 +3113,8 @@ TEST(MachoExternCallDispatch, RefusalNamesTheDeclaredSpellingAndTheAcceptedSet) 
     mod.externImports.push_back(std::move(imp));
 
     DiagnosticReporter rep;
-    auto const bytes = dss::macho::encode(mod, **target, **fmt, rep);
+    auto const bytes = dss::macho::encode(mod, **target, **fmt, rep,
+                             dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
     std::string diags;
     for (auto const& d : rep.all()) diags += d.actual + "\n";
     EXPECT_TRUE(bytes.empty()) << diags;

@@ -114,6 +114,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <unordered_map>
 
 namespace dss::opt::passes {
@@ -241,7 +242,29 @@ private:
 runInlining(Mir& mir, TypeInterner const& interner,
             DiagnosticReporter& reporter, std::uint32_t inlineThreshold,
             std::uint32_t callerGrowthPercent, InlineGrowthLedger& ledger,
-            bool maintainMarkers = true);
+            bool maintainMarkers = true,
+            // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the ACTIVE
+            // object format's DECLARED set of definition bindings this
+            // artifact's LOADER may replace with another image's body.
+            //
+            // ⚠ IT WIDENS GATE RULE 2, AND WITHOUT IT THE ROUTING THAT ROW
+            // INSTALLS IS DEFEATED IN THE RELEASE ARM ONLY. Rule 2 refuses a
+            // WEAK callee because a strong definition may replace it at LINK
+            // time. A shared library adds a SECOND replacement mechanism the
+            // rule never covered: under ELF the LOADER may replace a STRONG
+            // GLOBAL definition too (that is what makes LD_PRELOAD and
+            // semantic interposition work), so its body is likewise not the
+            // body that will run. ✔MEASURED before this parameter existed: the
+            // shipped `release` pipeline folded a `.so`'s strong `st()` to the
+            // constant 3 INSIDE its caller while the routing dutifully sent the
+            // (now dead) call through the PLT — a debug build that answered the
+            // loader's winner and a release build of the same source that did
+            // not.
+            //
+            // EMPTY (the default, and every format that declares no preemptible
+            // binding) leaves rule 2 exactly as it was — byte-identical
+            // inlining for every artifact that is not a shared library.
+            std::span<SymbolBinding const> preemptibleDefinitionBindings = {});
 
 // ── THE SINGLE-INVOCATION ENTRY POINT ─────────────────────────────────
 //

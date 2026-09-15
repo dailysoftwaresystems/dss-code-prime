@@ -303,6 +303,23 @@ bool isRootedPath(fs::path const& p) {
     return p.is_absolute() || p.has_root_directory();
 }
 
+// D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64 lifted this out of
+// `shipped_lib_descriptor.cpp`, where it was a file-local lambda, when a SECOND
+// config document kind gained the same key. See the header for why a duplicated
+// containment check is the shape that rots.
+bool shippedConfigRelativePathEscapes(std::string_view spelling) {
+    if (spelling.empty()) return true;
+    if (spelling.find('\\') != std::string_view::npos) return true;
+    fs::path const asPath{std::string{spelling}};
+    // `isRootedPath`, NOT `is_absolute() || has_root_name()` — the measurement
+    // is in the header, and the hole it closes admitted `//host/share/evil.c`.
+    if (isRootedPath(asPath)) return true;
+    for (auto const& seg : asPath) {
+        if (seg == ".." || seg == ".") return true;
+    }
+    return false;
+}
+
 HeaderSearchResult resolveInDir(fs::path const& dir, std::string_view relName,
                                 HeaderNameMatching matching) {
     return resolveMaybeAbsolute(fs::path{relName}, dir, matching);

@@ -1197,34 +1197,42 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 continue;
             }
             // The default is NOT section-backed -- an ABSOLUTE or UNDEF
-            // fallback. ✔MEASURED: this is how mingw gcc encodes a weak
-            // UNDEFINED REFERENCE (`extern __attribute__((weak)) int f(void);`
-            // with no definition) -- the default is an ABSOLUTE symbol of value
-            // 0, so an unresolved `f` tests as 0, which is the GNU semantics.
+            // fallback. ✔MEASURED: this is how clang encodes a weak UNDEFINED
+            // REFERENCE (`extern int ea __attribute__((weak));` with no
+            // definition) for BOTH `x86_64-w64-windows-gnu` and
+            // `x86_64-pc-windows-msvc` -- the default is an ABSOLUTE symbol of
+            // value 0, so an unresolved `ea` tests as 0, which is the GNU
+            // semantics.
             //
-            // ⚠ DSS CANNOT YET REPRESENT THAT, AND THE GAP IS NOT IN THIS FILE.
-            // A "weak undefined reference" needs a reference that may LEGALLY
-            // stay unresolved, and `ExternImport` carries no binding at all --
-            // measured, on EVERY format, not just COFF: the ELF object reader
-            // drops STB_WEAK on an undefined symbol the same way. Nothing in
-            // `symbolVa` is fed from `module.symbols` either, so binding the
-            // name to the absolute-0 default does not resolve it; it only moves
-            // the refusal from the unbound-extern gate to the compound index.
-            // ⇒ FAIL LOUD AND SAY WHICH FACT IS MISSING. The alternative is a
-            // SILENT weak->strong downgrade on re-emission, and the diagnostic
-            // it used to produce ("undefined symbol f") named the wrong defect.
-            return fail(DiagnosticCode::F_CorruptedBinary,
-                "pe::readRelocatableObject: weak external '" + s.name
-                + "' defers to '" + def.name + "', which is not defined in this "
-                  "object (SectionNumber "
-                + std::to_string(static_cast<std::int16_t>(def.sectNum))
-                + "). That is a WEAK UNDEFINED REFERENCE -- a reference that may "
-                  "legally stay unresolved and test as zero -- and DSS's "
-                  "link-tier symbol model has no way to carry it: ExternImport "
-                  "declares no binding on ANY format, so reading this as a plain "
-                  "strong extern would silently drop the one property that makes "
-                  "it weak. Refusing rather than downgrading it. "
-                  "D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE.");
+            // ★★ THE REFUSAL THAT STOOD HERE IS GONE, AND WHAT IT WAS WAITING
+            // FOR IS THE THING THAT LANDED. It read, correctly at the time:
+            // "DSS's link-tier symbol model has no way to carry it:
+            // `ExternImport` declares no binding on ANY format, so reading this
+            // as a plain strong extern would silently drop the one property that
+            // makes it weak." `ExternImport` now carries `binding`
+            // (D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE), every writer
+            // spells it, and an image link resolves an unbound weak reference to
+            // a null import slot -- so the fact this arm could not represent is
+            // representable, and refusing would now be refusing a shape DSS
+            // itself emits. It is a WEAK IMPORT, and it is read as one.
+            //
+            // ⓘ The fallback symbol's own name is deliberately NOT carried
+            // anywhere: PE/COFF 5.5.3 makes it the thing to use INSTEAD when
+            // sym1 is absent, and when it is an absolute 0 the answer it
+            // supplies is "nothing" -- which `SymbolBinding::Weak` already says
+            // in the format-neutral vocabulary. Keeping the synthetic
+            // `.weak.<n>.default` name would be re-exporting a producer's
+            // private spelling as if it named something.
+            {
+                ExternImport weakExt;
+                weakExt.symbol      = SymbolId{i};
+                weakExt.mangledName = s.name;
+                weakExt.isData      = !declaresFunction(s);
+                weakExt.binding     = SymbolBinding::Weak;
+                externBySym.emplace(i, mod.externImports.size());
+                mod.externImports.push_back(std::move(weakExt));
+                continue;
+            }
         }
 
         bool const isExt = (role == CoffSymbolRole::External);

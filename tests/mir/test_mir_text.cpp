@@ -1007,3 +1007,39 @@ TEST(MirText, StaticInitScheduleSurvivesRoundTripWithItsPriority) {
     DiagnosticReporter r3;
     EXPECT_EQ(text, emitMir(parsed->mir, ctx2, r3));
 }
+
+// ── D-MIR-TEXT-READER-LOOPS-FOREVER-ON-AN-UNTERMINATED-OPERAND-LIST ─────────
+//
+// The three list-shaped type arms (`tuple<…>`, `struct`/`union` fields, `fn(…)`
+// parameters) and `lit agg {…}` all read "while the next token is not my
+// terminator, take another operand". `Lexer::take` at end of input returns
+// `End` WITHOUT advancing, so a TRUNCATED text never reached its closer: the arm
+// asked for another operand, the head refused the `End` token and handed back an
+// Invalid, the arm appended it and asked again — forever, growing its operand
+// vector every turn. A `.dssmir` is truncated by any interrupted write, and this
+// reader is explicitly the half whose depth (and now length) follows an input the
+// compiler does NOT produce.
+//
+// ⚠ THIS IS A TERMINATION PIN, NOT A DIAGNOSTIC-TEXT PIN. What it asserts is
+// that `parseMir` RETURNS and says something at Error severity. A regression
+// does not fail this test, it HANGS it — which `ctest`'s own timeout reports as
+// the failure it is, and which is why each case is a separate, tiny parse.
+TEST(MirTextParse, TruncatedOperandListIsRefusedRatherThanLoopingForever) {
+    struct Case { char const* name; char const* text; };
+    Case const cases[] = {
+        {"tuple",  "dssir 1\nmodule {\n  global %1 : tuple<i32"},
+        {"struct", "dssir 1\nmodule {\n  global %1 : struct \"S\" { i32"},
+        {"union",  "dssir 1\nmodule {\n  global %1 : union \"U\" { i32"},
+        {"fn",     "dssir 1\nmodule {\n  function %2 : fn(i32"},
+        {"agg",    "dssir 1\nmodule {\n  global %1 : i64 = lit agg { lit int 1 : i64"},
+    };
+    for (Case const& c : cases) {
+        DiagnosticReporter r;
+        auto res = parseMir(c.text, CompilationUnitId{1}, r);
+        // It came back at all — that is the property.
+        EXPECT_NE(res, nullptr) << c.name;
+        EXPECT_GT(r.errorCount(), 0u)
+            << c.name << ": a truncated operand list must be refused BY NAME, "
+                         "never silently accepted as a shorter type";
+    }
+}

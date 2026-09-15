@@ -128,6 +128,30 @@ enum class HirKind : std::uint16_t {
     //    promise.) ──
     Extension,
 
+    // ── D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+    //    an INDIVISIBLE READ-MODIFY-WRITE of one object. Children = [target,
+    //    update]: `target` is the lvalue, whose ADDRESS is evaluated exactly once;
+    //    `update` computes the replacement from the value that attempt observed,
+    //    which it reads as `Ref(payload)` — the payload is the SymbolId of that
+    //    binding, so the old value is an ordinary `Ref` to every consumer rather
+    //    than a placeholder kind of its own. The node YIELDS THE VALUE THE OBJECT
+    //    HELD immediately before the replacement that took effect — the
+    //    `atomic_fetch_*` contract (C23 7.17.7.5) — so a `++x` / `x op= v` that
+    //    yields the NEW value recomputes `update` over that result.
+    //    ⚠ `update` MAY BE EVALUATED MORE THAN ONCE (a lost race re-runs it), so a
+    //    producer binds every operand with a side effect to a temporary first;
+    //    reading the binding and those temporaries is all `update` may do.
+    //    ★ WHY A CORE KIND AND NOT A FLAG ON `AssignStmt`: the desugar it replaces
+    //    (`x = x op v`) READS CORRECTLY WITHOUT THE FLAG — that was the defect — and
+    //    a flag-blind consumer of a flagged desugar would re-derive exactly the
+    //    non-atomic meaning. A kind every switch must classify cannot be misread
+    //    silently. A read-modify-write is paradigm-neutral (C11 `_Atomic`, C++
+    //    `std::atomic`, Rust `fetch_update`, Java `updateAndGet`).
+    //    ⓘ APPENDED AFTER `Extension` rather than filed under Expressions, because
+    //    the members are STABLE ordinals and inserting one would renumber every
+    //    kind after it.
+    ReadModifyWrite,
+
     Count_        // keep last — counts the core members
 };
 
@@ -163,7 +187,7 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
 // loud one, which is the exact hazard `nameOrEmpty` exists for. The row COUNT
 // is asserted against `Count_` below, so a new enumerator that arrives without a
 // row FAILS THE BUILD instead of rendering empty at some future reader.
-inline constexpr EnumNameTable<HirKind, 53> kHirKindTable{{{
+inline constexpr EnumNameTable<HirKind, 54> kHirKindTable{{{
     {HirKind::Module,          "Module"},
     {HirKind::Function,        "Function"},
     {HirKind::Global,          "Global"},
@@ -217,6 +241,7 @@ inline constexpr EnumNameTable<HirKind, 53> kHirKindTable{{{
     {HirKind::Unreachable,     "Unreachable"},
     {HirKind::Error,           "Error"},
     {HirKind::Extension,       "Extension"},
+    {HirKind::ReadModifyWrite, "ReadModifyWrite"},
 }}};
 DSS_CHECK_ENUM_NAME_TABLE(kHirKindTable);
 // ★ COMPLETENESS, WHICH WELL-FORMEDNESS DOES NOT GIVE YOU. `DSS_CHECK_ENUM_NAME_TABLE`
@@ -275,6 +300,9 @@ static_assert(kHirKindTable.rows.size()
         //    InvalidType), so all three require a resolved type and fail loud if
         //    typeless. ──
         case HirKind::VaStart: case HirKind::VaArg: case HirKind::VaEnd:
+        // A read-modify-write YIELDS the observed old value — typed as the
+        // object's value type.
+        case HirKind::ReadModifyWrite:
         // ── Types-as-values: carries the referenced lattice TypeId ──
         case HirKind::TypeRef:
         // ── Declarations carrying their own (source-defined) type ──
@@ -394,6 +422,9 @@ struct ChildArity {
         case HirKind::VaArg:              return {2, 2};
         case HirKind::BinaryOp: case HirKind::Index: case HirKind::LogicalAnd:
         case HirKind::LogicalOr:
+        // [target lvalue, update expression] — the observed old value is the
+        // payload symbol, not a third child.
+        case HirKind::ReadModifyWrite:
             return {2, 2};
         case HirKind::Ternary:            return {3, 3};
         // SeqExpr: [stmt..., resultExpr] — N>=0 statements then the value-

@@ -176,29 +176,129 @@ isByValueClass(TypeInterner const& interner, TypeId id) noexcept;
 computeLayout(TypeId id, TypeInterner const& interner,
               AggregateLayoutParams params, DataModel dm);
 
-// c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY) / D-MIR-OVERLAP-STRUCT-ZERO-INIT: do two
-// DISTINCT fields of composite `id` occupy INTERSECTING byte ranges — i.e. is
-// `[off_i, off_i+size_i)` ∩ `[off_j, off_j+size_j)` non-empty for some i≠j? THE
-// single authority for "this struct's members share bytes", consumed by every
-// tier that must refuse (or specially handle) a positional member-wise write:
-// the MIR brace-init lowering and the static-data encoder.
+// c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY) / D-MIR-OVERLAP-STRUCT-ZERO-INIT /
+// D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-BITFIELDS: do two DISTINCT members of
+// composite `id` occupy INTERSECTING BYTES under this ABI — is
+// `[begin_i, end_i)` ∩ `[begin_j, end_j)` non-empty for some i≠j? The authority
+// for that question, consumed by the two tiers that must refuse (or specially
+// handle) a FULL-WIDTH positional member-wise write: the MIR brace-init lowering
+// and the static-data encoder.
+//
+// TWO CHANNELS put members in the same bytes, and BOTH are swept:
+//   * EXPLICIT per-field byte offsets — an FFI overlay a descriptor pins
+//     (`ULARGE_INTEGER {QuadPart u64@0, LowPart u32@0, HighPart u32@4}`). A
+//     member's extent is its own type's size.
+//   * BIT-FIELDS — `struct { unsigned a:3; unsigned b:5; }` puts both members in
+//     ONE byte (under `__attribute__((packed))` the whole struct is that byte:
+//     `fieldOffsets` 0 and 0, `bitOffset` 0 and 3, pinned by
+//     `TypeInterner.PackedBitfieldCompositeLaysOutGnuTight`). A bit-field member's
+//     extent is the bytes ITS BITS land in — `off + bitOffset/8` up to
+//     `off + ceil((bitOffset+bitWidth)/8)`.
+// The O(1) short-circuit survives for a composite with NEITHER channel, where the
+// engine's monotonic invariant (each field at or after the previous field's end)
+// makes an intersection impossible.
+//
+// ⚠ A BIT-FIELD'S EXTENT IS ITS BITS' BYTES, **NOT** ITS ALLOCATION UNIT, and that
+// distinction is load-bearing rather than pedantic — it is the difference between a
+// correct answer and a false positive on a shape the shipped corpus contains.
+// ✔MEASURED (gcc 13.3.0 + clang 18.1.3, x86_64-linux, `-std=c17 -c`, one
+// `_Static_assert` battery, both rc=0): `struct { unsigned a:3; char x; }` is
+// sizeof 4 with `offsetof(x) == 1` — the ordinary member is packed INSIDE the
+// bit-field's 4-byte unit, which is the `gnu_packed` rule this engine implements —
+// so sweeping UNIT ranges reports a and x as sharing bytes when they provably do
+// not; `examples/c/bitfield_init`'s `struct T { char x; unsigned a:3; unsigned
+// b:4; }` is the same shape from the other side (sizeof 4, `offsetof(x) == 0`, a
+// AND b in byte 1, a's unit still anchored at 0). Likewise `struct { unsigned a:16;
+// unsigned b:16; }` (sizeof 4) shares ONE unit while a owns bytes [0,2) and b owns
+// [2,4). Sweeping BITS answers `false`, `false` and (for T) `true` from a ∩ b —
+// each correctly.
+//
+// ★ THAT MAKES THIS THE "DO THEY SHARE BYTES" AUTHORITY AND **NOT** A "IS A
+// POSITIONAL WRITE SAFE" ORACLE, WHICH IS A DIFFERENT QUESTION WITH A DIFFERENT
+// ANSWER. A full-width member-wise write of ANY bit-field composite is unsafe
+// whatever this returns — writing `a:3` as a whole `unsigned` clobbers every
+// co-resident neighbour in the unit. The predicate for THAT question is
+// `computeLayout(...)->bitFields` being NON-EMPTY (the layout authority's own
+// invariant: non-empty ⇔ the composite has a bit-field), and it is what BOTH
+// callers route on, ahead of asking this:
+//   * `hir_to_mir.cpp`'s `lowerAggregateInitIntoSlot` tests `hasBitfieldMember`
+//     and diverts to `lowerBitfieldAggregateInitIntoSlot` BEFORE this gate;
+//   * `asm.cpp`'s `encodeAggregateValue` hoists its `computeLayout` above the gate
+//     and consults this ONLY when `bitFields` is empty, then packs bit-fields by
+//     pre-zero + OR into the unit rather than by positional full-width writes.
+// So when this IS consulted by either caller the composite has no bit-fields, and
+// a `true` can only have come from the explicit-offset channel — which is what
+// keeps both refusal messages ("overlapping explicit-offset struct") accurate.
+//
+// ✔NO EXCLUSION REMAINS — D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-UNIONS closed the
+// last one, and it closed it by CHANGING THE ANSWER rather than by narrowing the
+// sentence. A UNION whose members carry neither channel used to reach the O(1)
+// short-circuit and answer `false`, though every member sits at offset 0 and they
+// therefore share bytes BY DEFINITION. It now falls through to the layout + range
+// sweep like any other composite and answers `true` whenever two or more of its
+// members are sizeable (a single-member union, or one whose members are all
+// zero-size, correctly stays `false` — there is nothing to intersect).
+//
+// ⓘ THE SHORT-CIRCUIT IS NOW KEYED ON `Struct`, AND THAT IS A SCOPE, NOT AN
+// EXCEPTION. Its justification is a theorem about the natural/packed BYTE PATH —
+// `off = alignUp(off); push(off); off += size` cannot emit an intersection for any
+// field list — and that path is what lays out a struct. The union arm of
+// `computeLayout` does not advance an offset at all; it places every member at 0
+// and folds a max size, so the theorem was never about unions and the old code was
+// applying it outside its domain. Keeping the struct fast path is deliberate: it is
+// what makes the common shape O(1) with no layout computed at all, and routing
+// structs through the sweep would buy uniformity the answer does not need at the
+// cost of a full `computeLayout` per naturally-laid-out struct in the corpus.
+//
+// ★ AND THE TRUTHFUL ANSWER IS WHY BOTH CALLERS NOW ROUTE UNIONS AWAY FROM THIS
+// GATE, which is the same shape the bit-field closure applied and NOT a way around
+// the predicate. The gate's question is "would a positional member-wise write
+// clobber a sibling", and for a union brace-init the answer is NO whatever the
+// members share: C 6.7.9p17 initializes exactly ONE member, so there is exactly one
+// write and no sibling to lose. ✔MEASURED — THREE independent things already give
+// that: `prepareUnionBraceInit` and its one-slot brace level yield a one-child `ConstructAggregate`,
+// `synthZeroOrError`'s composite arm computes `n = (core == Union) ? 1 :
+// ops.size()`, and `HirVerifier::checkConstructAggregate` refuses any other child
+// count. BOTH callers nevertheless ASSERT it rather than resting on it, because all
+// three guarantees live UPSTREAM and the verifier is a separate pass neither caller
+// runs: a multi-child union aggregate reaching either one would be silently written
+// member-wise, second write clobbering the first at offset 0, which is precisely
+// the permission this routing grants and the gate exists to refuse.
 //
 // A purely STRUCTURAL question about the type under one ABI — no target, format,
 // or language identity enters (the ABI arrives only through `params`/`dm`, exactly
-// as `computeLayout`'s does). Field SIZES are ABI-dependent (`long` is 4 or 8), so
-// overlap must be asked of a LAID-OUT type, never of the bare field list.
+// as `computeLayout`'s does; the bit→byte mapping is `BitFieldPlacement`'s own
+// LSB-first model, the only one the engine has). Member SIZES are ABI-dependent
+// (`long` is 4 or 8) and so is bit placement, so overlap must be asked of a
+// LAID-OUT type, never of the bare field list.
 //
-// Only the explicit-offset channel can answer true: natural layout places each
-// field at or after the previous field's end (the engine's monotonic invariant),
-// so a composite with no explicit offsets short-circuits to `false` in O(1).
-// A UNION's members overlap BY DEFINITION — but a union is not laid out
-// field-wise by its consumers, so it is reported through the same explicit-offset
-// gate as a struct and answers `false` unless it actually carries offsets.
-//
-// Zero-SIZE fields occupy no bytes and can never overlap; they are skipped.
-// An UN-COMPUTABLE layout (incomplete/out-of-scope field) answers `true` — the
+// Zero-SIZE members occupy no bytes and can never overlap; they are skipped, as
+// are the two members that occupy none BY CONSTRUCTION — a zero-width bit-field
+// (`unsigned : 0;`, a packing break whose `fieldOffsets` entry aliases the NEXT
+// unit) and a flexible array member (its unsized tail contributes nothing).
+// An UN-COMPUTABLE layout (incomplete/out-of-scope field, an unrealized bit-field
+// strategy, a straddler the placement model cannot express) answers `true` — the
 // CONSERVATIVE direction, so a caller keeps its LOUD refusal rather than silently
 // admitting a layout it could not verify.
+//
+// ✔THAT PROMISE HOLDS FOR EVERY COMPOSITE THIS SWEEPS, WHICH IS THE SECOND DEFECT
+// D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-BITFIELDS RECORDED AND IT IS FIXED BY
+// BEHAVIOUR, not by narrowing the sentence: the WHOLE-composite layout is attempted
+// before any range is derived, where the old code reached a layout only per-FIELD
+// and only past the explicit-offset gate. A bit-field composite whose layout the
+// engine refuses (`pack(2) struct { unsigned a; unsigned long long b:40; }`, or any
+// composite under an undeclared `bitFieldStrategy`) used to answer a PERMISSIVE
+// `false`; it now answers `true`.
+//
+// ⓘ The one case that still answers `false` WITHOUT attempting a layout is a
+// STRUCT with NEITHER channel, and there `false` is CORRECT rather than
+// permissive — it is a property of the placement ALGORITHM, not of a particular
+// outcome. The natural/packed byte path places each field at `alignUp(off)` and
+// then advances `off` by that field's size, so it cannot emit an intersection for
+// ANY field list, sizeable or not; a flexible array member takes an offset and no
+// advance, so it contributes no range either way. A UNION is not laid out by that
+// path at all and is no longer routed through this short-circuit — see the
+// D-CORE-COMPOSITE-OVERLAP-CLAIM-BLIND-TO-UNIONS note above.
 [[nodiscard]] DSS_EXPORT bool
 compositeFieldsOverlap(TypeId id, TypeInterner const& interner,
                        AggregateLayoutParams params, DataModel dm);

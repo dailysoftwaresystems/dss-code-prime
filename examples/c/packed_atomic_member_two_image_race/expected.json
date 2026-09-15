@@ -1,0 +1,26 @@
+{
+  "$comment": "D-C-ATOMICS-RUNTIME-PE64-BUS-LOCKS-EVERY-ACCESS-TO-A-CACHE-LINE-STRADDLING-OBJECT — the CROSS-IMAGE witness. ★★★ The pe64 atomics runtime is a static archive member, so the exe and the dll built from `dsslib.c` each link their OWN copy. Since P66 a copy serves an object that crosses a cache line with a copy under a SOFTWARE lock rather than a locked instruction (which took a bus lock that stalled every core), and a software lock is atomic only against code taking the same lock — so a lock table private to each image would tear this program. The runtime takes the process heap's lock, ONE per process, and this race is the execution evidence that both copies exclude each other: two writers (one per image) and two readers (one per image) over a `_Atomic unsigned` at bytes 62..65 of a line, every stored value carrying four equal bytes, so a torn value can only come from a split access. The deterministic evidence is `tests/program/test_atomics_runtime_no_split_lock`, which single-steps both copies and sees them lock the same heap. exit = 7 (the value crosses the image boundary both ways) + 35 (no torn value) = 42; 11 means the two images' copies did not exclude each other.",
+  "$legComment": "★ pe64 ONLY, AND THE REASON IS THE SUBJECT, NOT CONVENIENCE: the property under test is that TWO STATICALLY LINKED COPIES of DSS's own runtime share one arbiter, and only the pe64 formats link DSS's body. The elf64 and macho64 formats import the platform's single shared runtime image (`libatomic.so.1`, `libSystem.B.dylib`), so there is exactly one copy per process by construction and nothing here to witness; their run arms for a DSS-built dynamic library are also not wired in this corpus (see `examples/c/dynlib_resolve_roundtrip`, whose non-Windows arms declare `runOn: []`).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "x86_64:pe64-x86_64-windows-dll",
+          "artifact": "dsslib.dll",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

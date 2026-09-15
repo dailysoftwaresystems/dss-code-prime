@@ -34,9 +34,10 @@
 //
 // ⚠ THE PARSE PINS LIVE HERE RATHER THAN IN `test_project_config.cpp`
 // DELIBERATELY. They are about THIS mechanism's manifest surface, and keeping
-// the vocabulary pins beside the behaviour pins is what lets a reader see that
-// the `eviction` tokens the loader accepts are the ones the store actually
-// implements — two files would let those drift with nothing in either saying so.
+// the manifest pins beside the behaviour pins is what lets a reader see that
+// what the loader accepts is what the store actually implements — two files
+// would let those drift with nothing in either saying so. ⓘ That is also how
+// the WITHDRAWN `eviction` member is pinned here rather than one file over.
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
@@ -62,7 +63,6 @@
 #include <system_error>
 #include <vector>
 
-using dss::DependencyArtifactCacheEviction;
 using dss::DiagnosticCode;
 using dss::DiagnosticReporter;
 using dss::Program;
@@ -167,10 +167,14 @@ struct ManifestSpec {
     // `stackReserveControl` is how this file reaches "the target wrote an
     // artifact AND reported an error" — see `AFailingBuildIsNotStored`.
     std::uint64_t            stackReserve = 0;
-    // ⚠ EMPTY ⇒ THE `dependencyArtifactCache` KEY IS NOT EMITTED AT ALL. That
+    // ⚠ false ⇒ THE `dependencyArtifactCache` KEY IS NOT EMITTED AT ALL. That
     // is the REMOVE-direction config mutant's shape, and it is a distinct input
     // from an emitted object whose `enabled` is false.
-    std::string              cacheEviction;
+    // ⓘ It was a `std::string` holding the `eviction` token until that member
+    // was WITHDRAWN
+    // ([[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]);
+    // the object now has two members and nothing left to choose between.
+    bool                     declareCache = false;
 };
 
 [[nodiscard]] std::string renderManifest(ManifestSpec const& m) {
@@ -186,11 +190,10 @@ struct ManifestSpec {
     if (m.stackReserve != 0) {
         out += ",\n  \"stackReserve\": " + std::to_string(m.stackReserve);
     }
-    if (!m.cacheEviction.empty()) {
+    if (m.declareCache) {
         out += ",\n  \"dependencyArtifactCache\": {"
                "\"enabled\": true, \"rootOverrideVariable\": "
-             + jsonQuote(kCacheDirVar) + ", \"eviction\": "
-             + jsonQuote(m.cacheEviction) + "}";
+             + jsonQuote(kCacheDirVar) + "}";
     }
     out += "\n}\n";
     return out;
@@ -240,7 +243,7 @@ struct Fixture {
     fs::path projectFile;
     fs::path outBase;
 
-    explicit Fixture(fs::path root, std::string_view eviction,
+    explicit Fixture(fs::path root, bool declareCache,
                      std::uint64_t depStackReserve = 0,
                      std::string_view depSource = kDepSource)
         : dir(std::move(root)), depDir(dir / "leafutil"),
@@ -258,7 +261,7 @@ struct Fixture {
                   renderManifest({.targets = {std::string{kConsumerSpec}},
                                   .sources = {(dir / "main.c").generic_string()},
                                   .dependsOnPath = depDir.generic_string(),
-                                  .cacheEviction = std::string{eviction}}));
+                                  .declareCache = declareCache}));
     }
 
     [[nodiscard]] fs::path depArtifact() const {
@@ -302,22 +305,20 @@ TEST(DependencyArtifactCacheSurface, AbsentMemberIsNoPolicyAndNoDiagnostic) {
     EXPECT_EQ(rep.errorCount(), 0u);
 }
 
-TEST(DependencyArtifactCacheSurface, AllThreeMembersAreAccepted) {
+TEST(DependencyArtifactCacheSurface, BothMembersAreAccepted) {
     DiagnosticReporter rep;
     auto const pc = parseManifest(
         withCacheObject("{\"enabled\": true, \"rootOverrideVariable\": "
-                        "\"MY_CACHE\", \"eviction\": \"retain\"}"),
+                        "\"MY_CACHE\"}"),
         rep);
     ASSERT_TRUE(pc.has_value()) << "unexpected reject";
     ASSERT_TRUE(pc->dependencyArtifactCache.has_value());
     EXPECT_TRUE(pc->dependencyArtifactCache->enabled);
     EXPECT_EQ(pc->dependencyArtifactCache->rootOverrideVariable, "MY_CACHE");
-    EXPECT_EQ(pc->dependencyArtifactCache->eviction,
-              DependencyArtifactCacheEviction::Retain);
 }
 
 // ⚠ EACH MEMBER, SEPARATELY. A single "one member missing" case would leave the
-// other two untested, and the SILENT direction is a member the loader stopped
+// other untested, and the SILENT direction is a member the loader stopped
 // requiring — which is a policy half-declared and half-defaulted.
 TEST(DependencyArtifactCacheSurface, EveryMemberIsRequired) {
     struct Case {
@@ -325,11 +326,8 @@ TEST(DependencyArtifactCacheSurface, EveryMemberIsRequired) {
         std::string_view body;
     };
     constexpr Case kCases[] = {
-        {"enabled",
-         "{\"rootOverrideVariable\": \"C\", \"eviction\": \"retain\"}"},
-        {"rootOverrideVariable", "{\"enabled\": true, \"eviction\": \"retain\"}"},
-        {"eviction",
-         "{\"enabled\": true, \"rootOverrideVariable\": \"C\"}"},
+        {"enabled", "{\"rootOverrideVariable\": \"C\"}"},
+        {"rootOverrideVariable", "{\"enabled\": true}"},
     };
     for (Case const& c : kCases) {
         DiagnosticReporter rep;
@@ -346,7 +344,7 @@ TEST(DependencyArtifactCacheSurface, AnUnknownMemberRejects) {
     DiagnosticReporter rep;
     auto const pc = parseManifest(
         withCacheObject("{\"enabled\": true, \"rootOverrideVariable\": \"C\", "
-                        "\"eviction\": \"retain\", \"evicton\": \"retain\"}"),
+                        "\"rootOverrideVariabel\": \"C\"}"),
         rep);
     EXPECT_FALSE(pc.has_value())
         << "a mistyped member must reject — silently dropping it is dropping "
@@ -354,43 +352,47 @@ TEST(DependencyArtifactCacheSurface, AnUnknownMemberRejects) {
     EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
 }
 
-// ★ THE ACCEPTED SET IS DRIVEN FROM THE EXPORTED TABLE, never re-typed. A
-// re-typed list in a test recreates exactly the drift the derivation removed.
-TEST(DependencyArtifactCacheSurface, EveryExportedEvictionTokenIsAccepted) {
-    auto const tokens = dss::dependencyArtifactCacheEvictionTokens();
-    ASSERT_FALSE(tokens.empty())
-        << "the eviction vocabulary must not be empty — an empty table would "
-           "make every value reject and this whole loop vacuous.";
-    for (std::string_view const token : tokens) {
-        DiagnosticReporter rep;
-        auto const pc = parseManifest(
-            withCacheObject("{\"enabled\": true, \"rootOverrideVariable\": "
-                            "\"C\", \"eviction\": \"" + std::string{token}
-                            + "\"}"),
-            rep);
-        EXPECT_TRUE(pc.has_value())
-            << "the loader must accept the token it publishes: " << token;
-    }
-}
-
-TEST(DependencyArtifactCacheSurface, AnUnknownEvictionTokenRejectsNamingTheSet) {
+// ⛔ THE WITHDRAWN MEMBER, AND IT IS A REJECT RATHER THAN AN IGNORE
+// [[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]
+//
+// `eviction` was a required member with a closed two-token vocabulary
+// (`prune-superseded` / `retain`) until the store stopped deleting anything.
+// Two cases stood here — every published token is accepted, and an unknown one
+// rejects naming the set — and they are gone with the vocabulary.
+//
+// ★ WHAT REPLACES THEM IS NOT SYMMETRY, IT IS THE FAILURE MODE THAT IS LEFT.
+// A user upgrading carries the old member forward, and the two wrong answers
+// are ACCEPTING it (their manifest now states a policy nothing implements) and
+// reporting it as an UNKNOWN member (true, and it reads as a typo). This pins
+// the third: refused, naming the member and saying the policy is gone.
+TEST(DependencyArtifactCacheSurface, TheWithdrawnEvictionMemberRejectsWithItsReason) {
     DiagnosticReporter rep;
     auto const pc = parseManifest(
         withCacheObject("{\"enabled\": true, \"rootOverrideVariable\": \"C\", "
-                        "\"eviction\": \"lru\"}"),
+                        "\"eviction\": \"retain\"}"),
         rep);
-    EXPECT_FALSE(pc.has_value());
+    EXPECT_FALSE(pc.has_value())
+        << "a manifest naming the withdrawn 'eviction' member must REJECT: "
+           "accepting it would let a manifest declare a policy the compiler "
+           "does not implement.";
     ASSERT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
     std::string message;
     for (auto const& d : rep.all()) {
         if (d.code == DiagnosticCode::C_MalformedJson) message = d.actual;
     }
-    EXPECT_NE(message.find("'lru'"), std::string::npos)
-        << "the reject must name the offending token: " << message;
-    EXPECT_NE(message.find(dss::dependencyArtifactCacheEvictionTokenList()),
-              std::string::npos)
-        << "the reject must name the ACCEPTED set, derived from the table "
-           "rather than re-typed: " << message;
+    EXPECT_NE(message.find("'eviction'"), std::string::npos)
+        << "the refusal must name the member: " << message;
+    EXPECT_NE(message.find("no longer accepted"), std::string::npos)
+        << "the refusal must say the member was WITHDRAWN rather than report "
+           "it as unknown — 'unknown member' reads as a typo: " << message;
+    // ⚠ ON ONE LINE, PAST THE COLUMN GUIDE, DELIBERATELY. An anchor id split
+    // across two string literals still compiles and still MATCHES — and it is
+    // invisible to every grep and to `check-wrapped-anchor-ids`, which is how a
+    // wrap MINTS a second, unfindable id. Width loses to greppability here.
+    static constexpr std::string_view kWithdrawnAnchor =
+        "D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT";
+    EXPECT_NE(message.find(kWithdrawnAnchor), std::string::npos)
+        << "the refusal must carry the anchor a reader goes to: " << message;
 }
 
 // ═══ THE COLD ARM ════════════════════════════════════════════════════════════
@@ -403,7 +405,7 @@ TEST(DependencyArtifactCacheCold, AFirstBuildWritesOneVerifiableEntry) {
     fs::path const cacheRoot = scratch.path() / "cache";
     ScopedEnv const cacheEnv{kCacheDirVar, cacheRoot.string()};
 
-    Fixture const fx{scratch.path() / "tree", "prune-superseded"};
+    Fixture const fx{scratch.path() / "tree", /*declareCache=*/true};
     DiagnosticReporter rep;
     ASSERT_EQ(fx.build(rep), 0) << "the cold build must succeed";
     ASSERT_TRUE(fs::exists(fx.depArtifact()))
@@ -426,7 +428,8 @@ TEST(DependencyArtifactCacheCold, AFirstBuildWritesOneVerifiableEntry) {
         << "the stored bytes must be the bytes the build produced";
 
     // And it lives under the `deps/` component that keeps it from sharing a
-    // directory — and therefore a prune — with the shipped runtime objects.
+    // directory — and therefore an index space — with the shipped runtime
+    // objects.
     EXPECT_NE(entries.front().generic_string().find("/deps/"),
               std::string::npos)
         << "a dependency entry must live under its own 'deps/' component: "
@@ -444,7 +447,7 @@ TEST(DependencyArtifactCacheCold, NoPolicyStoresNothing) {
     fs::path const cacheRoot = scratch.path() / "cache";
     ScopedEnv const cacheEnv{kCacheDirVar, cacheRoot.string()};
 
-    Fixture const fx{scratch.path() / "tree", /*eviction=*/""};
+    Fixture const fx{scratch.path() / "tree", /*declareCache=*/false};
     DiagnosticReporter rep;
     ASSERT_EQ(fx.build(rep), 0);
     ASSERT_TRUE(fs::exists(fx.depArtifact()));
@@ -468,7 +471,7 @@ TEST(DependencyArtifactCacheWarm, ASecondBuildServesTheStoredBytes) {
     fs::path const cacheRoot = scratch.path() / "cache";
     ScopedEnv const cacheEnv{kCacheDirVar, cacheRoot.string()};
 
-    Fixture const fx{scratch.path() / "tree", "prune-superseded"};
+    Fixture const fx{scratch.path() / "tree", /*declareCache=*/true};
     DiagnosticReporter cold;
     ASSERT_EQ(fx.build(cold), 0);
     auto const entries = keyDocumentsUnder(cacheRoot);
@@ -520,7 +523,7 @@ TEST(DependencyArtifactCacheWarm, AHitPlacesTheArtifactIntoACleanedTree) {
     fs::path const cacheRoot = scratch.path() / "cache";
     ScopedEnv const cacheEnv{kCacheDirVar, cacheRoot.string()};
 
-    Fixture const fx{scratch.path() / "tree", "prune-superseded"};
+    Fixture const fx{scratch.path() / "tree", /*declareCache=*/true};
     DiagnosticReporter cold;
     ASSERT_EQ(fx.build(cold), 0);
     auto const entries = keyDocumentsUnder(cacheRoot);
@@ -550,7 +553,7 @@ TEST(DependencyArtifactCacheWarm, AHeaderNoManifestNamesMovesTheKey) {
     fs::path const cacheRoot = scratch.path() / "cache";
     ScopedEnv const cacheEnv{kCacheDirVar, cacheRoot.string()};
 
-    Fixture const fx{scratch.path() / "tree", "retain"};
+    Fixture const fx{scratch.path() / "tree", /*declareCache=*/true};
     DiagnosticReporter cold;
     ASSERT_EQ(fx.build(cold), 0);
     auto const first = keyDocumentsUnder(cacheRoot);
@@ -574,22 +577,36 @@ TEST(DependencyArtifactCacheWarm, AHeaderNoManifestNamesMovesTheKey) {
 
     auto const after = keyDocumentsUnder(cacheRoot);
     EXPECT_EQ(after.size(), 2u)
-        << "under 'retain' the moved key must MINT a second entry and keep the "
-           "first: " << after.size() << " entrie(s) found";
+        << "the moved key must MINT a second entry and keep the first: "
+        << after.size() << " entrie(s) found";
 }
 
-// ★ THE THIRD CONFIG MEMBER, DRIVEN. `retain` is pinned by the case above; this
-// is its opposite arm on the identical edit, so the two together show the token
-// DECIDES something rather than merely parsing.
-TEST(DependencyArtifactCacheEvictionPolicy, PruneSupersededRemovesTheOldEntry) {
-    ScratchDir scratch{Location::Temp, "dep-artifact-cache-prune"};
+// ★★★ THE NEGATIVE PIN FOR
+// [[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]],
+// AND IT IS THE ARM THIS FILE USED TO ASSERT THE OPPOSITE OF.
+//
+// `PruneSupersededRemovesTheOldEntry` stood here and required the second build
+// to leave ONE entry. That is exactly the deletion that took two corpus
+// examples red in cycle P66's gate: the entry a store calls superseded is
+// indistinguishable from the LIVE LINK INPUT of a build already holding its
+// path, because a store has no evidence about another process.
+//
+// ⚠ THE FIXTURE SYNTHESIZES THE NEGATIVE, WHICH IS WHY IT IS AN EDIT AND NOT A
+// PLANTED SECOND FILE. Writing a fake sibling into the cache directory would
+// prove only that some file survives; making the REAL key move — by editing a
+// header that no manifest names — produces the two live entries the way a
+// second process produces them, and then requires BOTH to survive.
+// ⇒ Reinstate any store-time prune and this goes RED at `2u`.
+TEST(DependencyArtifactCacheStore, ASecondKeyLEAVESTheFirstEntryIntact) {
+    ScratchDir scratch{Location::Temp, "dep-artifact-cache-keep"};
     fs::path const cacheRoot = scratch.path() / "cache";
     ScopedEnv const cacheEnv{kCacheDirVar, cacheRoot.string()};
 
-    Fixture const fx{scratch.path() / "tree", "prune-superseded"};
+    Fixture const fx{scratch.path() / "tree", /*declareCache=*/true};
     DiagnosticReporter cold;
     ASSERT_EQ(fx.build(cold), 0);
-    ASSERT_EQ(keyDocumentsUnder(cacheRoot).size(), 1u);
+    auto const first = keyDocumentsUnder(cacheRoot);
+    ASSERT_EQ(first.size(), 1u);
 
     writeText(fx.depDir / "dep_impl.h",
               "#ifndef DEP_IMPL_H\n#define DEP_IMPL_H\n"
@@ -597,10 +614,18 @@ TEST(DependencyArtifactCacheEvictionPolicy, PruneSupersededRemovesTheOldEntry) {
 
     DiagnosticReporter second;
     ASSERT_EQ(fx.build(second), 0);
-    EXPECT_EQ(keyDocumentsUnder(cacheRoot).size(), 1u)
-        << "'prune-superseded' must leave ONE current entry per artifact stem. "
-           "Two means the policy never reached the store; zero means it pruned "
-           "the entry it had just written.";
+    auto const after = keyDocumentsUnder(cacheRoot);
+    EXPECT_EQ(after.size(), 2u)
+        << "a store must leave every OTHER entry of this stem where it is. One "
+           "entry means the store deleted a file it cannot prove is dead — and "
+           "the file it deletes may be the archive a concurrent build was "
+           "handed the path to and has not opened yet.";
+    EXPECT_TRUE(fs::exists(first.front()))
+        << "the FIRST entry's key document specifically must survive: "
+        << first.front().generic_string();
+    EXPECT_TRUE(fs::exists(artifactBeside(first.front())))
+        << "and so must its artifact — the artifact is the file a concurrent "
+           "build opens, and the sidecar surviving alone would still fail it.";
 }
 
 // ⛔ A BUILD THAT REPORTED AN ERROR MUST NOT ENTER THE CACHE. Storing one would
@@ -631,7 +656,7 @@ TEST(DependencyArtifactCacheCold, AGraphThatFailsBeforeItsArtifactStoresNothing)
     fs::path const cacheRoot = scratch.path() / "cache";
     ScopedEnv const cacheEnv{kCacheDirVar, cacheRoot.string()};
 
-    Fixture const fx{scratch.path() / "tree", "prune-superseded",
+    Fixture const fx{scratch.path() / "tree", /*declareCache=*/true,
                      /*depStackReserve=*/8u * 1024u * 1024u};
     DiagnosticReporter rep;
     ASSERT_NE(fx.build(rep), 0)
@@ -664,7 +689,7 @@ TEST(DependencyArtifactCacheWarm, AnEntryWithNoKeyDocumentFailsTheBuild) {
     fs::path const cacheRoot = scratch.path() / "cache";
     ScopedEnv const cacheEnv{kCacheDirVar, cacheRoot.string()};
 
-    Fixture const fx{scratch.path() / "tree", "prune-superseded"};
+    Fixture const fx{scratch.path() / "tree", /*declareCache=*/true};
     DiagnosticReporter cold;
     ASSERT_EQ(fx.build(cold), 0);
     auto const entries = keyDocumentsUnder(cacheRoot);

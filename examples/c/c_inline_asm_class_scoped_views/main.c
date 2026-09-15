@@ -16,10 +16,16 @@
  * and a bare FP reference derives `registerNatural` = 128 bits, matching the
  * `v0` both references render.
  *
- * ⚠ WHY NO FP LETTER APPEARS INSIDE AN EXECUTED INSTRUCTION HERE: the aarch64
- * gas DIALECT spells no floating-point mnemonic (✔MEASURED, 51 instructions,
- * none floating — the gap `c_inline_asm_fp_class_constraint` records, a
- * cross-referenced row's subject, not this one's). The FP letters' decode,
+ * ⚠ WHY NO FP LETTER APPEARS INSIDE AN EXECUTED INSTRUCTION HERE: this
+ * paragraph SAID the aarch64 gas dialect spells no floating-point mnemonic
+ * (✔MEASURED at the time, 51 instructions, none floating), and that WAS true
+ * until P54 — `asm-arm64-gas.lang.json` now declares 58, seven of them
+ * floating (`fadd fsub fmul fdiv fneg fcmp fmov`), under
+ * D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME. ★ THE
+ * EXAMPLE IS UNCHANGED ON PURPOSE: its subject is the class-scoped width-view
+ * LETTERS, and `c_inline_asm_arm64_fp_operands` is now the file that executes
+ * FP mnemonics. Rewriting these templates to use one would trade a pin for a
+ * duplicate. The FP letters' decode,
  * width statement and refusal directions are pinned at the asm tier in
  * `tests/asm/test_asm_class_scoped_modifiers.cpp`; what execution CAN witness
  * on this port today — and could not before R1 — is an FP-class operand

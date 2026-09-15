@@ -89,9 +89,9 @@ Exit codes:  0 = pass   1 = gate failure   2 = usage / collapsed scan
 """
 
 import argparse
+import importlib.util
 import os
 import re
-import subprocess
 import sys
 
 # ── OUTPUT ENCODING — NOT COSMETIC, AND THE STREAM IS HALF THE FACT ─────────────
@@ -231,7 +231,6 @@ UNCOVERED_BASELINE = frozenset({
     "P_NumericLiteralOutOfRange",
     "P_UnclosedScope",
     "P_UnfinishedTree",
-    "P_InvalidEscape",
     "C_CircularShape",
     "C_UnclosableScope",
     "C_InvalidShippedFfiHeaderPath",
@@ -243,7 +242,6 @@ UNCOVERED_BASELINE = frozenset({
     "S_BitIntWidthExceedsMax",
     "S_BitIntWidthAboveC1Limit",
     "D_OutputDirCreateFailed",
-    "D_DirectoryScanFailed",
     "D_StaticLibFatArchiveUnsupported",
     "D_CompileUnitNullNoDiagnostic",
     "D_SynthRecipeFamilyUnknown",
@@ -383,12 +381,45 @@ def next_free_by_band(rows):
 
 # ── file-system side, kept thin so the pure core above is what gets tested ───
 
+_OWNING_TREE = None
+
+
+def _owning_tree():
+    """`scripts/owning-tree/owning-tree.py` -- the one owner of "which tree is this file in?".
+
+    Loaded by path from this file's sibling directory (a hyphen is not a module name). It
+    FAILS LOUD when absent rather than falling back to a local walk: a second copy of the
+    answer is the drift that owner exists to end.
+    """
+    global _OWNING_TREE
+    if _OWNING_TREE is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            sys.exit("check-diagnostic-codes: cannot find %s -- this guard's root is "
+                     "resolved there and nowhere else" % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OWNING_TREE = mod
+    return _OWNING_TREE
+
+
 def repo_root():
-    p = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                       capture_output=True, text=True)
-    if p.returncode != 0:
-        sys.exit("not inside a git repository")
-    return p.stdout.strip()
+    """The tree THIS FILE lives in -- never the tree the caller's shell is standing in.
+
+    ⚠ This was a bare `git rev-parse --show-toplevel`. ✔MEASURED 2026-09-15 (P66): run by
+    path with its cwd inside a different repository it reported OK over THAT repository's
+    header and test files, silently; from a directory inside no repository it would not
+    run at all. ctest pins `WORKING_DIRECTORY`, so no gate saw either. The walk and the
+    measurement that chose it are in `scripts/owning-tree/owning-tree.py`; this guard
+    reads files only, so git is not consulted.
+    """
+    ot = _owning_tree()
+    try:
+        return ot.resolve(__file__)
+    except ot.Refusal as exc:
+        sys.exit("check-diagnostic-codes: %s" % exc)
 
 
 def read_test_code(root):
@@ -565,6 +596,15 @@ def self_test():
     check("an unterminated enum block is None",
           extract_enum_body("enum class DiagnosticCode : std::uint16_t {\n  D_A = 1,"),
           None)
+
+    # ── (e) THE ROOT IS THE TREE THIS FILE LIVES IN, whatever the caller's cwd ──
+    # Arms, oracle and synthesized negatives are owned by scripts/owning-tree/owning-tree.py.
+    for ok, why, detail in _owning_tree().root_arms(repo_root, (SystemExit,), False, __file__):
+        # ★ Printed when it HOLDS as well: `check` reports only failures, and a red-on-disable
+        # transcript must SHOW the CONTROL arm staying green rather than imply it by a count.
+        if ok:
+            print("  ok   %s" % why)
+        check(why if ok else "%s -- %s" % (why, detail), ok, True)
 
     if failures:
         print("check-diagnostic-codes: SELF-TEST FAILED (%d case(s))" % len(failures))

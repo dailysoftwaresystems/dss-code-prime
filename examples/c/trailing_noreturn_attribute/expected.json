@@ -1,0 +1,34 @@
+{
+  "$comment": "P56 [[D-CSUBSET-TRAILING-NORETURN-NOT-HONORED]]: an `__attribute__((noreturn))` written anywhere but the LEADING specifier position was parsed, folded for linkage AND for attribute semantics, and its noreturn MEANING dropped -- accepted, so nothing warned, and the program simply lost the fact. ✔RE-MEASURED 2026-09-03 at `6482a71b` through the shipped CLI on programs shaped like this one: the after-declarator spelling (`void die(int) __attribute__((__noreturn__));`), its `extern` twin, AND the declaration-level SLOT spelling (`void __attribute__((__noreturn__)) die(int);` -- a position the row does not mention at all) each produced `error[H_VerifierFailure]: non-void function may fall through without returning a value` with NO binary, while every LEADING spelling exited 42. ★★ THE PIN IS THAT THE ATTRIBUTE IS HONORED, NOT THAT THE LINE PARSES -- it always parsed. `viaTrailing`, `viaSlot` and `viaExternTrailing` are non-void and each one's only non-return path ends in a decorated call, so an unhonored noreturn is not a missed optimisation but a build that does not happen; the witness is therefore a RUNNING program (main -> viaSibling(7)=7 -> viaSlot(200)=200 -> viaExternTrailing(300)=300 -> viaTrailing(0) -> stop(42) -> exit(42)) rather than a clean compile. ★ THE REFERENCES, EACH PROBED SEPARATELY 2026-09-03 by -Wreturn-type differential against an undecorated control: gcc 13.3.0 and clang 18.1.3 HONOR every spelling here at -std=c11, c17 and c2x alike; MSVC 19.51 implements no `__attribute__` in any position -- every spelling here is a hard syntax refusal at /std:c11, /std:c17 AND /std:clatest (C2061 for the trailing forms, C2143 for the leading ones) -- so it casts NO vote on the GNU spelling; two references that WORK make it REQUIRED. ✔AND THE PROGRAM IS REFERENCE-CLEAN, which is what makes exit 42 the CORRECT answer and not merely DSS's self-consistent one: gcc and clang each compile this file with `-Wall -Wextra` at c11, c17 and c2x with ZERO diagnostics and the binary exits 42 under both. ✔The DSS artifact was also BUILT for all five shipped formats at debug AND release from Windows and ROUND-TRIPPED at exit 42 on elf64-x86_64 (WSL) and elf64-aarch64 (qemu), both configs. ★ GRANULARITY IS THE OTHER HALF AND IT HAS THE UNSAFE DIRECTION: `keep` is the sibling declarator of a trailing-decorated `stop`, and ✔MEASURED in gcc AND clang a sibling does NOT inherit the attribute, so `viaSibling` must still supply its own return -- its value is checked at runtime. Dropping the flag costs a spurious diagnostic; LEAKING it onto a sibling would elide a return path that must be kept. ⚠ A trailing C23 `void die(int) [[noreturn]];` is DELIBERATELY ABSENT: no reference honors it (C23 6.7.13.1 puts an attribute after a declarator on the TYPE -- gcc `'noreturn' attribute ignored`, clang `error: 'noreturn' attribute cannot be applied to types`, MSVC C4649), so `declarators.afterDeclaratorAttrRules` gives `attrSpec` the grain `declarator` and `stdAttr` the grain `declaratorUnlessTypeDerived` (P56 lane `at` replaced the `afterDeclaratorEntityAttrRules` SUBSET key with a per-entry grain; every measurement behind that key re-derived true, but a subset can only say entity-or-not and the measured axis has three answers), and that negative is pinned in the unit suite where a non-building program can be asserted. RED-ON-DISABLE (REMOVE direction): set `attrSpec`'s `appertainsTo` in `declarators.afterDeclaratorAttrRules` to `type` in `src/dss-config/sources/c.lang.json` and this example FAILS IN BOTH RUNNERS while `extern_noreturn_specifier` and `noreturn_function` -- both LEADING spellings -- stay green.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

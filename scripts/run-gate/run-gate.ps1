@@ -37,6 +37,19 @@
     Windows host is where this project's primary ctest leg runs, so a bash-only
     gate wrapper is a gate wrapper that the main gate cannot use.
 
+    THE EXIT CODES ARE PART OF THE CONTRACT AND THE TWO TWINS MUST AGREE:
+      0   rc was 0 AND the success witness was present
+      1   the command exited 0 but produced no witness -- no evidence it ran
+      2   this wrapper refused before starting (bad usage, unwritable log/marker)
+      3   THE SOURCE TREE MOVED under the run -- the verdict is not evidence
+      4   ANOTHER RUN WAS LIVE IN THE SAME BUILD DIRECTORY -- likewise not evidence
+      5   ANOTHER LIVE RUN-GATE HOLDS THIS LOG PATH -- nothing was run, and that
+          run's log was not touched
+      *   otherwise, the command's own exit code (127 gets its own sentence)
+    ! 3, 4 and 5 are DELIBERATELY DIFFERENT NUMBERS. Each means "this run has no
+    verdict", and a reader who cannot tell which fired cannot pick the remedy:
+    settle the tree, wait for a sibling, or give this gate its own log path.
+
 .PARAMETER LogPath
     File to receive the command's combined output. TRUNCATED, never appended --
     a stale log is itself a way to "find" a witness this run never produced.
@@ -206,11 +219,13 @@ if ($LogPath.StartsWith('-')) {
     exit 2
 }
 
-# Truncate up front (see LogPath above).
-try {
-    Set-Content -LiteralPath $LogPath -Value $null -NoNewline -ErrorAction Stop
-} catch {
-    Write-Host "run-gate.ps1: FAIL - cannot create the log '$LogPath', so nothing was run."
+# (i) THE TRUNCATE NOW HAPPENS IN THE PRE-RUN SECTION, AFTER THIS RUN HAS TAKEN THE LOG
+#   PATH'S OWNER RECORD -- twin of the same note in run-gate.sh, and see "THE LOG PATH IS
+#   ONE LIVE RUN'S ALONE" below. Truncating first is what let a second run on one path
+#   erase a live run's log. The refusal text is kept here, as a function, so both of its
+#   callers say the same thing.
+function Show-RunGateLogPathRefusal([string]$What, [string]$Reason) {
+    Write-Host "run-gate.ps1: FAIL - cannot create $What, so nothing was run."
     Write-Host "  This refusal is about the LOG PATH, not about the gate command."
     Write-Host "  shell   : $(Get-RunGateShellIdentity)"
     Write-Host "  script  : $PSCommandPath"
@@ -225,8 +240,7 @@ try {
     } else {
         Write-Host "  Check that the parent directory exists and is writable by this shell."
     }
-    Write-Host "  reason  : $($_.Exception.Message)"
-    exit 2
+    if ($Reason) { Write-Host "  reason  : $Reason" }
 }
 
 if ($null -eq $CommandArgs) { $CommandArgs = @() }
@@ -332,9 +346,15 @@ trap { Restore-CplDefault; break }
 # See Get-RunGateShellIdentity above for the measurement. `Get-Command` resolves
 # an application, a cmdlet, a function and an explicit path alike, so this
 # rejects nothing the `&` below would have accepted.
-$resolved = Get-Command -Name $Command -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-if (-not $resolved) {
+# (i) CALLED FROM THE PRE-RUN SECTION, after the log path's owner record is taken and
+#   the log truncated: the refusal writes INTO the log, so it may only run once this
+#   run holds that log -- see "THE LOG PATH IS ONE LIVE RUN'S ALONE". `exit` inside a
+#   script-defined function ends the script with that code (+MEASURED 2026-09-15 on
+#   pwsh 7.6.6 and PowerShell 5.1), and the finally that releases the record still runs.
+function Resolve-RunGateCommandOrRefuse {
+    $found = Get-Command -Name $Command -ErrorAction SilentlyContinue |
+             Select-Object -First 1
+    if ($found) { return $found }
     $notFound = @(
         "run-gate.ps1: FAIL - the gate command was NOT FOUND, so it never ran (rc=127).",
         "  command : $Command $($CommandArgs -join ' ')",
@@ -352,6 +372,1166 @@ if (-not $resolved) {
     exit 127
 }
 
+# ---- THE RUN'S INPUTS MUST HOLD STILL, OR ITS VERDICT IS NOT EVIDENCE -------
+#
+# The twin of the block of the same name in run-gate.sh; that file carries the
+# full argument and the measurement. In short: this project's runners read
+# `src/dss-config/**`, `tests/corpus/**` and `examples/**` from the SOURCE TREE
+# at TEST TIME, so an edit to one of them while a suite is in flight makes the
+# run measure a tree that never existed as a whole.
+#
+# +MEASURED 2026-09-05 (P62): a whole-tree ctest reported 9 failures out of 2087;
+# EIGHT were examples failing `C_UnbackedPredefinedMacro` about shipped-library
+# descriptors, which reads as a defect in a sibling lane's FFI work -- and that
+# is where the investigation went. The cause was the orchestrator rewriting
+# `c.lang.json` mid-run. All eight passed on the stable tree seconds later.
+#
+# NO ESCAPE HATCH, deliberately: an escape every caller can set is one every
+# caller sets. A command that rewrites these roots is a build step, not a gate.
+# A root that does not exist contributes nothing, so a worktree carrying a subset
+# of the tree is not penalised for it.
+# ---- AND THE BUILD DIRECTORY MUST BE THIS RUN'S ALONE ----------------------
+#
+# The twin of the block of the same name in run-gate.sh, which carries the full
+# argument, the measurement and the list of what the scan CANNOT see. In short:
+# a run can be lied to through the BUILD DIRECTORY exactly as completely as
+# through the source tree. +MEASURED 2026-09-07 (P63): `ctest --test-dir build/sh`
+# launched while a lane's gate was already running against that same directory
+# gave 2100/2101 with ONE red that passes in isolation, and this wrapper printed
+# `inputs : held still`. Four concurrent ctest.exe were live.
+# D-GATE-RUN-GATE-BLIND-TO-A-SECOND-RUN-IN-THE-SAME-BUILD-DIRECTORY
+#
+# ! A SCAN, NOT A LOCK: a lock sees only runs that went through this wrapper,
+#   and the run that caused the measurement above did not.
+# ! THE RULES BELOW ARE THE TWIN'S RULES, SPELLED IN THIS SHELL'S IDIOMS AND
+#   NOTHING MORE -- same flag table, same program-keyed reading of `-C` (a
+#   CONFIGURATION to ctest, a DIRECTORY to ninja), same quote-aware tokenising,
+#   same exit code 4. That is the arrangement `check-line-endings` uses for the
+#   same reason: the shells marshal, they do not each invent a scan.
+$script:RunGateContentionExit = 4
+$script:RunGateBuildDir       = ''
+$script:RunGateAbsBuildDir    = ''
+$script:RunGateContenders     = @()
+$script:RunGateUnreadable     = 0
+$script:RunGateTableOk        = $false
+$script:RunGateRelativeMatch  = $false
+$script:RunGateContentionNote = ''
+# The two samples of the machine-wide subject, kept whole. See the block above
+# Save-RunGateContentionSample, and its twin above run_gate_sample_contention.
+$script:RunGateForeignBefore  = @()
+$script:RunGateForeignAfter   = @()
+$script:RunGateTableOkBefore  = $false
+$script:RunGateTableOkAfter   = $false
+# Parent links a scan refused because the parent was created AFTER its child (a
+# recycled pid), as `child>parent`; per scan, then kept per sample like the rows.
+$script:RunGateRecycled       = @()
+$script:RunGateRecycledBefore = @()
+$script:RunGateRecycledAfter  = @()
+
+function Test-RunGateIsWindows {
+    if (Test-Path variable:IsWindows) { return [bool]$IsWindows }
+    return $true   # Windows PowerShell 5.1 has no $IsWindows and runs nowhere else
+}
+
+# ONE SPELLING for a directory. Normalises exactly three things, like the twin:
+# separator, trailing slash, and (on Windows only) case.
+# ! SPLIT IN TWO, exactly as the twin is, because the two callers want DIFFERENT
+#   halves: comparing two processes' directories needs the case fold, NAMING one
+#   in the log does not -- `c:/source/dailysoftware/...` in a footer reads as a
+#   different tree from the one the reader knows. `Tidy` is the shared half.
+function Get-RunGateTidyDir([string]$p) {
+    $n = $p -replace '\\', '/'
+    while ($n.Length -gt 1 -and $n.EndsWith('/')) { $n = $n.Substring(0, $n.Length - 1) }
+    return $n
+}
+function Get-RunGateNormDir([string]$p) {
+    $n = Get-RunGateTidyDir $p
+    if (Test-RunGateIsWindows) { return $n.ToLowerInvariant() }
+    return $n
+}
+
+# A directory token made absolute. A RELATIVE token is resolved against THIS
+# shell's working directory, because a process's own working directory is not
+# readable from outside on Windows; every refusal below says so when it applies.
+function Get-RunGateAbsDir([string]$p) {
+    $d = $p -replace '\\', '/'
+    $full = $null
+    try { $full = (Resolve-Path -LiteralPath $d -ErrorAction Stop).ProviderPath } catch { $full = $null }
+    if (-not $full) {
+        try { $full = [IO.Path]::GetFullPath([IO.Path]::Combine((Get-Location).Path, $d)) } catch { $full = $d }
+    }
+    return Get-RunGateTidyDir $full
+}
+function Resolve-RunGateDir([string]$p) {
+    return Get-RunGateNormDir (Get-RunGateAbsDir $p)
+}
+
+# Quote-aware split. +MEASURED: a Windows command line reads
+# `"C:\Program Files\CMake\bin\cmake.exe" --build build/hg --parallel 6`, so a
+# split on whitespace alone tears the program path in half.
+function Split-RunGateCommandLine([string]$line) {
+    $out = New-Object System.Collections.Generic.List[string]
+    $cur = ''; $inq = $false
+    foreach ($c in $line.ToCharArray()) {
+        if ($c -eq '"') { $inq = -not $inq; continue }
+        if ((-not $inq) -and ($c -eq ' ' -or $c -eq "`t")) {
+            if ($cur -ne '') { $out.Add($cur); $cur = '' }
+            continue
+        }
+        $cur += $c
+    }
+    if ($cur -ne '') { $out.Add($cur) }
+    return $out.ToArray()
+}
+
+# THE FLAG TABLE, program-keyed. `ctest -C Debug` is a CONFIGURATION and
+# `ninja -C dir` is a DIRECTORY; a rule that read `-C` for both would turn every
+# `ctest -C Debug` into a build directory called `Debug`.
+function Get-RunGateDirsInTokens([string]$image, [string[]]$tok) {
+    $p = ([IO.Path]::GetFileName($image)).ToLowerInvariant()
+    if ($p.EndsWith('.exe')) { $p = $p.Substring(0, $p.Length - 4) }
+    $found = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt $tok.Count; $i++) {
+        $a = [string]$tok[$i]
+        $next = if ($i + 1 -lt $tok.Count) { [string]$tok[$i + 1] } else { $null }
+        if     ($a -eq '--test-dir'  -and $next) { $found.Add($next) }
+        elseif ($a.StartsWith('--test-dir='))    { $found.Add($a.Substring(11)) }
+        elseif ($p -eq 'cmake' -and $a -eq '--build' -and $next) { $found.Add($next) }
+        elseif ($p -eq 'cmake' -and $a -eq '-B' -and $next)      { $found.Add($next) }
+        elseif ($p -eq 'cmake' -and $a.Length -gt 2 -and $a.StartsWith('-B')) { $found.Add($a.Substring(2)) }
+        elseif (($p -eq 'ninja' -or $p -eq 'make' -or $p -eq 'gmake') -and $a -eq '-C' -and $next) { $found.Add($next) }
+        elseif (($p -eq 'ninja' -or $p -eq 'make' -or $p -eq 'gmake') -and $a.Length -gt 2 -and $a.StartsWith('-C')) { $found.Add($a.Substring(2)) }
+    }
+    return $found.ToArray()
+}
+
+# pid / ppid / image / command line / argv0 / CREATION KEY for every live process.
+# +MEASURED on this workstation: `Get-CimInstance Win32_Process` returns 507-538
+# rows in 341 ms from an already-running PowerShell, of which 249 report an
+# EMPTY CommandLine (protected/system processes) while all four live build-tool
+# processes reported theirs.
+#
+# ★★★ THE CREATION KEY IS WHAT MAKES `ParentId` SAFE TO FOLLOW. Twin of the block
+# "A PARENT LINK IS A CLAIM ABOUT ORDER" above run_gate_process_table in
+# run-gate.sh, which carries the measurements; not repeated here, so the two
+# cannot drift into describing it differently. In short: Windows does not
+# reparent an orphan and recycles pids, so a ParentId can name whatever process
+# now holds a dead parent's pid, and Get-RunGateTrustedParent refuses a link
+# whose parent was created AFTER its child.
+# D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY
+# (i) ONE KEY, BOTH TWINS: `yyyyMMddHHmmssffffff`, UTC, 20 digits, compared
+#   ORDINALLY as a string. InvariantCulture, because a custom date format under a
+#   non-Gregorian culture prints a different YEAR.
+function Get-RunGateProcessTable {
+    if (Test-RunGateIsWindows) {
+        try {
+            $inv = [Globalization.CultureInfo]::InvariantCulture
+            return @(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object {
+                [PSCustomObject]@{
+                    ProcId    = [int]$_.ProcessId
+                    ParentId  = [int]$_.ParentProcessId
+                    Image     = [string]$_.Name
+                    # CR, LF and TAB become a space -- twin of the same replacement in
+                    # run-gate.sh, which carries the measurement: a Windows command
+                    # line can hold a newline, and the twins must tokenise and print
+                    # the same text for the same process.
+                    CmdLine   = ([string]$_.CommandLine) -replace "[`t`r`n]", ' '
+                    Argv0     = [string]$_.Name   # CIM Name is already a bare image name
+                    Created   = $(if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('yyyyMMddHHmmssffffff', $inv) } else { '' })
+                } })
+        } catch { return @() }
+    }
+    # The twin's POSIX instrument, so the two agree off Windows as well — INCLUDING
+    # the two image spellings. See the note above run_gate_process_table in
+    # run-gate.sh: on macOS `comm` is an absolute path truncated to the column
+    # width, so a bare-name comparison against it can never match
+    # (D-SCRIPT-RUN-GATE-MATCHES-AN-IMAGE-AGAINST-A-COMM-COLUMN-THAT-IS-A-TRUNCATED-PATH-ON-MACOS).
+    # Both spellings are basenamed here and EITHER may match downstream.
+    # [!] `lstart` IS FIVE FIELDS (weekday, month, day, HH:MM:SS, year), so comm is
+    #   the EIGHTH, and it is read under LC_ALL=C TZ=UTC exactly as the twin reads
+    #   it: English month names, and no DST fall-back ordering a child before its
+    #   parent. The two variables are RESTORED, because a .ps1 runs in-process.
+    $prevLcAll = $env:LC_ALL
+    $prevTz    = $env:TZ
+    try {
+        $env:LC_ALL = 'C'
+        $env:TZ     = 'UTC'
+        return @(& ps -eo 'pid=,ppid=,lstart=,comm=,args=' 2>$null | ForEach-Object {
+            $f = ($_ -replace '^\s+', '') -split '\s+', 9
+            if ($f.Count -lt 8) { return }
+            $cl = if ($f.Count -ge 9) { [string]$f[8] } else { '' }
+            $a0 = if ($cl) { ($cl -split '[ \t]', 2)[0] } else { '' }
+            [PSCustomObject]@{
+                ProcId   = [int]$f[0]
+                ParentId = [int]$f[1]
+                Image    = [string]($f[7] -replace '^.*/', '')
+                CmdLine  = $cl
+                Argv0    = [string]($a0 -replace '^.*/', '')
+                Created  = (ConvertTo-RunGateLstartKey $f[3] $f[4] $f[5] $f[6])
+            } })
+    } catch {
+        return @()
+    } finally {
+        if ($null -eq $prevLcAll) { Remove-Item Env:\LC_ALL -ErrorAction SilentlyContinue } else { $env:LC_ALL = $prevLcAll }
+        if ($null -eq $prevTz)    { Remove-Item Env:\TZ -ErrorAction SilentlyContinue }     else { $env:TZ = $prevTz }
+    }
+}
+
+# `lstart`'s month / day / HH:MM:SS / year as the 20-digit key, or '' when any
+# part is not the shape it must be. Twin of the conversion inside
+# run_gate_process_table's awk, digit for digit.
+function ConvertTo-RunGateLstartKey([string]$Month, [string]$Day, [string]$Hms, [string]$Year) {
+    $mi = [Array]::IndexOf([string[]]@('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'), $Month) + 1
+    $t  = @($Hms -split ':')
+    if ($mi -lt 1 -or $t.Count -ne 3 -or ("$Day$Year$($t -join '')" -notmatch '^[0-9]+$')) { return '' }
+    return ('{0:D4}{1:D2}{2:D2}{3:D2}{4:D2}{5:D2}000000' -f [int]$Year, $mi, [int]$Day, [int]$t[0], [int]$t[1], [int]$t[2])
+}
+
+# ★★★ THE ONE RULE FOR FOLLOWING A PARENT LINK. Twin of `parent_of` in
+# run_gate_classify_table (run-gate.sh): the parent of $Child, or 0 when the link
+# must NOT be followed -- the parent is absent, is the child itself, either
+# creation key is not a 20-digit key, or the parent was created AFTER the child.
+# That last case is a RECYCLED pid and is recorded, by name, for the footer.
+# [!] Unknown ends the chain rather than extending it. Every direction that
+#   follows from a SHORTER chain is loud -- a foreign compiler REPORTED, or a
+#   contender REFUSED -- and the direction a longer, unproven chain produces is
+#   the silent one this rule exists to remove.
+function Get-RunGateTrustedParent([hashtable]$ById, [int]$Child) {
+    if (-not $ById.ContainsKey($Child)) { return 0 }
+    $p = [int]$ById[$Child].ParentId
+    if ($p -eq 0 -or $p -eq $Child -or -not $ById.ContainsKey($p)) { return 0 }
+    $ck = [string]$ById[$Child].Created
+    $pk = [string]$ById[$p].Created
+    if ($ck -notmatch '^[0-9]{20}$' -or $pk -notmatch '^[0-9]{20}$') { return 0 }
+    if ([string]::CompareOrdinal($pk, $ck) -gt 0) {
+        $tag = "$Child>$p"
+        if ($script:RunGateRecycled -notcontains $tag) { $script:RunGateRecycled += $tag }
+        return 0
+    }
+    return $p
+}
+
+# ── THE TWO IMAGE SETS, EACH SPELLED ONCE (twin of run-gate.sh) ─────────────
+#
+# [!] The build-tool list gained a SECOND reader when the ancestor walk started
+# asking whether one of OUR OWN ancestors is a build tool, so it is a variable
+# rather than two literals. A second spelling would not fail; it would classify
+# one process differently in the two places.
+$script:RunGateBuildTools = @('ctest', 'ninja', 'cmake', 'make', 'gmake', 'msbuild')
+
+# ★★★ THE COMPILER'S OWN IMAGE, AND WHY IT IS A SECOND SUBJECT RATHER THAN A
+# SEVENTH BUILD TOOL.
+# D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT
+#
+# +MEASURED 2026-09-10 (cycle P66): two corpus examples went red inside an
+# otherwise 2172/2174 run because a SECOND `dsscp` on the machine deleted a
+# cache entry this run had been handed the path to - and this wrapper printed
+# `contended: no`, which was TRUE (nothing else named the build directory) and
+# useless (the shared resource lives in %LOCALAPPDATA%, outside both srctree
+# and builddir).
+#
+# [!] It is NOT in the build-tool list. A build tool is matched only when its
+# ARGV NAMES THIS BUILD DIRECTORY, and `dsscp` has no such argument: the cache
+# it contends for is per-USER, so the subject is the MACHINE and the verdict is
+# a different sentence.
+$script:RunGateCompilerImage = 'dsscp'
+
+# The image name as the tables spell it, lowercased with any `.exe` removed.
+function Get-RunGateImageKey([string]$Name) {
+    $i = $Name.ToLowerInvariant()
+    if ($i.EndsWith('.exe')) { $i = $i.Substring(0, $i.Length - 4) }
+    return $i
+}
+
+# THE WORKING DIRECTORY OF ANOTHER PROCESS, where this host lets one be read -- twin of
+# run_gate_process_cwd in run-gate.sh, which carries the reasoning: `/proc/<pid>/cwd`
+# on Linux, `lsof -d cwd` on macOS, nothing on Windows; both readers TRIED rather than
+# looked up, and only an absolute answer accepted.
+# D-SCRIPT-RUN-GATE-RESOLVES-ANOTHER-PROCESS-RELATIVE-BUILD-DIR-AGAINST-ITS-OWN-CWD
+function Get-RunGateProcessCwd([long]$ProcId) {
+    if (Test-RunGateIsWindows) { return $null }
+    $c = ''
+    try { $c = [string](& readlink "/proc/$ProcId/cwd" 2>$null) } catch { $c = '' }
+    if (-not $c) {
+        try {
+            $n = @(& lsof -a -p $ProcId -d cwd -Fn 2>$null) | Where-Object { $_ -like 'n*' } | Select-Object -First 1
+            if ($n) { $c = ([string]$n).Substring(1) }
+        } catch { $c = '' }
+    }
+    if ($c -and $c.StartsWith('/')) { return $c }
+    return $null
+}
+
+# WHERE A PROCESS STANDS *NOW* IS NOT WHERE ITS RELATIVE ARGUMENTS WERE WRITTEN -- twin
+# of run_gate_path_ends_with in run-gate.sh, which carries the measurement (ctest enters
+# its --test-dir after parsing, so its cwd IS the directory it named). $true when the
+# dir's trailing components are the token; a token with a `..` or `.` component never
+# qualifies.
+function Test-RunGatePathEndsWith([string]$Dir, [string]$Token) {
+    $t = $Token -replace '\\', '/'
+    while ($true) {
+        if ($t.StartsWith('./')) { $t = $t.Substring(2); continue }
+        if ($t.Length -gt 1 -and $t.EndsWith('/')) { $t = $t.Substring(0, $t.Length - 1); continue }
+        break
+    }
+    if ($t -eq '' -or ("/$t/" -match '/\.\.?/')) { return $false }
+    return (Get-RunGateTidyDir $Dir).EndsWith('/' + $t, [StringComparison]::Ordinal)
+}
+
+function Get-RunGateContention {
+    $script:RunGateContenders    = @()
+    $script:RunGateUnreadable    = 0
+    $script:RunGateTableOk       = $false
+    $script:RunGateRelativeMatch = $false
+    $script:RunGateForeign       = @()
+    $script:RunGateRecycled      = @()
+    # [!] NO EARLY RETURN ON AN UNNAMED BUILD DIRECTORY. This function answers
+    # TWO questions and only the first has the build directory as its subject.
+    $table = Get-RunGateProcessTable
+    if ($table.Count -eq 0) { return }
+    $script:RunGateTableOk = $true
+
+    # OUR OWN ANCESTORS ARE NOT CONTENDERS. A gate legitimately invoked from
+    # inside a `ctest` (this repository registers guards that way) would
+    # otherwise refuse itself the moment it named the same tree.
+    # (i) TWO SETS COME OUT OF ONE WALK. `$exclude` is every ancestor - the
+    # build-directory question asks *did I name this myself*. `$own` is the
+    # BOUNDED prefix: this process, plus the chain UP TO AND INCLUDING THE
+    # OUTERMOST BUILD-TOOL ANCESTOR.
+    #
+    # [!] THE BOUND IS THE WHOLE POINT AND ITS ABSENCE DISARMS THE CHECK.
+    # *Descends from any ancestor of mine* sounds right and is not: a chain
+    # that reaches a login shell or a session manager makes EVERY process on
+    # the host a descendant of one of my ancestors, and the check then reports
+    # nothing, ever.
+    #
+    # ★★ BOTH WALKS FOLLOW PARENT LINKS, SO BOTH GO THROUGH Get-RunGateTrustedParent.
+    # A recycled pid misleads the upward walk from THIS process exactly as it
+    # misleads the one from a compiler: an unrelated ctest holding our dead parent's
+    # pid would be adopted as an ancestor, its tree read as ours, and a real
+    # contender in it excluded -- exit 0 where 4 is owed. Twin of the one awk pass,
+    # and its one `parent_of`, in run_gate_classify_table (run-gate.sh).
+    $byId = @{}
+    foreach ($r in $table) { if (-not $byId.ContainsKey($r.ProcId)) { $byId[$r.ProcId] = $r } }
+    # THIS RUN'S OWN CREATION KEY, from the same table, for the log path's owner record
+    # -- twin of run_gate_self_created in run_gate_scan_contention.
+    if ($byId.ContainsKey($PID)) { $script:RunGateSelfCreated = [string]$byId[$PID].Created }
+    $exclude = @{}
+    $own = @{ $PID = $true }
+    $chain = @($PID)
+    $walk = $PID; $depth = 0
+    while ($walk -and $depth -lt 24) {
+        $exclude[$walk] = $true
+        if (-not $byId.ContainsKey($walk)) { break }
+        if (($script:RunGateBuildTools -contains (Get-RunGateImageKey $byId[$walk].Image)) -or
+            ($script:RunGateBuildTools -contains (Get-RunGateImageKey $byId[$walk].Argv0))) {
+            foreach ($c in $chain) { $own[$c] = $true }
+        }
+        $walk = Get-RunGateTrustedParent $byId $walk
+        $depth++
+        if ($walk) { $chain += $walk }
+    }
+
+    # THE MACHINE-WIDE SUBJECT. Asked whether or not a build directory was
+    # named, and never fatal - see the footer for why.
+    foreach ($r in $table) {
+        # EITHER spelling. On macOS only Argv0 can ever match; matching either can
+        # only ADD a detection, so no host loses one. Twin of the `key()` pair in
+        # run_gate_classify_table.
+        if ((Get-RunGateImageKey $r.Image) -ne $script:RunGateCompilerImage -and
+            (Get-RunGateImageKey $r.Argv0) -ne $script:RunGateCompilerImage) { continue }
+        $a = $r.ProcId; $d = 0; $ours = $false
+        while ($a -and $d -lt 24) {
+            if ($own.ContainsKey($a)) { $ours = $true; break }
+            if (-not $byId.ContainsKey($a)) { break }
+            $a = Get-RunGateTrustedParent $byId $a
+            $d++
+        }
+        if ($ours) { continue }
+        # [!] STRUCTURED, not a pre-formatted line: the union below folds the two
+        # samples BY PID, so the pid has to survive as a field. The twin's rows
+        # are TAB-separated for the same reason.
+        $script:RunGateForeign += [PSCustomObject]@{
+            ProcId  = $r.ProcId
+            Image   = $script:RunGateCompilerImage
+            CmdLine = $r.CmdLine
+        }
+    }
+
+    if (-not $script:RunGateBuildDir) { return }
+
+    foreach ($r in $table) {
+        $img = Get-RunGateImageKey $r.Image
+        if ($script:RunGateBuildTools -notcontains $img) {
+            $img = Get-RunGateImageKey $r.Argv0
+            if ($script:RunGateBuildTools -notcontains $img) { continue }
+        }
+        if (-not $r.CmdLine) { $script:RunGateUnreadable++; continue }
+        if ($exclude.ContainsKey($r.ProcId)) { continue }
+        foreach ($raw in (Get-RunGateDirsInTokens $img (Split-RunGateCommandLine $r.CmdLine))) {
+            # A RELATIVE SPELLING IS RELATIVE TO *THAT* PROCESS'S DIRECTORY -- twin of the
+            # same block in run_gate_scan_contention, which carries the measurement.
+            # D-SCRIPT-RUN-GATE-RESOLVES-ANOTHER-PROCESS-RELATIVE-BUILD-DIR-AGAINST-ITS-OWN-CWD
+            $slashed = $raw -replace '\\', '/'
+            $assumed = $false
+            if ($slashed -match '^(/|[A-Za-z]:/)') {
+                $at = Resolve-RunGateDir $raw
+            } else {
+                $pcwd = Get-RunGateProcessCwd $r.ProcId
+                if ($pcwd) {
+                    # TWO READINGS -- see Test-RunGatePathEndsWith: the tool has not entered
+                    # the directory it named yet, or it already has and stands in it.
+                    $at = Resolve-RunGateDir ($pcwd + '/' + $slashed)
+                    if ($at -ne $script:RunGateBuildDir -and (Test-RunGatePathEndsWith $pcwd $slashed)) {
+                        $at = Resolve-RunGateDir $pcwd
+                    }
+                } else {
+                    $at = Resolve-RunGateDir $raw
+                    $assumed = $true
+                }
+            }
+            if ($at -ne $script:RunGateBuildDir) { continue }
+            if ($assumed) { $script:RunGateRelativeMatch = $true }
+            $script:RunGateContenders += "      pid $($r.ProcId)  $img  named it as '$raw'"
+            $script:RunGateContenders += "        $($r.CmdLine)"
+        }
+    }
+}
+
+# ★★★ THE MACHINE-WIDE SUBJECT IS SAMPLED TWICE, AND THE LINE REPORTS BOTH.
+# D-SCRIPT-RUN-GATE-COMPILERS-LINE-REPORTS-NONE-WHEN-IT-COULD-NOT-READ-THE-PROCESS-TABLE
+#
+# [!] THE FIRST SAMPLE USED TO BE THROWN AWAY. The scan runs before the command
+# and again after it; the second call overwrote the foreign list, so a compiler
+# this gate HAD SEEN at the start and that exited before the end was reported as
+# `compilers: none`. => *I saw one during this run* rendered as *the machine was
+# clean* - the same sentence this subject exists to be unable to say wrongly.
+#
+# ★ AND THE DISCARDED CASE IS THE WORST ONE THIS LINE HAS.
+# D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT is
+# exactly a second `dsscp` that ran DURING a gate, deleted a cache entry the run
+# had been handed the path to, and EXITED.
+#
+# +MEASURED 2026-09-14: a stub planted before the gate and outlived by it (gate
+# 13.74 s against an 8 s stub) produced `compilers: none` from a host whose
+# process table reads FINE.
+#
+# ★ That is also what the CI `windows-msvc-release` leg was printing - MEASURED
+# from its own log, where the arm next door printed `compilers: none outside`, a
+# sentence unreachable without a table. (i) INFERRED (that host cannot be logged
+# into): it hit the .sh twin and not this one because the .sh twin SPAWNS
+# `powershell` twice while this one calls Get-CimInstance IN-PROCESS - 3.58 s
+# against 2.29 s per gate, on a leg that runs 2.3x slower. A wall-clock
+# asymmetry between the twins, read for a cycle as a capability difference.
+#
+# (i) BOTH SAMPLES ARE KEPT WHOLE rather than accumulated in place, because the
+# report needs to say WHICH sample saw each process: *alongside you the whole
+# time* and *ran while you worked and exited* are different facts about your
+# verdict.
+function Save-RunGateContentionSample([string]$When) {
+    Get-RunGateContention
+    # [!] The recording lives HERE and not at the end of the scan: that function
+    # has three early returns, and a capture written after them would silently
+    # skip exactly the samples whose answer this line is about.
+    if ($When -eq 'before') {
+        $script:RunGateForeignBefore  = $script:RunGateForeign
+        $script:RunGateTableOkBefore  = $script:RunGateTableOk
+        $script:RunGateRecycledBefore = $script:RunGateRecycled
+    } else {
+        $script:RunGateForeignAfter  = $script:RunGateForeign
+        $script:RunGateTableOkAfter  = $script:RunGateTableOk
+        $script:RunGateRecycledAfter = $script:RunGateRecycled
+    }
+}
+
+# The union of the two samples, one entry per pid, carrying WHEN it was seen.
+# Twin of run_gate_foreign_union.
+function Get-RunGateForeignUnion {
+    $seen  = @{}
+    $order = @()
+    $rows  = @{}
+    $samples = @(
+        @{ Tag = 'B'; Rows = $script:RunGateForeignBefore },
+        @{ Tag = 'A'; Rows = $script:RunGateForeignAfter }
+    )
+    foreach ($sample in $samples) {
+        foreach ($r in @($sample.Rows)) {
+            if (-not $r) { continue }
+            if (-not $rows.ContainsKey($r.ProcId)) { $order += $r.ProcId; $rows[$r.ProcId] = $r }
+            $seen[$r.ProcId] = [string]$seen[$r.ProcId] + $sample.Tag
+        }
+    }
+    foreach ($p in $order) {
+        $sawIn = [string]$seen[$p]
+        $when = if ($sawIn.Contains('B') -and $sawIn.Contains('A')) { 'throughout this run' }
+                elseif ($sawIn.Contains('B'))                       { 'when this run STARTED' }
+                else                                                { 'when this run ENDED' }
+        [PSCustomObject]@{ ProcId = $p; Image = $rows[$p].Image; When = $when; CmdLine = $rows[$p].CmdLine }
+    }
+}
+
+function Show-RunGateContentionRefusal([string]$When) {
+    Write-Host "run-gate.ps1: FAIL - ANOTHER RUN IS LIVE IN THIS BUILD DIRECTORY, so this one has no verdict."
+    Write-Host "  build dir: $($script:RunGateBuildDir)"
+    Write-Host "  detected : $When"
+    Write-Host "  These live processes name that same directory:"
+    foreach ($l in $script:RunGateContenders) { Write-Host $l }
+    Write-Host "  [!] This is NOT 'the gate failed' and NOT 'the gate passed'. Two runs sharing one build"
+    Write-Host "      directory rewrite each other's binaries and test artefacts mid-run: +MEASURED, a"
+    Write-Host "      2100/2101 with ONE red that passed on a re-run in isolation."
+    if ($script:RunGateRelativeMatch) {
+        # Twin of the same sentence in run_gate_refuse_contention -- the fixture's arms 66/67
+        # read it from BOTH twins, which is how a stale copy here was caught.
+        # D-SCRIPT-RUN-GATE-RESOLVES-ANOTHER-PROCESS-RELATIVE-BUILD-DIR-AGAINST-ITS-OWN-CWD
+        Write-Host "  (i) At least one spelling above is RELATIVE and THAT process's own working directory"
+        Write-Host "      could not be read here (Windows does not expose it; on Linux and macOS it is read"
+        Write-Host "      from /proc or lsof, so reaching this sentence there means that read failed), so"
+        Write-Host "      this guard resolved it against THIS shell's working directory ($((Get-Location).Path))."
+        Write-Host "      If that process is really standing in a DIFFERENT tree, this is a false refusal;"
+        Write-Host "      read the command line printed above before assuming it is not."
+    }
+    Write-Host "  Wait for the other run to finish, or point this gate at its own build directory."
+    Write-Host "  (log: $LogPath)"
+}
+
+# ---- AND THE ROOTS ARE THE GATE COMMAND'S TREE, NOT THIS SHELL'S ------------
+#
+# ★★★ THE THREE ROOT NAMES ARE RELATIVE, AND WHAT THEY ARE RELATIVE **TO** IS THE
+# WHOLE QUESTION. They used to be resolved against the PROCESS WORKING DIRECTORY,
+# which is right only when the caller happens to be standing in the tree the gate
+# command reads -- and this project gates lane worktrees from sibling trees.
+#
+# +MEASURED 2026-09-08 (P65, lane `rc`), BOTH DIRECTIONS, BOTH TWINS, with two
+# synthetic trees A and B: cwd = B, gate command = `ctest --test-dir A/build/x`.
+#   . edit an input root in B (a tree the run never reads) -> exit 3 on BOTH
+#     twins, naming a file the run could not have seen: a LOUD FALSE REFUSAL
+#     that spends a quarter-hour gate. A sibling lane hit this shape in the field.
+#   . edit an input root in A (the tree whose build directory the command names,
+#     and whose config its tests read) -> exit 0 on BOTH twins, footer
+#     `inputs  : held still`. => THE SILENT WRONG ANSWER, and the one sentence
+#     this block exists to be unable to say wrongly.
+#
+# ★★★ WHAT DECIDES NOW, FROM THE MECHANISM RATHER THAN A PREFERENCE: the source
+# tree CMake itself records as having configured the build directory this command
+# names. `<build>/CMakeCache.txt` carries `CMAKE_HOME_DIRECTORY:INTERNAL=<dir>`,
+# and the tests registered in that build tree read `src/dss-config`,
+# `tests/corpus` and `examples` from THERE at test time.
+#
+# +AND THE BUILD SYSTEM SAYS IT IN SO MANY WORDS, which is why this is the
+# MECHANISM and not an inference. `CMakeLists.txt` gives 35 registered tests
+# `WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"`, and `tests/CMakeLists.txt` bakes
+# `DSS_TEST_REPO_ROOT="${CMAKE_SOURCE_DIR}"` into every test binary -- what
+# `tests/test_support/repo_root.hpp`'s `bakedRepoRoot()` returns and what every
+# helper there resolves the three roots against. `CMAKE_SOURCE_DIR` is EXACTLY
+# the value CMake writes to the cache as `CMAKE_HOME_DIRECTORY`.
+#
+# ! WHAT THIS STILL DOES NOT REACH, stated rather than left to be discovered:
+# `$DSS_CONFIG_ROOT`. The compiler's own walk composes `<that>/src/dss-config`
+# (`src/core/types/config_path_walk.cpp`, `repoShapedConfigRoot`), so a gate run
+# with that variable pointing OUTSIDE the tree named here reads a config tree
+# this scan never walks. NOT guessed at, deliberately -- the compiler and
+# `repo_root.hpp` document precedences that do not obviously agree about whether
+# the variable names a tree root or the config directory itself, and a rule
+# built on the wrong one would watch a directory that does not exist, which
+# contributes nothing and restores the very `held still` this block exists to
+# prevent. +MEASURED: the one shipped caller that sets it,
+# `scripts/profile-compile/profile-compile.sh`, sets it to the repository it is
+# already standing in, so nothing is relocated today.
+#
+# ! THREE OTHER CANDIDATES WERE MEASURED AND ALL THREE ARE WRONG -- the twin
+#   carries the full argument; the short form is: the repository root containing
+#   the build tree is refuted by `build/rvff` in this very repository, which sits
+#   in the main checkout and names a WORKTREE as its home directory; this
+#   wrapper's own location is refuted by its fixture, which drives the
+#   repository's copy over a synthetic sandbox; and the cwd is refuted by the
+#   measurement above, in both directions.
+#
+# (i) THE CWD REMAINS THE FALLBACK and is now STATED rather than assumed: a gate
+#   command need not name a build directory (`remote-leg` hands this wrapper a
+#   `bash`), and a named directory need not be a CMake build tree. In both cases
+#   there is no evidence about which tree the command reads, so the wrapper says
+#   which rule decided, on every run, in the log.
+# (i) NOT AN ESCAPE HATCH: nothing here is settable by a caller.
+$script:RunGateInputRootNames = @('src/dss-config', 'tests/corpus', 'examples')
+$script:RunGateSourceTree     = ''
+$script:RunGateSourceTreeWhy  = ''
+$script:RunGateSourceTreeMiss = ''
+
+# CMake's own record of which tree configured this build tree, or $null -- and
+# when $null, WHY, in $script:RunGateSourceTreeMiss.
+# ★★ THE FOUR MISSES ARE NOT ONE MISS, and collapsing them into "not a CMake
+# build tree" is the shape of message this pair keeps refusing: a sentence that
+# outruns its evidence. +MEASURED while building this -- a CMakeCache whose
+# recorded home directory THIS SHELL CANNOT SEE is a real, reachable state (an
+# MSYS-spelled `/c/...` is invisible to PowerShell and a `C:/...` is invisible to
+# a WSL bash), and it is emphatically NOT "there is no cache".
+function Get-RunGateSourceTreeOfBuildDir([string]$buildDir) {
+    $script:RunGateSourceTreeMiss = ''
+    if (-not $buildDir) {
+        $script:RunGateSourceTreeMiss = 'this command names no build directory, so there is nothing to ask'
+        return $null
+    }
+    $cache = "$buildDir/CMakeCache.txt"
+    if (-not (Test-Path -LiteralPath $cache -PathType Leaf)) {
+        $script:RunGateSourceTreeMiss = 'the build directory it names has no CMakeCache.txt, so nothing on disk records which tree configured it'
+        return $null
+    }
+    $hit = Select-String -LiteralPath $cache -Pattern '^CMAKE_HOME_DIRECTORY:INTERNAL=' -List -ErrorAction SilentlyContinue
+    $homeDir = ''
+    if ($hit) { $homeDir = $hit.Line.Substring('CMAKE_HOME_DIRECTORY:INTERNAL='.Length).Trim() }
+    if (-not $homeDir) {
+        $script:RunGateSourceTreeMiss = 'its CMakeCache.txt carries no CMAKE_HOME_DIRECTORY entry'
+        return $null
+    }
+    if (-not (Test-Path -LiteralPath $homeDir -PathType Container)) {
+        $script:RunGateSourceTreeMiss = "its CMakeCache.txt names '$homeDir' as CMAKE_HOME_DIRECTORY and THIS SHELL ($(Get-RunGateShellIdentity)) CANNOT SEE THAT DIRECTORY - a DOS-drive path is invisible to a WSL bash and an MSYS '/c/...' path is invisible to PowerShell, so check which shell you handed this gate to"
+        return $null
+    }
+    return (Get-RunGateTidyDir $homeDir)
+}
+
+function Set-RunGateInputRoots {
+    $fromBuild = Get-RunGateSourceTreeOfBuildDir $script:RunGateAbsBuildDir
+    if ($fromBuild) {
+        $script:RunGateSourceTree    = $fromBuild
+        $script:RunGateSourceTreeWhy = "CMAKE_HOME_DIRECTORY recorded in $($script:RunGateAbsBuildDir)/CMakeCache.txt - the tree this command's build directory was configured from"
+        return
+    }
+    $script:RunGateSourceTree    = Get-RunGateAbsDir '.'
+    $script:RunGateSourceTreeWhy = "this shell's working directory - $($script:RunGateSourceTreeMiss)"
+}
+
+# The three roots as ABSOLUTE paths. (i) Used by BOTH the scan and the footer on
+# purpose: a footer naming roots the scan did not walk is the class of lie this
+# whole block is about.
+function Get-RunGateAbsInputRoots {
+    return @($script:RunGateInputRootNames | ForEach-Object { "$($script:RunGateSourceTree)/$_" })
+}
+
+# ======== THE LOG PATH IS ONE LIVE RUN'S ALONE ================================
+# Twin of the block of the same name in run-gate.sh, which carries the measurements and
+# the argument; not repeated here, so the two cannot drift into describing it
+# differently. In short: before it truncates anything, this run takes
+# `<log>.run-gate-owner` by EXCLUSIVE CREATE, and refuses with exit 5 while another LIVE
+# run-gate -- of EITHER twin -- holds it. The record format, the liveness rule (the
+# process table's pid and creation key, in the same pid namespace), the hard-link
+# reclaim, and the refusals for a record that cannot be judged are the twin's, spelled in
+# this shell's idioms and nothing more.
+# D-SCRIPT-WSL-LEG-AND-RUN-GATE-LET-CONCURRENT-LEGS-SHARE-ONE-LOG-PATH
+$script:RunGateLogHeldExit     = 5
+$script:RunGateOwner           = "$LogPath.run-gate-owner"
+$script:RunGateOwnerFull       = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($script:RunGateOwner)
+$script:RunGateOwnerPrefix     = (Split-Path -Leaf $LogPath) + '.run-gate-'
+$script:RunGateOwnerToken      = ''
+$script:RunGateOwnerHeld       = $false
+$script:RunGateOwnerReclaimed  = ''
+$script:RunGateOwnerVerdict    = ''
+$script:RunGateOwnerWhy        = ''
+$script:RunGateOwnerHolder     = ''
+$script:RunGateOwnerStaleToken = ''
+$script:RunGateNamespace       = ''
+$script:RunGateSelfCreated     = ''
+
+# THIS SHELL'S PID NAMESPACE, spelled exactly as run_gate_namespace spells it: the OS
+# family, the host name lowercased, and on Linux the pid namespace's own inode.
+function Get-RunGateNamespace {
+    if (Test-RunGateIsWindows) {
+        $h = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { [Environment]::MachineName }
+        return 'windows:' + $h.ToLowerInvariant() + ':'
+    }
+    $k = ''; $h = ''; $n = ''
+    try { $k = [string](& uname -s 2>$null) } catch { $k = '' }
+    try { $h = [string](& uname -n 2>$null) } catch { $h = '' }
+    if ($k -eq 'Linux') {
+        $k = 'linux'
+        try { $n = [string](& readlink /proc/self/ns/pid 2>$null) } catch { $n = '' }
+    } elseif ($k -eq 'Darwin') {
+        $k = 'darwin'
+    } else {
+        $k = $k.ToLowerInvariant()
+    }
+    return $k + ':' + $h.ToLowerInvariant() + ':' + $n
+}
+
+function Get-RunGateOwnerField([string]$Path, [string]$Key) {
+    try {
+        foreach ($l in [IO.File]::ReadAllLines($Path)) {
+            if ($l.StartsWith("$Key=")) { return $l.Substring($Key.Length + 1).TrimEnd("`r") }
+        }
+    } catch { }
+    return ''
+}
+
+# Sets RunGateOwnerVerdict to held | unknown | stale, with RunGateOwnerWhy and
+# RunGateOwnerHolder for the message. Only `stale` may lead to a reclaim.
+function Test-RunGateOwnerRecord {
+    $script:RunGateOwnerVerdict    = 'held'
+    $script:RunGateOwnerStaleToken = ''
+    $ot = Get-RunGateOwnerField $script:RunGateOwnerFull 'token'
+    $op = Get-RunGateOwnerField $script:RunGateOwnerFull 'pid'
+    $oc = Get-RunGateOwnerField $script:RunGateOwnerFull 'created'
+    $on = Get-RunGateOwnerField $script:RunGateOwnerFull 'namespace'
+    $opShown = if ($op) { $op } else { '?' }
+    $script:RunGateOwnerHolder = "pid $opShown ($(Get-RunGateOwnerField $script:RunGateOwnerFull 'shell')), running: $(Get-RunGateOwnerField $script:RunGateOwnerFull 'command')"
+    if ($ot -notmatch '^[A-Za-z0-9-]+$') {
+        $script:RunGateOwnerWhy = 'its owner record is empty, half-written or unreadable -- another run-gate may be writing it this instant, or one died while writing it'
+        return
+    }
+    if ($op -notmatch '^[0-9]+$') {
+        $script:RunGateOwnerWhy = 'its owner record names no usable pid'
+        return
+    }
+    if ($on -ne $script:RunGateNamespace) {
+        $script:RunGateOwnerVerdict = 'unknown'
+        $script:RunGateOwnerWhy = "the record was written in pid namespace '$on' and this shell runs in '$($script:RunGateNamespace)', whose process table cannot see that holder"
+        return
+    }
+    $table = @(Get-RunGateProcessTable)
+    if ($table.Count -eq 0) {
+        $script:RunGateOwnerVerdict = 'unknown'
+        $script:RunGateOwnerWhy = 'no process table could be read on this host, so the holder could not be shown to be gone'
+        return
+    }
+    $pidValue = [long]$op
+    $row = $table | Where-Object { [long]$_.ProcId -eq $pidValue } | Select-Object -First 1
+    if (-not $row) {
+        $script:RunGateOwnerVerdict = 'stale'
+        $script:RunGateOwnerWhy = "pid $op is not alive"
+    } elseif ($pidValue -eq [long]$PID) {
+        $script:RunGateOwnerVerdict = 'stale'
+        $script:RunGateOwnerWhy = "pid $op is THIS run, so the holder it named is gone and its pid was reused"
+    } elseif ($oc -match '^[0-9]{20}$' -and ([string]$row.Created) -match '^[0-9]{20}$' -and $oc -ne [string]$row.Created) {
+        $script:RunGateOwnerVerdict = 'stale'
+        $script:RunGateOwnerWhy = "pid $op is alive but was created at $($row.Created), not at $oc -- a RECYCLED pid, not the holder"
+    } else {
+        $createdNote = if ($row.Created) { " (created $($row.Created))" } else { '' }
+        $script:RunGateOwnerWhy = "pid $op is alive$createdNote"
+        return
+    }
+    $script:RunGateOwnerStaleToken = $ot
+}
+
+# $true when the record judged stale is gone; $false when a sibling moved first, the
+# record was replaced in between, or no hard link could be made beside the log.
+function Invoke-RunGateOwnerReclaim {
+    $tomb = "$LogPath.run-gate-stale-$($script:RunGateOwnerStaleToken)"
+    $tombFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($tomb)
+    try {
+        New-Item -ItemType HardLink -Path $tombFull -Target $script:RunGateOwnerFull -ErrorAction Stop | Out-Null
+    } catch {
+        return $false
+    }
+    if ((Get-RunGateOwnerField $tombFull 'token') -ne $script:RunGateOwnerStaleToken) {
+        Remove-Item -LiteralPath $tombFull -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    Remove-Item -LiteralPath $script:RunGateOwnerFull -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $tombFull -Force -ErrorAction SilentlyContinue
+    return $true
+}
+
+# 0 the record is this run's | 5 another live run-gate holds the path | 2 not creatable
+function Enter-RunGateLogPath {
+    $script:RunGateOwnerToken = "$PID-$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())-$([guid]::NewGuid().ToString('N').Substring(0, 10))"
+    $commandText = ("$Command $($CommandArgs -join ' ')") -replace "[`r`n]", ' '
+    $body = "run-gate-owner-record: while this file exists a LIVE run-gate holds the log path beside it`n" +
+            "token=$($script:RunGateOwnerToken)`n" +
+            "pid=$PID`n" +
+            "created=$($script:RunGateSelfCreated)`n" +
+            "namespace=$($script:RunGateNamespace)`n" +
+            "shell=run-gate.ps1`n" +
+            "command=$commandText`n"
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($body)
+    $reclaimFailed = $false
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        $created = $false
+        # FileMode.CreateNew is an EXCLUSIVE create (CREATE_NEW / O_EXCL), so of two runs
+        # racing for a free path exactly one wins -- the twin's `set -C`.
+        try {
+            $fs = [IO.File]::Open($script:RunGateOwnerFull, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+            try { $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Close() }
+            $created = $true
+        } catch {
+            $created = $false
+        }
+        if ($created) {
+            $script:RunGateOwnerHeld = $true
+            return 0
+        }
+        if (-not (Test-Path -LiteralPath $script:RunGateOwnerFull)) { continue }
+        Test-RunGateOwnerRecord
+        if ($script:RunGateOwnerVerdict -ne 'stale') { return 5 }
+        if (Invoke-RunGateOwnerReclaim) {
+            $script:RunGateOwnerReclaimed = "$($script:RunGateOwnerHolder) -- $($script:RunGateOwnerWhy)"
+        } else {
+            $reclaimFailed = $true
+        }
+    }
+    if (-not (Test-Path -LiteralPath $script:RunGateOwnerFull)) { return 2 }
+    if ($reclaimFailed) {
+        $script:RunGateOwnerWhy += '; and the stale record could not be reclaimed (no hard link could be made beside the log, or a sibling kept replacing it)'
+    }
+    return 5
+}
+
+# Runs from the `finally` at the end of this file. Removes the record only while it is
+# still this run's.
+function Remove-RunGateOwnerRecord {
+    if (-not $script:RunGateOwnerHeld) { return }
+    if ((Get-RunGateOwnerField $script:RunGateOwnerFull 'token') -eq $script:RunGateOwnerToken) {
+        Remove-Item -LiteralPath $script:RunGateOwnerFull -Force -ErrorAction SilentlyContinue
+    }
+    $script:RunGateOwnerHeld = $false
+}
+
+function Show-RunGateLogHeldRefusal {
+    Write-Host "run-gate.ps1: FAIL - ANOTHER LIVE RUN-GATE HOLDS THIS LOG PATH, so nothing was run and its log was not touched (rc=$($script:RunGateLogHeldExit))."
+    Write-Host "  log     : $LogPath"
+    Write-Host "  record  : $($script:RunGateOwner)"
+    Write-Host "  holder  : $($script:RunGateOwnerHolder)"
+    Write-Host "  judged  : $($script:RunGateOwnerWhy)"
+    Write-Host "  [!] This is NOT 'the gate failed'. Two runs on one log path truncate and interleave each"
+    Write-Host "      other's output and delete each other's fingerprints, and a witness grep can then find"
+    Write-Host "      the OTHER run's success line. +MEASURED: a leg reported OK over a log that named"
+    Write-Host "      another clone's build directory."
+    Write-Host "  Give this gate its own log path, or wait for that run to finish. If you are CERTAIN"
+    Write-Host "    nothing uses this path (for instance the holder ran in another OS namespace and is"
+    Write-Host "    gone), delete the record by hand: $($script:RunGateOwner)"
+}
+
+# ---- PRE-RUN: refuse a contended build directory BEFORE anything starts -----
+# ! Placed AHEAD of the input marker deliberately, so a refusal here leaves no
+#   marker file behind for the next run to trip over.
+$__rawBuildDir = @(Get-RunGateDirsInTokens $Command $CommandArgs) | Select-Object -First 1
+if ($__rawBuildDir) {
+    # TWO SPELLINGS OF ONE DIRECTORY, each with exactly one caller, like the twin:
+    # the case-folded one is only ever COMPARED against another process's
+    # spelling; the plain one is what gets NAMED in a message and what
+    # CMakeCache.txt is read beside.
+    $script:RunGateAbsBuildDir = Get-RunGateAbsDir $__rawBuildDir
+    $script:RunGateBuildDir    = Get-RunGateNormDir $script:RunGateAbsBuildDir
+}
+Set-RunGateInputRoots
+Save-RunGateContentionSample 'before'
+
+# ======== THE LOG PATH IS TAKEN BEFORE ONE BYTE OF IT IS TOUCHED ============
+# After the pre-run sample, so the record carries this run's creation key from the
+# table that sample just read; before the truncate, so a refused run erases nothing.
+# D-SCRIPT-WSL-LEG-AND-RUN-GATE-LET-CONCURRENT-LEGS-SHARE-ONE-LOG-PATH
+$script:RunGateNamespace = Get-RunGateNamespace
+$__acquired = Enter-RunGateLogPath
+if ($__acquired -eq 5) {
+    Show-RunGateLogHeldRefusal
+    Restore-CplDefault
+    exit $script:RunGateLogHeldExit
+}
+if ($__acquired -ne 0) {
+    Show-RunGateLogPathRefusal "the log's owner record '$($script:RunGateOwner)'" ''
+    Restore-CplDefault
+    exit 2
+}
+# ======== FROM HERE TO THE END OF THIS FILE, THIS RUN HOLDS THE LOG PATH =========
+# The matching `finally` is the LAST statement of this file, so every exit below -- a
+# refusal, a verdict, a terminating error -- releases the owner record through it.
+# (+MEASURED 2026-09-15, pwsh 7.6.6 and PowerShell 5.1: a try/finally around a
+# top-level `exit` runs its finally.) The body is deliberately NOT re-indented, so this
+# change does not rewrite every line below it.
+try {
+
+# Truncate now that the path is this run's alone (see LogPath above).
+try {
+    Set-Content -LiteralPath $LogPath -Value $null -NoNewline -ErrorAction Stop
+} catch {
+    Show-RunGateLogPathRefusal "the log '$LogPath'" $_.Exception.Message
+    Restore-CplDefault
+    exit 2
+}
+
+# RESOLVE argv[0] BEFORE RUNNING IT -- see Resolve-RunGateCommandOrRefuse.
+$resolved = Resolve-RunGateCommandOrRefuse
+
+if ($script:RunGateContenders.Count -gt 0) {
+    Add-Content -LiteralPath $LogPath -Value @"
+--- run-gate.ps1 ---
+command : $Command $($CommandArgs -join ' ')
+builddir: $($script:RunGateBuildDir)
+contended: YES, BEFORE THE RUN - nothing was executed
+"@
+    foreach ($l in $script:RunGateContenders) { Add-Content -LiteralPath $LogPath -Value $l }
+    Show-RunGateContentionRefusal "BEFORE the run started, so nothing was executed"
+    Restore-CplDefault
+    exit $script:RunGateContentionExit
+}
+
+$script:RunGateMarker = "$LogPath.inputs-marker"
+try {
+    New-Item -ItemType File -Path $script:RunGateMarker -Force -ErrorAction Stop | Out-Null
+} catch {
+    Write-Host "run-gate.ps1: FAIL - cannot create the input marker '$($script:RunGateMarker)', so the run"
+    Write-Host "  could not be proved to have measured a still tree. Nothing was run."
+    Write-Host "  This refusal is about the MARKER PATH, which sits beside the log path you gave."
+    Write-Host "  shell   : $(Get-RunGateShellIdentity)"
+    Restore-CplDefault
+    exit 2
+}
+$script:RunGateMarkerTime = (Get-Item -LiteralPath $script:RunGateMarker -Force).LastWriteTimeUtc
+$script:RunGateInputsBefore = "$LogPath.inputs-before"
+$script:RunGateInputsAfter  = "$LogPath.inputs-after"
+# ⚠ THE WRAPPER MUST NOT MEASURE ITS OWN BOOKKEEPING — the twin's note applies
+# verbatim: all three files sit beside the CALLER'S log path, nothing stops that
+# path being inside a watched root, and `.inputs-before` exists only in the AFTER
+# snapshot, so an unexcluded run would refuse ITSELF.
+$script:RunGateBookkeepingPrefix = (Split-Path -Leaf $LogPath) + '.inputs-'
+
+# ⚠⚠⚠ WHY THIS IS A BEFORE/AFTER FINGERPRINT AND NOT `LastWriteTimeUtc -gt`.
+# ✔MEASURED 2026-09-09 (P66) on WSL x86_64: CLOCK_REALTIME there steps FORWARD by
+# +24.69 s for ~200 ms out of every ~5 s (4.8% duty cycle) and the excursion
+# REACHES INODE MTIMES — 12 of 60 marker/probe pairs had the probe, created one
+# second AFTER the marker, carrying an mtime 23.70 s EARLIER. Ordering two clock
+# readings taken seconds apart is therefore not sound on a carriage this project
+# gates on, and BOTH twins were shown to fail under one identical mutation (a
+# marker stamped +25 s): `find -newer` returned nothing, and this twin's
+# `LastWriteTimeUtc -gt $markerTime` returned nothing, from the same two inodes.
+# ⇒ this is a SHARED defect in one algorithm, not a divergence between the twins,
+# and it is fixed on both sides in one commit. The full measurement, the duty
+# cycle, and why EQUALITY of a fingerprint with itself is immune to it are in the
+# `.sh` twin's "THE RUN'S INPUTS MUST HOLD STILL" block; not repeated here so the
+# two cannot drift into describing it differently.
+# ⓘ SHA256 rather than MD5: `Get-FileHash -Algorithm MD5` throws under a FIPS
+#   policy, and only self-consistency between two snapshots in one run is
+#   load-bearing, so the stronger algorithm costs nothing worth having.
+#   ✔MEASURED 317 ms over the 1749 files of `examples/`.
+# ======== A FILE CHANGED AND PUT BACK MID-RUN IS STILL A MOVED TREE ==========
+# Twin of the block of the same name in run-gate.sh, which carries the measurement
+# (a `cp -p`, a Copy-Item and a `touch -r` restore all read `held still` on BOTH twins
+# while a reader saw the changed bytes) and the argument. In short: a third half, `U`,
+# compares by EQUALITY a value the file system advances on every change and user space
+# cannot set back -- the NTFS USN on Windows (ChangeTime is NOT it: +MEASURED, Copy-Item
+# puts it back), the status-change time on POSIX, read by the twin's own perl program.
+# A host that cannot read it still gets C and N, and the `changes :` line says so.
+# D-SCRIPT-RUN-GATE-INPUTS-HELD-STILL-OVER-A-FILE-CHANGED-AND-RESTORED-MID-RUN
+$script:RunGateChangeWitness = 'none'
+$script:RunGateChangeWhy     = ''
+$script:RunGateChangeState   = 'unavailable'
+# THE SAME TEXT AS run_gate_ctime_walker in run-gate.sh, which explains why it carries no
+# quote characters.
+$script:RunGateCtimeWalker = @'
+use strict; use File::Find (); use Time::HiRes ();
+my @pre; while (@ARGV && $ARGV[0] ne q{--}) { push @pre, shift @ARGV } shift @ARGV;
+my $n = 0;
+for my $root (@ARGV) {
+    next unless -d $root;
+    File::Find::find({ no_chdir => 1, wanted => sub {
+        my $p = $File::Find::name;
+        return unless -f $p && ! -l $p;
+        (my $b = $p) =~ s{.*/}{};
+        for my $x (@pre) { return if index($b, $x) == 0 }
+        my @s = Time::HiRes::stat($p);
+        return unless @s;
+        print qq{U $s[10] $p\n}; $n++;
+    } }, $root);
+}
+print qq{CTIME-OK $n\n};
+'@
+
+# Decides, once and after the marker exists, which witness this host can read.
+function Initialize-RunGateChangeWitness {
+    $script:RunGateChangeWitness = 'none'
+    $markerFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($script:RunGateMarker)
+    if (Test-RunGateIsWindows) {
+        try {
+            if (-not ('RunGate.FileUsn' -as [type])) {
+                Add-Type -ErrorAction Stop -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+namespace RunGate {
+    public static class FileUsn {
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool DeviceIoControl(SafeFileHandle h, uint code, IntPtr inBuf, uint inSize, byte[] outBuf, uint outSize, out uint returned, IntPtr overlapped);
+        public static string Of(string path) {
+            using (SafeFileHandle h = CreateFileW(path, 0x80, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+                if (h.IsInvalid) { return "unreadable"; }
+                byte[] buf = new byte[1024]; uint got;
+                if (!DeviceIoControl(h, 0x000900eb, IntPtr.Zero, 0, buf, (uint)buf.Length, out got, IntPtr.Zero)) { return "unreadable"; }
+                ushort major = BitConverter.ToUInt16(buf, 4);
+                return (major >= 3 ? BitConverter.ToInt64(buf, 40) : BitConverter.ToInt64(buf, 24)).ToString();
+            }
+        }
+    }
+}
+"@
+            }
+        } catch {
+            $script:RunGateChangeWhy = "the NTFS USN reader could not be loaded ($($_.Exception.Message -replace "[`r`n]", ' '))"
+            return
+        }
+        $m = [RunGate.FileUsn]::Of($markerFull)
+        if ($m -notmatch '^[0-9]+$' -or $m -eq '0') {
+            $script:RunGateChangeWhy = "the log's own volume returned no USN for this run's marker (no change journal?)"
+            return
+        }
+        $script:RunGateChangeWitness = 'usn'
+    } else {
+        $ok = ''
+        try { $ok = [string](& perl -MTime::HiRes -e 'my @s = Time::HiRes::stat($ARGV[0]); print((@s && $s[10] > 0) ? q{ok} : q{no})' $markerFull 2>$null) } catch { $ok = '' }
+        if ($ok -ne 'ok') {
+            $script:RunGateChangeWhy = 'perl with Time::HiRes did not return a status-change time for a file this run had just created'
+            return
+        }
+        $script:RunGateChangeWitness = 'ctime'
+    }
+}
+
+# Reads the two finished fingerprints and decides whether the U half may be believed.
+function Test-RunGateChangeWitness {
+    $script:RunGateChangeState = 'unavailable'
+    $b = @(Get-Content -LiteralPath $script:RunGateInputsBefore -ErrorAction SilentlyContinue)
+    $a = @(Get-Content -LiteralPath $script:RunGateInputsAfter -ErrorAction SilentlyContinue)
+    switch ($script:RunGateChangeWitness) {
+        'ctime' {
+            if (@($b -like 'CTIME-OK *').Count -gt 0 -and @($a -like 'CTIME-OK *').Count -gt 0) {
+                $script:RunGateChangeState = 'watched'
+            } else {
+                $script:RunGateChangeWhy = 'the perl ctime walk did not complete in both snapshots'
+            }
+        }
+        'usn' {
+            $z1 = ([string](@($b -like 'USN-ZERO *') | Select-Object -First 1)) -replace '^USN-ZERO ', ''
+            $z2 = ([string](@($a -like 'USN-ZERO *') | Select-Object -First 1)) -replace '^USN-ZERO ', ''
+            if (-not ($b -contains 'USN-OK') -or -not ($a -contains 'USN-OK')) {
+                $script:RunGateChangeWhy = 'the USN reader did not complete in both snapshots'
+            } elseif ($z1 -ne '0' -or $z2 -ne '0') {
+                $script:RunGateChangeWhy = "$z1 file(s) under the watched roots report USN 0, i.e. their volume keeps no change journal"
+            } else {
+                $script:RunGateChangeState = 'watched'
+            }
+        }
+    }
+}
+
+function Get-RunGateInputFingerprint {
+    $lines = New-Object System.Collections.Generic.List[string]
+    $zero = 0
+    foreach ($root in (Get-RunGateAbsInputRoots)) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        foreach ($f in (Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+            # This run's bookkeeping -- the fingerprints AND the log path's owner record.
+            if ($f.Name.StartsWith($script:RunGateBookkeepingPrefix) -or $f.Name.StartsWith($script:RunGateOwnerPrefix)) { continue }
+            $h = Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256 -ErrorAction SilentlyContinue
+            if ($null -ne $h) { $lines.Add("C $($h.Hash) $($f.Length) $($f.FullName)") }
+            # The stamp-order half, differenced against its own pre-run reading:
+            # a file that ALREADY carried a future stamp when the run started is
+            # in both snapshots and cancels, instead of refusing a run it never
+            # touched. See the twin for the measurement that made that real.
+            if ($f.LastWriteTimeUtc -gt $script:RunGateMarkerTime) { $lines.Add("N $($f.FullName)") }
+            if ($script:RunGateChangeWitness -eq 'usn') {
+                $u = [RunGate.FileUsn]::Of($f.FullName)
+                if ($u -eq '0') { $zero++ }
+                $lines.Add("U $u $($f.FullName)")
+            }
+        }
+    }
+    if ($script:RunGateChangeWitness -eq 'usn') {
+        $lines.Add("USN-ZERO $zero")
+        $lines.Add('USN-OK')
+    }
+    if ($script:RunGateChangeWitness -eq 'ctime') {
+        $roots = @(Get-RunGateAbsInputRoots)
+        foreach ($l in @(& perl -e $script:RunGateCtimeWalker $script:RunGateBookkeepingPrefix $script:RunGateOwnerPrefix -- @roots 2>$null)) {
+            $lines.Add([string]$l)
+        }
+    }
+    return @($lines | Sort-Object)
+}
+
+# ★ PROBED BY EXECUTION WITH A KNOWN ANSWER, like the twin's `cksum` probe: the
+# empty marker's SHA256 is a constant, so a hashing path that silently produced
+# nothing would refuse this run rather than emptying every snapshot and passing
+# everything while appearing to run.
+function Test-RunGateHashWorks {
+    $h = Get-FileHash -LiteralPath $script:RunGateMarker -Algorithm SHA256 -ErrorAction SilentlyContinue
+    return ($null -ne $h -and $h.Hash -eq 'E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855')
+}
+
+# ⚠⚠ `-Force` IS LOAD-BEARING, AND WITHOUT IT THIS TWIN IS BLIND OFF WINDOWS.
+# `Get-ChildItem -Recurse` omits HIDDEN entries, and on Linux and macOS "hidden"
+# means A LEADING DOT -- so every dot-file under the three input roots was
+# invisible here while `find -type f -newer` in the .sh twin saw it. That is the
+# worst possible direction for this particular check: the wrapper printed
+# `inputs  : held still` over a tree that HAD moved, which is the one sentence it
+# exists to be unable to say wrongly.
+# ✔MEASURED 2026-09-08 on WSL x86_64 (pwsh 7.5.4): `Get-ChildItem -Recurse -File`
+# under a directory holding `.dotfile` and `plain.txt` returned only `plain.txt`;
+# with `-Force` it returned both. The fixture's own probe file is a dot-file, so
+# arm `5-ps1-moved` of `scripts/run-gate/test-run-gate.sh` returned 0 instead of 3
+# and arm `6-parity` reported `.sh=3 vs .ps1=0`.
+# ⚠ IT WAS INVISIBLE ON WINDOWS FOR TWO COMPOUNDING REASONS: NTFS does not treat a
+# leading dot as hidden, so the same file was returned there without `-Force`; and
+# the fixture drove the .ps1 arms with a literal `powershell`, so they had never
+# run on a host where the difference exists. `-Force` also picks up genuinely
+# hidden-attributed files on Windows, which is what the .sh twin already did.
+# (i) A root that does not exist contributes nothing, so a lane worktree carrying
+#   a subset of the tree, or a synthetic self-test root, is not penalised for it.
+#   The roots are ABSOLUTE (see "AND THE ROOTS ARE THE GATE COMMAND'S TREE"
+#   above), so this walks the tree the gate command reads and not this shell's.
+# ⚠⚠ "I COULD NOT MEASURE" MUST NOT BE SPELLED `held still`, so taking the after
+# snapshot is the CALLER's job and its failure is a REFUSAL, not an empty list.
+# An empty return from here is indistinguishable from "nothing moved", which is
+# the fails-toward-clean answer this whole block exists to be unable to give —
+# and the scan this replaced had exactly that shape. The twin says the same in
+# its `run_gate_diff_inputs` note; both decide it in the outer flow instead.
+function Get-RunGateMovedInputs {
+    $after  = @(Get-Content -LiteralPath $script:RunGateInputsAfter -ErrorAction SilentlyContinue |
+                Where-Object { $_ -ne '' })
+    $before = @(Get-Content -LiteralPath $script:RunGateInputsBefore -ErrorAction SilentlyContinue |
+                Where-Object { $_ -ne '' })
+    $moved = @()
+    foreach ($line in (Compare-Object -ReferenceObject $before -DifferenceObject $after)) {
+        $l = $line.InputObject
+        if     ($l -match '^C \S+ \d+ (.+)$') { $moved += $Matches[1] }
+        elseif ($l -match '^N (.+)$')         { $moved += $Matches[1] }
+        # The change witness, believed only when Test-RunGateChangeWitness said so; the
+        # readers' sentinel lines (`USN-*`, `CTIME-OK`) match none of the three halves.
+        elseif ($script:RunGateChangeState -eq 'watched' -and $l -match '^U \S+ (.+)$') { $moved += $Matches[1] }
+    }
+    # Same cap as the .sh twin: the refusal names the class, it is not a manifest.
+    return @($moved | Sort-Object -Unique | Select-Object -First 20)
+}
+
+# ⚠ THREE REFUSALS, NOT ONE, like the twin: a wrapper that cannot fingerprint the
+# tree cannot vouch for its stillness, and the honest answer is to run NOTHING.
+if (-not (Test-RunGateHashWorks)) {
+    Write-Host "run-gate.ps1: FAIL - Get-FileHash did not return the known SHA256 of an empty file on"
+    Write-Host "  this host, so the input fingerprint this wrapper compares before and after the run"
+    Write-Host "  cannot be taken. Nothing was run."
+    Write-Host "  This refusal is deliberate rather than a skip: an empty fingerprint would make every"
+    Write-Host "    diff empty, and this check would pass everything while appearing to run."
+    Write-Host "  shell   : $(Get-RunGateShellIdentity)"
+    Remove-Item -LiteralPath $script:RunGateMarker -Force -ErrorAction SilentlyContinue
+    Restore-CplDefault
+    exit 2
+}
+# Which change witness this host can read -- see "A FILE CHANGED AND PUT BACK MID-RUN IS
+# STILL A MOVED TREE". Decided once, before the first fingerprint, so both carry the
+# same halves.
+Initialize-RunGateChangeWitness
+try {
+    Set-Content -LiteralPath $script:RunGateInputsBefore -ErrorAction Stop `
+        -Value ((Get-RunGateInputFingerprint) -join [Environment]::NewLine)
+} catch {
+    Write-Host "run-gate.ps1: FAIL - cannot record the pre-run input fingerprint at"
+    Write-Host "  '$($script:RunGateInputsBefore)', so the run could not be proved to have measured a"
+    Write-Host "  still tree. Nothing was run."
+    Write-Host "  This refusal is about that PATH, which sits beside the log path you gave."
+    Write-Host "  shell   : $(Get-RunGateShellIdentity)"
+    Remove-Item -LiteralPath $script:RunGateMarker -Force -ErrorAction SilentlyContinue
+    Restore-CplDefault
+    exit 2
+}
+
 # Redirect ALL streams to the log with `*>` so the native command stays last
 # and $LASTEXITCODE is its own, not a pipeline's.
 try {
@@ -366,11 +1546,200 @@ if ($null -eq $rc) {
     $rc = 0
 }
 
+# ★★★ THE WITNESS IS READ HERE, FROM THE COMMAND'S OWN OUTPUT, BEFORE THIS WRAPPER
+# WRITES ONE WORD INTO THE LOG - twin of the same block in run-gate.sh, which
+# carries the measurement: the footer records the command's argv, so a witness
+# searched for after it matched the wrapper's own sentence, and a command that
+# printed nothing was reported OK by both twins. Found and fixed in the lane that closed
+# D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY
+# (i) Only the RESULT is taken here; the refusal order below is unchanged.
+$witnessSeen = [bool](Select-String -LiteralPath $LogPath -Pattern $SuccessPattern -Quiet)
+
+$snapshotOk = $true
+if (-not (Test-Path -LiteralPath $script:RunGateInputsBefore)) {
+    $snapshotOk = $false
+} else {
+    try {
+        Set-Content -LiteralPath $script:RunGateInputsAfter -ErrorAction Stop `
+            -Value ((Get-RunGateInputFingerprint) -join [Environment]::NewLine)
+    } catch {
+        $snapshotOk = $false
+    }
+    if (-not (Test-Path -LiteralPath $script:RunGateInputsAfter)) { $snapshotOk = $false }
+}
+$movedInputs = @()
+if ($snapshotOk) {
+    # Before the diff reads it -- twin of the same ordering in run-gate.sh.
+    Test-RunGateChangeWitness
+    $movedInputs = Get-RunGateMovedInputs
+}
+Remove-Item -LiteralPath $script:RunGateMarker -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $script:RunGateInputsBefore -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $script:RunGateInputsAfter -Force -ErrorAction SilentlyContinue
+
+# ---- POST-RUN: a sibling can start MID-RUN, so the same question is asked again
+Save-RunGateContentionSample 'after'
+
 Add-Content -LiteralPath $LogPath -Value @"
 --- run-gate.ps1 ---
 command : $Command $($CommandArgs -join ' ')
 rc      : $rc
 "@
+if (-not $snapshotOk) {
+    Add-Content -LiteralPath $LogPath -Value "inputs  : NOT MEASURED - the post-run fingerprint could not be taken, so this verdict is not evidence"
+} elseif ($movedInputs.Count -gt 0) {
+    Add-Content -LiteralPath $LogPath -Value "inputs  : MOVED DURING THE RUN - this verdict is not evidence"
+    foreach ($m in $movedInputs) { Add-Content -LiteralPath $LogPath -Value "          $m" }
+} else {
+    Add-Content -LiteralPath $LogPath -Value "inputs  : held still"
+}
+# WHETHER `held still` COVERS THE MIDDLE OF THE RUN, ON EVERY RUN -- twin of the
+# `changes :` line in run-gate.sh, same two states, same words.
+if ($script:RunGateChangeState -eq 'watched') {
+    if ($script:RunGateChangeWitness -eq 'usn') {
+        Add-Content -LiteralPath $LogPath -Value "changes : watched through every file's NTFS USN - a change undone before the run ended is still seen"
+    } else {
+        Add-Content -LiteralPath $LogPath -Value "changes : watched through every file's status-change time (ctime) - a change undone before the run ended is still seen"
+    }
+} else {
+    $changeWhy = if ($script:RunGateChangeWhy) { $script:RunGateChangeWhy } else { 'no change witness was read' }
+    Add-Content -LiteralPath $LogPath -Value "changes : NOT WATCHED MID-RUN - $changeWhy; a file changed and restored during this run is not ruled out"
+}
+# ★★ THE FOOTER NAMES THE TREE IT WATCHED, ABSOLUTELY, ON EVERY RUN -- green,
+# refused, or failed. `held still` is a claim about a DIRECTORY, and a reader who
+# has to reconstruct the caller's working directory to learn which directory
+# cannot check the claim at all.
+Add-Content -LiteralPath $LogPath -Value "srctree : $($script:RunGateSourceTree)"
+Add-Content -LiteralPath $LogPath -Value "          decided by: $($script:RunGateSourceTreeWhy)"
+foreach ($r in (Get-RunGateAbsInputRoots)) { Add-Content -LiteralPath $LogPath -Value "watched : $r" }
+# THE LOG PATH'S OWNERSHIP, ON EVERY RUN THAT GOT THIS FAR -- twin of the `logpath :`
+# line in run-gate.sh.
+if ($script:RunGateOwnerReclaimed) {
+    Add-Content -LiteralPath $LogPath -Value "logpath : held by this run alone for its whole duration ($($script:RunGateOwner)) - it first RECLAIMED a stale record: $($script:RunGateOwnerReclaimed)"
+} else {
+    Add-Content -LiteralPath $LogPath -Value "logpath : held by this run alone for its whole duration ($($script:RunGateOwner))"
+}
+# HOW MANY OF THE RUN'S TWO SAMPLES ACTUALLY READ A PROCESS TABLE. Both lines
+# below are claims about a scan, and neither may assert more than the scans it
+# got - computed once so the two cannot answer differently.
+$samplesRead = [int]$script:RunGateTableOkBefore + [int]$script:RunGateTableOkAfter
+if (-not $script:RunGateBuildDir) {
+    Add-Content -LiteralPath $LogPath -Value "builddir: none named by this command - the contention check had no subject"
+} else {
+    Add-Content -LiteralPath $LogPath -Value "builddir: $($script:RunGateBuildDir)"
+    if ($script:RunGateContenders.Count -gt 0) {
+        Add-Content -LiteralPath $LogPath -Value "contended: YES, ANOTHER RUN WAS LIVE IN IT - this verdict is not evidence"
+        foreach ($l in $script:RunGateContenders) { Add-Content -LiteralPath $LogPath -Value $l }
+    } elseif ($samplesRead -eq 0) {
+        Add-Content -LiteralPath $LogPath -Value "contended: UNKNOWN - no process table could be read on this host (0 of this run's 2 samples), so nothing was ruled out"
+    } else {
+        # [!] THE WORDING IS NARROWED, AND THE OLD ONE WAS NOT WRONG - IT WAS
+        # OVER-READ, WHICH IS WORSE. It said "this run was alone in it", and
+        # "it" is the BUILD DIRECTORY, which was true of the run that took two
+        # false reds from a second compiler. A line that is true and invites the
+        # wrong conclusion costs more than one that is false, because nobody
+        # re-checks it.
+        #
+        # [!] AND IT COUNTS ITS SAMPLES FOR THE SAME REASON THE `compilers:`
+        # LINE BELOW DOES. This used to read the LAST scan's table flag alone,
+        # so a run whose pre-run scan could not look - the scan whose whole job
+        # is to refuse BEFORE anything executes - still printed a flat
+        # `contended: no`. That is this row's defect one line up.
+        # D-SCRIPT-RUN-GATE-COMPILERS-LINE-REPORTS-NONE-WHEN-IT-COULD-NOT-READ-THE-PROCESS-TABLE
+        if ($samplesRead -lt 2) {
+            Add-Content -LiteralPath $LogPath -Value "contended: no - no other build-tool run named THIS BUILD DIRECTORY ($($script:RunGateUnreadable) candidate process(es) had no readable command line and could not be judged), but only $samplesRead of this run's 2 samples could read a process table at all, so the other one ruled nothing out. [!] This says NOTHING about the rest of the machine; see 'compilers:' below."
+        } else {
+            Add-Content -LiteralPath $LogPath -Value "contended: no - no other build-tool run named THIS BUILD DIRECTORY ($($script:RunGateUnreadable) candidate process(es) had no readable command line and could not be judged). [!] This says NOTHING about the rest of the machine; see 'compilers:' below."
+        }
+    }
+}
+# ★★★ THE MACHINE-WIDE SUBJECT, ON EVERY RUN, GREEN OR NOT, AND WITH OR WITHOUT
+# A BUILD DIRECTORY.
+# D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT
+#
+# [!] IT REPORTS AND DOES NOT REFUSE, and that is a decision rather than
+# timidity. `exit 4` means THIS RUN HAS NO VERDICT, and a second compiler no
+# longer takes one away: the mechanism that made it do so - a store deleting a
+# cache entry it could not prove was dead - is gone in the same change that
+# added this line. What is left is real but weaker (CPU, a shared cache warmed
+# under us), and refusing on it would refuse EVERY gate of a project whose own
+# working rule is up to four lanes building in parallel - a refusal that fires
+# on every honest run, which is exactly as useless as an escape that does.
+#
+# ★★★ THREE STATES, AND THE THIRD IS NOT SPELLED AS A PASS. `none` and
+# `UNKNOWN` are different answers and the second is not an answer at all: a
+# reader skimming for `compilers: none` must MISS the blind case, and a reader
+# skimming for `compilers:` must land on something that says so. The sample
+# count is printed with every one of them, because "I looked twice" and "I
+# looked once and could not look the second time" are not the same evidence.
+$union = @(Get-RunGateForeignUnion)
+if ($samplesRead -eq 0) {
+    Add-Content -LiteralPath $LogPath -Value "compilers: UNKNOWN - NO PROCESS TABLE COULD BE READ on this host (0 of this run's 2 samples), so no other compiler was ruled out"
+} elseif ($union.Count -eq 0) {
+    if ($samplesRead -lt 2) {
+        Add-Content -LiteralPath $LogPath -Value "compilers: none outside this gate's own process tree - but only $samplesRead of this run's 2 samples could read a process table, so the other one ruled nothing out"
+    } else {
+        Add-Content -LiteralPath $LogPath -Value "compilers: none outside this gate's own process tree, in either of this run's 2 samples"
+    }
+} else {
+    Add-Content -LiteralPath $LogPath -Value "compilers: $($union.Count) '$($script:RunGateCompilerImage)' process(es) ran OUTSIDE this gate's process tree DURING this run - they share this user's compiler caches with this run, which are NOT under srctree or builddir"
+    foreach ($u in $union) {
+        Add-Content -LiteralPath $LogPath -Value "          pid $($u.ProcId)  $($u.Image)  seen $($u.When)"
+        Add-Content -LiteralPath $LogPath -Value "            $($u.CmdLine)"
+    }
+}
+# ★ A LINK THE RULE REFUSED IS NAMED - twin of the same line in run-gate.sh, for
+# its reason: refusing the link CHANGED a verdict, and without this line that
+# judgement is invisible to a reader lining up the pid columns by hand. Printed
+# only when a link was refused; an observation, never a refusal.
+# D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY
+$recycled = @(@($script:RunGateRecycledBefore) + @($script:RunGateRecycledAfter) | Where-Object { $_ } | Select-Object -Unique)
+if ($recycled.Count -gt 0) {
+    Add-Content -LiteralPath $LogPath -Value "ancestry: $($recycled.Count) parent link(s) NOT followed - each named a parent created AFTER its child, i.e. a RECYCLED pid, not an ancestor (child>parent): $(($recycled | Select-Object -First 8) -join ' ')"
+}
+
+# Checked BEFORE rc, and before the witness: a run whose inputs moved has no
+# verdict to report, and calling it a pass or a failure is the misattribution
+# this block exists to prevent. Exit 3 matches the .sh twin.
+# ⚠ "I could not measure" is checked FIRST OF ALL, for the reason the twin gives:
+# it is the one answer that must never be spelled `held still`.
+if (-not $snapshotOk) {
+    Write-Host "run-gate.ps1: FAIL - THE POST-RUN INPUT FINGERPRINT COULD NOT BE TAKEN, so this run"
+    Write-Host "  cannot be shown to have measured a still tree."
+    Write-Host "  (command exited $rc; that number is NOT being reported as a verdict)."
+    Write-Host "  The PRE-run fingerprint was taken successfully or this run would not have started,"
+    Write-Host "    so something removed or blocked '$($script:RunGateInputsBefore)' or"
+    Write-Host "    '$($script:RunGateInputsAfter)' while the command was running."
+    Write-Host "  Refusing is deliberate. Reading an unmeasurable tree as 'held still' is exactly"
+    Write-Host "    the fails-toward-clean answer this check exists to be unable to give."
+    Write-Host "  (log: $LogPath)"
+    exit 3
+}
+
+if ($movedInputs.Count -gt 0) {
+    Write-Host "run-gate.ps1: FAIL - the tree CHANGED UNDER THE RUN, so its result is not evidence"
+    Write-Host "  (command exited $rc; that number describes a tree that never existed as a whole)."
+    Write-Host "  These read-at-test-time files were modified after the run started:"
+    foreach ($m in $movedInputs) { Write-Host "      $m" }
+    Write-Host "  source tree watched: $($script:RunGateSourceTree)"
+    Write-Host "    decided by: $($script:RunGateSourceTreeWhy)"
+    Write-Host "  This is NOT 'the gate failed'. Any failure it reported may belong to the edit"
+    Write-Host "    rather than to the code under test, and any PASS is equally unproven."
+    Write-Host "  Let the tree settle and run it again. If you are the one who edited it: this"
+    Write-Host "    project's runners read src/dss-config, tests/corpus and examples from the"
+    Write-Host "    SOURCE TREE at test time, so an edit there is not inert while a suite runs."
+    Write-Host "  (log: $LogPath)"
+    exit 3
+}
+
+# Checked next, and still BEFORE rc and the witness. The ORDER between this and
+# the inputs check is fixed to match the twin so the two cannot disagree about
+# which sentence a doubly-spoiled run prints: inputs first, because that refusal
+# is the older one and its exit code (3) is already cited in shipped fixtures.
+if ($script:RunGateContenders.Count -gt 0) {
+    Show-RunGateContentionRefusal "AFTER the run finished (it exited $rc; that number describes a build directory two runs were writing)"
+    exit $script:RunGateContentionExit
+}
 
 function Show-Tail {
     if (Test-Path -LiteralPath $LogPath) {
@@ -398,7 +1767,7 @@ if ($rc -ne 0) {
     exit $rc
 }
 
-if (-not (Select-String -LiteralPath $LogPath -Pattern $SuccessPattern -Quiet)) {
+if (-not $witnessSeen) {
     Write-Host "run-gate.ps1: FAIL - command exited 0 but its output never matched the"
     Write-Host "  success witness /$SuccessPattern/, so there is NO EVIDENCE it did any work."
     Write-Host "  An exit code alone cannot distinguish 'passed' from 'never ran'."
@@ -409,3 +1778,9 @@ if (-not (Select-String -LiteralPath $LogPath -Pattern $SuccessPattern -Quiet)) 
 
 Write-Host "run-gate.ps1: OK - rc=0 and the success witness /$SuccessPattern/ was present."
 exit 0
+
+} finally {
+    # THE OTHER HALF OF "FROM HERE TO THE END OF THIS FILE, THIS RUN HOLDS THE LOG PATH":
+    # every exit above passes through here, so the owner record is released exactly once.
+    Remove-RunGateOwnerRecord
+}

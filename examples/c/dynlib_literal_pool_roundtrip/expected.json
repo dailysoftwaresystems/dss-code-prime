@@ -1,0 +1,63 @@
+{
+  "$comment": "★★★ [[D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING]] — THE CORPUS GAP THAT LET A BLOCKING REGRESSION SHIP GREEN, closed. WHY THIS EXAMPLE EXISTS, as the measurement that produced it rather than as a rationale: before it, the entire corpus built exactly ONE dynamic library from C source (`dynlib_resolve_roundtrip`) and NEITHER of that example's two sources contained a single `\"` character. So no corpus example ever asked a `-dyn`/`-dll`/`-dylib` build to place a string literal, a floating-point constant or `__func__`. When the preemptible-definition routing began judging every module global by BINDING and VISIBILITY alone, the compiler-synthesized literal-pool globals — minted `Global`/`Default` with NO on-binary name — were judged preemptible, found nameless, and REFUSED. ✔MEASURED 2026-09-06 with the shipped CLI: `const char *greet(void){ return \"hello, world\"; }` was rc 1 at `elf64-x86_64-linux-dyn` AND `elf64-aarch64-linux-dyn`, and rc 0 at every format declaring no preemptible binding set — a shared library containing a string literal did not compile, while the whole suite was 2090/2090 green. ★ WHAT THIS EXAMPLE ASSERTS THAT NO OTHER DOES, and it is two things, not one. FIRST, THAT THE LIBRARY BUILDS AT ALL on a format that DECLARES a preemptible binding set: each of the four `dependsOn` entries is a dynamic-library build of `dsslib.c`, and the two ELF `-dyn` entries go RED the moment the on-binary-NAME precondition in `symbolIsPreemptibleDefinition` is removed — that is the red-on-disable direction, and it is a BUILD failure, so it fires on every host including the compile-only arms. SECOND, THAT THE THREE SYNTHESIZED KINDS WERE MATERIALIZED CORRECTLY rather than merely accepted: a refusal is loud, but a literal whose address points at the wrong bytes is not, so `main.c` scores each kind separately and the exit code names which one came back wrong (8 = the string literal survived the image boundary; 16 = `__func__` read the DEFINING function's name; 16 = the promoted floating constants; 1 = the static-initializer entry for an EXPORTED definition agrees with the library's own address-take of it, C 6.2.2p2 inside one image; 1 = the `static` sibling still resolves to its own body, which is the in-object CONTROL that stops the previous bit from being true for the wrong reason; 8+16+16+1+1 = 42). RUNTIME, and why exactly one arm declares a `runOn`: an exec importing from a dynamic library needs the loader to FIND that library at run time. On Windows the DLL sits beside the exe in the arm's own output directory and the loader searches there, so the pe64 arm RUNS and asserts exit 42 — ✔MEASURED (shipped CLI, Windows host, cwd = the output directory): exit 42 at BOTH configurations. The two ELF arms would need LD_LIBRARY_PATH or an rpath and the Mach-O arm an LC_RPATH; those are runner capabilities that do not exist, so those three arms are `runOn: []` — COMPILE-ONLY, which is what the build-failure half needs from them. ⚠ THE ELF RAIL IS THE ONE THAT DECLARES THE KEY, so its execution was witnessed OUTSIDE the corpus rather than left unmeasured: ✔MEASURED 2026-09-06 through WSL with LD_LIBRARY_PATH set by hand, DSS `elf64-x86_64` exit 42 and DSS `elf64-aarch64` under qemu exit 42, against a gcc 13.3.0 control built from THESE SAME TWO SOURCES in the SAME invocation and run under the SAME loader, also exit 42. Whoever gives the runners a library-path capability should turn these three arms into running ones: the exitCode is already correct for them. ★ A REFERENCE SPLIT RECORDED SO IT IS NOT RE-DERIVED AS A DIVERGENCE: at `-O1` gcc folds `dss_table[0] == dss_greet` to 1 and deletes the table, and clang folds it at `-O0` already, so their optimized libraries carry no relocation row to compare. The fold is CORRECT — both sides denote one declaration, so C 6.2.2p2 makes them equal whichever image wins — and it is why the shape control is taken at gcc `-O0`, where gcc emits exactly DSS's three-row split: a symbol-based abs64 row for the exported entry, a bare RELATIVE row for the `static` control, and a GLOB_DAT for the in-library address-take. All three toolchains answer 1; two prove it statically and DSS proves it through the loader. `optimizedPipelines`: the `release` arm carries `mustDifferFromBaseline` at BOTH levels, and both were measured rather than assumed — ✔MEASURED (shipped CLI, Windows host, byte-comparing debug against release): all four LIBRARIES differ and all four EXECUTABLES differ, so neither key asserts a difference that is not there. Do not re-quote a byte count from this note as a pin: what is asserted is the DIFFERENCE, never a size. Leg-by-leg results are NOT recorded here — whoever runs the legs writes them.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "x86_64:pe64-x86_64-windows-dll",
+          "artifact": "dsslib.dll",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "x86_64:elf64-x86_64-linux-dyn",
+          "artifact": "dsslib.so",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "arm64:elf64-aarch64-linux-dyn",
+          "artifact": "dsslib.so",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "arm64:macho64-arm64-darwin-dylib",
+          "artifact": "dsslib.dylib",
+          "mustDifferFromBaseline": true
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

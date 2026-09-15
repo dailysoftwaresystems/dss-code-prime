@@ -85,6 +85,8 @@ Exit codes: 0 OK (or a clean dry run) · 1 not found / lint findings · 2 refuse
 Usage:
     anchors.py write --production D-<AREA>-<NAME> --status open --priority P1 --trigger '...'
     anchors.py set   D-<AREA>-<NAME> --status closed --closing '...'      # moves to the archive
+        ... and any prose cell may be read from a UTF-8 file instead, with --trigger-file,
+        --closing-file or --cross-refs-file PATH: the form for a cell too long for a command line.
     anchors.py read  D-<AREA>-<NAME> [--production|--harness|--done]
     anchors.py list  [--production|--harness|--done] [--band P0 P1] [--open] [--lint]
     anchors.py --self-test
@@ -108,22 +110,45 @@ for _s in (sys.stdout, sys.stderr):
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+def _owning_tree():
+    """`scripts/owning-tree/owning-tree.py` -- the one owner of "which tree is this file in?".
+
+    Loaded by path from this file's sibling directory (a hyphen is not a module name). It FAILS
+    LOUD when absent rather than falling back to a local walk: a second copy of the answer is the
+    drift that owner exists to end.
+    """
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                        "owning-tree", "owning-tree.py")
+    if not os.path.isfile(path):
+        sys.exit("anchors: cannot find %s -- this tool's root is resolved there and nowhere else"
+                 % path)
+    spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def repo_root():
-    """Walk up until `.plans/` and `scripts/` are both present.
+    """The tree THIS FILE lives in: the nearest ancestor holding BOTH `.plans/` and `scripts/`.
 
     Not a fixed number of `dirname` calls -- the depth-hardcoding defect the P17
     consolidation had to repair in seventeen scripts at once.
+    ⓘ This file used to carry its own copy of that walk -- the very rule `owning-tree.py` quotes
+    as "the rule `scripts/anchors/anchors.py` has always used", spelled a second time. Now the walk
+    has ONE owner, so the two spellings cannot drift apart (P66 lane ge; burndown-queue.py was
+    consolidated the same way by lane rr).
+    ⚠ STATED PLAINLY, BECAUSE A PIN IS EASY TO OVER-READ: the consolidation itself changes nothing a
+    test can see. The old walk was already keyed on this file and never on the caller's working
+    directory, and ✔MEASURED 2026-09-15 `read` and `list` answered byte-identically from this tree,
+    from another repository's working directory, from no repository, and under another
+    repository's GIT_DIR + GIT_WORK_TREE + GIT_INDEX_FILE. What self-test arms (38)-(40) pin is that
+    no cwd-keyed root can replace this one unseen.
     """
-    d = HERE
-    while True:
-        if os.path.isdir(os.path.join(d, ".plans")) and \
-           os.path.isdir(os.path.join(d, "scripts")):
-            return d
-        parent = os.path.dirname(d)
-        if parent == d:
-            sys.exit("anchors: no repository root above %s (looked for a directory "
-                     "holding BOTH .plans/ and scripts/)" % HERE)
-        d = parent
+    ot = _owning_tree()
+    try:
+        return ot.resolve(__file__)
+    except ot.Refusal as exc:
+        sys.exit("anchors: %s" % exc)
 
 
 def _load(root, rel, why):
@@ -303,7 +328,7 @@ def render_full(row):
 
 # ────────────────────────────────── writing ───────────────────────────────────
 
-def make_cell(text):
+def make_cell(text, field="cell"):
     """One field -> one cell body. The three ways a hand-written cell breaks a row.
 
     1. NEWLINES ARE COLLAPSED. A row is ONE physical line; a wrapped anchor id does not
@@ -321,8 +346,49 @@ def make_cell(text):
     it, raw text containing a literal backslash before a pipe emits an UNESCAPED
     separator, which is the exact silent column-shift this function exists to prevent.
     Correctness on the declared input beats safety on an input that never arrives.
+
+    ⚠⚠ ✔MEASURED 2026-09-02 (P54): THAT INPUT ARRIVES, AND HAS FOR MONTHS. The sentence
+    above was true about the DESIGN and false about the WORLD -- 35 pipes across 14 rows
+    were already stored with a doubled backslash, so those cells render `\\|` where their
+    author wrote `|`: `mtx_plain \\| mtx_recursive`, `awk -F"\\|"`, `[ -x "$LW" ] \\|\\|
+    ...`, a regex alternation, a PowerShell `\\| Out-Host`, a three-way enum. TWO callers
+    produce it and NEITHER is detectable downstream -- an author who PRE-ESCAPES a pipe
+    not knowing this function escapes for them, and a lane that reads the RAW TABLE LINE
+    with grep/sed instead of `read-anchor --json` and hands the escaped form back. The
+    second COMPOUNDS: every re-close adds one more backslash, forever.
+
+    ★ THE FIX IS NOT IDEMPOTENCE -- that is still the wrong contract, for the reason
+    above. It is to REFUSE the violating input HERE, at the one place that can still tell
+    a pre-escaped pipe from a deliberate one, because after this function returns the two
+    are the same bytes. A cell that genuinely wants to SHOW a backslash before a pipe
+    (~1000 rows hold one plausible candidate) spells the pipe `[|]` or says it in words:
+    that cost falls on one author, where the silent corruption fell on every reader of 14
+    rows.
     """
-    flat = " ".join(str(text).split())
+    # ★ ONLY LINE BREAKS COLLAPSE. Each one, with the whitespace either side of it, becomes
+    # ONE space and blank lines vanish; a run of spaces INSIDE a line is kept byte for byte.
+    # `splitlines()` rather than a bare "\n", because every boundary it knows (`\r`, U+0085,
+    # U+2028, a form feed) would split the physical row for SOME reader.
+    # ✔MEASURED 2026-09-15 (P66): this used to join `text.split()`, which collapses EVERY run.
+    # A one-line row never needed that, and it cost two things. Three of lane `pg`'s cells
+    # quoting tool output (`inputs  : held still`) were stored respaced. And `set-anchor`'s
+    # "everything unnamed survives verbatim" was false: 29 stored rows (30 cells) hold a run,
+    # some of them AS the evidence (`4  +  38` in a preprocessor whitespace row, `see  for
+    # details` marking a dropped token), and naming any other field of such a row rewrote them.
+    # D-GATE-ANCHORS-WRITER-COLLAPSES-EVERY-WHITESPACE-RUN-SO-AN-UNNAMED-CELL-DOES-NOT-SURVIVE-VERBATIM
+    flat = " ".join(line.strip() for line in str(text).splitlines() if line.strip())
+    if "\\|" in flat:
+        at = flat.find("\\|")
+        raise Refused(
+            "the %s cell's value contains a backslash immediately before a pipe. This "
+            "function escapes pipes FOR you, so a pre-escaped pipe is stored DOUBLED and "
+            "renders as a stray backslash to every reader. Two causes: (1) you escaped it "
+            "by hand -- write the plain pipe; (2) you read the cell from the RAW TABLE "
+            "LINE with grep/sed -- read it with `read-anchor --json`, whose fields come "
+            "back already un-escaped, or the escape deepens on every re-close. To DISPLAY "
+            "a backslash before a pipe deliberately, spell the pipe `[|]`.\n"
+            "  at char %d: ...%s..."
+            % (field, at, flat[max(0, at - 60):at + 60]))
     return " %s " % flat.replace("|", "\\|") if flat else " "
 
 
@@ -382,8 +448,9 @@ def make_row(anchor, priority, status, trigger, closing="", cross_refs="", minti
     row = "|" + "|".join([" `%s` " % anchor,
                           " %s " % normalise_priority(priority),
                           " %s " % normalise_status(status),
-                          make_cell(trigger), make_cell(closing),
-                          make_cell(cross_refs)]) + "|"
+                          make_cell(trigger, "Trigger"),
+                          make_cell(closing, "Closing work"),
+                          make_cell(cross_refs, "Cross-refs")]) + "|"
     # Self-check the product against the reader that will consume it, rather than
     # trusting the assembly above. Cheap, and the only thing that would catch a future
     # edit to `make_cell` that reintroduced a separator.
@@ -395,6 +462,40 @@ def make_row(anchor, priority, status, trigger, closing="", cross_refs="", minti
     if bal.row_name(cells[C_ANCHOR]) != anchor:
         raise Refused("assembled row reads back as %r, not %r"
                       % (bal.row_name(cells[C_ANCHOR]), anchor))
+    # ★★ AND THE VERDICT MUST NOT BE STATED TWICE, DIFFERENTLY. Since the six-cell shape
+    # landed, `Status` carries the verdict and `Trigger` still opens with glyph-led prose
+    # -- two cells stating one fact, so they can disagree. `check-anchor-balance` ARM 6
+    # refuses that AFTER the fact; nothing refused it at the moment of writing.
+    # ✔MEASURED 2026-09-08: three rows minted through this writer in P64 carried
+    # `Status = closed` beside a Trigger opening with the bare word CLOSED and no closure
+    # mark, and ARM 6 failed on all three at HEAD. `is_closed` is a LEADING-POSITION test,
+    # so "says CLOSED in words" is not the same fact as "reads CLOSED", and only the gate
+    # knew that. ⇒ Asked here through `bal.is_closed` on the SPLIT-BACK cells, which is
+    # byte-for-byte the question the gate will ask, so the writer and the gate cannot
+    # drift apart about what a contradiction is.
+    # ⚠ NO ESCAPE, deliberately: a row is allowed to disagree with itself in exactly zero
+    # cases, and an opt-out here would be taken by every row that trips it -- the failure
+    # this project already measured when a guard's escape was satisfied by every subject.
+    # ⓘ It bites ONLY the closed-vs-not axis, the same axis ARM 6 owns; OPEN-vs-GATED is
+    # ARM 7's, is a differential, and is not decidable from one row in isolation.
+    if str(trigger).strip() and bal.is_closed(cells[C_STATUS]) != bal.is_closed(
+            cells[C_TRIGGER]):
+        raise Refused(
+            "the Status column and the Trigger prose state DIFFERENT verdicts.\n"
+            "  Status : %s  -> reads %s\n"
+            "  Trigger: %s -> reads %s\n"
+            "  A verdict is one fact and this row states it twice. `is_closed` is a "
+            "LEADING-POSITION test, so a Trigger that says CLOSED in words but does not "
+            "OPEN with the closure mark reads as NOT CLOSED -- which is what "
+            "`check-anchor-balance` ARM 6 will report on this row the moment it lands. "
+            "Lead the Trigger with the mark the Status column carries (the archive spells "
+            "it `%s **CLOSED <date> (<cycle>, lane `<x>`)** - ...`), or set the status the "
+            "prose actually means."
+            % (" ".join(cells[C_STATUS].split()),
+               "CLOSED" if bal.is_closed(cells[C_STATUS]) else "NOT CLOSED",
+               " ".join(cells[C_TRIGGER].split())[:56],
+               "CLOSED" if bal.is_closed(cells[C_TRIGGER]) else "NOT CLOSED",
+               bal.CLOSED_MARK))
     return row
 
 
@@ -599,6 +700,47 @@ def _origin_of(anchor, bucket):
     return rows[0].table
 
 
+def cell_argument(inline, path, flag):
+    """-> one prose cell's raw text, given INLINE or read from a FILE; None when neither.
+
+    ★★ WHY A FILE FORM EXISTS AT ALL. An inline cell travels on the command line, and the
+    command line has a ceiling this file never sees: Windows' CreateProcess takes 32,767
+    characters for the WHOLE line. ✔MEASURED 2026-09-15 (P66, lane `bl`): a row whose
+    trigger, closing and cross-refs came to about 48 KB made `write-anchor.sh` die with
+    `python3: Argument list too long` (exit 126) BEFORE this file ran -- so the failure was
+    not even a refusal of this tool's, and nothing said which cell was too long.
+    [[D-GATE-ANCHORS-WRITER-TAKES-CELLS-ONLY-ON-THE-COMMAND-LINE-SO-A-LARGE-ROW-CANNOT-BE-WRITTEN]]
+
+    ★ THE FILE FORM IS NOT A SECOND WRITER. The text read here goes through `make_cell`
+    exactly as an inline value does, so every refusal -- the pre-escaped pipe, the empty
+    Trigger, the collapsed newline -- applies identically, and a trailing newline a file
+    naturally ends with is collapsed the same way a shell's `$(cat file)` drops it.
+
+    ⚠ Strict UTF-8, and a byte-order mark is REFUSED rather than stripped: it would become
+    an invisible first character of the cell, and cleaning input silently is the class of
+    behaviour this writer exists to refuse.
+    """
+    if inline is not None and path is not None:
+        raise Refused("the cell was given twice, as %s and as %s-file; give exactly one."
+                      % (flag, flag))
+    if path is None:
+        return inline
+    try:
+        with io.open(path, "r", encoding="utf-8", errors="strict", newline="") as f:
+            text = f.read()
+    except FileNotFoundError:
+        raise Refused("%s-file %s does not exist." % (flag, path))
+    except UnicodeDecodeError as exc:
+        raise Refused("%s-file %s is not UTF-8 (%s)." % (flag, path, exc))
+    except OSError as exc:
+        raise Refused("%s-file %s could not be read (%s)." % (flag, path, exc))
+    if text.startswith("﻿"):
+        raise Refused("%s-file %s starts with a byte-order mark, which would become an "
+                      "invisible first character of the cell. Save it as UTF-8 without "
+                      "a BOM." % (flag, path))
+    return text
+
+
 def cmd_write(argv):
     ap = argparse.ArgumentParser(prog="write-anchor", add_help=True)
     _bucket_flags(ap, required=True)
@@ -606,12 +748,24 @@ def cmd_write(argv):
     ap.add_argument("--priority", help="P0..P5; derived and PRINTED when omitted")
     ap.add_argument("--status", default="open",
                     help="one of %s (default open)" % "/".join(STATUS_WORDS))
-    ap.add_argument("--trigger", required=True, help="the Trigger cell (the prose)")
-    ap.add_argument("--closing", default="", help="the Closing work cell")
-    ap.add_argument("--cross-refs", dest="cross_refs", default="")
+    ap.add_argument("--trigger", help="the Trigger cell (the prose)")
+    ap.add_argument("--trigger-file", dest="trigger_file",
+                    help="read the Trigger cell from a UTF-8 file instead")
+    ap.add_argument("--closing", help="the Closing work cell")
+    ap.add_argument("--closing-file", dest="closing_file")
+    ap.add_argument("--cross-refs", dest="cross_refs")
+    ap.add_argument("--cross-refs-file", dest="cross_refs_file")
     ap.add_argument("--insert", action="store_true", help="declare a NEW row")
     ap.add_argument("--apply", action="store_true", help="write; otherwise dry run")
     a = ap.parse_args(argv)
+    # Each prose cell arrives inline OR from a file (see `cell_argument`); from here on the
+    # two are indistinguishable, which is the point.
+    a.trigger = cell_argument(a.trigger, a.trigger_file, "--trigger")
+    if a.trigger is None:
+        raise Refused("the Trigger cell is required: give --trigger TEXT or "
+                      "--trigger-file PATH.")
+    a.closing = cell_argument(a.closing, a.closing_file, "--closing") or ""
+    a.cross_refs = cell_argument(a.cross_refs, a.cross_refs_file, "--cross-refs") or ""
 
     working = _origin_of(a.anchor, a.bucket)
     status = normalise_status(a.status)
@@ -648,10 +802,18 @@ def cmd_set(argv):
     ap.add_argument("--status", help="one of %s; `closed` MOVES the row to the archive"
                                      % "/".join(STATUS_WORDS))
     ap.add_argument("--trigger")
+    ap.add_argument("--trigger-file", dest="trigger_file")
     ap.add_argument("--closing")
+    ap.add_argument("--closing-file", dest="closing_file")
     ap.add_argument("--cross-refs", dest="cross_refs")
+    ap.add_argument("--cross-refs-file", dest="cross_refs_file")
     ap.add_argument("--apply", action="store_true")
     a = ap.parse_args(argv)
+    # The same inline-or-file resolution `write` performs (see `cell_argument`). A cell
+    # named by neither form stays None, which is what leaves it untouched below.
+    a.trigger = cell_argument(a.trigger, a.trigger_file, "--trigger")
+    a.closing = cell_argument(a.closing, a.closing_file, "--closing")
+    a.cross_refs = cell_argument(a.cross_refs, a.cross_refs_file, "--cross-refs")
 
     rows = find(ROOT, a.anchor, (a.bucket,) if a.bucket else BUCKETS)
     if not rows:
@@ -668,7 +830,7 @@ def cmd_set(argv):
                                ("cross_refs", a.cross_refs)) if v is not None}
     if not given:
         raise Refused("nothing to set. Name at least one of --priority --status "
-                      "--trigger --closing --cross-refs.")
+                      "--trigger --closing --cross-refs, or the -file form of a cell.")
     fields = {"priority": row.priority, "status": row.status,
               "trigger": row.cell(C_TRIGGER), "closing": row.cell(C_CLOSING),
               "cross_refs": row.cell(C_XREF)}
@@ -844,12 +1006,40 @@ def self_test():
         "(3) a priority outside P0..P5 is REFUSED")
     pin("controlled vocabulary" in (refuse(make_row, CC_, "P1", "wibble", "t") or ""),
         "(4) a status outside the three-value vocabulary is REFUSED")
-    r = make_row(CC_, "P0", "closed", "verdict | with a raw pipe", "a\nb", "")
+    # ⓘ The Trigger leads with the closure mark because the STATUS is closed, and the
+    # split-verdict refusal below now requires the two to agree. That is incidental to
+    # what THIS arm measures -- the pipe and the newline -- and weakens none of it.
+    r = make_row(CC_, "P0", "closed", "✅ **CLOSED** verdict | with a raw pipe",
+                 "a\nb", "")
     c = bal.split_row(r)
     pin(len(c) == 8 and "with a raw pipe" in c[C_TRIGGER]
         and c[C_CLOSING].strip() == "a b" and bal.is_closed(c[C_STATUS]),
         "(5) a raw pipe is ESCAPED and a newline COLLAPSED -- neither can add a column "
         "or wrap an id", "cells=%d" % (len(c) - 2))
+    # ── (5b..5f) THE VERDICT STATED TWICE ────────────────────────────────────
+    # ✔The negative is the case that actually shipped: P64 minted three rows through
+    # this writer with `Status = closed` and a Trigger opening with the bare WORD
+    # CLOSED, and `check-anchor-balance` ARM 6 failed on all three at HEAD. Both
+    # directions are pinned because only one of them had ever occurred, and the three
+    # CONTROLS are here so a refusal that fired on everything could not produce this
+    # transcript -- including (5f), which proves the rule is the CLOSED axis and not
+    # "the two cells must match".
+    pin("DIFFERENT verdicts" in (refuse(make_row, CC_, "P1", "closed",
+                                        "CLOSED 2026-09-07 -- says it in words") or ""),
+        "(5b) status CLOSED + a Trigger that says CLOSED in WORDS but carries no "
+        "closure mark is REFUSED -- the exact row shape that reached HEAD in P64")
+    pin("DIFFERENT verdicts" in (refuse(make_row, CC_, "P1", "open",
+                                        "✅ **CLOSED** -- but the column says open") or ""),
+        "(5c) ... and the OTHER direction too, a closed-looking prose under an OPEN "
+        "column, which no row has done yet and which hides finished work")
+    pin(refuse(make_row, CC_, "P1", "closed", "✅ **CLOSED 2026-09-08** -- agreed") is None,
+        "(5d) CONTROL: closed + closure-marked prose is ACCEPTED")
+    pin(refuse(make_row, CC_, "P1", "open", "🟠 **OPEN** -- agreed") is None,
+        "(5e) CONTROL: open + open-marked prose is ACCEPTED")
+    pin(refuse(make_row, CC_, "P1", "gated", "🟠 **OPEN -- TRIGGER-GATED**") is None,
+        "(5f) CONTROL: GATED beside OPEN prose is ACCEPTED HERE -- this arm owns the "
+        "CLOSED axis only; the open-vs-gated skew is ARM 7's differential and is not "
+        "decidable from one row in isolation")
     # ★ THE ROUND TRIP AS A PROPERTY, not as an escape spelling: read a cell back out,
     # feed it straight in again, and the cell must be identical. That is exactly what
     # `set-anchor` does to every field it was not asked to change.
@@ -860,7 +1050,24 @@ def self_test():
         and _rt[C_TRIGGER].strip() == "a | b",
         "(6) a cell READ from a row and written straight back is IDENTICAL -- the round "
         "trip `set-anchor` depends on", "got=%r" % _rt2[C_TRIGGER])
-    pin(bal.split_row(make_row(CC_, "P1", "done", "t"))[C_STATUS].strip()
+    # ★ AND THE OTHER ROUND TRIP -- THE ONE THAT SILENTLY CORRUPTED 14 ROWS. Pin (6)
+    # reads the cell through `split_row`, which UN-escapes. A caller who instead reads
+    # the RAW TABLE LINE (grep/sed) gets `a \| b`, and writing that back stores `a \\| b`
+    # -- one more backslash on every re-close. An author who pre-escapes by hand hands
+    # over the identical bytes. Neither is distinguishable after `make_cell` returns, so
+    # it is refused before.
+    _pre = refuse(make_row, CC_, "P1", "open", "a \\| b") or ""
+    pin("backslash immediately before a pipe" in _pre and "read-anchor --json" in _pre,
+        "(6b) a PRE-ESCAPED pipe is REFUSED, and the message names the door that returns "
+        "un-escaped fields", "got=%r" % _pre[:80])
+    pin(refuse(make_row, CC_, "P1", "open", "t", "c \\| d") is not None
+        and refuse(make_row, CC_, "P1", "open", "t", "", "x \\| y") is not None,
+        "(6c) ...in EVERY prose cell, not only the Trigger -- the corruption was found in "
+        "all three")
+    pin("[|]" in _pre,
+        "(6d) ...and it names the spelling for a cell that WANTS to show a backslash "
+        "before a pipe, so the refusal is not a dead end")
+    pin(bal.split_row(make_row(CC_, "P1", "done", "✅ **CLOSED** t"))[C_STATUS].strip()
         == STATUS["closed"],
         "(7) `done` is accepted as a spelling of `closed` -- the operator's own word")
 
@@ -912,7 +1119,7 @@ def self_test():
         pin(msg is not None and "already has a row" in msg,
             "(14) --insert over an EXISTING row is REFUSED")
         msg = refuse(place_row, tmp, "done", B_,
-                     make_row(B_, "P1", "closed", "t"), True, report=quiet)
+                     make_row(B_, "P1", "closed", "✅ **CLOSED** t"), True, report=quiet)
         pin(msg is not None and "must be one of" in msg,
             "(15) the archive is never declared as a destination -- it is DERIVED")
 
@@ -959,7 +1166,7 @@ def self_test():
         box(tmp)
         before = io.open(os.path.join(tmp, REL["production"]), encoding="utf-8").read()
         place_row(tmp, "production", B_,
-                  make_row(B_, "P1", "closed", "t"), write=False, report=quiet)
+                  make_row(B_, "P1", "closed", "✅ **CLOSED** t"), write=False, report=quiet)
         pin(io.open(os.path.join(tmp, REL["production"]), encoding="utf-8").read()
             == before, "(24) a dry run writes nothing at all")
 
@@ -981,7 +1188,7 @@ def self_test():
 
         globals()["_rewrite"] = _fail_after_first
         try:
-            place_row(tmp, "production", B_, make_row(B_, "P1", "closed", "t"),
+            place_row(tmp, "production", B_, make_row(B_, "P1", "closed", "✅ **CLOSED** t"),
                       write=True, report=quiet)
         except IOError:
             pass
@@ -993,6 +1200,140 @@ def self_test():
             "(25) an INTERRUPTED move leaves the row SOMEWHERE, never nowhere")
         pin(("`%s`" % B_) in done,
             "(26) ... and specifically in the DESTINATION, because the append goes first")
+
+    # ── (27)..(33) A CELL READ FROM A FILE ───────────────────────────────────────
+    # [[D-GATE-ANCHORS-WRITER-TAKES-CELLS-ONLY-ON-THE-COMMAND-LINE-SO-A-LARGE-ROW-CANNOT-BE-WRITTEN]]
+    # The file form exists because an inline cell rides the command line, whose ceiling (32,767
+    # characters for the whole line on Windows) a 48 KB row crossed. What must hold is that the
+    # file form is the SAME cell and not a second writer: (27) pins the row it makes against the
+    # inline row, on a cell longer than that ceiling; (28)-(31) pin each way a file can be wrong,
+    # with (31b) as their control; and (32)(33) drive BOTH verbs through their own argument
+    # parsing, because a flag that is parsed and then never read passes every arm before them.
+    import contextlib
+    with tempfile.TemporaryDirectory() as tmp:
+        def put(name, data):
+            path = os.path.join(tmp, name)
+            with io.open(path, "wb") as f:
+                f.write(data if isinstance(data, bytes) else data.encode("utf-8"))
+            return path
+
+        big = "a cell | with a pipe, " + "x" * 40000 + "\nand a second line\n"
+        p_big = put("big.cell", big)
+        try:
+            got_big = cell_argument(None, p_big, "--trigger")
+        except Refused as exc:
+            got_big = "REFUSED: %s" % exc
+        pin(len(big) > 32767 and got_big == big
+            and make_row(CC_, "P1", "open", "🟠 **OPEN** " + got_big)
+            == make_row(CC_, "P1", "open", "🟠 **OPEN** " + big),
+            "(27) a cell read from a FILE makes the byte-identical row the same text makes "
+            "inline -- on a cell longer than the whole Windows command line")
+        pin("given twice" in (refuse(cell_argument, "t", p_big, "--trigger") or ""),
+            "(28) a cell given BOTH inline and by file is REFUSED -- neither silently wins")
+        pin("does not exist" in (refuse(cell_argument, None, os.path.join(tmp, "absent.cell"),
+                                        "--closing") or ""),
+            "(29) a missing cell file is REFUSED, naming it -- never an empty cell")
+        pin("not UTF-8" in (refuse(cell_argument, None, put("latin1.cell", b"caf\xe9 t"),
+                                   "--closing") or ""),
+            "(30) a cell file that is not UTF-8 is REFUSED")
+        pin("byte-order mark" in (refuse(cell_argument, None, put("bom.cell", b"\xef\xbb\xbft"),
+                                         "--trigger") or ""),
+            "(31) a byte-order mark is REFUSED, not stripped -- it would be an invisible first "
+            "character of the cell")
+        pin(cell_argument(None, None, "--closing") is None
+            and cell_argument("inline | text", None, "--closing") == "inline | text",
+            "(31b) CONTROL: naming neither form gives None, which is how `set` leaves a cell "
+            "alone, and the inline form is unchanged")
+
+        box(tmp)
+        FC_ = _FX + "-FILECELLS"
+        p_t = put("t.cell", "🟠 **OPEN** trigger from a file | " + "y" * 33000 + "\n")
+        p_c = put("c.cell", "closing from a file\n")
+        p_c2 = put("c2.cell", "closing replaced from a file")
+        real_root = globals()["ROOT"]
+        globals()["ROOT"] = tmp
+        sink = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(sink):
+                msg_w = refuse(cmd_write, ["--production", FC_, "--insert", "--priority", "P2",
+                                           "--status", "open", "--trigger-file", p_t,
+                                           "--closing-file", p_c, "--cross-refs", "r",
+                                           "--apply"])
+            got = find(tmp, FC_)
+            pin(msg_w is None and len(got) == 1
+                and got[0].cell(C_TRIGGER).strip().endswith("y" * 33000)
+                and got[0].cell(C_CLOSING).strip() == "closing from a file",
+                "(32) `write --trigger-file --closing-file` stores the FILES' text -- the flags "
+                "are wired, not merely parsed", "refused=%r rows=%d" % (msg_w, len(got)))
+            with contextlib.redirect_stdout(sink):
+                msg_s = refuse(cmd_set, [FC_, "--closing-file", p_c2, "--apply"])
+            got = find(tmp, FC_)
+            pin(msg_s is None and len(got) == 1
+                and got[0].cell(C_CLOSING).strip() == "closing replaced from a file"
+                and got[0].cell(C_TRIGGER).strip().endswith("y" * 33000),
+                "(33) `set --closing-file` replaces JUST that cell, and the Trigger survives",
+                "refused=%r rows=%d" % (msg_s, len(got)))
+
+            # ── (34..37) ONLY LINE BREAKS COLLAPSE; A RUN OF SPACES IS THE AUTHOR'S TEXT ──
+            # [D-GATE-ANCHORS-WRITER-COLLAPSES-EVERY-WHITESPACE-RUN-SO-AN-UNNAMED-CELL-DOES-NOT-SURVIVE-VERBATIM]
+            # (34) and (35) pin the helper in both directions; (36) and (37) drive the two VERBS
+            # to the stored bytes, because a pin that reads its cell back through the same helper
+            # cannot see this class. (37) injects its row as RAW TEXT, the way the stored rows
+            # holding a run were written, so `set` is measured on a row it did not make.
+            pin(make_cell("4  +  38 and a\ttab") == " 4  +  38 and a\ttab ",
+                "(34) a run of spaces and a tab INSIDE a line survive `make_cell` byte for byte")
+            broken = make_cell("a  \r\n   b\rc d\x85e\x0b\x0cf\n\n  g")
+            pin(broken == " a b c d e f g "
+                and not any(ch in broken for ch in "\r\n\x0b\x0c\x85 "),
+                "(35) CONTROL for (34): every line-break form, with the whitespace around it, "
+                "still collapses to ONE space -- the row stays one physical line", repr(broken))
+            WS_ = _FX + "-WSWRITE"
+            with contextlib.redirect_stdout(sink):
+                msg_ws = refuse(cmd_write, ["--production", WS_, "--insert", "--priority", "P2",
+                                            "--status", "open", "--trigger", "🟠 **OPEN** t",
+                                            "--closing", "see  for details", "--cross-refs", "r",
+                                            "--apply"])
+            prod = os.path.join(tmp, REL["production"])
+            with io.open(prod, "r", encoding="utf-8", newline="") as f:
+                stored = [ln for ln in f.read().splitlines() if WS_ + "`" in ln]
+            pin(msg_ws is None and len(stored) == 1 and "| see  for details |" in stored[0],
+                "(36) `write` keeps a closing cell's run of spaces in the registry's BYTES",
+                "refused=%r lines=%d" % (msg_ws, len(stored)))
+            RUN_ = _FX + "-SPACERUNS"
+            raw_row = ("| `" + RUN_ + "` | P2 | 🟠 OPEN | 🟠 **OPEN** so `4  +  38` IS the list"
+                       " | see  for details | `DCO  fail` |")
+            with io.open(prod, "r", encoding="utf-8", newline="") as f:
+                text_before = f.read()
+            with io.open(prod, "w", encoding="utf-8", newline="") as f:
+                f.write(text_before.replace(SEP_ROW_TEXT + "\n",
+                                            SEP_ROW_TEXT + "\n" + raw_row + "\n", 1))
+            before = find(tmp, RUN_)
+            with contextlib.redirect_stdout(sink):
+                msg_run = refuse(cmd_set, [RUN_, "--priority", "P3", "--apply"])
+            after = find(tmp, RUN_)
+            same = (len(before) == 1 and len(after) == 1
+                    and all(after[0].cell(k) == before[0].cell(k)
+                            for k in (C_TRIGGER, C_CLOSING, C_XREF)))
+            pin(msg_run is None and same and after[0].priority == "P3"
+                and "`4  +  38`" in after[0].cell(C_TRIGGER)
+                and "see  for details" in after[0].cell(C_CLOSING)
+                and "`DCO  fail`" in after[0].cell(C_XREF),
+                "(37) `set --priority` on a STORED row leaves every unnamed cell holding a run "
+                "byte-identical -- the verbatim promise, measured on a row `set` did not make",
+                "refused=%r before=%d after=%d" % (msg_run, len(before), len(after)))
+        finally:
+            globals()["ROOT"] = real_root
+
+    # ── (38)..(40) THE ROOT IS THE TREE THIS FILE LIVES IN, FROM ANY WORKING DIRECTORY ──
+    # The arms `scripts/owning-tree/owning-tree.py` hands every consumer, run against THIS
+    # file's own `repo_root`: cwd = its own tree (the CONTROL), cwd inside another git
+    # repository, cwd inside no repository -- each foreign condition proven real first. This
+    # tool asks git nothing, so the two git arms (steering, nested copy) do not apply.
+    # ⚠ They cannot tell the old local walk from the owner (both are file-keyed); they redden
+    # on a root keyed on the CALLER, which is the class they exist to keep out.
+    for _n, (_ok, _label, _detail) in enumerate(
+            _owning_tree().root_arms(repo_root, (SystemExit,), False, __file__), start=38):
+        pin(_ok, "(%d) %s" % (_n, _label), _detail)
 
     print("anchors self-test: %d failed" % failed[0])
     return 1 if failed[0] else 0

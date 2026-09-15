@@ -448,6 +448,54 @@ struct AggregateLayoutParams {
     // is measured identical on x64 and arm64 PE.
     UnnamedBitFieldAlignment unnamedBitFieldAlignment =
         UnnamedBitFieldAlignment::None;
+    // ── D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN (P63) ──
+    //
+    // The largest alignment a PROGRAM may REQUEST — `_Alignas(N)` and
+    // `__attribute__((aligned(N)))`, on a composite or on a member. REQUIRED
+    // whenever an `aggregateLayout` block is declared, for the reason
+    // `maxAlignment` is: a silent default is a policy nobody wrote down.
+    //
+    // ⚠⚠ IT IS NOT `maxAlignment`, AND CONFUSING THE TWO IS A WORSE DEFECT THAN
+    // THE ONE THIS KEY CLOSES. `maxAlignment` is the ISA's largest FUNDAMENTAL
+    // alignment (16 on x86_64 and arm64 — `alignof(max_align_t)`), the cap
+    // `naturalScalarAlignment` applies to a scalar's OWN alignment: it answers
+    // "how aligned is a `long double` by nature". THIS key answers "how aligned
+    // may a user ASK for", a number three orders of magnitude larger. Reusing
+    // `maxAlignment` here would refuse `_Alignas(32)` — an AVX spill, ordinary
+    // code — while trying to admit `_Alignas(4096)`.
+    //
+    // ✔MEASURED 2026-09-07, each reference probed SEPARATELY, BUILD **and** RUN
+    // with the exit asserted, subject `struct __attribute__((aligned(N))) big
+    // { char c; }` and its `_Alignas(N)` twin, CONTROL arm N = 16 green
+    // throughout: gcc 13.3.0 (x86_64-linux) and clang 18.1.3 RUN 42 at N = 512,
+    // 1024, 4096, 8192, 16384, 65536, 2^20 and 2^28, and gcc refuses 2^29 by
+    // name — *"requested alignment '536870912' exceeds maximum 268435456"*.
+    // aarch64-linux-gnu-gcc 13.3.0 gives the SAME number, so 2^28 is what both
+    // shipped targets declare. clang at 2^29 BUILDS and then answers 7 (its own
+    // `_Alignof` disagrees with the request), so under *"the union is over what
+    // WORKS, not what is ACCEPTED"* it casts no vote above gcc's ceiling.
+    // mingw-w64 gcc 13.2.0 refuses 2^29 with the identical message, so the
+    // TYPE-level ceiling is the same on PE as on ELF — which is why it is a
+    // TARGET key and not a format one.
+    //
+    // ⓘ A statically allocated OBJECT faces a SECOND, narrower ceiling that is
+    // genuinely per-FORMAT — what the image can place. That one is enforced by
+    // the format writer against the format's own declared section alignment
+    // (see `pe::encodeExec`'s static over-alignment refusal); it is a different
+    // question from this one and must not be folded into it. ✔MEASURED: on PE
+    // the two references refuse a static above 8192 (*"alignment of 'g' is
+    // greater than maximum object file alignment 8192"* / `C2345`) while
+    // BUILDING AND RUNNING the same alignment on a TYPE and on a LOCAL.
+    std::uint32_t       maxRequestedAlignment = 0;  // required; power of two
+    // ★ IT SITS LAST, AND THE POSITION IS A MEASUREMENT. Placed between
+    // `maxAlignment` and `bitFieldStrategy` — where it reads best — it re-seated
+    // every POSITIONAL aggregate initialiser of this struct in the tree: ✔34 sites
+    // across `tests/{analysis,asm,core,ffi,mir}` plus two `src/` headers. Four of
+    // them failed to compile only because an enum will not convert to `uint32_t`;
+    // between two NUMERIC fields the same shift compiles and pins a wrong ABI in
+    // silence. Appending keeps every existing brace-init valid and confines the
+    // change to the sites that actually care about the ceiling. Field ORDER in a
+    // params struct carries no meaning; the blast radius of moving it does.
 };
 
 } // namespace dss

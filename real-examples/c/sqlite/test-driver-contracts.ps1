@@ -537,8 +537,15 @@ function Pin-ConfoundSupply($driver) {
   # the named probe found its defect on THIS machine. 'probed' by default so
   # every assertion below keeps asking what it asked; the refusal gets its own
   # case. [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
-  $mk = { param($label, $c, $g = 'probed') [pscustomobject]@{ label = $label;
-            confounds = $c; confoundGating = $g } }
+  # + `runDirectoryGating`, the SECOND gating, which the supply also refuses to
+  # proceed without: a row declaring `requiresRunDirectory` is honoured only where
+  # THIS RUN measured the named precondition on THIS LEG'S own run directory.
+  # 'not-required' by default so every assertion below keeps asking what it asked;
+  # the refusal gets its own case.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  $mk = { param($label, $c, $g = 'probed', $rdg = 'not-required')
+          [pscustomobject]@{ label = $label; confounds = $c;
+                             confoundGating = $g; runDirectoryGating = $rdg } }
   Ck 'a leg gets ITS OWN declared patterns' '^walsetlk- ^busy2-' `
      ((@(Get-LegConfounds (& $mk 'elf64-x86_64' @('^walsetlk-','^busy2-')))) -join ' ')
   # THE ONE THAT WOULD HAVE CAUGHT IT: same declaration, DIFFERENT label. A
@@ -565,6 +572,21 @@ function Pin-ConfoundSupply($driver) {
   catch { $ungated = "$($_.Exception.Message)" }
   Ck 'an UNPROBED plan REFUSES rather than serving its ungated list' $true ($ungated -match "confoundGating='unprobed'")
   CkHas '...and says how to resolve a measured plan' "$ungated" '--environment-probes skip'
+  # ★★ AND AN UNCORROBORATED RUN DIRECTORY, the second gate, silent in the SAME
+  # direction and one step worse: skipping it would EXCUSE `vtabH-3.1` on a host
+  # whose run drive root is clean, i.e. launder a genuine dss regression into
+  # "expected" — and an excused failure is indistinguishable from an absent one
+  # in the leg verdict.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  $uncorrob = ''
+  try { [void](Get-LegConfounds (& $mk 'pe64-x86_64' @('^vtabH-3\.1$') 'probed' 'unmeasured')) }
+  catch { $uncorrob = "$($_.Exception.Message)" }
+  Ck 'an UNMEASURED run directory REFUSES rather than serving its uncorroborated list' $true ($uncorrob -match "runDirectoryGating='unmeasured'")
+  CkHas '...and names the call that would measure it' "$uncorrob" '--corroborate-run-dir'
+  # ★ AND THE ALLOWED VALUE REALLY PASSES — a refusal that refused everything
+  # would satisfy the two arms above while breaking every run.
+  Ck "a 'measured' run-directory gating is ACCEPTED" '^vtabH-3\.1$' `
+     ((@(Get-LegConfounds (& $mk 'pe64-x86_64' @('^vtabH-3\.1$') 'probed' 'measured'))) -join ' ')
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -601,21 +623,21 @@ function Pin-ConfoundSupplyStopsTheDriver($driver) {
   CkHas 'the extracted call site is the real supply call' $callsite[0] 'Get-LegConfounds $leg'
   $script = Join-Path ([IO.Path]::GetTempPath()) ("dss-confound-callsite-" + [Guid]::NewGuid().ToString('N') + ".ps1")
   $body = @(
-    'param($Gating)',
+    'param($Gating, $RunDirGating)',
     "`$ErrorActionPreference = 'Stop'",
     'function Info($m) { }',
     'function Step($m) { }',
     'function Die($m) { Write-Host "DIE: $m"; exit 1 }',
     '$ConfoundsOverride = $null',
     $region,
-    '$leg = [pscustomobject]@{ label = "someleg"; confounds = @("^busy2-"); confoundGating = $Gating; confoundRows = @(1) }',
+    '$leg = [pscustomobject]@{ label = "someleg"; confounds = @("^busy2-"); confoundGating = $Gating; runDirectoryGating = $RunDirGating; confoundRows = @(1) }',
     '$LegTag = "someleg"',
     $callsite[0],
     'Write-Host "REACHED-NEXT-STATEMENT size=$($Confounds.Count)"'
   ) -join "`n"
   Set-Content -LiteralPath $script -Value $body -Encoding utf8
   # ── THE REFUSAL ARM ──────────────────────────────────────────────────────
-  $out = & $pwshCmd.Source -NoProfile -NonInteractive -File $script 'unprobed' 2>&1 | Out-String
+  $out = & $pwshCmd.Source -NoProfile -NonInteractive -File $script 'unprobed' 'not-required' 2>&1 | Out-String
   $rc = $LASTEXITCODE
   Ck 'an UNPROBED plan STOPS THE DRIVER at the real call site (rc)' 1 $rc
   CkHas '...having said why' $out "confoundGating='unprobed'"
@@ -623,10 +645,21 @@ function Pin-ConfoundSupplyStopsTheDriver($driver) {
      $(if ($out -match 'REACHED-NEXT-STATEMENT') { 'yes' } else { 'no' })
   # ── THE NEGATIVE CONTROL: without it the arm above could pass for any
   #    reason at all, including a script that never ran ──────────────────────
-  $out = & $pwshCmd.Source -NoProfile -NonInteractive -File $script 'probed' 2>&1 | Out-String
+  $out = & $pwshCmd.Source -NoProfile -NonInteractive -File $script 'probed' 'not-required' 2>&1 | Out-String
   $rc = $LASTEXITCODE
   Ck 'a PROBED plan runs on through the call site (rc)' 0 $rc
   CkHas '...and reaches the next statement with the leg pattern' $out 'REACHED-NEXT-STATEMENT size=1'
+  # ★★ THE SECOND GATE, AT THE SAME REAL CALL SITE. A refusal that only THREW
+  # would let the driver run the whole corpus on an uncorroborated list; this is
+  # the one place that can prove the process actually stops, because it spawns a
+  # child.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  $out = & $pwshCmd.Source -NoProfile -NonInteractive -File $script 'probed' 'unmeasured' 2>&1 | Out-String
+  $rc = $LASTEXITCODE
+  Ck 'an UNMEASURED run directory STOPS THE DRIVER at the real call site (rc)' 1 $rc
+  CkHas '...having said why' $out "runDirectoryGating='unmeasured'"
+  Ck '...and the statement AFTER the call site never ran' 'no' `
+     $(if ($out -match 'REACHED-NEXT-STATEMENT') { 'yes' } else { 'no' })
   Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue
 }
 
@@ -658,6 +691,38 @@ function Pin-ConfoundReport($driver) {
   try { [void](Write-ConfoundReport 'elf64-x86_64' '   ') }
   catch { $empty = "$($_.Exception.Message)" }
   Ck 'an EMPTY report REFUSES rather than printing nothing' $true ($empty -match 'EMPTY confound report')
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# P - THE EXECUTION-EVIDENCE HELPERS RETURN LISTS A CALLER CAN COUNT
+# ═══════════════════════════════════════════════════════════════════════════
+# [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+# ✔MEASURED 2026-09-15 while writing them: the first cut ended with `return ,$mons`,
+# and the call site wraps the call in `@( )`. PowerShell then counts ONE element
+# for an EMPTY list — the empty array itself — so `Stop-ExecEvidenceMonitors` would
+# have bound `$null` to `-LiteralPath` and thrown on every segment of every leg with
+# no armed row (pe64 among them), and `Invoke-ExecEvidenceAttribution` would have
+# reported "1 failure(s) excused" over nothing. No run had reached that path yet.
+# So the empty shapes are asserted THROUGH THE CALL-SITE SPELLING, and a mutant that
+# restores the comma must red.
+function Pin-ExecEvidenceShapes($driver) {
+  Invoke-Expression (Get-Fns $driver @('Start-ExecEvidenceMonitors', 'Stop-ExecEvidenceMonitors', 'Invoke-ExecEvidenceAttribution'))
+  function Info($m) { }
+  function Warn($m) { }
+  $script:ConfoundsOverride = $null
+  $noEvidence = [pscustomobject]@{ label = 'pe64-x86_64'; confoundsByEvidence = @(); executionEvidence = @() }
+  $mons = @(Start-ExecEvidenceMonitors $noEvidence (Join-Path $Work 'no-evidence.log'))
+  Ck 'a leg with no armed row starts NO monitor, and the call site counts ZERO' 0 $mons.Count
+  $stopped = 'no error'
+  try { Stop-ExecEvidenceMonitors 'pe64-x86_64' $mons } catch { $stopped = "THREW: $($_.Exception.Message)" }
+  Ck '...and stopping that empty list is a no-op, not a null -LiteralPath' 'no error' $stopped
+  $excused = @(Invoke-ExecEvidenceAttribution $noEvidence 'native' @('x.log') @() @('walsetlk-2.2.3'))
+  Ck 'an attribution with no armed row excuses NOTHING, counted as zero' 0 $excused.Count
+  $script:ConfoundsOverride = @('^op-1')
+  $armed = [pscustomobject]@{ label = 'elf64-x86_64'; confoundsByEvidence = @('^walsetlk-'); executionEvidence = @('clock-realtime-steps') }
+  Ck 'the operator override starts no monitor either' 0 (@(Start-ExecEvidenceMonitors $armed (Join-Path $Work 'override.log'))).Count
+  Ck '...and attributes nothing' 0 (@(Invoke-ExecEvidenceAttribution $armed 'native' @('x.log') @() @('walsetlk-2.2.3'))).Count
+  $script:ConfoundsOverride = $null
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1463,6 +1528,20 @@ Green 'L    the smoke argv: MEASURED targets, DECLARED launcher' 'Pin-SmokeArgv'
 Green 'M    the precondition discriminator, silent crash included' 'Pin-Precondition'
 Green 'N    the confound report is PRINTED, per leg'          'Pin-ConfoundReport'
 Green 'O    the located compiler is PROVED current'           'Pin-CompilerCurrency'
+Green 'P    the execution-evidence helpers return COUNTABLE lists' 'Pin-ExecEvidenceShapes'
+# FP - THE DEFECT ITSELF, RESTORED: `return ,$mons`, which the call site's `@( )`
+# counts as ONE element for an EMPTY list. The pin must red on the zero count and on
+# the null -LiteralPath the stop then throws.
+# [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+$mP = Join-Path $Work 'mP.ps1'
+if (Invoke-Mutation 'FP restore the comma return in Start-ExecEvidenceMonitors' $mP '  if (-not $evidence.Count) { return $mons }' {
+      param($src)
+      return @($src | ForEach-Object {
+        if ($_ -eq '  if (-not $evidence.Count) { return $mons }') { '  if (-not $evidence.Count) { return ,$mons }' } else { $_ }
+      })
+    }) {
+  Red 'FP an EMPTY monitor list is counted as zero, and stopping it is a no-op' 'Pin-ExecEvidenceShapes' $mP
+}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # F - RED-ON-DISABLE. Every guard above is REMOVED in a copy; the pin must fail.

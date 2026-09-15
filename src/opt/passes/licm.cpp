@@ -115,8 +115,25 @@ using dss::opt::analysis::MirMemoryClobbers;
     // a Const isn't computed at runtime; relocating it has no
     // measurable benefit and would duplicate the rebuilder's
     // dedicated-builder dispatch logic at the LICM tier.
+    //
+    // ★ `BlockAddress` BELONGS TO THIS LIST BY THE LIST'S OWN RULE —
+    // a zero-operand value origin whose builder is `addBlockAddress`
+    // — and it was MISSING from it. It was stopped three lines above
+    // instead, by `hasSideEffects`, which it carries for a completely
+    // unrelated reason: its PRESENCE is the canonical mark that its
+    // target block is address-taken, so DCE must not drop it
+    // (mir_opcode.hpp). Protection by a coincidence of two
+    // independent facts is not protection: had that flag ever been
+    // revisited on its own terms, the hoist loop below would have
+    // forwarded `instPayload` — a block id — into the rebuild's NEW
+    // block numbering, pointing `&&label` at the wrong block with
+    // nothing to observe it. `MirBuilder::addInst` now REFUSES the
+    // opcode, so that route aborts rather than miscompiling; this
+    // entry is what makes LICM correct on its own terms instead of
+    // relying on the backstop.
     if (op == MirOpcode::Const || op == MirOpcode::Arg
-     || op == MirOpcode::GlobalAddr) return false;
+     || op == MirOpcode::GlobalAddr
+     || op == MirOpcode::BlockAddress) return false;
     return true;
 }
 

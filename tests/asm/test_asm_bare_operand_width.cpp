@@ -349,28 +349,84 @@ TEST(AsmBareOperandWidth, UndeclaredDerivationIsRefusedNotGuessed) {
 // only no-`subOf` rows).
 //
 // ⚠ WHY THIS PIN READS A MESSAGE AND NOT BYTES, STATED RATHER THAN GLOSSED:
-// `asm-arm64-gas.lang.json` declares no floating-point mnemonic (✔MEASURED,
-// and `examples/c/c_inline_asm_fp_class_constraint` records the same gap), so
-// no instruction containing an FP-class operand can ENCODE today. What the
-// derivation change moves is which refusal fires: at 128 bits the template
-// translator's width-flag map refuses FIRST, naming the width — which is only
-// reachable if the derivation really answered 128. The mutant control below
-// proves the discrimination in the other direction.
+// nothing on this target ENCODES at 128 bits. What the derivation change moves
+// is which refusal fires: at 128 bits the template translator's width-flag map
+// refuses FIRST, naming the width — which is only reachable if the derivation
+// really answered 128. The mutant control below proves the discrimination in
+// the other direction.
+//
+// ⚠⚠ THE REASON THIS COMMENT USED TO GIVE WENT FALSE ON 2026-09-02 AND THE PIN
+// DID NOT. It read: *`asm-arm64-gas.lang.json` declares no floating-point
+// mnemonic (✔MEASURED, and `examples/c/c_inline_asm_fp_class_constraint`
+// records the same gap), so no instruction containing an FP-class operand can
+// ENCODE today.* That dialect now spells seven FP mnemonics
+// (D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME, cycle
+// P54), and an FP-class operand encodes fine at 64 and 32 bits — `fadd d0, d1,
+// d2` runs. The pin survives untouched because its subject was never the
+// mnemonic table: it drives the `mov` spelling at the class's REGISTER-NATURAL
+// width. ⚠ THE TAIL OF THAT SENTENCE — *and 128 elects nothing because the
+// target declares no width-128 arithmetic variant, which is a different fact
+// and still true* — LASTED HOURS: `move_bytes` is a width-128 fpr variant on
+// exactly the `mov` spelling this pin writes
+// (D-ASM-ARM64-GAS-SPELLS-NO-ROUNDING-MODE-OR-VECTOR-MOVE, lane av), so 128
+// elects it. See the note on the TEST below for what the pin reads now.
+// ⚠⚠ AND THE REFUSAL THIS PIN WAS READING IS GONE ENTIRELY AS OF 2026-09-02 —
+// THE RUN NOW SUCCEEDS. Two replacements of this comment in one day are
+// recorded rather than collapsed, because the second one is a finding. The arm
+// first looked for `"128 bits"` (the template translator's width-flag map),
+// then for `"at width 128"` (election), and now for a WORD: lane `av` declared
+// `move_bytes`, the SIMD register move
+// (D-ASM-ARM64-GAS-SPELLS-NO-ROUNDING-MODE-OR-VECTOR-MOVE), so a width-128 fpr
+// `mov` finally HAS a variant and this template elects it.
+// ⚠ THAT ALSO MEANS DSS NOW ACCEPTS A SPELLING BOTH REFERENCES REFUSE — the
+// substituted text here is `mov v0, v1`, which GNU as 2.42 and clang 18.1.3
+// both REJECT (✔MEASURED). It is not this pin's defect and not this pin's to
+// fix: an arrangement is erased to a width before election, so no variant can
+// be reachable from `%0.16b` without also being reachable from a bare `%0` or
+// a `%q0`. Anchored at [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]].
+// ★ THE SUBJECT IS UNTOUCHED AND IS NOW MEASURED IN BYTES RATHER THAN IN A
+// MESSAGE, which is strictly stronger: the derivation must answer 128, so a
+// width-128 fpr variant must be elected and a derivation that answered 64 would
+// elect a different word from the same source text and the same 64-bit binding.
+//
+// ⚠⚠ THE **SPELLING** THIS PIN DRIVES CHANGED ON 2026-09-02, AND ITS OWN
+// PARAGRAPH ABOVE PREDICTED WHY. It wrote `mov %0, %1`, whose substituted text
+// is `mov v0, v1` — a line GNU as 2.42 and clang 18.1.3 BOTH REJECT (✔MEASURED)
+// — and the note above says in as many words that DSS accepting it *is not this
+// pin's defect and not this pin's to fix*. It is fixed now
+// ([[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]], lane `ae`): a
+// SCALAR spelling can no longer elect `move_bytes`, whose every field reads its
+// register as a vector of lanes, so `mov %0, %1` is refused exactly as both
+// references refuse it.
+// ⇒ the pin moved to a width-128 fpr instruction that really is SCALAR, which
+// is what a bare `%N` names: the Q-form load. ✔MEASURED, gas 2.42 and clang
+// 18.1.3 agreeing: `ldr q0, [x1, #16]` = 0x3DC00420 (imm12 = 16/16 = 1) against
+// the 64-bit `ldr d0, [x1, #8]` = 0xFD400420. The two words differ in the size
+// field, so a derivation that answered 64 elects `fldr_u`'s D arm and emits the
+// SECOND word — a different word, from the same source text and the same 64-bit
+// binding width, which is the same differential the old arm had.
 TEST(AsmBareOperandWidth, Arm64FpBareOperandNamesTheFullVectorRegister) {
-    auto const r = run(kArm, "mov %0, %1\n", {"%0", "%1"}, {"v0", "v1"}, 64,
+    auto const r = run(kArm, "ldr %0, [x1, #16]\n", {"%0"}, {"v0"}, 64,
                        LirRegClass::FPR);
     ASSERT_TRUE(r->parsed) << "template did not parse";
-    EXPECT_FALSE(r->ok)
-        << "a 128-bit FP operation elected a variant — no shipped arm64 "
-           "mnemonic declares one, so something substituted a narrower width";
-    auto const msg = messages(*r);
-    // ★ `ok == false` IS ITSELF THE DISCRIMINATOR: under the pre-R5
-    // `operandType` rule this exact run LOWERS CLEAN at 64 bits (the mutant
-    // control below proves it), so a refusal here can only mean a width the
-    // map has no arm for — and the message must say which.
-    EXPECT_NE(msg.find("128 bits"), std::string::npos)
-        << "the refusal must carry the derived width — 128, the register-"
-           "natural answer — or the derivation did not run: " << msg;
+    ASSERT_TRUE(r->ok) << messages(*r);
+    ASSERT_GE(r->bytes.size(), 4u) << hex(r->bytes);
+    EXPECT_EQ((std::vector<std::uint8_t>{r->bytes[0], r->bytes[1],
+                                         r->bytes[2], r->bytes[3]}),
+              (std::vector<std::uint8_t>{0x20, 0x04, 0xC0, 0x3D}))
+        << "a bare `%N` on an fpr binding must derive 128 (the class's "
+           "register-natural width) and elect LDR Qt — 0xFD400420 would mean "
+           "it derived 64: " << hex(r->bytes);
+
+    // ★ AND THE SPELLING THIS PIN USED TO DRIVE IS NOW REFUSED, which is the
+    // other half of the same derivation: `mov %0, %1` still answers 128, and
+    // 128 on `move_bytes` is a LANE form that a bare operand does not name.
+    auto const scalarMove = run(kArm, "mov %0, %1\n", {"%0", "%1"},
+                                {"v0", "v1"}, 64, LirRegClass::FPR);
+    ASSERT_TRUE(scalarMove->parsed) << messages(*scalarMove);
+    EXPECT_FALSE(scalarMove->ok)
+        << "`mov v0, v1` assembled, and gas 2.42 and clang 18.1.3 both REJECT "
+           "it";
 }
 
 // ★★ THE REMOVE-DIRECTION MUTANT FOR R5: revert the shipped `fpr` row to
@@ -398,27 +454,51 @@ TEST(AsmBareOperandWidth, RevertingTheFpDeclarationRestoresTheNarrowTier) {
     ASSERT_TRUE(reverted.has_value());
 
     auto const r = runOn(loadDialect(kArm.dialect), *reverted,
-                         "mov %0, %1\n", {"%0", "%1"}, {"v0", "v1"}, 64,
+                         "ldr %0, [x1, #16]\n", {"%0"}, {"v0"}, 64,
                          LirRegClass::FPR);
     ASSERT_TRUE(r->parsed);
-    // ⚠ THE TWO ARMS FAIL AT DIFFERENT TIERS AND THAT IS THE WHOLE PIN. Under
-    // `operandType` the 64-bit binding passes the width map, so the LOWERING
-    // succeeds — `ok` is TRUE — and the death happens later, at the encoder's
-    // register-bank guard, whose diagnostics this harness's `assemble()` call
-    // discards; what it leaves behind is an EMPTY byte vector (the function is
-    // dropped from the module). Under `registerNatural` the lowering itself
-    // refuses, naming 128. `ok` flipping with the document is the derivation
-    // being READ.
-    EXPECT_TRUE(r->ok)
-        << "under `operandType` the 64-bit-bound bare FP operand must pass "
-           "the lowering (the width map has a 64 arm): " << messages(*r);
-    EXPECT_EQ(messages(*r).find("128 bits"), std::string::npos)
-        << "the reverted document still derived 128 — the engine is not "
-           "reading the declaration: " << messages(*r);
-    EXPECT_TRUE(r->bytes.empty())
-        << "a gpr-elected `mov` over v-registers ENCODED — the register-bank "
-           "guard one tier down has been deleted, which is a different defect "
-           "this pin must not mask: " << hex(r->bytes);
+    // ⚠ THE TWO ARMS ANSWER DIFFERENTLY AND THAT IS THE WHOLE PIN. Under
+    // `registerNatural` the derivation says 128; under `operandType` it says
+    // 64. The observable flipping with the DOCUMENT is the declaration being
+    // READ rather than a 128 carried inside the engine.
+    //
+    // ⚠⚠ WHAT THE OBSERVABLE IS HAS CHANGED TWICE IN ONE DAY, AND BOTH MOVES
+    // ARE RECORDED BECAUSE THE SECOND IS A FINDING. (a) The arm first asserted
+    // an ENCODER-tier death leaving an EMPTY byte vector; `electOpcode` gained
+    // a register-PROFILE axis in cycle P54 (lane el) and the wrong-bank `mov`
+    // began dying at ELECTION instead, so the harness's trailing `ret` survived
+    // and the arm moved to a message plus a one-word bound. (b) Later the same
+    // day lane `av` declared `move_bytes`
+    // (D-ASM-ARM64-GAS-SPELLS-NO-ROUNDING-MODE-OR-VECTOR-MOVE) and BOTH arms
+    // began to SUCCEED: the operands are `v` registers, so an fpr-class `mov`
+    // variant now exists at 128 AND at 64 and there is no bank disagreement
+    // left to refuse. The pin therefore stops reading refusal TEXT — which was
+    // always the weakest thing it could read — and reads the WORD, which is
+    // the strictly stronger discrimination it wanted all along: 0x4EA11C20 for
+    // the derived 128, 0x0EA11C20 for the derived 64, from one source text.
+    // ⓘ That a scalar `%N` reaches a lane-form variant at all is the leak
+    // anchored at [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]]; it
+    // is not this pin's subject, and this pin is honest about which word it is
+    // looking at either way.
+    // ⚠⚠ (c) THAT LEAK IS CLOSED AS OF 2026-09-02 (lane `ae`) AND THE OBSERVABLE
+    // MOVED ONE LAST TIME, to the spelling the positive pin above now uses. A
+    // bare `%N` states NO lane arrangement, `move_bytes` reads every field as a
+    // vector of lanes, and `mov v0, v1` is therefore refused here exactly as
+    // GNU as 2.42 and clang 18.1.3 refuse it — so the `mov` spelling can no
+    // longer carry a two-arm width differential at all. The Q-form LOAD can,
+    // and it is a genuinely SCALAR 128-bit instruction, which is what a bare
+    // `%N` names. ✔MEASURED, both references agreeing: `ldr q0, [x1, #16]` =
+    // 0x3DC00420 (imm12 = 16/16) and `ldr d0, [x1, #16]` = 0xFD400820
+    // (imm12 = 16/8) — two different words from ONE source text, still keyed by
+    // nothing but the derivation this document declares.
+    ASSERT_TRUE(r->ok) << messages(*r);
+    ASSERT_GE(r->bytes.size(), 4u) << hex(r->bytes);
+    EXPECT_EQ((std::vector<std::uint8_t>{r->bytes[0], r->bytes[1],
+                                         r->bytes[2], r->bytes[3]}),
+              (std::vector<std::uint8_t>{0x20, 0x08, 0x40, 0xFD}))
+        << "the reverted document must derive 64 and elect the D arm "
+           "(0xFD400820); 0x3DC00420 would mean the engine is not reading the "
+           "declaration: " << hex(r->bytes);
 }
 
 // ★★ THE CONTROL FOR THE MUTANT ABOVE — the arm that proves the pin is not

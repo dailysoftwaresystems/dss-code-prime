@@ -1,0 +1,28 @@
+{
+  "$comment": "D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED (P60, lane rc): a RUNNABLE witness that the parser's two former host recursions are gone and that their ceilings rose to what the references WORK at. `main.c` nests 1300 parentheses (past the OLD `parser.maxExpressionDepth` of 1024, now 16384 — the paren/postfix-body atom re-entry, one host frame per `(`) and 400 `(int)` casts (past the OLD `parser.maxSpeculationDepth` of 320, now 2048 — the speculation drive, eight host frames per level, ✔MEASURED at 8.5 KiB per level under MSVC 19.51 Debug where a 1 MiB thread died at ~120 casts). Before P60 `dsscp` REFUSED this file with a positioned `P_ExpressionTooDeep` / `P_MaxSpeculationDepth`, so there was no binary to run at all; exit 42 = 12 + 30 proves both that the nests PARSE and that they mean what C says — a paren nest and an int cast chain are the identity over their operand, so any depth that dropped or duplicated a level would change the sum. ANTI-FOLD: both nests start from MUTABLE GLOBALS (`g12`, `g30`), so no front-end arm can fold either away and report green without having parsed it. ★ WHY 1300 AND NOT DEEPER: ✔MEASURED, MSVC 19.51.36252 compiles 1400 nested parentheses and refuses 1600 with `fatal error C1026` (mingw-w64 gcc 13.2.0 stops at 4096, gcc 13.3.0 at 32768), so 1300 is the deepest round depth past the old cap that THREE references still WORK at. ✔REFERENCE ORACLE, each probed SEPARATELY on this exact file: gcc 13.3.0 (WSL) compiles and RUNS it to 42; mingw-w64 gcc 13.2.0 compiles and RUNS it to 42; MSVC 19.51.36252 compiles it (`cl /c /std:c17`); clang 18.1.3 REFUSES it loudly (`bracket nesting level exceeded maximum of 256`, its documented default) — a loud refusal casts no vote, and one working reference makes the program REQUIRED (`DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C`, the union over what WORKS). The `release` arm additionally proves the result survives Mem2Reg/CSE/LICM/DCE with the same exit code. Every leg below can see this equally; the parser's own host stack no longer takes part, whatever its frames weigh.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

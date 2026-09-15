@@ -112,6 +112,7 @@ Usage:
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -297,15 +298,45 @@ class Collapse(Exception):
     """The scan failed structurally. Never reported as a clean pass."""
 
 
+_OWNING_TREE = None
+
+
+def _owning_tree():
+    """`scripts/owning-tree/owning-tree.py` -- the one owner of "which tree is this file in?".
+
+    Loaded by path from this file's sibling directory (a hyphen is not a module name). It
+    FAILS LOUD when absent rather than falling back to a local walk: a second copy of the
+    answer is the drift that owner exists to end.
+    """
+    global _OWNING_TREE
+    if _OWNING_TREE is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise Collapse("cannot find %s -- this guard's root is resolved there and "
+                           "nowhere else" % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OWNING_TREE = mod
+    return _OWNING_TREE
+
+
 def repo_root():
+    """The tree THIS FILE lives in -- never the tree the caller's shell is standing in.
+
+    ⚠ This was a bare `git rev-parse --show-toplevel`. ✔MEASURED 2026-09-15 (P66): run by
+    path with its cwd inside a different repository it ratcheted THAT repository's plans
+    (and reddened on a document only that repository holds); from a directory inside no
+    repository it would not run at all. ctest pins `WORKING_DIRECTORY`, so no gate saw
+    either. The walk and the measurement that chose it are in
+    `scripts/owning-tree/owning-tree.py`; this guard reads files only.
+    """
+    ot = _owning_tree()
     try:
-        p = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                           capture_output=True, check=False)
-    except OSError as exc:
-        raise Collapse("cannot run git (%s)" % exc)
-    if p.returncode != 0:
-        raise Collapse("not inside a git checkout")
-    return p.stdout.decode("utf-8", "replace").strip()
+        return ot.resolve(__file__)
+    except ot.Refusal as exc:
+        raise Collapse(str(exc))
 
 
 def _walk(root, rel_roots, keep):
@@ -642,7 +673,7 @@ def run(root, write, baseline=False):
 # an arm that checks only the code cannot tell which one it proved. That mistake
 # was measured in a sibling guard in this same cycle.
 
-EXPECTED_ARMS = 39
+EXPECTED_ARMS = 42
 _RAN = None
 
 # ⚠ THE MUTATION FIXTURE IS ASSEMBLED, NOT SPELLED OUT. A literal `path:line` in
@@ -1161,6 +1192,13 @@ def selftest(root):
         ok &= _arm("23c GREEN-AFTER-REPAIR", tmp, EXIT_OK)
 
         ok &= _pipe_arms(_fact)
+
+        # ── the root is the tree THIS FILE lives in, whatever the caller's cwd ──
+        # Arms, oracle and synthesized negatives are owned by
+        # scripts/owning-tree/owning-tree.py.
+        for _ok, _why, _detail in _owning_tree().root_arms(repo_root, (Collapse,), False,
+                                                           __file__):
+            ok &= _fact("R " + _why, _ok, "" if _ok else _detail)
 
         ok &= _arm("6 GREEN-AFTER-RESTORE", tmp, EXIT_OK)
     finally:

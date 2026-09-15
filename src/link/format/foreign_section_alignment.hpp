@@ -40,12 +40,25 @@
 // A declared section alignment is a RE-LAYOUT HINT, never a correctness input
 // on read-back: the merge re-lays-out every item it takes in, so this value
 // constrains where an item MAY be placed, and nothing downstream trusts it as a
-// statement about where the item already IS. Consequently a value the
-// `Alignment` newtype cannot represent (above its 256-byte ceiling, or -- for
-// the byte-count encoding -- not a power of two at all) degrades to byte
-// alignment rather than failing the read: refusing an object over a hint we do
-// not depend on would reject input every reference linker accepts, and 256
-// bytes already covers every alignment any producer in this pipeline emits.
+// statement about where the item already IS. Consequently a value ABOVE THE 256
+// BYTES THESE TWO HELPERS ACCEPT (or -- for the byte-count encoding -- not a
+// power of two at all) degrades to byte alignment rather than failing the read:
+// refusing an object over a hint we do not depend on would reject input every
+// reference linker accepts.
+//
+// ⚠ P63 (D-CSUBSET-ALIGNMENT-CEILING-REFUSES-WHAT-TWO-REFERENCES-RUN): THE 256
+// BELOW IS NOW THIS FILE'S OWN NUMBER, NOT THE NEWTYPE'S. It used to be both --
+// `Alignment::fromBytes` capped at 256 and these guards mirrored it -- and the
+// sentences here said so. The newtype's domain is now its STORAGE domain
+// (`Alignment::kMaxBytes`), because a policy number smuggled into a storage type
+// is what refused `aligned(4096)` in the front end for a whole release. These
+// two guards keep 256 as a DELIBERATE read-side policy, unchanged in behaviour;
+// what changed is that it no longer claims to be the newtype's limit.
+// ⓘ Raising it is a real, separate question with a real witness on the other
+// side: BOTH mingw-w64 gcc 13.2.0 and clang emit `IMAGE_SCN_ALIGN_*` classes up
+// to 8192, so a COFF `.rdata` declaring 512..8192 currently degrades to byte
+// alignment here rather than being carried. Not taken in P63 -- stated, because
+// a number that has stopped being derived should say what it is.
 //
 // ⚠ The degrade direction is deliberate and is the ONLY safe one available
 // here: it can only make the merge place an item MORE freely than the producer
@@ -65,8 +78,9 @@ namespace dss::link::format {
 // free to place the item anywhere.
 [[nodiscard]] constexpr Alignment
 foreignSectionAlignmentFromLog2(std::uint32_t log2) noexcept {
-    // 2^8 = 256 is the newtype's ceiling; a wild exponent (a corrupt or
-    // simply larger-than-we-model field) takes the same degrade arm.
+    // 2^8 = 256 is THIS FILE'S read-side policy (see the docblock -- it is no
+    // longer the newtype's ceiling); a wild exponent (a corrupt or simply
+    // larger-than-we-model field) takes the same degrade arm.
     if (log2 == 0u || log2 > 8u) return Alignment{};
     return Alignment::fromBytes(std::uint32_t{1} << log2)
         .value_or(Alignment{});

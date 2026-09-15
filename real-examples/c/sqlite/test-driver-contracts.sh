@@ -801,6 +801,19 @@ pin_confound_supply() { # pin_confound_supply <driver>
   LEG_CONFOUND_GATING[elf64-arm64]="probed"
   LEG_CONFOUND_GATING[unprobedleg]="unprobed"
   LEG_CONFOUNDS[unprobedleg]="'^busy2-'"
+  # ★ THE SECOND GATING STAMP, which the supply ALSO refuses to proceed without.
+  # A row declaring `requiresRunDirectory` is honoured only where THIS RUN measured
+  # the named precondition on THIS LEG'S own run directory, and a PLAN can never
+  # carry that measurement — it is resolved before any run directory exists.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  LEG_RUN_DIR_GATING=()
+  LEG_RUN_DIR_GATING[elf64-x86_64]="not-required"
+  LEG_RUN_DIR_GATING[pe64-x86_64]="not-required"
+  LEG_RUN_DIR_GATING[elf64-arm64]="not-required"
+  LEG_RUN_DIR_GATING[unprobedleg]="not-required"
+  LEG_RUN_DIR_GATING[uncorroboratedleg]="unmeasured"
+  LEG_CONFOUND_GATING[uncorroboratedleg]="probed"
+  LEG_CONFOUNDS[uncorroboratedleg]="'^vtabH-3\\.1$'"
   load_fns "$drv" leg_confound_patterns || return 0
   local -a got=()
   eval "got=($(leg_confound_patterns elf64-x86_64))"
@@ -834,6 +847,69 @@ pin_confound_supply() { # pin_confound_supply <driver>
   ck "an UNPROBED plan REFUSES rather than serving its ungated list" "97" "$rc"
   ck_has "...naming the gating it got" "$out" "confoundGating='unprobed'"
   ck_has "...and how to resolve a measured plan" "$out" "--environment-probes skip"
+  # ★★ AND AN UNCORROBORATED RUN DIRECTORY, the second gate. Silent in the SAME
+  # direction and one step worse: skipping it would EXCUSE `vtabH-3.1` on a host
+  # whose run drive root is clean, i.e. launder a genuine dss regression into
+  # "expected" — and an excused failure is indistinguishable from an absent one.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  out="$(leg_confound_patterns uncorroboratedleg 2>&1)"; rc=$?
+  ck "an UNMEASURED run directory REFUSES rather than serving its uncorroborated list" "97" "$rc"
+  ck_has "...naming the gating it actually got" "$out" "runDirectoryGating='unmeasured'"
+  ck_has "...and the call that would measure it" "$out" "--corroborate-run-dir"
+  # ★ AND THE ALLOWED VALUE REALLY PASSES — a refusal that refused everything
+  # would satisfy the three arms above while breaking every run.
+  eval "got=($(leg_confound_patterns elf64-x86_64))"
+  ck_has "a 'not-required' run-directory gating is ACCEPTED" "${got[*]}" "^walsetlk-"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# P — THE PER-FAILURE ATTRIBUTION IS FOLDED, NOT MERELY PRINTED
+# ═══════════════════════════════════════════════════════════════════════════
+# [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+# The resolver decides which failures an ARMED row excuses; this driver's whole job
+# is to fold that answer into the classifier's arrays. A fold that printed the
+# REPORT lines and left `real` untouched would read, in the log, exactly like an
+# attribution that worked — and every clock failure would still be charged. So the
+# shipped function runs against a resolver stub that answers in the wire format, and
+# the ARRAYS are asserted. Twin of test-driver-contracts.ps1's pin P.
+pin_exec_evidence_fold() { # pin_exec_evidence_fold <driver>
+  local drv="$1" stub="$WORK/fake-attribution.py"
+  cat > "$stub" <<'PY'
+import sys
+argv = sys.argv[1:]
+if "--attribute-unit-failures" not in argv:
+    sys.exit(9)
+if any(a == "--failure=explode-1.1" for a in argv):
+    print("the resolver refused on purpose", file=sys.stderr)
+    sys.exit(3)
+print("EXCUSED\twalsetlk-2.2.3")
+print("GENUINE\tselect1-1.1")
+print("REPORT\t[elf64-x86_64] per-failure clock attribution: walsetlk-2.2.3 EXCUSED by ^walsetlk- - stub")
+PY
+  load_fns "$drv" exec_evidence_start exec_evidence_attribute || return 0
+  local saved_resolver="$LEG_RESOLVER"
+  LEG_RESOLVER="$stub"; LEG_CATALOGUE="$CATALOGUE"; DSS_CONFOUNDS=""
+  LEG_EVIDENCE_CONFOUNDS=(); LEG_EXECUTION_EVIDENCE=()
+  LEG_EVIDENCE_CONFOUNDS[elf64-x86_64]="'^walsetlk-'"
+  LEG_EXECUTION_EVIDENCE[elf64-x86_64]="clock-realtime-steps"
+  SEG_LOGS=("$WORK/seg0.log"); TIER_PREFIXES=()
+  real=(walsetlk-2.2.3 select1-1.1); confound=(zipfile-25.0); evidence_excused=()
+  exec_evidence_attribute elf64-x86_64 native
+  ck "an EXCUSED name LEAVES the genuine list"          "select1-1.1"                "${real[*]}"
+  ck "...and JOINS the confounds"                        "zipfile-25.0 walsetlk-2.2.3" "${confound[*]}"
+  ck "...and is named as excused PER FAILURE"            "walsetlk-2.2.3"             "${evidence_excused[*]}"
+  # A resolver that could not answer excuses NOTHING and says so.
+  real=(walsetlk-2.2.3 explode-1.1); confound=(); evidence_excused=(); WARNINGS=""
+  exec_evidence_attribute elf64-x86_64 native
+  ck "a FAILED attribution leaves every failure GENUINE" "walsetlk-2.2.3 explode-1.1"  "${real[*]}"
+  ck "...excuses nothing"                                ""                           "${evidence_excused[*]}"
+  ck_has "...and warns that it could NOT run"            "$WARNINGS"                  "could NOT run"
+  # A leg with no armed row gets no monitor and its log is left alone.
+  printf 'keep me\n' > "$WORK/untouched.log"
+  exec_evidence_start pe64-x86_64 "$WORK/untouched.log"
+  ck "a leg with no armed row starts NO monitor"         "0"                          "${#EXEC_MON_PIDS[@]}"
+  ck "...and its segment log is NOT emptied"             "keep me"                    "$(cat "$WORK/untouched.log")"
+  LEG_RESOLVER="$saved_resolver"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -900,7 +976,7 @@ pin_confound_supply_stops_the_driver() { # pin_confound_supply_stops_the_driver 
   # the shipped driver's own text.
   {
     printf '%s\n' 'set -Eeuo pipefail'
-    printf '%s\n' 'declare -A LEG_CONFOUNDS=() LEG_CONFOUND_GATING=() LEG_CONFOUND_DECLARED=()'
+    printf '%s\n' 'declare -A LEG_CONFOUNDS=() LEG_CONFOUND_GATING=() LEG_CONFOUND_DECLARED=() LEG_RUN_DIR_GATING=()'
     printf '%s\n' 'DSS_CONFOUNDS=""'
     printf '%s\n' 'die() { printf "DIE: %s\n" "$*" >&2; exit 1; }'
     printf '%s\n' 'info() { :; }'
@@ -908,6 +984,7 @@ pin_confound_supply_stops_the_driver() { # pin_confound_supply_stops_the_driver 
     printf '%s\n' 'leg="${1:?leg}"'
     printf '%s\n' 'LEG_CONFOUNDS[$leg]="'"'"'^busy2-'"'"'"'
     printf '%s\n' 'LEG_CONFOUND_GATING[$leg]="${2:?gating}"'
+    printf '%s\n' 'LEG_RUN_DIR_GATING[$leg]="${3:?run-dir-gating}"'
     printf '%s\n' 'LEG_CONFOUND_DECLARED[$leg]=1'
     printf '%s\n' "$callsite"
     printf '%s\n' 'printf "REACHED-NEXT-STATEMENT size=%d\n" "${#CONFOUND_PATTERNS[@]}"'
@@ -923,7 +1000,7 @@ pin_confound_supply_stops_the_driver() { # pin_confound_supply_stops_the_driver 
   # TO START on that host because of it, so the whole sqlite corpus was unreachable
   # on macOS. ★ The re-exec above already found the right shell; `$BASH` is that
   # shell's own path, so the child cannot disagree with the parent about what bash is.
-  out="$("$BASH" "$script" someleg unprobed 2>&1)"; rc=$?
+  out="$("$BASH" "$script" someleg unprobed not-required 2>&1)"; rc=$?
   ck "an UNPROBED plan STOPS THE DRIVER at the real call site (rc)" "1" "$rc"
   ck_has "...having said why" "$out" "confoundGating='unprobed'"
   # ⚠ THROUGH `ck`, not a bare `bad`: `bad` bumps the GLOBAL failure count, which
@@ -933,9 +1010,20 @@ pin_confound_supply_stops_the_driver() { # pin_confound_supply_stops_the_driver 
      "$(printf '%s' "$out" | grep -q 'REACHED-NEXT-STATEMENT' && echo yes || echo no)"
   # ── THE NEGATIVE CONTROL: the same script must reach the marker on a
   #    `probed` plan, or the arm above would pass for the wrong reason ──────
-  out="$("$BASH" "$script" someleg probed 2>&1)"; rc=$?
+  out="$("$BASH" "$script" someleg probed not-required 2>&1)"; rc=$?
   ck "a PROBED plan runs on through the call site (rc)" "0" "$rc"
   ck_has "...and reaches the next statement with the leg's pattern" "$out" "REACHED-NEXT-STATEMENT size=1"
+  # ★★ THE SECOND GATE, AT THE SAME REAL CALL SITE. A refusal that only killed a
+  # SUBSHELL would let the driver run the whole corpus on an uncorroborated list
+  # — which is exactly what D-HARNESS-CONFOUND-SUPPLY-REFUSAL-DIES-IN-A-SUBSHELL
+  # measured for the first gate. This is the only place that can prove the process
+  # actually stops, because it spawns a child.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  out="$("$BASH" "$script" someleg probed unmeasured 2>&1)"; rc=$?
+  ck "an UNMEASURED run directory STOPS THE DRIVER at the real call site (rc)" "1" "$rc"
+  ck_has "...having said why" "$out" "runDirectoryGating='unmeasured'"
+  ck "...and the statement AFTER the call site never ran" "no" \
+     "$(printf '%s' "$out" | grep -q 'REACHED-NEXT-STATEMENT' && echo yes || echo no)"
   rm -f "$script"
 }
 
@@ -1544,6 +1632,15 @@ green "L    the launcher-prerequisite gate"                 pin_launcher_prereq
 green "M    the smoke argv: MEASURED targets, DECLARED launcher" pin_smoke_argv
 green "N    the confound report is PRINTED, per leg"        pin_confound_report
 green "O    the located compiler is PROVED current"         pin_compiler_currency
+green "P    the per-failure attribution is FOLDED into the classifier" pin_exec_evidence_fold
+# HP — the fold removed: the REPORT lines still print, the excused name stays in
+# `real`, and every clock failure is charged exactly as before the attribution.
+# [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+if mutate "HP drop the fold of the resolver's EXCUSED names" "$WORK/mP.sh" '  real=(${keep[@]+"${keep[@]}"})' '
+    $0 == "  real=(${keep[@]+\"${keep[@]}\"})" { next }
+    { print }'; then
+  red "HP an EXCUSED name is FOLDED out of the genuine list" pin_exec_evidence_fold "$WORK/mP.sh"
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 # H — RED-ON-DISABLE. Every guard above is REMOVED in a copy; the pin must fail.

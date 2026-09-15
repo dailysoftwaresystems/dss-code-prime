@@ -3,6 +3,7 @@
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
 #include "lir/lir_reg.hpp"
+#include "lir/lir_rewrite.hpp"
 
 #include <array>
 #include <cstdint>
@@ -14,34 +15,6 @@ namespace dss {
 
 namespace {
 
-// Per-pass cache of "which opcode is this register class's declared
-// register-to-register MOVE". Same lazily-resolved shape
-// `lir_2addr_legalize`'s `PassState` uses to resolve the copy it
-// SYNTHESIZES — deliberately, because the two passes must agree on which
-// opcode a copy IS: legalize mints one, this pass may delete one, and a
-// disagreement would let the minted copy survive as an unrecognized
-// opcode or (far worse) let some OTHER opcode be mistaken for a copy.
-//
-// ⚠ ABSENCE IS SILENT HERE, AND THAT IS THE CORRECT ARM. A class with no
-// declared `move` means this pass recognizes no copy for it and deletes
-// nothing — the fail-safe. `lir_2addr_legalize` reports the same absence
-// as an Error because it is trying to EMIT the instruction and cannot;
-// a cleanup that finds nothing to clean has nothing to report.
-struct PassState {
-    TargetSchema const& schema;
-    std::array<std::optional<std::optional<std::uint16_t>>, 5> movByClass{};
-
-    [[nodiscard]] std::optional<std::uint16_t> resolveMov(LirRegClass cls) {
-        auto const c = static_cast<std::size_t>(cls);
-        if (c >= movByClass.size()) return std::nullopt;
-        if (!movByClass[c].has_value()) {
-            movByClass[c] = schema.regClassOpOpcode(
-                static_cast<TargetRegClass>(c), RegClassOp::Move);
-        }
-        return *movByClass[c];
-    }
-};
-
 // ── RULE R1 — REDUNDANT-COPY ELIMINATION ────────────────────────────────
 //
 // True iff `inst` is the declared class MOVE copying one physical register
@@ -51,84 +24,72 @@ struct PassState {
 // on the shipped x86_64 target THREE opcodes (`mov`, `trunc`, `zext`)
 // disassemble as `mov` and only the first is a no-op when its source and
 // destination coincide.
+//
+// ★★★ THE PREDICATE ITSELF LIVES IN `lir_pass_util`, AND THAT IS THE POINT.
+// It has a second consumer — `censusIdentityClassMoves`, the stage-boundary
+// instrument that attributes this population per PASS
+// (D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT). A census
+// that re-implemented the rule would measure a population the rule does not
+// act on, which is exactly the failure that left the header's callconv claim
+// unfalsifiable for a cycle. One owner; the census reports the verdict this
+// function acts on, by construction.
 [[nodiscard]] bool
 isRedundantCopy(Lir const& src, LirInstId inst, TargetSchema const& schema,
-                PassState& state) {
-    auto const* info = schema.opcodeInfo(src.instOpcode(inst));
-    if (info == nullptr) return false;
-    // A terminator is never a copy, and deleting one would leave the block
-    // unterminated — the builder's abort, not a diagnostic.
-    if (info->isTerminator()) return false;
-    // A declared side effect (or a declared implicit register read/clobber)
-    // is an observable this pass cannot reason about from the operands.
-    if (info->hasSideEffects) return false;
-    if (info->implicitRegisters.has_value()) return false;
-
-    LirReg const result = src.instResult(inst);
-    if (!result.valid() || result.isPhysical == 0) return false;
-
-    // ★ THE OPCODE IDENTITY TEST. Not a mnemonic, not an encoded byte —
-    // the handle the SCHEMA names as this class's copy.
-    auto const movOpcode = state.resolveMov(result.regClass());
-    if (!movOpcode.has_value()) return false;
-    if (src.instOpcode(inst) != *movOpcode) return false;
-
-    // Exactly one operand, a physical register identical to the result.
-    auto const ops = src.instOperands(inst);
-    if (ops.size() != 1) return false;
-    if (ops[0].kind != LirOperandKind::Reg) return false;
-    if (ops[0].reg.isPhysical == 0) return false;
-    if (!(ops[0].reg == result)) return false;
-
-    // ★ THE WIDTH TEST — the second, independent guard on the partial-
-    // register-write hazard. A copy NARROWER than the register it names
-    // writes bits it did not read (x86-64's 32-bit GPR forms zero the
-    // upper half), so it is NOT a no-op even when source and destination
-    // are the same register.
-    //
-    // ⓘ A REGISTER WIDER THAN 64 BITS IS NOW SAYABLE, AND THIS RULE NEEDED
-    // NO EDIT TO GAIN IT. `lirInstWidthBits` was a three-flag field over
-    // {8,16,32,64} until 2026-08-26, so 128 was UNSAYABLE and a full-width copy
-    // of an x86-64 `xmm` (16 bytes) could never satisfy this equality -- a
-    // MEASURED 121 of 6079 corpus identity copies were skipped for that reason
-    // alone. That was an LIR expressiveness defect, not a peephole residue, so
-    // it was fixed at the substrate (`kLirInstFlagWidth128`) rather than
-    // special-cased here.
-    //
-    // The 121 copies are still not deleted, and that is now an honest
-    // statement about the LOWERING rather than about this rule: no shipped
-    // lowering STAMPS 128, because the FPR class moves on both shipped targets
-    // (`movaps`, `fmov`) declare encoding variants with no width guard and so
-    // have no reason to state a width. The day one does, this comparison starts
-    // matching them with no change here.
-    //
-    // *** AND THE GUARD MUST STAY EVEN THEN, because the lowering is not the
-    // only producer of a class move: the inline-asm path builds instructions
-    // from a dialect template and can mint a NARROW one (`movl %eax,%eax`
-    // writes 32 bits and zeroes the upper half of a 64-bit register). Inferring
-    // "writes the whole register" from the ABSENCE of a width guard on the
-    // variant would admit exactly that instruction, and is unsound for the same
-    // reason on any target whose only class-move form is a narrowing one.
-    auto const* regInfo = schema.registerInfo(
-        static_cast<std::uint16_t>(result.id));
-    if (regInfo == nullptr || regInfo->widthBytes == 0) return false;
-    auto const regWidthBits =
-        static_cast<std::uint32_t>(regInfo->widthBytes) * 8u;
-    if (static_cast<std::uint32_t>(lirInstWidthBits(src.instFlags(inst)))
-        != regWidthBits) {
-        return false;
-    }
-
-    // ★ NEVER DELETE THE ONLY NAMER OF A SIDE-STRUCTURE ENTRY. The
-    // per-instruction register-constraint pool is referenced by index from
-    // the instruction stream and `verifyLirRebuild` counts the references
-    // on both sides; orphaning an entry is `L_SideStructureReferenceLost`.
-    // Keeping a redundant copy costs one instruction — the fail-safe arm.
-    if (src.instRegConstraintHandle(inst) != kLirNoRegConstraints) {
-        return false;
-    }
-    return true;
+                lir_pass_util::ClassMoveOpcodeCache& movCache) {
+    return lir_pass_util::classifyIdentityClassMove(src, inst, schema,
+                                                    movCache)
+           == lir_pass_util::IdentityClassMoveVerdict::Deletable;
 }
+
+// ── WHY THE WIDTH CLAUSE INSIDE THAT PREDICATE IS NOT VACUOUS ───────────
+//
+// ⓘ A REGISTER WIDER THAN 64 BITS IS NOW SAYABLE, AND THIS RULE NEEDED
+// NO EDIT TO GAIN IT. `lirInstWidthBits` was a three-flag field over
+// {8,16,32,64} until 2026-08-26, so 128 was UNSAYABLE and a full-width copy
+// of an x86-64 `xmm` (16 bytes) could never satisfy this equality -- a
+// MEASURED 121 of 6079 corpus identity copies were skipped for that reason
+// alone. That was an LIR expressiveness defect, not a peephole residue, so
+// it was fixed at the substrate (`kLirInstFlagWidth128`) rather than
+// special-cased here.
+//
+// ★★ THE 121 COPIES ARE NOW DELETED, AND NOT BY THIS RULE — THE ALLOCATOR
+// STOPPED EMITTING THEM:
+// D-LIR-COPY-COALESCING-ASKS-THE-REGISTERS-WIDTH-NOT-THE-VALUES.
+// ⚠ THE PARAGRAPH THAT STOOD HERE PREDICTED THE WRONG FIX
+// AND IS WORTH KEEPING AS A CORRECTION: it said the residue was "an honest
+// statement about the LOWERING", that nothing stamps 128, and that "the day
+// one does, this comparison starts matching them with no change here". A
+// class move NEVER states 128 and never should — `movaps` and `fmov`
+// declare their register-to-register variants with no width guard, so a
+// stated width would be vocabulary with no purpose (and on arm64 there IS
+// no 128-bit `fmov`: the 128-bit SIMD move is ORR, different bytes). The
+// residue was never waiting on the lowering; it was this comparison asking
+// about the REGISTER when the answer depends on the VALUE, and the value is
+// knowable only while the ends are still virtual. ✔MEASURED corpus-wide:
+// 185 identity `movaps` (x86_64) and 150 identity `fmov` (arm64) reached
+// the emitted stream, every one of them refused HERE.
+//
+// ⇒ THIS TEST STAYS EXACTLY AS IT IS, and it is not vacuous: the copies
+// that still reach this pass are the ones the linear scan made identity by
+// COINCIDENCE, carrying no proof about the value, plus the author-pinned
+// physical ones. For those, "does it write the whole register" is the
+// only sound question, and it is the right one.
+//
+// *** AND THE GUARD MUST STAY EVEN THEN, because the lowering is not the
+// only producer of a class move: the inline-asm path builds instructions
+// from a dialect template and can mint a NARROW one (`movl %eax,%eax`
+// writes 32 bits and zeroes the upper half of a 64-bit register). Inferring
+// "writes the whole register" from the ABSENCE of a width guard on the
+// variant would admit exactly that instruction, and is unsound for the same
+// reason on any target whose only class-move form is a narrowing one.
+//
+// ✔MEASURED 2026-09-02 over `examples/c/**` at `--config=release`, by
+// `censusIdentityClassMoves` reading R1's OWN verdict at four stage
+// boundaries: this clause is what the entire post-peephole residue consists
+// of — 37 of 37 (arm64) and 39 of 39 (x86_64) surviving identity class moves
+// are refused by the width test and by nothing else, and ZERO deletable ones
+// survive to the encoder on either target. See the header's ATTRIBUTION
+// section (D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT).
 
 // ── RULE R2 — FALLTHROUGH-BRANCH ELISION (D-OPT-JCC-FALLTHROUGH) ────────
 //
@@ -182,7 +143,8 @@ isElidableFallthroughBranch(Lir const& src, LirBlockId blk, LirInstId inst,
 // peephole that cannot prove a rewrite simply does not perform it.
 [[nodiscard]] bool
 peepholeOneFunc(Lir const& src, LirFuncId srcFn, TargetSchema const& schema,
-                PassState& state, LirBuilder& b, std::size_t& removed,
+                lir_pass_util::ClassMoveOpcodeCache& movCache,
+                LirBuilder& b, std::size_t& removed,
                 std::size_t& elided, DiagnosticReporter& reporter) {
     (void)b.addFunction(src.funcSymbol(srcFn));
 
@@ -209,7 +171,7 @@ peepholeOneFunc(Lir const& src, LirFuncId srcFn, TargetSchema const& schema,
         std::uint32_t const instCount = src.blockInstCount(srcBlk);
         for (std::uint32_t ii = 0; ii < instCount; ++ii) {
             LirInstId const inst = src.blockInstAt(srcBlk, ii);
-            if (isRedundantCopy(src, inst, schema, state)) {
+            if (isRedundantCopy(src, inst, schema, movCache)) {
                 ++removed;
                 continue;
             }
@@ -274,7 +236,7 @@ runLirPeephole(Lir const&          src,
     }
     result.expectedFuncCount = src.moduleFuncCount();
 
-    PassState state{schema};
+    lir_pass_util::ClassMoveOpcodeCache movCache{};
     LirBuilder b{schema};
     // The wide-literal pool and the per-instruction register-constraint
     // pool, index-preserving, in ONE call — see `lir_pass_util.hpp`.
@@ -282,7 +244,7 @@ runLirPeephole(Lir const&          src,
 
     std::size_t const funcCount = src.moduleFuncCount();
     for (std::uint32_t fi = 0; fi < funcCount; ++fi) {
-        if (peepholeOneFunc(src, src.funcAt(fi), schema, state, b,
+        if (peepholeOneFunc(src, src.funcAt(fi), schema, movCache, b,
                             result.redundantCopiesRemoved,
                             result.fallthroughBranchesElided, reporter)) {
             continue;
@@ -297,6 +259,14 @@ runLirPeephole(Lir const&          src,
 
     result.lir     = std::move(b).finish();
     result.rebuilt = true;
+    // ★ THE STAGE BOUNDARY THIS PASS DID NOT HAVE
+    // (D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT).
+    // Env-gated and zero-cost when unset, like every other stage dump. Without
+    // it the nearest boundaries either side of this pass were `post-rewrite`
+    // and `post-callconv`, so ANY per-pass claim about the population R1 acts
+    // on could only be stated as a net across three passes — which is how the
+    // header's callconv claim came to rest on evidence that could not test it.
+    dumpLirFuncs(result.lir, schema, "post-peephole");
     return result;
 }
 

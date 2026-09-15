@@ -1,5 +1,5 @@
 {
-  "$comment": "C11/C23 6.4.5 (FF3, D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE) fail-loud witness: u\"\\xC3\\xA9\" uses \\x byte escapes in a char16_t string. The old path SILENTLY collapsed the two intended code units into one (0x00E9); Cycle C FAILS LOUD with H_WideByteEscapeUnsupported (unsuppressable) - a raw code-unit value is not a code point. Narrow \"\\xC3\\xA9\" is unchanged (byte-producing). The load-bearing pin is the CODE + a rejected compile at the literal position.",
+  "$comment": "C11/C23 6.4.5 (D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE) fail-loud witness. THE CLAIM MOVED, IT WAS NOT DROPPED: this example used to pin the WHOLESALE refusal of u\"\\xC3\\xA9\", which is gone - that literal now assembles to the two units 0xC3 and 0xA9 (see wide_string_hex_escape_units, which asserts them by value). What remains fail-loud is an escape that OVERFLOWS the element, the one case where the references genuinely split: MEASURED 2026-09-02, each compiled and RUN, gcc 13.3.0 and mingw-w64 gcc 13.2.0 accept u\"\\x1FFFF\" by TRUNCATING to 0xFFFF with a warning while clang 18.1.3 and MSVC 19.51 REFUSE. A reference that only accepts by narrowing the value away is not one that WORKS, so the union over what works is a refusal. 0x1FFFF is a fine char32_t unit - U\"\\x1FFFF\" compiles - so the bound is the ELEMENT WIDTH, not Unicode. The load-bearing pin is the CODE + a rejected compile at the literal position; the message names the width and the value.",
   "language": "c",
   "source": "main.c",
   "targets": [
@@ -9,8 +9,8 @@
   ],
   "expectDiagnostics": [
     {
-      "code": "H_WideByteEscapeUnsupported",
-      "line": 7,
+      "code": "H_EscapeValueExceedsCodeUnit",
+      "line": 26,
       "col": 43
     }
   ]

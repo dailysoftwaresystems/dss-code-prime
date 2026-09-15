@@ -77,8 +77,12 @@ breached · 4 usage error.
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # ★ AT IMPORT, COVERING BOTH STREAMS, and inside `main()` would NOT be enough --
@@ -162,7 +166,8 @@ def _git_prefix(repo: Path) -> list[str]:
     prefix = ["-C", key]
     probe = subprocess.run(("git", *prefix, "rev-parse", "--git-dir"),
                            capture_output=True, text=True,
-                           encoding="utf-8", errors="replace")
+                           encoding="utf-8", errors="replace",
+                           env=_owning_tree().git_environment())
     if probe.returncode != 0:
         dot_git = repo / ".git"
         if dot_git.is_file():
@@ -202,9 +207,15 @@ def _git(repo: Path, *argv: str) -> subprocess.CompletedProcess:
     # relative to whatever directory the carriage happened to start in -- and a floor
     # that answers about the wrong directory fails toward "not ignored", which is the
     # loud direction, but for the wrong reason and with an unactionable message.
+    # ★ `env=` IS LOAD-BEARING TOO. Without it a caller's exported GIT_DIR / GIT_WORK_TREE /
+    # GIT_INDEX_FILE decides which repository answers: ✔MEASURED 2026-09-15 (P66 lane rr),
+    # `ignored_paths` for this tree returned 0 paths under another repository's GIT_DIR +
+    # GIT_WORK_TREE, and failed on that repository's index under its GIT_INDEX_FILE. The rule,
+    # and why, are in scripts/owning-tree/owning-tree.py (`git_environment`).
     return subprocess.run(
         ("git", *_git_prefix(repo), *argv), cwd=str(repo),
         capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=_owning_tree().git_environment(),
     )
 
 
@@ -262,12 +273,123 @@ def render(paths: list[str], fmt: str) -> list[str]:
     return ["./" + p.rstrip("/") for p in paths]
 
 
+_OWNING_TREE = None
+
+
+def _owning_tree():
+    """`scripts/owning-tree/owning-tree.py` -- the one owner of "which tree is this file in?".
+
+    Loaded by path from this file's sibling directory (a hyphen is not a module name). It
+    FAILS LOUD when absent rather than falling back to a local walk: a second copy of the
+    answer is the drift that owner exists to end.
+    """
+    global _OWNING_TREE
+    if _OWNING_TREE is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            _die(2, f"cannot find {path} -- the default repository is resolved there and "
+                    "nowhere else.")
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OWNING_TREE = mod
+    return _OWNING_TREE
+
+
+def resolve_repo(arg):
+    """`--repo` as the caller typed it; else the tree THIS FILE lives in.
+
+    ⚠ The default was `.` -- the CALLER's working directory. ✔MEASURED 2026-09-15 (P66):
+    run by path from inside a different repository it derived THAT repository's exclude
+    list (and named it as the source); from a directory inside no repository it refused.
+    Every automated carriage passes `--repo` explicitly, so only a direct caller reached it.
+    ⓘ Only the WALK is taken from the owner, not its git agreement: which git can answer
+    for the tree is `_git_prefix`'s question, and it crosses the WSL namespace where a
+    plain `git -C` cannot.
+    """
+    if arg:
+        return Path(arg).resolve()
+    ot = _owning_tree()
+    try:
+        return Path(ot.resolve(__file__))
+    except ot.Refusal as exc:
+        _die(2, str(exc))
+
+
+# ⚠ Raising this is the claim that the arms you added actually RUN.
+SELF_TEST_ARMS = 5
+
+
+def self_test() -> int:
+    """The DEFAULT repository is this file's tree from any cwd; an explicit `--repo` still wins;
+    and git is asked without the caller's git environment.
+
+    Arms, oracle and synthesized negatives are owned by scripts/owning-tree/owning-tree.py.
+    """
+    ot = _owning_tree()
+    arms = ot.root_arms(lambda: str(resolve_repo(None)), (SystemExit,), False, __file__)
+    box = tempfile.mkdtemp(prefix="carriage-excludes-selftest-")
+    try:
+        got = resolve_repo(box)
+        arms.append((ot.same_path(str(got), box),
+                     "an explicit --repo still names ITS tree, never this one", f"got={got}"))
+    finally:
+        shutil.rmtree(box, ignore_errors=True)
+
+    # (5) its git calls IGNORE the caller's git environment. A synthetic repository ignores one
+    # directory; under a steering environment a bare `git status --ignored` proves git would
+    # have described the decoy instead.
+    fx = tempfile.mkdtemp(prefix="carriage-excludes-steer-")
+    real, clean, steered = False, None, None
+    try:
+        for rel, body in ((".gitignore", "ignored-own/\n"), ("ignored-own/x.txt", "x\n"),
+                          ("kept.txt", "k\n")):
+            full = os.path.join(fx, *rel.split("/"))
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(body)
+        ot.run_git(["init", "-q", fx], capture_output=True)
+        _GIT_DIR_FOR.clear()
+        clean = ignored_paths(Path(fx))
+        with ot.steering() as steer:
+            neg = ot.bare_git(["status", "--porcelain", "--ignored", "-z"], fx, steer)
+            real = neg.returncode == 0 and "!! ignored-own/" not in neg.stdout.split("\0")
+            _GIT_DIR_FOR.clear()
+            with ot.caller_environment(steer):
+                try:
+                    steered = ignored_paths(Path(fx))
+                except SystemExit as exc:
+                    steered = f"refused (exit {exc.code})"
+    finally:
+        _GIT_DIR_FOR.clear()
+        ot.remove_tree(fx)
+    arms.append((real and clean == ["ignored-own/"] and steered == clean,
+                 "its git calls IGNORE a caller's GIT_DIR + GIT_WORK_TREE + GIT_INDEX_FILE "
+                 "naming another repository",
+                 f"negative-synthesized={real} clean={clean} steered={steered}"))
+    failed = [a for a in arms if not a[0]]
+    for ok, why, detail in arms:
+        print(f"  {'ok  ' if ok else 'FAIL'} {why}" + ("" if ok else f"   [{detail}]"))
+    if len(arms) != SELF_TEST_ARMS:
+        print(f"carriage-excludes self-test: FAIL -- {len(arms)} arm(s) ran, "
+              f"{SELF_TEST_ARMS} expected")
+        return 1
+    print(f"carriage-excludes self-test: {'FAIL' if failed else 'OK'} ({len(arms)} arm(s))")
+    return 1 if failed else 0
+
+
 def main() -> int:
+    if sys.argv[1:] == ["--self-test"]:
+        return self_test()
     ap = argparse.ArgumentParser(
         prog="carriage-excludes.py", add_help=True,
         description="Emit a gate carriage's transport exclude list, derived from git.")
     ap.add_argument("--format", required=True, choices=("rsync", "tar", "plain"))
-    ap.add_argument("--repo", default=".", help="repository to ask (default: cwd)")
+    ap.add_argument("--repo", default=None,
+                    help="repository to ask (default: the tree this script lives in, never "
+                         "the caller's cwd; a relative --repo is taken relative to the "
+                         "caller, as typed)")
     ap.add_argument("--also", action="append", default=[], metavar="PATH",
                     help="a POLICY withhold this carriage adds on top of git's answer "
                          "-- e.g. `.git` on a carriage that syncs no history. Repeatable.")
@@ -275,7 +397,7 @@ def main() -> int:
                     help="write here instead of stdout (what --exclude-from wants)")
     args = ap.parse_args()
 
-    repo = Path(args.repo).resolve()
+    repo = resolve_repo(args.repo)
     top = _git(repo, "rev-parse", "--show-toplevel")
     if top.returncode != 0:
         _die(2, f"{repo} is not a git repository -- cannot derive an exclude list.")

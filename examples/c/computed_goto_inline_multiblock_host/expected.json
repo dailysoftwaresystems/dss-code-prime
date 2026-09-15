@@ -1,0 +1,30 @@
+{
+  "$comment": "D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST execution witness: a computed-goto threaded interpreter (`&&label`+`goto *p`) whose EVERY address-taken label block also calls the MULTI-BLOCK inline-eligible helper `adjust`. Under the `release` shippedPipeline (Inlining ON) `main` routes through MultiBlockInliner and every address-taken block is SPLIT at its call, so the run exercises both new caller-host arms: BlockAddress's block-id payload remapped through the block-ENTRY map (blockMap_), and IndirectBr's successors remapped 1:1. The exit code is what discriminates — a computed goto landing on the wrong block still yields well-formed IR. `op_add` is entered TWICE (prog[0], prog[2]), the second time through the BlockAddress, so remapping the address to the split chain's CONTINUATION instead of its entry skips one `adjust` and exits 113; `trace` is a base-4 register of which labels ran in which order, so any wrong-label landing or dropped IndirectBr edge moves the code too. adjust(x)=x>100?x-50:(x<0?-x:x+3); acc 1 -> 4 -> *2=14 -> 17 -> -7=13, trace 1 -> 6 -> 25 -> 103, exit 13+103=116. RED-ON-DISABLE (REMOVE-direction, src/opt/passes/inlining.cpp): delete MultiBlockInliner::emitCallerInst's BlockAddress arm and the verbatim addInst fallback copies the OLD block id; delete MultiBlockInliner::emitTerminator's IndirectBr arm and the switch default aborts the compile. Witnessed under baseline AND release.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 116,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

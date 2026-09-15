@@ -1,0 +1,17 @@
+{
+  "$comment": "D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE (P54): the RUN witness for a WEAK extern IMPORT nothing in the program defines. `&ea` must resolve to NULL (the else arm, +7) while an ordinary global's address must not (+35) -- 7 + 35 = 42, so reversing EITHER branch changes the exit code and the two cannot mask each other. Before this row closed, `weak` on an extern import reached the HIR linkage map and STOPPED (HIR->MIR consumed the map for function definitions and globals only), so every emitted object marked the undefined symbol STRONG and every DSS-linked image REFUSED the program with K_SymbolUndefined -- a loud refusal of a program gcc, clang and (on PE) clang-through-mingw-ld all link and run. ✔MEASURED at this tree, all four arms: elf64-x86_64 rc 42, elf64-aarch64 under qemu rc 42, pe64-x86_64 rc 42; the darwin arm is built on every host and RUN on the macOS leg. ★ THE `release` ARM IS NOT DECORATION HERE: the null resolution has to survive the optimizer, and a pass that assumed the address of a declared object is never null would fold `if (&ea)` to TRUE, take the read arm and load through the null slot -- a crash or a wrong exit, never 42. RED-on-disable: delete `__attribute__((weak))` from `ea`'s declaration -> the reference is STRONG, nothing defines it, and the link refuses with K_SymbolUndefined on every leg (no artifact at all, so no exit code). ⓘ HOW THE NULL IS SPELLED, because it is NOT 'give the symbol address 0': every reference to an extern DATA import is lowered got-indirect (the code materializes a POINTER SLOT and dereferences it), so the link gives the symbol a pointer-sized read-only slot whose CONTENT is 0. ✔MEASURED the alternative first -- binding the symbol itself at address 0 produced an ELF exec that linked clean and SEGFAULTED (rc 139), because the deref hit address 0. clang spells it the same way on PE (`.refptr.ea` in `.rdata`), and ld leaves an unresolved weak symbol's GOT slot zero on ELF.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

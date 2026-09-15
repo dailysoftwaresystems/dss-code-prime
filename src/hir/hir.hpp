@@ -165,6 +165,13 @@ public:
     [[nodiscard]] HirNodeId assignTarget(HirNodeId id) const;
     [[nodiscard]] HirNodeId assignValue(HirNodeId id)  const;
 
+    // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+    // read-modify-write — the lvalue whose address is taken once, the update
+    // expression, and the SymbolId `update` reads the observed old value through.
+    [[nodiscard]] HirNodeId rmwTarget(HirNodeId id)         const;
+    [[nodiscard]] HirNodeId rmwUpdate(HirNodeId id)         const;
+    [[nodiscard]] SymbolId  rmwOldValueSymbol(HirNodeId id) const;
+
     // ── declaration accessors (HR4) ──────────────────────────────────────────
     // module: its top-level declarations.
     [[nodiscard]] std::span<HirNodeId const> moduleDecls(HirNodeId id) const;
@@ -559,6 +566,15 @@ public:
     // target = value; — children [target, value]. `target` is an lvalue
     // expression (Ref / Index / MemberAccess / Deref).
     HirNodeId makeAssignStmt(HirNodeId target, HirNodeId value, HirFlags flags = HirFlags::None);
+
+    // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+    // an indivisible read-modify-write — children [target, update], payload
+    // `oldValueSymbol` (the binding `update` reads the observed value through as a
+    // `Ref`), `type` the object's VALUE type (unqualified). Yields the value the
+    // object held before the replacement that took effect. See `HirKind`.
+    HirNodeId makeReadModifyWrite(HirNodeId target, HirNodeId update,
+                                  std::uint32_t oldValueSymbol, TypeId type,
+                                  HirFlags flags = HirFlags::None);
 
     // ── typed declaration helpers (HR4) ──────────────────────────────────────
     //

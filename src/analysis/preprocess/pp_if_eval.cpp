@@ -127,47 +127,6 @@ using detail::makeBoolLiteral;
     return prefix.slice(t.span);
 }
 
-// D-PP-DEFINED-VIA-MACRO-EXPANSION: read the RAW BYTES `[start, end)` of an
-// operand that spans SEVERAL tokens -- an angle header name, whose spelling
-// includes whatever sat between its tokens (`<a b.h>` is the header `a b.h`), so
-// it cannot be rebuilt by concatenating token texts.
-//
-// ★★ THIS IS THE FUNCTION THAT REFUSES TO GUESS, and it exists because moving
-// the `__has_include` fold PAST macro expansion is exactly what makes guessing
-// possible. Before the move, both ends of the range always came from the same
-// directive line. After it, the tokens can arrive from a replacement list, from
-// the product tail, or from two different constructs spliced together -- and a
-// range read across such a splice is not a malformed header name, it is a
-// PLAUSIBLE one made of unrelated bytes, which the resolver would then answer
-// confidently. That is a silent wrong answer, strictly worse than the refusal
-// this change removed.
-//
-// Returns nullopt -- and EVERY caller then fails LOUD -- when the range cannot
-// be read without guessing:
-//   * the two ends live in DIFFERENT buffers (prefix vs product tail);
-//   * the range runs backwards, or past the end of its buffer;
-//   * the range CROSSES A LINE. A header name never does. A range that does is
-//     the tell that expansion joined two constructs: the `<` from a `#define`
-//     line and the `>` from the directive, with the whole file between them.
-[[nodiscard]] std::optional<std::string_view>
-ppRawRun(ByteOffset start, ByteOffset end, SourceBuffer const& prefix,
-         std::string_view tail) {
-    if (end < start) return std::nullopt;
-    const ByteOffset prefixLen = static_cast<ByteOffset>(prefix.text().size());
-    std::string_view text;
-    if (start < prefixLen) {
-        if (end > prefixLen) return std::nullopt;   // straddles both buffers
-        text = prefix.text().substr(start, end - start);
-    } else {
-        const ByteOffset s = start - prefixLen;
-        const ByteOffset e = end - prefixLen;
-        if (e > tail.size()) return std::nullopt;
-        text = tail.substr(s, e - s);
-    }
-    if (text.find('\n') != std::string_view::npos) return std::nullopt;
-    return text;
-}
-
 // Emit a positioned preprocessor diagnostic on the synth buffer.
 void emit(DiagnosticReporter& rep, DiagnosticCode code, BufferId buffer,
           SourceSpan span, std::string msg) {
@@ -250,7 +209,8 @@ public:
     IceParser(std::vector<Token> toks, GrammarSchema const& schema,
               SourceBuffer const& synth, SourceBuffer const& scratch,
               LiteralKinds const& lits, DiagnosticReporter& rep,
-              BufferId diagBufferId, std::string_view productTail)
+              BufferId diagBufferId, std::string_view productTail,
+              std::optional<bool> charIsUnsigned)
         : toks_(std::move(toks)),
           schema_(schema),
           synth_(synth),
@@ -273,7 +233,8 @@ public:
           // rather than an omission: at phase-4 widths every candidate is 64
           // bits, so a WIDTH model cannot reach the signedness answer. See
           // `preprocessorLiteralSignedness`.
-          intLadder_(schema.semantics().integerLiteralTyping) {
+          intLadder_(schema.semantics().integerLiteralTyping),
+          charIsUnsigned_(charIsUnsigned) {
         // The string-literal OPENER (C's `"`). A string literal lexes as an
         // opener token (`StringStart`) + a coalesced body; the body's schema
         // kind is in `lits_.string`, but the FIRST token the parser meets is the
@@ -307,9 +268,11 @@ public:
         charCloseKind_ = closeTokenForCoalescedBody(schema_, charBodyKind_);
     }
 
-    // Evaluate the whole token run. nullopt on any fail-loud condition (already
-    // reported). A TRAILING unconsumed token is malformed.
-    [[nodiscard]] std::optional<bool> evaluate() {
+    // Parse the WHOLE token run to one value. nullopt on any fail-loud condition
+    // (already reported): an empty run and a TRAILING unconsumed token are both
+    // malformed. The ONE parse both entry points below share, so the truth
+    // value and the phase-4 value can never come from different expressions.
+    [[nodiscard]] std::optional<HirLiteralValue> parseWhole() {
         if (atEnd()) {
             fail(DiagnosticCode::P_PreprocessorDirective,
                  "#if with an empty controlling expression");
@@ -323,6 +286,38 @@ public:
                  "trailing tokens after #if controlling expression");
             return std::nullopt;
         }
+        return v;
+    }
+
+    // The phase-4 VALUE (C 6.10.2p13: `intmax_t` / `uintmax_t`) of the whole
+    // run -- what an embed `limit` needs (D-PP-EMBED-PARAMS). The same
+    // integer-ness gate `evaluate()` applies (a float or string is refused with
+    // the same message), then the raw bits behind the domain `intmaxOperand`
+    // established: `asIntBits` is the reader entitled to them, and the core
+    // says which of the two types they are.
+    [[nodiscard]] std::optional<PpIfValue> evaluateValue() {
+        auto v = parseWhole();
+        if (!v.has_value()) return std::nullopt;
+        if (!asBool(*v, /*allowFloat=*/false).has_value()) {
+            fail(DiagnosticCode::P_PreprocessorDirective,
+                 "#if expression is not an integer constant");
+            return std::nullopt;
+        }
+        auto const bits = asIntBits(*v);
+        if (!bits.has_value()) {
+            fail(DiagnosticCode::P_PreprocessorDirective,
+                 "#if expression is not an integer constant");
+            return std::nullopt;
+        }
+        return PpIfValue{static_cast<std::uint64_t>(*bits),
+                         v->core != TypeKind::U64};
+    }
+
+    // Evaluate the whole token run to its TRUTH VALUE. nullopt on any fail-loud
+    // condition (already reported).
+    [[nodiscard]] std::optional<bool> evaluate() {
+        auto v = parseWhole();
+        if (!v.has_value()) return std::nullopt;
         // ── D-PP-IF-UNSIGNED-INTMAX ──────────────────────────────────────────
         // The question C 6.10.1p2 asks of the result is TRUTHINESS ("if it
         // compares unequal to 0"), never int64 representability. This used to
@@ -383,6 +378,16 @@ private:
     SchemaTokenId                 charOpenKind_{};   // c12: `'` opener
     SchemaTokenId                 charBodyKind_{};   // c12: coalesced char body
     SchemaTokenId                 charCloseKind_{};  // the `'` closer's own token
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]] / [[D-CSUBSET-CHAR-HIGHBYTE-ICE-SIGNEDNESS]]:
+    // the ACTIVE (target × object format)'s plain-`char` signedness, from the ONE
+    // accessor `TargetSchema::charIsUnsigned(ObjectFormatKind)`. C 6.10.1p4 makes
+    // a char constant in `#if` an `int`, and 6.4.4.4p10 makes THAT int negative
+    // for a high byte on a signed-`char` target — so this evaluator needs the
+    // target fact even though it runs before any type checking. `nullopt` (a
+    // caller with no target: the LSP, the direct-API tests) is honest and the
+    // 0–127 bodies that are every real program still fold; only a high byte
+    // refuses, loud.
+    std::optional<bool>           charIsUnsigned_{};
     std::size_t                   pos_ = 0;
     bool                          failed_ = false;
 
@@ -583,6 +588,11 @@ private:
             EvalOptions opts;
             opts.refuseOnDivByZero       = true;
             opts.refuseOnShiftOutOfRange = true;
+            // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the char leaf already
+            // resolved its own value, but the shared core still reads
+            // `intKindInfo` for any Char-cored operand — carry the ONE answer so
+            // the `#if` fold and the const-expr fold cannot diverge.
+            opts.charIsUnsigned          = charIsUnsigned_;
             auto folded = applyBinaryInt(*opK, lhs, *rhsOpt, opts, why);
             if (!folded.has_value()) {
                 fail(DiagnosticCode::P_PreprocessorDirective,
@@ -819,11 +829,35 @@ private:
                 && peek().schemaKind == charCloseKind_) {
                 advance();
             }
-            // C 6.10.1p4: an `int`, which that same paragraph then evaluates as
-            // a SIGNED intmax_t (D-PP-IF-UNSIGNED-INTMAX -- the value is
-            // unchanged; only the domain it folds in widens from 32 to 64).
-            return intmaxOperand(static_cast<std::uint64_t>(*cp),
-                                 /*isSigned=*/true);
+            // ── [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]] (the P0 arm) ────────
+            // C 6.10.1p4 makes this an `int`; C 6.4.4.4p10 says WHICH int, and
+            // it is not the code unit. `decodeCharLiteralBody` answers 0..255;
+            // the constant's value is that unit read as a plain `char`, so
+            // `'\xff'` is −1 where the target declares `char` signed. This arm
+            // used to hand the raw unit straight to `intmaxOperand`, which made
+            // `#if '\xff' < 0` take the `#else` arm on x86_64 — rc 0, zero
+            // diagnostics — where gcc 13.3.0 and clang 18.1.3 both take the
+            // `#if` arm. ✔MEASURED at b1f31420. The turn is the SHARED helper,
+            // the same one `cst_const_eval` and `lowerCharLiteral` call, so the
+            // three tiers cannot answer differently.
+            //
+            // A 0–127 body is the same integer under either signedness, which is
+            // why a caller with no target still folds every real-world `#if 'a'`;
+            // a high byte with no answer FAILS LOUD rather than picking one.
+            if (narrowCharConstantSignednessMatters(*cp)
+                && !charIsUnsigned_.has_value()) {
+                fail(DiagnosticCode::P_PreprocessorDirective,
+                     "a character constant above 0x7F in #if has a "
+                     "target-dependent value (C 6.2.5p15 leaves plain `char`'s "
+                     "signedness implementation-defined) and no target was "
+                     "supplied to this preprocessor run: "
+                     + std::string{textOf(bodyTok)});
+                return std::nullopt;
+            }
+            return intmaxOperand(
+                static_cast<std::uint64_t>(narrowCharConstantValue(
+                    *cp, charIsUnsigned_.value_or(false))),
+                /*isSigned=*/true);
         }
 
         // Integer literal (real, or a synthetic `defined`-result).
@@ -925,6 +959,135 @@ private:
     return 0;
 }
 
+// ══ D-PP-HAS-EXTENSION-BUILTIN-ABSENT: THE FEATURE-QUERY ANSWER ══════════════
+//
+// ★★★ EVERY ARM READS AN ALREADY-DECLARED CAPABILITY SET. Nothing below is a
+// list of names; each branch is a LOOKUP into the table that already owns the
+// truth, chosen by the operator's own config-declared `answers` verb. That is
+// what keeps `__has_builtin` from becoming a second, drifting copy of
+// `semantics.builtinFunctions` — the defect the ruling names explicitly.
+//
+// ⚠ AN UNKNOWN CAPABILITY ANSWERS 0 AND IS NOT AN ERROR. ✔MEASURED on every
+// reference that implements these operators (gcc 13.3.0, gcc 13.2.0 mingw,
+// clang 18.1.3): a name nothing declares answers 0, silently. That is the
+// CONTROL half of the operator, and it is the half a portable header depends on
+// — the whole idiom is "ask about something you may not have".
+[[nodiscard]] bool languageDeclaresAttribute(GrammarSchema const& schema,
+                                             std::string_view     name) {
+    std::string_view const bare = stripDunder(name);
+    for (auto const& row : schema.semantics().attributeEffects) {
+        for (auto const& n : row.names) {
+            if (n == name || n == bare) return true;
+        }
+    }
+    // The C23 standard attributes the language declares a VERSION for are
+    // attributes it knows too; `__has_c_attribute` already answers from this
+    // set, and an attribute in exactly one of the two tables is still an
+    // attribute this implementation honours.
+    for (CAttributeDef const& ka : schema.preprocess().knownCAttributes) {
+        if (ka.name == name || ka.name == bare) return true;
+    }
+    return false;
+}
+
+[[nodiscard]] bool languageDeclaresBuiltin(GrammarSchema const& schema,
+                                           std::string_view     name) {
+    for (auto const& b : schema.semantics().builtinFunctions) {
+        if (b.name == name) return true;
+    }
+    // The GNU compile-time builtins are declared as grammar KEYWORDS rather
+    // than `builtinFunctions` rows (they are operators wearing a call's
+    // punctuation — their operands are type-names, not values). The config
+    // names their KINDS; the WORD is read back out of the language's own
+    // keyword table here, so no spelling is stored twice and rebinding a
+    // keyword moves this answer with it.
+    if (schema.preprocess().builtinQueryKeywordTokens.empty()) return false;
+    for (LexemeMeaning const& m : schema.lookupLexeme(name)) {
+        for (std::string const& kindName :
+             schema.preprocess().builtinQueryKeywordTokens) {
+            SchemaTokenId const want = schema.schemaTokens().find(kindName);
+            if (want.valid() && m.id == want) return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] std::int64_t featureQueryAnswer(GrammarSchema const&     schema,
+                                              FeatureQueryAnswerSource src,
+                                              std::string_view         arg) {
+    switch (src) {
+        case FeatureQueryAnswerSource::DeclaredAttributes:
+            return languageDeclaresAttribute(schema, arg) ? 1 : 0;
+        case FeatureQueryAnswerSource::DeclaredBuiltins:
+            return languageDeclaresBuiltin(schema, arg) ? 1 : 0;
+        case FeatureQueryAnswerSource::DeclaredLanguageFeatures:
+            for (LanguageFeatureDef const& f :
+                 schema.preprocess().languageFeatures) {
+                if (f.name == arg
+                    && f.availability
+                           == LanguageFeatureAvailability::Standard) {
+                    return 1;
+                }
+            }
+            return 0;
+        case FeatureQueryAnswerSource::DeclaredLanguageExtensions:
+            // The SUPERSET arm, ✔MEASURED as clang's own behaviour: every
+            // feature is also an extension, so this reads the whole table.
+            for (LanguageFeatureDef const& f :
+                 schema.preprocess().languageFeatures) {
+                if (f.name == arg) return 1;
+            }
+            return 0;
+    }
+    return 0;   // unreachable — every source handled above
+}
+
+// D-PP-DEFINED-VIA-MACRO-EXPANSION: read the RAW BYTES `[start, end)` of an
+// operand that spans SEVERAL tokens -- an angle header name, whose spelling
+// includes whatever sat between its tokens (`<a b.h>` is the header `a b.h`), so
+// it cannot be rebuilt by concatenating token texts.
+//
+// ★★ THIS IS THE FUNCTION THAT REFUSES TO GUESS, and it exists because moving
+// the `__has_include` fold PAST macro expansion is exactly what makes guessing
+// possible. Before the move, both ends of the range always came from the same
+// directive line. After it, the tokens can arrive from a replacement list, from
+// the product tail, or from two different constructs spliced together -- and a
+// range read across such a splice is not a malformed header name, it is a
+// PLAUSIBLE one made of unrelated bytes, which the resolver would then answer
+// confidently. That is a silent wrong answer, strictly worse than the refusal
+// this change removed.
+//
+// Returns nullopt -- and EVERY caller then fails LOUD -- when the range cannot
+// be read without guessing:
+//   * the two ends live in DIFFERENT buffers (prefix vs product tail);
+//   * the range runs backwards, or past the end of its buffer;
+//   * the range CROSSES A LINE. A header name never does. A range that does is
+//     the tell that expansion joined two constructs: the `<` from a `#define`
+//     line and the `>` from the directive, with the whole file between them.
+//
+// Exported (declared in pp_if_eval.hpp) because the `#embed <resource>`
+// directive reads its angle name through THIS function too -- D-PP-EMBED-ANGLE
+// gave the directive the same refusal `__has_embed(<r>)` already had, rather
+// than a second slicer that could disagree with it.
+std::optional<std::string_view>
+ppRawRun(ByteOffset start, ByteOffset end, SourceBuffer const& prefix,
+         std::string_view tail) {
+    if (end < start) return std::nullopt;
+    const ByteOffset prefixLen = static_cast<ByteOffset>(prefix.text().size());
+    std::string_view text;
+    if (start < prefixLen) {
+        if (end > prefixLen) return std::nullopt;   // straddles both buffers
+        text = prefix.text().substr(start, end - start);
+    } else {
+        const ByteOffset s = start - prefixLen;
+        const ByteOffset e = end - prefixLen;
+        if (e > tail.size()) return std::nullopt;
+        text = tail.substr(s, e - s);
+    }
+    if (text.find('\n') != std::string_view::npos) return std::nullopt;
+    return text;
+}
+
 // ── D-PP-DEFINED-VIA-MACRO-EXPANSION: the shared `#if`-operand barrier ───────
 // The state machine and the MEASUREMENT behind each arm are documented on the
 // class (pp_if_eval.hpp). Every slot that does not match its expected shape
@@ -991,7 +1154,11 @@ bool PpIfOperandBarrier::protects(Token const& t, std::string_view word) {
         // forms; anything else is macro-expanded and re-examined (C's own
         // `#include MACRO` rule, ✔MEASURED unanimous — see the class doc). ──
         case State::HdrKeyword:
-            if (isKind(openParen_)) { state_ = State::HdrOpen; return true; }
+            if (isKind(openParen_)) {
+                state_        = State::HdrOpen;
+                operandDepth_ = 0;
+                return true;
+            }
             state_ = State::Idle;
             return false;
         case State::HdrOpen:
@@ -1010,16 +1177,233 @@ bool PpIfOperandBarrier::protects(Token const& t, std::string_view word) {
             return true;
         case State::InQuote:
             // A quote operand is the opener, ONE coalesced body token and the
-            // closer; none of them is expandable and none of them is the
-            // operator's `)`, so running to that `)` is exact and needs no
-            // second spelling of the literal-close token rule.
-            if (isKind(closeParen_)) { state_ = State::Idle; return true; }
+            // closer, then (for `__has_embed`, C23 6.10.2p7) an embed-parameter
+            // sequence whose clauses carry their own parens; none of it is
+            // expanded, and the run ends at the operator's DEPTH-0 `)` -- so the
+            // paren kinds are counted and no second spelling of the
+            // literal-close token rule is needed.
+            if (isKind(openParen_))  { ++operandDepth_; return true; }
+            if (isKind(closeParen_)) {
+                if (operandDepth_ == 0) { state_ = State::Idle; return true; }
+                --operandDepth_;
+                return true;
+            }
             return true;
         case State::HdrOperand:
-            state_ = State::Idle;
-            return isKind(closeParen_);
+            // Past the angle name: the same depth-counted run to the operator's
+            // own `)` -- `__has_embed(<r> limit(N))` holds `limit(N)` back
+            // exactly as the quote form does (6.10.2p7 protects the WHOLE
+            // parenthesized operand; only the `limit` clause is expanded, by the
+            // evaluator itself, 6.10.4.2p3).
+            if (isKind(openParen_))  { ++operandDepth_; return true; }
+            if (isKind(closeParen_)) {
+                if (operandDepth_ == 0) { state_ = State::Idle; return true; }
+                --operandDepth_;
+                return true;
+            }
+            return true;
     }
     return false;   // unreachable -- every State handled above
+}
+
+// ── C23 6.10.1p4–p9 / 6.10.4.1p2: the shared embed-parameter-sequence parser ──
+// (contract on the declaration in pp_if_eval.hpp)
+std::optional<PpEmbedParameterSequence>
+parseEmbedParameterSequence(std::span<Token const> toks, std::size_t begin,
+                            GrammarSchema const& schema,
+                            PpTokenTextFn const& textOf, PpEmbedFail const& fail,
+                            bool stopAtOperatorClose) {
+    using Role = PreprocessConfig::EmbedParameterRole;
+    PreprocessConfig const& pp = schema.preprocess();
+    SchemaTokenId const openParen =
+        schema.schemaTokens().find(pp.functionLikeOpenToken);
+    SchemaTokenId const closeParen =
+        schema.schemaTokens().find(pp.functionLikeCloseToken);
+    // The `::` of a prefixed parameter, by CONFIG kind. Invalid when the
+    // language declares no parameter surface: then no token is ever read as
+    // the separator and `vendor::name` fails as "not an identifier" at `::`.
+    SchemaTokenId const prefixSeparator =
+        pp.embedParameters.has_value()
+            ? schema.schemaTokens().find(pp.embedParameters->prefixSeparatorToken)
+            : InvalidSchemaToken;
+    auto isKind = [](Token const& t, SchemaTokenId k) {
+        return k.valid() && t.schemaKind == k;
+    };
+    auto skip = [&](std::size_t i) {
+        while (i < toks.size() && isTriviaTok(toks[i])) ++i;
+        return i;
+    };
+    // The standard verb `name` is bound to, or nullopt. C23 6.10.1p5: a
+    // standard parameter `x` and `__x__` "shall behave the same ... except for
+    // the spelling", so BOTH sides are dunder-folded through the ONE shared
+    // normaliser before comparing (a row may itself be spelled either way).
+    auto roleOf = [&](std::string_view name) -> std::optional<Role> {
+        if (!pp.embedParameters.has_value()) return std::nullopt;
+        std::string_view const bare = stripDunder(name);
+        for (PreprocessConfig::EmbedParameterDef const& def :
+             pp.embedParameters->standard) {
+            if (name == def.name || bare == stripDunder(def.name)) return def.role;
+        }
+        return std::nullopt;
+    };
+
+    PpEmbedParameterSequence seq;
+    std::size_t i = skip(begin);
+    while (i < toks.size()) {
+        Token const& nameTok = toks[i];
+        if (stopAtOperatorClose && isKind(nameTok, closeParen)) break;
+        if (!isWordTok(nameTok)) {
+            fail(nameTok, std::string{"#embed parameter must be an identifier "
+                                      "(C23 6.10.1p4 pp-parameter); got '"}
+                              + std::string{textOf(nameTok)} + "'");
+            return std::nullopt;
+        }
+        PpEmbedParameter param;
+        param.nameIndex = i;
+        param.spelling  = std::string{textOf(nameTok)};
+        std::size_t j = skip(i + 1);
+        if (j < toks.size() && isKind(toks[j], prefixSeparator)) {
+            // `identifier :: identifier` -- an implementation-defined
+            // (prefixed) parameter. DSS defines none, so `role` stays empty;
+            // the CALLER decides whether that is a violation (`#embed`,
+            // 6.10.1p9) or the NOT_FOUND signal (`__has_embed`, 6.10.2p8).
+            std::size_t const k = skip(j + 1);
+            if (k >= toks.size() || !isWordTok(toks[k])) {
+                fail(nameTok, std::string{"prefixed embed parameter '"}
+                                  + param.spelling + "::' requires an identifier "
+                                    "after '::' (C23 6.10.1p4 "
+                                    "pp-prefixed-parameter)");
+                return std::nullopt;
+            }
+            param.prefixed = true;
+            param.spelling += std::string{textOf(toks[j])};
+            param.spelling += std::string{textOf(toks[k])};
+            j = skip(k + 1);
+        } else {
+            param.role = roleOf(param.spelling);
+        }
+        if (j < toks.size() && isKind(toks[j], openParen)) {
+            // pp-parameter-clause: `( pp-balanced-token-sequence_opt )`,
+            // balanced on the paren kinds; the clause's own `)` is the first
+            // one at depth 0.
+            param.hasClause   = true;
+            param.clauseBegin = j + 1;
+            int         depth  = 0;
+            bool        closed = false;
+            std::size_t k      = j + 1;
+            for (; k < toks.size(); ++k) {
+                if (isKind(toks[k], openParen)) { ++depth; continue; }
+                if (isKind(toks[k], closeParen)) {
+                    if (depth == 0) { closed = true; break; }
+                    --depth;
+                }
+            }
+            if (!closed) {
+                fail(nameTok, std::string{"embed parameter '"} + param.spelling
+                                  + "' has an unterminated '(' clause (C23 "
+                                    "6.10.1p4 pp-parameter-clause)");
+                return std::nullopt;
+            }
+            param.clauseEnd = k;
+            j = skip(k + 1);
+        }
+        if (param.role.has_value()) {
+            if (!param.hasClause) {
+                fail(nameTok, std::string{"standard embed parameter '"}
+                                  + param.spelling + "' requires a parenthesized "
+                                    "clause (C23 6.10.4.2-6.10.4.5: \"shall be "
+                                    "present\")");
+                return std::nullopt;
+            }
+            if (seq.find(*param.role) != nullptr) {
+                fail(nameTok, std::string{"standard embed parameter '"}
+                                  + param.spelling + "' appears more than once "
+                                    "(C23 6.10.4.2-6.10.4.5: \"may appear zero "
+                                    "times or one time\")");
+                return std::nullopt;
+            }
+        }
+        seq.parameters.push_back(std::move(param));
+        i = j;
+    }
+    seq.next = i;
+    return seq;
+}
+
+// ── C23 6.10.4.2: the shared `limit` clause evaluator ───────────────────────
+// (contract on the declaration in pp_if_eval.hpp)
+std::optional<std::uint64_t>
+evaluateEmbedLimit(std::span<Token const>   clause,
+                   Token const&             anchor,
+                   GrammarSchema const&     schema,
+                   PpMacroExpand const&     macroExpand,
+                   PpIsDefined const&       isDefined,
+                   PpHasInclude const&      hasInclude,
+                   SourceBuffer const&      synth,
+                   PpProductText const&     productText,
+                   DiagnosticReporter&      rep,
+                   PpHasEmbed const&        hasEmbed,
+                   PpOperatorRevoked const& operatorRevoked,
+                   std::optional<bool>      charIsUnsigned,
+                   PpTokenTextFn const&     textOf,
+                   PpEmbedFail const&       fail) {
+    std::string const& definedKw = schema.preprocess().definedOperator;
+    // p2: "The token defined shall not appear within the constant expression."
+    // Checked on the clause as WRITTEN and again on its EXPANSION: a macro that
+    // produces `defined` is 6.10.2p13 undefined behaviour, refused rather than
+    // folded.
+    auto refusesDefined = [&](std::span<Token const> run, char const* where) {
+        if (definedKw.empty()) return false;
+        for (Token const& t : run) {
+            if (isWordTok(t) && textOf(t) == definedKw) {
+                fail(t, std::string{"the token '"} + definedKw
+                            + "' shall not appear within an embed limit(...) "
+                              "constant expression" + where
+                            + " (C23 6.10.4.2p2)");
+                return true;
+            }
+        }
+        return false;
+    };
+    if (refusesDefined(clause, "")) return std::nullopt;
+    std::vector<Token> raw;
+    raw.reserve(clause.size());
+    for (Token const& t : clause) {
+        if (!isTriviaTok(t)) raw.push_back(t);
+    }
+    if (raw.empty()) {
+        fail(anchor, "embed limit(...) requires an integer constant expression "
+                     "(C23 6.10.4.2p1: the clause \"shall be present and have the "
+                     "form ( constant-expression )\")");
+        return std::nullopt;
+    }
+    // p3: "the constant expression is evaluated after the balanced
+    // preprocessing token sequence is processed as in normal text" -- through
+    // the caller's expander, which is the ONE MacroExpander engine.
+    std::vector<Token> const expanded = macroExpand(raw);
+    if (refusesDefined(expanded, " after macro expansion")) return std::nullopt;
+    // p3 (cont.): "using the rules specified for conditional inclusion" -- the
+    // `#if` evaluator itself, under an IDENTITY expander so the run above is not
+    // expanded a second time (a self-referential macro would otherwise grow).
+    PpMacroExpand const identity =
+        [](std::vector<Token> const& run) { return run; };
+    auto const value = evaluateIfExpressionValue(
+        expanded, schema, identity, isDefined, hasInclude, synth, productText,
+        rep, hasEmbed, operatorRevoked, charIsUnsigned);
+    if (!value.has_value()) {
+        fail(anchor, "embed limit(...) is not an integer constant expression "
+                     "(C23 6.10.4.2p1); see the preceding diagnostic");
+        return std::nullopt;
+    }
+    // p1: "shall not evaluate to a value less than 0". Only the SIGNED reading
+    // can be negative; `limit(0u - 1)` is a legal, merely enormous, bound.
+    if (value->isSigned && static_cast<std::int64_t>(value->bits) < 0) {
+        fail(anchor, std::string{"embed limit(...) shall not evaluate to a value "
+                                 "less than 0 (C23 6.10.4.2p1); got "}
+                         + std::to_string(static_cast<std::int64_t>(value->bits)));
+        return std::nullopt;
+    }
+    return value->bits;
 }
 
 std::optional<bool>
@@ -1031,8 +1415,41 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                      SourceBuffer const&    synth,
                      PpProductText const&   productText,
                      DiagnosticReporter&    rep,
-                     PpHasEmbed const&      hasEmbed) {
+                     PpHasEmbed const&      hasEmbed,
+                     PpOperatorRevoked const& operatorRevoked,
+                     std::optional<bool>    charIsUnsigned) {
+    // C 6.10.2p12: the question asked of the value is whether it "evaluates to
+    // nonzero" -- the value engine below is the whole implementation.
+    auto const value = evaluateIfExpressionValue(
+        operandTokens, schema, macroExpand, isDefined, hasInclude, synth,
+        productText, rep, hasEmbed, operatorRevoked, charIsUnsigned);
+    if (!value.has_value()) return std::nullopt;
+    return value->bits != 0;
+}
+
+std::optional<PpIfValue>
+evaluateIfExpressionValue(std::span<Token const> operandTokens,
+                          GrammarSchema const&   schema,
+                          PpMacroExpand const&   macroExpand,
+                          PpIsDefined const&     isDefined,
+                          PpHasInclude const&    hasInclude,
+                          SourceBuffer const&    synth,
+                          PpProductText const&   productText,
+                          DiagnosticReporter&    rep,
+                          PpHasEmbed const&      hasEmbed,
+                          PpOperatorRevoked const& operatorRevoked,
+                          std::optional<bool>    charIsUnsigned) {
     LiteralKinds const lits = gatherLiteralKinds(schema);
+    // D-PP-HAS-EXTENSION-BUILTIN-ABSENT: every operator arm below is gated on
+    // this. An operator the program has `#undef`'d is no longer an operator —
+    // it is an ordinary undefined identifier, which the ICE parser's primary
+    // folds to 0 (and which then fails LOUD in the function-like position,
+    // exactly as gcc 13.3.0, gcc 13.2.0 and clang 18.1.3 do: "missing binary
+    // operator before token '('" / "function-like macro '__has_include' is not
+    // defined", both rc 1). Null-callback tolerant.
+    auto operatorLive = [&](std::string_view word) {
+        return !operatorRevoked || !operatorRevoked(word);
+    };
 
     PreprocessConfig const& pp = schema.preprocess();
     SchemaTokenId const openParen =
@@ -1108,7 +1525,13 @@ evaluateIfExpression(std::span<Token const> operandTokens,
     // `MacroExpander` as its `prefixLen`), so `synth.text().size()` IS that
     // length. Deriving it here rather than threading a second spelling of the
     // same number is what keeps the two from disagreeing.
-    std::string_view const tail = productText ? productText() : std::string_view{};
+    // NOT const: an embed `limit` clause inside a `__has_embed` operand is
+    // macro-expanded DURING the rewrite below (6.10.4.2p3), and that nested
+    // expansion may append to -- and reallocate -- the product tail this view
+    // names. The arm that expands re-takes the view afterwards; every read that
+    // may happen INSIDE the nested call goes through `freshWordOf` below, which
+    // re-asks the provider each time and can never hold a stale view.
+    std::string_view tail = productText ? productText() : std::string_view{};
 
     // ── Step 2: rewrite the conditional-inclusion OPERATORS to their values
     // (MF-1: the parens are the CONFIG function-like-open/close tokens, never
@@ -1318,7 +1741,8 @@ evaluateIfExpression(std::span<Token const> operandTokens,
         // The operand is NOT macro-expanded (like `defined`); the angle
         // delimiters are matched by CONFIG token KIND, never the `<`/`>` bytes.
         // EVERY malformed shape fails loud with P_PreprocessorHasInclude. ──
-        if (isWordTok(t) && !hasIncludeKw.empty() && word == hasIncludeKw) {
+        if (isWordTok(t) && !hasIncludeKw.empty() && word == hasIncludeKw
+            && operatorLive(word)) {
             std::size_t j = skipFwd(i + 1);
             if (j >= toks.size() || !openParen.valid()
                 || toks[j].schemaKind != openParen) {
@@ -1416,17 +1840,22 @@ evaluateIfExpression(std::span<Token const> operandTokens,
             continue;
         }
 
-        // ── FC17.9(h): `__has_embed(<r>)` / `__has_embed("r")` (C23 6.10.1).
+        // ── FC17.9(h): `__has_embed(<r>)` / `__has_embed("r")` (C23 6.10.2p7).
         // Mirror the `__has_include` extraction (operand NOT macro-expanded; the
-        // angle delimiters + quote opener matched by CONFIG token KIND), but mint
-        // the C23 TRICHOTOMY 0/1/2 via the `hasEmbed` callback, and treat ANY
-        // token between the resource and the operator's `)` as an unsupported
-        // PARAMETER clause -> NOT_FOUND(0) (the C23 feature-probe contract: "not
-        // found OR at least one parameter unsupported" -- NOT an error; the value
-        // IS the signal, so a guarded `#embed` correctly never runs;
-        // D-PP-EMBED-PARAMS). Malformed shapes (no `(`, empty name, unterminated)
-        // fail loud P_PreprocessorEmbed. ──
-        if (isWordTok(t) && !hasEmbedKw.empty() && word == hasEmbedKw) {
+        // angle delimiters + quote opener matched by CONFIG token KIND), then
+        // read the embed-parameter-sequence through the ONE parser the
+        // directive uses, evaluate a `limit` through the ONE evaluator the
+        // directive uses, and mint the C23 TRICHOTOMY 0/1/2 from the width the
+        // directive would embed (D-PP-EMBED-PARAMS / -ANGLE). Malformed shapes
+        // (no `(`, empty name, unterminated, a token that is not a
+        // pp-parameter, a duplicate or clause-less standard parameter, a bad
+        // `limit`) fail loud P_PreprocessorEmbed; an unrecognized PREFIXED
+        // parameter is NOT an error -- it is the NOT_FOUND signal (6.10.1p9
+        // footnote 196, 6.10.2p7 + p8 NOTE 1), and it is answered BEFORE the
+        // `limit` clause is evaluated. An unknown STANDARD-SHAPED name gets no
+        // such exemption and is loud here exactly as on a `#embed` line. ──
+        if (isWordTok(t) && !hasEmbedKw.empty() && word == hasEmbedKw
+            && operatorLive(word)) {
             std::size_t j = skipFwd(i + 1);
             if (j >= toks.size() || !openParen.valid()
                 || toks[j].schemaKind != openParen) {
@@ -1440,9 +1869,8 @@ evaluateIfExpression(std::span<Token const> operandTokens,
             if (j < toks.size() && angleOpen.valid()
                 && toks[j].schemaKind == angleOpen) {
                 // ANGLE form `<r>`: accumulate the raw bytes between the angle
-                // delimiters (matched by KIND). The angle form is a loud deferral
-                // (D-PP-EMBED-ANGLE) at the DIRECTIVE; the operator recognises it
-                // only so the callback can answer 0 (NOT_FOUND) truthfully.
+                // delimiters (matched by KIND). The callback runs the angle
+                // search the directive runs (C23 6.10.4.1p8).
                 isAngle = true;
                 std::size_t k = j + 1;
                 ByteOffset const innerStart = toks[j].span.end();
@@ -1503,40 +1931,118 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                     "operator '__has_embed' has an empty resource name");
                 break;
             }
-            // Scan to the operator's matching close paren, paren-DEPTH-aware (a
-            // parameter like `limit(1)` nests its own parens). ANY significant
-            // token before the depth-0 close paren is an unsupported parameter
-            // clause -> NOT_FOUND(0). An unterminated operator fails loud.
-            bool hasParams = false;
-            bool sawClose  = false;
-            int  depth     = 0;
-            std::size_t k = skipFwd(j);
-            for (; k < toks.size(); ++k) {
-                Token const& u = toks[k];
-                if (isTriviaTok(u)) continue;
-                if (openParen.valid() && u.schemaKind == openParen) {
-                    hasParams = true;
-                    ++depth;
-                    continue;
-                }
-                if (closeParen.valid() && u.schemaKind == closeParen) {
-                    if (depth == 0) { sawClose = true; break; }
-                    --depth;
-                    continue;
-                }
-                hasParams = true;   // any other significant token = a parameter
-            }
-            if (!sawClose) {
+            // ── C23 6.10.2p7: the embed-parameter-sequence, through the ONE
+            // parser the directive uses, so the operator and `#embed` read a
+            // sequence identically. `freshWordOf` re-asks the product provider
+            // on EVERY read: the `limit` clause is macro-expanded below and that
+            // may grow (and move) the tail `wordOf` holds a view of. ──
+            PpTokenTextFn const freshWordOf =
+                [&](Token const& u) -> std::string_view {
+                return ppTokenText(u, synth, /*scratch=*/nullptr,
+                                   productText ? productText()
+                                               : std::string_view{});
+            };
+            PpEmbedFail const failParam = [&](Token const& at, std::string msg) {
+                failHasEmbed(diagSpanFor(at), std::move(msg));
+            };
+            auto const seq = parseEmbedParameterSequence(
+                toks, j, schema, freshWordOf, failParam,
+                /*stopAtOperatorClose=*/true);
+            if (!seq.has_value()) break;   // reported through failParam
+            j = seq->next;
+            if (j >= toks.size() || !closeParen.valid()
+                || toks[j].schemaKind != closeParen) {
                 failHasEmbed(diagSpanFor(t), "expected ')' to close '__has_embed('");
                 break;
             }
-            j = k + 1;   // past the operator's close paren
-            // C23: any unsupported parameter -> NOT_FOUND(0); else resolve the
-            // trichotomy via the callback (null-tolerant -> 0 = NOT_FOUND).
-            int const v = hasParams
-                ? 0
-                : (hasEmbed ? hasEmbed(filename, isAngle, diagSpanFor(t)) : 0);
-            afterDefined.push_back(mintNumber(v));
+            ++j;   // past the operator's close paren
+            // ── ★★ THE TWO UNSUPPORTED VERDICTS, IN THE ORDER C23 FIXES, AND
+            // BOTH BEFORE `limit` IS EVALUATED. ──
+            //
+            // 6.10.1p9 footnote 196 carves out exactly ONE shape: "An
+            // unrecognized preprocessor PREFIXED parameter is a constraint
+            // violation, EXCEPT within has_embed expressions". So an unknown
+            // STANDARD-SHAPED name still owes a diagnostic here, exactly as on
+            // a `#embed` line -- there is nothing in 6.10.2 that exempts it.
+            if (PpEmbedParameter const* unknown =
+                    seq->firstUnsupportedStandardShaped()) {
+                std::string declared;
+                if (pp.embedParameters.has_value()) {
+                    for (PreprocessConfig::EmbedParameterDef const& def :
+                         pp.embedParameters->standard) {
+                        if (!declared.empty()) declared += ", ";
+                        declared += def.name;
+                    }
+                }
+                if (declared.empty()) declared = "none declared by this language";
+                failParam(toks[unknown->nameIndex],
+                          std::string{"'"} + unknown->spelling
+                              + "' is not a standard embed parameter (C23 "
+                                "6.10.1p9; footnote 196 exempts only a PREFIXED "
+                                "`vendor::name` inside __has_embed. The standard "
+                                "parameters are: "
+                              + declared + ")");
+                break;
+            }
+            // ⚠ AND NOW THE SHORT-CIRCUIT, WHICH MUST PRECEDE THE `limit`
+            // EVALUATION. p7: NOT_FOUND(0) "if the search fails or if any of the
+            // embed parameters ... are not supported by the implementation";
+            // p8 NOTE 1: such a parameter is "not a constraint violation and
+            // instead cause[s] the expression to be evaluated to 0". Evaluating
+            // a sibling `limit` first would refuse a translation unit the
+            // standard requires to answer 0 and take its `#elif` -- C23 6.10.2
+            // EXAMPLE 5's vendor guard (`ds9000::element_type(short)`) crossed
+            // with EXAMPLE 6's `limit` is exactly that program.
+            // ★ WHY SKIPPING THE CLAUSE IS CONFORMING, not a dropped check: p7
+            // imposes only the SYNTACTIC requirements of a `#embed` directive on
+            // the notional directive, and `parseEmbedParameterSequence` above
+            // has already enforced every one of them (pp-parameter shape,
+            // balanced and terminated clause, a required clause on a standard
+            // parameter, at most one of each). A limit's VALUE (6.10.4.2p1
+            // "shall not evaluate to a value less than 0", p2 "The token
+            // defined shall not appear") is a CONSTRAINT, not syntax, so it is
+            // evaluated only for a sequence this implementation supports --
+            // where it stays loud, as the directive's own arm does.
+            if (seq->anyUnsupportedPrefixed()) {
+                afterDefined.push_back(mintNumber(0));
+                i = j;
+                continue;
+            }
+            // 6.10.2 EXAMPLE 6 + 6.10.4.2: `limit` decides EMPTY "including in
+            // __has_embed expressions", so its clause is evaluated here by the
+            // shared evaluator -- a constraint violation in it is loud, exactly
+            // as on the directive.
+            std::optional<std::uint64_t> limit;
+            if (PpEmbedParameter const* lim =
+                    seq->find(PreprocessConfig::EmbedParameterRole::Limit)) {
+                limit = evaluateEmbedLimit(
+                    toks.subspan(lim->clauseBegin,
+                                 lim->clauseEnd - lim->clauseBegin),
+                    toks[lim->nameIndex], schema, macroExpand, isDefined,
+                    hasInclude, synth, productText, rep, hasEmbed,
+                    operatorRevoked, charIsUnsigned, freshWordOf, failParam);
+                // The nested expansion may have grown (and moved) the tail.
+                tail = productText ? productText() : std::string_view{};
+                if (!limit.has_value()) break;   // reported through failParam
+            }
+            // p7: every parameter here is supported, so the answer is the SEARCH
+            // and the WIDTH -- NOT_FOUND(0) if the search fails; else EMPTY(2)
+            // iff the width after `limit` is zero, else FOUND(1). The width
+            // formula is the directive's own (`embedResourceWidthBytes`), so
+            // the two can never disagree about emptiness.
+            int value = 0;
+            {
+                std::optional<std::uint64_t> const implementationBytes =
+                    hasEmbed ? hasEmbed(filename, isAngle, diagSpanFor(t))
+                             : std::nullopt;
+                if (implementationBytes.has_value()) {
+                    value = embedResourceWidthBytes(*implementationBytes, limit)
+                                    == 0
+                                ? 2
+                                : 1;
+                }
+            }
+            afterDefined.push_back(mintNumber(value));
             i = j;
             continue;
         }
@@ -1544,7 +2050,8 @@ evaluateIfExpression(std::span<Token const> operandTokens,
         // ── FC15c: `__has_c_attribute(attr)` (C23 6.10.1p4). Match the operator
         // by TEXT, extract the attr NAME (a Word), look it up in the config's
         // known-attribute set (raw + dunder-stripped), mint the version or 0. ──
-        if (isWordTok(t) && !hasCAttrKw.empty() && word == hasCAttrKw) {
+        if (isWordTok(t) && !hasCAttrKw.empty() && word == hasCAttrKw
+            && operatorLive(word)) {
             std::size_t j = skipFwd(i + 1);
             if (j >= toks.size() || !openParen.valid()
                 || toks[j].schemaKind != openParen) {
@@ -1579,6 +2086,60 @@ evaluateIfExpression(std::span<Token const> operandTokens,
             continue;
         }
 
+        // ── ★★★ D-PP-HAS-EXTENSION-BUILTIN-ABSENT: the FEATURE-QUERY family —
+        // `__has_attribute` / `__has_builtin` / `__has_feature` /
+        // `__has_extension` (operator ruling 2026-09-03).
+        //
+        // ONE arm for all four, because they differ only in WHICH declared
+        // capability set the answer is read from — which is `answers`, config
+        // DATA on the operator's own row. A per-operator arm here would be four
+        // copies of the same shape, and the fourth would be the one that drifts.
+        //
+        // The SHAPE is `__has_c_attribute`'s, deliberately: operator word, `(`,
+        // one identifier, `)`. ✔MEASURED, that is what all three implementing
+        // references accept, and a malformed shape fails LOUD on all three
+        // rather than folding to 0 — silence here would be a CLAIM ("I checked,
+        // and no") where an error is an admission ("I cannot read this").
+        if (isWordTok(t)) {
+            FeatureQueryOperatorDef const* fq =
+                findFeatureQueryOperator(word, pp);
+            if (fq != nullptr && operatorLive(word)) {
+                std::size_t j = skipFwd(i + 1);
+                if (j >= toks.size() || !openParen.valid()
+                    || toks[j].schemaKind != openParen) {
+                    emit(rep, DiagnosticCode::P_PreprocessorDirective,
+                         synth.id(), diagSpanFor(t),
+                         "operator '" + fq->name
+                             + "' requires a parenthesized name");
+                    rewriteFailed = true;
+                    break;
+                }
+                j = skipFwd(j + 1);
+                if (j >= toks.size() || !isWordTok(toks[j])) {
+                    emit(rep, DiagnosticCode::P_PreprocessorDirective,
+                         synth.id(), diagSpanFor(t),
+                         "operator '" + fq->name + "' requires a name");
+                    rewriteFailed = true;
+                    break;
+                }
+                std::string const queried{wordOf(toks[j])};
+                j = skipFwd(j + 1);
+                if (j >= toks.size() || !closeParen.valid()
+                    || toks[j].schemaKind != closeParen) {
+                    emit(rep, DiagnosticCode::P_PreprocessorDirective,
+                         synth.id(), diagSpanFor(t),
+                         "expected ')' to close '" + fq->name + "('");
+                    rewriteFailed = true;
+                    break;
+                }
+                ++j;
+                afterDefined.push_back(
+                    mintNumber(featureQueryAnswer(schema, fq->answers, queried)));
+                i = j;
+                continue;
+            }
+        }
+
         afterDefined.push_back(t);
         ++i;
     }
@@ -1602,8 +2163,8 @@ evaluateIfExpression(std::span<Token const> operandTokens,
     }
 
     IceParser parser{std::move(nonTrivia), schema, synth,    *scratchBuf, lits,
-                     rep,                  synth.id(), tail};
-    return parser.evaluate();
+                     rep,                  synth.id(), tail, charIsUnsigned};
+    return parser.evaluateValue();
 }
 
 } // namespace dss

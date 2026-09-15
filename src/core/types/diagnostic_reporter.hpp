@@ -442,6 +442,13 @@ private:
     // once a diagnostic is dropped there is nothing left to count).
     void noteCapDrop_();
 
+    // The rewrite half of `noteCapDrop_`, on its own so `truncateTo` can
+    // re-derive the sentence after a rollback restores `droppedByCap_`. The
+    // marker is written IN PLACE at an index that routinely predates the
+    // checkpoint, so a size-only restore cannot reach it and a rolled-back
+    // branch would otherwise leave its own count standing in the stream.
+    void rewriteCapMarker_();
+
     // ★★★ D-DIAG-MAXPERCODE-SILENT-COALESCE — THE PER-CODE ELISION LEDGER.
     //
     // The global cap got a marker; the two gates that actually fire in an

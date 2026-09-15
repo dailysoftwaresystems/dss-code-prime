@@ -73,7 +73,6 @@ import importlib.util
 import io
 import os
 import re
-import subprocess
 import sys
 import tempfile
 
@@ -94,12 +93,48 @@ class Refused(Exception):
     pass
 
 
+_OWNING_TREE = None
+
+
+def _owning_tree():
+    """`scripts/owning-tree/owning-tree.py` -- the one owner of "which tree is this file in?".
+
+    Loaded by path from this file's sibling directory (a hyphen is not a module name). It
+    FAILS LOUD when absent rather than falling back to a local walk: a second copy of the
+    answer is the drift that owner exists to end.
+    """
+    global _OWNING_TREE
+    if _OWNING_TREE is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise Refused("cannot find %s -- this tool's root is resolved there and nowhere "
+                          "else." % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OWNING_TREE = mod
+    return _OWNING_TREE
+
+
 def repo_root():
-    """From git, never hardcoded -- a predecessor pinned one absolute Windows path."""
-    out = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True)
-    if out.returncode != 0:
-        raise Refused("not inside a git repository.")
-    return os.path.realpath(out.stdout.decode("utf-8", "surrogateescape").strip())
+    """The tree THIS FILE lives in -- never the tree the caller's shell is standing in.
+
+    ⚠ A predecessor pinned one absolute Windows path; its replacement, a bare
+    `git rev-parse --show-toplevel`, answered from the CALLER's cwd -- and this tool
+    WRITES under the root. ✔MEASURED 2026-09-15 (P66): run by path with its cwd inside a
+    different repository, a dry run ACCEPTED a row that exists only in THAT repository's
+    registry, so `--apply` would have written there; from a directory inside no
+    repository it would not run at all. The shared writer this delegates to,
+    `scripts/anchors/anchors.py`, already walked up from ITS OWN file, so the two halves
+    of one application could name two different trees. Both now answer by the same walk,
+    owned by `scripts/owning-tree/owning-tree.py`.
+    """
+    ot = _owning_tree()
+    try:
+        return ot.resolve(__file__)
+    except ot.Refusal as exc:
+        raise Refused(str(exc))
 
 
 # The shared writer, resolved from THIS FILE rather than from the tree being edited.
@@ -408,6 +443,12 @@ def self_test():
         pin(msg is None,
             "(8b) the CONTROL: with the resolver restored the same call is accepted",
             "got=%r" % msg)
+
+    # (R) THE ROOT IS THE TREE THIS FILE LIVES IN, whatever the caller's cwd -- every
+    # `--apply` lands under it. Arms, oracle and synthesized negatives are owned by
+    # scripts/owning-tree/owning-tree.py.
+    for ok, why, detail in _owning_tree().root_arms(repo_root, (Refused,), False, __file__):
+        pin(ok, "(R) " + why, "" if ok else detail)
 
     print("apply-registry-row self-test: %d failed" % failed[0])
     return 1 if failed[0] else 0

@@ -1,0 +1,15 @@
+{
+  "$comment": "D-LK3-DYLIB-WEAK-EXPORT: a Mach-O IMAGE carrying WEAK definitions of both kinds -- a weak FUNCTION and a weak DATA global. Both image arms used to write a hard-coded n_desc 0 into every nlist record, build no export trie on the executable arm, and copy the schema's header flags verbatim, so a weak definition reaching an image went out SILENTLY STRONG (the dylib arm refused one outright rather than publish half the machinery). MEASURED 2026-09-05 on Apple Silicon (macOS 26.6.2, Apple clang 21.0.0 / ld-1267) against the identical source through Apple's toolchain: header flags 0x00218085 against a weak-free control's 0x00200085 -- a delta of exactly MH_WEAK_DEFINES | MH_BINDS_TO_WEAK -- plus `weak external` in nm -m and `[weak-def]` in dyld_info -exports; DSS now emits all three, measured on the same host from the DSS-built binary. The structural pins are tests/link/test_macho_dylib_writer.cpp; this example is the RUN witness that such an image still loads, passes its ad-hoc signature and exits 42 on darwin, and BUILDS everywhere. The cross-image COALESCING semantics were witnessed separately on that host (a DSS exec publishing a weak definition wins dyld's coalescing against an Apple-built dylib that defines the same symbol weakly: rc 22 coalesced against the strong control's 21), because they need a second image this harness cannot build. SHAPE: the two weak functions are reached through a const function-pointer table indexed by a RUNTIME value (argc - 1) and the weak global is READ rather than folded, so no pass sees a constant index or a constant initializer and the definitions stay alive through the release arm -- that is the INTENT of the shape, not a measurement; what this example asserts is the exit code on both arms. The pe arm RUNS on windows, elf x86_64 on linux, elf arm64 under qemu, macho arm64 on darwin.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

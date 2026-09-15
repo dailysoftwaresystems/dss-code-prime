@@ -23,8 +23,9 @@
 //     by a constant instead of a copied slot — a different arm of the same code.
 // (D) `sizeof a[0]` pins the copied-down PER-LEVEL row slot, not just the total.
 //
-// main is a LEAF (no calls) — the C1b VLA frame-model scope; a VLA function that calls
-// anything is separately refused (L_VlaNonLeafFrameUnsupported). `volatile` defeats
+// main is a LEAF (no calls). It USED TO SAY this was the C1b VLA frame-model scope and
+// that a VLA function which calls anything is separately refused
+// (L_VlaNonLeafFrameUnsupported). ⚠ THAT REFUSAL IS GONE since 2026-09-04 (P59): the non-leaf VLA frame model shipped and `D-CSUBSET-VLA-NONLEAF-CALL-FRAME` is CLOSED. `main` here is STILL a leaf, but now by CHOICE rather than by force -- a leaf keeps this example's own subject independent of the frame model, which has its own witness in `examples/c/c99_vla_nonleaf_call_frame`. `volatile` defeats
 // const-folding so the bounds are genuinely runtime. Each `return k` is a strict
 // in-program pin; only all-pass reaches 42.
 //

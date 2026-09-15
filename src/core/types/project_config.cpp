@@ -42,21 +42,35 @@ constexpr std::array<std::string_view, 14> kKnownKeys = {
 };
 DSS_CHECK_KEY_VOCABULARY(kKnownKeys);
 
-// ── the CLOSED `dependencyArtifactCache.eviction` vocabulary ────────────────
+// ── WITHDRAWN MEMBERS OF `dependencyArtifactCache`, AND WHY A TABLE ─────────
 //
-// The token table and the enumerator table are index-parallel and asserted so
-// here, rather than being one `switch` a future enumerator can silently fall
-// out of. `parseDependencyArtifactCacheEviction` and the reject message both
-// read THIS table, so a token that is accepted is a token the message lists.
-constexpr std::array<std::string_view, 2> kEvictionTokens = {
-    "prune-superseded", "retain",
+// A member this manifest format ONCE accepted and no longer does. It is a table
+// rather than a deletion because the two answers a user can get are very
+// different: `has unknown member 'eviction'` reads as a typo and sends them
+// looking for the right spelling, while what actually happened is that the
+// policy stopped existing. The reason travels with the name so the message can
+// say it.
+//
+// ⚠ THE ENTRY IS NOT CLUTTER TO BE SWEPT UP LATER. A withdrawn key is exactly
+// the thing a person copies out of an older manifest, and the day this table is
+// emptied the specific message becomes the generic one again.
+struct WithdrawnCacheMember {
+    std::string_view name;
+    std::string_view why;
 };
-DSS_CHECK_KEY_VOCABULARY(kEvictionTokens);
-
-constexpr std::array<DependencyArtifactCacheEviction, kEvictionTokens.size()>
-    kEvictionValues = {
-        DependencyArtifactCacheEviction::PruneSuperseded,
-        DependencyArtifactCacheEviction::Retain,
+constexpr std::array<WithdrawnCacheMember, 1> kWithdrawnCacheMembers = {
+    WithdrawnCacheMember{
+        "eviction",
+        "the cache no longer evicts anything, so there is no policy to "
+        "select: a store cannot prove that a sibling entry is not the live "
+        "link input of a build running right now, and deleting one that is "
+        "fails that build with a missing-file error. Measured over a real "
+        "cache, pruning also reclaimed ZERO bytes — the compiler's build "
+        "stamp is a directory component, so a superseded generation lands in "
+        "a different root and was never reachable to delete. Remove the "
+        "member; a cache is reclaimed by deleting its root directory. "
+        "Anchored: "
+        "D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT"},
 };
 
 // Comma-join a closed-key table for a diagnostic. ONE joiner for every table
@@ -622,14 +636,16 @@ bool readOptionalDependsOn(json const& doc,
 //
 // D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C). Absent ⇒
 // `nullopt` + no error (every manifest that predates this field must build
-// byte-identically). PRESENT ⇒ an object with ALL THREE members; everything
-// else fails loud `C_MalformedJson`.
+// byte-identically). PRESENT ⇒ an object with BOTH members; everything else
+// fails loud `C_MalformedJson`. ⓘ It was THREE members until the `eviction`
+// policy was withdrawn — see `kWithdrawnCacheMembers` above and
+// [[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]].
 //
 // ⚠ NO MEMBER IS OPTIONAL, and this is the `resolveLibraries` object-form rule
 // rather than strictness for its own sake. A partial policy is a policy nobody
-// declared: `{"enabled": true}` alone would leave the location override and the
-// eviction rule to a compiled-in default, which is exactly the "100% config
-// driven" property this member exists to establish. And the fully degenerate
+// declared: `{"enabled": true}` alone would leave the location override to a
+// compiled-in default, which is exactly the "100% config driven" property this
+// member exists to establish. And the fully degenerate
 // spelling — `{"enabled": false}` with nothing else — says what DELETING the
 // key says, so it rejects rather than aliasing.
 //
@@ -648,7 +664,7 @@ bool readOptionalDependencyArtifactCache(
     if (!v.is_object()) {
         emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
                          at + "must be an object {\"enabled\": …, "
-                              "\"rootOverrideVariable\": …, \"eviction\": …}");
+                              "\"rootOverrideVariable\": …}");
         return false;
     }
 
@@ -657,9 +673,20 @@ bool readOptionalDependencyArtifactCache(
     // of the very policy the object exists to state. `$`-prefixed members are
     // PROSE and are skipped by `firstUnknownKey`, so a nested `$comment` cannot
     // reinstate D-AP2-PROJECT-MANIFEST-REJECTS-COMMENT-KEY one level down.
-    static constexpr std::array<std::string_view, 3> kMemberKeys = {
-        "enabled", "rootOverrideVariable", "eviction"};
+    static constexpr std::array<std::string_view, 2> kMemberKeys = {
+        "enabled", "rootOverrideVariable"};
     DSS_CHECK_KEY_VOCABULARY(kMemberKeys);
+    // ★ THE WITHDRAWN ARM RUNS FIRST, and the order is the whole value of the
+    // table: `firstUnknownKey` would happily report `eviction` as unknown, and
+    // that answer is true and useless.
+    for (WithdrawnCacheMember const& withdrawn : kWithdrawnCacheMembers) {
+        if (!v.contains(std::string{withdrawn.name})) continue;
+        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
+                         at + "member '" + std::string{withdrawn.name}
+                         + "' is no longer accepted: "
+                         + std::string{withdrawn.why});
+        return false;
+    }
     if (auto bad = detail::firstUnknownKey(v, kMemberKeys)) {
         emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
                          at + "has unknown member '" + *bad
@@ -706,53 +733,11 @@ bool readOptionalDependencyArtifactCache(
         return false;
     }
 
-    if (!v.contains("eviction")) {
-        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
-                         at + "is missing required member 'eviction' "
-                              "(one of: "
-                         + dependencyArtifactCacheEvictionTokenList() + ")");
-        return false;
-    }
-    if (!v.at("eviction").is_string()) {
-        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
-                         at + "member 'eviction' must be a string (one of: "
-                         + dependencyArtifactCacheEvictionTokenList() + ")");
-        return false;
-    }
-    std::string const eviction = v.at("eviction").get<std::string>();
-    bool matched = false;
-    for (std::size_t i = 0; i < kEvictionTokens.size(); ++i) {
-        if (kEvictionTokens[i] != eviction) continue;
-        cfg.eviction = kEvictionValues[i];
-        matched      = true;
-        break;
-    }
-    if (!matched) {
-        // The message names the offending token AND the accepted set, derived
-        // from the one table — the same shape (and the same reason) as the
-        // `runOn` platform-token reject: a policy word the loader silently
-        // reinterpreted would be a cache behaving under a rule nobody wrote.
-        emitProjectError(rep, DiagnosticCode::C_MalformedJson, label,
-                         at + "member 'eviction' has unrecognized value '"
-                         + eviction + "' (accepted: "
-                         + dependencyArtifactCacheEvictionTokenList() + ")");
-        return false;
-    }
-
     out = std::move(cfg);
     return true;
 }
 
 } // namespace
-
-std::span<std::string_view const>
-dependencyArtifactCacheEvictionTokens() noexcept {
-    return std::span<std::string_view const>{kEvictionTokens};
-}
-
-std::string dependencyArtifactCacheEvictionTokenList() {
-    return joinKeys(kEvictionTokens);
-}
 
 std::span<std::string_view const> projectConfigKnownKeys() noexcept {
     return std::span<std::string_view const>{kKnownKeys};

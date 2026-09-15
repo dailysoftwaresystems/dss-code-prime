@@ -332,6 +332,37 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  "no value to sign-route on",
                                  o.mnemonic, vi));
             }
+            // [[D-ASM-ARM64-LDR-TO-LDUR-CONVENIENCE-ALIAS-REFUSED]]:
+            // `immMultipleOf` coherence, the THIRD member of the same family
+            // and deliberately the same predicate. (a) it needs the same
+            // value-bearing operand the other two read; (b) a modulus of 0 is
+            // a division by zero in the matcher; (c) a modulus of 1 makes
+            // EVERY magnitude a multiple, so the key states nothing while
+            // looking like it states something — the identical objection
+            // `aliases` raises against a row that lists its own name, and a
+            // real hazard here because a reader would take a `1` as "this
+            // field is unscaled" when it means the opposite of a restriction.
+            if (v.immMultipleOf.has_value()) {
+                if (!hasValueOperand) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/guard", i, vi),
+                         std::format("opcode '{}' variant {}: declares "
+                                     "immMultipleOf but its operandKinds carry "
+                                     "no 'imm32' or 'memoffset' operand — there "
+                                     "is no magnitude whose divisibility could "
+                                     "be tested",
+                                     o.mnemonic, vi));
+                }
+                if (*v.immMultipleOf <= 1) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/guard/immMultipleOf",
+                                     i, vi),
+                         std::format("opcode '{}' variant {}: immMultipleOf is "
+                                     "{} — 0 is not a modulus at all and every "
+                                     "integer is a multiple of 1, so neither "
+                                     "restricts anything. A field that scales "
+                                     "by nothing declares no divisibility key",
+                                     o.mnemonic, vi, *v.immMultipleOf));
+                }
+            }
             // ── D-TARGET-PRODUCER-VARIANT-WITHOUT-A-RESULT-SLOT-ENCODES-REGISTER-ZERO ──
             // A VALUE-PRODUCING x86-variable variant that names no home for its
             // result SILENTLY ENCODES REGISTER 0.
@@ -487,6 +518,31 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                        "`encoding.registerClass`)"));
                     }
                 };
+            // ★★ A ROLE A FIELD NAMES MUST BE ONE THE REGISTER TABLE DECLARES.
+            // [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]
+            //
+            // ⚠ THE FAILURE A TYPO CAUSES IS THE REASON THIS IS A LOAD ERROR
+            // AND NOT A NO-OP: `regRole: "stackpointer"` against a table that
+            // says `stackPointer` matches NO register, so the field refuses
+            // every operand and the encoding quietly leaves the dialect. The
+            // author sees an assembler that rejects a line both references
+            // accept, with nothing pointing at the register table.
+            auto const checkDeclaredRole =
+                [&](std::string path, std::string_view fieldDesc,
+                    std::string const& role) {
+                    if (role.empty() || !hasRegisterTable) return;
+                    for (auto const& r : registers) {
+                        if (r.encodingRole == role) return;
+                    }
+                    fail(std::move(path),
+                         std::format("{}: names shared-encoding role '{}', "
+                                     "which no register in this target's "
+                                     "`registers[]` declares as its "
+                                     "'encodingRole' — no operand could ever "
+                                     "satisfy the field, so the encoding would "
+                                     "be silently unreachable",
+                                     fieldDesc, role));
+                };
             if (v.resultSlot.has_value()) {
                 checkFieldBank(
                     std::format("/opcodes/{}/encoding/variants/{}/resultSlot",
@@ -507,6 +563,58 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  "there is no result field for the bank to "
                                  "govern",
                                  o.mnemonic, vi));
+            }
+            // D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME:
+            // `destWidth` is the WIDTH half of the same fact `resultRegClass`
+            // states the BANK half of, so it carries the identical coherence
+            // rule. A destination width on a variant that writes no
+            // destination governs nothing while reading as a guarantee — and
+            // this one would be worse than `resultRegClass`'s version, because
+            // election ELIMINATES candidates on it: a declaration that can
+            // never be true would silently narrow a candidate set.
+            if (v.destWidthBits != 0 && !v.resultSlot.has_value()) {
+                fail(std::format(
+                         "/opcodes/{}/encoding/variants/{}/destWidth", i, vi),
+                     std::format("opcode '{}' variant {}: declares "
+                                 "`destWidth` {} but has no `resultSlot` — "
+                                 "there is no destination field for the width "
+                                 "to describe, and election eliminates "
+                                 "candidates on this key",
+                                 o.mnemonic, vi,
+                                 static_cast<unsigned>(v.destWidthBits)));
+            }
+            // [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]]: the LANE
+            // SHAPE is the third member of that family and carries the same two
+            // coherence rules, stated once here and once per wire below.
+            //   (a) a shape for a field the variant does not have;
+            //   (b) a lane width that does not divide the width it views —
+            //       "N lanes of L bits" is only a shape when N is a whole
+            //       number, and a row failing it would elect at a total width
+            //       that happens to match while describing an operand the
+            //       machine cannot address.
+            if (v.destLanes && !v.resultSlot.has_value()) {
+                fail(std::format(
+                         "/opcodes/{}/encoding/variants/{}/destLanes", i, vi),
+                     std::format("opcode '{}' variant {}: declares "
+                                 "`destLanes` but has no `resultSlot` — there "
+                                 "is no destination field to read as a vector, "
+                                 "and election eliminates candidates on this "
+                                 "key",
+                                 o.mnemonic, vi));
+            }
+            if (v.destLaneBits != 0 && v.destWidthBits != 0
+                && (v.destLaneBits > v.destWidthBits
+                    || v.destWidthBits % v.destLaneBits != 0)) {
+                fail(std::format(
+                         "/opcodes/{}/encoding/variants/{}/destLaneBits", i,
+                         vi),
+                     std::format("opcode '{}' variant {}: `destLaneBits` {} "
+                                 "does not divide `destWidth` {} — a "
+                                 "destination read as lanes is a whole number "
+                                 "of them",
+                                 o.mnemonic, vi,
+                                 static_cast<unsigned>(v.destLaneBits),
+                                 static_cast<unsigned>(v.destWidthBits)));
             }
             for (std::size_t wi = 0; wi < v.wires.size(); ++wi) {
                 auto const& w = v.wires[wi];
@@ -538,6 +646,94 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                      operandKindFilterName(
                                          v.operandKinds[w.index])));
                 }
+                // The lane shape's two coherence rules, per wire — the same
+                // pair the destination carries above.
+                // [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]].
+                if (w.lanes && !carriesRegister) {
+                    fail(std::format(
+                             "/opcodes/{}/encoding/variants/{}/wires/{}/lanes",
+                             i, vi, wi),
+                         std::format("opcode '{}' variant {}: wire {} declares "
+                                     "`lanes` but its guard operand {} is '{}', "
+                                     "not a register — there is no register for "
+                                     "the field to read as a vector",
+                                     o.mnemonic, vi, wi, w.index,
+                                     operandKindFilterName(
+                                         v.operandKinds[w.index])));
+                }
+                if (w.laneBits != 0 && v.guardWidthBits != 0
+                    && (w.laneBits > v.guardWidthBits
+                        || v.guardWidthBits % w.laneBits != 0)) {
+                    fail(std::format(
+                             "/opcodes/{}/encoding/variants/{}/wires/{}/laneBits",
+                             i, vi, wi),
+                         std::format("opcode '{}' variant {}: wire {} declares "
+                                     "`laneBits` {}, which does not divide the "
+                                     "guard's width {} — a source read as lanes "
+                                     "is a whole number of them",
+                                     o.mnemonic, vi, wi,
+                                     static_cast<unsigned>(w.laneBits),
+                                     static_cast<unsigned>(v.guardWidthBits)));
+                }
+                // The shared-encoding READING, per wire — the same two-part
+                // shape the lane axis above has: it must govern a register, and
+                // it must name a role the table actually declares.
+                // [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]
+                if (!w.regRole.empty() && !carriesRegister) {
+                    fail(std::format(
+                             "/opcodes/{}/encoding/variants/{}/wires/{}/regRole",
+                             i, vi, wi),
+                         std::format("opcode '{}' variant {}: wire {} declares "
+                                     "`regRole` but its guard operand {} is "
+                                     "'{}', not a register — there is no "
+                                     "register whose shared encoding the field "
+                                     "could be reading",
+                                     o.mnemonic, vi, wi, w.index,
+                                     operandKindFilterName(
+                                         v.operandKinds[w.index])));
+                }
+                checkDeclaredRole(
+                    std::format(
+                        "/opcodes/{}/encoding/variants/{}/wires/{}/regRole", i,
+                        vi, wi),
+                    std::format("opcode '{}' variant {} wire {}", o.mnemonic,
+                                vi, wi),
+                    w.regRole);
+            }
+            // ★ THE RESULT FIELD'S TWO ROLE KEYS, checked against the same
+            // declared vocabulary. A typo here would not fail the document, it
+            // would make the variant unreachable — an encoding silently absent
+            // from the dialect, which is the shape a `regRole` axis is supposed
+            // to remove rather than introduce.
+            checkDeclaredRole(
+                std::format(
+                    "/opcodes/{}/encoding/variants/{}/resultRegRole", i, vi),
+                std::format("opcode '{}' variant {} result field", o.mnemonic,
+                            vi),
+                v.resultRegRole);
+            checkDeclaredRole(
+                std::format(
+                    "/opcodes/{}/encoding/variants/{}/requiresRegRole", i, vi),
+                std::format("opcode '{}' variant {}", o.mnemonic, vi),
+                v.requiresRegRole);
+            for (std::size_t ei = 0; ei < v.extraResultSlots.size(); ++ei) {
+                checkDeclaredRole(
+                    std::format("/opcodes/{}/encoding/variants/{}/"
+                                "extraResultSlots/{}/regRole",
+                                i, vi, ei),
+                    std::format("opcode '{}' variant {} extra result "
+                                "placement {}", o.mnemonic, vi, ei),
+                    v.extraResultSlots[ei].regRole);
+            }
+            if (!v.resultRegRole.empty() && !v.resultSlot.has_value()) {
+                fail(std::format(
+                         "/opcodes/{}/encoding/variants/{}/resultRegRole", i,
+                         vi),
+                     std::format("opcode '{}' variant {}: `resultRegRole` "
+                                 "states which register a RESULT field's shared "
+                                 "encoding means, but the variant declares no "
+                                 "`resultSlot` — there is no result field",
+                                 o.mnemonic, vi));
             }
 
             // `opcodeBytes` is meaningful only for the x86-variable
@@ -1435,6 +1631,31 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             break;
         }
     }
+    // ★★ DOES THIS TARGET HAVE A REGISTER **FIELD** AT ALL? — the subject the
+    // shared-encoding rule below is about.
+    // [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]
+    //
+    // ⚠ THE SCOPE IS NOT A SOFTENING, IT IS THE RULE'S OWN PREMISE. What the
+    // rule states is *two registers that can reach ONE register field must say
+    // which reading each is* — and a target that declares no register-bearing
+    // encoding field has no such field for either of them to reach, so nothing
+    // it could get wrong is observable. ✔MEASURED: three hand-built fixtures in
+    // `tests/core/test_target_schema.cpp` declare two or three GPRs with NO
+    // `hwEncoding` (all defaulting to 0) and no `encoding` on any opcode — they
+    // are testing `implicitRegisters` and `linkRegister`, and their registers
+    // are never encoded into anything.
+    // ⓘ BOTH SHIPPED TARGETS DECLARE ENCODINGS, so the rule applies to them at
+    // full strength, and a document that later grows one lights it up.
+    bool anyRegisterField = false;
+    for (auto const& o : opcodes) {
+        for (auto const& v : o.encoding.variants) {
+            if (v.resultSlot.has_value() || !v.wires.empty()) {
+                anyRegisterField = true;
+                break;
+            }
+        }
+        if (anyRegisterField) break;
+    }
     for (std::size_t i = 0; i < registers.size(); ++i) {
         auto const& r = registers[i];
         // Classed register must declare positive width — closes the
@@ -1449,6 +1670,124 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             fail(std::format("/registers/{}/subOf", i),
                  std::format("register '{}': subOf='{}' does not resolve to a known register",
                              r.name, r.subOf));
+        }
+        // ★★★ `subOf` ASSERTS CONTAINMENT, AND CONTAINMENT IS STRICT — the
+        // parent must be WIDER, of the SAME class, at the SAME `hwEncoding`.
+        //
+        // ⚠⚠ THIS RULE USED TO LIVE ONLY IN A TEST
+        // (`TargetSubRegisters.NoSubRegisterAppearsInAnyCallingConventionList`),
+        // which judges the two SHIPPED tables and nothing else — ✔MEASURED
+        // 2026-09-02 (cycle P55, lane lq) that a hand-authored target
+        // declaring a SAME-WIDTH `subOf` loaded clean. That was not a
+        // theoretical hole: it is exactly the shape a target reaches for when
+        // its assembler spells one register two ways at one width, and taking
+        // it would mint a SECOND ORDINAL for one machine register — a second
+        // free-list entry the moment anything made it allocatable, and a
+        // clobber that protects the spelling nobody allocated. The `aliases`
+        // key states that fact with ONE ordinal; this rule is what stops the
+        // other spelling of it from loading.
+        //
+        // ★ THE ENCODING EQUALITY IS THE TYPO CATCHER. A `subOf` naming the
+        // wrong parent of the right width would otherwise load clean and alias
+        // a DIFFERENT machine register, which is a wrong-register answer with
+        // nothing to see.
+        if (!r.subOf.empty()) {
+            if (auto const pit = registerIndex.find(r.subOf);
+                pit != registerIndex.end()) {
+                auto const& p = registers[pit->second];
+                if (p.widthBytes <= r.widthBytes) {
+                    fail(std::format("/registers/{}/subOf", i),
+                         std::format(
+                             "register '{}' ({} bytes) declares subOf='{}' ({} "
+                             "bytes), but `subOf` asserts CONTAINMENT — the "
+                             "parent must be STRICTLY WIDER. Two spellings of "
+                             "one register at ONE width are not a view of it: "
+                             "declare the second spelling in the parent row's "
+                             "`aliases` list, which resolves both names to the "
+                             "SAME ordinal instead of minting a second "
+                             "register the allocator would hand out twice",
+                             r.name, r.widthBytes, p.name, p.widthBytes));
+                } else if (p.regClass != r.regClass) {
+                    fail(std::format("/registers/{}/subOf", i),
+                         std::format(
+                             "register '{}' (class '{}') declares subOf='{}' "
+                             "(class '{}') — a view and the register it is a "
+                             "view OF are one physical register and must be in "
+                             "one class; two classes over one register is the "
+                             "double-declaration refused one tier up by "
+    "D-TARGET-ALIASED-VIEWS-BOTH-ALLOCATABLE-DOUBLE-COUNT-ONE-FILE",
+                             r.name, targetRegClassName(r.regClass), p.name,
+                             targetRegClassName(p.regClass)));
+                } else if (p.hwEncoding != r.hwEncoding) {
+                    fail(std::format("/registers/{}/subOf", i),
+                         std::format(
+                             "register '{}' (hwEncoding {}) declares subOf='{}' "
+                             "(hwEncoding {}) — a sub-register SHARES its "
+                             "parent's encoding, so a differing one means the "
+                             "`subOf` names the wrong parent; the view would "
+                             "load clean and alias a different machine register",
+                             r.name, r.hwEncoding, p.name, p.hwEncoding));
+                }
+            }
+        }
+        // ★★ `aliases` ASSERTS IDENTITY — a SECOND SPELLING of this very row.
+        // The loader already entered each one in `registerIndex` at this row's
+        // ordinal (and refused a collision there), so there is no width, class
+        // or encoding to check: an alias HAS this row's, because it IS this
+        // row. What is left is that the spelling is a usable, distinct name.
+        for (std::size_t a = 0; a < r.aliases.size(); ++a) {
+            auto const& alias = r.aliases[a];
+            if (alias.empty()) {
+                fail(std::format("/registers/{}/aliases/{}", i, a),
+                     std::format("register '{}': an alias may not be the empty "
+                                 "string — a spelling nothing can write is not "
+                                 "a spelling",
+                                 r.name));
+            } else if (alias == r.name) {
+                fail(std::format("/registers/{}/aliases/{}", i, a),
+                     std::format("register '{}': alias '{}' repeats the "
+                                 "register's own name — an alias is an "
+                                 "ADDITIONAL spelling, and a row that lists its "
+                                 "own name is stating nothing while looking "
+                                 "like it states something",
+                                 r.name, alias));
+            }
+        }
+        // ★★★ A ROW MAY UNSPELL ITS OWN NAME ONLY IF IT LEAVES ANOTHER ONE
+        // BEHIND. The anchor, whole on its own line so a grep finds it:
+        // [[D-ASM-ARM64-BARE-V-REGISTER-ACCEPTED-IN-A-SCALAR-MEMORY-OPERAND]]
+        // `nameRequiresLaneArrangement` removes ONE spelling in ONE
+        // position; a row that sets it while declaring no `aliases` removes
+        // the register's ONLY bare spelling, and the observable result is an
+        // assembler that refuses every scalar line naming it while the target
+        // still reports the register as present. That is the "accept and then
+        // fail somewhere else" shape the bar refuses, so it is a LOAD error
+        // naming both keys rather than a surprise at the first `.s` file.
+        // ⓘ The alias is also what the refusal DIAGNOSTIC offers as the
+        // spelling to write instead, so the rule buys the message its content.
+        if (r.nameRequiresLaneArrangement && r.aliases.empty()) {
+            fail(std::format("/registers/{}/nameRequiresLaneArrangement", i),
+                 std::format("register '{}': "
+                             "'nameRequiresLaneArrangement' says this row's own "
+                             "name denotes the register only with a lane "
+                             "arrangement written on it, but the row declares "
+                             "no 'aliases' — so the register would have NO bare "
+                             "spelling at all and every scalar operand naming "
+                             "it would be refused. Declare the scalar spelling "
+                             "as an alias, or drop the key",
+                             r.name));
+        }
+        // ★★★ A DEFAULT READING IS A PROPERTY **OF** A ROLE, so a row claiming
+        // one without naming a role is stating half a sentence.
+        // [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]
+        if (r.encodingRoleIsDefault && r.encodingRole.empty()) {
+            fail(std::format("/registers/{}/encodingRoleIsDefault", i),
+                 std::format("register '{}': 'encodingRoleIsDefault' says this "
+                             "row's role is the reading a register field gets "
+                             "when it names none, but the row declares no "
+                             "'encodingRole' — there is no role for it to be "
+                             "the default of",
+                             r.name));
         }
         if (anyX86VariableOpcode
             && (r.regClass == TargetRegClass::GPR
@@ -1490,6 +1829,125 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                      std::format("register '{}': subOf chain forms a cycle",
                                  registers[i].name));
                 break;  // one cycle finding per validate() — caller fixes & retries
+            }
+        }
+    }
+
+    // ★★★ A SHARED REGISTER ENCODING MUST SAY WHICH READING EACH OF ITS ROWS
+    // IS, AND EXACTLY ONE OF THEM MUST BE THE DEFAULT.
+    // [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]
+    //
+    // ★★ THIS IS THE RULE THAT MAKES THE DEFECT CLASS UNSAYABLE RATHER THAN
+    // MERELY FIXED. ✔MEASURED at the P55 base: `arm64.target.json` declared
+    // `sp` and `xzr` as two rows at one (class, width, hwEncoding) and said
+    // nothing about which one a register field meant, so `mov x0, sp` emitted
+    // `mov x0, xzr` — x0 got ZERO — with rc=0 and no diagnostic. Nothing in the
+    // document was wrong about either register; what was missing was the fact
+    // that they COLLIDE. A collision is derivable from the table, so it is
+    // checked here rather than trusted to an author noticing.
+    //
+    // ⚠ THE GROUP KEY IS (class, widthBytes, hwEncoding) AND THE WIDTH IS
+    // LOAD-BEARING: `wzr` is `xzr`'s 32-bit view and `w0` is `x0`'s, so every
+    // `subOf` row shares its parent's encoding by construction (the `subOf`
+    // rule above ENFORCES that). Grouping without the width would call all 96
+    // AArch64 GPR views collisions and refuse the shipped table.
+    // ⓘ ✔MEASURED across both shipped targets at HEAD: exactly ONE group had
+    // more than one row — {xzr, sp} — so this rule is precisely the shape of the
+    // one defect and imposes nothing on anything else.
+    //
+    // ⚠ SCOPED TO A TARGET THAT HAS A REGISTER FIELD — see `anyRegisterField`
+    // above for why that is the rule's premise rather than a relaxation of it.
+    if (anyRegisterField) {
+        struct RoleGroupKey {
+            TargetRegClass cls;
+            std::uint16_t  widthBytes;
+            std::uint16_t  hwEncoding;
+            [[nodiscard]] bool operator==(RoleGroupKey const&) const = default;
+        };
+        std::vector<RoleGroupKey>              keys;
+        std::vector<std::vector<std::size_t>>  members;
+        for (std::size_t i = 0; i < registers.size(); ++i) {
+            RoleGroupKey const k{registers[i].regClass,
+                                 registers[i].widthBytes,
+                                 registers[i].hwEncoding};
+            auto const it = std::find(keys.begin(), keys.end(), k);
+            if (it == keys.end()) {
+                keys.push_back(k);
+                members.push_back({i});
+            } else {
+                members[static_cast<std::size_t>(it - keys.begin())]
+                    .push_back(i);
+            }
+        }
+        for (std::size_t g = 0; g < members.size(); ++g) {
+            auto const& group = members[g];
+            if (group.size() == 1) {
+                // ⚠ A ROLE ON A ROW THAT SHARES ITS NUMBER WITH NOBODY IS
+                // REFUSED, and not for tidiness: every field that does not name
+                // that role would then refuse this register, so a key meant as
+                // documentation would silently unspell a register nothing else
+                // in the document explains.
+                auto const& r = registers[group[0]];
+                if (!r.encodingRole.empty()) {
+                    fail(std::format("/registers/{}/encodingRole", group[0]),
+                         std::format(
+                             "register '{}' declares encodingRole '{}', but no "
+                             "other register of class '{}' shares its width ({} "
+                             "bytes) and hwEncoding ({}) — a role names WHICH "
+                             "of several registers a shared encoding means, so "
+                             "on a register whose encoding is its own it only "
+                             "narrows which fields may name it",
+                             r.name, r.encodingRole,
+                             targetRegClassName(r.regClass), r.widthBytes,
+                             r.hwEncoding));
+                }
+                continue;
+            }
+            std::size_t defaults = 0;
+            for (std::size_t const mi : group) {
+                auto const& r = registers[mi];
+                if (r.encodingRole.empty()) {
+                    fail(std::format("/registers/{}/encodingRole", mi),
+                         std::format(
+                             "register '{}' shares class '{}', width {} and "
+                             "hwEncoding {} with {} other register(s), but "
+                             "declares no 'encodingRole' — nothing then says "
+                             "which of them an instruction field names, and a "
+                             "field would silently encode whichever the "
+                             "operand happened to resolve to (that is exactly "
+                             "how `mov x0, sp` came to emit `mov x0, xzr`)",
+                             r.name, targetRegClassName(r.regClass),
+                             r.widthBytes, r.hwEncoding, group.size() - 1));
+                    continue;
+                }
+                if (r.encodingRoleIsDefault) ++defaults;
+                for (std::size_t const oj : group) {
+                    if (oj <= mi) continue;
+                    if (registers[oj].encodingRole == r.encodingRole) {
+                        fail(std::format("/registers/{}/encodingRole", oj),
+                             std::format(
+                                 "registers '{}' and '{}' share one encoding "
+                                 "and both declare encodingRole '{}' — a role "
+                                 "is what tells them apart, so two rows "
+                                 "claiming it leaves the collision unresolved",
+                                 r.name, registers[oj].name, r.encodingRole));
+                    }
+                }
+            }
+            if (defaults != 1) {
+                fail(std::format("/registers/{}/encodingRoleIsDefault",
+                                 group.front()),
+                     std::format(
+                         "the {} registers sharing class '{}', width {} and "
+                         "hwEncoding {} declare {} default reading(s) — EXACTLY "
+                         "ONE must set 'encodingRoleIsDefault', because that is "
+                         "the register a field naming no 'regRole' resolves to. "
+                         "Zero would refuse every unannotated field; two would "
+                         "make the fall-back a coin flip",
+                         group.size(),
+                         targetRegClassName(registers[group.front()].regClass),
+                         registers[group.front()].widthBytes,
+                         registers[group.front()].hwEncoding, defaults));
             }
         }
     }
@@ -2098,6 +2556,38 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  "so naming one here would silently drop it from "
                                  "the register pool",
                                  cc.name, field, ref, reg.subOf, reg.subOf));
+            }
+            // ★★★ AND THE SAME FAILURE REACHED THROUGH THE OTHER KEY: a
+            // convention naming an ALIAS spelling rather than the row's
+            // canonical name (`TargetRegisterInfo::aliases`).
+            //
+            // ⚠ THE REASON IS MEASURED, NOT STYLISTIC. `lir_regalloc::
+            // buildFreeLists` and `lir_rewrite::collectAllocatable` walk the
+            // register TABLE and test `allocatable.contains(info.name)` — the
+            // row's CANONICAL name — against the set these very lists build.
+            // An alias in a cc list therefore matches NO row: the producer
+            // declared a register, got no register, and got no diagnostic,
+            // which is the identical shape D-TARGET-CC-NAMES-SUB-REGISTER
+            // exists to stop one line up. Worse in the singleton roles, where
+            // an unmatched `framePointer` leaves the frame base allocatable.
+            //
+            // ★ IT ALSO CLOSES THE DOUBLE-COUNT DOOR FROM THE OTHER SIDE
+            // ([[D-TARGET-ALIASED-VIEWS-BOTH-ALLOCATABLE-DOUBLE-COUNT-ONE-FILE]]):
+            // a convention listing BOTH spellings of one register is refused
+            // here by the alias half, so the pair can never reach the pool at
+            // all — on top of the one-ordinal construction that would have
+            // made it one entry anyway.
+            if (reg.name != ref) {
+                fail(std::format("/callingConventions/{}/{}/{}", ccIdx, field, k),
+                     std::format("callingConvention '{}'.{}: register '{}' is an "
+                                 "ALIAS spelling of '{}' — a calling convention "
+                                 "must name a register by its canonical name "
+                                 "('{}'). The allocatable pools are built by "
+                                 "matching these lists against each row's "
+                                 "canonical name, so an alias here matches no "
+                                 "row and silently drops the register from the "
+                                 "pool instead of declaring it",
+                                 cc.name, field, ref, reg.name, reg.name));
             }
             if (expectedClass != TargetRegClass::None
                 && reg.regClass != TargetRegClass::None

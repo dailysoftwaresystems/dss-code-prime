@@ -1,0 +1,17 @@
+{
+  "$comment": "P64 [[D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN]]: the POSITIVE runtime witness that an over-aligned `thread_local` is PLACED on pe64, in the MAIN thread's block and in a CreateThread worker's freshly allocated one. Before this cycle the pe64 writer refused every thread-local above 16 bytes with `K_ThreadLocalOveralignedForFormat`, on the premise that the Windows loader guarantees only MEMORY_ALLOCATION_ALIGNMENT and that IMAGE_TLS_DIRECTORY64 has no field to request more. $$ BOTH HALVES REFUTED BY MEASUREMENT (P64). The field is declared in the Windows SDK's own `um/winnt.h` -- `Characteristics` is a union over `{ Reserved0 : 20; Alignment : 4; Reserved1 : 8; }`, the ordinary IMAGE_SCN_ALIGN_* nibble -- and the loader honours it. THE DISCRIMINATOR, which makes this causal rather than correlational: one MSVC-linked image carrying seven 4096-aligned `__declspec(thread)` objects RAN 42 with every address `% 4096 == 0` on both threads, and the SAME FILE with ONLY that nibble rewritten 4096 -> 16 RAN 50 (`t1 mod 4096 = 720`). Same template, same block size, same code bytes. $$ THE REFERENCE TABLE, each probed SEPARATELY, BUILD **and** RUN with the address asserted on TWO threads, CONTROL arm N=16 green throughout: MSVC 19.51 -- which uses NATIVE Windows TLS and therefore speaks directly about the loader -- returns 42 at 8, 16, 32, 64 and 4096, and at 8192 with `/link /ALIGN:8192`; mingw-w64 gcc 13.2.0 returns 42 across the same range (via emutls) and refuses 16384 by name, \"requested alignment '16384' exceeds object file maximum 8192\". 8192 is the largest value the four-bit field encodes and is where both stop, so that is the ceiling DSS now refuses above, by name. $ THE SECOND THREAD IS THE MEASUREMENT: the main thread's TLS block is set up very early in process init and can be aligned by accident; a CreateThread worker gets a block the loader allocates fresh, so an image whose directory does not ASK for the alignment fails there. $ EIGHT OBJECTS WITH ODD FILLERS, tdata AND tbss: an object at block offset 0 is right by luck. $ pe64-ONLY: CreateThread is the native Windows primitive (as in this example's single-alignment sibling `examples/c/thread_local_win_threads`), and the Mach-O leg still refuses over-aligned thread-locals under its own anchor [[D-CSUBSET-THREAD-LOCAL-MACHO-OVERALIGN]], in a file this lane may not touch.",
+  "$commentRedOnDisable": "REMOVE direction: in `src/link/format/pe.cpp`, restore `putTlsU32(dirOff + 36, 0)` in the IMAGE_TLS_DIRECTORY64 writer (deleting the `alignNibble` computation). Build rc 0, source md5 moved and returned, the mutated TU's .obj md5 moved and returned; this example then BUILDS CLEAN and FAILS AT RUN TIME in BOTH runners with exit 50, while `examples/c/thread_local_win_threads` (whose thread-locals are all naturally aligned, so the nibble it asks for is the default) stays GREEN as the named control.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

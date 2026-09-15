@@ -116,13 +116,19 @@ constexpr std::string_view kDependencyKeyDocumentHeader =
 constexpr std::string_view kDependencyAnchor =
     "D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION";
 
-// ★★★ THE DEPENDENCY ENTRIES' OWN SUBTREE, AND IT IS A CORRECTNESS COMPONENT
-// RATHER THAN TIDINESS. `pruneSupersededSiblings` deletes by
+// ★★★ THE DEPENDENCY ENTRIES' OWN SUBTREE, AND IT IS STILL A CORRECTNESS
+// COMPONENT RATHER THAN TIDINESS — THOUGH ITS ORIGINAL REASON IS GONE. It was
+// introduced because `pruneSupersededSiblings` deleted by
 // `<stem>-<16 base32><suffix>` WITHIN ONE DIRECTORY, so two subject classes
-// sharing a directory would prune each other: a dependency named `unistd`
-// building to `.a` would delete the shipped runtime object for `unistd.c`, and
-// the next build of an unrelated program would recompile it. One component
-// keeps the two families disjoint by construction.
+// sharing a directory pruned each other: a dependency named `unistd` building
+// to `.a` deleted the shipped runtime object for `unistd.c`. That prune is gone
+// ([[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]),
+// and the component stays for the reason that survives it: two subject classes
+// in one directory would share an 80-bit index space under a shared stem, and a
+// cross-class collision there does not serve the wrong bytes — the sidecar
+// catches it — it REFUSES, i.e. it bricks both builds until someone deletes the
+// cache by hand. Separate subtrees keep an already-improbable event
+// structurally impossible instead of merely unlikely.
 //
 // ⓘ ONLY THE DEPENDENCY PATHS GAIN IT. The runtime object shape is unchanged,
 // so every artifact already written — including a packaged read-only `dist/` a
@@ -172,10 +178,13 @@ static_assert(!kCompilerStamp.empty(),
 
 // ── THE PATH INDEX'S SHAPE, DECIDED ONCE ────────────────────────────────────
 //
-// ⚠ THESE FOUR CONSTANTS ARE THE ONLY PLACE THE FILENAME SHAPE IS SPELLED.
-// `computeRuntimeObjectKey` composes with them and `pruneSupersededSiblings`
-// DELETES FILES with them; a second spelling that drifted would either strand
-// artifacts or delete somebody else's.
+// ⚠ THESE FOUR CONSTANTS ARE THE ONLY PLACE THE FILENAME SHAPE IS SPELLED, and
+// since the prune was removed
+// ([[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]])
+// they have exactly ONE consumer: `finishKey` COMPOSES with them. Nothing in
+// this file decomposes a name any more, which is a strengthening — a second
+// spelling used to be able to delete somebody else's file, and can now only
+// strand one.
 //
 // 10 bytes = 80 bits = EXACTLY 16 base32 characters with no partial group, so
 // the render is a clean prefix of the digest rather than a prefix plus a
@@ -191,25 +200,16 @@ static_assert(kPathDigestBytes * 8u % 5u == 0u,
               "not actually contain.");
 static_assert(kPathDigestChars == kPathDigestBytes * 8u / 5u);
 
-// A path index is well-formed iff it is EXACTLY 16 characters of RFC 4648's
-// LOWERCASE base32 alphabet. Same shape of predicate as `isSha256HexLower`
-// above and for the same reason: the complement is defined, so an uppercase,
-// padded (`=`), truncated or hex-looking name is rejected rather than
-// half-accepted.
-//
-// ⛔ THE ALPHABET EXCLUDES `0`, `1` AND `8`, AND THAT IS NOT AN OVERSIGHT — RFC
-// 4648's base32 alphabet is `a-z` then `2-7`. A check that accepted `[a-z0-9]`
-// would match names this encoder can never produce, and this predicate gates a
-// `remove()`.
-[[nodiscard]] bool isPathDigestBase32Lower(std::string_view text) noexcept {
-    if (text.size() != kPathDigestChars) return false;
-    for (char const c : text) {
-        bool const isLetter = c >= 'a' && c <= 'z';
-        bool const isDigit  = c >= '2' && c <= '7';
-        if (!isLetter && !isDigit) return false;
-    }
-    return true;
-}
+// ⓘ THE `isPathDigestBase32Lower` PREDICATE THAT STOOD HERE IS GONE WITH THE
+// PRUNE IT GATED
+// ([[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]).
+// It existed to decide whether a directory entry's middle component was a name
+// THIS cache could have produced, and its only caller was the sibling matcher
+// feeding `remove()`. Nothing else in this file ever parses an entry name back
+// apart — every path is COMPOSED here, never re-read — so keeping the predicate
+// would leave a validator with no subject, which is how a rule quietly acquires
+// a second, drifting owner later. `kPathDigestChars` stays: it is what the
+// encoder is asserted against.
 
 // Read a whole file as bytes. Binary mode on every host: the digest must be
 // identical whether the cache is populated on Windows or Linux, and text-mode
@@ -337,92 +337,36 @@ constexpr RootCandidate kPlatformRootCandidates[] = {
     return out;
 }
 
-// ── Superseded-sibling pruning ──────────────────────────────────────────────
+// ── THERE IS NO SUPERSEDED-SIBLING PRUNE, AND THAT IS THE FIX ────────────
 //
-// ⓘ BEST-EFFORT, AND ITS FAILURE IS NOT AN ERROR — this is a deliberate
-// asymmetry, not a swallowed exception. Correctness here never depended on the
-// old entry being GONE; it depends only on it being UNREACHABLE, and the
-// key-as-path already guarantees that: nothing computes the superseded key, so
-// nothing looks the superseded file up. Pruning is a disk-space courtesy.
-// Meanwhile the failure it will actually hit is routine and unfixable from
-// here: Windows refuses to unlink a file another process still has open, and a
-// build that turned "someone else is reading the old archive" into a hard
-// error would be less correct, not more.
+// [[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]
 //
-// The match is EXACT rather than a prefix glob: `<stem>-<16 lowercase base32>`
-// plus ONE of the two suffixes this cache writes, with a length check, a
-// separator check and an alphabet check on the middle. A loose `"<stem>-*.a"`
-// would let a unit named `foo` delete a DIFFERENT unit named `foo-bar`.
+// `matchesEntryName` and `pruneSupersededSiblings` stood here. Given the entry
+// this store was about to write, they deleted every `<stem>-<index><suffix>` in
+// the directory whose index was not that one — i.e. they inferred SUPERSEDED
+// from DIFFERENT INDEX. The full argument, the exhaustive enumeration behind
+// *no ordering is derivable from a `.key` document*, the two measurements
+// (the P66 red; the 0-byte reclaim over 1,561 build-stamp roots) and the four
+// rejected alternatives are on `storeRuntimeObject` in the header, where a
+// caller reads them. Two things are worth having HERE, at the site:
 //
-// ⚠ `keepIndex` IS THE PATH INDEX, NOT THE KEY. It is compared here only to
-// spare the entry this store is about to write; the entry's IDENTITY is settled
-// by the `.key` document, never by this 16-character name. Nothing about
-// deletion depends on the index being unique — a name that is NOT the one being
-// kept is superseded whichever key produced it, and its own key document goes
-// with it.
-[[nodiscard]] bool matchesEntryName(std::string_view name,
-                                    std::string_view sourceStem,
-                                    std::string_view suffix,
-                                    std::string_view keepIndex) {
-    if (name.size() != sourceStem.size() + 1u + kPathDigestChars + suffix.size())
-        return false;
-    if (!name.starts_with(sourceStem)) return false;
-    if (name[sourceStem.size()] != '-') return false;
-    if (!name.ends_with(suffix)) return false;
-    std::string_view const index{name.data() + sourceStem.size() + 1u,
-                                 kPathDigestChars};
-    if (!isPathDigestBase32Lower(index)) return false;
-    return index != keepIndex;
-}
+// ★ THE DELETED CODE WAS CAREFUL, AND CAREFUL WAS NOT THE PROBLEM. The match
+// was exact rather than a prefix glob (a length check, a separator check and an
+// alphabet check on the middle) so that a unit named `foo` could not delete a
+// unit named `foo-bar`; artifacts were unlinked before key documents so a
+// partial prune could not leave an artifact whose sidecar was gone; the whole
+// thing was best-effort so that Windows refusing to unlink an OPEN file was not
+// an error. Every one of those defends the deletion's MECHANICS. None of them
+// touches the question of whether the file may be deleted AT ALL, and that was
+// the only question that mattered.
+//
+// ⚠ SO DO NOT REINTRODUCE IT AS *"a safer prune"*. The unsafety is not in the
+// matching, the ordering or the error handling — it is that a store has no
+// evidence about another process, and every candidate repair that keeps a
+// store-time deletion has to invent some. What may be reclaimed here is
+// nothing; what a USER may reclaim is the whole per-stamp root, which is what
+// `buildStampPathSegment` exists to make possible.
 
-// ⚠ `artifactSuffix` IS A PARAMETER AND NOT `kArtifactSuffix`. It was the
-// constant while a shipped runtime archive (`.a`) was the only subject class;
-// a dependency artifact takes its OBJECT FORMAT'S OWN extension, so a hardcoded
-// `.a` would silently match NOTHING for a `.lib` and the eviction policy would
-// be a no-op nobody could see. The KEY DOCUMENT suffix stays the constant —
-// that one is this file's own and is the same for every subject.
-void pruneSupersededSiblings(fs::path const&  directory,
-                             std::string_view sourceStem,
-                             std::string_view artifactSuffix,
-                             std::string_view keepIndex) {
-    std::error_code ec;
-    fs::directory_iterator it(directory, ec);
-    if (ec) return;
-
-    // ⓘ COLLECT FIRST, DELETE AFTER. Unlinking the entry a `directory_iterator`
-    // is currently positioned on is a question every platform answers slightly
-    // differently, and this loop has no reason to ask it: the match set is
-    // small and the whole operation is best-effort anyway.
-    //
-    // ★★ TWO LISTS, AND THE SPLIT IS THE SAME SAFETY PROPERTY THE STORE'S WRITE
-    // ORDER HAS, RUN BACKWARDS. A partial prune must never leave an ARTIFACT
-    // whose key document is gone: that state REFUSES for anyone who later
-    // computes exactly this key (a reverted edit does), so a best-effort
-    // courtesy would have bricked a build. Artifacts are unlinked FIRST and key
-    // documents SECOND, so the surviving intermediate state is a stray `.key`
-    // — invisible to every lookup, and swept on the next prune.
-    std::vector<fs::path> supersededArtifacts;
-    std::vector<fs::path> supersededKeyDocuments;
-    for (fs::directory_iterator const end{}; it != end; it.increment(ec)) {
-        if (ec) break;
-        std::error_code typeEc;
-        if (!it->is_regular_file(typeEc) || typeEc) continue;
-        std::string const name = it->path().filename().string();
-        if (matchesEntryName(name, sourceStem, artifactSuffix, keepIndex)) {
-            supersededArtifacts.push_back(it->path());
-        } else if (matchesEntryName(name, sourceStem, kKeyDocumentSuffix,
-                                    keepIndex)) {
-            supersededKeyDocuments.push_back(it->path());
-        }
-    }
-    for (std::vector<fs::path> const* list :
-         {&supersededArtifacts, &supersededKeyDocuments}) {
-        for (fs::path const& stale : *list) {
-            std::error_code removeEc;
-            fs::remove(stale, removeEc);  // failure is explicitly NOT an error
-        }
-    }
-}
 
 // RAII: the temp file is removed on EVERY exit path unless explicitly
 // released. Written as a guard rather than as cleanup at each `return` because
@@ -706,9 +650,14 @@ writeThroughTemp(RuntimeObjectKey const&       key,
     // Same directory so the rename below is a same-filesystem operation (a
     // cross-device rename is a copy, and a copy is not atomic). The name is
     // dot-prefixed and carries a `.tmp-<pid>-<n>` tail, so it ends in neither
-    // `.a` nor `.key` and therefore cannot be mistaken for an entry by
-    // `pruneSupersededSiblings` — including by a CONCURRENT process's prune,
-    // which would otherwise be free to delete a temp being written right now.
+    // `.a` nor `.key` and therefore cannot be mistaken for an ENTRY by anything
+    // that walks this directory. ⓘ The hazard that originally motivated the
+    // shape — a CONCURRENT process's prune deleting a temp mid-write — no longer
+    // exists, because no store deletes anything
+    // ([[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]).
+    // The shape is kept because the property is the right one to hold
+    // independently of who is currently relying on it: a partially written file
+    // must not be nameable as a finished entry.
     //
     // ⚠ IT IS ALSO THE LONGEST NAME THIS CACHE EVER COMPOSES — the destination's
     // own name plus thirteen characters. That is why the path budget is measured
@@ -1380,12 +1329,16 @@ computeDependencyArtifactKey(DependencyArtifactRequest const& request) {
             request.artifactStem, request.inputClosureDigest,
             kDependencyAnchor));
     }
-    // ⚠ THE STEM AND THE SUFFIX GATE A `remove()`, WHICH IS WHY THEY ARE
-    // REFUSED RATHER THAN DEFAULTED. `pruneSupersededSiblings` matches
-    // `<stem>-<16 base32><suffix>` EXACTLY; an empty stem would make every
-    // entry in the directory whose name is `-<index><suffix>` one family, and
-    // an empty suffix would make the artifact and its `.key` sidecar
-    // indistinguishable to `replace_extension`.
+    // ⚠ THE STEM AND THE SUFFIX NAME THE ENTRY, WHICH IS WHY THEY ARE REFUSED
+    // RATHER THAN DEFAULTED. They used to gate a `remove()` as well; that prune
+    // is gone
+    // ([[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]])
+    // and the refusal is NOT weakened with it, because the naming half was
+    // always the load-bearing one: an empty stem composes the entry name
+    // `-<index><suffix>`, which is a file this cache can write and no reader can
+    // attribute to a dependency, and an empty suffix makes the artifact and its
+    // `.key` sidecar indistinguishable to `replace_extension` — i.e. the store
+    // would overwrite its own key document with the artifact's bytes.
     if (request.artifactStem.empty() || request.artifactSuffix.empty()) {
         return std::unexpected(std::format(
             "dependency artifact cache: the request names an artifact stem "
@@ -1554,8 +1507,7 @@ lookupRuntimeObject(RuntimeObjectKey const& key) {
 
 std::expected<fs::path, std::string>
 storeRuntimeObject(RuntimeObjectKey const&      key,
-                   std::span<std::uint8_t const> bytes,
-                   CacheEviction                 eviction) {
+                   std::span<std::uint8_t const> bytes) {
     // ── THE WRITABLE ROOT, OR A REFUSAL ─────────────────────────────────────
     //
     // ⛔ THE FIRST AND MOST IMPORTANT ARM: no per-user root resolved at all, so
@@ -1579,52 +1531,14 @@ storeRuntimeObject(RuntimeObjectKey const&      key,
     fs::path const  directory    = destination.parent_path();
     fs::path const  documentPath = runtimeKeyDocumentPath(destination);
 
-    // The prune target is derived ONCE, up front, and held in real strings —
-    // a `string_view` over `destination.filename().string()` would view a
-    // temporary that dies at the end of the statement.
-    //
-    // ★ SPLIT ON THE INDEX, NOT ON A KNOWN SUFFIX. This used to test
-    // `ends_with("-" + pathDigest + ".a")`, which silently produced an EMPTY
-    // stem — and therefore pruned nothing — for any entry whose extension is
-    // not `.a`. The index is the one component this file always composes, so
-    // splitting on it derives BOTH halves for every subject class instead of
-    // asserting one of them. `rfind` because a stem may legitimately contain a
-    // `-` run that happens to look like an index.
-    std::string const filename = destination.filename().string();
-    std::string const marker   = "-" + key.pathDigest;
-    std::size_t const markerAt = filename.rfind(marker);
-    bool const wellFormed = markerAt != std::string::npos && markerAt > 0u
-                         && markerAt + marker.size() < filename.size();
-    std::string const sourceStem =
-        wellFormed ? filename.substr(0u, markerAt) : std::string{};
-    std::string const artifactSuffix =
-        wellFormed ? filename.substr(markerAt + marker.size()) : std::string{};
-    // ⓘ Called on BOTH success paths (fresh rename AND destination-already-
-    // present): a build that lost the race still wants the superseded sibling
-    // gone, and the winner may have been a process that never had a chance to
-    // prune. Guarded on a non-empty stem so a hand-built key whose
-    // `userArtifactPath` does not follow `<stem>-<index>.a` prunes NOTHING
-    // rather than guessing at a stem — deleting the wrong file is not
-    // best-effort.
-    //
-    // ⓘ IT PRUNES THE PER-USER ROOT AND ONLY THAT ROOT, and it needs no check
-    // to guarantee it: `directory` is derived from `userArtifactPath`, so the
-    // shipped root is unreachable from here by construction rather than by a
-    // guard someone could weaken. A shipped superseded sibling is left exactly
-    // where the package manager put it — it is already unreachable (nothing
-    // computes its key) and deleting another owner's files is not this file's
-    // business.
-    //
-    // ⓘ AND UNDER `CacheEviction::Retain` IT DOES NOTHING AT ALL — the whole
-    // policy, expressed as the one call it gates. Retaining costs disk and
-    // nothing else: the key-as-path rule already makes a superseded entry
-    // UNREACHABLE, so keeping it can never cause one to be served.
-    auto const pruneNow = [&] {
-        if (eviction == CacheEviction::Retain) return;
-        if (sourceStem.empty() || artifactSuffix.empty()) return;
-        pruneSupersededSiblings(directory, sourceStem, artifactSuffix,
-                                key.pathDigest);
-    };
+    // ⓘ NOTHING IS DERIVED FROM THE DESTINATION'S NAME HERE ANY MORE. A block
+    // stood here splitting `<stem>-<index><suffix>` back apart, and its only
+    // consumer was the prune
+    // ([[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]).
+    // It went with it deliberately rather than being left "in case someone needs
+    // the stem": this file COMPOSES every path it uses and never re-reads one,
+    // so a lone decomposer is a second owner of the name's shape waiting to
+    // disagree with `finishKey`.
 
     std::error_code ec;
     if (!directory.empty()) {
@@ -1688,7 +1602,6 @@ storeRuntimeObject(RuntimeObjectKey const&      key,
         return std::unexpected(written.error());
     }
 
-    pruneNow();  // best-effort; see `pruneSupersededSiblings`
     return destination;
 }
 

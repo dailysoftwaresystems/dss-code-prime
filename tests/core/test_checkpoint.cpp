@@ -546,7 +546,7 @@ TEST(Checkpoint, RollbackRestoresDedupWindow) {
 // ── Cursor and cookie state round-trip ──────────────────────────────────
 
 TEST(Checkpoint, RollbackRestoresCursorAndStack) {
-    // Open a frame inside speculation (so cursorStack_ grows), leave it
+    // Open a frame inside speculation (so the walker's frame stack grows), leave it
     // open, roll back. After rollback the cursor stack must match pre-cp.
     auto h = make("a;", kBasicCfg);
     TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};

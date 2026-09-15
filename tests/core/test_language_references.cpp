@@ -1731,8 +1731,17 @@ TEST(LanguageReferences, HostSpelledPlaceholdersWalkTheMergedRulesToCompletion) 
 
         cur = schema->leaveRule(cur);
         ASSERT_TRUE(cur.valid()) << "could not resume after the selector";
-        EXPECT_TRUE(schema->isAtEndOfRule(cur))
-            << "`? 0` walked the rule but did not COMPLETE it";
+        // ⚠ `nullableTail`, NOT `isAtEndOfRule`, SINCE 2026-09-02: the rule
+        // gained an OPTIONAL trailing `asmTemplateArrangement` (`%0.16b`,
+        // D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME), so
+        // the cursor legitimately stands BEFORE a skippable slot rather than on
+        // `End`. The claim this arm makes is unchanged and is the one that
+        // matters — `? 0` can COMPLETE here — and `nullableTail` is the API
+        // that states exactly that. An `isAtEndOfRule` here would now be
+        // asserting the absence of a feature rather than the presence of a
+        // completion.
+        EXPECT_TRUE(schema->nullableTail(cur))
+            << "`? 0` walked the rule but cannot COMPLETE it";
     }
 
     // `?^ ( done )` and `?^ 2` — an `asm goto` label, by NAME and by INDEX.
@@ -1820,8 +1829,11 @@ TEST(LanguageReferences, HostSpelledPlaceholdersWalkTheMergedRulesToCompletion) 
                "placeholder families are no longer sharing one selector rule";
         cur = schema->leaveRule(cur);
         ASSERT_TRUE(cur.valid());
-        EXPECT_TRUE(schema->isAtEndOfRule(cur))
-            << "`?# <selector>` walked the rule but did not COMPLETE it";
+        // ⚠ `nullableTail` for the same reason as the index arm above: this
+        // rule also gained the optional `asmTemplateArrangement` tail, so
+        // "can complete here" is the honest question.
+        EXPECT_TRUE(schema->nullableTail(cur))
+            << "`?# <selector>` walked the rule but cannot COMPLETE it";
     }
 
     // ⚠ AND THE SIGILS ARE NOT INTERCHANGEABLE. If the merge had bound two

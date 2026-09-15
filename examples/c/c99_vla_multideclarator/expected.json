@@ -1,0 +1,58 @@
+{
+  "$comment": "D-CSUBSET-VLA-MULTIDECLARATOR-STATEMENT-TEARDOWN (a LIVE silent miscompile) + D-CSUBSET-VLA-FOR-INIT-MULTIDECL (the SAME producer refusing instead of corrupting). ONE declaration with MANY declarators is not a scope: C 6.2.4 gives `int a[n], b[n];` both objects the scope of the ENCLOSING block, but cst_to_hir has to hand a statement position ONE node and wraps the N declarators in a Block — read as a scope, that Block freed both objects at the end of the STATEMENT and the next VLA landed on the first. The example moves BOTH rows at once and in OPPOSITE directions: arms 1-4, 9-11 must give the RIGHT ANSWER (they were silently wrong: the pre-fix witness returned 10 where gcc 13.3.0 and clang 18.1.3 return 42), and arm 5 must COMPILE AND RUN AT ALL (it was a loud refusal of a program both references run). WHY THE READS SIT WHERE THEY DO: every arm that re-reads a declaration group does so BELOW the store to the object declared AFTER it. That placement is the whole test — an arm that reads a[0] before the corrupting store stays green with the fix removed, because nothing has landed on `a` yet. EVERY VLA function here is a LEAF (main makes no call), which is what makes this a witness for the teardown rather than for the VLA frame model: outgoingArgAreaSize is 0 with no calls, no frame bias is emitted, and the reproduction is byte-identical with and without D-CSUBSET-VLA-NONLEAF-CALL-FRAME. Arms 6, 7, 8 and 12 run 400000 iterations each and are CRASH-on-leak witnesses in the other direction — the fix widens a group's teardown out to the enclosing scope, and if that widening ever escaped to a real loop body the `sub sp` would accumulate per iteration and STATUS_STACK_OVERFLOW / SIGSEGV; arm 8 is the deliberate CONTROL for the conservative half of the recogniser (a real all-declaration compound statement, which the MIR tier cannot tell from a declarator group, and whose reclaim is therefore correct-but-late by exactly one scope). The `release` arm proves the optimizer preserves the widened save/restore placement. exitCode 42 iff total == 4400160, the value gcc 13.3.0 and clang 18.1.3 both produce at -std=c17 and -std=c2x, -O0. ★ ARM 13 ADDED BY THE P59 ORCHESTRATOR AFTER THE FOLD, and it could not have existed before it: the WIDENED shape puts a TEN-ARGUMENT CALL after the declarator group, so the callee's outgoing-argument stores land on a wrongly-freed group — a second, independent writer, and the one a real program is likeliest to have. Lane `md` could not write it because at its base any call inside a VLA function was refused (L_VlaNonLeafFrameUnsupported); [[D-CSUBSET-VLA-NONLEAF-CALL-FRAME]] closed in the same cycle. The two element reads sit BELOW the call deliberately — above it they would pass with the fix removed. The expected total moves 4400160 → 4400169.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "full-release-like",
+      "passes": [
+        "ConstFold",
+        "Mem2Reg",
+        "CopyProp",
+        "Cse",
+        "Licm",
+        "SimplifyCfg",
+        "Dce"
+      ],
+      "mustDifferFromBaseline": true
+    },
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

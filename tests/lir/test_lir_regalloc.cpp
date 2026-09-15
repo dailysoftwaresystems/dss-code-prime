@@ -32,10 +32,12 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -2910,4 +2912,207 @@ TEST(LirRegAllocCoalesce, RealAllocationsCarryNoInterferenceConflict) {
                 << (c ? c->b.id : 0) << " share a resource while both live";
         }
     }
+}
+
+// ── THE RELOAD-SCRATCH RESERVATION MUST BE ABLE TO MEET ITS OWN DEMAND ──────
+//
+// ★★★ D-AS-REGALLOC-SCRATCH-POOL-EXHAUSTED-BY-A-LARGE-FUNCTION-IN-RELEASE
+// (cycle P66, lane `ra`). The allocator holds back `computeReloadReserve`
+// registers per class as GUARANTEED spill-reload scratch. It used to draw them
+// only from the class's NON-ARGUMENT CALLER-SAVED registers and, when a
+// convention declared fewer of those than the demand, "reserve what EXISTS and
+// stop" — so the guarantee silently became a hope.
+//
+// ★★ WHY THIS PIN ASSERTS AN INVARIANT AND NOT A FUNCTION SIZE. The shortfall
+// is INVISIBLE until a function's pressure happens to assign every other
+// register of the class: the pool the rewriter gets is the reservation PLUS
+// whatever went unassigned, so a one-register shortfall shows up only at the
+// exact pressure that consumes the slack. ✔MEASURED through the shipped CLI — a
+// probe spilling 107 FPR vregs on the affected convention compiled CLEAN while
+// the reproducer spilling 50 refused, so "how many vregs spilled" is not the
+// property, and a witness pinned at whatever size fails today would stop
+// discriminating the moment anything moved the slack. `achieved >= demand` is
+// the property, it is true or false at ALLOCATION time, and no function size
+// enters it.
+//
+// ⓘ WHAT KEEPS THIS ARM NON-VACUOUS is the SYNTHESIZED arm below it: a
+// convention whose class has ZERO non-argument caller-saved registers is built
+// by mutation, so the callee-saved fallback is exercised by construction and
+// stays exercised however the shipped conventions are later edited.
+TEST(LirRegAlloc, ReloadScratchReservationMeetsItsDemandOnEveryShippedConvention) {
+    // Three-operand arithmetic in both banks: a multiply's two operands plus
+    // its result are three SAME-CLASS virtual registers on one instruction,
+    // which is what makes the peak per-instruction reload demand exceed the
+    // two non-argument caller-saved FPRs ms_x64 declares.
+    static constexpr char const* kSrc =
+        "double fd(double a, double b, double c) {\n"
+        "    return a * b + c * a - b * c;\n"
+        "}\n"
+        "int fi(int a, int b, int c) {\n"
+        "    return a * b + c * a - b * c;\n"
+        "}\n";
+
+    bool sawAnyDemand = false;
+    for (char const* targetName : {"x86_64", "arm64"}) {
+        auto probe = TargetSchema::loadShipped(targetName);
+        ASSERT_TRUE(probe.has_value()) << targetName;
+        auto const ccCount =
+            static_cast<std::uint16_t>((*probe)->callingConventionCount());
+        ASSERT_GT(ccCount, 0u) << targetName;
+
+        for (std::uint16_t ccIdx = 0; ccIdx < ccCount; ++ccIdx) {
+            auto lowered = lowerCToLir(kSrc, targetName, ccIdx);
+            ASSERT_TRUE(lowered.lir.ok) << targetName << " cc " << ccIdx;
+            Lir const& lir = lowered.lir.lir;
+            auto const* cc = lowered.target->callingConvention(ccIdx);
+            ASSERT_NE(cc, nullptr);
+
+            LirLiveness const lv = analyzeLiveness(lir);
+            DiagnosticReporter rep;
+            LirAllocation const out =
+                allocateRegisters(lir, *lowered.target, lv, ccIdx, rep);
+            ASSERT_TRUE(out.ok()) << targetName << " cc " << ccIdx;
+
+            for (auto const& alloc : out.perFunc) {
+                for (std::size_t c = 0; c < kLirRegClassCount; ++c) {
+                    std::uint16_t const demand   = alloc.reloadReserveDemand[c];
+                    std::uint16_t const achieved = alloc.reloadReserveAchieved[c];
+                    if (demand > 0) sawAnyDemand = true;
+                    EXPECT_GE(achieved, demand)
+                        << targetName << " cc '" << cc->name << "' func "
+                        << alloc.fn.v << " class '"
+                        << lirRegClassName(static_cast<LirRegClass>(c))
+                        << "': the allocator reserved " << achieved
+                        << " spill-reload scratch register(s) against a peak "
+                        << "single-instruction demand of " << demand
+                        << ". A shortfall is not a miscompile, but it makes the "
+                        << "scratch GUARANTEE conditional on pressure the "
+                        << "reservation cannot see -- the rewriter then refuses "
+                        << "a legal program with L_VirtualRegInPostRegalloc at "
+                        << "whatever function first consumes the slack.";
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(sawAnyDemand)
+        << "no shipped convention produced a non-zero reload demand for this "
+           "source -- the invariant above then held vacuously and this pin "
+           "measured nothing.";
+}
+
+// The SYNTHESIZED negative for the arm above: a convention with NO non-argument
+// caller-saved register of a class at all.
+//
+// ★★ REMOVE DIRECTION, DELIBERATELY. The mutation MOVES every non-argument
+// caller-saved FPR of `sysv_amd64` out of `callerSaved` and into `calleeSaved`:
+// the registers stay ALLOCATABLE (the register file is unchanged, so nothing
+// else about the allocation moves), but the class's non-argument caller-saved
+// supply drops to ZERO -- xmm0..xmm7 are all argument registers, and an
+// argument register may NEVER be reserved (D-AS-REGALLOC-ARG-REGISTER-OCCUPIED:
+// a reload staged through one clobbers an incoming parameter before its `arg`
+// op reads it, silently). An ADD-direction mutant -- handing some convention
+// MORE caller-saved registers -- would stay green under the defect and prove
+// nothing; this one is red under it by construction.
+//
+// ⚠ `mutateShippedTargetSchemaDoc` THROWS if the edit is a no-op, so this arm
+// cannot quietly stop mutating if the shipped register lists are renamed, and
+// the assertion below RE-MEASURES the supply out of the loaded schema rather
+// than trusting the edit.
+TEST(LirRegAlloc,
+     ReloadScratchReservationFallsBackToCalleeSavedWhenCallerSavedIsEmpty) {
+    static constexpr char const* kSrc =
+        "double fd(double a, double b, double c) {\n"
+        "    return a * b + c * a - b * c;\n"
+        "}\n";
+
+    std::size_t movedCount = 0;
+    auto mutated = dss::test_support::mutateShippedTargetSchemaDoc(
+        "x86_64", [&movedCount](nlohmann::json& doc) {
+            // The class of each register comes from the document's own
+            // `registers` table -- no register name is spelled here.
+            std::unordered_map<std::string, std::string> classOf;
+            for (auto const& r : doc.at("registers")) {
+                classOf.emplace(r.at("name").get<std::string>(),
+                                r.at("class").get<std::string>());
+            }
+            for (auto& cc : doc.at("callingConventions")) {
+                if (cc.at("name").get<std::string>() != "sysv_amd64") continue;
+                std::unordered_set<std::string> argNames;
+                for (auto const& a : cc.at("argGprs")) {
+                    argNames.insert(a.get<std::string>());
+                }
+                for (auto const& a : cc.at("argFprs")) {
+                    argNames.insert(a.get<std::string>());
+                }
+                std::vector<std::string> keep;
+                for (auto const& n : cc.at("callerSaved")) {
+                    auto const s  = n.get<std::string>();
+                    auto const it = classOf.find(s);
+                    bool const isFpr =
+                        it != classOf.end() && it->second == "fpr";
+                    if (isFpr && !argNames.contains(s)) {
+                        cc.at("calleeSaved").push_back(s);
+                        ++movedCount;
+                    } else {
+                        keep.push_back(s);
+                    }
+                }
+                cc.at("callerSaved") = keep;
+            }
+        });
+    ASSERT_TRUE(mutated.has_value())
+        << "the mutated x86_64 schema must still load";
+    ASSERT_GT(movedCount, 0u)
+        << "the mutation moved no register -- the pin below asserts nothing";
+
+    auto const& schema = **mutated;
+    std::optional<std::uint16_t> sysvIdx;
+    for (std::uint16_t i = 0;
+         i < static_cast<std::uint16_t>(schema.callingConventionCount()); ++i) {
+        auto const* c = schema.callingConvention(i);
+        if (c != nullptr && c->name == "sysv_amd64") { sysvIdx = i; break; }
+    }
+    ASSERT_TRUE(sysvIdx.has_value());
+    auto const* cc = schema.callingConvention(*sysvIdx);
+    ASSERT_NE(cc, nullptr);
+
+    // RE-MEASURED out of the loaded schema, not assumed from the edit.
+    std::unordered_set<std::string> argNames;
+    for (auto const& n : cc->argGprs) argNames.insert(n);
+    for (auto const& n : cc->argFprs) argNames.insert(n);
+    auto const regs = schema.registers();
+    std::size_t nonArgCallerSavedFprs = 0;
+    for (auto const& n : cc->callerSaved) {
+        if (argNames.contains(n)) continue;
+        auto const ord = schema.registerByName(n);
+        if (!ord.has_value()) continue;
+        if (regs[*ord].regClass == TargetRegClass::FPR) ++nonArgCallerSavedFprs;
+    }
+    ASSERT_EQ(nonArgCallerSavedFprs, 0u)
+        << "the mutant was supposed to leave this convention with no non-arg "
+           "caller-saved FPR; it has " << nonArgCallerSavedFprs;
+
+    auto lowered = lowerCToLir(kSrc, *mutated, *sysvIdx);
+    ASSERT_TRUE(lowered.lir.ok);
+    LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
+    DiagnosticReporter rep;
+    LirAllocation const out =
+        allocateRegisters(lowered.lir.lir, schema, lv, *sysvIdx, rep);
+    ASSERT_TRUE(out.ok());
+
+    bool sawFprDemand = false;
+    for (auto const& alloc : out.perFunc) {
+        auto const fpr = static_cast<std::size_t>(LirRegClass::FPR);
+        if (alloc.reloadReserveDemand[fpr] == 0) continue;
+        sawFprDemand = true;
+        EXPECT_GE(alloc.reloadReserveAchieved[fpr],
+                  alloc.reloadReserveDemand[fpr])
+            << "with ZERO non-argument caller-saved FPRs the reservation must "
+               "come out of the CALLEE-saved list -- reserved "
+            << alloc.reloadReserveAchieved[fpr] << " of "
+            << alloc.reloadReserveDemand[fpr];
+    }
+    EXPECT_TRUE(sawFprDemand)
+        << "no function in the mutant source demanded FPR reload scratch -- the "
+           "arm asserted nothing";
 }

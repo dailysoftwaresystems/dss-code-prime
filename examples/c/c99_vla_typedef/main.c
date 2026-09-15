@@ -2,13 +2,21 @@
 // C99 §6.7.7p2: the size expression `n` is evaluated ONCE, when the typedef
 // declaration is reached, and FROZEN — every later `R a;` allocates with that frozen
 // size (even if `n` changes between two uses of R). `volatile` seeds defeat constant
-// folding so the dims are genuinely runtime. main is a LEAF (no calls) — the C1b VLA
-// frame-model scope. Each `return k` (1..12) is a strict in-program pin; only all-pass
-// reaches 42. Two witnesses carry the correctness weight: (A) FREEZE-ONCE — after
+// folding so the dims are genuinely runtime. ★ LIFTED in P59: main used to be kept a LEAF
+// (no calls) because a VLA-object holder that CALLS was refused
+// (D-CSUBSET-VLA-NONLEAF-CALL-FRAME); it now CALLS `sink` between the freeze and the
+// re-reads, so every frozen object is verified to survive a call. Each `return k` is a
+// strict in-program pin; only all-pass reaches 42. Two witnesses carry the correctness weight: (A) FREEZE-ONCE — after
 // mutating `n`, a SECOND `R b;` must still be int[3], NOT int[100] (proven by the
 // runtime `sizeof a == sizeof b == 12`; if the freeze leaked, b would re-evaluate n=100
 // and size 400); (B) MULTI-DIM OFF-DIAGONAL — `c[1][0]` vs `c[0][1]` are DISTINCT cells,
 // so a wrong runtime row stride would alias/transpose them.
+// A call target, so main is a NON-LEAF function that also holds VLA objects — the shape
+// D-CSUBSET-VLA-NONLEAF-CALL-FRAME builds. Ten parameters so the call genuinely writes
+// stack arguments into the outgoing-args area that travels with SP.
+int sink(int a, int b, int c, int d, int e, int f,
+         int g, int h, int i, int j) { return a+b+c+d+e+f+g+h+i+j; }
+
 int main(void) {
     volatile int vn = 3;
     int n = vn;                 // runtime 3; volatile => no const fold
@@ -51,22 +59,54 @@ int main(void) {
     if (sizeof d    != 40) return 11;       // whole = 5*p*4 = 40
     if (sizeof d[0] != 8)  return 12;       // row   = p*4   = 8
 
+    // ★ THE LIFT: a wide CALL with a, b, c and d all still live, then every one of them
+    // re-read. main used to be kept a LEAF here because a VLA-object holder that CALLS
+    // was refused (D-CSUBSET-VLA-NONLEAF-CALL-FRAME); the ten arguments make the call
+    // genuinely write stack arguments into the outgoing-args area that travels with SP,
+    // so a frame model that placed the objects on that area would corrupt them here.
+    if (sink(1, 2, 3, 4, 5, 6, 7, 8, 9, 10) != 55) return 18;
+    if (a[0] + a[1] + a[2] != 33) return 19;
+    if (b[0] + b[1] + b[2] != 63) return 20;
+    if (c[1][0] != 77 || c[0][1] != 88) return 21;
+    if (d[1][0] != 55 || d[0][1] != 66) return 22;
+
+    // ⚠ SECTION (D) STAYS AFTER THE CALL AND IS NOT RE-READ ACROSS ONE, and that is a
+    // MEASURED limitation of a DIFFERENT defect, not of this frame model: a MULTI-
+    // DECLARATOR VLA statement (`R4 e, f;`) mis-lowers its C5 scope teardown — the
+    // second declarator's watermark frees the first object. ✔MEASURED at HEAD in a
+    // LEAF function (three plain VLA objects, one of them a multi-declarator: DSS reads
+    // back the third object's data out of the first; gcc 13.3.0 and clang 18.1.3 both
+    // return the right answer), so it predates and is independent of the non-leaf frame
+    // model. Re-reading e/f across a call would exercise THAT defect, not this one.
     // (D) MULTI-DECLARATOR one statement (`R4 e, f;` — two frozen objects share R4's ONE
     // freeze, each correlated a→R4 per-declarator) + a CONST-qualified VLA-typedef object
     // (`const R4 g;` — allocated + frozen-sized like any VLA object; a const VLA carries no
     // initializer, only reserved storage).
+    //
+    // ★ LIFTED for D-CSUBSET-VLA-MULTIDECLARATOR-STATEMENT-TEARDOWN. Until that row
+    // closed, `R4 e, f;` was freed at the end of its own DECLARATION and the next object
+    // in this scope landed on `e`. This section could not see it: `g` is const and is
+    // never STORED to, so nothing overwrote `e`, and the reads below it stayed green.
+    // `h` is the object that makes the storage overlap observable — it is written, and
+    // e's and f's element reads are placed BELOW those stores, which is the whole point.
+    // Reading them above `h`'s stores is green either way.
     volatile int vk = 3;
     int k = vk;
     typedef int R4[k];
     R4 e, f;
     const R4 g;
+    R4 h;
     e[0] = 13; e[1] = 14; e[2] = 15;
     f[0] = 1;  f[1] = 2;  f[2] = 3;
     if (sizeof e != 12) return 13;
     if (sizeof f != 12) return 14;
     if (sizeof g != 12) return 15;          // const VLA-typedef object is still frozen-sized
-    if (e[0] + e[1] + e[2] != 42) return 16;
-    if (f[0] + f[1] + f[2] != 6)  return 17;
+    if (sizeof h != 12) return 16;
+    h[0] = 90; h[1] = 91; h[2] = 92;        // the stores that land on `e` if the group is
+                                            // freed at the end of its own declaration
+    if (h[0] + h[1] + h[2] != 273) return 17;
+    if (e[0] + e[1] + e[2] != 42) return 23;   // <- read AFTER h is written
+    if (f[0] + f[1] + f[2] != 6)  return 24;   // <- read AFTER h is written
 
     return 42;
 }

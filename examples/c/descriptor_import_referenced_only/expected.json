@@ -1,0 +1,21 @@
+{
+  "$comment": "D-FFI-DESCRIPTOR-EAGER-IMPORT: the RUN witness for REFERENCED-ONLY import of shipped-descriptor symbols, guarding the OVER-pruning direction. A `#include`d descriptor's symbols used to be EAGER -- bound whether or not the TU referenced them: MEASURED at fcb3a9d7 by walking each format's real import pointer chain, this source imported 86 symbols on elf64-x86_64, 85 on pe64-x86_64 and 97 on macho64-x86_64 while referencing four, where gcc 13.3.0, clang 18.1.3, MSVC 19.51 and mingw-w64 gcc 13.2.0 each import only what is referenced (measured at BOTH the object tier and the linked-image tier, every arm with a control that fired). MEASURED with the fix: 5 / 8 / 5 -- the pe surplus is three UCRT stdio cores held alive by shim bodies the synth pass emits unconditionally, which is a separate residual, not this one. Because every descriptor row was eager, the linker's reference gate `rejectOrDropUnreferencedExterns` SHORT-CIRCUITED for every ordinary #include-only program and its reference scan never ran; it is now live for all of them, and this example is the corpus witness that the newly-live scan keeps each reference shape: (1) a DATA-ITEM relocation -- `g_table` statically initialized with an imported function's address, the sqlite aSyscall[] shape; (2) an ordinary direct CALL relocation (`strlen`); (3) an imported DATA OBJECT (`stdout`), lowered got-indirect on elf/macho and reached through `__acrt_iob_func` on pe -- two lowerings of one construct, and the reference a reloc-based scan is likeliest to miss. The NEGATIVE half (the ~80 unreferenced names that must NOT be imported) cannot be asserted from inside a running program, so it is pinned where artifact CONTENT can be read, by tests/ffi/test_descriptor_import_referenced_only.cpp -- the same assertion split, for the same reason, as project_module_standalone_build's archive-magic pin. HONEST: this example is green in BOTH states and says so; restoring the eager default does NOT red it. The arm that reds it is an UNDER-keeping one -- delete the data-item half of the gate's reference scan (`for (auto const& di : m.dataItems)` in rejectOrDropUnreferencedExterns) and SHAPE 1's import is dropped, so the indirect call through g_table[0] reaches nothing.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "$commentStdout": "The top-level pin carries the pe CRLF form and each non-pe target overrides it with LF, the convention hello_puts and adjacent_string_concat already use: `puts`/`fputs` write through the platform's own text-mode stdout, so the line ending is a property of the RUNTIME rather than of this program. MEASURED both ways -- pe64 emits \\r\\n, elf64 (x86_64 and aarch64 under qemu) emits \\n.",
+  "expectedStdout": "descriptor_import_referenced_only: ok\r\ndescriptor_import_referenced_only: indirect ok\r\n",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": ["linux"],
+      "expectedStdout": "descriptor_import_referenced_only: ok\ndescriptor_import_referenced_only: indirect ok\n" },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main",     "runOn": ["linux"], "emulator": "qemu-aarch64",
+      "expectedStdout": "descriptor_import_referenced_only: ok\ndescriptor_import_referenced_only: indirect ok\n" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"],
+      "expectedStdout": "descriptor_import_referenced_only: ok\ndescriptor_import_referenced_only: indirect ok\n" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true,
+      "$comment": "MEASURED 2026-09-03 on all five descriptor-serving targets -- the release image differs from the baseline's on every one, so the assertion is real rather than aspirational. It has something to transform: the `volatile` guard on the indirect call, the three-branch error ladder, and the strlen comparison. The arm matters here beyond coverage, because the optimizer can DELETE a reference and the reference gate runs AFTER it -- so this arm, not the baseline, is where an over-eager pass and a referenced-only import law would first disagree." }
+  ]
+}

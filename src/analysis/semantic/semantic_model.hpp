@@ -2,6 +2,7 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/compilation_unit/unit_attribute.hpp"
+#include "analysis/semantic/type_rules.hpp"   // arrayToPointerDecay (C 6.3.2.1p3)
 #include "core/export.hpp"
 #include "core/substrate/transparent_string_hash.hpp"  // c97: heterogeneous scope-binding lookup
 #include "core/types/data_model.hpp"
@@ -13,6 +14,7 @@
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -226,6 +228,12 @@ struct DSS_EXPORT SymbolRecord {
     // lowering, which HIR→MIR maps to the dedicated MirOpcode — NOT an ordinary
     // Call. None (the default) for every non-lowering symbol.
     BuiltinLowering builtinLowering = BuiltinLowering::None;
+    // D-CSUBSET-ATOMIC-MONOMORPH-I32: copied from the builtin's
+    // BuiltinFunctionMapping.genericPointee at injection. Present ⇒ `type` above
+    // is the EXEMPLAR signature and the call site derives the real one from the
+    // actual argument (see `specializeGenericPointeeBuiltin`). Absent ⇒ `type`
+    // binds verbatim, which is every non-generic symbol in the CU.
+    std::optional<BuiltinGenericPointee> genericPointee;
     // SE7/D8: copied from the minting DeclarationRule's `warnIfUnused`. After
     // analysis, a symbol with this flag set AND an empty use-set emits
     // S_UnusedVariable (a WARNING) at `declRuleNode`'s span.
@@ -369,6 +377,24 @@ struct DSS_EXPORT SymbolRecord {
     // codegen is a SEPARATE deferred task (D-CSUBSET-ALIGNAS: this cycle stores it
     // unconsumed for variables — member alignas works end-to-end via the interner).
     std::optional<std::uint32_t> explicitAlignment;
+    // D-CSUBSET-PER-MEMBER-PACKED: this declarator carries GNU
+    // `__attribute__((packed))` — its baseline alignment is 1. The exact INVERSE of
+    // `explicitAlignment` above and its structural twin: for a struct/union MEMBER
+    // it is read at the composite's Pass-1 completion to build the `fieldPacked`
+    // span passed to `completeComposite`, and the interned TYPE then owns the
+    // lowered layout, exactly as it owns the raised one. The two COMBINE rather
+    // than compete — the layout engine takes `max(packed ? 1 : natural, override)`,
+    // which is why `__attribute__((packed, aligned(2)))` on an `int` lands at 2 and
+    // not at the type's natural 4 (✔MEASURED, gcc 13.3.0 + clang 18.1.3, x86_64 +
+    // aarch64 + big-endian s390x).
+    //
+    // ⚠ INERT ON A NON-MEMBER, DELIBERATELY. `packed` on a file-/block-scope
+    // object, a function or a typedef reaches this flag too and nothing reads it —
+    // which is the reference behaviour (gcc warns and ignores; clang is silent;
+    // both emit identical bytes). The four-kind `appliesTo` vocabulary cannot tell
+    // a member from an object, so the member-only-ness is expressed HERE, at the
+    // only consumer that can express it.
+    bool isPackedField = false;
     // VLA C4b (D-CSUBSET-VLA): for a VLA-TYPEDEF OBJECT (`typedef int R[n]; R a;`)
     // — the SymbolId of the typedef `R` whose (variable-length) array type this
     // object aliases; `InvalidSymbol` (default) for every other symbol. C99
@@ -730,7 +756,10 @@ struct DSS_EXPORT ShippedExternSymbol {
     // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): the pe64 <threads.h> synth-recipe id
     // (== the symbol name, a validated descriptor invariant), or EMPTY for an ordinary
     // shipped extern. When non-empty the CST->HIR lowerer SKIPS this symbol's
-    // extern-import synthesis (kernel32 exports no mtx_lock — the eager-import law) and
+    // extern-import synthesis (kernel32 exports no `mtx_lock`, so an import of it is a
+    // pe binary the LOADER refuses at 0xC0000139 — and the skip is NOT a consequence of
+    // the retired eager law: a recipe row's own body CALLS the name, so referenced-only
+    // import would keep the import too. The row is realized, never imported) and
     // records {symbol, recipeId} into `CstToHirResult.synthRecipeBySymbol` so HIR->MIR
     // seeds `functionSymbols` (the user call lowers to GlobalAddr against a not-yet-
     // defined callee) and `synthesizeThreadsShim` supplies the definition before link.
@@ -775,10 +804,55 @@ struct DSS_EXPORT ShippedExternSymbol {
     // precise WITHOUT anyone enumerating a core set — the mechanism already in the
     // tree does it, which is also why this needs no update when a recipe is added.
     //
-    // TRUE for every ordinary declared shipped extern (D-FFI-DESCRIPTOR-EAGER-IMPORT:
-    // a `#include`d descriptor's symbol is imported whether or not the TU
-    // calls it), so every pre-existing row is byte-identical.
-    bool eagerImport = true;
+    // ★★ FALSE FOR EVERY ROW THIS STRUCT CAN HOLD, SINCE P57.
+    // [[D-FFI-DESCRIPTOR-EAGER-IMPORT]] — the id on ONE line, never wrapped.
+    //
+    // This field is a CHANNEL, and the policy it used to carry was a divergence from
+    // all four reference toolchains. It said TRUE for an ordinary declared shipped
+    // extern: a `#include`d descriptor's symbol was imported whether or not the TU
+    // called it.
+    //
+    // ★★★ THE REASON THAT WAS A DEFECT AND NOT A COST — an INTERNAL inconsistency,
+    // not bloat. C23 7.1.4p2 entitles a program to DECLARE a library function itself
+    // instead of including its header, and says the two are equivalent. ✔MEASURED in
+    // ONE eager tree, same referenced names, by walking each format's real import
+    // pointer chain:
+    //     hand-declared (`extern int puts(char const *);` …)   elf  3   pe  3
+    //     `#include <stdio.h> <string.h> <stdlib.h>`          elf 86   pe 85
+    // A hand-declared extern is producer A and was ALREADY non-eager, so two spellings
+    // the standard calls equivalent got import laws differing by ~28x — and it is the
+    // LOADER that sees the difference: one unexported name among those 86 breaks the
+    // load of EVERY binary that so much as includes the header.
+    //
+    // ✔MEASURED 2026-09-03, each reference probed SEPARATELY, each arm with a CONTROL
+    // that FIRED, at BOTH the object tier (`nm -u` / `dumpbin /symbols`) and the
+    // linked-IMAGE tier (`nm -D --undefined-only` / `dumpbin /imports` / `objdump -p`):
+    // gcc 13.3.0, clang 18.1.3, MSVC 19.51.36252 and mingw-w64 gcc 13.2.0 all emit
+    // NOTHING for a declared-but-unreferenced extern, header-declared ones included.
+    // ⚠ The FIRST MSVC arm was UNINSTRUMENTED and that is recorded rather than dropped:
+    // a default `cl` links the STATIC CRT, so the import table was EMPTY and every
+    // "absent" answer was vacuous. Only under `/MD` did the control (`puts` from
+    // api-ms-win-crt-stdio-l1-1-0.dll) fire and the absences become evidence.
+    //
+    // ★ NOTHING NEW WAS BUILT FOR THIS; A DEFAULT WAS CORRECTED. The pruning mechanism
+    // is the one the two comments above already rely on: the linker's
+    // `rejectOrDropUnreferencedExterns` keeps a NON-eager import only when a relocation
+    // in a function OR a data item references it. ⓘ AND IT HAD NEVER RUN for an
+    // ordinary `#include`-only program: that gate short-circuits on "every named import
+    // is eager", and `injectEntryTrampoline` appends the only other non-eager row such a
+    // program has (its `exit` import) AFTER the gate. Its reference scan is live for
+    // every such program only now.
+    //
+    // ⚠ THE FIELD IS NOT DEAD AND MUST NOT BE DELETED. `ExternImport::isEagerImport`
+    // still has one true producer — the SEH personality routine in
+    // `synth_seh_funclets.cpp`, whose reference lives in the pe UNWIND_INFO handler RVA
+    // rather than in any relocation, so the reloc-based gate cannot see it. EAGER means
+    // "referenced by something the gate cannot see", and no descriptor row is ever that.
+    //
+    // Pinned by `tests/ffi/test_descriptor_import_referenced_only.cpp` on all five
+    // descriptor-serving targets, and witnessed from a running program by
+    // `examples/c/descriptor_import_referenced_only`.
+    bool eagerImport = false;
     // D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: the CONFIG-ROOT-RELATIVE path of
     // the shipped source file that provides this symbol's body on the active
     // object format (`runtime/platform/pe/dirent.c`), or EMPTY for an ordinary
@@ -908,9 +982,14 @@ public:
                                                          suppressedShippedLibraries,
                   DataModel                              dataModel,
                   LongDoubleFormat                       longDoubleFormat,
-                  // Inline-asm P5: see `target()`. Last, and defaulted, because
+                  // Inline-asm P5: see `target()`. Defaulted, because
                   // every existing caller is target-less by construction.
-                  TargetSchema const*                    target = nullptr) noexcept
+                  TargetSchema const*                    target = nullptr,
+                  // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: see
+                  // `charIsUnsigned()`. Last, and defaulted, for the same
+                  // reason `target` is.
+                  std::optional<bool>                    charIsUnsigned =
+                      std::nullopt) noexcept
         : cu_(std::move(cu)),
           lattice_(std::move(lattice)),
           scopes_(std::move(scopes)),
@@ -928,7 +1007,8 @@ public:
           suppressedShippedLibraries_(std::move(suppressedShippedLibraries)),
           dataModel_(dataModel),
           longDoubleFormat_(longDoubleFormat),
-          target_(target) {}
+          target_(target),
+          charIsUnsigned_(charIsUnsigned) {}
 
     SemanticModel(SemanticModel const&)            = delete;
     SemanticModel& operator=(SemanticModel const&) = delete;
@@ -1115,6 +1195,24 @@ public:
     // (which cannot function without resolving the letter) fails loud there.
     [[nodiscard]] TargetSchema const* target() const noexcept { return target_; }
 
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: plain `char`'s signedness for the
+    // (target × object format) this analysis ran under —
+    // `TargetSchema::charIsUnsigned(ObjectFormatKind)`, RESOLVED ONCE by
+    // `analyze()` from the two axes it already receives. C 6.2.5p15 leaves it
+    // implementation-defined and the same arm64 CPU answers differently under
+    // GNU/Linux (unsigned) and Darwin (signed), so it is neither derivable from
+    // the arch nor from the format alone.
+    //
+    // The HIR lowering reads THIS rather than taking a second parameter — the
+    // `dataModel()` / `longDoubleFormat()` discipline — so the const-expr fold in
+    // the semantic tier and the value fold in the lowering tier cannot disagree
+    // about what `'ÿ'` is. `nullopt` (LSP / FFI header parser / direct-API
+    // tests, which analyze with no target) makes a `char` const-fold REFUSE, not
+    // guess: only code units above 0x7F can even tell the difference.
+    [[nodiscard]] std::optional<bool> charIsUnsigned() const noexcept {
+        return charIsUnsigned_;
+    }
+
 private:
     std::shared_ptr<CompilationUnit const> cu_;
     TypeLattice                            lattice_;
@@ -1163,6 +1261,9 @@ private:
     // pointer — the schema is owned by the driver and outlives the model, the
     // same lifetime contract `analyze()`'s `aggregateLayout` already has.
     TargetSchema const*                                    target_ = nullptr;
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the analysis-time plain-`char`
+    // signedness (see `charIsUnsigned()`).
+    std::optional<bool>                                    charIsUnsigned_{};
 };
 
 // Pin move-only / non-copyable at compile time so a future refactor
@@ -1175,5 +1276,133 @@ static_assert(!std::is_copy_constructible_v<SemanticModel>,
 static_assert(!std::is_copy_assignable_v<SemanticModel>,
               "SemanticModel must be move-only.");
 static_assert(std::is_move_constructible_v<SemanticModel>);
+
+// ── D-CSUBSET-ATOMIC-MONOMORPH-I32: the type-generic builtin substitution ────
+//
+// ★★ WHY THIS IS A FREE FUNCTION IN A SHARED HEADER RATHER THAN A PRIVATE
+// HELPER OF THE ANALYZER. ✔MEASURED: stamping the specialized FnSig on the
+// callee name token from the semantic tier alone DOES NOT REACH THE LOWERING —
+// the reference-rules pass re-stamps that node from the symbol afterwards, so
+// CST→HIR read the EXEMPLAR back (debug trace: analyzer wrote type 82 on node
+// 72; `cst_to_hir` read 34 for the same call) and coerced the argument to the
+// exemplar's `int`. That produced a value TRUNCATED to 32 bits under a `long`
+// atomic store — caught loud by the MIR verifier's memory-write typing belt
+// (`I_StoreValueTypeMismatch`), never silently, but it is the reason the
+// substitution has to be a FACT BOTH TIERS DERIVE rather than a value one tier
+// hands the other through a table the other tier may overwrite.
+//
+// Replace the innermost core of a DECLARED parameter/result type with `bound`,
+// preserving every pointer derivation level the declaration spelled:
+// `ptr<i32>` → `ptr<T>`, `ptr<ptr<i32>>` → `ptr<ptr<T>>`, a bare `i32` → `T`.
+// ⓘ `kind()` is transparent through the `_Atomic`/`volatile` skin, so a
+// qualified exemplar core needs no separate arm.
+[[nodiscard]] inline TypeId substituteDeclaredCore(TypeInterner& in,
+                                                   TypeId declared, TypeId bound) {
+    if (!declared.valid()) return declared;
+    if (in.kind(declared) == TypeKind::Ptr) {
+        auto const ops = in.operands(declared);
+        if (ops.size() != 1 || !ops[0].valid()) return declared;
+        return in.pointer(substituteDeclaredCore(in, ops[0], bound));
+    }
+    return bound;
+}
+
+// Derive a type-generic builtin's REAL signature at one call site from the
+// EXEMPLAR its config row declares (see `BuiltinGenericPointee`). `argTy` is the
+// actual type of the argument in the `bindFromParam` position.
+//
+// Returns the exemplar UNCHANGED whenever the binding cannot be made — a
+// non-pointer argument, an index the exemplar has no parameter for — so the
+// ordinary strict check then reports the real mismatch against the declared
+// signature, exactly as it did before this mechanism existed. This function
+// never diagnoses; it only decides which signature its callers work from.
+//
+// ★ THE `bindFromParam` PARAMETER TAKES THE ARGUMENT'S OWN TYPE VERBATIM rather
+// than a rebuilt `ptr<T>`: rebuilding it from the stripped `T` would hand the
+// checker a `ptr<i64>` for an argument typed `ptr<atomic<i64>>` — two distinct
+// interned ids — and the qualifier skin would then have to survive an
+// assignability rule that has nothing to do with this feature. The argument is
+// where `T` CAME FROM, so it is assignable to itself by construction, and every
+// OTHER substituted position still gets the ordinary strict check.
+// ⓘ This also ACCEPTS a plain (non-`_Atomic`) pointer argument, which is the
+// union's answer: gcc's `__atomic_*` builtins take any pointer while clang's
+// `__c11_atomic_*` require `_Atomic` — one working reference accepts, so DSS must.
+// ★★ THE BINDING ARGUMENT DECAYS FIRST (C 6.3.2.1p3). An ARRAY in the binding
+// position — `atomic_load_explicit(counters, 5)`, or `counters + 2` — is a
+// pointer to its first element everywhere else in C, and BOTH references run
+// both spellings (✔MEASURED: gcc 13.3.0 -O2 and clang 18.1.3 -O2, `arr` and
+// `arr + 2`, exit 42; DSS refused both `S_TypeMismatch`). Without the decay the
+// `Ptr` test below answers `Array`, the binding is skipped, and the exemplar's
+// strict check then reports a mismatch against a signature that was never
+// specialized — a LOUD refusal, but one the union forbids.
+// ⓘ It runs HERE, in the single function both tiers derive through, rather than
+// at either call site: a decay applied in one tier and not the other is the
+// exact two-derivations-disagree failure this function's own doc exists to
+// prevent. It reuses the lattice's own `arrayToPointerDecay` — the C 6.3.2.1p3
+// projection every other value-context site already calls — so the binding
+// position is not a second spelling of the same conversion.
+// ★ `pointerDifferenceTy` is C §7.17.1p6's `M` for an atomic POINTER object —
+// the language's declared `ptrdiff_t`, RESOLVED BY THE CALLER from
+// `SemanticConfig::pointerDifferenceType` under the active data model. It is a
+// REQUIRED parameter with no default on purpose: both tiers derive this
+// signature independently, and a default would let one tier quietly answer a
+// different question than the other — the exact failure this function's own doc
+// exists to prevent. Passing `InvalidType` is honest (a language with no
+// declared pointer-difference type), and a row that NEEDS it then falls back to
+// the exemplar, so the ordinary strict check refuses LOUDLY rather than
+// accepting a wrong operand type.
+[[nodiscard]] inline TypeId specializeGenericPointeeSignature(
+        TypeInterner& in, TypeId exemplar, TypeId argTy,
+        BuiltinGenericPointee const& gp, TypeId pointerDifferenceTy) {
+    if (!exemplar.valid() || in.kind(exemplar) != TypeKind::FnSig)
+        return exemplar;
+    argTy = arrayToPointerDecay(in, argTy);
+    if (!argTy.valid() || in.kind(argTy) != TypeKind::Ptr) return exemplar;
+    auto const pointee = in.operands(argTy);
+    if (pointee.size() != 1 || !pointee[0].valid()) return exemplar;
+    // The MATERIAL pointee: C yields the NON-atomic, non-volatile value type
+    // (`atomic_load_explicit(const volatile A *obj)` returns `C`).
+    TypeId const bound = in.stripVolatile(pointee[0]);
+    if (!bound.valid()) return exemplar;
+
+    std::vector<TypeId> params = [&] {
+        auto const sp = in.fnParams(exemplar);
+        return std::vector<TypeId>(sp.begin(), sp.end());
+    }();
+    // C §7.17.1p6: `M` is `C` for an atomic INTEGER object and `ptrdiff_t` for an
+    // atomic POINTER one. The declaration says WHICH parameters carry `M`; this
+    // is the only place the two answers differ, and it differs only when the
+    // bound `T` is itself a pointer.
+    bool const boundIsPointer = (in.kind(bound) == TypeKind::Ptr);
+    auto const carriesPointerDifference = [&](std::uint32_t idx) {
+        return boundIsPointer
+            && std::find(gp.pointerDifferenceParams.begin(),
+                         gp.pointerDifferenceParams.end(), idx)
+               != gp.pointerDifferenceParams.end();
+    };
+    for (std::uint32_t const idx : gp.applyToParams) {
+        if (idx >= params.size()) return exemplar;   // decl / exemplar disagree
+        if (idx == gp.bindFromParam) { params[idx] = argTy; continue; }
+        if (carriesPointerDifference(idx)) {
+            // No declared pointer-difference type ⇒ do not guess one. Returning
+            // the exemplar hands the call to the ordinary strict check, which
+            // refuses by name — the fail-loud direction.
+            if (!pointerDifferenceTy.valid()) return exemplar;
+            params[idx] = pointerDifferenceTy;
+            continue;
+        }
+        params[idx] = substituteDeclaredCore(in, params[idx], bound);
+    }
+    TypeId result = in.fnResult(exemplar);
+    if (gp.applyToResult) result = substituteDeclaredCore(in, result, bound);
+    // Preserve the exemplar's own calling convention rather than re-picking one:
+    // scalars[0] of a FnSig is the CC (scalars[1], when present, is the variadic
+    // bit — these builtins are never variadic, and an absent scalar falls back to
+    // the same CcSysV placeholder the builtin-injection site uses).
+    CallConv cc = CallConv::CcSysV;
+    if (auto const sc = in.scalars(exemplar); !sc.empty())
+        cc = static_cast<CallConv>(sc[0]);
+    return in.fnSig(params, result, cc);
+}
 
 } // namespace dss

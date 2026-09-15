@@ -59,6 +59,35 @@ template <class View>
 
 } // namespace declarator_walk_detail
 
+// ★★★ P66 (lane `ag`) — "IS THIS RULE A PER-SLOT DECLARATOR WRAPPER?", ASKED IN
+// ONE PLACE. A wrapper is a node that is NOT itself a `declaratorRule` but holds
+// exactly one as a child, plus whatever else that slot's grammar owns: an
+// initializer (`initDeclaratorRule`), a bit-field width (`memberDeclaratorRule`),
+// or an attribute run (`plainSlotRule`). Every walk that meets one must DESCEND to
+// the inner declarator, and the descent is otherwise identical for all three.
+//
+// ⚠ THIS PREDICATE EXISTS BECAUSE THE THIRD WRAPPER WAS THE ONE THAT MADE THE
+// PATTERN A DEFECT SHAPE. The `initDeclarator` / `memberDeclarator` disjunction was
+// written out by hand at SEVEN sites across this header and `semantic_analyzer.cpp`
+// (`declaratorNameNode`, `collectDeclarators`, `declaratorDerivesType`,
+// `declaratorDeclaredType`, `declaratorObjectIsConst`, the const-claim walk and the
+// param-list finder). Adding a third rule to six of seven would have read as a
+// complete fix and would not have been one — the seventh would silently answer a
+// question about the WRAPPER instead of about the declarator inside it, yielding a
+// wrong TYPE rather than a diagnostic ([[feedback-a-partial-fix-reads-as-a-complete-one]]).
+// So the disjunction is stated ONCE and a FOURTH wrapper is a config-only addition.
+//
+// ⓘ It takes a `RuleId` rather than a node: two of the seven sites already have the
+// rule in hand, and a node-taking form would make them re-read it.
+[[nodiscard]] inline bool
+isDeclaratorSlotWrapper(RuleId r, DeclaratorConfig const& dc) noexcept {
+    if (r == dc.initDeclaratorRule) return true;
+    if (dc.memberDeclaratorRule.has_value() && r == *dc.memberDeclaratorRule)
+        return true;
+    if (dc.plainSlotRule.has_value() && r == *dc.plainSlotRule) return true;
+    return false;
+}
+
 // The name-bearing `nameToken` leaf declared by the declarator (or
 // initDeclarator / direct) rooted at `node`, or InvalidNode for an ABSTRACT
 // declarator (no name — legal) and for any node outside the declarator role
@@ -73,18 +102,12 @@ template <class View>
     for (std::size_t step = 0; step < det::kMaxDeclaratorDepth; ++step) {
         if (!cur.valid() || v.kind(cur) != NodeKind::Internal) return {};
         RuleId const r = v.rule(cur);
-        if (r == dc.initDeclaratorRule) {
-            cur = det::firstChildOfRule(v, cur, dc.declaratorRule);
-            continue;
-        }
-        // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): a struct/union member-list
-        // slot wraps ONE declarator (+ its own bitfield suffix). Descend to the
-        // inner declaratorRule, identical to the initDeclaratorRule arm — an
-        // ABSENT inner declarator (the anonymous bit-field `int : 3;`) yields {}
-        // → abstract → no name, the same legal degrade. Guarded on the OPTIONAL
-        // role so a language without member lists never matches here.
-        if (dc.memberDeclaratorRule.has_value()
-            && r == *dc.memberDeclaratorRule) {
+        // EVERY per-slot wrapper descends to its inner declaratorRule, and the
+        // three are one arm because the descent is one descent (P66 lane `ag`;
+        // see `isDeclaratorSlotWrapper`). An ABSENT inner declarator — the
+        // anonymous bit-field `int : 3;` — yields {} → abstract → no name, the
+        // same legal degrade the single-wrapper arms always had.
+        if (isDeclaratorSlotWrapper(r, dc)) {
             cur = det::firstChildOfRule(v, cur, dc.declaratorRule);
             continue;
         }
@@ -147,18 +170,28 @@ void collectDeclarators(View const& v, NodeId node, DeclaratorConfig const& dc,
         }
         return;
     }
-    // TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): a BARE-declarator LIST —
-    // `declarator (',' declarator)*`, no per-slot wrapper. Collect each
-    // `declaratorRule` child (commas skipped), in source order. Structurally
-    // this is the `listRule` arm minus the `initDeclaratorRule` alternative,
-    // kept as its OWN arm rather than folded in because a language may declare
-    // both shapes and they must not alias each other's slot grammar. Guarded on
-    // the OPTIONAL role (a language without it never matches).
+    // TF-C88 (D-CSUBSET-TYPEDEF-MULTI-DECLARATOR): the INITIALIZER-FREE
+    // declarator LIST. Collect each slot (commas skipped), in source order.
+    // Structurally this is the `listRule` arm minus the `initDeclaratorRule`
+    // alternative, kept as its OWN arm rather than folded in because a language
+    // may declare both shapes and they must not alias each other's slot grammar.
+    // Guarded on the OPTIONAL role (a language without it never matches).
+    // ★ P66 (lane `ag`): a slot here may be a BARE `declaratorRule` or the
+    // OPTIONAL `plainSlotRule` wrapper — c's typedef list gained one so a
+    // MID-LIST `__attribute__((aligned(8)))` has somewhere to live and reaches
+    // the per-declarator attribute fold with DECLARATOR grain. BOTH spellings
+    // are accepted here rather than one replacing the other: a language that
+    // declares no slot rule keeps exactly the walk it had, and this arm cannot
+    // silently collect nothing if a grammar mixes them.
     if (dc.plainListRule.has_value() && r == *dc.plainListRule) {
         for (NodeId c : v.children(node)) {
             if (!v.isVisible(c)) continue;
             if (v.kind(c) != NodeKind::Internal) continue;
-            if (v.rule(c) == dc.declaratorRule) out.push_back(c);
+            RuleId const cr = v.rule(c);
+            if (cr == dc.declaratorRule
+                || (dc.plainSlotRule.has_value() && cr == *dc.plainSlotRule)) {
+                out.push_back(c);
+            }
         }
         return;
     }
@@ -177,16 +210,117 @@ void collectDeclarators(View const& v, NodeId node, DeclaratorConfig const& dc,
         }
         return;
     }
-    if (r == dc.initDeclaratorRule || r == dc.declaratorRule) {
-        out.push_back(node);
-        return;
-    }
-    // c23: a BARE single-slot member declarator (a one-element list the
-    // grammar may collapse to the slot directly) — push self; the caller's
-    // name/type walk descends it to the inner declarator.
-    if (dc.memberDeclaratorRule.has_value() && r == *dc.memberDeclaratorRule) {
+    // A SINGLE slot handed in directly (a one-element list the grammar may
+    // collapse) — push self; the caller's name/type walk descends it to the
+    // inner declarator. P66 (lane `ag`): the three wrapper roles are one
+    // question again here.
+    if (r == dc.declaratorRule || isDeclaratorSlotWrapper(r, dc)) {
         out.push_back(node);
     }
+}
+
+// ★★★ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+// DOES THE DECLARATOR ROOTED AT `node` **DERIVE** AN ARRAY OR FUNCTION TYPE FROM
+// THE THING IT NAMES? A pure query, added rather than changing any existing walk.
+//
+// ★★ WHY THIS PREDICATE EXISTS, AND WHY IT LIVES HERE RATHER THAN AT ITS
+// CONSUMERS. The granularity of an attribute run is CONFIG
+// (`AttrAppertainment`, `semantic_config.hpp`), and one of its four values —
+// `declaratorUnlessTypeDerived` — is relative to the declarator the run
+// follows. This is the ONLY thing that value needs from the tree, and it is
+// exactly the descent `declaratorNameNode` already performs one screen up
+// (carrier → declaratorRule → directRule, pointer layers skipped, grouping
+// parens NOT entered). Writing it beside that walk is what keeps ONE definition
+// of the traversal instead of a second that can drift — the divergence this
+// file's own header comment says it exists to prevent — and BOTH the semantic
+// attribute/noreturn folds and the HIR linkage fold need the answer, so a
+// file-local copy at either would be the three-diverging-copies shape again.
+//
+// ★★ IT IS THE C23 RULE, MEASURED IN ALL THREE REFERENCES AND STATED WITHOUT
+// NAMING A LANGUAGE. ✔MEASURED 2026-09-03, four attributes (`deprecated`,
+// `nodiscard`, `maybe_unused`, `noreturn`) x two declarator shapes, each
+// reference probed SEPARATELY:
+//     int  x       [[deprecated]];  gcc warns at the USE · clang warns at the
+//                                   USE · MSVC 19.51 /std:clatest C4996 at the
+//                                   USE                              ⇒ ENTITY
+//     int  arr[3]  [[deprecated]];  gcc `'deprecated' attribute ignored` ·
+//                                   clang `error: cannot be applied to types`
+//                                   (rc=1) · MSVC `C4649 attributes are
+//                                   ignored in this context`         ⇒ TYPE
+//     void f(void) [[deprecated]];  same three verdicts               ⇒ TYPE
+// C23 6.7.6p1 puts the sequence after an IDENTIFIER declarator on the declared
+// entity; 6.7.6.2p1 and 6.7.6.3p1 put the one after an array- or
+// function-declarator on the array or function TYPE. The answer is a property
+// of the SHAPE, constant across the four attributes.
+// ⓘ The GNU `__attribute__` spelling has NO such split — ✔MEASURED, it confers
+// on the entity after an identifier, an array declarator, a function declarator
+// and a function-POINTER declarator alike in gcc 13.3.0 and clang 18.1.3 (MSVC
+// implements no `__attribute__` in any position, C2061 at /std:c11, /std:c17
+// AND /std:clatest, so it ABSTAINS — an abstention is not agreement). That is
+// why the grain is declared PER RULE and this predicate is consulted only by
+// the rules that ask for it.
+//
+// ★ CONFIG-RESOLVED ROLES ONLY — `directRule`, `groupRule`, and the four suffix
+// roles. No rule name, no token spelling, no language test. A language that
+// declares no array/function suffix roles gets `false` everywhere, which
+// collapses `declaratorUnlessTypeDerived` to plain `declarator` — the reading a
+// language with no derived declarators should have.
+//
+// ⚠ POINTER LAYERS DO NOT COUNT AND GROUPING PARENS ARE NOT ENTERED, both
+// deliberately. `int *x` names an object (`*` is part of the type the
+// specifiers and declarator determine, but the declarator's direct part is
+// still the bare identifier) ⇒ ENTITY, and ✔MEASURED `int *x [[deprecated]];`
+// warns at the use in gcc and clang. `int (*p)(int)` has its fnSuffix on the
+// OUTER direct declarator, outside the parens ⇒ TYPE-derived, and ✔MEASURED
+// `void (*p)(int) [[noreturn]];` draws gcc's `'noreturn' attribute ignored`
+// and clang's rc=1 refusal. Descending INTO the group would read `p`'s inner
+// declarator and answer the wrong question.
+template <class View>
+[[nodiscard]] bool declaratorDerivesType(View const& v, NodeId node,
+                                         DeclaratorConfig const& dc) {
+    namespace det = declarator_walk_detail;
+    NodeId cur = node;
+    // Walk the carrier shapes down to the DIRECT declarator, the same arms
+    // `declaratorNameNode` takes, and stop there — the outermost derivation is
+    // the one the trailing run sits beside.
+    for (std::size_t step = 0; step < det::kMaxDeclaratorDepth; ++step) {
+        if (!cur.valid() || v.kind(cur) != NodeKind::Internal) return false;
+        RuleId const r = v.rule(cur);
+        if (isDeclaratorSlotWrapper(r, dc)) {
+            cur = det::firstChildOfRule(v, cur, dc.declaratorRule);
+            continue;
+        }
+        if (r == dc.declaratorRule) {
+            cur = det::firstChildOfRule(v, cur, dc.directRule);
+            continue;
+        }
+        if (r == dc.directRule
+            || (dc.directAbstractRule.has_value()
+                && r == *dc.directAbstractRule)) {
+            break;
+        }
+        return false;   // not a declarator-role shape — no derivation to see
+    }
+    if (!cur.valid() || v.kind(cur) != NodeKind::Internal) return false;
+    // Any suffix child of the DIRECT declarator derives a type. The suffix roles
+    // are read from config, and `fnSuffixRule` / `arraySuffixRule` may also be
+    // the direct declarator's BASE alternative in a grammar that admits a
+    // suffix-led abstract form — the same scan catches both, because both are
+    // direct children of this node.
+    for (NodeId c : v.children(cur)) {
+        if (!v.isVisible(c)) continue;
+        if (v.kind(c) != NodeKind::Internal) continue;
+        RuleId const cr = v.rule(c);
+        if (cr == dc.fnSuffixRule || cr == dc.arraySuffixRule) return true;
+        if (dc.fnSuffixTailRule.has_value() && cr == *dc.fnSuffixTailRule) {
+            return true;
+        }
+        if (dc.arrayStarSuffixRule.has_value()
+            && cr == *dc.arrayStarSuffixRule) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ── the Tree adapter (the frozen-tree consumer; the parser's TreeBuilder
@@ -215,6 +349,29 @@ inline void collectDeclarators(Tree const& tree, NodeId node,
     collectDeclarators(TreeDeclaratorView{tree}, node, dc, out);
 }
 
+// P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY): the
+// frozen-tree overload — every consumer of the grain axis is a `Tree` consumer.
+[[nodiscard]] inline bool declaratorDerivesType(Tree const& tree, NodeId node,
+                                                DeclaratorConfig const& dc) {
+    return declaratorDerivesType(TreeDeclaratorView{tree}, node, dc);
+}
+
+// P56: `run`'s grain, resolved against the declarator carrier it follows. The
+// ONE place the config value and the tree shape meet, so no consumer pairs them
+// itself — a consumer that read `appertainsTo` and forgot to resolve
+// `declaratorUnlessTypeDerived` would silently confer a C23 trailing attribute
+// on a function's ENTITY, which is the exact defect this row closes.
+[[nodiscard]] inline AttrAppertainment
+runAppertainmentFor(Tree const& tree, DeclaratorConfig const& dc,
+                    AttrRunRule const& run, NodeId declaratorCarrier) {
+    if (run.appertainsTo != AttrAppertainment::DeclaratorUnlessTypeDerived) {
+        return run.appertainsTo;
+    }
+    return resolveAppertainment(run.appertainsTo,
+                                declaratorDerivesType(tree, declaratorCarrier,
+                                                      dc));
+}
+
 // TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME) — THE shared "this child is a
 // decoration, not the initializer" predicate.
 //
@@ -228,13 +385,29 @@ inline void collectDeclarators(Tree const& tree, NodeId node,
 // `int f(void) __asm("_x");` as an initializer and type-checks a string against a
 // function type. One predicate, one place to extend.
 //
-// ★ WIDER THAN `isAfterDeclaratorAttrNode` ON PURPOSE. That predicate stays
-// attribute-ONLY because it also gates the LINKAGE/attribute FOLDS, which must not
-// be handed an asm label. This one gates the INIT scans, which must skip both.
+// ★ WIDER THAN THE ATTRIBUTE-ONLY MATCH THE FOLDS DO ON PURPOSE. The
+// LINKAGE/attribute folds must never be handed an asm label, so they match
+// against `afterDeclaratorAttrRules` alone; this one gates the INIT scans, which
+// must skip BOTH the attribute runs and the label.
+// ⓘ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+// that attribute-only match used to be a named bool predicate
+// (`isAfterDeclaratorAttrNode`, semantic_analyzer.cpp). It is gone — the folds
+// now need the matched `AttrRunRule` itself, not a yes/no, because what they do
+// with a run depends on its declared grain.
+//
+// ★★ P56 (D-CSUBSET-TRAILING-ATTRIBUTE-RUN-IS-READ-AT-THE-WRONG-GRANULARITY):
+// THIS READER IS GRAIN-BLIND AND MUST STAY THAT WAY. Every
+// `afterDeclaratorAttrRules` entry now declares what its attributes appertain
+// to, and every OTHER consumer of that list filters on it — but "is this child
+// the initializer?" is a question about the PARSE SHAPE, not about meaning. A
+// run whose attributes appertain to the TYPE still occupies the slot, so
+// filtering here by grain would make `void f(void) [[noreturn]];` read its
+// attribute run as the initializer and type-check it against a function type
+// (S_TypeMismatch — the exact failure TF-C62 introduced this predicate to fix).
 [[nodiscard]] inline bool isDeclaratorDecorationRule(DeclaratorConfig const& dc,
                                                     RuleId r) noexcept {
-    for (RuleId ar : dc.afterDeclaratorAttrRules)
-        if (r.v == ar.v) return true;
+    for (AttrRunRule const& ar : dc.afterDeclaratorAttrRules)
+        if (r.v == ar.rule.v) return true;
     return dc.asmLabelRule.has_value() && r.v == dc.asmLabelRule->v;
 }
 

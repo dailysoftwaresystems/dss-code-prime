@@ -50,9 +50,23 @@ namespace dss {
 //
 // `outcome` (when non-null) receives the AGGREGATE result: the specific error of
 // the first failing segment (so a caller renders H_InvalidUniversalCharacterName
-// vs. a generic escape error) and `usedByteEscape` ORed across every decoded
-// segment (so the wide/UTF path can fail loud on a `\x`/octal escape anywhere in
-// an adjacent-concatenated literal — D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE).
+// vs. a generic escape error), `usedByteEscape` ORed across every decoded
+// segment, and every segment's `escapeUnits` concatenated in source order.
+//
+// ★★ THE OFFSET REBASE IS LOAD-BEARING AND IS THE EASIEST THING HERE TO GET
+// WRONG. Each `EscapeValueUnit::byteOffset` is an offset into the buffer ITS OWN
+// segment produced, but the wide encoder splices values into the JOINED buffer —
+// so every segment's offsets must be shifted by the running join length before
+// they are appended. Un-rebased, `u"\xF" "F"` splices the escape's unit at
+// offset 0 of the joined buffer and re-decodes the real byte at offset 0 as
+// ordinary text: the units come out in the wrong place, silently. ✔MEASURED —
+// all four references give `u"\xF" "F"` the two units 0x000F, 0x0046, and the
+// P55 prototype reproduced that only once the rebase was added.
+//
+// ⚠ The rebase is also why phase 5 running PER SEGMENT stays correct for the
+// wide path: `"\xF" "F"` must never be raw-token-merged into `\xFF`, and with
+// unbounded hex digits (C 6.4.4.4p7) that merge would now change the VALUE
+// rather than merely the byte count.
 [[nodiscard]] inline std::optional<std::string>
 decodeAdjacentStringBodies(Tree const& tree, NodeId node, SchemaTokenId bodyTokenKind,
                            EscapeDecodeOutcome* outcome = nullptr) {
@@ -61,8 +75,15 @@ decodeAdjacentStringBodies(Tree const& tree, NodeId node, SchemaTokenId bodyToke
         if (tree.kind(c) != NodeKind::Token) continue;
         if (tree.tokenKind(c).v != bodyTokenKind.v) continue;
         EscapeDecodeOutcome oc;
+        std::size_t const base = out.size();                     // phase 6 join position
         auto seg = decodeStringLiteralBody(tree.text(c), &oc);   // phase 5 per segment
         if (outcome && oc.usedByteEscape) outcome->usedByteEscape = true;
+        if (outcome) {
+            for (EscapeValueUnit u : oc.escapeUnits) {
+                u.byteOffset += base;                            // REBASE onto the joined buffer
+                outcome->escapeUnits.push_back(u);
+            }
+        }
         if (!seg) {
             if (outcome) outcome->error = oc.error;              // first failing segment's reason
             return std::nullopt;                                 // malformed escape — fail loud

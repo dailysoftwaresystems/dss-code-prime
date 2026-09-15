@@ -153,6 +153,15 @@ std::string genericSpelling(fs::path const& p) {
     return out;
 }
 
+std::string genericSpelling(std::string_view spelling) {
+    // Through the `fs::path` form, never a second `std::replace` here: two
+    // spellings of one rule are two owners of it, and the one that gets
+    // forgotten is the one that stops matching. `fs::path`'s narrow constructor
+    // does not touch the bytes, so a stored native spelling round-trips into
+    // the same substitution the path form performs.
+    return genericSpelling(fs::path{spelling});
+}
+
 std::u8string genericSpellingU8(fs::path const& p) {
     // `u8string()` and NOT `generic_u8string()` -- the NATIVE spelling carries
     // the leading run, and the substitution below is the same normalisation

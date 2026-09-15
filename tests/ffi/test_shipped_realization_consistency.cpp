@@ -63,6 +63,7 @@
 #include "diagnostic_count.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "ffi/shipped_type_consistency.hpp"
+#include "fixture_role_resolver.hpp"   // the ONE test-side runtimeLibraries stand-in
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
 
@@ -191,6 +192,16 @@ struct SweepResult {
 // up instead as a SHORTFALL in `checked`/`compared`, which the caller's floors
 // catch — because this file is also run against DELIBERATELY MUTATED corpus copies,
 // where insisting every descriptor read cleanly would fire on the mutation itself.
+// D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: the
+// shipped descriptors name their C-library image by ROLE, and the driver's
+// `#include` path always carries a resolver over the active format, so the (C)
+// sweep carries one too. Without it every role entry decodes to NO image,
+// `memory.json` and `string.json` then agree about nothing, and the
+// REMOVE-direction mutant below has nothing to disagree with. The table itself
+// is the ONE test-side fixture (`fixture_role_resolver.hpp`), which also says
+// why it is a fixture and not a second owner of the image identity.
+using dss::ffi_test::FixtureRoleResolver;
+
 [[nodiscard]] SweepResult sweepOneTarget(fs::path const& shippedLibs,
                                          std::vector<fs::path> const& descriptors,
                                          std::string_view arch, TargetAxis const& ax,
@@ -208,11 +219,12 @@ struct SweepResult {
     // sibling sweep.
     ShippedTypeConsistency checker{interner, std::span<VocabularyCore const>{},
                                    ax.format};
+    FixtureRoleResolver const roles{ax.format};
     SweepResult out;
     for (auto const& path : descriptors) {
         DiagnosticReporter readRep;   // read health is a different invariant
         auto desc = readShippedLibDescriptor(path, interner, typeReg, readRep,
-                                             ax.dm, arch, ax.format, named);
+                                             ax.dm, arch, ax.format, named, &roles);
         if (!desc.has_value()) continue;
         if (!objectFormatInAvailabilitySet(desc->availableObjectFormats, ax.format))
             continue;   // the header does not exist here — it declares nothing here

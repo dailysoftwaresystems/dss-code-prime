@@ -368,12 +368,49 @@ def loud(msg: str) -> None:
 
 # ── run identity ─────────────────────────────────────────────────────────────
 
+_OWNING_TREE = None
+
+
+def _owning_tree():
+    """`scripts/owning-tree/owning-tree.py` -- the owner of asking git WITHOUT the caller's git environment.
+
+    Loaded by path from this file's sibling directory (a hyphen is not a module name). It FAILS
+    LOUD when absent: the rule it owns must not be spelled a second time here.
+    """
+    global _OWNING_TREE
+    if _OWNING_TREE is None:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            die(f"cannot find {path} -- the run identity asks git through it and nowhere else")
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OWNING_TREE = mod
+    return _OWNING_TREE
+
+
 def git(*args: str) -> str:
+    """One run-identity read (HEAD, branch, status) about THIS tree, never the caller's.
+
+    ★★ ASKED WITHOUT THE CALLER'S GIT ENVIRONMENT. `-C` moves git's working directory and
+    nothing else. ✔MEASURED 2026-09-15 (P66 lane ge), this function on a tree at edfa495d with
+    122 dirty paths, run under another repository's variables:
+      * GIT_DIR                  -> branch and HEAD of THAT repository;
+      * GIT_DIR + GIT_WORK_TREE  -> THAT repository's branch and HEAD, and "clean" for the
+                                    dirty tree -- a report stamped with another commit, clean;
+      * an absolute GIT_INDEX_FILE -> `git status` failed (rc 128, "unable to read <sha>").
+    A git hook exports GIT_INDEX_FILE ABSOLUTE during a partial commit, so such a caller is
+    real. ⇒ `owning-tree.run_git`: this process's environment minus every name git calls
+    repository-local. Pinned by `test-corpus-census.py` beside this file.
+    """
+    ot = _owning_tree()
     try:
-        out = subprocess.run(["git", "-C", str(REPO_ROOT), *args],
-                             capture_output=True, text=True, check=False)
+        out = ot.run_git(["-C", str(REPO_ROOT), *args],
+                         capture_output=True, text=True, check=False)
         return out.stdout.strip() if out.returncode == 0 else "UNKNOWN"
-    except OSError:
+    except (OSError, ot.Refusal):
         return "UNKNOWN"
 
 

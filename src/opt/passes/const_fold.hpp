@@ -45,6 +45,7 @@
 #include "mir/mir.hpp"
 
 #include <cstddef>
+#include <optional>
 
 namespace dss::opt::passes {
 
@@ -58,8 +59,19 @@ struct ConstFoldResult {
 // were rewritten as `Const` (for the optimizer engine's `passesMutated`
 // signal). On verifier-detected SSA violations the underlying MirBuilder
 // will abort loud (substrate invariant) — no recovery path needed.
+// [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: `charIsUnsigned` is the ACTIVE
+// (target x object format)'s answer for plain `char`, from the one accessor
+// `TargetSchema::charIsUnsigned(ObjectFormatKind)`, threaded down from the
+// compile pipeline. This pass has no target and no format of its own, and that
+// is exactly why the row it closes calls an `EvalOptions`-only fix a half-
+// measure: `intKindInfo`'s `Char` row is read HERE too, in `normalizeToType`,
+// and a pass that guessed would silently disagree with the front end under
+// `--config=release` only. `nullopt` (every hand-built MIR fixture) makes a
+// `char`-typed fold refuse and the instruction is copied verbatim -- a missed
+// optimization, never a wrong constant.
 [[nodiscard]] DSS_EXPORT ConstFoldResult
 runConstFold(Mir& mir, TypeInterner const& interner,
-             DiagnosticReporter& reporter);
+             DiagnosticReporter& reporter,
+             std::optional<bool> charIsUnsigned = std::nullopt);
 
 } // namespace dss::opt::passes

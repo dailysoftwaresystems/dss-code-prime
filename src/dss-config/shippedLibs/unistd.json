@@ -3,7 +3,7 @@
   "header": "unistd.h",
   "standard": "posix",
   "availableObjectFormats": ["elf", "macho", "pe"],
-  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "library": { "elf": { "role": "cLibrary" }, "macho": { "role": "cLibrary" } },
   "includes": [
     { "header": "io.h",      "when": { "format": "pe" } },
     { "header": "process.h", "when": { "format": "pe" } }

@@ -456,7 +456,9 @@ declare -A LEG_SPEC=() LEG_FORMAT=() LEG_ARCH=() \
            LEG_RUN_FILESYSTEM=() LEG_CONFOUNDS=() LEG_ABORT_CONFOUNDS=() \
            LEG_RUN_LAUNCH=() \
            LEG_CONFOUND_GATING=() LEG_CONFOUND_REPORT=() \
+           LEG_RUN_DIR_GATING=() LEG_RUN_DIR_REQUIREMENTS=() \
            LEG_CONFOUND_DECLARED=() \
+           LEG_EVIDENCE_CONFOUNDS=() LEG_EXECUTION_EVIDENCE=() \
            LEG_RECIPE_TRANSFORM=() LEG_HEADER_STAGE_KEY=() LEG_ZCONF_GUARDS=() \
            LEG_CONFIG_STAGE_KEY=() LEG_CONFIGURE_ANSWERS=() \
            LEG_STACK_RESERVE=() LEG_SHARED_FLAGS=() LEG_LOADEXT_NAME=() \
@@ -468,7 +470,12 @@ declare -A LEG_SPEC=() LEG_FORMAT=() LEG_ARCH=() \
 # its VERDICT — one name from the closed vocabulary in
 # tests/test_support/arm_verdict_ledger.hpp, with a reason. Empty verdict = "still
 # in flight"; Step 9 refuses to let any declared leg end that way.
-declare -A LEG_CC=() LEG_CC_MACHINE=() LEG_TCL_LIB=() LEG_Z_LIB=() LEG_VERDICT=() LEG_VERDICT_DETAIL=()
+# ⓘ LEG_CC holds the compiler's ARGV, TAB-joined — the resolver's own wire shape —
+# and LEG_CC_SHOWN the same argv space-joined FOR MESSAGES ONLY. A candidate may
+# be an argv (`clang -arch x86_64`), so the two must not be confused: one is
+# handed to `--reference-cc` verbatim, the other is never fed to anything.
+# [D-HARNESS-TARGETCC-BARE-NAME-HIDES-A-MULTI-TARGET-COMPILER-FROM-EVERY-LEG-BUT-ITS-DEFAULT]
+declare -A LEG_CC=() LEG_CC_SHOWN=() LEG_CC_MACHINE=() LEG_TCL_LIB=() LEG_Z_LIB=() LEG_VERDICT=() LEG_VERDICT_DETAIL=()
 # EVERY leg that resolved a libtcl, INCLUDING one whose zlib did not — the Tcl
 # header/library coherence check (Step 6) is about a version skew, and a leg that
 # found its Tcl can witness one whether or not it is buildable. LEG_TCL_LIB above
@@ -1272,6 +1279,57 @@ leg_run_dir_plan() {           # leg_run_dir_plan <leg> <driver-rundir>  -> JSON
       never assumed — and the assumption is what put a Linux sqlite corpus onto DrvFs."
   printf '%s\n' "$out"
 }
+# >>> dss:run-dir-corroborate >>>  (paired in build-and-test.ps1)
+# ★★★ A CONFOUND ROW MAY BE CORROBORATED AGAINST *THIS LEG'S OWN RUN DIRECTORY*,
+# AND THE MEASUREMENT IS TAKEN AFTER THE PLAN, BECAUSE THAT IS THE ONLY MOMENT
+# BOTH FACTS EXIST.
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+#
+# ★★ THE SHAPE IS `matches: build-tu`'s, ONE NAME SPACE OVER: THE ROW ALONE
+# EXCUSES NOTHING. A build-tu row is honoured only where THIS RUN's reference
+# oracle also rejected the named TU; a row declaring `requiresRunDirectory` is
+# honoured only where THIS RUN's measurement of THIS LEG's run directory found
+# the precondition. A row whose precondition measures ABSENT reports itself
+# UNCORROBORATED and excuses nothing.
+#
+# ⚠ IT IS NOT AN `environmentProbes` QUESTION AND CANNOT BE MADE ONE: probe
+# verdicts are filed per KERNEL, sampled ONCE, BEFORE any leg is built, and
+# `--probe-environment` takes no leg and no directory.
+#
+# ★ THIS DRIVER DECIDES NOTHING. It hands over the supply it holds and takes
+# back the supply that survived, exactly as it does for `--run-dir-plan`. Which
+# rows a measurement withheld is the resolver's answer, in one file, so the two
+# drivers cannot drift into two ledgers — one axis along from
+# D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG.
+#
+# ⚠ THE SUPPLY IS READ FROM THE SAME GLOBAL ARRAYS leg_confound_patterns READS,
+# deliberately: this driver has exactly one per-leg record of the plan, and a
+# second copy passed by argument would be a second thing to keep in step.
+leg_run_dir_corroboration() {  # leg_run_dir_corroboration <leg> <driver-rundir>
+  local leg="$1" driver_run_dir="$2"
+  local -a supplied=() supplied_abort=()
+  eval "supplied=(${LEG_CONFOUNDS[$leg]:-})"
+  eval "supplied_abort=(${LEG_ABORT_CONFOUNDS[$leg]:-})"
+  local -a argv=(--catalogue "$LEG_CATALOGUE" --corroborate-run-dir "$leg"
+                 --host-os "$HOST_OS" --host-arch "$HOST_ARCH"
+                 --driver-run-dir "$driver_run_dir" --format json)
+  local p
+  for p in "${supplied[@]:-}";       do [[ -n "$p" ]] && argv+=(--supplied "$p"); done
+  for p in "${supplied_abort[@]:-}"; do [[ -n "$p" ]] && argv+=(--supplied-abort "$p"); done
+  local out rc
+  # rc DIRECTLY off python3, never after a pipe.
+  if out="$(python3 "$LEG_RESOLVER" "${argv[@]}" 2>&1)"; then rc=0; else rc=$?; fi
+  [[ $rc -eq 0 && -n "${out//[[:space:]]/}" ]] || die "[$leg] could not CORROBORATE this leg's confound rows against its own run directory (harness_legs.py --corroborate-run-dir, rc=$rc):
+      ${out:-<no diagnostic>}
+      A row declaring \`requiresRunDirectory\` is honoured ONLY where THIS RUN measured the
+      precondition on THIS LEG'S own run directory. Continuing without the measurement would
+      either excuse a failure on evidence nobody gathered, or withhold an earned excusal and
+      report it as a compiler regression.
+      [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]"
+  printf '%s\n' "$out"
+}
+# <<< dss:run-dir-corroborate <<<
 # One field out of that JSON. A LIST field (the argv prefixes, the launcher argv)
 # comes back shlex-quoted and space-joined so the caller `eval`s it into an array
 # — the same transport `emit_sh` uses for LEG_LAUNCH, and for the same reason: a
@@ -4008,7 +4066,7 @@ resolve_leg_target_cc() {       # resolve_leg_target_cc <leg>  -> 0 + LEG_CC set
   # trap the resolver call below documents.
   if ! _err="$(mktemp)"; then
     LEG_CC_WHY="mktemp could not create a temp file for the target-cc probe's stderr (TMPDIR='${TMPDIR:-<unset>}'), so the candidate ladder was never captured and no compiler could be resolved for this leg"
-    unset "LEG_CC[$leg]"
+    unset "LEG_CC[$leg]" "LEG_CC_SHOWN[$leg]"
     return 5
   fi
   # rc DIRECTLY off python3, never after a pipe, and the `if` keeps errexit out
@@ -4031,13 +4089,39 @@ resolve_leg_target_cc() {       # resolve_leg_target_cc <leg>  -> 0 + LEG_CC set
   # Flattened to one line: it becomes a ledger DETAIL, which Step 9 prints per leg.
   LEG_CC_WHY="$(tr '\n' ' ' < "$_err" 2>/dev/null || true)"; rm -f "$_err"
   [[ "$_rc" -eq 0 ]] || return "$_rc"
-  # `<cc>\t<triple>` — TAB-separated for the same reason acq_field is: neither
-  # field may be re-derived here, and a compiler PATH can contain spaces.
-  LEG_CC["$leg"]="${_out%%$'\t'*}"
-  LEG_CC_MACHINE["$leg"]="${_out#*$'\t'}"
+  # `<argv0>\t…\t<argvN>\t<triple>` — TAB-separated for the same reason acq_field
+  # is: no field may be re-derived here, and a compiler PATH can contain spaces.
+  # ANCHOR, ONE LINE, DO NOT WRAP:
+  # D-HARNESS-TARGETCC-BARE-NAME-HIDES-A-MULTI-TARGET-COMPILER-FROM-EVERY-LEG-BUT-ITS-DEFAULT
+  # ★ THE TRIPLE IS THE LAST FIELD AND THE COMPILER IS EVERYTHING BEFORE IT. A
+  # candidate may be an ARGV (`clang -arch x86_64`), because a compiler whose
+  # target is chosen by a FLAG was otherwise invisible to every leg but its
+  # default. LEG_CC therefore holds the argv STILL TAB-JOINED — bash associative
+  # arrays cannot hold arrays — and it is handed to `--reference-cc` verbatim, in
+  # exactly the shape the resolver splits. It is NEVER interpolated as a command
+  # here; LEG_CC_SHOWN is the readable form and is for messages only.
+  # ⓘ For a bare-name candidate this is byte-identical to the two-field line this
+  # driver has always read.
+  local -a _cc_fields=()
+  IFS=$'\t' read -r -a _cc_fields <<< "$_out"
+  if [[ ${#_cc_fields[@]} -lt 2 ]]; then
+    LEG_CC_WHY="the resolver exited 0 but did not answer in the declared <argv>TAB…TAB<triple> shape (got ${#_cc_fields[@]} field(s): '$_out')"
+    unset "LEG_CC[$leg]" "LEG_CC_SHOWN[$leg]"; return 4
+  fi
+  # ⓘ `${arr[-1]}` READS on bash 4.2+, which this driver's declared bash 4+ floor
+  # covers, but `unset 'arr[-1]'` needs 4.3 — so the REMOVAL spells the index out.
+  # Both name the same element; only the second spelling is version-fussy.
+  LEG_CC_MACHINE["$leg"]="${_cc_fields[-1]}"
+  unset "_cc_fields[$(( ${#_cc_fields[@]} - 1 ))]"
+  # ⓘ `${arr[*]}` joins with the FIRST CHARACTER OF IFS, and IFS is the DEFAULT
+  # here: the `IFS=$'\t'` above is a PREFIX assignment and applied to `read`
+  # alone. So LEG_CC_SHOWN comes out space-joined while LEG_CC keeps its tabs —
+  # which is the difference between the two, and it is not an accident.
+  LEG_CC["$leg"]="$(printf '%s\t' "${_cc_fields[@]}")"; LEG_CC["$leg"]="${LEG_CC[$leg]%$'\t'}"
+  LEG_CC_SHOWN["$leg"]="${_cc_fields[*]}"
   [[ -n "${LEG_CC[$leg]}" ]] || {
     LEG_CC_WHY="the resolver exited 0 but named no compiler (output: '$_out')"
-    unset "LEG_CC[$leg]"; return 4
+    unset "LEG_CC[$leg]" "LEG_CC_SHOWN[$leg]"; return 4
   }
   return 0
 }
@@ -4095,7 +4179,7 @@ for leg in "${LEG_ORDER[@]}"; do
     [[ -z "${LEG_CC_WHY// /}" ]] || info "      the resolver's ladder: ${LEG_CC_WHY}"
     continue
   fi
-  info "[$leg] control cc: ${LEG_CC[$leg]} — it reports '${LEG_CC_MACHINE[$leg]}', which is ${LEG_SPEC[$leg]}'s arch+OS (asked, not assumed)"
+  info "[$leg] control cc: ${LEG_CC_SHOWN[$leg]} — it reports '${LEG_CC_MACHINE[$leg]}', which is ${LEG_SPEC[$leg]}'s arch+OS (asked, not assumed)"
   [[ -z "${LEG_CC_WHY// /}" ]] || info "      candidates passed over: ${LEG_CC_WHY}"
 done
 
@@ -4446,6 +4530,24 @@ resolve_abort_file() {         # resolve_abort_file <name-or-path> <corpus-list-
       if (best>0 && (best>bi || (best==bi && L>bl))) { bi=best; bl=L; bf=f } }
     END { if (bf!="") print bf }' "$2"
 }
+
+# ── RECORD A NOT-REACHED GROUP, WITH ITS ATTRIBUTION ─────────────────────────
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-PE64-UNDER-WINE-ABORTS-THREE-TEST-FILES-THAT-PASS-NATIVELY-ON-WINDOWS
+#
+# ★ ONE DOOR, so NOT_REACHED and NOT_REACHED_ABORT can never desync by index. A
+# second bare `NOT_REACHED+=` that forgot its twin would shift every later
+# attribution by one and hand an EARNED abort somebody else's coverage hole —
+# silently, and in the direction that under-reports.
+# $1  the abort (`perm/file`) this group is the direct consequence of, or "" when
+#     no abort accounts for it. ⚠ ONLY the remainder of the file an abort died in
+#     is ever attributed: an exhausted resume budget or a skipped permutation is a
+#     coverage hole in its own right and a proven-not-ours abort does not buy it.
+# $2  the human description that goes in the ledger.
+not_reached() {                # not_reached <abort-name-or-empty> <description>
+  NOT_REACHED+=("$2")
+  NOT_REACHED_ABORT+=("$1")
+}
 # Every corpus basename byte-wise AFTER <boundary> — the SQLITE_TEST_PATTERN_LIST
 # superset sqlite intersects with the permutation's own -files.
 files_after() { LC_ALL=C awk -v b="$1" '$0 > b' "$2"; }
@@ -4740,6 +4842,138 @@ run_fixture_segment() {        # run_fixture_segment <leg> <bin> <launch_bin> <l
   wait "$child" 2>/dev/null || SEG_RC=$?
 }
 # <<< dss:corpus-engine <<<
+
+# >>> dss:exec-evidence >>>  (paired in build-and-test.ps1)
+# ★★★ A CLOCK ROW EXCUSES A FAILURE ONLY ON EVIDENCE FROM THAT FAILURE'S OWN
+# EXECUTION, and this is where the evidence is gathered and read.
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN
+#
+# The rows used to be honoured on ONE clock sample taken before any leg was built,
+# so the same walsetlk failures were charged to DSS in one run and excused in the
+# next, and a PRESENT sample excused any walsetlk/busy2 failure for the whole run.
+# Now the plan only ARMS them (LEG_EVIDENCE_CONFOUNDS); around EVERY segment a
+# monitor (harness_legs.py --monitor-execution, spawned in the fixture's own
+# kernel) records every clock step with the segment log's size at that instant,
+# and after the corpus --attribute-unit-failures reads each failure against its
+# own execution window. THIS DRIVER DECIDES NOTHING: it spawns what the resolver
+# planned, empties the log the monitor must arm on, stops the monitor, and folds
+# the resolver's per-name answer — the same division of labour as
+# --classify-abort, so the two drivers cannot come to attribute one failure two
+# ways.
+# ⚠ EVERY FAILURE PATH HERE UN-EXCUSES AND SAYS SO, and none of them stops the run:
+# a monitor that cannot be planned, cannot arm or cannot stop leaves that
+# segment's clock failures GENUINE (noisy, investigated), never excused, and one
+# leg's missing evidence must not cost the other legs their corpus.
+declare -a EXEC_MON_PIDS=() EXEC_MON_STOPS=() EXEC_MON_PROBES=() EXEC_MON_STOP_SECS=()
+exec_evidence_start() {        # exec_evidence_start <leg> <segment-log>
+  local leg="$1" log="$2" probe out rc pid tries armed arm_secs
+  EXEC_MON_PIDS=(); EXEC_MON_STOPS=(); EXEC_MON_PROBES=(); EXEC_MON_STOP_SECS=()
+  # The operator override replaces the earned list on every leg, armed rows
+  # included, so there is nothing to gather evidence for.
+  [[ -z "$DSS_CONFOUNDS" && -n "${LEG_EVIDENCE_CONFOUNDS[$leg]:-}" ]] || return 0
+  local -a probes=()
+  eval "probes=(${LEG_EXECUTION_EVIDENCE[$leg]:-})"
+  if [[ ${#probes[@]} -eq 0 ]]; then
+    warn "[$leg] armed confound rows but NO execution-evidence probe in the plan — a transport defect; every failure an armed row matches stays GENUINE"
+    return 0
+  fi
+  # ★ EMPTY, BEFORE THE MONITOR ARMS. A byte offset is a point in THIS segment's
+  # execution only if the log began empty under the monitor's eye; the attributor
+  # REFUSES a timeline armed on a non-empty log (a stale file, or a fixture that
+  # started first). run_fixture_segment truncates it again, which changes nothing.
+  : > "$log"
+  for probe in "${probes[@]}"; do
+    if out="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" --execution-monitor-argv \
+               --run-filesystem "${LEG_RUN_FILESYSTEM[$leg]}" --evidence-probe "$probe" \
+               --watch-log "$log" --segment-cap-seconds "$DSS_SEGMENT_TIMEOUT" --format sh 2>&1)"; then rc=0; else rc=$?; fi
+    if [[ $rc -ne 0 ]]; then
+      warn "[$leg] NO '$probe' execution monitor for this segment (harness_legs.py --execution-monitor-argv, rc=$rc): ${out:-<no diagnostic>}"
+      warn "      every failure an armed '$probe' row would match in this segment stays GENUINE"
+      continue
+    fi
+    local -a EXEC_MONITOR_ARGV=()
+    local EXEC_MONITOR_TIMELINE="" EXEC_MONITOR_STOP="" EXEC_MONITOR_ARM_SECONDS="0" EXEC_MONITOR_STOP_SECONDS="0"
+    eval "$out"
+    rm -f -- "$EXEC_MONITOR_STOP" "$EXEC_MONITOR_TIMELINE"
+    ( trap - ERR; set +e; exec "${EXEC_MONITOR_ARGV[@]}" ) > "$EXEC_MONITOR_TIMELINE.stderr" 2>&1 < /dev/null &
+    pid=$!
+    armed=0; tries=0; arm_secs="${EXEC_MONITOR_ARM_SECONDS%.*}"
+    while [[ $tries -lt $(( arm_secs * 5 )) ]]; do
+      if [[ -s "$EXEC_MONITOR_TIMELINE" ]] && grep -q '"kind": "armed"' "$EXEC_MONITOR_TIMELINE"; then armed=1; break; fi
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.2; tries=$((tries + 1))
+    done
+    if [[ $armed -eq 1 ]]; then
+      EXEC_MON_PIDS+=("$pid"); EXEC_MON_STOPS+=("$EXEC_MONITOR_STOP"); EXEC_MON_PROBES+=("$probe")
+      EXEC_MON_STOP_SECS+=("${EXEC_MONITOR_STOP_SECONDS%.*}")
+      info "[$leg] execution monitor '$probe' armed (pid $pid) -> $EXEC_MONITOR_TIMELINE"
+    else
+      warn "[$leg] the '$probe' execution monitor did NOT arm within ${arm_secs}s (pid $pid; stderr in $EXEC_MONITOR_TIMELINE.stderr)"
+      warn "      every failure an armed '$probe' row would match in this segment stays GENUINE"
+      kill -TERM "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+}
+exec_evidence_stop() {         # exec_evidence_stop <leg>
+  local leg="$1" i n tries pid
+  n=${#EXEC_MON_PIDS[@]}
+  [[ $n -gt 0 ]] || return 0
+  for ((i = 0; i < n; i++)); do : > "${EXEC_MON_STOPS[$i]}"; done
+  for ((i = 0; i < n; i++)); do
+    pid="${EXEC_MON_PIDS[$i]}"; tries=0
+    while kill -0 "$pid" 2>/dev/null && [[ $tries -lt $(( ${EXEC_MON_STOP_SECS[$i]} * 5 )) ]]; do
+      sleep 0.2; tries=$((tries + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      warn "[$leg] execution monitor '${EXEC_MON_PROBES[$i]}' (pid $pid) did not stop within ${EXEC_MON_STOP_SECS[$i]}s of its stop file — killed; its timeline keeps every record it flushed"
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+    rm -f -- "${EXEC_MON_STOPS[$i]}"
+  done
+  EXEC_MON_PIDS=(); EXEC_MON_STOPS=(); EXEC_MON_PROBES=(); EXEC_MON_STOP_SECS=()
+}
+# exec_evidence_attribute <leg> <leg-mode>
+# Reads the per-leg classifier state at TOP LEVEL (real, confound, SEG_LOGS,
+# TIER_PREFIXES) and writes back real, confound and evidence_excused — the same
+# globals the matcher above fills, because this is the second half of one
+# classification, not a second classifier.
+exec_evidence_attribute() {
+  local leg="$1" mode="$2" out rc line t p
+  local -a argv=(--catalogue "$LEG_CATALOGUE" --attribute-unit-failures "$leg" --leg-mode "$mode")
+  local -a ev=()
+  eval "ev=(${LEG_EVIDENCE_CONFOUNDS[$leg]:-})"
+  for p in "${ev[@]}"; do argv+=("--evidence-pattern=$p"); done
+  for p in "${SEG_LOGS[@]}"; do argv+=("--segment-log=$p"); done
+  for p in ${TIER_PREFIXES[@]+"${TIER_PREFIXES[@]}"}; do argv+=("--tier-prefix=$p"); done
+  for t in "${real[@]}"; do argv+=("--failure=$t"); done
+  if out="$(python3 "$LEG_RESOLVER" "${argv[@]}" 2>&1)"; then rc=0; else rc=$?; fi
+  if [[ $rc -ne 0 ]]; then
+    warn "[$leg] per-failure clock attribution could NOT run (harness_legs.py --attribute-unit-failures, rc=$rc): ${out:-<no diagnostic>}"
+    warn "      every failure an armed row would match stays GENUINE"
+    return 0
+  fi
+  local -A excused_names=()
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    case "$line" in
+      EXCUSED$'\t'*) excused_names["${line#EXCUSED$'\t'}"]=1 ;;
+      REPORT$'\t'*)  info "${line#REPORT$'\t'}" ;;
+    esac
+  done <<< "$out"
+  local -a keep=()
+  for t in "${real[@]}"; do
+    if [[ -n "${excused_names[$t]:-}" ]]; then
+      confound+=("$t"); evidence_excused+=("$t")
+    else
+      keep+=("$t")
+    fi
+  done
+  real=(${keep[@]+"${keep[@]}"})
+}
+# <<< dss:exec-evidence <<<
 
 # ── Step 7 — build the full-source testfixture with dsscp, per leg ──
 step "7/9  Build the full-source testfixture (dsscp --project), per leg"
@@ -5935,6 +6169,25 @@ leg_confound_patterns() {   # leg_confound_patterns <leg>  -> shlex-quoted words
         honoured, on evidence gathered somewhere this driver cannot vouch for. A verdict captured on
         another box would excuse a real miscompile HERE, in silence. Drop the flag and let it measure.
       [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]"
+  # ★★ AND WHETHER *THIS LEG'S OWN RUN DIRECTORY* WAS MEASURED, when any row on
+  # it is corroborated against one. Its OWN field, never folded into
+  # LEG_CONFOUND_GATING: the two answer separate questions measured at separate
+  # times, and a refusal has to name which of the two it is refusing.
+  # ANCHOR, ONE LINE, DO NOT WRAP:
+  # D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+  # ⚠ `unmeasured` IS THE VALUE A PLAN ALONE CAN EVER CARRY — a plan is resolved
+  # before any run directory exists — so this refusal is what makes the
+  # corroborator STRUCTURALLY unskippable rather than a convention. A driver that
+  # forgot the call stops here instead of quietly under-excusing, which is the
+  # direction that reads as a compiler regression.
+  [[ "${LEG_RUN_DIR_GATING[$leg]:-}" == 'not-required' || "${LEG_RUN_DIR_GATING[$leg]:-}" == 'measured' ]] || die "[$leg] the resolved leg plan says runDirectoryGating='${LEG_RUN_DIR_GATING[$leg]:-<unset>}', which is neither 'not-required' nor 'measured'.
+      A confound row declaring \`requiresRunDirectory\` is honoured ONLY where THIS RUN measured
+      the named precondition on THIS LEG'S own run directory, and a PLAN can never carry that
+      measurement: it is resolved before any run directory exists. Call harness_legs.py
+      --corroborate-run-dir with this leg's run directory and supply THAT result here.
+      'unmeasured' is fail-safe (every corroborated row is INACTIVE) and NOT fit to run on: the
+      withheld excusals surface as GENUINE reds and read as compiler regressions.
+      [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]"
   printf '%s' "${LEG_CONFOUNDS[$leg]}"
 }
 # <<< dss:confound-supply <<<
@@ -6502,6 +6755,20 @@ for leg in "${LEG_ORDER[@]}"; do
     fi
     info "[$leg] loadext helper carried into the launcher's filesystem -> $leg_launch_run/$SQLITE_TESTDIR_SUBDIR/$(basename "$STAGE_STAGED")"
   fi
+  # ★ CORROBORATED AGAINST THIS LEG'S OWN RUN DIRECTORY FIRST, which by now
+  # exists. A row declaring `requiresRunDirectory` excuses nothing on a host
+  # where its precondition does not hold, and the resolver — not this driver —
+  # decides which rows the measurement withheld.
+  # ANCHOR, ONE LINE, DO NOT WRAP:
+  # D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+  # ⚠ A PLAIN ASSIGNMENT, for the same reason the supply below uses one: `die`
+  # is `exit 1`, which exits the SUBSHELL a command substitution runs in, and
+  # bash does not propagate a failed substitution inside a non-assignment
+  # command. [D-HARNESS-CONFOUND-SUPPLY-REFUSAL-DIES-IN-A-SUBSHELL]
+  RUN_DIR_CORROBORATION="$(leg_run_dir_corroboration "$leg" "$rundir")"
+  LEG_CONFOUNDS["$leg"]="$(run_dir_field "$RUN_DIR_CORROBORATION" confounds)"
+  LEG_ABORT_CONFOUNDS["$leg"]="$(run_dir_field "$RUN_DIR_CORROBORATION" abortConfounds)"
+  LEG_RUN_DIR_GATING["$leg"]="$(run_dir_field "$RUN_DIR_CORROBORATION" runDirectoryGating)"
   # THE CONFOUNDS FOR THIS LEG — read from the leg's OWN declaration (legs.json
   # `confounds`, resolved by harness_legs.py), which is the same declaration
   # build-and-test.ps1 reads. ONE ledger, both drivers.
@@ -6519,6 +6786,11 @@ for leg in "${LEG_ORDER[@]}"; do
   eval "CONFOUND_PATTERNS=($CONFOUND_SUPPLY)"
   if [[ ${#CONFOUND_PATTERNS[@]} -gt 0 ]]; then
     info "[$leg] confound patterns in force (${#CONFOUND_PATTERNS[@]}): ${CONFOUND_PATTERNS[*]}$( [[ -n "$DSS_CONFOUNDS" ]] && printf '   [operator DSS_CONFOUNDS — applied to EVERY leg]' || printf '   [EARNED on this leg — legs.json `confounds`, provenance per pattern]' )"
+  elif [[ -z "$DSS_CONFOUNDS" && -n "${LEG_EVIDENCE_CONFOUNDS[$leg]:-}" ]]; then
+    # ★ AN EMPTY BY-NAME SUPPLY BESIDE ARMED ROWS is neither "declares none" nor
+    # "every row gated off": the armed rows ARE in force, per failure, and the
+    # account below lists them. [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+    info "[$leg] NO confound pattern excuses a failure BY NAME on this leg; its ARMED row(s) (${LEG_EVIDENCE_CONFOUNDS[$leg]}) excuse a failure only on clock evidence from that failure's own execution — see the per-row account immediately below."
   elif [[ "${LEG_CONFOUND_DECLARED[$leg]:-0}" -gt 0 ]]; then
     # ★★ AN EMPTY SUPPLY IS NOT A CLAIM ABOUT THE CATALOGUE. Three different facts
     # produce an empty array and they must read differently: the catalogue declares
@@ -6537,6 +6809,11 @@ for leg in "${LEG_ORDER[@]}"; do
   # exactly what a reader of that run needs to know.
   # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
   print_confound_report "$leg" "${LEG_CONFOUND_REPORT[$leg]:-}"
+  # ★ AND THE CORROBORATION'S OWN ACCOUNT, generated by the resolver and printed
+  # verbatim — the measurement, the directory it was taken on, and every row it
+  # withheld or re-earned. An excusal a reader cannot check is not an earned one.
+  # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+  print_confound_report "$leg" "$(run_dir_field "$RUN_DIR_CORROBORATION" reportText)"
   runlog="$OUT_DIR/$leg/corpus.log"
   ledger="$OUT_DIR/$leg/corpus-units.txt"
   # scratch lives in the leg's OUT dir — NEVER in the sqlite clone (the .sh runs the
@@ -6573,6 +6850,16 @@ for leg in "${LEG_ORDER[@]}"; do
   US=$'\x1f'
   SEGQ=("tier${US}${US}$DSS_TIER.test${US}${US}${LAUNCH_TIER_SCRIPT}${US}")
   declare -a SEG_LOGS=() SEG_LABELS=() SEG_RCS=() SEG_COUNTS=() ABORTS=() ABORT_LOGS=() ABORT_ROWS=() NOT_REACHED=() HYGIENE=() CALIBRATION=()
+  # ── WHICH ABORT, IF ANY, ACCOUNTS FOR EACH NOT-REACHED GROUP ───────────────
+  # ANCHOR, ONE LINE, DO NOT WRAP:
+  # D-HARNESS-PE64-UNDER-WINE-ABORTS-THREE-TEST-FILES-THAT-PASS-NATIVELY-ON-WINDOWS
+  # Parallel to NOT_REACHED by INDEX. Holds the abort name (`perm/file`) for the
+  # one group an abort is known to have taken down — the REMAINDER of the file it
+  # died in — and "" for every other coverage hole. An EARNED abort may account
+  # for its own remainder and NOTHING ELSE: a proven-not-ours abort does not buy
+  # amnesty for an exhausted resume budget or a skipped permutation.
+  # Twin of $notReachedAbort in build-and-test.ps1.
+  declare -a NOT_REACHED_ABORT=()
   sum_tests=0; sum_errors=0; n_summarised=0; der_tests=0; der_errors=0; n_derived=0
   # Carry Step 7's pre-flight kills into this leg's hygiene record, then sweep again:
   # a leftover fixture holds file handles (the abort class this engine exists for IS
@@ -6634,8 +6921,14 @@ for leg in "${LEG_ORDER[@]}"; do
       if [[ -n "$leg_carrier_old" ]]; then export "$leg_carrier_name=$leg_carrier_old"
       else unset "$leg_carrier_name"; fi
     fi
+    # ★ THE MONITOR SPANS THE WHOLE SEGMENT: armed on the emptied log before the
+    # fixture starts, stopped after it exits, so every failure's execution window
+    # lies inside what it watched. No-op on a leg with no armed row.
+    # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+    exec_evidence_start "$leg" "$seglog"
     run_fixture_segment "$leg" "$bin" "$launch_bin" "$seglog" "${seg_argv[@]}"
     segrc="$SEG_RC"
+    exec_evidence_stop "$leg"
     unset SQLITE_TEST_PATTERN_LIST
     if [[ -n "$leg_carrier_name" ]]; then
       if [[ -n "$leg_carrier_old" ]]; then export "$leg_carrier_name=$leg_carrier_old"
@@ -6709,7 +7002,7 @@ for leg in "${LEG_ORDER[@]}"; do
       # summary, so it would otherwise read as a full run. Say so instead.
       if [[ -n "$s_gaveup" ]]; then
         warn "[$leg] segment $seg_i stopped EARLY at the --maxerror cap ('*** Giving up...') — this is NOT full coverage"
-        NOT_REACHED+=("every file after ${s_done:-(none)} in '$s_label' — the fixture hit its --maxerror cap and finalised early (raise it with --maxerror=N)")
+        not_reached "" "every file after ${s_done:-(none)} in '$s_label' — the fixture hit its --maxerror cap and finalised early (raise it with --maxerror=N)"
       fi
       continue
     fi
@@ -6768,7 +7061,7 @@ for leg in "${LEG_ORDER[@]}"; do
       warn "        $s_zero_sig"
       info "      first lines of that log ($_sz):"
       head -6 "$seglog" 2>/dev/null | sed 's/^/        /'
-      NOT_REACHED+=("EVERY unit of the '${s_perm:-$DSS_TIER}' corpus — the fixture never completed a single file. PRECONDITION FAILURE: $s_zero_sig")
+      not_reached "" "EVERY unit of the '${s_perm:-$DSS_TIER}' corpus — the fixture never completed a single file. PRECONDITION FAILURE: $s_zero_sig"
       break
     fi
     # Carried to the NEXT segment so the comparison above has something to compare
@@ -6850,7 +7143,7 @@ for leg in "${LEG_ORDER[@]}"; do
       # when the file got as far as a do_test. symlink2.test died before its
       # first one, so the last name in that log belonged to the PREVIOUS file —
       # which is exactly the confusion the old wording invited.
-      NOT_REACHED+=("the REMAINDER of $abort_file under permutation '${perm:-?}' (${abort_source:-source unrecorded}; last test emitted: ${s_last:-none})")
+      not_reached "${perm:-?}/$abort_file" "the REMAINDER of $abort_file under permutation '${perm:-?}' (${abort_source:-source unrecorded}; last test emitted: ${s_last:-none})"
     else
       if [[ "$forced" == 1 ]]; then
         what="the resume boundary was FORCED to ${boundary:-the end of the corpus}, so that one file may have been skipped without a verdict"
@@ -6860,7 +7153,7 @@ for leg in "${LEG_ORDER[@]}"; do
       # The traceback frame, when there was one, goes IN the report even though it
       # did not resolve: "the log named nothing" and "the log named something that
       # is not in this corpus" are different facts and the reader needs the second.
-      NOT_REACHED+=("the UNNAMED file that aborted under permutation '${perm:-?}' after ${s_done:-the start of the permutation} — the log named no resolvable corpus file (last test: ${s_last:-none}; traceback frame: ${s_blame:-none}); $what")
+      not_reached "" "the UNNAMED file that aborted under permutation '${perm:-?}' after ${s_done:-the start of the permutation} — the log named no resolvable corpus file (last test: ${s_last:-none}; traceback frame: ${s_blame:-none}); $what"
     fi
     tail -6 "$seglog" 2>/dev/null | sed 's/^/      /'
 
@@ -6869,7 +7162,7 @@ for leg in "${LEG_ORDER[@]}"; do
     fi
     if [[ -z "$perm" ]]; then
       warn "[$leg] CANNOT RESUME — the aborting permutation could not be determined from the log."
-      NOT_REACHED+=("every unit after $boundary — no resume was possible (permutation undetermined; see $seglog)"); continue
+      not_reached "" "every unit after $boundary — no resume was possible (permutation undetermined; see $seglog)"; continue
     fi
     perm_idx=-1
     for ((k = 0; k < ${#TIER_PERMS[@]}; k++)); do [[ "${TIER_PERMS[$k]}" == "$perm" ]] && { perm_idx=$k; break; }; done
@@ -6877,7 +7170,7 @@ for leg in "${LEG_ORDER[@]}"; do
       warn "[$leg] RESUME BUDGET EXHAUSTED ($DSS_MAX_RESUMES) — stopping. Raise DSS_MAX_RESUMES to go further."
       rest=""
       [[ $perm_idx -ge 0 && $perm_idx -lt $((${#TIER_PERMS[@]} - 1)) ]] && rest=" and every permutation after '$perm' (${TIER_PERMS[*]:$((perm_idx + 1))})"
-      NOT_REACHED+=("every unit after $boundary in '$perm'$rest — resume budget ($DSS_MAX_RESUMES) exhausted"); continue
+      not_reached "" "every unit after $boundary in '$perm'$rest — resume budget ($DSS_MAX_RESUMES) exhausted"; continue
     fi
     # (a) the rest of the aborting permutation, via sqlite's own file-selection hook.
     resumes=$((resumes + 1)); last_boundary="$boundary"
@@ -6890,7 +7183,7 @@ for leg in "${LEG_ORDER[@]}"; do
     if [[ "$s_kind" != "perm" ]]; then
       if [[ $perm_idx -lt 0 ]]; then
         warn "[$leg] permutation '$perm' is not named by ${TEST_FILE##*/} — cannot continue the tier past it."
-        NOT_REACHED+=("every permutation after '$perm' in ${TEST_FILE##*/} — '$perm' is not one of its run_test_suite entries")
+        not_reached "" "every permutation after '$perm' in ${TEST_FILE##*/} — '$perm' is not one of its run_test_suite entries"
       elif [[ $perm_idx -lt $((${#TIER_PERMS[@]} - 1)) ]]; then
         nextperm="${TIER_PERMS[$((perm_idx + 1))]}"
         TAIL_SEGS+=("tier${US}${nextperm}${US}${TEST_FILE##*/} --start=${nextperm}:${US}${US}${LAUNCH_TIER_SCRIPT}${US}--start=${nextperm}:")
@@ -7001,6 +7294,17 @@ for leg in "${LEG_ORDER[@]}"; do
     warn "[$leg] ${#scoped_excused[@]} failure(s) excused ONLY because this leg runs '$leg_mode': ${scoped_excused[*]}"
     warn "      these are NOT evidence of correctness on a native run of this target — and a crash-simulation"
     warn "      abort can TRUNCATE the rest of its .test file, so coverage there is partial."
+  fi
+  # ★★ THE SECOND HALF OF ONE CLASSIFICATION: a failure the by-name matcher did
+  # not excuse, and an ARMED row matches, is excused only on evidence from its OWN
+  # execution — read by the resolver from the monitor timelines beside each
+  # segment log. [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+  declare -a evidence_excused=()
+  if [[ ${#real[@]} -gt 0 && -z "$DSS_CONFOUNDS" && -n "${LEG_EVIDENCE_CONFOUNDS[$leg]:-}" ]]; then
+    exec_evidence_attribute "$leg" "$leg_mode"
+  fi
+  if [[ ${#evidence_excused[@]} -gt 0 ]]; then
+    info "[$leg] ${#evidence_excused[@]} failure(s) excused PER FAILURE on clock evidence recorded inside their own execution: ${evidence_excused[*]}"
   fi
   # ★ THE INDEX-PARALLEL INVARIANT, ASSERTED RATHER THAN ASSUMED. The four SEG_*
   # arrays are indexed by the same k below. They are appended together now (see the
@@ -7240,9 +7544,41 @@ for leg in "${LEG_ORDER[@]}"; do
     for h in "${HYGIENE[@]}"; do warn "[$leg] HYGIENE: $h"; done
   fi
   # A NOT-REACHED unit is a coverage hole even when nothing failed — never silent.
-  if [[ ${#NOT_REACHED[@]} -gt 0 && ${#ABORTS[@]} -eq 0 ]]; then
+  # ANCHOR, ONE LINE, DO NOT WRAP:
+  # D-HARNESS-PE64-UNDER-WINE-ABORTS-THREE-TEST-FILES-THAT-PASS-NATIVELY-ON-WINDOWS
+  #
+  # ⛔ THIS GUARD USED TO READ `${#ABORTS[@]} -eq 0`, AND IT WENT BLIND THE DAY AN
+  # ABORT COULD BE EARNED. That condition was written when ANY abort meant FAIL,
+  # so the abort branch above already carried the NOT-REACHED text and this arm
+  # only had to cover the no-abort case. Once `matches: abort-file` let a leg pass
+  # WITH aborts, a leg whose aborts were all earned landed in the PASS branch,
+  # skipped this arm because ABORTS was non-empty, and reported `PASS` with no
+  # word about the whole test files that never finished. ✔MEASURED 2026-09-14:
+  # that is exactly what the pe64 leg under wine would have reported the moment
+  # its three abort rows landed. An excused abort stops COUNTING against dss; it
+  # never stops being a coverage hole.
+  #
+  # ★ AND THE ACCOUNTING IS PER GROUP, NOT PER LEG. An EARNED abort accounts for
+  # exactly ONE thing — the remainder of the file it died in — and nothing else:
+  # an exhausted resume budget or a skipped permutation is its own hole and still
+  # fails the leg, even on a run whose every abort was proven not ours.
+  if [[ ${#NOT_REACHED[@]} -gt 0 && ${#ABORTS_UNEARNED[@]} -eq 0 ]]; then
+    _cov_unaccounted=0
+    for _ni in "${!NOT_REACHED[@]}"; do
+      _owner="${NOT_REACHED_ABORT[$_ni]:-}"; _acct=0
+      if [[ -n "$_owner" ]]; then
+        for _e in ${ABORTS_EARNED[@]+"${ABORTS_EARNED[@]}"}; do
+          [[ "$_e" == "$_owner" ]] && { _acct=1; break; }
+        done
+      fi
+      [[ $_acct -eq 1 ]] || _cov_unaccounted=$((_cov_unaccounted + 1))
+    done
     UNIT_VERDICT["$leg"]="${UNIT_VERDICT[$leg]}  [NOT FULL COVERAGE: ${#NOT_REACHED[@]} unit group(s) NOT REACHED — see $ledger]"
-    UNIT_FAILS=$((UNIT_FAILS + 1))
+    if [[ $_cov_unaccounted -gt 0 ]]; then
+      UNIT_FAILS=$((UNIT_FAILS + 1))
+    else
+      info "[$leg] the ${#NOT_REACHED[@]} NOT-REACHED group(s) are each the remainder of a PROVEN-not-DSS abort, so they do not fail this leg — they are still a coverage hole and are named below."
+    fi
     for n in "${NOT_REACHED[@]}"; do warn "[$leg] NOT REACHED: $n"; done
   fi
   LEG_SEGMENTS["$leg"]="$nseg"; LEG_RESUMES["$leg"]="$resumes"
@@ -7260,7 +7596,7 @@ for leg in "${LEG_ORDER[@]}"; do
   # "we never tested it".
   LEG_VERDICT["$leg"]="ran"
   LEG_VERDICT_DETAIL["$leg"]="${UNIT_VERDICT[$leg]:-<no unit verdict recorded>}"
-  unset real confound ABORTS ABORT_ROWS NOT_REACHED HYGIENE CALIBRATION SEG_LOGS SEG_LABELS SEG_RCS SEG_COUNTS TIER_PERMS TIER_PREFIXES
+  unset real confound ABORTS ABORT_ROWS NOT_REACHED NOT_REACHED_ABORT HYGIENE CALIBRATION SEG_LOGS SEG_LABELS SEG_RCS SEG_COUNTS TIER_PERMS TIER_PREFIXES
 done
 
 # ── Step 9 — results ─────────────────────────────────────────────────────────

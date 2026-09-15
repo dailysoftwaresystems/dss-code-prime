@@ -8,6 +8,7 @@
 #include "lir/lir_liveness.hpp"
 #include "lir/lir_reg.hpp"
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <variant>
@@ -50,21 +51,31 @@
 // virtual registers with a union-find whose edges are COPIES, merging
 // two classes only when their live ranges do not interfere
 // (`lirRangesInterfere` — the ONE predicate, see `lir_liveness.hpp`).
-// Every member of a class receives the SAME physical register, so the
-// copy that related them becomes a register-to-register move onto
-// itself and `lir_peephole`'s rule R1 deletes it. The copy is removed
-// **at its source** — the allocator stops creating the difference —
-// rather than pattern-matched afterwards.
+// Every member of a class receives the SAME physical register, and
+// `rewriteWithAllocation` then does not emit the copy that related them
+// at all. The copy is removed **at its source** — the allocator stops
+// creating the difference — rather than pattern-matched afterwards.
+// (`lir_peephole`'s rule R1 still deletes the identity copies the scan
+// produced by COINCIDENCE, which carry no such proof; see
+// `coalescedCopyInsts` for why the two are different questions.)
 //
 // **Two kinds of edge, both target VOCABULARY, neither a mnemonic:**
 //
 //   * an EXPLICIT copy — an instruction whose opcode IS the register
 //     class's declared move (`regClassOpOpcode(cls, RegClassOp::Move)`)
-//     at the register's FULL declared width, with one virtual-register
-//     operand and a virtual-register result of the same class. The
-//     opcode-identity + full-width pair is exactly R1's admission test,
-//     asked one tier earlier: `trunc`/`zext` print as `mov` and are NOT
-//     copies, and a NARROWER move writes bits it did not read.
+//     with one virtual-register operand and a virtual-register result of
+//     the same class, AT LEAST AS WIDE AS EVERY STATED ACCESS TO EITHER
+//     END. The opcode-identity half is R1's, asked one tier earlier:
+//     `trunc`/`zext` print as `mov` and are NOT copies.
+//     ★★ THE WIDTH HALF IS **NOT** R1's AND USED TO BE
+//     (D-LIR-COPY-COALESCING-ASKS-THE-REGISTERS-WIDTH-NOT-THE-VALUES).
+//     R1 asks whether the copy writes the whole REGISTER, because
+//     post-regalloc that is all it can ask. Here the ends are still
+//     virtual, so the honest question is whether the copy writes the
+//     whole VALUE — and asking R1's question one tier early vetoed the
+//     entire floating-point file on both shipped targets, forever: a
+//     class move is emitted with the width-default flags (64) and `xmm`
+//     and `v` are 16 bytes, so the equality could never hold.
 //   * an IMPLICIT copy — the (result, tied-operand) pair of an opcode
 //     declaring `requires2Address`. `legalizeTwoAddress` materializes
 //     `mov result, operands[tied]` iff the two differ AFTER allocation,
@@ -205,6 +216,57 @@ struct DSS_EXPORT LirFuncAllocation {
     // frame the function does not reserve).
     std::uint32_t                 coalescedCopies     = 0;
     std::uint32_t                 coalescedSpillSlots = 0;
+
+    // ── THE SPILL-RELOAD SCRATCH RESERVATION, AS ASKED FOR AND AS ACHIEVED ──
+    //
+    // ★★★ D-AS-REGALLOC-SCRATCH-POOL-EXHAUSTED-BY-A-LARGE-FUNCTION-IN-RELEASE.
+    // Indexed by `LirRegClass` ordinal. `reloadReserveDemand[c]` is this
+    // function's PEAK single-instruction same-class reload demand — the number
+    // of scratch registers of class `c` the rewriter can need at once for ONE
+    // instruction (`computeReloadReserve`). `reloadReserveAchieved[c]` is how
+    // many the free-list build actually held back for it.
+    //
+    // ⚠ THEY WERE ALLOWED TO DISAGREE SILENTLY, AND THAT WAS THE DEFECT. The
+    // reservation could draw only from the class's NON-ARGUMENT CALLER-SAVED
+    // registers, and when a convention declares fewer of those than the demand
+    // it "reserved what exists and stopped". The shortfall is invisible until
+    // register pressure happens to assign every other register of the class, at
+    // which point the rewriter's pool holds exactly the achieved count and the
+    // first instruction asking for the demanded count fails loud, naming
+    // pressure rather than the shortfall. ✔MEASURED on ms_x64, whose FPR class
+    // has exactly TWO non-argument caller-saved registers against a demand of
+    // three. The reservation now draws its shortfall from the class's
+    // callee-saved registers, so `achieved >= demand` holds wherever the class
+    // has the registers at all — and these two fields are what a pin asserts
+    // that against, rather than against any particular function size.
+    //
+    // ⓘ OBSERVATIONS, never inputs to a decision: nothing downstream reads them
+    // to choose anything, so a drifted counter cannot change what is emitted.
+    std::array<std::uint16_t, kLirRegClassCount> reloadReserveDemand{};
+    std::array<std::uint16_t, kLirRegClassCount> reloadReserveAchieved{};
+
+    // ── THE WIDTH-SAFE COPIES, AND THIS ONE **IS** AN INPUT TO A DECISION ──
+    //
+    // ★★★ D-LIR-COPY-COALESCING-ASKS-THE-REGISTERS-WIDTH-NOT-THE-VALUES. Source
+    // `LirInstId.v`s, ASCENDING, of every explicit class-move copy in this
+    // function whose two ends are virtual registers of one class AND whose
+    // width covers every stated access to either end. `rewriteWithAllocation`
+    // consults it: a copy in this list whose two ends the allocation put in the
+    // SAME physical register is not emitted at all.
+    //
+    // ⚠ IT IS THE **PROOF**, NOT THE OUTCOME, AND THE TWO ARE DELIBERATELY
+    // SEPARATE. Membership says only "deleting this copy cannot be observed",
+    // which is a property of the LIR; whether the two ends actually coincide is
+    // a property of the ALLOCATION, re-checked at the rewrite on the mapped
+    // registers. A copy the coalescer proved safe but whose union a veto
+    // refused is still deletable if the scan happened to land both ends on one
+    // register — and a copy that landed on one register by coincidence with NO
+    // proof is NOT, because a narrower-than-the-datum copy that survives is
+    // load-bearing (AArch64's `FMOV Dd,Dn` zeroes bits 127:64, so dropping it
+    // where something reads 128 bits changes the value). Carrying the proof
+    // rather than re-deriving it downstream is what keeps the rewrite from
+    // owning a second copy of the width question.
+    std::vector<std::uint32_t>    coalescedCopyInsts;
     // Cached index of the calling convention used to drive this
     // allocation. The downstream prologue/epilogue emitter reads this
     // so it doesn't re-derive the cc choice. Hazard: reordering
@@ -324,5 +386,26 @@ allocateFuncRegisters(Lir const&             lir,
                       LirFuncLiveness const& flow,
                       std::uint16_t          callingConventionIndex,
                       DiagnosticReporter&    reporter);
+
+// ── THE VALUE-WIDTH BOUND THE COPY CLAUSE IS DECIDED AGAINST ────────────────
+//
+// D-LIR-COPY-COALESCING-ASKS-THE-REGISTERS-WIDTH-NOT-THE-VALUES. The widest
+// operation width, in bits, that any instruction of `flow.fn` STATES while
+// naming each virtual register — as its result or as a register operand.
+// Indexed by vreg id; entry 0 is the sentinel and is always 0. A vreg liveness
+// never saw is out of range, which a caller reads as "cannot bound it".
+//
+// ★ PUBLISHED SO A PIN CAN ASSERT THE BOUND DIRECTLY. The coalescer's decision
+// is "the copy is at least this wide"; inferring that from an allocation
+// outcome would make every pin depend on which register the linear scan
+// happened to pick, and a pin that can pass because two vregs coincidentally
+// missed each other is measuring the scan, not the rule.
+//
+// ⚠ ONE WIDTH PER INSTRUCTION, SO A MEMORY OP'S BASE REGISTER IS CREDITED WITH
+// THE WIDTH OF THE DATA IT MOVES. That over-states the access to an address
+// register, which REFUSES merges and never admits one — the safe direction, and
+// the reason this is a bound rather than a measurement.
+[[nodiscard]] DSS_EXPORT std::vector<std::uint8_t>
+lirMaxStatedAccessWidthBits(Lir const& lir, LirFuncLiveness const& flow);
 
 } // namespace dss

@@ -86,7 +86,7 @@ TEST(TypeRules, DerefOfArrayYieldsElementNotWholeArray) {
     auto a10 = in.array(i32, 10);            // int a[10]
     EXPECT_EQ(derefResultType(in, a10).v, i32.v) << "*a is the element int, not int[10]";
     // The deref and index laws must AGREE: *arr == arr[0].
-    EXPECT_EQ(derefResultType(in, a10).v, indexResultType(in, a10).v);
+    EXPECT_EQ(derefResultType(in, a10).v, indexResultType(in, a10, i32).v);
     // Multi-dim `int m[3][4]`: *m is the ROW int[4], not the whole 2-D array.
     auto row = in.array(i32, 4);
     auto m34 = in.array(row, 3);
@@ -100,6 +100,74 @@ TEST(TypeRules, DerefOfNonPointerNonArrayIsInvalid) {
     EXPECT_FALSE(derefResultType(in, in.primitive(TypeKind::I32)).valid());
     EXPECT_FALSE(derefResultType(in, in.primitive(TypeKind::F64)).valid());
     EXPECT_FALSE(derefResultType(in, InvalidType).valid());
+}
+
+// ── D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE ──────────────────────────────
+// C 6.5.3.2p1 defines `E1[E2]` as `*((E1)+(E2))` and states its constraint
+// symmetrically, so EITHER operand may be the container. These pin the shared
+// law both tiers ask; the corpus example `subscript_commuted_operands` pins the
+// same fact end-to-end through a running program.
+//
+// RED-ON-DISABLE (unit, REMOVE direction): delete the `subIsContainer` arm from
+// `indexContainerOperand` and CommutedSubscript* red while every Base-first
+// assertion below stays green — the control that says the probe ORDER, not the
+// whole law, is what admits the reversed spelling.
+TEST(TypeRules, IndexOfPointerBaseIsUnchangedByCommutativity) {
+    auto in   = makeInterner();
+    auto i32  = in.primitive(TypeKind::I32);
+    auto pi32 = in.pointer(i32);
+    // The shape every C program writes: base is the pointer, subscript the int.
+    EXPECT_EQ(indexContainerOperand(in, pi32, i32), IndexContainerOperand::Base);
+    EXPECT_EQ(indexResultType(in, pi32, i32).v, i32.v);
+}
+TEST(TypeRules, CommutedSubscriptResolvesTheSubscriptOperand) {
+    auto in   = makeInterner();
+    auto i32  = in.primitive(TypeKind::I32);
+    auto f64  = in.primitive(TypeKind::F64);
+    auto pi32 = in.pointer(i32);
+    auto pf64 = in.pointer(f64);
+    auto a10  = in.array(i32, 10);
+    // `i[p]`, `2[p]`, `e[data]` — the container is the SECOND operand.
+    EXPECT_EQ(indexContainerOperand(in, i32, pi32),
+              IndexContainerOperand::Subscript);
+    EXPECT_EQ(indexResultType(in, i32, pi32).v, i32.v);
+    EXPECT_EQ(indexResultType(in, i32, a10).v, i32.v);
+    // The element type comes from the CONTAINER, never from the index: a
+    // double* indexed by an int yields double whichever side it is written on.
+    EXPECT_EQ(indexResultType(in, i32, pf64).v, f64.v);
+    EXPECT_EQ(indexResultType(in, pf64, i32).v, f64.v);
+    // Both spellings agree — the property the whole row is about.
+    EXPECT_EQ(indexResultType(in, pi32, i32).v, indexResultType(in, i32, pi32).v);
+}
+TEST(TypeRules, SubscriptWithTwoContainersIsAmbiguousNotSilentlyResolved) {
+    auto in   = makeInterner();
+    auto i32  = in.primitive(TypeKind::I32);
+    auto pi32 = in.pointer(i32);
+    auto a10  = in.array(i32, 10);
+    // `p[q]` cannot satisfy 6.5.3.2p1 in EITHER direction — one operand must be
+    // the integer one. Picking the base here is what aborted the process inside
+    // the type lattice at P53's base, so the law must NOT answer Base.
+    EXPECT_EQ(indexContainerOperand(in, pi32, pi32),
+              IndexContainerOperand::Ambiguous);
+    EXPECT_EQ(indexContainerOperand(in, a10, pi32),
+              IndexContainerOperand::Ambiguous);
+    EXPECT_FALSE(indexResultType(in, pi32, pi32).valid());
+}
+TEST(TypeRules, SubscriptWithNoContainerIsNeither) {
+    auto in  = makeInterner();
+    auto i32 = in.primitive(TypeKind::I32);
+    auto f64 = in.primitive(TypeKind::F64);
+    EXPECT_EQ(indexContainerOperand(in, i32, i32), IndexContainerOperand::Neither);
+    EXPECT_EQ(indexContainerOperand(in, i32, f64), IndexContainerOperand::Neither);
+    EXPECT_FALSE(indexResultType(in, i32, i32).valid());
+    // An InvalidType operand is a cascade, not a container: it must not be
+    // mistaken for the other operand's answer.
+    EXPECT_EQ(indexContainerOperand(in, InvalidType, InvalidType),
+              IndexContainerOperand::Neither);
+    EXPECT_FALSE(indexResultType(in, InvalidType, i32).valid());
+    EXPECT_FALSE(isIndexContainerType(in, InvalidType));
+    EXPECT_FALSE(isIndexContainerType(in, i32));
+    EXPECT_TRUE(isIndexContainerType(in, in.pointer(i32)));
 }
 
 // Identical TypeIds are trivially assignable (the post-intern equality
@@ -972,4 +1040,32 @@ TEST(TypeRules, FunctionDesignatorExplicitCastToBoolAndPointer) {
     // Nothing casts TO a function-designator type.
     EXPECT_FALSE(isExplicitCastable(in, fnSig, i64));
     EXPECT_FALSE(isExplicitCastable(in, fnSig, voidPtr));
+}
+
+// The C-taxonomy COMPLEMENT of "integer type", as a lattice predicate. It asks
+// "definitely NOT", never "not definitely": an accept-list would have to
+// enumerate Bool/Char/Byte/Enum/BitInt and both rank ladders, and one omission
+// there refuses a correct program.
+TEST(TypeRules, DefinitelyNotIndexIntegerCoversTheCComplementOnly) {
+    auto in = makeInterner();
+    // NOT integers, and each one either ABORTED the process or reached the
+    // assembler at P53's base.
+    EXPECT_TRUE(isDefinitelyNotIndexInteger(in, in.primitive(TypeKind::F32)));
+    EXPECT_TRUE(isDefinitelyNotIndexInteger(in, in.primitive(TypeKind::F64)));
+    EXPECT_TRUE(isDefinitelyNotIndexInteger(in, in.primitive(TypeKind::Void)));
+    // Integers of every C flavour must pass — this is the accept side, and the
+    // predicate must not claim any of them.
+    for (TypeKind k : {TypeKind::Bool, TypeKind::Char, TypeKind::Byte,
+                       TypeKind::I8, TypeKind::I16, TypeKind::I32, TypeKind::I64,
+                       TypeKind::I128, TypeKind::U8, TypeKind::U16, TypeKind::U32,
+                       TypeKind::U64, TypeKind::U128}) {
+        EXPECT_FALSE(isDefinitelyNotIndexInteger(in, in.primitive(k)))
+            << "TypeKind ordinal " << static_cast<unsigned>(k)
+            << " is an integer type and must remain a legal subscript";
+    }
+    // A cascade (InvalidType) is judged by nothing — it is a downstream effect.
+    EXPECT_FALSE(isDefinitelyNotIndexInteger(in, InvalidType));
+    // A POINTER is not judged here: two containers is `Ambiguous`, a different
+    // finding with a different message.
+    EXPECT_FALSE(isDefinitelyNotIndexInteger(in, in.pointer(in.primitive(TypeKind::I32))));
 }

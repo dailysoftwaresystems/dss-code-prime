@@ -63,6 +63,12 @@ dss_add_test(NAME lir/test_mir_to_lir    SOURCES test_mir_to_lir.cpp)
 # FC1 (V2-4.X): the role-contract red-on-disable levers strip
 # inputRoles/outputRoles off idiv_op via mutate_target_schema.hpp.
 target_link_libraries(dss_lir_test_mir_to_lir PRIVATE nlohmann_json::nlohmann_json)
+# D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+# the under-aligned `AtomicCas` routing — commit through the atomics runtime's
+# generic compare-exchange under the same arbiter as the load, each arm with its
+# aligned control.
+dss_add_test(NAME lir/test_atomic_cas_runtime_routing
+             SOURCES test_atomic_cas_runtime_routing.cpp)
 # FC3.5 sweep-c2: the FCmp predicate-mapping truth table + shape pins
 # (D-COND-FLOAT-NAN-TRUTHINESS-FCMP). Uses mutate_target_schema.hpp for
 # the strip-foeq/strip-fogt capability red-on-disable levers.
@@ -131,6 +137,12 @@ dss_add_test(NAME lir/test_lir_asm_memory_output
 # the AAPCS64 control green.
 dss_add_test(NAME lir/test_lir_apple_stack_arg_packing
              SOURCES test_lir_apple_stack_arg_packing.cpp)
+
+# D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the stacked-argument ALIGNMENT rule
+# (the sibling of the packing pin above — packing says how many bytes a datum
+# owns, this says where its slot may begin).
+dss_add_test(NAME lir/test_lir_long_double_stack_arg_alignment
+             SOURCES test_lir_long_double_stack_arg_alignment.cpp)
 
 # D-LIR-OUTGOING-ARG-CURSOR-SPLIT-BETWEEN-TWO-PASSES-COLLIDES: ONE pass owns
 # every outgoing-argument byte offset. `lowerWideCallArgs` states each stacked
@@ -225,3 +237,53 @@ dss_add_test(NAME lir/test_lir_overaligned_local_frame
 # harness fails rather than that the compiler succeeds.
 dss_add_test(NAME lir/test_lir_fixture_vacuity_guard
              SOURCES test_lir_fixture_vacuity_guard.cpp)
+
+# D-LIR-COPY-COALESCING-ASKS-THE-REGISTERS-WIDTH-NOT-THE-VALUES: the copy
+# admission test compared the copy's stated width against the widest register
+# its CLASS declares, which no FP copy on any shipped target could ever satisfy
+# (the class move carries the width-default flags, `xmm`/`v` are 16 bytes) — so
+# the whole FP file was vetoed and the identity copies the allocator left behind
+# reached the emitted stream, `lir_peephole` R1 being unable to prove them
+# no-ops for the same reason. The pins are the PREMISE (the file really is wider
+# than the copies), the POSITIVE through the real lowering on BOTH shipped
+# targets, and the two-sided NEGATIVE over the published value-width bound —
+# hand-built, because whether an unproved copy is dropped must not depend on
+# which register the linear scan happened to pick.
+dss_add_test(NAME lir/test_lir_copy_coalescing_value_width
+             SOURCES test_lir_copy_coalescing_value_width.cpp)
+
+# D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT. The peephole's
+# placement argument rests on "callconv mints exactly ZERO identity copies", and
+# the evidence it carried was a NET across three passes because no dump stage
+# existed between the peephole and callconv. This pins the claim on the pass it
+# names — the census read on BOTH SIDES OF CALLCONV ALONE — plus the one-owner
+# identity between the census and rule R1, and the fixpoint that makes any later
+# residue a refusal rather than a miss.
+dss_add_test(NAME lir/test_lir_identity_copy_stage_attribution
+             SOURCES test_lir_identity_copy_stage_attribution.cpp)
+
+# D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: a shared library's own call to
+# its own definition must be resolved by the LOADER, not branched to the local
+# body — otherwise that image answers one identifier differently from every
+# other image in the process, silently (MEASURED: a DSS-built ELF `.so` gave
+# rc 4 where the gcc-built control gave rc 6; a DSS-built darwin dylib gave rc 1
+# where ld64's gave rc 2). Its own target because the routing is a MATRIX —
+# (visibility × binding × the format's declaration) — and the over-routing and
+# back-compat directions are as load-bearing as the defect itself: routing a
+# `static` callee, or routing anything at all in a main executable, costs every
+# call an indirection for a definition no loader can replace.
+dss_add_test(NAME lir/test_preemptible_definition_routing
+             SOURCES test_preemptible_definition_routing.cpp)
+
+# D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING, the ADDRESS half: the same
+# artifact must not materialize its own body's ADDRESS for a name its loader may
+# replace — `&w` inside the library and `&w` in the executable would then be two
+# different pointers for one identifier, where C 6.2.2p2 gives one identifier one
+# function/object across the whole program (MEASURED: gcc 13.3.0 and clang 18.1.3
+# both GOT-load `&wk`, `&st`, `&wd` and `&sd` in a `.so` while leaving the
+# `static` and hidden siblings in the SAME object a bare `lea`). Its own target
+# beside the routing matrix because the SUBJECT differs: a call wants the entry
+# the format's dispatch names, an address wants the loader-filled slot's CONTENT,
+# and under `direct-plt` those are two different VAs of one import.
+dss_add_test(NAME lir/test_preemptible_definition_address
+             SOURCES test_preemptible_definition_address.cpp)

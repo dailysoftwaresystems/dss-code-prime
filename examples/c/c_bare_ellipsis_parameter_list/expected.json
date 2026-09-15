@@ -1,0 +1,33 @@
+{
+  "$comment": "P66 (C23 6.7.7.1, cycle P66 lane `ca`): THE BARE-ELLIPSIS PARAMETER LIST — `int f(...)`, a function that is VARIADIC WITH ZERO NAMED PARAMETERS. DSS REFUSED every declaration in this file at the pre-change HEAD — `error[P_NoAlternativeMatched]: expected 'StringStart', 'EndStatement', 'WideStringStart', 'Utf32StringStart', 'Utf16StringStart', 'Utf8StringStart' or 'BlockOpen' — got '('` at 1:6, the parameter list never opening at all because `/shapes/paramList` required a `param` before the marker could be reached — on programs gcc 13.3.0 and clang 18.1.3 both compile and RUN, so DSS was BELOW the union. ★ C23 6.7.7.1 gives `parameter-type-list` THREE productions — `parameter-list`, `parameter-list , ...` and a bare `...` — and DSS carried two; the third pairs with the ONE-ARGUMENT `va_start(ap)` the same edition introduced (there is no `last` parameter to name), which DSS already accepted. ✔MEASURED 2026-09-09, each reference probed SEPARATELY on its own translation unit: gcc 13.3.0 `-std=c2x` rc 0 and clang 18.1.3 `-std=c23` rc 0, both SILENT at `-Wall -Wextra` AND at `-pedantic-errors`, across the declaration, the definition, a zero-argument call, a call with arguments, the function-POINTER spelling, the typedef spelling, an abstract parameter and a `va_start(ap)` + `va_arg` read-back; MSVC 19.51.36257 `/std:clatest` REFUSES every one (`C2143: syntax error: missing ')' before '...'`). TWO working accepting references make the behaviour REQUIRED. Both references refuse it before C23 (`-std=c17 -pedantic-errors`: gcc `ISO C requires a named argument before '...' before C2X`, clang `ISO C requires a named parameter before '...'`), so this is a C23 feature and not a GNU extension. ★★ THE REFERENCE ORACLE FOR THIS FILE WAS RUN, NOT ASSUMED: `gcc -std=c2x -Wall -Wextra` and `clang -std=c2x -Wall -Wextra` compile it silently and BOTH linked binaries EXIT 42, at -O0 and at -O2. An example only DSS accepts is not a witness. ★★★ ACCEPTANCE IS THE CHEAP HALF AND EVERY LINE HERE HAS A RUNTIME CONSEQUENCE, which is what separates 'parses' from 'means the right thing': a bare-variadic callee has NO named parameter to seed the argument cursor from, so every ABI's va_list start offsets must be derived from the FnSig alone — four integer varargs through `va_start(ap)` (30), the same callee reached INDIRECTLY through a `typedef int F(...)` function pointer (3), the INTEGER/FLOAT register-class split with no named argument at all read back as 4.5 and doubled (9), a bare-variadic call with NO arguments (7), and one with arguments passed and never read (7). A callee whose va_list started one slot late, or that took the named-parameter offset where there is no named parameter, changes the exit code rather than passing quietly. Data-model-independent; ONE exit code across all four targets including the shipped release pipeline. RED-ON-DISABLE, REMOVE DIRECTION: delete the `\"ellipsisParam\"` branch from `/shapes/paramList`'s alt in `src/dss-config/sources/c.lang.json` — a CONFIG document, so the CONFIG md5 is the moved artefact and nothing recompiles — and this file does not COMPILE; it stops exiting 42. Transcript in the lane report.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

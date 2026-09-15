@@ -28,23 +28,22 @@ nameOfSymbol(std::span<std::string const> table, SymbolId s) {
     return table[s.v];
 }
 
-// Recurse into a literal, collecting every symbol-address target's NAME.
+// Walk a literal, collecting every symbol-address target's NAME.
+// D-MIR-NESTED-AGGREGATE-LITERAL-WALKS-RECURSE-PER-INITIALIZER-LEVEL: the field
+// descent was host recursion with no cap; it is now the shared heap walker.
 void collectLiteralSymbolNames(MirLiteralValue const& v,
                                std::span<std::string const> names,
                                std::vector<std::string>& out, bool& sawUnnamed) {
-    if (auto const* sa = std::get_if<MirSymbolAddrValue>(&v.value)) {
+    forEachLiteralNode(v, [&](MirLiteralValue const& node) {
+        auto const* sa = std::get_if<MirSymbolAddrValue>(&node.value);
+        if (sa == nullptr) return;
         std::string const& n = nameOfSymbol(names, SymbolId{sa->symbol});
         if (n.empty()) {
             sawUnnamed = true;
             return;
         }
         out.push_back(n);
-        return;
-    }
-    if (auto const* agg = std::get_if<MirAggregateValue>(&v.value)) {
-        for (auto const& fld : agg->fields)
-            collectLiteralSymbolNames(fld, names, out, sawUnnamed);
-    }
+    });
 }
 
 void sortUnique(std::vector<std::string>& v) {
@@ -425,14 +424,14 @@ void declareUndefinedReferences(
         declared.insert(v);           // once, however many references there are
         undefined.push_back(v);
     };
-    auto noteLiteral = [&](auto&& self, MirLiteralValue const& v) -> void {
-        if (auto const* sa = std::get_if<MirSymbolAddrValue>(&v.value)) {
-            note(sa->symbol);
-            return;
-        }
-        if (auto const* agg = std::get_if<MirAggregateValue>(&v.value)) {
-            for (auto const& fld : agg->fields) self(self, fld);
-        }
+    // D-MIR-NESTED-AGGREGATE-LITERAL-WALKS-RECURSE-PER-INITIALIZER-LEVEL: was a
+    // `self(self, …)` recursive lambda, one host frame per brace level, no cap.
+    auto noteLiteral = [&](MirLiteralValue const& v) -> void {
+        forEachLiteralNode(v, [&](MirLiteralValue const& n) {
+            if (auto const* sa = std::get_if<MirSymbolAddrValue>(&n.value)) {
+                note(sa->symbol);
+            }
+        });
     };
     for (std::uint32_t fi = 0; fi < nf; ++fi) {
         MirFuncId const f = merged.funcAt(fi);
@@ -447,9 +446,8 @@ void declareUndefinedReferences(
                     note(merged.globalAddrSymbol(inst).v);
                     break;
                 case MirOpcode::Const:
-                    noteLiteral(noteLiteral,
-                                merged.literalValue(
-                                    merged.constLiteralIndex(inst)));
+                    noteLiteral(merged.literalValue(
+                        merged.constLiteralIndex(inst)));
                     break;
                 default:
                     break;
@@ -460,7 +458,7 @@ void declareUndefinedReferences(
     for (std::uint32_t gi = 0; gi < ng; ++gi) {
         std::uint32_t const lit =
             merged.globalInitLiteralIndex(merged.globalAt(gi));
-        if (lit != UINT32_MAX) noteLiteral(noteLiteral, merged.literalValue(lit));
+        if (lit != UINT32_MAX) noteLiteral(merged.literalValue(lit));
     }
     // Sorted, so the emitted row order — and therefore the module's import
     // table — is a pure function of the module rather than of a walk order.

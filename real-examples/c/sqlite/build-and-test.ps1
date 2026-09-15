@@ -372,6 +372,21 @@ function Get-LegConfounds($leg) {
   if ($gating -ne 'probed') {
     Die "[$($leg.label)] the resolved leg plan says confoundGating='$gating', not 'probed'. A conditional confound row (``requires: [<environment probe>]``) is honoured ONLY where the named probe MEASURED its defect as PRESENT on THIS machine, and this plan carries no such measurement. 'unprobed' — nothing was measured, so every conditional row is INACTIVE: safe, and not usable, because the withheld excusals surface as GENUINE reds and read as compiler regressions; resolve the plan WITHOUT ``--environment-probes skip`` so harness_legs.py measures. 'injected' — the verdicts were READ FROM A FILE (``--probe-verdicts``), so conditional rows ARE honoured, on evidence this driver cannot vouch for: a verdict captured on another box would excuse a real miscompile HERE, in silence; drop the flag and let it measure. [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]"
   }
+  # ★★ AND WHETHER *THIS LEG'S OWN RUN DIRECTORY* WAS MEASURED, when any row on
+  # it is corroborated against one. The two gatings are SEPARATE fields because
+  # they answer separate questions measured at separate times, and a refusal has
+  # to name which of the two it is refusing.
+  # ANCHOR, ONE LINE, DO NOT WRAP:
+  # D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+  # ⚠ `unmeasured` IS THE VALUE A PLAN ALONE CAN EVER CARRY — a plan is resolved
+  # before any run directory exists — so this refusal is what makes the
+  # corroborator STRUCTURALLY unskippable rather than a convention. A driver that
+  # forgot the call stops here instead of quietly under-excusing, which is the
+  # direction that reads as a compiler regression.
+  $rdGating = if ($null -ne $leg.PSObject.Properties['runDirectoryGating']) { $leg.runDirectoryGating } else { '<unset>' }
+  if ($rdGating -ne 'not-required' -and $rdGating -ne 'measured') {
+    Die "[$($leg.label)] the resolved leg plan says runDirectoryGating='$rdGating', which is neither 'not-required' nor 'measured'. A confound row declaring ``requiresRunDirectory`` is honoured ONLY where THIS RUN measured the named precondition on THIS LEG'S own run directory, and a PLAN can never carry that measurement: it is resolved before any run directory exists. Call harness_legs.py --corroborate-run-dir with this leg's run directory and supply THAT result here. 'unmeasured' is fail-safe (every corroborated row is INACTIVE) and NOT fit to run on: the withheld excusals surface as GENUINE reds and read as compiler regressions. [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]"
+  }
   return @($leg.confounds | Where-Object { $_ })
 }
 # <<< dss:confound-supply <<<
@@ -755,6 +770,52 @@ function Get-LegRunDirPlan($label, $driverRunDir) {
     Die "[$label] harness_legs.py --run-dir-plan exited 0 but did not print the JSON this driver reads ($($_.Exception.Message)). Output was:`n$(($stdout | Select-Object -First 20 | ForEach-Object { "      $_" }) -join "`n")"
   }
 }
+# >>> dss:run-dir-corroborate >>>  (paired in build-and-test.sh)
+# ★★★ A CONFOUND ROW MAY BE CORROBORATED AGAINST *THIS LEG'S OWN RUN DIRECTORY*,
+# AND THE MEASUREMENT IS TAKEN HERE, AFTER THE PLAN, BECAUSE THAT IS THE ONLY
+# MOMENT BOTH FACTS EXIST.
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+#
+# ★★ THE SHAPE IS `matches: build-tu`'s, ONE NAME SPACE OVER: THE ROW ALONE
+# EXCUSES NOTHING. A build-tu row is honoured only where THIS RUN's reference
+# oracle also rejected the named TU; a row declaring `requiresRunDirectory` is
+# honoured only where THIS RUN's measurement of THIS LEG's run directory found
+# the precondition. A row whose precondition measures ABSENT reports itself
+# UNCORROBORATED and excuses nothing — which is also how a row that outlived its
+# host announces itself instead of rotting into furniture.
+#
+# ⚠ IT IS NOT AN `environmentProbes` QUESTION AND CANNOT BE MADE ONE: probe
+# verdicts are filed per KERNEL, sampled ONCE, BEFORE any leg is built, and
+# `--probe-environment` takes no leg and no directory.
+#
+# ★ THE DRIVER DECIDES NOTHING. It hands over the supply it holds and takes back
+# the supply that survived, exactly as it does for `--run-dir-plan` and
+# `--translate-path`. Which rows a measurement withheld is the resolver's answer,
+# in one file, so the two drivers cannot drift into two ledgers — which is
+# D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG, one axis along.
+function Get-LegRunDirCorroboration($label, $driverRunDir, $supplied, $suppliedAbort) {
+  $argv = @('--catalogue', $LegsJson, '--corroborate-run-dir', "$label",
+            '--host-os', $HostOs, '--host-arch', $HostArch,
+            '--driver-run-dir', "$driverRunDir", '--format', 'json')
+  foreach ($p in @($supplied))      { if ($p) { $argv += @('--supplied', "$p") } }
+  foreach ($p in @($suppliedAbort)) { if ($p) { $argv += @('--supplied-abort', "$p") } }
+  try {
+    $out = @(& $python3.Source $LegsPy @argv 2>&1)
+    $rc  = $LASTEXITCODE
+  } catch {
+    $rc = if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }
+    $out = @("$($_.Exception.Message)")
+  }
+  $stdout = @($out | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+  if ($rc -ne 0) {
+    Die "[$label] could not CORROBORATE this leg's confound rows against its own run directory (harness_legs.py --corroborate-run-dir, rc=$rc):`n$(($out | ForEach-Object { "      $_" }) -join "`n")`n      A row declaring ``requiresRunDirectory`` is honoured ONLY where THIS RUN measured the precondition on THIS LEG'S run directory. Continuing without the measurement would either excuse a failure on evidence nobody gathered, or withhold an earned excusal and report it as a compiler regression. [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]"
+  }
+  try { return ($stdout -join "`n") | ConvertFrom-Json } catch {
+    Die "[$label] harness_legs.py --corroborate-run-dir exited 0 but did not print the JSON this driver reads ($($_.Exception.Message)). Output was:`n$(($stdout | Select-Object -First 20 | ForEach-Object { "      $_" }) -join "`n")"
+  }
+}
+# <<< dss:run-dir-corroborate <<<
 # Run one of the resolver's argv PREFIXES. An EMPTY prefix means the launcher
 # shares this driver's filesystem and the caller does the operation natively —
 # that is what `runFilesystem: driver` MEANS, so empty is a real answer and not a
@@ -4506,6 +4567,24 @@ function Get-FilesAfter($corpusFiles, $boundary) {
   return $out
 }
 
+# ── RECORD A NOT-REACHED GROUP, WITH ITS ATTRIBUTION ─────────────────────────
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-PE64-UNDER-WINE-ABORTS-THREE-TEST-FILES-THAT-PASS-NATIVELY-ON-WINDOWS
+#
+# ★ ONE DOOR, so $notReached and $notReachedAbort can never desync by index. A
+# second bare `+=` that forgot its twin would shift every later attribution by one
+# and hand an EARNED abort somebody else's coverage hole — silently, and in the
+# direction that under-reports. Twin of not_reached() in build-and-test.sh.
+# -Abort: the abort (`perm/file`) this group is the direct consequence of, or ''
+#   when no abort accounts for it. ⚠ ONLY the remainder of the file an abort died
+#   in is ever attributed; an exhausted resume budget or a skipped permutation is
+#   a coverage hole in its own right and a proven-not-ours abort does not buy it.
+function Add-NotReached {
+  param([AllowEmptyString()][string]$Abort, [string]$Description)
+  $script:notReached      += $Description
+  $script:notReachedAbort += $Abort
+}
+
 # ── process hygiene ──────────────────────────────────────────────────────────
 # Scoped to OUR EXACT fixture binary path — never to the image name. A developer's
 # own testfixture.exe, or one belonging to a different checkout, is never touched.
@@ -4748,6 +4827,113 @@ function Invoke-Fixture($exe, $argv, $workdir, $logPath, $errPath, $stall, $cap,
   return @{ Rc = $p.ExitCode; KillReason = $killReason; Seconds = ((Get-Date) - $t0).TotalSeconds }
 }
 # <<< dss:corpus-engine <<<
+
+# >>> dss:exec-evidence >>>  (paired in build-and-test.sh)
+# ★★★ A CLOCK ROW EXCUSES A FAILURE ONLY ON EVIDENCE FROM THAT FAILURE'S OWN
+# EXECUTION — the twin of build-and-test.sh's exec_evidence_* functions.
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN
+# The plan only ARMS such a row (`confoundsByEvidence`). Around every segment a
+# monitor planned by harness_legs.py --execution-monitor-argv runs IN THE FIXTURE'S
+# OWN KERNEL (for a wsl.exe-launched leg that is inside WSL2, reaching this driver's
+# log through /mnt/c — ✔MEASURED 2026-09-15: a byte the launched child writes is
+# visible there after p50 1.4 ms / max 32 ms) and records every clock step with the
+# log's size at that instant; after the corpus --attribute-unit-failures reads each
+# failure against its own execution window. THIS DRIVER DECIDES NOTHING: it spawns
+# what the resolver planned, empties the log first, stops the monitor, and folds
+# the per-name answer. Every failure path un-excuses, says so, and lets the run go on.
+function Start-ExecEvidenceMonitors($leg, $logPath) {
+  $mons = @()
+  # The operator override replaces the earned list, armed rows included.
+  if ($null -ne $ConfoundsOverride) { return $mons }
+  $evidence = @($leg.confoundsByEvidence | Where-Object { $_ })
+  if (-not $evidence.Count) { return $mons }
+  $probes = @($leg.executionEvidence | Where-Object { $_ })
+  if (-not $probes.Count) {
+    Warn "[$($leg.label)] armed confound rows but NO execution-evidence probe in the plan - a transport defect; every failure an armed row matches stays GENUINE"
+    return $mons
+  }
+  # EMPTY, BEFORE THE MONITOR ARMS: the attributor refuses a timeline armed on a
+  # non-empty log, because a stale file's offsets are not this segment's.
+  Set-Content -LiteralPath $logPath -Value '' -NoNewline -Encoding ascii
+  $emptyIn = Join-Path ([System.IO.Path]::GetDirectoryName($logPath)) '.exec-evidence-stdin'
+  Set-Content -LiteralPath $emptyIn -Value '' -NoNewline -Encoding ascii
+  foreach ($probe in $probes) {
+    $planOut = @(& $python3.Source $LegsPy '--execution-monitor-argv' '--run-filesystem' "$($leg.run.runFilesystem)" '--evidence-probe' $probe '--watch-log' $logPath '--segment-cap-seconds' "$SegCap" '--format' 'json' 2>&1)
+    $planRc = $LASTEXITCODE
+    $plan = $null
+    if ($planRc -eq 0) { try { $plan = ($planOut -join "`n") | ConvertFrom-Json } catch { $plan = $null } }
+    if ($null -eq $plan) {
+      Warn "[$($leg.label)] NO '$probe' execution monitor for this segment (harness_legs.py --execution-monitor-argv, rc=$planRc): $($planOut -join ' ')"
+      Warn "      every failure an armed '$probe' row would match in this segment stays GENUINE"
+      continue
+    }
+    Remove-Item -LiteralPath $plan.stopFile -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $plan.timeline -ErrorAction SilentlyContinue
+    $argv = @($plan.argv)
+    $rest = @($argv | Select-Object -Skip 1 | ForEach-Object { if ("$_" -match '\s') { '"' + $_ + '"' } else { "$_" } })
+    $sp = @{
+      FilePath = $argv[0]; ArgumentList = $rest; NoNewWindow = $true; PassThru = $true
+      RedirectStandardOutput = "$($plan.timeline).stdout"; RedirectStandardError = "$($plan.timeline).stderr"
+      RedirectStandardInput = $emptyIn
+    }
+    $proc = Start-Process @sp
+    $deadline = (Get-Date).AddSeconds([double]$plan.armWithinSeconds)
+    $armed = $false
+    while ((Get-Date) -lt $deadline) {
+      if ((Test-Path -LiteralPath $plan.timeline) -and (Select-String -LiteralPath $plan.timeline -SimpleMatch '"kind": "armed"' -Quiet)) { $armed = $true; break }
+      if ($proc.HasExited) { break }
+      Start-Sleep -Milliseconds 200
+    }
+    if ($armed) {
+      $mons += [pscustomobject]@{ Probe = $probe; Process = $proc; StopFile = "$($plan.stopFile)"; StopWithinSeconds = [double]$plan.stopWithinSeconds }
+      Info "[$($leg.label)] execution monitor '$probe' armed (pid $($proc.Id)) -> $($plan.timeline)"
+    } else {
+      Warn "[$($leg.label)] the '$probe' execution monitor did NOT arm within $($plan.armWithinSeconds) s (pid $($proc.Id); stderr in $($plan.timeline).stderr)"
+      Warn "      every failure an armed '$probe' row would match in this segment stays GENUINE"
+      try { $proc.Kill($true) } catch { try { $proc.Kill() } catch {} }
+      [void]$proc.WaitForExit(10000)
+    }
+  }
+  return $mons
+}
+function Stop-ExecEvidenceMonitors($legTag, $mons) {
+  foreach ($m in @($mons)) { Set-Content -LiteralPath $m.StopFile -Value '' -NoNewline -Encoding ascii }
+  foreach ($m in @($mons)) {
+    if (-not $m.Process.WaitForExit([int]($m.StopWithinSeconds * 1000))) {
+      Warn "[$legTag] execution monitor '$($m.Probe)' (pid $($m.Process.Id)) did not stop within $($m.StopWithinSeconds) s of its stop file - killed; its timeline keeps every record it flushed"
+      try { $m.Process.Kill($true) } catch { try { $m.Process.Kill() } catch {} }
+      [void]$m.Process.WaitForExit(10000)
+    }
+    Remove-Item -LiteralPath $m.StopFile -ErrorAction SilentlyContinue
+  }
+}
+# Returns the names the resolver EXCUSED; prints its account verbatim.
+function Invoke-ExecEvidenceAttribution($leg, $legMode, $segmentLogs, $tierPrefixes, $failNames) {
+  $excused = @()
+  if ($null -ne $ConfoundsOverride) { return $excused }
+  $evidence = @($leg.confoundsByEvidence | Where-Object { $_ })
+  if (-not $evidence.Count -or -not @($failNames).Count) { return $excused }
+  $a = @('--attribute-unit-failures', "$($leg.label)", '--leg-mode', $legMode)
+  foreach ($p in $evidence) { $a += "--evidence-pattern=$p" }
+  foreach ($l in @($segmentLogs)) { $a += "--segment-log=$l" }
+  foreach ($p in @($tierPrefixes)) { $a += "--tier-prefix=$p" }
+  foreach ($t in @($failNames)) { $a += "--failure=$t" }
+  $out = @(& $python3.Source $LegsPy @a 2>&1)
+  $rc = $LASTEXITCODE
+  if ($rc -ne 0) {
+    Warn "[$($leg.label)] per-failure clock attribution could NOT run (harness_legs.py --attribute-unit-failures, rc=$rc): $($out -join ' ')"
+    Warn "      every failure an armed row would match stays GENUINE"
+    return $excused
+  }
+  foreach ($line in $out) {
+    $s = "$line".TrimEnd("`r")
+    if ($s.StartsWith("EXCUSED`t")) { $excused += $s.Substring(8) }
+    elseif ($s.StartsWith("REPORT`t")) { Info $s.Substring(7) }
+  }
+  return $excused
+}
+# <<< dss:exec-evidence <<<
 
 # ── Step 7 — PER LEG: generate the manifest + build the testfixture ──────────
 # ★ EVERY BUILDABLE LEG IS BUILT, ON EVERY HOST. Whether this machine can EXECUTE
@@ -5601,13 +5787,26 @@ function Resolve-LoadextHelper {
 $LegControlCc = @{}
 foreach ($leg in $RunnableLegs) {
   $lbl = $leg.label
-  $LegControlCc[$lbl] = @{ Cc = ''; Machine = '' }
+  $LegControlCc[$lbl] = @{ Cc = ''; Shown = ''; Machine = '' }
   $ccOut = & $python3.Source $LegsPy '--resolve-target-cc' $lbl 2>&1
   if ($LASTEXITCODE -eq 0) {
     $parts = ("$ccOut" -split "`t")
     if ($parts.Count -ge 2) {
-      $LegControlCc[$lbl] = @{ Cc = $parts[0].Trim(); Machine = $parts[1].Trim() }
-      Info "[$lbl] control cc: $($parts[0].Trim()) - it reports '$($parts[1].Trim())', which is $($leg.spec)'s arch+OS (asked, not assumed)"
+      # ANCHOR, ONE LINE, DO NOT WRAP:
+      # D-HARNESS-TARGETCC-BARE-NAME-HIDES-A-MULTI-TARGET-COMPILER-FROM-EVERY-LEG-BUT-ITS-DEFAULT
+      # ★ THE TRIPLE IS THE LAST FIELD; THE COMPILER IS EVERYTHING BEFORE IT. A
+      # candidate may be an ARGV (`clang -arch x86_64`), because a compiler whose
+      # target is chosen by a FLAG was otherwise invisible to every leg but its
+      # default. `.Cc` keeps the argv STILL TAB-JOINED — the resolver's own wire
+      # shape, handed to `-ReferenceCc` verbatim and never interpolated as a
+      # command here; `.Shown` is the readable form, for messages only.
+      # For a bare-name candidate this is byte-identical to the two-field line
+      # this driver has always read. Twin of the same split in build-and-test.sh.
+      $ccArgv = @($parts[0..($parts.Count - 2)] | ForEach-Object { $_.Trim() })
+      $LegControlCc[$lbl] = @{ Cc      = ($ccArgv -join "`t")
+                               Shown   = ($ccArgv -join ' ')
+                               Machine = $parts[-1].Trim() }
+      Info "[$lbl] control cc: $($ccArgv -join ' ') - it reports '$($parts[-1].Trim())', which is $($leg.spec)'s arch+OS (asked, not assumed)"
     } else {
       # ★ THE THIRD OUTCOME, WHICH USED TO FIRE NEITHER BRANCH AND SAY NOTHING.
       # rc=0 is the resolver's "I FOUND one" answer, and its contract is a single
@@ -5621,7 +5820,7 @@ foreach ($leg in $RunnableLegs) {
       # it would be the reverse defect. It is a NAMED, LOUD verdict with the bytes
       # quoted, consistent with the `default {}` arm of Resolve-LoadextHelper
       # above, which likewise refuses an unrecognised shape instead of assuming.
-      Warn "[$lbl] --resolve-target-cc exited 0 but did not answer in the declared <cc><TAB><machine> shape - got $($parts.Count) field(s): [$ccOut]. Treating this leg as having NO control compiler, and saying so: an rc=0 that will not parse is a RESOLVER defect, not the ordinary 'this host has no cross-compiler' case reported below. The loadext helper is still built by DSS; only the cross-check is lost."
+      Warn "[$lbl] --resolve-target-cc exited 0 but did not answer in the declared <argv>TAB...TAB<machine> shape (at least two TAB-separated fields, the machine triple LAST) - got $($parts.Count) field(s): [$ccOut]. Treating this leg as having NO control compiler, and saying so: an rc=0 that will not parse is a RESOLVER defect, not the ordinary 'this host has no cross-compiler' case reported below. The loadext helper is still built by DSS; only the cross-check is lost."
     }
   } else {
     Info "[$lbl] no CONTROL compiler on this host - the loadext helper will be built by DSS for $($leg.build.sharedLibFormat), which needs nothing from this machine."
@@ -5657,9 +5856,50 @@ $legLauncher = @($leg.run.launcher)
 # Translated ONCE, here, so a per-segment path is the only other site.
 $legXlate    = "$($leg.run.pathTranslation)"
 $legLaunchFixture = Convert-LaunchPath $legXlate $fixture
+# THE DRIVER-SIDE run directory, CREATED BEFORE THE CONFOUND SUPPLY.
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION
+# ★★ THE ORDER IS LOAD-BEARING AND IT IS ALSO WHAT build-and-test.sh ALREADY
+# DID: a row corroborated against this leg's run directory cannot be resolved
+# before that directory exists, so the supply is taken AFTER it. It exists on
+# EVERY leg regardless of where the corpus actually runs, because this driver has
+# to be able to WRITE into it: the loadext helper is produced by a process on
+# this machine and can only land where this machine can put a file. For a
+# `driver` filesystem it is also where the fixture runs; for a foreign one it is
+# the staging area the resolver's copy argv reads FROM.
+# [D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS]
+$rundir = Join-Path $legOut 'run'; if (Test-Path $rundir) { Remove-Item -Recurse -Force $rundir }
+New-Item -ItemType Directory -Force -Path $rundir | Out-Null
+# WHERE THE CORPUS RUNS, DECLARED — never "wherever this driver happens to put
+# its build tree". `$legRunDir` is the launcher's own path when the two
+# filesystems differ, and $rundir when they do not; `$legLaunchRun` is empty in
+# the second case, which is how every site below tells the two apart without
+# knowing a single verb name.
+$runDirPlan   = Get-LegRunDirPlan $LegTag $rundir
 # CONFOUNDS ARE PER LEG AND EVERY ONE OF THEM WAS EARNED SOMEWHERE — read from
 # THIS LEG'S OWN DECLARATION (legs.json `confounds`, resolved by harness_legs.py),
 # which is the same declaration build-and-test.sh reads. One ledger, both drivers.
+# ★ AND THEN CORROBORATED against this leg's own run directory, which is what
+# makes a `requiresRunDirectory` row excuse nothing on a host where its
+# precondition does not hold. The resolver decides; this driver hands over the
+# supply it holds and takes back the supply that survived.
+# ★★ THE BY-NAME SUPPLY, NOT `confounds`. An ARMED row (a clock row) is IN FORCE
+# but excuses a failure only on evidence from that failure's own execution, so it
+# must never reach the by-name matcher; `confoundsByName` is that supply and
+# `confoundsByEvidence` the armed half, read after the corpus by
+# Invoke-ExecEvidenceAttribution. The .sh's LEG_CONFOUNDS carries the same by-name
+# list (emit_sh), so both drivers corroborate and match the SAME set.
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN
+foreach ($field in @('confoundsByName', 'confoundsByEvidence', 'executionEvidence')) {
+  if ($null -eq $leg.PSObject.Properties[$field]) {
+    Die "[$LegTag] the resolved leg plan carries NO ``$field`` field. harness_legs.py emits it on every planned leg, so its absence is a transport defect between the resolver and this driver. Reading ``confounds`` instead would hand the by-name matcher rows that may only excuse a failure on evidence from its own execution. [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]"
+  }
+}
+$legRunDirCorroboration = Get-LegRunDirCorroboration $LegTag $rundir @($leg.confoundsByName) @($leg.abortConfounds)
+$leg | Add-Member -NotePropertyName 'confounds' -NotePropertyValue @($legRunDirCorroboration.confounds) -Force
+$leg | Add-Member -NotePropertyName 'abortConfounds' -NotePropertyValue @($legRunDirCorroboration.abortConfounds) -Force
+$leg | Add-Member -NotePropertyName 'runDirectoryGating' -NotePropertyValue "$($legRunDirCorroboration.runDirectoryGating)" -Force
 $Confounds   = @(Get-LegConfounds $leg)
 # The ABORT half of the SAME ledger, read from the same resolved plan. Kept as
 # its own list so a unit-name matcher can never see an `abort-file` pattern and
@@ -5690,6 +5930,11 @@ if ($Confounds.Count) {
 # exactly what a reader of that run needs to know.
 # [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST]
 Write-ConfoundReport $LegTag ($leg.confoundReport -join "`n")
+# ★ AND THE CORROBORATION'S OWN ACCOUNT, generated by the resolver and printed
+# verbatim — the measurement, the directory it was taken on, and every row it
+# withheld or re-earned. An excusal a reader cannot check is not an earned one.
+# [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
+Write-ConfoundReport $LegTag "$($legRunDirCorroboration.reportText)"
 # The leg's OWN library directories go on its TARGET's loader search variable so
 # its fixture can load them at run time; TCL_LIBRARY points the Tcl runtime at its
 # script library.
@@ -5731,20 +5976,10 @@ $runEnvPath = Get-LegLoaderSearchPath $leg $legLibDirs
 # red a currently-working tier before the declaration lands, and the per-leg WARN
 # at acquisition time says so out loud every run rather than letting it pass.
 $LegTclLibrary = if ($LegLibs[$LegTag].TclScriptDir) { "$($LegLibs[$LegTag].TclScriptDir)" } else { $TclLibrary }
-# THE DRIVER-SIDE run directory. It exists on EVERY leg regardless of where the
-# corpus actually runs, because this driver has to be able to WRITE into it: the
-# loadext helper is produced by a process on this machine and can only land where
-# this machine can put a file. For a `driver` filesystem it is also where the
-# fixture runs; for a foreign one it is the staging area the resolver's copy argv
-# reads FROM. [D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS]
-$rundir = Join-Path $legOut 'run'; if (Test-Path $rundir) { Remove-Item -Recurse -Force $rundir }
-New-Item -ItemType Directory -Force -Path $rundir | Out-Null
-# WHERE THE CORPUS RUNS, DECLARED — never "wherever this driver happens to put
-# its build tree". `$legRunDir` is the launcher's own path when the two
-# filesystems differ, and $rundir when they do not; `$legLaunchRun` is empty in
-# the second case, which is how every site below tells the two apart without
-# knowing a single verb name.
-$runDirPlan   = Get-LegRunDirPlan $LegTag $rundir
+# The run directory and its plan were resolved ABOVE, before the confound supply,
+# because a row corroborated against this leg's run directory cannot be resolved
+# before that directory exists.
+# [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
 $legRunFs     = "$($runDirPlan.runFilesystem)"
 $legLaunchRun = "$($runDirPlan.launcherPath)"
 $legRunDir    = if ($legLaunchRun) { $legLaunchRun } else { $rundir }
@@ -5852,6 +6087,16 @@ $segments   = @(@{ Kind = 'tier'; Args = (Get-SegmentArgs $legXlate $TestFile @(
 $results    = @()          # one Read-CorpusSegment record per segment actually run
 $aborts     = @()          # one record per abort — these NEVER disappear from the verdict
 $notReached = @()          # units we can prove were never given a chance
+# ── WHICH ABORT, IF ANY, ACCOUNTS FOR EACH NOT-REACHED GROUP ─────────────────
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-PE64-UNDER-WINE-ABORTS-THREE-TEST-FILES-THAT-PASS-NATIVELY-ON-WINDOWS
+# Parallel to $notReached by INDEX. Holds the abort name (`perm/file`) for the
+# one group an abort is known to have taken down — the REMAINDER of the file it
+# died in — and '' for every other coverage hole. An EARNED abort may account for
+# its own remainder and NOTHING ELSE: a proven-not-ours abort does not buy amnesty
+# for an exhausted resume budget or a skipped permutation.
+# Twin of NOT_REACHED_ABORT in build-and-test.sh.
+$notReachedAbort = @()
 $hygiene    = @()          # leftover/killed fixture processes — never silent
 foreach ($k in $legRec.PreflightKills) { $hygiene += $k }
 if ($LockStolen) { $hygiene += "took over a STALE run lock left by $LockStolen" }
@@ -5942,6 +6187,10 @@ while ($si -lt $segments.Count) {
     Info "[$LegTag] segment $($si + 1): $($seg.Label)$(if ($seg.Patterns.Count) { "  (SQLITE_TEST_PATTERN_LIST: $($seg.Patterns.Count) candidate file(s))" })"
   }
   $legEnv = $null
+  # ★ THE MONITOR SPANS THE WHOLE SEGMENT: armed on the emptied log before the
+  # fixture starts, stopped in `finally` after it exits. No-op on a leg with no
+  # armed row. [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+  $execMons = @(Start-ExecEvidenceMonitors $leg $log)
   try {
     if (Test-Path -LiteralPath $LegTclLibrary) { $env:TCL_LIBRARY = $LegTclLibrary }
     if ($TierExcludes.Count) { $env:QUICKTEST_OMIT = ($TierExcludes -join ',') }
@@ -5966,6 +6215,7 @@ while ($si -lt $segments.Count) {
     Pop-LegLaunchEnv $legEnv
     $env:TCL_LIBRARY = $oldTclLib
     $env:QUICKTEST_OMIT = $oldOmit; $env:SQLITE_TEST_PATTERN_LIST = $oldPatterns
+    Stop-ExecEvidenceMonitors $LegTag $execMons
   }
   if ($run.KillReason) { Warn "[$LegTag] segment $($si + 1) HUNG — killed: $($run.KillReason)"; $hygiene += "segment $($si + 1) TIMED OUT and was killed — $($run.KillReason)" }
   # POST-SEGMENT HYGIENE — a segment that spawned or left a fixture behind must not
@@ -5986,7 +6236,7 @@ while ($si -lt $segments.Count) {
     if ($res.GaveUp) {
       $lastF = if ($res.Completed.Count) { $res.Completed[$res.Completed.Count - 1] } else { '(none)' }
       Warn "[$LegTag] segment $si stopped EARLY at the --maxerror cap (`*** Giving up...`) — this is NOT full coverage"
-      $notReached += "every file after $lastF in '$($seg.Label)' — the fixture hit its --maxerror cap and finalised early (raise it with --maxerror=N)"
+      Add-NotReached '' "every file after $lastF in '$($seg.Label)' — the fixture hit its --maxerror cap and finalised early (raise it with --maxerror=N)"
     }
     continue
   }
@@ -6048,7 +6298,7 @@ while ($si -lt $segments.Count) {
     Warn "        $zeroSig"
     Info "      first lines of that log ($logSize):"
     Get-Content $log -TotalCount 6 | ForEach-Object { Info "        $_" }
-    $notReached += "EVERY unit of the '$(if ($seg.Perm) { $seg.Perm } else { $Tier })' corpus — the fixture never completed a single file. PRECONDITION FAILURE: $zeroSig"
+    Add-NotReached '' "EVERY unit of the '$(if ($seg.Perm) { $seg.Perm } else { $Tier })' corpus — the fixture never completed a single file. PRECONDITION FAILURE: $zeroSig"
     break
   }
   # Carried to the NEXT segment so the comparison above has something to compare
@@ -6120,27 +6370,27 @@ while ($si -lt $segments.Count) {
     # the file got as far as a do_test. symlink2.test died before its first one,
     # so the last name in that log belonged to the PREVIOUS file — which is
     # exactly the confusion the old wording invited.
-    $notReached += "the REMAINDER of $abortFile under permutation '$(if ($perm) { $perm } else { '?' })' ($(if ($abortSource) { $abortSource } else { 'source unrecorded' }); last test emitted: $(if ($res.LastTest) { $res.LastTest } else { 'none' }))"
+    Add-NotReached "$(if ($perm) { $perm } else { '?' })/$abortFile" "the REMAINDER of $abortFile under permutation '$(if ($perm) { $perm } else { '?' })' ($(if ($abortSource) { $abortSource } else { 'source unrecorded' }); last test emitted: $(if ($res.LastTest) { $res.LastTest } else { 'none' }))"
   } else {
     $what = if ($forced) { "the resume boundary was FORCED to $(if ($boundary) { $boundary } else { 'the end of the corpus' }), so that one file may have been skipped without a verdict" }
             else { "the next segment resumes from $(if ($boundary) { $boundary } else { 'the end of the corpus' }) and will RE-ATTEMPT it" }
     # The traceback frame, when there was one, goes IN the report even though it
     # did not resolve: "the log named nothing" and "the log named something that
     # is not in this corpus" are different facts and the reader needs the second.
-    $notReached += "the UNNAMED file that aborted under permutation '$(if ($perm) { $perm } else { '?' })' after $(if ($lastDone) { $lastDone } else { 'the start of the permutation' }) — the log named no resolvable corpus file (last test: $(if ($res.LastTest) { $res.LastTest } else { 'none' }); traceback frame: $(if ($blamed) { $blamed } else { 'none' })); $what"
+    Add-NotReached '' "the UNNAMED file that aborted under permutation '$(if ($perm) { $perm } else { '?' })' after $(if ($lastDone) { $lastDone } else { 'the start of the permutation' }) — the log named no resolvable corpus file (last test: $(if ($res.LastTest) { $res.LastTest } else { 'none' }); traceback frame: $(if ($blamed) { $blamed } else { 'none' })); $what"
   }
   Get-Content $log -Tail 6 | ForEach-Object { Info "      $_" }
 
   if (-not $boundary) { Warn "[$LegTag] the abort is at the END of the corpus file list — nothing left to resume."; continue }
   if (-not $perm) {
     Warn "[$LegTag] CANNOT RESUME — the aborting permutation could not be determined from the log."
-    $notReached += "every unit after $boundary — no resume was possible (permutation undetermined; see $log)"
+    Add-NotReached '' "every unit after $boundary — no resume was possible (permutation undetermined; see $log)"
     continue
   }
   $permIdx = $TierPerms.IndexOf($perm)
   if ($resumes -ge $MaxResumes) {
     Warn "[$LegTag] RESUME BUDGET EXHAUSTED ($MaxResumes) — stopping. Raise DSS_MAX_RESUMES to go further."
-    $notReached += "every unit after $boundary in '$perm'" + $(if ($permIdx -ge 0 -and $permIdx -lt $TierPerms.Count - 1) { " and every permutation after '$perm' ($($TierPerms[($permIdx + 1)..($TierPerms.Count - 1)] -join ' '))" } else { '' }) + " — resume budget ($MaxResumes) exhausted"
+    Add-NotReached '' ("every unit after $boundary in '$perm'" + $(if ($permIdx -ge 0 -and $permIdx -lt $TierPerms.Count - 1) { " and every permutation after '$perm' ($($TierPerms[($permIdx + 1)..($TierPerms.Count - 1)] -join ' '))" } else { '' }) + " — resume budget ($MaxResumes) exhausted")
     continue
   }
   # (a) the rest of the aborting permutation, via sqlite's own file-selection hook.
@@ -6154,7 +6404,7 @@ while ($si -lt $segments.Count) {
   if ($seg.Kind -ne 'perm') {
     if ($permIdx -lt 0) {
       Warn "[$LegTag] permutation '$perm' is not named by $([System.IO.Path]::GetFileName($TestFile)) — cannot continue the tier past it."
-      $notReached += "every permutation after '$perm' in $([System.IO.Path]::GetFileName($TestFile)) — '$perm' is not one of its run_test_suite entries"
+      Add-NotReached '' "every permutation after '$perm' in $([System.IO.Path]::GetFileName($TestFile)) — '$perm' is not one of its run_test_suite entries"
     } elseif ($permIdx -lt $TierPerms.Count - 1) {
       $next = $TierPerms[$permIdx + 1]
       $tail += @{ Kind = 'tier'; Args = (Get-SegmentArgs $legXlate $TestFile @("--start=${next}:")); Patterns = @(); Perm = $next
@@ -6251,6 +6501,20 @@ foreach ($t in $failNames) {
 }
 if ($scopedExcused.Count) {
   Warn "[$LegTag] $($scopedExcused.Count) failure(s) excused ONLY because this leg runs '$legMode': $($scopedExcused -join ' ')"
+}
+# ★★ THE SECOND HALF OF ONE CLASSIFICATION — the .sh's exec_evidence_attribute
+# twin. A failure the by-name matcher did not excuse, and an ARMED row matches, is
+# excused only on evidence from its OWN execution, read by the resolver from the
+# monitor timelines beside each segment log.
+# [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+$evidenceExcused = @()
+if ($real.Count) {
+  $evidenceExcused = @(Invoke-ExecEvidenceAttribution $leg $legMode @($results | ForEach-Object { $_.Log }) $TierPrefixes $real)
+  if ($evidenceExcused.Count) {
+    $confound += $evidenceExcused
+    $real = @($real | Where-Object { $evidenceExcused -notcontains $_ })
+    Info "[$LegTag] $($evidenceExcused.Count) failure(s) excused PER FAILURE on clock evidence recorded inside their own execution: $($evidenceExcused -join ' ')"
+  }
 }
 # Per-unit ledger — every file that reached a verdict, every abort, every gap.
 $led = New-Object 'System.Collections.Generic.List[string]'
@@ -6449,9 +6713,37 @@ if ($hygiene.Count) {
   foreach ($h in $hygiene) { Warn "[$LegTag] HYGIENE: $h" }
 }
 # A NOT-REACHED unit is a coverage hole even when nothing failed — never silent.
-if ($notReached.Count -and -not $aborts.Count) {
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-PE64-UNDER-WINE-ABORTS-THREE-TEST-FILES-THAT-PASS-NATIVELY-ON-WINDOWS
+#
+# ⛔ THIS GUARD USED TO READ `-not $aborts.Count`, AND IT WENT BLIND THE DAY AN
+# ABORT COULD BE EARNED. That condition was written when ANY abort meant FAIL, so
+# the abort branch above already carried the NOT-REACHED text and this arm only
+# had to cover the no-abort case. Once `matches: abort-file` let a leg pass WITH
+# aborts, a leg whose aborts were all earned landed in the PASS branch, skipped
+# this arm because $aborts was non-empty, and reported `PASS` with no word about
+# the whole test files that never finished. ✔MEASURED 2026-09-14: that is exactly
+# what the pe64 leg under wine would have reported the moment its three abort rows
+# landed. An excused abort stops COUNTING against dss; it never stops being a
+# coverage hole.
+#
+# ★ AND THE ACCOUNTING IS PER GROUP, NOT PER LEG. An EARNED abort accounts for
+# exactly ONE thing — the remainder of the file it died in — and nothing else: an
+# exhausted resume budget or a skipped permutation is its own hole and still fails
+# the leg, even on a run whose every abort was proven not ours.
+# Twin of the same block in build-and-test.sh.
+if ($notReached.Count -and -not $abortsUnearned.Count) {
+  $covUnaccounted = 0
+  for ($ni = 0; $ni -lt $notReached.Count; $ni++) {
+    $owner = if ($ni -lt $notReachedAbort.Count) { $notReachedAbort[$ni] } else { '' }
+    if (-not $owner -or $abortsEarned -notcontains $owner) { $covUnaccounted++ }
+  }
   $unitVerdict += "  [NOT FULL COVERAGE: $($notReached.Count) unit group(s) NOT REACHED — see $Ledger]"
-  $unitFail = $true
+  if ($covUnaccounted -gt 0) {
+    $unitFail = $true
+  } else {
+    Info "[$LegTag] the $($notReached.Count) NOT-REACHED group(s) are each the remainder of a PROVEN-not-DSS abort, so they do not fail this leg — they are still a coverage hole and are named below."
+  }
   foreach ($n in $notReached) { Warn "[$LegTag] NOT REACHED: $n" }
 }
 # The exclusion rides along on EVERY verdict — pass and fail alike — so a GREEN

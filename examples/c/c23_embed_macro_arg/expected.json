@@ -1,0 +1,35 @@
+{
+  "$comment": "D-PP-EMBED-MACRO-ARG (C23 6.10.4.1p11), closed P60: runtime witness for the MACRO-EXPANDED `#embed` operand -- a `# embed pp-tokens` line matching neither literal form has its whole tail macro-expanded 'just as in normal text' and the result must match one of the two forms -- RUN on BOTH the baseline (debug) AND the `release` (shippedPipeline) arm. Three shapes: `#embed RESOURCE` (expands to a bare quoted name: all 16 bytes), `#embed RESOURCE_WITH_LIMIT` (expands to name + `limit(3)`: 3 bytes), and `#embed RESOURCE limit(LIM) suffix(, 0xEE)` (the macro supplies the name, the line the parameters, and the limit clause holds a further macro, 6.10.4.2p3: 5 bytes + 0xEE); plus `__has_embed(RESOURCE)` / `__has_embed(RESOURCE_WITH_LIMIT)` through the operator's second form (6.10.2p5). payload.bin is 16 bytes (00 0D 0A 1A FF 10 20 30 40 50 60 70 80 90 A0 B0). Every count and byte is checked (exit 1..7 on a mismatch) before `(sum(a)+sum(b)+sum(c)) & 0xFF` = 133 is returned through a runtime-opaque index. ⚠ NO REFERENCE COMPILER CAN COMPILE THIS FILE: gcc 13.3.0, clang 18.1.3 and MSVC 19.51.36252 refuse `#embed` entirely (MEASURED 2026-09-04, each separately); the oracle is the ISO C23 text (N3220), cited clause by clause in main.c.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 133,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

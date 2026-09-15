@@ -72,6 +72,7 @@
 #include <fstream>
 #include <functional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -172,6 +173,79 @@ void forEachDescriptor(std::function<void(fs::path const&, json const&)> const& 
 
 }  // namespace
 
+// ── THE SECOND KIND OF DECLARER ──────────────────────────────────────────────
+//
+// D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64: an object format's
+// `runtimeLibraries[].source` names a file in this SAME tree, for a runtime role
+// whose entry points the COMPILER MINTS — so there is no descriptor row to hang
+// the realization off, and R1/R2 must see the format documents or the sweep
+// refuses a file the config legitimately names.
+//
+// ⚠ THIS IS A RAW READ OF A KEY THE `link` TIER OWNS, and that is a real hazard
+// rather than a shortcut: a second reader of a config key is how a sweep and a
+// loader come to disagree. It is pinned shut in
+// `tests/link/test_runtime_library_roles.cpp`, which asserts that every `source`
+// this raw read finds is exactly what `ObjectFormatSchema::runtimeLibraries()
+// .realizedSources()` reports for the same flavour. `tests/ffi` cannot load a
+// format document without depending on the object-format schema, which is the
+// layering inversion the split avoids.
+//
+// ★ EACH DECLARATION CARRIES ITS OWN LOCATOR (P54 lane `ar`). A bare list of
+// paths made every refusal say `an object format's runtimeLibraries[].source`
+// and name neither the document nor the role, so a broken path in ONE of the
+// four pe64 flavours reported identically to a broken path in any other — and
+// the reader had 26 documents to search. The document name and the role are
+// known exactly here and nowhere downstream, so they travel with the claim.
+//
+// ⚠ THE SAME SOURCE NAMED BY SEVERAL DOCUMENTS IS **NOT** DEDUPLICATED, and the
+// change is deliberate: `runtime/platform/src/atomic.c` is named by all FOUR
+// pe64 flavours (✔MEASURED), and folding them to one entry would have made a
+// refusal name one arbitrary document while the other three went unmentioned.
+// R1 resolving the same path four times is four `is_regular_file` calls.
+[[nodiscard]] std::vector<dss::ffi::ShippedSourceDeclaration>
+formatRealizedSources() {
+    std::vector<dss::ffi::ShippedSourceDeclaration> out;
+    auto const root = configRoot();
+    if (root.empty()) return out;
+    std::error_code ec;
+    fs::path const  dir = root / "object-formats";
+    if (!fs::is_directory(dir, ec)) return out;
+    for (fs::directory_iterator it{dir, ec}, end; it != end; it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file(ec)) continue;
+        std::ifstream in{it->path()};
+        if (!in) continue;
+        json doc;
+        try {
+            in >> doc;
+        } catch (...) {
+            continue;   // a malformed document is the format loader's refusal
+        }
+        if (!doc.contains("runtimeLibraries")) continue;
+        if (!doc.at("runtimeLibraries").is_array()) continue;
+        std::string const document = it->path().filename().generic_string();
+        for (auto const& row : doc.at("runtimeLibraries")) {
+            if (!row.is_object() || !row.contains("source")) continue;
+            if (!row.at("source").is_string()) continue;
+            auto src = row.at("source").get<std::string>();
+            if (src.empty()) continue;
+            std::string role = "<no role>";
+            if (row.contains("role") && row.at("role").is_string())
+                role = row.at("role").get<std::string>();
+            out.push_back(dss::ffi::ShippedSourceDeclaration{
+                "object format document '" + document
+                    + "' runtimeLibraries[" + role + "]",
+                std::move(src)});
+        }
+    }
+    std::sort(out.begin(), out.end(),
+              [](auto const& a, auto const& b) {
+                  return std::tie(a.source, a.declarer)
+                       < std::tie(b.source, b.declarer);
+              });
+    return out;
+}
+
 // ── R1 ───────────────────────────────────────────────────────────────────────
 // Every realization names a source that EXISTS. This is the corpus-wide half;
 // the load-time half lives in `readShippedLibDescriptor` and fires on the
@@ -189,6 +263,16 @@ TEST(ShippedSourceRealization, EveryRealizationNamesAnExistingSource) {
             << "' — no readable file is there, so object format '" << c.format
             << "' would carry a DECLARED symbol with no body.";
     }
+    for (auto const& d : formatRealizedSources()) {
+        fs::path const p = (root / d.source).lexically_normal();
+        std::error_code ec;
+        EXPECT_TRUE(fs::is_regular_file(p, ec))
+            << "R1: " << d.declarer << " names '" << d.source
+            << "', which resolves to '" << p.generic_string()
+            << "' — no readable file is there, so the role would be DECLARED "
+               "with no body and every compile that lowers to it would fail to "
+               "link.";
+    }
 }
 
 // The same refusal through the ENGINE's own entry point, so the test cannot
@@ -197,8 +281,9 @@ TEST(ShippedSourceRealization, EveryRealizationNamesAnExistingSource) {
 TEST(ShippedSourceRealization, EngineAcceptsTheShippedCorpus) {
     ASSERT_FALSE(configRoot().empty());
     dss::DiagnosticReporter rep{};
+    auto const formatSources = formatRealizedSources();
     EXPECT_TRUE(dss::ffi::validateShippedSourceTree(descriptorDir(), runtimeDir(),
-                                                    rep))
+                                                    formatSources, rep))
         << "the shipped corpus does not satisfy its own refusals";
     EXPECT_EQ(rep.errorCount(), 0u);
 }
@@ -218,6 +303,9 @@ TEST(ShippedSourceRealization, EveryRuntimeFileIsNamedByADescriptor) {
     std::vector<std::string> claimed;
     for (auto const& c : allClaims())
         claimed.push_back((root / c.source).lexically_normal().generic_string());
+    // The format documents are the SECOND declarer (see `formatRealizedSources`).
+    for (auto const& d : formatRealizedSources())
+        claimed.push_back((root / d.source).lexically_normal().generic_string());
 
     std::error_code ec;
     if (!fs::is_directory(runtimeDir(), ec)) return;  // no runtime tree yet is legal
@@ -240,6 +328,7 @@ TEST(ShippedSourceRealization, EveryRuntimeFileIsNamedByADescriptor) {
         std::string const p = it->path().lexically_normal().generic_string();
         EXPECT_NE(std::find(claimed.begin(), claimed.end(), p), claimed.end())
             << "R2/R4: '" << p << "' is named by NO descriptor's 'realization' "
+               "map and by no object format's runtimeLibraries[].source, "
                "map, so nothing can ever add it to a build graph. In particular "
                "a HEADER here would sit at an INCLUDE PATH and silently shadow "
                "the descriptor a unit exists to consume.";

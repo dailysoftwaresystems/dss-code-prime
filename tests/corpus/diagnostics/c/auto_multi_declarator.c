@@ -1,10 +1,10 @@
-// C23 6.7.9p2 (D-CSUBSET-AUTO-TYPE-INFERENCE): an initializer-inferred
-// declaration shall declare EXACTLY ONE declarator — `auto a = 1, b = 2;`
-// is a constraint violation (S_AutoRequiresSingleDeclarator, unsuppressable:
-// a suppressed reject would let Pass 2's initializer backfill type each
-// declarator independently — the exact multi-declarator form the
-// constraint forbids).
+// C23 6.7.10 (D-CSUBSET-INFERRED-AUTO-REFUSES-THE-MULTI-DECLARATOR-FORM-THE-STANDARD-NAMES-A-COMMON-EXTENSION):
+// an initializer-inferred declaration may carry SEVERAL declarators, and they
+// all share ONE deduced type. What is a violation is a DISAGREEMENT between
+// them (S_AutoDeclaratorsInferDifferentTypes, unsuppressable: a suppressed
+// reject falls through to Pass 2's initializer backfill, which would type each
+// declarator independently and ship a declaration with two types).
 int main(void) {
-    auto a = 1, b = 2;
-    return a + b;
+    auto a = 1, b = 2.5;
+    return a + (int)b;
 }

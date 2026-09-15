@@ -1,0 +1,34 @@
+{
+  "$comment": "D-PP-SYNTHBUILDER-PREDEFINED-DEFINEDNESS runtime witness: ONE definedness question about a PREDEFINED macro, asked in eight spellings, each gating a quote-#include the SynthBuilder PRE-SCAN must resolve before the authoritative pass runs. PART A pins the row's own claim on `__GNUC__` (an object-like language predefine present on every target here): #ifdef / #ifndef / #elifdef / #elifndef must each agree with #if defined() / #if !defined() / #elif defined() / #elif !defined(). Two spellings disagreeing is a SILENT WRONG BRANCH, not a refusal -- the file compiles and a header takes the arm meant for another platform -- so the bare-name arm and its defined() twin are adjacent: a fixture exercising only one path cannot see the divergence. PART B pins `#undef` composition on `__declspec`, the one FUNCTION-LIKE predefine c.lang.json declares: `sbNameDefined` answers for it out of a walk over the effective predefined list (a CONFIG list no directive can subtract from) while the authoritative pass holds it in its ordinary macro table where #undef DOES erase it, so after a #undef the three NEGATIVE spellings read DEAD in the pre-scan and LIVE in the real pass -- the silently-dropped-header direction, which the authoritative pass turns into a hard P_PreprocessorIncludeError rather than a drop. __declspec is availableObjectFormats:[pe], so pe exercises the #undef-of-a-live-predefine path and elf/macho reach the same verdicts with the name absent from the start (C 6.10.5.2p2: a #undef of an undefined name is ignored) -- which keeps ONE exit code on all four targets. REFERENCES (MEASURED 2026-09-03, each probed separately): mingw-w64 gcc 13.2.0, WSL gcc 13.3.0 and clang 18.1.3 all compile and run THIS source and exit 42, and all three also run the #undef-then-#ifndef-gated-include shape over their own predefined function-like macro (mingw __declspec; WSL gcc and clang __INTMAX_C) and exit 42. MSVC 19.51.36252 (/std:clatest /Zc:preprocessor) compiles this source cleanly and exits 18, which is NOT a preprocessor disagreement: __GNUC__ is a gcc/clang-family identity macro c.lang.json declares and MSVC does not, so every PART A arm scores 0 there while PART B agrees arm for arm (6 * 3 = 18, the whole difference); MSVC was probed directly and DOES support #elifdef. PART A is therefore a pin on DSS's own configured predefine set, not a portable claim about every reference's. SCORING: each of the 14 arms contributes 1 when it matches the reference and 0 otherwise -- same direction for every arm, so they cannot cancel -- and 14 * 3 = 42; the sum reaches identity() as a function argument so the baseline arm keeps a live runtime value. RED-ON-DISABLE: dropping the `undefinedNames` guard from SynthBuilder::sbNameDefined reds the pe leg with P_PreprocessorIncludeError on the PART B negative arms; dropping the effectivePredefines arm reds the PART A bare-name arms while their defined() twins keep their verdict.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

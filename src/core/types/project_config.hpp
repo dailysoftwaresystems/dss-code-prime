@@ -200,23 +200,37 @@ struct DSS_EXPORT DependencyEntry {
 // build declares the variable it already sets, and two projects on one machine
 // can keep separate caches without either of them patching the compiler.
 //
-// ⚠ ALL THREE MEMBERS ARE REQUIRED WHEN THE OBJECT IS PRESENT, and the
-// degenerate spelling REJECTS rather than aliasing — the same rule + rationale
-// as `resolveLibraries`' object form. `{"enabled": false}` alone would mean
+// ⚠ BOTH MEMBERS ARE REQUIRED WHEN THE OBJECT IS PRESENT, and the degenerate
+// spelling REJECTS rather than aliasing — the same rule + rationale as
+// `resolveLibraries`' object form. `{"enabled": false}` alone would mean
 // exactly what OMITTING the key means, said less clearly; and a cache whose
 // location override is unnamed is environment sniffing with an extra step.
-enum class DependencyArtifactCacheEviction {
-    // Storing an entry DELETES the superseded entries that share its stem in
-    // the same directory — the discipline `runtime_object_cache.cpp`'s
-    // `pruneSupersededSiblings` already applies. Bounded disk; a rebuilt
-    // dependency leaves one current entry behind.
-    PruneSuperseded,
-    // Every entry is KEPT. Deliberately unbounded, and it is the policy a
-    // branch-switching or bisecting workflow needs: under pruning, alternating
-    // between two revisions of one dependency evicts each other's entry and
-    // both arms stay permanently cold.
-    Retain,
-};
+// ⓘ It was THREE members until the eviction policy was withdrawn, below.
+
+// ⛔ THERE IS NO EVICTION POLICY, AND `DependencyArtifactCacheEviction` IS GONE
+// [[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]]
+//
+// It had two values. `PruneSuperseded` meant *storing an entry deletes the
+// entries sharing its stem in this directory*, and `Retain` meant *keep them
+// all*. The first is not implementable: an entry with another index belongs
+// either to a superseded build or to a build running RIGHT NOW that has already
+// been handed its path and will open it later, and nothing beside the artifacts
+// distinguishes those. ✔MEASURED — two corpus examples went red on a deleted
+// `dirent-<index>.a` in cycle P66's own gate.
+//
+// ⇒ REMOVED rather than quietly defaulted to `Retain`, because a two-value
+// policy whose values cannot differ is vocabulary that lies, and a manifest key
+// with one legal value is a decision the user cannot take. The `eviction`
+// member is WITHDRAWN from the manifest, and a manifest that still names it is
+// REFUSED with that reason rather than with `unknown member` — see
+// `kWithdrawnCacheMembers` in the parser.
+//
+// ⓘ AND NOTHING IS LOST, WHICH IS WHY THIS IS A REMOVAL AND NOT A REGRESSION.
+// ✔MEASURED over a real 72,301,184-byte cache: 15,906 entry families, every one
+// holding exactly ONE entry, so a perfect prune would have reclaimed 0 bytes.
+// The branch-switching workflow `Retain` was written for is now simply how the
+// cache behaves. Reclaim is a directory deletion, and the per-user root carries
+// a build-stamp segment precisely so one version's cache is one `rm -rf`.
 
 struct DSS_EXPORT DependencyArtifactCacheConfig {
     // false ⇒ nothing is looked up and nothing is stored, exactly as if the
@@ -227,21 +241,9 @@ struct DSS_EXPORT DependencyArtifactCacheConfig {
     // Never read here — this loader touches no environment, exactly as it
     // touches no filesystem (the pure-parser rule on `parseProjectConfig`).
     std::string rootOverrideVariable;
-    DependencyArtifactCacheEviction eviction =
-        DependencyArtifactCacheEviction::PruneSuperseded;
     friend bool operator==(DependencyArtifactCacheConfig const&,
                            DependencyArtifactCacheConfig const&) = default;
 };
-
-// The accepted `eviction` tokens, and that same list comma-joined for a
-// message. Exported for the reason `projectConfigKnownKeys()` is: a test that
-// pins the reject message must not re-type the vocabulary, or the drift the
-// derivation removes reappears one layer out.
-[[nodiscard]] DSS_EXPORT std::span<std::string_view const>
-dependencyArtifactCacheEvictionTokens() noexcept;
-
-[[nodiscard]] DSS_EXPORT std::string
-dependencyArtifactCacheEvictionTokenList();
 
 struct DSS_EXPORT ProjectConfig {
     std::string              language;

@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <format>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -84,11 +85,30 @@ namespace {
 // Build the CU for one malformed corpus file, collect EVERY diagnostic
 // (parser/lexer from the trees + semantic from `analyze()`), and render
 // them to the sorted golden text. `analyze()` is run UNCONDITIONALLY,
-// including on a parse-error tree: the analyzer is defensive on partial
-// trees (it guards `!tree.root().valid()`, bounds-checks every child
-// descent, and skips trivia), so this is safe + deterministic — and it
-// is REQUIRED, because an `S_*` corpus file with a recovered `P_*` would
-// otherwise drop its semantic coverage.
+// including on a parse-error tree, and it is REQUIRED: an `S_*` corpus file
+// with a recovered `P_*` would otherwise drop its semantic coverage.
+//
+// ⚠⚠ THIS COMMENT USED TO SAY "the analyzer is defensive on partial trees … so
+// this is safe", AND THAT CLAIM WAS FALSE — measured, in this very harness.
+// `analyze()` on a RECOVERY tree reached a specifier scan that read a
+// `NodeKind::Error` node as a Token, whose debug assert ABORTED THE PROCESS
+// (`0xc0000409`, `Tree::tokenKind on non-Token node`) at the FIRST fixture, so
+// every other fixture's verdict in this binary was lost and the transcript named
+// nothing but a tree accessor. That is the P58 88-pin class, arriving through a
+// driver that asserted its own safety instead of stating what it depends on.
+// The engine defect is fixed (`forEachTokenLeafUnder` in
+// `src/analysis/semantic/semantic_analyzer.cpp`) and pinned by the corpus file
+// `attr_arg_malformed_operator_expr.c`, whose whole job is to be a recovery tree
+// this driver then analyzes.
+//
+// ★ WHAT THIS DRIVER DEPENDS ON, STATED AS A DEPENDENCY RATHER THAN A PROPERTY:
+// `analyze()` must not TERMINATE on a recovery tree. It may report anything it
+// likes — a wrong code and a wrong position are a NAMED golden mismatch for the
+// one fixture and every sibling still reports. A process-level abort is the one
+// outcome this harness cannot survive, because there is no in-process way to
+// contain one; the fixture NAME is printed BEFORE the work starts (below) so that
+// if it ever happens again the transcript says WHICH file did it instead of
+// sending the reader to `Tree::tokenKind`.
 [[nodiscard]] std::string renderDiagnosticGolden(std::string_view langName,
                                                  fs::path const&  sourceFile) {
     auto loaded = GrammarSchema::loadShipped(langName);
@@ -103,8 +123,14 @@ namespace {
     // exactly as the production driver does (Program::compileFiles). A
     // deeply-nested corpus fixture (e.g. expression_too_deeply_nested.c, whose
     // paren nest exceeds the c config cap `parser.maxExpressionDepth`
-    // = 1024 to trip the depth guard) parses a ~1024-deep tree, which would
-    // overflow this test thread's default stack if built inline.
+    // = 16384 to trip the depth guard) parses a 16460-deep tree. ★ P60 raised
+    // that cap from 1024 and regenerated the fixture with it — the corpus is
+    // parsed through the SHIPPED config, so a fixture left at the old depth
+    // stops tripping the guard and emits NOTHING
+    // (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED).
+    // The parser itself no longer holds a host frame per nesting level, but the
+    // CU is still built on the large worker stack because that is what the
+    // production driver does and the tiers behind it are not all converted.
     auto cu = dss::substrate::callOnLargeStack(
         dss::substrate::kDeepRecursionStackBytes,
         [&]() -> std::shared_ptr<CompilationUnit> {
@@ -191,6 +217,13 @@ TEST(DiagnosticCorpus, EveryMalformedFilePinsCodesAndPositions) {
         std::ranges::sort(sources);
         for (auto const& src : sources) {
             SCOPED_TRACE(src.string());
+            // Named BEFORE the work, and FLUSHED. `SCOPED_TRACE` prints only when
+            // a gtest failure is reported, which a process-level abort never is —
+            // so on an abort this line is the last thing in the transcript and it
+            // names the fixture that did it. Costs one line per fixture on a
+            // binary that already runs for ~24 s.
+            std::cout << "[corpus] " << lang << " :: "
+                      << src.filename().string() << std::endl;
             const std::string actual = renderDiagnosticGolden(lang, src);
             dss::test_support::checkGoldenText(
                 actual, fs::path{src.string() + ".diag"});

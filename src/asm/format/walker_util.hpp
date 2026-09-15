@@ -359,12 +359,133 @@ variantMatchesInst(std::span<LirOperand const>  instOps,
     // A negValue variant is ALWAYS sign-gated (it must reject a
     // non-negative operand even with no immMin/immMax bound), so consult
     // the magnitude whenever the sign axis is on OR an imm-range is declared.
-    if (v.negValue || v.immMin.has_value() || v.immMax.has_value()) {
+    if (v.negValue || v.immMin.has_value() || v.immMax.has_value()
+        || v.immMultipleOf.has_value()) {
         if (!magnitude.has_value()) return false;  // wrong sign / no operand
         if (v.immMin.has_value() && *magnitude < *v.immMin) return false;
         if (v.immMax.has_value() && *magnitude > *v.immMax) return false;
+        // [[D-ASM-ARM64-LDR-TO-LDUR-CONVENIENCE-ALIAS-REFUSED]]: the
+        // DIVISIBILITY half of the same question. `immMin`/`immMax` bound an
+        // INTERVAL; a scaled field encodes `magnitude / N` and so carries only
+        // the MULTIPLES inside one. Without this a bounded variant matches an
+        // offset its own encoder then refuses — and because election commits
+        // to an opcode, the dialect's other candidate (the unscaled form that
+        // could have carried it) is never tried. `validate()` refuses a
+        // modulus of 0 or 1, so the division is always meaningful.
+        if (v.immMultipleOf.has_value()
+            && (*magnitude % *v.immMultipleOf) != 0) {
+            return false;
+        }
     }
     return true;
+}
+
+// ★★★ WHY NO VARIANT MATCHED, WHEN THE ANSWER IS "THE VALUE".
+// [[D-ASM-ARM64-LDR-TO-LDUR-CONVENIENCE-ALIAS-REFUSED]], 2026-09-03.
+//
+// ★★ THE PROBLEM THIS SOLVES, AND IT IS A DIAGNOSTIC ONE RATHER THAN A
+// CORRECTNESS ONE. `variantMatchesInst` weighs four kinds of axis — operand
+// SHAPE, WIDTH, memory DIRECTION and the operand's VALUE — and when every
+// variant is eliminated the walkers report one sentence: *no encoding variant
+// matches this instruction's operand kinds at width N*. That sentence is TRUE
+// only when the shape or the width was the cause. When the shape and the width
+// fit and the VALUE was rejected, it names the wrong thing and drops the one
+// datum the reader needs — which value, and against which bound.
+//
+// ⚠ IT MATTERED LITTLE UNTIL THE VALUE AXES BECAME PRECISE ENOUGH TO ELIMINATE
+// A VARIANT ITS OWN SLOT WOULD HAVE EXPLAINED. Before `immMultipleOf`, a scaled
+// memory variant matched almost any offset and the refusal came from the SLOT
+// handler, which names the offset, the access size and the reach. With the
+// guard mirroring the slot, the variant is eliminated one step EARLIER and that
+// message becomes unreachable. So the axis has to carry its own explanation.
+//
+// Returns the FIRST variant that matched every non-value axis, or nullptr when
+// the shape/width/direction really were the cause (in which case the walkers'
+// existing sentence is the right one). Source/target/format-agnostic: it reads
+// the target's own guard and the LIR operand pool.
+[[nodiscard]] inline TargetEncodingVariant const*
+variantRejectedOnValueOnly(TargetOpcodeInfo const&      info,
+                           std::span<LirOperand const>  instOps,
+                           std::uint8_t                 instWidthBits,
+                           bool memoryIsDestination) noexcept {
+    for (auto const& v : info.encoding.variants) {
+        if (!v.negValue && !v.immMin.has_value() && !v.immMax.has_value()
+            && !v.immMultipleOf.has_value()) {
+            continue;  // declares no value axis; it lost on something else
+        }
+        if (v.guardWidthBits != 0 && v.guardWidthBits != instWidthBits) continue;
+        if (!operandsMatchGuard(instOps, v.operandKinds)) continue;
+        if (v.memoryDestination.has_value()
+            && *v.memoryDestination != memoryIsDestination) {
+            continue;
+        }
+        return &v;
+    }
+    return nullptr;
+}
+
+// The value the axes above were read against, as a SIGNED number — the one a
+// message should quote, because it is what the programmer or the lowering
+// wrote. `variantImmMagnitude`/`variantNegMagnitude` report unsigned
+// magnitudes per sign half, which is right for RANGE arithmetic and wrong for
+// a sentence: quoting 8 for an offset of -8 is a small lie in exactly the
+// situation a reader is already confused.
+[[nodiscard]] inline std::optional<std::int32_t>
+variantValueOperand(std::span<LirOperand const>        instOps,
+                    std::span<OperandKindFilter const> guard) noexcept {
+    for (std::size_t i = 0; i < guard.size() && i < instOps.size(); ++i) {
+        if (guard[i] == OperandKindFilter::ImmInt
+            && instOps[i].kind == LirOperandKind::ImmInt) {
+            return instOps[i].immInt32;
+        }
+        if (guard[i] == OperandKindFilter::MemOffset
+            && instOps[i].kind == LirOperandKind::MemOffset) {
+            return instOps[i].offset;
+        }
+    }
+    return std::nullopt;
+}
+
+// The sentence a value-axis rejection deserves: which value, and which of the
+// variant's own declared bounds it fell outside. Built entirely from the
+// target's declared numbers, so it stays true for any target that keys on them.
+[[nodiscard]] inline std::string
+describeValueAxisRejection(TargetEncodingVariant const& v,
+                           std::int32_t                 value) {
+    if (v.immMultipleOf.has_value()
+        && value >= 0
+        && (static_cast<std::uint32_t>(value) % *v.immMultipleOf) != 0) {
+        return std::format(
+            "{} is not a multiple of the {}-byte access size this encoding "
+            "scales by, so it has no representation in the scaled field",
+            value, *v.immMultipleOf);
+    }
+    if (value < 0 && !v.negValue) {
+        return std::format(
+            "{} is negative and this encoding's field is unsigned", value);
+    }
+    // The mirror of the line above, and it is stated rather than left to the
+    // fallthrough: a `negValue` variant serves the NEGATIVE half of the value
+    // line only, so a non-negative operand reaching it has the wrong SIGN, not
+    // a value out of range. Saying "outside the declared range" there would
+    // send a reader hunting for a bound that is not the problem.
+    if (value >= 0 && v.negValue) {
+        return std::format(
+            "{} is non-negative and this encoding carries only negative values",
+            value);
+    }
+    auto const magnitude = static_cast<std::uint32_t>(
+        value < 0 ? -static_cast<std::int64_t>(value) : value);
+    if (v.immMin.has_value() && magnitude < *v.immMin) {
+        return std::format("{} is below this encoding's reach (from {})",
+                           value, *v.immMin);
+    }
+    if (v.immMax.has_value() && magnitude > *v.immMax) {
+        return std::format("{} is past this encoding's reach (up to {})",
+                           value, *v.immMax);
+    }
+    return std::format("{} is outside this encoding's declared value range",
+                       value);
 }
 
 // Read 4 little-endian bytes as a uint32. Caller guarantees the

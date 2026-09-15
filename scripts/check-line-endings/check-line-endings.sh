@@ -92,6 +92,301 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # the wrong file (or "missing"), which is the failure this mode exists to end.
 INVOKED_FROM="$(pwd -P)"
 
+# ── A GUARD THAT CAN HANG FOREVER IS INDISTINGUISHABLE FROM SLOW WORK ──────
+#
+# ★★★ D-GATE-LINE-ENDINGS-GUARD-CAN-WAIT-FOREVER-WITHOUT-NAMING-ITS-SUBJECT.
+# ✔REPORTED 2026-09-07 (P63): THREE ctest runs on this workstation hung — 65 min,
+# 11 min, and a whole-tree gate stalled at 898/2109 — with ctest and its children
+# at ZERO CPU delta. Twice the hung child was THIS GUARD (its `.ps1` twin) with a
+# hung `git rev-parse`, while `git` itself answered the same query by hand in
+# 29 ms. Three gate runs were voided and none of them said why.
+#
+# ⚠⚠ THE MECHANISM IS **NOT** ROOT-CAUSED, AND THIS BLOCK DOES NOT CLAIM TO FIX
+# IT. ✔MEASURED 2026-09-07, TWO reproduction probes in a lane worktree: 48 runs
+# at 12-way concurrency (4800–7821 ms) and 48 runs at 8-way concurrency BESIDE
+# six endless `git status` / `rev-parse` / `ls-files --eol` loops against the same
+# gitdir (9966–23218 ms). **96 runs, zero hangs, zero non-zero exits.** So the
+# hang did not reproduce, nothing below is a diagnosis, and a future reader must
+# not read this as one.
+#
+# ★★ WHAT IT DOES INSTEAD IS THE PART THAT IS ALWAYS TRUE: a wait with no bound
+# cannot be told apart from work that is merely slow, and this project has paid
+# for that ambiguity twice in one cycle. A BOUNDED wait that NAMES ITS SUBJECT
+# converts an invisible stall into a readable red — worth having whether or not
+# the underlying cause is ever found.
+#
+# ⓘ THE BUDGET IS NOT A TUNING KNOB AND IS DELIBERATELY NOT SETTABLE. ✔MEASURED
+# on this workstation: this guard costs 3970/4018/3987 ms on a quiet tree, and
+# 23218 ms at its worst under deliberate git-lock contention. 600 s is 26× that
+# worst case, so it cannot red honest work, and it still turns a 65-minute stall
+# into a 10-minute diagnosis. An environment variable here would be an escape
+# every caller sets — the shape that made a P56 guard refuse nothing at all —
+# and "wait longer" is never the remedy for a wait that has no end.
+#
+# ★ COST TO THE COMMON CASE: one `mktemp`, one background subshell, and one
+# small write per git query. The watchdog polls with `sleep 5`, so it is asleep
+# essentially the whole time. Nothing is skipped and no check is weakened.
+#
+# ⚠⚠ 600 → 90 IN P64, AND THE REASONING ABOVE IS AMENDED RATHER THAN REPLACED.
+# Everything it says stands; what changed is that the bound stopped being
+# hypothetical. ✔MEASURED P64: the hang FIRES ROUTINELY — a lane hit it on 3 of 3
+# attempts, both twins, and paid 600 s twice per gate. A budget is only free while
+# nothing reaches it. 90 s is still ~4× the 23218 ms worst case that paragraph
+# measured under deliberate git-lock contention, and ~34× the 2.6 s this guard
+# actually costs under `ctest` on a quiet tree — so it still cannot red honest
+# work, and it turns a 20-minute tax per lane into a 3-minute one.
+#
+# ⚠ THE MECHANISM IS STILL NOT DIAGNOSED, AND TWO PLAUSIBLE CAUSES ARE NOW
+# REFUTED — recorded so the next reader does not re-walk them:
+#   * NOT the `pwsh` binary. `find_program` resolves `POWERSHELL_EXE` to the
+#     .NET-TOOL SHIM (`~/.dotnet/tools/pwsh.exe`), which spawns
+#     dotnet → pwsh.dll → the real pwsh.exe — a three-process chain that looks
+#     exactly like a deadlock waiting to happen. ✔MEASURED: FOUR concurrent runs
+#     of this script finish in 5 s on the shim and 3 s on the real binary. Both
+#     fine.
+#   * NOT `git` contention across linked worktrees. All five trees share one
+#     `.git`, so concurrent `git ls-files --eol` was the obvious suspect.
+#     ✔MEASURED: five trees serially = 2 s, five trees AT ONCE = 1 s, every rc 0.
+#   * NOT host load, and this one refutes a guess of MINE rather than a lane's.
+#     ✔MEASURED by an independent P64 reviewer running these guards with TWO
+#     sibling ctest runs live — heavier load than any hang was seen under — and
+#     both PASSED, in 3.22 s and 7.85 s. ⇒ It is INTERMITTENT (3 of 4 across the
+#     cycle, not the 3-of-3 a single lane reported), and "more load" does not
+#     make it likelier. An earlier draft of this very paragraph said "FIRES
+#     ROUTINELY" and implied a load correlation; that is corrected here rather
+#     than quietly reworded, because a wrong lead costs the next reader more than
+#     no lead.
+#   * NOT a slow `git rev-parse`, and this refutes the lead THIS COMMENT used to
+#     give. ✔MEASURED P64: a lane hit the timeout twice in one run and the guard
+#     was stalled at TWO DIFFERENT activities, not both at the same query. An
+#     earlier draft here said "the stall is ON a `git rev-parse` the guard NAMES"
+#     and pointed the next probe at that query; one observation of one activity is
+#     not a pattern, and the second observation broke it. Recorded rather than
+#     reworded, because a confident wrong lead costs the next reader more than an
+#     honest absence of one.
+#   ⓘ What is left, and what the next probe should start from: it reproduces only
+#   under `ctest` (alone under ctest, on a quiet tree, it passes in 2.6 s), parent
+#   and child both sit at ~0 CPU, it is INTERMITTENT rather than load-driven, and
+#   the POSIX twin has been seen to pass in the same conditions the PowerShell twin
+#   hung in. A blocked pipe under ctest's own output capture fits all of those and
+#   is activity-INDEPENDENT, which the two-different-activities observation now
+#   favours; a file redirect — which is what both probes above used — would never
+#   show it.
+_LE_WATCHDOG_BUDGET=90
+_le_watchdog_pid=""
+_le_activity_file=""
+_le_started_at="$(date +%s 2>/dev/null || echo 0)"
+
+# WHAT THE GUARD IS DOING RIGHT NOW, in one line, for the watchdog to read. It is
+# a FILE and not a variable because the watchdog is a separate process — and it
+# has to be, since a shell runs no trap while it is blocked inside a child.
+_le_note() {
+    [[ -n "${_le_activity_file}" ]] && printf '%s\n' "$*" > "${_le_activity_file}" 2>/dev/null
+    return 0
+}
+
+# pid/ppid pairs, portably. ⚠ MSYS `ps` has NO `-o` (✔MEASURED: `ps: unknown
+# option -- o`), so the fallback reads its fixed columns; Linux and macOS take
+# the first form. The EMPTY OUTPUT is the discriminator, not an exit code —
+# MSYS's `ps` prints its usage to stderr and still exits 0.
+# ⚠⚠ AND IT IS BEST-EFFORT ON WINDOWS, ✔MEASURED 2026-09-07: MSYS `ps -e` reports
+# **PPID 1** for most `bash` processes on this host, because the parent is not an
+# MSYS process (or the `/bin/bash` -> `/usr/bin/bash` re-exec loses the link). So
+# the descendant sweep below can come back EMPTY even when children exist. That is
+# why it is not load-bearing: the bound is enforced by the TERM/KILL escalation and
+# by keeping every wait in SHORT SLICES so a trap is never deferred for long.
+_le_process_pairs() {
+    local _out
+    _out="$(ps -eo pid=,ppid= 2>/dev/null)"
+    [[ -n "${_out}" ]] || _out="$(ps -e 2>/dev/null | awk 'NR > 1 { print $1, $2 }')"
+    printf '%s\n' "${_out}"
+}
+
+# Everything below a pid, COLLECTED FIRST and killed after — killing a generation
+# before enumerating the next one loses the grandchildren to reparenting.
+_le_descendants_of() {   # <root-pid> -> the pids below it, one per line
+    local _root="$1" _pairs _gen _next _p _c _depth=0
+    _pairs="$(_le_process_pairs)"
+    _gen="${_root}"
+    while [[ -n "${_gen}" && "${_depth}" -lt 8 ]]; do
+        _next=""
+        for _p in ${_gen}; do
+            for _c in $(printf '%s\n' "${_pairs}" | awk -v pp="${_p}" '$2 == pp { print $1 }'); do
+                _next="${_next} ${_c}"
+                printf '%s\n' "${_c}"
+            done
+        done
+        _gen="${_next}"
+        _depth=$((_depth + 1))
+    done
+}
+
+# ⚠⚠ THE SPARE PID IS LOAD-BEARING AND IT COST A MEASUREMENT TO FIND. The
+# watchdog IS a descendant of the process it is watching, so a sweep of
+# "everything below `$_main`" includes THE WATCHDOG ITSELF and the `sleep` it is
+# running. ✔MEASURED 2026-09-07 under ctest: the watchdog printed its refusal,
+# SIGKILLed itself in the very next statement, and therefore never sent the TERM
+# or reached its `kill -9` escalation — so the run it was bounding carried on,
+# and the entry took 47 s instead of 6 while every assertion about the MESSAGE
+# still passed. A bound that prints and does not terminate is the same class of
+# instrument-that-answers-an-adjacent-question this file already documents.
+_le_kill_descendants() {   # <root-pid> <spare-pid: it and its subtree are left alone>
+    local _root="$1" _spare="${2:-}" _all _spared="" _c
+    _all="$(_le_descendants_of "${_root}")"
+    if [[ -n "${_spare}" ]]; then
+        _spared=" ${_spare} $(_le_descendants_of "${_spare}" | tr '\n' ' ') "
+    fi
+    for _c in ${_all}; do
+        case "${_spared}" in *" ${_c} "*) continue ;; esac
+        kill -9 "${_c}" 2>/dev/null
+    done
+    return 0
+}
+
+# The main line exits 2 — "could not be measured" — which is this guard's
+# existing meaning for every question it was unable to answer. The DIAGNOSTIC is
+# printed by the watchdog, because by then the main line is not running.
+_le_on_watchdog_term() {
+    exit 2
+}
+
+_le_start_watchdog() {
+    local _main=$$ _file="${_le_activity_file}" _budget="${_LE_WATCHDOG_BUDGET}" _t0="${_le_started_at}"
+    (
+        _waited=0
+        while [[ "${_waited}" -lt "${_budget}" ]]; do
+            kill -0 "${_main}" 2>/dev/null || exit 0
+            sleep 1
+            _waited=$((_waited + 1))
+        done
+        kill -0 "${_main}" 2>/dev/null || exit 0
+        _now="$(date +%s 2>/dev/null || echo 0)"
+        {
+            echo "line-endings: FAIL — TIMED OUT after ${_budget}s. This guard was still waiting, so it"
+            echo "  measured NOTHING and its silence must not be read as a clean tree."
+            echo "  it was waiting on : $(cat "${_file}" 2>/dev/null || echo '<no activity recorded>')"
+            echo "  elapsed           : $(( _now - _t0 ))s since the guard started"
+            echo "  ⚠ A hang is indistinguishable from slow work, which is why this is a RED and not a"
+            echo "    longer wait. ✔REPORTED 2026-09-07: three ctest runs on this host hung with every"
+            echo "    process at ZERO CPU, twice with this guard's .ps1 twin stuck on a \`git\` query that"
+            echo "    answered by hand in 29 ms. The mechanism is NOT root-caused; this bound only makes"
+            echo "    it visible. Re-run once — if it recurs at the same activity, say so in the row."
+        } >&2
+        # Unblock the main line by killing what it is waiting ON — but NEVER this
+        # watchdog's own subtree, or it dies here and the escalation below never
+        # runs. Then let the main line's own TERM handler set the exit code.
+        _le_kill_descendants "${_main}" "${BASHPID:-$$}"
+        kill -TERM "${_main}" 2>/dev/null
+        _le_grace=15
+        while [[ "${_le_grace}" -gt 0 ]] && kill -0 "${_main}" 2>/dev/null; do
+            sleep 1; _le_grace=$((_le_grace - 1))
+        done
+        kill -0 "${_main}" 2>/dev/null && kill -9 "${_main}" 2>/dev/null
+        exit 0
+    ) &
+    _le_watchdog_pid=$!
+}
+
+_le_cleanup() {
+    [[ -n "${_le_watchdog_pid}" ]] && kill "${_le_watchdog_pid}" 2>/dev/null
+    [[ -n "${_le_activity_file}" ]] && rm -f "${_le_activity_file}" 2>/dev/null
+    return 0
+}
+
+# ⚠ NOT `mktemp`. ✔MEASURED 2026-09-07: the first version of this block armed the
+# watchdog only `[[ -n "$(mktemp)" ]]`, and under ctest the child probe ran for
+# 604 s with NO watchdog and NO word about it — a bound that silently did not
+# exist, which is the "fails toward clean" direction this project treats as the
+# dangerous one. The path is now built in the shell (no external binary can fail
+# it), the watchdog is armed WHETHER OR NOT the file could be created, and the
+# absence of an activity file is SAID OUT LOUD instead of disarming the bound.
+_le_activity_file=""
+for _le_tmp_root in "${TMPDIR:-}" /tmp "${TEMP:-}" "${TMP:-}"; do
+    [[ -n "${_le_tmp_root}" && -d "${_le_tmp_root}" ]] || continue
+    _le_cand="${_le_tmp_root}/dss-le-activity-$$.txt"
+    if { : > "${_le_cand}"; } 2>/dev/null; then _le_activity_file="${_le_cand}"; break; fi
+done
+trap '_le_cleanup' EXIT
+trap '_le_on_watchdog_term' TERM
+# ⚠ READ BEFORE THE WATCHDOG STARTS, because it decides that watchdog's budget.
+# ★ `--watchdog-probe` IS NOT AN ESCAPE HATCH, AND THE REASON IS DIRECTIONAL: the
+# mode performs NO CHECK AT ALL — it starts a watchdog, records a synthetic
+# activity, and waits to be killed — and it CANNOT EXIT 0 by any path. So it is a
+# way to run NOTHING with a chosen budget, never a way to run the GUARD with a
+# longer one. The real budget stays a constant nobody can set.
+case "${1:-}" in
+    --watchdog-probe) _LE_WATCHDOG_BUDGET="${2:-5}" ;;
+esac
+_le_note "starting up (no query issued yet)"
+if [[ -z "${_le_activity_file}" ]]; then
+    # LOUD, never silent: the bound still applies, but its message will not be
+    # able to name a subject. A guard that quietly loses half a mechanism is the
+    # failure class this whole file is about.
+    echo "line-endings: NOTE — no writable temp directory was found, so the timeout can bound this" >&2
+    echo "    run but cannot NAME what it was waiting on. Tried: TMPDIR, /tmp, TEMP, TMP." >&2
+fi
+_le_start_watchdog
+
+# ── PROVING THE BOUND — a watchdog nobody has watched fire is a comment ─────
+# ★★ SYNTHESIZES THE NEGATIVE, like every other arm in this file: the probe
+# genuinely hangs and the arm asserts it is CUT SHORT and NAMED. A fixture that
+# ran a fast command and asserted it finished would stay green forever after the
+# watchdog stopped working.
+# ⓘ It is a SEPARATE ENTRY POINT and NOT part of `--selftest`, deliberately:
+# `--selftest` runs on every single invocation of this guard on every leg, and a
+# proof that necessarily costs a real timeout has no business in that path.
+# ✔MEASURED: the guard costs ~4 s; this arm costs ~10 s and runs as its own ctest
+# entry (`line_endings_watchdog_guard`), in parallel with everything else.
+_run_watchdog_selftest() {
+    local _fail=0 _t0 _t1 _rc _out _elapsed _ctl
+    _out="$(mktemp 2>/dev/null)" || { echo "line-endings: FAIL — watchdog selftest cannot mktemp" >&2; return 2; }
+    _ctl="$(mktemp 2>/dev/null)" || { echo "line-endings: FAIL — watchdog selftest cannot mktemp" >&2; return 2; }
+
+    # ARM W1 — THE NEGATIVE: a run that never finishes must be CUT SHORT.
+    _t0="$(date +%s)"
+    bash "${BASH_SOURCE[0]}" --watchdog-probe 5 >"${_out}" 2>&1
+    _rc=$?
+    _t1="$(date +%s)"
+    _elapsed=$(( _t1 - _t0 ))
+    if [[ "${_rc}" -eq 0 ]]; then
+        echo "line-endings: FAIL — watchdog selftest: the hanging probe exited 0. The bound did not hold." >&2; _fail=1
+    fi
+    # ARM W2 — and it must be cut short WITHIN the bound, not merely eventually.
+    if [[ "${_elapsed}" -gt 60 ]]; then
+        echo "line-endings: FAIL — watchdog selftest: a 5 s budget took ${_elapsed}s to fire." >&2; _fail=1
+    fi
+    # ARM W3 — the refusal must NAME the timeout...
+    if ! grep -q 'TIMED OUT after 5s' "${_out}"; then
+        echo "line-endings: FAIL — watchdog selftest: the refusal never said it timed out." >&2
+        sed 's/^/    /' "${_out}" >&2; _fail=1
+    fi
+    # ARM W4 — ...and NAME WHAT IT WAS WAITING ON. A bounded wait that cannot say
+    # its subject is only marginally better than an unbounded one.
+    if ! grep -q 'it was waiting on : SYNTHETIC watchdog probe' "${_out}"; then
+        echo "line-endings: FAIL — watchdog selftest: the refusal did not name the activity it was waiting on." >&2
+        sed 's/^/    /' "${_out}" >&2; _fail=1
+    fi
+    # ARM W5 — THE CONTROL, named: an ordinary run under the REAL budget must
+    # still finish and still pass. Without it, "the probe died" is equally
+    # consistent with "this watchdog now kills everything".
+    printf 'a\nb\n' > "${_ctl}"
+    _t0="$(date +%s)"
+    if ! bash "${BASH_SOURCE[0]}" --files "${_ctl}" >/dev/null 2>&1; then
+        echo "line-endings: FAIL — watchdog selftest CONTROL: an ordinary --files run over a clean file did not pass." >&2; _fail=1
+    fi
+    _elapsed=$(( $(date +%s) - _t0 ))
+    if [[ "${_elapsed}" -gt 60 ]]; then
+        echo "line-endings: FAIL — watchdog selftest CONTROL: an ordinary run took ${_elapsed}s; the watchdog is interfering with honest work." >&2; _fail=1
+    fi
+    rm -f "${_out}" "${_ctl}"
+    if [[ "${_fail}" -ne 0 ]]; then
+        echo "line-endings: FAIL — the WATCHDOG self-test failed (above)." >&2
+        return 2
+    fi
+    echo "line-endings: watchdog OK (5 arms: a hanging probe was cut short inside its budget, the refusal named the timeout AND its subject, and a named CONTROL run still passed)"
+    return 0
+}
+
 # ── THE ONE ROOT, AND ONE GIT THAT CAN SEE IT ─────────────────────────────
 # ⛔ D-SCRIPT-GUARDS-ASK-GIT-FROM-THE-LANE-WORKTREE. This guard used a BARE `git`,
 # which cannot describe a Windows-created lane worktree from the POSIX namespace:
@@ -128,7 +423,11 @@ INVOKED_FROM="$(pwd -P)"
 # _le_git <git-arg>...
 # ★ EVERY git query in this file goes through here, so the ENUMERATION ROOT is
 # the tree this script lives in, by construction rather than by remembering.
-_le_git() { leg_tree_driver_git "${REPO_ROOT}" "$@"; }
+# ⓘ THE ONE FUNNEL, so recording WHAT THE GUARD IS WAITING ON costs one line and
+# cannot be forgotten at a call site. ⚠ The `git` child is actually launched by
+# `leg_tree_driver_git` in `scripts/leg-tree/leg-tree.sh`, which this lane does
+# not own; the note is taken HERE, where the query is asked.
+_le_git() { _le_note "git $*  (via leg_tree_driver_git)"; leg_tree_driver_git "${REPO_ROOT}" "$@"; }
 
 # ⚠ RESOLVED HERE, ABOVE THE ARGUMENT DISPATCH, not down in the preconditions.
 # `--selftest` and `--audit-instruments` both ask git and both run BEFORE the main
@@ -136,6 +435,7 @@ _le_git() { leg_tree_driver_git "${REPO_ROOT}" "$@"; }
 # `git -C` — i.e. still broken in exactly the namespace this row is about, while
 # the default mode looked fixed. The loud refusal stays in the preconditions; this
 # line only makes the answer available to every entry point.
+_le_note "leg_tree_driver_identity: resolving which tree this guard is standing in (runs git rev-parse inside scripts/leg-tree/leg-tree.sh)"
 leg_tree_driver_identity "${REPO_ROOT}" || true
 
 # ── THE ONE CORRECT INSTRUMENT ────────────────────────────────────────────
@@ -193,7 +493,15 @@ check-line-endings.sh — the LF-contract guard, and the repo's CR instrument.
   --files-from FILE   The same, one path per line (`-` reads stdin).
   --audit-instruments Run Check F alone.
   --selftest          Run the self-test alone.
+  --selftest-watchdog Prove the timeout: hang on purpose, assert the guard is
+                      cut short inside its budget and NAMES what it waited on,
+                      and take a control run that still passes. Its own ctest
+                      entry, because it necessarily costs a real timeout.
   --help              This text.
+
+★ THIS GUARD IS BOUNDED. It gives up after 600 s and reds, naming the query it
+was waiting on. A hang cannot be told apart from slow work, and three ctest runs
+on this workstation were voided by exactly that ambiguity on 2026-09-07.
 
 ★ WHY `--files` EXISTS. Until 2026-08-27 this guard answered exactly one
 question — "is the whole repo clean?" — and took no arguments. A lane holding
@@ -419,6 +727,25 @@ case "${1:-}" in
         _run_files_mode "${_kept[@]+"${_kept[@]}"}"; exit $? ;;
     --audit-instruments) cd "${REPO_ROOT}"; _run_instrument_audit; exit $? ;;
     --selftest)          cd "${REPO_ROOT}"; _run_selftest; exit $? ;;
+    --selftest-watchdog) cd "${REPO_ROOT}"; _run_watchdog_selftest; exit $? ;;
+    --watchdog-probe)
+        # INTERNAL, and it can never report a clean tree: it checks NOTHING and
+        # has no path that exits 0. Either the watchdog kills it (exit 2 through
+        # the TERM handler) or the wait runs out and it refuses below.
+        _le_note "SYNTHETIC watchdog probe — this run checks nothing and is waiting to be killed"
+        # ⚠ BOUNDED BY CONSTRUCTION, and in ONE-SECOND SLICES. ✔MEASURED
+        # 2026-09-07: an earlier `sleep 3600` here left an ORPHANED `sleep.exe`
+        # holding ctest's output pipe after ctest itself had finished — the
+        # reader then waited with every process at ZERO CPU, which is the exact
+        # shape of the hang this whole block exists to make visible. Short slices
+        # also mean a TERM is never deferred behind a long foreground child, so
+        # the trap that sets exit 2 actually runs.
+        _le_probe_left=$(( _LE_WATCHDOG_BUDGET * 3 + 30 ))
+        while [[ "${_le_probe_left}" -gt 0 ]]; do sleep 1; _le_probe_left=$((_le_probe_left - 1)); done
+        echo "line-endings: FAIL — the watchdog did NOT fire within its budget; the bound is not holding." >&2
+        echo "    budget was ${_LE_WATCHDOG_BUDGET}s and this probe waited $(( _LE_WATCHDOG_BUDGET * 3 + 30 ))s." >&2
+        echo "    activity file: ${_le_activity_file:-<none could be created>}" >&2
+        exit 2 ;;
     "")                  : ;;
     *) echo "line-endings: FAIL — unknown argument '$1' (see --help)" >&2; exit 2 ;;
 esac

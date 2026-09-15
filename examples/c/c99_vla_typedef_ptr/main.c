@@ -24,7 +24,10 @@
 //     assigned afterwards — the spelling D-CSUBSET-VLA-PTR-INIT-FORM-TYPING once
 //     deferred and which must keep working through the typedef composition too.
 //
-// main is a LEAF (no calls) — the C1b VLA frame-model scope. `volatile` defeats
+// main is a LEAF (no calls). ⚠ "The C1b VLA frame-model scope" was leaf-ONLY and that
+// boundary is GONE since 2026-09-04 (P59): the non-leaf VLA frame model shipped and
+// D-CSUBSET-VLA-NONLEAF-CALL-FRAME is CLOSED. Still a leaf, now by CHOICE, so this
+// example's subject stays independent of that model. `volatile` defeats
 // const-folding so the bound is genuinely runtime. Each `return k` is a strict
 // in-program pin; only all-pass reaches 42.
 //

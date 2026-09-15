@@ -2576,6 +2576,88 @@ TEST(SynthSehFunclets, ExtractsFilterFuncletAndStubsParent) {
     EXPECT_TRUE(verifier.verify(rep)) << "the SEH-lowered module must verify";
 }
 
+// D-MIR-ADDINST-ADMITS-BLOCKADDRESS-WITH-A-FORWARDED-BLOCK-ID, the SIXTH
+// verbatim-copy site — and the one that was protected by NOTHING.
+//
+// This pass CLONES the filter block's instructions into a SEPARATE funclet
+// function, so its `default:` arm forwards `mir.instPayload(oldId)` into a
+// destination whose blocks are entirely different ones. Every other copy site
+// either has a `BlockAddress` re-mapping arm (`mir_rebuild_helper`,
+// `MultiBlockInliner::emitCallerInst`, `FunctionCloner`) or is kept away from the
+// opcode by a gate (`emitCalleeInst` by `inlineLegalityGate`, LICM's hoist by the
+// leaf-exclusion list). This one had neither: `__except(f(&&L))` reached the
+// verbatim clone and published a parent block id as a funclet block address.
+//
+// A re-map is not merely missing here, it is not MEANINGFUL — the funclet is a
+// different function and a parent block has no counterpart in it — so the answer
+// is a REPORTED refusal rather than an arm. `MirBuilder::addInst` now also refuses
+// the opcode outright, but reaching THAT would abort the compiler on valid C,
+// which is why this arm exists ahead of it.
+//
+// RED-ON-DISABLE: delete the `case MirOpcode::BlockAddress:` arm in
+// `synth_seh_funclets.cpp` and this dies on `addInst`'s dedicated-builder abort
+// instead of returning false — i.e. the test crashes rather than failing, which is
+// itself the demonstration that the backstop is real and that the arm is what
+// turns it into a diagnostic.
+TEST(SynthSehFunclets, LabelAddressInAFilterExpressionIsRefusedNotCloned) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32  = in.primitive(TypeKind::I32);
+    TypeId const u32  = in.primitive(TypeKind::U32);
+    TypeId const pI32 = in.pointer(i32);
+    TypeId const vptr = in.pointer(in.primitive(TypeKind::Void));
+    TypeId const sig  = in.fnSig({}, i32, CallConv::CcMS64);
+
+    MirBuilder mb;
+    mb.addFunction(sig, SymbolId{100});
+    MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tryBB    = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const filterBB = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const handlerBB= mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const joinBB   = mb.createBlock(StructCfMarker::Linear);
+    std::uint32_t const region = 0;
+
+    mb.beginBlock(entry);
+    mb.addSehTryBegin(tryBB, filterBB, region);
+
+    mb.beginBlock(tryBB);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pI32, 4);
+    (void)mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{slot}, i32);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, region);
+    mb.addBr(joinBB);
+
+    mb.beginBlock(filterBB);
+    // `&&join` INSIDE the filter expression — the whole point of the fixture. It is
+    // built through the sanctioned `addBlockAddress`, exactly as HIR→MIR would; what
+    // is under test is what the funclet CLONER does with it afterwards.
+    (void)mb.addBlockAddress(joinBB, vptr);
+    MirInstId const code = mb.addInst(MirOpcode::SehExceptionCode, {}, u32);
+    MirLiteralValue av; av.value = std::int64_t{0xC0000005}; av.core = TypeKind::U32;
+    MirInstId const avc = mb.addConst(std::move(av), u32);
+    MirInstId const cmp = mb.addInst(MirOpcode::ICmpEq,
+                                     std::array<MirInstId, 2>{code, avc}, i32);
+    mb.addSehFilterReturn(cmp, handlerBB, region);
+
+    mb.beginBlock(handlerBB);
+    mb.addBr(joinBB);
+    mb.beginBlock(joinBB);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    Mir mir = std::move(mb).finish();
+
+    std::vector<ExternImport> ext;
+    std::vector<MirSehScope>  scopes;
+    DiagnosticReporter        rep;
+    EXPECT_FALSE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                       CSymbolDecorationScheme::None,
+                                       "pe64-x86_64-windows-exec", scopes, rep))
+        << "a parent block address cannot be carried into a funclet";
+    EXPECT_GT(rep.errorCount(), 0u) << "and the refusal must be REPORTED, not silent";
+    bool named = false;
+    for (auto const& d : rep.all())
+        if (d.actual.find("address of a label") != std::string::npos) named = true;
+    EXPECT_TRUE(named)
+        << "the diagnostic must name the construct, not just fail generically";
+}
+
 TEST(SynthSehFunclets, NoSehIsANoOp) {
     TypeInterner in{CompilationUnitId{1}};
     TypeId const i32 = in.primitive(TypeKind::I32);
@@ -2771,6 +2853,208 @@ TEST(SynthSehFunclets, MultiBlockGuardedBodyIsContiguousAndBounded) {
     rederiveStructCfMarkers(mir);
     MirVerifier verifier{mir, &in};
     EXPECT_TRUE(verifier.verify(rep)) << "the multi-block SEH-lowered module must verify";
+}
+
+// D-MIR-SYNTH-PASSES-UNVERIFIED-ON-SINGLE-CU-PATH — a SEH parent whose
+// StructCfMarkers are ORDER-SENSITIVE: the only shape the region-contiguity
+// relayout can actually invalidate, and therefore the only shape that can pin
+// the pass's duty to re-derive them.
+//
+// ★ WHY A SECOND MULTI-BLOCK FIXTURE, AND WHY IT LOOKS CONTRIVED.
+// `buildSehParentMultiBlockBody` above is a diamond, and ✔MEASURED (cycle P63)
+// the relayout leaves ITS markers canonical: the derivation is a function of the
+// CFG — predecessors, RPO, dominators, post-dominators — and a pure REORDER
+// changes no edge. The whole `__try` corpus behaves the same way; every
+// `examples/c/seh_*` arm stays green with the pass's re-derivation removed. So
+// none of them can pin it, and the row that demanded this work asserted the
+// opposite ("the gate reds on every `__try` TU") from a grep that was never run.
+//
+// What CAN go stale is the ONE part of the derivation that reads block ORDER:
+// rules 4 and 5 iterate in FUNCTION BLOCK ORDER and claim FIRST-CLAIM-WINS, so a
+// block that two different CondBr heads would label differently is decided by
+// whichever head comes first. This fixture builds exactly that block, then makes
+// the relayout move one head past the other:
+//
+//   entry : SehTryBegin(0) → [tryBB, filterBB]
+//   tryBB : Br → bBB                              (region body, created 2nd)
+//   h2BB  : CondBr → [jBB, cBB]                   (NOT in the region, created 3rd)
+//   bBB   : SehTryEnd(0); CondBr → [xBB, jBB]     (region body, created 4th)
+//   xBB   : Br → h2BB     jBB : return 0     cBB : return 1
+//
+// `jBB` is `succs[1]` of bBB and `succs[0]` of h2BB, and NEITHER head
+// post-dominates through it (cBB returns), so both ipdoms are the virtual exit
+// and each head claims jBB for a DIFFERENT arm: h2BB says IfThen, bBB says
+// IfElse. Before the pass the block order is (… h2BB, bBB …) so h2BB claims
+// first and jBB is IfThen. The relayout pulls the region body — tryBB and bBB —
+// together, which moves bBB IN FRONT of h2BB, and the same derivation then
+// answers IfElse. The rebuild copies the OLD marker onto the new block, so
+// unless the pass re-derives, the module ships a marker its own verifier
+// rejects — and since the post-synthesis verify now runs BEHIND this pass, that
+// stale marker is a compile REFUSAL on a user's `__try` program rather than an
+// invisible inconsistency.
+Mir buildSehParentOrderSensitiveMarkers(TypeInterner& in, SymbolId sym) {
+    TypeId const i32   = in.primitive(TypeKind::I32);
+    TypeId const u32   = in.primitive(TypeKind::U32);
+    TypeId const pI32  = in.pointer(i32);
+    TypeId const boolTy = in.primitive(TypeKind::Bool);
+    TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
+    MirBuilder mb;
+    mb.addFunction(sig, sym);
+    // ⚠ CREATION ORDER IS THE EXPERIMENT. `h2BB` is deliberately created BETWEEN
+    // the region's two body blocks — which is not perversity but the state the
+    // pass's own contract describes: after the optimizer the block list is in RPO
+    // and "can interleave the join/handler between body blocks (empirically
+    // observed)", which is the reason the relayout exists at all.
+    MirBlockId const entry     = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tryBB     = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const h2BB      = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const bBB       = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const filterBB  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const handlerBB = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const xBB       = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const jBB       = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const cBB       = mb.createBlock(StructCfMarker::Linear);
+    std::uint32_t const region = 0;
+
+    mb.beginBlock(entry);
+    mb.addSehTryBegin(tryBB, filterBB, region);
+
+    mb.beginBlock(tryBB);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pI32, 4);
+    (void)mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{slot}, i32);
+    mb.addBr(bBB);
+
+    // The competing head, OUTSIDE the guarded region (reached only from xBB,
+    // which the region's fall-through exit branches to).
+    mb.beginBlock(h2BB);
+    MirInstId const h2v   = mb.addInst(MirOpcode::Load,
+                                       std::array<MirInstId, 1>{slot}, i32);
+    MirInstId const h2z   = mb.addConst(i32Lit(0), i32);
+    MirInstId const h2cnd = mb.addInst(MirOpcode::ICmpNe,
+                                       std::array<MirInstId, 2>{h2v, h2z}, boolTy);
+    mb.addCondBr(h2cnd, jBB, cBB);
+
+    // The guarded body's fall-through exit — and the second competing head.
+    mb.beginBlock(bBB);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, region);
+    MirInstId const bv   = mb.addInst(MirOpcode::Load,
+                                      std::array<MirInstId, 1>{slot}, i32);
+    MirInstId const bz   = mb.addConst(i32Lit(0), i32);
+    MirInstId const bcnd = mb.addInst(MirOpcode::ICmpNe,
+                                      std::array<MirInstId, 2>{bv, bz}, boolTy);
+    mb.addCondBr(bcnd, xBB, jBB);
+
+    mb.beginBlock(filterBB);
+    MirInstId const code = mb.addInst(MirOpcode::SehExceptionCode, {}, u32);
+    MirLiteralValue av; av.value = std::int64_t{0xC0000005}; av.core = TypeKind::U32;
+    MirInstId const avc = mb.addConst(std::move(av), u32);
+    MirInstId const cmp = mb.addInst(MirOpcode::ICmpEq,
+                                     std::array<MirInstId, 2>{code, avc}, i32);
+    mb.addSehFilterReturn(cmp, handlerBB, region);
+
+    mb.beginBlock(handlerBB);
+    mb.addBr(jBB);
+
+    mb.beginBlock(xBB);
+    mb.addBr(h2BB);
+
+    // jBB and cBB both RETURN — that is what keeps each head's post-dominator
+    // the virtual exit, which is what makes them disagree about jBB.
+    mb.beginBlock(jBB);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    mb.beginBlock(cBB);
+    mb.addReturn(mb.addConst(i32Lit(1), i32));
+    return std::move(mb).finish();
+}
+
+TEST(SynthSehFunclets, RelayoutLeavesStructCfMarkersCanonical) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSehParentOrderSensitiveMarkers(in, SymbolId{100});
+    // The real pipeline hands this pass a module whose markers are ALREADY
+    // canonical — `optimizeModule` and the mandatory prune both END in
+    // `rederiveStructCfMarkers`. Mirror that, so what is measured below is the
+    // PASS's effect and not the fixture's hand-stamped `Linear` defaults.
+    rederiveStructCfMarkers(mir);
+
+    std::vector<ExternImport> ext;
+    std::vector<MirSehScope>  scopes;
+    DiagnosticReporter        rep;
+    ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, peSehPersonality(),
+                                      CSymbolDecorationScheme::None,
+                                      "pe64-x86_64-windows-exec", scopes, rep));
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(scopes.size(), 1u);
+    ASSERT_EQ(mir.moduleFuncCount(), 2u) << "parent + the appended filter funclet";
+
+    // ── (1) THE FIXTURE IS NOT VACUOUS: the relayout really did move a head ──
+    // If bBB stopped moving in front of h2BB, everything below would pass for
+    // the wrong reason. Both are found structurally (bBB is the block holding
+    // SehTryEnd; h2BB is the only OTHER CondBr-terminated block reachable in the
+    // parent), so a renamed or re-minted block id cannot silently disarm this.
+    auto const parent = findFuncBySymbol(mir, SymbolId{100});
+    ASSERT_TRUE(parent.has_value());
+    std::uint32_t const nb = mir.funcBlockCount(*parent);
+    std::optional<std::uint32_t> tryEndPos, otherHeadPos;
+    for (std::uint32_t i = 0; i < nb; ++i) {
+        MirBlockId const b  = mir.funcBlockAt(*parent, i);
+        std::uint32_t const n = mir.blockInstCount(b);
+        bool holdsTryEnd = false;
+        for (std::uint32_t k = 0; k < n; ++k) {
+            if (mir.instOpcode(mir.blockInstAt(b, k)) == MirOpcode::SehTryEnd) {
+                holdsTryEnd = true;
+            }
+        }
+        if (holdsTryEnd) { tryEndPos = i; continue; }
+        if (n != 0 && mir.instOpcode(mir.blockTerminator(b)) == MirOpcode::CondBr) {
+            if (!otherHeadPos.has_value()) otherHeadPos = i;
+        }
+    }
+    ASSERT_TRUE(tryEndPos.has_value()) << "the guarded body's SehTryEnd block vanished";
+    ASSERT_TRUE(otherHeadPos.has_value()) << "the competing CondBr head vanished";
+    ASSERT_LT(*tryEndPos, *otherHeadPos)
+        << "the relayout no longer moves the region's exit head in front of the "
+           "non-region head — this fixture would then pin nothing";
+
+    // ── (2) POSITIVE — and there is deliberately no `rederiveStructCfMarkers`
+    //        here. The PASS owns that call; a test that made it would be
+    //        measuring itself, which is how this residue stayed unmeasured.
+    {
+        DiagnosticReporter vrep;
+        MirVerifier        verifier{mir, &in};
+        EXPECT_TRUE(verifier.verify(vrep))
+            << "the region-contiguity relayout left a stale StructCfMarker — "
+               "`synthesizeSehFunclets` must re-derive them after its rebuild, "
+               "exactly as realizeEntryShape / synthesizeStdioShim / "
+               "synthesizeThreadsShim / mergeCuMirs all do at their own sites";
+        for (auto const& d : vrep.all()) ADD_FAILURE() << d.actual;
+    }
+
+    // ── (3) CONTROL — falsify ONE marker on a reachable, non-entry block and
+    //        require the SAME verifier on the SAME module to red, NAMING the
+    //        rule. Without this, "the module verifies" is equally consistent
+    //        with "this verifier checks nothing here". The replacement is
+    //        chosen to differ from what is stored (which, by (2), is what the
+    //        derivation produces), so the mismatch is certain, not incidental.
+    MirBlockId const   victim    = mir.funcBlockAt(*parent, 1);
+    StructCfMarker const stored  = mir.blockMarker(victim);
+    StructCfMarker const falsified = (stored == StructCfMarker::LoopHeader)
+                                         ? StructCfMarker::IfJoin
+                                         : StructCfMarker::LoopHeader;
+    ASSERT_NE(stored, falsified);
+    mir.setBlockMarker(victim, falsified);
+    {
+        DiagnosticReporter vrep;
+        MirVerifier        verifier{mir, &in};
+        EXPECT_FALSE(verifier.verify(vrep))
+            << "the marker-equality rule did not fire on a falsified marker — "
+               "the positive arm above would then prove nothing";
+        bool named = false;
+        for (auto const& d : vrep.all()) {
+            if (d.code == DiagnosticCode::I_StructCfMismatch) named = true;
+        }
+        EXPECT_TRUE(named) << "the refusal must be I_StructCfMismatch, not some "
+                              "other rule failing for some other reason";
+    }
 }
 
 // c116b H1 (D-WIN64-SEH-FUNCLETS): a filter that READS A PARENT LOCAL. The parent has
@@ -3146,7 +3430,9 @@ TEST(SynthThreadsShim, ThrdExitConvertsExplicitlyToEachVehiclesExitParameterType
         ASSERT_EQ(conv.size(), 1u);
         EXPECT_EQ(mir.instOpcode(conv[0]), MirOpcode::Arg)
             << "the converted value is thrd_exit's own parameter";
-        EXPECT_EQ(mir.argIndex(conv[0]), 0u);
+        // `try*`: the EXPECT above is non-fatal, so a non-Arg here would fall
+        // through into an aborting read [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]].
+        EXPECT_EQ(mir.tryArgIndex(conv[0]), 0u);
         EXPECT_EQ(in.kind(mir.instType(conv[0])), TypeKind::I32)
             << "thrd_exit's declared parameter stays SIGNED int (C11 7.26.5.5) — the fix is "
                "a conversion at the call, never a re-signed Arg";
@@ -4219,37 +4505,50 @@ std::uint32_t countOpcodeIn(Mir const& mir, MirFuncId fn, MirOpcode op) {
 
 // ── SINGLE-SLOT IDENTITY PROBES ─────────────────────────────────────────────────────
 // Each answers "does THIS operand slot hold THAT value" and reports what it found
-// instead. They check the opcode FIRST and only then read the opcode-specific payload,
-// because `Mir::argIndex` / `Mir::constLiteralIndex` / `Mir::instPayload` abort LOUD on
-// a wrong opcode: a plain `EXPECT_EQ(opcode, …)` followed by a payload read would take
-// the whole test binary down on the first mismatch instead of failing one assertion and
-// letting the remaining slots report too.
+// instead. A plain `EXPECT_EQ(opcode, …)` followed by a payload read would take the
+// whole test binary down on the first mismatch — `EXPECT` records and falls THROUGH,
+// straight into an accessor that aborts — instead of failing one assertion and letting
+// the remaining slots report too. These probes exist to avoid that.
+//
+// ★ THEY NOW ASK THROUGH THE `try*` TWINS RATHER THAN HAND-ROLLING THE OPCODE TEST
+// [[D-MIR-ACCESSORS-ABORT-ON-WRONG-OPCODE]]. Same guarantee, one mechanism, and the
+// twin cannot drift from its aborting sibling because it delegates to it.
+//
+// ⚠ CORRECTED HERE: this block used to name `Mir::instPayload` among the accessors
+// that "abort LOUD on a wrong opcode". It does NOT — `instPayload` is the RAW payload
+// reader (`instArena_.at(id).payload`), bounds- and provenance-checked but with no
+// opcode test at all, so it has no `try*` twin and needs none. `isVaLeaf` below still
+// tests the opcode first, but for the OPPOSITE reason: a raw read on the wrong opcode
+// yields a meaningless NUMBER rather than a crash, which is the quieter failure.
 
 testing::AssertionResult isArg(Mir const& mir, MirInstId op, std::uint32_t ordinal) {
-    if (mir.instOpcode(op) != MirOpcode::Arg)
+    auto const idx = mir.tryArgIndex(op);
+    if (!idx.has_value())
         return testing::AssertionFailure()
                << "slot holds opcode #" << static_cast<int>(mir.instOpcode(op))
                << ", not the parameter `Arg " << ordinal << "`";
-    if (mir.argIndex(op) != ordinal)
+    if (*idx != ordinal)
         return testing::AssertionFailure()
-               << "slot holds parameter `Arg " << mir.argIndex(op) << "`, want `Arg "
+               << "slot holds parameter `Arg " << *idx << "`, want `Arg "
                << ordinal << "` — the arm forwarded the WRONG PARAMETER into this slot "
                              "(a transposition; both are pointers, so no type check "
                              "anywhere can see it)";
-    if (mir.argPosition(op) != ordinal)
+    auto const pos = mir.tryArgPosition(op);
+    if (pos != ordinal)
         return testing::AssertionFailure()
                << "`Arg " << ordinal << "` records flat call-operand position "
-               << mir.argPosition(op);
+               << pos.value_or(0);
     return testing::AssertionSuccess();
 }
 
 testing::AssertionResult isIntConst(Mir const& mir, MirInstId op, std::int64_t want,
                                     TypeKind wantCore) {
-    if (mir.instOpcode(op) != MirOpcode::Const)
+    auto const litIdx = mir.tryConstLiteralIndex(op);
+    if (!litIdx.has_value())
         return testing::AssertionFailure()
                << "slot holds opcode #" << static_cast<int>(mir.instOpcode(op))
                << ", not a Const (want " << want << ")";
-    MirLiteralValue const& lit = mir.literalValue(mir.constLiteralIndex(op));
+    MirLiteralValue const& lit = mir.literalValue(*litIdx);
     auto const* got = std::get_if<std::int64_t>(&lit.value);
     if (got == nullptr)
         return testing::AssertionFailure() << "Const does not carry an integer literal";
