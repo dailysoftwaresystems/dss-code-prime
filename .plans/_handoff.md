@@ -67,12 +67,24 @@ below is IN it.
    `D-C-ATOMICS-RUNTIME-PE64-BUS-LOCKS-EVERY-ACCESS-TO-A-CACHE-LINE-STRADDLING-OBJECT`
    🧠 The mechanism is INFERRED, not measured: the witness makes every access a split lock (a bus lock), and that runner's host likely throttles bus locks. The local gate cannot see it — this workstation's CPU reports no bus-lock detection.
 
+**Operator rulings, 2026-09-15.** They came after lane `bl` reported, and after gcc 13, clang 18 and MSVC 19.51 were measured on the same object. None of the three keeps a line-crossing packed `_Atomic` atomic across processes, and MSVC's and gcc's loads tear even inside one process (an MSVC-built copy of the witness tore in 20 of 20 runs).
+- *"If we can guarantee full atomicity across process, then Option 2. If Option 2 is really impossible or too expensive in terms of runtime cost (making it slow/heavy), then Option 1."*
+  - **Option 1** is `bl` as built: one lock per process, no bus lock.
+  - **Option 2** is also atomic across processes: a locked instruction for memory another process can map.
+- Fix the `+=`/`++` lost update **before** merging PR #57.
+
 **Owed, in order:**
 
-1. Lane `bl` (`.worktrees/bl`) measures the mechanism and, if it is confirmed, fixes the pe64 atomics runtime at root. ⛔ Not the remedy: a longer child limit, fewer rounds, a moved object, an excluded or flaky-marked example. ⚠ The fix reverses a stated P54 design choice; if it would change what a valid program observes, it goes to the operator first.
-2. Fold `bl`, apply its row, and take the eight-run gate `{Debug, Release} × four legs` on the resulting tree.
-3. Push. With `Run Pipes` on, CI runs by itself — read the finished run's failing test NAMES before concluding anything from it.
-4. Only then the merge.
+1. **Lane `bl`** (`.worktrees/bl`). Its Option 1 fix is built and gated but NOT folded. It now:
+   - measures whether Option 2 can guarantee cross-process atomicity without a heavy runtime cost;
+   - implements whichever option that ruling selects;
+   - adds the runtime's compare-exchange entry under the same arbiter.
+2. **Lane `ca`** (P0 production): route `+=`, `++` and `--` on an `_Atomic` lvalue through the compare-exchange retry loop that `atomic_fetch_*` already uses.
+   `D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE`
+   ✔MEASURED before filing: DSS loses updates on pe64 and elf64; MSVC built from the same source loses none.
+3. **Lane `ih`**: the `integrated_tests` runner hang `bl` recorded. A runner spun in ntdll file calls before creating its `ex/` directory, beside sibling examples whose names extend its own.
+4. Fold all three, take the eight-run gate `{Debug, Release} × four legs` on the resulting tree, and push once. With `Run Pipes` on, CI runs by itself — read the finished run's failing test NAMES before concluding anything from it.
+5. Only then the merge.
 
 ⚠ Rows have been opened and closed since the table below was measured — re-derive every count with `check-anchor-balance`; do not read them off it.
 
