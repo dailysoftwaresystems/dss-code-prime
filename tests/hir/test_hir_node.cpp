@@ -63,6 +63,12 @@ static_assert(dss::childArity(HirKind::TypeDecl).min == 0 && dss::childArity(Hir
 static_assert(dss::childArity(HirKind::ExternGlobal).min == 0 && dss::childArity(HirKind::ExternGlobal).max == 0);
 static_assert(dss::childArity(HirKind::ExternFunction).max == dss::kUnboundedArity);  // params…, no body
 static_assert(dss::childArity(HirKind::Module).max == dss::kUnboundedArity);          // decls…
+// D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+// a read-modify-write is exactly [target, update], and it is an EXPRESSION (it
+// yields the observed old value), so its type is required.
+static_assert(dss::childArity(HirKind::ReadModifyWrite).min == 2
+              && dss::childArity(HirKind::ReadModifyWrite).max == 2);
+static_assert(dss::requiresValidType(HirKind::ReadModifyWrite));
 
 // ── structured-CF kind predicates (compile-time) ──
 static_assert(dss::isLoopKind(HirKind::WhileStmt) && dss::isLoopKind(HirKind::ForStmt));

@@ -60,6 +60,7 @@ scan_document's docstring: FATAL iff the MEASUREMENT is incomplete) -- a silentl
 skipped table is the exact defect this whole anchor is about.
 """
 import argparse
+import importlib.util
 import io
 import os
 import re
@@ -1431,19 +1432,57 @@ def scan_document(text, relpath):
     return scan
 
 
+_OWNING_TREE = None
+
+
+def _owning_tree():
+    """`scripts/owning-tree/owning-tree.py` -- the one owner of "which tree is this file in?".
+
+    Loaded by path from this file's sibling directory (a hyphen is not a module name). It
+    FAILS LOUD when absent rather than falling back to a local walk: a second copy of the
+    answer is the drift that owner exists to end.
+    """
+    global _OWNING_TREE
+    if _OWNING_TREE is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            sys.exit("anchor-balance: cannot find %s -- this guard's root is resolved there "
+                     "and nowhere else" % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OWNING_TREE = mod
+    return _OWNING_TREE
+
+
 def repo_root():
-    p = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                       capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if p.returncode != 0:
-        sys.exit("not inside a git repository")
-    return p.stdout.strip()
+    """The tree THIS FILE lives in -- never the tree the caller's shell is standing in.
+
+    ⚠ This was a bare `git rev-parse --show-toplevel`. ✔MEASURED 2026-09-15 (P66): run by
+    path with its cwd inside a different repository, it counted THAT repository's
+    registries and named a row only that repository holds; from a directory inside no
+    repository it would not run at all. ctest pins `WORKING_DIRECTORY`, so no gate saw
+    either. The walk, the measurement that chose it, and why git must agree are in
+    `scripts/owning-tree/owning-tree.py`. `reads_git`, because the baseline half of this
+    gate is read through `git ls-tree` / `git show` at `--base`.
+    """
+    ot = _owning_tree()
+    try:
+        return ot.resolve(__file__, reads_git=True)
+    except ot.Refusal as exc:
+        sys.exit("anchor-balance: %s" % exc)
 
 
 def plan_files_at(root, ref):
     """Depth-1 `.plans/*.md` as of `ref`. Fails loud rather than scanning nothing."""
-    p = subprocess.run(["git", "ls-tree", "--name-only", "%s:%s" % (ref, PLANS_DIR)],
-                       cwd=root, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
+    # ★ THROUGH `run_git`: a caller's exported GIT_DIR otherwise names the repository whose
+    # `ref` is read. ✔MEASURED 2026-09-15 (P66 lane rr): under another repository's GIT_DIR
+    # this gate read THAT repository's HEAD as its baseline ("OPEN at HEAD registry=0 ...
+    # opened 447"). The helper, and why, are in scripts/owning-tree/.
+    p = _owning_tree().run_git(["ls-tree", "--name-only", "%s:%s" % (ref, PLANS_DIR)],
+                               cwd=root, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
     if p.returncode != 0:
         sys.exit("cannot list %s at %s: %s" % (PLANS_DIR, ref, (p.stderr or "").strip()[:200]))
     names = [n for n in p.stdout.split("\n") if n.strip().endswith(".md")]
@@ -1456,8 +1495,9 @@ def plan_files_at(root, ref):
 def scan_at_ref(root, ref):
     scan = Scan()
     for rel in plan_files_at(root, ref):
-        p = subprocess.run(["git", "show", "%s:%s" % (ref, rel)], cwd=root,
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        p = _owning_tree().run_git(["show", "%s:%s" % (ref, rel)], cwd=root,
+                                   capture_output=True, text=True, encoding="utf-8",
+                                   errors="replace")
         if p.returncode != 0:
             sys.exit("cannot read %s at %s: %s" % (rel, ref, (p.stderr or "").strip()[:200]))
         scan.merge(scan_document(p.stdout, rel))
@@ -2595,6 +2635,50 @@ def self_test():
         "closed row is 'correctly filed' and the discipline is unmeasured",
         "out=%r" % out_n[:160])
     extra_total += 4
+
+    # ── (s) THE BASELINE IS READ FROM THIS TREE'S GIT, whatever the caller exported ──
+    # ✔MEASURED 2026-09-15 (P66 lane rr): under another repository's GIT_DIR, `scan_at_ref`
+    # read THAT repository's `.plans` at HEAD. A synthetic repository commits one registry row;
+    # the steered negative is proven by a bare `git ls-tree` naming the decoy's plan document.
+    ot = _owning_tree()
+    fx = tempfile.mkdtemp(prefix="anchor-balance-steer-")
+    real, clean_keys, steered_keys, why = False, [], None, ""
+    try:
+        os.makedirs(os.path.join(fx, PLANS_DIR))
+        with io.open(os.path.join(fx, REG_REL), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_doc(*(REG6 + [OPEN6 % "STEEROWN"])) + "\n")
+        for args in (["init", "-q", fx], ["-C", fx, "add", "-A"],
+                     ["-C", fx, "-c", "user.email=anchor-balance@example.invalid",
+                      "-c", "user.name=anchor-balance", "-c", "commit.gpgsign=false",
+                      "commit", "-q", "--no-verify", "-m", "fixture"]):
+            ot.run_git(args, capture_output=True)
+        clean_keys = sorted(scan_at_ref(fx, "HEAD").rows)
+        with ot.steering() as steer:
+            neg = ot.bare_git(["ls-tree", "--name-only", "HEAD:" + PLANS_DIR], fx, steer)
+            real = os.path.basename(ot.STEER_PLANS_DECOY) in neg.stdout.split("\n")
+            with ot.caller_environment(steer):
+                try:
+                    steered_keys = sorted(scan_at_ref(fx, "HEAD").rows)
+                except SystemExit as exc:
+                    why = str(exc)
+    finally:
+        ot.remove_tree(fx)
+    pin(real and any(k.endswith("#D-XX" "-STEEROWN") for k in clean_keys)
+        and steered_keys == clean_keys,
+        "baseline: `scan_at_ref` IGNORES a caller's GIT_DIR + GIT_WORK_TREE + GIT_INDEX_FILE "
+        "naming another repository -- it reads this tree's own ref",
+        "negative-synthesized=%s clean=%r steered=%r %s"
+        % (real, clean_keys, steered_keys, why[:120]))
+    extra_total += 1
+
+    # ── (r) THE ROOT IS THE TREE THIS FILE LIVES IN, whatever the caller's cwd ──
+    # ★ `--self-test` is the form ctest runs, and it never reaches `repo_root()` on its
+    # own -- so without these arms the only gate that runs this file could not see a
+    # root taken from the caller's working directory. Arms, oracle and synthesized
+    # negatives are owned by scripts/owning-tree/owning-tree.py.
+    for ok, why, detail in _owning_tree().root_arms(repo_root, (SystemExit,), True, __file__):
+        pin(ok, why, "" if ok else detail)
+        extra_total += 1
 
     failed += extra_failed[0]
     print("self-test: %d case(s), %d failed" % (len(cases) + extra_total, failed))

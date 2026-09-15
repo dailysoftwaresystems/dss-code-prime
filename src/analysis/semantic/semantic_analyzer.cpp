@@ -4887,6 +4887,30 @@ resolveBitfieldSuffix(EngineState& s, Tree const& tree, DeclarationRule const& d
         s.reporter.report(std::move(d));
     };
     if (!fieldType.valid()) return out;   // unresolved base — upstream already loud
+    // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+    // an `_Atomic` bit-field is REFUSED AT ITS DECLARATION. C23 6.7.3.2p5: "It is
+    // implementation-defined whether atomic types are permitted" (Annex J.3.9
+    // lists the choice), and all three references make the SAME choice —
+    // ✔MEASURED gcc 13.3.0 "bit-field 'a' has atomic type", clang 18.1.3
+    // "bit-field 'a' has non-integral type '_Atomic(int)'", MSVC 19.51
+    // (`/experimental:c11atomics`) C7710 "'a': bit-fields cannot be atomic". So no
+    // reference makes one WORK and refusing is within the union.
+    // ★ WHY HERE, AND NOT WHERE IT USED TO FAIL: before this, DSS ACCEPTED the
+    // declaration and every ACCESS failed later — a plain read or write as the MIR
+    // verifier's internal `I_AtomicAccessNotLowered` ("a missed funnel site"),
+    // which blames the compiler for the user's declaration. A bit-field is a
+    // sub-object of its allocation unit; no indivisible access of one exists, and
+    // the declaration is where that is a property of the program.
+    // ⓘ `kind()` below sees through the qualifier skin, so without this check the
+    // `_Atomic int` passes as an `int` base — which is exactly how it slipped by.
+    if (s.lattice.interner().isAtomicQualified(fieldType)) {
+        emit(DiagnosticCode::S_BitFieldNonIntegerType,
+             "a bit-field may not have an atomic type: C23 6.7.3.2p5 makes it "
+             "implementation-defined whether atomic types are permitted, and this "
+             "implementation does not permit them — as gcc, clang and MSVC do not "
+             "(D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE)");
+        return out;
+    }
     // FC8 D-CSUBSET-ENUM-BITFIELD: an enum-typed bit-field (`enum E e : 3;`) is
     // permitted (C 6.7.2.1) — an enum behaves AS its underlying integer
     // (D-CSUBSET-ENUM-INT-CONVERSION), so validate the width against the

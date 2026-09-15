@@ -50,8 +50,8 @@
 # installing software on the operator's machine.
 #
 # Usage:
-#   scripts/macos-leg/macos-leg.ps1                        # push CWD, clean build, full ctest
-#   scripts/macos-leg/macos-leg.ps1 -Src <dir>             # push <dir> instead of CWD
+#   scripts/macos-leg/macos-leg.ps1                        # push THIS script's tree, clean build, full ctest
+#   scripts/macos-leg/macos-leg.ps1 -Src <dir>             # push <dir> instead (relative to the caller, as typed)
 #   scripts/macos-leg/macos-leg.ps1 -Filter '<regex>'      # scope the ctest
 #   scripts/macos-leg/macos-leg.ps1 -Jobs <n>              # ctest parallelism (default 6)
 #   scripts/macos-leg/macos-leg.ps1 -NoPush                # reuse what is already on the Mac
@@ -88,11 +88,23 @@ $ErrorActionPreference = 'Stop'
 # standing switch still means the same thing everywhere.
 $legGuards = if ($Guards) { '1' } elseif ($env:DSS_LEG_GUARDS) { $env:DSS_LEG_GUARDS } else { '0' }
 
-if (-not $Src) { $Src = (Get-Location).Path }
+# ★★ THE TREE THIS SCRIPT LIVES IN, NEVER THE CALLER'S LOCATION -- for the default source AND
+# for the carriage. This was `(Get-Location).Path` beside a location-relative carriage.
+# ✔MEASURED 2026-09-15 (P66, `pwsh` shadowed by a recording stub): run by path from inside
+# another repository, and from a directory inside no repository, it died with "carriage not
+# found at scripts/ssh-macos/ssh-macos.ps1 (run from the repo root)" while this script's own
+# tree held that carriage -- and from any directory that DOES hold one, another checkout's
+# root, it drives THAT checkout's carriage and pushes that directory. The class
+# [[D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED]] closed for the lane verbs.
+# ⓘ Two `Split-Path -Parent` calls, not `Join-Path '..\..'`: a backslash is not a separator
+# to PowerShell on a POSIX host. `-Src` still wins, relative to the caller as typed.
+# Pinned by `test-macos-leg.py` beside this file.
+$RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+if (-not $Src) { $Src = $RepoRoot }
 if (-not $Dst) {
     $Dst = if ($env:DSS_MACOS_LEG_DIR) { $env:DSS_MACOS_LEG_DIR } else { '~/src/dss-code-prime' }
 }
-$carriage = 'scripts/ssh-macos/ssh-macos.ps1'
+$carriage = Join-Path $RepoRoot 'scripts/ssh-macos/ssh-macos.ps1'
 
 # ★ `Die` RESTORES THE LEG CLONE BEFORE IT EXITS, which is the PowerShell answer to the
 # `.sh` twin's `trap … EXIT`. A leg that dies half way leaves the dirtiest tree of all,
@@ -109,7 +121,7 @@ function Die([string]$m) {
 }
 function Say([string]$m) { Write-Host ""; Write-Host "=== $m ===" }
 
-if (-not (Test-Path $carriage)) { Die "carriage not found at $carriage (run from the repo root)" }
+if (-not (Test-Path -LiteralPath $carriage)) { Die "carriage not found at $carriage, in the tree this script lives in" }
 
 if ($ResetTo) {
     Say "remote fetch + reset --hard $ResetTo"
@@ -132,18 +144,73 @@ if ($ResetTo) {
 # Operator ruling 2026-08-26: every leg host keeps its own clone (`~/src/dss-code-prime`
 # here), the leg CHECKS ITS BRANCH before working in it, and the leg cleans up after
 # itself. One owner for all three hosts: `scripts/leg-tree/`.
-# ★ The script text is INLINED rather than assumed present on the far side -- the Mac's
-# checkout can predate this file, and a bootstrap that needs the thing it bootstraps is
-# not a bootstrap. `-Raw` keeps it one string; the verb is appended on its own line.
+# ★ The helper is SENT rather than assumed present on the far side -- the Mac's checkout can
+# predate this file, and a bootstrap that needs the thing it bootstraps is not a bootstrap.
+# ★★ IT TRAVELS ON THE CARRIAGE'S STDIN, AS ITS EXACT BYTES; ONLY A ~450-BYTE COMMAND RIDES THE
+# COMMAND LINE -- `sh -c '<loader>' leg-tree <bytes> <verb> '<arg>'...`, the command
+# `leg_tree_remote_command` in `scripts/leg-tree/leg-tree.sh` builds for the `.sh` legs. The
+# loader is READ from that file's one `LEG_TREE_REMOTE_LOADER='...'` line, never re-typed here, and
+# `test-macos-leg.py` requires this twin to send the `.sh` twin's command byte for byte.
+# ⚠ THE PIPE IS A BYTE[], NOT A STRING. ✔MEASURED 2026-09-15 (P66 lane ge, pwsh 7.6.6, through an
+# intermediate `pwsh -File` carriage whose native child inherits its stdin): `Get-Content -Raw`
+# piped as a STRING arrived 33,903 of 33,901 bytes -- a CRLF appended -- while
+# `Get-Content -AsByteStream -Raw` arrived byte-identical. (The loader would ignore the extra
+# bytes; the byte pipe does not rely on that.)
 # ⚠ This runs even under `-NoPush`, deliberately: `-NoPush` means "do not replace the
 # files", not "do not know which commit they belong to".
-function Invoke-LegTree([string] $Verb, [string[]] $Args) {
-    $body = Get-Content -Raw (Join-Path $PSScriptRoot '..\leg-tree\leg-tree.sh')
-    $quoted = ($Args | ForEach-Object { "'$_'" }) -join ' '
-    & pwsh -NoProfile -File $carriage -Command "$body`nleg_tree_$Verb $quoted"
+# ⚠⚠ THE SECOND PARAMETER WAS NAMED `$Args`, AND `$Args` IS POWERSHELL'S AUTOMATIC VARIABLE.
+# Inside the function the name read the (empty) unbound-argument list, not the parameter.
+# ✔MEASURED 2026-09-15 (P66, pwsh 7.6.6): `function f([string]$V, [string[]]$Args)` called
+# with three values sees n=0; the same function with the parameter renamed sees n=3. And
+# through a recording stub carriage this driver sent the Mac `leg_tree_prepare ` with NO
+# repository, branch or sha -- which `leg_tree_prepare` refuses ("prepare needs <repo>
+# <branch> <sha>"), so no `.ps1` macOS leg could get past prepare, and every such attempt then
+# sent an equally argument-less `leg_tree_restore`. Found by `test-macos-leg.py`.
+# ⛔ THE HELPER USED TO RIDE THE COMMAND LINE, AND EVERY SIZE IT REACHED WAS A CEILING WAITING.
+# ✔MEASURED 2026-09-15 (P66 lane rr, `.temp/rr-scratch/probe5.out`): the whole-file payload of
+# 33,629 characters failed BEFORE any process started -- "Program 'pwsh.exe' failed to run:
+# StandardOutputEncoding is only supported when standard output is redirected", an error naming
+# the wrong cause -- so the payload was cut to comment-free code (10,736 characters), closed as
+# D-SCRIPT-MACOS-LEG-PS1-INLINES-LEG-TREE-PAST-THE-WINDOWS-COMMAND-LINE-CEILING. ✔MEASURED again
+# (P66 lane ge): that cut left 21,428 characters of headroom, bound at the carriage's `& ssh`
+# (CreateProcess, 32,767), and it still shrank with every code line the helper gained. On stdin
+# the helper has no ceiling to meet; the command above is ~450 bytes whatever the helper's size.
+function Invoke-LegTree([string] $Verb, [string[]] $VerbArgs) {
+    $helper = Join-Path $RepoRoot 'scripts/leg-tree/leg-tree.sh'
+    $lines = @(Get-Content -LiteralPath $helper | Where-Object { $_.StartsWith("LEG_TREE_REMOTE_LOADER='") })
+    $m = if ($lines.Count -eq 1) { [regex]::Match($lines[0], "^LEG_TREE_REMOTE_LOADER='([^']+)'$") } else { $null }
+    if ($null -eq $m -or -not $m.Success -or $Verb -notmatch '^[a-z_]+$') {
+        Write-Host "[X] macos-leg: cannot build the leg-tree command: $helper holds $($lines.Count) LEG_TREE_REMOTE_LOADER line(s), exactly one is required, and the verb '$Verb' must be a lower-case word"
+        $global:LASTEXITCODE = 4
+        return
+    }
+    $command = "sh -c '$($m.Groups[1].Value)' leg-tree $((Get-Item -LiteralPath $helper).Length) $Verb"
+    foreach ($a in @($VerbArgs)) { $command += " '" + ($a -replace "'", "'\''") + "'" }
+    Get-Content -LiteralPath $helper -AsByteStream -Raw | & pwsh -NoProfile -File $carriage -Command $command
 }
-$legBranch = (& git -C $Src rev-parse --abbrev-ref HEAD 2>$null)
-$legSha    = (& git -C $Src rev-parse HEAD 2>$null)
+
+# ★★★ THE DRIVER'S IDENTITY IS READ THROUGH `scripts/repo-tree/repo-tree.ps1`, NEVER A BARE `& git`.
+# ✔MEASURED 2026-09-15 (P66 lane ge; this driver COPIED into a fixture, a recording stub carriage):
+# with ANOTHER repository's GIT_DIR, or GIT_DIR + GIT_WORK_TREE, exported, `& git -C $Src rev-parse`
+# named THAT repository's branch and commit -- so the driver pushed its own tree and PREPARED the
+# Mac's clone on the other repository's branch at the other repository's commit. An absolute
+# GIT_INDEX_FILE changed neither read. The `.sh` twin was already immune, through
+# `leg_tree_driver_identity`. `Get-RepoTreeIdentity` and `Invoke-RepoTreeGit` ask git through
+# `Invoke-RepoTreeUnsteered`, the PowerShell owner of that removal. Pinned by `test-macos-leg.py`.
+# ⚠ Dot-sourcing it sets `Set-StrictMode -Version Latest` for the rest of this script, so both
+# names are bound before `Die` can read them, and the PHASE lines below are read without `.Line`
+# on a result that may be empty (✔MEASURED: under strict mode `$null.Line` throws).
+$legBranch = $null
+$legSha = $null
+. (Join-Path $RepoRoot 'scripts/repo-tree/repo-tree.ps1')
+try {
+    $legId = Get-RepoTreeIdentity $Src
+    $legSha = $legId.Sha
+    $legBranch = @(Invoke-RepoTreeGit $legId @('rev-parse', '--abbrev-ref', 'HEAD')) | Select-Object -First 1
+} catch {
+    $legBranch = $null
+    $legSha = $null
+}
 if (-not $legBranch) { Die "cannot read this checkout's branch - the host's clone is put on the DRIVER's branch, so a driver that cannot name its own has nothing to ask for" }
 Say "leg-tree prepare $Dst -> $legBranch @ $legSha"
 Invoke-LegTree 'prepare' @($Dst, $legBranch, $legSha)
@@ -254,8 +321,15 @@ $payload | & pwsh -NoProfile -File $carriage -Command 'bash -s' 2>&1 | Tee-Objec
 # [regex]::Escape, because the token is interpolated into a pattern and `[` is a
 # metacharacter - an unescaped one would make this match nothing and read as "no witness".
 $pat = 'REMOTE_CTEST_RC' + [regex]::Escape("[$legRun]") + '=(\d+)'
-$witness = (Select-String -Path $tmp -Pattern $pat | Select-Object -Last 1)
-(Select-String -Path $tmp -Pattern '^PHASE ').Line | Write-Host
+# ⚠ `Tee-Object` creates its file only once output ARRIVES. ✔MEASURED 2026-09-15 (P66): with
+# a carriage that printed nothing, `Select-String -Path $tmp` THREW "Cannot find path ...
+# because it does not exist", so the leg died on an uncaught error instead of on the `Die`
+# below -- the one exit that restores the clone. No output is exactly "no witness".
+$witness = $null
+if (Test-Path -LiteralPath $tmp) {
+    $witness = (Select-String -LiteralPath $tmp -Pattern $pat | Select-Object -Last 1)
+    Select-String -LiteralPath $tmp -Pattern '^PHASE ' | ForEach-Object { $_.Line } | Write-Host
+}
 Remove-Item $tmp -ErrorAction SilentlyContinue
 if (-not $witness) { Die "no REMOTE_CTEST_RC[$legRun] witness came back - this run's real status is UNKNOWN, which is not a pass" }
 $rc = [int]$witness.Matches[0].Groups[1].Value

@@ -1,0 +1,14 @@
+{
+  "$comment": "D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE — the RACE witness for DSS's pe64 generic compare-exchange entry: compare-exchange MIXED with plain store and load on ONE 4-byte `_Atomic` object at byte 62 of a 64-byte line, so every access to it takes the runtime's line-crossing arbiter. ★★ THE CHECKS ARE VALUES, NEVER TIMING. Every value written is `k | (~k << 16)`, so the half of the object in each cache line must be the complement of the other and a mix of two writes is visible. Arm 1: one compare-exchange, single-threaded. Arm 2: an EXACT COUNT — two threads each finish 30 000 increments with the load/compute/compare-exchange/retry loop compound assignment lowers to, beside a reader and a thread hammering the byte below the object; the result must be exactly 60 000, and no torn value may be read or written back through `expected`. Arm 3: compare-exchange racing a plain store; nothing torn may be read, stored or written back, and the neighbour byte must survive. exit = 7 + 17 + 18 = 42; 11 torn in arm 2, 12 a lost update, 13 torn in arm 3, 14 a torn final value, 15 the neighbour clobbered.",
+  "$legComment": "★ pe64 ONLY, for the reason `packed_atomic_member_compare_exchange` states: the subject is DSS's own runtime body, which only the pe64 formats link; elf64 and macho64 import their platform's runtime.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

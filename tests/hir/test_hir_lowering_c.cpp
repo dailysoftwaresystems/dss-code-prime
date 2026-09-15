@@ -2136,6 +2136,166 @@ TEST(HirLoweringC, CompoundAssignAsSubExpressionLowersToSeqExpr) {
     EXPECT_EQ(res->hir.kind(res->hir.seqExprResult(val)), HirKind::Ref);  // yield Ref x
 }
 
+// ── D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE ──
+//
+// On an `_Atomic` object the desugar above is the defect: its read and its write
+// are two atomic accesses with nothing tying them together, and two threads lose
+// updates (✔MEASURED rc 115 on pe64 and elf64 at `caf053eb`). These pin the
+// replacement's SHAPE; the race witnesses under `examples/c/atomic_compound_*`
+// pin its behaviour.
+namespace {
+
+[[nodiscard]] std::vector<HirNodeId> functionBodiesInOrder(Hir const& hir) {
+    std::vector<HirNodeId> out;
+    for (HirNodeId d : hir.moduleDecls(hir.root()))
+        if (hir.kind(d) == HirKind::Function) out.push_back(hir.functionBody(d));
+    return out;
+}
+
+// Every node of kind `k` in the module (the file's own `countKind` is defined
+// further down, past these tests).
+[[nodiscard]] std::size_t countRmwFixtureKind(Hir const& hir, HirKind k) {
+    std::size_t n = 0;
+    std::vector<HirNodeId> stack{hir.root()};
+    while (!stack.empty()) {
+        HirNodeId const id = stack.back();
+        stack.pop_back();
+        if (hir.kind(id) == k) ++n;
+        for (HirNodeId c : hir.children(id)) stack.push_back(c);
+    }
+    return n;
+}
+
+// Peel the synthetic conversions a return / coerce may wrap a value in.
+[[nodiscard]] HirNodeId peelCasts(Hir const& hir, HirNodeId n) {
+    while (hir.kind(n) == HirKind::Cast) n = hir.children(n)[0];
+    return n;
+}
+
+// Does the subtree under `root` contain a `Ref` to `sym`? (Heap walk.)
+[[nodiscard]] bool subtreeRefs(Hir const& hir, HirNodeId root, std::uint32_t sym) {
+    std::vector<HirNodeId> stack{root};
+    while (!stack.empty()) {
+        HirNodeId const n = stack.back();
+        stack.pop_back();
+        if (hir.kind(n) == HirKind::Ref && hir.payload(n) == sym) return true;
+        for (HirNodeId c : hir.children(n)) stack.push_back(c);
+    }
+    return false;
+}
+
+}  // namespace
+
+// RED-ON-DISABLE: route the `_Atomic` arm of `lowerCompoundAssign` back to the
+// desugar → the ReadModifyWrite count drops to 0 and an AssignStmt appears.
+TEST(HirLoweringC, AtomicCompoundAssignmentLowersToOneReadModifyWrite) {
+    SemanticModel model = analyzeC("_Atomic unsigned g;\nvoid f(unsigned v) { g += v; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countRmwFixtureKind(res->hir, HirKind::ReadModifyWrite), 1u);
+    EXPECT_EQ(countRmwFixtureKind(res->hir, HirKind::AssignStmt), 0u)
+        << "`g = g + v` is two atomic accesses — the lost-update desugar";
+
+    auto const bodies = functionBodiesInOrder(res->hir);
+    ASSERT_EQ(bodies.size(), 1u);
+    HirNodeId const stmt = res->hir.children(bodies[0])[0];
+    ASSERT_EQ(res->hir.kind(stmt), HirKind::Block);
+    auto const inner = res->hir.children(stmt);
+    ASSERT_EQ(inner.size(), 2u);
+    // E2 is bound ONCE, ahead of the node — the update re-runs on a lost race.
+    EXPECT_EQ(res->hir.kind(inner[0]), HirKind::VarDecl);
+    ASSERT_EQ(res->hir.kind(inner[1]), HirKind::ExprStmt);
+    HirNodeId const rmw = res->hir.exprStmtExpr(inner[1]);
+    ASSERT_EQ(res->hir.kind(rmw), HirKind::ReadModifyWrite);
+    EXPECT_EQ(res->hir.kind(res->hir.rmwTarget(rmw)), HirKind::Ref);
+    EXPECT_TRUE(subtreeRefs(res->hir, res->hir.rmwUpdate(rmw),
+                            res->hir.rmwOldValueSymbol(rmw).v))
+        << "the update must read the OBSERVED value through the node's own binding";
+    EXPECT_FALSE(subtreeRefs(res->hir, res->hir.rmwUpdate(rmw),
+                             res->hir.payload(res->hir.rmwTarget(rmw))))
+        << "the update must never re-read the object itself";
+}
+
+// Postfix yields the node's own value (the value replaced); prefix recomputes the
+// update over that value — neither re-reads the object, which a concurrent store
+// could have changed since the commit.
+TEST(HirLoweringC, AtomicIncrementYieldsTheReplacedOrRecomputedValueNeverAReRead) {
+    SemanticModel model = analyzeC(
+        "_Atomic int g;\n"
+        "int post(void) { return g++; }\n"
+        "int pre(void) { return ++g; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto const bodies = functionBodiesInOrder(res->hir);
+    ASSERT_EQ(bodies.size(), 2u);
+
+    HirNodeId const postRet = res->hir.children(bodies[0])[0];
+    HirNodeId const postVal = peelCasts(res->hir, *res->hir.returnValue(postRet));
+    EXPECT_EQ(res->hir.kind(postVal), HirKind::ReadModifyWrite)
+        << "postfix's result IS the value the read-modify-write replaced";
+
+    HirNodeId const preRet = res->hir.children(bodies[1])[0];
+    HirNodeId const preVal = peelCasts(res->hir, *res->hir.returnValue(preRet));
+    ASSERT_EQ(res->hir.kind(preVal), HirKind::SeqExpr);
+    auto const stmts = res->hir.seqExprStmts(preVal);
+    ASSERT_EQ(stmts.size(), 1u);
+    ASSERT_EQ(res->hir.kind(stmts[0]), HirKind::VarDecl);
+    auto const init = res->hir.varDeclInit(stmts[0]);
+    ASSERT_TRUE(init.has_value());
+    EXPECT_EQ(res->hir.kind(*init), HirKind::ReadModifyWrite);
+    HirNodeId const yield = peelCasts(res->hir, res->hir.seqExprResult(preVal));
+    EXPECT_NE(res->hir.kind(yield), HirKind::Ref)
+        << "prefix must yield the RECOMPUTED new value, never a re-read of `g`";
+    EXPECT_TRUE(subtreeRefs(res->hir, yield, res->hir.varDeclSymbol(stmts[0]).v))
+        << "the recompute reads the captured replaced value";
+}
+
+// ★ THE TARGET IS THE ORIGINAL LVALUE CHAIN, NOT `*tmp`. A packed struct's
+// `_Atomic` array element is under-aligned, and `provableLvalueAlign` can only
+// see that by walking Index → MemberAccess → Deref; the temp-pointer
+// reconstruction the desugar uses would read as ALIGNED and pick the native form
+// (the rc 135 SIGBUS class on native arm64). RED-ON-DISABLE: drop the
+// `isAtomicScalarType` arm from `classifyLvalue` → the target becomes a Deref.
+TEST(HirLoweringC, AtomicCompoundAssignmentKeepsTheOriginalLvalueChainAsItsTarget) {
+    SemanticModel model = analyzeC(
+        "struct __attribute__((packed)) P { char c; _Atomic int a[2]; };\n"
+        "void f(struct P *p, int i) { p->a[i] += 1; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(countRmwFixtureKind(res->hir, HirKind::ReadModifyWrite), 1u);
+    auto const bodies = functionBodiesInOrder(res->hir);
+    ASSERT_EQ(bodies.size(), 1u);
+    std::vector<HirNodeId> stack{bodies[0]};
+    HirNodeId rmw{};
+    while (!stack.empty()) {
+        HirNodeId const n = stack.back();
+        stack.pop_back();
+        if (res->hir.kind(n) == HirKind::ReadModifyWrite) { rmw = n; break; }
+        for (HirNodeId c : res->hir.children(n)) stack.push_back(c);
+    }
+    ASSERT_TRUE(rmw.valid());
+    EXPECT_EQ(res->hir.kind(res->hir.rmwTarget(rmw)), HirKind::Index)
+        << "the read-modify-write must address the ORIGINAL `p->a[i]` chain";
+}
+
+// THE CONTROL: a plain object keeps the desugar — the new node is for `_Atomic`
+// objects only, where the two halves must be one operation.
+TEST(HirLoweringC, NonAtomicCompoundAssignmentKeepsTheDesugar) {
+    SemanticModel model = analyzeC("unsigned g;\nvoid f(unsigned v) { g += v; ++g; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countRmwFixtureKind(res->hir, HirKind::ReadModifyWrite), 0u);
+    EXPECT_EQ(countRmwFixtureKind(res->hir, HirKind::AssignStmt), 2u);
+}
+
 TEST(HirLoweringC, ArrayDeclarationLowersToArrayType) {
     // `int a[10]` lowers to a local VarDecl whose type is Array<I32, 10>. (HR9
     // un-deferred arrays: the semantic phase folds the `[10]` declarator suffix

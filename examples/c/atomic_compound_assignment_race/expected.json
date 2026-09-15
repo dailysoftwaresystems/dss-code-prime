@@ -1,0 +1,16 @@
+{
+  "$comment": "D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE: the THREADED witness that `E1 op= E2`, `++` and `--` on an `_Atomic` object are ONE indivisible read-modify-write (C23 6.5.17.3p4, 6.5.3.5p2), for every naturally-aligned object shape. DSS used to lower them to an atomic load, the arithmetic and a SEPARATE atomic store, and two threads lost updates (MEASURED at caf053eb: a race probe exited 115 on pe64 and elf64; MSVC's build of the same source exited 100). They now lower to a HIR `ReadModifyWrite` whose MIR is the same AtomicCas retry loop the `atomic_fetch_*` family uses. ★ EVERY VERDICT IS AN EXACT VALUE fixed by arithmetic alone, never a timing: `+=`/`-=`/`++`/`--` counters (2N / 0), `*= 3` (3^(2N) mod 2^32 — multiplication commutes, so no interleaving changes it), a sub-word object (2N mod 256), a 64-bit object (6N), an aligned struct member, an atomic POINTER stepped by `p++` and `p += 1` (exactly 2N ELEMENTS, so a byte-wise stride reds too), and the VALUES `++x`/`x++` yield (together exactly {1..2N} / {0..2N-1}, each once — a lost update or a re-read of the object instead of the committed value both yield a duplicate). ★ WHY EVERY LEG: x86-64 commits through `lock cmpxchg`; arm64 through a real LL/SC loop over ldaxr/stlxr. ⚠ FOLD-RESISTANT: mutable globals crossing real thread boundaries, every access `_Atomic`, so the `release` arm runs the same indivisibility. Each arm returns its own code on failure. exit = 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

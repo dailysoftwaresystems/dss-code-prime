@@ -149,6 +149,16 @@ dss_add_test(NAME program/test_dump_predefined_macros
 dss_add_test(NAME program/test_entry_argv_run
              SOURCES test_entry_argv_run.cpp)
 
+# D-C-ATOMICS-RUNTIME-PE64-BUS-LOCKS-EVERY-ACCESS-TO-A-CACHE-LINE-STRADDLING-OBJECT:
+# the NON-TIMING pin that DSS's pe64 atomics runtime executes no split-locked
+# instruction on an object crossing a cache line, that every image in a process
+# locks the one process heap, and that an in-line object keeps its lock-free
+# store and a load that never writes. Driver tier because the subject is the
+# INSTRUCTION STREAM of a real DSS-built exe and dll: the test builds both with
+# the driver and single-steps the exe under the Win32 debugging API.
+dss_add_test(NAME program/test_atomics_runtime_no_split_lock
+             SOURCES test_atomics_runtime_no_split_lock.cpp)
+
 # `--suppress=<a code in kUnsuppressableCodes>` — the refused-request notice
 # (`D_SuppressRequestIgnored`). Driver tier because the defect lives in the seam
 # between the arg parser that ACCEPTS the flag and the reporter that IGNORES it:

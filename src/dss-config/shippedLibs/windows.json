@@ -281,6 +281,9 @@
     { "name": "HeapSize",                "signature": "fn(ptr<void>, u32, ptr<void>) -> u64",            "kind": "function", "linkage": "external" },
     { "name": "HeapCompact",             "signature": "fn(ptr<void>, u32) -> u64",                       "kind": "function", "linkage": "external" },
     { "name": "HeapValidate",            "signature": "fn(ptr<void>, u32, ptr<void>) -> i32",            "kind": "function", "linkage": "external" },
+    { "$comment": "D-C-ATOMICS-RUNTIME-PE64-BUS-LOCKS-EVERY-ACCESS-TO-A-CACHE-LINE-STRADDLING-OBJECT: the default heap's lock is THE PROCESS LOCK that `runtime/platform/src/atomic.c` holds around an under-aligned `_Atomic` access whose operand crosses a 64-byte cache line, instead of a locked instruction on that operand (a split lock, which takes a bus lock and stalls every core). It is that heap's lock and not a private one because the atomics body is a STATIC archive member linked into every DSS-built image separately: `GetProcessHeap` names ONE heap per process, so every image's copy locks the same arbiter, with no named object another process could squat on. Both names are kernel32 exports (MEASURED in its export table, ordinals 902 and 908 on this host) and BOOL-returning, so each is `-> i32` exactly as `HeapValidate` above.",
+      "name": "HeapLock",                "signature": "fn(ptr<void>) -> i32",                            "kind": "function", "linkage": "external" },
+    { "name": "HeapUnlock",              "signature": "fn(ptr<void>) -> i32",                            "kind": "function", "linkage": "external" },
 
     { "name": "CreateFileMappingW",      "signature": "fn(ptr<void>, ptr<void>, u32, u32, u32, ptr<u16>) -> ptr<void>", "kind": "function", "linkage": "external" },
     { "name": "MapViewOfFile",           "signature": "fn(ptr<void>, u32, u32, u32, u64) -> ptr<void>",  "kind": "function", "linkage": "external" },

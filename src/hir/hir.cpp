@@ -618,6 +618,13 @@ HirNodeId HirBuilder::makeAssignStmt(HirNodeId target, HirNodeId value, HirFlags
     return addParent(HirKind::AssignStmt, kids, InvalidType, /*payload=*/0, flags);
 }
 
+HirNodeId HirBuilder::makeReadModifyWrite(HirNodeId target, HirNodeId update,
+                                          std::uint32_t oldValueSymbol, TypeId type,
+                                          HirFlags flags) {
+    HirNodeId const kids[] = {target, update};
+    return addParent(HirKind::ReadModifyWrite, kids, type, oldValueSymbol, flags);
+}
+
 // ── typed declaration helpers (HR4) ─────────────────────────────────────────
 
 HirNodeId HirBuilder::makeModule(std::span<HirNodeId const> decls, HirFlags flags) {
@@ -838,6 +845,19 @@ HirNodeId Hir::assignTarget(HirNodeId id) const {
 HirNodeId Hir::assignValue(HirNodeId id) const {
     assert(kind(id) == HirKind::AssignStmt);
     return childAt(id, 1);
+}
+
+HirNodeId Hir::rmwTarget(HirNodeId id) const {
+    assert(kind(id) == HirKind::ReadModifyWrite);
+    return childAt(id, 0);
+}
+HirNodeId Hir::rmwUpdate(HirNodeId id) const {
+    assert(kind(id) == HirKind::ReadModifyWrite);
+    return childAt(id, 1);
+}
+SymbolId Hir::rmwOldValueSymbol(HirNodeId id) const {
+    assert(kind(id) == HirKind::ReadModifyWrite);
+    return SymbolId{payload(id)};
 }
 
 // ── declaration accessors (HR4) ─────────────────────────────────────────────

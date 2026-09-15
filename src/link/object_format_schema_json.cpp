@@ -2037,8 +2037,9 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // runtime; the TARGET's `underAlignedAtomicForm` then decides (refuse under
     // `traps`, keep the native form under `losesAtomicity`) — see
     // `ObjectFormatData::atomicsRuntime`.
-    static constexpr std::array<std::string_view, 3>
-        kAtomicsRuntimeKeys{"role", "loadMangledName", "storeMangledName"};
+    static constexpr std::array<std::string_view, 4>
+        kAtomicsRuntimeKeys{"role", "loadMangledName", "storeMangledName",
+                            "compareExchangeMangledName"};
     DSS_CHECK_KEY_VOCABULARY(kAtomicsRuntimeKeys);
     if (doc.contains("atomicsRuntime")) {
         if (!doc.at("atomicsRuntime").is_object()) {
@@ -2087,6 +2088,29 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     ok = false;
                 } else {
                     *n.out = ar.at(n.key).get<std::string>();
+                }
+            }
+            // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+            // the GENERIC compare-exchange entry. OPTIONAL — see
+            // `AtomicsRuntime::compareExchangeMangledName` for why a missing one
+            // is a named refusal at lowering rather than a half-lowered pair — but
+            // a PRESENT one must name something: an empty string would read as
+            // "declared" to this loader and as "not declared" to the lowerer.
+            char const* const kCasKey = "compareExchangeMangledName";
+            if (ar.contains(kCasKey)) {
+                auto const& cx = ar.at(kCasKey);
+                if (!cx.is_string() || cx.get<std::string>().empty()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              std::string{"/atomicsRuntime/"} + kCasKey,
+                              "'compareExchangeMangledName', when present, must be a "
+                              "non-empty string naming the GENERIC atomics "
+                              "compare-exchange entry (elf: "
+                              "\"__atomic_compare_exchange\", macho: "
+                              "\"___atomic_compare_exchange\") "
+                              "(D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE).");
+                    ok = false;
+                } else {
+                    out.compareExchangeMangledName = cx.get<std::string>();
                 }
             }
             if (ok) data.atomicsRuntime = std::move(out);

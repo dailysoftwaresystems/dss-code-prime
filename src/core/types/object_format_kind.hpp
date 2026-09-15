@@ -1195,6 +1195,21 @@ struct DSS_EXPORT AtomicsRuntime {
     std::string libraryPath;        // DERIVED: resolved from `role` at load
     std::string loadMangledName;    // "__atomic_load"  / "___atomic_load"
     std::string storeMangledName;   // "__atomic_store" / "___atomic_store"
+    // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+    // the GENERIC compare-exchange entry an UNDER-ALIGNED `_Atomic` compound
+    // assignment / increment commits through — the same arbiter as its load, which
+    // is the only way the two agree:
+    //     bool __atomic_compare_exchange(size_t size, void *mem, void *expected,
+    //                                    void *desired, int success, int failure)
+    // ✔The shape and argument order were read off clang 18's own call site (4,
+    // ptr, &expected, &desired, 5, 5). ✔`libatomic.so.1` exports it as plain text
+    // at `@@LIBATOMIC_1.0` on both Linux legs; ✔Apple clang 21 (arm64) links it
+    // `(from libSystem)` and the program runs.
+    // OPTIONAL, unlike its two siblings, and the difference is what a missing name
+    // DOES: a format without it cannot lower an under-aligned compare-exchange, and
+    // that refuses BY NAME at compile time — it never lowers half of the pair and
+    // faults later. Empty = not declared.
+    std::string compareExchangeMangledName;  // "__atomic_compare_exchange" / "___…"
 };
 
 // The format's shipped-library synthesis block (`"librarySynthesis"` in

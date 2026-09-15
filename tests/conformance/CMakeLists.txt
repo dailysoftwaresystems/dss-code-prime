@@ -41,8 +41,14 @@ add_dependencies(dss_conformance_test_reference_conformance dsscp)
 # Cost, MEASURED on this host (Windows, Debug, 5 oracles, 76 probes): the DSS
 # half is ~130 ms per invocation x 76 probes x 2 fixed targets, and each oracle
 # is ONE batch process rather than 76 (which is why the cl.exe leg does not pay
-# the vcvars64 cost per probe). The ctest default timeout is generous enough on
-# every leg measured; a leg that adds a slow WSL-bridged oracle pays one process
-# launch, not one per probe.
-set_tests_properties(conformance/test_reference_conformance PROPERTIES
-    TIMEOUT 900)
+# the vcvars64 cost per probe). A leg that adds a slow WSL-bridged oracle pays one
+# process launch, not one per probe.
+#
+# ⚠ NO TIMEOUT IS SET HERE, and that is the fix, not an omission
+# (D-TEST-INTEGRATED-RUNNER-HANGS-BEFORE-CREATING-ITS-EX-DIRECTORY). This entry's
+# budget comes from `cmake/DssTestBudgets.cmake`, with every other entry's, from
+# its OWN measured ceilings per kind of build. It used to carry `TIMEOUT 900`:
+# ✔MEASURED over six CI runs, linux-clang-asan runs it in up to 606.81 s — 1.48x
+# under that number — while the widest spread between two healthy runs of one
+# entry on that leg is 3.79x, so a healthy sanitized run could have been named a
+# hang. `ctest/entry-budgets` refuses a TIMEOUT set here below the rule's budget.

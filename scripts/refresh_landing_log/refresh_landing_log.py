@@ -99,18 +99,48 @@ def load_config(config_path: Path) -> list[PlanSpec]:
     return out
 
 
+def _owning_tree():
+    """`scripts/owning-tree/owning-tree.py` -- the owner of asking git WITHOUT the caller's git environment.
+
+    Loaded by path from this file's sibling directory (a hyphen is not a module name). It FAILS
+    LOUD when absent: the rule it owns must not be spelled a second time here.
+    """
+    import importlib.util
+    path = Path(__file__).resolve().parent.parent / "owning-tree" / "owning-tree.py"
+    if not path.is_file():
+        sys.exit(f"refresh_landing_log: cannot find {path} -- this tool asks git through it "
+                 f"and nowhere else")
+    spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def git_log_subjects() -> list[tuple[str, str]]:
     """Return (full_sha, subject) pairs for every commit reachable from HEAD.
 
     Reverse-chronological is git's default; we reverse to chronological so
     callers see "initial" before "review followup".
+
+    ★★ ASKED WITHOUT THE CALLER'S GIT ENVIRONMENT. `cwd=` moves git's working directory and
+    nothing else. ✔MEASURED 2026-09-15 (P66 lane ge): on a tree whose history holds 111
+    commits, this function returned ONE -- another repository's -- under that repository's
+    GIT_DIR, and again under GIT_DIR + GIT_WORK_TREE (GIT_INDEX_FILE alone changed nothing:
+    `git log` reads no index). `--check` could not show it on that tree only because no commit
+    there matches a configured subject pattern, so both histories rendered every marker empty;
+    against a history that does match, the verdict flips (self-test arm 3).
+    ⇒ `owning-tree.run_git`. A failing `git log` still raises, as `check_output` did.
     """
-    out = subprocess.check_output(
-        ["git", "log", "--pretty=format:%H %s"],
+    p = _owning_tree().run_git(
+        ["log", "--pretty=format:%H %s"],
         cwd=REPO_ROOT,
+        capture_output=True,
         text=True,
         encoding="utf-8",
     )
+    if p.returncode != 0:
+        raise subprocess.CalledProcessError(p.returncode, p.args, p.stdout, p.stderr)
+    out = p.stdout
     rows = [line.split(" ", 1) for line in out.splitlines() if line]
     rows.reverse()
     return [(sha, subj) for sha, subj in rows if sha and subj]
@@ -263,6 +293,127 @@ def process_plan(
     return original, new
 
 
+# ── the self-test: this tool reads the history of the tree it lives in ──────────────────
+_FX_PATTERN = r"^Fixture landing (FX[0-9]+)[a-z]?(?:\s+(review)(?:\s+round-([0-9]+))?)?:"
+_FX_PLAN = (".plans/fx-landing-plan.md",
+            "# fixture plan\n\n### PR landing log\n\n| PR | hashes |\n|---|---|\n"
+            "| FX1 | <!-- LANDING-LOG-HASHES: FX1 --><!-- /LANDING-LOG-HASHES --> |\n")
+SELF_TEST_ARMS = 6
+
+
+def self_test() -> int:
+    """Red-on-disable for the git environment `git_log_subjects` runs in, against a history that MATCHES.
+
+    ★ WHY A FIXTURE AND NOT THIS TREE. ✔MEASURED 2026-09-15 (P66 lane ge): no commit reachable from
+    this repository's HEAD matches any configured subject pattern, so `--check` renders every marker
+    empty from ANY history and could not see a steered `git log` at all. The fixture history holds one
+    matching commit and a marker carrying its hash. THIS FILE is copied into it, with the owner it asks
+    git through, and the COPY's `--check` runs in a child under each environment -- so a
+    `git_log_subjects` reverted to a bare git call reddens arms 3 and 4 by name.
+      (1) CONTROL                  no steering                    -> --check rc 0
+      (2) the verdict CAN flip     the marker holds another hash  -> --check rc 1, so the rc 0 below means something
+      (3) GIT_DIR                  another repository             -> --check rc 0 (negative: bare git log lacks FX1)
+      (4) GIT_DIR + GIT_WORK_TREE  another repository             -> --check rc 0 (negative proven the same way)
+      (5) GIT_INDEX_FILE           another repository's, ABSOLUTE -> --check rc 0, and bare git log is unmoved by it
+      (6) the fixture box is removed, git's read-only objects included
+    """
+    import shutil
+    import tempfile
+
+    ot = _owning_tree()
+    base = ot.git_environment()
+    ran: list[str] = []
+    failed: list[str] = []
+
+    def arm(ok: bool, label: str, detail: str = "") -> None:
+        ran.append(label)
+        if not ok:
+            failed.append(label)
+        print("  %-4s %s%s" % ("ok" if ok else "FAIL", label, "" if ok else "   [%s]" % detail))
+
+    def git(cwd: Path, *args: str) -> str:
+        p = ot.run_git(["-C", str(cwd), "-c", "user.email=landing-log@example.invalid",
+                        "-c", "user.name=landing-log", "-c", "commit.gpgsign=false"] + list(args),
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if p.returncode != 0:
+            raise RuntimeError("git %s failed: %s" % (" ".join(args), p.stderr.strip()))
+        return p.stdout.strip()
+
+    box = Path(tempfile.mkdtemp(prefix="landing-log-selftest-")).resolve()
+    try:
+        own, other = box / "own", box / "other"
+        tool = own / "scripts" / "refresh_landing_log" / "refresh_landing_log.py"
+        tool.parent.mkdir(parents=True)
+        shutil.copyfile(Path(__file__).resolve(), tool)
+        (tool.parent / "landing-log-config.json").write_text(
+            json.dumps({"plans": [{"path": _FX_PLAN[0], "subjectPattern": _FX_PATTERN}]}), encoding="utf-8")
+        owner = own / "scripts" / "owning-tree" / "owning-tree.py"
+        owner.parent.mkdir(parents=True)
+        shutil.copyfile(Path(__file__).resolve().parent.parent / "owning-tree" / "owning-tree.py", owner)
+        plan = own / _FX_PLAN[0]
+        plan.parent.mkdir(parents=True)
+        plan.write_text(_FX_PLAN[1], encoding="utf-8", newline="\n")
+        git(own, "init", "-q")
+        git(own, "add", "-A")
+        git(own, "commit", "-q", "--no-verify", "-m", "Fixture landing FX1: the landed change")
+        sha7 = git(own, "rev-parse", "HEAD")[:7]
+        marked = _FX_PLAN[1].replace("FX1 --><!--", "FX1 -->`%s`<!--" % sha7)
+        plan.write_text(marked, encoding="utf-8", newline="\n")
+        git(own, "add", "-A")
+        git(own, "commit", "-q", "--no-verify", "-m", "fixture: record the landing hash")
+        other.mkdir()
+        (other / "other.txt").write_text("another repository\n", encoding="utf-8")
+        git(other, "init", "-q")
+        git(other, "add", "-A")
+        git(other, "commit", "-q", "--no-verify", "-m", "an unrelated commit")
+
+        def check(extra: dict) -> tuple[int, str]:
+            p = subprocess.run([sys.executable, str(tool), "--check"], cwd=str(box),
+                               env=dict(base, GIT_CEILING_DIRECTORIES=str(box), **extra),
+                               capture_output=True, text=True, encoding="utf-8", errors="replace",
+                               timeout=180)
+            return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+
+        rc, said = check({})
+        arm(rc == 0, "(1) CONTROL: --check is clean where the marker holds the hash its own history renders",
+            "rc=%d %s" % (rc, said[-200:]))
+
+        plan.write_text(marked.replace("`%s`" % sha7, "`0000000`"), encoding="utf-8", newline="\n")
+        rc, said = check({})
+        plan.write_text(marked, encoding="utf-8", newline="\n")
+        arm(rc == 1 and "out of date" in said,
+            "(2) the verdict CAN flip: a marker that differs from the rendered history is drift (rc 1)",
+            "rc=%d %s" % (rc, said[-200:]))
+
+        other_git = other / ".git"
+        steers = (("GIT_DIR", {"GIT_DIR": str(other_git)}, True),
+                  ("GIT_DIR + GIT_WORK_TREE", {"GIT_DIR": str(other_git), "GIT_WORK_TREE": str(other)}, True),
+                  ("an ABSOLUTE GIT_INDEX_FILE", {"GIT_INDEX_FILE": str((other_git / "index").resolve())}, False))
+        for n, (label, extra, steers_bare_git) in enumerate(steers, start=3):
+            bare = subprocess.run(["git", "-C", str(own), "log", "--pretty=format:%s"],
+                                  env=dict(base, **extra), capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace")
+            lacks = "Fixture landing FX1" not in bare.stdout
+            rc, said = check(extra)
+            arm(rc == 0 and lacks == steers_bare_git,
+                "(%d) a caller's %s naming another repository leaves --check reading its own history"
+                % (n, label),
+                "bare-git-log-lacks-FX1=%s (expected %s) rc=%d %s" % (lacks, steers_bare_git, rc, said[-200:]))
+    finally:
+        gone = ot.remove_tree(str(box))
+    arm(gone, "(6) the fixture box is removed -- git's read-only objects included", "left behind: %s" % box)
+
+    if len(ran) != SELF_TEST_ARMS:
+        print("refresh_landing_log self-test: FAIL -- %d arm(s) ran, %d expected" % (len(ran), SELF_TEST_ARMS))
+        return 1
+    if failed:
+        print("refresh_landing_log self-test: FAIL -- %d of %d arm(s)" % (len(failed), len(ran)))
+        return 1
+    print("refresh_landing_log self-test: OK -- %d arm(s): the landing log is read from this tree's own "
+          "history under GIT_DIR, GIT_DIR + GIT_WORK_TREE and an absolute GIT_INDEX_FILE" % len(ran))
+    return 0
+
+
 def main() -> int:
     # Plan files are UTF-8 with emoji status markers; Windows defaults
     # stdout to cp1252 which would crash on the diff output. Reconfigure
@@ -281,6 +432,12 @@ def main() -> int:
         action="store_true",
         help="apply the rewrite in place",
     )
+    mode.add_argument(
+        "--self-test",
+        action="store_true",
+        help="prove this tool reads the history of the tree it lives in, whatever git "
+             "environment the caller exported (ctest: landing_log_git_environment_guard)",
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -288,6 +445,8 @@ def main() -> int:
         help="path to landing-log-config.json (default: scripts/refresh_landing_log/landing-log-config.json)",
     )
     args = parser.parse_args()
+    if args.self_test:
+        return self_test()
 
     plans = load_config(args.config)
     all_subjects = git_log_subjects()

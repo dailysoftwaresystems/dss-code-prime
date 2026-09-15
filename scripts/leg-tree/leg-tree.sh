@@ -73,6 +73,89 @@ leg_tree_abs() {
     esac
 }
 
+# leg_tree_unsteered <command> [arg]...
+#
+# Run ONE command with every repository-selecting variable the CALLER exported removed:
+# the names `git rev-parse --local-env-vars` lists -- git's own definition, the set git clears
+# itself when it enters a submodule. EVERY git call in this file goes through it, as
+# `leg_tree_git_unsteered` below.
+#
+# ★★ ANY COMMAND, NOT ONLY GIT: a program that runs git to find its own subject is steered by the
+# same variables. ✔MEASURED 2026-09-15 (P66 lane ge; gh 2.89.0): `gh api repos/:owner/:repo` run
+# from this repository's root answered `dailysoftwaresystems/dss-code-prime`, and HTTP 404 under
+# another repository's GIT_DIR, and again under GIT_DIR + GIT_WORK_TREE -- gh had resolved THAT
+# repository's origin -- so `check-ci-legs.sh` asked about another repository's CI even when it was
+# given the branch. What is removed is a property of the CALLER'S ENVIRONMENT, so it has one owner
+# whatever the command. ⚠ An empty command is refused (rc 4): `exec` with nothing runs nothing, rc 0.
+#
+# ★★★ WHY. `git -C <dir>` and `cd <dir>` move git's working directory and NOTHING ELSE: an
+# exported GIT_DIR, GIT_WORK_TREE or GIT_INDEX_FILE still decides which repository answers.
+# ✔MEASURED 2026-09-15 (P66 lane rr, round 2; fixture repositories; WSL bash 5.2.21 and Git
+# Bash 5.3.15):
+#   * with ANOTHER repository's GIT_DIR + GIT_WORK_TREE exported, `leg_tree_restore <clone>`
+#     printed "restored <clone> -- 2 dirty path(s) discarded", rc=0 -- and the discarded paths
+#     were the OTHER repository's, while the named clone stayed dirty;
+#   * `leg_tree_driver_git <tree> ls-files` listed a decoy repository's file under its
+#     GIT_INDEX_FILE, and again under its GIT_DIR;
+#   * `leg_tree_owning_root` answered a non-root under GIT_DIR alone, and the other
+#     repository under GIT_DIR + GIT_WORK_TREE.
+# A git hook exports GIT_INDEX_FILE to everything it runs -- ABSOLUTE during a partial
+# `git commit -- <path>` (✔measured) -- so a leg or a guard started from one is such a caller.
+# ⚠ The variables are removed in a SUBSHELL, so the caller's own environment is untouched.
+# The list is asked for once and kept; the query answers even with GIT_DIR pointing nowhere.
+# ⚠ REFUSES (rc 2) when that list does not name GIT_DIR: a command that cannot be kept from
+# the caller's environment is not run at all.
+leg_tree_unsteered() {
+    if [ "$#" -eq 0 ] || [ -z "${1:-}" ]; then
+        printf '\n[X] leg-tree: unsteered needs <command> [arg]... -- an empty command would run nothing and report success\n' >&2
+        return 4
+    fi
+    if [ -z "${_lt_git_local_vars:-}" ]; then
+        _lt_git_local_vars=$(git rev-parse --local-env-vars 2>/dev/null | tr '\n' ' ') \
+            || _lt_git_local_vars=''
+    fi
+    case " ${_lt_git_local_vars} " in
+        *" GIT_DIR "*) ;;
+        *)  _lt_git_local_vars=''
+            printf '\n[X] leg-tree: git rev-parse --local-env-vars did not name GIT_DIR, so no command can be kept from the caller git environment\n' >&2
+            return 2 ;;
+    esac
+    (
+        IFS=' '
+        for _lt_v in $_lt_git_local_vars; do unset "$_lt_v"; done
+        exec "$@"
+    )
+}
+
+# leg_tree_git_unsteered <git-arg>...
+#
+# ONE git command through `leg_tree_unsteered` above -- the name every git call in this file, and in
+# every script that sources it, is written against. Its behaviour is the owner's, unchanged by the
+# generalisation: `test-leg-tree.sh`'s steering arms, which predate it, are the control.
+leg_tree_git_unsteered() {
+    leg_tree_unsteered git "$@"
+}
+
+# leg_tree_dss_tree <dir>
+#
+# Print the nearest ancestor of <dir> (itself included) holding BOTH `.plans/` and `scripts/`,
+# or return 1: the DSS-tree rule `scripts/owning-tree/owning-tree.py` owns for Python, in this
+# language. `leg_tree_owning_root` checks git's answer against it.
+# ⚠ An EMPTY <dir> answers nothing: `cd ""` stays where the caller stands on bash 5.2 and dash.
+leg_tree_dss_tree() {
+    [ -n "${1:-}" ] || return 1
+    _lt_dt_d=$(cd "$1" 2>/dev/null && pwd -P) || return 1
+    while :; do
+        if [ -d "$_lt_dt_d/.plans" ] && [ -d "$_lt_dt_d/scripts" ]; then
+            printf '%s\n' "$_lt_dt_d"
+            return 0
+        fi
+        _lt_dt_up=$(dirname "$_lt_dt_d")
+        [ "$_lt_dt_up" != "$_lt_dt_d" ] || return 1
+        _lt_dt_d="$_lt_dt_up"
+    done
+}
+
 # leg_tree_driver_identity <src>
 #
 # Sets LEG_TREE_DRIVER_BRANCH, LEG_TREE_DRIVER_SHA and LEG_TREE_DRIVER_GIT_DIR from
@@ -109,8 +192,8 @@ leg_tree_driver_identity() {
     [ -n "$_lt_src" ] || return 1
 
     # The ordinary case: a real repository, or a worktree whose gitdir resolves here.
-    if _lt_s=$(git -C "$_lt_src" rev-parse HEAD 2>/dev/null) && [ -n "$_lt_s" ]; then
-        _lt_b=$(git -C "$_lt_src" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    if _lt_s=$(leg_tree_git_unsteered -C "$_lt_src" rev-parse HEAD 2>/dev/null) && [ -n "$_lt_s" ]; then
+        _lt_b=$(leg_tree_git_unsteered -C "$_lt_src" rev-parse --abbrev-ref HEAD 2>/dev/null)
         [ -n "$_lt_b" ] || return 1
         LEG_TREE_DRIVER_SHA="$_lt_s"; LEG_TREE_DRIVER_BRANCH="$_lt_b"
         return 0
@@ -146,8 +229,8 @@ leg_tree_driver_identity() {
     fi
     [ -d "$_lt_gd" ] || return 1
 
-    _lt_s=$(git --git-dir="$_lt_gd" --work-tree="$_lt_src" rev-parse HEAD 2>/dev/null) || return 1
-    _lt_b=$(git --git-dir="$_lt_gd" --work-tree="$_lt_src" rev-parse --abbrev-ref HEAD 2>/dev/null) || return 1
+    _lt_s=$(leg_tree_git_unsteered --git-dir="$_lt_gd" --work-tree="$_lt_src" rev-parse HEAD 2>/dev/null) || return 1
+    _lt_b=$(leg_tree_git_unsteered --git-dir="$_lt_gd" --work-tree="$_lt_src" rev-parse --abbrev-ref HEAD 2>/dev/null) || return 1
     [ -n "$_lt_s" ] && [ -n "$_lt_b" ] || return 1
     LEG_TREE_DRIVER_SHA="$_lt_s"; LEG_TREE_DRIVER_BRANCH="$_lt_b"
     LEG_TREE_DRIVER_GIT_DIR="$_lt_gd"
@@ -166,12 +249,22 @@ leg_tree_driver_identity() {
 # second of which is byte-identical to the reading a genuinely pristine tree produces,
 # which is the failure mode the WSL carriage already names in its own attribution
 # block. One accessor keeps both halves of the report on the same git.
+#
+# ⚠ AN EMPTY <src> IS REFUSED (rc 4). ✔MEASURED 2026-09-15 (P66 lane rr): `git -C ""` leaves git
+# in the caller's working directory, so `leg_tree_driver_git "" status --porcelain` answered for
+# whatever repository the caller stood in (" M t.txt ?? untracked.txt", rc=0) -- a report about
+# the wrong tree, in the words of the right one.
 leg_tree_driver_git() {
-    _lt_g_src=$(leg_tree_abs "$1"); shift
+    _lt_g_src=$(leg_tree_abs "${1:-}")
+    if [ -z "$_lt_g_src" ]; then
+        printf '\n[X] leg-tree: driver_git needs <src> <git-arg>... -- an empty <src> would answer for whatever repository the caller is standing in\n' >&2
+        return 4
+    fi
+    shift
     if [ -n "${LEG_TREE_DRIVER_GIT_DIR:-}" ]; then
-        git --git-dir="$LEG_TREE_DRIVER_GIT_DIR" --work-tree="$_lt_g_src" "$@"
+        leg_tree_git_unsteered --git-dir="$LEG_TREE_DRIVER_GIT_DIR" --work-tree="$_lt_g_src" "$@"
     else
-        git -C "$_lt_g_src" "$@"
+        leg_tree_git_unsteered -C "$_lt_g_src" "$@"
     fi
 }
 
@@ -216,35 +309,65 @@ leg_tree_driver_git() {
 # A bare repository has no working tree; `--show-toplevel` fatals there and case 2's
 # `.git` test does not match, so this helper correctly returns 1 rather than handing
 # back the bare directory as somewhere to put a checkout.
+#
+# ★★★ AND GIT'S ANSWER IS CHECKED AGAINST THE TREE THE PATH LIVES IN.
+# ✔MEASURED 2026-09-15 (P66 lane rr, fixtures; WSL bash 5.2.21 and Git Bash 5.3.15), each wrong
+# answer printed with rc 0:
+#     the caller exports GIT_DIR                    -> `<tree>/scripts/probe`, not a root at all
+#     the caller exports GIT_DIR and GIT_WORK_TREE  -> the OTHER repository
+#     an untracked DSS tree copied inside another checkout -> the OUTER checkout
+# The first two were the caller's environment reaching git; every git call in this file now
+# goes through `leg_tree_git_unsteered`. The third is git answering truthfully about another
+# question: an untracked copy has no git of its own, so the enclosing checkout answers, and a
+# verb managing `.worktrees/` from that copy would have managed the OUTER checkout's.
+# ⇒ THE RULE `scripts/owning-tree/owning-tree.py` states for Python, in this language:
+#     A = the nearest DSS tree holding the path (`.plans/` AND `scripts/`), if any
+#     G = git's working tree for the path (case 1, else case 2), asked without the caller's env
+#     no G                        -> return 1
+#     no A                        -> G   (a plain repository: lane-worktree's `--repo <repo>`)
+#     G is A, or G is inside A    -> G   (a tree, or a repository nested inside a tree)
+#     A is inside G               -> REFUSE, return 1: git answers for the enclosing checkout
 leg_tree_owning_root() {
-    _lt_or_p=$(leg_tree_abs "$1")
+    _lt_or_p=$(leg_tree_abs "${1:-}")
     [ -n "$_lt_or_p" ] || return 1
     [ -d "$_lt_or_p" ] || _lt_or_p=$(dirname "$_lt_or_p")
     _lt_or_d=$(cd "$_lt_or_p" 2>/dev/null && pwd -P) || return 1
 
-    # 1. The ordinary case, in every namespace that can simply see the tree.
-    if _lt_or_t=$(git -C "$_lt_or_d" rev-parse --show-toplevel 2>/dev/null) \
+    # G, case 1: the ordinary case, in every namespace that can simply see the tree.
+    _lt_or_g=''
+    if _lt_or_t=$(leg_tree_git_unsteered -C "$_lt_or_d" rev-parse --show-toplevel 2>/dev/null) \
        && [ -n "$_lt_or_t" ]; then
-        printf '%s\n' "$_lt_or_t"
-        return 0
+        _lt_or_g="$_lt_or_t"
+    else
+        # G, case 2: a worktree whose `.git` FILE names a gitdir THIS namespace cannot follow
+        # -- the Windows-created worktree read from inside WSL that
+        # `leg_tree_driver_identity` was written for. `git -C` fails outright there, so
+        # walk up to the directory that HOLDS the `.git` and let the identity resolver
+        # prove it can describe it. The directory holding a resolvable `.git` IS the
+        # root, so nothing here re-derives what case 1 would have printed.
+        _lt_or_w="$_lt_or_d"
+        while :; do
+            if [ -e "$_lt_or_w/.git" ] \
+               && leg_tree_driver_identity "$_lt_or_w" >/dev/null 2>&1; then
+                _lt_or_g="$_lt_or_w"
+                break
+            fi
+            _lt_or_up=$(dirname "$_lt_or_w")
+            [ "$_lt_or_up" != "$_lt_or_w" ] || break
+            _lt_or_w="$_lt_or_up"
+        done
     fi
+    [ -n "$_lt_or_g" ] || return 1
 
-    # 2. A worktree whose `.git` FILE names a gitdir THIS namespace cannot follow --
-    # the Windows-created worktree read from inside WSL that
-    # `leg_tree_driver_identity` was written for. `git -C` fails outright there, so
-    # walk up to the directory that HOLDS the `.git` and let the identity resolver
-    # prove it can describe it. The directory holding a resolvable `.git` IS the
-    # root, so nothing here re-derives what case 1 would have printed.
-    while :; do
-        if [ -e "$_lt_or_d/.git" ] \
-           && leg_tree_driver_identity "$_lt_or_d" >/dev/null 2>&1; then
-            printf '%s\n' "$_lt_or_d"
-            return 0
-        fi
-        _lt_or_up=$(dirname "$_lt_or_d")
-        [ "$_lt_or_up" != "$_lt_or_d" ] || return 1
-        _lt_or_d="$_lt_or_up"
-    done
+    # A, and the rule above.
+    _lt_or_a=$(leg_tree_dss_tree "$_lt_or_d") || { printf '%s\n' "$_lt_or_g"; return 0; }
+    _lt_or_gp=$(cd "$_lt_or_g" 2>/dev/null && pwd -P) || return 1
+    case "$_lt_or_gp/" in
+        "$_lt_or_a"/*) printf '%s\n' "$_lt_or_g"; return 0 ;;
+    esac
+    printf '\n[X] leg-tree: %s is a DSS tree nested inside the checkout %s, which it is not the root of. git answers for the enclosing checkout there, so no owning root is named.\n' \
+        "$_lt_or_a" "$_lt_or_gp" >&2
+    return 1
 }
 
 # leg_tree_prepare <repo> <branch> <sha>
@@ -257,23 +380,23 @@ leg_tree_owning_root() {
 # and the leg continues. A leg that refuses to run because of an attribution detail
 # would be trading a real measurement for a bookkeeping one.
 leg_tree_prepare() {
-    _lt_repo=$(leg_tree_abs "$1"); _lt_branch="$2"; _lt_sha="$3"
+    _lt_repo=$(leg_tree_abs "${1:-}"); _lt_branch="${2:-}"; _lt_sha="${3:-}"
     [ -n "$_lt_repo" ] && [ -n "$_lt_branch" ] || leg_tree_die "prepare needs <repo> <branch> <sha>" 4
 
     cd "$_lt_repo" 2>/dev/null || leg_tree_die "no such directory: $_lt_repo"
-    git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    leg_tree_git_unsteered rev-parse --is-inside-work-tree >/dev/null 2>&1 \
         || leg_tree_die "$_lt_repo is not a git work tree. This standard requires a real CLONE on every leg host -- clone it there once rather than letting a sync invent one."
 
-    _lt_was_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '<none>')
-    _lt_was_head=$(git rev-parse --short HEAD 2>/dev/null || echo '<none>')
-    _lt_was_dirty=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    _lt_was_branch=$(leg_tree_git_unsteered rev-parse --abbrev-ref HEAD 2>/dev/null || echo '<none>')
+    _lt_was_head=$(leg_tree_git_unsteered rev-parse --short HEAD 2>/dev/null || echo '<none>')
+    _lt_was_dirty=$(leg_tree_git_unsteered status --porcelain 2>/dev/null | wc -l | tr -d ' ')
 
     # Drop registrations for worktrees whose directory is gone. Cheap, and it is the
     # half of worktree hygiene that cannot be done from the driver.
-    git worktree prune 2>/dev/null || true
+    leg_tree_git_unsteered worktree prune 2>/dev/null || true
 
     # Non-fatal: a host that cannot reach origin can still test the synced tree.
-    if git fetch --quiet origin 2>/dev/null; then
+    if leg_tree_git_unsteered fetch --quiet origin 2>/dev/null; then
         _lt_fetch=ok
     else
         _lt_fetch=FAILED
@@ -296,8 +419,8 @@ leg_tree_prepare() {
     # ⚠ Discarding here is prepare's CONTRACT ("pristine before sync"), not a
     # liberty: `_lt_was_dirty` is already captured above, so the count survives
     # into the report even though the paths do not. `-fd`, never `-fdx`.
-    git reset --hard --quiet HEAD 2>/dev/null || true
-    git clean -fdq 2>/dev/null || true
+    leg_tree_git_unsteered reset --hard --quiet HEAD 2>/dev/null || true
+    leg_tree_git_unsteered clean -fdq 2>/dev/null || true
 
     # ★ THE BRANCH CHECK THE OPERATOR ASKED FOR, and it is done by MOVING the host
     # rather than by asserting about it: `-B` puts the branch at the driver's commit
@@ -337,22 +460,22 @@ leg_tree_prepare() {
     if [ "$_lt_branch" = "HEAD" ]; then
         [ -n "$_lt_sha" ] \
             || leg_tree_die "the driver is DETACHED (branch reads as the literal 'HEAD') but named no commit. A detached driver has no branch to fall back to, so the sha is the only thing that can identify the tree under test." 4
-        git cat-file -e "${_lt_sha}^{commit}" 2>/dev/null \
+        leg_tree_git_unsteered cat-file -e "${_lt_sha}^{commit}" 2>/dev/null \
             || leg_tree_die "the driver is DETACHED at $_lt_sha and this host does not carry that commit (fetch=$_lt_fetch). Push it, or run the leg from a checkout that is on a branch -- there is no branch here to fall back to." 3
-        git checkout --quiet --detach "$_lt_sha" \
+        leg_tree_git_unsteered checkout --quiet --detach "$_lt_sha" \
             || leg_tree_die "could not put $_lt_repo at detached $_lt_sha (git's reason is directly above)" 3
         _lt_at="$_lt_sha"
         printf '! leg-tree: the driver is DETACHED, so %s is put DETACHED at %s rather than on a branch.\n' \
             "$_lt_repo" "$_lt_sha" >&2
         printf '  That is the honest mirror of the driver (a lane worktree), not a degraded mode.\n' >&2
-    elif [ -n "$_lt_sha" ] && git cat-file -e "${_lt_sha}^{commit}" 2>/dev/null; then
-        git checkout --quiet -B "$_lt_branch" "$_lt_sha" \
+    elif [ -n "$_lt_sha" ] && leg_tree_git_unsteered cat-file -e "${_lt_sha}^{commit}" 2>/dev/null; then
+        leg_tree_git_unsteered checkout --quiet -B "$_lt_branch" "$_lt_sha" \
             || leg_tree_die "could not put $_lt_repo on $_lt_branch at $_lt_sha (git's reason is directly above)" 3
         _lt_at="$_lt_sha"
     else
-        git checkout --quiet "$_lt_branch" \
+        leg_tree_git_unsteered checkout --quiet "$_lt_branch" \
             || leg_tree_die "could not check out '$_lt_branch' in $_lt_repo (fetch=$_lt_fetch; git's reason is directly above)" 3
-        _lt_at=$(git rev-parse --short HEAD 2>/dev/null)
+        _lt_at=$(leg_tree_git_unsteered rev-parse --short HEAD 2>/dev/null)
         printf '! leg-tree: the driver HEAD %s is NOT on this host (fetch=%s).\n' \
             "${_lt_sha:-<unset>}" "$_lt_fetch" >&2
         printf '  Continuing at %s: the sync overwrites every tracked file, so the TREE under\n' "$_lt_at" >&2
@@ -366,39 +489,50 @@ leg_tree_prepare() {
     # its caller is "pristine before sync". Cheap insurance on a safety-critical path.
     # `-fd`, never `-fdx`: ignored paths (`build/`, the ccache) are the leg's own
     # working state and re-making them costs a cold build for no correctness gain.
-    git reset --hard --quiet HEAD 2>/dev/null || true
-    git clean -fdq 2>/dev/null || true
+    leg_tree_git_unsteered reset --hard --quiet HEAD 2>/dev/null || true
+    leg_tree_git_unsteered clean -fdq 2>/dev/null || true
 
     printf 'leg-tree: prepared %s\n' "$_lt_repo"
     printf '  was    : %s @ %s, %s dirty path(s)\n' "$_lt_was_branch" "$_lt_was_head" "$_lt_was_dirty"
     printf '  now    : %s @ %s, fetch=%s, pristine before sync\n' \
-        "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" \
-        "$(git rev-parse --short HEAD 2>/dev/null)" "$_lt_fetch"
+        "$(leg_tree_git_unsteered rev-parse --abbrev-ref HEAD 2>/dev/null)" \
+        "$(leg_tree_git_unsteered rev-parse --short HEAD 2>/dev/null)" "$_lt_fetch"
 }
 
 # leg_tree_restore <repo> [sha]
 #
 # ★ Called on EVERY exit path, a failure included. A leg that dies half way leaves the
 # dirtiest tree of all, which is exactly when the next leg most needs a clean one.
+#
+# ⛔ AN EMPTY OR MISSING <repo> IS REFUSED (rc 4) BEFORE ANY `cd`, EXACTLY AS PREPARE REFUSES.
+# ✔MEASURED 2026-09-15 (P66 lane rr, on fixture repositories): `cd ""` is a silent no-op on WSL
+# bash 5.2.21 and on dash, so `leg_tree_restore ""` and `leg_tree_restore` with no argument
+# (WSL bash), and `sh leg-tree.sh restore` (WSL bash and dash), each ran `reset --hard` and
+# `clean -fd` over WHATEVER REPOSITORY THE CALLER STOOD IN -- "leg-tree: restored  -- 2 dirty
+# path(s) discarded", rc=0. Git Bash 5.3 was spared only because its `cd ""` fails. A restore
+# runs from EXIT traps, where an unset variable is the likeliest mistake of all, so the refusal
+# lives here and not at each caller (`test-leg-tree.sh` arms E1-E3).
 leg_tree_restore() {
-    _lt_repo=$(leg_tree_abs "$1"); _lt_sha="${2:-}"
+    _lt_repo=$(leg_tree_abs "${1:-}"); _lt_sha="${2:-}"
+    [ -n "$_lt_repo" ] \
+        || leg_tree_die "restore needs <repo> [sha] -- an empty repository would restore whatever repository the caller is standing in" 4
     cd "$_lt_repo" 2>/dev/null || { printf '! leg-tree: restore skipped, no %s\n' "$_lt_repo" >&2; return 0; }
-    git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    leg_tree_git_unsteered rev-parse --is-inside-work-tree >/dev/null 2>&1 \
         || { printf '! leg-tree: restore skipped, %s is not a work tree\n' "$_lt_repo" >&2; return 0; }
 
-    _lt_dirty=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
-    if [ -n "$_lt_sha" ] && git cat-file -e "${_lt_sha}^{commit}" 2>/dev/null; then
-        git reset --hard --quiet "$_lt_sha" 2>/dev/null || true
+    _lt_dirty=$(leg_tree_git_unsteered status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    if [ -n "$_lt_sha" ] && leg_tree_git_unsteered cat-file -e "${_lt_sha}^{commit}" 2>/dev/null; then
+        leg_tree_git_unsteered reset --hard --quiet "$_lt_sha" 2>/dev/null || true
     else
-        git reset --hard --quiet HEAD 2>/dev/null || true
+        leg_tree_git_unsteered reset --hard --quiet HEAD 2>/dev/null || true
     fi
-    git clean -fdq 2>/dev/null || true
-    git worktree prune 2>/dev/null || true
+    leg_tree_git_unsteered clean -fdq 2>/dev/null || true
+    leg_tree_git_unsteered worktree prune 2>/dev/null || true
 
     printf 'leg-tree: restored %s -- %s dirty path(s) discarded, now %s dirty, at %s\n' \
         "$_lt_repo" "$_lt_dirty" \
-        "$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')" \
-        "$(git rev-parse --short HEAD 2>/dev/null)"
+        "$(leg_tree_git_unsteered status --porcelain 2>/dev/null | wc -l | tr -d ' ')" \
+        "$(leg_tree_git_unsteered rev-parse --short HEAD 2>/dev/null)"
 
     # ★★ NAME THE BUILD ROOTS THIS RESTORE JUST ORPHANED.
     # `clean -fd` (never `-fdx`) deliberately SPARES ignored paths, so `build/`
@@ -421,18 +555,82 @@ leg_tree_restore() {
                     | sed 's|/CMakeCache.txt$||' | tr '\n' ' ')
         if [ -n "$_lt_roots" ]; then
             printf '! leg-tree: these build root(s) were built from the tree just discarded and now sit over %s: %s\n' \
-                "$(git rev-parse --short HEAD 2>/dev/null)" "$_lt_roots" >&2
+                "$(leg_tree_git_unsteered rev-parse --short HEAD 2>/dev/null)" "$_lt_roots" >&2
             printf '! leg-tree: they are KEPT on purpose (cold rebuilds are expensive); rebuild before trusting a binary from them.\n' >&2
         fi
     fi
 }
 
-# ── dispatch, so this file is BOTH inlineable and runnable ───────────────────
-# The two remote carriages inline this text into their payload and call the
-# functions; the WSL leg runs the file. One owner either way.
+# ── the REMOTE transport: this file travels on STDIN, never on a command line ─
+#
+# leg_tree_remote_command <helper-file> <verb> [arg]...
+#
+# Print the ONE command a carriage hands its host so that `<verb> <arg>...` of this helper runs
+# there, when the carriage's STANDARD INPUT is <helper-file>'s bytes:
+#     sh -c '<LEG_TREE_REMOTE_LOADER>' leg-tree <bytes> <verb> '<arg>'...
+# Its length depends on the arguments and never on the helper. The drivers use it as
+#     <carriage> "$(leg_tree_remote_command "$helper" prepare "$repo" "$branch" "$sha")" < "$helper"
+# and `macos-leg.ps1` builds the identical command from the same loader line (its test compares them).
+#
+# ★★★ WHY. Every driver used to send this file's TEXT as one command-line argument, so each one
+# worked only while the file stayed under the smallest ceiling its path crossed. ✔MEASURED
+# 2026-09-15 (P66 lane ge), this file at 33,901 bytes:
+#   * NATIVE ssh.exe (what `Git\usr\bin\bash.exe`, and PowerShell, resolve `ssh` to) refused one
+#     argument of 32,700 characters ("Argument list too long", rc 126) and took 32,000 -- so
+#     `macos-leg.sh` through a native ssh.exe was already OVER the ceiling;
+#   * `macos-leg.ps1` fit only because it strips every comment line: 10,761 characters, whose
+#     second hop, the carriage's `& ssh`, failed at 32,193 -- 21,428 characters of headroom;
+#   * inside WSL (`remote-leg.sh`, both carriages) one argument of 131,072 bytes failed at the
+#     local execve (MAX_ARG_STRLEN) and 131,071 passed -- ~97,000 bytes of headroom.
+# Each is a size dependence, so each breaks again as this file grows; stdin has no such ceiling.
+#
+# ★★ WHAT THE LOADER DOES, AND WHY EACH STEP.
+#   * reads EXACTLY <bytes> bytes of stdin into a private temp file. Exact, because a PowerShell
+#     STRING pipe appends a CRLF (✔measured: 33,903 of 33,901 bytes arrived) and a drained or cut
+#     stream is shorter; `head -c` takes the helper's bytes and nothing after them;
+#   * REFUSES, rc 71, when fewer arrived, and runs NOTHING: a helper cut at a function boundary
+#     parses cleanly, defines functions, dispatches nothing and exits 0 -- a prepare that
+#     "succeeds" having done nothing;
+#   * runs `sh <file> <verb> <arg>...` with stdin from /dev/null, so nothing the verb starts
+#     (git fetch, a credential prompt) can read what follows, and the file is complete before any
+#     of it runs;
+#   * names `sh`, because an ssh command runs under the host's LOGIN shell (✔measured bash on the
+#     arm64 VPS; zsh is macOS's default) and this file is POSIX sh;
+#   * removes its temp file on every exit, a signal included, and passes the verb's exit status.
+# ⚠ The loader holds no single quote, so it can be single-quoted for any POSIX-family login
+# shell; an argument's own single quote is written '\'' (a branch name may contain one:
+# `git check-ref-format --branch "a'b"` accepts it).
+LEG_TREE_REMOTE_LOADER='n=$1; shift; t=$(mktemp "${TMPDIR:-/tmp}/leg-tree.XXXXXX") || exit 70; trap "rm -f -- \"$t\"" EXIT; trap "exit 129" HUP; trap "exit 130" INT; trap "exit 143" TERM; head -c "$n" > "$t"; got=$(wc -c < "$t" | tr -d " "); if [ "$got" != "$n" ]; then echo "leg-tree: the helper arrived TRUNCATED on stdin ($got of $n bytes), so nothing was run" >&2; exit 71; fi; sh "$t" "$@" < /dev/null'
+
+leg_tree_remote_command() {
+    _lt_rc_helper="${1:-}"; _lt_rc_verb="${2:-}"
+    if [ -z "$_lt_rc_helper" ] || [ ! -f "$_lt_rc_helper" ]; then
+        printf '\n[X] leg-tree: remote_command needs <helper-file> <verb> [arg]... -- no readable helper at %s\n' "$_lt_rc_helper" >&2
+        return 4
+    fi
+    case "$_lt_rc_verb" in
+        ''|*[!a-z_]*)
+            printf '\n[X] leg-tree: remote_command verb %s is not a lower-case word, so it cannot be sent unquoted\n' "'$_lt_rc_verb'" >&2
+            return 4 ;;
+    esac
+    shift 2
+    _lt_rc_n=$(wc -c < "$_lt_rc_helper" | tr -d ' ')
+    _lt_rc_cmd="sh -c '$LEG_TREE_REMOTE_LOADER' leg-tree $_lt_rc_n $_lt_rc_verb"
+    for _lt_rc_a in "$@"; do
+        _lt_rc_q=$(printf '%s' "$_lt_rc_a" | sed "s/'/'\\\\''/g")
+        _lt_rc_cmd="$_lt_rc_cmd '$_lt_rc_q'"
+    done
+    printf '%s\n' "$_lt_rc_cmd"
+}
+
+# ── dispatch, so this file is BOTH sourceable and runnable ───────────────────
+# The local drivers SOURCE it (with an empty argument) for their own git reads and
+# for `leg_tree_remote_command`; a remote host RUNS it, as `sh <file> <verb> <arg>...`,
+# once the loader has read it off the carriage's stdin; the WSL leg runs the file.
+# One owner either way.
 case "${1:-}" in
     prepare) shift; leg_tree_prepare "$@" ;;
     restore) shift; leg_tree_restore "$@" ;;
-    "")      ;;  # sourced or inlined: define the functions and do nothing
+    "")      ;;  # sourced: define the functions and do nothing
     *)       leg_tree_die "unknown subcommand '$1' (expected: prepare, restore)" 4 ;;
 esac

@@ -92,8 +92,8 @@
 # that silently mutates a personal box is the same class of mistake as one that resets it.
 #
 # Usage:
-#   scripts/macos-leg/macos-leg.sh                      # push CWD, clean build, full ctest
-#   scripts/macos-leg/macos-leg.sh --src <dir>          # push <dir> instead of CWD
+#   scripts/macos-leg/macos-leg.sh                      # push THIS script's tree, clean build, full ctest
+#   scripts/macos-leg/macos-leg.sh --src <dir>          # push <dir> instead (relative to the caller, as typed)
 #   scripts/macos-leg/macos-leg.sh -R '<regex>'         # scope the ctest
 #   scripts/macos-leg/macos-leg.sh -j <n>               # ctest parallelism (default 6)
 #   scripts/macos-leg/macos-leg.sh --guards             # ALSO run the repo guards (off by
@@ -117,7 +117,21 @@
 # is not a positive integer is refused rather than silently replaced by the default.
 set -uo pipefail
 
-SRC="$(pwd)"
+# ★★ THE TREE THIS SCRIPT LIVES IN, NEVER THE CALLER'S WORKING DIRECTORY -- for the default
+# source AND for every repository file this driver opens (the carriage, `leg-tree.sh`).
+# This was `SRC="$(pwd)"` beside a cwd-relative carriage. ✔MEASURED 2026-09-15 (P66, under
+# `bash -x` with a refused `-j`, so nothing reached a carriage): run by path from inside
+# another repository, `SRC` was THAT repository, and from a directory inside no repository
+# it was that directory -- with the carriage looked up relative to each. So from any other
+# checkout's root this pushed and tested THAT checkout, through THAT checkout's carriage,
+# while this file reported the leg: the class
+# [[D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED]] closed for the lane verbs.
+# The spelling is `remote-leg.sh`'s, this driver's sibling. `--src` still wins, taken
+# relative to the caller as typed; it names what is PUSHED, never where this driver's own
+# machinery comes from. Pinned by `test-macos-leg.py` beside this file.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+SRC="$REPO_ROOT"
 FILTER=""
 JOBS=""
 GUARDS="${DSS_LEG_GUARDS:-0}"
@@ -132,7 +146,7 @@ RESET_TO=""
 MODE="full"
 TREE="dbg"
 BUILD_TYPE="Debug"
-CARRIAGE="scripts/ssh-macos/ssh-macos.sh"
+CARRIAGE="$REPO_ROOT/scripts/ssh-macos/ssh-macos.sh"
 
 die() { printf '\n[X] macos-leg: %s\n' "$*" >&2; exit 1; }
 say() { printf '\n=== %s ===\n' "$*"; }
@@ -219,7 +233,7 @@ case "${JOBS:-}" in
     0|*[!0-9]*) die "-j '$JOBS' is not a positive job count. Refused rather than silently replaced by the remote default." ;;
 esac
 
-[ -f "$CARRIAGE" ] || die "carriage not found at $CARRIAGE (run from the repo root)"
+[ -f "$CARRIAGE" ] || die "carriage not found at $CARRIAGE, in the tree this script lives in"
 
 if [ -n "$RESET_TO" ]; then
     say "remote fetch + reset --hard $RESET_TO"
@@ -241,19 +255,21 @@ fi
 # Operator ruling 2026-08-26: every leg host keeps its own clone (`~/src/dss-code-prime`
 # here), the leg CHECKS ITS BRANCH before working in it, and the leg cleans up after
 # itself. One owner for all three hosts: `scripts/leg-tree/`.
-# ★ The script text is INLINED rather than assumed present on the far side -- the Mac's
-# checkout can predate this file, and a bootstrap that needs the thing it bootstraps is
-# not a bootstrap. `"$(cat …)"` is what makes that safe: command-substitution output is
-# NOT re-expanded, so the script's own `$` and quotes arrive verbatim while the three
-# values written explicitly expand here, once, under this shell's control.
+# ★ The helper is SENT rather than assumed present on the far side -- the Mac's checkout can
+# predate this file, and a bootstrap that needs the thing it bootstraps is not a bootstrap.
+# ★★ IT TRAVELS ON THE CARRIAGE'S STDIN; ONLY A ~450-BYTE COMMAND RIDES THE COMMAND LINE.
+# This used to pass `"$(cat …/leg-tree.sh)"` as ONE argument, which works only while that file
+# stays under the smallest ceiling its path crosses. ✔MEASURED 2026-09-15 (P66 lane ge): from a
+# Git Bash whose `ssh` is the NATIVE ssh.exe (`Git\usr\bin\bash.exe` resolves it so), one
+# argument of 32,700 characters is refused ("Argument list too long", rc 126) -- and the file was
+# 33,901 bytes, already over. `leg_tree_remote_command` in `scripts/leg-tree/leg-tree.sh` owns the
+# command, its loader and the measurements; stdin carries the file's exact bytes.
 # ⚠ THIS RUNS EVEN WHEN `--no-push` IS GIVEN, and deliberately: `--no-push` means "do
 # not replace the files", not "do not know which commit they belong to".
 leg_tree_remote() {
-    _ltr_verb="$1"; shift
-    _ltr_args=""
-    for _a in "$@"; do _ltr_args="$_ltr_args '$_a'"; done
-    bash "$CARRIAGE" "$(cat "$SRC/scripts/leg-tree/leg-tree.sh")
-leg_tree_${_ltr_verb}${_ltr_args}"
+    _ltr_helper="$REPO_ROOT/scripts/leg-tree/leg-tree.sh"
+    _ltr_cmd=$(leg_tree_remote_command "$_ltr_helper" "$@") || return 4
+    bash "$CARRIAGE" "$_ltr_cmd" < "$_ltr_helper"
 }
 # ★ THE IDENTITY IS RESOLVED BY `leg-tree`, NOT BY A BARE `git -C "$SRC"`. This
 # carriage resolves from WSL and not from Git Bash, and a Windows-created lane
@@ -263,7 +279,7 @@ leg_tree_${_ltr_verb}${_ltr_args}"
 # its transcript are in `scripts/leg-tree/leg-tree.sh`. The empty argument to `.` is
 # load-bearing: without it, leg-tree's dispatch reads THIS script's positionals.
 # shellcheck source=../leg-tree/leg-tree.sh
-. "$SRC/scripts/leg-tree/leg-tree.sh" "" || die "cannot load scripts/leg-tree/leg-tree.sh"
+. "$REPO_ROOT/scripts/leg-tree/leg-tree.sh" "" || die "cannot load $REPO_ROOT/scripts/leg-tree/leg-tree.sh"
 if leg_tree_driver_identity "$SRC"; then
     LEG_BRANCH="$LEG_TREE_DRIVER_BRANCH"
     LEG_SHA="$LEG_TREE_DRIVER_SHA"

@@ -186,6 +186,33 @@ void HirVerifier::checkNodeArity(DiagnosticReporter& reporter) const {
             }
         }
 
+        // ReadModifyWrite
+        // (D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE):
+        // the TARGET must name an object — its address is what the indivisible
+        // update is taken against — and the UPDATE must yield the replacement.
+        // A target that is not an lvalue kind has no address to take; an update
+        // that yields nothing has no value to commit. Both would otherwise surface
+        // three tiers later as a message about whatever node kind arrived.
+        if (kind == HirKind::ReadModifyWrite && count == 2) {
+            HirNodeId const target = hir_.children(id)[0];
+            HirNodeId const update = hir_.children(id)[1];
+            HirKind const tk = hir_.kind(target);
+            if (tk != HirKind::Ref && tk != HirKind::Deref && tk != HirKind::Index
+                && tk != HirKind::MemberAccess) {
+                reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                         std::format("ReadModifyWrite #{} target (child 0) is a '{}', "
+                                     "not an lvalue (Ref / Deref / Index / "
+                                     "MemberAccess)", id.v, describeKind(tk)),
+                         sourceMap_);
+            }
+            if (!requiresValidType(hir_.kind(update))) {
+                reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                         std::format("ReadModifyWrite #{} update (child 1) is not a "
+                                     "value-yielding expression", id.v),
+                         sourceMap_);
+            }
+        }
+
         ChildArity const a = childArity(kind);
         bool const ok = count >= a.min && (a.max == kUnboundedArity || count <= a.max);
         if (!ok) {

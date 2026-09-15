@@ -67,6 +67,14 @@
 # (exit 4) rather than a pair of unattributable verdicts; a lane that wants to run
 # concurrently passes its own `--dst`.
 #
+# LOGS live beside that lock -- one set per clone and build tree -- and each path is
+# printed as `log  : <step> <path>` before the build starts, so a caller copies the
+# right one:
+#     <dst>/build/wsl-leg-<tree>-{configure,build,ctest,armwitness}.log
+# They were `/tmp/wsl-leg-*.log`, one set per DISTRO, which two concurrent legs in two
+# clones overwrote under each other:
+#     D-SCRIPT-WSL-LEG-AND-RUN-GATE-LET-CONCURRENT-LEGS-SHARE-ONE-LOG-PATH
+#
 # Usage:
 #   wsl.exe -e bash scripts/wsl-leg/wsl-leg.sh
 #   wsl.exe -e bash scripts/wsl-leg/wsl-leg.sh --mode guards
@@ -315,8 +323,18 @@ EXCLUDES="$(mktemp)" || die "cannot create the exclude list"
 # else. The lock and exclude paths are absolute, so they are unaffected either way --
 # which is exactly the kind of "it happens to work" this project does not build on.
 trap '( leg_tree_restore "$DST" "$DRIVER_SHA" ); rm -f "$LOCK" "$EXCLUDES"' EXIT INT TERM
+# ★★ `build` IS WITHHELD BY POLICY TOO, NOT ONLY WHEN GIT HAPPENS TO REPORT IT.
+# [[D-SCRIPT-WSL-LEG-AND-RUN-GATE-LET-CONCURRENT-LEGS-SHARE-ONE-LOG-PATH]]
+# The derived list names only ignored paths that EXIST in `$SRC`, so a source checkout
+# with no `build/` of its own (a fresh clone, a new lane worktree) produced no build
+# exclude, and `rsync --delete` then removed `$DST/build/` -- the leg LOCK above and
+# this leg's logs with it. ✔MEASURED 2026-09-15 (P66, lane `pg`), two real legs of
+# this script on a fixture source with no build directory: each printed its lock path,
+# then died `configure failed` because `$DST/build/wsl-leg-dbg-configure.log` could not
+# be created -- the directory was gone. The lock's own comment above promised the sync
+# could not delete it; that held only when `$SRC` happened to carry a `build/`.
 "$PY" "$SRC/scripts/carriage-excludes/carriage-excludes.py" \
-    --format rsync --repo "$SRC" --also .git --out "$EXCLUDES" \
+    --format rsync --repo "$SRC" --also .git --also build --out "$EXCLUDES" \
     || die "carriage-excludes refused (rc=$?) -- refusing to rsync with a list it would not vouch for"
 rsync -a --delete --exclude-from="$EXCLUDES" \
     "$SRC/" "$DST/" || die "rsync failed"
@@ -374,6 +392,38 @@ else
     CONFIGURE_EXTRA=""
 fi
 
+# ── WHERE THIS LEG'S LOGS GO: UNDER ITS OWN CLONE, NEVER A HOST-GLOBAL PATH ──
+# ★★★ [[D-SCRIPT-WSL-LEG-AND-RUN-GATE-LET-CONCURRENT-LEGS-SHARE-ONE-LOG-PATH]]
+# These were `/tmp/wsl-leg-{configure,build,ctest,armwitness}.log` -- ONE path per
+# distro, whichever clone a leg ran from, while run-gate keys its own state files
+# (`<log>.inputs-*`) off the log path. ✔MEASURED 2026-09-15 (P66, lane `pg`), two
+# REAL legs of this script in two clones of one fixture repository, run at once:
+# leg B's run-gate truncated the shared ctest log under leg A's live run, and leg A
+# then reported `=== WSL leg OK ===` over a log that no longer named its own build
+# directory and DID name the other clone. Lane `ca` measured the field form the same
+# day: a leg refused as a moving tree listing another lane's clone, and a full leg's
+# log gone from /tmp the moment a second leg started.
+# ⇒ `$DST/build/`, beside the leg lock, named for the build tree:
+#   * `build/` is git-ignored, so the carriage never syncs or deletes it;
+#   * `leg_tree_restore` cleans with `-fd`, never `-fdx`, so a caller can copy the logs
+#     after the leg exits;
+#   * the lock on `$DST` already admits one leg per clone, so a path under the clone
+#     belongs to exactly one live leg -- and run-gate now REFUSES (exit 5) a second
+#     live run on any log path it holds, so a future caller that shares one fails red.
+# ★ Printed as `log  : <step> <path>` BEFORE the expensive part, so a caller watching
+#   a background leg knows which file to tail and which to copy.
+LEG_ROOT="$(pwd -P)"
+LOG_STEM="$LEG_ROOT/build/wsl-leg-${BUILD##*/}"
+LOG_CONFIGURE="$LOG_STEM-configure.log"
+LOG_BUILD="$LOG_STEM-build.log"
+LOG_CTEST="$LOG_STEM-ctest.log"
+LOG_WITNESS="$LOG_STEM-armwitness.log"
+printf 'log  : configure %s\n' "$LOG_CONFIGURE"
+printf 'log  : build     %s\n' "$LOG_BUILD"
+if [[ "$MODE" != "build" ]]; then
+    printf 'log  : ctest     %s\n' "$LOG_CTEST"
+fi
+
 # ★★ ccache — THE CLEAN BUILD IS CORRECT AND ONLY ITS COST WAS EVER THE
 # PROBLEM. The `rm -rf "$BUILD"` below stays (see the mtime note in the header);
 # ccache removes the cost WITHOUT trusting an mtime, because it keys on CONTENT
@@ -404,12 +454,12 @@ if [[ -e "$BUILD" ]]; then
     die "could not remove $BUILD, so this build would be INCREMENTAL under a heading that says CLEAN (see D-SYNC-RSYNC-PRESERVED-MTIME-DEFEATS-THE-REBUILD in the header)"
 fi
 cmake -S . -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DDSS_BUILD_TESTS=ON \
-      $CONFIGURE_EXTRA $CACHE_ARGS > /tmp/wsl-leg-configure.log 2>&1 \
-    || { tail -25 /tmp/wsl-leg-configure.log; die "configure failed"; }
+      $CONFIGURE_EXTRA $CACHE_ARGS > "$LOG_CONFIGURE" 2>&1 \
+    || { tail -25 "$LOG_CONFIGURE"; die "configure failed (log $LOG_CONFIGURE)"; }
 # ★★★ OPERATOR RULING 2026-08-25: "never use all CPUS, the idea is to keep build + tests + run always at 4 cpus", AMENDED same-day to "make it 6 cores, not 4, everywhere".  (a bare `cmake --build` means ninja's all-cores default)
-cmake --build "$BUILD" --parallel "${DSS_JOBS:-6}" > /tmp/wsl-leg-build.log 2>&1 \
-    || { tail -30 /tmp/wsl-leg-build.log; die "build failed"; }
-printf 'build: %s\n' "$(tail -1 /tmp/wsl-leg-build.log)"
+cmake --build "$BUILD" --parallel "${DSS_JOBS:-6}" > "$LOG_BUILD" 2>&1 \
+    || { tail -30 "$LOG_BUILD"; die "build failed (log $LOG_BUILD)"; }
+printf 'build: %s\n' "$(tail -1 "$LOG_BUILD")"
 
 # ── build: STOP HERE, deliberately ──────────────────────────────────────────
 # A mode that syncs and builds and does NOT test. It exists because a
@@ -471,16 +521,24 @@ GUARD_SKIP=""
 [[ "${DSS_LEG_GUARDS:-1}" == "1" ]] || GUARD_SKIP="-LE repo-guard"
 say "ctest${FILTER:+ (-R $FILTER)}${GUARD_SKIP:+ (guards skipped)}"
 # shellcheck disable=SC2086
+# ★ THE BUILD DIRECTORY IS NAMED ABSOLUTELY, NOT AS `build/dbg`.
+# [[D-SCRIPT-RUN-GATE-RESOLVES-ANOTHER-PROCESS-RELATIVE-BUILD-DIR-AGAINST-ITS-OWN-CWD]]
+# ✔MEASURED 2026-09-15 (P66, lane `pg`): a leg in one clone was refused exit 4 because
+# a leg in ANOTHER clone (a sibling lane's, the first time) ran `ctest --test-dir
+# build/dbg`, and the scanning gate read that relative token as its own directory.
+# run-gate now joins such a token to the other process's own directory where the host
+# can read it; spelling this leg's absolutely removes the question for every reader of
+# its command line, on any host.
 if [[ -n "$FILTER" ]]; then
-    bash scripts/run-gate/run-gate.sh /tmp/wsl-leg-ctest.log 'tests passed' \
-        ctest --test-dir "$BUILD" --output-on-failure -R "$FILTER" $GUARD_SKIP
+    bash scripts/run-gate/run-gate.sh "$LOG_CTEST" 'tests passed' \
+        ctest --test-dir "$LEG_ROOT/$BUILD" --output-on-failure -R "$FILTER" $GUARD_SKIP
 else
-    bash scripts/run-gate/run-gate.sh /tmp/wsl-leg-ctest.log '100% tests passed' \
-        ctest --test-dir "$BUILD" --output-on-failure $GUARD_SKIP
+    bash scripts/run-gate/run-gate.sh "$LOG_CTEST" '100% tests passed' \
+        ctest --test-dir "$LEG_ROOT/$BUILD" --output-on-failure $GUARD_SKIP
 fi
 rc=$?
-grep -E "tests passed|tests failed|The following tests FAILED" -A20 /tmp/wsl-leg-ctest.log | tail -25
-[[ $rc -eq 0 ]] || die "ctest leg failed (rc=$rc, log /tmp/wsl-leg-ctest.log)"
+grep -E "tests passed|tests failed|The following tests FAILED" -A20 "$LOG_CTEST" | tail -25
+[[ $rc -eq 0 ]] || die "ctest leg failed (rc=$rc, log $LOG_CTEST)"
 
 # ── ★★ THE EMULATOR WITNESS — the one thing the gate above CANNOT tell you ────
 # ✔MEASURED 2026-08-26 (P39), and it cost four probes to answer a question the
@@ -499,8 +557,8 @@ grep -E "tests passed|tests failed|The following tests FAILED" -A20 /tmp/wsl-leg
 # project has the `QEMU_LD_PREFIX` scar to prove the two look identical.
 if [[ -z "$FILTER" ]]; then
     say "emulator witness (is the arm64 leg actually RUNNING?)"
-    _wit=/tmp/wsl-leg-armwitness.log
-    ctest --test-dir "$BUILD" -R '^examples/c/builtin_bitcount$' -V > "$_wit" 2>&1 || true
+    _wit="$LOG_WITNESS"
+    ctest --test-dir "$LEG_ROOT/$BUILD" -R '^examples/c/builtin_bitcount$' -V > "$_wit" 2>&1 || true
     # The runner's own vocabulary, not a string this script invented: `ran=` lists
     # the specs whose artifacts were SPAWNED and completed.
     if ! grep -qE '^\S*\s*\[coverage-boundary\].*[[:space:]]ran=[^[:space:]]*arm64:' "$_wit"; then

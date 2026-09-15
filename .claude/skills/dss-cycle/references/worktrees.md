@@ -57,7 +57,30 @@ a document.
 ```bash
 bash scripts/lane-worktree/lane-worktree.sh add k        # -> <repo>/.worktrees/k
 bash scripts/lane-worktree/lane-worktree.sh remove k     # removes AND prunes
+python scripts/lane-fold/lane-fold.py land k harness --apply   # the way a FINISHED lane leaves
 ```
+
+⚠ **`remove` REFUSES (exit 8) a worktree that still carries the lane's work** — by its own
+`git status`, a tracked modification or an untracked file that is not ignored (seeded paths
+included); or a commit its HEAD holds that no ref of the repository reaches, asked at the repository
+root as `git rev-list <HEAD> --not --glob=refs/*` (removing the worktree would orphan that commit,
+and gc would delete it) — until it is told `--discard-work` (`-DiscardWork`), which names every path
+and commit it discards. It cannot tell folded work from unfolded work; `lane-fold.py land` can,
+builds that flag only from its own "nothing left to fold" measurement, and refuses a lane whose HEAD
+left its base: past the recorded base, or, for a format-1 manifest that records none, holding such a
+commit.
+
+⚠ **`remove` REFUSES (exit 7) a worktree whose evidence roots, `scratchpad/` AND `.temp/`, hold
+any file**, until it is told `--preserve-to <dir>` or `--discard-evidence` (`-PreserveTo` /
+`-DiscardEvidence` in PowerShell). ✔MEASURED P66: the gate used to count `scratchpad/` only, while
+every live lane kept its evidence under `.temp/<lane>-scratch/`, so it counted zero for all of them.
+A preserve refuses a destination inside the worktree or one already holding a same-named file with
+other bytes, and re-reads every file at the destination. `--discard-scratchpad` is retired and refused.
+
+★ **A finished lane is LANDED, never removed by hand:** `lane-fold.py land <lane> <production|harness>`
+folds it, applies its `row/` cells through the row writer all-or-nothing and re-reads each row, checks
+nothing is left to fold, keeps the whole evidence set under `.worktrees/.evidence/<lane>-<stamp>/`,
+and only then removes the worktree. Without `--apply` it is a dry run; a stopped landing can be re-run.
 
 ⚠ **THE THREE LANE VERBS RESOLVE THEIR TREE FROM THE SCRIPT'S OWN LOCATION, NOT FROM YOUR
 `cwd` — SINCE P53, AND THE INVOCATIONS ABOVE ARE UNCHANGED.** `lane-worktree.sh`,

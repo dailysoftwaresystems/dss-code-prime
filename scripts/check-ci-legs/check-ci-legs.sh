@@ -68,15 +68,17 @@
 # neither source answers, `? s cap` is printed and the leg is NOT classified: a
 # discriminator that invents its denominator is worse than one that says it has none.
 #
-# ⚠ NO ctest ENTRY, AND THE REASON IS STATED RATHER THAN LEFT AS AN OMISSION. Every
-# arm of this tool needs the NETWORK and an authenticated `gh`; registered as a ctest
-# guard it would red on any host without credentials — a guard that fails for a
-# property of the machine rather than of the tree, which this repository refuses by
-# name. ✔What it IS proved by: EXECUTION, both twins, against six real Pipeline runs
-# on 2026-09-14, printing identical rows and returning rc 1 on the HEAD run; the
-# refusal arms (`gh` absent, detached HEAD, unreadable run, empty job list) were each
-# reached during that work. The `.sh`/`.ps1` pair is held in step BY REVIEW, per the
-# repository's pairing ruling, not by a detector.
+# ⚠ NO ctest ENTRY READS CI, AND THE REASON IS STATED RATHER THAN LEFT AS AN OMISSION.
+# Reading CI needs the NETWORK and an authenticated `gh`; a ctest guard doing that would red
+# on any host without credentials — a guard that fails for a property of the machine rather
+# than of the tree, which this repository refuses by name. ✔What proves the READ: EXECUTION,
+# both twins, against six real Pipeline runs on 2026-09-14, printing identical rows and
+# returning rc 1 on the HEAD run; the refusal arms (`gh` absent, detached HEAD, unreadable
+# run, empty job list) were each reached during that work.
+# ⓘ WHAT ctest DOES pin is the LOCAL half, hermetically: `test-check-ci-legs.py` (entry
+# `check_ci_legs_git_environment_guard`) drives COPIES of both twins against a stub gh, and
+# proves which branch they ask about, which repository gh's own git sees, and the GH_REPO
+# refusal -- the same arms on each twin, so that part of the pair is held by a detector.
 #
 # Exit: 0 every leg green · 1 at least one leg red · 2 the instrument could not run
 # (no `gh`, not authenticated, no such run). ⚠ 2 is NOT "green": an instrument that
@@ -90,6 +92,25 @@ set -uo pipefail
 # from a subdirectory would lose the fallback without saying so.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd -- "${SCRIPT_DIR}/../.." || exit 2
+
+# ★★★ NEITHER git NOR gh IS ASKED IN THE CALLER'S GIT ENVIRONMENT. The `cd` above moves the
+# working directory and nothing else: an exported GIT_DIR or GIT_WORK_TREE still decides which
+# repository git answers for -- and gh finds `:owner/:repo` BY RUNNING git.
+# ✔MEASURED 2026-09-15 (P66 lane ge; gh a recording stub, and the real gh 2.89.0 for one
+# read-only GET): with another repository's GIT_DIR, or GIT_DIR + GIT_WORK_TREE, exported, this
+# tool read THAT repository's branch and asked `gh run list --branch <its branch>` where it
+# should have refused a detached HEAD; given `--branch`, gh's own git still saw THAT
+# repository's origin, and the real `gh api repos/:owner/:repo` answered HTTP 404 there against
+# `dailysoftwaresystems/dss-code-prime` without the variables. GIT_INDEX_FILE alone steered
+# neither. The `.ps1` twin behaved identically.
+# ⇒ every git AND gh call goes through `leg_tree_unsteered`, the sh owner of that removal. Pinned
+# hermetically -- a stub gh on PATH, no network -- by `test-check-ci-legs.py` beside this file.
+# The empty argument is load-bearing: `.` forwards THIS script's positionals otherwise.
+# shellcheck source=../leg-tree/leg-tree.sh
+. "${SCRIPT_DIR}/../leg-tree/leg-tree.sh" "" || {
+    printf 'check-ci-legs: FATAL -- cannot load scripts/leg-tree/leg-tree.sh; CI was NOT read\n' >&2
+    exit 2
+}
 
 WORKFLOW="Pipeline"
 # The matrix builder's own source, read ONLY when GitHub truncated a job name out of
@@ -112,13 +133,26 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+# ★★ A CALLER'S GH_REPO IS REFUSED -- NOT HONOURED, AND NOT STRIPPED. It is gh's own explicit
+# override, not git steering (it is not among the names `leg_tree_unsteered` removes), and it
+# makes gh answer for whatever repository it names. This tool's subject is fixed: the CI of the
+# tree it lives in. Honouring the override would report another repository's legs under this
+# tree's name -- the default branch is still read from THIS tree -- and whether it names this
+# tree cannot be checked without re-deriving gh's own remote resolution. Stripping it would
+# silently discard an instruction the caller gave. So a non-empty GH_REPO stops the read and
+# names it, exit 2: the instrument did not run. (gh itself treats an empty GH_REPO as unset.)
+if [ -n "${GH_REPO:-}" ]; then
+    printf 'check-ci-legs: FATAL -- GH_REPO is set (%s), so gh would answer for THAT repository; this tool reads only the CI of the tree it lives in. Unset GH_REPO for this call. CI was NOT read (this is not a pass)\n' "$GH_REPO" >&2
+    exit 2
+fi
+
 command -v gh >/dev/null 2>&1 || {
     printf 'check-ci-legs: FATAL -- `gh` is not on PATH; CI was NOT read (this is not a pass)\n' >&2
     exit 2
 }
 
 if [ "${#RUNS[@]}" -eq 0 ]; then
-    [ -n "$BRANCH" ] || BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    [ -n "$BRANCH" ] || BRANCH="$(leg_tree_git_unsteered rev-parse --abbrev-ref HEAD 2>/dev/null)"
     [ -n "$BRANCH" ] && [ "$BRANCH" != "HEAD" ] || {
         printf 'check-ci-legs: FATAL -- no branch to ask about (detached HEAD?); pass --branch or --run\n' >&2
         exit 2
@@ -128,7 +162,7 @@ if [ "${#RUNS[@]}" -eq 0 ]; then
     # on the run that introduced it — `[undeclared-bash-4-dependency]`.
     while IFS= read -r _rg_id; do
         [ -n "$_rg_id" ] && RUNS+=("$_rg_id")
-    done < <(gh run list --workflow "$WORKFLOW" --branch "$BRANCH" \
+    done < <(leg_tree_unsteered gh run list --workflow "$WORKFLOW" --branch "$BRANCH" \
         --limit "$LIMIT" --json databaseId --jq '.[].databaseId' 2>/dev/null)
     [ "${#RUNS[@]}" -gt 0 ] || {
         printf 'check-ci-legs: FATAL -- no `%s` run found for branch %s; CI was NOT read\n' \
@@ -139,7 +173,7 @@ fi
 
 rc=0
 for run in "${RUNS[@]}"; do
-    meta=$(gh api "repos/:owner/:repo/actions/runs/$run" \
+    meta=$(leg_tree_unsteered gh api "repos/:owner/:repo/actions/runs/$run" \
         --jq '[.head_sha[0:8], .head_branch, .created_at, .conclusion] | @tsv' 2>/dev/null) || {
         printf 'check-ci-legs: FATAL -- run %s could not be read\n' "$run" >&2
         exit 2
@@ -156,7 +190,7 @@ for run in "${RUNS[@]}"; do
     # ⚠ THE SKIPPED-MATRIX CASE IS REPORTED, NEVER INFERRED AWAY. A run whose
     # `run-tests` is `skipped` says nothing about the tree, and a caller that
     # counted it as a red would be counting the label, not the code.
-    legs=$(gh api "repos/:owner/:repo/actions/runs/$run/jobs?per_page=100" --jq '
+    legs=$(leg_tree_unsteered gh api "repos/:owner/:repo/actions/runs/$run/jobs?per_page=100" --jq '
         [.jobs[] | select(.name|test("run-tests \\("))] as $m |
         if ($m|length) == 0 then
             "NO-MATRIX\t" + ([.jobs[] | .name + "=" + (.conclusion // "?")] | join(" "))

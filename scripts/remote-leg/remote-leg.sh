@@ -244,22 +244,23 @@ if [[ "$CARRIAGE" == "macos" && -z "${DSS_MACOS_HOST:-}" ]]; then
 fi
 
 # ── the leg repository is a CLONE (operator ruling 2026-08-26) ───────────────
-# Run one `leg-tree` verb on the carriage. The script text is INLINED rather than
-# assumed present on the far side: the host's checkout can predate this file, and a
-# bootstrap that needs the thing it bootstraps is not a bootstrap.
-# ★ `"$(cat …)"` IS WHAT MAKES THIS SAFE, and the distinction is the one this project
-# keeps paying for: command-substitution output is NOT re-expanded, so the script's own
-# `$`, backticks and quotes reach the remote verbatim, while the few values written
-# explicitly below expand locally, once, under this shell's control. Writing the body
-# inside the same double quotes would have expanded the SCRIPT's variables here.
-# ⓘ The inlined text ends in a dispatch guarded by `${1:-}`; with no argument it takes
-# the no-op arm and only the verb appended below runs.
+# Run one `leg-tree` verb on the carriage. The helper is SENT rather than assumed present
+# on the far side: the host's checkout can predate this file, and a bootstrap that needs
+# the thing it bootstraps is not a bootstrap.
+# ★★ IT TRAVELS ON THE CARRIAGE'S STDIN; ONLY A ~450-BYTE COMMAND RIDES THE COMMAND LINE.
+# This used to pass `"$(cat …/leg-tree.sh)"` as ONE ssh argument. ✔MEASURED 2026-09-15 (P66
+# lane ge) inside WSL, where this driver runs for both carriages: one argument of 131,072
+# bytes fails at the local execve (MAX_ARG_STRLEN, rc 126) and 131,071 passes, so the leg
+# worked only while that file plus its verb line stayed under it -- a dependence on the
+# helper's SIZE that breaks again as it grows. `leg_tree_remote_command` in
+# `scripts/leg-tree/leg-tree.sh` owns the command, its loader (which reads the exact byte
+# count, refuses a short stream, and runs the verb under `sh` with stdin closed) and the
+# measurements. ⓘ This header's "never stdin" note is about the TREE transport: the push
+# still goes over `--rsync`; the helper is one small file whose byte count is checked.
 leg_tree_remote() {
-    _ltr_verb="$1"; shift
-    _ltr_args=""
-    for _a in "$@"; do _ltr_args="$_ltr_args '$_a'"; done
-    carriage "$(cat "$REPO_ROOT/scripts/leg-tree/leg-tree.sh")
-leg_tree_${_ltr_verb}${_ltr_args}"
+    _ltr_helper="$REPO_ROOT/scripts/leg-tree/leg-tree.sh"
+    _ltr_cmd=$(leg_tree_remote_command "$_ltr_helper" "$@") || return 4
+    carriage "$_ltr_cmd" < "$_ltr_helper"
 }
 
 # ── reachability, BEFORE anything expensive ─────────────────────────────────

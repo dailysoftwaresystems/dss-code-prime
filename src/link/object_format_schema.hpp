@@ -1640,7 +1640,8 @@ struct DSS_EXPORT ObjectFormatData {
     // ── D-CSUBSET-PACKED-ATOMIC-MEMBER: the atomics-runtime declaration ────
     //
     // OPTIONAL top-level `"atomicsRuntime"` block (`{"role": …,
-    // "loadMangledName": …, "storeMangledName": …}`). The GENERIC C11 atomics
+    // "loadMangledName": …, "storeMangledName": …, and the OPTIONAL
+    // "compareExchangeMangledName": …}`). The GENERIC C11 atomics
     // entry points an UNDER-ALIGNED `_Atomic` scalar access lowers to a CALL
     // of. `std::nullopt` = this format supplies NO atomics runtime, which is
     // NOT a silent default: what happens then is the TARGET's

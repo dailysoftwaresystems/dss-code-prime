@@ -27,6 +27,10 @@ PURPOSE: create and remove lane worktrees inside the ignored .worktrees/, refusi
   at the twin level. ⇒ Anything changed in either file lands in BOTH, in the same
   commit, and `test-lane-worktree.sh` now drives BOTH so the claim is measured rather
   than asserted.
+  ⓘ P66 changed both twins together: the evidence gate covers `scratchpad/` AND `.temp/`,
+  the preserve refuses a destination inside the worktree or one already holding a
+  same-named file and verifies every file, `-DiscardScratchpad` is retired in favour of
+  `-DiscardEvidence`, and `add` records the lane's base commit in its manifest.
 
 ⚠ THE MAX_PATH PREFLIGHT MATTERS MORE ON THIS SIDE, NOT LESS. MAX_PATH IS A WINDOWS
   LIMIT, AND THIS IS THE WINDOWS ENTRY POINT -- the anchored defect
@@ -39,7 +43,15 @@ PURPOSE: create and remove lane worktrees inside the ignored .worktrees/, refusi
 Exit codes: 0 OK - 2 not a repository / git refused / a path that cannot be resolved
             - 3 MAX_PATH would be breached - 4 .worktrees/ is not ignored - 5 usage
             - 6 the worktree is STILL ON DISK after remove, prune and delete
-            - 7 a scratchpad would be lost (see `Invoke-Remove`).
+            - 7 EVIDENCE WOULD BE LOST: an evidence root (scratchpad/ or .temp/) holds
+              files and no decision was given, or a preserve could not be proved -- a
+              destination inside the worktree, one already holding a same-named file
+              with other bytes, a failed copy, or a file that does not re-read identical
+              (see `Invoke-Remove`)
+            - 8 THE LANE'S WORK WOULD BE LOST: the worktree's own git status lists a
+              tracked modification or an untracked file that is not ignored, or its HEAD
+              holds a commit that no ref of the repository reaches -- or either cannot be
+              read -- and -DiscardWork was not given.
 #>
 [CmdletBinding()]
 param(
@@ -50,9 +62,16 @@ param(
     # caller's cwd. See `Get-RepoRoot` for the row and the measurement.
     [string]$Repo,
     # `remove` only, and they contradict each other by design. The `.sh` twin spells
-    # them `--preserve-to <dir>` and `--discard-scratchpad`; the behaviour, the
-    # refusals and the exit codes are the same on both sides.
+    # them `--preserve-to <dir>` and `--discard-evidence`; the behaviour, the refusals
+    # and the exit codes are the same on both sides.
     [string]$PreserveTo,
+    [switch]$DiscardEvidence,
+    # `remove` only: delete the worktree although its own `git status` lists uncommitted work, or
+    # its HEAD holds commits no ref of the repository reaches; it names what it discards.
+    # The `.sh` twin spells it `--discard-work`. See `Invoke-Remove`.
+    [switch]$DiscardWork,
+    # RETIRED. Declared only so that passing it reaches this script's own refusal (exit 5,
+    # naming its replacement) instead of a parameter-binding error. See `Invoke-Remove`.
     [switch]$DiscardScratchpad
 )
 
@@ -74,12 +93,22 @@ $WORST_SUFFIX = 163
 # Refuse a root that only just fits: this repository's test names dominate that
 # suffix and keep growing, and the margin is what protects the next long one.
 $MARGIN = 20
+# The top-level directories a lane keeps its EVIDENCE in -- the `.sh` twin's
+# `EVIDENCE_ROOTS`, and the measurement behind the pair is in that file's `cmd_remove`.
+$EVIDENCE_ROOTS = @('scratchpad', '.temp')
 
 function Say  { param([string]$m) Write-Host "lane-worktree: $m" }
 function Die  {
     param([int]$Code, [string[]]$Lines)
     foreach ($l in $Lines) { [Console]::Error.WriteLine("lane-worktree: $l") }
     exit $Code
+}
+# `git rev-list --oneline` lines -> indented lines: the first 10, then a count of the rest. Handed
+# to `Say` or `Die`, they print exactly as the `.sh` twin's `_lw_list_commits` does.
+function Format-CommitList {
+    param([string[]]$Lines)
+    $Lines | Select-Object -First 10 | ForEach-Object { "  $_" }
+    if ($Lines.Count -gt 10) { "  ... and $($Lines.Count - 10) more" }
 }
 
 # ★★★ WHICH TREE THIS VERB IS ABOUT, AND THE ANSWER IS NOT "WHERE AM I STANDING".
@@ -205,20 +234,30 @@ function Invoke-Add {
     #    change vanishing while every report reads clean, which is the class this
     #    project treats as worst.
     #    ⇒ A worktree created here is a checkout of a COMMIT and carries no uncommitted
-    #    work, so its honest manifest is EMPTY. An orchestrator that then seeds
+    #    work, so its honest manifest holds NO paths. An orchestrator that then seeds
     #    uncommitted work in re-writes it via `lane-fold.py seed <lane>`, the only other
     #    writer.
     #    ⚠ THIS LANDED IN THE `.sh` TWIN ONLY UNTIL P63 (see this file's header): the
     #    Windows entry point left the stale manifest in place, so the fold defect above
     #    was reachable through it the whole time.
+    # ⚠⚠ AND THE MANIFEST RECORDS THE COMMIT THE LANE WAS CREATED AT (lane-fold's manifest
+    #    format 2): a fold measures every unseeded path against the blob at the LANE'S OWN
+    #    base, and refuses a lane whose HEAD has moved away from it. The `.sh` twin's
+    #    `cmd_add` carries the reproduction that made it necessary.
+    $base = git -C $abs rev-parse --verify HEAD 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$base)) {
+        Die 2 @("could not read the new worktree's HEAD, so '$Name' has no base commit to record.")
+    }
+    $base = ([string]$base).Trim()
     $manifestDir = Join-Path $repo '.worktrees/.manifests'
     try {
         if (-not (Test-Path -LiteralPath $manifestDir -PathType Container)) {
             New-Item -ItemType Directory -Path $manifestDir -Force | Out-Null
         }
-        # ⓘ `-NoNewline` and no BOM: `lane-fold.py` parses this as JSON, and the `.sh`
-        # twin writes exactly two bytes with `printf '{}'`. The two writers must agree.
-        [IO.File]::WriteAllText((Join-Path $manifestDir "seed-$Name.json"), '{}',
+        # ⓘ No newline and no BOM: `lane-fold.py` parses this as JSON, and the `.sh` twin
+        # writes exactly this string with `printf`. The two writers must agree byte for byte.
+        [IO.File]::WriteAllText((Join-Path $manifestDir "seed-$Name.json"),
+                                ('{"base":"' + $base + '","format":2,"paths":{}}'),
                                 (New-Object System.Text.UTF8Encoding($false)))
     } catch {
         Die 2 @("could not reset the seed manifest for '$Name': $($_.Exception.Message)")
@@ -226,7 +265,7 @@ function Invoke-Add {
 
     $short = (git -C $abs rev-parse --short HEAD).Trim()
     Say "created $rel at $short"
-    Say 'seed manifest reset to empty (this lane starts from the commit, not from uncommitted work)'
+    Say 'seed manifest reset: base recorded, no seeded paths (this lane starts from the commit, not from uncommitted work)'
     Say "build into $rel/build/$Name -- never into the main tree's build/."
     # ⚠ THE FIRST BUILD OF A FRESH TREE NEEDS --build-type, AND THIS LINE EXISTS
     #    BECAUSE THE ORCHESTRATOR KEPT WRITING BRIEFS THAT OMITTED IT.
@@ -243,7 +282,121 @@ function Invoke-Add {
     Write-Output $abs
 }
 
-# ⚠⚠ A LANE'S SCRATCHPAD IS ITS EVIDENCE, AND THIS VERB USED TO DELETE IT WITHOUT
+# The `.sh` twin's `_lw_preserve`: copies every file under every evidence root to
+# <Destination>\<root>\<same path> and REFUSES (exit 7) on anything that would lose
+# evidence. It deletes nothing, ever. The refusals, their order and their exit code are
+# the twin's; the per-file proof here is size plus SHA-256 where the `.sh` uses size plus
+# CRC -- one property (every file re-reads identical), each shell's own instrument.
+function Invoke-PreserveEvidence {
+    param(
+        [Parameter(Mandatory = $true)][string]$WorktreeAbs,
+        [Parameter(Mandatory = $true)][string]$Rel,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][int]$Counted
+    )
+    # ★ The resolver is `repo-tree.ps1`'s, dot-sourced above -- ONE OWNER of "what does this
+    # path really point at". A missing owner is a refusal, never a silent fallback.
+    if (-not (Get-Command Resolve-RepoTreeRealPath -ErrorAction SilentlyContinue)) {
+        Die 7 @("cannot prove a preserve: repo-tree.ps1's path resolver is not available. Nothing was copied or removed.")
+    }
+    # A relative -PreserveTo means relative to THIS SESSION'S location, which .NET's own
+    # path functions do not track -- so it is made absolute through PowerShell first.
+    $destFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Destination)
+    try {
+        [void][IO.Directory]::CreateDirectory($destFull)
+    } catch {
+        Die 7 @("could not create '$Destination': $($_.Exception.Message); nothing was removed.")
+    }
+    $sep      = [IO.Path]::DirectorySeparatorChar
+    $destReal = ([string](Resolve-RepoTreeRealPath $destFull)).TrimEnd($sep)
+    $wtReal   = ([string](Resolve-RepoTreeRealPath $WorktreeAbs)).TrimEnd($sep)
+    # ⚠ A DESTINATION INSIDE THE TREE ABOUT TO BE DELETED IS A COPY INTO NOWHERE.
+    if (($destReal + $sep).StartsWith($wtReal + $sep, [StringComparison]::OrdinalIgnoreCase)) {
+        Die 7 @(
+            "REFUSING: -PreserveTo '$Destination' resolves to '$destReal', which is INSIDE '$Rel'.",
+            'This verb is about to delete that tree, so the copy would be destroyed with the',
+            'evidence it was taken from -- after being reported as verified. Nothing was removed.')
+    }
+
+    # ONE list, taken ONCE: the count, the clash check, the copy and the verify all walk it.
+    $files = New-Object 'System.Collections.Generic.List[object]'
+    try {
+        foreach ($r in $EVIDENCE_ROOTS) {
+            $rootDir = [IO.Path]::GetFullPath((Join-Path $WorktreeAbs $r))
+            if (-not [IO.Directory]::Exists($rootDir)) { continue }
+            $prefix = $rootDir.TrimEnd($sep) + $sep
+            foreach ($f in Get-ChildItem -LiteralPath $rootDir -Recurse -File -Force -ErrorAction Stop) {
+                if (-not $f.FullName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "'$($f.FullName)' does not sit under '$prefix'"
+                }
+                $sub = $f.FullName.Substring($prefix.Length)
+                $files.Add([pscustomobject]@{
+                    Rel    = ($r + '/' + ($sub -replace '\\', '/'))
+                    Src    = $f.FullName
+                    Dst    = [IO.Path]::Combine($destReal, $r, $sub)
+                    Length = $f.Length
+                    Hash   = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+                })
+            }
+        }
+    } catch {
+        Die 7 @("could not re-read the evidence under '$Rel': $($_.Exception.Message)",
+                'Nothing was copied or removed.')
+    }
+    if ($files.Count -ne $Counted) {
+        Die 7 @("counted $Counted evidence file(s) under '$Rel' but re-read $($files.Count): the tree changed",
+                'underneath this verb. Nothing was copied or removed.')
+    }
+
+    # ⚠ A FILE ALREADY AT THE DESTINATION UNDER THE SAME PATH, WITH OTHER BYTES, IS
+    #   SOMEBODY ELSE'S EVIDENCE -- refused before anything is copied.
+    $clash = @()
+    foreach ($e in $files) {
+        if ([IO.File]::Exists($e.Dst)) {
+            $len = ([IO.FileInfo]::new($e.Dst)).Length
+            if ($len -ne $e.Length -or (Get-FileHash -LiteralPath $e.Dst -Algorithm SHA256).Hash -ne $e.Hash) {
+                $clash += $e.Rel
+            }
+        }
+    }
+    if ($clash.Count -gt 0) {
+        Die 7 (@(
+            "REFUSING: '$destReal' already holds a file at the same path with DIFFERENT bytes, so",
+            'copying would silently OVERWRITE evidence that is already there. Nothing was copied and',
+            'nothing was removed; preserve into a fresh directory. First clash(es):') +
+            @($clash | Select-Object -First 5))
+    }
+
+    # File by file, to the exact path the list names: no wildcard, no Copy-Item nesting rule,
+    # and each root lands under its own name, as the `.sh` twin's `cp -R <root>/.` does.
+    try {
+        foreach ($e in $files) {
+            [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($e.Dst))
+            [IO.File]::Copy($e.Src, $e.Dst, $true)
+        }
+    } catch {
+        Die 7 @("copy of the evidence under '$Rel' -> '$destReal' FAILED; nothing was removed: $($_.Exception.Message)")
+    }
+
+    # ⚠ VERIFY EVERY FILE, NEVER A COUNT.
+    $bad = @()
+    foreach ($e in $files) {
+        if (-not [IO.File]::Exists($e.Dst)) { $bad += "$($e.Rel) (absent)"; continue }
+        $len = ([IO.FileInfo]::new($e.Dst)).Length
+        if ($len -ne $e.Length) { $bad += "$($e.Rel) (size $len, expected $($e.Length))"; continue }
+        if ((Get-FileHash -LiteralPath $e.Dst -Algorithm SHA256).Hash -ne $e.Hash) { $bad += "$($e.Rel) (content differs)" }
+    }
+    if ($bad.Count -gt 0) {
+        Die 7 (@(
+            "preserve VERIFY FAILED: the $($files.Count) evidence file(s) under '$Rel' do not all re-read",
+            "identical (size and SHA-256, file by file) under '$destReal':") +
+            @($bad | Select-Object -First 5) +
+            @("REFUSING to remove '$Rel' -- the evidence would be lost."))
+    }
+    Say "preserved $($files.Count) evidence file(s) -> $destReal (every file re-read at the destination: size and SHA-256 match)"
+}
+
+# ⚠⚠ A LANE'S EVIDENCE IS WHAT ITS ROW CITES, AND THIS VERB USED TO DELETE IT WITHOUT
 #    ASKING. [[D-CYCLE-LANE-WORKTREE-REMOVE-DISCARDS-AN-UNPRESERVED-SCRATCHPAD]]
 #    ✔MEASURED 2026-09-01 (cycle P50): the orchestrator ran a `cp ... && echo preserved`
 #    followed by `lane-worktree.sh remove t2` on ONE command line. The destination's
@@ -252,70 +405,143 @@ function Invoke-Add {
 #    `t2`'s 14 result JSONs and its md5 ledger are gone, and the row that cites them had
 #    to be amended to admit it. ★ THE PRESERVE STEP WAS A CONVENTION LIVING IN THE
 #    ORCHESTRATOR'S HEAD, and a rule with no teeth at the moment of the decision erodes.
-#    ⇒ the tool owns it: a lane whose scratchpad holds files cannot be removed silently.
-#    `-PreserveTo <dir>` makes the COPY this script's job so it cannot fail quietly (it
-#    copies, counts both sides, and REFUSES on any mismatch); `-DiscardScratchpad` is
-#    the explicit "I do not want it", which is a decision rather than an accident.
+#    ⇒ the tool owns it: a lane whose evidence roots hold files cannot be removed silently.
 #    ⚠⚠ AND UNTIL P63 THAT SENTENCE WAS TRUE OF THE `.sh` TWIN ONLY. This function had
 #    NO gate at all while the row read ✅ CLOSED. See this file's header.
+#    ⚠⚠ AND UNTIL P66 BOTH TWINS GATED ONLY `scratchpad/`, while every live lane kept its
+#    evidence under `.temp/<lane>-scratch/` -- the `.sh` twin's `cmd_remove` carries the
+#    measurement (26,466 evidence files across five lanes, all ungated) and the two
+#    reproduced ways the preserve itself could lose what it had just "verified".
 function Invoke-Remove {
     if ([string]::IsNullOrWhiteSpace($Name)) {
-        Die 5 @('usage: lane-worktree.ps1 remove <name> [-PreserveTo <dir> | -DiscardScratchpad]')
+        Die 5 @('usage: lane-worktree.ps1 remove <name> [-DiscardWork] [-PreserveTo <dir> | -DiscardEvidence]')
     }
-    if ($DiscardScratchpad.IsPresent -and -not [string]::IsNullOrWhiteSpace($PreserveTo)) {
-        Die 5 @('-PreserveTo and -DiscardScratchpad contradict each other; pick one.')
+    if ($DiscardScratchpad.IsPresent) {
+        # ⚠ RETIRED, AND REFUSED RATHER THAN KEPT AS AN ALIAS: honouring it now would
+        #   silently WIDEN a destructive flag to `.temp/` as well.
+        Die 5 @(
+            "-DiscardScratchpad is retired: the gate now covers every evidence root ($($EVIDENCE_ROOTS -join ' ')),",
+            'so a flag named for one of them would silently discard the others.',
+            'Say which you mean: -DiscardEvidence deletes ALL of it; -PreserveTo <dir> keeps it.')
+    }
+    if ($DiscardEvidence.IsPresent -and -not [string]::IsNullOrWhiteSpace($PreserveTo)) {
+        Die 5 @('-PreserveTo and -DiscardEvidence contradict each other; pick one.')
     }
     Assert-LaneName $Name
     $repo = Get-RepoRoot
     $rel  = ".worktrees/$Name"
     $abs  = "$repo/$rel"
 
-    # ── THE SCRATCHPAD GATE, BEFORE ANY DELETION ────────────────────────────────
+    # ── THE WORK GATE, FIRST ────────────────────────────────────────────────────
+    # The `.sh` twin's `cmd_remove` carries the reproductions and the reasoning. This verb asks
+    # only (1) whether the worktree's OWN `git status` lists a tracked modification or an
+    # untracked file that is not ignored, and (2) which commits its HEAD holds that no ref of
+    # the repository reaches -- `rev-list <HEAD> --not --glob=refs/*`, asked AT THE REPOSITORY
+    # ROOT -- never whether that work is folded, which is `lane-fold.py`'s measurement. A status
+    # that cannot be read at the worktree's own root (`--show-prefix` not empty: git walked up to
+    # a parent repository), and a commit list git cannot produce, are refused too.
+    if (Test-Path -LiteralPath $abs) {
+        $workReadable = $true
+        $workLines = @()
+        $commitsReadable = $true
+        $commitLines = @()
+        $prefix = git --no-optional-locks -C $abs rev-parse --show-prefix 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not [string]::IsNullOrEmpty((@($prefix) -join ''))) {
+            $workReadable = $false
+        }
+        if ($workReadable) {
+            $workLines = @(git --no-optional-locks -C $abs status --porcelain --untracked-files=all 2>$null |
+                           Where-Object { $_ -ne '' })
+            if ($LASTEXITCODE -ne 0) { $workReadable = $false }
+        }
+        if ($workReadable) {
+            $workHead = (@(git --no-optional-locks -C $abs rev-parse --verify -q HEAD 2>$null) -join '').Trim()
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrEmpty($workHead)) {
+                $commitLines = @(git --no-optional-locks -C $repo rev-list --oneline $workHead --not '--glob=refs/*' 2>$null |
+                                 Where-Object { $_ -ne '' })
+                if ($LASTEXITCODE -ne 0) { $commitsReadable = $false }
+            }
+        }
+        if (-not $workReadable) {
+            if (-not $DiscardWork.IsPresent) {
+                Die 8 @(
+                    "cannot read the git status of '$rel' at its own root, so it cannot be shown to carry no",
+                    'uncommitted work (git cannot open it as a working tree there, and asked from inside it',
+                    'git answers about a parent repository instead). REFUSING to delete it.',
+                    '  pass -DiscardWork to remove it anyway, deliberately.')
+            }
+            Say "DISCARDING '$rel', whose git status cannot be read at its own root, as instructed"
+        }
+        elseif (-not $commitsReadable) {
+            if (-not $DiscardWork.IsPresent) {
+                Die 8 @(
+                    "cannot list the commits of '$rel' that no ref of the repository reaches (git rev-list",
+                    'failed at the repository root), so it cannot be shown to hold none. REFUSING to delete it.',
+                    '  pass -DiscardWork to remove it anyway, deliberately.')
+            }
+            Say "DISCARDING '$rel', whose commits cannot be listed, as instructed"
+        }
+        elseif ($workLines.Count -gt 0 -or $commitLines.Count -gt 0) {
+            if (-not $DiscardWork.IsPresent) {
+                $refusal = @()
+                if ($workLines.Count -gt 0) {
+                    $refusal += @(
+                        "'$rel' carries $($workLines.Count) path(s) of UNCOMMITTED WORK -- tracked modifications, or untracked",
+                        'files that are not ignored, by its own git status -- and would be DELETED with them.',
+                        'first path(s):') + @($workLines | Select-Object -First 5)
+                }
+                if ($commitLines.Count -gt 0) {
+                    $refusal += @(
+                        "'$rel' holds $($commitLines.Count) COMMIT(S) that no branch, tag or other ref of the repository reaches --",
+                        "only this worktree's HEAD holds them, and removing it would ORPHAN them:") + @(Format-CommitList $commitLines)
+                }
+                Die 8 ($refusal + @(
+                    "This verb cannot tell whether that work is already folded; that is lane-fold's measurement:",
+                    "  python scripts/lane-fold/lane-fold.py land $Name <production|harness> --apply",
+                    '    (folds uncommitted work, passes -DiscardWork only after measuring nothing left to fold,',
+                    '     and refuses a lane that committed)',
+                    '  git branch <branch> <commit>   keeps a commit, so the removal no longer orphans it',
+                    '  -DiscardWork                   delete it deliberately'))
+            }
+            if ($workLines.Count -gt 0) {
+                Say "DISCARDING $($workLines.Count) path(s) of uncommitted work under $rel, as instructed"
+            }
+            if ($commitLines.Count -gt 0) {
+                Say "DISCARDING $($commitLines.Count) commit(s) under $rel that no ref of the repository reaches, as instructed:"
+                Format-CommitList $commitLines | ForEach-Object { Say $_ }
+            }
+        }
+    }
+
+    # ── THE EVIDENCE GATE, BEFORE ANY DELETION ──────────────────────────────────
     # Counted with files only, so an empty directory tree is correctly "nothing to
-    # preserve" and a single file is enough to stop the removal.
-    $pad = "$abs/scratchpad"
-    $padFiles = Get-FileCount $pad
-    if ($padFiles -gt 0 -and -not $DiscardScratchpad.IsPresent -and
+    # preserve" and a single file under either root is enough to stop the removal.
+    $evTotal = 0
+    $evWhere = @()
+    foreach ($r in $EVIDENCE_ROOTS) {
+        $n = Get-FileCount (Join-Path $abs $r)
+        $evTotal += $n
+        $evWhere += "$r/=$n"
+    }
+    $evWhereText = $evWhere -join ' '
+    if ($evTotal -gt 0 -and -not $DiscardEvidence.IsPresent -and
         [string]::IsNullOrWhiteSpace($PreserveTo)) {
         Die 7 @(
-            "'$rel' holds a scratchpad with $padFiles file(s) and would be DELETED with it.",
-            "A lane's scratchpad is its EVIDENCE -- probes, transcripts, mutant logs, the",
-            'artefacts its registry row cites. Choose explicitly:',
-            '  -PreserveTo <dir>        copy it there FIRST; this script verifies the copy',
-            '  -DiscardScratchpad       delete it deliberately',
-            "This gate exists because a hand-rolled 'cp && remove' one-liner lost lane t2's",
-            "entire evidence tree in P50 when the destination's parent did not exist."
+            "'$rel' holds $evTotal evidence file(s) ($evWhereText) and would be DELETED with them.",
+            "A lane's evidence is what its registry row cites -- findings logs, mutant",
+            'transcripts, gate logs, row cells. Choose explicitly:',
+            '  -PreserveTo <dir>        copy ALL of it there FIRST; every file is re-read and matched',
+            '  -DiscardEvidence         delete it deliberately',
+            "This gate exists because a hand-rolled 'cp && remove' lost lane t2's evidence in P50,",
+            'and because the gate that closed that looked only at scratchpad/ while every P66',
+            'lane kept its evidence under .temp/.'
         )
     }
-    if ($padFiles -gt 0 -and -not [string]::IsNullOrWhiteSpace($PreserveTo)) {
-        try {
-            if (-not (Test-Path -LiteralPath $PreserveTo -PathType Container)) {
-                New-Item -ItemType Directory -Path $PreserveTo -Force | Out-Null
-            }
-        } catch {
-            Die 7 @("could not create '$PreserveTo': $($_.Exception.Message)")
-        }
-        try {
-            # The CONTENTS, so an existing destination is filled rather than nested one
-            # level deeper -- the shape a re-run needs. `-Force` is what reaches hidden
-            # entries, which the `.sh` twin's `cp -R <src>/.` reaches by construction.
-            Copy-Item -Path (Join-Path $pad '*') -Destination $PreserveTo -Recurse -Force -ErrorAction Stop
-        } catch {
-            Die 7 @("copy of '$pad' -> '$PreserveTo' FAILED; nothing was removed: $($_.Exception.Message)")
-        }
-        $got = Get-FileCount $PreserveTo
-        # ⚠ VERIFY, DO NOT ASSUME. The whole defect this gate closes was a copy that
-        # failed while the caller read silence as success.
-        if ($got -lt $padFiles) {
-            Die 7 @(
-                "preserve VERIFY FAILED: $padFiles file(s) under '$pad' but only $got under",
-                "'$PreserveTo'. REFUSING to remove '$rel' -- the evidence would be lost."
-            )
-        }
-        Say "preserved $padFiles scratchpad file(s) -> $PreserveTo (verified $got present)"
+    if ($evTotal -gt 0 -and -not [string]::IsNullOrWhiteSpace($PreserveTo)) {
+        Invoke-PreserveEvidence -WorktreeAbs $abs -Rel $rel -Destination $PreserveTo -Counted $evTotal
     }
-    elseif ($padFiles -gt 0) {
-        Say "DISCARDING $padFiles scratchpad file(s) under $rel, as instructed"
+    elseif ($evTotal -gt 0) {
+        Say "DISCARDING $evTotal evidence file(s) under $rel ($evWhereText), as instructed"
     }
 
     # --force because a lane worktree always carries an ignored build/ tree; without
@@ -415,7 +641,7 @@ switch ($Verb) {
     default  { Die 5 @(
         'usage: lane-worktree.ps1 [-Repo <path>]',
         '                         {add <name> [committish] |',
-        '                          remove <name> [-PreserveTo <dir> | -DiscardScratchpad] |',
+        '                          remove <name> [-DiscardWork] [-PreserveTo <dir> | -DiscardEvidence] |',
         '                          list}',
         '',
         'The tree acted on defaults to the one THIS SCRIPT LIVES IN, never the',

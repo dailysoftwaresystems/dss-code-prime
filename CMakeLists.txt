@@ -662,7 +662,7 @@ if(DSS_BUILD_TESTS)
     # ★ RIDES CTEST rather than being a CI step, for the reason the guards above
     # give: every leg then runs it, on the host it is about.
     # ★★ AND IT SELF-TESTS ON EVERY RUN — the no-argument form used here verifies the
-    # tree and then drives 34 arms against synthetic fixtures, each red arm asserting
+    # tree and then drives 35 arms against synthetic fixtures, each red arm asserting
     # the MESSAGE of the refusal it names, so this entry cannot pass without proving
     # the guard can fail (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
     add_test(
@@ -904,6 +904,85 @@ if(DSS_BUILD_TESTS)
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
         set_tests_properties(root_litter_guard PROPERTIES
             ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dss_lane_bash_dir}")
+
+        # ── macos-leg drives the tree IT lives in (2026-09-15, P66 lane rr) ──────
+        # Both twins took their default source from the caller's working directory,
+        # beside a cwd-relative carriage, so a leg run by path from another checkout's
+        # root pushed and tested THAT checkout. Nothing here could see it: the leg has
+        # no other test, and a real run needs a Mac. `test-macos-leg.py` COPIES each twin
+        # into a fixture whose carriage is a recording STUB, then drives it from a foreign
+        # repository, from no repository, and with an explicit source.
+        # ★ Registered HERE for the reason `root_litter_guard` is: the `.sh` twin needs
+        # the bash this block already proved can open a `C:/` path. The `.ps1` twin is
+        # the Windows driver, so it is exercised where the host is Windows.
+        set(_dss_macos_leg_test_args --bash "${DSS_BASH_FOR_LANE_GUARD}")
+        if(CMAKE_HOST_WIN32)
+            list(APPEND _dss_macos_leg_test_args --pwsh "${POWERSHELL_EXE}")
+        endif()
+        add_test(
+            NAME macos_leg_source_tree_guard
+            COMMAND ${Python3_EXECUTABLE}
+                    "${CMAKE_SOURCE_DIR}/scripts/macos-leg/test-macos-leg.py"
+                    ${_dss_macos_leg_test_args}
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        set_tests_properties(macos_leg_source_tree_guard PROPERTIES
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dss_lane_bash_dir}")
+
+        # ── leg-tree refuses an empty repository, and ignores the caller's git environment ──
+        # (2026-09-15, P66 lane rr.) `leg_tree_restore ""` -- or with no argument, or
+        # `leg-tree.sh restore` -- ran `cd ""`, a silent no-op on WSL bash 5.2 and dash, and then
+        # `reset --hard` + `clean -fd` over WHATEVER REPOSITORY THE CALLER STOOD IN (✔MEASURED on
+        # fixtures: "2 dirty path(s) discarded", rc=0). With another repository's GIT_DIR +
+        # GIT_WORK_TREE exported, a restore of a NAMED clone discarded the other repository's
+        # paths instead, and `check-root-litter.sh`, which asks git through the same helper,
+        # called a littered root clean. `test-leg-tree.sh` builds every repository it touches
+        # under `mktemp -d`, proven outside this checkout before anything runs.
+        # ★ Registered HERE for the reason `root_litter_guard` is: it needs the bash this block
+        # already proved can open a `C:/` path.
+        add_test(
+            NAME leg_tree_guard
+            COMMAND "${DSS_BASH_FOR_LANE_GUARD}"
+                    "${CMAKE_SOURCE_DIR}/scripts/leg-tree/test-leg-tree.sh"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        set_tests_properties(leg_tree_guard PROPERTIES
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dss_lane_bash_dir}")
+
+        # ── check-ci-legs asks git AND gh about the tree it lives in (2026-09-15, P66 lane ge) ──
+        # With another repository's GIT_DIR, or GIT_DIR + GIT_WORK_TREE, exported, both twins read
+        # THAT repository's branch, and gh -- which finds `:owner/:repo` by running git -- saw THAT
+        # repository's origin even when told the branch (✔MEASURED: the real gh 2.89.0 answered
+        # HTTP 404 there). The test is HERMETIC: copies of both twins, a stub gh leading PATH, no
+        # network, no gh authentication.
+        # ★ Registered HERE for the reason `macos_leg_source_tree_guard` is: the `.sh` twin needs
+        # this block's proven bash; the `.ps1` twin runs where the host is Windows.
+        set(_dss_ci_legs_test_args --bash "${DSS_BASH_FOR_LANE_GUARD}")
+        if(CMAKE_HOST_WIN32)
+            list(APPEND _dss_ci_legs_test_args --pwsh "${POWERSHELL_EXE}")
+        endif()
+        add_test(
+            NAME check_ci_legs_git_environment_guard
+            COMMAND ${Python3_EXECUTABLE}
+                    "${CMAKE_SOURCE_DIR}/scripts/check-ci-legs/test-check-ci-legs.py"
+                    ${_dss_ci_legs_test_args}
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        set_tests_properties(check_ci_legs_git_environment_guard PROPERTIES
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dss_lane_bash_dir}")
+
+        # ── remote-leg sends leg-tree.sh on the carriage's STDIN (2026-09-15, P66 lane ge) ──
+        # It passed the helper's whole text as ONE carriage argument, so a leg worked only while that
+        # file stayed under the smallest ceiling its path crossed (✔MEASURED inside WSL, where it
+        # runs: one argument of 131,072 bytes fails at execve). `test-remote-leg.py` copies the driver
+        # into a fixture whose arm64-vps carriage is a recording STUB; prepare, and the restore its
+        # EXIT trap runs, must arrive as the owner's small command with the helper's exact bytes on
+        # stdin, and still do with the helper padded past 140 KB of code.
+        add_test(
+            NAME remote_leg_helper_transport_guard
+            COMMAND ${Python3_EXECUTABLE}
+                    "${CMAKE_SOURCE_DIR}/scripts/remote-leg/test-remote-leg.py"
+                    --bash "${DSS_BASH_FOR_LANE_GUARD}"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        set_tests_properties(remote_leg_helper_transport_guard PROPERTIES
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dss_lane_bash_dir}")
     else()
         set(_dss_lane_refusal_script
             "${CMAKE_CURRENT_BINARY_DIR}/lane_worktree_guard_refusal.cmake")
@@ -930,6 +1009,38 @@ if(DSS_BUILD_TESTS)
             NAME root_litter_guard
             COMMAND ${CMAKE_COMMAND} -P "${_dss_litter_refusal_script}")
         message(STATUS "root_litter_guard registered as a REFUSAL: no bash proved able to drive scripts/check-root-litter/check-root-litter.sh")
+
+        # The same rule for the third neighbour: `macos_leg_source_tree_guard` needs this
+        # bash too, so where it was refused the entry REFUSES rather than disappearing.
+        set(_dss_macos_leg_refusal_script
+            "${CMAKE_CURRENT_BINARY_DIR}/macos_leg_source_tree_guard_refusal.cmake")
+        file(WRITE "${_dss_macos_leg_refusal_script}"
+             "message(FATAL_ERROR \"macos_leg_source_tree_guard CANNOT RUN: it drives macos-leg.sh with the same bash as lane_worktree_guard, and that bash was refused — ${_dss_lane_refusal}\")\n")
+        add_test(
+            NAME macos_leg_source_tree_guard
+            COMMAND ${CMAKE_COMMAND} -P "${_dss_macos_leg_refusal_script}")
+        message(STATUS "macos_leg_source_tree_guard registered as a REFUSAL: no bash proved able to drive scripts/macos-leg/macos-leg.sh")
+
+        # And the fourth neighbour: `leg_tree_guard` drives test-leg-tree.sh with that bash too.
+        set(_dss_leg_tree_refusal_script
+            "${CMAKE_CURRENT_BINARY_DIR}/leg_tree_guard_refusal.cmake")
+        file(WRITE "${_dss_leg_tree_refusal_script}"
+             "message(FATAL_ERROR \"leg_tree_guard CANNOT RUN: it drives scripts/leg-tree/test-leg-tree.sh with the same bash as lane_worktree_guard, and that bash was refused — ${_dss_lane_refusal}\")\n")
+        add_test(
+            NAME leg_tree_guard
+            COMMAND ${CMAKE_COMMAND} -P "${_dss_leg_tree_refusal_script}")
+        message(STATUS "leg_tree_guard registered as a REFUSAL: no bash proved able to drive scripts/leg-tree/test-leg-tree.sh")
+
+        # And the P66 lane ge neighbours, which drive their `.sh` subjects with that bash too.
+        foreach(_dss_ge_guard IN ITEMS check_ci_legs_git_environment_guard remote_leg_helper_transport_guard)
+            set(_dss_ge_refusal_script "${CMAKE_CURRENT_BINARY_DIR}/${_dss_ge_guard}_refusal.cmake")
+            file(WRITE "${_dss_ge_refusal_script}"
+                 "message(FATAL_ERROR \"${_dss_ge_guard} CANNOT RUN: it drives a .sh script with the same bash as lane_worktree_guard, and that bash was refused — ${_dss_lane_refusal}\")\n")
+            add_test(
+                NAME ${_dss_ge_guard}
+                COMMAND ${CMAKE_COMMAND} -P "${_dss_ge_refusal_script}")
+            message(STATUS "${_dss_ge_guard} registered as a REFUSAL: no bash proved able to drive its .sh subject")
+        endforeach()
     endif()
 
     # Citation-stability guard (2026-08-19 — D-PLANS-CITATION-LINE-NUMBERS-SILENTLY-INVALIDATED).
@@ -1160,6 +1271,54 @@ if(DSS_BUILD_TESTS)
         NAME anchors_selftest_guard
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/scripts/anchors/anchors.py"
+                --self-test
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # Which tree does a script's own file live in? (2026-09-15, P66 lane rr.)
+    # Eleven Python scripts took their root from the CALLER'S working directory -- a
+    # bare `git rev-parse --show-toplevel`, or a cwd-relative path -- and no entry in
+    # this file could see it, because every entry pins WORKING_DIRECTORY to the source
+    # tree. ✔MEASURED before the fix: run by path from inside another repository they
+    # reported on THAT repository, some of them OK. `scripts/owning-tree/owning-tree.py`
+    # now owns the answer; every consumer's own self-test carries the cwd arms, and this
+    # first entry proves those arms can FAIL.
+    add_test(
+        NAME owning_tree_selftest_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/owning-tree/owning-tree.py"
+                --self-test
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # Two more tools that read their subject THROUGH git, and handed git the caller's git
+    # environment (2026-09-15, P66 lane ge). ✔MEASURED before the fix, under another repository's
+    # GIT_DIR or GIT_DIR + GIT_WORK_TREE: corpus-census stamped its report with THAT repository's
+    # HEAD and branch (and "clean" for a dirty tree), and refresh_landing_log read THAT
+    # repository's history -- 1 commit instead of 111. Both now ask through
+    # `owning-tree.run_git`; each entry drives a COPY of the tool in a fixture history, so a
+    # reverted call reddens by arm name. Neither needs a network or a built binary.
+    add_test(
+        NAME corpus_census_git_environment_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/corpus-census/test-corpus-census.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(
+        NAME landing_log_git_environment_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/refresh_landing_log/refresh_landing_log.py"
+                --self-test
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # ⚠ Two of those consumers had a self-test and NO entry: a self-test behind a flag
+    # nobody passes, the D-GATE-TWO-GUARDS-SELF-TEST-BEHIND-A-FLAG-NOBODY-PASSES shape.
+    # One of them WRITES registry rows under the root it resolves.
+    add_test(
+        NAME apply_registry_row_selftest_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/apply-registry-row/apply-registry-row.py"
+                --self-test
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(
+        NAME carriage_excludes_selftest_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/scripts/carriage-excludes/carriage-excludes.py"
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
@@ -1905,3 +2064,4 @@ if(DSS_BUILD_TESTS)
     set_tests_properties(pkg_pipeline_modes_guard PROPERTIES LABELS "repo-guard")
     message(STATUS "repo-guard label applied to 1 additional test (pkg_pipeline_modes_guard)")
 endif()
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DssTestBudgets.cmake")  # every ctest entry's TIMEOUT — keep this LAST

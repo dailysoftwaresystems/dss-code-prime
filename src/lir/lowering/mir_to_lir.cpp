@@ -11622,6 +11622,32 @@ struct Lowerer {
         std::uint8_t const widthFlags =
             memAccessWidthFlags(mir.instType(id), regClassFor(id));
 
+        // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+        // ★★ AN UNDER-ALIGNED COMPARE-EXCHANGE IS COMMITTED BY THE SAME ARBITER AS
+        // THE LOAD IT PAIRS WITH. This function used to be the ONE atomic access
+        // `atomicLoweringFor` was never consulted for, which was harmless while
+        // every producer stamped `payload2 = 0` ("unknown → aligned"). A HIR
+        // `ReadModifyWrite` on a packed member now stamps the member's provable
+        // alignment on its CAS as on its AtomicLoad — and a load taken under the
+        // atomics runtime's lock, committed by a native `lock cmpxchg`/`stlxr`
+        // that never takes that lock, is two arbiters for one object. Under
+        // `traps` the native exclusive pair is also the measured SIGBUS class.
+        // ⓘ An aligned CAS (every producer before this row) answers `Native` and
+        // takes the rules below byte-for-byte unchanged.
+        switch (atomicLoweringFor(id, widthFlags)) {
+            case AtomicLowering::Native: break;
+            case AtomicLowering::RuntimeCall:
+                if (!lowerUnderAlignedAtomicCas(id, widthFlags, *ptr, *comparand,
+                                                *newval)) {
+                    poisonValue(id);
+                }
+                return;
+            case AtomicLowering::RefuseNoRuntime:
+                reportMissingAtomicsRuntime(MirOpcode::AtomicCas, id);
+                poisonValue(id);
+                return;
+        }
+
         // Rule 1 — x86 single-op `lock cmpxchg` with implicit-RAX roles.
         if (auto const casOp = opcode(MnemonicSlot::LockCmpxchg); casOp.has_value()) {
             auto const movOp = opcode(MnemonicSlot::Mov);
@@ -12032,16 +12058,29 @@ struct Lowerer {
     // physical registers are deliberately NOT copied here: that verb marshals
     // 128-bit values the classifier cannot see, while these four are plain
     // integer/pointer arguments the classifier handles exactly right.
+    // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+    // the argument list is `size, object, <slots…>, <models…>` — ONE shape for the
+    // three generic entries: load/store pass one slot and one model, the
+    // compare-exchange passes `expected` + `desired` and `success` + `failure`.
+    // The emission order (size constant, model constants, call) is the one the
+    // two-argument form always had, so load and store are byte-identical.
     [[nodiscard]] bool
-    emitAtomicsRuntimeCall(SymbolId sym, LirReg objectAddr, LirReg slotAddr,
-                           std::uint32_t sizeBytes, std::uint32_t order,
+    emitAtomicsRuntimeCall(SymbolId sym, LirReg objectAddr,
+                           std::span<LirReg const> slotAddrs,
+                           std::uint32_t sizeBytes,
+                           std::span<std::uint32_t const> models,
                            std::uint8_t ptrBytes, std::string_view context) {
         auto const sizeReg = emitBareConstToFresh(
             static_cast<std::int64_t>(sizeBytes));
         if (!sizeReg.has_value()) return false;
-        auto const orderReg = emitBareConstToFresh(
-            static_cast<std::int64_t>(order));
-        if (!orderReg.has_value()) return false;
+        std::vector<LirReg> modelRegs;
+        modelRegs.reserve(models.size());
+        for (std::uint32_t const model : models) {
+            auto const modelReg = emitBareConstToFresh(
+                static_cast<std::int64_t>(model));
+            if (!modelReg.has_value()) return false;
+            modelRegs.push_back(*modelReg);
+        }
         // P55: the per-symbol answer, as at every other extern call site.
         MnemonicSlot const callSlot = externRefUsesSlot(sym)
             ? MnemonicSlot::CallIndirectViaExtern
@@ -12056,13 +12095,15 @@ struct Lowerer {
         // genuinely has a MIR type. `size_t` takes the same width (it IS
         // pointer-width on every LP64/LLP64 target DSS serves) and the
         // memory-order model is a plain `int`.
-        std::array<LirOperand, 5> ops{
-            LirOperand::makeSymbolRef(sym.v),
-            LirOperand::makeArgReg(*sizeReg,   ptrBytes),
-            LirOperand::makeArgReg(objectAddr, ptrBytes),
-            LirOperand::makeArgReg(slotAddr,   ptrBytes),
-            LirOperand::makeArgReg(*orderReg,  std::uint8_t{4}),
-        };
+        std::vector<LirOperand> ops;
+        ops.reserve(3 + slotAddrs.size() + modelRegs.size());
+        ops.push_back(LirOperand::makeSymbolRef(sym.v));
+        ops.push_back(LirOperand::makeArgReg(*sizeReg,   ptrBytes));
+        ops.push_back(LirOperand::makeArgReg(objectAddr, ptrBytes));
+        for (LirReg const slot : slotAddrs)
+            ops.push_back(LirOperand::makeArgReg(slot, ptrBytes));
+        for (LirReg const modelReg : modelRegs)
+            ops.push_back(LirOperand::makeArgReg(modelReg, std::uint8_t{4}));
         emitInst(*callOp, InvalidLirReg, ops);
         return true;
     }
@@ -12092,8 +12133,9 @@ struct Lowerer {
         auto const sym = resolveAtomicsRuntimeExtern(
             atomicsRuntime_->loadMangledName, "MIR AtomicLoad");
         if (!sym.has_value()) return false;
-        if (!emitAtomicsRuntimeCall(*sym, *objectAddr, *slotAddr, sizeBytes,
-                                    mir.instPayload(id),
+        std::array<LirReg, 1> const slots{*slotAddr};
+        std::array<std::uint32_t, 1> const models{mir.instPayload(id)};
+        if (!emitAtomicsRuntimeCall(*sym, *objectAddr, slots, sizeBytes, models,
                                     atomicPointerArgBytes(operands[0]),
                                     "under-aligned _Atomic load (call)")) {
             return false;
@@ -12164,10 +12206,127 @@ struct Lowerer {
         // a fresh short-range vreg).
         std::optional<LirReg> const callSlotAddr = emitLeaFrameSlot(*slotIndex);
         if (!callSlotAddr.has_value()) return false;
-        return emitAtomicsRuntimeCall(*sym, *objectAddr, *callSlotAddr,
-                                      sizeBytes, mir.instPayload(id),
+        std::array<LirReg, 1> const slots{*callSlotAddr};
+        std::array<std::uint32_t, 1> const models{mir.instPayload(id)};
+        return emitAtomicsRuntimeCall(*sym, *objectAddr, slots, sizeBytes, models,
                                       atomicPointerArgBytes(operands[1]),
                                       "under-aligned _Atomic store (call)");
+    }
+
+    // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+    // an under-aligned AtomicCas →
+    //     slot expected := comparand ; slot desired := newval ;
+    //     __atomic_compare_exchange(size, obj, &expected, &desired, 5, 5) ;
+    //     result := load expected
+    // ✔THE SHAPE was read off clang 18's own call site (`4, ptr, &expected_slot,
+    // &desired_slot, 5, 5`) — BOTH values travel through caller-supplied slots, the
+    // `__atomic_store` discipline, and never in registers.
+    // ★★ THE RESULT IS THE `expected` SLOT READ BACK, NOT A FUNCTION OF THE
+    // RETURNED `_Bool`, AND IT IS EXACT ON BOTH OUTCOMES. The MIR op's contract is
+    // "the value observed", and the generic entry writes the observed value through
+    // `expected` exactly when the comparison FAILS, leaving it — equal to the
+    // observed value, since they compared equal — untouched when it succeeds. So
+    // the slot holds the observed value either way, and the MIR tier's own
+    // `prev == old` equality decides the retry exactly as it does over the native
+    // forms. Reading the `_Bool` would add a second answer to a question already
+    // answered.
+    // ⓘ Both models are seq_cst (5): every producer of a runtime-routed CAS is a
+    // read-modify-write, which C23 6.5.17.3p4 makes seq_cst — the value clang
+    // passes too.
+    [[nodiscard]] bool lowerUnderAlignedAtomicCas(MirInstId id,
+                                                  std::uint8_t widthFlags,
+                                                  LirReg objectAddr,
+                                                  LirReg comparand,
+                                                  LirReg newval) {
+        if (atomicsRuntime_->compareExchangeMangledName.empty()) {
+            reportMissingAtomicsCompareExchange(id);
+            return false;
+        }
+        std::uint32_t const sizeBytes = lirInstWidthBits(widthFlags) / 8u;
+        auto const storeOp = classOp(LirRegClass::GPR, RegClassOp::Store);
+        if (!storeOp.has_value()) {
+            reportMissingClassOp(LirRegClass::GPR, RegClassOp::Store,
+                                 "under-aligned _Atomic compare-exchange (slots)");
+            return false;
+        }
+        auto const loadOp = classOp(LirRegClass::GPR, RegClassOp::Load);
+        if (!loadOp.has_value()) {
+            reportMissingClassOp(LirRegClass::GPR, RegClassOp::Load,
+                                 "under-aligned _Atomic compare-exchange (result)");
+            return false;
+        }
+        auto const expectedSlot = emitF80ScratchSlot(
+            sizeBytes, "under-aligned _Atomic compare-exchange (expected slot)");
+        if (!expectedSlot.has_value()) return false;
+        auto const desiredSlot = emitF80ScratchSlot(
+            sizeBytes, "under-aligned _Atomic compare-exchange (desired slot)");
+        if (!desiredSlot.has_value()) return false;
+        auto const storeInto = [&](LirReg value, std::uint32_t slot) {
+            std::optional<LirReg> const addr = emitLeaFrameSlot(slot);
+            if (!addr.has_value()) return false;
+            std::array<LirOperand, 4> stOps{
+                LirOperand::makeReg(value),
+                LirOperand::makeReg(*addr),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(0),
+            };
+            emitInst(*storeOp, InvalidLirReg, stOps, /*payload=*/0, widthFlags);
+            return true;
+        };
+        if (!storeInto(comparand, *expectedSlot)) return false;
+        if (!storeInto(newval, *desiredSlot)) return false;
+        auto const sym = resolveAtomicsRuntimeExtern(
+            atomicsRuntime_->compareExchangeMangledName, "MIR AtomicCas");
+        if (!sym.has_value()) return false;
+        // Rematerialized for the call, as the store arm does: the slot stores
+        // above are the last uses of their own address vregs.
+        std::optional<LirReg> const expectedAddr = emitLeaFrameSlot(*expectedSlot);
+        std::optional<LirReg> const desiredAddr  = emitLeaFrameSlot(*desiredSlot);
+        if (!expectedAddr.has_value() || !desiredAddr.has_value()) return false;
+        std::array<LirReg, 2> const slots{*expectedAddr, *desiredAddr};
+        std::array<std::uint32_t, 2> const models{kAtomicOrderSeqCst,
+                                                  kAtomicOrderSeqCst};
+        auto const operands = mir.instOperands(id);
+        if (!emitAtomicsRuntimeCall(*sym, objectAddr, slots, sizeBytes, models,
+                                    atomicPointerArgBytes(operands[0]),
+                                    "under-aligned _Atomic compare-exchange (call)")) {
+            return false;
+        }
+        // The observed value, out of `expected` — re-addressed, because the call
+        // clobbered every caller-saved register.
+        std::optional<LirReg> const readbackAddr = emitLeaFrameSlot(*expectedSlot);
+        if (!readbackAddr.has_value()) return false;
+        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 3> ldOps{
+            LirOperand::makeReg(*readbackAddr),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        emitInst(*loadOp, result, ldOps, /*payload=*/0, widthFlags);
+        defineValue(id, result);
+        return true;
+    }
+
+    // The format declares an atomics runtime but no compare-exchange entry in it.
+    // A REFUSAL, never the native form: committing a runtime-loaded value with a
+    // native compare-exchange arbitrates one object with two mechanisms.
+    void reportMissingAtomicsCompareExchange(MirInstId id) {
+        dss::report(reporter,
+            DiagnosticCode::L_UnsupportedLoweringForOpcode,
+            DiagnosticSeverity::Error,
+            std::format(
+                "MIR AtomicCas (inst {}): this _Atomic compare-exchange is provably "
+                "under-aligned ({} byte(s)) on target '{}', so — like the load it "
+                "commits — it must go through the object format's atomics runtime, "
+                "but the format's `atomicsRuntime` block declares no "
+                "`compareExchangeMangledName`: there is no generic "
+                "`__atomic_compare_exchange` entry to call. Committing with the "
+                "native form instead would arbitrate one object with two "
+                "mechanisms (the runtime's lock for the load, the processor's for "
+                "the commit), which arbitrates nothing. Declare the entry in the "
+                "format's `.format.json` "
+                "(D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE).",
+                id.v, mir.instPayload2(id), target.name()));
     }
 
     // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): lower a MIR AtomicLoad to a

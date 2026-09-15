@@ -880,13 +880,96 @@ struct Lowerer {
             // PROVABLE alignment — the layout fact MIR→LIR needs to choose
             // between the native `ldar` and the runtime libcall, and the last
             // tier that still has the HIR access chain to derive it from.
-            return mir.addInst(MirOpcode::AtomicLoad, ptrOps, accessedTy,
-                               /*payload=*/kAtomicOrderSeqCst,
-                               MirInstFlags::None,
-                               atomicAlignPayload(node, accessedTy));
+            return emitAtomicLoadOf(ptrOps, accessedTy, kAtomicOrderSeqCst,
+                                    atomicAlignPayload(node, accessedTy));
         }
         return mir.addInst(MirOpcode::Load, ptrOps, accessedTy, /*payload=*/0,
                            volatileFlagFor(node) | volatileFlagForType(accessedTy));
+    }
+
+    // ── D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE ──
+    //
+    // ★★★ A FLOATING `_Atomic` IS ACCESSED THROUGH ITS INTEGER REPRESENTATION, AND
+    // THAT IS THE MEANING, NOT A DETOUR. C23 7.17.7.4 defines compare-exchange as
+    // comparing "the contents of the memory", so the indivisible operations on an
+    // `_Atomic double` are operations on its 64 BITS: a value comparison would be
+    // WRONG twice over — NaN never equals itself, so a loop committing only on
+    // `prev == old` would retry forever over a NaN it itself stored, and +0.0 == -0.0
+    // would let a commit overwrite a concurrent sign change. ✔MEASURED what the
+    // references do: clang 18.1.3 lowers `fd += d` on an `_Atomic double` to a
+    // `lock cmpxchg %rcx` retry loop over the bits, gcc 13.3.0 to the same loop
+    // (wrapped in `fnstenv`/`ldmxcsr` — the NOTE 5 environment hold), and a
+    // two-thread race over `d += 1.0`, `f += 1.0f` and `++dd` exits clean on gcc,
+    // clang and MSVC 19.51 (`/experimental:c11atomics`) at -O0/-O2 (/Od, /O2),
+    // three runs each. Before this, DSS lowered NO fenced access of a floating
+    // `_Atomic` at all — `mir_to_lir` refused every one (`reportNonGprAtomic`,
+    // "a float _Atomic is a named deferral"), plain load and store included.
+    //
+    // So a floating access retypes its ADDRESS to the same-width integer, performs
+    // the integer atomic operation the targets already realize (x86-64 `xchg`/`mov`
+    // /`lock cmpxchg`, arm64 `ldar`/`stlr`/LL/SC, the atomics runtime when
+    // under-aligned), and `Bitcast`s across register classes — the move
+    // `lowerBitcast` already realizes on both shipped targets (MOVQ/MOVD, FMOV).
+    // Every `_Atomic` MIR operation is therefore integer- or pointer-typed, which is
+    // why no tier below needed a floating fence form.
+    // ⓘ An `long double` that IS a double (pe64, Apple arm64) takes this route; an
+    // x87 80-bit or 128-bit one has no single-register representation and stays in
+    // the non-lock-free class ([[D-CSUBSET-ATOMIC-NONLOCKFREE]]).
+    [[nodiscard]] TypeId atomicReprType(TypeId valueTy) {
+        if (!valueTy.valid()) return valueTy;
+        switch (interner.kind(valueTy)) {
+            case TypeKind::F32: return interner.primitive(TypeKind::U32);
+            case TypeKind::F64: return interner.primitive(TypeKind::U64);
+            default:            return valueTy;   // integer / pointer / enum: itself
+        }
+    }
+
+    // The same address, typed as the representation it is accessed through. The
+    // pointee is UNQUALIFIED on purpose: the verifier's store-typing rule then
+    // compares the integer bits against an integer slot, which is what they are.
+    [[nodiscard]] MirInstId atomicReprPointer(MirInstId ptr, TypeId reprTy) {
+        std::array<MirInstId, 1> const ops{ptr};
+        return mir.addInst(MirOpcode::Bitcast, ops, interner.pointer(reprTy));
+    }
+
+    // One indivisible load of a `valueTy` object. An integer or pointer object is
+    // the single AtomicLoad this funnel always emitted (byte-identical); a
+    // floating one loads its representation and bit-casts it back.
+    [[nodiscard]] MirInstId emitAtomicLoadOf(std::span<MirInstId const> ptrOps,
+                                             TypeId valueTy, std::uint32_t order,
+                                             std::uint32_t alignPayload) {
+        TypeId const reprTy = atomicReprType(valueTy);
+        if (reprTy == valueTy || ptrOps.size() != 1) {
+            return mir.addInst(MirOpcode::AtomicLoad, ptrOps, valueTy, order,
+                               MirInstFlags::None, alignPayload);
+        }
+        MirInstId const reprPtr = atomicReprPointer(ptrOps[0], reprTy);
+        if (!reprPtr.valid()) return InvalidMirInst;
+        std::array<MirInstId, 1> const ld{reprPtr};
+        MirInstId const bits = mir.addInst(MirOpcode::AtomicLoad, ld, reprTy, order,
+                                           MirInstFlags::None, alignPayload);
+        if (!bits.valid()) return InvalidMirInst;
+        std::array<MirInstId, 1> const bc{bits};
+        return mir.addInst(MirOpcode::Bitcast, bc, valueTy);
+    }
+
+    // The store twin: `storeOps` is the plain-Store pair {value, ptr}. Returns the
+    // AtomicStore instruction (a no-result op still has an id, and the builtin
+    // caller hands it back as its evaluation), or InvalidMirInst on failure.
+    MirInstId emitAtomicStoreOf(std::span<MirInstId const> storeOps, TypeId valueTy,
+                                std::uint32_t order, std::uint32_t alignPayload) {
+        TypeId const reprTy = atomicReprType(valueTy);
+        if (reprTy == valueTy || storeOps.size() != 2) {
+            return mir.addInst(MirOpcode::AtomicStore, storeOps, InvalidType, order,
+                               MirInstFlags::None, alignPayload);
+        }
+        std::array<MirInstId, 1> const bc{storeOps[0]};
+        MirInstId const bits = mir.addInst(MirOpcode::Bitcast, bc, reprTy);
+        MirInstId const reprPtr = atomicReprPointer(storeOps[1], reprTy);
+        if (!bits.valid() || !reprPtr.valid()) return InvalidMirInst;
+        std::array<MirInstId, 2> const st{bits, reprPtr};
+        return mir.addInst(MirOpcode::AtomicStore, st, InvalidType, order,
+                           MirInstFlags::None, alignPayload);
     }
 
     // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the Store twin of `emitScalarLoad`.
@@ -902,9 +985,8 @@ struct Lowerer {
         if (interner.isAtomicQualified(accessedTy)) {
             // D-CSUBSET-PACKED-ATOMIC-MEMBER: see the `emitScalarLoad` twin —
             // `payload2` is the lvalue's provable alignment.
-            mir.addInst(MirOpcode::AtomicStore, storeOps, InvalidType,
-                        /*payload=*/kAtomicOrderSeqCst, MirInstFlags::None,
-                        atomicAlignPayload(node, accessedTy));
+            emitAtomicStoreOf(storeOps, accessedTy, kAtomicOrderSeqCst,
+                              atomicAlignPayload(node, accessedTy));
             return;
         }
         mir.addInst(MirOpcode::Store, storeOps, InvalidType, /*payload=*/0,
@@ -1073,11 +1155,37 @@ struct Lowerer {
             || (op != BuiltinLowering::AtomicExchange && !operandVal.valid())) {
             return InvalidMirInst;
         }
-        if (!isIntegerLikeAtomicRmwType(valueTy)) {
-            unsupported(node,
-                "[[D-CSUBSET-ATOMIC-RMW]] an atomic read-modify-write needs an "
-                "integer or pointer object type — the load-op-store composition "
-                "is defined over the integer ALU verbs");
+        // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+        // a FLOATING object's loop runs over its representation (`atomicReprType`),
+        // so the verbs whose computation is defined on a float take it too:
+        //   * `atomic_exchange` — no ALU step at all. ✔MEASURED gcc 13.3.0, clang
+        //     18.1.3 and MSVC 19.51 all compile and run it on an `_Atomic double`.
+        //   * `atomic_fetch_add` / `atomic_fetch_sub` — the float `+`/`-`. C23
+        //     7.17.7.5 applies the fetch family to integer and address types, and
+        //     ✔MEASURED gcc 13.3.0 ("operand type '_Atomic double *' is
+        //     incompatible") and MSVC 19.51 (C7712) refuse them — but clang 18.1.3
+        //     compiles AND RUNS both correctly (rc 42), and one working reference
+        //     makes the construct REQUIRED.
+        //   * `or`/`xor`/`and` have no float computation, and ✔MEASURED gcc 13.3.0 and
+        //     clang 18.1.3 both refuse them on an `_Atomic double` ("must be a pointer
+        //     to atomic integer"; MSVC refuses the whole family) — so they stay
+        //     refused, within the union.
+        bool const floating  = atomicReprType(valueTy) != valueTy;
+        bool const floatArith = floating
+            && (op == BuiltinLowering::AtomicFetchAdd
+             || op == BuiltinLowering::AtomicFetchSub);
+        bool const representable =
+            (op == BuiltinLowering::AtomicExchange || floatArith)
+                ? isIntegerLikeAtomicRmwType(atomicReprType(valueTy))
+                : isIntegerLikeAtomicRmwType(valueTy);
+        if (!representable) {
+            unsupported(node, floating
+                ? "[[D-CSUBSET-ATOMIC-RMW]] `atomic_fetch_or`/`_xor`/`_and` have no "
+                  "computation on a floating object — gcc 13.3.0, clang 18.1.3 and "
+                  "MSVC 19.51 all refuse them on an `_Atomic double`"
+                : "[[D-CSUBSET-ATOMIC-RMW]] an atomic read-modify-write needs an "
+                  "integer, pointer or floating object type — the load-op-store "
+                  "composition runs over a single-register representation");
             return InvalidMirInst;
         }
         MirOpcode const alu = atomicRmwAluOpcode(op);
@@ -1088,17 +1196,10 @@ struct Lowerer {
             return InvalidMirInst;
         }
 
-        MirBlockId const header = mir.createBlock(StructCfMarker::LoopHeader);
-        MirBlockId const bodyBB = mir.createBlock(StructCfMarker::Linear);
-        MirBlockId const exitBB = mir.createBlock(StructCfMarker::LoopExit);
-
-        mir.addBr(header);
-        mir.beginBlock(header);
-        std::array<MirInstId, 1> const ldOps{objPtr};
-        MirInstId const oldVal =
-            mir.addInst(MirOpcode::AtomicLoad, ldOps, valueTy, order,
-                        MirInstFlags::None, alignPayload);
-        if (!oldVal.valid()) return InvalidMirInst;
+        std::optional<AtomicRmwLoop> const loop =
+            openAtomicRmwLoop(objPtr, valueTy, order, alignPayload);
+        if (!loop.has_value()) return InvalidMirInst;
+        MirInstId const oldVal = loop->old;
         MirInstId newVal = operandVal;
         bool const pointerArith = interner.kind(valueTy) == TypeKind::Ptr
             && (op == BuiltinLowering::AtomicFetchAdd
@@ -1136,12 +1237,28 @@ struct Lowerer {
                 unsupported(node,
                     "[[D-CSUBSET-ATOMIC-RMW]] atomic pointer arithmetic: the "
                     "object's pointer type has no pointee to take a stride from");
+                abandonAtomicRmwLoop(*loop);
                 return InvalidMirInst;
             }
             newVal = emitPointerOffsetGep(
                 oldVal, valueTy, operandVal, operandTy, ptOps[0],
                 /*negate=*/op == BuiltinLowering::AtomicFetchSub, node);
-            if (!newVal.valid()) return InvalidMirInst;
+            if (!newVal.valid()) {
+                abandonAtomicRmwLoop(*loop);
+                return InvalidMirInst;
+            }
+        } else if (floatArith) {
+            // The float `+`/`-` over the observed VALUE (the loop bit-cast it back
+            // from the representation); `closeAtomicRmwLoop` commits its bits. No
+            // promotion — that is an integer rule.
+            std::array<MirInstId, 2> const fops{oldVal, operandVal};
+            newVal = mir.addInst(op == BuiltinLowering::AtomicFetchAdd
+                                     ? MirOpcode::FAdd : MirOpcode::FSub,
+                                 fops, valueTy);
+            if (!newVal.valid()) {
+                abandonAtomicRmwLoop(*loop);
+                return InvalidMirInst;
+            }
         } else if (op != BuiltinLowering::AtomicExchange) {
             // ⚠ THE ALU STEP RUNS AT THE PROMOTION WIDTH, NOT THE OBJECT WIDTH.
             // ✔MEASURED: a byte/half `Add` is refused by name on BOTH shipped
@@ -1157,38 +1274,162 @@ struct Lowerer {
             // `prev == old` equality below faithful at the promoted width.
             MirInstId const promotedOld = promoteForAtomicRmw(oldVal, valueTy);
             MirInstId const promotedVal = promoteForAtomicRmw(operandVal, valueTy);
-            if (!promotedOld.valid() || !promotedVal.valid())
+            if (!promotedOld.valid() || !promotedVal.valid()) {
+                abandonAtomicRmwLoop(*loop);
                 return InvalidMirInst;
+            }
             TypeId const aluTy = atomicRmwPromotedType(valueTy);
             std::array<MirInstId, 2> const aluOps{promotedOld, promotedVal};
             MirInstId const promotedNew = mir.addInst(alu, aluOps, aluTy);
-            if (!promotedNew.valid()) return InvalidMirInst;
+            if (!promotedNew.valid()) {
+                abandonAtomicRmwLoop(*loop);
+                return InvalidMirInst;
+            }
             newVal = narrowFromAtomicRmw(promotedNew, valueTy);
-            if (!newVal.valid()) return InvalidMirInst;
+            if (!newVal.valid()) {
+                abandonAtomicRmwLoop(*loop);
+                return InvalidMirInst;
+            }
+        }
+        // C11 §7.17.7.5: every `atomic_fetch_*` and `atomic_exchange` yields the
+        // value the object held BEFORE the operation — which is what the loop's
+        // close returns.
+        return closeAtomicRmwLoop(*loop, newVal);
+    }
+
+    // ── D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE ──
+    //
+    // ★★★ THE RETRY LOOP `emitAtomicRmw` DRAWS IS SPLIT AT THE ONE POINT ITS TWO
+    // PRODUCERS DIFFER — NOT COPIED. That function (the `atomic_fetch_*` family) and
+    // a HIR `ReadModifyWrite` (`E1 op= E2` and `++`/`--` on an `_Atomic` lvalue)
+    // compute the replacement from the observed value differently — an ALU verb
+    // over a builtin's operand, or an arbitrary expression lowered on the work stack
+    // between the halves — and share everything else: the load, the commit through
+    // `AtomicCas`, the equality that decides the retry, and the CFG. Before this,
+    // the operator spellings never reached the loop at all: they lowered to a
+    // separate `AtomicLoad` and `AtomicStore` and LOST UPDATES under contention
+    // (✔MEASURED, a two-thread race probe: rc 115 on pe64 and elf64, where MSVC's
+    // build of the same source exits 100). A second loop for them would have been
+    // a second place to get the width rule or the alignment routing wrong.
+    //   open:  br header ; header: old = AtomicLoad(obj)          ; LoopHeader
+    //          <the caller emits new = f(old) here, in `header` or below it>
+    //   close: prev = AtomicCas(obj, old, new) ; CondBr(prev == old, exit, body)
+    //          body: br header                                      ; the retry
+    //          exit:                                                ; LoopExit
+    // ★★ THE CAS CARRIES THE SAME PROVABLE-ALIGNMENT `payload2` AS THE LOAD, and
+    // that is load-bearing rather than tidy: `mir_to_lir` routes an under-aligned
+    // access through the atomics runtime, and a runtime-arbitrated load committed
+    // by a NATIVE compare-exchange is two mechanisms arbitrating one object —
+    // which arbitrates nothing. Before this the CAS carried 0 ("unknown → aligned")
+    // at every producer.
+    // ⓘ A FLOATING object's loop runs over its REPRESENTATION (see
+    // `atomicReprType`): `objPtr` is the retyped address, the load and the commit
+    // are integer-typed, and `old` is the observed bits bit-cast back — the one
+    // value the update ever sees. The retry equality is therefore on the bits,
+    // which is what makes a NaN or a signed zero commit exactly once.
+    struct AtomicRmwLoop {
+        MirInstId     objPtr;       // the address load and commit take (retyped if floating)
+        MirInstId     old;          // the observed value, as `valueTy`
+        MirInstId     oldBits;      // the observed representation (== `old` if not floating)
+        TypeId        valueTy;
+        TypeId        reprTy;       // == `valueTy` unless floating
+        std::uint32_t alignPayload = 0;
+        MirBlockId    header;
+        MirBlockId    body;
+        MirBlockId    exit;
+    };
+    // The loops a `ReadModifyWrite` frame has opened and not yet closed. A stack
+    // parallel to the driver's `work`, for the `callCtxs` reason: the frame holds
+    // an INDEX, so a nested lowering that grows this vector cannot dangle it.
+    std::vector<AtomicRmwLoop> rmwLoops_;
+
+    [[nodiscard]] std::optional<AtomicRmwLoop>
+    openAtomicRmwLoop(MirInstId objPtr, TypeId valueTy, std::uint32_t order,
+                      std::uint32_t alignPayload) {
+        AtomicRmwLoop loop;
+        loop.valueTy      = valueTy;
+        loop.reprTy       = atomicReprType(valueTy);
+        loop.alignPayload = alignPayload;
+        bool const viaRepr = loop.reprTy != valueTy;
+        // The retyped address is loop-invariant, so it is taken ONCE, before the
+        // loop and before any block is minted — a failure here leaves nothing to seal.
+        loop.objPtr = viaRepr ? atomicReprPointer(objPtr, loop.reprTy) : objPtr;
+        if (!loop.objPtr.valid()) return std::nullopt;
+        loop.header = mir.createBlock(StructCfMarker::LoopHeader);
+        loop.body   = mir.createBlock(StructCfMarker::Linear);
+        loop.exit   = mir.createBlock(StructCfMarker::LoopExit);
+        mir.addBr(loop.header);
+        mir.beginBlock(loop.header);
+        std::array<MirInstId, 1> const ldOps{loop.objPtr};
+        loop.oldBits = mir.addInst(MirOpcode::AtomicLoad, ldOps, loop.reprTy, order,
+                                   MirInstFlags::None, alignPayload);
+        if (!loop.oldBits.valid()) {
+            abandonAtomicRmwLoop(loop);
+            return std::nullopt;
+        }
+        loop.old = loop.oldBits;
+        if (viaRepr) {
+            std::array<MirInstId, 1> const bc{loop.oldBits};
+            loop.old = mir.addInst(MirOpcode::Bitcast, bc, valueTy);
+            if (!loop.old.valid()) {
+                abandonAtomicRmwLoop(loop);
+                return std::nullopt;
+            }
+        }
+        return loop;
+    }
+
+    // A failure BETWEEN the halves (the update did not lower): seal what `open`
+    // minted, so `finish()` never meets a created-but-unfilled block — the same
+    // discipline the Ternary frame applies to its own blocks.
+    void abandonAtomicRmwLoop(AtomicRmwLoop const& loop) {
+        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+        sealCreatedAsUnreachable(loop.body);
+        sealCreatedAsUnreachable(loop.exit);
+    }
+
+    [[nodiscard]] MirInstId closeAtomicRmwLoop(AtomicRmwLoop const& loop,
+                                               MirInstId newVal) {
+        MirInstId newBits = newVal;
+        if (loop.reprTy != loop.valueTy) {
+            std::array<MirInstId, 1> const bc{newVal};
+            newBits = mir.addInst(MirOpcode::Bitcast, bc, loop.reprTy);
+            if (!newBits.valid()) {
+                abandonAtomicRmwLoop(loop);
+                return InvalidMirInst;
+            }
         }
         // The UNIVERSAL CAS operand order the shipped opcode documents:
         // [ptr, comparand(expected), newval(desired)].
-        std::array<MirInstId, 3> const casOps{objPtr, oldVal, newVal};
+        std::array<MirInstId, 3> const casOps{loop.objPtr, loop.oldBits, newBits};
         MirInstId const prev =
-            mir.addInst(MirOpcode::AtomicCas, casOps, valueTy);
-        if (!prev.valid()) return InvalidMirInst;
-        MirInstId const cmpPrev = promoteForAtomicRmw(prev, valueTy);
-        MirInstId const cmpOld  = promoteForAtomicRmw(oldVal, valueTy);
-        if (!cmpPrev.valid() || !cmpOld.valid()) return InvalidMirInst;
+            mir.addInst(MirOpcode::AtomicCas, casOps, loop.reprTy, /*payload=*/0,
+                        MirInstFlags::None, loop.alignPayload);
+        if (!prev.valid()) {
+            abandonAtomicRmwLoop(loop);
+            return InvalidMirInst;
+        }
+        MirInstId const cmpPrev = promoteForAtomicRmw(prev, loop.reprTy);
+        MirInstId const cmpOld  = promoteForAtomicRmw(loop.oldBits, loop.reprTy);
+        if (!cmpPrev.valid() || !cmpOld.valid()) {
+            abandonAtomicRmwLoop(loop);
+            return InvalidMirInst;
+        }
         std::array<MirInstId, 2> const eqOps{cmpPrev, cmpOld};
         MirInstId const committed =
             mir.addInst(MirOpcode::ICmpEq, eqOps,
                         interner.primitive(TypeKind::Bool));
-        if (!committed.valid()) return InvalidMirInst;
-        mir.addCondBr(committed, exitBB, bodyBB);
+        if (!committed.valid()) {
+            abandonAtomicRmwLoop(loop);
+            return InvalidMirInst;
+        }
+        mir.addCondBr(committed, loop.exit, loop.body);
 
-        mir.beginBlock(bodyBB);
-        mir.addBr(header);
+        mir.beginBlock(loop.body);
+        mir.addBr(loop.header);
 
-        mir.beginBlock(exitBB);
-        // C11 §7.17.7.5: every `atomic_fetch_*` and `atomic_exchange` yields the
-        // value the object held BEFORE the operation.
-        return oldVal;
+        mir.beginBlock(loop.exit);
+        return loop.old;
     }
 
     // D-CSUBSET-ATOMIC-RMW: `atomic_compare_exchange_{strong,weak}_explicit`.
@@ -1208,30 +1449,55 @@ struct Lowerer {
     // ⓘ Both the `_strong` and `_weak` spellings route here: C permits the weak
     // form to fail spuriously but never REQUIRES it to, so a strong CAS is a
     // conforming realization of both.
+    // `alignPayload` is the pointee's provable alignment, stamped on the CAS for
+    // the reason `closeAtomicRmwLoop` stamps its own: `mir_to_lir` decides native
+    // vs atomics-runtime from it, per access.
     [[nodiscard]] MirInstId emitAtomicCompareExchange(
             MirInstId objPtr, MirInstId expectedPtr, MirInstId desired,
-            TypeId valueTy, TypeId resultTy, HirNodeId node) {
+            TypeId valueTy, TypeId resultTy, std::uint32_t alignPayload,
+            HirNodeId node) {
         if (!objPtr.valid() || !expectedPtr.valid() || !desired.valid())
             return InvalidMirInst;
-        if (!isIntegerLikeAtomicRmwType(valueTy)) {
+        // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+        // a FLOATING object compares and exchanges its REPRESENTATION — C23
+        // 7.17.7.4 compares "the contents of the memory", so a NaN expected value
+        // matches a NaN object with the same bits and +0.0 does not match -0.0.
+        // ✔MEASURED gcc 13.3.0, clang 18.1.3 and MSVC 19.51 all run
+        // `atomic_compare_exchange_strong` on an `_Atomic double` in both outcomes.
+        TypeId const reprTy = atomicReprType(valueTy);
+        if (!isIntegerLikeAtomicRmwType(reprTy)) {
             unsupported(node,
                 "[[D-CSUBSET-ATOMIC-RMW]] an atomic compare-exchange needs an "
-                "integer or pointer object type");
+                "integer, pointer or floating object type");
             return InvalidMirInst;
         }
+        bool const viaRepr = reprTy != valueTy;
         std::array<MirInstId, 1> const expLd{expectedPtr};
         MirInstId const expected =
             mir.addInst(MirOpcode::Load, expLd, valueTy);
         if (!expected.valid()) return InvalidMirInst;
-        std::array<MirInstId, 3> const casOps{objPtr, expected, desired};
+        MirInstId casObj  = objPtr;
+        MirInstId expBits = expected;
+        MirInstId desBits = desired;
+        if (viaRepr) {
+            casObj = atomicReprPointer(objPtr, reprTy);
+            std::array<MirInstId, 1> const e{expected};
+            expBits = mir.addInst(MirOpcode::Bitcast, e, reprTy);
+            std::array<MirInstId, 1> const d{desired};
+            desBits = mir.addInst(MirOpcode::Bitcast, d, reprTy);
+            if (!casObj.valid() || !expBits.valid() || !desBits.valid())
+                return InvalidMirInst;
+        }
+        std::array<MirInstId, 3> const casOps{casObj, expBits, desBits};
         MirInstId const prev =
-            mir.addInst(MirOpcode::AtomicCas, casOps, valueTy);
+            mir.addInst(MirOpcode::AtomicCas, casOps, reprTy, /*payload=*/0,
+                        MirInstFlags::None, alignPayload);
         if (!prev.valid()) return InvalidMirInst;
         // The same promotion rule as `emitAtomicRmw`: a byte/half ICmp has no
         // native-width form on either shipped target (D-CSUBSET-32BIT-ALU-FORMS),
         // and both operands take the SAME extension, so equality is preserved.
-        MirInstId const cmpPrev = promoteForAtomicRmw(prev, valueTy);
-        MirInstId const cmpExp  = promoteForAtomicRmw(expected, valueTy);
+        MirInstId const cmpPrev = promoteForAtomicRmw(prev, reprTy);
+        MirInstId const cmpExp  = promoteForAtomicRmw(expBits, reprTy);
         if (!cmpPrev.valid() || !cmpExp.valid()) return InvalidMirInst;
         std::array<MirInstId, 2> const eqOps{cmpPrev, cmpExp};
         MirInstId const ok =
@@ -1243,10 +1509,20 @@ struct Lowerer {
         MirBlockId const joinBB = mir.createBlock(StructCfMarker::IfJoin);
         mir.addCondBr(ok, joinBB, failBB);
         mir.beginBlock(failBB);
-        std::array<MirInstId, 2> const st{prev, expectedPtr};
-        mir.addInst(MirOpcode::Store, st, InvalidType);
+        // The observed value goes back through `expected` as the VALUE type — the
+        // representation bit-cast back for a floating object.
+        MirInstId observed = prev;
+        if (viaRepr) {
+            std::array<MirInstId, 1> const bc{prev};
+            observed = mir.addInst(MirOpcode::Bitcast, bc, valueTy);
+        }
+        if (observed.valid()) {
+            std::array<MirInstId, 2> const st{observed, expectedPtr};
+            mir.addInst(MirOpcode::Store, st, InvalidType);
+        }
         mir.addBr(joinBB);
         mir.beginBlock(joinBB);
+        if (!observed.valid()) return InvalidMirInst;
 
         if (!resultTy.valid() || interner.kind(resultTy) == TypeKind::Bool)
             return ok;
@@ -3557,11 +3833,12 @@ struct Lowerer {
                             "atomic_load_explicit expects exactly 2 args");
                         return InvalidMirInst;
                     }
+                    // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+                    // through the ONE atomic-load verb, so a floating pointee loads
+                    // its representation exactly as the scalar funnel does.
                     std::array<MirInstId, 1> const ld{operands[0]};
-                    return mir.addInst(MirOpcode::AtomicLoad, ld, t,
-                                       foldAtomicOrder(kids[1]),
-                                       MirInstFlags::None,
-                                       atomicPointerAlignPayload(kids[0]));
+                    return emitAtomicLoadOf(ld, t, foldAtomicOrder(kids[1]),
+                                            atomicPointerAlignPayload(kids[0]));
                 }
                 case BuiltinLowering::AtomicStore: {
                     // FC17.9(d) (D-CSUBSET-ATOMIC): atomic_store_explicit(ptr, val,
@@ -3574,11 +3851,12 @@ struct Lowerer {
                             "atomic_store_explicit expects exactly 3 args");
                         return InvalidMirInst;
                     }
+                    // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+                    // the store twin — the value's own type picks the representation.
                     std::array<MirInstId, 2> const st{operands[1], operands[0]};
-                    return mir.addInst(MirOpcode::AtomicStore, st, InvalidType,
-                                       foldAtomicOrder(kids[2]),
-                                       MirInstFlags::None,
-                                       atomicPointerAlignPayload(kids[0]));
+                    return emitAtomicStoreOf(st, hir.typeId(kids[1]),
+                                             foldAtomicOrder(kids[2]),
+                                             atomicPointerAlignPayload(kids[0]));
                 }
                 // ── D-CSUBSET-ATOMIC-RMW: C11 §7.17.7 read-modify-write ──
                 // `atomic_<op>_explicit(obj, operand, order)` → the AtomicCas
@@ -3641,6 +3919,7 @@ struct Lowerer {
                     }
                     return emitAtomicCompareExchange(operands[0], operands[1],
                                                      operands[2], valueTy, t,
+                                                     atomicPointerAlignPayload(kids[0]),
                                                      node);
                 }
                 case BuiltinLowering::AtomicFence: {
@@ -5528,7 +5807,15 @@ struct Lowerer {
             // remaining un-flattened multi-child expression kind. Its args pump
             // through `callCtxs[aux].operands` exactly as IntrinsicCall's do;
             // `emitBuiltinCall` is the shared emission body.
-            BuiltinCall
+            BuiltinCall,
+            // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+            // a HIR `ReadModifyWrite`. The target ADDRESS (phase 0→1), then the
+            // retry loop's open half and the UPDATE lowered inside it with the
+            // old-value binding live (phase 1→2), then the close half (phase 2).
+            // The update rides this stack like every other child, so the loop costs
+            // no host frame of its own. `aux` indexes the open loop in `rmwLoops_`
+            // (LIFO — a nested read-modify-write finishes inner-first).
+            ReadModifyWrite
         };
         enum class StmtKind : std::uint8_t {
             Block, If, While, DoWhile, For, Label, Switch, Seh
@@ -5682,6 +5969,18 @@ struct Lowerer {
                         work.push_back({.family = LFam::Value, .vkind = LVK::SeqExpr,
                                         .node = n, .phase = 0, .flag0 = true});
                         return;
+                    // A read-modify-write asked for BY ADDRESS: the request flip
+                    // above sends a complex-typed one here, and the frame's phase 0
+                    // refuses it BY NAME (`flag0` records the position) rather than
+                    // letting it reach `lowerLvalueAddressNode`'s kind refusal.
+                    case HirKind::ReadModifyWrite:
+                        if (hir.children(n).size() == 2) {
+                            work.push_back({.family = LFam::Value,
+                                            .vkind = LVK::ReadModifyWrite,
+                                            .node = n, .phase = 0, .flag0 = true});
+                            return;
+                        }
+                        break;
                     default: break;
                 }
                 // Every OTHER lvalue arm (Ref/global, Deref, Call-sret, the
@@ -5812,6 +6111,17 @@ struct Lowerer {
                                     .node = n, .phase = 0, .aux = ctxIdx});
                     return;
                 }
+                // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+                // an indivisible read-modify-write. A malformed arity delegates to
+                // the recursive body, whose default arm fails loud.
+                case HirKind::ReadModifyWrite:
+                    if (hir.children(n).size() == 2) {
+                        work.push_back({.family = LFam::Value,
+                                        .vkind = LVK::ReadModifyWrite,
+                                        .node = n, .phase = 0});
+                        return;
+                    }
+                    break;
                 default: break;
             }
             result = lowerExprNode(n);   // delegate (terminal / CFG / by-address)
@@ -6308,6 +6618,140 @@ struct Lowerer {
                 HirNodeId const argN =
                     hir.children(callCtxs[ctxIdx].node)[callCtxs[ctxIdx].argIdx];
                 request(argN, false);   // lower the next arg — may invalidate `f`
+                break;
+            }
+            case LowerFrame::ValueKind::ReadModifyWrite: {
+                // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE.
+                //   phase 0: vet the object type; request the TARGET's ADDRESS —
+                //            evaluated exactly once, BEFORE the loop.
+                //   phase 1: open the retry loop (the AtomicLoad in `header`), bind
+                //            the old-value symbol to the observed value, and request
+                //            the UPDATE — which the loop re-runs on a lost race.
+                //   phase 2: unbind; close the loop (AtomicCas + the retry edge).
+                //            The node's value is the observed old value.
+                // ★ THE UPDATE READS THE OBSERVED VALUE AS A PLAIN `Ref`, resolved
+                // by the `symbolToValue` arm every pure-SSA `Ref` already takes —
+                // no placeholder kind and no special case in the `Ref` lowering.
+                // The binding lives exactly as long as the update's lowering: it is
+                // defined in `header`, which dominates everything the update emits.
+                if (f.phase == 0) {
+                    HirNodeId const node2  = f.node;
+                    TypeId const valueTy   = hir.typeId(node2);
+                    HirNodeId const target = hir.rmwTarget(node2);
+                    // Integer, pointer and FLOATING objects all loop over a
+                    // single-register representation (`atomicReprType`). What is left
+                    // — an x87 80-bit or 128-bit `long double`, a complex, an
+                    // aggregate — is the NON-LOCK-FREE class, and it is REFUSED HERE BY
+                    // NAME rather than lowered as a separate load and store, which is
+                    // the lost-update defect this row closes. ⚠ THAT IS A DEFERRAL,
+                    // NOT A VERDICT: ✔MEASURED gcc 13.3.0 makes `+=` on an
+                    // `_Atomic long double` and on an `_Atomic double _Complex` WORK
+                    // under a two-thread race (libatomic's
+                    // `__atomic_compare_exchange_16`), so the construct is REQUIRED
+                    // and belongs to [[D-CSUBSET-ATOMIC-NONLOCKFREE]]'s libcall route.
+                    // (clang 18.1.3 makes the `long double` form work and LOSES updates
+                    // on the complex one.) The semantic tier already refuses the
+                    // complex/aggregate declarations; an x87 `long double` reaches here.
+                    if (!valueTy.valid() || isMemoryResidentType(interner, valueTy)
+                        || !isIntegerLikeAtomicRmwType(atomicReprType(valueTy))) {
+                        unsupported(node2,
+                            "[[D-CSUBSET-ATOMIC-NONLOCKFREE]] a compound assignment, "
+                            "increment or decrement of an `_Atomic` object with no "
+                            "single-register representation (an x87 or 128-bit `long "
+                            "double`, a complex or an aggregate) is not lowered yet: "
+                            "its indivisible read-modify-write needs the atomics "
+                            "runtime's size-generic compare-exchange, and lowering it "
+                            "as a separate load and store would lose updates under "
+                            "contention "
+                            "(D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE)");
+                        work.pop_back(); result = InvalidMirInst; break;
+                    }
+                    if (f.flag0) {
+                        unsupported(node2,
+                            "internal: a read-modify-write was requested BY ADDRESS — "
+                            "it yields a value (the observed old value) and designates "
+                            "no object");
+                        work.pop_back(); result = InvalidMirInst; break;
+                    }
+                    // A BELT, NOT THE REFUSAL: the semantic tier refuses an `_Atomic`
+                    // bit-field at its DECLARATION (`resolveBitfieldSuffix`), as gcc
+                    // 13.3.0, clang 18.1.3 and MSVC 19.51 all do (✔MEASURED), so no
+                    // C source reaches this. It stays because a compare-exchange
+                    // commits a WHOLE object and a bit-field is a sub-object of its
+                    // unit — a hand-built HIR must not slip one through as a store.
+                    if (bitfieldPlacementOf(target) != nullptr) {
+                        unsupported(node2,
+                            "[[D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE]] "
+                            "a read-modify-write of a bit-field "
+                            "is not lowered: the compare-exchange commits a whole "
+                            "object, and gcc 13.3.0 and clang 18.1.3 both refuse an "
+                            "`_Atomic` bit-field");
+                        work.pop_back(); result = InvalidMirInst; break;
+                    }
+                    f.phase = 1;
+                    request(target, /*wantAddr=*/true);   // may invalidate `f`
+                    break;
+                }
+                if (f.phase == 1) {
+                    MirInstId const objPtr = result;
+                    HirNodeId const node2  = f.node;
+                    if (!objPtr.valid()) { work.pop_back(); result = InvalidMirInst; break; }
+                    HirNodeId const target = hir.rmwTarget(node2);
+                    TypeId const valueTy   = hir.typeId(node2);
+                    // The provable alignment of the ORIGINAL lvalue chain — the fact
+                    // that routes an under-aligned object's load AND its commit
+                    // through the atomics runtime together.
+                    std::uint32_t const align =
+                        atomicAlignPayload(target, hir.typeId(target));
+                    std::optional<AtomicRmwLoop> const loop = openAtomicRmwLoop(
+                        objPtr, valueTy, kAtomicOrderSeqCst, align);
+                    if (!loop.has_value()) {
+                        work.pop_back(); result = InvalidMirInst; break;
+                    }
+                    std::uint32_t const oldSym = hir.rmwOldValueSymbol(node2).v;
+                    if (addressableLocal.contains(oldSym)
+                        || symbolToValue.contains(oldSym)) {
+                        unsupported(node2, std::format(
+                            "internal: a read-modify-write's old-value symbol {} is "
+                            "already bound — its producer reused a live symbol", oldSym));
+                        abandonAtomicRmwLoop(*loop);
+                        work.pop_back(); result = InvalidMirInst; break;
+                    }
+                    symbolToValue.emplace(oldSym, loop->old);
+                    f.aux = static_cast<std::uint32_t>(rmwLoops_.size());
+                    rmwLoops_.push_back(*loop);
+                    f.phase = 2;
+                    request(hir.rmwUpdate(node2), /*wantAddr=*/false);  // may invalidate `f`
+                    break;
+                }
+                {
+                    HirNodeId const node2 = f.node;
+                    std::uint32_t const at = f.aux;
+                    symbolToValue.erase(hir.rmwOldValueSymbol(node2).v);
+                    // LIFO by construction: an inner read-modify-write inside this
+                    // update has already closed and popped its own loop.
+                    if (at + 1u != rmwLoops_.size()) {
+                        unsupported(node2, std::format(
+                            "internal: read-modify-write loop stack out of step "
+                            "(frame index {}, {} open) — a nested loop did not close",
+                            at, rmwLoops_.size()));
+                        if (at < rmwLoops_.size()) {
+                            abandonAtomicRmwLoop(rmwLoops_[at]);
+                            rmwLoops_.resize(at);
+                        }
+                        work.pop_back(); result = InvalidMirInst; break;
+                    }
+                    AtomicRmwLoop const loop = rmwLoops_[at];
+                    rmwLoops_.pop_back();
+                    MirInstId const newVal = result;
+                    work.pop_back();
+                    if (!newVal.valid()) {
+                        abandonAtomicRmwLoop(loop);
+                        result = InvalidMirInst;
+                        break;
+                    }
+                    result = closeAtomicRmwLoop(loop, newVal);
+                }
                 break;
             }
             }
@@ -10266,6 +10710,15 @@ struct Lowerer {
         } else if (k == HirKind::AssignStmt) {
             HirNodeId const target = hir.assignTarget(node);
             if (auto s = refSymOf(target); s.has_value()) {
+                out.insert(*s);
+            }
+        } else if (k == HirKind::ReadModifyWrite) {
+            // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+            // a read-modify-write WRITES its target through `lowerLvalueAddress`,
+            // exactly as `AssignStmt` does — so a bare-`Ref` target (an `_Atomic`
+            // PARAMETER, which is otherwise a pure-SSA `Arg`) needs real storage for
+            // the identical reason the arm above gives it one.
+            if (auto s = refSymOf(hir.rmwTarget(node)); s.has_value()) {
                 out.insert(*s);
             }
         } else if (k == HirKind::InlineAsm) {
@@ -14447,6 +14900,9 @@ struct Lowerer {
         // bindings — entries from the previous function are stale.
         symbolToValue.clear();
         addressableLocal.clear();
+        // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+        // a read-modify-write's loop never outlives the function that opened it.
+        rmwLoops_.clear();
         vlaStrideSlot.clear();   // VLA C2/C3 (D-CSUBSET-VLA): per-function size/stride slots
         labelBlocks_.clear();   // FC5: labels are function-scoped
         addressTakenLabelOrdinals_.clear();  // D-CSUBSET-COMPUTED-GOTO

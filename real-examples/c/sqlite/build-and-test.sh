@@ -458,6 +458,7 @@ declare -A LEG_SPEC=() LEG_FORMAT=() LEG_ARCH=() \
            LEG_CONFOUND_GATING=() LEG_CONFOUND_REPORT=() \
            LEG_RUN_DIR_GATING=() LEG_RUN_DIR_REQUIREMENTS=() \
            LEG_CONFOUND_DECLARED=() \
+           LEG_EVIDENCE_CONFOUNDS=() LEG_EXECUTION_EVIDENCE=() \
            LEG_RECIPE_TRANSFORM=() LEG_HEADER_STAGE_KEY=() LEG_ZCONF_GUARDS=() \
            LEG_CONFIG_STAGE_KEY=() LEG_CONFIGURE_ANSWERS=() \
            LEG_STACK_RESERVE=() LEG_SHARED_FLAGS=() LEG_LOADEXT_NAME=() \
@@ -4842,6 +4843,138 @@ run_fixture_segment() {        # run_fixture_segment <leg> <bin> <launch_bin> <l
 }
 # <<< dss:corpus-engine <<<
 
+# >>> dss:exec-evidence >>>  (paired in build-and-test.ps1)
+# ★★★ A CLOCK ROW EXCUSES A FAILURE ONLY ON EVIDENCE FROM THAT FAILURE'S OWN
+# EXECUTION, and this is where the evidence is gathered and read.
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN
+#
+# The rows used to be honoured on ONE clock sample taken before any leg was built,
+# so the same walsetlk failures were charged to DSS in one run and excused in the
+# next, and a PRESENT sample excused any walsetlk/busy2 failure for the whole run.
+# Now the plan only ARMS them (LEG_EVIDENCE_CONFOUNDS); around EVERY segment a
+# monitor (harness_legs.py --monitor-execution, spawned in the fixture's own
+# kernel) records every clock step with the segment log's size at that instant,
+# and after the corpus --attribute-unit-failures reads each failure against its
+# own execution window. THIS DRIVER DECIDES NOTHING: it spawns what the resolver
+# planned, empties the log the monitor must arm on, stops the monitor, and folds
+# the resolver's per-name answer — the same division of labour as
+# --classify-abort, so the two drivers cannot come to attribute one failure two
+# ways.
+# ⚠ EVERY FAILURE PATH HERE UN-EXCUSES AND SAYS SO, and none of them stops the run:
+# a monitor that cannot be planned, cannot arm or cannot stop leaves that
+# segment's clock failures GENUINE (noisy, investigated), never excused, and one
+# leg's missing evidence must not cost the other legs their corpus.
+declare -a EXEC_MON_PIDS=() EXEC_MON_STOPS=() EXEC_MON_PROBES=() EXEC_MON_STOP_SECS=()
+exec_evidence_start() {        # exec_evidence_start <leg> <segment-log>
+  local leg="$1" log="$2" probe out rc pid tries armed arm_secs
+  EXEC_MON_PIDS=(); EXEC_MON_STOPS=(); EXEC_MON_PROBES=(); EXEC_MON_STOP_SECS=()
+  # The operator override replaces the earned list on every leg, armed rows
+  # included, so there is nothing to gather evidence for.
+  [[ -z "$DSS_CONFOUNDS" && -n "${LEG_EVIDENCE_CONFOUNDS[$leg]:-}" ]] || return 0
+  local -a probes=()
+  eval "probes=(${LEG_EXECUTION_EVIDENCE[$leg]:-})"
+  if [[ ${#probes[@]} -eq 0 ]]; then
+    warn "[$leg] armed confound rows but NO execution-evidence probe in the plan — a transport defect; every failure an armed row matches stays GENUINE"
+    return 0
+  fi
+  # ★ EMPTY, BEFORE THE MONITOR ARMS. A byte offset is a point in THIS segment's
+  # execution only if the log began empty under the monitor's eye; the attributor
+  # REFUSES a timeline armed on a non-empty log (a stale file, or a fixture that
+  # started first). run_fixture_segment truncates it again, which changes nothing.
+  : > "$log"
+  for probe in "${probes[@]}"; do
+    if out="$(python3 "$LEG_RESOLVER" --catalogue "$LEG_CATALOGUE" --execution-monitor-argv \
+               --run-filesystem "${LEG_RUN_FILESYSTEM[$leg]}" --evidence-probe "$probe" \
+               --watch-log "$log" --segment-cap-seconds "$DSS_SEGMENT_TIMEOUT" --format sh 2>&1)"; then rc=0; else rc=$?; fi
+    if [[ $rc -ne 0 ]]; then
+      warn "[$leg] NO '$probe' execution monitor for this segment (harness_legs.py --execution-monitor-argv, rc=$rc): ${out:-<no diagnostic>}"
+      warn "      every failure an armed '$probe' row would match in this segment stays GENUINE"
+      continue
+    fi
+    local -a EXEC_MONITOR_ARGV=()
+    local EXEC_MONITOR_TIMELINE="" EXEC_MONITOR_STOP="" EXEC_MONITOR_ARM_SECONDS="0" EXEC_MONITOR_STOP_SECONDS="0"
+    eval "$out"
+    rm -f -- "$EXEC_MONITOR_STOP" "$EXEC_MONITOR_TIMELINE"
+    ( trap - ERR; set +e; exec "${EXEC_MONITOR_ARGV[@]}" ) > "$EXEC_MONITOR_TIMELINE.stderr" 2>&1 < /dev/null &
+    pid=$!
+    armed=0; tries=0; arm_secs="${EXEC_MONITOR_ARM_SECONDS%.*}"
+    while [[ $tries -lt $(( arm_secs * 5 )) ]]; do
+      if [[ -s "$EXEC_MONITOR_TIMELINE" ]] && grep -q '"kind": "armed"' "$EXEC_MONITOR_TIMELINE"; then armed=1; break; fi
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.2; tries=$((tries + 1))
+    done
+    if [[ $armed -eq 1 ]]; then
+      EXEC_MON_PIDS+=("$pid"); EXEC_MON_STOPS+=("$EXEC_MONITOR_STOP"); EXEC_MON_PROBES+=("$probe")
+      EXEC_MON_STOP_SECS+=("${EXEC_MONITOR_STOP_SECONDS%.*}")
+      info "[$leg] execution monitor '$probe' armed (pid $pid) -> $EXEC_MONITOR_TIMELINE"
+    else
+      warn "[$leg] the '$probe' execution monitor did NOT arm within ${arm_secs}s (pid $pid; stderr in $EXEC_MONITOR_TIMELINE.stderr)"
+      warn "      every failure an armed '$probe' row would match in this segment stays GENUINE"
+      kill -TERM "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+}
+exec_evidence_stop() {         # exec_evidence_stop <leg>
+  local leg="$1" i n tries pid
+  n=${#EXEC_MON_PIDS[@]}
+  [[ $n -gt 0 ]] || return 0
+  for ((i = 0; i < n; i++)); do : > "${EXEC_MON_STOPS[$i]}"; done
+  for ((i = 0; i < n; i++)); do
+    pid="${EXEC_MON_PIDS[$i]}"; tries=0
+    while kill -0 "$pid" 2>/dev/null && [[ $tries -lt $(( ${EXEC_MON_STOP_SECS[$i]} * 5 )) ]]; do
+      sleep 0.2; tries=$((tries + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      warn "[$leg] execution monitor '${EXEC_MON_PROBES[$i]}' (pid $pid) did not stop within ${EXEC_MON_STOP_SECS[$i]}s of its stop file — killed; its timeline keeps every record it flushed"
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+    rm -f -- "${EXEC_MON_STOPS[$i]}"
+  done
+  EXEC_MON_PIDS=(); EXEC_MON_STOPS=(); EXEC_MON_PROBES=(); EXEC_MON_STOP_SECS=()
+}
+# exec_evidence_attribute <leg> <leg-mode>
+# Reads the per-leg classifier state at TOP LEVEL (real, confound, SEG_LOGS,
+# TIER_PREFIXES) and writes back real, confound and evidence_excused — the same
+# globals the matcher above fills, because this is the second half of one
+# classification, not a second classifier.
+exec_evidence_attribute() {
+  local leg="$1" mode="$2" out rc line t p
+  local -a argv=(--catalogue "$LEG_CATALOGUE" --attribute-unit-failures "$leg" --leg-mode "$mode")
+  local -a ev=()
+  eval "ev=(${LEG_EVIDENCE_CONFOUNDS[$leg]:-})"
+  for p in "${ev[@]}"; do argv+=("--evidence-pattern=$p"); done
+  for p in "${SEG_LOGS[@]}"; do argv+=("--segment-log=$p"); done
+  for p in ${TIER_PREFIXES[@]+"${TIER_PREFIXES[@]}"}; do argv+=("--tier-prefix=$p"); done
+  for t in "${real[@]}"; do argv+=("--failure=$t"); done
+  if out="$(python3 "$LEG_RESOLVER" "${argv[@]}" 2>&1)"; then rc=0; else rc=$?; fi
+  if [[ $rc -ne 0 ]]; then
+    warn "[$leg] per-failure clock attribution could NOT run (harness_legs.py --attribute-unit-failures, rc=$rc): ${out:-<no diagnostic>}"
+    warn "      every failure an armed row would match stays GENUINE"
+    return 0
+  fi
+  local -A excused_names=()
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    case "$line" in
+      EXCUSED$'\t'*) excused_names["${line#EXCUSED$'\t'}"]=1 ;;
+      REPORT$'\t'*)  info "${line#REPORT$'\t'}" ;;
+    esac
+  done <<< "$out"
+  local -a keep=()
+  for t in "${real[@]}"; do
+    if [[ -n "${excused_names[$t]:-}" ]]; then
+      confound+=("$t"); evidence_excused+=("$t")
+    else
+      keep+=("$t")
+    fi
+  done
+  real=(${keep[@]+"${keep[@]}"})
+}
+# <<< dss:exec-evidence <<<
+
 # ── Step 7 — build the full-source testfixture with dsscp, per leg ──
 step "7/9  Build the full-source testfixture (dsscp --project), per leg"
 declare -A FIXTURE=()          # leg -> binary path (on success)
@@ -6653,6 +6786,11 @@ for leg in "${LEG_ORDER[@]}"; do
   eval "CONFOUND_PATTERNS=($CONFOUND_SUPPLY)"
   if [[ ${#CONFOUND_PATTERNS[@]} -gt 0 ]]; then
     info "[$leg] confound patterns in force (${#CONFOUND_PATTERNS[@]}): ${CONFOUND_PATTERNS[*]}$( [[ -n "$DSS_CONFOUNDS" ]] && printf '   [operator DSS_CONFOUNDS — applied to EVERY leg]' || printf '   [EARNED on this leg — legs.json `confounds`, provenance per pattern]' )"
+  elif [[ -z "$DSS_CONFOUNDS" && -n "${LEG_EVIDENCE_CONFOUNDS[$leg]:-}" ]]; then
+    # ★ AN EMPTY BY-NAME SUPPLY BESIDE ARMED ROWS is neither "declares none" nor
+    # "every row gated off": the armed rows ARE in force, per failure, and the
+    # account below lists them. [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+    info "[$leg] NO confound pattern excuses a failure BY NAME on this leg; its ARMED row(s) (${LEG_EVIDENCE_CONFOUNDS[$leg]}) excuse a failure only on clock evidence from that failure's own execution — see the per-row account immediately below."
   elif [[ "${LEG_CONFOUND_DECLARED[$leg]:-0}" -gt 0 ]]; then
     # ★★ AN EMPTY SUPPLY IS NOT A CLAIM ABOUT THE CATALOGUE. Three different facts
     # produce an empty array and they must read differently: the catalogue declares
@@ -6783,8 +6921,14 @@ for leg in "${LEG_ORDER[@]}"; do
       if [[ -n "$leg_carrier_old" ]]; then export "$leg_carrier_name=$leg_carrier_old"
       else unset "$leg_carrier_name"; fi
     fi
+    # ★ THE MONITOR SPANS THE WHOLE SEGMENT: armed on the emptied log before the
+    # fixture starts, stopped after it exits, so every failure's execution window
+    # lies inside what it watched. No-op on a leg with no armed row.
+    # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+    exec_evidence_start "$leg" "$seglog"
     run_fixture_segment "$leg" "$bin" "$launch_bin" "$seglog" "${seg_argv[@]}"
     segrc="$SEG_RC"
+    exec_evidence_stop "$leg"
     unset SQLITE_TEST_PATTERN_LIST
     if [[ -n "$leg_carrier_name" ]]; then
       if [[ -n "$leg_carrier_old" ]]; then export "$leg_carrier_name=$leg_carrier_old"
@@ -7150,6 +7294,17 @@ for leg in "${LEG_ORDER[@]}"; do
     warn "[$leg] ${#scoped_excused[@]} failure(s) excused ONLY because this leg runs '$leg_mode': ${scoped_excused[*]}"
     warn "      these are NOT evidence of correctness on a native run of this target — and a crash-simulation"
     warn "      abort can TRUNCATE the rest of its .test file, so coverage there is partial."
+  fi
+  # ★★ THE SECOND HALF OF ONE CLASSIFICATION: a failure the by-name matcher did
+  # not excuse, and an ARMED row matches, is excused only on evidence from its OWN
+  # execution — read by the resolver from the monitor timelines beside each
+  # segment log. [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+  declare -a evidence_excused=()
+  if [[ ${#real[@]} -gt 0 && -z "$DSS_CONFOUNDS" && -n "${LEG_EVIDENCE_CONFOUNDS[$leg]:-}" ]]; then
+    exec_evidence_attribute "$leg" "$leg_mode"
+  fi
+  if [[ ${#evidence_excused[@]} -gt 0 ]]; then
+    info "[$leg] ${#evidence_excused[@]} failure(s) excused PER FAILURE on clock evidence recorded inside their own execution: ${evidence_excused[*]}"
   fi
   # ★ THE INDEX-PARALLEL INVARIANT, ASSERTED RATHER THAN ASSUMED. The four SEG_*
   # arrays are indexed by the same k below. They are appended together now (see the

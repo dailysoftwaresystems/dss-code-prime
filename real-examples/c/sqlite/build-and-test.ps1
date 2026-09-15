@@ -4828,6 +4828,113 @@ function Invoke-Fixture($exe, $argv, $workdir, $logPath, $errPath, $stall, $cap,
 }
 # <<< dss:corpus-engine <<<
 
+# >>> dss:exec-evidence >>>  (paired in build-and-test.sh)
+# ★★★ A CLOCK ROW EXCUSES A FAILURE ONLY ON EVIDENCE FROM THAT FAILURE'S OWN
+# EXECUTION — the twin of build-and-test.sh's exec_evidence_* functions.
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN
+# The plan only ARMS such a row (`confoundsByEvidence`). Around every segment a
+# monitor planned by harness_legs.py --execution-monitor-argv runs IN THE FIXTURE'S
+# OWN KERNEL (for a wsl.exe-launched leg that is inside WSL2, reaching this driver's
+# log through /mnt/c — ✔MEASURED 2026-09-15: a byte the launched child writes is
+# visible there after p50 1.4 ms / max 32 ms) and records every clock step with the
+# log's size at that instant; after the corpus --attribute-unit-failures reads each
+# failure against its own execution window. THIS DRIVER DECIDES NOTHING: it spawns
+# what the resolver planned, empties the log first, stops the monitor, and folds
+# the per-name answer. Every failure path un-excuses, says so, and lets the run go on.
+function Start-ExecEvidenceMonitors($leg, $logPath) {
+  $mons = @()
+  # The operator override replaces the earned list, armed rows included.
+  if ($null -ne $ConfoundsOverride) { return $mons }
+  $evidence = @($leg.confoundsByEvidence | Where-Object { $_ })
+  if (-not $evidence.Count) { return $mons }
+  $probes = @($leg.executionEvidence | Where-Object { $_ })
+  if (-not $probes.Count) {
+    Warn "[$($leg.label)] armed confound rows but NO execution-evidence probe in the plan - a transport defect; every failure an armed row matches stays GENUINE"
+    return $mons
+  }
+  # EMPTY, BEFORE THE MONITOR ARMS: the attributor refuses a timeline armed on a
+  # non-empty log, because a stale file's offsets are not this segment's.
+  Set-Content -LiteralPath $logPath -Value '' -NoNewline -Encoding ascii
+  $emptyIn = Join-Path ([System.IO.Path]::GetDirectoryName($logPath)) '.exec-evidence-stdin'
+  Set-Content -LiteralPath $emptyIn -Value '' -NoNewline -Encoding ascii
+  foreach ($probe in $probes) {
+    $planOut = @(& $python3.Source $LegsPy '--execution-monitor-argv' '--run-filesystem' "$($leg.run.runFilesystem)" '--evidence-probe' $probe '--watch-log' $logPath '--segment-cap-seconds' "$SegCap" '--format' 'json' 2>&1)
+    $planRc = $LASTEXITCODE
+    $plan = $null
+    if ($planRc -eq 0) { try { $plan = ($planOut -join "`n") | ConvertFrom-Json } catch { $plan = $null } }
+    if ($null -eq $plan) {
+      Warn "[$($leg.label)] NO '$probe' execution monitor for this segment (harness_legs.py --execution-monitor-argv, rc=$planRc): $($planOut -join ' ')"
+      Warn "      every failure an armed '$probe' row would match in this segment stays GENUINE"
+      continue
+    }
+    Remove-Item -LiteralPath $plan.stopFile -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $plan.timeline -ErrorAction SilentlyContinue
+    $argv = @($plan.argv)
+    $rest = @($argv | Select-Object -Skip 1 | ForEach-Object { if ("$_" -match '\s') { '"' + $_ + '"' } else { "$_" } })
+    $sp = @{
+      FilePath = $argv[0]; ArgumentList = $rest; NoNewWindow = $true; PassThru = $true
+      RedirectStandardOutput = "$($plan.timeline).stdout"; RedirectStandardError = "$($plan.timeline).stderr"
+      RedirectStandardInput = $emptyIn
+    }
+    $proc = Start-Process @sp
+    $deadline = (Get-Date).AddSeconds([double]$plan.armWithinSeconds)
+    $armed = $false
+    while ((Get-Date) -lt $deadline) {
+      if ((Test-Path -LiteralPath $plan.timeline) -and (Select-String -LiteralPath $plan.timeline -SimpleMatch '"kind": "armed"' -Quiet)) { $armed = $true; break }
+      if ($proc.HasExited) { break }
+      Start-Sleep -Milliseconds 200
+    }
+    if ($armed) {
+      $mons += [pscustomobject]@{ Probe = $probe; Process = $proc; StopFile = "$($plan.stopFile)"; StopWithinSeconds = [double]$plan.stopWithinSeconds }
+      Info "[$($leg.label)] execution monitor '$probe' armed (pid $($proc.Id)) -> $($plan.timeline)"
+    } else {
+      Warn "[$($leg.label)] the '$probe' execution monitor did NOT arm within $($plan.armWithinSeconds) s (pid $($proc.Id); stderr in $($plan.timeline).stderr)"
+      Warn "      every failure an armed '$probe' row would match in this segment stays GENUINE"
+      try { $proc.Kill($true) } catch { try { $proc.Kill() } catch {} }
+      [void]$proc.WaitForExit(10000)
+    }
+  }
+  return $mons
+}
+function Stop-ExecEvidenceMonitors($legTag, $mons) {
+  foreach ($m in @($mons)) { Set-Content -LiteralPath $m.StopFile -Value '' -NoNewline -Encoding ascii }
+  foreach ($m in @($mons)) {
+    if (-not $m.Process.WaitForExit([int]($m.StopWithinSeconds * 1000))) {
+      Warn "[$legTag] execution monitor '$($m.Probe)' (pid $($m.Process.Id)) did not stop within $($m.StopWithinSeconds) s of its stop file - killed; its timeline keeps every record it flushed"
+      try { $m.Process.Kill($true) } catch { try { $m.Process.Kill() } catch {} }
+      [void]$m.Process.WaitForExit(10000)
+    }
+    Remove-Item -LiteralPath $m.StopFile -ErrorAction SilentlyContinue
+  }
+}
+# Returns the names the resolver EXCUSED; prints its account verbatim.
+function Invoke-ExecEvidenceAttribution($leg, $legMode, $segmentLogs, $tierPrefixes, $failNames) {
+  $excused = @()
+  if ($null -ne $ConfoundsOverride) { return $excused }
+  $evidence = @($leg.confoundsByEvidence | Where-Object { $_ })
+  if (-not $evidence.Count -or -not @($failNames).Count) { return $excused }
+  $a = @('--attribute-unit-failures', "$($leg.label)", '--leg-mode', $legMode)
+  foreach ($p in $evidence) { $a += "--evidence-pattern=$p" }
+  foreach ($l in @($segmentLogs)) { $a += "--segment-log=$l" }
+  foreach ($p in @($tierPrefixes)) { $a += "--tier-prefix=$p" }
+  foreach ($t in @($failNames)) { $a += "--failure=$t" }
+  $out = @(& $python3.Source $LegsPy @a 2>&1)
+  $rc = $LASTEXITCODE
+  if ($rc -ne 0) {
+    Warn "[$($leg.label)] per-failure clock attribution could NOT run (harness_legs.py --attribute-unit-failures, rc=$rc): $($out -join ' ')"
+    Warn "      every failure an armed row would match stays GENUINE"
+    return $excused
+  }
+  foreach ($line in $out) {
+    $s = "$line".TrimEnd("`r")
+    if ($s.StartsWith("EXCUSED`t")) { $excused += $s.Substring(8) }
+    elseif ($s.StartsWith("REPORT`t")) { Info $s.Substring(7) }
+  }
+  return $excused
+}
+# <<< dss:exec-evidence <<<
+
 # ── Step 7 — PER LEG: generate the manifest + build the testfixture ──────────
 # ★ EVERY BUILDABLE LEG IS BUILT, ON EVERY HOST. Whether this machine can EXECUTE
 # the result is a separate question, asked in Step 8. A leg that this host can
@@ -5776,7 +5883,20 @@ $runDirPlan   = Get-LegRunDirPlan $LegTag $rundir
 # makes a `requiresRunDirectory` row excuse nothing on a host where its
 # precondition does not hold. The resolver decides; this driver hands over the
 # supply it holds and takes back the supply that survived.
-$legRunDirCorroboration = Get-LegRunDirCorroboration $LegTag $rundir @($leg.confounds) @($leg.abortConfounds)
+# ★★ THE BY-NAME SUPPLY, NOT `confounds`. An ARMED row (a clock row) is IN FORCE
+# but excuses a failure only on evidence from that failure's own execution, so it
+# must never reach the by-name matcher; `confoundsByName` is that supply and
+# `confoundsByEvidence` the armed half, read after the corpus by
+# Invoke-ExecEvidenceAttribution. The .sh's LEG_CONFOUNDS carries the same by-name
+# list (emit_sh), so both drivers corroborate and match the SAME set.
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN
+foreach ($field in @('confoundsByName', 'confoundsByEvidence', 'executionEvidence')) {
+  if ($null -eq $leg.PSObject.Properties[$field]) {
+    Die "[$LegTag] the resolved leg plan carries NO ``$field`` field. harness_legs.py emits it on every planned leg, so its absence is a transport defect between the resolver and this driver. Reading ``confounds`` instead would hand the by-name matcher rows that may only excuse a failure on evidence from its own execution. [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]"
+  }
+}
+$legRunDirCorroboration = Get-LegRunDirCorroboration $LegTag $rundir @($leg.confoundsByName) @($leg.abortConfounds)
 $leg | Add-Member -NotePropertyName 'confounds' -NotePropertyValue @($legRunDirCorroboration.confounds) -Force
 $leg | Add-Member -NotePropertyName 'abortConfounds' -NotePropertyValue @($legRunDirCorroboration.abortConfounds) -Force
 $leg | Add-Member -NotePropertyName 'runDirectoryGating' -NotePropertyValue "$($legRunDirCorroboration.runDirectoryGating)" -Force
@@ -6067,6 +6187,10 @@ while ($si -lt $segments.Count) {
     Info "[$LegTag] segment $($si + 1): $($seg.Label)$(if ($seg.Patterns.Count) { "  (SQLITE_TEST_PATTERN_LIST: $($seg.Patterns.Count) candidate file(s))" })"
   }
   $legEnv = $null
+  # ★ THE MONITOR SPANS THE WHOLE SEGMENT: armed on the emptied log before the
+  # fixture starts, stopped in `finally` after it exits. No-op on a leg with no
+  # armed row. [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+  $execMons = @(Start-ExecEvidenceMonitors $leg $log)
   try {
     if (Test-Path -LiteralPath $LegTclLibrary) { $env:TCL_LIBRARY = $LegTclLibrary }
     if ($TierExcludes.Count) { $env:QUICKTEST_OMIT = ($TierExcludes -join ',') }
@@ -6091,6 +6215,7 @@ while ($si -lt $segments.Count) {
     Pop-LegLaunchEnv $legEnv
     $env:TCL_LIBRARY = $oldTclLib
     $env:QUICKTEST_OMIT = $oldOmit; $env:SQLITE_TEST_PATTERN_LIST = $oldPatterns
+    Stop-ExecEvidenceMonitors $LegTag $execMons
   }
   if ($run.KillReason) { Warn "[$LegTag] segment $($si + 1) HUNG — killed: $($run.KillReason)"; $hygiene += "segment $($si + 1) TIMED OUT and was killed — $($run.KillReason)" }
   # POST-SEGMENT HYGIENE — a segment that spawned or left a fixture behind must not
@@ -6376,6 +6501,20 @@ foreach ($t in $failNames) {
 }
 if ($scopedExcused.Count) {
   Warn "[$LegTag] $($scopedExcused.Count) failure(s) excused ONLY because this leg runs '$legMode': $($scopedExcused -join ' ')"
+}
+# ★★ THE SECOND HALF OF ONE CLASSIFICATION — the .sh's exec_evidence_attribute
+# twin. A failure the by-name matcher did not excuse, and an ARMED row matches, is
+# excused only on evidence from its OWN execution, read by the resolver from the
+# monitor timelines beside each segment log.
+# [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+$evidenceExcused = @()
+if ($real.Count) {
+  $evidenceExcused = @(Invoke-ExecEvidenceAttribution $leg $legMode @($results | ForEach-Object { $_.Log }) $TierPrefixes $real)
+  if ($evidenceExcused.Count) {
+    $confound += $evidenceExcused
+    $real = @($real | Where-Object { $evidenceExcused -notcontains $_ })
+    Info "[$LegTag] $($evidenceExcused.Count) failure(s) excused PER FAILURE on clock evidence recorded inside their own execution: $($evidenceExcused -join ' ')"
+  }
 }
 # Per-unit ledger — every file that reached a verdict, every abort, every gap.
 $led = New-Object 'System.Collections.Generic.List[string]'

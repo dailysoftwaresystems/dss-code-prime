@@ -28,7 +28,13 @@ function Warn($m) { "      WARN: $m" }
 # host's "OK (N assertions)". This file now has a skippable block of its own, so it
 # inherits the same hazard and the same cure.
 # ★ ADDING AN ASSERTION WITHOUT BUMPING THIS NUMBER FAILS ON THE VERY NEXT RUN.
-$TotalAssertions = 128    # 11 classifier + 18 checkout-provenance + 9 loadext rc contract (python-gated)
+$TotalAssertions = 140    # 11 classifier + 18 checkout-provenance + 9 loadext rc contract (python-gated)
+                          # + 12 BOTH-DRIVERS pairing for the EXECUTION-EVIDENCE
+                          #   region: the marker, the --execution-monitor-argv argv,
+                          #   the segment loop starting and stopping the monitor,
+                          #   the --attribute-unit-failures argv and the classifier
+                          #   calling it, each asserted on BOTH drivers
+                          #   [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
                           # +6 (2026-09-01): the identity-triple JOIN in both
                           # drivers, and what each hands --reference-target
                           # [D-HARNESS-ORACLE-CLASSIFIER-READS-AN-IDENTITY-TRIPLE-WITH-THE-LEG-SPEC-READERS]
@@ -537,6 +543,26 @@ Check "the .ps1 supplies the oracle STATUS"             ($ps1Code -match '--orac
 Check "the .ps1 hands the oracle STATUS to its oracle REPORT" ($ps1Code -match [regex]::Escape("'--oracle-status', `"`$(if (`$lr) { `$lr.OracleStatus })`")"))
 Check "the .sh hands the oracle STATUS to its oracle REPORT" ($shCode -match [regex]::Escape('--oracle-status "${LEG_ORACLE_STATUS[$leg]:-}" 2>&1)'))
 Check "the .sh supplies it too"                         ($shCode  -match '--oracle-status')
+# [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+# ★★ A CLOCK ROW EXCUSES A FAILURE ONLY ON EVIDENCE FROM THAT FAILURE'S OWN
+# EXECUTION. A driver that never started the monitor, or never asked the resolver to
+# read it, charges every clock failure on its side while the other driver excuses
+# it — two verdicts on one tree, and the charged side looks like any red. So, on
+# BOTH drivers and each by the needle its own call spells: the region marker, the
+# monitor-plan argv, the segment loop STARTING and STOPPING the monitor, the
+# attribution argv, and the classifier CALLING it.
+Check "the .ps1 marks the execution-evidence region"    ($ps1Txt -match 'dss:exec-evidence')
+Check "the .sh marks it too"                            ($shTxt  -match 'dss:exec-evidence')
+Check "the .ps1's argv really names the monitor-plan verb" ($ps1Code -match [regex]::Escape("`$LegsPy '--execution-monitor-argv'"))
+Check "the .sh's argv really names it too"              ($shCode -match [regex]::Escape('--execution-monitor-argv \'))
+Check "the .ps1 segment loop STARTS the monitor on this segment's log" ($ps1Code -match [regex]::Escape('Start-ExecEvidenceMonitors $leg $log'))
+Check "the .sh segment loop starts it too"              ($shCode -match [regex]::Escape('exec_evidence_start "$leg" "$seglog"'))
+Check "the .ps1 STOPS it after the fixture"             ($ps1Code -match [regex]::Escape('Stop-ExecEvidenceMonitors $LegTag $execMons'))
+Check "the .sh stops it too"                            ($shCode -match [regex]::Escape('exec_evidence_stop "$leg"'))
+Check "the .ps1's argv really names the attribution verb" ($ps1Code -match [regex]::Escape("@('--attribute-unit-failures', `"`$(`$leg.label)`""))
+Check "the .sh's argv really names it too"              ($shCode -match [regex]::Escape('--attribute-unit-failures "$leg"'))
+Check "the .ps1 classifier CALLS it with this leg's run mode" ($ps1Code -match [regex]::Escape('Invoke-ExecEvidenceAttribution $leg $legMode'))
+Check "the .sh classifier calls it too"                 ($shCode -match [regex]::Escape('exec_evidence_attribute "$leg" "$leg_mode"'))
 # [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
 # ★★ AN OPERATOR SWITCH HONOURED BY ONE DRIVER AND IGNORED BY THE OTHER is the
 # worst shape available: the ignoring side runs legs the operator excluded and

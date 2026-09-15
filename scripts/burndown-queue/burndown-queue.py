@@ -76,26 +76,37 @@ for _s in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+def _owning_tree():
+    """`scripts/owning-tree/owning-tree.py` -- the one owner of "which tree is this file in?".
+
+    Loaded by path from this file's sibling directory (a hyphen is not a module name). It
+    FAILS LOUD when absent rather than falling back to a local walk: a second copy of the
+    answer is the drift that owner exists to end.
+    """
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                        "owning-tree", "owning-tree.py")
+    if not os.path.isfile(path):
+        sys.exit("burndown-queue: cannot find %s -- this instrument's root is resolved there "
+                 "and nowhere else" % path)
+    spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def repo_root():
-    """Walk up until `.plans/` and `scripts/` are both present.
+    """The tree THIS FILE lives in: the nearest ancestor holding BOTH `.plans/` and `scripts/`.
 
-    ⚠ Not a fixed number of `dirname` calls: this file is expected to move from
-    `scratchpad/p33/orch/` to `scripts/burndown-queue/`, and a hard-coded depth is
-    exactly the defect the P17 consolidation had to repair in 17 scripts at once.
+    ⓘ This file used to carry its own copy of that walk -- the same rule, spelled a second
+    time. A fixed `dirname` depth was never the answer (the file moved from a scratch
+    directory to `scripts/burndown-queue/`); now the walk has ONE owner,
+    `scripts/owning-tree/owning-tree.py`, so the two spellings cannot drift apart.
     """
-    d = HERE
-    while True:
-        if os.path.isdir(os.path.join(d, ".plans")) and \
-           os.path.isdir(os.path.join(d, "scripts")):
-            return d
-        parent = os.path.dirname(d)
-        if parent == d:
-            sys.exit("burndown-queue: no repository root above %s "
-                     "(looked for a directory holding BOTH .plans/ and scripts/)" % HERE)
-        d = parent
+    ot = _owning_tree()
+    try:
+        return ot.resolve(__file__)
+    except ot.Refusal as exc:
+        sys.exit("burndown-queue: %s" % exc)
 
 
 ROOT = repo_root()

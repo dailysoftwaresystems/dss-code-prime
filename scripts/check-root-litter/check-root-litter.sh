@@ -29,7 +29,7 @@
 # The defect this guards is loose FILES; a stray directory has never happened and
 # guarding it would trade a real signal for a speculative one.
 #
-# Exit codes: 0 clean - 1 litter found (named) - 2 cannot run (not a repo / no git).
+# Exit codes: 0 clean - 1 litter found (named) - 2 cannot run (not a repo / no git / git status failed).
 set -uo pipefail
 
 _here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd -P)" \
@@ -43,7 +43,19 @@ _root="$(cd "$_here/../.." && pwd -P)" || exit 2
 
 command -v git >/dev/null 2>&1 || {
     echo "check-root-litter: CANNOT RUN -- git is not on PATH" >&2; exit 2; }
-git -C "$_root" rev-parse --git-dir >/dev/null 2>&1 || {
+
+# ⚠⚠ GIT IS ASKED WITHOUT THE CALLER'S GIT ENVIRONMENT, through the one shell owner of that rule.
+# ✔MEASURED 2026-09-15 (P66 lane rr; a copy of this guard in a fixture tree holding ONE loose
+# root file): under another repository's exported GIT_INDEX_FILE this guard said "OK -- no
+# untracked files" (rc 0), and again under its GIT_DIR + GIT_WORK_TREE; under its GIT_DIR alone
+# it named a TRACKED file as litter. `-C "$_root"` moves git's directory, never its repository,
+# and a git hook exports GIT_INDEX_FILE -- so a gate run from one is exactly that caller.
+# The empty argument to `.` is load-bearing: without it leg-tree's dispatch would read this
+# script's positional parameters as a subcommand.
+# shellcheck source=../leg-tree/leg-tree.sh
+. "$_here/../leg-tree/leg-tree.sh" "" || {
+    echo "check-root-litter: CANNOT RUN -- cannot load scripts/leg-tree/leg-tree.sh" >&2; exit 2; }
+leg_tree_git_unsteered -C "$_root" rev-parse --git-dir >/dev/null 2>&1 || {
     echo "check-root-litter: CANNOT RUN -- '$_root' is not a git repository" >&2; exit 2; }
 
 # `--porcelain` prefixes untracked entries with `?? `. A path with no `/` is at
@@ -72,11 +84,23 @@ git -C "$_root" rev-parse --git-dir >/dev/null 2>&1 || {
 #   root directories are `.kilo/ .secrets/ .temp/ .worktrees/ build/ scratchpad/`,
 #   every one legitimate, so a directory rule would need an allowlist — an escape
 #   every subject takes. The one bad directory ever seen is caught by SHAPE below.
+#
+# ⛔ AND A `git status` THAT FAILS IS A REFUSAL, NEVER AN EMPTY LIST.
+# ✔MEASURED 2026-09-15 (P66 lane rr, the same fixture with `.git/index` overwritten): git exited
+# 128 ("index file smaller than expected"), and this guard -- whose `2>/dev/null` sat inside a
+# process substitution whose exit status nothing reads -- said "OK -- no untracked files" over
+# a loose root file, rc 0. The steered GIT_INDEX_FILE case above was that same failure ("fatal:
+# unable to read <sha>", rc 128). So the listing is taken FIRST, and its exit status is read.
+if ! _status="$(leg_tree_git_unsteered -C "$_root" status --porcelain=v1 --untracked-files=normal --ignored=matching 2>&1)"; then
+    echo "check-root-litter: CANNOT RUN -- \`git status\` failed in '$_root', so this guard cannot tell a clean root from a dirty one:" >&2
+    printf '%s\n' "$_status" | sed 's/^/    /' >&2
+    exit 2
+fi
 _litter=()
 while IFS= read -r _p; do
     [ -n "$_p" ] && _litter+=("$_p")
 done < <(
-    git -C "$_root" status --porcelain=v1 --untracked-files=normal --ignored=matching 2>/dev/null \
+    printf '%s\n' "$_status" \
     | sed -n -e 's/^?? //p' -e 's/^!! //p' \
     | grep -vE '/' \
     | LC_ALL=C sort -u

@@ -238,3 +238,28 @@ dss_use_config_snapshot(integrated_tests/coverage-boundary)
 # ORDER IS LOAD-BEARING, same as every call above: `dss_strict_arm_verdicts`
 # READS the entry's existing ENVIRONMENT and appends to it.
 dss_strict_arm_verdicts(integrated_tests/coverage-boundary)
+
+# ── `ctest/entry-budgets`: the pin on EVERY entry's TIMEOUT ──────────────────
+# D-TEST-INTEGRATED-RUNNER-HANGS-BEFORE-CREATING-ITS-EX-DIRECTORY
+#
+# Every ctest entry in this build — both corpus harnesses' and all the others —
+# gets its TIMEOUT from ONE mechanism, `cmake/DssTestBudgets.cmake`, which the root
+# CMakeLists.txt includes as its LAST line; the rule and every measurement behind
+# it are stated there. This entry proves the mechanism ran and says what it did:
+# no entry without a TIMEOUT, no entry the walk never saw, every budget the one the
+# rule gives, no registration's own TIMEOUT below that budget, the class selected
+# from this build's own configuration by its ONE owner (`cmake/DssBuildClass.cmake`)
+# and read by both of its consumers, and CI's own configure lines selecting the
+# classes their legs declare.
+#
+# ⚠ REGISTERED HERE AND NOT IN THAT MODULE, ON PURPOSE. A pin living inside the
+# mechanism it pins disappears with it, and deleting the module's `include()` is
+# the first way the mechanism can be lost — here, that deletion reds this entry.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME ctest/entry-budgets
+         COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/cmake/DssTestBudgetsCheck.py"
+                 --build-dir "${CMAKE_BINARY_DIR}"
+                 --source-dir "${CMAKE_SOURCE_DIR}"
+                 --ctest "${CMAKE_CTEST_COMMAND}"
+                 --cmake "${CMAKE_COMMAND}"
+                 --module "${CMAKE_SOURCE_DIR}/cmake/DssTestBudgets.cmake")

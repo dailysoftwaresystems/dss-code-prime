@@ -2,16 +2,26 @@
 # test-run-gate.sh -- prove BOTH run-gate twins refuse a run whose evidence is
 # spoiled, and that they still pass a run whose evidence is intact.
 #
-# SEVEN SUBJECTS, one fixture, because they are one contract:
+# ELEVEN SUBJECTS, one fixture, because they are one contract:
 #   * the SOURCE TREE moving under the run          -> exit 3
 #   * ANOTHER RUN live in the same BUILD DIRECTORY  -> exit 4
 #   * WHICH TREE those roots are read from at all   -> 3 or 0, and which one it
 #     was must be readable from the log ALONE
 #   * whether a file's TIMESTAMP can decide either answer -> it must not, in
 #     EITHER direction, because one carriage's clock is not monotonic
-#   * a COMPILER running outside this gate's process tree -> NAMED, never refused
+#   * a COMPILER running outside this gate's process tree -> NAMED, never refused,
+#     and asserted BY PID, so unrelated compilers on the machine decide nothing
 #   * a PARENT LINK that names a RECYCLED PID       -> never followed
 #   * a WITNESS found only in the wrapper's OWN footer -> exit 1, not evidence
+#   * a LOG PATH another LIVE run-gate holds         -> exit 5, its log untouched;
+#     a dead holder's record reclaimed, an unjudgeable one refused
+#   * a file CHANGED AND RESTORED during the run     -> exit 3, whatever the restore
+#     did to its bytes and timestamps
+#   * a RELATIVE build directory in ANOTHER process's tree -> not a contender where
+#     that process's directory can be read; a stated assumption where it cannot
+#   * a PROCESS TABLE big enough to fill a pipe      -> the pre-run scan completes
+# ⓘ AND IT RUNS IN A SCRATCH DIRECTORY OF ITS OWN PER INVOCATION, so two gates of one
+#   checkout can run it at once (see ONE SCRATCH DIRECTORY PER INVOCATION below).
 #
 # ⚠⚠ THE THIRD SUBJECT IS THE ONE WHOSE FAILURE IS SILENT, and that is why it is
 #   proved in BOTH directions rather than only the refusing one. The input roots
@@ -189,7 +199,34 @@ SELF_SCRIPT="${SELF_DIR}/$(basename "${BASH_SOURCE[0]}")"
 ROOT="$(cd "${SELF_DIR}/../.." && pwd -P)"
 GATE_SH="${ROOT}/scripts/run-gate/run-gate.sh"
 GATE_PS1="${ROOT}/scripts/run-gate/run-gate.ps1"
-SCRATCH="${ROOT}/.temp/test-run-gate-scratch"
+
+# ═══ ONE SCRATCH DIRECTORY PER INVOCATION, NOT PER SOURCE TREE ═════════════════
+# [[D-TEST-RUN-GATE-GUARD-SCRATCH-IS-KEYED-BY-SOURCE-TREE-SO-CONCURRENT-GATES-DESTROY-EACH-OTHERS-FIXTURE]]
+# ⚠⚠ THIS WAS `${ROOT}/.temp/test-run-gate-scratch`, ONE PATH PER CHECKOUT, and every
+#   run began with `rm -rf` of it. The end-of-round gate runs TWO build trees of ONE
+#   checkout (MinGW Debug and MSVC Release), each registering this very fixture.
+#   ✔MEASURED 2026-09-15 (lane `ca`): the MSVC gate's guard failed 7 arms, 0 of them
+#   fixture preconditions, first FAIL 7 s after the MinGW gate's guard re-created the
+#   sandbox under it. ✔REPRODUCED the same day (lane `pg`) through ctest, `build/pg`
+#   and `build/pg2` of one worktree 24 s apart: the EARLIER guard failed 9 arms, first
+#   FAIL ~1 s after the later one's wipe, and the later guard passed.
+# ⇒ `run-<pid>[w<winpid>]-XXXXXX` under that base, made by `mktemp -d`, so no two
+#   live invocations can ever share one, however they were launched. The OWNER'S
+#   IDENTITY IS IN THE NAME, so the sweep below can tell a live sibling from a dead
+#   run without a window in which a just-created directory has no owner record.
+# ★ STILL CLEANED, AND STILL INSIDE `.temp/`: each run removes every instance whose
+#   owner is gone -- stopping that instance's leftover stand-ins by their recorded
+#   identity first -- so the post-mortem of the latest run survives until the next
+#   run starts, exactly as the single directory did.
+# ⓘ A `__stand-in` callback is a SEPARATE process running this file, so it is told
+#   its instance through `RG_FIXTURE_SCRATCH`. Only that callback mode reads it; the
+#   fixture proper always makes its own, so the variable is not a knob a caller can
+#   turn to share a directory.
+SCRATCH_BASE="${ROOT}/.temp/test-run-gate-scratch"
+SCRATCH=""
+if [ "${1:-}" = "__stand-in" ]; then
+    SCRATCH="${RG_FIXTURE_SCRATCH:?test-run-gate.sh: a __stand-in callback needs RG_FIXTURE_SCRATCH, which only the fixture itself sets}"
+fi
 STAND_IN_STATE="${SCRATCH}/stand-in"
 RG_TAB=$'\t'
 RG_NL=$'\n'
@@ -338,6 +375,15 @@ stand_in_main() {  # <verb> <label>
             fi
             echo hang-guard > "$STAND_IN_STATE/$2/stop-result"
             exit 70 ;;
+        (logholder)
+            # A GATED COMMAND THAT HOLDS ITS GATE LIVE: it prints a line into the gate's
+            # log, runs a stand-in body (image $3) until this fixture stops that body by
+            # its recorded pid, and only then prints its witness. The gate is therefore
+            # alive for exactly as long as the fixture says, at any host speed.
+            echo "LOG-HOLDER-STARTED $2"
+            "$3" "$SELF_SCRIPT" __stand-in body "$2"
+            printf '%s-%s-%s\n' LOG HOLDER DONE
+            exit 0 ;;
         (*)
             echo "test-run-gate.sh: unknown __stand-in verb '${1:-}'" >&2
             exit 64 ;;
@@ -352,20 +398,73 @@ fi
 
 # ═══ THE FIXTURE ═══════════════════════════════════════════════════════════════
 
-# A LEFTOVER FROM AN EARLIER RUN IS STOPPED BEFORE ITS STATE IS DELETED -- by its
-# recorded identity, and only when that identity still holds.
-if [ -d "$STAND_IN_STATE" ]; then
-    for _rg_left in "$STAND_IN_STATE"/*/; do
-        _rg_left="$(basename "$_rg_left")"
-        stand_in_is_ours "$_rg_left" || continue
+# ── THE SWEEP: AN INSTANCE WHOSE OWNER IS GONE IS STOPPED, THEN REMOVED ───────
+# See ONE SCRATCH DIRECTORY PER INVOCATION at the top of this file. An instance is
+# `run-<pid>[w<winpid>]-XXXXXX`, and its owner is LIVE only while the identity the
+# stand-ins already use still holds: on Windows the (MSYS pid, WINPID) pair, so a
+# recycled pid cannot keep a dead run's directory alive; elsewhere that pid running
+# THIS file. A live sibling is never touched, whatever launched it.
+fixture_instance_alive() {  # <instance dir>
+    local name id pid wp=""
+    name="$(basename "$1")"
+    id="${name#run-}"; id="${id%-*}"
+    pid="${id%%w*}"
+    case "$id" in *w*) wp="${id#*w}" ;; esac
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    if run_gate_host_is_windows; then
+        case "$wp" in ''|*[!0-9]*) return 1 ;; esac
+        ps -W 2>/dev/null | awk -v p="$pid" -v w="$wp" '
+            { o = ($1 ~ /^[0-9]+$/) ? 0 : 1 }
+            $(1 + o) == p && $(4 + o) == w { f = 1 }
+            END { exit !f }'
+    else
+        case "$(ps -ww -o args= -p "$pid" 2>/dev/null)" in
+            (*test-run-gate.sh*) return 0 ;;
+            (*)                  return 1 ;;
+        esac
+    fi
+}
+# A dead instance's stand-ins are stopped by THEIR recorded identity, and only when that
+# identity still holds, before any of its state is deleted.
+stop_leftover_stand_ins() {  # <a stand-in state directory>
+    local saved="$STAND_IN_STATE" left
+    [ -d "$1" ] || return 0
+    STAND_IN_STATE="$1"
+    for left in "$1"/*/; do
+        [ -d "$left" ] || continue
+        left="$(basename "$left")"
+        stand_in_is_ours "$left" || continue
         kill -TERM "$RG_SI_PID" 2>/dev/null
-        stand_in_wait gone "$_rg_left" \
-            || echo "  [warn] a stand-in left by an earlier run ($_rg_left, pid $RG_SI_PID) did not stop"
+        stand_in_wait gone "$left" \
+            || echo "  [warn] a stand-in left by an earlier run ($1/$left, pid $RG_SI_PID) did not stop"
     done
-fi
-
+    STAND_IN_STATE="$saved"
+}
+mkdir -p "$SCRATCH_BASE" || { echo "test-run-gate.sh: cannot create $SCRATCH_BASE"; exit 1; }
+# ⓘ THE PRE-INSTANCE LAYOUT kept its stand-ins directly under `stand-in/`; they are
+#   stopped FIRST, because on Windows an executable still running cannot be deleted.
+stop_leftover_stand_ins "$SCRATCH_BASE/stand-in"
+for _rg_inst in "$SCRATCH_BASE"/*; do
+    [ -e "$_rg_inst" ] || continue
+    case "$(basename "$_rg_inst")" in
+        (run-*)
+            [ -d "$_rg_inst" ] || continue
+            fixture_instance_alive "$_rg_inst" && continue
+            stop_leftover_stand_ins "$_rg_inst/stand-in"
+            rm -rf "$_rg_inst"
+            ;;
+        (*)
+            rm -rf "$_rg_inst"   # the pre-instance layout's entries
+            ;;
+    esac
+done
+_rg_self_winpid=""
+if run_gate_host_is_windows; then read -r _rg_self_winpid < "/proc/$$/winpid"; fi
+SCRATCH="$(mktemp -d "$SCRATCH_BASE/run-$$${_rg_self_winpid:+w$_rg_self_winpid}-XXXXXX")" \
+    || { echo "test-run-gate.sh: cannot create a scratch instance under $SCRATCH_BASE"; exit 1; }
+export RG_FIXTURE_SCRATCH="$SCRATCH"
+STAND_IN_STATE="${SCRATCH}/stand-in"
 SANDBOX="${SCRATCH}/tree"
-rm -rf "$SCRATCH"
 mkdir -p "$SANDBOX/examples" "$SANDBOX/src/dss-config" "$SANDBOX/tests/corpus" "$STAND_IN_STATE"
 PROBE_REL="examples/.test-run-gate-input-probe.txt"
 NOWHERE_BIN="${SCRATCH}/no-interpreter-here"
@@ -749,6 +848,62 @@ says_named_or_unknown() {  # <log-basename> [the exact identity line]
     else
         says "$1" 'compilers: UNKNOWN' --log
     fi
+}
+
+# ★★★ THE `compilers:` LINE MAY NAME ONLY COMPILERS OUTSIDE THIS RUN, AND MUST COUNT
+# WHAT IT NAMES. [[D-TEST-RUN-GATE-GUARD-ASSERTS-THAT-NO-COMPILER-RUNS-ANYWHERE-ON-THE-MACHINE]]
+# The decidable form of "the twin does not report unconditionally" (arm 26). With any
+# number of unrelated compilers alive, a correct line is `none`, or a count followed by
+# exactly that many rows, each of whose command line names the compiler image and none
+# of which is a stand-in this run planted. A line that fires regardless of the table
+# names non-compilers, or states a count it does not print.
+compilers_line_is_sound() {  # <log basename>
+    local f="$SCRATCH/$1" head count verdict label pids=""
+    head="$(logtext "$f" | grep -m1 '^compilers:')"
+    case "$head" in
+        ("compilers: none outside"*)
+            echo "  [ok  ] $1   is sound: compilers: none outside (nothing to name)"
+            return 0 ;;
+        ("compilers: UNKNOWN"*)
+            if [ "$TABLE_STATE" = blind ]; then
+                echo "  [ok  ] $1   is sound: compilers: UNKNOWN on a host whose process table is unreadable"
+                return 0
+            fi
+            echo "  [FAIL] $1   said compilers: UNKNOWN on a host whose process table reads"
+            show_tail "$f"; fails=$((fails + 1)); return 1 ;;
+        ("compilers: "[0-9]*) ;;
+        (*)
+            echo "  [FAIL] $1   carries no recognisable 'compilers:' line"
+            show_tail "$f"; fails=$((fails + 1)); return 1 ;;
+    esac
+    count="${head#compilers: }"; count="${count%% *}"
+    for label in $STAND_IN_PLANTED; do
+        stand_in_subject_pid "$label"
+        [ -n "${RG_SI_SUBJECT:-}" ] && pids="$pids $RG_SI_SUBJECT"
+    done
+    verdict="$(logtext "$f" | awk -v want="$count" -v planted=" $pids " '
+        /^compilers: [0-9]/ { on = 1; next }
+        on && /^          pid [0-9]+  / {
+            rows++
+            if (index(planted, " " $2 " ") > 0) own++
+            # ⓘ An EMPTY command line is a compiler whose line could not be read (it had
+            #   exited, or is protected) -- ✔MEASURED in a live footer beside four readable
+            #   ones. It was matched by its IMAGE, so it is not evidence of a line that
+            #   fires regardless; only a READABLE line that names no compiler is.
+            if ((getline cl) > 0) { sub(/^ +/, "", cl); if (cl != "" && tolower(cl) !~ /dsscp/) bad++ }
+            next
+        }
+        on { on = 0 }
+        END {
+            if (rows != want) { printf "states %s process(es) and prints %d row(s)", want, rows; exit }
+            if (bad > 0)      { printf "names %d process(es) whose command line is not the compiler", bad; exit }
+            if (own > 0)      { printf "names %d stand-in(s) this run planted and observed gone", own; exit }
+            printf "OK %d", rows
+        }')"
+    case "$verdict" in
+        (OK*) echo "  [ok  ] $1   is sound: ${verdict#OK } process(es) named, each a compiler outside this run" ;;
+        (*)   echo "  [FAIL] $1   'compilers:' line is NOT sound: it $verdict"; show_tail "$f"; fails=$((fails + 1)) ;;
+    esac
 }
 
 # ---- ARM 2 (sh) THE DEFECT: an input root is edited DURING the run ----------
@@ -1298,7 +1453,28 @@ if [ -n "$STAND_IN" ]; then
     stand_in_describe "$L23"; rg_at
     echo "  [info] $L23   independent reading of its stand-in ($RG_SI_DESC): before the gate=${r23a:-never-read}, after the gate=${r23s:-never-read}   $RG_AT"
     if [ "$r23a" = present ] && [ "$r23s" = stopped ]; then
-        exit_reason_check "$L23" && says a23.log "compilers: none outside" --log
+        # ★★★ THE SUBJECT IS *THIS* DESCENDANT, NEVER THE WHOLE MACHINE.
+        # [[D-TEST-RUN-GATE-GUARD-ASSERTS-THAT-NO-COMPILER-RUNS-ANYWHERE-ON-THE-MACHINE]]
+        # This arm used to require `compilers: none outside` -- a claim about every
+        # process on the host, which a project running four lanes cannot keep true.
+        # ✔MEASURED 2026-09-15: lane `ca`'s MSVC gate failed here while lane `ih` was
+        # compiling; and (lane `pg`) ONE planted foreign `dsscp` alive through an
+        # unmodified guard failed exactly this arm and arm 26, both naming that pid,
+        # and nothing else. The arm's subject is that a DESCENDANT is classified INSIDE
+        # the gate's tree, so it asserts the gate did not name THAT pid -- decidable
+        # with any number of unrelated compilers alive, and still red the moment the
+        # descendant is misread as outside. Arm 24 remains its control: it must name
+        # its own foreign stand-in BY PID, so a matcher that recognised nothing cannot
+        # pass both.
+        if exit_reason_check "$L23"; then
+            stand_in_subject_pid "$L23"
+            if [ "$TABLE_STATE" = readable ]; then
+                says a23.log 'compilers:' --log
+                says_not a23.log "pid $RG_SI_SUBJECT  dsscp" --log
+            else
+                says a23.log 'compilers: UNKNOWN' --log
+            fi
+        fi
     else
         precondition_failed "$L23" "its stand-in was not observed present before the nested gate and stopped after it (await '${r23a:-none}', stop '${r23s:-none}'), so the gate's samples were not shown a descendant"
         stop_foreign_compiler "$L23"
@@ -1367,7 +1543,18 @@ if [ -n "$PS_EXE" ] && [ -n "$STAND_IN" ]; then
             "$PS_EXE" -NoProfile -Command "Write-Output HELLO"
         rg_at
         echo "  [info] 26-ps1-no-compiler   independent reading: every stand-in this run planted ($STAND_IN_PLANTED ) was gone before the gate   $RG_AT"
-        says a26.log "compilers: none outside" --log
+        # ★★★ SOUNDNESS, NOT SILENCE.
+        # [[D-TEST-RUN-GATE-GUARD-ASSERTS-THAT-NO-COMPILER-RUNS-ANYWHERE-ON-THE-MACHINE]]
+        # This arm used to require `compilers: none outside` -- a claim about the whole
+        # machine, which one unrelated compiler falsifies. ✔MEASURED 2026-09-15 (lane
+        # `pg`): one planted foreign `dsscp` failed this arm and arm 23 and nothing else.
+        # Its real subject is that the twin does not report UNCONDITIONALLY, and that is
+        # decidable at any load: every process the line names is a compiler (its command
+        # line names the compiler image), none is a stand-in this run planted (all were
+        # observed gone above), and the count the line states is the number of rows it
+        # prints. A line that fires regardless fails the first clause or the last; a
+        # correct twin passes with or without unrelated compilers alive.
+        compilers_line_is_sound a26.log
     else
         precondition_failed 26-ps1-no-compiler "a stand-in from an earlier arm was still alive, so a 'none' answer could not be asked for"
     fi
@@ -1376,8 +1563,15 @@ if [ -n "$PS_EXE" ] && [ -n "$STAND_IN" ]; then
     ran
     rc_of 24-sh-foreign-compiler; sh_rc="$RG_RC"
     rc_of 25-ps1-foreign-compiler; ps_rc="$RG_RC"
-    sh_saw=$(logtext "$SCRATCH/a24.log" | grep -c "OUTSIDE this gate's process tree" || true)
-    ps_saw=$(logtext "$SCRATCH/a25.log" | grep -c "OUTSIDE this gate's process tree" || true)
+    # ⚠ PID-SPECIFIC. [[D-TEST-RUN-GATE-GUARD-ASSERTS-THAT-NO-COMPILER-RUNS-ANYWHERE-ON-THE-MACHINE]]
+    # Counting the bare "OUTSIDE this gate's process tree" header was satisfied by ANY
+    # unrelated compiler alive on the machine, so a twin that failed to name its own
+    # stand-in still counted as having reported one. Each count is now of the arm's OWN
+    # stand-in's row.
+    stand_in_subject_pid 24-sh-foreign-compiler
+    sh_saw=$(logtext "$SCRATCH/a24.log" | grep -c "pid $RG_SI_SUBJECT  dsscp  seen throughout this run" || true)
+    stand_in_subject_pid 25-ps1-foreign-compiler
+    ps_saw=$(logtext "$SCRATCH/a25.log" | grep -c "pid $RG_SI_SUBJECT  dsscp  seen throughout this run" || true)
     rg_at
     if [ "$sh_rc" = not-run ] || [ "$ps_rc" = not-run ]; then
         precondition_failed 27-parity "arm 24 or 25 never ran (.sh rc=$sh_rc, .ps1 rc=$ps_rc) -- its own precondition failure is reported above"
@@ -1405,8 +1599,13 @@ if [ -n "$PS_EXE" ] && [ -n "$STAND_IN" ]; then
     ran
     rc_of 28-sh-compiler-exits-midrun; sh_urc="$RG_RC"
     rc_of 29-ps1-compiler-exits-midrun; ps_urc="$RG_RC"
-    sh_u=$(logtext "$SCRATCH/a28.log" | grep -c "seen when this run STARTED" || true)
-    ps_u=$(logtext "$SCRATCH/a29.log" | grep -c "seen when this run STARTED" || true)
+    # ⚠ PID-SPECIFIC, for the reason arm 27 gives: an unrelated compiler that happened to
+    # exit during the run would otherwise satisfy this count for a twin that failed to
+    # name its own stand-in.
+    stand_in_subject_pid 28-sh-compiler-exits-midrun
+    sh_u=$(logtext "$SCRATCH/a28.log" | grep -c "pid $RG_SI_SUBJECT  dsscp  seen when this run STARTED" || true)
+    stand_in_subject_pid 29-ps1-compiler-exits-midrun
+    ps_u=$(logtext "$SCRATCH/a29.log" | grep -c "pid $RG_SI_SUBJECT  dsscp  seen when this run STARTED" || true)
     if [ "$TABLE_STATE" = blind ]; then
         sh_u=$(logtext "$SCRATCH/a28.log" | grep -c 'compilers: UNKNOWN' || true)
         ps_u=$(logtext "$SCRATCH/a29.log" | grep -c 'compilers: UNKNOWN' || true)
@@ -1768,6 +1967,578 @@ else
     na 36-ps1-witness-only-in-argv   "$PS_ABSENT_WHY -- the .ps1 twin was never shown a witness spelled only in its argv"
     na 37-ps1-witness-only-in-output "$PS_ABSENT_WHY -- the .ps1 twin's output-only CONTROL was not taken"
     na 38-parity-witness             "$PS_ABSENT_WHY -- arms 34 and 35 still prove the .sh twin, but the twins were NOT compared"
+fi
+
+# ═══ THE EIGHTH SUBJECT: A LOG PATH ANOTHER LIVE RUN-GATE HOLDS ════════════════
+# [[D-SCRIPT-WSL-LEG-AND-RUN-GATE-LET-CONCURRENT-LEGS-SHARE-ONE-LOG-PATH]]
+# ✔MEASURED 2026-09-15 (P66, lane `pg`), a second run started on a log path while the
+# first was live: .sh/.sh left the first run exit 3 (its fingerprint deleted by the
+# second run's cleanup) and its output ERASED while the second reported OK; .sh/.ps1
+# left NEITHER run's output in the log; a .ps1 first run refused a second one only by
+# the accident of its open handle. On two real wsl-leg runs sharing
+# /tmp/wsl-leg-ctest.log, a leg reported OK over a log naming another clone.
+# ★ THE ARMS ARE A SET: a live HOLDER on a path (held by this fixture, never by a
+#   clock); a CHALLENGER of each twin on that path must refuse 5 WITHOUT touching the
+#   holder's log; the holder must still finish 0 with its own evidence and release the
+#   record; the released path must take a new run (CONTROL); a record left by a
+#   HARD-KILLED holder must be RECLAIMED, across the twins (CONTROL: liveness decides,
+#   not the file's existence); and a record from another pid namespace, or an empty
+#   one, must still refuse -- the silent direction stays shut.
+
+# The pid a run-gate's owner record names, read from the record itself.
+owner_record_pid() {  # <log basename> -> RG_OWNER_PID
+    RG_OWNER_PID="$(sed -n 's/^pid=//p' "$SCRATCH/$1.run-gate-owner" 2>/dev/null | tr -d '\r' | head -1)"
+}
+
+# Kills a process by the pid its OWN owner record names, with no chance to clean up --
+# the shape a TerminateProcess or a SIGKILL leaves. Windows pids go through PowerShell,
+# which takes a Windows pid; elsewhere a plain SIGKILL.
+hard_kill_recorded_pid() {  # <pid in the process table's namespace>
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    if run_gate_host_is_windows; then
+        "$PS_EXE" -NoProfile -Command "Stop-Process -Id $1 -Force -ErrorAction Stop" >/dev/null 2>&1
+    else
+        kill -9 "$1" 2>/dev/null
+    fi
+}
+
+# Starts a HOLDER gate in the background and blocks until its gated command is live.
+start_log_holder() {  # <label> <twin: sh|ps1> <log basename> -> HOLDER_BG
+    local label=$1
+    rm -rf "${STAND_IN_STATE:?}/$label"
+    mkdir -p "$STAND_IN_STATE/$label"
+    STAND_IN_PLANTED="$STAND_IN_PLANTED $label"
+    rm -f "$SCRATCH/$3" "$SCRATCH/$3".run-gate-*
+    if [ "$2" = sh ]; then
+        bash "$GATE_SH" "$SCRATCH/$3" 'LOG-HOLDER-DONE' \
+            "$BASH" "$SELF_SCRIPT" __stand-in logholder "$label" "$STAND_IN" \
+            > "$SCRATCH/$label.holder.out" 2>&1 &
+    else
+        "$PS_EXE" -NoProfile -ExecutionPolicy Bypass -File "$GATE_PS1" "$SCRATCH/$3" 'LOG-HOLDER-DONE' \
+            "$BASH_W" "$SELF_SCRIPT_W" __stand-in logholder "$label" "$STAND_IN_W" \
+            > "$SCRATCH/$label.holder.out" 2>&1 &
+    fi
+    HOLDER_BG=$!
+    stand_in_wait present "$label" && return 0
+    precondition_failed "$label" "the holder gate's command never became live within the ${RG_HANG_GUARD_S}s hang guard"
+    return 1
+}
+
+# Releases a holder's command and waits for the holder gate to finish -> HOLDER_RC.
+finish_log_holder() {  # <label>
+    local start=$SECONDS
+    HOLDER_RC=not-run
+    if ! stand_in_stop "$1"; then
+        precondition_failed "$1" "the holder's stand-in could not be stopped"
+        return 1
+    fi
+    while kill -0 "$HOLDER_BG" 2>/dev/null; do
+        if [ $((SECONDS - start)) -ge "$RG_HANG_GUARD_S" ]; then
+            precondition_failed "$1" "the holder gate was still running ${RG_HANG_GUARD_S}s after its command was released"
+            return 1
+        fi
+        sleep 0.2   # the poll cadence of a hang-guarded wait: no outcome depends on its length
+    done
+    wait "$HOLDER_BG"; HOLDER_RC=$?
+    return 0
+}
+
+record_is_gone() {  # <log basename>
+    ran; rg_at
+    if [ -e "$SCRATCH/$1.run-gate-owner" ]; then
+        echo "  [FAIL] $1   its owner record is still on disk after the holder finished   $RG_AT"
+        fails=$((fails + 1))
+    else
+        echo "  [ok  ] $1   its owner record was released when the holder finished   $RG_AT"
+    fi
+}
+
+# One holder, a challenger of each twin, the holder's completion, and the CONTROL.
+log_holder_arms() {  # <holder twin> <holder label> <log> <sh challenger label> <ps1 challenger label> <completes label> <again label>
+    local ht=$1 lh=$2 lg=$3
+    if ! start_log_holder "$lh" "$ht" "$lg"; then
+        stand_in_stop "$lh" >/dev/null 2>&1
+        return 1
+    fi
+    ran; rg_at
+    echo "  [ok  ] $lh   the $ht holder's gated command is live (its stand-in observed present)   $RG_AT"
+    says "$lg" "LOG-HOLDER-STARTED $lh" --log
+    arm "$4" 5 bash "$GATE_SH" "$SCRATCH/$lg" 'CHALLENGER-WITNESS' \
+        bash -c 'printf "%s-%s\n" CHALLENGER RAN; printf "%s-%s\n" CHALLENGER WITNESS'
+    says "$4" 'ANOTHER LIVE RUN-GATE HOLDS THIS LOG PATH'
+    says "$4" 'holder  : pid'
+    if [ -n "$PS_EXE" ]; then
+        arm "$5" 5 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+            -File "$GATE_PS1" "$SCRATCH/$lg" 'CHALLENGER-WITNESS' \
+            "$PS_EXE" -NoProfile -Command "Write-Output ('CHALLENGER-' + 'RAN'); Write-Output ('CHALLENGER-' + 'WITNESS')"
+        says "$5" 'ANOTHER LIVE RUN-GATE HOLDS THIS LOG PATH'
+        says "$5" 'holder  : pid'
+    else
+        na "$5" "$PS_ABSENT_WHY -- the .ps1 twin was never shown a held log path"
+    fi
+    # The holder's evidence is intact WHILE it is still live -- the moment that matters.
+    says "$lg" "LOG-HOLDER-STARTED $lh" --log
+    says_not "$lg" 'CHALLENGER-RAN' --log
+    if finish_log_holder "$lh"; then
+        ran; rg_at
+        if [ "$HOLDER_RC" = 0 ]; then
+            echo "  [ok  ] $6   the holder finished rc=0 after its challengers were refused   $RG_AT"
+        else
+            echo "  [FAIL] $6   the holder finished rc=$HOLDER_RC (want 0)   $RG_AT"
+            logtext "$SCRATCH/$lh.holder.out" | sed 's/^/         /' | head -12
+            fails=$((fails + 1))
+        fi
+        says "$lg" 'LOG-HOLDER-DONE' --log
+        says "$lg" 'logpath : held by this run alone' --log
+        says_not "$lg" 'CHALLENGER-RAN' --log
+        record_is_gone "$lg"
+    fi
+    # CONTROL: a path whose holder has finished takes the next run.
+    if [ "$ht" = sh ]; then
+        arm "$7" 0 bash "$GATE_SH" "$SCRATCH/$lg" 'AGAIN-OK' bash -c 'printf "%s-%s\n" AGAIN OK'
+        says "$7" 'run-gate.sh: OK'
+    else
+        arm "$7" 0 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+            -File "$GATE_PS1" "$SCRATCH/$lg" 'AGAIN-OK' \
+            "$PS_EXE" -NoProfile -Command "Write-Output ('AGAIN-' + 'OK')"
+        says "$7" 'run-gate.ps1: OK'
+    fi
+    record_is_gone "$lg"
+}
+
+if [ -n "$STAND_IN" ]; then
+    # ---- ARMS 39-43: a .sh HOLDER --------------------------------------------
+    log_holder_arms sh 39-sh-holds-log a39.log \
+        40-sh-challenger-vs-sh-holder 41-ps1-challenger-vs-sh-holder \
+        42-sh-holder-completes 43-sh-same-path-again
+    if [ -n "$PS_EXE" ]; then
+        # ---- ARMS 44-48: a .ps1 HOLDER ---------------------------------------
+        log_holder_arms ps1 44-ps1-holds-log a44.log \
+            45-sh-challenger-vs-ps1-holder 46-ps1-challenger-vs-ps1-holder \
+            47-ps1-holder-completes 48-ps1-same-path-again
+    else
+        na 44-ps1-holds-log "$PS_ABSENT_WHY -- no .ps1 holder could be started"
+    fi
+
+    # ---- ARM 49 TWIN PARITY ON A HELD LOG PATH -------------------------------
+    ran
+    rc_of 40-sh-challenger-vs-sh-holder;   p40="$RG_RC"
+    rc_of 41-ps1-challenger-vs-sh-holder;  p41="$RG_RC"
+    rc_of 45-sh-challenger-vs-ps1-holder;  p45="$RG_RC"
+    rc_of 46-ps1-challenger-vs-ps1-holder; p46="$RG_RC"
+    rg_at
+    if [ -z "$PS_EXE" ]; then
+        na 49-parity-log-held "$PS_ABSENT_WHY -- arm 40 still proves the .sh twin, but the twins were NOT compared"
+    elif [ "$p40$p41$p45$p46" = 5555 ]; then
+        echo "  [ok  ] 49-parity-log-held  every challenger of either twin refused a held path with exit 5 (sh-held 5/5, ps1-held 5/5)   $RG_AT"
+    else
+        echo "  [FAIL] 49-parity-log-held  sh holder: .sh=$p40 .ps1=$p41; ps1 holder: .sh=$p45 .ps1=$p46 (all must be 5)   $RG_AT"
+        fails=$((fails + 1))
+    fi
+
+    # ---- ARMS 50-51: A RECORD LEFT BY A HARD-KILLED HOLDER IS RECLAIMED --------
+    # ⚠ The .sh holder's command writes the log FILE directly, so after its gate is
+    #   killed it may still print; this waits for that last line before the reclaim
+    #   runs, so nothing but the reclaiming run writes the log afterwards. A .ps1
+    #   holder's command writes through a pipe its dead PowerShell owned, so nothing
+    #   of it can reach the file after the kill.
+    if [ -n "$PS_EXE" ]; then
+        LS=50-stale-sh-record
+        if start_log_holder "$LS" sh a50.log; then
+            owner_record_pid a50.log; stale50="$RG_OWNER_PID"
+            hard_kill_recorded_pid "$stale50"
+            stand_in_stop "$LS" >/dev/null 2>&1
+            wait "$HOLDER_BG" 2>/dev/null
+            _rg_n=0
+            while ! logtext "$SCRATCH/a50.log" | grep -qF 'LOG-HOLDER-DONE' && [ "$_rg_n" -lt $((RG_HANG_GUARD_S * 5)) ]; do
+                _rg_n=$((_rg_n + 1)); sleep 0.2
+            done
+            if [ -e "$SCRATCH/a50.log.run-gate-owner" ]; then
+                arm 50-ps1-reclaims-stale-sh-record 0 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+                    -File "$GATE_PS1" "$SCRATCH/a50.log" 'RECLAIM-OK' \
+                    "$PS_EXE" -NoProfile -Command "Write-Output ('RECLAIM-' + 'OK')"
+                says a50.log 'RECLAIMED a stale record' --log
+                says a50.log "pid $stale50" --log
+                record_is_gone a50.log
+            else
+                precondition_failed 50-ps1-reclaims-stale-sh-record "the killed .sh holder (pid $stale50) left no owner record, so there was nothing stale to reclaim"
+            fi
+        fi
+        LS=51-stale-ps1-record
+        if start_log_holder "$LS" ps1 a51.log; then
+            owner_record_pid a51.log; stale51="$RG_OWNER_PID"
+            hard_kill_recorded_pid "$stale51"
+            stand_in_stop "$LS" >/dev/null 2>&1
+            wait "$HOLDER_BG" 2>/dev/null
+            if [ -e "$SCRATCH/a51.log.run-gate-owner" ]; then
+                arm 51-sh-reclaims-stale-ps1-record 0 bash "$GATE_SH" "$SCRATCH/a51.log" 'RECLAIM-OK' \
+                    bash -c 'printf "%s-%s\n" RECLAIM OK'
+                says a51.log 'RECLAIMED a stale record' --log
+                says a51.log "pid $stale51" --log
+                record_is_gone a51.log
+            else
+                precondition_failed 51-sh-reclaims-stale-ps1-record "the killed .ps1 holder (pid $stale51) left no owner record, so there was nothing stale to reclaim"
+            fi
+        fi
+    else
+        na 50-ps1-reclaims-stale-sh-record "$PS_ABSENT_WHY -- a cross-twin reclaim needs both twins"
+        na 51-sh-reclaims-stale-ps1-record "$PS_ABSENT_WHY -- a cross-twin reclaim needs both twins"
+    fi
+else
+    na 39-sh-holds-log "$STAND_IN_ABSENT_WHY -- no holder could be kept live without a stand-in"
+fi
+
+# ---- ARMS 52-56: RECORDS NO LIVENESS RULE MAY RECLAIM ------------------------
+# A record from another pid namespace cannot be judged from here, and an empty one may
+# be a sibling's half-written create; both must REFUSE, from either twin.
+write_constructed_record() {  # <log basename> <namespace>
+    printf 'run-gate-owner-record: constructed by test-run-gate.sh\ntoken=constructed-0-1\npid=1\ncreated=\nnamespace=%s\nshell=test-run-gate.sh\ncommand=constructed\n' "$2" \
+        > "$SCRATCH/$1.run-gate-owner"
+}
+write_constructed_record a52.log 'elsewhere:no-such-host:'
+arm 52-sh-foreign-namespace-record 5 bash "$GATE_SH" "$SCRATCH/a52.log" 'NS-OK' bash -c 'printf "%s-%s\n" NS OK'
+says 52-sh-foreign-namespace-record 'pid namespace'
+: > "$SCRATCH/a54.log.run-gate-owner"
+arm 54-sh-empty-record 5 bash "$GATE_SH" "$SCRATCH/a54.log" 'EMPTY-OK' bash -c 'printf "%s-%s\n" EMPTY OK'
+says 54-sh-empty-record 'empty, half-written'
+if [ -n "$PS_EXE" ]; then
+    arm 53-ps1-foreign-namespace-record 5 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+        -File "$GATE_PS1" "$SCRATCH/a52.log" 'NS-OK' \
+        "$PS_EXE" -NoProfile -Command "Write-Output ('NS-' + 'OK')"
+    says 53-ps1-foreign-namespace-record 'pid namespace'
+    arm 55-ps1-empty-record 5 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+        -File "$GATE_PS1" "$SCRATCH/a54.log" 'EMPTY-OK' \
+        "$PS_EXE" -NoProfile -Command "Write-Output ('EMPTY-' + 'OK')"
+    says 55-ps1-empty-record 'empty, half-written'
+    ran
+    rc_of 52-sh-foreign-namespace-record; p52="$RG_RC"
+    rc_of 53-ps1-foreign-namespace-record; p53="$RG_RC"
+    rc_of 54-sh-empty-record; p54="$RG_RC"
+    rc_of 55-ps1-empty-record; p55="$RG_RC"
+    rg_at
+    if [ "$p52$p53$p54$p55" = 5555 ]; then
+        echo "  [ok  ] 56-parity-unjudgeable-record  both twins refused a foreign-namespace record (5/5) and an empty one (5/5)   $RG_AT"
+    else
+        echo "  [FAIL] 56-parity-unjudgeable-record  foreign namespace: .sh=$p52 .ps1=$p53; empty: .sh=$p54 .ps1=$p55 (all must be 5)   $RG_AT"
+        fails=$((fails + 1))
+    fi
+else
+    na 53-ps1-foreign-namespace-record "$PS_ABSENT_WHY"
+    na 55-ps1-empty-record             "$PS_ABSENT_WHY"
+    na 56-parity-unjudgeable-record    "$PS_ABSENT_WHY -- arms 52 and 54 still prove the .sh twin, but the twins were NOT compared"
+fi
+rm -f "$SCRATCH/a52.log.run-gate-owner" "$SCRATCH/a54.log.run-gate-owner"
+
+# ═══ THE NINTH SUBJECT: A FILE CHANGED AND RESTORED DURING THE RUN ═════════════
+# [[D-SCRIPT-RUN-GATE-INPUTS-HELD-STILL-OVER-A-FILE-CHANGED-AND-RESTORED-MID-RUN]]
+# ✔MEASURED 2026-09-15 (P66, lane `pg`), both twins, a gated command that let a watched
+# file be changed, READ the changed bytes, and let it be restored: restored by a plain
+# rewrite -> exit 3; restored by `cp -p`, by PowerShell `Copy-Item`, or rewritten and
+# `touch -r`'d -> exit 0, `inputs  : held still`.
+# ★ THE GATED COMMAND DOES ALL THREE STEPS ITSELF (a script ctest runs), so the change
+#   and the restore land between the twins' two snapshots by construction.
+# ★ HOST-CONDITIONAL, AND THE CONDITION IS READ FROM THE SUBJECT: the witness is ctime
+#   (perl) on POSIX and the NTFS USN (PowerShell) on Windows. Where a twin reports
+#   `changes : NOT WATCHED`, it cannot be asked to refuse, so its arms are NOT
+#   APPLICABLE -- named and counted. The untouched-tree CONTROL below, and every
+#   `held still` arm above, must pass on every host: a witness that moved on its own
+#   would break them all.
+change_state_of() {  # <log basename> -> RG_CHANGE_STATE
+    RG_CHANGE_STATE=""
+    if   logtext "$SCRATCH/$1" | grep -qF 'changes : watched';     then RG_CHANGE_STATE=watched
+    elif logtext "$SCRATCH/$1" | grep -qF 'changes : NOT WATCHED'; then RG_CHANGE_STATE=unwatched
+    fi
+}
+change_state_of a1.log; SH_CHANGE="$RG_CHANGE_STATE"
+ran; rg_at
+if [ -n "$SH_CHANGE" ]; then
+    echo "  [ok  ] 57-probe-change-witness   run-gate.sh reports its change witness as $SH_CHANGE on this host (MEASURED from a1.log)   $RG_AT"
+else
+    echo "  [FAIL] 57-probe-change-witness   a1.log carries no 'changes :' line   $RG_AT"
+    fails=$((fails + 1))
+fi
+PS_CHANGE=""
+if [ -n "$PS_EXE" ]; then change_state_of a4.log; PS_CHANGE="$RG_CHANGE_STATE"; fi
+
+TREE_D="${SCRATCH}/gate-tree-d"
+mk_source_tree "$TREE_D"
+RESTORED="$TREE_D/examples/.probe-restored.txt"
+native_path "$RESTORED"; RESTORED_W="$RG_NATIVE"
+native_path "$SCRATCH/probe-restored.orig"; RESTORED_ORIG_W="$RG_NATIVE"
+# Before EVERY arm: a fresh file, back-dated, and its scratch copy -- a write BEFORE the
+# run, which both snapshots then see alike.
+reset_restored_probe() {
+    echo ORIGINAL > "$RESTORED"
+    touch -t 202001010000 "$RESTORED"
+    cp -p "$RESTORED" "$SCRATCH/probe-restored.orig"
+}
+# The two restores, each a script ctest runs as the gate command's only test.
+printf '%s\n' '#!/usr/bin/env bash' \
+    "echo MUTATED > '$RESTORED'" \
+    "cat '$RESTORED'" \
+    "cp -p '$SCRATCH/probe-restored.orig' '$RESTORED'" \
+    'echo ok' > "$SCRATCH/restore-cp-p.sh"
+printf '%s\n' '#!/usr/bin/env bash' \
+    "echo MUTATED > '$RESTORED'" \
+    "cat '$RESTORED'" \
+    "\"\$1\" -NoProfile -Command \"Copy-Item -LiteralPath '$RESTORED_ORIG_W' -Destination '$RESTORED_W' -Force\"" \
+    'echo ok' > "$SCRATCH/restore-copy-item.sh"
+native_path "$SCRATCH/restore-cp-p.sh"; RESTORE_CPP_W="$RG_NATIVE"
+native_path "$SCRATCH/restore-copy-item.sh"; RESTORE_CI_W="$RG_NATIVE"
+mkdir -p "$TREE_D/build/cp-p" "$TREE_D/build/copy-item" "$TREE_D/build/untouched"
+for _rg_bd in cp-p copy-item untouched; do
+    printf 'CMAKE_HOME_DIRECTORY:INTERNAL=%s\n' "$(gate_spelling "$TREE_D")" > "$TREE_D/build/$_rg_bd/CMakeCache.txt"
+done
+printf 'add_test(probe "%s" "%s")\n' "$BASH_W" "$RESTORE_CPP_W" > "$TREE_D/build/cp-p/CTestTestfile.cmake"
+printf 'add_test(probe "%s" "%s" "%s")\n' "$BASH_W" "$RESTORE_CI_W" "${PS_EXE:-pwsh}" > "$TREE_D/build/copy-item/CTestTestfile.cmake"
+printf 'add_test(probe "%s" "-c" "echo ok")\n' "$BASH_W" > "$TREE_D/build/untouched/CTestTestfile.cmake"
+
+restored_arm() {  # <label> <twin: sh|ps1> <build dir> <want> <log basename>
+    reset_restored_probe
+    if [ "$2" = sh ]; then
+        arm "$1" "$4" bash "$GATE_SH" "$SCRATCH/$5" '100% tests passed' ctest --test-dir "$TREE_D/build/$3"
+    else
+        arm "$1" "$4" "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+            -File "$GATE_PS1" "$SCRATCH/$5" '100% tests passed' ctest --test-dir "$TREE_D/build/$3"
+    fi
+}
+
+# ---- ARM 58 (sh) CONTROL: the witness does not move on an untouched tree -----------
+restored_arm 58-sh-untouched-control sh untouched 0 a58.log
+says 58-sh-untouched-control 'run-gate.sh: OK'
+says a58.log 'inputs  : held still' --log
+if [ "$SH_CHANGE" = watched ]; then
+    says a58.log 'changes : watched' --log
+    # ---- ARM 59 (sh) THE DEFECT: changed, read, restored with `cp -p` ----------
+    restored_arm 59-sh-cp-p-restore-refuses sh cp-p 3 a59.log
+    says 59-sh-cp-p-restore-refuses 'the tree CHANGED UNDER THE RUN'
+    says 59-sh-cp-p-restore-refuses '.probe-restored.txt'
+    if [ -n "$PS_EXE" ]; then
+        # ---- ARM 60 (sh) THE DEFECT: restored by PowerShell Copy-Item ------------
+        restored_arm 60-sh-copy-item-restore-refuses sh copy-item 3 a60.log
+        says 60-sh-copy-item-restore-refuses 'the tree CHANGED UNDER THE RUN'
+        says 60-sh-copy-item-restore-refuses '.probe-restored.txt'
+    else
+        na 60-sh-copy-item-restore-refuses "$PS_ABSENT_WHY -- no Copy-Item to restore with"
+    fi
+else
+    na 59-sh-cp-p-restore-refuses       "run-gate.sh does not watch changes mid-run on this host ($(logtext "$SCRATCH/a58.log" | sed -n 's/^changes : //p' | head -1))"
+    na 60-sh-copy-item-restore-refuses  "run-gate.sh does not watch changes mid-run on this host"
+fi
+if [ -n "$PS_EXE" ]; then
+    # ---- ARM 61 (ps1) CONTROL ----------------------------------------------------
+    restored_arm 61-ps1-untouched-control ps1 untouched 0 a61.log
+    says 61-ps1-untouched-control 'run-gate.ps1: OK'
+    says a61.log 'inputs  : held still' --log
+    if [ "$PS_CHANGE" = watched ]; then
+        says a61.log 'changes : watched' --log
+        restored_arm 62-ps1-cp-p-restore-refuses ps1 cp-p 3 a62.log
+        says 62-ps1-cp-p-restore-refuses 'the tree CHANGED UNDER THE RUN'
+        says 62-ps1-cp-p-restore-refuses '.probe-restored.txt'
+        restored_arm 63-ps1-copy-item-restore-refuses ps1 copy-item 3 a63.log
+        says 63-ps1-copy-item-restore-refuses 'the tree CHANGED UNDER THE RUN'
+        says 63-ps1-copy-item-restore-refuses '.probe-restored.txt'
+    else
+        na 62-ps1-cp-p-restore-refuses       "run-gate.ps1 does not watch changes mid-run on this host ($(logtext "$SCRATCH/a61.log" | sed -n 's/^changes : //p' | head -1))"
+        na 63-ps1-copy-item-restore-refuses  "run-gate.ps1 does not watch changes mid-run on this host"
+    fi
+    # ---- ARM 64 TWIN PARITY ON THE RESTORED CHANGE -------------------------------
+    ran
+    rc_of 58-sh-untouched-control;          r58="$RG_RC"
+    rc_of 61-ps1-untouched-control;         r61="$RG_RC"
+    rc_of 59-sh-cp-p-restore-refuses;       r59="$RG_RC"
+    rc_of 62-ps1-cp-p-restore-refuses;      r62="$RG_RC"
+    rc_of 60-sh-copy-item-restore-refuses;  r60="$RG_RC"
+    rc_of 63-ps1-copy-item-restore-refuses; r63="$RG_RC"
+    rg_at
+    if [ "$SH_CHANGE" != "$PS_CHANGE" ]; then
+        echo "  [FAIL] 64-parity-restored-change  the twins disagree about watching changes on ONE host: .sh=$SH_CHANGE .ps1=$PS_CHANGE   $RG_AT"
+        fails=$((fails + 1))
+    elif [ "$SH_CHANGE" != watched ]; then
+        na 64-parity-restored-change "neither twin watches changes mid-run on this host; their untouched controls were .sh=$r58 .ps1=$r61"
+    elif [ "$r58$r61" = 00 ] && [ "$r59$r62$r60$r63" = 3333 ]; then
+        echo "  [ok  ] 64-parity-restored-change  untouched 0/0; a cp -p restore 3/3 and a Copy-Item restore 3/3   $RG_AT"
+    else
+        echo "  [FAIL] 64-parity-restored-change  untouched .sh=$r58 .ps1=$r61 (0); cp -p .sh=$r59 .ps1=$r62 (3); Copy-Item .sh=$r60 .ps1=$r63 (3)   $RG_AT"
+        fails=$((fails + 1))
+    fi
+else
+    na 61-ps1-untouched-control          "$PS_ABSENT_WHY"
+    na 62-ps1-cp-p-restore-refuses       "$PS_ABSENT_WHY"
+    na 63-ps1-copy-item-restore-refuses  "$PS_ABSENT_WHY"
+    na 64-parity-restored-change         "$PS_ABSENT_WHY -- arms 58 and 59 still prove the .sh twin, but the twins were NOT compared"
+fi
+
+# ═══ THE TENTH SUBJECT: A RELATIVE BUILD DIRECTORY IN ANOTHER PROCESS'S TREE ═══
+# [[D-SCRIPT-RUN-GATE-RESOLVES-ANOTHER-PROCESS-RELATIVE-BUILD-DIR-AGAINST-ITS-OWN-CWD]]
+# ✔MEASURED 2026-09-15 (P66, lane `pg`) on WSL: a leg in one clone was refused exit 4
+# because a leg in another clone ran `ctest --test-dir build/dbg`, a relative token the
+# scan resolved against its OWN directory.
+# ★ A contender ctest standing in tree X names `bd-rel`; a gate standing in tree Y names
+#   `bd-rel` too. Where this host can read another process's working directory the gate
+#   must NOT refuse (different trees); where it cannot (Windows), the refusal is the
+#   stated limitation and must SAY that the resolution was assumed. The CONTROL puts the
+#   contender in tree Y itself, which every host must refuse -- and, where the directory
+#   is readable, without the caveat.
+REL_X="$SCRATCH/rel-tree-x"
+REL_Y="$SCRATCH/rel-tree-y"
+mkdir -p "$REL_X/bd-rel" "$REL_Y/bd-rel"
+start_relative_contender() {  # <label> <tree> -> CONTENDER_BG
+    rm -rf "${STAND_IN_STATE:?}/$1"
+    mkdir -p "$STAND_IN_STATE/$1"
+    STAND_IN_PLANTED="$STAND_IN_PLANTED $1"
+    # ★ TWO TESTS, SELECTED BY NAME: the contender runs `held`, every gate arm runs `fast`.
+    #   A gate that fails to refuse then finishes in about a second, rc 0 -- a fast red
+    #   naming the missed contender -- instead of running the contender's held test until
+    #   RG_STAND_IN_LEAK_BOUND_S. ✔MEASURED 2026-09-15 on WSL with one shared `held` test:
+    #   the unrefused arms 69/70 took 600.30 s and 601.81 s, and a second `__stand-in body`
+    #   of one label re-records that label's pid file.
+    {
+        printf 'add_test(held "%s" "%s" "__stand-in" "body" "%s")\n' "$BASH_W" "$SELF_SCRIPT_W" "$1"
+        printf 'add_test(fast "%s" "-c" "echo ok")\n' "$BASH_W"
+    } > "$2/bd-rel/CTestTestfile.cmake"
+    ( cd "$2" && exec ctest --test-dir bd-rel -R held ) > "$SCRATCH/$1.contender.log" 2>&1 &
+    CONTENDER_BG=$!
+    stand_in_wait present "$1" && return 0
+    precondition_failed "$1" "the relative contender's held test never appeared within the ${RG_HANG_GUARD_S}s hang guard"
+    return 1
+}
+# Can THIS host read another process's working directory? Asked of the live contender,
+# by the same two readers the subject uses -- measured, not looked up.
+# ⚠ EITHER DIRECTORY IS THE CONTENDER'S. ✔MEASURED 2026-09-15 on WSL: ctest enters its
+#   --test-dir after parsing, so its cwd reads `<tree>/bd-rel`, not `<tree>`; this probe
+#   first compared against `<tree>` alone and reported CANNOT on a host that can.
+contender_cwd_readable() {  # <expected tree>
+    local want got=""
+    want="$(cd "$1" && pwd -P)"
+    run_gate_host_is_windows && return 1
+    got="$(readlink "/proc/$CONTENDER_BG/cwd" 2>/dev/null)"
+    [ -n "$got" ] || got="$(lsof -a -p "$CONTENDER_BG" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+    [ "$got" = "$want" ] || [ "$got" = "$want/bd-rel" ]
+}
+relative_gate_arm() {  # <label> <twin> <want> <log basename>
+    if [ "$2" = sh ]; then
+        arm "$1" "$3" bash -c 'cd "$1" && exec bash "$2" "$3" "100% tests passed" ctest --test-dir bd-rel -R fast' \
+            _ "$REL_Y" "$GATE_SH" "$SCRATCH/$4"
+    else
+        arm "$1" "$3" bash -c 'cd "$1" && exec "$2" -NoProfile -ExecutionPolicy Bypass -File "$3" "$4" "100% tests passed" ctest --test-dir bd-rel -R fast' \
+            _ "$REL_Y" "$PS_EXE" "$GATE_PS1_W" "$SCRATCH_W/$4"
+    fi
+}
+printf 'add_test(fast "%s" "-c" "echo ok")\n' "$BASH_W" > "$REL_Y/bd-rel/CTestTestfile.cmake"
+# ⓘ A BRACE GROUP FOR LAYOUT ONLY: the contender's held test is plain bash, so unlike the
+#   compiler arms these need no stand-in image and run on every host.
+{
+    LX=65-relative-contender-in-tree-x
+    if start_relative_contender "$LX" "$REL_X"; then
+        if contender_cwd_readable "$REL_X"; then REL_READABLE=1; else REL_READABLE=0; fi
+        ran; rg_at
+        echo "  [ok  ] 65-probe-cwd-readable   this host $( [ "$REL_READABLE" = 1 ] && echo CAN || echo CANNOT ) read another process's working directory (asked of the live contender)   $RG_AT"
+        if [ "$REL_READABLE" = 1 ]; then want_other=0; else want_other=4; fi
+        relative_gate_arm 66-sh-relative-contender-other-tree sh "$want_other" a66.log
+        if [ -n "$PS_EXE" ]; then
+            relative_gate_arm 67-ps1-relative-contender-other-tree ps1 "$want_other" a67.log
+        else
+            na 67-ps1-relative-contender-other-tree "$PS_ABSENT_WHY"
+        fi
+        if [ "$REL_READABLE" = 0 ]; then
+            says 66-sh-relative-contender-other-tree 'could not be read here'
+            [ -n "$PS_EXE" ] && says 67-ps1-relative-contender-other-tree 'could not be read here'
+        fi
+        stand_in_stop "$LX" >/dev/null 2>&1
+        wait "$CONTENDER_BG" 2>/dev/null
+    fi
+    printf 'add_test(fast "%s" "-c" "echo ok")\n' "$BASH_W" > "$REL_Y/bd-rel/CTestTestfile.cmake"
+    LY=68-relative-contender-in-tree-y
+    if start_relative_contender "$LY" "$REL_Y"; then
+        relative_gate_arm 69-sh-relative-contender-same-tree sh 4 a69.log
+        says 69-sh-relative-contender-same-tree 'ANOTHER RUN IS LIVE IN THIS BUILD DIRECTORY'
+        if [ -n "$PS_EXE" ]; then
+            relative_gate_arm 70-ps1-relative-contender-same-tree ps1 4 a70.log
+            says 70-ps1-relative-contender-same-tree 'ANOTHER RUN IS LIVE IN THIS BUILD DIRECTORY'
+        else
+            na 70-ps1-relative-contender-same-tree "$PS_ABSENT_WHY"
+        fi
+        if [ "${REL_READABLE:-0}" = 1 ]; then
+            says_not 69-sh-relative-contender-same-tree 'could not be read here'
+            [ -n "$PS_EXE" ] && says_not 70-ps1-relative-contender-same-tree 'could not be read here'
+        fi
+        stand_in_stop "$LY" >/dev/null 2>&1
+        wait "$CONTENDER_BG" 2>/dev/null
+    fi
+    if [ -n "$PS_EXE" ]; then
+        ran
+        rc_of 66-sh-relative-contender-other-tree;  r66="$RG_RC"
+        rc_of 67-ps1-relative-contender-other-tree; r67="$RG_RC"
+        rc_of 69-sh-relative-contender-same-tree;   r69="$RG_RC"
+        rc_of 70-ps1-relative-contender-same-tree;  r70="$RG_RC"
+        rg_at
+        if [ "$r66" = "$r67" ] && [ "$r69$r70" = 44 ] && [ "$r66" = "${want_other:-x}" ]; then
+            echo "  [ok  ] 71-parity-relative-contender  other tree $r66/$r67 (want ${want_other:-?}), same tree 4/4   $RG_AT"
+        else
+            echo "  [FAIL] 71-parity-relative-contender  other tree .sh=$r66 .ps1=$r67 (want ${want_other:-?}); same tree .sh=$r69 .ps1=$r70 (want 4)   $RG_AT"
+            fails=$((fails + 1))
+        fi
+    else
+        na 71-parity-relative-contender "$PS_ABSENT_WHY -- the twins were NOT compared"
+    fi
+}
+
+# ═══ THE ELEVENTH SUBJECT: A PROCESS TABLE THAT FILLS A PIPE ════════════════════
+# [[D-SCRIPT-RUN-GATE-PRE-RUN-SCAN-DEADLOCKS-ON-A-HERE-DOCUMENT-SIZED-BY-THE-PROCESS-TABLE]]
+# ✔MEASURED 2026-09-15 (P66, lane `pg`), Git Bash / bash 5.3.15: a here-document body of
+# 65422 or 65858 bytes reads, and 65656 bytes DEADLOCKS the shell that expands it. The
+# pre-run scan fed its classification of the live process table through exactly such a
+# document, and ✔REPRODUCED end to end: 60 foreign compiler rows sized to ~65580 bytes
+# WEDGED run-gate.sh with a 0-byte log and 0.05 CPU-s -- the signature of the arm that sat
+# idle for 876 s in a busy MSVC gate.
+# ★ The subject's own table reader (`powershell`) is SHIMMED, first on PATH, to print that
+#   table, and the gate gets the hang guard every waiting arm here has: still running past
+#   it is a WEDGE, named, and stopped by its pid.
+# ⓘ Red-capable only where bash deadlocks in that band (MSYS); on a POSIX host the
+#   subject reads its table with `ps`, the band was not reproduced (WSL bash 5.2.21 read
+#   every size), and the arm is NOT APPLICABLE.
+if run_gate_host_is_windows; then
+    SHIM="$SCRATCH/shim-table"
+    mkdir -p "$SHIM"
+    : > "$SHIM/table.txt"
+    _rg_pad="$(head -c 1050 /dev/zero | tr '\0' 'x')"
+    _rg_i=0
+    while [ "$_rg_i" -lt 60 ]; do
+        _rg_i=$((_rg_i + 1))
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$((900000001 + 2 * _rg_i))" 900000000 dsscp.exe "C:/fake/dsscp.exe $_rg_pad" dsscp.exe 20260915000000000000 >> "$SHIM/table.txt"
+    done
+    printf '#!/usr/bin/env bash\ncat "%s"\n' "$SHIM/table.txt" > "$SHIM/powershell"
+    chmod +x "$SHIM/powershell"
+    _rg_band="$(awk -F'\t' '{ n += length("FOREIGN\t" $1 "\tdsscp\t" $4) + 1 } END { print n }' "$SHIM/table.txt")"
+    ran
+    _rg_t0=$SECONDS
+    ( PATH="$SHIM:$PATH" exec bash "$GATE_SH" "$SCRATCH/a72.log" 'BAND-OK' bash -c 'printf "%s-%s\n" BAND OK' ) > "$SCRATCH/72.out" 2>&1 &
+    _rg_gbg=$!
+    _rg_wedged=0
+    while kill -0 "$_rg_gbg" 2>/dev/null; do
+        if [ $((SECONDS - _rg_t0)) -ge "$RG_HANG_GUARD_S" ]; then _rg_wedged=1; break; fi
+        sleep 0.2   # the poll cadence of a hang-guarded wait: no outcome depends on its length
+    done
+    rg_at
+    if [ "$_rg_wedged" = 1 ]; then
+        kill -9 "$_rg_gbg" 2>/dev/null
+        wait "$_rg_gbg" 2>/dev/null
+        echo "  [FAIL] 72-sh-process-table-in-the-pipe-band   WEDGED: still running ${RG_HANG_GUARD_S}s after it started over a ~${_rg_band}-byte classification (log $(wc -c < "$SCRATCH/a72.log" 2>/dev/null || echo '?') bytes); stopped by its pid   $RG_AT"
+        fails=$((fails + 1))
+    else
+        wait "$_rg_gbg"; _rg_rc=$?
+        if [ "$_rg_rc" = 0 ]; then
+            echo "  [ok  ] 72-sh-process-table-in-the-pipe-band   completed rc=0 in $((SECONDS - _rg_t0)) s over a ~${_rg_band}-byte classification   $RG_AT"
+        else
+            echo "  [FAIL] 72-sh-process-table-in-the-pipe-band   rc=$_rg_rc (want 0) over a ~${_rg_band}-byte classification   $RG_AT"
+            logtext "$SCRATCH/72.out" | sed 's/^/         /' | head -12
+            fails=$((fails + 1))
+        fi
+        says a72.log 'compilers: 60' --log
+    fi
+else
+    na 72-sh-process-table-in-the-pipe-band "the deadlock band is a property of MSYS pipes, and on this host run-gate.sh reads its process table with ps"
 fi
 
 # ---- WHAT THIS RUN ACTUALLY PROVED -----------------------------------------

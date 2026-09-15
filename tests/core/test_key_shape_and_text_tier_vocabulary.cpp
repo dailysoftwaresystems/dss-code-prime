@@ -519,22 +519,22 @@ TEST(TextTierVocabulary, BuiltinLoweringRefusalNamesEveryVerbTheLoaderAccepts) {
 TEST(TextTierVocabulary, EveryHirAttributeRefusalAdvertisesExactlyWhatItAccepts) {
     constexpr HirAttrVocabulary kVocabularies[] = {
         {"ffi linkage",
-         "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(link ",
+         "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(link ",
          ")\n  extern_global %1 : i32\n}\n", "unknown ffi linkage", 3},
         {"ffi visibility",
-         "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(vis ",
+         "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(vis ",
          ")\n  extern_global %1 : i32\n}\n", "unknown ffi visibility", 3},
         {"shader stage",
-         "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(stage ",
+         "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(stage ",
          ")\n  extern_global %1 : i32\n}\n", "unknown shader stage", 7},
         {"shader builtin",
-         "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(builtin ",
+         "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(builtin ",
          ")\n  extern_global %1 : i32\n}\n", "unknown shader builtin", 12},
         {"transpile idiom",
-         "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @transpile(idiom ",
+         "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @transpile(idiom ",
          ")\n  extern_global %1 : i32\n}\n", "unknown transpile idiom", 6},
         {"diag recovery",
-         "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @diag(code 0, recovery ",
+         "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @diag(code 0, recovery ",
          ")\n  extern_global %1 : i32\n}\n", "unknown diag recovery", 4},
     };
 
@@ -1175,7 +1175,7 @@ TEST(TextTierVocabulary, MirBitIntAndWideFloatLiteralsRoundTripThroughText) {
 // constant in the reader's translation unit, so the two ends cannot drift.
 TEST(TextTierVocabulary, TheUnspelledAggregateLiteralMarkerIsRefusedByName) {
     auto const text =
-        std::string{"dsshir 3\nproducer \"\"\n"
+        std::string{"dsshir 4\nproducer \"\"\n"
                     "symbols { %1 \"g\" }\n"
                     "module [] \"probe\" {\n"
                     "  global %1 : i32 = lit unspelled_aggregate : i32\n"
@@ -1219,7 +1219,7 @@ namespace {
 
 // A `.dsshir` module whose single function body is `bodyLine`.
 [[nodiscard]] std::string hirBody(std::string_view bodyLine) {
-    return std::string{"dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+    return std::string{"dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
                        "  function %1 : fn() -> void {\n    block {\n      "}
          + std::string{bodyLine} + "\n      return\n    }\n  }\n}\n";
 }
@@ -1309,14 +1309,18 @@ TEST(TextTierVocabulary, EveryAdvertisedNodeKeywordIsRecognizedByTheReader) {
     ASSERT_FALSE(msg.empty())
         << "an unrecognized node keyword must be refused BY NAME.";
     auto const advertised = advertisedIn(msg);
-    // 28 statement keywords + 25 expression keywords.
+    // 28 statement keywords + 26 expression keywords.
     // ⓘ 23 → 25 on 2026-08-23 (cycle P28, lane Z): `builtincall` and `labeladdr`
     // were WRITTEN by `emitExpr` and advertised by neither table — the same
     // write-only shape as the `va_*` hole this arm was built for, two arms over
     // (D-HIR-TEXT-WRITER-SPELLS-KEYWORDS-THE-READER-HAS-NO-ROW-FOR). This is a
     // GROWTH, which is the legitimate direction; the loop below already proved
     // both new spellings are recognized before this number moved.
-    EXPECT_EQ(advertised.size(), 53u)
+    // ⓘ 25 → 26 on 2026-09-15 (cycle P66, lane `ca`): `rmw`, the `ReadModifyWrite`
+    // kind (D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE).
+    // ✔MEASURED before the number moved: on the WSL leg this arm reported 54
+    // advertised and every one of them — `rmw` included — passed the loop below.
+    EXPECT_EQ(advertised.size(), 54u)
         << "the advertised node-keyword set changed size. A SHRINK means a "
            "keyword the reader dispatches stopped being advertised — or, worse, "
            "stopped being routed.\nmessage:\n  " << msg;

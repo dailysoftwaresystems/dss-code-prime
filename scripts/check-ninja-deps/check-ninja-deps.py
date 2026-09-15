@@ -89,7 +89,7 @@ described `check()`, which skipped. One code path, one fix, and it is in
 and the legitimate one is visible in the command line that requested it.
 
 Usage:
-    python scripts/check-ninja-deps/check-ninja-deps.py [build-dir ...]     # default: build/dbg, else build-dbg
+    python scripts/check-ninja-deps/check-ninja-deps.py [build-dir ...]     # default: build/dbg, else build-dbg, in THIS script's tree
     python scripts/check-ninja-deps/check-ninja-deps.py --allow-non-ninja <dir>
     python scripts/check-ninja-deps/check-ninja-deps.py --self-test
 
@@ -107,6 +107,7 @@ Exit: 0 clean · 1 dep-less objects found · 2 the instrument could not run
 `--allow-non-ninja` was not passed).
 """
 
+import importlib.util
 import os
 import re
 import subprocess
@@ -573,13 +574,30 @@ def self_test():
         if Path(_tmp).exists():
             fails.append("self-test temp tree was not removed")
 
+    # ── THE DEFAULT TREE IS THE ONE THIS FILE LIVES IN; AN EXPLICIT ONE STILL WINS ──
+    # Arms, oracle and synthesized negatives are owned by scripts/owning-tree/owning-tree.py.
+    # The resolver pinned is `default_build_dir()` itself, its `build/dbg` or `build-dbg`
+    # tail taken off -- so reverting the default to a cwd-relative path reddens here.
+    def _default_tree():
+        d = os.path.realpath(default_build_dir())
+        for tail in (os.path.join("build", "dbg"), "build-dbg"):
+            if d.endswith(os.sep + tail):
+                return d[:-len(tail) - 1]
+        return d
+    for ok, why, detail in _owning_tree().root_arms(_default_tree, (SystemExit,), False,
+                                                    __file__):
+        if not ok:
+            fails.append(f"default build tree: {why} [{detail}]")
+    if build_dirs(["x/explicit-tree", "--allow-non-ninja"]) != ["x/explicit-tree"]:
+        fails.append("an EXPLICIT build-tree argument did not win over the default")
+
     if fails:
         print("ninja-deps self-test: FAIL")
         for f in fails:
             print("   ", f)
         return 1
     print("ninja-deps self-test: OK (7 parser cases, 5 target-verdict cases, "
-          "5 deps=msvc excusal cases)")
+          "5 deps=msvc excusal cases, 3 default-tree cases, 1 explicit-tree case)")
     return 0
 
 
@@ -598,9 +616,57 @@ def default_build_dir():
     the auto-pick landed on the right path and the tool then said nothing about
     it. `target_verdict` is where the claim became true
     (D-GATE-NINJA-DEPS-EXITS-ZERO-ON-A-DIRECTORY-THAT-DOES-NOT-EXIST).
+    ⚠ BOTH CANDIDATES WERE RELATIVE TO THE CALLER'S CWD until P66, so the default named
+    whichever tree the process happened to start in. ✔MEASURED 2026-09-15: run by path
+    from inside a different repository holding an empty `build/dbg`, it probed THAT
+    directory ("exists but has no build.ninja") instead of this tree's. Both are now
+    resolved under the tree this file lives in (scripts/owning-tree/owning-tree.py); an
+    explicit directory argument still wins, taken relative to the caller as typed.
     """
-    return "build/dbg" if Path("build/dbg").is_dir() else (
-        "build-dbg" if Path("build-dbg").is_dir() else "build/dbg")
+    root = repo_root()
+    dbg = os.path.join(root, "build", "dbg")
+    flat = os.path.join(root, "build-dbg")
+    return dbg if os.path.isdir(dbg) else (flat if os.path.isdir(flat) else dbg)
+
+
+_OWNING_TREE = None
+
+
+def _owning_tree():
+    """`scripts/owning-tree/owning-tree.py` -- the one owner of "which tree is this file in?".
+
+    Loaded by path from this file's sibling directory (a hyphen is not a module name). It
+    FAILS LOUD when absent rather than falling back to a local walk: a second copy of the
+    answer is the drift that owner exists to end.
+    """
+    global _OWNING_TREE
+    if _OWNING_TREE is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            print("ninja-deps: FATAL -- cannot find %s; this tool's root is resolved there "
+                  "and nowhere else, so the check did NOT run." % path)
+            sys.exit(2)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OWNING_TREE = mod
+    return _OWNING_TREE
+
+
+def repo_root():
+    """The tree THIS FILE lives in -- see scripts/owning-tree/owning-tree.py."""
+    ot = _owning_tree()
+    try:
+        return ot.resolve(__file__)
+    except ot.Refusal as exc:
+        print("ninja-deps: FATAL -- %s; the check did NOT run." % exc)
+        sys.exit(2)
+
+
+def build_dirs(argv):
+    """The build trees to check: every positional argument as typed, else this tree's default."""
+    return [a for a in argv if not a.startswith("-")] or [default_build_dir()]
 
 
 def main(argv):
@@ -614,7 +680,7 @@ def main(argv):
               % " ".join(unknown))
         return 2
     allow_non_ninja = "--allow-non-ninja" in argv
-    dirs = [a for a in argv if not a.startswith("-")] or [default_build_dir()]
+    dirs = build_dirs(argv)
     worst = 0
     for d in dirs:
         worst = max(worst, check(d, allow_non_ninja))

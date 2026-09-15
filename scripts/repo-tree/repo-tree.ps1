@@ -20,6 +20,12 @@
 #                                   cases, identical to the .sh twin.
 #   Invoke-RepoTreeGit  <id> <args> ONE git command in whichever form that identity
 #                                   decided -- so no caller reads the gitdir itself.
+#   Invoke-RepoTreeUnsteered -Command <c> -Arguments <args>  ONE command of any kind with the
+#                                   CALLER's repository-selecting git variables removed
+#                                   (a tool like gh finds its repository by running git).
+#   Invoke-RepoTreeUnsteeredGit <args>  ONE git command with the CALLER's repository-
+#                                   selecting git variables removed. Every git call in
+#                                   this file goes through it.
 #   Enter-RepoTree      <tree>      ★ THE POINT OF THE FILE. Moves BOTH working
 #                                   directories PowerShell keeps, then PROVES they
 #                                   agree with git's.
@@ -120,6 +126,97 @@ function script:ConvertTo-RepoTreeComparable([string]$Path) {
     return $p.TrimEnd([IO.Path]::DirectorySeparatorChar).ToLowerInvariant()
 }
 
+$script:RepoTreeLocalGitVars = $null
+
+function script:Get-RepoTreeLocalGitVars {
+    # The names git calls repository-local (`git rev-parse --local-env-vars`), asked ONCE.
+    # ✔MEASURED 2026-09-15: that query answers (15 names) even with GIT_DIR pointing nowhere.
+    # ⚠ A list that does not name GIT_DIR is a COLLAPSE: without git's own list no git call
+    # here can be kept from the caller's environment, and a hand-typed list would be a second
+    # definition of a fact git owns.
+    if ($null -eq $script:RepoTreeLocalGitVars) {
+        $names = @(& git rev-parse --local-env-vars 2>$null | Where-Object { $_ -ne '' })
+        if ($names -notcontains 'GIT_DIR') {
+            throw [RepoTreeCollapse]::new("git rev-parse --local-env-vars did not name GIT_DIR (exit $LASTEXITCODE), so no git call here can be kept from the caller's git environment")
+        }
+        $script:RepoTreeLocalGitVars = $names
+    }
+    return $script:RepoTreeLocalGitVars
+}
+
+function Invoke-RepoTreeUnsteered {
+    <#
+    .SYNOPSIS
+    Run ONE command with every repository-selecting variable the CALLER exported REMOVED, then
+    put each back exactly as it was. `Invoke-RepoTreeUnsteeredGit` below is this owner, for git.
+
+    ★★ ANY COMMAND, NOT ONLY GIT: a program that runs git to find its own subject is steered by
+    the same variables. ✔MEASURED 2026-09-15 (P66 lane ge; gh 2.89.0, pwsh 7.6.6): `gh api
+    repos/:owner/:repo` run from this repository's root answered
+    `dailysoftwaresystems/dss-code-prime`, and HTTP 404 under another repository's GIT_DIR, and
+    again under GIT_DIR + GIT_WORK_TREE -- gh had resolved THAT repository's origin -- so
+    `check-ci-legs.ps1` asked about another repository's CI even when it was given the branch.
+
+    ⚠ STDERR IS THE CALLER'S, UNLESS `-DiscardStandardError` IS GIVEN, AND THE SWITCH IS NOT A
+    STYLE CHOICE. ✔MEASURED 2026-09-15 (pwsh 7.6.6): a `2>$null` on the native call INSIDE a
+    function discards its stderr even when the caller writes `2>&1`; without it, a caller's `2>&1`
+    receives the lines as ErrorRecords and a bare call prints them. So the git wrapper's contract
+    (stderr discarded) can only be kept by redirecting AT the call, which is what the switch does.
+    ⚠ `$Arguments` is ONE explicit array, for the reason `Invoke-RepoTreeGit` records. Returns
+    the command's output; `$LASTEXITCODE` is the command's. Self-test arms 17 and 18.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Command,
+        [string[]]$Arguments = @(),
+        [switch]$DiscardStandardError
+    )
+    $held = @{}
+    foreach ($name in (Get-RepoTreeLocalGitVars)) {
+        $item = Get-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        if ($null -ne $item) {
+            $held[$name] = [string]$item.Value
+            Remove-Item -LiteralPath "Env:$name"
+        }
+    }
+    try {
+        if ($DiscardStandardError) { & $Command @Arguments 2>$null } else { & $Command @Arguments }
+    } finally {
+        foreach ($name in $held.Keys) {
+            Set-Item -LiteralPath "Env:$name" -Value $held[$name]
+        }
+    }
+}
+
+function Invoke-RepoTreeUnsteeredGit {
+    <#
+    .SYNOPSIS
+    Run ONE git command with every repository-selecting variable the CALLER exported REMOVED,
+    then put each back exactly as it was. Every git call in this file goes through it.
+    ⓘ It is `Invoke-RepoTreeUnsteered` above with git's stderr discarded; its contract is the one
+    it had before the owner was generalised, and self-test arms 10 and 11 -- which predate that --
+    are the control.
+
+    ★★★ WHY. `git -C <dir>` moves git's working directory and nothing else: an exported
+    GIT_DIR, GIT_WORK_TREE or GIT_INDEX_FILE still decides which repository answers.
+    ✔MEASURED 2026-09-15 (P66 lane rr, round 2; pwsh 7.6.6, fixture repositories):
+      * `Invoke-RepoTreeGit <id> @('ls-files','-co','--exclude-standard')` listed a decoy
+        repository's file under its GIT_INDEX_FILE and under its GIT_DIR, and listed nothing
+        at all under an EMPTY-but-set GIT_INDEX_FILE -- an empty value steers too;
+      * `Get-RepoTreeOwningRoot` answered `<tree>\scripts\probe` under GIT_DIR alone, and the
+        OTHER repository under GIT_DIR + GIT_WORK_TREE.
+    A git hook exports GIT_INDEX_FILE to everything it runs, so a guard started from one is
+    exactly such a caller. The names are git's own list -- the set git clears itself when it
+    enters a submodule.
+    ⚠ `Remove-Item Env:`, NEVER `[Environment]::SetEnvironmentVariable($n, $null)` nor
+    `$env:X = ''`: ✔MEASURED on the same pwsh, both leave the variable SET TO EMPTY, and an
+    empty value is a steering value.
+    ⚠ Same argument contract as `Invoke-RepoTreeGit`: ONE explicit array. Returns git's output;
+    `$LASTEXITCODE` is git's.
+    #>
+    param([Parameter(Mandatory = $true)][string[]]$GitArgs)
+    Invoke-RepoTreeUnsteered -Command 'git' -Arguments $GitArgs -DiscardStandardError
+}
+
 function Get-RepoTreeIdentity {
     <#
     .SYNOPSIS
@@ -143,7 +240,7 @@ function Get-RepoTreeIdentity {
     }
 
     # The ordinary case: a real repository, or a worktree whose gitdir resolves here.
-    $sha = & git -C $root rev-parse HEAD 2>$null
+    $sha = Invoke-RepoTreeUnsteeredGit @('-C', $root, 'rev-parse', 'HEAD')
     if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($sha)) {
         return @{ Root = $root; GitDir = ''; Sha = $sha.Trim() }
     }
@@ -196,7 +293,7 @@ function Get-RepoTreeIdentity {
     }
     $gd = [IO.Path]::GetFullPath($gd).TrimEnd([IO.Path]::DirectorySeparatorChar)
 
-    $sha = & git --git-dir=$gd --work-tree=$root rev-parse HEAD 2>$null
+    $sha = Invoke-RepoTreeUnsteeredGit @("--git-dir=$gd", "--work-tree=$root", 'rev-parse', 'HEAD')
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($sha)) {
         throw [RepoTreeCollapse]::new("resolved the gitdir to $gd but git still cannot describe $root")
     }
@@ -233,7 +330,7 @@ function Invoke-RepoTreeGit {
     } else {
         @("--git-dir=$($Identity.GitDir)", "--work-tree=$($Identity.Root)")
     }
-    $out = & git @pre @GitArgs 2>$null
+    $out = Invoke-RepoTreeUnsteeredGit (@($pre) + @($GitArgs))
     if ($null -eq $out) { return @() }
     # ⚠ ORDINARY PIPELINE SEMANTICS -- `@(...)`, NEVER `,@(...)`, AND BOTH WRONG
     # ANSWERS WERE MEASURED HERE ON 2026-09-01 BEFORE THIS SETTLED.
@@ -285,6 +382,18 @@ function Get-RepoTreeOwningRoot {
     SUBMODULE checkout `--git-common-dir` names `<super>/.git/modules/<name>` and
     `git worktree list` names it too -- neither is a working tree, and rooting a
     removal there would aim it inside `.git`. `--show-toplevel` answers correctly.
+
+    ★★★ AND GIT'S ANSWER IS CHECKED AGAINST THE TREE THE PATH LIVES IN.
+    ✔MEASURED 2026-09-15 (P66 lane rr, fixtures; pwsh 7.6.6), each wrong answer returned with
+    no throw:
+        the caller exports GIT_DIR                    -> `<tree>\scripts\probe`, not a root
+        the caller exports GIT_DIR and GIT_WORK_TREE  -> the OTHER repository
+        an untracked DSS tree copied inside another checkout -> the OUTER checkout
+    ⇒ git is asked through `Invoke-RepoTreeUnsteeredGit`, and the rule the `.sh` twin and
+    `scripts/owning-tree/owning-tree.py` state is applied here too:
+        A = the nearest DSS tree holding the path (`.plans\` AND `scripts\`), if any
+        G = git's working tree for the path (case 1, else case 2)
+        no G -> throw · no A -> G · G is A, or inside A -> G · A inside G -> throw
     #>
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -300,29 +409,46 @@ function Get-RepoTreeOwningRoot {
         throw [RepoTreeCollapse]::new("no such directory for '$Path'")
     }
 
-    # 1. The ordinary case: ask git, but AT THE SCRIPT'S OWN DIRECTORY rather than at
-    #    the cwd. That relocation is the whole of the fix.
-    $top = & git -C $dir rev-parse --show-toplevel 2>$null
-    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($top)) {
-        return ([IO.Path]::GetFullPath($top.Trim()).TrimEnd([IO.Path]::DirectorySeparatorChar))
+    # G, case 1: ask git AT THE PATH'S OWN DIRECTORY rather than at the cwd, and without the
+    #    caller's git environment.
+    $git = $null
+    $top = Invoke-RepoTreeUnsteeredGit @('-C', $dir, 'rev-parse', '--show-toplevel')
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$top)) {
+        $git = [IO.Path]::GetFullPath(([string]$top).Trim()).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    } else {
+        # G, case 2: a worktree whose `.git` FILE names a gitdir THIS namespace cannot follow.
+        #    `git -C` fails outright there, so walk up to the directory that HOLDS the `.git`
+        #    and let `Get-RepoTreeIdentity` prove it can describe it -- the directory holding a
+        #    resolvable `.git` IS the root.
+        $cur = $dir
+        while ($true) {
+            if (Test-Path -LiteralPath (Join-Path $cur '.git')) {
+                $ok = $true
+                try { $null = Get-RepoTreeIdentity $cur } catch { $ok = $false }
+                if ($ok) { $git = $cur; break }
+            }
+            $up = [IO.Path]::GetDirectoryName($cur)
+            if ([string]::IsNullOrEmpty($up) -or $up -eq $cur) { break }
+            $cur = $up
+        }
     }
+    if ($null -eq $git) { throw [RepoTreeCollapse]::new("no git working tree contains '$Path'") }
 
-    # 2. A worktree whose `.git` FILE names a gitdir THIS namespace cannot follow.
-    #    `git -C` fails outright there, so walk up to the directory that HOLDS the
-    #    `.git` and let `Get-RepoTreeIdentity` prove it can describe it -- the
-    #    directory holding a resolvable `.git` IS the root.
+    # A, and the rule in the synopsis.
+    $dss = $null
     $cur = $dir
     while ($true) {
-        if (Test-Path -LiteralPath (Join-Path $cur '.git')) {
-            $ok = $true
-            try { $null = Get-RepoTreeIdentity $cur } catch { $ok = $false }
-            if ($ok) { return $cur }
-        }
+        if ((Test-Path -LiteralPath (Join-Path $cur '.plans') -PathType Container) -and
+            (Test-Path -LiteralPath (Join-Path $cur 'scripts') -PathType Container)) { $dss = $cur; break }
         $up = [IO.Path]::GetDirectoryName($cur)
         if ([string]::IsNullOrEmpty($up) -or $up -eq $cur) { break }
         $cur = $up
     }
-    throw [RepoTreeCollapse]::new("no git working tree contains '$Path'")
+    if ($null -eq $dss) { return $git }
+    $cg = ConvertTo-RepoTreeComparable $git
+    $ca = ConvertTo-RepoTreeComparable $dss
+    if ($cg -eq $ca -or $cg.StartsWith($ca + [IO.Path]::DirectorySeparatorChar, [StringComparison]::Ordinal)) { return $git }
+    throw [RepoTreeCollapse]::new("'$dss' is a DSS tree nested inside the checkout '$git', which it is not the root of. git answers for the enclosing checkout there, so no owning root is named.")
 }
 
 function Assert-RepoTreeOneRoot {
@@ -440,6 +566,11 @@ function script:Remove-RepoTreeSandbox([string]$Dir) {
     Remove-Item -LiteralPath $real -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+function script:Test-RepoTreeSamePath($A, $B) {
+    if ([string]::IsNullOrWhiteSpace([string]$A) -or [string]::IsNullOrWhiteSpace([string]$B)) { return $false }
+    return ((ConvertTo-RepoTreeComparable ([string]$A)) -eq (ConvertTo-RepoTreeComparable ([string]$B)))
+}
+
 function Invoke-RepoTreeSelfTest {
     $fail = 0
     $box = $null
@@ -555,6 +686,175 @@ function Invoke-RepoTreeSelfTest {
             Write-Host "repo-tree: FAIL - arm 9: an already-absolute path was re-rooted."
             $fail = 1
         }
+
+        # ══ THE CALLER'S GIT ENVIRONMENT, AND WHICH TREE A PATH BELONGS TO (P66 lane rr) ══
+        # ★ Every steering arm proves its negative first: the same query through a bare `& git`
+        # under the same environment must reach the other repository, or the arm fails saying so.
+        $decoy = Join-Path $box 'decoy'
+        & git init -q $decoy 2>&1 | Out-Null
+        [IO.File]::WriteAllText((Join-Path $decoy 'zz-steer-decoy.txt'), "d`n")
+        & git -C $decoy add zz-steer-decoy.txt 2>&1 | Out-Null
+        & git -C $decoy -c user.email=selftest@example.invalid -c user.name=repo-tree commit -q --no-verify -m decoy 2>&1 | Out-Null
+
+        # ARM 10 - Invoke-RepoTreeGit IGNORES a caller's GIT_INDEX_FILE, and a caller's GIT_DIR.
+        foreach ($steer in @(@{ N = 'GIT_INDEX_FILE'; V = (Join-Path $decoy '.git/index') },
+                             @{ N = 'GIT_DIR'; V = (Join-Path $decoy '.git') })) {
+            Set-Item -LiteralPath "Env:$($steer.N)" -Value $steer.V
+            try {
+                $raw = @(& git -C $main ls-files -co --exclude-standard 2>$null | Where-Object { $_ -match 'zz-steer-decoy' })
+                $got = @(Invoke-RepoTreeGit $idMain @('ls-files', '-co', '--exclude-standard'))
+            } finally { Remove-Item -LiteralPath "Env:$($steer.N)" -ErrorAction SilentlyContinue }
+            $listed = @($got | Where-Object { $_ -match 'zz-steer-decoy' }).Count
+            if ($raw.Count -lt 1 -or $listed -ne 0 -or $got -notcontains 'witness.txt') {
+                Write-Host "repo-tree: FAIL - arm 10 ($($steer.N)): Invoke-RepoTreeGit listed the other repository's file $listed time(s) and witness.txt $(@($got | Where-Object { $_ -eq 'witness.txt' }).Count) time(s); a bare git listed the other repository's file $($raw.Count) time(s), and 0 there means the negative never materialised."
+                $fail = 1
+            }
+        }
+
+        # ARM 11 - and the caller's environment is PUT BACK exactly: a value kept, an absence kept.
+        $env:GIT_WORK_TREE = 'repo-tree-held-value'
+        $before = @{}; $after = @{}; $inside = $null
+        try {
+            foreach ($n in (Get-RepoTreeLocalGitVars)) {
+                $i = Get-Item -LiteralPath "Env:$n" -ErrorAction SilentlyContinue
+                $before[$n] = if ($null -eq $i) { '<absent>' } else { "=$($i.Value)" }
+            }
+            $inside = Invoke-RepoTreeUnsteeredGit @('-C', $main, 'rev-parse', '--show-toplevel')
+            foreach ($n in (Get-RepoTreeLocalGitVars)) {
+                $i = Get-Item -LiteralPath "Env:$n" -ErrorAction SilentlyContinue
+                $after[$n] = if ($null -eq $i) { '<absent>' } else { "=$($i.Value)" }
+            }
+        } finally { Remove-Item -LiteralPath Env:GIT_WORK_TREE -ErrorAction SilentlyContinue }
+        $drift = @($before.Keys | Where-Object { $before[$_] -ne $after[$_] })
+        if ($drift.Count -gt 0 -or $before['GIT_WORK_TREE'] -ne '=repo-tree-held-value' -or -not (Test-RepoTreeSamePath $inside $main)) {
+            Write-Host "repo-tree: FAIL - arm 11: after Invoke-RepoTreeUnsteeredGit the caller's git environment drifted on [$($drift -join ', ')], or git inside answered '$inside' rather than '$main' while GIT_WORK_TREE was held."
+            $fail = 1
+        }
+
+        # A DSS-shaped tree that is its own repository, and another repository.
+        $dss = Join-Path $box 'dss'
+        $null = New-Item -ItemType Directory -Path (Join-Path $dss '.plans'), (Join-Path $dss 'scripts/probe')
+        [IO.File]::WriteAllText((Join-Path $dss 'scripts/probe/probe.ps1'), "# probe`n")
+        & git init -q $dss 2>&1 | Out-Null
+        $foreign = Join-Path $box 'foreign'
+        & git init -q $foreign 2>&1 | Out-Null
+        $probeDir = Join-Path $dss 'scripts/probe'
+        $probe = Join-Path $probeDir 'probe.ps1'
+
+        # ARM 12 - CONTROL: the owning root of a path in that tree is the tree.
+        $got = $null; $why = ''
+        try { $got = Get-RepoTreeOwningRoot $probe } catch { $why = $_.Exception.Message }
+        if (-not (Test-RepoTreeSamePath $got $dss)) {
+            Write-Host "repo-tree: FAIL - arm 12 (control): Get-RepoTreeOwningRoot answered '$got' $why for a path in '$dss'."
+            $fail = 1
+        }
+
+        # ARM 13 - under a caller's GIT_DIR, and GIT_DIR + GIT_WORK_TREE, it is STILL the tree.
+        foreach ($steer in @(@{ L = 'GIT_DIR'; E = @{ GIT_DIR = (Join-Path $foreign '.git') } },
+                             @{ L = 'GIT_DIR + GIT_WORK_TREE'; E = @{ GIT_DIR = (Join-Path $foreign '.git'); GIT_WORK_TREE = $foreign } })) {
+            foreach ($k in @($steer.E.Keys)) { Set-Item -LiteralPath "Env:$k" -Value $steer.E[$k] }
+            $got = $null; $why = ''; $raw = $null
+            try {
+                $raw = & git -C $probeDir rev-parse --show-toplevel 2>$null
+                try { $got = Get-RepoTreeOwningRoot $probe } catch { $why = $_.Exception.Message }
+            } finally { foreach ($k in @($steer.E.Keys)) { Remove-Item -LiteralPath "Env:$k" -ErrorAction SilentlyContinue } }
+            if ([string]::IsNullOrWhiteSpace([string]$raw) -or (Test-RepoTreeSamePath $raw $dss) -or -not (Test-RepoTreeSamePath $got $dss)) {
+                Write-Host "repo-tree: FAIL - arm 13 ($($steer.L)): Get-RepoTreeOwningRoot answered '$got' $why for a path in '$dss'; a bare git answered '$raw', which must name some OTHER directory for this arm to mean anything."
+                $fail = 1
+            }
+        }
+
+        # ARM 14 - an untracked DSS tree copied INSIDE another checkout is REFUSED.
+        $outer = Join-Path $box 'outer'
+        & git init -q $outer 2>&1 | Out-Null
+        $copy = Join-Path $outer '.temp/copy'
+        $null = New-Item -ItemType Directory -Path (Join-Path $copy '.plans'), (Join-Path $copy 'scripts/probe')
+        [IO.File]::WriteAllText((Join-Path $copy 'scripts/probe/probe.ps1'), "# probe`n")
+        $raw = & git -C (Join-Path $copy 'scripts/probe') rev-parse --show-toplevel 2>$null
+        $got = $null; $why = ''
+        try { $got = Get-RepoTreeOwningRoot (Join-Path $copy 'scripts/probe/probe.ps1') } catch { $why = $_.Exception.Message }
+        if (-not (Test-RepoTreeSamePath $raw $outer) -or $null -ne $got -or $why -notmatch 'nested inside the checkout') {
+            Write-Host "repo-tree: FAIL - arm 14: for an untracked DSS tree inside another checkout Get-RepoTreeOwningRoot answered '$got' ($why); a bare git answered '$raw' and must name the OUTER checkout '$outer' for this arm to mean anything."
+            $fail = 1
+        }
+
+        # ARM 15 - a plain repository with no DSS tree around it is still answered (lane-worktree's -Repo).
+        $got = $null; $why = ''
+        try { $got = Get-RepoTreeOwningRoot $foreign } catch { $why = $_.Exception.Message }
+        if (-not (Test-RepoTreeSamePath $got $foreign)) {
+            Write-Host "repo-tree: FAIL - arm 15: a plain repository resolved to '$got' $why, not '$foreign'."
+            $fail = 1
+        }
+
+        # ARM 16 - a repository nested INSIDE a DSS tree is its own working tree.
+        $inner = Join-Path $dss '.temp/inner'
+        $null = New-Item -ItemType Directory -Path $inner
+        & git init -q $inner 2>&1 | Out-Null
+        $got = $null; $why = ''
+        try { $got = Get-RepoTreeOwningRoot $inner } catch { $why = $_.Exception.Message }
+        if (-not (Test-RepoTreeSamePath $got $inner)) {
+            Write-Host "repo-tree: FAIL - arm 16: a repository nested inside a DSS tree resolved to '$got' $why, not '$inner'."
+            $fail = 1
+        }
+
+        # ══ THE OWNER RUNS ANY COMMAND UNSTEERED, NOT ONLY GIT (P66 lane ge) ══
+        # ARM 17 - Invoke-RepoTreeUnsteered runs a NON-git command with the caller's GIT_DIR,
+        # GIT_WORK_TREE and GIT_INDEX_FILE removed, hands back its exit status, and puts the
+        # caller's values back. A child pwsh stands in for gh, which resolves its repository by
+        # running git. The negative is the same child launched bare under the same environment.
+        $pw17 = script:Get-RepoTreePwsh
+        $probe17 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(
+            '$s = foreach ($n in @(''GIT_DIR'', ''GIT_WORK_TREE'', ''GIT_INDEX_FILE'')) { if (Test-Path -LiteralPath ("Env:" + $n)) { "$n=set" } else { "$n=unset" } }; Write-Output ($s -join '' ''); exit 7'))
+        $steer17 = @{ GIT_DIR = (Join-Path $decoy '.git'); GIT_WORK_TREE = $decoy; GIT_INDEX_FILE = (Join-Path $decoy '.git/index') }
+        $raw17 = $null; $got17 = $null; $rc17 = $null; $lost17 = @('<not measured>')
+        foreach ($k in @($steer17.Keys)) { Set-Item -LiteralPath "Env:$k" -Value $steer17[$k] }
+        try {
+            $raw17 = @(& $pw17 -NoProfile -EncodedCommand $probe17) | Select-Object -Last 1
+            $got17 = @(Invoke-RepoTreeUnsteered -Command $pw17 -Arguments @('-NoProfile', '-EncodedCommand', $probe17)) | Select-Object -Last 1
+            $rc17 = $LASTEXITCODE
+            $lost17 = @($steer17.Keys | Where-Object { [string](Get-Item -LiteralPath "Env:$_" -ErrorAction SilentlyContinue).Value -ne $steer17[$_] })
+        } finally { foreach ($k in @($steer17.Keys)) { Remove-Item -LiteralPath "Env:$k" -ErrorAction SilentlyContinue } }
+        if ($raw17 -ne 'GIT_DIR=set GIT_WORK_TREE=set GIT_INDEX_FILE=set' -or
+            $got17 -ne 'GIT_DIR=unset GIT_WORK_TREE=unset GIT_INDEX_FILE=unset' -or $rc17 -ne 7 -or $lost17.Count -ne 0) {
+            Write-Host "repo-tree: FAIL - arm 17: through Invoke-RepoTreeUnsteered a non-git child saw '$got17' and exited $rc17 (expected all three unset, exit 7); launched bare it saw '$raw17' (all three set is the negative); caller values not put back: [$($lost17 -join ', ')]."
+            $fail = 1
+        }
+
+        # ARM 18 - THE STDERR CONTRACT. Invoke-RepoTreeUnsteeredGit still DISCARDS git's stderr,
+        # even under a caller's 2>&1; Invoke-RepoTreeUnsteered leaves it to its caller unless
+        # -DiscardStandardError is given. The negative is the owner without the switch: git's
+        # stderr must reach that caller, or the empty captures prove nothing.
+        $missing18 = Join-Path $box 'no-such-directory'
+        $wrap18 = @(Invoke-RepoTreeUnsteeredGit @('-C', $missing18, 'rev-parse', 'HEAD') 2>&1)
+        $rcWrap18 = $LASTEXITCODE
+        $open18 = @(Invoke-RepoTreeUnsteered -Command 'git' -Arguments @('-C', $missing18, 'rev-parse', 'HEAD') 2>&1 |
+                    Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
+        $shut18 = @(Invoke-RepoTreeUnsteered -Command 'git' -Arguments @('-C', $missing18, 'rev-parse', 'HEAD') -DiscardStandardError 2>&1)
+        if ($open18.Count -lt 1 -or $wrap18.Count -ne 0 -or $rcWrap18 -eq 0 -or $shut18.Count -ne 0) {
+            Write-Host "repo-tree: FAIL - arm 18: git's stderr reached a 2>&1 caller $($wrap18.Count) time(s) through Invoke-RepoTreeUnsteeredGit (exit $rcWrap18, must be non-zero) and $($shut18.Count) time(s) through the owner with -DiscardStandardError, both expected 0; without the switch it reached that caller $($open18.Count) time(s), and 0 there means the negative never materialised."
+            $fail = 1
+        }
+
+        # ══ THE CHILD PROBE'S OWN VERDICT PATH (P66 exit gate) ══
+        # Each arm catches its own throw and names itself: a probe that throws is a finding about
+        # THAT arm, and must not collapse every arm after it into one unattributed line.
+        # ARM 19 - CONTROL: a child that exits 0 and answers comes back as exactly its answer.
+        $got19 = $null; $why19 = ''
+        try { $got19 = script:Invoke-RepoTreeProbe -Cwd $main -Tree $lane -Mode 'echo' } catch { $why19 = $_.Exception.Message }
+        if ($why19 -ne '' -or $got19 -ne 'PROBE-ECHO') {
+            Write-Host "repo-tree: FAIL - arm 19 (control): a child that exits 0 printing PROBE-ECHO came back as '$got19'$(if ($why19) { " and the probe THREW: $why19" }). Arm 20 cannot be read without this."
+            $fail = 1
+        }
+
+        # ARM 20 - a child that exits NON-ZERO and writes NOTHING comes back as a CHILD-EXIT verdict
+        # naming its exit code and both (empty) streams -- never as a throw. That child is the shape
+        # that collapsed this whole self-test in P66's eight-run gate.
+        $got20 = $null; $why20 = ''
+        try { $got20 = script:Invoke-RepoTreeProbe -Cwd $main -Tree $lane -Mode 'exit-silent' } catch { $why20 = $_.Exception.Message }
+        if ($why20 -ne '' -or $got20 -ne "CHILD-EXIT-3: stdout='' stderr=''") {
+            Write-Host "repo-tree: FAIL - arm 20: a child that exited 3 with both streams empty came back as '$got20'$(if ($why20) { " and the probe THREW: $why20" }); expected exactly CHILD-EXIT-3 naming both streams empty."
+            $fail = 1
+        }
     } catch {
         Write-Host "repo-tree: FAIL - selftest collapsed: $($_.Exception.Message)"
         $fail = 2
@@ -569,7 +869,7 @@ function Invoke-RepoTreeSelfTest {
         $env:GIT_CONFIG_SYSTEM = $null
     }
     if ($fail -eq 0) {
-        Write-Host "repo-tree: self-test OK - 9 arms (ordinary checkout leaves the common path alone, a worktree-shaped tree resolves without the mangled join, the wrong-root read is PINNED with a control that reproduces it, the one-root proof refuses a split and passes a sound one, two refusal arms, path rooting); this owner is PROVEN able to fail."
+        Write-Host "repo-tree: self-test OK - 20 arms (ordinary checkout leaves the common path alone, a worktree-shaped tree resolves without the mangled join, the wrong-root read is PINNED with a control that reproduces it, the one-root proof refuses a split and passes a sound one, two refusal arms, path rooting, a caller's GIT_INDEX_FILE and GIT_DIR reach no git call and the caller's environment is put back exactly, the owning root is the tree a path lives in under GIT_DIR and GIT_DIR + GIT_WORK_TREE, refused for a nested untracked copy, answered for a plain repository and for a repository nested in a tree, and the unsteered owner runs a NON-git command with the caller's git variables removed and its exit status kept, while the git wrapper still discards git's stderr, and a child that exits non-zero with both streams empty comes back as a CHILD-EXIT verdict naming its exit code, beside a control that reads an ordinary child); this owner is PROVEN able to fail."
     }
     return $fail
 }
@@ -631,6 +931,14 @@ try {
             try { Assert-RepoTreeOneRoot `$id; Write-Output 'OK' }
             catch { Write-Output "REFUSED: `$(`$_.Exception.Message)" }
         }
+        'echo' {
+            # Arm 19, the control: a child that exits 0 and answers.
+            Write-Output 'PROBE-ECHO'
+        }
+        'exit-silent' {
+            # Arm 20: a child that exits NON-ZERO and writes nothing to either stream.
+            exit 3
+        }
     }
 } catch { Write-Output "THREW: `$(`$_.Exception.Message)" }
 "@
@@ -642,10 +950,30 @@ try {
                        -ArgumentList @('-NoProfile', '-File', $script) `
                        -WorkingDirectory $Cwd -Wait -PassThru `
                        -RedirectStandardOutput $out -RedirectStandardError $err
-    if ($p.ExitCode -ne 0) {
-        return "CHILD-EXIT-$($p.ExitCode): " + ((Get-Content -LiteralPath $err -Raw -ErrorAction SilentlyContinue) -replace '\s+', ' ').Trim()
+    # ★★ THE VERDICT PATH IS TOTAL: whatever the child did, ONE string comes back and nothing
+    # throws. A child that did not exit 0 is `CHILD-EXIT-<code>` carrying BOTH its streams, so
+    # the arm that asked reports the evidence, instead of the whole self-test collapsing on it.
+    # ✔MEASURED 2026-09-15 (P66's eight-run gate, Windows Debug, ctest -j 8): repo_tree_guard
+    # failed in 2.76 s (5.7 to 18.3 s whenever it passed, locally and on CI) with *selftest
+    # collapsed: Method invocation failed because [System.Object[]] does not contain a method
+    # named 'Trim'*. The failure path was `((Get-Content $err -Raw) -replace '\s+', ' ').Trim()`:
+    # over an EMPTY or a MISSING file `Get-Content -Raw` yields nothing, `-replace` over nothing
+    # yields an EMPTY ARRAY, and `.Trim()` on an empty array throws exactly that (pwsh 7.6.6, with
+    # and without StrictMode). So a child had not exited 0 and had written nothing to stderr, and
+    # the exit code and the stdout that could have said why were discarded with it.
+    # ⚠ `$p.ExitCode` reads as $null, WITHOUT an exception, while the child has not exited
+    # (✔MEASURED, same pwsh), and `$null -ne 0` is true. So "has not exited" and "exited
+    # non-zero" both land here, and the verdict says which of the two it was.
+    # ⚠ Both reads are cast to [string] first: `[string]` of nothing is '', and only a string can
+    # be trimmed without first asking what kind of nothing came back.
+    $stdout = [string](Get-Content -LiteralPath $out -Raw -ErrorAction SilentlyContinue)
+    $stderr = [string](Get-Content -LiteralPath $err -Raw -ErrorAction SilentlyContinue)
+    $code = $p.ExitCode
+    if ($code -ne 0) {
+        $exitText = if ($null -eq $code) { "UNREAD (HasExited=$($p.HasExited))" } else { [string]$code }
+        return "CHILD-EXIT-${exitText}: stdout='$(($stdout -replace '\s+', ' ').Trim())' stderr='$(($stderr -replace '\s+', ' ').Trim())'"
     }
-    return ((Get-Content -LiteralPath $out -Raw -ErrorAction SilentlyContinue) + '').Trim()
+    return $stdout.Trim()
 }
 
 # ── entry point ─────────────────────────────────────────────────────────────────

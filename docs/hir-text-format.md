@@ -142,7 +142,7 @@ int sum_fields(struct Point *p) {
 ```
 
 ```
-dsshir 3
+dsshir 4
 producer "0.0.2+gcd1331ebc3ef.dirty922bae8971de8a1b"
 buffers {
   buf 1 "/work/doc_example.c"
@@ -192,7 +192,11 @@ stmt       := block | if | while | do | for | switch
 expr       := lit | ref | call | intrinsic | binop | unop | cast | member
             | index | swizzle | construct | ternary | logical_and
             | logical_or | sizeof | alignof | addressof | deref | typeref
-            | ext_node | error
+            | rmw | ext_node | error
+rmw        := "rmw" flags? SYM ":" type "(" expr "," expr ")"
+              (an indivisible read-modify-write: the object's lvalue, then the
+               update, which reads the observed value as `ref SYM`; yields the
+               value the object held before the replacement that took effect)
 type       := (see docs/ir-type-text.md — one grammar, one decoder)
 ```
 
@@ -201,7 +205,7 @@ Sections are emitted **only when non-empty**, in the order shown. The two header
 
 ### 4.1 `dsshir <version>` — the format version
 
-The first line. **Currently `3`.** A reader that does not understand the version must **refuse**,
+The first line. **Currently `4`.** A reader that does not understand the version must **refuse**,
 not guess. Our own parser does exactly that: a version it does not know is a hard
 `H_TextVersionMismatch` error and no module is produced.
 
@@ -419,12 +423,13 @@ program. Output:
 dsshir-kinds 1
 dsshir-format-version 2
 producer "0.0.2+gcd1331ebc3ef.dirty922bae8971de8a1b"
-core-kind-count 53
+core-kind-count 54
 kind "Module" position non-expr typed no symbol no
 kind "Function" position non-expr typed yes symbol yes
 kind "Literal" position expr keyword "lit" typed yes symbol no
 kind "Ref" position expr keyword "ref" typed yes symbol yes
 ...
+kind "ReadModifyWrite" position expr keyword "rmw" typed yes symbol yes
 stmt-keyword "var"
 stmt-keyword "param"
 ...
@@ -469,7 +474,10 @@ window.** Concretely:
    composite marker and the `rec <H>` type head (§5.1): a v2 reader meeting
    `struct "Node" rec 1 {i32, ptr<rec 1>}` would meet a token it has no rule for — which is the
    correct outcome, and precisely why the number has to move. The alternative is a reader that skips
-   what it does not recognise and rebuilds a `Node` with no `next`.
+   what it does not recognise and rebuilds a `Node` with no `next`. **v4** added the `rmw` expression
+   (an indivisible read-modify-write of an `_Atomic` object, §4): a v3 reader meeting it has no rule
+   for the keyword — and one that skipped it would rebuild `x += v` as the separate load and store
+   whose lost updates the node exists to prevent.
 3. **We do not maintain a compatibility window.** This build understands **one** version and refuses
    every other, in both directions — a v1 file is refused by a v2 parser just as a v3 file is. One
    grammar, no conditional parsing, no "mostly works".
@@ -478,7 +486,7 @@ window.** Concretely:
    and plan to re-emit rather than to migrate files.
 5. **After C++ lands the format is expected to stabilise** and bumps to become rare.
 
-**What is stable today** (as stable as anything in a `3`): the mode and its exit-code contract, the
+**What is stable today** (as stable as anything in a `4`): the mode and its exit-code contract, the
 two header lines and their order, the section order, the type syntax (shared with FFI descriptors,
 see [`ir-type-text.md`](./ir-type-text.md)), and the self-containment rules in §5.
 

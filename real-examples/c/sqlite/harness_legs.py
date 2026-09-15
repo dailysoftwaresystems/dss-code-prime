@@ -1500,6 +1500,374 @@ def probe_verdict_honours(verdict):
     return verdict == "present"
 
 
+def probe_verdict_arms(verdict):
+    """Does this PRE-RUN verdict arm a row whose probe decides PER FAILURE?
+
+    `present` and `absent` both mean the instrument READ this kernel's clocks, so
+    the monitor that spans the corpus can gather evidence there; `indeterminate`
+    (no instrument, a clock that could not be read, a kernel that could not be
+    entered) leaves the row unarmed and every failure it would match GENUINE.
+
+    ★★ WHY `absent` ARMS, AND IT IS THE WHOLE FIX. The verdict is a 20 s sample of
+    a clock whose steps it can neither predict nor see: ✔MEASURED 2026-09-14, a
+    loaded run sampled ABSENT and then charged walsetlk failures to DSS, while the
+    quiet run sampled PRESENT and excused the same failures — and on 2026-09-15 the
+    250 ms sampler registered 16 of 17 excursions the kernel notification reported.
+    Letting that sample decide, in either direction, is the defect.
+    ANCHOR, ONE LINE, DO NOT WRAP:
+    D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN
+    """
+    if verdict not in PROBE_VERDICTS:
+        raise LegError(
+            "unknown probe verdict %r (known: %s). Whether a row is armed decides "
+            "whether its failures can be excused at all; an unrecognised verdict "
+            "cannot be read as one that arms it." % (verdict, ", ".join(PROBE_VERDICTS)))
+    return verdict in ("present", "absent")
+
+
+# ── READING THE MONITOR'S TIMELINE AGAINST ONE FAILURE ─────────────────────
+#
+# [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+# The monitor, its record format and the two sound bounds that place a step in a
+# failure's window are described at `execution_monitor_loop` (the EXECUTION
+# EVIDENCE header). Everything below is PURE — text and bytes in, verdicts out — so
+# --self-test drives every arm, and ONE implementation serves both drivers, the
+# same argument `classify_abort_decisions` makes for aborts.
+EXECUTION_RECORD_KINDS = ("armed", "step", "set", "heartbeat", "log-shrank",
+                          "stopped")
+_EXECUTION_OBS_KEYS = ("sizeBefore", "sizeAfter", "reference", "offset")
+
+
+def _execution_obs_ok(obs):
+    return (isinstance(obs, dict) and all(k in obs for k in _EXECUTION_OBS_KEYS)
+            and isinstance(obs["sizeBefore"], int)
+            and isinstance(obs["sizeAfter"], int))
+
+
+def read_execution_timeline(text, probe):
+    """One monitor timeline, VALIDATED, or a LegError saying why it is not evidence.
+
+    ⚠ EVERY REFUSAL HERE IS A FAILURE THAT STAYS GENUINE, never a crash: the caller
+    turns the LegError into "no usable timeline" for the windows it would have
+    decided. A torn LAST line is the one tolerated defect — a killed monitor stops
+    mid-write — and the prefix before it stands, because every record in it was
+    flushed whole."""
+    lines = (text or "").split("\n")
+    records = []
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            if all(not rest.strip() for rest in lines[i + 1:]):
+                break
+            raise LegError("line %d is not a JSON record" % (i + 1))
+        if not isinstance(rec, dict) or rec.get("schema") != EXECUTION_TIMELINE_SCHEMA:
+            raise LegError("line %d is not a schema-%d timeline record"
+                           % (i + 1, EXECUTION_TIMELINE_SCHEMA))
+        if rec.get("kind") not in EXECUTION_RECORD_KINDS:
+            raise LegError("line %d is an unknown record kind %r (known: %s)"
+                           % (i + 1, rec.get("kind"),
+                              ", ".join(EXECUTION_RECORD_KINDS)))
+        records.append(rec)
+    if not records or records[0]["kind"] != "armed":
+        raise LegError("its first record is not `armed`, so nothing says when the "
+                       "monitor began watching")
+    armed = records[0]
+    if armed.get("probe") != probe:
+        raise LegError("it was written for probe %r, not %r"
+                       % (armed.get("probe"), probe))
+    if not _execution_obs_ok(armed.get("obs")):
+        raise LegError("its `armed` record carries no well-formed observation")
+    if armed["obs"]["sizeBefore"] != 0:
+        raise LegError(
+            "the monitor armed on a log already holding %d byte(s). Both drivers "
+            "empty a segment log BEFORE starting its monitor, so a non-empty one is "
+            "either a stale file or a fixture that started first, and in both cases "
+            "no byte offset in it can be placed in time" % armed["obs"]["sizeBefore"])
+    steps, set_records, stopped = [], [], None
+    covered = armed["obs"]["sizeBefore"]
+    for rec in records[1:]:
+        kind = rec["kind"]
+        if kind == "armed":
+            raise LegError("a second `armed` record: two monitors wrote one timeline")
+        if kind == "log-shrank":
+            raise LegError("the watched log SHRANK while it was watched, so its byte "
+                           "offsets name two different files")
+        if kind in ("step", "set"):
+            if (not _execution_obs_ok(rec.get("before"))
+                    or not _execution_obs_ok(rec.get("after"))
+                    or not isinstance(rec.get("delta"), (int, float))):
+                raise LegError("a `%s` record without both observations and a "
+                               "delta" % kind)
+            if kind == "step":
+                steps.append(rec)
+            else:
+                set_records.append(rec)
+            covered = max(covered, rec["before"]["sizeBefore"],
+                          rec["after"]["sizeBefore"])
+        elif kind == "heartbeat":
+            if not _execution_obs_ok(rec.get("obs")):
+                raise LegError("a `heartbeat` record without an observation")
+            covered = max(covered, rec["obs"]["sizeBefore"])
+        elif kind == "stopped":
+            stopped = rec
+            if _execution_obs_ok(rec.get("obs")):
+                covered = max(covered, rec["obs"]["sizeBefore"])
+    return {"probe": probe, "instrument": str(armed.get("instrument", "")),
+            "instrumentWhy": str(armed.get("instrumentWhy", "")),
+            "steps": steps, "sets": len(set_records), "setRecords": set_records,
+            "stopped": stopped,
+            # The most of the log any observation SAW EXIST: an observation whose
+            # size-before reached a verdict's offset happened after that verdict
+            # was written, so the monitor was watching through that window.
+            "coveredThrough": covered}
+
+
+_UNIT_VERDICT_EXPECTED_RE = re.compile(rb"^! (\S+) expected:")
+_UNIT_NAME_DOTS_RE = re.compile(rb"^(\S+)\.\.\.")
+_CORPUS_FILE_TIME_RE = re.compile(rb"^Time: \S+ \d+ ms$")
+
+
+def unit_verdict_occurrences(log_bytes, names):
+    """{name: [{verdictOffset, fileStart}]} — every place each named unit FAILED in
+    one segment log, as BYTE offsets, with the offset its test file's output began.
+
+    A failure is written by tester.tcl's do_test as `! <name> expected: …` (the
+    offset of that line is the verdict), or, for a Tcl error, as `<name>...`
+    followed by an `Error: …` line (the offset of the Error line). A file's output
+    begins just past the previous file's `Time: <file> <ms> ms` line, or at byte 0
+    of the segment. The summary line `!Failures on these tests:` is NOT a verdict
+    and matches neither rule. Bytes, never decoded text, because an offset into a
+    decoded string is not an offset into the file the monitor measured."""
+    wanted = {}
+    for n in names:
+        wanted[n.encode("utf-8", "surrogateescape")] = n
+    found = dict((n, []) for n in names)
+    pos, total = 0, len(log_bytes)
+    file_start, last_name = 0, None
+    while pos < total:
+        nl = log_bytes.find(b"\n", pos)
+        nxt = total if nl < 0 else nl + 1
+        line = log_bytes[pos:nxt].rstrip(b"\r\n")
+        if _CORPUS_FILE_TIME_RE.match(line):
+            file_start, last_name = nxt, None
+        else:
+            m = _UNIT_VERDICT_EXPECTED_RE.match(line)
+            if m:
+                if m.group(1) in wanted:
+                    found[wanted[m.group(1)]].append(
+                        {"verdictOffset": pos, "fileStart": file_start})
+                last_name = None
+            elif line.startswith(b"Error: "):
+                if last_name in wanted:
+                    found[wanted[last_name]].append(
+                        {"verdictOffset": pos, "fileStart": file_start})
+                last_name = None
+            else:
+                d = _UNIT_NAME_DOTS_RE.match(line)
+                if d:
+                    last_name = d.group(1)
+                elif line.strip():
+                    last_name = None
+        pos = nxt
+    return found
+
+
+def _read_file_bytes(path):
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def _read_file_text(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def attribute_unit_failures(leg, catalogue_doc, evidence_wires, failures,
+                            segment_logs, tier_prefixes=(), leg_mode="native",
+                            read_bytes=None, read_text=None):
+    """[{name, verdict, wire, why}] — for every failure, EXCUSED only when EVERY
+    place it failed carries at least `minStepsInFailureWindow` qualifying steps of
+    EVERY probe its row requires, inside that place's own execution window; GENUINE
+    in every other case, with the reason — and a GENUINE reason never calls an
+    absence of steps MEASURED while an unmeasured SET sits in the same window.
+
+    `evidence_wires` are the plan's `confoundsByEvidence` for this leg, i.e. rows
+    the pre-run verdict ARMED; a wire naming anything else is REFUSED, because an
+    unconditional or unknown row handed to a per-failure reading is a transport
+    defect, and reading it either way would decide on a row nobody armed.
+    `failures` are the names the by-name matcher did NOT excuse. Name matching is
+    the drivers' own: the pattern against the name as reported and with the tier's
+    declared prefix removed, and a `scope`d pattern only on its own run mode."""
+    label = leg.get("label", "<unlabelled>")
+    read_bytes = read_bytes or _read_file_bytes
+    read_text = read_text or _read_file_text
+    if leg_mode not in CONFOUND_SCOPES:
+        raise LegError("leg mode %r is not one of %s" % (leg_mode,
+                                                          ", ".join(CONFOUND_SCOPES)))
+    probes = environment_probes(catalogue_doc)
+    rows = []
+    for wire in evidence_wires:
+        scope, rx = "", wire
+        for s in CONFOUND_SCOPES:
+            if wire.startswith(s + ":"):
+                scope, rx = s, wire[len(s) + 1:]
+                break
+        row = None
+        for cand in leg.get("confounds", []):
+            if cand.get("pattern") == rx and cand.get("scope", "") == scope:
+                row = cand
+                break
+        if row is None:
+            raise LegError("[%s] evidence pattern %r names no confound row on this "
+                           "leg" % (label, wire))
+        if confound_match_kind(row) != "unit" or not row.get("requires"):
+            raise LegError(
+                "[%s] %r is not a conditional UNIT row, so there is nothing to "
+                "attribute per failure: an unconditional row is matched by name, and "
+                "handing it here would decide it twice" % (label, wire))
+        for nm in row["requires"]:
+            spec = probes.get(nm)
+            if spec is None:
+                raise LegError("[%s] %r requires probe %r, which `environmentProbes` "
+                               "does not declare" % (label, wire, nm))
+            verb = probe_verb(spec.get("verb", ""))
+            if verb.get("stepsInWindow") is None:
+                raise LegError(
+                    "[%s] %r requires probe %r, whose verb %r declares no "
+                    "`stepsInWindow`, so no failure can be read against it"
+                    % (label, wire, nm, spec.get("verb")))
+            if verb.get("setsInWindow") is None:
+                raise LegError(
+                    "[%s] %r requires probe %r, whose verb %r declares no "
+                    "`setsInWindow`, so a failure it leaves GENUINE could be told an "
+                    "absence was measured while an unmeasured SET sat in its window"
+                    % (label, wire, nm, spec.get("verb")))
+        rows.append({"wire": wire, "scope": scope, "rx": rx, "row": row})
+    hits_by_name = dict((n, []) for n in failures)
+    unreadable = []
+    for log in segment_logs:
+        try:
+            data = read_bytes(log)
+        except OSError as exc:
+            unreadable.append("%s (%s)" % (os.path.basename(log), exc))
+            continue
+        for n, hits in unit_verdict_occurrences(data, failures).items():
+            for h in hits:
+                hits_by_name[n].append(dict(h, log=log))
+    cache = {}
+
+    def timeline_for(log, probe):
+        key = (log, probe)
+        if key not in cache:
+            path = execution_timeline_path(log, probe)
+            try:
+                cache[key] = (read_execution_timeline(read_text(path), probe), "")
+            except (OSError, LegError) as exc:
+                cache[key] = (None, "%s: %s" % (os.path.basename(path), exc))
+        return cache[key]
+    results = []
+    for name in failures:
+        bare = name
+        for pfx in tier_prefixes:
+            if pfx and name.startswith(pfx):
+                bare = name[len(pfx):]
+                break
+        hit = None
+        for r in rows:
+            if r["scope"] and r["scope"] != leg_mode:
+                continue
+            if re.search(r["rx"], name) or re.search(r["rx"], bare):
+                hit = r
+                break
+        if hit is None:
+            results.append({"name": name, "verdict": "GENUINE", "wire": "",
+                            "why": "matches no row armed for per-failure "
+                                   "attribution on this leg"})
+            continue
+        places = hits_by_name.get(name, [])
+        if not places:
+            results.append({
+                "name": name, "verdict": "GENUINE", "wire": hit["wire"],
+                "why": "its verdict line was found in none of the %d segment log(s)"
+                       "%s, so its execution window cannot be established and no "
+                       "evidence can be placed in it"
+                       % (len(segment_logs),
+                          ("; unreadable: " + ", ".join(unreadable))
+                          if unreadable else "")})
+            continue
+        excused, said = True, []
+        for place in places:
+            where = ("log bytes %d..%d of %s" % (place["fileStart"],
+                                                  place["verdictOffset"],
+                                                  os.path.basename(place["log"])))
+            for nm in hit["row"]["requires"]:
+                spec = probes[nm]
+                cfg = spec.get("config", {})
+                # ★ NOT `minStepsRequired`, which is the pre-run sample's floor for
+                # calling a MACHINE's clock stepping. One step inside a failure's
+                # own window is the whole causal evidence: ✔MEASURED 2026-09-15, a
+                # +26.318 s jump during walsetlk-2.1.3's timed region stayed
+                # displaced for 15.3 s, its return edge landed after the verdict,
+                # and DSS, gcc and clang all failed that unit together.
+                need = int(cfg["minStepsInFailureWindow"])
+                tl, bad = timeline_for(place["log"], nm)
+                if tl is None:
+                    excused = False
+                    said.append("NO USABLE %s TIMELINE for %s (%s)" % (nm, where, bad))
+                    continue
+                got = probe_verb(spec["verb"])["stepsInWindow"](
+                    tl, place["fileStart"], place["verdictOffset"], cfg)
+                if len(got) >= need:
+                    said.append(
+                        "%d %s step(s) of >= %g s (%s%s) recorded by %s inside its "
+                        "execution window (%s)"
+                        % (len(got), nm, float(cfg["minStepSeconds"]),
+                           " ".join("%+.3f" % float(s["delta"]) for s in got[:6]),
+                           " ..." if len(got) > 6 else "", tl["instrument"], where))
+                    continue
+                excused = False
+                unmeasured = probe_verb(spec["verb"])["setsInWindow"](
+                    tl, place["fileStart"], place["verdictOffset"], cfg)
+                if unmeasured:
+                    coverage = (
+                        "but the kernel reported %d UNMEASURED clock SET(s) inside "
+                        "this window (the offset moved %s between two clock "
+                        "readings: a small adjustment, or an excursion that began "
+                        "and ended between them), so this absence is NOT measured - "
+                        "read the timeline"
+                        % (len(unmeasured),
+                           " ".join("%+.3f s" % float(s["delta"])
+                                    for s in unmeasured[:6])
+                           + (" ..." if len(unmeasured) > 6 else "")))
+                elif tl["coveredThrough"] >= place["verdictOffset"]:
+                    coverage = ("the monitor armed on the empty log and observed past "
+                                "this verdict, so this is a MEASURED absence")
+                else:
+                    coverage = ("but the monitor's last observation saw only %d "
+                                "byte(s), BEFORE this verdict, so the absence is NOT "
+                                "fully measured" % tl["coveredThrough"])
+                said.append("%d qualifying %s step(s) inside its execution window "
+                            "(%s), %d needed; %s (instrument %s)"
+                            % (len(got), nm, where, need, coverage, tl["instrument"]))
+        results.append({"name": name, "verdict": "EXCUSED" if excused else "GENUINE",
+                        "wire": hit["wire"], "why": "; ".join(said)})
+    return results
+
+
+def attribution_report_lines(label, results):
+    """The account both drivers print verbatim — one line per failure an ARMED row
+    matched, EXCUSED or not. ASCII, for the same byte-for-byte reason as the
+    confound report. A failure no armed row matched gets no line here: it was never
+    this mechanism's to decide, and the drivers already report it as genuine."""
+    return [_ascii_snippet("[%s] per-failure clock attribution: %s %s by %s - %s"
+                           % (label, r["name"], r["verdict"], r["wire"], r["why"]),
+                           2000)
+            for r in results if r["wire"]]
+
+
 # The "nothing was injected" sentinel. `None` cannot do this job: `awake=None`
 # is a REAL fixture — "this interpreter has no monotonic clock" — and the arm it
 # selects (INDETERMINATE) is one the self-test has to be able to drive. Reusing
@@ -1743,6 +2111,443 @@ def _measure_wall_clock_step(config, clock=None, awake=_PROBE_DEFAULT,
            samples, ref_says)), evidence
 
 
+# ── EXECUTION EVIDENCE: A CLOCK MONITOR SPANNING THE CORPUS, READ PER FAILURE ─
+#
+# ANCHOR, ONE LINE, DO NOT WRAP:
+# D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN
+#
+# ★★★ A SAMPLE TAKEN BEFORE THE TESTS RUN CANNOT ATTRIBUTE A FAILURE THAT HAPPENS
+# DURING THEM. The `requires: [clock-realtime-steps]` rows were honoured or not on
+# ONE 20 s sample per kernel, taken before any leg was built, and the excuse never
+# looked at the failure it excused. ✔MEASURED 2026-09-14: the same walsetlk
+# failures on the same compiler were charged to DSS in one WSL run (sample: 0
+# steps) and excused in the next (sample: 8 steps). The other direction is the
+# silent one: a PRESENT sample excused ANY walsetlk/busy2 failure for the whole
+# run, a genuine blocking-lock regression included.
+#
+# ★★ AND THE SAMPLER WAS BLIND, WHICH IS WHY THE CLOCK LOOKED INTERMITTENT.
+# ✔MEASURED 2026-09-15 in WSL2 with three instruments at once: CLOCK_REALTIME
+# makes a +26.25 s EXCURSION lasting ~0.23 s every ~5.01 s. The kernel's own
+# clock-set notification (_ClockSetNotification) fired for both edges of 17 of 17
+# excursions; a 1 ms sampler saw all 17; the 250 ms sampler every earlier
+# comparison used registered 16. An excursion shorter than the sampling interval is
+# seen only when the sample phase lands inside it, and that phase drifts a few ms
+# per cycle, so a sampler goes blind for long stretches while the clock keeps
+# stepping. A notification has no phase to miss.
+#
+# ⇒ THE EVIDENCE IS GATHERED DURING THE FAILURE'S OWN EXECUTION, by a monitor that
+# spans each corpus segment in the kernel the fixture runs in, and a clock row is
+# honoured for ONE failure only when that evidence falls inside THAT failure's own
+# execution window. No evidence stays GENUINE.
+#
+# ★ HOW A CLOCK EVENT IS PLACED IN A FAILURE'S WINDOW WITHOUT A SECOND CLOCK. The
+# monitor watches the segment LOG the fixture writes. tester.tcl flushes at the start
+# and at the end of every do_test, so a byte offset in the log is a point in the
+# fixture's own execution. Every reading of the two clocks is a POINT, and a point
+# carries two log sizes: `sizeBefore`, the last size read that COMPLETED before its
+# clocks were read, and `sizeAfter`, the first size read that STARTED after. A step
+# lies between two consecutive points: the earlier one's sizeBefore was read before
+# that point saw the old clock, so it is a LOWER bound on the log when the step
+# happened; the later one's sizeAfter was read after that point saw the new clock,
+# so it is an UPPER bound. A step is therefore INSIDE a failure's window when
+#     before.sizeBefore >= the offset just past the previous file's `Time:` line
+#     after.sizeAfter   <  the offset of the failure's own verdict line
+# Both are SOUND in the direction that matters: buffering only makes bytes appear
+# LATER than the code that produced them, which can only move the first bound later
+# (fewer steps counted) and cannot move the second.
+#
+# ★★ NO TWO CLOCK READINGS MAY BE MORE THAN ONE SLOW OPERATION APART. A step is seen
+# only if some point lands inside the displaced stretch, and an excursion lasts
+# ~0.23 s. ✔MEASURED 2026-09-15 on the Windows driver's elf64-x86_64 leg, whose
+# segment log and timeline live on DrvFs, under load: a loop that read the size,
+# THEN the clocks, THEN the size again, and checked the stop file between two such
+# observations, once left 496 ms between two clock readings, and a whole
+# +26.387 s / -26.370 s excursion that two concurrent in-kernel monitors each
+# recorded edge by edge fell between them, leaving only a `set` of +0.017 s. Those
+# two monitors, which touch no DrvFs file, recorded 510 and 194 steps over their
+# corpora and not one `set` (🧠INFERRED: DrvFs operations, slow under load, are what
+# held the readings apart). So the clocks are read right after every wake and right
+# after every slow operation — a size read, a timeline write, the stop-file check —
+# and a size is read immediately before the wait and immediately after the wake,
+# which keeps both bounds as tight as before. An excursion that begins AND ends
+# inside one slow operation is still not measured: it leaves a `set`, which counts
+# no step, and the failure whose window holds one is never told that its absence of
+# steps was measured.
+#
+# ★ WHY THE WINDOW IS THE TEST FILE AND NOT THE do_test. A unit's verdict can rest
+# on a measurement taken anywhere earlier in its file: walsetlk_recover-1.3 tests a
+# `$::tm` measured at file top level BEFORE 1.2 ran, so a window cut at the unit's
+# own do_test excludes the very measurement that failed. Every .test file runs in
+# a fresh interpreter, so the file bounds what a verdict can depend on. And a clock
+# step belongs to the KERNEL, not to a process: one landing in a `testfixture_nb`
+# HELPER's `after 2000` lands inside the main fixture's window too, because the
+# window is a span of the log, i.e. of time, not of one process's reads.
+#
+# ⛔ WHY A REFERENCE FIXTURE RE-RUN IS NOT THE EXCUSE. A reference run after the
+# corpus is a different experiment under a different clock. ✔MEASURED (orchestrator,
+# 2026-09-15, three-way and stamped races): failures follow the steps each run
+# absorbed, and concurrent fixtures drift apart as soon as one absorbs a jump (DSS
+# 172 s against 66 s in one round, gcc slowest in another). A reference failing
+# later says nothing about why this run failed, and one passing in a quiet later
+# run would charge a clock failure to the compiler.
+#
+# ⚠ BIASED TOWARD GENUINE, like every probe here: an unusable timeline, a monitor
+# that never armed, a verdict line that cannot be found, a SET whose magnitude was
+# not measured, each counts no step. What is NOT closed, stated rather than hidden:
+# on a kernel whose clock steps throughout a file, a GENUINE clock-family
+# regression in that file is excused along with the clock failures, because nothing
+# in the log tells them apart. The same regression reds on every leg and host whose
+# clock does not step, where the monitor records no step at all.
+EXECUTION_TIMELINE_SCHEMA = 1
+
+# A heartbeat record at most this often, so a quiet stretch reads as a monitor that
+# was WATCHING rather than one that died. A property of the record's cadence, not of
+# the defect, so it is not config.
+EXECUTION_HEARTBEAT_SECONDS = 10.0
+
+# How long a driver waits for the monitor's `stopped` record after creating the
+# stop file. The monitor looks for the file once per loop, i.e. at least every
+# `sampleIntervalMs` plus two log stats and any timeline writes, so this is
+# generous by two orders of magnitude.
+EXECUTION_STOP_BUDGET_SECONDS = 30.0
+
+# The monitor's own lifetime when the segment it spans has NO cap of its own
+# (DSS_SEGMENT_TIMEOUT=0). A monitor must not be able to outlive a killed driver by
+# more than this; `all` runs a single segment for ~13 h, so 48 h is the floor.
+EXECUTION_UNCAPPED_LIFETIME_SECONDS = 48 * 3600.0
+
+EXECUTION_PROBE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def execution_timeline_path(watch_log, probe):
+    """Where the monitor for `probe` writes its timeline: beside the segment log it
+    watches. Named ONCE, here, so neither driver spells the convention and the
+    attributor finds exactly the file the monitor wrote."""
+    if not EXECUTION_PROBE_NAME_RE.match(probe or ""):
+        raise LegError(
+            "an execution-evidence probe name must be lower-case letters, digits "
+            "and dashes (it becomes part of a file name); got %r" % (probe,))
+    if not watch_log:
+        raise LegError("an execution monitor needs the segment log it watches")
+    return "%s.evidence-%s.jsonl" % (watch_log, probe)
+
+
+def execution_stop_path(timeline):
+    """The file whose existence tells a monitor to write `stopped` and exit."""
+    return timeline + ".stop"
+
+
+class _ClockSetNotification(object):
+    """THE KERNEL'S OWN REPORT THAT CLOCK_REALTIME WAS SET — no sampling, so no
+    phase to miss.
+
+    A CLOCK_REALTIME timerfd armed with TFD_TIMER_ABSTIME|TFD_TIMER_CANCEL_ON_SET
+    makes read() fail with ECANCELED whenever the realtime clock is set
+    discontinuously (settimeofday, clock_settime, a hypervisor time sync), and it
+    must be re-armed after each one. ✔MEASURED 2026-09-15 in WSL2: both edges of
+    17 of 17 excursions, each within 50 ms of the edge a 1 ms sampler placed.
+
+    ★ OFFERED OR NOT, NEVER GUESSED. Built through ctypes because `os.timerfd_*`
+    only exists from CPython 3.13 and this project's Linux hosts run 3.12. A libc
+    without timerfd (Darwin), a Windows interpreter, or a failing syscall leaves
+    `available()` False with the reason in `why`, and the monitor then says in its
+    own record that it fell back to a sampler with a stated blind spot."""
+
+    _CLOCK_REALTIME = 0
+    _TFD_CLOEXEC = 0o2000000
+    _TFD_TIMER_ABSTIME = 1
+    _TFD_TIMER_CANCEL_ON_SET = 2
+
+    def __init__(self):
+        self.fd = -1
+        self.why = ""
+        try:
+            import ctypes
+            import ctypes.util
+            import select as _select
+            if not hasattr(_select, "poll"):
+                raise OSError("select.poll is not offered by this interpreter")
+            libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+            create = libc.timerfd_create
+            settime = libc.timerfd_settime
+        except (OSError, AttributeError, TypeError) as exc:
+            self.why = ("the kernel clock-set notification is not offered here "
+                        "(%s: %s)" % (type(exc).__name__, exc))
+            return
+
+        class _Timespec(ctypes.Structure):
+            _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
+
+        class _Itimerspec(ctypes.Structure):
+            _fields_ = [("it_interval", _Timespec), ("it_value", _Timespec)]
+
+        fd = create(self._CLOCK_REALTIME, self._TFD_CLOEXEC)
+        if fd < 0:
+            self.why = ("timerfd_create(CLOCK_REALTIME) failed with errno %d"
+                        % ctypes.get_errno())
+            return
+        self._ctypes, self._settime, self._its = ctypes, settime, _Itimerspec
+        self.fd = fd
+        if not self._arm():
+            os.close(fd)
+            self.fd = -1
+            return
+        self._poll = _select.poll()
+        self._poll.register(fd, _select.POLLIN)
+
+    def _arm(self):
+        import time as _time
+        its = self._its()
+        # Ten years ahead, ABSOLUTE: the timer never expires in practice, and the
+        # only thing that can wake a reader is a SET of the clock.
+        its.it_value.tv_sec = int(_time.time()) + 10 * 365 * 86400
+        rc = self._settime(self.fd,
+                           self._TFD_TIMER_ABSTIME | self._TFD_TIMER_CANCEL_ON_SET,
+                           self._ctypes.byref(its), None)
+        if rc != 0:
+            self.why = ("timerfd_settime(TFD_TIMER_CANCEL_ON_SET) failed with "
+                        "errno %d" % self._ctypes.get_errno())
+            return False
+        return True
+
+    def available(self):
+        return self.fd >= 0
+
+    def wait(self, seconds):
+        """'set' when CLOCK_REALTIME was set since the last arm, else 'timeout'.
+        Re-arms after a set, and raises LegError when it cannot — a notifier that
+        silently stopped notifying would read as a clock that stopped stepping."""
+        import errno as _errno
+        if not self._poll.poll(max(0, int(seconds * 1000))):
+            return "timeout"
+        try:
+            os.read(self.fd, 8)
+        except OSError as exc:
+            if exc.errno != _errno.ECANCELED:
+                raise
+            if not self._arm():
+                raise LegError("the clock-set notification could not be re-armed "
+                               "after a set: %s" % self.why)
+            return "set"
+        # The ten-year timer really expired. Not a clock set: re-arm and go on.
+        if not self._arm():
+            raise LegError("the clock-set notification could not be re-armed: %s"
+                           % self.why)
+        return "timeout"
+
+    def close(self):
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+
+def _execution_record_obs(rec):
+    """The observations one timeline record carries, whatever its kind."""
+    return [rec[k] for k in ("before", "after", "obs") if isinstance(rec.get(k), dict)]
+
+
+def execution_monitor_loop(config, read_size, read_clocks, wait, should_stop,
+                           expired, emit, head):
+    """THE MONITOR, with every instrument INJECTED so --self-test drives each arm.
+
+    `read_clocks()` returns (wall, continuous) read back to back; `read_size()` the
+    watched log's size; `wait(seconds)` 'set' when the clock-set notification fired
+    and 'timeout' otherwise. A sampler-only monitor always times out, and `wait(0)`
+    blocks for nothing: it only collects a notification that is already pending.
+
+    Every reading of the clocks is a POINT carrying the two sizes the EXECUTION
+    EVIDENCE header bounds a step with: `sizeBefore`, the last size read that
+    COMPLETED before it, and `sizeAfter`, the first that STARTED after it. A record
+    is a `step` when the wall-minus-continuous offset moved by at least
+    `minStepSeconds` since the previous point (BOTH points carried), a `set` when a
+    notification was collected without such a move (reported, never counted), and
+    otherwise a `heartbeat` at most every EXECUTION_HEARTBEAT_SECONDS. A point has
+    its `sizeAfter` only once the next size is read, so a record is written once
+    every point it carries has one. The difference of two clocks is the same noise
+    immunity `_measure_wall_clock_step` documents: a descheduled monitor inflates
+    both and cancels.
+
+    ★★ THE ORDER IS THE FIDELITY (the header says what it cost to learn): the clocks
+    are read right after EVERY wake and right after EVERY slow operation — a size
+    read, a timeline write, the stop-file check — so no two readings are ever more
+    than one slow operation apart; and a size is read immediately BEFORE the wait
+    and immediately AFTER the wake, so every point taken before the wait has its
+    `sizeAfter` before the fixture writes anything more."""
+    min_step = float(config["minStepSeconds"])
+    interval = float(config["sampleIntervalMs"]) / 1000.0
+    state = {"size": int(read_size()), "prev": None, "beat": 0.0}
+    unsized, held = [], []
+
+    def point(how):
+        wall, ref = read_clocks()
+        cur = {"sizeBefore": state["size"], "reference": round(float(ref), 6),
+               "offset": round(float(wall) - float(ref), 6)}
+        unsized.append(cur)
+        prev, state["prev"] = state["prev"], cur
+        if prev is None:
+            state["beat"] = cur["reference"]
+            return
+        delta = round(cur["offset"] - prev["offset"], 6)
+        if abs(delta) >= min_step:
+            held.append({"kind": "step", "notified": how == "set", "delta": delta,
+                         "before": prev, "after": cur})
+            state["beat"] = cur["reference"]
+        elif how == "set":
+            held.append({"kind": "set", "notified": True, "delta": delta,
+                         "before": prev, "after": cur})
+            state["beat"] = cur["reference"]
+        elif cur["reference"] - state["beat"] >= EXECUTION_HEARTBEAT_SECONDS:
+            held.append({"kind": "heartbeat", "obs": cur})
+            state["beat"] = cur["reference"]
+
+    # A slow operation has just returned: collect whatever notification it held
+    # back, and read the clocks NOW rather than after the next one.
+    def after_slow():
+        return point(wait(0))
+
+    def read_log(then_read_clocks=True):
+        size = int(read_size())
+        if size < state["size"]:
+            held.append({"kind": "log-shrank", "fromBytes": state["size"],
+                         "toBytes": size})
+        state["size"] = size
+        for p in unsized:
+            p["sizeAfter"] = size
+        del unsized[:]
+        if then_read_clocks:
+            after_slow()
+
+    def flush():
+        while held and all("sizeAfter" in o for o in _execution_record_obs(held[0])):
+            emit(held.pop(0))
+            after_slow()
+
+    point("timeout")
+    first = state["prev"]
+    read_log()
+    emit(dict(head, kind="armed", obs=first))
+    after_slow()
+    reason = "stop-file"
+    while True:
+        stop = should_stop()
+        after_slow()
+        if stop:
+            break
+        why_expired = expired()
+        if why_expired:
+            reason = why_expired
+            break
+        read_log()
+        point(wait(interval))
+        read_log()
+        flush()
+    read_log(then_read_clocks=False)
+    point(wait(0))
+    last = state["prev"]
+    read_log(then_read_clocks=False)
+    for rec in held:
+        emit(rec)
+    emit({"kind": "stopped", "reason": reason, "obs": last})
+
+
+def _monitor_wall_clock_step(probe, spec, watch_log, timeline, stop_file,
+                             max_seconds, notifier=None):
+    """The `wall-clock-step` verb's EXECUTION MONITOR, wired to real instruments.
+    Runs until `stop_file` exists, until `max_seconds` of continuous time pass, or
+    until this process is orphaned; writes one JSON record per line to `timeline`,
+    flushed as it is written, so a killed monitor leaves a readable prefix."""
+    import time as _time
+    config = spec.get("config", {})
+    reference, ref_name, _suspend = _resolve_continuous_clock()
+    notifier = _ClockSetNotification() if notifier is None else notifier
+    interval_ms = float(config["sampleIntervalMs"])
+    if notifier.available():
+        instrument = "clock-set-notification"
+        instrument_why = ("the kernel reports every SET of CLOCK_REALTIME "
+                          "(timerfd TFD_TIMER_CANCEL_ON_SET), and the clocks are "
+                          "read right after it and after every slow operation; an "
+                          "excursion that begins and ends inside one slow operation "
+                          "is recorded as a `set`, never as a step")
+        wait = notifier.wait
+    else:
+        instrument = "sampler"
+        instrument_why = ("%s; sampling every %g ms instead, which is BLIND to an "
+                          "excursion shorter than that interval"
+                          % (notifier.why, interval_ms))
+
+        def wait(seconds):
+            _time.sleep(seconds)
+            return "timeout"
+
+    def read_size():
+        try:
+            return os.stat(watch_log).st_size
+        except OSError:
+            return 0
+    started = reference()
+    parent = os.getppid() if hasattr(os, "getppid") else None
+
+    def expired():
+        if max_seconds and reference() - started >= float(max_seconds):
+            return "expired after %g s" % float(max_seconds)
+        if parent is not None and os.getppid() != parent:
+            return "orphaned: the process that started this monitor is gone"
+        return ""
+    head = {"probe": probe, "verb": spec.get("verb", ""),
+            "instrument": instrument,
+            "instrumentWhy": _ascii_snippet(instrument_why, 400),
+            "referenceClock": ref_name, "watchLog": watch_log,
+            "config": dict(config), "pid": os.getpid()}
+    with open(timeline, "w", encoding="utf-8", newline="\n") as fh:
+        def emit(rec):
+            fh.write(json.dumps(dict(rec, schema=EXECUTION_TIMELINE_SCHEMA),
+                                sort_keys=True) + "\n")
+            fh.flush()
+        try:
+            execution_monitor_loop(
+                config, read_size, lambda: (_time.time(), reference()),
+                wait, lambda: os.path.exists(stop_file), expired, emit, head)
+        except Exception as exc:                                # noqa: BLE001
+            emit({"kind": "stopped", "obs": None,
+                  "reason": _ascii_snippet("error: %s: %s"
+                                           % (type(exc).__name__, exc), 400)})
+            raise
+        finally:
+            notifier_close = getattr(notifier, "close", None)
+            if notifier_close is not None:
+                notifier_close()
+    return 0
+
+
+def _execution_record_in_window(rec, file_start, verdict_offset):
+    """True when a `step` or `set` record lies INSIDE [file_start, verdict_offset) by
+    the two sound bounds in the EXECUTION EVIDENCE header. ONE predicate for both
+    kinds, so a step and a set can never be placed by two different rules."""
+    return (int(rec["before"]["sizeBefore"]) >= int(file_start)
+            and int(rec["after"]["sizeAfter"]) < int(verdict_offset))
+
+
+def _wall_clock_steps_in_window(timeline, file_start, verdict_offset, config):
+    """The `wall-clock-step` verb's reading of ONE failure's window: every recorded
+    step of at least `minStepSeconds` that lies INSIDE [file_start, verdict_offset)
+    by the two sound bounds in the header above. A `set` record never counts: its
+    magnitude was not measured, and an unmeasured event is not evidence."""
+    min_step = float(config["minStepSeconds"])
+    return [s for s in timeline["steps"]
+            if abs(float(s["delta"])) >= min_step
+            and _execution_record_in_window(s, file_start, verdict_offset)]
+
+
+def _wall_clock_sets_in_window(timeline, file_start, verdict_offset, config):
+    """Every `set` record inside the same window: a SET of the clock the kernel
+    reported and no pair of clock readings measured at `minStepSeconds` or more —
+    a small adjustment, or an excursion that began and ended between two readings.
+    NEVER evidence for a failure; its only use is that a failure whose window holds
+    one is not told the absence of a step there was measured."""
+    return [s for s in timeline["setRecords"]
+            if _execution_record_in_window(s, file_start, verdict_offset)]
+
+
 # THE CLOSED VERB TABLE. `configKeys` closes the config so a typo'd threshold is
 # a LOUD refusal and not a silently-ignored key; `floors` is the one thing config
 # may NOT weaken.
@@ -1764,13 +2569,34 @@ ENVIRONMENT_PROBE_VERBS = {
                 "ELAPSED TIME — the monotonic clock that counts a host suspend, "
                 "not the one that stops with the machine?",
         "configKeys": ("sampleSeconds", "sampleIntervalMs", "minStepSeconds",
-                       "minStepsRequired"),
+                       "minStepsRequired", "minStepsInFailureWindow"),
         "floors": {"sampleSeconds": 15.0, "minStepsRequired": 2,
-                   "minStepSeconds": 1.0},
+                   "minStepSeconds": 1.0, "minStepsInFailureWindow": 1},
         # Config may only ever RAISE these. `sampleIntervalMs` has no floor: a
         # shorter interval takes MORE samples in the same window, which can only
         # make the measurement finer.
-        "raiseOnly": ("sampleSeconds", "minStepsRequired", "minStepSeconds"),
+        "raiseOnly": ("sampleSeconds", "minStepsRequired", "minStepSeconds",
+                      "minStepsInFailureWindow"),
+        # ★★ WHAT DECIDES A FAILURE, AND IT IS NOT `measure`.
+        # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+        # `measure` above is the PRE-RUN sample, taken once per kernel before any
+        # leg is built; it now only establishes that this verb's instrument can
+        # read that kernel's clocks at all (present/absent ARM a row, indeterminate
+        # does not). A row is honoured for ONE failure by `monitor`, which spans
+        # every corpus segment in the fixture's own kernel, and `stepsInWindow`,
+        # which reads that monitor's timeline against the failure's own window.
+        # `minStepSeconds` keeps its floor and its meaning there. The COUNT a window
+        # needs is its own key, `minStepsInFailureWindow` (floor 1), and not the
+        # sample's `minStepsRequired` (floor 2): a machine is called stepping on
+        # more than one pair of readings, but ONE set between a measurement's two
+        # clock reads is that failure's whole cause. ✔MEASURED 2026-09-15: a
+        # +26.318 s jump inside walsetlk-2.1.3 stayed displaced for 15.3 s, its
+        # return landed after the verdict, and DSS, gcc and clang failed together.
+        "monitor": _monitor_wall_clock_step,
+        "stepsInWindow": _wall_clock_steps_in_window,
+        # The monitor's `set` records in the same window: never evidence, only what
+        # keeps a GENUINE failure from being told its absence of steps was measured.
+        "setsInWindow": _wall_clock_sets_in_window,
     },
 }
 
@@ -2722,6 +3548,67 @@ def kernel_probe_argv(fs_verb, script, catalogue, only, translator=None):
     return argv
 
 
+def execution_monitor_plan(catalogue_doc, fs_verb, probe, watch_log,
+                           segment_cap_seconds, script, catalogue, translator=None):
+    """How a driver runs the execution monitor for `probe` over one segment log:
+    {argv, timeline, stopFile, kernel, armWithinSeconds, stopWithinSeconds,
+    maxSeconds}. `timeline` and `stopFile` are in the DRIVER's namespace (it waits
+    on the first and creates the second); `argv` carries them translated into the
+    monitor's.
+
+    ★ THE MONITOR RUNS IN THE KERNEL THE FIXTURE RUNS IN, entered through the SAME
+    declared `kernelEntryArgv` the pre-run probe uses — the question is about THAT
+    kernel's clock, and D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-
+    THE-LAUNCHED-ONE already paid for asking it anywhere else. An in-process kernel
+    runs the monitor with THIS interpreter, so the answer never depends on which
+    `python` a PATH lookup would have found.
+    [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]"""
+    spec = environment_probes(catalogue_doc).get(probe)
+    if spec is None:
+        raise LegError("execution-evidence probe %r is not declared in "
+                       "`environmentProbes`" % (probe,))
+    if probe_verb(spec.get("verb", "")).get("monitor") is None:
+        raise LegError("probe %r (verb %r) declares no execution monitor"
+                       % (probe, spec.get("verb")))
+    timeline = execution_timeline_path(watch_log, probe)
+    stop = execution_stop_path(timeline)
+    fs = run_filesystem(fs_verb)
+    entry = list(fs["kernelEntryArgv"])
+    cap = float(segment_cap_seconds or 0.0)
+    # The monitor's own lifetime: the segment's cap plus room to arm and to stop, or
+    # the uncapped ceiling. It exists so a monitor cannot outlive a killed driver
+    # indefinitely; the stop file is what ends it in every normal run.
+    lifetime = ((cap + KERNEL_PROBE_ENTRY_ALLOWANCE_SECONDS
+                 + 2 * EXECUTION_STOP_BUDGET_SECONDS) if cap > 0
+                else EXECUTION_UNCAPPED_LIFETIME_SECONDS)
+    paths = [script, catalogue, watch_log, timeline, stop]
+    if entry:
+        interp = fs["kernelProbeInterpreter"]
+        if not interp:
+            raise LegError(
+                "runFilesystem %r declares a kernelEntryArgv (%s) but no "
+                "`kernelProbeInterpreter`, so the execution monitor has nothing to "
+                "run with inside that kernel" % (fs_verb, " ".join(entry)))
+        xlate = fs["kernelEntryPathTranslation"]
+        head = entry + [interp]
+        paths = [translate_path(xlate, x, translator) for x in paths]
+    else:
+        xlate = ""
+        head = [os.path.abspath(sys.executable)]
+    t_script, t_catalogue, t_log, t_timeline, t_stop = paths
+    argv = head + [t_script, "--catalogue", t_catalogue, "--monitor-execution",
+                   "--evidence-probe", probe, "--watch-log", t_log,
+                   "--timeline", t_timeline, "--stop-file", t_stop,
+                   "--max-seconds", "%g" % lifetime]
+    if xlate:
+        assert_translated(xlate, argv)
+    return {"argv": argv, "timeline": timeline, "stopFile": stop,
+            "kernel": probe_kernel(fs_verb),
+            "armWithinSeconds": KERNEL_PROBE_ENTRY_ALLOWANCE_SECONDS,
+            "stopWithinSeconds": EXECUTION_STOP_BUDGET_SECONDS,
+            "maxSeconds": lifetime}
+
+
 # ── EVERY CHILD THIS RESOLVER SPAWNS: BOUNDED, AND DECODED ──────────────────
 #
 # Three functions spawn ON THE PLAN-RESOLUTION PATH — `_run_kernel_probe` (the
@@ -3352,16 +4239,23 @@ def leg_confound_decisions(leg, gate, rd_gate=None):
         def _decision(active, reason, _requires=(), _pattern=pattern, _wire=wire,
                       _scope=scope, _scoped_out=scoped_out,
                       _clause=scope_clause, _matches=confound_match_kind(row),
-                      _row=row, _rd_requires=tuple(rd_requires)):
+                      _row=row, _rd_requires=tuple(rd_requires), _evidence=()):
             """One row's verdict. `active` stays the SUPPLY question — is this
             pattern handed to the matcher — and `scopedOut` is the separate,
             separately-reported question of whether the matcher can apply it on
             this run. Two questions, two fields; collapsing them is what produced
-            a row reported ACTIVE with the reason "unconditional"."""
+            a row reported ACTIVE with the reason "unconditional".
+
+            `evidence` is a THIRD question: which probes must show evidence INSIDE
+            A FAILURE'S OWN EXECUTION before this active row may excuse it. Empty
+            means the row is matched BY NAME; non-empty means it is ARMED and a
+            name match alone excuses nothing.
+            [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]"""
             return {"pattern": _pattern, "wire": _wire, "scope": _scope,
                     "requires": list(_requires), "active": active,
                     "matches": _matches, "row": _row,
                     "requiresRunDirectory": list(_rd_requires),
+                    "evidence": list(_evidence),
                     "scopedOut": _scoped_out, "reason": reason + _clause}
 
         requires = list(row.get("requires", []))
@@ -3450,7 +4344,22 @@ def leg_confound_decisions(leg, gate, rd_gate=None):
                     "without the defect — and guessing either way is the whole "
                     "hazard: guess 'present' and a real miscompile is excused in "
                     "silence." % (label, pattern, nm))
-            if probe_verdict_honours(got["verdict"]):
+            # ★★ ARMED, NOT HONOURED. The pre-run sample only says whether this
+            # probe's instrument could read the leg's own kernel; which failures
+            # the row excuses is decided per failure, from the monitor that spans
+            # the corpus. A row honoured on the sample was the defect in both
+            # directions.
+            # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+            if probe_verb(got.get("verb", "")).get("stepsInWindow") is None:
+                raise LegError(
+                    "leg '%s': confound %r requires probe '%s', whose verb %r "
+                    "reads no failure's execution window. Every probe a row may "
+                    "require decides PER FAILURE; a verb that cannot is a vocabulary "
+                    "gap, and honouring its sample would restore the defect "
+                    "D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-"
+                    "BEFORE-THE-TESTS-RUN records." % (label, pattern, nm,
+                                                       got.get("verb")))
+            if probe_verdict_arms(got["verdict"]):
                 holding.append("%s: %s" % (nm, got["verdict"]))
             else:
                 blocking.append("%s: %s (%s)"
@@ -3458,11 +4367,19 @@ def leg_confound_decisions(leg, gate, rd_gate=None):
         if blocking:
             out.append(_decision(
                 False,
-                "NOT honoured here: %s. A failure matching this pattern will be "
+                "NOT ARMED here: %s. The probe's instrument could not read this "
+                "leg's own kernel, so no evidence can be gathered inside any "
+                "failure's execution, and a failure matching this pattern will be "
                 "reported as GENUINE." % "; ".join(blocking), requires))
         else:
-            out.append(_decision(True, "honoured: %s" % "; ".join(holding),
-                                 requires))
+            out.append(_decision(
+                True,
+                "ARMED, attributed PER FAILURE: excused only where the monitor "
+                "spanning this leg's corpus records the probe's minimum steps inside "
+                "that failure's own execution window, and GENUINE everywhere else. "
+                "The pre-run sample (%s) decides no failure: it established only "
+                "that the instrument reads this kernel" % "; ".join(holding),
+                requires, _evidence=requires))
     return out
 
 
@@ -3475,6 +4392,34 @@ def leg_confounds(leg, gate, rd_gate=None):
     about, one axis along."""
     return [d["wire"] for d in leg_confound_decisions(leg, gate, rd_gate)
             if d["active"] and d["matches"] == "unit"]
+
+
+def confounds_by_name(decisions):
+    """The UNIT rows a driver's matcher may excuse BY NAME: active, and carrying no
+    execution evidence to check. This — never `confounds` — is what both drivers
+    hand their unit matcher.
+
+    ★★ AN ARMED ROW IS NEVER IN IT. A pattern the matcher sees excuses every
+    failure it matches, which for a row armed on a pre-run sample is exactly the
+    defect: the sample, not the failure, deciding.
+    [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]"""
+    return [d["wire"] for d in decisions
+            if d["active"] and d["matches"] == "unit" and not d.get("evidence")]
+
+
+def confounds_by_evidence(decisions):
+    """The UNIT rows that are ARMED: active, and excusing a failure only on evidence
+    from that failure's own execution (`attribute_unit_failures`)."""
+    return [d["wire"] for d in decisions
+            if d["active"] and d["matches"] == "unit" and d.get("evidence")]
+
+
+def execution_evidence_probes(decisions):
+    """Every probe an ARMED row needs a monitor for, sorted — the monitors a
+    driver starts around each corpus segment of this leg."""
+    return sorted({nm for d in decisions
+                   if d["active"] and d["matches"] == "unit"
+                   for nm in d.get("evidence", [])})
 
 
 def leg_abort_confounds(leg, gate, rd_gate=None):
@@ -3720,6 +4665,15 @@ def confound_report_lines(label, decisions, gate, rd_gate=None):
     lines.append("[%s] confound rows ACTIVE (%d of %d): %s"
                  % (label, len(active), len(decisions),
                     " ".join(d["wire"] for d in active) or "<none>"))
+    # ★★ AN ARMED ROW IS ACTIVE AND EXCUSES NOTHING BY NAME, so it gets its own
+    # line. A reader counting the excusal set from the line above would otherwise
+    # read the clock rows as excusing every walsetlk/busy2 failure outright — which
+    # is precisely what a pre-run sample used to make them do.
+    # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+    for d in active:
+        if d.get("evidence"):
+            lines.append("[%s] confound row ARMED (per failure): %s - %s"
+                         % (label, d["wire"], d["reason"]))
     # ★ A SUPPLIED ROW THE MATCHER CANNOT APPLY ON THIS RUN GETS ITS OWN LINE.
     # It is in the ACTIVE list because it IS handed to the matcher, and the matcher
     # is the one owner of scope matching — but a reader counting the excusal set
@@ -4473,6 +5427,19 @@ def oracle_report_lines(leg, ref_target, ref_path, leg_oracle=None,
                      "ATTRIBUTE: it fails too => upstream; it passes => dss."
                      % (spec, leg_oracle.get("cc", "<unnamed cc>"),
                         leg_oracle.get("triple", "<unmeasured triple>")))
+        # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+        # A reference handed dsscp's declared header edges is not the bare
+        # toolchain, and a reader deciding what a pass on it proves must be told.
+        surface = leg.get("build", {}).get("referenceSurface")
+        headers = [e.get("header") for e in (surface if isinstance(surface, list)
+                                             else [])
+                   if isinstance(e, dict) and e.get("header")]
+        if headers:
+            lines.append("    ⓘ with dsscp's OWN declared header edges for this "
+                         "target (%s), generated from its shipped descriptors: "
+                         "the edges dss compiles with and this compiler's own "
+                         "headers lack, so both build the same TU set."
+                         % ", ".join("<%s>" % h for h in headers))
         return lines
     cls, why = oracle_class_for_leg(leg, ref_target, ref_path,
                                     oracle_status)
@@ -4496,7 +5463,7 @@ def oracle_report_lines(leg, ref_target, ref_path, leg_oracle=None,
                 "(%s) is on PATH and PROVES it targets %s, so a same-platform "
                 "oracle COULD have been built from this leg's own manifest and "
                 "was not. Read the leg's reference-oracle log."
-                % (cc, machine, spec))
+                % (cc_display(cc), machine, spec))
         else:
             lines.append(
                 "    No declared compiler on this host targets %s, so none can "
@@ -4534,7 +5501,7 @@ def reference_oracle_name(leg):
     return REFERENCE_ORACLE_NAME_BY_TARGET_OS[os_name]
 
 
-def reference_oracle_argv(cc, manifest, output, link_flags):
+def reference_oracle_argv(cc, manifest, output, link_flags, surface_dir=""):
     """The one command that builds a leg's same-platform reference, composed
     from the leg's OWN manifest. PURE — returns argv, spawns nothing, so the
     composition is unit-testable without a compiler on the host.
@@ -4542,10 +5509,18 @@ def reference_oracle_argv(cc, manifest, output, link_flags):
     `link_flags` is the leg's DECLARED `build.referenceLinkFlags`: the TARGET's
     system libraries (`-lm`, `-ldl`, `-lpthread` on a POSIX target; nothing on a
     Windows one, where mingw links them itself). It is a property of the target,
-    declared per leg, never sniffed from the host."""
+    declared per leg, never sniffed from the host.
+
+    `surface_dir` is the directory `write_reference_surface` generated from the
+    leg's declared `build.referenceSurface`, or "" when the leg declares none.
+    It is searched BEFORE every manifest include root, because a shim that
+    `#include_next`s the reference's own header works only when it is found
+    first; a leg without one gets the argv it always had, byte for byte."""
     argv = cc_argv(cc) + ["-o", output]
     for d in manifest.get("defines", []):
         argv.append("-D%s" % d)
+    if surface_dir:
+        argv.append("-I%s" % surface_dir)
     for inc in manifest.get("includes", []):
         argv.append("-I%s" % inc)
     argv.extend(manifest.get("sources", []))
@@ -4556,6 +5531,505 @@ def reference_oracle_argv(cc, manifest, output, link_flags):
         argv.append(lib["path"] if isinstance(lib, dict) else lib)
     argv.extend(link_flags or [])
     return argv
+
+
+# ── THE REFERENCE IS HANDED DSS'S OWN DECLARED HEADER EDGES ─────────────────
+#
+# ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN
+#
+# ★★★ WHY pe64 STILL HAD NO ORACLE AFTER `--build-reference-oracle` EXISTED.
+# ✔MEASURED 2026-09-15: a `-dumpmachine`-verified mingw-w64 gcc given the pe64
+# leg's own 189-TU manifest fails ONE TU, `ext/misc/fileio.c` (31 errors, 24
+# warnings, identical with the `windows-selfconfig` transform reverted, so the
+# recipe is not the cause). The cause is upstream, and that leg's
+# `matches: build-tu` row names it. dss compiles the TU only because its
+# shipped pe descriptors DECLARE three header edges mingw's own headers lack:
+# <direct.h> pulls <dirent.h>, <dirent.h> pulls <windows.h>, and <sys/stat.h>
+# defines S_ISLNK. A reference without them compiles a DIFFERENT HEADER GRAPH:
+# it could not build the fixture, and had it built one, it would not stand for
+# dss in a runtime comparison.
+#
+# ★★ THE FIX HANDS THE REFERENCE THE SAME EDGES, READ FROM THE SAME DECLARATION.
+# A leg NAMES the edges it needs in `build.referenceSurface`. Their CONTENT is
+# read here from the shipped descriptors, selected for the leg's own
+# object-format kind by the format-only `when` rule dsscp applies to exactly
+# these two surfaces, and written as one `#include_next` shim per header into a
+# directory searched first. Nothing is typed twice: an edge the descriptors do
+# not declare ACTIVE on that format is a lint finding and a refused build, so a
+# shim cannot outlive the declaration it copies. ✔MEASURED 2026-09-15 with those
+# three edges as shadow headers: all 189 TUs built, the fixture ran, and its
+# `PRAGMA compile_options` equalled dss's but for COMPILER.
+#
+# ⚠ WHAT THIS IS NOT, ALSO MEASURED: an MSVC reference. `cl -dumpmachine` exits
+# 2, so `resolve_target_cc` cannot verify it; `cl` compiles fileio.c's
+# `_MSC_VER` arm, a different program for BUILD attribution; and for RUNTIME
+# attribution it varies the atomic intrinsics, the CRT and the optimisation
+# level beside the compiler. The GNU identity dss claims on this target is what
+# makes mingw the like-for-like reference, and `#include_next` needs a GNU
+# driver, which `reference_oracle_argv` already composes for.
+REFERENCE_SURFACE_ENTRY_KEYS = ("header", "includes", "macros")
+# The PARENT of the generated shims, beside the oracle binary. Each declaration
+# is written to its own digest-named subdirectory (write_reference_surface).
+REFERENCE_SURFACE_DIR_NAME = "reference-surface"
+
+
+def dss_config_tree(environ=None):
+    """(directory, how) of the `src/dss-config` tree a declared reference
+    surface is read from.
+
+    The FIRST arm of dsscp's own config discovery: `$DSS_CONFIG_ROOT` names the
+    directory that CONTAINS `src/dss-config`, and wins when it answers, so an
+    operator who pins the compiler's config pins the reference's with it.
+    Otherwise the checkout this harness lives in, the tree the drivers build dss
+    from. A set override that does not answer falls through, as it does for
+    dsscp, and `how` SAYS so. ⚠ dsscp's two later arms (an installed layout
+    beside its executable, a walk up from its working directory) are not
+    reproduced; `how` names the tree that was read, so a reader can compare."""
+    environ = os.environ if environ is None else environ
+    note = ""
+    override = environ.get("DSS_CONFIG_ROOT", "")
+    if override:
+        candidate = os.path.join(override, "src", "dss-config")
+        if os.path.isdir(candidate):
+            return candidate, "$DSS_CONFIG_ROOT"
+        note = "; $DSS_CONFIG_ROOT=%s did not answer (no %s)" % (override, candidate)
+    own = os.path.normpath(os.path.join(HERE, os.pardir, os.pardir, os.pardir,
+                                        "src", "dss-config"))
+    if os.path.isdir(own):
+        return own, "the checkout holding this harness" + note
+    raise LegError(
+        "no dss config tree to read a declared reference surface from: %s is "
+        "not a directory%s. Set DSS_CONFIG_ROOT to the checkout the compiler was "
+        "built from." % (own, note))
+
+
+def _config_json(path):
+    """One shipped config document, or a LegError naming the file."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except OSError as exc:
+        raise LegError("cannot read %s: %s" % (path, exc))
+    except ValueError as exc:
+        raise LegError("%s is not valid JSON: %s" % (path, exc))
+    if not isinstance(doc, dict):
+        raise LegError("%s does not hold a JSON object" % path)
+    return doc
+
+
+def _format_kind_of(doc, path):
+    fmt = doc.get("format")
+    kind = fmt.get("kind") if isinstance(fmt, dict) else None
+    if not isinstance(kind, str) or not kind.strip():
+        raise LegError("%s declares no format.kind" % path)
+    return kind
+
+
+def shipped_format_kinds(config_dir):
+    """Every object-format KIND a shipped `*.format.json` declares: the closed
+    vocabulary a descriptor's `when.format` is checked against. Read from the
+    format files rather than listed here, so a kind is known exactly when the
+    tree ships a format of it (✔MEASURED 2026-09-15: elf, macho, pe, spirv, wasm,
+    the selectable names of dsscp's own object-format kind table)."""
+    paths = sorted(glob.glob(os.path.join(config_dir, "object-formats",
+                                          "*.format.json")))
+    if not paths:
+        raise LegError("no *.format.json under %s"
+                       % os.path.join(config_dir, "object-formats"))
+    return {_format_kind_of(_config_json(p), p) for p in paths}
+
+
+def leg_format_kind(leg, config_dir):
+    """The object-format KIND of the leg's own declared format (`pe` for
+    `x86_64:pe64-x86_64-windows-exec`), read from that format's shipped file:
+    the value a descriptor's `when.format` names. Keyed on the leg, never on
+    the host."""
+    fmt = spec_format(leg.get("spec", ""))
+    if not fmt or "/" in fmt or "\\" in fmt or fmt in (".", ".."):
+        raise LegError("leg '%s' declares spec %r, which names no object format"
+                       % (leg.get("label"), leg.get("spec")))
+    path = os.path.join(config_dir, "object-formats", fmt + ".format.json")
+    return _format_kind_of(_config_json(path), path)
+
+
+def shipped_descriptor_path(config_dir, header):
+    """The shipped descriptor for a header NAME, by dsscp's own convention: the
+    name with its extension dropped, subdirectories kept, `.json` appended
+    (`sys/stat.h` -> `shippedLibs/sys/stat.json`). A name that is not a plain
+    relative header path is REFUSED, because it could only resolve outside the
+    descriptor tree."""
+    parts = header.split("/") if isinstance(header, str) else []
+    if (not parts or header != header.strip() or "\\" in header or ":" in header
+            or any(p in ("", ".", "..") for p in parts)):
+        raise LegError("%r is not a relative header name such as `sys/stat.h`"
+                       % (header,))
+    parts[-1] = os.path.splitext(parts[-1])[0]
+    return os.path.join(config_dir, "shippedLibs", *parts) + ".json"
+
+
+def _descriptor_available(doc, kind, known, where):
+    """`availableObjectFormats`, absent or empty meaning every format."""
+    avail = doc.get("availableObjectFormats")
+    if avail is None:
+        return True
+    if (not isinstance(avail, list)
+            or not all(isinstance(a, str) and a in known for a in avail)):
+        raise LegError("%s: availableObjectFormats %r must list known format "
+                       "kinds (%s)" % (where, avail, ", ".join(sorted(known))))
+    return not avail or kind in avail
+
+
+def descriptor_when_matches(when, kind, known, where):
+    """Does a descriptor `when` select format KIND? The FORMAT-ONLY mode of
+    dsscp's one `when` evaluator, the mode its `includes` edges and `macros`
+    variants are read in: `{format}` is the whole key vocabulary, an empty
+    `when` is refused (it would select every target), and the format must be a
+    known kind. Every refusal RAISES: a selector this reader does not
+    understand is never taken as a match, and never as a miss."""
+    if not isinstance(when, dict) or not when:
+        raise LegError("%s must be a non-empty object; an empty `when` would "
+                       "select every target" % where)
+    extra = sorted(k for k in when if not k.startswith("$") and k != "format")
+    if extra:
+        raise LegError("%s names %s, outside the format-only vocabulary "
+                       "({format}) dsscp reads this surface in"
+                       % (where, ", ".join(extra)))
+    want = when.get("format")
+    if not isinstance(want, str) or want not in known:
+        raise LegError("%s format %r is not a kind any shipped object format "
+                       "declares (%s)" % (where, want, ", ".join(sorted(known))))
+    return want == kind
+
+
+def descriptor_active_includes(doc, kind, known, where):
+    """The header names a descriptor's `includes` makes edges ON format KIND. A
+    bare name is unconditional; `{header, when}` is taken only where its `when`
+    selects. Every entry's SHAPE is checked whether or not it is active, which
+    is the anti-lurking rule dsscp's own reader applies."""
+    raw = doc.get("includes", [])
+    if not isinstance(raw, list):
+        raise LegError("%s: includes must be a list" % where)
+    active = []
+    for i, entry in enumerate(raw):
+        at = "%s includes[%d]" % (where, i)
+        if isinstance(entry, str) and entry.strip():
+            active.append(entry)
+            continue
+        if not isinstance(entry, dict):
+            raise LegError("%s must be a header name or {header, when}" % at)
+        extra = sorted(k for k in entry
+                       if not k.startswith("$") and k not in ("header", "when"))
+        header = entry.get("header")
+        if extra or not isinstance(header, str) or not header.strip():
+            raise LegError("%s must be exactly {header, when} naming a header%s"
+                           % (at, (" (unknown: %s)" % ", ".join(extra))
+                              if extra else ""))
+        if descriptor_when_matches(entry.get("when"), kind, known, at + ".when"):
+            active.append(header)
+    return active
+
+
+def descriptor_active_macro(doc, name, kind, known, where):
+    """(params, replacement, variadic) of macro NAME as dsscp injects it on
+    format KIND, or None when it is not injected there; `params` is None for an
+    object-like macro. A flat body applies wherever the macro is available. A
+    `variants` macro takes the ONE arm whose `when` selects KIND: no arm means
+    not injected, and two arms are ambiguous, which RAISES because dsscp
+    refuses it too."""
+    macros = doc.get("macros", [])
+    if not isinstance(macros, list):
+        raise LegError("%s: macros must be a list" % where)
+    hits = [m for m in macros if isinstance(m, dict) and m.get("name") == name]
+    if not hits:
+        return None
+    if len(hits) > 1:
+        raise LegError("%s declares macro %s %d times" % (where, name, len(hits)))
+    macro, at = hits[0], "%s macro %s" % (where, name)
+    if not _descriptor_available(macro, kind, known, at):
+        return None
+    body = macro
+    if "variants" in macro:
+        arms = macro["variants"]
+        if not isinstance(arms, list) or not arms:
+            raise LegError("%s: variants must be a non-empty list" % at)
+        chosen = []
+        for j, arm in enumerate(arms):
+            if not isinstance(arm, dict):
+                raise LegError("%s variants[%d] must be an object" % (at, j))
+            if descriptor_when_matches(arm.get("when"), kind, known,
+                                       "%s variants[%d].when" % (at, j)):
+                chosen.append(arm)
+        if len(chosen) > 1:
+            raise LegError("%s has %d variants selecting format %r: ambiguous, "
+                           "and dsscp refuses it too" % (at, len(chosen), kind))
+        if not chosen:
+            return None
+        body = chosen[0]
+    params = body.get("params")
+    if params is not None and (
+            not isinstance(params, list)
+            or not all(isinstance(p, str) and _BARE_IDENTIFIER.match(p)
+                       for p in params)):
+        raise LegError("%s: params %r must be a list of identifiers" % (at, params))
+    replacement = body.get("replacement")
+    if not isinstance(replacement, str) or "\n" in replacement:
+        raise LegError("%s: replacement must be one line of text" % at)
+    variadic = body.get("variadic", False)
+    if not isinstance(variadic, bool) or (variadic and params is None):
+        raise LegError("%s: variadic must be a boolean on a function-like macro"
+                       % at)
+    return (params, replacement, variadic)
+
+
+def _descriptor_label(config_dir, path):
+    return "shippedLibs/" + os.path.relpath(
+        path, os.path.join(config_dir, "shippedLibs")).replace(os.sep, "/")
+
+
+def reference_surface_findings(leg, config_dir=None):
+    """Everything wrong with a leg's declared `build.referenceSurface`, as lint
+    findings; [] for a leg that declares none. ONE implementation for `--lint`
+    and for the oracle build, which generates nothing while a finding stands.
+    Every finding names `build.referenceSurface`, the key it is about."""
+    label = leg.get("label", "<unlabelled>")
+    surface = leg.get("build", {}).get("referenceSurface")
+    if surface is None:
+        return []
+    head = "leg '%s': build.referenceSurface" % label
+    if not isinstance(surface, list) or not surface:
+        return ["%s must be a non-empty list of {header, includes, macros}; an "
+                "empty one is a second spelling of declaring none" % head]
+    try:
+        if config_dir is None:
+            config_dir = dss_config_tree()[0]
+        kind = leg_format_kind(leg, config_dir)
+        known = shipped_format_kinds(config_dir)
+    except LegError as exc:
+        return ["%s cannot be checked: %s" % (head, exc)]
+    findings, seen = [], set()
+    for i, entry in enumerate(surface):
+        at = "%s[%d]" % (head, i)
+        if not isinstance(entry, dict):
+            findings.append("%s must be an object {header, includes, macros}" % at)
+            continue
+        extra = sorted(k for k in entry if not k.startswith("$")
+                       and k not in REFERENCE_SURFACE_ENTRY_KEYS)
+        if extra:
+            findings.append("%s declares unknown key(s) %s (known: %s)"
+                            % (at, ", ".join(extra),
+                               ", ".join(REFERENCE_SURFACE_ENTRY_KEYS)))
+        header = entry.get("header")
+        try:
+            desc = shipped_descriptor_path(config_dir, header)
+        except LegError as exc:
+            findings.append("%s: header %s" % (at, exc))
+            continue
+        if header in seen:
+            findings.append("%s declares <%s> a second time" % (at, header))
+            continue
+        seen.add(header)
+        lists = {}
+        for key in ("includes", "macros"):
+            vals = entry.get(key, [])
+            if (not isinstance(vals, list)
+                    or not all(isinstance(v, str) and v.strip() for v in vals)
+                    or len(set(vals)) != len(vals)):
+                findings.append("%s <%s>: %s must be a list of distinct non-empty "
+                                "names, got %r" % (at, header, key, vals))
+                vals = None
+            lists[key] = vals
+        if lists["includes"] is None or lists["macros"] is None:
+            continue
+        if not lists["includes"] and not lists["macros"]:
+            findings.append("%s <%s> declares neither includes nor macros: a shim "
+                            "that adds nothing" % (at, header))
+            continue
+        where = _descriptor_label(config_dir, desc)
+        if not os.path.isfile(desc):
+            findings.append("%s <%s>: no shipped descriptor at %s, so dsscp "
+                            "declares nothing for that header" % (at, header, where))
+            continue
+        try:
+            doc = _config_json(desc)
+            if not _descriptor_available(doc, kind, known, where):
+                findings.append("%s <%s>: %s is not available on format kind %r, "
+                                "so dsscp serves no such header there"
+                                % (at, header, where, kind))
+                continue
+            active = descriptor_active_includes(doc, kind, known, where)
+            for inc in lists["includes"]:
+                if inc not in active:
+                    findings.append(
+                        "%s <%s> -> <%s> is not an edge dsscp takes on format kind "
+                        "%r (%s's active edges there: %s); a shim for it would hand "
+                        "the reference a header graph dss does not have"
+                        % (at, header, inc, kind, where,
+                           ", ".join("<%s>" % a for a in active) or "none"))
+                elif not os.path.isfile(shipped_descriptor_path(config_dir, inc)):
+                    findings.append("%s <%s> -> <%s>: the edge names a header with "
+                                    "no shipped descriptor" % (at, header, inc))
+            for name in lists["macros"]:
+                if descriptor_active_macro(doc, name, kind, known, where) is None:
+                    findings.append("%s <%s>: macro %s is not injected by dsscp on "
+                                    "format kind %r (%s selects no body for it "
+                                    "there)" % (at, header, name, kind, where))
+        except LegError as exc:
+            findings.append("%s <%s>: %s" % (at, header, exc))
+    return findings
+
+
+def reference_surface_shims(leg, config_dir=None):
+    """{header name: shim text} for the leg's declared surface; {} when it
+    declares none. RAISES while any finding stands: a shim is generated from a
+    declaration the descriptors confirm, or not at all.
+
+    A shim continues to the reference's OWN header, then adds what dsscp
+    injects for that header on this format, parent first as dsscp walks it: the
+    macros the descriptor selects, then the headers its active edges pull. A
+    macro is defined unconditionally, so a reference header that already
+    defines it DIFFERENTLY is reported by the compiler as a redefinition,
+    instead of silently winning or silently losing."""
+    if leg.get("build", {}).get("referenceSurface") is None:
+        return {}
+    if config_dir is None:
+        config_dir = dss_config_tree()[0]
+    problems = reference_surface_findings(leg, config_dir)
+    if problems:
+        raise LegError("leg '%s': the declared reference surface cannot be "
+                       "generated: %s" % (leg.get("label"), "; ".join(problems)))
+    kind = leg_format_kind(leg, config_dir)
+    known = shipped_format_kinds(config_dir)
+    shims = {}
+    for entry in leg["build"]["referenceSurface"]:
+        header = entry["header"]
+        desc = shipped_descriptor_path(config_dir, header)
+        where = _descriptor_label(config_dir, desc)
+        doc = _config_json(desc)
+        lines = ["// Generated by harness_legs.py from dsscp's %s for format kind "
+                 "%s." % (where, kind),
+                 "// Rewritten by every oracle build: change the descriptor, "
+                 "never this file.",
+                 "#include_next <%s>" % header]
+        for name in entry.get("macros", []):
+            params, replacement, variadic = descriptor_active_macro(
+                doc, name, kind, known, where)
+            head = name if params is None else "%s(%s)" % (
+                name, ", ".join(list(params) + (["..."] if variadic else [])))
+            lines.append(("#define %s %s" % (head, replacement)).rstrip())
+        for inc in entry.get("includes", []):
+            lines.append("#include <%s>" % inc)
+        shims[header] = "\n".join(lines) + "\n"
+    return shims
+
+
+def write_reference_surface(shims, root):
+    """Write the shims under `root/<digest>/` and return that directory, or ""
+    when there are none.
+
+    ★ THE DIRECTORY IS NAMED BY ITS OWN CONTENT, which is what makes a stale shim
+    impossible without deleting anything: a declaration that drops a header
+    gets a DIFFERENT directory, so a shim an earlier build wrote can never sit
+    on this build's include path. A file in the directory that this declaration
+    did not generate is REFUSED, because an include path holding a header nobody
+    declared builds a different reference."""
+    if not shims:
+        return ""
+    digest = hashlib.sha256()
+    for name in sorted(shims):
+        digest.update(name.encode("utf-8") + b"\0"
+                      + shims[name].encode("utf-8") + b"\0")
+    target = os.path.abspath(os.path.join(root, digest.hexdigest()[:16]))
+    expected = set()
+    for name in sorted(shims):
+        dest = os.path.join(target, *name.split("/"))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(shims[name])
+        expected.add(os.path.normcase(dest))
+    stray = sorted(os.path.join(dirpath, f)
+                   for dirpath, _dirs, files in os.walk(target) for f in files
+                   if os.path.normcase(os.path.join(dirpath, f)) not in expected)
+    if stray:
+        raise LegError(
+            "the reference surface directory %s holds %d file(s) its declaration "
+            "did not generate (%s); refusing to put it on the reference's include "
+            "path" % (target, len(stray), ", ".join(stray)))
+    return target
+
+
+def _spawn_capturing(argv):
+    """(rc, combined output bytes). rc DIRECTLY off the process, never after a
+    pipe."""
+    import subprocess
+    proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return proc.returncode, proc.stdout
+
+
+def build_reference_oracle(leg, manifest_path, oracle_output, oracle_log,
+                           runner=None, which=None, spawn=None, environ=None):
+    """`--build-reference-oracle`, returned instead of printed: (report, rc,
+    stderr lines). rc 0 built, 3 the build failed, 4 no declared compiler on
+    this host targets the leg. A declared surface this harness refuses RAISES
+    LegError (rc 2 at the CLI) and nothing is built.
+
+    The probe, the lookup and the spawn are injectable, so the self-test drives
+    this exact composition (the resolution, the generated surface and the argv
+    that carries it) with no compiler on the host."""
+    cc, machine, rejections = resolve_target_cc(leg, runner=runner, which=which)
+    notes = ["  rejected %s" % line for line in rejections]
+    if not cc:
+        # rc 4 is NOT a failure of this run — it is the honest statement
+        # that this host cannot produce a control for this leg. The leg
+        # then reports NO ORACLE, which is the whole point of the anchor.
+        notes.append(
+            "no declared targetCc candidate for leg '%s' (%s) both "
+            "exists on this host AND targets it, so NO same-platform "
+            "attribution oracle can be built here. The leg reports that "
+            "it HAS NO ORACLE rather than inheriting another platform's "
+            "reference [D-HARNESS-PE64-HAS-NO-SAME-PLATFORM-ORACLE]."
+            % (leg.get("label"), leg.get("spec")))
+        return ({"status": ORACLE_STATUS_NO_COMPILER,
+                 "leg": leg.get("label"), "spec": leg.get("spec"),
+                 "rejections": rejections}, 4, notes)
+    with open(manifest_path, "r", encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    surface_dir, surface, config = "", [], ""
+    if leg.get("build", {}).get("referenceSurface") is not None:
+        config_dir, how = dss_config_tree(environ)
+        shims = reference_surface_shims(leg, config_dir)
+        surface_dir = write_reference_surface(shims, os.path.join(
+            os.path.dirname(os.path.abspath(oracle_output)),
+            REFERENCE_SURFACE_DIR_NAME))
+        surface, config = sorted(shims), "%s (%s)" % (config_dir, how)
+    argv = reference_oracle_argv(
+        cc, manifest, oracle_output,
+        leg.get("build", {}).get("referenceLinkFlags", []), surface_dir)
+    with open(oracle_log, "w", encoding="utf-8") as log:
+        log.write("%s\n\n" % " ".join(argv))
+        log.flush()
+        rc, output = (spawn or _spawn_capturing)(argv)
+        log.write((output or b"").decode("utf-8", "replace"))
+    built = rc == 0 and os.path.isfile(oracle_output)
+    report = {"status": ORACLE_STATUS_BUILT if built else ORACLE_STATUS_BUILD_FAILED,
+              "leg": leg.get("label"), "spec": leg.get("spec"),
+              "cc": cc_display(cc), "ccArgv": list(cc),
+              "triple": machine, "rc": rc,
+              "path": oracle_output if built else "",
+              "log": oracle_log, "sources": len(manifest.get("sources", [])),
+              "rejections": rejections,
+              "referenceSurface": surface,
+              "referenceSurfaceDir": surface_dir,
+              "referenceSurfaceConfig": config}
+    if not built:
+        # LOUD, and it does not degrade to the cross-platform reference:
+        # a control that failed to build is an absent control, and saying
+        # so is the entire discipline this anchor enforces.
+        notes.append(
+            "the same-platform oracle for leg '%s' did NOT build (%s "
+            "exited %d). The leg reports NO ORACLE; read %s."
+            % (leg.get("label"), cc_display(cc), rc, oracle_log))
+        return report, 3, notes
+    return report, 0, notes
 
 
 # ── PER-TU BUILD ATTRIBUTION, DRIVEN BY THE LEG'S OWN ORACLE ────────────────
@@ -8177,6 +9651,18 @@ def plan_leg(leg, host_os, host_arch, available, kernel_measurements=None):
         # name space. [D-HARNESS-ABORT-HAS-NO-EARNED-CONFOUND-VOCABULARY]
         "confounds": [d["wire"] for d in decisions
                       if d["active"] and d["matches"] == "unit"],
+        # ★★ `confounds` IS EVERY UNIT ROW IN FORCE; WHAT A MATCHER MAY EXCUSE BY
+        # NAME IS `confoundsByName`. An ARMED row (a clock row whose probe's
+        # instrument read this leg's kernel) is in force and excuses a failure
+        # only on evidence from that failure's own execution, so it lives in
+        # `confoundsByEvidence`, both drivers keep it away from their by-name
+        # matcher, and `executionEvidence` names the monitors they start around
+        # every corpus segment. `confounds` stays the union so a reader of the plan
+        # still sees every row in force.
+        # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+        "confoundsByName": confounds_by_name(decisions),
+        "confoundsByEvidence": confounds_by_evidence(decisions),
+        "executionEvidence": execution_evidence_probes(decisions),
         "abortConfounds": [d["wire"] for d in decisions
                            if d["active"] and d["matches"] == "abort-file"],
         "confoundRows": [dict(r) for r in leg.get("confounds", [])],
@@ -8829,7 +10315,17 @@ def emit_sh(resolved):
         # confound under one and a compiler defect under the other. The
         # provenance behind each pattern stays in legs.json, where the lint can
         # require it — a driver needs the pattern, a reader needs the evidence.
-        put("LEG_CONFOUNDS", " ".join(q(x) for x in leg["confounds"]))
+        # ★★ THE BY-NAME SUPPLY. `LEG_CONFOUNDS` is what the unit matcher and the
+        # run-directory corroboration read, so it carries `confoundsByName` — never
+        # an ARMED row, which excuses a failure only on evidence from that
+        # failure's own execution. The armed half and the monitors it needs travel
+        # beside it.
+        # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+        put("LEG_CONFOUNDS", " ".join(q(x) for x in leg["confoundsByName"]))
+        put("LEG_EVIDENCE_CONFOUNDS",
+            " ".join(q(x) for x in leg["confoundsByEvidence"]))
+        put("LEG_EXECUTION_EVIDENCE",
+            " ".join(q(x) for x in leg["executionEvidence"]))
         put("LEG_ABORT_CONFOUNDS",
             " ".join(q(x) for x in leg.get("abortConfounds", [])))
         # ★ AND WHETHER A MACHINE MEASUREMENT BACKS THAT LIST. `unprobed` is
@@ -9853,6 +11349,12 @@ def lint(path=CATALOGUE):
                 cc_argv(cand)
             except LegError as exc:
                 findings.append("leg '%s': %s" % (label, exc))
+        # ── THE REFERENCE'S DECLARED HEADER EDGES, AGAINST THE DESCRIPTORS ──────
+        # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+        # Checked HERE as well as at the oracle build, by the one function both
+        # call: an edge the descriptors stopped declaring must turn the catalogue
+        # red before a run spends an hour building a reference from it.
+        findings.extend(reference_surface_findings(leg))
         if not build.get("sharedLibFlags"):
             findings.append("leg '%s': no sharedLibFlags" % label)
         # ── the object format the helper is EMITTED in ────────────────────────
@@ -10082,6 +11584,18 @@ DSS_REGIONS = {
     # module (corroborate_run_directory / run_directory_row_verdict) and pinned by
     # the self-test, so what a driver can still get wrong is asking at all.
     "run-dir-corroborate": {
+        "drivers": ["build-and-test.sh", "build-and-test.ps1"],
+        "verifiers": ["test-confound-scope.sh", "test-confound-scope.ps1"]},
+    # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+    # BOTH DRIVERS, `mirror` NOT claimed — the build-attribution and
+    # run-dir-corroborate judgement again: the two halves spawn a process and fold a
+    # resolver answer through genuinely different transports (bash background jobs
+    # and `$( )`, PowerShell Start-Process and `& python`). What is enforced is the
+    # PAIRING, because a driver that never started the monitor would charge every
+    # clock failure on its side to DSS while the other excused it on evidence — two
+    # verdicts on one tree. The DECISION is single-implementation in this module
+    # (attribute_unit_failures, execution_monitor_loop) and pinned by the self-test.
+    "exec-evidence": {
         "drivers": ["build-and-test.sh", "build-and-test.ps1"],
         "verifiers": ["test-confound-scope.sh", "test-confound-scope.ps1"]},
     # [D-HARNESS-RUN-FIDELITY-IS-COMPUTED-BUT-NEITHER-RECORDED-NOR-SELECTABLE]
@@ -13350,6 +14864,289 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           _argv == ["cc", "-o", "/out/ref", "-DA=1", "-I/inc", "/a.c",
                     "/lib/z.so", "/lib/tcl.so", "-lm"],
           "got %r" % (_argv,))
+    # ── THE REFERENCE IS HANDED DSS'S OWN DECLARED HEADER EDGES ─────────────
+    # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+    # Driven over the SHIPPED descriptors and the SHIPPED pe64 declaration first,
+    # because a shim is only as right as the tree it is read from; then over a
+    # synthesized tree, for every refusal the shipped one cannot reach.
+    def _rs_try(thunk, default):
+        """(value, "") or (default, the refusal): a LegError out of a surface
+        call must turn the checks below red BY NAME, never take the runner
+        down with a traceback that names nothing."""
+        try:
+            return thunk(), ""
+        except LegError as exc:
+            return default, "raised: %s" % exc
+    _rs_shims, _rs_why = _rs_try(
+        lambda: reference_surface_shims(_pe_leg_for_oracle), {})
+
+    def _rs_directives(text):
+        return [ln for ln in (text or "").splitlines() if ln.startswith("#")]
+    check("the pe64 surface derives exactly its three shims from the shipped descriptors",
+          sorted(_rs_shims) == ["direct.h", "dirent.h", "sys/stat.h"],
+          "got %r %s" % (sorted(_rs_shims), _rs_why))
+    check("...<direct.h> continues to the reference's own header, then takes dsscp's edge to <dirent.h>",
+          _rs_directives(_rs_shims.get("direct.h"))
+          == ["#include_next <direct.h>", "#include <dirent.h>"],
+          "%r" % _rs_shims.get("direct.h"))
+    check("...<dirent.h> takes dsscp's edge to <windows.h>",
+          _rs_directives(_rs_shims.get("dirent.h"))
+          == ["#include_next <dirent.h>", "#include <windows.h>"],
+          "%r" % _rs_shims.get("dirent.h"))
+    check("...and <sys/stat.h> gains the S_ISLNK dsscp injects on pe, its body read from the descriptor",
+          _rs_directives(_rs_shims.get("sys/stat.h"))
+          == ["#include_next <sys/stat.h>", "#define S_ISLNK(m) (0)"],
+          "%r" % _rs_shims.get("sys/stat.h"))
+    check("the shipped pe64 surface has no lint finding (the control)",
+          reference_surface_findings(_pe_leg_for_oracle) == [],
+          "%r" % reference_surface_findings(_pe_leg_for_oracle))
+    check("a leg that declares no surface gets no shims and no finding (the ELF control)",
+          reference_surface_shims(legs[0]) == {}
+          and reference_surface_findings(legs[0]) == [])
+
+    def _rs_findings_for(leg, surface, config_dir=None):
+        _l = json.loads(json.dumps(leg))
+        _l["build"]["referenceSurface"] = surface
+        return reference_surface_findings(_l, config_dir)
+    # ★ KEYED ON THE LEG'S FORMAT, NEVER ON THE HOST, and shown on the SHIPPED
+    # descriptors in all three places a format decides: whether the header is
+    # served at all, whether an edge is taken, and which macro body is injected.
+    _rs_elf = json.loads(json.dumps(legs[0]))
+    _rs_elf["build"]["referenceSurface"] = [{"header": "direct.h",
+                                             "includes": ["dirent.h"]}]
+    _rs_f = reference_surface_findings(_rs_elf)
+    check("a pe-only header declared on an ELF leg is REFUSED: dsscp serves <direct.h> on no ELF target",
+          any("<direct.h>" in f and "not available on format kind 'elf'" in f
+              for f in _rs_f), "%r" % _rs_f)
+    check("...and generating it RAISES rather than writing a shim dss would not have",
+          _raises(lambda: reference_surface_shims(_rs_elf)))
+    _rs_f = _rs_findings_for(legs[0], [{"header": "sys/stat.h",
+                                        "includes": ["io.h"]}])
+    check("an edge dsscp takes only on pe is REFUSED on an ELF leg, on a header served on both",
+          any("<sys/stat.h> -> <io.h>" in f and "'elf'" in f for f in _rs_f),
+          "%r" % _rs_f)
+    check("...and the SAME declaration is accepted on the pe leg (the control)",
+          _rs_findings_for(_pe_leg_for_oracle,
+                           [{"header": "sys/stat.h", "includes": ["io.h"]}]) == [])
+    _rs_elf_macro = json.loads(json.dumps(legs[0]))
+    _rs_elf_macro["build"]["referenceSurface"] = [{"header": "sys/stat.h",
+                                                   "macros": ["S_ISLNK"]}]
+    _rs_elf_shims, _rs_why = _rs_try(
+        lambda: reference_surface_shims(_rs_elf_macro), {})
+    check("...and the same macro declaration renders the ELF body on an ELF leg: the format picks the arm",
+          _rs_directives(_rs_elf_shims.get("sys/stat.h"))
+          == ["#include_next <sys/stat.h>",
+              "#define S_ISLNK(m) (((m) & 61440) == 40960)"],
+          "%r %s" % (_rs_elf_shims, _rs_why))
+    for _surface, _needle, _what in (
+            ([{"header": "direct.h", "includes": ["stdio.h"]}], "<stdio.h>",
+             "an edge the descriptor does not declare"),
+            ([{"header": "sys/stat.h", "macros": ["S_ISSOCK"]}], "S_ISSOCK",
+             "a macro dsscp injects on no pe arm"),
+            ([{"header": "direct.h", "includes": ["dirent.h"], "defines": ["X"]}],
+             "unknown key(s) defines", "an entry key nothing reads"),
+            ([{"header": "no-such-header.h", "includes": ["dirent.h"]}],
+             "no shipped descriptor", "a header dsscp ships no descriptor for"),
+            ([{"header": "../direct.h", "includes": ["dirent.h"]}],
+             "'../direct.h'", "a header name that climbs out of the descriptor tree"),
+            ([{"header": "direct.h"}], "neither includes nor macros",
+             "an entry that adds nothing"),
+            ([{"header": "direct.h", "includes": ["dirent.h"]},
+              {"header": "direct.h", "includes": ["dirent.h"]}], "second time",
+             "the same header declared twice"),
+            ([], "non-empty list", "an empty surface"),
+    ):
+        _rs_f = _rs_findings_for(_pe_leg_for_oracle, _surface)
+        check("the surface lint REFUSES %s" % _what,
+              any(_needle in f for f in _rs_f), "%r" % _rs_f)
+    check("a leg whose oracle carries dsscp's declared edges SAYS so in its report, naming each header",
+          "declared header edges" in _own and "<direct.h>" in _own
+          and "<dirent.h>" in _own and "<sys/stat.h>" in _own, _own)
+    _own_elf = "\n".join(oracle_report_lines(
+        legs[0], _elf_ref, "/out/reference-testfixture",
+        {"path": "/out/elf64/reference-testfixture", "cc": "cc",
+         "triple": "x86_64-linux-gnu"}))
+    check("...and a leg without them says nothing of the kind (the control)",
+          ": SAME-PLATFORM" in _own_elf and "declared header edges" not in _own_elf,
+          _own_elf)
+    # ★ AND THE COMPILER A NO-ORACLE LINE NAMES IS SHOWN AS THE ARGV IT IS.
+    # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+    # ✔MEASURED 2026-09-15 in a real driver run's own Step 9: `resolve_target_cc`
+    # answers an ARGV LIST and this line formatted it with `%s`, so the report
+    # read "`['aarch64-linux-gnu-gcc']` ... is on PATH". The arms above feed the
+    # resolver's place a bare STRING, the one shape the resolver never returns,
+    # which is why none of them could see it.
+    _rs_gap = "\n".join(oracle_report_lines(
+        _pe_leg_for_oracle, _elf_ref, "/out/reference-testfixture", None,
+        (["x86_64-w64-mingw32-gcc"], "x86_64-w64-mingw32", []), ""))
+    check("the no-oracle line names the resolved compiler as the argv it is, never as a python list",
+          "`x86_64-w64-mingw32-gcc` (x86_64-w64-mingw32) is on PATH" in _rs_gap
+          and "['" not in _rs_gap, _rs_gap)
+    import tempfile as _tf_rs
+    _rs_dir = _tf_rs.mkdtemp(prefix="dss-refsurface-")
+    try:
+        _rs_root = os.path.join(_rs_dir, "tree")
+        _rs_cfg = os.path.join(_rs_root, "src", "dss-config")
+        for _sub in ("object-formats", "shippedLibs"):
+            os.makedirs(os.path.join(_rs_cfg, _sub))
+        for _fmt, _kind in (("pe64-x86_64-windows-exec", "pe"),
+                            ("elf64-x86_64-linux-exec", "elf")):
+            with open(os.path.join(_rs_cfg, "object-formats",
+                                   _fmt + ".format.json"), "w",
+                      encoding="utf-8") as _fh:
+                json.dump({"format": {"name": _fmt, "kind": _kind}}, _fh)
+
+        def _rs_descriptor(name, doc):
+            with open(os.path.join(_rs_cfg, "shippedLibs", name + ".json"), "w",
+                      encoding="utf-8") as _fh:
+                json.dump(doc, _fh)
+        _rs_descriptor("b", {"header": "b.h", "symbols": []})
+        _rs_synth = {"label": "synth", "spec": "x86_64:pe64-x86_64-windows-exec",
+                     "build": {}}
+        for _when, _needle, _what in (
+                ({"format": "pe", "arch": "x86_64"}, "names arch",
+                 "an `arch` key (dsscp reads edges FORMAT-ONLY)"),
+                ({}, "non-empty object",
+                 "an empty `when`, which would select every target"),
+                ({"format": "pef"}, "'pef'",
+                 "a format no shipped object format declares"),
+        ):
+            _rs_descriptor("a", {"header": "a.h",
+                                 "includes": [{"header": "b.h", "when": _when}]})
+            _rs_f = _rs_findings_for(_rs_synth, [{"header": "a.h",
+                                                  "includes": ["b.h"]}], _rs_cfg)
+            check("a descriptor edge with %s is REFUSED, never guessed" % _what,
+                  any(_needle in f for f in _rs_f), "%r" % _rs_f)
+        _rs_descriptor("a", {"header": "a.h", "includes": [
+            {"header": "b.h", "when": {"format": "elf"}}]})
+        _rs_f = _rs_findings_for(_rs_synth, [{"header": "a.h",
+                                              "includes": ["b.h"]}], _rs_cfg)
+        check("an edge dsscp takes only on ELF is not an edge on a pe leg",
+              any("<b.h>" in f and "'pe'" in f for f in _rs_f), "%r" % _rs_f)
+        _rs_descriptor("a", {"header": "a.h", "includes": ["b.h"], "macros": [
+            {"name": "M", "variants": [
+                {"when": {"format": "pe"}, "replacement": "1"},
+                {"when": {"format": "pe"}, "replacement": "2"}]}]})
+        _rs_f = _rs_findings_for(_rs_synth, [{"header": "a.h", "macros": ["M"]}],
+                                 _rs_cfg)
+        check("a macro with TWO arms for the leg's format is REFUSED as ambiguous",
+              any("ambiguous" in f for f in _rs_f), "%r" % _rs_f)
+        _rs_descriptor("a", {"header": "a.h", "availableObjectFormats": ["elf"],
+                             "includes": ["b.h"]})
+        _rs_f = _rs_findings_for(_rs_synth, [{"header": "a.h",
+                                              "includes": ["b.h"]}], _rs_cfg)
+        check("a header dsscp does not serve on the leg's format at all is REFUSED",
+              any("not available" in f for f in _rs_f), "%r" % _rs_f)
+        _rs_descriptor("a", {"header": "a.h", "includes": ["b.h"], "macros": [
+            {"name": "V", "params": ["x"], "variadic": True,
+             "replacement": "f(x, __VA_ARGS__)"},
+            {"name": "O", "variants": [
+                {"when": {"format": "pe"}, "replacement": "7"},
+                {"when": {"format": "elf"}, "params": ["q"], "replacement": "q"}]}]})
+        _rs_l = json.loads(json.dumps(_rs_synth))
+        _rs_l["build"]["referenceSurface"] = [
+            {"header": "a.h", "includes": ["b.h"], "macros": ["V", "O"]}]
+        _rs_sh, _rs_why = _rs_try(
+            lambda: reference_surface_shims(_rs_l, _rs_cfg), {})
+        check("a variadic and a per-format object-like macro render as dsscp injects them on pe, the parent's defines before its edges",
+              _rs_directives(_rs_sh.get("a.h"))
+              == ["#include_next <a.h>", "#define V(x, ...) f(x, __VA_ARGS__)",
+                  "#define O 7", "#include <b.h>"], "%r %s" % (_rs_sh, _rs_why))
+        check("the descriptors are read from $DSS_CONFIG_ROOT when it answers, as dsscp reads its own",
+              dss_config_tree({"DSS_CONFIG_ROOT": _rs_root})
+              == (_rs_cfg, "$DSS_CONFIG_ROOT"),
+              "%r" % (dss_config_tree({"DSS_CONFIG_ROOT": _rs_root}),))
+        try:
+            _rs_fall = dss_config_tree(
+                {"DSS_CONFIG_ROOT": os.path.join(_rs_dir, "nowhere")})
+        except LegError as _exc:
+            _rs_fall = ("", "raised: %s" % _exc)
+        check("...and a set override that does not answer falls through to this checkout, SAYING so",
+              _rs_fall[0] not in ("", _rs_cfg) and "did not answer" in _rs_fall[1],
+              "%r" % (_rs_fall,))
+        # THE WRITER.
+        _rs_out = os.path.join(_rs_dir, "oracle", REFERENCE_SURFACE_DIR_NAME)
+        _rs_d1 = write_reference_surface(_rs_shims, _rs_out)
+
+        def _rs_files(d):
+            return sorted(os.path.relpath(os.path.join(dp, f), d).replace(os.sep, "/")
+                          for dp, _dn, fs in os.walk(d) for f in fs)
+        check("the writer puts exactly the declared shims under one directory",
+              _rs_files(_rs_d1) == ["direct.h", "dirent.h", "sys/stat.h"],
+              "%r" % _rs_files(_rs_d1))
+        check("...named by its own content: the same declaration lands in the same place",
+              write_reference_surface(_rs_shims, _rs_out) == _rs_d1)
+        _rs_fewer = dict((k, v) for k, v in _rs_shims.items() if k != "sys/stat.h")
+        _rs_d2 = write_reference_surface(_rs_fewer, _rs_out)
+        check("...and a changed declaration in ANOTHER, so a shim an earlier build wrote can never sit on this build's include path",
+              _rs_d2 != _rs_d1 and _rs_files(_rs_d2) == ["direct.h", "dirent.h"],
+              "%r / %r" % (_rs_d2, _rs_d1))
+        if _rs_d1:
+            with open(os.path.join(_rs_d1, "stray.h"), "w", encoding="utf-8") as _fh:
+                _fh.write("#define STRAY 1\n")
+        check("a file in the surface directory that the declaration did not generate is REFUSED",
+              bool(_rs_d1)
+              and _raises(lambda: write_reference_surface(_rs_shims, _rs_out)))
+        check("no surface, no directory",
+              write_reference_surface({}, _rs_out) == "")
+        # THE WIRING `--build-reference-oracle` runs, with an injected compiler.
+        _rs_manifest_doc = {"defines": ["A=1"], "includes": ["/inc"],
+                            "sources": ["/a.c"], "resolveLibraries": []}
+        _rs_manifest = os.path.join(_rs_dir, "manifest.json")
+        with open(_rs_manifest, "w", encoding="utf-8") as _fh:
+            json.dump(_rs_manifest_doc, _fh)
+        _rs_spawned = []
+
+        def _rs_spawn(argv):
+            _rs_spawned.append(list(argv))
+            with open(argv[argv.index("-o") + 1], "wb") as _fh:
+                _fh.write(b"MZ")
+            return 0, b""
+        _rs_pe_dir = os.path.join(_rs_dir, "pe-oracle")
+        os.makedirs(_rs_pe_dir)
+        (_rs_rep, _rs_rc, _rs_notes), _rs_why = _rs_try(
+            lambda: build_reference_oracle(
+                _pe_leg_for_oracle, _rs_manifest,
+                os.path.join(_rs_pe_dir, reference_oracle_name(_pe_leg_for_oracle)),
+                os.path.join(_rs_pe_dir, "reference-oracle.log"),
+                runner=lambda argv: (0, "x86_64-w64-mingw32\n"),
+                which=lambda name: "/fixture/bin/" + name, spawn=_rs_spawn),
+            ({}, None, []))
+        _rs_notes = list(_rs_notes) + ([_rs_why] if _rs_why else [])
+        _rs_sd = _rs_rep.get("referenceSurfaceDir", "")
+        _rs_argv = _rs_spawned[0] if _rs_spawned else []
+        check("the oracle build puts the generated surface on the reference's include path AHEAD of the manifest's",
+              _rs_rc == 0 and bool(_rs_sd) and ("-I" + _rs_sd) in _rs_argv
+              and "-I/inc" in _rs_argv
+              and _rs_argv.index("-I" + _rs_sd) < _rs_argv.index("-I/inc"),
+              "rc=%r report=%r argv=%r notes=%r"
+              % (_rs_rc, _rs_rep, _rs_argv, _rs_notes))
+        check("...and its report names the headers and the tree they were read from",
+              _rs_rep.get("referenceSurface") == ["direct.h", "dirent.h", "sys/stat.h"]
+              and bool(_rs_rep.get("referenceSurfaceConfig"))
+              and os.path.isfile(os.path.join(_rs_sd, "sys", "stat.h")),
+              "%r" % (_rs_rep,))
+        _rs_spawned[:] = []
+        _rs_elf_dir = os.path.join(_rs_dir, "elf-oracle")
+        os.makedirs(_rs_elf_dir)
+        _rs_elf_out = os.path.join(_rs_elf_dir, reference_oracle_name(legs[0]))
+        (_rs_rep0, _rs_rc0, _rs_notes0), _rs_why = _rs_try(
+            lambda: build_reference_oracle(
+                legs[0], _rs_manifest, _rs_elf_out,
+                os.path.join(_rs_elf_dir, "reference-oracle.log"),
+                runner=lambda argv: (0, "x86_64-linux-gnu\n"),
+                which=lambda name: "/fixture/bin/" + name, spawn=_rs_spawn),
+            ({}, None, []))
+        _rs_notes0 = list(_rs_notes0) + ([_rs_why] if _rs_why else [])
+        check("...while a leg with no surface builds with exactly the argv it always had (the control)",
+              _rs_rc0 == 0 and _rs_rep0.get("referenceSurface") == []
+              and _rs_spawned == [reference_oracle_argv(
+                  _rs_rep0.get("ccArgv"), _rs_manifest_doc, _rs_elf_out,
+                  legs[0]["build"].get("referenceLinkFlags", []))],
+              "rc=%r report=%r argv=%r notes=%r"
+              % (_rs_rc0, _rs_rep0, _rs_spawned, _rs_notes0))
+    finally:
+        shutil.rmtree(_rs_dir, ignore_errors=True)
     # ── THE ABORT HALF OF THE SAME LEDGER ───────────────────────────────────
     # [D-HARNESS-ABORT-HAS-NO-EARNED-CONFOUND-VOCABULARY] Driven through the
     # SHIPPED catalogue's own rows, never a retyped fixture: these assert about
@@ -14689,22 +16486,65 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     _ind = {nm: {"verdict": "indeterminate", "why": "self-test fixture",
                  "verb": "wall-clock-step", "evidence": {},
                  "source": PROBE_SOURCE_MEASURED} for nm in _reg}
+    # DERIVED from the leg's own declaration — every unit row that names a probe —
+    # and asserted to contain the three families this mechanism was built on, so a
+    # clock row earned later (a new wall-clock test) cannot silently fall outside
+    # these pins, and renaming one of the three still reds.
+    _clock_rows = {r["pattern"] for r in _elf["confounds"]
+                   if r.get("requires") and confound_match_kind(r) == "unit"}
+    check("the clock rows these pins read are derived from the catalogue and "
+          "include the three original families",
+          {"^walsetlk-", "^walsetlk_recover-", "^busy2-"} <= _clock_rows,
+          "got %r" % sorted(_clock_rows))
+    _uncond_rows = {"^zipfile-25\\.0$", "^date-2\\.4c$", "^recoverfault"}
+    _dec_present = leg_confound_decisions(_elf, _gate(_probes_present, _same_kernel))
+    _dec_absent = leg_confound_decisions(_elf, _gate(_absent, _same_kernel))
     _on = set(leg_confounds(_elf, _gate(_probes_present, _same_kernel)))
-    _off = set(leg_confounds(_elf, _gate(_absent, _same_kernel)))
-    check("with the clock defect PRESENT, the clock families are honoured",
-          {"^walsetlk-", "^walsetlk_recover-", "^busy2-"} <= _on, "got %r" % _on)
-    # ★★★ THE WHOLE POINT OF THIS CHANGE, IN ONE ASSERTION. On a healthy-clock box
-    # — the arm64 VPS is the real one — those three patterns are NOT in force, so a
-    # genuine walsetlk failure there is reported as GENUINE for the first time.
-    check("with the clock HEALTHY, the clock families are NOT honoured",
-          not ({"^walsetlk-", "^walsetlk_recover-", "^busy2-"} & _off),
-          "this is the blind spot closing: at `scope: any` these excused a "
-          "walsetlk failure on the arm64 VPS, where the clock has never been shown "
-          "to step; got %r" % _off)
-    check("...and INDETERMINATE behaves exactly like ABSENT here",
-          set(leg_confounds(_elf, _gate(_ind, _same_kernel))) == _off)
-    check("the UNCONDITIONAL rows survive a healthy clock",
-          {"^zipfile-25\\.0$", "^date-2\\.4c$", "^recoverfault"} <= _off,
+    # `_off` is the state in which NO conditional row is in force: the instrument
+    # could not read the kernel. Until the per-failure attribution it was also the
+    # ABSENT state, and that equality was the defect.
+    _off = set(leg_confounds(_elf, _gate(_ind, _same_kernel)))
+    check("with a PRESENT pre-run sample, the clock families are IN FORCE (armed)",
+          _clock_rows <= _on, "got %r" % _on)
+    # ★★★ THE WHOLE POINT OF THE PER-FAILURE ATTRIBUTION, AT PLAN LEVEL, IN THREE
+    # ASSERTIONS. [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+    # (1) an armed row never reaches a by-name matcher, so a PRESENT sample cannot
+    #     excuse a failure by itself — the silent direction;
+    check("...but NOT ONE clock row is matched BY NAME on a PRESENT sample",
+          not (_clock_rows & set(confounds_by_name(_dec_present)))
+          and _clock_rows <= set(confounds_by_evidence(_dec_present)),
+          "a pattern the by-name matcher sees excuses every failure it matches, "
+          "which is the pre-run sample deciding; by-name %r, by-evidence %r"
+          % (confounds_by_name(_dec_present), confounds_by_evidence(_dec_present)))
+    # (2) an ABSENT sample arms the SAME rows, so a sampler that missed the clock
+    #     cannot charge its failures to the compiler — the noisy direction;
+    check("with an ABSENT pre-run sample the clock families are STILL ARMED",
+          _clock_rows <= set(leg_confounds(_elf, _gate(_absent, _same_kernel)))
+          and _clock_rows <= set(confounds_by_evidence(_dec_absent)),
+          "✔MEASURED 2026-09-14: the loaded run sampled ABSENT and charged walsetlk "
+          "failures to DSS that the quiet run excused; got %r"
+          % confounds_by_evidence(_dec_absent))
+    # (3) and the two samples therefore yield the SAME supply — the flip, gone.
+    check("...and a PRESENT and an ABSENT sample yield IDENTICAL supplies",
+          confounds_by_name(_dec_present) == confounds_by_name(_dec_absent)
+          and confounds_by_evidence(_dec_present) == confounds_by_evidence(_dec_absent)
+          and execution_evidence_probes(_dec_present)
+          == execution_evidence_probes(_dec_absent) == ["clock-realtime-steps"],
+          "the loaded and the quiet scenario must reach the per-failure reading "
+          "with the same rows armed; present %r/%r, absent %r/%r"
+          % (confounds_by_name(_dec_present), confounds_by_evidence(_dec_present),
+             confounds_by_name(_dec_absent), confounds_by_evidence(_dec_absent)))
+    check("an INDETERMINATE sample (the instrument could not read the kernel) "
+          "arms NOTHING",
+          not (_clock_rows & _off)
+          and not confounds_by_evidence(
+              leg_confound_decisions(_elf, _gate(_ind, _same_kernel))),
+          "no evidence can be gathered by an instrument that cannot read the "
+          "clock, so nothing may wait for it; got %r" % _off)
+    check("the UNCONDITIONAL rows survive every verdict, matched BY NAME",
+          _uncond_rows <= _off
+          and _uncond_rows <= set(confounds_by_name(_dec_absent))
+          and _uncond_rows <= set(confounds_by_name(_dec_present)),
           "a row with `requires: []` rests on its own control and must not be "
           "gated on anything; got %r" % _off)
     # ★★★ THE KERNEL QUESTION, ALL FOUR DIRECTIONS, AS A DECISION AND NOT A
@@ -14922,11 +16762,442 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("the report names the probe, its VERDICT and its measured evidence",
           any("clock-realtime-steps = ABSENT" in l and "healthy clock" in l
               for l in _rep), "got %r" % _rep)
-    check("the report names every INACTIVE row and says a match will be GENUINE",
-          sum(1 for l in _rep if "INACTIVE" in l) == 3
-          and all("GENUINE" in l for l in _rep if "INACTIVE" in l),
+    # ★★ ON AN ABSENT SAMPLE THE CLOCK ROWS ARE ARMED, NOT INACTIVE — and the
+    # account must say they decide nothing by name and nothing on the sample.
+    # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+    check("the report names every ARMED row and says it is decided PER FAILURE",
+          sum(1 for l in _rep if "confound row ARMED (per failure)" in l)
+          == len(_clock_rows)
+          and all("PER FAILURE" in l and "decides no failure" in l
+                  for l in _rep if "confound row ARMED" in l)
+          and not any("confound row INACTIVE" in l for l in _rep),
+          "a reader counting the excusal set must see that a clock row excuses "
+          "nothing by name; got %r" % _rep)
+    _ind_gate = _gate(_ind, _same_kernel)
+    _ind_rep = confound_report_lines(
+        "elf64-x86_64", leg_confound_decisions(_elf, _ind_gate), _ind_gate)
+    check("...and on an INDETERMINATE sample every clock row is INACTIVE, GENUINE",
+          sum(1 for l in _ind_rep if "confound row INACTIVE" in l)
+          == len(_clock_rows)
+          and all("GENUINE" in l for l in _ind_rep if "INACTIVE" in l)
+          and not any("confound row ARMED" in l for l in _ind_rep),
           "a run whose report cannot say why a failure was excused has not earned "
-          "the exclusion; got %r" % _rep)
+          "the exclusion; got %r" % _ind_rep)
+    # ── THE PER-FAILURE ATTRIBUTION, END TO END, WITH INJECTED CLOCKS ────────
+    # ANCHOR, ONE LINE, DO NOT WRAP:
+    # D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN
+    # Every timeline below is the REAL execution_monitor_loop's output over a REAL
+    # byte stream — a synthetic segment log flushed chunk by chunk the way
+    # tester.tcl's do_test flushes — driven by a scripted clock. None of them is a
+    # hand-typed record, so a defect in the monitor cannot hide behind a fixture
+    # that already has the right shape.
+    check("probe_verdict_arms: PRESENT and ABSENT arm, INDETERMINATE does not, an "
+          "invented word raises",
+          probe_verdict_arms("present") and probe_verdict_arms("absent")
+          and not probe_verdict_arms("indeterminate")
+          and _raises(lambda: probe_verdict_arms("probably")))
+    check("every environment-probe verb declares BOTH an execution monitor and a "
+          "per-window reading",
+          all(callable(v.get("monitor")) and callable(v.get("stepsInWindow"))
+              and callable(v.get("setsInWindow"))
+              for v in ENVIRONMENT_PROBE_VERBS.values()),
+          "a verb whose rows could only be honoured on its pre-run sample would "
+          "restore the defect this attribution removes")
+    _cfg_clock = dict(_reg["clock-realtime-steps"]["config"])
+    _STEP = 26.25
+
+    def _drive_monitor(script, notifier=True):
+        """(timeline text, log bytes) from the REAL monitor loop. The script's actions
+        happen while the monitor BLOCKS, one per blocking wait():
+          ("write", bytes)   the fixture flushes these bytes into the log
+          ("excursion",)     CLOCK_REALTIME jumps +26.25 s and back inside ONE
+                             sampling interval — the measured WSL2 shape. The
+                             kernel wakes a NOTIFIED reader at each edge; a sampler
+                             sleeps through both.
+          ("step", seconds)  a one-way SET
+          ("idle", seconds)  real time passes and nothing is written
+          ("slow", {op: [seconds, ...]})  each SET lands DURING the next call of that
+                             slow operation — "read" (the log stat), "stop" (the
+                             stop-file check), "emit" (a timeline write): the
+                             measured DrvFs shape, where each takes long enough for
+                             an edge to land inside it
+          ("truncate", n)    the log is cut back to n bytes
+        wait(0), and any wait while a notification is pending, blocks for nothing
+        and consumes no action."""
+        world = {"log": bytearray(), "wall": 1000000.0, "ref": 500.0, "n": 0,
+                 "pending": [], "notified": False,
+                 "slow": {"read": [], "stop": [], "emit": []}}
+        out = []
+
+        def during(op):
+            if world["slow"][op]:
+                for seconds in world["slow"][op]:
+                    world["wall"] += seconds
+                world["slow"][op] = []
+                world["notified"] = world["notified"] or notifier
+
+        def read_size():
+            during("read")
+            return len(world["log"])
+
+        def wait(seconds):
+            if seconds <= 0 or world["notified"]:
+                if world["notified"]:
+                    world["notified"] = False
+                    return "set"
+                return "timeout"
+            world["ref"] += seconds
+            world["wall"] += seconds
+            if world["pending"]:
+                world["wall"] += world["pending"].pop()
+                return "set"
+            world["n"] += 1
+            if world["n"] > len(script):
+                return "timeout"
+            act = script[world["n"] - 1]
+            if act[0] == "write":
+                world["log"] += act[1]
+            elif act[0] == "excursion":
+                if notifier:
+                    world["wall"] += _STEP
+                    world["pending"].append(-_STEP)
+                    return "set"
+            elif act[0] == "step":
+                world["wall"] += act[1]
+                return "set" if notifier else "timeout"
+            elif act[0] == "idle":
+                world["ref"] += act[1]
+                world["wall"] += act[1]
+            elif act[0] == "slow":
+                for op, edges in act[1].items():
+                    world["slow"][op] += list(edges)
+            elif act[0] == "truncate":
+                del world["log"][act[1]:]
+            return "timeout"
+
+        def should_stop():
+            during("stop")
+            return (world["n"] > len(script) and not world["pending"]
+                    and not any(world["slow"].values()))
+
+        def emit(rec):
+            out.append(rec)
+            during("emit")
+        execution_monitor_loop(
+            _cfg_clock, read_size, lambda: (world["wall"], world["ref"]), wait,
+            should_stop, lambda: "", emit,
+            {"probe": "clock-realtime-steps", "verb": "wall-clock-step",
+             "instrument": "clock-set-notification" if notifier else "sampler"})
+        return ("".join(json.dumps(dict(r, schema=EXECUTION_TIMELINE_SCHEMA),
+                                   sort_keys=True) + "\n" for r in out),
+                bytes(world["log"]))
+
+    def _unit(name, ok):
+        """The two flushes tester.tcl's do_test makes for one unit."""
+        return (("write", ("%s..." % name).encode("ascii")),
+                ("write", b" Ok\n" if ok else
+                 ("\n! %s expected: [1]\n! %s got:      [0]\n"
+                  % (name, name)).encode("ascii")))
+
+    def _scenario(during_a, during_b, during_c, notifier=True):
+        """walsetlk.test (2.2.3 FAILS, clock actions inside its do_test), then
+        select1.test (1.1 FAILS — no clock row matches it), then
+        walsetlk_recover.test (clock actions at FILE TOP LEVEL between 1.0 and
+        1.2, then 1.2 and 1.3 FAIL — 1.3's own do_test holds no step)."""
+        s = list(_unit("walsetlk-1.1", True))
+        h, t = _unit("walsetlk-2.2.3", False)
+        s += [h] + during_a + [t, ("write", b"Time: walsetlk.test 1000 ms\n")]
+        h, t = _unit("select1-1.1", False)
+        s += [h] + during_b + [t, ("write", b"Time: select1.test 1000 ms\n")]
+        s += list(_unit("walsetlk_recover-1.0", True)) + during_c
+        s += list(_unit("walsetlk_recover-1.2", False))
+        s += list(_unit("walsetlk_recover-1.3.(79271)", False))
+        s += [("write", b"Time: walsetlk_recover.test 1000 ms\n")]
+        return _drive_monitor(s, notifier)
+    _EXC = [("excursion",)]
+    _names = ["walsetlk-2.2.3", "select1-1.1", "walsetlk_recover-1.2",
+              "walsetlk_recover-1.3.(79271)"]
+    _tl_file = execution_timeline_path("seg0.log", "clock-realtime-steps")
+
+    def _attribute(timeline_text, log_bytes, wires=None, names=None):
+        files = {"seg0.log": log_bytes}
+        texts = {_tl_file: timeline_text} if timeline_text is not None else {}
+
+        def rb(p):
+            if p not in files:
+                raise OSError("no such file: %s" % p)
+            return files[p]
+
+        def rt(p):
+            if p not in texts:
+                raise OSError("no such file: %s" % p)
+            return texts[p]
+        return dict((r["name"], r) for r in attribute_unit_failures(
+            _elf, _doc, confounds_by_evidence(_dec_absent) if wires is None else wires,
+            _names if names is None else names, ["seg0.log"], (), "native",
+            read_bytes=rb, read_text=rt))
+
+    def _shipped(sample, name):
+        """THE PREDICATE THIS REPLACES, kept executable so the flip is REPRODUCED
+        rather than described: a clock row honoured on the pre-run sample, then
+        matched by name alone."""
+        return ("EXCUSED" if probe_verdict_honours(sample)
+                and any(re.search(p, name) for p in _clock_rows) else "GENUINE")
+    _t_during, _l_during = _scenario(_EXC, _EXC, _EXC)
+    _t_quiet, _l_quiet = _scenario([], [], [])
+    _tl_during = read_execution_timeline(_t_during, "clock-realtime-steps")
+    check("the REAL monitor records BOTH edges of every excursion, notified, with "
+          "their magnitudes",
+          len(_tl_during["steps"]) == 6
+          and all(s["notified"] for s in _tl_during["steps"])
+          and sorted(round(float(s["delta"]), 2) for s in _tl_during["steps"])
+          == [-_STEP] * 3 + [_STEP] * 3
+          and _tl_during["stopped"] is not None
+          and _tl_during["coveredThrough"] == len(_l_during),
+          "got %r" % _tl_during)
+    # ★★★ THE CLOSE CONDITION, IN FOUR ASSERTIONS: the flip reproduced on the
+    # shipped predicate, and fixed. LOADED = pre-run sample ABSENT with steps DURING;
+    # QUIET = sample PRESENT with steps DURING; REVERSE = sample PRESENT, no step.
+    _loaded = _attribute(_t_during, _l_during, wires=confounds_by_evidence(_dec_absent))
+    _quiet_run = _attribute(_t_during, _l_during,
+                            wires=confounds_by_evidence(_dec_present))
+    _reverse = _attribute(_t_quiet, _l_quiet, wires=confounds_by_evidence(_dec_present))
+    check("SHIPPED predicate: the SAME failure flips between the LOADED and the "
+          "QUIET scenario (the defect, reproduced)",
+          _shipped("absent", "walsetlk-2.2.3") == "GENUINE"
+          and _shipped("present", "walsetlk-2.2.3") == "EXCUSED")
+    check("LOADED (sample ABSENT, steps DURING): the per-failure reading EXCUSES "
+          "every clock failure the shipped predicate charged",
+          all(_loaded[n]["verdict"] == "EXCUSED" for n in _names if n != "select1-1.1"),
+          "got %r" % _loaded)
+    check("QUIET (sample PRESENT, steps DURING): the SAME verdict as LOADED, name "
+          "for name",
+          all(_loaded[n]["verdict"] == _quiet_run[n]["verdict"] for n in _names),
+          "loaded %r / quiet %r" % (_loaded, _quiet_run))
+    check("REVERSE (sample PRESENT, NO step during): the shipped predicate excused "
+          "it in silence; the per-failure reading keeps it GENUINE, a MEASURED "
+          "absence",
+          _shipped("present", "walsetlk-2.2.3") == "EXCUSED"
+          and all(_reverse[n]["verdict"] == "GENUINE" for n in _names)
+          and "MEASURED absence" in _reverse["walsetlk-2.2.3"]["why"],
+          "got %r" % _reverse)
+    check("a GENUINE non-clock failure while the clock steps inside its own file "
+          "stays GENUINE",
+          _loaded["select1-1.1"]["verdict"] == "GENUINE"
+          and _loaded["select1-1.1"]["wire"] == "", "got %r" % _loaded["select1-1.1"])
+    check("THE FILE IS THE WINDOW: walsetlk_recover-1.3, whose own do_test holds no "
+          "step, is excused by the step at its file's top level",
+          _loaded["walsetlk_recover-1.3.(79271)"]["verdict"] == "EXCUSED",
+          "a window cut at the unit's own do_test would charge the measurement 1.2 "
+          "took before it; got %r" % _loaded["walsetlk_recover-1.3.(79271)"])
+    _t_else, _l_else = _scenario([], _EXC + _EXC, [])
+    _else = _attribute(_t_else, _l_else)
+    check("steps inside ANOTHER file's window excuse nothing",
+          _else["walsetlk-2.2.3"]["verdict"] == "GENUINE"
+          and _else["walsetlk_recover-1.3.(79271)"]["verdict"] == "GENUINE",
+          "got %r" % _else)
+    # ★★ ONE STEP INSIDE THE WINDOW IS THE WHOLE CAUSAL EVIDENCE, so the window is
+    # read against `minStepsInFailureWindow` and NOT the pre-run sample's
+    # `minStepsRequired`. ✔MEASURED 2026-09-15 in a real three-way race over this
+    # monitor: CLOCK_REALTIME jumped +26.318 s during walsetlk-2.1.3's timed region
+    # and stayed displaced for 15.3 s, so its return edge landed AFTER the verdict;
+    # DSS, gcc and clang all failed that unit together, and a two-step reading
+    # charged all three to their compilers. Here: the jump inside 2.2.3, the
+    # return inside the NEXT file.
+    _t_long, _l_long = _scenario([("step", _STEP)], [("step", -_STEP)], [])
+    _long = _attribute(_t_long, _l_long)
+    check("a LONG excursion whose return lands after the verdict EXCUSES the failure "
+          "its jump caused (the measured walsetlk-2.1.3 shape)",
+          int(_cfg_clock["minStepsInFailureWindow"]) == 1
+          and _long["walsetlk-2.2.3"]["verdict"] == "EXCUSED"
+          and _long["walsetlk_recover-1.3.(79271)"]["verdict"] == "GENUINE",
+          "got %r" % _long)
+    _doc_two = json.loads(json.dumps(_doc))
+    _doc_two["environmentProbes"]["clock-realtime-steps"]["config"][
+        "minStepsInFailureWindow"] = 2
+    _long_files = {"seg0.log": _l_long}
+    _long_texts = {_tl_file: _t_long}
+    _long_two = dict((r["name"], r) for r in attribute_unit_failures(
+        _elf, _doc_two, confounds_by_evidence(_dec_absent), _names, ["seg0.log"], (),
+        "native", read_bytes=lambda p: _long_files[p],
+        read_text=lambda p: _long_texts[p]))
+    check("...and the threshold is CONFIG: raising minStepsInFailureWindow to 2 "
+          "charges that same single step",
+          _long_two["walsetlk-2.2.3"]["verdict"] == "GENUINE", "got %r" % _long_two)
+    _t_small, _l_small = _scenario([("step", 0.5), ("step", -0.5)], [], [])
+    check("a clock SET below minStepSeconds inside the window excuses nothing",
+          _attribute(_t_small, _l_small)["walsetlk-2.2.3"]["verdict"] == "GENUINE"
+          and read_execution_timeline(_t_small, "clock-realtime-steps")["sets"] == 2)
+    _t_samp, _l_samp = _scenario(_EXC, [], _EXC, notifier=False)
+    check("a SAMPLER sleeps through a sub-interval excursion (no step, GENUINE) that "
+          "the clock-set notification records edge by edge",
+          not read_execution_timeline(_t_samp, "clock-realtime-steps")["steps"]
+          and _attribute(_t_samp, _l_samp)["walsetlk-2.2.3"]["verdict"] == "GENUINE"
+          and _loaded["walsetlk-2.2.3"]["verdict"] == "EXCUSED",
+          "✔MEASURED 2026-09-15: the 250 ms sampler registered 327 of 356 "
+          "excursions the notification reported over 30 minutes")
+    # ★★ NO TWO CLOCK READINGS MORE THAN ONE SLOW OPERATION APART. ✔MEASURED
+    # 2026-09-15 on the Windows driver's elf64-x86_64 leg, whose log and timeline
+    # live on DrvFs: 496 ms between two clock readings under load, and a whole
+    # excursion that two concurrent in-kernel monitors recorded edge by edge fell
+    # between them, leaving one `set`. Here the jump lands DURING a log stat and the
+    # return DURING the next stop-file check, with no wait between the two.
+    _t_drvfs, _l_drvfs = _scenario([("slow", {"read": [_STEP], "stop": [-_STEP]})],
+                                   [], [])
+    _tl_drvfs = read_execution_timeline(_t_drvfs, "clock-realtime-steps")
+    check("an excursion whose jump lands DURING one slow operation and whose return "
+          "lands DURING the next is measured edge by edge, and EXCUSES the failure "
+          "it hit (the measured DrvFs shape)",
+          sorted(round(float(s["delta"]), 2) for s in _tl_drvfs["steps"])
+          == [-_STEP, _STEP]
+          and all(s["notified"] for s in _tl_drvfs["steps"])
+          and _tl_drvfs["sets"] == 0
+          and _attribute(_t_drvfs, _l_drvfs)["walsetlk-2.2.3"]["verdict"] == "EXCUSED",
+          "got %r" % _tl_drvfs)
+    _t_blip, _l_blip = _scenario([("slow", {"read": [_STEP, -_STEP]})], [], [])
+    _tl_blip = read_execution_timeline(_t_blip, "clock-realtime-steps")
+    _blip = _attribute(_t_blip, _l_blip)["walsetlk-2.2.3"]
+    check("...but one that begins AND ends inside ONE slow operation is not "
+          "measured: a `set`, no step, GENUINE, and the reason refuses to call that "
+          "absence measured",
+          not _tl_blip["steps"] and _tl_blip["sets"] == 1
+          and _blip["verdict"] == "GENUINE"
+          and "UNMEASURED clock SET" in _blip["why"]
+          and "MEASURED absence" not in _blip["why"],
+          "got %r / %r" % (_tl_blip, _blip))
+    check("a log that SHRINKS under the real monitor is recorded, and its timeline is "
+          "refused",
+          _raises(lambda: read_execution_timeline(
+              _drive_monitor([("write", b"walsetlk-1.1... Ok\n"), ("truncate", 3),
+                              ("write", b"x")])[0], "clock-realtime-steps")))
+    _t_stale = _t_during.replace('"sizeBefore": 0}', '"sizeBefore": 7}', 1)
+    check("a timeline ARMED ON A NON-EMPTY LOG is refused, and its failures stay "
+          "GENUINE",
+          _raises(lambda: read_execution_timeline(_t_stale, "clock-realtime-steps"))
+          and _attribute(_t_stale, _l_during)["walsetlk-2.2.3"]["verdict"] == "GENUINE")
+    _o = {"sizeBefore": 5, "sizeAfter": 5, "reference": 1.0, "offset": 0.0}
+    check("a timeline whose log SHRANK, a second `armed`, another probe's, or an "
+          "unknown record kind is refused",
+          _raises(lambda: read_execution_timeline(
+              _t_during + json.dumps({"schema": EXECUTION_TIMELINE_SCHEMA,
+                                      "kind": "log-shrank", "before": _o,
+                                      "after": _o}) + "\n", "clock-realtime-steps"))
+          and _raises(lambda: read_execution_timeline(
+              _t_during + _t_during.splitlines()[0] + "\n", "clock-realtime-steps"))
+          and _raises(lambda: read_execution_timeline(_t_during, "another-probe"))
+          and _raises(lambda: read_execution_timeline(
+              _t_during + '{"schema": 1, "kind": "maybe"}\n', "clock-realtime-steps")))
+    check("a TORN last line (a killed monitor) keeps every flushed record",
+          read_execution_timeline(_t_during + '{"schema": 1, "kind": "hea',
+                                  "clock-realtime-steps")["steps"]
+          == _tl_during["steps"])
+    _nolog = _attribute(_t_during, _l_during, names=["walsetlk-9.9"])["walsetlk-9.9"]
+    _notl = _attribute(None, _l_during)["walsetlk-2.2.3"]
+    check("no verdict line in any log, or no timeline at all, stays GENUINE and SAYS "
+          "which",
+          _nolog["verdict"] == "GENUINE" and "found in none" in _nolog["why"]
+          and _notl["verdict"] == "GENUINE" and "NO USABLE" in _notl["why"],
+          "got %r / %r" % (_nolog, _notl))
+    check("a wire that is not an ARMED row is REFUSED, never read either way",
+          _raises(lambda: _attribute(_t_during, _l_during, wires=["^zipfile-25\\.0$"]))
+          and _raises(lambda: _attribute(_t_during, _l_during, wires=["^nope-"])))
+    _vlog = (b"a-1...\n! a-1 expected: [1]\n! a-1 got:      [0]\n"
+             b"Time: a.test 5 ms\nb-2...\nError: boom\n"
+             b"!Failures on these tests: a-1 b-2\n")
+    check("the verdict reader finds `! name expected:` and `name...`+`Error:` "
+          "verdicts, starts each file past the previous `Time:`, and ignores the "
+          "summary line",
+          unit_verdict_occurrences(_vlog, ["a-1", "b-2"])
+          == {"a-1": [{"verdictOffset": _vlog.index(b"! a-1 expected"),
+                       "fileStart": 0}],
+              "b-2": [{"verdictOffset": _vlog.index(b"Error: boom"),
+                       "fileStart": _vlog.index(b"b-2...")}]},
+          "got %r" % unit_verdict_occurrences(_vlog, ["a-1", "b-2"]))
+    _alines = attribution_report_lines("elf64-x86_64", list(_loaded.values()))
+    check("the per-failure account is ASCII, names each armed-row failure with its "
+          "verdict and its evidence, and gives no line to the unarmed one",
+          all(ord(c) < 127 for l in _alines for c in l)
+          and any("walsetlk-2.2.3 EXCUSED by ^walsetlk-" in l and "+26.250" in l
+                  and "clock-set-notification" in l for l in _alines)
+          and not any("select1-1.1" in l for l in _alines),
+          "got %r" % _alines)
+    _t_idle, _ = _drive_monitor([("idle", 30.0)])
+    check("a quiet stretch still leaves a HEARTBEAT, and every timeline ENDS with "
+          "`stopped`",
+          '"kind": "heartbeat"' in _t_idle
+          and '"kind": "stopped"' in _t_idle.rstrip().splitlines()[-1])
+    _mp = execution_monitor_plan(_doc, "driver", "clock-realtime-steps",
+                                 "/r/out/corpus.log", 3600, "/r/harness_legs.py",
+                                 "/r/legs.json")
+    check("an in-kernel monitor runs THIS interpreter over THIS script with the "
+          "driver's own paths, the timeline beside the log, and a bounded life",
+          _mp["argv"][0] == os.path.abspath(sys.executable)
+          and _mp["argv"][1] == "/r/harness_legs.py"
+          and "--monitor-execution" in _mp["argv"]
+          and _mp["timeline"] == "/r/out/corpus.log.evidence-clock-realtime-steps.jsonl"
+          and _mp["stopFile"] == _mp["timeline"] + ".stop"
+          and _mp["argv"][_mp["argv"].index("--max-seconds") + 1]
+          == "%g" % (3600 + KERNEL_PROBE_ENTRY_ALLOWANCE_SECONDS
+                     + 2 * EXECUTION_STOP_BUDGET_SECONDS),
+          "got %r" % _mp)
+    check("an UNCAPPED segment gets the bounded uncapped lifetime, never forever",
+          execution_monitor_plan(_doc, "driver", "clock-realtime-steps", "/r/c.log",
+                                 0, "/r/h.py", "/r/l.json")["maxSeconds"]
+          == EXECUTION_UNCAPPED_LIFETIME_SECONDS)
+
+    def _xl(argv):
+        return (0, "/mnt/c" + argv[-1][2:].replace("\\", "/"), "")
+    _wsl_head = (list(RUN_FILESYSTEMS["wsl-linux"]["kernelEntryArgv"])
+                 + [RUN_FILESYSTEMS["wsl-linux"]["kernelProbeInterpreter"]])
+    _mpw = execution_monitor_plan(_doc, "wsl-linux", "clock-realtime-steps",
+                                  "C:\\r\\out\\corpus.log", 3600,
+                                  "C:\\r\\harness_legs.py", "C:\\r\\legs.json", _xl)
+    check("a monitor for a LAUNCHED kernel enters THAT kernel, every path it is "
+          "handed is translated, and the driver keeps its own spelling",
+          _mpw["argv"][:len(_wsl_head)] == _wsl_head
+          and "C:" not in " ".join(_mpw["argv"])
+          and "/mnt/c/r/out/corpus.log" in _mpw["argv"]
+          and _mpw["timeline"]
+          == "C:\\r\\out\\corpus.log.evidence-clock-realtime-steps.jsonl"
+          and _mpw["kernel"] == probe_kernel("wsl-linux"),
+          "got %r" % _mpw)
+    check("a bad probe name or an undeclared probe is refused before any spawn",
+          _raises(lambda: execution_timeline_path("/r/x.log", "Clock Steps"))
+          and _raises(lambda: execution_monitor_plan(_doc, "driver", "nope", "/r/c.log",
+                                                     0, "/r/h.py", "/r/l.json")))
+    _ntf = _ClockSetNotification()
+    check("the clock-set notification either works on this interpreter or SAYS why "
+          "not",
+          _ntf.available() or bool(_ntf.why), "available=%r why=%r"
+          % (_ntf.available(), _ntf.why))
+    _ntf.close()
+    try:
+        _pl = plan("linux", "x86_64", set(), path,
+                   {"driver": kernel_measurement("driver", "in-process",
+                                                 "self-test fixture", _absent)})
+        _pe = [l for l in _pl["legs"] if l["label"] == "elf64-x86_64"][0]
+        _plan_ok = (set(_pe["confoundsByEvidence"]) == _clock_rows
+                    and not (_clock_rows & set(_pe["confoundsByName"]))
+                    and set(_pe["confounds"])
+                    == set(_pe["confoundsByName"]) | set(_pe["confoundsByEvidence"])
+                    and _pe["executionEvidence"] == ["clock-realtime-steps"])
+        _sh_elf = [s for s in sh_statements(emit_sh(_pl))
+                   if s.startswith("LEG_CONFOUNDS[elf64-x86_64]=")
+                   or s.startswith("LEG_EVIDENCE_CONFOUNDS[elf64-x86_64]=")]
+        _plan_why = "%r / %r" % (dict((k, _pe[k]) for k in (
+            "confounds", "confoundsByName", "confoundsByEvidence",
+            "executionEvidence")), _sh_elf)
+    except LegError as _exc:
+        _plan_ok, _sh_elf, _plan_why = False, [], "raised %s" % _exc
+    check("the PLAN carries the split: `confounds` is by-name plus by-evidence, the "
+          "clock rows are only by-evidence, and the monitor is named",
+          _plan_ok, _plan_why)
+    check("...and emit_sh hands the drivers the BY-NAME list as LEG_CONFOUNDS",
+          len(_sh_elf) == 2
+          and not any("walsetlk" in s for s in _sh_elf
+                      if s.startswith("LEG_CONFOUNDS["))
+          and any("walsetlk" in s for s in _sh_elf
+                  if s.startswith("LEG_EVIDENCE_CONFOUNDS[")), _plan_why)
     check("the report is ASCII, and non-ASCII RAISES at the generator",
           all(ord(c) < 127 for l in _rep for c in l)
           and _raises(lambda: confound_report_lines(
@@ -15110,6 +17381,13 @@ def self_test(path=CATALOGUE, out=sys.stdout):
             os.unlink(p2)
     check("the shipped probe config clears every floor",
           not _lint_with_probe_config(), "%r" % _lint_with_probe_config())
+    # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+    # The per-failure count is config with a floor of ONE: zero would excuse a
+    # clock-row failure on no evidence at all, which is the dangerous direction.
+    check("a per-failure window needing ZERO steps is REFUSED (the floor is 1)",
+          any("minStepsInFailureWindow" in f
+              for f in _lint_with_probe_config(minStepsInFailureWindow=0)),
+          "%r" % _lint_with_probe_config(minStepsInFailureWindow=0))
     check("a 5 s sample window is REFUSED (the floor is 15 s)",
           any("sampleSeconds" in f for f in _lint_with_probe_config(sampleSeconds=5)))
     check("requiring only ONE step is REFUSED (never a single pair of readings)",
@@ -15515,8 +17793,10 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     sh = emit_sh(plan("linux", "x86_64", every, path))
     check("the sh emitter names every leg", all(lbl in sh for lbl in labels))
     statements = sh_statements(sh)
+    # 41 per leg: LEG_EVIDENCE_CONFOUNDS and LEG_EXECUTION_EVIDENCE joined the
+    # 39 in [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN].
     check("the sh emitter emitted one statement per leg field",
-          len(statements) == 1 + len(labels) * 39,
+          len(statements) == 1 + len(labels) * 41,
           "got %d statements for %d legs" % (len(statements), len(labels)))
     # [D-HARNESS-CONFOUND-CATALOGUE-CANNOT-EXPRESS-A-PER-LEG-RUN-DIRECTORY-PRECONDITION]
     # ★★ THE SAME TRANSPORT ARGUMENT AS run FIDELITY, one axis along. The .ps1
@@ -15618,7 +17898,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     _none_sh = emit_sh(plan("linux", "x86_64", set(), path))
     _none_statements = _statements_or_why(_none_sh)
     check("the sh emitter emits assignments only on a launchers-NONE plan too",
-          len(_none_statements) == 1 + len(labels) * 39
+          len(_none_statements) == 1 + len(labels) * 41
           and all(ASSIGNMENT_RE.match(s) for s in _none_statements),
           "got %d statements, %r"
           % (len(_none_statements),
@@ -16936,6 +19216,25 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                      r for r in e.get("requires", [])
                      if "ld-linux" not in r.get("path", "")])),
              _interp_cross_check),
+            # ★ RED ON DISABLE FOR build.referenceSurface
+            # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+            # on the SHIPPED catalogue and the SHIPPED descriptors: an edge they
+            # do not declare, a macro dsscp injects on no pe arm, and the pe edges
+            # on a leg whose format takes none of them. Each would hand a
+            # reference a header graph dss does not have.
+            ("windows", "referenceSurface",
+             "a surface edge dsscp's descriptor does not declare",
+             lambda l: [e.update(includes=["stdio.h"])
+                        for e in l["build"]["referenceSurface"]
+                        if e.get("header") == "direct.h"]),
+            ("windows", "referenceSurface",
+             "a surface macro dsscp injects on no pe arm",
+             lambda l: [e.update(macros=["S_ISSOCK"])
+                        for e in l["build"]["referenceSurface"]
+                        if e.get("header") == "sys/stat.h"]),
+            ("linux", "referenceSurface", "the pe surface declared on a Linux leg",
+             lambda l: l["build"].update(referenceSurface=[
+                 {"header": "direct.h", "includes": ["dirent.h"]}])),
         ):
             _os, _key, _variant, _mutate = _row[:4]
             _checker = _row[4] if len(_row) > 4 else lint
@@ -17381,6 +19680,40 @@ def main(argv=None):
                         "it `confoundGating: unprobed`; every conditional "
                         "confound row is then INACTIVE and both drivers REFUSE "
                         "to run a corpus on it. For structural callers only.")
+    # ── EXECUTION EVIDENCE ──────────────────────────────────────────────────
+    # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+    p.add_argument("--execution-monitor-argv", action="store_true",
+                   help="print the argv that runs the execution monitor for "
+                        "--evidence-probe over --watch-log IN the kernel "
+                        "--run-filesystem executes in, plus the timeline and stop "
+                        "file (driver namespace) and the arm/stop budgets. "
+                        "--format sh prints assignments, json an object.")
+    p.add_argument("--monitor-execution", action="store_true",
+                   help="RUN the execution monitor in THIS process until "
+                        "--stop-file exists, --max-seconds pass, or this process "
+                        "is orphaned. Spawned by the drivers from "
+                        "--execution-monitor-argv; not for a human.")
+    p.add_argument("--attribute-unit-failures", default=None, metavar="LABEL",
+                   help="read each --failure against the monitor timelines beside "
+                        "each --segment-log and print EXCUSED/GENUINE per name "
+                        "(TAB-separated) plus REPORT lines, for the ARMED rows "
+                        "named by --evidence-pattern")
+    p.add_argument("--evidence-probe", default=None, metavar="NAME")
+    p.add_argument("--watch-log", default="", metavar="PATH")
+    p.add_argument("--timeline", default="", metavar="PATH")
+    p.add_argument("--stop-file", default="", metavar="PATH")
+    p.add_argument("--max-seconds", default=None, type=float, metavar="S")
+    p.add_argument("--run-filesystem", default=None, metavar="VERB")
+    p.add_argument("--segment-cap-seconds", default=None, type=float, metavar="S",
+                   help="the segment's own absolute cap (DSS_SEGMENT_TIMEOUT); 0 "
+                        "means none, and the monitor then lives at most "
+                        "EXECUTION_UNCAPPED_LIFETIME_SECONDS")
+    p.add_argument("--segment-log", action="append", default=None, metavar="PATH")
+    p.add_argument("--evidence-pattern", action="append", default=None,
+                   metavar="WIRE")
+    p.add_argument("--failure", action="append", default=None, metavar="NAME")
+    p.add_argument("--tier-prefix", action="append", default=None, metavar="PFX")
+    p.add_argument("--leg-mode", default=None, choices=CONFOUND_SCOPES)
     p.add_argument("--lint", action="store_true")
     p.add_argument("--self-test", action="store_true")
     p.add_argument("--host-os", default=None)
@@ -17500,7 +19833,9 @@ def main(argv=None):
             or args.stage_build or args.check_launcher or args.identify_binary
             or args.launcher_for_target
             or args.registry_controls or args.check_regions
-            or args.probe_environment or args.print_probe_budget):
+            or args.probe_environment or args.print_probe_budget
+            or args.execution_monitor_argv or args.monitor_execution
+            or args.attribute_unit_failures):
         p.error("one of --verdict-vocabulary / --library-providers / "
                 "--plan / --probe-environment / "
                 "--print-probe-budget / "
@@ -17569,6 +19904,70 @@ def main(argv=None):
         if args.check_regions:
             counts = check_dss_regions(HERE)
             return 0 if counts["failed"] == 0 else 1
+        # ── EXECUTION EVIDENCE ─────────────────────────────────────────────
+        # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+        # None of the three needs a plan, and none of them measures anything
+        # before a corpus runs: the monitor measures DURING a segment and the
+        # attribution reads what it recorded.
+        if args.execution_monitor_argv:
+            if not (args.run_filesystem and args.evidence_probe and args.watch_log
+                    and args.segment_cap_seconds is not None):
+                p.error("--execution-monitor-argv requires --run-filesystem, "
+                        "--evidence-probe, --watch-log and --segment-cap-seconds")
+            planned = execution_monitor_plan(
+                load_catalogue_doc(args.catalogue), args.run_filesystem,
+                args.evidence_probe, args.watch_log, args.segment_cap_seconds,
+                os.path.abspath(__file__), os.path.abspath(args.catalogue))
+            if args.format == "sh":
+                q = shlex.quote
+                sys.stdout.write("EXEC_MONITOR_ARGV=(%s)\n"
+                                 % " ".join(q(a) for a in planned["argv"]))
+                sys.stdout.write("EXEC_MONITOR_TIMELINE=%s\n" % q(planned["timeline"]))
+                sys.stdout.write("EXEC_MONITOR_STOP=%s\n" % q(planned["stopFile"]))
+                sys.stdout.write("EXEC_MONITOR_ARM_SECONDS=%d\n"
+                                 % int(planned["armWithinSeconds"]))
+                sys.stdout.write("EXEC_MONITOR_STOP_SECONDS=%d\n"
+                                 % int(planned["stopWithinSeconds"]))
+            else:
+                json.dump(planned, sys.stdout, indent=2, sort_keys=True)
+                sys.stdout.write("\n")
+            return 0
+        if args.monitor_execution:
+            if not (args.evidence_probe and args.watch_log and args.timeline
+                    and args.stop_file and args.max_seconds is not None):
+                p.error("--monitor-execution requires --evidence-probe, --watch-log, "
+                        "--timeline, --stop-file and --max-seconds")
+            doc = load_catalogue_doc(args.catalogue)
+            spec = environment_probes(doc).get(args.evidence_probe)
+            if spec is None:
+                raise LegError("--evidence-probe %r is not declared in "
+                               "`environmentProbes`" % args.evidence_probe)
+            monitor = probe_verb(spec.get("verb", "")).get("monitor")
+            if monitor is None:
+                raise LegError("probe %r (verb %r) declares no execution monitor"
+                               % (args.evidence_probe, spec.get("verb")))
+            return monitor(args.evidence_probe, spec, args.watch_log, args.timeline,
+                           args.stop_file, args.max_seconds)
+        if args.attribute_unit_failures:
+            if not args.segment_log:
+                p.error("--attribute-unit-failures requires at least one "
+                        "--segment-log: a failure's execution window is a span of "
+                        "the log it was written to, and there is no default log")
+            if args.leg_mode is None:
+                p.error("--attribute-unit-failures requires --leg-mode "
+                        "native|emulated, the same mode the drivers' matcher uses")
+            results = attribute_unit_failures(
+                leg_by_label(load_catalogue(args.catalogue),
+                             args.attribute_unit_failures, args.catalogue),
+                load_catalogue_doc(args.catalogue), args.evidence_pattern or [],
+                args.failure or [], args.segment_log, args.tier_prefix or [],
+                args.leg_mode)
+            for r in results:
+                sys.stdout.write("%s\t%s\n" % (r["verdict"], r["name"]))
+            for line in attribution_report_lines(args.attribute_unit_failures,
+                                                 results):
+                sys.stdout.write("REPORT\t%s\n" % line)
+            return 0
         if args.registry_controls:
             # OUTSIDE the LegError contract on purpose — this mode has no
             # failure mode by design, so it is answered before anything that
@@ -17693,58 +20092,17 @@ def main(argv=None):
                                 ("--oracle-log", args.oracle_log)):
                 if not value:
                     p.error("--build-reference-oracle requires %s" % flag)
-            cc, machine, rejections = resolve_target_cc(leg)
-            for line in rejections:
-                sys.stderr.write("  rejected %s\n" % line)
-            if not cc:
-                # rc 4 is NOT a failure of this run — it is the honest statement
-                # that this host cannot produce a control for this leg. The leg
-                # then reports NO ORACLE, which is the whole point of the anchor.
-                sys.stderr.write(
-                    "no declared targetCc candidate for leg '%s' (%s) both "
-                    "exists on this host AND targets it, so NO same-platform "
-                    "attribution oracle can be built here. The leg reports that "
-                    "it HAS NO ORACLE rather than inheriting another platform's "
-                    "reference [D-HARNESS-PE64-HAS-NO-SAME-PLATFORM-ORACLE].\n"
-                    % (leg.get("label"), leg.get("spec")))
-                sys.stdout.write(json.dumps(
-                    {"status": "no-reference-compiler",
-                     "leg": leg.get("label"), "spec": leg.get("spec"),
-                     "rejections": rejections}) + "\n")
-                return 4
-            with open(args.manifest, "r", encoding="utf-8") as fh:
-                manifest = json.load(fh)
-            argv = reference_oracle_argv(
-                cc, manifest, oracle_output,
-                leg.get("build", {}).get("referenceLinkFlags", []))
-            import subprocess
-            with open(args.oracle_log, "w", encoding="utf-8") as log:
-                log.write("%s\n\n" % " ".join(argv))
-                log.flush()
-                # rc DIRECTLY off the process, never after a pipe.
-                proc = subprocess.run(argv, stdout=subprocess.PIPE,
-                                      stderr=subprocess.STDOUT)
-                log.write(proc.stdout.decode("utf-8", "replace"))
-            built = proc.returncode == 0 and os.path.isfile(oracle_output)
-            report = {"status": "built" if built else "build-failed",
-                      "leg": leg.get("label"), "spec": leg.get("spec"),
-                      "cc": cc_display(cc), "ccArgv": list(cc),
-                      "triple": machine, "rc": proc.returncode,
-                      "path": oracle_output if built else "",
-                      "log": args.oracle_log, "sources": len(manifest.get("sources", [])),
-                      "rejections": rejections}
+            # ONE composition, shared with the self-test that drives it with an
+            # injected compiler: resolution, the generated reference surface and
+            # the argv carrying it. rc 0 built · 3 build failed · 4 no compiler;
+            # a declared surface this harness refuses raises LegError (rc 2).
+            # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+            report, rc, notes = build_reference_oracle(
+                leg, args.manifest, oracle_output, args.oracle_log)
+            for line in notes:
+                sys.stderr.write("%s\n" % line)
             sys.stdout.write(json.dumps(report) + "\n")
-            if not built:
-                # LOUD, and it does not degrade to the cross-platform reference:
-                # a control that failed to build is an absent control, and saying
-                # so is the entire discipline this anchor enforces.
-                sys.stderr.write(
-                    "the same-platform oracle for leg '%s' did NOT build (%s "
-                    "exited %d). The leg reports NO ORACLE; read %s.\n"
-                    % (leg.get("label"), cc_display(cc), proc.returncode,
-                       args.oracle_log))
-                return 3
-            return 0
+            return rc
         if args.loadext_builder:
             sys.stdout.write("%s\n"
                              % loadext_helper_builder(args.helper_builder))
@@ -17843,8 +20201,8 @@ def main(argv=None):
                     "this harness takes from the host rather than from a leg's "
                     "own declaration, so it cannot be checked against the "
                     "libraries the legs will link "
-                    "[D-HARNESS-TCL-HEADER-IS-HOST-CHOSEN-WHILE-EVERY-LEG-"
-                    "LIBRARY-IS-PINNED]." % _fwd(args.staged_tcl_header))
+                    "[D-HARNESS-TCL-HEADER-IS-HOST-CHOSEN-WHILE-EVERY-LEG-LIBRARY-IS-PINNED]."
+                    % _fwd(args.staged_tcl_header))
             entries = []
             for raw in (args.leg_tcl_library or []):
                 label, sep, path = raw.partition("=")
@@ -18045,8 +20403,7 @@ def main(argv=None):
                     "--print-probe-budget prices that measurement; "
                     "--probe-verdicts READS a file. Asking for both would print "
                     "somebody else's answer under the name of a measurement. "
-                    "[D-HARNESS-PROBE-VERDICTS-FLAG-INJECTS-AN-UNVALIDATED-"
-                    "PRESENT]")
+                    "[D-HARNESS-PROBE-VERDICTS-FLAG-INJECTS-AN-UNVALIDATED-PRESENT]")
             doc = load_catalogue_doc(args.catalogue)
             only = required_probe_names(load_catalogue(args.catalogue))
             if args.probe_only is not None:

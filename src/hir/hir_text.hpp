@@ -46,7 +46,7 @@
 //   - The five per-node side-tables (source-loc / ffi / shader / transpile / diag)
 //     live OUTSIDE the `Hir`, so emit takes them by pointer and parse hands them
 //     back, bound to the rebuilt module.
-//   - The FORMAT VERSION and the PRODUCER REVISION head the file (`dsshir 3`,
+//   - The FORMAT VERSION and the PRODUCER REVISION head the file (`dsshir 4`,
 //     `producer "…"`). Both are MANDATORY on read: a file that opens any other
 //     way is refused, never guessed at. The version is a constant of this build
 //     (`kHirTextFormatVersion`); the producer is supplied by the caller, because
@@ -112,7 +112,7 @@ class TypeRegistry;
 // stray token — which is the correct outcome and exactly why the number moves:
 // the alternative is a reader that skips what it does not recognise and rebuilds
 // a `Node` with no `next`.
-inline constexpr std::uint32_t kHirTextFormatVersion = 3;
+inline constexpr std::uint32_t kHirTextFormatVersion = 4;
 
 // ── kHirTextMaxNodeDepth — THE FORMAT'S DECLARED NESTING LIMIT ────────────────
 //

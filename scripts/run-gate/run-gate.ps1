@@ -43,10 +43,12 @@
       2   this wrapper refused before starting (bad usage, unwritable log/marker)
       3   THE SOURCE TREE MOVED under the run -- the verdict is not evidence
       4   ANOTHER RUN WAS LIVE IN THE SAME BUILD DIRECTORY -- likewise not evidence
+      5   ANOTHER LIVE RUN-GATE HOLDS THIS LOG PATH -- nothing was run, and that
+          run's log was not touched
       *   otherwise, the command's own exit code (127 gets its own sentence)
-    ! 3 and 4 are DELIBERATELY DIFFERENT NUMBERS. Both mean "this run has no
-    verdict", and a reader who cannot tell which of the two fired cannot tell
-    whether to settle the tree or wait for a sibling -- two different remedies.
+    ! 3, 4 and 5 are DELIBERATELY DIFFERENT NUMBERS. Each means "this run has no
+    verdict", and a reader who cannot tell which fired cannot pick the remedy:
+    settle the tree, wait for a sibling, or give this gate its own log path.
 
 .PARAMETER LogPath
     File to receive the command's combined output. TRUNCATED, never appended --
@@ -217,11 +219,13 @@ if ($LogPath.StartsWith('-')) {
     exit 2
 }
 
-# Truncate up front (see LogPath above).
-try {
-    Set-Content -LiteralPath $LogPath -Value $null -NoNewline -ErrorAction Stop
-} catch {
-    Write-Host "run-gate.ps1: FAIL - cannot create the log '$LogPath', so nothing was run."
+# (i) THE TRUNCATE NOW HAPPENS IN THE PRE-RUN SECTION, AFTER THIS RUN HAS TAKEN THE LOG
+#   PATH'S OWNER RECORD -- twin of the same note in run-gate.sh, and see "THE LOG PATH IS
+#   ONE LIVE RUN'S ALONE" below. Truncating first is what let a second run on one path
+#   erase a live run's log. The refusal text is kept here, as a function, so both of its
+#   callers say the same thing.
+function Show-RunGateLogPathRefusal([string]$What, [string]$Reason) {
+    Write-Host "run-gate.ps1: FAIL - cannot create $What, so nothing was run."
     Write-Host "  This refusal is about the LOG PATH, not about the gate command."
     Write-Host "  shell   : $(Get-RunGateShellIdentity)"
     Write-Host "  script  : $PSCommandPath"
@@ -236,8 +240,7 @@ try {
     } else {
         Write-Host "  Check that the parent directory exists and is writable by this shell."
     }
-    Write-Host "  reason  : $($_.Exception.Message)"
-    exit 2
+    if ($Reason) { Write-Host "  reason  : $Reason" }
 }
 
 if ($null -eq $CommandArgs) { $CommandArgs = @() }
@@ -343,9 +346,15 @@ trap { Restore-CplDefault; break }
 # See Get-RunGateShellIdentity above for the measurement. `Get-Command` resolves
 # an application, a cmdlet, a function and an explicit path alike, so this
 # rejects nothing the `&` below would have accepted.
-$resolved = Get-Command -Name $Command -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-if (-not $resolved) {
+# (i) CALLED FROM THE PRE-RUN SECTION, after the log path's owner record is taken and
+#   the log truncated: the refusal writes INTO the log, so it may only run once this
+#   run holds that log -- see "THE LOG PATH IS ONE LIVE RUN'S ALONE". `exit` inside a
+#   script-defined function ends the script with that code (+MEASURED 2026-09-15 on
+#   pwsh 7.6.6 and PowerShell 5.1), and the finally that releases the record still runs.
+function Resolve-RunGateCommandOrRefuse {
+    $found = Get-Command -Name $Command -ErrorAction SilentlyContinue |
+             Select-Object -First 1
+    if ($found) { return $found }
     $notFound = @(
         "run-gate.ps1: FAIL - the gate command was NOT FOUND, so it never ran (rc=127).",
         "  command : $Command $($CommandArgs -join ' ')",
@@ -634,6 +643,41 @@ function Get-RunGateImageKey([string]$Name) {
     return $i
 }
 
+# THE WORKING DIRECTORY OF ANOTHER PROCESS, where this host lets one be read -- twin of
+# run_gate_process_cwd in run-gate.sh, which carries the reasoning: `/proc/<pid>/cwd`
+# on Linux, `lsof -d cwd` on macOS, nothing on Windows; both readers TRIED rather than
+# looked up, and only an absolute answer accepted.
+# D-SCRIPT-RUN-GATE-RESOLVES-ANOTHER-PROCESS-RELATIVE-BUILD-DIR-AGAINST-ITS-OWN-CWD
+function Get-RunGateProcessCwd([long]$ProcId) {
+    if (Test-RunGateIsWindows) { return $null }
+    $c = ''
+    try { $c = [string](& readlink "/proc/$ProcId/cwd" 2>$null) } catch { $c = '' }
+    if (-not $c) {
+        try {
+            $n = @(& lsof -a -p $ProcId -d cwd -Fn 2>$null) | Where-Object { $_ -like 'n*' } | Select-Object -First 1
+            if ($n) { $c = ([string]$n).Substring(1) }
+        } catch { $c = '' }
+    }
+    if ($c -and $c.StartsWith('/')) { return $c }
+    return $null
+}
+
+# WHERE A PROCESS STANDS *NOW* IS NOT WHERE ITS RELATIVE ARGUMENTS WERE WRITTEN -- twin
+# of run_gate_path_ends_with in run-gate.sh, which carries the measurement (ctest enters
+# its --test-dir after parsing, so its cwd IS the directory it named). $true when the
+# dir's trailing components are the token; a token with a `..` or `.` component never
+# qualifies.
+function Test-RunGatePathEndsWith([string]$Dir, [string]$Token) {
+    $t = $Token -replace '\\', '/'
+    while ($true) {
+        if ($t.StartsWith('./')) { $t = $t.Substring(2); continue }
+        if ($t.Length -gt 1 -and $t.EndsWith('/')) { $t = $t.Substring(0, $t.Length - 1); continue }
+        break
+    }
+    if ($t -eq '' -or ("/$t/" -match '/\.\.?/')) { return $false }
+    return (Get-RunGateTidyDir $Dir).EndsWith('/' + $t, [StringComparison]::Ordinal)
+}
+
 function Get-RunGateContention {
     $script:RunGateContenders    = @()
     $script:RunGateUnreadable    = 0
@@ -669,6 +713,9 @@ function Get-RunGateContention {
     # and its one `parent_of`, in run_gate_classify_table (run-gate.sh).
     $byId = @{}
     foreach ($r in $table) { if (-not $byId.ContainsKey($r.ProcId)) { $byId[$r.ProcId] = $r } }
+    # THIS RUN'S OWN CREATION KEY, from the same table, for the log path's owner record
+    # -- twin of run_gate_self_created in run_gate_scan_contention.
+    if ($byId.ContainsKey($PID)) { $script:RunGateSelfCreated = [string]$byId[$PID].Created }
     $exclude = @{}
     $own = @{ $PID = $true }
     $chain = @($PID)
@@ -722,9 +769,29 @@ function Get-RunGateContention {
         if (-not $r.CmdLine) { $script:RunGateUnreadable++; continue }
         if ($exclude.ContainsKey($r.ProcId)) { continue }
         foreach ($raw in (Get-RunGateDirsInTokens $img (Split-RunGateCommandLine $r.CmdLine))) {
-            if ((Resolve-RunGateDir $raw) -ne $script:RunGateBuildDir) { continue }
+            # A RELATIVE SPELLING IS RELATIVE TO *THAT* PROCESS'S DIRECTORY -- twin of the
+            # same block in run_gate_scan_contention, which carries the measurement.
+            # D-SCRIPT-RUN-GATE-RESOLVES-ANOTHER-PROCESS-RELATIVE-BUILD-DIR-AGAINST-ITS-OWN-CWD
             $slashed = $raw -replace '\\', '/'
-            if (-not ($slashed -match '^(/|[A-Za-z]:/)')) { $script:RunGateRelativeMatch = $true }
+            $assumed = $false
+            if ($slashed -match '^(/|[A-Za-z]:/)') {
+                $at = Resolve-RunGateDir $raw
+            } else {
+                $pcwd = Get-RunGateProcessCwd $r.ProcId
+                if ($pcwd) {
+                    # TWO READINGS -- see Test-RunGatePathEndsWith: the tool has not entered
+                    # the directory it named yet, or it already has and stands in it.
+                    $at = Resolve-RunGateDir ($pcwd + '/' + $slashed)
+                    if ($at -ne $script:RunGateBuildDir -and (Test-RunGatePathEndsWith $pcwd $slashed)) {
+                        $at = Resolve-RunGateDir $pcwd
+                    }
+                } else {
+                    $at = Resolve-RunGateDir $raw
+                    $assumed = $true
+                }
+            }
+            if ($at -ne $script:RunGateBuildDir) { continue }
+            if ($assumed) { $script:RunGateRelativeMatch = $true }
             $script:RunGateContenders += "      pid $($r.ProcId)  $img  named it as '$raw'"
             $script:RunGateContenders += "        $($r.CmdLine)"
         }
@@ -813,11 +880,15 @@ function Show-RunGateContentionRefusal([string]$When) {
     Write-Host "      directory rewrite each other's binaries and test artefacts mid-run: +MEASURED, a"
     Write-Host "      2100/2101 with ONE red that passed on a re-run in isolation."
     if ($script:RunGateRelativeMatch) {
-        Write-Host "  (i) At least one spelling above is RELATIVE, and this guard resolved it against THIS"
-        Write-Host "      shell's working directory ($((Get-Location).Path)) - a process's own working"
-        Write-Host "      directory is not readable from outside on Windows. If that process is really"
-        Write-Host "      standing in a DIFFERENT tree, this is a false refusal; read the command line"
-        Write-Host "      printed above before assuming it is not."
+        # Twin of the same sentence in run_gate_refuse_contention -- the fixture's arms 66/67
+        # read it from BOTH twins, which is how a stale copy here was caught.
+        # D-SCRIPT-RUN-GATE-RESOLVES-ANOTHER-PROCESS-RELATIVE-BUILD-DIR-AGAINST-ITS-OWN-CWD
+        Write-Host "  (i) At least one spelling above is RELATIVE and THAT process's own working directory"
+        Write-Host "      could not be read here (Windows does not expose it; on Linux and macOS it is read"
+        Write-Host "      from /proc or lsof, so reaching this sentence there means that read failed), so"
+        Write-Host "      this guard resolved it against THIS shell's working directory ($((Get-Location).Path))."
+        Write-Host "      If that process is really standing in a DIFFERENT tree, this is a false refusal;"
+        Write-Host "      read the command line printed above before assuming it is not."
     }
     Write-Host "  Wait for the other run to finish, or point this gate at its own build directory."
     Write-Host "  (log: $LogPath)"
@@ -937,6 +1008,197 @@ function Get-RunGateAbsInputRoots {
     return @($script:RunGateInputRootNames | ForEach-Object { "$($script:RunGateSourceTree)/$_" })
 }
 
+# ======== THE LOG PATH IS ONE LIVE RUN'S ALONE ================================
+# Twin of the block of the same name in run-gate.sh, which carries the measurements and
+# the argument; not repeated here, so the two cannot drift into describing it
+# differently. In short: before it truncates anything, this run takes
+# `<log>.run-gate-owner` by EXCLUSIVE CREATE, and refuses with exit 5 while another LIVE
+# run-gate -- of EITHER twin -- holds it. The record format, the liveness rule (the
+# process table's pid and creation key, in the same pid namespace), the hard-link
+# reclaim, and the refusals for a record that cannot be judged are the twin's, spelled in
+# this shell's idioms and nothing more.
+# D-SCRIPT-WSL-LEG-AND-RUN-GATE-LET-CONCURRENT-LEGS-SHARE-ONE-LOG-PATH
+$script:RunGateLogHeldExit     = 5
+$script:RunGateOwner           = "$LogPath.run-gate-owner"
+$script:RunGateOwnerFull       = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($script:RunGateOwner)
+$script:RunGateOwnerPrefix     = (Split-Path -Leaf $LogPath) + '.run-gate-'
+$script:RunGateOwnerToken      = ''
+$script:RunGateOwnerHeld       = $false
+$script:RunGateOwnerReclaimed  = ''
+$script:RunGateOwnerVerdict    = ''
+$script:RunGateOwnerWhy        = ''
+$script:RunGateOwnerHolder     = ''
+$script:RunGateOwnerStaleToken = ''
+$script:RunGateNamespace       = ''
+$script:RunGateSelfCreated     = ''
+
+# THIS SHELL'S PID NAMESPACE, spelled exactly as run_gate_namespace spells it: the OS
+# family, the host name lowercased, and on Linux the pid namespace's own inode.
+function Get-RunGateNamespace {
+    if (Test-RunGateIsWindows) {
+        $h = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { [Environment]::MachineName }
+        return 'windows:' + $h.ToLowerInvariant() + ':'
+    }
+    $k = ''; $h = ''; $n = ''
+    try { $k = [string](& uname -s 2>$null) } catch { $k = '' }
+    try { $h = [string](& uname -n 2>$null) } catch { $h = '' }
+    if ($k -eq 'Linux') {
+        $k = 'linux'
+        try { $n = [string](& readlink /proc/self/ns/pid 2>$null) } catch { $n = '' }
+    } elseif ($k -eq 'Darwin') {
+        $k = 'darwin'
+    } else {
+        $k = $k.ToLowerInvariant()
+    }
+    return $k + ':' + $h.ToLowerInvariant() + ':' + $n
+}
+
+function Get-RunGateOwnerField([string]$Path, [string]$Key) {
+    try {
+        foreach ($l in [IO.File]::ReadAllLines($Path)) {
+            if ($l.StartsWith("$Key=")) { return $l.Substring($Key.Length + 1).TrimEnd("`r") }
+        }
+    } catch { }
+    return ''
+}
+
+# Sets RunGateOwnerVerdict to held | unknown | stale, with RunGateOwnerWhy and
+# RunGateOwnerHolder for the message. Only `stale` may lead to a reclaim.
+function Test-RunGateOwnerRecord {
+    $script:RunGateOwnerVerdict    = 'held'
+    $script:RunGateOwnerStaleToken = ''
+    $ot = Get-RunGateOwnerField $script:RunGateOwnerFull 'token'
+    $op = Get-RunGateOwnerField $script:RunGateOwnerFull 'pid'
+    $oc = Get-RunGateOwnerField $script:RunGateOwnerFull 'created'
+    $on = Get-RunGateOwnerField $script:RunGateOwnerFull 'namespace'
+    $opShown = if ($op) { $op } else { '?' }
+    $script:RunGateOwnerHolder = "pid $opShown ($(Get-RunGateOwnerField $script:RunGateOwnerFull 'shell')), running: $(Get-RunGateOwnerField $script:RunGateOwnerFull 'command')"
+    if ($ot -notmatch '^[A-Za-z0-9-]+$') {
+        $script:RunGateOwnerWhy = 'its owner record is empty, half-written or unreadable -- another run-gate may be writing it this instant, or one died while writing it'
+        return
+    }
+    if ($op -notmatch '^[0-9]+$') {
+        $script:RunGateOwnerWhy = 'its owner record names no usable pid'
+        return
+    }
+    if ($on -ne $script:RunGateNamespace) {
+        $script:RunGateOwnerVerdict = 'unknown'
+        $script:RunGateOwnerWhy = "the record was written in pid namespace '$on' and this shell runs in '$($script:RunGateNamespace)', whose process table cannot see that holder"
+        return
+    }
+    $table = @(Get-RunGateProcessTable)
+    if ($table.Count -eq 0) {
+        $script:RunGateOwnerVerdict = 'unknown'
+        $script:RunGateOwnerWhy = 'no process table could be read on this host, so the holder could not be shown to be gone'
+        return
+    }
+    $pidValue = [long]$op
+    $row = $table | Where-Object { [long]$_.ProcId -eq $pidValue } | Select-Object -First 1
+    if (-not $row) {
+        $script:RunGateOwnerVerdict = 'stale'
+        $script:RunGateOwnerWhy = "pid $op is not alive"
+    } elseif ($pidValue -eq [long]$PID) {
+        $script:RunGateOwnerVerdict = 'stale'
+        $script:RunGateOwnerWhy = "pid $op is THIS run, so the holder it named is gone and its pid was reused"
+    } elseif ($oc -match '^[0-9]{20}$' -and ([string]$row.Created) -match '^[0-9]{20}$' -and $oc -ne [string]$row.Created) {
+        $script:RunGateOwnerVerdict = 'stale'
+        $script:RunGateOwnerWhy = "pid $op is alive but was created at $($row.Created), not at $oc -- a RECYCLED pid, not the holder"
+    } else {
+        $createdNote = if ($row.Created) { " (created $($row.Created))" } else { '' }
+        $script:RunGateOwnerWhy = "pid $op is alive$createdNote"
+        return
+    }
+    $script:RunGateOwnerStaleToken = $ot
+}
+
+# $true when the record judged stale is gone; $false when a sibling moved first, the
+# record was replaced in between, or no hard link could be made beside the log.
+function Invoke-RunGateOwnerReclaim {
+    $tomb = "$LogPath.run-gate-stale-$($script:RunGateOwnerStaleToken)"
+    $tombFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($tomb)
+    try {
+        New-Item -ItemType HardLink -Path $tombFull -Target $script:RunGateOwnerFull -ErrorAction Stop | Out-Null
+    } catch {
+        return $false
+    }
+    if ((Get-RunGateOwnerField $tombFull 'token') -ne $script:RunGateOwnerStaleToken) {
+        Remove-Item -LiteralPath $tombFull -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    Remove-Item -LiteralPath $script:RunGateOwnerFull -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $tombFull -Force -ErrorAction SilentlyContinue
+    return $true
+}
+
+# 0 the record is this run's | 5 another live run-gate holds the path | 2 not creatable
+function Enter-RunGateLogPath {
+    $script:RunGateOwnerToken = "$PID-$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())-$([guid]::NewGuid().ToString('N').Substring(0, 10))"
+    $commandText = ("$Command $($CommandArgs -join ' ')") -replace "[`r`n]", ' '
+    $body = "run-gate-owner-record: while this file exists a LIVE run-gate holds the log path beside it`n" +
+            "token=$($script:RunGateOwnerToken)`n" +
+            "pid=$PID`n" +
+            "created=$($script:RunGateSelfCreated)`n" +
+            "namespace=$($script:RunGateNamespace)`n" +
+            "shell=run-gate.ps1`n" +
+            "command=$commandText`n"
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($body)
+    $reclaimFailed = $false
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        $created = $false
+        # FileMode.CreateNew is an EXCLUSIVE create (CREATE_NEW / O_EXCL), so of two runs
+        # racing for a free path exactly one wins -- the twin's `set -C`.
+        try {
+            $fs = [IO.File]::Open($script:RunGateOwnerFull, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+            try { $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Close() }
+            $created = $true
+        } catch {
+            $created = $false
+        }
+        if ($created) {
+            $script:RunGateOwnerHeld = $true
+            return 0
+        }
+        if (-not (Test-Path -LiteralPath $script:RunGateOwnerFull)) { continue }
+        Test-RunGateOwnerRecord
+        if ($script:RunGateOwnerVerdict -ne 'stale') { return 5 }
+        if (Invoke-RunGateOwnerReclaim) {
+            $script:RunGateOwnerReclaimed = "$($script:RunGateOwnerHolder) -- $($script:RunGateOwnerWhy)"
+        } else {
+            $reclaimFailed = $true
+        }
+    }
+    if (-not (Test-Path -LiteralPath $script:RunGateOwnerFull)) { return 2 }
+    if ($reclaimFailed) {
+        $script:RunGateOwnerWhy += '; and the stale record could not be reclaimed (no hard link could be made beside the log, or a sibling kept replacing it)'
+    }
+    return 5
+}
+
+# Runs from the `finally` at the end of this file. Removes the record only while it is
+# still this run's.
+function Remove-RunGateOwnerRecord {
+    if (-not $script:RunGateOwnerHeld) { return }
+    if ((Get-RunGateOwnerField $script:RunGateOwnerFull 'token') -eq $script:RunGateOwnerToken) {
+        Remove-Item -LiteralPath $script:RunGateOwnerFull -Force -ErrorAction SilentlyContinue
+    }
+    $script:RunGateOwnerHeld = $false
+}
+
+function Show-RunGateLogHeldRefusal {
+    Write-Host "run-gate.ps1: FAIL - ANOTHER LIVE RUN-GATE HOLDS THIS LOG PATH, so nothing was run and its log was not touched (rc=$($script:RunGateLogHeldExit))."
+    Write-Host "  log     : $LogPath"
+    Write-Host "  record  : $($script:RunGateOwner)"
+    Write-Host "  holder  : $($script:RunGateOwnerHolder)"
+    Write-Host "  judged  : $($script:RunGateOwnerWhy)"
+    Write-Host "  [!] This is NOT 'the gate failed'. Two runs on one log path truncate and interleave each"
+    Write-Host "      other's output and delete each other's fingerprints, and a witness grep can then find"
+    Write-Host "      the OTHER run's success line. +MEASURED: a leg reported OK over a log that named"
+    Write-Host "      another clone's build directory."
+    Write-Host "  Give this gate its own log path, or wait for that run to finish. If you are CERTAIN"
+    Write-Host "    nothing uses this path (for instance the holder ran in another OS namespace and is"
+    Write-Host "    gone), delete the record by hand: $($script:RunGateOwner)"
+}
+
 # ---- PRE-RUN: refuse a contended build directory BEFORE anything starts -----
 # ! Placed AHEAD of the input marker deliberately, so a refusal here leaves no
 #   marker file behind for the next run to trip over.
@@ -951,6 +1213,43 @@ if ($__rawBuildDir) {
 }
 Set-RunGateInputRoots
 Save-RunGateContentionSample 'before'
+
+# ======== THE LOG PATH IS TAKEN BEFORE ONE BYTE OF IT IS TOUCHED ============
+# After the pre-run sample, so the record carries this run's creation key from the
+# table that sample just read; before the truncate, so a refused run erases nothing.
+# D-SCRIPT-WSL-LEG-AND-RUN-GATE-LET-CONCURRENT-LEGS-SHARE-ONE-LOG-PATH
+$script:RunGateNamespace = Get-RunGateNamespace
+$__acquired = Enter-RunGateLogPath
+if ($__acquired -eq 5) {
+    Show-RunGateLogHeldRefusal
+    Restore-CplDefault
+    exit $script:RunGateLogHeldExit
+}
+if ($__acquired -ne 0) {
+    Show-RunGateLogPathRefusal "the log's owner record '$($script:RunGateOwner)'" ''
+    Restore-CplDefault
+    exit 2
+}
+# ======== FROM HERE TO THE END OF THIS FILE, THIS RUN HOLDS THE LOG PATH =========
+# The matching `finally` is the LAST statement of this file, so every exit below -- a
+# refusal, a verdict, a terminating error -- releases the owner record through it.
+# (+MEASURED 2026-09-15, pwsh 7.6.6 and PowerShell 5.1: a try/finally around a
+# top-level `exit` runs its finally.) The body is deliberately NOT re-indented, so this
+# change does not rewrite every line below it.
+try {
+
+# Truncate now that the path is this run's alone (see LogPath above).
+try {
+    Set-Content -LiteralPath $LogPath -Value $null -NoNewline -ErrorAction Stop
+} catch {
+    Show-RunGateLogPathRefusal "the log '$LogPath'" $_.Exception.Message
+    Restore-CplDefault
+    exit 2
+}
+
+# RESOLVE argv[0] BEFORE RUNNING IT -- see Resolve-RunGateCommandOrRefuse.
+$resolved = Resolve-RunGateCommandOrRefuse
+
 if ($script:RunGateContenders.Count -gt 0) {
     Add-Content -LiteralPath $LogPath -Value @"
 --- run-gate.ps1 ---
@@ -1002,12 +1301,125 @@ $script:RunGateBookkeepingPrefix = (Split-Path -Leaf $LogPath) + '.inputs-'
 #   policy, and only self-consistency between two snapshots in one run is
 #   load-bearing, so the stronger algorithm costs nothing worth having.
 #   ✔MEASURED 317 ms over the 1749 files of `examples/`.
+# ======== A FILE CHANGED AND PUT BACK MID-RUN IS STILL A MOVED TREE ==========
+# Twin of the block of the same name in run-gate.sh, which carries the measurement
+# (a `cp -p`, a Copy-Item and a `touch -r` restore all read `held still` on BOTH twins
+# while a reader saw the changed bytes) and the argument. In short: a third half, `U`,
+# compares by EQUALITY a value the file system advances on every change and user space
+# cannot set back -- the NTFS USN on Windows (ChangeTime is NOT it: +MEASURED, Copy-Item
+# puts it back), the status-change time on POSIX, read by the twin's own perl program.
+# A host that cannot read it still gets C and N, and the `changes :` line says so.
+# D-SCRIPT-RUN-GATE-INPUTS-HELD-STILL-OVER-A-FILE-CHANGED-AND-RESTORED-MID-RUN
+$script:RunGateChangeWitness = 'none'
+$script:RunGateChangeWhy     = ''
+$script:RunGateChangeState   = 'unavailable'
+# THE SAME TEXT AS run_gate_ctime_walker in run-gate.sh, which explains why it carries no
+# quote characters.
+$script:RunGateCtimeWalker = @'
+use strict; use File::Find (); use Time::HiRes ();
+my @pre; while (@ARGV && $ARGV[0] ne q{--}) { push @pre, shift @ARGV } shift @ARGV;
+my $n = 0;
+for my $root (@ARGV) {
+    next unless -d $root;
+    File::Find::find({ no_chdir => 1, wanted => sub {
+        my $p = $File::Find::name;
+        return unless -f $p && ! -l $p;
+        (my $b = $p) =~ s{.*/}{};
+        for my $x (@pre) { return if index($b, $x) == 0 }
+        my @s = Time::HiRes::stat($p);
+        return unless @s;
+        print qq{U $s[10] $p\n}; $n++;
+    } }, $root);
+}
+print qq{CTIME-OK $n\n};
+'@
+
+# Decides, once and after the marker exists, which witness this host can read.
+function Initialize-RunGateChangeWitness {
+    $script:RunGateChangeWitness = 'none'
+    $markerFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($script:RunGateMarker)
+    if (Test-RunGateIsWindows) {
+        try {
+            if (-not ('RunGate.FileUsn' -as [type])) {
+                Add-Type -ErrorAction Stop -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+namespace RunGate {
+    public static class FileUsn {
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool DeviceIoControl(SafeFileHandle h, uint code, IntPtr inBuf, uint inSize, byte[] outBuf, uint outSize, out uint returned, IntPtr overlapped);
+        public static string Of(string path) {
+            using (SafeFileHandle h = CreateFileW(path, 0x80, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+                if (h.IsInvalid) { return "unreadable"; }
+                byte[] buf = new byte[1024]; uint got;
+                if (!DeviceIoControl(h, 0x000900eb, IntPtr.Zero, 0, buf, (uint)buf.Length, out got, IntPtr.Zero)) { return "unreadable"; }
+                ushort major = BitConverter.ToUInt16(buf, 4);
+                return (major >= 3 ? BitConverter.ToInt64(buf, 40) : BitConverter.ToInt64(buf, 24)).ToString();
+            }
+        }
+    }
+}
+"@
+            }
+        } catch {
+            $script:RunGateChangeWhy = "the NTFS USN reader could not be loaded ($($_.Exception.Message -replace "[`r`n]", ' '))"
+            return
+        }
+        $m = [RunGate.FileUsn]::Of($markerFull)
+        if ($m -notmatch '^[0-9]+$' -or $m -eq '0') {
+            $script:RunGateChangeWhy = "the log's own volume returned no USN for this run's marker (no change journal?)"
+            return
+        }
+        $script:RunGateChangeWitness = 'usn'
+    } else {
+        $ok = ''
+        try { $ok = [string](& perl -MTime::HiRes -e 'my @s = Time::HiRes::stat($ARGV[0]); print((@s && $s[10] > 0) ? q{ok} : q{no})' $markerFull 2>$null) } catch { $ok = '' }
+        if ($ok -ne 'ok') {
+            $script:RunGateChangeWhy = 'perl with Time::HiRes did not return a status-change time for a file this run had just created'
+            return
+        }
+        $script:RunGateChangeWitness = 'ctime'
+    }
+}
+
+# Reads the two finished fingerprints and decides whether the U half may be believed.
+function Test-RunGateChangeWitness {
+    $script:RunGateChangeState = 'unavailable'
+    $b = @(Get-Content -LiteralPath $script:RunGateInputsBefore -ErrorAction SilentlyContinue)
+    $a = @(Get-Content -LiteralPath $script:RunGateInputsAfter -ErrorAction SilentlyContinue)
+    switch ($script:RunGateChangeWitness) {
+        'ctime' {
+            if (@($b -like 'CTIME-OK *').Count -gt 0 -and @($a -like 'CTIME-OK *').Count -gt 0) {
+                $script:RunGateChangeState = 'watched'
+            } else {
+                $script:RunGateChangeWhy = 'the perl ctime walk did not complete in both snapshots'
+            }
+        }
+        'usn' {
+            $z1 = ([string](@($b -like 'USN-ZERO *') | Select-Object -First 1)) -replace '^USN-ZERO ', ''
+            $z2 = ([string](@($a -like 'USN-ZERO *') | Select-Object -First 1)) -replace '^USN-ZERO ', ''
+            if (-not ($b -contains 'USN-OK') -or -not ($a -contains 'USN-OK')) {
+                $script:RunGateChangeWhy = 'the USN reader did not complete in both snapshots'
+            } elseif ($z1 -ne '0' -or $z2 -ne '0') {
+                $script:RunGateChangeWhy = "$z1 file(s) under the watched roots report USN 0, i.e. their volume keeps no change journal"
+            } else {
+                $script:RunGateChangeState = 'watched'
+            }
+        }
+    }
+}
+
 function Get-RunGateInputFingerprint {
     $lines = New-Object System.Collections.Generic.List[string]
+    $zero = 0
     foreach ($root in (Get-RunGateAbsInputRoots)) {
         if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
         foreach ($f in (Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue)) {
-            if ($f.Name.StartsWith($script:RunGateBookkeepingPrefix)) { continue }
+            # This run's bookkeeping -- the fingerprints AND the log path's owner record.
+            if ($f.Name.StartsWith($script:RunGateBookkeepingPrefix) -or $f.Name.StartsWith($script:RunGateOwnerPrefix)) { continue }
             $h = Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256 -ErrorAction SilentlyContinue
             if ($null -ne $h) { $lines.Add("C $($h.Hash) $($f.Length) $($f.FullName)") }
             # The stamp-order half, differenced against its own pre-run reading:
@@ -1015,6 +1427,21 @@ function Get-RunGateInputFingerprint {
             # in both snapshots and cancels, instead of refusing a run it never
             # touched. See the twin for the measurement that made that real.
             if ($f.LastWriteTimeUtc -gt $script:RunGateMarkerTime) { $lines.Add("N $($f.FullName)") }
+            if ($script:RunGateChangeWitness -eq 'usn') {
+                $u = [RunGate.FileUsn]::Of($f.FullName)
+                if ($u -eq '0') { $zero++ }
+                $lines.Add("U $u $($f.FullName)")
+            }
+        }
+    }
+    if ($script:RunGateChangeWitness -eq 'usn') {
+        $lines.Add("USN-ZERO $zero")
+        $lines.Add('USN-OK')
+    }
+    if ($script:RunGateChangeWitness -eq 'ctime') {
+        $roots = @(Get-RunGateAbsInputRoots)
+        foreach ($l in @(& perl -e $script:RunGateCtimeWalker $script:RunGateBookkeepingPrefix $script:RunGateOwnerPrefix -- @roots 2>$null)) {
+            $lines.Add([string]$l)
         }
     }
     return @($lines | Sort-Object)
@@ -1066,6 +1493,9 @@ function Get-RunGateMovedInputs {
         $l = $line.InputObject
         if     ($l -match '^C \S+ \d+ (.+)$') { $moved += $Matches[1] }
         elseif ($l -match '^N (.+)$')         { $moved += $Matches[1] }
+        # The change witness, believed only when Test-RunGateChangeWitness said so; the
+        # readers' sentinel lines (`USN-*`, `CTIME-OK`) match none of the three halves.
+        elseif ($script:RunGateChangeState -eq 'watched' -and $l -match '^U \S+ (.+)$') { $moved += $Matches[1] }
     }
     # Same cap as the .sh twin: the refusal names the class, it is not a manifest.
     return @($moved | Sort-Object -Unique | Select-Object -First 20)
@@ -1084,6 +1514,10 @@ if (-not (Test-RunGateHashWorks)) {
     Restore-CplDefault
     exit 2
 }
+# Which change witness this host can read -- see "A FILE CHANGED AND PUT BACK MID-RUN IS
+# STILL A MOVED TREE". Decided once, before the first fingerprint, so both carry the
+# same halves.
+Initialize-RunGateChangeWitness
 try {
     Set-Content -LiteralPath $script:RunGateInputsBefore -ErrorAction Stop `
         -Value ((Get-RunGateInputFingerprint) -join [Environment]::NewLine)
@@ -1134,7 +1568,11 @@ if (-not (Test-Path -LiteralPath $script:RunGateInputsBefore)) {
     if (-not (Test-Path -LiteralPath $script:RunGateInputsAfter)) { $snapshotOk = $false }
 }
 $movedInputs = @()
-if ($snapshotOk) { $movedInputs = Get-RunGateMovedInputs }
+if ($snapshotOk) {
+    # Before the diff reads it -- twin of the same ordering in run-gate.sh.
+    Test-RunGateChangeWitness
+    $movedInputs = Get-RunGateMovedInputs
+}
 Remove-Item -LiteralPath $script:RunGateMarker -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $script:RunGateInputsBefore -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $script:RunGateInputsAfter -Force -ErrorAction SilentlyContinue
@@ -1155,6 +1593,18 @@ if (-not $snapshotOk) {
 } else {
     Add-Content -LiteralPath $LogPath -Value "inputs  : held still"
 }
+# WHETHER `held still` COVERS THE MIDDLE OF THE RUN, ON EVERY RUN -- twin of the
+# `changes :` line in run-gate.sh, same two states, same words.
+if ($script:RunGateChangeState -eq 'watched') {
+    if ($script:RunGateChangeWitness -eq 'usn') {
+        Add-Content -LiteralPath $LogPath -Value "changes : watched through every file's NTFS USN - a change undone before the run ended is still seen"
+    } else {
+        Add-Content -LiteralPath $LogPath -Value "changes : watched through every file's status-change time (ctime) - a change undone before the run ended is still seen"
+    }
+} else {
+    $changeWhy = if ($script:RunGateChangeWhy) { $script:RunGateChangeWhy } else { 'no change witness was read' }
+    Add-Content -LiteralPath $LogPath -Value "changes : NOT WATCHED MID-RUN - $changeWhy; a file changed and restored during this run is not ruled out"
+}
 # ★★ THE FOOTER NAMES THE TREE IT WATCHED, ABSOLUTELY, ON EVERY RUN -- green,
 # refused, or failed. `held still` is a claim about a DIRECTORY, and a reader who
 # has to reconstruct the caller's working directory to learn which directory
@@ -1162,6 +1612,13 @@ if (-not $snapshotOk) {
 Add-Content -LiteralPath $LogPath -Value "srctree : $($script:RunGateSourceTree)"
 Add-Content -LiteralPath $LogPath -Value "          decided by: $($script:RunGateSourceTreeWhy)"
 foreach ($r in (Get-RunGateAbsInputRoots)) { Add-Content -LiteralPath $LogPath -Value "watched : $r" }
+# THE LOG PATH'S OWNERSHIP, ON EVERY RUN THAT GOT THIS FAR -- twin of the `logpath :`
+# line in run-gate.sh.
+if ($script:RunGateOwnerReclaimed) {
+    Add-Content -LiteralPath $LogPath -Value "logpath : held by this run alone for its whole duration ($($script:RunGateOwner)) - it first RECLAIMED a stale record: $($script:RunGateOwnerReclaimed)"
+} else {
+    Add-Content -LiteralPath $LogPath -Value "logpath : held by this run alone for its whole duration ($($script:RunGateOwner))"
+}
 # HOW MANY OF THE RUN'S TWO SAMPLES ACTUALLY READ A PROCESS TABLE. Both lines
 # below are claims about a scan, and neither may assert more than the scans it
 # got - computed once so the two cannot answer differently.
@@ -1321,3 +1778,9 @@ if (-not $witnessSeen) {
 
 Write-Host "run-gate.ps1: OK - rc=0 and the success witness /$SuccessPattern/ was present."
 exit 0
+
+} finally {
+    # THE OTHER HALF OF "FROM HERE TO THE END OF THIS FILE, THIS RUN HOLDS THE LOG PATH":
+    # every exit above passes through here, so the owner record is released exactly once.
+    Remove-RunGateOwnerRecord
+}

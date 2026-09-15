@@ -19,10 +19,11 @@
 #   pwsh -NoProfile -File scripts/check-ci-legs/check-ci-legs.ps1 -Branch <name>
 #   pwsh -NoProfile -File scripts/check-ci-legs/check-ci-legs.ps1 -Run 123,456
 #
-# [!] NO ctest ENTRY, for the reason stated in the .sh header: every arm needs the
-# network and an authenticated `gh`, so a ctest registration would red for a property
-# of the machine rather than of the tree. Proved by EXECUTION instead, both twins,
-# against six real Pipeline runs.
+# [!] NO ctest ENTRY READS CI, for the reason stated in the .sh header: that needs the
+# network and an authenticated `gh`, so it would red for a property of the machine rather
+# than of the tree. The READ was proved by EXECUTION, both twins, against six real Pipeline
+# runs. The LOCAL half -- which branch is asked about, which repository gh's own git sees,
+# and the GH_REPO refusal -- is pinned hermetically for both twins by `test-check-ci-legs.py`.
 #
 # Exit: 0 every leg green - 1 at least one leg red - 2 the instrument could not run.
 # [!] 2 is NOT "green": an instrument that could not look must never read as a pass.
@@ -41,6 +42,22 @@ $ErrorActionPreference = 'Continue'
 # workflow-file fallback below is a repo-relative path.
 Set-Location (Join-Path $PSScriptRoot '..\..')
 
+# Neither git NOR gh is asked in the caller's git environment -- twin of the block in the .sh,
+# which carries the measurement: under another repository's GIT_DIR (or GIT_DIR + GIT_WORK_TREE)
+# both twins read THAT repository's branch, and gh -- which finds `:owner/:repo` by running git --
+# saw THAT repository's origin even with -Branch given. Every git and gh call below goes through
+# `Invoke-RepoTreeUnsteered`, the PowerShell owner of that removal. Dot-sourced, never re-spelled.
+# Pinned hermetically (a stub gh, no network) by `test-check-ci-legs.py` beside this file.
+. (Join-Path $PSScriptRoot '..\repo-tree\repo-tree.ps1')
+
+# A caller's GH_REPO is REFUSED -- not honoured, not stripped. The reason is the .sh twin's: it is
+# gh's explicit override, it makes gh answer for the repository it names, and this tool reads only
+# the CI of the tree it lives in. Exit 2: the instrument did not run.
+if (-not [string]::IsNullOrEmpty($env:GH_REPO)) {
+    [Console]::Error.WriteLine("check-ci-legs: FATAL -- GH_REPO is set ($($env:GH_REPO)), so gh would answer for THAT repository; this tool reads only the CI of the tree it lives in. Unset GH_REPO for this call. CI was NOT read (this is not a pass)")
+    exit 2
+}
+
 # The matrix builder's own source, read ONLY when GitHub truncated a job name out of
 # its budget fields - see the .sh header for why that fallback exists at all (the
 # `linux-clang-asan` name is the truncated one, and it is the leg nearest its cap).
@@ -53,12 +70,12 @@ if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
 
 $runs = @($Run)
 if ($runs.Count -eq 0) {
-    if (-not $Branch) { $Branch = (& git rev-parse --abbrev-ref HEAD 2>$null) }
+    if (-not $Branch) { $Branch = (Invoke-RepoTreeUnsteeredGit @('rev-parse', '--abbrev-ref', 'HEAD')) }
     if (-not $Branch -or $Branch -eq 'HEAD') {
         [Console]::Error.WriteLine('check-ci-legs: FATAL -- no branch to ask about (detached HEAD?); pass -Branch or -Run')
         exit 2
     }
-    $runs = @(& gh run list --workflow $Workflow --branch $Branch --limit $Limit --json databaseId --jq '.[].databaseId' 2>$null)
+    $runs = @(Invoke-RepoTreeUnsteered -Command 'gh' -Arguments @('run', 'list', '--workflow', $Workflow, '--branch', $Branch, '--limit', "$Limit", '--json', 'databaseId', '--jq', '.[].databaseId') -DiscardStandardError)
     if ($runs.Count -eq 0) {
         [Console]::Error.WriteLine("check-ci-legs: FATAL -- no ``$Workflow`` run found for branch $Branch; CI was NOT read")
         exit 2
@@ -93,7 +110,7 @@ end
 
 $rc = 0
 foreach ($r in $runs) {
-    $meta = & gh api "repos/:owner/:repo/actions/runs/$r" --jq '[.head_sha[0:8], .head_branch, .created_at, .conclusion] | @tsv' 2>$null
+    $meta = Invoke-RepoTreeUnsteered -Command 'gh' -Arguments @('api', "repos/:owner/:repo/actions/runs/$r", '--jq', '[.head_sha[0:8], .head_branch, .created_at, .conclusion] | @tsv') -DiscardStandardError
     if (-not $meta) {
         [Console]::Error.WriteLine("check-ci-legs: FATAL -- run $r could not be read")
         exit 2
@@ -101,7 +118,7 @@ foreach ($r in $runs) {
     Write-Output ''
     Write-Output "=== run $r  $meta"
 
-    $legs = @(& gh api "repos/:owner/:repo/actions/runs/$r/jobs?per_page=100" --jq $jqProgram 2>$null)
+    $legs = @(Invoke-RepoTreeUnsteered -Command 'gh' -Arguments @('api', "repos/:owner/:repo/actions/runs/$r/jobs?per_page=100", '--jq', $jqProgram) -DiscardStandardError)
     # An EMPTY answer is FATAL, not a green run - twin of the same refusal in the .sh.
     if ($legs.Count -eq 0) {
         [Console]::Error.WriteLine("check-ci-legs: FATAL -- run $r returned NO job rows; nothing was verified")

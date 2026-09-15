@@ -1,0 +1,14 @@
+{
+  "$comment": "D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE — the SEMANTICS witness for DSS's pe64 generic compare-exchange entry, `__atomic_compare_exchange`, called by name so the body is exercised whether or not the compound-assignment lowering that consumes it has landed. ★★ THE CONTRACT, as clang 18.1.3's own call site reads it (✔MEASURED at -O1 on `g.a += 5`: size, object, &expected slot, &desired slot, 5, 5, then a test of the returned byte and, on false, a RELOAD of the expected slot): equal ⇒ store `*desired`, return 1, leave `*expected` untouched; unequal ⇒ return 0, leave the object untouched, and write the OBSERVED value into `*expected`. ★ EVERY ARM OF THE BODY IS REACHED BY PLACEMENT, not by luck: 4 bytes crossing a 64-byte line and 8 bytes crossing one (the process lock), 4 bytes and 8 bytes misaligned inside one line (`lock cmpxchg` at width), and 2 plain bytes inside an aligned 8-byte block (the residue block CAS). Each check also proves the byte beside the object survived. exit 42 when all hold; otherwise 100 + arm×10 + the failing check.",
+  "$legComment": "★ pe64 ONLY, AND THE SUBJECT IS WHY: this pins DSS's OWN runtime body, which only the pe64 formats link. The elf64 formats import `libatomic.so.1` (which exports the same entry, ✔MEASURED `T __atomic_compare_exchange@@LIBATOMIC_1.0` on x86_64 and aarch64) and macho64 imports libSystem, so a run there would test those libraries rather than this body; the compound-assignment lowering's own witnesses exercise every leg through `+=`.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

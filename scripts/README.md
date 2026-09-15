@@ -54,7 +54,7 @@ python scripts/check-scripts-index/check-scripts-index.py --write
 | **`check-anchor-balance`** | `check-anchor-balance.py` | refuse a cycle that ends with more OPEN deferral-registry rows than it began. |
 | **`check-anchor-registry`** | `check-anchor-registry.ps1`, `check-anchor-registry.sh` | refuse a `D-*` anchor cited in a scanned root that resolves to no registry row, and refuse a markdown table row whose unescaped pipes would silently drop cells. |
 | **`check-carriage-paths`** | `check-carriage-paths.py` | refuse a carriage script whose repository path disagrees with the project's own declared name. |
-| **`check-ci-legs`** | `check-ci-legs.ps1`, `check-ci-legs.sh` | read the PR's CI verdict per leg from job METADATA, which outlives the logs, and separate a real test failure from a budget overrun. |
+| **`check-ci-legs`** | `check-ci-legs.ps1`, `check-ci-legs.sh`, `test-check-ci-legs.py` | read the PR's CI verdict per leg from job METADATA, which outlives the logs, and separate a real test failure from a budget overrun. |
 | **`check-diagnostic-codes`** | `check-diagnostic-codes.py` | refuse a duplicate, implicitly-numbered, or newly-uncovered `DiagnosticCode` ordinal. |
 | **`check-doc-census`** | `check-doc-census.py`, `source-census.py` | refuse a documented figure that a census refutes, in prose or in a source comment, and repair it in place. |
 | **`check-enum-name-table-guards`** | `check-enum-name-table-guards.py` | refuse an `EnumNameTable` vocabulary declared in `src/` without a `DSS_CHECK_ENUM_NAME_TABLE` well-formedness assert. |
@@ -78,18 +78,19 @@ python scripts/check-scripts-index/check-scripts-index.py --write
 | **`check-wrapped-anchor-ids`** | `check-wrapped-anchor-ids.py` | refuse a NEW anchor id split across a line break, which no grep can ever return. |
 | **`cmake-import`** | `cmake-import.ps1`, `cmake-import.py`, `cmake-import.sh` | convert a CMake project into a DSS `.dss-project.json` manifest. |
 | **`compile-bench`** | `compile-bench.py`, `compile-bench.sh` | time dsscp against gcc/clang/MSVC/tcc on ONE host over a subject size ladder, naming every reference it could not find. |
-| **`corpus-census`** | `corpus-census.ps1`, `corpus-census.py`, `corpus-census.sh` | census the real-example corpus into a run-identified report instead of one overwritten log. |
+| **`corpus-census`** | `corpus-census.ps1`, `corpus-census.py`, `corpus-census.sh`, `test-corpus-census.py` | census the real-example corpus into a run-identified report instead of one overwritten log. |
 | **`examples-census`** | `examples-census.py` | re-derive every corpus-manifest figure examples/README.md states, by parsing the manifests. |
-| **`lane-fold`** | `lane-fold.py` | seed a lane worktree from the main tree and fold only that lane's real changes back. |
+| **`lane-fold`** | `lane-fold.py` | seed a lane worktree from the main tree, fold only that lane's real changes back, and land it with its rows applied and its evidence preserved. |
 | **`lane-worktree`** | `lane-worktree.ps1`, `lane-worktree.sh`, `test-lane-worktree.sh` | create and remove lane worktrees inside the ignored .worktrees/, refusing any root that would exceed Windows MAX_PATH. |
-| **`leg-tree`** | `leg-tree.sh` | put a gate host's own clone on the tree under test before a leg, and restore it to pristine afterwards. |
+| **`leg-tree`** | `leg-tree.sh`, `test-leg-tree.sh` | put a gate host's own clone on the tree under test before a leg, and restore it to pristine afterwards. |
 | **`local-build`** | `local-build.ps1`, `local-build.sh` | build dsscp incrementally on this host, and optionally run ctest. |
 | **`macho-alias-ld64-matrix`** | `macho-alias-ld64-matrix.remote.sh`, `macho-alias-ld64-matrix.sh` | measure what Apple's ld64 does with a SECOND defined symbol at the same address as a canonical one, with and without -dead_strip. |
-| **`macos-leg`** | `macos-leg.ps1`, `macos-leg.sh` | run a DSS gate leg on the operator's macOS host -- push the tree, build clean, run ctest. |
+| **`macos-leg`** | `macos-leg.ps1`, `macos-leg.sh`, `test-macos-leg.py` | run a DSS gate leg on the operator's macOS host -- push the tree, build clean, run ctest. |
+| **`owning-tree`** | `owning-tree.py` | name the DSS tree a script's own file lives in -- walked up from that file, never taken from the caller's working directory or git environment. |
 | **`pragma-profile-census`** | `pragma-profile-census.ps1`, `pragma-profile-census.py`, `pragma-profile-census.sh` | census `#pragma` usage across the corpus and hold the profile to its expected shape. |
 | **`profile-compile`** | `profile-compile-dispatch.sh`, `profile-compile-support.py`, `profile-compile.sh` | compile one fixed subject with a RELEASE dsscp on this host and report where the time went, so the HOST is the only variable across legs. |
 | **`refresh_landing_log`** | `refresh_landing_log.py`, `test_refresh_landing_log.py` | regenerate the PR landing-log hash anchors in the plans from git log. |
-| **`remote-leg`** | `remote-leg.sh` | run a DSS gate leg on a physical remote host -- push the working tree over a carriage, build clean, and run ctest through run-gate. |
+| **`remote-leg`** | `remote-leg.sh`, `test-remote-leg.py` | run a DSS gate leg on a physical remote host -- push the working tree over a carriage, build clean, and run ctest through run-gate. |
 | **`repo-secrets`** | `repo-secrets.sh` | print the `.secrets` directory a checkout must read, following a lane worktree back to the main checkout that holds it. |
 | **`repo-tree`** | `repo-tree.ps1` | resolve the repository tree a PowerShell script is standing in, and keep that script's git enumeration and its file reads on the SAME root. |
 | **`run-gate`** | `run-gate.ps1`, `run-gate.sh`, `test-run-gate.sh` | run a gate command and REFUSE to report success without evidence that it ran. |

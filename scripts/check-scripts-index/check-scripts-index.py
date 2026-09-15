@@ -67,10 +67,10 @@ Usage:
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import io
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 
@@ -131,27 +131,49 @@ class Entry:
         self.purpose = purpose
 
 
-def repo_root():
-    """The checkout root, asked of git rather than derived from `__file__`.
+_OWNING_TREE = None
 
-    ★ Deliberate: this script's own depth under the repo is exactly the fact that
-    changed on 2026-08-19 when `tools/` was merged into `scripts/`, and every
-    guard that derived its root by counting `..` had to be edited by hand. A
-    guard that asks git cannot be broken by moving it.
+
+def _owning_tree():
+    """`scripts/owning-tree/owning-tree.py` -- the one owner of "which tree is this file in?".
+
+    Loaded by path from this file's sibling directory (a hyphen is not a module name). It
+    FAILS LOUD when absent rather than falling back to a local walk: a second copy of the
+    answer is the drift that owner exists to end.
     """
+    global _OWNING_TREE
+    if _OWNING_TREE is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise Collapse("cannot find %s -- this guard's root is resolved there and "
+                           "nowhere else" % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OWNING_TREE = mod
+    return _OWNING_TREE
+
+
+def repo_root():
+    """The tree THIS FILE lives in -- never the tree the caller's shell is standing in.
+
+    ★ Still NOT derived by counting `..`: this script's own depth under the repo is the
+    fact that changed on 2026-08-19 when `tools/` was merged into `scripts/`, and every
+    guard that counted had to be edited by hand. The walk in
+    `scripts/owning-tree/owning-tree.py` does not count either.
+    ⚠ What it replaces -- a bare `git rev-parse --show-toplevel` -- answered from the
+    CALLER's cwd. ✔MEASURED 2026-09-15 (P66): run by path with its cwd inside a different
+    repository it indexed THAT repository and collapsed on a directory only that repository
+    lacks; from a directory inside no repository it would not run at all. ctest pins
+    `WORKING_DIRECTORY`, so no gate saw either. (Its old "pass the repo root as an
+    argument" advice was never true: `main` refuses every positional argument.)
+    """
+    ot = _owning_tree()
     try:
-        p = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                           capture_output=True, text=True, check=False)
-    except OSError as exc:
-        # Found by audit: an absent git raised through main() as a traceback and
-        # exit 1 -- the code reserved for "the index disagrees with the tree",
-        # so the ctest log told a maintainer their documents were stale when the
-        # truth was that the environment had no git.
-        raise Collapse("cannot run git (%s). Pass the repo root as an argument "
-                       "instead: check-scripts-index.py <root>" % exc)
-    if p.returncode != 0:
-        raise Collapse("not inside a git checkout: " + p.stderr.strip())
-    return p.stdout.strip()
+        return ot.resolve(__file__)
+    except ot.Refusal as exc:
+        raise Collapse(str(exc))
 
 
 def primary_script(scripts_dir, name):
@@ -482,7 +504,7 @@ def _write(p, text):
 # defeated its own purpose: deleting a document from DOC_RELS then lowered BOTH
 # sides of the comparison and the sabotage passed. An expectation that follows
 # the change it is meant to catch is not an expectation.
-EXPECTED_ARMS = 28
+EXPECTED_ARMS = 31
 
 
 def selftest(root):
@@ -628,6 +650,17 @@ def selftest(root):
         for name in os.listdir(held):
             shutil.move(os.path.join(held, name), os.path.join(keep, name))
         shutil.rmtree(held, ignore_errors=True)
+
+        # ── the root is the tree THIS FILE lives in, whatever the caller's cwd ──
+        # Arms, oracle and synthesized negatives are owned by
+        # scripts/owning-tree/owning-tree.py.
+        for _ok, _why, _detail in _owning_tree().root_arms(repo_root, (Collapse,), False,
+                                                           __file__):
+            ran.append("R " + _why)
+            print("scripts-index: self-test arm %-26s %s%s"
+                  % ("R " + _why, "as expected" if _ok else "FAILED",
+                     "" if _ok else " (" + _detail + ")"))
+            ok &= _ok
 
         ok &= _arm("19 GREEN-AFTER-RESTORE", tmp, EXIT_OK)
     finally:

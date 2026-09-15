@@ -108,11 +108,16 @@
 #include "run_binary.hpp"
 #include "stage_tree.hpp"  // recursive corpus staging — ONE copy, shared with
                            // tests/examples/examples_runner.cpp
+#include "test_wait_budget.hpp"  // kWaitBudget — the concurrent scratch-removal
+                                 // pin's bound (do not rely on the transitive
+                                 // include through run_binary.hpp)
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>  // std::sort (do not rely on a transitive include)
 #include <chrono>
+#include <condition_variable>  // the concurrent scratch-removal pin releases its
+                               // deleters together and waits for them, bounded
 #include <cstdint>
 #include <cctype>   // mentionsIdentifier: identifier-boundary match
 #include <cstdlib>
@@ -123,6 +128,7 @@
 #include <iterator>  // std::istreambuf_iterator (do not rely on a transitive include)
 #include <map>       // std::map (dependency artifacts, keyed — do not rely on a
                      // transitive include)
+#include <mutex>     // (the concurrent scratch-removal pin)
 #include <optional>  // std::optional (per-target exitCode override)
 #include <set>       // std::set (dependency-identity distinctness pin — do not
                      // rely on a transitive include)
@@ -132,6 +138,7 @@
 #include <stdexcept>     // std::runtime_error (scratch-root setup fails loud)
 #include <string>
 #include <system_error>  // std::error_code (do not rely on a transitive include)
+#include <thread>        // (the concurrent scratch-removal pin)
 #include <utility>       // std::pair (kept-root prune list)
 #include <vector>
 
@@ -5271,6 +5278,261 @@ constexpr auto kRunningStaleAfter = std::chrono::hours{6};
         "accumulating — delete the directory and re-run.");
 }
 
+// ── Removing a scratch root: ONE deleter per root, by construction ──────────
+//
+// D-TEST-INTEGRATED-RUNNER-HANGS-BEFORE-CREATING-ITS-EX-DIRECTORY
+//
+// Two places delete a scratch root — the startup prune below and a green run
+// releasing its own root at exit — and left uncoordinated BOTH meet other
+// processes deleting the SAME root: every run started in the same instant prunes
+// the same oldest kept roots, and a released root is a prune candidate the moment
+// its `.running` is gone.
+//
+// ★★★ WHAT THAT COST. Both used to call `std::filesystem::remove_all`, and on the
+// MinGW gate it NEVER RETURNS under that race. ✔MEASURED 2026-09-15, MinGW-w64
+// gcc 13.2 (libstdc++, UCRT): its erase loop runs `while (!ec)` and removes each
+// entry with `fs::remove`, which on Windows answers an entry that has ALREADY
+// VANISHED with `false` and a CLEARED error — so the loop retries that entry
+// forever, one core flat out in `ZwQueryInformationByName` / `ZwCreateFile`. Four
+// threads released onto one tree left three spinning; four processes left one
+// spinning in 35 of 40 rounds; and with 30 kept roots planted before each run,
+// 20 of 20 scoped ctest runs of this runner hung two entries, every one stuck in
+// the prune with only `run-info.txt` and `.running` in its root — the picture two
+// hung entries of a real gate showed. MSVC's STL returns an error instead (✔300
+// rounds, no hang) and libc++ reports ENOENT (✔measured on macOS when the prune
+// was written), which is how a race measured safe on one host shipped a spin on
+// another. 📄 [fs.race.behavior] makes a file-system race undefined behaviour for
+// `<filesystem>`, so no standard library owes `remove_all` a better answer.
+//
+// ★★ SO THE RACE IS REMOVED, NOT SURVIVED. Before it deletes anything, a deleter
+// creates `<base>/reclaim/<root name>` with the SINGULAR `create_directory` — the
+// primitive `claimRunRoot` already stands on — and only the creator deletes.
+// ✔MEASURED exclusive on this host with BOTH standard libraries: 8 threads racing
+// one path, 2000 rounds, exactly one `true` every round. ⚠ NOT `rename`: four
+// threads moving one directory into four distinct targets ✔all reported success,
+// 1199 of 1200 times, on Windows — the move follows the open handle.
+// ⚠ SURVIVING the race was built first and MEASURED insufficient: a removal that
+// ends however many deleters share the tree cured the hang, but the real runner
+// still printed 6 `[WARN] cannot prune kept root … Access denied` lines over 8
+// heavy seeded runs, because an entry another deleter holds DELETE-PENDING refuses
+// access for an instant. That is the noise the rule at the prune's `[WARN]` exists
+// to keep out, and it is a collision tolerated rather than removed.
+//
+// The walk is still built from SINGLE-OBJECT operations and never `remove_all`,
+// because a claim binds only THIS runner: a pre-fix build of it in another tree, a
+// human, or an antivirus quarantine can still delete under the claim holder, and
+// the walk must END whatever they do.
+// ⚠ Do NOT "simplify" either half away: `runConcurrentScratchRemovalPin` reds both.
+struct ScratchRemoval {
+    std::size_t failures = 0;
+    std::string first;  // the first failure: the path and its cause
+};
+
+// `true` iff nothing is at `p` now. A stat that ERRS is not "gone": an entry
+// that cannot even be looked at may well still be there.
+[[nodiscard]] bool scratchEntryIsGone(fs::path const& p) {
+    std::error_code ec;
+    return fs::symlink_status(p, ec).type() == fs::file_type::not_found;
+}
+
+void noteScratchFailure(ScratchRemoval& out, fs::path const& p,
+                        std::error_code const& ec) {
+    if (scratchEntryIsGone(p)) return;  // a sibling got there first
+    if (out.failures++ == 0) {
+        out.first = "'" + p.generic_string() + "': " + ec.message();
+    }
+}
+
+// Remove `target` — one file, or a whole tree — with single-object operations
+// only: a SNAPSHOT of each directory, one `symlink_status` and at most one
+// `remove` per entry, the directory itself last. Nothing is ever retried, so it
+// ENDS whatever another deleter does, and an attempt that failed on an entry
+// which is now GONE was beaten to the outcome wanted, so only an entry STILL THERE
+// counts as a failure. ✔MEASURED, four of these released onto one tree for 400
+// rounds with each standard library: none stuck, no tree left behind.
+[[nodiscard]] ScratchRemoval removeScratchTree(fs::path const& target) {
+    ScratchRemoval out;
+    std::error_code tec;
+    auto const kind = fs::symlink_status(target, tec).type();
+    if (kind == fs::file_type::not_found) return out;
+    if (tec) {
+        noteScratchFailure(out, target, tec);
+        return out;
+    }
+    if (kind != fs::file_type::directory) {
+        std::error_code rec;
+        fs::remove(target, rec);
+        if (rec) noteScratchFailure(out, target, rec);
+        return out;
+    }
+    // An explicit work stack rather than recursion, so a deep tree costs heap
+    // rather than stack. A directory is LISTED once, and removed once every
+    // entry of that listing has been handled.
+    struct Pending {
+        fs::path dir;
+        bool     listed = false;
+    };
+    std::vector<Pending> work;
+    work.push_back({target, false});
+    while (!work.empty()) {
+        if (work.back().listed) {
+            fs::path const dir = std::move(work.back().dir);
+            work.pop_back();
+            std::error_code ec;
+            fs::remove(dir, ec);
+            if (ec) noteScratchFailure(out, dir, ec);
+            continue;
+        }
+        work.back().listed = true;
+        fs::path const dir = work.back().dir;  // a COPY: `work` grows below
+        // The snapshot. Entries are acted on only once the listing is complete,
+        // so nothing is ever deleted under a live iterator.
+        std::vector<fs::path> entries;
+        std::error_code ec;
+        fs::directory_iterator it(dir, ec);
+        for (fs::directory_iterator const end; !ec && it != end;
+             it.increment(ec)) {
+            entries.push_back(it->path());
+        }
+        if (ec) noteScratchFailure(out, dir, ec);
+        for (auto& entry : entries) {
+            std::error_code sec;
+            auto const type = fs::symlink_status(entry, sec).type();
+            if (type == fs::file_type::not_found) continue;  // already gone
+            if (sec) {
+                noteScratchFailure(out, entry, sec);
+                continue;
+            }
+            // `symlink_status`, so a link is removed AS a link and never
+            // followed out of the scratch tree.
+            if (type == fs::file_type::directory) {
+                work.push_back({std::move(entry), false});
+                continue;
+            }
+            std::error_code rec;
+            fs::remove(entry, rec);
+            if (rec) noteScratchFailure(out, entry, rec);
+        }
+    }
+    return out;
+}
+
+// Where a deleter CLAIMS a root before removing any of it (see the section note).
+// Beside the roots, in the base; the prune never mistakes it for a root because
+// it holds no `run-info.txt`, and a claim is only ever an EMPTY directory.
+constexpr char const* kReclaimDirName = "reclaim";
+
+// The claim on `root`, or nothing when another deleter holds it — or when the
+// claim cannot be made at all, in which case nobody here may delete, the safe
+// direction for a best-effort tidy.
+[[nodiscard]] std::optional<fs::path> claimRootForRemoval(fs::path const& root) {
+    std::error_code ec;
+    auto const claims = root.parent_path() / kReclaimDirName;
+    // PLURAL on purpose: for the shared parent, already existing is success.
+    fs::create_directories(claims, ec);
+    if (ec) return std::nullopt;
+    auto claim = claims / root.filename();
+    // SINGULAR, and the whole guarantee: `true` for exactly one caller.
+    if (!fs::create_directory(claim, ec) || ec) return std::nullopt;
+    return claim;
+}
+
+void releaseRemovalClaim(fs::path const& claim) {
+    std::error_code ec;
+    fs::remove(claim, ec);  // an empty directory: one rmdir, nothing to spin on
+}
+
+// Remove a root THIS deleter has claimed: everything else first, `run-info.txt`
+// LAST, then the root. `run-info.txt` is how a prune recognises a root, so a
+// deleter killed half way leaves a root the next prune can still find and finish
+// once the dead claim is swept (`sweepStaleRemovalClaims`); the other order would
+// leak a half-deleted tree that nothing recognises, forever. For the same reason
+// `run-info.txt` STAYS if anything else could not be removed.
+[[nodiscard]] ScratchRemoval removeClaimedRoot(fs::path const& root) {
+    ScratchRemoval out;
+    std::vector<fs::path> entries;
+    std::error_code ec;
+    fs::directory_iterator it(root, ec);
+    for (fs::directory_iterator const end; !ec && it != end; it.increment(ec)) {
+        if (it->path().filename() != kRunInfoName) entries.push_back(it->path());
+    }
+    if (ec) noteScratchFailure(out, root, ec);
+    for (auto const& entry : entries) {
+        auto const part = removeScratchTree(entry);
+        if (part.failures != 0 && out.failures == 0) out.first = part.first;
+        out.failures += part.failures;
+    }
+    if (out.failures != 0) return out;
+    return removeScratchTree(root);  // `run-info.txt`, then the root itself
+}
+
+// A claim is held for milliseconds, so one older than `kRunningStaleAfter` was left
+// by a deleter that died holding it; clearing it lets the next prune finish the root
+// that deleter left. Cheap to race: a claim is an EMPTY directory, so each is one
+// rmdir, and a sibling sweeping the same claim costs an ignored error.
+void sweepStaleRemovalClaims(fs::path const& base, fs::file_time_type now) {
+    std::vector<fs::path> stale;
+    std::error_code ec;
+    fs::directory_iterator it(base / kReclaimDirName, ec);
+    for (fs::directory_iterator const end; !ec && it != end; it.increment(ec)) {
+        std::error_code tec;
+        auto const stamp = fs::last_write_time(it->path(), tec);
+        if (!tec && now - stamp >= kRunningStaleAfter) stale.push_back(it->path());
+    }
+    for (auto const& claim : stale) releaseRemovalClaim(claim);
+}
+
+// What one attempt to reclaim a selected kept root came to.
+enum class Reclaim : std::uint8_t {
+    Removed,  // claimed, still the root the scan selected, and removed
+    NotOurs,  // another deleter holds it, or it is no longer the selected root
+    Warned,   // claimed and attempted, but it is still there — a [WARN] was printed
+};
+
+// One kept root the scan selected, removed only under its claim.
+[[nodiscard]] Reclaim reclaimKeptRoot(fs::path const& root,
+                                      fs::file_time_type scannedMtime,
+                                      fs::file_time_type now) {
+    auto const claim = claimRootForRemoval(root);
+    if (!claim) return Reclaim::NotOurs;  // its deleter's root, not ours
+    // RE-CHECKED UNDER THE CLAIM, because the scan is a snapshot. Since it, the
+    // root may have been removed and a NEW run given the same name (pids recycle)
+    // — a LIVE root, and deleting it is the original defect. A young `.running`
+    // says so; so does an mtime that is not the one the scan saw, which also
+    // covers the instant between a new run's `run-info.txt` and its `.running`.
+    // A root with no `run-info.txt` any more is somebody else's finished work.
+    bool const stillSelected = [&] {
+        std::error_code sec;
+        auto const running = root / kRunningName;
+        bool const sentinel = fs::exists(running, sec);
+        if (sec) return false;  // could not even ask: treat as LIVE
+        if (sentinel) {
+            auto const stamp = fs::last_write_time(running, sec);
+            if (sec || now - stamp < kRunningStaleAfter) return false;
+        }
+        if (!fs::exists(root / kRunInfoName, sec) || sec) return false;
+        auto const mtime = fs::last_write_time(root, sec);
+        return !sec && mtime == scannedMtime;
+    }();
+    Reclaim outcome = Reclaim::NotOurs;
+    if (stillSelected) {
+        auto const removal = removeClaimedRoot(root);
+        outcome = Reclaim::Removed;
+        // Warn only if the root is still THERE, i.e. only when a human actually
+        // has something to do. ✔MEASURED (six concurrent runs over a 6000-root
+        // base, macOS): warning on every error a race produced emitted ~2500
+        // [WARN] lines PER RUN — noise from the very function whose job is to stop
+        // concurrency producing noise.
+        if (removal.failures != 0 && !scratchEntryIsGone(root)) {
+            std::cerr << "[WARN] cannot prune kept root '"
+                      << root.generic_string() << "': " << removal.first << "\n";
+            outcome = Reclaim::Warned;
+        }
+    }
+    releaseRemovalClaim(*claim);
+    return outcome;
+}
+
 // Bound the population of KEPT roots (a red run keeps its own — see `main`).
 // Called once at startup AFTER this run claimed `mine`, so `mine` is never a
 // candidate.
@@ -5300,8 +5562,12 @@ constexpr auto kRunningStaleAfter = std::chrono::hours{6};
 // networked TMPDIR — all measured to throw from inside this exact loop. The
 // `error_code` forms are what make the loop survivable on every host and every
 // error class rather than on the one that happens to be benign here.
-void pruneKeptRoots(fs::path const& base, fs::path const& mine) {
+//
+// Returns how many selected roots it WARNED about (removal attempted, root still
+// there); only the concurrent-removal pin reads it.
+std::size_t pruneKeptRoots(fs::path const& base, fs::path const& mine) {
     auto const now = fs::file_time_type::clock::now();
+    sweepStaleRemovalClaims(base, now);
 
     std::error_code ec;
     fs::directory_iterator it(base, ec);
@@ -5309,7 +5575,7 @@ void pruneKeptRoots(fs::path const& base, fs::path const& mine) {
         std::cerr << "[WARN] cannot scan scratch base '"
                   << base.generic_string() << "': " << ec.message()
                   << " — kept roots may accumulate\n";
-        return;
+        return 0;
     }
 
     std::vector<std::pair<fs::file_time_type, fs::path>> prunable;
@@ -5352,28 +5618,63 @@ void pruneKeptRoots(fs::path const& base, fs::path const& mine) {
                   << "' stopped early: " << ec.message()
                   << " — kept roots may accumulate\n";
     }
-    if (prunable.size() <= kKeptRootLimit) return;
+    if (prunable.size() <= kKeptRootLimit) return 0;
 
     std::sort(prunable.begin(), prunable.end(),
               [](auto const& a, auto const& b) { return a.first > b.first; });
+    std::size_t warned = 0;
     for (std::size_t i = kKeptRootLimit; i < prunable.size(); ++i) {
-        auto const& root = prunable[i].second;
-        std::error_code rec;
-        fs::remove_all(root, rec);
-        if (!rec) continue;
-        // A sibling prune got there first: the root is GONE, which is the
-        // outcome this loop wanted, so there is nothing to report. MEASURED
-        // (six concurrent runs over a 6000-root base): libc++ reports ENOENT
-        // from the middle of `remove_all`'s own recursion, and warning on it
-        // emitted ~2500 [WARN] lines PER RUN — a spurious noise burst thrown by
-        // the very function whose job is to stop concurrency producing spurious
-        // noise. Warn only if the root is still THERE, i.e. only when a human
-        // actually has something to do.
-        std::error_code xec;
-        if (!fs::exists(root, xec) && !xec) continue;
-        std::cerr << "[WARN] cannot prune kept root '"
-                  << root.generic_string() << "': " << rec.message() << "\n";
+        // Every sibling that started in the same instant is walking this SAME
+        // list — which is why a root is only ever removed under its claim.
+        if (reclaimKeptRoot(prunable[i].second, prunable[i].first, now)
+            == Reclaim::Warned) {
+            ++warned;
+        }
     }
+    return warned;
+}
+
+// What releasing this run's own root came to.
+struct RootRelease {
+    bool        removedHere = false;  // THIS call removed the root
+    std::string warning;              // to print; empty when there is nothing to say
+};
+
+// The end of a run, and the only place a run deletes its OWN root. A RED run KEEPS
+// it — every `[FAIL]` line cites a `cli.log` inside it, and the old code removed the
+// tree unconditionally, so those paths named files that no longer existed by the
+// time anyone read them — and gives up only `.running`, which makes it an ordinary
+// kept root that later prunes retain or reclaim. A GREEN run removes it, under the
+// same claim a prune takes, because from the moment `.running` is gone the root is
+// a candidate for every sibling's prune.
+[[nodiscard]] RootRelease releaseRunRoot(fs::path const& root, bool keep) {
+    std::error_code ec;
+    if (keep) {
+        fs::remove(root / kRunningName, ec);  // this run is over
+        return {};
+    }
+    auto const claim = claimRootForRemoval(root);
+    if (!claim) {
+        // A deleter is deciding about a root of this NAME right now — a prune that
+        // selected the older root a recycled pid once gave this name, or a claim a
+        // killed deleter left. Deleting under it is the defect this section closes,
+        // so the root is handed to a later prune instead: without `.running` it is
+        // an ordinary kept root, and the retention bound covers it.
+        fs::remove(root / kRunningName, ec);
+        return {};
+    }
+    RootRelease out;
+    // Somebody may have finished it before this claim was ours.
+    if (!scratchEntryIsGone(root)) {
+        auto const removal = removeClaimedRoot(root);
+        out.removedHere = true;
+        if (removal.failures != 0 && !scratchEntryIsGone(root)) {
+            out.warning = "could not remove scratch root '"
+                        + root.generic_string() + "': " + removal.first;
+        }
+    }
+    releaseRemovalClaim(*claim);
+    return out;
 }
 
 // Nothing writes to the pre-fix shared tree any more, so it is inert — but it
@@ -5440,6 +5741,303 @@ void reportLegacyDebris(fs::path const& base) {
         << "\nonce. Delete THIS file to be told about it again.\n";
 }
 
+// Run `calls` invocations of `body(i)` released together, and return only once
+// every one has returned. ★ A HANG MUST FAIL, NOT HOLD: a call that is spinning
+// can never be joined, so past `bound` this prints the [FAIL] naming `what` and
+// ENDS THE PROCESS — the entry goes red by name in seconds, instead of waiting
+// out its ctest TIMEOUT with nothing said about why.
+template <class Body>
+void runTogetherOrFail(int calls, std::chrono::seconds bound,
+                       std::string const& what, Body const& body) {
+    std::mutex               gate;
+    std::condition_variable  changed;
+    bool                     released = false;
+    int                      returned = 0;
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(calls));
+    for (int i = 0; i < calls; ++i) {
+        threads.emplace_back([&, i] {
+            {
+                std::unique_lock<std::mutex> lock(gate);
+                changed.wait(lock, [&] { return released; });
+            }
+            body(i);
+            {
+                std::lock_guard<std::mutex> lock(gate);
+                ++returned;
+            }
+            changed.notify_all();
+        });
+    }
+    {
+        std::lock_guard<std::mutex> lock(gate);
+        released = true;
+    }
+    changed.notify_all();
+    bool allReturned = false;
+    {
+        std::unique_lock<std::mutex> lock(gate);
+        allReturned = changed.wait_for(lock, bound,
+                                       [&] { return returned == calls; });
+    }
+    if (!allReturned) {
+        check(what + ": every concurrent call returned within "
+                  + std::to_string(bound.count()) + " s",
+              false,
+              "a call is STILL RUNNING — a scratch deleter that never returns"
+              " is D-TEST-INTEGRATED-RUNNER-HANGS-BEFORE-CREATING-ITS-EX-DIRECTORY"
+              " — and a spinning thread cannot be joined, so the run ends here");
+        std::cout.flush();
+        std::cerr.flush();
+        std::_Exit(1);
+    }
+    for (auto& t : threads) t.join();
+}
+
+// ── Harness self-test: ONE deleter per scratch root, and removal that ENDS ───
+//
+// D-TEST-INTEGRATED-RUNNER-HANGS-BEFORE-CREATING-ITS-EX-DIRECTORY. UNNUMBERED for
+// the reason its neighbours give: the `[Test N]` labels are cited from the
+// registry. It drives the REAL `pruneKeptRoots`, `reclaimKeptRoot` and
+// `releaseRunRoot` — not copies — from threads RELEASED TOGETHER onto planted
+// roots, which is the race a busy gate produces between processes: threads,
+// because the claim is atomic across threads and processes alike, and threads
+// released together overlap on demand (✔four of them stuck `remove_all` on the
+// FIRST round of a 200-round probe). Four properties, each red when its half of
+// the fix is taken away:
+//   (a) concurrent prunes of one base remove each selected root ONCE — no prune
+//       warns, no claim is left behind, at most the retention bound survives,
+//       and every survivor is whole;
+//   (b) a green run releasing its root while prunes that selected that same
+//       root race it — exactly ONE of them removes it, and nobody warns;
+//   (c) a claimed removal while deleters that honour NO claim (a pre-fix build,
+//       a human) remove the same root — it ENDS, and the root is gone;
+//   (d) a root recreated under a name a scan selected (pids recycle) — the stale
+//       selection leaves the live root whole, before and after its `.running`
+//       exists.
+// ★ A HANG MUST FAIL THIS PIN, NOT HOLD IT: see `runTogetherOrFail`.
+void runConcurrentScratchRemovalPin(fs::path const& scratch) {
+    std::cout << "[Harness self-test] a scratch root has ONE deleter and its"
+                 " removal ENDS (concurrent prunes; a release racing prunes;"
+                 " deleters that honour no claim; a recycled root name)\n";
+    constexpr int         kRounds       = 6;
+    constexpr int         kDeleters     = 4;
+    constexpr int         kFilesPerArm  = 24;
+    constexpr std::size_t kRootsPerBase = kKeptRootLimit + 5;
+    // The suite's MEASURED budget for waiting on something the code under test
+    // should already have done (`test_wait_budget.hpp`): a healthy removal of
+    // these trees returns in milliseconds, so only a call that never returns can
+    // reach it — never a slow host.
+    constexpr auto const  kBound        = ::dss::test_support::kWaitBudget;
+    // Two arm directories of files, plus `run-info.txt`.
+    constexpr std::size_t kPlantedFiles =
+        2 * static_cast<std::size_t>(kFilesPerArm) + 1;
+
+    // A kept root's own shape: the marker, and one example's two arm
+    // directories. Returns what could not be planted; empty on success.
+    auto const plant = [&](fs::path const& root) -> std::string {
+        std::error_code ec;
+        for (char const* arm : {"arm", "arm.arm-release"}) {
+            auto const dir = root / "ex" / "example" / arm;
+            fs::create_directories(dir, ec);
+            if (ec) {
+                return "cannot create '" + dir.generic_string() + "': "
+                     + ec.message();
+            }
+            for (int i = 0; i < kFilesPerArm; ++i) {
+                std::ofstream((dir / ("file" + std::to_string(i))).string())
+                    << "planted\n";
+            }
+        }
+        std::ofstream((root / kRunInfoName).string())
+            << "planted by the concurrent scratch-removal pin\n";
+        if (!fs::exists(root / kRunInfoName, ec)) {
+            return "cannot plant '" + (root / kRunInfoName).generic_string()
+                 + "'";
+        }
+        return {};
+    };
+
+    auto const filesUnder = [](fs::path const& root) {
+        std::size_t n = 0;
+        std::error_code ec;
+        for (fs::recursive_directory_iterator it(root, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            std::error_code fec;
+            if (it->is_regular_file(fec)) ++n;
+        }
+        return n;
+    };
+    auto const claimsLeftIn = [](fs::path const& base) {
+        std::size_t n = 0;
+        std::error_code ec;
+        for (fs::directory_iterator it(base / kReclaimDirName, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            ++n;
+        }
+        return n;
+    };
+
+    std::string planted;  // the first root that could not be planted
+    std::string a, b, c, d;
+
+    // (a) concurrent prunes of ONE base.
+    for (int round = 0; round < kRounds && planted.empty() && a.empty();
+         ++round) {
+        auto const base = scratch / ("prune-" + std::to_string(round));
+        for (std::size_t k = 0; k < kRootsPerBase && planted.empty(); ++k) {
+            planted = plant(base / ("kept-" + std::to_string(k)));
+        }
+        if (!planted.empty()) break;
+        std::vector<std::size_t> warned(static_cast<std::size_t>(kDeleters), 0u);
+        runTogetherOrFail(kDeleters, kBound,
+                          "concurrent startup prunes of ONE scratch base",
+                          [&](int i) {
+                              warned[static_cast<std::size_t>(i)] =
+                                  pruneKeptRoots(base, base / "not-a-root");
+                          });
+        std::size_t warnings = 0;
+        for (auto const w : warned) warnings += w;
+        std::size_t left   = 0;
+        std::size_t broken = 0;
+        std::error_code ec;
+        for (fs::directory_iterator it(base, ec), end; !ec && it != end;
+             it.increment(ec)) {
+            std::error_code iec;
+            if (!fs::exists(it->path() / kRunInfoName, iec)) continue;
+            ++left;
+            if (filesUnder(it->path()) != kPlantedFiles) ++broken;
+        }
+        std::size_t const claims = claimsLeftIn(base);
+        if (warnings != 0 || claims != 0 || left > kKeptRootLimit
+            || broken != 0) {
+            a = "round " + std::to_string(round) + ": "
+              + std::to_string(warnings) + " warning(s), "
+              + std::to_string(claims) + " claim(s) left, "
+              + std::to_string(left) + " root(s) left, "
+              + std::to_string(broken) + " of them not whole";
+        }
+    }
+
+    // (b) a green release racing prunes that selected the SAME root. Planted
+    // without `.running`, so every prune passes its re-check and only the CLAIM
+    // stands between them and the release.
+    for (int round = 0; round < kRounds && planted.empty() && b.empty();
+         ++round) {
+        auto const root = scratch / ("release-" + std::to_string(round))
+                        / ("root-" + std::to_string(round));
+        planted = plant(root);
+        if (!planted.empty()) break;
+        std::error_code mec;
+        auto const selectedMtime = fs::last_write_time(root, mec);
+        auto const now = fs::file_time_type::clock::now();
+        std::vector<int> removed(static_cast<std::size_t>(kDeleters), 0);
+        std::vector<int> warned(static_cast<std::size_t>(kDeleters), 0);
+        runTogetherOrFail(
+            kDeleters, kBound,
+            "a green release racing prunes that selected the same root",
+            [&](int i) {
+                auto const slot = static_cast<std::size_t>(i);
+                if (i == 0) {
+                    auto const released = releaseRunRoot(root, /*keep=*/false);
+                    removed[slot] = released.removedHere ? 1 : 0;
+                    warned[slot]  = released.warning.empty() ? 0 : 1;
+                    return;
+                }
+                auto const outcome = reclaimKeptRoot(root, selectedMtime, now);
+                removed[slot] = outcome == Reclaim::NotOurs ? 0 : 1;
+                warned[slot]  = outcome == Reclaim::Warned ? 1 : 0;
+            });
+        int removers = 0;
+        int warners  = 0;
+        for (auto const v : removed) removers += v;
+        for (auto const v : warned) warners += v;
+        bool const        gone   = scratchEntryIsGone(root);
+        std::size_t const claims = claimsLeftIn(root.parent_path());
+        if (mec || removers != 1 || warners != 0 || !gone || claims != 0) {
+            b = "round " + std::to_string(round) + ": "
+              + std::to_string(removers) + " remover(s), "
+              + std::to_string(warners) + " warning(s), root "
+              + (gone ? "gone" : "STILL THERE") + ", "
+              + std::to_string(claims) + " claim(s) left"
+              + (mec ? ", mtime unreadable: " + mec.message() : std::string{});
+        }
+    }
+
+    // (c) a claimed removal while deleters that honour NO claim work on it too.
+    for (int round = 0; round < kRounds && planted.empty() && c.empty();
+         ++round) {
+        auto const root = scratch / ("unclaimed-" + std::to_string(round))
+                        / ("root-" + std::to_string(round));
+        planted = plant(root);
+        if (!planted.empty()) break;
+        runTogetherOrFail(
+            kDeleters, kBound,
+            "a claimed removal racing deleters that honour no claim",
+            [&](int i) {
+                if (i == 0) {
+                    static_cast<void>(releaseRunRoot(root, /*keep=*/false));
+                } else {
+                    static_cast<void>(removeScratchTree(root));
+                }
+            });
+        if (!scratchEntryIsGone(root)) {
+            c = "round " + std::to_string(round) + ": "
+              + root.generic_string() + " is still there";
+        }
+    }
+
+    // (d) a recycled name: a NEW live run holds the name a stale scan selected.
+    // First in the instant before its `.running` exists, where ONLY the mtime can
+    // tell; then with `.running` and the very mtime a scan would now read, where
+    // ONLY the sentinel can tell.
+    if (planted.empty()) {
+        auto const root = scratch / "recycled" / "4242-0";
+        planted = plant(root);
+        if (planted.empty()) {
+            auto const now = fs::file_time_type::clock::now();
+            std::error_code mec;
+            // Any mtime but the root's own: a scan taken before this root existed.
+            auto const olderScan = fs::file_time_type{};
+            auto const early      = reclaimKeptRoot(root, olderScan, now);
+            auto const earlyFiles = filesUnder(root);
+            std::ofstream((root / kRunningName).string());
+            auto const currentScan = fs::last_write_time(root, mec);
+            auto const live        = reclaimKeptRoot(root, currentScan, now);
+            auto const liveFiles   = filesUnder(root);
+            if (mec || early != Reclaim::NotOurs || earlyFiles != kPlantedFiles
+                || live != Reclaim::NotOurs
+                || liveFiles != kPlantedFiles + 1u) {
+                d = std::string{"before `.running`: "}
+                  + (early == Reclaim::NotOurs ? "left" : "REMOVED") + " ("
+                  + std::to_string(earlyFiles) + " of "
+                  + std::to_string(kPlantedFiles) + " files); with it: "
+                  + (live == Reclaim::NotOurs ? "left" : "REMOVED") + " ("
+                  + std::to_string(liveFiles) + " of "
+                  + std::to_string(kPlantedFiles + 1u) + " files)"
+                  + (mec ? "; mtime unreadable: " + mec.message()
+                         : std::string{});
+            }
+        }
+    }
+
+    check("the pin planted its scratch roots", planted.empty(), planted);
+    check("(a) concurrent prunes of one base removed each selected root ONCE:"
+          " no warning, no claim left, at most "
+              + std::to_string(kKeptRootLimit) + " roots left, every one whole",
+          a.empty(), a);
+    check("(b) a green release racing prunes that selected the same root:"
+          " exactly ONE removed it, and nobody warned",
+          b.empty(), b);
+    check("(c) a claimed removal racing deleters that honour no claim ENDED,"
+          " and the root is gone",
+          c.empty(), c);
+    check("(d) a root recreated under a selected name is left WHOLE, before and"
+          " after its `.running` exists",
+          d.empty(), d);
+    std::cout << "\n";
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -5463,6 +6061,14 @@ int main(int argc, char* argv[]) {
                   << "  (omitted)            everything, exactly as before\n";
         return 1;
     }
+
+    // D-TEST-INTEGRATED-RUNNER-HANGS-BEFORE-CREATING-ITS-EX-DIRECTORY: every line
+    // reaches ctest the moment it is written. Under ctest stdout is a PIPE and so
+    // fully buffered, and a run that hangs until its TIMEOUT ends it used to leave
+    // NO output at all — ✔the two hung entries that opened that row showed
+    // nothing, so nobody could say how far either got. Unbuffered, the last line
+    // printed is where the run stopped.
+    std::cout << std::unitbuf;
 
     // ── `--only`, parsed BEFORE anything expensive ──────────────────────────
     // D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-ONE-THREAD. An UNKNOWN
@@ -5534,6 +6140,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // The chosen root is LOGGED once, here, so a failing run stays
+    // inspectable even though the name is no longer predictable. BEFORE the
+    // housekeeping below, so a run that stalls there has already said which
+    // root it claimed.
+    std::cout << "=== DSS Code Prime — Integration Tests ===\n"
+              << "Compiler:      " << compiler << "\n"
+              << "Examples root: " << examplesRoot.generic_string() << "\n"
+              << "Output:        " << outputBase.string()
+              << "  (per-run, unique to THIS process)\n"
+              << "Host OS:       " << currentHostOs() << "\n\n";
+
     // Housekeeping, deliberately OUTSIDE the fatal `try` above: CLAIMING a root
     // is a precondition of running, tidying up after old ones is not, and the
     // two must not share an exit status. Both calls already report-and-continue
@@ -5550,15 +6167,6 @@ int main(int argc, char* argv[]) {
         std::cerr << "[WARN] scratch housekeeping skipped: " << e.what()
                   << " — kept roots may accumulate\n";
     }
-
-    // The chosen root is LOGGED once, here, so a failing run stays
-    // inspectable even though the name is no longer predictable.
-    std::cout << "=== DSS Code Prime — Integration Tests ===\n"
-              << "Compiler:      " << compiler << "\n"
-              << "Examples root: " << examplesRoot.generic_string() << "\n"
-              << "Output:        " << outputBase.string()
-              << "  (per-run, unique to THIS process)\n"
-              << "Host OS:       " << currentHostOs() << "\n\n";
 
     // ── the coverage-boundary entry picks its subject, then becomes an
     //    ordinary per-example run ──────────────────────────────────────────
@@ -5703,6 +6311,11 @@ int main(int argc, char* argv[]) {
     // is handed an absolute path by construction, which is the gap this closes.
     runSourceArgumentShapePin(compiler,
                               outputBase / "harness-source-arg-shapes");
+    // UNNUMBERED for the same reason as its neighbours. It pins how this runner
+    // removes a scratch root while siblings work on the same base — a property
+    // of its housekeeping, not of any example, so it runs with the CLI surface
+    // rather than in 600 per-example entries.
+    runConcurrentScratchRemovalPin(outputBase / "harness-concurrent-removal");
 
     }  // wantCliSurface
 
@@ -5794,22 +6407,13 @@ int main(int argc, char* argv[]) {
               << armLedger.total()
               << " declared target arms NOT verified (see 'Arm verdicts' above)\n";
 
-    // Cleanup policy. A GREEN run leaves nothing behind. A RED run KEEPS its
-    // root, because every `[FAIL]` line above cites a `cli.log` path inside
-    // it: the old code removed the tree unconditionally right here, so those
-    // paths named files that no longer existed by the time anyone read them.
-    // `pruneKeptRoots` at the next run's startup is what stops kept roots
-    // accumulating — the retention is bounded, not open-ended.
-    std::error_code ec;
-    fs::remove(outputBase / kRunningName, ec);  // this run is over either way
-    if (failures == 0) {
-        fs::remove_all(outputBase, ec);
-        if (ec) {
-            std::cerr << "[WARN] could not remove scratch root '"
-                      << outputBase.generic_string() << "': " << ec.message()
-                      << "\n";
-        }
-    } else {
+    // Cleanup policy — a GREEN run leaves nothing behind, a RED run keeps its
+    // root; see `releaseRunRoot`.
+    if (auto const released = releaseRunRoot(outputBase, /*keep=*/failures > 0);
+        !released.warning.empty()) {
+        std::cerr << "[WARN] " << released.warning << "\n";
+    }
+    if (failures > 0) {
         std::cout << "Artifacts KEPT for inspection: " << outputBase.string()
                   << "\n(kept only on failure; the " << kKeptRootLimit
                   << " most recent are retained, older ones are pruned at the"

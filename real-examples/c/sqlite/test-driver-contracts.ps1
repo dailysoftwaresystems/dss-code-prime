@@ -694,6 +694,38 @@ function Pin-ConfoundReport($driver) {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# P - THE EXECUTION-EVIDENCE HELPERS RETURN LISTS A CALLER CAN COUNT
+# ═══════════════════════════════════════════════════════════════════════════
+# [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+# ✔MEASURED 2026-09-15 while writing them: the first cut ended with `return ,$mons`,
+# and the call site wraps the call in `@( )`. PowerShell then counts ONE element
+# for an EMPTY list — the empty array itself — so `Stop-ExecEvidenceMonitors` would
+# have bound `$null` to `-LiteralPath` and thrown on every segment of every leg with
+# no armed row (pe64 among them), and `Invoke-ExecEvidenceAttribution` would have
+# reported "1 failure(s) excused" over nothing. No run had reached that path yet.
+# So the empty shapes are asserted THROUGH THE CALL-SITE SPELLING, and a mutant that
+# restores the comma must red.
+function Pin-ExecEvidenceShapes($driver) {
+  Invoke-Expression (Get-Fns $driver @('Start-ExecEvidenceMonitors', 'Stop-ExecEvidenceMonitors', 'Invoke-ExecEvidenceAttribution'))
+  function Info($m) { }
+  function Warn($m) { }
+  $script:ConfoundsOverride = $null
+  $noEvidence = [pscustomobject]@{ label = 'pe64-x86_64'; confoundsByEvidence = @(); executionEvidence = @() }
+  $mons = @(Start-ExecEvidenceMonitors $noEvidence (Join-Path $Work 'no-evidence.log'))
+  Ck 'a leg with no armed row starts NO monitor, and the call site counts ZERO' 0 $mons.Count
+  $stopped = 'no error'
+  try { Stop-ExecEvidenceMonitors 'pe64-x86_64' $mons } catch { $stopped = "THREW: $($_.Exception.Message)" }
+  Ck '...and stopping that empty list is a no-op, not a null -LiteralPath' 'no error' $stopped
+  $excused = @(Invoke-ExecEvidenceAttribution $noEvidence 'native' @('x.log') @() @('walsetlk-2.2.3'))
+  Ck 'an attribution with no armed row excuses NOTHING, counted as zero' 0 $excused.Count
+  $script:ConfoundsOverride = @('^op-1')
+  $armed = [pscustomobject]@{ label = 'elf64-x86_64'; confoundsByEvidence = @('^walsetlk-'); executionEvidence = @('clock-realtime-steps') }
+  Ck 'the operator override starts no monitor either' 0 (@(Start-ExecEvidenceMonitors $armed (Join-Path $Work 'override.log'))).Count
+  Ck '...and attributes nothing' 0 (@(Invoke-ExecEvidenceAttribution $armed 'native' @('x.log') @() @('walsetlk-2.2.3'))).Count
+  $script:ConfoundsOverride = $null
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # H - A FAILED RUN-DIRECTORY OPERATION IS A VERDICT, NOT A SILENT FALLBACK
 # ═══════════════════════════════════════════════════════════════════════════
 # D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS. Two properties, and BOTH matter:
@@ -1496,6 +1528,20 @@ Green 'L    the smoke argv: MEASURED targets, DECLARED launcher' 'Pin-SmokeArgv'
 Green 'M    the precondition discriminator, silent crash included' 'Pin-Precondition'
 Green 'N    the confound report is PRINTED, per leg'          'Pin-ConfoundReport'
 Green 'O    the located compiler is PROVED current'           'Pin-CompilerCurrency'
+Green 'P    the execution-evidence helpers return COUNTABLE lists' 'Pin-ExecEvidenceShapes'
+# FP - THE DEFECT ITSELF, RESTORED: `return ,$mons`, which the call site's `@( )`
+# counts as ONE element for an EMPTY list. The pin must red on the zero count and on
+# the null -LiteralPath the stop then throws.
+# [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+$mP = Join-Path $Work 'mP.ps1'
+if (Invoke-Mutation 'FP restore the comma return in Start-ExecEvidenceMonitors' $mP '  if (-not $evidence.Count) { return $mons }' {
+      param($src)
+      return @($src | ForEach-Object {
+        if ($_ -eq '  if (-not $evidence.Count) { return $mons }') { '  if (-not $evidence.Count) { return ,$mons }' } else { $_ }
+      })
+    }) {
+  Red 'FP an EMPTY monitor list is counted as zero, and stopping it is a no-op' 'Pin-ExecEvidenceShapes' $mP
+}
 
 # ═══════════════════════════════════════════════════════════════════════════
 # F - RED-ON-DISABLE. Every guard above is REMOVED in a copy; the pin must fail.

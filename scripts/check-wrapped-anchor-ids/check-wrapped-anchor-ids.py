@@ -408,8 +408,11 @@ def anchor_key_set(root):
 
 # ── the governed set ────────────────────────────────────────────────────────
 def governed_files(root):
-    p = subprocess.run(
-        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+    # ★ THROUGH `run_git`, never a bare `subprocess.run(["git", ...])`: a caller's exported
+    # GIT_INDEX_FILE or GIT_DIR otherwise decides which repository this listing describes.
+    # ✔MEASURED 2026-09-15 (P66 lane rr). The helper, and why, are in scripts/owning-tree/.
+    p = _owning_tree().run_git(
+        ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
         cwd=root, capture_output=True, text=True, encoding="utf-8",
         errors="replace")
     if p.returncode != 0:
@@ -714,7 +717,7 @@ def run(root, write, baseline=False):
 # arm that checks only the code cannot tell which one it proved. That exact
 # mistake was measured in a sibling guard.
 
-EXPECTED_ARMS = 47
+EXPECTED_ARMS = 53
 
 
 def _tmp_repo(files, ceilings, comment=None):
@@ -726,7 +729,7 @@ def _tmp_repo(files, ceilings, comment=None):
     written verbatim, which is how a DIVERGENCE is synthesized.
     """
     root = tempfile.mkdtemp(prefix="wrapped-anchor-ids-selftest-")
-    subprocess.run(["git", "init", "-q"], cwd=root, capture_output=True)
+    _owning_tree().run_git(["init", "-q"], cwd=root, capture_output=True)
     for rel, text in files.items():
         full = os.path.join(root, rel.replace("/", os.sep))
         os.makedirs(os.path.dirname(full), exist_ok=True)
@@ -1036,6 +1039,40 @@ def selftest():
         check("every synthetic root was removed and the floors restored",
               not leaked and (FILE_FLOOR, KEY_FLOOR) == saved_floors)
 
+    # ── G. the root is the tree THIS FILE lives in, whatever the caller's cwd ──
+    # Arms, oracle and synthesized negatives are owned by scripts/owning-tree/owning-tree.py.
+    for _ok, _why, _detail in _owning_tree().root_arms(repo_root, (SystemExit,), True, __file__):
+        check(_why if _ok else "%s -- %s" % (_why, _detail), _ok)
+
+    # ── H. the listing ignores the CALLER's git environment ────────────────────
+    # ✔MEASURED 2026-09-15 (P66 lane rr): with another repository's GIT_INDEX_FILE or GIT_DIR
+    # exported, `git ls-files` here listed THAT repository's paths. Asserted on a synthetic
+    # repository; the steered negative is proven by a bare `git` under the same environment.
+    ot = _owning_tree()
+    held_floor = FILE_FLOOR
+    steer_root = _tmp_repo({"src/own.cpp": "// own\n"}, None)
+    real, clean, steered = False, [], None
+    try:
+        FILE_FLOOR = 1
+        clean = governed_files(steer_root)
+        with ot.steering() as steer:
+            neg = ot.bare_git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                              steer_root, steer)
+            real = ot.STEER_DECOY in neg.stdout.split("\0")
+            with ot.caller_environment(steer):
+                try:
+                    steered = governed_files(steer_root)
+                except Collapse as exc:
+                    steered = ["COLLAPSE: %s" % str(exc).split("\n")[0]]
+    finally:
+        FILE_FLOOR = held_floor
+        ot.remove_tree(steer_root)
+    _label = ("the governed listing IGNORES a caller's GIT_DIR + GIT_WORK_TREE + GIT_INDEX_FILE "
+              "naming another repository")
+    _held = real and "src/own.cpp" in clean and steered == clean
+    check(_label if _held else "%s -- negative-synthesized=%s clean=%r steered=%r"
+          % (_label, real, clean, steered), _held)
+
     if arms != EXPECTED_ARMS:
         print("  [FAIL] expected %d arms, ran %d - an arm was dropped or added "
               "without updating EXPECTED_ARMS" % (EXPECTED_ARMS, arms))
@@ -1045,13 +1082,46 @@ def selftest():
     return EXIT_RATCHET if bad else EXIT_OK
 
 
+_OWNING_TREE = None
+
+
+def _owning_tree():
+    """`scripts/owning-tree/owning-tree.py` -- the one owner of "which tree is this file in?".
+
+    Loaded by path from this file's sibling directory (a hyphen is not a module name). It
+    FAILS LOUD when absent rather than falling back to a local walk: a second copy of the
+    answer is the drift that owner exists to end.
+    """
+    global _OWNING_TREE
+    if _OWNING_TREE is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            sys.exit("wrapped-anchor-ids: FATAL - cannot find %s -- this guard's root is "
+                     "resolved there and nowhere else" % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OWNING_TREE = mod
+    return _OWNING_TREE
+
+
 def repo_root():
-    p = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                       capture_output=True, text=True, encoding="utf-8",
-                       errors="replace")
-    if p.returncode != 0:
-        sys.exit("wrapped-anchor-ids: FATAL - not inside a git repository")
-    return p.stdout.strip()
+    """The tree THIS FILE lives in -- never the tree the caller's shell is standing in.
+
+    ⚠ This was a bare `git rev-parse --show-toplevel`. ✔MEASURED 2026-09-15 (P66): run by
+    path with its cwd inside a different repository it scanned THAT repository and
+    reddened on a document only that repository holds; from a directory inside no
+    repository it would not run at all. ctest pins `WORKING_DIRECTORY`, so no gate saw
+    either. The walk, the measurement that chose it, and why git must agree are in
+    `scripts/owning-tree/owning-tree.py`. `reads_git`, because the scanned set is
+    enumerated through `git ls-files`.
+    """
+    ot = _owning_tree()
+    try:
+        return ot.resolve(__file__, reads_git=True)
+    except ot.Refusal as exc:
+        sys.exit("wrapped-anchor-ids: FATAL - %s" % exc)
 
 
 REPO = repo_root()

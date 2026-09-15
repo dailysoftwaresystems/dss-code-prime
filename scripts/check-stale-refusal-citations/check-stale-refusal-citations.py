@@ -524,8 +524,13 @@ def row_sets(root):
 
 
 def governed_files(root):
-    p = subprocess.run(
-        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+    # ★ THROUGH `run_git`, never a bare `subprocess.run(["git", ...])`: a caller's exported
+    # GIT_INDEX_FILE or GIT_DIR otherwise decides which repository this listing describes.
+    # ✔MEASURED 2026-09-15 (P66 lane rr): under another repository's GIT_INDEX_FILE this guard
+    # said "OK (3350 governed file(s) ...)", rc=0, while this tree held 3349 -- the extra one
+    # was not this tree's. The helper, and why, are in scripts/owning-tree/.
+    p = _owning_tree().run_git(
+        ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
         cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if p.returncode != 0:
         raise Collapse(
@@ -862,7 +867,7 @@ def list_sites(root):
 # rule as the literals, and the one fixture that NEEDS a realistic length is
 # ASSEMBLED from fragments no grep can join.
 
-EXPECTED_ARMS = 64
+EXPECTED_ARMS = 70
 
 # The one synthetic plan document every arm's temp repo carries. The closure mark
 # is taken from the shared module at run time rather than written here -- this
@@ -917,7 +922,7 @@ def _tmp_repo(root, files, ceilings, closed_mark, subject_mark=None,
     written verbatim, which is how a DIVERGENCE is synthesized.
     """
     box = tempfile.mkdtemp(prefix="stale-refusal-selftest-")
-    subprocess.run(["git", "init", "-q"], cwd=box, capture_output=True)
+    _owning_tree().run_git(["init", "-q"], cwd=box, capture_output=True)
     payload = dict(files)
     payload[".plans/00-synthetic.md"] = _plan_text(closed_mark,
                                                    subject_mark=subject_mark)
@@ -1292,7 +1297,7 @@ def selftest(root):
         boxes.append(box)
         os.makedirs(os.path.join(box, ".plans"))
         os.makedirs(os.path.join(box, "src"))
-        subprocess.run(["git", "init", "-q"], cwd=box, capture_output=True)
+        _owning_tree().run_git(["init", "-q"], cwd=box, capture_output=True)
         with io.open(os.path.join(box, ".plans", "00-synthetic.md"), "w",
                      encoding="utf-8", newline="\n") as fh:
             fh.write(_plan_text(ab.CLOSED_MARK))
@@ -1321,6 +1326,44 @@ def selftest(root):
         check("every synthetic root was removed and the floors restored",
               not leaked and (FILE_FLOOR, NAME_FLOOR, CLOSED_FLOOR) == saved)
 
+    # ── G. the root is the tree THIS FILE lives in, whatever the caller's cwd ──
+    # Arms, oracle and synthesized negatives are owned by scripts/owning-tree/owning-tree.py.
+    for _ok, _why, _detail in _owning_tree().root_arms(repo_root, (Collapse,), True, __file__):
+        check(_why, _ok, "" if _ok else _detail)
+
+    # ── H. the listing ignores the CALLER's git environment ────────────────────
+    # ✔MEASURED 2026-09-15 (P66 lane rr): with another repository's GIT_INDEX_FILE or GIT_DIR
+    # exported, `git ls-files` here listed THAT repository's paths and the guard said OK over
+    # them. Asserted on a synthetic repository; the steered negative is proven by a bare `git`.
+    ot = _owning_tree()
+    held_floor = FILE_FLOOR
+    steer_root = tempfile.mkdtemp(prefix="stale-refusal-steer-")
+    real, clean, steered = False, [], None
+    try:
+        os.makedirs(os.path.join(steer_root, "src"))
+        with io.open(os.path.join(steer_root, "src", "own.cpp"), "w", encoding="utf-8",
+                     newline="\n") as fh:
+            fh.write("// own\n")
+        ot.run_git(["init", "-q"], cwd=steer_root, capture_output=True)
+        FILE_FLOOR = 1
+        clean = governed_files(steer_root)
+        with ot.steering() as steer:
+            neg = ot.bare_git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                              steer_root, steer)
+            real = ot.STEER_DECOY in neg.stdout.split("\0")
+            with ot.caller_environment(steer):
+                try:
+                    steered = governed_files(steer_root)
+                except Collapse as exc:
+                    steered = ["COLLAPSE: %s" % str(exc).split("\n")[0]]
+    finally:
+        FILE_FLOOR = held_floor
+        ot.remove_tree(steer_root)
+    check("the governed listing IGNORES a caller's GIT_DIR + GIT_WORK_TREE + GIT_INDEX_FILE "
+          "naming another repository",
+          real and "src/own.cpp" in clean and steered == clean,
+          "negative-synthesized=%s clean=%r steered=%r" % (real, clean, steered))
+
     if len(arms) != EXPECTED_ARMS:
         print("  [FAIL] expected %d arms, ran %d - an arm was dropped or added "
               "without updating EXPECTED_ARMS" % (EXPECTED_ARMS, len(arms)))
@@ -1332,13 +1375,45 @@ def selftest(root):
     return EXIT_RATCHET if bad else EXIT_OK
 
 
+_OWNING_TREE = None
+
+
+def _owning_tree():
+    """`scripts/owning-tree/owning-tree.py` -- the one owner of "which tree is this file in?".
+
+    Loaded by path from this file's sibling directory (a hyphen is not a module name). It
+    FAILS LOUD when absent rather than falling back to a local walk: a second copy of the
+    answer is the drift that owner exists to end.
+    """
+    global _OWNING_TREE
+    if _OWNING_TREE is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise Collapse("cannot find %s -- this guard's root is resolved there and "
+                           "nowhere else" % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OWNING_TREE = mod
+    return _OWNING_TREE
+
+
 def repo_root():
-    p = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                       capture_output=True, text=True, encoding="utf-8",
-                       errors="replace")
-    if p.returncode != 0:
-        raise Collapse("not inside a git repository")
-    return p.stdout.strip()
+    """The tree THIS FILE lives in -- never the tree the caller's shell is standing in.
+
+    ⚠ This was a bare `git rev-parse --show-toplevel`. ✔MEASURED 2026-09-15 (P66): run by
+    path with its cwd inside a different repository it reported OK over THAT repository's
+    files and rows, silently; from a directory inside no repository it would not run at
+    all. ctest pins `WORKING_DIRECTORY`, so no gate saw either. The walk, the measurement
+    that chose it, and why git must agree are in `scripts/owning-tree/owning-tree.py`.
+    `reads_git`, because the governed set is enumerated through `git ls-files`.
+    """
+    ot = _owning_tree()
+    try:
+        return ot.resolve(__file__, reads_git=True)
+    except ot.Refusal as exc:
+        raise Collapse(str(exc))
 
 
 def main(argv):

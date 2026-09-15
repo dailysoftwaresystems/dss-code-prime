@@ -16457,6 +16457,254 @@ TEST(MirLoweringC, AtomicCompareExchangeWritesTheObservedValueBackOnFailure) {
            "failure-only write-back of the OBSERVED value through it";
 }
 
+// ── D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE ──
+//
+// ★★★ EVERY COMPOUND OPERATOR, `++` AND `--` ON AN `_Atomic` OBJECT COMMITS
+// THROUGH THE SHIPPED AtomicCas — THE SAME LOOP `atomic_fetch_add` USES ABOVE.
+// Before this they lowered to an AtomicLoad and a SEPARATE AtomicStore, which
+// computes the right answer single-threaded and loses updates under contention
+// (✔MEASURED rc 115 on pe64 and elf64 at `caf053eb`). The store count is the
+// assertion a value-only test cannot make.
+// RED-ON-DISABLE: route `lowerCompoundAssign` / `lowerIncDecStmt`'s `_Atomic` arm
+// back to the desugar → AtomicCas 0, AtomicStore 14.
+TEST(MirLoweringC, AtomicCompoundOperatorsAndIncrementsCommitThroughTheCasLoop) {
+    auto L = lowerC(
+        "_Atomic int g;\n"
+        "_Atomic unsigned u;\n"
+        "void f(int v) {\n"
+        "    g += v; g -= v; g *= v; g /= v; g %= v;\n"
+        "    u <<= 1; u >>= 1; u &= 3u; u |= 4u; u ^= 5u;\n"
+        "    g++; ++g; g--; --g;\n"
+        "}\n"
+        "int main(void) { f(1); return 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    auto const ops = atomicRmwOpcodesIn(L);
+    EXPECT_EQ(countAtomicRmwOpcode(ops, MirOpcode::AtomicCas), 14u)
+        << "ten compound operators and four increment/decrement spellings — one "
+           "compare-exchange commit each";
+    EXPECT_EQ(countAtomicRmwOpcode(ops, MirOpcode::AtomicLoad), 14u)
+        << "exactly one atomic read per loop: nothing else here reads an `_Atomic`";
+    EXPECT_EQ(countAtomicRmwOpcode(ops, MirOpcode::AtomicStore), 0u)
+        << "a separate AtomicStore IS the lost update";
+}
+
+// The pointer arm: the update steps by the POINTEE (a stride), inside the loop.
+TEST(MirLoweringC, AtomicPointerCompoundAssignmentScalesInsideTheCasLoop) {
+    auto L = lowerC(
+        "int cells[8];\n"
+        "int *_Atomic p = cells;\n"
+        "int main(void) { p += 2; p++; return 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    auto const ops = atomicRmwOpcodesIn(L);
+    EXPECT_EQ(countAtomicRmwOpcode(ops, MirOpcode::AtomicCas), 2u);
+    EXPECT_EQ(countAtomicRmwOpcode(ops, MirOpcode::AtomicStore), 0u);
+    EXPECT_GE(countAtomicRmwOpcode(ops, MirOpcode::Gep), 2u)
+        << "each pointer update is a scaled Gep over the observed value";
+}
+
+namespace {
+// Per function, in module order: the `payload2` of every AtomicCas and of the
+// AtomicLoad it pairs with (one read-modify-write per function in the fixture).
+struct RmwAlign { std::uint32_t load = 0; std::uint32_t cas = 0; int loads = 0; int cases = 0; };
+[[nodiscard]] std::vector<RmwAlign> rmwAlignPerFunction(Lowered const& L) {
+    std::vector<RmwAlign> out;
+    Mir const& m = L.mir.mir;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        RmwAlign a;
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                if (m.instOpcode(id) == MirOpcode::AtomicLoad) { a.load = m.instPayload2(id); ++a.loads; }
+                if (m.instOpcode(id) == MirOpcode::AtomicCas)  { a.cas  = m.instPayload2(id); ++a.cases; }
+            }
+        }
+        if (a.cases != 0) out.push_back(a);
+    }
+    return out;
+}
+}  // namespace
+
+// ★★ THE CAS CARRIES THE LVALUE'S PROVABLE ALIGNMENT, EQUAL TO ITS LOAD'S. `mir_to_lir`
+// routes an under-aligned access through the atomics runtime from exactly this
+// payload, so a load and its commit that disagree would be arbitrated by two
+// different mechanisms. RED-ON-DISABLE: stamp 0 on the CAS in
+// `closeAtomicRmwLoop` → the packed arm reads 0 against its load's 1.
+TEST(MirLoweringC, AtomicReadModifyWriteStampsTheLvalueAlignmentOnItsCas) {
+    auto L = lowerC(
+        "struct __attribute__((packed)) P { char c; _Atomic int a; };\n"
+        "struct A { char c; _Atomic int a; };\n"
+        "void packed_member(struct P *p) { p->a += 1; }\n"
+        "void aligned_member(struct A *q) { q->a += 1; }\n"
+        "int main(void) { return 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    auto const aligns = rmwAlignPerFunction(L);
+    ASSERT_EQ(aligns.size(), 2u);
+    EXPECT_EQ(aligns[0].cases, 1);
+    EXPECT_EQ(aligns[0].loads, 1);
+    EXPECT_EQ(aligns[0].load, 1u) << "a packed member is provably 1-aligned";
+    EXPECT_EQ(aligns[0].cas, aligns[0].load)
+        << "the commit must be routed exactly as its load";
+    EXPECT_EQ(aligns[1].load, 4u) << "CONTROL: an aligned member is 4-aligned";
+    EXPECT_EQ(aligns[1].cas, aligns[1].load);
+}
+
+// ★★ A FLOATING `_Atomic` COMMITS THROUGH ITS INTEGER REPRESENTATION. Every
+// reference makes `d += 1.0` on an `_Atomic double` WORK under a race (✔MEASURED
+// gcc 13.3.0, clang 18.1.3, MSVC 19.51), and the compare-exchange C defines is over
+// the CONTENTS OF MEMORY — so the loop's load and commit are 64-bit INTEGER ops on
+// a retyped address, with `Bitcast` across register classes at the two ends. A
+// value-typed commit would spin forever over a NaN (NaN != NaN).
+// RED-ON-DISABLE: make `atomicReprType` answer the value type itself for a
+// floating kind → the CAS is `f64`-typed and the U64 counts below drop to 0.
+TEST(MirLoweringC, AtomicFloatingCompoundAssignmentLoopsOverTheRepresentation) {
+    auto L = lowerC("_Atomic double d;\n"
+                    "_Atomic float f;\n"
+                    "int main(void) { d += 1.0; ++f; return 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    auto const& ti = L.model.lattice().interner();
+    int cas64 = 0, cas32 = 0, load64 = 0, load32 = 0, stores = 0, bitcasts = 0;
+    int floatTypedAtomics = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const fn = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(fn); ++bi) {
+            MirBlockId const b = m.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                MirOpcode const op = m.instOpcode(id);
+                TypeKind const k = m.instType(id).valid()
+                    ? ti.kind(m.instType(id)) : TypeKind::Void;
+                if (op == MirOpcode::AtomicCas || op == MirOpcode::AtomicLoad) {
+                    if (k == TypeKind::F32 || k == TypeKind::F64) ++floatTypedAtomics;
+                }
+                if (op == MirOpcode::AtomicCas && k == TypeKind::U64) ++cas64;
+                if (op == MirOpcode::AtomicCas && k == TypeKind::U32) ++cas32;
+                if (op == MirOpcode::AtomicLoad && k == TypeKind::U64) ++load64;
+                if (op == MirOpcode::AtomicLoad && k == TypeKind::U32) ++load32;
+                if (op == MirOpcode::AtomicStore) ++stores;
+                if (op == MirOpcode::Bitcast) ++bitcasts;
+            }
+        }
+    }
+    EXPECT_EQ(floatTypedAtomics, 0)
+        << "no atomic op may be float-typed: the targets realize integer fences only";
+    EXPECT_EQ(cas64, 1) << "`d += 1.0` commits its 64 bits";
+    EXPECT_EQ(load64, 1);
+    EXPECT_EQ(cas32, 1) << "`++f` commits its 32 bits";
+    EXPECT_EQ(load32, 1);
+    EXPECT_EQ(stores, 0) << "a separate AtomicStore IS the lost update";
+    // Per loop: the retyped address, bits→value after the load, value→bits before
+    // the commit.
+    EXPECT_GE(bitcasts, 6);
+}
+
+// The plain accesses take the same route: before this row DSS refused EVERY fenced
+// access of a floating `_Atomic` in `mir_to_lir` (`reportNonGprAtomic`), so the
+// compound assignment alone would have been unobservable — its result could not
+// be read back.
+TEST(MirLoweringC, AtomicFloatingLoadAndStoreGoThroughTheRepresentation) {
+    auto L = lowerC("_Atomic double d;\n"
+                    "int main(void) { d = 40.0; double const v = d; return (int)v; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& ti = L.model.lattice().interner();
+    int load64 = 0, store64 = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const fn = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(fn); ++bi) {
+            MirBlockId const b = m.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                if (m.instOpcode(id) == MirOpcode::AtomicLoad
+                    && ti.kind(m.instType(id)) == TypeKind::U64) {
+                    ++load64;
+                }
+                if (m.instOpcode(id) == MirOpcode::AtomicStore) {
+                    auto const ops = m.instOperands(id);
+                    if (ops.size() == 2 && ti.kind(m.instType(ops[0])) == TypeKind::U64)
+                        ++store64;
+                }
+            }
+        }
+    }
+    EXPECT_EQ(load64, 1) << "the plain read loads the 64-bit representation";
+    EXPECT_EQ(store64, 1) << "the plain write stores the 64-bit representation";
+}
+
+// `atomic_fetch_add`/`_sub` on an `_Atomic double` compute the float `+`/`-` and
+// commit the BITS — ✔MEASURED clang 18.1.3 compiles and runs both (gcc 13.3.0 and
+// MSVC 19.51 refuse), so they are required. `atomic_fetch_or` has no float
+// computation and every reference refuses it: the CONTROL here is that DSS refuses
+// it by name while the add/sub module lowers.
+// RED-ON-DISABLE: drop `floatArith` from `emitAtomicRmw`'s `representable` → the
+// add/sub module refuses and `L.mir.ok` flips.
+TEST(MirLoweringC, AtomicFetchAddAndSubOnAFloatingObjectCommitItsBits) {
+    auto L = lowerC("_Atomic double d;\n"
+                    "int main(void) {\n"
+                    "    double const a = atomic_fetch_add_explicit(&d, 2.0, 5);\n"
+                    "    double const s = atomic_fetch_sub_explicit(&d, 1.0, 5);\n"
+                    // No float arithmetic outside the two verbs, so the FAdd/FSub
+                    // counts below are theirs alone.
+                    "    return (int)a - (int)s;\n"
+                    "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    auto const ops = atomicRmwOpcodesIn(L);
+    EXPECT_EQ(countAtomicRmwOpcode(ops, MirOpcode::FAdd), 1u);
+    EXPECT_EQ(countAtomicRmwOpcode(ops, MirOpcode::FSub), 1u);
+    EXPECT_EQ(countAtomicRmwOpcode(ops, MirOpcode::AtomicCas), 2u);
+    EXPECT_EQ(countAtomicRmwOpcode(ops, MirOpcode::AtomicStore), 0u);
+
+    auto R = lowerC("_Atomic double d;\n"
+                    "int main(void) { (void)atomic_fetch_or_explicit(&d, 2.0, 5); return 0; }\n");
+    ASSERT_FALSE(R.model.hasErrors());
+    ASSERT_TRUE(R.hir->ok);
+    EXPECT_FALSE(R.mir.ok) << "CONTROL: fetch_or has no float computation";
+    bool named = false;
+    for (auto const& diag : R.mirReporter.all())
+        if (diag.actual.find("D-CSUBSET-ATOMIC-RMW") != std::string::npos) named = true;
+    EXPECT_TRUE(named);
+}
+
 // D-CSUBSET-ATOMIC-MONOMORPH-I32: the `<stdatomic.h>` accessor surface is no
 // longer monomorphized to i32 — the config row's signature is an EXEMPLAR and
 // the real one is derived per call site from the argument's pointee.

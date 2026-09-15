@@ -125,7 +125,14 @@ fails='writecrash-1.1.1 walsetlk-2.1.3 zipfile-25.0 sometest-9.9'
 # a pass over work it did not do.
 # ★ ADDING AN ASSERTION WITHOUT BUMPING THIS NUMBER FAILS ON THE VERY NEXT RUN,
 # by design. One line to update, against an instrument that would otherwise lie.
-TOTAL_ASSERTIONS=170     # 20 classifier + 14 provenance helpers + 12 Step-2 gate
+TOTAL_ASSERTIONS=182     # 20 classifier + 14 provenance helpers + 12 Step-2 gate
+                         # + 6 EXECUTION EVIDENCE, this driver, x2 with the
+                         #   .ps1-gated pairing block = 12 (region marker, the
+                         #   --execution-monitor-argv argv, the segment loop
+                         #   STARTING and STOPPING the monitor, the
+                         #   --attribute-unit-failures argv, and the classifier
+                         #   CALLING it)
+                         #   [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
                          # + 3 RUN-DIRECTORY CORROBORATION, this driver, x2 with
                          #   the .ps1-gated pairing block = 6 (region marker, the
                          #   --corroborate-run-dir call, and the runDirectoryGating
@@ -844,6 +851,24 @@ check "...and supplies the oracle STATUS, so a stale log cannot buy an amnesty" 
 # never wired -- a pin whose witness is not unique in its own subject.
 check "the .sh hands the oracle STATUS to the oracle REPORT, not only to the attributor" \
       '--oracle-status "${LEG_ORACLE_STATUS[$leg]:-}" 2>&1)' "$SHCODE"
+# [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+# ★★ A CLOCK ROW EXCUSES A FAILURE ONLY ON EVIDENCE FROM THAT FAILURE'S OWN
+# EXECUTION, and a driver that never started the monitor — or never asked the
+# resolver to read it — would charge every clock failure on its side to dss while
+# the other driver excused it: two verdicts on one tree, and the missing side is
+# invisible because a charged failure reads like any other. So: the region marker,
+# the plan call as the argv spells it, the segment loop STARTING and STOPPING the
+# monitor around the fixture, the attribution call, and the classifier CALLING it.
+check "the .sh marks the execution-evidence region" "dss:exec-evidence" "$SHTXT"
+check "the .sh's argv really names the monitor-plan verb" \
+      '--execution-monitor-argv \' "$SHCODE"
+check "...and the segment loop STARTS the monitor on this segment's log" \
+      'exec_evidence_start "$leg" "$seglog"' "$SHCODE"
+check "...and STOPS it after the fixture" 'exec_evidence_stop "$leg"' "$SHCODE"
+check "the .sh's argv really names the per-failure attribution verb" \
+      '--attribute-unit-failures "$leg"' "$SHCODE"
+check "...and the classifier CALLS it with this leg's run mode" \
+      'exec_evidence_attribute "$leg" "$leg_mode"' "$SHCODE"
 
 # ── BOTH DRIVERS, OR THE CAPABILITY IS A SILENT HARNESS BUG ──────────────────
 # D-HARNESS-PS1-STAGES-NO-LOADEXT-HELPER-COVERAGE-IS-UNDECLARED existed because
@@ -852,8 +877,8 @@ check "the .sh hands the oracle STATUS to the oracle REPORT, not only to the att
 # and not the other, and THIS is the assertion that keeps it that way.
 PS1="$(dirname "$SH")/build-and-test.ps1"
 if [ ! -f "$PS1" ]; then
-  echo "  SKIP build-and-test.ps1 not found beside the .sh — 52 pairing assertions not run"
-  skip=$((skip+53))
+  echo "  SKIP build-and-test.ps1 not found beside the .sh — 58 pairing assertions not run"
+  skip=$((skip+59))
 else
   PS1TXT="$(cat "$PS1")"
   # Same comment-stripped view as $SHCODE above, and for the same measured reason.
@@ -884,6 +909,19 @@ else
   # written out per driver instead of shared.
   check "...and hands it to the .ps1's oracle REPORT too" \
         "--oracle-status', \"\$(if (\$lr) { \$lr.OracleStatus })\")" "$PS1CODE"
+  # [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+  # The same six claims on the .ps1: a driver that never gathered or read the
+  # evidence would charge every clock failure on its side while this one excused it.
+  check "the .ps1 marks the execution-evidence region too" "dss:exec-evidence" "$PS1TXT"
+  check "the .ps1's argv really names the monitor-plan verb too" \
+        "\$LegsPy '--execution-monitor-argv'" "$PS1CODE"
+  check "...and the segment loop STARTS the monitor on this segment's log too" \
+        'Start-ExecEvidenceMonitors $leg $log' "$PS1CODE"
+  check "...and STOPS it after the fixture too" 'Stop-ExecEvidenceMonitors $LegTag $execMons' "$PS1CODE"
+  check "the .ps1's argv really names the per-failure attribution verb too" \
+        "@('--attribute-unit-failures', \"\$(\$leg.label)\"" "$PS1CODE"
+  check "...and the classifier CALLS it with this leg's run mode too" \
+        'Invoke-ExecEvidenceAttribution $leg $legMode' "$PS1CODE"
   # ★★ AN OPERATOR SWITCH HONOURED BY ONE DRIVER AND IGNORED BY THE OTHER is the
   # worst shape available: the ignoring side runs legs the operator excluded and
   # reports them as covered — a FALSE claim of coverage, not a missing one.

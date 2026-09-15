@@ -863,6 +863,56 @@ pin_confound_supply() { # pin_confound_supply <driver>
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# P — THE PER-FAILURE ATTRIBUTION IS FOLDED, NOT MERELY PRINTED
+# ═══════════════════════════════════════════════════════════════════════════
+# [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+# The resolver decides which failures an ARMED row excuses; this driver's whole job
+# is to fold that answer into the classifier's arrays. A fold that printed the
+# REPORT lines and left `real` untouched would read, in the log, exactly like an
+# attribution that worked — and every clock failure would still be charged. So the
+# shipped function runs against a resolver stub that answers in the wire format, and
+# the ARRAYS are asserted. Twin of test-driver-contracts.ps1's pin P.
+pin_exec_evidence_fold() { # pin_exec_evidence_fold <driver>
+  local drv="$1" stub="$WORK/fake-attribution.py"
+  cat > "$stub" <<'PY'
+import sys
+argv = sys.argv[1:]
+if "--attribute-unit-failures" not in argv:
+    sys.exit(9)
+if any(a == "--failure=explode-1.1" for a in argv):
+    print("the resolver refused on purpose", file=sys.stderr)
+    sys.exit(3)
+print("EXCUSED\twalsetlk-2.2.3")
+print("GENUINE\tselect1-1.1")
+print("REPORT\t[elf64-x86_64] per-failure clock attribution: walsetlk-2.2.3 EXCUSED by ^walsetlk- - stub")
+PY
+  load_fns "$drv" exec_evidence_start exec_evidence_attribute || return 0
+  local saved_resolver="$LEG_RESOLVER"
+  LEG_RESOLVER="$stub"; LEG_CATALOGUE="$CATALOGUE"; DSS_CONFOUNDS=""
+  LEG_EVIDENCE_CONFOUNDS=(); LEG_EXECUTION_EVIDENCE=()
+  LEG_EVIDENCE_CONFOUNDS[elf64-x86_64]="'^walsetlk-'"
+  LEG_EXECUTION_EVIDENCE[elf64-x86_64]="clock-realtime-steps"
+  SEG_LOGS=("$WORK/seg0.log"); TIER_PREFIXES=()
+  real=(walsetlk-2.2.3 select1-1.1); confound=(zipfile-25.0); evidence_excused=()
+  exec_evidence_attribute elf64-x86_64 native
+  ck "an EXCUSED name LEAVES the genuine list"          "select1-1.1"                "${real[*]}"
+  ck "...and JOINS the confounds"                        "zipfile-25.0 walsetlk-2.2.3" "${confound[*]}"
+  ck "...and is named as excused PER FAILURE"            "walsetlk-2.2.3"             "${evidence_excused[*]}"
+  # A resolver that could not answer excuses NOTHING and says so.
+  real=(walsetlk-2.2.3 explode-1.1); confound=(); evidence_excused=(); WARNINGS=""
+  exec_evidence_attribute elf64-x86_64 native
+  ck "a FAILED attribution leaves every failure GENUINE" "walsetlk-2.2.3 explode-1.1"  "${real[*]}"
+  ck "...excuses nothing"                                ""                           "${evidence_excused[*]}"
+  ck_has "...and warns that it could NOT run"            "$WARNINGS"                  "could NOT run"
+  # A leg with no armed row gets no monitor and its log is left alone.
+  printf 'keep me\n' > "$WORK/untouched.log"
+  exec_evidence_start pe64-x86_64 "$WORK/untouched.log"
+  ck "a leg with no armed row starts NO monitor"         "0"                          "${#EXEC_MON_PIDS[@]}"
+  ck "...and its segment log is NOT emptied"             "keep me"                    "$(cat "$WORK/untouched.log")"
+  LEG_RESOLVER="$saved_resolver"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # I2 — THE REFUSAL MUST STOP *THE DRIVER*, NOT JUST RETURN NON-ZERO
 # ═══════════════════════════════════════════════════════════════════════════
 # D-HARNESS-CONFOUND-SUPPLY-REFUSAL-DIES-IN-A-SUBSHELL.
@@ -1582,6 +1632,15 @@ green "L    the launcher-prerequisite gate"                 pin_launcher_prereq
 green "M    the smoke argv: MEASURED targets, DECLARED launcher" pin_smoke_argv
 green "N    the confound report is PRINTED, per leg"        pin_confound_report
 green "O    the located compiler is PROVED current"         pin_compiler_currency
+green "P    the per-failure attribution is FOLDED into the classifier" pin_exec_evidence_fold
+# HP — the fold removed: the REPORT lines still print, the excused name stays in
+# `real`, and every clock failure is charged exactly as before the attribution.
+# [D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN]
+if mutate "HP drop the fold of the resolver's EXCUSED names" "$WORK/mP.sh" '  real=(${keep[@]+"${keep[@]}"})' '
+    $0 == "  real=(${keep[@]+\"${keep[@]}\"})" { next }
+    { print }'; then
+  red "HP an EXCUSED name is FOLDED out of the genuine list" pin_exec_evidence_fold "$WORK/mP.sh"
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 # H — RED-ON-DISABLE. Every guard above is REMOVED in a copy; the pin must fail.

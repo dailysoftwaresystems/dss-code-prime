@@ -63,6 +63,12 @@ dss_add_test(NAME lir/test_mir_to_lir    SOURCES test_mir_to_lir.cpp)
 # FC1 (V2-4.X): the role-contract red-on-disable levers strip
 # inputRoles/outputRoles off idiv_op via mutate_target_schema.hpp.
 target_link_libraries(dss_lir_test_mir_to_lir PRIVATE nlohmann_json::nlohmann_json)
+# D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+# the under-aligned `AtomicCas` routing — commit through the atomics runtime's
+# generic compare-exchange under the same arbiter as the load, each arm with its
+# aligned control.
+dss_add_test(NAME lir/test_atomic_cas_runtime_routing
+             SOURCES test_atomic_cas_runtime_routing.cpp)
 # FC3.5 sweep-c2: the FCmp predicate-mapping truth table + shape pins
 # (D-COND-FLOAT-NAN-TRUTHINESS-FCMP). Uses mutate_target_schema.hpp for
 # the strip-foeq/strip-fogt capability red-on-disable levers.

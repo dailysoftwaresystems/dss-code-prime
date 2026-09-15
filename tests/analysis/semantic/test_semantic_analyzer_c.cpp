@@ -22500,6 +22500,45 @@ TEST(SemanticAnalyzerC, ValidBitFieldsStayClean) {
                         DiagnosticCode::S_BitFieldNonIntegerType), 0u);
 }
 
+// D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+// an `_Atomic` bit-field is refused AT ITS DECLARATION. C23 6.7.3.2p5 makes it
+// implementation-defined whether atomic types are permitted, and ✔MEASURED all
+// three references refuse — gcc 13.3.0 "bit-field 'a' has atomic type", clang
+// 18.1.3 "non-integral type '_Atomic(int)'", MSVC 19.51 C7710 "bit-fields cannot
+// be atomic". Before, DSS accepted the declaration and a later ACCESS failed as the
+// MIR verifier's internal `I_AtomicAccessNotLowered`.
+// RED-ON-DISABLE: delete the `isAtomicQualified` arm of `resolveBitfieldSuffix` →
+// the refusal count drops to 0 (the qualifier skin is transparent to `kind()`).
+TEST(SemanticAnalyzerC, AtomicBitFieldIsRefusedAtItsDeclaration) {
+    // ⓘ The `_Atomic ( type-name )` SPECIFIER spelling is not here: DSS refuses it
+    // at the PARSER today ([[D-CSUBSET-ATOMIC-SPECIFIER-FORM]], a grammar row), so
+    // it never reaches this validator — measured while writing this pin.
+    for (char const* src : {
+             "struct S { _Atomic int a : 3; };\n",
+             "struct S { int _Atomic a : 3; };\n",
+             "struct S { unsigned long _Atomic b : 7; };\n"}) {
+        auto model = analyzeShipped("c", {
+            std::string{src} + "int main(void){ return 0; }\n",
+        });
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_BitFieldNonIntegerType), 1u)
+            << src;
+        std::string const msg =
+            firstActualForCode(model, DiagnosticCode::S_BitFieldNonIntegerType);
+        EXPECT_NE(msg.find("atomic"), std::string::npos) << src << " -> " << msg;
+        EXPECT_NE(msg.find("6.7.3.2p5"), std::string::npos) << src << " -> " << msg;
+    }
+    // THE CONTROLS: the same widths on a plain base, and an `_Atomic` NON-bit-field
+    // member beside a plain bit-field, stay clean.
+    auto clean = analyzeShipped("c", {
+        "struct S { int a : 3; _Atomic int b; unsigned c : 5; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(clean.diagnostics(),
+                        DiagnosticCode::S_BitFieldNonIntegerType), 0u);
+    EXPECT_FALSE(clean.hasErrors());
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // D-C-FLOAT-LITERAL-OVERFLOW-REFUSED-INSTEAD-OF-YIELDING-INFINITY — the RANGE
 // WARNING (P54 lane `fw`).

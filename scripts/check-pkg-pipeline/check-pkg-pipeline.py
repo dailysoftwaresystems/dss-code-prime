@@ -77,6 +77,8 @@ collapses onto a sibling's refusal is an arm that proves nothing.
 
 from __future__ import annotations
 
+import importlib.util
+import os
 import re
 import sys
 from pathlib import Path
@@ -92,7 +94,52 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError, OSError):
         pass
 
-WORKFLOW = Path(".github/workflows/pipeline-pkg.yml")
+# ⚠ REPOSITORY-RELATIVE, AND RESOLVED AGAINST THE TREE THIS FILE LIVES IN -- never the
+# caller's cwd. This was `Path(".github/workflows/pipeline-pkg.yml")`, relative to
+# whatever directory the process started in. ✔MEASURED 2026-09-15 (P66): run by path
+# from inside a different repository that lacks the file, and from a directory inside
+# no repository, it reported the workflow "not found (run from the repository root)"
+# while the tree it lives in held it; by the same mechanism, from inside another
+# checkout that HAS one it pins that checkout's workflow instead. ctest pins
+# `WORKING_DIRECTORY`, so no gate saw either.
+WORKFLOW_REL = ".github/workflows/pipeline-pkg.yml"
+
+_OWNING_TREE = None
+
+
+def _owning_tree():
+    """`scripts/owning-tree/owning-tree.py` -- the one owner of "which tree is this file in?".
+
+    Loaded by path from this file's sibling directory (a hyphen is not a module name). It
+    FAILS LOUD when absent rather than falling back to a local walk: a second copy of the
+    answer is the drift that owner exists to end.
+    """
+    global _OWNING_TREE
+    if _OWNING_TREE is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                            "owning-tree", "owning-tree.py")
+        if not os.path.isfile(path):
+            raise SystemExit("check-pkg-pipeline: cannot find %s -- this guard's root is "
+                             "resolved there and nowhere else" % path)
+        spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _OWNING_TREE = mod
+    return _OWNING_TREE
+
+
+def repo_root() -> str:
+    """The tree THIS FILE lives in -- see scripts/owning-tree/owning-tree.py."""
+    ot = _owning_tree()
+    try:
+        return ot.resolve(__file__)
+    except ot.Refusal as exc:
+        raise SystemExit("check-pkg-pipeline: %s" % exc)
+
+
+def workflow_path() -> Path:
+    """The workflow this guard pins, in the tree this file lives in."""
+    return Path(repo_root()) / WORKFLOW_REL
 
 # The exact release branches the push trigger may name. Widening this set is how
 # a release would be cut from a branch nobody meant to release from.
@@ -1245,13 +1292,28 @@ def selftest(text: str) -> int:
     return failures
 
 
-def main() -> int:
-    if not WORKFLOW.is_file():
-        print(f"FAIL: {WORKFLOW.as_posix()} not found (run from the repository root).")
-        return 2
-    text = WORKFLOW.read_text(encoding="utf-8")
+def root_selftest() -> int:
+    """The workflow is read from the tree THIS FILE lives in, whatever the caller's cwd.
 
-    print(f"check-pkg-pipeline: {WORKFLOW.as_posix()}")
+    Arms, oracle and synthesized negatives are owned by scripts/owning-tree/owning-tree.py.
+    The resolver pinned is this guard's own `workflow_path()`, whose tree is three levels up.
+    """
+    failures = 0
+    for ok, why, detail in _owning_tree().root_arms(
+            lambda: str(workflow_path().parents[2]), (SystemExit,), False, __file__):
+        print(f"    {'held' if ok else 'ROOT ARM FAILED'}  {why}" + ("" if ok else f"  [{detail}]"))
+        failures += 0 if ok else 1
+    return failures
+
+
+def main() -> int:
+    workflow = workflow_path()
+    if not workflow.is_file():
+        print(f"FAIL: {WORKFLOW_REL} not found in {repo_root()}, the tree this guard lives in.")
+        return 2
+    text = workflow.read_text(encoding="utf-8")
+
+    print(f"check-pkg-pipeline: {WORKFLOW_REL}")
     print(f"  release path pinned at {len(RELEASE_PATH)} step(s) across {len(JOB_ORDER)} job(s)")
     problems = check(text)
     if problems:
@@ -1261,6 +1323,7 @@ def main() -> int:
         print("  CONTROL arm (the real, unmutated file): 0 refusals")
 
     failures = selftest(text)
+    failures += root_selftest()
     if problems or failures:
         print(f"REFUSED: {len(problems)} tree problem(s), {failures} self-test arm(s) that did not fire.")
         return 1

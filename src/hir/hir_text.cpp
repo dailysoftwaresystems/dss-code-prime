@@ -216,10 +216,13 @@ enum class HirTextExprKw : std::uint8_t {
     Lit, Ref, Call, Intrinsic, BuiltinCall, BinOp, UnOp, Member, Swizzle,
     TypeRef, Seq, Cast, Index, Construct, Ternary, LogicalAnd, LogicalOr,
     SizeOf, AlignOf, AddressOf, Deref, LabelAddr, VaStart, VaArg, VaEnd,
+    // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+    // `rmw %<old-value sym> : <type> (<target>, <update>)`.
+    Rmw,
 
     Count_  // keep last — counts the members; deliberately UNLISTED below
 };
-inline constexpr EnumNameTable<HirTextExprKw, 25> kHirTextExprKwTable{{{
+inline constexpr EnumNameTable<HirTextExprKw, 26> kHirTextExprKwTable{{{
     { HirTextExprKw::Lit,        "lit"         },
     { HirTextExprKw::Ref,        "ref"         },
     { HirTextExprKw::Call,       "call"        },
@@ -245,6 +248,7 @@ inline constexpr EnumNameTable<HirTextExprKw, 25> kHirTextExprKwTable{{{
     { HirTextExprKw::VaStart,    "va_start"    },
     { HirTextExprKw::VaArg,      "va_arg"      },
     { HirTextExprKw::VaEnd,      "va_end"      },
+    { HirTextExprKw::Rmw,        "rmw"         },
 }}};
 DSS_CHECK_ENUM_NAME_TABLE(kHirTextExprKwTable);
 DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextExprKwTable));
@@ -714,6 +718,7 @@ exprKwForKind(HirKind k) noexcept {
         case HirKind::VaStart:            return HirTextExprKw::VaStart;
         case HirKind::VaArg:              return HirTextExprKw::VaArg;
         case HirKind::VaEnd:              return HirTextExprKw::VaEnd;
+        case HirKind::ReadModifyWrite:    return HirTextExprKw::Rmw;
 
         // ── everything that is NOT written in expression position ──
         // `Error` and `Extension` are the deliberate subtlety: they DO render
@@ -765,6 +770,9 @@ exprKwForKind(HirKind k) noexcept {
         case HirKind::Ref: case HirKind::VarDecl: case HirKind::Function:
         case HirKind::Global: case HirKind::TypeDecl: case HirKind::ExternFunction:
         case HirKind::ExternGlobal:
+        // The binding its `update` reads the observed old value through — without
+        // a handle here the artifact would name a symbol its table never defines.
+        case HirKind::ReadModifyWrite:
             return true;
         default: return false;
     }
@@ -1923,6 +1931,7 @@ private:
             case HirKind::LabelAddressOf: case HirKind::VaStart:
             case HirKind::VaArg:       case HirKind::VaEnd:
             case HirKind::TypeRef:     case HirKind::CaseArm:
+            case HirKind::ReadModifyWrite:
             case HirKind::Count_:
                 report(std::format("unexpected node kind '{}' in statement position",
                                    hirKindName(hir_.kind(id))),
@@ -2298,6 +2307,12 @@ private:
             }
             case HirKind::Ref:
                 header(); out_ += std::format(" %{} : ", handleOf(hir_.payload(id))); appendType(hir_.typeId(id)); return;
+            case HirKind::ReadModifyWrite:
+                // `rmw %<old-value sym> : <type> (<target>, <update>)` — the `ref`
+                // spelling for the binding, then the two children as operands.
+                header(); out_ += std::format(" %{} : ", handleOf(hir_.payload(id)));
+                appendType(hir_.typeId(id)); out_ += ' ';
+                operands(hir_.children(id)); return;
             case HirKind::IntrinsicCall: {
                 header(); out_ += ' ';
                 std::uint32_t const p = hir_.payload(id);
@@ -4157,6 +4172,20 @@ private:
                 f.flags    = flags;
                 std::uint32_t payload = 0; (void)parseOp(payload);
                 f.payload  = payload;
+                f.type     = parseTypeAnnot();
+                f.preIdx   = idx;
+                f.attrs    = std::move(attrs);
+                return openParenOperands(stack, done, std::move(f));
+            }
+            case HirTextExprKw::Rmw: {
+                // `rmw %<sym> : <type> (<target>, <update>)` — the writer's mirror.
+                // The handle resolves through the SAME production `ref` uses, so
+                // the binding and every `ref` to it name one symbol.
+                NodeParseFrame f;
+                f.kind     = NodeParseFrame::Kind::ParenOperands;
+                f.nodeKind = HirKind::ReadModifyWrite;
+                f.flags    = flags;
+                f.payload  = parseSymHandle();
                 f.type     = parseTypeAnnot();
                 f.preIdx   = idx;
                 f.attrs    = std::move(attrs);

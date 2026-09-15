@@ -34,13 +34,16 @@
 #     2   this wrapper refused before starting (bad usage, unwritable log/marker)
 #     3   THE SOURCE TREE MOVED under the run — the verdict is not evidence
 #     4   ANOTHER RUN WAS LIVE IN THE SAME BUILD DIRECTORY — likewise not evidence
+#     5   ANOTHER LIVE RUN-GATE HOLDS THIS LOG PATH — nothing was run, and that
+#         run's log was not touched
 #     *   otherwise, the command's own exit code (127 gets its own sentence)
-#   ⚠ 3 and 4 are DELIBERATELY DIFFERENT NUMBERS. Both mean "this run has no
-#   verdict", and a reader who cannot tell which of the two fired cannot tell
-#   whether to settle the tree or wait for a sibling — two different remedies.
+#   ⚠ 3, 4 and 5 are DELIBERATELY DIFFERENT NUMBERS. Each means "this run has no
+#   verdict", and a reader who cannot tell which fired cannot pick the remedy:
+#   settle the tree, wait for a sibling, or give this gate its own log path.
 #
-# Example:
-#   scripts/run-gate/run-gate.sh /tmp/ctest.log '100% tests passed' \
+# Example — a log path that belongs to ONE tree and ONE build directory, because a
+# log path is one live run's alone (a second live run on it is refused with 5):
+#   scripts/run-gate/run-gate.sh build/dbg-ctest.log '100% tests passed' \
 #       ctest --test-dir build/dbg --output-on-failure
 set -u
 
@@ -83,7 +86,12 @@ witness="$1"; shift
 # serial `ctest` under MSYS is fine (measured), so it is allowed through — an
 # escape everything triggers would refuse nothing
 # ([[feedback-an-escape-every-row-triggers-disarms-the-guard]]).
-run_gate_preflight_exit=4
+# ⚠ EXIT 2, NOT 4. This refusal used to return 4, the number the contract above
+# reserves for "another run is live in the same build directory" — a usage refusal
+# wearing the contention code, whose remedy (wait for a sibling) is the wrong one.
+# A parallel ctest from this shell is an invocation this host cannot honour, which
+# is exactly what 2 says. D-SCRIPT-WSL-LEG-AND-RUN-GATE-LET-CONCURRENT-LEGS-SHARE-ONE-LOG-PATH
+run_gate_preflight_exit=2
 case "$(uname -s 2>/dev/null || echo unknown)" in
     MSYS*|MINGW*)
         run_gate_is_ctest=0
@@ -300,8 +308,13 @@ case "$log" in
         ;;
 esac
 
-if ! { : > "$log"; } 2>/dev/null; then
-    echo "run-gate.sh: FAIL — cannot create the log '$log', so nothing was run." >&2
+# ⓘ THE TRUNCATE ITSELF NOW HAPPENS IN THE PRE-RUN SECTION, AFTER THIS RUN HAS TAKEN
+#   THE LOG PATH'S OWNER RECORD — see "THE LOG PATH IS ONE LIVE RUN'S ALONE". Truncating
+#   here, first, is what let a second run on the same path erase a live run's log
+#   before anything could notice the path was taken. The refusal text is kept here,
+#   as a function, so both of its callers say the same thing.
+run_gate_refuse_log_path() {   # <what could not be created>
+    echo "run-gate.sh: FAIL — cannot create $1, so nothing was run." >&2
     echo "  This refusal is about the LOG PATH, not about the gate command." >&2
     echo "  shell   : $(run_gate_shell_identity)" >&2
     echo "  script  : $0" >&2
@@ -317,8 +330,7 @@ if ! { : > "$log"; } 2>/dev/null; then
     else
         echo "  Check that the parent directory exists and is writable by this shell." >&2
     fi
-    exit 2
-fi
+}
 
 # ── THE RUN'S INPUTS MUST HOLD STILL, OR ITS VERDICT IS NOT EVIDENCE ────────
 #
@@ -712,6 +724,53 @@ run_gate_self_pid() {
     fi
 }
 
+# THE WORKING DIRECTORY OF ANOTHER PROCESS, where this host lets one be read.
+# [[D-SCRIPT-RUN-GATE-RESOLVES-ANOTHER-PROCESS-RELATIVE-BUILD-DIR-AGAINST-ITS-OWN-CWD]]
+# A contender's RELATIVE build-directory token means nothing until it is joined to
+# THAT process's directory. Linux publishes it as `/proc/<pid>/cwd`; macOS answers
+# through `lsof -d cwd`, which ships with the OS; Windows does not expose another
+# process's directory at all, so there — and wherever the read fails (another user's
+# process, no lsof) — this returns 1 and the caller falls back to this shell's
+# directory AND SAYS SO in the refusal.
+# ⓘ BOTH readers are TRIED, never looked up with `command -v`, which this repository
+#   has measured lying over a non-interactive ssh session on the macOS carriage.
+# ⓘ Only an ABSOLUTE answer is accepted, so a reader that prints something else
+#   cannot become a path this shell then `cd`s into.
+run_gate_process_cwd() {   # <pid, in the table's namespace> -> prints the directory
+    run_gate_is_windows && return 1
+    _rg_pc="$(readlink "/proc/$1/cwd" 2>/dev/null)"
+    [ -n "$_rg_pc" ] || _rg_pc="$(lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+    case "$_rg_pc" in
+        /*) printf '%s' "$_rg_pc"; return 0 ;;
+    esac
+    return 1
+}
+
+# ⚠⚠ WHERE A PROCESS STANDS *NOW* IS NOT WHERE ITS RELATIVE ARGUMENTS WERE WRITTEN.
+# ✔MEASURED 2026-09-15 (P66, lane `pg`) on WSL: `( cd Y && exec ctest --test-dir bd-rel )`
+# reads `/proc/<pid>/cwd` = `Y/bd-rel` -- ctest changes INTO its test directory after it
+# parses its arguments, and `ninja -C` does the same. Joining that cwd to the token built
+# `Y/bd-rel/bd-rel`, so a contender in the SAME tree went unrefused and the gate ran its
+# test. ⇒ a relative token denotes one of TWO directories: `cwd/token` while the tool has
+# not entered it yet, or the cwd ITSELF once it has -- and the second reading is only
+# offered when the cwd's own trailing components ARE the token. A token with a `..` or `.`
+# component gets only the first reading, because a suffix comparison cannot interpret it.
+run_gate_path_ends_with() {   # <absolute dir> <relative token> -> 0 when the dir's tail IS the token
+    _rg_et="$(printf '%s' "$2" | tr '\\' '/')"
+    while :; do
+        case "$_rg_et" in
+            ./*) _rg_et="${_rg_et#./}" ;;
+            ?*/) _rg_et="${_rg_et%/}" ;;
+            *)   break ;;
+        esac
+    done
+    case "/$_rg_et/" in
+        //|*/../*|*/./*) return 1 ;;
+    esac
+    _rg_ed="$(run_gate_tidy_dir "$1")"
+    [ "${_rg_ed%"/$_rg_et"}" != "$_rg_ed" ]
+}
+
 # Candidates that name a build directory. Emitted as
 #   DIR <TAB> pid <TAB> image <TAB> raw-token <TAB> command-line
 #   UNREADABLE <TAB> pid <TAB> image
@@ -894,7 +953,26 @@ run_gate_scan_contention() {   # sets run_gate_contenders / run_gate_unreadable 
     _rg_self="$(run_gate_self_pid)"
     [ -n "$_rg_self" ] || run_gate_contention_note="ancestry: UNRESOLVED (this shell's pid was not found in the process table; nothing was excluded, and every live compiler reads as external)"
     _rg_exclude=""
+    # THIS RUN'S OWN CREATION KEY, read from the same table, for the log path's owner
+    # record — see "THE LOG PATH IS ONE LIVE RUN'S ALONE" below.
+    run_gate_self_created="$(printf '%s\n' "$_rg_tbl" | awk -F'\t' -v p="$_rg_self" '$1 == p { print $6; exit }')"
     _rg_class="$(printf '%s\n' "$_rg_tbl" | run_gate_classify_table "$_rg_self")"
+    # ⚠⚠⚠ PROCESS SUBSTITUTION, NEVER A HERE-DOCUMENT, FOR TEXT THE MACHINE SIZES.
+    # [[D-SCRIPT-RUN-GATE-PRE-RUN-SCAN-DEADLOCKS-ON-A-HERE-DOCUMENT-SIZED-BY-THE-PROCESS-TABLE]]
+    # Both loops below used to read `done <<EOF $_rg_class EOF` and `$_rg_cands`, and
+    # the size of that text is set by the MACHINE: one FOREIGN row per live `dsscp`
+    # outside this gate, each carrying that process's whole command line.
+    # ✔MEASURED 2026-09-15 (P66, lane pg), Git Bash / bash 5.3.15: a here-document
+    # body of 65422 bytes and of 65858 bytes reads fine, and a 65656-byte body
+    # DEADLOCKS the shell that expands it — bash decides the document fits in a pipe,
+    # writes it into one whose MSYS capacity is smaller, and blocks on its own write
+    # with nobody left to read. Idle, no CPU, forever. WSL's bash 5.2.21 reads every
+    # size. ✔REPRODUCED END TO END with this file, its process table shimmed to 60
+    # foreign rows: ~65340 and ~65820 bytes completed in ~1.4 s, ~65580 bytes WEDGED
+    # with a 0-byte log and 0.05 CPU-s — the signature of the `run_gate_guard` arm
+    # that sat idle for 876 s in a busy MSVC gate with its log truncated and empty.
+    # ⇒ `< <(printf …)`: the writer is a separate process, so the pipe drains while it
+    # fills, at ANY size (✔MEASURED at 65656, 66197 and 1010101 bytes on the same host).
     while IFS="$run_gate_tab" read -r _rg_kind _rg_f1 _rg_f2 _rg_f3; do
         case "$_rg_kind" in
             EXCLUDE)  _rg_exclude="$_rg_f1" ;;
@@ -903,31 +981,48 @@ run_gate_scan_contention() {   # sets run_gate_contenders / run_gate_unreadable 
             FOREIGN)  run_gate_foreign="${run_gate_foreign}${_rg_f1}${run_gate_tab}${_rg_f2}${run_gate_tab}${_rg_f3}${run_gate_nl}" ;;
             RECYCLED) run_gate_recycled="${run_gate_recycled}${_rg_f1}>${_rg_f2}${run_gate_nl}" ;;
         esac
-    done <<EOF
-$_rg_class
-EOF
+    done < <(printf '%s\n' "$_rg_class")
 
     [ -n "$run_gate_build_dir" ] || return 0
 
     _rg_cands="$(printf '%s\n' "$_rg_tbl" | run_gate_candidates_from_table)"
     run_gate_unreadable="$(printf '%s\n' "$_rg_cands" | grep -c '^UNREADABLE' || true)"
-    while IFS='	' read -r _rg_kind _rg_pid _rg_img _rg_raw _rg_cl; do
+    while IFS="$run_gate_tab" read -r _rg_kind _rg_pid _rg_img _rg_raw _rg_cl; do
         [ "${_rg_kind:-}" = "DIR" ] || continue
         case " $_rg_exclude " in *" $_rg_pid "*) continue ;; esac
-        [ "$(run_gate_resolve_dir "$_rg_raw")" = "$run_gate_build_dir" ] || continue
-        # Whether the RESOLUTION was an assumption is recorded per match, so the
-        # refusal only makes that caveat when it actually applies — a message
-        # that outruns its evidence is the shape this whole file is about.
+        # ★★ A RELATIVE SPELLING IS RELATIVE TO *THAT* PROCESS'S DIRECTORY, AND THIS
+        # HOST MAY BE ABLE TO READ IT. [[D-SCRIPT-RUN-GATE-RESOLVES-ANOTHER-PROCESS-RELATIVE-BUILD-DIR-AGAINST-ITS-OWN-CWD]]
+        # ✔MEASURED 2026-09-15 (P66, lane pg) on WSL: a leg in one clone was refused
+        # exit 4 because a leg in ANOTHER clone ran `ctest --test-dir build/dbg`, and
+        # this loop resolved that token against THIS shell's directory — so two clones
+        # contended over a directory neither shared. Where the other process's working
+        # directory IS readable (`run_gate_process_cwd`) the token is joined to it;
+        # only where it is not is this shell's directory assumed, and then the refusal
+        # SAYS so. Whether the resolution was an assumption is recorded per match, so
+        # the caveat is made only when it actually applies.
+        _rg_assumed=0
         case "$(printf '%s' "$_rg_raw" | tr '\\' '/')" in
-            /*|[A-Za-z]:/*) ;;
-            *) run_gate_relative_match=1 ;;
+            /*|[A-Za-z]:/*) _rg_at="$(run_gate_resolve_dir "$_rg_raw")" ;;
+            *)
+                if _rg_pcwd="$(run_gate_process_cwd "$_rg_pid")"; then
+                    # TWO READINGS -- see run_gate_path_ends_with: the tool has not entered
+                    # the directory it named yet, or it already has and stands in it.
+                    _rg_at="$(run_gate_resolve_dir "$_rg_pcwd/$_rg_raw")"
+                    if [ "$_rg_at" != "$run_gate_build_dir" ] && run_gate_path_ends_with "$_rg_pcwd" "$_rg_raw"; then
+                        _rg_at="$(run_gate_resolve_dir "$_rg_pcwd")"
+                    fi
+                else
+                    _rg_at="$(run_gate_resolve_dir "$_rg_raw")"
+                    _rg_assumed=1
+                fi
+                ;;
         esac
+        [ "$_rg_at" = "$run_gate_build_dir" ] || continue
+        [ "$_rg_assumed" -eq 1 ] && run_gate_relative_match=1
         run_gate_contenders="${run_gate_contenders}      pid ${_rg_pid}  ${_rg_img}  named it as '${_rg_raw}'
         ${_rg_cl}
 "
-    done <<EOF
-$_rg_cands
-EOF
+    done < <(printf '%s\n' "$_rg_cands")
 }
 
 # ★★★ THE MACHINE-WIDE SUBJECT IS SAMPLED TWICE, AND THE LINE REPORTS BOTH.
@@ -1027,11 +1122,12 @@ run_gate_refuse_contention() {   # <when>
     echo "    directory rewrite each other's binaries and test artefacts mid-run: ✔MEASURED, a" >&2
     echo "    2100/2101 with ONE red that passed on a re-run in isolation." >&2
     if [ "$run_gate_relative_match" -eq 1 ]; then
-        echo "  ⓘ At least one spelling above is RELATIVE, and this guard resolved it against THIS" >&2
-        echo "    shell's working directory ($(pwd -P)) — a process's own working" >&2
-        echo "    directory is not readable from outside on Windows. If that process is really" >&2
-        echo "    standing in a DIFFERENT tree, this is a false refusal; read the command line" >&2
-        echo "    printed above before assuming it is not." >&2
+        echo "  ⓘ At least one spelling above is RELATIVE and THAT process's own working directory" >&2
+        echo "    could not be read here (Windows does not expose it; on Linux and macOS it is read" >&2
+        echo "    from /proc or lsof, so reaching this sentence there means that read failed), so" >&2
+        echo "    this guard resolved it against THIS shell's working directory ($(pwd -P))." >&2
+        echo "    If that process is really standing in a DIFFERENT tree, this is a false refusal;" >&2
+        echo "    read the command line printed above before assuming it is not." >&2
     fi
     echo "  Wait for the other run to finish, or point this gate at its own build directory." >&2
     echo "  (log: $log)" >&2
@@ -1215,15 +1311,222 @@ run_gate_cksum_works() {
 #   N <path>                the stamp order — differenced against its own pre-run
 #                           reading, so a future stamp that predates the run
 #                           cancels instead of refusing it
+#   U <witness> <path>      a CHANGE WITNESS the file system keeps and user space
+#                           cannot put back — see the block below
+# ⓘ The owner record of the log path (`<log>.run-gate-*`) is bookkeeping too, and is
+#   excluded for the same reason as `<log>.inputs-*`.
 run_gate_snapshot_inputs() {
-    run_gate_abs_input_roots | while IFS= read -r _rg_root; do
-        [ -n "$_rg_root" ] || continue
-        [ -d "$_rg_root" ] || continue
-        find "$_rg_root" -type f ! -name "$run_gate_bookkeeping_glob" \
-            -exec cksum {} + 2>/dev/null | sed 's/^/C /'
-        find "$_rg_root" -type f ! -name "$run_gate_bookkeeping_glob" \
-            -newer "$run_gate_marker" -print 2>/dev/null | sed 's/^/N /'
-    done | LC_ALL=C sort
+    {
+        run_gate_abs_input_roots | while IFS= read -r _rg_root; do
+            [ -n "$_rg_root" ] || continue
+            [ -d "$_rg_root" ] || continue
+            find "$_rg_root" -type f ! -name "$run_gate_bookkeeping_glob" ! -name "$run_gate_owner_glob" \
+                -exec cksum {} + 2>/dev/null | sed 's/^/C /'
+            find "$_rg_root" -type f ! -name "$run_gate_bookkeeping_glob" ! -name "$run_gate_owner_glob" \
+                -newer "$run_gate_marker" -print 2>/dev/null | sed 's/^/N /'
+        done
+        run_gate_change_witness_lines
+    } | LC_ALL=C sort
+}
+
+# ══ A FILE CHANGED AND PUT BACK MID-RUN IS STILL A MOVED TREE ═══════════════════
+# [[D-SCRIPT-RUN-GATE-INPUTS-HELD-STILL-OVER-A-FILE-CHANGED-AND-RESTORED-MID-RUN]]
+#
+# ★★★ `C` AND `N` COMPARE THE TREE AT THE TWO ENDS OF THE RUN, AND A TEST READS IT IN
+# THE MIDDLE. A file changed after the first snapshot and restored before the second
+# carries its old bytes (C sees nothing) and, when the restore also restores its
+# timestamp, an mtime older than the marker (N sees nothing) — while every test that
+# read it in between saw the changed bytes.
+# ✔MEASURED 2026-09-15 (P66, lane `pg`), both twins, a gated command that read a
+# watched file, let it be changed, READ THE CHANGED BYTES, and let it be restored:
+#     restored by a plain rewrite ........... exit 3 (N saw the new mtime)
+#     restored by `cp -p` ................... exit 0, `inputs  : held still`
+#     restored by PowerShell `Copy-Item` .... exit 0, `inputs  : held still`
+#     rewritten, then `touch -r` ............ exit 0, `inputs  : held still`
+# `Copy-Item` from a scratch copy is exactly the undo this repository prescribes to a
+# lane that corrupts its own file, and the red-on-disable workflow restores that way.
+#
+# ★★ SO A THIRD HALF, `U`, COMPARES A VALUE THE FILE SYSTEM ADVANCES ON EVERY CHANGE
+# AND NO USER-SPACE WRITE CAN SET BACK — by EQUALITY, like `C`, never by order.
+#   · POSIX: the status-change time (ctime). `utimes` cannot set it; ✔MEASURED on WSL
+#     ext4, a `cp -p` restore and a rewrite + `touch -r` both moved it, and `cat`,
+#     `cksum` and `find` did not.
+#   · Windows: NOT ctime. ✔MEASURED on NTFS: `Copy-Item` puts ChangeTime BACK to the
+#     source copy's value, which MSYS reports as ctime — so the twin that trusted ctime
+#     here would still say `held still` over the prescribed restore. The file's USN
+#     (FSCTL_READ_FILE_USN_DATA) is what NTFS advances on every change: ✔MEASURED
+#     unelevated, unchanged by reads, moved by that very Copy-Item, 1753 files in
+#     ~0.24 s. It is read by a PowerShell helper, because no MSYS tool reads it.
+# ⚠ WHAT IT DELIBERATELY DOES NOT CHANGE: a tree nobody touched keeps every witness,
+#   so it still reads `held still`; a file rewritten BEFORE the run carries the same
+#   witness in both snapshots and cancels, exactly as `N` already cancels a stamp that
+#   predates the run. A write DURING the run that leaves the bytes identical was
+#   already `MOVED` through `N` (✔MEASURED, both twins) and stays so: an identical
+#   rewrite truncates first, and a reader inside that window sees a torn file.
+# ⚠ WHEN THE WITNESS CANNOT BE READ the run is NOT refused — `C` and `N` still stand —
+#   and the footer's `changes :` line says NOT WATCHED and why, on every such run. A
+#   refusal here would fail every gate on a host without perl or a USN journal.
+
+# The perl program for POSIX: walks the roots itself (File::Find, core), skips this
+# run's bookkeeping, prints `U <ctime> <path>`, and ends with a sentinel so a walk
+# that died cannot pass for an empty tree. Arguments: the bookkeeping name prefixes,
+# `--`, then the roots.
+# ⓘ THE SAME TEXT IS THE .ps1 TWIN'S (`$script:RunGateCtimeWalker`), which hands it to
+#   perl on a POSIX host. It carries NO quote characters (`q{}`/`qq{}` instead) because
+#   PowerShell's native-argument quoting has differed across versions, and a program that
+#   contains no quotes cannot be re-quoted wrongly.
+run_gate_ctime_walker='use strict; use File::Find (); use Time::HiRes ();
+my @pre; while (@ARGV && $ARGV[0] ne q{--}) { push @pre, shift @ARGV } shift @ARGV;
+my $n = 0;
+for my $root (@ARGV) {
+    next unless -d $root;
+    File::Find::find({ no_chdir => 1, wanted => sub {
+        my $p = $File::Find::name;
+        return unless -f $p && ! -l $p;
+        (my $b = $p) =~ s{.*/}{};
+        for my $x (@pre) { return if index($b, $x) == 0 }
+        my @s = Time::HiRes::stat($p);
+        return unless @s;
+        print qq{U $s[10] $p\n}; $n++;
+    } }, $root);
+}
+print qq{CTIME-OK $n\n};'
+
+# The PowerShell program for Windows, sent as -EncodedCommand so no quoting and no
+# MSYS argument conversion can touch it. Variables $roots/$prefixes/$marker are
+# prepended per run. Prints `U <usn> <path>`, then the marker's own USN, the count of
+# files reporting USN 0 (a volume with no change journal), and a sentinel.
+run_gate_usn_program='$ErrorActionPreference = "Stop"
+try {
+    if (-not ("RunGate.FileUsn" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+namespace RunGate {
+    public static class FileUsn {
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool DeviceIoControl(SafeFileHandle h, uint code, IntPtr inBuf, uint inSize, byte[] outBuf, uint outSize, out uint returned, IntPtr overlapped);
+        public static string Of(string path) {
+            using (SafeFileHandle h = CreateFileW(path, 0x80, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+                if (h.IsInvalid) { return "unreadable"; }
+                byte[] buf = new byte[1024]; uint got;
+                if (!DeviceIoControl(h, 0x000900eb, IntPtr.Zero, 0, buf, (uint)buf.Length, out got, IntPtr.Zero)) { return "unreadable"; }
+                ushort major = BitConverter.ToUInt16(buf, 4);
+                return (major >= 3 ? BitConverter.ToInt64(buf, 40) : BitConverter.ToInt64(buf, 24)).ToString();
+            }
+        }
+    }
+}
+"@
+    }
+    $zero = 0
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        foreach ($f in (Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+            $skip = $false
+            foreach ($x in $prefixes) { if ($f.Name.StartsWith($x)) { $skip = $true } }
+            if ($skip) { continue }
+            $u = [RunGate.FileUsn]::Of($f.FullName)
+            if ($u -eq "0") { $zero++ }
+            "U " + $u + " " + ($f.FullName -replace "\\", "/")
+        }
+    }
+    "USN-MARKER " + [RunGate.FileUsn]::Of($marker)
+    "USN-ZERO " + $zero
+    "USN-OK"
+} catch {
+    "USN-FAILED " + ($_.Exception.Message -replace "[\r\n]", " ")
+}'
+
+run_gate_change_witness=none
+run_gate_change_why=""
+run_gate_change_state=unavailable
+run_gate_usn_shell=""
+run_gate_usn_encoded=""
+
+# Decides, once, which witness this host can read. Run after the marker exists.
+run_gate_decide_change_witness() {
+    run_gate_change_witness=none
+    if run_gate_is_windows; then
+        for _rg_c in powershell pwsh; do
+            if command -v "$_rg_c" >/dev/null 2>&1; then run_gate_usn_shell="$_rg_c"; break; fi
+        done
+        if [ -z "$run_gate_usn_shell" ]; then
+            run_gate_change_why="no PowerShell was found to read NTFS USNs with"
+            return
+        fi
+        _rg_q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"; }
+        _rg_pr=""
+        while IFS= read -r _rg_r; do
+            [ -n "$_rg_r" ] && _rg_pr="${_rg_pr}$(_rg_q "$_rg_r"),"
+        done < <(run_gate_abs_input_roots)
+        _rg_pm="$(cygpath -m "$run_gate_marker" 2>/dev/null || printf '%s' "$run_gate_marker")"
+        _rg_script="\$roots = @(${_rg_pr%,})
+\$prefixes = @($(_rg_q "${log##*/}.inputs-"),$(_rg_q "${log##*/}.run-gate-"))
+\$marker = $(_rg_q "$_rg_pm")
+$run_gate_usn_program"
+        if ! run_gate_usn_encoded="$(printf '%s' "$_rg_script" | iconv -f UTF-8 -t UTF-16LE 2>/dev/null | base64 2>/dev/null | tr -d '\n')" \
+           || [ -z "$run_gate_usn_encoded" ]; then
+            run_gate_change_why="the USN reader could not be encoded for PowerShell (iconv/base64 failed)"
+            return
+        fi
+        run_gate_change_witness=usn
+    else
+        if [ "$(perl -MTime::HiRes -e 'my @s = Time::HiRes::stat($ARGV[0]); print((@s && $s[10] > 0) ? "ok" : "no")' "$run_gate_marker" 2>/dev/null)" != ok ]; then
+            run_gate_change_why="perl with Time::HiRes did not return a status-change time for a file this run had just created"
+            return
+        fi
+        run_gate_change_witness=ctime
+    fi
+}
+
+run_gate_change_witness_lines() {
+    case "$run_gate_change_witness" in
+        ctime)
+            _rg_wr=()
+            while IFS= read -r _rg_r; do
+                [ -n "$_rg_r" ] && _rg_wr+=("$_rg_r")
+            done < <(run_gate_abs_input_roots)
+            perl -e "$run_gate_ctime_walker" "${log##*/}.inputs-" "${log##*/}.run-gate-" -- "${_rg_wr[@]}" 2>/dev/null
+            ;;
+        usn)
+            "$run_gate_usn_shell" -NoProfile -NonInteractive -EncodedCommand "$run_gate_usn_encoded" 2>/dev/null | tr -d '\r'
+            ;;
+    esac
+    return 0
+}
+
+# Reads the two finished snapshots IN THE MAIN SHELL (see the note on
+# run_gate_diff_inputs) and decides whether the U half may be believed.
+run_gate_judge_change_witness() {
+    run_gate_change_state=unavailable
+    case "$run_gate_change_witness" in
+        ctime)
+            if grep -q '^CTIME-OK ' "$run_gate_inputs_before" && grep -q '^CTIME-OK ' "$run_gate_inputs_after"; then
+                run_gate_change_state=watched
+            else
+                run_gate_change_why="the perl ctime walk did not complete in both snapshots"
+            fi
+            ;;
+        usn)
+            _rg_m1="$(sed -n 's/^USN-MARKER //p' "$run_gate_inputs_before" | head -1)"
+            _rg_z1="$(sed -n 's/^USN-ZERO //p' "$run_gate_inputs_before" | head -1)"
+            _rg_z2="$(sed -n 's/^USN-ZERO //p' "$run_gate_inputs_after" | head -1)"
+            if ! grep -q '^USN-OK$' "$run_gate_inputs_before" || ! grep -q '^USN-OK$' "$run_gate_inputs_after"; then
+                run_gate_change_why="the USN reader did not complete in both snapshots ($(sed -n 's/^USN-FAILED //p' "$run_gate_inputs_before" "$run_gate_inputs_after" | head -1))"
+            elif [ -z "$_rg_m1" ] || [ "$_rg_m1" = 0 ] || [ "$_rg_m1" = unreadable ]; then
+                run_gate_change_why="the log's own volume returned no USN for this run's marker (no change journal?)"
+            elif [ "${_rg_z1:-0}" != 0 ] || [ "${_rg_z2:-0}" != 0 ]; then
+                run_gate_change_why="${_rg_z1:-?} file(s) under the watched roots report USN 0, i.e. their volume keeps no change journal"
+            else
+                run_gate_change_state=watched
+            fi
+            ;;
+        *) : ;;
+    esac
 }
 
 # THE DIFF ALONE, over two snapshot files the caller has already proved exist.
@@ -1235,13 +1538,220 @@ run_gate_snapshot_inputs() {
 # this whole block exists to be unable to give. ⓘ The scan this replaced had the
 # same shape (`[ -f "$run_gate_marker" ] || return 1`): a marker that vanished
 # mid-run read as a still tree. Both doors are closed by deciding it out here.
+# ⓘ ONLY THE THREE HALVES ARE DIFFERENCED. The witness readers' sentinel lines
+#   (`CTIME-OK`, `USN-*`) are judged by run_gate_judge_change_witness, never reported
+#   as moved files; and the `U` half is believed only when that judge said `watched`.
 run_gate_diff_inputs() {
     {
         LC_ALL=C comm -23 "$run_gate_inputs_before" "$run_gate_inputs_after"
         LC_ALL=C comm -13 "$run_gate_inputs_before" "$run_gate_inputs_after"
-    } 2>/dev/null | sed -e 's/^C [0-9][0-9]* [0-9][0-9]* //' -e 's/^N //' \
+    } 2>/dev/null | grep -E '^[CNU] ' \
+      | if [ "$run_gate_change_state" = watched ]; then cat; else grep -v '^U '; fi \
+      | sed -e 's/^C [0-9][0-9]* [0-9][0-9]* //' -e 's/^N //' -e 's/^U [^ ][^ ]* //' \
       | LC_ALL=C sort -u | head -20
 }
+# ══ THE LOG PATH IS ONE LIVE RUN'S ALONE ══════════════════════════════════════
+# [[D-SCRIPT-WSL-LEG-AND-RUN-GATE-LET-CONCURRENT-LEGS-SHARE-ONE-LOG-PATH]]
+#
+# ★★★ THE SIXTH WAY A GATE'S EXIT CODE CAN MEAN NOTHING, AND IT NEEDS NO DEFECT IN
+# THE GATE COMMAND: two runs handed ONE LOG PATH. This file truncates its log,
+# appends the command's output to it, greps it for the witness and keeps its state
+# files beside it (`<log>.inputs-*`), so a second run on the same path erases the
+# first's evidence, interleaves both commands' output, and deletes the first's
+# fingerprints when it cleans up after itself.
+# ✔MEASURED 2026-09-15 (P66, lane `pg`), a live first run whose command printed NO
+#   witness and a second run on the same path whose command printed one:
+#     .sh then .sh    first run exit 3 (its `.inputs-before` deleted by the second
+#                     run's cleanup); second run exit 0 OK over a log a live run was
+#                     writing; the first run's own output ERASED from the log
+#     .sh then .ps1   both exit 1, and NEITHER run's output survived in the log
+#     .ps1 then either  second run exit 2: the .ps1 twin's open log handle refused it
+#                     by accident, and in one direction only
+#   and on two REAL `wsl-leg.sh` runs in two clones sharing `/tmp/wsl-leg-ctest.log`,
+#   a leg reported `WSL leg OK` over a log naming the OTHER clone's build directory.
+# ⇒ exit 5, with nothing touched: this run takes the path's OWNER RECORD
+#   (`<log>.run-gate-owner`) by EXCLUSIVE CREATE before it truncates anything, and
+#   refuses to start while another LIVE run-gate holds it. Both twins write and honour
+#   the same record, so a .sh run and a .ps1 run on one path exclude each other too.
+#
+# ★★ "LIVE" IS DECIDED BY THE PROCESS TABLE, BY THE RULE THIS FILE ALREADY TRUSTS.
+#   The record names the holder's pid IN THE TABLE'S NAMESPACE and its creation key —
+#   the key "A PARENT LINK IS A CLAIM ABOUT ORDER" compares. The holder is gone only
+#   when a FRESH table lacks that pid, or shows it with a DIFFERENT creation key (a
+#   recycled pid); only then is the record reclaimed. Every other state REFUSES: an
+#   unreadable table, a record written in another pid namespace (a WSL run and a
+#   Windows run share `/mnt/c`, and ✔MEASURED even `uname -n`), a record that is
+#   empty or half-written. A refusal that should not have fired costs a retry; a
+#   reclaim that should not have happened is the silent trade this block ends.
+# ★★ A RECLAIM IS ITSELF A RACE, MADE ATOMIC BY A HARD LINK. Two runs that both judge
+#   one dead record stale must not both delete-and-create. A reclaimer first LINKS the
+#   record to a tombstone named for the dead holder's token — `ln` fails when that name
+#   exists, so exactly one reclaimer wins — and re-reads the tombstone's token before
+#   deleting anything, so a record replaced in between is never taken for the one judged.
+# ⓘ NO ESCAPE HATCH: the path is the caller's own argument, so "use another log path"
+#   is always available and nothing here is settable.
+# ⓘ A run killed by SIGKILL or TerminateProcess leaves its record behind (no EXIT trap
+#   runs then); the liveness rule reclaims it on the next run, and the footer says so.
+run_gate_log_held_exit=5
+run_gate_owner="${log}.run-gate-owner"
+run_gate_owner_glob="${log##*/}.run-gate-*"
+run_gate_owner_token=""
+run_gate_owner_held=0
+run_gate_owner_reclaimed=""
+run_gate_owner_verdict=""
+run_gate_owner_why=""
+run_gate_owner_holder=""
+run_gate_owner_stale_token=""
+run_gate_self_table_pid=""
+run_gate_ns=""
+
+# THIS SHELL'S PID NAMESPACE, spelled exactly as the .ps1 twin spells it: the OS
+# family, the host name lowercased, and on Linux the pid namespace's own inode, because
+# two WSL distros share a host name and a `/mnt/c` but not a process table.
+run_gate_namespace() {
+    _rg_nh=""; _rg_nn=""
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        MINGW*|MSYS*|CYGWIN*) _rg_nk=windows; _rg_nh="${COMPUTERNAME:-$(uname -n 2>/dev/null)}" ;;
+        Linux)                _rg_nk=linux;   _rg_nh="$(uname -n 2>/dev/null)"; _rg_nn="$(readlink /proc/self/ns/pid 2>/dev/null)" ;;
+        Darwin)               _rg_nk=darwin;  _rg_nh="$(uname -n 2>/dev/null)" ;;
+        *)                    _rg_nk="$(uname -s 2>/dev/null | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"; _rg_nh="$(uname -n 2>/dev/null)" ;;
+    esac
+    printf '%s:%s:%s' "$_rg_nk" "$(printf '%s' "$_rg_nh" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')" "$_rg_nn"
+}
+
+run_gate_owner_field() {   # <record file> <key>
+    sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1 | tr -d '\r'
+}
+
+# Sets run_gate_owner_verdict to held | unknown | stale, with run_gate_owner_why and
+# run_gate_owner_holder for the message. Only `stale` may lead to a reclaim.
+run_gate_judge_owner() {
+    run_gate_owner_verdict=held
+    run_gate_owner_stale_token=""
+    _rg_ot="$(run_gate_owner_field "$run_gate_owner" token)"
+    _rg_op="$(run_gate_owner_field "$run_gate_owner" pid)"
+    _rg_oc="$(run_gate_owner_field "$run_gate_owner" created)"
+    _rg_on="$(run_gate_owner_field "$run_gate_owner" namespace)"
+    run_gate_owner_holder="pid ${_rg_op:-?} ($(run_gate_owner_field "$run_gate_owner" shell)), running: $(run_gate_owner_field "$run_gate_owner" command)"
+    case "$_rg_ot" in
+        ''|*[!A-Za-z0-9-]*)
+            run_gate_owner_why="its owner record is empty, half-written or unreadable -- another run-gate may be writing it this instant, or one died while writing it"
+            return ;;
+    esac
+    case "$_rg_op" in
+        ''|*[!0-9]*)
+            run_gate_owner_why="its owner record names no usable pid"
+            return ;;
+    esac
+    if [ "$_rg_on" != "$run_gate_ns" ]; then
+        run_gate_owner_verdict=unknown
+        run_gate_owner_why="the record was written in pid namespace '$_rg_on' and this shell runs in '$run_gate_ns', whose process table cannot see that holder"
+        return
+    fi
+    _rg_otbl="$(run_gate_process_table)"
+    if [ -z "$_rg_otbl" ]; then
+        run_gate_owner_verdict=unknown
+        run_gate_owner_why="no process table could be read on this host, so the holder could not be shown to be gone"
+        return
+    fi
+    _rg_ocur="$(printf '%s\n' "$_rg_otbl" | awk -F'\t' -v p="$_rg_op" '$1 == p { print "L" $6; f = 1; exit } END { if (!f) print "A" }')"
+    if [ "$_rg_ocur" = A ]; then
+        run_gate_owner_verdict=stale
+        run_gate_owner_why="pid $_rg_op is not alive"
+    elif [ "$_rg_op" = "$run_gate_self_table_pid" ]; then
+        run_gate_owner_verdict=stale
+        run_gate_owner_why="pid $_rg_op is THIS run, so the holder it named is gone and its pid was reused"
+    else
+        _rg_ocur="${_rg_ocur#L}"
+        if printf '%s' "$_rg_oc" | grep -qE '^[0-9]{20}$' \
+           && printf '%s' "$_rg_ocur" | grep -qE '^[0-9]{20}$' \
+           && [ "$_rg_oc" != "$_rg_ocur" ]; then
+            run_gate_owner_verdict=stale
+            run_gate_owner_why="pid $_rg_op is alive but was created at $_rg_ocur, not at $_rg_oc -- a RECYCLED pid, not the holder"
+        else
+            run_gate_owner_why="pid $_rg_op is alive${_rg_ocur:+ (created $_rg_ocur)}"
+            return
+        fi
+    fi
+    run_gate_owner_stale_token="$_rg_ot"
+}
+
+# 0 when the record judged stale is gone; 1 when a sibling moved first, the record was
+# replaced in between, or no hard link could be made beside the log.
+run_gate_reclaim_owner() {
+    _rg_tomb="${log}.run-gate-stale-$run_gate_owner_stale_token"
+    ln "$run_gate_owner" "$_rg_tomb" 2>/dev/null || return 1
+    if [ "$(run_gate_owner_field "$_rg_tomb" token)" != "$run_gate_owner_stale_token" ]; then
+        rm -f "$_rg_tomb"
+        return 1
+    fi
+    rm -f "$run_gate_owner"
+    rm -f "$_rg_tomb"
+    return 0
+}
+
+# 0 the record is this run's | 5 another live run-gate holds the path | 2 not creatable
+run_gate_acquire_log() {   # <the gate command's argv>
+    run_gate_self_table_pid="$(run_gate_self_pid)"
+    run_gate_owner_token="$$-$(date +%s 2>/dev/null || echo 0)-$RANDOM$RANDOM"
+    _rg_body="run-gate-owner-record: while this file exists a LIVE run-gate holds the log path beside it
+token=$run_gate_owner_token
+pid=$run_gate_self_table_pid
+created=$run_gate_self_created
+namespace=$run_gate_ns
+shell=run-gate.sh
+command=$(printf '%s' "$*" | tr '\r\n' '  ')
+"
+    _rg_try=0
+    _rg_reclaim_failed=0
+    while [ "$_rg_try" -lt 5 ]; do
+        _rg_try=$((_rg_try + 1))
+        # `set -C` is an EXCLUSIVE create (O_EXCL; ✔MEASURED to refuse an existing file
+        # under Git Bash too), so of two runs racing for a free path exactly one wins.
+        if ( set -C; printf '%s' "$_rg_body" > "$run_gate_owner" ) 2>/dev/null; then
+            run_gate_owner_held=1
+            return 0
+        fi
+        [ -e "$run_gate_owner" ] || continue
+        run_gate_judge_owner
+        [ "$run_gate_owner_verdict" = stale ] || return 5
+        if run_gate_reclaim_owner; then
+            run_gate_owner_reclaimed="$run_gate_owner_holder -- $run_gate_owner_why"
+        else
+            _rg_reclaim_failed=1
+        fi
+    done
+    [ -e "$run_gate_owner" ] || return 2
+    if [ "$_rg_reclaim_failed" -eq 1 ]; then
+        run_gate_owner_why="$run_gate_owner_why; and the stale record could not be reclaimed (no hard link could be made beside the log, or a sibling kept replacing it)"
+    fi
+    return 5
+}
+
+# Runs from the EXIT trap. Removes the record only while it is still this run's.
+run_gate_release_log() {
+    [ "$run_gate_owner_held" -eq 1 ] || return 0
+    if [ "$(run_gate_owner_field "$run_gate_owner" token)" = "$run_gate_owner_token" ]; then
+        rm -f "$run_gate_owner"
+    fi
+    run_gate_owner_held=0
+}
+
+run_gate_refuse_log_held() {
+    echo "run-gate.sh: FAIL — ANOTHER LIVE RUN-GATE HOLDS THIS LOG PATH, so nothing was run and its log was not touched (rc=$run_gate_log_held_exit)." >&2
+    echo "  log     : $log" >&2
+    echo "  record  : $run_gate_owner" >&2
+    echo "  holder  : $run_gate_owner_holder" >&2
+    echo "  judged  : $run_gate_owner_why" >&2
+    echo "  ⚠ This is NOT 'the gate failed'. Two runs on one log path truncate and interleave each" >&2
+    echo "    other's output and delete each other's fingerprints, and a witness grep can then find" >&2
+    echo "    the OTHER run's success line. ✔MEASURED: a leg reported OK over a log that named" >&2
+    echo "    another clone's build directory." >&2
+    echo "  Give this gate its own log path, or wait for that run to finish. If you are CERTAIN" >&2
+    echo "    nothing uses this path (for instance the holder ran in another OS namespace and is" >&2
+    echo "    gone), delete the record by hand: $run_gate_owner" >&2
+}
+
 # ── PRE-RUN: refuse a contended build directory BEFORE anything starts ──────
 # ⚠ Placed AHEAD of the input marker deliberately, so a refusal here leaves no
 # marker file behind for the next run to trip over.
@@ -1256,6 +1766,31 @@ if run_gate_raw_build_dir="$(run_gate_dir_named_by_argv "$@")"; then
 fi
 run_gate_decide_input_roots
 run_gate_sample_contention before
+
+# ── THE LOG PATH IS TAKEN BEFORE ONE BYTE OF IT IS TOUCHED ──────────────────
+# After the pre-run sample, so the record carries this run's creation key from the
+# table that sample just read; before the truncate, so a refused run erases nothing.
+run_gate_ns="$(run_gate_namespace)"
+run_gate_acquire_log "$@"
+case "$?" in
+    0) trap run_gate_release_log EXIT ;;
+    5) run_gate_refuse_log_held; exit "$run_gate_log_held_exit" ;;
+    *) run_gate_refuse_log_path "the log's owner record '$run_gate_owner'"; exit 2 ;;
+esac
+
+# Truncate rather than append: a stale log from a previous run is itself a way
+# to "find" a success witness that this invocation never produced.
+# ⚠ `{ …; } 2>/dev/null` and NOT `: > "$log" 2>/dev/null`. Redirections are set up
+# LEFT TO RIGHT, so in the second form the failing `>` reports to the ORIGINAL
+# stderr before `2>` is ever established — ✔MEASURED: bash's raw
+# `line NNN: C:/…: No such file or directory` printed AHEAD of the named refusal,
+# which is the anonymous noise the refusal exists to replace. The group form
+# establishes the group's stderr first, so only our sentence survives.
+if ! { : > "$log"; } 2>/dev/null; then
+    run_gate_refuse_log_path "the log '$log'"
+    exit 2
+fi
+
 if [ -n "$run_gate_contenders" ]; then
     {
         echo "--- run-gate.sh ---"
@@ -1292,6 +1827,11 @@ if ! run_gate_cksum_works; then
     rm -f "$run_gate_marker"
     exit 2
 fi
+
+# Which change witness this host can read — see "A FILE CHANGED AND PUT BACK MID-RUN
+# IS STILL A MOVED TREE". Decided once, before the first snapshot, so both snapshots
+# carry the same halves.
+run_gate_decide_change_witness
 
 if ! run_gate_snapshot_inputs > "$run_gate_inputs_before" 2>/dev/null \
    || [ ! -f "$run_gate_inputs_before" ]; then
@@ -1331,7 +1871,11 @@ elif [ ! -f "$run_gate_inputs_after" ]; then
     run_gate_snapshot_ok=0
 fi
 run_gate_moved=""
-[ "$run_gate_snapshot_ok" -eq 1 ] && run_gate_moved="$(run_gate_diff_inputs)"
+if [ "$run_gate_snapshot_ok" -eq 1 ]; then
+    # IN THE MAIN SHELL, before the diff reads it — see run_gate_diff_inputs.
+    run_gate_judge_change_witness
+    run_gate_moved="$(run_gate_diff_inputs)"
+fi
 rm -f "$run_gate_marker" "$run_gate_inputs_before" "$run_gate_inputs_after"
 
 # ── POST-RUN: a sibling can start MID-RUN, so the same question is asked again ──
@@ -1349,6 +1893,18 @@ run_gate_sample_contention after
     else
         echo "inputs  : held still"
     fi
+    # ★★ WHETHER `held still` COVERS THE MIDDLE OF THE RUN, ON EVERY RUN — see "A FILE
+    # CHANGED AND PUT BACK MID-RUN IS STILL A MOVED TREE". Two states, and the second is
+    # not spelled as a pass: a reader who skims for `held still` must still land on a
+    # line that says what the two ends could not see.
+    if [ "$run_gate_change_state" = watched ]; then
+        case "$run_gate_change_witness" in
+            usn) echo "changes : watched through every file's NTFS USN — a change undone before the run ended is still seen" ;;
+            *)   echo "changes : watched through every file's status-change time (ctime) — a change undone before the run ended is still seen" ;;
+        esac
+    else
+        echo "changes : NOT WATCHED MID-RUN — ${run_gate_change_why:-no change witness was read}; a file changed and restored during this run is not ruled out"
+    fi
     # ★★ THE FOOTER NAMES THE TREE IT WATCHED, ABSOLUTELY, ON EVERY RUN — green,
     # refused, or failed. `held still` is a claim about a DIRECTORY, and a reader
     # who has to reconstruct the caller's working directory to learn which
@@ -1358,6 +1914,14 @@ run_gate_sample_contention after
     echo "srctree : $run_gate_source_tree"
     echo "          decided by: $run_gate_source_tree_why"
     run_gate_abs_input_roots | sed 's/^/watched : /'
+    # THE LOG PATH'S OWNERSHIP, ON EVERY RUN THAT GOT THIS FAR — see "THE LOG PATH IS
+    # ONE LIVE RUN'S ALONE". A reclaim changed what this run was allowed to do, so it
+    # is named rather than left for a reader to infer from a vanished file.
+    if [ -n "$run_gate_owner_reclaimed" ]; then
+        echo "logpath : held by this run alone for its whole duration ($run_gate_owner) — it first RECLAIMED a stale record: $run_gate_owner_reclaimed"
+    else
+        echo "logpath : held by this run alone for its whole duration ($run_gate_owner)"
+    fi
     # HOW MANY OF THE RUN'S TWO SAMPLES ACTUALLY READ A PROCESS TABLE. Both
     # lines below are claims about a scan, and neither may assert more than the
     # scans it got — computed once here so the two cannot answer differently.

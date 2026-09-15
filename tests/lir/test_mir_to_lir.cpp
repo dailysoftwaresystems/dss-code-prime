@@ -8949,6 +8949,17 @@ TEST(MirToLirPackedAtomic, LosesAtomicityTargetWithARuntimeStillTakesTheLibcall)
 // longer libatomic at all: it is DSS's own `runtime/platform/src/atomic.c`
 // (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64), which serves n = 4 and n = 8 with a
 // width-native `lock`-prefixed RMW and takes no lock in any case.
+//
+// ⚠⚠ AND THAT SENTENCE WENT FALSE IN P66, SO IT TOO IS KEPT AS THE CORRECTION:
+// D-C-ATOMICS-RUNTIME-PE64-BUS-LOCKS-EVERY-ACCESS-TO-A-CACHE-LINE-STRADDLING-OBJECT
+// ✔MEASURED that a locked operand crossing a cache line is a split lock whose
+// bus lock stalled every core (a lock-free benchmark on another core ran 8.6×
+// slower beside the concurrency witness above). The runtime now keeps the
+// width-native forms only for an operand inside ONE line — an `xchg` store and
+// a PLAIN read, so a load never writes — and copies a line-crossing object under
+// the process lock, `HeapLock(GetProcessHeap())`. It therefore DOES take a lock,
+// for exactly the case libatomic takes one. None of that moves the route pinned
+// below, which is decided by the lowering and not by the body.
 TEST(MirToLirPackedAtomic, ShippedPe64FormatRoutesTheUnderAlignedAccessToTheRuntime) {
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());

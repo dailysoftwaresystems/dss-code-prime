@@ -108,7 +108,10 @@ constexpr PeFlavour kPeFlavours[] = {
      "and RUNS, while its naturally-aligned control keeps the native xchg/mov. "
      "P54 lane `la` moved WHO answers those calls — from mingw-w64's "
      "libatomic-1.dll (not in-box on Windows) to DSS's own compiled body — and "
-     "the witness moved with it: the image now imports ucrtbase.dll ALONE"},
+     "the witness moved with it: the image then imported ucrtbase.dll ALONE. "
+     "P66 added kernel32.dll's GetProcessHeap/HeapLock/HeapUnlock, the process "
+     "lock the body holds around an object that crosses a cache line "
+     "(D-C-ATOMICS-RUNTIME-PE64-BUS-LOCKS-EVERY-ACCESS-TO-A-CACHE-LINE-STRADDLING-OBJECT)"},
     {"pe64-x86_64-windows-dll", true, true,
      "the .dll image routes through the SAME encodeExec substrate as the .exe "
      "(pe.type = dll), so it genuinely carries .pdata + .xdata. MEASURED by "
@@ -831,6 +834,36 @@ TEST(RuntimeLibraryRoles, DeletingTheAtomicsRuntimeRowRefusesTheFormatAtLoad) {
            "reader knows which `.format.json` key to add";
 }
 
+// D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+// `compareExchangeMangledName` is OPTIONAL — a format without it refuses an
+// under-aligned compare-exchange by name at lowering — but a PRESENT one must name
+// something. An empty string would read as "declared" to the loader and as "not
+// declared" to the lowerer, two answers to one question.
+TEST(RuntimeLibraryRoles, AnEmptyCompareExchangeEntryNameIsRefusedAtLoad) {
+    std::string const text = readShippedFormatText("elf64-x86_64-linux-exec");
+    ASSERT_FALSE(text.empty()) << "the shipped elf-x86_64 exec format must be readable";
+    {
+        auto ok = ObjectFormatSchema::loadFromText(text, "<control>");
+        ASSERT_TRUE(ok.has_value()) << "CONTROL: the shipped document loads";
+        ASSERT_TRUE((*ok)->atomicsRuntime().has_value());
+        EXPECT_EQ((*ok)->atomicsRuntime()->compareExchangeMangledName,
+                  "__atomic_compare_exchange");
+    }
+    std::string mutant = text;
+    ASSERT_TRUE(substituteOnce(
+        mutant, R"("compareExchangeMangledName": "__atomic_compare_exchange")",
+        R"("compareExchangeMangledName": "")"))
+        << "the mutation anchor must exist — a no-op mutation proves nothing";
+    auto bad = ObjectFormatSchema::loadFromText(mutant, "<empty-cas>");
+    ASSERT_FALSE(bad.has_value())
+        << "an EMPTY compare-exchange entry name must refuse the format at load";
+    bool named = false;
+    for (auto const& d : bad.error()) {
+        if (d.path.find("compareExchangeMangledName") != std::string::npos) named = true;
+    }
+    EXPECT_TRUE(named) << "the refusal must name the key";
+}
+
 TEST(RuntimeLibraryRoles, DeletingTheAtomicsRuntimeBlockLeavesTheRowInertAndRefuses) {
     // The OTHER direction. Delete the BLOCK and the row it named becomes inert
     // config — nothing reads it, so nothing contradicts it, which is exactly how
@@ -895,6 +928,11 @@ TEST(RuntimeLibraryRoles, EveryFormatThatDeclaresAnAtomicsBlockDeclaresBothEntry
                        "under-aligned _Atomic access has no runtime to call";
         EXPECT_EQ(ar->loadMangledName, "__atomic_load") << name;
         EXPECT_EQ(ar->storeMangledName, "__atomic_store") << name;
+        // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+        // ✔MEASURED `nm -D --defined-only` — `__atomic_compare_exchange@@LIBATOMIC_1.0`
+        // on both Linux legs, beside the load/store pair.
+        EXPECT_EQ(ar->compareExchangeMangledName, "__atomic_compare_exchange")
+            << name;
         EXPECT_EQ(ar->libraryPath, "libatomic.so.1")
             << name << ": MEASURED — libc and libgcc_s export ZERO __atomic_* "
                        "symbols on both Linux legs; this is a distinct image";
@@ -910,6 +948,11 @@ TEST(RuntimeLibraryRoles, EveryFormatThatDeclaresAnAtomicsBlockDeclaresBothEntry
         // would be the hardcoded-`msvcrt.dll` defect one tier over.
         EXPECT_EQ(ar->loadMangledName, "___atomic_load") << name;
         EXPECT_EQ(ar->storeMangledName, "___atomic_store") << name;
+        // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+        // ✔MEASURED on arm64 macOS 26.6.2 — Apple clang 21 imports
+        // `___atomic_compare_exchange (from libSystem)` for a packed `+=` and runs.
+        EXPECT_EQ(ar->compareExchangeMangledName, "___atomic_compare_exchange")
+            << name;
         EXPECT_EQ(ar->libraryPath, "/usr/lib/libSystem.B.dylib")
             << name << ": MEASURED — Apple clang links the packed case with "
                        "libSystem ALONE; the role points at the image cLibrary "
@@ -956,6 +999,13 @@ TEST(RuntimeLibraryRoles, EveryFormatThatDeclaresAnAtomicsBlockDeclaresBothEntry
         // underscore. Three spellings, one per format, all declared not derived.
         EXPECT_EQ(ar->loadMangledName, "__atomic_load") << name;
         EXPECT_EQ(ar->storeMangledName, "__atomic_store") << name;
+        // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+        // the entry an under-aligned compound assignment or increment commits
+        // through. On this format DSS's own body defines it, under the SAME
+        // arbiter as the load and store above
+        // (D-C-ATOMICS-RUNTIME-PE64-BUS-LOCKS-EVERY-ACCESS-TO-A-CACHE-LINE-STRADDLING-OBJECT),
+        // so a document that dropped the key would refuse every packed `+=` by name.
+        EXPECT_EQ(ar->compareExchangeMangledName, "__atomic_compare_exchange") << name;
         // ★★ P54 lane `la` (D-C-ATOMICS-RUNTIME-IS-OURS-ON-PE64) — THE PIN
         // FLIPPED FROM AN IMAGE TO A REALIZATION, AND THE OLD MEASUREMENT IS NOT
         // REFUTED, ONLY SUPERSEDED. It remains true that no in-box Windows DLL

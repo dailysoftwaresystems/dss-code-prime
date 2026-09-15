@@ -37,6 +37,7 @@
 #include "core/types/tree_node.hpp"             // isEmptySpace
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/type_lattice/type_layout.hpp"  // isMemoryResidentType: an `_Atomic` SCALAR lvalue
 #include "hir/const_eval_arith.hpp"
 #include "hir/cst_const_eval.hpp"
 #include "hir/hir_op.hpp"
@@ -47,6 +48,7 @@
 #include <cctype>
 #include <cstdint>
 #include <format>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <ranges>
@@ -3502,6 +3504,17 @@ struct Lowerer {
         // on its MemberAccess through `recordMemberVolatility`; the reconstruction
         // stamps it too, so the two renditions of the same access cannot drift.
         bool                   volatileField = false;
+        // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+        // an `_Atomic` SCALAR index / deref lvalue keeps its ORIGINAL node here,
+        // still unparented, instead of binding `&lvalue` into a temp pointer. Every
+        // consumer of an `_Atomic` lvalue lowers it to a `ReadModifyWrite` (or, for
+        // a value-position plain `=`, one store), which takes the address exactly
+        // ONCE by itself — so the temp buys nothing, and `*tmp` would LOSE the
+        // lvalue chain `provableLvalueAlign` walks: a packed struct's `_Atomic`
+        // array element would read as ALIGNED and take the native inline form,
+        // the rc 135 SIGBUS class on native arm64. SINGLE-USE by construction:
+        // consumers take it through `atomicRmwTargetNode`, never through `lvNode`.
+        HirNodeId              atomicTarget{};
     };
 
     // One work-stack frame. Only the DEEP arms allocate a frame; the per-arm
@@ -3672,7 +3685,12 @@ struct Lowerer {
                             // Emit the lvalue READ HERE — BEFORE entering the rhs —
                             // to match the recursive arm's L-to-R braced-init order
                             // (lvRead's node precedes the rhs subtree). See AssignCtx.
-                            ctx.compoundLhsRead = lvRead(ctx.lv);
+                            // ⚠ NOT for an `_Atomic` lvalue: `finishAssign` lowers
+                            // it to a read-modify-write, which reads the object
+                            // itself — a read minted here would be an orphan, and
+                            // for a kept original lvalue node, a second parent.
+                            if (!isAtomicLvalue(ctx.lv))
+                                ctx.compoundLhsRead = lvRead(ctx.lv);
                         }
                         std::uint32_t const ctxIdx =
                             static_cast<std::uint32_t>(assignCtxs.size());
@@ -4083,6 +4101,20 @@ struct Lowerer {
         AssignCtx const& ctx = assignCtxs[ctxIdx];
         Lvalue const& lv = ctx.lv;
         NodeId const node = work.back().node;   // the binary (assign) node (provenance)
+        // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+        // an `_Atomic` lvalue in value position — `(x op= v)` is one read-modify-
+        // write; a plain `(x = v)` on an `_Atomic` scalar yields the stored value.
+        // `atomicAssignValue` builds HIR only (the rhs is already lowered), so it
+        // cannot grow `assignCtxs` under the held `ctx` reference.
+        if (isAtomicLvalue(lv) && (ctx.compound || isAtomicScalarType(lv.type))) {
+            std::optional<HirOpKind> compoundOp;
+            if (ctx.compound) compoundOp = ctx.baseOp;
+            E const atomicE = atomicAssignValue(node, lv, result, compoundOp);
+            work.pop_back();
+            assignCtxs.pop_back();
+            result = atomicE;
+            return;
+        }
         HirNodeId stored;
         if (!ctx.compound) {
             // c90 (D-CSUBSET-ASSIGN-VALUE-RHS-COERCE): a plain `=` in VALUE position
@@ -5812,6 +5844,20 @@ struct Lowerer {
             auto lv = lhsN.valid() ? classifyLvalue(lhsN) : std::nullopt;
             if (!lv || !rhsN.valid())
                 return exprError(node, "assignment sub-expression needs an lvalue and a value");
+            // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+            // the value-position twin of `finishAssign`'s atomic arm.
+            if (isAtomicLvalue(*lv)
+                && (!e.compoundBase.empty() || isAtomicScalarType(lv->type))) {
+                std::optional<HirOpKind> compoundOp;
+                if (!e.compoundBase.empty()) {
+                    auto op = coreOpFromName(e.compoundBase);
+                    if (!op || arityOf(*op) != HirOpArity::Binary)
+                        return exprError(node, std::format("compound base op '{}' is not binary",
+                                                           e.compoundBase));
+                    compoundOp = *op;
+                }
+                return atomicAssignValue(node, *lv, lowerExpr(rhsN), compoundOp);
+            }
             HirNodeId stored;
             if (e.compoundBase.empty()) {
                 // c90 (D-CSUBSET-ASSIGN-VALUE-RHS-COERCE): coerce the plain-`=` RHS
@@ -6354,6 +6400,23 @@ struct Lowerer {
             bool const isInc = (e.target == "PostInc");
             auto lv = classifyIncDecLvalue(baseN, node);
             if (!lv) return {errorNode(node), InvalidType};
+            // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+            // `x++` on an `_Atomic` object is ONE read-modify-write, and the node
+            // already yields the value it replaced — postfix's result.
+            if (isAtomicLvalue(*lv)) {
+                TypeId const valTy = interner.stripVolatile(lv->type);
+                HirNodeId const rmw = makeAtomicRmw(
+                    atomicRmwTargetNode(*lv), lv->type,
+                    [&](E old) {
+                        return incDecNewValueFrom(valTy, isInc, node,
+                                                  [&] { return old.id; });
+                    },
+                    node);
+                if (lv->prep.empty()) return {rmw, valTy};
+                return {track(builder.makeSeqExpr(lv->prep, rmw, valTy,
+                                                  HirFlags::Synthetic), node),
+                        valTy};
+            }
             SymbolId const tmp = freshSymbol();
             std::vector<HirNodeId> stmts = lv->prep;
             stmts.push_back(builder.makeVarDecl(lv->type, tmp.v, lvRead(*lv), HirFlags::Synthetic));
@@ -7971,16 +8034,28 @@ struct Lowerer {
     // pointer arithmetic on it"* cites the standard CORRECTLY and then draws the
     // conclusion the `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` bar forbids — ISO C does
     // forbid it, and that settles nothing when both references implement it.
-    [[nodiscard]] HirNodeId pointerIncDecStep(Lvalue const& lv, bool inc, NodeId anchor) {
-        // lv.type is Ptr<T>; extract the pointee T.
-        auto const ops = interner.operands(lv.type);
+    // ★ D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+    // the three `…From` forms take the CURRENT VALUE as a producer instead of
+    // reading an `Lvalue`, so the `ReadModifyWrite` update can compute the new
+    // value from the value its attempt OBSERVED — with the same stride, the same
+    // promotion and the same narrowing as the desugar. The `Lvalue` overloads pass
+    // `lvRead` and invoke it at the point they always read, so their HIR is
+    // unchanged node for node.
+    template <class ReadOld>
+    [[nodiscard]] HirNodeId pointerIncDecStepFrom(TypeId ptrType, bool inc,
+                                                  NodeId anchor, ReadOld&& readOld) {
+        // ptrType is Ptr<T>; extract the pointee T.
+        auto const ops = interner.operands(ptrType);
         TypeId const pointee = ops.empty() ? InvalidType : ops[0];
         if (!pointee.valid()) return errorNode(anchor);
-        HirNodeId const baseRead = lvRead(lv);                 // the current Ptr<T>
+        HirNodeId const baseRead = readOld();                  // the current Ptr<T>
         HirNodeId const step     = synthPtrStep(inc);          // ±1 (I64)
         HirNodeId const idx =
             builder.makeIndex(baseRead, step, pointee, HirFlags::Synthetic);  // T-typed
-        return builder.makeAddressOf(idx, lv.type, HirFlags::Synthetic);      // Ptr<T>
+        return builder.makeAddressOf(idx, ptrType, HirFlags::Synthetic);      // Ptr<T>
+    }
+    [[nodiscard]] HirNodeId pointerIncDecStep(Lvalue const& lv, bool inc, NodeId anchor) {
+        return pointerIncDecStepFrom(lv.type, inc, anchor, [&] { return lvRead(lv); });
     }
 
     // FC-F1: the NEW value an integer/enum-typed ++/-- writes back: `lvRead OP 1`
@@ -7989,7 +8064,12 @@ struct Lowerer {
     // shared single source across the three ++/-- sites — keeps postfix-int from
     // regressing). Pointer lvalues route to `pointerIncDecStep` instead.
     [[nodiscard]] HirNodeId incDecArithValue(Lvalue const& lv, bool inc, NodeId anchor) {
-        TypeId opType = incDecArithType(lv.type);         // enum → underlying int
+        return incDecArithValueFrom(lv.type, inc, anchor, [&] { return lvRead(lv); });
+    }
+    template <class ReadOld>
+    [[nodiscard]] HirNodeId incDecArithValueFrom(TypeId valueType, bool inc,
+                                                 NodeId anchor, ReadOld&& readOld) {
+        TypeId opType = incDecArithType(valueType);       // enum → underlying int
         // c71 (D-CSUBSET-32BIT-ALU-FORMS): a SUB-INT lvalue (`char c; c++`)
         // must integer-PROMOTE the arithmetic to `int` (C 6.3.1.1) — else the
         // BinaryOp Add/Sub is Char/I8-typed and walls at the target's
@@ -8003,11 +8083,11 @@ struct Lowerer {
         if (arith_.has_value())
             opType = integerPromotedType(interner, opType, *arith_);
         HirNodeId const one = synthOne(opType);
-        HirNodeId const lhs = coerce(E{lvRead(lv), lv.type}, opType).id;  // widen (SExt/ZExt) if sub-int/enum
+        HirNodeId const lhs = coerce(E{readOld(), valueType}, opType).id;  // widen (SExt/ZExt) if sub-int/enum
         HirNodeId const sum = track(builder.addParent(
             HirKind::BinaryOp, std::array{lhs, one}, opType,
             encodeOp(inc ? HirOpKind::Add : HirOpKind::Sub)), anchor);
-        return coerce(E{sum, opType}, lv.type).id;        // narrow back for the store
+        return coerce(E{sum, opType}, valueType).id;      // narrow back for the store
     }
 
     // FC-F1: the new value `++`/`--` stores for lvalue `lv` — the scaled pointer
@@ -8017,6 +8097,13 @@ struct Lowerer {
         if (lv.type.valid() && interner.kind(lv.type) == TypeKind::Ptr)
             return pointerIncDecStep(lv, inc, anchor);
         return incDecArithValue(lv, inc, anchor);
+    }
+    template <class ReadOld>
+    [[nodiscard]] HirNodeId incDecNewValueFrom(TypeId valueType, bool inc,
+                                               NodeId anchor, ReadOld&& readOld) {
+        if (valueType.valid() && interner.kind(valueType) == TypeKind::Ptr)
+            return pointerIncDecStepFrom(valueType, inc, anchor, readOld);
+        return incDecArithValueFrom(valueType, inc, anchor, readOld);
     }
 
     // FC-F1: classify the ++/-- operand as a MODIFIABLE lvalue, or report
@@ -8048,6 +8135,15 @@ struct Lowerer {
                   "operand of ++/-- is not a modifiable lvalue (C 6.5.2.4 / 6.5.3.1)");
             return std::nullopt;
         }
+        // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+        // keep the original lvalue node (see `Lvalue::atomicTarget`).
+        if (isAtomicScalarType(target.type)) {
+            Lvalue lv;
+            lv.simple       = false;
+            lv.type         = target.type;
+            lv.atomicTarget = target.id;
+            return lv;
+        }
         Lvalue lv;
         lv.simple  = false;
         lv.type    = target.type;
@@ -8056,6 +8152,151 @@ struct Lowerer {
         HirNodeId addr = builder.makeAddressOf(target.id, lv.ptrType, HirFlags::Synthetic);
         lv.prep.push_back(builder.makeVarDecl(lv.ptrType, lv.sym.v, addr, HirFlags::Synthetic));
         return lv;
+    }
+
+    // ── D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE ──
+    //
+    // ★★★ THE DESUGAR THIS FILE USES FOR `x op= v` AND `++x` IS WHERE THE LOST
+    // UPDATE WAS BORN. Everywhere else here those lower to `x = x op v`: an
+    // `AssignStmt` whose value RE-READS the lvalue. For a plain object that is C's
+    // meaning exactly. For an `_Atomic` one it is TWO indivisible accesses —
+    // HIR→MIR sends the read to `AtomicLoad` and the write to `AtomicStore` — with
+    // nothing tying them together, so another thread's update between them is
+    // silently overwritten. ✔MEASURED at `caf053eb`: a two-thread race probe exits
+    // 115 on pe64 and on elf64 (four of its five forms lost updates) where MSVC's
+    // build of the same source exits 100. C23 6.5.17.3p4: "If E1 has an atomic
+    // type, compound assignment is a read-modify-write operation"; 6.5.3.5p2 says
+    // it of postfix `++`.
+    //
+    // So an `_Atomic` lvalue lowers to ONE `ReadModifyWrite` node instead:
+    //   * the object's ADDRESS is taken once, by the node itself;
+    //   * E2 is evaluated ONCE, into a temporary, AHEAD of the node — C23
+    //     6.5.17.3's NOTE writes exactly `T2 val = (E2);` — because the update
+    //     re-runs whenever a race is lost;
+    //   * the update reads the value its attempt OBSERVED through a fresh binding
+    //     (`Ref(oldSym)`), so its conversions are the desugar's, verbatim;
+    //   * the node yields the OLD value, which is postfix's result; `++x` and
+    //     `(x op= v)` yield the NEW one by recomputing the update over it — a pure
+    //     function of that value and the bound operand, so it equals the value the
+    //     loop committed, where re-reading the object would observe whatever
+    //     another thread stored since.
+    // ⓘ Evaluating E2 before the target's address is legal: the operands of an
+    // assignment are unsequenced (C23 6.5.17.1p3), and a call in either is
+    // indeterminately sequenced against the other.
+    [[nodiscard]] bool isAtomicLvalue(Lvalue const& lv) const {
+        return lv.type.valid() && interner.isAtomicQualified(lv.type);
+    }
+
+    // An `_Atomic` object whose value lives in a register (not an aggregate,
+    // complex or wide `_BitInt`, which the memory-resident model reaches by
+    // address). The one shape for which a classifier keeps the original lvalue
+    // node, and a value-position plain `=` yields the stored value.
+    [[nodiscard]] bool isAtomicScalarType(TypeId t) const {
+        return t.valid() && interner.isAtomicQualified(t)
+            && !isMemoryResidentType(interner, t);
+    }
+
+    // The node a read-modify-write takes its address from: the ORIGINAL lvalue
+    // when the classifier kept it, else the usual reconstruction.
+    [[nodiscard]] HirNodeId atomicRmwTargetNode(Lvalue const& lv) {
+        return lv.atomicTarget.valid() ? lv.atomicTarget : lvNode(lv);
+    }
+
+    // `ReadModifyWrite(target, makeUpdate(<observed value>))`, typed as the
+    // object's VALUE type — lvalue conversion drops the atomic qualifier (C23
+    // 6.3.2.1p2), and the binding is a value, not an object.
+    template <class MakeUpdate>
+    [[nodiscard]] HirNodeId makeAtomicRmw(HirNodeId target, TypeId lvType,
+                                          MakeUpdate const& makeUpdate,
+                                          NodeId anchor) {
+        TypeId const valTy = interner.stripVolatile(lvType);
+        SymbolId const oldSym = freshSymbol();
+        HirNodeId const oldRead =
+            builder.makeRef(valTy, oldSym.v, HirFlags::Synthetic);
+        HirNodeId const update = makeUpdate(E{oldRead, valTy});
+        return track(builder.makeReadModifyWrite(target, update, oldSym.v, valTy,
+                                                 HirFlags::Synthetic), anchor);
+    }
+
+    // `(T1)(old OP val)` at the usual-arithmetic common type, narrowed back to the
+    // object's value type — `lowerCompoundAssign`'s computation over the observed
+    // value. A pointer object has no arithmetic common type and keeps its own, so
+    // `p += n` takes the stride `BinaryOp` exactly as the desugar does.
+    [[nodiscard]] HirNodeId atomicCompoundUpdate(E oldE, E valE, HirOpKind op,
+                                                 NodeId anchor) {
+        TypeId const valTy  = oldE.type;
+        TypeId const common = commonArithType(oldE.type, valE.type);
+        TypeId const opType = common.valid() ? common : valTy;
+        if (common.valid()) {
+            oldE = coerce(oldE, common);
+            valE = coerce(valE, common);
+        }
+        HirNodeId const opResult = track(builder.addParent(
+            HirKind::BinaryOp, std::array{oldE.id, valE.id}, opType,
+            encodeOp(op)), anchor);
+        return coerce(E{opResult, opType}, valTy).id;
+    }
+
+    // Bind E2 ONCE into a temporary appended to `stmts`, and return the update that
+    // reads a FRESH `Ref` of it each time it is built (a HIR node has one parent,
+    // and a yield-new form builds the update twice).
+    [[nodiscard]] std::function<HirNodeId(E)> bindAtomicRmwOperand(
+            E rhs, HirOpKind op, NodeId anchor, std::vector<HirNodeId>& stmts) {
+        TypeId const opndTy = interner.stripVolatile(rhs.type);
+        SymbolId const valSym = freshSymbol();
+        stmts.push_back(builder.makeVarDecl(opndTy, valSym.v, rhs.id,
+                                            HirFlags::Synthetic));
+        return [this, opndTy, valSym, op, anchor](E old) {
+            E const val{builder.makeRef(opndTy, valSym.v, HirFlags::Synthetic),
+                        opndTy};
+            return atomicCompoundUpdate(old, val, op, anchor);
+        };
+    }
+
+    // `++x` / `(x op= v)`: capture the value the read-modify-write replaced, and
+    // yield the update recomputed over it.
+    template <class MakeUpdate>
+    [[nodiscard]] E atomicRmwYieldingNew(NodeId node, Lvalue const& lv,
+                                         std::vector<HirNodeId> stmts,
+                                         MakeUpdate const& makeUpdate) {
+        TypeId const valTy = interner.stripVolatile(lv.type);
+        HirNodeId const rmw =
+            makeAtomicRmw(atomicRmwTargetNode(lv), lv.type, makeUpdate, node);
+        SymbolId const tOld = freshSymbol();
+        stmts.push_back(builder.makeVarDecl(valTy, tOld.v, rmw, HirFlags::Synthetic));
+        HirNodeId const yield = makeUpdate(
+            E{builder.makeRef(valTy, tOld.v, HirFlags::Synthetic), valTy});
+        return {track(builder.makeSeqExpr(stmts, yield, valTy, HirFlags::Synthetic),
+                      node),
+                valTy};
+    }
+
+    // An `_Atomic` lvalue assigned in VALUE position — `(x op= v)`, or a plain
+    // `(x = v)` on an `_Atomic` SCALAR. `rhs` is the already-lowered right operand.
+    // ⓘ THE PLAIN FORM yields the value STORED rather than re-reading the object:
+    // both are conforming (C17 6.5.16p3's footnote lets an implementation read the
+    // object or not), but a re-read of an `_Atomic` is a second access that can
+    // observe another thread's store — and the ORIGINAL lvalue node the classifier
+    // may have kept is single-use, so the read-back had no object to name anyway.
+    [[nodiscard]] E atomicAssignValue(NodeId node, Lvalue const& lv, E rhs,
+                                      std::optional<HirOpKind> compoundOp) {
+        if (!rhs.type.valid()) return {errorNode(node), InvalidType};
+        std::vector<HirNodeId> stmts = lv.prep;
+        if (compoundOp.has_value()) {
+            auto const update = bindAtomicRmwOperand(rhs, *compoundOp, node, stmts);
+            return atomicRmwYieldingNew(node, lv, std::move(stmts), update);
+        }
+        TypeId const valTy = interner.stripVolatile(lv.type);
+        HirNodeId const stored = coerce(rhs, valTy).id;
+        SymbolId const t = freshSymbol();
+        stmts.push_back(builder.makeVarDecl(valTy, t.v, stored, HirFlags::Synthetic));
+        stmts.push_back(builder.makeAssignStmt(
+            atomicRmwTargetNode(lv),
+            builder.makeRef(valTy, t.v, HirFlags::Synthetic)));
+        return {track(builder.makeSeqExpr(
+                          stmts, builder.makeRef(valTy, t.v, HirFlags::Synthetic),
+                          valTy, HirFlags::Synthetic), node),
+                valTy};
     }
 
     // FC-F1 (C 6.5.3.1): PREFIX `++x` / `--x` in VALUE position. Unlike postfix
@@ -8069,6 +8310,17 @@ struct Lowerer {
     E lowerPreIncDec(NodeId node, NodeId operandN, bool isInc) {
         auto lv = classifyIncDecLvalue(operandN, node);
         if (!lv) return {errorNode(node), InvalidType};
+        // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+        // `++x` on an `_Atomic` object — the new value is RECOMPUTED over the
+        // value the read-modify-write replaced, never re-read from the object
+        // (a re-read would observe whatever another thread wrote since).
+        if (isAtomicLvalue(*lv)) {
+            TypeId const valTy = interner.stripVolatile(lv->type);
+            auto const update = [&](E old) {
+                return incDecNewValueFrom(valTy, isInc, node, [&] { return old.id; });
+            };
+            return atomicRmwYieldingNew(node, *lv, lv->prep, update);
+        }
         std::vector<HirNodeId> stmts = lv->prep;
         HirNodeId const newVal = incDecNewValue(*lv, isInc, node);
         stmts.push_back(lvWrite(*lv, newVal));
@@ -10782,6 +11034,15 @@ struct Lowerer {
                   "(D-CSUBSET-ASSIGNMENT-TO-A-NON-LVALUE-REFUSED-BY-THE-LOWERING-TIER)");
             return std::nullopt;
         }
+        // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+        // keep the original lvalue node (see `Lvalue::atomicTarget`).
+        if (isAtomicScalarType(target.type)) {
+            Lvalue lv;
+            lv.simple       = false;
+            lv.type         = target.type;
+            lv.atomicTarget = target.id;
+            return lv;
+        }
         Lvalue lv;
         lv.simple  = false;
         // c27 (D-CSUBSET-VOLATILE-POINTEE): `target.type` already carries the
@@ -10823,6 +11084,18 @@ struct Lowerer {
         if (!lv || !rhsN.valid() || !op || arityOf(*op) != HirOpArity::Binary)
             return reportedError(binNode, "compound assignment needs an lvalue and a binary base op");
         E rhs = lowerExpr(rhsN);
+        // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+        // an `_Atomic` left operand is ONE read-modify-write, never the re-reading
+        // desugar below (see `makeAtomicRmw`).
+        if (isAtomicLvalue(*lv)) {
+            if (!rhs.type.valid()) return errorNode(binNode);
+            std::vector<HirNodeId> stmts = lv->prep;
+            auto const update = bindAtomicRmwOperand(rhs, *op, binNode, stmts);
+            HirNodeId const rmw =
+                makeAtomicRmw(atomicRmwTargetNode(*lv), lv->type, update, binNode);
+            stmts.push_back(builder.makeExprStmt(rmw));
+            return track(builder.makeBlock(stmts), binNode);
+        }
         // C99 compound-assign spec: `a OP= b` ≡ `a = (T)((a) OP (b))` where
         // T is the type of `a`, and OP is computed at the COMMON type of a
         // and b (so a narrower-than-int operand is integer-promoted first).
@@ -10864,6 +11137,23 @@ struct Lowerer {
                 emitH(DiagnosticCode::S_IncDecNeedsModifiableLvalue, incDecNode,
                       "operand of ++/-- is not a modifiable lvalue (C 6.5.2.4 / 6.5.3.1)");
             return errorNode(incDecNode);
+        }
+        // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+        // `x++;` / `++x;` on an `_Atomic` object — one read-modify-write whose
+        // yielded value is discarded. Always a Block, so a for-clause and a
+        // statement position take the same statement.
+        if (isAtomicLvalue(*lv)) {
+            TypeId const valTy = interner.stripVolatile(lv->type);
+            HirNodeId const rmw = makeAtomicRmw(
+                atomicRmwTargetNode(*lv), lv->type,
+                [&](E old) {
+                    return incDecNewValueFrom(valTy, isInc, incDecNode,
+                                              [&] { return old.id; });
+                },
+                incDecNode);
+            std::vector<HirNodeId> stmts = lv->prep;
+            stmts.push_back(builder.makeExprStmt(rmw));
+            return track(builder.makeBlock(stmts), incDecNode);
         }
         HirNodeId const value = incDecNewValue(*lv, isInc, incDecNode);
         return asStmt(*lv, lvWrite(*lv, value), incDecNode);

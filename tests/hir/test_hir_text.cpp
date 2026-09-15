@@ -108,7 +108,7 @@ TEST(HirText, EmitMinimalModule) {
     HirTextContext ctx;  // no interner/symbols needed for an empty module
     DiagnosticReporter r;
     std::string const text = emitHir(hir, ctx, r);
-    EXPECT_NE(text.find("dsshir 3\nproducer \"\"\n"), std::string::npos);
+    EXPECT_NE(text.find("dsshir 4\nproducer \"\"\n"), std::string::npos);
     EXPECT_NE(text.find("module \"toy\" {"), std::string::npos);
     expectRoundTrip(hir, ctx);
 }
@@ -241,7 +241,7 @@ TEST(HirText, MalformedLiteralValuesFailLoud) {
     // never silently default. Pins the bool/overflow/unknown-tag guards.
     auto parseFails = [](std::string_view body) {
         std::string const text =
-            std::string("dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+            std::string("dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
                         "  function %1 : fn() -> void {\n    block {\n      expr ")
             + std::string(body) + "\n      return\n    }\n  }\n}\n";
         DiagnosticReporter r;
@@ -275,6 +275,41 @@ TEST(HirText, RoundTripSeqExpr) {
     std::string const text = expectRoundTrip(hir, ctx);
     EXPECT_NE(text.find("seq : i32 {"), std::string::npos);
     EXPECT_NE(text.find("yield ref %2"), std::string::npos);
+}
+
+// D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
+// `rmw %<sym> : <type> (<target>, <update>)` round-trips, and its PAYLOAD symbol —
+// the binding the update reads the observed value through — reaches the
+// artifact's symbol table. ★ That second half is the one a writer could drop and
+// still produce parseable text: without `carriesSymbol` the handle would name a
+// symbol the table never defines, and the update's `ref` to it would read back
+// as a DIFFERENT symbol than the node binds.
+// RED-ON-DISABLE: remove `ReadModifyWrite` from `carriesSymbol` → the round trip
+// or the `"old"` name assertion reds; remove the parser's `Rmw` arm → it refuses
+// its own writer's keyword.
+TEST(HirText, RoundTripReadModifyWrite) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId i32   = in.primitive(TypeKind::I32);
+    TypeId voidT = in.primitive(TypeKind::Void);
+    TypeId sig   = in.fnSig({}, voidT, CallConv::CcSysV);
+
+    HirBuilder b{"toy"};
+    HirNodeId target = b.makeRef(i32, 2);                  // the object
+    HirNodeId oldRd  = b.makeRef(i32, 3);                  // the observed value
+    HirNodeId one    = b.makeLiteral(i32, 0);
+    HirNodeId update = b.makeBinaryOp(HirOpKind::Add, oldRd, one, i32);
+    HirNodeId rmw    = b.makeReadModifyWrite(target, update, 3, i32);
+    HirNodeId body   = b.makeBlock(std::vector<HirNodeId>{b.makeExprStmt(rmw), b.makeReturn()});
+    HirNodeId fn     = b.makeFunction(sig, 1, {}, body);
+    HirNodeId root   = b.makeModule(std::vector<HirNodeId>{fn});
+    Hir hir = std::move(b).finish(root);
+
+    std::vector<std::string> names{"", "main", "g", "old"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    std::string const text = expectRoundTrip(hir, ctx);
+    EXPECT_NE(text.find("rmw %"), std::string::npos) << text;
+    EXPECT_NE(text.find("\"old\""), std::string::npos)
+        << "the read-modify-write's binding must be in the symbol table\n" << text;
 }
 
 TEST(HirText, RoundTripTypesAndFlags) {
@@ -472,7 +507,7 @@ TEST(HirText, ParseMalformedEnumReports) {
     // An unrecognized enum name must report, not silently coerce to a default.
     DiagnosticReporter r;
     auto res = parseHir(
-        "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  @ffi(link bogus)\n  extern_global %1 : i32\n}\n",
         CompilationUnitId{1}, r);
     EXPECT_FALSE(res->ok);
@@ -484,7 +519,7 @@ TEST(HirText, ParseStuckTokenDoesNotHang) {
     // never spin (regression: the progress guard was dead). Reaching the assert
     // at all proves termination.
     DiagnosticReporter r;
-    auto res = parseHir("dsshir 3\nproducer \"\"\nmodule \"toy\" {\n  $ % :\n}\n", CompilationUnitId{1}, r);
+    auto res = parseHir("dsshir 4\nproducer \"\"\nmodule \"toy\" {\n  $ % :\n}\n", CompilationUnitId{1}, r);
     EXPECT_FALSE(res->ok);
     EXPECT_GT(countCode(r, DiagnosticCode::H_TextMalformed), 0u);
 }
@@ -498,7 +533,7 @@ TEST(HirText, ParseVersionMismatch) {
 
 TEST(HirText, ParseMalformedReports) {
     DiagnosticReporter r;
-    auto res = parseHir("dsshir 3\nproducer \"\"\nmodule \"x\" {\n  @@@ garbage\n}\n", CompilationUnitId{1}, r);
+    auto res = parseHir("dsshir 4\nproducer \"\"\nmodule \"x\" {\n  @@@ garbage\n}\n", CompilationUnitId{1}, r);
     EXPECT_FALSE(res->ok);
     EXPECT_GT(countCode(r, DiagnosticCode::H_TextMalformed), 0u);
 }
@@ -507,7 +542,7 @@ TEST(HirText, ParseUnknownSymbolReports) {
     // %9 referenced but only %1 declared.
     DiagnosticReporter r;
     auto res = parseHir(
-        "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"a\"\n}\nmodule \"toy\" {\n"
+        "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"a\"\n}\nmodule \"toy\" {\n"
         "  global %9 : i32\n}\n",
         CompilationUnitId{1}, r);
     EXPECT_GT(countCode(r, DiagnosticCode::H_TextUnknownName), 0u);
@@ -1594,7 +1629,7 @@ TEST(HirText, InlineAsmTemplateWithANewlineStillRoundTripsByteIdentically) {
 // exactly the reason that row exists.
 TEST(HirText, InlineAsmOperandKindThatNamesNoFormIsRefusedWithTheAcceptedSet) {
     std::string const text =
-        "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"m\" "
         "operand_kind not_a_form -> lit int 0 : i32 ) }\n"
@@ -1618,7 +1653,7 @@ TEST(HirText, InlineAsmOperandKindThatNamesNoFormIsRefusedWithTheAcceptedSet) {
 // indistinguishable from one analyzed with no target in scope.
 TEST(HirText, InlineAsmImmediateFormOperandSurvivesTheTextTier) {
     std::string const text =
-        "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"i\" "
         "operand_kind imm32 -> lit int 7 : i32 ) }\n"
@@ -1648,7 +1683,7 @@ TEST(HirText, InlineAsmImmediateFormOperandSurvivesTheTextTier) {
 // emits and what stored goldens carry. Only the acceptance changed.
 TEST(HirText, InlineAsmRegisterClassOrdinalOutsideTheEnumIsRefused) {
     std::string const text =
-        "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"r\" "
         "class 200 -> lit int 0 : i32 ) }\n"
@@ -1668,7 +1703,7 @@ TEST(HirText, InlineAsmRegisterClassOrdinalOutsideTheEnumIsRefused) {
 // and still round-trips its value.
 TEST(HirText, InlineAsmRegisterClassOrdinalInsideTheEnumStillLoads) {
     std::string const text =
-        "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"r\" "
         "class 1 -> lit int 0 : i32 ) }\n"
@@ -1995,7 +2030,7 @@ TEST(HirText, MalformedRecursionMarkersAreRefusedByName) {
          "DIFFERENT content"},
     }};
     auto const wrap = [](char const* ty) {
-        return std::string{"dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"S\"\n}\n"
+        return std::string{"dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"S\"\n}\n"
                            "module \"toy\" {\n  type_decl %1 : "} + ty + "\n}\n";
     };
     for (Arm const& arm : arms) {
@@ -2237,7 +2272,7 @@ TEST(HirTextDeepNesting, PastTheFormatDepthLimitTheWriterRefusesByNameAndPoisons
 // treatment of `?`, and it does not need the depth to be exercised.
 TEST(HirTextDeepNesting, ThePoisonTokenTheDepthRefusalWritesIsRefusedOnTheWayBackIn) {
     std::string const text =
-        "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
+        "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
         "module \"toy\" {\n  ?\n}\n";
     DiagnosticReporter r;
     auto res = parseHir(text, CompilationUnitId{91}, r);
@@ -2245,7 +2280,7 @@ TEST(HirTextDeepNesting, ThePoisonTokenTheDepthRefusalWritesIsRefusedOnTheWayBac
 
     // CONTROL: the identical artifact with a real statement in that slot loads.
     std::string const ok =
-        "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
+        "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
         "module \"toy\" {\n  unreachable\n}\n";
     DiagnosticReporter cr;
     auto good = parseHir(ok, CompilationUnitId{92}, cr);
@@ -2276,7 +2311,7 @@ namespace {
 [[nodiscard]] std::string deepChainArtifact(std::size_t depth) {
     std::string s;
     s.reserve(depth * 32 + 256);
-    s += "dsshir 3\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
+    s += "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
          "module \"toy\" {\n  function %1 : fn() -> i32 {\n    block {\n      return ";
     for (std::size_t i = 0; i < depth; ++i) s += "binop Add : i32 (";
     s += "lit #0 : i32";
