@@ -83,8 +83,11 @@ below is IN it.
    `D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE`
    ✔MEASURED before filing: DSS loses updates on pe64 and elf64; MSVC built from the same source loses none.
 3. **Lane `ih`**: the `integrated_tests` runner hang `bl` recorded. A runner spun in ntdll file calls before creating its `ex/` directory, beside sibling examples whose names extend its own.
-4. Fold all three, take the eight-run gate `{Debug, Release} × four legs` on the resulting tree, and push once. With `Run Pipes` on, CI runs by itself — read the finished run's failing test NAMES before concluding anything from it.
-5. Only then the merge.
+4. **Lane `wl`** (P1 harness): the sqlite `walsetlk` confound rows are honoured on a 20-second clock sample taken before the corpus runs, so the same failures were charged to DSS in one WSL run and excused in the next.
+   `D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN`
+   ✔MEASURED 2026-09-15: racing the same tests at the same time, the gcc reference fixture fails when DSS fails and passes when DSS passes, following whether the clock stepped during the run. At the operator's request the lane also races an MSVC-built fixture against DSS's pe64 one on Windows.
+5. Fold all four, take the eight-run gate `{Debug, Release} × four legs` on the resulting tree, and push once. With `Run Pipes` on, CI runs by itself — read the finished run's failing test NAMES before concluding anything from it.
+6. Only then the merge.
 
 ⚠ Rows have been opened and closed since the table below was measured — re-derive every count with `check-anchor-balance`; do not read them off it.
 
