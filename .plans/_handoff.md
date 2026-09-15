@@ -86,8 +86,18 @@ below is IN it.
 4. **Lane `wl`** (P1 harness): the sqlite `walsetlk` confound rows are honoured on a 20-second clock sample taken before the corpus runs, so the same failures were charged to DSS in one WSL run and excused in the next.
    `D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN`
    ✔MEASURED 2026-09-15: racing the same tests at the same time, the gcc reference fixture fails when DSS fails and passes when DSS passes, following whether the clock stepped during the run. At the operator's request the lane also races an MSVC-built fixture against DSS's pe64 one on Windows.
-5. Fold all four, take the eight-run gate `{Debug, Release} × four legs` on the resulting tree, and push once. With `Run Pipes` on, CI runs by itself — read the finished run's failing test NAMES before concluding anything from it.
-6. Only then the merge.
+   ✔MEASURED 2026-09-15 by the orchestrator (the operator asked whether DSS's longer WSL runs were a DSS or x86_64 target issue): per-test timing on `walsetlk.test`, every test's completion stamped on a clock that does not step. The evidence is under `~/.cache/refprobe/` on each host, and the lane records it in its row.
+   - **Steady-clock arm64 VPS:** DSS matches gcc on every timed test, to 0.01 s.
+   - **WSL x86_64:** DSS matches gcc and clang wherever no clock jump landed.
+   - **macOS under Rosetta (x86_64):** DSS matches an x86_64 Apple-clang reference on every test.
+   ⇒ No DSS-attributable timing difference on any host or architecture.
+5. **Fold all four.** Integration the lanes cannot do for each other:
+   - Add `"compareExchangeMangledName": "__atomic_compare_exchange"` to the `atomicsRuntime` object of the four pe64 format documents. Lane `ca` introduced the key and its schema; lane `bl` defines the entry in `runtime/platform/src/atomic.c`.
+   - Hand-merge `tests/link/test_runtime_library_roles.cpp`, which `bl` and `ca` both edited.
+   - Re-derive the example census with `check-doc-census --write`.
+   - Close `ca`'s row only after the combined gate has run its pe64 packed-race arms.
+6. Take the eight-run gate `{Debug, Release} × four legs` on the resulting tree, and push once. With `Run Pipes` on, CI runs by itself — read the finished run's failing test NAMES before concluding anything from it.
+7. Only then the merge.
 
 ⚠ Rows have been opened and closed since the table below was measured — re-derive every count with `check-anchor-balance`; do not read them off it.
 
