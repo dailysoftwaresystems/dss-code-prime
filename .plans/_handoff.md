@@ -50,13 +50,31 @@ below is IN it.
 
 ---
 
-**Last updated:** 2026-09-14 — cycles **P14 … P66**. ✅ **P66 IS COMPLETE.** Every exit criterion the operator set is met and the tree is clean; the only remaining step is the operator's merge of PR #57, and the next cycle branches from `main`. §0.0 has the state.
+**Last updated:** 2026-09-14 — cycles **P14 … P66**. ⛔ **P66 IS NOT COMPLETE — PR #57's CI WENT RED AFTER THE EXIT WAS WRITTEN UP.** `windows-msvc-release` failed `run_gate_guard` at `87175a7a`; a P0 harness row is OPEN and lane `rt` is working it. §0.0's first block says what is owed; the block after it overstates the state.
 
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
 
-## §0.0 — STATE: P66 IS COMPLETE AND THE PR IS WAITING ON THE OPERATOR'S MERGE
+## §0.0 — STATE
+
+⛔ **SUPERSEDED THE SAME DAY — PR #57's CI WENT RED AFTER THE BLOCK BELOW WAS WRITTEN. Read this first; everything below it that says the cycle is complete is FALSE.**
+
+✔MEASURED 2026-09-14, PR #57 run 34902431890, job 104171431676, at `87175a7a`: `windows-msvc-release` failed `run_gate_guard`, 1 of 2179. Arm `28-sh-compiler-exits-midrun` printed `compilers: none` and did not say `seen when this run STARTED`, while its `.ps1` twin (arm 29) saw the same kind of stand-in at start; `30-parity-union` is red. Every other CI leg is green on that commit, and the guard is green locally in the identical MSVC Release configuration.
+
+**Owed, in order:**
+
+1. Lane `rt` (`.worktrees/rt`, seeded at `34cfbb68`) closes this P0:
+   `D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY`
+   Two candidates, both to be MEASURED: the fixture races fixed-lifetime stand-ins against the gate's sampling latency (closed twice before by moving a sleep number, 12 s then 3 s, never by removing the race); and a stale `ParentProcessId` after PID reuse, which neither twin guards because neither process table carries a creation time. ⛔ No timing number may be the remedy.
+2. Fold `rt`, apply its row, and re-take the eight-run gate `{Debug, Release} × four legs` on the resulting tree.
+3. The operator re-runs CI. `Run Pipes` is theirs alone — never label, re-run or push to trigger it.
+4. Only then the merge.
+
+⚠ One harness row has been opened since the table below was measured — re-derive the counts with `check-anchor-balance`; do not read them off it.
+
+### What was written as the exit state, before the red (kept, not deleted)
+
 
 ✔**MEASURED 2026-09-14.** Every exit criterion the operator set is met. **Nothing is owed on this
 branch.** The one thing left is not ours: the merge.
