@@ -413,6 +413,11 @@ $script:RunGateForeignBefore  = @()
 $script:RunGateForeignAfter   = @()
 $script:RunGateTableOkBefore  = $false
 $script:RunGateTableOkAfter   = $false
+# Parent links a scan refused because the parent was created AFTER its child (a
+# recycled pid), as `child>parent`; per scan, then kept per sample like the rows.
+$script:RunGateRecycled       = @()
+$script:RunGateRecycledBefore = @()
+$script:RunGateRecycledAfter  = @()
 
 function Test-RunGateIsWindows {
     if (Test-Path variable:IsWindows) { return [bool]$IsWindows }
@@ -491,21 +496,39 @@ function Get-RunGateDirsInTokens([string]$image, [string[]]$tok) {
     return $found.ToArray()
 }
 
-# pid / ppid / image / command line for every live process.
+# pid / ppid / image / command line / argv0 / CREATION KEY for every live process.
 # +MEASURED on this workstation: `Get-CimInstance Win32_Process` returns 507-538
 # rows in 341 ms from an already-running PowerShell, of which 249 report an
 # EMPTY CommandLine (protected/system processes) while all four live build-tool
 # processes reported theirs.
+#
+# ★★★ THE CREATION KEY IS WHAT MAKES `ParentId` SAFE TO FOLLOW. Twin of the block
+# "A PARENT LINK IS A CLAIM ABOUT ORDER" above run_gate_process_table in
+# run-gate.sh, which carries the measurements; not repeated here, so the two
+# cannot drift into describing it differently. In short: Windows does not
+# reparent an orphan and recycles pids, so a ParentId can name whatever process
+# now holds a dead parent's pid, and Get-RunGateTrustedParent refuses a link
+# whose parent was created AFTER its child.
+# D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY
+# (i) ONE KEY, BOTH TWINS: `yyyyMMddHHmmssffffff`, UTC, 20 digits, compared
+#   ORDINALLY as a string. InvariantCulture, because a custom date format under a
+#   non-Gregorian culture prints a different YEAR.
 function Get-RunGateProcessTable {
     if (Test-RunGateIsWindows) {
         try {
+            $inv = [Globalization.CultureInfo]::InvariantCulture
             return @(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object {
                 [PSCustomObject]@{
                     ProcId    = [int]$_.ProcessId
                     ParentId  = [int]$_.ParentProcessId
                     Image     = [string]$_.Name
-                    CmdLine   = [string]$_.CommandLine
+                    # CR, LF and TAB become a space -- twin of the same replacement in
+                    # run-gate.sh, which carries the measurement: a Windows command
+                    # line can hold a newline, and the twins must tokenise and print
+                    # the same text for the same process.
+                    CmdLine   = ([string]$_.CommandLine) -replace "[`t`r`n]", ' '
                     Argv0     = [string]$_.Name   # CIM Name is already a bare image name
+                    Created   = $(if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('yyyyMMddHHmmssffffff', $inv) } else { '' })
                 } })
         } catch { return @() }
     }
@@ -515,20 +538,68 @@ function Get-RunGateProcessTable {
     # width, so a bare-name comparison against it can never match
     # (D-SCRIPT-RUN-GATE-MATCHES-AN-IMAGE-AGAINST-A-COMM-COLUMN-THAT-IS-A-TRUNCATED-PATH-ON-MACOS).
     # Both spellings are basenamed here and EITHER may match downstream.
+    # [!] `lstart` IS FIVE FIELDS (weekday, month, day, HH:MM:SS, year), so comm is
+    #   the EIGHTH, and it is read under LC_ALL=C TZ=UTC exactly as the twin reads
+    #   it: English month names, and no DST fall-back ordering a child before its
+    #   parent. The two variables are RESTORED, because a .ps1 runs in-process.
+    $prevLcAll = $env:LC_ALL
+    $prevTz    = $env:TZ
     try {
-        return @(& ps -eo 'pid=,ppid=,comm=,args=' 2>$null | ForEach-Object {
-            $f = ($_ -replace '^\s+', '') -split '\s+', 4
-            if ($f.Count -lt 3) { return }
-            $cl = if ($f.Count -ge 4) { [string]$f[3] } else { '' }
+        $env:LC_ALL = 'C'
+        $env:TZ     = 'UTC'
+        return @(& ps -eo 'pid=,ppid=,lstart=,comm=,args=' 2>$null | ForEach-Object {
+            $f = ($_ -replace '^\s+', '') -split '\s+', 9
+            if ($f.Count -lt 8) { return }
+            $cl = if ($f.Count -ge 9) { [string]$f[8] } else { '' }
             $a0 = if ($cl) { ($cl -split '[ \t]', 2)[0] } else { '' }
             [PSCustomObject]@{
                 ProcId   = [int]$f[0]
                 ParentId = [int]$f[1]
-                Image    = [string]($f[2] -replace '^.*/', '')
+                Image    = [string]($f[7] -replace '^.*/', '')
                 CmdLine  = $cl
                 Argv0    = [string]($a0 -replace '^.*/', '')
+                Created  = (ConvertTo-RunGateLstartKey $f[3] $f[4] $f[5] $f[6])
             } })
-    } catch { return @() }
+    } catch {
+        return @()
+    } finally {
+        if ($null -eq $prevLcAll) { Remove-Item Env:\LC_ALL -ErrorAction SilentlyContinue } else { $env:LC_ALL = $prevLcAll }
+        if ($null -eq $prevTz)    { Remove-Item Env:\TZ -ErrorAction SilentlyContinue }     else { $env:TZ = $prevTz }
+    }
+}
+
+# `lstart`'s month / day / HH:MM:SS / year as the 20-digit key, or '' when any
+# part is not the shape it must be. Twin of the conversion inside
+# run_gate_process_table's awk, digit for digit.
+function ConvertTo-RunGateLstartKey([string]$Month, [string]$Day, [string]$Hms, [string]$Year) {
+    $mi = [Array]::IndexOf([string[]]@('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'), $Month) + 1
+    $t  = @($Hms -split ':')
+    if ($mi -lt 1 -or $t.Count -ne 3 -or ("$Day$Year$($t -join '')" -notmatch '^[0-9]+$')) { return '' }
+    return ('{0:D4}{1:D2}{2:D2}{3:D2}{4:D2}{5:D2}000000' -f [int]$Year, $mi, [int]$Day, [int]$t[0], [int]$t[1], [int]$t[2])
+}
+
+# ★★★ THE ONE RULE FOR FOLLOWING A PARENT LINK. Twin of `parent_of` in
+# run_gate_classify_table (run-gate.sh): the parent of $Child, or 0 when the link
+# must NOT be followed -- the parent is absent, is the child itself, either
+# creation key is not a 20-digit key, or the parent was created AFTER the child.
+# That last case is a RECYCLED pid and is recorded, by name, for the footer.
+# [!] Unknown ends the chain rather than extending it. Every direction that
+#   follows from a SHORTER chain is loud -- a foreign compiler REPORTED, or a
+#   contender REFUSED -- and the direction a longer, unproven chain produces is
+#   the silent one this rule exists to remove.
+function Get-RunGateTrustedParent([hashtable]$ById, [int]$Child) {
+    if (-not $ById.ContainsKey($Child)) { return 0 }
+    $p = [int]$ById[$Child].ParentId
+    if ($p -eq 0 -or $p -eq $Child -or -not $ById.ContainsKey($p)) { return 0 }
+    $ck = [string]$ById[$Child].Created
+    $pk = [string]$ById[$p].Created
+    if ($ck -notmatch '^[0-9]{20}$' -or $pk -notmatch '^[0-9]{20}$') { return 0 }
+    if ([string]::CompareOrdinal($pk, $ck) -gt 0) {
+        $tag = "$Child>$p"
+        if ($script:RunGateRecycled -notcontains $tag) { $script:RunGateRecycled += $tag }
+        return 0
+    }
+    return $p
 }
 
 # ── THE TWO IMAGE SETS, EACH SPELLED ONCE (twin of run-gate.sh) ─────────────
@@ -569,6 +640,7 @@ function Get-RunGateContention {
     $script:RunGateTableOk       = $false
     $script:RunGateRelativeMatch = $false
     $script:RunGateForeign       = @()
+    $script:RunGateRecycled      = @()
     # [!] NO EARLY RETURN ON AN UNNAMED BUILD DIRECTORY. This function answers
     # TWO questions and only the first has the build directory as its subject.
     $table = Get-RunGateProcessTable
@@ -588,6 +660,13 @@ function Get-RunGateContention {
     # that reaches a login shell or a session manager makes EVERY process on
     # the host a descendant of one of my ancestors, and the check then reports
     # nothing, ever.
+    #
+    # ★★ BOTH WALKS FOLLOW PARENT LINKS, SO BOTH GO THROUGH Get-RunGateTrustedParent.
+    # A recycled pid misleads the upward walk from THIS process exactly as it
+    # misleads the one from a compiler: an unrelated ctest holding our dead parent's
+    # pid would be adopted as an ancestor, its tree read as ours, and a real
+    # contender in it excluded -- exit 0 where 4 is owed. Twin of the one awk pass,
+    # and its one `parent_of`, in run_gate_classify_table (run-gate.sh).
     $byId = @{}
     foreach ($r in $table) { if (-not $byId.ContainsKey($r.ProcId)) { $byId[$r.ProcId] = $r } }
     $exclude = @{}
@@ -601,7 +680,7 @@ function Get-RunGateContention {
             ($script:RunGateBuildTools -contains (Get-RunGateImageKey $byId[$walk].Argv0))) {
             foreach ($c in $chain) { $own[$c] = $true }
         }
-        $walk = $byId[$walk].ParentId
+        $walk = Get-RunGateTrustedParent $byId $walk
         $depth++
         if ($walk) { $chain += $walk }
     }
@@ -611,14 +690,14 @@ function Get-RunGateContention {
     foreach ($r in $table) {
         # EITHER spelling. On macOS only Argv0 can ever match; matching either can
         # only ADD a detection, so no host loses one. Twin of the `key()` pair in
-        # run_gate_foreign_from_table.
+        # run_gate_classify_table.
         if ((Get-RunGateImageKey $r.Image) -ne $script:RunGateCompilerImage -and
             (Get-RunGateImageKey $r.Argv0) -ne $script:RunGateCompilerImage) { continue }
         $a = $r.ProcId; $d = 0; $ours = $false
         while ($a -and $d -lt 24) {
             if ($own.ContainsKey($a)) { $ours = $true; break }
             if (-not $byId.ContainsKey($a)) { break }
-            $a = $byId[$a].ParentId
+            $a = Get-RunGateTrustedParent $byId $a
             $d++
         }
         if ($ours) { continue }
@@ -688,11 +767,13 @@ function Save-RunGateContentionSample([string]$When) {
     # has three early returns, and a capture written after them would silently
     # skip exactly the samples whose answer this line is about.
     if ($When -eq 'before') {
-        $script:RunGateForeignBefore = $script:RunGateForeign
-        $script:RunGateTableOkBefore = $script:RunGateTableOk
+        $script:RunGateForeignBefore  = $script:RunGateForeign
+        $script:RunGateTableOkBefore  = $script:RunGateTableOk
+        $script:RunGateRecycledBefore = $script:RunGateRecycled
     } else {
-        $script:RunGateForeignAfter = $script:RunGateForeign
-        $script:RunGateTableOkAfter = $script:RunGateTableOk
+        $script:RunGateForeignAfter  = $script:RunGateForeign
+        $script:RunGateTableOkAfter  = $script:RunGateTableOk
+        $script:RunGateRecycledAfter = $script:RunGateRecycled
     }
 }
 
@@ -1031,6 +1112,15 @@ if ($null -eq $rc) {
     $rc = 0
 }
 
+# ★★★ THE WITNESS IS READ HERE, FROM THE COMMAND'S OWN OUTPUT, BEFORE THIS WRAPPER
+# WRITES ONE WORD INTO THE LOG - twin of the same block in run-gate.sh, which
+# carries the measurement: the footer records the command's argv, so a witness
+# searched for after it matched the wrapper's own sentence, and a command that
+# printed nothing was reported OK by both twins. Found and fixed in the lane that closed
+# D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY
+# (i) Only the RESULT is taken here; the refusal order below is unchanged.
+$witnessSeen = [bool](Select-String -LiteralPath $LogPath -Pattern $SuccessPattern -Quiet)
+
 $snapshotOk = $true
 if (-not (Test-Path -LiteralPath $script:RunGateInputsBefore)) {
     $snapshotOk = $false
@@ -1141,6 +1231,15 @@ if ($samplesRead -eq 0) {
         Add-Content -LiteralPath $LogPath -Value "            $($u.CmdLine)"
     }
 }
+# ★ A LINK THE RULE REFUSED IS NAMED - twin of the same line in run-gate.sh, for
+# its reason: refusing the link CHANGED a verdict, and without this line that
+# judgement is invisible to a reader lining up the pid columns by hand. Printed
+# only when a link was refused; an observation, never a refusal.
+# D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY
+$recycled = @(@($script:RunGateRecycledBefore) + @($script:RunGateRecycledAfter) | Where-Object { $_ } | Select-Object -Unique)
+if ($recycled.Count -gt 0) {
+    Add-Content -LiteralPath $LogPath -Value "ancestry: $($recycled.Count) parent link(s) NOT followed - each named a parent created AFTER its child, i.e. a RECYCLED pid, not an ancestor (child>parent): $(($recycled | Select-Object -First 8) -join ' ')"
+}
 
 # Checked BEFORE rc, and before the witness: a run whose inputs moved has no
 # verdict to report, and calling it a pass or a failure is the misattribution
@@ -1211,7 +1310,7 @@ if ($rc -ne 0) {
     exit $rc
 }
 
-if (-not (Select-String -LiteralPath $LogPath -Pattern $SuccessPattern -Quiet)) {
+if (-not $witnessSeen) {
     Write-Host "run-gate.ps1: FAIL - command exited 0 but its output never matched the"
     Write-Host "  success witness /$SuccessPattern/, so there is NO EVIDENCE it did any work."
     Write-Host "  An exit code alone cannot distinguish 'passed' from 'never ran'."

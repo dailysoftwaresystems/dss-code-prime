@@ -586,9 +586,10 @@ run_gate_dir_named_by_argv() {   # <argv...>
     return 1
 }
 
-# pid <TAB> ppid <TAB> image <TAB> command-line <TAB> argv0-image, one row per
-# live process. TWO spellings of the image, and that is the whole point of the
-# fifth column.
+# pid <TAB> ppid <TAB> image <TAB> command-line <TAB> argv0-image <TAB> created,
+# one row per live process. TWO spellings of the image, and that is the whole
+# point of the fifth column. The sixth is what makes the SECOND column safe to
+# follow at all — see "A PARENT LINK IS A CLAIM ABOUT ORDER" below.
 #
 # ★★★ `comm` IS NOT AN IMAGE NAME ON macOS, AND THE CHECKS BUILT ON IT WERE
 # STRUCTURALLY BLIND THERE. [D-SCRIPT-RUN-GATE-MATCHES-AN-IMAGE-AGAINST-A-COMM-COLUMN-THAT-IS-A-TRUNCATED-PATH-ON-MACOS]
@@ -620,6 +621,55 @@ run_gate_dir_named_by_argv() {   # <argv...>
 # of it. `pwsh` was measured SLOWER to start (877–944 ms) and `Get-Process`
 # slower still (1494–1575 ms), so `powershell` is preferred and `pwsh` is the
 # fallback. Two checks per gate is ~1.6 s against gates that run for minutes.
+#
+# ★★★ A PARENT LINK IS A CLAIM ABOUT ORDER, AND ON WINDOWS IT GOES STALE.
+# D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY
+# Windows does NOT reparent an orphan: `ParentProcessId` keeps naming the dead
+# parent's pid, and pids are RECYCLED. ✔MEASURED 2026-09-14 on this workstation:
+#   · under MSYS nearly every process is an orphan FROM BIRTH. A bash started
+#     from another bash already reads `ppid=26144 NOT IN TABLE` (fork, exec in
+#     the fork child, the fork child exits), and so does a background job;
+#   · a freed pid is handed out again after ~108 allocations — 400 sequential
+#     spawns gave 36 repeats, every gap 108 or 217 — and threads draw from the
+#     same table, so under a parallel build that is well under a second.
+# ⇒ both walks below could climb from a process into WHATEVER NOW HOLDS its dead
+# parent's pid. ✔REPRODUCED DETERMINISTICALLY, by handing this file's own
+# classifier the table such a recycle produces, before this rule existed:
+#   · a foreign compiler whose dead parent's pid went to this gate's OWN
+#     sampler read as ours — `compilers: none` with a foreign compiler alive;
+#   · a gate whose own dead parent's pid went to an unrelated `ctest.exe`
+#     adopted that ctest's whole tree, and the build-directory exclusion below
+#     then waves through a real contender: exit 0 where 4 is owed, SILENTLY.
+# ★ THE RULE (`parent_of` in run_gate_classify_table, and Get-RunGateTrustedParent
+# in the twin): a process can only be the parent of a process created AFTER it.
+# A link naming a parent created LATER is a recycled pid and the chain ENDS
+# there; an unknown creation time on either side ends it too. A shorter chain
+# fails LOUD — a compiler reported, a contender refused — and a longer unproven
+# one is the silent direction this rule exists to remove.
+# ⓘ POSIX REPARENTS an orphan to an OLDER live process, ✔MEASURED on all three
+# carriages: WSL -> `Relay(599)`, macOS -> launchd (pid 1), arm64 VPS -> systemd
+# (pid 1). The rule cannot fire there; it is applied anyway, so both twins decide
+# by ONE rule on every host rather than by a host fork.
+# ⓘ THE KEY is `yyyyMMddHHmmssffffff`, UTC, 20 digits, compared as a STRING — as
+# a number it exceeds a double's exact range and awk would order it wrongly.
+# Windows: CIM `CreationDate`, microseconds, InvariantCulture (a custom date
+# format under a non-Gregorian culture prints a different year). POSIX: `lstart`
+# under `LC_ALL=C TZ=UTC`, seconds, so equal keys are trusted — ✔`etimes` does
+# not exist on macOS (`ps: etimes: keyword not found`) and `lstart` exists on all
+# three; C for English month names, UTC so a DST fall-back cannot order a child
+# before its parent. A `ps` without `lstart` yields NO table and reads as blind
+# (`UNKNOWN`), which is the honest answer for a host that cannot say who is whose.
+#
+# ⚠⚠ ONE ROW PER PROCESS IS A PROPERTY OF THE COMMAND LINE, AND ON WINDOWS A
+# COMMAND LINE CAN HOLD A NEWLINE. The CIM query used to replace only TABS in it.
+# ✔MEASURED 2026-09-14 on this workstation: the VS Code PowerShell extension's
+# `pwsh.exe` carries a multi-line `-Command`, and this table came back with that
+# process's row cut short and FOUR invented rows after it —
+# `Copyright (c) Microsoft Corporation.`, `https://aka.ms/vscode-powershell`, … —
+# each one "a process" whose pid column is prose. The trailing columns (argv0,
+# and now the creation key) landed on the wrong line. The `.ps1` twin holds
+# OBJECTS and never saw it: a parity break inside the pair, invisible on any
+# host without such a process. ⇒ CR, LF and TAB all become a space, in both twins.
 run_gate_process_table() {
     if run_gate_is_windows; then
         _rg_pssh=""
@@ -627,16 +677,25 @@ run_gate_process_table() {
             if command -v "$_rg_c" >/dev/null 2>&1; then _rg_pssh="$_rg_c"; break; fi
         done
         [ -n "$_rg_pssh" ] || return 1
-        "$_rg_pssh" -NoProfile -NonInteractive -Command '$ErrorActionPreference="SilentlyContinue"; Get-CimInstance Win32_Process | ForEach-Object { $_.ProcessId.ToString() + "`t" + $_.ParentProcessId.ToString() + "`t" + $_.Name + "`t" + ($_.CommandLine -replace "`t", " ") + "`t" + $_.Name }' 2>/dev/null | tr -d '\r'
+        "$_rg_pssh" -NoProfile -NonInteractive -Command '$ErrorActionPreference="SilentlyContinue"; $inv = [Globalization.CultureInfo]::InvariantCulture; Get-CimInstance Win32_Process | ForEach-Object { $cr = ""; if ($_.CreationDate) { $cr = $_.CreationDate.ToUniversalTime().ToString("yyyyMMddHHmmssffffff", $inv) }; $_.ProcessId.ToString() + "`t" + $_.ParentProcessId.ToString() + "`t" + $_.Name + "`t" + ($_.CommandLine -replace "[`t`r`n]", " ") + "`t" + $_.Name + "`t" + $cr }' 2>/dev/null | tr -d '\r'
     else
-        ps -eo pid=,ppid=,comm=,args= 2>/dev/null |
+        LC_ALL=C TZ=UTC ps -eo pid=,ppid=,lstart=,comm=,args= 2>/dev/null |
             awk '{
-                p=$1; q=$2; c=$3; $1=""; $2=""; $3=""; sub(/^[ \t]+/, "")
-                cl=$0
-                a0=cl; sub(/[ \t].*$/, "", a0)   # argv[0], whole-path
-                sub(/^.*\//, "", a0)             # ... basenamed
-                sub(/^.*\//, "", c)              # comm, basenamed
-                printf "%s\t%s\t%s\t%s\t%s\n", p, q, c, cl, a0
+                p = $1; q = $2
+                # lstart is FIVE fields: weekday, month, day, HH:MM:SS, year.
+                mi = index("JanFebMarAprMayJunJulAugSepOctNovDec", $4)
+                n = split($6, hms, ":")
+                cr = ""
+                if (length($4) == 3 && mi > 0 && (mi - 1) % 3 == 0 && n == 3 && ($5 $7 hms[1] hms[2] hms[3]) ~ /^[0-9]+$/)
+                    cr = sprintf("%04d%02d%02d%02d%02d%02d000000", $7, (mi + 2) / 3, $5, hms[1], hms[2], hms[3])
+                c = $8
+                for (i = 1; i <= 8; i++) $i = ""
+                sub(/^[ \t]+/, "")
+                cl = $0
+                a0 = cl; sub(/[ \t].*$/, "", a0)   # argv[0], whole-path
+                sub(/^.*\//, "", a0)               # ... basenamed
+                sub(/^.*\//, "", c)                # comm, basenamed
+                printf "%s\t%s\t%s\t%s\t%s\t%s\n", p, q, c, cl, a0, cr
             }'
     fi
 }
@@ -699,8 +758,22 @@ run_gate_candidates_from_table() {
         }'
 }
 
-# Every live `dsscp` that is NOT part of THIS gate's own process tree, one row:
-#   pid <TAB> image <TAB> command-line
+# THIS GATE'S OWN LINEAGE, AND EVERY LIVE `dsscp` OUTSIDE IT — one awk pass over
+# the table, one line per fact:
+#   EXCLUDE  <TAB> every ancestor of this shell reached by a FOLLOWED link, this shell first
+#   OWN      <TAB> the BOUNDED prefix of that chain (see below)
+#   FOREIGN  <TAB> pid <TAB> image <TAB> command-line   one per compiler outside OWN
+#   RECYCLED <TAB> child <TAB> parent                   one per link NOT followed
+#                                                        because the parent is YOUNGER
+#
+# ★★ ONE PASS, AND ONE SPELLING OF `parent_of`. BOTH walks follow parent links —
+# this shell's up towards the build machinery, every compiler's up towards this
+# shell — so BOTH carry the recycled-pid rule described above
+# run_gate_process_table, and two awk programs would be two spellings of it.
+# ⓘ It also retires the shell loop that walked this shell's ancestry with three
+# awk spawns per ancestor. And it is a PURE FUNCTION of (table, this shell's
+# pid): nothing in it reads the machine, which is what lets test-run-gate.sh
+# hand it the exact table a recycled pid produces.
 #
 # ★★★ THE DISCRIMINATOR IS DESCENT, AND THE NAIVE VERSION IS USELESS. This
 # gate's own `ctest` spawns hundreds of `dsscp` children, so *any live dsscp*
@@ -720,46 +793,84 @@ run_gate_candidates_from_table() {
 # sibling `dsscp` processes belong to the same logical run — and it cannot
 # widen past the build machinery no matter how the caller was launched.
 #
-# ⓘ ONE awk PASS, not a shell loop calling awk per ancestor: awk builds the
-# pid → ppid map itself. The shell version was O(processes x depth) subshells
-# on a table this file already measured at 534 rows.
-run_gate_foreign_from_table() {   # <own-pid-list>
-    awk -F'\t' -v own="$1" -v want="$run_gate_compiler_image" '
+# ⓘ awk builds the pid → ppid map itself. The shell version was O(processes x
+# depth) subshells on a table this file already measured at 534 rows.
+run_gate_classify_table() {   # <this shell's pid, in the table's namespace>
+    awk -F'\t' -v self="$1" -v tools=" $run_gate_build_tools " -v want="$run_gate_compiler_image" '
         function key(s) { s = tolower(s); sub(/\.exe$/, "", s); return s }
-        BEGIN { n = split(own, o, " "); for (i = 1; i <= n; i++) if (o[i] != "") OWN[o[i]] = 1 }
-        { par[$1] = $2; nm[$1] = $3; cl[$1] = $4; a0[$1] = $5; order[++k] = $1 }
+        # BOTH image spellings, as everywhere else in this file.
+        function is_tool(p,   k) {
+            k = key(nm[p]); if (k != "" && index(tools, " " k " ") > 0) return 1
+            k = key(a0[p]); return (k != "" && index(tools, " " k " ") > 0)
+        }
+        function valid(k) { return length(k) == 20 && k ~ /^[0-9]+$/ }
+        # ★ THE ONE RULE — "A PARENT LINK IS A CLAIM ABOUT ORDER" above
+        # run_gate_process_table. The parent of c, or "" when the link must NOT
+        # be followed: absent, itself, a key that is not 20 digits, or created
+        # AFTER c — a recycled pid, recorded once per link for the footer.
+        # ⚠ The keys are compared as STRINGS on purpose (`"" ...`): 20 digits
+        # exceed a double, so a numeric comparison would order them wrongly.
+        function parent_of(c,   p) {
+            p = par[c]
+            if (p == "" || p == c || !(p in row)) return ""
+            if (!valid(cr[c]) || !valid(cr[p])) return ""
+            if ((cr[p] "") > (cr[c] "")) {
+                if (!((c, p) in refused)) { refused[c, p] = 1; rec[++nrec] = c "\t" p }
+                return ""
+            }
+            return p
+        }
+        $1 != "" { row[$1] = 1; par[$1] = $2; nm[$1] = $3; cl[$1] = $4; a0[$1] = $5; cr[$1] = $6; order[++k] = $1 }
         END {
+            # 1. THIS SHELL, UP: every followed ancestor is excluded from the
+            #    build-directory question; the prefix up to the OUTERMOST build
+            #    tool is "own" for the compiler question.
+            walk = self; d = 0; chain = ""; own = self; exclude = ""
+            while (walk != "" && d < 24) {
+                exclude = exclude " " walk
+                chain = chain " " walk
+                if (!(walk in row)) break
+                if (is_tool(walk)) own = chain
+                walk = parent_of(walk); d++
+            }
+            n = split(own, o, " ")
+            for (i = 1; i <= n; i++) if (o[i] != "") OWN[o[i]] = 1
+            # 2. EVERY COMPILER, UP, until it reaches OWN or a link ends.
             for (i = 1; i <= k; i++) {
                 p = order[i]
                 # EITHER spelling — the comm basename or the argv[0] basename.
                 # On macOS only the second one can ever match; see the note
                 # above run_gate_process_table.
-                m = key(nm[p])
-                if (m != want && key(a0[p]) != want) continue
-                m = want
+                if (key(nm[p]) != want && key(a0[p]) != want) continue
                 a = p; d = 0; ours = 0
                 while (a != "" && d < 24) {
                     if (a in OWN) { ours = 1; break }
-                    if (!(a in par)) break
-                    a = par[a]; d++
+                    if (!(a in row)) break
+                    a = parent_of(a); d++
                 }
                 if (ours) continue
-                # ⚠ `m`, not `nm[p]`: on macOS the comm column is a truncated
+                # ⚠ `want`, not `nm[p]`: on macOS the comm column is a truncated
                 # PATH, so printing it here would name the process by a string
                 # the reader cannot grep for. The command line beside it carries
                 # the whole truth.
-                print p "\t" m "\t" cl[p]
+                print "FOREIGN\t" p "\t" want "\t" cl[p]
             }
+            print "EXCLUDE\t" exclude
+            print "OWN\t" own
+            for (i = 1; i <= nrec; i++) print "RECYCLED\t" rec[i]
         }'
 }
 
 # The refusal text, shared by the pre-run and post-run arms so the two cannot
 # drift into describing the same fact differently.
 run_gate_contenders="" ; run_gate_unreadable=0 ; run_gate_table_ok=0 ; run_gate_relative_match=0
-run_gate_foreign=""
-run_gate_scan_contention() {   # sets run_gate_contenders / run_gate_unreadable / run_gate_table_ok / run_gate_foreign
+run_gate_foreign="" ; run_gate_recycled=""
+# ONE tab and ONE newline, spelled once, for the fields this file reassembles.
+run_gate_tab=$'\t'
+run_gate_nl=$'\n'
+run_gate_scan_contention() {   # sets run_gate_contenders / run_gate_unreadable / run_gate_table_ok / run_gate_foreign / run_gate_recycled
     run_gate_contenders=""; run_gate_unreadable=0; run_gate_table_ok=0; run_gate_relative_match=0
-    run_gate_foreign=""
+    run_gate_foreign=""; run_gate_recycled=""
     # ⚠ NO EARLY RETURN ON AN UNNAMED BUILD DIRECTORY ANY MORE. This function
     # now answers TWO questions, and only the first one has the build directory
     # as its subject; `run-gate.sh <log> <witness> bash -c …` names no build
@@ -773,42 +884,28 @@ run_gate_scan_contention() {   # sets run_gate_contenders / run_gate_unreadable 
     # otherwise refuse itself the moment it named the same tree.
     # ⓘ TWO SETS COME OUT OF ONE WALK. `_rg_exclude` is every ancestor — the
     # build-directory question asks *did I name this myself*, and any ancestor
-    # of mine did. `_rg_own` is the BOUNDED prefix documented on
-    # `run_gate_foreign_from_table`, because the machine-wide question asks
+    # of mine did. OWN is the BOUNDED prefix documented on
+    # `run_gate_classify_table`, because the machine-wide question asks
     # *is this process part of my run*, which a login shell three levels up
     # does not make true.
+    # ⓘ BOTH walks, BOTH image spellings for an ancestor build tool (an ancestor
+    # `ctest` on macOS is `comm`ed as a truncated path), and the recycled-pid rule
+    # they share now live in that one awk pass. This function reads the verdict.
     _rg_self="$(run_gate_self_pid)"
+    [ -n "$_rg_self" ] || run_gate_contention_note="ancestry: UNRESOLVED (this shell's pid was not found in the process table; nothing was excluded, and every live compiler reads as external)"
     _rg_exclude=""
-    _rg_own=""
-    if [ -n "$_rg_self" ]; then
-        _rg_walk="$_rg_self"; _rg_depth=0; _rg_chain=""; _rg_own=" $_rg_self"
-        while [ -n "$_rg_walk" ] && [ "$_rg_depth" -lt 24 ]; do
-            _rg_exclude="$_rg_exclude $_rg_walk"
-            _rg_chain="$_rg_chain $_rg_walk"
-            # BOTH spellings again — an ancestor `ctest` on macOS is `comm`ed as a
-            # truncated path, and an ancestor that is not recognised as a build
-            # tool narrows `own`, which makes this gate's OWN children read as
-            # foreign. Same two columns, same rule, third site.
-            _rg_aimg="$(printf '%s\n' "$_rg_tbl" | awk -F'\t' -v p="$_rg_walk" '$1 == p { print tolower($3); exit }')"
-            _rg_aimg="${_rg_aimg%.exe}"
-            _rg_aalt="$(printf '%s\n' "$_rg_tbl" | awk -F'\t' -v p="$_rg_walk" '$1 == p { print tolower($5); exit }')"
-            _rg_aalt="${_rg_aalt%.exe}"
-            case " $run_gate_build_tools " in
-                *" $_rg_aimg "*) _rg_own="$_rg_chain" ;;
-                *) case " $run_gate_build_tools " in
-                       *" $_rg_aalt "*) _rg_own="$_rg_chain" ;;
-                   esac ;;
-            esac
-            _rg_walk="$(printf '%s\n' "$_rg_tbl" | awk -F'\t' -v p="$_rg_walk" '$1 == p { print $2; exit }')"
-            _rg_depth=$((_rg_depth + 1))
-        done
-    else
-        run_gate_contention_note="ancestry: UNRESOLVED (this shell's pid was not found in the process table; nothing was excluded, and every live compiler reads as external)"
-    fi
-
-    # THE MACHINE-WIDE SUBJECT. Asked whether or not a build directory was
-    # named, and never fatal — see the footer for why.
-    run_gate_foreign="$(printf '%s\n' "$_rg_tbl" | run_gate_foreign_from_table "$_rg_own")"
+    _rg_class="$(printf '%s\n' "$_rg_tbl" | run_gate_classify_table "$_rg_self")"
+    while IFS="$run_gate_tab" read -r _rg_kind _rg_f1 _rg_f2 _rg_f3; do
+        case "$_rg_kind" in
+            EXCLUDE)  _rg_exclude="$_rg_f1" ;;
+            # THE MACHINE-WIDE SUBJECT. Asked whether or not a build directory
+            # was named, and never fatal — see the footer for why.
+            FOREIGN)  run_gate_foreign="${run_gate_foreign}${_rg_f1}${run_gate_tab}${_rg_f2}${run_gate_tab}${_rg_f3}${run_gate_nl}" ;;
+            RECYCLED) run_gate_recycled="${run_gate_recycled}${_rg_f1}>${_rg_f2}${run_gate_nl}" ;;
+        esac
+    done <<EOF
+$_rg_class
+EOF
 
     [ -n "$run_gate_build_dir" ] || return 0
 
@@ -868,8 +965,8 @@ EOF
 # report needs to say WHICH sample saw each process: *alongside you the whole
 # time* and *ran while you worked and exited* are different facts about your
 # verdict, and collapsing them loses the one that explains a mid-run red.
-run_gate_foreign_before="" ; run_gate_table_ok_before=0
-run_gate_foreign_after=""  ; run_gate_table_ok_after=0
+run_gate_foreign_before="" ; run_gate_table_ok_before=0 ; run_gate_recycled_before=""
+run_gate_foreign_after=""  ; run_gate_table_ok_after=0  ; run_gate_recycled_after=""
 run_gate_sample_contention() {   # <before|after> — scan, then RECORD that sample
     run_gate_scan_contention
     # ⚠ The recording lives HERE and not at the end of the scan: that function
@@ -879,9 +976,11 @@ run_gate_sample_contention() {   # <before|after> — scan, then RECORD that sam
     if [ "$1" = before ]; then
         run_gate_foreign_before="$run_gate_foreign"
         run_gate_table_ok_before="$run_gate_table_ok"
+        run_gate_recycled_before="$run_gate_recycled"
     else
         run_gate_foreign_after="$run_gate_foreign"
         run_gate_table_ok_after="$run_gate_table_ok"
+        run_gate_recycled_after="$run_gate_recycled"
     fi
 }
 
@@ -1208,6 +1307,21 @@ fi
 "$@" >>"$log" 2>&1
 rc=$?
 
+# ★★★ THE WITNESS IS READ HERE, FROM THE COMMAND'S OWN OUTPUT, BEFORE THIS WRAPPER
+# WRITES ONE WORD INTO THE LOG. Found and fixed in the lane that closed
+# D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY
+# ✔MEASURED 2026-09-14, both twins: the footer below records `command : <argv>`,
+# and the witness used to be grepped over the WHOLE log after it — so
+#   run-gate.sh <log> 'ZQX-WITNESS' bash -c ': ZQX-WITNESS'
+# a command that printed NOTHING, came back `run-gate.sh: OK`, and the .ps1 twin
+# said the same of `$null = "ZQX-WITNESS"`. The evidence the wrapper found was the
+# sentence it had just written — exactly the case the witness exists to refuse: an
+# exit code with no work behind it, whenever a witness is also spelled in the argv.
+# ⓘ Only the RESULT is taken here. The refusal order below is unchanged, so a moved
+#   tree, a contended build directory, 127 and a non-zero rc still outrank it.
+run_gate_witness_seen=0
+grep -qE "$witness" "$log" && run_gate_witness_seen=1
+
 run_gate_snapshot_ok=1
 if [ ! -f "$run_gate_inputs_before" ]; then
     run_gate_snapshot_ok=0
@@ -1319,6 +1433,16 @@ run_gate_sample_contention after
         printf '%s\n' "$run_gate_union" |
             awk -F'\t' '$1 != "" { printf "          pid %s  %s  seen %s\n            %s\n", $1, $2, $3, $4 }'
     fi
+    # ★ A LINK THE RULE REFUSED IS NAMED, because refusing it CHANGED a verdict: a
+    # process whose parent pid points into this gate's tree was judged NOT to
+    # descend from it. Without this line the judgement is invisible, and a reader
+    # lining up the pid columns by hand would call it a defect. Printed only when
+    # a link was refused; an observation, never a refusal.
+    # D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY
+    run_gate_recycled_union="$(printf '%s%s' "$run_gate_recycled_before" "$run_gate_recycled_after" | awk 'NF && !seen[$0]++')"
+    if [ -n "$run_gate_recycled_union" ]; then
+        echo "ancestry: $(printf '%s\n' "$run_gate_recycled_union" | grep -c .) parent link(s) NOT followed — each named a parent created AFTER its child, i.e. a RECYCLED pid, not an ancestor (child>parent): $(printf '%s\n' "$run_gate_recycled_union" | head -8 | tr '\n' ' ')"
+    fi
     [ -n "$run_gate_contention_note" ] && echo "$run_gate_contention_note"
 } >> "$log"
 
@@ -1398,7 +1522,7 @@ if [ "$rc" -ne 0 ]; then
     exit "$rc"
 fi
 
-if ! grep -qE "$witness" "$log"; then
+if [ "$run_gate_witness_seen" -ne 1 ]; then
     echo "run-gate.sh: FAIL — command exited 0 but its output never matched the" >&2
     echo "  success witness /$witness/, so there is NO EVIDENCE it did any work." >&2
     echo "  An exit code alone cannot distinguish 'passed' from 'never ran'." >&2

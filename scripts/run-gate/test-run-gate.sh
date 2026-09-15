@@ -2,13 +2,16 @@
 # test-run-gate.sh -- prove BOTH run-gate twins refuse a run whose evidence is
 # spoiled, and that they still pass a run whose evidence is intact.
 #
-# FOUR SUBJECTS, one fixture, because they are one contract:
+# SEVEN SUBJECTS, one fixture, because they are one contract:
 #   * the SOURCE TREE moving under the run          -> exit 3
 #   * ANOTHER RUN live in the same BUILD DIRECTORY  -> exit 4
 #   * WHICH TREE those roots are read from at all   -> 3 or 0, and which one it
 #     was must be readable from the log ALONE
 #   * whether a file's TIMESTAMP can decide either answer -> it must not, in
 #     EITHER direction, because one carriage's clock is not monotonic
+#   * a COMPILER running outside this gate's process tree -> NAMED, never refused
+#   * a PARENT LINK that names a RECYCLED PID       -> never followed
+#   * a WITNESS found only in the wrapper's OWN footer -> exit 1, not evidence
 #
 # ⚠⚠ THE THIRD SUBJECT IS THE ONE WHOSE FAILURE IS SILENT, and that is why it is
 #   proved in BOTH directions rather than only the refusing one. The input roots
@@ -27,14 +30,24 @@
 # the long block about that in run-gate.sh). A flag could not be spelled without
 # colliding with that refusal, so the proof lives beside the subject instead --
 # the same shape as scripts/lane-worktree/test-lane-worktree.sh.
+# ⓘ `__stand-in <verb>` IS NOT A FLAG OF THE SUBJECT. It is this FIXTURE calling
+#   back into itself for the processes it plants (see THE STAND-IN LIFECYCLE), so
+#   that every piece of choreography lives in one reviewed file rather than in a
+#   helper generated at run time.
 #
 # ! THE CONTROLS ARE THE POINT. Arms 1, 4, 7, 9, 14 and 16 must PASS: without
 #   them, a green refusal arm is equally consistent with "this wrapper now
 #   refuses everything".
 # ! The mutations are REAL -- a real edit to a real read-at-test-time root while
-#   the gate command runs, and a real second `ctest` alive in the same build
-#   directory -- rather than simulations with a pre-dated marker or a fake
-#   process table.
+#   the gate command runs, a real second `ctest` alive in the same build
+#   directory, a real compiler-named process alive beside the gate -- rather than
+#   simulations with a pre-dated marker or a fake process table.
+#   ⚠ WITH ONE NAMED EXCEPTION, AND ITS REASON: arms 31-33 hand the subject's OWN
+#   classifier a CONSTRUCTED table, because the state they are about cannot be
+#   produced on demand. ✔MEASURED 2026-09-14: Windows hands a freed pid back only
+#   after ~108 allocations, and to a process nobody chooses; every POSIX carriage
+#   REPARENTS an orphan, so the state is unreachable there at all. The REAL arms
+#   23, 24 and 28 remain the proof that the real table carries keys that work.
 #
 # ⚠⚠ THIS FIXTURE RUNS INSIDE A SANDBOX TREE AND MUST KEEP DOING SO.
 #   ✔MEASURED 2026-09-07 (P63): the first version hard-coded
@@ -65,6 +78,49 @@
 #       that plainly contains the string. Read it through `logtext`, never
 #       directly -- otherwise this fixture reports a defect in the subject that
 #       belongs to the reader.
+#
+# ═══ NO ARM MAY DEPEND ON THE WALL CLOCK ══════════════════════════════════════
+# [[D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY]]
+# ⚠⚠⚠ CI WENT RED ON THIS FIXTURE THREE TIMES, AND IT WAS "FIXED" TWICE BY MOVING A
+#   NUMBER. The primitive was `plant_foreign_compiler <seconds>`: a copy of `sleep`
+#   with a FIXED lifetime, planted and forgotten, and every compiler arm then
+#   ASSUMED the subject would sample inside that lifetime -- a claim about HOST
+#   SPEED, never about run-gate. ✔MEASURED 2026-09-14 on the Windows workstation,
+#   against COPIES of both twins slowed immediately ahead of their first
+#   process-table read (the shipped scripts untouched):
+#     · arm 28's 3 s stand-in was still named at +2.0 s of delay and missed at
+#       +2.5 s, on BOTH twins. Unslowed, the .sh twin finishes its first sample
+#       1.3-1.45 s after planting and the .ps1 twin 1.0-1.2 s, so a runner that is
+#       2.3x slower puts the .sh twin at the edge and the .ps1 twin under it --
+#       which is the CI signature;
+#     · at +5 s this fixture printed that signature exactly: 28 red on
+#       `compilers: none`, 29 green, `30-parity-union .sh reported=0 .ps1 reported=1`;
+#     · at +3 s it went GREEN, and `a28.log` named ARM 24's 12 s stand-in, still
+#       alive: an arm PASSING on a leftover of the arm before it.
+#   And ctest holds a test's output until the test ends (✔MEASURED with
+#   `--output-on-failure`, the CI flag: three lines written one second apart
+#   arrived 30 ms apart, after the test), which is why the CI log could not say
+#   which arm was slow however this file flushed.
+# ⇒ THE CHOREOGRAPHY, and each clause removes one way the clock could decide:
+#   · a stand-in has NO lifetime. It lives until this fixture stops it, by its
+#     recorded PID and never by image name -- a real build on the same machine
+#     runs real `dsscp` -- and one this fixture could not stop ends itself at a
+#     LEAK bound that is reported as a failure, never counted as a stop;
+#   · every plant BLOCKS until the stand-in is observed present and every stop
+#     BLOCKS until it is observed gone, by an instrument that is NOT the subject's:
+#     its own PID through `kill -0` on POSIX, MSYS's `ps -W` on Windows, never CIM;
+#   · a compiler that must exit MID-RUN is stopped by the GATED COMMAND. Both twins
+#     take their pre-run sample before they start the command and their post-run
+#     sample after it returns, so "alive for the first, gone for the second" holds
+#     at any host speed;
+#   · every assertion about a stand-in names ITS pid, so no leftover can pass it;
+#   · arm 23's ordering is ctest's own DEPENDS, and a contender is released by the
+#     same PID stop -- no settle sleeps anywhere;
+#   · a bounded wait is a HANG GUARD: exceeding it FAILS a named fixture
+#     precondition, is never a skip, and is never reported as run-gate's verdict;
+#   · every arm line carries its own clock (`at +S.SSs took S.SSs`, wall clock,
+#     so WSL's stepping clock can distort it -- diagnostics only), and every
+#     stand-in arm prints its independent reading before and after the gate.
 #
 # ⚠⚠ THE .ps1 ARMS ARE HOST-CONDITIONAL, AND THAT CONDITION IS THE ONLY ESCAPE IN
 #   THIS FIXTURE. Not every carriage this project gates on carries a PowerShell,
@@ -98,12 +154,12 @@
 #     the same predicate the subject uses). PowerShell ships with that OS and
 #     `CMakeLists.txt` already refuses to configure without one, so a Windows host
 #     answering "no PowerShell" has a broken PATH, not a legitimate absence --
-#     and left escapable it would silently drop all NINE .ps1 arms on the one host
+#     and left escapable it would silently drop every .ps1 arm on the one host
 #     category where twin parity is actually proved, while reporting green for
 #     doing less work.
 #   ★ THE .sh ARMS ARE NEVER ESCAPABLE. A host with no PowerShell still proves the
-#     .sh twin: arms 1, 2, 3, 7, 8, 12, 13, 14, 18 and 19 run everywhere,
-#     unconditionally.
+#     .sh twin: arms 1, 2, 3, 7, 8, 12, 13, 14, 18, 19, 31, 34 and 35 run
+#     everywhere, unconditionally, and 23, 24 and 28 wherever a stand-in can run.
 #
 # ⚠⚠ THE REACH OF THIS GUARD -- WHERE TWIN PARITY IS ACTUALLY PROVED, AND WHERE IT
 #   IS NOT. ✔MEASURED BY EXECUTION 2026-09-08 on all four hosts this project gates
@@ -112,9 +168,10 @@
 #       WSL x86_64           /usr/bin/pwsh 7.5.4                -> .ps1 arms RUN
 #       macOS arm64          /usr/local/bin/pwsh                -> .ps1 arms RUN
 #       arm64 VPS (ubuntu)   NEITHER spelling present           -> .ps1 arms N/A
-#   ⇒ on the arm64 VPS leg, arms 4, 5, 9, 10, 15, 16, 20 and 21 -- and with them
-#     ALL FOUR parity arms, 6, 11, 17 and 22 -- are not proved, and that is
-#     PERMANENT rather than pending:
+#   ⇒ on the arm64 VPS leg the .ps1 arms (4, 5, 9, 10, 15, 16, 20, 21, 25, 26, 29,
+#     32, 36 and 37) -- and with them EVERY parity arm, 6, 11, 17, 22, 27, 30, 33
+#     and 38 --
+#     are not proved, and that is PERMANENT rather than pending:
 #     nothing in this tree installs PowerShell there. A green `run_gate_guard` on
 #     that carriage is evidence about `run-gate.sh` ALONE. The run says so in
 #     words AND in a count of not-applicable arms, so the two cannot be confused.
@@ -127,19 +184,239 @@
 #     `ps -eo` branch of `Get-RunGateProcessTable`); only the fixture was not.
 set -u
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SELF_SCRIPT="${SELF_DIR}/$(basename "${BASH_SOURCE[0]}")"
+ROOT="$(cd "${SELF_DIR}/../.." && pwd -P)"
 GATE_SH="${ROOT}/scripts/run-gate/run-gate.sh"
 GATE_PS1="${ROOT}/scripts/run-gate/run-gate.ps1"
 SCRATCH="${ROOT}/.temp/test-run-gate-scratch"
+STAND_IN_STATE="${SCRATCH}/stand-in"
+RG_TAB=$'\t'
+RG_NL=$'\n'
+
+# ★ THE ONLY TWO NUMBERS IN THE STAND-IN LIFECYCLE, AND NEITHER IS SYNCHRONIZATION.
+# · RG_HANG_GUARD_S bounds a wait for an event this fixture itself causes (a plant
+#   appearing, a stop taking effect) -- ✔MEASURED at 103 ms and 26 ms. Exceeding it
+#   is a FAILED PRECONDITION, by name; nothing waits for it to elapse.
+# · RG_STAND_IN_LEAK_BOUND_S ends a stand-in this fixture could not stop (it was
+#   SIGKILLed, say), so a leaked `dsscp` cannot sit in every later gate's
+#   `compilers:` line. A stand-in that reaches it records why, and any arm still
+#   relying on it fails its precondition rather than passing.
+RG_HANG_GUARD_S=120
+RG_STAND_IN_LEAK_BOUND_S=600
+
+# ⚠ THE SAME PREDICATE AS `run_gate_is_windows` IN THE SUBJECT, deliberately
+#   spelled the same way: a second answer to "is this Windows" is how two halves
+#   of one pair start disagreeing. It cannot be reused by sourcing, because
+#   run-gate.sh EXECUTES.
+run_gate_host_is_windows() {
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        MINGW*|MSYS*|CYGWIN*) return 0 ;;
+        *)                    return 1 ;;
+    esac
+}
+
+# ═══ THE STAND-IN LIFECYCLE ════════════════════════════════════════════════════
+# A stand-in is a copy of this host's bash NAMED like the compiler, running this
+# very file as `__stand-in body <label>`. It records its own identity in
+# `$STAND_IN_STATE/<label>/pid` and then lives until it is stopped.
+# ⓘ WHY bash AND NOT `sleep`: a `sleep` can only be given a lifetime, and a
+#   lifetime is the defect. A shell can wait for a signal instead.
+# ⚠ Running the REAL `dsscp` here would be actively wrong: it writes to the
+#   per-user cache this whole subject is about, so the fixture would perturb the
+#   machine it is measuring.
+
+# The recorded identity: RG_SI_PID in this host's own pid namespace (what `kill`
+# takes), and RG_SI_WINPID on Windows (the pid CIM, and so run-gate, reports).
+stand_in_load() {  # <label> -> 0 when an identity was recorded
+    RG_SI_PID=""
+    RG_SI_WINPID=""
+    [ -f "$STAND_IN_STATE/$1/pid" ] || return 1
+    read -r RG_SI_PID RG_SI_WINPID < "$STAND_IN_STATE/$1/pid"
+    [ -n "$RG_SI_PID" ]
+}
+stand_in_describe() {  # <label> -> RG_SI_DESC
+    if stand_in_load "$1"; then
+        RG_SI_DESC="pid $RG_SI_PID${RG_SI_WINPID:+, WINPID $RG_SI_WINPID}"
+    else
+        RG_SI_DESC="no pid recorded"
+    fi
+}
+
+# ALIVE AND PROVABLY THAT STAND-IN -- the pair (MSYS pid, WINPID) on Windows, the
+# label in the command line on POSIX -- so a recycled pid can never read as present.
+# ⓘ `ps -W` can prefix a row with a one-letter state column; `o` absorbs it.
+stand_in_is_ours() {  # <label>
+    stand_in_load "$1" || return 1
+    if run_gate_host_is_windows; then
+        ps -W 2>/dev/null | awk -v p="$RG_SI_PID" -v w="$RG_SI_WINPID" '
+            { o = ($1 ~ /^[0-9]+$/) ? 0 : 1 }
+            $(1 + o) == p && $(4 + o) == w { f = 1 }
+            END { exit !f }'
+    else
+        case "$(ps -ww -o args= -p "$RG_SI_PID" 2>/dev/null)" in
+            (*"__stand-in body $1") return 0 ;;
+            (*)                     return 1 ;;
+        esac
+    fi
+}
+
+# OBSERVED GONE, STRICTLY. On Windows no row may carry the recorded WINPID beside
+# the stand-in's image directory at all, whatever MSYS pid sits next to it: that
+# WINPID is exactly what the subject's CIM query would report.
+stand_in_gone() {  # <label>
+    stand_in_load "$1" || return 1
+    if run_gate_host_is_windows; then
+        ! ps -W 2>/dev/null | awk -v w="$RG_SI_WINPID" '
+            { o = ($1 ~ /^[0-9]+$/) ? 0 : 1 }
+            $(4 + o) == w && /stand-in-bin/ { f = 1 }
+            END { exit !f }'
+    else
+        ! kill -0 "$RG_SI_PID" 2>/dev/null
+    fi
+}
+
+stand_in_wait() {  # <present|gone> <label> -> 0 when observed, 1 when the hang guard ran out
+    local start=$SECONDS
+    while :; do
+        if [ "$1" = present ]; then
+            stand_in_is_ours "$2" && return 0
+        else
+            stand_in_gone "$2" && return 0
+        fi
+        [ $((SECONDS - start)) -lt "$RG_HANG_GUARD_S" ] || return 1
+        sleep 0.2   # the poll cadence of a hang-guarded wait: no outcome depends on its length
+    done
+}
+
+# BY ITS RECORDED PID, AND ONLY WHEN IT IS PROVABLY OURS. Never by image name:
+# `pkill dsscp` or `taskkill /IM dsscp.exe` would kill real compilers.
+stand_in_stop() {  # <label> -> 0 when stopped AND observed gone
+    stand_in_load "$1" || return 1
+    if stand_in_is_ours "$1"; then kill -TERM "$RG_SI_PID" 2>/dev/null; fi
+    stand_in_wait gone "$1"
+}
+
+# WHAT A STAND-IN RUNS. `sleep 1 & wait $!` rather than a foreground `sleep`,
+# because bash runs a trap the moment `wait` is interrupted but only after a
+# foreground child exits -- ✔MEASURED: stopped and gone 26 ms after the signal.
+stand_in_body() {  # <label>
+    local dir="$STAND_IN_STATE/$1" wp=""
+    [ -d "$dir" ] || exit 71
+    if run_gate_host_is_windows; then read -r wp < "/proc/$$/winpid"; fi
+    { printf '%s %s\n' "$$" "$wp" > "$dir/pid.tmp" && mv "$dir/pid.tmp" "$dir/pid"; } || exit 72
+    trap 'echo stopped > "$dir/exit-reason"; exit 0' TERM
+    while [ -d "$dir" ]; do
+        if [ "$SECONDS" -ge "$RG_STAND_IN_LEAK_BOUND_S" ]; then
+            echo leak-bound > "$dir/exit-reason"
+            exit 0
+        fi
+        sleep 1 </dev/null >/dev/null 2>&1 &   # the leak check's cadence, not synchronization
+        wait $!
+    done
+    exit 0
+}
+
+# THE WITNESS A GATED STOP PRINTS. ⚠ It must not appear in the gate command's own
+# argv: both twins append that argv to the log in their footer BEFORE they grep
+# for the witness, so a witness spelled in the command line matches the footer.
+RG_STOP_WITNESS='stand-in stopped and observed gone'
+
+stand_in_main() {  # <verb> <label>
+    case "${1:-}" in
+        (body)
+            stand_in_body "$2" ;;
+        (await)
+            if stand_in_wait present "$2"; then echo present > "$STAND_IN_STATE/$2/await-result"; exit 0; fi
+            echo hang-guard > "$STAND_IN_STATE/$2/await-result"
+            exit 70 ;;
+        (stop)
+            if stand_in_stop "$2"; then
+                echo stopped > "$STAND_IN_STATE/$2/stop-result"
+                echo "$RG_STOP_WITNESS"
+                exit 0
+            fi
+            echo hang-guard > "$STAND_IN_STATE/$2/stop-result"
+            exit 70 ;;
+        (*)
+            echo "test-run-gate.sh: unknown __stand-in verb '${1:-}'" >&2
+            exit 64 ;;
+    esac
+}
+
+if [ "${1:-}" = "__stand-in" ]; then
+    shift
+    stand_in_main "$@"
+    exit $?
+fi
+
+# ═══ THE FIXTURE ═══════════════════════════════════════════════════════════════
+
+# A LEFTOVER FROM AN EARLIER RUN IS STOPPED BEFORE ITS STATE IS DELETED -- by its
+# recorded identity, and only when that identity still holds.
+if [ -d "$STAND_IN_STATE" ]; then
+    for _rg_left in "$STAND_IN_STATE"/*/; do
+        _rg_left="$(basename "$_rg_left")"
+        stand_in_is_ours "$_rg_left" || continue
+        kill -TERM "$RG_SI_PID" 2>/dev/null
+        stand_in_wait gone "$_rg_left" \
+            || echo "  [warn] a stand-in left by an earlier run ($_rg_left, pid $RG_SI_PID) did not stop"
+    done
+fi
+
 SANDBOX="${SCRATCH}/tree"
 rm -rf "$SCRATCH"
-mkdir -p "$SANDBOX/examples" "$SANDBOX/src/dss-config" "$SANDBOX/tests/corpus"
+mkdir -p "$SANDBOX/examples" "$SANDBOX/src/dss-config" "$SANDBOX/tests/corpus" "$STAND_IN_STATE"
 PROBE_REL="examples/.test-run-gate-input-probe.txt"
 NOWHERE_BIN="${SCRATCH}/no-interpreter-here"
 mkdir -p "$NOWHERE_BIN"
 fails=0
+preconditions_failed=0
 arms_ran=0
 arms_na=0
+STAND_IN_PLANTED=""
+
+# EVERY stand-in this run planted is stopped on the way out, whatever the way out.
+cleanup_stand_ins() {
+    for _rg_l in $STAND_IN_PLANTED; do
+        if stand_in_is_ours "$_rg_l"; then kill -TERM "$RG_SI_PID" 2>/dev/null; fi
+    done
+}
+trap cleanup_stand_ins EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ── A CLOCK FOR THE LOG, NOT FOR ANY DECISION ──────────────────────────────────
+# Microseconds from bash's EPOCHREALTIME where it exists (bash 5), else whole
+# seconds from `date`. Its locale may spell the decimal point as a comma.
+rg_now() {
+    local t="${EPOCHREALTIME:-}"
+    if [ -n "$t" ]; then
+        t="${t/,/.}"
+        RG_NOW_US="${t%%.*}${t#*.}"
+    else
+        RG_NOW_US="$(date +%s)000000"
+    fi
+}
+rg_span() {  # <from-us> <to-us> -> RG_SPAN
+    local d=$(( ($2 - $1) / 10000 ))
+    if [ "$d" -lt 0 ]; then RG_SPAN="?(the clock stepped back)"; return 0; fi
+    local cs=$(( d % 100 ))
+    [ "$cs" -lt 10 ] && cs="0$cs"
+    RG_SPAN="$(( d / 100 )).$cs"
+}
+rg_at() { rg_now; rg_span "$FIXTURE_T0_US" "$RG_NOW_US"; RG_AT="at +${RG_SPAN}s"; }
+rg_now; FIXTURE_T0_US="$RG_NOW_US"
+
+# A FAILURE OF THIS FIXTURE, NAMED AS ONE. It FAILS the run -- never a skip -- and
+# its sentence says, every time, that it is not a verdict on the subject.
+precondition_failed() {  # <label> <what>
+    preconditions_failed=$((preconditions_failed + 1))
+    fails=$((fails + 1))
+    rg_at
+    echo "  [FAIL] $1   FIXTURE PRECONDITION NOT MET, which is NOT a verdict on run-gate: $2   $RG_AT"
+}
 
 # ── WHICH POWERSHELL, IF ANY, CAN RUN THE .ps1 TWIN ON THIS HOST ────────────
 # BY EXECUTION, never by lookup -- see the block above for why `command -v` is
@@ -164,17 +441,6 @@ run_gate_powershell() {
     return 1
 }
 
-# ⚠ THE SAME PREDICATE AS `run_gate_is_windows` IN THE SUBJECT, deliberately
-#   spelled the same way: a second answer to "is this Windows" is how two halves
-#   of one pair start disagreeing. It cannot be reused by sourcing, because
-#   run-gate.sh EXECUTES.
-run_gate_host_is_windows() {
-    case "$(uname -s 2>/dev/null || echo unknown)" in
-        MINGW*|MSYS*|CYGWIN*) return 0 ;;
-        *)                    return 1 ;;
-    esac
-}
-
 ran() { arms_ran=$((arms_ran + 1)); }
 
 # An arm this host CANNOT run. Named, with its reason, and counted -- the three
@@ -184,103 +450,65 @@ na() {  # <label> <reason>
     echo "  [n/a ] $1   NOT APPLICABLE ON THIS HOST: $2"
 }
 
-# A synthetic ctest tree: a `CTestTestfile.cmake` alone is enough for ctest to
-# run -- ✔MEASURED, no configure and no project needed. `slow` exists so a
-# contender can still be alive while the arm under test starts.
 # ⚠ THE INTERPRETER IS `$BASH` -- THE ONE ALREADY RUNNING THIS FIXTURE -- NOT A
 #   HARD-CODED `/usr/bin/bash`. ✔MEASURED 2026-09-08 on the macOS carriage:
-#   `/usr/bin/bash` DOES NOT EXIST there (only `/bin/bash`), so the synthetic
-#   `add_test` below named a program that could not be launched, every arm from
+#   `/usr/bin/bash` DOES NOT EXIST there (only `/bin/bash`), so a synthetic
+#   `add_test` named a program that could not be launched, every arm from
 #   `7-sh-alone` on lost its success witness, and the guard would have red on
 #   that leg naming the SUBJECT for a defect in the fixture's own test tree.
 #   ⓘ `$BASH` needs no probe and cannot lie: it is the absolute path of the shell
-#     executing this line. `cygpath -m` converts it for CMake only on MSYS, where
-#     a `/usr/bin/...` path is not something `ctest` can spawn.
-BASH_W="$BASH"
-if command -v cygpath >/dev/null 2>&1; then BASH_W="$(cygpath -m "$BASH")"; fi
+#     executing this line. `cygpath -m` converts a path for a NATIVE consumer
+#     (CMake, ctest, PowerShell) only on MSYS, where a `/c/...` path is not
+#     something they can open.
+native_path() {  # <path> -> RG_NATIVE
+    RG_NATIVE="$1"
+    if command -v cygpath >/dev/null 2>&1; then RG_NATIVE="$(cygpath -m "$1")"; fi
+}
+native_path "$BASH";        BASH_W="$RG_NATIVE"
+native_path "$SELF_SCRIPT"; SELF_SCRIPT_W="$RG_NATIVE"
+native_path "$GATE_SH";     GATE_SH_W="$RG_NATIVE"
+native_path "$GATE_PS1";    GATE_PS1_W="$RG_NATIVE"
+native_path "$SCRATCH";     SCRATCH_W="$RG_NATIVE"
 
-# ── A STAND-IN COMPILER, AND IT IS A COPY OF `sleep` RATHER THAN THE REAL ONE ─
-#
-# The subject matches on the process IMAGE NAME, so a copy of any long-lived
-# program named `dsscp` is exactly as good a subject as the compiler and costs
-# no build. ⚠ Running the REAL `dsscp` here would be actively wrong: it writes
-# to the per-user cache this whole subject is about, so the fixture would
-# perturb the machine it is measuring.
-# ⓘ `.exe` on MSYS because that is the name Win32 reports and the matcher
-# strips; a bare name elsewhere. `$STUB` is empty when no `sleep` binary can be
-# copied, and the arms below then report NOT APPLICABLE rather than skipping.
-STUB=""
-STUB_W=""
-if _rg_sleep="$(command -v sleep 2>/dev/null)" && [ -x "$_rg_sleep" ]; then
-    mkdir -p "$SCRATCH/bin"
-    if run_gate_host_is_windows; then STUB="$SCRATCH/bin/dsscp.exe"; else STUB="$SCRATCH/bin/dsscp"; fi
-    if cp "$_rg_sleep" "$STUB" 2>/dev/null; then
-        chmod +x "$STUB" 2>/dev/null || true
-        # ★★★ macOS SIGKILLS A COPY OF A PLATFORM BINARY, AND THAT KILLED THIS
-        # WHOLE SUBJECT ON ONE HOST WHILE READING AS A DEFECT IN THE DETECTOR.
-        # [D-TEST-RUN-GATE-STUB-IS-A-COPY-OF-A-PLATFORM-BINARY-AND-MACOS-KILLS-IT]
-        # ✔MEASURED 2026-09-14 on the macOS carriage, three constructions launched
-        # exactly as `plant_foreign_compiler` launches one and checked BEHAVIOURALLY
-        # two seconds later:
-        #   · plain `cp /bin/sleep …/dsscp`            -> alive_after_2s = 0  (killed)
-        #   · the same copy + `codesign --force -s -`  -> alive_after_2s = 1
-        #   · `ln -s /bin/sleep …/dsscp`               -> alive_after_2s = 1
-        # `codesign -dv` on the plain copy still reports `Identifier=com.apple.sleep`:
-        # /bin/sleep is a PLATFORM binary whose code identity lives in the system
-        # trust cache, so a copy off the system volume satisfies nothing and AMFI
-        # kills it. ⇒ ad-hoc sign the copy. It is the COPY that is signed, so the
-        # stub keeps its own path as argv[0] — a symlink would exec the real
-        # `/bin/sleep` and is the weaker fixture for a subject about image names.
-        # ⚠ THE FAILURE THIS COST: with the stub dead, arm 23's ctest returned 8
-        # (`busy` reported "Subprocess killed" at 1.11 s of its 8 s) and arms 24/25
-        # scanned a machine with no live stub on it, so all SEVEN of the subject's
-        # assertions failed — on macOS, on every leg that runs repo-guards, since
-        # the arms landed. None of those failures was about run-gate.
-        if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
-            codesign --force --sign - "$STUB" >/dev/null 2>&1 || true
-        fi
-        STUB_W="$STUB"
-        if command -v cygpath >/dev/null 2>&1; then STUB_W="$(cygpath -m "$STUB")"; fi
-        # ★★ AND IT IS PROVED TO RUN, not assumed to. A stand-in that cannot start
-        # makes every arm below assert against an empty machine and PASS or FAIL for
-        # a reason that is not the subject's — the shape this file exists to refuse.
-        # A stub that will not run is treated as ABSENT, which routes to the `na`
-        # arms and says so out loud.
-        if ! "$STUB" 0 >/dev/null 2>&1; then
-            STUB=""
-            STUB_W=""
-            _rg_stub_unrunnable=1
-        fi
+# ── THE STAND-IN'S IMAGE: this bash, copied under the compiler's name ───────────
+# ⓘ `.exe` on MSYS because that is the name Win32 reports and the matcher strips;
+#   a bare name elsewhere. `$STAND_IN` is empty when no runnable copy can be made,
+#   and the compiler arms then report NOT APPLICABLE rather than skipping.
+STAND_IN=""
+STAND_IN_W=""
+mkdir -p "$SCRATCH/stand-in-bin"
+if run_gate_host_is_windows; then _rg_si="$SCRATCH/stand-in-bin/dsscp.exe"; else _rg_si="$SCRATCH/stand-in-bin/dsscp"; fi
+if cp "$BASH" "$_rg_si" 2>/dev/null; then
+    chmod +x "$_rg_si" 2>/dev/null || true
+    # ★★★ macOS SIGKILLS A COPY OF A PLATFORM BINARY, AND THAT KILLED THIS WHOLE
+    # SUBJECT ON ONE HOST WHILE READING AS A DEFECT IN THE DETECTOR.
+    # [D-TEST-RUN-GATE-STUB-IS-A-COPY-OF-A-PLATFORM-BINARY-AND-MACOS-KILLS-IT]
+    # ✔MEASURED 2026-09-14 on the macOS carriage, three constructions of the
+    # then-`sleep` stand-in launched the way the fixture launched one:
+    #   · plain `cp /bin/sleep …/dsscp`            -> alive_after_2s = 0  (killed)
+    #   · the same copy + `codesign --force -s -`  -> alive_after_2s = 1
+    #   · `ln -s /bin/sleep …/dsscp`               -> alive_after_2s = 1
+    # A platform binary's code identity lives in the system trust cache, so a copy
+    # off the system volume satisfies nothing and AMFI kills it. ⇒ ad-hoc sign the
+    # COPY, so the stand-in keeps its own path as argv[0]; a symlink would exec the
+    # real binary and is the weaker fixture for a subject about image names. The
+    # same holds for `/bin/bash`, and a Homebrew bash merely gets re-signed.
+    if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
+        codesign --force --sign - "$_rg_si" >/dev/null 2>&1 || true
+    fi
+    # ★★ AND IT IS PROVED TO RUN, not assumed to. A stand-in that cannot start
+    # makes every arm below assert against an empty machine.
+    if "$_rg_si" -c 'exit 0' >/dev/null 2>&1; then
+        STAND_IN="$_rg_si"
+        native_path "$STAND_IN"; STAND_IN_W="$RG_NATIVE"
     else
-        STUB=""
+        _rg_stand_in_unrunnable=1
     fi
 fi
-STUB_ABSENT_WHY="no 'sleep' binary could be copied to a stand-in named after the compiler, so no live-compiler subject could be created on this host"
-if [ "${_rg_stub_unrunnable:-0}" = "1" ]; then
-    STUB_ABSENT_WHY="a stand-in named after the compiler was copied but WOULD NOT RUN on this host (on macOS a copy of a platform binary is SIGKILLed by AMFI unless ad-hoc signed, and \`codesign\` was absent or refused), so no live-compiler subject could be created"
+STAND_IN_ABSENT_WHY="no copy of this shell could be made under the compiler's name, so no live-compiler subject could be created on this host"
+if [ "${_rg_stand_in_unrunnable:-0}" = "1" ]; then
+    STAND_IN_ABSENT_WHY="a copy of this shell named after the compiler was made but WOULD NOT RUN on this host (on macOS a copy of a platform binary is SIGKILLed by AMFI unless ad-hoc signed, and \`codesign\` was absent or refused), so no live-compiler subject could be created"
 fi
-
-# A stand-in compiler with NO RESOLVABLE ANCESTRY — the shape a compiler started
-# from another terminal has, as seen from here.
-# ⚠ THE ORPHANING IS THE FIXTURE, NOT AN ACCIDENT. The inner shell exits
-# immediately, so the stub's recorded parent is gone before the scan runs and
-# the subject's upward walk stops at a pid that is not in the table. ✔MEASURED
-# on MSYS: that is also what a background job started from ANY shell looks like
-# here, because MSYS's fork/exec emulation leaves a transient parent behind.
-plant_foreign_compiler() {  # <seconds>
-    bash -c "nohup '$STUB' $1 >/dev/null 2>&1 &"
-}
-mk_ctest_dir() {  # <dir> <fast|slow>
-    mkdir -p "$1"
-    if [ "$2" = slow ]; then
-        # 12 s: the contender only has to outlive the 3 s settle plus the gate's
-        # ✔MEASURED ~1.6 s of scanning, and this fixture is a ctest entry whose
-        # wall clock is paid on every leg.
-        printf 'add_test(slow "%s" "-c" "sleep 12; echo ok")\n' "$BASH_W" > "$1/CTestTestfile.cmake"
-    else
-        printf 'add_test(fast "%s" "-c" "echo ok")\n' "$BASH_W" > "$1/CTestTestfile.cmake"
-    fi
-}
 
 # THE SPELLING run-gate ITSELF PRINTS for a directory. ⚠ NOT a second
 # canonicaliser: it is the SAME two steps the subject takes -- `cd && pwd -P`,
@@ -291,6 +519,13 @@ gate_spelling() {  # <dir>
     local abs
     abs=$(cd "$1" && pwd -P) || return 1
     if command -v cygpath >/dev/null 2>&1; then cygpath -m "$abs"; else printf '%s\n' "$abs"; fi
+}
+
+# A synthetic ctest tree: a `CTestTestfile.cmake` alone is enough for ctest to
+# run -- ✔MEASURED, no configure and no project needed.
+mk_ctest_dir() {  # <dir>
+    mkdir -p "$1"
+    printf 'add_test(fast "%s" "-c" "echo ok")\n' "$BASH_W" > "$1/CTestTestfile.cmake"
 }
 
 # A synthetic SOURCE tree: its own three read-at-test-time roots, nothing else.
@@ -346,16 +581,31 @@ logtext() { tr -d '\000' < "$1" 2>/dev/null; }   # UTF-16LE or UTF-8, either way
 arm() {  # <label> <want-rc> ...cmd
     local label=$1 want=$2; shift 2
     ran
+    rg_now
+    local t0="$RG_NOW_US"
     "$@" > "$SCRATCH/$label.out" 2>&1
     local rc=$?
+    rg_now
+    rg_span "$t0" "$RG_NOW_US"
+    local took="$RG_SPAN"
+    rg_span "$FIXTURE_T0_US" "$RG_NOW_US"
     echo "$rc" > "$SCRATCH/$label.rc"
     if [ "$rc" -eq "$want" ]; then
-        echo "  [ok  ] $label   rc=$rc (want $want)"
+        echo "  [ok  ] $label   rc=$rc (want $want)   at +${RG_SPAN}s took ${took}s"
     else
-        echo "  [FAIL] $label   rc=$rc (want $want)"
+        echo "  [FAIL] $label   rc=$rc (want $want)   at +${RG_SPAN}s took ${took}s"
         logtext "$SCRATCH/$label.out" | sed 's/^/         /' | head -12
         fails=$((fails + 1))
     fi
+}
+
+# ★ A FAILED ASSERTION SHOWS WHAT IT READ. ctest holds this fixture's output
+#   until it ends, and a CI runner's scratch directory is gone by the time anyone
+#   looks, so a needle that is missing must bring the end of its haystack with it
+#   -- otherwise the red names the arm and hides the evidence.
+show_tail() {  # <file>
+    echo "         ... the last lines of $(basename "$1"):"
+    logtext "$1" | tail -8 | sed 's/^/         | /'
 }
 
 says() {  # <label-or-file> <needle> [--log]
@@ -365,6 +615,7 @@ says() {  # <label-or-file> <needle> [--log]
         echo "  [ok  ] $1   says: $2"
     else
         echo "  [FAIL] $1   did NOT say: $2"
+        show_tail "$f"
         fails=$((fails + 1))
     fi
 }
@@ -378,13 +629,21 @@ says_not() {  # <label-or-file> <needle> [--log]
     [ "${3:-}" = "--log" ] && f="$SCRATCH/$1"
     if logtext "$f" | grep -qF "$2"; then
         echo "  [FAIL] $1   SAID what it must not: $2"
+        show_tail "$f"
         fails=$((fails + 1))
     else
         echo "  [ok  ] $1   does not say: $2"
     fi
 }
 
-echo "run-gate evidence-integrity proof (sandbox: $SANDBOX)"
+# The rc an arm recorded, or `not-run` when its own precondition kept it from running.
+rc_of() {  # <label> -> RG_RC
+    RG_RC=not-run
+    [ -f "$SCRATCH/$1.rc" ] && read -r RG_RC < "$SCRATCH/$1.rc"
+}
+
+rg_now
+echo "run-gate evidence-integrity proof (sandbox: $SANDBOX), started $(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
 
 # ---- ARM 0 THE ESCAPE MUST BE DIRECTIONAL, AND IT IS MEASURED HERE ----------
 # The SAME probe, run where PATH reaches an EMPTY directory and nothing else,
@@ -395,11 +654,12 @@ echo "run-gate evidence-integrity proof (sandbox: $SANDBOX)"
 #   caller's environment for a FUNCTION, which would break every later arm.
 ran
 neg_out=$( PATH="$NOWHERE_BIN"; run_gate_powershell ); neg_rc=$?
+rg_at
 if [ "$neg_rc" -eq 0 ]; then
-    echo "  [FAIL] 0-probe-negative   probe claimed PowerShell '$neg_out' with no interpreter on PATH"
+    echo "  [FAIL] 0-probe-negative   probe claimed PowerShell '$neg_out' with no interpreter on PATH   $RG_AT"
     fails=$((fails + 1))
 else
-    echo "  [ok  ] 0-probe-negative   no interpreter reachable -> probe reports ABSENT (the escape is directional)"
+    echo "  [ok  ] 0-probe-negative   no interpreter reachable -> probe reports ABSENT (the escape is directional)   $RG_AT"
 fi
 
 # ---- ARM 0b WHICH INTERPRETER THIS HOST ACTUALLY HAS ------------------------
@@ -409,11 +669,12 @@ fi
 #   (`find_program(POWERSHELL_EXE NAMES pwsh powershell REQUIRED)`), so a Windows
 #   host that answers "no PowerShell" has a broken environment, not a legitimate
 #   absence. Left escapable, a `ctest` launched with a stripped PATH would drop
-#   all nine .ps1 arms on the ONE host category where every carriage proves twin
+#   every .ps1 arm on the ONE host category where every carriage proves twin
 #   parity, and report a green run for doing less work. It fails loud instead.
 ran
+rg_at
 if PS_EXE=$(run_gate_powershell); then
-    echo "  [ok  ] 0-probe-positive   .ps1 arms will run under '$PS_EXE' (probed BY EXECUTION, not by lookup)"
+    echo "  [ok  ] 0-probe-positive   .ps1 arms will run under '$PS_EXE' (probed BY EXECUTION, not by lookup)   $RG_AT"
 elif run_gate_host_is_windows; then
     PS_EXE=""
     echo "  [FAIL] 0-probe-positive   THIS IS WINDOWS and none of '$PS_CANDIDATES' ran: PowerShell ships with"
@@ -422,7 +683,7 @@ elif run_gate_host_is_windows; then
     fails=$((fails + 1))
 else
     PS_EXE=""
-    echo "  [ok  ] 0-probe-positive   no working PowerShell here: none of '$PS_CANDIDATES' returned '$PS_PROBE_TOKEN' with rc 0"
+    echo "  [ok  ] 0-probe-positive   no working PowerShell here: none of '$PS_CANDIDATES' returned '$PS_PROBE_TOKEN' with rc 0   $RG_AT"
 fi
 PS_ABSENT_WHY="no working PowerShell on this host (each of '$PS_CANDIDATES' was RUN and did not return '$PS_PROBE_TOKEN' with rc 0)"
 
@@ -465,28 +726,21 @@ if   logtext "$SCRATCH/a1.log" | grep -qF 'compilers: UNKNOWN'; then TABLE_STATE
 elif logtext "$SCRATCH/a1.log" | grep -qF 'compilers:';         then TABLE_STATE=readable
 fi
 ran
+rg_at
 if [ -n "$TABLE_STATE" ]; then
-    echo "  [ok  ] 0-probe-table-state   this host's run-gate reports its process table as $TABLE_STATE (MEASURED from a1.log, not looked up)"
+    echo "  [ok  ] 0-probe-table-state   this host's run-gate reports its process table as $TABLE_STATE (MEASURED from a1.log, not looked up)   $RG_AT"
 else
-    echo "  [FAIL] 0-probe-table-state   a1.log carries NO 'compilers:' line at all, so every compiler arm below has no host state to branch on"
+    echo "  [FAIL] 0-probe-table-state   a1.log carries NO 'compilers:' line at all, so every compiler arm below has no host state to branch on   $RG_AT"
     fails=$((fails + 1))
 fi
-
-# An INDEPENDENT reading of whether the stand-in is on this machine. ⚠ Used only
-# to DIAGNOSE a failure, never to excuse one: a precondition measured with the
-# instrument under test proves nothing, and an arm that skips itself when its
-# own subject looks absent is the vacuous skip this file exists to refuse.
-stub_live_count() {
-    if run_gate_host_is_windows; then ps -W 2>/dev/null | grep -c 'dsscp' || true
-    else                              ps -A 2>/dev/null | grep -c 'dsscp' || true
-    fi
-}
 
 # The compiler arms' shared assertion set, so the two twins and the two
 # subjects cannot drift into demanding different things of the same line.
 # ⚠ `compilers: none` is refused FIRST and on every host — that is the
 # invariant; everything after it is what the host makes checkable.
-says_named_or_unknown() {  # <log-basename> [when-phrase]
+# ★ THE IDENTITY LINE NAMES THE STAND-IN'S OWN PID. ✔MEASURED: a bare "dsscp …
+# seen when this run STARTED" was satisfied by the PREVIOUS arm's stand-in.
+says_named_or_unknown() {  # <log-basename> [the exact identity line]
     says_not "$1" 'compilers: none' --log
     if [ "$TABLE_STATE" = readable ]; then
         says "$1" "OUTSIDE this gate's process tree" --log
@@ -498,9 +752,13 @@ says_named_or_unknown() {  # <log-basename> [when-phrase]
 }
 
 # ---- ARM 2 (sh) THE DEFECT: an input root is edited DURING the run ----------
+# ⓘ NO SETTLE BEFORE THE EDIT. Both twins take the pre-run fingerprint before they
+#   start the command and the post-run one after it returns, so the edit lands
+#   between them by construction -- and landing in the same SECOND as the marker is
+#   the stricter case, the one a timestamp scan could miss.
 rm -f "$PROBE_REL"
 arm 2-sh-moved 3 bash "$GATE_SH" "$SCRATCH/a2.log" 'HELLO' \
-    bash -c "sleep 1; echo touched > $PROBE_REL; echo HELLO"
+    bash -c "echo touched > $PROBE_REL; echo HELLO"
 says 2-sh-moved 'the tree CHANGED UNDER THE RUN'
 says 2-sh-moved 'test-run-gate-input-probe'
 says 2-sh-moved 'This is NOT'
@@ -510,11 +768,12 @@ rm -f "$PROBE_REL"
 # Arm 2's command exits 0 and prints the witness, so a wrapper that checked
 # either one first would have PASSED it. This names that ordering.
 ran
+rg_at
 if logtext "$SCRATCH/2-sh-moved.out" | grep -q 'run-gate.sh: OK'; then
-    echo "  [FAIL] 3-sh-order   the moved-input run reported OK"
+    echo "  [FAIL] 3-sh-order   the moved-input run reported OK   $RG_AT"
     fails=$((fails + 1))
 else
-    echo "  [ok  ] 3-sh-order   a witness-matching rc=0 run was still refused"
+    echo "  [ok  ] 3-sh-order   a witness-matching rc=0 run was still refused   $RG_AT"
 fi
 
 if [ -n "$PS_EXE" ]; then
@@ -534,7 +793,7 @@ if [ -n "$PS_EXE" ]; then
     arm 5-ps1-moved 3 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
         -File "$GATE_PS1" "$SCRATCH/a5.log" 'HELLO' \
         "$PS_EXE" -NoProfile -Command \
-        "Start-Sleep -Seconds 2; Set-Content -Path '$PROBE_REL' -Value touched; Write-Output HELLO"
+        "Set-Content -Path '$PROBE_REL' -Value touched; Write-Output HELLO"
     says 5-ps1-moved 'the tree CHANGED UNDER THE RUN'
     says 5-ps1-moved 'test-run-gate-input-probe'
     says 5-ps1-moved 'This is NOT'
@@ -546,10 +805,11 @@ if [ -n "$PS_EXE" ]; then
     #   about what they decided. Compare the numbers the twins actually returned.
     ran
     sh_rc=$(cat "$SCRATCH/2-sh-moved.rc"); ps_rc=$(cat "$SCRATCH/5-ps1-moved.rc")
+    rg_at
     if [ "$sh_rc" = "$ps_rc" ] && [ "$sh_rc" = "3" ]; then
-        echo "  [ok  ] 6-parity   both twins refused the moved tree with exit $sh_rc"
+        echo "  [ok  ] 6-parity   both twins refused the moved tree with exit $sh_rc   $RG_AT"
     else
-        echo "  [FAIL] 6-parity   .sh returned $sh_rc, .ps1 returned $ps_rc (both must be 3)"
+        echo "  [FAIL] 6-parity   .sh returned $sh_rc, .ps1 returned $ps_rc (both must be 3)   $RG_AT"
         fails=$((fails + 1))
     fi
 else
@@ -565,8 +825,71 @@ fi
 # ⚠ Every arm below uses a SYNTHETIC build directory under the sandbox. Pointing
 #   one at the repository's real build tree would make this fixture refuse the
 #   very gate that is running it.
-mk_ctest_dir "$SANDBOX/bd-alone" fast
-mk_ctest_dir "$SANDBOX/bd-shared" slow
+# ★ THE CONTENDER IS HELD, NOT TIMED. It is a real ctest whose one test is a
+#   stand-in body: it is alive from the moment it is observed present until this
+#   fixture stops it by pid AFTER the gate returns, so the gate's pre-run sample
+#   cannot miss it on any host. The `sleep 12` contender and the `sleep 3` settle
+#   it replaces were a bet that the gate would start sampling inside 12 s.
+mk_ctest_dir "$SANDBOX/bd-alone"
+mkdir -p "$SANDBOX/bd-shared"
+
+start_contender() {  # <label> <build dir> -> CONTENDER_BG
+    rm -rf "${STAND_IN_STATE:?}/$1"
+    mkdir -p "$STAND_IN_STATE/$1"
+    STAND_IN_PLANTED="$STAND_IN_PLANTED $1"
+    printf 'add_test(held "%s" "%s" "__stand-in" "body" "%s")\n' "$BASH_W" "$SELF_SCRIPT_W" "$1" > "$2/CTestTestfile.cmake"
+    ctest --test-dir "$2" > "$SCRATCH/$1.contender.log" 2>&1 &
+    CONTENDER_BG=$!
+    stand_in_wait present "$1" && return 0
+    precondition_failed "$1" "the contending ctest's held test never appeared within the ${RG_HANG_GUARD_S}s hang guard"
+    return 1
+}
+release_contender() {  # <label>
+    stand_in_stop "$1"
+    local start=$SECONDS
+    while kill -0 "$CONTENDER_BG" 2>/dev/null; do
+        if [ $((SECONDS - start)) -ge "$RG_HANG_GUARD_S" ]; then
+            precondition_failed "$1" "the contending ctest was still running ${RG_HANG_GUARD_S}s after its held test was stopped"
+            return 1
+        fi
+        sleep 0.2   # the poll cadence of a hang-guarded wait: no outcome depends on its length
+    done
+    wait "$CONTENDER_BG" 2>/dev/null
+    return 0
+}
+# The contender reading: its held test by pid, and the ctest that holds it.
+contender_reading() {  # <label> -> RG_READING
+    local t=gone c=exited
+    stand_in_is_ours "$1" && t=present
+    kill -0 "$CONTENDER_BG" 2>/dev/null && c=running
+    RG_READING="held-test=$t,ctest=$c"
+}
+contender_arm() {  # <label> <gate twin: sh|ps1> <log> -> 1 when a precondition failed
+    local label=$1 before after ok=0
+    if ! start_contender "$label" "$SANDBOX/bd-shared"; then
+        release_contender "$label"
+        return 1
+    fi
+    contender_reading "$label"; before="$RG_READING"
+    if [ "$2" = sh ]; then
+        arm "$label" 4 bash "$GATE_SH" "$SCRATCH/$3" '100% tests passed' \
+            ctest --test-dir "$SANDBOX/bd-shared"
+    else
+        arm "$label" 4 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+            -File "$GATE_PS1" "$SCRATCH/$3" '100% tests passed' \
+            ctest --test-dir "$SANDBOX/bd-shared"
+    fi
+    contender_reading "$label"; after="$RG_READING"
+    stand_in_describe "$label"; rg_at
+    echo "  [info] $label   independent reading of the contender ($RG_SI_DESC): before the gate=$before, after the gate=$after   $RG_AT"
+    case "$before" in
+        (held-test=present,ctest=running) : ;;
+        (*) precondition_failed "$label" "the contender was not live when the gate started ($before), so the gate was never shown a shared build directory"
+            ok=1 ;;
+    esac
+    release_contender "$label" || ok=1
+    return "$ok"
+}
 
 # ---- ARM 7 (sh) CONTROL: alone in the build directory -> still passes -------
 arm 7-sh-alone 0 bash "$GATE_SH" "$SCRATCH/a7.log" '100% tests passed' \
@@ -575,15 +898,11 @@ says 7-sh-alone 'run-gate.sh: OK'
 says a7.log 'contended: no' --log
 
 # ---- ARM 8 (sh) THE DEFECT: a second ctest is ALREADY live in it -----------
-ctest --test-dir "$SANDBOX/bd-shared" > "$SCRATCH/bg8.log" 2>&1 &
-bg8=$!
-sleep 3
-arm 8-sh-contended 4 bash "$GATE_SH" "$SCRATCH/a8.log" '100% tests passed' \
-    ctest --test-dir "$SANDBOX/bd-shared"
-says 8-sh-contended 'ANOTHER RUN IS LIVE IN THIS BUILD DIRECTORY'
-says 8-sh-contended 'bd-shared'
-says 8-sh-contended 'This is NOT'
-wait $bg8 2>/dev/null
+if contender_arm 8-sh-contended sh a8.log; then
+    says 8-sh-contended 'ANOTHER RUN IS LIVE IN THIS BUILD DIRECTORY'
+    says 8-sh-contended 'bd-shared'
+    says 8-sh-contended 'This is NOT'
+fi
 
 if [ -n "$PS_EXE" ]; then
     # ---- ARM 9 (ps1) CONTROL ------------------------------------------------
@@ -594,23 +913,20 @@ if [ -n "$PS_EXE" ]; then
     says a9.log 'contended: no' --log
 
     # ---- ARM 10 (ps1) THE DEFECT --------------------------------------------
-    ctest --test-dir "$SANDBOX/bd-shared" > "$SCRATCH/bg10.log" 2>&1 &
-    bg10=$!
-    sleep 3
-    arm 10-ps1-contended 4 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
-        -File "$GATE_PS1" "$SCRATCH/a10.log" '100% tests passed' \
-        ctest --test-dir "$SANDBOX/bd-shared"
-    says 10-ps1-contended 'ANOTHER RUN IS LIVE IN THIS BUILD DIRECTORY'
-    says 10-ps1-contended 'bd-shared'
-    wait $bg10 2>/dev/null
+    if contender_arm 10-ps1-contended ps1 a10.log; then
+        says 10-ps1-contended 'ANOTHER RUN IS LIVE IN THIS BUILD DIRECTORY'
+        says 10-ps1-contended 'bd-shared'
+    fi
 
     # ---- ARM 11 TWIN PARITY ON THE SECOND SUBJECT ---------------------------
     ran
-    sh_rc=$(cat "$SCRATCH/8-sh-contended.rc"); ps_rc=$(cat "$SCRATCH/10-ps1-contended.rc")
+    rc_of 8-sh-contended; sh_rc="$RG_RC"
+    rc_of 10-ps1-contended; ps_rc="$RG_RC"
+    rg_at
     if [ "$sh_rc" = "$ps_rc" ] && [ "$sh_rc" = "4" ]; then
-        echo "  [ok  ] 11-parity  both twins refused the shared build directory with exit $sh_rc"
+        echo "  [ok  ] 11-parity  both twins refused the shared build directory with exit $sh_rc   $RG_AT"
     else
-        echo "  [FAIL] 11-parity  .sh returned $sh_rc, .ps1 returned $ps_rc (both must be 4)"
+        echo "  [FAIL] 11-parity  .sh returned $sh_rc, .ps1 returned $ps_rc (both must be 4)   $RG_AT"
         fails=$((fails + 1))
     fi
 else
@@ -624,13 +940,15 @@ fi
 #   wait for a sibling -- two different remedies. This asserts the codes differ
 #   AND that neither refusal borrows the other's sentence.
 ran
-moved_rc=$(cat "$SCRATCH/2-sh-moved.rc"); cont_rc=$(cat "$SCRATCH/8-sh-contended.rc")
+rc_of 2-sh-moved; moved_rc="$RG_RC"
+rc_of 8-sh-contended; cont_rc="$RG_RC"
+rg_at
 if [ "$moved_rc" != "$cont_rc" ] \
    && ! logtext "$SCRATCH/8-sh-contended.out" | grep -q 'CHANGED UNDER THE RUN' \
    && ! logtext "$SCRATCH/2-sh-moved.out"     | grep -q 'ANOTHER RUN IS LIVE'; then
-    echo "  [ok  ] 12-distinct  moved-tree ($moved_rc) and contended-build-dir ($cont_rc) are distinct refusals"
+    echo "  [ok  ] 12-distinct  moved-tree ($moved_rc) and contended-build-dir ($cont_rc) are distinct refusals   $RG_AT"
 else
-    echo "  [FAIL] 12-distinct  the two refusals are not tellable apart (rc $moved_rc vs $cont_rc)"
+    echo "  [FAIL] 12-distinct  the two refusals are not tellable apart (rc $moved_rc vs $cont_rc)   $RG_AT"
     fails=$((fails + 1))
 fi
 
@@ -647,10 +965,11 @@ rm -f "$PROBE_REL"
 #   "this wrapper stopped watching". 13/15 are the refusal, 14/16 are the CONTROL
 #   -- and 13/15 are the direction whose failure was SILENT, which is why they
 #   are here at all rather than being left to the older arms 2/5.
+# ⓘ No settle before either edit, for the reason arm 2 gives.
 mk_cmake_build_dir "$TREE_A/build/own" "$TREE_A" \
-    "sleep 1; echo touched > '$TREE_A/examples/.probe-own-tree.txt'; echo ok"
+    "echo touched > '$TREE_A/examples/.probe-own-tree.txt'; echo ok"
 mk_cmake_build_dir "$TREE_A/build/foreign" "$TREE_A" \
-    "sleep 1; echo touched > '$SANDBOX/examples/.probe-foreign-tree.txt'; echo ok"
+    "echo touched > '$SANDBOX/examples/.probe-foreign-tree.txt'; echo ok"
 
 # ---- ARM 13 (sh) THE DEFECT: a foreign cwd must not HIDE this run's own tree --
 rm -f "$TREE_A/examples/.probe-own-tree.txt"
@@ -704,10 +1023,11 @@ if [ -n "$PS_EXE" ]; then
     own_ps=$(cat "$SCRATCH/15-ps1-own-tree-moves.rc")
     fgn_sh=$(cat "$SCRATCH/14-sh-foreign-tree-moves.rc")
     fgn_ps=$(cat "$SCRATCH/16-ps1-foreign-tree-moves.rc")
+    rg_at
     if [ "$own_sh" = "3" ] && [ "$own_ps" = "3" ] && [ "$fgn_sh" = "0" ] && [ "$fgn_ps" = "0" ]; then
-        echo "  [ok  ] 17-parity  both twins read their roots from the gate command's tree (own moved 3/3, foreign moved 0/0)"
+        echo "  [ok  ] 17-parity  both twins read their roots from the gate command's tree (own moved 3/3, foreign moved 0/0)   $RG_AT"
     else
-        echo "  [FAIL] 17-parity  own tree moved: .sh=$own_sh .ps1=$own_ps (both must be 3); foreign tree moved: .sh=$fgn_sh .ps1=$fgn_ps (both must be 0)"
+        echo "  [FAIL] 17-parity  own tree moved: .sh=$own_sh .ps1=$own_ps (both must be 3); foreign tree moved: .sh=$fgn_sh .ps1=$fgn_ps (both must be 0)   $RG_AT"
         fails=$((fails + 1))
     fi
 else
@@ -745,7 +1065,7 @@ mk_source_tree "$TREE_C"
 BACKDATED="$TREE_C/examples/.probe-backdated.txt"
 BYSTANDER="$TREE_C/examples/.probe-bystander.txt"
 mk_cmake_build_dir "$TREE_C/build/backdated" "$TREE_C" \
-    "sleep 1; echo touched > '$BACKDATED'; touch -t 200001010000 '$BACKDATED'; echo ok"
+    "echo touched > '$BACKDATED'; touch -t 200001010000 '$BACKDATED'; echo ok"
 mk_cmake_build_dir "$TREE_C/build/bystander" "$TREE_C" "echo ok"
 
 # A file created DURING the run, then stamped into the year 2000 -- exactly what
@@ -795,10 +1115,11 @@ if [ -n "$PS_EXE" ]; then
     bd_ps=$(cat "$SCRATCH/20-ps1-backdated-change-refuses.rc")
     by_sh=$(cat "$SCRATCH/19-sh-future-stamped-bystander.rc")
     by_ps=$(cat "$SCRATCH/21-ps1-future-stamped-bystander.rc")
+    rg_at
     if [ "$bd_sh" = "3" ] && [ "$bd_ps" = "3" ] && [ "$by_sh" = "0" ] && [ "$by_ps" = "0" ]; then
-        echo "  [ok  ] 22-parity  neither twin decides by TIMESTAMP ORDER (backdated change 3/3, future-stamped bystander 0/0)"
+        echo "  [ok  ] 22-parity  neither twin decides by TIMESTAMP ORDER (backdated change 3/3, future-stamped bystander 0/0)   $RG_AT"
     else
-        echo "  [FAIL] 22-parity  backdated change: .sh=$bd_sh .ps1=$bd_ps (both must be 3); future-stamped bystander: .sh=$by_sh .ps1=$by_ps (both must be 0)"
+        echo "  [FAIL] 22-parity  backdated change: .sh=$bd_sh .ps1=$bd_ps (both must be 3); future-stamped bystander: .sh=$by_sh .ps1=$by_ps (both must be 0)   $RG_AT"
         fails=$((fails + 1))
     fi
 else
@@ -817,181 +1138,294 @@ fi
 # is a PER-USER cache under `%LOCALAPPDATA%`, outside both `srctree` and
 # `builddir`, so no subject this wrapper already had could see it.
 #
-# ★★★ THE THREE ARMS ARE A SET AND NONE OF THEM MEANS ANYTHING ALONE.
+# ★★★ THE ARMS ARE A SET AND NONE OF THEM MEANS ANYTHING ALONE.
 #   · the DESCENDANT arm proves the check is not "any live dsscp", which would
 #     fire on every gate this project runs (its own ctest spawns hundreds);
 #   · the FOREIGN arm proves it is not permanently silent — and it is also the
 #     descendant arm's control, because a matcher that recognised nothing would
 #     satisfy the descendant arm perfectly;
-#   · the CONTROL arm (arms 1 and 7 already carry the line) proves it says
-#     "none" when there is nothing to say.
-# Run in that order so the foreign arm's orphan cannot be alive during the
-# descendant arm.
+#   · the EXITS-MID-RUN arm proves the line reports the UNION of both samples;
+#   · the CONTROL arm (26) proves it says "none" when there is nothing to say.
+# ★★ EVERY STAND-IN BELOW IS PLANTED, OBSERVED PRESENT, READ BEFORE AND AFTER THE
+#   GATE, STOPPED BY PID AND OBSERVED GONE -- see NO ARM MAY DEPEND ON THE WALL
+#   CLOCK at the top of this file. No stand-in outlives its own arm.
 
-if [ -n "$STUB" ]; then
+# The pid run-gate's footer names for a stand-in: the WINPID on Windows, where
+# the table is CIM's, and the pid itself elsewhere.
+stand_in_subject_pid() {  # <label> -> RG_SI_SUBJECT
+    stand_in_load "$1"
+    if run_gate_host_is_windows; then RG_SI_SUBJECT="$RG_SI_WINPID"; else RG_SI_SUBJECT="$RG_SI_PID"; fi
+}
+stand_in_reading() {  # <label> -> RG_READING: present | gone | never-started
+    if ! stand_in_load "$1"; then RG_READING=never-started
+    elif stand_in_is_ours "$1"; then RG_READING=present
+    else RG_READING=gone
+    fi
+}
+
+# ORPHANED from this shell on purpose: the inner shell exits at once, so the
+# stand-in has no resolvable ancestry — the shape a compiler started from another
+# terminal has, as seen from here. ✔MEASURED on MSYS: its Windows parent is dead
+# before the gate ever samples, and every POSIX carriage reparents it to pid 1 or
+# a session relay, none of which is part of the gate's tree.
+plant_foreign_compiler() {  # <label>   -- NO lifetime: it lives until stop_foreign_compiler
+    rm -rf "${STAND_IN_STATE:?}/$1"
+    mkdir -p "$STAND_IN_STATE/$1"
+    STAND_IN_PLANTED="$STAND_IN_PLANTED $1"
+    "$BASH" -c '"$0" "$@" </dev/null >/dev/null 2>&1 &' "$STAND_IN" "$SELF_SCRIPT" __stand-in body "$1"
+    stand_in_wait present "$1" && return 0
+    precondition_failed "$1" "its stand-in never appeared as a live process with a recorded pid within the ${RG_HANG_GUARD_S}s hang guard"
+    return 1
+}
+stop_foreign_compiler() {  # <label>
+    stand_in_stop "$1" && return 0
+    stand_in_describe "$1"
+    precondition_failed "$1" "its stand-in ($RG_SI_DESC) was still alive ${RG_HANG_GUARD_S}s after it was stopped"
+    return 1
+}
+
+# A stand-in must have ended because it was STOPPED, never on its own.
+exit_reason_check() {  # <label>
+    local r=""
+    [ -f "$STAND_IN_STATE/$1/exit-reason" ] && read -r r < "$STAND_IN_STATE/$1/exit-reason"
+    [ "$r" = stopped ] && return 0
+    precondition_failed "$1" "its stand-in ended with reason '${r:-none recorded}', not 'stopped'"
+    return 1
+}
+
+# THE READING BEFORE AND AFTER THE GATE, PRINTED EVERY TIME, ENFORCED WHERE THE
+# ARM'S CLAIM DEPENDS ON IT.
+check_readings() {  # <label> <before> <after> <want-before> <want-after>
+    stand_in_describe "$1"
+    rg_at
+    echo "  [info] $1   independent reading of its stand-in ($RG_SI_DESC): before the gate=$2, after the gate=$3   $RG_AT"
+    if [ "$2" = "$4" ] && [ "$3" = "$5" ]; then return 0; fi
+    precondition_failed "$1" "this arm needs its stand-in $4 before the gate and $5 after it, and the independent reading was $2 then $3 -- the subject's two samples were not shown the process this arm is about"
+    return 1
+}
+
+# A foreign-compiler arm whose stand-in is alive for BOTH of the gate's samples.
+alive_throughout_arm() {  # <label> <twin: sh|ps1> <log basename>
+    local label=$1 before after
+    plant_foreign_compiler "$label" || return 1
+    stand_in_reading "$label"; before="$RG_READING"
+    if [ "$2" = sh ]; then
+        arm "$label" 0 bash "$GATE_SH" "$SCRATCH/$3" 'HELLO' \
+            bash -c 'echo HELLO'
+    else
+        arm "$label" 0 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+            -File "$GATE_PS1" "$SCRATCH/$3" 'HELLO' \
+            "$PS_EXE" -NoProfile -Command "Write-Output HELLO"
+    fi
+    stand_in_reading "$label"; after="$RG_READING"
+    stop_foreign_compiler "$label" || return 1
+    check_readings "$label" "$before" "$after" present present || return 1
+    exit_reason_check "$label"
+}
+
+# A foreign-compiler arm whose stand-in the GATED COMMAND stops: alive for the
+# pre-run sample, gone for the post-run one, by the twins' own sequencing.
+exits_midrun_arm() {  # <label> <twin: sh|ps1> <log basename>
+    local label=$1 before after r=""
+    plant_foreign_compiler "$label" || return 1
+    stand_in_reading "$label"; before="$RG_READING"
+    if [ "$2" = sh ]; then
+        arm "$label" 0 bash "$GATE_SH" "$SCRATCH/$3" "$RG_STOP_WITNESS" \
+            "$BASH" "$SELF_SCRIPT" __stand-in stop "$label"
+    else
+        arm "$label" 0 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+            -File "$GATE_PS1" "$SCRATCH/$3" "$RG_STOP_WITNESS" \
+            "$BASH_W" "$SELF_SCRIPT_W" __stand-in stop "$label"
+    fi
+    stand_in_reading "$label"; after="$RG_READING"
+    [ -f "$STAND_IN_STATE/$label/stop-result" ] && read -r r < "$STAND_IN_STATE/$label/stop-result"
+    if [ "$r" != stopped ]; then
+        precondition_failed "$label" "the gated command did not stop its stand-in (stop-result '${r:-none}'), so the post-run sample may still have seen it"
+        stop_foreign_compiler "$label"
+        return 1
+    fi
+    check_readings "$label" "$before" "$after" present gone || return 1
+    exit_reason_check "$label"
+}
+
+if [ -n "$STAND_IN" ]; then
     # ---- ARM 23 (sh) A DESCENDANT COMPILER MUST NOT BE REPORTED -------------
-    # The fixture is a REAL ctest running two tests concurrently: the stub, and
-    # a nested run-gate. Both are children of that ctest, so the stub is inside
-    # the gate's own process tree through a BUILD-TOOL ancestor — the one case
-    # the bounded "own" set exists to cover, and the shape a guard registered as
-    # a ctest test really has in this repository.
+    # The fixture is a REAL ctest running four tests: the stand-in `busy`, a
+    # nested run-gate `gate`, and two stand-in verbs that ORDER them. `busy` and
+    # `gate` are both children of that ctest, so the stand-in is inside the gate's
+    # own process tree through a BUILD-TOOL ancestor — the one case the bounded
+    # "own" set exists to cover, and the shape a guard registered as a ctest test
+    # really has in this repository.
+    # ★ THE ORDER IS ctest's DEPENDS, NOT A LIFETIME: `started` does not finish
+    #   until `busy` is observed present, `gate` does not start until `started`
+    #   finishes, and `stopper` does not stop `busy` until `gate` has finished --
+    #   so the stand-in is alive across BOTH of the gate's samples on any host.
+    #   ✔MEASURED that ctest honours DEPENDS as run-after under -j. The `busy 8`
+    #   this replaces was a bet that the nested gate would be done inside 8 s, and
+    #   a stand-in that exited first would have made this arm agree with a subject
+    #   that reports nothing.
     # ⚠ IT CANNOT BE BUILT AS "the gate command backgrounds a child": the scans
     # run BEFORE and AFTER the command, so such a child is either not yet born
     # or already orphaned. ✔MEASURED — an orphaned child reads as FOREIGN, which
     # is the fail-toward-reporting direction and is what arm 24 relies on.
-    mkdir -p "$SANDBOX/bd-nested"
+    L23=23-sh-descendant-compiler
+    rm -rf "${STAND_IN_STATE:?}/$L23"
+    mkdir -p "$STAND_IN_STATE/$L23" "$SANDBOX/bd-nested"
+    STAND_IN_PLANTED="$STAND_IN_PLANTED $L23"
     {
-        printf 'add_test(busy "%s" "8")\n' "$STUB_W"
+        printf 'add_test(busy "%s" "%s" "__stand-in" "body" "%s")\n' "$STAND_IN_W" "$SELF_SCRIPT_W" "$L23"
+        printf 'add_test(started "%s" "%s" "__stand-in" "await" "%s")\n' "$BASH_W" "$SELF_SCRIPT_W" "$L23"
         printf 'add_test(gate "%s" "%s" "%s" "HELLO" "%s" "-c" "echo HELLO")\n' \
-            "$BASH_W" "$(gate_spelling "$ROOT")/scripts/run-gate/run-gate.sh" \
-            "$SCRATCH/a23.log" "$BASH_W"
+            "$BASH_W" "$GATE_SH_W" "$SCRATCH_W/a23.log" "$BASH_W"
+        printf 'set_tests_properties(gate PROPERTIES DEPENDS started)\n'
+        printf 'add_test(stopper "%s" "%s" "__stand-in" "stop" "%s")\n' "$BASH_W" "$SELF_SCRIPT_W" "$L23"
+        printf 'set_tests_properties(stopper PROPERTIES DEPENDS gate)\n'
     } > "$SANDBOX/bd-nested/CTestTestfile.cmake"
-    arm 23-sh-descendant-compiler 0 ctest --test-dir "$SANDBOX/bd-nested" -j 2
-    # The ctest verdict IS this arm's precondition: `busy` must actually have
-    # run, or the nested gate looked at a machine with no stub on it and the
-    # assertion below holds vacuously.
-    # ⓘ AND IT MUST HAVE OUTLIVED THE GATE, which is why the stub sleeps 8 s:
-    # ✔MEASURED on this host the nested gate finished in 5.10 s (two process
-    # table reads dominate it) while `busy` ran the full 8.04 s, so the stub was
-    # live across BOTH of the gate's scans. A stub that exited first would make
-    # this arm agree with a broken subject.
-    says 23-sh-descendant-compiler 'tests failed out of 2'
-    says a23.log "compilers: none outside" --log
+    arm "$L23" 0 ctest --test-dir "$SANDBOX/bd-nested" -j 4
+    # The ctest verdict IS part of this arm's precondition: all four tests,
+    # including the two that prove the ordering, must have passed -- rc 0 above,
+    # and ctest's summary, read in the words EVERY ctest version prints.
+    # ⚠ NOT one sentence: ✔MEASURED 2026-09-14, ctest 4.3.2 (Windows, WSL) prints
+    #   `100% tests passed, 0 tests failed out of 4` and ctest 4.4.1 (the arm64 VPS)
+    #   prints `100% tests passed out of 4`. The needle this arm used to carry,
+    #   `tests failed out of 2`, exists only in the older form, so it would have
+    #   gone red on any carriage or runner that upgraded CMake.
+    says "$L23" '100% tests passed'
+    says "$L23" 'out of 4'
+    r23a=""; r23s=""
+    [ -f "$STAND_IN_STATE/$L23/await-result" ] && read -r r23a < "$STAND_IN_STATE/$L23/await-result"
+    [ -f "$STAND_IN_STATE/$L23/stop-result" ] && read -r r23s < "$STAND_IN_STATE/$L23/stop-result"
+    stand_in_describe "$L23"; rg_at
+    echo "  [info] $L23   independent reading of its stand-in ($RG_SI_DESC): before the gate=${r23a:-never-read}, after the gate=${r23s:-never-read}   $RG_AT"
+    if [ "$r23a" = present ] && [ "$r23s" = stopped ]; then
+        exit_reason_check "$L23" && says a23.log "compilers: none outside" --log
+    else
+        precondition_failed "$L23" "its stand-in was not observed present before the nested gate and stopped after it (await '${r23a:-none}', stop '${r23s:-none}'), so the gate's samples were not shown a descendant"
+        stop_foreign_compiler "$L23"
+    fi
 
     # ---- ARM 24 (sh) THE DEFECT: A COMPILER OUTSIDE THIS GATE'S TREE --------
-    plant_foreign_compiler 12
-    a24_live_before=$(stub_live_count)
-    arm 24-sh-foreign-compiler 0 bash "$GATE_SH" "$SCRATCH/a24.log" 'HELLO' \
-        bash -c 'echo HELLO'
-    a24_live_after=$(stub_live_count)
-    says 24-sh-foreign-compiler 'run-gate.sh: OK'
-    says_named_or_unknown a24.log
-    # ⚠ AND IT MUST NOT HAVE BECOME A REFUSAL. The line is an OBSERVATION: the
-    # mechanism that made a second compiler destroy a verdict is gone, and
-    # refusing here would refuse every gate of a project that runs four lanes in
-    # parallel by design. rc 0 above is that claim; this is it said out loud.
-    says_not 24-sh-foreign-compiler 'FAIL'
+    if alive_throughout_arm 24-sh-foreign-compiler sh a24.log; then
+        stand_in_subject_pid 24-sh-foreign-compiler
+        says 24-sh-foreign-compiler 'run-gate.sh: OK'
+        says_named_or_unknown a24.log "pid $RG_SI_SUBJECT  dsscp  seen throughout this run"
+        # ⚠ AND IT MUST NOT HAVE BECOME A REFUSAL. The line is an OBSERVATION: the
+        # mechanism that made a second compiler destroy a verdict is gone, and
+        # refusing here would refuse every gate of a project that runs four lanes in
+        # parallel by design. rc 0 above is that claim; this is it said out loud.
+        says_not 24-sh-foreign-compiler 'FAIL'
+    fi
 
     # ---- ARM 28 (sh) THE COMPILER THAT EXITS *DURING* THE RUN ---------------
     #
-    # ★★★ THIS IS THE ARM THAT WOULD HAVE CAUGHT THE CI FAILURE LOCALLY, and
-    # the red-on-disable half of the union:
+    # ★★★ THE RED-ON-DISABLE HALF OF THE UNION:
     # [[D-SCRIPT-RUN-GATE-COMPILERS-LINE-REPORTS-NONE-WHEN-IT-COULD-NOT-READ-THE-PROCESS-TABLE]]
-    #
-    # ⚠ ARM 24 ALONE IS SATISFIED BY A SUBJECT THAT ONLY EVER READS ITS LAST
-    # SAMPLE, and it is ALSO satisfied by a gate that simply finished before its
-    # stand-in did. The arm was measuring the GATE'S WALL CLOCK.
-    # ✔MEASURED 2026-09-14 on this host with the subject unmodified: a 13.74 s
-    # gate against an 8 s stand-in printed `compilers: none` with all three of
-    # arm 24's assertions red and `27-parity .sh reported=0 .ps1 reported=1` —
-    # the `windows-msvc-release` signature exactly, from a healthy subject.
-    # ⓘ INFERRED, not measured, for the CI host itself, which cannot be logged
-    # into: the `.sh` gate costs 3.58 s here against the `.ps1` twin's 2.29 s
-    # because it SPAWNS `powershell` twice where the twin calls Get-CimInstance
-    # in-process, and that leg runs this fixture 2.3x slower (253–259 s vs
-    # 109.4 s). What IS measured there is that the twin READ the table: arm 23's
-    # `compilers: none outside` cannot be printed otherwise.
-    #
-    # ⇒ HERE THE STAND-IN IS *DELIBERATELY* OUTLIVED: 3 s against a command that
-    # sleeps 5. It is alive for the pre-run sample and certainly gone for the
-    # post-run one, so only a subject that reports the UNION of both samples can
-    # pass — and a compiler that ran during the gate and exited is the exact
-    # shape of [[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]],
-    # the defect this whole line was added for.
-    plant_foreign_compiler 3
-    arm 28-sh-compiler-exits-midrun 0 bash "$GATE_SH" "$SCRATCH/a28.log" 'HELLO' \
-        bash -c 'sleep 5; echo HELLO'
-    says 28-sh-compiler-exits-midrun 'run-gate.sh: OK'
-    says_named_or_unknown a28.log 'seen when this run STARTED'
-    says_not 28-sh-compiler-exits-midrun 'FAIL'
+    # ⚠ ARM 24 ALONE IS SATISFIED BY A SUBJECT THAT ONLY EVER READS ITS LAST SAMPLE.
+    # Here the GATED COMMAND stops the stand-in and waits until it is observed
+    # gone, so it is alive for the pre-run sample and gone for the post-run one BY
+    # CONSTRUCTION, and only a subject that reports the UNION of both samples can
+    # name it `seen when this run STARTED` — the exact shape of
+    # [[D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT]], a
+    # compiler that ran during the gate and exited.
+    # ⚠ This arm used to plant a 3 s stand-in against a 5 s command on the argument
+    # that it was "certainly alive for the pre-run sample". On a runner 2.3x slower
+    # it was not, and CI went red on a healthy subject; see the top of this file.
+    if exits_midrun_arm 28-sh-compiler-exits-midrun sh a28.log; then
+        stand_in_subject_pid 28-sh-compiler-exits-midrun
+        says 28-sh-compiler-exits-midrun 'run-gate.sh: OK'
+        says_named_or_unknown a28.log "pid $RG_SI_SUBJECT  dsscp  seen when this run STARTED"
+        says_not 28-sh-compiler-exits-midrun 'FAIL'
+    fi
 else
-    na 23-sh-descendant-compiler     "$STUB_ABSENT_WHY"
-    na 24-sh-foreign-compiler        "$STUB_ABSENT_WHY"
-    na 28-sh-compiler-exits-midrun   "$STUB_ABSENT_WHY"
-    a24_live_before=0
-    a24_live_after=0
+    na 23-sh-descendant-compiler     "$STAND_IN_ABSENT_WHY"
+    na 24-sh-foreign-compiler        "$STAND_IN_ABSENT_WHY"
+    na 28-sh-compiler-exits-midrun   "$STAND_IN_ABSENT_WHY"
 fi
 
-if [ -n "$PS_EXE" ] && [ -n "$STUB" ]; then
+if [ -n "$PS_EXE" ] && [ -n "$STAND_IN" ]; then
     # ---- ARM 25 (ps1) THE DEFECT -------------------------------------------
-    plant_foreign_compiler 12
-    arm 25-ps1-foreign-compiler 0 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
-        -File "$GATE_PS1" "$SCRATCH/a25.log" 'HELLO' \
-        "$PS_EXE" -NoProfile -Command "Write-Output HELLO"
-    says 25-ps1-foreign-compiler 'run-gate.ps1: OK'
-    says_named_or_unknown a25.log
+    if alive_throughout_arm 25-ps1-foreign-compiler ps1 a25.log; then
+        stand_in_subject_pid 25-ps1-foreign-compiler
+        says 25-ps1-foreign-compiler 'run-gate.ps1: OK'
+        says_named_or_unknown a25.log "pid $RG_SI_SUBJECT  dsscp  seen throughout this run"
+    fi
 
     # ---- ARM 26 (ps1) THE CONTROL, i.e. THE ESCAPE IS DIRECTIONAL ----------
     # ⚠ WITHOUT THIS THE TWIN COULD SIMPLY ALWAYS REPORT. Arm 25 alone is
     # satisfied by a line that fires unconditionally, which is the failure this
     # whole subject was written to avoid in the other direction.
-    # ⓘ It waits for arm 25's orphan rather than asserting over it: 12 s was
-    # chosen to outlive one gate and not two.
-    sleep 13
-    arm 26-ps1-no-compiler 0 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
-        -File "$GATE_PS1" "$SCRATCH/a26.log" 'HELLO' \
-        "$PS_EXE" -NoProfile -Command "Write-Output HELLO"
-    says a26.log "compilers: none outside" --log
+    # ⓘ NO WAIT BEFORE IT: every stand-in planted so far was stopped and OBSERVED
+    #   gone by its own arm. That is re-checked here, by pid, rather than assumed
+    #   -- the `sleep 13` it replaces was a bet that arm 25's 12 s stand-in had died.
+    all_gone=1
+    for _rg_l in $STAND_IN_PLANTED; do
+        stand_in_gone "$_rg_l" || { stand_in_load "$_rg_l" && all_gone=0; }
+    done
+    if [ "$all_gone" = 1 ]; then
+        arm 26-ps1-no-compiler 0 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+            -File "$GATE_PS1" "$SCRATCH/a26.log" 'HELLO' \
+            "$PS_EXE" -NoProfile -Command "Write-Output HELLO"
+        rg_at
+        echo "  [info] 26-ps1-no-compiler   independent reading: every stand-in this run planted ($STAND_IN_PLANTED ) was gone before the gate   $RG_AT"
+        says a26.log "compilers: none outside" --log
+    else
+        precondition_failed 26-ps1-no-compiler "a stand-in from an earlier arm was still alive, so a 'none' answer could not be asked for"
+    fi
 
     # ---- ARM 27 TWIN PARITY ON THE FIFTH SUBJECT ---------------------------
     ran
+    rc_of 24-sh-foreign-compiler; sh_rc="$RG_RC"
+    rc_of 25-ps1-foreign-compiler; ps_rc="$RG_RC"
     sh_saw=$(logtext "$SCRATCH/a24.log" | grep -c "OUTSIDE this gate's process tree" || true)
     ps_saw=$(logtext "$SCRATCH/a25.log" | grep -c "OUTSIDE this gate's process tree" || true)
-    sh_rc=$(cat "$SCRATCH/24-sh-foreign-compiler.rc")
-    ps_rc=$(cat "$SCRATCH/25-ps1-foreign-compiler.rc")
-    if [ "$sh_saw" -ge 1 ] && [ "$ps_saw" -ge 1 ] && [ "$sh_rc" = "0" ] && [ "$ps_rc" = "0" ]; then
-        echo "  [ok  ] 27-parity  both twins REPORTED a foreign compiler and both still exited 0"
+    rg_at
+    if [ "$sh_rc" = not-run ] || [ "$ps_rc" = not-run ]; then
+        precondition_failed 27-parity "arm 24 or 25 never ran (.sh rc=$sh_rc, .ps1 rc=$ps_rc) -- its own precondition failure is reported above"
+    elif [ "$sh_saw" -ge 1 ] && [ "$ps_saw" -ge 1 ] && [ "$sh_rc" = "0" ] && [ "$ps_rc" = "0" ]; then
+        echo "  [ok  ] 27-parity  both twins REPORTED a foreign compiler and both still exited 0   $RG_AT"
     else
-        echo "  [FAIL] 27-parity  .sh reported=$sh_saw rc=$sh_rc, .ps1 reported=$ps_saw rc=$ps_rc (both must report, both must exit 0)"
-        # ★ THE DIAGNOSIS THE CI FAILURE DID NOT CARRY. These four lines alone
-        # were read for a whole cycle as "the .sh twin cannot see the process
-        # table", and the SAME four lines are produced by a stand-in that simply
-        # died before the twin's slower second scan — ✔MEASURED, on a subject
-        # with nothing wrong with it. The reading below separates the two, it is
-        # taken with a DIFFERENT instrument from the subject's, and it only ever
-        # explains a failure — it never excuses one.
-        echo "         stand-in live count around arm 24: before=$a24_live_before after=$a24_live_after"
-        echo "         (before>0 and after=0 means the GATE OUTLIVED THE STAND-IN, so the"
-        echo "          subject's two samples disagreed; that is a union defect in run-gate,"
-        echo "          not a blindness one. before=0 means the stand-in never started.)"
+        echo "  [FAIL] 27-parity  .sh reported=$sh_saw rc=$sh_rc, .ps1 reported=$ps_saw rc=$ps_rc (both must report, both must exit 0)   $RG_AT"
         fails=$((fails + 1))
     fi
 
     # ---- ARM 29 (ps1) THE COMPILER THAT EXITS *DURING* THE RUN -------------
-    # The twin of arm 28. ⚠ A capability in one twin and not the other is this
-    # project's canonical silent harness bug, and the union is a capability.
-    plant_foreign_compiler 3
-    arm 29-ps1-compiler-exits-midrun 0 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
-        -File "$GATE_PS1" "$SCRATCH/a29.log" 'HELLO' \
-        "$PS_EXE" -NoProfile -Command "Start-Sleep -Seconds 5; Write-Output HELLO"
-    says 29-ps1-compiler-exits-midrun 'run-gate.ps1: OK'
-    says_named_or_unknown a29.log 'seen when this run STARTED'
+    # The twin of arm 28, with the SAME gated command. ⚠ A capability in one twin
+    # and not the other is this project's canonical silent harness bug, and the
+    # union is a capability.
+    if exits_midrun_arm 29-ps1-compiler-exits-midrun ps1 a29.log; then
+        stand_in_subject_pid 29-ps1-compiler-exits-midrun
+        says 29-ps1-compiler-exits-midrun 'run-gate.ps1: OK'
+        says_named_or_unknown a29.log "pid $RG_SI_SUBJECT  dsscp  seen when this run STARTED"
+    fi
 
     # ---- ARM 30 TWIN PARITY ON THE UNION -----------------------------------
     # ⚠ ARM 27 CANNOT COVER THIS. It compares the twins on a compiler that was
     # alive for BOTH samples, which a last-sample-wins subject also reports. The
     # parity that broke on CI is the one over a compiler alive for only ONE.
     ran
-    sh_u=$(logtext "$SCRATCH/a28.log" | grep -c "OUTSIDE this gate's process tree" || true)
-    ps_u=$(logtext "$SCRATCH/a29.log" | grep -c "OUTSIDE this gate's process tree" || true)
-    sh_urc=$(cat "$SCRATCH/28-sh-compiler-exits-midrun.rc")
-    ps_urc=$(cat "$SCRATCH/29-ps1-compiler-exits-midrun.rc")
+    rc_of 28-sh-compiler-exits-midrun; sh_urc="$RG_RC"
+    rc_of 29-ps1-compiler-exits-midrun; ps_urc="$RG_RC"
+    sh_u=$(logtext "$SCRATCH/a28.log" | grep -c "seen when this run STARTED" || true)
+    ps_u=$(logtext "$SCRATCH/a29.log" | grep -c "seen when this run STARTED" || true)
     if [ "$TABLE_STATE" = blind ]; then
         sh_u=$(logtext "$SCRATCH/a28.log" | grep -c 'compilers: UNKNOWN' || true)
         ps_u=$(logtext "$SCRATCH/a29.log" | grep -c 'compilers: UNKNOWN' || true)
     fi
-    if [ "$sh_u" -ge 1 ] && [ "$ps_u" -ge 1 ] && [ "$sh_urc" = "0" ] && [ "$ps_urc" = "0" ]; then
-        echo "  [ok  ] 30-parity-union  both twins reported the SAME state ($TABLE_STATE) for a compiler that exited mid-run, and both still exited 0"
+    rg_at
+    if [ "$sh_urc" = not-run ] || [ "$ps_urc" = not-run ]; then
+        precondition_failed 30-parity-union "arm 28 or 29 never ran (.sh rc=$sh_urc, .ps1 rc=$ps_urc) -- its own precondition failure is reported above"
+    elif [ "$sh_u" -ge 1 ] && [ "$ps_u" -ge 1 ] && [ "$sh_urc" = "0" ] && [ "$ps_urc" = "0" ]; then
+        echo "  [ok  ] 30-parity-union  both twins reported the SAME state ($TABLE_STATE) for a compiler that exited mid-run, and both still exited 0   $RG_AT"
     else
-        echo "  [FAIL] 30-parity-union  host=$TABLE_STATE .sh reported=$sh_u rc=$sh_urc, .ps1 reported=$ps_u rc=$ps_urc (both must report the same state, both must exit 0)"
+        echo "  [FAIL] 30-parity-union  host=$TABLE_STATE .sh reported=$sh_u rc=$sh_urc, .ps1 reported=$ps_u rc=$ps_urc (both must report the same state, both must exit 0)   $RG_AT"
         fails=$((fails + 1))
     fi
-elif [ -z "$STUB" ]; then
-    na 25-ps1-foreign-compiler       "$STUB_ABSENT_WHY"
-    na 26-ps1-no-compiler            "$STUB_ABSENT_WHY"
-    na 27-parity                     "$STUB_ABSENT_WHY -- the twins were NOT compared on the fifth subject"
-    na 29-ps1-compiler-exits-midrun  "$STUB_ABSENT_WHY"
-    na 30-parity-union               "$STUB_ABSENT_WHY -- the twins were NOT compared on the two-sample union"
+elif [ -z "$STAND_IN" ]; then
+    na 25-ps1-foreign-compiler       "$STAND_IN_ABSENT_WHY"
+    na 26-ps1-no-compiler            "$STAND_IN_ABSENT_WHY"
+    na 27-parity                     "$STAND_IN_ABSENT_WHY -- the twins were NOT compared on the fifth subject"
+    na 29-ps1-compiler-exits-midrun  "$STAND_IN_ABSENT_WHY"
+    na 30-parity-union               "$STAND_IN_ABSENT_WHY -- the twins were NOT compared on the two-sample union"
 else
     na 25-ps1-foreign-compiler       "$PS_ABSENT_WHY -- the .ps1 twin was never shown a foreign compiler"
     na 26-ps1-no-compiler            "$PS_ABSENT_WHY -- the .ps1 twin's no-compiler CONTROL was not taken"
@@ -1000,15 +1434,352 @@ else
     na 30-parity-union               "$PS_ABSENT_WHY -- arm 28 still proves the .sh twin's union, but the twins were NOT compared on it"
 fi
 
+# ═══ THE SIXTH SUBJECT: A PARENT LINK THAT NAMES A RECYCLED PID ════════════════
+# [[D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY]]
+# ★★★ BOTH TWINS DECIDE "ours" BY WALKING PARENT LINKS, AND ON WINDOWS A PARENT
+# LINK GOES STALE. Windows does not reparent an orphan and recycles pids;
+# ✔MEASURED on the workstation: under MSYS a bash's own Windows parent is ALREADY
+# dead when it starts, and a freed pid comes back after ~108 allocations. Before
+# the rule, BOTH twins were driven through the tables below and got FOUR of them
+# wrong: a foreign compiler read as ours, an unrelated ctest's tree adopted as the
+# gate's own, and a real contender waved through — silently, exit 0 where 4 is owed.
+# ★ THE RULE UNDER TEST: a process is another's parent only if it was CREATED
+# FIRST; a link naming a younger process is a recycled pid, and the walk ends.
+#
+# ⓘ SHARED DATA, TWO DRIVERS, ONE COMPARISON. The scenarios are written ONCE, as
+#   data, and each twin's driver feeds them to that twin's OWN functions -- the
+#   .sh loaded from its source text, the .ps1 through the PowerShell PARSER -- so
+#   neither script is executed, nothing in either is settable by a caller, and
+#   arm 33 can require the two twins' verdicts to be identical line for line.
+# ⓘ EVERY PID IS ODD AND ABOVE 900000000, so none can collide with a real one:
+#   Windows pids are multiples of four, Linux caps at 4194304, macOS at 99999.
+# ⓘ And each driver first asks its twin's REAL table for this process's own row:
+#   the rule is only as good as the key it compares, so a real key must exist.
+write_recycled_pid_scenarios() {  # <file>
+    cat > "$1" <<'SCENARIOS'
+# row is pid|ppid|image|created|command-line; SELF is the classifying process.
+scenario|A-a-compilers-dead-parent-pid-went-to-this-gates-own-sampler|-
+row|SELF|900000005|bash.exe|20260914222907360291|bash.exe run-gate.sh
+row|900000021|900000013|dsscp.exe|20260914222908245336|C:/stand-in/dsscp.exe
+row|900000009|SELF|bash.exe|20260914222909050000|bash.exe
+row|900000013|900000009|powershell.exe|20260914222909100000|powershell -NoProfile -Command Get-CimInstance Win32_Process
+expect|foreign|900000021
+expect|recycled|900000021>900000013
+end
+scenario|B-control-the-same-orphan-whose-parent-pid-was-not-recycled|-
+row|SELF|900000005|bash.exe|20260914222907360291|bash.exe run-gate.sh
+row|900000021|900000013|dsscp.exe|20260914222908245336|C:/stand-in/dsscp.exe
+row|900000009|SELF|bash.exe|20260914222909050000|bash.exe
+row|900000017|900000009|powershell.exe|20260914222909100000|powershell -NoProfile -Command Get-CimInstance Win32_Process
+expect|foreign|900000021
+end
+scenario|C-control-a-genuine-descendant-through-a-build-tool|-
+row|900000041|900000033|ctest.exe|20260914222900000000|ctest --test-dir C:/x/bd-nested -j 4
+row|SELF|900000041|bash.exe|20260914222901000000|bash.exe run-gate.sh
+row|900000045|900000041|dsscp.exe|20260914222901000500|C:/stand-in/dsscp.exe
+expect|ours|900000045
+end
+scenario|D-this-gates-dead-parent-pid-went-to-an-unrelated-build-tool|-
+row|SELF|900000061|bash.exe|20260914222907360291|bash.exe run-gate.sh
+row|900000061|900000057|ctest.exe|20260914222930000000|ctest --test-dir C:/other/build -j 6
+row|900000065|900000061|dsscp.exe|20260914222931000000|C:/other/dsscp.exe main.c
+expect|foreign|900000065
+expect|recycled|SELF>900000061
+end
+scenario|X-a-contender-holding-this-gates-dead-parent-pid-is-still-a-contender|/rg-recycled-pid/build
+row|SELF|900000081|bash.exe|20260914222907360291|bash.exe run-gate.sh
+row|900000081|900000077|ctest.exe|20260914222930000000|ctest --test-dir /rg-recycled-pid/build -j 6
+expect|contender|900000081
+end
+scenario|Y-control-a-gate-genuinely-run-inside-that-ctest-is-not-refused|/rg-recycled-pid/build
+row|900000101|900000097|ctest.exe|20260914222900000000|ctest --test-dir /rg-recycled-pid/build -j 6
+row|SELF|900000101|bash.exe|20260914222901000000|bash.exe run-gate.sh
+expect|excluded|900000101
+end
+SCENARIOS
+}
+
+# The .sh twin's FUNCTIONS and the settings they read, never its top level: every
+# `name() {` block through its closing `}` at column 0, plus four one-line
+# assignments the functions depend on.
+sh_subject_definitions() {
+    awk '
+        /^[A-Za-z_][A-Za-z0-9_]*\(\) *\{/ { cap = 1 }
+        !cap && /^run_gate_(build_tools|compiler_image)="[^"]*"$/ { print; next }
+        !cap && /^run_gate_(tab|nl)=\$'"'"'[^'"'"']*'"'"'$/ { print; next }
+        cap { print }
+        cap && /^}/ { cap = 0; print "" }
+    ' "$GATE_SH"
+}
+
+# One verdict line per expectation: `<scenario>|<kind>|<subject>|<what the twin did>`.
+recycled_pid_verdicts_sh() {  # <scenario file>
+    (
+        eval "$(sh_subject_definitions)"
+        for _f in run_gate_scan_contention run_gate_resolve_dir run_gate_process_table; do
+            declare -F "$_f" >/dev/null || { echo "EXTRACT-FAILED|$_f"; exit 91; }
+        done
+        if [ -z "${run_gate_build_tools:-}" ] || [ -z "${run_gate_compiler_image:-}" ]; then
+            echo "EXTRACT-FAILED|settings"
+            exit 91
+        fi
+        _me="$$"
+        if run_gate_host_is_windows; then read -r _me < "/proc/$$/winpid"; fi
+        echo "REALKEY|$(run_gate_process_table 2>/dev/null | awk -F'\t' -v p="$_me" '$1 == p { print $6; exit }')"
+        _self=900000001
+        run_gate_self_pid() { printf '%s' "$_self"; }
+        run_gate_process_table() { printf '%s' "$_tbl"; }
+        _tbl=""; _name=""; _bd="-"; _expects=""
+        while IFS='|' read -r _k _a _b _c _d _e; do
+            case "$_k" in
+                (scenario)
+                    _name="$_a"; _bd="$_b"; _tbl=""; _expects="" ;;
+                (row)
+                    [ "$_a" = SELF ] && _a="$_self"
+                    [ "$_b" = SELF ] && _b="$_self"
+                    _tbl="$_tbl$_a$RG_TAB$_b$RG_TAB$_c$RG_TAB$_e$RG_TAB$_c$RG_TAB$_d$RG_NL" ;;
+                (expect)
+                    _expects="$_expects$_a|$_b$RG_NL" ;;
+                (end)
+                    run_gate_contention_note=""
+                    run_gate_build_dir=""
+                    [ "$_bd" = "-" ] || run_gate_build_dir="$(run_gate_resolve_dir "$_bd")"
+                    run_gate_scan_contention
+                    while IFS='|' read -r _kind _subj; do
+                        [ -n "$_kind" ] || continue
+                        case "$_subj" in
+                            (SELF*) _real="$_self${_subj#SELF}" ;;
+                            (*)     _real="$_subj" ;;
+                        esac
+                        case "$_kind" in
+                            (foreign|ours)
+                                if printf '%s\n' "${run_gate_foreign:-}" | awk -F'\t' -v p="$_real" '$1 == p { f = 1 } END { exit !f }'
+                                then _got=foreign; else _got=ours; fi ;;
+                            (contender|excluded)
+                                if printf '%s\n' "${run_gate_contenders:-}" | grep -q "pid $_real "
+                                then _got=contender; else _got=excluded; fi ;;
+                            (*)
+                                if printf '%s\n' "${run_gate_recycled:-}" | grep -qxF "$_real"
+                                then _got=recycled; else _got=followed; fi ;;
+                        esac
+                        echo "$_name|$_kind|$_subj|$_got"
+                    done <<EOF
+$_expects
+EOF
+                    ;;
+            esac
+        done < "$1"
+        exit 0
+    )
+}
+
+# The .ps1 twin's driver: the same contract, through the PowerShell PARSER.
+write_recycled_pid_driver_ps1() {  # <file>
+    cat > "$1" <<'PS1'
+# Generated by test-run-gate.sh: the .ps1 twin's half of the recycled-pid arms.
+param()
+$gate = [string]$args[0]
+$scen = [string]$args[1]
+$errs = $null; $toks = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($gate, [ref]$toks, [ref]$errs)
+if ($errs.Count -gt 0) { Write-Output 'EXTRACT-FAILED|parse'; exit 91 }
+foreach ($fn in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
+    . ([ScriptBlock]::Create($fn.Extent.Text))
+}
+foreach ($as in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Parent -is [System.Management.Automation.Language.NamedBlockAst] }, $false)) {
+    if ($as.Left.Extent.Text -eq '$script:RunGateBuildTools' -or $as.Left.Extent.Text -eq '$script:RunGateCompilerImage') {
+        . ([ScriptBlock]::Create($as.Extent.Text))
+    }
+}
+foreach ($need in 'Get-RunGateContention', 'Resolve-RunGateDir', 'Get-RunGateProcessTable') {
+    if (-not (Get-Command $need -ErrorAction SilentlyContinue)) { Write-Output "EXTRACT-FAILED|$need"; exit 91 }
+}
+if (-not $script:RunGateBuildTools -or -not $script:RunGateCompilerImage) { Write-Output 'EXTRACT-FAILED|settings'; exit 91 }
+$mine = @(Get-RunGateProcessTable | Where-Object { $_.ProcId -eq $PID })
+$realKey = if ($mine.Count -gt 0) { [string]$mine[0].Created } else { '' }
+Write-Output "REALKEY|$realKey"
+$script:ScenarioRows = @()
+function Get-RunGateProcessTable { return @($script:ScenarioRows) }
+$name = ''; $bd = '-'; $rows = @(); $expects = @()
+foreach ($line in (Get-Content -LiteralPath $scen)) {
+    if (-not $line -or $line.StartsWith('#')) { continue }
+    $f = $line -split '\|'
+    if ($f[0] -eq 'scenario') { $name = $f[1]; $bd = $f[2]; $rows = @(); $expects = @(); continue }
+    if ($f[0] -eq 'row') {
+        $id = if ($f[1] -eq 'SELF') { $PID } else { [int]$f[1] }
+        $pp = if ($f[2] -eq 'SELF') { $PID } else { [int]$f[2] }
+        $rows += [PSCustomObject]@{ ProcId = [int]$id; ParentId = [int]$pp; Image = $f[3]; CmdLine = $f[5]; Argv0 = $f[3]; Created = $f[4] }
+        continue
+    }
+    if ($f[0] -eq 'expect') { $expects += ,@($f[1], $f[2]); continue }
+    if ($f[0] -ne 'end') { continue }
+    $script:ScenarioRows = $rows
+    $script:RunGateBuildDir = if ($bd -eq '-') { '' } else { Resolve-RunGateDir $bd }
+    $script:RunGateRecycled = @()
+    Get-RunGateContention
+    foreach ($e in $expects) {
+        $kind = $e[0]; $subj = $e[1]
+        $real = if ($subj.StartsWith('SELF')) { "$PID" + $subj.Substring(4) } else { $subj }
+        if ($kind -eq 'foreign' -or $kind -eq 'ours') {
+            $got = if (@($script:RunGateForeign | Where-Object { "$($_.ProcId)" -eq $real }).Count -gt 0) { 'foreign' } else { 'ours' }
+        } elseif ($kind -eq 'contender' -or $kind -eq 'excluded') {
+            $got = if (@($script:RunGateContenders | Where-Object { $_ -match ('^\s*pid ' + [regex]::Escape($real) + '\s') }).Count -gt 0) { 'contender' } else { 'excluded' }
+        } else {
+            $got = if (@($script:RunGateRecycled) -contains $real) { 'recycled' } else { 'followed' }
+        }
+        Write-Output "$name|$kind|$subj|$got"
+    }
+}
+exit 0
+PS1
+}
+
+# THE JUDGEMENT, shared by both twins' arms: the expectation's kind IS the
+# correct verdict, every expectation in the data must have produced a line, and
+# the twin's REAL table must have given this process a 20-digit creation key.
+judge_recycled_pid_verdicts() {  # <label> <verdict file> <driver rc> <scenario file>
+    local label=$1 file=$2 drc=$3 scen=$4 key n_want n_got name kind subj got
+    rg_at
+    if [ "$drc" -ne 0 ] || grep -q '^EXTRACT-FAILED' "$file"; then
+        echo "  [FAIL] $label   the driver could not load the subject's own definitions (rc=$drc): $(tr -d '\r' < "$file" | head -3 | tr '\n' ' ')   $RG_AT"
+        fails=$((fails + 1))
+        return 1
+    fi
+    key="$(tr -d '\r' < "$file" | sed -n 's/^REALKEY|//p')"
+    case "$key" in
+        (*[!0-9]*|"") key_ok=0 ;;
+        (*) key_ok=1; [ "${#key}" -eq 20 ] || key_ok=0 ;;
+    esac
+    if [ "$key_ok" = 1 ]; then
+        echo "  [ok  ] $label   the subject's REAL process table gives this process a 20-digit creation key ($key)"
+    else
+        echo "  [FAIL] $label   the subject's REAL process table gives this process no 20-digit creation key ('$key'), so the recycled-pid rule has nothing to compare on this host"
+        fails=$((fails + 1))
+    fi
+    n_want=$(grep -c '^expect|' "$scen")
+    n_got=0
+    while IFS='|' read -r name kind subj got; do
+        [ "$name" = REALKEY ] && continue
+        [ -n "$name" ] || continue
+        n_got=$((n_got + 1))
+        if [ "$got" = "$kind" ]; then
+            echo "  [ok  ] $label   $name: $subj is $got"
+        else
+            echo "  [FAIL] $label   $name: $subj was classified '$got', and the correct verdict is '$kind'"
+            fails=$((fails + 1))
+        fi
+    done <<EOF
+$(tr -d '\r' < "$file")
+EOF
+    if [ "$n_got" -ne "$n_want" ]; then
+        echo "  [FAIL] $label   $n_got verdict(s) for the $n_want expectation(s) in the scenario data"
+        fails=$((fails + 1))
+    fi
+    return 0
+}
+
+SCEN="$SCRATCH/recycled-pid-scenarios.txt"
+write_recycled_pid_scenarios "$SCEN"
+
+# ---- ARM 31 (sh) A RECYCLED PID IS NEVER A PARENT -----------------------------
+ran
+rg_now; t31="$RG_NOW_US"
+recycled_pid_verdicts_sh "$SCEN" > "$SCRATCH/31-sh-recycled-pid.verdicts" 2> "$SCRATCH/31-sh-recycled-pid.err"
+rc31=$?
+rg_now; rg_span "$t31" "$RG_NOW_US"
+echo "  [info] 31-sh-recycled-pid   the .sh twin's own classifier, driven through $(grep -c '^scenario|' "$SCEN") constructed tables, took ${RG_SPAN}s"
+judge_recycled_pid_verdicts 31-sh-recycled-pid "$SCRATCH/31-sh-recycled-pid.verdicts" "$rc31" "$SCEN"
+
+if [ -n "$PS_EXE" ]; then
+    # ---- ARM 32 (ps1) A RECYCLED PID IS NEVER A PARENT ------------------------
+    write_recycled_pid_driver_ps1 "$SCRATCH/recycled-pid-verdicts.ps1"
+    native_path "$SCRATCH/recycled-pid-verdicts.ps1"; drv_w="$RG_NATIVE"
+    native_path "$SCEN"; scen_w="$RG_NATIVE"
+    ran
+    rg_now; t32="$RG_NOW_US"
+    "$PS_EXE" -NoProfile -ExecutionPolicy Bypass -File "$drv_w" "$GATE_PS1_W" "$scen_w" \
+        > "$SCRATCH/32-ps1-recycled-pid.verdicts" 2> "$SCRATCH/32-ps1-recycled-pid.err"
+    rc32=$?
+    rg_now; rg_span "$t32" "$RG_NOW_US"
+    echo "  [info] 32-ps1-recycled-pid   the .ps1 twin's own classifier, driven through the same tables, took ${RG_SPAN}s"
+    judge_recycled_pid_verdicts 32-ps1-recycled-pid "$SCRATCH/32-ps1-recycled-pid.verdicts" "$rc32" "$SCEN"
+
+    # ---- ARM 33 TWIN PARITY ON THE RECYCLED-PID RULE --------------------------
+    ran
+    tr -d '\r' < "$SCRATCH/31-sh-recycled-pid.verdicts"  | grep -v '^REALKEY|' > "$SCRATCH/33.sh.cmp"
+    tr -d '\r' < "$SCRATCH/32-ps1-recycled-pid.verdicts" | grep -v '^REALKEY|' > "$SCRATCH/33.ps1.cmp"
+    rg_at
+    if [ -s "$SCRATCH/33.sh.cmp" ] && cmp -s "$SCRATCH/33.sh.cmp" "$SCRATCH/33.ps1.cmp"; then
+        echo "  [ok  ] 33-parity-recycled-pid  both twins reached the SAME $(grep -c . "$SCRATCH/33.sh.cmp") verdicts on the same tables   $RG_AT"
+    else
+        echo "  [FAIL] 33-parity-recycled-pid  the twins' verdicts differ on the same tables:   $RG_AT"
+        diff "$SCRATCH/33.sh.cmp" "$SCRATCH/33.ps1.cmp" | sed 's/^/         /' | head -12
+        fails=$((fails + 1))
+    fi
+else
+    na 32-ps1-recycled-pid       "$PS_ABSENT_WHY -- the .ps1 twin's classifier was never shown a recycled pid"
+    na 33-parity-recycled-pid    "$PS_ABSENT_WHY -- arm 31 still proves the .sh twin, but the twins were NOT compared"
+fi
+
+# ═══ THE SEVENTH SUBJECT: A WITNESS THE WRAPPER WROTE ITSELF ═══════════════════
+# [[D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY]]
+# ★★★ THE WITNESS MUST COME FROM THE COMMAND'S OUTPUT, AND IT USED NOT TO HAVE TO.
+# ✔MEASURED 2026-09-14 while this fixture was being rebuilt: both twins append the
+# gate command's argv to the log (`command : …`) BEFORE they search it for the
+# witness, so a command that printed NOTHING but spelled the witness in its own
+# argv came back OK from both — `bash -c ': ZQX-WITNESS'` and
+# `$null = "ZQX-WITNESS"`. Every arm above that pairs a witness with `echo HELLO`
+# carries HELLO in its argv too, so none of them could ever have seen it.
+# ★ THE PAIR IS THE POINT: 34/36 put the witness ONLY in the argv and must be
+#   refused (exit 1); 35/37 put it ONLY in the output — the argv spells it split
+#   in two — and must pass, or the refusal arms are equally consistent with a
+#   wrapper that now refuses every witness.
+arm 34-sh-witness-only-in-argv 1 bash "$GATE_SH" "$SCRATCH/a34.log" 'RG-WITNESS-ARGV-ONLY' \
+    bash -c ': RG-WITNESS-ARGV-ONLY'
+says 34-sh-witness-only-in-argv 'NO EVIDENCE it did any work'
+arm 35-sh-witness-only-in-output 0 bash "$GATE_SH" "$SCRATCH/a35.log" 'RG-WITNESS-OUTPUT-ONLY' \
+    bash -c 'printf "%s-%s\n" RG-WITNESS OUTPUT-ONLY'
+says 35-sh-witness-only-in-output 'run-gate.sh: OK'
+
+if [ -n "$PS_EXE" ]; then
+    arm 36-ps1-witness-only-in-argv 1 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+        -File "$GATE_PS1" "$SCRATCH/a36.log" 'RG-WITNESS-ARGV-ONLY' \
+        "$PS_EXE" -NoProfile -Command '$null = "RG-WITNESS-ARGV-ONLY"'
+    says 36-ps1-witness-only-in-argv 'NO EVIDENCE it did any work'
+    arm 37-ps1-witness-only-in-output 0 "$PS_EXE" -NoProfile -ExecutionPolicy Bypass \
+        -File "$GATE_PS1" "$SCRATCH/a37.log" 'RG-WITNESS-OUTPUT-ONLY' \
+        "$PS_EXE" -NoProfile -Command "Write-Output ('RG-WITNESS-' + 'OUTPUT-ONLY')"
+    says 37-ps1-witness-only-in-output 'run-gate.ps1: OK'
+
+    # ---- ARM 38 TWIN PARITY ON THE WITNESS'S SOURCE ---------------------------
+    ran
+    rc_of 34-sh-witness-only-in-argv;   w_sh_argv="$RG_RC"
+    rc_of 35-sh-witness-only-in-output; w_sh_out="$RG_RC"
+    rc_of 36-ps1-witness-only-in-argv;  w_ps_argv="$RG_RC"
+    rc_of 37-ps1-witness-only-in-output; w_ps_out="$RG_RC"
+    rg_at
+    if [ "$w_sh_argv" = 1 ] && [ "$w_ps_argv" = 1 ] && [ "$w_sh_out" = 0 ] && [ "$w_ps_out" = 0 ]; then
+        echo "  [ok  ] 38-parity-witness  both twins take the witness from the command's OUTPUT only (argv-only 1/1, output-only 0/0)   $RG_AT"
+    else
+        echo "  [FAIL] 38-parity-witness  argv-only: .sh=$w_sh_argv .ps1=$w_ps_argv (both must be 1); output-only: .sh=$w_sh_out .ps1=$w_ps_out (both must be 0)   $RG_AT"
+        fails=$((fails + 1))
+    fi
+else
+    na 36-ps1-witness-only-in-argv   "$PS_ABSENT_WHY -- the .ps1 twin was never shown a witness spelled only in its argv"
+    na 37-ps1-witness-only-in-output "$PS_ABSENT_WHY -- the .ps1 twin's output-only CONTROL was not taken"
+    na 38-parity-witness             "$PS_ABSENT_WHY -- arms 34 and 35 still prove the .sh twin, but the twins were NOT compared"
+fi
+
 # ---- WHAT THIS RUN ACTUALLY PROVED -----------------------------------------
 # The count is printed on EVERY host, green or not. A reader who sees only
 # "0 failure(s)" cannot tell a run that proved both twins from one that proved
 # half of them, and that is the whole reason the not-applicable arms are counted
 # rather than skipped.
-echo "run-gate evidence-integrity proof: $arms_ran arm(s) ran, $arms_na not applicable on this host, $fails failure(s)"
+rg_at
+echo "run-gate evidence-integrity proof: $arms_ran arm(s) ran, $arms_na not applicable on this host, $fails failure(s), $preconditions_failed of them FIXTURE PRECONDITIONS (not verdicts on run-gate); finished $RG_AT"
 if [ "$arms_na" -gt 0 ]; then
-    echo "  ! NOT PROVED HERE: the .ps1 twin, and therefore TWIN PARITY. This host has no"
-    echo "    working PowerShell, so a green run above is evidence about run-gate.sh ALONE."
+    echo "  ! NOT PROVED HERE: every arm marked n/a above. Where that is the .ps1 twin, TWIN"
+    echo "    PARITY is not proved here, and a green run is evidence about run-gate.sh ALONE."
     echo "    Not-applicable is not a failure and this fixture still exits on failures only."
 else
     echo "  both twins were driven on this host; twin parity is proved here."
