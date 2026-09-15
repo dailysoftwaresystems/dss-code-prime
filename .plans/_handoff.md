@@ -58,7 +58,7 @@ below is IN it.
 
 ## §0.0 — STATE
 
-✅ **THIS COMMIT CARRIES P66's EXIT, and it is pushed to PR #57 right after it. The merge is the operator's.** All eight lanes are folded, the fold-time eight-run gate is green, and both P0 atomics rows are ✅ CLOSED. This file cannot name the commit that carries it; re-derive HEAD with `git log --oneline -3`.
+✅ **P66's EXIT IS `956e5526`, PUSHED TO PR #57. CI and sqlite `veryquick` have run on it, as measured below. The merge is the operator's.** All eight lanes are folded, the fold-time eight-run gate is green, and both P0 atomics rows are ✅ CLOSED. The commit carrying this record follows `956e5526`; re-derive HEAD with `git log --oneline -3`.
 
 **The eight-run gate on the folded tree, 2026-09-15.** Each run went through `run-gate` with its witness present, inputs held still, and no compilers outside its own process tree:
 
@@ -89,15 +89,34 @@ below is IN it.
 - the `check-plan-citations` and `check-wrapped-anchor-ids` self-tests leak temp boxes;
 - `refresh_landing_log --check` cannot fail.
 
+**MEASURED after `956e5526` was pushed, 2026-09-15:**
+- **CI run 35002599732 on `956e5526`: GREEN on all five test legs**, and DCO passed.
+  - `windows-msvc-release` ran its 2207 tests in 977.65 s (979 s of its 3000 s cap). There `packed_atomic_member_concurrency` passed in 2.05 s (CLI runner) and 2.18 s (in-process runner), where the red run at `b3e006a8` took 33.31 s and 17.17 s; `program/test_atomics_runtime_no_split_lock` passed in 2.70 s.
+  - `linux-clang-asan` used 3301 s of its 6600 s cap (50%; the previous run used 5817 s).
+- **sqlite `veryquick` over `956e5526` on all four hosts, 0 poisoned on every one:**
+
+| host | verdict |
+|---|---|
+| Windows | Driver rc 1. pe64-x86_64 GREEN (3 errors of 394,470, all known confounds). elf64-x86_64 in the WSL kernel GREEN (9 of 394,817, all known confounds). elf64-arm64 under qemu in the WSL kernel **2 GENUINE by the window rule** (`walsetlk_recover-1.2`, `walsetlk_recover-1.3.(1770)`), 6 confounds excused. Both Mach-O legs built, not run (`runOn`). |
+| WSL x86_64 | Driver rc 0; the clone was prepared at `956e5526` and restored clean. elf64-x86_64 GREEN (6 of 394,817). elf64-arm64 under qemu GREEN (10 of 394,821; `walsetlk_recover-1.3` among them, EXCUSED with 2 clock steps inside its window). pe64-x86_64 under wine GREEN (3 of 392,936) but NOT FULL COVERAGE (3 unit groups not reached). |
+| macOS arm64 | GREEN: macho64-arm64 3 of 394,609 and macho64-x86_64 3 of 394,605, all known confounds. The first launch refused at preflight, because the host's Homebrew stages Tcl 9.0 headers while every leg's pinned library is Tcl 8.6. It re-ran with `DSS_TCL_VERSION=8.6`, the setting the driver names. |
+| arm64 VPS | GREEN: elf64-arm64 NATIVE 3 of 394,799 and elf64-x86_64 under qemu 3 of 394,795, all known confounds. |
+
+- ⚠ **The Windows run's two reds are ENVIRONMENTAL, not DSS.**
+  - The same DSS-built elf64-arm64 code passed the whole corpus NATIVELY on the arm64 VPS, with no `walsetlk_recover` failure.
+  - The same qemu leg on WSL hit `walsetlk_recover-1.3` again, with clock steps recorded inside its window.
+  - On the Windows host that leg runs under qemu inside WSL2, where the run's own probe measured 10 wall-clock steps and 27 s of drift in 20 s.
+  - Lane `wl`'s per-failure excusal found no step inside those two failures' own log windows, so it charged them to DSS. 🧠 INFERRED: the clock damage lands outside a failure's log window, or qemu's slowness meets a lock timeout.
+  - That excusal is harness, left for repo-harness by the operator's ruling.
+- ✔ **Cleanup:** all eight lane worktrees were removed through `lane-worktree.sh remove --discard-work --preserve-to`.
+  - Beforehand, no worktree held a path absent from `956e5526`.
+  - Every evidence file, 28,890 in all, was copied to the session scratchpad and re-read with size and CRC matching.
+  - `git worktree list` now shows the main checkout alone.
+  - ⓘ LEFT IN PLACE, not deleted by this session: WSL's `~/.cache/pg/` and `~/ge-p66-gate`, the leaked probe manifests, and the `csp-*` temp boxes.
+
 **Owed, in order:**
-1. sqlite `veryquick` on all four hosts over the pushed commit, using item 8's recipe below. A declined host is stated, never skipped. `benchmark-speedtest1` is not owed this batch (item 8 says why).
-2. Read CI's finished run on the push: the failing test NAMES, `packed_atomic_member_concurrency` on `windows-msvc-release`, and the ASan leg's duration.
-3. Cleanup, not merge-critical:
-   - Remove the eight lane worktrees (`bl`, `ca`, `ih`, `pg`, `rr`, `wl`, `lf`, `ge`), using `--discard-work` only after checking that each holds nothing the commit lacks.
-   - Remove WSL's `~/.cache/pg/` and `~/ge-p66-gate`, and the leaked probe manifests.
-   - The `csp-*` temp boxes are left for the operator.
-4. The merge, which is the operator's.
-5. After the merge: branch from `main` and take production anchors first. Confirm with the operator how the harness rows move to repo-harness before touching them.
+1. The merge, which is the operator's.
+2. After the merge: branch from `main` and take production anchors first. Confirm with the operator how the harness rows move to repo-harness before touching them.
 
 ### How the exit got here, kept as the record
 
