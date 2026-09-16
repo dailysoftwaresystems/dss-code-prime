@@ -9658,7 +9658,7 @@ struct Lowerer {
                      kLirInstFlagWidth128);
         }
 
-        // D-LANG-VARIADIC (step 13.4): forward the MIR Call's variadic-payload
+        // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): forward the MIR Call's variadic-payload
         // bits (isVariadic + fixedOperandCount) to the LIR Call so the post-
         // regalloc ML7 materialize pass can emit the platform's variadic-call
         // setup. Non-variadic calls keep payload=0.

@@ -289,6 +289,18 @@
       "linux-arm64-release"
     ]
   },
+  // ★ EVERY minVersion IS SPELLED WITH THREE COMPONENTS, ALWAYS.
+  // ✔MEASURED 2026-09-16 against DssHarness 0.5.3: a minimum is compared through
+  // RepoHarness.Core.Hosts.SemanticVersion.TryParse, which returns false unless the
+  // numeric part has exactly three components, and RepoHarness.Core.Tools.
+  // ToolProvisionService refuses when EITHER side fails to parse. Spelled "4.0",
+  // "13.0" and "16.0" these three entries reported `unknown: '4.3.2' there cannot be
+  // compared with the minVersion '4.0'` on every host that HAD the tool — and the
+  // refusal blames "the tool's probe", which had already matched and captured the
+  // version it is quoting. ⚠ THE PROBE REGEXES WERE NEVER THE CAUSE; widening one to
+  // silence this would be an escape that disarms the guard. Every entry WITHOUT a
+  // minVersion reported `already current`; every entry WITH one reported `unknown`.
+  // That was the whole population, which is what identified the parser and not the probes.
   "tools": [
     {
       "name": "cmake",
@@ -298,7 +310,7 @@
         ],
         "regex": "cmake version (\\d+\\.\\d+\\.\\d+)"
       },
-      "minVersion": "4.0",
+      "minVersion": "4.0.0",
       "why": "configures and drives every build; the root CMakeLists declares cmake_minimum_required(VERSION 4.0)"
     },
     {
@@ -361,7 +373,23 @@
         ],
         "regex": "\\)\\s+(\\d+\\.\\d+\\.\\d+)"
       },
-      "minVersion": "13.0",
+      "minVersion": "13.0.0",
+      // ★ THE REGEX STAYS GNU-SHAPED, AND ON macOS IT IS MEANT TO MATCH NOTHING.
+      // ✔MEASURED 2026-09-16, raw `g++ --version` first line per host:
+      //   local Windows  `g++.exe (MinGW-W64 x86_64-ucrt-posix-seh, ... r8) 13.2.0`
+      //   wsl Ubuntu     `g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0`
+      //   ssh arm64-vps  GNU-shaped: the probe captured 13.3.0, which this regex can
+      //                  only produce from a `) <version>` tail
+      //   ssh macos      `Apple clang version 21.0.0 (clang-2100.1.1.101)` - no digits
+      //                  follow the only `)`, so the probe matches nothing and says so.
+      // macOS HAS NO GCC: `g++` there is a shim for Apple clang, and the macos legs build
+      // with the `clang` toolchain (CC=clang, CXX=clang++), so they never call g++ at all.
+      // Widening this to `version (\d+\.\d+\.\d+)` would capture 21.0.0, compare it
+      // against 13.0.0 and report "already current" - i.e. make this file ASSERT that
+      // GCC 13+ is present on macOS, which is FALSE, to turn a red green. The residual is
+      // not ours: a ToolConfig (RepoHarness.Core.Configuration.ToolModels) carries no
+      // platform, host or leg scope, and ToolProvisionService walks every declared tool on
+      // every leg's host, so "needed only where a gcc toolchain runs" has no spelling here.
       "why": "the compiler behind the mingw-gcc and gcc toolchains; the root CMakeLists records GCC 13+ as verified"
     },
     {
@@ -372,7 +400,10 @@
         ],
         "regex": "clang version (\\d+\\.\\d+\\.\\d+)"
       },
-      "minVersion": "16.0",
+      "minVersion": "16.0.0",
+      // ✔MEASURED 2026-09-16: this regex reads both vendors' banners, unlike g++'s above -
+      // `Apple clang version 21.0.0 (clang-2100.1.1.101)` and `Ubuntu clang version
+      // 18.1.3 (1ubuntu1)` both match, so no widening is needed or wanted.
       "why": "the compiler behind the clang toolchain on macOS; the root CMakeLists records Clang 16+ as verified"
     },
     {
@@ -426,6 +457,50 @@
       "why": "the user-mode emulator the qemu-x86_64 entry runs x86_64 artefacts through on the arm64 VPS"
     }
   ],
+  "predefinedRunners": {
+    // ⓘ Named for what it measures, not for one host. R30's JSON sketch calls it
+    // 'wsl-clock-step-probe'; R26's own list calls the fifth runner 'the clock-step probe',
+    // and a clock step is a property of ANY host - `defaults.clockStepToleranceMilliseconds`
+    // above is declared once for all of them, and `help configuration` says a duration
+    // spanning a clock step or a host sleep is marked suspect wherever it ran.
+    // ✔MEASURED 2026-09-16: declaring more legs here widens no excusal. A runner reached
+    // through a runCheck is run by RepoHarness.Cli.Commands.RunCommand.ConfirmAsync on the
+    // CARRYING entry's leg, with ResolvedLegs set to that leg alone; the checked runner's own
+    // `legs` is not consulted on that path. R30's run-mode scope is the carrying runner's.
+    "clock-step-probe": {
+      "description": "Counts the intervals in which this host's CLOCK_REALTIME diverged from CLOCK_MONOTONIC by more than the clock-step tolerance, and prints that count as 'steps='. The one runner here that is not work: it exists only to be checked, so that an expected exception which blames a clock step has something that can refuse to confirm it. The failing unit's own window stays the caller's - this runner measures the host it is asked on, when it is asked.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      // ★ THE OPERATOR'S LAYOUT, AND THE TOOL CANNOT LOAD IT YET. Ruling 2026-09-16: one
+      // directory per action, named for the action, holding its `.yml` and every supporting
+      // file - because a `run` line is a program and its arguments with no shell, so anything
+      // that is not a one-liner needs a file next to the action. The layout is declared here as
+      // ruled, deliberately, rather than bent to what today's tool accepts.
+      // ✔MEASURED 2026-09-16 against DssHarness 0.5.3, with the file present at exactly this
+      // path: `DssHarness legs` PASSES (exit 0); `DssHarness run` REFUSES with exit 12 - 'is not
+      // a file name. A runner's action names one file directly inside ...'.
+      // ⚠ SO `DssHarness run clock-step-probe` DOES NOT RUN UNTIL repo-harness IS FIXED. The
+      // cost is bounded and was weighed: no ctest entry invokes `run`, and the four runners that
+      // are real work are not written yet. The supporting-file half of the ruling already works -
+      // this action's only `run` line starts a program under `actions/clock-step-probe/`.
+      // ★ THE UPSTREAM FIX IS NOT 'REMOVE THE CHECK'. RepoHarness.Core.Runners.ActionFileParser.LoadAsync
+      // refuses any `action` whose Path.GetFileName is not the whole string, and its own comment
+      // gives the reason: resolving a name with a separator would let a runner run a file from
+      // anywhere on the machine, and 'only files a reviewer sees in this directory may declare
+      // what a runner does'. That reason is sound and a nested file does not weaken it - a
+      // subdirectory of `actions/` is equally reviewable. The correct form is to combine, resolve
+      // to a full path, and require it to remain UNDER the actions directory, which still refuses
+      // `..` traversal and a rooted path. Reported to the operator.
+      // ⚠ A SECOND DEFECT RIDES THIS ONE: RepoHarness.Core.Configuration.HarnessConfigValidator
+      // accepts this value and the verb rejects it, so a config that `legs` calls valid fails only
+      // when a runner is invoked - against `help configuration`'s promise that problems are listed
+      // at once when the file is read.
+      "action": "clock-step-probe/clock-step-probe.yml",
+      "stallSeconds": 120
+    }
+  },
   "commit": {
     "signOff": true
   },

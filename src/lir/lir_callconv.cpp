@@ -597,7 +597,7 @@ functionLocalAllocaPayloads(Lir const& src, LirFuncId fn,
     return payloads;
 }
 
-// D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 (closed co-with-D-ML7-2.6, 2026-06-02): compute the
+// D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 (closed co-with plan-12 step ML7-2.6, 2026-06-02): compute the
 // maximum number of stack-passed-arg slots ACROSS all call sites in
 // `fn`. The function's prologue must reserve enough outgoing-args
 // area to accommodate the WIDEST call (any call with more args than
@@ -4629,7 +4629,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         b.addInst(h.movqXmmToGpr, m.dest, dupOps);
                     }
                 }
-                // D-LANG-VARIADIC (step 13.4): when the call is
+                // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): when the call is
                 // variadic AND the cc declares a vector-arg count
                 // register, emit `mov <countReg>, <count>` per
                 // SysV §3.5.7 (see `variadicVectorCountReg`
@@ -4666,7 +4666,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // capped at the pool bound by construction (only the register-
                     // resident branch increments it).
                     std::uint32_t const vectorArgsInVararg = fpVarargsInVectorArgRegs;
-                    // D-LANG-VARIADIC (step 13.4) post-fold (type-design
+                    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4) post-fold (type-design
                     // analyzer rec): derive the countReg's class from
                     // the SCHEMA's register-table entry, NOT a
                     // hardcoded LirRegClass::GPR. SysV's rax is GPR;

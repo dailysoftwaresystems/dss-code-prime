@@ -37,7 +37,7 @@
 // FAT is DETECTED, never READ: `readImports` carries no target, so it
 // has nothing to select a slice with.
 //
-// D-FF1-NEST CLOSED (FF1-MachO cycle 2026-06-01): per-format reader
+// D-FF1-NEST-BINARY-READER-TU-SPLIT CLOSED (FF1-MachO cycle 2026-06-01): per-format reader
 // TUs live in `binary_readers/{elf,pe,macho}_reader.{hpp,cpp}` —
 // shared byte primitives in `binary_readers/reader_common.hpp`.
 

@@ -5527,7 +5527,7 @@ encode(AssembledModule const&    module,
     // ET_REL keeps `.rela.text` (after any `.rodata`/`.data`/`.bss` —
     // D-LK-OBJECT-DATA-SECTION-RELOCATABLE); ET_EXEC drops it entirely (no
     // SHT_NULL placeholder). Section count derives from the actually-emitted
-    // slots — same architect B-LK1-2 / D-LK2-5 discipline that LK1 cycle 1 +
+    // slots — same architect B-LK1-2 / D-LK2-5-DERIVED-SECTION-COUNT discipline that LK1 cycle 1 +
     // LK2 already adopt.
     std::vector<SectionHeader const*> headers;
     headers.reserve(8);

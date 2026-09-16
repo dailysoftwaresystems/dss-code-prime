@@ -202,7 +202,7 @@
 
   "relocations": [
     {
-      "$comment": "PE32+ image-side relocations: same kinds as the .obj schema. cycle-2 walker applies intra-module relocs in-place via the LK6 cycle 1 structured-formula triple (closes D-LK1-3-equivalent for PE). REL32 is PC-relative 32-bit; ADDR64/ADDR32 are absolute. The image is ASLR-aware (dllCharacteristics carries DYNAMIC_BASE), so the walker DOES emit a `.reloc` base-relocation section carrying an IMAGE_REL_BASED_DIR64 entry per 8-byte absolute fixup: the cross-CU thunk slots + F5 symbol-address global pointers + (TLS C3) the 3 IMAGE_TLS_DIRECTORY64 VA fields.",
+      "$comment": "PE32+ image-side relocations: same kinds as the .obj schema. cycle-2 walker applies intra-module relocs in-place via the LK6 cycle 1 structured-formula triple (closes the D-LK1-3 equivalent for PE). REL32 is PC-relative 32-bit; ADDR64/ADDR32 are absolute. The image is ASLR-aware (dllCharacteristics carries DYNAMIC_BASE), so the walker DOES emit a `.reloc` base-relocation section carrying an IMAGE_REL_BASED_DIR64 entry per 8-byte absolute fixup: the cross-CU thunk slots + F5 symbol-address global pointers + (TLS C3) the 3 IMAGE_TLS_DIRECTORY64 VA fields.",
       "name": "IMAGE_REL_AMD64_REL32",
       "kind": 1,
       "nativeId": 4

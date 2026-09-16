@@ -1910,7 +1910,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         }
     }
 
-    // ── aggregateLayout (FC6, D-FF3-1 layout half): the per-ABI struct/union/
+    // ── aggregateLayout (FC6, D-FF3-1-TARGET-AGGREGATE-LAYOUT-PARAMS layout half): the per-ABI struct/union/
     //    array layout params the generic `type_layout` engine reads. REQUIRED on
     //    a register-machine target — a silent default would bake a wrong alignment
     //    rule into every aggregate (mirrors the format's required `dataModel`). ──
@@ -4405,7 +4405,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         }
                     }
                 }
-                // D-LANG-VARIADIC (step 13.4, 2026-06-02): optional
+                // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4, 2026-06-02): optional
                 // caller-side vector-count register for variadic calls.
                 // SysV AMD64 sets it to "al"; Win64 / AAPCS64 omit it.
                 if (c.contains("variadicVectorCountReg")) {

@@ -39,7 +39,9 @@
 // The
 // substrate ships flat single-interval ranges per vreg today; the
 // allocator co-designs split-aware sub-intervals with this substrate
-// — see plan 12 §3.1 ML6 deferral D-ML6-1.1.
+// — see plan 12 §3.1's ML6 sub-interval deferral, which the registry now
+// carries as D-PLAN12-SUB-INTERVAL-LIRLIVERANGE-LIST-DEFERRED-FROM-ML6-CYCLE
+// (its pre-migration plan-step spelling was ML6-1.1).
 //
 // LIR has no Phi opcode: MIR Phis were resolved into parallel-copy
 // `mov`s on predecessor edges during MIR→LIR isel. Liveness therefore

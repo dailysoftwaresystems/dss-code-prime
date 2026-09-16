@@ -15,7 +15,7 @@ namespace dss::ffi {
 
 // ── Slim dispatch ────────────────────────────────────────────────
 //
-// D-FF1-NEST split (FF1-MachO cycle 2026-06-01): the per-format
+// D-FF1-NEST-BINARY-READER-TU-SPLIT split (FF1-MachO cycle 2026-06-01): the per-format
 // reader bodies (`readElf64`, `readPe`, `readMacho`) live in
 // `binary_readers/{elf,pe,macho}_reader.{hpp,cpp}` after the 3rd-
 // reader split. This TU now holds ONLY the format-dispatch entry

@@ -755,8 +755,43 @@ if(DSS_BUILD_TESTS)
     # the block could not. That condition is gone — the block below now runs on every
     # configure — and the hoist stays because the arm that CHOOSES a bash and the arms
     # that REFUSE one must not be able to come to disagree.
+    # ── AND ITS SUBJECT IS A HOST-INVARIANT FILE, BECAUSE IT ASKS A HOST QUESTION ──
+    # ⛔⛔ THIS ONE STRING USED TO ALSO `test -f
+    # ${CMAKE_SOURCE_DIR}/scripts/lane-worktree/lane-worktree.sh`, which let a TREE
+    # fact — does that script exist — decide a HOST fact, and decide it for every
+    # consumer at once.
+    # ✔MEASURED 2026-09-16 (P68 lane s4) on this Windows host, by pointing the `test -f`
+    # at an absent path and reconfiguring with `-U DSS_BASH_FOR_LANE_GUARD`: EIGHT ctest
+    # entries went to a refusal — `lane_worktree_guard`, `root_litter_guard`,
+    # `macos_leg_source_tree_guard`, `leg_tree_guard`,
+    # `check_ci_legs_git_environment_guard`, `remote_leg_helper_transport_guard`,
+    # `run_gate_guard` and `line_endings_watchdog_sh_guard` — and every one of them said
+    # *no bash on this host could both open … and resolve dirname, mktemp and git*,
+    # while its own candidate list read `[C:/Program Files/Git/bin/bash.exe -> exit 1]
+    # [C:/Program Files/Git/usr/bin/bash.exe -> exit 1]`. A PRESENT, WORKING bash
+    # reported absent, eight times, because a FILE was missing. Nobody should have to
+    # diagnose a bash that is there.
+    # ⓘ The eighth is the one a reader would miss: `line_endings_watchdog_sh_guard` is
+    # registered from `_dss_rg_bash`, which is derived from the cache variable this
+    # probe sets, so it rides the same answer without ever naming the probe.
+    # ⇒ THE TWO QUESTIONS ARE SEPARATED, AND EACH SITS WITH ITS OWNER:
+    #   · "is there a bash here that can open a native `C:/…` path into this source
+    #     tree and resolve `dirname`, `mktemp` and `git`?" is asked HERE, against
+    #     `${CMAKE_SOURCE_DIR}/CMakeLists.txt` — the one path in this repository whose
+    #     existence is guaranteed by CMake executing this very line, so the answer can
+    #     only ever be about the HOST. A host capability must survive every deletion the
+    #     tree ever makes.
+    #   · "does this guard's own script exist?" is asked by the `add_test` that NAMES
+    #     that script, which is where the path already lives, so a missing subject reds
+    #     THAT entry with THAT path instead of eight entries with a PATH diagnosis.
+    # ★ THE VIRTUE IS UNCHANGED AND DELIBERATELY SO. This still FAILS rather than
+    # disappearing when no usable bash is found, because a guard that silently does not
+    # run publishes a gate figure that is about the operator's PATH and not about the
+    # tree. And it still catches the WSL shim: `C:/WINDOWS/system32/bash.exe` cannot open
+    # a `C:/` path AT ALL, so it fails on `CMakeLists.txt` for exactly the reason it
+    # failed on the script — ✔MEASURED, see the red-on-disable arm in the P68 s4 report.
     set(_dss_lane_probe
-        "test -f '${CMAKE_SOURCE_DIR}/scripts/lane-worktree/lane-worktree.sh' && command -v dirname >/dev/null && command -v mktemp >/dev/null && command -v git >/dev/null")
+        "test -f '${CMAKE_SOURCE_DIR}/CMakeLists.txt' && command -v dirname >/dev/null && command -v mktemp >/dev/null && command -v git >/dev/null")
     if(CMAKE_HOST_WIN32)
         string(ASCII 59 _dss_lane_path_sep)
     else()
@@ -856,7 +891,7 @@ if(DSS_BUILD_TESTS)
         string(APPEND _dss_lane_tried " [${_dss_lane_cand} -> exit ${_dss_lane_cand_rc}]")
         if(_dss_lane_cand_rc EQUAL 0)
             set(DSS_BASH_FOR_LANE_GUARD "${_dss_lane_cand}" CACHE FILEPATH
-                "bash proved able to run the lane-worktree scratchpad guard" FORCE)
+                "bash proved able to open this source tree through its native path form and resolve dirname, mktemp and git" FORCE)
             break()
         endif()
     endforeach()
@@ -878,11 +913,11 @@ if(DSS_BUILD_TESTS)
         set(ENV{PATH} "${_dss_lane_saved_path}")
         if(NOT _dss_lane_bash_rc EQUAL 0)
             set(_dss_lane_refusal
-                "lane_worktree_guard CANNOT RUN: the bash CMake found (${DSS_BASH_FOR_LANE_GUARD}) could not, with its own directory prepended to PATH, both open ${CMAKE_SOURCE_DIR}/scripts/lane-worktree/lane-worktree.sh and resolve dirname, mktemp and git (probe exit ${_dss_lane_bash_rc}). On Windows a bare 'bash' can resolve to the WSL shim, which cannot open a C:/ path at all. Point DSS_BASH_FOR_LANE_GUARD at a bash that can, or install Git for Windows. This test FAILS rather than disappearing, because a guard that silently does not run publishes a gate figure that is about the operator's PATH and not about the tree.")
+                "lane_worktree_guard CANNOT RUN: the bash CMake found (${DSS_BASH_FOR_LANE_GUARD}) could not, with its own directory prepended to PATH, both open this source tree through its native path form (${CMAKE_SOURCE_DIR}/CMakeLists.txt) and resolve dirname, mktemp and git (probe exit ${_dss_lane_bash_rc}). This probe asks only about the HOST: the file it opens is the one CMake is reading, so a failure here is never a missing script. On Windows a bare 'bash' can resolve to the WSL shim, which cannot open a C:/ path at all. Point DSS_BASH_FOR_LANE_GUARD at a bash that can, or install Git for Windows. This test FAILS rather than disappearing, because a guard that silently does not run publishes a gate figure that is about the operator's PATH and not about the tree.")
         endif()
     else()
         set(_dss_lane_refusal
-            "lane_worktree_guard CANNOT RUN: no bash on this host could both open ${CMAKE_SOURCE_DIR}/scripts/lane-worktree/lane-worktree.sh and resolve dirname, mktemp and git, so the scratchpad gate for lane-worktree.sh was never exercised. Candidates tried, each with its own directory prepended to PATH:${_dss_lane_tried} (empty means no bash was found at all). On Windows a bare 'bash' can resolve to the WSL shim, which cannot open a C:/ path; Git for Windows' bin/bash.exe or usr/bin/bash.exe can. Point -DDSS_BASH_FOR_LANE_GUARD at one that works. This test FAILS rather than disappearing, because a guard that silently does not run publishes a gate figure that is about the host and not about the tree.")
+            "lane_worktree_guard CANNOT RUN: no bash on this host could both open this source tree through its native path form (${CMAKE_SOURCE_DIR}/CMakeLists.txt) and resolve dirname, mktemp and git, so the scratchpad gate for lane-worktree.sh was never exercised. This probe asks only about the HOST: the file it opens is the one CMake is reading, so a failure here is never a missing script. Candidates tried, each with its own directory prepended to PATH:${_dss_lane_tried} (empty means no bash was found at all). On Windows a bare 'bash' can resolve to the WSL shim, which cannot open a C:/ path; Git for Windows' bin/bash.exe or usr/bin/bash.exe can. Point -DDSS_BASH_FOR_LANE_GUARD at one that works. This test FAILS rather than disappearing, because a guard that silently does not run publishes a gate figure that is about the host and not about the tree.")
     endif()
     if(_dss_lane_refusal STREQUAL "")
         add_test(

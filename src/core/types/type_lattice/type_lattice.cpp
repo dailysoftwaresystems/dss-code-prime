@@ -1140,7 +1140,7 @@ TypeId TypeInterner::fnSig(std::span<TypeId const> params, TypeId result, CallCo
 TypeId TypeInterner::fnSig(std::span<TypeId const> params, TypeId result, CallConv cc,
                            bool isVariadic) {
     // operands = [result, params...] so the result is recoverable at a
-    // fixed position. D-LANG-VARIADIC (step 13.4, 2026-06-02): scalars
+    // fixed position. D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4, 2026-06-02): scalars
     // encoding depends on isVariadic:
     //   non-variadic → scalars=[(int)cc]               (1 slot, legacy)
     //   variadic     → scalars=[(int)cc, isVariadic=1] (2 slots)
@@ -1302,7 +1302,7 @@ GuardedSpan<TypeId> TypeInterner::fnParams(TypeId id) const {
 bool TypeInterner::fnIsVariadic(TypeId id) const {
     if (kind(id) != TypeKind::FnSig) latticeFatal("fnIsVariadic: TypeId is not a FnSig");
     auto const sc = scalars(id);
-    // D-LANG-VARIADIC (step 13.4): every FnSig MUST carry at least
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): every FnSig MUST carry at least
     // the cc scalar (post-13.4 audit-fold HIGH-1). Pre-13.4 FnSigs
     // encode scalars=[(int)cc] (1 slot); variadic FnSigs encode
     // scalars=[(int)cc, 1] (2 slots). A 0-slot FnSig has no cc —

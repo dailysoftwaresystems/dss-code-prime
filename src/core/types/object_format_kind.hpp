@@ -376,7 +376,7 @@ inline constexpr std::string_view kCCallingConventionNone = "none";
 // The format's C calling-convention block (`"cCallingConvention"` in
 // `.format.json`). A BLOCK carrying one `convention` verb rather than a bare
 // scalar, for `cSymbolDecoration`'s stated reason: a future per-format ABI
-// parameter (a layout-quirk selector, say — D-FF3-1) gains a sibling key
+// parameter (a layout-quirk selector, say — D-FF3-1-TARGET-AGGREGATE-LAYOUT-PARAMS) gains a sibling key
 // INSIDE this block instead of a second root key. REQUIRED on every format —
 // see `ObjectFormatData::validate()` for why the rule is unconditional.
 struct DSS_EXPORT CCallingConvention {

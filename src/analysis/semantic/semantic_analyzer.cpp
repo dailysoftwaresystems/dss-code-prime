@@ -1179,7 +1179,7 @@ resolveMemberAccess(EngineState const& s, SemanticConfig const& cfg,
 // True iff a token of kind `kind` appears anywhere in `node`'s subtree,
 // stopping descent at any NESTED declaration-rule node (other than the
 // root `node` itself). Used by SE4 const-marker detection (walk a decl's
-// `typeChild` for the language's const keyword) AND by D-LANG-VARIADIC
+// `typeChild` for the language's const keyword) AND by D-LANG-VARIADIC-CALL-SUBSTRATE
 // variadic-marker detection (walk a decl's `paramsChild` for the
 // language's `EllipsisOp` marker). Generic substrate — any future
 // "marker token within a decl subtree" scan (async/inline/noexcept
@@ -5665,7 +5665,7 @@ scanSpecifierPrefixStorage(SemanticConfig const& cfg, Tree const& tree,
 // block-scope `extern` into a tentative definition.
 //
 // ★★★ P65 — AN INITIALIZER ON THE DECLARATOR OUTRANKS BOTH OF THEM AT FILE
-// SCOPE (the file-scope half of D-FF2-3, whose refusal this narrows), and that
+// SCOPE (the file-scope half of D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE, whose refusal this narrows), and that
 // override is the third thing this predicate now says. C 6.9.2p1: *a
 // declaration of an identifier for an object that has file scope WITH AN
 // INITIALIZER is a definition* — no clause exempts `extern`, so the keyword is
@@ -9043,7 +9043,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // rows (params/locals/globals) never set anonymousNameAllowed
                     // so the anon block is inert for them.
                     bool boundNamed = false;
-                    // P65 (the file-scope half of D-FF2-3): the scope half of C
+                    // P65 (the file-scope half of D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE): the scope half of C
                     // 6.9.2p1's override, hoisted out of the
                     // loop because it is a property of the DECLARATION's position,
                     // not of any one declarator. `current` — not `here` — is the
@@ -13915,7 +13915,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         for (auto const& [pNode, pTy] : params) {
                             paramTypes.push_back(pTy);
                         }
-                        // D-LANG-VARIADIC (step 13.4): scan the params
+                        // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): scan the params
                         // subtree for the declaration's configured
                         // variadic-marker token (e.g. `EllipsisOp` for
                         // c). When present, build a variadic
@@ -17440,7 +17440,7 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         return std::vector<TypeId>(sp.begin(), sp.end());
     }();
 
-    // D-LANG-VARIADIC (step 13.4): a C-style variadic FnSig
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): a C-style variadic FnSig
     // (scalars[1] == 1) admits >= fixedParamCount args; a non-variadic
     // FnSig admits exactly fixedParamCount. The pre-existing
     // `variadicBuiltin` flag (e.g. tsql COALESCE) admits ANY arg count
@@ -17457,7 +17457,7 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(node);
-        // D-LANG-VARIADIC (step 13.4) post-fold MEDIUM-1: mirror the
+        // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4) post-fold MEDIUM-1: mirror the
         // HIR verifier's "fixed " word for variadic-too-few so users
         // can distinguish "wrong fixed-arity" from "variadic prefix
         // too short" without inspecting the FnSig.

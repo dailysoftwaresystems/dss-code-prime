@@ -53,12 +53,19 @@ something is mechanical or a judgment, it is a judgment.**
    `git rev-list --left-right --count origin/<branch>...HEAD` for push state.
 3. **Inventory.** Every file under `.plans/`, plus `README.md` and the sibling skills. Name them in
    the report — an unswept plan is a hole in the guarantee.
-4. **Scan.** Run `python scripts/scan_staleness.py <repo-root>` for the mechanical classes. Walk the
-   full taxonomy (see file map) across the inventory for the classes a grep cannot see.
-5. **Classify** every hit fix|flag per the rule above, recorded as `file:line`.
+4. **Scan.** Run `python .claude/skills/dss-plan-sweep/scripts/scan_staleness.py <repo-root>` for the
+   mechanical classes. ⚠ **The script lives under this skill, not in the repository's `scripts/`** —
+   ✔MEASURED 2026-09-16 at `305604f1`: there is no `scripts/scan_staleness.py`, and this step named
+   one for months. Walk the full taxonomy (see file map) across the inventory for the classes a grep
+   cannot see.
+5. **Classify** every hit fix|flag per the rule above, recorded as a path plus the SYMBOL or heading
+   it sits under. ⛔ **Never record a `path:line` citation** — this repository forbids line numbers in
+   artifacts, and `plan_citations_guard` ratchets the positional citations in `.plans/**` and
+   `.claude/**` DOWNWARD only, so a sweep that mints new ones reds the guard it was meant to satisfy.
 6. **Reconcile.** Fix the mechanical divergences. Reconcile all four surfaces for the same fact
    *together* — a fix that leaves the other three stale just relocates the drift.
-7. **Verify.** Re-run `scripts/scan_staleness.py`. Every mechanical class must come back clean. A
+7. **Verify.** Re-run `.claude/skills/dss-plan-sweep/scripts/scan_staleness.py`. Every mechanical
+   class must come back clean. A
    divergence still present and not on the flag list means the sweep is not finished.
 8. **Report and commit.** Markdown only: `docs(plans): staleness sweep — <scope/date>`, body listing
    fixes and flags, then push. If the sweep produced *only* flags, there is no commit — just the report.
@@ -90,7 +97,8 @@ re-scan clean: counts ✓ · pending-push ✓ · anchor guard ✓ · cross-plan 
   reconciling the four surfaces that must agree.
 - Read `references/completeness-guarantee.md` when reporting, or when judging whether the sweep is
   actually finished.
-- Run `scripts/scan_staleness.py` at steps 4 and 7 — the mechanical scans, identical both times.
+- Run `.claude/skills/dss-plan-sweep/scripts/scan_staleness.py` at steps 4 and 7 — the mechanical
+  scans, identical both times.
 
 ## Failure modes this skill exists to prevent
 

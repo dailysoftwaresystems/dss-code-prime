@@ -899,7 +899,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         return std::nullopt;
     }
 
-    // D-FF3-3 (commit 9440143): resolve the (target, format) calling
+    // D-FF3-3-RESOLVED-CC-INDEX-THREADED (commit 9440143): resolve the (target, format) calling
     // convention BEFORE dispatching to compileSingleUnit. Replaces
     // the previous silent dispatch to `callingConventions[0]` —
     // that hardcode produced SysV register assignments on PE+x86_64
@@ -2343,7 +2343,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the <stdio.h> printf-family shim sibling —
         // see `synth_stdio_shim.hpp` for the full contract. A clean no-op when
         // `mergedStdioRecipes` is empty. The va_list block is read from the SAME
-        // resolved CC (`abi->cc`, D-FF3-3 above) the merged module's calling-convention
+        // resolved CC (`abi->cc`, D-FF3-3-RESOLVED-CC-INDEX-THREADED above) the merged module's calling-convention
         // index was derived from — no second lookup, no format-name branch. It is passed
         // WHOLE, not narrowed to `.strategy`: `variadicUsesOverflowBase` is what selects
         // the shim's va leaf, and dropping it here would silently emit the home-base leaf

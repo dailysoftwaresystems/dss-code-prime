@@ -358,7 +358,7 @@ struct DSS_EXPORT LirAllocation {
 // this compile. The allocator records it on every produced
 // `LirFuncAllocation`; `materializeCallingConvention` reads it back
 // to look up the structured cc and emit the right prologue/epilogue.
-// Pre-D-FF3-3 every function was hardcoded to index 0 — silent
+// Pre-D-FF3-3-RESOLVED-CC-INDEX-THREADED every function was hardcoded to index 0 — silent
 // miscompile on non-default-cc targets (e.g. PE64 + x86_64 silently
 // dispatched to sysv_amd64 instead of ms_x64).
 [[nodiscard]] DSS_EXPORT LirAllocation
@@ -377,7 +377,7 @@ allocateRegisters(Lir const&          lir,
 //
 // Post-fold-#5 code-reviewer-#82 fold: the parameter is REQUIRED (no
 // default) so a future caller cannot accidentally inherit the
-// pre-D-FF3-3 `0` hardcode silently. Test callers pass `0` explicitly
+// pre-D-FF3-3-RESOLVED-CC-INDEX-THREADED `0` hardcode silently. Test callers pass `0` explicitly
 // when the test fixture's target ships a single cc (cc[0] is then
 // the only valid choice).
 [[nodiscard]] DSS_EXPORT LirFuncAllocation

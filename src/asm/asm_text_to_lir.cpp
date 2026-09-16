@@ -2134,7 +2134,11 @@ private:
                 // directive states nothing about whether the thing it points
                 // at is code or data — so the import would be a guess with a
                 // wire-format consequence. Anchored:
-                // D-ASM-DATA-SLOT-CANNOT-NAME-AN-UNDEFINED-SYMBOL.
+                // D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL —
+                // ONE row holds both this data-slot site and the address-
+                // operand site so the decision cannot be answered twice
+                // differently; the sibling spelling this comment used to
+                // carry named no row at all.
                 sink_.fail(p.at,
                      std::format("'.{}' names '{}', which this file defines no "
                                  "label for. A data slot holding an address "

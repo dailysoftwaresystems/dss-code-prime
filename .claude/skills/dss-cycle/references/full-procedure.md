@@ -45,8 +45,9 @@ The loop resumes only after the user answers. While paused, do not start a diffe
   drifted is worse than a missing one, because it is trusted.
 - Check `git status` + current branch + the last commit subject. A `… WIP` cycle in flight
   means **this cycle finishes it** (it is the priority).
-- Read §0.1 of plan 00 and skim the two WORKING registries for open anchors --
-  `_deferred-anchor-registry-{production,harness}.md`. ⚠ **Not `-done.md`**: it is the archive
+- Read §0.1 of plan 00 and skim the WORKING registry for open anchors --
+  `_deferred-anchor-registry-production.md`, which since 2026-09-16 is the only one. ⚠ **Not
+  `-done.md`**: it is the archive
   (every closed row, moved out on close since 2026-09-01) and reading it to ORIENT is how a
   closed row got recommended three times in this project's history. One screen:
   `bash scripts/anchors/read-anchors.sh --production`.
@@ -190,10 +191,16 @@ independent audit.) Running it here catches such a thing **before** anything is 
   who will not notice.
 - Commit using the repo cycle convention: subject `Cycle <id>: <concise summary>` (use
   `Cycle <id> WIP: …` only if the cycle legitimately pauses mid-task at a §B gate). Body
-  lists anchors closed/opened + test delta. End with the repo's standard Co-Authored-By
-  trailer (currently `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`).
-- **Push immediately** to the current feature branch (push-after-every-commit: it starts CI
-  while context is hot, so GCC issues surface on the next cycle, not days later).
+  lists anchors closed/opened + test delta. End with the repo's standard `Co-authored-by:`
+  trailer. ⛔ **The model name is deliberately not written here** — this line said
+  `Claude Opus 4.8` long after the tree had moved on, which is exactly the rot a hardcoded
+  model name guarantees. Take the trailer from the session's own attribution instructions, or
+  read the newest one off the tree:
+  `git log --format='%b' -20 | grep -im1 '^[Cc]o-authored-by:'`.
+- **Push immediately** to the current feature branch (push-after-every-commit, so the work is
+  on the remote before context is lost). ⚠ **It does not start the test matrix**: ✔MEASURED
+  2026-09-16 at `305604f1`, `.github/workflows/pipeline-pr.yml` gates every build and test job
+  on the operator's `Run Pipes` label, and only `landing-log-check` is ungated.
 - Stay on the current feature branch; do not cut a new branch per cycle unless the user asks.
 
 ### Step 10 — Report & end

@@ -2474,6 +2474,13 @@ def self_test():
         with tempfile.TemporaryDirectory() as tmp:
             plans = os.path.join(tmp, PLANS_DIR)
             os.makedirs(plans)
+            # ⚠ `-harness.md` here is a SYNTHETIC fixture name, not a live document: the
+            # harness registry retired 2026-09-16. It is kept deliberately because
+            # `is_registry` keys on the `_deferred-anchor-registry` PREFIX and
+            # `scan_worktree` reads every `.md` under `.plans/`, so this arm is what
+            # proves a SECOND working registry still canonicalises to one key -- the
+            # behaviour a third registry would depend on. Renaming it would delete the
+            # only coverage of that rule. ✔MEASURED 2026-09-16: not a dead branch.
             for name, rows in (("_deferred-anchor-registry-production.md", rows_p),
                                ("_deferred-anchor-registry-harness.md", rows_h)):
                 with io.open(os.path.join(plans, name), "w", encoding="utf-8") as fh:
@@ -2607,6 +2614,13 @@ def self_test():
         with tempfile.TemporaryDirectory() as tmp:
             plans = os.path.join(tmp, PLANS_DIR)
             os.makedirs(plans)
+            # ⚠ `-harness.md` here is a SYNTHETIC fixture name, not a live document: the
+            # harness registry retired 2026-09-16. It is kept deliberately because
+            # `is_registry` keys on the `_deferred-anchor-registry` PREFIX and
+            # `scan_worktree` reads every `.md` under `.plans/`, so this arm is what
+            # proves a SECOND working registry still canonicalises to one key -- the
+            # behaviour a third registry would depend on. Renaming it would delete the
+            # only coverage of that rule. ✔MEASURED 2026-09-16: not a dead branch.
             docs = [("_deferred-anchor-registry-production.md", prod_rows),
                     ("_deferred-anchor-registry-harness.md", harn_rows)]
             if with_archive:

@@ -1831,7 +1831,7 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         return out;
     }
 
-    // D-FF3-3 post-fold #5: callingConventionIndex now comes from
+    // D-FF3-3-RESOLVED-CC-INDEX-THREADED post-fold #5: callingConventionIndex now comes from
     // `resolveAbi(target, format)` resolution at compileOneTarget,
     // threaded through compileSingleUnit. The previous hardcoded
     // `0` silently dispatched non-ELF targets (e.g. PE64+x86_64)

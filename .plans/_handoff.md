@@ -35,6 +35,13 @@ below is IN it.
    door, and `read-anchor <ID> --json` the only sanctioned reader — the raw table line stores every
    `|` escaped, and reading it raw hands the escape back doubled. `write-anchor` also takes
    `--relocating` for a row that exists elsewhere in the repository and is being MOVED, not named.
+   ✔MEASURED 2026-09-16 at `305604f1`: every verb's usage line reads `(--production | --done)`.
+   **`--harness` is gone and is refused.**
+   ⓘ **The successor is named, and it is not live here yet.** DssHarness ships `write-anchor`,
+   `set-anchor`, `read-anchor`, `read-anchors`, `check-anchor-balance` and `check-anchor-citations`
+   (✔MEASURED, `DssHarness --help` at 0.5.3). This sentence becomes false, and the door becomes
+   `DssHarness`, in **the commit that deletes `scripts/anchors/`** — not before. While the scripts
+   exist they are the door.
 4. **`.claude/skills/dss-cycle/references/dss-harness.md`** — the tool the harness is moving to:
    which of its verbs exist today, which scripts are still the only way to do their job, this
    repository's `.harness-config/config.json`, and the exit codes.
@@ -56,7 +63,7 @@ below is IN it.
 
 ---
 
-**Last updated:** 2026-09-15 — cycles **P14 … P66**. ⛔ **P66 IS NOT COMPLETE.** PR #57's CI is GREEN at `090f090e`, which fixed the `run_gate_guard` red. But the run before it exposed a second defect that does not reproduce on every runner — `packed_atomic_member_concurrency` stalling a `windows-msvc-release` runner — and it is a P0 production row that lane `bl` is working. §0.0's first block says what is owed; the block after it overstates the state.
+**Last updated:** 2026-09-16 — cycles **P14 … P68**. ✔**P66 IS COMPLETE AND LANDED.** PR #57 MERGED 2026-09-15T21:22:25Z as `e8dbc3c5` on `main`, and `main` is now `adf254c7` (`v0.5.0`) — ✔MEASURED at `305604f1` with `gh pr view 57 --json state,mergedAt` and `git log --oneline origin/main -3`. The `packed_atomic_member_concurrency` P0 that lane `bl` was working is no longer open: ✔MEASURED, `bash scripts/anchors/read-anchors.sh --production --open --band P0` reports **0 rows**. ⚠ The block that used to stand here said P66 was incomplete and named that P0 as the reason; both halves are discharged. **§0.0 below is the live state; everything under `§0.1 — P66 RAN IN TWO HALVES` is P66's own record.**
 
 ---
 
@@ -64,10 +71,39 @@ below is IN it.
 
 ## §0.0 — STATE
 
-🔵 **P67 IS THE DssHarness MIGRATION, IN FLIGHT ON `feature/dssharness-migration`, PR #58.** This
-branch carries the migration and nothing else (operator ruling, 2026-09-15). Its contract is
-`.temp/pending-harness-for-code-prime.md` — deliberately untracked, reviewed by six read-only agents
-before any of it was executed. **Re-derive HEAD with `git log --oneline -3`.**
+🔵 **P68 CONTINUES THE DssHarness MIGRATION ON `feature/dssharness-migration`, PR #58 (OPEN, base
+`main`).** This branch carries the migration and nothing else (operator ruling, 2026-09-15). Its
+contract is `.temp/pending-harness-for-code-prime.md` — deliberately untracked, reviewed by six
+read-only agents before any of it was executed; the working note beside it is
+`.temp/HANDOFF-dssharness-migration-2026-09-16.md`. ✔MEASURED at `305604f1`: **7 commits ahead of
+`origin/main`**, in sync with its own remote. **Re-derive HEAD with `git log --oneline -3`.**
+
+★★★ **THE PREMISE OF THIS WHOLE BRANCH CHANGED ON 2026-09-16, AND EVERY DOCUMENT THAT SAID OTHERWISE
+WAS STALE WITHIN A DAY.** ✔MEASURED at `305604f1`:
+
+- `curl -s https://api.nuget.org/v3-flatcontainer/dssharness/index.json` → `["0.5.1","0.5.2","0.5.3"]`.
+  **0.5.3 IS PUBLISHED.**
+- `DssHarness --version` → `0.5.3`; `dotnet tool list --global` shows `dssharness 0.5.3`.
+- `DssHarness --help` lists, all shipping: `init`, `verify-git`, `create-worktree`, `delete-worktree`,
+  `list-worktree`, `write-anchor`, `set-anchor`, `read-anchor`, `read-anchors`,
+  `check-anchor-balance`, `check-anchor-citations`, `check-root-litter`, `fix-line-endings`,
+  `check-ci-legs`, `legs`, `install-missing-tools`, `sync`, `build`, `test`, `run`, `host-exec`,
+  `help`.
+- ✔MEASURED **BY THE ORCHESTRATOR**, same day, same commit — the one claim in this block not taken by
+  the lane that wrote it: `DssHarness legs` → `OK - 8 of 8 leg(s) can run`, installing 0.5.3 onto wsl
+  Ubuntu, ssh macos and ssh arm64-vps on the way. ⚠ **`legs` therefore is NOT a read-only probe** —
+  it installs or updates the tool on any host that is behind, and so does `host-exec`. That is why it
+  was not simply re-run to confirm.
+
+⇒ ⛔ **`build`, `test`, `sync` and `run` DO EXIST.** They never shipped as 0.6/0.7/0.8/0.9 — all four
+landed in **0.5.3**. Any document still saying they are unbuilt is describing a world that ended on
+2026-09-16, and a contextless session reading it would plan around a blocker that is gone.
+⚠ **A verb existing is not a script deleted.** Nothing is removed until its replacement is proven on
+all four legs, so the gate, leg and carriage scripts are still the only way to do their jobs today.
+Read `.claude/skills/dss-cycle/references/dss-harness.md` before touching a leg, a worktree or an
+anchor. 🧠INFERRED, and worth stating: the fact that a leg installs only a PUBLISHED version made
+every earlier "the source already has it" observation about repo-harness's working tree irrelevant to
+this branch — the only version number that ever mattered is the one on nuget.org.
 
 **THE HARNESS REGISTRY IS GONE, AND EVERY ANCHOR IS A PRODUCTION ANCHOR.** Two documents now:
 `.plans/_deferred-anchor-registry-production.md` holds every still-open row, the archive holds every
@@ -77,14 +113,11 @@ rows and the archive's 544 closed ones are readable in git at the parent of the 
 them. ⛔ `scripts/anchors/{write,set,read}-anchor` is still the only door while those scripts exist,
 and `read-anchor <ID> --json` still the only sanctioned reader.
 
-**The tool.** `DssHarness`, built in `C:\Source\DailySoftware\repo-harness` and published on
-nuget.org; 0.5.2 installed here. It has the anchor, worktree, leg and host verbs; `build`, `test`,
-`sync` and `run` are planned for 0.6 through 0.9 and do not exist yet, which is why the gate, leg and
-carriage scripts stay. Read `.claude/skills/dss-cycle/references/dss-harness.md` before touching a
-leg, a worktree or an anchor. ✔MEASURED 2026-09-16: repo-harness's working tree already carries 28
-files of uncommitted work adding `sshItems`, `wslDistros`, `citationRoots`, `maxDeleteFraction` and
-`evidenceRoots` and deleting its ssh-config reader — the requirements this plan asks for. None is in
-the published 0.5.2, so `.harness-config/config.json` targets the shape the tool is moving to.
+**Where the registry stands.** ✔MEASURED at `305604f1`, by two independent instruments that agree —
+`check-anchor-balance.py --breakdown --denominator registry` and
+`read-anchors.sh --production --open`: **574 OPEN in the registry, 0 in the plans**, banding
+**P0 0 · P1 62 · P2 179 · P3 320 · P4 9 · P5 4**. ⛔ **Do not re-quote those numbers — re-derive
+them.** A lane is moving rows in the same tree this was measured in.
 
 ### ⚠ THE FIRST THING A FRESH CHECKOUT HITS, AND IT LOOKS LIKE A COMPILER DEFECT
 
@@ -113,14 +146,97 @@ a defect in the file it names.
    and `burndown-queue` taught a two-registry world, and the registry and its archive table deleted —
    with the seven rows describing a defect a user of the compiler could hit re-filed as production.
 
-**Owed, in order, and all of it is this branch's:**
-1. The eight-run gate: Windows Debug is green on every commit so far; **Windows Release and the three
-   remote legs, Debug and Release, have not run on this branch yet.**
-2. The scripts whose replacing verb does not exist: `local-build` waits for `build` (0.6), `run-gate`
-   for `test` (0.7), the leg drivers and carriages for `sync` (0.8), the sqlite corpus and the
-   benchmark for `run` (0.9). Nothing is deleted before its verb is proven on all four legs, and each
-   release's deletions are one commit.
-3. `.secrets/` is deleted once the last carriage that reads it is gone (ruling 14).
+### P68 ROUND 1 — what this commit carries, and its EIGHT gate numbers
+
+✔MEASURED on the folded tree, `{Debug, Release} × four legs`, **all eight green, zero failures**:
+
+| leg | Debug | Release |
+|---|---|---|
+| Windows x86_64, MinGW GCC / MSVC | **2207 / 2207** (815 s) | **2207 / 2207** (404 s) |
+| WSL x86_64, gcc | **2206 / 2206** (554 s) | **2206 / 2206** (148 s) |
+| macOS arm64, clang | **2167 / 2167** (975 s) | **2167 / 2167** (847 s) |
+| arm64 VPS, gcc | **2167 / 2167** (1422 s) | **2167 / 2167** (275 s) |
+
+★ **The cross-leg identity, re-derived and not re-quoted:** `2207 − 40 repo-guards = 2167`, exact on
+both ssh legs. ⚠ **WSL is 2206 because it RUNS the guards** — only the two ssh legs skip them, and the
+skill's claim that guards ran on *"exactly one local host"* was false in both halves (see the
+SCRIPT-ERA blocks in `dss-cycle/SKILL.md`).
+⚠ The four suite runs above predate three markdown edits made after them, so **the 40-guard subset was
+re-measured at the exact tree this commit carries**: `40 / 40`, 265 s, witness present, inputs held
+still. Compiled code was untouched in between.
+
+**What landed, in four lanes plus the orchestrator:**
+1. `cit` — **all 45 unresolvable anchor ids settled**, 240 citations. 28 rows born ✅ CLOSED as design
+   records, 6 genuinely open, 10 malformed citations corrected, 5 obsolete ones rewritten.
+   `DssHarness check-anchor-citations --current-tree` → **OK, every cited anchor resolves**.
+   ★ 12 legacy two-segment ids (`D-FF3-1`, `D-LK2-5`…) were RENAMED rather than the writer's
+   three-segment rule being relaxed, each keeping its old spelling as a literal prefix.
+2. `cfg` — every `minVersion` respelled with three components, which cleared **14** `unknown` tool
+   reports across six legs; the `run` verb proved end to end with a red-on-disable transcript.
+3. `doc` — the verb table, the ignored-paths claim and this file's own owed list corrected; the
+   reporting ruling landed in three places; **14** brief refutations, including two dead flags the
+   skill was still instructing (`--harness`, and a `scripts/scan_staleness.py` that does not exist).
+4. `s4` — the CMake bash probe retargeted at `CMakeLists.txt`, so it can only ever answer the HOST
+   question. ★ Its blast radius is **EIGHT** ctest entries, not the contract's seven —
+   `line_endings_watchdog_sh_guard` rides the cache variable without naming the probe.
+   `cmake/DssHarnessDeletionInventory.md` now carries every wave, every re-derived floor, and the
+   prose that must die with its code.
+5. orchestrator — three `scripts/**` defects fixed: a FAIL remediation naming three things that no
+   longer exist, a `_mirror` defined twice, and a SUCCESS path gutted to a bare `OK` plus a debug dump
+   into a hardcoded `/tmp/lane-q-anchors.txt`. Both `check-anchor-registry` twins now diff CLEAN.
+
+⚠⚠ **THE BALANCE GATE IS RED ON PURPOSE, AND IT MUST NOT BE WIDENED.**
+`check-anchor-balance --base 305604f1` → **exit 1, `created 6`, net +6** (574 → 580).
+**Operator ruling 2026-09-16, verbatim:** *"Option 4 - Close all 6 in this PR, but address the
+migration first because it will make our cycles/lanes faster"*. So the **PR** ends at net ≤ 0 while
+the intermediate commits carry the +6. The six are the pre-existing debt 240 production citations were
+already pointing at: `D-CSUBSET-LONG-BRANCH`, `D-CSUBSET-THREAD-LOCAL-INITIAL-EXEC`,
+`D-HIR-VERIFIER-POINTER-CONVERT-CONTRACT` (one audit test — the cheapest),
+`D-LIR-SETCC-DEAD-AFTER-FUSION`, and two needing targets that do not exist
+(`D-FF4-1-PE32-STDCALL-DECORATION`, `D-FF3-4-MICROSOFT-ARM64-CC-ROW`).
+
+**Owed, in order, and all of it is this branch's.** ⚠ This list previously led with *"the scripts
+whose replacing verb does not exist"*. **No such item remains** — every verb exists, so what is owed
+is PROOF, not a release.
+
+1. **The eight-run gate at the FINAL commit** — `{Debug, Release} × {Windows, WSL x86_64, macOS arm64,
+   arm64 VPS}`. 📄DOCUMENTED: Windows Debug passed **2207/2207** at `288a6be0`, and nothing committed
+   since touches compiled code. That is not a discharge — a gate figure is re-measured at the commit
+   that carries it, never re-quoted, so **all eight runs are owed at the commit that merges**.
+2. **`DssHarness install-missing-tools` green, or its residual STATED.** ✔MEASURED at `305604f1`:
+   `FAIL - 0 of 8 leg(s) have every tool they need`. Being worked this cycle; a tool that declares no
+   install is reported and never installed, and a privileged install with no declared credential is
+   refused by name — so a residue here may be legitimate, and then it is written down rather than
+   skipped.
+3. **Parity, PER LEG, at ONE fixed commit** — the script leg against the DssHarness leg on the same
+   tree, same build type, same toolchain, recording five things for each: **the ctest total and pass
+   count, the failing test NAMES, the build type, the toolchain identity, and the exit code.** Parity
+   means all five agree. ⛔ **The comparison runs in the commit BEFORE the deletion** — a leg whose
+   script twin is already gone cannot be compared — and the deletion commit cites it. A parity claim
+   across a moving tree is the misattribution `run-gate` already refuses with its own exit code.
+4. **The script deletions, ONE COMMIT PER VERB GROUP, each carrying its own S4 wiring** — the CMake
+   bash probe for `lane-worktree`, the test-budget rows and `scripts_index_guard`, the plan-citation
+   ratchet in BOTH directions, the wrapped-id and output-encoding inventories, five guard floors plus
+   `kScriptFloor` in the sqlite-harness-legs test, and the importers of `owning-tree`. **When a count
+   drops below a floor, fix the scan, never the floor.** ⚠ **Delete every leg's copy of the
+   repository before the first deletion commit** and let the tool create it again: a copy made before
+   a deletion still holds the deleted file, and a gate has already been lost to exactly that.
+5. **The runners** — the five `predefinedRunners`, each with its YAML action laid out **one directory
+   per action**: `.harness-config/runner/actions/<action-name>/<action-name>.yml`, holding every
+   supporting file that action needs (operator ruling, 2026-09-16; it SUPERSEDES the flat
+   `actions/<name>.yml` the contract was written with — a `run` line is a program and its arguments
+   with no shell, so anything longer than a one-liner needs a file beside its action, exactly as
+   `scripts/` already works). ✔MEASURED at `305604f1`: `predefinedRunners` is absent from
+   `config.json`, so none is declared yet. Machine-specific paths (Tcl's, notably) go in
+   `.harness-config/runner/.env/`, never in the tracked runner `env` — precedence is values, then
+   secrets, then runner `env`, then step `env`, so a tracked path cannot be overridden per machine.
+6. **`.secrets/` LAST** (ruling 14), once nothing reads it — today `scripts/repo-secrets`,
+   `scripts/ssh-macos` and `scripts/ssh-arm64-vps` do, and `scripts/remote-leg` through them.
+   Acceptance: the directory is gone and no tracked file names it.
+
+⓵ **Also owed, and not a step in that sequence:** `DssHarness check-anchor-citations` reports
+`FAIL - 240 citation(s) of 45 anchor id(s) resolve to no row` (✔MEASURED at `305604f1`). Being worked
+this cycle.
 
 ## §0.1 — P66 RAN IN TWO HALVES AND TWENTY-ONE LANES
 
@@ -152,9 +268,15 @@ part worth carrying:
 | arm 24 of the run-gate fixture | a stand-in that outlives the gate | a CI runner ~3× slower, where the gate outlives the stand-in | the same red, twice, looking like a real defect |
 
 ⇒ **Before trusting a rule a guard cites, ask which TOOLCHAIN, which PLATFORM, and which HOST it was
-measured on.** ★ The counter-example that held all cycle is arithmetic, not judgement: remote legs
-run `-LE repo-guard` so their total is Windows − **31**, and WSL's is Windows − **1**. A leg that had
-not synced could not land on those numbers.
+measured on.** ★ The counter-example that held all cycle is arithmetic, not judgement: the macOS and
+arm64-VPS legs run `-LE repo-guard`, so their total is Windows − *(the guard count)*, and WSL's is
+Windows − **1**. A leg that had not synced could not land on those numbers.
+⛔ **THE GUARD COUNT IS NOT WRITTEN HERE ANY MORE.** This sentence said **31**, which was P66's
+figure; ✔MEASURED **40** at `305604f1` with `ctest -N -L repo-guard`. A count typed into prose is a
+measurement with no instrument attached, and this one had already gone stale. Read it from
+`ctest -N -L repo-guard`, or from that commit's own configure line
+`repo-guard label applied to N test(s)` — which is exactly what the root `CMakeLists.txt` says to do,
+in those words.
 
 ## §0.3 — WHAT LANDED (production)
 
@@ -3783,7 +3905,7 @@ commit that lands it, and never delete a ticked row.
       fixed, the examples given something for the pipeline to transform, and all **12** `dependsOn` entries
       armed with `mustDifferFromBaseline`. ✔All 12 library images differ debug→release across four targets;
       macho64-arm64 and elf64-aarch64 verified BY EXECUTION on real hardware, exit 42 in all eight arms.
-      **The row predicted a finding and got two** — see §0.00000000000000000000000.
+      **The row predicted a finding and got two**.
 - [x] **P22 — `D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM` CLOSED. ✅ DONE 2026-08-20.** OPERATOR-ORDERED
       2026-08-20 for the IMMEDIATE next cycle** (*"remember to address anchor in the immediate next cycle.
       only best long term solutions! no workarounds"*). DSS cannot link a **file-local** function out of an
@@ -3977,18 +4099,17 @@ commit that lands it, and never delete a ticked row.
       🔵 **DISCLOSED PRE-EXISTING** — surfaced by lane Q, exempt from the net, and real regardless.
 - [x] **P26 — OPERATOR-INSERTED, not from this list: the three red CI legs. ✅ DONE 2026-08-22.**
       Argument: *"CI failed for linux-clang-asan, macos and windows"*. Three legs, three different
-      causes; detail in §0.00000000000000000000000000000. SEVEN rows BORN CLOSED, two 🔵 DISCLOSED
+      causes. SEVEN rows BORN CLOSED, two 🔵 DISCLOSED
       (both checkable in `3ce4e336`), net +0 after the exemption. ⚠ The two disclosed rows are the
       only judgement call in the cycle and are flagged for operator veto — if either reads as debt this
       cycle CREATED, it becomes P27's first work.
-- [x] **P27 — OPERATOR-INSERTED: the two CI legs still red after P26. ✅ DONE 2026-08-22.**
-      Detail in §0.000000000000000000000000000000. Two rows BORN CLOSED, one CLOSED
+- [x] **P27 — OPERATOR-INSERTED: the two CI legs still red after P26. ✅ DONE 2026-08-22.** Two rows BORN CLOSED, one CLOSED
       ([[D-CI-WINDOWS-CTEST-COST-IS-UNMEASURED]], answered by the first Windows ctest run that ever
       happened) and one OPENED and sized rather than absorbed, net ±0. Both defects were instruments that were correct about their subject and
       wrong about their environment.
 - [x] **P28 — THE REST OF THE P25 BATCH, plus the branch's HIGH row, plus the operator's VR ruling. ✅ DONE 2026-08-23.**
       Thirteen lanes. Balance **1036 → 1022, net −14** (closed 22, opened 8 — 6 created, 2 disclosed,
-      7 bookkeeping-only). Detail in §0.0000000000000000000000000000000.
+      7 bookkeeping-only).
       ★★ The pick had to resolve a **contradiction inside this very queue**: the entry below made
       `D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS` P26's mandatory first item, while the
       entry above it said ⛔ MUST-NOT-BE-PICKED. Re-derived from the REGISTRY, reported rather than
@@ -4023,7 +4144,6 @@ commit that lands it, and never delete a ticked row.
       `D-PLANS-GATED-ROWS-NAME-NO-OPENER` is NOT, and it is item 1 of the P30 entry below.
       Balance at the lock: 1022 → 1022, net +0; gate 1580/1580 — ⚠ re-measure with
       `python scripts/check-anchor-balance/check-anchor-balance.py` rather than re-quoting this line.
-      Detail in §0.00000000000000000000000000000000.
 - [ ] **P30 — THE ROW P29 LEFT OPEN, THEN THE ROWS P29 OPENED, per the standing order refined
       2026-08-20.** P29 opened **2 created** rows and 3 disclosed **and left one of its own queued
       rows open**; re-derive each from the REGISTRY at the pick — this list is a pointer, not a
@@ -7332,7 +7452,7 @@ re-litigated**.
 created-over-closed.** ⚠ **THE BALANCE GATE REFUSES THIS, AND IT SHIPPED ANYWAY ON AN OPERATOR RULING** —
 see the audit-fold section below for the ruling verbatim and for what the +13 is made of. Every one of the
 21 created is a defect this cycle FOUND rather than inherited, each was sized before being written down,
-and all of them are the NEXT cycle's first work (§0.00000000000000000 P25). ★ The mid-cycle claim of
+and all of them are the NEXT cycle's first work (P25). ★ The mid-cycle claim of
 "net −1" was true of the tree at the time and is superseded here rather than deleted, because the reason
 it moved — an independent audit refuting one of this cycle's own closure claims — is the finding.
 
@@ -7863,7 +7983,7 @@ so these 4 are closed next cycle."*
 ★ **This is the §B escape hatch the rule reserves, used deliberately by the operator with the number in
 front of them — NOT the gate being softened.** Every one of the 21 is a defect this cycle FOUND rather
 than inherited, and each was sized before being written down. They are the next cycle's first work
-(§0.00000000000000000 P25).
+(P25).
 
 ⚠⚠ **ONE THING WAS DELIBERATELY *NOT* DONE, AND IT MATTERS MORE THAN THE +14.** ✔MEASURED over 1,737
 registry rows: **45** rows whose status cell OPENS with a closure word are not marked closed; a strict
@@ -10581,9 +10701,9 @@ clobbers. It is an `if`, **not** a `switch` — the compiler forces nothing. Shi
    do not trigger it). Then FC18 ([[D-DIAG-CORPUS-EVERY-CODE]], sole remaining C23 phase — read its
    BLOCKED note first; prerequisite `D-PP-SEMANTIC-DIAGNOSTIC-POSITION-UNREMAPPED`, which is also
    the loop's C1 head).
-0. ✅ **DONE 2026-08-18 (Cycle P10): FIRST-CLASS, CONFIG-DRIVEN LTO** — [[D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE]] CLOSED (see §0.00000000). The grammar + two-stage topology shipped; the split decided by the runtime-measured rule; runtime-differential is a standing instrument.
+0. ✅ **DONE 2026-08-18 (Cycle P10): FIRST-CLASS, CONFIG-DRIVEN LTO** — [[D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE]] CLOSED. The grammar + two-stage topology shipped; the split decided by the runtime-measured rule; runtime-differential is a standing instrument.
 0. ✅ **DONE 2026-08-18 (Cycle P9): MAKE THE COMPILE FAST.** Four measured causes fixed,
-   byte-identical output (§0.0000000). [[D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX]] stays
+   byte-identical output. [[D-PERF-WINDOWS-HOST-COMPILES-8X-SLOWER-THAN-LINUX]] stays
    🟠 OPEN at a ~2.1× residual — the row says step one is an experiment, not an edit.
 
 1. **FINISH THE P5 CYCLE.** Wave 2 is unstarted: the typed inline-asm view, the four

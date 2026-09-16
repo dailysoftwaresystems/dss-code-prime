@@ -87,7 +87,7 @@ firstConfigCauseInline(std::span<ConfigDiagnostic const> diags) {
 // `loc` parameter (when set) is threaded into BOTH the emitted
 // `ParseDiagnostic` (for the reporter pipeline) AND the returned
 // `HeaderReadError::at` field (for programmatic consumers without
-// reporter access). D-FF2-2 fold: the struct-side mirror closes the
+// reporter access). D-FF2-2-HEADERREADERROR-SOURCE-LOCATION fold: the struct-side mirror closes the
 // gap where LSP / test pins had to re-parse reporter prose to locate
 // the offending decl. `HirSourceLoc{}` is the documented absent
 // value (`HirSourceLoc` in `hir/attributes/source_span.hpp`) — no optional

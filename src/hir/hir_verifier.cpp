@@ -897,7 +897,7 @@ void HirVerifier::checkCallArguments(DiagnosticReporter& reporter) const {
 
         auto params = interner_->fnParams(sig);
         auto args   = kids.subspan(1);
-        // D-LANG-VARIADIC (step 13.4): a variadic FnSig admits args
+        // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): a variadic FnSig admits args
         // beyond `fnParams().size()` — the declared params are the
         // FIXED prefix; positions [fixedCount, args.size()) are
         // vararg-region positions whose types are not constrained
@@ -932,7 +932,7 @@ void HirVerifier::checkCallArguments(DiagnosticReporter& reporter) const {
         // JIT path), add an audit test that constructs HIR with a
         // bare `Ptr<int>→Ptr<Void>` call arg WITHOUT a Cast and pins
         // `H_VerifierFailure` fires here.
-        // D-LANG-VARIADIC (step 13.4): vararg-region args (positions
+        // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): vararg-region args (positions
         // >= params.size() on a variadic FnSig) have no type
         // constraint from the FnSig — the per-arg assignability check
         // bounds at `params.size()`, not `args.size()`. C's default

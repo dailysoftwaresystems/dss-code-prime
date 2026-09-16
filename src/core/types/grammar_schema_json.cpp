@@ -9486,7 +9486,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
-                        // D-LANG-VARIADIC (step 13.4, 2026-06-02): optional
+                        // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4, 2026-06-02): optional
                         // C-style variadic-marker token. Same shape as
                         // `constMarker` above: a bad token name is
                         // C_UnknownToken; the declaration is still usable

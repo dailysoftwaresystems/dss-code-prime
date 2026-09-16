@@ -1308,7 +1308,7 @@ struct DSS_EXPORT TargetCallingConvention {
     // would silently skip a guard page and reintroduce the crash.
     std::uint16_t stackProbePageBytes = 0;
 
-    // D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7 (closed co-with-D-ML7-2.2, 2026-06-02): when true,
+    // D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7 (closed co-with plan-12 step ML7-2.2, 2026-06-02): when true,
     // the cc uses SLOT-ALIGNED arg passing — each arg consumes ONE
     // shared slot index regardless of its register class, AND both
     // argGprs[N] AND argFprs[N] are reserved by slot N (matters for
@@ -1452,14 +1452,17 @@ struct DSS_EXPORT TargetCallingConvention {
     FramePointerReservation framePointerReservation =
         FramePointerReservation::DynamicFrameOnly;
 
-    // D-LANG-VARIADIC (step 13.4, 2026-06-02): the register the caller
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4, 2026-06-02): the register the caller
     // MUST load with the count of vector (FPR) arguments passed in
     // vector registers BEFORE the call instruction of any C-style
     // variadic function. SysV AMD64 (§3.2.3): `al = number of XMM
     // arguments used by varargs (0..8)`. Win64 ms_x64 has no
-    // equivalent (the loader-side ABI uses GPR-shadow + double-spill
-    // — anchored D-ML7-VARIADIC-WIN64-DOUBLE-SPILL — and this field
-    // is left empty). AAPCS64 (ARM64-ELF): no equivalent — variadic FP
+    // equivalent (the loader-side ABI uses GPR-shadow + double-spill,
+    // and this field is left empty). ⓘ That double-spill SHIPPED at
+    // FC12b under D-FC12B-WIN64-VARIADIC-CALLEE — `lir_callconv`'s
+    // `fpDupMoves` emit a `movq_xmm_to_gpr` per FP vararg into its home
+    // integer register — so the forward-looking anchor this sentence
+    // used to carry named work that is done. AAPCS64 (ARM64-ELF): no equivalent — variadic FP
     // args pass in v0..v7 and ARE spilled to the VR save area (the dual-
     // cursor walk reads them via __vr_offs); there is simply no SysV-style
     // al count register. (APPLE arm64 is the ABI where variadic args —
@@ -4616,7 +4619,7 @@ struct DSS_EXPORT TargetSchemaData {
     // OR'ing zero into the opcode byte.
     bool condCodeEncodingLoaded = false;
 
-    // FC6 (D-FF3-1 layout half): the per-ABI aggregate-layout parameters
+    // FC6 (D-FF3-1-TARGET-AGGREGATE-LAYOUT-PARAMS layout half): the per-ABI aggregate-layout parameters
     // (`"aggregateLayout"` in .target.json) the generic `type_layout` engine reads
     // — the natural-alignment rule + the ISA max alignment. OPTIONAL at load (a
     // minimal target may omit it, like `callingConventions` / `registers`); the
@@ -5171,7 +5174,7 @@ public:
         return d_.condCodeEncodingLoaded;
     }
 
-    // ── Aggregate layout (FC6, D-FF3-1) ──────────────────────────
+    // ── Aggregate layout (FC6, D-FF3-1-TARGET-AGGREGATE-LAYOUT-PARAMS) ──────────────────────────
     // The per-ABI struct/union/array layout params the `type_layout` engine
     // reads. `aggregateLayoutLoaded()` is false for a target that never declared
     // the block (OPTIONAL at load; this accessor lets a consumer assert it and

@@ -158,10 +158,10 @@ this repository's configuration, and which scripts are still the only way to do 
   the archive can never be picked up.
 - ⚠ **The audit trail is NOT deleted, it is RELOCATED.** "Never delete a closed row" still holds;
   the archive is where it goes.
-- ★ **RESOLUTION reads all three; ORIENTATION reads only the two working ones.** A `D-*` cited in
-  `src/` must resolve wherever its row now lives, so every guard that RESOLVES a citation globs
+- ★ **RESOLUTION reads both; ORIENTATION reads only the working one.** A `D-*` cited in `src/` must
+  resolve wherever its row now lives, so every guard that RESOLVES a citation globs
   `_deferred-anchor-registry*.md`. Everything that asks *what is left* — `burndown-queue`, Step 1's
-  priority pick, this skill — reads production and harness and stops there.
+  priority pick, this skill — reads production and stops there.
 
 ⚠ A row's bucket follows the **DEFECT, never the instrument that found it**. `D-CONFIG-*` and
 `D-DIAG-*` are PRODUCTION deliberately: in this architecture a `.lang/.target/.format.json` document
@@ -186,12 +186,15 @@ three-value controlled vocabulary — `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED`.
   leading its `Trigger` prose.** Two cells now state the same fact, so they can disagree — silently,
   because the gate would believe the column while every human reads the prose.
 - ★ **Plan-side §3.1 tables were NOT migrated** and still use the four-cell shape. Both are
-  recognized; only the three registry documents changed.
+  recognized; only the registry documents changed.
 
 ### The four verbs — `scripts/anchors/`
 
 Each has a `.sh` and a `.ps1` launcher over one implementation (`anchors.py`), so the pair cannot
-drift. Every verb takes `--production` / `--harness` / `--done`.
+drift. Every verb takes **`--production` / `--done`, and those are the only two.**
+⚠ **`--harness` NO LONGER EXISTS and is refused** — the harness registry retired on 2026-09-16.
+✔MEASURED 2026-09-16 at `305604f1`: `write-anchor`, `set-anchor` and `read-anchors` each print
+`(--production | --done)` in their own usage line. A command still typing `--harness` fails.
 
 ```
 scripts/anchors/write-anchor.sh  --production D-<AREA>-<NAME> --priority P1 --status open \
@@ -237,9 +240,11 @@ neither was detectable downstream: an author PRE-ESCAPING by hand, and the raw-l
    faced** — this cycle, in the lane that hit it, as part of that lane's work. A gate that lies, a
    guard blind to its subject, a script that blocks the work in front of you: fix it NOW. **Filing
    it and routing around it is exactly the failure this ruling names.**
-3. **The harness registry is a RECORD, not a backlog.** It is drained by encounter, not by
-   scheduling. A harness row is normally written already ✅ CLOSED, naming a fix that landed in the
-   same cycle.
+3. **A harness row is a RECORD, not a backlog entry.** Harness work is drained by encounter, not by
+   scheduling, and such a row is normally written already ✅ CLOSED, naming a fix that landed in the
+   same cycle. ⚠ **It no longer has a registry of its own** — since 2026-09-16 a defect in the
+   TOOL is repo-harness's to fix and is reported there, and a defect in THIS repository's build
+   wiring, tests or plans is an ordinary production row.
 4. **Still file the row.** *Anchor every issue found* is not repealed — a harness defect fixed
    silently teaches nobody, and the row is what makes the fix auditable. This ruling governs what
    gets **SCHEDULED**, not what gets **RECORDED**.
@@ -590,8 +595,24 @@ while the local four-leg Debug gate was **2179 / 2178 / 2148 / 2148 GREEN on tha
      `#include`. The local Windows gate is **MinGW GCC**, so the fact is invisible to it in *every*
      build type.
    - macOS was `run_gate_guard`, proved **build-type independent** by running it from the repo root
-     with no build tree at all. It is invisible locally because the three INDIRECT legs run
-     `-LE repo-guard`, so **31 guard tests run on exactly one local host and on all five CI legs.**
+     with no build tree at all. ★ **THE DURABLE FACT: a repo-guard is HOST-INDEPENDENT** — it reads
+     the TREE, not the machine — **so which legs execute it is a CONFIGURATION decision, and a
+     leg that skips it can never see a guard-only defect.** Derive the leg set from the run you
+     are looking at (the per-leg totals differ by exactly the guard count), never from memory.
+     ⏳ **SCRIPT-ERA, deleted by `W-sync` — see `cmake/DssHarnessDeletionInventory.md`:** today
+     that decision is made independently in THREE scripts with DIFFERENT defaults, which is
+     precisely why the claim below was wrong for a year. ✔MEASURED 2026-09-16: `remote-leg.sh`
+     passes `-LE repo-guard` (macOS, arm64 VPS) while `wsl-leg.sh` defaults `DSS_LEG_GUARDS` to
+     `1` and runs every guard — Windows **2207**, WSL **2206**, macOS and the VPS **2167**.
+     ⛔ This sentence used to say all three indirect legs skip guards and that guards run on
+     exactly ONE local host. Both halves were false: it is TWO local hosts and **four** of a
+     round's eight runs. ★ **One tool reading one config cannot have this class of bug**, which
+     is the argument for the migration in one line.
+     ⚠ **The count is not typed here.** `ctest -N -L repo-guard` prints it, and so does the configure
+     line `repo-guard label applied to N test(s)` — which is what the root `CMakeLists.txt` says to
+     read, in those words, having already gone stale by eight entries once. ✔MEASURED **40** at
+     `305604f1` (`ctest -N -L repo-guard`); this sentence said **31** until 2026-09-16, and **18**
+     before that.
 
 ★★★ **THE SHAPE IS THIS CYCLE'S OWN THROUGH-LINE, TWICE MORE: THE RULE A DEFECT CITED WAS TRUE — OF
 THE THING NEXT DOOR.** *"`#deps 0` is never legitimate"* is true of **gcc** and false of **MSVC**.
@@ -740,11 +761,13 @@ hand-typing every edit or reading every subsystem.
 0. **Orient.** Read `.plans/_handoff.md` first — the previous cycle's claim, not ground truth; where
    it disagrees with your own measurements, say so and correct it this cycle. Check `git status`,
    branch, last commit subject. Read plan-00 §0.1 and skim the anchor registry.
-   ⚠ **ORIENTATION READS THE TWO WORKING REGISTRIES ONLY** — `-production.md` and `-harness.md`
-   hold what is LEFT, and `bash scripts/anchors/read-anchors.sh --production` is the whole list in
-   one screen. **Do not read `_deferred-anchor-registry-done.md` to choose work**: it is the
-   archive, it is by far the largest of the three, and reading it to orient is how a closed row got
-   recommended three times in this project's history. Establish a green
+   ⚠ **ORIENTATION READS THE WORKING REGISTRY ONLY** — since 2026-09-16 that is ONE document,
+   `-production.md`, which holds everything that is LEFT, and
+   `bash scripts/anchors/read-anchors.sh --production` is the whole list in one screen.
+   (This line named `-harness.md` as a second working registry until the harness registry retired.)
+   **Do not read `_deferred-anchor-registry-done.md` to choose work**: it is the archive, it is by
+   far the larger of the two, and reading it to orient is how a closed row got recommended three
+   times in this project's history. Establish a green
    baseline (`cmake --build build`, then full `ctest`). **A red baseline with no WIP-repair context
    is itself a pause gate** — present it; do not silently "fix it".
 
@@ -1052,7 +1075,7 @@ hand-typing every edit or reading every subsystem.
    in place. `scripts/anchors/set-anchor.sh <ANCHOR> --status closed --closing '...' --apply` rewrites
    the row and lifts it out of the working registry into `_deferred-anchor-registry-done.md`; a lane
    handing you a verbatim row FILE goes through `apply-registry-row`, which delegates to the same
-   writer. A NEW row is `write-anchor.sh --production|--harness ... --insert --apply`. ⚠ Never
+   writer. A NEW row is `write-anchor.sh --production|--done ... --insert --apply`. ⚠ Never
    hand-edit a table: `check-anchor-balance`'s partition arm fails the tree for a closed row left
    behind or an open row filed in the archive, and its ARM 6 fails it for a `Status` column that
    contradicts its own `Trigger` prose.
@@ -1062,10 +1085,16 @@ hand-typing every edit or reading every subsystem.
     this gate until clean. A finding implying a *design choice* is a pause gate, not a loop.
 11. **Commit and push.** `.plans/_handoff.md` must be staged in THIS commit — it ships with the work
     it describes, never in a follow-up. Subject `Cycle <id>: <concise summary>`; body lists anchors
-    closed/opened plus the test delta; end with the repo's standard Co-Authored-By trailer (currently
-    `Co-authored-by: Claude Opus 5 <noreply@anthropic.com>`). ⚠ DO NOT TRUST THAT SPELLING FROM HERE — it said 4.8 until 2026-08-28, when the last six commits actually carried Opus 5 five times. Read the trailer off `git log` before committing; a hardcoded model name in a skill is stale the moment the model changes.. Push immediately — it starts CI while
-    context is hot. Stay on the current feature branch. **Open the PR here if the branch does not
-    have one yet.**
+    closed/opened plus the test delta; end with the repo's standard `Co-authored-by:` trailer.
+    ⛔ **THE MODEL NAME IS NOT WRITTEN HERE, ON PURPOSE.** A hardcoded one is stale the moment the
+    model changes, and this line carried `Opus 4.8` for weeks after the commits had moved on. Take it
+    from the session's own attribution instructions, or read the newest one off the tree:
+    `git log --format='%b' -20 | grep -im1 '^[Cc]o-authored-by:'`. ✔MEASURED 2026-09-16 at
+    `305604f1`: the last ten commits all carry the same trailer, and it is the one that instrument
+    prints. Push immediately. ⚠ **Pushing does NOT start the test matrix** — `pipeline-pr.yml` is
+    gated on the operator's `Run Pipes` label and only the ungated landing-log job runs; push because
+    the work should be on the remote, not because it buys a CI verdict. Stay on the current feature
+    branch. **Open the PR here if the branch does not have one yet.**
     ⚠ **THIS STEP IS REACHED ONCE PER COMPLETED LANE SET, NOT ONCE PER CYCLE** — see
     *A COMPLETED SET OF LANES IS A COMMIT POINT* above. A cycle running several sets of lanes lands
     several commits on one PR, and **the next set is seeded only AFTER this step**, so every lane
@@ -1088,6 +1117,21 @@ proceed (failures, done/not done, final report, etc)"*.
 3. **Done / not done** — a step's terminal state, when the operator's next action depends on it.
 4. **The final report** — the output contract below.
 5. **A direct answer to a direct question.**
+6. ★★★ **A DssHarness finding** (operator ruling, 2026-09-16: *"please also put in dss-cycle skill
+   that any issue found in DssHarness must be reported to me (the operator)"*). **Emit it even when
+   it neither fails nor blocks this cycle** — which is the usual case, because the cycle routes
+   around a tool defect by using the script that still exists, and the finding then matches none of
+   categories 1–5 and dies in a lane report. That silence is what this item closes.
+   - **Same FORM as everything else:** what was run, what happened, what should have happened, and
+     the exact source symbol in repo-harness that produces it — **path + SYMBOL, never a line
+     number**. A few lines. No significance commentary, no derivation.
+   - **Report it in the cycle that FINDS it**, never filed for later — the same shape as *fix it when
+     you face it*.
+   - **A DssHarness defect does NOT become a `D-*` row here**; it is not this repository's defect.
+     **The cycle report is its only route out**, which is why this item has to exist at all.
+   - ⚠ **Reporting does not replace fixing our side.** Where the defect has a correct LOCAL
+     expression that is not a workaround — spelling a `minVersion` with three components because the
+     tool documents semantic versions, say — fix it here AND report the tool's part. Not alternatives.
 
 ⛔ **Everything else is noise, and the list of what NOT to emit is the useful half:** no progress
 narration ("lane X is running", "starting the build"), no interim summaries of work that is not
@@ -1285,9 +1329,16 @@ opening the inter-procedural *arc*, not about every line in `src/opt/`.
   **never** on touching the operator's PR: do not label, re-run or push to re-trigger CI.
   ⚠ **The local gate cannot substitute for it, and assuming otherwise is the defect.** ✔MEASURED
   2026-09-14: the two legs that were red run in configurations **no local leg builds** — the local
-  Windows gate is **MinGW GCC**, so every `deps = msvc` fact is invisible to it, and the three
-  INDIRECT legs (WSL, macOS, arm64 VPS) skip `-L repo-guard` entirely, so 31 guard tests run on
-  exactly one local host and on all five CI legs.
+  Windows gate is **MinGW GCC**, so every `deps = msvc` fact is invisible to it, and the two SSH
+  legs (macOS, arm64 VPS) skip `-LE repo-guard`, so a guard-only defect is invisible to THEM.
+  ⚠ **WSL is NOT in that set** — ✔MEASURED 2026-09-16, `wsl-leg.sh` defaults `DSS_LEG_GUARDS` to
+  `1` and runs every guard; the counts say so (Windows 2207, WSL 2206, macOS/VPS 2167).
+  ⏳ **SCRIPT-ERA — the two script names above die in `W-sync`.** What survives the migration is
+  the principle: a guard is host-independent, so its leg set is a CONFIG decision, and a leg that
+  skips it cannot see a guard-only defect. **Re-derive the set from the run in front of you.**
+  ⚠ Read the count from `ctest -N -L repo-guard` or
+  from that commit's own `repo-guard label applied to N test(s)` configure line — never from here.
+  ✔MEASURED **40** at `305604f1`.
 
 ## Stop-command handling
 
@@ -1313,7 +1364,8 @@ never lowers the bar.
   anchor** — `DssHarness` is the tool this repository's harness is moving to, and that file says which
   of its verbs exist today, which scripts are still the only way to do their job, what this
   repository's `.harness-config/config.json` declares, and the exit codes to act on. ⛔ A defect in
-  the tool is a repo-harness issue, never a local workaround.
+  the tool is a repo-harness issue, never a local workaround, **and it is REPORTED TO THE OPERATOR in
+  the cycle that finds it** (ruling 2026-09-16) — see output-contract item 6.
 - Read `references/scripts.md` **before writing any script, probe, or one-off shell pipeline** —
   the index of every script this repository already ships, each with its purpose. Most of what a
   cycle needs is already there, and re-typing it inline re-opens the edge cases it was taught

@@ -414,20 +414,6 @@ def run(root, write):
 # not the absence of an exception -- "it did not throw" is exactly how a guard
 # that stopped checking anything reports success.
 
-def _mirror(root, dst):
-    os.makedirs(os.path.join(dst, "scripts"), exist_ok=True)
-    src_scripts = os.path.join(root, "scripts")
-    for name in os.listdir(src_scripts):
-        s = os.path.join(src_scripts, name)
-        if os.path.isdir(s) and name != "__pycache__":
-            shutil.copytree(s, os.path.join(dst, "scripts", name),
-                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    for rel in DOC_RELS:
-        d = os.path.join(dst, rel)
-        os.makedirs(os.path.dirname(d), exist_ok=True)
-        shutil.copyfile(os.path.join(root, rel), d)
-
-
 _RAN = None   # set by selftest() so every arm is counted where it is judged
 
 

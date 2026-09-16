@@ -281,10 +281,11 @@ AssembledModule assemble(Lir const&                 lir,
                    std::format("function symbol id {} dropped from "
                                "AssembledModule — at least one "
                                "instruction failed to encode (see "
-                               "preceding diagnostic); D-ASM-ENCODE-"
-                               "FAILURE-FUNCTION-ROLLBACK preserves "
-                               "byte-offset integrity by aborting the "
-                               "function on first per-inst failure",
+                               "preceding diagnostic); "
+                               "D-ASM-ENCODE-FAILURE-FUNCTION-ROLLBACK "
+                               "preserves byte-offset integrity by "
+                               "aborting the function on first per-inst "
+                               "failure",
                                outFn.symbol.v));
             // Clear the function's bytes/relocs entirely so the
             // partial output cannot leak past assemble().

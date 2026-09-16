@@ -91,7 +91,7 @@ deferral is the rare exception that must earn its place, not the convenient way 
 | **Handoff — read at Step 0, rewritten at Step 8.1** | `.plans/_handoff.md` — ①where we are ②where we need to get ③priorities ④concurrent branches/PRs (rebase surface) ⑤timeline (accumulates) |
 | Open PRs / rebase surface | `gh pr list --state open` · `gh pr view <n> --json files` (Step 8.2) |
 | Priority spine | `.plans/00-compiler-implementation-plan - tbd.md` §0.1 |
-| Deferral registry — WORKING (what is LEFT) | `.plans/_deferred-anchor-registry-{production,harness}.md` |
+| Deferral registry — WORKING (what is LEFT) | `.plans/_deferred-anchor-registry-production.md` — the only working registry since 2026-09-16 |
 | Deferral registry — ARCHIVE (closed; never read to ORIENT) | `.plans/_deferred-anchor-registry-done.md` |
 | Read ONE anchor, in full | `bash scripts/anchors/read-anchor.sh <ANCHOR>` (`.ps1` twin on Windows) |
 | List anchors — name, priority, status | `bash scripts/anchors/read-anchors.sh --production [--band P0]` |

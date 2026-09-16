@@ -1051,7 +1051,7 @@ struct DSS_EXPORT DeclarationRule {
     // ptrQualifier volatile wraps the pointer; the former pointee-volatile reject is
     // retired (volatile is now a type qualifier). Config-driven, no hardcoded keyword.
     std::optional<SchemaTokenId> volatileMarker;
-    // D-LANG-VARIADIC (step 13.4, 2026-06-02): a token kind that, when
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4, 2026-06-02): a token kind that, when
     // found anywhere in this declaration's params subtree (the subtree
     // rooted at the `paramsChild` visible child), marks the declared
     // FnSig as C-style variadic. The semantic analyzer scans for this
@@ -3582,24 +3582,23 @@ struct DSS_EXPORT SemanticConfig {
     //     `Bitcast` (no representation change at runtime).
     //
     // Anchored for future:
-    //   * `D-LANG-VOIDPTR-ARITH-REJECT`: pointer arithmetic on void*
-    //     is undefined in standard C (sizeof(void) is invalid); GCC
+    //   * [[D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED]]: pointer arithmetic
+    //     on void* is undefined in standard C (sizeof(void) is invalid); GCC
     //     permits it as an extension treating void as 1-byte. When
     //     c gains pointer arithmetic, the void* arm rejects by
-    //     default; a `allowVoidPtrArithmetic: bool` opt-in field
-    //     extends this struct.
-    //     ✅ LANDED P42, and this 2026-06-02 sketch called the SHAPE
-    //     right and the LOCATION wrong — worth keeping for that. The
-    //     opt-in is real, but it is NOT a bool on THIS struct: `void`
+    //     default.
+    //     ✅ LANDED P42, and the 2026-06-02 sketch this bullet used to head
+    //     called the SHAPE right and the LOCATION wrong — worth recording for
+    //     that. The opt-in is real, but it is NOT a bool on THIS struct: `void`
     //     and a function type are objectless in the same way and take
     //     the same rule, so the fact is a SIZE (`nonObjectTypeSizes`,
     //     at the bottom of this file) read by the ONE `operandLayout`
     //     query that `sizeof`, `_Alignof` and the element stride all
     //     ask. A bool here would have made this a POINTER-CONVERSION
-    //     rule, which it is not — nothing is being converted. The
-    //     tracked row is [[D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED]];
-    //     the id above never became a registry row and is kept only as
-    //     this pointer to the one that did.
+    //     rule, which it is not — nothing is being converted. ⚠ The sketch's
+    //     own id never became a registry row, so spelling it here was a
+    //     citation that resolved to nothing; the row above is the one that
+    //     tracks this and the supersession is recorded in its registry entry.
     //   * `D-LANG-VOIDPTR-FN-CONVERT`: `void* ↔ fn-pointer` is
     //     technically UB in standard C even though every compiler
     //     permits it. Function-pointer types landed (FC4: Ptr<FnSig>
@@ -3607,21 +3606,25 @@ struct DSS_EXPORT SemanticConfig {
     //     opt-in below now gates the whole fn<->void* class (Option B, the
     //     single authoritative gate) for the gcc/POSIX dlsym / Tcl ClientData
     //     idiom; c opts in, default false stays ISO-strict.
-    //   * `D-LANG-VOIDPTR-PREDICATE-GATE` (type-design analyst,
-    //     step 13.2 audit fold): if a future language needs
-    //     per-element-type predicates ("only T* → void* when T ∈
-    //     {char, byte}" or "only when sizeof(T) ≥ alignof(void*)"),
-    //     today's two-bool shape forecloses it. Trigger: first
-    //     language whose `void*` rules depend on the element T.
-    //     Closure: add a `PointerConversionPredicate` variant slot
-    //     beside the bools (additive, doesn't break existing flags).
-    //   * `D-TYPERULES-PTRRULES-PASS-BY-VALUE` (type-design analyst
-    //     D4, step 13.2 audit fold): the `isAssignable` signature
-    //     takes `PointerConversionRules const&` for a 2-byte POD.
-    //     By-value would marginally simplify; const-ref form is
-    //     idiomatic-enough today. Trigger: any post-merge pass
-    //     touching the `isAssignable` signature (e.g. when a 3rd
-    //     rules-block lands).
+    // ── TWO 2026-06-02 type-design notes, BOTH REFUTED BY MEASUREMENT ──
+    // Each was recorded as a forward-looking anchor whose premise was the
+    // SHAPE of this struct on the day it was written. ✔MEASURED 2026-09-16:
+    // this struct now carries SIX bools, not two, so neither premise holds
+    // and neither id ever became a registry row — spelling them here was a
+    // citation resolving to nothing. What survives is the design fact:
+    //   * PER-ELEMENT-TYPE PREDICATES ARE NOT FORECLOSED. The note claimed
+    //     "today's two-bool shape forecloses" a rule like "only T* → void*
+    //     when T ∈ {char, byte}". The four flags added since (the two
+    //     null-pointer-constant arms, `allowVoidPtrFnConvert`,
+    //     `directCallIntPointeeCompat`) are the evidence that this block
+    //     extends ADDITIVELY; a `PointerConversionPredicate` variant slot
+    //     would land beside the bools exactly the same way, breaking
+    //     nothing. Nothing is deferred and nothing is at risk.
+    //   * `isAssignable` TAKING THIS BY CONST-REF IS NOW THE ONLY SENSIBLE
+    //     FORM. The note weighed by-value against const-ref "for a 2-byte
+    //     POD"; at six bools, and with `isAssignable` carrying a dozen
+    //     further scalar parameters, by-value is not the simpler spelling
+    //     it was argued to be. The question is settled, not deferred.
     struct PointerConversionRules {
         // T* → void* (typed → untyped). Information-erasing direction.
         // Universally safe (no runtime risk; just forgetting type).

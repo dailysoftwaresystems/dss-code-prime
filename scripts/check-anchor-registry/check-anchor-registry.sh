@@ -1509,8 +1509,13 @@ if [[ ${#MISSING[@]} -eq 0 ]]; then
     # ${_anchor_count}, not `echo "${SRC_ANCHORS}" | wc -l` — the latter reports 1 for
     # an EMPTY set (echo emits a lone newline), which is exactly how the fail-open bug
     # above dressed a scan of nothing as "OK (1 src anchors all resolve)".
-    printf "%s
-" "${SRC_ANCHORS}" > /tmp/lane-q-anchors.txt; echo "anchor-registry: OK"
+    # ⚠ RESTORED 2026-09-16 (P68). This line had been replaced by a bare "OK" plus a
+    # dump of SRC_ANCHORS into a hardcoded /tmp/lane-q-anchors.txt -- one lane's debug
+    # artifact, left in the guard, clobbered on every run and raced by any two lanes
+    # running at once. It also cost the two figures the comment above exists to explain,
+    # and made this the ONE line on which the .sh and .ps1 twins' output differed --
+    # in a guard whose own header says the twins are verified by DIFFING their output.
+    echo "anchor-registry: OK (${_anchor_count} src anchors all resolve to plans, ${_retired_count} retired id(s) uncited)"
     # ★ The cell-width verdict is NOT allowed to be swallowed by the anchor
     # check's success. Exit codes: 1 = an anchor resolves nowhere, 2 = a scan
     # collapsed, 3 = a markdown table row drops content, 4 = a citation names a
@@ -1620,13 +1625,13 @@ FILENAME == idxf {
 ' "${_locator_tmp}" "${_missing_tmp}"
 echo ""
 echo "Fix: either"
-echo "  (a) add a row in the deferred-anchor registry naming the"
-echo "      trigger + closing work -- .plans/_deferred-anchor-registry-production.md"
-echo "      if a USER of the compiler could hit it, -harness.md if only WE can, OR"
-echo "  (b) cite the anchor in a per-plan section 3.1 row (preferred when the"
-echo "      anchor maps to a specific plan's feature area), OR"
-echo "  (c) if the string is a code-internal pin not deferred work, add it"
-echo "      to the Allowlist section of the registry."
+echo "  (a) add a row in .plans/_deferred-anchor-registry-production.md naming the"
+echo "      trigger + closing work -- write it with scripts/anchors/write-anchor.sh,"
+echo "      which is the only door; a hand-edited table is how the halves drift, OR"
+echo "  (b) correct the citation to the id of the row that already covers it,"
+echo "      confirmed with scripts/anchors/read-anchor.sh <ID> --json, OR"
+echo "  (c) if the string is a code-internal pin and NOT deferred work, rename it"
+echo "      out of the D- shape under a PIN- prefix, as the retired Allowlist was."
 echo ""
 echo "Discipline: this leak recurred TWICE before this guard landed."
 echo "See .plans/_deferred-anchor-registry-production.md for the discipline rationale."

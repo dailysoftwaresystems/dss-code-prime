@@ -196,10 +196,43 @@ examples/**/*.so binary
 #
 # Placed after `examples/**/*.so` so last-match precedence beats `src/dss-config/**`.
 src/dss-config/runtime/platform/dist/** binary
+
 # ── DssHarness configuration and runner actions ───────────────────────────────
-# A pin does not retroactively rewrite committed content, so these land in the SAME
-# commit as the files. A `run` block is split on newlines and each line trimmed, so a
-# CRLF checkout would otherwise be a difference the action parser has to absorb.
+# A `run` block in an action file is split on newlines and each line trimmed
+# (RepoHarness.Core.Runners.ActionFileParser.RunLines), so a CRLF checkout is a
+# difference the action parser would have to absorb, on the one file whose whole
+# point is that what it says is what runs.
+#
+# ⓘ 2026-09-16, P68: the intent recorded here was "these land in the SAME commit as
+# the files, because a pin does not retroactively rewrite committed content". ✔THE
+# `.yml`/`.yaml` HALF DID — the first action file arrives with this cycle. ✔THE
+# `.json` HALF DID NOT: `git log --diff-filter=A -- .harness-config/config.json`
+# names 2290087c, and this block landed one commit later in 288a6be0. Corrected
+# rather than left standing, because a comment stating a mechanism that did not
+# happen is the kind of claim this file exists to stop.
+#
+# ⚠ AND IT COST NOTHING ONLY BY LUCK, which is the distinction drawn three times
+# above. `git ls-files --eol -- .harness-config/config.json` reports `i/lf w/lf`:
+# the unpinned commit stored LF regardless, because this workstation has
+# `core.autocrlf=false` (--global; --local unset). On a machine with the
+# Git-for-Windows installer default the same commit would have stored CRLF, and no
+# later pin would have undone it. LF by an author's machine, not by mechanism.
+# ⓘ The instrument that ALMOST said otherwise, recorded so it is not re-run: piping
+# `git cat-file -p <blob>` through PowerShell's `Out-String` reports 501 CRs, every
+# one of them added by the pipeline. `git ls-files --eol` reads the blob and is the
+# only answer that means anything here.
 .harness-config/**/*.json text eol=lf
 .harness-config/**/*.yml  text eol=lf
 .harness-config/**/*.yaml text eol=lf
+
+# ⓘ 2026-09-16, P68: `.py` JOINS THEM, because the operator's action layout invites it.
+# One directory per action holds its `.yml` and every supporting file, and the first such
+# file is a Python program the action's only `run` line starts - a `run` line being a
+# program and its arguments with no shell, anything that is not a one-liner must be a file.
+# `scripts/**/*.py` above is pinned already; a second home for repository Python that is NOT
+# pinned would be the same defect in a new directory, and the comment above records that this
+# block has already been one commit late once. Named by EXTENSION, not as
+# `.harness-config/** text`, for the reason the `examples/**/*.bin binary` rule exists: a
+# directory-wide text pin claims binary bytes it does not know about, and an action's
+# supporting files are exactly where a fixture blob will one day be added.
+.harness-config/**/*.py   text eol=lf

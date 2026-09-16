@@ -15,7 +15,7 @@
     "scripts/burndown-queue/burndown-queue.py": 2,
     "scripts/check-anchor-registry/check-anchor-registry.ps1": 2,
     "scripts/check-scripts-index/check-scripts-index.py": 1,
-    "src/asm/asm.cpp": 8,
+    "src/asm/asm.cpp": 7,
     "src/core/types/grammar_schema_json.cpp": 3,
     "src/core/types/target_schema_json.cpp": 1,
     "src/link/format/elf.cpp": 1,

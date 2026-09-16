@@ -188,7 +188,7 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 //   `callingConventionIndex`, resolved by `dss::ffi::resolveAbi` and turned into
 //   an ordinal by pointer distance. ✔MEASURED: `x86_64.target.json` declares
 //   `sysv_amd64` at ordinal 0 and `ms_x64` at 1, so the literal `0` compiles and
-//   silently emits SysV register assignments on pe64 — `D-FF3-3`, exactly.
+//   silently emits SysV register assignments on pe64 — `D-FF3-3-RESOLVED-CC-INDEX-THREADED`, exactly.
 //   PINNED by `program/test_entry_argv_run`
 //   `EntryArgvRun.RealCommandLineReachesMainByteExact`: a real `CreateProcess`
 //   command line into `main(int, char**)`, which reads rcx/rdx under MS_x64 and
@@ -491,7 +491,7 @@ effectiveUnnamedBitFieldAlignment(TargetSchema const&       target,
 // `callingConventionIndex` is the per-(target, format) cc ordinal
 // resolved by `dss::ffi::resolveAbi` in the driver before reaching
 // this kernel. Threaded through to the LIR allocator so prologue/
-// epilogue emission picks the correct cc table row. Pre-D-FF3-3
+// epilogue emission picks the correct cc table row. Pre-D-FF3-3-RESOLVED-CC-INDEX-THREADED
 // every compile silently used index 0 — a real miscompile on
 // non-default-cc targets (PE64 + x86_64 silently emitted SysV
 // register assignments instead of MS_x64).
