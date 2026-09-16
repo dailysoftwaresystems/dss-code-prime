@@ -465,7 +465,12 @@ jobs:
         env:
           ARTIFACT_NAME: ${{ needs.resolve-version.outputs.artifact-name }}
           VERSION: ${{ needs.resolve-version.outputs.version }}
-          PLATFORM: ${{ matrix.platform }}
+          # ⚠ NOT `PLATFORM`. On the Windows leg the Visual Studio developer environment
+          # already defines `Platform`, Windows environment names are case-INSENSITIVE so
+          # Actions' injection updates that slot while keeping its casing, and `bash` is
+          # case-SENSITIVE — so `${PLATFORM}` expanded to NOTHING and release v0.5.0 shipped
+          # `dsscp-0.5.0-.tar.gz` while the other three legs were named correctly.
+          DSS_PLATFORM: ${{ matrix.platform }}
           # The staged PREFIX TREE (bin/, lib/, share/), not the build dir. The
           # exe finds its config by a path relative to itself, so the tarball
           # must preserve that relative layout — which is exactly what a prefix
@@ -476,7 +481,20 @@ jobs:
         run: |
           set -e
           mkdir -p dist
-          archive="$(pwd)/dist/${ARTIFACT_NAME}-${VERSION}-${PLATFORM}.tar.gz"
+
+          # ★ EVERY COMPONENT OF THE NAME IS REQUIRED, AND AN EMPTY ONE IS A HARD FAILURE.
+          # An asset whose name is missing a component is indistinguishable from a correct one
+          # to anything that globs `*.tar.gz` — including this workflow's own upload step — while
+          # `publish-packages.yml` fetches by NAME and simply cannot find it. That is how a
+          # nameless Windows package reached a published release without one job going red.
+          for _part in ARTIFACT_NAME VERSION DSS_PLATFORM; do
+            if [ -z "${!_part}" ]; then
+              echo "::error::\$$_part is empty, so the archive name would be missing a component. Refusing to package."
+              exit 1
+            fi
+          done
+
+          archive="$(pwd)/dist/${ARTIFACT_NAME}-${VERSION}-${DSS_PLATFORM}.tar.gz"
 
           if [ -n "$PACKAGE_COMMAND" ]; then
             # Escape hatch: the consumer's command must write the finished
