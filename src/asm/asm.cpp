@@ -14,7 +14,6 @@
 #include <cmath>     // D-MIR-OVERLAP-STRUCT-ZERO-INIT: std::signbit (rejects -0.0)
 #include <cstring>
 #include <format>
-#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -439,10 +438,10 @@ AssembledModule assemble(Lir const&                 lir,
 
         // Resolve intra-function block-relative branch patches now
         // that every block's byte offset is known. Each patch wrote
-        // 4 zero placeholder bytes; we overwrite them with the
-        // signed 32-bit displacement `target_offset - (patch_offset
-        // + 4)` (the x86 convention: rel32 is relative to the byte
-        // AFTER the displacement).
+        // 4 zero placeholder bytes; we overwrite the field the
+        // patch's GEOMETRY ROW describes with the displacement that
+        // row's own formula produces — `(target - (patch + pcBias))
+        // >> scaleLog2`, written whole or as a bit-window.
         //
         // D-ASM-PATCH-PARTIAL-OUTPUT-FAILLOUD (post-fold, silent-
         // failure-hunter HIGH #3): on ANY patch failure, abort the
@@ -450,10 +449,10 @@ AssembledModule assemble(Lir const&                 lir,
         // The previous shape `continue`-d past failures and shipped
         // a partial-patched binary — a missing-target patch left 4
         // zero bytes (rel32=0 → branch-to-self → infinite loop).
-        // Dispatch via patch.kind so the shared resolver does NOT
-        // bake in x86 rel32-after-disp arithmetic. Each ISA's
-        // walker tags its patches with the appropriate kind; the
-        // resolver dispatches accordingly. Architect FOLD-NOW post-
+        // `patch.kind` selects a ROW rather than a code path, so the
+        // shared resolver bakes in no ISA's arithmetic at all: every
+        // number it uses is data, and the SAME data the scan phase
+        // and the escape election read. Architect FOLD-NOW post-
         // fold: pre-fix the `target - (patch + 4)` formula and
         // 4-byte LE write lived as raw arithmetic here — an
         // agnosticism break per the project's standing rules
@@ -550,106 +549,132 @@ AssembledModule assemble(Lir const&                 lir,
                 patchOk = false;
                 break;
             }
-            switch (patch.kind) {
-                case walker_util::BlockRelPatchKind::X86Rel32: {
-                    std::int64_t const disp =
-                        static_cast<std::int64_t>(it->second)
-                      - static_cast<std::int64_t>(patch.patchOffset + 4);
-                    if (disp < std::numeric_limits<std::int32_t>::min()
-                     || disp > std::numeric_limits<std::int32_t>::max()) {
-                        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
-                               DiagnosticSeverity::Error,
-                               std::format("intra-function branch in fn '{}' "
-                                           "needs displacement {} which exceeds "
-                                           "rel32 range — function body too large "
-                                           "for 32-bit branch reach (anchor "
-                                           "D-CSUBSET-LONG-BRANCH for thunks)",
-                                           outFn.symbol.v, disp));
-                        patchOk = false;
-                        break;
-                    }
-                    asm_byte_emit::writeU32LEAt(outFn.bytes, patch.patchOffset,
-                        static_cast<std::uint32_t>(static_cast<std::int32_t>(disp)));
-                    break;
-                }
-                case walker_util::BlockRelPatchKind::Arm64Imm19:
-                case walker_util::BlockRelPatchKind::Arm64Imm26: {
-                    // D-AS3-BLOCK-REL-IMM19/26: AArch64 intra-function
-                    // branch resolution. The displacement is PC-relative
-                    // TO THE INSTRUCTION ITSELF (no +4 bias, unlike x86's
-                    // rel32-after-disp) and SCALED by 4 (branch targets
-                    // are word-aligned). Imm19 (B.cond) occupies bits
-                    // 5..23; Imm26 (B) occupies bits 0..25. We READ-
-                    // MODIFY-WRITE only that bit-field so the opcode /
-                    // cond-nibble / register bits already emitted into
-                    // the word survive (writeU32LEAt over all 4 bytes
-                    // would clobber them).
-                    bool const isImm19 =
-                        patch.kind == walker_util::BlockRelPatchKind::Arm64Imm19;
-                    std::uint32_t const lsb   = isImm19 ? 5u : 0u;
-                    std::uint32_t const width = isImm19 ? 19u : 26u;
-                    std::int64_t const delta =
-                        static_cast<std::int64_t>(it->second)
-                      - static_cast<std::int64_t>(patch.patchOffset);
-                    // 4-byte alignment is a hard invariant — every ARM64
-                    // instruction (and thus every block boundary) is
-                    // word-aligned. A non-multiple delta means the
-                    // block-offset table or the patch offset is corrupt;
-                    // fail loud rather than silently drop the low bits.
-                    if ((delta & 0x3) != 0) {
-                        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
-                               DiagnosticSeverity::Error,
-                               std::format("intra-function ARM64 branch in fn "
-                                           "'{}' has unaligned displacement {} "
-                                           "(not a multiple of 4) — block "
-                                           "offsets must be word-aligned "
-                                           "(D-AS3-BLOCK-REL-IMM19/26)",
-                                           outFn.symbol.v, delta));
-                        patchOk = false;
-                        break;
-                    }
-                    std::int64_t const disp = delta >> 2;  // arithmetic, signed
-                    // Signed range derived from the field WIDTH:
-                    // Imm19 ∈ [-(1<<18), (1<<18)-1]; Imm26 ∈
-                    // [-(1<<25), (1<<25)-1]. Out-of-range = the function
-                    // body exceeds the branch's reach; fail loud (a long-
-                    // branch thunk is the future generalization, anchored
-                    // D-CSUBSET-LONG-BRANCH).
-                    std::int64_t const lo = -(std::int64_t{1} << (width - 1));
-                    std::int64_t const hi =  (std::int64_t{1} << (width - 1)) - 1;
-                    if (disp < lo || disp > hi) {
-                        report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
-                               DiagnosticSeverity::Error,
-                               std::format("intra-function ARM64 branch in fn "
-                                           "'{}' needs scaled displacement {} "
-                                           "which exceeds the signed {}-bit "
-                                           "field range [{}..{}] — function "
-                                           "body too large for branch reach "
-                                           "(anchor D-CSUBSET-LONG-BRANCH for "
-                                           "inverted-cond + long B thunks)",
-                                           outFn.symbol.v, disp, width, lo, hi));
-                        patchOk = false;
-                        break;
-                    }
-                    // READ the existing 32-bit LE word at the patch site,
-                    // OR in the masked displacement, write the whole word
-                    // back. The mask clears only the [lsb, lsb+width) bits.
-                    std::uint32_t const o = patch.patchOffset;
-                    std::uint32_t word =
-                        static_cast<std::uint32_t>(outFn.bytes[o])
-                      | (static_cast<std::uint32_t>(outFn.bytes[o + 1]) << 8)
-                      | (static_cast<std::uint32_t>(outFn.bytes[o + 2]) << 16)
-                      | (static_cast<std::uint32_t>(outFn.bytes[o + 3]) << 24);
-                    std::uint32_t const mask = (width >= 32u)
-                        ? 0xFFFFFFFFu
-                        : ((1u << width) - 1u);
-                    word = (word & ~(mask << lsb))
-                         | ((static_cast<std::uint32_t>(disp) & mask) << lsb);
-                    asm_byte_emit::writeU32LEAt(outFn.bytes, o, word);
-                    break;
-                }
+            // ── D-CSUBSET-LONG-BRANCH: ONE RESOLVER, ONE GEOMETRY ROW ───
+            //
+            // ★★★ THE `switch` THIS REPLACES CARRIED A SECOND COPY OF EVERY
+            // NUMBER IN `blockRelFieldGeometry`, AND NOTHING KEPT THE TWO IN
+            // STEP. The scan phase above was converted to read the table when
+            // relaxation landed; the resolver was not, so it still derived
+            // `lsb`/`width` from `isImm19 ? 5u : 0u` / `isImm19 ? 19u : 26u`
+            // and spelled the scale as a bare `>> 2` and x86's PC bias as a
+            // bare `+ 4`. Two components deciding the SAME field's shape from
+            // two sources is the N-transforms-on-one-value shape: correcting a
+            // width in the table would have moved the promotion boundary while
+            // the bytes kept landing at the old one, and the disagreement
+            // emits VALID INSTRUCTIONS WITH THE WRONG DISPLACEMENT — no
+            // diagnostic, no crash. The table is now the only source.
+            //
+            // ⚠ AND THE `switch` HAD NO `default`. A fourth `BlockRelPatchKind`
+            // matched no arm, left `patchOk` true, and shipped the four ZERO
+            // placeholder bytes the walker wrote — `B #0` (a branch to itself)
+            // on a fixed-width ISA, `rel32 = 0` on x86. The table's documented
+            // enum-drift backstop (an unknown kind yields a ZERO-WIDTH field,
+            // whose signed range is empty) was therefore INERT, because the
+            // component it protects never asked it. Reading the row makes the
+            // backstop live: a kind with no row now refuses every displacement
+            // loudly instead of silently writing none.
+            auto const g = walker_util::blockRelFieldGeometry(patch.kind);
+            std::int64_t const delta =
+                static_cast<std::int64_t>(it->second)
+              - (static_cast<std::int64_t>(patch.patchOffset)
+                 + static_cast<std::int64_t>(g.pcBias));
+            // A scaled field cannot represent a displacement that is not a
+            // multiple of its scale. On a fixed-width ISA that is a hard
+            // invariant (every block boundary is instruction-aligned), so a
+            // non-multiple delta means the block-offset table or the patch
+            // offset is corrupt; fail loud rather than silently drop the low
+            // bits. An UNSCALED field (x86 rel32, scaleLog2 = 0) has an empty
+            // mask, so this check never fires there — byte-identical to the
+            // arm it replaces, which did not perform it at all.
+            std::int64_t const alignMask =
+                (std::int64_t{1} << g.scaleLog2) - 1;
+            if ((delta & alignMask) != 0) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("intra-function branch in fn '{}' has "
+                                   "displacement {} which is not a multiple "
+                                   "of this field's scale ({} bytes) — block "
+                                   "offsets must be instruction-aligned "
+                                   "(D-AS3-BLOCK-REL-IMM19/26)",
+                                   outFn.symbol.v, delta, alignMask + 1));
+                patchOk = false;
+                break;
             }
-            if (!patchOk) break;
+            std::int64_t const disp = delta >> g.scaleLog2;  // arithmetic, signed
+            std::int64_t const lo = walker_util::blockRelFieldMin(g);
+            std::int64_t const hi = walker_util::blockRelFieldMax(g);
+            if (disp < lo || disp > hi) {
+                // ★★★ THE REMEDY IS CARRIED, NOT REMEMBERED. Both arms used to
+                // end with a fixed prescription — "for thunks" on x86, "for
+                // inverted-cond + long B thunks" on AArch64 — and the second
+                // one is WRONG for the wider of the two fields it served: an
+                // `Imm26` overflow cannot be rescued by a long `B`, because
+                // `B` IS the Imm26 form. Which case this is can only be
+                // answered by the OPCODE's own encoding variants, so the
+                // walker stamps the answer and the resolver quotes it.
+                bool const escapableInPrinciple = patch.widerFieldDeclared;
+                report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                       DiagnosticSeverity::Error,
+                       std::format("intra-function branch in fn '{}' needs "
+                                   "displacement {} (scaled by {}) which "
+                                   "exceeds its signed {}-bit field range "
+                                   "[{}..{}] — function body too large for "
+                                   "this branch's reach. {} "
+                                   "(anchor D-CSUBSET-LONG-BRANCH)",
+                                   outFn.symbol.v, disp, alignMask + 1,
+                                   g.width, lo, hi,
+                                   escapableInPrinciple
+                                     ? "This opcode DOES declare a wider "
+                                       "block-relative word, and this wire is "
+                                       "not the one the escape rescues: wire "
+                                       "it to the wider slot, or make it the "
+                                       "narrowest block-relative field of the "
+                                       "instruction so the election picks it"
+                                     : "This opcode declares NO self-contained "
+                                       "word carrying a wider block-relative "
+                                       "field. If the TARGET has one, "
+                                       "declaring that word on this opcode's "
+                                       "encoding row is the fix and the escape "
+                                       "election will find it; if this is "
+                                       "already the target's widest "
+                                       "block-relative field, no encoding row "
+                                       "can rescue it — the escape is then a "
+                                       "different ADDRESSING MODE (an indirect "
+                                       "branch through a materialized absolute "
+                                       "address), which needs a per-block "
+                                       "symbol the assembler cannot mint"));
+                patchOk = false;
+                break;
+            }
+            if (g.wholeField) {
+                // The displacement IS the four bytes at the patch site (x86
+                // rel32): write all 32 bits, no read-modify-write.
+                asm_byte_emit::writeU32LEAt(outFn.bytes, patch.patchOffset,
+                    static_cast<std::uint32_t>(static_cast<std::int32_t>(disp)));
+            } else {
+                // The displacement is a bit-window inside a 32-bit LE word:
+                // READ the word, replace only [lsb, lsb+width), write it back,
+                // so the opcode / cond-nibble / register bits already emitted
+                // into that word survive (a whole-word store would clobber
+                // them).
+                std::uint32_t const o = patch.patchOffset;
+                std::uint32_t word =
+                    static_cast<std::uint32_t>(outFn.bytes[o])
+                  | (static_cast<std::uint32_t>(outFn.bytes[o + 1]) << 8)
+                  | (static_cast<std::uint32_t>(outFn.bytes[o + 2]) << 16)
+                  | (static_cast<std::uint32_t>(outFn.bytes[o + 3]) << 24);
+                std::uint32_t const mask = (g.width >= 32u)
+                    ? 0xFFFFFFFFu
+                    : ((1u << g.width) - 1u);
+                word = (word & ~(mask << g.lsb))
+                     | ((static_cast<std::uint32_t>(disp) & mask) << g.lsb);
+                asm_byte_emit::writeU32LEAt(outFn.bytes, o, word);
+            }
+            // (The trailing `if (!patchOk) break;` this loop used to carry was
+            // the `switch`'s exit door: a failing arm's `break` left the SWITCH
+            // and needed a second one to leave the loop. Without the switch,
+            // every refusal above breaks the loop directly, so the re-test is
+            // unreachable — and an unreachable guard reads as a live one.)
         }
         if (!patchOk) {
             outFn.bytes.clear();

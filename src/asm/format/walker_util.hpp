@@ -34,6 +34,7 @@
 #include "lir/lir_pass_util.hpp"
 #include "lir/lir_reg.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <optional>
@@ -583,6 +584,30 @@ struct BlockRelPatch {
     // always had. The resolver never invents an escape — it only honours one
     // the config proved exists.
     bool relaxable = false;
+    // D-CSUBSET-LONG-BRANCH: does this patch's OPCODE declare, on any of its
+    // encoding variants, a self-contained word carrying a block-relative field
+    // that out-reaches THIS patch's own? Distinct from `relaxable`, which is
+    // additionally gated on this being the narrowest wire of the instruction —
+    // the escape rescues one wire, but the question of whether a wider field
+    // was declared at all is asked of every patch, and only the walker can
+    // answer it because only the walker sees the variants.
+    //
+    // It exists for ONE purpose: the out-of-range refusal must prescribe a
+    // remedy that can actually work. TRUE means a wider field IS declared on
+    // this opcode and this wire simply is not the one the escape rescues — a
+    // pure CONFIG gap. FALSE means the opcode declares no such word, which is
+    // where the two halves of D-CSUBSET-LONG-BRANCH part: either the TARGET
+    // has a wider field nobody declared here (still config), or this already
+    // IS the target's widest block-relative field and no encoding row can ever
+    // rescue it, because its escape is a different ADDRESSING MODE (an
+    // indirect branch through a materialized absolute address) needing a
+    // per-block symbol the assembler cannot mint. The refusal says both, and
+    // says WHICH is ruled out, rather than guessing at the one it cannot see.
+    //
+    // FALSE is the conservative default, so a walker that declares no escape
+    // vocabulary at all (`x86_variable`, whose widest block-relative slot is
+    // also its only one) is correct by construction rather than by remembering.
+    bool widerFieldDeclared = false;
     // D-CSUBSET-LONG-BRANCH: the LIR instruction this patch came from —
     // the STABLE IDENTITY across the relaxation re-encodes. `asm.cpp` stamps
     // it centrally over the patches a single `encodeInst` appended, so no
@@ -666,6 +691,27 @@ blockRelByteReach(BlockRelPatchKind kind) noexcept {
     auto const g = blockRelFieldGeometry(kind);
     return blockRelFieldMax(g) << g.scaleLog2;
 }
+
+// D-CSUBSET-LONG-BRANCH: how many kinds the enum declares. Used only to WALK
+// the ordinals, because the enum alone cannot be iterated and a kind added
+// without a `blockRelFieldGeometry` row would silently take the zero-width
+// backstop — an outcome that is safe (it refuses) but wants to be LOUD at
+// build time rather than discovered in a binary.
+// `AsmLongBranch.EveryBlockRelPatchKindHasAGeometryRow` is that ratchet.
+inline constexpr std::size_t kBlockRelPatchKindCount = 3;
+
+// ★★★ THE QUESTION "IS THERE A WIDER FIELD TO ESCAPE INTO" CANNOT BE ASKED OF
+// THIS TABLE, AND THE ATTEMPT IS RECORDED HERE BECAUSE IT LOOKED RIGHT.
+// ✔MEASURED 2026-09-16 (cycle P68 round 3, lane `cfgbr`) by a pin written
+// BEFORE the code it checks: a `blockRelWiderKindExists(kind)` that scanned
+// every row for a greater `blockRelByteReach` answered TRUE for `Arm64Imm26`,
+// because `X86Rel32` (±2 GiB) out-reaches it (±128 MiB) — IN A DIFFERENT ISA.
+// The table is a vocabulary of every shape the assembler knows, not of one
+// target's, so a table-wide maximum is a cross-ISA leak: it would have told a
+// reader whose arm64 `B` overflowed to go declare a wider word that AArch64
+// does not have. The question is therefore asked where it can be answered —
+// of the OPCODE's own encoding variants, by `electEscapeWord` — and its answer
+// rides to the resolver on `BlockRelPatch::widerFieldDeclared`.
 
 // D-CSUBSET-COMPUTED-GOTO (`&&label` block-address materialization):
 // a pending SYNTHETIC-SYMBOL ↔ BLOCK binding accumulated by an encoder

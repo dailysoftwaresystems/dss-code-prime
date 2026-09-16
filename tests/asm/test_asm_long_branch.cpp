@@ -426,3 +426,227 @@ TEST(AsmLongBranch, TheWidestBlockRelativeFieldHasNoWiderFieldToEscapeInto) {
         << "rel32 must be the widest field in the table — if some kind "
            "out-reaches it, the x86 arm has an escape it is not taking";
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// THE GEOMETRY TABLE IS THE ONLY SOURCE, AND THESE ARMS MEASURE THAT.
+// ─────────────────────────────────────────────────────────────────────────
+//
+// ★★★ WHAT THESE ADD THAT THE ARMS ABOVE COULD NOT SEE. Relaxation converted
+// the SCAN phase and the escape election to read `blockRelFieldGeometry`, and
+// the row that shipped it claimed the table was read by the range check, the
+// patch write and the escape election alike. THE PATCH WRITE WAS NOT: the
+// resolver kept deriving lsb and width from a CPU-named ternary, and spelled
+// the scale as a bare shift and x86's PC bias as a bare addition. Two
+// components deciding one field's shape from two sources agree only by review
+// — and when they stop agreeing the output is a VALID INSTRUCTION WITH THE
+// WRONG DISPLACEMENT, which no assertion about diagnostics can catch. The arms
+// below tie the RESOLVED BYTES to the table's own numbers, on both ISAs, so the
+// two cannot drift apart again without something going red.
+
+// Every kind in the enum must have a geometry row. This is the ratchet on the
+// one drift the table cannot catch itself: a kind added to the enum and not to
+// `blockRelFieldGeometry` takes the zero-width backstop, which is SAFE (an
+// empty signed range refuses every displacement) but wants to be loud here
+// rather than discovered by a function that will not assemble.
+TEST(AsmLongBranch, EveryBlockRelPatchKindHasAGeometryRow) {
+    using walker_util::BlockRelPatchKind;
+    for (std::size_t i = 0; i < walker_util::kBlockRelPatchKindCount; ++i) {
+        auto const g =
+            walker_util::blockRelFieldGeometry(static_cast<BlockRelPatchKind>(i));
+        EXPECT_NE(g.width, 0u)
+            << "BlockRelPatchKind ordinal " << i << " has no row in "
+               "`blockRelFieldGeometry` — it would take the zero-width "
+               "backstop and refuse EVERY displacement. Add its row.";
+    }
+}
+
+// ⚠ THE TABLE SPANS ISAs, SO ITS MAXIMUM IS NOT ANY TARGET'S MAXIMUM — and
+// this arm exists because a first draft of the refusal's advice read it that
+// way. `X86Rel32` out-reaches `Arm64Imm26`, so "some row reaches further than
+// mine" is TRUE for the widest field AArch64 has, and an advice line derived
+// from it would have told a reader to declare a wider word that the ISA does
+// not have. The reach ordering pinned above is a fact about the TABLE; whether
+// a wider field can be DECLARED is a fact about one opcode's encoding row, and
+// only the walker can see that. This pins the distinction so the two do not get
+// confused again.
+TEST(AsmLongBranch, TheTablesWidestReachSpansISAsAndIsNotATargetsCeiling) {
+    using walker_util::BlockRelPatchKind;
+    using walker_util::blockRelByteReach;
+    EXPECT_GT(blockRelByteReach(BlockRelPatchKind::X86Rel32),
+              blockRelByteReach(BlockRelPatchKind::Arm64Imm26))
+        << "if these ever compare equal, the cross-ISA leak this arm records "
+           "stops being observable and the next author will re-introduce it";
+}
+
+// ★★★ THE RESOLVED FIELD LANDS WHERE THE TABLE SAYS, NOT WHERE THE RESOLVER
+// REMEMBERS. The control arm above pins six words byte-for-byte against the ARM
+// ARM; this arm pins the same kind of word against the TABLE's own `lsb`,
+// `width`, `scaleLog2` and `pcBias`, so the two spellings of one fact are
+// checked against each other. A resolver that writes at a position the table
+// does not name reds here.
+TEST(AsmLongBranch, Arm64ResolvedFieldLandsAtTheGeometryTablesOwnBitWindow) {
+    Arm64Kit const kit = loadArm64Kit();
+    ASSERT_NE(kit.schema, nullptr);
+
+    LirBuilder b{*kit.schema};
+    (void)b.addFunction(SymbolId{1});
+    LirBlockId const header = b.createBlock();
+    LirBlockId const body   = b.createBlock();
+    LirBlockId const exit   = b.createBlock();
+    b.beginBlock(header);
+    {
+        std::array<LirOperand, 2> jccOps{LirOperand::makeBlockRef(body.v),
+                                         LirOperand::makeBlockRef(exit.v)};
+        (void)b.addCondBr(kit.jccOp, jccOps, body, exit,
+                          static_cast<std::uint32_t>(TargetCondCode::Sgt));
+    }
+    b.beginBlock(body);
+    {
+        std::array<LirOperand, 2> subOps{LirOperand::makeReg(kit.x0),
+                                         LirOperand::makeReg(kit.x0)};
+        (void)b.addInst(kit.subOp, kit.x0, subOps);
+        (void)b.addBr(kit.jmpOp, exit);
+    }
+    b.beginBlock(exit);
+    (void)b.addReturn(kit.retOp, {});
+
+    Lir lir = std::move(b).finish();
+    std::vector<MirInstId> lirToMir(lir.instCount(), InvalidMirInst);
+    DiagnosticReporter rep;
+    auto mod = assemble(lir, *kit.schema, lirToMir, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(mod.functions.empty());
+    auto const& bytes = mod.functions[0].bytes;
+    auto const& offs  = mod.functions[0].blockByteOffsets;
+    ASSERT_GE(bytes.size(), 8u);
+
+    auto offsetOf = [&](LirBlockId blk) -> std::int64_t {
+        auto it = offs.find(blk.v);
+        EXPECT_NE(it, offs.end());
+        return it == offs.end() ? -1 : static_cast<std::int64_t>(it->second);
+    };
+    // Read the field out of the emitted word USING THE TABLE, and compare it to
+    // the displacement the table's OWN formula demands. The two agree only if
+    // the resolver consulted the same row.
+    auto fieldAt = [&](walker_util::BlockRelPatchKind kind,
+                       std::uint32_t patchOffset) -> std::int64_t {
+        auto const g = walker_util::blockRelFieldGeometry(kind);
+        std::uint32_t const mask =
+            (g.width >= 32u) ? 0xFFFFFFFFu : ((1u << g.width) - 1u);
+        return signExtend((wordAt(bytes, patchOffset) >> g.lsb) & mask,
+                          g.width);
+    };
+    auto expectedDisp = [&](walker_util::BlockRelPatchKind kind,
+                            std::uint32_t patchOffset,
+                            LirBlockId target) -> std::int64_t {
+        auto const g = walker_util::blockRelFieldGeometry(kind);
+        return (offsetOf(target)
+                - (static_cast<std::int64_t>(patchOffset) + g.pcBias))
+               >> g.scaleLog2;
+    };
+    using walker_util::BlockRelPatchKind;
+    EXPECT_EQ(fieldAt(BlockRelPatchKind::Arm64Imm19, 0),
+              expectedDisp(BlockRelPatchKind::Arm64Imm19, 0, body))
+        << "the B.cond's Imm19 is not at the table's [lsb, lsb+width) window, "
+           "or does not carry the table's own (target - pc) >> scale";
+    EXPECT_EQ(fieldAt(BlockRelPatchKind::Arm64Imm26, 4),
+              expectedDisp(BlockRelPatchKind::Arm64Imm26, 4, exit))
+        << "the trailing B's Imm26 is not at the table's window";
+    // ⚠ AND THE BITS OUTSIDE THE WINDOW MUST BE UNTOUCHED. A whole-word store
+    // would clobber the opcode and the cond nibble into a DIFFERENT valid
+    // instruction, which is why the table carries `wholeField` at all.
+    std::uint32_t const outsideMask =
+        ~(((1u << 19) - 1u) << 5);  // ARM ARM: B.cond's imm19 is bits 5..23
+    auto nib = kit.schema->condCodeEncoding(TargetCondCode::Sgt);
+    ASSERT_TRUE(nib.has_value());
+    EXPECT_EQ(wordAt(bytes, 0) & outsideMask,
+              (0x54000000u | static_cast<std::uint32_t>(*nib)))
+        << "the read-modify-write disturbed a bit outside the field window";
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// THE x86 ARM OF THE SAME RESOLVER — this file's first byte pin on it.
+// ─────────────────────────────────────────────────────────────────────────
+//
+// ⚠ THIS FILE PINNED ONLY AArch64 UNTIL NOW, AND THE RESOLVER IS SHARED. The
+// two ISAs used to reach it through two hand-written `switch` arms, so an
+// AArch64-only fixture could not see an x86 regression at all; they now reach
+// it through ONE body parameterized by a geometry row, and an x86 pin is what
+// proves the unification did not move the other ISA. Thirteen bytes, every one
+// of them an Intel SDM fact, with the two rel32 fields additionally tied to the
+// table's `pcBias` so a change to it cannot pass unobserved.
+TEST(AsmLongBranch, X86BlockRelativeBranchesResolveThroughTheSameGeometryRow) {
+    auto sOpt = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(sOpt.has_value());
+    auto const& s = **sOpt;
+    auto opc = [&](char const* m) {
+        auto o = s.opcodeByMnemonic(m);
+        EXPECT_TRUE(o.has_value()) << "x86_64 missing opcode '" << m << "'";
+        return o.value_or(0);
+    };
+    std::uint16_t const jccOp = opc("jcc");
+    std::uint16_t const retOp = opc("ret");
+
+    LirBuilder b{s};
+    (void)b.addFunction(SymbolId{1});
+    LirBlockId const head  = b.createBlock();
+    LirBlockId const taken = b.createBlock();
+    LirBlockId const fall  = b.createBlock();
+    b.beginBlock(head);
+    {
+        std::array<LirOperand, 2> ops{LirOperand::makeBlockRef(taken.v),
+                                      LirOperand::makeBlockRef(fall.v)};
+        (void)b.addCondBr(jccOp, ops, taken, fall,
+                          static_cast<std::uint32_t>(TargetCondCode::Sgt));
+    }
+    b.beginBlock(taken);
+    (void)b.addReturn(retOp, {});
+    b.beginBlock(fall);
+    (void)b.addReturn(retOp, {});
+
+    Lir lir = std::move(b).finish();
+    std::vector<MirInstId> lirToMir(lir.instCount(), InvalidMirInst);
+    DiagnosticReporter rep;
+    auto mod = assemble(lir, s, lirToMir, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(mod.functions.empty());
+    auto const& bytes = mod.functions[0].bytes;
+
+    //   [+0x00] 0F 8F 05 00 00 00   jg  .taken    rel32 = 11 - (2+4) = 5
+    //   [+0x06] E9    01 00 00 00   jmp .fall     rel32 = 12 - (7+4) = 1
+    //   [+0x0B] C3                  ret           <- .taken
+    //   [+0x0C] C3                  ret           <- .fall
+    // `0F 8F` is `jg` (SDM 0F 8x, cc = F for G/NLE); `E9` the near `jmp`.
+    static constexpr std::array<std::uint8_t, 13> kExpected{
+        0x0Fu, 0x8Fu, 0x05u, 0x00u, 0x00u, 0x00u,
+        0xE9u, 0x01u, 0x00u, 0x00u, 0x00u,
+        0xC3u, 0xC3u};
+    ASSERT_EQ(bytes.size(), kExpected.size())
+        << "the jcc compound is 11 bytes and each `ret` one — a different "
+           "total means the encoder selected another variant";
+    for (std::size_t i = 0; i < kExpected.size(); ++i)
+        EXPECT_EQ(bytes[i], kExpected[i])
+            << "byte " << i << " diverged from the SDM encoding";
+
+    // The same two displacements, recomputed from the TABLE. If `pcBias` or
+    // `wholeField` moves, the literals above and this recomputation part ways
+    // — which is the whole point of stating one fact two ways.
+    auto const g = walker_util::blockRelFieldGeometry(
+        walker_util::BlockRelPatchKind::X86Rel32);
+    EXPECT_TRUE(g.wholeField)
+        << "rel32 IS the four bytes at the patch site; a read-modify-write "
+           "path here would depend on placeholder bytes it must not read";
+    auto const& offs = mod.functions[0].blockByteOffsets;
+    auto rel32At = [&](std::uint32_t patchOffset) -> std::int64_t {
+        return static_cast<std::int32_t>(wordAt(bytes, patchOffset));
+    };
+    auto offsetOf = [&](LirBlockId blk) -> std::int64_t {
+        auto it = offs.find(blk.v);
+        EXPECT_NE(it, offs.end());
+        return it == offs.end() ? -1 : static_cast<std::int64_t>(it->second);
+    };
+    EXPECT_EQ(rel32At(2), offsetOf(taken) - (2 + g.pcBias))
+        << "the conditional's rel32 is not the table's (target - (pc + bias))";
+    EXPECT_EQ(rel32At(7), offsetOf(fall) - (7 + g.pcBias))
+        << "the fallthrough jmp's rel32 is not the table's formula";
+}

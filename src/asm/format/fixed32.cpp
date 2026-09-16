@@ -387,16 +387,32 @@ bool encode(Lir const&                  lir,
             narrowReach   = reach;
         }
     }
+    // The widest self-contained escape word this OPCODE declares ANYWHERE in
+    // its variants, unfiltered. Two different questions read it: whether THIS
+    // instruction escapes (below, after the strictly-wider test), and whether
+    // a wider field was declared at all — which each patch carries to the
+    // resolver so an out-of-range refusal can prescribe a remedy that exists.
+    // ⚠ Guarded by `narrowWireIdx`, because the election scans every variant
+    // of the opcode and the overwhelming majority of instructions carry no
+    // block-relative wire at all. This stays off their path.
+    std::optional<EscapePlan> declaredEscape;
+    if (narrowWireIdx.has_value()) declaredEscape = electEscapeWord(*info);
     std::optional<EscapePlan> escape;
-    if (narrowWireIdx.has_value()) {
-        auto const candidate = electEscapeWord(*info);
+    if (declaredEscape.has_value()) {
         // An escape must reach STRICTLY further than the field it rescues.
         // The widest block-relative slot rescuing ITSELF is not an escape —
         // that is the arm64 `B` (Imm26) case and the x86 rel32 case, and
         // both correctly keep the refusal.
-        if (candidate.has_value() && candidate->byteReach > narrowReach)
-            escape = candidate;
+        if (declaredEscape->byteReach > narrowReach)
+            escape = declaredEscape;
     }
+    // Does the opcode declare a word out-reaching the field `kind` names?
+    auto const widerDeclaredThan =
+        [&](walker_util::BlockRelPatchKind kind) {
+            return declaredEscape.has_value()
+                && declaredEscape->byteReach
+                       > walker_util::blockRelByteReach(kind);
+        };
     // Is THIS instruction promoted? `relaxedInsts` is sorted and almost
     // always empty, so the common path is one comparison against `.empty()`
     // inside `binary_search`.
@@ -742,6 +758,11 @@ bool encode(Lir const&                  lir,
         // its field runs out of reach? Carried to the resolver on the
         // `BlockRelPatch` so the fixed point never has to re-derive it.
         bool                              relaxable;
+        // D-CSUBSET-LONG-BRANCH: and, separately, did the opcode declare a
+        // wider field AT ALL — the fact the out-of-range refusal needs to
+        // prescribe a remedy that exists. See `BlockRelPatch` for why the two
+        // are not the same question.
+        bool                              widerFieldDeclared;
     };
     std::vector<PendingBlockPatch> pendingBlockPatches;
     for (auto const& wire : selected->wires) {
@@ -934,7 +955,8 @@ bool encode(Lir const&                  lir,
                 pendingBlockPatches.push_back(PendingBlockPatch{
                     srcOp.blockSlot, escape->kind,
                     static_cast<std::uint8_t>(escapeWordIdx),
-                    /*relaxable=*/false});
+                    /*relaxable=*/false,
+                    /*widerFieldDeclared=*/widerDeclaredThan(escape->kind)});
                 continue;
             }
             wroteSlot[wire.wordIndex][slotIdx] = true;
@@ -944,7 +966,8 @@ bool encode(Lir const&                  lir,
                 // declares a wider one can escape. Every other patch keeps
                 // the loud out-of-range refusal — including the wide field
                 // itself, whose own overflow has nowhere further to go.
-                /*relaxable=*/isNarrowWire && escape.has_value()});
+                /*relaxable=*/isNarrowWire && escape.has_value(),
+                /*widerFieldDeclared=*/widerDeclaredThan(patchKind)});
         } else if (srcOp.kind == LirOperandKind::ImmInt) {
             // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: the shifted-imm12
             // word-pair slot. The callconv's prologue/epilogue `sub/add
@@ -1568,7 +1591,8 @@ bool encode(Lir const&                  lir,
                     static_cast<std::uint32_t>(out.size()),
                     bp.targetBlock,
                     bp.kind,
-                    bp.relaxable});
+                    bp.relaxable,
+                    bp.widerFieldDeclared});
             }
         }
         asm_byte_emit::appendU32LE(out, words[i]);
