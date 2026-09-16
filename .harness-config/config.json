@@ -385,9 +385,13 @@
         "linux": {
           "manager": "apt",
           "id": "tcl"
+        },
+        "macos": {
+          "manager": "brew",
+          "id": "tcl-tk"
         }
       },
-      "why": "the sqlite corpus's testfixture TCL suite; tclsh also decides which Tcl header the corpus build compiles against"
+      "why": "the sqlite corpus's testfixture TCL suite; tclsh also decides which Tcl header the corpus build compiles against. The unversioned formula deliberately, not tcl-tk@8: the corpus reads tclConfig.sh and supports Tcl 9, and the versioned formulae are keg-only, so their tclsh lands under /opt/homebrew/opt/<formula>/bin where neither the PATH nor the resolver's searched directories reach it. Finding a tclsh is not the same as knowing which Tcl a leg builds against - on macOS the name resolves to the system 8.5.9 while the corpus links Homebrew's 9.x - so the location belongs to the runner, not to this entry"
     },
     {
       "name": "qemu-aarch64",
