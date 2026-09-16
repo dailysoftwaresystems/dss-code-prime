@@ -273,6 +273,30 @@ id_ed25519
 # before the tool has ever run.
 /.harness-config/*
 !/.harness-config/config.json
+
+# ★ THE PLACEHOLDERS ARE TRACKED SO THE DIRECTORIES SURVIVE A CLONE. git stores no
+# directory, so without these a fresh checkout has nowhere to put its connection
+# data and nothing says the slots exist — the tool's `init` creates each directory
+# WITH its `.gitkeep`, and the rule above would then ignore the placeholder it just
+# wrote. Contents are excluded rather than the directory, because git cannot
+# re-include a file whose parent directory is itself excluded.
+# ⚠ The negation names ONE file. `sshItems/*` still excludes every per-host
+# directory and everything inside it — a key, an address, a user — and a `.gitkeep`
+# deeper down is not what `!/.harness-config/sshItems/.gitkeep` matches.
+# ⚠ THE WORKTREES ROOT IS DELIBERATELY NOT IN THIS LIST. `worktrees.root` is
+# `.worktrees`, resolved against the checkout root and ignored as a DIRECTORY by
+# the rule above — which is what four guards assert with
+# `git check-ignore -q -- '.worktrees/'` and what keeps N lane checkouts off every
+# gate host. Excluding its contents instead, the shape used here, would answer
+# NOT-IGNORED for the directory and refuse every carriage. It needs no placeholder:
+# `lane-worktree` creates it.
+!/.harness-config/sshItems/
+/.harness-config/sshItems/*
+!/.harness-config/sshItems/.gitkeep
+!/.harness-config/wslDistros/
+/.harness-config/wslDistros/*
+!/.harness-config/wslDistros/.gitkeep
+
 !/.harness-config/runner/
 /.harness-config/runner/*
 !/.harness-config/runner/actions/
