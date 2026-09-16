@@ -2646,7 +2646,7 @@ TEST(LirRegAllocCoalesce, ParameterIsPreColoredIntoItsIncomingArgRegister) {
 }
 
 TEST(LirRegAllocCoalesce, ComputedOutgoingArgumentIsPreColoredIntoItsArgRegister) {
-    // D-ML7-2.5, the USE side — the mirror of
+    // D-PLAN12-REGALLOC-PRE-COLORING-HINT-FOR-ARG-CALL-ARG, the USE side — the mirror of
     // `ParameterIsPreColoredIntoItsIncomingArgRegister`, and the half that had
     // been withheld.
     //

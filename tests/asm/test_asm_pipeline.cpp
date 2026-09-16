@@ -52,7 +52,7 @@ assembleEndToEnd(test_support::LoweredLir& lowered,
     // legalize pass freshly minted. The pipeline test verifies
     // shape invariants, not source-map fidelity (that comes when
     // legalize threads its own lirToMir-equivalent through —
-    // anchored at plan 12 §3.1 D-ML3-2.1 MirSourceMap IOU).
+    // anchored at plan 12 §3.1 D-PLAN12-MIRSOURCEMAP-INJECTION-SLOT-MIRVERIFIER-CYCLE-STASHES-NODE-ACTUAL MirSourceMap IOU).
     return assemble(legal.lir, *lowered.target, lirToMir, rep);
 }
 

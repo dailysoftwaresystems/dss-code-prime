@@ -4,7 +4,7 @@
 // need to exercise specific MIR opcodes the c frontend doesn't
 // emit naturally (e.g. bitwise/float arithmetic, reverse Bitcast,
 // liveness-shape probes). Promoted to a shared header in ML6 cycle 1
-// (cycle-3e deferral D-3e.7) so multiple test binaries — `test_mir_to_lir`
+// (cycle-3e deferral D-PLAN12-BUILDSYNTHETICFN-TEST-HELPER-PROMOTION-LIFT-FROM-TESTS-LIR) so multiple test binaries — `test_mir_to_lir`
 // and `test_lir_liveness` — share the same harness.
 //
 // Lives in `tests/lir/` so it's available only to the LIR test binaries

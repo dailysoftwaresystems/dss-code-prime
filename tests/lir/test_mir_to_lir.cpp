@@ -2676,7 +2676,7 @@ TEST(MirToLir, WideLiteralRoutesThroughLiteralPool) {
 // ─── cycle 3d: bitwise + float arithmetic + cross-class Bitcast ──────────
 //
 // `SyntheticFn` / `buildSyntheticFn` were promoted to `synthetic_fn.hpp`
-// (ML6 cycle 1, cycle-3e deferral D-3e.7) so the new
+// (ML6 cycle 1, cycle-3e deferral D-PLAN12-BUILDSYNTHETICFN-TEST-HELPER-PROMOTION-LIFT-FROM-TESTS-LIR) so the new
 // `test_lir_liveness` binary can share the same harness. The shared
 // namespace is `dss::test_support` (not `dss::testing` — gtest already
 // owns the `::testing` namespace and `using namespace dss;` would
@@ -2895,7 +2895,7 @@ TEST(MirToLir, BitcastCrossClassFprToGprUsesTheDeclaredPairMove) {
 }
 
 TEST(MirToLir, BitcastCrossClassGprToFprUsesTheDeclaredPairMove) {
-    // The reverse direction (cycle-3e deferral D-3e.8 folded ML6 cycle 1).
+    // The reverse direction (cycle-3e deferral D-PLAN12-REVERSE-BITCAST-I64-F64-TEST-CURRENTLY-ONLY-F64 folded ML6 cycle 1).
     // ★ IT IS A SEPARATE OPCODE ON BOTH TARGETS AND DELIBERATELY SO: the
     // encoding-variant guard keys only on (operandKinds, width) and both
     // directions are `reg` at the same width, so one opcode carrying both
@@ -4186,7 +4186,7 @@ TEST(MirToLir, DirectCallEmitsCallOpcode) {
 
     auto const leaOp  = *sch.opcodeByMnemonic("lea");
     auto const callOp = *sch.opcodeByMnemonic("call");
-    // D-ML7-2.9 (dead-callee-LEA suppression): a DIRECT call's callee is modeled
+    // D-PLAN12-CLOSED-2026-C50-DEAD-CALLEE-ADDRESS-LEA-SUPPRESSED (dead-callee-LEA suppression): a DIRECT call's callee is modeled
     // as a standalone GlobalAddr(f). `lowerCall` folds f's SymbolId straight into
     // the `call` (a SymbolRef operand) and NEVER reads the GlobalAddr's lea vreg,
     // so `globalAddrFoldsIntoDirectCall` now SUPPRESSES that lea (previously it was
@@ -4216,7 +4216,7 @@ TEST(MirToLir, DirectCallEmitsCallOpcode) {
     // RED-ON-DISABLE: revert `globalAddrFoldsIntoDirectCall` → the dead callee lea
     // reappears → this EXPECT_FALSE fails.
     EXPECT_FALSE(foundGlobalAddrLea)
-        << "the dead GlobalAddr(f) callee LEA must be SUPPRESSED (D-ML7-2.9) — "
+        << "the dead GlobalAddr(f) callee LEA must be SUPPRESSED (D-PLAN12-CLOSED-2026-C50-DEAD-CALLEE-ADDRESS-LEA-SUPPRESSED) — "
            "lowerCall folds the symbol straight into the direct call";
     EXPECT_TRUE(foundCall) << "Call must emit the `call` opcode";
     EXPECT_TRUE(callFoldsCalleeSymbol)

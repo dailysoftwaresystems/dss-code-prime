@@ -514,7 +514,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         return std::unexpected(std::move(coll).release());
     }
     data.name = format.at("name").get<std::string>();
-    // Cross-tier symmetry with `target.name` (D-LK6-8.2 post-fold #2
+    // Cross-tier symmetry with `target.name` (D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET post-fold #2
     // architect Q3): `format.name` is the label every walker
     // diagnostic message uses. An empty or whitespace-only name
     // would produce unintelligible diagnostics silently. The same

@@ -268,7 +268,7 @@ computeFrameLayout(LirFuncAllocation const& alloc,
     // makes (`stackProbePageBytes > 0 && totalFrameSize > it`) WITHOUT
     // re-consulting the cc — the config value that already lives here.
     layout.stackProbePageBytes = cc.stackProbePageBytes;
-    // D-ML7-2.2 + D-ML7-2.6 (co-closed 2026-06-02): outgoingArgAreaSize
+    // D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 + D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7 (co-closed 2026-06-02): outgoingArgAreaSize
     // is THIS function's reserved space for ITS calls. Encompasses
     // BOTH the callee's shadow space (Win64=32, SysV=0; reserved
     // unconditionally when hasCalls) AND any explicit stack-arg
@@ -597,7 +597,7 @@ functionLocalAllocaPayloads(Lir const& src, LirFuncId fn,
     return payloads;
 }
 
-// D-ML7-2.2 (closed co-with-D-ML7-2.6, 2026-06-02): compute the
+// D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 (closed co-with-D-ML7-2.6, 2026-06-02): compute the
 // maximum number of stack-passed-arg slots ACROSS all call sites in
 // `fn`. The function's prologue must reserve enough outgoing-args
 // area to accommodate the WIDEST call (any call with more args than
@@ -1295,7 +1295,7 @@ void emitPrologue(LirBuilder& b, FrameLayout const& layout,
                                       framedCfaOffset});
         }
     }
-    // D-ML7-2.2 audit-fold (2026-06-02 silent-failure CRITICAL C1):
+    // D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 audit-fold (2026-06-02 silent-failure CRITICAL C1):
     // saved regs sit at [SP + savedRegAreaOffset() + i*slotSize),
     // NOT [SP + i*slotSize). The new outgoing-args area pushes saved
     // regs upward by `outgoingArgAreaSize` bytes. Pre-fold the
@@ -1996,7 +1996,7 @@ argPassingRegister(TargetSchema const&            schema,
                DiagnosticSeverity::Error,
                std::format("{}: arg index {} requires stack passing "
                            "(cc '{}' has only {} {} arg-passing registers); "
-                           "stack-passed args are anchored at D-ML7-2.2",
+                           "stack-passed args are anchored at D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7",
                            contextLabel, index, cc.name, pool->size(),
                            lirRegClassName(cls)));
         return std::nullopt;
@@ -2372,7 +2372,7 @@ indirectResultReg(TargetSchema const& schema, TargetCallingConvention const& cc,
 // (e.g. the two eightbytes of a {long,long} return landing cross-wise in rax/rdx,
 // or a 3-/4-FPR AAPCS64 HFA return cycle — FC7 C3; or a caller-side arg-passing
 // permutation such as a 2-swap `f(y,x)` or an N-way rotation across the FP arg
-// registers — D-ML7-2.3) is broken with a scratch register. The scratch-break
+// registers — D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS) is broken with a scratch register. The scratch-break
 // linearizes a cycle of ANY length through ONE scratch (it redirects all readers of
 // one source to the scratch, freeing that source so the progress scan drains the
 // resulting chain), reused across disjoint cycles as `moves` shrinks;
@@ -2389,7 +2389,7 @@ emitParallelRegMoves(LirBuilder& b, TargetSchema const& schema,
                      std::span<std::uint16_t const> reserved,
                      std::string_view ctx, DiagnosticReporter& reporter,
                      MemSrcLoadCtx const& memCtx = {}) {
-    // D-ML7-2.3 scratch-collapse fix: every parallel-move destination holds a
+    // D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS scratch-collapse fix: every parallel-move destination holds a
     // COMMITTED value that must survive intact until the following `call` — an
     // emitted move's destination now carries its final argument; an IDENTITY
     // move's destination (dst==src) carries an incoming argument already in
@@ -2498,7 +2498,7 @@ emitParallelRegMoves(LirBuilder& b, TargetSchema const& schema,
         if (progressed) continue;
         // Only cycles remain. Break ONE cycle per outer iteration; the break
         // generalizes to any cycle length (FC7 C3 raised this from the SysV-only
-        // ≤2-piece gate — a 3-/4-FPR HFA return can form a ≥3-cycle; D-ML7-2.3
+        // ≤2-piece gate — a 3-/4-FPR HFA return can form a ≥3-cycle; D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS
         // extends it to caller-side arg permutations): copy one member's source
         // aside, then redirect every reader of that source to the scratch — freeing
         // the source register so a safe move opens up next iteration, and the
@@ -2905,7 +2905,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
         }
         if (!alreadySaved) usedSaved.push_back(fp);
     }
-    // D-ML7-2.2: pre-scan call sites for the maximum stack-arg
+    // D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7: pre-scan call sites for the maximum stack-arg
     // overflow across all calls. The prologue reserves enough
     // outgoing-arg-area bytes for the widest call.
     std::uint32_t const outgoingArgSlots = hasCalls
@@ -3248,7 +3248,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             // param into the regalloc-chosen home — or skip when
             // regalloc happened to pick the source reg itself (no-op).
             //
-            // D-ML7-2.2 + D-ML7-2.6 closure (2026-06-02): when the
+            // D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 + D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7 closure (2026-06-02): when the
             // arg index overflows the register pool, the arg lives in
             // the caller's outgoing-args area on the stack. The
             // callee reads it via `frame_load result, [sp +
@@ -3267,13 +3267,13 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             // resident when slot < poolSize, else stack-resident.
             // Independent counters (SysV/AAPCS64): payload IS the
             // per-class index. HIR→MIR emits each param/struct-piece Arg
-            // with a monotonic per-class counter (D-ML7-2.10 ✅ CLOSED by
+            // with a monotonic per-class counter (D-PLAN12-CLOSED-2026-FC7-C1B-COMMIT-B7F547D-FIXED-VIA ✅ CLOSED by
             // FC7 C1b — the mixed-class latent gap is fixed: a scalar
             // param's payload is now its per-class index, not the param
             // index, so an int-then-float-then-int signature lands the
             // float in xmm0, not xmm1).
             //
-            // A future regalloc pre-coloring hint (D-ML7-2.5) would
+            // A future regalloc pre-coloring hint (D-PLAN12-REGALLOC-PRE-COLORING-HINT-FOR-ARG-CALL-ARG) would
             // eliminate most register-resident movs by pre-pinning
             // the param vreg to its cc arg reg; for v1 correctness,
             // the unconditional mov is the right shape.
@@ -3821,7 +3821,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             // RESOLVED, not refused: `emitParallelRegMoves` emits the
             // acyclic part in dependency order and breaks each cycle
             // with a scratch drawn from `cc.callerSaved`. That is
-            // `D-ML7-2.3`, closed in c76; the v1 O(N^2) detector this
+            // `D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS`, closed in c76; the v1 O(N^2) detector this
             // sentence used to describe was deleted with it.
             // `L_MoveCycleUnsupported` survives as the resolver's own
             // fail-loud backstop — see `pickScratchReg`.
@@ -3964,7 +3964,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                        "prepended at operand 1)", inst.v));
                     return false;
                 }
-                // D-ML7-2.6: under slot-aligned cc (Win64 ms_x64),
+                // D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7: under slot-aligned cc (Win64 ms_x64),
                 // each arg consumes one shared slot index regardless
                 // of class. Under independent counters (SysV/AAPCS64),
                 // gpr/fpr counters advance separately.
@@ -4252,7 +4252,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                        "already removed", inst.v, argRegionIdx));
                             return false;
                         }
-                        // D-ML7-2.2 stack-arg overflow: spill srcReg
+                        // D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 stack-arg overflow: spill srcReg
                         // into THIS fn's outgoing-args area at
                         // [sp + shadowSpaceBytes + the cursor's byte offset].
                         // Stack stores are emitted BEFORE register
@@ -4284,7 +4284,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // own EARLIER arg-move before this LATER move overwrites x8 (safe);
                 // a genuine cross-dependency (the sret ptr parked in an arg-dest reg
                 // an arg-move overwrites, or vice-versa) trips the same loud
-                // L_MoveCycleUnsupported the arg path already uses (D-ML7-2.3) —
+                // L_MoveCycleUnsupported the arg path already uses (D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS) —
                 // never a silent clobber. R is a real Call operand ⇒ regalloc keeps
                 // it live to here (no post-regalloc dangling).
                 if (hasIrr) {
@@ -4305,7 +4305,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     }
                     argMoves.push_back({*irr, sretOp.reg});
                 }
-                // D-ML7-2.3 (closed): the arg-passing register moves are a
+                // D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS (closed): the arg-passing register moves are a
                 // PARALLEL COPY — every source must be read at its pre-call value
                 // before any destination overwrites it. regalloc can pin sources
                 // to registers that are ALSO destinations (a permutation), forming
@@ -4409,7 +4409,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         }
                     }
                 }
-                // D-ML7-2.2 (closed 2026-06-02): emit stack-arg
+                // D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 (closed 2026-06-02): emit stack-arg
                 // stores FIRST, before any register move. The
                 // stack-store reads its src reg; if a later register
                 // move would have written to that reg, the store
@@ -4562,7 +4562,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         }
                     }
                 }
-                // D-ML7-2.3: emit the arg-passing register moves as a PARALLEL COPY
+                // D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS: emit the arg-passing register moves as a PARALLEL COPY
                 // — orderable moves in dependency order, each remaining cycle broken
                 // with a class-correct scratch register (FC2 Part B: every move's
                 // mnemonic follows its class, so an FPR cycle breaks through an FPR

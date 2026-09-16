@@ -144,8 +144,8 @@ struct UnsuppressableEntry {
 // the single source of truth):
 //   - Permanent architectural exclusions / wrong-machine-code
 //     surfaces: D_TargetAbiModelUnsupportedByDriver,
-//     D_TargetMachineCodeMismatch (D-LK6-8.2 SIGILL),
-//     D_TargetAbiModelMismatch (D-LK6-8.2 SIGILL),
+//     D_TargetMachineCodeMismatch (D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET SIGILL),
+//     D_TargetAbiModelMismatch (D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET SIGILL),
 //     F_FfiIngestAbiModelUnsupported, F_FfiIngestEmptyCanonical,
 //     H_ExternHasInitializer.
 //   - Pending-plan announcement (suppressing misleads the user):

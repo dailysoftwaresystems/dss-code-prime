@@ -1308,7 +1308,7 @@ struct DSS_EXPORT TargetCallingConvention {
     // would silently skip a guard page and reintroduce the crash.
     std::uint16_t stackProbePageBytes = 0;
 
-    // D-ML7-2.6 (closed co-with-D-ML7-2.2, 2026-06-02): when true,
+    // D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7 (closed co-with-D-ML7-2.2, 2026-06-02): when true,
     // the cc uses SLOT-ALIGNED arg passing — each arg consumes ONE
     // shared slot index regardless of its register class, AND both
     // argGprs[N] AND argFprs[N] are reserved by slot N (matters for
@@ -1911,7 +1911,7 @@ enum class EncodingSlotKind : std::uint8_t {
     ModRmRmMem    = 8,
     MemBaseScale  = 9,
     Disp32Mem     = 10,
-    // D-AS4-5 closure (2026-06-01): SIB.index field (bits 3..5 of
+    // D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL closure (2026-06-01): SIB.index field (bits 3..5 of
     // the SIB byte). Wires an index register's hwEncoding low 3
     // bits into SIB.index and the high bit into REX.X (the AS2
     // pre-declared `rexX` field is finally consumed here). Paired
@@ -2666,7 +2666,7 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         // is not either; a symbol-bearing complement form would need the
         // LINKER to invert and is not a shape any target declares).
         case EncodingSlotKind::Imm16Inverted:
-            // D-AS4-1 / D-AS4-5 memory-addressing slots write immediate
+            // D-AS4-1 / D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL memory-addressing slots write immediate
             // displacements / register encodings (not symbol-relative).
             // The companion symbol-bearing slot for RIP-relative `lea`
             // is `RipRelDisp32` above; it's distinct because it forces

@@ -452,7 +452,7 @@ collectIndirectCalleePositions(Lir const& lir, TargetSchema const& schema,
 // (MnemonicSlot::Arg = "arg") and lir_callconv materializes (h.arg). A
 // target without an `arg` op (no register-machine param passing) yields
 // an empty list — zero new behavior. `payload` is the per-class arg
-// index (D-ML7-2.10: HIR→MIR emits a monotonic per-class counter). The
+// index (D-PLAN12-CLOSED-2026-FC7-C1B-COMMIT-B7F547D-FIXED-VIA: HIR→MIR emits a monotonic per-class counter). The
 // arg register NAME→ordinal resolves via the cc; a name that fails to
 // resolve is left unrecorded (the callconv pass fails loud on it later —
 // this collector never weakens allocation on a bad schema by inventing
@@ -831,7 +831,7 @@ tryAllocateExcluding(FreeListsByClass& free,
 // stops being minted at all (`lir_callconv.cpp`'s `maybeMov` emits nothing when
 // `dest.id == src.id`).
 //
-// This closes the long-standing `D-ML7-2.5` (plan 12) — "regalloc pre-coloring
+// This closes the long-standing `D-PLAN12-REGALLOC-PRE-COLORING-HINT-FOR-ARG-CALL-ARG` (plan 12) — "regalloc pre-coloring
 // hint for `arg`/`call` arg-position vregs" — whose own trigger names this
 // cycle: *"when the redundant-mov count becomes a measurable perf issue … or
 // the codegen-quality/peephole arc (plan 22) opens"*. Plan 22 OPT8 is that arc.
@@ -1207,7 +1207,7 @@ struct AntiAffinityPair {
 // (`tryAllocatePreferred`) rather than as a union-find edge — get the vreg into
 // that register and the copy becomes a move onto itself, which R1 deletes.
 //
-// ⓘ This is the shape `D-ML7-2.5`'s SECOND consumer names: the div/mod family
+// ⓘ This is the shape `D-PLAN12-REGALLOC-PRE-COLORING-HINT-FOR-ARG-CALL-ARG`'s SECOND consumer names: the div/mod family
 // captures its implicit-output register with `result = mov <rax>`, so the
 // capture disappears exactly when the result vreg is allocated there. Nothing
 // about the rule is div-specific — it reads the operand's `isPhysical` bit, so
@@ -1279,7 +1279,7 @@ struct MoveOpcodeCache {
     }
 };
 
-// ── THE OUTGOING-ARGUMENT HINT (D-ML7-2.5, the half that was withheld) ───────
+// ── THE OUTGOING-ARGUMENT HINT (D-PLAN12-REGALLOC-PRE-COLORING-HINT-FOR-ARG-CALL-ARG, the half that was withheld) ───────
 //
 // The DEF-side hints cover where a value is BORN: an incoming parameter
 // arrives in its ABI register, a call result arrives in the return register.
@@ -1293,7 +1293,7 @@ struct MoveOpcodeCache {
 // producing the move-graph cycle `L_MoveCycleUnsupported` used to refuse. Two
 // independent measurements say otherwise:
 //
-//   * THE REFUSAL IS GONE. `D-ML7-2.3`'s parallel-copy resolution shipped in
+//   * THE REFUSAL IS GONE. `D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS`'s parallel-copy resolution shipped in
 //     c76: `emitParallelRegMoves` emits the acyclic part in dependency order
 //     and breaks each remaining cycle with a scratch drawn from
 //     `cc.callerSaved`. The v1 O(N^2) detector it superseded was deleted.
@@ -1759,7 +1759,7 @@ buildCoalescePartition(CoalesceInput const&             in,
         // any merge that would put them together. Veto 1 therefore implies
         // veto 2 for any liveness analysis in which a use is live at the
         // position it is used, which is every correct one, split intervals
-        // (D-ML6-1.1) included.
+        // (D-PLAN12-SPLIT-AWARE-SUB-INTERVAL-LIRLIVERANGE-LIST-CURRENTLY-FLAT) included.
         //
         // ⇒ IT STAYS, DELIBERATELY, AS DEFENCE IN DEPTH WITH ITS PROOF
         // ATTACHED. What it guards — legalize's `mov result, operands[tied]`

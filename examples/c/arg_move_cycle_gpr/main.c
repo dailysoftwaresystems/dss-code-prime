@@ -1,4 +1,4 @@
-/* D-ML7-2.3 (parallel-copy resolution) x D-ML7-2.5 (outgoing-argument
+/* D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS (parallel-copy resolution) x D-PLAN12-REGALLOC-PRE-COLORING-HINT-FOR-ARG-CALL-ARG (outgoing-argument
  * pre-coloring), P40 lane L.
  *
  * The pre-existing `arg_move_cycle` example witnesses ONE shape: an 8-element

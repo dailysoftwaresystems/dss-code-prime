@@ -2454,14 +2454,14 @@ enum class DiagnosticCode : std::uint16_t {
     // tooling already filtering on this code; new emissions use the
     // remediation-distinct codes below).
     D_TargetFormatMismatch        = 0xD00C,
-    // D_TargetMachineCodeMismatch: D-LK6-8.2 closure — the machine
+    // D_TargetMachineCodeMismatch: D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET closure — the machine
     // code declared on the FORMAT schema doesn't match the TARGET
     // schema's expected machine code for that format kind. Example:
     // `arm64:elf64-x86_64-linux-exec` declares `elf.machine=62`
     // (EM_X86_64) but the "arm64" target expects `elf.machine=183`
     // (EM_AARCH64). Pre-fold this dispatched silently into the wrong
     // PLT-stub emitter → SIGILL.
-    // D_TargetAbiModelMismatch: D-LK6-8.2 post-fold #1 closure — the
+    // D_TargetAbiModelMismatch: D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET post-fold #1 closure — the
     // target's `abiModel` (register-machine / operand-stack /
     // result-id) doesn't match the format's `kind` (Elf/Pe/MachO vs
     // Wasm vs Spirv). Example: register-machine x86_64 target paired
@@ -3947,7 +3947,7 @@ enum class DiagnosticCode : std::uint16_t {
     //   cycle (e.g. swap two args between argGprs[0] and argGprs[1]).
     //   The v1 emit-in-order materialization would silently miscompile
     //   such a cycle — second mov reads a clobbered source. v1 detects
-    //   loud; D-ML7-2.3 anchors the proper parallel-copy resolution.
+    //   loud; D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS anchors the proper parallel-copy resolution.
     // L_IndirectCallUnsupported: the LIR `call` instruction's callee
     //   operand is neither a `SymbolRef` (direct call) nor a `Reg`
     //   (indirect call through a register — FC4 c2 landed that

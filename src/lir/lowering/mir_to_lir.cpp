@@ -8425,7 +8425,7 @@ struct Lowerer {
     // emits 7 bytes into the function body as a dead def; regalloc
     // handles the dead vreg, but the bytes remain in the binary.
     // Dead-LEA elimination for direct-call-only GlobalAddrs is
-    // anchored at D-ML7-2.9 (carried forward from the prior `mov`
+    // anchored at D-PLAN12-CLOSED-2026-C50-DEAD-CALLEE-ADDRESS-LEA-SUPPRESSED (carried forward from the prior `mov`
     // shape — same elimination opportunity, same trigger).
     //
     // Pre-D-LK4-RODATA-PRODUCER shape was `mov result, SymbolRef`,
@@ -8558,7 +8558,7 @@ struct Lowerer {
         return false;
     }
 
-    // D-ML7-2.9: the SOLE consumer of this GlobalAddr is a DIRECT call's CALLEE
+    // D-PLAN12-CLOSED-2026-C50-DEAD-CALLEE-ADDRESS-LEA-SUPPRESSED: the SOLE consumer of this GlobalAddr is a DIRECT call's CALLEE
     // slot (operand[0] of a `Call`). `lowerCall` folds the callee's SymbolId
     // straight into a direct branch (x86 `call rel32` / arm64 `bl` CALL26 + the
     // undefined-extern reloc) and NEVER reads this GlobalAddr's LEA vreg — so the
@@ -8930,7 +8930,7 @@ struct Lowerer {
         emitInst(*loadOp, idxReg, idxLoadOps,
                  /*payload=*/0, /*flags=*/kLirInstFlagWidth32);
         // Step 3 — load THIS module's TLS block base: [tp + index*8].
-        // The existing scale-8 SIB indexed-load form (D-AS4-5); width 64
+        // The existing scale-8 SIB indexed-load form (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL); width 64
         // (a pointer). tp is the array base, index the module ordinal,
         // scale 8 = sizeof(void*).
         LirReg const blockReg = lir.newVReg(LirRegClass::GPR);
@@ -8992,7 +8992,7 @@ struct Lowerer {
             foldedGlobalAddrs_.insert(id.v);
             return;
         }
-        // D-ML7-2.9: the sole consumer is a DIRECT call's callee slot —
+        // D-PLAN12-CLOSED-2026-C50-DEAD-CALLEE-ADDRESS-LEA-SUPPRESSED: the sole consumer is a DIRECT call's callee slot —
         // `lowerCall` folds the symbol straight into the direct branch and never
         // reads this lea's vreg, so emit NO lea (dead on every target; on arm64
         // the absolute adrp+add against an undefined extern would also break a
@@ -10579,7 +10579,7 @@ struct Lowerer {
     // pre-coloring mechanism exists (call results use an explicit
     // post-regalloc mov in `materializeOneFunc`), and building one
     // for a perf-only delta would speculatively erect the deferred
-    // D-ML7-2.5 substrate.
+    // D-PLAN12-REGALLOC-PRE-COLORING-HINT-FOR-ARG-CALL-ARG substrate.
     //
     // **Cycle 10r split rationale** (preserved) — cycle 10q packaged
     // CQO+IDIV into a single compound op with opcode bytes `[0x48,

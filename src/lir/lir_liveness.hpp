@@ -127,7 +127,7 @@ struct DSS_EXPORT LirLiveRange {
 // header note above), so a value dead in a hole is still reported live across
 // it. Over-approximating liveness makes this return `true` where a
 // split-interval analysis would return `false` — a MISSED coalesce, never an
-// unsound one. When split-aware sub-intervals land (D-ML6-1.1) this predicate
+// unsound one. When split-aware sub-intervals land (D-PLAN12-SPLIT-AWARE-SUB-INTERVAL-LIRLIVERANGE-LIST-CURRENTLY-FLAT) this predicate
 // gains precision and every consumer gains it at once.
 [[nodiscard]] constexpr bool
 lirRangesInterfere(LirLiveRange const& a, LirLiveRange const& b) noexcept {

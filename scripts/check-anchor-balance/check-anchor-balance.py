@@ -283,7 +283,7 @@ SHAPES_PREFIX = [
 # ── Tables that carry an anchor-looking token in cell 1 but are NOT deferral tables ──
 # NAMED, not guessed. Each was read before being listed here:
 #   `pr | title | scope`        13-assembler section 3 PR breakdown; one row's cell 1 is
-#                               "~~AS3~~ ... (substrate slice + binary ops + D-ML7-2.1)"
+#                               "~~AS3~~ ... (substrate slice + binary ops + D-PLAN12-ARM64-STACKPOINTER-REGISTRATION-ABI-GOLDEN-TESTS)"
 #                               -- a PR title that MENTIONS an anchor.
 #   `phase | what | closes`     23-full-c cluster tables; the anchors live in the
 #                               "Closes" column, and cell 1 is a phase id like "**FC8**".
@@ -1923,7 +1923,7 @@ def self_test():
          set(), "an UNRECOGNIZED anchor-looking table is REPORTED, never skipped",
          path=".plans/99-x.md", expect_fatal=1)
     case(_doc("| PR | Title | Scope |", "|---|---|---|",
-              "| ~~AS3~~ | cycle 3 landed (binary ops + D-ML7-2.1) | s |"),
+              "| ~~AS3~~ | cycle 3 landed (binary ops + D-PLAN12-ARM64-STACKPOINTER-REGISTRATION-ABI-GOLDEN-TESTS) | s |"),
          set(), "a NAMED non-deferral table is excluded, and raises no false alarm",
          path=".plans/13-x.md")
     case(_doc("| Tier | Example | External tools? |", "|---|---|---|",

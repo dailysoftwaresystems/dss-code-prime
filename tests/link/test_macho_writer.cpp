@@ -2841,13 +2841,14 @@ TEST(MachOExecFormatJsonValidate, ExecMissingLoadDylibsRejected) {
 // ── New tests folded from 7-agent review of LK3 cycle 2 ────────
 
 TEST(MachOExecFormatJsonValidate, DylibWithoutDylibImageShapeRejected) {
-    // c153 (D-LK3-3): MH_DYLIB is a SUPPORTED filetype now, but a
-    // dylib schema missing its image identity (installName, a
-    // loadDylibs entry, text VA == segmentPageSize) is still
-    // rejected by the dylib shape rules — the bare-minimum JSON that
-    // pre-c153 rejected on the filetype itself keeps failing, for
-    // the precise per-field reasons. (The ACCEPTED full dylib shape
-    // is pinned in test_macho_dylib_writer.cpp.)
+    // A dylib schema missing its image identity (installName, a
+    // loadDylibs entry, text VA == segmentPageSize) is rejected by the
+    // dylib shape rules, for the precise per-field reasons: the
+    // bare-minimum JSON that pre-c153 rejected on the filetype itself
+    // keeps failing.
+    // MH_DYLIB itself is a SUPPORTED filetype since c153, which is what
+    // `D-LK3-3` delivered; the ACCEPTED full dylib shape is pinned in
+    // test_macho_dylib_writer.cpp.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },

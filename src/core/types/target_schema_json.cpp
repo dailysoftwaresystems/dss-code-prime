@@ -1463,9 +1463,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // Empty OR whitespace-only `name` would be silently accepted by
     // the closed-enum cross-validation at the driver tier
     // (`lookupTargetArch` does exact comparison → no match → skip),
-    // reopening the SIGILL surface D-LK6-8.2 was anchored to close.
+    // reopening the SIGILL surface D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET was anchored to close.
     // Also reject leading/trailing whitespace ("  arm64 " ≠ "arm64").
-    // (silent-failure CRITICAL-2 + HIGH-1 post-fold — D-LK6-8.2 audit
+    // (silent-failure CRITICAL-2 + HIGH-1 post-fold — D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET audit
     // rounds 1 and 2 — empty was caught in round 1, whitespace in
     // round 2.)
     auto const isNonAsciiWhitespace = [](char c) noexcept {
@@ -1491,7 +1491,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                   "'name' must be a non-empty string with no leading "
                   "or trailing whitespace — would silently bypass the "
                   "(target, format) machine cross-check (plan 14 §3.1 "
-                  "D-LK6-8.2).");
+                  "D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET).");
         return std::unexpected(std::move(coll).release());
     }
     if (target.contains("version") && target.at("version").is_string()) {
@@ -4124,7 +4124,7 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                         }
                     }
                 }
-                // D-ML7-2.6: slot-aligned arg passing (Win64 ms_x64).
+                // D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7: slot-aligned arg passing (Win64 ms_x64).
                 // Defaults to false (independent counters — SysV/AAPCS64
                 // semantics). A cc declaring `slotAligned: true` means
                 // each arg consumes one shared slot index regardless of

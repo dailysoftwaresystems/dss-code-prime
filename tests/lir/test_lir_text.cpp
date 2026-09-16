@@ -74,7 +74,7 @@ TEST(LirText, EmitterPreambleCarriesVersionAndTargetName) {
     EXPECT_NE(text.find("dsslir 1\n"), std::string::npos);
     EXPECT_NE(text.find("target x86_64 version \""), std::string::npos)
         << "preamble must carry both the target name AND its semantic version "
-           "(D-ML8-1.2 fold — version pinned so cross-bump load is rejected)";
+           "(D-PLAN12-SCHEMA-VERSION-TAG-DSSLIR-PREAMBLE fold — version pinned so cross-bump load is rejected)";
 }
 
 TEST(LirText, EmitterEmptyModuleProducesValidStructure) {
@@ -482,7 +482,7 @@ TEST(LirText, EmitterRendersLiteralPoolBodyWithCoreTag) {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// Parser + round-trip tests (ML8 cycle 2 — D-ML8-1.1 fold).
+// Parser + round-trip tests (ML8 cycle 2 — D-PLAN12-DSSLIR-PARSER-EMITLIR-PARSELIR-EMITLIR-EMITLIR-ROUND-TRIP fold).
 // Contract:
 //   emitLir(parseLir(emitLir(m))->lir) == emitLir(m)   (byte-identical)
 // ═════════════════════════════════════════════════════════════════════

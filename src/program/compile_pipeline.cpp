@@ -1575,7 +1575,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     //     diverged from the original MIR's instruction set, so a
     //     fidelity-preserving map would require legalize + callconv
     //     to thread their own translation tables (anchored at
-    //     plan 12 D-ML3-2.1 MirSourceMap IOU). Cycle 2 acceptance
+    //     plan 12 D-PLAN12-MIRSOURCEMAP-INJECTION-SLOT-MIRVERIFIER-CYCLE-STASHES-NODE-ACTUAL MirSourceMap IOU). Cycle 2 acceptance
     //     pins SHAPE + BYTES, not source-map fidelity.
     auto const asmEntry = reporter.errorCount();
     phase.emplace(substrate::CompilePhase::Encode);

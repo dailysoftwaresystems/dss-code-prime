@@ -62,7 +62,7 @@ struct EncodingState {
     bool                  rexR       = false;   // high bit of ModRmReg slot's hwEncoding
     bool                  rexB       = false;   // high bit of ModRmRm slot's hwEncoding
     // `rexX` carries the SIB.index high bit. Set by the `SibIndex`
-    // slot's wiring (D-AS4-5 closure 2026-06-01) from the index reg
+    // slot's wiring (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL closure 2026-06-01) from the index reg
     // hwEncoding bit 3. Stays false on no-index forms (the SIB byte
     // emits index=4 = no-index marker).
     bool                  rexX       = false;
@@ -93,7 +93,7 @@ struct EncodingState {
     // ModR/M-mem + missing-Disp32Mem pairing fail loud rather than
     // silently emitting a zero offset.
     std::optional<std::int32_t> disp32Mem;
-    // SIB.index slot (D-AS4-5). Set when a `SibIndex` wire fires;
+    // SIB.index slot (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL). Set when a `SibIndex` wire fires;
     // `optional` is the written-bit — same pattern as `disp32Mem`
     // (code-simplifier REQUIRED post-fold #1: dropped the redundant
     // `wroteSibIndex` flag).
@@ -250,7 +250,7 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
             st.rexB           = (hwEnc & 0x8u) != 0u;
             return true;
         case EncodingSlotKind::SibIndex:
-            // D-AS4-5 indexed addressing: the index register's low 3
+            // D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL indexed addressing: the index register's low 3
             // bits fill SIB.index; the high bit drives REX.X. With-
             // index forces a SIB byte unconditionally (independent of
             // the rsp/r12 force-presence rule for no-index).
@@ -501,9 +501,9 @@ wireImm64(EncodingState& st, EncodingSlotKind slot, std::uint64_t v,
     return true;
 }
 
-// D-AS4-1 + D-AS4-5 memory-addressing: validate a MemBase operand's
+// D-AS4-1 + D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL memory-addressing: validate a MemBase operand's
 // scale and store the SIB.scale exponent for emission. Scale ∈
-// {1,2,4,8} (D-AS4-5 generalisation from cycle-1's scale==1-only).
+// {1,2,4,8} (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL generalisation from cycle-1's scale==1-only).
 // The slot writes no bytes directly; the exponent feeds the SIB
 // byte when a `SibIndex` is also wired (or the existing rsp/r12
 // force-presence rule fires on no-index).
@@ -909,10 +909,10 @@ bool encode(Lir const&                  lir,
                 return false;
             }
         } else if (srcOp.kind == LirOperandKind::MemBase) {
-            // D-AS4-1 + D-AS4-5 memory-addressing: MemBase carries the
+            // D-AS4-1 + D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL memory-addressing: MemBase carries the
             // scale for `[base + index*scale + disp]` addressing.
             // Cycle-1 (closed at LK10 cycle 2) handled scale==1 only;
-            // D-AS4-5 generalises to scale ∈ {1,2,4,8}.
+            // D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL generalises to scale ∈ {1,2,4,8}.
             if (!wireMemBaseScale(st, wire.slotKind, srcOp.scale,
                                    info->mnemonic, reporter)) {
                 return false;
@@ -1249,7 +1249,7 @@ bool encode(Lir const&                  lir,
     //    MemDisp32).
     // Decide whether a SIB byte follows. Two triggers:
     //   (a) D-AS4-1 force-presence: memory mode + rm.lo3 == 4.
-    //   (b) D-AS4-5 indexed addressing: a SibIndex wire fired.
+    //   (b) D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL indexed addressing: a SibIndex wire fired.
     // When SIB follows, ModR/M.rm MUST be 4 (the "SIB follows"
     // marker); the actual base register's lo3 goes into SIB.base.
     // The pre-existing no-index force-presence path "worked by
@@ -1320,7 +1320,7 @@ bool encode(Lir const&                  lir,
         }
     }
 
-    // 4.5) D-AS4-5 coherence: a SibIndex wire is only meaningful with
+    // 4.5) D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL coherence: a SibIndex wire is only meaningful with
     //      a ModRmRmMem base (the indexed form is a memory-addressing
     //      mode; register-direct mode has no SIB). Fail loud if a
     //      schema declared SibIndex without ModRmRmMem — silent
@@ -1343,7 +1343,7 @@ bool encode(Lir const&                  lir,
     //        that otherwise means "SIB follows"). No index register;
     //        SIB encodes `[base + 0 + disp]` with index=4 (no-index
     //        marker) and scale=0.
-    //    (b) D-AS4-5 indexed addressing: a `SibIndex` wire fired
+    //    (b) D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL indexed addressing: a `SibIndex` wire fired
     //        (st.wroteSibIndex). SIB encodes `[base + index*scale + disp]`
     //        with index = st.sibIndex3 (from the SibIndex wire's
     //        register operand), scale exponent = st.sibScaleExp

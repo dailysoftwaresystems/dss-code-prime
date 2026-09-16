@@ -848,7 +848,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         return std::nullopt;
     }
 
-    // D-LK6-8.2 cross-validation: confirm the (target, format) pair's
+    // D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET cross-validation: confirm the (target, format) pair's
     // machine identity matches before linking. Without this guard, a
     // hand-edited format JSON with the wrong `machine` value would
     // silently dispatch the linker to the wrong PLT-stub emitter,

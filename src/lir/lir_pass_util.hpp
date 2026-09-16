@@ -19,7 +19,7 @@
 
 // Shared substrate for LIR transformation passes (rewrite, callconv,
 // future inlining/optimization passes). Folds the cycle-3b / ML7
-// duplication identified by the simplifier as D-ML7-1.1: every pass
+// duplication identified by the simplifier as D-PLAN12-SHARED-LIR-PASS-UTIL-HPP-FOR-EMITTERMINATOR-REPORT: every pass
 // that walks an input `Lir` and builds a fresh one re-implements the
 // same diagnostic-emission, block-ref remapping, and terminator
 // dispatch — all of which are tier-invariant (target-blind, source-

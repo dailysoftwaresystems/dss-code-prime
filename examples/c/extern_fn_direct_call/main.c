@@ -1,4 +1,4 @@
-/* TF-C50 (D-LK-ARM64-ELF-RELOC-EXTERN-DISPATCH + D-ML7-2.9) end-to-end witness.
+/* TF-C50 (D-LK-ARM64-ELF-RELOC-EXTERN-DISPATCH + D-PLAN12-CLOSED-2026-C50-DEAD-CALLEE-ADDRESS-LEA-SUPPRESSED) end-to-end witness.
  *
  * A DIRECT call to an undefined extern function. In an arm64 RELOCATABLE object
  * this lowers to a plain `BL` + R_AARCH64_CALL26 (the foreign linker inserts the

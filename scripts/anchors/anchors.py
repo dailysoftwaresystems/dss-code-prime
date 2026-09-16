@@ -796,7 +796,7 @@ def cmd_write(argv):
     # to write the row that owns it. Refusing it would force a rename of the row AND of every
     # citation, or a hand-written table row; both are worse than saying what is happening.
     # ⚠ It does NOT relax the shape: ANCHOR_ID_WELLFORMED still refuses a dot, a space, or a
-    # name no registry could hold, which is why the 48 `D-3e.1`-shaped rows are still minted.
+    # name no registry could hold, which is why the 48 `D-PLAN12-LOWERSWITCH-FIRST-CMP-IMPLICIT-BLOCK-PLACEMENT-ASSERTION-ASSERT`-shaped rows are still minted.
     if a.relocating and not a.insert:
         raise Refused(
             "--relocating describes an --insert of a row that exists elsewhere. Without "

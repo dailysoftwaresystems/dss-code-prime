@@ -9664,7 +9664,7 @@ struct Lowerer {
     // a SLOT-ALIGNED CC (Win64) uses one FLAT shared slot. Monotonic per class,
     // so a struct's multiple pieces land in consecutive registers and no two
     // Args of the same class collide. (Threading per-class here also fixes the
-    // latent mixed-class `D-ML7-2.10`: a scalar param now gets its per-class
+    // latent mixed-class `D-PLAN12-CLOSED-2026-FC7-C1B-COMMIT-B7F547D-FIXED-VIA`: a scalar param now gets its per-class
     // index, not the param index.)
     struct ArgOrdinalCounter {
         bool          slotAligned = false;
@@ -15073,7 +15073,7 @@ struct Lowerer {
         // lockstep with the caller's operand order. For an all-GPR scalar-only
         // function the per-class GPR ordinal equals the param index (no change); a
         // mixed int/float signature now lands each arg in its own class (fixes
-        // D-ML7-2.10). `argCtr` is hoisted above (shared with the sret arg).
+        // D-PLAN12-CLOSED-2026-FC7-C1B-COMMIT-B7F547D-FIXED-VIA). `argCtr` is hoisted above (shared with the sret arg).
         // c63 (D-CSUBSET-VA-LIST-PARAM-SLOT): is `t` a SysV `va_list` PARAM — an
         // `__va_list_tag[1]` array (or, defensively, a Ptr<__va_list_tag>) — under the
         // SysVRegisterSave strategy? Such a param's incoming GPR is a POINTER to the
@@ -15221,7 +15221,7 @@ struct Lowerer {
                 addressableLocal[sym.v] = slot;
                 continue;
             }
-            // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG / fixes D-ML7-2.10): a scalar
+            // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG / fixes D-PLAN12-CLOSED-2026-FC7-C1B-COMMIT-B7F547D-FIXED-VIA): a scalar
             // param's `Arg` payload is its PER-CLASS register ordinal (GPR/FPR
             // counted separately for an independent CC), not the param index.
             AbiPieceClass const sCls = scalarArgClass(ty);

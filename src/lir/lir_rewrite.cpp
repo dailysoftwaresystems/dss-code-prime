@@ -223,7 +223,7 @@ resolveReg(LirReg r, LirFuncAllocation const& alloc,
 }
 
 // translateNonVregOperand + emitTerminator are now in lir_pass_util
-// (D-ML7-1.1 fold — shared with lir_callconv).
+// (D-PLAN12-SHARED-LIR-PASS-UTIL-HPP-FOR-EMITTERMINATOR-REPORT fold — shared with lir_callconv).
 
 // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): classify each operand of a CALL
 // instruction as a REGISTER-PASSED scalar arg (→ its LirRegClass) or not

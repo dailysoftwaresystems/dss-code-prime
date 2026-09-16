@@ -617,58 +617,8 @@ These **50** `D-AXIS-*` anchors are **reserved/future** — they live here until
 
 ⛔ **Retired 2026-09-04, recorded so it is not re-minted:** `D-AXIS-MANUAL-ANNOTATION` (the `@manual` escape hatch) — deleted with the design it named, §2.3a. [`plan-09.5`](./09.5-dss-hir-plan.md) retires its analysis counterpart on the same grounds.
 
-| Anchor | Owns |
-|--------|------|
-| `D-AXIS-COMPILER-OWNS-MEMORY` | ★★★ the compiler owns memory in every case; the programmer describes semantics (§2.3) |
-| `D-AXIS-NO-MANUAL-ESCAPE-HATCH` | ⛔ no `@manual` and no equivalent, under any spelling — the absence is a designed property (§2.3a) |
-| `D-AXIS-NO-UNSAFE-BLOCK` | ⛔ no `unsafe` mode; the model has no bypass (§3.1e) |
-| `D-AXIS-RESIDUAL-ENFORCES-NEVER-REFUSES` | ★ failure to prove generates enforcement, not rejection — the cycle refusal is the one survivor (§2.3) |
-| `D-AXIS-OWNS-CYCLE-ANNOTATION` | ★★ `@ownsCycle` — a CHECKED claim that a cycle ends here; inert or unverifiable = refused (§3.1f) |
-| `D-AXIS-NOT-GARBAGE-COLLECTION-VOCABULARY` | ★ five falsifiable properties; "GC"/"collector"/"managed" are wrong about this design (§2.3) |
-| `D-AXIS-STATIC-BORROW-ZERO-COST` | a proven single-context borrow emits **no** runtime machinery (§3.1c) |
-| `D-AXIS-CONCURRENT-BORROW-DYNAMIC-RECORD` | the cross-context residual materializes an ownership record; representation is 09.5's (§3.1c) |
-| `D-AXIS-PROOF-IS-AN-OPTIMIZATION-FACT` | proofs enter the IR and survive into MIR/LIR; enforcement is deleted, not skipped (§3.1d, lock 9) |
-| `D-AXIS-DYNAMIC-TIER-NEEDS-A-STORAGE-PROVIDER` | ⚠ TD needs atomics + storage; a profile without one refuses its residual (§3.1a) |
-| `D-AXIS-CONTROL-AND-MEMORY-ARE-SEPARATE-AXES` | ★★★ descending the computational ladder never transfers memory responsibility (§2.8, §6) |
-| `D-AXIS-ISA-OPERATIONS-STAY-SEMANTIC` | `isa.*` operates on Axis values under the full Axis memory model (§3.6b) |
-| `D-AXIS-ISA-IS-NOT-INLINE-ASM` | ⚠ `isa.*` is Axis; a `.s`/`asm` unit is a separate language with no memory model (§3.6b) |
-| `D-AXIS-ISA-VOCABULARY-FROM-TARGET-CONFIG` | `isa.*` names resolve against `.target.json` `opcodes[]`; unknown name = build refusal (§3.6b) |
-| `D-AXIS-RUNTIME-AUTHORED-IN-HIR` | ★★ 100% of the runtime in HIR source, gated on C++ readiness (§3.9) |
-| `D-AXIS-HIR-SOURCE-MUST-BE-HUMAN-AUTHORABLE` | HIR text becomes real source, so round-trippable is no longer sufficient (§3.9, lock 11) |
-| `D-AXIS-ASYNC-CONSTRUCTORS` | `async new(...)` construction-that-awaits |
-| `D-AXIS-ASYNC-DI` | language-side async dependency injection API |
-| `D-AXIS-MEMORY-LATTICE-CONFIG` | the `memory` block — a declared tier lattice, never a boolean (§3.1a) |
-| `D-AXIS-RUNTIME-ENABLE-CONFIG` | the `runtime` block — opt-in DSS Native Runtime, independent of `memory` (§3.1a) |
-| `D-AXIS-ANNOTATIONS-WITH-PARAMETERS` | `@name(...)` on declarations, members and blocks — with no memory escape in it (§3.1b) |
-| `D-AXIS-ENGINE-KEEPS-GC-CAPABILITY` | ★ GC leaves the LANGUAGE, not the ENGINE — C#/Java/Python/JS still need it (§4.2) |
-| `D-AXIS-PAR-OWNERSHIP-ACROSS-THREADS` | moving a value across threads: proven unique, visibly shared, or TD-enforced (§3.1c, §3.8) |
-| `D-AXIS-GPU-EXECUTION-MODIFIER` | `gpu` / `gpu?` on methods and blocks; keyword not annotation (§3.6a) |
-| `D-AXIS-GPU-NO-SILENT-FALLBACK` | ★ a GPU→CPU downgrade is declared (`gpu?`) or refused (`gpu`), never quiet (§3.6a) |
-| `D-AXIS-GPU-BLOCK-LATTICE-PROFILE` | a `gpu` body declares a narrower lattice — no T4 and no TD without a host allocator (§3.6a) |
-| `D-AXIS-GPU-FALLBACK-RESULT-EQUIVALENCE` | ★ `gpu?` FP-equivalence and plan-17's oracle tolerance are ONE question, ONE answer (§3.6a) |
-| `D-AXIS-ASYNC-TASK-SHAPE` | `Task<T>` / `Task` as the awaitable type across async fns, constructors, DI (C#-style TAP) |
-| `D-AXIS-DESTRUCTURE-SPREAD` | bind-destructure + `...` spread |
-| `D-AXIS-COLLECTION-OPERATORS` | array `+` append, spread, friendly collection ops |
-| `D-AXIS-CLONE-DEEPCLONE` | built-in / auto-derived shallow + deep clone |
-| `D-AXIS-DYNAMIC-CONSTRUCTORS` | runtime constructor selection/dispatch |
-| `D-AXIS-MANAGED-LANG-PARITY` | the Dart/C#/Java modern-OOP surface, ceremony-free |
-| `D-AXIS-CLOSED-WORLD-REFLECTION` | native (no-VM) closed-world reflection metadata + runtime lib |
-| `D-AXIS-OPEN-WORLD-INTERPRET-LIBS` | the optional eval/dynamic-codegen interpret-libs tail |
-| `D-AXIS-NATIVE-FLOOR-ADAPTIVE-CEILING` | base-service profiler + owned-compiler runtime recompiler |
-| `D-AXIS-FFI-IMPORT` | language-side `import`/`extern` (machinery → [`plan-11`](./11-ffi-plan%20-%20tbd.md)) |
-| `D-AXIS-FFI-EXPORT` | DSS Axis libs callable natively from other languages |
-| `D-AXIS-FFI-PARAMETER-CONTRACTS` | ★★ `readonly` / `noescape` at an FFI call — deep, orthogonal, pessimistic by default, inert on a scalar (§3.5a) |
-| `D-AXIS-FFI-CONTRACT-VERIFICATION-ASYMMETRY` | ⚠ `readonly` is debug-checkable directly; `noescape` only by consequence — the quarantine arm is required, not optional (§3.5a) |
-| `D-AXIS-EASY-AS-NODE-ERGONOMICS` | use/assign/construct/destruct fluency goal |
-| `D-AXIS-SELF-HOST-TRANSPILE` | C++ engine → DSS Axis via [`plan-10`](./10-source-translation-plan%20-%20tbd.md) under the HIR oracle |
-| `D-AXIS-PAR-DUAL-API` | every waiting primitive ships co-equal blocking + async (`Task<T>`) forms |
-| `D-AXIS-PAR-ATOMICS` | atomics + interlocked + explicit memory ordering (→ ISA via [`plan-21`](./21-runtime-reserved-plan%20-%20tbd.md) §2.4) |
-| `D-AXIS-PAR-LOCKS` | mutex / recursive / reader-writer / spinlock / scoped lock |
-| `D-AXIS-PAR-SEMAPHORES` | counting + binary semaphores (blocking + async) |
-| `D-AXIS-PAR-SYNC-PRIMITIVES` | barrier / latch / condvar / event / once / lazy |
-| `D-AXIS-PAR-STRUCTURED-CONCURRENCY` | task groups, parallel-for / data-parallel, channels, actors |
-| `D-AXIS-PAR-CONCURRENT-COLLECTIONS` | concurrent + lock-free + persistent collections |
-| `D-AXIS-PAR-CANCELLATION` | cancellation tokens, deadlines, linked cancellation |
+> **The deferral rows that were listed here have moved into the anchor registries.** The open ones are in `.plans/_deferred-anchor-registry-production.md` and the closed ones in `.plans/_deferred-anchor-registry-done.md`, under `D-AXIS-*`. A row whose id this plan spelled in a form no registry could hold carries its former spelling in its `Cross-refs` cell. Read the registry, never this document, for what is still open.
+
 
 ---
 

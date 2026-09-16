@@ -2333,7 +2333,7 @@ TEST(X86VariableEncoder, NegativeDispLeaSingleInstructionUnchanged) {
     EXPECT_EQ(bytes[6], 0xFF);
 }
 
-// ── D-AS4-5: SIB-with-index (indexed/scaled addressing) ──────
+// ── D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL: SIB-with-index (indexed/scaled addressing) ──────
 
 TEST(X86VariableEncoder, LeaWithIndexScale1) {
     auto schema = TargetSchema::loadShipped("x86_64");

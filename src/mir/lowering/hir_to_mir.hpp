@@ -140,7 +140,7 @@ struct DSS_EXPORT MirLoweringConfig {
     // each scalar param + each struct-piece `Arg` with the matching monotonic
     // counter, so a multi-register struct param lands in consecutive arg
     // registers and the lir_callconv per-class/flat lookup resolves it. (This
-    // also fixes the latent mixed-class `D-ML7-2.10`: a scalar param's payload is
+    // also fixes the latent mixed-class `D-PLAN12-CLOSED-2026-FC7-C1B-COMMIT-B7F547D-FIXED-VIA`: a scalar param's payload is
     // now its per-class index, not the param index.)
     bool               argSlotAligned             = false;
 

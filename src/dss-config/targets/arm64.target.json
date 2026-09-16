@@ -1,5 +1,5 @@
 {
-  "$comment": "ARM64 (AArch64) target descriptor (plan 13 AS3 + plan 12 D-ML7-2.1). 100% JSON-configured — the same target-blind LIR substrate that drives x86_64 reads this file. Adding ARM64 = drop this file; no C++ change. Encoding shape: `fixed32` (32-bit fixed word + bit-field slots). Calling convention: AAPCS64 (https://github.com/ARM-software/abi-aa).",
+  "$comment": "ARM64 (AArch64) target descriptor (plan 13 AS3 + plan 12 D-PLAN12-ARM64-STACKPOINTER-REGISTRATION-ABI-GOLDEN-TESTS). 100% JSON-configured — the same target-blind LIR substrate that drives x86_64 reads this file. Adding ARM64 = drop this file; no C++ change. Encoding shape: `fixed32` (32-bit fixed word + bit-field slots). Calling convention: AAPCS64 (https://github.com/ARM-software/abi-aa).",
   "dssTargetVersion": 1,
   "target": {
     "name":    "arm64",

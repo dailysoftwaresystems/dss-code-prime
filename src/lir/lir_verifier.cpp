@@ -718,7 +718,7 @@ void checkVregClassMatchesMirType(
 // inst whose source MIR inst is a MIR `IntrinsicCall`, the LIR
 // result-reg presence must match the MIR result type — Void MIR
 // type → LIR result MUST be `InvalidLirReg`; non-Void MIR type → LIR
-// result MUST be valid. Closes the cycle-3e D-3e.2 deferral.
+// result MUST be valid. Closes the cycle-3e D-PLAN12-INTRINSICCALL-VOID-NON-VOID-RESULT-VALIDITY-VERIFIER-RULE-2 deferral.
 void checkIntrinsicCallResultValidity(Lir const& lir, Mir const& mir,
                                       TypeInterner const& interner,
                                       TargetSchema const& schema,

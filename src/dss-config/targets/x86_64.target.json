@@ -2632,7 +2632,7 @@
             ]
           },
           {
-            "$comment": "4-op indexed form (D-AS4-5), width 64: `mov reg, [base + index*scale + disp32]` (REX.W 0x8B). The walker emits SIB unconditionally when SibIndex wires.",
+            "$comment": "4-op indexed form (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL), width 64: `mov reg, [base + index*scale + disp32]` (REX.W 0x8B). The walker emits SIB unconditionally when SibIndex wires.",
             "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
             "resultSlot": "modrm.reg",
             "template":   { "rexW": true, "opcode": [139] },
@@ -2754,7 +2754,7 @@
             ]
           },
           {
-            "$comment": "5-op indexed form (D-AS4-5), width 64: `mov [base + index*scale + disp32], reg` (REX.W 0x89 + SIB).",
+            "$comment": "5-op indexed form (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL), width 64: `mov [base + index*scale + disp32], reg` (REX.W 0x89 + SIB).",
             "guard":    { "operandKinds": ["reg", "reg", "reg", "membase", "memoffset"], "width": 64 },
             "template": { "rexW": true, "opcode": [137] },
             "wires":    [
@@ -4760,7 +4760,7 @@
       "callPushBytes": 8,
       "$stackProbePageBytesComment": "D-WIN64-LARGE-FRAME-STACK-PROBE: the Windows x86-64 stack guard-page size (4096). A function whose total frame EXCEEDS 4096 bytes must touch every page on the way down (committing each PAGE_GUARD page) instead of a bare `sub rsp, F` that jumps over the guard page → STATUS_GUARD_PAGE_VIOLATION → access violation on the first deep write. The ML7 prologue reads this generically and, when totalFrameSize > 4096, emits the `stack_probe` virtual op (page step = this value) which the x86_64 encoder lowers to an inline page-walking loop — INSTEAD of the plain `sub rsp, F`. NO __chkstk dependency (dss PE exes are freestanding; __chkstk lives in msvcrt/ucrt). sysv_amd64 omits this field (0 = no probing: Linux auto-grows the stack via demand paging). Agnostic: the prologue branches on the VALUE, never on cc.name/arch/format.",
       "stackProbePageBytes": 4096,
-      "$slotAlignedComment": "D-ML7-2.6 (closed co-with-D-ML7-2.2, 2026-06-02): Win64 ms_x64 uses SLOT-ALIGNED arg passing — each arg consumes one shared slot index regardless of register class. Slot N reserves BOTH argGprs[N] AND argFprs[N]. `f(int, double, int, double, int)` consumes slots 0..4 → (rcx OR xmm0, rdx OR xmm1, r8 OR xmm2, r9 OR xmm3, [rsp+0x20]). Pure-GPR calls (WriteFile, GetStdHandle, etc.) happen to give the same overflow count as independent counters; mixed-class calls require the slot-aligned counting to land arg-5 on the stack correctly. ML7 `computeMaxOutgoingStackArgs` + `materializeOneFunc` consult this flag.",
+      "$slotAlignedComment": "D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7 (closed co-with-D-ML7-2.2, 2026-06-02): Win64 ms_x64 uses SLOT-ALIGNED arg passing — each arg consumes one shared slot index regardless of register class. Slot N reserves BOTH argGprs[N] AND argFprs[N]. `f(int, double, int, double, int)` consumes slots 0..4 → (rcx OR xmm0, rdx OR xmm1, r8 OR xmm2, r9 OR xmm3, [rsp+0x20]). Pure-GPR calls (WriteFile, GetStdHandle, etc.) happen to give the same overflow count as independent counters; mixed-class calls require the slot-aligned counting to land arg-5 on the stack correctly. ML7 `computeMaxOutgoingStackArgs` + `materializeOneFunc` consult this flag.",
       "slotAligned": true,
       "$vaListLayoutComment": "FC12b (D-FC12B-WIN64-VARIADIC-CALLEE): Microsoft x64 variadic-CALLEE layout. `va_list` is a plain `char*` (sizeof 8) — the HomogeneousPointer strategy, NOT SysV's __va_list_tag/register-save-area. Win64 spills the first 4 named integer args into the caller-provided 32-byte HOME SPACE (rcx/rdx/r8/r9 slots) which sits CONTIGUOUS with the 5th+ stack args, so `va_arg` is a LINEAR pointer bump by namedArgSlotBytes (8) across home→overflow — no diamond, no per-class cursor. The callee prologue spills the named integer arg regs into their home slots; `va_start` sets ap = &home[namedArgCount]. FP varargs are passed in BOTH the XMM and matching integer register, and the callee reads va_arg(double) from the home (GPR) slot — so the CALLER duplicates each FP vararg into the matching integer reg (lir_callconv, strategy-gated). Struct-by-value varargs are DEFERRED this cycle (D-FC12B-WIN64-STRUCT-VARARG, fail-loud). Every fact is config — the lowering + spill read these, never branching on cc.name/arch/format.",
       "vaListLayout": {
