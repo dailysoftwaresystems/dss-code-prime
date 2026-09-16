@@ -13,6 +13,18 @@ cmake_minimum_required(VERSION 4.0)
 # drift on every release.
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" DSS_VERSION_RAW)
 string(STRIP "${DSS_VERSION_RAW}" DSS_VERSION)
+# ★ A VERSION BUMP MUST RE-RUN CONFIGURE, AND WITHOUT THIS LINE IT DOES NOT.
+# The version is read HERE, at configure time, and baked into the binary as
+# DSS_STAMP_VERSION; the shipped config tree is stamped from the same file but
+# staged per RUN. So after a bump, an INCREMENTAL build keeps a compiler stamped
+# with the old version beside a config tree stamped with the new one, and the
+# version-skew check refuses every compile.
+# ✔MEASURED 2026-09-16 on the merge that bumped 0.0.2 -> 0.5.0: 1868 of 2207 tests
+# failed, every one of them reporting `C_InvalidLanguageName` + `D_SchemaLoadFailed`
+# — a diagnostic that reads like a defect in `c.lang.json` and is nothing of the
+# kind. The build that produced it reported success.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
 
 project(dss-code-prime VERSION ${DSS_VERSION} LANGUAGES CXX)
 

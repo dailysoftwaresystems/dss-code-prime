@@ -56,7 +56,7 @@ using dss::link_format::test::readU16LE;
 using dss::link_format::test::readU32LE;
 using dss::link_format::test::readU64LE;
 // readI16LE is PE-only (used at one .reloc site); keep local until
-// a 2nd signed-LE consumer lands. Anchor D-TEST-LE-READ-SIGNED.
+// a 2nd signed-LE consumer lands. Anchor PIN-TEST-LE-READ-SIGNED.
 [[nodiscard]] std::int16_t readI16LE(std::span<std::uint8_t const> b,
                                       std::size_t off) {
     return static_cast<std::int16_t>(readU16LE(b, off));

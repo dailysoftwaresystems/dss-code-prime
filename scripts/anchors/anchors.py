@@ -756,6 +756,9 @@ def cmd_write(argv):
     ap.add_argument("--cross-refs", dest="cross_refs")
     ap.add_argument("--cross-refs-file", dest="cross_refs_file")
     ap.add_argument("--insert", action="store_true", help="declare a NEW row")
+    ap.add_argument("--relocating", action="store_true",
+                    help="with --insert: this row already exists elsewhere in the repository and "
+                         "is being MOVED here, so its id is not a new name")
     ap.add_argument("--apply", action="store_true", help="write; otherwise dry run")
     a = ap.parse_args(argv)
     # Each prose cell arrives inline OR from a file (see `cell_argument`); from here on the
@@ -784,8 +787,24 @@ def cmd_write(argv):
               "`set-anchor --priority` and the correction survives every later edit.")
     # MINT only when --insert: otherwise this is an UPDATE of a row place_row
     # will refuse unless it already exists. See ANCHOR_ID_WELLFORMED.
+    #
+    # ★ --relocating IS THE THIRD CASE, AND IT IS AN INSERT THAT IS NOT A NAMING.
+    # A row that already exists in a plan document and is being moved into a registry is not
+    # being named for the first time: its id is in the tree, cited, and resolvable. The minting
+    # rule exists so a NEW name is guard-resolvable, and `check-anchor-registry` resolves `D-`
+    # plus ONE hyphen group -- so `D-AS3-1` resolves today while this stricter rule would refuse
+    # to write the row that owns it. Refusing it would force a rename of the row AND of every
+    # citation, or a hand-written table row; both are worse than saying what is happening.
+    # ⚠ It does NOT relax the shape: ANCHOR_ID_WELLFORMED still refuses a dot, a space, or a
+    # name no registry could hold, which is why the 48 `D-3e.1`-shaped rows are still minted.
+    if a.relocating and not a.insert:
+        raise Refused(
+            "--relocating describes an --insert of a row that exists elsewhere. Without "
+            "--insert this is the UPDATE path, where the relaxed id rule already applies and "
+            "`place_row` refuses an id that names no row -- a stronger identity check than "
+            "either rule.")
     row = make_row(a.anchor, priority, status, a.trigger, a.closing, a.cross_refs,
-                   minting=bool(a.insert))
+                   minting=bool(a.insert) and not a.relocating)
     dest = place_row(ROOT, working, a.anchor, row, write=a.apply, insert=a.insert)
     print("  row     %d chars" % len(row))
     print("anchors: WROTE %s" % dest if a.apply
@@ -1273,6 +1292,38 @@ def self_test():
                 and got[0].cell(C_TRIGGER).strip().endswith("y" * 33000),
                 "(33) `set --closing-file` replaces JUST that cell, and the Trigger survives",
                 "refused=%r rows=%d" % (msg_s, len(got)))
+
+            # ── (41) A RELOCATION IS AN INSERT THAT IS NOT A NAMING ──────────────────────
+            # The id is assembled from fragments for the reason the header of this function
+            # gives: a literal `D-x-y` in `scripts/` is a CITATION the guard must resolve.
+            RL_ = "D-" + "RELOC" + "-1"
+            with contextlib.redirect_stdout(sink):
+                msg_r1 = refuse(cmd_write, ["--production", RL_, "--insert", "--priority", "P3",
+                                            "--status", "open", "--trigger", "🟠 **OPEN** t",
+                                            "--apply"])
+            pin("not a well-formed anchor id" in (msg_r1 or ""),
+                "(41a) `--insert` alone still refuses a two-segment id as a NEW name")
+            with contextlib.redirect_stdout(sink):
+                msg_r2 = refuse(cmd_write, ["--production", RL_, "--insert", "--relocating",
+                                            "--priority", "P3", "--status", "open",
+                                            "--trigger", "🟠 **OPEN** t", "--apply"])
+            pin(msg_r2 is None and len(find(tmp, RL_)) == 1,
+                "(41b) `--insert --relocating` writes it -- the row exists elsewhere, so the id "
+                "is not a new name", "refused=%r" % (msg_r2,))
+            with contextlib.redirect_stdout(sink):
+                msg_r3 = refuse(cmd_write, ["--production", _FX + "-RELOCNOINSERT",
+                                            "--relocating", "--priority", "P3", "--status",
+                                            "open", "--trigger", "🟠 **OPEN** t", "--apply"])
+            pin("--relocating describes an --insert" in (msg_r3 or ""),
+                "(41c) CONTROL: `--relocating` without `--insert` is refused, so the flag cannot "
+                "quietly become a second spelling of the update path")
+            with contextlib.redirect_stdout(sink):
+                msg_r4 = refuse(cmd_write, ["--production", "D-" + "has dot.1", "--insert",
+                                            "--relocating", "--priority", "P3", "--status",
+                                            "open", "--trigger", "🟠 **OPEN** t", "--apply"])
+            pin("not a well-formed anchor id" in (msg_r4 or ""),
+                "(41d) CONTROL: `--relocating` still refuses a name no registry could hold -- it "
+                "relaxes the SEGMENT COUNT, never the shape")
 
             # ── (34..37) ONLY LINE BREAKS COLLAPSE; A RUN OF SPACES IS THE AUTHOR'S TEXT ──
             # [D-GATE-ANCHORS-WRITER-COLLAPSES-EVERY-WHITESPACE-RUN-SO-AN-UNNAMED-CELL-DOES-NOT-SURVIVE-VERBATIM]

@@ -1,4 +1,4 @@
-// D-LK6-14-PAYLOAD-PIN: direct unit tests for the chained-fixups
+// PIN-LK6-14-PAYLOAD-PIN: direct unit tests for the chained-fixups
 // payload builder hoisted from macho.cpp at the d312c1c audit fold.
 // Pins byte-structure invariants of the LC_DYLD_CHAINED_FIXUPS
 // __LINKEDIT payload independently of the encodeExec* integration —

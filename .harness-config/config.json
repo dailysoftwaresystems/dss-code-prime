@@ -1,0 +1,501 @@
+{
+  "version": 1,
+  "defaults": {
+    "buildCores": 6,
+    "testCores": 6,
+    "maxParallelLegs": 4,
+    "project": "dss-code-prime",
+    "stallSeconds": 1800,
+    "durationWarningFactor": 3.0,
+    "clockStepToleranceMilliseconds": 2000,
+    "processSampleSeconds": 5
+  },
+  "toolchains": {
+    "msvc": {
+      "platforms": [
+        "windows"
+      ],
+      "generator": "Ninja"
+    },
+    "mingw-gcc": {
+      "platforms": [
+        "windows"
+      ],
+      "generator": "Ninja",
+      "env": {
+        "CC": "gcc",
+        "CXX": "g++"
+      }
+    },
+    "gcc": {
+      "platforms": [
+        "linux"
+      ],
+      "generator": "Ninja",
+      "env": {
+        "CC": "gcc",
+        "CXX": "g++"
+      }
+    },
+    "clang": {
+      "platforms": [
+        "macos"
+      ],
+      "generator": "Ninja",
+      "env": {
+        "CC": "clang",
+        "CXX": "clang++"
+      }
+    }
+  },
+  "sanitizers": {
+    "asan": {
+      "env": {
+        "CFLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer -g",
+        "CXXFLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer -g",
+        "LDFLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer -g",
+        "ASAN_OPTIONS": "abort_on_error=1:detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1",
+        "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1"
+      }
+    }
+  },
+  "buildConfigs": {
+    "debug": {
+      "cmakeBuildType": "Debug"
+    },
+    "release": {
+      "cmakeBuildType": "Release"
+    }
+  },
+  "projects": [
+    {
+      "name": "dss-code-prime",
+      "type": "cmake",
+      "path": ".",
+      "defaultToolchain": {
+        "windows": "mingw-gcc",
+        "linux": "gcc",
+        "macos": "clang"
+      },
+      "test": {
+        "all": {
+          "runner": "ctest",
+          "args": [
+            "--output-on-failure",
+            "--no-tests=error"
+          ],
+          "filterArg": "-R",
+          "excludeArg": "-LE",
+          "coresEnv": [
+            "CTEST_PARALLEL_LEVEL"
+          ],
+          "successPattern": "100% tests passed",
+          "countPattern": "tests failed out of (?<total>\\d+)"
+        }
+      }
+    }
+  ],
+  "hosts": {
+    "local": {},
+    "wsl": {
+      "Ubuntu": {
+        "repositoryPath": "~/src/dss-code-prime"
+      }
+    },
+    "ssh": {
+      "macos": {
+        "repositoryPath": "~/src/dss-code-prime",
+        "keepAwake": [
+          "caffeinate",
+          "-dimsu",
+          "-w",
+          "{pid}"
+        ],
+        "connectTimeoutSeconds": 25,
+        "keepAliveSeconds": 30
+      },
+      "arm64-vps": {
+        "repositoryPath": "~/src/Github/dss-code-prime",
+        "connectTimeoutSeconds": 25,
+        "keepAliveSeconds": 30
+      }
+    }
+  },
+  "emulators": {
+    "qemu-aarch64": {
+      "hostOs": "linux",
+      "hostProcessor": "x86_64",
+      "processor": "arm64",
+      "launcher": [
+        "qemu-aarch64"
+      ],
+      "env": {
+        "QEMU_LD_PREFIX": "/usr/aarch64-linux-gnu"
+      },
+      "requires": [
+        "qemu-aarch64",
+        "/usr/aarch64-linux-gnu",
+        "/usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1",
+        "/usr/aarch64-linux-gnu/lib/libgcc_s.so.1"
+      ],
+      "phases": [
+        "test"
+      ],
+      "witness": {
+        "command": [
+          "/usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1",
+          "--help"
+        ],
+        "pattern": "self-identifies as: /lib/ld-linux-aarch64\\.so\\.1"
+      },
+      "tool": "qemu-aarch64",
+      "description": "runs arm64 Linux artefacts on an x86_64 Linux host (the WSL leg's arm64 corpus arm)"
+    },
+    "qemu-x86_64": {
+      "hostOs": "linux",
+      "hostProcessor": "arm64",
+      "processor": "x86_64",
+      "launcher": [
+        "qemu-x86_64"
+      ],
+      "env": {
+        "QEMU_LD_PREFIX": "/usr/x86_64-linux-gnu"
+      },
+      "requires": [
+        "qemu-x86_64",
+        "/usr/x86_64-linux-gnu",
+        "/usr/x86_64-linux-gnu/lib/ld-linux-x86-64.so.2",
+        "/usr/x86_64-linux-gnu/lib/libgcc_s.so.1"
+      ],
+      "phases": [
+        "test"
+      ],
+      "witness": {
+        "command": [
+          "/usr/x86_64-linux-gnu/lib/ld-linux-x86-64.so.2",
+          "--help"
+        ],
+        "pattern": "self-identifies as: /lib64/ld-linux-x86-64\\.so\\.2"
+      },
+      "tool": "qemu-x86_64",
+      "description": "runs x86_64 Linux artefacts on the arm64 VPS"
+    },
+    "rosetta": {
+      "hostOs": "macos",
+      "hostProcessor": "arm64",
+      "processor": "x86_64",
+      "launcher": [
+        "arch",
+        "-x86_64"
+      ],
+      "requires": [
+        "arch",
+        "/Library/Apple/usr/libexec/oah"
+      ],
+      "phases": [
+        "test"
+      ],
+      "witness": {
+        "command": [
+          "/usr/bin/uname",
+          "-m"
+        ],
+        "pattern": "^x86_64$"
+      },
+      "description": "runs x86_64 Mach-O artefacts on the Apple Silicon Mac"
+    }
+  },
+  "legs": {
+    "windows-x86_64-debug": {
+      "os": "windows",
+      "processor": "x86_64",
+      "project": "dss-code-prime",
+      "toolchain": "mingw-gcc",
+      "config": "debug",
+      "description": "Debug build and test on Windows with MinGW-w64 GCC (the build/dbg tree)"
+    },
+    "windows-x86_64-release": {
+      "os": "windows",
+      "processor": "x86_64",
+      "project": "dss-code-prime",
+      "toolchain": "msvc",
+      "config": "release",
+      "description": "Release build and test on Windows with MSVC cl.exe (the build/msvc tree)"
+    },
+    "linux-x86_64-debug": {
+      "os": "linux",
+      "processor": "x86_64",
+      "wsl": "Ubuntu",
+      "project": "dss-code-prime",
+      "toolchain": "gcc",
+      "config": "debug",
+      "description": "Debug build and test on the WSL x86_64 distribution"
+    },
+    "linux-x86_64-release": {
+      "os": "linux",
+      "processor": "x86_64",
+      "wsl": "Ubuntu",
+      "project": "dss-code-prime",
+      "toolchain": "gcc",
+      "config": "release",
+      "description": "Release build and test on the WSL x86_64 distribution"
+    },
+    "macos-arm64-debug": {
+      "os": "macos",
+      "processor": "arm64",
+      "ssh": "macos",
+      "project": "dss-code-prime",
+      "toolchain": "clang",
+      "config": "debug",
+      "description": "Debug build and test on the Apple Silicon Mac"
+    },
+    "macos-arm64-release": {
+      "os": "macos",
+      "processor": "arm64",
+      "ssh": "macos",
+      "project": "dss-code-prime",
+      "toolchain": "clang",
+      "config": "release",
+      "description": "Release build and test on the Apple Silicon Mac"
+    },
+    "linux-arm64-debug": {
+      "os": "linux",
+      "processor": "arm64",
+      "ssh": "arm64-vps",
+      "project": "dss-code-prime",
+      "toolchain": "gcc",
+      "config": "debug",
+      "description": "Debug build and test natively on the arm64 Linux VPS"
+    },
+    "linux-arm64-release": {
+      "os": "linux",
+      "processor": "arm64",
+      "ssh": "arm64-vps",
+      "project": "dss-code-prime",
+      "toolchain": "gcc",
+      "config": "release",
+      "description": "Release build and test natively on the arm64 Linux VPS"
+    }
+  },
+  "legSets": {
+    "gate": [
+      "windows-x86_64-debug",
+      "windows-x86_64-release",
+      "linux-x86_64-debug",
+      "linux-x86_64-release",
+      "macos-arm64-debug",
+      "macos-arm64-release",
+      "linux-arm64-debug",
+      "linux-arm64-release"
+    ]
+  },
+  "tools": [
+    {
+      "name": "cmake",
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "cmake version (\\d+\\.\\d+\\.\\d+)"
+      },
+      "minVersion": "4.0",
+      "why": "configures and drives every build; the root CMakeLists declares cmake_minimum_required(VERSION 4.0)"
+    },
+    {
+      "name": "ninja",
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "(\\d+\\.\\d+\\.\\d+)"
+      },
+      "install": {
+        "linux": {
+          "manager": "apt",
+          "id": "ninja-build"
+        }
+      },
+      "why": "the generator every toolchain in this file requests"
+    },
+    {
+      "name": "git",
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "git version (\\d+\\.\\d+\\.\\d+)"
+      },
+      "install": {
+        "linux": {
+          "manager": "apt",
+          "id": "git"
+        }
+      },
+      "why": "the tree, the worktrees, and the ignore list every sync is derived from"
+    },
+    {
+      "name": "python3",
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "Python (\\d+\\.\\d+\\.\\d+)"
+      },
+      "why": "the configure step runs find_package(Python3 COMPONENTS Interpreter REQUIRED), and most repository guards registered as ctest entries are Python"
+    },
+    {
+      "name": "pwsh",
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "PowerShell (\\d+\\.\\d+\\.\\d+)"
+      },
+      "why": "on a Windows host the configure step requires a PowerShell interpreter for the anchor-registry and line-endings guards"
+    },
+    {
+      "name": "g++",
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "\\)\\s+(\\d+\\.\\d+\\.\\d+)"
+      },
+      "minVersion": "13.0",
+      "why": "the compiler behind the mingw-gcc and gcc toolchains; the root CMakeLists records GCC 13+ as verified"
+    },
+    {
+      "name": "clang++",
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "clang version (\\d+\\.\\d+\\.\\d+)"
+      },
+      "minVersion": "16.0",
+      "why": "the compiler behind the clang toolchain on macOS; the root CMakeLists records Clang 16+ as verified"
+    },
+    {
+      "name": "cl",
+      "why": "the MSVC compiler the windows-x86_64-release leg builds with; it is on PATH only inside a Visual Studio developer environment, so no probe is declared"
+    },
+    {
+      "name": "tclsh",
+      "install": {
+        "linux": {
+          "manager": "apt",
+          "id": "tcl"
+        }
+      },
+      "why": "the sqlite corpus's testfixture TCL suite; tclsh also decides which Tcl header the corpus build compiles against"
+    },
+    {
+      "name": "qemu-aarch64",
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "version (\\d+\\.\\d+\\.\\d+)"
+      },
+      "install": {
+        "linux": {
+          "manager": "apt",
+          "id": "qemu-user"
+        }
+      },
+      "why": "the user-mode emulator the qemu-aarch64 entry runs arm64 artefacts through on an x86_64 Linux host"
+    },
+    {
+      "name": "qemu-x86_64",
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "version (\\d+\\.\\d+\\.\\d+)"
+      },
+      "install": {
+        "linux": {
+          "manager": "apt",
+          "id": "qemu-user"
+        }
+      },
+      "why": "the user-mode emulator the qemu-x86_64 entry runs x86_64 artefacts through on the arm64 VPS"
+    }
+  ],
+  "commit": {
+    "signOff": true
+  },
+  "sync": {
+    "neverTransfer": [
+      "build",
+      "build-wsl",
+      "target",
+      ".dss-deps",
+      "scratchpad",
+      "Testing",
+      "test-scratch",
+      ".worktrees",
+      ".claude/worktrees",
+      ".secrets",
+      ".temp",
+      ".venv",
+      "node_modules",
+      ".kilo",
+      "__pycache__",
+      ".ccache",
+      ".cache"
+    ],
+    "maxDeleteFraction": 0.25
+  },
+  "contention": {
+    "buildTools": [
+      "ctest",
+      "ninja",
+      "cmake",
+      "make",
+      "gmake",
+      "msbuild"
+    ],
+    "sharedResourceTools": [
+      "dsscp"
+    ]
+  },
+  "worktrees": {
+    "root": ".worktrees",
+    "evidenceRoots": [
+      "scratchpad",
+      ".temp"
+    ],
+    "maxNameLength": 10,
+    "pathBudgetReserve": 163,
+    "pathBudgetMargin": 20,
+    "pathLimit": 260,
+    "detach": true
+  },
+  "anchors": {
+    "pendingAnchorsPath": ".plans/_deferred-anchor-registry-production.md",
+    "doneAnchorsPath": ".plans/_deferred-anchor-registry-done.md",
+    "idPrefix": "D",
+    "minimumIdSegments": 3,
+    "citationRoots": [
+      "src",
+      "examples",
+      "docs",
+      "README.md",
+      ".gitattributes"
+    ]
+  },
+  "sshItems": [
+    "macos",
+    "arm64-vps"
+  ],
+  "wslDistros": [
+    "Ubuntu"
+  ],
+  "ci": {
+    "workflows": [
+      ".github/workflows/pipeline-pr.yml"
+    ],
+    "legBudgetMinutes": 180
+  }
+}

@@ -1138,7 +1138,7 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                         "dss::mergeCuMirs fatal: CU %u global symbol v=%u "
                         "initFunc (func symbol v=%u) was not cloned — a global's "
                         "init function must survive the merge "
-                        "(D-MERGE-GLOBAL-INITFUNC).\n",
+                        "(PIN-MERGE-GLOBAL-INITFUNC).\n",
                         ci, m.globalSymbol(g).v, m.funcSymbol(oldInitFunc).v);
                     std::abort();
                 }

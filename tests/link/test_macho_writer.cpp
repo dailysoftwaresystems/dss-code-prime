@@ -4453,7 +4453,7 @@ TEST(MachOExecWriter, ChainedFixupsStartsInImageTracksTheImageSegmentCount) {
     }
 }
 
-// D-LK6-14-SIZEOFCMDS-DELTA-PIN: chained path's sizeofcmds must be
+// PIN-LK6-14-SIZEOFCMDS-DELTA-PIN: chained path's sizeofcmds must be
 // exactly `kDysymtabCommandSize` (80) less than legacy path's (since
 // LC_DYSYMTAB is dropped on chained). Pins the ncmds/sizeofcmds
 // arithmetic against subtle drift.
@@ -4542,7 +4542,7 @@ TEST(MachOExecWriter, ChainedFixupsMultiPageGotFailsLoud) {
     constexpr std::uint32_t kPageSize    = 4096u;
     constexpr std::uint32_t kSlotSize    = 8u;
     constexpr std::uint32_t kSpillCount  = (kPageSize / kSlotSize) + 1u;
-    // FIXTURE-INVARIANT (D-TEST-MULTI-PAGE-FIXTURE-INVARIANT): all
+    // FIXTURE-INVARIANT (PIN-TEST-MULTI-PAGE-FIXTURE-INVARIANT): all
     // 513 externs share libSystem (libOrdinal=1 << 127 ceiling) and
     // the symbols-pool stays under 8 MiB (D-LK6-14-NAME-OFFSET-OVERFLOW).
     // The SOLE failure surface this fixture probes is

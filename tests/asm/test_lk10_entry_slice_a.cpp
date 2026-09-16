@@ -358,7 +358,7 @@ TEST(LK10EntrySliceA, SyscallWithStrayOperandFailsLoud) {
     // `x86_64.target.json` $reservedFields: "minOperands/
     // maxOperands fields are NOT yet fully enforced"). The encoder's
     // variant-guard match in `walker_util.hpp::operandsMatchGuard`
-    // is the SOLE gate today. Anchor D-LIR-BUILDER-OPERAND-COUNT-GATE
+    // is the SOLE gate today. Anchor PIN-LIR-BUILDER-OPERAND-COUNT-GATE
     // — if a future LirBuilder operand-count gate is added, the test
     // would start to fail at addInst (different code path); that
     // signals an intentional substrate change the test author

@@ -27,6 +27,10 @@ below is IN it.
    could hit. **This is the priority, always.**
 3. **`.plans/_deferred-anchor-registry-harness.md`** — the open defects only WE can hit (tests,
    gates, scripts, carriages). A RECORD, not a backlog: drained by encounter, never scheduled.
+   ⏳ **THIS FILE IS BEING RETIRED** by `feature/dssharness-migration`: the harness becomes
+   DssHarness's problem, and every anchor from then on is a production anchor. While the branch is
+   open the file is still here and still authoritative; the commit that deletes it rewrites this
+   chain and item 4 below in the same commit.
 4. **`.plans/_deferred-anchor-registry-done.md`** — the archive. **Nothing here is work.**
    ⚠ Closing a row MOVES it between these files. It is never marked in place.
    ⛔ **Never hand-edit or hand-read a row.** `scripts/anchors/{write,set,read}-anchor` is the only
@@ -58,319 +62,60 @@ below is IN it.
 
 ## §0.0 — STATE
 
-✅ **P66's EXIT IS `956e5526`, PUSHED TO PR #57. CI and sqlite `veryquick` have run on it, as measured below. The merge is the operator's.** All eight lanes are folded, the fold-time eight-run gate is green, and both P0 atomics rows are ✅ CLOSED. The commit carrying this record follows `956e5526`; re-derive HEAD with `git log --oneline -3`.
+🔵 **P67 IS THE DssHarness MIGRATION, AND IT IS IN FLIGHT ON `feature/dssharness-migration`.** This
+branch carries the migration and nothing else (operator ruling, 2026-09-15). Its contract is
+`.temp/pending-harness-for-code-prime.md` — deliberately untracked, 860 lines, reviewed by six
+read-only agents before any of it was executed. **Re-derive HEAD with `git log --oneline -3`.**
 
-**The eight-run gate on the folded tree, 2026-09-15.** Each run went through `run-gate` with its witness present, inputs held still, and no compilers outside its own process tree:
+**What this repository is migrating to.** `DssHarness`, the cross-platform .NET tool built in
+`C:\Source\DailySoftware\repo-harness` and published on nuget.org; 0.5.2 is installed here. It has
+the anchor, worktree, leg and host verbs; `build`, `test`, `sync` and `run` are planned for 0.6
+through 0.9 and do not exist yet, which is why the gate, leg and carriage scripts stay for now.
+✔MEASURED 2026-09-16: repo-harness's working tree already carries 28 files of uncommitted work
+adding `sshItems`, `wslDistros`, `citationRoots`, `maxDeleteFraction` and `evidenceRoots` and
+deleting its ssh-config reader — the requirements this plan asks for. None of those fields is in
+the published 0.5.2, so this repository's `config.json` targets the shape the tool is moving to.
 
-|  | Windows | WSL x86_64 | macOS arm64 | arm64 VPS |
-|---|---|---|---|---|
-| **Debug** | 2207/2207 (MinGW gcc, re-run on the fixed tree) | 2206/2206 (arm-ledger 0 poisoned) | 2167/2167 | 2167/2167 |
-| **Release** | 2207/2207 (MSVC, `build/msvc`) | 2206/2206 (arm-ledger 0 poisoned) | 2167/2167 | 2167/2167 |
+### ⚠ THE FIRST THING A FRESH CHECKOUT HITS, AND IT LOOKS LIKE A COMPILER DEFECT
 
-- ⚠ **The first Windows Debug run was 2206/2207, red on `repo_tree_guard` alone.** It was a harness defect, now FIXED. `Invoke-RepoTreeProbe` threw on a child that exited non-zero with an empty stderr, which collapsed the self-test and discarded the exit code. Row `D-TEST-REPO-TREE-SELFTEST-PROBE-THROWS-ON-A-SILENT-CHILD-AND-DISCARDS-ITS-EXIT-CODE` (✅ CLOSED, harness) was proven red-on-disable through ctest. WHY that child failed was left unmeasured, by the harness ruling below. On the fixed script, the MSVC tree's `repo-guard` label passed 40/40.
-- The remote legs run `-LE repo-guard`, so their totals are the Windows totals less its 40 guards.
-- Anchor balance, measured after the closures: OPEN 787 → 786 against the cycle base `de1e83ef` (net −1), and 789 → 786 against the previous commit (closed 3, opened 0). `check-anchor-registry` is OK.
-- CI's last finished run (`090f090e`) was green on all five legs. ⚠ Its `linux-clang-asan` Test step used 5817 s of its 6600 s cap (88%), and this PR adds about 28 entries. Read that leg's duration on the push's run.
+✔MEASURED 2026-09-16 at `e8dbc3c5`: **1868 of 2207 tests failed**, every `examples/c/*` among them,
+each reporting `C_InvalidLanguageName: shipped-config version skew: this compiler is version 0.0.2
+but the config tree ... 0.5.0` plus `D_SchemaLoadFailed` naming `c.lang.json`. **Nothing was wrong
+with the configuration.** The squash merge bumped `VERSION` 0.0.2 → 0.5.0; CMake reads that file at
+configure time and stamps it into the binary, while the config tree is staged per run — so an
+INCREMENTAL build left a 0.0.2 compiler beside a 0.5.0 config tree, and the build reported success.
+`VERSION` is now a `CMAKE_CONFIGURE_DEPENDS` (root `CMakeLists.txt`), so a bump re-runs configure.
+★ The lesson is the diagnostic's, not the build's: a version-skew refusal is worded as a language
+error, so it reads as a defect in the file it names.
 
-**Closed by this exit:**
-- `D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE` (P0, production): `+=`, `++` and `--` on an `_Atomic` lvalue commit through the compare-exchange retry loop.
-- `D-C-ATOMICS-RUNTIME-PE64-BUS-LOCKS-EVERY-ACCESS-TO-A-CACHE-LINE-STRADDLING-OBJECT` (P0, production): a pe64 object that crosses a cache line is copied under the process heap's lock, and no access takes a bus lock (Option 1, per the operator's ruling below).
-- ⚠ **The bus-lock row's red was CI-only and intermittent** (`b3e006a8` red, `090f090e` green on the old runtime). Its proof is `packed_atomic_member_concurrency` on CI's `windows-msvc-release`, across runs. A green run is necessary, not sufficient; if it goes red again, reopen the row with that run's numbers.
+**Landed in this commit:**
+- `VERSION` as a configure dependency (above), and the green baseline re-taken on the fixed tree.
+- `anchors.py write --relocating`: a row that already exists in a plan document and is being MOVED
+  into a registry is not being NAMED, so the minting rule does not apply to it. Four self-test arms,
+  including the two controls that keep the flag from becoming a second spelling of the update path.
+- **The allowlist is retired.** Its eight entries were code-internal pins, not deferred work; each is
+  renamed out of the `D-` shape to `PIN-`, with all nine citations rewritten in the same commit. The
+  table went with them — an anchor-shaped table inside a registry document is a parse refusal for
+  DssHarness, not untidiness.
+- **The archive's malformed rows are repaired**: four Anchor cells that were not one backticked id,
+  and the three production ids that carried two rows each, merged with both texts preserved.
+- **`.harness-config/`**: the tool's contract — eight legs as a `gate` leg set, four toolchains,
+  three emulators, eleven tools, the two registry paths, the never-transfer floor, the contention
+  tools and the worktree budget — with the per-host connection data ignored and only the contract and
+  the runner actions tracked.
 
-**Operator rulings, 2026-09-15, in addition to the atomics ruling recorded below:**
-- *"we need to merge this PR... just add new sessions if you find blockers for current session"*: during an exit, only merge blockers get lanes.
-- *"don't worry too much on harnesses. after this PR is merged, we'll start using our new dotnet tool as harness: C:\Source\DailySoftware\repo-harness\RepoHarness.slnx. It's a client that will do most of our harness work and we'll ideally remove our harness anchors from here and this being working will be that repo responsibility. Also, it'll ensure cross platform on commands and avoid posix/windows pairing"*
-- *"my real concern is this shit to be fixed: D-C-ATOMICS-RUNTIME-PE64-BUS-LOCKS-EVERY-ACCESS-TO-A-CACHE-LINE-STRADDLING-OBJECT and you wasting hours on harnesses..."*
-- Push order, chosen by the operator: push right after the gate's commit, so CI tests the bus-lock fix sooner; `veryquick` runs on the pushed commit.
-
-**NOT DISPATCHED, by the harness ruling.** The four harness sessions spawned during P66 belong to repo-harness:
-- lane-worktree's git calls are steered by a caller's `GIT_DIR`;
-- the PowerShell ssh carriages miss `.secrets` when run from a lane worktree;
-- the `check-plan-citations` and `check-wrapped-anchor-ids` self-tests leak temp boxes;
-- `refresh_landing_log --check` cannot fail.
-
-**MEASURED after `956e5526` was pushed, 2026-09-15:**
-- **CI run 35002599732 on `956e5526`: GREEN on all five test legs**, and DCO passed.
-  - `windows-msvc-release` ran its 2207 tests in 977.65 s (979 s of its 3000 s cap). There `packed_atomic_member_concurrency` passed in 2.05 s (CLI runner) and 2.18 s (in-process runner), where the red run at `b3e006a8` took 33.31 s and 17.17 s; `program/test_atomics_runtime_no_split_lock` passed in 2.70 s.
-  - `linux-clang-asan` used 3301 s of its 6600 s cap (50%; the previous run used 5817 s).
-- **sqlite `veryquick` over `956e5526` on all four hosts, 0 poisoned on every one:**
-
-| host | verdict |
-|---|---|
-| Windows | Driver rc 1. pe64-x86_64 GREEN (3 errors of 394,470, all known confounds). elf64-x86_64 in the WSL kernel GREEN (9 of 394,817, all known confounds). elf64-arm64 under qemu in the WSL kernel **2 GENUINE by the window rule** (`walsetlk_recover-1.2`, `walsetlk_recover-1.3.(1770)`), 6 confounds excused. Both Mach-O legs built, not run (`runOn`). |
-| WSL x86_64 | Driver rc 0; the clone was prepared at `956e5526` and restored clean. elf64-x86_64 GREEN (6 of 394,817). elf64-arm64 under qemu GREEN (10 of 394,821; `walsetlk_recover-1.3` among them, EXCUSED with 2 clock steps inside its window). pe64-x86_64 under wine GREEN (3 of 392,936) but NOT FULL COVERAGE (3 unit groups not reached). |
-| macOS arm64 | GREEN: macho64-arm64 3 of 394,609 and macho64-x86_64 3 of 394,605, all known confounds. The first launch refused at preflight, because the host's Homebrew stages Tcl 9.0 headers while every leg's pinned library is Tcl 8.6. It re-ran with `DSS_TCL_VERSION=8.6`, the setting the driver names. |
-| arm64 VPS | GREEN: elf64-arm64 NATIVE 3 of 394,799 and elf64-x86_64 under qemu 3 of 394,795, all known confounds. |
-
-- ⚠ **The Windows run's two reds are ENVIRONMENTAL, not DSS.**
-  - The same DSS-built elf64-arm64 code passed the whole corpus NATIVELY on the arm64 VPS, with no `walsetlk_recover` failure.
-  - The same qemu leg on WSL hit `walsetlk_recover-1.3` again, with clock steps recorded inside its window.
-  - On the Windows host that leg runs under qemu inside WSL2, where the run's own probe measured 10 wall-clock steps and 27 s of drift in 20 s.
-  - Lane `wl`'s per-failure excusal found no step inside those two failures' own log windows, so it charged them to DSS. 🧠 INFERRED: the clock damage lands outside a failure's log window, or qemu's slowness meets a lock timeout.
-  - That excusal is harness, left for repo-harness by the operator's ruling.
-- ✔ **Cleanup:** all eight lane worktrees were removed through `lane-worktree.sh remove --discard-work --preserve-to`.
-  - Beforehand, no worktree held a path absent from `956e5526`.
-  - Every evidence file, 28,890 in all, was copied to the session scratchpad and re-read with size and CRC matching.
-  - `git worktree list` now shows the main checkout alone.
-  - ⓘ LEFT IN PLACE, not deleted by this session: WSL's `~/.cache/pg/` and `~/ge-p66-gate`, the leaked probe manifests, and the `csp-*` temp boxes.
-
-**Owed, in order:**
-1. The merge, which is the operator's.
-2. After the merge: branch from `main` and take production anchors first. Confirm with the operator how the harness rows move to repo-harness before touching them.
-
-### How the exit got here, kept as the record
-
-✔MEASURED 2026-09-14 and 2026-09-15. Two CI reds, two different defects:
-
-1. **`run_gate_guard` at `87175a7a` — FIXED in `090f090e` (pushed).** Lane `rt` closed `D-TEST-RUN-GATE-FIXTURE-RACES-FIXED-LIFETIME-PROCESSES-AGAINST-THE-GATES-SAMPLING-LATENCY`: the fixture raced fixed-lifetime stand-ins against the gate's sampling, and both twins followed recycled parent pids. ✔**CI GREEN on `090f090e`** (Pipeline run 34921813148): all five test legs; `windows-msvc-release` 2179/2179, `run_gate_guard` Passed in 257.23 s.
-2. **`packed_atomic_member_concurrency` at `b3e006a8` — OPEN, P0 production.** `run_gate_guard` PASSED on that run. `windows-msvc-release` failed because the DSS-built pe64 witness exceeded the runners' 5000 ms child limit three times in one job. The tests running beside it were a median 3.97× and 3.54× slower in its two windows, while the run as a whole was faster than the green one (median 0.65×). ✔The same witness bytes PASSED on `090f090e`'s runner (2.14 s and 2.66 s; that run totalled 863.62 s, like the earlier green run's 871.20 s, against the red run's 656.35 s). ⚠ So a green CI run does NOT mean it is fixed: a later run can go red on it again until the runtime changes.
-   `D-C-ATOMICS-RUNTIME-PE64-BUS-LOCKS-EVERY-ACCESS-TO-A-CACHE-LINE-STRADDLING-OBJECT`
-   🧠 The mechanism is INFERRED, not measured: the witness makes every access a split lock (a bus lock), and that runner's host likely throttles bus locks. The local gate cannot see it — this workstation's CPU reports no bus-lock detection.
-
-**Operator rulings, 2026-09-15.** They came after lane `bl` reported, and after gcc 13, clang 18 and MSVC 19.51 were measured on the same object. None of the three keeps a line-crossing packed `_Atomic` atomic across processes, and MSVC's and gcc's loads tear even inside one process (an MSVC-built copy of the witness tore in 20 of 20 runs).
-- *"If we can guarantee full atomicity across process, then Option 2. If Option 2 is really impossible or too expensive in terms of runtime cost (making it slow/heavy), then Option 1."*
-  - **Option 1** is `bl` as built: one lock per process, no bus lock.
-  - **Option 2** is also atomic across processes: a locked instruction for memory another process can map.
-- Fix the `+=`/`++` lost update **before** merging PR #57.
-
-**The fold record, 2026-09-15: DONE, kept as the audit trail.** Items 1–9 below were written while the exit was in flight. Where they say *owed*, *launched* or *NOT COMMITTED*, the block at the top of §0.0 supersedes them.
-
-1. **Lane `bl`** (P0 production) — ✔**FOLDED into the main tree on 2026-09-15, NOT COMMITTED: 20 paths, plus its hunk in `tests/link/test_runtime_library_roles.cpp`, merged by hand. Its row was updated (48,306 characters, written by file) and is still 🟠 OPEN.**
-   `D-C-ATOMICS-RUNTIME-PE64-BUS-LOCKS-EVERY-ACCESS-TO-A-CACHE-LINE-STRADDLING-OBJECT`
-   - **Option 2 is not taken, and the operator's ruling decides that.** ✔MEASURED by `bl`: it cannot guarantee cross-process atomicity. A read-only mapping has no locked read, and a process DSS did not build cannot join. Classifying memory also costs a `VirtualQuery` on every access: a private store takes 303 ns against 14.4 ns, 21× slower.
-   - **So Option 1 ships:** a line-crossing object is copied under `HeapLock(GetProcessHeap())`, one lock per process. `__atomic_compare_exchange` is defined under the same arbiter.
-   - ⚠ **What Option 1 gives up.** DSS-built processes racing a line-crossing object in WRITABLE shared memory were mutually atomic under the old bus-locking design (0 torn in 10 of 10 runs) and now tear (10 of 10). No reference compiler provides that either.
-   - **Mutants:** nine, through ctest, each with named controls.
-   - ✔**Gates,** re-read by the orchestrator from the lane's logs:
-     - MSVC Release 2187/2188 and WSL x86_64 2186/2187, red only on `anchor_registry_guard`. It cites `ca`'s row, which is absent from `bl`'s base.
-     - MinGW Debug 2186/2188, which also reds `run_gate_guard` arms a23 and a26 on other lanes' `dsscp` (item 5).
-     - Every gate started after the last mutant restore, and each gate tree's staged `atomic.c` carries the final md5.
-   - ⚠ Its row cites lane `ih`'s row, which must land with it or before it.
-2. **Lane `ca`** (P0 production): route `+=`, `++` and `--` on an `_Atomic` lvalue through the compare-exchange retry loop that `atomic_fetch_*` already uses. ✔**FOLDED into the main tree on 2026-09-15, NOT COMMITTED (62 paths). Its row was updated and is still 🟠 OPEN.**
-   `D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE`
-   ✔MEASURED before filing: DSS loses updates on pe64 and elf64; MSVC built from the same source loses none.
-   ✔MEASURED by the lane on its final tree, then re-read by the orchestrator from the lane's own logs:
-   - **Gates:** MinGW Debug 2186/2188, MSVC Release 2185/2188, WSL x86_64 2186/2187, strict arm64 qemu 887/888 (scoped).
-   - **Reds:** every one but one is the packed race's pe64 arm, which waits on `bl`'s `__atomic_compare_exchange` and the pe64 key (item 7). The exception is MSVC's `run_gate_guard`, whose a23 arm saw lane `ih`'s `dsscp` (item 5).
-   - **Mutants:** five red-on-disable mutants, each built, its source md5 moved and returned, and its failing names read.
-   - **Tree:** no changed file is newer than the first gate log.
-   - **Row:** the cells landed byte-identical to the lane's (trigger 13957, closing 6653, cross-refs 1539 characters).
-   - **References:** floating `_Atomic` now WORKS, because gcc, clang and MSVC all run it. `atomic_fetch_add`/`sub` on a double works because clang runs it. `_Atomic` bit-fields stay refused, because all three refuse them.
-3. **Lane `ih`** (harness): the `integrated_tests` runner hang `bl` recorded. ✔**FOLDED 2026-09-15, NOT COMMITTED. The orchestrator sent it back twice first, and both reworks are recorded below.**
-   `D-TEST-INTEGRATED-RUNNER-HANGS-BEFORE-CREATING-ITS-EX-DIRECTORY` (row cells written ✅ CLOSED, P3; not in the registry yet)
-   - ✔**Root cause, MEASURED by the lane.** In MinGW gcc 13.2's libstdc++, `std::filesystem::remove_all` retries an entry forever once another process has deleted it. Runs starting together all prune the same kept scratch roots. Unfixed with planted roots: 20 of 20 runs hung. Fixed: 0 of 20.
-   - **The fix:** a `create_directory` claim, measured exclusive on MinGW and MSVC, then a re-check under the claim, then single-file deletion.
-   - **Mutants:** four, each 5 of 5 red.
-   - **The hang guard is REFUTED by CI's own log, ✔MEASURED by the orchestrator.** The lane gave all 1672 corpus entries TIMEOUT 300 s, on an INFERRED 100 s worst case for the ASan leg. Pipeline run 34921813148 (`linux-clang-asan` job 104231413144) measured `examples/c/deep_comma_chain_lowers_in_order` at **240.01 s**, so 300 s leaves 25% headroom. The slowest non-corpus entries on that leg are 1460.59 s (`program/test_emit_hir_round_trips_every_example`) and 1345.59 s.
-   - ✔**REWORKED, and re-read by the orchestrator.** `cmake/DssTestBudgets.cmake`, included as the root's last line, gives every ctest entry without its own TIMEOUT `9 × ceiling(tier, class)`.
-     - The class comes from the build's own flags: sanitized, release or debug. The tier is corpus, one of 38 named entries, or unit.
-     - The ceilings were MEASURED over six CI runs of all five legs, plus local and VPS cost data. The sanitized corpus ceiling is 289 s, set by one example that took 288.39 s under ASan.
-     - The pin `ctest/entry-budgets` has four mutants, each 3 of 3 red. A real hang was ended by name at 360 s.
-     - **Gates:** MSVC Release 2179/2180, MinGW Debug 2179/2180 and WSL x86_64 2178/2179. Each is red only on `anchor_registry_guard`, which cites the row not yet applied.
-     - The `run_gate_guard` wedge (1840 s, measured in this lane's MSVC gate) is `pg`'s to root-cause.
-   - **Sent back again for three gaps in its own mechanism, now all closed and re-verified.**
-     - **The module owns every budget.** Both explicit TIMEOUTs are removed, and the pin refuses a registration's own TIMEOUT that sits below the rule.
-     - **One owner for the class.** `cmake/DssBuildClass.cmake` is read by both the budgets and the shuffle arm. It stops the configure if the class moves between readers.
-     - **CI's real configure line.** The lane configured it exactly with clang-19, ccache and Ninja: the cache holds the flags, and the class selected is `sanitized`. The pin also re-reads the workflow and probes all five legs.
-     - **Mutants:** eight, each 3 of 3 red, plus a configure-stop arm; the control stays green.
-     - **Gates:** MSVC Release 2179/2180, MinGW Debug 2178/2180 and WSL 2178/2179. The reds are `anchor_registry_guard` (the row not yet applied) and, on MinGW only, `run_gate_guard` a26 seeing lane `pg`'s stand-in `dsscp`.
-   - ✔**FOLDED 2026-09-15, NOT COMMITTED: 9 paths.** Its row is ✅ CLOSED in the archive (20,729 characters), read back byte-identical.
-4. **Lane `wl`** (P1 harness): the sqlite `walsetlk` confound rows were honoured on a 20-second clock sample taken before the corpus runs, so the same failures were charged to DSS in one WSL run and excused in the next. ✔**FOLDED 2026-09-15, NOT COMMITTED: 8 files under `real-examples/c/sqlite/`. Its row is ✅ CLOSED and MOVED to the archive (53,135 characters, byte-identical to the lane's cells).**
-   - **Attribution now:** a clock-row failure is excused only when the kernel clock-set monitor spanning its corpus segment records a step of at least 5 s INSIDE that failure's own log window. The pre-run sample only arms the rows.
-   - **The pe64 reference oracle** now builds with DSS's three declared header edges. It emits them as `#include_next` shims derived from the shipped descriptors (`build.referenceSurface`), at the stated cost that a DSS failure on `fileio.c` is charged to DSS.
-   - ✔**Re-derived by the orchestrator on the lane's final files:** harness `--self-test` 2222/0, `--lint` 0 findings, `test-confound-scope.ps1` 140/0, `test-driver-contracts.ps1` 571/0. After the fold, `harness/test_sqlite_harness_legs` passed on the main Debug build.
-   - ⚠ **UNOBSERVED:** a pe64-leg run of either driver with the new oracle. The exit gate's sqlite legs owe it.
-   `D-HARNESS-SQLITE-CLOCK-CONFOUND-IS-GATED-ON-A-PROBE-TAKEN-BEFORE-THE-TESTS-RUN`
-   ✔MEASURED 2026-09-15: racing the same tests at the same time, the gcc reference fixture fails when DSS fails and passes when DSS passes, following whether the clock stepped during the run. At the operator's request the lane also races an MSVC-built fixture against DSS's pe64 one on Windows.
-   ✔MEASURED 2026-09-15 by the orchestrator (the operator asked whether DSS's longer WSL runs were a DSS or x86_64 target issue): per-test timing on `walsetlk.test`, every test's completion stamped on a clock that does not step. The evidence is under `~/.cache/refprobe/` on each host, and the lane records it in its row.
-   - **Steady-clock arm64 VPS:** DSS matches gcc on every timed test, to 0.01 s.
-   - **WSL x86_64:** DSS matches gcc and clang wherever no clock jump landed.
-   - **macOS under Rosetta (x86_64):** DSS matches an x86_64 Apple-clang reference on every test.
-   - **Windows x86_64 (pe64):** ✔MEASURED by a helper agent of lane `wl`, then re-derived by the orchestrator from its raw stamped files. The stamps (QueryPerformanceCounter) saw 0 clock steps, but the quiet gate was never met: the host was 42–100% busy.
-     - **Against a mingw gcc oracle built with the same `compile_options`:** DSS matches to ±0.02 s on every 2.x test, over 4 rounds with 0 failures.
-     - **Against MSVC,** a PARTIAL control (`ATOMIC_INTRINSICS` 1 vs 0, static `/MT` CRT, `/Od`): both fixtures fail the same "1 s < t < 4 s" assertions. Over 17 paired runs that is 12 DSS failures and 9 MSVC; the stamped rounds alone give 4 DSS and 7 MSVC. DSS's per-test medians sum 0.54 s higher.
-     - **One outlier:** an unstamped loaded round had 5 DSS-only failures (53.0 s against 42.3 s). The 2 stamped loaded rounds did not reproduce it, and its cause is 🧠INFERRED.
-     - **Evidence:** `.worktrees/wl/.temp/wl-scratch/msvc/`.
-   ⇒ No DSS-attributable timing difference on any host or architecture.
-5. **Lane `pg`** (harness), dispatched 2026-09-15 at `edfa495d`: gate evidence has to survive lanes running in parallel. Lane `ca` MEASURED all three defects:
-   - **Shared WSL leg log:** `scripts/wsl-leg/wsl-leg.sh` hard-codes `/tmp/wsl-leg-ctest.log` for every leg, and run-gate keys its state files off the log path, so two legs in one distro trade logs. `ca`'s strict leg was refused for listing lane `bl`'s files, and the log it copied out was `bl`'s run. 🧠 The same collision can hand a leg a green it did not earn.
-   - **Shared guard sandbox:** `run_gate_guard`'s sandbox is keyed by SOURCE TREE, so two gates of one checkout destroy each other's fixture. That is the end-of-round shape: Debug and Release of one tree. ⚠ Until `pg` lands, run those two gates ONE AT A TIME.
-   - **Machine-wide a23 arm:** `run_gate_guard`'s a23 arm goes red whenever any other `dsscp` runs anywhere on the machine.
-6. **Lane `lf`** (harness), dispatched 2026-09-15 at `edfa495d` and SEEDED with the main tree's uncommitted state (86 paths): the lane-landing tooling. ✔**Reported 2026-09-15 and verified by the orchestrator. NOT FOLDED: resumed for two more items.**
-   - **Fixed.** Each defect was reproduced first in a throwaway repository:
-     - The fold now measures an unseeded path against the LANE'S base commit; manifest format 2 records it.
-     - `remove` gates `.temp/` and `scratchpad/`, with a preserve that verifies every file.
-     - The landing steps are now the verbs `lane-fold.py apply-rows` and `land`.
-   - **Gates:** on Windows, `lane_fold_selftest_guard` 65/65, `lane_worktree_guard` 65/65 and `repo-guard` 31/31; on WSL, both guards. The final `lane-fold.py` mutant pass was 16 of 16 red as predicted.
-   - **Rows:** three harness rows are ready (P1, P2, P2).
-   - **Resumed for:**
-     - (a) `remove` still deletes a lane's unfolded tracked work. It must refuse without an explicit acknowledgment, which `land` gives only after measuring that nothing is left to fold.
-     - (b) About 256 leftover probe manifests sit in `.worktrees/.manifests/`. Find the guard that named them, fix any leak into the real repository, and list them for the orchestrator to delete.
-   - The three defects it closes, as first measured by reading the code, 2026-09-15:
-   - **`lane-fold.py fold` compares against the wrong HEAD.** For a path no seed recorded, the baseline is the MAIN tree's HEAD at fold time, not the lane's base commit. So once one lane's fold is COMMITTED, an OVERLAPPING lane's fold overwrites that lane's edits SILENTLY.
-     - ⛔ Until it is fixed, **do NOT commit between the `ca` and `bl` folds.** They share `tests/link/test_runtime_library_roles.cpp`, `examples/README.md` and `src/program/compile_pipeline.hpp`.
-     - With `ca` left uncommitted, the `bl` fold REFUSES on those three, loudly, instead.
-   - **`lane-worktree.sh remove` does not guard the lane's evidence.** It gates only `<worktree>/scratchpad/`, but lanes keep their evidence under `.temp/<lane>-scratch/`, which it deletes unguarded.
-     - ⛔ Until it is fixed, **remove no lane worktree** unless `.temp/<lane>-scratch/` was copied out first and the copy counted.
-   - **The orchestrator's `land-lane.sh` and `apply-lane-rows.sh` exist only in a SESSION scratchpad,** so a new session does not have them.
-     - `land-lane.sh` keeps only a `findings.md`.
-     - `apply-lane-rows.sh` treated every `*.status` stem as a row and wrote rows one at a time. On `ca` it wrote the real row, then refused a draft named `lead`. ✔ The scratch copy now checks every stem before writing any row, and hands cells over by file.
-   - ✔**FIXED by the orchestrator: the row writer took every cell only on the command line.**
-     - **What happened:** `bl`'s 48 KB row hit Windows' 32,767-character command-line limit (`Argument list too long`, exit 126), and nothing was written.
-     - **The fix:** `anchors.py`'s `write` and `set` verbs now also take `--trigger-file`, `--closing-file` and `--cross-refs-file`.
-     - **Proof:** self-test arms (27)–(33), and three mutants through ctest, each red exactly where predicted.
-     - **Row:** `D-GATE-ANCHORS-WRITER-TAKES-CELLS-ONLY-ON-THE-COMMAND-LINE-SO-A-LARGE-ROW-CANNOT-BE-WRITTEN` (✅ CLOSED, harness).
-6b. **Lane `rr`** (harness), dispatched 2026-09-15 at `edfa495d` and SEEDED with the main tree's uncommitted state (95 paths): guard scripts that find their repository from the CALLER'S working directory.
-   - ✔**MEASURED 2026-09-15.** The orchestrator's working directory was in `.worktrees/wl`. From there, the main tree's `check-anchor-balance.py`, run by absolute path, reported `OPEN now registry=448`: the `wl` worktree's registries. The main tree holds 447, and both runs said `OK`.
-   - **The mechanism:** a bare `git rev-parse --show-toplevel` sets the root in at least eight scripts: `check-anchor-balance`, `apply-registry-row`, `check-diagnostic-codes`, `check-wrapped-anchor-ids`, `check-scripts-index`, `check-stale-refusal-citations`, `check-guard-output-encoding` and `check-plan-citations`.
-   - **Why no gate saw it:** ctest runs every guard from the source tree.
-   - **Prior art:** the same class that `D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED` closed for the lane tools.
-7. **ALL EIGHT LANES ARE FOLDED** (`ca`, `bl`, `wl`, `ih`, `pg`, `rr`, `lf`, `ge`), NOT COMMITTED. The integration the lanes could not do for each other is DONE, also uncommitted:
-   - ⚠ **The combined-tree check, 2026-09-15, after `ge` folded:**
-     - The rebuild re-ran CMake; the `repo-guard` label covers 40 entries, and budgets assign a TIMEOUT to 2207 entries (unit 481), 0 with their own.
-     - `repo-guard` passed **39/40**. The one red was `lane_fold_selftest_guard`, which passed in `lf`'s own tree; a merge blocker, FIXED by the orchestrator:
-       - **Cause (MEASURED, reproduced on a re-run):** `lane-fold.py`'s landing fixture copied the row writer with only `anchors`, `check-anchor-balance` and `burndown-queue`. `rr` moved the latter two onto `owning-tree`, and `ge` moved `anchors`, so the copied writer "refused to load" for want of `owning-tree.py`. `lf`'s tree held no `owning-tree` consumer, and `rr` and `ge` gated against the older `lane-fold.py`.
-       - **Fix:** the fixture copies the writer's whole load closure, `owning-tree` included, with a comment naming it.
-       - **Red-on-disable** through ctest: pristine 1/1 passed (80 pins, 0 failed); with `owning-tree` dropped (md5 moved and returned) it failed rc 8 with the same refusal while control pin (t3) stayed ok; restored, 1/1 passed.
-       - Row `D-TEST-LANE-FOLD-LANDING-FIXTURE-COPIES-THE-ROW-WRITER-WITHOUT-OWNING-TREE` (✅ CLOSED, harness, P2) was written with no citation and read back identical.
-     - ✔MEASURED after that fix: `repo-guard` **40/40** through `run-gate.ps1`, with inputs held still, changes watched, not contended, and no compilers outside its own tree. Anchor balance: 448 at HEAD, 447 now.
-     - ⏳ **The eight-run gate was then LAUNCHED:**
-       - local legs one after another: Windows Debug, Windows Release (MSVC), WSL Debug, WSL Release;
-       - macOS and the arm64 VPS in parallel, each running Debug then Release;
-       - one `run-gate.ps1` log per leg, named `eight-<leg>.log`.
-     - `ctest/entry-budgets` passed 1/1. The anchor balance is 448 open at HEAD, 447 now.
-     - The probe manifests stayed at 258 across the run, so the worktree guard no longer writes into the real repository.
-   - ★★★ **OPERATOR, 2026-09-15:** *"we need to merge this PR... just add new sessions if you find blockers for current session"*, then *"don't need to kill ongoing lanes, just for nexts"*.
-     - ⇒ No new lane, lane round, or orchestrator side-task for a finding made mid-session unless it BLOCKS merging PR #57. A non-blocking finding becomes a separate spawned session with a standalone prompt.
-     - `lf` round 3 and `ge` run to completion as briefed; both were told to list new findings rather than take them on.
-     - ✔ **An exception the operator asked for the same day:** `lane-fold.py`'s move onto `owning-tree` (its root, plus unsteered git) IS part of this PR. It was added to `lf`'s round 3, because `lf` holds that file. `lf` copies `owning-tree.py` from the main tree byte for byte, so settle that path at the fold. The spawned task's chip had already been started into THIS session, and `ListAgents` shows no separate session working on it, so `lf` is the only effort.
-   - ✔MEASURED on the main tree after its last registry write (the whitespace row's closing cell): `repo-guard` 31/31 through `run-gate.ps1`, with clean footers.
-   - ✔ **Lane `lf` round 3 VERIFIED and FOLDED 2026-09-15.**
-     - ✔ **Round 3 verified:** the eight changed files match its report. Its Windows gate's own md5 manifest, recorded at the start, holds the final bytes of every one; a later mtime on `lane-worktree.sh` was a mutant re-run restoring the same bytes. Windows: both guards (80 pins, 133 assertions) and `repo-guard` 31/31 with `run_gate_guard` passing. WSL: both guards, with all 94 overlay paths md5-checked. M8a–M8m and M9a–M9e went red as predicted, controls ok, md5 moved and returned.
-     - ✔ **Folded:** `lane-fold --settled` on the two index files and on `owning-tree.py` (md5-identical to the main tree's). Five paths were written md5-identical, the index was regenerated (`check-scripts-index` OK, 52 scripts), and seven rows were written and read back identical. Both `remove` rows carry the measured steering limit in their closing cells.
-     - ⚠ **Candidate blocker, ruled NOT a merge blocker:** the twins' own git calls still follow a caller's `GIT_DIR` + `GIT_WORK_TREE`, so under that steering `remove` deletes a lane's uncommitted work despite the new gate. Nothing in the merge runs `remove` steered, and before this PR `remove` deleted such work in every case. Spawned as a separate session for after the merge.
-     - Also named by `lf`: its new arm (46b) once reported CANNOT CONSTRUCT under a mutant, about 1 run in 28, cause unmeasured. Attribute it by name if it appears in a gate.
-     - ✔ **Round 2 verified:** the seven md5s match its report, and its final Windows and WSL gates started after its last write. On Windows both guards passed 2/2 and `repo-guard` 31/31; on WSL both guards passed, with an overlay md5 covering the four scripts. Every M6/M7 mutant's md5 moved and was restored, and its five rows carry no citation.
-     - **Why round 3:** `remove`'s new work gate asks only about UNCOMMITTED work. A commit on a lane's detached HEAD would, by hypothesis, be referenced by nothing once the worktree is removed. The lane measures that first; if the commit is orphaned it refuses with the work exit code, with pins, mutants and a new row born closed.
-   - **Fold plan for `rr` and `lf`:**
-     - `rr`'s dry-run fold already REFUSES on `CMakeLists.txt`: the main tree drifted from HEAD with `ih`'s include line. Hand-merge `rr`'s hunk onto it, then fold with `--settled CMakeLists.txt`.
-     - Both lanes change `scripts/README.md` and `.claude/skills/dss-cycle/references/scripts.md`. Settle both paths and regenerate them with `check-scripts-index.py --write` once both have landed.
-     - `rr` changes `leg-tree.sh` and `repo-tree.ps1`, which `lf`'s new fixture guard copies. Re-run `lane_worktree_guard` on the combined tree.
-   - ✔ **Lane `rr` round 2 VERIFIED and FOLDED 2026-09-15:**
-     - ✔ **The fold:** its `CMakeLists.txt` hunk was rebuilt from its final file (identical to the one checked earlier) and applied onto the main tree. The result differs from `rr`'s file by exactly `ih`'s `DssTestBudgets` include, still the last line. `lane-fold --settled CMakeLists.txt` then wrote its other 23 paths, all md5-identical to the lane, and its nine rows were written and read back byte for byte. For the new lane, measured: 919 `csp-*` boxes in `%TEMP%`, created 2026-08-26 to 2026-09-15.
-     - ✔MEASURED on the main tree after the fold: the rebuild re-ran CMake; the `repo-guard` label now covers 36 entries; budgets assign a TIMEOUT to 2203 entries (unit 477, five more for `rr`'s), 0 with their own. `repo-guard` minus `run_gate_guard` passed 35/35 through `run-gate.ps1` with clean footers, `ctest/entry-budgets` passed 1/1, and the anchor balance is 448 open at HEAD, 447 now. `run_gate_guard` waits until `lf` stops gating.
-     - Its 23 own paths (95 seeded ones skip) match the md5s it reported. Its final Windows gate started after its last write, and its WSL clone held all 119 changed files md5-identical.
-     - Gates on its final bytes: Windows `repo-guard` 35/36 and WSL 34/35, each red ONLY on `wrapped_anchor_ids_guard` — the split ids it inherited through its seed, already fixed in the main tree. Footers clean.
-     - Round-2 mutants: every md5 moved and returned through its own ctest entry, the failing arm names match, the control arms stayed green, and every restored run was green.
-     - Its nine rows carry no citation, and all dry-run as NEW closed harness rows.
-   - **`rr`'s residuals go to a NEW lane seeded from the folded tree**, not to a third round in `rr`'s worktree, because re-folding paths already folded would drift on every one:
-     - Four more tools that `rr` INFERRED, by reading, hand git the caller's environment: `macos-leg.ps1`'s leg branch and sha, `corpus-census.py`, `refresh_landing_log.py`, and `check-ci-legs.{sh,ps1}`. Measure each, then fix.
-     - `macos-leg.sh` and `remote-leg.sh` still inline all of `leg-tree.sh` into a command line, and `macos-leg.ps1`'s fix strips comments to fit under the ceiling. That class should not depend on the helper's size.
-     - `check-shell-portability`'s self-test and `test-macos-leg.py` leave git fixture boxes in `%TEMP%` (hundreds of `csp-*`).
-     - `anchors.py`'s root and git environment go to that lane; `lane-fold.py`'s are mine once `lf` lands.
-   - ⚠ **Coordinate `run_gate_guard` with `lf`.** `lf`'s tree still carries the OLD guard, whose arm 23 goes red on any foreign `dsscp` stand-in, and the fixed guard in the main tree plants exactly those. Interim main-tree label runs exclude `run_gate_guard` while `lf` gates; the eight-run gate runs everything.
-   - ✔ **Lane `ge` VERIFIED and FOLDED 2026-09-15.** It was dispatched the same day, seeded with 131 paths from the folded main tree at `edfa495d`, for `rr`'s residuals.
-     - ✔ **Verified:** the 19 changed files match its report and were written before both gates started. Windows `repo-guard` minus `run_gate_guard` passed 39/39 and WSL 38/38, footers clean. All 17 mutants moved and returned their md5, went red on the predicted arm, and kept their named controls green. For two of them (U1, L2) the recorded prediction STRING did not match the printed arm title, but the arm ids and the 1-of-27 failures do.
-     - ✔ **Folded:** 17 paths md5-identical. The index files were settled and regenerated (OK over 52 scripts), and the `DssTestBudgets` include is still the last line of `CMakeLists.txt`. Nine rows read back identical: eight new, plus `rr`'s transport row with its trigger unchanged and a SUPERSEDED pointer appended.
-     - **Its non-blocking findings became separate sessions:** the `ssh` carriage's secrets lookup from a lane worktree; two more self-tests leaking temp boxes; `refresh_landing_log --check` being unable to fail. The existing 920 `csp-*` boxes are left for the operator.
-     - Its items, each premise measured first:
-     - (A) the git environment in `macos-leg.ps1`, `corpus-census.py`, `refresh_landing_log.py` and `check-ci-legs.{sh,ps1}`;
-     - (B) `leg-tree.sh` delivered as one command-line argument, a transport that depends on the helper's size;
-     - (C) the `csp-*` temp litter, with the existing 919 boxes left for the orchestrator to decide;
-     - (D) `anchors.py`'s root consolidated onto `owning-tree.py`.
-     - It gates with `-E ^run_gate_guard$` while `lf` gates, and stays out of `lf`'s files. It builds configure-only while `lf` gates, because a full compile would trip `lf`'s OLD `run_gate_guard`.
-     - **Grant extended 2026-09-15: `scripts/repo-tree/repo-tree.ps1`**, for generalising the unsteered owner. ✔`ge` MEASURED that `gh`'s own repository resolution follows `GIT_DIR`: `gh api repos/:owner/:repo` answers this repository with no steering and HTTP 404 (another repository's origin) under it. So `check-ci-legs` must run `gh` unsteered too. One owner per language now runs ANY command unsteered (`leg_tree_unsteered`, `Invoke-RepoTreeUnsteered`), and the git helpers delegate to it unchanged. Its pins use a stub `gh`, never the network.
-   - ✔ **Lane `pg` folded 2026-09-15:** `run-gate.sh`, `run-gate.ps1`, `test-run-gate.sh` and `wsl-leg.sh`, unseeded, and no other lane touches them. Its six rows are written ✅ CLOSED in the harness table:
-     - `D-SCRIPT-WSL-LEG-AND-RUN-GATE-LET-CONCURRENT-LEGS-SHARE-ONE-LOG-PATH` (P1)
-     - `D-TEST-RUN-GATE-GUARD-SCRATCH-IS-KEYED-BY-SOURCE-TREE-SO-CONCURRENT-GATES-DESTROY-EACH-OTHERS-FIXTURE` (P2)
-     - `D-TEST-RUN-GATE-GUARD-ASSERTS-THAT-NO-COMPILER-RUNS-ANYWHERE-ON-THE-MACHINE` (P2)
-     - `D-SCRIPT-RUN-GATE-INPUTS-HELD-STILL-OVER-A-FILE-CHANGED-AND-RESTORED-MID-RUN` (P1)
-     - `D-SCRIPT-RUN-GATE-RESOLVES-ANOTHER-PROCESS-RELATIVE-BUILD-DIR-AGAINST-ITS-OWN-CWD` (P2)
-     - `D-SCRIPT-RUN-GATE-PRE-RUN-SCAN-DEADLOCKS-ON-A-HERE-DOCUMENT-SIZED-BY-THE-PROCESS-TABLE` (P1)
-     - ✔ **Verified before folding:** the four md5s in the main tree equal the lane's recorded ones and its WSL clone's. Every final gate started after the last write. `run_gate_guard` ran 80 arms with 0 failures and 0 preconditions alone and in two concurrent build directories on Windows, and 79 plus 1 not applicable on WSL. Each mutant's md5 moved and was restored, and the failing arm names match the report: d5 red on 66, 67, 69, 70 and 71; d5b red on 69, 70 and 71 with 66 and 67 green.
-     - ⚠ **D1(a), `wsl-leg.sh`'s per-tree log path, has no ctest entry.** Its mutant was a two-leg scratch run taken against an earlier `run-gate.sh`. A regression still cannot pass silently: the second leg is refused with exit 5 by the owner record, which `run_gate_guard` pins on the final files.
-     - ✔MEASURED on the main tree after the rows: `repo-guard` 31/31, with the new `changes :` and `logpath :` footer lines. Anchor balance: 448 open at HEAD, 447 now; the six rows were born closed.
-     - **Owed from the lane's notes:** read the `changes :` footer on macOS, the arm64 VPS and CI during the eight-run gate, because a volume without a USN journal says `NOT WATCHED MID-RUN`. The second wedge in `ih`'s gate (arm 15, rc 127) left no artefact. Cleanup: `build/pg`, `build/pg2`, and `$HOME/.cache/pg/` on WSL.
-     - ✔MEASURED while verifying `pg`: `set-anchor` respaces cells. `make_cell` collapses EVERY whitespace run, so three of `pg`'s cells lost a double space inside quoted tool output. 29 stored rows (30 cells) hold a run, and in some the run IS the evidence (`4  +  38`; `see  for details`). A `set-anchor` naming any other field of those rows rewrote them, which contradicts "everything unnamed survives verbatim".
-       - ✔ **FIXED:** `make_cell` now collapses only line breaks (every `splitlines()` boundary, with the whitespace around it), and a run inside a line is kept. Self-test arms (34) to (37) pin it; two of them drive `write` and `set` down to the stored bytes, one on a row injected as raw text.
-       - ✔ **Red-on-disable** through ctest, md5 moved and returned: m4 (the old collapse) red on exactly (34), (36) and (37); m5 (breaking only at a newline) red on exactly (35).
-       - ✔ `pg`'s three cells were re-set from its files, and all six of its rows now read back identical. Row: `D-GATE-ANCHORS-WRITER-COLLAPSES-EVERY-WHITESPACE-RUN-SO-AN-UNNAMED-CELL-DOES-NOT-SURVIVE-VERBATIM` (✅ CLOSED, harness, P2). ✔MEASURED once it was written: its cells carried no citation, it read back identical to its files, and `repo-guard` passed 31/31 through `run-gate.ps1` with clean footers.
-       - ✔ **No earlier damage to repair.** A census compared every anchor's cells with the pre-writer snapshot `7f452a5f^` (1989 anchors) and with this PR's start `7f452a5f` (2092): 0 cells kept their words but lost a whitespace run. Its control, on today's tree, reported exactly the 35 run-holding cells once every run was collapsed, 0 against itself, and 0 with the words changed too.
-   - ✔ **The pe64 key.** `"compareExchangeMangledName": "__atomic_compare_exchange"` is in the `atomicsRuntime` object of all four pe64 documents, each with a sentence in its comment.
-     - One all-or-nothing script wrote them: exactly one block per document, parsing as JSON before and after.
-     - The pe64 arm of `EveryFormatThatDeclaresAnAtomicsBlockDeclaresBothEntryNames` now expects the key.
-   - ✔ **The hand-merge.** `bl`'s hunk is merged into `tests/link/test_runtime_library_roles.cpp`; it does not overlap `ca`'s hunks.
-   - ✔ **The census.** Its two files were left at `ca`'s text and regenerated: `check-doc-census --write` repaired 20 figures (manifests 833 → 841), and its verify run is OK.
-   - ✔ **Two wrapped anchor ids that came in with lane `wl`.**
-     - ✔MEASURED through ctest: once `wl` folded, `wrapped_anchor_ids_guard` went red on the main tree. `real-examples/c/sqlite/harness_legs.py` holds 21 wrapped ids against an inventory of 19. Lane `rr`'s gate is what surfaced it.
-     - Both ids were split across two adjacent Python string literals. Each pair is now joined onto one line, so the runtime text is unchanged.
-     - ⚠ **The gap:** the orchestrator's check of `wl` re-ran the lane's own tests but never the `repo-guard` label. Run that label on a lane's own tree before folding it.
-   - ✔ **A positional citation that came in with lane `ih`'s row.**
-     - ✔MEASURED 2026-09-15 through `run-gate.ps1` on the main tree's Debug build, after `ih` folded: `repo-guard` 30/31. The one red was `plan_citations_guard`, because the done registry's count rose 1363 → 1364.
-     - The new citation was in the closing cell of `D-TEST-INTEGRATED-RUNNER-HANGS-BEFORE-CREATING-ITS-EX-DIRECTORY`. It quoted a mutant transcript that named two lines of `tests/CMakeLists.txt` by number.
-     - The cell now names the shuffle-arm block instead, written through `set-anchor --closing-file`. The guard's own `count_in` read 1 on the old cell (the control) and 0 on the new one. Read back, only `closing` changed. ✔MEASURED after the fix and this record: `repo-guard` passed 31/31 through `run-gate.ps1`, inputs held still, no contention, no compilers outside its own process tree.
-     - ⚠ **The same gap as `wl`, reached through a ROW:** a lane's cells are repository text too. Run the `repo-guard` label after the lane's rows are applied, not only over its source files.
-     - Iteration only, NOT the gate: the rebuild after `ih` folded assigned a TIMEOUT to 2198 entries (class debug, 0 with their own). A scoped run then passed 40/40 with inputs held still: `ctest/entry-budgets`, the sqlite harness legs test, `integrated_tests/cli-surface`, every `atomic` entry, `runtime_library_roles`, `mir_to_lir`, `emit_hir_round_trips`, `config/snapshot` and `cells-reset`.
-   - ✔**MEASURED 2026-09-15, iteration only, NOT the gate:**
-     - The main tree's Debug build of the combined tree succeeded.
-     - A scoped run through `run-gate.ps1` passed 47/47, with inputs held still, no contention and no compilers outside its own process tree.
-     - It covered every `atomic` example in both runners, plus `link/test_runtime_library_roles`, `lir/test_atomic_cas_runtime_routing`, `program/test_atomics_runtime_no_split_lock`, `program/test_emit_hir_round_trips_every_example`, and the census, anchors and anchor-registry guards.
-     - Read verbosely, `atomic_compound_assignment_packed_race`'s pe64 arms, red in `ca`'s own tree, now compile and exit 42 in the baseline AND the release arm.
-   - **Owed:** the eight-run gate on the final tree. Close `ca`'s and `bl`'s rows only after it.
-8. **Take the eight-run gate on the resulting tree**, `{Debug, Release} × four legs`, once `lf` and `ge` have landed and nothing is editing the tree. The recipe, re-derived 2026-09-15 from the scripts' own usage text and §0.7's previous record:
-   - ✔ **EARLY macOS Debug leg on the folded tree, before `lf` and `ge` land** (operator FYI 2026-09-15: macOS is up). It is iteration, NOT the gate.
-     - `run-gate` rc 0, ctest **2167/2167** with `-LE repo-guard`: exactly the Windows total of 2203 minus its 36 guards.
-     - `rr`'s `leg-tree.sh` prepared and restored the Mac's clone, its first run in a macOS shell. The clone lacks the unpushed driver HEAD `edfa495d` (fetch ok), which `leg-tree` handled.
-     - `pg`'s change witness answers on macOS: `changes : watched through every file's status-change time (ctime)`. That settles the macOS third of `pg`'s owed footer check; the arm64 VPS and CI remain.
-     - macOS was then released to `ge` for its item-B probe. The eight-run gate re-runs macOS on the final tree.
-   - **Windows Debug:** `cmake --build build/dbg && ctest --test-dir build/dbg --output-on-failure -j 8` (Strawberry gcc), through `run-gate.ps1` with the witness `100% tests passed`.
-   - **Windows Release:** the MSVC tree `build/msvc` (`cl.exe` 14.51, Release). That is CI's `windows-msvc-release` configuration, NOT the gcc `build/rel`. Its build and its ctest run inside ONE `vcvars64.bat` environment, from a `.cmd` launched by `run-gate.ps1`: CMake's cache pins only `cl.exe`, and no script in the repository records that environment.
-   - **WSL x86_64:** `wsl-leg.sh --mode full`, and again with `--build-type Release`; it derives `build/dbg` and `build/rel` itself. Read the arm-ledger line from the Debug leg's log. Since `pg`, its logs are per tree under the clone's `build/`, and it prints each path.
-   - **arm64 VPS and macOS arm64:** `remote-leg.sh --carriage arm64-vps` and `--carriage macos`, each with `--mode full`, and each again with `--build-type Release`.
-   - Launch every non-Windows leg from PowerShell with a `/mnt/c/...` path (§0.1), through `run-gate.ps1`, and read the LOG, never a pipe.
-   - **Then commit** by explicit paths, **then** run `real-examples/c/sqlite/build-and-test.{ps1,sh}` `veryquick` on all four hosts over the COMMITTED tree. That is the operator's 2026-08-31 regime: `veryquick` at a batch end, after the fold, the gate and the commit.
-     - **How each host gets the committed tree**, re-derived 2026-09-15 from the scripts:
-       - The driver never fetches or switches our repository. It builds whatever tree sits at `SRC_DIR` (default `$HOME/src/dss-code-prime`, or the checkout the driver lives in when that is absent), and it always configures and builds `$SRC_DIR/build/rel` itself before running, so a stale build root is not a hazard.
-       - **Windows:** `build-and-test.ps1` from the main tree. Tier and config default to `veryquick` and `release` (`DSS_TIER`, `DSS_CONFIG`).
-       - **macOS and the arm64 VPS:** `remote-leg.sh --carriage <host> --mode sync-only` stages the tree on the host's clone (prepare plus rsync, with NO restore). The driver then runs there through `scripts/ssh-<host>/ssh-<host>.sh`, detached with `nohup` (`setsid` does not exist on macOS), and is judged by its log growing. Until the commit is pushed the host's HEAD cannot be that commit (the early macOS leg printed that `edfa495d` is not on the host), so the provenance is the host HEAD plus the harness's divergence count.
-       - **WSL:** `wsl-leg.sh` restores its clone on EXIT in every mode, so it cannot stage a tree for a later run. Either clone the local repository into a separate WSL directory and point `SRC_DIR` at it, which makes HEAD the commit, or run after the push.
-   - **`benchmark-speedtest1` is NOT owed this batch, and that is a stated decision, not a skip.** On 2026-08-31 the operator narrowed it to cycles that explicitly changed compile time or the optimizer pipeline, and P66's lanes changed neither: atomics correctness, gate and fold tooling, the sqlite clock confound, test budgets.
-   - Push once. With `Run Pipes` on, CI runs by itself — read the finished run's failing test NAMES before concluding anything from it.
-9. Only then the merge.
-
-⚠ Rows have been opened and closed since the table below was measured — re-derive every count with `check-anchor-balance`; do not read them off it.
-
-### What was written as the exit state, before the red (kept, not deleted)
-
-
-✔**MEASURED 2026-09-14.** Every exit criterion the operator set is met. **Nothing is owed on this
-branch.** The one thing left is not ours: the merge.
-
-| fact | value | how to re-derive |
-|---|---|---|
-| branch | `feature/c23-conformance-burndown-6`, **PR #57**, 39 commits over `7f452a5f` | `git status -sb` · `git rev-list --count 7f452a5f..HEAD` |
-| HEAD | ⚠ **not named here** — the commit carrying this table moves HEAD past any sha it could state | `git log --oneline -8` |
-| the cycle's BASE | **`de1e83ef`** — it does not move when this file is edited | `git log --oneline` |
-| registry OPEN | **445** = production **258** + harness **187** (the sum IS the cross-check) | `python scripts/check-anchor-balance/check-anchor-balance.py --breakdown --denominator registry` |
-| total OPEN | **786** = registry 445 + plans 341 | same command |
-| lane worktrees | **none** — all twenty-one removed and VERIFIED absent | `git worktree list` |
-| tree | clean | `git status --short` |
-
-⚠ **THE PER-BUCKET SUM HAS A TRAP.** A naive `grep '^| \`D-'` returns **454**, not 445: the harness
-registry carries an 8-row **ALLOWLIST** table (`| Pattern | Reason |`) whose first cell also starts
-with a backticked `D-`. `check-anchor-balance` counts by TABLE HEADER SHAPE and excludes it
-correctly. **Count only rows under the `| Anchor | Priority | Status | Trigger | Closing work |
-Cross-refs |` header.**
-
-### ⛔ THE ONLY REMAINING STEP, AND IT IS NOT OURS
-
-**The operator merges PR #57. The next cycle branches from `main`, not from this branch.** The
-`/loop` is not over at the merge — the registries outlive the PR and the standing order carries into
-the new branch unchanged.
-
-**Operator's stated order for the next PR, 2026-09-14:** *"next PR we'll keep acting on production
-anchors, then on -j4 and our optimizer"*. ⇒ **Production anchors FIRST**, then the two perf axes
-§0.5 records with their measurements.
+**Owed, in order, and all of it is this branch's:**
+1. The 434 plan-side rows (309 open or gated → the production registry, 125 closed → the archive),
+   through the transcriber that is already written and rehearsed against the writer's own formatter.
+2. The citation strip from the production roots, and `check-anchor-registry` narrowed to them in the
+   same commit — it resolves an id against any mention in any plan document, so the deletion below
+   would otherwise red it over 1,176 citations in 230 files.
+3. The 41 production rows that cite an id leaving with the harness registry.
+4. The deletion of the harness registry and the archive's harness table — **the only irreversible
+   step, and it comes last**, in the commit that also teaches `anchors.py` and `burndown-queue` a
+   two-registry world.
+5. The skills: `/dss-cycle` gains the tool's section; `dss-code-prime`, `dss-plan-sweep` and
+   `dss-audit` each name what is leaving.
 
 ## §0.1 — P66 RAN IN TWO HALVES AND TWENTY-ONE LANES
 

@@ -196,3 +196,10 @@ examples/**/*.so binary
 #
 # Placed after `examples/**/*.so` so last-match precedence beats `src/dss-config/**`.
 src/dss-config/runtime/platform/dist/** binary
+# ── DssHarness configuration and runner actions ───────────────────────────────
+# A pin does not retroactively rewrite committed content, so these land in the SAME
+# commit as the files. A `run` block is split on newlines and each line trimmed, so a
+# CRLF checkout would otherwise be a difference the action parser has to absorb.
+.harness-config/**/*.json text eol=lf
+.harness-config/**/*.yml  text eol=lf
+.harness-config/**/*.yaml text eol=lf

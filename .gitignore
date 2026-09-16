@@ -261,3 +261,20 @@ id_ed25519
 # Explicit exceptions: template/example files that carry NO secret, only field names.
 !*.env.example
 !*.env.template
+# ── DssHarness ────────────────────────────────────────────────────────────────
+# The tool's own state, its per-host connection data and its runner inputs are
+# ignored; the contract (`config.json`) and the runner ACTIONS are tracked, because
+# they describe what this repository does and must travel with a clone. `init`
+# writes rules of this shape itself — they are kept here so a fresh clone is right
+# before the tool has ever run.
+/.harness-config/*
+!/.harness-config/config.json
+!/.harness-config/runner/
+/.harness-config/runner/*
+!/.harness-config/runner/actions/
+!/.harness-config/runner/.env/
+/.harness-config/runner/.env/*
+!/.harness-config/runner/.env/.gitkeep
+!/.harness-config/runner/.secrets/
+/.harness-config/runner/.secrets/*
+!/.harness-config/runner/.secrets/.gitkeep
