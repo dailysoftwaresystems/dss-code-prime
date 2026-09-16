@@ -284,12 +284,17 @@ id_ed25519
 # directory and everything inside it — a key, an address, a user — and a `.gitkeep`
 # deeper down is not what `!/.harness-config/sshItems/.gitkeep` matches.
 # ⚠ THE WORKTREES ROOT IS DELIBERATELY NOT IN THIS LIST. `worktrees.root` is
-# `.worktrees`, resolved against the checkout root and ignored as a DIRECTORY by
-# the rule above — which is what four guards assert with
-# `git check-ignore -q -- '.worktrees/'` and what keeps N lane checkouts off every
-# gate host. Excluding its contents instead, the shape used here, would answer
-# NOT-IGNORED for the directory and refuse every carriage. It needs no placeholder:
-# `lane-worktree` creates it.
+# `.worktrees`, resolved against the checkout root, and it stays ignored as a
+# DIRECTORY — the one rule that keeps N lane checkouts off every gate host.
+# ✔MEASURED, because the reason is NOT the one it looks like: the contents shape
+# used here still answers IGNORED to `check-ignore '.worktrees/'`, absent or
+# present, so the four guards that ask with the trailing slash would survive it.
+# What changes is the spelling WITHOUT the slash — `/x/` answers IGNORED for an
+# existing directory, `/x/* + !/x/.gitkeep` answers NOT-IGNORED — and it fails
+# toward not-ignored. That costs nothing on a slot holding an address and a key;
+# on a root holding entire working trees it is the difference between a clean sync
+# and shipping N checkouts, which this repository has already paid for once. The
+# root needs no placeholder anyway: `lane-worktree` creates it on demand.
 !/.harness-config/sshItems/
 /.harness-config/sshItems/*
 !/.harness-config/sshItems/.gitkeep
