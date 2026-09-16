@@ -2276,9 +2276,9 @@ struct DSS_EXPORT FloatLiteralTypingRule {
 //   * `promoteComparisons` — when true (C), comparison operands run the
 //     same conversion (so `-1 > 0ul` compares as U64); the result stays
 //     Bool. When false, comparisons keep their raw operand types.
-//   * `shiftResult` — closed verb for the C 6.5.7 shift-result discipline
-//     (D-UAC-SHIFT-RESULT-RULE-CONFIG). `promotedLeft` (C): a shift's result
-//     is the integer-PROMOTED LEFT operand's type; the right operand never
+//   * `shiftResult` — closed verb for the C 6.5.7 shift-result discipline.
+//     `promotedLeft` (C): a shift's result is the integer-PROMOTED LEFT
+//     operand's type; the right operand never
 //     contributes (`i32 << i64` is I32). `commonType`: the shift is typed
 //     like an ordinary binary op — both operands run the usual conversions
 //     and the result is their common type (`i32 << i64` is I64). The engine

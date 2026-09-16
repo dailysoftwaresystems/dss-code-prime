@@ -1910,11 +1910,20 @@ def self_test():
          path=".plans/24-x.md")
 
     # ── (c) blind spots of the OLD row regex, now counted ──
-    case(_doc(*REG_HDR, "| `D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY` | ⚠ OPEN | w | r |"),
-         {"D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY"},
+    # ⚠ ASSEMBLED FROM FRAGMENTS, like the `D-XX-NEWTABLE` case below and for the same
+    # reason: `scripts/` is prose this repository's guards read, so a real row id written
+    # whole here is a CITATION rather than test data. Both of these WERE real ids, and one
+    # of them went unnoticed only because its strikethrough made the row unreadable -- until
+    # the DssHarness migration repaired that cell and the fixture's "still open" text became
+    # a refusal citing a closed row. The VALUE is still a well-formed name at runtime, which
+    # is the whole of what these cases measure.
+    _UNDERSCORE = "D-FIXTURE" + "-QEMU_LD_PREFIX-AMBIENT-ONLY"
+    _STRUCK = "D-FIXTURE" + "-DYN-RODATA-ITEM-RELOC"
+    case(_doc(*REG_HDR, "| `" + _UNDERSCORE + "` | ⚠ OPEN | w | r |"),
+         {_UNDERSCORE},
          "UNDERSCORE in the name: invisible to the old regex, counted now")
-    case(_doc(*REG_HDR, "| ~~`D-LK-DYN-RODATA-ITEM-RELOC`~~ | ⚠ still open | w | r |"),
-         {"D-LK-DYN-RODATA-ITEM-RELOC"},
+    case(_doc(*REG_HDR, "| ~~`" + _STRUCK + "`~~ | ⚠ still open | w | r |"),
+         {_STRUCK},
          "STRIKETHROUGH name: invisible to the old regex, counted now")
 
     # ── (d) fail-loud on shapes, and NO false alarm on the named exclusions ──

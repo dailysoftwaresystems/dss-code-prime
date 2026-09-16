@@ -55,9 +55,9 @@ void emit(DiagnosticReporter& reporter,
 // writes WITHIN one process.
 //
 // Neither is a guarantee on its own, and this is the exact correction
-// `tests/test_support/scratch_dir.hpp` records for
-// D-TEST-EXAMPLES-RUNNER-PARALLEL-CONTENTION-FLAKE: pids RECYCLE, and a
-// killed run can leave a stale artifact at any (pid, counter) pair — 55
+// `tests/test_support/scratch_dir.hpp` records for the examples runner's
+// parallel-contention flake: pids RECYCLE, and a killed run can leave a stale
+// artifact at any (pid, counter) pair — 55
 // stale scratch dirs were being silently SHARED because the code claimed
 // its slot with a call that reports success when the slot already exists.
 // So the pid+counter pair here is only the SEED. The claim itself is made
@@ -746,9 +746,8 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
         // (MinGW-W64 UCRT g++ 13.2.0): `std::filesystem::create_symlink`
         // returns `ENOSYS` ("Function not implemented", 40) even though
         // `mklink` succeeds in the same directory, so no test on that leg can
-        // construct the input. The pin is therefore POSIX-leg only and SAYS SO
-        // (D-GATE-INSTRUMENT-SCOPE-UNSTATED); see
-        // `tests/link/test_link_writer_exclusive_claim.cpp`.
+        // construct the input. The pin is therefore POSIX-leg only and SAYS SO;
+        // see `tests/link/test_link_writer_exclusive_claim.cpp`.
         //
         // `status_known` is not used as the test: `symlink_status` reports a
         // NON-EXISTENT name as `file_type::not_found`, which IS a known status,

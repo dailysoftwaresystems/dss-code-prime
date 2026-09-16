@@ -15,9 +15,10 @@
  * the second category. mingw-w64 reaches the identical conclusion and ships
  * the identical shape — ordinary C in `mingw-w64-crt/misc/dirent.c` over these
  * very primitives. gcc's literal answer here is "link libmingwex"; DSS cannot
- * take it without breaking BUILD ANY TARGET INSIDE ANY HOST
- * (D-HARNESS-CROSS-HOST-ANY-TARGET) and re-adopting the third-party runtime
- * dependency the pe→UCRT migration ran to eliminate. So DSS ships its own.
+ * take it without breaking BUILD ANY TARGET INSIDE ANY HOST — a Windows-
+ * targeting build on a Mac would need a mingw sysroot — and
+ * re-adopting the third-party runtime dependency the pe→UCRT migration ran to
+ * eliminate. So DSS ships its own.
  *
  * ★★ WIDE, NOT NARROW — AND THAT IS A CORRECTNESS DECISION, NOT A PREFERENCE.
  * The narrow `_findfirst64i32` family interprets and produces file names in the

@@ -37,7 +37,8 @@ target_link_libraries(asm PRIVATE core lir mir tokenizer analysis_syntactic)
 # named FOUR files and missed `asm_text_to_lir.cpp` — same target, same
 # no-`default` control-flow dispatch shape, same defect class — which then
 # shipped an unhandled `Switch` enumerator that only a macOS build ever
-# reported (D-BUILD-CLANG-ONLY-WARNINGS-INVISIBLE-TO-THE-MSVC-AND-GCC-LEGS).
+# reported — not because gcc and MSVC cannot see it (✔MEASURED: both do, under
+# `-Wswitch` and C4062 respectively), but because nothing had asked them.
 # A gate you have to remember to extend is a gate that gets extended late.
 #
 # ⚠ Do NOT restore a per-file block here. The old comment justified the

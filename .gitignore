@@ -221,7 +221,11 @@ __pycache__/
 # ★ Since 2026-08-26 the carriages derive their exclude list from git
 # (`scripts/carriage-excludes/`), so a rule written HERE is what keeps a tree off
 # every gate host, and a rule written only in `.git/info/exclude` protects one.
-# D-SCRIPT-CARRIAGE-EXCLUDES-ARE-A-HAND-LIST-AND-MISS-NESTED-IGNORED-TREES
+# ⚠ AND A HAND LIST PATCHED AFTER THE FACT DOES NOT UNDO THE DAMAGE: rsync does
+# NOT delete an EXCLUDED path, so a name added late PROTECTS the stale copy
+# instead of removing it. ✔MEASURED 2026-08-26 — `.secrets/` was named by one of
+# the four lists and leaked anyway, leaving each gate host holding the OTHER
+# host's private key; both hosts had to be cleaned once, explicitly.
 .kilo/
 node_modules/
 .venv/

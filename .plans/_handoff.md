@@ -25,17 +25,19 @@ below is IN it.
 1. **This file, §0.** What is true right now, and what is owed. Rewritten every cycle.
 2. **`.plans/_deferred-anchor-registry-production.md`** — the open defects a USER of the compiler
    could hit. **This is the priority, always.**
-3. **`.plans/_deferred-anchor-registry-harness.md`** — the open defects only WE can hit (tests,
-   gates, scripts, carriages). A RECORD, not a backlog: drained by encounter, never scheduled.
-   ⏳ **THIS FILE IS BEING RETIRED** by `feature/dssharness-migration`: the harness becomes
-   DssHarness's problem, and every anchor from then on is a production anchor. While the branch is
-   open the file is still here and still authoritative; the commit that deletes it rewrites this
-   chain and item 4 below in the same commit.
-4. **`.plans/_deferred-anchor-registry-done.md`** — the archive. **Nothing here is work.**
+   ⓘ **There is no harness registry.** It retired on 2026-09-16 with the move to `DssHarness`: a
+   defect in the harness is that tool's to fix, and a defect in THIS repository's build wiring,
+   tests or plans is a production row like any other. Its 187 open rows and the archive's 544
+   closed ones are readable in git at the parent of the commit that deleted them.
+3. **`.plans/_deferred-anchor-registry-done.md`** — the archive, one table. **Nothing here is work.**
    ⚠ Closing a row MOVES it between these files. It is never marked in place.
    ⛔ **Never hand-edit or hand-read a row.** `scripts/anchors/{write,set,read}-anchor` is the only
    door, and `read-anchor <ID> --json` the only sanctioned reader — the raw table line stores every
-   `|` escaped, and reading it raw hands the escape back doubled.
+   `|` escaped, and reading it raw hands the escape back doubled. `write-anchor` also takes
+   `--relocating` for a row that exists elsewhere in the repository and is being MOVED, not named.
+4. **`.claude/skills/dss-cycle/references/dss-harness.md`** — the tool the harness is moving to:
+   which of its verbs exist today, which scripts are still the only way to do their job, this
+   repository's `.harness-config/config.json`, and the exit codes.
 5. **`.claude/skills/dss-cycle/SKILL.md`** — the operator's standing rulings, in force, verbatim,
    with the measurements that produced them. **Read it before deciding anything about scope, about
    what counts as done, or about what the reference compilers are evidence FOR.**
@@ -62,60 +64,63 @@ below is IN it.
 
 ## §0.0 — STATE
 
-🔵 **P67 IS THE DssHarness MIGRATION, AND IT IS IN FLIGHT ON `feature/dssharness-migration`.** This
+🔵 **P67 IS THE DssHarness MIGRATION, IN FLIGHT ON `feature/dssharness-migration`, PR #58.** This
 branch carries the migration and nothing else (operator ruling, 2026-09-15). Its contract is
-`.temp/pending-harness-for-code-prime.md` — deliberately untracked, 860 lines, reviewed by six
-read-only agents before any of it was executed. **Re-derive HEAD with `git log --oneline -3`.**
+`.temp/pending-harness-for-code-prime.md` — deliberately untracked, reviewed by six read-only agents
+before any of it was executed. **Re-derive HEAD with `git log --oneline -3`.**
 
-**What this repository is migrating to.** `DssHarness`, the cross-platform .NET tool built in
-`C:\Source\DailySoftware\repo-harness` and published on nuget.org; 0.5.2 is installed here. It has
-the anchor, worktree, leg and host verbs; `build`, `test`, `sync` and `run` are planned for 0.6
-through 0.9 and do not exist yet, which is why the gate, leg and carriage scripts stay for now.
-✔MEASURED 2026-09-16: repo-harness's working tree already carries 28 files of uncommitted work
-adding `sshItems`, `wslDistros`, `citationRoots`, `maxDeleteFraction` and `evidenceRoots` and
-deleting its ssh-config reader — the requirements this plan asks for. None of those fields is in
-the published 0.5.2, so this repository's `config.json` targets the shape the tool is moving to.
+**THE HARNESS REGISTRY IS GONE, AND EVERY ANCHOR IS A PRODUCTION ANCHOR.** Two documents now:
+`.plans/_deferred-anchor-registry-production.md` holds every still-open row, the archive holds every
+closed one in one table. A defect in the harness is repo-harness's to fix; a defect in this
+repository's build wiring, tests or plans is a production row like any other. The 187 open harness
+rows and the archive's 544 closed ones are readable in git at the parent of the commit that deleted
+them. ⛔ `scripts/anchors/{write,set,read}-anchor` is still the only door while those scripts exist,
+and `read-anchor <ID> --json` still the only sanctioned reader.
+
+**The tool.** `DssHarness`, built in `C:\Source\DailySoftware\repo-harness` and published on
+nuget.org; 0.5.2 installed here. It has the anchor, worktree, leg and host verbs; `build`, `test`,
+`sync` and `run` are planned for 0.6 through 0.9 and do not exist yet, which is why the gate, leg and
+carriage scripts stay. Read `.claude/skills/dss-cycle/references/dss-harness.md` before touching a
+leg, a worktree or an anchor. ✔MEASURED 2026-09-16: repo-harness's working tree already carries 28
+files of uncommitted work adding `sshItems`, `wslDistros`, `citationRoots`, `maxDeleteFraction` and
+`evidenceRoots` and deleting its ssh-config reader — the requirements this plan asks for. None is in
+the published 0.5.2, so `.harness-config/config.json` targets the shape the tool is moving to.
 
 ### ⚠ THE FIRST THING A FRESH CHECKOUT HITS, AND IT LOOKS LIKE A COMPILER DEFECT
 
 ✔MEASURED 2026-09-16 at `e8dbc3c5`: **1868 of 2207 tests failed**, every `examples/c/*` among them,
-each reporting `C_InvalidLanguageName: shipped-config version skew: this compiler is version 0.0.2
-but the config tree ... 0.5.0` plus `D_SchemaLoadFailed` naming `c.lang.json`. **Nothing was wrong
-with the configuration.** The squash merge bumped `VERSION` 0.0.2 → 0.5.0; CMake reads that file at
-configure time and stamps it into the binary, while the config tree is staged per run — so an
-INCREMENTAL build left a 0.0.2 compiler beside a 0.5.0 config tree, and the build reported success.
-`VERSION` is now a `CMAKE_CONFIGURE_DEPENDS` (root `CMakeLists.txt`), so a bump re-runs configure.
-★ The lesson is the diagnostic's, not the build's: a version-skew refusal is worded as a language
-error, so it reads as a defect in the file it names.
+each reporting `C_InvalidLanguageName: shipped-config version skew ... 0.0.2 ... 0.5.0` plus
+`D_SchemaLoadFailed` naming `c.lang.json`. **Nothing was wrong with the configuration.** The squash
+merge bumped `VERSION`; CMake reads it at configure time and stamps it into the binary while the
+config tree is staged per run, so an INCREMENTAL build left a 0.0.2 compiler beside a 0.5.0 config
+tree — and the build reported success. `VERSION` is now a `CMAKE_CONFIGURE_DEPENDS`, and the identity
+predefine pin reads the file instead of restating `0.0.2`.
+★ The lesson is the diagnostic's: a version-skew refusal is worded as a language error, so it reads as
+a defect in the file it names.
 
-**Landed in this commit:**
-- `VERSION` as a configure dependency (above), and the green baseline re-taken on the fixed tree.
-- `anchors.py write --relocating`: a row that already exists in a plan document and is being MOVED
-  into a registry is not being NAMED, so the minting rule does not apply to it. Four self-test arms,
-  including the two controls that keep the flag from becoming a second spelling of the update path.
-- **The allowlist is retired.** Its eight entries were code-internal pins, not deferred work; each is
-  renamed out of the `D-` shape to `PIN-`, with all nine citations rewritten in the same commit. The
-  table went with them — an anchor-shaped table inside a registry document is a parse refusal for
-  DssHarness, not untidiness.
-- **The archive's malformed rows are repaired**: four Anchor cells that were not one backticked id,
-  and the three production ids that carried two rows each, merged with both texts preserved.
-- **`.harness-config/`**: the tool's contract — eight legs as a `gate` leg set, four toolchains,
-  three emulators, eleven tools, the two registry paths, the never-transfer floor, the contention
-  tools and the worktree budget — with the per-host connection data ignored and only the contract and
-  the runner actions tracked.
+**What landed, in three commits:**
+1. `VERSION` as a configure dependency; the predefine pin reading it; `anchors.py write --relocating`
+   (a row that exists elsewhere and is being MOVED is not being NAMED); the allowlist retired, its
+   eight pins renamed to `PIN-` with all nine citations; the archive's four malformed Anchor cells and
+   three duplicated production ids repaired; `.harness-config/` with the contract tracked and the
+   per-host connection data ignored.
+2. The plan-side rows: **434 written** — 309 open or gated into the production registry, 125 closed
+   into the archive — with 85 ids minted (each recording its former spelling), 93 written on the
+   relocation path, 57 files' citations rewritten, and the ten plan documents' tables replaced by
+   prose. Two ids carried two rows each and were settled by reading both.
+3. The harness registry retired: 112 citations stripped from the production roots, the citation guard
+   narrowed to `src/`, `examples/` and `docs/`, 40 production rows made self-contained, `anchors.py`
+   and `burndown-queue` taught a two-registry world, and the registry and its archive table deleted —
+   with the seven rows describing a defect a user of the compiler could hit re-filed as production.
 
 **Owed, in order, and all of it is this branch's:**
-1. The 434 plan-side rows (309 open or gated → the production registry, 125 closed → the archive),
-   through the transcriber that is already written and rehearsed against the writer's own formatter.
-2. The citation strip from the production roots, and `check-anchor-registry` narrowed to them in the
-   same commit — it resolves an id against any mention in any plan document, so the deletion below
-   would otherwise red it over 1,176 citations in 230 files.
-3. The 41 production rows that cite an id leaving with the harness registry.
-4. The deletion of the harness registry and the archive's harness table — **the only irreversible
-   step, and it comes last**, in the commit that also teaches `anchors.py` and `burndown-queue` a
-   two-registry world.
-5. The skills: `/dss-cycle` gains the tool's section; `dss-code-prime`, `dss-plan-sweep` and
-   `dss-audit` each name what is leaving.
+1. The eight-run gate: Windows Debug is green on every commit so far; **Windows Release and the three
+   remote legs, Debug and Release, have not run on this branch yet.**
+2. The scripts whose replacing verb does not exist: `local-build` waits for `build` (0.6), `run-gate`
+   for `test` (0.7), the leg drivers and carriages for `sync` (0.8), the sqlite corpus and the
+   benchmark for `run` (0.9). Nothing is deleted before its verb is proven on all four legs, and each
+   release's deletions are one commit.
+3. `.secrets/` is deleted once the last carriage that reads it is gone (ruling 14).
 
 ## §0.1 — P66 RAN IN TWO HALVES AND TWENTY-ONE LANES
 

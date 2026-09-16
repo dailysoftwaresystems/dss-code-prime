@@ -124,16 +124,22 @@ cycle applying the union by reflex over ACCEPTANCE cannot quietly revert it to t
 > *"the priority is always production anchors. ALWAYS. harness we fix as we need when we face the
 > problem (NEVER LATER)."*
 
-The registry is **three files** — two WORKING lists and one ARCHIVE. It split into production and
-harness on 2026-08-25 (*"the priority is real errors, not cosmetics"*), and the archive was carved
-out on 2026-09-01 (*"split what's done from what's to be done. this way we adjust our skills to only
-read what's yet to be done"*):
+The registry is **two files** — one WORKING list and one ARCHIVE:
 
 | file | holds |
 |---|---|
-| `.plans/_deferred-anchor-registry-production.md` | a **still-open** defect **a user of the compiler could hit** — in the shipped binary, or in the config it reads |
-| `.plans/_deferred-anchor-registry-harness.md` | a **still-open** defect **only we can hit** — tests, gates, guards, cycle machinery, plans, scripts, carriages, CI |
-| `.plans/_deferred-anchor-registry-done.md` | every **CLOSED** row, in two tables that preserve which working list it came from. **Nothing here is work.** |
+| `.plans/_deferred-anchor-registry-production.md` | every **still-open** row |
+| `.plans/_deferred-anchor-registry-done.md` | every **CLOSED** row, in one table. **Nothing here is work.** |
+
+★★★ **THE HARNESS REGISTRY RETIRED 2026-09-16, AND THE RULING ABOVE STILL GOVERNS.** The harness
+moved to `DssHarness` (operator, 2026-09-15: *"we'll start using our new dotnet tool as harness ...
+this being working will be that repo responsibility"*), and with it the third file: a defect in the
+harness is repo-harness's to fix, and a defect in THIS repository's build wiring, tests or plans is a
+production row like any other. Its 187 open rows and the archive's 544 closed ones are readable in git
+at the parent of the commit that deleted them. **What did not change is the priority**: a defect a
+user of the compiler could hit outranks one only we can hit, every time — the registry simply stopped
+being where that distinction is recorded. See `references/dss-harness.md` for the tool, its verbs,
+this repository's configuration, and which scripts are still the only way to do their job.
 
 ### ★★★ MOVE ON CLOSE — a closed row does not stay where it was
 
@@ -1303,6 +1309,11 @@ never lowers the bar.
   whether an anchor is eligible.
 - Read `references/operator-discipline.md` when reporting or claiming anything — the bar applies to
   the operator, not only to the code, and it opens with the **never-cite-a-line-number** rule.
+- Read `references/dss-harness.md` **before running anything that touches a leg, a worktree or an
+  anchor** — `DssHarness` is the tool this repository's harness is moving to, and that file says which
+  of its verbs exist today, which scripts are still the only way to do their job, what this
+  repository's `.harness-config/config.json` declares, and the exit codes to act on. ⛔ A defect in
+  the tool is a repo-harness issue, never a local workaround.
 - Read `references/scripts.md` **before writing any script, probe, or one-off shell pipeline** —
   the index of every script this repository already ships, each with its purpose. Most of what a
   cycle needs is already there, and re-typing it inline re-opens the edge cases it was taught

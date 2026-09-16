@@ -178,6 +178,6 @@ set_source_files_properties(types/grammar_schema_json.cpp PROPERTIES
 # The old note warned against spreading the flag to grammar_schema.cpp /
 # target_schema.cpp, whose switches use subset-with-`default` forms. Spreading
 # it is now exactly what happened, and it is inert for them: `-Werror=switch` /
-# C4062 do not fire on a switch that has a `default:` arm. ✔MEASURED — see
-# D-BUILD-CLANG-ONLY-WARNINGS-INVISIBLE-TO-THE-MSVC-AND-GCC-LEGS for the
-# whole-tree probe that found zero `-Wswitch` sites after consolidation.
+# C4062 do not fire on a switch that has a `default:` arm. ✔MEASURED — the
+# whole-tree probe run when the five per-file copies of this gate were folded
+# into the root CMakeLists.txt found zero `-Wswitch` sites left.

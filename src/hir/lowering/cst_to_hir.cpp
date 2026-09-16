@@ -5570,8 +5570,8 @@ struct Lowerer {
         }
         // FC3 c1 shifts under the `arithmeticConversions` block: the result
         // type follows the config verb `shiftResult` via the shared
-        // `shiftResultType` chokepoint (D-UAC-SHIFT-RESULT-RULE-CONFIG) — the
-        // SAME function the semantic typer calls, so the two tiers can never
+        // `shiftResultType` chokepoint — the SAME function the semantic typer
+        // calls, so the two tiers can never
         // diverge on the verb. `promotedLeft` (C 6.5.7): the PROMOTED LEFT
         // operand only (the count's type never contributes; `i64 << u32` is
         // I64, `u32 >> 1` is U32 → LShr). `commonType`: the usual-arithmetic

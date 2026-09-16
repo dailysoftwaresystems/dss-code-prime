@@ -14347,14 +14347,21 @@ def self_test(path=CATALOGUE, out=sys.stdout):
               in registry_controls(_reg, [], ["zzzznosuchfamily-1.0"])[1])
         check("a registry that is a DIRECTORY is fail-soft, not an exception",
               registry_controls(_rdir, ["elf64-x86_64"], [])[0] == [])
-        # ★★ THE REGISTRY IS TWO DOCUMENTS (production / tools-harness) since
-        # 2026-08-25, and this arm is what keeps the lookup able to see BOTH. Revert
+        # ★★ THE REGISTRY IS MORE THAN ONE DOCUMENT, and this arm is what keeps the
+        # lookup able to see EVERY one. It was production + harness from 2026-08-25, and
+        # production + archive since the harness registry retired on 2026-09-16; the
+        # fixture names a neutral second document because the POINT is the glob. Revert
         # `_registry_documents` to a single-file check and every arm above still
         # passes -- they each name one concrete file -- while the real lookup silently
         # reads half the registry and reports "nothing matched". That is the exact
         # shape of a fail-soft instrument going blind.
         _FX_C = _FX + "SECOND-DOCUMENT"
-        _reg_b = os.path.join(_rdir, "_deferred-anchor-registry-harness.md")
+        # ⓘ Named to sort BEFORE `-production.md`: this arm pins that every row says which
+        # document it came from, and the fixture's first-match ordering is what it reads
+        # back. The name only has to be a second registry document, and `-harness.md` was
+        # one until 2026-09-16.
+        _reg_b_name = "_deferred-anchor-registry-aux.md"
+        _reg_b = os.path.join(_rdir, _reg_b_name)
         with open(_reg_b, "w", encoding="utf-8") as _fh:
             _fh.write(
                 "| Anchor | Status | Resolution | Files |\n"
@@ -14375,7 +14382,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
         _a_lines = [ln for ln in _both if _FX_A in ln]
         check("...and each row names WHICH document it came from, because a bare "
               "line number stopped being unique when the registry split",
-              len(_c_lines) == 1 and "-harness.md" in _c_lines[0]
+              len(_c_lines) == 1 and _reg_b_name in _c_lines[0]
               and len(_a_lines) == 1
               and "_deferred-anchor-registry-production.md" in _a_lines[0],
               "c=%r a=%r" % (_c_lines, _a_lines))

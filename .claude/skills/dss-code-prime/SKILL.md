@@ -55,9 +55,8 @@ done from what's to be done. this way we adjust our skills to only read what's y
 
 | file | holds |
 |---|---|
-| `_deferred-anchor-registry-production.md` | a **still-open** defect **a user of the compiler could hit** — in the shipped binary, or in the config it reads |
-| `_deferred-anchor-registry-harness.md` | a **still-open** defect **only we can hit** — tests, gates, guards, cycle machinery, plans, scripts, carriages, CI |
-| `_deferred-anchor-registry-done.md` | every **CLOSED** row, in two tables preserving which working list it came from. **Nothing here is work.** |
+| `_deferred-anchor-registry-production.md` | every **still-open** row. Since 2026-09-16 that is ALL of them: the harness registry retired with the move to `DssHarness`, and a defect only we can hit is now either that tool's to fix or a production row here |
+| `_deferred-anchor-registry-done.md` | every **CLOSED** row, in one table. **Nothing here is work.** |
 
 ⚠ A row's bucket follows the **DEFECT, never the instrument that found it**. `D-CONFIG-*` and
 `D-DIAG-*` are PRODUCTION deliberately: in this architecture a `.lang/.target/.format.json` document

@@ -84,8 +84,8 @@ scripts/**/*.py  text eol=lf
 # on arrival on the very host it was meant to run from. MEASURED here only as
 # the NEGATIVE: this workstation has `core.autocrlf=false` (both --local and
 # --global), which is exactly why the hazard has never been observed in-tree —
-# it is latent on a DIFFERENT machine, i.e. the same shape as the host-locking
-# defect D-HARNESS-CROSS-HOST-ANY-TARGET exists to end.
+# it is latent on a DIFFERENT machine, i.e. exactly the shape of a capability
+# that works on the host it was authored on and is dead on every other one.
 # Listed by EXTENSION rather than as `real-examples/** text eol=lf`, because the
 # broad form would also force text normalization onto any binary fixture added
 # later — the corruption the `examples/**/*.bin binary` rule above had to be
@@ -95,7 +95,7 @@ real-examples/**/*.ps1  text eol=lf
 real-examples/**/*.py   text eol=lf
 real-examples/**/*.json text eol=lf
 
-# ── D-REPO-GITATTRIBUTES-PINS-EOL-FOR-CONFIGS-BUT-NOT-FOR-SOURCES ──────────
+# ── EOL WAS PINNED FOR CONFIGS AND GOLDENS, AND NOT FOR SOURCES ────────────
 # THE SOURCE TREE ITSELF. Every rule above pins a CONFIG, a GOLDEN or a
 # DRIVER — i.e. a file some test reads byte-exactly — and not one of them
 # covers a `.cpp`. MEASURED 2026-08-06 before this block existed:
@@ -151,7 +151,7 @@ CMakeLists.txt text eol=lf
 # reader test decodes, was covered by nothing in this file. The EOL pin added the same day
 # named SOURCE extensions and forgot that test DATA is the category most likely to need the
 # OPPOSITE treatment — a pin's blast radius is exactly what it names, and what it omits is
-# invisible (D-REPO-GITATTRIBUTES-DOES-NOT-COVER-BINARY-TEST-FIXTURES).
+# invisible.
 tests/**/data/** binary
 
 # Binary EXAMPLE fixtures: prebuilt shared libraries a runnable example loads.

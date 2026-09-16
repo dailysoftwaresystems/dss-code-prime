@@ -1148,14 +1148,23 @@ fi
 # filesystem where it DOES, not for a difference visible here.
 #
 # root|floor|include-globs (space separated)
+# ★★★ NARROWED 2026-09-16 TO THE PRODUCTION ROOTS, BY OPERATOR RULING 5.
+# The harness registry is being deleted, so every id that lived only there stops
+# resolving; this guard resolves an id against a registry row OR any mention in any
+# `.plans/*.md`, so it would refuse 1,176 citations in 230 files across the roots it
+# used to scan (MEASURED 2026-09-16: 511 of the 736 leaving ids are mentioned nowhere
+# else). Only 87 of those are in production code, and those are stripped in the same
+# commit as this narrowing. The rest are harness-side prose labels, deliberately left
+# unresolvable, and this guard no longer looks at them.
+# ⚠ THE FLOORS BELOW STILL SAY WHAT THEY ALWAYS SAID: fix the scan, never the floor.
+# `docs` is new and its floor is set below its MEASURED 15 distinct ids, not at it.
+# ⓘ The root FILES that ruling 5 also covers -- README.md, .gitattributes -- are named
+# in `.harness-config/config.json`'s `anchors.citationRoots` for the DssHarness command
+# that replaces this guard; this one scans directories and cannot express them.
 _ROOT_SPECS=(
     'src|400|*.cpp *.hpp *.json *.c *.s *.inc *.probes CMakeLists.txt *.md'
     'examples|150|*.cpp *.hpp *.json *.c *.s *.inc *.probes CMakeLists.txt *.md'
-    'tests|300|*.cpp *.hpp *.json *.c *.s *.inc *.probes CMakeLists.txt *.md'
-    'integrated_tests|8|*.cpp *.hpp *.json *.c *.s *.inc *.probes CMakeLists.txt *.md'
-    'real-examples|10|*.sh *.ps1 *.py'
-    'scripts|25|*.sh *.ps1 *.py *.md'
-    '.claude|15|*.md *.py *.mjs'
+    'docs|8|*.md'
 )
 for _spec in "${_ROOT_SPECS[@]}"
 #

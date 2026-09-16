@@ -828,8 +828,7 @@ librarySynthVehicleFromName(std::string_view s) noexcept {
 // ★ The pe table pointing `cLibrary` and `unwindPersonality` at the SAME image
 // is therefore FINE: the table PERMITS sameness without ASSERTING it. That is
 // the whole difference from a single string, and it is what stops the value
-// from having to be re-cut every time a new configuration arrives
-// (`D-TEST-PE64-CONFOUND-PIN-WEAKENED-BY-ITS-OWN-SUBJECT`).
+// from having to be re-cut every time a new configuration arrives.
 //
 // ROLE IS A CLOSED ENUM, deliberately: every per-format BEHAVIORAL rule in this
 // schema family already is one, and free-form strings stay reserved for names

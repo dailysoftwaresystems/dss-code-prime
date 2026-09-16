@@ -9646,8 +9646,7 @@ struct Lowerer {
     // <row>)"*, and that sentence IS FALSE. It is corrected in place rather
     // than deleted because "this phase" is exactly the qualifier that made it
     // look safe: a scope word does not stop a present-tense verb from being
-    // read as the present tense once the phase is over
-    // (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
+    // read as the present tense once the phase is over.
     // ✔RE-MEASURED at the CLI 2026-08-24 on x86_64:pe64-x86_64-windows-exec,
     // debug AND release, one program covering all three return classes — an 8-
     // byte struct (one register), a 16-byte struct (two registers) and a

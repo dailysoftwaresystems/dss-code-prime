@@ -219,7 +219,8 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
 }
 
 // ── THE BUILD'S STATEMENT OF RECORD ABOUT WHAT IT PRODUCED ─────────────────
-// D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING (TF-C118).
+// TF-C118 — born from a harness fixture that RECONSTRUCTED the artifact name
+// from its own suffix table and so assumed the POSIX spelling.
 //
 // ★ WHY THIS EXISTS. Until now a SUCCESSFUL build said nothing at all about
 // the file it had written, so every consumer had to RECONSTRUCT the name —
@@ -1172,9 +1173,9 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         return std::nullopt;
     }
 
-    // D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING (TF-C118):
-    // THE ONE report site for the three link/write dispatches below (static
-    // archive / single CU / merged multi-CU). They are three routes to the
+    // The artifact report (TF-C118) — THE ONE report site for the three
+    // link/write dispatches below (static archive / single CU / merged
+    // multi-CU). They are three routes to the
     // SAME `outPath`, so the report is attached at their only common ancestor
     // rather than copied into each — and it is attached to their RESULT, so
     // the line cannot be printed for a write that failed. Every `return` of a

@@ -948,8 +948,7 @@ static void dumpRewrittenFuncsIfRequestedImpl(Lir const&          lir,
 
 // Stage-labelled wrapper so the pipeline can dump at any post-regalloc point.
 //
-// ★★ THE STAGE LINE CARRIES A CENSUS, AND THE CENSUS IS THE INSTRUMENT
-// (D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT). The
+// ★★ THE STAGE LINE CARRIES A CENSUS, AND THE CENSUS IS THE INSTRUMENT. The
 // per-function body below is filtered by `DSS_DUMP_LIR_MIN_INSTS` and prints
 // MNEMONICS — which carry neither the operation width nor the register class,
 // the two things `lir_peephole` R1's verdict turns on. Counting the string

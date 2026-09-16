@@ -243,7 +243,10 @@ incomingArgRegister(TargetSchema const&            schema,
                     std::uint32_t                  payload);
 
 // ── THE IDENTITY-CLASS-MOVE QUESTION, WITH ONE OWNER ────────────────────
-// D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT.
+// A per-pass claim about this population is falsifiable only while the
+// instrument that COUNTS it and the rule that ACTS on it ask the same
+// question; a second implementation counts a population the rule never
+// touches.
 //
 // "Is this instruction the declared register-to-register MOVE for its
 // result's register class, copying a physical register into ITSELF?" is

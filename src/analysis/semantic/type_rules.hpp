@@ -1683,10 +1683,10 @@ integerPromotedType(TypeInterner& interner, TypeId t,
     return interner.primitive(p);
 }
 
-// C 6.5.7 shift RESULT TYPE under the config verb `shiftResult`
-// (D-UAC-SHIFT-RESULT-RULE-CONFIG) — the SINGLE chokepoint both the CST→HIR
-// shift lowering and the semantic-tier expression typer call, so the two tiers
-// can never diverge on the verb (a regression to one is a regression to both,
+// C 6.5.7 shift RESULT TYPE under the config verb `shiftResult` — the SINGLE
+// chokepoint both the CST→HIR shift lowering and the semantic-tier expression
+// typer call, so the two tiers can never diverge on the verb (a regression to
+// one is a regression to both,
 // caught by the one test). `PromotedLeft` (C): the PROMOTED LEFT operand — the
 // count's type never contributes (`i32 << i64` is I32). `CommonType`: the
 // usual-arithmetic common type — a shift typed like an ordinary binary op

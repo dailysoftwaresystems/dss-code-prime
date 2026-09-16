@@ -35,7 +35,8 @@ A row written to the old four-cell shape would land with its TRIGGER sitting in 
 STATUS column, which is why the count is a refusal and not a warning.
 
 ★★★ AND SINCE THE SAME DATE IT DOES NOT PLACE THE ROW ITSELF -- `scripts/anchors/anchors.py`
-DOES. The registry became THREE documents (production / harness / done) with a
+DOES. The registry is TWO documents (production / done) since the harness one retired on
+2026-09-16; it was three (production / harness / done) with a
 move-on-close rule: a row whose status is closed is DELETED from its working registry and
 appended to the archive's matching table, and a reopened one moves back. That routing is
 ONE decision, and two programs that both write the registry are two programs that will
@@ -288,12 +289,8 @@ def self_test():
         doc(an.REL["production"], "# p", "", HDR, SEP,
             "| `" + A_ + "` | P1 | 🟠 OPEN | 🟠 **OPEN** | w | r |",
             "| `" + B_ + "` | P2 | 🟠 OPEN | 🟠 **OPEN** | w | r |", "")
-        doc(an.REL["harness"], "# h", "", HDR, SEP,
-            "| `" + HG_ + "` | P3 | 🟠 OPEN | 🟠 **OPEN** | w | r |", "")
         doc(an.REL["done"], "# d", "", an.DONE_TABLE["production"], "", HDR, SEP,
-            "| `" + _FX + "-OLDP` | P1 | ✅ CLOSED | ✅ **CLOSED** | - | r |", "",
-            an.DONE_TABLE["harness"], "", HDR, SEP,
-            "| `" + _FX + "-OLDH` | P3 | ✅ CLOSED | ✅ **CLOSED** | - | r |", "")
+            "| `" + _FX + "-OLDP` | P1 | ✅ CLOSED | ✅ **CLOSED** | - | r |", "")
 
     def refusal(box, rel, anchor, body):
         path = os.path.join(box, "row.md")
@@ -348,12 +345,15 @@ def self_test():
         pin(msg is not None and "expected a backticked" in msg,
             "(3) a row applied to the WRONG anchor is REFUSED", "got=%r" % msg)
 
-        # (4) a duplicate is refused, never settled by position.
-        with io.open(os.path.join(box, an.REL["harness"]), encoding="utf-8",
+        # (4) a duplicate is refused, never settled by position. Since the harness registry
+        # retired, the duplicate that can still happen is the working registry against the
+        # ARCHIVE: a row that is OPEN and CLOSED at the same time, where settling by position
+        # would decide whether the work is done by which document was read first.
+        with io.open(os.path.join(box, an.REL["done"]), encoding="utf-8",
                      newline="") as fh:
             hl = fh.read().split("\n")
-        hl.insert(5, "| `" + A_ + "` | P1 | 🟠 OPEN | 🟠 **OPEN again** | w | r |")
-        io.open(os.path.join(box, an.REL["harness"]), "w", encoding="utf-8",
+        hl.insert(6, "| `" + A_ + "` | P1 | 🟠 OPEN | 🟠 **OPEN again** | w | r |")
+        io.open(os.path.join(box, an.REL["done"]), "w", encoding="utf-8",
                 newline="").write("\n".join(hl))
         msg = refusal(box, rel, A_, GOOD)
         pin(msg is not None and "One id, one home" in msg,

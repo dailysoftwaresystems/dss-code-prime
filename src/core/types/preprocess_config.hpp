@@ -1067,8 +1067,7 @@ struct DSS_EXPORT PreprocessConfig {
     // BOTH of its halves WERE FALSE by the time the commit landed. It is
     // corrected here instead of deleted because the failure mode is the point:
     // a bare "today" is a claim with no date and no instrument, so it never
-    // stops being read as the present tense
-    // (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
+    // stops being read as the present tense.
     // MEASURED at the CLI 2026-08-24 on x86_64:pe64-x86_64-windows-exec, debug
     // AND release: `#define SUM3(...) dssAdd(__VA_ARGS__)` called as
     // `SUM3(20, 15, 7)` compiles rc=0 and the program RUNS returning 42 -- the

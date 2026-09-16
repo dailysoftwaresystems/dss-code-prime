@@ -194,14 +194,15 @@ NS_ENV = ("D-ENV-", "D-UPSTREAM-")
 # prefix. Per-plan rows have no such file, so they keep the namespace sieve.
 # ⇒ D-QUEUE-BURNDOWN-BANDED-A-HARNESS-ROW-INTO-THE-PRODUCTION-QUEUE (closed 2026-08-31)
 REG_PRODUCTION = ".plans/_deferred-anchor-registry-production.md"
-REG_HARNESS = ".plans/_deferred-anchor-registry-harness.md"
+# THE HARNESS REGISTRY WAS RETIRED 2026-09-16 by the DssHarness migration: the harness is
+# that tool's responsibility now, and every anchor here is a PRODUCTION anchor. Its rows are
+# readable in git at the parent of the commit that deleted them.
 # ★ THE ARCHIVE (operator, 2026-09-01). The registry became THREE documents: the two
 # WORKING lists above hold what is LEFT, and every closed row is moved out to this one.
 # It is named here so a row from it is IMPOSSIBLE to band -- see `BUCKET_ARCHIVE`.
 REG_DONE = ".plans/_deferred-anchor-registry-done.md"
-REGISTRIES = (REG_PRODUCTION, REG_HARNESS, REG_DONE)
+REGISTRIES = (REG_PRODUCTION, REG_DONE)
 BUCKET_PRODUCTION = "PRODUCTION"
-BUCKET_HARNESS = "harness"
 BUCKET_PLAN = "plan"
 BUCKET_ARCHIVE = "archive"
 
@@ -210,8 +211,6 @@ def bucket_of(rel):
     """-> which registry file holds this row. `plan` = a per-plan section 3.1 row."""
     if rel == REG_PRODUCTION:
         return BUCKET_PRODUCTION
-    if rel == REG_HARNESS:
-        return BUCKET_HARNESS
     if rel == REG_DONE:
         return BUCKET_ARCHIVE
     return BUCKET_PLAN
@@ -322,11 +321,10 @@ def band_of(name, flat, bucket=BUCKET_PLAN):
     if base.startswith(NS_RECORD):
         return "P4", "namespace", None
     m, sup = first_own_match(WRONG, flat)
-    if bucket == BUCKET_HARNESS:
-        # ★ THE FILE SAID SO. No prefix needs to agree, and this is the arm that catches
-        # `D-CONF-*`, `D-SCRIPT-*` and every other harness id nobody thought to list.
-        return "P3", ("registry file; note: %s" % evidence(flat, m)) if m else \
-            "registry file (-harness.md)", None
+    # ⓘ THE ARM THAT READ "THE FILE SAID SO" WENT WITH THE HARNESS REGISTRY (2026-09-16).
+    # It banded every row in `-harness.md` P3 without asking what the row said, which was
+    # right while the FILE carried that fact. With one working registry the file says
+    # nothing, so a row is banded by its own text — which is what the sieve below is for.
     if bucket != BUCKET_PRODUCTION and base.startswith(NS_HARNESS):
         # ⚠ A harness row can still describe a PRODUCT miscompile it found. Band it by
         # what it IS -- a harness row -- but say so, because the sieve saw the phrase.
@@ -514,9 +512,8 @@ def main(argv):
              sum(1 for r in items if not r["schedulable"])))
     prod_total = sum(1 for r in items if r["bucket"] == BUCKET_PRODUCTION)
     print("burndown-queue: BY BUCKET (the operator's outer sort key) -- "
-          "PRODUCTION %d, harness %d, per-plan %d"
+          "PRODUCTION %d, per-plan %d"
           % (prod_total,
-             sum(1 for r in items if r["bucket"] == BUCKET_HARNESS),
              sum(1 for r in items if r["bucket"] == BUCKET_PLAN)))
     print("\nBAND       total  schedulable  PROD   RED  ORANGE  YELLOW  GREEN")
     for b in BANDS:
@@ -622,13 +619,22 @@ def selftest():
     # in its clause. If the sieve's vocabulary changes, arm (a2) goes red and says so.
     wrong = "OPEN. This miscompiles the emitted image."
     plain = "OPEN. A capability that is absent."
+    # Assembled from fragments: a literal anchor-shaped name in this file would be a
+    # CITATION, and `band_of` is a pure function of (name, flat, bucket) that asserts
+    # nothing about where -- or whether -- the row is filed.
+    _FX = "D-" + "QUEUEFIXTURE"
 
-    b, _, _ = band_of("x#D-CONF-REFERENCE-DIFFERENTIAL-ORACLE", wrong, BUCKET_HARNESS)
-    pin(b == "P3", "(a) a harness-registry row with a NON-harness prefix bands P3, "
-        "not P0 -- the measured defect", "got %s" % b)
-    b2, _, _ = band_of("x#D-CONF-REFERENCE-DIFFERENTIAL-ORACLE", wrong, BUCKET_PLAN)
-    pin(b2 == "P0", "(a2) CONTROL: identical text with no registry home still bands "
-        "P0 -- so (a) is the BUCKET's doing, not the sieve's", "got %s" % b2)
+    # ⓘ (a) AND (a2) USED TO PIN THE OPPOSITE, AND THE CHANGE IS THE POINT.
+    # While the harness registry existed, a row filed there banded P3 whatever it said --
+    # the FILE was the evidence. That registry retired on 2026-09-16 and every row here is
+    # a production anchor now, so the only evidence left is the row's own text. These arms
+    # pin that: identical text bands the same way from either home.
+    b, _, _ = band_of("x#" + _FX + "-DIFFERENTIAL-ORACLE", wrong, BUCKET_PRODUCTION)
+    pin(b == "P0", "(a) a row whose text says it miscompiles bands P0 from the "
+        "production registry", "got %s" % b)
+    b2, _, _ = band_of("x#" + _FX + "-DIFFERENTIAL-ORACLE", wrong, BUCKET_PLAN)
+    pin(b2 == "P0", "(a2) CONTROL: identical text with no registry home bands P0 too -- "
+        "no file decides a band any more", "got %s" % b2)
 
     # ⚠ EVERY FIXTURE ID BELOW IS A REAL REGISTRY ROW, AND THAT IS NOT DECORATION.
     # `scripts/` is a root `check-anchor-registry` scans, so a plausible-looking
@@ -647,21 +653,19 @@ def selftest():
         "namespace sieve", "got %s" % b2)
 
     pin(bucket_of(REG_PRODUCTION) == BUCKET_PRODUCTION
-        and bucket_of(REG_HARNESS) == BUCKET_HARNESS
+        and bucket_of(REG_DONE) == BUCKET_ARCHIVE
         and bucket_of(".plans/14-linker-plan - tbd.md") == BUCKET_PLAN,
-        "(c) bucket_of maps production / harness / per-plan")
+        "(c) bucket_of maps production / archive / per-plan")
 
     # ⚠ (d) AND (d2) PIN THE THING I FIRST GOT WRONG. The invariant I reached for was
     # "every harness row bands P3", and the measurement refuted it with 23 rows. Both
     # bands below are LOWER priority than P3 and the verdict is more specific, so the
     # code is right; these arms exist so nobody "fixes" it back by reordering `band_of`.
-    b, _, _ = band_of("x#D-ENV-MACOS-GATEKEEPER-ADMISSION-IRREDUCIBLE", wrong,
-                      BUCKET_HARNESS)
-    pin(b == "P5", "(d) a D-ENV-* row in -harness.md bands P5, NOT P3 -- deliberate: "
-        "ENV is more specific AND lower", "got %s" % b)
-    b, _, _ = band_of("x#D-PLANS-LINE-CITATION-ROT", wrong, BUCKET_HARNESS)
-    pin(b == "P4", "(d2) a D-PLANS-* row in -harness.md bands P4, NOT P3 -- same "
-        "reason", "got %s" % b)
+    b, _, _ = band_of("x#D-ENV-" + "QUEUEFIXTURE-GATEKEEPER", wrong, BUCKET_PLAN)
+    pin(b == "P5", "(d) a D-ENV-* row bands P5, NOT P0 -- deliberate: ENV is more "
+        "specific AND lower, and it outranks the wrong-output sieve", "got %s" % b)
+    b, _, _ = band_of("x#D-PLANS-" + "QUEUEFIXTURE-CITATION-ROT", wrong, BUCKET_PLAN)
+    pin(b == "P4", "(d2) a D-PLANS-* row bands P4 -- same reason", "got %s" % b)
 
     b, _, _ = band_of("x#D-CSUBSET-VLA", plain, BUCKET_PRODUCTION)
     pin(b == "P2", "(e) GREEN CONTROL: an ordinary production row with no wrong or "

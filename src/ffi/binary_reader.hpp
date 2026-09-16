@@ -83,7 +83,7 @@ struct DSS_EXPORT BinaryReadError {
 // fragile against parser-order refactors. (pr-test-analyzer Gap 1
 // priority 9, post-fold #2.)
 //
-// Deliberately NOT DSS_EXPORT (D-BUILD-DSS-EXPORT-ON-FREE-CONSTEXPR-IGNORED).
+// Deliberately NOT DSS_EXPORT.
 // It is a free constexpr function DEFINED here, so it is implicitly inline and
 // every consumer emits its own copy — there is no DLL symbol to import. The
 // attribute was therefore dead, and dllimport on a free constexpr function is

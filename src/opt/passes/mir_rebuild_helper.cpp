@@ -302,9 +302,9 @@ MirInstId MirFunctionRebuilder::rewriteOperand(MirInstId oldOp) const {
         // the count `mir_rebuild_helper.hpp` states, and both had drifted to two
         // below the truth. The header's copy is now census-bound and checked; this
         // one is the UNIVERSAL claim it was always making, which no arithmetic can
-        // invalidate — the same repair
-        // D-TEST-CMAKE-COMMENT-QUOTES-A-CORPUS-COUNT-THE-TEST-IT-REGISTERS-FORBIDS
-        // made. One fact, one owner.
+        // invalidate — the same repair a quoted corpus count in a CMake comment
+        // needed, where the number had already moved before the commit that
+        // wrote it was made. One fact, one owner.
         rebuildFatal(kRebuilderSubject, policy_.passName(),
             std::format("rewriteOperand: old MirInstId v={} has no rewrite "
                         "entry — scan-order violation OR operand referenced a "

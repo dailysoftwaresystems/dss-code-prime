@@ -62,7 +62,6 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 
 // ═══════════════════════════════════════════════════════════════════════════
 // WHICH ARGUMENTS THE **DRIVER** MUST SUPPLY — and where each one is witnessed
-// (D-TEST-STATIC-LINK-UNIT-SUITE-CANNOT-WITNESS-A-DRIVER-THREADING-GAP)
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // ★★★ WHY THIS BLOCK EXISTS. Every entry point below has thorough unit

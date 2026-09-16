@@ -4,7 +4,7 @@
 
 Operator, 2026-09-01, in three instructions that this one file answers together:
   * *"we need to make this deterministic: inside scripts we must have anchors directory,
-    inside it (all with options like --done, --harness or --production): write-anchor,
+    inside it (all with options like --done or --production): write-anchor,
     read-anchor and read-anchors. Write you pass the parameters and it writes in the
     correct form. read 1 brings the full anchor result, read all brings the name,
     priority and status only. we must also ensure now that the anchor format is correct
@@ -87,8 +87,8 @@ Usage:
     anchors.py set   D-<AREA>-<NAME> --status closed --closing '...'      # moves to the archive
         ... and any prose cell may be read from a UTF-8 file instead, with --trigger-file,
         --closing-file or --cross-refs-file PATH: the form for a cell too long for a command line.
-    anchors.py read  D-<AREA>-<NAME> [--production|--harness|--done]
-    anchors.py list  [--production|--harness|--done] [--band P0 P1] [--open] [--lint]
+    anchors.py read  D-<AREA>-<NAME> [--production|--done]
+    anchors.py list  [--production|--done] [--band P0 P1] [--open] [--lint]
     anchors.py --self-test
 """
 from __future__ import annotations
@@ -174,8 +174,16 @@ queue = _load(ROOT, "scripts/burndown-queue/burndown-queue.py",
               "this tool REUSES its priority banding and must not re-implement it.")
 
 PLANS = ".plans"
-BUCKETS = ("production", "harness", "done")
-WORKING = ("production", "harness")
+# ★★★ TWO REGISTRIES SINCE 2026-09-16, AND THE THIRD IS NOT COMING BACK.
+# The harness registry was retired by the DssHarness migration: the harness becomes that
+# tool's responsibility, and every anchor from here on is a PRODUCTION anchor (operator
+# rulings 1-3). Its 187 open rows and the archive's 544 closed ones are readable in git at
+# the parent of the commit that deleted them.
+# ⚠ THIS TUPLE IS NOT COSMETIC. `read_rows` raises when a named registry is missing, and
+# `find`/`read`/`set`/`write` all pass the full tuple — so the file and this line have to
+# change together or every verb refuses, reads included.
+BUCKETS = ("production", "done")
+WORKING = ("production",)
 REL = {b: "%s/_deferred-anchor-registry-%s.md" % (PLANS, b) for b in BUCKETS}
 
 TABLE_HEADER = "| Anchor | Priority | Status | Trigger | Closing work | Cross-refs |"
@@ -189,7 +197,7 @@ FIELD_COL = {"priority": C_PRIORITY, "status": C_STATUS, "trigger": C_TRIGGER,
 
 # The archive keeps one table per ORIGIN bucket, so a reopened row knows where it goes
 # back to. The heading is the routing key, declared once.
-DONE_TABLE = {"production": "## Closed — Production", "harness": "## Closed — Harness"}
+DONE_TABLE = {"production": "## Closed — Production"}
 
 # ★ THE THREE-VALUE STATUS VOCABULARY. Spelled glyph-first because `is_closed` tests the
 # LEADING character; spelled with the word because a reader greps for `CLOSED`, not for
@@ -538,7 +546,7 @@ def _rewrite(path, lines, write):
 def place_row(root, working, anchor, row, write, insert=False, report=print):
     """Put `row` where its STATUS says it belongs, and remove it from anywhere else.
 
-    `working` is `production` or `harness` -- the bucket decision, which no tool can make
+    `working` is `production` -- the only working registry since the harness one retired
     and which the caller therefore always states. The DESTINATION is derived: closed rows
     go to the archive's matching table, open and gated rows to the working registry.
 
@@ -695,7 +703,7 @@ def _origin_of(anchor, bucket):
     rows = find(ROOT, anchor)
     if not rows:
         raise Refused("--done needs an existing row to take its origin table from; a new "
-                      "row is filed with --production or --harness and routed to the "
+                      "row is filed with --production and routed to the "
                       "archive from there when its status is closed.")
     return rows[0].table
 
@@ -964,7 +972,7 @@ def self_test():
     B_ = _FX + "-BETA"
     N_ = _FX + "-NOSUCH"
     CC_ = _FX + "-CELLS"
-    HG_ = _FX + "-HGAMMA"
+    HG_ = _FX + "-GAMMA"
 
 
     def pin(ok, why, detail=""):
@@ -983,12 +991,10 @@ def self_test():
             with io.open(os.path.join(tmp, rel), "w", encoding="utf-8", newline="") as f:
                 f.write("\n".join(body) + "\n")
         doc(REL["production"], "# p", "", TABLE_HEADER, SEP_ROW_TEXT,
-            O % "ALPHA", O % "BETA", "")
-        doc(REL["harness"], "# h", "", TABLE_HEADER, SEP_ROW_TEXT,
+            O % "ALPHA", O % "BETA",
             "| `" + HG_ + "` | P3 | 🟠 OPEN | 🟠 **OPEN** | w | r |", "")
         doc(REL["done"], "# d", "", DONE_TABLE["production"], "", TABLE_HEADER,
-            SEP_ROW_TEXT, C % "OLDP", "", DONE_TABLE["harness"], "", TABLE_HEADER,
-            SEP_ROW_TEXT, "| `" + _FX + "-OLDH` | P3 | ✅ CLOSED | ✅ **CLOSED** | - | r |", "")
+            SEP_ROW_TEXT, C % "OLDP", "")
 
     def refuse(fn, *a, **k):
         try:
@@ -1103,10 +1109,10 @@ def self_test():
         pin(dest == REL["done"] and A_ not in prod and A_ in done,
             "(8) a CLOSED row is DELETED from the working registry and appended to the "
             "archive", "dest=%s" % dest)
-        pin(done.index(A_) < done.index(DONE_TABLE["harness"]),
-            "(9) ...into the PRODUCTION table of the archive, not the harness one")
-        pin(B_ in prod and HG_ in
-            io.open(os.path.join(tmp, REL["harness"]), encoding="utf-8").read(),
+        pin(done.index(DONE_TABLE["production"]) < done.index(A_),
+            "(9) ...UNDER the archive's production heading, which is the routing key a "
+            "reopened row is read back from")
+        pin(B_ in prod and HG_ in prod,
             "(10) the sibling rows are untouched")
 
         # ── REOPENING moves it BACK ───────────────────────────────────────────
@@ -1143,10 +1149,16 @@ def self_test():
             "(15) the archive is never declared as a destination -- it is DERIVED")
 
         # ── a DUPLICATE across two files is refused, never settled ────────────
-        lines = io.open(os.path.join(tmp, REL["harness"]), encoding="utf-8",
+        # ⚠ The two files are now the working registry and the ARCHIVE, which is the
+        # duplicate that can still happen and the one that matters: a row that is OPEN and
+        # CLOSED at the same time. Settling it by picking a file would decide whether the
+        # work is done by which document was read first.
+        lines = io.open(os.path.join(tmp, REL["done"]), encoding="utf-8",
                         newline="").read().split("\n")
-        lines.insert(5, O % "BETA")
-        io.open(os.path.join(tmp, REL["harness"]), "w", encoding="utf-8",
+        # AFTER the separator: a row between the header and the separator is not in the
+        # table at all, and the arm would then pin a parser quirk instead of the duplicate.
+        lines.insert(6, O % "BETA")
+        io.open(os.path.join(tmp, REL["done"]), "w", encoding="utf-8",
                 newline="").write("\n".join(lines))
         pin(len({r.bucket for r in find(tmp, B_)}) == 2,
             "(16) an id filed in TWO registries is FOUND in both, never silently halved")

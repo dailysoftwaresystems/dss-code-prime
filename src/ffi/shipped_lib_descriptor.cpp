@@ -84,9 +84,9 @@ void emitMalformed(DiagnosticReporter& reporter, std::string what) {
 // of a BUILD and says nothing about the PROCESS the cache actually lives in: the
 // cache is `thread_local`, so its lifetime is the THREAD's, and nothing scopes it
 // to a compile. Serving the pre-change document silently is the wrong-answer class
-// `readFileChecked`'s own torn-read refusal exists to prevent one layer down
-// (D-TEST-SHIPPED-CONFIG-READ-FROM-A-TREE-ANOTHER-PROCESS-IS-WRITING names the
-// same tree-changes-under-the-reader situation).
+// `readFileChecked`'s own torn-read refusal exists to prevent one layer down —
+// the same tree-changes-under-the-reader situation, seen from the cache
+// instead of from the read.
 //
 // ⓘ REACHABILITY, MEASURED RATHER THAN ASSUMED — AND THE MEASUREMENT REFUTED THE
 // OBVIOUS ANSWER. The candidate production reach is `dsscp --lsp`: a long-running

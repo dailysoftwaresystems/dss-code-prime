@@ -1494,8 +1494,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     //     why it runs HERE and not after callconv: callconv mints ZERO
     //     additional identity class moves, and its `perFuncCfi` is keyed BY
     //     `LirInstId`,
-    //     ⚠ CORRECTED 2026-09-02 (P53,
-    //     D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT).
+    //     ⚠ CORRECTED 2026-09-02 (P53).
     //     This repeated `lir_peephole.hpp`'s evidence verbatim -- "MEASURED
     //     5575 at both stages" -- and that evidence could not support the
     //     claim. post-rewrite and post-callconv were the only two dump stages

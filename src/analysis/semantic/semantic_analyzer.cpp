@@ -18348,8 +18348,8 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             // the i1/Bool SSA carrier is the deliberate machine-tier divergence.
             if (isComparison(*op)) return comparisonResultType();
             // Shift result type follows the config verb `shiftResult` via the
-            // shared `shiftResultType` chokepoint (D-UAC-SHIFT-RESULT-RULE-CONFIG)
-            // — the SAME function cst_to_hir's combineBinary uses.
+            // shared `shiftResultType` chokepoint — the SAME function
+            // cst_to_hir's combineBinary uses.
             if ((*op == HirOpKind::Shl || *op == HirOpKind::Shr)
                 && arith.has_value()) {
                 return shiftResultType(interner, lt, rt, *arith);

@@ -38,12 +38,13 @@ deferral is the rare exception that must earn its place, not the convenient way 
    - `.plans/_deferred-anchor-registry-production.md` — a still-open defect **a user of the
      compiler could hit**, in the shipped binary or in the config it reads. ★ This is the file
      the burndown works from, ALWAYS (operator, 2026-08-25).
-   - `.plans/_deferred-anchor-registry-harness.md` — a still-open defect **only we can hit**:
-     tests, gates, guards, cycle machinery, plans, scripts, carriages, CI. ⚠ Fix a harness defect
-     the moment you FACE it, in that cycle; this file is a RECORD, not a backlog to schedule from.
    - `.plans/_deferred-anchor-registry-done.md` — the ARCHIVE (operator, 2026-09-01). Every CLOSED
-     row, in two tables that preserve which working list it came from. **Nothing here is work, and
-     you never file INTO it directly** — a row arrives by being closed.
+     row, in one table. **Nothing here is work, and you never file INTO it directly** — a row
+     arrives by being closed.
+   - ⚠ **There is no harness registry.** It retired on 2026-09-16 with the move to `DssHarness`:
+     a defect in the harness is that tool's to fix, and a defect in this repository's own build
+     wiring, tests or plans is a production row like any other. The rule it carried has not
+     changed — fix a harness defect the moment you FACE it, never later.
    ⚠ A row's bucket follows the **DEFECT**, never the instrument that found it. `D-CONFIG-*` and
    `D-DIAG-*` are PRODUCTION deliberately — a config document IS the compiler's behaviour here,
    and a diagnostic IS its output to a user.

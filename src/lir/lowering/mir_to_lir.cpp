@@ -2148,8 +2148,8 @@ struct Lowerer {
     // widths (x86 D3/C1 CL+imm8 forms via the implicit-count "count"
     // role contract; arm64 LSLV/LSRV/ASRV X+W forms) — they pass this
     // TYPE gate at 32/64 and lower through `lowerShift`. Bitwise
-    // (audit-residue sweep c1, D-AUDIT-BITWISE-UNWALL-WITNESS): And/Or
-    // are ENCODED end-to-end on BOTH targets (x86 21/09 reg-reg at
+    // (audit-residue sweep c1): And/Or are ENCODED end-to-end on BOTH
+    // targets (x86 21/09 reg-reg at
     // widths 64+32 since FC3.5 sweep-c2 — added for the composed-FCmp
     // materialization, which also un-walled source-level `&`/`|`;
     // arm64 AND/ORR X-form, width-absent variants) — witnessed by
@@ -13571,8 +13571,8 @@ struct Lowerer {
             // FC3 c2: the fused compare's width follows the ICmp
             // OPERANDS' type — the same rule as lowerICmp's cmp
             // (D-CSUBSET-32BIT-ALU-FORMS). Pinned (audit-residue sweep
-            // c1, D-AUDIT-FUSED-CMP-WIDTH-PIN): the Fused{I32,I64}…
-            // width pins in tests/lir/test_mir_to_lir.cpp + the
+            // c1): the Fused{I32,I64}… width pins in
+            // tests/lir/test_mir_to_lir.cpp + the
             // examples/c/fused_negative_compare runtime witness
             // (width-64 here flips its exit 42 → 7: a zero-extended
             // negative I32 reads as positive).

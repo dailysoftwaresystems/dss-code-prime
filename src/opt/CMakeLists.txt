@@ -37,6 +37,7 @@ target_link_libraries(opt PRIVATE core mir hir nlohmann_json::nlohmann_json)
 # reach — it is just covered by construction now instead of by a filename.
 # The pass implementations' deliberate subset-switches WITH `default:` arms stay
 # unaffected: `-Werror=switch` / C4062 are the no-`default` flavor and are
-# suppressed by a `default:`. See
-# D-BUILD-CLANG-ONLY-WARNINGS-INVISIBLE-TO-THE-MSVC-AND-GCC-LEGS for why the
-# five per-file copies of this gate were consolidated into one.
+# suppressed by a `default:`. The five per-file copies of this gate were folded
+# into one because a hand-written list of files to protect misses files: the
+# miss it cost was reported only on a macOS build, because no local MSVC or GCC
+# leg was passing the flag that would have caught it.

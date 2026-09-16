@@ -71,8 +71,7 @@
  *           `c_inline_asm_subnative_operand` is their runtime witness. An
  *           earlier draft of this bullet stated the refusal with NO target
  *           qualifier while the gcc/clang bullet below carried one, which made
- *           a per-target fact read as a universal
- *           (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
+ *           a per-target fact read as a universal.
  *   gcc 13.3.0 and clang 19, aarch64 — bare `%N` on an `"r"` operand ALWAYS
  *           renders the 64-bit `x` name, for EVERY integer type including
  *           `char`; `%w` is how a 32-bit form is asked for. clang says so

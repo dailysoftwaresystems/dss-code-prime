@@ -33,8 +33,8 @@
 // ancestry, find shipped config at all. A set-but-miss falls through.
 //
 // ★ ARM 2 EXISTS BECAUSE A PACKAGED COMPILER HAD NO WAY TO FIND ITS OWN
-// CONFIG ([[D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE]]). With only an
-// override and a cwd walk, an installed `dsscp` at `/usr/bin` invoked from a
+// CONFIG. With only an override and a cwd walk, an installed `dsscp` at
+// `/usr/bin` invoked from a
 // user's project walked THAT project's ancestors and found nothing — so
 // copying the config tree into a package would still not have worked, and
 // `#include <stdio.h>` was unresolvable. The layout it probes is COMPUTED BY
@@ -260,10 +260,10 @@ struct DSS_EXPORT ResolvedConfigRoot {
     // that it was SILENT, which is the same invisible-outcome class as the
     // foreign tree above and has already cost a measured 5x false regression
     // (the speedtest1 benchmark's pin was one directory too deep, missed, and
-    // fell through to the very cwd walk it existed to prevent). That row fixed
-    // its own pin and recorded the rest as "a production question, raised
-    // rather than taken":
-    // [[D-BENCH-CONFIG-ROOT-PIN-IS-ONE-LEVEL-TOO-DEEP-AND-SILENTLY-DOES-NOTHING]]
+    // fell through to the very cwd walk it existed to prevent). The benchmark
+    // fixed its own pin and left the rest — SAYING SO when a set override is
+    // ignored — as "a production question, raised rather than taken". This
+    // field is that half, taken.
     std::optional<std::string> ignoredOverride;
 };
 
