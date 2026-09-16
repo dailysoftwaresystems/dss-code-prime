@@ -60,6 +60,24 @@ encode(Lir const&                  lir,
        // operand). asm.cpp resolves each against the function's
        // completed block-offset table into a `SyntheticBlockSymbol`.
        std::vector<walker_util::BlockSymPatch>& blockSymPatches,
+       // D-CSUBSET-LONG-BRANCH: the LIR instructions this function's
+       // branch-relaxation fixed point has PROMOTED to their escape form,
+       // as a SORTED span of `LirInstId.v`. Empty on the first encode pass
+       // of every function — and permanently empty for every function whose
+       // branches all fit, which is why an unrelaxed function encodes
+       // byte-for-byte as it did before this parameter existed.
+       //
+       // ⚠ IT IS AN INPUT TO ENCODING, NOT AN OUTPUT OF IT, and that is the
+       // whole architecture: an escape emits REAL INSTRUCTIONS, so it changes
+       // the function's byte layout, so it cannot be applied by the patch
+       // resolver after the block-offset table is built. `asm.cpp` re-encodes
+       // the function with a larger promoted set until the set stops growing.
+       //
+       // Only `fixed32` takes it. `x86_variable` has no block-relative slot
+       // wider than `BlockRel32`, so no escape can be ELECTED there at all
+       // (see the election in the .cpp) and a parameter it could never read
+       // would be a false promise rather than symmetry.
+       std::span<std::uint32_t const> relaxedInsts,
        DiagnosticReporter&         reporter);
 
 } // namespace dss::fixed32

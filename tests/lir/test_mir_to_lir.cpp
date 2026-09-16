@@ -2233,10 +2233,18 @@ TEST(MirToLir, UnsupportedMirOpcodeFailsLoud) {
 TEST(MirToLir, IfElseLowersToCondBrChain) {
     // `int sign(int x) { if (x > 0) return 1; return 0; }`
     // MIR: ICmpSgt + CondBr + return-blocks.
-    // LIR: cmp+setcc / cmp+jcc / mov+ret in each branch / mov+ret in the
-    // join. Cycle 3b's "lower each MIR op naively" approach (no
-    // ICmp+CondBr peephole) is asserted here so the optimizer can later
-    // delete the redundant cmp/setcc.
+    // LIR: a single fused `cmp x, 0; jcc-Sgt`, then mov+ret in each branch.
+    //
+    // ⚠ THIS ARM USED TO ASSERT A `setcc` IN THE ENTRY BLOCK, and its comment
+    // said so out loud: *"cycle 3b's 'lower each MIR op naively' approach (no
+    // ICmp+CondBr peephole) is asserted here so the optimizer can later delete
+    // the redundant cmp/setcc"*. It was pinning a placeholder against the day
+    // the deletion arrived. It has (D-LIR-SETCC-DEAD-AFTER-FUSION): the
+    // compare's Bool is read by NOTHING but the CondBr that re-derives the
+    // flags for itself, so the use-count gate declines to mint the
+    // `cmp → setcc → zext` trio at all. The absence is now the assertion, and
+    // it is asserted BESIDE the `cmp` and the `jcc` that must still be there —
+    // a branch that silently stopped fusing would also have no setcc.
     auto L = lowerCToLir(
         "int sign(int x) { if (x > 0) return 1; return 0; }");
     assertUpstreamClean(L);
@@ -2255,28 +2263,48 @@ TEST(MirToLir, IfElseLowersToCondBrChain) {
     EXPECT_EQ(lir.instOpcode(entryTerm), *sch.opcodeByMnemonic("jcc"))
         << "entry block must end in jcc for an if/else";
 
-    // Somewhere in the entry block there's a `cmp` (the CondBr-side compare)
-    // and a `setcc` (the ICmpSgt-side materialization).
-    bool foundCmp = false, foundSetcc = false;
+    // The entry block holds the FUSED compare — exactly one — and no
+    // materialization of a Bool that nothing reads.
+    std::uint32_t cmpCount = 0, setccCount = 0;
     auto const cmpOp   = *sch.opcodeByMnemonic("cmp");
     auto const setccOp = *sch.opcodeByMnemonic("setcc");
     for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
         auto const o = lir.instOpcode(lir.blockInstAt(entry, i));
-        if (o == cmpOp)   foundCmp   = true;
-        if (o == setccOp) foundSetcc = true;
+        if (o == cmpOp)   ++cmpCount;
+        if (o == setccOp) ++setccCount;
     }
-    EXPECT_TRUE(foundCmp)   << "ICmp/CondBr must emit at least one cmp";
-    EXPECT_TRUE(foundSetcc) << "ICmpSgt must materialize a bool via setcc";
+    EXPECT_EQ(cmpCount, 1u)
+        << "the fused branch re-emits the compare, and that is the only "
+           "compare this function needs";
+    EXPECT_EQ(setccCount, 0u)
+        << "nothing reads the ICmpSgt's Bool but the branch that fuses it, so "
+           "no setcc materializes it (D-LIR-SETCC-DEAD-AFTER-FUSION)";
+    EXPECT_EQ(lir.instPayload(entryTerm),
+              static_cast<std::uint32_t>(::dss::TargetCondCode::Sgt))
+        << "and the jcc carries the COMPARE's condition — without this, a "
+           "branch that stopped fusing would satisfy the setcc absence above";
 }
 
 TEST(MirToLir, SignedICmpVariantsLowerWithCorrectSetccPayload) {
     // C-subset's `int` is signed, so the surface-visible comparison ops
     // (`==`/`!=`/`<`/`<=`/`>`/`>=`) lower to the signed conditions only.
-    // Each test source feeds the comparison through `if (...)` so the
-    // setcc is emitted (CondBr re-fetches via cmp+0; the setcc isn't the
-    // immediate predecessor of the jcc — but it MUST appear in the entry
-    // block carrying the right condition). Unsigned variants need a
-    // synthetic-MIR helper (deferred to cycle 3c).
+    // The SUBJECT is the `condCodeForICmp` mapping, read off the setcc's
+    // payload: a regression mapping (say) ICmpEq → Sle passes every other test
+    // in this file and fails here.
+    //
+    // ⚠ EACH SOURCE USED TO BE `if (a OP b) return 1; return 0;` AND THAT
+    // SHAPE NO LONGER EMITS A setcc AT ALL. Its Bool was read by nothing but
+    // the CondBr that fuses it, so the use-count gate
+    // (D-LIR-SETCC-DEAD-AFTER-FUSION) declines to materialize it — and a
+    // subject that has ceased to exist is not a weaker pin, it is a vacuous
+    // one, because the loop would simply never find a setcc to disagree with.
+    // The source is now `return a OP b;`, which RETURNS the Bool: a genuine
+    // consumer, the materialization every `condCodeForICmp` row is actually
+    // for, and the same six-way mapping. The FUSED half of the mapping is
+    // pinned separately on the jcc payload —
+    // `CondBrFusesIcmpConditionIntoJccPayload` below and
+    // `tests/lir/test_lir_fused_compare_dce.cpp`.
+    // Unsigned variants need a synthetic-MIR helper (deferred to cycle 3c).
     struct Case { char const* op; ::dss::TargetCondCode cond; };
     std::array<Case, 6> cases{{
         {"==", ::dss::TargetCondCode::Eq},
@@ -2291,8 +2319,8 @@ TEST(MirToLir, SignedICmpVariantsLowerWithCorrectSetccPayload) {
         return *(*sch)->opcodeByMnemonic("setcc");
     }();
     for (auto const& [op, expectedCond] : cases) {
-        std::string src = std::string{"int f(int a, int b) { if (a "} +
-                          op + " b) return 1; return 0; }";
+        std::string src = std::string{"int f(int a, int b) { return a "} +
+                          op + " b; }";
         auto L = lowerCToLir(src);
         assertUpstreamClean(L);
         ASSERT_TRUE(L.lir.ok) << "ICmp `" << op << "` must lower cleanly";
@@ -2313,7 +2341,9 @@ TEST(MirToLir, SignedICmpVariantsLowerWithCorrectSetccPayload) {
             break;
         }
         EXPECT_TRUE(foundCorrectSetcc)
-            << "ICmp `" << op << "` must emit a setcc in the entry block";
+            << "ICmp `" << op << "` must emit a setcc in the entry block — a "
+               "RETURNED Bool is a real consumer, so the use-count gate must "
+               "not reach it";
     }
 }
 

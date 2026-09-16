@@ -584,12 +584,27 @@ static std::optional<CuMirModule> buildCuMirImpl(
             // the format's rule instead of the canonical identifier. Already
             // resolved per (arch, format) at descriptor-read time — a plain
             // string like `version`, not a per-format map needing the fold above.
+            // D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA: carry the
+            // DECLARATION's thread storage duration so the binary binder can
+            // compare it against the LIBRARY's own answer for the same name.
+            // Read from the SAME `threadLocalMap` side table HIR→MIR reads to
+            // stamp `ExternImport.isThreadLocal` — one producer, so the FFI
+            // tier and the MIR tier can never disagree about what the source
+            // said. Absent entry ⇒ false: the map is SPARSE (only thread-local
+            // declarations are recorded), which is exactly the `!isThreadLocal`
+            // this check is looking for.
+            bool declaredThreadLocal = false;
+            if (auto const* tl = hir->threadLocalMap.tryGet(r.node);
+                tl != nullptr) {
+                declaredThreadLocal = tl->isThreadLocal;
+            }
             refs.push_back({r.node, r.canonicalName, resolvedLibs[i],
                             r.noLibraryBinding,
                             r.version,   // D-LK-ELF-SYMBOL-VERSIONING (c156)
                             r.isEagerImport,
                             r.asmName,
-                            r.linkName});
+                            r.linkName,
+                            declaredThreadLocal});
         }
 
         auto const ffiEntry = reporter.errorCount();
@@ -2817,6 +2832,12 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
 struct OperatorNamedImport {
     std::string library;   // the runtime identity to RECORD
     std::string version;   // ELF default version, or empty
+    // D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA: what the LIBRARY says this
+    // name's storage duration is, carried verbatim from the reader's row so the
+    // askers can compare it against their own row's declaration. Format-blind
+    // vocabulary (`SymbolKind::Tls` == ELF STT_TLS / PE __declspec(thread) /
+    // Mach-O S_THREAD_LOCAL_*), so no asker grows a format arm.
+    ffi::SymbolKind kind = ffi::SymbolKind::NoType;
 };
 
 [[nodiscard]] std::optional<std::unordered_map<std::string, OperatorNamedImport>>
@@ -2851,7 +2872,8 @@ resolveOperatorNamedLibraryImports(std::span<ResolveLibrarySpec const> libraries
             }
             bySymbol.try_emplace(
                 row.mangledName,
-                OperatorNamedImport{std::move(identity), std::move(version)});
+                OperatorNamedImport{std::move(identity), std::move(version),
+                                    row.kind});
         }
     }
     return bySymbol;
@@ -3427,6 +3449,17 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
                 if (definedNames.count(ext.mangledName) != 0) continue;
                 auto const it = bySymbol->find(ext.mangledName);
                 if (it == bySymbol->end()) continue;
+                // D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA: the pulled
+                // member's reference must agree with the library's storage
+                // duration for the same name, exactly as a C source reference
+                // must. ONE rule, one implementation (ffi/ingest.hpp) — the
+                // member arrives from an object reader rather than from HIR,
+                // and that must not decide whether the rule applies.
+                if (ffi::reportLibraryThreadStorageDisagreement(
+                        ext.mangledName, it->second.library, it->second.kind,
+                        ext.isThreadLocal, reporter)) {
+                    continue;   // left unbound behind a reported Error
+                }
                 ext.libraryPath = it->second.library;
                 ext.version     = it->second.version;
             }
@@ -3884,6 +3917,20 @@ namespace {
             if (!e.libraryPath.empty()) continue;
             auto const it = bySymbol->find(e.mangledName);
             if (it == bySymbol->end()) continue;
+            // D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA: an assembly unit's
+            // extern is subject to the SAME agreement rule as a C one — the
+            // storage duration a definition has is a property of the DEFINITION,
+            // not of the language that wrote the reference. `.s` has no
+            // `_Thread_local` spelling to carry, so `isThreadLocal` is false on
+            // every row here and the rule reduces to "an assembly extern may not
+            // name a library thread-local" — which is the correct answer while
+            // no assembly surface can request the thread-pointer-relative access
+            // such a symbol needs.
+            if (ffi::reportLibraryThreadStorageDisagreement(
+                    e.mangledName, it->second.library, it->second.kind,
+                    e.isThreadLocal, reporter)) {
+                continue;   // left unbound behind a reported Error
+            }
             e.libraryPath = it->second.library;
             e.version     = it->second.version;
         }

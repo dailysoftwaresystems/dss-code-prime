@@ -5,30 +5,17 @@ description: >-
   this deliberately does NOT do are documented in the program itself,
   `.harness-config/runner/actions/clock-step-probe/clock-step-probe.py`.
 
-  ★ LAYOUT, 2026-09-16 - THIS FILE IS WHERE THE OPERATOR RULED IT GOES, AND THE TOOL CANNOT
-  LOAD IT YET. The ruling is one directory per action, named for the action, holding its `.yml`
-  and every supporting file, because a `run` line is a program and its arguments with no shell,
-  so anything that is not a one-liner needs a file next to the action.
-  ✔MEASURED the same day against DssHarness 0.5.3, with this file at exactly this path:
-  `DssHarness legs` passes (exit 0); `DssHarness run` refuses with exit 12 - *'is not a file
-  name. A runner's action names one file directly inside ...'* - from
-  RepoHarness.Core.Runners.ActionFileParser.LoadAsync, which rejects any `action` whose
-  Path.GetFileName is not the whole string. ⚠ So this runner does not run until repo-harness is
-  fixed; that cost was weighed rather than absorbed - no ctest entry invokes `run`, and the four
-  runners that are real work are not written yet. The layout is not bent to fit today's tool.
-  ★ The upstream fix is NOT to delete the check. Its own comment gives a sound reason -
-  resolving a name with a separator would let a runner run a file from anywhere on the machine,
-  and *'only files a reviewer sees in this directory may declare what a runner does'* - and a
-  subdirectory of `actions/` is equally reviewable. The correct form is to combine, resolve to a
-  full path, and require it to remain UNDER the actions directory, which still refuses `..` and
-  a rooted path.
-
-  ⚠ THE RELATIVE PATH BELOW IS RESOLVED AGAINST THE REPOSITORY ROOT, NOT THIS DIRECTORY.
-  ✔MEASURED by running a step that printed its own working directory: a `run` line starts in the
-  leg's tree root. The operator's example `python3 ./bla.py` therefore does NOT work as written -
-  it looks for `bla.py` beside CMakeLists.txt. A supporting file is named from the root, as here.
-  This is also why the path survives the `.yml` moving into its action's directory later: it was
-  never relative to the `.yml`.
+  ★ LAYOUT — THE OPERATOR'S RULING, AND ✔PROVEN WORKING AT DssHarness 0.5.4 (2026-09-16).
+  One directory per action, named for the action, holding its `.yml` and every supporting file,
+  because a `run` line is a program and its arguments with no shell, so anything that is not a
+  one-liner needs a file next to the action.
+  ⚠ THIS BLOCK USED TO SAY THE TOOL COULD NOT LOAD IT. At 0.5.3 that was true - `DssHarness run`
+  refused with exit 12, *'is not a file name'*, from ActionFileParser.LoadAsync, and the `.yml` was
+  declared here anyway rather than bent to what that version accepted. 0.5.4 loads it. The refusal is
+  kept on the record only to explain why the file was written before it could run.
+  ✔MEASURED at 0.5.4: the step log records `# command python3 ./clock-step-probe.py` and the witness
+  fired - `clock-step-probe steps=0 samples=250 window=5.058s`. Both halves of the ruling now hold: the
+  supporting file sits beside its action, and the `.yml` sits inside the action's own directory.
 
 steps:
   - name: sample-clock-step
@@ -57,8 +44,17 @@ steps:
       python3 ./clock-step-probe.py
     # Exiting 0 is not proof the probe ran: an interpreter that started, printed nothing and
     # exited would pass on its exit code alone. The witness is the count itself.
-    # ✔RED-ON-DISABLE, 2026-09-16, Windows host, through `DssHarness run`: with the program's
-    # token changed to `count=` and this pattern untouched, the run reported `unwitnessed -
-    # sample-clock-step exited 0 and its success pattern never matched its output` and exited 5.
-    # Restored, the same command passed. The witness is load-bearing, not decorative.
+    # ✔RED-ON-DISABLE, 2026-09-16, Windows host, DssHarness **0.5.4**, AT THIS LAYOUT.
+    # Retaken after the nested `.yml` and `workingDirectoryRoot: action` began to load, because a
+    # transcript must describe what SHIPS, and the earlier one described the flat layout.
+    #   md5 before    f611a13fb7f77be2394aa712fb42b39c
+    #   mutation      the program prints `count=`; this pattern, untouched, still expects `steps=`
+    #   md5 moved     b8e2705188dccc482966694d5ede7ff5
+    #   run           `unwitnessed (sample-clock-step exited 0 and its success pattern never
+    #                 matched its output)` — **exit 5**
+    #   md5 restored  f611a13fb7f77be2394aa712fb42b39c
+    #   control arm   the same command, restored: `passed`, exit 0
+    # ★ THE MUTANT EXITED 0 AND THE RUN STILL REFUSED. That is the whole point: this witness is
+    #   what stands between a passing exit code and an interpreter that started, printed nothing
+    #   and said so in no way anyone could detect.
     successPattern: "clock-step-probe steps="

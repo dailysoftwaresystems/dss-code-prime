@@ -195,6 +195,59 @@ already pointing at: `D-CSUBSET-LONG-BRANCH`, `D-CSUBSET-THREAD-LOCAL-INITIAL-EX
 `D-LIR-SETCC-DEAD-AFTER-FUSION`, and two needing targets that do not exist
 (`D-FF4-1-PE32-STDCALL-DECORATION`, `D-FF3-4-MICROSOFT-ARM64-CC-ROW`).
 
+### P68 ROUND 2 — the four disclosed rows that could be worked, and its EIGHT gate numbers
+
+✔MEASURED on the folded tree, `{Debug, Release} × four legs`, **all eight green, zero failures** —
+⚠ but read the WSL Release note below before quoting it:
+
+| leg | Debug | Release |
+|---|---|---|
+| Windows x86_64, MinGW GCC / MSVC | **2209 / 2209** (863 s) | **2209 / 2209** (515 s) |
+| WSL x86_64, gcc | **2208 / 2208** (546 s) | **2208 / 2208** (148 s), **on the THIRD attempt** |
+| macOS arm64, clang | **2169 / 2169** (983 s) | **2169 / 2169** (862 s) |
+| arm64 VPS, gcc | **2169 / 2169** (1421 s) | **2169 / 2169** (275 s) |
+
+★ The cross-leg identity re-derived at THIS tree: `2209 − 40 repo-guards = 2169`, exact on both ssh
+legs; WSL reads 2208 because it RUNS the guards and skips one Windows-only entry. The round added
+**2** ctest entries (2207 → 2209).
+
+⚠⚠ **THE WSL RELEASE LEG WENT RED TWICE BEFORE THAT GREEN, AND THE RED WAS REAL.** `run_gate_guard`
+alone, arms `40/41-*-challenger-vs-sh-holder`: a challenger that must be REFUSED while a holder is
+live exited 0 and OVERWROTE the live holder's log. run-gate keys process identity on `ps lstart`, an
+absolute wall clock, so a CLOCK_REALTIME step rewrites every live process's creation time and a live
+holder reads as a recycled pid. The red run carried **4** `clock stepped` reports against **0** in each
+green run. Row: `D-SCRIPT-RUN-GATE-LOG-HOLDER-IDENTITY-KEYS-ON-A-WALL-CLOCK-A-STEPPING-HOST-REWRITES`,
+inventory §13, wave `W-test`. **Do not read a WSL leg as green without reading its `clock stepped`
+count.**
+
+**What landed, in four lanes plus the orchestrator:**
+1. `tls` — **a P0 SILENT MISCOMPILE, found and fixed in one session.** A plain `extern int` declared
+   against a library that exports the symbol `STT_TLS` bound as ORDINARY DATA with no diagnostic at any
+   severity, and the binary read the library's ELF header where its datum should be (exit **127** =
+   `0x7f`; the `>> 8` probe exits **69** = `0x45` = `E`). GNU ld refuses the identical program.
+   `SymbolKind::Tls` had been produced since FF1 and consumed by nobody. The refusal now lives at the
+   three binders, reporting `K_ExternImportAttributeConflict`.
+2. `br` — **branch relaxation.** The patch resolver is a FIXED POINT with a per-function promoted set,
+   bounded by construction; the escape word is QUOTED from the target config
+   (`electEscapeWord`), never synthesized; field reach became one data table. `D-CSUBSET-LONG-BRANCH`
+   stays OPEN for the `Imm26` / `rel32` residue, whose escapes are different ADDRESSING MODES and need
+   `src/dss-config/targets/*.target.json` rows.
+3. `lir` — the fused compare stops emitting a `cmp → setcc → zext` trio no LIR instruction reads. The
+   gate is a **use count**, not a mnemonic pattern; it lives in the lowering, not `lir_peephole`, which
+   runs post-regalloc where a vreg use-count rule is vacuous.
+4. `hv` — the HIR verifier's pointer-convert contract finally has the audit pin its own closure clause
+   asked for, with a synthesized negative beside the firing arm.
+5. orchestrator — the eight-run gate; the long-branch row's *"the cross-leg run is owed"* answered;
+   the run-gate row and inventory §13; the DssHarness findings below.
+
+**DssHarness at 0.5.4 — reported to the operator, never worked around.** `buildOutputs` still cannot
+express a cross-platform executable, so `DssHarness test` exits 5 `unwitnessed` and **parity cannot be
+taken**; `LegRunService` still builds its OK line from legs REPORTED ON while `SkippedUnavailable` is
+`IsFailure=false`. NEW, and NOT a defect: `DssHarness sync` refuses to adopt a checkout it did not
+create — ✔MEASURED, `sync --dry-run --legs linux-x86_64-debug` exits **13** — because a sync deletes
+what the source lacks. It is right, and all three ssh/WSL hosts hold exactly such a checkout with warm
+build roots, so **the migration owes a decision, not a fix**.
+
 **Owed, in order, and all of it is this branch's.** ⚠ This list previously led with *"the scripts
 whose replacing verb does not exist"*. **No such item remains** — every verb exists, so what is owed
 is PROOF, not a release.

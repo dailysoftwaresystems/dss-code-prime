@@ -382,3 +382,17 @@ target_include_directories(dss_asm_test_asm_arm64_shared_encoding_31
 # an unnameable code is ungreppable, which is the defect itself.
 dss_add_test(NAME asm/test_static_data_diagnostic_codes
              SOURCES test_static_data_diagnostic_codes.cpp)
+
+# [[D-CSUBSET-LONG-BRANCH]] (cycle P68 round 2, lane `br`): the branch-relaxation
+# fixed point. A SYNTHESIZED oversized function body — ~1 MiB of padding, laid
+# out so one conditional is out of AArch64 `B.cond`'s ±1 MiB reach by exactly one
+# word and a second is exactly AT the limit until the first one escapes — proves
+# that the resolver iterates rather than patching once, and that both escape
+# shapes (condition preserved / condition inverted) are emitted correctly. The
+# six-word in-reach skeleton is the named CONTROL arm: its bytes are pinned as
+# literals, so a relaxation that fires on branches that fit reds there while the
+# oversized pin stays green.
+# ⓘ It is the slowest test in this directory by construction — reaching a ±1 MiB
+# branch edge means emitting ~1 MiB of code, three times.
+dss_add_test(NAME asm/test_asm_long_branch
+             SOURCES test_asm_long_branch.cpp)

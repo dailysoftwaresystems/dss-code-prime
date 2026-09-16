@@ -287,3 +287,15 @@ dss_add_test(NAME lir/test_preemptible_definition_routing
 # and under `direct-plt` those are two different VAs of one import.
 dss_add_test(NAME lir/test_preemptible_definition_address
              SOURCES test_preemptible_definition_address.cpp)
+
+# D-LIR-SETCC-DEAD-AFTER-FUSION: the use-count gate that stops `lowerICmp` /
+# `lowerFCmp` minting a `cmp -> setcc -> zext` trio whose only would-be reader is
+# a CondBr that FUSES the compare and re-derives the flags for itself. Its own
+# target because the claim is a MATRIX of two arms that must move in opposite
+# ways: the fused-only shape loses all three instructions, and the
+# second-consumer shape — same CFG, one extra read — must not change by a byte.
+# A rule keyed on the `setcc` mnemonic instead of on the use count passes the
+# first arm and silently breaks the second (D-LIR-FUSION-USE-COUNT-GATE), so the
+# control arm is as load-bearing as the pin.
+dss_add_test(NAME lir/test_lir_fused_compare_dce
+             SOURCES test_lir_fused_compare_dce.cpp)

@@ -978,6 +978,92 @@ TEST(HirVerifier, NonVariadicFnSigStillRejectsExtraArgs) {
     EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
 }
 
+// ── D-HIR-VERIFIER-POINTER-CONVERT-CONTRACT — the post-coerce pointer
+//    invariant, pinned ──────────────────────────────────────────────────────
+//
+// `checkCallArguments` calls `isAssignable` WITHOUT its 4th parameter, so the
+// pointer rules default to `PointerConversionRules{}` — every flag false,
+// strict reject. That omission IS the invariant, not a conservatism: the
+// verifier reads POST-coerce HIR, in which every implicit pointer conversion
+// the active language admits has already been materialized as an explicit
+// `HirKind::Cast` by `cst_to_hir.cpp::coerce()`. A bare `Ptr<I32>` arriving in
+// a `Ptr<Void>` parameter slot is therefore a PRODUCER BUG, and admitting it
+// would bless a shim wiring a `FILE*` into a `char*` slot. `mir_verifier.cpp`
+// (`sameSlotType`) states the same rule one tier down.
+//
+// Until these two arms the contract was asserted by CONSTRUCTION and by COMMENT
+// only — nothing went red if someone "helpfully" threaded the active language's
+// `pointerConversions` block into that call site, which for `c` sets
+// `implicitToVoidPtr = true` and would silently admit the uncast argument.
+//
+// The comment's own Closure clause named the trigger: the first non-`cst_to_hir`
+// HIR producer. It has fired. `parseHir` (`hir/hir_text.cpp`) rebuilds a whole
+// module from `.dsshir` text and runs `HirVerifier` on load, and a `HirBuilder`
+// caller — every fixture in this file, and tomorrow's FFI shim or trampoline
+// synthesizer — reaches the same check without passing through `coerce()` at all.
+//
+// The argument is a `Ref`, NOT a `Literal`, deliberately: this same walker
+// carries the D-LANG-NULL-POINTER-CONSTANT structural fallback, which admits an
+// INTEGER-typed `Literal` in a `Ptr<*>` slot. A `Ref` is structurally outside
+// that arm, so what these arms measure is the pointer rule alone.
+//
+// Both arms are required. The FIRES arm alone could be satisfied by
+// blanket-rejecting every `Ptr`→`Ptr` argument; the CLEAN arm pins that the
+// rule is about the MISSING Cast, which is the only thing that makes the
+// post-coerce invariant a contract rather than a ban on pointers.
+
+TEST(HirVerifier, BarePointerArgIntoVoidPointerParamFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32     = ti.primitive(TypeKind::I32);
+    TypeId const voidTy  = ti.primitive(TypeKind::Void);
+    TypeId const ptrI32  = ti.pointer(i32);
+    TypeId const ptrVoid = ti.pointer(voidTy);
+    TypeId const sig     = ti.fnSig(std::array{ptrVoid}, i32,
+                                    dss::CallConv::CcSysV);  // (ptr<void>)->i32
+
+    HirBuilder b{"toy"};
+    HirNodeId const callee = b.makeRef(sig, /*symbol=*/1);
+    // NO interposed Cast — exactly the shape a producer emits when it assumes
+    // "all pointers are interchangeable".
+    HirNodeId const arg  = b.makeRef(ptrI32, /*symbol=*/2);
+    HirNodeId const call = b.makeCall(callee, std::array{arg}, i32);
+    Hir h = std::move(b).finish(call);
+
+    DiagnosticReporter reporter;
+    EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)))
+        << "a bare Ptr<I32> in a Ptr<Void> param slot is a post-coerce "
+           "producer bug and must not verify clean";
+    EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u)
+        << "threading the active language's PointerConversionRules into "
+           "checkCallArguments' isAssignable call would silence exactly this";
+}
+
+TEST(HirVerifier, PointerArgCastToVoidPointerParamIsClean) {
+    // The NEGATIVE of the arm above, and the whole reason the rule is a
+    // contract: once `coerce()` has materialized the conversion as an explicit
+    // Cast, the argument's type IS the parameter's type and the check passes.
+    TypeInterner ti = makeInterner();
+    TypeId const i32     = ti.primitive(TypeKind::I32);
+    TypeId const voidTy  = ti.primitive(TypeKind::Void);
+    TypeId const ptrI32  = ti.pointer(i32);
+    TypeId const ptrVoid = ti.pointer(voidTy);
+    TypeId const sig     = ti.fnSig(std::array{ptrVoid}, i32,
+                                    dss::CallConv::CcSysV);
+
+    HirBuilder b{"toy"};
+    HirNodeId const callee = b.makeRef(sig, /*symbol=*/1);
+    HirNodeId const arg    = b.makeCast(b.makeRef(ptrI32, /*symbol=*/2),
+                                        ptrVoid, HirFlags::Synthetic);
+    HirNodeId const call   = b.makeCall(callee, std::array{arg}, i32);
+    Hir h = std::move(b).finish(call);
+
+    DiagnosticReporter reporter;
+    EXPECT_TRUE((HirVerifier{h, nullptr, &ti}.verify(reporter)))
+        << "the post-coerce shape — Cast(Ref : ptr<i32>) : ptr<void> — is what "
+           "cst_to_hir emits and must verify clean";
+    EXPECT_EQ(reporter.errorCount(), 0u);
+}
+
 // ── intrinsic rule (HR6, H_UnknownIntrinsic) ──
 
 TEST(HirVerifier, UnregisteredIntrinsicFires) {

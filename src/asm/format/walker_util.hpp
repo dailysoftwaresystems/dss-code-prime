@@ -554,9 +554,9 @@ enum class BlockRelPatchKind : std::uint8_t {
     // as 4 LE bytes at `patch_offset`. Used by `E9 rel32` /
     // `0F 8x rel32` (jmp / jcc family).
     X86Rel32 = 0,
-    // ARM64 placeholders (D-AS3-BLOCK-REL-IMM19/26 — close when
-    // ARM64 control-flow lands). Mentioned to lock in the enum
-    // shape; resolver MUST fail-loud on these until implemented.
+    // ARM64 (D-AS3-BLOCK-REL-IMM19/26 — RESOLVED since 2026-06-08; the
+    // "fail-loud placeholder" this comment used to describe is long gone,
+    // and `blockRelFieldGeometry` below now carries each arm's numbers).
     Arm64Imm19 = 1,  // B.cc — bits 23..5 of the 32-bit word, shift=2
     Arm64Imm26 = 2,  // B    — bits 25..0 of the 32-bit word, shift=2
 };
@@ -574,7 +574,98 @@ struct BlockRelPatch {
     std::uint32_t patchOffset;  // byte offset of the placeholder in out
     std::uint32_t targetBlock;  // LirBlockId.v of the branch target block
     BlockRelPatchKind kind = BlockRelPatchKind::X86Rel32;
+    // D-CSUBSET-LONG-BRANCH: does an ESCAPE exist for this patch when its
+    // displacement leaves the field's reach? Set by the WALKER, because only
+    // the walker can see the opcode's declared encoding variants and decide
+    // whether a strictly-wider block-relative slot is available to escape
+    // into. FALSE is the conservative default: a patch that declares no
+    // escape keeps the loud `A_ImmediateOperandOutOfRange` refusal it has
+    // always had. The resolver never invents an escape — it only honours one
+    // the config proved exists.
+    bool relaxable = false;
+    // D-CSUBSET-LONG-BRANCH: the LIR instruction this patch came from —
+    // the STABLE IDENTITY across the relaxation re-encodes. `asm.cpp` stamps
+    // it centrally over the patches a single `encodeInst` appended, so no
+    // walker has to remember to. The promoted-instruction set is keyed on
+    // this value, which is why it must survive a re-encode unchanged
+    // (byte offsets do not — that is the whole reason the set is keyed on
+    // the instruction rather than on the patch site).
+    std::uint32_t instV = 0;
 };
+
+// ─────────────────────────────────────────────────────────────────────
+// D-CSUBSET-LONG-BRANCH — THE REACH OF A BLOCK-RELATIVE FIELD, AS DATA
+// ─────────────────────────────────────────────────────────────────────
+//
+// ★★★ THE REACH OF A FIELD IS A PROPERTY OF THE FIELD, NOT OF A CPU NAME.
+// Before this table the `asm.cpp` resolver carried the lsb / width / scale /
+// PC-bias of each patch kind as literals inside its own `switch` arms — two
+// arms that happened to agree on ARM64's `>>2, no bias` and one that spelled
+// x86's `+4, whole word`. Adding an escape path to that shape would have
+// meant a THIRD copy of the same four numbers. They live here once, keyed by
+// the kind the encoder already selects from `wire.slotKind` (config-driven),
+// and every consumer — range check, patch write, escape election — reads the
+// same row.
+//
+// `wholeField` distinguishes the two write disciplines the resolver needs:
+//   * true  — the displacement IS the four bytes at `patchOffset` (x86
+//             rel32): write all 32 bits, no read-modify-write.
+//   * false — the displacement is a bit-window inside a 32-bit LE word
+//             (AArch64 Imm19 / Imm26): READ the word, replace only
+//             [lsb, lsb+width), write it back. A whole-word store here
+//             would clobber the opcode and the cond nibble.
+struct BlockRelFieldGeometry {
+    std::uint8_t lsb;         // first bit of the field inside its 32-bit word
+    std::uint8_t width;       // field width in bits
+    std::uint8_t scaleLog2;   // displacement = delta >> scaleLog2
+    std::int8_t  pcBias;      // bytes added to patchOffset before subtracting
+    bool         wholeField;  // the field is the whole 4-byte little-endian word
+};
+
+[[nodiscard]] constexpr BlockRelFieldGeometry
+blockRelFieldGeometry(BlockRelPatchKind kind) noexcept {
+    switch (kind) {
+        // x86 rel32-after-disp: `disp = target - (patch + 4)`, unscaled,
+        // written as the whole 4-byte LE field at `patchOffset`.
+        case BlockRelPatchKind::X86Rel32:
+            return BlockRelFieldGeometry{ 0, 32, 0, 4, true };
+        // AArch64 `B.cond`: bits 5..23 of the word, scaled by 4, PC-relative
+        // to the instruction ITSELF (no bias). ±1 MiB.
+        case BlockRelPatchKind::Arm64Imm19:
+            return BlockRelFieldGeometry{ 5, 19, 2, 0, false };
+        // AArch64 `B`: bits 0..25, scaled by 4, no bias. ±128 MiB.
+        case BlockRelPatchKind::Arm64Imm26:
+            return BlockRelFieldGeometry{ 0, 26, 2, 0, false };
+    }
+    // Enum-drift backstop: a new kind added without a row here returns a
+    // ZERO-WIDTH field, whose signed range is empty, so the resolver refuses
+    // every displacement loudly rather than silently writing nothing.
+    return BlockRelFieldGeometry{ 0, 0, 0, 0, false };
+}
+
+// The inclusive signed displacement range (in SCALED units — the value that
+// actually lands in the field) a geometry admits. A zero-width field yields
+// an empty range `[0, -1]`, which no displacement satisfies.
+[[nodiscard]] constexpr std::int64_t
+blockRelFieldMin(BlockRelFieldGeometry g) noexcept {
+    return g.width == 0 ? 0 : -(std::int64_t{1} << (g.width - 1));
+}
+[[nodiscard]] constexpr std::int64_t
+blockRelFieldMax(BlockRelFieldGeometry g) noexcept {
+    return g.width == 0 ? -1 : (std::int64_t{1} << (g.width - 1)) - 1;
+}
+
+// How far, in BYTES, a kind can branch in the positive direction. Used to
+// ORDER two block-relative slots when the walker elects an escape: an escape
+// is only an escape if it reaches STRICTLY further than the field it rescues.
+// Comparing byte reach rather than bit width is what makes the ordering
+// correct across kinds with different scales (a 19-bit field scaled by 4
+// reaches further than an unscaled 19-bit one would).
+[[nodiscard]] constexpr std::int64_t
+blockRelByteReach(BlockRelPatchKind kind) noexcept {
+    auto const g = blockRelFieldGeometry(kind);
+    return blockRelFieldMax(g) << g.scaleLog2;
+}
 
 // D-CSUBSET-COMPUTED-GOTO (`&&label` block-address materialization):
 // a pending SYNTHETIC-SYMBOL ↔ BLOCK binding accumulated by an encoder

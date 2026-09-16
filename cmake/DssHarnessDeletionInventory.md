@@ -364,6 +364,43 @@ reading one config cannot have that class of bug.**
 `.harness-config/runner/actions/<name>/<name>.yml` is the wave that decides their leg set in config —
 and that is the moment the durable sentence above becomes checkable rather than advisory.
 
+## 13. `run_gate_guard` is a COIN FLIP on the WSL leg — measured 2026-09-16 (P68 round 2, orchestrator)
+
+**Wave: `W-test` (`run-gate`).** This is the first measured cost of keeping the script alive, as opposed
+to the standing 252 s it charges every gate run.
+
+✔MEASURED at this commit's tree, WSL x86_64: `run_gate_guard` went **RED twice and GREEN on the third
+attempt** on the **Release** leg, and green first time on the **Debug** leg, with nothing in the tree
+changing between runs. The failing arms are `40-sh-challenger-vs-sh-holder` and
+`41-ps1-challenger-vs-sh-holder`: a challenger that must be REFUSED (exit 5) while a holder is live
+exited 0, RECLAIMED the holder's log path, and wrote `CHALLENGER-RAN` into a log that had to carry
+`LOG-HOLDER-STARTED`. **A live gate's evidence log was overwritten under it** — so the guard is right
+and the red is real.
+
+**Why it happens, and why it is a WAVE item rather than a fix:** run-gate keys process IDENTITY on
+`ps -eo lstart`, an absolute wall-clock value, and `lstart` is `btime + starttime/HZ` with `btime`
+recomputed from the realtime clock — so a CLOCK_REALTIME step rewrites the creation time of every LIVE
+process, and `run_gate_owner_stale` then reads a live holder as a recycled pid. The red run carried
+**4** `clock stepped` reports from the proof's own instrumentation (`took ?(the clock stepped back)s`)
+against **0** in each green run. The host is this WSL2 box's known ±34.47 s CLOCK_REALTIME oscillation.
+
+| | Debug | Release |
+|---|---|---|
+| `clock stepped` reports in the run | 0 | 4 (red) / 0 (green, 3rd attempt) |
+| `run_gate_guard` | passed | failed, failed, passed |
+
+★ **THE POINT FOR THIS FILE:** the sound fix — key identity on `/proc/<pid>/stat` field 22, ticks since
+boot, which no realtime step can move — has to land in BOTH twins, needs a new guard arm and a
+red-on-disable transcript, and then a **fresh eight-run gate**, because run-gate is what RUNS the gate.
+That is a full round spent hardening a script this wave deletes. The row
+`D-SCRIPT-RUN-GATE-LOG-HOLDER-IDENTITY-KEYS-ON-A-WALL-CLOCK-A-STEPPING-HOST-REWRITES` carries the
+decision and names the fix, **so that if `W-test` slips out of this PR the fix happens instead of the
+knowledge evaporating.**
+
+⚠ **AND IT RAISES A QUESTION THIS FILE MUST NOT ANSWER BY ASSUMPTION:** DssHarness owns the gate after
+`W-test`. Whether ITS run-verification keys on a wall clock anywhere is unmeasured here, and inheriting
+the same defect would make this deletion a lateral move. Reported to the operator with the rest.
+
 ## Summary of disagreements with contract S4
 
 | # | Contract S4 says | ✔MEASURED at this commit |

@@ -9,6 +9,7 @@
 #include "core/types/type_lattice/type_layout.hpp"   // computeLayout, scalarByteSize
 #include "lir/lir_pass_util.hpp"
 
+#include <algorithm>  // D-CSUBSET-LONG-BRANCH: sort / unique / binary_search over the promoted set
 #include <bit>
 #include <cmath>     // D-MIR-OVERLAP-STRUCT-ZERO-INIT: std::signbit (rejects -0.0)
 #include <cstring>
@@ -48,6 +49,11 @@ using dss::report;
                               std::vector<walker_util::BlockRelPatch>& blockPatches,
                               std::vector<walker_util::BlockSymPatch>& blockSymPatches,
                               std::span<MirInstId const> lirToMir,
+                              // D-CSUBSET-LONG-BRANCH: the sorted set of
+                              // `LirInstId.v` this function's relaxation
+                              // fixed point has promoted to their escape
+                              // form. Empty on pass 0 of every function.
+                              std::span<std::uint32_t const> relaxedInsts,
                               DiagnosticReporter&     reporter) {
     auto const opcode = lir.instOpcode(inst);
     auto const* info  = schema.opcodeInfo(opcode);
@@ -95,7 +101,7 @@ using dss::report;
         case TargetEncodingShape::Fixed32:
             return fixed32::encode(lir, schema, inst, info, lirToMir,
                                     out, relocs, srcMap, blockPatches,
-                                    blockSymPatches, reporter);
+                                    blockSymPatches, relaxedInsts, reporter);
         }
 
         // Enum-drift fallback. A new `TargetEncodingShape` value
@@ -220,6 +226,68 @@ AssembledModule assemble(Lir const&                 lir,
 
         std::uint32_t const blockCount = lir.funcBlockCount(fn);
 
+        // ─────────────────────────────────────────────────────────────
+        // D-CSUBSET-LONG-BRANCH — BRANCH RELAXATION AS A FIXED POINT
+        // ─────────────────────────────────────────────────────────────
+        //
+        // ★★★ A SINGLE PATCHING PASS CANNOT BE RIGHT, AND THE ROW SAID SO
+        // BEFORE THE CODE DID. An intra-function branch whose displacement
+        // leaves its field's reach is rescued by an ESCAPE — real extra
+        // instructions the encoder emits. Emitting them changes the
+        // function's byte layout, so every block offset captured before
+        // them is stale, so the decision cannot be made by the resolver
+        // after the block-offset table is built. Worse, the growth is not
+        // local: widening one branch pushes the spans that CONTAIN it
+        // further apart, and a branch that was exactly in reach falls out
+        // of it. That is why this is a LOOP and not a fix-up.
+        //
+        // ★★★ WHY IT TERMINATES, AND WHY THE BOUND IS A BACKSTOP RATHER
+        // THAN THE ARGUMENT. `relaxedInsts` is MONOTONE: an instruction is
+        // promoted to its escape form and never demoted, and the loop only
+        // takes another pass when the pass just finished promoted at least
+        // one instruction that was not already in the set. So the set
+        // strictly grows every iteration, and it is bounded above by the
+        // number of instructions in the function. The iteration count is
+        // therefore at most `instCount + 1` by construction, with no appeal
+        // to displacements shrinking or to any convergence property of the
+        // layout. `relaxBound` re-states that same number and refuses
+        // LOUDLY if it is ever reached — because a monotonicity argument
+        // that is true of the code today is not a guarantee about the code
+        // tomorrow, and an assembler that spins is worse than one that
+        // refuses. There is no recursion here and no input-proportional
+        // stack: one `for`, one explicit vector.
+        //
+        // ⚠ THE COMMON PATH IS EXACTLY ONE PASS. A function whose branches
+        // all fit promotes nothing, so `relaxedInsts` stays empty, so the
+        // encode is the encode that ran before this loop existed and the
+        // bytes are identical to the byte. The scan below is arithmetic
+        // over the patch list; it writes nothing and reports nothing.
+        std::vector<std::uint32_t> relaxedInsts;
+        std::uint32_t const relaxBound = [&] {
+            std::uint32_t n = 1;
+            for (std::uint32_t bi = 0; bi < blockCount; ++bi)
+                n += lir.blockInstCount(lir.funcBlockAt(fn, bi));
+            return n;
+        }();
+
+        // ⓘ THE LOOP BODY IS DELIBERATELY NOT RE-INDENTED, and the closing
+        // brace below says so again. Indenting the ~280 lines this loop now
+        // wraps would have produced a whitespace-only diff large enough to
+        // hide the six lines that actually changed — and the block it wraps
+        // is the pre-existing per-function encode, unchanged except where
+        // this comment's anchor is named.
+        for (std::uint32_t relaxPass = 0; ; ++relaxPass) {
+        // Every pass re-encodes the function FROM SCRATCH. Nothing survives
+        // a pass except `relaxedInsts` — carrying stale bytes, relocations,
+        // source-map entries or block symbols into a re-layout is precisely
+        // the partial-output failure `D-ASM-PATCH-PARTIAL-OUTPUT-FAILLOUD`
+        // exists to prevent, one tier up.
+        outFn.bytes.clear();
+        outFn.relocations.clear();
+        outFn.sourceMap.clear();
+        outFn.blockSymbols.clear();
+        outFn.blockByteOffsets.clear();
+
         // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1):
         // intra-function block-relative branch patching. Build the
         // block-offset table while emitting block-by-block, then
@@ -257,10 +325,20 @@ AssembledModule assemble(Lir const&                 lir,
             for (std::uint32_t ii = 0; ii < instCount; ++ii) {
                 LirInstId const inst = lir.blockInstAt(blk, ii);
                 std::size_t const preInstByteCount = outFn.bytes.size();
+                std::size_t const prePatchCount = blockPatches.size();
                 bool const ok = encodeInst(lir, schema, inst,
                                  outFn.bytes, outFn.relocations,
                                  outFn.sourceMap, blockPatches,
-                                 blockSymPatches, lirToMir, reporter);
+                                 blockSymPatches, lirToMir,
+                                 relaxedInsts, reporter);
+                // D-CSUBSET-LONG-BRANCH: stamp the originating instruction
+                // on every patch this instruction just appended. Done HERE,
+                // once, rather than in each walker: the promoted set is
+                // keyed on instruction identity because byte offsets do not
+                // survive a re-layout, and a walker that forgot to stamp
+                // would silently key the whole fixed point on instruction 0.
+                for (std::size_t pi = prePatchCount; pi < blockPatches.size(); ++pi)
+                    blockPatches[pi].instV = inst.v;
                 if (!ok) {
                     outFn.bytes.resize(preInstByteCount);
                     funcEncodeOk = false;
@@ -292,7 +370,7 @@ AssembledModule assemble(Lir const&                 lir,
             outFn.bytes.clear();
             outFn.relocations.clear();
             outFn.sourceMap.clear();
-            continue;  // skip patch resolution for this function
+            break;  // leave the relaxation loop — this function is dropped
         }
 
         // D-OPT-SWITCH-JUMP-TABLE (c70): publish the completed block-byte-offset
@@ -356,7 +434,7 @@ AssembledModule assemble(Lir const&                 lir,
             outFn.relocations.clear();
             outFn.sourceMap.clear();
             outFn.blockSymbols.clear();
-            continue;  // skip branch-patch resolution for this function
+            break;  // leave the relaxation loop — this function is dropped
         }
 
         // Resolve intra-function block-relative branch patches now
@@ -380,6 +458,84 @@ AssembledModule assemble(Lir const&                 lir,
         // 4-byte LE write lived as raw arithmetic here — an
         // agnosticism break per the project's standing rules
         // (shared substrate, zero CPU-name branches).
+        // ── D-CSUBSET-LONG-BRANCH: THE SCAN PHASE ────────────────────
+        //
+        // A pure arithmetic sweep of the patch list that WRITES NOTHING and
+        // REPORTS NOTHING. Its only question is: does this layout ask a
+        // field to hold a displacement it cannot hold, when an escape for
+        // that field exists and has not been taken yet? Every such patch's
+        // instruction joins the promoted set and the function is re-encoded.
+        //
+        // ★★★ IT RUNS IN FRONT OF THE RESOLVER RATHER THAN INSIDE IT, AND
+        // THAT IS DELIBERATE. The resolver below is byte-for-byte the code
+        // that shipped before relaxation existed — same range checks, same
+        // refusals, same diagnostics. Folding the promotion decision into it
+        // would have made every out-of-range path conditional on a fixed
+        // point that, for every function in the corpus today, never runs.
+        // Kept separate, an unrelaxed function reaches the resolver having
+        // been asked one extra subtraction per branch.
+        //
+        // ⚠ A NON-ESCAPABLE OVERFLOW IS NOT REPORTED FROM HERE. If this pass
+        // promotes anything, the layout it just measured is PROVISIONAL and
+        // every other displacement in it is provisional too — reporting a
+        // refusal against a layout that is about to change would name a
+        // number the final binary never had. Relaxation only ever GROWS the
+        // function, so an out-of-reach non-escapable branch cannot come back
+        // into reach: it will be measured again, against the settled layout,
+        // and refused there with the number that is actually true.
+        std::vector<std::uint32_t> newlyPromoted;
+        for (auto const& patch : blockPatches) {
+            if (!patch.relaxable) continue;
+            if (std::binary_search(relaxedInsts.begin(), relaxedInsts.end(),
+                                   patch.instV))
+                continue;  // already escaped; its wider field speaks for it
+            auto const it = blockOffsets.find(patch.targetBlock);
+            if (it == blockOffsets.end()) continue;  // resolver reports this
+            auto const g = walker_util::blockRelFieldGeometry(patch.kind);
+            std::int64_t const delta =
+                static_cast<std::int64_t>(it->second)
+              - (static_cast<std::int64_t>(patch.patchOffset) + g.pcBias);
+            std::int64_t const disp = delta >> g.scaleLog2;
+            if (disp >= walker_util::blockRelFieldMin(g)
+             && disp <= walker_util::blockRelFieldMax(g))
+                continue;
+            newlyPromoted.push_back(patch.instV);
+        }
+        if (!newlyPromoted.empty()) {
+            std::sort(newlyPromoted.begin(), newlyPromoted.end());
+            newlyPromoted.erase(
+                std::unique(newlyPromoted.begin(), newlyPromoted.end()),
+                newlyPromoted.end());
+            relaxedInsts.insert(relaxedInsts.end(),
+                                newlyPromoted.begin(), newlyPromoted.end());
+            std::sort(relaxedInsts.begin(), relaxedInsts.end());
+            // The monotonicity backstop. Reaching it means the promoted set
+            // grew more times than the function has instructions, which no
+            // sequence of promotions can do — so it is an internal-invariant
+            // violation, not a large program, and it is said that way.
+            if (relaxPass + 1 >= relaxBound) {
+                report(reporter, DiagnosticCode::A_FunctionEncodeAborted,
+                       DiagnosticSeverity::Error,
+                       std::format("function symbol id {} dropped — long-"
+                                   "branch relaxation did not reach a fixed "
+                                   "point within {} passes ({} branch(es) "
+                                   "promoted). The promoted set is monotone "
+                                   "and bounded by the instruction count, so "
+                                   "exceeding this bound is an internal-"
+                                   "invariant violation, not an oversized "
+                                   "function (D-CSUBSET-LONG-BRANCH)",
+                                   outFn.symbol.v, relaxBound,
+                                   relaxedInsts.size()));
+                outFn.bytes.clear();
+                outFn.relocations.clear();
+                outFn.sourceMap.clear();
+                outFn.blockSymbols.clear();
+                outFn.blockByteOffsets.clear();
+                break;
+            }
+            continue;  // re-encode with the larger promoted set
+        }
+
         bool patchOk = true;
         for (auto const& patch : blockPatches) {
             auto it = blockOffsets.find(patch.targetBlock);
@@ -500,6 +656,12 @@ AssembledModule assemble(Lir const&                 lir,
             outFn.relocations.clear();
             outFn.sourceMap.clear();
         }
+        // D-CSUBSET-LONG-BRANCH: THE FIXED POINT. Control only arrives here
+        // when the scan promoted nothing, which means every block-relative
+        // field in this layout holds a displacement it can hold — so the
+        // layout is settled and the bytes above are final.
+        break;
+        }  // relaxation loop
     }
 
     return result;

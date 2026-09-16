@@ -419,7 +419,79 @@ struct DSS_EXPORT ExternDeclRef {
     // initializers (the ~30 fixtures in tests/ffi) keep compiling and default it
     // to "".
     std::string_view linkName{};
+    // D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA: the DECLARATION's thread
+    // storage duration — TRUE iff the source spelled `_Thread_local` /
+    // `thread_local` on this extern. Read from the CU's `HirThreadLocalMap` by
+    // the caller (compile_pipeline), which is the same side table HIR→MIR reads
+    // to stamp `ExternImport.isThreadLocal`.
+    //
+    // ⚠ THIS IS THE SOURCE'S CLAIM, NEVER THE LIBRARY'S. The library's own
+    // answer is `ImportSurface::kind == SymbolKind::Tls`, and the WHOLE POINT
+    // of carrying both is that they can DISAGREE: a plain `extern int e;`
+    // against a library that defines `e` with thread storage duration is a
+    // program gcc REFUSES to link and DSS used to bind as ordinary data. The
+    // disagreement IS the diagnostic — see
+    // `reportLibraryThreadStorageDisagreement` below.
+    //
+    // LAST field for the same aggregate-initializer reason as `linkName`.
+    bool isThreadLocal = false;
 };
+
+// ★★★ THE THREAD-STORAGE-DURATION AGREEMENT CHECK, AS A FUNCTION — the ONE
+// place a declaration's storage duration is compared against the storage
+// duration the LIBRARY gives the same name. The anchor, on a line of its own
+// because a wrapped id does not fail, it goes INVISIBLE to every grep:
+//   D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA
+// The sibling of `recordedImportIdentity` above, a function for the identical
+// reason: there is more than one binder, and a rule written twice is a rule
+// that gets updated once.
+//
+// ── THE RULE ────────────────────────────────────────────────────────────────
+// A reference whose DEFINITION has thread storage duration must ITSELF be
+// declared with thread storage duration. C requires the agreement (C23 6.7.1p3
+// — `thread_local` on every declaration of the same object) and every reference
+// toolchain enforces it at the link step; ✔MEASURED, GNU ld refuses the program
+// outright: "TLS definition in <lib> section .tdata mismatches non-TLS
+// reference".
+//
+// It matters far beyond conformance, because the two bind through DIFFERENT
+// MACHINERY and neither can stand in for the other. A plain data import binds
+// `got-indirect` — ONE process-shared address per object — while a thread-local
+// needs a per-thread offset from the thread pointer. ✔MEASURED before this
+// check existed: DSS emitted `R_X86_64_GLOB_DAT` / `R_AARCH64_GLOB_DAT` against
+// an `STT_TLS` symbol, the loader resolved the slot to the LIBRARY'S OWN LOAD
+// ADDRESS, and the program read the shared object's ELF header where its datum
+// should have been — exit 127 (`0x7f`) for the first byte and 69 (`0x45`, the
+// `E` of `\x7fELF`) for the second, on x86_64 AND arm64, debug AND release,
+// with `--warnings-as-errors` reporting nothing at all.
+//
+// ── SCOPE, STATED RATHER THAN IMPLIED ───────────────────────────────────────
+// ONE DIRECTION: library-is-TLS vs declaration-is-not. The REVERSE (a
+// `thread_local` reference to a library symbol that is ordinary data) is a
+// wrong program too, and it is ALREADY walled loud — a surviving thread-local
+// extern import reaches `K_FormatLacksThreadLocalSupport` at the link tier
+// whatever the library says, because the initial-exec model that would bind one
+// is not implemented ([[D-CSUBSET-THREAD-LOCAL-INITIAL-EXEC]]). No wrong
+// artifact can ship down that path, so widening this check to cover it would
+// add a second message for a program that already has one. When initial-exec
+// lands, that arm becomes reachable and belongs HERE.
+//
+// ── AGNOSTIC ────────────────────────────────────────────────────────────────
+// No object-format, target or source-language arm. `SymbolKind::Tls` is the
+// format-blind vocabulary every FF1 reader already produces — ELF `STT_TLS`,
+// PE `__declspec(thread)`, Mach-O `S_THREAD_LOCAL_*` — so a format whose reader
+// learns to classify thread-locals is covered by this the day it does, with no
+// edit here.
+//
+// Returns TRUE iff it REPORTED (the two disagree). A caller that gets TRUE must
+// not bind the import: the diagnostic is an Error, and binding anyway would
+// leave a wrong row behind an error the tier gate is about to refuse on.
+[[nodiscard]] DSS_EXPORT bool
+reportLibraryThreadStorageDisagreement(std::string_view    mangledName,
+                                       std::string_view    libraryIdentity,
+                                       SymbolKind          librarySymbolKind,
+                                       bool                declaredThreadLocal,
+                                       DiagnosticReporter& reporter);
 
 // ── HirIngestResult ─────────────────────────────────────────────
 
