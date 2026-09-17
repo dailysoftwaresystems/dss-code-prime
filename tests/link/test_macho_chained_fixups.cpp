@@ -48,9 +48,10 @@ using dss::macho::detail::kDyldChainedStartsInSegmentHdrSz;
 // externs and no writable globals, and the shape ld64 was measured on.
 constexpr std::uint32_t kFourSegmentImage   = 4u;
 constexpr std::uint32_t kDataConstSegIndex  = 2u;
-// D-TEST-LE-READ-HELPERS CLOSED (8aabc04 audit fold 2026-06-01):
-// promoted to the shared `link_test_support.hpp` (where readU64LE
-// already lives); 2nd consumer trigger met.
+// The little-endian read helpers were promoted out of this file
+// at the 8aabc04 audit fold (2026-06-01) into the shared
+// `link_test_support.hpp` (where readU64LE already lives), on the
+// 2nd consumer.
 using dss::link_format::test::readU16LE;
 using dss::link_format::test::readU32LE;
 

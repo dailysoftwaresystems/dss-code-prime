@@ -1,5 +1,5 @@
-// THE GUARD ON THE RUN'S SHIPPED-CONFIG SNAPSHOT.
-//   D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED
+// THE GUARD ON THE RUN'S SHIPPED-CONFIG SNAPSHOT — the exposure that reddened
+// one suite was never confined to that suite.
 //
 // `cmake/DssConfigSnapshot.cmake` gives every config-reading ctest entry a
 // `$DSS_CONFIG_ROOT` pointed at a copy of the shipped config tree taken ONCE per

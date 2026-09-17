@@ -4,7 +4,7 @@
 # self-tests for the substrate itself.)
 
 dss_add_test(NAME test_support/test_scratch_dir SOURCES test_scratch_dir.cpp)
-# D-TEST-SCOPED-ENV-DUPLICATED-THREE-WAYS. `scoped_env.hpp` is the ONE env
+# `scoped_env.hpp` is the ONE test-side env
 # override, hoisted from five hand-copied versions none of which was ever
 # exercised directly. Its job is RESTORING state, so a wrong restore fails in a
 # LATER, unrelated test in the same binary — the symptom lands arbitrarily far
@@ -21,7 +21,7 @@ dss_add_test(NAME test_support/test_scoped_env SOURCES test_scoped_env.cpp)
 dss_add_test(NAME test_support/test_repo_root SOURCES test_repo_root.cpp)
 set_property(TEST test_support/test_repo_root APPEND PROPERTY
              ENVIRONMENT "GTEST_FILTER=-BakedRootOnly.*")
-# D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED — the
+# The
 # guard on the per-run shipped-config snapshot that `dss_add_test` now points
 # every entry at. It asserts the override was READ and not merely SET (a
 # set-but-miss falls THROUGH to the live tree and every test still passes), that
@@ -33,13 +33,14 @@ dss_add_test(NAME test_support/test_config_snapshot
              SOURCES test_config_snapshot.cpp)
 dss_add_test(NAME test_support/test_host_native_target
              SOURCES test_host_native_target.cpp)
-# D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT + D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR.
+# The per-arm verdict ledger (a cross-arch skip must still yield a VERDICT) and
+# the manifest lint (a cross-arch-capable arm must DECLARE an emulator).
 # On a windows/x86_64 host the corpus produces ZERO environmental
 # skips (every non-Windows arm is excluded by `runOn` first), so without these
 # the strict-mode guard would have no witness on that leg at all.
 dss_add_test(NAME test_support/test_arm_verdict_ledger
              SOURCES test_arm_verdict_ledger.cpp)
-# D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS. `runBinary` is the ONE spawn
+# `runBinary` is the ONE spawn
 # chokepoint both corpus harnesses use, and its capture path used to drain the
 # pipe only after the child exited — a deadlock for any child bigger than the
 # pipe buffer, reported as if the CHILD had hung. This pin spawns the test
@@ -49,7 +50,7 @@ dss_add_test(NAME test_support/test_arm_verdict_ledger
 # argv), which is why it must stay a SEPARATE target from its siblings above.
 dss_add_test(NAME test_support/test_run_binary_capture
              SOURCES test_run_binary_capture.cpp)
-# D-TEST-SCHEMA-MUTATION-HELPER-FAILS-OPEN. `mutate_target_schema.hpp` is the
+# `mutate_target_schema.hpp` is the
 # instrument ~54 pins use to build a MUTANT target schema, and it could mutate
 # NOTHING and report success by three routes (unmatched mnemonic, countless
 # erase/remove_if, an undocumented bare `return` on a document with no
@@ -64,7 +65,7 @@ dss_add_test(NAME test_support/test_mutate_target_schema
              SOURCES test_mutate_target_schema.cpp)
 target_link_libraries(dss_test_support_test_mutate_target_schema
                       PRIVATE nlohmann_json::nlohmann_json)
-# D-TEST-RUN-HARNESS-DEADLINE-COUNTS-HOST-SUSPEND. The same chokepoint's
+# The same chokepoint's
 # DEADLINE: it used to be spent on `steady_clock`, which on Darwin counts host
 # suspend, so a napping laptop was billed to the child. Pins which clock is
 # selected (against a clock id read from the kernel here) and that the deadline
@@ -73,7 +74,8 @@ target_link_libraries(dss_test_support_test_mutate_target_schema
 # sibling above — it must stay a SEPARATE target.
 dss_add_test(NAME test_support/test_run_binary_deadline_clock
              SOURCES test_run_binary_deadline_clock.cpp)
-# D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+# The CLI-subprocess corpus runner builds only the spec THIS host can execute,
+# so a capability one runner sees can be invisible to the other.
 # `coverage_boundary.hpp` is the ONE grammar in which the two corpus harnesses
 # state what they actually BUILT, and the `integrated_tests/coverage-boundary`
 # entry judges the real thing with it. Most of its REFUSALS are unreachable from

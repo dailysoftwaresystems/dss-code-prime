@@ -4,7 +4,7 @@ cmake/DssTestBudgets.cmake assigns, for the class cmake/DssBuildClass.cmake — 
 ONE owner of "what kind of build is this" — selects from this build's own
 configuration.
 
-D-TEST-INTEGRATED-RUNNER-HANGS-BEFORE-CREATING-ITS-EX-DIRECTORY
+Born of an integrated runner that hung before creating its own directory.
 
 Registered as `ctest/entry-budgets` by integrated_tests/CMakeLists.txt, and
 deliberately NOT by the module it pins: a pin inside the mechanism disappears with

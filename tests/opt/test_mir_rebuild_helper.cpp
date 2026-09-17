@@ -936,8 +936,8 @@ TEST(MirRebuildHelper, CloneGlobalsPreservesThreadLocal) {
 // literal existed in the source would pass for a message nothing ever printed;
 // only a spawned child that actually dies proves the text reaches stderr. These
 // use `EXPECT_DEATH`, so the abort happens in the CHILD and takes no sibling
-// test's verdict with it (the failure mode
-// D-TEST-ABORT-IN-A-FIXTURE-HAS-NO-GUARD exists to stop).
+// test's verdict with it — an abort in a fixture itself has no guard to stop
+// it.
 //
 // ★★ THE MATCHERS CARRY NO REGEX METACHARACTERS ON PURPOSE. The obvious witness
 // is the bracketed form `[pass=X]`, and `[...]` is a CHARACTER CLASS to both

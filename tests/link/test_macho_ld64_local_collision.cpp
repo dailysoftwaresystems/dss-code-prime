@@ -83,9 +83,9 @@
 // header that way: `tests/core` is not on this target's include path, and a
 // quoted include resolves against the includer's own directory first. Reused
 // rather than re-spelled because the cmd.exe-vs-POSIX redirection difference in
-// there is a MEASURED defect that cost two cycles of silently-inert oracles
-// (D-TEST-NATIVE-ORACLE-INERT-ON-POSIX); a second copy would be free to make it
-// again.
+// there is a MEASURED defect that cost two cycles of silently-inert oracles — a
+// native oracle that skips on error is a broken oracle reporting success; a
+// second copy would be free to make it again.
 #include "../core/native_c_probe.hpp"
 
 #include <gtest/gtest.h>
@@ -586,11 +586,10 @@ namespace {
 //
 // A skipped gtest exits 0 and ctest paints the entry green, so "the linker was
 // not there" and "the linker linked it" are indistinguishable from the gate's
-// summary line. That is the masked-coverage shape
-// D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT was opened for (449 of 557 manifests
-// silently skipped and counted as passes) and the shape
-// D-TEST-NATIVE-ORACLE-INERT-ON-POSIX was opened for (a native oracle that
-// skips on error is a broken oracle that reports success). This tier therefore
+// summary line. That is the masked-coverage shape, twice over: a CROSS-ARCH
+// SKIP YIELDS NO VERDICT (449 of 557 manifests silently skipped and counted as
+// passes), and a NATIVE ORACLE THAT SKIPS ON ERROR is a broken oracle that
+// reports success. This tier therefore
 // lands in the SAME `ArmVerdict` vocabulary the corpus harnesses use, prints
 // the ledger line whatever the outcome, and honours DSS_STRICT_ARM_VERDICTS.
 //

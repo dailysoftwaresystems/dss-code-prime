@@ -189,10 +189,9 @@ movzArmsOf(TargetSchema const& s) {
 // other pin in this file reaches the shipped arm64 document through
 // `findShippedConfig`, which honours `$DSS_CONFIG_ROOT` and otherwise WALKS THE
 // CWD — so a test binary launched from a different tree silently reads that
-// tree's config (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE). `ctest`
-// sets the variable; a bare `.exe` invocation does not. This test fails loudly
-// when the document actually read is not the one under test, which turns a
-// mis-rooted run into a red instead of a meaningless green.
+// tree's config. `ctest` sets the variable; a bare `.exe` invocation does not.
+// This test fails loudly when the document actually read is not the one under
+// test, which turns a mis-rooted run into a red instead of a meaningless green.
 TEST(Arm64MovzWForm, ShippedTargetDeclaresBothMovzWidths) {
     auto s = shippedArm64();
     ASSERT_NE(s, nullptr);

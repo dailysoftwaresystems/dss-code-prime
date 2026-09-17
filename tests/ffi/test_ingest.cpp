@@ -1,4 +1,5 @@
-// Plan 11 FF5 (`ingest()`) tests — closes D-FF4-Apply + D-FF5-INGESTION-SOURCE
+// Plan 11 FF5 (`ingest()`) tests — closes plan-11 step FF4's APPLY half
+// (per-format C symbol decoration, `applyCMangling`) + D-FF5-INGESTION-SOURCE
 // + D-FF6-HEADER-DIR-READER at the ingest boundary.
 //
 // Pins:
@@ -219,7 +220,7 @@ TEST(FfiIngest, CHeaderSourceMatchesAndAnnotatesExtern) {
 
 }
 
-// ── D-FF4-Apply on Mach-O: applyCMangling adds leading underscore ─
+// ── FF4 apply on Mach-O: applyCMangling adds leading underscore ─
 
 TEST(FfiIngest, MachOFormatAppliesLeadingUnderscoreOnMangling) {
     TypeInterner ti = makeInterner();
@@ -251,7 +252,7 @@ TEST(FfiIngest, MachOFormatAppliesLeadingUnderscoreOnMangling) {
 
     auto const* meta = ffi.tryGet(built.externNode);
     ASSERT_NE(meta, nullptr);
-    // Mach-O decorates with leading underscore (D-FF4-Apply contract).
+    // Mach-O decorates with leading underscore (the FF4 apply contract).
     EXPECT_EQ(meta->mangledName, "_puts");
     EXPECT_EQ(meta->importLibrary, "libSystem.B.dylib");
 

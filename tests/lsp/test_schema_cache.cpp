@@ -215,7 +215,7 @@ TEST(SchemaCache, ShippedModeWithNoDirectoryReportsShippedDirNotFound) {
 // `src/dss-config/sources/` with zero `*.lang.json` files.
 TEST(SchemaCache, ShippedModeWithEmptyDirectoryReportsShippedDirEmpty) {
     namespace fs = std::filesystem;
-    // D-TEST-FIXED-SCRATCH-PATH-POPULATION — the root came from a CONSTANT name
+    // A FIXED SCRATCH PATH IS A SHARED ONE — the root came from a CONSTANT name
     // under `temp_directory_path()`, and the old "clean any prior run"
     // `remove_all` existed precisely BECAUSE that path could be stale. Under two
     // concurrent instances that line was the weapon: one instance wiped the tree

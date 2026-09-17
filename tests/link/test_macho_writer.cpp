@@ -74,8 +74,8 @@ namespace {
 
 namespace {
 
-// D-TEST-LE-READ-HELPERS CLOSED at 8aabc04 audit fold; local LE
-// readers harmonized to the shared substrate at
+// At the 8aabc04 audit fold the local LE readers were harmonized
+// to the shared substrate at
 // `tests/link/link_test_support.hpp`. The fold left local copies
 // in this file dead-but-present; the 5ac97ae audit fold (4-agent
 // convergence: code-reviewer HIGH-1 + type-design Q5 + simplifier

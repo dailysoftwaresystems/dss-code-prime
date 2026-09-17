@@ -29,9 +29,9 @@ struct SyntheticFn {
 
 // ── THE PROBE'S KIND -> TypeId RESOLUTION, ONE OWNER ──────────────────────
 //
-// D-TEST-LIR-AND-LINK-SUITES-MINT-AN-OPERAND-LESS-PTR. These lowering probes
-// name a type by its KIND because what they assert is register CLASS and
-// WIDTH, not structure -- and every kind they name is a LEAF kind that
+// THE `tests/lir` AND `tests/link` SUITES MINTED AN OPERAND-LESS `Ptr`. These
+// lowering probes name a type by its KIND because what they assert is register
+// CLASS and WIDTH, not structure -- and every kind they name is a LEAF kind that
 // `primitive(k)` builds directly, EXCEPT `Ptr`.
 //
 // `Ptr` is structural: it carries a pointee operand. `primitive(TypeKind::Ptr)`

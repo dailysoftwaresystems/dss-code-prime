@@ -9,7 +9,7 @@ method names, comment ids or defined anchors. everything that changes is unrelia
 ✗ src/mir/lowering.cpp  + a line number   <- moves the moment anything above it changes
 ✓ src/mir/lowering.cpp — lowerCallArgs()
 ✓ tests/CMakeLists.txt — the `no RUN_SERIAL` rationale
-✓ [[D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES]]
+✓ a defined anchor id, when a registry row is the subject
 ```
 
 **A symbol survives every edit above it; a line number survives none.** And the failure is the bad
@@ -49,8 +49,8 @@ operator**.
    the test family and the symptom — then CITE what you find, or state explicitly that nothing
    matched. ✔MEASURED 2026-08-06: a 2×2 attribution (compiler × rundir filesystem) was
    commissioned from scratch for 57 sqlite failures; the identical experiment with the identical
-   verdict was **already in the registry** from seven cycles earlier
-   (`D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS`), and the row was findable — the leg name, the
+   verdict was **already in the registry** from seven cycles earlier — a row on the WSL-launched
+   leg's rundir sitting on DrvFS — and the row was findable: the leg name, the
    driver and the word `rundir` all appear in it. ⇒ **the cost was not the duplicated work: the
    un-cited row would have pre-empted THREE FALSE STATEMENTS that reached a commit** ("previously
    green", "the Tcl move is the prime suspect", "the WAL/journal TIMING family"). ★ THE FAILURE
@@ -58,13 +58,13 @@ operator**.
    surfaced a plausible NEIGHBOUR (the WSL2 clock defect — real, but the wrong population); a
    grep would have surfaced the exact CONTROL. **Recall finds what is similar; grep finds what
    is the same.** ⇒ anchoring every issue is worthless if the next cycle does not READ the
-   anchors before investigating (`D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE`).
+   anchors before investigating.
    ★★ **AND GREP THE DEFECT'S VOCABULARY, NOT THE NAME YOU WOULD PICK — the rule above was
    FOLLOWED and still missed, by the operator who wrote it.** ✔MEASURED 2026-08-07 (TF-C126): a
    recipe derivation was found harvesting `tool/lemon.c` / `lempar.c` / `mksourceid.c` as target
    TUs. The registry WAS grepped first — for anchor NAMES matching `RECIPE|MAKE-N|DERIV|LEMON|
-   TU-LIST` — and returned nothing, so a fresh row was written. The existing row was
-   [[D-HARNESS-FIXTURE-TU-SCRAPE-ABSORBS-BUILD-HOST-TOOLS]]: same three files, same whole-blob
+   TU-LIST` — and returned nothing, so a fresh row was written. The existing row described the
+   fixture TU scrape absorbing build-host tools: same three files, same whole-blob
    cause, the same fix prescribed — **and it had PRE-REGISTERED the exact firing condition that
    had just fired** ("safe today only because its reference build normally builds `lemon` FIRST …
    if that build fails early, the fixture set absorbs the tools too"). It was missed because it is

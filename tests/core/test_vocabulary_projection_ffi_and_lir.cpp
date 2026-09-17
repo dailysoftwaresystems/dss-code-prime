@@ -67,11 +67,11 @@ using ::dss::test_support::quotedTokens;
 // ★ `quotedTokens` used to be a file-local FOURTH copy here — byte-identical to
 // the one three sibling files had already merged into
 // `vocabulary_projection_probe.hpp`, and therefore invisible to the mutant that
-// closed D-TEST-VOCABULARY-PROJECTION-PROBE-HELPERS-ARE-COPIED-PER-FILE: that
+// ended the per-file copying of these probe helpers: that
 // mutant reddened 3 of 4 and this file stayed GREEN over a helper that no longer
 // worked. It has ONE owner now, so a change to what counts as a QUOTED TOKEN
-// reaches every pin that reads a refusal back — see
-// D-TEST-VOCABULARY-PROBE-HELPER-FOURTH-COPY-OUTSIDE-THE-EXTRACTED-HEADER.
+// reaches every pin that reads a refusal back — this file was the FOURTH copy,
+// the one that sat outside the extracted header.
 
 // A spelling no vocabulary in this tree claims.
 constexpr char const* kBadSpelling = "zzNotAnyVocabularySpelling";

@@ -1,4 +1,6 @@
-// ARM64 schema + fixed32 walker tests — plan 13 AS3 + plan 12 D-ML7-2.1.
+// ARM64 schema + fixed32 walker tests — plan 13 AS3 + plan-12 step ML7 cycle
+// 2.1, registered as
+// D-PLAN12-ARM64-STACKPOINTER-REGISTRATION-ABI-GOLDEN-TESTS.
 //
 // Pins:
 //   * arm64.target.json loads cleanly.

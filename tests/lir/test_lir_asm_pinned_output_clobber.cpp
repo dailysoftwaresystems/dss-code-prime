@@ -44,8 +44,9 @@
 // fourteen values live across the block still computes the right answer.
 //
 // ⚠ CONFIG-LEVEL: `dss_add_test` sets `DSS_CONFIG_ROOT`, so this file must run
-// through ctest and never as a bare `.exe`
-// (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+// through ctest and never as a bare `.exe` -- a bare run falls back to a cwd
+// walk and can read a DIFFERENT config tree, which turns a red-on-disable
+// arm green for the wrong reason.
 //
 // ⚠ x86_64 ONLY, for a CONFIG reason: a pinned output needs a constraint letter
 // that BINDS A NAMED REGISTER, and `arm64.target.json` declares only class- and

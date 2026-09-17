@@ -397,9 +397,43 @@ That is a full round spent hardening a script this wave deletes. The row
 decision and names the fix, **so that if `W-test` slips out of this PR the fix happens instead of the
 knowledge evaporating.**
 
-⚠ **AND IT RAISES A QUESTION THIS FILE MUST NOT ANSWER BY ASSUMPTION:** DssHarness owns the gate after
-`W-test`. Whether ITS run-verification keys on a wall clock anywhere is unmeasured here, and inheriting
-the same defect would make this deletion a lateral move. Reported to the operator with the rest.
+✅ **THE QUESTION THIS SECTION RAISED IS ANSWERED, AND THE ANSWER IS WHY `W-test` STAYS ON SCHEDULE.**
+It asked whether DssHarness's own run verification keys on a wall clock, because inheriting the same
+defect would make this deletion a lateral move. Reported to the operator; repo-harness measured it and
+**had the identical bug** — its `RunLock` recorded a wall-clock instant and compared it against
+`Process.StartTime`, which .NET derives on Linux the same way `ps lstart` does, under a one-second
+tolerance that absorbs nothing. On a clock-stepping host every live holder read as dead, so a second
+sync or build could start on a tree a live one was still writing, with no warning. Fixed upstream by
+removing the clock from the identity: `{boot_id}:{starttime ticks}` from `/proc` on Linux, the kernel's
+recorded creation time elsewhere, compared exactly, and the contention sampler had the same fault
+independently and took the same fix. ⇒ **`W-test` routes through a lock that does not share our bug.**
+⚠ It is not released yet — it is on repo-harness's `consumer-findings-0-5-4`, so the wave that lands
+`W-test` must confirm the deployed version carries it rather than assuming this paragraph still holds.
+
+## 14. Exit **21** is not a pass — a requirement with no consumer YET, which is why it is written here
+
+**Wave: every wave that replaces a script with a DssHarness verb.**
+
+DssHarness is gaining a shared exit code **21 (Incomplete)**: the work ran, nothing failed, but not
+every leg reached a verdict — distinct from 0 (all passed) and 20 (something failed). Its JSON ledger
+gains a `complete` boolean beside `passed`. This closes the second of the two blockers this branch
+reported, where `LegRunService` built its OK line from legs *reported on* while `Verdicts` marked
+`SkippedUnavailable` as `IsFailure=false`, so a run that skipped every leg reported passed.
+
+✔MEASURED 2026-09-16, and it is the reason this belongs in the deletion inventory rather than in a
+fix: **there is no DssHarness invocation anywhere in `scripts/`, `.github/`, `cmake/` or `tests/`.**
+Every reference is prose. So there is nothing here to correct today, and a requirement with no
+consumer is exactly the kind that gets lost — the wave commit is its first reader.
+
+**What every wave commit owes when it introduces one:**
+- treat **21 as NOT a pass**. Any test of the shape "not 20" or "non-zero means failure" is wrong;
+  the pass condition is `rc == 0`.
+- when parsing the ledger, read **`complete` as well as `passed`**. `passed` alone repeats the defect
+  the exit code was added to fix.
+
+ⓘ `scripts/run-gate` already behaves correctly by construction — it requires `rc == 0` **and** a
+tool-emitted success witness in the command's own output, so a 21 fails it twice over. That is a
+property of the script `W-test` deletes, not of whatever replaces it.
 
 ## Summary of disagreements with contract S4
 

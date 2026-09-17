@@ -1,5 +1,5 @@
-# conformance/ — the DIFFERENTIAL accept/reject oracle.
-# D-CONF-REFERENCE-DIFFERENTIAL-ORACLE
+# conformance/ — the DIFFERENTIAL accept/reject oracle, judged against the
+# reference C compilers.
 #
 # Compiles a probe corpus with the real DSS CLI *and* with every reference C
 # compiler present on the host, then DIFFS the accept/reject verdicts in BOTH
@@ -44,8 +44,7 @@ add_dependencies(dss_conformance_test_reference_conformance dsscp)
 # the vcvars64 cost per probe). A leg that adds a slow WSL-bridged oracle pays one
 # process launch, not one per probe.
 #
-# ⚠ NO TIMEOUT IS SET HERE, and that is the fix, not an omission
-# (D-TEST-INTEGRATED-RUNNER-HANGS-BEFORE-CREATING-ITS-EX-DIRECTORY). This entry's
+# ⚠ NO TIMEOUT IS SET HERE, and that is the fix, not an omission. This entry's
 # budget comes from `cmake/DssTestBudgets.cmake`, with every other entry's, from
 # its OWN measured ceilings per kind of build. It used to carry `TIMEOUT 900`:
 # ✔MEASURED over six CI runs, linux-clang-asan runs it in up to 606.81 s — 1.48x

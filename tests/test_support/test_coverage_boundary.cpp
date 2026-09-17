@@ -1,6 +1,7 @@
 // Direct self-tests for the coverage-boundary vocabulary.
 //
-// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+// The CLI-subprocess runner builds only the spec THIS host can execute, so a
+// capability one runner sees can be invisible to the other.
 //
 // ★★★ WHY A UNIT SUITE EXISTS BESIDE THE END-TO-END ENTRY. The
 // `integrated_tests/coverage-boundary` entry runs both corpus harnesses and

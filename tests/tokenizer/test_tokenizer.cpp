@@ -25,7 +25,6 @@ struct H {
 };
 
 [[nodiscard]] H loadToy(std::string text) {
-    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT.
     // This used to be a NON-FATAL `EXPECT_TRUE` followed by
     // `.schema = loaded.has_value() ? *loaded : nullptr` -- so on a torn
     // shipped config the fixture recorded a failure and then handed a NULL
@@ -40,7 +39,6 @@ struct H {
 }
 
 [[nodiscard]] H loadC(std::string text) {
-    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT.
     // This used to be a NON-FATAL `EXPECT_TRUE` followed by
     // `.schema = loaded.has_value() ? *loaded : nullptr` -- so on a torn
     // shipped config the fixture recorded a failure and then handed a NULL
@@ -1032,7 +1030,6 @@ TEST(TokenizerDeath, NullSchemaAborts) {
 namespace {
 
 [[nodiscard]] H loadTsql(std::string text) {
-    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT.
     // This used to be a NON-FATAL `EXPECT_TRUE` followed by
     // `.schema = loaded.has_value() ? *loaded : nullptr` -- so on a torn
     // shipped config the fixture recorded a failure and then handed a NULL

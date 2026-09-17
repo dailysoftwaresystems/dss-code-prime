@@ -50,7 +50,7 @@ using namespace dss;
 // Nothing below may name `temp_directory_path()` directly — that is the whole
 // point of routing 39 sites through one function.
 //
-// WHY THE ROOT MUST BE PER-RUN (D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES).
+// WHY THE ROOT MUST BE PER-RUN.
 // `tests/CMakeLists.txt` registers a SECOND ctest entry that runs THIS
 // binary again under `--gtest_shuffle --gtest_repeat=20`, deliberately without
 // serialization. So on any ordinary `ctest -j` two live processes of this
@@ -93,7 +93,7 @@ using namespace dss;
 // REFERENCE to the cached owner. Same shape as `x86Schema()` in
 // tests/lir/test_lir.cpp.
 //
-// D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE — WHY THIS RETURNS A REFERENCE.
+// WHY THIS RETURNS A REFERENCE.
 // While this returned `std::shared_ptr<GrammarSchema const>` BY VALUE, every
 // call built a fresh schema owned solely by the returned temporary, so the
 // one-liner `auto const& x = cSubset()->accessor();` bound a reference into an
@@ -128,9 +128,9 @@ using namespace dss;
     return schema;
 }
 
-// D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE — the DURABLE guard, and the only
-// kind available here. Once `cSubset()` hands back a reference to a static the
-// dangling read becomes IMPOSSIBLE, which retires the crash test that proved it:
+// The DURABLE guard against that dangling read, and the only kind available
+// here. Once `cSubset()` hands back a reference to a static the dangling read
+// becomes IMPOSSIBLE, which retires the crash test that proved it:
 // a runtime red-on-disable cannot survive its own fix. So the property is pinned
 // at COMPILE time instead. Restoring the by-value return re-admits the entire
 // defect class at all 36 call sites, so that regression must not be silent.
@@ -138,7 +138,7 @@ using namespace dss;
 // `std::shared_ptr<GrammarSchema const>` and this fails to compile.
 static_assert(std::is_reference_v<decltype(cSubset())>,
               "cSubset() must return a REFERENCE to a cached owner. A by-value "
-              "return re-admits D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: "
+              "return re-admits the dangling-reference defect: "
               "`helper()->accessor()` would again bind a reference into a schema "
               "owned only by the temporary, which dies at the end of the "
               "full-expression (heap-use-after-free).");
@@ -11104,10 +11104,10 @@ TEST(Preprocessor, TFC115EndiannessPredefinesCrossLayerCoherence) {
 // engine's own notion of the set.
 namespace {
 [[nodiscard]] std::vector<std::string> tfc86DeclaredOperators() {
-    // D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: NAME the owning handle. The
-    // one-liner `auto const& pp = cSubset()->preprocess();` binds a reference
-    // INTO a schema owned only by a temporary `shared_ptr`, which dies at the
-    // end of that full-expression -> `pp` dangles for every read below.
+    // NAME the owning handle. The one-liner
+    // `auto const& pp = cSubset()->preprocess();` binds a reference INTO a
+    // schema owned only by a temporary `shared_ptr`, which dies at the end of
+    // that full-expression -> `pp` dangles for every read below.
     auto schema = cSubset();
     auto const& pp = schema->preprocess();
     std::vector<std::string> names;
@@ -11208,8 +11208,8 @@ TEST(Preprocessor, TFC86ConditionalInclusionOperatorsAreDefinedInElifdefForms) {
 // reds. Without this test an over-broad predicate would pass every assertion
 // above while quietly changing what `#ifdef defined` means.
 TEST(Preprocessor, TFC86DefinedOperatorItselfIsNotADefinedName) {
-    // D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: see the note in
-    // `tfc86DeclaredOperators` — the owning handle must outlive `pp`.
+    // See the note in `tfc86DeclaredOperators` — the owning handle must
+    // outlive `pp`.
     auto schema = cSubset();
     auto const& pp = schema->preprocess();
     ASSERT_FALSE(pp.definedOperator.empty());

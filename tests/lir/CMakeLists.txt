@@ -218,16 +218,15 @@ dss_add_test(NAME lir/test_lir_text_unsealed_block
 # reservation) rather than over a table of offsets — a table would be right at 32 and
 # silent at 64. Nothing here drives the unit-tier front end — a sufficiency property
 # is pinned harder by calling the derivation directly than by inspecting one lowered
-# program, and the file's own banner carries the reason (the row it used to cite,
-# D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO, closed
-# in P49 and no longer states a live hazard). The end-to-end evidence is the runtime
+# program, and the file's own banner carries the reason (the hazard it used to
+# cite — a front end lowering a many-arg call to nothing, so the pins measured
+# zero — was fixed in P49). The end-to-end evidence is the runtime
 # corpus (`examples/c/alignas_local_over32`, `alignas_local_cacheline64`,
 # `alignas_member_over32_local`).
 dss_add_test(NAME lir/test_lir_overaligned_local_frame
              SOURCES test_lir_overaligned_local_frame.cpp)
 
-# D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO:
-# the pin over `lowered_lir_fixture.hpp` ITSELF. `lowerCToLir` used to return a
+# The pin over `lowered_lir_fixture.hpp` ITSELF. `lowerCToLir` used to return a
 # refused lowering looking exactly like an accepted one, so every pin driving it
 # could be asserting over a mutilated module. Its arms run the fixture INSIDE
 # `EXPECT_NONFATAL_FAILURE` — an instrument that reports is worth nothing until
@@ -252,7 +251,7 @@ dss_add_test(NAME lir/test_lir_fixture_vacuity_guard
 dss_add_test(NAME lir/test_lir_copy_coalescing_value_width
              SOURCES test_lir_copy_coalescing_value_width.cpp)
 
-# D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT. The peephole's
+# THE PEEPHOLE/CALLCONV IDENTITY-COPY CLAIM HAD NO INSTRUMENT. The peephole's
 # placement argument rests on "callconv mints exactly ZERO identity copies", and
 # the evidence it carried was a NET across three passes because no dump stage
 # existed between the peephole and callconv. This pins the claim on the pass it

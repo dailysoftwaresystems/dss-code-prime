@@ -1,4 +1,4 @@
-// D-HARNESS-CROSS-HOST-ANY-TARGET item (2) — THE GATE ON THE DE-HOST-LOCKED
+// BUILD ANY TARGET INSIDE ANY HOST, ITEM (2) — THE GATE ON THE DE-HOST-LOCKED
 // SQLITE HARNESS DRIVERS.
 //
 // THE REQUIREMENT (user, 2026-07-25): "build ANY target inside ANY host, this
@@ -34,7 +34,7 @@
 //      must spell it the same way, so a reader cannot conclude the project has
 //      two qemus.
 //   7. EVERY LEG COMPILES AGAINST A THIRD-PARTY HEADER CONFIGURED FOR ITS OWN
-//      TARGET (D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED). One staged zconf.h
+//      TARGET — THE STAGED zconf.h USED TO BE PE-SHAPED. One staged zconf.h
 //      used to serve all five legs, carrying the pe leg's `Z_HAVE_UNISTD_H`
 //      answer — so the .ps1 refused every other leg and the .sh, which never
 //      applied the flip at all, could not build its pe leg. The catalogue now
@@ -153,8 +153,7 @@ struct PyRun {
 
 // ── THE DEADLINE THE SPAWNS BELOW RUN UNDER IS THE SCRIPT'S, NOT THIS FILE'S ─
 //
-// ANCHOR, ONE LINE, DO NOT WRAP:
-// D-HARNESS-ENV-PROBE-TEST-TIMEOUT-IS-A-MAGIC-NUMBER-NOT-THE-DERIVED-BUDGET
+// THE ENV-PROBE TEST TIMEOUT WAS A MAGIC NUMBER, NOT THE DERIVED BUDGET.
 //
 // Every spawn here used to be bounded by a `std::chrono::seconds{120}` typed
 // into the line above, while the subject of those spawns DERIVES the same
@@ -274,9 +273,8 @@ struct SpawnBudget {
             " Every spawn in this file runs under the budget the SCRIPT derives"
             " from the catalogue's declared sample windows"
             " (--print-probe-budget); there is no local number to fall back to,"
-            " because a local number is the defect"
-            " [D-HARNESS-ENV-PROBE-TEST-TIMEOUT-IS-A-MAGIC-NUMBER-NOT-THE-"
-            "DERIVED-BUDGET].";
+            " because a local number IS the defect: a magic number standing in"
+            " for the derived budget.";
         return out;
     }
     return spawnResolver(args, catalogueCopy, resolverDeadline());
@@ -467,8 +465,8 @@ public:
         return doc_;  // unreachable in a passing run
     }
     // The leg itself, for the declarations that live beside `launchers` rather
-    // than inside one — `confounds` is per LEG, which is the whole point of
-    // D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG.
+    // than inside one — `confounds` is per LEG, which is the whole point: the
+    // ledger used to be per DRIVER rather than per LEG.
     [[nodiscard]] json& legOf(std::string const& label) {
         for (auto& leg : doc_.at("legs")) {
             if (leg.at("label").get<std::string>() == label) return leg;
@@ -615,8 +613,8 @@ TEST_F(HarnessLegs, TheLegCatalogueLintsClean) {
 // any kind here, which is the wrong file to leave unwatched: it is an
 // ATTRIBUTION instrument, so its failure mode is not a red gate but a confident
 // wrong answer. It shipped one — a leg whose binary never launched (the guest
-// loader was absent) was reported as fourteen DSS defects
-// (D-HARNESS-CLI-SMOKE-CHARGES-A-LAUNCH-FAILURE-TO-THE-COMPILER).
+// loader was absent) was reported as fourteen DSS defects — the CLI smoke
+// charging a LAUNCH failure to the COMPILER.
 //
 // Its `--self-test` is self-contained: no network, no build, no sqlite, a few
 // seconds. It asserts the full cross product of {subject launched, not launched}
@@ -644,7 +642,7 @@ TEST_F(HarnessLegs, TheCliSmokeGateSelfTestPasses) {
     ASSERT_TRUE(fs::exists(script))
         << "the sqlite3 CLI smoke gate is missing: " << script;
     // ★★ THE GATE RUNS FROM A SCRATCH COPY, NEVER FROM THE REPO FILE.
-    // D-HARNESS-CLI-SMOKE-SELFTEST-CHMODS-TRACKED-SOURCE — CLOSED BY THIS BLOCK.
+    // THE SELF-TEST USED TO chmod TRACKED SOURCE — CLOSED BY THIS BLOCK.
     // `runBinary`'s POSIX arm `chmod`s its `binaryPath` to 0755 before spawning —
     // it has to, because the linker writes emitted binaries 0644 and `execve`
     // needs the bit. Handing it a path under `real-examples/` therefore MUTATES A
@@ -716,7 +714,7 @@ TEST_F(HarnessLegs, TheCliSmokeGateSelfTestPasses) {
         << res.capturedStdout;
 }
 
-// ── The pipe-buffer pin (D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS) ────
+// ── The pipe-buffer pin: draining AFTER exit deadlocks ────────────────────
 //
 // This test is the reason that anchor exists. `runBinary` used to drain the
 // capture pipe only AFTER the child exited, so a child that outgrew the pipe's
@@ -788,7 +786,7 @@ TEST_F(HarnessLegs, EveryDeclaredLegIsBuiltOnEveryHost) {
             << "host " << host.os << '/' << host.arch
             << " plans a DIFFERENT set of legs than the catalogue declares."
                " The leg set is a property of the harness, not of the machine"
-               " (D-HARNESS-CROSS-HOST-ANY-TARGET item 2).";
+               " — build ANY target inside ANY host, item 2.";
 
         for (auto const& leg : plan.at("legs")) {
             auto const label = leg.at("label").get<std::string>();
@@ -1007,7 +1005,7 @@ TEST_F(HarnessLegs, LauncherSpellingsAgreeWithTheExamplesCorpus) {
 
 // ── 7. Every leg's staged zlib header is configured for ITS OWN target ─────
 //
-// D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED. Three tests, one per link in the
+// THE STAGED zconf.h WAS PE-SHAPED. Three tests, one per link in the
 // chain: the DECLARATION (does the catalogue say the right thing?), the PLAN (is
 // the recipeTransform -> zinc/ mapping host-free and one-stage-per-transform?),
 // and the ARTEFACT (does stage-zinc.py actually write it?).
@@ -1200,7 +1198,7 @@ TEST_F(HarnessLegs, StageZincWritesOneHeaderPerTargetAndEveryLegGetsItsOwn) {
             << ", whose Z_HAVE_UNISTD_H reads " << got << " — it declared "
             << want
             << ". A leg parsing a zlib header configured for a different target"
-               " is D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED exactly.";
+               " is the pe-shaped staged zconf.h defect exactly.";
         // Z_HAVE_STDARG_H is the CONTROL: it is declared true on every leg, so
         // if the tool were rewriting whole blocks rather than the one declared
         // guard, this would move too.
@@ -1262,7 +1260,7 @@ TEST_F(HarnessLegs, BothDriversStageOneZincPerTransform) {
 
 // ── 8. A launcher's PATH NAMESPACE is declared, closed, and enforced ───────
 //
-// D-HARNESS-NO-WSL-LAUNCHER-FOR-ELF-ON-WINDOWS. The catalogue declared Wine for
+// THERE WAS NO WSL LAUNCHER FOR ELF ON WINDOWS. The catalogue declared Wine for
 // pe-on-Linux and NOTHING for elf-on-Windows, so a Windows host recorded
 // `skipped-by-runOn` for a leg whose testfixture it had just built — and that
 // same artefact, run under WSL BY HAND, passed 330,436 tests.
@@ -1480,7 +1478,7 @@ TEST_F(HarnessLegs, AMalformedPathTranslationDeclarationFailsLint) {
             << r.output;
     }
     // ── and the same, for the launcher's FILESYSTEM ────────────────────────
-    // D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS. The third namespace, and the
+    // A WSL-LAUNCHED LEG'S RUNDIR IS DrvFs. The third namespace, and the
     // one whose absence cost 55 unit failures across 6 families plus a fixture
     // ABORT — every one of them non-DSS, all of them reported as if they were.
     {
@@ -1540,9 +1538,9 @@ TEST_F(HarnessLegs, AMalformedPathTranslationDeclarationFailsLint) {
 
 // ── THE EARNED-CONFOUND LEDGER LIVES IN THE CATALOGUE ───────────────────────
 //
-// D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG /
-// D-HARNESS-SQLITE-CONFOUNDS-NOT-DECLARED-PER-LEG /
-// D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY.
+// THE CONFOUND LEDGER WAS PER DRIVER, NOT PER LEG, and the confounds were not
+// declared per leg at all — the two halves of
+// D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY seen from the harness side.
 //
 // A confound asserts THE COMPILER IS INNOCENT of a failing test, and the count
 // of genuine failures is what every verdict this harness renders rests on. So
@@ -1578,7 +1576,7 @@ TEST_F(HarnessLegs, EveryLegDeclaresItsEarnedConfoundsWithProvenance) {
                        " furniture.";
             }
             // ★★ `requires` REPLACED `scope` AS THE REQUIRED CONDITION FIELD.
-            // [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST.] `scope`
+            // [a confound's condition is a RUN MODE, not a host.] `scope`
             // matched a pattern against the leg's RUN MODE, which is the wrong
             // axis for any row whose mechanism is a property of the MACHINE: the
             // three clock rows sat at `scope: any` and would have excused a
@@ -1610,7 +1608,7 @@ TEST_F(HarnessLegs, EveryLegDeclaresItsEarnedConfoundsWithProvenance) {
             // whose real mechanism has no probe yet, and each of those must NAME
             // its blocker — otherwise the axis becomes an inert alternative the
             // next row reaches for, which is how a proxy gets re-cut to fit each
-            // new case (D-TEST-PE64-CONFOUND-PIN-WEAKENED-BY-ITS-OWN-SUBJECT).
+            // new case — a pin weakened by its own subject.
             if (row.contains("scope")) {
                 auto const scope = row.at("scope").get<std::string>();
                 EXPECT_TRUE(scope == "native" || scope == "emulated")
@@ -1709,7 +1707,7 @@ TEST_F(HarnessLegs, AConfoundWithoutProvenanceFailsLint) {
 
 // ── THE CONDITION UNDER WHICH AN EXCUSE HOLDS IS A MEASUREMENT ──────────────
 //
-// D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST.
+// A CONFOUND'S CONDITION IS A RUN MODE, NOT A HOST.
 //
 // `scope` matched a pattern against the leg's RUN MODE. That is the wrong axis
 // for a row whose mechanism is a property of the MACHINE, and the catalogue could
@@ -1886,7 +1884,7 @@ TEST_F(HarnessLegs, ConditionalConfoundsAreGatedOnAMeasuredEnvironmentProbe) {
 }
 
 // THE PLAN SAYS WHETHER ITS GATING WAS MEASURED, AND AN UNMEASURED PLAN HONOURS
-// NO CONDITIONAL ROW. [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST.]
+// NO CONDITIONAL ROW. [a confound's condition is a RUN MODE, not a host.]
 //
 // `--environment-probes skip` is the structural door — it exists so a caller that
 // only wants the plan's SHAPE need not sample a clock for 20 s. What it must never
@@ -1944,7 +1942,7 @@ TEST_F(HarnessLegs, AnUnprobedPlanHonoursNoConditionalConfound) {
 
 // ── A VERDICT MEASURED IN THIS KERNEL DOES NOT DECIDE A LEG THAT RUNS IN ANOTHER ─
 //
-// D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE.
+// THE ENVIRONMENT PROBE MEASURED THE DRIVER'S KERNEL, NOT THE LAUNCHED ONE.
 //
 // ★★★ THE CAVEAT WAS TRUE PROSE AND A FALSE STATEMENT AT THE SAME TIME. ✔MEASURED
 // at 0ecec160 with `--host-os windows --host-arch x86_64 --launchers-available
@@ -2059,7 +2057,7 @@ TEST_F(HarnessLegs, ACrossKernelLegDoesNotHonourAVerdictMeasuredByThisDriver) {
         // to say only while the probe could not GO there. Printing it now would be
         // a fresh instance of the claim-rot this anchor exists to remove.
         // ⚠ THE COUNT IS DERIVED, NEVER TYPED.
-        // [D-HARNESS-A-WITHHOLDING-PIN-WAS-COUPLED-TO-THE-CONFOUND-CATALOGUES-SIZE]
+        // [a withholding pin coupled to the confound catalogue's SIZE]
         // What this assertion is ABOUT is that NO row was withheld — `N of N` for
         // whatever N this leg declares. Spelling N as the literal 7 coupled a
         // WITHHOLDING claim to the catalogue's SIZE, so earning one more confound
@@ -2133,7 +2131,7 @@ TEST_F(HarnessLegs, ACrossKernelLegDoesNotHonourAVerdictMeasuredByThisDriver) {
 
 // ── AN INJECTED VERDICT IS VALIDATED, VISIBLE, AND CANNOT RUN A CORPUS ──────
 //
-// D-HARNESS-PROBE-VERDICTS-FLAG-INJECTS-AN-UNVALIDATED-PRESENT.
+// THE PROBE-VERDICTS FLAG INJECTED AN UNVALIDATED `present`.
 //
 // ✔MEASURED at 0ecec160: `--probe-verdicts` accepted any JSON object, checked only
 // `isinstance(dict)`, stamped the plan `confoundGating: probed` and honoured
@@ -2226,7 +2224,7 @@ TEST_F(HarnessLegs, AnInjectedProbeVerdictIsAnnouncedAndCannotRunACorpus) {
         // ★ THE KERNEL NAME IS VALIDATED TOO: a drawer nobody opens would let a
         // typo'd kernel decide nothing, silently — the direction that hides an
         // unapplied measurement.
-        // [D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE]
+        // [the probe measuring the DRIVER's kernel, not the launched one]
         {"inject-unknownkernel.json",
          R"({"some-other-box": {"clock-realtime-steps": {"verdict": "present", )"
          R"("why": "x", "verb": "wall-clock-step", "evidence": {}}}})",
@@ -2247,7 +2245,7 @@ TEST_F(HarnessLegs, AnInjectedProbeVerdictIsAnnouncedAndCannotRunACorpus) {
 }
 
 // THE PROBE IS A MEASUREMENT AND IT REPORTS ITS EVIDENCE.
-// [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST.]
+// [a confound's condition is a RUN MODE, not a host.]
 //
 // ⓘ THIS RUNS THE REAL PROBE, so it costs the declared sample window once. That is
 // deliberate: the verb's arms are all driven with INJECTED clocks by
@@ -2289,7 +2287,7 @@ TEST_F(HarnessLegs, TheEnvironmentProbeReportsAVerdictWithItsEvidence) {
 
 // THE DEADLINE THAT SPAWN RAN UNDER IS THE SCRIPT'S OWN, AND IT MOVES WHEN THE
 // DECLARED WINDOW MOVES.
-// [D-HARNESS-ENV-PROBE-TEST-TIMEOUT-IS-A-MAGIC-NUMBER-NOT-THE-DERIVED-BUDGET]
+// [a test timeout that is a magic number instead of the derived budget]
 //
 // ⓘ COSTS NOTHING — `--print-probe-budget` samples nothing, so all three spawns
 // here are ~0.1 s. That is deliberate: the property is "the number tracks the
@@ -2325,9 +2323,9 @@ TEST_F(HarnessLegs, TheSpawnDeadlineIsTheScriptsOwnBudgetAndTracksTheWindow) {
         << "every spawn in this file ran under " << resolverDeadline().count()
         << " ms while the script's own budget for the heaviest of them is "
         << shipped.probeEnvironment.count()
-        << " ms. A deadline the subject never agreed to is the whole of"
-           " D-HARNESS-ENV-PROBE-TEST-TIMEOUT-IS-A-MAGIC-NUMBER-NOT-THE-DERIVED-"
-           "BUDGET, and it kills a healthy child rather than a hung one.";
+        << " ms. A deadline the subject never agreed to is the whole defect —"
+           " a magic number standing in for the derived budget — and it kills a"
+           " healthy child rather than a hung one.";
     EXPECT_GT(shipped.probeEnvironment, shipped.noSample)
         << "the shipped catalogue DECLARES a sample window, so a run that"
            " measures it must be priced above one that measures nothing. Equal"
@@ -2370,7 +2368,7 @@ TEST_F(HarnessLegs, TheSpawnDeadlineIsTheScriptsOwnBudgetAndTracksTheWindow) {
 
 // ── THE DOORS AROUND THAT INSTRUMENT ARE FAIL-CLOSED ────────────────────────
 //
-// D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE.
+// THE ENVIRONMENT PROBE MEASURED THE DRIVER'S KERNEL, NOT THE LAUNCHED ONE.
 //
 // `--probe-environment` is what `--plan` re-enters this script with INSIDE each
 // kernel a leg executes in, so its contract is now load-bearing in a second place:
@@ -2580,7 +2578,7 @@ TEST_F(HarnessLegs, AWindowsHostLaunchesTheLinuxLegRatherThanSkippingIt) {
             EXPECT_EQ(runPlan.at("mode").get<std::string>(), "launched")
                 << "windows/" << cell.hostArch << ' ' << cell.leg
                 << " is not launched: " << runPlan.at("detail")
-                << "\nD-HARNESS-NO-WSL-LAUNCHER-FOR-ELF-ON-WINDOWS: this driver"
+                << "\nNo WSL launcher is declared for ELF on Windows: this driver"
                    " BUILDS this leg on this host and the artefact has been"
                    " MEASURED to pass 330,436 tests under WSL. A skip beside a"
                    " working binary is a declaration gap, not a capability one.";
@@ -2731,7 +2729,7 @@ TEST_F(HarnessLegs, BothDriversTranslateTheFixtureAndEverySegmentScript) {
     // emptying the real list stayed GREEN. Measured, and fixed here.
     //
     // ★ TWO CONSTRUCTS SINCE TF-C124, AND THE SPLIT IS THE POINT
-    // [D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-BOUNDARY]. This
+    // [TCL_LIBRARY was not forwarded across the WSL boundary]. This
     // pin used to assert that TCL_LIBRARY appeared in NO forward construct,
     // which was right about the danger and wrong about the remedy: the variable
     // has to cross (a leg whose Tcl was acquired cannot find init.tcl without
@@ -2822,8 +2820,8 @@ TEST_F(HarnessLegs, BothDriversTranslateTheFixtureAndEverySegmentScript) {
         // ⚠ Deliberately NOT a blanket ban on the word `wslpath`: both drivers
         // legitimately name it in their recipe-DERIVATION step, which spells a
         // WSL path the Windows way for the manifest — the opposite direction and
-        // a different mechanism, tracked separately as
-        // D-HARNESS-STAGING-PATH-TRANSLATION-IS-HAND-ROLLED-AND-HOST-KEYED. A
+        // a different mechanism — staging path translation, which is
+        // hand-rolled and host-keyed, and which no registry row tracks. A
         // pin that outlawed the word would be "fixed" by renaming a variable.
         // ★ OVER LIVE LINES, not raw text. Both drivers DOCUMENT these flags in
         // their headers, so a raw-text search is satisfied by a comment — the
@@ -2905,7 +2903,7 @@ TEST_F(HarnessLegs, BothDriversTranslateTheFixtureAndEverySegmentScript) {
             << ") does not name TCL_LIBRARY. A leg whose Tcl came from"
                " acquisition cannot find init.tcl without it, and the failure is"
                " reported against the acquisition rather than the boundary"
-               " [D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-BOUNDARY].";
+               ": TCL_LIBRARY is not forwarded across the WSL boundary.";
         EXPECT_TRUE(asksForPathForward)
             << d.name << " never spells --forward-path, so whatever it names in"
                          " its driver-path group crosses UNTRANSLATED — a"
@@ -2960,7 +2958,7 @@ TEST_F(HarnessLegs, NeitherDriverCallsAZeroFileRunGreen) {
 
 // A CRASH THAT SAYS NOTHING MUST NOT COST A LEG ITS WHOLE RESUME BUDGET.
 //
-// D-HARNESS-PRECONDITION-DISCRIMINATOR-BLIND-TO-A-SILENT-CRASH.
+// THE PRECONDITION DISCRIMINATOR WAS BLIND TO A SILENT CRASH.
 //
 // ✔MEASURED 2026-08-10, ONE Windows run, TWO legs, same commit, same root cause,
 // and the A/B is the whole argument for this pin:
@@ -3059,7 +3057,7 @@ TEST_F(HarnessLegs, NeitherDriverSpendsItsBudgetOnASilentCrash) {
 
 // ── 8. The declared library-acquisition route ──────────────────────────────
 //
-// D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER. Operator
+// LIBRARY ACQUISITION WAS BUILT FOR ONE LEG, IN ONE DRIVER. Operator
 // principle, 2026-08-04: "we should be able to build macho on linux. ANY LEG
 // MUST BE ABLE TO BUILD TO ANY LEG."
 //
@@ -3178,7 +3176,8 @@ TEST_F(HarnessLegs, AnAcquiredLibraryDeclaresTheIdentityItIsRecordedUnder) {
     EXPECT_NE(bad.output.find("importName"), std::string::npos) << bad.output;
 }
 
-// A LIBRARY IS NOT ALWAYS SELF-CONTAINED — D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY.
+// A LIBRARY IS NOT ALWAYS SELF-CONTAINED: AN ACQUIRED Tcl DYLIB SHIPS NO
+// SCRIPT LIBRARY.
 //
 // The macho leg's testfixture BUILT (189 TUs, 0 diagnostics) and ran an
 // individual `.test` file correctly, and then the TIER driver died instantly at
@@ -3253,7 +3252,7 @@ TEST_F(HarnessLegs, EveryAcquiredTclStagesItsScriptLibraryAndSaysWhere) {
 }
 
 // THE FAILURE RETURN CARRIES THE SAME FIELDS AS THE SUCCESS RETURN.
-// D-HARNESS-PINNED-ARCHIVE-FAILURE-RETURN-OMITS-ACQUIRED was one instance of
+// The pinned-archive FAILURE return omitting `acquired` was one instance of
 // this ("a function whose SUCCESS return and FAILURE return carry different
 // field sets is a silent-omission generator"); its own closing note asks for ONE
 // record type on both paths. `--acquire` therefore prints the record even when
@@ -3437,7 +3436,7 @@ TEST_F(HarnessLegs, TheAcquisitionRouteIsChecksumPinnedAndContentAddressed) {
 // entry here reds the size assertion below, so a new driver-local capability
 // cannot be introduced quietly — it has to argue with a test first.
 [[nodiscard]] std::set<std::string> knownDriverLocalProviders() {
-    // D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE (closed)
+    // The ubuntu-ports provider is generalised to the pinned archive (closed)
     return {};
 }
 
@@ -3458,8 +3457,8 @@ TEST_F(HarnessLegs, BothDriversImplementEveryProviderTheCatalogueDeclares) {
     EXPECT_TRUE(exempt.empty())
         << "the driver-local exemption list may only SHRINK, and it reached"
            " ZERO in TF-C123. Any entry means a capability exists in one driver"
-           " and not the other, which is the defect D-HARNESS-LIBRARY-"
-           "ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER exists to end.";
+           " and not the other, which is library acquisition built for one"
+           " leg in one driver — the defect this pin exists to end.";
     struct Driver {
         char const* name;
         bool        powershell;
@@ -3528,8 +3527,7 @@ TEST_F(HarnessLegs, BothDriversImplementEveryProviderTheCatalogueDeclares) {
 // arm: ubuntu-ports-arm64" — false in both halves, and it cited a CLOSED row as
 // live. A reader who believed either would have written a declaration
 // `harness_legs.py --lint` refuses outright.
-// ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
-// D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE
+// THE UBUNTU-PORTS PROVIDER WAS NOT GENERALISED TO THE PINNED ARCHIVE.
 //
 // The existing pin could not see any of it: every one of those sites is a
 // provider the catalogue does NOT declare, so its loop never looked at the name.
@@ -3643,8 +3641,7 @@ TEST_F(HarnessLegs, NeitherDriverKeepsAProviderTheResolverNoLongerKnows) {
 
 // ── THE TWO DRIVERS MUST REACH THE SAME VERDICT FOR THE SAME CONDITION ──────
 //
-// ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
-// D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT
+// THE TWIN DRIVERS DISAGREED ON THE UNKNOWN-PROVIDER VERDICT.
 //
 // ★★ WHAT THE TWO PINS ABOVE COULD NOT SEE, AND WHY. Both of them walk dispatch
 // arm EXISTENCE and retired-name ABSENCE. Neither asks what an arm DOES — so a
@@ -3839,7 +3836,7 @@ TEST_F(HarnessLegs, BothDriversRefuseAnUnimplementedProviderWithTheSameVerdict) 
     // skipped differential is exactly the state this pin must not accept.
     // ★★ AND THE ONE NON-PASS THIS HOST CANNOT DO ANYTHING ABOUT IS SEPARATED
     // FROM THE REST, BY READING THE INSTRUMENT'S OWN STATED REASON.
-    // D-TEST-HARNESS-DIFFERENTIAL-NEEDS-A-POWERSHELL-INTERPRETER-AND-DOES-NOT-SAY-SO:
+    // THE DIFFERENTIAL NEEDS A POWERSHELL INTERPRETER AND USED NOT TO SAY SO:
     // this differential executes BOTH driver copies, so it needs a PowerShell
     // interpreter, and `pwsh` does not exist on every gate host. ✔MEASURED
     // 2026-08-21 across the four legs: Windows has it, WSL has it at
@@ -4008,7 +4005,7 @@ TEST_F(HarnessLegs, TheRecordedIdentityFlagIsNamedInExactlyOneFile) {
 
 // ── 9. NOTHING INVOKES `wsl.exe` WITHOUT `-e` ──────────────────────────────
 //
-// D-TOOLS-WSL-EXE-WITHOUT-DASH-E-RUNS-A-LOCAL-SHELL.
+// `wsl.exe` WITHOUT `-e` RUNS A LOCAL SHELL.
 //
 // THE FORBIDDEN SHAPE, in one line: `wsl.exe <anything-but--e> …`.
 //
@@ -4291,7 +4288,7 @@ TEST_F(HarnessLegs, NoScriptInvokesWslWithoutExec) {
                     << name << ':' << at << " invokes `" << m.spelling
                     << "` without `-e`:\n  " << line
                     << "\nThe next token is '" << next
-                    << "'. D-TOOLS-WSL-EXE-WITHOUT-DASH-E-RUNS-A-LOCAL-SHELL:"
+                    << "'. `wsl.exe` without `-e` runs a LOCAL shell:"
                        " `wsl.exe <cmd>` does not run <cmd>, it hands the"
                        " reconstructed command line to the distro's DEFAULT"
                        " SHELL, which strips quoting and expands ON THIS MACHINE"
@@ -4386,7 +4383,7 @@ TEST_F(HarnessLegs, NoDeclaredWslArgvOmitsExec) {
 
 // ── 10. NEITHER DRIVER NAMES THE ARTEFACT — THE COMPILER DOES ──────────────
 //
-// ★ ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING
+// ★ THE FIXTURE PATH ASSUMED THE POSIX ARTIFACT SPELLING.
 //
 // ✔MEASURED 2026-08-04, WSL x86_64, HEAD a3af1320: the .sh driver CROSS-BUILT the
 // Windows testfixture — 189 TUs compiled, the link ran, ZERO `error[` and zero
@@ -4397,8 +4394,8 @@ TEST_F(HarnessLegs, NoDeclaredWslArgvOmitsExec) {
 // in the build had ever told it what the artefact was CALLED.
 //
 // ★ WHY THIS IS WORSE THAN AN ORDINARY BUG, and why it earns a gate test. It is a
-// false negative on the project's headline capability
-// (ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-CROSS-HOST-ANY-TARGET)
+// false negative on the project's headline capability — build ANY target
+// inside ANY host —
 // manufactured by the instrument that measures it — and it hid ITSELF:
 // only a POSIX host cross-building for Windows can reach it, which is exactly the
 // case this harness exists to observe. On the arm64 VPS the leg never got that far;
@@ -4540,7 +4537,7 @@ TEST_F(HarnessLegs, NeitherDriverNamesTheArtefactTheCompilerDoes) {
 }
 
 // ── 8. THE FOURTH, PER-LEG Tcl COHERENCE CHECK ─────────────────────────────
-// [D-HARNESS-TCL-HEADER-IS-HOST-CHOSEN-WHILE-EVERY-LEG-LIBRARY-IS-PINNED]
+// [the Tcl HEADER is host-chosen while every leg's LIBRARY is pinned]
 //
 // THE DEFECT, ✔MEASURED 2026-08-06 by the first native macOS run of
 // build-and-test.sh. The harness picks the Tcl HEADER from the HOST (tclsh on
@@ -4561,8 +4558,8 @@ TEST_F(HarnessLegs, NeitherDriverNamesTheArtefactTheCompilerDoes) {
 // worth having:
 //
 //   1. IT IS PER-LEG AND IT LIVES IN THE SHARED RESOLVER, so it cannot exist in
-//      one driver and not the other
-//      (D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER).
+//      one driver and not the other — which is how library acquisition came to
+//      be built for ONE leg, in ONE driver.
 //      Both drivers must actually CALL it.
 //   2. IT REFUSES, IT DOES NOT WARN. A warn ships a binary that links clean and
 //      then misbehaves — the exact class this harness exists to prevent.
@@ -4726,8 +4723,7 @@ TEST_F(HarnessLegs, BothDriversRunThePerLegTclCoherenceCheck) {
                    " leg's library is pinned by its target-keyed provider; a"
                    " driver that does not compare them builds a fixture against"
                    " one Tcl and links another"
-                   " [D-HARNESS-TCL-HEADER-IS-HOST-CHOSEN-WHILE-EVERY-LEG-"
-                   "LIBRARY-IS-PINNED].";
+                   " — a host-chosen header against pinned leg libraries.";
         }
     }
 }

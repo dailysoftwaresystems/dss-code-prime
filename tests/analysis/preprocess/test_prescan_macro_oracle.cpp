@@ -70,8 +70,7 @@ constexpr std::string_view kMainName    = "oracle_main.c";
 
 // Shared schema fixture. Returns a REFERENCE to a function-local static: a
 // `GrammarSchema`'s accessors hand back references INTO the schema, so a
-// by-value return makes `helper()->accessor()` a heap-use-after-free
-// (D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE).
+// by-value return makes `helper()->accessor()` a heap-use-after-free.
 //
 // ⚠ CALL THIS BEFORE `useAsCwd()`. Schema discovery reads `$DSS_CONFIG_ROOT`
 // first — which `dss_add_test` sets — but its fallback walks UP FROM THE CWD, so

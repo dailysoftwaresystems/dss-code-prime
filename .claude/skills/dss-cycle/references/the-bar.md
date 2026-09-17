@@ -111,8 +111,8 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      whose own failure is unbounded: **a mutation that silently no-ops makes the pin report green,
      and that green reads exactly like earned confidence.** ✔MEASURED 2026-08-06: a mutator process
      was killed by a cygwin fork error before it edited anything; the pin passed, as it correctly
-     should have, and was briefly read as "the guard is not vacuous"
-     (`D-GATE-RED-ON-DISABLE-MUTATION-CAN-SILENTLY-NO-OP`). So every demonstration must be
+     should have, and was briefly read as "the guard is not vacuous".
+     So every demonstration must be
      **fail-closed**: the witness text is UNIQUE in the subject, the mutant DIFFERS byte-wise
      (`cmp`/hash — **never a line count**, which a same-length replacement slips straight past),
      the witness is ABSENT from the mutant, and the mutant still parses. Never infer that a mutator
@@ -129,8 +129,8 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      SAME MATCHER THE PIN USES**, not by eye and not by a different reader. Describe a mutation in
      the harness's output, never inside the mutated file.
      ★★ **AND AN EMPTY MUTATION ANCHOR MATCHES EVERYWHERE — SO A FAIL-CLOSED CHECK WRITTEN
-     AROUND ONE FIRES *AFTER* THE DAMAGE.** ⚠ ✔MEASURED 2026-08-20 (cycle P23,
-     `D-GATE-RED-ON-DISABLE-EMPTY-RESTORE-ANCHOR-MATCHES-EVERYWHERE`): a mutation whose replacement
+     AROUND ONE FIRES *AFTER* THE DAMAGE.** ⚠ ✔MEASURED 2026-08-20 (cycle P23):
+     a mutation whose replacement
      text was the empty string made the RESTORE anchor `""`, and `str.count("")` returns **`len + 1`**
      — 8,181 on the subject file. The uniqueness clause therefore tripped on the restore, *after*
      the forward half had already run, and the source was left mutated with a totality
@@ -148,18 +148,16 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      why the rule has to be about the *read*, not about any one layer:
      - **The mutant was never COMPILED IN.** `ninja -t deps <obj>` reported **`#deps 0`** — ninja had
        recorded zero header dependencies, so a header-only change did not rebuild its consumer.
-       **10 of 403 objects** in `build-dbg` were in that state
-       (`D-BUILD-NINJA-RECORDS-ZERO-HEADER-DEPS-UNDER-CONCURRENT-BUILDS`). ⇒ use the subject
+       **10 of 403 objects** in `build-dbg` were in that state. ⇒ use the subject
        **binary's mtime** as the build-success criterion. **Never a grep over build output** — the
        same lane's grep reported "BUILD OK" over a link that had failed.
      - **The mutant was never LOADED.** `findShippedConfig` reads `DSS_CONFIG_ROOT` *else* walks the
        cwd. `dss_add_test` sets that variable, so **ctest** reads the intended tree — but running a
        test `.exe` **directly** takes the cwd-walk and silently reads whichever tree the shell stands
        in, so a worktree binary run from the shared tree's cwd read the *shared* config and never saw
-       the mutant (`D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE`). ⇒ **a config-level
+       the mutant. ⇒ **a config-level
        red-on-disable MUST run through `ctest`, never a bare `.exe`.**
-     - **The mutant was COMPILED IN — TO THE WRONG BINARY.** ✔MEASURED 2026-08-20 (cycle P23,
-       `D-TEST-RED-ON-DISABLE-MTIME-WITNESS-MUST-BE-THE-ARTIFACT-THAT-RUNS-THE-ASSERTION`): the
+     - **The mutant was COMPILED IN — TO THE WRONG BINARY.** ✔MEASURED 2026-08-20 (cycle P23): the
        mutated predicate was a **header inline**. A narrow build rebuilt the shared library and its
        mtime advanced — the instrument the clause above prescribes, behaving exactly as written
        — and the pin stayed **GREEN**, because the assertion under test calls the copy of the
@@ -172,8 +170,7 @@ bar **stops and reports** — it never pushes a partial or a workaround.
        another lane — **a mutant that reds the WRONG test is the same signal as one that reds
        nothing.** Read *which* test went red, never the count.
      - **The witness MOVED WITHOUT THE MUTANT — and this one indicts the instrument the first
-       bullet prescribes.** ✔MEASURED 2026-08-24 (cycle P31,
-       `D-TEST-A-PE-IMAGE-MD5-IS-NOT-A-COMPILED-IN-PROOF`): **a PE image carries a LINK TIMESTAMP**,
+       bullet prescribes.** ✔MEASURED 2026-08-24 (cycle P31): **a PE image carries a LINK TIMESTAMP**,
        so the shipped DLL's md5 moved **between two builds of IDENTICAL sources**
        (`5e6cbe74…` vs `10eb22ea…`), and moved for CONFIG-ONLY mutants that recompile
        nothing. ⇒ **a moved image md5 is NOT evidence the mutant compiled in — it is evidence
@@ -194,7 +191,7 @@ bar **stops and reports** — it never pushes a partial or a workaround.
        refusal it names** — a mutant can be compiled into the right artifact and still exercise
        nothing. Where the two disagree, the message wins.
      - **The OBJECT moved and the mutant still never ran — because the LINK failed.** ✔MEASURED
-       2026-08-24 (cycle P31, `D-TEST-A-MOVED-OBJECT-MD5-IS-NOT-A-REACHED-THE-BINARY-PROOF`), one
+       2026-08-24 (cycle P31), one
        cycle after the bullet above prescribed the object as the subject: a code mutant's ctest run
        came back GREEN twice with the object md5 correctly MOVED both times. The compile had
        succeeded; the link had not — `ld.exe: cannot open output file
@@ -218,7 +215,7 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      A red-on-disable makes **two** claims — *mutant RED* **and** *subject GREEN* — and a stale binary
      silently invalidates the second. The rule above is stated only for the mutate direction, and every
      word of it applies identically to the restore.
-     ✔MEASURED 2026-08-17 (`D-GATE-RED-ON-DISABLE-RESTORE-NOT-PROVEN-TO-REACH-THE-PROCESS`): a mutation
+     ✔MEASURED 2026-08-17: a mutation
      script restored the SOURCE in its `finally` and never rebuilt, so the next script's "UNMUTATED"
      column ran against a binary that still contained the mutant. **Both of its columns were therefore
      the mutant — and they agreed perfectly, which reads exactly like a stable measurement.** It
@@ -242,7 +239,7 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      tokens — clean by construction, in a shape the driver NEVER RECEIVES — and so could not see
      that the real path returned `ran\r` on Windows (Python writes stdout in text mode; `read -r`
      strips `\n` and keeps `\r`), which would have made the driver reject EVERY legitimate token
-     and fail every run (`D-TEST-A-PIN-THAT-STUBS-ITS-SUBJECTS-INPUT-IS-TESTING-THE-STUB`).
+     and fail every run.
      **A pin that supplies its subject's input in a form the subject never sees is testing the
      stub.** Extract and execute the shipped code path. Where a stub is genuinely unavoidable,
      assert the stub matches what the real path produces. ★ And prefer assertions on **CONTENT**
@@ -392,7 +389,7 @@ bar **stops and reports** — it never pushes a partial or a workaround.
    catch:** the TF-C51 fat-archive gate hit a real GNU-on-Windows COFF `-Wa,-mbig-obj` scope gap
    on an *unrelated* test TU (`test_mir_to_lir.cpp`, "file too big"); the first instinct —
    exclude that test from the Windows leg — was a workaround. Correct handling per §A.7:
-   root-cause → anchor `D-BUILD-GNU-WINDOWS-BIGOBJ-SCOPE` → fix it (project-wide flag) → witness
+   root-cause → anchor it → fix it (project-wide flag) → witness
    the TU now builds+passes → commit. **An orthogonal issue you merely *found* is still yours to
    anchor + handle** — the discovery is the obligation.
 

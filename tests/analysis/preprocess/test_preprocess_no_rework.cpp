@@ -31,7 +31,7 @@
 // `linux-gcc-release` and PASSED on `linux-arm64-gcc-release` in the SAME run at
 // the SAME commit. A ratio's MEANING is host-insensitive; its MEASUREMENT is
 // two half-second samples on a shared two-vCPU runner, where scheduling noise
-// is the same order as the effect. [[D-TEST-PP-NO-REWORK-PINS-A-COUNT-WITH-A-WALL-CLOCK-RATIO]]
+// is the same order as the effect.
 //
 // ⇒ THE RULE THE TWO CASES NOW FOLLOW, AND THE SPLIT IS THE POINT:
 //   • ASK THE PROPERTY WHAT KIND OF QUANTITY IT IS. The include defect is
@@ -82,10 +82,9 @@ using namespace dss;
 namespace fs = std::filesystem;
 
 // Shared schema fixture — a REFERENCE to a function-local static, for the
-// reason `test_preprocessor.cpp` spells out under
-// D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: `GrammarSchema`'s accessors hand
-// back references INTO the schema, so a by-value return would make
-// `helper()->accessor()` a heap-use-after-free.
+// reason `test_preprocessor.cpp` spells out at its own `cSubset()`:
+// `GrammarSchema`'s accessors hand back references INTO the schema, so a
+// by-value return would make `helper()->accessor()` a heap-use-after-free.
 [[nodiscard]] std::shared_ptr<GrammarSchema const> const& cSchema() {
     static std::shared_ptr<GrammarSchema const> const schema = [] {
         auto loaded = GrammarSchema::loadShipped("c");
@@ -175,7 +174,6 @@ void forceTheWriteTimeBackTo(fs::path const& path,
 // — ✔MEASURED FALSE on CI run 33156833090, where exactly that shape reddened on
 // one runner and passed on another at the same commit. Load does not scale two
 // samples; it is ADDED to whichever one it lands on.
-// [[D-TEST-PP-NO-REWORK-PINS-A-COUNT-WITH-A-WALL-CLOCK-RATIO]]
 template <typename F>
 [[nodiscard]] double microseconds(F&& f) {
     auto const t0 = std::chrono::steady_clock::now();
@@ -275,7 +273,7 @@ TEST(PpIfNoRework, AProductInTheUnitDoesNotMakeEveryIfCostTheWholeUnit) {
     // (run 33156833090). That case has since been re-pinned on an exact COUNT
     // because its property IS a count. This one's property is a MEMCPY whose
     // only trace is time, so the instrument stays a clock and the fix belongs in
-    // how the clock is read. [[D-TEST-PP-NO-REWORK-PINS-A-COUNT-WITH-A-WALL-CLOCK-RATIO]]
+    // how the clock is read.
     //
     // ⓘ `kRounds` is a repetition count, not a duration: it is not sized on any
     // machine and cannot go stale on a slower one.
@@ -463,8 +461,7 @@ TEST(PpIncludeNoRework, OneHeaderAcrossManyUnitsIsReadAndTokenizedOnce) {
     // times and can take none, because no two of them name the same file.
     //
     // ★★★ THIS USED TO BE A WALL-CLOCK RATIO (`sameUs / distUs < 0.85`) AND THE
-    // RATIO IS WHAT BROKE, NOT THE PROPERTY.
-    // [[D-TEST-PP-NO-REWORK-PINS-A-COUNT-WITH-A-WALL-CLOCK-RATIO]]. ✔MEASURED on
+    // RATIO IS WHAT BROKE, NOT THE PROPERTY. ✔MEASURED on
     // CI run 33156833090: it read x1.0483 against the 0.85 bound on
     // `linux-gcc-release` and PASSED on `linux-arm64-gcc-release` in the SAME
     // run at the SAME commit — two half-second arms on a shared two-vCPU runner,

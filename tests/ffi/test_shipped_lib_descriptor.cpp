@@ -4492,13 +4492,16 @@ TEST(ShippedLibDescriptor, MacroVariantNoMatchNotInjected) {
 //       Worse, the in-process examples runner and the CLI harness then disagree on
 //       the COLUMN for the same diagnostic (31:11 vs 31:1) — there is no honest
 //       line:col to put in a manifest.
-//   (2) D-TEST-POSITIONED-FALSE-REQUIRES-SPANLESS-RENDERING — `positioned:false`
-//       is not an escape hatch. The integrated CLI arm matches a
-//       code-only expectation by grepping for the SYMBOLIC rendering
-//       `error[S_UnknownType]`, and the CLI emits that spelling ONLY for
-//       SPAN-LESS diagnostics — a spanned one renders `error[S0006]`
-//       (D-DIAG-TWO-CODE-RENDERINGS). So `positioned:false` is today usable only
-//       for genuinely span-less codes, an undocumented coupling.
+//   (2) `positioned:false` WAS NOT AN ESCAPE HATCH. The integrated CLI arm
+//       matches a code-only expectation by grepping for the SYMBOLIC rendering
+//       `error[S_UnknownType]`, and the CLI emitted that spelling ONLY for
+//       SPAN-LESS diagnostics — a spanned one rendered `error[S0006]`. So
+//       `positioned:false` was usable only for genuinely span-less codes, an
+//       undocumented coupling.
+//       ⚠ D-DIAG-TWO-CODE-RENDERINGS, the split that CAUSED this, has since
+//       closed by unifying every render surface on the symbolic name, so this
+//       coupling is reported gone. RE-MEASURE it before re-taking the pe-arm
+//       decision below on the strength of this paragraph.
 // A pe corpus arm lands when those are fixed; until then the pe axis is pinned
 // HERE, strictly, and it does red alone (add a pe variant to any of the nine).
 TEST(ShippedLibDescriptor, RealSysTypesBsdSpellingGroupPerFormat) {

@@ -65,7 +65,7 @@ constexpr ShippedPair kArm{"asm-arm64-gas", "arm64", "%function"};
 
 // The shipped dialect document's TEXT. ⚠ CONFIG-LEVEL: `dss_add_test` sets
 // `DSS_CONFIG_ROOT`, so this file must run through ctest and never as a bare
-// `.exe` (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+// `.exe`, which walks the cwd and would read whichever tree the shell stands in.
 [[nodiscard]] std::string dialectText(std::string_view name) {
     auto pathR = findShippedConfig(
         ShippedConfigLocator{name, "sources", ".lang.json", "language",

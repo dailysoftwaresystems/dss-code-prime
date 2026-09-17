@@ -3010,9 +3010,10 @@ TEST_P(MirToLirCastMapping, EmitsExpectedMnemonicAndRegClass) {
 
     // Synthetic MIR: single src-typed arg → cast → return dst-typed value.
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    // D-TEST-LIR-AND-LINK-SUITES-MINT-AN-OPERAND-LESS-PTR: the IntToPtr /
-    // PtrToInt / Bitcast rows name `Ptr`, which is structural — the ONE resolver
-    // in `synthetic_fn.hpp` builds the opaque `void*` the row means.
+    // The IntToPtr / PtrToInt / Bitcast rows name `Ptr`, which is structural,
+    // and a probe that minted an operand-less one interned a pointer with NO
+    // pointee — the ONE resolver in `synthetic_fn.hpp` builds the opaque
+    // `void*` these rows mean.
     auto const srcT = ::dss::test_support::probeTypeOfKind(interner, param.srcKind);
     auto const dstT = ::dss::test_support::probeTypeOfKind(interner, param.dstKind);
     std::array<::dss::TypeId, 1> params{srcT};
@@ -5132,8 +5133,8 @@ TEST(MirToLir, U32CompareLowersWithThirtyTwoBitCmpWidth) {
 }
 
 // ── audit-residue sweep c1: the FUSED ICmp+CondBr cmp width pin ─────────
-// D-AUDIT-FUSED-CMP-WIDTH-PIN: lowerCondBr's ICmp-fusion arm emits its
-// OWN `cmp lhs, rhs` (immediately before the jcc) — a SEPARATE emit
+// lowerCondBr's ICmp-fusion arm emits its OWN `cmp lhs, rhs`
+// (immediately before the jcc) — a SEPARATE emit
 // site from lowerICmp's value-path cmp (which the U32Compare… pin
 // above covers). The fused cmp's width must follow the ICmp OPERANDS'
 // type, the same FC3-c2 rule. Because the 32-bit producers zero the
@@ -5242,7 +5243,7 @@ TEST(MirToLir, FusedI32CompareCondBrCmpCarriesThirtyTwoBitWidth) {
         EXPECT_EQ(s.fusedCmpWidthBits, 32u)
             << "the FUSED cmp over I32 operands must read 32 bits — "
                "width-64 here reads zero-extended upper bits and calls "
-               "a negative int positive (D-AUDIT-FUSED-CMP-WIDTH-PIN)";
+               "a negative int positive";
     }
 }
 
@@ -5278,10 +5279,10 @@ namespace {
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     EXPECT_TRUE(target.has_value());
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    // D-TEST-LIR-AND-LINK-SUITES-MINT-AN-OPERAND-LESS-PTR: three `CastCase` rows
-    // below name `Ptr` as a src or dst kind (IntToPtr / PtrToInt / Bitcast), and
-    // `primitive(TypeKind::Ptr)` would mint a pointer with NO pointee. The ONE
-    // resolver in `synthetic_fn.hpp` builds what the row means.
+    // Three `CastCase` rows below name `Ptr` as a src or dst kind (IntToPtr /
+    // PtrToInt / Bitcast), and `primitive(TypeKind::Ptr)` would mint a pointer
+    // with NO pointee. The ONE resolver in `synthetic_fn.hpp` builds what the
+    // row means.
     auto const srcTy = ::dss::test_support::probeTypeOfKind(interner, src);
     auto const dstTy = ::dss::test_support::probeTypeOfKind(interner, dst);
     std::array<::dss::TypeId, 1> params{srcTy};
@@ -8158,9 +8159,9 @@ TEST(MirToLir, VlaOverAlignedElementLowers) {
             << "L_OverAlignedStackLocal survives only as the non-power-of-two invariant "
                "guard; an ordinary _Alignas(32) element must not reach it";
     }
-    // ⚠ A lowering that emitted NOTHING would satisfy both assertions vacuously — the
-    // exact class D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO
-    // was closed for this cycle. Assert a POSITIVE count rather than trusting `ok`.
+    // ⚠ A lowering that emitted NOTHING would satisfy both assertions vacuously —
+    // the exact class a front end that lowers a many-arg call to nothing puts
+    // every pin into. Assert a POSITIVE count rather than trusting `ok`.
     std::uint32_t insts = 0;
     for (std::size_t f = 0; f < L.lir.lir.moduleFuncCount(); ++f) {
         LirFuncId const fn = L.lir.lir.funcAt(static_cast<std::uint32_t>(f));

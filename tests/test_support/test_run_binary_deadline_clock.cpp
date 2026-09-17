@@ -1,4 +1,4 @@
-// D-TEST-RUN-HARNESS-DEADLINE-COUNTS-HOST-SUSPEND — the permanent pin.
+// THE RUN HARNESS'S DEADLINE MUST NOT COUNT HOST SUSPEND — the permanent pin.
 //
 // THE DEFECT (measured 2026-08-13). `runBinary`'s POSIX arm took
 // `steady_clock::now()` and killed the child at `start + timeout`. "Has this
@@ -106,8 +106,8 @@ constexpr std::string_view kHangFlag = "--dss-hang-ms=";
 // upper bound against a number*. The file contradicted itself in one diff. Kept
 // and corrected rather than quietly reworded, because the lesson is the shape:
 // a UNIVERSAL claim over the contents of a file is falsified by anything the
-// same commit adds to that file, and nothing mechanical checks it
-// ([[D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED]]).
+// same commit adds to that file, and nothing mechanical checks it — a comment
+// can be true when it is typed and false by the time the commit lands.
 
 // STIMULUS. The child sleeps this long; the parent's budget is a small fraction
 // of it, so the kill is unambiguous even on a loaded box. A slow host makes the

@@ -75,7 +75,7 @@ TEST(ScratchDirSubstrate, DifferentGroupsLandUnderDifferentSubdirs) {
     EXPECT_NE(a.path().parent_path(), b.path().parent_path());
 }
 
-// TF-C58 (`D-TEST-EXAMPLES-RUNNER-PARALLEL-CONTENTION-FLAKE`) red-on-disable.
+// TF-C58 (the examples-runner parallel-contention flake) red-on-disable.
 // A STALE directory sitting on the slot the ctor is about to draw must be
 // STEPPED OVER, never reused. `MultipleScratchDirsGetDistinctPaths` above does
 // NOT catch this — the counter advances anyway, so it stayed green through the

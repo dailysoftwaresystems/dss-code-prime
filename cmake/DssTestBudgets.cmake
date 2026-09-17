@@ -1,6 +1,7 @@
 # ══ cmake/DssTestBudgets.cmake — EVERY ctest entry gets a TIMEOUT ═════════════
 #
-# D-TEST-INTEGRATED-RUNNER-HANGS-BEFORE-CREATING-ITS-EX-DIRECTORY
+# Born of an integrated runner that hung before creating its own directory,
+# under ctest's default timeout, which is no timeout at all.
 #
 # ★★★ A HANG MUST FAIL BY NAME. This project never calls `include(CTest)`, so an
 # entry without its own TIMEOUT runs under ctest's default of 10 000 000 s:

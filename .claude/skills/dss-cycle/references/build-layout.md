@@ -101,7 +101,7 @@ than sending the reader after a deliberately removed one — both arms measured)
 searches `build/rel`, `build/dbg`, then the three legacy roots, and a from-scratch build lands in the
 new layout.
 
-Tracked by `D-BUILD-LAYOUT-FLAT-ROOT-BUILD-DIRS-NOT-MIGRATED`. Sequence it for a quiet tree — no
-lanes in flight, no gate mid-run — because the migration edits the very scripts the gate runs.
+The flat root-level `build-*` directories are not migrated yet. Sequence that migration for a quiet
+tree — no lanes in flight, no gate mid-run — because it edits the very scripts the gate runs.
 ⚠ Until it lands, the rule above still governs **new** build trees: create them as
 `build/<name>`, and do not add another root-level `build-*`.

@@ -7,7 +7,7 @@
 // artifact, spawn-failure, timeout, or wrong-exit-code all break
 // the test loud.
 //
-// PROJECT MODE (D-EXAMPLES-RUNNER-PROJECT-MANIFEST): a manifest may name a
+// PROJECT MODE — THE RUNNER'S PROJECT-MANIFEST PATH: a manifest may name a
 // `.dss-project.json` via the top-level `"project"` key INSTEAD of
 // `source`/`sources`, and the build then goes through
 // `Program::compileProject` — the only driver entry point that expands the
@@ -34,7 +34,8 @@
 //
 // ★★★ AND THAT POLICY MAKES THIS RUNNER THE SOLE WITNESS FOR EVERY CROSS-HOST
 // SPEC, WHICH IS NOW A CHECKED FACT RATHER THAN A HABIT.
-// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+// THE INTEGRATED RUNNER BUILDS ONLY THE HOST-RUNNABLE SPEC, SO ONE RUNNER
+// SEES A CAPABILITY THE OTHER CANNOT.
 // The CLI-subprocess sibling binds ONE target per manifest and compiles only
 // that one, by a user invariant of 2026-06-02 stated in its own header. So the
 // sentence above is not merely this runner's policy — it is the ONLY reason a
@@ -47,7 +48,7 @@
 // cannot, and the `integrated_tests/coverage-boundary` entry runs BOTH
 // harnesses on one example and judges them against it.
 //
-// A SKIP IS NOT A PASS (D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT). Every
+// A SKIP IS NOT A PASS — A CROSS-ARCH SKIP YIELDS NO VERDICT. Every
 // declared arm — every target x every optimizedPipelines arm — lands in an
 // `ArmVerdictLedger` with a named reason, and the entry prints the accounting
 // on stdout. Skips whose cause is the MACHINE rather than the manifest (a
@@ -59,7 +60,8 @@
 // bug, which is how this defect survived in both for as long as it did.
 
 #include "arm_verdict_ledger.hpp"
-// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+// THE INTEGRATED RUNNER BUILDS ONLY THE HOST-RUNNABLE SPEC, SO ONE RUNNER
+// SEES A CAPABILITY THE OTHER CANNOT.
 // The COVERAGE BOUNDARY vocabulary — one grammar, emitted by both runners and
 // parsed by the boundary guard. This runner is the SUPERSET half: it compiles
 // every declared target, including the ones this host can never spawn, and its
@@ -114,7 +116,7 @@ using namespace dss::test_support;
 
 namespace {
 
-// D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: `currentHostOs`, `currentHostArch`,
+// A CROSS-ARCH SKIP YIELDS NO VERDICT: `currentHostOs`, `currentHostArch`,
 // `specTargetArch` and `findOnPath` used to live here AND, byte-identically, in
 // `integrated_tests/runner.cpp`. They now come from the shared
 // `arm_verdict_ledger.hpp`, so the two corpus harnesses cannot disagree about
@@ -127,7 +129,7 @@ using ::dss::test_support::findOnPath;
 using ::dss::test_support::qemuSysrootHint;
 using ::dss::test_support::specTargetArch;
 
-// D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): one PREREQUISITE artifact a
+// THE RUNNER'S MULTI-ARTIFACT MODE (c171): one PREREQUISITE artifact a
 // target build depends on — a LIBRARY the runner builds FIRST, then threads
 // into the dependent build's `--resolve-library` (the c162 reader-consumer
 // surface). PER-TARGET (on `ExampleTarget`) so one example can express the
@@ -167,8 +169,8 @@ struct DependsOnArtifact {
     // library half ONLY while every `main.c` in the corpus happens to be
     // trivial — an incidental property of two source files, which the next
     // person to add a loop to a `main.c` silently repeals. This key makes the
-    // library its own subject, which is what
-    // [[D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM]] is actually about.
+    // library its own subject, which is what a `dependsOn` entry with no
+    // release-optimizer arm of its own is actually about.
     // Per-DEPENDENCY rather than per-target because a fat archive and the
     // input archive it merges are different subjects: the input may be a
     // trivial `return 42;` with nothing to fold while the fat one carries real
@@ -266,7 +268,7 @@ struct ExampleTarget {
     std::string                  spec;
     std::string                  artifact;
     std::vector<std::string>     runOn;  // host OS names allowed to spawn
-    // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): prerequisite LIBRARY artifacts
+    // THE RUNNER'S MULTI-ARTIFACT MODE (c171): prerequisite LIBRARY artifacts
     // this target links against. The runner builds each FIRST (into the same
     // scratch out dir) and passes their output paths to the dependent build's
     // `--resolve-library` (`Program::setResolveLibraries`). Empty (the
@@ -318,7 +320,7 @@ struct OptimizedArm {
     std::vector<std::string>     passes;  // PassId names (inline-array form)
     bool                         hasPasses = false;          // `passes` key present
     std::optional<std::string>   shippedPipeline;            // shipped-config form
-    // D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING: the
+    // A RELEASE ARM BYTE-IDENTICAL TO THE BASELINE ASSERTS NOTHING: the
     // ESCALATION LEVER. False (the default) ⇒ a byte-identical optimized image
     // is REPORTED; true ⇒ it is a hard RED. Opt-in PER ARM rather than per
     // manifest because the two live side by side in one file: a
@@ -403,8 +405,8 @@ struct ExpectedDiagnostic {
 struct ExampleManifest {
     std::string                  language;
     std::string                  source;
-    // D-EXAMPLES-RUNNER-PROJECT-MANIFEST: PROJECT MODE. Present ⇒ this example is
-    // built by `Program::compileProject` from the named `.dss-project.json` (a
+    // PROJECT MODE. Present ⇒ this example is built by
+    // `Program::compileProject` from the named `.dss-project.json` (a
     // path relative to the example dir) instead of by `compileFiles`/
     // `compileUnits` over `source`/`sources`. MUTUALLY EXCLUSIVE with both of
     // those (readManifest fails loud on the ambiguity) because the two spellings
@@ -481,7 +483,7 @@ struct ExampleManifest {
     std::vector<ExpectedDiagnostic> expectWarnings;
 };
 
-// D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171) + nested extension: parse ONE
+// THE RUNNER'S MULTI-ARTIFACT MODE (c171) + nested extension: parse ONE
 // `dependsOn` entry. RECURSIVE — an entry may itself carry a nested
 // `dependsOn` (e.g. a fat `-staticlib` that resolves an input `-staticlib` to
 // MERGE it). This SAME helper serves both the target-level parse AND the
@@ -590,7 +592,7 @@ parseDependsOnEntry(nlohmann::json const& d, fs::path const& manifestPath) {
 // CLI-subprocess sibling's `parsePrebuiltLibraryEntry`
 // (integrated_tests/runner.cpp), because a manifest one runner accepts and the
 // other rejects is the silent-harness-bug class
-// [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]] exists to catch. Returns nullopt
+// the TWO RUNNERS MUST AGREE rule exists to catch. Returns nullopt
 // (ADD_FAILURE already fired) on any malformed field.
 //
 // ⚠ BOTH FIELDS ARE REQUIRED, and neither requirement is ceremony: a missing
@@ -1067,7 +1069,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
             }
             et.exitCodeOverride = t.at("exitCode").get<std::int64_t>();
         }
-        // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): optional prerequisite
+        // THE RUNNER'S MULTI-ARTIFACT MODE (c171): optional prerequisite
         // library artifacts this target links against (built FIRST, threaded
         // into `--resolve-library`). Each entry is parsed by the SHARED
         // recursive helper, so a dep may carry its OWN nested `dependsOn`
@@ -1156,7 +1158,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                 }
                 oa.shippedPipeline = arm.at("shippedPipeline").get<std::string>();
             }
-            // D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING:
+            // A RELEASE ARM BYTE-IDENTICAL TO THE BASELINE ASSERTS NOTHING:
             // optional per-arm escalation. Absent ⇒ false ⇒ report-only.
             if (arm.contains("mustDifferFromBaseline")) {
                 if (!arm.at("mustDifferFromBaseline").is_boolean()) {
@@ -1534,7 +1536,7 @@ buildPipeline(OptimizedArm const& arm, fs::path const& manifestPath) {
 // (the original `skipped: bool` shape) would let a baseline that secretly
 // failed to compile produce a silently-bypassed differential-verify assertion.
 //
-// D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the single `SkippedCrossHost` that
+// A CROSS-ARCH SKIP YIELDS NO VERDICT: the single `SkippedCrossHost` that
 // used to cover all three skip reasons is GONE. It was the defect: a
 // `runOn`-excluded arm (structural, expected), an arm whose manifest declares
 // no emulator (a manifest defect) and an arm whose declared emulator is absent
@@ -1549,7 +1551,7 @@ struct ArmResult {
     // summary can name the runOn list / the missing emulator rather than
     // reprint a bare status.
     std::string detail;
-    // D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING: the
+    // A RELEASE ARM BYTE-IDENTICAL TO THE BASELINE ASSERTS NOTHING: the
     // WHOLE produced artifact, read off disk before this arm returns.
     //
     // ⚠ CAPTURED HERE, NOT COMPARED-BY-PATH LATER, and that is forced rather
@@ -1560,7 +1562,8 @@ struct ArmResult {
     // SILENT MISS — exactly the class of defect this exists to end — and corpus
     // artifacts are single-digit KB, so the exact comparison costs nothing.
     std::string artifactBytes;
-    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // THE INTEGRATED RUNNER BUILDS ONLY THE HOST-RUNNABLE SPEC, SO ONE RUNNER
+    // SEES A CAPABILITY THE OTHER CANNOT.
     // The ATTEMPT to exec, not its outcome. `verdict == Ran` cannot stand in for
     // it — a spawn that FAILED is `Poisoned` — and the coverage-boundary clause
     // that forbids exec'ing a foreign-host artifact must catch the attempt
@@ -1576,7 +1579,7 @@ struct ArmResult {
     std::map<std::string, std::string> dependencyBytes;
 };
 
-// ── D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING ─────────
+// ── A RELEASE ARM BYTE-IDENTICAL TO THE BASELINE ASSERTS NOTHING ─────────────
 //
 // THE DEFECT. An `optimizedPipelines` arm compiles the example a SECOND time
 // under a named pipeline and asserts the binary still produces the baseline's
@@ -1871,7 +1874,7 @@ resolvePrebuiltLibrary(PrebuiltLibrary const& lib, fs::path const& exampleDir) {
     return resolved;
 }
 
-// D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171) + nested extension: build ONE
+// THE RUNNER'S MULTI-ARTIFACT MODE (c171) + nested extension: build ONE
 // prerequisite LIBRARY artifact into `outDir`, RECURSIVELY building its own
 // nested `dependsOn` FIRST (into the same `outDir`) and threading their output
 // paths into THIS dep's `--resolve-library`. So a `-staticlib` dep listing a
@@ -1895,7 +1898,7 @@ resolvePrebuiltLibrary(PrebuiltLibrary const& lib, fs::path const& exampleDir) {
 // purpose: a defaulted parameter is exactly how a future call site would omit
 // them again in silence.
 //
-// [[D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM]] — this used to take
+// A `dependsOn` ENTRY HAD NO RELEASE-OPTIMIZER ARM — this used to take
 // NEITHER, so every prerequisite was built at the default configuration no
 // matter which arm asked for it. A `release` arm on a `dependsOn` example would
 // then optimize the EXECUTABLE and leave every static library it links on the
@@ -2105,7 +2108,7 @@ compileAndRunArm(fs::path const& exampleDir,
     // manifest typo fails loud here, not as a confusing driver error.
     //
     // ★★ THESE PATHS ARE ABSOLUTE, AND THAT IS ONE OF THE FOUR SHAPES A USER CAN
-    // TYPE (`D-HARNESS-EXAMPLE-RUNNERS-ALWAYS-COMPILE-AN-ABSOLUTE-SOURCE-PATH`).
+    // TYPE: BOTH EXAMPLE RUNNERS ALWAYS COMPILE AN ABSOLUTE SOURCE PATH.
     // `main.c`, `sub/main.c` and `./main.c` are the other three, and a corpus
     // that spells only one of them could not see
     // `D-PP-BARE-RELATIVE-MAIN-PATH-DEFEATS-THE-INCLUDER-DIRECTORY-SEARCH` — a
@@ -2222,7 +2225,7 @@ compileAndRunArm(fs::path const& exampleDir,
         }
     }
 
-    // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171) + nested extension: build each
+    // THE RUNNER'S MULTI-ARTIFACT MODE (c171) + nested extension: build each
     // prerequisite LIBRARY artifact FIRST (into the same out dir), recursively
     // building any nested `dependsOn` before it, then thread their paths into
     // the dependent build's `--resolve-library`. A dep (or nested-dep) build
@@ -2442,15 +2445,15 @@ compileAndRunArm(fs::path const& exampleDir,
         return armResult;
     }
 
-    // D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING: take the
+    // A RELEASE ARM BYTE-IDENTICAL TO THE BASELINE ASSERTS NOTHING: take the
     // image NOW. `scratch` is destroyed when this function returns, so this is
     // the last moment the artifact exists. Deliberately BEFORE the `runOn` and
     // emulator gates below: whether an image was TRANSFORMED is a question
     // about the COMPILE, and a machine that cannot spawn the binary can still
     // answer it. (The comparison itself still only happens when both arms ran —
     // an optimized arm is not even compiled when the baseline did not run, which
-    // is D-TEST-EXAMPLES-CROSS-HOST-RELEASE-ARM-NEVER-COMPILED's business, not
-    // this row's.)
+    // is the business of the cross-host release arm that is never compiled,
+    // not this one's.)
     auto captured = readArtifactBytes(artifactPath);
     // ★ CROSS-CHECKED AGAINST `file_size`, not merely non-empty. A SHORT READ is
     // the capture failure this mechanism is least able to survive: it produces a
@@ -2501,7 +2504,7 @@ compileAndRunArm(fs::path const& exampleDir,
     // emulator (e.g. qemu-aarch64 for an AArch64 ELF on x86_64). The
     // emulator is declared per-target in the manifest.
     //
-    // D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the two outcomes below used to
+    // A CROSS-ARCH SKIP YIELDS NO VERDICT: the two outcomes below used to
     // share one status and one shrug. They do not share a meaning. NO EMULATOR
     // DECLARED is a property of the MANIFEST — no machine can fix it, and
     // `lintDeclaredEmulators` reds it host-independently rather than leaving it
@@ -2538,15 +2541,16 @@ compileAndRunArm(fs::path const& exampleDir,
         launcherPrefix.push_back(emuPath);
     }
 
-    // ── D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY, closing-work item (2), first half ──
+    // ── QEMU_LD_PREFIX IS AMBIENT-ONLY: closing-work item (2), first half ────
     //
-    // ⚠ This is a PARTIAL discharge of an OPEN row, not its closure. That row
-    // asks for two things: (1) the harness DERIVES the guest sysroot instead of
-    // inheriting it ambiently, and (2) an exit-255 under an emulator is
+    // ⚠ This is a PARTIAL discharge, not a closure. TWO things are wanted:
+    // (1) the harness DERIVES the guest sysroot instead of inheriting it
+    // ambiently, and (2) an exit-255 under an emulator is
     // CLASSIFIED as an environment failure and quotes the loader line rather
     // than being presented as an exit-code mismatch. What follows is the cheap,
     // no-masking half of (2): the mismatch is still reported as a mismatch, but
-    // it now carries the remedy. Full classification still owes the row.
+    // it now carries the remedy. (1) and the classification half of (2) are
+    // still owed, and no registry row tracks them.
     //
     // Being on PATH is not the same as being ABLE TO RUN, and the gap between
     // those two facts costs an operator an afternoon. `qemu-aarch64` resolves
@@ -2573,7 +2577,7 @@ compileAndRunArm(fs::path const& exampleDir,
     // host-identity assumption in a harness that has none. It only makes the
     // red SAY what is most likely wrong. Turning this into a proper
     // `SkippedLauncherPrerequisiteMissing` verdict needs the guest's PT_INTERP
-    // read out of the artifact and probed; that is the registry row's work.
+    // read out of the artifact and probed; that is the work still owed.
     // The remedy text this condition earns is attached where the mismatch is
     // ASSERTED, in `runOneTarget` — see `qemuSysrootHint` below.
 
@@ -2637,7 +2641,8 @@ void runOneTarget(fs::path const&        exampleDir,
                                            "baseline");
     ledger.record(exampleId, t.spec, "baseline", baseline.verdict,
                   baseline.detail);
-    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // THE INTEGRATED RUNNER BUILDS ONLY THE HOST-RUNNABLE SPEC, SO ONE RUNNER
+    // SEES A CAPABILITY THE OTHER CANNOT.
     // ★★★ THE OBSERVATION THIS RUNNER IS THE ONLY ONE ABLE TO MAKE, AND WHICH
     // THE ARM VERDICT ERASES. A `runOn`-excluded target lands in the ledger as
     // `SkippedByRunOn` here AND in the CLI-subprocess sibling — but here it means
@@ -2650,9 +2655,9 @@ void runOneTarget(fs::path const&        exampleDir,
     if (baseline.spawnAttempted) coverage.spawned.push_back(t.spec);
     if (baseline.verdict == ArmVerdict::Ran) coverage.ran.push_back(t.spec);
     if (baseline.verdict != ArmVerdict::Ran) {
-        // D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the declared optimized arms
+        // A CROSS-ARCH SKIP YIELDS NO VERDICT: the declared optimized arms
         // are NOT compiled when the baseline does not run (the early return is
-        // also what D-TEST-EXAMPLES-CROSS-HOST-RELEASE-ARM-NEVER-COMPILED owns).
+        // also what leaves a cross-host release arm never compiled).
         // They are DECLARED work, so they get a verdict too rather than
         // vanishing from the accounting — carrying the baseline's reason, and
         // saying plainly that not even the compile was attempted.
@@ -2724,7 +2729,7 @@ void runOneTarget(fs::path const&        exampleDir,
         // the entry summary instead of as a check that quietly stopped looking.
         ++identity.armsThatRan;
 
-        // ── D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING ──
+        // ── A RELEASE ARM BYTE-IDENTICAL TO THE BASELINE ASSERTS NOTHING ──────
         //
         // Both arms ran, so both images exist as bytes. Ask whether the
         // pipeline changed anything at all BEFORE asserting that the program's
@@ -2750,7 +2755,7 @@ void runOneTarget(fs::path const&        exampleDir,
 
         // ── THE DEPENDENCY HALF OF THE SAME QUESTION ────────────────────────
         //
-        // [[D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM]]. The judgement
+        // A `dependsOn` ENTRY AND ITS OWN OPTIMIZER ARM. The judgement
         // above asked whether the pipeline changed the EXECUTABLE. On a
         // `dependsOn` example that is only part of the program: the
         // prerequisite libraries were compiled too, and an arm that optimized
@@ -2849,7 +2854,7 @@ void runErrorTarget(fs::path const&        exampleDir,
                     ExampleTarget const&   t,
                     std::string const&     exampleId,
                     ArmVerdictLedger&      ledger) {
-    // D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: an expect-error arm is VERIFIED
+    // A CROSS-ARCH SKIP YIELDS NO VERDICT: an expect-error arm is VERIFIED
     // without ever being spawned — its assertion is the exact diagnostic set
     // below, which is host-independent. Recorded up-front (rather than after
     // the asserts) so that an ASSERT_ returning early still leaves the arm
@@ -3014,7 +3019,7 @@ void runErrorTarget(fs::path const&        exampleDir,
 }
 
 // ── THE CORPUS SCRATCH TREE MUST BE PER BUILD TREE ──────────────────────────
-//   D-TEST-EXAMPLES-CORPUS-SCRATCH-IS-SHARED-BY-EVERY-BUILD-TREE
+//   IT USED TO BE SHARED BY EVERY BUILD TREE.
 //
 // Every arm below opens `ScratchDir{Location::InsideRepo, "examples"}`, and
 // that location is literally `<cwd>/test-scratch/examples/<pid>-<n>` — so the
@@ -3026,7 +3031,7 @@ void runErrorTarget(fs::path const&        exampleDir,
 // ⚠ WHAT THIS IS *NOT*. It is not a collision guard. `ScratchDir` claims its
 // slot with the SINGULAR `create_directory`, which is atomic in the OS, so two
 // processes cannot share a slot however many of them run at once
-// (`D-TEST-EXAMPLES-RUNNER-PARALLEL-CONTENTION-FLAKE`, closed). The defect this
+// (the runner's parallel-contention flake, closed). The defect this
 // refuses is a shared WRITE LOCATION, and the distinction matters because a
 // reader who thinks it is about collisions will conclude the parallel gate was
 // unsafe, which was measured to be false: two full 1347-entry corpus runs at
@@ -3098,7 +3103,8 @@ TEST(Examples, RunFromManifest) {
 
     ArmVerdictLedger      ledger;
     ArtifactIdentityTally identity;
-    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // THE INTEGRATED RUNNER BUILDS ONLY THE HOST-RUNNABLE SPEC, SO ONE RUNNER
+    // SEES A CAPABILITY THE OTHER CANNOT.
     // `declared` is filled from the manifest BEFORE the loop, so a target whose
     // build dies mid-way still appears as declared-and-uncompiled rather than
     // disappearing from the boundary judgement altogether.
@@ -3127,7 +3133,7 @@ TEST(Examples, RunFromManifest) {
     // what it did.
     std::cout << renderCoverageLine(coverage) << '\n';
 
-    // ── D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the ledger ───────────────
+    // ── A CROSS-ARCH SKIP YIELDS NO VERDICT: the ledger ───────────────────
     //
     // EVERY declared arm is now in `ledger`, and it is printed unconditionally.
     // ctest hides a passing test's stdout by default, which is precisely why
@@ -3175,7 +3181,7 @@ TEST(Examples, RunFromManifest) {
         }
     }
 
-    // ── D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING ─────
+    // ── A RELEASE ARM BYTE-IDENTICAL TO THE BASELINE ASSERTS NOTHING ─────────
     //
     // LAST in the body, deliberately: the assertion below is fatal, and the arm
     // ledger and the strict-verdict gate above are what a reader triages a red
@@ -3269,7 +3275,7 @@ TEST(RunHarnessStack, GenerousSpawnStackBumpIsWired) {
 #endif
 }
 
-// ── D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR: the corpus emulator lint ───
+// ── AN ARM64 ARM IN A MANIFEST WITH NO EMULATOR: the corpus lint ──────────
 //
 // Registered inside the ONE extra ctest entry (`examples/corpus-lints`, which
 // was named `examples/manifest-emulator-lint` until AP6 renamed it for the
@@ -3374,7 +3380,7 @@ TEST(ExamplesCorpusLint, StagesNestedSubdirectoriesWithContentIntact) {
     EXPECT_TRUE(findings.empty()) << findings;
 }
 
-// ── D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING ────────
+// ── A RELEASE ARM BYTE-IDENTICAL TO THE BASELINE ASSERTS NOTHING ────────────
 //
 // The two-direction pin for the optimized-vs-baseline identity check. Filed in
 // `ExamplesCorpusLint` (the one suite the per-example entries exclude and the
@@ -3593,7 +3599,7 @@ TEST(ExamplesCorpusLint, ByteIdenticalOptimizedArtifactIsDetectedBothWays) {
 
 // ── THE DEPENDENCY HALF OF THE SAME LEVER ──────────────────────────────────
 //
-// [[D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM]]. The arm-level lever above
+// A `dependsOn` ENTRY AND ITS OWN OPTIMIZER ARM. The arm-level lever above
 // compares the EXECUTABLE. That is enough to witness the prerequisite's
 // pipeline ONLY while every `main.c` in the corpus is trivial enough to give
 // the optimizer nothing of its own to do — because then the exec's only source
@@ -3935,7 +3941,7 @@ TEST(ExamplesCorpusLint, DependsOnEntryRefusesAnUnknownKeyAtEveryDepth) {
 //
 // Mirrored, refusal for refusal, by the CLI-subprocess sibling's
 // `runPrebuiltLibraryParserPin` — a manifest one runner accepts and the other
-// rejects is [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]].
+// rejects is exactly what the TWO RUNNERS MUST AGREE rule forbids.
 TEST(ExamplesCorpusLint, PrebuiltLibraryEntryIsRefusedUnlessItIsWitnessed) {
     ScratchDir sandbox{Location::Temp, "prebuilt-library-keys"};
     auto const dir = sandbox.path();
@@ -4152,9 +4158,9 @@ TEST(ExamplesCorpusLint, ManifestRefusesAnUnknownKeyAtTopLevelAndPerTarget) {
 //
 // WHAT CAN STILL REGRESS, and is therefore what this pins: a copy coming BACK.
 // That is not hypothetical here — this repo has paid for exactly that drift
-// twice (D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT,
-// D-TEST-SCOPED-ENV-DUPLICATED-THREE-WAYS), both times by someone adding a
-// local copy rather than reaching for the shared header. The three clauses are
+// twice (a cross-arch skip that yielded no verdict, and a scoped-env helper
+// duplicated three ways), both times by someone adding a local copy rather
+// than reaching for the shared header. The three clauses are
 // the three ways the single-definition property dies: the header stops
 // defining it, a runner starts defining it, or a runner stops including it.
 //
@@ -4243,7 +4249,7 @@ TEST(ExamplesCorpusLint, StagingPrimitiveLivesOnlyInTheSharedHeader) {
     }
 }
 
-// ── D-TEST-EXAMPLES-CORPUS-SCRATCH-IS-SHARED-BY-EVERY-BUILD-TREE ────────────
+// ── THE CORPUS SCRATCH TREE WAS SHARED BY EVERY BUILD TREE ──────────────────
 //
 // TWO CLAUSES, because the property has a runtime half and a structural half
 // and neither one implies the other.

@@ -322,8 +322,8 @@ TEST(Reporter, CapNoticeRemedyNamesBothTheCliFlagAndTheConfigField) {
     // a `std::string const&` through a VIEW TEMPORARY that dies at the end of
     // the full expression — clang reports it as `-Wdangling-gsl` ("object
     // backing the pointer will be destroyed at the end of the full-expression")
-    // and NEITHER MSVC NOR GCC SAYS A WORD
-    // (D-BUILD-CLANG-ONLY-WARNINGS-INVISIBLE-TO-THE-MSVC-AND-GCC-LEGS).
+    // and NEITHER MSVC NOR GCC SAYS A WORD, so a clang-only warning is
+    // invisible on the MSVC and GCC legs.
     // The bytes themselves live in the reporter's own vector, so the chained
     // spelling happened to read valid memory here — but only because nothing
     // reports again before the reads: one more `report()` may reallocate that

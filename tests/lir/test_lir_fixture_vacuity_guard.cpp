@@ -1,5 +1,5 @@
-// ★★★ THE INSTRUMENT'S OWN PIN —
-// D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO.
+// ★★★ THE INSTRUMENT'S OWN PIN — the front end lowered a many-arg call to
+// NOTHING, so every pin over it measured zero.
 //
 // `lowered_lir_fixture.hpp`'s `lowerCToLir` is the front end that ~20 files in
 // `tests/lir` and `tests/asm` drive. It used to return a `LoweredLir` and say

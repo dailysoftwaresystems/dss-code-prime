@@ -237,8 +237,8 @@ std::vector<std::string> const& tryAccessorNames() {
 
 // Which twin names occur in `text`. Factored out so the tree scan and the
 // self-test arm below run the IDENTICAL matcher — a guard whose ability to fail
-// is only asserted through a flag nobody passes has proved nothing about itself
-// (D-GATE-TWO-GUARDS-SELF-TEST-BEHIND-A-FLAG-NOBODY-PASSES).
+// is only asserted through a flag nobody passes has proved nothing about
+// itself.
 [[nodiscard]] std::set<std::string> twinNamesIn(std::string_view text) {
     std::set<std::string> hits;
     for (auto const& name : tryAccessorNames()) {
@@ -399,8 +399,8 @@ TEST(MirTryAccessors, EveryAbortingPayloadAccessorHasANonFatalTwin) {
 // fix, because `ASSERT_*` returns before the read. It is also not claimable
 // everywhere: `ASSERT_*` expands to `return;` and will not COMPILE in a
 // value-returning helper, which is precisely where the naked reads lived. There
-// is NO comment marker, NO allow-list and NO per-file exemption
-// [[D-GATE-TARGET-SCHEMA-PRODUCER-GUARD-CARRIED-AN-INERT-EXEMPTION]].
+// is NO comment marker, NO allow-list and NO per-file exemption — a sibling
+// producer guard carried one and it went INERT, refusing nothing.
 //
 // ⚠ KNOWN FALSE NEGATIVES, stated rather than discovered later: a read with no
 // opcode assertion anywhere near it; an assertion on a DIFFERENT SPELLING of the
@@ -621,7 +621,7 @@ TEST(MirTryAccessors, NoTestReadsAPayloadGuardedOnlyByANonFatalOpcodeExpect) {
     // disarmed-guard lesson demands: how many candidates actually REACH the
     // refusal. If a formatting or naming change stopped `EXPECT_*`+`instOpcode(`
     // statements being recognised, the tree arm would go green while refusing
-    // nothing at all [[D-GATE-TARGET-SCHEMA-PRODUCER-GUARD-CARRIED-AN-INERT-EXEMPTION]].
+    // nothing at all.
     EXPECT_GT(candidates, 100u)
         << "the matcher recognised implausibly few non-fatal opcode assertions "
            "across tests/ — it is no longer reaching its subjects";
@@ -640,10 +640,11 @@ TEST(MirTryAccessors, NoTestReadsAPayloadGuardedOnlyByANonFatalOpcodeExpect) {
 }
 
 // ★ THE SELF-TEST, IN THE SAME RUN AS THE CHECK ABOVE, through the IDENTICAL
-// matcher. A guard that only ever reports "found nothing" has proved nothing
-// about itself (D-GATE-TWO-GUARDS-SELF-TEST-BEHIND-A-FLAG-NOBODY-PASSES). Each
-// negative arm is a SHAPE THE TREE ACTUALLY CONTAINS, so a matcher that started
-// refusing them would be caught here rather than by 59 false failures.
+// matcher. A guard that only ever reports "found nothing", or whose ability to
+// fail is asserted only behind a flag nobody passes, has proved nothing about
+// itself. Each negative arm is a SHAPE THE TREE ACTUALLY CONTAINS, so a matcher
+// that started refusing them would be caught here rather than by 59 false
+// failures.
 TEST(MirTryAccessors, TheNonFatalOpcodeExpectMatcherFiresAndDiscriminates) {
     auto count = [](char const* src) { return expectThenFatalIn(src).offences.size(); };
 

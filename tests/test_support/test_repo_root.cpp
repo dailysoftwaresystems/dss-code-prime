@@ -96,7 +96,7 @@ TEST(RepoRoot, ValidConfigOverrideIsHonoured) {
 
 // ★★★ THE SPLIT ITSELF, and it is the assertion that lets the whole suite run
 // against a config-only snapshot.
-// D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED points
+// The per-run snapshot that ends the shipped-config exposure points
 // `$DSS_CONFIG_ROOT` at `<build>/dss-config-snapshot`, a root that holds
 // `src/dss-config` and `VERSION` and NOTHING ELSE. `repoRoot()` reaches
 // tests/corpus, tests/hir/lowering_goldens, examples/, scripts/, real-examples/

@@ -46,10 +46,10 @@ dss_add_test(NAME hir/test_hir_text_vocabulary_and_capability SOURCES test_hir_t
 dss_add_test(NAME hir/test_hir_text_operand_form_reaches_mir
              SOURCES test_hir_text_operand_form_reaches_mir.cpp)
 
-# D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT — the two
-# suites that DIED (0xC0000409, `__fastfail`) on an emptied shipped config must
-# now REPORT it. The property is how a test binary TERMINATES, and a process
-# cannot observe its own abort, so both subjects are spawned as CHILDREN.
+# A TORN SHIPPED CONFIG MUST RED A SUITE, NOT KILL IT: the two suites that DIED
+# (0xC0000409, `__fastfail`) on an emptied shipped config must now REPORT it.
+# The property is how a test binary TERMINATES, and a process cannot observe
+# its own abort, so both subjects are spawned as CHILDREN.
 #
 # ★ The paths are BAKED, not searched: `$<TARGET_FILE:…>` resolves to the real
 #   executable at generate time (with `.exe` on Windows) so this entry cannot

@@ -222,18 +222,17 @@ fresh context.
 
 ## D. Hard stops & gated anchors (always route through §B)
 
-- **OPT7 / inlining — roadmap `G-406` (plan 07); cross-CU sub-anchor `D-OPT7-1` (plan 22).**
+- **OPT7 / inlining — roadmap `G-406` (plan 07), with its cross-CU sub-anchor in plan 22.**
   First inter-procedural pass; touches linkage / DCE / cross-CU legality. Plan 07 marks it a
   **"HARD STOP boundary … supervised cycle when opened"** — so always halt and present a §B
   decision brief; never open autonomously.
-- **Trigger-gated anchors** (e.g. `D-OPT-MEMORYSSA-CLOBBER-WALK`,
-  `D-OPT4-1-NON-LINEAR-MARKER-MERGE`). A trigger-gated anchor is **NOT a TODO** — it means
+- **Trigger-gated anchors.** A trigger-gated anchor is **NOT a TODO** — it means
   "do not build until the trigger fires" (real-input failure, 3rd consumer, targeted
   backend). If its trigger has not fired, **skip it and report "trigger not fired"** — do
   not close it because it is next in a backlog. Backlog ordering is sequencing guidance, not
   a closure license.
-- **Correctness-critical anchors** (silent-miscompile class, e.g.
-  `D-OPT6-LICM-TRAP-SAFE-HOIST`). The closing cycle MUST ship a **negative miscompile-pin**:
+- **Correctness-critical anchors** (the silent-miscompile class — a trap-safe hoist, say).
+  The closing cycle MUST ship a **negative miscompile-pin**:
   a program that breaks (e.g. traps via div-by-zero) iff the transform mis-fires under a
   constructed input. If the pin cannot be constructed this cycle, **STOP** and bring a §B
   brief — do not ship on review alone.

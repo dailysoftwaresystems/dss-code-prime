@@ -249,7 +249,7 @@ dss_add_test(NAME program/test_shipped_runtime_compiles
              SOURCES test_shipped_runtime_compiles.cpp)
 
 # THE DRIVER'S **SUPPLYING** OF THE PIPELINE KERNEL'S DRIVER-DERIVED ARGUMENTS
-# (D-TEST-STATIC-LINK-UNIT-SUITE-CANNOT-WITNESS-A-DRIVER-THREADING-GAP). The
+# — A UNIT SUITE CANNOT WITNESS A DRIVER THREADING GAP. The
 # classification these pins witness lives in a block comment in
 # `src/program/compile_pipeline.hpp`, beside the exports it classifies.
 #
@@ -274,7 +274,7 @@ dss_add_test(NAME program/test_driver_argument_supply
              SOURCES test_driver_argument_supply.cpp)
 
 # THE FOUR SOURCE-ARGUMENT SHAPES A USER CAN TYPE
-# (D-HARNESS-EXAMPLE-RUNNERS-ALWAYS-COMPILE-AN-ABSOLUTE-SOURCE-PATH).
+# — BOTH EXAMPLE RUNNERS ALWAYS COMPILE AN ABSOLUTE SOURCE PATH.
 #
 # ★★★ DRIVER TIER BECAUSE THE SHAPE IS A PROPERTY OF THE INVOCATION, NOT OF AN
 # EXAMPLE. Both corpus runners construct an ABSOLUTE source path by
@@ -292,8 +292,8 @@ dss_add_test(NAME program/test_driver_argument_supply
 #
 # ⓘ ITS CLI-SUBPROCESS COUNTERPART is `runSourceArgumentShapePin` on the
 # `integrated_tests/cli-surface` entry. A capability that exists on one tier and
-# not the other is [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]]; these two land
-# together.
+# not the other is exactly what the TWO RUNNERS MUST AGREE rule forbids; these
+# two land together.
 dss_add_test(NAME program/test_source_argument_shape
              SOURCES test_source_argument_shape.cpp)
 

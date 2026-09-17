@@ -2,7 +2,8 @@
 
 // ── THE VOCABULARY-PROJECTION PROBE, WITH ONE OWNER ─────────────────────────
 //
-// D-TEST-VOCABULARY-PROJECTION-PROBE-HELPERS-ARE-COPIED-PER-FILE.
+// THE DEFECT THIS ENDS: these probe helpers were COPIED PER FILE, so they
+// drifted per file.
 //
 // ★★★ WHY THIS HEADER EXISTS, AND WHY THE IRONY IS THE POINT RATHER THAN A
 // JOKE. Every file that includes this one exists BECAUSE A SPELLING HAD TWO
@@ -30,15 +31,16 @@
 // QUOTED TOKEN, had to be made in three places or the three files would
 // silently measure different things. This header is the one place.
 //
-// ✔ THE FOURTH COPY IS ROUTED (2026-08-23, cycle P28,
-// D-TEST-VOCABULARY-PROBE-HELPER-FOURTH-COPY-OUTSIDE-THE-EXTRACTED-HEADER).
+// ✔ THE FOURTH COPY — the one that sat OUTSIDE this extracted header — IS
+// ROUTED (2026-08-23, cycle P28).
 // `tests/core/test_vocabulary_projection_ffi_and_lir.cpp` carried a `quotedTokens`
-// that was BYTE-IDENTICAL to this one, so the mutant that closed the parent row
-// reddened 3 of 4 and that file stayed green over a helper that no longer worked.
+// that was BYTE-IDENTICAL to this one, so the mutant that ended the per-file
+// copying reddened 3 of 4 and that file stayed green over a helper that no
+// longer worked.
 // It includes this header now and the same mutant reds 4 of 4.
 //
-// ✔ AND THE CLASS IS NOW UNIVERSAL (2026-08-23, cycle P28,
-// D-TEST-VOCABULARY-PROBE-MESSAGE-HALF-IS-UNREACHABLE-AND-JSON-COUPLED), by
+// ✔ AND THE CLASS IS NOW UNIVERSAL (2026-08-23, cycle P28) — the probe's
+// MESSAGE half was UNREACHABLE and JSON-COUPLED, and was fixed by
 // SPLITTING rather than by relocating. This file kept two unrelated jobs — it
 // LOCATES a shipped config document, and it READS A DIAGNOSTIC BACK — and only
 // the first needs `nlohmann/json.hpp`. Two measured obstacles, neither of them

@@ -471,15 +471,15 @@ TEST(TypeRules, EnumPromotesToUnderlyingInArith) {
         << "enum + same-enum → the underlying int";
 }
 
-// D-UAC-SHIFT-RESULT-RULE-CONFIG: `shiftResultType` is the SINGLE chokepoint
-// both the CST→HIR shift lowering and the semantic-tier expression typer route
-// through, so the config verb `shiftResult` cannot be read inconsistently. The
-// verb picks the result type: `promotedLeft` (C 6.5.7) → the promoted LEFT
-// operand (`i32 << i64` is I32, the count's type never contributes);
-// `commonType` → the usual-arithmetic common type (`i32 << i64` is I64). RED-ON-
-// DISABLE: the I32↔I64 flip when ONLY the verb changes — a dead read would peg
-// both arms at promotedLeft's I32 (or a divergent edit to one tier would let
-// the two disagree; routing both through this one function forecloses that).
+// `shiftResultType` is the SINGLE chokepoint both the CST→HIR shift lowering
+// and the semantic-tier expression typer route through, so the config verb
+// `shiftResult` cannot be read inconsistently. The verb picks the result type:
+// `promotedLeft` (C 6.5.7) → the promoted LEFT operand (`i32 << i64` is I32,
+// the count's type never contributes); `commonType` → the usual-arithmetic
+// common type (`i32 << i64` is I64). RED-ON-DISABLE: the I32↔I64 flip when ONLY
+// the verb changes — a dead read would peg both arms at promotedLeft's I32 (or
+// a divergent edit to one tier would let the two disagree; routing both through
+// this one function forecloses that).
 TEST(TypeRules, ShiftResultRuleSelectsByVerb) {
     auto in  = makeInterner();
     auto i32 = in.primitive(TypeKind::I32);

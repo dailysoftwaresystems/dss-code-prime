@@ -80,7 +80,7 @@ DATE-STAMP.** A previous pass did try annotating the rotting number instead of r
 numbers where before there was one, and the caveat lent the second one credibility. A caveat beside
 a stale figure is just a second stale figure. ⇒ the repo's own standing rule is the only stable
 form: *"never re-quote a gate figure — RE-MEASURE at the commit that carries it."*
-Species: [[D-PLANS-SKILL-REFERENCE-ASSERTS-UNRECHECKED-STATUS]].
+Species: a skill reference asserting a status nobody re-checked.
 
 ### Where status actually comes from
 

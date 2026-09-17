@@ -1795,8 +1795,10 @@ TEST(Program_Transpile, SuppressedPlanNotLandedStillReturnsNonZero) {
 // fail. The H1 fix's load-bearing path is suppressible per-target
 // diagnostics; pinning it requires a suppressible per-target
 // emitter, which doesn't exist in the c path today.
-// Anchored as D-H1-SUPPRESSIBLE-PER-TARGET-PIN (trigger: first
-// suppressible code that fires reliably on the per-target path).
+// DEFERRED, and no registry row tracks it: the pin needs a
+// suppressible per-target emitter, so it becomes writable only
+// with the first suppressible code that fires reliably on the
+// per-target path.
 // ★★ P65 — RE-POINTED, AND THIS ONE'S SUBJECT IS THE CODE ITSELF, which is why
 // it could NOT take a different failure. The claim is that
 // `H_ExternHasInitializer` specifically stays visible through the whole

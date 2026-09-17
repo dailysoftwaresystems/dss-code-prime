@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# PURPOSE: refuse a raw coordinate conversion in src/lsp/ outside lsp_coordinates.cpp — the anti-regression device for D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES.
+# PURPOSE: refuse a raw coordinate conversion in src/lsp/ outside lsp_coordinates.cpp — the anti-regression device for LSP positions resolved in synthesized preprocessor coordinates.
 """Keep `src/lsp/` unable to re-acquire the defect it just lost.
 
 ════════════════════════════════════════════════════════════════════════════

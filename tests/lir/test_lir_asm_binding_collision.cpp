@@ -34,8 +34,9 @@
 // lowering that refuses every named operand.
 //
 // ⚠ CONFIG-LEVEL: `dss_add_test` sets `DSS_CONFIG_ROOT`, so this file must run
-// through ctest and never as a bare `.exe`
-// (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+// through ctest and never as a bare `.exe` -- a bare run falls back to a cwd
+// walk and can read a DIFFERENT config tree, which turns a red-on-disable
+// arm green for the wrong reason.
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/strong_ids.hpp"

@@ -313,9 +313,7 @@ separate numbers in the cycle report — a single total hides exactly the thing 
 ### ⚠ A row that is SHIPPED but not marked ✅ is an anchor "rising" for free
 
 ✔MEASURED 2026-08-26, and it is why this warning is here rather than in prose somewhere: of the
-15 `D-OPT*` rows the instrument reported OPEN, **three were shipped work** —
-`D-OPT-NOOPTIMIZE-NEUTERS-POLICY`, `D-OPT-REBUILD-POLICY-NEUTERED-STATE-HOOK`, and
-`D-OPT-REBUILD-MANDATORY-NORMALIZATION`, each whose own status cell opens with
+15 `D-OPT*` rows the instrument reported OPEN, **three were shipped work**, each whose own status cell opens with
 *"🟢 DESIGN RECORD — SHIPPED 2026-07-29 (TF-C85), NOT deferred work"*, and each verified present
 in the tree (`onFunctionNeutered`, `mandatoryNormalization`, the `funcNoOptimize` neuter, with
 their pins). **They counted as OPEN solely because the status cell begins with 🟢 instead of ✅**
@@ -351,13 +349,13 @@ naming them explicitly. "Next cycle will notice" is the follow-up culture this s
 
 ⚠⚠ **AND THE BALANCE GATE IS BLIND TO HALF OF IT. `check-anchor-balance` COUNTS *ROWS*, so an
 anchor cited in source with NO ROW IS INVISIBLE TO IT.** ✔MEASURED P40: it reported **"opened 0"**
-while a finished lane had cited `D-PP-PREDEFINE-REDEFINITION-PARTITION` across **six** files with
+while a finished lane had cited a minted anchor id across **six** files with
 no row anywhere in `.plans/`. Only `scripts/check-anchor-registry/check-anchor-registry.sh` catches
 that class, and there it is the one telling the truth.
 ⇒ **Run BOTH before calling a cycle clean. A green balance is NOT evidence that nothing was
 opened.**
 
-✔MEASURED P40, the sideways-move class: `D-FULLC-STDBIT-ADDRESSABLE-FN` was **re-verdicted** from
+✔MEASURED P40, the sideways-move class: a row was **re-verdicted** from
 *"⏳ DEFERRED, trigger-gated"* to plain 🟠 OPEN by a lane that then exited — better described, still
 open. **"Re-verdicted" is not closed**, exactly as *"refused but not fixed"* is not.
 
@@ -651,7 +649,7 @@ Four clauses, and each is measured rather than asserted — detail in `reference
 2. ⚠ **The MAX_PATH budget is now SPENT, not slack.** The move costs **46 characters** on every
    build path: longest build-relative suffix **163**, so `C:/dssp40k` had **87 spare** and
    `.worktrees/k` has **46**. `lane-worktree.sh` refuses by arithmetic any root leaving under 20,
-   naming `D-CYCLE-WORKTREE-UNDER-THE-SESSION-SCRATCH-PATH-CANNOT-BE-BUILT-ON-WINDOWS` — the defect
+   naming in the refusal the anchor for a worktree root that cannot be built on Windows — the defect
    whose failure mode is a per-TU compile error in files the lane never touched.
    ⇒ **Keep lane names SHORT** (`k`, `l`, `rod`); a descriptive name spends that margin.
 3. **The lane that takes a worktree owns removing it**, via `remove` — which prunes, because a stale
@@ -698,8 +696,8 @@ lane's own authority, it is discovering the gate does not apply.
   measurement **in the row** and **flags it in the cycle report** so the operator can veto;
 - an **INCONCLUSIVE** measurement escalates. **Silence is never a discharge.**
 
-✔The case that produced this ruling: `D-CSUBSET-INLINE-ASM-SPELLING` was pinned §B because bare
-`asm` "needs a new standard-mode axis". A lane measured that DSS already declares GNU mode in the
+✔The case that produced this ruling: bare `asm` was pinned §B because the spelling
+"needs a new standard-mode axis". A lane measured that DSS already declares GNU mode in the
 reference compilers' own machine-readable spelling (defines `__GNUC__`/`__clang__`, does **not**
 define `__STRICT_ANSI__`) — so no axis exists or was added, and the predicate was false. It also
 measured that DSS was **accepting `int asm = 42;`**, which no reference compiler accepts in GNU
@@ -737,12 +735,12 @@ to building counts**, so the honest response is to build it now, not to record t
 
 ★ **Prefer a prerequisite that unblocks MORE THAN ONE row, and name which when you pick it.**
 ✔The case that produced the ruling: an escape-analysis / points-to substrate for `mirMayAlias` is
-the stated trigger for `D-OPT-MEMSSA-WALK-PAST-PRECISION` **and** the stated prerequisite for
-`D-OPT7-INLINE-LEGALITY-GATE` clause (c). One substrate, two rows.
+the stated trigger for the MemorySSA walk-past-precision row **and** the stated prerequisite for
+clause (c) of the **OPT7 / inlining** legality gate. One substrate, two rows.
 
 ⚠ **CHECK THE TREE BEFORE CALLING THE PREREQUISITE MISSING.** ✔MEASURED 2026-08-26: DSS's HIR
 intrinsic registry was about to be described as absent. It EXISTS — `HirIntrinsicRegistry`,
-`Hir::intrinsicRegistry()`, `makeIntrinsicCall`, and a shipped `D-CSUBSET-INTRINSIC-UMULH`
+`Hir::intrinsicRegistry()`, `makeIntrinsicCall`, and a shipped `umulh`
 builtin-intrinsic node. Only the *routing* of a shipped C construct through it is missing, which
 is a far smaller job than the row implied.
 
@@ -771,8 +769,8 @@ hand-typing every edit or reading every subsystem.
    baseline (`cmake --build build`, then full `ctest`). **A red baseline with no WIP-repair context
    is itself a pause gate** — present it; do not silently "fix it".
 
-   ★★★ **AND READ CI. NO STEP OF THIS SKILL USED TO, AND TWO LEGS STAYED RED FOR SIX MATRIX RUNS.**
-   [[D-CI-TWO-RELEASE-LEGS-HAVE-BEEN-RED-FOR-TEN-DAYS-WHILE-EVERY-LOCAL-LEG-WAS-GREEN]].
+   ★★★ **AND READ CI. NO STEP OF THIS SKILL USED TO, AND TWO RELEASE LEGS STAYED RED FOR TEN DAYS
+   — SIX MATRIX RUNS — WHILE EVERY LOCAL LEG WAS GREEN.**
    ✔MEASURED 2026-09-14: the PR's Pipeline had been red on **every** run that executed the matrix,
    with two legs failing at `Test` while the four-leg local gate was 2179/2178/2148/2148 GREEN at
    the very same commit — because **no configuration either red leg runs in is one the local gate
@@ -834,8 +832,7 @@ hand-typing every edit or reading every subsystem.
    `src/dss-config/**` is a FILE SET like any other, and a config document is an INPUT to
    every lane's build. Editing one while a lane is running does not merely risk a merge
    conflict — it changes what that lane's binaries MEAN between two runs.
-   ⚠ ✔MEASURED 2026-08-20 (cycle P22,
-   `D-CYCLE-CONFIG-EDITS-NOT-SEQUENCED-AGAINST-LANE-OWNERSHIP`): the orchestrator
+   ⚠ ✔MEASURED 2026-08-20 (cycle P22): the orchestrator
    corrected a relocation `nativeId` while a lane was mid
    red-on-disable run. A test's verdict flipped between two runs of the same binary, and the
    lane reported a stale tree as a defect in its final report. **The damage is not the wasted
@@ -847,7 +844,7 @@ hand-typing every edit or reading every subsystem.
    report and the tree disagree, suspect the SEQUENCING before suspecting the lane.
    ★★★★ **HANDING `src/dss-config/**` TO A LANE DOES NOT FIX THIS — IT ONLY MOVES WHOSE
    HAND IS ON IT, AND ✔THE HAZARD RECURRED THAT WAY ON 2026-08-26 (cycle P38).** The P22
-   row [[D-CYCLE-CONFIG-EDITS-NOT-SEQUENCED-AGAINST-LANE-OWNERSHIP]] is CLOSED and the
+   row above is CLOSED and the
    mechanism it built is sound; what recurred was the SCHEDULING. A lane was given
    `src/dss-config/targets/**` + `src/core/types/target_schema.*` and run CONCURRENTLY
    with three lanes that gate — so `test_support/test_config_snapshot` reddened in one
@@ -865,7 +862,7 @@ hand-typing every edit or reading every subsystem.
    SEQUENCING finding, and the integration gate, not the lane, is what settles it.
    ★★ **AND THE TREE THAT RULE NAMES IS TOO NARROW: `.plans/**` IS AN INPUT TO A
    GUARD, AND A GUARD IS A CTEST ENTRY, SO EVERY LANE'S GATE READS IT.**
-   ⚠ ✔MEASURED 2026-08-24 (cycle P31, `D-CYCLE-THE-ORCHESTRATOR-EDITED-PLANS-UNDER-A-RUNNING-LANE-AND-FLIPPED-ITS-GATE`):
+   ⚠ ✔MEASURED 2026-08-24 (cycle P31):
    a lane's `plan_citations_guard` was RED in one gate and GREEN in the next **with no edit
    of its own in between**, because the orchestrator applied registry rows and re-baselined
    the citation ratchet while that gate was in flight. `anchor_registry_guard`,
@@ -895,8 +892,7 @@ hand-typing every edit or reading every subsystem.
    one-root rule). `scripts/local-build/local-build.{sh,ps1} --tree <name>` takes one.
    ★★ **AND A LANE THAT WRITES SCRATCH FILES GETS ITS OWN SCRATCH DIRECTORY.** The per-lane
    BUILD tree isolates artifacts; it isolates neither the scratchpad nor the working tree.
-   ⚠ ✔MEASURED 2026-08-20 (cycle P23,
-   `D-CYCLE-LANE-SCRATCHPADS-ARE-SHARED-AND-LANES-CLOBBER-EACH-OTHER`):
+   ⚠ ✔MEASURED 2026-08-20 (cycle P23):
    four lanes were given one `scratchpad/<cycle>/` directory, one lane's
    mutation harness was OVERWRITTEN by another lane's file of the same name mid-run, and the
    next three red-on-disable cycles executed the WRONG SCRIPT with the first lane's arguments.
@@ -937,14 +933,13 @@ hand-typing every edit or reading every subsystem.
    fix is one command: run the invocation once before pasting it into a brief.
    ★★ **AND THE SAME STANDARD BINDS A MECHANISM, NOT ONLY AN INTERFACE: A BRIEF THAT NAMES THE
    FIELD A DECISION READS, OR THE ROLE A VALUE CARRIES, IS MAKING A MEASUREMENT AND OWES AN
-   INSTRUMENT.** ⚠ ✔MEASURED 2026-08-20 (cycle P23,
-   `D-CYCLE-BRIEF-ROUTED-A-DECISION-ONTO-A-FIELD-THAT-DOES-NOT-DISCRIMINATE`): a brief told a lane
+   INSTRUMENT.** ⚠ ✔MEASURED 2026-08-20 (cycle P23): a brief told a lane
    to route the COFF weak-external decision on the auxiliary record's `Characteristics` field. gcc
    emits `Characteristics = 1` for **all four** weak shapes, so routing on it would have classified
    every gcc weak DEFINITION as unresolvable — *precisely the defect the lane existed to fix*. The
-   field that discriminates is the record's own `TagIndex`. ★ **This is the same trap as
-   `D-LK-MACHO-ISDATA-NO-CALL-SIGNAL` (a relocation's arithmetic substituted for its role) and as
-   `D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE`'s revisit condition (a front-end feature substituted
+   field that discriminates is the record's own `TagIndex`. ★ **This is the same trap as the
+   Mach-O `isData` no-call-signal case (a relocation's arithmetic substituted for its role) and as
+   the PE `/ALTERNATENAME` declare-and-refuse revisit condition (a front-end feature substituted
    for the existence of a caller). The trap is not any particular field — it is reaching for
    whichever field sits nearest the decision and assuming it carries it.** Where a brief cannot
    supply an instrument, it says *"unmeasured, verify first"* rather than stating the fact flat.
@@ -959,8 +954,7 @@ hand-typing every edit or reading every subsystem.
    APPEND-ONLY — AND SAYS SO.** A new `test_*.cpp` cannot RUN without a `dss_add_test` block, and
    that file belongs to the directory rather than to any lane, so a brief that lists the test file
    and not its registration leaves the lane a choice between not landing the test and editing an
-   unowned file. ⚠ ✔MEASURED 2026-08-20 (cycle P23,
-   `D-CYCLE-BRIEF-ASSIGNS-A-TEST-FILE-WITHOUT-ITS-BUILD-REGISTRATION`): four lanes added tests and
+   unowned file. ⚠ ✔MEASURED 2026-08-20 (cycle P23): four lanes added tests and
    three shared `CMakeLists.txt` files were each edited by lanes that had not been given them.
    Append-only edits merged cleanly; the damage came from ONE lane rewriting a whole file in CRLF,
    reddening `line_endings_guard` for three other lanes' work and leaving a diff nobody could claim.
@@ -969,7 +963,7 @@ hand-typing every edit or reading every subsystem.
    ★★ **A MESSAGE TO A LIVE LANE RE-STATES THAT LANE'S SUBJECT AND OWNED PATHS, IN ITS
    OPENING LINES.** A lane handle is an opaque id; several lanes run at once; and a message from
    the orchestrator carries the orchestrator's authority. ⚠ ✔MEASURED 2026-08-20 (cycle
-   P23, `D-CYCLE-A-LANE-MESSAGE-DELIVERED-TO-THE-WRONG-LANE`): an ownership-NARROWING message
+   P23): an ownership-NARROWING message
    — reassigning a file set and asserting *"your scope was always X"* — was delivered to
    the wrong lane. Had it been obeyed, two lanes would have edited one file set and BOTH reports
    would have become unattributable, which is the same damage class as editing a lane's config
@@ -984,8 +978,7 @@ hand-typing every edit or reading every subsystem.
    registry row text, its red-on-disable transcript, its md5s and any number the fold will quote come
    back INLINE in the reply. `scratchpad/<cycle>/<lane>/` keeps its P23 job — a private place for
    harnesses and intermediates — and stops being a place a RESULT is left.
-   ⚠ ✔MEASURED 2026-08-24 (cycle P31,
-   `D-CYCLE-A-LANE-DELIVERABLE-LEFT-IN-THE-SCRATCHPAD-IS-INVISIBLE-TO-THE-FOLD`): TWO lanes in one
+   ⚠ ✔MEASURED 2026-08-24 (cycle P31): TWO lanes in one
    cycle reported by citing a path, and both paths were empty when the orchestrator read them — one
    of them holding the lane's **registry row**, which IS that lane's deliverable, and the other a
    483-row byte-identity baseline taken at a named commit.
@@ -1004,7 +997,7 @@ hand-typing every edit or reading every subsystem.
    `clean` / `reset` because the tree is shared, and that prohibition is correct and stays
    BLANKET. ⚠ But it was SILENT about a need it creates: a lane that corrupts its own
    exclusively-owned file has no way back except the one thing it is forbidden to do.
-   ✔MEASURED 2026-08-24 (cycle P31, `D-CYCLE-THE-NEVER-CHECKOUT-RULE-LEAVES-A-LANE-NO-WAY-TO-UNDO-ITS-OWN-EDIT`):
+   ✔MEASURED 2026-08-24 (cycle P31):
    a lane ran `git checkout -- <its own config file>` to undo a malformed patch of its own, then
    disclosed it unprompted. ★ **The disclosure is the only reason anyone knows** — a restored
    file looks exactly like a file that was never edited, so this violation leaves nothing in any
@@ -1017,7 +1010,7 @@ hand-typing every edit or reading every subsystem.
    it owns, which is the case the rule exists for.
    ★★ **A BYTE-IDENTITY BASELINE IS TAKEN AS AN ISOLATING PAIR, NEVER INHERITED —
    AND IN A SHARED TREE ITS SHELF LIFE IS MEASURED IN HOURS.**
-   ⚠ ✔MEASURED 2026-08-24 (cycle P31, `D-CYCLE-A-BYTE-IDENTITY-BASELINE-EXPIRES-WHEN-THE-SHARED-TREE-MOVES`):
+   ⚠ ✔MEASURED 2026-08-24 (cycle P31):
    a lane diffed a predecessor's 483-row baseline, taken two hours earlier at the same commit, and
    got **13 differing lines with 8 examples flipping to NO-ARTIFACT — none of them its own**. A
    sibling lane's front-end work had landed in between, while the instrument's `cfgroot` snapshot
@@ -1268,7 +1261,7 @@ commit messages, and code comments alike.
 ✗  src/mir/lowering.cpp  + a line number    <- moves the instant anything above it changes
 ✓  src/mir/lowering.cpp — lowerCallArgs()
 ✓  tests/CMakeLists.txt — the `no RUN_SERIAL` rationale block
-✓  [[D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES]]
+✓  a defined anchor id, when a registry row is the subject
 ```
 
 **A symbol survives every edit above it; a line number survives none** — and the failure mode is the
@@ -1313,7 +1306,7 @@ measured defect behind a rule written to stop *new pass development*.
 Touching a gated subsystem's source does not by itself make it a capability; the OPT7 gate is about
 opening the inter-procedural *arc*, not about every line in `src/opt/`.
 
-- **OPT7 / inlining** (`G-406`, sub-anchor `D-OPT7-1`) — first inter-procedural pass, touches
+- **OPT7 / inlining** (`G-406`, plus its cross-CU sub-anchor) — first inter-procedural pass, touches
   linkage / DCE / cross-CU legality. A supervised cycle; **never open autonomously.**
   ⇒ **Gated: opening the arc.** ⇒ **NOT gated: fixing a defect in inlining that already ships**,
   per the ruling above.

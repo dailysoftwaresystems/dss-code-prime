@@ -1,4 +1,5 @@
-// D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS — the permanent pin.
+// DRAINING A CAPTURE PIPE ONLY AFTER THE CHILD EXITS DEADLOCKS — the permanent
+// pin.
 //
 // THE DEFECT (measured 2026-08-04, TF-C114). `runBinary(captureStdout=true)`
 // created an anonymous pipe, spawned the child, waited for the child to EXIT,
@@ -122,7 +123,7 @@ TEST(RunBinaryCapture, ALargeChildIsDrainedConcurrentlyAndNotDeadlocked) {
     EXPECT_FALSE(r.timedOut)
         << "runBinary TIMED OUT capturing " << kPayloadBytes
         << " bytes after " << elapsedMs << " ms. That is the drain-after-exit"
-           " deadlock (D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS): the child"
+           " deadlock: the child"
            " is blocked writing into a pipe nobody is reading, and the harness"
            " then kills it and reports the stall as the CHILD's fault."
            "  diagnostic: "
@@ -162,7 +163,7 @@ TEST(RunBinaryCapture, ASmallChildStillRoundTripsItsBytes) {
     EXPECT_EQ(r.exitCode, 0u);
 }
 
-// ── D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY — the sysroot-derivation pins ───────
+// ── `QEMU_LD_PREFIX` IS AMBIENT-ONLY — the sysroot-derivation pins ─────────
 //
 // THE DEFECT, and it has now fired twice with an identical signature.
 // `qemu-aarch64` being on PATH does not mean it can RUN anything: a
@@ -564,8 +565,8 @@ TEST(QemuGuestSysroot, RunBinaryRefusesTheSpawnAndSaysWhichVariableIsUnset) {
     // `spawnAndWait` calls `ensureQemuGuestSysroot` BEFORE a single handle
     // exists — so on this arm the function returns its refusal without ever
     // creating a process, and nothing is ever waited on. A wall-clock deadline
-    // is therefore standing in for a CONDITION here
-    // ([[D-TEST-WALL-CLOCK-DEADLINE-STANDS-IN-FOR-A-CONDITION-ON-A-REFUSAL-PATH]]);
+    // is therefore standing in for a CONDITION here, on a refusal path — which
+    // is a shape to state, never to leave implied;
     // the condition is what `EXPECT_FALSE(result.spawned)` below asserts, and if
     // this budget is ever actually spent that assertion is what reds. The shared
     // cap is passed so no unmeasured number exists on a line that cannot use one.

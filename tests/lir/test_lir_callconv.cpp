@@ -1565,8 +1565,8 @@ TEST(LirCallconvAbi, SingleArgFunctionEmitsMovFromArgGpr0) {
 TEST(LirCallconvAbi, MsX64CcDoesNotDeclareVariadicVectorCountReg) {
     // D-LANG-VARIADIC (step 13.4) post-fold MEDIUM-2: Win64 ms_x64
     // has NO equivalent to SysV's AL-count register — the loader
-    // ABI uses vararg double-spill (anchored
-    // D-ML7-VARIADIC-WIN64-DOUBLE-SPILL). A regression that copy-
+    // ABI uses vararg double-spill instead, which DSS does not yet
+    // implement. A regression that copy-
     // pasted SysV's `variadicVectorCountReg: rax` into the ms_x64
     // entry would silently emit a wrong-cc count-mov at every printf
     // call from a Windows-targeted binary. Pin: the ms_x64 cc field
@@ -1579,8 +1579,8 @@ TEST(LirCallconvAbi, MsX64CcDoesNotDeclareVariadicVectorCountReg) {
     EXPECT_FALSE(msX64->variadicVectorCountReg.has_value())
         << "Win64 ms_x64 has NO caller-side variadic vector-count "
            "register — the count-mov path is SysV-specific. A future "
-           "Win64 vararg-double-spill implementation goes through "
-           "D-ML7-VARIADIC-WIN64-DOUBLE-SPILL, NOT this field.";
+           "Win64 vararg-double-spill implementation goes through the "
+           "double-spill path, NOT this field.";
 }
 
 TEST(LirCallconvAbi, SysVCcDeclaresVariadicVectorCountReg) {
@@ -2537,7 +2537,8 @@ TEST(LirCallconvAbi, SysVSevenArgFunctionStackPassesOverflowArg) {
     EXPECT_EQ(::dss::test_support::countCode(
                   ccRep, DiagnosticCode::L_StackPassedArgUnsupported),
               0u)
-        << "stack-passed guard must NOT fire on D-ML7-2.2-closed substrate";
+        << "stack-passed guard must NOT fire on the substrate plan-12 step "
+           "ML7 cycle 2.2 closed";
 
     // f7's frame must reserve outgoing-args area sized for the
     // function's CALLS (none — f7 is leaf), but its non-leaf flag
@@ -2604,7 +2605,8 @@ TEST(LirCallconvAbi, SysVSevenArgFunctionStackPassesOverflowArg) {
 }
 
 TEST(LirCallconvAbi, Win64FiveArgFunctionStackPassesViaSlotAligned) {
-    // D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7 (closed co-with-D-ML7-2.2, 2026-06-02): Win64 ms_x64
+    // D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7
+    // (closed alongside plan-12 step ML7 cycle 2.2, 2026-06-02): Win64 ms_x64
     // has 4 GPR arg registers (rcx/rdx/r8/r9). A 5-arg int function
     // overflows arg 4 onto the stack. Under slot-aligned semantics,
     // arg-4 lands at [rsp + shadowSpaceBytes + 0 * slotSize] =
@@ -5216,17 +5218,18 @@ TEST(LirCallconv, Aarch64HighStackDoubleParamUsesScaledFpFrameLoad) {
 
 // ── THE OUTGOING-ARGUMENT STORE TWIN OF THE ARM ABOVE ──────────────────────
 //
-// ★★ THIS PIN EXISTS AGAIN, AND ITS ABSENCE WAS THE WHOLE OF
-// D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO.
+// ★★ THIS PIN EXISTS AGAIN, AND ITS ABSENCE WAS THE WHOLE DEFECT: the front end
+// lowered a many-arg call to NOTHING, so the pins over it measured zero.
 // Lane `fo` wrote it in P47, measured ZERO scaled stores, and REMOVED it rather
-// than ship a green test about nothing — the correct call, and the row was
-// filed from it. What the row could not see is WHY: `lowerCToLir` passed a NULL
-// `ffiMap`, so the `double g(...);` PROTOTYPE this source needs was refused at
-// HIR->MIR, the call to it was dropped as an unbound Ref, and the module `fo`
-// measured had no call in it at all. `mirReporter` carried both errors and
-// `HirToMirResult.ok` was FALSE the entire time; the fixture returned them
-// unread. The map is threaded now and the fixture states its verdict, so the
-// same source lowers the same forty stores the CLI always emitted.
+// than ship a green test about nothing — the correct call, and the finding was
+// filed from it. What that finding could not see is WHY: `lowerCToLir` passed
+// a NULL `ffiMap`, so the `double g(...);` PROTOTYPE this source needs was
+// refused at HIR->MIR, the call to it was dropped as an unbound Ref, and the
+// module `fo` measured had no call in it at all. `mirReporter` carried both
+// errors and `HirToMirResult.ok` was FALSE the entire time; the fixture
+// returned them unread. The map is threaded now and the fixture states its
+// verdict, so the same source lowers the same forty stores the CLI always
+// emitted.
 //
 // ⚠ THE ARGUMENT COUNT WAS NEVER THE TRIGGER. `Aarch64HighStackDoubleParamUses
 // ScaledFpFrameLoad` above passes the identical eighty doubles as PARAMETERS

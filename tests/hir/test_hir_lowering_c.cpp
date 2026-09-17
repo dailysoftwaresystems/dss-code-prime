@@ -15,7 +15,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
-#include "core/types/target_schema.hpp"   // D-TEST-THE-HIR-LOWERING-FIXTURE-ANALYZES-WITH-NO-TARGET-IN-SCOPE
+#include "core/types/target_schema.hpp"   // this file's fixtures analyze WITH a target in scope
 #include "core/types/wide_string_encode.hpp"   // elementByteWidth (assert unit COUNTS, not format-specific bytes)
 #include "hir/const_eval.hpp"
 #include "hir/hir.hpp"
@@ -59,9 +59,8 @@ namespace {
     return n;
 }
 
-// D-TEST-THE-HIR-LOWERING-FIXTURE-ANALYZES-WITH-NO-TARGET-IN-SCOPE: the shipped
-// `x86_64` target document + the `sysv_amd64` va_list strategy this file's fixtures
-// analyze under, OWNED for the whole process.
+// The shipped `x86_64` target document + the `sysv_amd64` va_list strategy this
+// file's fixtures analyze under, OWNED for the whole process.
 //
 // ★★ WHY A PROCESS-LIFETIME OWNER AND NOT A LOCAL. `analyze` takes the target
 // NON-OWNING and the returned `SemanticModel` REPUBLISHES it as `model.target()`
@@ -104,8 +103,7 @@ namespace {
 // Drive: c source → CompilationUnit → SemanticModel. Asserts the front
 // end (parse + semantic) is clean so a lowering test never chases a phantom.
 [[nodiscard]] SemanticModel analyzeC(std::string src) {
-    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
-    // this was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
+    // This was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
     // ✔MEASURED against an emptied shipped config, the abort took the whole
     // binary out at 0xC0000409 with no `[  FAILED  ]` line, no case name and
     // no summary -- every sibling test in this executable lost its verdict.
@@ -113,9 +111,9 @@ namespace {
     UnitBuilder builder{loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    // D-TEST-THE-HIR-LOWERING-FIXTURE-ANALYZES-WITH-NO-TARGET-IN-SCOPE: the target
-    // + its va_list strategy, exactly as `compile_pipeline.cpp` and the sibling MIR
-    // harness thread them. See `fixtureTarget` for why they are process-owned.
+    // The target + its va_list strategy, exactly as `compile_pipeline.cpp` and
+    // the sibling MIR harness thread them. See `fixtureTarget` for why they are
+    // process-owned.
     // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the OBJECT FORMAT is threaded
     // too, and it is not decoration here. Plain `char`'s signedness is a
     // (processor x object format) fact — the same arm64 CPU is unsigned under
@@ -135,8 +133,7 @@ namespace {
 // witness the FORMAT-keyed wide-char constraint (an astral `L'😀'` is representable
 // under the default I32 but NOT under the pe U16).
 [[nodiscard]] SemanticModel analyzeCPe(std::string src) {
-    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
-    // this was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
+    // This was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
     // ✔MEASURED against an emptied shipped config, the abort took the whole
     // binary out at 0xC0000409 with no `[  FAILED  ]` line, no case name and
     // no summary -- every sibling test in this executable lost its verdict.
@@ -159,8 +156,7 @@ namespace {
 // program (no `#include`) parses via Tokenizer+Parser directly (skipping the PP)
 // and is ingested via `UnitBuilder::addTree` — exactly the construct these pins use.
 [[nodiscard]] SemanticModel analyzeCRaisedCap(std::string src, std::size_t cap) {
-    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
-    // this was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
+    // This was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
     // ✔MEASURED against an emptied shipped config, the abort took the whole
     // binary out at 0xC0000409 with no `[  FAILED  ]` line, no case name and
     // no summary -- every sibling test in this executable lost its verdict.
@@ -222,10 +218,9 @@ namespace {
 [[nodiscard]] std::string shippedCText() {
     fs::path const cand =
         dss::test::configRoot() / "sources" / "c.lang.json";
-    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT: this
-    // returned an EMPTY string on an unreadable config, and the caller then
-    // aborted on the resulting missing needle -- so an I/O fault surfaced as
-    // "shiftResult key not found", one frame away from the truth, and killed
+    // This returned an EMPTY string on an unreadable config, and the caller
+    // then aborted on the resulting missing needle -- so an I/O fault surfaced
+    // as "shiftResult key not found", one frame away from the truth, and killed
     // the binary. THROW at the fault, and read through the ONE checked read
     // (D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT) so a
     // TORN read is named as a read failure rather than as a bad document.
@@ -243,7 +238,7 @@ namespace {
 // coercion), so the BinaryOp's own type IS the shift's result type:
 // `promotedLeft` (C 6.5.7) → the promoted left operand int (I32); `commonType`
 // → the usual-arithmetic common type of (int, long) = long (I64). Exercises the
-// cst_to_hir shift arm — the site D-UAC-SHIFT-RESULT-RULE-CONFIG names.
+// cst_to_hir shift arm, the site that reads the verb.
 [[nodiscard]] TypeKind shiftResultKind(std::string const& verb) {
     std::string text = shippedCText();
     // The shipped config declares `promotedLeft`; swap ONLY that closed-verb
@@ -384,13 +379,12 @@ TEST(HirLoweringC, ArithmeticAndParams) {
     EXPECT_EQ(res->hir.kind(ret), HirKind::BinaryOp);           // a + b
 }
 
-// D-UAC-SHIFT-RESULT-RULE-CONFIG: the C 6.5.7 shift-result rule is the config
-// verb `shiftResult`, read by the cst_to_hir shift arm (the site the anchor
-// names). `promotedLeft` types `int << long` as the promoted left operand (I32);
-// `commonType` types it like an ordinary binary op (common(int,long) = I64). The
-// I32↔I64 flip when ONLY the verb changes is the red-on-disable proof the engine
-// reads the verb at the HIR-lowering tier (the const-context sibling site is
-// pinned in test_fc3_width_semantics.cpp).
+// The C 6.5.7 shift-result rule is the config verb `shiftResult`, read by the
+// cst_to_hir shift arm. `promotedLeft` types `int << long` as the promoted left
+// operand (I32); `commonType` types it like an ordinary binary op
+// (common(int,long) = I64). The I32↔I64 flip when ONLY the verb changes is the
+// red-on-disable proof the engine reads the verb at the HIR-lowering tier (the
+// const-context sibling site is pinned in test_fc3_width_semantics.cpp).
 TEST(HirLoweringC, ShiftResultPromotedLeftIsLeftType) {
     EXPECT_EQ(shiftResultKind("promotedLeft"), TypeKind::I32)
         << "promotedLeft (C 6.5.7): (int << long) lowers to a BinaryOp typed I32";
@@ -6195,7 +6189,6 @@ namespace {
 }
 
 [[nodiscard]] std::string readFile(fs::path const& p) {
-    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
     // `std::abort()` here killed the whole binary, so one unreadable golden
     // cost every sibling test its verdict. THROW -- GoogleTest reports an
     // escaping exception as a failure of the ONE running test. The read itself
@@ -7877,8 +7870,7 @@ TEST(HirLoweringC, DeepNestedSwitchAnalyzesFlatOnNormalStack) {
     // off the bounded reserve), then ANALYZE on the bounded reserve — the flatness
     // witness. A bare `int main(){…}` program parses via Tokenizer+Parser directly
     // (no PP) and is ingested via addTree — exactly as analyzeCRaisedCap does.
-    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
-    // this was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
+    // This was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
     // ✔MEASURED against an emptied shipped config, the abort took the whole
     // binary out at 0xC0000409 with no `[  FAILED  ]` line, no case name and
     // no summary -- every sibling test in this executable lost its verdict.
@@ -9509,8 +9501,7 @@ namespace {
     // ended in `std::abort()`, which kills the whole test BINARY and costs
     // every sibling test its verdict. `configRoot()` throws instead.
     fs::path const shipped = dss::test::configRoot() / "shippedLibs";
-    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
-    // this was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
+    // This was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
     // ✔MEASURED against an emptied shipped config, the abort took the whole
     // binary out at 0xC0000409 with no `[  FAILED  ]` line, no case name and
     // no summary -- every sibling test in this executable lost its verdict.
@@ -9969,8 +9960,8 @@ TEST(HirLoweringC, FunctionDesignatorConditionDecaysAndTakesTheChokepoint) {
 // SECOND revert that reds it alone: drop `|| rk == TypeKind::Complex` from
 // `scalarConvertsToBool` in `analysis/semantic/type_rules.hpp` and the count goes
 // 7 -> 6 while `ASSERT_FALSE(model.hasErrors())` fires first with S0003.
-// ★★ D-TEST-THE-HIR-LOWERING-FIXTURE-ANALYZES-WITH-NO-TARGET-IN-SCOPE — this
-// file's fixture must see what the shipped CLI sees.
+// ★★ THIS FILE'S FIXTURE MUST SEE WHAT THE SHIPPED CLI SEES — it used to
+// analyze with NO TARGET IN SCOPE.
 //
 // `analyzeC` called `analyze(cu, budget)` and nothing more, so its 290-odd
 // fixtures analyzed with `target == nullptr`. That default is CORRECT for the

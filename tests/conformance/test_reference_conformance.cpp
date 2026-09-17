@@ -1,5 +1,5 @@
 // ════════════════════════════════════════════════════════════════════════════
-//  THE DIFFERENTIAL ACCEPT/REJECT ORACLE — D-CONF-REFERENCE-DIFFERENTIAL-ORACLE
+//  THE DIFFERENTIAL ACCEPT/REJECT ORACLE — DSS AGAINST THE REFERENCE COMPILERS
 // ════════════════════════════════════════════════════════════════════════════
 //
 // The operator's standing rule: "WE MUST SUPPORT WHAT REFERENCE COMPILERS DO
@@ -72,7 +72,8 @@
 //
 // ── AND AN ABSENT ORACLE MUST NEVER READ LIKE A PASS ───────────────────────
 //
-// `D-TEST-NATIVE-ORACLE-INERT-ON-POSIX` is on record in this repo: an oracle that
+// This repo has already been burned by a native oracle that sat INERT on every
+// POSIX host while printing green: an oracle that
 // no-ops where its compiler is absent is indistinguishable from one that agreed.
 // So: every candidate that is not used is reported BY NAME WITH A REASON; the
 // corpus carries a SANITY PAIR (one trivially-valid and one trivially-invalid
@@ -397,9 +398,8 @@ struct ScriptRun {
     std::string diagnostic;
     std::string scriptPath;
     std::map<std::string, StepOutcome> outcomes;   // marker -> verdict + its output
-    // ★ THE LOG PATH TRAVELS WITH THE RESULT.
-    // [D-TEST-NATIVE-PROBE-COMPILE-FAILURE-DISCARDS-ITS-OWN-OUTPUT,
-    // same shape.] A driver that launched and then
+    // ★ THE LOG PATH TRAVELS WITH THE RESULT — the same shape as a probe whose
+    // compile failure discards its own output. A driver that launched and then
     // produced no marker has an explanation sitting in its capture file, and the
     // first version of this file threw it away: the failure read `produced no
     // @@PROBE IDENT marker ... the shell could not run it`, which named a guess
@@ -1282,7 +1282,7 @@ constexpr std::size_t kMinDirectionBProbes = 15;
 //  candidate std flag, and three of the four tests below need it; re-running it
 //  per TEST would triple that for no extra information. The scratch dir is
 //  ScratchDir's per-run one, so two concurrent ctest processes never share a
-//  path (D-TEST-FIXED-SCRATCH-PATH-POPULATION).
+//  path — a scratch path derived from a FIXED name is one they would both draw.
 // ═══════════════════════════════════════════════════════════════════════════
 namespace {
 
@@ -1464,7 +1464,8 @@ TEST(ReferenceConformance, OracleStandardLevelsAreMeasuredNotAssumed) {
 
     if (set.found.empty()) {
         // ★ A SKIP IS ITSELF FAIL-CLOSED. ctest scores a gtest SKIP as a pass, which
-        // is exactly the `D-TEST-NATIVE-ORACLE-INERT-ON-POSIX` shape — so the one
+        // is exactly the shape of an oracle that sits INERT and reports success —
+        // so the one
         // legitimate skip is only legitimate if discovery actually LOOKED. An empty
         // absent list means the candidate enumeration produced nothing at all, i.e.
         // a harness defect wearing a skip's clothes.
@@ -1474,8 +1475,8 @@ TEST(ReferenceConformance, OracleStandardLevelsAreMeasuredNotAssumed) {
                "toolchain-less host.";
         GTEST_SKIP() << "NO reference C compiler could be used on this host. This is the "
                         "ONE legitimate skip, and it is a skip rather than a pass on "
-                        "purpose (D-TEST-NATIVE-ORACLE-INERT-ON-POSIX). Every candidate "
-                        "and its reason:" << describeOracles(set);
+                        "purpose, so an absent oracle can never read like agreement. "
+                        "Every candidate and its reason:" << describeOracles(set);
     }
 
     for (auto const& o : set.found) {

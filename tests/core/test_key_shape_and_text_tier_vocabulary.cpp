@@ -156,11 +156,11 @@ public:
 
 // ★ `quotedTokens` used to be a file-local copy here, byte-identical to the one
 // `tests/core/vocabulary_projection_probe.hpp` already owned — and therefore
-// invisible to the mutant that closed
-// D-TEST-VOCABULARY-PROJECTION-PROBE-HELPERS-ARE-COPIED-PER-FILE. It has ONE
+// invisible to the mutant that ended the per-file copying of these probe
+// helpers. It has ONE
 // owner now, `tests/test_support/vocabulary_message_probe.hpp`, which is
-// json-free and on every test target's include path; see
-// D-TEST-VOCABULARY-PROBE-MESSAGE-HALF-IS-UNREACHABLE-AND-JSON-COUPLED.
+// json-free and on every test target's include path — the split that made the
+// probe's MESSAGE half reachable without dragging `nlohmann/json.hpp` in.
 using ::dss::test_support::quotedTokens;
 
 template <typename Diags>

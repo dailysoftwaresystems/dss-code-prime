@@ -2,7 +2,9 @@
 
 // ── READING A DIAGNOSTIC BACK — ONE OWNER, AND NO JSON ───────────────────────
 //
-// D-TEST-VOCABULARY-PROBE-MESSAGE-HALF-IS-UNREACHABLE-AND-JSON-COUPLED.
+// The probe's MESSAGE half used to be unreachable from most of its callers and
+// coupled to `nlohmann/json.hpp` it never needed; this header is that half,
+// split out.
 //
 // ★★★ WHY THIS HEADER IS SEPARATE FROM `tests/core/vocabulary_projection_probe.hpp`
 // RATHER THAN A SECOND COPY OF IT. That header does two unrelated jobs: it

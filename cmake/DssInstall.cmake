@@ -1,5 +1,5 @@
 # ── The INSTALL SET ────────────────────────────────────────────────────────────
-# D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE.
+# No packaging path shipped the config tree.
 #
 # ★★★ WHAT WAS BROKEN, AND IT WAS NOT PACKAGING PLUMBING. Before this file there
 # were ZERO `install()` rules in the repository (✔MEASURED on this branch AND on
@@ -196,7 +196,7 @@ if(DSS_BUILD_TESTS)
                 -D "DSS_SMOKE_TARGET_SPEC=${_dss_smoke_spec}"
                 -P "${CMAKE_SOURCE_DIR}/cmake/DssInstallSmokeTest.cmake")
     # ⚠ NO TIMEOUT IS SET HERE: the budget comes from `cmake/DssTestBudgets.cmake`,
-    # with every other entry's (D-TEST-INTEGRATED-RUNNER-HANGS-BEFORE-CREATING-ITS-EX-DIRECTORY).
+    # with every other entry's.
     # It used to carry `TIMEOUT 600`, a guess sized for "a cold CI runner". ✔MEASURED
     # instead — this entry is registered on every host whenever DSS_BUILD_TESTS is
     # on, and all five CI legs run it: at most 14.42 s on linux-clang-asan and 3.85 s

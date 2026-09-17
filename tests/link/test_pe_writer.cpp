@@ -50,8 +50,9 @@ using dss::link_format::test::rejectSummary;
 
 namespace {
 
-// D-TEST-LE-READ-HELPERS CLOSED at 8aabc04 audit fold; complete-
-// hoist at 5ac97ae audit fold per code-architect Q1.
+// The little-endian read helpers are shared, not file-local:
+// hoisted at the 8aabc04 audit fold and completed at the 5ac97ae
+// one per code-architect Q1.
 using dss::link_format::test::readU16LE;
 using dss::link_format::test::readU32LE;
 using dss::link_format::test::readU64LE;

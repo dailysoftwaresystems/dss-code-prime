@@ -1,7 +1,7 @@
 #pragma once
 
-// ONE repo-root resolver for the whole test-support layer.
-// [[D-TEST-HELPERS-IGNORE-DSS-CONFIG-ROOT-OUT-OF-TREE]]
+// ONE repo-root resolver for the whole test-support layer, because the
+// test-side helpers used to IGNORE `$DSS_CONFIG_ROOT` out of tree.
 //
 // WHY THIS EXISTS. Before this header, 19 files under `tests/` +
 // `integrated_tests/` each carried their OWN copy of "walk up from
@@ -22,7 +22,8 @@
 // resolver, which is this one. Do not re-open a local walk anywhere.
 //
 // ── TWO QUESTIONS, TWO RESOLVERS ────────────────────────────────────────
-//   D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED
+//   (the split that lets the whole suite run against a config-only snapshot
+//   instead of against the live source tree several workstreams write to)
 //
 // ★★★ `$DSS_CONFIG_ROOT` ANSWERS "WHICH CONFIG TREE", NOT "WHICH CHECKOUT", AND
 // CONFLATING THE TWO WAS A LATENT DEFECT THIS HEADER USED TO CARRY. Its

@@ -120,8 +120,7 @@ constexpr std::size_t kProbeBudgetFactor = std::size_t{1} << 20;
 // here loses its verdict, which is the exact signature these tests exist to tell
 // APART from a stack overflow. `no_abort_in_tests_guard` enforces the same rule.
 // `budgetFactorOverride` is ZERO for every PIN in this file: a pin must be
-// parsed with the parser `dsscp` ships, which is the whole subject of
-// D-TEST-DEEP-NESTING-FIXTURE-PARSED-WITH-A-STRICTER-PARSER-THAN-THE-SHIPPED-ONE.
+// parsed with the parser `dsscp` ships, never with a stricter one.
 // The env-gated PROBES below pass a larger factor deliberately, and only because
 // the property they measure sits BELOW the parser: past a few thousand comma
 // elements the shipped `parser.speculationBudgetFactor` refuses the input LOUD
@@ -1055,9 +1054,9 @@ TEST(HirToMirAggregateSeqProbe, WalksTheConfiguredAggregateCommaChainLength) {
 // Restore the recursion and the process dies — under the gate's own toolchain,
 // whatever its frames weigh.
 //
-// ⚠ The parser config is the SHIPPED one (no `budgetFactorOverride`), which is
-// what D-TEST-DEEP-NESTING-FIXTURE-PARSED-WITH-A-STRICTER-PARSER-THAN-THE-SHIPPED-ONE
-// asks of a PIN; the depths below are chosen to sit inside it.
+// ⚠ The parser config is the SHIPPED one (no `budgetFactorOverride`), because a
+// PIN must never be parsed with a parser stricter than the shipped one; the
+// depths below are chosen to sit inside it.
 
 namespace {
 

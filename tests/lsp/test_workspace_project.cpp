@@ -28,7 +28,7 @@
 #include "lsp/workspace_project.hpp"
 #include "lsp_test_helpers.hpp"
 #include "repo_root.hpp"
-// The ONE test-side env override (D-TEST-SCOPED-ENV-DUPLICATED-THREE-WAYS).
+// The ONE test-side env override, hoisted out of the hand-copied duplicates.
 // The local copy that used to sit below carried a note claiming the hoist was
 // "outside this lane's files" — which was never true; `tests/test_support/**`
 // was in the grant the whole time. A stated blocker that is WRONG is worse than

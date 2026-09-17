@@ -49,8 +49,7 @@ a remote leg over a carriage, a watcher — background or foreground, however ma
 They consume machine, not judgment, so run as many as the machine and the tree can take.
 
 ⚠⚠ **BUT "AS MANY AS THE MACHINE CAN TAKE" IS A BUDGET THE ORCHESTRATOR MUST DIVIDE, AND UNTIL
-2026-08-23 NOTHING DIVIDED IT.** ✔MEASURED (cycle P28,
-`D-CYCLE-LANE-CTEST-PARALLELISM-IS-UNBOUNDED-IN-AGGREGATE`): P17 made `-j 8` the default for
+2026-08-23 NOTHING DIVIDED IT.** ✔MEASURED (cycle P28): P17 made `-j 8` the default for
 `run-gate` and `local-build`, which is right for ONE gate. With four lanes each running its own
 `ctest -j 8` in its own build tree, the aggregate is **32 concurrent test processes**, and a lane
 measured single example tests going from **~6 s to ~200 s** — a ~33x degradation. One lane
@@ -114,7 +113,6 @@ sibling lane the same day hit the wall, moved to a throwaway worktree, verified,
   a clean verdict and a next-free diagnostic ordinal ~200 slots off, from bytes existing in no real
   tree. Nothing was wrong with the instrument.
 - Give each lane a **lane-private scratch subdirectory**; the session scratchpad is shared.
-- See [[D-GATE-H0-WORKTREE-RULE-IS-WRITTEN-AND-UNENFORCED]] for the full measurement.
 
 **★ DO NOT DELEGATE — the orchestrator keeps these:**
 - **Step 6, the gate** (builds, ctest, the 3-leg run, the sqlite re-probe). A delegated
