@@ -14,7 +14,8 @@
     "or parenthesis boundary -- were removed from the PREDICATE, so nothing is",
     "silenced by a bare line with no argument behind it. Each remaining entry is a",
     "sentence somebody should re-measure through the CLI and then correct.",
-    "Species record: D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED."
+    "The species: a claim TRUE WHEN IT WAS TYPED and FALSE WHEN THE COMMIT LANDED,",
+    "still reading as evidence."
   ],
   "ceilings": {}
 }

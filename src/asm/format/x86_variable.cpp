@@ -40,6 +40,76 @@ constexpr std::uint8_t kX86RegFieldBits = 4;
 // minimal.)
 using walker_util::PendingRelocSlot;
 
+// ─────────────────────────────────────────────────────────────────────
+// [[D-CSUBSET-LONG-BRANCH]] — THE ISLAND BODY, QUOTED FROM THIS CONFIG
+// ─────────────────────────────────────────────────────────────────────
+//
+// ★★★ THIS WALKER NEEDS NO "ELECTION" IN THE SENSE THE ROW MEANT, AND SAYING
+// SO IS HALF THE FIX. The row's (c) reads as missing machinery: `x86_variable`
+// "has no election and no WORD vocabulary to elect from". It does not need
+// one, because the bytes an island is made of are ALREADY WRITTEN DOWN in the
+// two rows that branch — `jmp`'s `template.opcode: [0xE9]`, and `jcc`'s
+// wire-1 `prefixOpcodeBytes: [0xE9]`, each immediately followed by the
+// `block.rel32` field. "Those bytes, then a block-relative field" IS an island
+// body verbatim. What was missing is that nobody carried it to the resolver.
+//
+// ⚠ TWO PLACES A SELF-CONTAINED UNCONDITIONAL BRANCH CAN BE DECLARED, AND
+// BOTH ARE READ:
+//
+//   * a wire with `prefixOpcodeBytes` — those bytes are emitted immediately
+//     before this wire's displacement and after everything the variant's
+//     earlier wires emitted, so prefix + displacement is a whole instruction
+//     by construction, whatever precedes it. This is jcc's trailing `E9`.
+//   * the variant's OWN `opcodeBytes`, when the variant is nothing but those
+//     bytes plus this one block-relative wire: no ModR/M (`modrmRegExt`
+//     absent and no ModR/M-family wire), no result placement, no cond nibble,
+//     no prefixes, no immediate. This is the one-byte `jmp` row.
+//
+// ⚠ AND THE OPCODE MUST DECLARE ITSELF UNCONDITIONAL for the second form, for
+// the same reason the `fixed32` election asks: the second form quotes the
+// variant's LEADING bytes, and on a conditional opcode those bytes ARE the
+// condition. Control reaches an island only through a branch aimed at it, so a
+// conditional island could fall out of its bottom into the next island — valid
+// bytes, wrong destination, no diagnostic. `terminatorKind == Br` is the
+// config's own sentence for "transfers control unconditionally". The first
+// form needs no such test: a wire's prefix bytes are a SECOND instruction
+// inside a macro, and the macro's conditional half is the part before them.
+[[nodiscard]] inline walker_util::BranchIslandBody
+electIslandBody(TargetOpcodeInfo const& info) {
+    constexpr std::uint8_t kRel32Bytes = 4;
+    bool const opcodeIsUnconditionalBranch =
+        info.terminatorKind == TargetTerminatorKind::Br;
+    auto quote = [](std::span<std::uint8_t const> lead)
+        -> walker_util::BranchIslandBody {
+        walker_util::BranchIslandBody body;
+        if (lead.empty()
+         || lead.size() + kRel32Bytes > walker_util::kMaxBranchIslandBytes)
+            return {};
+        for (std::size_t i = 0; i < lead.size(); ++i)
+            body.bytes[i] = lead[i];
+        body.byteCount   = static_cast<std::uint8_t>(lead.size() + kRel32Bytes);
+        body.fieldOffset = static_cast<std::uint8_t>(lead.size());
+        body.kind        = walker_util::BlockRelPatchKind::X86Rel32;
+        return body;
+    };
+    for (auto const& variant : info.encoding.variants) {
+        for (auto const& wire : variant.wires) {
+            if (wire.slotKind != EncodingSlotKind::BlockRel32) continue;
+            if (!wire.prefixOpcodeBytes.empty())
+                return quote(wire.prefixOpcodeBytes);
+            if (!opcodeIsUnconditionalBranch)            continue;
+            if (variant.wires.size() != 1)               continue;
+            if (variant.resultSlot.has_value())          continue;
+            if (variant.tmpl.condCodeFromPayload)        continue;
+            if (variant.tmpl.modrmRegExt.has_value())    continue;
+            if (!variant.tmpl.mandatoryPrefix.empty())   continue;
+            if (variant.tmpl.payloadBytePrefix)          continue;
+            return quote(variant.tmpl.opcodeBytes);
+        }
+    }
+    return {};
+}
+
 // State accumulated while emitting one variant: the 3-bit codes
 // destined for ModR/M.reg / ModR/M.rm + their high bits for REX.R /
 // REX.B, plus the immediate(s) and pending symbol-relative slot
@@ -341,6 +411,9 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
         case EncodingSlotKind::Imm32MovzMovk:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:
+        // [[D-CSUBSET-LONG-BRANCH]]: the TBZ/TBNZ imm14 is a fixed32 bit-window
+        // slot, like Imm19.
+        case EncodingSlotKind::Imm14:
         // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE: the inverted-imm16
         // (complement-immediate) slot is fixed32, like Imm16 whose window it
         // shares.
@@ -1498,6 +1571,14 @@ bool encode(Lir const&                  lir,
     //    `0F 8x rel32; E9 rel32`), then 4 zero placeholder bytes
     //    at the patch offset. asm.cpp resolves all patches once
     //    every block in the function has been encoded.
+    //    [[D-CSUBSET-LONG-BRANCH]]: every one of them carries the island body
+    //    this opcode declares. `rel32` is x86-64's WIDEST block-relative field,
+    //    so no escape into a wider one can ever be elected here — which is
+    //    exactly the arm that needs an island, and the body is elected once
+    //    per instruction rather than once per patch.
+    auto const island = st.blockRels.empty()
+        ? walker_util::BranchIslandBody{}
+        : electIslandBody(*info);
     for (auto const& br : st.blockRels) {
         for (auto b : br.prefixBytes) {
             out.push_back(b);
@@ -1505,11 +1586,21 @@ bool encode(Lir const&                  lir,
         blockPatches.push_back(walker_util::BlockRelPatch{
             static_cast<std::uint32_t>(out.size()),
             br.targetBlock,
+            walker_util::BlockRelPatchKind::X86Rel32,
+            /*relaxable=*/false,
+            /*widerFieldDeclared=*/false,
+            /*instV=*/0,  // stamped centrally by asm.cpp
+            island,
         });
         asm_byte_emit::appendU32LE(out, 0u);
     }
 
     return true;
+}
+
+walker_util::BranchIslandBody
+islandBody(TargetOpcodeInfo const& info) {
+    return electIslandBody(info);
 }
 
 } // namespace dss::x86_variable

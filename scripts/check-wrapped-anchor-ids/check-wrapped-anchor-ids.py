@@ -485,8 +485,12 @@ _INVENTORY_COMMENT = [
     "one line of its own) and lower the number in the SAME commit; the guard prints",
     "the new value. Raising an entry, or adding a file, is a FAILURE -- that is the",
     "ratchet. This file is DEBT, not a pass: green means no NEW wrap landed.",
-    "Burn-down tracked by D-ANCHOR-ID-WRAPPED-ACROSS-A-LINE-BREAK-IS-INVISIBLE-TO-EVERY-GREP.",
-    "EMPTY as of cycle P29: 290 sites across 145 files were un-wrapped. Green now means ZERO, so a single new wrap reds immediately -- there is no headroom left to hide one in.",
+    "An EMPTY ceilings map is the strongest state this guard has, not a disabled one.",
+    "It WAS empty once -- cycle P36, after 290 sites across 145 files were un-wrapped --",
+    "and this line used to say so. That sentence went FALSE the moment a later cycle",
+    "re-filed an entry, which is the exact species the sibling stale-refusal guard exists",
+    "to catch. So it no longer states a count: the guard prints the live total and the",
+    "file count on every run. Read that, never this.",
 ]
 
 
@@ -565,9 +569,8 @@ def report_comment_divergence(comment):
           "--write", file=sys.stderr)
     print("  If the JSON is right, edit `_INVENTORY_COMMENT` to match it - running "
           "`--write` would DESTROY the corrected text. That is not hypothetical: it "
-          "is what this literal did once, and the species record is",
-          file=sys.stderr)
-    print("      D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED",
+          "is what this literal did once. The species is a claim TRUE WHEN IT WAS "
+          "TYPED and FALSE WHEN THE COMMIT LANDED, still reading as evidence.",
           file=sys.stderr)
     return EXIT_RATCHET
 
@@ -693,8 +696,9 @@ def run(root, write, baseline=False):
     if total:
         print("wrapped-anchor-ids: OK (%d file(s) scanned against %d anchor id(s); %d "
               "wrapped id(s) across %d file(s), all within the inventory ratchet). "
-              "DEBT, not a pass - see "
-              "D-ANCHOR-ID-WRAPPED-ACROSS-A-LINE-BREAK-IS-INVISIBLE-TO-EVERY-GREP."
+              "DEBT, not a pass - every one of those ids is split across a line break, "
+              "so no grep returns it and no anchor guard counts it. Green here means "
+              "only that no NEW wrap landed."
               % (len(files), len(keys), total, len(counts)))
     else:
         print("wrapped-anchor-ids: OK (%d file(s) scanned against %d anchor id(s); 0 "

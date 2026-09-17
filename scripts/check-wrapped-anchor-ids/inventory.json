@@ -6,8 +6,12 @@
     "one line of its own) and lower the number in the SAME commit; the guard prints",
     "the new value. Raising an entry, or adding a file, is a FAILURE -- that is the",
     "ratchet. This file is DEBT, not a pass: green means no NEW wrap landed.",
-    "Burn-down tracked by D-ANCHOR-ID-WRAPPED-ACROSS-A-LINE-BREAK-IS-INVISIBLE-TO-EVERY-GREP.",
-    "EMPTY as of cycle P29: 290 sites across 145 files were un-wrapped. Green now means ZERO, so a single new wrap reds immediately -- there is no headroom left to hide one in."
+    "An EMPTY ceilings map is the strongest state this guard has, not a disabled one.",
+    "It WAS empty once -- cycle P36, after 290 sites across 145 files were un-wrapped --",
+    "and this line used to say so. That sentence went FALSE the moment a later cycle",
+    "re-filed an entry, which is the exact species the sibling stale-refusal guard exists",
+    "to catch. So it no longer states a count: the guard prints the live total and the",
+    "file count on every run. Read that, never this."
   ],
   "ceilings": {
     "real-examples/c/sqlite/harness_legs.py": 19,

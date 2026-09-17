@@ -50,7 +50,11 @@ deferral is the rare exception that must earn its place, not the convenient way 
    and a diagnostic IS its output to a user.
 
    **The schema is SIX cells:** `| Anchor | Priority | Status | Trigger | Closing work | Cross-refs |`
-   — `Priority` is `P0`..`P5`, `Status` is `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED`.
+   — `Priority` is `P0`..`P5`, `Status` is `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` /
+   `🔵 🟠 OPEN (DISCLOSED)`. The last one is **OPEN WORK** whose debt PRE-DATES this cycle: it
+   counts in every total and is exempt only from the balance gate's net-increase refusal, so
+   writing up a defect you merely FOUND is not punished like shipping a new deferral. The claim
+   is checkable against the base ref — never use it for a defect this cycle introduced.
    ⚠⚠ **DO NOT HAND-WRITE THE ROW.** Use the writer, which takes the FIELDS:
 
        bash scripts/anchors/write-anchor.sh --production D-<AREA>-<NAME> \

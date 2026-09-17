@@ -18,8 +18,10 @@ THE ROW SHAPE, since 2026-09-01:
 
     | Anchor | Priority | Status | Trigger | Closing work | Cross-refs |
 
-`Priority` is `P0`..`P5`; `Status` is a three-value controlled vocabulary spelled
-`✅ CLOSED`, `🟠 OPEN`, `⏳ GATED`.
+`Priority` is `P0`..`P5`; `Status` is a controlled vocabulary spelled `✅ CLOSED`,
+`🟠 OPEN`, `⏳ GATED`, and `🔵 🟠 OPEN (DISCLOSED)` for open work whose debt PRE-DATES
+this cycle -- the last is OPEN in every count and is exempt only from the balance gate's
+net-increase refusal.
 ⚠ THE STATUS CELL KEEPS ITS GLYPH AND THAT IS THE CONTRACT, NOT DECORATION. This
 project's one definition of closed is *"the cell OPENS with ✅ after stripping `*_ `"* --
 the complement defined, never the variants, so a glyph nobody has thought of yet counts
@@ -199,11 +201,33 @@ FIELD_COL = {"priority": C_PRIORITY, "status": C_STATUS, "trigger": C_TRIGGER,
 # back to. The heading is the routing key, declared once.
 DONE_TABLE = {"production": "## Closed — Production"}
 
-# ★ THE THREE-VALUE STATUS VOCABULARY. Spelled glyph-first because `is_closed` tests the
+# ★ THE STATUS VOCABULARY. Spelled glyph-first because `is_closed` tests the
 # LEADING character; spelled with the word because a reader greps for `CLOSED`, not for
 # a codepoint. `GATED` is OPEN as far as every count is concerned -- it says *why* the
 # row cannot be picked up, which is the distinction `--schedulable` already draws.
 STATUS = {"open": "🟠 OPEN", "gated": "⏳ GATED", "closed": "✅ CLOSED"}
+
+# ★★★ THE FOURTH SPELLING, AND IT IS **DERIVED FROM THE GATE**, NEVER RE-TYPED.
+# `check-anchor-balance` exempts a row whose status cell OPENS with its disclosed mark
+# from the net-increase refusal -- that marker exists, in its own words, "precisely so
+# that writing up a defect you merely FOUND is not punished like shipping a new
+# deferral". This writer is the ONLY sanctioned door to a row and it had three status
+# words, so NO ROW WRITTEN TODAY COULD CARRY THE MARK: the six-cell migration removed the
+# affordance while leaving the exemption in place, and the incentive the mark exists to
+# destroy came back -- the cheapest way to pass the gate is to not write the row at all.
+# ⚠ COMPOSED FROM `bal.DISCLOSED_MARK` AND FROM `STATUS["open"]`, so the cell this writer
+# emits MOVES when either owner moves. Re-typing the codepoint here would make the writer
+# and the gate two owners of one fact -- the precise class this file's header already
+# refuses ("`is_closed`, `split_row` and `row_name` come from `check-anchor-balance` ...
+# re-typing would re-open the class"). Pinned by arms (42a)-(42d) in `self_test`.
+# ⓘ A DISCLOSED ROW IS OPEN WORK AND NOTHING ABOUT IT IS SOFTENED. `is_closed` finds no
+# leading closure mark, so every count counts it, `--done` refuses it, `place_row` files
+# it in the working registry, and the OPEN word leading the cell is what ARM 7 reads. The
+# mark is exempt from the net-increase FAILURE and from nothing else whatsoever.
+# ⚠ AND THE CLAIM IS CHECKABLE, which is why it is a word and not a flag: it asserts the
+# defect PRE-DATES this cycle, so a reviewer can look for it in the base ref. Marking a
+# defect you introduced is a false statement about history, not a formatting choice.
+STATUS["disclosed"] = "%s %s (DISCLOSED)" % (bal.DISCLOSED_MARK, STATUS["open"])
 STATUS_WORDS = tuple(STATUS)
 
 # ★ THE ID SHAPE IS THE GUARD'S, NOT A NEW ONE. `check-anchor-registry` resolves `D-`
@@ -421,10 +445,14 @@ def normalise_status(value):
         if v == canon:
             return canon
     raise Refused(
-        "status %r is not one of %s. The column is a three-value controlled vocabulary "
-        "on purpose: before 2026-09-01 the verdict was the first glyph of a prose blob "
-        "that also carried the trigger, the history and the retraction, and every reader "
-        "had to agree where the verdict stopped." % (value, "/".join(STATUS_WORDS)))
+        "status %r is not one of %s. The column is a CONTROLLED VOCABULARY on purpose: "
+        "before 2026-09-01 the verdict was the first glyph of a prose blob that also "
+        "carried the trigger, the history and the retraction, and every reader had to "
+        "agree where the verdict stopped. `disclosed` is OPEN work whose debt PRE-DATES "
+        "this cycle -- it counts as open everywhere and is exempt from the balance "
+        "gate's net-increase FAILURE and from nothing else; claiming it for a defect "
+        "this cycle introduced is a false statement about history, and the reviewer can "
+        "check it against the base ref." % (value, "/".join(STATUS_WORDS)))
 
 
 def make_row(anchor, priority, status, trigger, closing="", cross_refs="", minting=True):
@@ -973,6 +1001,7 @@ def self_test():
     N_ = _FX + "-NOSUCH"
     CC_ = _FX + "-CELLS"
     HG_ = _FX + "-GAMMA"
+    DISC_ = _FX + "-DISCLOSED"
 
 
     def pin(ok, why, detail=""):
@@ -1029,8 +1058,14 @@ def self_test():
         "(2) an empty Trigger cell is REFUSED")
     pin("is not one of" in (refuse(make_row, CC_, "P9", "open", "t") or ""),
         "(3) a priority outside P0..P5 is REFUSED")
-    pin("controlled vocabulary" in (refuse(make_row, CC_, "P1", "wibble", "t") or ""),
-        "(4) a status outside the three-value vocabulary is REFUSED")
+    pin("CONTROLLED VOCABULARY" in (refuse(make_row, CC_, "P1", "wibble", "t") or ""),
+        "(4) a status outside the controlled vocabulary is REFUSED")
+    pin("disclosed" in "/".join(STATUS_WORDS)
+        and (refuse(make_row, CC_, "P1", "disclosed",
+                    "🔵 🟠 **OPEN (DISCLOSED)** t") is None),
+        "(4b) ...and `disclosed` is INSIDE it -- the gate's exemption is reachable through "
+        "the only sanctioned door, which is the whole defect this word repairs",
+        "words=%s" % "/".join(STATUS_WORDS))
     # ⓘ The Trigger leads with the closure mark because the STATUS is closed, and the
     # split-verdict refusal below now requires the two to agree. That is incidental to
     # what THIS arm measures -- the pipe and the newline -- and weakens none of it.
@@ -1178,7 +1213,7 @@ def self_test():
                  REL["done"], 7, O % "HIDDEN", "OPEN row in the archive"),
                 ("(21) a Priority outside the band vocabulary", REL["production"], 5,
                  "| `" + _FX + "-BAND` | P9 | 🟠 OPEN | t | w | r |", "Priority"),
-                ("(22) a Status outside the three-value vocabulary", REL["production"],
+                ("(22) a Status outside the controlled vocabulary", REL["production"],
                  5, "| `" + _FX + "-VOCAB` | P2 | ORANGE | t | w | r |", "Status"),
                 ("(23) a Status column contradicting its own Trigger prose",
                  REL["production"], 5,
@@ -1397,6 +1432,52 @@ def self_test():
     for _n, (_ok, _label, _detail) in enumerate(
             _owning_tree().root_arms(repo_root, (SystemExit,), False, __file__), start=38):
         pin(_ok, "(%d) %s" % (_n, _label), _detail)
+
+    # ── (42a)..(42d) THE DISCLOSED STATUS IS THE GATE'S MARK, NOT A SECOND COPY ──
+    # ★★★ WHAT THESE ARMS PIN IS THE **COUPLING**, WHICH IS WHY NOT ONE OF THEM NAMES
+    # THE CODEPOINT. The gate exempts a row whose status cell OPENS with its disclosed
+    # mark from the net-increase refusal; this writer is the only sanctioned door to a
+    # row, so an exemption it cannot spell is an exemption no row written today can
+    # reach. The repair is a fourth status word DERIVED from `bal.DISCLOSED_MARK`, and
+    # the property that matters is not "a fourth dict entry exists" -- it is that the
+    # writer's emitted cell and the gate's predicate have ONE owner between them.
+    # ⇒ Every assertion below asks the GATE (`bal.is_disclosed`, `bal.is_closed`,
+    # `bal.lead_verdict_word`) about bytes this WRITER produced. Move the mark in its one
+    # home and these stay green because the writer followed it; re-type the glyph here
+    # and (42a)/(42b) go red the moment the two copies differ by one codepoint.
+    _disc = bal.split_row(make_row(CC_, "P1", "disclosed",
+                                   "🔵 🟠 **OPEN (DISCLOSED)** the debt pre-dates this cycle"))
+    _plain = bal.split_row(make_row(CC_, "P1", "open", "🟠 **OPEN** t"))
+    pin(bal.is_disclosed(_disc[C_STATUS]),
+        "(42a) the writer's `disclosed` cell is what the GATE reads as disclosed -- asked "
+        "through `bal.is_disclosed`, never compared against a glyph re-typed here",
+        "cell=%r" % _disc[C_STATUS].strip())
+    pin(not bal.is_disclosed(_plain[C_STATUS]),
+        "(42b) CONTROL: the plain `open` cell is NOT disclosed, so (42a) is reading the "
+        "mark and not merely the word OPEN")
+    pin(not bal.is_closed(_disc[C_STATUS])
+        and bal.lead_verdict_word(_disc[C_STATUS]) == "OPEN",
+        "(42c) a disclosed row is OPEN WORK -- no closure mark, and its VERDICT WORD is "
+        "OPEN, so ARM 7 reads it as agreeing with an OPEN trigger",
+        "word=%r" % bal.lead_verdict_word(_disc[C_STATUS]))
+    with tempfile.TemporaryDirectory() as _dtmp:
+        box(_dtmp)
+        _real_root = globals()["ROOT"]
+        globals()["ROOT"] = _dtmp
+        try:
+            _quiet = lambda *a, **k: None
+            _row = make_row(DISC_, "P1", "disclosed", "🔵 🟠 **OPEN (DISCLOSED)** t", "w", "r")
+            _dest = place_row(_dtmp, "production", DISC_, _row, write=True, insert=True,
+                              report=_quiet)
+            _refusal = refuse(cmd_write, ["--done", DISC_, "--priority", "P1", "--status",
+                                          "disclosed", "--trigger", "t", "--apply"])
+        finally:
+            globals()["ROOT"] = _real_root
+        pin(_dest == REL["production"] and _refusal is not None
+            and "not a place work can hide" in _refusal and not lint(_dtmp),
+            "(42d) a disclosed row files in the WORKING registry, `--done` REFUSES it, and "
+            "`--lint` accepts its Status -- the exemption touches the FAILURE only",
+            "dest=%s refused=%r lint=%d" % (_dest, (_refusal or "")[:46], len(lint(_dtmp))))
 
     print("anchors self-test: %d failed" % failed[0])
     return 1 if failed[0] else 0

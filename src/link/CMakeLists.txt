@@ -1,4 +1,5 @@
 add_library(link OBJECT
+    branch_veneers.cpp
     cross_cu_resolve.cpp
     entry_trampoline.cpp
     image_request.cpp

@@ -2289,11 +2289,28 @@ enum class EncodingSlotKind : std::uint8_t {
     // `LirOperandKind::ImmInt` discriminator, whose name is historical); the
     // SLOT decides the emitted width, exactly as `Imm8` already does.
     Imm16Bytes = 32,
+    // [[D-CSUBSET-LONG-BRANCH]]: the AArch64 TEST-AND-BRANCH displacement —
+    // the SIGNED 14-bit PC-relative offset of `TBZ`/`TBNZ <Rt>, #imm, <label>`,
+    // bits 5..18 of the 32-bit word, SCALED by 4 (±32 KiB). BLOCK-RELATIVE and
+    // NOT symbol-bearing, exactly like `Imm19`: the walker writes ZERO bits and
+    // pushes a `walker_util::BlockRelPatch{ kind = Arm64Imm14 }`, and the
+    // assemble-time resolver patches the field. `isSymbolBearingSlot` is false.
+    //
+    // ⓘ WHY IT EXISTS WITHOUT A SHIPPED OPCODE WIRING IT. It is the NARROWEST
+    // block-relative field AArch64 has, and a field's reach is what decides
+    // whether the branch-island machinery is reachable by a test at all: the
+    // two widest fields' edges cost a 134 MB and a 2 GiB function body, which
+    // is a property of those fields and not of any lane's budget. Declaring the
+    // narrow one lets the SAME shared resolver be pinned at kilobyte scale.
+    // The numbers are the ARM ARM's. `immediateFieldBits` already takes this
+    // posture for `Imm32` — the width is a true fact about the slot, and the
+    // next caller should read it rather than re-derive it.
+    Imm14 = 33,
     // Future fixed32 slots (paired with their consumer cycle):
     //   Sf-flag / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 33> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 34> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -2327,6 +2344,7 @@ inline constexpr EnumNameTable<EncodingSlotKind, 33> kEncodingSlotKindTable{{{
     { EncodingSlotKind::MemRelocDisp32,    "memreloc.disp32" },
     { EncodingSlotKind::Imm16Inverted, "imm16.inverted" },
     { EncodingSlotKind::Imm16Bytes,   "imm16.bytes"    },
+    { EncodingSlotKind::Imm14,        "imm14"          },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -2350,7 +2368,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 33,
+static_assert(kEncodingSlotKindCount == 34,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -2418,6 +2436,9 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Imm32MovzMovk:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:
+        // [[D-CSUBSET-LONG-BRANCH]]: the TBZ/TBNZ imm14 is a fixed32 slot for the
+        // same reason Imm19 is — a bit-window inside a 32-bit instruction word.
+        case EncodingSlotKind::Imm14:
         // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE: the inverted-imm16
         // slot shares `Imm16`'s bit-window, so it is a fixed32 slot for the
         // same reason Imm16 is (an x86-variable opcode wiring it would be a
@@ -2661,6 +2682,9 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         // stays symbol-bearing above for the BL/`call` form; the encoder
         // distinguishes Imm26's dual use by operand kind — a BlockRef
         // operand is block-relative, a SymbolRef operand emits the reloc.)
+        // [[D-CSUBSET-LONG-BRANCH]]: the TBZ/TBNZ imm14 is block-relative and
+        // resolved at assemble time, exactly like Imm19 above — no relocation.
+        case EncodingSlotKind::Imm14:
         case EncodingSlotKind::Imm19:
         // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE: the inverted-imm16
         // slot writes the operand's COMPLEMENT into the field directly —

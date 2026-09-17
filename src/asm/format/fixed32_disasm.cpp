@@ -113,6 +113,10 @@ windowFor(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::MemOffsetZero:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:
+        // [[D-CSUBSET-LONG-BRANCH]]: the TBZ/TBNZ imm14 is block-relative like
+        // Imm19 and is not decoded by this mirror yet — the same
+        // disasm-completeness gap (D-AS5-MULTIWORD-DISASM).
+        case EncodingSlotKind::Imm14:
         // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB: the MOVZ/MOVK 3-word
         // form is not decoded by this round-trip mirror yet (the same
         // disasm-completeness gap as Imm19/MemOffsetZero — anchored

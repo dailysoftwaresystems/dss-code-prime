@@ -68,9 +68,12 @@ IS the compiler's behaviour, and a diagnostic IS its output to a user.
 
     | Anchor | Priority | Status | Trigger | Closing work | Cross-refs |
 
-`Priority` is `P0`..`P5`; `Status` is `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED`. The status cell keeps its
-glyph because the project's one definition of closed is *"the cell OPENS with ✅"* — a column holding
-the bare word would make that test false for every closed row at once.
+`Priority` is `P0`..`P5`; `Status` is `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` / `🔵 🟠 OPEN (DISCLOSED)`.
+The status cell keeps its glyph because the project's one definition of closed is *"the cell OPENS
+with ✅"* — a column holding the bare word would make that test false for every closed row at once.
+`DISCLOSED` marks OPEN work whose debt PRE-DATES this cycle: it counts as open everywhere and is
+exempt only from the balance gate's net-increase refusal, so writing up a defect you merely FOUND is
+not punished like shipping a new deferral.
 
 ### Move on close, and never hand-write a row
 

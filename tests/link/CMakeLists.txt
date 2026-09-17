@@ -94,6 +94,11 @@ dss_add_test(NAME link/test_macho_dylib_writer   SOURCES test_macho_dylib_writer
 
 # D-LK6-1 closure — ARM64 bit-shift relocation-formula variants.
 dss_add_test(NAME link/test_aarch64_reloc_formulas SOURCES test_aarch64_reloc_formulas.cpp)
+# [[D-LK-AARCH64-CALL26-BEYOND-RANGE-HAS-NO-VENEER]]: the veneer pass that
+# gives an out-of-range call somewhere nearer to aim. Reaches the REAL
+# +/-128 MiB edge, because the pass reads function SIZES rather than
+# instruction bytes -- one ~200 MiB zero-filled allocation, no encoding.
+dss_add_test(NAME link/test_branch_veneers SOURCES test_branch_veneers.cpp)
 
 # Plan 14 LK7 — codesign-placeholder reservation tests.
 dss_add_test(NAME link/test_codesign_placeholder SOURCES test_codesign_placeholder.cpp)

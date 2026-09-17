@@ -332,6 +332,109 @@ went with the harness registry, carrying the operator's refusal of BOTH obvious 
 no serializing the gates). **A refusal that survives only in a source comment is one a later session
 overrides without learning it was ever ruled on.**
 
+### P68 ROUND 5 — two lanes: the Python defects the migration would have carried, and the long branch
+
+✔MEASURED on the folded tree, **all eight green, zero failures**:
+
+| leg | Debug | Release |
+|---|---|---|
+| Windows x86_64, MinGW GCC | **2210 / 2210** (809 s) | — |
+| Windows x86_64, MSVC | — | **2210 / 2210** (405 s) |
+| WSL x86_64, gcc | **2209 / 2209** (520 s) | **2209 / 2209** (144 s) |
+| macOS arm64, clang | **2170 / 2170** (6671 s) | **2170 / 2170** (842 s) |
+| arm64 VPS, gcc | **2170 / 2170** (1424 s) | **2170 / 2170** (274 s) |
+
+Guards 40/40 inside the Windows Debug run. ⓘ **No leg needed a retry and no leg reported a
+single `clock stepped` (0 across all eight logs)** — the first clean round in three,
+and the `run_gate_guard` row's own prediction holding from the other side.
+⚠ The counts moved because a test was ADDED: Windows 2210, WSL 2209 (it RUNS the guards and
+skips one Windows-only entry), the two ssh legs 2170 = 2210 − 40 repo guards. The identity is
+unchanged; only its terms moved.
+
+**LANE `lb` — `D-CSUBSET-LONG-BRANCH` IS CLOSED, AND THE OPERATOR'S REFRAME IS WHY.**
+The row modelled relaxation as *escape into a WIDER field*, under which the widest field has no
+escape and the residue forces an absolute address, a multi-word veneer, a relocation, a
+synthetic symbol and an allocator threaded from `src/program`. ✔MEASURED that every step of
+that chain is an artifact of the frame. **The residue is INTRA-FUNCTION, so the widest field
+does not need a wider field — it needs a NEARER TARGET:** a branch island holding the branch
+again, the same field twice, chained. The row's (a) and (b) DISSOLVE. Its (c) survives in NAME
+only — ✔MEASURED that both x86 island bodies are ALREADY declared in `x86_64.target.json`
+and the missing part was carrying them to the resolver.
+★ **The hazard the row never named is why this shape and not the prescribed one.** ✔MEASURED
+`x16`/`x17` are in `callerSaved` on BOTH arm64 callconvs, so every veneer the row prescribed
+needs a scratch GPR the assembler cannot safely spend — it runs after regalloc with no
+liveness. Such a veneer is a SILENT WRONG ANSWER, not a refusal. An island is a branch, and a
+branch reads no register.
+★ **The lane held `src/dss-config/**` and wrote NOTHING.** Round 3 concluded a config row
+*"cannot work"*; round 5 finds one is not WANTED — the config already says everything both
+elections ask it.
+⚠⚠ **THE ASSEMBLER PIN IS A COMPOSITION AND NEITHER REAL EDGE WAS MEASURED** — not here, not
+behind a slow label, not anywhere. The arm64 `Imm26` edge needs a function body over 134 MB and
+the x86-64 `rel32` edge one over 2 GiB held across every relaxation pass. Three factors were
+measured instead and their product is NOT an edge run: the machinery end-to-end at KILOBYTE
+scale on a synthetic `imm14` target (with its own positive control — the identical function on
+a target differing in ONE token must emit not one extra byte), the real fields' geometry by the
+byte-for-byte arms, and each real target's island BODY by reading it.
+✔ **The LINK tier's edge IS real**, because that pass reads function SIZES and relocation
+entries rather than instruction bytes: `±128 MiB` costs a zero-filled `resize`, not 33 million
+encoded instructions. Opened and closed alongside it:
+[[D-LK-AARCH64-CALL26-BEYOND-RANGE-HAS-NO-VENEER]].
+
+**LANE `py` — THE `🔵` EXEMPTION WAS REACHING ZERO ROWS, NOT FIVE.**
+`check-anchor-balance` exempts a row whose STATUS cell opens with the disclosed mark from the
+net-increase refusal. ✔MEASURED at `91820d36` through the gate's own `split_row`/`is_disclosed`:
+production **0 of 580 lead**, archive **0 of 1459**, `--breakdown` printing
+`disclosed-pre-existing 0`. All seven surviving marks sit in the `Trigger` cell. ⇒ **the
+six-cell migration did not merely stop new rows reaching the exemption — it moved the existing
+claims into a cell the predicate stopped reading.** The fourth status word is now composed FROM
+`bal.DISCLOSED_MARK`, so writer and gate have ONE owner between them, and the red-on-disable
+takes TWO mutants because a coupling has two halves: moving the mark reds the gate's self-test
+while the writer's stays green *because it followed the constant*, and a third mutant that also
+re-types the glyph reds the writer, proving that green was not vacuous.
+★ `is_disclosed` had **zero test coverage** — unreachable and unpinned at once.
+
+★★★ **THE ROUND'S REAL LESSON: EVERY INSTRUMENT ANSWERED A NARROWER QUESTION THAN THE
+SENTENCE WRITTEN ABOUT IT, AND EACH PRODUCED A CONFIDENT NUMBER.** Three of round 4's reported
+figures were corrected here, all in the same direction — the defect was worse than reported.
+(1) The `🔵` census read the wrong CELL. (2) *"5 dead printed ids in 4 guards"* was really
+**8 across FIVE** — the scan could not see ids built by implicit string concatenation, and all
+three misses were in `OK` lines, the most-read output those guards have. (3) *"`.claude/` →
+0 citations"* was measured over MARKDOWN ONLY; one citation survived in a `.mjs` file. It is now
+zero across all four extensions present, 37 files, with a positive AND a negative control.
+⇒ **State the scan's SCOPE in the same sentence as its result, or the result silently claims
+a scope it never had.**
+
+⛔ **AND A NEW QUOTING TRAP, BENIGN ONLY BY LUCK.** Running a `.py` through `bash` executes
+its docstring as SHELL. `bash scripts/lane-fold/lane-fold.py --help` fired `git worktree add`
+with garbage and parsed a prose line reading `-> something changed it` as the REDIRECT
+`> something`, creating a file in the repo root. `>` TRUNCATES: a docstring saying `-> build/dbg`
+would have emptied something real. Check the interpreter, and read a wall of `command not found`
+as evidence that arbitrary text just ran.
+
+⚠⚠ **AND THE GATE ITSELF HAS A DEFECT NOW, FILED AS
+[[D-GATE-MACOS-DEBUG-LEG-COSTS-SEVEN-TIMES-ITS-OWN-BASELINE]].** The macOS Debug leg took
+**7030 s and FAILED one test on a ctest TIMEOUT**, then **6671 s and passed** when re-run on a
+deliberately idle driver. ✔MEASURED against a PRESERVED log of the same carriage and the
+same `build/dbg, Debug` configure: **907 s for 2073 tests on 2026-09-06**. That is ~7x the wall
+clock for 5% more tests. ★ **The cause is NOT this cycle's code, and the measurement that
+shows it is the OTHER LEGS:** the same tree ran Windows MinGW Debug FASTER than the previous
+round and the arm64 VPS unchanged. A systemic compile-time regression appears on every leg;
+this appears on one. ⚠ **My first hypothesis was REFUTED and is recorded in the row so
+nobody spends the two hours again** -- I attributed it to my own over-subscription (remote
+`ctest` streams stdout back over `ssh`, and a saturated driver applies backpressure), and the
+controlled quiet re-run came back within 5%. ⚠ It already costs a gate RUN, not just time:
+`analysis/compilation_unit/test_import_resolver_shuffled` took **315.02 s against a 315 s
+budget** in one run and **14.37 s** in the next -- a 22x swing on identical code while the leg
+total barely moved. **Do not close that row by raising the budget:** it converts a loud flake
+into a silent two-hour leg.
+ⓘ It is the FIRST row to carry the `disclosed` status word, and the gate read it correctly
+on its first real use -- `closed 1, opened 1 (created 0, disclosed-pre-existing 1)`, net **+0**.
+
+⚠ **A near-miss worth the same weight:** `local-build.sh` REFUSED a `--build-type` on an
+existing tree, and a full ctest was launched against stale binaries anyway. What caught it was
+not the exit code — a background task's reported exit code is the SHELL's, not the command's —
+but checking the REGISTERED TEST COUNT and finding the new test absent.
+
 **Owed, in order, and all of it is this branch's.** ⚠ This list previously led with *"the scripts
 whose replacing verb does not exist"*. **No such item remains** — every verb exists, so what is owed
 is PROOF, not a release.

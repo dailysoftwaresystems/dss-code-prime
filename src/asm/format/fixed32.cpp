@@ -64,6 +64,8 @@ blockRelKindForSlot(EncodingSlotKind k) noexcept {
         return walker_util::BlockRelPatchKind::Arm64Imm19;
     if (k == EncodingSlotKind::Imm26)
         return walker_util::BlockRelPatchKind::Arm64Imm26;
+    if (k == EncodingSlotKind::Imm14)
+        return walker_util::BlockRelPatchKind::Arm64Imm14;
     return std::nullopt;
 }
 
@@ -93,9 +95,31 @@ blockRelKindForSlot(EncodingSlotKind k) noexcept {
 // would emit that word with those fields ZEROED — a valid encoding of a
 // DIFFERENT instruction, which is the silent-miscompile shape this project
 // names over and over. The election therefore requires the candidate word to
-// carry EXACTLY ONE wire (the block-relative one) and no result placement,
-// and to not be word 0 (where `resultSlot` and the cond nibble implicitly
-// live).
+// carry EXACTLY ONE wire (the block-relative one) and no result placement.
+//
+// ★★★ WORD 0 IS ADMISSIBLE EXACTLY WHEN THE OPCODE SAYS IT IS UNCONDITIONAL,
+// AND THAT REPLACES A BLANKET EXCLUSION WITH A CONFIG FACT.
+// [[D-CSUBSET-LONG-BRANCH]] round 5: the previous rule was "never word 0",
+// justified as "resultSlot + the cond nibble live here". Both halves of that
+// justification are things the config STATES — `resultSlot` is a field on the
+// variant and `condCodeFromPayload` a knob on its template — so the blanket
+// exclusion was answering a question it could have asked. Asking it matters,
+// because word 0 of an UNCONDITIONAL branch opcode is the only self-contained
+// branch word a single-word `jmp` row has, and that word is what a BRANCH
+// ISLAND is made of.
+//
+// ⚠ AND THE OPCODE'S OWN `terminatorKind` IS THE THIRD CONDITION, NOT AN
+// AFTERTHOUGHT. A quoted word is re-emitted at a place control can reach ONLY
+// by a branch aimed at it; if that word were CONDITIONAL, control could fall
+// out of the bottom of it into whatever follows — valid bytes, wrong
+// destination, no diagnostic. `condCodeFromPayload` catches the conditional
+// whose nibble the walker writes, but not one baked into a `fixedWord`
+// constant. `terminatorKind == Br` is the config's own sentence for "this
+// opcode transfers control unconditionally", so word 0 of a `Br` opcode is
+// unconditional BY DECLARATION. For a `CondBr` opcode word 0 is its
+// conditional half and stays excluded — which is the old rule, now derived
+// rather than assumed — while a LATER word of its macro is the unconditional
+// half by the same construction that made it the escape.
 struct EscapePlan {
     std::uint32_t                  baseWord;   // the quoted, self-contained word
     walker_util::BlockRelPatchKind kind;       // its block-relative field
@@ -104,13 +128,21 @@ struct EscapePlan {
 
 [[nodiscard]] inline std::optional<EscapePlan>
 electEscapeWord(TargetOpcodeInfo const& info) {
+    bool const opcodeIsUnconditionalBranch =
+        info.terminatorKind == TargetTerminatorKind::Br;
     std::optional<EscapePlan> best;
     for (auto const& variant : info.encoding.variants) {
         for (auto const& wire : variant.wires) {
             auto const kind = blockRelKindForSlot(wire.slotKind);
             if (!kind.has_value()) continue;
             std::size_t const w = wire.wordIndex;
-            if (w == 0) continue;               // resultSlot + cond nibble live here
+            if (w == 0) {
+                // resultSlot and the cond nibble implicitly live in word 0 —
+                // ask the config whether THIS variant puts them there.
+                if (!opcodeIsUnconditionalBranch) continue;
+                if (variant.resultSlot.has_value()) continue;
+                if (variant.tmpl.condCodeFromPayload) continue;
+            }
             if (w >= variant.tmpl.wordCount()) continue;  // validate() bounds this
             // Self-containment: this word may carry no other wire...
             std::size_t wiresInWord = 0;
@@ -128,6 +160,25 @@ electEscapeWord(TargetOpcodeInfo const& info) {
         }
     }
     return best;
+}
+
+// [[D-CSUBSET-LONG-BRANCH]]: the elected word, as the ISLAND BODY the shared
+// resolver materializes. A `fixed32` word is four little-endian bytes and its
+// block-relative field is a window inside them, so the field begins at byte 0
+// of the body — the bit position comes from the geometry row, as everywhere
+// else. The conversion lives here rather than in the resolver because the
+// WORD-ness of the body is this walker's fact, not the resolver's.
+[[nodiscard]] inline walker_util::BranchIslandBody
+islandBodyOf(EscapePlan const& plan) noexcept {
+    walker_util::BranchIslandBody body;
+    body.bytes[0] = static_cast<std::uint8_t>(plan.baseWord & 0xFFu);
+    body.bytes[1] = static_cast<std::uint8_t>((plan.baseWord >> 8) & 0xFFu);
+    body.bytes[2] = static_cast<std::uint8_t>((plan.baseWord >> 16) & 0xFFu);
+    body.bytes[3] = static_cast<std::uint8_t>((plan.baseWord >> 24) & 0xFFu);
+    body.byteCount   = kFixed32WordBytes;
+    body.fieldOffset = 0;
+    body.kind        = plan.kind;
+    return body;
 }
 
 // (`PendingRelocSlot` hoisted to walker_util.hpp; alias kept minimal.)
@@ -169,6 +220,12 @@ windowFor(EncodingSlotKind s) noexcept {
         // resolver-side lsb/width derivation symmetry; the encoder's
         // BlockRef arm bypasses orInto (no immediate written upfront).
         case EncodingSlotKind::Imm19: return SlotBitWindow{ 5,  19 };
+        // Imm14 ([[D-CSUBSET-LONG-BRANCH]]): AArch64 TBZ/TBNZ signed 14-bit
+        // PC-relative branch offset at bits 5..18. BLOCK-RELATIVE, exactly like
+        // Imm19 — the walker writes ZERO bits here (a BlockRef operand pushes a
+        // BlockRelPatch instead) except when the branch takes an island hop,
+        // which is an ordinary write through this window.
+        case EncodingSlotKind::Imm14: return SlotBitWindow{ 5,  14 };
         // MemBaseNoScale (D-LK10-ENTRY-ARM64): width-0 marker for a
         // memory-base operand on an ISA with no scale field (AArch64
         // unscaled). orInto with width 0 writes nothing but marks the
@@ -412,6 +469,21 @@ bool encode(Lir const&                  lir,
             return declaredEscape.has_value()
                 && declaredEscape->byteReach
                        > walker_util::blockRelByteReach(kind);
+        };
+    // [[D-CSUBSET-LONG-BRANCH]]: the ISLAND BODY for a patch on `kind` — the
+    // same elected word, admitted on `>=` rather than `>`. That one character
+    // is the reframe: an ESCAPE must reach STRICTLY further (it rescues the
+    // branch by widening the field), while an ISLAND reaches exactly as far
+    // and rescues it by standing nearer. The widest field is therefore its own
+    // island body, which is why the arm the row called unescapable has one.
+    auto const islandBodyFor =
+        [&](walker_util::BlockRelPatchKind kind)
+        -> walker_util::BranchIslandBody {
+            if (!declaredEscape.has_value()) return {};
+            if (declaredEscape->byteReach
+                    < walker_util::blockRelByteReach(kind))
+                return {};
+            return islandBodyOf(*declaredEscape);
         };
     // Is THIS instruction promoted? `relaxedInsts` is sorted and almost
     // always empty, so the common path is one comparison against `.empty()`
@@ -763,6 +835,13 @@ bool encode(Lir const&                  lir,
         // prescribe a remedy that exists. See `BlockRelPatch` for why the two
         // are not the same question.
         bool                              widerFieldDeclared;
+        // [[D-CSUBSET-LONG-BRANCH]]: the self-contained unconditional branch
+        // word this opcode declares, as the body the resolver copies when it
+        // needs a NEARER TARGET rather than a wider field. Undeclared when the
+        // opcode has no such word, or when the widest one it has cannot reach
+        // as far as this patch's own field — an island that reaches less far
+        // than the branch that jumps to it is not an escape from anything.
+        walker_util::BranchIslandBody     island;
     };
     std::vector<PendingBlockPatch> pendingBlockPatches;
     for (auto const& wire : selected->wires) {
@@ -873,22 +952,24 @@ bool encode(Lir const&                  lir,
             // emits a `call26` linker relocation [BL]; a BlockRef
             // operand on Imm26 here is the intra-function `B`. The
             // encoder distinguishes by OPERAND KIND, not by slot.)
-            walker_util::BlockRelPatchKind patchKind;
-            if (wire.slotKind == EncodingSlotKind::Imm19) {
-                patchKind = walker_util::BlockRelPatchKind::Arm64Imm19;
-            } else if (wire.slotKind == EncodingSlotKind::Imm26) {
-                patchKind = walker_util::BlockRelPatchKind::Arm64Imm26;
-            } else {
+            // ⚠ THE MAPPING IS ASKED OF `blockRelKindForSlot`, NOT RESTATED.
+            // This arm used to carry its own `if (Imm19) … else if (Imm26)`
+            // beside the factored-out predicate the escape election already
+            // used — two copies of one mapping, which is how an escape gets
+            // elected onto a slot the encoder then refuses to patch.
+            auto const patchKindOpt = blockRelKindForSlot(wire.slotKind);
+            if (!patchKindOpt.has_value()) {
                 report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                        DiagnosticSeverity::Error,
                        std::format("opcode '{}': BlockRef operand wired to "
                                    "slot '{}' — fixed32 supports intra-"
-                                   "function branch targets only on the "
-                                   "Imm19 (B.cond) or Imm26 (B) slots",
+                                   "function branch targets only on slots "
+                                   "that declare a block-relative field",
                                    info->mnemonic,
                                    encodingSlotKindName(wire.slotKind)));
                 return false;
             }
+            walker_util::BlockRelPatchKind const patchKind = *patchKindOpt;
             if (wire.wordIndex >= words.size()) {
                 report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                        DiagnosticSeverity::Error,
@@ -956,7 +1037,8 @@ bool encode(Lir const&                  lir,
                     srcOp.blockSlot, escape->kind,
                     static_cast<std::uint8_t>(escapeWordIdx),
                     /*relaxable=*/false,
-                    /*widerFieldDeclared=*/widerDeclaredThan(escape->kind)});
+                    /*widerFieldDeclared=*/widerDeclaredThan(escape->kind),
+                    /*island=*/islandBodyFor(escape->kind)});
                 continue;
             }
             wroteSlot[wire.wordIndex][slotIdx] = true;
@@ -967,7 +1049,8 @@ bool encode(Lir const&                  lir,
                 // the loud out-of-range refusal — including the wide field
                 // itself, whose own overflow has nowhere further to go.
                 /*relaxable=*/isNarrowWire && escape.has_value(),
-                /*widerFieldDeclared=*/widerDeclaredThan(patchKind)});
+                /*widerFieldDeclared=*/widerDeclaredThan(patchKind),
+                /*island=*/islandBodyFor(patchKind)});
         } else if (srcOp.kind == LirOperandKind::ImmInt) {
             // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: the shifted-imm12
             // word-pair slot. The callconv's prologue/epilogue `sub/add
@@ -1592,12 +1675,21 @@ bool encode(Lir const&                  lir,
                     bp.targetBlock,
                     bp.kind,
                     bp.relaxable,
-                    bp.widerFieldDeclared});
+                    bp.widerFieldDeclared,
+                    /*instV=*/0,  // stamped centrally by asm.cpp
+                    bp.island});
             }
         }
         asm_byte_emit::appendU32LE(out, words[i]);
     }
     return true;
+}
+
+walker_util::BranchIslandBody
+islandBody(TargetOpcodeInfo const& info) {
+    auto const plan = electEscapeWord(info);
+    if (!plan.has_value()) return {};
+    return islandBodyOf(*plan);
 }
 
 } // namespace dss::fixed32

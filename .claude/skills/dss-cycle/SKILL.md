@@ -173,7 +173,18 @@ IS the compiler's behaviour, and a diagnostic IS its output to a user.
 
 Operator, 2026-09-01: *"add columns for priority and status ... then the write explicitly writes it
 correctly, this way we always have clean statuses."* `Priority` is `P0`..`P5`; `Status` is a
-three-value controlled vocabulary — `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED`.
+controlled vocabulary — `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` / `🔵 🟠 OPEN (DISCLOSED)`.
+
+- ★★★ **`DISCLOSED` is for debt this cycle FOUND, not debt it CREATED, and it exists to remove an
+  incentive rather than to grant an excuse.** The balance gate forbids a cycle that OPENS new debt;
+  it does not forbid one that DISCLOSES pre-existing debt. Without the word, the cheapest way to
+  pass the gate is to not write the row at all — which is the precise dishonesty the gate exists to
+  prevent, produced BY the gate. A disclosed row is **OPEN WORK**: it counts in every total, it
+  files in the working registry, and `--done` refuses it. It is exempt from the net-increase
+  FAILURE and from nothing else.
+- ⚠ **The claim is checkable, so claiming it falsely is a lie about history, not a formatting
+  choice.** It asserts the defect PRE-DATES this cycle, and a reviewer can look for it in the base
+  ref. Use it for a defect you merely faced; never for one you introduced.
 
 - ⚠ **The status cell keeps its glyph, and the glyph is the contract.** A row is CLOSED iff its
   status cell OPENS with ✅ after stripping `*_ ` — the complement defined, never the variants. A

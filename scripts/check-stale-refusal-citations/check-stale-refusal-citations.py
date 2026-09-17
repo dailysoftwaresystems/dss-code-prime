@@ -588,7 +588,8 @@ _INVENTORY_COMMENT = [
     "or parenthesis boundary -- were removed from the PREDICATE, so nothing is",
     "silenced by a bare line with no argument behind it. Each remaining entry is a",
     "sentence somebody should re-measure through the CLI and then correct.",
-    "Species record: D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED.",
+    "The species: a claim TRUE WHEN IT WAS TYPED and FALSE WHEN THE COMMIT LANDED,",
+    "still reading as evidence.",
 ]
 
 
@@ -686,8 +687,9 @@ def report_comment_divergence(comment):
     print("      python scripts/check-stale-refusal-citations/"
           "check-stale-refusal-citations.py --write")
     print("  If the JSON is right, edit `_INVENTORY_COMMENT` to match it -")
-    print("  running `--write` would DESTROY the corrected text. Species record:")
-    print("      D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED")
+    print("  running `--write` would DESTROY the corrected text. The species is")
+    print("  this guard's own subject: a claim TRUE WHEN IT WAS TYPED and FALSE")
+    print("  WHEN THE COMMIT LANDED, still reading as evidence.")
     return EXIT_RATCHET
 
 
@@ -810,8 +812,9 @@ def run(root, write=False, baseline=False):
     if total:
         print("%s: OK (%d governed file(s) scanned against %d known row(s), %d of "
               "them CLOSED; %d site(s) across %d file(s), all within the inventory "
-              "ratchet). DEBT, not a pass - see "
-              "D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED."
+              "ratchet). DEBT, not a pass - every site is a refusal sentence citing "
+              "a row that has since CLOSED, unrepaired, and green here means only "
+              "that no NEW one landed."
               % (GUARD, len(files), len(names), len(closed), total, len(counts)))
     else:
         print("%s: OK (%d governed file(s) scanned against %d known row(s), %d of "

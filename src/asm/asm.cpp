@@ -269,6 +269,77 @@ AssembledModule assemble(Lir const&                 lir,
             return n;
         }();
 
+        // ─────────────────────────────────────────────────────────────
+        // D-CSUBSET-LONG-BRANCH — THE SECOND MONOTONE SET: BRANCH ISLANDS
+        // ─────────────────────────────────────────────────────────────
+        //
+        // ★★★ THE WIDEST FIELD NEEDS A NEARER TARGET, NOT A WIDER FIELD.
+        // The escape above rescues a branch by MOVING IT INTO A WIDER FIELD,
+        // which is why the widest field has no escape and why the row this
+        // anchor names concluded the residue needed an absolute address — a
+        // multi-word veneer, a relocation, a synthetic symbol the assembler
+        // cannot mint. It does not. The residue is INTRA-FUNCTION: every byte
+        // offset in this function is known right here, so aiming the SAME
+        // field at a nearer point of the SAME function is the same
+        // subtraction. That nearer point is an ISLAND holding the branch
+        // again — `B island` / `island: B far`, the same field twice, chained
+        // as far as the distance demands. It is what ld64 does for AArch64
+        // text over 128 MiB, and it needs NO scratch register, which is what
+        // makes it available to an assembler running after register
+        // allocation with no liveness to consult.
+        //
+        // ★★★ WHAT IS MONOTONE, AND WHAT IS RE-DERIVED EVERY PASS. A SITE
+        // ("after LIR instruction I, place a landing pad for block T") is
+        // monotone: once requested it is never withdrawn, and its identity is
+        // a LIR instruction id, which survives a re-layout exactly as
+        // `relaxedInsts`'s members do. Everything positional — where the
+        // cluster landed, which islands exist at which byte offsets — is
+        // re-derived from scratch on every pass, because byte offsets do not
+        // survive relaxation. That split is the same one the promoted set
+        // already makes, which is why islands ride this loop rather than
+        // needing one of their own.
+        //
+        // ★★★ THE ISLAND BOUND, AS ARITHMETIC.
+        //   Let R be the field's byte reach and S = R/2 its placement STRIDE
+        //   (`blockRelIslandStride`; the half is what leaves a placed island
+        //   slack against later layout growth). The resolver only ever aims at
+        //   an island STRICTLY CLOSER to the target than the site it is
+        //   standing on, and it only requests one S bytes further along, so
+        //   every hop of a chain advances at least S bytes and no target is
+        //   further away than the function's own size N. One branch's chain
+        //   therefore holds at most ceil(N / S) islands, and over the
+        //   function's B block-relative branches:
+        //
+        //       islandBound = B * (ceil(N / S) + 1)
+        //
+        //   The `+ 1` is SLACK, not arithmetic: the bound is re-derived each
+        //   pass from a layout the previous pass just grew, and without the
+        //   cushion it could refuse a placement it had already justified. The
+        //   argument is `B * ceil(N / S)`; the cushion is the `+ 1`, and which
+        //   is which is said rather than left for a reader to reconcile
+        //   against the code.
+        //
+        //   `islandCap` below restates exactly that and refuses LOUDLY if it
+        //   is ever exceeded, for the same reason `relaxBound` does: a
+        //   termination argument true of today's code is not a guarantee
+        //   about tomorrow's, and an assembler that spins is worse than one
+        //   that refuses. The chain cannot cycle either — each hop strictly
+        //   decreases a non-negative integer (the distance to the target) —
+        //   but that argument, too, is backed by a counter rather than
+        //   trusted. One `for`, explicit vectors: no recursion anywhere.
+        struct IslandSite {
+            std::uint32_t                 afterInstV;   // emitted after this inst
+            std::uint32_t                 targetBlock;  // where it branches
+            walker_util::BranchIslandBody body;         // what it is made of
+        };
+        auto const siteKeyLess = [](IslandSite const& a, IslandSite const& b) {
+            if (a.afterInstV != b.afterInstV) return a.afterInstV < b.afterInstV;
+            if (a.targetBlock != b.targetBlock) return a.targetBlock < b.targetBlock;
+            return static_cast<std::uint8_t>(a.body.kind)
+                 < static_cast<std::uint8_t>(b.body.kind);
+        };
+        std::vector<IslandSite> islandSites;
+
         // ⓘ THE LOOP BODY IS DELIBERATELY NOT RE-INDENTED, and the closing
         // brace below says so again. Indenting the ~280 lines this loop now
         // wraps would have produced a whitespace-only diff large enough to
@@ -302,6 +373,23 @@ AssembledModule assemble(Lir const&                 lir,
         // into `outFn.blockSymbols` once `blockOffsets` is complete (after
         // the funcEncodeOk check), mirroring the `blockPatches` discipline.
         std::vector<walker_util::BlockSymPatch> blockSymPatches;
+
+        // D-CSUBSET-LONG-BRANCH: the POSITIONAL half of the island machinery,
+        // rebuilt from scratch every pass because byte offsets do not survive
+        // a re-layout. `instEnds` is the offset→instruction index the site
+        // request needs (it is built in emit order, so it is sorted by offset
+        // by construction); `emittedIslands` is where this pass's landing pads
+        // actually landed, which is what an out-of-reach patch aims at.
+        struct EmittedIsland {
+            std::uint32_t                  bodyStart;    // first byte of the pad
+            std::uint32_t                  fieldOffset;  // its field's patch site
+            std::uint32_t                  targetBlock;
+            walker_util::BlockRelPatchKind kind;
+        };
+        std::vector<EmittedIsland> emittedIslands;
+        struct InstEnd { std::uint32_t endOffset; std::uint32_t instV; };
+        std::vector<InstEnd> instEnds;
+        instEnds.reserve(relaxBound);
 
         // D-ASM-ENCODE-FAILURE-FUNCTION-ROLLBACK (step 13.5 cycle 1
         // post-fold, silent-failure-hunter CRITICAL #2): track
@@ -341,6 +429,115 @@ AssembledModule assemble(Lir const&                 lir,
                 if (!ok) {
                     outFn.bytes.resize(preInstByteCount);
                     funcEncodeOk = false;
+                    continue;
+                }
+                instEnds.push_back(InstEnd{
+                    static_cast<std::uint32_t>(outFn.bytes.size()), inst.v});
+                // ── D-CSUBSET-LONG-BRANCH: THE ISLAND CLUSTER ────────────
+                //
+                // Every site requested after THIS instruction is materialized
+                // here, as one cluster:
+                //
+                //     B over        <- the jump-over, same declared body
+                //     B far         <- island, one per (target, field) site
+                //     B far'
+                //   over:           <- the next instruction, untouched
+                //
+                // ⚠ THE JUMP-OVER IS NOT OPTIONAL AND IT IS NOT A DETAIL.
+                // A landing pad is reached ONLY by a branch aimed at it; the
+                // instruction before it has no idea it is there. Without the
+                // jump-over the instruction stream falls straight into the
+                // first pad and takes a branch nobody asked for — valid
+                // bytes, wrong destination, no diagnostic. Its displacement
+                // is the cluster's own size, which is known HERE, at emit
+                // time, so it is written here rather than queued as a patch:
+                // a patch names a target BLOCK, and the landing point of a
+                // jump-over is a byte offset that belongs to no block.
+                //
+                // ⓘ A CLUSTER CARRIES NO SOURCE-MAP ENTRY, DELIBERATELY. The
+                // CFI producer derives each unwind range from consecutive
+                // `sourceMap` byte offsets, so an unmapped cluster extends the
+                // PRECEDING instruction's range over it — which is the correct
+                // description, because a branch changes no unwind state: it
+                // touches neither the stack pointer nor a callee-saved
+                // register. Attributing these bytes to a LIR instruction that
+                // did not emit them would be the false claim.
+                if (islandSites.empty()) continue;
+                auto const siteLo = std::lower_bound(
+                    islandSites.begin(), islandSites.end(), inst.v,
+                    [](IslandSite const& s, std::uint32_t v) {
+                        return s.afterInstV < v;
+                    });
+                auto siteHi = siteLo;
+                while (siteHi != islandSites.end()
+                       && siteHi->afterInstV == inst.v)
+                    ++siteHi;
+                if (siteLo == siteHi) continue;
+                std::size_t padBytes = 0;
+                for (auto it = siteLo; it != siteHi; ++it)
+                    padBytes += it->body.byteCount;
+                auto const appendBody =
+                    [&](walker_util::BranchIslandBody const& b) {
+                        for (std::uint8_t k = 0; k < b.byteCount; ++k)
+                            outFn.bytes.push_back(b.bytes[k]);
+                    };
+                auto const& over = siteLo->body;
+                auto const overStart =
+                    static_cast<std::uint32_t>(outFn.bytes.size());
+                appendBody(over);
+                {
+                    auto const g =
+                        walker_util::blockRelFieldGeometry(over.kind);
+                    auto const field = overStart + over.fieldOffset;
+                    std::int64_t const landing =
+                        static_cast<std::int64_t>(overStart)
+                      + over.byteCount + static_cast<std::int64_t>(padBytes);
+                    std::int64_t const hop =
+                        (landing - (static_cast<std::int64_t>(field) + g.pcBias))
+                            >> g.scaleLog2;
+                    // ⚠ A CLUSTER BIG ENOUGH TO OUTRUN ITS OWN JUMP-OVER IS A
+                    // REFUSAL, NOT A MASKED WRITE. The field write below
+                    // truncates to the field's width by construction, so an
+                    // unrepresentable hop would silently land somewhere inside
+                    // the cluster and execute a branch nobody asked for. It
+                    // cannot happen while the island bound holds — that is the
+                    // point of checking it rather than assuming it.
+                    if (hop < walker_util::blockRelFieldMin(g)
+                     || hop > walker_util::blockRelFieldMax(g)) {
+                        report(reporter, DiagnosticCode::A_FunctionEncodeAborted,
+                               DiagnosticSeverity::Error,
+                               std::format("function symbol id {} dropped — a "
+                                           "branch-island cluster of {} byte(s) "
+                                           "is larger than its own jump-over's "
+                                           "field can span, so control could "
+                                           "not be carried past it "
+                                           "(D-CSUBSET-LONG-BRANCH)",
+                                           outFn.symbol.v,
+                                           over.byteCount + padBytes));
+                        funcEncodeOk = false;
+                        continue;
+                    }
+                    walker_util::writeBlockRelField(outFn.bytes, field, g, hop);
+                }
+                for (auto it = siteLo; it != siteHi; ++it) {
+                    auto const start =
+                        static_cast<std::uint32_t>(outFn.bytes.size());
+                    appendBody(it->body);
+                    // The pad's OWN branch is an ordinary block-relative
+                    // patch, which is what makes a CHAIN free: if this pad
+                    // cannot reach the target either, the scan below asks for
+                    // one nearer, and this one aims at that.
+                    blockPatches.push_back(walker_util::BlockRelPatch{
+                        start + it->body.fieldOffset,
+                        it->targetBlock,
+                        it->body.kind,
+                        /*relaxable=*/false,
+                        /*widerFieldDeclared=*/false,
+                        /*instV=*/it->afterInstV,
+                        it->body});
+                    emittedIslands.push_back(EmittedIsland{
+                        start, it->body.fieldOffset, it->targetBlock,
+                        it->body.kind});
                 }
             }
         }
@@ -482,25 +679,156 @@ AssembledModule assemble(Lir const&                 lir,
         // function, so an out-of-reach non-escapable branch cannot come back
         // into reach: it will be measured again, against the settled layout,
         // and refused there with the number that is actually true.
+        //
+        // ★★★ WHERE A PATCH ACTUALLY AIMS — its target block, or the best
+        // island standing in for it. ONE function, read by the scan phase and
+        // by the resolver alike, for the same reason the geometry row is read
+        // by both: two components deciding one displacement from two rules
+        // agree only by review, and their disagreement is a valid instruction
+        // with the wrong destination.
+        //
+        // ⚠ AN ISLAND IS ADMISSIBLE ONLY IF IT IS STRICTLY CLOSER TO THE
+        // TARGET THAN THIS PATCH SITE IS. Each hop then strictly decreases a
+        // non-negative integer, so a chain terminates and no cycle of pads can
+        // form however they are laid out.
+        //
+        // ⚠ AND A PAD IS EXCLUDED FROM ITS OWN AIM BY THE IDENTITY TEST BELOW,
+        // NOT BY THAT STRICTNESS — a claim this comment made until a mutant
+        // refuted it. ✔MEASURED 2026-09-17: relaxing the gap comparison from
+        // `>=` to `>` left the whole suite GREEN, because the identity test is
+        // what stops a pad resolving to ITSELF (a branch to itself, the
+        // infinite loop D-ASM-PATCH-PARTIAL-OUTPUT-FAILLOUD keeps out of a
+        // binary) and the strictness only ever decided TIES between two
+        // different pads. Both lines stay — one is the termination argument,
+        // the other the self-exclusion — but they are no longer described as
+        // one thing doing two jobs.
+        auto const aimOffsetFor =
+            [&](walker_util::BlockRelPatch const& patch,
+                std::int64_t targetOffset) -> std::optional<std::int64_t> {
+            auto const g = walker_util::blockRelFieldGeometry(patch.kind);
+            std::int64_t const alignMask =
+                (std::int64_t{1} << g.scaleLog2) - 1;
+            auto const inReach = [&](std::int64_t dest) {
+                std::int64_t const delta =
+                    dest - (static_cast<std::int64_t>(patch.patchOffset)
+                            + g.pcBias);
+                if ((delta & alignMask) != 0) return false;
+                std::int64_t const disp = delta >> g.scaleLog2;
+                return disp >= walker_util::blockRelFieldMin(g)
+                    && disp <= walker_util::blockRelFieldMax(g);
+            };
+            if (inReach(targetOffset)) return targetOffset;
+            std::optional<std::int64_t> best;
+            std::int64_t bestGap =
+                targetOffset > static_cast<std::int64_t>(patch.patchOffset)
+                    ? targetOffset - static_cast<std::int64_t>(patch.patchOffset)
+                    : static_cast<std::int64_t>(patch.patchOffset) - targetOffset;
+            // ⚠ A PAD'S OWN FIELD KIND IS NOT FILTERED ON, AND THAT IS
+            // DELIBERATE. What this patch needs is a landing point IT can
+            // encode a displacement to — which `inReach` asks with THIS
+            // patch's geometry — and which is closer to the target than it is.
+            // How far the pad's own branch reaches is the pad's own problem:
+            // its field is an ordinary patch and resolves through this same
+            // function, chaining again if it must. Filtering on kind would
+            // make a narrow branch unable to use a wide pad standing right
+            // next to it.
+            for (auto const& pad : emittedIslands) {
+                if (pad.targetBlock != patch.targetBlock) continue;
+                if (pad.bodyStart + pad.fieldOffset == patch.patchOffset)
+                    continue;  // this patch IS that pad's own branch
+                std::int64_t const at = static_cast<std::int64_t>(pad.bodyStart);
+                std::int64_t const gap =
+                    targetOffset > at ? targetOffset - at : at - targetOffset;
+                if (gap >= bestGap) continue;
+                if (!inReach(at)) continue;
+                best    = at;
+                bestGap = gap;
+            }
+            return best;
+        };
+
         std::vector<std::uint32_t> newlyPromoted;
+        std::vector<IslandSite>    newSites;
         for (auto const& patch : blockPatches) {
-            if (!patch.relaxable) continue;
-            if (std::binary_search(relaxedInsts.begin(), relaxedInsts.end(),
-                                   patch.instV))
-                continue;  // already escaped; its wider field speaks for it
             auto const it = blockOffsets.find(patch.targetBlock);
             if (it == blockOffsets.end()) continue;  // resolver reports this
-            auto const g = walker_util::blockRelFieldGeometry(patch.kind);
-            std::int64_t const delta =
-                static_cast<std::int64_t>(it->second)
-              - (static_cast<std::int64_t>(patch.patchOffset) + g.pcBias);
-            std::int64_t const disp = delta >> g.scaleLog2;
-            if (disp >= walker_util::blockRelFieldMin(g)
-             && disp <= walker_util::blockRelFieldMax(g))
+            auto const target = static_cast<std::int64_t>(it->second);
+            bool const escapable =
+                patch.relaxable
+                && !std::binary_search(relaxedInsts.begin(), relaxedInsts.end(),
+                                       patch.instV);
+            // ⚠ THE ORDER IS NOT ARBITRARY. A patch that can escape into a
+            // WIDER field is escaped first: that costs one appended word and
+            // no jump-over, where an island costs a cluster and a second hop.
+            // Islands are what the widest field has INSTEAD of an escape, not
+            // a cheaper alternative to one.
+            if (escapable) {
+                auto const g = walker_util::blockRelFieldGeometry(patch.kind);
+                std::int64_t const delta =
+                    target - (static_cast<std::int64_t>(patch.patchOffset)
+                              + g.pcBias);
+                std::int64_t const disp = delta >> g.scaleLog2;
+                if (disp >= walker_util::blockRelFieldMin(g)
+                 && disp <= walker_util::blockRelFieldMax(g))
+                    continue;
+                newlyPromoted.push_back(patch.instV);
                 continue;
-            newlyPromoted.push_back(patch.instV);
+            }
+            if (!patch.island.declared()) continue;  // resolver refuses it
+            if (aimOffsetFor(patch, target).has_value()) continue;
+            // ── ASK FOR A LANDING PAD, ONE STRIDE ALONG THE WAY ──────────
+            // Half the field's reach towards the target, at the nearest
+            // instruction boundary. The stride cannot overshoot the target:
+            // control only arrives here when the target is further away than
+            // the WHOLE reach, and the stride is half of it.
+            std::int64_t const stride =
+                walker_util::blockRelIslandStride(patch.kind);
+            std::int64_t const from =
+                static_cast<std::int64_t>(patch.patchOffset);
+            std::int64_t desired = target >= from ? from + stride
+                                                  : from - stride;
+            if (desired < 0) desired = 0;
+            if (instEnds.empty()) continue;  // nothing encoded to hang it on
+            auto const nearest = [&]() -> std::uint32_t {
+                auto lo = std::lower_bound(
+                    instEnds.begin(), instEnds.end(), desired,
+                    [](InstEnd const& e, std::int64_t v) {
+                        return static_cast<std::int64_t>(e.endOffset) < v;
+                    });
+                if (lo == instEnds.end()) return instEnds.back().instV;
+                if (lo == instEnds.begin()) return lo->instV;
+                auto const prev = std::prev(lo);
+                std::int64_t const dHi =
+                    static_cast<std::int64_t>(lo->endOffset) - desired;
+                std::int64_t const dLo =
+                    desired - static_cast<std::int64_t>(prev->endOffset);
+                return dLo <= dHi ? prev->instV : lo->instV;
+            }();
+            newSites.push_back(IslandSite{nearest, patch.targetBlock,
+                                          patch.island});
         }
-        if (!newlyPromoted.empty()) {
+        if (!newSites.empty()) {
+            std::sort(newSites.begin(), newSites.end(), siteKeyLess);
+            newSites.erase(
+                std::unique(newSites.begin(), newSites.end(),
+                            [&](IslandSite const& a, IslandSite const& b) {
+                                return !siteKeyLess(a, b) && !siteKeyLess(b, a);
+                            }),
+                newSites.end());
+            std::size_t const before = islandSites.size();
+            for (auto const& s : newSites) {
+                auto const at = std::lower_bound(islandSites.begin(),
+                                                 islandSites.end(), s,
+                                                 siteKeyLess);
+                if (at != islandSites.end() && !siteKeyLess(s, *at)) continue;
+                islandSites.insert(at, s);
+            }
+            // A pass that asked only for sites it already has made no
+            // progress; let it fall through to the resolver, which refuses
+            // loudly against this settled layout rather than looping.
+            if (islandSites.size() == before) newSites.clear();
+        }
+        if (!newlyPromoted.empty() || !newSites.empty()) {
             std::sort(newlyPromoted.begin(), newlyPromoted.end());
             newlyPromoted.erase(
                 std::unique(newlyPromoted.begin(), newlyPromoted.end()),
@@ -508,23 +836,54 @@ AssembledModule assemble(Lir const&                 lir,
             relaxedInsts.insert(relaxedInsts.end(),
                                 newlyPromoted.begin(), newlyPromoted.end());
             std::sort(relaxedInsts.begin(), relaxedInsts.end());
-            // The monotonicity backstop. Reaching it means the promoted set
-            // grew more times than the function has instructions, which no
-            // sequence of promotions can do — so it is an internal-invariant
+            // ── THE ISLAND BOUND, EVALUATED ─────────────────────────────
+            // `B * ceil(N / S)` from the block comment at the top of this
+            // loop, with N this pass's byte size, S the narrowest stride any
+            // declared field has, and B the function's own branches — the
+            // patch count MINUS one patch per island, because each island
+            // contributes exactly one and counting them would let the bound
+            // chase its own tail.
+            std::uint64_t const islandCap = [&] {
+                std::int64_t stride = walker_util::blockRelIslandStride(
+                    static_cast<walker_util::BlockRelPatchKind>(0));
+                for (std::size_t k = 1;
+                     k < walker_util::kBlockRelPatchKindCount; ++k) {
+                    auto const s = walker_util::blockRelIslandStride(
+                        static_cast<walker_util::BlockRelPatchKind>(k));
+                    if (s < stride) stride = s;
+                }
+                std::uint64_t const branches =
+                    blockPatches.size() >= islandSites.size()
+                        ? blockPatches.size() - islandSites.size()
+                        : 0u;
+                std::uint64_t const hops =
+                    (static_cast<std::uint64_t>(outFn.bytes.size())
+                     + static_cast<std::uint64_t>(stride) - 1u)
+                    / static_cast<std::uint64_t>(stride);
+                return branches * (hops + 1u);
+            }();
+            // The monotonicity backstop. Reaching it means the two monotone
+            // sets between them grew more times than the instruction count
+            // plus the island bound allows, which no sequence of promotions
+            // and placements can do — so it is an internal-invariant
             // violation, not a large program, and it is said that way.
-            if (relaxPass + 1 >= relaxBound) {
+            if (islandSites.size() > islandCap
+             || relaxPass + 1 >= relaxBound + islandCap) {
                 report(reporter, DiagnosticCode::A_FunctionEncodeAborted,
                        DiagnosticSeverity::Error,
                        std::format("function symbol id {} dropped — long-"
                                    "branch relaxation did not reach a fixed "
                                    "point within {} passes ({} branch(es) "
-                                   "promoted). The promoted set is monotone "
-                                   "and bounded by the instruction count, so "
-                                   "exceeding this bound is an internal-"
-                                   "invariant violation, not an oversized "
-                                   "function (D-CSUBSET-LONG-BRANCH)",
-                                   outFn.symbol.v, relaxBound,
-                                   relaxedInsts.size()));
+                                   "promoted, {} branch island(s) placed "
+                                   "against a bound of {}). Both sets are "
+                                   "monotone — one bounded by the instruction "
+                                   "count, the other by branches x ceil(bytes "
+                                   "/ half-reach) — so exceeding this bound is "
+                                   "an internal-invariant violation, not an "
+                                   "oversized function (D-CSUBSET-LONG-BRANCH)",
+                                   outFn.symbol.v, relaxBound + islandCap,
+                                   relaxedInsts.size(), islandSites.size(),
+                                   islandCap));
                 outFn.bytes.clear();
                 outFn.relocations.clear();
                 outFn.sourceMap.clear();
@@ -574,8 +933,16 @@ AssembledModule assemble(Lir const&                 lir,
             // backstop live: a kind with no row now refuses every displacement
             // loudly instead of silently writing none.
             auto const g = walker_util::blockRelFieldGeometry(patch.kind);
+            // D-CSUBSET-LONG-BRANCH: what this field actually holds is a
+            // displacement to the AIM POINT — the target block when it is in
+            // reach, and otherwise the landing pad standing in for it. When
+            // neither is in reach the aim falls back to the target itself, so
+            // the refusal below quotes the displacement the programmer's
+            // branch really needs rather than a pad's.
+            auto const aim = aimOffsetFor(patch,
+                                          static_cast<std::int64_t>(it->second));
             std::int64_t const delta =
-                static_cast<std::int64_t>(it->second)
+                aim.value_or(static_cast<std::int64_t>(it->second))
               - (static_cast<std::int64_t>(patch.patchOffset)
                  + static_cast<std::int64_t>(g.pcBias));
             // A scaled field cannot represent a displacement that is not a
@@ -612,6 +979,15 @@ AssembledModule assemble(Lir const&                 lir,
                 // `B` IS the Imm26 form. Which case this is can only be
                 // answered by the OPCODE's own encoding variants, so the
                 // walker stamps the answer and the resolver quotes it.
+                // ★★★ AND THE PRESCRIPTION CHANGED WHEN THE FRAME DID. It used
+                // to end, for the widest field, with "the escape is then a
+                // different ADDRESSING MODE (an indirect branch through a
+                // materialized absolute address), which needs a per-block
+                // symbol the assembler cannot mint". That is REFUTED: the
+                // widest field escapes into a NEARER TARGET, not a wider one,
+                // and a landing pad is a copy of a branch this opcode already
+                // declares. So the remaining ways to be here are three, and
+                // each names something a reader can actually do.
                 bool const escapableInPrinciple = patch.widerFieldDeclared;
                 report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
                        DiagnosticSeverity::Error,
@@ -630,46 +1006,38 @@ AssembledModule assemble(Lir const&                 lir,
                                        "it to the wider slot, or make it the "
                                        "narrowest block-relative field of the "
                                        "instruction so the election picks it"
+                                     : patch.island.declared()
+                                     ? "This opcode declares a branch island "
+                                       "body and the resolver still could not "
+                                       "place one within reach of this site — "
+                                       "an internal-invariant violation of the "
+                                       "island placement, not a property of "
+                                       "the program: report it against this "
+                                       "anchor"
                                      : "This opcode declares NO self-contained "
-                                       "word carrying a wider block-relative "
-                                       "field. If the TARGET has one, "
-                                       "declaring that word on this opcode's "
-                                       "encoding row is the fix and the escape "
-                                       "election will find it; if this is "
-                                       "already the target's widest "
-                                       "block-relative field, no encoding row "
-                                       "can rescue it — the escape is then a "
-                                       "different ADDRESSING MODE (an indirect "
-                                       "branch through a materialized absolute "
-                                       "address), which needs a per-block "
-                                       "symbol the assembler cannot mint"));
+                                       "unconditional-branch word. That word "
+                                       "is what both remedies are made of: a "
+                                       "WIDER one is an escape, and one of "
+                                       "EQUAL reach is a branch island, which "
+                                       "rescues even the target's widest "
+                                       "field by standing nearer. Declare the "
+                                       "unconditional branch on this opcode's "
+                                       "encoding row — one self-contained word "
+                                       "(or, on a byte-oriented shape, one "
+                                       "wire whose `prefixOpcodeBytes` are a "
+                                       "whole unconditional branch) — and both "
+                                       "elections will find it"));
                 patchOk = false;
                 break;
             }
-            if (g.wholeField) {
-                // The displacement IS the four bytes at the patch site (x86
-                // rel32): write all 32 bits, no read-modify-write.
-                asm_byte_emit::writeU32LEAt(outFn.bytes, patch.patchOffset,
-                    static_cast<std::uint32_t>(static_cast<std::int32_t>(disp)));
-            } else {
-                // The displacement is a bit-window inside a 32-bit LE word:
-                // READ the word, replace only [lsb, lsb+width), write it back,
-                // so the opcode / cond-nibble / register bits already emitted
-                // into that word survive (a whole-word store would clobber
-                // them).
-                std::uint32_t const o = patch.patchOffset;
-                std::uint32_t word =
-                    static_cast<std::uint32_t>(outFn.bytes[o])
-                  | (static_cast<std::uint32_t>(outFn.bytes[o + 1]) << 8)
-                  | (static_cast<std::uint32_t>(outFn.bytes[o + 2]) << 16)
-                  | (static_cast<std::uint32_t>(outFn.bytes[o + 3]) << 24);
-                std::uint32_t const mask = (g.width >= 32u)
-                    ? 0xFFFFFFFFu
-                    : ((1u << g.width) - 1u);
-                word = (word & ~(mask << g.lsb))
-                     | ((static_cast<std::uint32_t>(disp) & mask) << g.lsb);
-                asm_byte_emit::writeU32LEAt(outFn.bytes, o, word);
-            }
+            // The two write disciplines (whole 4-byte field vs. a bit-window
+            // read-modify-write) live in `walker_util::writeBlockRelField`,
+            // because the island cluster's jump-over writes the same shape at
+            // emit time and two spellings of one write is the same
+            // N-transforms-on-one-value shape the geometry table exists to
+            // close.
+            walker_util::writeBlockRelField(outFn.bytes, patch.patchOffset,
+                                            g, disp);
             // (The trailing `if (!patchOk) break;` this loop used to carry was
             // the `switch`'s exit door: a failing arm's `break` left the SWITCH
             // and needed a second one to leave the loop. Without the switch,

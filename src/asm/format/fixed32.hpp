@@ -80,4 +80,20 @@ encode(Lir const&                  lir,
        std::span<std::uint32_t const> relaxedInsts,
        DiagnosticReporter&         reporter);
 
+// [[D-CSUBSET-LONG-BRANCH]]: WHAT THIS OPCODE DECLARES AS ITS SELF-CONTAINED
+// UNCONDITIONAL BRANCH — the body a branch island is made of, or an undeclared
+// one when the opcode declares no such word. A pure function of the config.
+//
+// ★★★ IT IS PUBLIC BECAUSE THE ANSWER CANNOT OTHERWISE BE OBSERVED WHERE IT
+// MATTERS. An island only appears in emitted bytes when a branch outgrows its
+// field, and the arm64 `Imm26` edge is a 134 MB function body while the x86-64
+// `rel32` edge is over 2 GiB — costs that are properties of those fields, not
+// of a test's budget. The MACHINERY is pinned end-to-end on a narrow field at
+// kilobyte scale; what a REAL target declares as its island body is pinned
+// here, by reading it. Saying that composition out loud is the point: without
+// this query the x86 arm would have no pin at all and the row would be free to
+// imply an edge measurement nobody took.
+[[nodiscard]] DSS_EXPORT walker_util::BranchIslandBody
+islandBody(TargetOpcodeInfo const& info);
+
 } // namespace dss::fixed32
