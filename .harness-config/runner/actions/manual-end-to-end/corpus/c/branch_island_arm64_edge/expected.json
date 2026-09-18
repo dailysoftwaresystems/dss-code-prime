@@ -1,0 +1,12 @@
+{
+  "$comment": "D-CSUBSET-LONG-BRANCH — the AArch64 BRANCH ISLAND edge. ★★★ `manualRun` IS THE DECLARATION AND IT DEFAULTS TO FALSE: an entry that does not declare it true is SKIPPED by name, so this directory is never a place where something runs by accident. What keeps it out of a DEFAULT run is not this key but the LOCATION — ✔MEASURED at this tree, both corpus harnesses glob `${CMAKE_SOURCE_DIR}/examples/*/*/expected.json` — exactly that ROOT — so nothing here is registered as a ctest entry at all and the default entry count cannot move. ⚠ THE ROOT IS THE GUARANTEE, NOT THE DEPTH: this corpus is itself `corpus/<language>/<name>/` now, mirroring `examples/` and `real-examples/`, and its driver discovers entries recursively. The key decides what the manual runner executes; the location decides what the gate sees. ⚠ THE SCHEMA IS THIS RUNNER'S, NOT THE CORPUS HARNESSES'. It reads `language`, `source`, `targets[0].spec`, `targets[0].artifact` and `manualRun`; keys the shipped corpus manifests carry are deliberately NOT mirrored here, because a second half-implementation of that schema would be two vocabularies drifting apart. ⓘ NO `exitCode`, and the absence is a fact rather than an omission: this entry's assertion is that the compile COMPLETES and emits an image past the island edge, and running a >134 MB binary under an emulator would measure the emulator. Whether it runs natively on the arm64 leg is a question for the evidence write-up, not an assertion here. ⓘ NO `optimizedPipelines`: the baseline pipeline is what the evidence quotes, and doubling a run of this size to compare two would double the one cost this entry exists to bound. ⚠ ONE TARGET. `Imm26` is an AArch64 field; x86-64's block-relative slot is `rel32` at ±2 GiB, whose island edge needs a >2 GiB function held across every relaxation pass. Whether that is honest on available hardware is decided by measurement and recorded in docs/ — it is NOT implied covered by this entry.",
+  "manualRun": true,
+  "language": "c",
+  "source": "main.c",
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main"
+    }
+  ]
+}

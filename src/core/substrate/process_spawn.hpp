@@ -108,9 +108,10 @@
 //   kill a child that overruns it, and a killed child must still yield whatever
 //   it managed to print; a pipe is the only thing that can be read out of a
 //   process you are about to terminate. Paying for that means paying for the
-//   concurrent drain thread its `D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS`
-//   note measures. This facility enforces no deadline and kills nothing, so it
-//   captures into a FILE and the whole class of buffer-limit deadlocks is
+//   concurrent drain thread `run_binary.hpp`'s own note measures — draining
+//   only AFTER the child has exited deadlocks. This facility enforces no
+//   deadline and kills nothing, so it captures into a FILE and the whole class
+//   of buffer-limit deadlocks is
 //   absent rather than managed. Sharing the capture would mean importing the
 //   drain, and the drain exists only to survive the timeout this facility does
 //   not have.
@@ -123,8 +124,8 @@
 // `tryBuildWindowsCommandLine`) and `run_binary.hpp`'s Windows arm call it.
 // There is exactly ONE implementation of the algorithm in the repository.
 // `run_binary.hpp` used to carry a second, half-correct copy that escaped
-// neither embedded quotes nor trailing backslashes and said so in a comment
-// (D-TEST-RUN-BINARY-ARGV-QUOTING-UNESCAPED); that copy is gone.
+// neither embedded quotes nor trailing backslashes and said so in a comment;
+// that copy is gone.
 //
 // HOW IT IS SHARED WITHOUT A LINK — and why it is NOT shared by linking. The
 // obvious wiring fails: `integrated_tests` (`integrated_tests/runner.cpp`)
@@ -272,8 +273,8 @@ spawnAndWaitInherit(std::vector<std::string> const& argv,
 // AFTERWARDS deadlocks the moment the child writes past that buffer: the child
 // blocks in `write`, the parent blocks in the wait, and neither moves. That is
 // not a hypothesis — `tests/test_support/run_binary.hpp` shipped exactly that
-// shape and MEASURED it (D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS, ~7 KB
-// of JSON, two spawns consuming 240 s of a 240.7 s run before the harness
+// shape and MEASURED it (~7 KB of JSON, two spawns consuming 240 s of a
+// 240.7 s run before the harness
 // killed a child that was working correctly). Its fix was a drain thread
 // running CONCURRENTLY with the wait, which is correct THERE and would be a
 // poor trade here: this facility has NO TIMEOUT (see the two-implementations

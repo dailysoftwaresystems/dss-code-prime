@@ -1096,7 +1096,7 @@ TEST(TargetSchema, CallPushBytesShippedX8664SysVDeclaresEight) {
 }
 
 TEST(TargetSchema, SlotAlignedShippedMsX64IsTrueOthersFalse) {
-    // D-ML7-2.6 (closed co-with-D-ML7-2.2, 2026-06-02): the shipped
+    // D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7 (closed co-with-D-ML7-2.2, 2026-06-02): the shipped
     // schemas must declare `slotAligned: true` on ms_x64 (the only
     // SLOT-ALIGNED cc DSS supports today) and leave it false elsewhere.
     // A schema regression that silently flipped this would: (a) flip
@@ -1129,7 +1129,7 @@ TEST(TargetSchema, SlotAlignedShippedMsX64IsTrueOthersFalse) {
 }
 
 TEST(TargetSchema, SlotAlignedRejectsNonBoolean) {
-    // D-ML7-2.6 validator: the slotAligned field must be a JSON
+    // D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7 validator: the slotAligned field must be a JSON
     // boolean. A non-boolean value (string "true", number 1, null,
     // etc.) is rejected loud with C_MalformedJson — matches the
     // sibling fields' (`isCall`, `pcRelative`, `rexW`) discipline.

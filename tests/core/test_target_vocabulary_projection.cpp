@@ -94,8 +94,8 @@ constexpr char const* kBadSpelling = "zzNotAnyVocabularySpelling";
 
 // ★ `summarize`, `quotedTokens`, `namesContain` and `findVocabularyMessage`
 // used to be file-local copies here. They now have ONE owner —
-// `vocabulary_projection_probe.hpp` — for the reason this whole file exists:
-// D-TEST-VOCABULARY-PROJECTION-PROBE-HELPERS-ARE-COPIED-PER-FILE. The header
+// `vocabulary_projection_probe.hpp` — for the reason this whole file exists: a
+// probe helper copied per file drifts per file. The header
 // records which of the copies had already drifted apart, and in which
 // direction each merge resolved.
 

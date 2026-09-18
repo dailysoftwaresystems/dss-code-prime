@@ -1,7 +1,7 @@
 // FC3 c2 — the UNSIGNED-INT (U32) sibling of `unsigned_division/`
 // (D-CSUBSET-UDIV-RUNTIME-HIGH-BIT-PIN's original 0x80001003u literal
 // shape; the U64 example carried the pin while U32 arithmetic was
-// D-CSUBSET-32BIT-ALU-FORMS-gated — c2's 32-bit div family lifts it).
+// gated on D-CSUBSET-32BIT-ALU-FORMS — c2's 32-bit div family lifts it).
 //
 // A HIGH-BIT `unsigned int` dividend exercises the 32-bit UNSIGNED
 // divide (x86: XOR EDX,EDX + 32-bit F7 /6 DIV; arm64: UDIV W-form):

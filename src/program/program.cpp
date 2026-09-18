@@ -219,7 +219,8 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
 }
 
 // ── THE BUILD'S STATEMENT OF RECORD ABOUT WHAT IT PRODUCED ─────────────────
-// D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING (TF-C118).
+// TF-C118 — born from a harness fixture that RECONSTRUCTED the artifact name
+// from its own suffix table and so assumed the POSIX spelling.
 //
 // ★ WHY THIS EXISTS. Until now a SUCCESSFUL build said nothing at all about
 // the file it had written, so every consumer had to RECONSTRUCT the name —
@@ -848,7 +849,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         return std::nullopt;
     }
 
-    // D-LK6-8.2 cross-validation: confirm the (target, format) pair's
+    // D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET cross-validation: confirm the (target, format) pair's
     // machine identity matches before linking. Without this guard, a
     // hand-edited format JSON with the wrong `machine` value would
     // silently dispatch the linker to the wrong PLT-stub emitter,
@@ -898,7 +899,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         return std::nullopt;
     }
 
-    // D-FF3-3 (commit 9440143): resolve the (target, format) calling
+    // D-FF3-3-RESOLVED-CC-INDEX-THREADED (commit 9440143): resolve the (target, format) calling
     // convention BEFORE dispatching to compileSingleUnit. Replaces
     // the previous silent dispatch to `callingConventions[0]` —
     // that hardcode produced SysV register assignments on PE+x86_64
@@ -1172,9 +1173,9 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         return std::nullopt;
     }
 
-    // D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING (TF-C118):
-    // THE ONE report site for the three link/write dispatches below (static
-    // archive / single CU / merged multi-CU). They are three routes to the
+    // The artifact report (TF-C118) — THE ONE report site for the three
+    // link/write dispatches below (static archive / single CU / merged
+    // multi-CU). They are three routes to the
     // SAME `outPath`, so the report is attached at their only common ancestor
     // rather than copied into each — and it is attached to their RESULT, so
     // the line cannot be printed for a write that failed. Every `return` of a
@@ -2342,7 +2343,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
         // D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): the <stdio.h> printf-family shim sibling —
         // see `synth_stdio_shim.hpp` for the full contract. A clean no-op when
         // `mergedStdioRecipes` is empty. The va_list block is read from the SAME
-        // resolved CC (`abi->cc`, D-FF3-3 above) the merged module's calling-convention
+        // resolved CC (`abi->cc`, D-FF3-3-RESOLVED-CC-INDEX-THREADED above) the merged module's calling-convention
         // index was derived from — no second lookup, no format-name branch. It is passed
         // WHOLE, not narrowed to `.strategy`: `variadicUsesOverflowBase` is what selects
         // the shim's va leaf, and dropping it here would silently emit the home-base leaf

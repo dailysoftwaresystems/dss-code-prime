@@ -34,11 +34,13 @@ using dss::cu_test::hasCode;
 using dss::cu_test::loadShippedSchema;
 
 // RAII temp directory for the c include tests: files must share a
-// directory so same-directory `#include` resolution finds them. The facade —
-// and the reason its unique-path scheme is NOT reimplemented locally, defect
-// D-TEST-FIXED-SCRATCH-PATH-POPULATION — lives in `toy_cu_fixture.hpp`; it was
-// identical here and in test_type_name_oracle.cpp. The GROUP below is this
-// suite's own, so its scratch tree stays separate from that sibling's.
+// directory so same-directory `#include` resolution finds them. The facade
+// lives in `toy_cu_fixture.hpp` — it was identical here and in
+// test_type_name_oracle.cpp — and its unique-path scheme is NOT reimplemented
+// locally because a reimplemented one is exactly what collided: a fixed scratch
+// path let concurrent processes of this binary delete each other's fixtures.
+// The GROUP below is this suite's own, so its scratch tree stays separate from
+// that sibling's.
 constexpr char kScratchGroup[] = "cu4-import-resolver";
 using TempDir = dss::cu_test::ScratchSourceDir<kScratchGroup>;
 

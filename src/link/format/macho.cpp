@@ -2444,7 +2444,7 @@ encode(AssembledModule const&    module,
     // ── Layout: header + load commands + section data + relocs
     //    + symtab + strtab ─────────────────────────────────────
     //
-    // Section count is DERIVED (architect D-LK2-5 precedent — pre-fix LK2
+    // Section count is DERIVED (architect D-LK2-5-DERIVED-SECTION-COUNT precedent — pre-fix LK2
     // hardcoded `1` and had to be folded into a derived size; ELF was
     // rewritten the same way at LK1): `numSections` (computed with the
     // section ordinals above) flows through the `mach_header_64.sizeofcmds`

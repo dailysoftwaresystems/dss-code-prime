@@ -154,7 +154,8 @@ _repo_root() {
 
 # `.worktrees/` must be IGNORED, and that is checked rather than assumed: it is the
 # single rule that keeps N full checkouts off every gate host, because the carriages
-# derive their exclude list from git (scripts/carriage-excludes/).
+# derive what they carry from git, and the harness also names `.worktrees` outright in
+# `sync.neverTransfer`.
 # ⚠ The trailing slash is required -- `git check-ignore .worktrees` answers
 #   NOT-IGNORED for a directory that does not exist yet, while `.worktrees/` answers
 #   correctly. ✔MEASURED 2026-08-26, both spellings, absent directory.
@@ -239,11 +240,13 @@ cmd_add() {  # <name> [committish]
   _say "build into $rel/build/$name -- never into the main tree's build/."
   # ⚠ THE FIRST BUILD OF A FRESH TREE NEEDS --build-type, AND THIS LINE EXISTS
   #    BECAUSE THE ORCHESTRATOR KEPT WRITING BRIEFS THAT OMITTED IT.
-  #    `local-build.sh` maps only `dbg` -> Debug and `rel` -> Release, and REFUSES
-  #    (rc 3) to guess one for any other tree name. That refusal is CORRECT and is
-  #    not to be softened: guessing Debug for an unknown lane would hand a
-  #    Release-intending caller a Debug tree silently, which is the
-  #    fails-to-WRONG-ANSWER direction. ✔MEASURED (P63): a lane hit the rc 3, and
+  #    ⓘ THE FLAG IS GONE AND THE LESSON IS NOT. The build script that took
+  #    `--build-type` mapped only `dbg` -> Debug and `rel` -> Release and REFUSED
+  #    (rc 3) to guess one for any other tree name, because guessing Debug for an
+  #    unknown lane would hand a Release-intending caller a Debug tree silently --
+  #    the fails-to-WRONG-ANSWER direction. `dssharness` removes the guess entirely:
+  #    the build type is part of the LEG NAME, so there is nothing to infer from a
+  #    tree name at all. ✔MEASURED (P63): a lane hit the rc 3, and
   #    the brief that sent it there had never been run by its author --
   #    [[D-CYCLE-BRIEF-STATED-AN-INVOCATION-ITS-AUTHOR-HAD-NEVER-RUN]], whose class
   #    this repository has now paid for more than once.
@@ -253,8 +256,15 @@ cmd_add() {  # <name> [committish]
   #    evidence-preserve step, one verb below.
   #    ⓘ `--configure` is NOT needed: an absent build.ninja enters the configure
   #    block on its own. Naming it would teach a redundant flag.
-  _say "FIRST build of this tree:  DSS_JOBS=6 bash scripts/local-build/local-build.sh --tree $name --build-type Debug"
-  _say "        every build after:  DSS_JOBS=6 bash scripts/local-build/local-build.sh --tree $name"
+  # ⓘ ONE VERB, AND THE DEBUG/RELEASE CHOICE IS A LEG NAME. `--build-type` and
+  # `--tree` are gone with the script that had them: DssHarness reads its legs and
+  # its build root from `.harness-config/config.json`, and each leg builds in its
+  # own variant-keyed directory INSIDE the tree the command is run in. ✔MEASURED
+  # from a lane worktree: `dssharness build --legs windows-x86_64-debug` configured
+  # `-S <lane>/. -B <lane>/build/x86_64-mingw-gcc-debug -G Ninja` and passed.
+  # First build and every build after are the same command — the tool decides.
+  _say "build this tree:  cd $abs && dssharness build --legs windows-x86_64-debug"
+  _say "     its legs:    dssharness legs"
   printf '%s\n' "$abs"
 }
 
@@ -367,7 +377,7 @@ _lw_preserve() {
 #    Gating `.temp/<lane>-scratch/` alone would repeat the P50 mistake one convention
 #    later -- a lane that names its directory differently is unguarded again. The cost
 #    is measured and accepted: `.temp/` also holds a guard's fixture scratch
-#    (`test-run-gate-scratch/`, 132 files in every live lane that ran the suite), so a
+#    (132 files in every live lane that ran the suite, from a fixture since retired), so a
 #    preserve copies that too. "Too much preserved" fails as a copy; "too little" fails
 #    as evidence nobody can get back. ⓘ No `.temp/` or `scratchpad/` exists BELOW the top
 #    level of any live lane (✔MEASURED the same day), so these two are every location

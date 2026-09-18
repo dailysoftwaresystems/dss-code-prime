@@ -219,8 +219,8 @@ combineBinary(Hir const& hir, TypeInterner& interner, HirNodeId expr,
         //     regardless of operand types (force-override; applyBinaryInt
         //     inherited LHS's core which is wrong for the cmp case).
         //   - Shift ops (Shl/Shr): the result type is the config-driven
-        //     shift-result rule (D-UAC-SHIFT-RESULT-RULE-CONFIG) — already
-        //     resolved and stamped on THIS node's authoritative typeId by
+        //     shift-result rule — already resolved and stamped on THIS node's
+        //     authoritative typeId by
         //     cst_to_hir's `shiftResultType` funnel. Read it directly so
         //     the folded mirror agrees with the verb for EVERY language
         //     (never re-derive C's promoted-left discipline here — that

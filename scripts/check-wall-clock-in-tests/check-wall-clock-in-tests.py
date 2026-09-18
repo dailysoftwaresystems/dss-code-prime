@@ -546,8 +546,9 @@ def main():
     if total:
         print('wall-clock-in-tests: OK (%d files scanned; %d pre-existing literal(s) '
               'in %d file(s), all within the INVENTORY ratchet; %d allowlisted by '
-              'proof). DEBT, not a pass - see '
-              'D-TEST-WALL-CLOCK-LITERAL-INVENTORY-IS-DEBT.'
+              'proof). DEBT, not a pass - an INVENTORY entry is an UNEXAMINED wall-clock '
+              'literal, not a sanctioned one; only the ALLOWLIST carries a proof. Green '
+              'here means only that no NEW literal landed.'
               % (scanned, total, len(per_file), len(ALLOWLIST)))
     else:
         print('wall-clock-in-tests: OK (%d files, 0 live wall-clock literals, %d '

@@ -430,8 +430,7 @@ struct DSS_EXPORT TranslationTimestamp {
 // stopwatch. ✔MEASURED on CI run 33156833090: the ratio pin that stood in for
 // this counter read x1.048 against a bound of 0.85 on `linux-gcc-release` and
 // PASSED on `linux-arm64-gcc-release` in the same run at the same commit, which
-// is a property of the runner rather than of the compiler
-// [[D-TEST-PP-NO-REWORK-PINS-A-COUNT-WITH-A-WALL-CLOCK-RATIO]].
+// is a property of the runner rather than of the compiler.
 //
 // ⚠ COUNTERS, NOT A CACHE POLICY SURFACE. There is nothing to configure here
 // and nothing a caller may switch off: the memo is a memo of a pure function,

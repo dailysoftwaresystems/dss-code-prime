@@ -6,6 +6,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
+#include "link/branch_reloc_geometry.hpp"
 #include "link/format/byte_emit.hpp"
 
 #include <cstdint>
@@ -60,9 +61,17 @@
 //   * Linear:                value = S + A + (pcRelative ? -P : 0) + addendBias
 //                            written `widthBytes` LE into `text` at the patch site.
 //                            Covers x86_64 rel32 / abs32 / abs64 + ARM64 abs64.
-//   * Aarch64Call26:         value = (S + A - P) >> 2; signed 26-bit;
-//                            OR (value & 0x03FFFFFF) into the 32-bit
-//                            instruction word at `text[patchOff..+4]`.
+//   * Aarch64Call26:         value = (S + A - P) >> scale; signed `fieldBits`;
+//                            OR it into the 32-bit instruction word at
+//                            `text[patchOff..+4]` at the row's own bit window.
+//                            ⚠ The scale, width and window are NOT spelled in
+//                            the arm — they are read from
+//                            `link::branchRelocGeometry`, which the veneer
+//                            pass reads too
+//                            ([[D-LK-AARCH64-CALL26-BEYOND-RANGE-HAS-NO-VENEER]]).
+//                            They
+//                            used to be a literal 26, a bare
+//                            `>>2` and a bare 0x03FFFFFF here.
 //   * Aarch64AdrPrelPgHi21:  value = ((S + A) >> 12) - (P >> 12);
 //                            signed 21-bit; ADRP-split bits[1:0]→immlo[30:29],
 //                            bits[20:2]→immhi[23:5].
@@ -350,11 +359,23 @@ planGotSlotSymbols(AssembledModule const& module,
                     break;
                 }
                 case RelocFormulaKind::Aarch64Call26: {
-                    // value = (S + A - P) >> 2; signed 26 bits.
+                    // value = (S + A - P) >> scale; signed `fieldBits` bits.
+                    //
+                    // ★★★ THE THREE NUMBERS ARE READ, NOT SPELLED. They used to
+                    // be a literal `26`, a bare `>> 2` and a bare `0x03FFFFFF`
+                    // here — and the veneer pass of
+                    // [[D-LK-AARCH64-CALL26-BEYOND-RANGE-HAS-NO-VENEER]]
+                    // needs the identical three to decide whether a
+                    // call can reach its callee at all. Two components deciding
+                    // one field's shape from two sources agree only by review,
+                    // and their disagreement writes a VALID BRANCH TO THE WRONG
+                    // PLACE. `branchRelocGeometry` is now the only source.
+                    auto const bg =
+                        ::dss::link::branchRelocGeometry(tri->formulaKind);
                     std::int64_t const delta =
                         static_cast<std::int64_t>(S) + A
                         - static_cast<std::int64_t>(P);
-                    if ((delta & 0x3) != 0) {
+                    if ((delta & ((std::int64_t{1} << bg.scaleLog2) - 1)) != 0) {
                         emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                              prefixStr + ": relocation '" + tri->name
                                  + "' (S+A-P)=" + std::to_string(delta)
@@ -362,18 +383,42 @@ planGotSlotSymbols(AssembledModule const& module,
                                    "branch target must be word-aligned.");
                         return false;
                     }
-                    std::int64_t const value = delta >> 2;
-                    if (!fitsSignedNBits(value, 26)) {
+                    std::int64_t const value = delta >> bg.scaleLog2;
+                    std::uint32_t const mask =
+                        (bg.fieldBits >= 32u)
+                            ? 0xFFFFFFFFu
+                            : (((1u << bg.fieldBits) - 1u) << bg.lsb);
+                    if (!fitsSignedNBits(value, bg.fieldBits)) {
                         emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                              prefixStr + ": relocation '" + tri->name
                                  + "' shifted value " + std::to_string(value)
-                                 + " does not fit signed 26-bit — "
-                                   "branch out of ±128 MiB range.");
+                                 + " does not fit signed "
+                                 + std::to_string(static_cast<int>(bg.fieldBits))
+                                 + "-bit — branch out of range. A call beyond "
+                                   "this field's reach is rescued by a VENEER "
+                                   "(a nearer branch standing in for the "
+                                   "callee), which `injectBranchVeneers` places "
+                                   "before this kernel runs. Reaching this "
+                                   "refusal means one of THREE things, and the "
+                                   "third is the one a large image hits: the "
+                                   "target declares nothing to build a veneer "
+                                   "from; the placement ran and could not find "
+                                   "a site (it says so by name); or THE VENEER "
+                                   "PASS NEVER SAW THIS RELOCATION AT ALL — it "
+                                   "models `.text` as the module's own "
+                                   "functions concatenated, so a call whose "
+                                   "target is an IMPORT STUB is invisible to "
+                                   "it, and the stub's address is chosen by "
+                                   "this writer AFTER that pass has run. The "
+                                   "synthetic entry's call to the process-exit "
+                                   "import is exactly such a call "
+                                   "(D-LK-AARCH64-CALL26-BEYOND-RANGE-HAS-NO-VENEER).");
                         return false;
                     }
                     auto const inst = readInst32();
-                    if (rejectIfBitfieldDirty(inst, 0x03FFFFFFu)) return false;
-                    auto const bits = static_cast<std::uint32_t>(value) & 0x03FFFFFFu;
+                    if (rejectIfBitfieldDirty(inst, mask)) return false;
+                    auto const bits =
+                        (static_cast<std::uint32_t>(value) << bg.lsb) & mask;
                     writeInst32(inst | bits);
                     break;
                 }

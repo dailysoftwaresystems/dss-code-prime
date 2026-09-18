@@ -6,7 +6,7 @@
 parallel lanes needs these verbs, and every cycle before 2026-08-29 rewrote them
 from scratch in a session-scoped scratchpad that does not survive the session. The
 `/dss-cycle` handoff of 2026-08-28 recorded that waste explicitly and left the
-promotion as a decision to take; `scripts/wsl-leg/wsl-leg.sh`'s own header records the
+promotion as a decision to take; the retired WSL leg driver's own header recorded the
 identical waste happening three times inside ONE session. The operator's standing rule
 is *"if a tool has a problem, fix before using again, not workaround an own tool.
 reusable tools exists to avoid bunch of problems like mangling or edge cases"* -- and a
@@ -186,9 +186,9 @@ Usage:
                                           #   re-copy .plans/ into a LIVE lane and
                                           #   update its manifest, so a row applied
                                           #   mid-cycle stops reddening its guards
-    python scripts/lane-fold/lane-fold.py apply-rows <lane> <production|harness> [--apply]
+    python scripts/lane-fold/lane-fold.py apply-rows <lane> <production> [--apply]
                                           #   apply the lane's row/ cells, all or nothing
-    python scripts/lane-fold/lane-fold.py land <lane> <production|harness> [--apply]
+    python scripts/lane-fold/lane-fold.py land <lane> <production> [--apply]
                                           [--settled <path>]... [--preserve-to <dir>]
                                           #   fold, apply rows, verify both, keep the
                                           #   evidence, THEN remove the worktree
@@ -402,7 +402,7 @@ def is_lane_tree(rel):
     ⇒ The failure mode if that ignore line is ever edited away is not a red gate: it is
     every lane silently receiving a full copy of every sibling lane, `.git` included,
     which then folds back. So the exclusion is asserted HERE, where the copy happens,
-    exactly as `scripts/carriage-excludes/` pins `.worktrees/` in its own
+    exactly as the retired carriage-exclude derivation pinned `.worktrees/` in its own
     MUST_NEVER_TRAVEL floor rather than trusting the same line.
     """
     return rel == WORKTREES_DIR or rel.startswith(WORKTREES_DIR + "/") \
@@ -2147,16 +2147,13 @@ def self_test():
         registries = [
             (".plans/_deferred-anchor-registry-production.md", "\n".join([
                 "# p", "", HDR, SEP,
-                "| `%s-EXISTING` | P2 | 🟠 OPEN | 🟠 **OPEN** existing row | w | r |" % FX, ""])),
-            (".plans/_deferred-anchor-registry-harness.md", "\n".join([
-                "# h", "", HDR, SEP,
-                "| `%s-HARNESSROW` | P3 | 🟠 OPEN | 🟠 **OPEN** harness row | w | r |" % FX,
+                "| `%s-EXISTING` | P2 | 🟠 OPEN | 🟠 **OPEN** existing row | w | r |" % FX,
+                "| `%s-SECOND` | P2 | 🟠 OPEN | 🟠 **OPEN** second existing row | w | r |" % FX,
                 ""])),
             (".plans/_deferred-anchor-registry-done.md", "\n".join([
                 "# d", "", "## Closed — Production", "", HDR, SEP,
                 "| `%s-OLDP` | P2 | ✅ CLOSED | ✅ **CLOSED** old | - | r |" % FX, "",
-                "## Closed — Harness", "", HDR, SEP,
-                "| `%s-OLDH` | P3 | ✅ CLOSED | ✅ **CLOSED** old | - | r |" % FX, ""]))]
+                ""]))]
         make_repo(r3, [(".gitignore", IGNORE), ("tracked.txt", "base\n")] + registries)
         A3 = load_anchors_module(r3)
         REGS = [os.path.join(r3, *rel.split("/")) for rel, _ in registries]
@@ -2209,7 +2206,7 @@ def self_test():
             """
             writes[:] = []
             snapshot = reg_now()
-            rv_, out_ = quiet(cmd_apply_rows, r3, "rows", "harness", apply_it)
+            rv_, out_ = quiet(cmd_apply_rows, r3, "rows", "production", apply_it)
             return rv_, out_, reg_now() == snapshot
 
         try:
@@ -2238,23 +2235,23 @@ def self_test():
                 "silently OPEN", "rv=%r out=%s" % (rv, out[-300:]))
             drop(wrows, "rows", FX + "-DRAFT")
 
-            # (r1d) a `.bucket` that contradicts where an existing row lives.
+            # (r1d) a `.bucket` that contradicts where an existing row lives. Since the
+            # harness registry retired, the contradiction to construct is the ARCHIVE: an
+            # OPEN row in the working registry, re-declared as if it were closed there.
             cells(wrows, "rows", FX + "-EXISTING", "🟠 OPEN",
-                  "🟠 **OPEN** existing row, re-declared", bucket="harness")
+                  "🟠 **OPEN** existing row, re-declared", bucket="done")
             rv, out, unchanged = run_rows(True)
-            pin(rv == 2 and "EXISTING.bucket" in out and "production" in out
-                and unchanged and not writes,
+            pin(rv == 2 and "EXISTING.bucket" in out and unchanged and not writes,
                 "(r1d) a .bucket contradicting an EXISTING row's home REFUSES -- never "
                 "silently ignored", "rv=%r out=%s" % (rv, out[-300:]))
             drop(wrows, "rows", FX + "-EXISTING")
 
-            # (r1e) an ARCHIVED row with no explicit bucket.
-            cells(wrows, "rows", FX + "-OLDH", "✅ CLOSED", "✅ **CLOSED** old, amended")
-            rv, out, unchanged = run_rows(True)
-            pin(rv == 2 and "OLDH.bucket" in out and unchanged and not writes,
-                "(r1e) an ARCHIVED row that would be re-filed with no .bucket REFUSES",
-                "rv=%r out=%s" % (rv, out[-300:]))
-            drop(wrows, "rows", FX + "-OLDH")
+            # ⓘ (r1e) RETIRED 2026-09-16, and this note is the arm. It pinned a refusal
+            # on an ARCHIVED row re-filed with no `.bucket`: with TWO working registries the
+            # archive could not derive which one a reopened row came from, so a missing
+            # declaration was ambiguous. There is ONE working registry now, so the answer is
+            # derivable, and refusing it would be refusing a question that has an answer. If a
+            # second working registry ever returns, this arm returns with it.
 
             # (r1f) THE WRITER'S OWN REFUSAL on a LATER row: the valid row sorts first,
             # and it must not be written -- the partial application the scratchpad
@@ -2281,8 +2278,8 @@ def self_test():
         cells(wrows, "rows", FX + "-EXISTING", "✅ CLOSED",
               "✅ **CLOSED 2026-09-15** existing row closed", closing="closed by the self-test")
         cells(wrows, "rows", FX + "-OLDH", "✅ CLOSED", "✅ **CLOSED** old, amended",
-              closing="amended closing", bucket="harness")
-        rv, out = quiet(cmd_apply_rows, r3, "rows", "harness", True)
+              closing="amended closing", bucket="production")
+        rv, out = quiet(cmd_apply_rows, r3, "rows", "production", True)
         new, ex, oh = A3.find(r3, NEW), A3.find(r3, FX + "-EXISTING"), A3.find(r3, FX + "-OLDH")
         pin(rv == 0 and len(new) == 1 and new[0].bucket == "production"
             and new[0].priority == "P5",
@@ -2293,7 +2290,7 @@ def self_test():
             "(r2b) an EXISTING row keeps its own home and CARRIES its priority; closed, it "
             "moved to that home's archive table",
             "got=%s" % [(r.bucket, r.table, r.priority) for r in ex])
-        pin(len(oh) == 1 and oh[0].table == "harness"
+        pin(len(oh) == 1 and oh[0].table == "production"
             and _flat(oh[0].cell(A3.C_CLOSING)) == "amended closing",
             "(r2c) an ARCHIVED row with its declared bucket is replaced in its own table",
             "got=%s" % [(r.table, r.cell(A3.C_CLOSING)) for r in oh])
@@ -2307,7 +2304,7 @@ def self_test():
         writes[:] = []
         globals()["_run_writer"] = spy
         try:
-            rv, out = quiet(cmd_apply_rows, r3, "rows", "harness", True)
+            rv, out = quiet(cmd_apply_rows, r3, "rows", "production", True)
         finally:
             globals()["_run_writer"] = real_writer
         pin(rv == 0 and reg_now() == after_r2 and not writes and "ALREADY LANDED" in out,
@@ -2316,7 +2313,11 @@ def self_test():
 
         # (r3) ALL OR NOTHING SURVIVES A FAILURE THE DRY RUN COULD NOT FORESEE: the second
         # real write fails after the first one landed.
-        cells(wrows, "rows", FX + "-HARNESSROW", "✅ CLOSED", "✅ **CLOSED** harness row closed",
+        # ⓘ A SECOND PRODUCTION ROW, not a harness one: the harness registry retired on
+        # 2026-09-16 and `anchors.py` knows two buckets now. This arm never pinned the
+        # bucket — it pins that a write failing AFTER an earlier one landed restores every
+        # registry byte for byte, and it needs two closable rows to do that.
+        cells(wrows, "rows", FX + "-SECOND", "✅ CLOSED", "✅ **CLOSED** a second existing row",
               priority="P4")
         cells(wrows, "rows", FX + "-NEW2", "✅ CLOSED", "✅ **CLOSED** a second new row")
         before_r3 = reg_now()
@@ -2331,7 +2332,7 @@ def self_test():
 
         globals()["_run_writer"] = fail_second_write
         try:
-            rv, out = quiet(cmd_apply_rows, r3, "rows", "harness", True)
+            rv, out = quiet(cmd_apply_rows, r3, "rows", "production", True)
         finally:
             globals()["_run_writer"] = real_writer
         pin(rv == 2 and len(calls) == 2 and reg_now() == before_r3 and "RESTORED" in out,
@@ -2351,7 +2352,7 @@ def self_test():
 
         globals()["_run_writer"] = wrong_closing
         try:
-            rv, out = quiet(cmd_apply_rows, r3, "rows", "harness", True)
+            rv, out = quiet(cmd_apply_rows, r3, "rows", "production", True)
         finally:
             globals()["_run_writer"] = real_writer
         pin(rv == 2 and "VERIFY FAILED" in out and "NEW2" in out,
@@ -2367,7 +2368,7 @@ def self_test():
         for rel, body in evidence.items():
             write_atomic(os.path.join(wl1, *rel.split("/")), body)
         cells(wl1, "land1", FX + "-LANDONE", "✅ CLOSED",
-              "✅ **CLOSED 2026-09-15** landed by the self-test", bucket="harness",
+              "✅ **CLOSED 2026-09-15** landed by the self-test", bucket="production",
               priority="P3")
         dest1 = os.path.join(top, "evidence-land1")
         real_classify = globals()["classify"]
@@ -2389,13 +2390,13 @@ def self_test():
         globals()["classify"] = spy_classify
         globals()["lane_worktree_remove_argv"] = spy_remove_argv
         try:
-            rv, out = quiet(cmd_land, r3, "land1", "harness", True, (), dest1)
+            rv, out = quiet(cmd_land, r3, "land1", "production", True, (), dest1)
         finally:
             globals()["classify"] = real_classify
             globals()["lane_worktree_remove_argv"] = real_remove_argv
         got = A3.find(r3, FX + "-LANDONE")
         pin(rv == 0 and os.path.isfile(os.path.join(r3, "work-land1.txt"))
-            and len(got) == 1 and got[0].table == "harness" and not os.path.exists(wl1),
+            and len(got) == 1 and got[0].table == "production" and not os.path.exists(wl1),
             "(l1) land folds the work, applies and verifies the row, then removes the worktree",
             "rv=%r out=%s" % (rv, out[-700:]))
         pin(all(os.path.isfile(os.path.join(dest1, *rel.split("/")))
@@ -2427,7 +2428,7 @@ def self_test():
         write_atomic(os.path.join(wl2, "work-land2.txt"), "lane land2 work\n")
         cells(wl2, "land2", FX + "-LANDTWO", "draft", "🟠 **OPEN** a bad status")
         before_l2 = reg_now()
-        rv, out = quiet(cmd_land, r3, "land2", "harness", True, (),
+        rv, out = quiet(cmd_land, r3, "land2", "production", True, (),
                         os.path.join(top, "evidence-land2"))
         pin(rv == 2 and not os.path.exists(os.path.join(r3, "work-land2.txt"))
             and reg_now() == before_l2 and os.path.isdir(wl2),
@@ -2439,7 +2440,7 @@ def self_test():
         write_atomic(os.path.join(wl3, "work-land3.txt"), "lane land3 work\n")
         write_atomic(os.path.join(wl3, ".temp", "land3-scratch", "findings.log"), "f3\n")
         cells(wl3, "land3", FX + "-LANDTHREE", "✅ CLOSED", "✅ **CLOSED** land3",
-              bucket="harness", priority="P3")
+              bucket="production", priority="P3")
 
         def fail_every_write(root_, plan_, apply_it_):
             if apply_it_:
@@ -2448,7 +2449,7 @@ def self_test():
 
         globals()["_run_writer"] = fail_every_write
         try:
-            rv, out = quiet(cmd_land, r3, "land3", "harness", True, (),
+            rv, out = quiet(cmd_land, r3, "land3", "production", True, (),
                             os.path.join(top, "evidence-land3"))
         finally:
             globals()["_run_writer"] = real_writer
@@ -2456,7 +2457,7 @@ def self_test():
             and not A3.find(r3, FX + "-LANDTHREE") and os.path.isdir(wl3),
             "(l3) a row write that fails AFTER the fold keeps the worktree, with the fold "
             "applied and no row", "rv=%r out=%s" % (rv, out[-400:]))
-        rv, out = quiet(cmd_land, r3, "land3", "harness", True, (),
+        rv, out = quiet(cmd_land, r3, "land3", "production", True, (),
                         os.path.join(top, "evidence-land3"))
         pin(rv == 0 and len(A3.find(r3, FX + "-LANDTHREE")) == 1 and not os.path.exists(wl3),
             "(l3b) ...and RE-RUNNING the landing completes it: the fold re-measures its own "
@@ -2470,11 +2471,11 @@ def self_test():
         write_atomic(os.path.join(wl4, ".temp", "land4-scratch", "findings.log"),
                      "lane land4 findings\n")
         cells(wl4, "land4", FX + "-LANDFOUR", "✅ CLOSED", "✅ **CLOSED** land4",
-              bucket="harness", priority="P3")
+              bucket="production", priority="P3")
         clash = os.path.join(top, "evidence-clash")
         write_atomic(os.path.join(clash, ".temp", "land4-scratch", "findings.log"),
                      "somebody else's findings\n")
-        rv, out = quiet(cmd_land, r3, "land4", "harness", True, (), clash)
+        rv, out = quiet(cmd_land, r3, "land4", "production", True, (), clash)
         pin(rv == 2 and os.path.isdir(wl4)
             and text(os.path.join(clash, ".temp", "land4-scratch", "findings.log"))
             == "somebody else's findings\n",
@@ -2482,7 +2483,7 @@ def self_test():
             "evidence already at the destination is untouched", "rv=%r out=%s"
             % (rv, out[-500:]))
         dest4 = os.path.join(top, "evidence-land4")
-        rv, out = quiet(cmd_land, r3, "land4", "harness", True, (), dest4)
+        rv, out = quiet(cmd_land, r3, "land4", "production", True, (), dest4)
         pin(rv == 0 and not os.path.exists(wl4)
             and text(os.path.join(dest4, ".temp", "land4-scratch", "findings.log"))
             == "lane land4 findings\n" and "ALREADY LANDED" in out,
@@ -2496,7 +2497,7 @@ def self_test():
         write_atomic(os.path.join(wl7, "work-land7.txt"), "w7\n")
         write_atomic(os.path.join(wl7, ".temp", "land7-scratch", "findings.log"), "f7\n")
         cells(wl7, "land7", FX + "-LANDSEVEN", "✅ CLOSED", "✅ **CLOSED** land7",
-              bucket="harness", priority="P3")
+              bucket="production", priority="P3")
         real_apply_fold = globals()["_apply_fold"]
         calls7 = []
 
@@ -2507,7 +2508,7 @@ def self_test():
         globals()["_apply_fold"] = lambda root_, wt_, cls_: None
         globals()["lane_worktree_remove_argv"] = spy_remove_argv7
         try:
-            rv, out = quiet(cmd_land, r3, "land7", "harness", True, (),
+            rv, out = quiet(cmd_land, r3, "land7", "production", True, (),
                             os.path.join(top, "evidence-land7"))
         finally:
             globals()["_apply_fold"] = real_apply_fold
@@ -2517,7 +2518,7 @@ def self_test():
             "(l7a) when the post-fold measurement still finds the lane's work unfolded, land stops "
             "and NO removal is built -- the worktree and its work are kept",
             "rv=%r removal-calls=%d out=%s" % (rv, len(calls7), out[-400:]))
-        rv, out = quiet(cmd_land, r3, "land7", "harness", True, (),
+        rv, out = quiet(cmd_land, r3, "land7", "production", True, (),
                         os.path.join(top, "evidence-land7"))
         pin(rv == 0 and not os.path.exists(wl7)
             and os.path.isfile(os.path.join(r3, "work-land7.txt")),
@@ -2554,7 +2555,7 @@ def self_test():
         head8 = lane_head(wl8)
         write_atomic(os.path.join(wl8, ".temp", "land8-scratch", "findings.log"), "f8\n")
         cells(wl8, "land8", FX + "-LANDEIGHT", "✅ CLOSED", "✅ **CLOSED** land8",
-              bucket="harness", priority="P3")
+              bucket="production", priority="P3")
         before_l8 = reg_now()
         calls8 = []
 
@@ -2566,7 +2567,7 @@ def self_test():
             calls8[:] = []
             globals()["lane_worktree_remove_argv"] = spy_remove_argv8
             try:
-                return quiet(cmd_land, r3, "land8", "harness", True, (),
+                return quiet(cmd_land, r3, "land8", "production", True, (),
                              os.path.join(top, "evidence-land8"))
             finally:
                 globals()["lane_worktree_remove_argv"] = real_remove_argv
@@ -2627,13 +2628,13 @@ def self_test():
         wl9 = make_lane(r3, "land9")
         write_atomic(os.path.join(wl9, "work-land9.txt"), "w9\n")
         cells(wl9, "land9", FX + "-LANDNINE", "✅ CLOSED", "✅ **CLOSED** land9",
-              bucket="harness", priority="P3")
+              bucket="production", priority="P3")
         with ot.steering() as steer:
             neg = ot.bare_git(["worktree", "list", "--porcelain"], r3, steer)
             real9 = neg.returncode != 0 or "land9" not in neg.stdout
             with ot.caller_environment(steer):
                 try:
-                    rv, out = quiet(cmd_land, r3, "land9", "harness", True, (),
+                    rv, out = quiet(cmd_land, r3, "land9", "production", True, (),
                                     os.path.join(top, "evidence-land9"))
                 except Exception as exc:   # a steered git call that raises IS the defect
                     rv, out = "raised", "%s: %s" % (type(exc).__name__, exc)
@@ -2647,7 +2648,7 @@ def self_test():
 
         # (l5) a lane with no row/ directory is not landed.
         wl5 = make_lane(r3, "land5")
-        rv, out = quiet(cmd_land, r3, "land5", "harness", True, (),
+        rv, out = quiet(cmd_land, r3, "land5", "production", True, (),
                         os.path.join(top, "evidence-land5"))
         pin(rv == 2 and os.path.isdir(wl5) and "no row directory" in out,
             "(l5) a lane with no row/ directory is NOT landed", "rv=%r out=%s"
@@ -2658,7 +2659,7 @@ def self_test():
         write_atomic(os.path.join(wl6, "work-land6.txt"), "w6\n")
         cells(wl6, "land6", FX + "-LANDSIX", "🟠 OPEN", "🟠 **OPEN** land6")
         before_l6 = reg_now()
-        rv, out = quiet(cmd_land, r3, "land6", "harness", False, (),
+        rv, out = quiet(cmd_land, r3, "land6", "production", False, (),
                         os.path.join(top, "evidence-land6"))
         pin(rv == 0 and not os.path.exists(os.path.join(r3, "work-land6.txt"))
             and reg_now() == before_l6 and os.path.isdir(wl6),
@@ -2677,7 +2678,7 @@ def _dispatch_landing(root, verb, lane, rest):
     know is REFUSED -- a landing that silently ignored a mistyped flag would do something
     other than what its caller said."""
     if len(rest) < 2 or rest[1].startswith("-"):
-        die("verb %s needs a lane and a default bucket: %s <lane> <production|harness> "
+        die("verb %s needs a lane and a default bucket: %s <lane> <production> "
             "[--apply]" % (verb, verb), 3)
     bucket = rest[1]
     if bucket not in ("production", "harness"):

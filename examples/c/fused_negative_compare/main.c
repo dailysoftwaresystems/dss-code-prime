@@ -1,4 +1,4 @@
-// Audit-residue sweep c1 — D-AUDIT-FUSED-CMP-WIDTH-PIN runtime witness.
+// Audit-residue sweep c1 — the fused-compare width runtime witness.
 //
 // The highest-traffic compare shape in C: a runtime-NEGATIVE int
 // feeding `if (x < 0)`. The ICmpSlt's ONLY consumer is the CondBr, so

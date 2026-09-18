@@ -72,9 +72,9 @@ namespace {
 using namespace dss;
 namespace fs = std::filesystem;
 
-// See test_include_bare_relative_includer_dir.cpp's note under
-// D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: a by-value return makes
-// `helper()->accessor()` a heap-use-after-free.
+// See test_include_bare_relative_includer_dir.cpp's note on its own shared
+// schema fixture: a by-value return makes `helper()->accessor()` a
+// heap-use-after-free.
 [[nodiscard]] std::shared_ptr<GrammarSchema const> const& cSchema() {
     static std::shared_ptr<GrammarSchema const> const schema = [] {
         auto loaded = GrammarSchema::loadShipped("c");

@@ -2454,14 +2454,14 @@ enum class DiagnosticCode : std::uint16_t {
     // tooling already filtering on this code; new emissions use the
     // remediation-distinct codes below).
     D_TargetFormatMismatch        = 0xD00C,
-    // D_TargetMachineCodeMismatch: D-LK6-8.2 closure — the machine
+    // D_TargetMachineCodeMismatch: D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET closure — the machine
     // code declared on the FORMAT schema doesn't match the TARGET
     // schema's expected machine code for that format kind. Example:
     // `arm64:elf64-x86_64-linux-exec` declares `elf.machine=62`
     // (EM_X86_64) but the "arm64" target expects `elf.machine=183`
     // (EM_AARCH64). Pre-fold this dispatched silently into the wrong
     // PLT-stub emitter → SIGILL.
-    // D_TargetAbiModelMismatch: D-LK6-8.2 post-fold #1 closure — the
+    // D_TargetAbiModelMismatch: D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET post-fold #1 closure — the
     // target's `abiModel` (register-machine / operand-stack /
     // result-id) doesn't match the format's `kind` (Elf/Pe/MachO vs
     // Wasm vs Spirv). Example: register-machine x86_64 target paired
@@ -3466,7 +3466,7 @@ enum class DiagnosticCode : std::uint16_t {
     //   block-scope declaration of an identifier WITH LINKAGE: the identifier
     //   names an object whose storage lives in another translation unit, so an
     //   initializer would either redefine it locally (contradicting `extern`)
-    //   or be silently dropped at lowering (the D-FF2-3 fold replaced that
+    //   or be silently dropped at lowering (the D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE fold replaced that
     //   drop). ✔MEASURED — all three references refuse it: gcc 13.3.0 "'x' has
     //   both 'extern' and initializer", clang 18.1.3 "declaration of block
     //   scope identifier with linkage cannot have an initializer", MSVC
@@ -3932,7 +3932,8 @@ enum class DiagnosticCode : std::uint16_t {
     //   (or `argFprs.size()` for an FPR-class arg). Stack-passed args
     //   need both a callee-side load from `[SP + caller-arg-offset]`
     //   and a caller-side store/push BEFORE the call. v1 register-only.
-    //   Anchor: D-ML7-2.2.
+    //   Anchor: D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7
+    //   (the registry row; its pre-migration plan-step spelling was ML7-2.2).
     // L_CcRegLookupFailed: the cc declares a register name in
     //   `argGprs`/`argFprs`/`returnGprs`/`returnFprs` that does not
     //   resolve via `schema.registerByName(...)` — schema misconfiguration
@@ -3947,7 +3948,7 @@ enum class DiagnosticCode : std::uint16_t {
     //   cycle (e.g. swap two args between argGprs[0] and argGprs[1]).
     //   The v1 emit-in-order materialization would silently miscompile
     //   such a cycle — second mov reads a clobbered source. v1 detects
-    //   loud; D-ML7-2.3 anchors the proper parallel-copy resolution.
+    //   loud; D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS anchors the proper parallel-copy resolution.
     // L_IndirectCallUnsupported: the LIR `call` instruction's callee
     //   operand is neither a `SymbolRef` (direct call) nor a `Reg`
     //   (indirect call through a register — FC4 c2 landed that
@@ -5072,7 +5073,7 @@ enum class DiagnosticCode : std::uint16_t {
     // F_HeaderInternalInvariant: an internal-invariant violation
     //   reached the header walker — a compiler bug, not a user-fixable
     //   issue. Remediation: file a bug.
-    // (D-FF2-3 CLOSED 2026-06-01 via `H_ExternHasInitializer`
+    // (D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE CLOSED 2026-06-01 via `H_ExternHasInitializer`
     // (0xF00A) at the lowering tier — the FFI walker reuses the
     // c frontend, so the reject reaches it through the
     // shared lowering pipeline; no separate F_* code needed.
@@ -5131,7 +5132,7 @@ enum class DiagnosticCode : std::uint16_t {
     //   conservative `unapplyCMangling` which silently passes such
     //   input through. Used by FF5 ingest where the format-kind
     //   is authoritative and a missing prefix is a structural
-    //   anomaly. (D-FF4-3 post-fold-#3.)
+    //   anomaly. (D-FF4-3-STRICT-MANGLE-PREFIX-CHECK post-fold-#3.)
     F_MangleMissingExpectedPrefix  = 0x5014,
     // F_FfiIngestDuplicateSymbol: FF5 ingest() saw the same canonical
     //   symbol exposed by more than one IngestionSource. First-source-

@@ -29,8 +29,8 @@
 //     encoding.
 //
 // ⚠ CONFIG-LEVEL: `dss_add_test` sets `DSS_CONFIG_ROOT`, so this file must run
-// through ctest and never as a bare `.exe`
-// (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+// through ctest and never as a bare `.exe`, which walks the cwd and would read
+// whichever config tree the shell stands in.
 
 #include "asm/asm.hpp"
 #include "asm/asm_template_to_lir.hpp"

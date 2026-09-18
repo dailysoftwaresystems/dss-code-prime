@@ -61,10 +61,10 @@ using dss::tests::tokenizeShipped;
 //
 // The unique-path scheme is NOT reimplemented here — it is the shared one in
 // `tests/test_support/scratch_dir.hpp`. It used to be reimplemented, and that
-// is the defect D-TEST-FIXED-SCRATCH-PATH-POPULATION names: the path came from
-// an atomic counter with NO per-process seed, so the Nth TempFile of EVERY
-// process of this binary resolved to the same `<temp>/dss_cu2_<n>.toy` and the
-// dtor's `remove` deleted a concurrent sibling process's fixture file mid-test.
+// reimplementation was the defect: the path came from an atomic counter with
+// NO per-process seed, so the Nth TempFile of EVERY process of this binary
+// resolved to the same `<temp>/dss_cu2_<n>.toy` and the dtor's `remove`
+// deleted a concurrent sibling process's fixture file mid-test.
 // Uniqueness now comes from the DIRECTORY (claimed atomically); the leaf name
 // inside it is free to be constant.
 //

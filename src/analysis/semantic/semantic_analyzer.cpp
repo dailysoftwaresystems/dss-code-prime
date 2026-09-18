@@ -250,6 +250,7 @@ struct EngineState {
           lattice{cu.id(), cu.compositeSourceLanguage()},
           nodeToSymbol{cu},
           nodeToType{cu},
+          derivedExprType{cu},
           nodeToSelectedExpr{cu},
           nodeToFoldedConstant{cu},
           nullPointerConstantNodes{cu},
@@ -262,6 +263,78 @@ struct EngineState {
     SymbolTable                symbols;
     UnitAttribute<SymbolId>    nodeToSymbol;
     UnitAttribute<TypeId>      nodeToType;
+
+    // ★★★ THE SEMANTIC TIER'S OWN DERIVED-EXPRESSION-TYPE RECORD, and it is
+    // DELIBERATELY NOT `nodeToType` (D-SEMANTIC-EXPRESSION-TYPER-REDERIVES-EVERY-SUBTREE).
+    //
+    // `subtreeType` types a whole expression subtree bottom-up and returns only the
+    // ROOT's type, discarding the N-1 descendant types it necessarily computed on the
+    // way. `pass2Post` is a POST-ORDER walk that asks that whole-subtree question at
+    // EVERY operator node (the C 6.3.2.2 void-operand arm and the C23 nullptr-operand
+    // arm each ask it of the left operand), so on a left-deep `a + a + … + a` chain —
+    // a tree of DEPTH N — the walk is paid in full at every level and the phase costs
+    // Θ(N²). ✔MEASURED before this record existed, `enter` invocations at
+    // n = 1000 / 2000 / 4000: 1 998 010 / 7 996 010 / 31 992 010 — 4.0020× and 4.0010×
+    // per doubling, the identity `visits == 2N²` holding to the digit, while the
+    // NUMBER of questions asked stayed linear (3 001 / 6 001 / 12 001). gcc 13.2.0 is
+    // FLAT at 0.20 s on the identical file, and under `DSS = (gcc ∪ clang ∪ MSVC) ∪
+    // ISO C` taken over what WORKS a working reference makes near-linear REQUIRED.
+    //
+    // ★ WHY A SEPARATE TABLE AND NOT A STAMP ON `nodeToType`. `nodeToType` is THE DOOR
+    // from this tier into the HIR lowering (`cst_to_hir`'s `semTypeAt`/`typeAtOr` read
+    // it, and `typeAtOr` PREFERS it over the type the lowering would compute itself).
+    // Stamping operator nodes there would hand the lowering the SEMANTIC type where it
+    // used to compute its own — and the two are deliberately different for a whole
+    // family of nodes (D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE: a
+    // comparison is C's `int` here and the i1/Bool SSA carrier there). A memo must not
+    // be able to change what is generated, so it does not live in the table that
+    // decides what is generated.
+    //
+    // ★ THE SCOPE IS PART OF THE KEY, NOT AN ASSUMPTION. `subtreeType` resolves an
+    // IDENTIFIER leaf by `scopes.lookup(scope, text)`, so the derived type of a
+    // subtree is a function of `(node, scope)` — the same node typed under a
+    // different (or an invalid) scope is a DIFFERENT question and gets its own
+    // answer. An entry whose recorded scope does not match the asking scope is a
+    // MISS, never a coerced hit.
+    //
+    // ⚠ THE STAMP STILL WINS. Every lookup happens AFTER the authoritative
+    // `typeAt` check, so a node that later acquires a Pass-2 stamp is answered by
+    // the stamp and its memo entry is simply never consulted again — the record can
+    // only ever answer for nodes the analyzer has no stamp for.
+    //
+    // ⚠ CLEARED AT EVERY PASS BOUNDARY (`resetDerivedExprTypes`). A derivation is
+    // reusable only while the facts it read are unchanged, and a PASS is exactly the
+    // unit that changes them: Pass 1.5 derives types before Pass 2 has stamped a
+    // single reference, so a Pass-1.5 answer is not a Pass-2 answer. Within one pass
+    // the post-order walk guarantees a node's subtree is complete before any parent
+    // asks about it.
+    struct DerivedExprType {
+        ScopeId scope;
+        TypeId  type;
+    };
+    // `mutable` because this is a MEMO behind a logically-const read: the typer's
+    // handle is `EngineState const&` (the same reason the interner handle is taken
+    // by const_cast there). Recording an answer the walk already computed changes
+    // no observable state — the stamp table, the symbols and the diagnostics are
+    // untouched.
+    mutable UnitAttribute<DerivedExprType> derivedExprType;
+
+    // The two counters THE PIN reads (`SemanticModel::exprType{Queries,NodeVisits}`).
+    // ★ TWO, NOT ONE, AND THE SECOND IS NOT A REFINEMENT OF THE FIRST. `queries`
+    // counts how often the expression typer was ASKED; `nodeVisits` counts how many
+    // nodes the walks actually CLASSIFIED. With only the second, "the record made
+    // this free" and "the question is no longer asked at all" are the same number —
+    // and the second of those is a correctness regression wearing a performance
+    // win's clothes. Mutable because the typer's handle is `EngineState const&` (it
+    // is a logically-const read); the same reason the interner handle is const_cast.
+    mutable std::uint64_t exprTypeQueries    = 0;
+    mutable std::uint64_t exprTypeNodeVisits = 0;
+
+    // Drop every derived-expression-type entry. Called at each PASS boundary — see
+    // the record's own note above for why a pass is the right unit.
+    void resetDerivedExprTypes(CompilationUnit const& cu) {
+        derivedExprType = UnitAttribute<DerivedExprType>{cu};
+    }
     // FC16 (D-CSUBSET-GENERIC-SELECTION): for each `_Generic` node, the NodeId of
     // the SELECTED association's result-expression (the winner of the compile-time
     // type match). Written by Pass 2's generic-selection arm; read by the CST→HIR
@@ -1179,7 +1252,7 @@ resolveMemberAccess(EngineState const& s, SemanticConfig const& cfg,
 // True iff a token of kind `kind` appears anywhere in `node`'s subtree,
 // stopping descent at any NESTED declaration-rule node (other than the
 // root `node` itself). Used by SE4 const-marker detection (walk a decl's
-// `typeChild` for the language's const keyword) AND by D-LANG-VARIADIC
+// `typeChild` for the language's const keyword) AND by D-LANG-VARIADIC-CALL-SUBSTRATE
 // variadic-marker detection (walk a decl's `paramsChild` for the
 // language's `EllipsisOp` marker). Generic substrate — any future
 // "marker token within a decl subtree" scan (async/inline/noexcept
@@ -5665,7 +5738,7 @@ scanSpecifierPrefixStorage(SemanticConfig const& cfg, Tree const& tree,
 // block-scope `extern` into a tentative definition.
 //
 // ★★★ P65 — AN INITIALIZER ON THE DECLARATOR OUTRANKS BOTH OF THEM AT FILE
-// SCOPE (the file-scope half of D-FF2-3, whose refusal this narrows), and that
+// SCOPE (the file-scope half of D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE, whose refusal this narrows), and that
 // override is the third thing this predicate now says. C 6.9.2p1: *a
 // declaration of an identifier for an object that has file scope WITH AN
 // INITIALIZER is a definition* — no clause exempts `extern`, so the keyword is
@@ -9043,7 +9116,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // rows (params/locals/globals) never set anonymousNameAllowed
                     // so the anon block is inert for them.
                     bool boundNamed = false;
-                    // P65 (the file-scope half of D-FF2-3): the scope half of C
+                    // P65 (the file-scope half of D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE): the scope half of C
                     // 6.9.2p1's override, hoisted out of the
                     // loop because it is a property of the DECLARATION's position,
                     // not of any one declarator. `current` — not `here` — is the
@@ -13915,7 +13988,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         for (auto const& [pNode, pTy] : params) {
                             paramTypes.push_back(pTy);
                         }
-                        // D-LANG-VARIADIC (step 13.4): scan the params
+                        // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): scan the params
                         // subtree for the declaration's configured
                         // variadic-marker token (e.g. `EllipsisOp` for
                         // c). When present, build a variadic
@@ -17440,7 +17513,7 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         return std::vector<TypeId>(sp.begin(), sp.end());
     }();
 
-    // D-LANG-VARIADIC (step 13.4): a C-style variadic FnSig
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): a C-style variadic FnSig
     // (scalars[1] == 1) admits >= fixedParamCount args; a non-variadic
     // FnSig admits exactly fixedParamCount. The pre-existing
     // `variadicBuiltin` flag (e.g. tsql COALESCE) admits ANY arg count
@@ -17457,7 +17530,7 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(node);
-        // D-LANG-VARIADIC (step 13.4) post-fold MEDIUM-1: mirror the
+        // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4) post-fold MEDIUM-1: mirror the
         // HIR verifier's "fixed " word for variadic-too-few so users
         // can distinguish "wrong fixed-arity" from "variadic prefix
         // too short" without inspecting the FnSig.
@@ -18197,8 +18270,18 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     // already-stamped node) BEFORE building the per-call closures below (notably
     // `resolveArithmeticRules`). The driver's `enter` repeats this check for
     // every child, so this is purely the root's fast exit (output-identical).
+    ++s.exprTypeQueries;
     if (!rootNode.valid()) return InvalidType;
     if (TypeId t = s.typeAt(rootNode); t.valid()) return t;
+    // The derived-expression-type record — the answer this very walk computed for
+    // this node earlier in the pass. Consulted AFTER the authoritative stamp above
+    // (the stamp always wins) and keyed on the scope the answer was derived under.
+    // The driver's `enter` repeats this check for every child; this is the root's
+    // fast exit, exactly like the stamp check it follows.
+    if (auto const* m = s.derivedExprType.tryGet(rootNode);
+        m != nullptr && m->scope.v == scope.v) {
+        return m->type;
+    }
 
     // The interning derivations memoize into the interner's arena, so they need
     // a mutable handle. Sound because every caller owns a non-const EngineState
@@ -18348,8 +18431,8 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
             // the i1/Bool SSA carrier is the deliberate machine-tier divergence.
             if (isComparison(*op)) return comparisonResultType();
             // Shift result type follows the config verb `shiftResult` via the
-            // shared `shiftResultType` chokepoint (D-UAC-SHIFT-RESULT-RULE-CONFIG)
-            // — the SAME function cst_to_hir's combineBinary uses.
+            // shared `shiftResultType` chokepoint — the SAME function
+            // cst_to_hir's combineBinary uses.
             if ((*op == HirOpKind::Shl || *op == HirOpKind::Shr)
                 && arith.has_value()) {
                 return shiftResultType(interner, lt, rt, *arith);
@@ -18683,10 +18766,19 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     // Frame for one of the five recursive arms. Mirrors the prior dispatch order
     // EXACTLY so the result is byte-identical.
     auto const enter = [&](NodeId node) {
+        ++s.exprTypeNodeVisits;
         if (!node.valid()) { result = InvalidType; return; }
         // Stamped type wins — Pass 2 already computed refs/member/call/cast/
         // sizeof/literals/compound-literals onto the node itself.
         if (TypeId t = s.typeAt(node); t.valid()) { result = t; return; }
+        // Then the derived-expression-type record: the answer a previous walk in
+        // THIS pass already computed for this node under THIS scope. This is the
+        // lookup that turns the repeated whole-subtree re-derivation into one
+        // derivation per node per pass.
+        if (auto const* m = s.derivedExprType.tryGet(node);
+            m != nullptr && m->scope.v == scope.v) {
+            result = m->type; return;
+        }
         if (tree.kind(node) != NodeKind::Internal) { result = leafType(node); return; }
         RuleId const r = tree.rule(node);
         // ── cast / sizeof / compound-literal: RE-TYPING wrappers (Pass-1.5; Pass 2
@@ -18969,6 +19061,17 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     // `result` for the parent's next phase to consume.
     enter(rootNode);
     while (!work.empty()) {
+        // ★ THE ONE PLACE A DERIVED TYPE IS RECORDED, and it is one place because a
+        // frame's arms are the only code that can pop it. Every arm below either
+        // ENTERS a child (pushing, or settling a terminal — never popping) or
+        // COMBINES and pops; none does both. So "the stack got shorter" is an exact
+        // test for "the frame on top finished, and `result` is its type", and it
+        // holds for all six frame kinds without each arm having to remember to say
+        // so. Capturing the node BEFORE the switch is the same discipline the
+        // Ternary and Postfix arms already carry in their own comments: `f` is a
+        // reference into `work` and the pop dangles it.
+        std::size_t const depthBefore = work.size();
+        NodeId const      framedNode  = work.back().node;
         Frame& f = work.back();
         switch (f.kind) {
         case Frame::Kind::Binary:
@@ -19095,6 +19198,14 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 work.pop_back();
             }
             break;
+        }
+        if (work.size() < depthBefore) {
+            // This frame finished: `result` is the type of `framedNode`, derived
+            // (not stamped — the stamp arm never builds a frame). Record it under
+            // the scope it was derived in so the next walk that meets this node
+            // answers in O(1) instead of re-deriving its whole subtree.
+            s.derivedExprType.set(framedNode,
+                                  EngineState::DerivedExprType{scope, result});
         }
     }
     return result;
@@ -20897,6 +21008,10 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     }
 
     // Pass 1.5 per tree: resolve declaration types + function signatures.
+    // A derived expression type is only reusable while the facts it read are
+    // unchanged, and a PASS is the unit that changes them — Pass 1 minted symbols
+    // this pass will type against, so nothing derived before it survives into it.
+    s.resetDerivedExprTypes(*cu);
     for (std::size_t ti = 0; ti < trees.size(); ++ti) {
         auto const& tree = trees[ti];
         if (!tree.root().valid()) continue;
@@ -21827,6 +21942,11 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
 
     // Pass 2 per tree, against that tree's root scope. Loop-context depth
     // starts at 0 (GAP C).
+    // Drop Pass 1.5's derived expression types: this pass stamps references,
+    // literals, calls, members and casts that Pass 1.5 could not see, so an answer
+    // derived without them is not an answer for this pass. (The same reasoning as
+    // the reset before Pass 1.5 — see `EngineState::derivedExprType`.)
+    s.resetDerivedExprTypes(*cu);
     for (auto const& tree : trees) {
         if (!tree.root().valid()) continue;
         s.activate(tree.schema());
@@ -21923,6 +22043,11 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         // analysis ran under so HIR lowering reads the SAME answer — the
         // `dataModel()` / `longDoubleFormat()` discipline.
         s.charIsUnsigned,
+        // D-SEMANTIC-EXPRESSION-TYPER-REDERIVES-EVERY-SUBTREE: the expression
+        // typer's own work, carried out so a COMPLEXITY pin can assert a growth
+        // ratio over an ALGORITHM's counters instead of over a wall clock.
+        s.exprTypeQueries,
+        s.exprTypeNodeVisits,
     };
 }
 

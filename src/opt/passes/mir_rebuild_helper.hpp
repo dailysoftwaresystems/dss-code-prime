@@ -172,8 +172,7 @@ public:
     // WRITE A NUMBER HERE. It read `~9` until 2026-09-07 (cycle P63) and was wrong
     // by two, and nothing in the tree could see that — a count in a comment is a
     // measurement with no instrument attached, so it decays silently in the
-    // direction of looking authoritative
-    // (D-TEST-CMAKE-COMMENT-QUOTES-A-CORPUS-COUNT-THE-TEST-IT-REGISTERS-FORBIDS).
+    // direction of looking authoritative.
     // The `census:` marker binds it to the `opt.mirRebuildPolicies` key of
     // `scripts/check-doc-census/source-census.json`, which OWNS the counting
     // pattern. ★ The pattern is deliberately NOT restated here: a pattern quoted in

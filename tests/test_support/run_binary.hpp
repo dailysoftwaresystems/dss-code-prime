@@ -13,8 +13,8 @@
 //   * Windows — `CreateProcessW` + `WaitForSingleObject` +
 //     `GetExitCodeProcess` (Stage 1 Slice C 2026-06-02; the call
 //     moved from the `A` to the `W` form when the argv quoting
-//     was shared with the compiler's own spawn substrate —
-//     D-TEST-RUN-BINARY-ARGV-QUOTING-UNESCAPED. The shared quoter
+//     was shared with the compiler's own spawn substrate, because
+//     this harness's own copy left argv UNESCAPED. The shared quoter
 //     produces a `std::wstring`, so `W` consumes it directly
 //     instead of round-tripping it back through UTF-8, and a path
 //     character outside the ANSI code page now survives.)
@@ -49,7 +49,7 @@
 // regression in ANY layer (FFI mangling, .idata layout, CRT
 // init, msvcrt's puts, file-descriptor wiring) trips the pin.
 
-// D-TEST-RUN-BINARY-ARGV-QUOTING-UNESCAPED — the MSVCRT / CommandLineToArgvW
+// THE MSVCRT / CommandLineToArgvW
 // argv quoter used by the Windows arm below. THE SAME ONE the shipped compiler
 // spawns with (`src/core/substrate/process_spawn.cpp`): this harness used to
 // carry a second, half-correct copy that escaped neither embedded quotes nor
@@ -176,7 +176,7 @@ inline void ensureGenerousSpawnStack() noexcept {
     (void)done;
 }
 
-// ─── D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY, closing-work item (1) ─────────────
+// ─── `QEMU_LD_PREFIX` MUST NOT BE AMBIENT-ONLY ────────────────────────────
 //
 // The SECOND ambient-process-setup dependency of an emulated spawn, and the
 // sibling of `ensureGenerousSpawnStack` directly above: that one owns the
@@ -423,7 +423,7 @@ decideQemuGuestSysroot(std::vector<std::string> const& launcherPrefix,
         "path against the host filesystem, so it would exit 255 before the "
         "guest's first instruction and the run would be reported as an "
         "exit-code mismatch against the manifest rather than as the missing "
-        "package it is (D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY). Not found at '"
+        "package it is. Not found at '"
       + (hostRoot / interpRelative).generic_string() + "'; searched: "
       + searched
       + ". Fix: install the guest's cross RUNTIME — on Debian/Ubuntu the "
@@ -503,7 +503,7 @@ ensureQemuGuestSysroot(std::vector<std::string> const& launcherPrefix,
 // SHAPE they produce — the two-phase warm-up-then-time spawn — is documented
 // at `runBinary` below, which is the code that implements it.
 
-// ─── D-TEST-RUN-HARNESS-DEADLINE-COUNTS-HOST-SUSPEND ───────────────────────
+// ─── THE DEADLINE MUST NOT COUNT HOST SUSPEND ─────────────────────────────
 //
 // EVERY BUDGET ABOVE IS A QUESTION ABOUT AWAKE TIME. "Has this child made
 // progress" cannot be answered on a clock that ran while the machine was
@@ -657,8 +657,8 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
     // arms of the platform fork below are past the point where a missing
     // sysroot could still be reported as anything but the child's own exit
     // code, so the refusal has to happen HERE — before a handle exists, and
-    // before anything has been asked of the OS. See the
-    // D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY block above ensureQemuGuestSysroot.
+    // before anything has been asked of the OS. See the QEMU_LD_PREFIX block
+    // above `ensureQemuGuestSysroot`.
     if (std::string prerequisite =
             ensureQemuGuestSysroot(launcherPrefix, binaryPath);
         !prerequisite.empty()) {
@@ -673,7 +673,7 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
         return out;
     }
 
-    // ── D-TEST-RUN-BINARY-ARGV-QUOTING-UNESCAPED ──────────────────────────────
+    // ── ARGV QUOTING, AND IT IS NOT THIS FILE'S OWN ───────────────────────────
     // ONE argv vector → ONE command line, through the SHARED quoter (see the
     // include note at the top of this file). The vector is exactly the POSIX
     // arm's `argStrings`: [launcherPrefix..., binary, programArgs...], so both
@@ -833,7 +833,7 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
     // the parent's copy open the ReadFile-until-EOF drain loop
     // below would hang forever waiting for ITSELF to close the
     // write end.
-    // ── D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS ──────────────────────
+    // ── DRAINING AFTER THE CHILD EXITS DEADLOCKS ───────────────────────────
     // The drain runs CONCURRENTLY with the wait, on its own thread. It used to
     // run AFTER the child exited, which deadlocks any child that outgrows the
     // pipe's kernel buffer: the child blocks in write(), the parent blocks in
@@ -1050,7 +1050,7 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
     // Parent closes its write-end copy so EOF reaches the read
     // end after the child exits.
     //
-    // D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS — the drain runs
+    // The drain runs
     // CONCURRENTLY with the waitpid poll, for the reason spelled out on the
     // Windows arm above. A Linux pipe buffers 64 KiB by default (vs Windows'
     // 4 KiB), so this arm needs a chattier child to hit it — the bug is the
@@ -1091,7 +1091,7 @@ spawnAndWait(std::filesystem::path const&     binaryPath,
         pipeFds[0] = -1;
     };
 
-    // D-TEST-RUN-HARNESS-DEADLINE-COUNTS-HOST-SUSPEND — the deadline is spent on
+    // The deadline is spent on
     // AWAKE time, not on elapsed time. See the AwakeClock block above for the
     // per-OS measurements; the type is distinct from steady_clock so this pair
     // cannot be recomputed from the wrong clock without a compile error.

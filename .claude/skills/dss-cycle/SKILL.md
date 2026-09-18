@@ -124,16 +124,22 @@ cycle applying the union by reflex over ACCEPTANCE cannot quietly revert it to t
 > *"the priority is always production anchors. ALWAYS. harness we fix as we need when we face the
 > problem (NEVER LATER)."*
 
-The registry is **three files** — two WORKING lists and one ARCHIVE. It split into production and
-harness on 2026-08-25 (*"the priority is real errors, not cosmetics"*), and the archive was carved
-out on 2026-09-01 (*"split what's done from what's to be done. this way we adjust our skills to only
-read what's yet to be done"*):
+The registry is **two files** — one WORKING list and one ARCHIVE:
 
 | file | holds |
 |---|---|
-| `.plans/_deferred-anchor-registry-production.md` | a **still-open** defect **a user of the compiler could hit** — in the shipped binary, or in the config it reads |
-| `.plans/_deferred-anchor-registry-harness.md` | a **still-open** defect **only we can hit** — tests, gates, guards, cycle machinery, plans, scripts, carriages, CI |
-| `.plans/_deferred-anchor-registry-done.md` | every **CLOSED** row, in two tables that preserve which working list it came from. **Nothing here is work.** |
+| `.plans/_deferred-anchor-registry-production.md` | every **still-open** row |
+| `.plans/_deferred-anchor-registry-done.md` | every **CLOSED** row, in one table. **Nothing here is work.** |
+
+★★★ **THE HARNESS REGISTRY RETIRED 2026-09-16, AND THE RULING ABOVE STILL GOVERNS.** The harness
+moved to `DssHarness` (operator, 2026-09-15: *"we'll start using our new dotnet tool as harness ...
+this being working will be that repo responsibility"*), and with it the third file: a defect in the
+harness is repo-harness's to fix, and a defect in THIS repository's build wiring, tests or plans is a
+production row like any other. Its 187 open rows and the archive's 544 closed ones are readable in git
+at the parent of the commit that deleted them. **What did not change is the priority**: a defect a
+user of the compiler could hit outranks one only we can hit, every time — the registry simply stopped
+being where that distinction is recorded. See `references/dss-harness.md` for the tool, its verbs,
+this repository's configuration, and which scripts are still the only way to do their job.
 
 ### ★★★ MOVE ON CLOSE — a closed row does not stay where it was
 
@@ -152,10 +158,10 @@ read what's yet to be done"*):
   the archive can never be picked up.
 - ⚠ **The audit trail is NOT deleted, it is RELOCATED.** "Never delete a closed row" still holds;
   the archive is where it goes.
-- ★ **RESOLUTION reads all three; ORIENTATION reads only the two working ones.** A `D-*` cited in
-  `src/` must resolve wherever its row now lives, so every guard that RESOLVES a citation globs
+- ★ **RESOLUTION reads both; ORIENTATION reads only the working one.** A `D-*` cited in `src/` must
+  resolve wherever its row now lives, so every guard that RESOLVES a citation globs
   `_deferred-anchor-registry*.md`. Everything that asks *what is left* — `burndown-queue`, Step 1's
-  priority pick, this skill — reads production and harness and stops there.
+  priority pick, this skill — reads production and stops there.
 
 ⚠ A row's bucket follows the **DEFECT, never the instrument that found it**. `D-CONFIG-*` and
 `D-DIAG-*` are PRODUCTION deliberately: in this architecture a `.lang/.target/.format.json` document
@@ -167,7 +173,18 @@ IS the compiler's behaviour, and a diagnostic IS its output to a user.
 
 Operator, 2026-09-01: *"add columns for priority and status ... then the write explicitly writes it
 correctly, this way we always have clean statuses."* `Priority` is `P0`..`P5`; `Status` is a
-three-value controlled vocabulary — `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED`.
+controlled vocabulary — `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` / `🔵 🟠 OPEN (DISCLOSED)`.
+
+- ★★★ **`DISCLOSED` is for debt this cycle FOUND, not debt it CREATED, and it exists to remove an
+  incentive rather than to grant an excuse.** The balance gate forbids a cycle that OPENS new debt;
+  it does not forbid one that DISCLOSES pre-existing debt. Without the word, the cheapest way to
+  pass the gate is to not write the row at all — which is the precise dishonesty the gate exists to
+  prevent, produced BY the gate. A disclosed row is **OPEN WORK**: it counts in every total, it
+  files in the working registry, and `--done` refuses it. It is exempt from the net-increase
+  FAILURE and from nothing else.
+- ⚠ **The claim is checkable, so claiming it falsely is a lie about history, not a formatting
+  choice.** It asserts the defect PRE-DATES this cycle, and a reviewer can look for it in the base
+  ref. Use it for a defect you merely faced; never for one you introduced.
 
 - ⚠ **The status cell keeps its glyph, and the glyph is the contract.** A row is CLOSED iff its
   status cell OPENS with ✅ after stripping `*_ ` — the complement defined, never the variants. A
@@ -180,20 +197,23 @@ three-value controlled vocabulary — `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED`.
   leading its `Trigger` prose.** Two cells now state the same fact, so they can disagree — silently,
   because the gate would believe the column while every human reads the prose.
 - ★ **Plan-side §3.1 tables were NOT migrated** and still use the four-cell shape. Both are
-  recognized; only the three registry documents changed.
+  recognized; only the registry documents changed.
 
 ### The four verbs — `scripts/anchors/`
 
 Each has a `.sh` and a `.ps1` launcher over one implementation (`anchors.py`), so the pair cannot
-drift. Every verb takes `--production` / `--harness` / `--done`.
+drift. Every verb takes **`--production` / `--done`, and those are the only two.**
+⚠ **`--harness` NO LONGER EXISTS and is refused** — the harness registry retired on 2026-09-16.
+✔MEASURED 2026-09-16 at `305604f1`: `write-anchor`, `set-anchor` and `read-anchors` each print
+`(--production | --done)` in their own usage line. A command still typing `--harness` fails.
 
 ```
-scripts/anchors/write-anchor.sh  --production D-<AREA>-<NAME> --priority P1 --status open \
+DssHarness write-anchor  D-<AREA>-<NAME> --priority P1 --status open \
                                  --trigger '...' --closing '...' --cross-refs '...' --apply
-scripts/anchors/set-anchor.sh    D-<AREA>-<NAME> --status closed --closing '...' --apply   # MOVES it
-scripts/anchors/read-anchor.sh   D-<AREA>-<NAME>                    # the full row, field by field
-scripts/anchors/read-anchors.sh  --production --band P0       # name + priority + status only
-scripts/anchors/read-anchors.sh  --lint                       # every row a reader cannot key on
+DssHarness set-anchor    D-<AREA>-<NAME> --status closed --closing '...'           # MOVES it
+DssHarness read-anchor   D-<AREA>-<NAME>                    # the full row, field by field
+DssHarness read-anchors  --pending --band P0       # name + priority + status only
+DssHarness read-anchors  --lint                       # every row a reader cannot key on
 ```
 
 ⚠ **Never hand-assemble a row.** The writer takes the FIELDS, so a wrapped anchor id (invisible to
@@ -231,9 +251,11 @@ neither was detectable downstream: an author PRE-ESCAPING by hand, and the raw-l
    faced** — this cycle, in the lane that hit it, as part of that lane's work. A gate that lies, a
    guard blind to its subject, a script that blocks the work in front of you: fix it NOW. **Filing
    it and routing around it is exactly the failure this ruling names.**
-3. **The harness registry is a RECORD, not a backlog.** It is drained by encounter, not by
-   scheduling. A harness row is normally written already ✅ CLOSED, naming a fix that landed in the
-   same cycle.
+3. **A harness row is a RECORD, not a backlog entry.** Harness work is drained by encounter, not by
+   scheduling, and such a row is normally written already ✅ CLOSED, naming a fix that landed in the
+   same cycle. ⚠ **It no longer has a registry of its own** — since 2026-09-16 a defect in the
+   TOOL is repo-harness's to fix and is reported there, and a defect in THIS repository's build
+   wiring, tests or plans is an ordinary production row.
 4. **Still file the row.** *Anchor every issue found* is not repealed — a harness defect fixed
    silently teaches nobody, and the row is what makes the fix auditable. This ruling governs what
    gets **SCHEDULED**, not what gets **RECORDED**.
@@ -302,9 +324,7 @@ separate numbers in the cycle report — a single total hides exactly the thing 
 ### ⚠ A row that is SHIPPED but not marked ✅ is an anchor "rising" for free
 
 ✔MEASURED 2026-08-26, and it is why this warning is here rather than in prose somewhere: of the
-15 `D-OPT*` rows the instrument reported OPEN, **three were shipped work** —
-`D-OPT-NOOPTIMIZE-NEUTERS-POLICY`, `D-OPT-REBUILD-POLICY-NEUTERED-STATE-HOOK`, and
-`D-OPT-REBUILD-MANDATORY-NORMALIZATION`, each whose own status cell opens with
+15 `D-OPT*` rows the instrument reported OPEN, **three were shipped work**, each whose own status cell opens with
 *"🟢 DESIGN RECORD — SHIPPED 2026-07-29 (TF-C85), NOT deferred work"*, and each verified present
 in the tree (`onFunctionNeutered`, `mandatoryNormalization`, the `funcNoOptimize` neuter, with
 their pins). **They counted as OPEN solely because the status cell begins with 🟢 instead of ✅**
@@ -340,13 +360,13 @@ naming them explicitly. "Next cycle will notice" is the follow-up culture this s
 
 ⚠⚠ **AND THE BALANCE GATE IS BLIND TO HALF OF IT. `check-anchor-balance` COUNTS *ROWS*, so an
 anchor cited in source with NO ROW IS INVISIBLE TO IT.** ✔MEASURED P40: it reported **"opened 0"**
-while a finished lane had cited `D-PP-PREDEFINE-REDEFINITION-PARTITION` across **six** files with
+while a finished lane had cited a minted anchor id across **six** files with
 no row anywhere in `.plans/`. Only `scripts/check-anchor-registry/check-anchor-registry.sh` catches
 that class, and there it is the one telling the truth.
 ⇒ **Run BOTH before calling a cycle clean. A green balance is NOT evidence that nothing was
 opened.**
 
-✔MEASURED P40, the sideways-move class: `D-FULLC-STDBIT-ADDRESSABLE-FN` was **re-verdicted** from
+✔MEASURED P40, the sideways-move class: a row was **re-verdicted** from
 *"⏳ DEFERRED, trigger-gated"* to plain 🟠 OPEN by a lane that then exited — better described, still
 open. **"Re-verdicted" is not closed**, exactly as *"refused but not fixed"* is not.
 
@@ -375,8 +395,8 @@ tree, so a gate host holding one can run a corpus belonging to somebody's uncomm
 and report the result as the cycle's.
 
 **The three rules:**
-- **A push is a SYNC, never an accumulation.** `ssh-macos.{sh,ps1}` take `--prune`/`-Prune`
-  and `macos-leg` passes it; the VPS path already had `rsync --delete`. A transport that only
+- **A push is a SYNC, never an accumulation.** `dssharness sync` deletes what the source no
+  longer has and verifies the copy afterwards — one transport, every host. A transport that only
   adds is a transport that silently diverges.
 - **Worktrees are excluded at the transport, on BOTH carriages.** An agent worktree never
   belongs on a gate host. ⓘ rsync does NOT delete excluded paths, so adding the exclude does
@@ -391,11 +411,11 @@ makes `git status` worth reading after a merge you are sure about.
 
 ⚠ **This narrows, and does not repeal, the standing order against cleaning those hosts.** No
 `git clean`, no `reset --hard`, no `checkout --` on either machine unless the operator names it
-(`macos-leg --reset-to` stays opt-in for exactly that reason). What is authorised is removing
+(a deliberate reset stays opt-in for exactly that reason). What is authorised is removing
 what the repo does not have: stale files and worktrees.
 ⇒ ★★★ **THE OPERATOR NAMED IT ON 2026-08-26. Read the next section — restoring a leg clone is
-now REQUIRED where this paragraph once forbade it, and `scripts/leg-tree/` is the only thing
-that may do it.**
+now REQUIRED where this paragraph once forbade it, and the transport is the only thing that may
+do it — `dssharness sync` today.**
 
 ## ★★★ EVERY LEG HOST KEEPS A CLONE, AND THE LEG CLEANS UP AFTER ITSELF — operator ruling 2026-08-26
 
@@ -430,11 +450,11 @@ destructive verb attached.
 deleting them buys tidiness and costs every leg a cold rebuild.
 
 ⚠ **CLEANUP BELONGS TO THE MODE THAT MADE THE MESS, not to every mode that runs afterwards.**
-✔Caught while wiring this: `remote-leg --mode sync-only` exists to LEAVE a host staged for a
-manual probe, and `--mode test-only` runs over whatever is already there. A restore on exit would
-have deleted the staging as the command returned, and a prepare would have made `test-only` test
-HEAD while reporting on the staged tree. ⇒ `full` prepares and restores; `sync-only` prepares
-only; `test-only` does neither.
+✔Caught while wiring this: a sync-only mode exists to LEAVE a host staged for a manual probe, and
+a test-only mode runs over whatever is already there. A restore on exit would have deleted the
+staging as the command returned, and a prepare would have made test-only test HEAD while reporting
+on the staged tree. ⇒ the three shapes must stay distinct. Today they are `dssharness sync`,
+`dssharness test --use-staged` and `dssharness test --no-build`.
 
 ⚠ **WHY THIS REPLACED THE OLD ARRANGEMENT.** ✔MEASURED 2026-08-26: the macOS clone sat on branch
 `…-3` at `8cb9afbd` (**three commits back**) with a **2,696-path index under a 2,759-path working
@@ -538,8 +558,8 @@ A set that cannot go green does not get committed because a boundary arrived.
 whichever build type it is working in; what this ruling fixes is what a ROUND owes before its commit
 is called green. ⚠ **Report eight numbers with their build type beside each** — a four-number gate
 line is now an incomplete gate that reads as complete.
-ⓘ `scripts/remote-leg/remote-leg.sh --build-type Release` takes the remote half; the tree name
-follows the type and an unknown type refuses.
+ⓘ `dssharness test --legs <leg>-release` takes the remote half; the build type is part of the
+leg NAME now, and `dssharness legs` lists every one that can run.
 
 ### ⚠⚠ CI IS EXPENSIVE TO **RUN** AND FREE TO **READ** — AND THE TWO RULES ARE OPPOSITE
 
@@ -550,7 +570,7 @@ follows the type and an unknown type refuses.
   commits have no verdict at all, which is exactly why the eight-run local gate above is what a
   round owes.
 - ✅ **ALWAYS read whatever verdict already exists.** Reading costs nothing, and step 0 now does it
-  with `scripts/check-ci-legs/`. A red leg is a HARD STOP on *proceeding*, never on *fixing*.
+  with `dssharness check-ci-legs`. A red leg is a HARD STOP on *proceeding*, never on *fixing*.
 
 ★ **This corrects a framing I first wrote into a row, and the correction is the point.** I filed
 *"no step of `/dss-cycle` reads CI at all"* as though the READING were the defect, and then
@@ -583,9 +603,25 @@ while the local four-leg Debug gate was **2179 / 2178 / 2148 / 2148 GREEN on tha
      `/showIncludes`, which reports headers ONLY**, so `#deps 0` is CORRECT for a TU with no
      `#include`. The local Windows gate is **MinGW GCC**, so the fact is invisible to it in *every*
      build type.
-   - macOS was `run_gate_guard`, proved **build-type independent** by running it from the repo root
-     with no build tree at all. It is invisible locally because the three INDIRECT legs run
-     `-LE repo-guard`, so **31 guard tests run on exactly one local host and on all five CI legs.**
+   - macOS was a repo-guard entry, proved **build-type independent** by running it from the repo
+     root with no build tree at all. ★ **THE DURABLE FACT: a repo-guard is HOST-INDEPENDENT** — it reads
+     the TREE, not the machine — **so which legs execute it is a CONFIGURATION decision, and a
+     leg that skips it can never see a guard-only defect.** Derive the leg set from the run you
+     are looking at (the per-leg totals differ by exactly the guard count), never from memory.
+     ★★★ **AND THE LEG SET IS DECLARED, NOT DECIDED THREE TIMES.** ✔MEASURED 2026-09-16, while
+     three hand-written drivers still existed: each chose its own default, so one passed
+     `-LE repo-guard` on the two ssh legs while another ran every guard on WSL — Windows **2207**,
+     WSL **2206**, macOS and the VPS **2167**. ⛔ This sentence asserted for a year that guards ran
+     on exactly ONE local host and that all three indirect legs skipped them. Both halves were
+     false: it was TWO local hosts and **four** of a round's eight runs. ★ **That class of bug
+     needs two programs to disagree; one tool reading one configuration cannot have it** — which
+     is the argument for the migration in one line, and the reason the durable sentence above is
+     now checkable rather than advisory.
+     ⚠ **The count is not typed here, and the migration is why that matters more than ever:** it
+     moves by whole waves. `ctest -N -L repo-guard` prints it, and so does the configure line
+     `repo-guard label applied to N test(s)` — which is what the root `CMakeLists.txt` says to read,
+     in those words, having already gone stale by eight entries once. This sentence has said **18**,
+     then **31**, then **40**; **re-derive it at the commit in front of you.**
 
 ★★★ **THE SHAPE IS THIS CYCLE'S OWN THROUGH-LINE, TWICE MORE: THE RULE A DEFECT CITED WAS TRUE — OF
 THE THING NEXT DOOR.** *"`#deps 0` is never legitimate"* is true of **gcc** and false of **MSVC**.
@@ -617,14 +653,16 @@ bash scripts/lane-worktree/lane-worktree.sh remove k   # removes AND prunes
 Four clauses, and each is measured rather than asserted — detail in `references/worktrees.md` §H.0b:
 
 1. **`.gitignore`'s `/.worktrees/` rule is what satisfies the "ALL host copies" clause.** The
-   carriages derive their exclude list from git (`scripts/carriage-excludes/`), so that one line is
-   what stops four full repo copies riding to macOS and the arm64 VPS on every push. It is ALSO
-   pinned in that script's `MUST_NEVER_TRAVEL` floor, which re-asks git and **refuses the carriage**
-   if the line is ever edited away (refusal arm exercised: exit 3, naming `.worktrees/`).
+   transport derives what it carries from git, so that one line is what stops four full repo copies
+   riding to macOS and the arm64 VPS on every push. ★ It is ALSO declared independently of git:
+   ✔MEASURED 2026-09-17, `.harness-config/config.json`'s `sync.neverTransfer` names `.worktrees`,
+   `.claude/worktrees`, `.secrets`, `.temp`, `build`, `scratchpad` and `test-scratch` — once, for
+   every host. `dssharness sync --dry-run` lists every path it would write, which is how to CHECK
+   this rather than trust it.
 2. ⚠ **The MAX_PATH budget is now SPENT, not slack.** The move costs **46 characters** on every
    build path: longest build-relative suffix **163**, so `C:/dssp40k` had **87 spare** and
    `.worktrees/k` has **46**. `lane-worktree.sh` refuses by arithmetic any root leaving under 20,
-   naming `D-CYCLE-WORKTREE-UNDER-THE-SESSION-SCRATCH-PATH-CANNOT-BE-BUILT-ON-WINDOWS` — the defect
+   naming in the refusal the anchor for a worktree root that cannot be built on Windows — the defect
    whose failure mode is a per-TU compile error in files the lane never touched.
    ⇒ **Keep lane names SHORT** (`k`, `l`, `rod`); a descriptive name spends that margin.
 3. **The lane that takes a worktree owns removing it**, via `remove` — which prunes, because a stale
@@ -671,8 +709,8 @@ lane's own authority, it is discovering the gate does not apply.
   measurement **in the row** and **flags it in the cycle report** so the operator can veto;
 - an **INCONCLUSIVE** measurement escalates. **Silence is never a discharge.**
 
-✔The case that produced this ruling: `D-CSUBSET-INLINE-ASM-SPELLING` was pinned §B because bare
-`asm` "needs a new standard-mode axis". A lane measured that DSS already declares GNU mode in the
+✔The case that produced this ruling: bare `asm` was pinned §B because the spelling
+"needs a new standard-mode axis". A lane measured that DSS already declares GNU mode in the
 reference compilers' own machine-readable spelling (defines `__GNUC__`/`__clang__`, does **not**
 define `__STRICT_ANSI__`) — so no axis exists or was added, and the predicate was false. It also
 measured that DSS was **accepting `int asm = 42;`**, which no reference compiler accepts in GNU
@@ -710,12 +748,12 @@ to building counts**, so the honest response is to build it now, not to record t
 
 ★ **Prefer a prerequisite that unblocks MORE THAN ONE row, and name which when you pick it.**
 ✔The case that produced the ruling: an escape-analysis / points-to substrate for `mirMayAlias` is
-the stated trigger for `D-OPT-MEMSSA-WALK-PAST-PRECISION` **and** the stated prerequisite for
-`D-OPT7-INLINE-LEGALITY-GATE` clause (c). One substrate, two rows.
+the stated trigger for the MemorySSA walk-past-precision row **and** the stated prerequisite for
+clause (c) of the **OPT7 / inlining** legality gate. One substrate, two rows.
 
 ⚠ **CHECK THE TREE BEFORE CALLING THE PREREQUISITE MISSING.** ✔MEASURED 2026-08-26: DSS's HIR
 intrinsic registry was about to be described as absent. It EXISTS — `HirIntrinsicRegistry`,
-`Hir::intrinsicRegistry()`, `makeIntrinsicCall`, and a shipped `D-CSUBSET-INTRINSIC-UMULH`
+`Hir::intrinsicRegistry()`, `makeIntrinsicCall`, and a shipped `umulh`
 builtin-intrinsic node. Only the *routing* of a shipped C construct through it is missing, which
 is a far smaller job than the row implied.
 
@@ -734,23 +772,30 @@ hand-typing every edit or reading every subsystem.
 0. **Orient.** Read `.plans/_handoff.md` first — the previous cycle's claim, not ground truth; where
    it disagrees with your own measurements, say so and correct it this cycle. Check `git status`,
    branch, last commit subject. Read plan-00 §0.1 and skim the anchor registry.
-   ⚠ **ORIENTATION READS THE TWO WORKING REGISTRIES ONLY** — `-production.md` and `-harness.md`
-   hold what is LEFT, and `bash scripts/anchors/read-anchors.sh --production` is the whole list in
-   one screen. **Do not read `_deferred-anchor-registry-done.md` to choose work**: it is the
-   archive, it is by far the largest of the three, and reading it to orient is how a closed row got
-   recommended three times in this project's history. Establish a green
+   ⚠ **ORIENTATION READS THE WORKING REGISTRY ONLY** — since 2026-09-16 that is ONE document,
+   `-production.md`, which holds everything that is LEFT, and
+   `DssHarness read-anchors --pending` is the whole list in one screen.
+   (This line named `-harness.md` as a second working registry until the harness registry retired.)
+   **Do not read `_deferred-anchor-registry-done.md` to choose work**: it is the archive, it is by
+   far the larger of the two, and reading it to orient is how a closed row got recommended three
+   times in this project's history. Establish a green
    baseline (`cmake --build build`, then full `ctest`). **A red baseline with no WIP-repair context
    is itself a pause gate** — present it; do not silently "fix it".
 
-   ★★★ **AND READ CI. NO STEP OF THIS SKILL USED TO, AND TWO LEGS STAYED RED FOR SIX MATRIX RUNS.**
-   [[D-CI-TWO-RELEASE-LEGS-HAVE-BEEN-RED-FOR-TEN-DAYS-WHILE-EVERY-LOCAL-LEG-WAS-GREEN]].
+   ★★★ **AND READ CI. NO STEP OF THIS SKILL USED TO, AND TWO RELEASE LEGS STAYED RED FOR TEN DAYS
+   — SIX MATRIX RUNS — WHILE EVERY LOCAL LEG WAS GREEN.**
    ✔MEASURED 2026-09-14: the PR's Pipeline had been red on **every** run that executed the matrix,
    with two legs failing at `Test` while the four-leg local gate was 2179/2178/2148/2148 GREEN at
    the very same commit — because **no configuration either red leg runs in is one the local gate
    builds.** The operator had to point at it.
 
-       bash scripts/check-ci-legs/check-ci-legs.sh --branch <this branch>
-       pwsh -NoProfile -File scripts/check-ci-legs/check-ci-legs.ps1 -Branch <this branch>
+       dssharness check-ci-legs --branch <this branch>
+
+   ★ ✔MEASURED 2026-09-17, same branch and same run id: the retired shell twins printed
+   *"THE MATRIX DID NOT RUN … says NOTHING about the tree"* and then **exited 0**; the verb
+   REFUSES, *"no job … is a leg, so nothing was verified about the tree. This is not a pass"*,
+   **exit 2**. A nothing-was-verified run must never read as a pass to a caller that tests the
+   exit code.
 
    - **A red leg is a HARD STOP the cycle reads before picking work**, and it is a FIX, so no other
      hard stop applies to repairing it (see *Hard stops* below). It goes in front of §0.1.
@@ -805,8 +850,7 @@ hand-typing every edit or reading every subsystem.
    `src/dss-config/**` is a FILE SET like any other, and a config document is an INPUT to
    every lane's build. Editing one while a lane is running does not merely risk a merge
    conflict — it changes what that lane's binaries MEAN between two runs.
-   ⚠ ✔MEASURED 2026-08-20 (cycle P22,
-   `D-CYCLE-CONFIG-EDITS-NOT-SEQUENCED-AGAINST-LANE-OWNERSHIP`): the orchestrator
+   ⚠ ✔MEASURED 2026-08-20 (cycle P22): the orchestrator
    corrected a relocation `nativeId` while a lane was mid
    red-on-disable run. A test's verdict flipped between two runs of the same binary, and the
    lane reported a stale tree as a defect in its final report. **The damage is not the wasted
@@ -818,7 +862,7 @@ hand-typing every edit or reading every subsystem.
    report and the tree disagree, suspect the SEQUENCING before suspecting the lane.
    ★★★★ **HANDING `src/dss-config/**` TO A LANE DOES NOT FIX THIS — IT ONLY MOVES WHOSE
    HAND IS ON IT, AND ✔THE HAZARD RECURRED THAT WAY ON 2026-08-26 (cycle P38).** The P22
-   row [[D-CYCLE-CONFIG-EDITS-NOT-SEQUENCED-AGAINST-LANE-OWNERSHIP]] is CLOSED and the
+   row above is CLOSED and the
    mechanism it built is sound; what recurred was the SCHEDULING. A lane was given
    `src/dss-config/targets/**` + `src/core/types/target_schema.*` and run CONCURRENTLY
    with three lanes that gate — so `test_support/test_config_snapshot` reddened in one
@@ -836,7 +880,7 @@ hand-typing every edit or reading every subsystem.
    SEQUENCING finding, and the integration gate, not the lane, is what settles it.
    ★★ **AND THE TREE THAT RULE NAMES IS TOO NARROW: `.plans/**` IS AN INPUT TO A
    GUARD, AND A GUARD IS A CTEST ENTRY, SO EVERY LANE'S GATE READS IT.**
-   ⚠ ✔MEASURED 2026-08-24 (cycle P31, `D-CYCLE-THE-ORCHESTRATOR-EDITED-PLANS-UNDER-A-RUNNING-LANE-AND-FLIPPED-ITS-GATE`):
+   ⚠ ✔MEASURED 2026-08-24 (cycle P31):
    a lane's `plan_citations_guard` was RED in one gate and GREEN in the next **with no edit
    of its own in between**, because the orchestrator applied registry rows and re-baselined
    the citation ratchet while that gate was in flight. `anchor_registry_guard`,
@@ -863,11 +907,12 @@ hand-typing every edit or reading every subsystem.
    attributable to anything** — which makes it worthless exactly when it matters, during a
    red-on-disable observation.
    ⇒ Name the lane's build tree in its brief (`build/<lane>`), and clear it once green (the
-   one-root rule). `scripts/local-build/local-build.{sh,ps1} --tree <name>` takes one.
+   one-root rule). `dssharness build` gives each leg its own variant-keyed directory INSIDE the
+   tree it is run in, so a lane worktree isolates itself — ✔MEASURED from one:
+   `-S <lane>/. -B <lane>/build/x86_64-mingw-gcc-debug`.
    ★★ **AND A LANE THAT WRITES SCRATCH FILES GETS ITS OWN SCRATCH DIRECTORY.** The per-lane
    BUILD tree isolates artifacts; it isolates neither the scratchpad nor the working tree.
-   ⚠ ✔MEASURED 2026-08-20 (cycle P23,
-   `D-CYCLE-LANE-SCRATCHPADS-ARE-SHARED-AND-LANES-CLOBBER-EACH-OTHER`):
+   ⚠ ✔MEASURED 2026-08-20 (cycle P23):
    four lanes were given one `scratchpad/<cycle>/` directory, one lane's
    mutation harness was OVERWRITTEN by another lane's file of the same name mid-run, and the
    next three red-on-disable cycles executed the WRONG SCRIPT with the first lane's arguments.
@@ -902,20 +947,19 @@ hand-typing every edit or reading every subsystem.
    §5's "a measurement is stated only with the instrument that produced it", one level up: an
    invocation is a claim about the world, and writing one from memory is writing an
    unmeasured fact into the place a lane trusts most. ⚠ ✔MEASURED 2026-08-20 (cycle P23): the
-   orchestrator's own common brief spelled `run-gate.sh -- ctest …`; the real interface is
+   orchestrator's own common brief spelled the witness gate as `-- ctest …`; its real interface was
    `<log-path> <success-regex> <command> [args...]`. TWO lanes hit it, it refused
    (fail-closed, correctly), and one left a file literally named `--` in the repo root. The
    fix is one command: run the invocation once before pasting it into a brief.
    ★★ **AND THE SAME STANDARD BINDS A MECHANISM, NOT ONLY AN INTERFACE: A BRIEF THAT NAMES THE
    FIELD A DECISION READS, OR THE ROLE A VALUE CARRIES, IS MAKING A MEASUREMENT AND OWES AN
-   INSTRUMENT.** ⚠ ✔MEASURED 2026-08-20 (cycle P23,
-   `D-CYCLE-BRIEF-ROUTED-A-DECISION-ONTO-A-FIELD-THAT-DOES-NOT-DISCRIMINATE`): a brief told a lane
+   INSTRUMENT.** ⚠ ✔MEASURED 2026-08-20 (cycle P23): a brief told a lane
    to route the COFF weak-external decision on the auxiliary record's `Characteristics` field. gcc
    emits `Characteristics = 1` for **all four** weak shapes, so routing on it would have classified
    every gcc weak DEFINITION as unresolvable — *precisely the defect the lane existed to fix*. The
-   field that discriminates is the record's own `TagIndex`. ★ **This is the same trap as
-   `D-LK-MACHO-ISDATA-NO-CALL-SIGNAL` (a relocation's arithmetic substituted for its role) and as
-   `D-LK-PE-ALTERNATENAME-DECLARE-AND-REFUSE`'s revisit condition (a front-end feature substituted
+   field that discriminates is the record's own `TagIndex`. ★ **This is the same trap as the
+   Mach-O `isData` no-call-signal case (a relocation's arithmetic substituted for its role) and as
+   the PE `/ALTERNATENAME` declare-and-refuse revisit condition (a front-end feature substituted
    for the existence of a caller). The trap is not any particular field — it is reaching for
    whichever field sits nearest the decision and assuming it carries it.** Where a brief cannot
    supply an instrument, it says *"unmeasured, verify first"* rather than stating the fact flat.
@@ -923,15 +967,14 @@ hand-typing every edit or reading every subsystem.
    OFF-BRIEF** — say so in the brief, so the lane knows a refutation is a deliverable.
    ⚠ **AND THE FIRST WRITE-UP OF THIS RULE MISSTATED ITS OWN MEASUREMENT** — it said
    that invocation exits 127 with an empty log. ✔RE-MEASURED: it exits **2**, with a named
-   refusal. The 127-and-empty-log shape is the DIFFERENT invocation `bash <C:/.../run-gate.sh>`,
+   refusal. The 127-and-empty-log shape is the DIFFERENT invocation `bash <C:/.../script.sh>`,
    where bash cannot open the SCRIPT (see below). Two failures that look alike were being
    described as one, inside the rule that exists to stop exactly that.
    ★★ **A BRIEF THAT ASSIGNS `tests/<dir>/` GRANTS THAT DIRECTORY'S `CMakeLists.txt` AS
    APPEND-ONLY — AND SAYS SO.** A new `test_*.cpp` cannot RUN without a `dss_add_test` block, and
    that file belongs to the directory rather than to any lane, so a brief that lists the test file
    and not its registration leaves the lane a choice between not landing the test and editing an
-   unowned file. ⚠ ✔MEASURED 2026-08-20 (cycle P23,
-   `D-CYCLE-BRIEF-ASSIGNS-A-TEST-FILE-WITHOUT-ITS-BUILD-REGISTRATION`): four lanes added tests and
+   unowned file. ⚠ ✔MEASURED 2026-08-20 (cycle P23): four lanes added tests and
    three shared `CMakeLists.txt` files were each edited by lanes that had not been given them.
    Append-only edits merged cleanly; the damage came from ONE lane rewriting a whole file in CRLF,
    reddening `line_endings_guard` for three other lanes' work and leaving a diff nobody could claim.
@@ -940,7 +983,7 @@ hand-typing every edit or reading every subsystem.
    ★★ **A MESSAGE TO A LIVE LANE RE-STATES THAT LANE'S SUBJECT AND OWNED PATHS, IN ITS
    OPENING LINES.** A lane handle is an opaque id; several lanes run at once; and a message from
    the orchestrator carries the orchestrator's authority. ⚠ ✔MEASURED 2026-08-20 (cycle
-   P23, `D-CYCLE-A-LANE-MESSAGE-DELIVERED-TO-THE-WRONG-LANE`): an ownership-NARROWING message
+   P23): an ownership-NARROWING message
    — reassigning a file set and asserting *"your scope was always X"* — was delivered to
    the wrong lane. Had it been obeyed, two lanes would have edited one file set and BOTH reports
    would have become unattributable, which is the same damage class as editing a lane's config
@@ -955,8 +998,7 @@ hand-typing every edit or reading every subsystem.
    registry row text, its red-on-disable transcript, its md5s and any number the fold will quote come
    back INLINE in the reply. `scratchpad/<cycle>/<lane>/` keeps its P23 job — a private place for
    harnesses and intermediates — and stops being a place a RESULT is left.
-   ⚠ ✔MEASURED 2026-08-24 (cycle P31,
-   `D-CYCLE-A-LANE-DELIVERABLE-LEFT-IN-THE-SCRATCHPAD-IS-INVISIBLE-TO-THE-FOLD`): TWO lanes in one
+   ⚠ ✔MEASURED 2026-08-24 (cycle P31): TWO lanes in one
    cycle reported by citing a path, and both paths were empty when the orchestrator read them — one
    of them holding the lane's **registry row**, which IS that lane's deliverable, and the other a
    483-row byte-identity baseline taken at a named commit.
@@ -975,7 +1017,7 @@ hand-typing every edit or reading every subsystem.
    `clean` / `reset` because the tree is shared, and that prohibition is correct and stays
    BLANKET. ⚠ But it was SILENT about a need it creates: a lane that corrupts its own
    exclusively-owned file has no way back except the one thing it is forbidden to do.
-   ✔MEASURED 2026-08-24 (cycle P31, `D-CYCLE-THE-NEVER-CHECKOUT-RULE-LEAVES-A-LANE-NO-WAY-TO-UNDO-ITS-OWN-EDIT`):
+   ✔MEASURED 2026-08-24 (cycle P31):
    a lane ran `git checkout -- <its own config file>` to undo a malformed patch of its own, then
    disclosed it unprompted. ★ **The disclosure is the only reason anyone knows** — a restored
    file looks exactly like a file that was never edited, so this violation leaves nothing in any
@@ -988,7 +1030,7 @@ hand-typing every edit or reading every subsystem.
    it owns, which is the case the rule exists for.
    ★★ **A BYTE-IDENTITY BASELINE IS TAKEN AS AN ISOLATING PAIR, NEVER INHERITED —
    AND IN A SHARED TREE ITS SHELF LIFE IS MEASURED IN HOURS.**
-   ⚠ ✔MEASURED 2026-08-24 (cycle P31, `D-CYCLE-A-BYTE-IDENTITY-BASELINE-EXPIRES-WHEN-THE-SHARED-TREE-MOVES`):
+   ⚠ ✔MEASURED 2026-08-24 (cycle P31):
    a lane diffed a predecessor's 483-row baseline, taken two hours earlier at the same commit, and
    got **13 differing lines with 8 examples flipping to NO-ARTIFACT — none of them its own**. A
    sibling lane's front-end work had landed in between, while the instrument's `cfgroot` snapshot
@@ -1043,10 +1085,10 @@ hand-typing every edit or reading every subsystem.
    keep surfacing logic findings without converging are a pause signal — stop and report, do not grind.
 7. **Fail-loud gate** — the mechanical battery, including the anchor-balance gate.
 8. **Pin every deferral** discovered this cycle — and **CLOSE by MOVING**, never by editing a status
-   in place. `scripts/anchors/set-anchor.sh <ANCHOR> --status closed --closing '...' --apply` rewrites
+   in place. `DssHarness set-anchor <ANCHOR> --status closed --closing '...'` rewrites
    the row and lifts it out of the working registry into `_deferred-anchor-registry-done.md`; a lane
    handing you a verbatim row FILE goes through `apply-registry-row`, which delegates to the same
-   writer. A NEW row is `write-anchor.sh --production|--harness ... --insert --apply`. ⚠ Never
+   writer. A NEW row is `write-anchor.sh --production|--done ... --insert --apply`. ⚠ Never
    hand-edit a table: `check-anchor-balance`'s partition arm fails the tree for a closed row left
    behind or an open row filed in the archive, and its ARM 6 fails it for a `Status` column that
    contradicts its own `Trigger` prose.
@@ -1056,10 +1098,16 @@ hand-typing every edit or reading every subsystem.
     this gate until clean. A finding implying a *design choice* is a pause gate, not a loop.
 11. **Commit and push.** `.plans/_handoff.md` must be staged in THIS commit — it ships with the work
     it describes, never in a follow-up. Subject `Cycle <id>: <concise summary>`; body lists anchors
-    closed/opened plus the test delta; end with the repo's standard Co-Authored-By trailer (currently
-    `Co-authored-by: Claude Opus 5 <noreply@anthropic.com>`). ⚠ DO NOT TRUST THAT SPELLING FROM HERE — it said 4.8 until 2026-08-28, when the last six commits actually carried Opus 5 five times. Read the trailer off `git log` before committing; a hardcoded model name in a skill is stale the moment the model changes.. Push immediately — it starts CI while
-    context is hot. Stay on the current feature branch. **Open the PR here if the branch does not
-    have one yet.**
+    closed/opened plus the test delta; end with the repo's standard `Co-authored-by:` trailer.
+    ⛔ **THE MODEL NAME IS NOT WRITTEN HERE, ON PURPOSE.** A hardcoded one is stale the moment the
+    model changes, and this line carried `Opus 4.8` for weeks after the commits had moved on. Take it
+    from the session's own attribution instructions, or read the newest one off the tree:
+    `git log --format='%b' -20 | grep -im1 '^[Cc]o-authored-by:'`. ✔MEASURED 2026-09-16 at
+    `305604f1`: the last ten commits all carry the same trailer, and it is the one that instrument
+    prints. Push immediately. ⚠ **Pushing does NOT start the test matrix** — `pipeline-pr.yml` is
+    gated on the operator's `Run Pipes` label and only the ungated landing-log job runs; push because
+    the work should be on the remote, not because it buys a CI verdict. Stay on the current feature
+    branch. **Open the PR here if the branch does not have one yet.**
     ⚠ **THIS STEP IS REACHED ONCE PER COMPLETED LANE SET, NOT ONCE PER CYCLE** — see
     *A COMPLETED SET OF LANES IS A COMMIT POINT* above. A cycle running several sets of lanes lands
     several commits on one PR, and **the next set is seeded only AFTER this step**, so every lane
@@ -1082,6 +1130,21 @@ proceed (failures, done/not done, final report, etc)"*.
 3. **Done / not done** — a step's terminal state, when the operator's next action depends on it.
 4. **The final report** — the output contract below.
 5. **A direct answer to a direct question.**
+6. ★★★ **A DssHarness finding** (operator ruling, 2026-09-16: *"please also put in dss-cycle skill
+   that any issue found in DssHarness must be reported to me (the operator)"*). **Emit it even when
+   it neither fails nor blocks this cycle** — which is the usual case, because the cycle routes
+   around a tool defect by using the script that still exists, and the finding then matches none of
+   categories 1–5 and dies in a lane report. That silence is what this item closes.
+   - **Same FORM as everything else:** what was run, what happened, what should have happened, and
+     the exact source symbol in repo-harness that produces it — **path + SYMBOL, never a line
+     number**. A few lines. No significance commentary, no derivation.
+   - **Report it in the cycle that FINDS it**, never filed for later — the same shape as *fix it when
+     you face it*.
+   - **A DssHarness defect does NOT become a `D-*` row here**; it is not this repository's defect.
+     **The cycle report is its only route out**, which is why this item has to exist at all.
+   - ⚠ **Reporting does not replace fixing our side.** Where the defect has a correct LOCAL
+     expression that is not a workaround — spelling a `minVersion` with three components because the
+     tool documents semantic versions, say — fix it here AND report the tool's part. Not alternatives.
 
 ⛔ **Everything else is noise, and the list of what NOT to emit is the useful half:** no progress
 narration ("lane X is running", "starting the build"), no interim summaries of work that is not
@@ -1144,12 +1207,13 @@ workaround an own tool. reusable tools exists to avoid bunch of problems like ma
   ✔MEASURED 2026-08-20 (cycle P23): from a Windows-native process, `bash` resolves to
   `C:\WINDOWS\system32\bash.exe` — **WSL's** — which cannot open a `C:/...` path. Two
   distinct failures follow and they look alike:
-  * `bash scripts/run-gate/run-gate.sh <C:/...log>` — the script RUNS and cannot write its
-    log; it now exits **2** with a named refusal that identifies the shell.
-  * `bash <C:/.../run-gate.sh>` — bash cannot open the SCRIPT, so **it never executes**.
+  * `bash <relative-script> <C:/...log>` — the script RUNS and cannot write its log; a
+    well-written one exits **2** with a named refusal that identifies the shell.
+  * `bash <C:/.../script.sh>` — bash cannot open the SCRIPT, so **it never executes**.
     Exit **127**, empty log, and **no edit inside any script can ever improve this shape**.
     The only fix is at the CALL SITE: invoke it as a relative path from Git Bash, or run the
-    `.ps1` twin.
+    `.ps1` twin. ⓘ The root `CMakeLists.txt` asks this same question once, by EXECUTION, before
+    registering any bash-driven entry — that probe is where the rule is enforced now.
   ★ Worth stating because the second shape reads as *"the gate refused"* when what happened
   is *"the wrong bash ran"* — an instrument that misattributes is the failure this project
   cares most about.
@@ -1184,8 +1248,8 @@ execution is posix only."*
   project's primary ctest runs; a bash-only capability is one the main gate cannot use.
 - **Omit it — and say so in the header — when either holds:** the script is already cross-platform (a
   `.py` runs on both hosts, so a twin would be a second implementation of something never split), or
-  execution is POSIX-ONLY BY NATURE (`wsl-leg` runs inside a WSL distro where PowerShell is not the
-  shell; `profile-compile` drives a POSIX toolchain over a carriage).
+  execution is POSIX-ONLY BY NATURE (a driver that runs inside a WSL distro where PowerShell is not
+  the shell; `profile-compile` drives a POSIX toolchain over a carriage).
 - **Where a pair exists, the two must not drift — and that is checked IN THE REVIEW, at the moment the
   script is written or changed.** Operator ruling 2026-08-19: *"the parity must be checked in the
   review, before the commit, when the script is being created or modified. Not after and not a script
@@ -1218,7 +1282,7 @@ commit messages, and code comments alike.
 ✗  src/mir/lowering.cpp  + a line number    <- moves the instant anything above it changes
 ✓  src/mir/lowering.cpp — lowerCallArgs()
 ✓  tests/CMakeLists.txt — the `no RUN_SERIAL` rationale block
-✓  [[D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES]]
+✓  a defined anchor id, when a registry row is the subject
 ```
 
 **A symbol survives every edit above it; a line number survives none** — and the failure mode is the
@@ -1263,7 +1327,7 @@ measured defect behind a rule written to stop *new pass development*.
 Touching a gated subsystem's source does not by itself make it a capability; the OPT7 gate is about
 opening the inter-procedural *arc*, not about every line in `src/opt/`.
 
-- **OPT7 / inlining** (`G-406`, sub-anchor `D-OPT7-1`) — first inter-procedural pass, touches
+- **OPT7 / inlining** (`G-406`, plus its cross-CU sub-anchor) — first inter-procedural pass, touches
   linkage / DCE / cross-CU legality. A supervised cycle; **never open autonomously.**
   ⇒ **Gated: opening the arc.** ⇒ **NOT gated: fixing a defect in inlining that already ships**,
   per the ruling above.
@@ -1273,15 +1337,22 @@ opening the inter-procedural *arc*, not about every line in `src/opt/`.
 - **Correctness-critical anchors** (silent-miscompile class) — the closing cycle MUST ship a negative
   miscompile-pin that breaks iff the transform mis-fires. If the pin cannot be constructed, STOP and
   bring a decision brief. Never ship on review alone.
-- ★★★ **A RED CI LEG — read at step 0 with `scripts/check-ci-legs/`.** It stops the cycle from
+- ★★★ **A RED CI LEG — read at step 0 with `dssharness check-ci-legs`.** It stops the cycle from
   picking new work until it is diagnosed, and since repairing it is a FIX, **no other hard stop
   applies to the repair itself**. ⛔ The stop is on *proceeding past it*, never on fixing it, and
   **never** on touching the operator's PR: do not label, re-run or push to re-trigger CI.
   ⚠ **The local gate cannot substitute for it, and assuming otherwise is the defect.** ✔MEASURED
   2026-09-14: the two legs that were red run in configurations **no local leg builds** — the local
-  Windows gate is **MinGW GCC**, so every `deps = msvc` fact is invisible to it, and the three
-  INDIRECT legs (WSL, macOS, arm64 VPS) skip `-L repo-guard` entirely, so 31 guard tests run on
-  exactly one local host and on all five CI legs.
+  Windows gate is **MinGW GCC**, so every `deps = msvc` fact is invisible to it, and the two SSH
+  legs (macOS, arm64 VPS) skip `-LE repo-guard`, so a guard-only defect is invisible to THEM.
+  ⚠ **WSL was NOT in that set** — ✔MEASURED 2026-09-16, the WSL driver ran every guard while the
+  two ssh drivers excluded the label; the counts said so (Windows 2207, WSL 2206, macOS/VPS 2167).
+  ★★★ **THE DURABLE RULE: a guard is HOST-INDEPENDENT — it reads the TREE — so which legs execute
+  it is a CONFIGURATION decision, and a leg that skips it cannot see a guard-only defect.**
+  **Re-derive the set from the run in front of you**, never from this page: the divergence above
+  existed precisely because three programs each answered the question separately.
+  ⚠ Read the count from `ctest -N -L repo-guard` or from that commit's own
+  `repo-guard label applied to N test(s)` configure line — never from here.
 
 ## Stop-command handling
 
@@ -1303,6 +1374,12 @@ never lowers the bar.
   whether an anchor is eligible.
 - Read `references/operator-discipline.md` when reporting or claiming anything — the bar applies to
   the operator, not only to the code, and it opens with the **never-cite-a-line-number** rule.
+- Read `references/dss-harness.md` **before running anything that touches a leg, a worktree or an
+  anchor** — `DssHarness` is the tool this repository's harness is moving to, and that file says which
+  of its verbs exist today, which scripts are still the only way to do their job, what this
+  repository's `.harness-config/config.json` declares, and the exit codes to act on. ⛔ A defect in
+  the tool is a repo-harness issue, never a local workaround, **and it is REPORTED TO THE OPERATOR in
+  the cycle that finds it** (ruling 2026-09-16) — see output-contract item 6.
 - Read `references/scripts.md` **before writing any script, probe, or one-off shell pipeline** —
   the index of every script this repository already ships, each with its purpose. Most of what a
   cycle needs is already there, and re-typing it inline re-opens the edge cases it was taught

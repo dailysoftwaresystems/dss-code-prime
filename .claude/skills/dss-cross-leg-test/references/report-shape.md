@@ -108,14 +108,13 @@ against the same `~/src/sqlite`, and its Step-3 `git pull` had moved the tree fo
 those artifacts were built. ⇒ **the expectation was stale, not the binary**, and a probe that
 reads the id from whatever the tree says today will fabricate a DSS-charged failure whenever
 any other run has pulled since. Ask the ARTIFACT what vintage it is (`<cli> --version`) and
-use that, or pin the upstream commit for the whole comparison. This is
-[[D-HARNESS-SQLITE-STAGED-TREE-MIXED-VINTAGE]] reaching the round-trip probes.
+use that, or pin the upstream commit for the whole comparison. This is the staged sqlite
+tree's mixed-vintage hazard reaching the round-trip probes.
 
 ⚠ **`--launcher` and dash-leading tokens:** `--launcher arch --launcher -x86_64` makes
 argparse read `-x86_64` as an option and die with `expected one argument`. Use the `=` form —
-`--launcher=arch --launcher=-x86_64`. Already anchored as
-[[D-HARNESS-DASH-LEADING-LAUNCHER-TOKEN-MISPARSED-AS-AN-OPTION]]; noted here because the
-round-trip path is where a human types it by hand.
+`--launcher=arch --launcher=-x86_64`. Noted here because the round-trip path is where a
+human types it by hand.
 
 ⚠ **The UNITS round trip is heavier than the CLI's and must not be quietly skipped for that
 reason.** Running a cross-built testfixture on the target needs the test corpus and Tcl's

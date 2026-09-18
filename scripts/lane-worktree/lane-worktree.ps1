@@ -145,7 +145,8 @@ function Get-RepoRoot {
 
 # `.worktrees/` must be IGNORED, and it is CHECKED rather than assumed: that one
 # rule is what keeps N full checkouts off every gate host, because the carriages
-# derive their exclude list from git (scripts/carriage-excludes/).
+# derive what they carry from git, and the harness also names `.worktrees` outright in
+# `sync.neverTransfer`.
 # ⚠ The trailing slash is required -- `git check-ignore .worktrees` answers
 #   NOT-IGNORED for a directory that does not exist yet, while `.worktrees/`
 #   answers correctly. ✔MEASURED 2026-08-26, both spellings, absent directory.
@@ -269,16 +270,26 @@ function Invoke-Add {
     Say "build into $rel/build/$Name -- never into the main tree's build/."
     # ⚠ THE FIRST BUILD OF A FRESH TREE NEEDS --build-type, AND THIS LINE EXISTS
     #    BECAUSE THE ORCHESTRATOR KEPT WRITING BRIEFS THAT OMITTED IT.
-    #    `local-build.sh` maps only `dbg` -> Debug and `rel` -> Release, and REFUSES
-    #    (rc 3) to guess one for any other tree name. That refusal is CORRECT and is
-    #    not to be softened: guessing Debug for an unknown lane would hand a
-    #    Release-intending caller a Debug tree silently, which is the
-    #    fails-to-WRONG-ANSWER direction. ✔MEASURED (P63): a lane hit the rc 3, and
+    #    ⓘ THE FLAG IS GONE AND THE LESSON IS NOT. The build script that took
+    #    `--build-type` mapped only `dbg` -> Debug and `rel` -> Release and REFUSED
+    #    (rc 3) to guess one for any other tree name, because guessing Debug for an
+    #    unknown lane would hand a Release-intending caller a Debug tree silently --
+    #    the fails-to-WRONG-ANSWER direction. `dssharness` removes the guess entirely:
+    #    the build type is part of the LEG NAME, so there is nothing to infer from a
+    #    tree name at all. ✔MEASURED (P63): a lane hit the rc 3, and
     #    the brief that sent it there had never been run by its author --
     #    [[D-CYCLE-BRIEF-STATED-AN-INVOCATION-ITS-AUTHOR-HAD-NEVER-RUN]].
     #    ⇒ The command belongs where the lane name is KNOWN, which is here.
-    Say "FIRST build of this tree:  DSS_JOBS=6 bash scripts/local-build/local-build.sh --tree $Name --build-type Debug"
-    Say "        every build after:  DSS_JOBS=6 bash scripts/local-build/local-build.sh --tree $Name"
+    #    ⓘ ONE VERB, AND THE DEBUG/RELEASE CHOICE IS A LEG NAME. `--build-type`
+    #    and `--tree` are gone with the script that had them: DssHarness reads its
+    #    legs and its build root from `.harness-config/config.json`, and each leg
+    #    builds in its own variant-keyed directory INSIDE the tree the command is
+    #    run in. ✔MEASURED from a lane worktree: `dssharness build --legs
+    #    windows-x86_64-debug` configured `-S <lane>/. -B
+    #    <lane>/build/x86_64-mingw-gcc-debug -G Ninja` and passed. First build and
+    #    every build after are the same command — the tool decides.
+    Say "build this tree:  cd $abs; dssharness build --legs windows-x86_64-debug"
+    Say "     its legs:    dssharness legs"
     Write-Output $abs
 }
 

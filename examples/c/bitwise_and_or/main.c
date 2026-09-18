@@ -1,4 +1,4 @@
-// Audit-residue sweep c1 — D-AUDIT-BITWISE-UNWALL-WITNESS runtime corpus.
+// Audit-residue sweep c1 — the runtime corpus for source-level `&`/`|`.
 //
 // FC3.5 sweep-c2 added the x86 `and`/`or` encodings (21 /r and 09 /r,
 // widths 64+32) for the composed-FCmp materialization — which silently

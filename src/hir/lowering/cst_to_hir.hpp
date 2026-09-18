@@ -146,7 +146,7 @@ struct DSS_EXPORT CstToHirResult {
                                   // stamp MirFunc.noInline (the inliner's refusal)
     HirAlwaysInlineMap alwaysInlineMap; // bound to `hir` — native-FUNCTION inliner
                                   // cost-model BYPASS (TF-C81,
-                                  // D-CSUBSET-ALWAYS-INLINE); read at HIR→MIR to stamp
+                                  // D-CSUBSET-ALWAYSINLINE); read at HIR→MIR to stamp
                                   // MirFunc.alwaysInline (suppresses rule 6's
                                   // size threshold, never a correctness rule)
     HirNoOptimizeMap noOptimizeMap; // bound to `hir` — native-FUNCTION optimizer

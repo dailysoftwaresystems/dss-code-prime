@@ -12,8 +12,7 @@ cmake_minimum_required(VERSION 3.28)
 # because this harness compiles ONLY the host-runnable spec, a manifest's other
 # targets are compiled by the IN-PROCESS runner ALONE. That division of labour is
 # checked by the `integrated_tests/coverage-boundary` entry at the bottom of this
-# file — see
-# D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+# file.
 #
 # The runner ALSO drives the curated `examples/` corpus through
 # the CLI path (parallel to the in-process exercise via
@@ -202,8 +201,6 @@ dss_use_config_snapshot(integrated_tests/adjudicate)
 # red-on-disable pin with it.
 
 # ── the coverage boundary between the TWO corpus harnesses ───────────────────
-#
-# D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
 #
 # ★★★ THE ONE ENTRY THAT RUNS BOTH HARNESSES AND COMPARES THEM. Every other
 # entry in this file measures ONE runner; this one selects a corpus example that

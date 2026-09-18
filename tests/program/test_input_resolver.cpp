@@ -21,9 +21,9 @@ namespace fs = std::filesystem;
 using namespace dss;
 
 // In-repo scratch dir (test artifacts; auto-removed by dtor). This file used to
-// carry its OWN copy of `ScratchDir` — that duplicate is what
-// D-TEST-FIXED-SCRATCH-PATH-POPULATION calls out here, and it is now deleted in
-// favour of the shared `tests/test_support/scratch_dir.hpp`.
+// carry its OWN copy of `ScratchDir`, populating a fixed scratch path; that
+// duplicate is now deleted in favour of the shared
+// `tests/test_support/scratch_dir.hpp`.
 //
 // The copy was not a live collision: it already seeded the path with the PID.
 // It was weaker in the CLAIM. It took the slot with PLURAL

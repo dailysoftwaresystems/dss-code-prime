@@ -783,8 +783,8 @@ TEST(Reporter, NormalCodeSuppressedAlongsideUnsuppressableInSameReporter) {
 // so changes neither the reference count (735) nor the outcome, so the extra
 // machinery would be untested weight.
 //
-// ⚠ KNOWN LIMIT, STATED SO A FUTURE FALSE RED IS DIAGNOSED AND NOT PAPERED OVER
-// [[D-TEST-UNSUPPRESSABLE-EMIT-SITE-SCAN-BLIND-TO-CONFIG-DECLARED-CODES]].
+// ⚠ KNOWN LIMIT, STATED SO A FUTURE FALSE RED IS DIAGNOSED AND NOT PAPERED
+// OVER — THIS EMIT-SITE SCAN IS BLIND TO CONFIG-DECLARED CODES.
 // A diagnostic can also be emitted WITHOUT any `DiagnosticCode::` reference, by
 // naming the code as a STRING in language config and letting the name→code
 // resolver in `grammar_schema_json.cpp` bind it (MEASURED: `S_StaticStorageInForInit`

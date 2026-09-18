@@ -81,7 +81,7 @@ using ::dss::test_support::summarize;
 // guard used to be file-local copies here, and the local `shippedLanguageDoc`
 // took NO argument — it could only ever read `kLanguage`. They now have ONE
 // owner, `vocabulary_projection_probe.hpp`, for the reason this whole file
-// exists: D-TEST-VOCABULARY-PROJECTION-PROBE-HELPERS-ARE-COPIED-PER-FILE. The
+// exists: a probe helper copied per file drifts per file. The
 // header records which copies had already drifted and how each merge resolved.
 
 // ── THE TWO AXES, FOUND BY SEARCHING ─────────────────────────────────────

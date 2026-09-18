@@ -552,8 +552,9 @@ def report_comment_divergence(comment):
     print("  the CODE is right, re-stamp the JSON:")
     print("      python scripts/check-plan-citations/check-plan-citations.py --write")
     print("  If the JSON is right, edit `_INVENTORY_COMMENT` to match it -- running")
-    print("  `--write` would DESTROY the corrected text. Species record:")
-    print("      D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED")
+    print("  `--write` would DESTROY the corrected text. The species: a claim that")
+    print("  was TRUE WHEN IT WAS TYPED and FALSE WHEN THE COMMIT LANDED, still")
+    print("  reading as evidence.")
     return EXIT_RATCHET
 
 
@@ -642,7 +643,7 @@ def run(root, write, baseline=False):
         print("  still reading as evidence. Cite something the file CARRIES instead:")
         print("      a symbol      src/mir/lowering.cpp `lowerCallArgs()`")
         print("      a rationale   tests/CMakeLists.txt (the `no RUN_SERIAL` block)")
-        print("      an anchor     [[D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES]]")
+        print("      an anchor     [[D-ANCHOR]] -- a registry row's id, which resolves")
         print("")
         print("  `--write` will NOT make this go away. It may only LOWER, and it")
         print("  refuses while any document sits above its ceiling. Raising ground is")

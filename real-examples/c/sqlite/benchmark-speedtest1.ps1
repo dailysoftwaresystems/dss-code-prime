@@ -212,7 +212,7 @@ if ($Dss -and -not (Test-Path $Dss)) {
 if (-not $Dss) {
   Die @"
 no dsscp binary found.
-      Pass -Dss <path>, or build one: scripts\local-build\local-build.ps1 -Tree rel
+      Pass -Dss <path>, or build one: dssharness build --legs <a release leg; dssharness legs lists them>
       Searched for dsscp.exe under $DssSrc\build\{rel,dbg}\.
 "@
 }
@@ -259,7 +259,7 @@ if ($LASTEXITCODE -ne 0) {
   Die @"
 the dss pre-flight refused (its diagnostic is above). Nothing is measured against
       a compiler that cannot compile three lines. Rebuild it:
-        scripts\local-build\local-build.ps1 -Tree rel
+        dssharness build --legs <a release leg; dssharness legs lists them>
 "@
 }
 

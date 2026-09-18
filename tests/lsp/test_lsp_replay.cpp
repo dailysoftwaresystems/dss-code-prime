@@ -115,8 +115,8 @@ void runOneSession(fs::path const& inputPath) {
     // reason, as `LspTestHarness`: this thread stands in for production's MAIN
     // thread, and `std::async` handed it macOS's 512 KiB secondary-thread
     // default instead of main's 8 MiB. ✔MEASURED 2026-08-25 (cycle P34): this
-    // binary died `Bus error` on macOS, in a 415,360-byte frame.
-    // D-TEST-LSP-HARNESS-RAN-THE-SERVER-LOOP-ON-A-HOST-DEFAULT-STACK
+    // binary died `Bus error` on macOS, in a 415,360-byte frame — the harness
+    // was running the server loop on the HOST'S DEFAULT stack.
     std::promise<int> exitPromise;
     std::future<int>  exitCode = exitPromise.get_future();
     dss::substrate::StackSizedThread serverThread{

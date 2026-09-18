@@ -5570,8 +5570,8 @@ struct Lowerer {
         }
         // FC3 c1 shifts under the `arithmeticConversions` block: the result
         // type follows the config verb `shiftResult` via the shared
-        // `shiftResultType` chokepoint (D-UAC-SHIFT-RESULT-RULE-CONFIG) — the
-        // SAME function the semantic typer calls, so the two tiers can never
+        // `shiftResultType` chokepoint — the SAME function the semantic typer
+        // calls, so the two tiers can never
         // diverge on the verb. `promotedLeft` (C 6.5.7): the PROMOTED LEFT
         // operand only (the count's type never contributes; `i64 << u32` is
         // I64, `u32 >> 1` is U32 → LShr). `commonType`: the usual-arithmetic
@@ -13792,7 +13792,7 @@ struct Lowerer {
             // because `extern int a = 1, b;` is one declaration with two different
             // answers.
             //
-            // ★★★ P65 (the FILE-SCOPE half of D-FF2-3) —
+            // ★★★ P65 (the FILE-SCOPE half of D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE) —
             // THE ARM SPLITS ON WHAT THE SEMANTIC TIER ALREADY DECIDED, NOT ON A
             // SECOND READING OF THE SCOPE. `isExternDeclaration` is Pass 1's answer
             // from `declarationIsNonDefining`, which now applies C 6.9.2p1: a
@@ -13809,7 +13809,7 @@ struct Lowerer {
             //     scope (gcc 13.3.0 and clang 18.1.3 with a warning, MSVC
             //     19.51.36231 silently) and all three emit a DEFINED symbol.
             //   * STILL an extern declaration ⇒ BLOCK scope, and C 6.7.11p5 makes
-            //     an initializer a constraint violation there. D-FF2-3's loud
+            //     an initializer a constraint violation there. D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE's loud
             //     refusal is unchanged and is what all three references also do
             //     (gcc "'x' has both 'extern' and initializer", clang "declaration
             //     of block scope identifier with linkage cannot have an
@@ -13922,7 +13922,7 @@ struct Lowerer {
     // True iff `d` (a declarator/initDeclarator from collectDeclarators) carries an
     // initializer — an initDeclarator with a visible Internal child that is NOT the
     // declarator (the `= initValue` subtree). Used to reject an extern-with-
-    // initializer (D-FF2-3). Mirrors lowerVarLikeInto's init-detection scan.
+    // initializer (D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE). Mirrors lowerVarLikeInto's init-detection scan.
     // TF-C62 (D-CSUBSET-GNU-ATTRIBUTE) + TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): is `c` an
     // AFTER-DECLARATOR DECORATION rather than the initializer? The init-detection
     // scans read "the first visible Internal child that is not the declarator" as
@@ -13947,7 +13947,7 @@ struct Lowerer {
         return initDeclaratorInitNode(d, dc).valid();
     }
 
-    // P65 (the file-scope half of D-FF2-3): the SAME scan
+    // P65 (the file-scope half of D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE): the SAME scan
     // as a NODE rather than a bool, because a declarator whose initializer is
     // legal must now be LOWERED and not merely detected. It is one scan with
     // three consumers — the has-initializer predicate above, `lowerVarLikeInto`'s

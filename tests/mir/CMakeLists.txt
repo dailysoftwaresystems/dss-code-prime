@@ -79,10 +79,9 @@ dss_add_test(NAME mir/test_mir_text_operand_forms SOURCES test_mir_text_operand_
 # D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED
 # D-MIR-LVALUE-REFUSAL-RENDERS-A-RAW-ORDINAL-NOT-A-NAME
 # ⚠ Those two ids sit on their own lines because an anchor id split across a
-# line break is invisible to every grep AND to the registry guard — the exact
-# defect D-ANCHOR-ID-WRAPPED-ACROSS-A-LINE-BREAK-IS-INVISIBLE-TO-EVERY-GREP
-# records, and this comment carried an instance of it until the step-10 audit
-# found it. Break BEFORE an id or AFTER it, never inside it.
+# line break is invisible to every grep AND to the registry guard — and this
+# comment carried an instance of exactly that until the step-10 audit found it.
+# Break BEFORE an id or AFTER it, never inside it.
 # The `"i"` IMMEDIATE constraint at the tier that owns
 # the two facts nothing below it can recover: the CONSTANT PROOF (gcc refuses a
 # non-constant with "impossible constraint in 'asm'", and so must this) and the

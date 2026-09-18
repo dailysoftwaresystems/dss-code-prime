@@ -58,6 +58,19 @@ loadOneRelocTarget(std::string_view formula, std::uint32_t kind = 1) {
 struct Patched {
     std::vector<std::uint8_t> text;
     bool                      ok = false;
+    // ⓘ THE REFUSALS THEMSELVES, NOT ONLY THE FACT OF ONE. Every arm here used
+    // to assert `ok == false` and nothing else, so a refusal that named the
+    // wrong CAUSE was indistinguishable from the right one — and the Call26
+    // out-of-range message did name the wrong cause for two years' worth of
+    // large images (it listed two possibilities and the one a real image hits
+    // is a third). Carrying the text out is what lets an arm say which.
+    std::vector<std::string>  messages;
+
+    [[nodiscard]] bool anySays(std::string_view needle) const {
+        for (auto const& m : messages)
+            if (m.find(needle) != std::string::npos) return true;
+        return false;
+    }
 };
 
 // Run the kernel with a single function, single reloc on the
@@ -104,6 +117,7 @@ Patched applyOneReloc(std::shared_ptr<TargetSchema const> tgt,
         out.text, mod, funcTextStart, symbolVaMap,
         *tgt, patchSectionVa, "test", rep,
         gotSlotVa != 0 ? &gotMap : nullptr);
+    for (auto const& d : rep.all()) out.messages.push_back(d.actual);
     return out;
 }
 
@@ -385,6 +399,58 @@ TEST(Aarch64Call26, RejectsOutOfRange) {
                             /*patchSectionVa*/ 0,
                             /*funcOffset*/ 0);
     EXPECT_FALSE(p.ok);
+}
+
+// ★★★ AND THE REFUSAL MUST NAME THE CAUSE A REAL IMAGE ACTUALLY HITS, WHICH IT
+// DID NOT. This is the LAST line of defence: a call the veneer pass could not
+// rescue arrives here and is refused. The message used to offer exactly two
+// explanations — *"the target declares nothing to build one from, or the
+// placement was skipped"* — and ✔MEASURED 2026-09-17 on
+// `arm64:elf64-aarch64-linux-exec` AND `arm64:macho64-arm64-darwin-exec`, the
+// explanation a large image hits is NEITHER: the veneer pass never saw the
+// relocation at all, because its target is an IMPORT STUB, which is not a
+// function of the module and whose address the format writer chooses AFTER that
+// pass has run. The overflowing call in both measurements was the linker's OWN
+// synthetic entry calling its process-exit import.
+//
+// ⚠ A DIAGNOSTIC THAT CONFIDENTLY LISTS THE WRONG CAUSES IS WORSE THAN A BARE
+// ONE, because a reader acts on it — and the two it listed both point at the
+// veneer pass's own configuration, which is exactly where the answer is not.
+TEST(Aarch64Call26, TheOutOfRangeRefusalNamesTheCauseALargeImageActuallyHits) {
+    auto tgt = loadOneRelocTarget("aarch64_call26");
+    ASSERT_NE(tgt, nullptr);
+
+    auto p = applyOneReloc(tgt, 0x94000000u,
+                            /*symbolVa*/ 0x10000000,
+                            /*addend*/   0,
+                            /*patchSectionVa*/ 0,
+                            /*funcOffset*/ 0);
+    ASSERT_FALSE(p.ok);
+    ASSERT_FALSE(p.messages.empty())
+        << "a refusal with no message is not a refusal a reader can act on";
+
+    EXPECT_TRUE(p.anySays("NEVER SAW THIS RELOCATION"))
+        << "the third cause — the veneer pass is blind to an import-bound "
+           "call — is the one measured to fire on a real oversized image, and "
+           "it must be among the explanations offered";
+    EXPECT_TRUE(p.anySays("IMPORT STUB"))
+        << "naming the mechanism is what makes the cause actionable; without "
+           "it the reader is sent to configure a pass that behaved correctly";
+
+    // THE CONTROL, in the same arm: an UNALIGNED target is a DIFFERENT refusal
+    // and must NOT pick up this text. Without it, a message that appended the
+    // import prose to every Call26 diagnostic would satisfy the two arms above.
+    auto q = applyOneReloc(tgt, 0x94000000u,
+                            /*symbolVa*/ 0x400005,
+                            /*addend*/   0,
+                            /*patchSectionVa*/ 0x400000,
+                            /*funcOffset*/ 0);
+    ASSERT_FALSE(q.ok);
+    EXPECT_FALSE(q.anySays("NEVER SAW THIS RELOCATION"))
+        << "CONTROL: a misaligned branch target is not an out-of-range one, "
+           "and must not borrow its explanation";
+    EXPECT_TRUE(q.anySays("word-aligned"))
+        << "CONTROL: the alignment refusal must still name ITS own cause";
 }
 
 TEST(Aarch64Call26, RejectsBaseInstWithDirtyBitfield) {

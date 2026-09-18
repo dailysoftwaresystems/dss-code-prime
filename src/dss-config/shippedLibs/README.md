@@ -56,8 +56,7 @@ a real binary's export table to learn their names — which is impossible for a
 Darwin target on a non-Mac host. "Just give them descriptors" is the obvious fix,
 it is wrong, and it was recommended by an agent *and* by the orchestrator before
 being rejected. **The rule was nowhere in this README at the time, which is
-precisely why it was proposed.** It is here now. See
-`D-HARNESS-MACHO-LEG-INPUTS-UNOBTAINABLE-OFF-MAC` for the correct direction: a
+precisely why it was proposed.** It is here now. The correct direction is a
 per-leg declared library input, living with the build, not with the platform.
 
 ---
@@ -505,10 +504,10 @@ implements these three functions as ordinary C in `mingw-w64-crt/misc/dirent.c`,
 over the same Win32 primitives DSS uses.
 
 gcc's literal answer here is "link libmingwex". **DSS cannot take it**: depending
-on a host mingw-w64 breaks *build ANY target inside ANY host*
-(`D-HARNESS-CROSS-HOST-ANY-TARGET`) — a Windows-targeting build on a Mac would
-need a mingw sysroot — and it re-introduces exactly the third-party runtime
-dependency the pe→UCRT migration ran to eliminate. So DSS ships its own. This is
+on a host mingw-w64 breaks *build ANY target inside ANY host* — a
+Windows-targeting build on a Mac would need a mingw sysroot — and it
+re-introduces exactly the third-party runtime dependency the pe→UCRT migration
+ran to eliminate. So DSS ships its own. This is
 the standard structure reached by the only route the constraints allow.
 
 ★ **THE SCOPE RULE ABOVE NEEDED NO WIDENING FOR THIS.** It already says *OS
@@ -676,7 +675,7 @@ pe, and all four legs answer 42.
    Record the macho answer in **`tests/ffi/data/darwin-link-names.tsv`**; a new
    Mach-O-visible function with no row there is RED
    (`ffi/test_darwin_link_name_oracle`), which is how this step is enforced
-   rather than merely requested. `scripts/ssh-macos/ssh-macos.sh` reaches the
+   rather than merely requested. `dssharness host-exec --ssh macos` reaches the
    operator's Mac.
 5. `AllShippedDescriptorsDecode` will validate the new file decodes and every
    signature parses. Add an end-to-end corpus under `examples/c/` if it

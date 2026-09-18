@@ -232,7 +232,7 @@ public:
     // Currently-open block, or default-constructed (invalid) id when
     // no block is open. Mirrors `MirBuilder::currentlyOpenBlock` —
     // exposed so lowerers can pin the "first emission must land in
-    // the entry-time block" invariant (ML5 cycle-3e deferral D-3e.1
+    // the entry-time block" invariant (ML5 cycle-3e deferral D-PLAN12-LOWERSWITCH-FIRST-CMP-IMPLICIT-BLOCK-PLACEMENT-ASSERTION-ASSERT
     // for switch-lowering's first compare).
     [[nodiscard]] LirBlockId openBlock() const noexcept { return openBlock_; }
 

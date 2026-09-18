@@ -3411,7 +3411,7 @@ if ($DssCurrencySpecs.Count -eq 0) {
 # that names a fix which does not work — the defect this step already recorded once
 # about DSS_ALLOW_NONRELEASE_COMPILER.
 $DssRebuildTree = if ($DssInfo.Tree) { $DssInfo.Tree } else { Join-Path $RepoRoot 'build\rel' }
-$DssRebuildCmd = "cmake --build $DssRebuildTree --config Release --target dsscp   (or: scripts\local-build\local-build.ps1 -Tree rel)"
+$DssRebuildCmd = "cmake --build $DssRebuildTree --config Release --target dsscp   (or: dssharness build --legs <a release leg>)"
 $DssCurrencyOk = Assert-DssCompilerCurrent $python3.Source $BenchCore $DssBin $dssAge $DssOrigin $DssConfigRoot $DssCurrencySpecs $DssRebuildCmd
 # <<< dss:compiler-currency <<<
 # Carried to the Step-9 verdict beside the compiler's path: every figure this run

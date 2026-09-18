@@ -1,4 +1,4 @@
-// D-HARNESS-CROSS-HOST-ANY-TARGET item (2) — THE GATE ON THE DE-HOST-LOCKED
+// BUILD ANY TARGET INSIDE ANY HOST, ITEM (2) — THE GATE ON THE DE-HOST-LOCKED
 // SQLITE HARNESS DRIVERS.
 //
 // THE REQUIREMENT (user, 2026-07-25): "build ANY target inside ANY host, this
@@ -34,7 +34,7 @@
 //      must spell it the same way, so a reader cannot conclude the project has
 //      two qemus.
 //   7. EVERY LEG COMPILES AGAINST A THIRD-PARTY HEADER CONFIGURED FOR ITS OWN
-//      TARGET (D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED). One staged zconf.h
+//      TARGET — THE STAGED zconf.h USED TO BE PE-SHAPED. One staged zconf.h
 //      used to serve all five legs, carrying the pe leg's `Z_HAVE_UNISTD_H`
 //      answer — so the .ps1 refused every other leg and the .sh, which never
 //      applied the flip at all, could not build its pe leg. The catalogue now
@@ -153,8 +153,7 @@ struct PyRun {
 
 // ── THE DEADLINE THE SPAWNS BELOW RUN UNDER IS THE SCRIPT'S, NOT THIS FILE'S ─
 //
-// ANCHOR, ONE LINE, DO NOT WRAP:
-// D-HARNESS-ENV-PROBE-TEST-TIMEOUT-IS-A-MAGIC-NUMBER-NOT-THE-DERIVED-BUDGET
+// THE ENV-PROBE TEST TIMEOUT WAS A MAGIC NUMBER, NOT THE DERIVED BUDGET.
 //
 // Every spawn here used to be bounded by a `std::chrono::seconds{120}` typed
 // into the line above, while the subject of those spawns DERIVES the same
@@ -274,9 +273,8 @@ struct SpawnBudget {
             " Every spawn in this file runs under the budget the SCRIPT derives"
             " from the catalogue's declared sample windows"
             " (--print-probe-budget); there is no local number to fall back to,"
-            " because a local number is the defect"
-            " [D-HARNESS-ENV-PROBE-TEST-TIMEOUT-IS-A-MAGIC-NUMBER-NOT-THE-"
-            "DERIVED-BUDGET].";
+            " because a local number IS the defect: a magic number standing in"
+            " for the derived budget.";
         return out;
     }
     return spawnResolver(args, catalogueCopy, resolverDeadline());
@@ -467,8 +465,8 @@ public:
         return doc_;  // unreachable in a passing run
     }
     // The leg itself, for the declarations that live beside `launchers` rather
-    // than inside one — `confounds` is per LEG, which is the whole point of
-    // D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG.
+    // than inside one — `confounds` is per LEG, which is the whole point: the
+    // ledger used to be per DRIVER rather than per LEG.
     [[nodiscard]] json& legOf(std::string const& label) {
         for (auto& leg : doc_.at("legs")) {
             if (leg.at("label").get<std::string>() == label) return leg;
@@ -615,8 +613,8 @@ TEST_F(HarnessLegs, TheLegCatalogueLintsClean) {
 // any kind here, which is the wrong file to leave unwatched: it is an
 // ATTRIBUTION instrument, so its failure mode is not a red gate but a confident
 // wrong answer. It shipped one — a leg whose binary never launched (the guest
-// loader was absent) was reported as fourteen DSS defects
-// (D-HARNESS-CLI-SMOKE-CHARGES-A-LAUNCH-FAILURE-TO-THE-COMPILER).
+// loader was absent) was reported as fourteen DSS defects — the CLI smoke
+// charging a LAUNCH failure to the COMPILER.
 //
 // Its `--self-test` is self-contained: no network, no build, no sqlite, a few
 // seconds. It asserts the full cross product of {subject launched, not launched}
@@ -644,7 +642,7 @@ TEST_F(HarnessLegs, TheCliSmokeGateSelfTestPasses) {
     ASSERT_TRUE(fs::exists(script))
         << "the sqlite3 CLI smoke gate is missing: " << script;
     // ★★ THE GATE RUNS FROM A SCRATCH COPY, NEVER FROM THE REPO FILE.
-    // D-HARNESS-CLI-SMOKE-SELFTEST-CHMODS-TRACKED-SOURCE — CLOSED BY THIS BLOCK.
+    // THE SELF-TEST USED TO chmod TRACKED SOURCE — CLOSED BY THIS BLOCK.
     // `runBinary`'s POSIX arm `chmod`s its `binaryPath` to 0755 before spawning —
     // it has to, because the linker writes emitted binaries 0644 and `execve`
     // needs the bit. Handing it a path under `real-examples/` therefore MUTATES A
@@ -716,7 +714,7 @@ TEST_F(HarnessLegs, TheCliSmokeGateSelfTestPasses) {
         << res.capturedStdout;
 }
 
-// ── The pipe-buffer pin (D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS) ────
+// ── The pipe-buffer pin: draining AFTER exit deadlocks ────────────────────
 //
 // This test is the reason that anchor exists. `runBinary` used to drain the
 // capture pipe only AFTER the child exited, so a child that outgrew the pipe's
@@ -788,7 +786,7 @@ TEST_F(HarnessLegs, EveryDeclaredLegIsBuiltOnEveryHost) {
             << "host " << host.os << '/' << host.arch
             << " plans a DIFFERENT set of legs than the catalogue declares."
                " The leg set is a property of the harness, not of the machine"
-               " (D-HARNESS-CROSS-HOST-ANY-TARGET item 2).";
+               " — build ANY target inside ANY host, item 2.";
 
         for (auto const& leg : plan.at("legs")) {
             auto const label = leg.at("label").get<std::string>();
@@ -1007,7 +1005,7 @@ TEST_F(HarnessLegs, LauncherSpellingsAgreeWithTheExamplesCorpus) {
 
 // ── 7. Every leg's staged zlib header is configured for ITS OWN target ─────
 //
-// D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED. Three tests, one per link in the
+// THE STAGED zconf.h WAS PE-SHAPED. Three tests, one per link in the
 // chain: the DECLARATION (does the catalogue say the right thing?), the PLAN (is
 // the recipeTransform -> zinc/ mapping host-free and one-stage-per-transform?),
 // and the ARTEFACT (does stage-zinc.py actually write it?).
@@ -1200,7 +1198,7 @@ TEST_F(HarnessLegs, StageZincWritesOneHeaderPerTargetAndEveryLegGetsItsOwn) {
             << ", whose Z_HAVE_UNISTD_H reads " << got << " — it declared "
             << want
             << ". A leg parsing a zlib header configured for a different target"
-               " is D-HARNESS-SQLITE-STAGE-ZCONF-IS-PE-SHAPED exactly.";
+               " is the pe-shaped staged zconf.h defect exactly.";
         // Z_HAVE_STDARG_H is the CONTROL: it is declared true on every leg, so
         // if the tool were rewriting whole blocks rather than the one declared
         // guard, this would move too.
@@ -1262,7 +1260,7 @@ TEST_F(HarnessLegs, BothDriversStageOneZincPerTransform) {
 
 // ── 8. A launcher's PATH NAMESPACE is declared, closed, and enforced ───────
 //
-// D-HARNESS-NO-WSL-LAUNCHER-FOR-ELF-ON-WINDOWS. The catalogue declared Wine for
+// THERE WAS NO WSL LAUNCHER FOR ELF ON WINDOWS. The catalogue declared Wine for
 // pe-on-Linux and NOTHING for elf-on-Windows, so a Windows host recorded
 // `skipped-by-runOn` for a leg whose testfixture it had just built — and that
 // same artefact, run under WSL BY HAND, passed 330,436 tests.
@@ -1480,7 +1478,7 @@ TEST_F(HarnessLegs, AMalformedPathTranslationDeclarationFailsLint) {
             << r.output;
     }
     // ── and the same, for the launcher's FILESYSTEM ────────────────────────
-    // D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS. The third namespace, and the
+    // A WSL-LAUNCHED LEG'S RUNDIR IS DrvFs. The third namespace, and the
     // one whose absence cost 55 unit failures across 6 families plus a fixture
     // ABORT — every one of them non-DSS, all of them reported as if they were.
     {
@@ -1540,9 +1538,9 @@ TEST_F(HarnessLegs, AMalformedPathTranslationDeclarationFailsLint) {
 
 // ── THE EARNED-CONFOUND LEDGER LIVES IN THE CATALOGUE ───────────────────────
 //
-// D-HARNESS-CONFOUND-LEDGER-IS-PER-DRIVER-NOT-PER-LEG /
-// D-HARNESS-SQLITE-CONFOUNDS-NOT-DECLARED-PER-LEG /
-// D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY.
+// THE CONFOUND LEDGER WAS PER DRIVER, NOT PER LEG, and the confounds were not
+// declared per leg at all — the two halves of
+// D-SQLITE-CONFOUND-LIST-DRIVER-ASYMMETRY seen from the harness side.
 //
 // A confound asserts THE COMPILER IS INNOCENT of a failing test, and the count
 // of genuine failures is what every verdict this harness renders rests on. So
@@ -1578,7 +1576,7 @@ TEST_F(HarnessLegs, EveryLegDeclaresItsEarnedConfoundsWithProvenance) {
                        " furniture.";
             }
             // ★★ `requires` REPLACED `scope` AS THE REQUIRED CONDITION FIELD.
-            // [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST.] `scope`
+            // [a confound's condition is a RUN MODE, not a host.] `scope`
             // matched a pattern against the leg's RUN MODE, which is the wrong
             // axis for any row whose mechanism is a property of the MACHINE: the
             // three clock rows sat at `scope: any` and would have excused a
@@ -1610,7 +1608,7 @@ TEST_F(HarnessLegs, EveryLegDeclaresItsEarnedConfoundsWithProvenance) {
             // whose real mechanism has no probe yet, and each of those must NAME
             // its blocker — otherwise the axis becomes an inert alternative the
             // next row reaches for, which is how a proxy gets re-cut to fit each
-            // new case (D-TEST-PE64-CONFOUND-PIN-WEAKENED-BY-ITS-OWN-SUBJECT).
+            // new case — a pin weakened by its own subject.
             if (row.contains("scope")) {
                 auto const scope = row.at("scope").get<std::string>();
                 EXPECT_TRUE(scope == "native" || scope == "emulated")
@@ -1709,7 +1707,7 @@ TEST_F(HarnessLegs, AConfoundWithoutProvenanceFailsLint) {
 
 // ── THE CONDITION UNDER WHICH AN EXCUSE HOLDS IS A MEASUREMENT ──────────────
 //
-// D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST.
+// A CONFOUND'S CONDITION IS A RUN MODE, NOT A HOST.
 //
 // `scope` matched a pattern against the leg's RUN MODE. That is the wrong axis
 // for a row whose mechanism is a property of the MACHINE, and the catalogue could
@@ -1886,7 +1884,7 @@ TEST_F(HarnessLegs, ConditionalConfoundsAreGatedOnAMeasuredEnvironmentProbe) {
 }
 
 // THE PLAN SAYS WHETHER ITS GATING WAS MEASURED, AND AN UNMEASURED PLAN HONOURS
-// NO CONDITIONAL ROW. [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST.]
+// NO CONDITIONAL ROW. [a confound's condition is a RUN MODE, not a host.]
 //
 // `--environment-probes skip` is the structural door — it exists so a caller that
 // only wants the plan's SHAPE need not sample a clock for 20 s. What it must never
@@ -1944,7 +1942,7 @@ TEST_F(HarnessLegs, AnUnprobedPlanHonoursNoConditionalConfound) {
 
 // ── A VERDICT MEASURED IN THIS KERNEL DOES NOT DECIDE A LEG THAT RUNS IN ANOTHER ─
 //
-// D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE.
+// THE ENVIRONMENT PROBE MEASURED THE DRIVER'S KERNEL, NOT THE LAUNCHED ONE.
 //
 // ★★★ THE CAVEAT WAS TRUE PROSE AND A FALSE STATEMENT AT THE SAME TIME. ✔MEASURED
 // at 0ecec160 with `--host-os windows --host-arch x86_64 --launchers-available
@@ -2059,7 +2057,7 @@ TEST_F(HarnessLegs, ACrossKernelLegDoesNotHonourAVerdictMeasuredByThisDriver) {
         // to say only while the probe could not GO there. Printing it now would be
         // a fresh instance of the claim-rot this anchor exists to remove.
         // ⚠ THE COUNT IS DERIVED, NEVER TYPED.
-        // [D-HARNESS-A-WITHHOLDING-PIN-WAS-COUPLED-TO-THE-CONFOUND-CATALOGUES-SIZE]
+        // [a withholding pin coupled to the confound catalogue's SIZE]
         // What this assertion is ABOUT is that NO row was withheld — `N of N` for
         // whatever N this leg declares. Spelling N as the literal 7 coupled a
         // WITHHOLDING claim to the catalogue's SIZE, so earning one more confound
@@ -2133,7 +2131,7 @@ TEST_F(HarnessLegs, ACrossKernelLegDoesNotHonourAVerdictMeasuredByThisDriver) {
 
 // ── AN INJECTED VERDICT IS VALIDATED, VISIBLE, AND CANNOT RUN A CORPUS ──────
 //
-// D-HARNESS-PROBE-VERDICTS-FLAG-INJECTS-AN-UNVALIDATED-PRESENT.
+// THE PROBE-VERDICTS FLAG INJECTED AN UNVALIDATED `present`.
 //
 // ✔MEASURED at 0ecec160: `--probe-verdicts` accepted any JSON object, checked only
 // `isinstance(dict)`, stamped the plan `confoundGating: probed` and honoured
@@ -2226,7 +2224,7 @@ TEST_F(HarnessLegs, AnInjectedProbeVerdictIsAnnouncedAndCannotRunACorpus) {
         // ★ THE KERNEL NAME IS VALIDATED TOO: a drawer nobody opens would let a
         // typo'd kernel decide nothing, silently — the direction that hides an
         // unapplied measurement.
-        // [D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE]
+        // [the probe measuring the DRIVER's kernel, not the launched one]
         {"inject-unknownkernel.json",
          R"({"some-other-box": {"clock-realtime-steps": {"verdict": "present", )"
          R"("why": "x", "verb": "wall-clock-step", "evidence": {}}}})",
@@ -2247,7 +2245,7 @@ TEST_F(HarnessLegs, AnInjectedProbeVerdictIsAnnouncedAndCannotRunACorpus) {
 }
 
 // THE PROBE IS A MEASUREMENT AND IT REPORTS ITS EVIDENCE.
-// [D-HARNESS-CONFOUND-SCOPE-IS-A-RUN-MODE-NOT-A-HOST.]
+// [a confound's condition is a RUN MODE, not a host.]
 //
 // ⓘ THIS RUNS THE REAL PROBE, so it costs the declared sample window once. That is
 // deliberate: the verb's arms are all driven with INJECTED clocks by
@@ -2289,7 +2287,7 @@ TEST_F(HarnessLegs, TheEnvironmentProbeReportsAVerdictWithItsEvidence) {
 
 // THE DEADLINE THAT SPAWN RAN UNDER IS THE SCRIPT'S OWN, AND IT MOVES WHEN THE
 // DECLARED WINDOW MOVES.
-// [D-HARNESS-ENV-PROBE-TEST-TIMEOUT-IS-A-MAGIC-NUMBER-NOT-THE-DERIVED-BUDGET]
+// [a test timeout that is a magic number instead of the derived budget]
 //
 // ⓘ COSTS NOTHING — `--print-probe-budget` samples nothing, so all three spawns
 // here are ~0.1 s. That is deliberate: the property is "the number tracks the
@@ -2325,9 +2323,9 @@ TEST_F(HarnessLegs, TheSpawnDeadlineIsTheScriptsOwnBudgetAndTracksTheWindow) {
         << "every spawn in this file ran under " << resolverDeadline().count()
         << " ms while the script's own budget for the heaviest of them is "
         << shipped.probeEnvironment.count()
-        << " ms. A deadline the subject never agreed to is the whole of"
-           " D-HARNESS-ENV-PROBE-TEST-TIMEOUT-IS-A-MAGIC-NUMBER-NOT-THE-DERIVED-"
-           "BUDGET, and it kills a healthy child rather than a hung one.";
+        << " ms. A deadline the subject never agreed to is the whole defect —"
+           " a magic number standing in for the derived budget — and it kills a"
+           " healthy child rather than a hung one.";
     EXPECT_GT(shipped.probeEnvironment, shipped.noSample)
         << "the shipped catalogue DECLARES a sample window, so a run that"
            " measures it must be priced above one that measures nothing. Equal"
@@ -2370,7 +2368,7 @@ TEST_F(HarnessLegs, TheSpawnDeadlineIsTheScriptsOwnBudgetAndTracksTheWindow) {
 
 // ── THE DOORS AROUND THAT INSTRUMENT ARE FAIL-CLOSED ────────────────────────
 //
-// D-HARNESS-ENVIRONMENT-PROBE-MEASURES-THE-DRIVERS-KERNEL-NOT-THE-LAUNCHED-ONE.
+// THE ENVIRONMENT PROBE MEASURED THE DRIVER'S KERNEL, NOT THE LAUNCHED ONE.
 //
 // `--probe-environment` is what `--plan` re-enters this script with INSIDE each
 // kernel a leg executes in, so its contract is now load-bearing in a second place:
@@ -2580,7 +2578,7 @@ TEST_F(HarnessLegs, AWindowsHostLaunchesTheLinuxLegRatherThanSkippingIt) {
             EXPECT_EQ(runPlan.at("mode").get<std::string>(), "launched")
                 << "windows/" << cell.hostArch << ' ' << cell.leg
                 << " is not launched: " << runPlan.at("detail")
-                << "\nD-HARNESS-NO-WSL-LAUNCHER-FOR-ELF-ON-WINDOWS: this driver"
+                << "\nNo WSL launcher is declared for ELF on Windows: this driver"
                    " BUILDS this leg on this host and the artefact has been"
                    " MEASURED to pass 330,436 tests under WSL. A skip beside a"
                    " working binary is a declaration gap, not a capability one.";
@@ -2731,7 +2729,7 @@ TEST_F(HarnessLegs, BothDriversTranslateTheFixtureAndEverySegmentScript) {
     // emptying the real list stayed GREEN. Measured, and fixed here.
     //
     // ★ TWO CONSTRUCTS SINCE TF-C124, AND THE SPLIT IS THE POINT
-    // [D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-BOUNDARY]. This
+    // [TCL_LIBRARY was not forwarded across the WSL boundary]. This
     // pin used to assert that TCL_LIBRARY appeared in NO forward construct,
     // which was right about the danger and wrong about the remedy: the variable
     // has to cross (a leg whose Tcl was acquired cannot find init.tcl without
@@ -2822,8 +2820,8 @@ TEST_F(HarnessLegs, BothDriversTranslateTheFixtureAndEverySegmentScript) {
         // ⚠ Deliberately NOT a blanket ban on the word `wslpath`: both drivers
         // legitimately name it in their recipe-DERIVATION step, which spells a
         // WSL path the Windows way for the manifest — the opposite direction and
-        // a different mechanism, tracked separately as
-        // D-HARNESS-STAGING-PATH-TRANSLATION-IS-HAND-ROLLED-AND-HOST-KEYED. A
+        // a different mechanism — staging path translation, which is
+        // hand-rolled and host-keyed, and which no registry row tracks. A
         // pin that outlawed the word would be "fixed" by renaming a variable.
         // ★ OVER LIVE LINES, not raw text. Both drivers DOCUMENT these flags in
         // their headers, so a raw-text search is satisfied by a comment — the
@@ -2905,7 +2903,7 @@ TEST_F(HarnessLegs, BothDriversTranslateTheFixtureAndEverySegmentScript) {
             << ") does not name TCL_LIBRARY. A leg whose Tcl came from"
                " acquisition cannot find init.tcl without it, and the failure is"
                " reported against the acquisition rather than the boundary"
-               " [D-HARNESS-PS1-TCL-LIBRARY-NOT-FORWARDED-ACROSS-THE-WSL-BOUNDARY].";
+               ": TCL_LIBRARY is not forwarded across the WSL boundary.";
         EXPECT_TRUE(asksForPathForward)
             << d.name << " never spells --forward-path, so whatever it names in"
                          " its driver-path group crosses UNTRANSLATED — a"
@@ -2960,7 +2958,7 @@ TEST_F(HarnessLegs, NeitherDriverCallsAZeroFileRunGreen) {
 
 // A CRASH THAT SAYS NOTHING MUST NOT COST A LEG ITS WHOLE RESUME BUDGET.
 //
-// D-HARNESS-PRECONDITION-DISCRIMINATOR-BLIND-TO-A-SILENT-CRASH.
+// THE PRECONDITION DISCRIMINATOR WAS BLIND TO A SILENT CRASH.
 //
 // ✔MEASURED 2026-08-10, ONE Windows run, TWO legs, same commit, same root cause,
 // and the A/B is the whole argument for this pin:
@@ -3059,7 +3057,7 @@ TEST_F(HarnessLegs, NeitherDriverSpendsItsBudgetOnASilentCrash) {
 
 // ── 8. The declared library-acquisition route ──────────────────────────────
 //
-// D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER. Operator
+// LIBRARY ACQUISITION WAS BUILT FOR ONE LEG, IN ONE DRIVER. Operator
 // principle, 2026-08-04: "we should be able to build macho on linux. ANY LEG
 // MUST BE ABLE TO BUILD TO ANY LEG."
 //
@@ -3178,7 +3176,8 @@ TEST_F(HarnessLegs, AnAcquiredLibraryDeclaresTheIdentityItIsRecordedUnder) {
     EXPECT_NE(bad.output.find("importName"), std::string::npos) << bad.output;
 }
 
-// A LIBRARY IS NOT ALWAYS SELF-CONTAINED — D-HARNESS-ACQUIRED-TCL-DYLIB-HAS-NO-SCRIPT-LIBRARY.
+// A LIBRARY IS NOT ALWAYS SELF-CONTAINED: AN ACQUIRED Tcl DYLIB SHIPS NO
+// SCRIPT LIBRARY.
 //
 // The macho leg's testfixture BUILT (189 TUs, 0 diagnostics) and ran an
 // individual `.test` file correctly, and then the TIER driver died instantly at
@@ -3253,7 +3252,7 @@ TEST_F(HarnessLegs, EveryAcquiredTclStagesItsScriptLibraryAndSaysWhere) {
 }
 
 // THE FAILURE RETURN CARRIES THE SAME FIELDS AS THE SUCCESS RETURN.
-// D-HARNESS-PINNED-ARCHIVE-FAILURE-RETURN-OMITS-ACQUIRED was one instance of
+// The pinned-archive FAILURE return omitting `acquired` was one instance of
 // this ("a function whose SUCCESS return and FAILURE return carry different
 // field sets is a silent-omission generator"); its own closing note asks for ONE
 // record type on both paths. `--acquire` therefore prints the record even when
@@ -3437,7 +3436,7 @@ TEST_F(HarnessLegs, TheAcquisitionRouteIsChecksumPinnedAndContentAddressed) {
 // entry here reds the size assertion below, so a new driver-local capability
 // cannot be introduced quietly — it has to argue with a test first.
 [[nodiscard]] std::set<std::string> knownDriverLocalProviders() {
-    // D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE (closed)
+    // The ubuntu-ports provider is generalised to the pinned archive (closed)
     return {};
 }
 
@@ -3458,8 +3457,8 @@ TEST_F(HarnessLegs, BothDriversImplementEveryProviderTheCatalogueDeclares) {
     EXPECT_TRUE(exempt.empty())
         << "the driver-local exemption list may only SHRINK, and it reached"
            " ZERO in TF-C123. Any entry means a capability exists in one driver"
-           " and not the other, which is the defect D-HARNESS-LIBRARY-"
-           "ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER exists to end.";
+           " and not the other, which is library acquisition built for one"
+           " leg in one driver — the defect this pin exists to end.";
     struct Driver {
         char const* name;
         bool        powershell;
@@ -3528,8 +3527,7 @@ TEST_F(HarnessLegs, BothDriversImplementEveryProviderTheCatalogueDeclares) {
 // arm: ubuntu-ports-arm64" — false in both halves, and it cited a CLOSED row as
 // live. A reader who believed either would have written a declaration
 // `harness_legs.py --lint` refuses outright.
-// ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
-// D-HARNESS-UBUNTU-PORTS-PROVIDER-NOT-GENERALISED-TO-PINNED-ARCHIVE
+// THE UBUNTU-PORTS PROVIDER WAS NOT GENERALISED TO THE PINNED ARCHIVE.
 //
 // The existing pin could not see any of it: every one of those sites is a
 // provider the catalogue does NOT declare, so its loop never looked at the name.
@@ -3643,8 +3641,7 @@ TEST_F(HarnessLegs, NeitherDriverKeepsAProviderTheResolverNoLongerKnows) {
 
 // ── THE TWO DRIVERS MUST REACH THE SAME VERDICT FOR THE SAME CONDITION ──────
 //
-// ANCHOR, ONE LINE, DO NOT WRAP (the registry guard matches the whole name):
-// D-HARNESS-TWIN-DRIVERS-DISAGREE-ON-THE-UNKNOWN-PROVIDER-VERDICT
+// THE TWIN DRIVERS DISAGREED ON THE UNKNOWN-PROVIDER VERDICT.
 //
 // ★★ WHAT THE TWO PINS ABOVE COULD NOT SEE, AND WHY. Both of them walk dispatch
 // arm EXISTENCE and retired-name ABSENCE. Neither asks what an arm DOES — so a
@@ -3839,7 +3836,7 @@ TEST_F(HarnessLegs, BothDriversRefuseAnUnimplementedProviderWithTheSameVerdict) 
     // skipped differential is exactly the state this pin must not accept.
     // ★★ AND THE ONE NON-PASS THIS HOST CANNOT DO ANYTHING ABOUT IS SEPARATED
     // FROM THE REST, BY READING THE INSTRUMENT'S OWN STATED REASON.
-    // D-TEST-HARNESS-DIFFERENTIAL-NEEDS-A-POWERSHELL-INTERPRETER-AND-DOES-NOT-SAY-SO:
+    // THE DIFFERENTIAL NEEDS A POWERSHELL INTERPRETER AND USED NOT TO SAY SO:
     // this differential executes BOTH driver copies, so it needs a PowerShell
     // interpreter, and `pwsh` does not exist on every gate host. ✔MEASURED
     // 2026-08-21 across the four legs: Windows has it, WSL has it at
@@ -4008,7 +4005,7 @@ TEST_F(HarnessLegs, TheRecordedIdentityFlagIsNamedInExactlyOneFile) {
 
 // ── 9. NOTHING INVOKES `wsl.exe` WITHOUT `-e` ──────────────────────────────
 //
-// D-TOOLS-WSL-EXE-WITHOUT-DASH-E-RUNS-A-LOCAL-SHELL.
+// `wsl.exe` WITHOUT `-e` RUNS A LOCAL SHELL.
 //
 // THE FORBIDDEN SHAPE, in one line: `wsl.exe <anything-but--e> …`.
 //
@@ -4035,13 +4032,18 @@ TEST_F(HarnessLegs, TheRecordedIdentityFlagIsNamedInExactlyOneFile) {
 // `-e`. That is why `--` is called out by name below instead of being lumped in
 // with "some other token" — it reads like the safe spelling and is not.
 //
-// WHAT IT COST, so nobody re-litigates the severity: scripts/ssh-arm64-vps/ssh-arm64-vps.ps1 ran
-// `wsl.exe bash -lc "ssh … $Command"`, so `-Command 'hostname; uname -m'`
-// printed the VPS hostname and then the LOCAL WSL architecture — x86_64 for an
-// aarch64 box — while exiting 0. A cross-host verification instrument answering
-// with the wrong host's data, silently. The same defect sat under
-// `wslpath: C:ab`, where it was misattributed to wslpath eating backslashes and
-// papered over with a separator rewrite (section 8's corrected comment).
+// WHAT IT COST, so nobody re-litigates the severity. ✔MEASURED on the carriage
+// script that used to reach the aarch64 VPS: it ran `wsl.exe bash -lc "ssh …
+// $Command"`, so `-Command 'hostname; uname -m'` printed the VPS hostname and
+// then the LOCAL WSL architecture — x86_64 for an aarch64 box — while exiting 0.
+// A cross-host verification instrument answering with the wrong host's data,
+// silently. The same defect sat under `wslpath: C:ab`, where it was
+// misattributed to wslpath eating backslashes and papered over with a separator
+// rewrite (section 8's corrected comment).
+// ⓘ That script is GONE — the DssHarness migration replaced every carriage
+// script with one tool reading one configuration — and the measurement is kept
+// because it is why this rule exists, not because the file is still there to
+// look at. Nothing below depends on it: the shapes are proved against fixtures.
 //
 // THE RULE, and why it is shaped this way rather than "the file must not
 // contain `wsl.exe` without `-e`":
@@ -4062,7 +4064,13 @@ TEST_F(HarnessLegs, TheRecordedIdentityFlagIsNamedInExactlyOneFile) {
 //     regex, `build-wsl/` and `$wslKey` out of it without naming any of them;
 //   · a PowerShell SPLAT (`& wsl.exe @a`) is the correct fix's own shape — there
 //     is no string left to escape — so it is accepted only when the array it
-//     splats is bound to `-e` nearby. That is how scripts/ssh-arm64-vps/ssh-arm64-vps.ps1 passes.
+//     splats is bound to `-e` nearby. ★ THAT EXEMPTION IS PROVED BY FIXTURE, NOT
+//     BY CENSUS: `TheWslExecRuleJudgesEverySyntheticShape` drives the bound form
+//     (accepted), the unbound form (refused) and a binding outside the window
+//     (refused). It used to be exercised by ONE live carriage script, which the
+//     DssHarness migration deleted — and an escape whose only case leaves the
+//     tree is an escape nothing exercises, which is a disarmed guard rather than
+//     dead weight.
 //
 // COVERAGE IS BY DIRECTORY, NOT BY LIST: both sqlite drivers plus every
 // `.ps1` and `.sh` anywhere under `scripts/`, so a NEW script is governed the
@@ -4211,6 +4219,21 @@ struct Mention {
     std::string spelling;
 };
 
+// One refusal the rule raised, with the text that caused it.
+struct WslRefusal {
+    std::string subject;   // the file's name
+    std::size_t line;      // its RAW line number, 0 when not recoverable
+    std::string text;      // the live line
+    std::string why;       // the rule's own diagnosis
+};
+
+// What one scan saw. `invocations` counts every mention in COMMAND POSITION —
+// the shapes this rule governs — whether it accepted or refused them.
+struct WslScan {
+    std::size_t             invocations = 0;
+    std::vector<WslRefusal> refusals;
+};
+
 // Every offset at which this line names the WSL launcher AS A COMMAND WORD.
 [[nodiscard]] std::vector<Mention> wslMentions(std::string const& line) {
     std::vector<Mention> out;
@@ -4237,18 +4260,21 @@ struct Mention {
     return out;
 }
 
-}  // namespace
-
-TEST_F(HarnessLegs, NoScriptInvokesWslWithoutExec) {
-    std::size_t invocationsSeen = 0;
-    for (auto const& script : shellScriptsUnderTest()) {
-        ASSERT_TRUE(fs::exists(script.path)) << script.path;
+// THE RULE ITSELF, over one set of scripts, answering rather than asserting.
+//
+// ★★★ EXTRACTED SO THE RULE CAN BE POINTED AT A FIXTURE. It used to be the body
+// of the tree test, which meant every shape it recognises was proved only by the
+// tree happening to contain that shape — and the exemption below was proved by
+// exactly ONE file. A rule whose escape hatch has no synthetic case is an escape
+// nothing exercises: it can be broken in either direction and stay green, and
+// the day its one live example leaves the tree it becomes untested logic.
+[[nodiscard]] WslScan scanForWslExec(std::vector<Script> const& scripts) {
+    WslScan scan;
+    for (auto const& script : scripts) {
         auto const name  = script.path.filename().string();
         auto const lines = liveLines(script.path, script.powershell);
-        ASSERT_FALSE(lines.empty()) << name << " has no live lines";
-
         for (std::size_t i = 0; i < lines.size(); ++i) {
-            auto const& line = lines[i];
+            auto const& line     = lines[i];
             auto const  mentions = wslMentions(line);
             auto const  at = mentions.empty() ? 0 : rawLineNumberOf(script.path, line);
             for (auto const& m : mentions) {
@@ -4257,61 +4283,228 @@ TEST_F(HarnessLegs, NoScriptInvokesWslWithoutExec) {
                 // `--` first and UNCONDITIONALLY, command position or not: it is
                 // wrong even as advice an operator pastes, so it is refused
                 // wherever it is written.
-                EXPECT_NE(next, "--")
-                    << name << ':' << at << " spells `" << m.spelling
-                    << " --`:\n  " << line
-                    << "\n`--` is NOT `--exec`. MEASURED: `wsl.exe -- /nope`"
-                       " answers `/bin/bash: line 1: /nope: No such file` where"
-                       " `wsl.exe -e /nope` answers `execvpe(/nope) failed` — so"
-                       " `--` hands the whole argv to the distro's default shell,"
-                       " which re-expands it. Use `-e`.";
+                // ⚠ AND IT DOES NOT SHORT-CIRCUIT. A `--` in command position is
+                // ALSO an invocation without `-e`, so it earns the second refusal
+                // below and counts toward what the rule was seen to govern.
+                // Returning early here would have made `wsl.exe --` invisible to
+                // the non-vacuity census — the rule's worst spelling being the one
+                // that stopped proving the rule was awake.
+                if (next == "--") {
+                    scan.refusals.push_back(
+                        {name, at, line,
+                         "spells `" + m.spelling +
+                             " --`. `--` is NOT `--exec`. MEASURED: `wsl.exe --"
+                             " /nope` answers `/bin/bash: line 1: /nope: No such"
+                             " file` where `wsl.exe -e /nope` answers"
+                             " `execvpe(/nope) failed` — so `--` hands the whole"
+                             " argv to the distro's default shell, which"
+                             " re-expands it. Use `-e`."});
+                }
 
                 char const prev = precedingSymbol(line, m.at);
                 bool const commandPosition =
                     prev == '\0' || prev == '&' || prev == ';' || prev == '(' ||
                     prev == '{' || prev == '`';
                 if (!commandPosition) continue;   // a mention, not an invocation
-                ++invocationsSeen;
+                ++scan.invocations;
 
                 if (next == "-e" || next == "--exec") continue;
                 std::string const var = splattedVariable(next);
                 if (!var.empty()) {
-                    EXPECT_TRUE(splatIsBoundToExec(lines, i, var))
-                        << name << ':' << at << " splats `" << next
-                        << "` into " << m.spelling
-                        << " but nothing within 12 live lines above binds `$"
-                        << var << "` to an argv naming '-e':\n  " << line
-                        << "\nA real argv is the RIGHT fix for this defect — it"
-                           " is what scripts/ssh-arm64-vps/ssh-arm64-vps.ps1 does — but only if"
-                           " `-e` is actually in it.";
+                    if (!splatIsBoundToExec(lines, i, var)) {
+                        scan.refusals.push_back(
+                            {name, at, line,
+                             "splats `" + next + "` into " + m.spelling +
+                                 " but nothing within 12 live lines above binds"
+                                 " `$" + var +
+                                 "` to an argv naming '-e'. A real argv is the"
+                                 " RIGHT fix for this defect — there is no string"
+                                 " left for a shell to re-expand — but only if"
+                                 " `-e` is actually in it."});
+                    }
                     continue;
                 }
 
-                ADD_FAILURE()
-                    << name << ':' << at << " invokes `" << m.spelling
-                    << "` without `-e`:\n  " << line
-                    << "\nThe next token is '" << next
-                    << "'. D-TOOLS-WSL-EXE-WITHOUT-DASH-E-RUNS-A-LOCAL-SHELL:"
-                       " `wsl.exe <cmd>` does not run <cmd>, it hands the"
-                       " reconstructed command line to the distro's DEFAULT"
-                       " SHELL, which strips quoting and expands ON THIS MACHINE"
-                       " first. MEASURED: the same input string gives"
-                       " [echo A=x86_64] without `-e` and [echo A=$(uname -m)]"
-                       " with it, and a SINGLE-QUOTED $HOME in a payload still"
-                       " expanded. Quoting cannot fix it — pass `-e`, or build a"
-                       " real argv and splat it as scripts/ssh-arm64-vps/ssh-arm64-vps.ps1 does.";
+                scan.refusals.push_back(
+                    {name, at, line,
+                     "invokes `" + m.spelling + "` without `-e`. The next token"
+                     " is '" + next +
+                         "'. `wsl.exe` without `-e` runs a LOCAL shell:"
+                         " `wsl.exe <cmd>` does not run <cmd>, it hands the"
+                         " reconstructed command line to the distro's DEFAULT"
+                         " SHELL, which strips quoting and expands ON THIS"
+                         " MACHINE first. MEASURED: the same input string gives"
+                         " [echo A=x86_64] without `-e` and [echo A=$(uname -m)]"
+                         " with it, and a SINGLE-QUOTED $HOME in a payload still"
+                         " expanded. Quoting cannot fix it — pass `-e`, or build"
+                         " a real argv and splat it."});
             }
         }
     }
-    // NON-VACUITY. Every invocation above could stop being RECOGNISED — a
-    // renamed helper, a driver that stops shelling out, a boundary rule that
-    // grew too strict — and this test would go green by seeing nothing. The
-    // floor is what the two sqlite drivers and ssh-arm64-vps.ps1 supply today.
-    EXPECT_GE(invocationsSeen, 4u)
-        << "only " << invocationsSeen
-        << " wsl invocation(s) were RECOGNISED across the scanned scripts, so"
-           " this rule has stopped seeing the shape it governs and is vacuous."
-           " Fix the recogniser, do not delete the test.";
+    return scan;
+}
+
+}  // namespace
+
+TEST_F(HarnessLegs, NoScriptInvokesWslWithoutExec) {
+    auto const scripts = shellScriptsUnderTest();
+    for (auto const& s : scripts) {
+        ASSERT_TRUE(fs::exists(s.path)) << s.path;
+        // A subject with nothing live in it is a subject this rule cannot govern,
+        // and it would be indistinguishable from one it governed and cleared.
+        ASSERT_FALSE(liveLines(s.path, s.powershell).empty())
+            << s.path.filename().string() << " has no live lines";
+    }
+
+    auto const scan = scanForWslExec(scripts);
+    for (auto const& r : scan.refusals) {
+        ADD_FAILURE() << r.subject << ':' << r.line << ' ' << r.why << "\n  "
+                      << r.text;
+    }
+
+    // NON-VACUITY, AND IT IS PER SUPPLIER NOW.
+    //
+    // ⛔ THE UNION FLOOR WAS WRONG IN A WAY ITS OWN NUMBER HID. It read
+    // `invocationsSeen >= 4` over every scanned file at once, with a comment
+    // naming its three suppliers — "the two sqlite drivers and ssh-arm64-vps.ps1".
+    // ✔MEASURED before the DssHarness migration removed the carriage scripts:
+    // the live total was 5 — THREE from build-and-test.ps1, one from
+    // ssh-arm64-vps.ps1 and one from ssh-macos.sh — so a supplier could go to
+    // zero and the union still cleared 4. That is the same defect the per-root
+    // floors elsewhere in this repository exist to close: one big contributor
+    // satisfies the total while another silently empties.
+    //
+    // ⇒ THE FLOOR IS ATTACHED TO THE FILE THAT SUPPLIES IT. `build-and-test.ps1`
+    // supplies three and always has; that number is not lowered here, it is
+    // merely no longer summed with suppliers that have left the tree. Scripts
+    // that shell out to WSL may come and go; this driver is the one the harness
+    // cannot lose.
+    //
+    // ★ AND THE RECOGNISER'S COVERAGE IS NO LONGER PROVED BY A CENSUS AT ALL —
+    // TheWslExecRuleJudgesEverySyntheticShape below drives every shape, accepted
+    // and refused, against fixtures this test writes. A census can only ever
+    // prove that the tree still happens to contain an example.
+    auto const driver = harnessDir() / "build-and-test.ps1";
+    auto const driverScan = scanForWslExec({{driver, true}});
+    EXPECT_GE(driverScan.invocations, 3u)
+        << "only " << driverScan.invocations
+        << " wsl invocation(s) were RECOGNISED in " << driver.string()
+        << ", which has supplied three since this rule was written. The rule has"
+           " stopped seeing the shape it governs in the one file that cannot"
+           " stop using it. Fix the recogniser, do not lower this number.";
+}
+
+// ── The rule's own arms, synthesized — including the one the tree stopped
+//    supplying ──────────────────────────────────────────────────────────────
+//
+// ★★★ WHY THIS EXISTS. The PowerShell SPLAT exemption (`& wsl.exe @a`, accepted
+// only when `$a` is bound to an argv naming `-e` nearby) had exactly one live
+// example in the whole repository, and the DssHarness migration deleted the file
+// that carried it. ✔MEASURED before the deletion with the recogniser's own
+// boundary rules: `grep` for a splatted wsl invocation returned one hit, in the
+// carriage script; the nearest survivor uses the DIRECT `& wsl.exe -e …` form,
+// which a different clause accepts. So after the deletion the exemption had no
+// positive case anywhere — an escape nothing exercises, which this repository
+// treats as a disarmed guard rather than as dead weight.
+//
+// A fixture must synthesize the NEGATIVE as well, so each shape appears twice:
+// the spelling that must be ACCEPTED and the neighbouring spelling that must be
+// REFUSED. Without the negative half a recogniser that accepts everything passes.
+TEST_F(HarnessLegs, TheWslExecRuleJudgesEverySyntheticShape) {
+    auto const dir = scratch_->path() / "wsl-exec-shapes";
+    fs::create_directories(dir);
+
+    struct Shape {
+        char const* name;        // fixture file name, .ps1 or .sh
+        char const* body;        // its whole text
+        bool        refused;     // the verdict this shape must get
+        std::size_t invocations; // how many mentions must reach command position
+        char const* why;         // what the shape is for, quoted on failure
+    };
+
+    static constexpr Shape kShapes[] = {
+        // ── the splat exemption, both halves ──────────────────────────────
+        {"splat-bound-accepted.ps1",
+         "$a = @('-e', 'bash', '-lc', $payload)\n& wsl.exe @a\n",
+         false, 1,
+         "a splatted argv whose array names -e is the CORRECT fix and must be"
+         " accepted: there is no command string left for a shell to re-expand"},
+        {"splat-unbound-refused.ps1",
+         "$a = @('bash', '-lc', $payload)\n& wsl.exe @a\n",
+         true, 1,
+         "a splatted argv with no -e in it is the DEFECT wearing the fix's"
+         " clothes, and must be refused"},
+        // ⚠ THE FILLER IS LIVE CODE, NOT COMMENTS, AND THAT IS THE WHOLE POINT
+        // OF THE FIXTURE. The window counts LIVE lines, and `liveLines` drops
+        // `#` lines entirely — so a comment-padded version of this fixture puts
+        // the binding one live line above the call and is ACCEPTED, proving the
+        // opposite of what it claims. Caught by reading the fixture against the
+        // recogniser before it ever ran.
+        {"splat-bound-too-far-refused.ps1",
+         "$a = @('-e', 'bash')\n"
+         "$f1 = 1\n$f2 = 1\n$f3 = 1\n$f4 = 1\n$f5 = 1\n$f6 = 1\n$f7 = 1\n"
+         "$f8 = 1\n$f9 = 1\n$f10 = 1\n$f11 = 1\n$f12 = 1\n$f13 = 1\n"
+         "& wsl.exe @a\n",
+         true, 1,
+         "the binding window is twelve LIVE lines; a binding further away is not"
+         " evidence about this call site"},
+
+        // ── the direct spellings ──────────────────────────────────────────
+        {"exec-short-accepted.ps1", "& wsl.exe -e bash -lc $payload\n",
+         false, 1, "`-e` is the shape the rule exists to require"},
+        {"exec-long-accepted.ps1", "& wsl.exe --exec bash -lc $payload\n",
+         false, 1, "`--exec` is `-e` spelled out"},
+        {"bare-refused.sh", "wsl.exe bash -lc \"$payload\"\n",
+         true, 1,
+         "a bare invocation hands the reconstructed command line to the distro's"
+         " DEFAULT SHELL, which expands it on THIS machine first"},
+        {"dashdash-refused.sh", "wsl.exe -- bash -lc \"$payload\"\n",
+         true, 1,
+         "`--` reads like the safe spelling and is not: it means `pass the rest"
+         " as is`, and `as is` means `to the shell`"},
+
+        // ── what must NOT be refused: the boundary rules ──────────────────
+        {"mention-not-invocation.ps1",
+         "$probe = Get-Command wsl.exe -ErrorAction SilentlyContinue\n",
+         false, 0,
+         "resolving the launcher is not invoking it, and a diagnostic may name"
+         " it in prose — neither is command position"},
+        {"name-not-launcher.sh",
+         "grep -qiE 'microsoft|wsl' /proc/version\nkey=$wslKey\ncd build-wsl/\n",
+         false, 0,
+         "`$wslKey`, `build-wsl/` and a regex alternation are NAMES; an"
+         " invocation is always followed by whitespace and its argv"},
+        {"comment-only.ps1",
+         "# wsl.exe bash -lc 'the shape this file used to have'\n$x = 1\n",
+         false, 0,
+         "comments are prose ABOUT the code — a rule that punished writing down"
+         " what you removed would be satisfied by deleting the explanation"},
+    };
+
+    for (auto const& shape : kShapes) {
+        fs::path const p = dir / shape.name;
+        {
+            std::ofstream out(p, std::ios::binary);
+            ASSERT_TRUE(out.good()) << p;
+            out << shape.body;
+        }
+        bool const ps = p.extension() == ".ps1";
+        auto const scan = scanForWslExec({{p, ps}});
+
+        std::string got;
+        for (auto const& r : scan.refusals) got += "\n    " + r.why;
+
+        EXPECT_EQ(!scan.refusals.empty(), shape.refused)
+            << shape.name << " was " << (shape.refused ? "ACCEPTED" : "REFUSED")
+            << " and must be the other:\n  " << shape.why << "\n  body:\n"
+            << shape.body << (got.empty() ? "" : "\n  refusals:" + got);
+        EXPECT_EQ(scan.invocations, shape.invocations)
+            << shape.name << " put " << scan.invocations
+            << " mention(s) in command position, expected " << shape.invocations
+            << ". The recogniser's BOUNDARY moved, which changes what the rule"
+               " governs without changing what it says:\n  "
+            << shape.why;
+    }
 }
 
 // The same rule over the two places the spelling is DATA rather than script
@@ -4386,7 +4579,7 @@ TEST_F(HarnessLegs, NoDeclaredWslArgvOmitsExec) {
 
 // ── 10. NEITHER DRIVER NAMES THE ARTEFACT — THE COMPILER DOES ──────────────
 //
-// ★ ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING
+// ★ THE FIXTURE PATH ASSUMED THE POSIX ARTIFACT SPELLING.
 //
 // ✔MEASURED 2026-08-04, WSL x86_64, HEAD a3af1320: the .sh driver CROSS-BUILT the
 // Windows testfixture — 189 TUs compiled, the link ran, ZERO `error[` and zero
@@ -4397,8 +4590,8 @@ TEST_F(HarnessLegs, NoDeclaredWslArgvOmitsExec) {
 // in the build had ever told it what the artefact was CALLED.
 //
 // ★ WHY THIS IS WORSE THAN AN ORDINARY BUG, and why it earns a gate test. It is a
-// false negative on the project's headline capability
-// (ANCHOR, ONE LINE, DO NOT WRAP: D-HARNESS-CROSS-HOST-ANY-TARGET)
+// false negative on the project's headline capability — build ANY target
+// inside ANY host —
 // manufactured by the instrument that measures it — and it hid ITSELF:
 // only a POSIX host cross-building for Windows can reach it, which is exactly the
 // case this harness exists to observe. On the arm64 VPS the leg never got that far;
@@ -4540,7 +4733,7 @@ TEST_F(HarnessLegs, NeitherDriverNamesTheArtefactTheCompilerDoes) {
 }
 
 // ── 8. THE FOURTH, PER-LEG Tcl COHERENCE CHECK ─────────────────────────────
-// [D-HARNESS-TCL-HEADER-IS-HOST-CHOSEN-WHILE-EVERY-LEG-LIBRARY-IS-PINNED]
+// [the Tcl HEADER is host-chosen while every leg's LIBRARY is pinned]
 //
 // THE DEFECT, ✔MEASURED 2026-08-06 by the first native macOS run of
 // build-and-test.sh. The harness picks the Tcl HEADER from the HOST (tclsh on
@@ -4561,8 +4754,8 @@ TEST_F(HarnessLegs, NeitherDriverNamesTheArtefactTheCompilerDoes) {
 // worth having:
 //
 //   1. IT IS PER-LEG AND IT LIVES IN THE SHARED RESOLVER, so it cannot exist in
-//      one driver and not the other
-//      (D-HARNESS-LIBRARY-ACQUISITION-BUILT-FOR-ONE-LEG-IN-ONE-DRIVER).
+//      one driver and not the other — which is how library acquisition came to
+//      be built for ONE leg, in ONE driver.
 //      Both drivers must actually CALL it.
 //   2. IT REFUSES, IT DOES NOT WARN. A warn ships a binary that links clean and
 //      then misbehaves — the exact class this harness exists to prevent.
@@ -4726,8 +4919,7 @@ TEST_F(HarnessLegs, BothDriversRunThePerLegTclCoherenceCheck) {
                    " leg's library is pinned by its target-keyed provider; a"
                    " driver that does not compare them builds a fixture against"
                    " one Tcl and links another"
-                   " [D-HARNESS-TCL-HEADER-IS-HOST-CHOSEN-WHILE-EVERY-LEG-"
-                   "LIBRARY-IS-PINNED].";
+                   " — a host-chosen header against pinned leg libraries.";
         }
     }
 }

@@ -66,6 +66,29 @@ struct DSS_EXPORT ExternImport {
     // NOT implemented (D-CSUBSET-THREAD-LOCAL-INITIAL-EXEC) — and the
     // walker tier rejects it loud (slice C). Meaningless (false) for
     // function imports (S_ThreadLocalOnFunction rejects those upstream).
+    //
+    // ⚠⚠ THIS FIELD IS THE SOURCE'S CLAIM, AND IT IS NOT EVIDENCE ABOUT THE
+    // LIBRARY (D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA). `false` here
+    // means "no declaration in this program spelled `thread_local`" — it does
+    // NOT mean the symbol has static storage duration, because the definition
+    // lives in somebody else's binary and has its own answer. Reading this
+    // field as though it were the definition's property is precisely the
+    // defect that anchor was opened for: a plain `extern int e;` against a
+    // library that exports `e` as `STT_TLS` left this `false`, sailed past the
+    // `K_FormatLacksThreadLocalSupport` gate below (which keys on THIS field),
+    // bound got-indirect, and emitted `R_*_GLOB_DAT` against a thread-local —
+    // ✔MEASURED to make the program read the shared library's ELF header
+    // instead of its datum, on both ELF legs, with no diagnostic at all.
+    // ★ THE LIBRARY'S ANSWER IS NOT CARRIED ON THIS ROW ON PURPOSE, AND THE
+    // ABSENCE IS THE DESIGN RATHER THAN AN OMISSION. It is known ONLY where a
+    // library is read and matched — the FF1 reader's `ImportSurface::kind` —
+    // and the link tier never opens a library at all (it has a NAME, not a
+    // path), so a field here could only ever be a copy made at the binder,
+    // which is the tier that can simply refuse. The agreement rule therefore
+    // lives at the binder, once, in `ffi::reportLibraryThreadStorageDisagreement`
+    // (ffi/ingest.hpp), and is applied by all three binders: the C/HIR one in
+    // `ffi::ingest`, and the assembly + pulled-archive-member ones in
+    // `program/compile_pipeline.cpp`.
     bool        isThreadLocal = false;
     // D-LK-EXTERN-DATA-IMPORT: the imported DATA object's byte size +
     // alignment, DERIVED from the declared type's layout at HIR→MIR

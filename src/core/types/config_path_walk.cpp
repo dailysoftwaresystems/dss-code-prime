@@ -40,8 +40,8 @@
 //
 // Undefined => the build is BROKEN, loudly, here and now — exactly as
 // `DSS_PROJECT_VERSION` does one header over. A default would ship a compiler
-// that silently has no installed-layout arm, which is the defect
-// [[D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE]] closed.
+// that silently has no installed-layout arm — the defect that left a PACKAGED
+// compiler with no way to find its own config tree.
 #ifndef DSS_INSTALL_CONFIG_RELDIR
 #    error "DSS_INSTALL_CONFIG_RELDIR is not defined — cmake/DssInstall.cmake must compute it and src/core/CMakeLists.txt must forward it (see the top-level CMakeLists.txt)."
 #endif
@@ -211,9 +211,9 @@ struct Resolution {
     // cwd walk it existed to prevent, and a `/mnt/c` working directory turned
     // every shipped-descriptor canonicalisation into a 9P round trip —
     // 213.50 s at 13% CPU against 15.16 s at 90%, same binary, only the cwd
-    // moving. That row fixed its own pin and recorded the remaining half as
-    // *"a production question, raised rather than taken"*:
-    // [[D-BENCH-CONFIG-ROOT-PIN-IS-ONE-LEVEL-TOO-DEEP-AND-SILENTLY-DOES-NOTHING]]
+    // moving. The benchmark fixed its own pin and left the remaining half —
+    // SAYING SO when a set override is ignored — as *"a production question,
+    // raised rather than taken"*. This field is that half, taken.
     std::optional<std::string> ignoredOverride;
     std::optional<std::string> refusal;  // engaged => stop, and say this
     std::vector<std::string> tried;      // every candidate, in order, for the diagnostic

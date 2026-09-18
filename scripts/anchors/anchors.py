@@ -4,7 +4,7 @@
 
 Operator, 2026-09-01, in three instructions that this one file answers together:
   * *"we need to make this deterministic: inside scripts we must have anchors directory,
-    inside it (all with options like --done, --harness or --production): write-anchor,
+    inside it (all with options like --done or --production): write-anchor,
     read-anchor and read-anchors. Write you pass the parameters and it writes in the
     correct form. read 1 brings the full anchor result, read all brings the name,
     priority and status only. we must also ensure now that the anchor format is correct
@@ -18,8 +18,10 @@ THE ROW SHAPE, since 2026-09-01:
 
     | Anchor | Priority | Status | Trigger | Closing work | Cross-refs |
 
-`Priority` is `P0`..`P5`; `Status` is a three-value controlled vocabulary spelled
-`✅ CLOSED`, `🟠 OPEN`, `⏳ GATED`.
+`Priority` is `P0`..`P5`; `Status` is a controlled vocabulary spelled `✅ CLOSED`,
+`🟠 OPEN`, `⏳ GATED`, and `🔵 🟠 OPEN (DISCLOSED)` for open work whose debt PRE-DATES
+this cycle -- the last is OPEN in every count and is exempt only from the balance gate's
+net-increase refusal.
 ⚠ THE STATUS CELL KEEPS ITS GLYPH AND THAT IS THE CONTRACT, NOT DECORATION. This
 project's one definition of closed is *"the cell OPENS with ✅ after stripping `*_ `"* --
 the complement defined, never the variants, so a glyph nobody has thought of yet counts
@@ -87,8 +89,8 @@ Usage:
     anchors.py set   D-<AREA>-<NAME> --status closed --closing '...'      # moves to the archive
         ... and any prose cell may be read from a UTF-8 file instead, with --trigger-file,
         --closing-file or --cross-refs-file PATH: the form for a cell too long for a command line.
-    anchors.py read  D-<AREA>-<NAME> [--production|--harness|--done]
-    anchors.py list  [--production|--harness|--done] [--band P0 P1] [--open] [--lint]
+    anchors.py read  D-<AREA>-<NAME> [--production|--done]
+    anchors.py list  [--production|--done] [--band P0 P1] [--open] [--lint]
     anchors.py --self-test
 """
 from __future__ import annotations
@@ -174,8 +176,16 @@ queue = _load(ROOT, "scripts/burndown-queue/burndown-queue.py",
               "this tool REUSES its priority banding and must not re-implement it.")
 
 PLANS = ".plans"
-BUCKETS = ("production", "harness", "done")
-WORKING = ("production", "harness")
+# ★★★ TWO REGISTRIES SINCE 2026-09-16, AND THE THIRD IS NOT COMING BACK.
+# The harness registry was retired by the DssHarness migration: the harness becomes that
+# tool's responsibility, and every anchor from here on is a PRODUCTION anchor (operator
+# rulings 1-3). Its 187 open rows and the archive's 544 closed ones are readable in git at
+# the parent of the commit that deleted them.
+# ⚠ THIS TUPLE IS NOT COSMETIC. `read_rows` raises when a named registry is missing, and
+# `find`/`read`/`set`/`write` all pass the full tuple — so the file and this line have to
+# change together or every verb refuses, reads included.
+BUCKETS = ("production", "done")
+WORKING = ("production",)
 REL = {b: "%s/_deferred-anchor-registry-%s.md" % (PLANS, b) for b in BUCKETS}
 
 TABLE_HEADER = "| Anchor | Priority | Status | Trigger | Closing work | Cross-refs |"
@@ -189,13 +199,35 @@ FIELD_COL = {"priority": C_PRIORITY, "status": C_STATUS, "trigger": C_TRIGGER,
 
 # The archive keeps one table per ORIGIN bucket, so a reopened row knows where it goes
 # back to. The heading is the routing key, declared once.
-DONE_TABLE = {"production": "## Closed — Production", "harness": "## Closed — Harness"}
+DONE_TABLE = {"production": "## Closed — Production"}
 
-# ★ THE THREE-VALUE STATUS VOCABULARY. Spelled glyph-first because `is_closed` tests the
+# ★ THE STATUS VOCABULARY. Spelled glyph-first because `is_closed` tests the
 # LEADING character; spelled with the word because a reader greps for `CLOSED`, not for
 # a codepoint. `GATED` is OPEN as far as every count is concerned -- it says *why* the
 # row cannot be picked up, which is the distinction `--schedulable` already draws.
 STATUS = {"open": "🟠 OPEN", "gated": "⏳ GATED", "closed": "✅ CLOSED"}
+
+# ★★★ THE FOURTH SPELLING, AND IT IS **DERIVED FROM THE GATE**, NEVER RE-TYPED.
+# `check-anchor-balance` exempts a row whose status cell OPENS with its disclosed mark
+# from the net-increase refusal -- that marker exists, in its own words, "precisely so
+# that writing up a defect you merely FOUND is not punished like shipping a new
+# deferral". This writer is the ONLY sanctioned door to a row and it had three status
+# words, so NO ROW WRITTEN TODAY COULD CARRY THE MARK: the six-cell migration removed the
+# affordance while leaving the exemption in place, and the incentive the mark exists to
+# destroy came back -- the cheapest way to pass the gate is to not write the row at all.
+# ⚠ COMPOSED FROM `bal.DISCLOSED_MARK` AND FROM `STATUS["open"]`, so the cell this writer
+# emits MOVES when either owner moves. Re-typing the codepoint here would make the writer
+# and the gate two owners of one fact -- the precise class this file's header already
+# refuses ("`is_closed`, `split_row` and `row_name` come from `check-anchor-balance` ...
+# re-typing would re-open the class"). Pinned by arms (42a)-(42d) in `self_test`.
+# ⓘ A DISCLOSED ROW IS OPEN WORK AND NOTHING ABOUT IT IS SOFTENED. `is_closed` finds no
+# leading closure mark, so every count counts it, `--done` refuses it, `place_row` files
+# it in the working registry, and the OPEN word leading the cell is what ARM 7 reads. The
+# mark is exempt from the net-increase FAILURE and from nothing else whatsoever.
+# ⚠ AND THE CLAIM IS CHECKABLE, which is why it is a word and not a flag: it asserts the
+# defect PRE-DATES this cycle, so a reviewer can look for it in the base ref. Marking a
+# defect you introduced is a false statement about history, not a formatting choice.
+STATUS["disclosed"] = "%s %s (DISCLOSED)" % (bal.DISCLOSED_MARK, STATUS["open"])
 STATUS_WORDS = tuple(STATUS)
 
 # ★ THE ID SHAPE IS THE GUARD'S, NOT A NEW ONE. `check-anchor-registry` resolves `D-`
@@ -413,10 +445,14 @@ def normalise_status(value):
         if v == canon:
             return canon
     raise Refused(
-        "status %r is not one of %s. The column is a three-value controlled vocabulary "
-        "on purpose: before 2026-09-01 the verdict was the first glyph of a prose blob "
-        "that also carried the trigger, the history and the retraction, and every reader "
-        "had to agree where the verdict stopped." % (value, "/".join(STATUS_WORDS)))
+        "status %r is not one of %s. The column is a CONTROLLED VOCABULARY on purpose: "
+        "before 2026-09-01 the verdict was the first glyph of a prose blob that also "
+        "carried the trigger, the history and the retraction, and every reader had to "
+        "agree where the verdict stopped. `disclosed` is OPEN work whose debt PRE-DATES "
+        "this cycle -- it counts as open everywhere and is exempt from the balance "
+        "gate's net-increase FAILURE and from nothing else; claiming it for a defect "
+        "this cycle introduced is a false statement about history, and the reviewer can "
+        "check it against the base ref." % (value, "/".join(STATUS_WORDS)))
 
 
 def make_row(anchor, priority, status, trigger, closing="", cross_refs="", minting=True):
@@ -538,7 +574,7 @@ def _rewrite(path, lines, write):
 def place_row(root, working, anchor, row, write, insert=False, report=print):
     """Put `row` where its STATUS says it belongs, and remove it from anywhere else.
 
-    `working` is `production` or `harness` -- the bucket decision, which no tool can make
+    `working` is `production` -- the only working registry since the harness one retired
     and which the caller therefore always states. The DESTINATION is derived: closed rows
     go to the archive's matching table, open and gated rows to the working registry.
 
@@ -695,7 +731,7 @@ def _origin_of(anchor, bucket):
     rows = find(ROOT, anchor)
     if not rows:
         raise Refused("--done needs an existing row to take its origin table from; a new "
-                      "row is filed with --production or --harness and routed to the "
+                      "row is filed with --production and routed to the "
                       "archive from there when its status is closed.")
     return rows[0].table
 
@@ -756,6 +792,9 @@ def cmd_write(argv):
     ap.add_argument("--cross-refs", dest="cross_refs")
     ap.add_argument("--cross-refs-file", dest="cross_refs_file")
     ap.add_argument("--insert", action="store_true", help="declare a NEW row")
+    ap.add_argument("--relocating", action="store_true",
+                    help="with --insert: this row already exists elsewhere in the repository and "
+                         "is being MOVED here, so its id is not a new name")
     ap.add_argument("--apply", action="store_true", help="write; otherwise dry run")
     a = ap.parse_args(argv)
     # Each prose cell arrives inline OR from a file (see `cell_argument`); from here on the
@@ -784,8 +823,24 @@ def cmd_write(argv):
               "`set-anchor --priority` and the correction survives every later edit.")
     # MINT only when --insert: otherwise this is an UPDATE of a row place_row
     # will refuse unless it already exists. See ANCHOR_ID_WELLFORMED.
+    #
+    # ★ --relocating IS THE THIRD CASE, AND IT IS AN INSERT THAT IS NOT A NAMING.
+    # A row that already exists in a plan document and is being moved into a registry is not
+    # being named for the first time: its id is in the tree, cited, and resolvable. The minting
+    # rule exists so a NEW name is guard-resolvable, and `check-anchor-registry` resolves `D-`
+    # plus ONE hyphen group -- so `D-AS3-1` resolves today while this stricter rule would refuse
+    # to write the row that owns it. Refusing it would force a rename of the row AND of every
+    # citation, or a hand-written table row; both are worse than saying what is happening.
+    # ⚠ It does NOT relax the shape: ANCHOR_ID_WELLFORMED still refuses a dot, a space, or a
+    # name no registry could hold, which is why the 48 `D-PLAN12-LOWERSWITCH-FIRST-CMP-IMPLICIT-BLOCK-PLACEMENT-ASSERTION-ASSERT`-shaped rows are still minted.
+    if a.relocating and not a.insert:
+        raise Refused(
+            "--relocating describes an --insert of a row that exists elsewhere. Without "
+            "--insert this is the UPDATE path, where the relaxed id rule already applies and "
+            "`place_row` refuses an id that names no row -- a stronger identity check than "
+            "either rule.")
     row = make_row(a.anchor, priority, status, a.trigger, a.closing, a.cross_refs,
-                   minting=bool(a.insert))
+                   minting=bool(a.insert) and not a.relocating)
     dest = place_row(ROOT, working, a.anchor, row, write=a.apply, insert=a.insert)
     print("  row     %d chars" % len(row))
     print("anchors: WROTE %s" % dest if a.apply
@@ -945,7 +1000,8 @@ def self_test():
     B_ = _FX + "-BETA"
     N_ = _FX + "-NOSUCH"
     CC_ = _FX + "-CELLS"
-    HG_ = _FX + "-HGAMMA"
+    HG_ = _FX + "-GAMMA"
+    DISC_ = _FX + "-DISCLOSED"
 
 
     def pin(ok, why, detail=""):
@@ -964,12 +1020,10 @@ def self_test():
             with io.open(os.path.join(tmp, rel), "w", encoding="utf-8", newline="") as f:
                 f.write("\n".join(body) + "\n")
         doc(REL["production"], "# p", "", TABLE_HEADER, SEP_ROW_TEXT,
-            O % "ALPHA", O % "BETA", "")
-        doc(REL["harness"], "# h", "", TABLE_HEADER, SEP_ROW_TEXT,
+            O % "ALPHA", O % "BETA",
             "| `" + HG_ + "` | P3 | 🟠 OPEN | 🟠 **OPEN** | w | r |", "")
         doc(REL["done"], "# d", "", DONE_TABLE["production"], "", TABLE_HEADER,
-            SEP_ROW_TEXT, C % "OLDP", "", DONE_TABLE["harness"], "", TABLE_HEADER,
-            SEP_ROW_TEXT, "| `" + _FX + "-OLDH` | P3 | ✅ CLOSED | ✅ **CLOSED** | - | r |", "")
+            SEP_ROW_TEXT, C % "OLDP", "")
 
     def refuse(fn, *a, **k):
         try:
@@ -1004,8 +1058,14 @@ def self_test():
         "(2) an empty Trigger cell is REFUSED")
     pin("is not one of" in (refuse(make_row, CC_, "P9", "open", "t") or ""),
         "(3) a priority outside P0..P5 is REFUSED")
-    pin("controlled vocabulary" in (refuse(make_row, CC_, "P1", "wibble", "t") or ""),
-        "(4) a status outside the three-value vocabulary is REFUSED")
+    pin("CONTROLLED VOCABULARY" in (refuse(make_row, CC_, "P1", "wibble", "t") or ""),
+        "(4) a status outside the controlled vocabulary is REFUSED")
+    pin("disclosed" in "/".join(STATUS_WORDS)
+        and (refuse(make_row, CC_, "P1", "disclosed",
+                    "🔵 🟠 **OPEN (DISCLOSED)** t") is None),
+        "(4b) ...and `disclosed` is INSIDE it -- the gate's exemption is reachable through "
+        "the only sanctioned door, which is the whole defect this word repairs",
+        "words=%s" % "/".join(STATUS_WORDS))
     # ⓘ The Trigger leads with the closure mark because the STATUS is closed, and the
     # split-verdict refusal below now requires the two to agree. That is incidental to
     # what THIS arm measures -- the pipe and the newline -- and weakens none of it.
@@ -1084,10 +1144,10 @@ def self_test():
         pin(dest == REL["done"] and A_ not in prod and A_ in done,
             "(8) a CLOSED row is DELETED from the working registry and appended to the "
             "archive", "dest=%s" % dest)
-        pin(done.index(A_) < done.index(DONE_TABLE["harness"]),
-            "(9) ...into the PRODUCTION table of the archive, not the harness one")
-        pin(B_ in prod and HG_ in
-            io.open(os.path.join(tmp, REL["harness"]), encoding="utf-8").read(),
+        pin(done.index(DONE_TABLE["production"]) < done.index(A_),
+            "(9) ...UNDER the archive's production heading, which is the routing key a "
+            "reopened row is read back from")
+        pin(B_ in prod and HG_ in prod,
             "(10) the sibling rows are untouched")
 
         # ── REOPENING moves it BACK ───────────────────────────────────────────
@@ -1124,10 +1184,16 @@ def self_test():
             "(15) the archive is never declared as a destination -- it is DERIVED")
 
         # ── a DUPLICATE across two files is refused, never settled ────────────
-        lines = io.open(os.path.join(tmp, REL["harness"]), encoding="utf-8",
+        # ⚠ The two files are now the working registry and the ARCHIVE, which is the
+        # duplicate that can still happen and the one that matters: a row that is OPEN and
+        # CLOSED at the same time. Settling it by picking a file would decide whether the
+        # work is done by which document was read first.
+        lines = io.open(os.path.join(tmp, REL["done"]), encoding="utf-8",
                         newline="").read().split("\n")
-        lines.insert(5, O % "BETA")
-        io.open(os.path.join(tmp, REL["harness"]), "w", encoding="utf-8",
+        # AFTER the separator: a row between the header and the separator is not in the
+        # table at all, and the arm would then pin a parser quirk instead of the duplicate.
+        lines.insert(6, O % "BETA")
+        io.open(os.path.join(tmp, REL["done"]), "w", encoding="utf-8",
                 newline="").write("\n".join(lines))
         pin(len({r.bucket for r in find(tmp, B_)}) == 2,
             "(16) an id filed in TWO registries is FOUND in both, never silently halved")
@@ -1147,7 +1213,7 @@ def self_test():
                  REL["done"], 7, O % "HIDDEN", "OPEN row in the archive"),
                 ("(21) a Priority outside the band vocabulary", REL["production"], 5,
                  "| `" + _FX + "-BAND` | P9 | 🟠 OPEN | t | w | r |", "Priority"),
-                ("(22) a Status outside the three-value vocabulary", REL["production"],
+                ("(22) a Status outside the controlled vocabulary", REL["production"],
                  5, "| `" + _FX + "-VOCAB` | P2 | ORANGE | t | w | r |", "Status"),
                 ("(23) a Status column contradicting its own Trigger prose",
                  REL["production"], 5,
@@ -1274,6 +1340,38 @@ def self_test():
                 "(33) `set --closing-file` replaces JUST that cell, and the Trigger survives",
                 "refused=%r rows=%d" % (msg_s, len(got)))
 
+            # ── (41) A RELOCATION IS AN INSERT THAT IS NOT A NAMING ──────────────────────
+            # The id is assembled from fragments for the reason the header of this function
+            # gives: a literal `D-x-y` in `scripts/` is a CITATION the guard must resolve.
+            RL_ = "D-" + "RELOC" + "-1"
+            with contextlib.redirect_stdout(sink):
+                msg_r1 = refuse(cmd_write, ["--production", RL_, "--insert", "--priority", "P3",
+                                            "--status", "open", "--trigger", "🟠 **OPEN** t",
+                                            "--apply"])
+            pin("not a well-formed anchor id" in (msg_r1 or ""),
+                "(41a) `--insert` alone still refuses a two-segment id as a NEW name")
+            with contextlib.redirect_stdout(sink):
+                msg_r2 = refuse(cmd_write, ["--production", RL_, "--insert", "--relocating",
+                                            "--priority", "P3", "--status", "open",
+                                            "--trigger", "🟠 **OPEN** t", "--apply"])
+            pin(msg_r2 is None and len(find(tmp, RL_)) == 1,
+                "(41b) `--insert --relocating` writes it -- the row exists elsewhere, so the id "
+                "is not a new name", "refused=%r" % (msg_r2,))
+            with contextlib.redirect_stdout(sink):
+                msg_r3 = refuse(cmd_write, ["--production", _FX + "-RELOCNOINSERT",
+                                            "--relocating", "--priority", "P3", "--status",
+                                            "open", "--trigger", "🟠 **OPEN** t", "--apply"])
+            pin("--relocating describes an --insert" in (msg_r3 or ""),
+                "(41c) CONTROL: `--relocating` without `--insert` is refused, so the flag cannot "
+                "quietly become a second spelling of the update path")
+            with contextlib.redirect_stdout(sink):
+                msg_r4 = refuse(cmd_write, ["--production", "D-" + "has dot.1", "--insert",
+                                            "--relocating", "--priority", "P3", "--status",
+                                            "open", "--trigger", "🟠 **OPEN** t", "--apply"])
+            pin("not a well-formed anchor id" in (msg_r4 or ""),
+                "(41d) CONTROL: `--relocating` still refuses a name no registry could hold -- it "
+                "relaxes the SEGMENT COUNT, never the shape")
+
             # ── (34..37) ONLY LINE BREAKS COLLAPSE; A RUN OF SPACES IS THE AUTHOR'S TEXT ──
             # [D-GATE-ANCHORS-WRITER-COLLAPSES-EVERY-WHITESPACE-RUN-SO-AN-UNNAMED-CELL-DOES-NOT-SURVIVE-VERBATIM]
             # (34) and (35) pin the helper in both directions; (36) and (37) drive the two VERBS
@@ -1334,6 +1432,52 @@ def self_test():
     for _n, (_ok, _label, _detail) in enumerate(
             _owning_tree().root_arms(repo_root, (SystemExit,), False, __file__), start=38):
         pin(_ok, "(%d) %s" % (_n, _label), _detail)
+
+    # ── (42a)..(42d) THE DISCLOSED STATUS IS THE GATE'S MARK, NOT A SECOND COPY ──
+    # ★★★ WHAT THESE ARMS PIN IS THE **COUPLING**, WHICH IS WHY NOT ONE OF THEM NAMES
+    # THE CODEPOINT. The gate exempts a row whose status cell OPENS with its disclosed
+    # mark from the net-increase refusal; this writer is the only sanctioned door to a
+    # row, so an exemption it cannot spell is an exemption no row written today can
+    # reach. The repair is a fourth status word DERIVED from `bal.DISCLOSED_MARK`, and
+    # the property that matters is not "a fourth dict entry exists" -- it is that the
+    # writer's emitted cell and the gate's predicate have ONE owner between them.
+    # ⇒ Every assertion below asks the GATE (`bal.is_disclosed`, `bal.is_closed`,
+    # `bal.lead_verdict_word`) about bytes this WRITER produced. Move the mark in its one
+    # home and these stay green because the writer followed it; re-type the glyph here
+    # and (42a)/(42b) go red the moment the two copies differ by one codepoint.
+    _disc = bal.split_row(make_row(CC_, "P1", "disclosed",
+                                   "🔵 🟠 **OPEN (DISCLOSED)** the debt pre-dates this cycle"))
+    _plain = bal.split_row(make_row(CC_, "P1", "open", "🟠 **OPEN** t"))
+    pin(bal.is_disclosed(_disc[C_STATUS]),
+        "(42a) the writer's `disclosed` cell is what the GATE reads as disclosed -- asked "
+        "through `bal.is_disclosed`, never compared against a glyph re-typed here",
+        "cell=%r" % _disc[C_STATUS].strip())
+    pin(not bal.is_disclosed(_plain[C_STATUS]),
+        "(42b) CONTROL: the plain `open` cell is NOT disclosed, so (42a) is reading the "
+        "mark and not merely the word OPEN")
+    pin(not bal.is_closed(_disc[C_STATUS])
+        and bal.lead_verdict_word(_disc[C_STATUS]) == "OPEN",
+        "(42c) a disclosed row is OPEN WORK -- no closure mark, and its VERDICT WORD is "
+        "OPEN, so ARM 7 reads it as agreeing with an OPEN trigger",
+        "word=%r" % bal.lead_verdict_word(_disc[C_STATUS]))
+    with tempfile.TemporaryDirectory() as _dtmp:
+        box(_dtmp)
+        _real_root = globals()["ROOT"]
+        globals()["ROOT"] = _dtmp
+        try:
+            _quiet = lambda *a, **k: None
+            _row = make_row(DISC_, "P1", "disclosed", "🔵 🟠 **OPEN (DISCLOSED)** t", "w", "r")
+            _dest = place_row(_dtmp, "production", DISC_, _row, write=True, insert=True,
+                              report=_quiet)
+            _refusal = refuse(cmd_write, ["--done", DISC_, "--priority", "P1", "--status",
+                                          "disclosed", "--trigger", "t", "--apply"])
+        finally:
+            globals()["ROOT"] = _real_root
+        pin(_dest == REL["production"] and _refusal is not None
+            and "not a place work can hide" in _refusal and not lint(_dtmp),
+            "(42d) a disclosed row files in the WORKING registry, `--done` REFUSES it, and "
+            "`--lint` accepts its Status -- the exemption touches the FAILURE only",
+            "dest=%s refused=%r lint=%d" % (_dest, (_refusal or "")[:46], len(lint(_dtmp))))
 
     print("anchors self-test: %d failed" % failed[0])
     return 1 if failed[0] else 0

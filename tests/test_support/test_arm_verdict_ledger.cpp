@@ -1,6 +1,6 @@
-// Self-tests for the corpus harnesses' per-arm verdict ledger
-// (D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT) and the manifest emulator lint
-// (D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR).
+// Self-tests for the corpus harnesses' per-arm verdict ledger (a cross-arch
+// skip must still yield a VERDICT) and the manifest emulator lint (a
+// cross-arch-capable arm must DECLARE an emulator).
 //
 // WHY THESE EXIST AS UNIT TESTS RATHER THAN ONLY AS CORPUS RUNS. On a
 // windows/x86_64 host every non-Windows arm in the corpus is excluded by
@@ -60,8 +60,8 @@ namespace {
 // ── The verdict vocabulary ─────────────────────────────────────────────────
 
 // The three skip reasons must stay DISTINGUISHABLE. Collapsing any two of them
-// back into one status is exactly the defect
-// D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT names, so it is pinned rather than
+// back into one status re-creates the silent cross-arch skip this ledger
+// exists to end, so it is pinned rather than
 // left to a comment. Red-on-disable: give two verdicts the same name, or make
 // `armVerdictIsEnvironmentalSkip` answer true for a structural one.
 TEST(ArmVerdict, EveryVerdictHasADistinctNameAndExactlyOneClass) {
@@ -167,7 +167,8 @@ TEST(ArmVerdict, TheCardinalitySentinelIsNotAVerdict) {
 // usable, and its sysroot / its ELF interpreter / the program it crosses into a
 // distro to reach is not there; `SkippedBuildInputMissing` is "the machine
 // cannot BUILD it" — a declared resolve-library binary or a leg's target
-// compiler is absent (D-HARNESS-CROSS-HOST-ANY-TARGET). They share a CLASS
+// compiler is absent, which any host may hit because every host is expected to
+// BUILD every declared target. They share a CLASS
 // because they share an enforcement (warn by default, red under
 // DSS_STRICT_ARM_VERDICTS) and a remedy (install the missing thing), and they
 // stay SEPARATE names because a reader must be able to tell which part of the
@@ -453,7 +454,7 @@ TEST(ArmVerdictHostIdentity, HostArchMatchesTheHostNativeTargetSpec) {
 
 // ── The host binding rule ──────────────────────────────────────────────────
 //
-// D-TEST-INTEGRATED-TESTS-CANNOT-PASS-ON-A-NATIVE-ARM64-LINUX-HOST. The
+// WHY THE INTEGRATED TESTS COULD NOT PASS ON A NATIVE ARM64 LINUX HOST. The
 // CLI-subprocess runner binds ONE target per manifest, and it used to bind the
 // FIRST whose `runOn` admits the host. `runOn` names an OS, not a machine, so on
 // a native aarch64 Linux box that rule bound the corpus's x86_64 arm — which

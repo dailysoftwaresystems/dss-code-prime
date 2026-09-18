@@ -210,6 +210,47 @@ void LirBuilder::beginBlock(LirBlockId block) {
 
 LirReg LirBuilder::newVReg(LirRegClass cls) {
     if (!openFunc_.valid()) lirFatal("LirBuilder::newVReg: no open function");
+    // ── THE ID SPACE IS FINITE, AND ITS EXHAUSTION IS NOW LOUD ───────────────
+    // D-LIR-VREG-ID-BITFIELD-TRUNCATES-SILENTLY-PAST-ITS-WIDTH.
+    //
+    // `LirReg::id` is a bit-field of `kLirRegIdBits`, so handing it a wider
+    // value TRUNCATES MODULO THAT WIDTH — silently, with no conversion warning,
+    // because the argument and the field are both `std::uint32_t`. ✔MEASURED
+    // 2026-09-17: the first id past the old 24-bit width came back as **0**, the
+    // invalid sentinel, and ids past that ALIASED live virtual registers that
+    // were still in use. Liveness keys ranges by id, so two aliased vregs became
+    // ONE range spanning both, the allocator could place none of them, and one
+    // AArch64 function was still allocating after 900 s with 898 406 spill slots
+    // in flight. ⛔ The stall was the FORTUNATE outcome: two live values on one
+    // id can equally be given one register, and `findAllocationConflict` cannot
+    // see it — it re-derives interference from the same liveness table and
+    // inherits the same collision. That is a silent miscompile.
+    //
+    // ★ WHY A REFUSAL AND NOT A WIDER TYPE HERE. The width is already the whole
+    // of what a 4-byte `LirReg` has left after a class and a physicality bit
+    // (see `kLirRegIdBits`); there is no unspent bit to take. A function needing
+    // more virtual registers than that genuinely cannot be REPRESENTED by this
+    // substrate, and the bar for that case is to refuse by name rather than to
+    // produce something smaller or wrong.
+    //
+    // ★ WHY `lirFatal` AND NOT `poison()`. Poison is documented as the state a
+    // builder enters when its caller HAS ALREADY EMITTED a diagnostic; there is
+    // no reporter on this path and a hundred `newVReg` call sites upstream, so
+    // poisoning here would abandon the module with nothing on stderr saying why
+    // — the silent-degradation shape poison exists to prevent. This is the same
+    // verb the precondition one line above already uses.
+    //
+    // ⚠ It also ends an UNBOUNDED LOOP: the `.dsslir` text parser mints in a
+    // `while (true)` until `minted.id` reaches the id the text names, and once
+    // ids wrap that condition can never be met.
+    if (nextVReg_ > kLirRegMaxId) {
+        lirFatal("LirBuilder::newVReg: this function needs more virtual "
+                 "registers than a LirReg id can name — the id space is "
+                 "exhausted. Minting past it would truncate the id and ALIAS "
+                 "two live values onto one virtual register, which no "
+                 "downstream check can detect. Refusing rather than emitting a "
+                 "wrong artifact: split the function");
+    }
     LirReg const r = makeVirtualReg(nextVReg_++, cls);
     // Also bump the function's vreg counter (read at freeze).
     auto& fn = funcArena_.at(openFunc_);

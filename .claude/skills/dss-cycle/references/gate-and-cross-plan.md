@@ -15,7 +15,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   `SKIP build-dbg -- no build.ninja` and exited **0**, so a cycle following this reference verbatim
   ran the build-verifiability check against a nonexistent directory and read `rc=0` as a pass.
   Both halves are fixed: the invocation above, and the tool — a named directory that does not exist
-  is now **exit 2**, never a skip (`D-GATE-NINJA-DEPS-EXITS-ZERO-ON-A-DIRECTORY-THAT-DOES-NOT-EXIST`).
+  is now **exit 2**, never a skip.
   A directory that exists but is not a ninja tree is also exit 2 unless you pass `--allow-non-ninja`,
   which prints a SKIP naming the flag — an unasked-for skip is indistinguishable from a pass.
   ⓘ The no-argument form auto-picks `build/dbg`, else the pre-migration `build-dbg`, else fails loud
@@ -30,8 +30,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   live objects — **10 of 403** on 2026-08-13, then **51 of 430** after a seven-lane concurrent
   cycle, **16 of those being `src/` TUs compiled into the shipped DLL**. A gate run in that state
   is a green suite over a partly-stale compiler: the same class as a false-green red-on-disable,
-  arriving through the build system instead of through a test
-  (`D-BUILD-NINJA-RECORDS-ZERO-HEADER-DEPS-UNDER-CONCURRENT-BUILDS`).
+  arriving through the build system instead of through a test.
   ⚠ `#deps 0` is NEVER legitimate — ✔MEASURED that even a TU with zero `#include` directives
   records `#deps 1` (gcc lists the source itself), so a zero count is always a lost record, never
   a header-free file. The tool treats an EMPTY parse as FATAL too: "nothing found" and "nothing
@@ -93,15 +92,14 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   is no standing regression and the log is void — ✔that is exactly what settled the case
   above, in one command, against 501 failures.
 - ★★★ **A WRAPPER CANNOT REPORT ITS VERDICT IF YOU APPEND A COMMAND AFTER IT — AND THE
-  FAILURE IS SILENT AND FLATTERING.** ✔MEASURED 2026-08-24 (cycle P31,
-  `D-CYCLE-A-TRAILING-ECHO-REPLACED-A-FAILED-GATE-S-EXIT-CODE-WITH-ZERO`): the fold gate
+  FAILURE IS SILENT AND FLATTERING.** ✔MEASURED 2026-08-24 (cycle P31): the fold gate
   exited **8** with `stale_refusal_citations_guard` RED, and the background-task notification
   said **`completed (exit code 0)`**. The invocation ended `…; echo "RUNGATE_EXIT=$?"`. The
   echo read the code CORRECTLY and printed `RUNGATE_EXIT=8` — and then, being the last
   command in the compound, **became the terminal state**, which is the one thing the
   notification channel carries. ★ **The instinct was right and the placement destroyed the
   signal it existed to make visible.**
-  ⇒ **Never append a command after `run-gate.sh`.** Its last line is already the verdict.
+  ⇒ **Never append a command after the gate command.** Its last line is already the verdict.
   Where a witness line is genuinely wanted, PRESERVE the code across it:
   `…; rc=$?; echo "RUNGATE_EXIT=$rc"; exit "$rc"`.
   ⚠ **This is the standing watcher rule one hop further out.** *"A watcher must observe every
@@ -126,16 +124,15 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   `ADD_FAILURE(); std::abort();` idiom copy-pasted), so those are recorded in an `INVENTORY` whose
   per-file ceilings may only come **down**. A new site reds; a *fixed* site also reds until the
   ceiling is lowered, because unclaimed headroom is where the next regression hides. ⚠ Do not
-  confuse `INVENTORY` with `ALLOWLIST` — the latter is by PROOF and is empty. Burn-down is
-  `D-TEST-ABORT-IN-A-FIXTURE-HAS-NO-GUARD`, which stays OPEN until the inventory is.
+  confuse `INVENTORY` with `ALLOWLIST` — the latter is by PROOF and is empty. The burn-down stays
+  open in the registry until the inventory is empty.
   ⓘ Self-tests: `python scripts/check-no-abort-in-tests/check-no-abort-in-tests.py --selftest` (the comment/string stripper is
   the whole correctness — a bare token grep would red on the very file that documents the fix).
 - anchor-registry guard OK: `scripts/check-anchor-registry/check-anchor-registry.ps1` (or `.sh`).
   ⓘ Exit **4** now means *a citation names a RETIRED anchor id* — a name whose registry row opens
   with the `RETIRED-ID` marker. Resolution is substring-anywhere (load-bearing: it is what lets a
   line-wrapped citation resolve), so it cannot otherwise tell a live name from a dead one — a stale
-  id resolved for weeks on the strength of the row written to report it as stale
-  (`D-GATE-ANCHOR-CITATION-RESOLVES-VIA-ITS-OWN-BUG-REPORT`).
+  id resolved for weeks on the strength of the row written to report it as stale.
 - script-index guard OK: `python scripts/check-scripts-index/check-scripts-index.py`.
   Rides ctest as `scripts_index_guard`, so it runs anyway — run it directly when this cycle
   added, renamed, deleted or REPURPOSED a script. It reds when the tree and the two indexes
@@ -151,12 +148,12 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   under 3.2 (exit 0) and fails only when the substitution is EXPANDED. Do not "check it with the old
   shell" instead; that instrument is blind by construction. The cost of not having this guard was
   `anchor_registry_guard` dying inside its OWN self-test on `macos-latest`, so the anchor registry
-  had never been checked on that host (`D-SCRIPT-CASE-IN-COMMAND-SUBSTITUTION-BREAKS-BASH-3-2`).
+  had never been checked on that host.
   ⓘ It walks the TREE and asks git only what is IGNORED — never `git ls-files`. ✔MEASURED on the
   macOS leg the same day: a carriage's checkout sits at an old commit with the working tree rsynced
   over it, so the INDEX named seven deleted `tools/*.sh` paths and the guard reported seven
   violations on a host where nothing was wrong. Every carriage has that shape, so the distinction is
-  operational, not academic (`D-GATE-SHELL-PORTABILITY-SCANNED-THE-INDEX-NOT-THE-TREE`).
+  operational, not academic.
 - agnosticism scan clean (no hardcoded language/CPU/format in shared substrate).
 - CI-hazard screen clean (from Step 5): no GCC-vs-MSVC portability traps. Local green ≠ CI green.
 - review folded clean.
@@ -185,7 +182,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   `🔴|🟠|⚠` and was blind to `⏳`, so it reported **269** open rows where there were **579**, and a
   cycle that closed one 🟠 row while opening one ⏳ row would have been congratulated for an
   improvement. ✔MEASURED 2026-08-11, on the very cycle that introduced the gate — the row it could
-  not see was `D-OPT6-LICM-SPECULATIVE-LOAD-HOIST`, a HIGH miscompile. The tool inverts the rule:
+  not see was a HIGH-severity speculative-load-hoist miscompile. The tool inverts the rule:
   **a row is OPEN unless its status cell carries an explicit `✅`**, so a glyph nobody has thought of
   yet counts as open, which is the safe direction. `--self-test` pins that inversion (including a
   deliberately novel glyph); run it if you touch the script. Enumerating the open glyphs is the same
@@ -201,8 +198,8 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   Both homes are now counted, so MOVING a deferral between them is arithmetically NEUTRAL.
   - **✔MEASURED the day it was fixed: `661 → 662 → 987`**, decomposing with no residue. The
     registry-only number was itself wrong (**+2 −1**): the row regex `^\| \`(D-[A-Z0-9-]+)\` \|`
-    admitted no `_`, so **two OPEN rows were INVISIBLE** (`D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY`,
-    `D-TEST-CORPUS-NO-QEMU-X86_64-ON-ARM64-HOST`) — ★ **a row the gate cannot SEE cannot be seen
+    admitted no `_`, so **two OPEN rows were INVISIBLE** — the two whose ids carry an underscore,
+    one naming `QEMU_LD_PREFIX` and the other `x86_64` — ★ **a row the gate cannot SEE cannot be seen
     to OPEN either** — and one row it counted lives in the registry's own **“Allowlist (code-internal
     pins, NOT deferrals)”** table. The remaining **+325** is the plan side (231 deferred-items, 84
     reserved, 10 registry-shaped).
@@ -229,22 +226,14 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
 
   ★★ **THE FAILURE MODE THIS EXISTS TO KILL, ✔MEASURED 2026-08-11 and it is not subtle:** a lane was
   dispatched to FIX the predefined-macro set. When it was stopped it had written **nine new OPEN rows
-  describing predefined-macro gaps** — `D-PP-COMPILER-IDENTITY-INCOHERENT`,
-  `D-PP-IMPL-DETAIL-PREDEFINES-ABSENT`, `D-PP-CODE-MODEL-PREDEFINES` and six more — i.e. it had
+  describing predefined-macro gaps** — an incoherent compiler identity, absent implementation-detail
+  predefines, the code-model predefines, and six more — i.e. it had
   converted its own assignment into nine reasons to do it later, each one honestly written and
   correctly cross-referenced. **A row that restates the task you were given is not documentation, it
   is the task not being done.** Before writing ANY row, answer in one sentence: *is this the work I
   was sent to do?* If yes, the row is forbidden and the work is mandatory. That cycle's 22 committed
   rows over five commits are the same arithmetic at a slower rate.
 
-  ⓘ ANCHOR-GUARD-QUOTED-NOT-CITED: `D-PP-COMPILER-IDENTITY-INCOHERENT` `D-PP-IMPL-DETAIL-PREDEFINES-ABSENT` `D-PP-CODE-MODEL-PREDEFINES`
-  — the three ids in the paragraph above are **quoted, not cited**. They name rows that were correctly
-  DELETED, so they resolve to nothing **by design**, and the sentence only carries weight because they
-  are the real names. They must not be given rows, allowlisted, or blurred into placeholders to make a
-  tool green: the record is the authority, the guard is the instrument. The anchor guard exempts them
-  **in this file only**, and reds if any of them is ever cited elsewhere, acquires a plan row, or stops
-  appearing above — see the QUOTED-NOT-CITED block in
-  `scripts/check-anchor-registry/check-anchor-registry.sh`.
 - **★ FOUR ROWS THAT LOOK DIFFERENT AND ARE THE SAME ROW.** Before appending, grep the registry for
   the SYMPTOM, the ARTEFACT and the FILE NAMES in your evidence — not the title you have in mind
   (§C.-1 1b). Nine rows about one absent macro family is one row, or better, one fix.
@@ -260,9 +249,9 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   - ✔**Two concurrent lanes allocated `0xD029`.** One lane was told the slot was free; another had
     already taken it for `D_DependencyBuildFailed`. Nothing mechanical noticed — it was caught only
     because the second lane RE-MEASURED the header instead of trusting its brief. That is diligence,
-    not a mechanism, and it is the same non-mechanism `scripts/run-gate/run-gate.sh` exists to replace.
-  - ✔**A code shipped with no test at all.** `D-AP6-NEW-DIAGNOSTIC-CODES-HAD-NO-VALUE-PIN` closed on
-    exactly this and **re-opened one cycle later**: `D_LanguageTargetIsaMismatch` (0xD02A) landed
+    not a mechanism, and it is the same non-mechanism a WITNESSED run replaces.
+  - ✔**A code shipped with no test at all.** The row demanding a value pin for every new diagnostic
+    code closed on exactly this and **re-opened one cycle later**: `D_LanguageTargetIsaMismatch` (0xD02A) landed
     engine code in `src/` while appearing in ZERO test files.
 
   ★ **The instrument reads the ENUM, never a hand-maintained table.** The contiguity pin in
@@ -284,7 +273,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
     that built its baseline, which had called `P_InvalidEscape` covered on the strength of
     `P_InvalidEscapeSequence` appearing in a test.
   - A collapsed parse (enum block not found, implausibly few enumerators, no test sources) exits **2**
-    rather than reporting "0 duplicates, OK" — the instrument that enforces run-gate's lesson must not
+    rather than reporting "0 duplicates, OK" — the instrument that enforces the witness lesson must not
     embody its inverse.
   - `--self-test` covers the collision shapes a text-compare would miss (`0xd029` vs `0xD029`,
     decimal vs hex), the commented-out-enumerator false positive, the comment-strip property, and the
@@ -300,7 +289,7 @@ Keep the plans honest in the **same commit** as the code:
 - Update the owning sub-plan: flip the §0 status row AND stamp the §3.1 deferred-items row
   (status flip in §0; `✅ CLOSED` stamp in §3.1 — update both, not one).
 - In the registry: **close a row by MOVING it**, never by editing a status in place —
-  `bash scripts/anchors/set-anchor.sh <ANCHOR> --status closed --closing '...' --apply` stamps the
+  `DssHarness set-anchor <ANCHOR> --status closed --closing '...'` stamps the
   `Status` column and lifts the row out of its working registry into
   `_deferred-anchor-registry-done.md`. Add new anchors with `write-anchor.sh ... --insert --apply`.
   **The row is never DELETED** — the audit trail is load-bearing, which is exactly why the archive
@@ -321,7 +310,7 @@ never a dated sibling. If it does not exist, **create it this cycle**.
 
 ##### ⛔ REWRITE IT ENCODE-FIRST AND REPLACE ATOMICALLY — never open the real file for writing
 
-✔MEASURED 2026-08-24 (cycle P29, `D-CYCLE-HANDOFF-PATCHER-TRUNCATES-ITS-TARGET-BEFORE-IT-CAN-FAIL`):
+✔MEASURED 2026-08-24 (cycle P29):
 an orchestrator patch script did `io.open(path, "w", …)` and then `fh.write(...)`. The write raised
 on a lone surrogate pair in one of its own literals — **and `"w"` had already TRUNCATED the file**, so
 a **377 KB handoff became 0 bytes**. It was recovered with `git checkout --` only because the handoff
@@ -382,7 +371,7 @@ The handoff is the only channel between them, so it carries — **measured, not 
   session every cycle and is the most likely conflict in the repo. Plan 00 and the shared
   `CMakeLists.txt`/`parse_diagnostic.hpp` slot tables are next.
 - 📄 **Restate the staging rule**, because it is the mitigation: **stage by explicit path, never
-  `git add -A`** (`D-CYCLE-CANNOT-ASSUME-IT-OWNS-THE-WORKING-TREE`). A concurrent workstream's
+  `git add -A`**. A concurrent workstream's
   edits can be sitting in this very working tree.
 - ⚠ **Diagnostic-code slots and anchor names are cross-branch resources.** Two sessions taking the
   same `K_*` slot or minting the same `D-*` name conflict *semantically* — git merges both cleanly

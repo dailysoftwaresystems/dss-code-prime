@@ -389,9 +389,7 @@ TEST(LirRewrite, MultiSpilledSameClassOperandsGetDistinctScratches) {
     ASSERT_TRUE(bundle.alloc.ok());
 
     // ★★ THE PRESSURE MUST ACTUALLY EXIST — a positive-count assertion before
-    // any assertion of shape. The row:
-    // D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO
-    // ✔MEASURED, P49: this pin's source declares
+    // any assertion of shape. ✔MEASURED, P49: this pin's source declares
     // `int g(int,int);`, and while `lowerCToLir` passed a NULL ffiMap the extern
     // was refused, the call to it was dropped as an unbound Ref, and the whole
     // cross-call pressure this test is named for never existed. The walk below

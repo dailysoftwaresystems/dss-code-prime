@@ -662,7 +662,7 @@ TEST(Fc3LoaderRejects, NonIntegerLadderCandidateRejects) {
     EXPECT_FALSE(schemaLoads(doc));
 }
 
-// ── D-UAC-SHIFT-RESULT-RULE-CONFIG: the shift-result rule is a config verb ──
+// ── The shift-result rule is a config verb ──────────────────────────────
 //
 // The closed verb `shiftResult` selects a shift's RESULT TYPE (C 6.5.7). The
 // SEMANTIC-tier site (`subtreeType`) is witnessed end-to-end by folding
@@ -1017,8 +1017,8 @@ TEST(Fc3Descriptor, FseekOffsetFollowsTheDataModel) {
 }
 
 TEST(Fc3Descriptor, UnknownSignatureByDataModelKeyFailsLoud) {
-    // D-TEST-FIXED-SCRATCH-PATH-POPULATION — the descriptor used to be a CONSTANT
-    // filename under `temp_directory_path()`, shared by every concurrent instance
+    // The descriptor used to be a CONSTANT filename under
+    // `temp_directory_path()`, shared by every concurrent instance
     // of this binary. That never went RED here (MEASURED: 600/600 green with the
     // file hammer-deleted throughout the run) because both assertions below are
     // NEGATIVE — a vanished or half-written file also yields "no descriptor" plus
@@ -1073,8 +1073,8 @@ TEST(Fc3Descriptor, UnknownSignatureByDataModelKeyFailsLoud) {
 TEST(Fc3Descriptor, MalformedOverrideFailsEvenWhenNotSelected) {
     // A broken LLP64 override must fail the read under LP64 too — it
     // would otherwise lurk until the first Windows compile.
-    // D-TEST-FIXED-SCRATCH-PATH-POPULATION — same fixed-name/false-green hazard as
-    // the sibling above; see the note there.
+    // Same fixed-name/false-green hazard as the sibling above; see the note
+    // there.
     dss::test_support::ScratchDir scratch{
         dss::test_support::Location::Temp, "fc3-desc-badsig"};
     auto const tmp = scratch.path() / "desc.json";

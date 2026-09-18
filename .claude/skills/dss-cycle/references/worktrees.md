@@ -15,7 +15,7 @@ Nobody did anything wrong; the shared tree was the wrong venue. So:
 
 ### ★★ H.0a — AND IT GOES AT A **SHORT** ABSOLUTE PATH, NEVER UNDER THE SESSION SCRATCH DIRECTORY
 
-✔MEASURED 2026-08-23 (cycle P29, `D-CYCLE-WORKTREE-UNDER-THE-SESSION-SCRATCH-PATH-CANNOT-BE-BUILT-ON-WINDOWS`).
+✔MEASURED 2026-08-23 (cycle P29).
 Two cycle rules — *mutate in a worktree* and *every temporary file lives under the session scratch
 directory* — compose into a path that **cannot be built on Windows**:
 `…/AppData/Local/Temp/claude/C--Source-DailySoftware-dss-code-prime/<uuid>/scratchpad/<cycle>/lane-<x>/wt`
@@ -89,7 +89,7 @@ every path they derived was rooted at whichever repository the CALLER happened t
 in. ✔MEASURED in P52 it silently redirected a whole guard run at another repository, and
 ✔MEASURED again in P53 it hit the ORCHESTRATOR live: a shell that had drifted into
 `.worktrees/io` made `lane-fold fold io --apply` resolve `…/.worktrees/io/.worktrees/io`.
-⇒ **Closed by [[D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED]].** Each verb now anchors on its
+⇒ **Closed: the lane verbs' repo root is no longer `cwd`-keyed.** Each verb now anchors on its
 own file through the owner for its language (`leg_tree_owning_root` in `scripts/leg-tree/`,
 `Get-RepoTreeOwningRoot` in `scripts/repo-tree/`), and every one accepts an explicit
 **`--repo <path>`** (`-Repo` in PowerShell) for a caller that genuinely means another tree.
@@ -99,7 +99,7 @@ exactly that in P53 and the lane REFUTED it by measurement: from inside `.worktr
 main-checkout answer resolves `remove io` onto a LIVE SIBLING LANE'S uncommitted work, where the
 script-anchored answer resolves to a path that does not exist and refuses. It is also wrong for a
 submodule, where `--git-common-dir` names `<super>/.git/modules/<child>` — rooting a removal
-*inside* `.git`. The blast radius inverts; the row's original predicate was right.
+*inside* `.git`. The blast radius inverts; the original predicate was right.
 
 ⚠ **THE MAX_PATH BUDGET IS NOW SPENT, NOT SLACK — AND THIS IS THE ONE THING TO CARRY FROM H.0a.**
 Moving from a 10-char root into the repository root costs **46 characters** of the MAX_PATH budget
@@ -107,15 +107,16 @@ on every build path. ✔MEASURED 2026-08-26 in a live lane worktree: the longest
 suffix is **163 chars**, so `C:/dssp40k` totalled 173 (**87 spare**) and `<repo>/.worktrees/k`
 totals 214 (**46 spare**). It fits — but the margin more than halved, and this repository's test
 names are what dominate that suffix and keep growing.
-⇒ `lane-worktree.sh` **refuses by arithmetic** any root leaving under 20 chars of margin, naming
-`D-CYCLE-WORKTREE-UNDER-THE-SESSION-SCRATCH-PATH-CANNOT-BE-BUILT-ON-WINDOWS` in the refusal. ✔The
+⇒ `lane-worktree.sh` **refuses by arithmetic** any root leaving under 20 chars of margin, naming in
+the refusal the anchor for a worktree root that cannot be built on Windows. ✔The
 refusal arm is exercised: a 44-char lane name is refused at rc=3 with 3 chars spare.
 ⇒ **Keep lane names SHORT** — `k`, `l`, `rod`. A descriptive name spends the margin that protects
 the next long test name.
 
 ⚠ **`.gitignore`'s `/.worktrees/` rule is what keeps lane checkouts off every gate host**, and it
 is a REQUIREMENT, not tidiness. Since 2026-08-26 the carriages derive their exclude list from git
-(`scripts/carriage-excludes/`), so that one line is what stops four full repo copies riding to
+(and `sync.neverTransfer` in `.harness-config/config.json` names it a second time), so that one
+line is what stops four full repo copies riding to
 macOS and the arm64 VPS on every push — and a gate host holding one runs somebody's uncommitted
 `examples/` corpus and reports it as the cycle's. It is therefore ALSO pinned in that script's
 `MUST_NEVER_TRAVEL` floor, which re-asks git and **refuses the carriage** if the rule is edited

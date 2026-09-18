@@ -357,7 +357,8 @@ TEST(MirInlineAsmImmediate, AnImmediateWiderThanTheFormIsRefusedByName) {
 //
 // ⚠ THE MUTATION IS VERIFIED, NOT ASSUMED: `mutateShippedTargetSchemaDoc`
 // THROWS on a byte-identical document, so an arm whose navigator missed its
-// container cannot pass by asserting nothing (D-TEST-SCHEMA-MUTATION-HELPER-FAILS-OPEN).
+// container cannot pass by asserting nothing — the mutation helper must not
+// fail OPEN.
 TEST(MirInlineAsmImmediate, TheFormIsReadFromTheTargetNotFromTheLetterSpelling) {
     for (char const* arch : {kX86, kArm}) {
         SCOPED_TRACE(arch);

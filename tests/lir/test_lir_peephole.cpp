@@ -18,8 +18,8 @@
 //     `examples/c/lir_peephole_self_ops`.
 //     ⚠ THE FIGURES HERE READ "12021 … only 5575 are the class MOVE"
 //     (2026-08-25) until the census existed. The class-MOVE half had fallen by
-//     two orders of magnitude in between and nothing re-derived it —
-//     D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT. The
+//     two orders of magnitude in between and nothing re-derived it, because
+//     the peephole/callconv identity-copy claim had no instrument. The
 //     margin is now pinned as an inequality, not a remembered ratio, in
 //     `test_lir_identity_copy_stage_attribution.cpp`.
 //

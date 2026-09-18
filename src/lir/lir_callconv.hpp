@@ -33,7 +33,7 @@
 //   * `frame_load` pseudo-ops become `load result, [SP + slotOffset]`.
 //   * `frame_store` pseudo-ops become `store value, [SP + slotOffset]`.
 //
-// **Frame layout (target-blind, D-ML7-2.2 closure 2026-06-02)**:
+// **Frame layout (target-blind, D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 closure 2026-06-02)**:
 //   [SP+0 .. SP+outgoingArgAreaSize)              outgoing-args area
 //                                                  — THIS fn's reserved
 //                                                  space for ITS calls.
@@ -527,7 +527,7 @@ argPoolsShareACursor(TargetSchema const&            schema,
 //     pool states what this target made allocatable, and is NOT a capacity
 //     overflow the stack could absorb;
 //   * the pool is EXHAUSTED — `index >= pool.size()`, which IS stack passing
-//     (D-ML7-2.2).
+//     (D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7).
 [[nodiscard]] DSS_EXPORT std::optional<LirReg>
 argPassingRegister(TargetSchema const&            schema,
                    TargetCallingConvention const& cc,
@@ -836,7 +836,7 @@ struct DSS_EXPORT FrameLayout {
     bool                hasCalls          = false;
 
     // Derived: saved-reg area starts immediately after the outgoing-
-    // args area. Updated by D-ML7-2.2 closure (2026-06-02) — the
+    // args area. Updated by D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 closure (2026-06-02) — the
     // outgoing area is the new SP+0 zone for stack-arg overflow on
     // ANY cc that overflows its argGprs/argFprs pool. Zero when this
     // function makes no calls or every call fits in the register

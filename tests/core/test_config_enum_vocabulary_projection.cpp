@@ -91,8 +91,8 @@ constexpr char const* kBadSpelling = "zzNotAnyEnumSpelling";
 // * `ProjectionProbeError`, `shippedLanguageDoc`, `at`, `summarize`,
 // `quotedTokens` and `findVocabularyMessage` used to be file-local copies
 // here. They now have ONE owner, `vocabulary_projection_probe.hpp`, for the
-// reason this whole file exists:
-// D-TEST-VOCABULARY-PROJECTION-PROBE-HELPERS-ARE-COPIED-PER-FILE. Two of the
+// reason this whole file exists: a probe helper copied per file drifts per
+// file. Two of the
 // copies had already drifted from their siblings (`findVocabularyMessage`
 // returned a COPY of the message here and a pointer in the target-side file;
 // `shippedLanguageDoc` took no argument in the composite-kind file); the

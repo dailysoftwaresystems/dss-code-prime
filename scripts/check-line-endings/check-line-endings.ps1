@@ -506,7 +506,7 @@ check-line-endings.ps1 - the LF-contract guard, and the repo's CR instrument.
                       entry, because it necessarily costs a real timeout.
   --help              This text.
 
-THIS GUARD IS BOUNDED. It gives up after 600 s and reds, naming the query it was
+THIS GUARD IS BOUNDED. It gives up after 90 s and reds, naming the query it was
 waiting on. A hang cannot be told apart from slow work, and three ctest runs on
 this workstation were voided by exactly that ambiguity on 2026-09-07.
 

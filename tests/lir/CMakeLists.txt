@@ -218,16 +218,15 @@ dss_add_test(NAME lir/test_lir_text_unsealed_block
 # reservation) rather than over a table of offsets — a table would be right at 32 and
 # silent at 64. Nothing here drives the unit-tier front end — a sufficiency property
 # is pinned harder by calling the derivation directly than by inspecting one lowered
-# program, and the file's own banner carries the reason (the row it used to cite,
-# D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO, closed
-# in P49 and no longer states a live hazard). The end-to-end evidence is the runtime
+# program, and the file's own banner carries the reason (the hazard it used to
+# cite — a front end lowering a many-arg call to nothing, so the pins measured
+# zero — was fixed in P49). The end-to-end evidence is the runtime
 # corpus (`examples/c/alignas_local_over32`, `alignas_local_cacheline64`,
 # `alignas_member_over32_local`).
 dss_add_test(NAME lir/test_lir_overaligned_local_frame
              SOURCES test_lir_overaligned_local_frame.cpp)
 
-# D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO:
-# the pin over `lowered_lir_fixture.hpp` ITSELF. `lowerCToLir` used to return a
+# The pin over `lowered_lir_fixture.hpp` ITSELF. `lowerCToLir` used to return a
 # refused lowering looking exactly like an accepted one, so every pin driving it
 # could be asserting over a mutilated module. Its arms run the fixture INSIDE
 # `EXPECT_NONFATAL_FAILURE` — an instrument that reports is worth nothing until
@@ -252,7 +251,18 @@ dss_add_test(NAME lir/test_lir_fixture_vacuity_guard
 dss_add_test(NAME lir/test_lir_copy_coalescing_value_width
              SOURCES test_lir_copy_coalescing_value_width.cpp)
 
-# D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT. The peephole's
+# D-LIR-COALESCE-ANTI-AFFINITY-QUERY-IS-QUADRATIC. The coalescer's anti-affinity
+# veto re-scanned the WHOLE forbidden list per query on a written premise that
+# the list is "short"; it is Θ(instructions), so the query was Θ(edges ×
+# forbidden) and a large straight-line function spent 63% of its compile there.
+# The pin asserts the GROWTH RATIO of the algorithm's own probe COUNTER across a
+# doubled input — never a wall clock, which is sized on the machine that wrote
+# it — plus a control arm on the coalescer's DECISIONS, which the fix must leave
+# byte-identical.
+dss_add_test(NAME lir/test_lir_coalesce_anti_affinity_complexity
+             SOURCES test_lir_coalesce_anti_affinity_complexity.cpp)
+
+# THE PEEPHOLE/CALLCONV IDENTITY-COPY CLAIM HAD NO INSTRUMENT. The peephole's
 # placement argument rests on "callconv mints exactly ZERO identity copies", and
 # the evidence it carried was a NET across three passes because no dump stage
 # existed between the peephole and callconv. This pins the claim on the pass it
@@ -287,3 +297,27 @@ dss_add_test(NAME lir/test_preemptible_definition_routing
 # and under `direct-plt` those are two different VAs of one import.
 dss_add_test(NAME lir/test_preemptible_definition_address
              SOURCES test_preemptible_definition_address.cpp)
+
+# D-LIR-SETCC-DEAD-AFTER-FUSION: the use-count gate that stops `lowerICmp` /
+# `lowerFCmp` minting a `cmp -> setcc -> zext` trio whose only would-be reader is
+# a CondBr that FUSES the compare and re-derives the flags for itself. Its own
+# target because the claim is a MATRIX of two arms that must move in opposite
+# ways: the fused-only shape loses all three instructions, and the
+# second-consumer shape — same CFG, one extra read — must not change by a byte.
+# A rule keyed on the `setcc` mnemonic instead of on the use count passes the
+# first arm and silently breaks the second (D-LIR-FUSION-USE-COUNT-GATE), so the
+# control arm is as load-bearing as the pin.
+dss_add_test(NAME lir/test_lir_fused_compare_dce
+             SOURCES test_lir_fused_compare_dce.cpp)
+
+# D-LIR-VREG-ID-BITFIELD-TRUNCATES-SILENTLY-PAST-ITS-WIDTH: `LirReg`'s three
+# bit-fields spent 31 of 32 bits, capping one function at 2^24 virtual registers
+# and TRUNCATING silently past it — two distinct vregs on one id, which liveness
+# keys by and `findAllocationConflict` therefore cannot tell apart. Its own
+# target because the claim is about a TYPE's capacity, not about a pass: the
+# arms are exact integer identities over `LirReg` itself, and the control arm
+# (size, class round-trip, the positional-init seal) must stay green when the id
+# field is narrowed, so a red here always means "the id got smaller" and never
+# "something else broke".
+dss_add_test(NAME lir/test_lir_vreg_id_width
+             SOURCES test_lir_vreg_id_width.cpp)

@@ -1,6 +1,6 @@
 // Self-test for the ONE test-side environment override
-// (`tests/test_support/scoped_env.hpp`, hoisted at
-// `D-TEST-SCOPED-ENV-DUPLICATED-THREE-WAYS` closure).
+// (`tests/test_support/scoped_env.hpp`, hoisted 2026-08-13 out of the
+// hand-copied duplicates).
 //
 // ★ WHY A HOISTED HELPER EARNS ITS OWN PIN. Its whole job is RESTORING state,
 // and a restore that is subtly wrong does not fail here — it fails somewhere
@@ -104,18 +104,17 @@ TEST(ScopedEnvTest, ConstructToClearOnAnAlreadyAbsentVariableIsANoOp) {
 // ── ★★ THE CENSUS: THE DUPLICATION CANNOT COME BACK ─────────────────────────
 //
 // A hoist with no enforcement is a hoist that gets undone. This suite's own
-// history proves it: the row tracking these copies said THREE, and a
+// history proves it: the count that ordered the hoist said THREE, and a
 // `grep -rn 'class ScopedEnv' tests/` found FIVE — the count was written from
 // memory once and never re-measured, so two copies were invisible for as long
-// as the row existed.
+// as that count stood unchallenged.
 //
 // ── WHAT CHANGED, AND WHY THIS PIN SURVIVED THE DAY IT WENT GREEN ──────────
 // It used to carry an EXACT expected list of the two known stragglers
 // (`tests/program/test_asm_dialect_per_target.cpp`,
 // `tests/program/test_system_dirs_cwd_independent.cpp`) so that repointing
-// either one reddened the pin and forced the list to be updated. Both were
-// repointed at `D-TEST-SCOPED-ENV-STRAGGLERS-IN-TESTS-PROGRAM` closure and the
-// list emptied.
+// either one reddened the pin and forced the list to be updated. Both
+// stragglers were repointed at `scoped_env.hpp` and the list emptied.
 //
 // ★★ AN EMPTY EXPECTED LIST IS NOT NOTHING — IT IS THE STRONGEST FORM OF THE
 // FIRST HALF OF THE CONTRACT ("a new local copy anywhere under tests/ ⇒ RED").
@@ -205,7 +204,7 @@ TEST(ScopedEnvTest, TheOnlyDefinitionOfThisHelperIsTheCanonicalOne) {
     // repoint the offending file at `scoped_env.hpp` instead. The two entries
     // this list used to carry (`tests/program/test_asm_dialect_per_target.cpp`,
     // `tests/program/test_system_dirs_cwd_independent.cpp`) were repointed at
-    // `D-TEST-SCOPED-ENV-STRAGGLERS-IN-TESTS-PROGRAM` closure.
+    // `scoped_env.hpp` and this list emptied.
     EXPECT_EQ(found, std::vector<std::string>{})
         << "a file under tests/ carries its OWN copy of the helper. Delete the "
            "local class, `#include \"scoped_env.hpp\"`, and add "

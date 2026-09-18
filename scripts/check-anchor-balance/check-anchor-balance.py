@@ -283,7 +283,7 @@ SHAPES_PREFIX = [
 # ── Tables that carry an anchor-looking token in cell 1 but are NOT deferral tables ──
 # NAMED, not guessed. Each was read before being listed here:
 #   `pr | title | scope`        13-assembler section 3 PR breakdown; one row's cell 1 is
-#                               "~~AS3~~ ... (substrate slice + binary ops + D-ML7-2.1)"
+#                               "~~AS3~~ ... (substrate slice + binary ops + D-PLAN12-ARM64-STACKPOINTER-REGISTRATION-ABI-GOLDEN-TESTS)"
 #                               -- a PR title that MENTIONS an anchor.
 #   `phase | what | closes`     23-full-c cluster tables; the anchors live in the
 #                               "Closes" column, and cell 1 is a phase id like "**FC8**".
@@ -1910,11 +1910,20 @@ def self_test():
          path=".plans/24-x.md")
 
     # ── (c) blind spots of the OLD row regex, now counted ──
-    case(_doc(*REG_HDR, "| `D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY` | ⚠ OPEN | w | r |"),
-         {"D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY"},
+    # ⚠ ASSEMBLED FROM FRAGMENTS, like the `D-XX-NEWTABLE` case below and for the same
+    # reason: `scripts/` is prose this repository's guards read, so a real row id written
+    # whole here is a CITATION rather than test data. Both of these WERE real ids, and one
+    # of them went unnoticed only because its strikethrough made the row unreadable -- until
+    # the DssHarness migration repaired that cell and the fixture's "still open" text became
+    # a refusal citing a closed row. The VALUE is still a well-formed name at runtime, which
+    # is the whole of what these cases measure.
+    _UNDERSCORE = "D-FIXTURE" + "-QEMU_LD_PREFIX-AMBIENT-ONLY"
+    _STRUCK = "D-FIXTURE" + "-DYN-RODATA-ITEM-RELOC"
+    case(_doc(*REG_HDR, "| `" + _UNDERSCORE + "` | ⚠ OPEN | w | r |"),
+         {_UNDERSCORE},
          "UNDERSCORE in the name: invisible to the old regex, counted now")
-    case(_doc(*REG_HDR, "| ~~`D-LK-DYN-RODATA-ITEM-RELOC`~~ | ⚠ still open | w | r |"),
-         {"D-LK-DYN-RODATA-ITEM-RELOC"},
+    case(_doc(*REG_HDR, "| ~~`" + _STRUCK + "`~~ | ⚠ still open | w | r |"),
+         {_STRUCK},
          "STRIKETHROUGH name: invisible to the old regex, counted now")
 
     # ── (d) fail-loud on shapes, and NO false alarm on the named exclusions ──
@@ -1923,7 +1932,7 @@ def self_test():
          set(), "an UNRECOGNIZED anchor-looking table is REPORTED, never skipped",
          path=".plans/99-x.md", expect_fatal=1)
     case(_doc("| PR | Title | Scope |", "|---|---|---|",
-              "| ~~AS3~~ | cycle 3 landed (binary ops + D-ML7-2.1) | s |"),
+              "| ~~AS3~~ | cycle 3 landed (binary ops + D-PLAN12-ARM64-STACKPOINTER-REGISTRATION-ABI-GOLDEN-TESTS) | s |"),
          set(), "a NAMED non-deferral table is excluded, and raises no false alarm",
          path=".plans/13-x.md")
     case(_doc("| Tier | Example | External tools? |", "|---|---|---|",
@@ -2326,6 +2335,76 @@ def self_test():
         "expected -1, got %d" % uncorrected)
     extra_total += 4
 
+    # ── (f3) THE DISCLOSED EXEMPTION, run through the real arithmetic ──────────
+    # ★★★ THE MIRROR OF (f2), AND UNTIL NOW IT HAD **NO ARM AT ALL**. `is_disclosed`
+    # and the `- len(disclosed)` term in `net_new` were reachable only from a row a
+    # human typed by hand, and since the six-cell migration the only sanctioned
+    # writer could not type one -- so the exemption was unreachable AND untested at
+    # the same time, which is how an escape hatch quietly becomes decoration.
+    # Two worlds differing in ONE edit -- whether the newly opened row leads with the
+    # disclosed mark -- and the two outputs must move in OPPOSITE ways:
+    #   * the OPEN population is IDENTICAL either way (2 -> 3). A disclosed row is
+    #     OPEN WORK. If this ever differs, the mark has become a way to hide a row,
+    #     which is the one thing it must never be;
+    #   * the NET differs (0 vs 1), because only the net-increase FAILURE is exempt.
+    # ⚠ THE FIXTURE SPELLS THE GLYPH, exactly as every other fixture in this file
+    # spells `\U0001f7e0` and `\U0001f534`, and that is what makes this a red-on-disable
+    # arm rather than a tautology: the test states the expected VALUE independently of
+    # the constant the code reads, so moving `DISCLOSED_MARK` in its one home reddens
+    # here. The WRITER's side of the same coupling is pinned the other way round, in
+    # `anchors.py` arms (42a)-(42d), which ask this file's predicate about bytes the
+    # writer produced and therefore stay GREEN under that same mutant.
+    # ⓘ The status cell is spelled as the writer now emits it -- the mark, then the
+    # open glyph, then the word -- so the two halves of the coupling are pinned against
+    # the same shape rather than against two conventions.
+    disc_before = _doc(*REG_HDR,
+                       "| `D-XX" "-DSTAY` | \U0001f7e0 **OPEN** | work | refs |",
+                       "| `D-XX" "-DALSO` | \U0001f7e0 **OPEN** | work | refs |")
+    disc_found = _doc(*REG_HDR,
+                      "| `D-XX" "-DSTAY` | \U0001f7e0 **OPEN** | work | refs |",
+                      "| `D-XX" "-DALSO` | \U0001f7e0 **OPEN** | work | refs |",
+                      "| `D-XX" "-DNEW` | \U0001f535 \U0001f7e0 **OPEN (DISCLOSED)** the "
+                      "defect pre-dates this cycle | work | refs |")
+    disc_created = _doc(*REG_HDR,
+                        "| `D-XX" "-DSTAY` | \U0001f7e0 **OPEN** | work | refs |",
+                        "| `D-XX" "-DALSO` | \U0001f7e0 **OPEN** | work | refs |",
+                        "| `D-XX" "-DNEW` | \U0001f7e0 **OPEN** the defect is new | work | refs |")
+    bd0 = scan_document(disc_before, REG_REL)
+    bdF = scan_document(disc_found, REG_REL)
+    bdC = scan_document(disc_created, REG_REL)
+    balF = balance(bd0, bdF, bdF.bookkeeping, "registry+plans")
+    balC = balance(bd0, bdC, bdC.bookkeeping, "registry+plans")
+    pin(balF.after == balC.after == 3,
+        "a DISCLOSED row is OPEN WORK -- the population counts it exactly like any other",
+        "expected 3 == 3, got %d vs %d" % (balF.after, balC.after))
+    pin(len(balF.disclosed) == 1 and len(balC.disclosed) == 0,
+        "the mark is recognised ONLY when it leads the status cell",
+        "expected 1 vs 0, got %d vs %d" % (len(balF.disclosed), len(balC.disclosed)))
+    pin(balF.net_new == 0 and balC.net_new == 1,
+        "EXEMPT: disclosing pre-existing debt scores 0 where creating it scores 1",
+        "expected 0 vs 1, got %d vs %d" % (balF.net_new, balC.net_new))
+    pin(balF.created == [] and len(balC.created) == 1
+        and balC.created[0].endswith("#D-XX" "-DNEW"),
+        "and the two are told apart BY NAME, so a reader can check the claim in the base ref",
+        "created=%s vs %s" % (balF.created, balC.created))
+    extra_total += 4
+
+    # ⚠ THE MID-PROSE NEGATIVE, because leading position is the whole predicate and a
+    # positive arm alone passes just as well with `is_disclosed` weakened to a
+    # substring test -- the exact weakening `is_closed` already suffered once, measured
+    # at 65 hidden rows. A row that merely MENTIONS disclosure claims nothing.
+    disc_prose = _doc(*REG_HDR,
+                      "| `D-XX" "-DSTAY` | \U0001f7e0 **OPEN** | work | refs |",
+                      "| `D-XX" "-DALSO` | \U0001f7e0 **OPEN** | work | refs |",
+                      "| `D-XX" "-DNEW` | \U0001f7e0 **OPEN** -- arguably \U0001f535 disclosed, "
+                      "since something like it existed before | work | refs |")
+    bdP = scan_document(disc_prose, REG_REL)
+    balP = balance(bd0, bdP, bdP.bookkeeping, "registry+plans")
+    pin(len(balP.disclosed) == 0 and balP.net_new == 1,
+        "a mark MID-PROSE claims no exemption -- leading position is the predicate",
+        "disclosed=%d net=%d" % (len(balP.disclosed), balP.net_new))
+    extra_total += 1
+
     # A bookkeeping mark on a row that was ALREADY closed at the base ref is not
     # this cycle's business: it never entered `closed`, so it cannot be credited.
     b3 = scan_document(_doc(*REG_HDR,
@@ -2465,6 +2544,13 @@ def self_test():
         with tempfile.TemporaryDirectory() as tmp:
             plans = os.path.join(tmp, PLANS_DIR)
             os.makedirs(plans)
+            # ⚠ `-harness.md` here is a SYNTHETIC fixture name, not a live document: the
+            # harness registry retired 2026-09-16. It is kept deliberately because
+            # `is_registry` keys on the `_deferred-anchor-registry` PREFIX and
+            # `scan_worktree` reads every `.md` under `.plans/`, so this arm is what
+            # proves a SECOND working registry still canonicalises to one key -- the
+            # behaviour a third registry would depend on. Renaming it would delete the
+            # only coverage of that rule. ✔MEASURED 2026-09-16: not a dead branch.
             for name, rows in (("_deferred-anchor-registry-production.md", rows_p),
                                ("_deferred-anchor-registry-harness.md", rows_h)):
                 with io.open(os.path.join(plans, name), "w", encoding="utf-8") as fh:
@@ -2598,6 +2684,13 @@ def self_test():
         with tempfile.TemporaryDirectory() as tmp:
             plans = os.path.join(tmp, PLANS_DIR)
             os.makedirs(plans)
+            # ⚠ `-harness.md` here is a SYNTHETIC fixture name, not a live document: the
+            # harness registry retired 2026-09-16. It is kept deliberately because
+            # `is_registry` keys on the `_deferred-anchor-registry` PREFIX and
+            # `scan_worktree` reads every `.md` under `.plans/`, so this arm is what
+            # proves a SECOND working registry still canonicalises to one key -- the
+            # behaviour a third registry would depend on. Renaming it would delete the
+            # only coverage of that rule. ✔MEASURED 2026-09-16: not a dead branch.
             docs = [("_deferred-anchor-registry-production.md", prod_rows),
                     ("_deferred-anchor-registry-harness.md", harn_rows)]
             if with_archive:
@@ -3030,7 +3123,9 @@ def main():
                   % (k, col, prose))
         print("  Decide which is TRUE, then make both say it. Set the column with")
         print("      python scripts/anchors/anchors.py set --<registry> <anchor> "
-              "--status open|gated|closed --apply")
+              "--status <word> --apply")
+        print("  (`anchors.py --help` lists the words; this message deliberately does")
+        print("   NOT re-type the vocabulary, which would be a second copy of it)")
         print("  which rewrites the column and MOVES the row if the verdict changed;")
         print("  reword the prose only if the prose is the half that is wrong. Do NOT")
         print("  silence this by reading one cell -- the whole reason the column exists")

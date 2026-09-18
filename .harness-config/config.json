@@ -1,0 +1,675 @@
+{
+  "version": 1,
+  "defaults": {
+    "buildCores": 6,
+    "testCores": 6,
+    "maxParallelLegs": 4,
+    "project": "dss-code-prime",
+    "stallSeconds": 1800,
+    "durationWarningFactor": 3.0,
+    "clockStepToleranceMilliseconds": 2000,
+    "processSampleSeconds": 5
+  },
+  "toolchains": {
+    "msvc": {
+      "platforms": [
+        "windows"
+      ],
+      "generator": "Ninja"
+    },
+    "mingw-gcc": {
+      "platforms": [
+        "windows"
+      ],
+      "generator": "Ninja",
+      "env": {
+        "CC": "gcc",
+        "CXX": "g++"
+      }
+    },
+    "gcc": {
+      "platforms": [
+        "linux"
+      ],
+      "generator": "Ninja",
+      "env": {
+        "CC": "gcc",
+        "CXX": "g++"
+      }
+    },
+    "clang": {
+      "platforms": [
+        "macos"
+      ],
+      "generator": "Ninja",
+      "env": {
+        "CC": "clang",
+        "CXX": "clang++"
+      }
+    }
+  },
+  "sanitizers": {
+    "asan": {
+      "env": {
+        "CFLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer -g",
+        "CXXFLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer -g",
+        "LDFLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer -g",
+        "ASAN_OPTIONS": "abort_on_error=1:detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1",
+        "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1"
+      }
+    }
+  },
+  "buildConfigs": {
+    "debug": {
+      "cmakeBuildType": "Debug"
+    },
+    "release": {
+      "cmakeBuildType": "Release"
+    }
+  },
+  "projects": [
+    {
+      "name": "dss-code-prime",
+      "type": "cmake",
+      "path": ".",
+      "buildOutputs": [
+        "compile_commands.json",
+        { "windows": "bin/dss/dsscp.exe", "all": "bin/dss/dsscp" }
+      ],
+      "defaultToolchain": {
+        "windows": "mingw-gcc",
+        "linux": "gcc",
+        "macos": "clang"
+      },
+      "test": {
+        "all": {
+          "runner": "ctest",
+          "args": [
+            // ★ `{buildDir}` IS THE LEG'S VARIANT-KEYED BUILD DIRECTORY, WHICH ONLY THE HARNESS
+            // KNOWS -- it is `build/<processor>-<toolchain>-<config>` and differs per leg, so no
+            // literal path could be written here. Shipped in 0.5.6 with `{treeDir}` and
+            // `{harnessDir}`; an unknown name is refused when this file is READ, listing what is
+            // available, and expansion happens AFTER `filterArg`/`excludeArg` splice in, so every
+            // argument the runner sees goes through one rule.
+            // ⛔ WITHOUT THIS, `dssharness test` STARTS ctest AT THE TREE ROOT AND FINDS NOTHING:
+            // ✔MEASURED at 0.5.5, exit 8, "No tests were found!!!" -- which is why the eight-run
+            // gate could not be driven through the tool before this release.
+            "--test-dir",
+            "{buildDir}",
+            "--output-on-failure",
+            "--no-tests=error"
+          ],
+          "filterArg": "-R",
+          "excludeArg": "-LE",
+          "coresEnv": [
+            "CTEST_PARALLEL_LEVEL"
+          ],
+          "successPattern": "100% tests passed",
+          "countPattern": "tests failed out of (?<total>\\d+)"
+        }
+      }
+    }
+  ],
+  "hosts": {
+    "local": {},
+    "wsl": {
+      "Ubuntu": {
+        "repositoryPath": "~/src/dss-code-prime"
+      }
+    },
+    "ssh": {
+      "macos": {
+        "repositoryPath": "~/src/dss-code-prime",
+        "keepAwake": [
+          "caffeinate",
+          "-dimsu",
+          "-w",
+          "{pid}"
+        ],
+        "connectTimeoutSeconds": 25,
+        "keepAliveSeconds": 30
+      },
+      "arm64-vps": {
+        "repositoryPath": "~/src/Github/dss-code-prime",
+        "connectTimeoutSeconds": 25,
+        "keepAliveSeconds": 30
+      }
+    }
+  },
+  "emulators": {
+    "qemu-aarch64": {
+      "hostOs": "linux",
+      "hostProcessor": "x86_64",
+      "processor": "arm64",
+      "launcher": [
+        "qemu-aarch64"
+      ],
+      "env": {
+        "QEMU_LD_PREFIX": "/usr/aarch64-linux-gnu"
+      },
+      "requires": [
+        "qemu-aarch64",
+        "/usr/aarch64-linux-gnu",
+        "/usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1",
+        "/usr/aarch64-linux-gnu/lib/libgcc_s.so.1"
+      ],
+      "phases": [
+        "test"
+      ],
+      "witness": {
+        "command": [
+          "/usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1",
+          "--help"
+        ],
+        "pattern": "self-identifies as: /lib/ld-linux-aarch64\\.so\\.1"
+      },
+      "tool": "qemu-aarch64",
+      "description": "runs arm64 Linux artefacts on an x86_64 Linux host (the WSL leg's arm64 corpus arm)"
+    },
+    "qemu-x86_64": {
+      "hostOs": "linux",
+      "hostProcessor": "arm64",
+      "processor": "x86_64",
+      "launcher": [
+        "qemu-x86_64"
+      ],
+      "env": {
+        "QEMU_LD_PREFIX": "/usr/x86_64-linux-gnu"
+      },
+      "requires": [
+        "qemu-x86_64",
+        "/usr/x86_64-linux-gnu",
+        "/usr/x86_64-linux-gnu/lib/ld-linux-x86-64.so.2",
+        "/usr/x86_64-linux-gnu/lib/libgcc_s.so.1"
+      ],
+      "phases": [
+        "test"
+      ],
+      "witness": {
+        "command": [
+          "/usr/x86_64-linux-gnu/lib/ld-linux-x86-64.so.2",
+          "--help"
+        ],
+        "pattern": "self-identifies as: /lib64/ld-linux-x86-64\\.so\\.2"
+      },
+      "tool": "qemu-x86_64",
+      "description": "runs x86_64 Linux artefacts on the arm64 VPS"
+    },
+    "rosetta": {
+      "hostOs": "macos",
+      "hostProcessor": "arm64",
+      "processor": "x86_64",
+      "launcher": [
+        "arch",
+        "-x86_64"
+      ],
+      "requires": [
+        "arch",
+        "/Library/Apple/usr/libexec/oah"
+      ],
+      "phases": [
+        "test"
+      ],
+      "witness": {
+        "command": [
+          "/usr/bin/uname",
+          "-m"
+        ],
+        "pattern": "^x86_64$"
+      },
+      "description": "runs x86_64 Mach-O artefacts on the Apple Silicon Mac"
+    }
+  },
+  "legs": {
+    "windows-x86_64-debug": {
+      "os": "windows",
+      "processor": "x86_64",
+      "project": "dss-code-prime",
+      "toolchain": "mingw-gcc",
+      "config": "debug",
+      "description": "Debug build and test on Windows with MinGW-w64 GCC (the build/dbg tree)"
+    },
+    "windows-x86_64-release": {
+      "os": "windows",
+      "processor": "x86_64",
+      "project": "dss-code-prime",
+      "toolchain": "msvc",
+      "config": "release",
+      "description": "Release build and test on Windows with MSVC cl.exe (the build/msvc tree)"
+    },
+    "linux-x86_64-debug": {
+      "os": "linux",
+      "processor": "x86_64",
+      "wsl": "Ubuntu",
+      "project": "dss-code-prime",
+      "toolchain": "gcc",
+      "config": "debug",
+      "description": "Debug build and test on the WSL x86_64 distribution"
+    },
+    "linux-x86_64-release": {
+      "os": "linux",
+      "processor": "x86_64",
+      "wsl": "Ubuntu",
+      "project": "dss-code-prime",
+      "toolchain": "gcc",
+      "config": "release",
+      "description": "Release build and test on the WSL x86_64 distribution"
+    },
+    "macos-arm64-debug": {
+      "os": "macos",
+      "processor": "arm64",
+      "ssh": "macos",
+      "project": "dss-code-prime",
+      "toolchain": "clang",
+      "config": "debug",
+      "description": "Debug build and test on the Apple Silicon Mac"
+    },
+    "macos-arm64-release": {
+      "os": "macos",
+      "processor": "arm64",
+      "ssh": "macos",
+      "project": "dss-code-prime",
+      "toolchain": "clang",
+      "config": "release",
+      "description": "Release build and test on the Apple Silicon Mac"
+    },
+    "linux-arm64-debug": {
+      "os": "linux",
+      "processor": "arm64",
+      "ssh": "arm64-vps",
+      "project": "dss-code-prime",
+      "toolchain": "gcc",
+      "config": "debug",
+      "description": "Debug build and test natively on the arm64 Linux VPS"
+    },
+    "linux-arm64-release": {
+      "os": "linux",
+      "processor": "arm64",
+      "ssh": "arm64-vps",
+      "project": "dss-code-prime",
+      "toolchain": "gcc",
+      "config": "release",
+      "description": "Release build and test natively on the arm64 Linux VPS"
+    }
+  },
+  "legSets": {
+    "gate": [
+      "windows-x86_64-debug",
+      "windows-x86_64-release",
+      "linux-x86_64-debug",
+      "linux-x86_64-release",
+      "macos-arm64-debug",
+      "macos-arm64-release",
+      "linux-arm64-debug",
+      "linux-arm64-release"
+    ]
+  },
+  // ★ EVERY minVersion IS SPELLED WITH THREE COMPONENTS, ALWAYS.
+  // ✔MEASURED 2026-09-16 against DssHarness 0.5.3: a minimum is compared through
+  // RepoHarness.Core.Hosts.SemanticVersion.TryParse, which returns false unless the
+  // numeric part has exactly three components, and RepoHarness.Core.Tools.
+  // ToolProvisionService refuses when EITHER side fails to parse. Spelled "4.0",
+  // "13.0" and "16.0" these three entries reported `unknown: '4.3.2' there cannot be
+  // compared with the minVersion '4.0'` on every host that HAD the tool — and the
+  // refusal blames "the tool's probe", which had already matched and captured the
+  // version it is quoting. ⚠ THE PROBE REGEXES WERE NEVER THE CAUSE; widening one to
+  // silence this would be an escape that disarms the guard. Every entry WITHOUT a
+  // minVersion reported `already current`; every entry WITH one reported `unknown`.
+  // That was the whole population, which is what identified the parser and not the probes.
+  "tools": [
+    {
+      "name": "cmake",
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "cmake version (\\d+\\.\\d+\\.\\d+)"
+      },
+      "minVersion": "4.0.0",
+      "why": "configures and drives every build; the root CMakeLists declares cmake_minimum_required(VERSION 4.0)"
+    },
+    {
+      "name": "ninja",
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "(\\d+\\.\\d+\\.\\d+)"
+      },
+      "install": {
+        "linux": {
+          "manager": "apt",
+          "id": "ninja-build"
+        }
+      },
+      "why": "the generator every toolchain in this file requests"
+    },
+    {
+      "name": "git",
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "git version (\\d+\\.\\d+\\.\\d+)"
+      },
+      "install": {
+        "linux": {
+          "manager": "apt",
+          "id": "git"
+        }
+      },
+      "why": "the tree, the worktrees, and the ignore list every sync is derived from"
+    },
+    {
+      "name": "python3",
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "Python (\\d+\\.\\d+\\.\\d+)"
+      },
+      "why": "the configure step runs find_package(Python3 COMPONENTS Interpreter REQUIRED), and most repository guards registered as ctest entries are Python"
+    },
+    {
+      "name": "pwsh",
+      "platforms": [
+        "windows"
+      ],
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "PowerShell (\\d+\\.\\d+\\.\\d+)"
+      },
+      "why": "on a Windows host the configure step requires a PowerShell interpreter for the anchor-registry and line-endings guards"
+    },
+    {
+      "name": "g++",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "\\)\\s+(\\d+\\.\\d+\\.\\d+)"
+      },
+      "minVersion": "13.0.0",
+      // ★ THE REGEX STAYS GNU-SHAPED, AND ON macOS IT IS MEANT TO MATCH NOTHING.
+      // ✔MEASURED 2026-09-16, raw `g++ --version` first line per host:
+      //   local Windows  `g++.exe (MinGW-W64 x86_64-ucrt-posix-seh, ... r8) 13.2.0`
+      //   wsl Ubuntu     `g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0`
+      //   ssh arm64-vps  GNU-shaped: the probe captured 13.3.0, which this regex can
+      //                  only produce from a `) <version>` tail
+      //   ssh macos      `Apple clang version 21.0.0 (clang-2100.1.1.101)` - no digits
+      //                  follow the only `)`, so the probe matches nothing and says so.
+      // macOS HAS NO GCC: `g++` there is a shim for Apple clang, and the macos legs build
+      // with the `clang` toolchain (CC=clang, CXX=clang++), so they never call g++ at all.
+      // Widening this to `version (\d+\.\d+\.\d+)` would capture 21.0.0, compare it
+      // against 13.0.0 and report "already current" - i.e. make this file ASSERT that
+      // GCC 13+ is present on macOS, which is FALSE, to turn a red green. The residual is
+      // not ours: a ToolConfig (RepoHarness.Core.Configuration.ToolModels) carries no
+      // platform, host or leg scope, and ToolProvisionService walks every declared tool on
+      // every leg's host, so "needed only where a gcc toolchain runs" has no spelling here.
+      "why": "the compiler behind the mingw-gcc and gcc toolchains; the root CMakeLists records GCC 13+ as verified"
+    },
+    {
+      "name": "clang++",
+      "platforms": [
+        "macos"
+      ],
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "clang version (\\d+\\.\\d+\\.\\d+)"
+      },
+      "minVersion": "16.0.0",
+      // ✔MEASURED 2026-09-16: this regex reads both vendors' banners, unlike g++'s above -
+      // `Apple clang version 21.0.0 (clang-2100.1.1.101)` and `Ubuntu clang version
+      // 18.1.3 (1ubuntu1)` both match, so no widening is needed or wanted.
+      "why": "the compiler behind the clang toolchain on macOS; the root CMakeLists records Clang 16+ as verified"
+    },
+    {
+      "name": "cl",
+      "platforms": [
+        "windows"
+      ],
+      "why": "the MSVC compiler the windows-x86_64-release leg builds with; it is on PATH only inside a Visual Studio developer environment, so no probe is declared"
+    },
+    {
+      "name": "tclsh",
+      "install": {
+        "linux": {
+          "manager": "apt",
+          "id": "tcl"
+        },
+        "macos": {
+          "manager": "brew",
+          "id": "tcl-tk"
+        }
+      },
+      "why": "the sqlite corpus's testfixture TCL suite; tclsh also decides which Tcl header the corpus build compiles against. The unversioned formula deliberately, not tcl-tk@8: the corpus reads tclConfig.sh and supports Tcl 9, and the versioned formulae are keg-only, so their tclsh lands under /opt/homebrew/opt/<formula>/bin where neither the PATH nor the resolver's searched directories reach it. Finding a tclsh is not the same as knowing which Tcl a leg builds against - on macOS the name resolves to the system 8.5.9 while the corpus links Homebrew's 9.x - so the location belongs to the runner, not to this entry"
+    },
+    {
+      "name": "qemu-aarch64",
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "version (\\d+\\.\\d+\\.\\d+)"
+      },
+      "install": {
+        "linux": {
+          "manager": "apt",
+          "id": "qemu-user"
+        }
+      },
+      "why": "the user-mode emulator the qemu-aarch64 entry runs arm64 artefacts through on an x86_64 Linux host"
+    },
+    {
+      "name": "qemu-x86_64",
+      "probe": {
+        "args": [
+          "--version"
+        ],
+        "regex": "version (\\d+\\.\\d+\\.\\d+)"
+      },
+      "install": {
+        "linux": {
+          "manager": "apt",
+          "id": "qemu-user"
+        }
+      },
+      "why": "the user-mode emulator the qemu-x86_64 entry runs x86_64 artefacts through on the arm64 VPS"
+    }
+  ],
+  "predefinedRunners": {
+    // ⓘ Named for what it measures, not for one host. R30's JSON sketch calls it
+    // 'wsl-clock-step-probe'; R26's own list calls the fifth runner 'the clock-step probe',
+    // and a clock step is a property of ANY host - `defaults.clockStepToleranceMilliseconds`
+    // above is declared once for all of them, and `help configuration` says a duration
+    // spanning a clock step or a host sleep is marked suspect wherever it ran.
+    // ✔MEASURED 2026-09-16: declaring more legs here widens no excusal. A runner reached
+    // through a runCheck is run by RepoHarness.Cli.Commands.RunCommand.ConfirmAsync on the
+    // CARRYING entry's leg, with ResolvedLegs set to that leg alone; the checked runner's own
+    // `legs` is not consulted on that path. R30's run-mode scope is the carrying runner's.
+    "clock-step-probe": {
+      "description": "Counts the intervals in which this host's CLOCK_REALTIME diverged from CLOCK_MONOTONIC by more than the clock-step tolerance, and prints that count as 'steps='. The one runner here that is not work: it exists only to be checked, so that an expected exception which blames a clock step has something that can refuse to confirm it. The failing unit's own window stays the caller's - this runner measures the host it is asked on, when it is asked.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      // ★ THE OPERATOR'S LAYOUT, AND THE TOOL CANNOT LOAD IT YET. Ruling 2026-09-16: one
+      // directory per action, named for the action, holding its `.yml` and every supporting
+      // file - because a `run` line is a program and its arguments with no shell, so anything
+      // that is not a one-liner needs a file next to the action. The layout is declared here as
+      // ruled, deliberately, rather than bent to what today's tool accepts.
+      // ✔MEASURED 2026-09-16 against DssHarness 0.5.3, with the file present at exactly this
+      // path: `DssHarness legs` PASSES (exit 0); `DssHarness run` REFUSES with exit 12 - 'is not
+      // a file name. A runner's action names one file directly inside ...'.
+      // ✅ FIXED UPSTREAM AND SHIPPED. ✔MEASURED 2026-09-17 at DssHarness 0.5.6: `help runners`
+      // now documents `.harness-config/runner/actions/<name>/<name>.yml` as THE layout, and names
+      // the three shapes it still refuses - a flat `<name>.yml`, a path leaving the directory, and
+      // a file whose name differs from its directory's. That is the fix this comment asked for:
+      // combine, resolve, and require the result to stay UNDER the actions directory, which keeps
+      // the reviewability reason intact while allowing one directory per action.
+      // ⚠ ONE DIRECTORY LEVEL ONLY, still: ✔MEASURED 2026-09-17, a nested
+      // `actions/<name>/<sub>/<file>.yml` is refused with exit 12, and the refusal rejects the
+      // WHOLE config file rather than the one entry.
+      // ⓘ The paragraph above is kept rather than deleted because it records what was measured at
+      // 0.5.3, and a reader meeting a `run` refusal on an older tool needs to find it.
+      // ★ THE UPSTREAM FIX IS NOT 'REMOVE THE CHECK'. RepoHarness.Core.Runners.ActionFileParser.LoadAsync
+      // refuses any `action` whose Path.GetFileName is not the whole string, and its own comment
+      // gives the reason: resolving a name with a separator would let a runner run a file from
+      // anywhere on the machine, and 'only files a reviewer sees in this directory may declare
+      // what a runner does'. That reason is sound and a nested file does not weaken it - a
+      // subdirectory of `actions/` is equally reviewable. The correct form is to combine, resolve
+      // to a full path, and require it to remain UNDER the actions directory, which still refuses
+      // `..` traversal and a rooted path. Reported to the operator.
+      // ⚠ A SECOND DEFECT RIDES THIS ONE: RepoHarness.Core.Configuration.HarnessConfigValidator
+      // accepts this value and the verb rejects it, so a config that `legs` calls valid fails only
+      // when a runner is invoked - against `help configuration`'s promise that problems are listed
+      // at once when the file is read.
+      "action": "clock-step-probe/clock-step-probe.yml",
+      "stallSeconds": 120
+    },
+    // ★★★ THE MANUAL END-TO-END CORPUS. Declared here because a runner is reachable ONLY through
+    // this map — `DssHarness run <runner>` takes the runner "as predefinedRunners names it", so an
+    // action directory without an entry here is a program nothing can start. ✔MEASURED 2026-09-17:
+    // both actions below shipped with their directories and WITHOUT their entries, so neither was
+    // reachable.
+    // ★ THE LEGS ARE THE arm64 VPS ON PURPOSE, and it is the measurement that chooses them: the
+    // island edge is a property of AArch64's `Imm26` field, so the compile runs NATIVELY on the
+    // architecture whose field is being exhausted rather than cross-built from a host that cannot
+    // execute the result.
+    // ⚠ `requireBuild` because the driver LOCATES `dsscp` under `<tree>/build/*/bin/dss/` and
+    // REFUSES when it finds none - the refusal names the path, but a leg that was never built is a
+    // wasted round trip to a remote host rather than a measurement.
+    // ⓘ `stallSeconds` is NOT a time budget: the driver heartbeats every 15 s, so 120 is eight
+    // beats. The island compile's DURATION is the thing being measured, so bounding it would bound
+    // the measurement. The action file carries the same number and the reasoning in full.
+    "manual-end-to-end": {
+      "description": "Runs the MANUAL end-to-end corpus - entries whose cost makes them wrong to put in a gate, taken deliberately instead. Today that is the AArch64 branch-island edge, which fires only beyond the Imm26 field's reach, so witnessing it means compiling a single function larger than 134 MB. Its corpus is grouped by language at `.harness-config/runner/actions/manual-end-to-end/corpus/<language>/<name>/` and is invisible to both shipped corpus harnesses, which glob the `examples/` ROOT - so no entry here can move the default ctest count. Each entry must declare `manualRun: true` or this driver skips it by name.",
+      "legs": [
+        "linux-arm64-debug",
+        "linux-arm64-release"
+      ],
+      "requireBuild": true,
+      "action": "manual-end-to-end/manual-end-to-end.yml",
+      "stallSeconds": 120
+    },
+    // ★ A MEASUREMENT INSTRUMENT, NOT A GATE - no ctest entry depends on it, and its ANSWER rather
+    // than its file is what `src/link/format/macho.cpp` cites. macOS-only BY NATURE and not by
+    // configuration: every cell shells to `/usr/bin/clang` and `nm -m`, which exist on no other leg.
+    // ⓘ ONE leg, not two: it measures what Apple's ld64 does with a second defined symbol at a
+    // canonical address, which is a property of ld64 and not of how DSS was configured, so a release
+    // arm would re-measure the same external tool and answer the same thing.
+    // ⓘ NO `requireBuild`: the action never invokes `dsscp`.
+    // ⚠ `stallSeconds: 900` is the action's own figure, kept in step with it - eight linked cells
+    // plus an n_desc dump per variant, over ssh, where a single slow cell is not a hang.
+    "macho-alias-ld64-matrix": {
+      "description": "Measures what Apple's ld64 does with a SECOND defined symbol at the same address as a canonical one, with and without -dead_strip. Eight cells: three producer variants (plain, altentry, setalias) crossed with dead-strip off/on while referencing ONLY the alias, plus a canonical-only control at both settings, and an n_desc dump per variant. Its answer is load-bearing and cited as evidence in src/link/format/macho.cpp and tests/link/test_macho_writer.cpp: a plain alias (n_desc = 0) is correct and N_ALT_ENTRY is not needed.",
+      "legs": [
+        "macos-arm64-debug"
+      ],
+      "action": "macho-alias-ld64-matrix/macho-alias-ld64-matrix.yml",
+      "stallSeconds": 900
+    }
+  },
+  "commit": {
+    "signOff": true
+  },
+  "sync": {
+    "neverTransfer": [
+      "build",
+      "build-wsl",
+      "target",
+      ".dss-deps",
+      "scratchpad",
+      "Testing",
+      "test-scratch",
+      ".worktrees",
+      ".claude/worktrees",
+      ".secrets",
+      ".temp",
+      ".venv",
+      "node_modules",
+      ".kilo",
+      "__pycache__",
+      ".ccache",
+      ".cache",
+      // ★★ `**/name` MEANS THAT NAME AT ANY DEPTH (whole segments, so `**/cache` does not cover
+      // `src/mycache`). A BARE NAME STAYS ROOTED, deliberately, upstream -- widening bare names
+      // would silently stop transferring every nested directory of that name to every host.
+      // ⇒ ✔MEASURED before 0.5.6: every entry above is a bare name, so `__pycache__` (133 nested,
+      // no root instance), `node_modules` and `.claude/worktrees` protected NOTHING AT ALL.
+      // ★ THE ONE THAT MATTERED IS `.secrets`: the bare entry covers the root instance, while a
+      // SECOND `.secrets` at depth 3 under `.harness-config/` -- the directory the superuser design
+      // names as where a host credential goes -- was covered by nothing. It holds only `.gitkeep`
+      // today, so this closes a LATENT exposure rather than an incident. `.env` is the same shape.
+      // ⚠ A protective rule that silently matches nothing is WORSE than no rule, because the name
+      // in this file reads as evidence that the thing is protected. 0.5.6 now says so at sync time.
+      "**/.secrets",
+      "**/.env"
+      // ⛔ AND DELIBERATELY NOT `**/__pycache__`, though the upstream deploy list asked for it and
+      // repo-harness then agreed the arithmetic here is better. Protecting it makes every emptied
+      // directory persist on every host, for every `.py` this migration deletes, until somebody
+      // removes it by hand -- and `scripts_index_guard` reds on each one. Leaving it unprotected
+      // costs one `.pyc` recompile per script per host and lets 0.5.6's prune close the husk.
+    ],
+    "maxDeleteFraction": 0.25
+  },
+  "contention": {
+    "buildTools": [
+      "ctest",
+      "ninja",
+      "cmake",
+      "make",
+      "gmake",
+      "msbuild"
+    ],
+    "sharedResourceTools": [
+      "dsscp"
+    ]
+  },
+  "worktrees": {
+    "root": ".worktrees",
+    "evidenceRoots": [
+      "scratchpad",
+      ".temp"
+    ],
+    "maxNameLength": 10,
+    "pathBudgetReserve": 163,
+    "pathBudgetMargin": 20,
+    "pathLimit": 260,
+    "detach": true
+  },
+  "anchors": {
+    "pendingAnchorsPath": ".plans/_deferred-anchor-registry-production.md",
+    "doneAnchorsPath": ".plans/_deferred-anchor-registry-done.md",
+    "idPrefix": "D",
+    "minimumIdSegments": 3,
+    "citationRoots": [
+      "src",
+      "examples",
+      "docs",
+      "README.md",
+      ".gitattributes"
+    ]
+  },
+  "sshItems": [
+    "macos",
+    "arm64-vps"
+  ],
+  "wslDistros": [
+    "Ubuntu"
+  ],
+  "ci": {
+    "workflows": [
+      ".github/workflows/pipeline-pr.yml"
+    ],
+    "legBudgetMinutes": 180
+  }
+}

@@ -597,7 +597,7 @@ public:
     // before any consumer queries this. Aborts if `id` is not a BitInt.
     [[nodiscard]] TypeKind bitIntContainerKind(TypeId id) const;
     // fnSig: operands=[result, params...], scalars=[(int)cc, isVariadic].
-    // D-LANG-VARIADIC (step 13.4): variadic flips the second scalar slot;
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): variadic flips the second scalar slot;
     // non-variadic encodings remain 1-slot for cache stability against
     // every pre-13.4 TypeId. The declared params are the FIXED arg count
     // (matches LLVM's `(i32 (i8*, ...))*` convention — `...` is a
@@ -670,7 +670,7 @@ public:
     // `id` is not a FnSig.
     [[nodiscard]] TypeId               fnResult(TypeId id) const;
     [[nodiscard]] GuardedSpan<TypeId>  fnParams(TypeId id) const;
-    // D-LANG-VARIADIC (step 13.4): true iff this FnSig was built via
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): true iff this FnSig was built via
     // the 4-arg `fnSig()` overload with `isVariadic=true`. Read from
     // scalars[1]. Pre-13.4 FnSigs (built via the 3-arg overload)
     // encode scalars=[(int)cc] only — `fnIsVariadic` returns false

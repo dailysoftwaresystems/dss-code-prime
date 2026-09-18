@@ -55,7 +55,7 @@ namespace {
 // S_AsmLabelOnAutomaticVariable below, each pinned as a NEGATIVE.
 //
 // Examples in shipped
-// closed-table: D-LK6-8.2 split codes (silent ABI mismatch ⇒
+// closed-table: D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET split codes (silent ABI mismatch ⇒
 // SIGILL at user runtime), I_* verifier invariants (SSA / CFG
 // violations sailing through), K_ImageWrite* (silently truncated
 // on-disk image), F_FfiIngest* architectural exclusions (silent
@@ -826,7 +826,7 @@ constexpr std::array<UnsuppressableEntry, 174> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
-    // D-LK6-8.2 split codes that close the SIGILL surface
+    // D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET split codes that close the SIGILL surface
     // (suppressing either would let `--target=arm64:elf64-x86_64...`
     // or schema-typo'd `machine` dispatch wrong PLT-stub emitter).
     {DiagnosticCode::D_PlanNotLanded, kWhyPlanNotLanded},

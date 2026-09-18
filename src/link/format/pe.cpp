@@ -2694,7 +2694,7 @@ encode(AssembledModule const&    module,
     //    → per-section relocs → symbol table → string table ─────
     //
     // Section count is DERIVED from `numSections` (the ordinal cursor
-    // above — architect D-LK2-5 convergence; a hardcoded literal would
+    // above — architect D-LK2-5-DERIVED-SECTION-COUNT convergence; a hardcoded literal would
     // silently corrupt the file whenever a data section appears). Raw
     // section data is PACKED back-to-back with no inter-section file
     // padding — cl.exe's own convention (its raw pointers land at odd
@@ -3304,11 +3304,20 @@ encodeExec(AssembledModule const&    module,
     // rather than the magic `sectionHeaders[1u + (rdata ?
     // 1u : 0u)]` arithmetic that an earlier shape used.
     //
-    // **Anchor D-LK2-RODATA-SECTION-LAYOUT-RECORD**: this type is
-    // walker-local today (PE is the sole consumer); when
-    // D-LK1-RODATA (ELF) or D-LK3-RODATA (Mach-O) closes, hoist to
-    // `src/link/format/data_section_layout.hpp` as shared
-    // substrate. Trigger: 2nd walker arm.
+    // **Anchor D-LK2-RODATA-SECTION-LAYOUT-RECORD**: this type stays
+    // walker-local, and the trigger it was written with has been
+    // REFUTED rather than left pending. It read "when D-LK1-RODATA
+    // (ELF) or D-LK3-RODATA (Mach-O) closes, hoist to a shared
+    // `data_section_layout.hpp`". D-LK3-RODATA HAS closed, and the
+    // hoist it predicted did not become necessary: what the three
+    // walkers actually came to share is the BYTE-LAYOUT of a data
+    // section (`ExecDataSectionLayout` + `buildExecDataSection` in
+    // `exec_data_section.hpp`, consumed by pe/elf/macho alike). The
+    // tuple below is the PE/COFF SECTION-HEADER record — rva,
+    // virtualSize, rawSize, rawPointer, headerIndex — and `rawPointer`
+    // / `headerIndex` name PE/COFF header fields that neither ELF's
+    // section headers nor Mach-O's `section_64` has an analogue for.
+    // A second consumer of THIS shape has never appeared.
     struct DataSectionLayout {
         std::uint32_t rva         = 0;
         std::uint32_t virtualSize = 0;  // section-aligned
@@ -5061,7 +5070,7 @@ encodeExec(AssembledModule const&    module,
 
     // Build the section-header vector NOW so NumberOfSections,
     // headerBytesUnpadded, sizeOfImage, etc. ALL derive from
-    // `sectionHeaders.size()` — same B-LK1-2 / D-LK2-5 discipline
+    // `sectionHeaders.size()` — same B-LK1-2 / D-LK2-5-DERIVED-SECTION-COUNT discipline
     // the .obj arm + ELF walker adopted (architect O3 + code-
     // reviewer #5 convergence). A future cycle adding .rdata /
     // .data simply pushes onto this vector; counts update.

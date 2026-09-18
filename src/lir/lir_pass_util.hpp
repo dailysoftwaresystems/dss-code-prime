@@ -19,7 +19,7 @@
 
 // Shared substrate for LIR transformation passes (rewrite, callconv,
 // future inlining/optimization passes). Folds the cycle-3b / ML7
-// duplication identified by the simplifier as D-ML7-1.1: every pass
+// duplication identified by the simplifier as D-PLAN12-SHARED-LIR-PASS-UTIL-HPP-FOR-EMITTERMINATOR-REPORT: every pass
 // that walks an input `Lir` and builds a fresh one re-implements the
 // same diagnostic-emission, block-ref remapping, and terminator
 // dispatch — all of which are tier-invariant (target-blind, source-
@@ -243,7 +243,10 @@ incomingArgRegister(TargetSchema const&            schema,
                     std::uint32_t                  payload);
 
 // ── THE IDENTITY-CLASS-MOVE QUESTION, WITH ONE OWNER ────────────────────
-// D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT.
+// A per-pass claim about this population is falsifiable only while the
+// instrument that COUNTS it and the rule that ACTS on it ask the same
+// question; a second implementation counts a population the rule never
+// touches.
 //
 // "Is this instruction the declared register-to-register MOVE for its
 // result's register class, copying a physical register into ITSELF?" is

@@ -40,10 +40,13 @@
 #include "core/types/extern_import.hpp"
 #include "core/types/object_format_kind.hpp"
 #include "core/types/target_schema.hpp"
+#include "ffi/import_surface.hpp"
+#include "ffi/ingest.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 
 #include "image_dependency_table.hpp"
+#include "diagnostic_count.hpp"
 
 #include <gtest/gtest.h>
 
@@ -241,5 +244,88 @@ TEST(ImageLibraryDeps, ExtractorsReportOnlyTheLibrariesActuallyRecorded) {
     for (auto const& leg : allLegs()) {
         SCOPED_TRACE(leg.label);
         checkExtractorReportsOnlyRecorded(leg);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA — a reference may not name a
+// definition whose STORAGE DURATION it disagrees with.
+//
+// SAME FAULT FAMILY AS THIS FILE'S SUBJECT, one axis over: the defect above was
+// a reader telling the binder the wrong thing about WHICH LIBRARY owns a name;
+// this one is a reader telling the binder the right thing about WHAT KIND of
+// object a name is, and the binder discarding it. `SymbolKind::Tls` (ELF
+// STT_TLS) has been produced by `ffi/binary_readers/elf_reader.cpp` since FF1
+// shipped and was consumed by NOBODY, so a plain `extern int e;` against a
+// library that defines `e` as a thread-local bound `got-indirect` — one
+// process-shared address — and the emitted image carried
+// `R_X86_64_GLOB_DAT` / `R_AARCH64_GLOB_DAT` against a thread-local symbol.
+//
+// ✔MEASURED before the rule landed, both ELF legs, debug AND release: the
+// artifact linked with rc 0 under `--warnings-as-errors` and then read the
+// SHARED LIBRARY'S OWN ELF HEADER where its datum should have been — `return
+// lib_counter` exited 127 (`0x7f`) and `return (lib_counter >> 8) & 0xFF`
+// exited 69 (`0x45`, the `E` of `\x7fELF`), where the library's value was 7.
+// GNU ld REFUSES the identical program outright ("TLS definition in <lib>
+// section .tdata mismatches non-TLS reference"), which is what makes this a
+// DEFECT rather than a missing feature: the reference union rejects it.
+//
+// WHAT IS PINNED IS THE RULE, NOT A MESSAGE — `reportLibraryThreadStorageDis-
+// agreement` is the ONE implementation all three binders call (the C/HIR one in
+// `ffi::ingest`, and the assembly + pulled-archive-member ones in
+// `program/compile_pipeline.cpp`), so pinning it here covers every binder.
+//
+// ⚠ THE NEGATIVE ARMS ARE THE POINT, and there are three of them. A guard that
+// fires on everything is not a guard: ordinary library data, library functions,
+// and an untyped row must ALL still bind, and a CORRECTLY-spelled
+// `extern _Thread_local` must reach its OWN, DIFFERENT refusal
+// (`K_FormatLacksThreadLocalSupport`, D-CSUBSET-THREAD-LOCAL-INITIAL-EXEC)
+// rather than this one — two wrong programs, two messages.
+//
+// RED-ON-DISABLE: change the `librarySymbolKind != SymbolKind::Tls` early-out
+// in `src/ffi/ingest.cpp` to an unconditional `return false` and
+// `RefusesAPlainReferenceToALibraryThreadLocal` reds while all three negative
+// arms stay green.
+
+TEST(ImportStorageDuration, RefusesAPlainReferenceToALibraryThreadLocal) {
+    DiagnosticReporter rep;
+    EXPECT_TRUE(ffi::reportLibraryThreadStorageDisagreement(
+        "lib_counter", "libtls.so", ffi::SymbolKind::Tls,
+        /*declaredThreadLocal=*/false, rep))
+        << "a plain reference to a library thread-local must be REFUSED — "
+           "binding it got-indirect hands every thread one shared datum";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_ExternImportAttributeConflict), 1u);
+    ASSERT_FALSE(rep.all().empty());
+    auto const& d = rep.all().front();
+    EXPECT_EQ(d.severity, DiagnosticSeverity::Error)
+        << "a silent miscompile guard is an Error, never a Warning";
+    // The message must NAME both sides, or it cannot be acted on.
+    EXPECT_NE(d.actual.find("lib_counter"), std::string::npos) << d.actual;
+    EXPECT_NE(d.actual.find("libtls.so"), std::string::npos) << d.actual;
+}
+
+TEST(ImportStorageDuration, AThreadLocalReferenceIsLeftToTheInitialExecRefusal) {
+    DiagnosticReporter rep;
+    EXPECT_FALSE(ffi::reportLibraryThreadStorageDisagreement(
+        "lib_counter", "libtls.so", ffi::SymbolKind::Tls,
+        /*declaredThreadLocal=*/true, rep))
+        << "a CORRECTLY-spelled `extern _Thread_local` agrees with the "
+           "library; its refusal is K_FormatLacksThreadLocalSupport "
+           "(D-CSUBSET-THREAD-LOCAL-INITIAL-EXEC), a different program and a "
+           "different message";
+    EXPECT_EQ(rep.all().size(), 0u);
+}
+
+TEST(ImportStorageDuration, OrdinaryLibraryObjectsAndFunctionsStillBind) {
+    for (auto const kind : {ffi::SymbolKind::Object, ffi::SymbolKind::Function,
+                            ffi::SymbolKind::NoType, ffi::SymbolKind::Forwarder}) {
+        SCOPED_TRACE(static_cast<int>(kind));
+        DiagnosticReporter rep;
+        EXPECT_FALSE(ffi::reportLibraryThreadStorageDisagreement(
+            "plain_datum", "libplain.so", kind,
+            /*declaredThreadLocal=*/false, rep))
+            << "only a THREAD-LOCAL definition may refuse a plain reference; "
+               "a guard that fires on ordinary data is no guard at all";
+        EXPECT_EQ(rep.all().size(), 0u);
     }
 }

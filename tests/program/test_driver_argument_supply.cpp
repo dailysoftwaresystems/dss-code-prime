@@ -1,5 +1,5 @@
-// ★★★ THE DRIVER'S SUPPLYING IS THE SUBJECT — NOT THE CALLEE'S BEHAVIOUR
-// (D-TEST-STATIC-LINK-UNIT-SUITE-CANNOT-WITNESS-A-DRIVER-THREADING-GAP).
+// ★★★ THE DRIVER'S SUPPLYING IS THE SUBJECT — NOT THE CALLEE'S BEHAVIOUR.
+// A UNIT SUITE CANNOT WITNESS A DRIVER THREADING GAP.
 //
 // ── WHAT THIS FILE IS FOR ───────────────────────────────────────────────────
 // `src/program/compile_pipeline.hpp` exports the pipeline kernel. Several of

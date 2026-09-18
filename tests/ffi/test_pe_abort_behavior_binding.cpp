@@ -276,8 +276,8 @@ constexpr std::int64_t kCallReportValue = 2;
 // both are worth keeping: the honest-baseline ASSERT at the top of
 // `DescriptorAuditRejectsEveryDishonestShape`, and the fact that the real tree
 // and the synthetic baseline failed IDENTICALLY, which pointed at the predicate
-// rather than the data. Same class as
-// D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE (tests/CMakeLists.txt).
+// rather than the data. Same class as the schema fixture in
+// `tests/CMakeLists.txt` that bound a reference to a destroyed temporary.
 nlohmann::json const kNoRows = nlohmann::json::array();
 
 [[nodiscard]] std::vector<std::string> auditAbortBehaviorBinding(

@@ -50,7 +50,7 @@ using namespace dss;
 // Nothing below may name `temp_directory_path()` directly — that is the whole
 // point of routing 39 sites through one function.
 //
-// WHY THE ROOT MUST BE PER-RUN (D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES).
+// WHY THE ROOT MUST BE PER-RUN.
 // `tests/CMakeLists.txt` registers a SECOND ctest entry that runs THIS
 // binary again under `--gtest_shuffle --gtest_repeat=20`, deliberately without
 // serialization. So on any ordinary `ctest -j` two live processes of this
@@ -93,7 +93,7 @@ using namespace dss;
 // REFERENCE to the cached owner. Same shape as `x86Schema()` in
 // tests/lir/test_lir.cpp.
 //
-// D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE — WHY THIS RETURNS A REFERENCE.
+// WHY THIS RETURNS A REFERENCE.
 // While this returned `std::shared_ptr<GrammarSchema const>` BY VALUE, every
 // call built a fresh schema owned solely by the returned temporary, so the
 // one-liner `auto const& x = cSubset()->accessor();` bound a reference into an
@@ -128,9 +128,9 @@ using namespace dss;
     return schema;
 }
 
-// D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE — the DURABLE guard, and the only
-// kind available here. Once `cSubset()` hands back a reference to a static the
-// dangling read becomes IMPOSSIBLE, which retires the crash test that proved it:
+// The DURABLE guard against that dangling read, and the only kind available
+// here. Once `cSubset()` hands back a reference to a static the dangling read
+// becomes IMPOSSIBLE, which retires the crash test that proved it:
 // a runtime red-on-disable cannot survive its own fix. So the property is pinned
 // at COMPILE time instead. Restoring the by-value return re-admits the entire
 // defect class at all 36 call sites, so that regression must not be silent.
@@ -138,7 +138,7 @@ using namespace dss;
 // `std::shared_ptr<GrammarSchema const>` and this fails to compile.
 static_assert(std::is_reference_v<decltype(cSubset())>,
               "cSubset() must return a REFERENCE to a cached owner. A by-value "
-              "return re-admits D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: "
+              "return re-admits the dangling-reference defect: "
               "`helper()->accessor()` would again bind a reference into a schema "
               "owned only by the temporary, which dies at the end of the "
               "full-expression (heap-use-after-free).");
@@ -4175,7 +4175,17 @@ TEST(Preprocessor, FC15bPredefinedMacroBadObjectFormatIsLoadError) {
 //   __GNUC__ 4 / __GNUC_MINOR__ 2 / __GNUC_PATCHLEVEL__ 1 / __APPLE_CC__ 6000 /
 //   __clang__ 1.
 // `__DSSCP__` is the one row with no clang counterpart — it is DSS's own
-// identity, packed from VERSION (0.0.2 -> 0*1000000 + 0*1000 + 2 == 2).
+// identity, packed from the repo-root VERSION file (0.0.2 -> 0*1000000 + 0*1000
+// + 2 == 2; 0.5.0 -> 5000).
+//
+// ⚠ ITS EXPECTED VALUE IS READ FROM `VERSION`, NEVER RESTATED HERE. The five
+// clang rows are literals because they are MEASURED against clang and a bump of
+// this project changes none of them; `__DSSCP__` is the opposite — it follows
+// this repository's own version, so a literal here is a pin that goes stale at
+// the next release and reds the whole corpus while blaming the config.
+// ✔MEASURED 2026-09-16: it did. The merge that bumped VERSION 0.0.2 -> 0.5.0
+// left this expectation at "2", and this test plus its shuffled twin were the
+// only two failures on an otherwise green 2207-test gate.
 //
 // WHY VALUES AND NOT JUST PRESENCE: `__GNUC__` alone would satisfy a
 // presence-only test while yielding GCC_VERSION 4000000 instead of the truthful
@@ -4191,14 +4201,35 @@ TEST(Preprocessor, TFC83IdentityPredefineValuesMatchClang) {
             got[pm.name] = pm.value;
         }
     }
+    // The repository's own version, read where the loader reads it, packed the way
+    // the loader packs it. `packVersionComponents` is exercised on its own against
+    // fixed strings by TFC83VersionPackingIsOrderPreserving below, so this is not a
+    // tautology: that test owns the transform, this one owns the wiring.
+    auto const versionFile = dss::test::repoRoot() / "VERSION";
+    std::ifstream versionIn(versionFile);
+    ASSERT_TRUE(versionIn) << "cannot read " << versionFile.string();
+    std::string versionText;
+    std::getline(versionIn, versionText);
+    // Trailing whitespace only -- a CRLF checkout of this one-line file leaves a
+    // carriage return that `packVersionComponents` would refuse.
+    while (!versionText.empty() && versionText.back() <= ' ') {
+        versionText.pop_back();
+    }
+    const std::vector<long long> versionWeights{1000000, 1000, 1};
+    auto const packed = dss::packVersionComponents(versionText, versionWeights);
+    ASSERT_TRUE(packed.has_value())
+        << versionFile.string() << " holds " << versionText << ": "
+        << (packed ? std::string{} : packed.error());
+
     const std::map<std::string, std::string> want{
-        {"__APPLE_CC__", "6000"},     {"__DSSCP__", "2"},
+        {"__APPLE_CC__", "6000"},     {"__DSSCP__", std::to_string(*packed)},
         {"__GNUC_MINOR__", "2"},      {"__GNUC_PATCHLEVEL__", "1"},
         {"__GNUC__", "4"},            {"__clang__", "1"},
     };
     EXPECT_EQ(got, want)
         << "the TF-C83 identity predefines must carry their clang-MEASURED "
-           "values; __DSSCP__ must be VERSION (0.0.2) packed to 2";
+           "values; __DSSCP__ must be VERSION (" << versionText << ") packed to "
+        << *packed;
     // The GCC_VERSION arithmetic sqliteInt.h actually performs.
     EXPECT_EQ(std::stoll(got.at("__GNUC__")) * 1000000
                   + std::stoll(got.at("__GNUC_MINOR__")) * 1000
@@ -11073,10 +11104,10 @@ TEST(Preprocessor, TFC115EndiannessPredefinesCrossLayerCoherence) {
 // engine's own notion of the set.
 namespace {
 [[nodiscard]] std::vector<std::string> tfc86DeclaredOperators() {
-    // D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: NAME the owning handle. The
-    // one-liner `auto const& pp = cSubset()->preprocess();` binds a reference
-    // INTO a schema owned only by a temporary `shared_ptr`, which dies at the
-    // end of that full-expression -> `pp` dangles for every read below.
+    // NAME the owning handle. The one-liner
+    // `auto const& pp = cSubset()->preprocess();` binds a reference INTO a
+    // schema owned only by a temporary `shared_ptr`, which dies at the end of
+    // that full-expression -> `pp` dangles for every read below.
     auto schema = cSubset();
     auto const& pp = schema->preprocess();
     std::vector<std::string> names;
@@ -11177,8 +11208,8 @@ TEST(Preprocessor, TFC86ConditionalInclusionOperatorsAreDefinedInElifdefForms) {
 // reds. Without this test an over-broad predicate would pass every assertion
 // above while quietly changing what `#ifdef defined` means.
 TEST(Preprocessor, TFC86DefinedOperatorItselfIsNotADefinedName) {
-    // D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: see the note in
-    // `tfc86DeclaredOperators` — the owning handle must outlive `pp`.
+    // See the note in `tfc86DeclaredOperators` — the owning handle must
+    // outlive `pp`.
     auto schema = cSubset();
     auto const& pp = schema->preprocess();
     ASSERT_FALSE(pp.definedOperator.empty());

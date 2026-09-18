@@ -20,12 +20,13 @@
 // ★ THE FIXTURE LOWERS REAL c SOURCE, never a hand-built descriptor,
 // because the property under test is a RELATION between what the front end
 // minted (the spellings) and what this tier bound (the blocks). A hand-typed
-// descriptor would be testing the hand-typing —
-// `D-TEST-A-PIN-THAT-STUBS-ITS-SUBJECTS-INPUT-IS-TESTING-THE-STUB`.
+// descriptor would be testing the hand-typing: a pin that stubs its subject's
+// INPUT is testing the stub.
 //
 // ⚠ CONFIG-LEVEL: `dss_add_test` sets `DSS_CONFIG_ROOT`, so this file must run
-// through ctest and never as a bare `.exe`
-// (D-TEST-CONFIG-RED-ON-DISABLE-READS-THE-WRONG-TREE).
+// through ctest and never as a bare `.exe` -- a bare run falls back to a cwd
+// walk and can read a DIFFERENT config tree, which turns a red-on-disable
+// arm green for the wrong reason.
 
 #include "core/types/target_schema.hpp"
 #include "lir/lir.hpp"

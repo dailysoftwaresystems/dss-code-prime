@@ -862,6 +862,28 @@ def check(raw: str) -> list[str]:
         if needle not in text:
             bad.append(message)
 
+    # ── H2. the archive name carries every component, and an empty one REFUSES ──
+    # ✔MEASURED on release v0.5.0: the Windows leg published `dsscp-0.5.0-.tar.gz` while the
+    # other three legs were named correctly. The Visual Studio developer environment defines
+    # `Platform`, Windows environment names are case-INSENSITIVE so Actions' `PLATFORM`
+    # injection updated that slot keeping its casing, and `bash` is case-SENSITIVE — so the
+    # expansion was empty. Nothing went red: the job succeeded and the asset shipped, and only
+    # a human reading the release noticed. `publish-packages.yml` fetches assets BY NAME, so a
+    # nameless package is one nothing downstream can find.
+    if "DSS_PLATFORM: ${{ matrix.platform }}" not in text:
+        bad.append(
+            "PKG-PLATFORM-ENV-RENAMED: the packaging step no longer reads the leg's platform "
+            "from `DSS_PLATFORM`. A bare `PLATFORM` collides with the Visual Studio "
+            "environment's own `Platform` on the Windows leg and expands to nothing there."
+        )
+    if "for _part in ARTIFACT_NAME VERSION DSS_PLATFORM; do" not in text:
+        bad.append(
+            "PKG-ARCHIVE-NAME-UNCHECKED: the packaging step no longer refuses an empty "
+            "component of the archive name. An asset missing its platform is indistinguishable "
+            "from a correct one to anything globbing `*.tar.gz`, which is how a nameless "
+            "Windows tarball reached a published release with every job green."
+        )
+
     # ── H. the platforms ────────────────────────────────────────────────────
     for platform in REQUIRED_PLATFORMS:
         if f'"platform":"{platform}"' not in text:
@@ -1152,6 +1174,16 @@ def _arms(text: str) -> list[tuple[str, str, str]]:
             "the macOS leg deleted",
             sub('"platform":"macos-arm64"', '"platform":"macos-x86"'),
             "PKG-PLATFORM-LEG-GONE",
+        ),
+        (
+            "the platform env renamed back to the colliding name",
+            sub("DSS_PLATFORM: ${{ matrix.platform }}", "PLATFORM: ${{ matrix.platform }}"),
+            "PKG-PLATFORM-ENV-RENAMED",
+        ),
+        (
+            "the empty-name-component refusal deleted",
+            sub("for _part in ARTIFACT_NAME VERSION DSS_PLATFORM; do", "for _part in; do"),
+            "PKG-ARCHIVE-NAME-UNCHECKED",
         ),
         (
             "the artifact upload deleted",

@@ -863,7 +863,7 @@ TEST(BinaryReaderReporter,
 
 TEST(BinaryReaderReporter,
      Elf64PartialCorruptionElevatesToErrorUnderWarningsAsErrors) {
-    // D-FF1-PARTIAL-CORRUPTION-WAE-PIN (2026-06-01): pin that
+    // PIN-FF1-PARTIAL-CORRUPTION-WAE-PIN (2026-06-01): pin that
     // --warnings-as-errors elevates F_BinaryReaderPartialCorruption
     // from Warning to Error end-to-end. The unsuppressable gate
     // bypasses --suppress + overrides (silencing) but NOT

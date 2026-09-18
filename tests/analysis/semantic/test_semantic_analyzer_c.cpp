@@ -5278,8 +5278,8 @@ TEST(SemanticAnalyzerC, BreakAfterLoopIsOutsideLoop) {
 // closes GAP F and proves the FC13 splice handles a spaced directive: one
 // tree, zero cross-refs, header text present.
 TEST(SemanticAnalyzerC, SpacedIncludeIsInlined) {
-    // D-TEST-FIXED-SCRATCH-PATH-POPULATION — the one site in this file that had
-    // drifted: the include dir came from a CONSTANT name under
+    // The one scratch site in this file that had drifted from its neighbours:
+    // the include dir came from a CONSTANT name under
     // `temp_directory_path()`, so two concurrent instances of this binary shared
     // it and the first one's `remove_all` deleted `x.h` while the second was
     // preprocessing (MEASURED: "cannot open .../dss_gapF_include_test/x.h" and

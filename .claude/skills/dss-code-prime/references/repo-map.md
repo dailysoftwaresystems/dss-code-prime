@@ -76,9 +76,10 @@ Non-negotiable rules for anything under `real-examples/`:
 
 ### 3.1 Real non-x86-Windows hardware is reachable over SSH (added 2026-08-04)
 
-Two physical machines are now scriptable, which changes what "verified" can mean for the
-non-native targets. Both are reached through **capability-paired** helpers in `scripts/`:
-`ssh-arm64-vps.{sh,ps1}` and `ssh-macos.{sh,ps1}`.
+Two physical machines are reachable, which changes what "verified" can mean for the non-native
+targets. Both are declared hosts of the repository harness: `dssharness host-exec --ssh macos` and
+`--ssh arm64-vps` run a command in each host's own checkout, and `dssharness legs` says which legs
+they can carry. They used to be reached through a capability-paired helper per host in `scripts/`.
 
 | host | what it is | why it matters |
 |---|---|---|

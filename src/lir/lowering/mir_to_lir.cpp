@@ -2148,8 +2148,8 @@ struct Lowerer {
     // widths (x86 D3/C1 CL+imm8 forms via the implicit-count "count"
     // role contract; arm64 LSLV/LSRV/ASRV X+W forms) — they pass this
     // TYPE gate at 32/64 and lower through `lowerShift`. Bitwise
-    // (audit-residue sweep c1, D-AUDIT-BITWISE-UNWALL-WITNESS): And/Or
-    // are ENCODED end-to-end on BOTH targets (x86 21/09 reg-reg at
+    // (audit-residue sweep c1): And/Or are ENCODED end-to-end on BOTH
+    // targets (x86 21/09 reg-reg at
     // widths 64+32 since FC3.5 sweep-c2 — added for the composed-FCmp
     // materialization, which also un-walled source-level `&`/`|`;
     // arm64 AND/ORR X-form, width-absent variants) — witnessed by
@@ -8425,7 +8425,7 @@ struct Lowerer {
     // emits 7 bytes into the function body as a dead def; regalloc
     // handles the dead vreg, but the bytes remain in the binary.
     // Dead-LEA elimination for direct-call-only GlobalAddrs is
-    // anchored at D-ML7-2.9 (carried forward from the prior `mov`
+    // anchored at D-PLAN12-CLOSED-2026-C50-DEAD-CALLEE-ADDRESS-LEA-SUPPRESSED (carried forward from the prior `mov`
     // shape — same elimination opportunity, same trigger).
     //
     // Pre-D-LK4-RODATA-PRODUCER shape was `mov result, SymbolRef`,
@@ -8558,7 +8558,7 @@ struct Lowerer {
         return false;
     }
 
-    // D-ML7-2.9: the SOLE consumer of this GlobalAddr is a DIRECT call's CALLEE
+    // D-PLAN12-CLOSED-2026-C50-DEAD-CALLEE-ADDRESS-LEA-SUPPRESSED: the SOLE consumer of this GlobalAddr is a DIRECT call's CALLEE
     // slot (operand[0] of a `Call`). `lowerCall` folds the callee's SymbolId
     // straight into a direct branch (x86 `call rel32` / arm64 `bl` CALL26 + the
     // undefined-extern reloc) and NEVER reads this GlobalAddr's LEA vreg — so the
@@ -8930,7 +8930,7 @@ struct Lowerer {
         emitInst(*loadOp, idxReg, idxLoadOps,
                  /*payload=*/0, /*flags=*/kLirInstFlagWidth32);
         // Step 3 — load THIS module's TLS block base: [tp + index*8].
-        // The existing scale-8 SIB indexed-load form (D-AS4-5); width 64
+        // The existing scale-8 SIB indexed-load form (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL); width 64
         // (a pointer). tp is the array base, index the module ordinal,
         // scale 8 = sizeof(void*).
         LirReg const blockReg = lir.newVReg(LirRegClass::GPR);
@@ -8992,7 +8992,7 @@ struct Lowerer {
             foldedGlobalAddrs_.insert(id.v);
             return;
         }
-        // D-ML7-2.9: the sole consumer is a DIRECT call's callee slot —
+        // D-PLAN12-CLOSED-2026-C50-DEAD-CALLEE-ADDRESS-LEA-SUPPRESSED: the sole consumer is a DIRECT call's callee slot —
         // `lowerCall` folds the symbol straight into the direct branch and never
         // reads this lea's vreg, so emit NO lea (dead on every target; on arm64
         // the absolute adrp+add against an undefined extern would also break a
@@ -9658,7 +9658,7 @@ struct Lowerer {
                      kLirInstFlagWidth128);
         }
 
-        // D-LANG-VARIADIC (step 13.4): forward the MIR Call's variadic-payload
+        // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): forward the MIR Call's variadic-payload
         // bits (isVariadic + fixedOperandCount) to the LIR Call so the post-
         // regalloc ML7 materialize pass can emit the platform's variadic-call
         // setup. Non-variadic calls keep payload=0.
@@ -10579,7 +10579,7 @@ struct Lowerer {
     // pre-coloring mechanism exists (call results use an explicit
     // post-regalloc mov in `materializeOneFunc`), and building one
     // for a perf-only delta would speculatively erect the deferred
-    // D-ML7-2.5 substrate.
+    // D-PLAN12-REGALLOC-PRE-COLORING-HINT-FOR-ARG-CALL-ARG substrate.
     //
     // **Cycle 10r split rationale** (preserved) — cycle 10q packaged
     // CQO+IDIV into a single compound op with opcode bytes `[0x48,
@@ -12568,10 +12568,90 @@ struct Lowerer {
         reporter.report(std::move(d));
     }
 
-    // MIR ICmp{Eq,Ne,Slt,...} → LIR `cmp` + `setcc(cond)` pair. Naive
-    // (no peephole with subsequent CondBr); the optimizer's compare-flag
-    // forwarding pass will collapse `cmp/setcc/cmp 0/jcc-ne` to
-    // `cmp/jcc-cond` once a use-count analysis lands.
+    // ★★★ D-LIR-SETCC-DEAD-AFTER-FUSION — THE ONE OWNER OF "WILL THE BRANCH
+    // RE-DERIVE THIS FLOAT COMPARE FOR ITSELF?".
+    //
+    // `lowerCondBr` fuses an FCmp+CondBr pair by RE-EMITTING the float compare
+    // at the branch and branching on its flags directly. Whether it may do so
+    // is a CAPABILITY question with three independent clauses, and this
+    // function is the only place they are spelled. Both the fusion site and
+    // the materialization gate below ask it, because a disagreement between
+    // the two is precisely the failure this predicate exists to make
+    // impossible: the gate declining to materialize a Bool the branch then
+    // wants would leave `regForValue` reading a never-defined vreg.
+    //
+    // ⚠ That disagreement is FAIL-LOUD, not silent — `regForValue` reports
+    // `L_UnsupportedLoweringForOpcode` on an undefined value — which is the
+    // same guarantee `foldedGlobalAddrs_` rests on. One owner makes it
+    // unreachable; the loud failure is the second line, not the first.
+    [[nodiscard]] bool floatCompareFusesIntoBranch(MirInstId cmpInst,
+                                                   MirOpcode cmpOp) const {
+        // A composed predicate (x86 Oeq/Une, arm64 One) has no single
+        // condition code: `floatCmpPlan` still yields a plan, but the
+        // `condCodeEncoding` clause below refuses it.
+        auto const plan = floatCmpPlan(cmpOp);
+        if (!plan.has_value()) return false;
+        auto const ops = mir.instOperands(cmpInst);
+        if (ops.size() != 2) return false;
+        TypeKind const kind = interner.kind(mir.instType(ops[0]));
+        // LD-3: a binary128 compare is a CALL to a softfloat helper, so fusing
+        // would call it a SECOND time. F128 takes the non-fused arm on purpose
+        // and therefore NEEDS its materialized Bool.
+        if (kind == TypeKind::F128) return false;
+        bool const haveCompare =
+            (kind == TypeKind::F80) ? opcode(MnemonicSlot::FucomiP).has_value()
+                                    : opcode(MnemonicSlot::FCmp).has_value();
+        return haveCompare && target.condCodeEncoding(plan->single).has_value();
+    }
+
+    // ★★★ D-LIR-SETCC-DEAD-AFTER-FUSION — THE USE-COUNT GATE.
+    //
+    // True iff this compare's Bool result is read by EXACTLY ONE instruction
+    // and that instruction is a CondBr which will FUSE it. In that shape the
+    // `cmp → setcc → zext` trio the materialization emits has NO LIR consumer
+    // whatever: the branch re-derives the flags from the compare's own
+    // operands, so the trio is written, allocated a register, encoded, and
+    // executed for nothing. ✔MEASURED 2026-09-16 on x86_64:pe64, before this
+    // gate existed, every `if` and every `while` carried all three to
+    // post-callconv.
+    //
+    // ★★★ IT IS A USE COUNT, NOT A MNEMONIC PATTERN, AND THAT IS THE WHOLE
+    // CORRECTNESS ARGUMENT. The fusion does NOT consume the Bool — it ignores
+    // it — so a SECOND consumer (a stored bool, a returned bool, a ternary, a
+    // phi) leaves the trio genuinely LIVE while the branch still fuses. A rule
+    // keyed on `setcc` would delete it in exactly that case
+    // (D-LIR-FUSION-USE-COUNT-GATE). `count == 1` is what makes the two
+    // indistinguishable-by-mnemonic shapes distinguishable at all, and the
+    // census it reads (`computeValueUses`) counts `instOperands` AND
+    // `phiIncomings`, so a phi-read Bool is not silently under-counted.
+    //
+    // ⚠ A compare with ZERO uses is NOT elided here. It cannot occur in
+    // optimized MIR (the MIR DCE takes it) and admitting it would widen this
+    // gate from "somebody else re-derives it" to "nobody wants it" — a
+    // different claim, resting on the census being the only read channel
+    // rather than on the branch's own re-emission. The narrow claim is the one
+    // this gate can prove.
+    [[nodiscard]] bool compareIsFusedOnly(MirInstId cmpInst) const {
+        auto const it = mirValueUses_.find(cmpInst.v);
+        if (it == mirValueUses_.end() || it->second.count != 1) return false;
+        MirInstId const user = it->second.user;
+        if (!user.valid() || mir.instOpcode(user) != MirOpcode::CondBr) {
+            return false;
+        }
+        // A CondBr carries exactly ONE operand — its condition — so a CondBr
+        // that reads this value reads it AS the condition. `lowerCondBr`
+        // refuses any other arity before it fuses anything.
+        if (mir.instOperands(user).size() != 1) return false;
+        MirOpcode const cmpOp = mir.instOpcode(cmpInst);
+        // The INTEGER arm fuses unconditionally: `lowerCondBr` takes it
+        // whenever `condCodeForICmp` yields a code, which is the same
+        // condition under which `lowerInst` routed here at all.
+        if (condCodeForICmp(cmpOp).has_value()) return true;
+        return floatCompareFusesIntoBranch(cmpInst, cmpOp);
+    }
+
+    // MIR ICmp{Eq,Ne,Slt,...} → LIR `cmp` + `setcc(cond)` + `zext`, unless the
+    // use-count gate above proves the branch re-derives the flags itself.
     void lowerICmp(MirInstId id, TargetCondCode cond) {
         if (!opcode(MnemonicSlot::Cmp).has_value()) {
             reportMissingOpcode(MnemonicSlot::Cmp, "MIR ICmp");
@@ -12590,6 +12670,14 @@ struct Lowerer {
             reportUnsupported(mir.instOpcode(id), id);
             return;
         }
+        // ★ D-LIR-SETCC-DEAD-AFTER-FUSION: nothing reads this Bool but the
+        // branch that will re-derive it, so emit NOTHING and define no value.
+        // Placed AFTER the opcode-presence and arity checks so every
+        // diagnostic this lowering used to report still reports — the gate
+        // removes instructions, never a refusal. The two operands are not
+        // resolved here either: the fused arm resolves the SAME two, so an
+        // unresolvable operand still surfaces there.
+        if (compareIsFusedOnly(id)) return;
         std::optional<LirReg> const a = regForValue(operands[0]);
         std::optional<LirReg> const b = regForValue(operands[1]);
         if (!a.has_value() || !b.has_value()) return;
@@ -12614,12 +12702,28 @@ struct Lowerer {
         // zext makes the zero-extend a first-class LIR operation
         // so the result is always a CLEAN 0/1 r64 — `cmp r64, 0`
         // / `cmp r64, r64` consumers downstream cannot read garbage.
-        // The ICmp+CondBr fusion at `lowerCondBr` still elides the
-        // cmp-against-0 (the setcc + zext become "dead" via
-        // D-LIR-SETCC-DEAD-AFTER-FUSION DCE in 13.6), but non-adjacent
-        // ICmp uses (bool stored, bool returned, bool ternary) now
-        // get correct width semantics for free. Clean SSA: setcc
-        // defines `b8`; zext consumes `b8` AND defines `result`.
+        // The ICmp+CondBr fusion at `lowerCondBr` elides the
+        // cmp-against-0; reaching this point at all means the
+        // use-count gate above proved somebody OTHER than a fusing
+        // branch reads this Bool (bool stored, bool returned, bool
+        // ternary, bool into a phi), and those uses get correct width
+        // semantics for free. Clean SSA: setcc defines `b8`; zext
+        // consumes `b8` AND defines `result`.
+        // ⚠ THE PARAGRAPH THAT STOOD HERE PREDICTED A PASS THAT NEVER
+        // ARRIVED AND COULD NOT HAVE. It said the setcc+zext "become
+        // dead via D-LIR-SETCC-DEAD-AFTER-FUSION DCE in 13.6" —
+        // deferring the cleanup to `lir_peephole`. ✔MEASURED
+        // 2026-09-16: that pass runs POST-REGALLOC (between
+        // `legalizeTwoAddress` and `materializeCallingConvention`), by
+        // which point `rewriteWithAllocation` has replaced every vreg
+        // with a physical register and `verifyLirPostRegalloc` refuses
+        // any survivor — so a "result vreg has no remaining use" rule
+        // is VACUOUS there, and its physical-register form is UNSOUND:
+        // `lowerReturn`'s F128 arm writes the ABI return register with
+        // no LIR consumer at all, and a use count would delete it. The
+        // deadness is created HERE, by the fusion, and the only tier
+        // that can both observe it and still name virtual registers is
+        // this one.
         LirReg const b8 = lir.newVReg(LirRegClass::GPR);
         emitInst(*opcode(MnemonicSlot::Setcc), b8, std::span<LirOperand const>{},
                     /*payload=*/static_cast<std::uint32_t>(cond));
@@ -12688,6 +12792,11 @@ struct Lowerer {
             poisonValue(id);
             return;
         }
+        // ★ D-LIR-SETCC-DEAD-AFTER-FUSION, the float half. Same gate, same
+        // owner: only a predicate the branch can realize as ONE condition code
+        // fuses, so a composed predicate and an F128 pair both fail the gate
+        // here and keep the Bool they are about to branch on.
+        if (compareIsFusedOnly(id)) return;
         // The compare's realization + encoded width follow the OPERANDS' float
         // type (the result is Bool); post-UAC both operands carry the same
         // type, so operand 0 is authoritative (the lowerICmp rule).
@@ -13484,10 +13593,16 @@ struct Lowerer {
         // garbage upper 56 bits of setcc's r8 result and trip the
         // branch the wrong way) with a single fused `cmp lhs, rhs;
         // jcc-cond` using the ICmp's args and condition directly.
-        // The setcc emitted by lowerICmp becomes dead code (its
-        // result has no LIR consumer in this fused path); a future
-        // dead-LIR-instruction-elimination pass anchored
-        // D-LIR-SETCC-DEAD-AFTER-FUSION removes the wasted bytes.
+        // ★ The Bool this branch fuses over is NOT emitted at all when
+        // nothing else reads it — `compareIsFusedOnly`, the use-count
+        // gate `lowerICmp` / `lowerFCmp` consult
+        // (D-LIR-SETCC-DEAD-AFTER-FUSION). It used to be emitted and
+        // left dead: a whole `cmp → setcc → zext` trio per fused
+        // compare, written, register-allocated and encoded for a
+        // result with no LIR consumer. A SECOND consumer makes the
+        // trio live again, the gate sees `count != 1`, and the
+        // materialization happens exactly as before — which is why the
+        // gate counts uses instead of matching the mnemonic.
         // This pre-empts the optimizer fusion (planned at 13.6)
         // because the substrate would otherwise be load-bearing
         // broken for every `if/while` until then.
@@ -13529,14 +13644,14 @@ struct Lowerer {
                 fcmpOperandKind = interner.kind(mir.instType(fcmpOps[0]));
             }
         }
-        bool const fuseFloat =
-            floatPlan.has_value()
-            && fcmpOperandKind.has_value()
-            && *fcmpOperandKind != TypeKind::F128
-            && (*fcmpOperandKind == TypeKind::F80
-                    ? opcode(MnemonicSlot::FucomiP).has_value()
-                    : opcode(MnemonicSlot::FCmp).has_value())
-            && target.condCodeEncoding(floatPlan->single).has_value();
+        // ★★★ ONE OWNER (D-LIR-SETCC-DEAD-AFTER-FUSION). The four clauses that
+        // used to be spelled inline here now live in
+        // `floatCompareFusesIntoBranch`, because `lowerFCmp`'s
+        // materialization gate has to ask the IDENTICAL question: it declines
+        // to materialize the Bool precisely when this returns true, so a
+        // second, separately-maintained copy of the test is a Bool that
+        // nobody emits and this arm then declines to fuse.
+        bool const fuseFloat = floatCompareFusesIntoBranch(condInst, condOp);
         TargetCondCode jccCond;
         if (fuseFloat) {
             auto const fcmpOperands = mir.instOperands(condInst);
@@ -13571,8 +13686,8 @@ struct Lowerer {
             // FC3 c2: the fused compare's width follows the ICmp
             // OPERANDS' type — the same rule as lowerICmp's cmp
             // (D-CSUBSET-32BIT-ALU-FORMS). Pinned (audit-residue sweep
-            // c1, D-AUDIT-FUSED-CMP-WIDTH-PIN): the Fused{I32,I64}…
-            // width pins in tests/lir/test_mir_to_lir.cpp + the
+            // c1): the Fused{I32,I64}… width pins in
+            // tests/lir/test_mir_to_lir.cpp + the
             // examples/c/fused_negative_compare runtime witness
             // (width-64 here flips its exit 42 → 7: a zero-extended
             // negative I32 reads as positive).

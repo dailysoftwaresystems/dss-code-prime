@@ -92,7 +92,7 @@
 #   findings [[feedback-a-vacuous-skip-and-a-misnamed-red]].
 # ★ THE PROBE IS BY EXECUTION, NEVER BY LOOKUP (`lane_worktree_powershell`), AND WHAT IT
 #   RUNS IS THE SUBJECT ITSELF. `command -v` is documented IN THIS REPOSITORY to LIE over a
-#   non-interactive ssh session on the macOS carriage (`scripts/remote-leg/remote-leg.sh`
+#   non-interactive ssh session on the macOS carriage (the retired remote leg driver
 #   carries that measurement), and a lookup also fails the other way -- naming an interpreter
 #   that cannot start. The probe requires `lane-worktree.ps1`'s OWN usage line back, so an
 #   interpreter that runs but cannot open or parse the subject is ABSENT, not present.

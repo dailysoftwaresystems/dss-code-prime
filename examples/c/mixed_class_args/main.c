@@ -1,4 +1,4 @@
-/* D-ML7-2.10 (fixed via FC7 C1b per-class Arg ordinals): a function with MIXED
+/* D-PLAN12-CLOSED-2026-FC7-C1B-COMMIT-B7F547D-FIXED-VIA (fixed via FC7 C1b per-class Arg ordinals): a function with MIXED
  * integer + floating-point parameters must place each in the right register of
  * its OWN class under SysV — the double in xmm0 (FPR ordinal 0), the two ints in
  * rdi/rsi (GPR ordinals 0,1). The pre-fix global counter used the param index as

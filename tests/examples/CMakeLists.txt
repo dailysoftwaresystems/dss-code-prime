@@ -10,7 +10,7 @@
 # parallelism across examples.
 #
 # ── WORKING DIRECTORY: PER BUILD TREE, NEVER THE CHECKOUT ROOT ───────────────
-#   D-TEST-EXAMPLES-CORPUS-SCRATCH-IS-SHARED-BY-EVERY-BUILD-TREE
+#   THE CORPUS SCRATCH TREE USED TO BE SHARED BY EVERY BUILD TREE.
 #
 # ★★★ THIS BLOCK USED TO SAY THE OPPOSITE, AND ITS REASON HAD EXPIRED.
 # It read: "the runner uses `ScratchDir(InsideRepo) + useAsCwd()`. ScratchDir
@@ -44,7 +44,7 @@
 # ⚠ THE COLLISION IS NOT WHAT MAKES THIS WRONG, AND SAYING SO IS THE POINT.
 # `ScratchDir`'s ctor claims its slot with `create_directory` (SINGULAR), which
 # is atomic in the OS, so two concurrent processes CANNOT end up in one
-# directory — that was `D-TEST-EXAMPLES-RUNNER-PARALLEL-CONTENTION-FLAKE` and it
+# directory — that was the runner's parallel-contention flake and it
 # is closed. ✔MEASURED here: two full 1347-entry corpus runs at `ctest -j 6`,
 # 0 reds. So this change fixes a SHARED-LOCATION defect, not a flake, and a
 # reader must not come away thinking the flake was re-found. What it removes is
@@ -53,7 +53,7 @@
 # ⇒ `${CMAKE_CURRENT_BINARY_DIR}` — the same cwd `dss_add_test` gives every other
 # entry in the suite. The scratch tree becomes
 # `<build>/tests/examples/test-scratch/examples/<pid>-<n>`: isolated per build
-# tree by construction, and it dies with `local-build.sh --clean` instead of
+# tree by construction, and it dies with the build directory instead of
 # accumulating in the source tree.
 #
 # ⚠ WINDOWS PATH BUDGET, MEASURED rather than assumed (the runtime object cache
@@ -90,8 +90,8 @@ target_include_directories(dss_examples_runner
 # nlohmann_json include dir on this target is additive and does not affect the
 # precompiled STL/gtest set.
 #
-# ★ GUARDED 2026-08-03 (TF-C112), D-BUILD-PCH-REUSE-FROM-UNGUARDED-IN-DEBUG — the
-# SECOND of the two unguarded REUSE_FROM sites (the other is tests/CMakeLists.txt).
+# ★ GUARDED 2026-08-03 (TF-C112) — this was the SECOND of the two unguarded
+# REUSE_FROM sites in Debug (the other is tests/CMakeLists.txt).
 # This comment previously ended "No-op in Debug (PCH disabled)", which was FALSE and
 # is the reason both sites survived review: a CONSUMER `REUSE_FROM` call is NOT a
 # no-op when CMAKE_DISABLE_PRECOMPILE_HEADERS is set — it warns, once per emission,
@@ -131,17 +131,17 @@ target_compile_definitions(dss_examples_runner PRIVATE
     DSS_TEST_REPO_ROOT="${CMAKE_SOURCE_DIR}")
 
 # ★★ THE GLOB MOVED TO THE ROOT `CMakeLists.txt` AND THIS FILE NOW READS IT.
-# D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-ONE-THREAD gave the CLI-
-# subprocess sibling per-example ctest entries too, so BOTH harnesses derive
+# The CLI-subprocess sibling used to walk every example in ONE thread; giving it
+# per-example ctest entries too means BOTH harnesses derive
 # their entry set from the corpus. Two independent globs would let them
 # enumerate different corpora while both stayed green — the
-# [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]] divergence in its most basic
+# TWO RUNNERS MUST AGREE divergence in its most basic
 # form. One glob, hoisted, read here and in `integrated_tests/CMakeLists.txt`;
 # the root also REFUSES a collapsed result, which this file could not do alone
 # because a collapse looks identical to a small corpus from inside one consumer.
 set(EXAMPLE_MANIFESTS ${DSS_EXAMPLE_MANIFESTS})
 
-# D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR: the corpus emulator lint is a
+# THE MANIFEST ARM64 ARM WITHOUT AN EMULATOR: the corpus emulator lint is a
 # CORPUS-wide question with one corpus-wide answer, so it is ONE entry, not 611
 # (✔RE-MEASURED 2026-08-20; this line said 558, which was true when it was
 # written and has been wrong by 53 since - a raw count of a growing corpus is a
@@ -155,8 +155,8 @@ set(EXAMPLE_MANIFESTS ${DSS_EXAMPLE_MANIFESTS})
 # `[  PASSED  ] 0 tests.` plus a WARNING and returns **rc=0**. So a typo in a
 # GTest name — in this file, in a rename, anywhere — buys a permanently GREEN
 # ctest entry that asserts nothing, which is precisely the vacuous-coverage class
-# `D-TEST-EXAMPLES-CORPUS-LINT-ENTRY-SELECTS-ONE-TEST-NOT-THE-SUITE` was opened
-# for. The pair list makes the STRUCTURE safe; this makes the STRING safe.
+# the lint entry below fell into when it selected ONE test instead of the suite.
+# The pair list makes the STRUCTURE safe; this makes the STRING safe.
 #
 # ⚠ It is a ctest property and not a gtest flag on purpose: this googletest has
 # `--gtest_fail_if_no_test_linked` (nothing linked at all) but NO flag for
@@ -183,7 +183,7 @@ set(EXAMPLES_LINT_SUITE "ExamplesCorpusLint")
 # `examples/manifest-emulator-lint` would have gone looking at manifests and
 # qemu for a failure in a filesystem walk.
 #
-# ★★★ D-TEST-EXAMPLES-CORPUS-LINT-ENTRY-SELECTS-ONE-TEST-NOT-THE-SUITE — AND THE
+# ★★★ THE LINT ENTRY SELECTED ONE TEST, NOT THE SUITE — AND THE
 # PARAGRAPH ABOVE IS WHY THIS WAS NOT NOTICED FOR THIRTEEN CYCLES. It says the
 # filter selects the WHOLE suite. ✔MEASURED 2026-08-20: it named exactly ONE
 # test, so of the **8** lints defined that day **2** were selected and **6** were
@@ -205,15 +205,16 @@ set(EXAMPLES_LINT_SUITE "ExamplesCorpusLint")
 # hand-written filter and a hand-written `add_test` did. ⚠ Do NOT "simplify"
 # this back into two literal filters: the literal form is what failed, and it
 # failed silently, in the direction that greens the gate.
-# ⚠ THE OLD NAME IS CITED AS LANDED EVIDENCE by the CLOSED registry row
-# `D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR` above. That citation was
-# ANNOTATED with this rename rather than rewritten — a closed row records what
-# was true when it closed, and silently editing its evidence to match today's
-# tree is how an audit trail stops being one. Anything else naming this entry
-# must move WITH it; ✔MEASURED at the rename, the repo-wide citations were this
-# file, `tests/examples/examples_runner.cpp` (x2) and that one registry row.
+# ⚠ THE OLD NAME WAS ALSO CITED AS LANDED EVIDENCE BY A CLOSED REGISTRY ROW, and
+# that citation was ANNOTATED with this rename rather than rewritten — a closed
+# row records what was true when it closed, and silently editing its evidence to
+# match today's tree is how an audit trail stops being one. That row lived in the
+# harness anchor registry, which has since been retired, so the registry is no
+# longer one of the places a renamer has to visit. Anything else naming this
+# entry must move WITH it; ✔MEASURED at the rename, the repo-wide citations were
+# this file, `tests/examples/examples_runner.cpp` (x2) and that one row.
 # ⚠ ✔RE-MEASURED 2026-08-20: the set has GROWN — this file names the entry at 4
-# sites and `examples_runner.cpp` at 4, plus the registry. The figure above is
+# sites and `examples_runner.cpp` at 4, plus that row. The figure above is
 # history, correct for its date; the number a future renamer must act on is the
 # one they measure themselves. Do not read a dated count as a current one.
 
@@ -227,7 +228,7 @@ foreach(MANIFEST ${EXAMPLE_MANIFESTS})
              COMMAND dss_examples_runner ${EXAMPLE_DIR}
                      --gtest_filter=-${EXAMPLES_LINT_SUITE}.*
              WORKING_DIRECTORY ${DSS_EXAMPLES_ENTRY_CWD})
-    # D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED.
+    # THE LIVE-TREE CONFIG EXPOSURE WAS UNFIXED OUTSIDE THE ONE SUITE THAT FLAKED.
     # ★ These entries carried NO `DSS_CONFIG_ROOT` at all: the runner's
     # `ScratchDir(InsideRepo) + useAsCwd()` put the cwd under the repo, so every
     # compile in every one of them resolved shipped config by the ancestor walk

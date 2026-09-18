@@ -596,7 +596,6 @@ namespace {
 }
 
 [[nodiscard]] std::string readFile(fs::path const& p) {
-    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
     // `std::abort()` here killed the whole binary, so one unreadable golden
     // cost every sibling test its verdict. THROW -- GoogleTest reports an
     // escaping exception as a failure of the ONE running test. The read itself

@@ -10,7 +10,7 @@
 //
 // End-to-end substrate exercised by this example:
 //
-//   * D-ML7-2.2 stack-passed args (step 13.1) — WriteFile is a 5-arg
+//   * D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 stack-passed args (step 13.1) — WriteFile is a 5-arg
 //     call; Win64 ms_x64 passes args 1-4 in RCX/RDX/R8/R9 and arg 5
 //     (`lpOverlapped`) on the stack.
 //

@@ -38,21 +38,26 @@ deferral is the rare exception that must earn its place, not the convenient way 
    - `.plans/_deferred-anchor-registry-production.md` — a still-open defect **a user of the
      compiler could hit**, in the shipped binary or in the config it reads. ★ This is the file
      the burndown works from, ALWAYS (operator, 2026-08-25).
-   - `.plans/_deferred-anchor-registry-harness.md` — a still-open defect **only we can hit**:
-     tests, gates, guards, cycle machinery, plans, scripts, carriages, CI. ⚠ Fix a harness defect
-     the moment you FACE it, in that cycle; this file is a RECORD, not a backlog to schedule from.
    - `.plans/_deferred-anchor-registry-done.md` — the ARCHIVE (operator, 2026-09-01). Every CLOSED
-     row, in two tables that preserve which working list it came from. **Nothing here is work, and
-     you never file INTO it directly** — a row arrives by being closed.
+     row, in one table. **Nothing here is work, and you never file INTO it directly** — a row
+     arrives by being closed.
+   - ⚠ **There is no harness registry.** It retired on 2026-09-16 with the move to `DssHarness`:
+     a defect in the harness is that tool's to fix, and a defect in this repository's own build
+     wiring, tests or plans is a production row like any other. The rule it carried has not
+     changed — fix a harness defect the moment you FACE it, never later.
    ⚠ A row's bucket follows the **DEFECT**, never the instrument that found it. `D-CONFIG-*` and
    `D-DIAG-*` are PRODUCTION deliberately — a config document IS the compiler's behaviour here,
    and a diagnostic IS its output to a user.
 
    **The schema is SIX cells:** `| Anchor | Priority | Status | Trigger | Closing work | Cross-refs |`
-   — `Priority` is `P0`..`P5`, `Status` is `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED`.
+   — `Priority` is `P0`..`P5`, `Status` is `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` /
+   `🔵 🟠 OPEN (DISCLOSED)`. The last one is **OPEN WORK** whose debt PRE-DATES this cycle: it
+   counts in every total and is exempt only from the balance gate's net-increase refusal, so
+   writing up a defect you merely FOUND is not punished like shipping a new deferral. The claim
+   is checkable against the base ref — never use it for a defect this cycle introduced.
    ⚠⚠ **DO NOT HAND-WRITE THE ROW.** Use the writer, which takes the FIELDS:
 
-       bash scripts/anchors/write-anchor.sh --production D-<AREA>-<NAME> \
+       DssHarness write-anchor D-<AREA>-<NAME> \
             --priority P1 --status open --trigger '...' --closing '...' --cross-refs '...' \
             --insert --apply
 
@@ -64,7 +69,7 @@ deferral is the rare exception that must earn its place, not the convenient way 
 2b. **CLOSING IS A MOVE, NOT AN EDIT** (operator, 2026-09-01: *"always delete a done item and put
    into `_deferred-anchor-registry-done.md` once finished"*):
 
-       bash scripts/anchors/set-anchor.sh D-<AREA>-<NAME> --status closed --closing '...' --apply
+       DssHarness set-anchor D-<AREA>-<NAME> --status closed --closing '...'
 
    `set-anchor` patches only the fields you name, preserves the rest byte-for-byte, deletes the row
    from its working registry and appends it to the archive's matching table. Reopening (`--status
@@ -90,14 +95,25 @@ deferral is the rare exception that must earn its place, not the convenient way 
 | **Handoff — read at Step 0, rewritten at Step 8.1** | `.plans/_handoff.md` — ①where we are ②where we need to get ③priorities ④concurrent branches/PRs (rebase surface) ⑤timeline (accumulates) |
 | Open PRs / rebase surface | `gh pr list --state open` · `gh pr view <n> --json files` (Step 8.2) |
 | Priority spine | `.plans/00-compiler-implementation-plan - tbd.md` §0.1 |
-| Deferral registry — WORKING (what is LEFT) | `.plans/_deferred-anchor-registry-{production,harness}.md` |
+| Deferral registry — WORKING (what is LEFT) | `.plans/_deferred-anchor-registry-production.md` — the only working registry since 2026-09-16 |
 | Deferral registry — ARCHIVE (closed; never read to ORIENT) | `.plans/_deferred-anchor-registry-done.md` |
-| Read ONE anchor, in full | `bash scripts/anchors/read-anchor.sh <ANCHOR>` (`.ps1` twin on Windows) |
-| List anchors — name, priority, status | `bash scripts/anchors/read-anchors.sh --production [--band P0]` |
-| Write a NEW row from fields | `bash scripts/anchors/write-anchor.sh --production <ANCHOR> --trigger '...' --insert --apply` |
-| Change a row — **closing MOVES it to the archive** | `bash scripts/anchors/set-anchor.sh <ANCHOR> --status closed --apply` |
+| Read ONE anchor, in full | `DssHarness read-anchor <ANCHOR>` — one command on every host |
+| List anchors — name, priority, status | `DssHarness read-anchors --pending [--band P0]` |
+| Write a NEW row from fields | `DssHarness write-anchor <ANCHOR> --trigger '...' --closing '...'` — ⚠ it WRITES; `--anchor-dry-run` is how you look first |
+| Change a row — **closing MOVES it to the archive** | `DssHarness set-anchor <ANCHOR> --status closed --closing '...'` — ⚠ it WRITES |
 | Apply a lane's VERBATIM row file | `python scripts/apply-registry-row/apply-registry-row.py <working-registry> <ANCHOR> <row-file> --apply` |
-| Lint every row a reader cannot key on | `bash scripts/anchors/read-anchors.sh --lint` |
+| Lint every row a reader cannot key on | `DssHarness read-anchors --lint` |
+
+⛔⛔ **THE DEFAULT INVERTED WHEN THE DOOR MOVED, AND A COPIED IDIOM NOW WRITES.** The retired
+`scripts/anchors/*-anchor.{sh,ps1}` twins DRY-RAN unless given `--apply`; `DssHarness write-anchor`
+and `set-anchor` **WRITE unless given `--anchor-dry-run`**. So the one habit that used to be safe —
+leaving `--apply` off to see what would happen — now lands the change. ✔MEASURED 2026-09-17:
+`DssHarness set-anchor <ID> --priority P2 --anchor-dry-run` answers *"dry run: … would be updated in
+the pending registry; nothing was written"*, exit 0, and `git status` is clean afterwards.
+ⓘ `--production` is gone with the twins: the registry a row lands in is decided by its STATUS, and
+`--pending` / `--done` narrow a LISTING. Every field also has a `--<field>-file` form, which is how
+a multi-line cell reaches the tool without a shell quoting it.
+
 | Anchor balance gate | `python scripts/check-anchor-balance/check-anchor-balance.py` |
 | Per-cycle plan | `/feature-dev:feature-dev` (Step 3) |
 | Plan-lock design audit | independent `dss-audit` lens on the plan, pre-build (Step 3.5) |

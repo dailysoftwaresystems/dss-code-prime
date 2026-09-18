@@ -131,7 +131,7 @@ TEST(LspServerE2E, DidOpenPublishesDiagnosticsForToySource) {
     EXPECT_EQ(params.at("version"), 1);
     auto const& diags = params.at("diagnostics");
     ASSERT_TRUE(diags.is_array());
-    // [[D-TEST-LSP-E2E-SEGFAULTS-RATHER-THAN-FAILING-LOUD]]
+    // THIS SUITE ONCE SEGFAULTED RATHER THAN FAILING LOUD.
     // ASSERT, not EXPECT. `nlohmann::json::operator[](size_type) const`
     // forwards straight to `std::vector::operator[]` with NO bounds check, so
     // the `diags[0]` below on an empty array reads a null reference and takes

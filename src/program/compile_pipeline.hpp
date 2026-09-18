@@ -62,7 +62,6 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 
 // ═══════════════════════════════════════════════════════════════════════════
 // WHICH ARGUMENTS THE **DRIVER** MUST SUPPLY — and where each one is witnessed
-// (D-TEST-STATIC-LINK-UNIT-SUITE-CANNOT-WITNESS-A-DRIVER-THREADING-GAP)
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // ★★★ WHY THIS BLOCK EXISTS. Every entry point below has thorough unit
@@ -189,7 +188,7 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 //   `callingConventionIndex`, resolved by `dss::ffi::resolveAbi` and turned into
 //   an ordinal by pointer distance. ✔MEASURED: `x86_64.target.json` declares
 //   `sysv_amd64` at ordinal 0 and `ms_x64` at 1, so the literal `0` compiles and
-//   silently emits SysV register assignments on pe64 — `D-FF3-3`, exactly.
+//   silently emits SysV register assignments on pe64 — `D-FF3-3-RESOLVED-CC-INDEX-THREADED`, exactly.
 //   PINNED by `program/test_entry_argv_run`
 //   `EntryArgvRun.RealCommandLineReachesMainByteExact`: a real `CreateProcess`
 //   command line into `main(int, char**)`, which reads rcx/rdx under MS_x64 and
@@ -376,7 +375,7 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // ✔MEASURED — the merged route is reachable ONLY through
 // `Program::compileUnits` with ≥2 sources, and
 // <!--census:examples:top.sources-->30 of the
-// <!--census:examples:manifests-->841 shipped corpus example manifests declare a
+// <!--census:examples:manifests-->844 shipped corpus example manifests declare a
 // multi-source `sources` array, so the corpus exercises it roughly 3% as often
 // as the single-CU route.
 // ⚠ THE RATIO IS THE ONE FIGURE HERE THAT IS **NOT** MACHINE-CHECKED — a census
@@ -492,7 +491,7 @@ effectiveUnnamedBitFieldAlignment(TargetSchema const&       target,
 // `callingConventionIndex` is the per-(target, format) cc ordinal
 // resolved by `dss::ffi::resolveAbi` in the driver before reaching
 // this kernel. Threaded through to the LIR allocator so prologue/
-// epilogue emission picks the correct cc table row. Pre-D-FF3-3
+// epilogue emission picks the correct cc table row. Pre-D-FF3-3-RESOLVED-CC-INDEX-THREADED
 // every compile silently used index 0 — a real miscompile on
 // non-default-cc targets (PE64 + x86_64 silently emitted SysV
 // register assignments instead of MS_x64).

@@ -35,7 +35,7 @@
 #     afterwards.
 #
 # ★ WHAT IT DELIBERATELY DOES NOT DO: it does not move bytes.  The carriage is
-# `scripts/ssh-macos/`, `scripts/ssh-arm64-vps/` or a plain filesystem copy, and
+# `dssharness host-exec --ssh <host>`, `dssharness sync` or a plain filesystem copy, and
 # each already handles its own host's quoting, keys and rsync contract.  A
 # second transport here would be a fourth spelling of something that exists.
 #

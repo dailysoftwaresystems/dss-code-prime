@@ -695,18 +695,21 @@ TEST(MachOCodeSignPlaceholder, ShippedX86DarwinExecEmitsAdHocSignature) {
 // D-LK-MACHO-ADHOC-SIGNATURE-DROPPED-ON-STATIC-ARM — the REGISTERED id, read
 // back from .plans/_deferred-anchor-registry*.md rather than restated from
 // memory. ⚠ This comment used to CARRY the withdrawn "proposed anchor"
-// spelling, and said the guard could not catch that because it scanned src/,
-// examples/ and real-examples/, never tests/. Both halves were right, and it
-// stayed right for twelve days. The guard now scans tests/ and
-// integrated_tests/, which is how the dead spelling was finally found —
-// D-GATE-ANCHOR-GUARD-DOES-NOT-SCAN-INTEGRATED-TESTS.
+// spelling, and said the citation guard could not catch that because it scanned
+// src/, examples/ and real-examples/, never tests/. Both halves were right, and
+// it stayed right for twelve days — until the guard was widened over tests/ and
+// integrated_tests/ and the dead spelling was finally found.
+// ⚠ THE SCAN ROOTS HAVE SINCE NARROWED AGAIN and no longer include tests/, so
+// nothing checks this file's ids automatically; they are declared at
+// `anchors.citationRoots` in `.harness-config/config.json`, which is the one
+// place that answers what is scanned today.
 // ⛔ THE DEAD SPELLING IS NO LONGER WRITTEN HERE, and that is deliberate rather
 // than tidying: a retired id resolves only because something still MENTIONS it,
-// so narration that spells one is how it survives its own retirement. The guard
-// now refuses any citation of a RETIRED-ID-marked row by name
-// (D-GATE-ANCHOR-CITATION-RESOLVES-VIA-ITS-OWN-BUG-REPORT), which would red on
-// the sentence this comment replaced. Look the old id up in the registry, where
-// it has a row whose only job is to redirect here.
+// so narration that spells one is how it survives its own retirement — and a
+// guard that refuses a retired id BY NAME would then red on the very sentence
+// keeping it alive, which is why the sentence this comment replaced could not
+// simply be left in place. Look the old id up in the registry, where it has a
+// row whose only job is to redirect here.
 //
 // ★ WHAT THIS TEST USED TO BE, because the change is the point. It was a
 // DUAL-MODE marker: it drove the defect, and branched on `bytes.empty()` so it

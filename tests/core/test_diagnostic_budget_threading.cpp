@@ -271,8 +271,8 @@ TEST(DiagnosticBudgetThreading, BudgetDoesNotCarryPolicyIntoATier) {
 // or bumps an allowlisted count (fails too).
 namespace {
 
-// ⚠ THERE WAS A PRIVATE `repoRoot()` HERE AND IT WAS THE LAST ONE IN THE TREE.
-// D-TEST-BUDGET-THREADING-PRIVATE-REPO-ROOT-WALK-FAILS-OUT-OF-SOURCE. It walked
+// ⚠ THERE WAS A PRIVATE `repoRoot()` HERE AND IT WAS THE LAST ONE IN THE TREE,
+// AND ITS WALK FAILED OUT OF SOURCE. It walked
 // up from `fs::current_path()` ONLY — never consulting `DSS_CONFIG_ROOT` nor the
 // CMake-baked `DSS_TEST_REPO_ROOT` — so the SAME binary passed with a cwd inside
 // the repo and FAILED from an out-of-repo build directory, where the walk runs

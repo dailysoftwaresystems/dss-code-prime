@@ -19,7 +19,7 @@ using namespace dss::ffi;
 using dss::test_support::countCode;
 namespace fs = std::filesystem;
 
-// ── D-TEST-SHIPPED-CONFIG-READ-FROM-A-TREE-ANOTHER-PROCESS-IS-WRITING ─────────
+// ── READING A SHIPPED CONFIG FROM A TREE ANOTHER PROCESS IS WRITING ──────────
 //
 // ★★★ EVERY `readCHeaderFromText` CALL BELOW RE-OPENS THE SHIPPED `c` GRAMMAR
 // FROM DISK. `readCHeaderFromText` starts with `GrammarSchema::loadShipped("c")`,
@@ -29,11 +29,14 @@ namespace fs = std::filesystem;
 // time. That made this the single most exposed reader of that file in the tree,
 // and it is why a neighbouring lane's in-place rewrite of it (truncate, then
 // write) turned this suite — and only this suite — red once at 8-way parallelism
-// and green on the immediate re-run.
+// and green on the immediate re-run. The torn-read half of that exposure is
+// closed at D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT,
+// which names this field condition: an in-place rewrite of a shipped `.json`
+// now yields a NAMED torn read rather than a parse error against a prefix.
 //
 // ★★★ THE OPT-IN THAT USED TO SIT HERE IS GONE, AND ITS ABSENCE IS THE FIX
 // LANDING RATHER THAN BEING WITHDRAWN.
-// D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED measured
+// A census of the whole population of live-tree readers measured
 // that this suite — the one that flaked — was not even the worst reader in the
 // tree: `analysis/semantic/test_semantic_analyzer_c` held that handle for ~42 s
 // per run against this suite's ~0.9 s, and 150 test sources reached the live

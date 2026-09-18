@@ -48,7 +48,6 @@ using namespace dss;
 namespace {
 
 // ★★ THE SHIPPED TARGET DOCUMENT, OR A LOUD STOP — never a silent default.
-// D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD
 //
 // Every site in this file that wanted a machine model wrote
 // `if (auto t = TargetSchema::loadShipped(...); t.has_value())` and simply did
@@ -84,8 +83,7 @@ requireShippedTarget(std::string const& name) {
             "TargetSchema::loadShipped(\"" + name + "\") failed — the fixture "
             "cannot proceed without a machine model, and continuing walks into "
             "MIR building and aborts on a block it never terminated, naming a "
-            "block id instead of the config "
-            "(D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD)."
+            "block id instead of the config."
             " The loader said:" + why);
     }
     return *t;
@@ -151,7 +149,6 @@ struct Lowered {
     std::shared_ptr<TargetSchema const> targetSchema;
     // ★★ A FAILED TARGET LOAD IS A HARNESS FAILURE, NOT A CONFIGURATION THIS
     //    FIXTURE MAY PROCEED UNDER.
-    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD
     //
     // Both neighbours here — `GrammarSchema::loadShipped("c")` above and
     // `ObjectFormatSchema::loadShipped(formatName)` below — `ADD_FAILURE()` and
@@ -247,9 +244,8 @@ struct Lowered {
     // compile_pipeline.cpp does, so member-access + aggregate-local lowering
     // resolves field byte offsets. dataModel stays the Lp64 default (an
     // int-based struct's field offsets are dataModel-independent here).
-    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD: reuse the ONE
-    // load taken above (which already failed loud if the document will not load)
-    // instead of asking the same question a second time.
+    // Reuse the ONE load taken above (which already failed loud if the document
+    // will not load) instead of asking the same question a second time.
     {
         auto const& t = loadedTarget;
         mirCfg.aggregateLayout       = t->aggregateLayout();
@@ -975,9 +971,8 @@ namespace {
     DiagnosticReporter mirReporter;
     MirLoweringConfig mirCfg;
     mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
-    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD: a target that
-    // will not load is a STOP, never a fixture that quietly measures a default
-    // machine model.
+    // A target that will not load is a STOP, never a fixture that quietly
+    // measures a default machine model.
     {
         auto const t = requireShippedTarget("x86_64");
         mirCfg.aggregateLayout       = t->aggregateLayout();
@@ -1066,9 +1061,8 @@ namespace {
     DiagnosticReporter mirReporter;
     MirLoweringConfig mirCfg;
     mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
-    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD: a target that
-    // will not load is a STOP, never a fixture that quietly measures a default
-    // machine model.
+    // A target that will not load is a STOP, never a fixture that quietly
+    // measures a default machine model.
     {
         auto const t = requireShippedTarget("x86_64");
         mirCfg.aggregateLayout       = t->aggregateLayout();
@@ -9919,9 +9913,8 @@ TEST(MirLoweringC, IterativeDeepIndexAddressChainLowersFlatAndByteIdentical) {
     // Thread the x86_64 aggregate layout so array stride/size resolve (mirrors
     // lowerC). A char[1]…[1] is 1 byte; stride at every level is 1.
     MirLoweringConfig mirCfg;
-    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD: a target that
-    // will not load is a STOP, never a fixture that quietly measures a default
-    // machine model.
+    // A target that will not load is a STOP, never a fixture that quietly
+    // measures a default machine model.
     {
         auto const t = requireShippedTarget("x86_64");
         mirCfg.aggregateLayout       = t->aggregateLayout();
@@ -14586,9 +14579,8 @@ constexpr char const* kSetjmpRoundTripSrc =
     DiagnosticReporter mirReporter;
     MirLoweringConfig mirCfg;
     mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
-    // D-HARNESS-MIR-LOWERC-SWALLOWS-A-FAILED-TARGET-SCHEMA-LOAD: a target that
-    // will not load is a STOP, never a fixture that quietly measures a default
-    // machine model.
+    // A target that will not load is a STOP, never a fixture that quietly
+    // measures a default machine model.
     {
         auto const t = requireShippedTarget("x86_64");
         mirCfg.aggregateLayout       = t->aggregateLayout();
@@ -16303,9 +16295,8 @@ TEST(MirLoweringC, ByValueStructArgumentCallIsLoweredExactlyOnce) {
         EXPECT_EQ(countCalls(calls, "mk"), 1u)
             // ⚠ The anchor id sits on ONE source line. Split across two string
             // literals it still CONCATENATES at runtime, but every grep and the
-            // registry guard see two ids — one of them invented. That is
-            // D-ANCHOR-ID-WRAPPED-ACROSS-A-LINE-BREAK-IS-INVISIBLE-TO-EVERY-GREP,
-            // and this line carried an instance of it until the guard said so.
+            // registry guard see two ids — one of them invented. This line
+            // carried an instance of exactly that until the guard said so.
             << "C 6.5.2.2p10: `op(mk())` evaluates `mk()` ONCE. Two emitted "
                "Calls means the by-value argument path lowered the argument "
                "expression twice — a duplicated side effect with no diagnostic: "

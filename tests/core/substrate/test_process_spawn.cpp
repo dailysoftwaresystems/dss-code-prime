@@ -18,7 +18,7 @@
 
 #include "core/substrate/process_spawn.hpp"
 
-// D-TEST-RUN-BINARY-ARGV-QUOTING-UNESCAPED. The TEST-TIER spawner, which now
+// THE TEST HARNESS USED TO LEAVE ITS ARGV UNESCAPED. The TEST-TIER spawner, which now
 // composes its Windows command line with the very quoter pinned in this file
 // (`src/core/substrate/windows_command_line.hpp`) instead of its own
 // half-correct copy. It is included HERE, next to the substrate's own pins,
@@ -137,8 +137,8 @@ constexpr std::string_view kFloodStdoutDirective = "--dss-fixture-flood-stdout";
 // Linux gives an anonymous pipe 64 KiB; a Windows anonymous pipe defaults to
 // 4 KiB. A redirect built on a pipe that is drained only AFTER the wait wedges
 // the moment the child writes past that — the child blocks in write, the parent
-// blocks in the wait, and neither moves (measured, and documented in
-// `run_binary.hpp` as D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS). 256 KiB
+// blocks in the wait, and neither moves (measured, and documented on
+// `run_binary.hpp`'s drain-after-exit block). 256 KiB
 // clears the larger of the two by 4x, so the pin is not sitting on the boundary
 // of some host's buffer size, and it stays small enough to cost milliseconds.
 constexpr std::size_t kFloodBytes = 256u * 1024u;
@@ -434,8 +434,8 @@ private:
 // cap is the same 60 s — what changed is that it is now ONE decision.
 //
 // ⛔ Do NOT reinstate a local constant here to "make it explicit". A name beside
-// the site is not a measurement (see
-// [[D-TEST-WALL-CLOCK-ROW-REMEDY-SANCTIONS-A-SHAPE-ITS-OWN-GUARD-COUNTS]]); it is
+// the site is not a measurement — a remedy that sanctions the very shape the
+// guard counts is no remedy at all; it is
 // the same unmeasured number with a label, and `check-wall-clock-in-tests` counts
 // it as the literal it is.
 
@@ -771,8 +771,8 @@ TEST(BuildWindowsCommandLine, ArgumentWithATabIsQuoted) {
 TEST(BuildWindowsCommandLine, EmbeddedQuoteIsBackslashEscaped) {
     // The naive `"` + arg + `"` produces `"a"b"`, whose embedded quote CLOSES
     // the argument — everything after it re-splits into new arguments. This is
-    // half of the live defect documented as
-    // D-TEST-RUN-BINARY-ARGV-QUOTING-UNESCAPED in run_binary.hpp.
+    // half of the unescaped-argv defect documented on `run_binary.hpp`'s
+    // Windows arm.
     auto const got = buildWindowsCommandLine({"a\"b"});
     EXPECT_EQ(got, std::wstring{L"\"a\\\"b\""}) << narrowForMessage(got);
 }
@@ -1698,7 +1698,7 @@ TEST(SpawnAndWaitInherit, ArgumentsReachTheChildByteIdenticallyWithNoShell) {
 // ★ THE DEADLINE IS NOT DECORATION. This pin's failure mode is not a wrong
 // value, it is no value at all: a capture with a bounded buffer and no
 // concurrent drain wedges permanently once the child outruns it (measured, on
-// only ~7 KB, as `run_binary.hpp`'s D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS).
+// only ~7 KB, as `run_binary.hpp`'s drain-after-exit deadlock).
 // Without `CallDeadline` the observable result of that regression
 // is a CI job hanging until an outer timeout kills the suite — no test name and
 // no red. With it, the hang becomes a named non-zero exit in 60 s.
@@ -2656,7 +2656,7 @@ TEST(InterpretExecHandshake, TheLiveSpawnPathAgreesWithTheCleanArm) {
 
 // ══ tests/test_support/run_binary.hpp — the SAME quoter, the OTHER spawner ══
 //
-// ★★ D-TEST-RUN-BINARY-ARGV-QUOTING-UNESCAPED, CLOSED AND PINNED.
+// ★★ THE UNESCAPED-ARGV DEFECT, CLOSED AND PINNED.
 //
 // The test harness used to build its Windows command line with `"` + arg + `"`
 // and a comment admitting it escaped neither embedded quotes nor trailing

@@ -8,8 +8,8 @@
 # into the first would make every leg carry a copy of the fleet's topology, which
 # is how a host-keyed assumption gets into a target-keyed tool.
 #
-# ⚠ RUN THIS FROM WSL. The ssh carriage (scripts/ssh-arm64-vps/ssh-arm64-vps.sh,
-# scripts/ssh-macos/ssh-macos.sh) works only there: `ssh dss` resolves nowhere from Windows,
+# ⚠ RUN THIS FROM WSL. The ssh carriage this tool rides (now retired -- see the refusal
+# below) worked only there: `ssh dss` resolves nowhere from Windows,
 # the key exists only inside WSL, and the .ps1 twins of those carriage scripts are
 # known-broken. That is a property of this fleet's credentials, not of this tool.
 #
@@ -44,7 +44,23 @@ done
 RUNNER="$REPO/scripts/profile-compile/profile-compile.sh"
 SUPPORT="$REPO/scripts/profile-compile/profile-compile-support.py"
 GATE="$REPO/scripts/run-gate/run-gate.sh"
-for f in "$RUNNER" "$SUPPORT" "$GATE"; do [[ -f "$f" ]] || die "missing $f"; done
+for f in "$RUNNER" "$SUPPORT"; do [[ -f "$f" ]] || die "missing $f"; done
+# ⛔ THE GATE THIS DISPATCHER SHIPPED TO EACH LEG HAS BEEN RETIRED.
+# `scripts/run-gate/` went with the DssHarness migration of the gate runners: the
+# witness discipline it enforced — a zero exit code with no success match, a tree
+# that moved under the run, a build directory another live run holds — is now
+# carried by `dssharness build`, `test` and `run` from `.harness-config/config.json`
+# (`successPattern`, `witness`, `stallSeconds`, `contention`), so there is no file
+# left to rsync. ⇒ this dispatcher's remaining job is to TIME a build, which
+# `dssharness run <runner> --time` does across the legs a runner declares, and
+# that is where this tool goes. It REFUSES here rather than timing an
+# unwitnessed command, which is the one thing its own support module says it must
+# never do.
+[[ -f "$GATE" ]] || die "the witness gate this dispatcher ships to each leg no longer exists.
+      scripts/run-gate/ was retired with the DssHarness migration; its refusals live in
+      .harness-config/config.json now. Timing a command with no witness is exactly what this
+      tool refuses to do, so it stops here. Use 'dssharness run <runner> --time', and declare
+      the profiling runner under .harness-config/runner/actions."
 
 # ⓘ The remote checkouts are where they are; these are the fleet's actual paths,
 # not a guess. Each leg's repo already exists (the runner BUILDS the compiler
@@ -68,6 +84,9 @@ if [[ -z "$SSH" ]]; then
        --kit "$RREPO/build/perf/kit" --target "$TARGET" --label "$LABEL"
 fi
 
+[[ -f "$SSH" ]] || die "the carriage script $SSH no longer exists: scripts/ssh-macos/ and
+      scripts/ssh-arm64-vps/ were retired with the DssHarness migration. Reaching a declared host
+      is 'dssharness host-exec --ssh <host>' now, and shipping files to one is 'dssharness sync'."
 [[ -x "$SSH" ]] || die "carriage script $SSH is not executable (run this from WSL)"
 echo "--- staging the kit onto $WHICH ($RREPO) ---"
 # ★ The script directories are created explicitly rather than assumed: rsync

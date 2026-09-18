@@ -70,11 +70,11 @@ namespace dss::cu_test {
 //
 // The unique-path scheme is NOT reimplemented here — it is the shared one in
 // `tests/test_support/scratch_dir.hpp`. It used to be reimplemented per file,
-// and that is the defect D-TEST-FIXED-SCRATCH-PATH-POPULATION names: the path
-// came from an atomic counter with NO per-process seed, so the Nth TempDir of
-// EVERY process of a binary resolved to the same fixed path (`<temp>/dss_cu4_<n>`
-// in the import-resolver suite, `<temp>/dss_fc2_oracle_<n>` in the type-name-
-// oracle one) and the dtor's `remove_all` deleted a concurrent sibling
+// and that per-file reimplementation was the defect: the path came from an
+// atomic counter with NO per-process seed, so the Nth TempDir of EVERY process
+// of a binary resolved to the same fixed path (`<temp>/dss_cu4_<n>` in the
+// import-resolver suite, `<temp>/dss_fc2_oracle_<n>` in the type-name-oracle
+// one) and the dtor's `remove_all` deleted a concurrent sibling
 // process's fixture files mid-test. MEASURED before the change, two concurrent
 // processes of the SAME binary, `--gtest_repeat=12 --gtest_shuffle`: 6 of 6
 // rounds red in BOTH suites — 1..18 failed tests per round (import resolver),

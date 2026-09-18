@@ -13,7 +13,6 @@
 //     path misses.
 //
 // ★★★ THE COVERAGE BOUNDARY, AND ITS COMPLEMENT — the half that was missing.
-// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
 //
 //   BOTH runners compile the target this host can execute, and both run it.
 //   Only the IN-PROCESS runner compiles a target whose `runOn` excludes this
@@ -94,7 +93,6 @@
 // implemented identically in the in-process sibling.
 
 #include "arm_verdict_ledger.hpp"
-// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
 // The COVERAGE BOUNDARY vocabulary — one grammar, emitted by both runners and
 // parsed by the boundary guard. Its header states the boundary as a sentence;
 // this runner's own statement of its half is in the block above `runExampleViaCli`.
@@ -223,7 +221,6 @@ enum class OnlyKind {
     // exactly one check — two entries for one scope, so a reader triaging "a
     // corpus-wide thing is red" had to know which to open.
     Adjudicate,
-    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
     // ★ SELECTS its own subject from the corpus, then DEGRADES ITSELF INTO
     // `OneExample` so the CLI half of the measurement goes through the very code
     // path a per-example entry uses — a boundary guard that measured a private
@@ -268,7 +265,7 @@ std::vector<DeclaredArm> declaredArms;
 // different fixes, so collapsing them would cost the reader the fix.
 std::size_t manifestsWalked = 0;
 
-// ── D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY ──
+// ── the coverage boundary between the two corpus harnesses ──
 //
 // The SIBLING runner's executable, supplied by the ctest registration of the
 // coverage-boundary entry. EMPTY on every other invocation: no other entry
@@ -1194,6 +1191,45 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
         }
         out.targets.push_back(std::move(et));
     }
+    // ── THE TWO KEYS A REFUSAL ARM CANNOT HONOUR, REFUSED BY NAME ───────────
+    //
+    // The behavioural mirror of the in-process sibling's refusal, landed in the
+    // SAME change for the reason this file's own `optimizedPipelines` note gave:
+    // *"it must land in BOTH runners in ONE change. Adding it to only this side
+    // would make the two runners accept different manifests, which is the very
+    // divergence [Test 6] and this whole change exist to end."* That note asked
+    // for exactly this refusal and named it THE RIGHT FIX; `dependsOn` joins it
+    // because it is dropped here the same way and for the same reason.
+    //
+    // `prebuiltLibraries` is deliberately NOT refused: the expect-error arm
+    // below now threads it into `--resolve-library`, which is what makes an
+    // import-disagreement refusal expressible as a corpus example at all.
+    //
+    // ✔MEASURED at this tree: 841 manifests, 34 `expectDiagnostics`, ZERO
+    // declaring either key beside it.
+    if (!out.expectDiagnostics.empty()) {
+        if (j.contains("optimizedPipelines")) {
+            std::cerr << "  manifest declares BOTH 'expectDiagnostics' and"
+                         " 'optimizedPipelines'. A refusal arm never builds an"
+                         " artifact, so there is no baseline image for an"
+                         " optimized arm to differ from — the arm would be"
+                         " parsed and then silently dropped: "
+                      << path.generic_string() << "\n";
+            return false;
+        }
+        for (auto const& t : out.targets) {
+            if (t.dependsOn.empty()) continue;
+            std::cerr << "  manifest target '" << t.spec
+                      << "' declares 'dependsOn' beside 'expectDiagnostics'."
+                         " A prerequisite is BUILT and compared against images"
+                         " this arm produces; a refusal arm produces none."
+                         " Declare a library input a refusal needs as"
+                         " 'prebuiltLibraries', which the refusal arm resolves"
+                         " and threads into --resolve-library: "
+                      << path.generic_string() << "\n";
+            return false;
+        }
+    }
     // D-TEST-INTEGRATED-RUNNER-HAS-NO-OPTIMIZATION-ARM-CONCEPT: the OPTIMIZED
     // arms. Parsed with the in-process runner's exact rules — including the
     // CLOSED per-arm key set, which is what stops a manifest from declaring an
@@ -1749,7 +1785,6 @@ struct CliArmOutcome {
     // arm's image with the baseline's, and that comparison is host-independent.
     fs::path    artifactPath;
     bool        compiled = false;
-    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
     // The ATTEMPT to exec, not its outcome. `verdict == Ran` cannot stand in for
     // it: a spawn that FAILED is `Poisoned`, and the coverage-boundary clause
     // that forbids exec'ing a foreign-host artifact must catch the attempt
@@ -2283,7 +2318,6 @@ std::size_t dependencyImagesDiffered  = 0;
     // exit carries it, because the arm-vs-baseline artifact comparison is
     // host-independent and must survive a run this MACHINE cannot perform: a box
     // with no emulator still proves the two pipelines produced different code.
-    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
     // Set at the exec site below and read by EVERY outcome built after it, so
     // no exit path can report a spawn attempt as not having happened — the
     // failing paths (`spawn failed`, `spawn timed out`) are precisely the ones a
@@ -2500,7 +2534,6 @@ void runSelectedTargetViaCli(std::string const& compiler,
     // every pre-existing skip line greps exactly as it did.
     armLedger.record(exampleId, target->spec, "cli", baseline.verdict,
                      baseline.detail);
-    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
     // ★ THE FACT THE ARM VERDICT CANNOT CARRY. `SkippedByRunOn` means *compiled,
     // not spawned* in the in-process sibling and *never compiled* here, so the
     // shared ledger cannot tell a witnessed spec from an unwitnessed one. These
@@ -2865,7 +2898,6 @@ void runExampleViaCli(std::string const& compiler,
         }
     }
 
-    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
     // ★★★ THIS RUNNER'S HALF OF THE COVERAGE BOUNDARY, EMITTED RATHER THAN
     // IMPLIED. `declared` is filled BEFORE either exit path below, so the
     // no-bound-target case reports its (empty) coverage against the full
@@ -2909,7 +2941,6 @@ void runErrorExampleViaCli(std::string const& compiler,
     }
     auto const& spec = m.targets.front().spec;
 
-    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
     // ⚠ AN EXPECT-ERROR EXAMPLE REPORTS AN EMPTY `compiled` SET, AND THAT IS THE
     // TRUTH, NOT A HOLE: its whole assertion is that the compile FAILS, so no
     // runner can produce an artifact for it and the union-completeness clause
@@ -2958,11 +2989,39 @@ void runErrorExampleViaCli(std::string const& compiler,
     for (auto const& s : m.sources) {
         compileArgs += " " + quote((exampleDir / s).string());
     }
+    // ── LIBRARY INPUTS ON A REFUSAL ARM, THROUGH THE SHIPPED CLI ────────────
+    //
+    // The behavioural mirror of the in-process sibling's staging in
+    // `examples_runner.cpp::runErrorTarget`, same key, same resolution rule,
+    // same three integrity checks, same order. Until this landed, BOTH runners
+    // parsed `prebuiltLibraries` on an `expectDiagnostics` manifest and then
+    // compiled without it — so a manifest could assert a refusal that only a
+    // library can cause, against a compile that never saw one.
+    //
+    // ⚠ A FIXTURE THAT DID NOT RESOLVE POISONS THE ARM RATHER THAN COMPILING
+    // WITHOUT IT. `resolvePrebuiltLibraryCli` has already emitted the `check`
+    // naming which of the three failures it was; going on to compile would turn
+    // a missing file into "the compiler refused this program", which is the one
+    // false green an expect-error arm has no other defence against.
+    std::string errorResolveArgs;
+    for (auto const& lib : m.targets.front().prebuiltLibraries) {
+        auto resolved = resolvePrebuiltLibraryCli(lib, exampleName);
+        if (!resolved.has_value()) {  // check already fired
+            check(exampleName + ": prebuilt library " + lib.path
+                      + " staged for the refusal arm",
+                  false,
+                  "compiling without it would assert a refusal the library was"
+                  " supposed to cause");
+            return;
+        }
+        errorResolveArgs += " --resolve-library " + quote(resolved->string());
+    }
     auto const cliLog = outDir / "cli.log";
     std::string cmd = quote(compiler)
         + " --compile"   + compileArgs
         + " --language " + m.language
         + " --target "   + spec
+        + errorResolveArgs
         + " --output "   + quote(outDir.string())
         + " > " + quote(cliLog.string()) + " 2>&1";
     int const sysRc = std::system(shellWrap(cmd).c_str());
@@ -4726,8 +4785,6 @@ void runRunnerVocabularyPin() {
 
 // ═══ THE COVERAGE BOUNDARY GUARD ════════════════════════════════════════════
 //
-// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
-//
 // ★★★ WHAT THIS ENTRY IS FOR, IN ONE SENTENCE: it RUNS both corpus harnesses
 // over the same example and compares what each of them actually built, so the
 // division of labour between them is a CHECKED FACT rather than a habit.
@@ -6170,7 +6227,6 @@ int main(int argc, char* argv[]) {
 
     // ── the coverage-boundary entry picks its subject, then becomes an
     //    ordinary per-example run ──────────────────────────────────────────
-    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
     // ★ THE DEGRADE IS THE DESIGN, not a shortcut. Rewriting the selector into
     // `OneExample` means this entry's CLI-side measurement goes through the
     // SAME `runAllExamples` -> `runExampleViaCli` path every per-example entry
@@ -6334,7 +6390,6 @@ int main(int argc, char* argv[]) {
     }
 
     // ── the coverage boundary, judged over what the walk above ACTUALLY did ──
-    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
     if (wantCoverageBoundary) {
         runCoverageBoundaryJudge(boundarySubjectDir, boundarySubjectId,
                                  boundarySubject, outputBase);

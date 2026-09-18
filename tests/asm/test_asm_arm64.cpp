@@ -1,4 +1,6 @@
-// ARM64 schema + fixed32 walker tests — plan 13 AS3 + plan 12 D-ML7-2.1.
+// ARM64 schema + fixed32 walker tests — plan 13 AS3 + plan-12 step ML7 cycle
+// 2.1, registered as
+// D-PLAN12-ARM64-STACKPOINTER-REGISTRATION-ABI-GOLDEN-TESTS.
 //
 // Pins:
 //   * arm64.target.json loads cleanly.
@@ -4031,7 +4033,7 @@ TEST(Arm64Fpr, FullPipelineDoubleAddToIntEncodesFaddAndFcvtzs) {
     //     parameter somewhere else;
     //   * the FADD reading d0/d1 DIRECTLY (Rn at 5..9, Rm at 16..20) — which
     //     is what happens once regalloc PRE-COLORS each parameter into its own
-    //     incoming register (plan 22 OPT8 / D-ML7-2.5) and `maybeMov` therefore
+    //     incoming register (plan 22 OPT8 / D-PLAN12-REGALLOC-PRE-COLORING-HINT-FOR-ARG-CALL-ARG) and `maybeMov` therefore
     //     emits nothing at all.
     // ⚠ The second form is strictly better code and used to read here as a
     // failure. The property under test was never "a copy exists" — it is that

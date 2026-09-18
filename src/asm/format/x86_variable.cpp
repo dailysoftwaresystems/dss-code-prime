@@ -40,6 +40,76 @@ constexpr std::uint8_t kX86RegFieldBits = 4;
 // minimal.)
 using walker_util::PendingRelocSlot;
 
+// ─────────────────────────────────────────────────────────────────────
+// [[D-CSUBSET-LONG-BRANCH]] — THE ISLAND BODY, QUOTED FROM THIS CONFIG
+// ─────────────────────────────────────────────────────────────────────
+//
+// ★★★ THIS WALKER NEEDS NO "ELECTION" IN THE SENSE THE ROW MEANT, AND SAYING
+// SO IS HALF THE FIX. The row's (c) reads as missing machinery: `x86_variable`
+// "has no election and no WORD vocabulary to elect from". It does not need
+// one, because the bytes an island is made of are ALREADY WRITTEN DOWN in the
+// two rows that branch — `jmp`'s `template.opcode: [0xE9]`, and `jcc`'s
+// wire-1 `prefixOpcodeBytes: [0xE9]`, each immediately followed by the
+// `block.rel32` field. "Those bytes, then a block-relative field" IS an island
+// body verbatim. What was missing is that nobody carried it to the resolver.
+//
+// ⚠ TWO PLACES A SELF-CONTAINED UNCONDITIONAL BRANCH CAN BE DECLARED, AND
+// BOTH ARE READ:
+//
+//   * a wire with `prefixOpcodeBytes` — those bytes are emitted immediately
+//     before this wire's displacement and after everything the variant's
+//     earlier wires emitted, so prefix + displacement is a whole instruction
+//     by construction, whatever precedes it. This is jcc's trailing `E9`.
+//   * the variant's OWN `opcodeBytes`, when the variant is nothing but those
+//     bytes plus this one block-relative wire: no ModR/M (`modrmRegExt`
+//     absent and no ModR/M-family wire), no result placement, no cond nibble,
+//     no prefixes, no immediate. This is the one-byte `jmp` row.
+//
+// ⚠ AND THE OPCODE MUST DECLARE ITSELF UNCONDITIONAL for the second form, for
+// the same reason the `fixed32` election asks: the second form quotes the
+// variant's LEADING bytes, and on a conditional opcode those bytes ARE the
+// condition. Control reaches an island only through a branch aimed at it, so a
+// conditional island could fall out of its bottom into the next island — valid
+// bytes, wrong destination, no diagnostic. `terminatorKind == Br` is the
+// config's own sentence for "transfers control unconditionally". The first
+// form needs no such test: a wire's prefix bytes are a SECOND instruction
+// inside a macro, and the macro's conditional half is the part before them.
+[[nodiscard]] inline walker_util::BranchIslandBody
+electIslandBody(TargetOpcodeInfo const& info) {
+    constexpr std::uint8_t kRel32Bytes = 4;
+    bool const opcodeIsUnconditionalBranch =
+        info.terminatorKind == TargetTerminatorKind::Br;
+    auto quote = [](std::span<std::uint8_t const> lead)
+        -> walker_util::BranchIslandBody {
+        walker_util::BranchIslandBody body;
+        if (lead.empty()
+         || lead.size() + kRel32Bytes > walker_util::kMaxBranchIslandBytes)
+            return {};
+        for (std::size_t i = 0; i < lead.size(); ++i)
+            body.bytes[i] = lead[i];
+        body.byteCount   = static_cast<std::uint8_t>(lead.size() + kRel32Bytes);
+        body.fieldOffset = static_cast<std::uint8_t>(lead.size());
+        body.kind        = walker_util::BlockRelPatchKind::X86Rel32;
+        return body;
+    };
+    for (auto const& variant : info.encoding.variants) {
+        for (auto const& wire : variant.wires) {
+            if (wire.slotKind != EncodingSlotKind::BlockRel32) continue;
+            if (!wire.prefixOpcodeBytes.empty())
+                return quote(wire.prefixOpcodeBytes);
+            if (!opcodeIsUnconditionalBranch)            continue;
+            if (variant.wires.size() != 1)               continue;
+            if (variant.resultSlot.has_value())          continue;
+            if (variant.tmpl.condCodeFromPayload)        continue;
+            if (variant.tmpl.modrmRegExt.has_value())    continue;
+            if (!variant.tmpl.mandatoryPrefix.empty())   continue;
+            if (variant.tmpl.payloadBytePrefix)          continue;
+            return quote(variant.tmpl.opcodeBytes);
+        }
+    }
+    return {};
+}
+
 // State accumulated while emitting one variant: the 3-bit codes
 // destined for ModR/M.reg / ModR/M.rm + their high bits for REX.R /
 // REX.B, plus the immediate(s) and pending symbol-relative slot
@@ -62,7 +132,7 @@ struct EncodingState {
     bool                  rexR       = false;   // high bit of ModRmReg slot's hwEncoding
     bool                  rexB       = false;   // high bit of ModRmRm slot's hwEncoding
     // `rexX` carries the SIB.index high bit. Set by the `SibIndex`
-    // slot's wiring (D-AS4-5 closure 2026-06-01) from the index reg
+    // slot's wiring (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL closure 2026-06-01) from the index reg
     // hwEncoding bit 3. Stays false on no-index forms (the SIB byte
     // emits index=4 = no-index marker).
     bool                  rexX       = false;
@@ -93,7 +163,7 @@ struct EncodingState {
     // ModR/M-mem + missing-Disp32Mem pairing fail loud rather than
     // silently emitting a zero offset.
     std::optional<std::int32_t> disp32Mem;
-    // SIB.index slot (D-AS4-5). Set when a `SibIndex` wire fires;
+    // SIB.index slot (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL). Set when a `SibIndex` wire fires;
     // `optional` is the written-bit — same pattern as `disp32Mem`
     // (code-simplifier REQUIRED post-fold #1: dropped the redundant
     // `wroteSibIndex` flag).
@@ -250,7 +320,7 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
             st.rexB           = (hwEnc & 0x8u) != 0u;
             return true;
         case EncodingSlotKind::SibIndex:
-            // D-AS4-5 indexed addressing: the index register's low 3
+            // D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL indexed addressing: the index register's low 3
             // bits fill SIB.index; the high bit drives REX.X. With-
             // index forces a SIB byte unconditionally (independent of
             // the rsp/r12 force-presence rule for no-index).
@@ -341,6 +411,9 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
         case EncodingSlotKind::Imm32MovzMovk:
         case EncodingSlotKind::SymbolPatchMarker:
         case EncodingSlotKind::Imm19:
+        // [[D-CSUBSET-LONG-BRANCH]]: the TBZ/TBNZ imm14 is a fixed32 bit-window
+        // slot, like Imm19.
+        case EncodingSlotKind::Imm14:
         // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE: the inverted-imm16
         // (complement-immediate) slot is fixed32, like Imm16 whose window it
         // shares.
@@ -501,9 +574,9 @@ wireImm64(EncodingState& st, EncodingSlotKind slot, std::uint64_t v,
     return true;
 }
 
-// D-AS4-1 + D-AS4-5 memory-addressing: validate a MemBase operand's
+// D-AS4-1 + D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL memory-addressing: validate a MemBase operand's
 // scale and store the SIB.scale exponent for emission. Scale ∈
-// {1,2,4,8} (D-AS4-5 generalisation from cycle-1's scale==1-only).
+// {1,2,4,8} (D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL generalisation from cycle-1's scale==1-only).
 // The slot writes no bytes directly; the exponent feeds the SIB
 // byte when a `SibIndex` is also wired (or the existing rsp/r12
 // force-presence rule fires on no-index).
@@ -909,10 +982,10 @@ bool encode(Lir const&                  lir,
                 return false;
             }
         } else if (srcOp.kind == LirOperandKind::MemBase) {
-            // D-AS4-1 + D-AS4-5 memory-addressing: MemBase carries the
+            // D-AS4-1 + D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL memory-addressing: MemBase carries the
             // scale for `[base + index*scale + disp]` addressing.
             // Cycle-1 (closed at LK10 cycle 2) handled scale==1 only;
-            // D-AS4-5 generalises to scale ∈ {1,2,4,8}.
+            // D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL generalises to scale ∈ {1,2,4,8}.
             if (!wireMemBaseScale(st, wire.slotKind, srcOp.scale,
                                    info->mnemonic, reporter)) {
                 return false;
@@ -1249,7 +1322,7 @@ bool encode(Lir const&                  lir,
     //    MemDisp32).
     // Decide whether a SIB byte follows. Two triggers:
     //   (a) D-AS4-1 force-presence: memory mode + rm.lo3 == 4.
-    //   (b) D-AS4-5 indexed addressing: a SibIndex wire fired.
+    //   (b) D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL indexed addressing: a SibIndex wire fired.
     // When SIB follows, ModR/M.rm MUST be 4 (the "SIB follows"
     // marker); the actual base register's lo3 goes into SIB.base.
     // The pre-existing no-index force-presence path "worked by
@@ -1320,7 +1393,7 @@ bool encode(Lir const&                  lir,
         }
     }
 
-    // 4.5) D-AS4-5 coherence: a SibIndex wire is only meaningful with
+    // 4.5) D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL coherence: a SibIndex wire is only meaningful with
     //      a ModRmRmMem base (the indexed form is a memory-addressing
     //      mode; register-direct mode has no SIB). Fail loud if a
     //      schema declared SibIndex without ModRmRmMem — silent
@@ -1343,7 +1416,7 @@ bool encode(Lir const&                  lir,
     //        that otherwise means "SIB follows"). No index register;
     //        SIB encodes `[base + 0 + disp]` with index=4 (no-index
     //        marker) and scale=0.
-    //    (b) D-AS4-5 indexed addressing: a `SibIndex` wire fired
+    //    (b) D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL indexed addressing: a `SibIndex` wire fired
     //        (st.wroteSibIndex). SIB encodes `[base + index*scale + disp]`
     //        with index = st.sibIndex3 (from the SibIndex wire's
     //        register operand), scale exponent = st.sibScaleExp
@@ -1498,6 +1571,14 @@ bool encode(Lir const&                  lir,
     //    `0F 8x rel32; E9 rel32`), then 4 zero placeholder bytes
     //    at the patch offset. asm.cpp resolves all patches once
     //    every block in the function has been encoded.
+    //    [[D-CSUBSET-LONG-BRANCH]]: every one of them carries the island body
+    //    this opcode declares. `rel32` is x86-64's WIDEST block-relative field,
+    //    so no escape into a wider one can ever be elected here — which is
+    //    exactly the arm that needs an island, and the body is elected once
+    //    per instruction rather than once per patch.
+    auto const island = st.blockRels.empty()
+        ? walker_util::BranchIslandBody{}
+        : electIslandBody(*info);
     for (auto const& br : st.blockRels) {
         for (auto b : br.prefixBytes) {
             out.push_back(b);
@@ -1505,11 +1586,21 @@ bool encode(Lir const&                  lir,
         blockPatches.push_back(walker_util::BlockRelPatch{
             static_cast<std::uint32_t>(out.size()),
             br.targetBlock,
+            walker_util::BlockRelPatchKind::X86Rel32,
+            /*relaxable=*/false,
+            /*widerFieldDeclared=*/false,
+            /*instV=*/0,  // stamped centrally by asm.cpp
+            island,
         });
         asm_byte_emit::appendU32LE(out, 0u);
     }
 
     return true;
+}
+
+walker_util::BranchIslandBody
+islandBody(TargetOpcodeInfo const& info) {
+    return electIslandBody(info);
 }
 
 } // namespace dss::x86_variable

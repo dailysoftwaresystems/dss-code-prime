@@ -1,4 +1,4 @@
-// FC6 (D-FF3-1): the aggregate-layout substrate witnessed end-to-end via
+// FC6 (D-FF3-1-TARGET-AGGREGATE-LAYOUT-PARAMS): the aggregate-layout substrate witnessed end-to-end via
 // `sizeof`. The compiler computes struct field offsets + padding + total size
 // from per-ABI params in the .target.json (read by the generic type_layout
 // engine), then const-folds `sizeof` through it.

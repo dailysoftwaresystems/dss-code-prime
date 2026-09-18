@@ -53,9 +53,9 @@
 // against the size measured on the SAME OPEN HANDLE. A mismatch in either
 // direction is a torn read and is refused BY NAME.
 //
-// ★ THE SIZE COMPARISON IS ALSO THE FIELD FIX for
-// D-TEST-SHIPPED-CONFIG-READ-FROM-A-TREE-ANOTHER-PROCESS-IS-WRITING: a neighbour
-// rewriting a shipped `.json` IN PLACE opens a short-file window, and a reader
+// ★ THE SIZE COMPARISON IS ALSO THE FIELD FIX FOR READING A CONFIG TREE ANOTHER
+// PROCESS IS WRITING: a neighbour rewriting a shipped `.json` IN PLACE opens a
+// short-file window, and a reader
 // caught inside it now says "the file changed under the reader" instead of
 // emitting a parse error against a prefix.
 //

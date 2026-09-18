@@ -44,7 +44,7 @@ enum class HeaderReadErrorKind : std::uint8_t {
     InternalInvariant            = 7,  // compiler-bug surface — file a bug
 };
 
-// D-FF2-2: source location of the offending construct, set by per-decl
+// D-FF2-2-HEADERREADERROR-SOURCE-LOCATION: source location of the offending construct, set by per-decl
 // rejection sites (HeaderHasFunctionBody / HeaderHasNonExternDecl /
 // HeaderHasUnsupportedTopLevel / InternalInvariant) and by HeaderParseFailed
 // when a downstream lowering emitted a span-bearing diagnostic. Entry-point

@@ -139,8 +139,11 @@ constexpr char const* kPeExecFormat  = "pe64-x86_64-windows-exec";
 // losing it, exactly as every earlier merge in this class kept the more
 // informative form. One owner now:
 // `tests/test_support/vocabulary_message_probe.hpp`, json-free and reachable
-// from every suite; see
-// D-TEST-VOCABULARY-PROBE-MESSAGE-HALF-IS-UNREACHABLE-AND-JSON-COUPLED.
+// from every suite. It lives there and not in
+// `tests/core/vocabulary_projection_probe.hpp` because that header also LOCATES
+// a shipped config document and so drags in `nlohmann/json.hpp`, and because
+// `dss_add_test` puts only `src` and `tests/test_support` on every test
+// target's include path — `tests/core` is on no other suite's.
 using ::dss::test_support::quotedTokens;
 
 [[nodiscard]] bool contains(std::span<std::string_view const> names,

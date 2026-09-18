@@ -9,7 +9,9 @@
 // makes it race-free against a concurrent process AND makes it STEP OVER a
 // stale `.dsstmp-*` left by a killed run instead of silently adopting and
 // TRUNCATING it — the exact defect `tests/test_support/scratch_dir.hpp` records
-// for D-TEST-EXAMPLES-RUNNER-PARALLEL-CONTENTION-FLAKE, one layer down.
+// one layer down, where a PID-seeded path was ADOPTED rather than refused
+// because `create_directories` reports success on a directory that already
+// exists.
 //
 // NOTHING PINNED THAT. Before this file, disabling the exclusive create left
 // EVERY existing link-writer test GREEN. That count is LEG-DEPENDENT, and
@@ -804,8 +806,8 @@ TEST(LinkWriterExclusiveClaim, WriteBytesStepsOverStaleTempsAndNeverAdoptsOne) {
 // fails with `ENOSYS` — "Function not implemented" (40) — in a directory where
 // `mklink` succeeds in the same session, so libstdc++ never even attempts the
 // call and no privilege can change that. The tests below therefore SAY they
-// skipped and WHY rather than silently passing — see
-// D-GATE-INSTRUMENT-SCOPE-UNSTATED.
+// skipped and WHY rather than silently passing: an instrument that does not
+// state what it did NOT cover gets read as having covered everything.
 // ⚠ THEY MUST SKIP BEFORE CONSUMING A SLOT: the ledger above is
 // audited by the integration test, so a skip that had already called
 // `writeBytes` would desynchronise it.

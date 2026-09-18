@@ -80,7 +80,7 @@ DATE-STAMP.** A previous pass did try annotating the rotting number instead of r
 numbers where before there was one, and the caveat lent the second one credibility. A caveat beside
 a stale figure is just a second stale figure. ⇒ the repo's own standing rule is the only stable
 form: *"never re-quote a gate figure — RE-MEASURE at the commit that carries it."*
-Species: [[D-PLANS-SKILL-REFERENCE-ASSERTS-UNRECHECKED-STATUS]].
+Species: a skill reference asserting a status nobody re-checked.
 
 ### Where status actually comes from
 
@@ -88,7 +88,7 @@ Species: [[D-PLANS-SKILL-REFERENCE-ASSERTS-UNRECHECKED-STATUS]].
 |---|---|---|
 | % complete, empirical C coverage, plan-23 arc %, SQLite-readiness, the cross-target emit/run matrix, an ETA | the **`dss-state`** skill — it runs a 104-probe C-feature battery through the REAL CLI and re-derives every axis at the commit you are standing on | any figure written in a document |
 | What the last cycle did, what it owes the next one, the live operator queue | `.plans/_handoff.md` — **READ FIRST**, rewritten every cycle | a plan's §0 summary, which lags |
-| Whether one specific defect is open | that row's own `Status` cell — `bash scripts/anchors/read-anchor.sh <ANCHOR>` prints it, and finds the row in whichever of the three registries holds it | any list, queue or summary that names the row |
+| Whether one specific defect is open | that row's own `Status` cell — `DssHarness read-anchor.sh <ANCHOR>` prints it, and finds the row in whichever registry holds it (two since 2026-09-16: production and the archive) | any list, queue or summary that names the row |
 | Whether it is OPEN vs GATED, and its priority | the same row's `Status` and `Priority` columns, explicit since 2026-09-01 | the glyph leading its `Trigger` prose, which is a second copy the gate cross-checks but does not read |
 | Anchor open/closed counts | `python scripts/check-anchor-balance/check-anchor-balance.py` | a count quoted in prose |
 | Suite size, pass count, timings | run the gate | this file |

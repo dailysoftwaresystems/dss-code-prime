@@ -46,7 +46,9 @@
 #include "scratch_dir.hpp"
 
 // The native-witness skip-vs-fail vocabulary, shared with the two ABI conformance
-// witnesses under tests/core (D-TEST-NATIVE-ORACLE-INERT-ON-POSIX). Spelled relative
+// witnesses under tests/core: a native oracle that skips on error is a broken
+// oracle reporting success, so ABSENT is a skip and PRESENT-and-failing is a red.
+// Spelled relative
 // because only `tests/test_support` is on this target's include path; the header's
 // natural long-term home IS `tests/test_support/`, and moving it there would drop this
 // `../` — deliberately left for whoever owns that shared directory.
@@ -1231,7 +1233,7 @@ namespace {
 // `native_probe::locateMsvcToolchain` is the single implementation, shared with the ABI
 // conformance witnesses; this struct only USES what that returns.
 //
-// D-TEST-NATIVE-ORACLE-INERT-ON-POSIX — a native oracle that skips on error is a broken oracle that reports success.
+// A native oracle that skips on error is a broken oracle that reports success.
 //
 // The lookup used to be written TWICE — once here, once inside `native_c_probe.hpp`'s
 // `findCompiler` — and the copies disagreed about the same machine: this one reddened
@@ -1566,12 +1568,12 @@ TEST(CoffLocalFunctionInArchive, DssBuiltLibMemberCallingAStaticHelperExitsForty
     // leg. EXECUTING that image is a host CAPABILITY, and only Windows has it --
     // the same split `tests/program/test_static_link.cpp` already spells for its
     // pe / elf / Mach-O run arms.
-    // ⚠ D-TEST-COFF-ARCHIVE-RUN-ARM-NOT-HOST-GATED: this arm shipped ungated and
-    // TWO of the three legs then in use hid it. Windows runs a PE natively; WSL
-    // runs one through the interop binfmt handler, so `posix_spawn` succeeds
-    // there and the arm reads as portable. ✔MEASURED 2026-08-21 on the native
-    // aarch64 VPS, which has neither: `posix_spawn(main.exe) failed: rc=8`
-    // (ENOEXEC) -- a red that says nothing about the reader this file tests.
+    // ⚠ THIS ARM SHIPPED UNGATED, and TWO of the three legs then in use hid it.
+    // Windows runs a PE natively; WSL runs one through the interop binfmt
+    // handler, so `posix_spawn` succeeds there and the arm reads as portable.
+    // ✔MEASURED 2026-08-21 on the native aarch64 VPS, which has neither:
+    // `posix_spawn(main.exe) failed: rc=8` (ENOEXEC) -- a red that says nothing
+    // about the reader this file tests.
     // ★ The general shape: A CROSS-COMPILE TEST THAT SPAWNS ITS OUTPUT IS TWO
     // TESTS, and only the second one is about the host.
 #if defined(_WIN32)
@@ -2665,10 +2667,10 @@ namespace {
 
 #if defined(_WIN32)
 // A mingw gcc on PATH, or nothing. LOCATE, then PROVE IT BUILDS -- the same
-// skip-vs-fail discipline as `native_probe::locateMsvcToolchain`
-// (D-TEST-NATIVE-ORACLE-INERT-ON-POSIX): a tool that is ABSENT is a skip, a tool
-// that is PRESENT and fails is a RED. Gating on `where gcc` alone would call a
-// broken install "absent" and quietly retire the witness.
+// skip-vs-fail discipline as `native_probe::locateMsvcToolchain`: a tool that is
+// ABSENT is a skip, a tool that is PRESENT and fails is a RED. Gating on
+// `where gcc` alone would call a broken install "absent" and quietly retire the
+// witness.
 struct MingwGcc {
     bool        usable = false;
     std::string detail;

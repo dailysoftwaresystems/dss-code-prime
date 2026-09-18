@@ -47,6 +47,54 @@ std::string recordedImportIdentity(std::string_view declaredImportName,
     return std::string{readerLibraryPath};
 }
 
+// The thread-storage-duration agreement rule. Doc + rationale + the measured
+// wrong-artifact evidence live on the declaration in `ingest.hpp`; the callers
+// are `ingest()` below (the C/HIR binder) and the `encode` tier's `.s` extern
+// binder in `program/compile_pipeline.cpp` — the same two binders that share
+// `recordedImportIdentity`, for the same reason.
+//
+// ⚠ THE CODE IS BORROWED DELIBERATELY, NOT FOR WANT OF A BETTER ONE.
+// `K_ExternImportAttributeConflict` already means "two declarations of ONE
+// imported symbol disagree about an attribute that SELECTS THE BINDING MODEL",
+// names `isThreadLocal` as one of those attributes, and carries the remediation
+// this fault has ("make the declarations agree"). It is already a member of
+// `kUnsuppressableCodes`, which a silent-miscompile guard REQUIRES: outside
+// that table the reporter's dedup window and per-code cap can drop the
+// diagnostic and restore the silence. What this site broadens is WHOSE second
+// declaration it is — the LIBRARY'S OWN DEFINITION rather than a sibling CU's
+// `extern` — and that widening is not yet written into the code's docblock in
+// `core/types/parse_diagnostic.hpp`, which this lane does not hold.
+bool reportLibraryThreadStorageDisagreement(std::string_view    mangledName,
+                                            std::string_view    libraryIdentity,
+                                            SymbolKind          librarySymbolKind,
+                                            bool                declaredThreadLocal,
+                                            DiagnosticReporter& reporter) {
+    if (librarySymbolKind != SymbolKind::Tls) return false;
+    if (declaredThreadLocal) return false;
+    dss::report(
+        reporter, DiagnosticCode::K_ExternImportAttributeConflict,
+        DiagnosticSeverity::Error,
+        std::format(
+            "extern import '{}': library '{}' defines it with THREAD STORAGE "
+            "DURATION (a thread-local), but the reference declares it as an "
+            "ordinary object — a non-thread-local reference cannot name a "
+            "thread-local definition (C23 6.7.1p3 requires the storage "
+            "duration to agree on every declaration). The two bind through "
+            "different machinery and neither substitutes for the other: an "
+            "ordinary data import binds got-indirect, ONE process-shared "
+            "address for every thread, so accepting this would hand the "
+            "program a datum that is not its thread's. Declare the reference "
+            "`_Thread_local` (or `thread_local`) to match the definition. "
+            "⚠ Doing so currently reaches a second, DIFFERENT refusal — "
+            "binding a library thread-local needs the initial-exec TLS model, "
+            "which is not implemented "
+            "(D-CSUBSET-THREAD-LOCAL-INITIAL-EXEC); an intra-program "
+            "`extern thread_local` resolves by compiling it with its defining "
+            "translation unit. (D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA)",
+            mangledName, libraryIdentity));
+    return true;
+}
+
 // ── The FormatGuess → ObjectFormatKind vocabulary map ───────────────────────
 //
 // A pure TRANSLATION between two closed enums, in the same shape as
@@ -897,6 +945,25 @@ ingest(std::span<IngestionSource const> sources,
             unapplyCMangling(linkerName, format.cSymbolDecoration().scheme));
         if (it == bySymbol.end()) continue;  // unmatched -> caller applies policy
         TaggedRow const& matched = *it->second;
+
+        // D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA: the matched row is the
+        // LIBRARY'S OWN ANSWER about this name, and this is the first and only
+        // moment both answers are in scope — the declaration's storage duration
+        // (`ext.isThreadLocal`, the source spelling) and the definition's
+        // (`matched.row.kind`, what the export table says). BIND ONLY IF THEY
+        // AGREE. The reader has classified `STT_TLS` since FF1 shipped and
+        // nothing consumed it; that dangling fact is what let a plain
+        // `extern int` bind a thread-local as ordinary data and read the
+        // library's ELF header at run time. Reported as an Error, so the row is
+        // left UNBOUND rather than written half-right behind a refusal.
+        if (reportLibraryThreadStorageDisagreement(
+                linkerName,
+                recordedImportIdentity(matched.declaredImportName,
+                                       matched.row.soname,
+                                       matched.row.libraryPath),
+                matched.row.kind, ext.isThreadLocal, reporter)) {
+            continue;
+        }
 
         FfiMetadata meta{};
         meta.mangledName   = linkerName;

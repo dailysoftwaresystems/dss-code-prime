@@ -85,8 +85,8 @@ leg_tree_abs() {
 # from this repository's root answered `dailysoftwaresystems/dss-code-prime`, and HTTP 404 under
 # another repository's GIT_DIR, and again under GIT_DIR + GIT_WORK_TREE -- gh had resolved THAT
 # repository's origin -- so `check-ci-legs.sh` asked about another repository's CI even when it was
-# given the branch. What is removed is a property of the CALLER'S ENVIRONMENT, so it has one owner
-# whatever the command. ⚠ An empty command is refused (rc 4): `exec` with nothing runs nothing, rc 0.
+# given the branch (that pair is retired; `dssharness check-ci-legs` reads the verdict now). What is
+# removed is a property of the CALLER'S ENVIRONMENT, so it has one owner whatever the command. ⚠ An empty command is refused (rc 4): `exec` with nothing runs nothing, rc 0.
 #
 # ★★★ WHY. `git -C <dir>` and `cd <dir>` move git's working directory and NOTHING ELSE: an
 # exported GIT_DIR, GIT_WORK_TREE or GIT_INDEX_FILE still decides which repository answers.
@@ -565,12 +565,23 @@ leg_tree_restore() {
 #
 # leg_tree_remote_command <helper-file> <verb> [arg]...
 #
+# ⛔ THE CARRIAGE HALF OF THIS FILE HAS NO CALLER LEFT. The three leg drivers that used
+# `leg_tree_remote_command`, `leg_tree_prepare` and `leg_tree_restore` went with the DssHarness
+# migration of the gate runners; `dssharness sync` puts each host's copy on the tree under test and
+# verifies it afterwards. What keeps this FILE alive is its other half -- it is the `.sh` owner of
+# "which tree am I standing in" (`leg_tree_driver_identity`, `leg_tree_git_unsteered`,
+# `leg_tree_owning_root`), sourced at runtime by `check-line-endings.sh`, `check-root-litter.sh` and
+# `lane-worktree.sh`, so it retires with its LAST CONSUMER beside `repo-tree.ps1` and
+# `owning-tree.py`, not with the legs. The measurements below are kept because they are why the
+# transport is shaped this way, not because the drivers are still there to read.
+#
 # Print the ONE command a carriage hands its host so that `<verb> <arg>...` of this helper runs
 # there, when the carriage's STANDARD INPUT is <helper-file>'s bytes:
 #     sh -c '<LEG_TREE_REMOTE_LOADER>' leg-tree <bytes> <verb> '<arg>'...
 # Its length depends on the arguments and never on the helper. The drivers use it as
 #     <carriage> "$(leg_tree_remote_command "$helper" prepare "$repo" "$branch" "$sha")" < "$helper"
-# and `macos-leg.ps1` builds the identical command from the same loader line (its test compares them).
+# and the PowerShell driver built the identical command from the same loader line, which its own
+# test compared -- both retired with the migration.
 #
 # ★★★ WHY. Every driver used to send this file's TEXT as one command-line argument, so each one
 # worked only while the file stayed under the smallest ceiling its path crossed. ✔MEASURED

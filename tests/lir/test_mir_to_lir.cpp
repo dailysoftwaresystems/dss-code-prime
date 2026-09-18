@@ -2233,10 +2233,18 @@ TEST(MirToLir, UnsupportedMirOpcodeFailsLoud) {
 TEST(MirToLir, IfElseLowersToCondBrChain) {
     // `int sign(int x) { if (x > 0) return 1; return 0; }`
     // MIR: ICmpSgt + CondBr + return-blocks.
-    // LIR: cmp+setcc / cmp+jcc / mov+ret in each branch / mov+ret in the
-    // join. Cycle 3b's "lower each MIR op naively" approach (no
-    // ICmp+CondBr peephole) is asserted here so the optimizer can later
-    // delete the redundant cmp/setcc.
+    // LIR: a single fused `cmp x, 0; jcc-Sgt`, then mov+ret in each branch.
+    //
+    // ⚠ THIS ARM USED TO ASSERT A `setcc` IN THE ENTRY BLOCK, and its comment
+    // said so out loud: *"cycle 3b's 'lower each MIR op naively' approach (no
+    // ICmp+CondBr peephole) is asserted here so the optimizer can later delete
+    // the redundant cmp/setcc"*. It was pinning a placeholder against the day
+    // the deletion arrived. It has (D-LIR-SETCC-DEAD-AFTER-FUSION): the
+    // compare's Bool is read by NOTHING but the CondBr that re-derives the
+    // flags for itself, so the use-count gate declines to mint the
+    // `cmp → setcc → zext` trio at all. The absence is now the assertion, and
+    // it is asserted BESIDE the `cmp` and the `jcc` that must still be there —
+    // a branch that silently stopped fusing would also have no setcc.
     auto L = lowerCToLir(
         "int sign(int x) { if (x > 0) return 1; return 0; }");
     assertUpstreamClean(L);
@@ -2255,28 +2263,48 @@ TEST(MirToLir, IfElseLowersToCondBrChain) {
     EXPECT_EQ(lir.instOpcode(entryTerm), *sch.opcodeByMnemonic("jcc"))
         << "entry block must end in jcc for an if/else";
 
-    // Somewhere in the entry block there's a `cmp` (the CondBr-side compare)
-    // and a `setcc` (the ICmpSgt-side materialization).
-    bool foundCmp = false, foundSetcc = false;
+    // The entry block holds the FUSED compare — exactly one — and no
+    // materialization of a Bool that nothing reads.
+    std::uint32_t cmpCount = 0, setccCount = 0;
     auto const cmpOp   = *sch.opcodeByMnemonic("cmp");
     auto const setccOp = *sch.opcodeByMnemonic("setcc");
     for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
         auto const o = lir.instOpcode(lir.blockInstAt(entry, i));
-        if (o == cmpOp)   foundCmp   = true;
-        if (o == setccOp) foundSetcc = true;
+        if (o == cmpOp)   ++cmpCount;
+        if (o == setccOp) ++setccCount;
     }
-    EXPECT_TRUE(foundCmp)   << "ICmp/CondBr must emit at least one cmp";
-    EXPECT_TRUE(foundSetcc) << "ICmpSgt must materialize a bool via setcc";
+    EXPECT_EQ(cmpCount, 1u)
+        << "the fused branch re-emits the compare, and that is the only "
+           "compare this function needs";
+    EXPECT_EQ(setccCount, 0u)
+        << "nothing reads the ICmpSgt's Bool but the branch that fuses it, so "
+           "no setcc materializes it (D-LIR-SETCC-DEAD-AFTER-FUSION)";
+    EXPECT_EQ(lir.instPayload(entryTerm),
+              static_cast<std::uint32_t>(::dss::TargetCondCode::Sgt))
+        << "and the jcc carries the COMPARE's condition — without this, a "
+           "branch that stopped fusing would satisfy the setcc absence above";
 }
 
 TEST(MirToLir, SignedICmpVariantsLowerWithCorrectSetccPayload) {
     // C-subset's `int` is signed, so the surface-visible comparison ops
     // (`==`/`!=`/`<`/`<=`/`>`/`>=`) lower to the signed conditions only.
-    // Each test source feeds the comparison through `if (...)` so the
-    // setcc is emitted (CondBr re-fetches via cmp+0; the setcc isn't the
-    // immediate predecessor of the jcc — but it MUST appear in the entry
-    // block carrying the right condition). Unsigned variants need a
-    // synthetic-MIR helper (deferred to cycle 3c).
+    // The SUBJECT is the `condCodeForICmp` mapping, read off the setcc's
+    // payload: a regression mapping (say) ICmpEq → Sle passes every other test
+    // in this file and fails here.
+    //
+    // ⚠ EACH SOURCE USED TO BE `if (a OP b) return 1; return 0;` AND THAT
+    // SHAPE NO LONGER EMITS A setcc AT ALL. Its Bool was read by nothing but
+    // the CondBr that fuses it, so the use-count gate
+    // (D-LIR-SETCC-DEAD-AFTER-FUSION) declines to materialize it — and a
+    // subject that has ceased to exist is not a weaker pin, it is a vacuous
+    // one, because the loop would simply never find a setcc to disagree with.
+    // The source is now `return a OP b;`, which RETURNS the Bool: a genuine
+    // consumer, the materialization every `condCodeForICmp` row is actually
+    // for, and the same six-way mapping. The FUSED half of the mapping is
+    // pinned separately on the jcc payload —
+    // `CondBrFusesIcmpConditionIntoJccPayload` below and
+    // `tests/lir/test_lir_fused_compare_dce.cpp`.
+    // Unsigned variants need a synthetic-MIR helper (deferred to cycle 3c).
     struct Case { char const* op; ::dss::TargetCondCode cond; };
     std::array<Case, 6> cases{{
         {"==", ::dss::TargetCondCode::Eq},
@@ -2291,8 +2319,8 @@ TEST(MirToLir, SignedICmpVariantsLowerWithCorrectSetccPayload) {
         return *(*sch)->opcodeByMnemonic("setcc");
     }();
     for (auto const& [op, expectedCond] : cases) {
-        std::string src = std::string{"int f(int a, int b) { if (a "} +
-                          op + " b) return 1; return 0; }";
+        std::string src = std::string{"int f(int a, int b) { return a "} +
+                          op + " b; }";
         auto L = lowerCToLir(src);
         assertUpstreamClean(L);
         ASSERT_TRUE(L.lir.ok) << "ICmp `" << op << "` must lower cleanly";
@@ -2313,7 +2341,9 @@ TEST(MirToLir, SignedICmpVariantsLowerWithCorrectSetccPayload) {
             break;
         }
         EXPECT_TRUE(foundCorrectSetcc)
-            << "ICmp `" << op << "` must emit a setcc in the entry block";
+            << "ICmp `" << op << "` must emit a setcc in the entry block — a "
+               "RETURNED Bool is a real consumer, so the use-count gate must "
+               "not reach it";
     }
 }
 
@@ -2676,7 +2706,7 @@ TEST(MirToLir, WideLiteralRoutesThroughLiteralPool) {
 // ─── cycle 3d: bitwise + float arithmetic + cross-class Bitcast ──────────
 //
 // `SyntheticFn` / `buildSyntheticFn` were promoted to `synthetic_fn.hpp`
-// (ML6 cycle 1, cycle-3e deferral D-3e.7) so the new
+// (ML6 cycle 1, cycle-3e deferral D-PLAN12-BUILDSYNTHETICFN-TEST-HELPER-PROMOTION-LIFT-FROM-TESTS-LIR) so the new
 // `test_lir_liveness` binary can share the same harness. The shared
 // namespace is `dss::test_support` (not `dss::testing` — gtest already
 // owns the `::testing` namespace and `using namespace dss;` would
@@ -2895,7 +2925,7 @@ TEST(MirToLir, BitcastCrossClassFprToGprUsesTheDeclaredPairMove) {
 }
 
 TEST(MirToLir, BitcastCrossClassGprToFprUsesTheDeclaredPairMove) {
-    // The reverse direction (cycle-3e deferral D-3e.8 folded ML6 cycle 1).
+    // The reverse direction (cycle-3e deferral D-PLAN12-REVERSE-BITCAST-I64-F64-TEST-CURRENTLY-ONLY-F64 folded ML6 cycle 1).
     // ★ IT IS A SEPARATE OPCODE ON BOTH TARGETS AND DELIBERATELY SO: the
     // encoding-variant guard keys only on (operandKinds, width) and both
     // directions are `reg` at the same width, so one opcode carrying both
@@ -2980,9 +3010,10 @@ TEST_P(MirToLirCastMapping, EmitsExpectedMnemonicAndRegClass) {
 
     // Synthetic MIR: single src-typed arg → cast → return dst-typed value.
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    // D-TEST-LIR-AND-LINK-SUITES-MINT-AN-OPERAND-LESS-PTR: the IntToPtr /
-    // PtrToInt / Bitcast rows name `Ptr`, which is structural — the ONE resolver
-    // in `synthetic_fn.hpp` builds the opaque `void*` the row means.
+    // The IntToPtr / PtrToInt / Bitcast rows name `Ptr`, which is structural,
+    // and a probe that minted an operand-less one interned a pointer with NO
+    // pointee — the ONE resolver in `synthetic_fn.hpp` builds the opaque
+    // `void*` these rows mean.
     auto const srcT = ::dss::test_support::probeTypeOfKind(interner, param.srcKind);
     auto const dstT = ::dss::test_support::probeTypeOfKind(interner, param.dstKind);
     std::array<::dss::TypeId, 1> params{srcT};
@@ -4186,7 +4217,7 @@ TEST(MirToLir, DirectCallEmitsCallOpcode) {
 
     auto const leaOp  = *sch.opcodeByMnemonic("lea");
     auto const callOp = *sch.opcodeByMnemonic("call");
-    // D-ML7-2.9 (dead-callee-LEA suppression): a DIRECT call's callee is modeled
+    // D-PLAN12-CLOSED-2026-C50-DEAD-CALLEE-ADDRESS-LEA-SUPPRESSED (dead-callee-LEA suppression): a DIRECT call's callee is modeled
     // as a standalone GlobalAddr(f). `lowerCall` folds f's SymbolId straight into
     // the `call` (a SymbolRef operand) and NEVER reads the GlobalAddr's lea vreg,
     // so `globalAddrFoldsIntoDirectCall` now SUPPRESSES that lea (previously it was
@@ -4216,7 +4247,7 @@ TEST(MirToLir, DirectCallEmitsCallOpcode) {
     // RED-ON-DISABLE: revert `globalAddrFoldsIntoDirectCall` → the dead callee lea
     // reappears → this EXPECT_FALSE fails.
     EXPECT_FALSE(foundGlobalAddrLea)
-        << "the dead GlobalAddr(f) callee LEA must be SUPPRESSED (D-ML7-2.9) — "
+        << "the dead GlobalAddr(f) callee LEA must be SUPPRESSED (D-PLAN12-CLOSED-2026-C50-DEAD-CALLEE-ADDRESS-LEA-SUPPRESSED) — "
            "lowerCall folds the symbol straight into the direct call";
     EXPECT_TRUE(foundCall) << "Call must emit the `call` opcode";
     EXPECT_TRUE(callFoldsCalleeSymbol)
@@ -5102,8 +5133,8 @@ TEST(MirToLir, U32CompareLowersWithThirtyTwoBitCmpWidth) {
 }
 
 // ── audit-residue sweep c1: the FUSED ICmp+CondBr cmp width pin ─────────
-// D-AUDIT-FUSED-CMP-WIDTH-PIN: lowerCondBr's ICmp-fusion arm emits its
-// OWN `cmp lhs, rhs` (immediately before the jcc) — a SEPARATE emit
+// lowerCondBr's ICmp-fusion arm emits its OWN `cmp lhs, rhs`
+// (immediately before the jcc) — a SEPARATE emit
 // site from lowerICmp's value-path cmp (which the U32Compare… pin
 // above covers). The fused cmp's width must follow the ICmp OPERANDS'
 // type, the same FC3-c2 rule. Because the 32-bit producers zero the
@@ -5212,7 +5243,7 @@ TEST(MirToLir, FusedI32CompareCondBrCmpCarriesThirtyTwoBitWidth) {
         EXPECT_EQ(s.fusedCmpWidthBits, 32u)
             << "the FUSED cmp over I32 operands must read 32 bits — "
                "width-64 here reads zero-extended upper bits and calls "
-               "a negative int positive (D-AUDIT-FUSED-CMP-WIDTH-PIN)";
+               "a negative int positive";
     }
 }
 
@@ -5248,10 +5279,10 @@ namespace {
     auto target = ::dss::TargetSchema::loadShipped("x86_64");
     EXPECT_TRUE(target.has_value());
     ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
-    // D-TEST-LIR-AND-LINK-SUITES-MINT-AN-OPERAND-LESS-PTR: three `CastCase` rows
-    // below name `Ptr` as a src or dst kind (IntToPtr / PtrToInt / Bitcast), and
-    // `primitive(TypeKind::Ptr)` would mint a pointer with NO pointee. The ONE
-    // resolver in `synthetic_fn.hpp` builds what the row means.
+    // Three `CastCase` rows below name `Ptr` as a src or dst kind (IntToPtr /
+    // PtrToInt / Bitcast), and `primitive(TypeKind::Ptr)` would mint a pointer
+    // with NO pointee. The ONE resolver in `synthetic_fn.hpp` builds what the
+    // row means.
     auto const srcTy = ::dss::test_support::probeTypeOfKind(interner, src);
     auto const dstTy = ::dss::test_support::probeTypeOfKind(interner, dst);
     std::array<::dss::TypeId, 1> params{srcTy};
@@ -8128,9 +8159,9 @@ TEST(MirToLir, VlaOverAlignedElementLowers) {
             << "L_OverAlignedStackLocal survives only as the non-power-of-two invariant "
                "guard; an ordinary _Alignas(32) element must not reach it";
     }
-    // ⚠ A lowering that emitted NOTHING would satisfy both assertions vacuously — the
-    // exact class D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO
-    // was closed for this cycle. Assert a POSITIVE count rather than trusting `ok`.
+    // ⚠ A lowering that emitted NOTHING would satisfy both assertions vacuously —
+    // the exact class a front end that lowers a many-arg call to nothing puts
+    // every pin into. Assert a POSITIVE count rather than trusting `ok`.
     std::uint32_t insts = 0;
     for (std::size_t f = 0; f < L.lir.lir.moduleFuncCount(); ++f) {
         LirFuncId const fn = L.lir.lir.funcAt(static_cast<std::uint32_t>(f));

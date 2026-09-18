@@ -338,7 +338,9 @@ def main() -> int:
         print(f'no-abort-in-tests: OK ({scanned} files scanned; {total} '
               f'pre-existing site(s) in {len(per_file)} file(s), all within the '
               f'INVENTORY ratchet; {len(ALLOWLIST)} allowlisted by proof). '
-              f'DEBT, not a pass - see D-TEST-ABORT-IN-A-FIXTURE-HAS-NO-GUARD.')
+              f'DEBT, not a pass - every INVENTORY site is a live abort() that still '
+              f'kills the whole test PROCESS, taking every sibling test\'s verdict with '
+              f'it. Green here means only that no NEW site landed.')
     else:
         print(f'no-abort-in-tests: OK ({scanned} files, 0 live abort() call '
               f'sites, {len(ALLOWLIST)} allowlisted)')

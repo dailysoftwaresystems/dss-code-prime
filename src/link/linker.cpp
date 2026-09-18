@@ -7,6 +7,7 @@
 #include "core/types/section_kind.hpp"        // relocBearingGlobalSection (c145 chokepoint)
 #include "core/types/type_lattice/type_layout.hpp"  // scalarByteSize — the null import slot's pointer width
 #include "link/cross_cu_resolve.hpp"
+#include "link/branch_veneers.hpp"
 #include "link/entry_trampoline.hpp"
 #include "link/fresh_symbol_ids.hpp"   // maxExistingSymbolIdV — the ONE taken-id scan
 #include "link/static_init_tables.hpp"
@@ -2322,6 +2323,30 @@ LinkedImage link(std::span<AssembledModule const> modules,
             return image;
         }
         moduleP = &moduleCopy;
+        image.expectedFuncCount = moduleCopy.expectedFuncCount;
+    }
+    // ── [[D-LK-AARCH64-CALL26-BEYOND-RANGE-HAS-NO-VENEER]] ──────────────
+    //
+    // A call whose callee is beyond its relocation field's reach is refused by
+    // `applyExecRelocations` — correctly, but with nothing to do about it. The
+    // veneer pass gives it somewhere nearer to aim: a one-instruction synthetic
+    // function holding the same unconditional branch, re-aimed at the callee.
+    // Its sibling [[D-CSUBSET-LONG-BRANCH]] does exactly this WITHIN a function,
+    // with branch islands between instructions.
+    //
+    // ⚠ THE `needsVeneers` PRE-CHECK IS THE COPY-ON-WRITE DISCIPLINE, NOT AN
+    // OPTIMIZATION (D-LK10-ENTRY-MODULE-COW). `moduleCopy` exists only when the
+    // trampoline was injected; a module that needs no veneer must not be cloned
+    // at all, and the overwhelmingly common case needs none.
+    if (branchVeneersNeeded(*moduleP, targetSchema)) {
+        if (moduleP != &moduleCopy) {
+            moduleCopy = inputModule;
+            moduleP    = &moduleCopy;
+        }
+        if (!injectBranchVeneers(moduleCopy, targetSchema, reporter)) {
+            image.resolvedFuncCount = 0;
+            return image;
+        }
         image.expectedFuncCount = moduleCopy.expectedFuncCount;
     }
     AssembledModule const& module = *moduleP;

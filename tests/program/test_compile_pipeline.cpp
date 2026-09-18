@@ -152,7 +152,7 @@ TEST(Program_CompileFiles, ZeroArgFunctionWiresThroughPipeline) {
     // closed the encoder half (load/store with `[base+disp32]`
     // addressing + add/sub reg+imm32 for prologue/epilogue SP
     // adjustment). The remaining D-AS4-1 sub-items (`lea` encoding,
-    // indexed/scaled addressing — D-AS4-5, Disp8 form) are unrelated
+    // indexed/scaled addressing — D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL, Disp8 form) are unrelated
     // to the c zero-arg corpus and stay deferred.
     auto const outDir = scratch.path() / "target" / "elf64-x86_64-linux";
     ASSERT_TRUE(fs::is_directory(outDir));
@@ -1199,13 +1199,13 @@ TEST(Program_CompileFiles, MultiTargetMismatchAggregatesToNonZeroExit) {
     EXPECT_EQ(rc, 1) << "multi-target compile with errors must exit 1";
 }
 
-// ── D-LK6-8.2 pr-test-analyzer Gap 5 P9: cross-validate wired ──
+// ── D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET pr-test-analyzer Gap 5 P9: cross-validate wired ──
 // Pins that crossValidateTargetFormat IS INVOKED from the compile
 // pipeline (program.cpp call site between schema-load and
 // compileSingleUnit). Without this, a refactor could quietly remove
 // the call and every cross-validation case would silently pass
 // through to compileSingleUnit — exactly the silent-failure surface
-// D-LK6-8.2 was anchored to close. Pair (target=x86_64,
+// D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET was anchored to close. Pair (target=x86_64,
 // format=elf64-aarch64-linux): the schemas load individually, but
 // the (62 vs 183) elf.machine mismatch trips cross-validate and
 // compileFiles returns non-zero.
@@ -1795,8 +1795,10 @@ TEST(Program_Transpile, SuppressedPlanNotLandedStillReturnsNonZero) {
 // fail. The H1 fix's load-bearing path is suppressible per-target
 // diagnostics; pinning it requires a suppressible per-target
 // emitter, which doesn't exist in the c path today.
-// Anchored as D-H1-SUPPRESSIBLE-PER-TARGET-PIN (trigger: first
-// suppressible code that fires reliably on the per-target path).
+// DEFERRED, and no registry row tracks it: the pin needs a
+// suppressible per-target emitter, so it becomes writable only
+// with the first suppressible code that fires reliably on the
+// per-target path.
 // ★★ P65 — RE-POINTED, AND THIS ONE'S SUBJECT IS THE CODE ITSELF, which is why
 // it could NOT take a different failure. The claim is that
 // `H_ExternHasInitializer` specifically stays visible through the whole

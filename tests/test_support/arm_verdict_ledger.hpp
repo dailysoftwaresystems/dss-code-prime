@@ -1,6 +1,6 @@
 #pragma once
 
-// D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT — A VERDICT FOR EVERY DECLARED ARM.
+// A VERDICT FOR EVERY DECLARED ARM — A CROSS-ARCH SKIP MUST NOT YIELD SILENCE.
 //
 // THE DEFECT THIS CLOSES (measured 2026-08-03, both corpus harnesses): when a
 // target arm's arch differed from the host's and EITHER the manifest declared
@@ -39,12 +39,11 @@
 //   * HARNESS     (`NotSelectedByRunner`) — the CLI-subprocess runner binds ONE
 //     target per manifest (`selectBoundTargetIndex` below: the host's own arch
 //     where the manifest offers it, else the first `runOn` match), so the other
-//     matching targets are never considered
-//     (D-TEST-CLI-HARNESS-BINDS-FIRST-MATCHING-TARGET, whose remaining half is
-//     that ONE is bound at all). Ledgered honestly rather than left absent or
-//     miscounted as a skip. NEVER a failure, not even in strict mode: it is a
-//     known harness limitation with its own anchor, and failing on it would make
-//     strict mode unusable until that anchor closes.
+//     matching targets are never considered — a known limitation of that
+//     runner, whose remaining half is that ONE is bound at all. Ledgered
+//     honestly rather than left absent or miscounted as a skip. NEVER a
+//     failure, not even in strict mode: failing on a limitation of the harness
+//     itself would make strict mode unusable until the harness is rewritten.
 //
 // AGNOSTIC: nothing here hardcodes an arch, an OS or an emulator name. Every
 // decision keys on values the MANIFEST declared (`spec`, `runOn`, `emulator`)
@@ -148,7 +147,7 @@ namespace dss::test_support {
 // scope; both copies carried a ⚠ naming this fold as the fix. One
 // spec-splitting vocabulary, one definition: the two harnesses must not be able
 // to disagree about how a spec splits, which is exactly the divergence class
-// `D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT` cost us once already.
+// that cost us a whole leg of silent skips once already.
 [[nodiscard]] inline std::string specFormatName(std::string const& spec) {
     auto const colon = spec.find(':');
     return colon == std::string::npos ? std::string{} : spec.substr(colon + 1);
@@ -156,7 +155,7 @@ namespace dss::test_support {
 
 // ── WHICH TARGET A ONE-TARGET-PER-MANIFEST RUNNER BINDS ON THIS HOST ───────
 //
-// D-TEST-INTEGRATED-TESTS-CANNOT-PASS-ON-A-NATIVE-ARM64-LINUX-HOST. The
+// WHY THE INTEGRATED TESTS COULD NOT PASS ON A NATIVE ARM64 LINUX HOST. The
 // CLI-subprocess runner builds and spawns ONE target per manifest (its
 // in-process sibling iterates all of them), and it used to bind the FIRST
 // target whose `runOn` admits the host. `runOn` names an OS, not a MACHINE:
@@ -224,7 +223,7 @@ selectBoundTargetIndex(std::vector<HostBindingCandidate> const& candidates,
     return firstRunOnMatch;
 }
 
-// D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY, closing-work item (2), first half: the
+// `QEMU_LD_PREFIX` MUST NOT BE AMBIENT-ONLY, first half: the
 // remedy line to append to a FAILING run's message when that run went through
 // qemu-user with `QEMU_LD_PREFIX` unset. Empty in every other case, so a native
 // arm's failure text is never padded with an irrelevant environment lecture.
@@ -348,16 +347,18 @@ enum class ArmVerdict {
                                 // machine — the sqlite harness's resolve-library
                                 // binaries (tcl86.dll for the pe64 leg, libtcl
                                 // .so for an elf leg, …) or a leg's target C
-                                // compiler. D-HARNESS-CROSS-HOST-ANY-TARGET: the
-                                // BUILD of a declared leg is attempted on every
-                                // host, so "this box has no copy of the target's
-                                // tcl runtime" needed a name of its own. It is
+                                // compiler. Because ANY target must be buildable
+                                // inside ANY host, the BUILD of a declared leg is
+                                // attempted on every host — so "this box has no
+                                // copy of the target's tcl runtime" needed a name
+                                // of its own. It is
                                 // NOT `Poisoned` (nothing was miscompiled) and
                                 // NOT structural (another machine, same
                                 // manifest, builds it fine) — it is the build
                                 // twin of SkippedEmulatorMissing, and strict
                                 // mode promotes both for the same reason.
-    // HARNESS limitation — see D-TEST-CLI-HARNESS-BINDS-FIRST-MATCHING-TARGET.
+    // HARNESS limitation — the CLI runner binds ONE target per manifest; see
+    // `selectBoundTargetIndex` above.
     NotSelectedByRunner,        // runOn matched, but another target was bound first
     // FAILURE — every assertion has already fired at the recording site.
     Poisoned,                   // compile failed / artifact missing / spawn failed
@@ -625,8 +626,8 @@ public:
             o << "  ★ LEDGER ACCOUNTING HOLE: " << accountedCount()
               << " of " << total()
               << " records fall in a reported class — the rest belong to NO"
-                 " class and have VANISHED from this line"
-                 " (D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT)";
+                 " class and have VANISHED from this line, which is the silent"
+                 " cross-arch skip this ledger exists to end";
         }
         return o.str();
     }
@@ -664,7 +665,7 @@ private:
 
 // ── Manifest lint: a cross-arch-capable arm must declare an emulator ───────
 //
-// D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR. Exactly ONE manifest in a
+// WHAT IT CAUGHT. Exactly ONE manifest in a
 // 557-manifest corpus declared an `arm64:elf64-aarch64-linux-exec` arm with no
 // `emulator`, against 449 siblings that declare `qemu-aarch64` on the same
 // (arch, runOn-OS) pair — so it was skipped on every x86_64 Linux host forever
@@ -751,7 +752,7 @@ lintDeclaredEmulators(std::vector<DeclaredArm> const& arms) {
           << " sibling arm(s) with the same (arch=" << k.first
           << ", runOn=" << k.second << ") declare '" << *it->second.begin()
           << "' — this arm is silently skipped on every host of a different"
-             " arch (D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR)";
+             " arch, so it can only ever run on native hardware";
         findings.push_back({a.manifest, a.spec, k.first, k.second, o.str()});
     }
     return findings;

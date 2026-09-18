@@ -411,6 +411,9 @@ disassemble(TargetSchema const&            schema,
                 case EncodingSlotKind::Imm32MovzMovk:
                 case EncodingSlotKind::SymbolPatchMarker:
                 case EncodingSlotKind::Imm19:
+                // [[D-CSUBSET-LONG-BRANCH]]: the TBZ/TBNZ imm14 is a
+                // fixed32 bit-window slot, like Imm19.
+                case EncodingSlotKind::Imm14:
                 // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE: the
                 // inverted-imm16 (complement-immediate) slot is fixed32,
                 // like Imm16 whose window it shares.

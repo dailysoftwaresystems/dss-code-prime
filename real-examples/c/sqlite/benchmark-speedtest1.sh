@@ -469,7 +469,7 @@ if [[ -z "$DSS_BIN" ]]; then
       die "the only dsscp under $SRC_DIR/build is a ${_dss_other_type} build: $_dss_other
       A debug compiler's build time is not a number worth publishing, and a
       benchmark cannot tell a slow compiler from a wrongly-selected one.
-      Build a release one:  scripts/local-build/local-build.sh --tree rel
+      Build a release one:  dssharness build --legs <a release leg; dssharness legs lists them>
       Pass one explicitly:  --dss <path>
       Or override on purpose: DSS_ALLOW_NONRELEASE_COMPILER=1 $0"
     fi
@@ -486,7 +486,7 @@ if [[ -n "${DSS_BIN:-}" && ! -x "$DSS_BIN" ]]; then
       (the compiler is named 'dsscp[.exe]', not 'dss')"
 fi
 [[ -n "${DSS_BIN:-}" ]] || die "no dsscp binary found.
-      Pass --dss <path>, or build one: scripts/local-build/local-build.sh --tree rel
+      Pass --dss <path>, or build one: dssharness build --legs <a release leg; dssharness legs lists them>
       Searched for an executable named dsscp* under $SRC_DIR/build/."
 # ⚠ THE BUILD TYPE IS PRINTED BESIDE THE PATH, ALWAYS. A benchmark cannot tell a
 # slow compiler from a wrongly-selected one, so the reader must be able to. A path
@@ -739,7 +739,7 @@ elif python3 "$BENCH_CORE" --preflight-dss "$DSS_BIN" --config-root "$DSS_CONFIG
 else
   die "the dss pre-flight refused (its diagnostic is above). Nothing is measured
       against a compiler that cannot compile three lines. Rebuild it:
-        scripts/local-build/local-build.sh --tree rel"
+        dssharness build --legs <a release leg; dssharness legs lists them>"
 fi
 
 OUT_DIR="${OUT_DIR:-$SQLITE_DIR/bld-dss-bench}"

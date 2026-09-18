@@ -29,7 +29,7 @@
 //     code paths (`findShippedConfig` walks UP from cwd looking for
 //     `src/dss-config/`), because a temp-rooted scratch breaks the walk.
 //
-// UNIQUENESS (`D-TEST-EXAMPLES-RUNNER-PARALLEL-CONTENTION-FLAKE`, corrected
+// UNIQUENESS (the examples-runner parallel-contention flake, corrected
 // TF-C58 2026-07-24). A PID seed plus an atomic counter is NOT by itself a
 // guarantee, and this docblock used to claim it was. The original code built
 // the path from PID+counter and called `create_directories`, which reports

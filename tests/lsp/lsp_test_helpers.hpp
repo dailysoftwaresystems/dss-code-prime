@@ -125,8 +125,8 @@ public:
         // (cycle P34): `buildSchemaFromJsonText` compiles to a **415,360-byte**
         // frame under clang -O0, so all four LSP binaries died `Bus error` on macOS
         // and passed everywhere else. The harness was emulating an 8 MiB thread
-        // with 1/16th of its stack.
-        // D-TEST-LSP-HARNESS-RAN-THE-SERVER-LOOP-ON-A-HOST-DEFAULT-STACK
+        // with 1/16th of its stack: this harness ran the server loop on the
+        // HOST'S DEFAULT stack instead of the one production gives it.
         , serverThread_(kServerLoopStackBytes, [this] {
               // Nothing may escape a thread entry, and a `run()` that threw would
               // otherwise leave the promise unsatisfied -- which `runUntilExit`
@@ -199,7 +199,8 @@ public:
     // expected EXIT CODE, so a bare -1 reads as `Which is: -1` — a wrong exit
     // status, which is not what happened. The added failure names the real event;
     // the -1 return is kept so no call site has to change.
-    // D-TEST-LSP-WAIT-DEADLINE-IS-SIZED-FOR-AN-IDLE-HOST
+    // ⚠ The default comes from the shared cap, never from a local literal: a
+    // wait deadline sized for an IDLE host reds on a loaded one.
     [[nodiscard]] int runUntilExit(
         std::chrono::seconds timeout = dss::test_support::kWaitBudget) {
         if (exitFuture_.wait_for(timeout) != std::future_status::ready) {

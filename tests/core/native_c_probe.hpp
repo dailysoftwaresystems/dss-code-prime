@@ -11,7 +11,7 @@
 // what makes "fixed in one place" actually mean "fixed everywhere", and it is the
 // reason the fix below cannot silently apply to only one of the two batteries.
 //
-// D-TEST-NATIVE-ORACLE-INERT-ON-POSIX — a native oracle that skips on error is a broken oracle that reports success.
+// A native oracle that skips on error is a broken oracle that reports success.
 //
 // WHAT THIS SEAM GUARANTEES. `runNativeCProbe` reports WHY it produced no rows, and
 // that distinction is the entire point of the file:
@@ -174,7 +174,7 @@ struct ProbeResult {
 }
 
 // Run an ALREADY-ASSEMBLED command string with BOTH streams captured into `out`.
-// [D-TEST-NATIVE-PROBE-COMPILE-FAILURE-DISCARDS-ITS-OWN-OUTPUT.]
+// A probe whose compile fails must not discard its own output.
 //
 // Distinct from `redirectCmd` above, which takes an executable PATH and quotes it.
 // Here the caller already holds a full command line (on Windows a
@@ -351,7 +351,8 @@ struct CompilerLocation {
         // Generate a build batch: call vcvars64, then cl. Quote everything.
         fs::path const bat = work / "build_probe.bat";
         std::ofstream b{bat};
-        // ★ `cl` IS NO LONGER SILENCED. [D-TEST-NATIVE-PROBE-COMPILE-FAILURE-DISCARDS-ITS-OWN-OUTPUT.]
+        // ★ `cl` IS NO LONGER SILENCED — a failing compile must not discard its
+        // own output.
         // `>nul 2>&1` here threw the compiler's diagnostics away INSIDE the batch,
         // so the caller's capture — added in the same pass — collected an empty log
         // and could only report "the build command produced NO output at all". ✔That
@@ -361,9 +362,8 @@ struct CompilerLocation {
         // `call vcvars` KEEPS its silencer: on success it prints a banner that is
         // pure noise, and its failure mode is already covered upstream — this batch
         // is only written after `locateMsvcToolchain` has validated the path.
-        // ★★★ `cd /d <work>` IS THE FIX FOR
-        // [D-TEST-NATIVE-PROBE-COMPILE-FAILS-UNDER-CONCURRENT-LOAD],
-        // AND IT IS A ROOT CAUSE, NOT A RETRY.
+        // ★★★ `cd /d <work>` IS THE FIX FOR THE PROBE COMPILE THAT FAILED UNDER
+        // CONCURRENT LOAD, AND IT IS A ROOT CAUSE, NOT A RETRY.
         // ✔MEASURED (ctest -j 6, dss-wt-lane2): `core/test_bitfield_abi_conformance`
         // failed `NATIVE-PROBE-COMPILE-FAILED` with the compiler's own words —
         //   probe.c : fatal error C1083: Cannot open compiler generated file:
@@ -484,10 +484,10 @@ runNativeCProbe(std::string_view tag,
     writeSource(src, loc.compiler->kind);
 
     std::string const build = loc.compiler->buildCmd(src, exe);
-    // ★ CAPTURE THE BUILD'S OWN OUTPUT. [D-TEST-NATIVE-PROBE-COMPILE-FAILURE-DISCARDS-ITS-OWN-OUTPUT.]
-    // ⚠ AND THIS ARM HAS AN OPEN, UNEXPLAINED OCCURRENCE BEHIND IT:
-    // [D-TEST-NATIVE-PROBE-COMPILE-FAILS-UNDER-CONCURRENT-LOAD] — one non-reproducing
-    // failure under a concurrently-running second gate, scratch-dir collision ruled
+    // ★ CAPTURE THE BUILD'S OWN OUTPUT — a failing compile must not discard it.
+    // ⚠ AND THIS ARM HAS AN UNEXPLAINED OCCURRENCE BEHIND IT: one
+    // non-reproducing probe-compile failure under a concurrently-running second
+    // gate, scratch-dir collision ruled
     // out by construction, mechanism NOT established. Do not "fix" it with a retry
     // and do not serialize the gates around it (the operator refused that class of
     // remedy). The capture below IS the experiment the next occurrence needs.

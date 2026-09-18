@@ -5,7 +5,9 @@
  * abort at `scanstatus2-5.1` as a DSS miscompile on exactly this construct,
  * and ✔MEASURED 2026-08-19 it is not one. Every arm below exits 42 on DSS
  * (debug AND release) and on gcc (-O0 AND -O2); the real cause of that abort
- * is upstream and lives in `D-HARNESS-PE64-CORPUS-WINE-ABORT-SCANSTATUS2`.
+ * is upstream — sqlite's own test registers a pointer key with `%p` and
+ * rebuilds it in Tcl with a `0x` prefix that no Windows C library prints,
+ * so the lookup misses and the API is handed a NULL.
  *
  * What this example is FOR, then, is the lowering shape itself, which is worth
  * a machine-checked witness on every leg and had none:

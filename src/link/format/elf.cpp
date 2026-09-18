@@ -161,9 +161,9 @@ constexpr std::uint64_t SHF_EXECINSTR = 4;
 // ⚠ THIS SENTENCE USED TO READ *"zero `.got` hits under `src/dss-config/`"* AND
 // THAT GREP RETURNS FOUR. The intended claim was always the structural one
 // above and it is TRUE; the sentence stating it was a self-documenting COUNT
-// that was already false when it was typed
-// (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED, one
-// tier earlier: false at the moment of typing). The claim is stated
+// that was already false when it was typed — one tier worse than the ordinary
+// rot, where a claim is true when typed and goes false only once the commit
+// lands. The claim is stated
 // structurally rather than as a figure because it is not a line count over a
 // named file set — the four prose hits are exactly what such a count would
 // report — so there is nothing here for the source census to bind.
@@ -5527,7 +5527,7 @@ encode(AssembledModule const&    module,
     // ET_REL keeps `.rela.text` (after any `.rodata`/`.data`/`.bss` —
     // D-LK-OBJECT-DATA-SECTION-RELOCATABLE); ET_EXEC drops it entirely (no
     // SHT_NULL placeholder). Section count derives from the actually-emitted
-    // slots — same architect B-LK1-2 / D-LK2-5 discipline that LK1 cycle 1 +
+    // slots — same architect B-LK1-2 / D-LK2-5-DERIVED-SECTION-COUNT discipline that LK1 cycle 1 +
     // LK2 already adopt.
     std::vector<SectionHeader const*> headers;
     headers.reserve(8);

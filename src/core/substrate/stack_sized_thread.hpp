@@ -24,9 +24,9 @@
 // SIGBUS/SIGSEGV inside the compiler's own stack probe, with no diagnostic
 // and no failing assertion. That is the least fail-loud failure available.
 //
-// ⚠ ✔MEASURED 2026-08-25 (cycle P34,
-// D-TEST-LSP-HARNESS-RAN-THE-SERVER-LOOP-ON-A-HOST-DEFAULT-STACK): four LSP
-// tests died `Bus error` on macOS and nowhere else. The crash report named it
+// ⚠ ✔MEASURED 2026-08-25 (cycle P34), on an LSP harness that ran the server
+// loop on a host-DEFAULT stack: four LSP tests died `Bus error` on macOS and
+// nowhere else. The crash report named it
 // exactly — `EXC_BAD_ACCESS (SIGBUS)`, "Thread stack size exceeded", innermost
 // frame `___chkstk_darwin` — on a thread whose outermost frames were
 // `__thread_proxy` / `_pthread_start`, i.e. a plain `std::thread`. The

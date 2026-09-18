@@ -12,7 +12,7 @@
 #include <optional>
 #include <vector>
 
-// ── FC6: the struct/union/array LAYOUT engine (realizes D-FF3-1, layout half) ──
+// ── FC6: the struct/union/array LAYOUT engine (realizes D-FF3-1-TARGET-AGGREGATE-LAYOUT-PARAMS, layout half) ──
 //
 // A GENERIC, target-AGNOSTIC engine that computes the byte layout of any complete
 // type — field offsets, alignment, padding, total size, flexible-array-member
