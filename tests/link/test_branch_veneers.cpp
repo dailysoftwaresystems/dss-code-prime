@@ -309,30 +309,206 @@ TEST(LinkBranchVeneer, AnUnconditionalBranchWordAndAMatchingRelocationRowMustBot
 // veneers' own branch relocations grew as fast as the veneers did, so it never
 // fired either.
 //
-// The shape is not hypothetical and it is not this tier's to fix: a single
-// function bigger than ±128 MiB is exactly what the ASSEMBLER's branch islands
-// are for, because an island goes between two INSTRUCTIONS and a veneer can
-// only go between two FUNCTIONS. The right answer is a refusal that says so.
+// ⚠⚠ THIS COMMENT USED TO END *"a single function bigger than ±128 MiB is
+// exactly what the ASSEMBLER's branch islands are for … the right answer is a
+// refusal that says so"*, AND THE REFUSAL SAID SO, AND IT WAS FALSE. The
+// assembler's islands serve `walker_util::BlockRelPatch`es — INTRA-function
+// branches to a block of the SAME function, resolved at assemble time and never
+// carried past it. A cross-function CALL relocation is not one of those, so no
+// island the assembler can place will ever serve this shape. A refusal naming a
+// tier that structurally cannot help is worse than one naming nothing, because a
+// reader acts on it.
+//
+// ★★★ AND THERE ARE TWO SHAPES HERE, NOT ONE, SEPARATED BY WHETHER A BOUNDARY
+// IS IN REACH OF THE CALL SITE AT ALL. ✔MEASURED 2026-09-17 against
+// `aarch64-linux-gnu-ld` 2.42: it REFUSES the first (*"relocation truncated to
+// fit: R_AARCH64_CALL26"*) and LINKS the second, with an `adrp/add/br x16` stub
+// standing at a boundary 24 bytes from the call site and 150 994 960 bytes from
+// the callee. So one of our two refusals matches a working reference and the
+// other does not, and the messages must not be interchangeable.
+// ⚠⚠ AND THIS ARM'S OWN SUBJECT TURNED OUT TO BE THE **BRIDGEABLE** SHAPE, which
+// is why its expectation moved. Its layout is caller │ oversized filler │ callee,
+// so the boundary between the caller and the filler is FOUR BYTES from the call
+// site — comfortably in reach — and two reaches from the callee. There was always
+// somewhere to stand; what could not use it is a one-word veneer body. The
+// genuinely site-less shape is a call buried inside an oversized function, and it
+// has its own arm below.
 TEST(LinkBranchVeneer, OneOversizedFunctionBetweenCallerAndCalleeRefusesLoudly) {
     auto sOpt = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(sOpt.has_value());
     auto const& target = **sOpt;
 
-    // ONE filler, so the only boundaries in the image are at its two ends —
-    // both on the wrong side of a gap wider than the field.
+    // ONE filler, so the only boundaries in the image are at its two ends.
     Span span = buildSpannedCall(
         target, static_cast<std::uint64_t>(2 * call26Reach()), /*fillerCount=*/1);
     ASSERT_TRUE(linker::branchVeneersNeeded(span.module, target));
 
     DiagnosticReporter rep;
     EXPECT_FALSE(linker::injectBranchVeneers(span.module, target, rep))
-        << "a gap with no boundary to stand at must be refused, not searched";
+        << "a gap no veneer body can bridge must be refused, not searched";
     EXPECT_GT(rep.errorCount(), 0u);
-    bool namedTheCause = false;
-    for (auto const& d : rep.all())
+    bool saidBoundaryInReach = false, saidNoBoundaryAtAll = false;
+    bool namedTheCost = false, sentToTheAssembler = false;
+    for (auto const& d : rep.all()) {
+        if (d.actual.find("stand within a veneer's placement reach of the call "
+                          "site") != std::string::npos)
+            saidBoundaryInReach = true;
         if (d.actual.find("NO FUNCTION BOUNDARY") != std::string::npos)
-            namedTheCause = true;
-    EXPECT_TRUE(namedTheCause)
-        << "the refusal must name the real cause — no boundary to place a "
-           "veneer at — rather than reporting a generic out-of-range value";
+            saidNoBoundaryAtAll = true;
+        if (d.actual.find("WHAT IS REFUSED AND WHAT IT COSTS")
+            != std::string::npos)
+            namedTheCost = true;
+        if (d.actual.find("belongs to the assembler") != std::string::npos)
+            sentToTheAssembler = true;
+    }
+    EXPECT_TRUE(saidBoundaryInReach)
+        << "a boundary WAS in reach of the call site here; claiming there was "
+           "none sends the reader after a site that already exists";
+    EXPECT_FALSE(saidNoBoundaryAtAll)
+        << "this is the shape a reference linker LINKS, with an indirect stub "
+           "at exactly that boundary; it must not borrow the message written "
+           "for the shape every linker refuses";
+    EXPECT_TRUE(namedTheCost)
+        << "a refusal with a working reference AGAINST it must record what it "
+           "costs, or a later cycle applying the union rule reverts it blind";
+    EXPECT_FALSE(sentToTheAssembler)
+        << "a cross-function CALL relocation can never be served by an "
+           "assembler branch island, which is intra-function and resolved "
+           "before this tier exists; the refusal must not send a reader there";
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// THE SHAPE **NO** LINKER CAN BRIDGE — AND THE ONE OUR REFUSAL MATCHES.
+// ─────────────────────────────────────────────────────────────────────────
+//
+// ★★★ THE CALL SITE IS BURIED DEEPER THAN THE PLACEMENT STRIDE INSIDE ONE
+// FUNCTION, so no function boundary exists that the call could even branch to.
+// No veneer body of any shape changes that: a trampoline the call cannot reach
+// is not a trampoline. ✔MEASURED 2026-09-17 that `aarch64-linux-gnu-ld` 2.42
+// refuses the identical shape — *"relocation truncated to fit:
+// R_AARCH64_CALL26"* — so THIS refusal matches a working reference and the one
+// above does not. Keeping the two messages apart is what stops a later reader
+// treating them as one problem.
+TEST(LinkBranchVeneer, ACallBuriedDeeperThanTheStrideInsideOneFunctionHasNoSite) {
+    auto sOpt = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(sOpt.has_value());
+    auto const& target = **sOpt;
+    auto const* call26 = target.relocationByName("call26");
+    ASSERT_NE(call26, nullptr);
+
+    // callee (`RET`) │ ONE caller function, with the call buried inside it.
+    //
+    // ⚠ EVERY OFFSET BELOW IS DERIVED FROM THE FIELD'S OWN REACH, and each has
+    // to hold or the arm proves nothing. With R the reach and the placement
+    // stride R/2:
+    //   * the call sits at R+8 inside the caller, so the callee (at 0) is R+12
+    //     away — OUT of range, which is what puts the pass in this code path;
+    //   * the boundary BEFORE it is R+8 away and the one AFTER it is R/2+8
+    //     away, both strictly more than the stride — so nothing is standable.
+    // Making the caller any shorter puts its trailing boundary back in reach and
+    // the arm silently becomes a copy of the one above.
+    auto const R      = static_cast<std::uint64_t>(call26Reach());
+    auto const stride = R / 2u;
+    auto const callAt = R + 8u;            // offset of the `BL` inside the caller
+    auto const size   = callAt + stride + 8u;
+
+    AssembledModule module;
+    SymbolId const caller{1}, callee{2};
+    module.functions.push_back(word(callee, kRet));
+    AssembledFunction big;
+    big.symbol = caller;
+    big.bytes.resize(static_cast<std::size_t>(size), 0u);
+    for (std::uint8_t b = 0; b < 4; ++b)
+        big.bytes[static_cast<std::size_t>(callAt) + b] =
+            static_cast<std::uint8_t>((kBL >> (8u * b)) & 0xFFu);
+    big.relocations.push_back(
+        Relocation{static_cast<std::uint32_t>(callAt), callee, call26->kind, 0});
+    module.functions.push_back(std::move(big));
+    module.expectedFuncCount = module.functions.size();
+
+    ASSERT_TRUE(linker::branchVeneersNeeded(module, target));
+    DiagnosticReporter rep;
+    EXPECT_FALSE(linker::injectBranchVeneers(module, target, rep));
+    ASSERT_GT(rep.errorCount(), 0u);
+
+    bool saidNoBoundaryAtAll = false, saidBoundaryInReach = false;
+    for (auto const& d : rep.all()) {
+        if (d.actual.find("NO FUNCTION BOUNDARY") != std::string::npos)
+            saidNoBoundaryAtAll = true;
+        if (d.actual.find("stand within a veneer's placement reach of the call "
+                          "site") != std::string::npos)
+            saidBoundaryInReach = true;
+    }
+    EXPECT_TRUE(saidNoBoundaryAtAll)
+        << "with the call site a full reach from every boundary there is "
+           "nowhere to stand, and the refusal must say THAT";
+    EXPECT_FALSE(saidBoundaryInReach)
+        << "no boundary is in reach here; reporting one would be a count of "
+           "sites that do not exist";
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// THE MEASURED BLIND SPOT — AN IMPORT-BOUND CALL IS INVISIBLE TO THIS PASS.
+// ─────────────────────────────────────────────────────────────────────────
+//
+// ★★★ THIS ARM PINS A DEFECT'S PREMISE, NOT A CONTRACT, AND SAYS SO IN ITS OWN
+// ASSERTION TEXT. `branchVeneersNeeded` walks `module.functions` and `continue`s
+// on any relocation whose target is not one of them. An extern import is not one
+// of them, so an out-of-range call to an import reports "no veneers needed" and
+// the writer refuses later with a message about a pass that never looked.
+//
+// ⚠ IT IS NOT A HYPOTHETICAL. ✔MEASURED 2026-09-17,
+// `arm64:elf64-aarch64-linux-exec`: the linker's own entry trampoline calls
+// `exit` through the PLT, `elf.cpp` places `.plt` past the whole of `.text`, and
+// every shipped `processExit` declares `"mechanism": "by-name-import"` — so a
+// 212 992-statement program is refused for a `call26` of 139 722 816 bytes that
+// no user wrote. The island edge above it is therefore unreachable in a linked
+// image: at 196 608 statements the body's own branch spans 128 974 856 bytes
+// (in range, no island) while the artifact is already 128 984 576 bytes, so the
+// import call crosses the reach ~9 720 bytes BEFORE the island is needed.
+//
+// ★ WHEN THIS IS FIXED THIS ARM GOES RED, WHICH IS THE POINT.
+TEST(LinkBranchVeneer, AnOutOfRangeCallToAnImportIsNotSeenByThisPassYet) {
+    auto sOpt = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(sOpt.has_value());
+    auto const& target = **sOpt;
+    auto const* call26 = target.relocationByName("call26");
+    ASSERT_NE(call26, nullptr);
+
+    // A module holding ONLY an oversized function and a caller whose `BL` names
+    // a symbol that is NOT a function of this module — which is exactly the
+    // shape of a call to an import stub.
+    AssembledModule module;
+    SymbolId const caller{1};
+    SymbolId const importSym{9999};
+    auto callerFn = word(caller, kBL);
+    callerFn.relocations.push_back(Relocation{0u, importSym, call26->kind, 0});
+    module.functions.push_back(std::move(callerFn));
+    AssembledFunction filler;
+    filler.symbol = SymbolId{100};
+    filler.bytes.resize(static_cast<std::size_t>(2 * call26Reach()), 0u);
+    module.functions.push_back(std::move(filler));
+    module.expectedFuncCount = module.functions.size();
+
+    // THE CONTROL, first: the identical module with the call aimed at a symbol
+    // this module DOES define is seen. Without it a `false` below could mean the
+    // fixture never built an out-of-range call at all.
+    {
+        AssembledModule seen = module;
+        seen.functions.push_back(word(SymbolId{2}, kRet));
+        seen.expectedFuncCount = seen.functions.size();
+        // Aim it past the filler, so the distance really is out of range and a
+        // `false` below cannot mean "the call was in range all along".
+        seen.functions[0].relocations[0].target = SymbolId{2};
+        EXPECT_TRUE(linker::branchVeneersNeeded(seen, target))
+            << "CONTROL: an out-of-range call to a symbol this module defines "
+               "must be seen, or the negative below proves nothing";
+    }
+
+    EXPECT_FALSE(linker::branchVeneersNeeded(module, target))
+        << "MEASURED BLIND SPOT, not a contract: this pass cannot see a call "
+           "whose target is an import, because the stub is not a function of "
+           "the module and its address is chosen by the format writer "
+           "afterwards. When a later cycle gives the pass a layout oracle that "
+           "includes import stubs, this expectation is what must change";
 }

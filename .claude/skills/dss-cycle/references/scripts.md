@@ -56,14 +56,11 @@ the other in the same commit.
 <!-- BEGIN GENERATED SCRIPT INDEX -->
 | Script | Runs as | Purpose |
 | --- | --- | --- |
-| **`anchors`** | `anchors.py`, `read-anchor.ps1`, `read-anchor.sh`, `read-anchors.ps1`, `read-anchors.sh`, `set-anchor.ps1`, `set-anchor.sh`, `write-anchor.ps1`, `write-anchor.sh` | read and write deferred-anchor registry rows in the one canonical form, so a row is never hand-assembled. |
+| **`anchors`** | `anchors.py` | read and write deferred-anchor registry rows in the one canonical form, so a row is never hand-assembled. |
 | **`apply-registry-row`** | `apply-registry-row.py` | replace one deferred-anchor registry row with a lane's verbatim row text from a file. |
 | **`burndown-queue`** | `burndown-queue.py` | re-derive the prioritized burndown queue from the registry, production errors first. |
-| **`carriage-excludes`** | `carriage-excludes.py` | emit the transport exclude list for a gate carriage, derived from what git ignores rather than re-typed once per carriage. |
 | **`check-anchor-balance`** | `check-anchor-balance.py` | refuse a cycle that ends with more OPEN deferral-registry rows than it began. |
 | **`check-anchor-registry`** | `check-anchor-registry.ps1`, `check-anchor-registry.sh` | refuse a `D-*` anchor cited in a scanned root that resolves to no registry row, and refuse a markdown table row whose unescaped pipes would silently drop cells. |
-| **`check-carriage-paths`** | `check-carriage-paths.py` | refuse a carriage script whose repository path disagrees with the project's own declared name. |
-| **`check-ci-legs`** | `check-ci-legs.ps1`, `check-ci-legs.sh`, `test-check-ci-legs.py` | read the PR's CI verdict per leg from job METADATA, which outlives the logs, and separate a real test failure from a budget overrun. |
 | **`check-diagnostic-codes`** | `check-diagnostic-codes.py` | refuse a duplicate, implicitly-numbered, or newly-uncovered `DiagnosticCode` ordinal. |
 | **`check-doc-census`** | `check-doc-census.py`, `source-census.py` | refuse a documented figure that a census refutes, in prose or in a source comment, and repair it in place. |
 | **`check-enum-name-table-guards`** | `check-enum-name-table-guards.py` | refuse an `EnumNameTable` vocabulary declared in `src/` without a `DSS_CHECK_ENUM_NAME_TABLE` well-formedness assert. |
@@ -78,7 +75,6 @@ the other in the same commit.
 | **`check-pkg-pipeline`** | `check-pkg-pipeline.py` | pin the package pipeline's release-path step sequence and refuse an artifacts-only run that can reach a release. |
 | **`check-plan-citations`** | `check-plan-citations.py` | refuse a new `path:line` citation in the plans -- a citation names a stable reference, never a line number. |
 | **`check-retyped-closed-sets`** | `check-retyped-closed-sets.py` | census the diagnostics that RETYPE a closed vocabulary instead of projecting it. |
-| **`check-root-litter`** | `check-root-litter.sh`, `test-check-root-litter.sh` | refuse any untracked file sitting directly in a repository root -- the probe litter lanes leave behind when a bare filename lands in their cwd. |
 | **`check-scripts-index`** | `check-scripts-index.py` | refuse a script that no index documents, and an index entry that no script backs. |
 | **`check-shell-portability`** | `check-shell-portability.py` | refuse a tracked shell script that cannot run on bash 3.2 without declaring it. |
 | **`check-stale-blockers`** | `check-stale-blockers.py` | list OPEN registry rows whose Closing-work cell waits on a blocker that has since CLOSED. |
@@ -92,41 +88,46 @@ the other in the same commit.
 | **`lane-fold`** | `lane-fold.py` | seed a lane worktree from the main tree, fold only that lane's real changes back, and land it with its rows applied and its evidence preserved. |
 | **`lane-worktree`** | `lane-worktree.ps1`, `lane-worktree.sh`, `test-lane-worktree.sh` | create and remove lane worktrees inside the ignored .worktrees/, refusing any root that would exceed Windows MAX_PATH. |
 | **`leg-tree`** | `leg-tree.sh`, `test-leg-tree.sh` | put a gate host's own clone on the tree under test before a leg, and restore it to pristine afterwards. |
-| **`local-build`** | `local-build.ps1`, `local-build.sh` | build dsscp incrementally on this host, and optionally run ctest. |
-| **`macho-alias-ld64-matrix`** | `macho-alias-ld64-matrix.remote.sh`, `macho-alias-ld64-matrix.sh` | measure what Apple's ld64 does with a SECOND defined symbol at the same address as a canonical one, with and without -dead_strip. |
-| **`macos-leg`** | `macos-leg.ps1`, `macos-leg.sh`, `test-macos-leg.py` | run a DSS gate leg on the operator's macOS host -- push the tree, build clean, run ctest. |
 | **`owning-tree`** | `owning-tree.py` | name the DSS tree a script's own file lives in -- walked up from that file, never taken from the caller's working directory or git environment. |
 | **`pragma-profile-census`** | `pragma-profile-census.ps1`, `pragma-profile-census.py`, `pragma-profile-census.sh` | census `#pragma` usage across the corpus and hold the profile to its expected shape. |
 | **`profile-compile`** | `profile-compile-dispatch.sh`, `profile-compile-support.py`, `profile-compile.sh` | compile one fixed subject with a RELEASE dsscp on this host and report where the time went, so the HOST is the only variable across legs. |
 | **`refresh_landing_log`** | `refresh_landing_log.py`, `test_refresh_landing_log.py` | regenerate the PR landing-log hash anchors in the plans from git log. |
-| **`remote-leg`** | `remote-leg.sh`, `test-remote-leg.py` | run a DSS gate leg on a physical remote host -- push the working tree over a carriage, build clean, and run ctest through run-gate. |
 | **`repo-secrets`** | `repo-secrets.sh` | print the `.secrets` directory a checkout must read, following a lane worktree back to the main checkout that holds it. |
 | **`repo-tree`** | `repo-tree.ps1` | resolve the repository tree a PowerShell script is standing in, and keep that script's git enumeration and its file reads on the SAME root. |
-| **`run-gate`** | `run-gate.ps1`, `run-gate.sh`, `test-run-gate.sh` | run a gate command and REFUSE to report success without evidence that it ran. |
 | **`sqlite-round-trip`** | `sqlite-round-trip.py` | carry a sqlite leg's DSS-built artefacts to a machine that runs their target and prove they EXECUTE there (the round trip). |
 | **`sqlite-runtime-bench`** | `sqlite-runtime-bench.py` | measure the RUNTIME of an emitted sqlite3 binary, the standing runtime-differential instrument. |
-| **`ssh-arm64-vps`** | `ssh-arm64-vps.ps1`, `ssh-arm64-vps.sh` | reach the native aarch64 Linux VPS (the carriage; WSL only). |
-| **`ssh-macos`** | `ssh-macos.ps1`, `ssh-macos.sh` | reach the operator's physical macOS host (the carriage). |
-| **`wsl-leg`** | `wsl-leg.sh` | run a DSS gate leg inside WSL -- sync the Windows checkout, build clean, and run ctest through run-gate. |
 <!-- END GENERATED SCRIPT INDEX -->
 
 ## The ones a cycle reaches for most
 
-- **`run-gate`** — wrap any gate command. It refuses to report success on exit 0
-  alone; the output must also carry a **tool-emitted** witness. Use
-  `'100% tests passed'` for ctest. ★ It correctly refuses a witness the caller
-  wrote themselves, which is the whole point: a `BUILD OK` you echoed is not
-  evidence. It also defaults `CTEST_PARALLEL_LEVEL` to 8.
+★★★ **THE GATE RUNNERS ARE NOT IN THIS DIRECTORY ANY MORE.** Building a leg,
+testing one, putting a host's copy on the tree under test and reaching a carriage
+are `dssharness` verbs reading `.harness-config/config.json`. `dssharness legs`
+lists what can run where; `dssharness help <topic>` and `<verb> --help` are the
+interface, and a brief states one only if its author has RUN it.
+
+- **`dssharness build` / `test`** — each leg in its own variant-keyed build
+  directory inside the tree the command runs in. The witness discipline is theirs:
+  a pass needs exit 0 **and** a declared `successPattern` matching the command's
+  own output, never anything the harness wrote. A tree that moved under the run, a
+  build directory another live run holds, and a zero exit with no witness each
+  report as themselves, with their own exit codes.
+- **`dssharness sync`** — puts a host's copy in step with this tree, deleting what
+  the source no longer has and verifying the copy afterwards. It writes by content
+  hash, so an unchanged file's mtime never moves and incremental builds survive a
+  transport. `--dry-run` lists every path it would write.
+- **`dssharness host-exec --ssh <host>` / `--wsl <distro>`** — run a DssHarness
+  command in that host's own checkout. ⚠ It runs a DssHarness command, never an
+  arbitrary shell string; a procedure of this repository's own belongs in a
+  predefined runner under `.harness-config/runner/actions`.
+- **`dssharness check-ci-legs`** — read the CI verdict per leg from job metadata.
+  ★ It exits **2** when the matrix did not run at all, because an empty answer is
+  indistinguishable from every leg passing and must never be read as one.
 - **`check-anchor-balance`** — the mandatory end-of-cycle receipt. The report
   line's numbers come from here; never from a previous message.
-- **`check-anchor-registry`**, **`check-line-endings`**, **`check-orphan-tests`**,
-  **`check-scripts-index`** — the four ctest-wired guards. They run anyway; run
-  them early when a change touches plans, scripts, or test wiring.
-- **`ssh-arm64-vps`**, **`ssh-macos`** — the carriages to the non-native legs.
-  ⚠ `ssh-arm64-vps` works **from WSL only** (the key lives there; `ssh dss`
-  resolves nowhere else), and the macOS carriage needs absolute paths because a
-  non-interactive shell drops `/opt/homebrew/bin`.
-- **`local-build`** — incremental build plus optional ctest, for this host.
+- **`check-line-endings`**, **`check-orphan-tests`**, **`check-scripts-index`** —
+  ctest-wired guards. They run anyway; run them early when a change touches plans,
+  scripts, or test wiring.
 
 <!-- CR-INSTRUMENT-QUOTED:BEGIN — this section QUOTES the blind idioms in order
      to warn about them; it does not run one as a measurement. -->

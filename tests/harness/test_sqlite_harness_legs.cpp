@@ -4032,13 +4032,18 @@ TEST_F(HarnessLegs, TheRecordedIdentityFlagIsNamedInExactlyOneFile) {
 // `-e`. That is why `--` is called out by name below instead of being lumped in
 // with "some other token" — it reads like the safe spelling and is not.
 //
-// WHAT IT COST, so nobody re-litigates the severity: scripts/ssh-arm64-vps/ssh-arm64-vps.ps1 ran
-// `wsl.exe bash -lc "ssh … $Command"`, so `-Command 'hostname; uname -m'`
-// printed the VPS hostname and then the LOCAL WSL architecture — x86_64 for an
-// aarch64 box — while exiting 0. A cross-host verification instrument answering
-// with the wrong host's data, silently. The same defect sat under
-// `wslpath: C:ab`, where it was misattributed to wslpath eating backslashes and
-// papered over with a separator rewrite (section 8's corrected comment).
+// WHAT IT COST, so nobody re-litigates the severity. ✔MEASURED on the carriage
+// script that used to reach the aarch64 VPS: it ran `wsl.exe bash -lc "ssh …
+// $Command"`, so `-Command 'hostname; uname -m'` printed the VPS hostname and
+// then the LOCAL WSL architecture — x86_64 for an aarch64 box — while exiting 0.
+// A cross-host verification instrument answering with the wrong host's data,
+// silently. The same defect sat under `wslpath: C:ab`, where it was
+// misattributed to wslpath eating backslashes and papered over with a separator
+// rewrite (section 8's corrected comment).
+// ⓘ That script is GONE — the DssHarness migration replaced every carriage
+// script with one tool reading one configuration — and the measurement is kept
+// because it is why this rule exists, not because the file is still there to
+// look at. Nothing below depends on it: the shapes are proved against fixtures.
 //
 // THE RULE, and why it is shaped this way rather than "the file must not
 // contain `wsl.exe` without `-e`":
@@ -4059,7 +4064,13 @@ TEST_F(HarnessLegs, TheRecordedIdentityFlagIsNamedInExactlyOneFile) {
 //     regex, `build-wsl/` and `$wslKey` out of it without naming any of them;
 //   · a PowerShell SPLAT (`& wsl.exe @a`) is the correct fix's own shape — there
 //     is no string left to escape — so it is accepted only when the array it
-//     splats is bound to `-e` nearby. That is how scripts/ssh-arm64-vps/ssh-arm64-vps.ps1 passes.
+//     splats is bound to `-e` nearby. ★ THAT EXEMPTION IS PROVED BY FIXTURE, NOT
+//     BY CENSUS: `TheWslExecRuleJudgesEverySyntheticShape` drives the bound form
+//     (accepted), the unbound form (refused) and a binding outside the window
+//     (refused). It used to be exercised by ONE live carriage script, which the
+//     DssHarness migration deleted — and an escape whose only case leaves the
+//     tree is an escape nothing exercises, which is a disarmed guard rather than
+//     dead weight.
 //
 // COVERAGE IS BY DIRECTORY, NOT BY LIST: both sqlite drivers plus every
 // `.ps1` and `.sh` anywhere under `scripts/`, so a NEW script is governed the
@@ -4208,6 +4219,21 @@ struct Mention {
     std::string spelling;
 };
 
+// One refusal the rule raised, with the text that caused it.
+struct WslRefusal {
+    std::string subject;   // the file's name
+    std::size_t line;      // its RAW line number, 0 when not recoverable
+    std::string text;      // the live line
+    std::string why;       // the rule's own diagnosis
+};
+
+// What one scan saw. `invocations` counts every mention in COMMAND POSITION —
+// the shapes this rule governs — whether it accepted or refused them.
+struct WslScan {
+    std::size_t             invocations = 0;
+    std::vector<WslRefusal> refusals;
+};
+
 // Every offset at which this line names the WSL launcher AS A COMMAND WORD.
 [[nodiscard]] std::vector<Mention> wslMentions(std::string const& line) {
     std::vector<Mention> out;
@@ -4234,18 +4260,21 @@ struct Mention {
     return out;
 }
 
-}  // namespace
-
-TEST_F(HarnessLegs, NoScriptInvokesWslWithoutExec) {
-    std::size_t invocationsSeen = 0;
-    for (auto const& script : shellScriptsUnderTest()) {
-        ASSERT_TRUE(fs::exists(script.path)) << script.path;
+// THE RULE ITSELF, over one set of scripts, answering rather than asserting.
+//
+// ★★★ EXTRACTED SO THE RULE CAN BE POINTED AT A FIXTURE. It used to be the body
+// of the tree test, which meant every shape it recognises was proved only by the
+// tree happening to contain that shape — and the exemption below was proved by
+// exactly ONE file. A rule whose escape hatch has no synthetic case is an escape
+// nothing exercises: it can be broken in either direction and stay green, and
+// the day its one live example leaves the tree it becomes untested logic.
+[[nodiscard]] WslScan scanForWslExec(std::vector<Script> const& scripts) {
+    WslScan scan;
+    for (auto const& script : scripts) {
         auto const name  = script.path.filename().string();
         auto const lines = liveLines(script.path, script.powershell);
-        ASSERT_FALSE(lines.empty()) << name << " has no live lines";
-
         for (std::size_t i = 0; i < lines.size(); ++i) {
-            auto const& line = lines[i];
+            auto const& line     = lines[i];
             auto const  mentions = wslMentions(line);
             auto const  at = mentions.empty() ? 0 : rawLineNumberOf(script.path, line);
             for (auto const& m : mentions) {
@@ -4254,61 +4283,228 @@ TEST_F(HarnessLegs, NoScriptInvokesWslWithoutExec) {
                 // `--` first and UNCONDITIONALLY, command position or not: it is
                 // wrong even as advice an operator pastes, so it is refused
                 // wherever it is written.
-                EXPECT_NE(next, "--")
-                    << name << ':' << at << " spells `" << m.spelling
-                    << " --`:\n  " << line
-                    << "\n`--` is NOT `--exec`. MEASURED: `wsl.exe -- /nope`"
-                       " answers `/bin/bash: line 1: /nope: No such file` where"
-                       " `wsl.exe -e /nope` answers `execvpe(/nope) failed` — so"
-                       " `--` hands the whole argv to the distro's default shell,"
-                       " which re-expands it. Use `-e`.";
+                // ⚠ AND IT DOES NOT SHORT-CIRCUIT. A `--` in command position is
+                // ALSO an invocation without `-e`, so it earns the second refusal
+                // below and counts toward what the rule was seen to govern.
+                // Returning early here would have made `wsl.exe --` invisible to
+                // the non-vacuity census — the rule's worst spelling being the one
+                // that stopped proving the rule was awake.
+                if (next == "--") {
+                    scan.refusals.push_back(
+                        {name, at, line,
+                         "spells `" + m.spelling +
+                             " --`. `--` is NOT `--exec`. MEASURED: `wsl.exe --"
+                             " /nope` answers `/bin/bash: line 1: /nope: No such"
+                             " file` where `wsl.exe -e /nope` answers"
+                             " `execvpe(/nope) failed` — so `--` hands the whole"
+                             " argv to the distro's default shell, which"
+                             " re-expands it. Use `-e`."});
+                }
 
                 char const prev = precedingSymbol(line, m.at);
                 bool const commandPosition =
                     prev == '\0' || prev == '&' || prev == ';' || prev == '(' ||
                     prev == '{' || prev == '`';
                 if (!commandPosition) continue;   // a mention, not an invocation
-                ++invocationsSeen;
+                ++scan.invocations;
 
                 if (next == "-e" || next == "--exec") continue;
                 std::string const var = splattedVariable(next);
                 if (!var.empty()) {
-                    EXPECT_TRUE(splatIsBoundToExec(lines, i, var))
-                        << name << ':' << at << " splats `" << next
-                        << "` into " << m.spelling
-                        << " but nothing within 12 live lines above binds `$"
-                        << var << "` to an argv naming '-e':\n  " << line
-                        << "\nA real argv is the RIGHT fix for this defect — it"
-                           " is what scripts/ssh-arm64-vps/ssh-arm64-vps.ps1 does — but only if"
-                           " `-e` is actually in it.";
+                    if (!splatIsBoundToExec(lines, i, var)) {
+                        scan.refusals.push_back(
+                            {name, at, line,
+                             "splats `" + next + "` into " + m.spelling +
+                                 " but nothing within 12 live lines above binds"
+                                 " `$" + var +
+                                 "` to an argv naming '-e'. A real argv is the"
+                                 " RIGHT fix for this defect — there is no string"
+                                 " left for a shell to re-expand — but only if"
+                                 " `-e` is actually in it."});
+                    }
                     continue;
                 }
 
-                ADD_FAILURE()
-                    << name << ':' << at << " invokes `" << m.spelling
-                    << "` without `-e`:\n  " << line
-                    << "\nThe next token is '" << next
-                    << "'. `wsl.exe` without `-e` runs a LOCAL shell:"
-                       " `wsl.exe <cmd>` does not run <cmd>, it hands the"
-                       " reconstructed command line to the distro's DEFAULT"
-                       " SHELL, which strips quoting and expands ON THIS MACHINE"
-                       " first. MEASURED: the same input string gives"
-                       " [echo A=x86_64] without `-e` and [echo A=$(uname -m)]"
-                       " with it, and a SINGLE-QUOTED $HOME in a payload still"
-                       " expanded. Quoting cannot fix it — pass `-e`, or build a"
-                       " real argv and splat it as scripts/ssh-arm64-vps/ssh-arm64-vps.ps1 does.";
+                scan.refusals.push_back(
+                    {name, at, line,
+                     "invokes `" + m.spelling + "` without `-e`. The next token"
+                     " is '" + next +
+                         "'. `wsl.exe` without `-e` runs a LOCAL shell:"
+                         " `wsl.exe <cmd>` does not run <cmd>, it hands the"
+                         " reconstructed command line to the distro's DEFAULT"
+                         " SHELL, which strips quoting and expands ON THIS"
+                         " MACHINE first. MEASURED: the same input string gives"
+                         " [echo A=x86_64] without `-e` and [echo A=$(uname -m)]"
+                         " with it, and a SINGLE-QUOTED $HOME in a payload still"
+                         " expanded. Quoting cannot fix it — pass `-e`, or build"
+                         " a real argv and splat it."});
             }
         }
     }
-    // NON-VACUITY. Every invocation above could stop being RECOGNISED — a
-    // renamed helper, a driver that stops shelling out, a boundary rule that
-    // grew too strict — and this test would go green by seeing nothing. The
-    // floor is what the two sqlite drivers and ssh-arm64-vps.ps1 supply today.
-    EXPECT_GE(invocationsSeen, 4u)
-        << "only " << invocationsSeen
-        << " wsl invocation(s) were RECOGNISED across the scanned scripts, so"
-           " this rule has stopped seeing the shape it governs and is vacuous."
-           " Fix the recogniser, do not delete the test.";
+    return scan;
+}
+
+}  // namespace
+
+TEST_F(HarnessLegs, NoScriptInvokesWslWithoutExec) {
+    auto const scripts = shellScriptsUnderTest();
+    for (auto const& s : scripts) {
+        ASSERT_TRUE(fs::exists(s.path)) << s.path;
+        // A subject with nothing live in it is a subject this rule cannot govern,
+        // and it would be indistinguishable from one it governed and cleared.
+        ASSERT_FALSE(liveLines(s.path, s.powershell).empty())
+            << s.path.filename().string() << " has no live lines";
+    }
+
+    auto const scan = scanForWslExec(scripts);
+    for (auto const& r : scan.refusals) {
+        ADD_FAILURE() << r.subject << ':' << r.line << ' ' << r.why << "\n  "
+                      << r.text;
+    }
+
+    // NON-VACUITY, AND IT IS PER SUPPLIER NOW.
+    //
+    // ⛔ THE UNION FLOOR WAS WRONG IN A WAY ITS OWN NUMBER HID. It read
+    // `invocationsSeen >= 4` over every scanned file at once, with a comment
+    // naming its three suppliers — "the two sqlite drivers and ssh-arm64-vps.ps1".
+    // ✔MEASURED before the DssHarness migration removed the carriage scripts:
+    // the live total was 5 — THREE from build-and-test.ps1, one from
+    // ssh-arm64-vps.ps1 and one from ssh-macos.sh — so a supplier could go to
+    // zero and the union still cleared 4. That is the same defect the per-root
+    // floors elsewhere in this repository exist to close: one big contributor
+    // satisfies the total while another silently empties.
+    //
+    // ⇒ THE FLOOR IS ATTACHED TO THE FILE THAT SUPPLIES IT. `build-and-test.ps1`
+    // supplies three and always has; that number is not lowered here, it is
+    // merely no longer summed with suppliers that have left the tree. Scripts
+    // that shell out to WSL may come and go; this driver is the one the harness
+    // cannot lose.
+    //
+    // ★ AND THE RECOGNISER'S COVERAGE IS NO LONGER PROVED BY A CENSUS AT ALL —
+    // TheWslExecRuleJudgesEverySyntheticShape below drives every shape, accepted
+    // and refused, against fixtures this test writes. A census can only ever
+    // prove that the tree still happens to contain an example.
+    auto const driver = harnessDir() / "build-and-test.ps1";
+    auto const driverScan = scanForWslExec({{driver, true}});
+    EXPECT_GE(driverScan.invocations, 3u)
+        << "only " << driverScan.invocations
+        << " wsl invocation(s) were RECOGNISED in " << driver.string()
+        << ", which has supplied three since this rule was written. The rule has"
+           " stopped seeing the shape it governs in the one file that cannot"
+           " stop using it. Fix the recogniser, do not lower this number.";
+}
+
+// ── The rule's own arms, synthesized — including the one the tree stopped
+//    supplying ──────────────────────────────────────────────────────────────
+//
+// ★★★ WHY THIS EXISTS. The PowerShell SPLAT exemption (`& wsl.exe @a`, accepted
+// only when `$a` is bound to an argv naming `-e` nearby) had exactly one live
+// example in the whole repository, and the DssHarness migration deleted the file
+// that carried it. ✔MEASURED before the deletion with the recogniser's own
+// boundary rules: `grep` for a splatted wsl invocation returned one hit, in the
+// carriage script; the nearest survivor uses the DIRECT `& wsl.exe -e …` form,
+// which a different clause accepts. So after the deletion the exemption had no
+// positive case anywhere — an escape nothing exercises, which this repository
+// treats as a disarmed guard rather than as dead weight.
+//
+// A fixture must synthesize the NEGATIVE as well, so each shape appears twice:
+// the spelling that must be ACCEPTED and the neighbouring spelling that must be
+// REFUSED. Without the negative half a recogniser that accepts everything passes.
+TEST_F(HarnessLegs, TheWslExecRuleJudgesEverySyntheticShape) {
+    auto const dir = scratch_->path() / "wsl-exec-shapes";
+    fs::create_directories(dir);
+
+    struct Shape {
+        char const* name;        // fixture file name, .ps1 or .sh
+        char const* body;        // its whole text
+        bool        refused;     // the verdict this shape must get
+        std::size_t invocations; // how many mentions must reach command position
+        char const* why;         // what the shape is for, quoted on failure
+    };
+
+    static constexpr Shape kShapes[] = {
+        // ── the splat exemption, both halves ──────────────────────────────
+        {"splat-bound-accepted.ps1",
+         "$a = @('-e', 'bash', '-lc', $payload)\n& wsl.exe @a\n",
+         false, 1,
+         "a splatted argv whose array names -e is the CORRECT fix and must be"
+         " accepted: there is no command string left for a shell to re-expand"},
+        {"splat-unbound-refused.ps1",
+         "$a = @('bash', '-lc', $payload)\n& wsl.exe @a\n",
+         true, 1,
+         "a splatted argv with no -e in it is the DEFECT wearing the fix's"
+         " clothes, and must be refused"},
+        // ⚠ THE FILLER IS LIVE CODE, NOT COMMENTS, AND THAT IS THE WHOLE POINT
+        // OF THE FIXTURE. The window counts LIVE lines, and `liveLines` drops
+        // `#` lines entirely — so a comment-padded version of this fixture puts
+        // the binding one live line above the call and is ACCEPTED, proving the
+        // opposite of what it claims. Caught by reading the fixture against the
+        // recogniser before it ever ran.
+        {"splat-bound-too-far-refused.ps1",
+         "$a = @('-e', 'bash')\n"
+         "$f1 = 1\n$f2 = 1\n$f3 = 1\n$f4 = 1\n$f5 = 1\n$f6 = 1\n$f7 = 1\n"
+         "$f8 = 1\n$f9 = 1\n$f10 = 1\n$f11 = 1\n$f12 = 1\n$f13 = 1\n"
+         "& wsl.exe @a\n",
+         true, 1,
+         "the binding window is twelve LIVE lines; a binding further away is not"
+         " evidence about this call site"},
+
+        // ── the direct spellings ──────────────────────────────────────────
+        {"exec-short-accepted.ps1", "& wsl.exe -e bash -lc $payload\n",
+         false, 1, "`-e` is the shape the rule exists to require"},
+        {"exec-long-accepted.ps1", "& wsl.exe --exec bash -lc $payload\n",
+         false, 1, "`--exec` is `-e` spelled out"},
+        {"bare-refused.sh", "wsl.exe bash -lc \"$payload\"\n",
+         true, 1,
+         "a bare invocation hands the reconstructed command line to the distro's"
+         " DEFAULT SHELL, which expands it on THIS machine first"},
+        {"dashdash-refused.sh", "wsl.exe -- bash -lc \"$payload\"\n",
+         true, 1,
+         "`--` reads like the safe spelling and is not: it means `pass the rest"
+         " as is`, and `as is` means `to the shell`"},
+
+        // ── what must NOT be refused: the boundary rules ──────────────────
+        {"mention-not-invocation.ps1",
+         "$probe = Get-Command wsl.exe -ErrorAction SilentlyContinue\n",
+         false, 0,
+         "resolving the launcher is not invoking it, and a diagnostic may name"
+         " it in prose — neither is command position"},
+        {"name-not-launcher.sh",
+         "grep -qiE 'microsoft|wsl' /proc/version\nkey=$wslKey\ncd build-wsl/\n",
+         false, 0,
+         "`$wslKey`, `build-wsl/` and a regex alternation are NAMES; an"
+         " invocation is always followed by whitespace and its argv"},
+        {"comment-only.ps1",
+         "# wsl.exe bash -lc 'the shape this file used to have'\n$x = 1\n",
+         false, 0,
+         "comments are prose ABOUT the code — a rule that punished writing down"
+         " what you removed would be satisfied by deleting the explanation"},
+    };
+
+    for (auto const& shape : kShapes) {
+        fs::path const p = dir / shape.name;
+        {
+            std::ofstream out(p, std::ios::binary);
+            ASSERT_TRUE(out.good()) << p;
+            out << shape.body;
+        }
+        bool const ps = p.extension() == ".ps1";
+        auto const scan = scanForWslExec({{p, ps}});
+
+        std::string got;
+        for (auto const& r : scan.refusals) got += "\n    " + r.why;
+
+        EXPECT_EQ(!scan.refusals.empty(), shape.refused)
+            << shape.name << " was " << (shape.refused ? "ACCEPTED" : "REFUSED")
+            << " and must be the other:\n  " << shape.why << "\n  body:\n"
+            << shape.body << (got.empty() ? "" : "\n  refusals:" + got);
+        EXPECT_EQ(scan.invocations, shape.invocations)
+            << shape.name << " put " << scan.invocations
+            << " mention(s) in command position, expected " << shape.invocations
+            << ". The recogniser's BOUNDARY moved, which changes what the rule"
+               " governs without changing what it says:\n  "
+            << shape.why;
+    }
 }
 
 // The same rule over the two places the spelling is DATA rather than script

@@ -441,3 +441,17 @@ dss_add_test(NAME analysis/semantic/test_advertised_capability_is_honoured
              SOURCES test_advertised_capability_is_honoured.cpp)
 target_include_directories(dss_analysis_semantic_test_advertised_capability_is_honoured
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# ★★★ D-SEMANTIC-EXPRESSION-TYPER-REDERIVES-EVERY-SUBTREE — the COMPLEXITY pin.
+# `subtreeType` typed a whole expression subtree and discarded every descendant type
+# it computed, while `pass2Post` asked that whole-subtree question at EVERY operator
+# node of a post-order walk — so a left-deep `v + v + … + v` chain (a tree of DEPTH N)
+# cost Θ(N²) and the `semantic` phase was 98% of the compile: 24.2 s at n=8 000
+# against gcc 13.2.0 at 0.74 s on the identical file. The pin asserts the ALGORITHM'S
+# OWN counters (`SemanticModel::exprType{Queries,NodeVisits}`) and never a wall clock,
+# so it is deterministic, host-independent and identical in Debug and Release. Shares
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root.
+dss_add_test(NAME analysis/semantic/test_semantic_expression_type_reuse_complexity
+             SOURCES test_semantic_expression_type_reuse_complexity.cpp)
+target_include_directories(dss_analysis_semantic_test_semantic_expression_type_reuse_complexity
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

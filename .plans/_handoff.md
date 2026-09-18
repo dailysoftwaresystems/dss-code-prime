@@ -34,17 +34,20 @@ below is IN it.
    calls a row OPEN, or tells you to read it, it describes the state on the day it was written.
 3. **`.plans/_deferred-anchor-registry-done.md`** — the archive, one table. **Nothing here is work.**
    ⚠ Closing a row MOVES it between these files. It is never marked in place.
-   ⛔ **Never hand-edit or hand-read a row.** `scripts/anchors/{write,set,read}-anchor` is the only
+   ⛔ **Never hand-edit or hand-read a row.** `dssharness {write,set,read}-anchor` is the only
    door, and `read-anchor <ID> --json` the only sanctioned reader — the raw table line stores every
-   `|` escaped, and reading it raw hands the escape back doubled. `write-anchor` also takes
-   `--relocating` for a row that exists elsewhere in the repository and is being MOVED, not named.
-   ✔MEASURED 2026-09-16 at `305604f1`: every verb's usage line reads `(--production | --done)`.
-   **`--harness` is gone and is refused.**
-   ⓘ **The successor is named, and it is not live here yet.** DssHarness ships `write-anchor`,
-   `set-anchor`, `read-anchor`, `read-anchors`, `check-anchor-balance` and `check-anchor-citations`
-   (✔MEASURED, `DssHarness --help` at 0.5.3). This sentence becomes false, and the door becomes
-   `DssHarness`, in **the commit that deletes `scripts/anchors/`** — not before. While the scripts
-   exist they are the door.
+   `|` escaped, and reading it raw hands the escape back doubled.
+   ✅ **THE HANDOVER HAS HAPPENED.** The paragraph here used to name `scripts/anchors/` and to say
+   it stopped being true "in the commit that deletes `scripts/anchors/` — not before". ⇒ That
+   predicate has FIRED: those eight launchers are deleted on this branch, and the door is the tool.
+   ✔MEASURED 2026-09-17 at 0.5.6, exercised on this tree: `write-anchor` (three rows added),
+   `set-anchor --status` (four rows moved or restated), `read-anchor --json`,
+   `check-anchor-balance` and `check-anchor-citations --current-tree`.
+   ⚠ **The registry selectors changed spelling with the door.** The tool says `--pending` where the
+   scripts said `--production`; `--done` is unchanged. A command still typing `--production` fails.
+   ⚠ **The status vocabulary is FOUR values, not three** — `open`, `gated`, `disclosed`, `closed`.
+   `🔵 DISCLOSED` is open work whose debt pre-dates the cycle, and it is what keeps
+   `check-anchor-balance` from counting a newly-FOUND pre-existing defect as newly-CREATED debt.
 4. **`.claude/skills/dss-cycle/references/dss-harness.md`** — the tool the harness is moving to:
    which of its verbs exist today, which scripts are still the only way to do their job, this
    repository's `.harness-config/config.json`, and the exit codes.
@@ -66,13 +69,119 @@ below is IN it.
 
 ---
 
-**Last updated:** 2026-09-16 — cycles **P14 … P68**. ✔**P66 IS COMPLETE AND LANDED.** PR #57 MERGED 2026-09-15T21:22:25Z as `e8dbc3c5` on `main`, and `main` is now `adf254c7` (`v0.5.0`) — ✔MEASURED at `305604f1` with `gh pr view 57 --json state,mergedAt` and `git log --oneline origin/main -3`. The `packed_atomic_member_concurrency` P0 that lane `bl` was working is no longer open: ✔MEASURED, `bash scripts/anchors/read-anchors.sh --production --open --band P0` reports **0 rows**. ⚠ The block that used to stand here said P66 was incomplete and named that P0 as the reason; both halves are discharged. **§0.0 below is the live state; everything under `§0.1 — P66 RAN IN TWO HALVES` is P66's own record.**
+**Last updated:** 2026-09-18 — cycles **P14 … P68** (round 6 of P68 landed; its block heads §0.0). ✔**P66 IS COMPLETE AND LANDED.** PR #57 MERGED 2026-09-15T21:22:25Z as `e8dbc3c5` on `main`, and `main` is now `adf254c7` (`v0.5.0`) — ✔MEASURED at `305604f1` with `gh pr view 57 --json state,mergedAt` and `git log --oneline origin/main -3`. The `packed_atomic_member_concurrency` P0 that lane `bl` was working is no longer open: ✔MEASURED, `bash scripts/anchors/read-anchors.sh --production --open --band P0` reports **0 rows**. ⚠ The block that used to stand here said P66 was incomplete and named that P0 as the reason; both halves are discharged. **§0.0 below is the live state; everything under `§0.1 — P66 RAN IN TWO HALVES` is P66's own record.**
 
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
 
 ## §0.0 — STATE
+
+### ★ P68 ROUND 6 — READ THIS FIRST: the tool is 0.5.7, and seven lanes landed
+
+⚠ **Everything above this block that says `0.5.3` describes 2026-09-16.** ✔MEASURED 2026-09-17:
+`dssharness --version` → **0.5.7**, installed on all four hosts. The command is spelled **`dssharness`**
+(lowercase) since 0.5.6; a ctest entry must never spell it bare (`DSS_HARNESS_EXE`, with HINTS).
+
+**What 0.5.7 changed that this repository now relies on — each ✔MEASURED with a control:**
+- a verb run INSIDE a linked worktree reads THAT worktree's `config.json` (and so does `-C`) — at 0.5.6
+  nothing reached a worktree's config at all;
+- grouped action directories LOAD (`.harness-config/runner/actions/real-examples/c/<name>/<name>.yml`
+  is the action `<name>`); a group directory named `build` or `artifacts` is refused by name;
+- unknown config keys are refused (exit 12), so a key that loads is a key the tool reads;
+- `create-worktree` / `delete-worktree` / `list-worktree` exist, and `worktrees.root` is `.worktrees`
+  in our config — the operator's 2026-08-26 location.
+
+**THE SEVEN LANES THIS COMMIT CARRIES**, each folded (md5-verified against its lane) and its rows applied:
+
+| lane | subject | what landed |
+|---|---|---|
+| `mg` | migration waves | `W-build`, `W-test`, `W-sync`, `W-cilegs` — the carriages and the gate driver are gone |
+| `m2` | migration waves | four more waves; §17 of `cmake/DssHarnessDeletionInventory.md` records the four programs NO verb covers and why they stay |
+| `ee` | examples | the refusal arm now stages `prebuiltLibraries` in BOTH runners; the `manual-end-to-end` and `macho-alias-ld64-matrix` runners |
+| `sx` | compile-size wall | an O(N²) coalescer query (N² to the digit, 400M/1.6B/6.4B) and a 24-bit vreg-id bitfield that SILENTLY TRUNCATED past 2²⁴ — 131 MB in one function now compiles in 46 s |
+| `sm` | `semantic` quadratic | a DESCENDANT re-walk, not an ancestor walk: 24.232 s → 69 ms at n=8000 (351×); output identical over 907 subjects × 2 targets including 93 refusal subjects |
+| `il` | the long-branch arc | ⚠ **refuted its own brief**: GNU ld DOES link across the ±128 MiB edge; every executable whose `.text` exceeds the branch reach is refused at its OWN entry (`_start` → the exit import stub past all of `.text`). Three false diagnostics fixed; the veneer itself awaits the operator (row below) |
+| `mf` | the migration, attempted at 0.5.6 | **findings, no code** — they became repo-harness's round-3 fixes: a declared `inputs` value was not substituted, and no path reached a worktree's `config.json`. ⚠ Its headline, *"every verb acts on the main checkout"*, was CORRECTED by repo-harness and the correction is right: the CONFIG was main's, the WORK (`{treeDir}`, the step's cwd) was the worktree's all along. Its one edited file carries the deploy-day config edits main already has — nothing to fold |
+
+**Registry.** ✔MEASURED at this commit: `check-anchor-balance` → **584 open against 580 at HEAD, counted
+0**, banding **P0 0 · P1 63 · P2 181 · P3 325 · P4 11 · P5 4** (the bands sum to the balance total).
+⚠ The gate reads **0 closed** because every closure this round was BORN closed — it cannot see a row
+born in the cycle. The real movement — **closed 5**: `D-LIR-COALESCE-ANTI-AFFINITY-QUERY-IS-QUADRATIC`,
+`D-LIR-VREG-ID-BITFIELD-TRUNCATES-SILENTLY-PAST-ITS-WIDTH`,
+`D-SEMANTIC-EXPRESSION-TYPER-REDERIVES-EVERY-SUBTREE`,
+`D-TEST-EXAMPLES-REFUSAL-ARM-DISCARDS-EVERY-LIBRARY-INPUT`,
+`D-TEST-SCRIPT-SCAN-COLLAPSES-ON-A-BYTECODE-HUSK`; **disclosed 4** — pre-existing debt this round FOUND,
+each measured to pre-date it, and each with an owner in round 7:
+`D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH` (P1 — awaiting the operator's
+three-part veneer decision), `D-TEST-EXAMPLES-BUILD-ONLY-ARM-CANNOT-CARRY-AN-OPTIMIZED-ARM` (P3 — ✔SEVEN
+manifests at the base declare optimized arms built on no host; lane `dl`),
+`D-LINK-WRITER-RENAME-OVER-FAILS-WHILE-ANOTHER-PROCESS-HOLDS-THE-FILE` (P2; lane `rw`) and
+`D-TEST-LANE-WORKTREE-GUARD-IS-GREEN-ONLY-ON-A-QUIET-MACHINE` (P2; lane `mig`). Three malformed
+`🔵 🟠 OPEN (DISCLOSED)` status cells were set to the tool's `🔵 DISCLOSED`.
+
+**Also landed (orchestrator):** the manual corpus moved to `corpus/<language>/<name>/` and its driver
+discovers entries recursively (the ROOT, not the depth, is what keeps it out of the gate); both
+`manual-end-to-end` and `macho-alias-ld64-matrix` were UNREACHABLE — action directories with no
+`predefinedRunners` entry — and are now declared; 14 citations of a deleted row were cleaned from
+`integrated_tests/` and 2 from `examples/` (the 2 were what `anchor_citations_guard` actually saw — it
+reads `anchors.citationRoots` only, and `integrated_tests/` is not one); the `scripts/anchors/` handover
+applied in the four documents that still called the deleted launchers "the only door".
+
+**THE GATE THIS COMMIT CARRIES** — ✔MEASURED, `dssharness test`, all eight legs, on the folded tree:
+
+| leg | Debug | Release |
+|---|---|---|
+| Windows x86_64 (MinGW Debug · MSVC Release) | run 1 **2214 / 2214** · re-run on the final tree **2213 / 2214**: `lane_worktree_guard` TIMEOUT 314.64 s with four legs on the host — alone, as a control, it PASSES in 139.66 s | run 1 **2213 / 2214**: `FrontHalfMultiTuPoolIsRepeatStable`, the rename race below · re-run on the final tree **2214 / 2214** |
+| WSL x86_64, gcc | run 1 2211 / 2213: the bytecode husk · re-run **2213 / 2213** | run 1 2211 / 2213: the husk · re-run **2213 / 2213** |
+| macOS arm64, clang | ⛔ **BLOCKED ON repo-harness** — `poisoned`, see below | ⛔ same |
+| arm64 VPS, gcc | **passed** (1h29m) | **passed** (1h16m) |
+
+⚠ **The VPS counts were not relayed to the driver** — they stay in that host's own run directory, and
+this session does not read connection data to fetch them. ⟶ By arithmetic, not measurement: WSL runs
+2213 WITH the 35-entry `repo-guard` label and the ssh legs exclude it, so each VPS leg ran **2178**.
+⚠ **Two failures appeared under load and neither reproduces alone; both are DEFECTS, filed and owned
+this round, never retried away:** the writer's rename race (`FrontHalfMultiTuPoolIsRepeatStable`, 0 of 15
+failures alone) and `lane_worktree_guard`'s load-sensitivity (over its own 104 s budget even alone).
+The WSL red was a third defect, in our guards, FIXED in this commit (`bytecode_husk`, red-on-disable
+recorded in its row).
+
+⛔ **The two macOS runs are BLOCKED ON repo-harness, not skipped.** Both legs synced and then the Mac's
+own run failed `poisoned (ExecutableNotFoundException: Executable 'cmake' was not found on PATH.)`:
+`RepoHarness.Core.Processes.ProcessRunner.ResolveProgram` searches only the non-login PATH, Homebrew is
+not on it, and a `tools` entry has no location field — so no configuration of ours can fix it, and
+editing the Mac's shell files would be a workaround. `legs` reported the Mac runnable throughout.
+Reported to repo-harness 2026-09-17 together with four smaller findings (an empty `FAIL - ` verdict line
+for a poisoned leg; `worktrees.pathBudgetReserve`'s definition — ✔195 measured in a tree, 166 below the
+variant directory; no check that `<action>/artifacts/` is gitignored; `create-worktree`'s description
+hardcodes the default root), one un-isolated observation (a host busy with a run surveyed as "did not
+answer" — to be re-measured during a sync once round four ships), and on 2026-09-18 a sixth: a host's
+SIBLING legs of one invocation are reported as processes "ran outside this run" — ✔778 warnings, one
+per pid. repo-harness answered with **round four** — every item fixed at its cause, two further defects
+of theirs found on the same path — **in implementation, not yet released**. ⚠ Their closing summary
+also misreads at 0.5.7 (`test: FAIL - poisoned: 8 leg(s) reported` when 2 were poisoned, 3 failed, 3
+passed); round four recomposes it, so re-read that line after the upgrade.
+
+**LANE EVIDENCE** from every folded lane is preserved, byte-verified, under the ignored
+`.temp/p68-lanes/<lane>/` — findings files, red-on-disable transcripts, probe logs.
+
+**NEXT — P68 ROUND 7, five lanes seeded from this commit** (operator, 2026-09-17: *"implement all
+possible items in the lanes, leaving just the blockers behind until dssharness finish on their side"*,
+and a fifth lane authorized): `mig` — finish the migration: `scripts/` and `real-examples/` cease to
+exist, every program deleted (a verb covers it, proven) or moved into `.harness-config/runner/actions/`;
+plus our 0.5.7-exposed defects (the `artifacts/` ignore rule, the path budget, `lane_worktree_guard`).
+⛔ **It can only LAND after repo-harness ROUND FOUR ships**: under 0.5.7 the sync sends nothing under
+`.harness-config/` except `config.json` (their defect A), so a moved guard is missing on every host that
+syncs. Round four also restores the macOS legs, fixes a worktree's remote legs reading main's config
+(defect B), and REDEFINES `worktrees.pathBudgetReserve` — **168, applied with the release, never
+before**. `rw` — `D-LINK-WRITER-RENAME-OVER-FAILS-WHILE-ANOTHER-PROCESS-HOLDS-THE-FILE`. `fo` — a correct `_BitInt(256)` program REFUSED on AArch64 at the default pipeline
+(frame offset 32768 overflows the `imm9` slot), the closed scaled-imm12 row that does not reach it, and
+the P1 `D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS` gated since 2026-08-27 on that closed row.
+`dl` — the seven phantom optimized arms. `cr` — a real-corpus compile-time measurement (the operator's
+*"do we need another improvement in timing"*, which the synthetic table cannot answer: every phase on
+it is now LINEAR) and the dangling citations under `tests/` and `packaging/`.
+
+---
 
 🔵 **P68 CONTINUES THE DssHarness MIGRATION ON `feature/dssharness-migration`, PR #58 (OPEN, base
 `main`).** This branch carries the migration and nothing else (operator ruling, 2026-09-15). Its
@@ -113,8 +222,9 @@ this branch — the only version number that ever mattered is the one on nuget.o
 closed one in one table. A defect in the harness is repo-harness's to fix; a defect in this
 repository's build wiring, tests or plans is a production row like any other. The 187 open harness
 rows and the archive's 544 closed ones are readable in git at the parent of the commit that deleted
-them. ⛔ `scripts/anchors/{write,set,read}-anchor` is still the only door while those scripts exist,
-and `read-anchor <ID> --json` still the only sanctioned reader.
+them. ⛔ `dssharness {write,set,read}-anchor` is the door — the `scripts/anchors/` launchers this
+sentence used to name are DELETED on this branch — and `read-anchor <ID> --json` is still the only
+sanctioned reader.
 
 **Where the registry stands.** ✔MEASURED at `305604f1`, by two independent instruments that agree —
 `check-anchor-balance.py --breakdown --denominator registry` and
@@ -243,13 +353,49 @@ count.**
 5. orchestrator — the eight-run gate; the long-branch row's *"the cross-leg run is owed"* answered;
    the run-gate row and inventory §13; the DssHarness findings below.
 
-**DssHarness at 0.5.4 — reported to the operator, never worked around.** `buildOutputs` still cannot
-express a cross-platform executable, so `DssHarness test` exits 5 `unwitnessed` and **parity cannot be
-taken**; `LegRunService` still builds its OK line from legs REPORTED ON while `SkippedUnavailable` is
-`IsFailure=false`. NEW, and NOT a defect: `DssHarness sync` refuses to adopt a checkout it did not
-create — ✔MEASURED, `sync --dry-run --legs linux-x86_64-debug` exits **13** — because a sync deletes
-what the source lacks. It is right, and all three ssh/WSL hosts hold exactly such a checkout with warm
-build roots, so **the migration owes a decision, not a fix**.
+**DssHarness 0.5.5 — all three of this branch's reported blockers are CLOSED, ✔MEASURED 2026-09-17
+against the installed tool rather than relayed.**
+
+1. **`buildOutputs` can be scoped by platform, and ours now is.** ⚠ Note for anyone reading the
+   0.5.4 record below it: this repository had **no `buildOutputs` entry at all**, so the earlier
+   "one flat path" framing never applied here and nothing was witnessed by that mechanism. The entry
+   now names `compile_commands.json` plus `{ windows: bin/dss/dsscp.exe, all: bin/dss/dsscp }`,
+   against ✔MEASURED artifacts on both platforms. **`dssharness build --legs linux-x86_64-debug`
+   PASSES** where `test` used to exit 5 `unwitnessed` — parity is no longer blocked.
+   ★ **AND THE MAPPING IS PROVEN LIVE BY A NEGATIVE CONTROL, not by the pass:** removing the
+   `windows` arm makes the config READ refuse with **exit 12**, naming `windows-x86_64-debug` and
+   `windows-x86_64-release` by name; the file's md5 was restored exactly afterwards. A build that
+   passes proves an output was found, never that the mapping was consulted.
+2. **Exit 21 (Incomplete) shipped**, with `complete` beside `passed` in the `--json` ledger, so a run
+   where a leg reached no verdict can no longer report itself as a pass. ✔MEASURED there is still
+   **no DssHarness invocation anywhere** in `scripts/`, `.github/`, `cmake/` or `tests/` — every hit
+   is prose — so there is nothing to correct today and the requirement lives in the deletion
+   inventory, whose first reader is the wave commit that introduces one.
+3. **`sync --adopt` shipped, and ALL THREE HOSTS ARE ADOPTED** — the blocker round 3 recorded as
+   *"the migration owes a decision, not a fix"* is settled, at zero cost. ✔MEASURED before each one,
+   because an adoption OVERWRITES and an overwrite kills an uncommitted host edit silently: each
+   host's checkout root holds nothing outside this tree plus `sync.neverTransfer`; each was CLEAN at
+   `91820d36` with zero porcelain lines; each dry run said **31 overwritten, 0 deleted**. Adopted one
+   at a time with the full quoted spelling. ✔**Warm build roots survived on every host — 658 objects
+   and a live `CMakeCache.txt` in both `build/dbg` and `build/rel`** — which was the entire point.
+   A plain `sync --dry-run` across every host now answers `OK - 3 host(s) inspected` with no refusal.
+
+⚠ **What an adoption does NOT keep, recorded because the refusal itself says so and a later session
+will be tempted to trust the word "ignored":** ignored paths are listed by asking git which ignored
+files exist in THIS tree, so a directory only a HOST has is ignored by nothing this side can see and
+is deleted like any other file. `sync.neverTransfer` is the only thing that protects such a path.
+Ours already named `build`, `node_modules`, `.venv`, `.ccache`, `.temp`, `.worktrees` and the rest,
+which is why the loss lists were empty — that was checked, not assumed.
+
+⚠ **Two things to put to the operator rather than treat as settled.** `dssharness legs` prints
+`OK - N of M leg(s) can run` and exits **0** when a host is unreachable — the same shape as the line
+exit 21 exists to fix, though `legs` is a survey and not a verdict. And `sync --dry-run` on an
+unadopted checkout exited **13** at 0.5.4 and exits **0** at 0.5.5 while reporting the same cost, so
+anything that read 13 as *"needs adoption"* now sees success.
+
+ⓘ **The Mac resolves intermittently from this workstation** — mDNS missed it twelve times running
+while Windows resolved it and found port 22 open. It is the resolver, not the host; the carriage
+names that case first in its own refusal.
 
 ### P68 ROUND 3 — one lane, alone, because it held `src/dss-config/**`
 

@@ -25,12 +25,28 @@ commit's author will actually see it.
   the command again.
 
 ## The deletion waves, named once
-`W-anchors` · `W-build` (`local-build`) · `W-test` (`run-gate`) · `W-sync` (`wsl-leg`, `remote-leg`,
-`macos-leg`, `leg-tree`, `ssh-macos`, `ssh-arm64-vps`, `carriage-excludes`, `check-carriage-paths`) ·
-`W-worktrees` (`lane-worktree`) · `W-run` (`sqlite-runtime-bench`, `sqlite-round-trip`,
-`macho-alias-ld64-matrix`) · `W-buildtime` (`profile-compile`, `compile-bench`) · `W-lineendings` ·
-`W-cilegs` · `W-buildchecks` (`check-ninja-deps`, `check-root-litter`) · `W-secrets` ·
-`W-lastconsumer` (`repo-tree`, `owning-tree`).
+`W-anchors` · ~~`W-build` (`local-build`)~~ **LANDED** · ~~`W-test` (`run-gate`)~~ **LANDED** ·
+~~`W-sync` (`wsl-leg`, `remote-leg`, `macos-leg`, `ssh-macos`, `ssh-arm64-vps`, `carriage-excludes`,
+`check-carriage-paths`)~~ **LANDED** · `W-worktrees` (`lane-worktree`) · `W-run`
+(`sqlite-runtime-bench`, `sqlite-round-trip`, `macho-alias-ld64-matrix`) · `W-buildtime`
+(`profile-compile`, `compile-bench`) · `W-lineendings` · ~~`W-cilegs`~~ **LANDED** · `W-buildchecks`
+(`check-ninja-deps`, `check-root-litter`) · `W-secrets` · `W-lastconsumer` (`repo-tree`,
+`owning-tree`, **`leg-tree`**).
+
+⛔⛔ **`leg-tree` MOVED OUT OF `W-sync`, AND A WAVE THAT DELETES IT THERE REDS FOUR ENTRIES BELONGING
+TO THREE OTHER WAVES.** ✔MEASURED 2026-09-17 (lane `mg`, while landing `W-sync`):
+`scripts/leg-tree/leg-tree.sh` is TWO programs under one name. Its carriage half
+(`leg_tree_prepare`, `leg_tree_restore`, `leg_tree_remote_command`) is what `dssharness sync`
+replaces and now has no caller. Its other half is the **`.sh` owner of "which tree am I standing
+in"** — `leg_tree_driver_identity`, `leg_tree_git_unsteered`, `leg_tree_owning_root` — one of the
+three one-per-language resolvers beside `repo-tree.ps1` and `owning-tree.py`, and **three scripts
+outside the leg drivers SOURCE it at runtime and die loudly if it is absent**:
+`check-line-endings.sh` (`W-lineendings`), `check-root-litter.sh` (`W-buildchecks`) and
+`lane-worktree.sh` (`W-worktrees`), plus `test-lane-worktree.sh`, which copies it into its fixture.
+The entries that would have gone red: `line_endings_guard`, `line_endings_watchdog_sh_guard`,
+`root_litter_guard`, `lane_worktree_guard`. ⇒ it retires with its LAST CONSUMER, which is item 10's
+rule applied to the `.sh` resolver — item 10 recorded it only for the Python one.
+Instrument: `grep -rnE "^\s*\.\s+.*leg-tree\.sh" --include=*.sh scripts/`.
 
 ---
 
@@ -45,6 +61,13 @@ commit's author will actually see it.
 
 ✔MEASURED 2026-09-16, lane s4. The filesystem walk and `git ls-files` agree exactly at 49, so no
 untracked stray is inflating the figure. **AGREES with contract S4** (49 today, 41 go, 8 remain).
+
+**⟶ RE-MEASURED 2026-09-17, after `W-build` + `W-test` + `W-sync` + `W-cilegs` landed** (lane `mg`,
+same two instruments): **34** (22 `.sh`, 12 `.ps1`) and **42** directories. Those four waves took
+**15 files and 10 directories**. Remaining to the ⟶ 8 / ⟶ 25 target: **26 files, 17 directories**.
+⚠ Not the 17 files and 11 directories the wave list implied, because `leg-tree` did not go — see the
+block under *The deletion waves*. The `⟶` figures in the two rows above stay as the whole
+migration's projection and are still arithmetic until the last wave runs them.
 
 ---
 
@@ -61,6 +84,15 @@ untracked stray is inflating the figure. **AGREES with contract S4** (49 today, 
 The eight: `lane_worktree_guard`, `root_litter_guard`, `macos_leg_source_tree_guard`,
 `leg_tree_guard`, `check_ci_legs_git_environment_guard`, `remote_leg_helper_transport_guard`,
 `run_gate_guard`, **`line_endings_watchdog_sh_guard`**.
+
+⟶ ✔RE-MEASURED 2026-09-17: **four**, after the leg-driver guards left with their subjects —
+`lane_worktree_guard`, `root_litter_guard`, `leg_tree_guard`, `line_endings_watchdog_sh_guard`.
+★ The probe itself did NOT change, which is the point of having defused it: its answer is about the
+HOST, so it survived a wave that removed half its consumers without anyone touching it. **Re-derive
+the set from the configure in front of you** rather than counting these names.
+⚠ `run_gate_guard` left but its bash DERIVATION stayed, because `line_endings_watchdog_sh_guard` is
+registered from `_dss_rg_bash` and would otherwise have vanished silently on every Windows host —
+the eighth consumer this row exists to name.
 
 ⚠ **DISAGREES with contract S4, which says seven.** The eighth is `line_endings_watchdog_sh_guard`,
 registered in `CMakeLists.txt` from `_dss_rg_bash`, which is derived from
@@ -108,7 +140,7 @@ right. ⇒ delete the probe, its three refusal arms and the entry in ONE commit 
 |---|---|
 | Location | `cmake/DssTestBudgets.cmake`, symbol `_DSS_TB_NAMED` |
 | Rows naming a migrating subject | `run_gate_guard\|102\|288\|88` → `W-test`; `lane_worktree_guard\|37\|104\|33` → `W-worktrees`; `harness/test_sqlite_harness_legs\|66\|73\|67` → **stays** (the test is retargeted, not deleted — item 9) |
-| Rows total | **38** ✔MEASURED, and the configure line reads `named 38`, so all 38 match a registered entry today |
+| Rows total | **38** ✔MEASURED, and the configure line reads `named 38`, so all 38 match a registered entry today. ⟶ ✔RE-MEASURED 2026-09-17: **37**, `named 37`, after `W-test` deleted the `run_gate_guard` row with its entry. Total ctest entries 2210 ⟶ **2204**, and the −6 are exactly the six registrations those four waves removed |
 | Instrument | `cmake -B build/<lane>` and read `-- ctest entry budgets: … (corpus N, named 38, unit N)`; the per-row detail is `build/<lane>/ctest-entry-budgets.txt`, `named\t<name>\t<ceiling>\t<matched>` |
 
 ⚠ **PARTLY DISAGREES with contract S4**, which says *"the budget check refuses a row naming a test
@@ -118,6 +150,27 @@ The **refusal** is a separate ctest entry, `ctest/entry-budgets`, registered by
 `integrated_tests/CMakeLists.txt` and implemented in `cmake/DssTestBudgetsCheck.py`
 (failure class `named-row-stale`). ⇒ the deletion commit must delete the row, and a commit that
 forgets is caught by `ctest/entry-budgets`, not by its own configure.
+
+⛔⛔ **AND THE ROW IS NOT THE ONLY BINDING. `cmake/DssTestBudgetsCheck.py`'s `PROBES` TABLE
+NAMES A `_DSS_TB_NAMED` ENTRY TOO, AND THIS ITEM DID NOT RECORD IT.**
+✔MEASURED 2026-09-17, in the full Debug gate of the commit that landed `W-test`: deleting the
+`run_gate_guard|102|288|88` row — correct, because the entry left with the script it watched —
+turned `ctest/entry-budgets` **RED**, and not through `named-row-stale`:
+
+```
+ctest-entry-budgets: FAIL class-probe (1)
+    type='release' multi=0 flags='' entry='run_gate_guard': class release tier unit, expected release named
+```
+
+The probe re-configures a synthetic `release` build and asserts that entry is tiered `named`.
+The budget FILE and the budget CHECKER are one decision written twice, so a deletion moves
+both in the same commit. ⇒ **RETARGETED at `plan_citations_guard`, never removed**: the
+lowercase-`release` arm is what proves a build type is compared case-insensitively and the
+`named` tier is what proves a measured row is honoured over the unit ceiling — losing either
+to a deletion is the guard disarmed by the thing it exists to catch. Any surviving
+`_DSS_TB_NAMED` row whose entry is registered will do.
+ⓘ ✔MEASURED that the blast radius is exactly one entry: `git grep DssTestBudgetsCheck` outside
+that file returns only `integrated_tests/CMakeLists.txt`'s `ctest/entry-budgets` registration.
 
 ---
 
@@ -134,6 +187,9 @@ forgets is caught by `ctest/entry-budgets`, not by its own configure.
 
 Instrument: `python scripts/check-scripts-index/check-scripts-index.py` →
 `check-scripts-index: OK (52 scripts, both indexes agree with the tree and with …)`.
+
+⟶ ✔RE-MEASURED 2026-09-17, after the four waves: **42 scripts**, both indexes agree, `SCRIPT_FLOOR`
+UNCHANGED at 12 with 30 of headroom, `EXPECTED_ARMS` UNCHANGED at 31.
 
 ⚠ **DISAGREES with contract S4**, which lists `check-scripts-index (≥ 12 directories)` among the
 floors *"this migration crosses"*. It is **not crossed**: 25 ≥ 12, with 13 of headroom. The real
@@ -152,6 +208,23 @@ follows the change it is meant to catch is not an expectation"*, which is the ex
 file's own `EXPECTED_ARMS = 31` comment was written about. ⇒ **`W-test` must re-point the fixture at a
 surviving script in the same commit** (`cmake-import` is the natural pick: both twins, a `PURPOSE:`
 mark, and it survives every wave). This is a retarget of a FIXTURE, not of a floor.
+
+✅ **DISCHARGED 2026-09-17 IN THE `W-test` COMMIT, and the fix generalises past this subject.**
+`SELFTEST_SUBJECT = "cmake-import"` is named once and the primary, the contradictable sibling,
+the index row and the purpose text are all DERIVED from it; `_subject_paths` refuses before arm 0
+when the subject has no primary or no sibling; and **every sabotage now goes through `_sabotage`,
+which RAISES when its needle is absent**. ✔MEASURED: there were **eight** stale literals, not one
+— six bare `run-gate` spellings, the index row ``| **`run-gate`**``, and, buried, `PURPOSE: run a
+gate`, the opening words of that one script's own purpose text.
+⚠ **AND THIS ROW'S PREDICTION OF THE FAILURE MODE WAS WRONG, ✔MEASURED.** It says the stale
+`.replace` leaves the document pristine *"and the arm expects `EXIT_DISAGREE`"*. At the full
+deletion `_read(prim)` raises FIRST, so the old shape produces a raw `FileNotFoundError` traceback
+under a ctest entry whose name says nothing about a retired fixture — not a subtly-wrong arm. The
+subtle-arm hazard is real but reachable only when the subject SURVIVES and a needle drifts, which
+is the case `_sabotage` converts into a named refusal. Both mutants were driven THROUGH `ctest`
+with the source md5 moved and returned and a named green control; the transcript is in the lane's
+report. The row's CONCLUSION held; its prescribed diagnosis decayed, which is this project's own
+rule about a remedy decaying fastest.
 
 ---
 
@@ -185,6 +258,11 @@ Instrument for the primaries: load `scripts/check-scripts-index/check-scripts-in
 `scan(Path('.'))` and count entries whose `primary` ends `.py` (this is the same enumeration
 `check-guard-output-encoding` consumes). Breakdown today: **30 `.py`, 21 `.sh`, 1 `.ps1`**.
 
+⟶ ✔RE-MEASURED 2026-09-17 after the four waves: **28 `.py`, 13 `.sh`, 1 `.ps1`** = 42. `PY_FLOOR`
+UNCHANGED at 8, 20 of headroom. The two Python primaries that left are `carriage-excludes` and
+`check-carriage-paths`; the `unprotected` inventory is untouched, its one migrating entry
+(`sqlite-runtime-bench`) still belonging to `W-run`.
+
 ⚠ **DISAGREES with contract S4**, which lists `check-guard-output-encoding (≥ 8 Python primaries)`
 among the crossed floors. It is **not crossed**: 21 ≥ 8, with 13 of headroom. The nine primaries
 that leave are `anchors`, `apply-registry-row`, `burndown-queue`, `carriage-excludes`,
@@ -198,13 +276,29 @@ that leave are `anchors`, `apply-registry-row`, `burndown-queue`, `carriage-excl
 | Guard | Symbol | Floor | Now | After | Crossed? | Wave |
 |---|---|---|---|---|---|---|
 | `check-anchor-registry` | `_ROOT_SPECS` | `src` 400 · `examples` 150 · `docs` 8 | — | unchanged | **N/A — the roots contract S4 names no longer exist** | `W-anchors` deletes the guard |
-| `check-shell-portability` | `SCAN_FLOOR` | **15** | **39** | ⟶ **12** | ✅ **YES** | 27 `.sh` are removed in total and the floor is crossed by the **25th** (39 − 25 = 14 < 15); retarget in that commit |
+| `check-shell-portability` | `SCAN_FLOOR` | **15** | **39** ⟶ ✔**30** (2026-09-17) | ⟶ **12** | ✅ **YES, but not yet** | the four landed waves removed 9 `.sh` and left **15 of headroom**; the floor is crossed by the 25th of the 27, so it is still the LATER commit that owes the retarget |
 | `check-guard-output-encoding` | `PY_FLOOR` | **8** | **30** | ⟶ **21** | ❌ no | — |
 | `check-scripts-index` | `SCRIPT_FLOOR` | **12** | **52** | ⟶ **25** | ❌ no | — |
 | `check-carriage-paths` | `FLOOR_ROOTS` | **6** | **11** | ⟶ **2** | ✅ **YES** | `W-sync` |
 | `check-carriage-paths` | `FLOOR_SKILLDIRS` | **1** | **3** | ⟶ **1** | ❌ no (zero headroom) | `W-sync` |
 | `check-carriage-paths` | `FLOOR_CLONEPAIRS` | **1** | **1** | ⟶ **1** | ❌ no (zero headroom) | `W-sync` |
 | `tests/harness/test_sqlite_harness_legs.cpp` | `kScriptFloor` | **16** | **49** | ⟶ **8** | ✅ **YES** | see item 9 |
+| `tests/harness/test_sqlite_harness_legs.cpp` | `NoScriptInvokesWslWithoutExec`'s `invocationsSeen` | **4** | **5** | ⟶ **3** | ✅ **YES** | **`W-sync` — RETARGETED THERE 2026-09-17** |
+
+⛔⛔ **THE SECOND `test_sqlite_harness_legs` FLOOR WAS MISSING FROM THIS TABLE, AND `W-sync` CROSSED
+IT WHILE `kScriptFloor` HELD.** ✔MEASURED 2026-09-17 (lane `mg`) with a replica of the test's own
+recogniser: the live total was **5** — THREE from `real-examples/c/sqlite/build-and-test.ps1`, one
+from `ssh-arm64-vps.ps1`, one from `ssh-macos.sh`. `W-sync` deletes two of the three suppliers, so
+the union total goes to **3** against a floor of 4. ⇒ RETARGETED, never lowered: the rule is
+extracted into `scanForWslExec` so it can be pointed at a fixture; a new
+`TEST_F(HarnessLegs, TheWslExecRuleJudgesEverySyntheticShape)` drives ten SYNTHESIZED shapes with
+both verdicts each (the splat bound to `-e`, the splat unbound, a binding outside the twelve-line
+window, `-e`, `--exec`, bare, `--`, and three that must NOT be refused); and the tree census is now
+attached to the file that SUPPLIES it — `build-and-test.ps1` must supply ≥ 3, the same three it has
+always supplied, no longer summed with suppliers that have left. A union floor of 4 was satisfiable
+with one supplier at zero, which is the hazard the per-root floors elsewhere here exist to close.
+★ This also discharges item 9's *"the commit that deletes the file must give the exemption a
+SYNTHETIC fixture"*.
 
 ⚠⚠ **The largest disagreement with contract S4.** It says *"six guards refuse below a floor, and this
 migration crosses five of them"*, naming `check-anchor-registry` (`scripts` ≥ 25 distinct ids,
@@ -276,12 +370,27 @@ per-root rule is *the directory must EXIST*, not *it must be non-empty*.
 ⛔ **NOT RETARGETED IN THIS COMMIT, deliberately.** The count has not moved; a retarget landing
 before the deletion would make the guard assert something no commit has yet made true.
 
+⇒ **STILL NOT RETARGETED AFTER `W-build`/`W-test`/`W-sync`/`W-cilegs`, for the same reason.**
+✔MEASURED 2026-09-17 at the commit that landed those four: the `scripts/`-only walk counts **34**
+against a floor of **16**, so those waves do not take it under and the per-root shape above would
+still be asserting something no commit has made true. **The retarget belongs to the commit that
+takes the count under 16**, exactly as this row says. What DID move in those waves is the SECOND
+floor in the same file, `invocationsSeen` — see item 8.
+
 **Three assertions re-point with it**, all naming `scripts/ssh-arm64-vps/ssh-arm64-vps.ps1`:
 - `TEST_F(HarnessLegs, TheRecordedIdentityFlagIsNamedInExactlyOneFile)` — two references, both in
   the measured narrative of what the defect cost;
 - `TEST_F(HarnessLegs, NoScriptInvokesWslWithoutExec)` — the `-e`-bound splat is described as *"how
   `scripts/ssh-arm64-vps/ssh-arm64-vps.ps1` passes"*, i.e. the rule's only live example of the
   accepted shape.
+
+⚠ **THE FIRST BULLET MIS-ATTRIBUTES, AND THE CORRECTION MATTERS TO WHOEVER GREPS FOR IT.**
+✔MEASURED 2026-09-17: `TheRecordedIdentityFlagIsNamedInExactlyOneFile` ENDS before those two
+references begin — both sit in the narrative comment block that opens section 9 of that file
+(*"NOTHING INVOKES `wsl.exe` WITHOUT `-e`"*), between the two tests, not inside either. The second
+bullet is right: two more references sit inside `NoScriptInvokesWslWithoutExec`'s own failure
+messages, and a fifth in its non-vacuity comment. All five re-pointed in the `W-sync` commit; the
+narrative measurement is KEPT and marked as history, because it is why the rule exists.
 
 ⛔ **`ssh-arm64-vps.ps1` leaves in `W-sync`, and it is the ONLY splat site in the repository.**
 ✔MEASURED: `grep -rnE "(&\s*)?wsl(\.exe)?\s+@[A-Za-z_]" --include=*.ps1 scripts real-examples
@@ -410,12 +519,22 @@ independently and took the same fix. ⇒ **`W-test` routes through a lock that d
 ⚠ It is not released yet — it is on repo-harness's `consumer-findings-0-5-4`, so the wave that lands
 `W-test` must confirm the deployed version carries it rather than assuming this paragraph still holds.
 
+✅ **CONFIRMED AGAINST THE DEPLOYED 0.5.5 BEFORE `W-test` LANDED, 2026-09-17**, not against this
+paragraph: `repo-harness/docs/architecture.md`, *Leg integrity → One run per build directory*, states
+it as shipped behaviour — *"That stamp holds no clock. On Linux it is the boot this machine is on and
+the tick within it the process started, read from `/proc`; on Windows and macOS it is the start time
+the kernel records once at creation and never works out again. A start time recomputed from the
+current clock — which is what `ps lstart` reports, and what adding `/proc/stat`'s `btime` to
+ticks-since-boot produces — moves for every live process the moment the clock steps."* That is this
+row's defect, named and fixed. ⇒ `W-test` landed, and with it the standing 252 s charge and the
+`40-sh-challenger-vs-sh-holder` / `41-ps1-challenger-vs-sh-holder` coin flip.
+
 ## 14. Exit **21** is not a pass — a requirement with no consumer YET, which is why it is written here
 
 **Wave: every wave that replaces a script with a DssHarness verb.**
 
-DssHarness is gaining a shared exit code **21 (Incomplete)**: the work ran, nothing failed, but not
-every leg reached a verdict — distinct from 0 (all passed) and 20 (something failed). Its JSON ledger
+DssHarness **SHIPPED** a shared exit code **21 (Incomplete)** in 0.5.5: the work ran, nothing failed, but
+not every leg reached a verdict — distinct from 0 (all passed) and 20 (something failed). Its JSON ledger
 gains a `complete` boolean beside `passed`. This closes the second of the two blockers this branch
 reported, where `LegRunService` built its OK line from legs *reported on* while `Verdicts` marked
 `SkippedUnavailable` as `IsFailure=false`, so a run that skipped every leg reported passed.
@@ -430,10 +549,300 @@ consumer is exactly the kind that gets lost — the wave commit is its first rea
   the pass condition is `rc == 0`.
 - when parsing the ledger, read **`complete` as well as `passed`**. `passed` alone repeats the defect
   the exit code was added to fix.
+- ⚠ **If the gate ENUMERATES acceptable codes, 21 goes in the FAILING set by name.** Letting it fall
+  through as "unknown" is how a new code becomes a silent pass the first time it is emitted — the
+  same shape as the defect it was added to fix, one level out.
+- ⚠ **An INTERRUPTED run (exit 130) also reports `complete: false`.** Before 0.5.5 it described
+  itself as a clean pass of however many legs had finished, so a Ctrl-C mid-gate produced a green
+  ledger. Anything reading the ledger rather than the exit code must therefore read `complete`, not
+  `passed`, or Ctrl-C reads as success.
+
+✔MEASURED 2026-09-17 at 0.5.5, with the upgraded tool reading this repository's own config:
+`dssharness legs` answers `OK - 8 of 8 leg(s) can run`, exit 0, so no leg names a toolchain absent
+from its own `os` — a contradiction that 0.5.5 turned into a hard config-read refusal and that had
+been silently ignored until now. ⚠ **AND `legs` IS NO LONGER EXEMPT — this file said it was, and that is now false.**
+It answered `OK - N of M` with **exit 0** when a host was unreachable, and this branch reported that
+as the same shape exit 21 exists to fix. It was accepted: from **0.5.6** `legs` exits **21** when a
+declared host did not answer, naming the hosts. A leg that cannot run because no host MATCHES it is
+still exit 0 — that is a complete survey, honestly reported. ⇒ **gate on 21 from `legs` too.**
 
 ⓘ `scripts/run-gate` already behaves correctly by construction — it requires `rc == 0` **and** a
 tool-emitted success witness in the command's own output, so a 21 fails it twice over. That is a
 property of the script `W-test` deletes, not of whatever replaces it.
+
+## 15. Superuser: root in CI, a declared key for declared hosts, the prompt only at a terminal
+
+**Wave: every wave that replaces a script with a DssHarness verb.**
+
+0.5.5 makes an install that needs a superuser ask at the terminal, once per host, held in memory for
+that one command and written nowhere. That is fine for a person and must never be what CI depends on.
+
+✔MEASURED 2026-09-17, which is why this is a requirement and not a change: **no workflow under
+`.github/` invokes DssHarness at all.** Every `sudo` there is a direct `apt-get` or `gem install` in
+its own dedicated step on a GitHub-hosted runner, where the runner user already has passwordless
+sudo. So nothing in CI can depend on being asked today, and nothing needs correcting today.
+
+**What a wave commit owes when it introduces the first CI invocation:**
+- **Run the harness as root** for any step needing a privileged install — that needs no password at
+  all. Normally it does not arise, because dependencies are installed in an earlier step.
+- **Do not feed a password in.** A run with no terminal, a run answering with `--json`, and a run
+  given `--no-prompt` all refuse exactly as a run with no credential always has, so what a script
+  parses keeps parsing. Make the STEP root rather than supplying a secret.
+- For a **declared** host, the credential is `SUDO_PASSWORD` in that host's own `.env` under
+  `.harness-config/`. ⛔ A session does not read `.secrets/` and never prints, copies or commits such
+  a value; placing one is the operator's act, not a session's.
+
+## 16. The FINAL DssHarness API — agreed 2026-09-17, **NOT YET DEPLOYED**
+
+**Wave: every wave that replaces a script with a DssHarness verb, and deploy day itself.**
+
+📄DOCUMENTED, not ✔MEASURED — **every line of this section is a promise until a version carrying it
+is installed.** That distinction is not pedantry here: §16.3 below exists because this repository
+already wrote one such promise in the present tense and retired a guard on the strength of it.
+
+### 16.1 `{buildDir}` — the blocker, and the one-line change deploy day owes
+
+    "test": { "all": { "runner": "ctest",
+                       "args": ["--test-dir", "{buildDir}", "--output-on-failure", "--no-tests=error"] } }
+
+Vocabulary: `{buildDir}`, `{treeDir}`, `{harnessDir}`, usable in `args` and in a new
+`workingDirectory` key. A name outside it is refused when `config.json` is READ, listing what is
+available. Expansion happens **after** `--filter` and `--exclude` are spliced in, so every argument
+the runner sees goes through one rule — `filterArg` / `excludeArg` / `countPattern` are untouched.
+⇒ this is what makes `dssharness test` reach its build directory instead of starting `ctest` at the
+tree root and finding nothing (exit 8, ✔MEASURED 2026-09-17), and it is why the eight-run gate
+cannot yet be driven through the tool.
+
+### 16.2 `rebuildableFormats` — and **nothing is owed here**
+
+The rebuild-input set is derived from the project's type (cmake / dotnet / dart). Override with
+`projects[].rebuildableFormats: string[]`, entries being extensions or whole file names — `".cpp"`,
+`"cpp"` and `"CMakeLists.txt"` all match. Non-empty REPLACES the language set; empty or absent means
+the language set applies. **Empty is *say nothing*, never *match nothing*.** ★ A file with **no
+extension is always a build input**, whatever any list says.
+
+✔MEASURED at this commit (`git ls-files`, basename without a dot; churn against the merge-base
+`adf254c7`): this repository has **four** extensionless tracked files — `DCO`, `LICENSE`, `NOTICE`,
+`VERSION` — and **zero** of them changed across the whole PR. So the always-a-build-input rule costs
+this consumer nothing, `VERSION` is covered on its own merits rather than resting on
+`CMAKE_CONFIGURE_DEPENDS`, and **no override belongs in our config**. If a wave reveals a build that
+reads something else, that is a finding to report, not an override to write.
+
+⇒ a documentation edit stops forcing a clean rebuild, and the ledger now names **which** of the three
+rebuild conditions fired, not only which file differed.
+
+### 16.3 ★★★ `build` gets the moving-tree guard IT NEVER HAD — and this tree already claimed it did
+
+repo-harness verified: `BuildService` fingerprinted the tree exactly **once, AFTER the build**.
+Nothing watched a build while it ran, so a source edited mid-build produced a binary from a tree that
+never existed and the leg reported `passed`. All three verbs now open the same guard scope:
+`test` contention + inputs (unchanged) · `build` contention + inputs (**new**) · `run` whatever the
+step declares (§16.4).
+
+⚠⚠ **AND THAT FALSIFIES A CLAIM THIS BRANCH HAS ALREADY WRITTEN.** The `run_gate_guard` obituary in
+`CMakeLists.txt` — by symbol, in the `line_endings_watchdog_sh_guard` block — states that *"DssHarness
+`build`, `test` and `run` carry those refusals themselves now"*, of the moving-tree (exit 3) and
+shared-build-directory (exit 4) refusals. **False for `build` at every version installed to date, and
+false for `run` except where a step declares the keys.** ⇒ a guard was retired against a capability
+the tool did not have. Nothing was harmed — ✔MEASURED zero tracked files moved inside any build
+window — but the deletion's stated justification was a promise, not a property.
+
+★ **THE RULE THIS PUTS ON EVERY REMAINING WAVE:** a deletion is justified by what the INSTALLED tool
+does, or it states plainly that the replacement ships later. *"The verb carries it now"* is a claim
+with a version attached. Write the version.
+
+**Two consequences for whatever consumes a verdict:**
+- **`build` can now answer `contended` (exit 4)** where it previously answered `passed`. ⇒ extending
+  §14: if a gate ENUMERATES codes, **4 now belongs to `build` as well as `test`**, and the set of
+  build verdicts is no longer closed at *passed / failed*.
+- **A build whose tree moved records itself untrustworthy**, so the NEXT build starts from clean and
+  says why.
+
+✔RE-DERIVED at this commit, and it is why this is a requirement rather than a correction: there is
+still **no DssHarness invocation anywhere** in `scripts/`, `.github/`, `cmake/` or `tests/` — every
+hit is prose. The wave commit that introduces the first one is this rule's first reader.
+
+### 16.4 Actions carry the guard properties — the caveat is WITHDRAWN
+
+    steps:
+      - name: <step>
+        run: |
+          <program> <args>
+        successPattern: "<regex>"
+        stallSeconds: 900
+        watchContention: true
+        requireInputsUnmoved: true
+
+Not a special case: the same guard scope all three verbs use. ⇒ the standing constraint that *a unit
+of work needing inputs held still belongs in `test`/`build`, never an action* is repealed.
+
+⚠ **ONE LIMIT, and it fires at the worst possible moment.** `watchContention` needs a directory to
+watch, which is **the leg's build directory**. An action run with **no leg** has none, and that
+combination is refused **WHEN THE ACTION RUNS**, naming the key — deliberately not at config-read,
+because reading an action file cannot know how it will later be invoked. ⇒ an action meant to be
+invoked standalone (a manual runner is exactly this) must not declare `watchContention`: it would be
+green in every check available beforehand and refuse at the one moment it exists for. No limit was
+stated for `requireInputsUnmoved` — that is UNSTATED, not proven absent.
+
+### 16.5 `sync` removes emptied directories — and it DOES close our case
+
+The husk is invisible from the deleting side because `git rm` takes the directory with the last file,
+so only the HOST keeps it; a manifest holds files, so a plan can delete every file a directory had and
+never mention the directory. After deleting, `sync` removes directories a deletion emptied, walking
+upward while parents empty too, and **reports each surviving one by name with what kept it**.
+
+⚠⚠ **AN EARLIER DRAFT OF THIS SECTION SAID THE FIX DID NOT CLOSE OUR CASE. THAT WAS WRONG, AND THE
+WAY IT WAS WRONG IS THE PART WORTH KEEPING.** The claim was that `sync.neverTransfer` protected the
+`__pycache__` inside our two husks, so they were not empty and would survive the prune. ✔MEASURED on
+the WSL host 2026-09-17:
+
+    0 files  ./scripts/carriage-excludes/__pycache__
+    0 files  ./scripts/check-carriage-paths/__pycache__
+
+against **1–2 files in each of the other 29** `__pycache__` directories on that host. **The `.pyc`
+were deleted.** They were never protected: repo-harness disclosed that the matcher compared the whole
+relative path or an `entry + '/'` prefix — **ROOTED ONLY** — and ✔MEASURED, **all 17 of our entries
+are bare names**, with no `./__pycache__` at our root. That entry protected **nothing at all**, and
+two more (`node_modules`, `.claude/worktrees`) protected nothing either. What survives in our two
+husks is an empty `__pycache__` and its empty parent: an ordinary husk, exactly what the prune takes.
+
+⇒ **the eight go, and so do the two, and `scripts_index_guard` goes green on WSL** — on one condition.
+
+### ⛔ 16.5a WE DO **NOT** TAKE THE `**/__pycache__` ENTRY WE WERE TOLD TO ADD
+
+0.5.6 makes `**/name` mean that name at any depth (whole segments, so `**/cache` does not cover
+`src/mycache`), and a bare name **stays rooted, deliberately**. The deploy-day list we were sent says
+to add `**/__pycache__`. **For this repository that is backwards**, and the arithmetic is one-sided:
+
+| | protect `__pycache__` at depth | leave it unprotected |
+|---|---|---|
+| cost | every husk persists on every host, for every `.py` we ever delete, until a human removes it by hand — and `scripts_index_guard` reds on each | one `.pyc` recompile per script per host, once |
+| benefit | avoids that recompile | the prune closes the husk automatically |
+
+We are deleting most of `scripts/`. ⇒ **leave it unprotected.** A trivial recompile is the price of a
+guard that stays green without anybody SSHing anywhere.
+
+### ★★ 16.5b THE ENTRY THAT *DOES* NEED `**/`, AND IT IS NOT `__pycache__`
+
+✔MEASURED at this commit, redacted to a count and a depth because a session does not read `.secrets/`:
+the bare `.secrets` entry protects the root instance, and there is a **second `.secrets` directory at
+depth 3 under `.harness-config/` that it did not protect** — the very directory this inventory's §15
+and DssHarness's own superuser design name as where a host credential goes. It holds only `.gitkeep`
+today, so **nothing has leaked and nothing is owed as an incident**; the exposure is latent and becomes
+real the first time anyone does what §15 says to do.
+
+⇒ **the `**/` entries this repository actually needs are `**/.secrets` and `**/.env`** — not the one on
+the list. ★ And the general lesson, which is why this sits in the binding map: **a protective rule that
+silently matches nothing is worse than no rule**, because the name in the config file is read as
+evidence that the thing is protected. Our config named `.secrets` and a reader would stop there.
+
+⇒ **Reported back to repo-harness** as the suggestion that a bare `neverTransfer` entry with **no root
+instance but N nested instances** should be named at config-read. That is our `__pycache__` case
+exactly (root absent, 133 nested) and would have surfaced this the first time anyone ran it.
+
+⚠ **ONE RESIDUAL TO MEASURE ON DEPLOY DAY, not to assume.** The prune is described as removing
+directories **a deletion emptied**. Our two were emptied by an EARLIER sync, so a run that deletes
+nothing inside them may never walk them. If the wave reports the eight and not these two, that is the
+reason, and a one-off manual removal closes it. ⛔ Either way it is never a reason to lower a floor or
+soften a structural guard: a guard disarmed to accommodate a husk on a remote host is the guard being
+defeated by its own subject.
+
+### 16.6 The doubled `DETAIL` column — and why it was not cosmetic
+
+The ledger's `Detail` carried the timing mark **already composed** and carried the notes separately,
+so a remote leg answering with `--json` handed back a string that the asking machine composed the mark
+onto a second time — doubling once per machine the answer passed through. Fixed by separating data
+from presentation: `Detail` is now what the leg said, notes travel beside it, and the mark is composed
+only where the table is drawn. **The `--json` shape is unchanged.** ✔RE-DERIVED: nothing in this
+repository parses it, per the scan in §16.3.
+
+### 16.7 Deploy day, in order
+
+1. `"--test-dir", "{buildDir}"` into `projects[].test.all.args` — **the orchestrator's one line**, and
+   the one that unblocks the eight-run gate.
+2. Nothing for `rebuildableFormats` (§16.2).
+3. `sync.neverTransfer` gains **`**/.secrets` and `**/.env`** (§16.5b). ⛔ **NOT `**/__pycache__`**,
+   which the list we were sent asks for and which §16.5a declines by measurement.
+4. Open any enumeration of build verdicts to `contended` (§16.3); gate on **21** from `legs` (§14) and
+   on **13** from `sync --dry-run`.
+5. Re-run a deletion wave against a host and read what `sync` reports. **Expect all ten directories to
+   go**, the two `__pycache__` husks included, since they are empty. ⚠ If the two survive, the reason
+   is that the prune is scoped to what THIS deletion emptied and theirs was emptied earlier (§16.5) —
+   a one-off manual removal closes it. ⛔ Not a reason to touch a floor either way.
+6. Land the version-gated changes the lanes prepared: the retiring tools declared as actions, with
+   `watchContention` / `requireInputsUnmoved` wherever a step needs what `run-gate` gave us.
+7. Correct the obituary in `CMakeLists.txt` (§16.3) to the version-stamped form: **`test` carries
+   these; `build` carries them from 0.5.6; `run` carries them where a step asks.**
+8. Correct `scripts/check-diagnostic-codes/`'s docstring: the success-witness rule is **`test` and
+   `run`**; **`build` witnesses by `buildOutputs`** and sets no pattern anywhere (§16.3).
+
+## 17. What lane `m2` measured, and the four waves that CANNOT complete as written
+
+**Added 2026-09-17, lane `m2`, at `9cac826b`** — a base that does NOT contain lane `mg`'s four landed
+waves, so every figure here is over a **49-file / 52-directory** `scripts/`, not over the 34 / 42 in
+§1's re-measurement. ⚠ Do not read the two sets of numbers as one series.
+
+### 17.1 ⛔⛔ A ctest ENTRY MAY NEVER SPELL `dssharness` AS A BARE NAME
+| Item | Value |
+|---|---|
+| Location | `CMakeLists.txt`, symbols `DSS_HARNESS_EXE` and `dss_add_harness_guard` |
+| ✔MEASURED, WSL x86_64, `wsl.exe -e bash <file>` | the installed file is `<home>/.dotnet/tools/DssHarness` — **capitalised**, no lowercase sibling — and that directory is on the **login** `PATH` only |
+| ⇒ | `command -v dssharness` fails under both shell classes; `command -v DssHarness` fails under a non-login one. Two independent failures, either hiding the other, and **invisible from Windows**, where PATH carries the directory and the filesystem folds case |
+| The shape that survives it | `find_program(... NAMES DssHarness dssharness HINTS "$ENV{HOME}/.dotnet/tools" "$ENV{USERPROFILE}/.dotnet/tools")`, plus a REFUSAL entry when absent |
+| Control arm | the same `find_program` with `HINTS` removed answers **NOT FOUND** on the same WSL shell — so the hint is load-bearing, ✔MEASURED through a throwaway project under `mktemp -d` |
+| Wave | **every wave that registers a harness verb as a ctest entry** |
+
+⚠ `dssharness legs` answered `OK - 8 of 8 leg(s) can run` while this was true, so `legs` does not see
+it. Reported to the operator.
+
+### 17.2 ⛔ `test-leg-tree.sh`'s `G` ARMS WERE A SECOND `run-gate`-CLASS FIXTURE, AND §5 DID NOT NAME IT
+| Item | Value |
+|---|---|
+| Location | `scripts/leg-tree/test-leg-tree.sh`, the block headed *"a CONSUMER asks git only through leg_tree_git_unsteered"*, constant `EXPECTED` |
+| Was | it `cp`'d the REAL `scripts/check-root-litter/check-root-litter.sh` into its fixture and drove three arms against it |
+| ✔MEASURED in this lane's own gate | deleting that script turned `leg_tree_guard` RED at `cp: cannot stat …` with three arms at **rc 127** — an entry whose name says nothing about a retired fixture. Exactly §5's shape, one guard over, and this file did not record it |
+| RETARGETED, never lowered | both consumers are now **SYNTHESIZED** by `_lt_write_consumer` — the correct shape and the historical DEFECT (git asked bare, its exit status never read) — so no real script can be deleted out from under the arms. `EXPECTED` **raised 27 ⟶ 30**: three paired negatives `N1a`, `N1b`, `N2`, each driving the bare consumer through the identical conditions |
+| ✔MEASURED after | `test-leg-tree: OK -- 30 arm(s)`, exit 0, all six `G`/`N` arms green |
+| Wave | `W-buildchecks`, in the same commit as `check-root-litter` |
+
+### 17.3 THE FOUR SUBJECTS WHOSE HARNESS VERB DOES NOT COVER THEM — ⛔ STOP, per this file's own rule
+✔MEASURED by diffing each script's checks against `dssharness <verb> --help` and running both sides.
+
+| Subject | Verb | What the verb does NOT cover | Disposition |
+|---|---|---|---|
+| `check-anchor-registry` | `check-anchor-citations` | the markdown CELL-WIDTH / unescaped-pipe property over ALL of `.plans/` (✔MEASURED **340 tables, 4264 rows, 42 files**; `read-anchors --lint` sees the two registry files only); the RETIRED-ID matcher; the QUOTED-NOT-CITED expiry mechanism; every per-root collapse floor; the 21-arm self-test | guard KEPT; `anchor_citations_guard` added BESIDE it for the coverage the tool adds |
+| `check-line-endings` | `fix-line-endings --check --all` | Check A (HEAD **blobs**) and Check B (index blobs) — the tool judges the working tree; Check C (a pinned source git calls binary); Checks E1/E2 (✔MEASURED **72 files with no declared ending**, considered and not judged; and untracked files); **Check F entirely** — *"a CR instrument that cannot see one"*, which is half the stated PURPOSE; `--files`; `SCAN_FLOOR`; the watchdog and its 5-arm proof | ⛔ NOT DELETED |
+| `check-ninja-deps` | **none** | ✔MEASURED: all ten `dssharness help` topics grepped for `ninja\|depfile\|header dep` — **zero matches**. `build` checks PRODUCTS, not dependency RECORDS | ⛔ NOT DELETED |
+| `lane-worktree` | `create-worktree` / `delete-worktree` / `list-worktree` | `--preserve-to`, the VERIFIED evidence copy — the harness can only refuse or delete; and the **seed-manifest write `scripts/lane-fold/lane-fold.py` reads to adjudicate a fold** | ⛔ NOT DELETED — deleting it breaks fold adjudication |
+
+★ The path-budget and evidence gates DID port cleanly and are visible in `.harness-config/config.json`
+as `worktrees.pathBudgetReserve` / `pathLimit` / `pathBudgetMargin` / `evidenceRoots` — ✔MEASURED,
+`create-worktree` with a 20-character name refuses with the same 260-character reasoning.
+
+### 17.4 `owning-tree` CANNOT RETIRE — §10's 🧠INFERRED consequence is now ✔MEASURED
+Twelve directories that SURVIVE every wave import it: `check-anchor-balance`,
+`check-diagnostic-codes`, `check-guard-output-encoding`, `check-pkg-pipeline`,
+`check-plan-citations`, `check-scripts-index`, `check-shell-portability`,
+`check-stale-refusal-citations`, `check-wrapped-anchor-ids`, `corpus-census`, `lane-fold`,
+`refresh_landing_log`. It is not a script a verb replaces — it is a LIBRARY supplying `resolve()`,
+`run_git()` and `root_arms`, the shared arm set each consumer's self-test runs against its own
+resolver. No DssHarness verb offers any of the three. ⇒ **the ⟶ 25 directory target is ⟶ 26**, and
+the ⟶ 8 FILE target is unaffected because `owning-tree` ships no `.sh` and no `.ps1`.
+ⓘ `scripts/anchors/` retires the same way and for the same reason: its eight SHELL twins are the
+door and are replaced, while `anchors.py` stays as the library `check-anchor-balance`,
+`check-stale-blockers` and `lane-fold` import. A directory is not the unit of this migration; a
+PROGRAM is.
+
+### 17.5 `.harness-config/runner/actions` NOW HOLDS A SHELL PROGRAM, WHICH §9 SAID IT DID NOT
+✔MEASURED: `macho-alias-ld64-matrix.remote.sh` moved there with mode **100755** (six tracked files
+already carry that mode, so it is an existing convention, not a new one), and its local half —
+which was pure base64-into-one-ssh-argument transport — is DELETED rather than ported. ⇒ §9's
+*"`.harness-config/runner/actions` holds zero shell programs today … its per-root rule is
+that the directory must EXIST, not that it must be non-empty"* is now false in the direction that
+HELPS: a per-root floor of ≥ 1 is spellable for the first time.
+⚠ `kScriptFloor` is still NOT crossed and still NOT retargeted: ✔MEASURED **37** against a floor of
+**16** at this commit. §9's rule holds — the retarget belongs to the commit that takes it under 16,
+which is the FOLD, not this lane.
 
 ## Summary of disagreements with contract S4
 

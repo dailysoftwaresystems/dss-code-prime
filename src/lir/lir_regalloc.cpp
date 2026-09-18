@@ -1581,6 +1581,24 @@ struct CoalescePartition {
     std::vector<LirLiveRange>               hull;
     std::vector<std::vector<std::uint32_t>> members;
     std::uint32_t                           unions = 0;
+    // D-LIR-COALESCE-ANTI-AFFINITY-QUERY-IS-QUADRATIC: forbidden-pair
+    // inspections performed by the anti-affinity veto. It is the ALGORITHM'S
+    // OWN WORK, not a clock, which is what makes it a usable complexity pin: it
+    // is deterministic, host-independent, and identical under load. ⓘ An
+    // OBSERVATION, never an input to a decision — nothing reads it to choose
+    // anything, so a drifted counter cannot change what is emitted.
+    //
+    // ⚠ TWO COUNTERS, BECAUSE ONE CANNOT SAY WHAT A PIN NEEDS TO HEAR.
+    // `antiAffinityQueries` is how many times the veto was ASKED; `probes` is
+    // how many forbidden pairs it INSPECTED to answer. The old flat scan made
+    // `probes == queries x |forbidden|`. The index routinely answers a query by
+    // inspecting NOTHING — a straddling pair is incident to BOTH classes, so an
+    // empty incidence list on either side settles it — which makes a legitimate
+    // `probes == 0`. With only `probes`, a pin could not tell "the index made
+    // this free" from "the veto is no longer on the path at all", and the second
+    // reading is a correctness regression wearing a performance win's clothes.
+    std::uint64_t                           antiAffinityQueries = 0;
+    std::uint64_t                           antiAffinityProbes  = 0;
 
     [[nodiscard]] std::uint32_t find(std::uint32_t x) noexcept {
         while (parent[x] != x) {
@@ -1713,13 +1731,78 @@ buildCoalescePartition(CoalesceInput const&             in,
     // Anti-affinity is checked against the CLASSES being merged, so it must be
     // asked as "does any forbidden pair straddle these two roots" — a pair
     // whose two ends have already been pulled into one class by an unrelated
-    // chain would otherwise slip through. Kept as a flat list and re-resolved
-    // through `find` on every query: the lists are short (one entry per untied
-    // register operand of a 2-address instruction) and re-resolution is what
-    // keeps the answer true as the partition evolves.
+    // chain would otherwise slip through. Re-resolution through `find` at query
+    // time is what keeps the answer true as the partition evolves.
+    //
+    // ── D-LIR-COALESCE-ANTI-AFFINITY-QUERY-IS-QUADRATIC ─────────────────────
+    //
+    // ★★★ THIS QUERY USED TO RE-SCAN THE WHOLE `in.forbidden` LIST, ON THE
+    // WRITTEN PREMISE THAT "the lists are short (one entry per untied register
+    // operand of a 2-address instruction)". ✔MEASURED: that premise is a SIZE
+    // claim and it is false. "One entry per untied register operand of a
+    // 2-address instruction" is Θ(instructions) — one per 2-address
+    // instruction — not a constant. A single function of N straight-line
+    // `s += k;` statements lowers on x86-64 to N two-address `add`s, so it
+    // mints N forbidden pairs AND N copy edges, and the query runs once per
+    // edge: `|edges| x |forbidden|` = **N-squared** inner iterations, measured
+    // EXACTLY at 400 000 000 / 1 600 000 000 / 6 400 000 000 for N = 20 000 /
+    // 40 000 / 80 000. At N = 80 000 that was 5.2 s of an 8.3 s compile — 63%
+    // of the whole pipeline in a veto that returned false every single time,
+    // while gcc compiled the same file in 0.63 s and scaled at n^0.9.
+    //
+    // ★★ WHAT CHANGED IS THE INDEX, NOT THE PREDICATE. `incident[root]` holds
+    // the INDEX into `in.forbidden` of every pair one of whose ends currently
+    // resolves to `root`. Pair INDICES are stored rather than partner roots, so
+    // a merge never has to rewrite anybody's stored partner: the partner is
+    // re-resolved through `find` at query time, exactly as the flat scan did.
+    // The query therefore answers the IDENTICAL question — ∃ f : {find(f.a),
+    // find(f.b)} = {ra, rb} — and returns the identical bool. Only the ORDER in
+    // which candidate pairs are examined differs, and the result is a bool that
+    // does not depend on it.
+    //
+    // ⚠ THE VETO IS NOT WEAKENED, REMOVED OR CAPPED, AND THAT IS DELIBERATE.
+    // The block comment at its call site records a P40 red-on-disable arm
+    // proving it DORMANT on the corpus, with the structural argument that veto
+    // 1 implies it. That argument's premise lives in another file
+    // (`lir_liveness.cpp`'s use recording) and its failure mode is a SILENT
+    // miscompile (D-CSUBSET-BINOP-RIGHT-CLOBBER). Making a dormant correctness
+    // veto CHEAP is the fix; deleting it because it is dormant is the trade
+    // this project does not take, and a bail-out after k probes would turn a
+    // slow compile into a wrong one.
+    // ⚠ BUILT ONLY WHEN THERE IS SOMETHING TO INDEX, AND THAT IS NOT A
+    // MICRO-OPTIMIZATION. `incident` is one vector PER VREG, so sizing it
+    // unconditionally would cost ~24 bytes x the vreg count on every function —
+    // including every function that declares no two-address tie at all, which is
+    // the whole of arm64's `add` family. ✔MEASURED at this tree: the AArch64
+    // branch-island subject reaches 8.2 MILLION vregs in ONE function at 128 000
+    // statements, so an unconditional index would have added ~200 MB of empty
+    // vectors to precisely the compile this row's neighbourhood is already
+    // memory-stressed by. An empty `forbidden` cannot produce a straddle, so the
+    // absent index IS the answer rather than a shortcut around it.
+    std::vector<std::vector<std::uint32_t>> incident;
+    if (!in.forbidden.empty()) {
+        incident.resize(n);
+        for (std::uint32_t fi = 0;
+             fi < static_cast<std::uint32_t>(in.forbidden.size()); ++fi) {
+            auto const& f = in.forbidden[fi];
+            if (f.a >= n || f.b >= n) continue;  // the bounds test the scan made
+            if (f.a == f.b) continue;            // never straddles two roots
+            incident[f.a].push_back(fi);
+            incident[f.b].push_back(fi);
+        }
+    }
     auto const straddles = [&](std::uint32_t ra, std::uint32_t rb) {
-        for (auto const& f : in.forbidden) {
-            if (f.a >= n || f.b >= n) continue;
+        ++p.antiAffinityQueries;
+        if (incident.empty()) return false;  // no forbidden pair exists at all
+        // Scan the SHORTER incidence list. A pair that straddles `ra` and `rb`
+        // is incident to BOTH, so it appears in both lists and either one finds
+        // it; taking the shorter bounds a query by the SMALLER of the two
+        // classes rather than by the whole function.
+        auto const& side = incident[ra].size() <= incident[rb].size()
+                               ? incident[ra] : incident[rb];
+        for (std::uint32_t const fi : side) {
+            ++p.antiAffinityProbes;
+            auto const& f = in.forbidden[fi];
             auto const fa = p.find(f.a);
             auto const fb = p.find(f.b);
             if ((fa == ra && fb == rb) || (fa == rb && fb == ra)) return true;
@@ -1797,6 +1880,27 @@ buildCoalescePartition(CoalesceInput const&             in,
         p.members[keep].insert(p.members[keep].end(),
                                p.members[drop].begin(), p.members[drop].end());
         p.members[drop].clear();
+        // D-LIR-COALESCE-ANTI-AFFINITY-QUERY-IS-QUADRATIC: keep the incidence
+        // index true across the merge — the class that disappears hands its
+        // pairs to the survivor.
+        //
+        // ★ SMALL-TO-LARGE, AND THE SWAP IS WHAT MAKES IT SO. Which root
+        // SURVIVES is fixed above by the determinism rule (the lower id), so it
+        // cannot be chosen by list length; when the DROPPED class holds the
+        // longer list the two vectors are SWAPPED first and the shorter is
+        // appended into it. A pair index therefore only ever moves into a list
+        // at least as long as the one it left, so it moves at most log2(F)
+        // times and the whole partition costs O(F log F) — where appending the
+        // survivor's list into the dropped one unconditionally would reproduce
+        // the very O(N^2) this row removes, just one level down.
+        if (!incident.empty()) {
+            if (incident[keep].size() < incident[drop].size())
+                incident[keep].swap(incident[drop]);
+            incident[keep].insert(incident[keep].end(),
+                                  incident[drop].begin(), incident[drop].end());
+            incident[drop].clear();
+            incident[drop].shrink_to_fit();
+        }
         ++p.unions;
     }
     return p;
@@ -1994,6 +2098,8 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
     CoalescePartition part = buildCoalescePartition(
         coalesceIn, rangeOf, buildPressureMap(flow, classCapacity));
     out.coalescedCopies = part.unions;
+    out.coalesceAntiAffinityQueries = part.antiAffinityQueries;
+    out.coalesceAntiAffinityProbes  = part.antiAffinityProbes;
     // The PROOF travels with the allocation, not the outcome — see the field's
     // docblock. Sorted so the rewrite's membership test is a binary search over
     // a contract this line establishes rather than over the walk's happening to

@@ -28,7 +28,7 @@ the regex). Always pair the scan with §E.
 - **Trigger-gated anchors are not TODOs.** A row that DECLARES a trigger must remain open until that
   trigger fires; a closure with no fired trigger is a finding (§E #5). ⚠ **Find them with the
   instrument, never from a list in prose:** since 2026-09-01 a gated row DECLARES itself in its
-  `Status` column, so `bash scripts/anchors/read-anchors.sh --open | grep GATED` is the exact
+  `Status` column, so `DssHarness read-anchors --open` (its `Status` column names GATED rows) is the exact
   population (`--production` to narrow it); `grep -n 'trigger-gated' .plans/_deferred-anchor-registry*.md`
   still finds the older prose declarations, which is what the column was seeded FROM. And
   `python scripts/check-anchor-balance/check-anchor-balance.py` says which are still open. This bullet

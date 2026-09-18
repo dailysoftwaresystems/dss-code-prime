@@ -1107,6 +1107,52 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
         }
         m.targets.push_back(std::move(et));
     }
+    // ── THE TWO KEYS A REFUSAL ARM CANNOT HONOUR, REFUSED BY NAME ───────────
+    //
+    // ★★★ THEY WERE ACCEPTED AND SILENTLY DISCARDED, which is the shape this
+    // file refuses everywhere else (see the closed per-target key set above:
+    // *"an expectation the runner does not read is an assertion that never
+    // fires"*). `optimizedPipelines` was already named as such in the CLI
+    // sibling's own comment, which called a load-time refusal of the pair THE
+    // RIGHT FIX and said it had to land in both runners in one change. This is
+    // that change, widened by one key for the same reason.
+    //
+    // `dependsOn` is a BUILD — recursive, carrying an arm's optimizer
+    // configuration, asserting `mustDifferFromBaseline` over images it
+    // produces. None of that has meaning on an arm whose whole claim is that
+    // the compile FAILS, so there is nothing to implement here and the pair is
+    // a manifest defect rather than a missing capability. `prebuiltLibraries`
+    // is the opposite case and is deliberately NOT in this refusal: it names a
+    // file already on disk, the refusal arm now stages it, and a whole family
+    // of import-disagreement refusals is inexpressible without it.
+    //
+    // ✔MEASURED at this tree: 841 manifests, 34 of them `expectDiagnostics`,
+    // and ZERO declare either of these keys beside it — so this refuses a shape
+    // nothing uses, which is the only moment a refusal is free to add.
+    if (!m.expectDiagnostics.empty()) {
+        if (j.contains("optimizedPipelines")) {
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " declares BOTH 'expectDiagnostics' and"
+                             " 'optimizedPipelines'. A refusal arm never builds"
+                             " an artifact, so there is no baseline image for an"
+                             " optimized arm to differ from — the arm would be"
+                             " parsed and then silently dropped.";
+            return m;
+        }
+        for (auto const& t : m.targets) {
+            if (t.dependsOn.empty()) continue;
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " target '" << t.spec
+                          << "' declares 'dependsOn' beside 'expectDiagnostics'."
+                             " A prerequisite is BUILT, under the arm's own"
+                             " optimizer configuration, and compared against the"
+                             " images it produces; a refusal arm produces none."
+                             " Declare a library input this refusal needs as"
+                             " 'prebuiltLibraries', which the refusal arm"
+                             " resolves and threads into --resolve-library.";
+            return m;
+        }
+    }
     // D-OPT1-DIFFERENTIAL-VERIFY-RUNNER. Manifest shape — each arm
     // declares EXACTLY ONE OF `passes` (inline array) or `shippedPipeline`
     // (a config name); the exactly-one-of is enforced in `buildPipeline`:
@@ -2899,10 +2945,54 @@ void runErrorTarget(fs::path const&        exampleDir,
     auto const srcPath = scratch.path() / srcRel;
     scratch.useAsCwd();
 
+    // ── LIBRARY INPUTS ON A REFUSAL ARM ─────────────────────────────────────
+    //
+    // ★★★ THE REFUSALS THAT NEED A LIBRARY WERE INEXPRESSIBLE, AND THE MANIFEST
+    // KEY THAT WOULD HAVE SAID SO WAS ACCEPTED AND DISCARDED. `prebuiltLibraries`
+    // parses on every target of every manifest, including an `expectDiagnostics`
+    // one; this arm never read it, so a manifest that declared a library input
+    // compiled WITHOUT it and asserted a diagnostic set produced by a build that
+    // had never seen the library. An expectation the runner does not read is an
+    // assertion that never fires, and a SILENT one is the worst shape of it.
+    //
+    // A whole family of refusals lives behind this door and none of it could be
+    // witnessed end to end: every disagreement between what a C declaration says
+    // about an imported name and what the LIBRARY'S OWN export table says about
+    // it — storage duration, object format, architecture — is knowable only when
+    // a real library is on the command line.
+    //
+    // ⚠ `dependsOn` IS REFUSED RATHER THAN STAGED, and the asymmetry is the
+    // honest one. A `prebuiltLibraries` entry is a file already on disk: staging
+    // it is a path resolution and three integrity checks, all of which already
+    // exist here. A `dependsOn` entry is a BUILD — recursive, carrying this arm's
+    // optimizer configuration, asserting `mustDifferFromBaseline` against images
+    // it produces — and none of that has any meaning on an arm whose whole claim
+    // is that the compile fails. The parser refuses the pair by name (see
+    // `readManifest`), so nothing reaches here holding one.
+    std::vector<fs::path> errorResolveLibs;
+    errorResolveLibs.reserve(t.prebuiltLibraries.size());
+    for (auto const& lib : t.prebuiltLibraries) {
+        auto resolved = resolvePrebuiltLibrary(lib, exampleDir);
+        // `resolvePrebuiltLibrary` has already fired ADD_FAILURE naming which of
+        // the three integrity checks failed. Returning here rather than
+        // compiling without the library is what keeps a missing fixture from
+        // reading as "the compiler refused this program", which is the exact
+        // false green an expect-error arm is most exposed to.
+        ASSERT_TRUE(resolved.has_value())
+            << "expect-error example " << exampleDir.generic_string()
+            << " declares a prebuilt library its tree could not supply — "
+               "compiling without it would assert a refusal the library was "
+               "supposed to cause";
+        errorResolveLibs.push_back(std::move(*resolved));
+    }
+
     Program            prog;
     DiagnosticReporter rep;
     auto const         outDir = scratch.path() / "out";
     prog.setOutputDir(outDir);
+    if (!errorResolveLibs.empty()) {
+        prog.setResolveLibraries(errorResolveLibs);
+    }
     // Same entry-point choice the SUCCESS arm makes: a `sources` array is the
     // CU6 multi-CU model (`compileUnits`, one CU per file, merged at link), a
     // single `source` is the CU5 one-unit model (`compileFiles`). Routing the

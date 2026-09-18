@@ -115,7 +115,8 @@ the next long test name.
 
 ⚠ **`.gitignore`'s `/.worktrees/` rule is what keeps lane checkouts off every gate host**, and it
 is a REQUIREMENT, not tidiness. Since 2026-08-26 the carriages derive their exclude list from git
-(`scripts/carriage-excludes/`), so that one line is what stops four full repo copies riding to
+(and `sync.neverTransfer` in `.harness-config/config.json` names it a second time), so that one
+line is what stops four full repo copies riding to
 macOS and the arm64 VPS on every push — and a gate host holding one runs somebody's uncommitted
 `examples/` corpus and reports it as the cycle's. It is therefore ALSO pinned in that script's
 `MUST_NEVER_TRAVEL` floor, which re-asks git and **refuses the carriage** if the rule is edited

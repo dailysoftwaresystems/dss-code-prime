@@ -80,10 +80,13 @@ not punished like shipping a new deferral.
 - **Closing a row MOVES it** out of its working registry into the archive; reopening moves it back.
   `check-anchor-balance` fails the tree for a closed row left behind, for an open row filed in the
   archive, and for a `Status` column that contradicts its own `Trigger` prose.
-- **`scripts/anchors/`** is the door — `write-anchor`, `set-anchor`, `read-anchor`, `read-anchors`,
-  each with a `.sh` and a `.ps1` launcher over one implementation. The writer takes the FIELDS, so a
-  wrapped anchor id (invisible to every grep, and it mints a false id), an unescaped `|` and a wrong
-  cell count are inexpressible.
+- **`dssharness`** is the door — `write-anchor`, `set-anchor`, `read-anchor`, `read-anchors`. The
+  writer takes the FIELDS, so a wrapped anchor id (invisible to every grep, and it mints a false
+  id), an unescaped `|` and a wrong cell count are inexpressible. ⚠ The registry selector is
+  `--pending`, not `--production`; `--done` is unchanged.
+  ⏳ **SCRIPT-ERA, and the predicate has fired:** the eight `scripts/anchors/*.{sh,ps1}` launchers
+  this line used to name are DELETED. `scripts/anchors/anchors.py` itself survives — it is still the
+  subject of `anchors_selftest_guard` — but it is no longer a door anyone should reach for.
 - ★ **RESOLUTION reads both files; ORIENTATION reads only the working one.** A `D-*` cited in `src/`
   must resolve wherever its row lives, so resolvers glob `_deferred-anchor-registry*.md`. Anything
   asking *what is left* reads production and stops there.
@@ -177,7 +180,7 @@ execution is posix only."*
   project's primary ctest runs, so a bash-only capability is one the main gate cannot use.
 - **Omit it, and say so in the header, when either holds:** the script is already cross-platform (a
   `.py` runs on both hosts; a twin would be a second implementation of something never split), or its
-  execution is POSIX-ONLY BY NATURE (`wsl-leg` runs inside a WSL distro where PowerShell is not the
+  execution is POSIX-ONLY BY NATURE (a driver that runs inside a WSL distro where PowerShell is not the
   shell; `profile-compile` drives a POSIX toolchain over a carriage).
 - **Where a pair exists, the two must not drift — and that is checked IN THE REVIEW, at the moment the
   script is written or changed.** Operator ruling 2026-08-19: *"the parity must be checked in the

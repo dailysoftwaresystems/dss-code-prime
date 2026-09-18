@@ -1135,13 +1135,13 @@ foreach ($a in $missing) {
 Write-Host ""
 Write-Host "Fix: either"
 Write-Host "  (a) add a row in .plans/_deferred-anchor-registry-production.md naming the"
-Write-Host "      trigger + closing work -- write it with scripts/anchors/write-anchor.sh,"
+Write-Host "      trigger + closing work -- write it with DssHarness write-anchor,"
 Write-Host "      which is the only door; a hand-edited table is how the halves drift, OR"
 # ⚠ THESE EIGHT LINES WRAP EXACTLY AS THE `.sh`'s DO, and that is not fussiness:
 # the twins are verified by DIFFING their output, so a report that differs on a
 # line for no reason is noise a real divergence could hide inside.
 Write-Host "  (b) correct the citation to the id of the row that already covers it,"
-Write-Host "      confirmed with scripts/anchors/read-anchor.sh <ID> --json, OR"
+Write-Host "      confirmed with DssHarness read-anchor <ID> --json, OR"
 Write-Host "  (c) if the string is a code-internal pin and NOT deferred work, rename it"
 Write-Host "      out of the D- shape under a PIN- prefix, as the retired Allowlist was."
 Write-Host ""

@@ -50,7 +50,7 @@
 //     elf both    struct tm 56/8 · timespec 16/8 · timeval 16/8 · rusage 144/8
 //                 · utimbuf 16/8 · passwd 48/8
 //     macho arm64 (Apple clang 21.0.0, macOS 26.6.2, the operator's own
-//                 hardware, reached over the ssh-macos carriage)
+//                 hardware, reached over the macOS carriage)
 //                                                 struct stat 144/8, st_mode u16@4,
 //                                                 st_ino u64@8, st_size i64@96,
 //                                                 st_blocks@104, st_blksize i32@112

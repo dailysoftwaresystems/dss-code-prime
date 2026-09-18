@@ -208,12 +208,12 @@ drift. Every verb takes **`--production` / `--done`, and those are the only two.
 `(--production | --done)` in their own usage line. A command still typing `--harness` fails.
 
 ```
-scripts/anchors/write-anchor.sh  --production D-<AREA>-<NAME> --priority P1 --status open \
+DssHarness write-anchor  D-<AREA>-<NAME> --priority P1 --status open \
                                  --trigger '...' --closing '...' --cross-refs '...' --apply
-scripts/anchors/set-anchor.sh    D-<AREA>-<NAME> --status closed --closing '...' --apply   # MOVES it
-scripts/anchors/read-anchor.sh   D-<AREA>-<NAME>                    # the full row, field by field
-scripts/anchors/read-anchors.sh  --production --band P0       # name + priority + status only
-scripts/anchors/read-anchors.sh  --lint                       # every row a reader cannot key on
+DssHarness set-anchor    D-<AREA>-<NAME> --status closed --closing '...'           # MOVES it
+DssHarness read-anchor   D-<AREA>-<NAME>                    # the full row, field by field
+DssHarness read-anchors  --pending --band P0       # name + priority + status only
+DssHarness read-anchors  --lint                       # every row a reader cannot key on
 ```
 
 ⚠ **Never hand-assemble a row.** The writer takes the FIELDS, so a wrapped anchor id (invisible to
@@ -395,8 +395,8 @@ tree, so a gate host holding one can run a corpus belonging to somebody's uncomm
 and report the result as the cycle's.
 
 **The three rules:**
-- **A push is a SYNC, never an accumulation.** `ssh-macos.{sh,ps1}` take `--prune`/`-Prune`
-  and `macos-leg` passes it; the VPS path already had `rsync --delete`. A transport that only
+- **A push is a SYNC, never an accumulation.** `dssharness sync` deletes what the source no
+  longer has and verifies the copy afterwards — one transport, every host. A transport that only
   adds is a transport that silently diverges.
 - **Worktrees are excluded at the transport, on BOTH carriages.** An agent worktree never
   belongs on a gate host. ⓘ rsync does NOT delete excluded paths, so adding the exclude does
@@ -411,11 +411,11 @@ makes `git status` worth reading after a merge you are sure about.
 
 ⚠ **This narrows, and does not repeal, the standing order against cleaning those hosts.** No
 `git clean`, no `reset --hard`, no `checkout --` on either machine unless the operator names it
-(`macos-leg --reset-to` stays opt-in for exactly that reason). What is authorised is removing
+(a deliberate reset stays opt-in for exactly that reason). What is authorised is removing
 what the repo does not have: stale files and worktrees.
 ⇒ ★★★ **THE OPERATOR NAMED IT ON 2026-08-26. Read the next section — restoring a leg clone is
-now REQUIRED where this paragraph once forbade it, and `scripts/leg-tree/` is the only thing
-that may do it.**
+now REQUIRED where this paragraph once forbade it, and the transport is the only thing that may
+do it — `dssharness sync` today.**
 
 ## ★★★ EVERY LEG HOST KEEPS A CLONE, AND THE LEG CLEANS UP AFTER ITSELF — operator ruling 2026-08-26
 
@@ -450,11 +450,11 @@ destructive verb attached.
 deleting them buys tidiness and costs every leg a cold rebuild.
 
 ⚠ **CLEANUP BELONGS TO THE MODE THAT MADE THE MESS, not to every mode that runs afterwards.**
-✔Caught while wiring this: `remote-leg --mode sync-only` exists to LEAVE a host staged for a
-manual probe, and `--mode test-only` runs over whatever is already there. A restore on exit would
-have deleted the staging as the command returned, and a prepare would have made `test-only` test
-HEAD while reporting on the staged tree. ⇒ `full` prepares and restores; `sync-only` prepares
-only; `test-only` does neither.
+✔Caught while wiring this: a sync-only mode exists to LEAVE a host staged for a manual probe, and
+a test-only mode runs over whatever is already there. A restore on exit would have deleted the
+staging as the command returned, and a prepare would have made test-only test HEAD while reporting
+on the staged tree. ⇒ the three shapes must stay distinct. Today they are `dssharness sync`,
+`dssharness test --use-staged` and `dssharness test --no-build`.
 
 ⚠ **WHY THIS REPLACED THE OLD ARRANGEMENT.** ✔MEASURED 2026-08-26: the macOS clone sat on branch
 `…-3` at `8cb9afbd` (**three commits back**) with a **2,696-path index under a 2,759-path working
@@ -558,8 +558,8 @@ A set that cannot go green does not get committed because a boundary arrived.
 whichever build type it is working in; what this ruling fixes is what a ROUND owes before its commit
 is called green. ⚠ **Report eight numbers with their build type beside each** — a four-number gate
 line is now an incomplete gate that reads as complete.
-ⓘ `scripts/remote-leg/remote-leg.sh --build-type Release` takes the remote half; the tree name
-follows the type and an unknown type refuses.
+ⓘ `dssharness test --legs <leg>-release` takes the remote half; the build type is part of the
+leg NAME now, and `dssharness legs` lists every one that can run.
 
 ### ⚠⚠ CI IS EXPENSIVE TO **RUN** AND FREE TO **READ** — AND THE TWO RULES ARE OPPOSITE
 
@@ -570,7 +570,7 @@ follows the type and an unknown type refuses.
   commits have no verdict at all, which is exactly why the eight-run local gate above is what a
   round owes.
 - ✅ **ALWAYS read whatever verdict already exists.** Reading costs nothing, and step 0 now does it
-  with `scripts/check-ci-legs/`. A red leg is a HARD STOP on *proceeding*, never on *fixing*.
+  with `dssharness check-ci-legs`. A red leg is a HARD STOP on *proceeding*, never on *fixing*.
 
 ★ **This corrects a framing I first wrote into a row, and the correction is the point.** I filed
 *"no step of `/dss-cycle` reads CI at all"* as though the READING were the defect, and then
@@ -603,25 +603,25 @@ while the local four-leg Debug gate was **2179 / 2178 / 2148 / 2148 GREEN on tha
      `/showIncludes`, which reports headers ONLY**, so `#deps 0` is CORRECT for a TU with no
      `#include`. The local Windows gate is **MinGW GCC**, so the fact is invisible to it in *every*
      build type.
-   - macOS was `run_gate_guard`, proved **build-type independent** by running it from the repo root
-     with no build tree at all. ★ **THE DURABLE FACT: a repo-guard is HOST-INDEPENDENT** — it reads
+   - macOS was a repo-guard entry, proved **build-type independent** by running it from the repo
+     root with no build tree at all. ★ **THE DURABLE FACT: a repo-guard is HOST-INDEPENDENT** — it reads
      the TREE, not the machine — **so which legs execute it is a CONFIGURATION decision, and a
      leg that skips it can never see a guard-only defect.** Derive the leg set from the run you
      are looking at (the per-leg totals differ by exactly the guard count), never from memory.
-     ⏳ **SCRIPT-ERA, deleted by `W-sync` — see `cmake/DssHarnessDeletionInventory.md`:** today
-     that decision is made independently in THREE scripts with DIFFERENT defaults, which is
-     precisely why the claim below was wrong for a year. ✔MEASURED 2026-09-16: `remote-leg.sh`
-     passes `-LE repo-guard` (macOS, arm64 VPS) while `wsl-leg.sh` defaults `DSS_LEG_GUARDS` to
-     `1` and runs every guard — Windows **2207**, WSL **2206**, macOS and the VPS **2167**.
-     ⛔ This sentence used to say all three indirect legs skip guards and that guards run on
-     exactly ONE local host. Both halves were false: it is TWO local hosts and **four** of a
-     round's eight runs. ★ **One tool reading one config cannot have this class of bug**, which
-     is the argument for the migration in one line.
-     ⚠ **The count is not typed here.** `ctest -N -L repo-guard` prints it, and so does the configure
-     line `repo-guard label applied to N test(s)` — which is what the root `CMakeLists.txt` says to
-     read, in those words, having already gone stale by eight entries once. ✔MEASURED **40** at
-     `305604f1` (`ctest -N -L repo-guard`); this sentence said **31** until 2026-09-16, and **18**
-     before that.
+     ★★★ **AND THE LEG SET IS DECLARED, NOT DECIDED THREE TIMES.** ✔MEASURED 2026-09-16, while
+     three hand-written drivers still existed: each chose its own default, so one passed
+     `-LE repo-guard` on the two ssh legs while another ran every guard on WSL — Windows **2207**,
+     WSL **2206**, macOS and the VPS **2167**. ⛔ This sentence asserted for a year that guards ran
+     on exactly ONE local host and that all three indirect legs skipped them. Both halves were
+     false: it was TWO local hosts and **four** of a round's eight runs. ★ **That class of bug
+     needs two programs to disagree; one tool reading one configuration cannot have it** — which
+     is the argument for the migration in one line, and the reason the durable sentence above is
+     now checkable rather than advisory.
+     ⚠ **The count is not typed here, and the migration is why that matters more than ever:** it
+     moves by whole waves. `ctest -N -L repo-guard` prints it, and so does the configure line
+     `repo-guard label applied to N test(s)` — which is what the root `CMakeLists.txt` says to read,
+     in those words, having already gone stale by eight entries once. This sentence has said **18**,
+     then **31**, then **40**; **re-derive it at the commit in front of you.**
 
 ★★★ **THE SHAPE IS THIS CYCLE'S OWN THROUGH-LINE, TWICE MORE: THE RULE A DEFECT CITED WAS TRUE — OF
 THE THING NEXT DOOR.** *"`#deps 0` is never legitimate"* is true of **gcc** and false of **MSVC**.
@@ -653,10 +653,12 @@ bash scripts/lane-worktree/lane-worktree.sh remove k   # removes AND prunes
 Four clauses, and each is measured rather than asserted — detail in `references/worktrees.md` §H.0b:
 
 1. **`.gitignore`'s `/.worktrees/` rule is what satisfies the "ALL host copies" clause.** The
-   carriages derive their exclude list from git (`scripts/carriage-excludes/`), so that one line is
-   what stops four full repo copies riding to macOS and the arm64 VPS on every push. It is ALSO
-   pinned in that script's `MUST_NEVER_TRAVEL` floor, which re-asks git and **refuses the carriage**
-   if the line is ever edited away (refusal arm exercised: exit 3, naming `.worktrees/`).
+   transport derives what it carries from git, so that one line is what stops four full repo copies
+   riding to macOS and the arm64 VPS on every push. ★ It is ALSO declared independently of git:
+   ✔MEASURED 2026-09-17, `.harness-config/config.json`'s `sync.neverTransfer` names `.worktrees`,
+   `.claude/worktrees`, `.secrets`, `.temp`, `build`, `scratchpad` and `test-scratch` — once, for
+   every host. `dssharness sync --dry-run` lists every path it would write, which is how to CHECK
+   this rather than trust it.
 2. ⚠ **The MAX_PATH budget is now SPENT, not slack.** The move costs **46 characters** on every
    build path: longest build-relative suffix **163**, so `C:/dssp40k` had **87 spare** and
    `.worktrees/k` has **46**. `lane-worktree.sh` refuses by arithmetic any root leaving under 20,
@@ -772,7 +774,7 @@ hand-typing every edit or reading every subsystem.
    branch, last commit subject. Read plan-00 §0.1 and skim the anchor registry.
    ⚠ **ORIENTATION READS THE WORKING REGISTRY ONLY** — since 2026-09-16 that is ONE document,
    `-production.md`, which holds everything that is LEFT, and
-   `bash scripts/anchors/read-anchors.sh --production` is the whole list in one screen.
+   `DssHarness read-anchors --pending` is the whole list in one screen.
    (This line named `-harness.md` as a second working registry until the harness registry retired.)
    **Do not read `_deferred-anchor-registry-done.md` to choose work**: it is the archive, it is by
    far the larger of the two, and reading it to orient is how a closed row got recommended three
@@ -787,8 +789,13 @@ hand-typing every edit or reading every subsystem.
    the very same commit — because **no configuration either red leg runs in is one the local gate
    builds.** The operator had to point at it.
 
-       bash scripts/check-ci-legs/check-ci-legs.sh --branch <this branch>
-       pwsh -NoProfile -File scripts/check-ci-legs/check-ci-legs.ps1 -Branch <this branch>
+       dssharness check-ci-legs --branch <this branch>
+
+   ★ ✔MEASURED 2026-09-17, same branch and same run id: the retired shell twins printed
+   *"THE MATRIX DID NOT RUN … says NOTHING about the tree"* and then **exited 0**; the verb
+   REFUSES, *"no job … is a leg, so nothing was verified about the tree. This is not a pass"*,
+   **exit 2**. A nothing-was-verified run must never read as a pass to a caller that tests the
+   exit code.
 
    - **A red leg is a HARD STOP the cycle reads before picking work**, and it is a FIX, so no other
      hard stop applies to repairing it (see *Hard stops* below). It goes in front of §0.1.
@@ -900,7 +907,9 @@ hand-typing every edit or reading every subsystem.
    attributable to anything** — which makes it worthless exactly when it matters, during a
    red-on-disable observation.
    ⇒ Name the lane's build tree in its brief (`build/<lane>`), and clear it once green (the
-   one-root rule). `scripts/local-build/local-build.{sh,ps1} --tree <name>` takes one.
+   one-root rule). `dssharness build` gives each leg its own variant-keyed directory INSIDE the
+   tree it is run in, so a lane worktree isolates itself — ✔MEASURED from one:
+   `-S <lane>/. -B <lane>/build/x86_64-mingw-gcc-debug`.
    ★★ **AND A LANE THAT WRITES SCRATCH FILES GETS ITS OWN SCRATCH DIRECTORY.** The per-lane
    BUILD tree isolates artifacts; it isolates neither the scratchpad nor the working tree.
    ⚠ ✔MEASURED 2026-08-20 (cycle P23):
@@ -938,7 +947,7 @@ hand-typing every edit or reading every subsystem.
    §5's "a measurement is stated only with the instrument that produced it", one level up: an
    invocation is a claim about the world, and writing one from memory is writing an
    unmeasured fact into the place a lane trusts most. ⚠ ✔MEASURED 2026-08-20 (cycle P23): the
-   orchestrator's own common brief spelled `run-gate.sh -- ctest …`; the real interface is
+   orchestrator's own common brief spelled the witness gate as `-- ctest …`; its real interface was
    `<log-path> <success-regex> <command> [args...]`. TWO lanes hit it, it refused
    (fail-closed, correctly), and one left a file literally named `--` in the repo root. The
    fix is one command: run the invocation once before pasting it into a brief.
@@ -958,7 +967,7 @@ hand-typing every edit or reading every subsystem.
    OFF-BRIEF** — say so in the brief, so the lane knows a refutation is a deliverable.
    ⚠ **AND THE FIRST WRITE-UP OF THIS RULE MISSTATED ITS OWN MEASUREMENT** — it said
    that invocation exits 127 with an empty log. ✔RE-MEASURED: it exits **2**, with a named
-   refusal. The 127-and-empty-log shape is the DIFFERENT invocation `bash <C:/.../run-gate.sh>`,
+   refusal. The 127-and-empty-log shape is the DIFFERENT invocation `bash <C:/.../script.sh>`,
    where bash cannot open the SCRIPT (see below). Two failures that look alike were being
    described as one, inside the rule that exists to stop exactly that.
    ★★ **A BRIEF THAT ASSIGNS `tests/<dir>/` GRANTS THAT DIRECTORY'S `CMakeLists.txt` AS
@@ -1076,7 +1085,7 @@ hand-typing every edit or reading every subsystem.
    keep surfacing logic findings without converging are a pause signal — stop and report, do not grind.
 7. **Fail-loud gate** — the mechanical battery, including the anchor-balance gate.
 8. **Pin every deferral** discovered this cycle — and **CLOSE by MOVING**, never by editing a status
-   in place. `scripts/anchors/set-anchor.sh <ANCHOR> --status closed --closing '...' --apply` rewrites
+   in place. `DssHarness set-anchor <ANCHOR> --status closed --closing '...'` rewrites
    the row and lifts it out of the working registry into `_deferred-anchor-registry-done.md`; a lane
    handing you a verbatim row FILE goes through `apply-registry-row`, which delegates to the same
    writer. A NEW row is `write-anchor.sh --production|--done ... --insert --apply`. ⚠ Never
@@ -1198,12 +1207,13 @@ workaround an own tool. reusable tools exists to avoid bunch of problems like ma
   ✔MEASURED 2026-08-20 (cycle P23): from a Windows-native process, `bash` resolves to
   `C:\WINDOWS\system32\bash.exe` — **WSL's** — which cannot open a `C:/...` path. Two
   distinct failures follow and they look alike:
-  * `bash scripts/run-gate/run-gate.sh <C:/...log>` — the script RUNS and cannot write its
-    log; it now exits **2** with a named refusal that identifies the shell.
-  * `bash <C:/.../run-gate.sh>` — bash cannot open the SCRIPT, so **it never executes**.
+  * `bash <relative-script> <C:/...log>` — the script RUNS and cannot write its log; a
+    well-written one exits **2** with a named refusal that identifies the shell.
+  * `bash <C:/.../script.sh>` — bash cannot open the SCRIPT, so **it never executes**.
     Exit **127**, empty log, and **no edit inside any script can ever improve this shape**.
     The only fix is at the CALL SITE: invoke it as a relative path from Git Bash, or run the
-    `.ps1` twin.
+    `.ps1` twin. ⓘ The root `CMakeLists.txt` asks this same question once, by EXECUTION, before
+    registering any bash-driven entry — that probe is where the rule is enforced now.
   ★ Worth stating because the second shape reads as *"the gate refused"* when what happened
   is *"the wrong bash ran"* — an instrument that misattributes is the failure this project
   cares most about.
@@ -1238,8 +1248,8 @@ execution is posix only."*
   project's primary ctest runs; a bash-only capability is one the main gate cannot use.
 - **Omit it — and say so in the header — when either holds:** the script is already cross-platform (a
   `.py` runs on both hosts, so a twin would be a second implementation of something never split), or
-  execution is POSIX-ONLY BY NATURE (`wsl-leg` runs inside a WSL distro where PowerShell is not the
-  shell; `profile-compile` drives a POSIX toolchain over a carriage).
+  execution is POSIX-ONLY BY NATURE (a driver that runs inside a WSL distro where PowerShell is not
+  the shell; `profile-compile` drives a POSIX toolchain over a carriage).
 - **Where a pair exists, the two must not drift — and that is checked IN THE REVIEW, at the moment the
   script is written or changed.** Operator ruling 2026-08-19: *"the parity must be checked in the
   review, before the commit, when the script is being created or modified. Not after and not a script
@@ -1327,7 +1337,7 @@ opening the inter-procedural *arc*, not about every line in `src/opt/`.
 - **Correctness-critical anchors** (silent-miscompile class) — the closing cycle MUST ship a negative
   miscompile-pin that breaks iff the transform mis-fires. If the pin cannot be constructed, STOP and
   bring a decision brief. Never ship on review alone.
-- ★★★ **A RED CI LEG — read at step 0 with `scripts/check-ci-legs/`.** It stops the cycle from
+- ★★★ **A RED CI LEG — read at step 0 with `dssharness check-ci-legs`.** It stops the cycle from
   picking new work until it is diagnosed, and since repairing it is a FIX, **no other hard stop
   applies to the repair itself**. ⛔ The stop is on *proceeding past it*, never on fixing it, and
   **never** on touching the operator's PR: do not label, re-run or push to re-trigger CI.
@@ -1335,14 +1345,14 @@ opening the inter-procedural *arc*, not about every line in `src/opt/`.
   2026-09-14: the two legs that were red run in configurations **no local leg builds** — the local
   Windows gate is **MinGW GCC**, so every `deps = msvc` fact is invisible to it, and the two SSH
   legs (macOS, arm64 VPS) skip `-LE repo-guard`, so a guard-only defect is invisible to THEM.
-  ⚠ **WSL is NOT in that set** — ✔MEASURED 2026-09-16, `wsl-leg.sh` defaults `DSS_LEG_GUARDS` to
-  `1` and runs every guard; the counts say so (Windows 2207, WSL 2206, macOS/VPS 2167).
-  ⏳ **SCRIPT-ERA — the two script names above die in `W-sync`.** What survives the migration is
-  the principle: a guard is host-independent, so its leg set is a CONFIG decision, and a leg that
-  skips it cannot see a guard-only defect. **Re-derive the set from the run in front of you.**
-  ⚠ Read the count from `ctest -N -L repo-guard` or
-  from that commit's own `repo-guard label applied to N test(s)` configure line — never from here.
-  ✔MEASURED **40** at `305604f1`.
+  ⚠ **WSL was NOT in that set** — ✔MEASURED 2026-09-16, the WSL driver ran every guard while the
+  two ssh drivers excluded the label; the counts said so (Windows 2207, WSL 2206, macOS/VPS 2167).
+  ★★★ **THE DURABLE RULE: a guard is HOST-INDEPENDENT — it reads the TREE — so which legs execute
+  it is a CONFIGURATION decision, and a leg that skips it cannot see a guard-only defect.**
+  **Re-derive the set from the run in front of you**, never from this page: the divergence above
+  existed precisely because three programs each answered the question separately.
+  ⚠ Read the count from `ctest -N -L repo-guard` or from that commit's own
+  `repo-guard label applied to N test(s)` configure line — never from here.
 
 ## Stop-command handling
 

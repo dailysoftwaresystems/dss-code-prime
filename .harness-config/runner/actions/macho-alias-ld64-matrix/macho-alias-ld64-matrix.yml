@@ -1,0 +1,59 @@
+name: macho-alias-ld64-matrix
+description: >-
+  Measures what Apple's ld64 does with a SECOND defined symbol at the same address as a canonical
+  one, with and without `-dead_strip`. Eight cells: three producer variants (`plain`, `altentry`,
+  `setalias`) crossed with dead-strip off/on while referencing ONLY the alias, plus a
+  canonical-only control at both dead-strip settings, and an n_desc dump per variant. The mechanism,
+  the cells and what each one proves are documented in the program itself,
+  `.harness-config/runner/actions/macho-alias-ld64-matrix/macho-alias-ld64-matrix.remote.sh`.
+
+  ★ WHAT THIS ACTION REPLACED, AND WHY THE REPLACEMENT IS SMALLER THAN WHAT IT REPLACES.
+  `scripts/macho-alias-ld64-matrix/macho-alias-ld64-matrix.sh` was two things: this measurement's
+  local half, and a TRANSPORT. The transport base64-encoded the mac-side program into ONE argument
+  of `scripts/ssh-macos/ssh-macos.sh` — its own comment gives the reason, *"`ssh-macos.sh --rsync`
+  needs a real rsync (absent from Git Bash), and ssh joins its remaining arguments with spaces"* —
+  and then reconstructed the file into `/tmp` on the Mac and ran it there. A runner reaches the Mac
+  through `sync`, which has already placed this directory in that host's own copy of the repository,
+  so there is nothing left to encode: the program runs where it already is. ⇒ the local half is not
+  ported, it is DELETED, and the mac-side half is the whole action.
+  ⚠ AND THE OLD SHAPE IS ALREADY INOPERABLE: its carriage, `scripts/ssh-macos/ssh-macos.sh`, is
+  removed by the same migration, so the driver had no way to reach the Mac whether or not this
+  action existed.
+
+  ★ THIS IS A MEASUREMENT INSTRUMENT, NOT A GATE. No ctest entry depends on it — ✔MEASURED
+  2026-09-17 across `CMakeLists.txt`, `cmake/**`, `tests/**`, `integrated_tests/**` and `.github/**`,
+  which name it nowhere. Its ANSWER, however, is load-bearing and cited as evidence in
+  `src/link/format/macho.cpp` and `tests/link/test_macho_writer.cpp`: a plain alias (n_desc = 0) is
+  correct and `N_ALT_ENTRY` is not needed. Those citations are of the measurement, not of the file,
+  and they now name this action.
+
+  ⚠ IT IS macOS-ONLY BY NATURE and not by configuration: every cell is `/usr/bin/clang`, `nm -m`,
+  `otool -l` and Apple's ld64. There is no other host on which the question exists.
+
+steps:
+  - name: alias-matrix
+    # ★ THE PROGRAM IS NAMED AS A REPOSITORY PATH, NOT AS `bash <file>`, and that is forced rather
+    # than chosen: a run line's first token must be a program the configuration declares under
+    # `tools` or a path in the repository, and `bash` is NOT one of this repository's declared
+    # tools. The file therefore carries mode 100755 and its own `#!/bin/bash`, which is how a
+    # repository path becomes executable on the only host this ever runs on.
+    # ★ `workingDirectoryRoot: action` so the program is named as `./…` beside its own `.yml`,
+    # the idiom `clock-step-probe` establishes. The program builds every throwaway subject it
+    # needs under `/tmp/dss-macho-alias-matrix` on the Mac and reads nothing from this tree.
+    workingDirectoryRoot: action
+    run: |
+      ./macho-alias-ld64-matrix.remote.sh
+    # ★ rc=0 IS NOT AN OBSERVABLE — the program's own words. A shell that started, found no clang
+    # and fell out would exit 0 on some paths and print nothing anyone would miss. The witness is
+    # the tally line the matrix always emits; the VERDICT stays the exit code, which is the failing
+    # cell count (`exit "$fail"`), so a run that measured 3 bad cells witnesses AND fails.
+    successPattern: "MATRIX_FAIL="
+    stallSeconds: 900
+    # ⛔ NO `watchContention`, DELIBERATELY, AND NOT BECAUSE THE KEY IS UNAVAILABLE TODAY.
+    # Nothing here is timed — the observables are symbol presence, symbol address equality, a
+    # program's return value and a `__text` size — so a loaded machine cannot move a reading.
+    # ⚠ AND IT MUST NOT ACQUIRE ONE LATER: `watchContention` needs a build directory to watch,
+    # which an action invoked through `host-exec` with no leg does not have, and that combination
+    # is refused when the action RUNS. This action is meant to be reachable that way.
+    # ⛔ NO `requireInputsUnmoved` either: the only tracked file this step reads is its own
+    # program, read once by the interpreter that runs it.

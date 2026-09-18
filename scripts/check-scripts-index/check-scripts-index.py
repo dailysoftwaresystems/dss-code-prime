@@ -189,6 +189,30 @@ def primary_script(scripts_dir, name):
     return None
 
 
+def bytecode_husk(path):
+    """True when `path` holds nothing the tree could: only Python's own bytecode cache, or nothing.
+
+    ★★ WHY THIS IS NOT A LOOSENING. Deleting a Python program deletes the files git
+    tracks; the `__pycache__/<name>.cpython-XY.pyc` Python wrote beside it when it was
+    last imported is ignored, so neither git nor the harness's sync removes it, and the
+    directory SURVIVES holding only that. ✔MEASURED 2026-09-18, eight-leg gate: the WSL
+    leg host's copy still held `scripts/carriage-excludes/` after its program was deleted,
+    and both this guard and `check-guard-output-encoding` COLLAPSED on it
+    ("has no primary script") on BOTH WSL legs, while Windows -- where the program had
+    never been imported -- passed. A directory holding only a bytecode cache is a byproduct
+    of a program that no longer exists, not a script directory missing its primary.
+    ⚠ The exemption is deliberately NARROW: a single file that is not a `.pyc` inside a
+    `__pycache__` directory disqualifies it, so a real directory that lost its primary
+    still refuses -- self-test arms `11b` and `11c` pin both directions.
+    """
+    for dirpath, _dirs, files in os.walk(path):
+        in_cache = os.path.basename(dirpath) == "__pycache__"
+        for f in files:
+            if not (in_cache and f.endswith(".pyc")):
+                return False
+    return True
+
+
 def read_purpose(path):
     """The single `PURPOSE:` declaration in a script's header.
 
@@ -259,7 +283,8 @@ def scan(root):
             "nothing." % ", ".join(loose))
 
     names = sorted(n for n in os.listdir(scripts_dir)
-                   if os.path.isdir(os.path.join(scripts_dir, n)) and n != "__pycache__")
+                   if os.path.isdir(os.path.join(scripts_dir, n)) and n != "__pycache__"
+                   and not bytecode_husk(os.path.join(scripts_dir, n)))
     entries = []
     for name in names:
         prim = primary_script(scripts_dir, name)
@@ -481,6 +506,90 @@ def _write(p, text):
         f.write(text)
 
 
+# ★★★ THE FIXTURE'S SUBJECT IS NAMED ONCE, AND EVERY SABOTAGE PROVES IT LANDED.
+#
+# This self-test does not synthesize its subject: `_mirror` copies the REAL
+# scripts/ tree and both REAL index documents, so the arms sabotage a script that
+# exists. That is deliberate -- a synthetic subject would prove the guard can
+# read a fixture, not that it reads THIS repository -- and it has TWO failure
+# modes, which are different and were ✔MEASURED separately, each through ctest:
+#
+#   The subject was `run-gate`, spelled as a bare literal in six places and
+#   buried inside a seventh (`PURPOSE: run a gate`, the opening words of that one
+#   script's purpose).
+#
+#   (1) THE SUBJECT IS RETIRED. ✔MEASURED: `_read(prim)` raises first, so this
+#       entry fails with a raw `FileNotFoundError` traceback under a name that
+#       says nothing about a retired fixture. Loud, but it sends the reader into
+#       the wrong file. `_subject_paths` now refuses by name instead.
+#   (2) THE SUBJECT SURVIVES AND A NEEDLE DRIFTS -- a purpose reworded, an index
+#       row respelled. ✔MEASURED: nothing raises. The document stays pristine and
+#       the arm that expects a REFUSAL asserts against an untouched tree. **This
+#       is the dangerous one**: a sabotage that changes nothing is an arm that
+#       proves nothing, and it fails toward CLEAN.
+#
+#   ⚠ THE FIRST DRAFT OF THIS COMMENT DESCRIBED (2) AND BLAMED IT ON (1),
+#   which is two failures that look alike being written up as one -- the exact
+#   thing the rule about naming an instrument exists to stop. Corrected from the
+#   mutant transcripts rather than from the argument that produced it.
+#
+# ⇒ TWO RULES, and the second is the one that generalises:
+#   · the subject is `SELFTEST_SUBJECT`, and the primary, the twin, the index row
+#     and the purpose text are all DERIVED from it rather than re-typed;
+#   · every sabotage goes through `_sabotage`, which RAISES when its needle is
+#     absent. A future migration that retires this subject gets a loud refusal
+#     naming the needle, in the same run, instead of a green self-test.
+#
+# The subject must be a directory that survives: a primary carrying a `PURPOSE:`
+# declaration, at least one script sibling beside it (arm 14 needs something to
+# contradict), no scripts buried in its subdirectories, and a row in both index
+# documents. `_subject_paths` checks all four before arm 0 runs.
+SELFTEST_SUBJECT = "cmake-import"
+
+
+def _sabotage(text, old, new, count=1):
+    """`text.replace(old, new)`, refusing when `old` is not there.
+
+    ★★★ The needle is the expectation. `str.replace` is silent about a miss, so
+    a stale literal turns a refusal arm into a no-op that still reports the
+    refusal it never caused.
+    """
+    if old not in text:
+        raise Collapse(
+            "self-test sabotage found nothing to replace: %r is absent from the "
+            "text it was about to mutate. The arm would have run against a "
+            "PRISTINE fixture and proved nothing. This is what a retired subject "
+            "looks like -- point SELFTEST_SUBJECT at a script that exists, and "
+            "derive the needle from it rather than re-typing it." % (old,))
+    return text.replace(old, new, count)
+
+
+def _subject_paths(tmp):
+    """The mirrored subject's primary, a contradictable sibling and its purpose.
+
+    Refuses here, before any arm runs, rather than letting a subject that no
+    longer fits produce a confusing red six arms later.
+    """
+    scripts_dir = os.path.join(tmp, "scripts")
+    prim = primary_script(scripts_dir, SELFTEST_SUBJECT)
+    if prim is None:
+        raise Collapse(
+            "SELFTEST_SUBJECT names scripts/%s/, which has no primary script. "
+            "The self-test sabotages a REAL directory; point it at one that "
+            "exists." % SELFTEST_SUBJECT)
+    here = os.path.join(scripts_dir, SELFTEST_SUBJECT)
+    sibs = sorted(f for f in os.listdir(here)
+                  if os.path.isfile(os.path.join(here, f))
+                  and os.path.splitext(f)[1] in SCRIPT_EXTS
+                  and os.path.abspath(os.path.join(here, f)) != os.path.abspath(prim))
+    if not sibs:
+        raise Collapse(
+            "SELFTEST_SUBJECT names scripts/%s/, which has no script sibling "
+            "beside its primary. Arm 14 needs one to contradict."
+            % SELFTEST_SUBJECT)
+    return prim, os.path.join(here, sibs[0]), read_purpose(prim)
+
+
 # ★★ THE EXPECTED ARM COUNT IS A CONSTANT THE RUN CHECKS, NOT A SENTENCE IT
 # PRINTS. The summary used to assert "11 arms exercised" in prose while the code
 # ran a different number, and an audit found two of the counts in it wrong. It is
@@ -490,7 +599,7 @@ def _write(p, text):
 # defeated its own purpose: deleting a document from DOC_RELS then lowered BOTH
 # sides of the comparison and the sabotage passed. An expectation that follows
 # the change it is meant to catch is not an expectation.
-EXPECTED_ARMS = 31
+EXPECTED_ARMS = 33
 
 
 def selftest(root):
@@ -500,7 +609,9 @@ def selftest(root):
     try:
         globals()["_RAN"] = ran
         _mirror(root, tmp)
-        prim = os.path.join(tmp, "scripts", "run-gate", "run-gate.sh")
+        prim, twin, subject_purpose = _subject_paths(tmp)
+        subject_row = "| **`" + SELFTEST_SUBJECT + "`**"
+        subject_row_typo = "| **`" + SELFTEST_SUBJECT + "-TYPO`**"
         pristine = _read(prim)
         readme = os.path.join(tmp, README_REL)
 
@@ -518,15 +629,15 @@ def selftest(root):
         # ★ Moved OUT of scripts/, not renamed in place: a rename leaves a
         # directory not addressable by its own name, which trips the structural
         # refusal instead of the disagreement this arm exists to prove.
-        gone = os.path.join(tmp, "scripts", "run-gate")
+        gone = os.path.join(tmp, "scripts", SELFTEST_SUBJECT)
         stash = tempfile.mkdtemp(prefix="scripts-index-stash-")
-        shutil.move(gone, os.path.join(stash, "run-gate"))
+        shutil.move(gone, os.path.join(stash, SELFTEST_SUBJECT))
         ok &= _arm("2 INDEX-ENTRY-NOT-A-SCRIPT", tmp, EXIT_DISAGREE, says=README_REL)
-        shutil.move(os.path.join(stash, "run-gate"), gone)
+        shutil.move(os.path.join(stash, SELFTEST_SUBJECT), gone)
         shutil.rmtree(stash, ignore_errors=True)
         ok &= _arm("2b RESTORED", tmp, EXIT_OK)
 
-        _write(prim, pristine.replace(PURPOSE_MARK, PURPOSE_MARK + "MUTATED -- ", 1))
+        _write(prim, _sabotage(pristine, PURPOSE_MARK, PURPOSE_MARK + "MUTATED -- "))
         ok &= _arm("3 PURPOSE-DRIFTED", tmp, EXIT_DISAGREE, says=README_REL)
         _write(prim, pristine)
         ok &= _arm("3b RESTORED", tmp, EXIT_OK)
@@ -546,7 +657,7 @@ def selftest(root):
         for i, rel in enumerate(DOC_RELS):
             others = [o for o in DOC_RELS if o != rel]
             _write(os.path.join(tmp, rel),
-                   pristine_docs[rel].replace("| **`run-gate`**", "| **`run-gate-TYPO`**", 1))
+                   _sabotage(pristine_docs[rel], subject_row, subject_row_typo))
             ok &= _arm("4.%d ONLY-%s-DRIFTS" % (i, os.path.basename(rel)), tmp,
                        EXIT_DISAGREE, says=rel,
                        not_says=others[0] if len(others) == 1 else None)
@@ -555,28 +666,31 @@ def selftest(root):
         pristine_readme = pristine_docs[README_REL]
 
         # ── the declaration itself (EXIT_COLLAPSE) ───────────────────────────
-        _write(prim, pristine.replace("# " + PURPOSE_MARK, "# (removed) ", 1))
+        _write(prim, _sabotage(pristine, "# " + PURPOSE_MARK, "# (removed) "))
         ok &= _arm("6 NO-PURPOSE-DECLARED", tmp, EXIT_COLLAPSE, says="declares no")
         _write(prim, pristine)
         ok &= _arm("6b RESTORED", tmp, EXIT_OK)
 
-        _write(prim, pristine.replace("# " + PURPOSE_MARK,
-                                      "# " + PURPOSE_MARK + "one.\n# " + PURPOSE_MARK, 1))
+        _write(prim, _sabotage(pristine, "# " + PURPOSE_MARK,
+                               "# " + PURPOSE_MARK + "one.\n# " + PURPOSE_MARK))
         ok &= _arm("7 TWO-PURPOSE-LINES", tmp, EXIT_COLLAPSE, says="Exactly one is required")
         _write(prim, pristine)
 
-        _write(prim, pristine.replace("# " + PURPOSE_MARK + "run a gate",
-                                      "# " + PURPOSE_MARK + "\n# was: run a gate", 1))
+        # ★ THE NEEDLE IS THE SUBJECT'S OWN PURPOSE TEXT, READ BACK OUT OF THE
+        # FILE. It used to be the literal opening words of one script's purpose,
+        # which is the second half of the same hazard `_sabotage` catches.
+        _write(prim, _sabotage(pristine, "# " + PURPOSE_MARK + subject_purpose,
+                               "# " + PURPOSE_MARK + "\n# was: " + subject_purpose))
         ok &= _arm("8 EMPTY-PURPOSE", tmp, EXIT_COLLAPSE, says="EMPTY purpose")
         _write(prim, pristine)
 
-        _write(prim, pristine.replace("# " + PURPOSE_MARK,
-                                      "# " + PURPOSE_MARK + "a | b ", 1))
+        _write(prim, _sabotage(pristine, "# " + PURPOSE_MARK,
+                               "# " + PURPOSE_MARK + "a | b "))
         ok &= _arm("9 PIPE-IN-PURPOSE", tmp, EXIT_COLLAPSE, says="raw pipe")
         _write(prim, pristine)
 
-        _write(prim, pristine.replace("# " + PURPOSE_MARK,
-                                      "# " + PURPOSE_MARK + END + " ", 1))
+        _write(prim, _sabotage(pristine, "# " + PURPOSE_MARK,
+                               "# " + PURPOSE_MARK + END + " "))
         ok &= _arm("10 MARKER-IN-PURPOSE", tmp, EXIT_COLLAPSE, says="never converge")
         _write(prim, pristine)
         ok &= _arm("10b RESTORED", tmp, EXIT_OK)
@@ -588,18 +702,28 @@ def selftest(root):
         ok &= _arm("11 NO-PRIMARY-SCRIPT", tmp, EXIT_COLLAPSE, says="no primary script")
         shutil.rmtree(orphan)
 
+        # A deleted program's BYTECODE HUSK is not a script directory -- and a husk that
+        # also holds one real file IS one, still missing its primary. Both directions, so
+        # the exemption cannot quietly widen into "any directory with a __pycache__".
+        husk = os.path.join(tmp, "scripts", "zz-selftest-husk")
+        os.makedirs(os.path.join(husk, "__pycache__"))
+        _write(os.path.join(husk, "__pycache__", "zz-selftest-husk.cpython-312.pyc"), "")
+        ok &= _arm("11b BYTECODE-HUSK", tmp, EXIT_OK, not_says="no primary script")
+        _write(os.path.join(husk, "notes.txt"), "not bytecode\n")
+        ok &= _arm("11c HUSK-PLUS-A-FILE", tmp, EXIT_COLLAPSE, says="no primary script")
+        shutil.rmtree(husk)
+
         loose = os.path.join(tmp, "scripts", "zz-loose.sh")
         _write(loose, "#!/usr/bin/env bash\n# PURPOSE: sit where no index looks.\n")
         ok &= _arm("12 LOOSE-SCRIPT", tmp, EXIT_COLLAPSE, says="directly under scripts/")
         os.remove(loose)
 
-        buried_dir = os.path.join(tmp, "scripts", "run-gate", "sub")
+        buried_dir = os.path.join(tmp, "scripts", SELFTEST_SUBJECT, "sub")
         os.makedirs(buried_dir)
         _write(os.path.join(buried_dir, "sub.sh"), "#!/usr/bin/env bash\n")
         ok &= _arm("13 BURIED-SCRIPT", tmp, EXIT_COLLAPSE, says="buries script")
         shutil.rmtree(buried_dir)
 
-        twin = os.path.join(tmp, "scripts", "run-gate", "run-gate.ps1")
         pristine_twin = _read(twin)
         _write(twin, "# " + PURPOSE_MARK + "something else entirely.\n" + pristine_twin)
         ok &= _arm("14 SIBLING-CONTRADICTS", tmp, EXIT_COLLAPSE, says="differs from its primary")

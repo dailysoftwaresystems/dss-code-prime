@@ -49,8 +49,8 @@ a remote leg over a carriage, a watcher — background or foreground, however ma
 They consume machine, not judgment, so run as many as the machine and the tree can take.
 
 ⚠⚠ **BUT "AS MANY AS THE MACHINE CAN TAKE" IS A BUDGET THE ORCHESTRATOR MUST DIVIDE, AND UNTIL
-2026-08-23 NOTHING DIVIDED IT.** ✔MEASURED (cycle P28): P17 made `-j 8` the default for
-`run-gate` and `local-build`, which is right for ONE gate. With four lanes each running its own
+2026-08-23 NOTHING DIVIDED IT.** ✔MEASURED (cycle P28): P17 made `-j 8` the default for the
+build and gate runners, which is right for ONE gate. With four lanes each running its own
 `ctest -j 8` in its own build tree, the aggregate is **32 concurrent test processes**, and a lane
 measured single example tests going from **~6 s to ~200 s** — a ~33x degradation. One lane
 **abandoned a 639-test gate** it had already earned, because at that rate it projected to ~4 hours

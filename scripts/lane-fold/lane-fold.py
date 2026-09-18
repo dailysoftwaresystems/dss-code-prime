@@ -6,7 +6,7 @@
 parallel lanes needs these verbs, and every cycle before 2026-08-29 rewrote them
 from scratch in a session-scoped scratchpad that does not survive the session. The
 `/dss-cycle` handoff of 2026-08-28 recorded that waste explicitly and left the
-promotion as a decision to take; `scripts/wsl-leg/wsl-leg.sh`'s own header records the
+promotion as a decision to take; the retired WSL leg driver's own header recorded the
 identical waste happening three times inside ONE session. The operator's standing rule
 is *"if a tool has a problem, fix before using again, not workaround an own tool.
 reusable tools exists to avoid bunch of problems like mangling or edge cases"* -- and a
@@ -402,7 +402,7 @@ def is_lane_tree(rel):
     ⇒ The failure mode if that ignore line is ever edited away is not a red gate: it is
     every lane silently receiving a full copy of every sibling lane, `.git` included,
     which then folds back. So the exclusion is asserted HERE, where the copy happens,
-    exactly as `scripts/carriage-excludes/` pins `.worktrees/` in its own
+    exactly as the retired carriage-exclude derivation pinned `.worktrees/` in its own
     MUST_NEVER_TRAVEL floor rather than trusting the same line.
     """
     return rel == WORKTREES_DIR or rel.startswith(WORKTREES_DIR + "/") \

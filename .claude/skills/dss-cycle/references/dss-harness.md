@@ -13,15 +13,88 @@ leg must run the same version as the machine driving it, a host ahead of the roo
 there is no downgrade path. So a fix we need in the tool costs a release before any leg can use it.
 ⇒ Read the published set with
 `curl -s https://api.nuget.org/v3-flatcontainer/dssharness/index.json`, never from a document: **this
-one included**. ✔MEASURED 2026-09-16 at `305604f1` — published `0.5.1`, `0.5.2`, `0.5.3`; installed
-here `0.5.3`; `DssHarness legs` reported `OK - 8 of 8 leg(s) can run` after installing 0.5.3 onto wsl
-Ubuntu, ssh macos and ssh arm64-vps (that run was the orchestrator's, same day, same commit).
+one included**. ⇒ and ask the machine what it has with `DssHarness --version`.
+
+★ **`DssHarness legs` INSTALLS OR UPDATES the tool on every host it measures**, bringing each leg up
+to the version the driving machine runs — ✔MEASURED repeatedly, most recently when the three remote
+hosts were carried forward by that command alone. ⇒ so `legs` is both the survey and the remedy for a
+host that is behind, and a version skew is usually one command from gone rather than a task.
+
+⚠ **DO NOT RECORD THE INSTALLED VERSION, OR ANY OTHER CURRENT-STATE NUMBER, IN THIS FILE.** Ask the
+machine: `DssHarness --version`, and the published set from nuget's index as the block above says.
+★ **The rule, because this file has been broken on it twice:** a statement about WHAT THE TOOL CAN DO
+is durable and belongs here; a statement about WHAT IS TRUE OF THIS MACHINE RIGHT NOW is stale-able
+and belongs in a command the reader runs. *"`buildOutputs` accepts a platform mapping"* never rots.
+*"the installed version is X"*, *"N of M legs can run"*, *"this host holds N object files"* all rot,
+and a stale number in a skill is WORSE than no number, because a contextless session trusts it.
+
+**Capabilities this repository depends on, stated as contract rather than as a release note** — each
+verifiable with a command, none carrying a version:
+- `buildOutputs` accepts a **platform mapping**, so one entry can name a `.exe` on windows and a bare
+  name elsewhere; a config naming no path for a platform some leg builds on is REFUSED at
+  config-read time, naming the leg.
+- A `tools` entry may declare `platforms`, so a host is never probed for a compiler its own platform
+  does not use, and never counted against that host's legs.
+- `toolchains[].platforms` is CHECKED: a leg naming a compiler absent from its own `os` is refused.
+- **Exit 21 (`Incomplete`)** separates *nothing failed but not every leg reported* from a pass, with
+  `complete` beside `passed` in the `--json` ledger. 21 is NOT a pass, and an interrupted run reports
+  `complete: false` too.
+- `sync --adopt "<host>"` takes over a checkout the harness did not create, naming the cost first.
+
+## ★★★ THE UPSTREAM DOCS ARE THE AUTHORITY, AND THEY ARE READABLE FROM HERE
+
+This file summarises the tool. **A summary rots, so read the source when the answer matters** — the
+same rule the version block above applies to nuget, for the same reason.
+
+    https://raw.githubusercontent.com/dailysoftwaresystems/repo-harness/refs/heads/release/stable/docs/architecture.md
+    https://raw.githubusercontent.com/dailysoftwaresystems/repo-harness/refs/heads/release/stable/docs/releasing.md
+
+★ **`release/stable` is the ref to read, and the choice is load-bearing.** ✔MEASURED: repo-harness
+publishes `release/stable` and `release/beta` beside `main`, and a PR lands on `main` BEFORE the
+version bump that deploys it — so `main` describes behaviour nobody can install for as long as that
+window lasts, and a leg installs only a PUBLISHED version. Reading a ref that tracks what is RELEASED
+removes that trap rather than explaining it. Read `release/beta` when the question is what is coming
+next; read `main` only when the question is what is merged but undeployed.
+
+⚠ **Never a local clone.** A clone under `repo-harness` is a WORKING COPY and can sit on any branch,
+including the consumer-findings branch this repository files against, which may describe something
+that never ships.
+
+★★★ **AND THE INSTALLED BINARY STILL OUTRANKS EVERY DOCUMENT FOR ONE QUESTION: what can I run now.**
+Ask it, do not look it up — `DssHarness --version`, `DssHarness help <topic>`, `DssHarness <verb>
+--help`. ⚠ **WE HAVE PAID FOR GETTING THIS BACKWARDS.** The `clock-step-probe` runner action's own
+comment records its `.yml` being written against a capability the then-installed tool refused with
+exit **12**, *'is not a file name'*, and only a later release loaded it. Writing against a documented
+capability before it is installable costs a release before any leg can use it.
+⇒ When a document and the binary disagree, the binary wins for today, and the gap is a deploy you are
+waiting on — a fact worth stating in the row rather than discovering in a red leg.
+
+**What `architecture.md` answers, by section, so a question goes straight to one:** Layering ·
+Worktrees · Anchor registries · Hosts, trees and legs · Parallel execution · Leg integrity ·
+Cross-leg contamination · Syncing a tree · Predefined runners · Reporting · Exit codes ·
+Success witnesses · Timeouts.
+
+⇒ **Before filing anything upstream as a missing capability, check there.** The commonest mistake is
+reporting a gap that is a verb nobody found; `help <topic>` and `<verb> --help` are the other two
+places that close that question without costing a release.
+
+★ Two answers from it that this repository kept re-deriving, recorded here because they decide whether
+a script can be DELETED rather than merely replaced — both are statements about the CONTRACT, which is
+why they are safe to write down:
+- **Success witnesses.** A test invocation must declare a `successPattern`, and a runner phase may;
+  the work passes only if the exit code is zero **AND** the pattern matches the command's own output.
+  That is the same contract `scripts/run-gate` enforces, so the property SURVIVES that script's
+  deletion rather than being lost with it.
+- **Timeouts are deliberately not wall-clock** for phases and legs, because a time budget is a guess
+  about workload size and honest runs exceeding it get killed. A phase declares a **stall** bound
+  instead — no output for N seconds means hung — since output cadence stays stable when duration does
+  not. ⇒ a long step must EMIT PROGRESS, or no bound can be set on it honestly.
 
 ## What it does today, and what is still a script
 
-★ **Every verb this migration was waiting for SHIPS.** ✔MEASURED 2026-09-16 at `305604f1`:
-`curl -s https://api.nuget.org/v3-flatcontainer/dssharness/index.json` lists `0.5.1`, `0.5.2`,
-`0.5.3`; `DssHarness --version` reports `0.5.3`; and `DssHarness --help` lists every verb below.
+★ **Every verb this migration was waiting for SHIPS** — `build`, `test`, `sync` and `run` among
+them. ⇒ confirm against the machine rather than against this sentence: `DssHarness --help` lists
+every verb the installed tool has, and `DssHarness --version` says which tool that is.
 ⚠ **This table used to say `build` was 0.6.0, `test` 0.7.0, `sync` 0.8.0 and `run` 0.9.0.** Those
 releases never happened — all four landed in 0.5.3 instead. A document still quoting them is stale.
 
@@ -33,10 +106,10 @@ releases never happened — all four landed in 0.5.3 instead. A document still q
 | `check-anchor-citations` | `scripts/check-anchor-registry` |
 | `check-root-litter` | `scripts/check-root-litter` |
 | `fix-line-endings` | `scripts/check-line-endings` |
-| `check-ci-legs` | `scripts/check-ci-legs` |
-| `build` | `scripts/local-build`; with `--time`, `scripts/profile-compile` and `scripts/compile-bench` |
-| `test` | `scripts/run-gate` |
-| `sync` | the leg drivers (`wsl-leg`, `remote-leg`, `macos-leg`), `leg-tree`, the carriages (`ssh-macos`, `ssh-arm64-vps`, `carriage-excludes`, `check-carriage-paths`) |
+| `check-ci-legs` | ~~`scripts/check-ci-legs`~~ — **DELETED** |
+| `build` | ~~`scripts/local-build`~~ — **DELETED**; with `--time`, `scripts/profile-compile` and `scripts/compile-bench` still pending |
+| `test` | ~~`scripts/run-gate`~~ — **DELETED** |
+| `sync` | the leg drivers, the carriages and the exclude derivation — **DELETED**. ⚠ `leg-tree` STAYS: it is also the `.sh` owner of *which tree am I standing in*, sourced by `check-line-endings`, `check-root-litter` and `lane-worktree`, so it retires with its LAST CONSUMER beside `repo-tree.ps1` and `owning-tree.py` |
 | `run` | the sqlite corpus driver, `sqlite-round-trip`, `sqlite-runtime-bench` and `macho-alias-ld64-matrix`, as predefined runners |
 
 ⚠ **A verb EXISTING is not a script deleted, and this rule did not change when the verbs shipped.**
@@ -105,8 +178,11 @@ fixture, a data table — has to live in a FILE beside the action, and a flat di
 to live that is obviously owned by that action. It is the same rule this repository already applies to
 `scripts/`: **one directory per script, named for the script, assets alongside.**
 
-⚠ **MEASURED 2026-09-16 against DssHarness 0.5.3: the tool can express HALF of it, and the
-layout is declared as ruled anyway.**
+⚠ **The table below was written when the tool could express only HALF of this ruling, and the layout
+was declared as ruled anyway.** ⇒ **re-answer it before relying on it** — `DssHarness help runners`
+states the current contract, and the upstream `architecture.md` section named at the top of this file
+gives the reasons. A capability claim pinned to a release goes quietly false the release after; this
+one has already moved once.
 
 | half of the ruling | state |
 |---|---|
@@ -168,9 +244,15 @@ The harness registry is gone: a defect in the harness is repo-harness's to fix, 
 repository's own build wiring or tests is a production row like any other. Its 187 open rows and the
 archive's 544 closed ones are readable in git at the parent of the commit that deleted them.
 
-⛔ **The door is still `scripts/anchors/{write,set,read}-anchor` while those scripts exist**, and
-`read-anchor <ID> --json` is still the only sanctioned way to read a cell. `write-anchor` gained
-`--relocating` for a row that exists elsewhere in the repository and is being moved rather than named.
+⛔ **The door is `dssharness {write,set,read}-anchor`**, and `read-anchor <ID> --json` is still the
+only sanctioned way to read a cell. This line used to say *"still `scripts/anchors/…` while those
+scripts exist"*; ✔those eight launchers are DELETED on this branch, so the condition has fired.
+⚠ **Two spellings changed with the door, and a stale command FAILS rather than misbehaving:** the
+registry selector is `--pending` where the scripts said `--production` (`--done` is unchanged), and
+the status vocabulary is FOUR values — `open`, `gated`, `disclosed`, `closed`.
+ⓘ `🔵 DISCLOSED` is open work whose debt PRE-DATES the cycle. It is what stops
+`check-anchor-balance` from reading a newly-FOUND pre-existing defect as newly-CREATED debt, and it
+is not a way to silence the gate: a disclosed row stays in the pending registry and stays work.
 
 ## Exit codes
 

@@ -50,7 +50,7 @@ The loop resumes only after the user answers. While paused, do not start a diffe
   `-done.md`**: it is the archive
   (every closed row, moved out on close since 2026-09-01) and reading it to ORIENT is how a
   closed row got recommended three times in this project's history. One screen:
-  `bash scripts/anchors/read-anchors.sh --production`.
+  `DssHarness read-anchors --pending`.
 - Establish the baseline: `cmake --build build` then `ctest --test-dir build --output-on-failure`.
   Baseline must be green before new work (unless the WIP is the thing being repaired). A red
   baseline with no WIP-repair context is itself a **§B gate** — present it; do not silently

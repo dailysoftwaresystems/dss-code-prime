@@ -251,6 +251,17 @@ dss_add_test(NAME lir/test_lir_fixture_vacuity_guard
 dss_add_test(NAME lir/test_lir_copy_coalescing_value_width
              SOURCES test_lir_copy_coalescing_value_width.cpp)
 
+# D-LIR-COALESCE-ANTI-AFFINITY-QUERY-IS-QUADRATIC. The coalescer's anti-affinity
+# veto re-scanned the WHOLE forbidden list per query on a written premise that
+# the list is "short"; it is Θ(instructions), so the query was Θ(edges ×
+# forbidden) and a large straight-line function spent 63% of its compile there.
+# The pin asserts the GROWTH RATIO of the algorithm's own probe COUNTER across a
+# doubled input — never a wall clock, which is sized on the machine that wrote
+# it — plus a control arm on the coalescer's DECISIONS, which the fix must leave
+# byte-identical.
+dss_add_test(NAME lir/test_lir_coalesce_anti_affinity_complexity
+             SOURCES test_lir_coalesce_anti_affinity_complexity.cpp)
+
 # THE PEEPHOLE/CALLCONV IDENTITY-COPY CLAIM HAD NO INSTRUMENT. The peephole's
 # placement argument rests on "callconv mints exactly ZERO identity copies", and
 # the evidence it carried was a NET across three passes because no dump stage
@@ -298,3 +309,15 @@ dss_add_test(NAME lir/test_preemptible_definition_address
 # control arm is as load-bearing as the pin.
 dss_add_test(NAME lir/test_lir_fused_compare_dce
              SOURCES test_lir_fused_compare_dce.cpp)
+
+# D-LIR-VREG-ID-BITFIELD-TRUNCATES-SILENTLY-PAST-ITS-WIDTH: `LirReg`'s three
+# bit-fields spent 31 of 32 bits, capping one function at 2^24 virtual registers
+# and TRUNCATING silently past it — two distinct vregs on one id, which liveness
+# keys by and `findAllocationConflict` therefore cannot tell apart. Its own
+# target because the claim is about a TYPE's capacity, not about a pass: the
+# arms are exact integer identities over `LirReg` itself, and the control arm
+# (size, class round-trip, the positional-init seal) must stay green when the id
+# field is narrowed, so a red here always means "the id got smaller" and never
+# "something else broke".
+dss_add_test(NAME lir/test_lir_vreg_id_width
+             SOURCES test_lir_vreg_id_width.cpp)

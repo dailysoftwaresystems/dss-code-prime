@@ -269,3 +269,4 @@ DSS Code Prime — and **DSS Axis**, the forthcoming DSS language — are licens
 - [Implementation plan](.plans/00-compiler-implementation-plan%20-%20tbd.md) — master plan, sub-plan index, gap catalog
 - [Plan 09 — HIR](.plans/09-hir-plan%20-%20ok.md) · [Plan 12 — MIR + LIR](.plans/12-mir-lir-plan%20-%20ok.md) · [Plan 13 — Assembler](.plans/13-assembler-plan%20-%20tbd.md) · [Plan 14 — Linker](.plans/14-linker-plan%20-%20tbd.md)
 - `docs/language-config-spec.md` — the `.lang.json` schema · `docs/tree-model.md` — the Tree + arena substrate
+- [`docs/branch-relaxation-limits.md`](docs/branch-relaxation-limits.md) — how far a branch reaches on each ISA, which relaxation tiers a real C program has been shown to reach, and what the edges cost to reach at all

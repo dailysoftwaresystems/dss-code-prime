@@ -52,6 +52,20 @@ RELEASE_TYPES = ("release", "relwithdebinfo", "minsizerel")
 SHOWN = 12  # lines of detail per refusal; the count is always complete
 
 # (build type, multi-config, compile flags, entry, expected class, expected tier)
+#
+# ★★★ EVERY `named` PROBE HERE NAMES A REAL ROW OF `_DSS_TB_NAMED`, AND THAT IS
+# A SECOND BINDING TO THAT TABLE THAT ITS OWN FILE DOES NOT ADVERTISE.
+# ✔MEASURED 2026-09-17: deleting the `run_gate_guard` row from
+# `cmake/DssTestBudgets.cmake` — correct, because the entry left with the script
+# it watched — turned the probe below RED with
+#   `type='release' entry='run_gate_guard': class release tier unit, expected release named`
+# because this table still asked for it by name. The budget file and this file are
+# ONE decision written twice, and a deletion must move both in the same commit.
+# ⇒ RETARGETED, never removed: the `release`-lowercase arm is what proves a
+# build type is compared case-insensitively, and the `named` tier is what proves
+# a measured row is honoured over the unit ceiling. Losing either arm to a
+# deletion would be the guard disarmed by the thing it exists to catch. Point it
+# at any surviving `_DSS_TB_NAMED` row whose entry is registered.
 PROBES = [
     ("Debug", "0", "-fsanitize=address,undefined -fno-omit-frame-pointer -g",
      "examples/c/any", "sanitized", "corpus"),
@@ -65,7 +79,7 @@ PROBES = [
     ("Profile", "0", "", "core/test_strong_ids", "debug", "unit"),
     ("Release", "1", "", "core/test_strong_ids", "debug", "unit"),
     ("Release", "0", "-O2", "integrated_tests/cli-surface", "release", "corpus"),
-    ("release", "0", "", "run_gate_guard", "release", "named"),
+    ("release", "0", "", "plan_citations_guard", "release", "named"),
     ("MinSizeRel", "0", "", "core/test_strong_ids", "release", "unit"),
     # NEGATIVE: a name that only LOOKS like a corpus entry
     ("RelWithDebInfo", "0", "", "examples_extra/not-corpus", "release", "unit"),

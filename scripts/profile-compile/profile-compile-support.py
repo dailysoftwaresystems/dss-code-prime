@@ -12,7 +12,8 @@ Subcommands
   kit         build a self-contained, RELOCATABLE profiling kit from a manifest
   manifest    materialize a kit's template onto THIS host's paths, verifying each
   build-type  read a compiler's CMake build type from the tree that produced it
-  timed-gate  run a command under scripts/run-gate/run-gate.sh and time it on a MONOTONIC clock
+  timed-gate  run a command under a witness gate and time it on a MONOTONIC clock
+              (RETIRED SUBJECT: the gate script is gone -- see the refusal in cmd_timed_gate)
   gcc-reference  the yardstick: build the SAME TUs with gcc, from the SAME manifest
   agg-trace   aggregate a DSS_OPT_TRACE log into per-pass totals
 
@@ -261,12 +262,15 @@ def cmd_build_type(args):
 # ── timed-gate ──────────────────────────────────────────────────────────────
 # ★★★ TWO SEPARATE DISCIPLINES, DELIBERATELY COMPOSED RATHER THAN REIMPLEMENTED:
 #
-# 1. THE WITNESS. scripts/run-gate/run-gate.sh already refuses to report success on an
-#    exit-0 that produced no evidence of work, and captures rc DIRECTLY rather
-#    than after a pipe. It is invoked here rather than copied — this tool's own
-#    predecessor printed `PROFILE-LEG-OK vps-arm64 rc=1` over a compile that had
-#    died before parsing a single file, which is precisely the self-authored
-#    success string run-gate.sh exists to make unsayable.
+# 1. THE WITNESS. A witness gate refuses to report success on an exit-0 that produced
+#    no evidence of work, and captures rc DIRECTLY rather than after a pipe. It is
+#    invoked here rather than copied — this tool's own predecessor printed
+#    `PROFILE-LEG-OK vps-arm64 rc=1` over a compile that had died before parsing a
+#    single file, which is precisely the self-authored success string a witness
+#    exists to make unsayable.
+#    ⛔ THE SCRIPT THAT SUPPLIED IT IS RETIRED. `dssharness build`, `test` and `run`
+#    carry the same refusals from `.harness-config/config.json`; this subcommand has
+#    not been moved onto them yet and REFUSES rather than timing an unwitnessed run.
 #
 # 2. THE CLOCK, AND IT MUST BE MONOTONIC. ✔MEASURED: the first gcc reference used
 #    `date +%s%N` (CLOCK_REALTIME) and reported a compile that took MINUS 11.7
@@ -289,8 +293,17 @@ def cmd_timed_gate(args):
     # for the whole.
     gate = os.path.join(args.repo, 'scripts', 'run-gate', 'run-gate.sh')
     if not os.path.isfile(gate):
-        die('scripts/run-gate/run-gate.sh not found under %s — the witness discipline is not '
-            'optional, so this refuses rather than time an unwitnessed command'
+        # ⛔ RETIRED SUBJECT, NAMED AS SUCH. The witness gate was not misplaced --
+        # it was deleted with the DssHarness migration of the gate runners, and
+        # its refusals (a zero exit code with no success match, a moved tree, a
+        # build directory another live run holds) are carried by `dssharness
+        # build`, `test` and `run` out of `.harness-config/config.json`. A
+        # message telling the reader to restore a file would send them looking
+        # for something that is not coming back.
+        die('the witness gate this subcommand runs under no longer exists (looked under %s). '
+            'scripts/run-gate/ was retired with the DssHarness migration; its refusals are '
+            'config now. The witness discipline is not optional, so this refuses rather than '
+            'time an unwitnessed command -- use `dssharness run <runner> --time`.'
             % args.repo)
     # ★ THE PATH IS BASH-FACING, SO IT CARRIES FORWARD SLASHES ON EVERY HOST.
     # os.path.join on Windows emits `…\tools\run-gate.sh`; bash then eats each
@@ -495,7 +508,7 @@ def main():
     p.add_argument('--require', help='refuse unless the build type is this')
     p.set_defaults(fn=cmd_build_type)
 
-    p = sub.add_parser('timed-gate', help='run under run-gate.sh, timed monotonically')
+    p = sub.add_parser('timed-gate', help='run under a witness gate, timed monotonically')
     p.add_argument('--repo', required=True)
     p.add_argument('--log', required=True)
     p.add_argument('--witness', required=True)

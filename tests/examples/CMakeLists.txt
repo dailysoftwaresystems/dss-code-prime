@@ -53,7 +53,7 @@
 # ⇒ `${CMAKE_CURRENT_BINARY_DIR}` — the same cwd `dss_add_test` gives every other
 # entry in the suite. The scratch tree becomes
 # `<build>/tests/examples/test-scratch/examples/<pid>-<n>`: isolated per build
-# tree by construction, and it dies with `local-build.sh --clean` instead of
+# tree by construction, and it dies with the build directory instead of
 # accumulating in the source tree.
 #
 # ⚠ WINDOWS PATH BUDGET, MEASURED rather than assumed (the runtime object cache

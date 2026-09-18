@@ -675,7 +675,7 @@ pe, and all four legs answer 42.
    Record the macho answer in **`tests/ffi/data/darwin-link-names.tsv`**; a new
    Mach-O-visible function with no row there is RED
    (`ffi/test_darwin_link_name_oracle`), which is how this step is enforced
-   rather than merely requested. `scripts/ssh-macos/ssh-macos.sh` reaches the
+   rather than merely requested. `dssharness host-exec --ssh macos` reaches the
    operator's Mac.
 5. `AllShippedDescriptorsDecode` will validate the new file decodes and every
    signature parses. Add an end-to-end corpus under `examples/c/` if it

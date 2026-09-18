@@ -67,8 +67,8 @@ tests/lsp/sessions/** text eol=lf
 # executes is a convention."
 # ⓘ 2026-08-19: these three globs said `tools/**` until the whole directory
 # was merged into `scripts/` (one directory per script, siblings inside).
-# Retargeting them WIDENED the pin: cmake-import, corpus-census,
-# pragma-profile-census and local-build already lived under scripts/ and had
+# Retargeting them WIDENED the pin: cmake-import, corpus-census and
+# pragma-profile-census already lived under scripts/ and had
 # never been pinned at all — they were LF by an author's care, which is the
 # exact distinction this comment draws against.
 scripts/**/*.sh  text eol=lf
@@ -236,3 +236,22 @@ src/dss-config/runtime/platform/dist/** binary
 # directory-wide text pin claims binary bytes it does not know about, and an action's
 # supporting files are exactly where a fixture blob will one day be added.
 .harness-config/**/*.py   text eol=lf
+
+# ⚠⚠ 2026-09-17, lane m2: `.sh` AND `.ps1` JOIN THEM, AND THE GAP WAS MEASURED BY FALLING
+# INTO IT. The shell pins in this file are PATH-SCOPED -- `scripts/**/*.sh` and
+# `real-examples/**/*.sh` -- not by extension. So the first supporting `.sh` to reach an
+# action directory arrived UNPINNED: ✔MEASURED, `git check-attr text eol` answered
+# `unspecified` for both attributes on
+# `.harness-config/runner/actions/macho-alias-ld64-matrix/macho-alias-ld64-matrix.remote.sh`
+# the moment it moved out of `scripts/`, and `DssHarness fix-line-endings --check --all`
+# counted it in the tier it CONSIDERS and does not JUDGE -- "with no declared ending",
+# 72 ⟶ 73. The bytes did not change; the RULE that keeps them did.
+# ★ A `.sh` checked out CRLF breaks at its own shebang, and this one runs on exactly one
+# host -- the Mac -- where no local run would ever have shown it.
+# ★★ The reasoning is the `.py` block's above, one extension over: an action directory
+# holds the `.yml` and EVERY supporting file, so every language an action can ship needs a
+# pin the day the layout allows it, not the day the file arrives. `.ps1` is pinned here
+# with no such file present for that reason -- the `.py` rule was written one commit late
+# once, and this block already records what that cost.
+.harness-config/**/*.sh   text eol=lf
+.harness-config/**/*.ps1  text eol=lf

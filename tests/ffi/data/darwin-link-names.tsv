@@ -38,7 +38,7 @@
 #                 The test strips the format's decoration itself, through the
 #                 same `ffi::applyCMangling` rule the compiler uses.
 #
-# HOW TO REGENERATE (needs a real Mac; `scripts/ssh-macos/ssh-macos.sh` reaches
+# HOW TO REGENERATE (needs a real Mac; `dssharness host-exec --ssh macos` reaches
 # the operator's). Per symbol, per arch:
 #     printf '#include <%s>\nvoid *p(void){return (void*)&%s;}\n' HEADER SYM > t.c
 #     cc -arch <x86_64|arm64> -fno-builtin -fno-stack-protector -w -c -o t.o t.c

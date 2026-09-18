@@ -15,8 +15,8 @@ hit both:
       already taken it for `D_DependencyBuildFailed`. Nothing mechanical
       noticed. It was caught only because the second lane happened to
       RE-MEASURE the header instead of trusting its brief -- i.e. by luck and
-      diligence, which is the same non-mechanism that `scripts/run-gate/run-gate.sh` was
-      written to replace. Two lanes, one counter, no lock.
+      diligence, which is the same non-mechanism a WITNESSED run replaces. Two
+      lanes, one counter, no lock.
 
   (2) ★ A CODE LANDED WITH NO TEST AT ALL. `D-AP6-NEW-DIAGNOSTIC-CODES-HAD-NO-VALUE-PIN`
       closed on exactly this and it RE-OPENED ONE CYCLE LATER:
@@ -66,8 +66,10 @@ hit both:
 ★ AND IT REFUSES TO PASS VACUOUSLY. A parse that collapses -- enum block not
   found, implausibly few enumerators, no test files -- exits 2 rather than
   reporting "0 duplicates, OK". An instrument that cannot tell "clean" from
-  "never ran" is the exact failure `scripts/run-gate/run-gate.sh` exists to forbid, and it
-  would be absurd for the gate that enforces that lesson to embody its inverse.
+  "never ran" is the exact failure a witnessed run exists to forbid -- the rule
+  `dssharness build`, `test` and `run` now carry from config, where a zero exit
+  code with no success match reports as itself -- and it would be absurd for the
+  gate that enforces that lesson to embody its inverse.
 
 ⚠⚠ RUN THIS ON A QUIET TREE, and the reason is specific rather than general
    caution. This gate reads the WORKTREE, and the project's own red-on-disable

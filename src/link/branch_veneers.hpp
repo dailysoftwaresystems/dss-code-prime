@@ -36,6 +36,36 @@
 // a register-materialized long branch, it joins as a second declared BODY, not
 // as a second mechanism.
 //
+// ⚠⚠ THAT PARAGRAPH IS A DESIGN PREFERENCE AND IT WAS WRITTEN WITHOUT THE
+// MEASUREMENT THAT DECIDES IT. ✔MEASURED 2026-09-17, `aarch64-linux-gnu-ld`
+// 2.42, six probes in three shapes: the two bodies are NOT interchangeable, and
+// the difference is not cost.
+//
+//   * A veneer whose body is a self-contained PC-relative branch word reaches
+//     exactly as far as that word's field. It therefore needs a boundary that is
+//     BOTH within reach of the call site AND closer to the callee — and an image
+//     whose call site sits immediately past a function larger than the field has
+//     no such boundary, so the pass refuses.
+//   * GNU ld LINKS that image. Its stub is `adrp x16 / add x16 / br x16`, whose
+//     final hop carries no PC-relative field at all, so it only ever needs a
+//     boundary in reach of the CALL SITE. ✔MEASURED: stub at `0x9400088`,
+//     `_start` at `0x94000a0` (24 bytes away), callee 150 994 960 bytes away —
+//     a distance no `b` could span, and it does not matter. The same body, named
+//     `__exit@@GLIBC_2.17_veneer`, bridges a PLT-bound call the same way.
+//   * x30 is preserved identically by both: the `bl` into the stub sets it and
+//     neither body touches it. So the return-address argument above does not
+//     discriminate between them.
+//
+// ⇒ THE ONE-WORD BODY IS NOT A CHEAPER SPELLING OF THE SAME MECHANISM; it is a
+// STRICTLY WEAKER one, and the images it cannot link are refused by name in
+// `injectBranchVeneers`. What stands between here and the stronger body is not
+// this preference but two things nothing in the tree declares: that a link-tier
+// veneer may be a SEQUENCE with more than one relocation, and WHICH REGISTER a
+// linker may clobber at a branch site. `callerSaved` does not answer the second
+// — a caller-saved register is dead across a CALL, not across a BRANCH — and
+// getting it wrong is a silent wrong answer rather than a refusal. That decision
+// is the operator's; see the row.
+//
 // ★★★ WHY THE DECISION CAN BE TAKEN HERE, BEFORE ANY IMAGE EXISTS. ✔MEASURED:
 // all three format writers build `.text` by CONCATENATING
 // `module.functions[i].bytes` in order with no padding between them, so a
@@ -45,6 +75,25 @@
 // this pass's distances are an UPPER BOUND on the true ones and it can place a
 // veneer that turns out to be unnecessary but never miss one that was needed.
 // Nothing in any writer changes.
+//
+// ⚠⚠ THAT IS TRUE OF FUNCTIONS AND IS NOT TRUE OF IMPORT STUBS, WHICH IS THIS
+// PASS'S ONE BLIND SPOT AND THE ONE A LARGE IMAGE ACTUALLY HITS. A call whose
+// target is an `externImport` resolves to no entry in `module.functions`, so
+// both entry points below `continue` past it — and the stub's address is not a
+// property of the module at all: `elf.cpp` puts `.plt` at
+// `alignUp(rodataOff + rodataSz, 16)`, i.e. PAST the whole of `.text`, and
+// chooses it long after this pass has run. ✔MEASURED 2026-09-17 on
+// `arm64:elf64-aarch64-linux-exec`: a single-function program of 212 992
+// statements is refused by `applyExecRelocations` for a `call26` of
+// 139 722 816 bytes, and that call is the SYNTHETIC ENTRY's `bl exit@plt` —
+// every shipped `processExit` block declares `"mechanism": "by-name-import"`,
+// so the trampoline always makes it. ⇒ every image whose text exceeds the
+// field's reach is refused at the linker's own entry, whatever it contains, and
+// this pass never sees the relocation that did it.
+// ★ The reference makes the opposite layout choice: ✔MEASURED `ld` 2.42 puts
+// `.plt` BEFORE `.text` (`0x2b0` against `0x2e0`), so the entry's call to its
+// own import is a few dozen bytes whatever the image's size — and where that is
+// still not enough, it veneers.
 //
 // The `applyExecRelocations` refusal stays exactly where it is, and stays the
 // backstop: a veneer pass that got the arithmetic wrong is caught there, loudly,

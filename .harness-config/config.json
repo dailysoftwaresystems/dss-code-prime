@@ -72,6 +72,10 @@
       "name": "dss-code-prime",
       "type": "cmake",
       "path": ".",
+      "buildOutputs": [
+        "compile_commands.json",
+        { "windows": "bin/dss/dsscp.exe", "all": "bin/dss/dsscp" }
+      ],
       "defaultToolchain": {
         "windows": "mingw-gcc",
         "linux": "gcc",
@@ -81,6 +85,17 @@
         "all": {
           "runner": "ctest",
           "args": [
+            // ★ `{buildDir}` IS THE LEG'S VARIANT-KEYED BUILD DIRECTORY, WHICH ONLY THE HARNESS
+            // KNOWS -- it is `build/<processor>-<toolchain>-<config>` and differs per leg, so no
+            // literal path could be written here. Shipped in 0.5.6 with `{treeDir}` and
+            // `{harnessDir}`; an unknown name is refused when this file is READ, listing what is
+            // available, and expansion happens AFTER `filterArg`/`excludeArg` splice in, so every
+            // argument the runner sees goes through one rule.
+            // ⛔ WITHOUT THIS, `dssharness test` STARTS ctest AT THE TREE ROOT AND FINDS NOTHING:
+            // ✔MEASURED at 0.5.5, exit 8, "No tests were found!!!" -- which is why the eight-run
+            // gate could not be driven through the tool before this release.
+            "--test-dir",
+            "{buildDir}",
             "--output-on-failure",
             "--no-tests=error"
           ],
@@ -357,6 +372,9 @@
     },
     {
       "name": "pwsh",
+      "platforms": [
+        "windows"
+      ],
       "probe": {
         "args": [
           "--version"
@@ -367,6 +385,10 @@
     },
     {
       "name": "g++",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
       "probe": {
         "args": [
           "--version"
@@ -394,6 +416,9 @@
     },
     {
       "name": "clang++",
+      "platforms": [
+        "macos"
+      ],
       "probe": {
         "args": [
           "--version"
@@ -408,6 +433,9 @@
     },
     {
       "name": "cl",
+      "platforms": [
+        "windows"
+      ],
       "why": "the MSVC compiler the windows-x86_64-release leg builds with; it is on PATH only inside a Visual Studio developer environment, so no probe is declared"
     },
     {
@@ -481,10 +509,17 @@
       // ✔MEASURED 2026-09-16 against DssHarness 0.5.3, with the file present at exactly this
       // path: `DssHarness legs` PASSES (exit 0); `DssHarness run` REFUSES with exit 12 - 'is not
       // a file name. A runner's action names one file directly inside ...'.
-      // ⚠ SO `DssHarness run clock-step-probe` DOES NOT RUN UNTIL repo-harness IS FIXED. The
-      // cost is bounded and was weighed: no ctest entry invokes `run`, and the four runners that
-      // are real work are not written yet. The supporting-file half of the ruling already works -
-      // this action's only `run` line starts a program under `actions/clock-step-probe/`.
+      // ✅ FIXED UPSTREAM AND SHIPPED. ✔MEASURED 2026-09-17 at DssHarness 0.5.6: `help runners`
+      // now documents `.harness-config/runner/actions/<name>/<name>.yml` as THE layout, and names
+      // the three shapes it still refuses - a flat `<name>.yml`, a path leaving the directory, and
+      // a file whose name differs from its directory's. That is the fix this comment asked for:
+      // combine, resolve, and require the result to stay UNDER the actions directory, which keeps
+      // the reviewability reason intact while allowing one directory per action.
+      // ⚠ ONE DIRECTORY LEVEL ONLY, still: ✔MEASURED 2026-09-17, a nested
+      // `actions/<name>/<sub>/<file>.yml` is refused with exit 12, and the refusal rejects the
+      // WHOLE config file rather than the one entry.
+      // ⓘ The paragraph above is kept rather than deleted because it records what was measured at
+      // 0.5.3, and a reader meeting a `run` refusal on an older tool needs to find it.
       // ★ THE UPSTREAM FIX IS NOT 'REMOVE THE CHECK'. RepoHarness.Core.Runners.ActionFileParser.LoadAsync
       // refuses any `action` whose Path.GetFileName is not the whole string, and its own comment
       // gives the reason: resolving a name with a separator would let a runner run a file from
@@ -499,6 +534,48 @@
       // at once when the file is read.
       "action": "clock-step-probe/clock-step-probe.yml",
       "stallSeconds": 120
+    },
+    // ★★★ THE MANUAL END-TO-END CORPUS. Declared here because a runner is reachable ONLY through
+    // this map — `DssHarness run <runner>` takes the runner "as predefinedRunners names it", so an
+    // action directory without an entry here is a program nothing can start. ✔MEASURED 2026-09-17:
+    // both actions below shipped with their directories and WITHOUT their entries, so neither was
+    // reachable.
+    // ★ THE LEGS ARE THE arm64 VPS ON PURPOSE, and it is the measurement that chooses them: the
+    // island edge is a property of AArch64's `Imm26` field, so the compile runs NATIVELY on the
+    // architecture whose field is being exhausted rather than cross-built from a host that cannot
+    // execute the result.
+    // ⚠ `requireBuild` because the driver LOCATES `dsscp` under `<tree>/build/*/bin/dss/` and
+    // REFUSES when it finds none - the refusal names the path, but a leg that was never built is a
+    // wasted round trip to a remote host rather than a measurement.
+    // ⓘ `stallSeconds` is NOT a time budget: the driver heartbeats every 15 s, so 120 is eight
+    // beats. The island compile's DURATION is the thing being measured, so bounding it would bound
+    // the measurement. The action file carries the same number and the reasoning in full.
+    "manual-end-to-end": {
+      "description": "Runs the MANUAL end-to-end corpus - entries whose cost makes them wrong to put in a gate, taken deliberately instead. Today that is the AArch64 branch-island edge, which fires only beyond the Imm26 field's reach, so witnessing it means compiling a single function larger than 134 MB. Its corpus is grouped by language at `.harness-config/runner/actions/manual-end-to-end/corpus/<language>/<name>/` and is invisible to both shipped corpus harnesses, which glob the `examples/` ROOT - so no entry here can move the default ctest count. Each entry must declare `manualRun: true` or this driver skips it by name.",
+      "legs": [
+        "linux-arm64-debug",
+        "linux-arm64-release"
+      ],
+      "requireBuild": true,
+      "action": "manual-end-to-end/manual-end-to-end.yml",
+      "stallSeconds": 120
+    },
+    // ★ A MEASUREMENT INSTRUMENT, NOT A GATE - no ctest entry depends on it, and its ANSWER rather
+    // than its file is what `src/link/format/macho.cpp` cites. macOS-only BY NATURE and not by
+    // configuration: every cell shells to `/usr/bin/clang` and `nm -m`, which exist on no other leg.
+    // ⓘ ONE leg, not two: it measures what Apple's ld64 does with a second defined symbol at a
+    // canonical address, which is a property of ld64 and not of how DSS was configured, so a release
+    // arm would re-measure the same external tool and answer the same thing.
+    // ⓘ NO `requireBuild`: the action never invokes `dsscp`.
+    // ⚠ `stallSeconds: 900` is the action's own figure, kept in step with it - eight linked cells
+    // plus an n_desc dump per variant, over ssh, where a single slow cell is not a hang.
+    "macho-alias-ld64-matrix": {
+      "description": "Measures what Apple's ld64 does with a SECOND defined symbol at the same address as a canonical one, with and without -dead_strip. Eight cells: three producer variants (plain, altentry, setalias) crossed with dead-strip off/on while referencing ONLY the alias, plus a canonical-only control at both settings, and an n_desc dump per variant. Its answer is load-bearing and cited as evidence in src/link/format/macho.cpp and tests/link/test_macho_writer.cpp: a plain alias (n_desc = 0) is correct and N_ALT_ENTRY is not needed.",
+      "legs": [
+        "macos-arm64-debug"
+      ],
+      "action": "macho-alias-ld64-matrix/macho-alias-ld64-matrix.yml",
+      "stallSeconds": 900
     }
   },
   "commit": {
@@ -522,7 +599,25 @@
       ".kilo",
       "__pycache__",
       ".ccache",
-      ".cache"
+      ".cache",
+      // ★★ `**/name` MEANS THAT NAME AT ANY DEPTH (whole segments, so `**/cache` does not cover
+      // `src/mycache`). A BARE NAME STAYS ROOTED, deliberately, upstream -- widening bare names
+      // would silently stop transferring every nested directory of that name to every host.
+      // ⇒ ✔MEASURED before 0.5.6: every entry above is a bare name, so `__pycache__` (133 nested,
+      // no root instance), `node_modules` and `.claude/worktrees` protected NOTHING AT ALL.
+      // ★ THE ONE THAT MATTERED IS `.secrets`: the bare entry covers the root instance, while a
+      // SECOND `.secrets` at depth 3 under `.harness-config/` -- the directory the superuser design
+      // names as where a host credential goes -- was covered by nothing. It holds only `.gitkeep`
+      // today, so this closes a LATENT exposure rather than an incident. `.env` is the same shape.
+      // ⚠ A protective rule that silently matches nothing is WORSE than no rule, because the name
+      // in this file reads as evidence that the thing is protected. 0.5.6 now says so at sync time.
+      "**/.secrets",
+      "**/.env"
+      // ⛔ AND DELIBERATELY NOT `**/__pycache__`, though the upstream deploy list asked for it and
+      // repo-harness then agreed the arithmetic here is better. Protecting it makes every emptied
+      // directory persist on every host, for every `.py` this migration deletes, until somebody
+      // removes it by hand -- and `scripts_index_guard` reds on each one. Leaving it unprotected
+      // costs one `.pyc` recompile per script per host and lets 0.5.6's prune close the husk.
     ],
     "maxDeleteFraction": 0.25
   },

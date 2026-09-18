@@ -989,7 +989,14 @@ public:
                   // `charIsUnsigned()`. Last, and defaulted, for the same
                   // reason `target` is.
                   std::optional<bool>                    charIsUnsigned =
-                      std::nullopt) noexcept
+                      std::nullopt,
+                  // D-SEMANTIC-EXPRESSION-TYPER-REDERIVES-EVERY-SUBTREE: the
+                  // expression typer's own work, reported so a COMPLEXITY pin can
+                  // assert a growth ratio instead of a wall clock. See the two
+                  // accessors below. Defaulted (0/0) for every direct constructor
+                  // caller that is not the analyzer.
+                  std::uint64_t                          exprTypeQueries = 0,
+                  std::uint64_t                          exprTypeNodeVisits = 0) noexcept
         : cu_(std::move(cu)),
           lattice_(std::move(lattice)),
           scopes_(std::move(scopes)),
@@ -1008,7 +1015,9 @@ public:
           dataModel_(dataModel),
           longDoubleFormat_(longDoubleFormat),
           target_(target),
-          charIsUnsigned_(charIsUnsigned) {}
+          charIsUnsigned_(charIsUnsigned),
+          exprTypeQueries_(exprTypeQueries),
+          exprTypeNodeVisits_(exprTypeNodeVisits) {}
 
     SemanticModel(SemanticModel const&)            = delete;
     SemanticModel& operator=(SemanticModel const&) = delete;
@@ -1043,6 +1052,25 @@ public:
     // tree in this CU.
     [[nodiscard]] SymbolId symbolAt(NodeId id) const;
     [[nodiscard]] TypeId   typeAt(NodeId id)   const;
+
+    // ── the expression typer's own work (D-SEMANTIC-EXPRESSION-TYPER-REDERIVES-EVERY-SUBTREE) ──
+    //
+    // `exprTypeQueries` — how many times the semantic tier ASKED for the type of an
+    // expression subtree. `exprTypeNodeVisits` — how many nodes those walks actually
+    // CLASSIFIED. The second over the first is the walk's average reach, and it is
+    // the number a complexity pin asserts: it is deterministic, host-independent,
+    // load-independent and identical in Debug and Release, so a statement about it
+    // is a fact about the ALGORITHM rather than about the box a test ran on. A
+    // wall-clock assertion would be sized on the machine that wrote it and would red
+    // on the slowest leg that runs it, naming the wrong event
+    // (`scripts/check-wall-clock-in-tests/` refuses new ones for that reason).
+    //
+    // ⚠ BOTH ARE LOAD-BEARING AND NEITHER SUBSTITUTES FOR THE OTHER. With only
+    // `nodeVisits`, "the derived-type record made this free" and "the type is no
+    // longer asked for at all" are the same reading, and the second is a
+    // correctness regression wearing a performance win's clothes.
+    [[nodiscard]] std::uint64_t exprTypeQueries()    const noexcept { return exprTypeQueries_; }
+    [[nodiscard]] std::uint64_t exprTypeNodeVisits() const noexcept { return exprTypeNodeVisits_; }
 
     // FC16 (D-CSUBSET-GENERIC-SELECTION): for a `_Generic` node, the NodeId of
     // the selected association's result-expression (the compile-time type-match
@@ -1264,6 +1292,10 @@ private:
     // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the analysis-time plain-`char`
     // signedness (see `charIsUnsigned()`).
     std::optional<bool>                                    charIsUnsigned_{};
+    // D-SEMANTIC-EXPRESSION-TYPER-REDERIVES-EVERY-SUBTREE: the expression typer's
+    // own work for this analysis (see the two accessors).
+    std::uint64_t                                          exprTypeQueries_ = 0;
+    std::uint64_t                                          exprTypeNodeVisits_ = 0;
 };
 
 // Pin move-only / non-copyable at compile time so a future refactor

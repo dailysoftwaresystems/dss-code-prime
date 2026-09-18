@@ -51,7 +51,7 @@ if git -C "$TMP" rev-parse --show-toplevel >/dev/null 2>&1; then
 fi
 trap 'rm -rf -- "$TMP"' EXIT
 
-EXPECTED=27
+EXPECTED=30
 RAN=0; BAD=0
 _ok()   { RAN=$((RAN + 1)); printf '  ok   %s\n' "$1"; }
 _fail() { RAN=$((RAN + 1)); BAD=$((BAD + 1)); printf '  FAIL %s\n' "$1"; shift
@@ -223,13 +223,62 @@ else
     _fail "(O5) leg_tree_owning_root on a repository nested inside a DSS tree" "rc=$rc got=$got want=$INNER"
 fi
 
-# ── G: a CONSUMER -- check-root-litter.sh asks git only through leg_tree_git_unsteered ──
-# ✔MEASURED 2026-09-15 (P66 lane rr, probe3/probe4): a copy of that guard in a fixture tree with
-# ONE loose root file said "OK -- no untracked files" (rc 0) under another repository's
-# GIT_INDEX_FILE, and under its GIT_DIR + GIT_WORK_TREE; with its own `.git/index` corrupt,
-# `git status` exited 128 and the guard still said OK. Its copy runs here beside a copy of THIS
-# leg-tree.sh, so a guard that stops using the helper, or stops reading git's exit status,
+# ── G: a CONSUMER asks git only through leg_tree_git_unsteered ─────────────────────────
+# ✔MEASURED 2026-09-15 (P66 lane rr, probe3/probe4): a consumer in a fixture tree with ONE loose
+# root file said "OK -- no untracked files" (rc 0) under another repository's GIT_INDEX_FILE, and
+# under its GIT_DIR + GIT_WORK_TREE; with its own `.git/index` corrupt, `git status` exited 128 and
+# it still said OK. A consumer that stops using the helper, or stops reading git's exit status,
 # reddens this entry by arm name.
+#
+# ⛔⛔ THE SUBJECT IS SYNTHESIZED, AND IT USED TO BE A COPY OF A REAL SCRIPT.
+# These arms copied `scripts/check-root-litter/check-root-litter.sh` into the fixture. That script
+# is retired -- its subject is now `DssHarness check-root-litter` -- and the three arms then failed
+# with `cp: cannot stat` and rc 127, under an entry whose name says nothing about a retired fixture.
+# ✔MEASURED 2026-09-17 in this lane's own gate, which is how it was found. That is the same hazard
+# `scripts_index_guard` was rebuilt for, one guard over: *"an expectation that follows the change it
+# is meant to catch is not an expectation"*.
+# ★ THE FIX IS NOT A SECOND REAL SUBJECT. A fixture pointed at whichever script survives today has
+# only postponed this, and leg-tree.sh retires with its LAST consumer, so that subject would be the
+# next to go. Both consumers below are WRITTEN HERE: the correct one and the DEFECT, so the arms
+# carry their own negative instead of borrowing one from a file that can be deleted underneath them.
+# ★★ AND THE NEGATIVE IS EXERCISED, not assumed. Each G arm has a paired N arm driving the bare
+# consumer through the identical conditions: an arm that passes for both shapes is proving nothing.
+
+# _lt_write_consumer <path> <helper|bare>
+# `helper`: the correct shape -- source leg-tree.sh, ask git through leg_tree_git_unsteered, and
+#           READ the listing's exit status before believing it.
+# `bare`  : both halves of the historical defect at once -- git asked directly, in whatever git
+#           environment the caller exported, and its exit status never read.
+_lt_write_consumer() {
+    mkdir -p "$(dirname "$1")"
+    {
+        printf '%s\n' '#!/usr/bin/env bash' 'set -u' \
+            '_here=$(cd "$(dirname "$0")" && pwd -P) || exit 2' \
+            '_root=$(cd "$_here/../.." && pwd -P) || exit 2'
+        if [ "$2" = helper ]; then
+            printf '%s\n' \
+                '. "$_root/scripts/leg-tree/leg-tree.sh" "" || { echo "consumer: CANNOT RUN -- no leg-tree.sh" >&2; exit 2; }' \
+                'if ! _s="$(leg_tree_git_unsteered -C "$_root" status --porcelain=v1 --untracked-files=normal --ignored=matching 2>&1)"; then' \
+                '    echo "consumer: CANNOT RUN -- \`git status\` failed in $_root" >&2; exit 2; fi'
+        else
+            printf '%s\n' \
+                '_s="$(git -C "$_root" status --porcelain=v1 --untracked-files=normal --ignored=matching 2>/dev/null)"'
+        fi
+        printf '%s\n' \
+            '_n=0' \
+            'while IFS= read -r _l; do' \
+            '    case "$_l" in "?? "*|"!! "*) ;; *) continue ;; esac' \
+            '    _p=${_l#?? }; _p=${_p#!! }' \
+            '    case "$_p" in */*) continue ;; esac' \
+            '    echo "consumer: LOOSE $_p"; _n=$((_n + 1))' \
+            'done <<EOF' \
+            '$_s' \
+            'EOF' \
+            '[ "$_n" = 0 ] || exit 1' \
+            'echo "consumer: OK -- no loose files"'
+    } > "$1"
+}
+
 _steered() {  # <GIT_INDEX_FILE|GIT_DIR+GIT_WORK_TREE> <command...>
     _sc="$1"; shift
     if [ "$_sc" = GIT_INDEX_FILE ]; then
@@ -239,21 +288,30 @@ _steered() {  # <GIT_INDEX_FILE|GIT_DIR+GIT_WORK_TREE> <command...>
     fi
 }
 LIT="$TMP/litter-tree"
-mkdir -p "$LIT/.plans" "$LIT/scripts/check-root-litter" "$LIT/scripts/leg-tree"
-cp "$REPO/scripts/check-root-litter/check-root-litter.sh" "$LIT/scripts/check-root-litter/check-root-litter.sh"
+mkdir -p "$LIT/.plans" "$LIT/scripts/leg-tree"
+_lt_write_consumer "$LIT/scripts/probe-consumer/probe-consumer.sh" helper
+_lt_write_consumer "$LIT/scripts/probe-bare/probe-bare.sh" bare
 cp "$LT" "$LIT/scripts/leg-tree/leg-tree.sh"
 printf 'own\n' > "$LIT/README.md"
 git init -q "$LIT" && git -C "$LIT" add README.md scripts && _commit "$LIT" -m fixture
 printf 'litter\n' > "$LIT/loose.txt"
 for _case in GIT_INDEX_FILE GIT_DIR+GIT_WORK_TREE; do
     tag=$([ "$_case" = GIT_INDEX_FILE ] && echo G1a || echo G1b)
+    ntag=$([ "$_case" = GIT_INDEX_FILE ] && echo N1a || echo N1b)
     neg=$(_steered "$_case" git -C "$LIT" status --porcelain=v1 --untracked-files=normal 2>/dev/null | grep -c '^?? loose.txt$')
-    out=$(_steered "$_case" bash "$LIT/scripts/check-root-litter/check-root-litter.sh" 2>&1); rc=$?
+    out=$(_steered "$_case" bash "$LIT/scripts/probe-consumer/probe-consumer.sh" 2>&1); rc=$?
     if [ "${neg:-0}" = 0 ] && [ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'loose.txt' \
        && ! printf '%s' "$out" | grep -q 'README.md'; then
-        _ok "($tag) check-root-litter.sh under a caller's $_case still names the loose root file, and only it (raw git did not name it)"
+        _ok "($tag) a leg_tree_git_unsteered consumer under a caller's $_case still names the loose root file, and only it (raw git did not name it)"
     else
-        _fail "($tag) check-root-litter.sh under a caller's $_case" "raw-git-named-loose=${neg:-0} (0 is the steered negative) rc=$rc" "said: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-240)"
+        _fail "($tag) a leg_tree_git_unsteered consumer under a caller's $_case" "raw-git-named-loose=${neg:-0} (0 is the steered negative) rc=$rc" "said: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-240)"
+    fi
+    # The paired negative: the SAME conditions, the bare consumer, which must NOT come out right.
+    nout=$(_steered "$_case" bash "$LIT/scripts/probe-bare/probe-bare.sh" 2>&1); nrc=$?
+    if [ "$nrc" != 1 ] || ! printf '%s' "$nout" | grep -q 'loose.txt'; then
+        _ok "($ntag) THE ARM CAN FAIL: the same consumer asking git BARE is steered away from its own root under $_case (rc $nrc)"
+    else
+        _fail "($ntag) the bare consumer was NOT steered under $_case, so ($tag) proves nothing" "rc=$nrc" "said: $(printf '%s' "$nout" | tr '\n' ' ' | cut -c1-240)"
     fi
 done
 
@@ -261,16 +319,22 @@ CORRUPT="$TMP/litter-corrupt"
 cp -R "$LIT" "$CORRUPT"
 printf 'not an index\n' > "$CORRUPT/.git/index"
 git -C "$CORRUPT" status --porcelain >/dev/null 2>&1; rawrc=$?
-out=$(bash "$CORRUPT/scripts/check-root-litter/check-root-litter.sh" 2>&1); rc=$?
+out=$(bash "$CORRUPT/scripts/probe-consumer/probe-consumer.sh" 2>&1); rc=$?
 if [ "$rawrc" != 0 ] && [ "$rc" = 2 ] && printf '%s' "$out" | grep -q 'CANNOT RUN'; then
-    _ok "(G2) check-root-litter.sh REFUSES (rc 2) when git status itself fails (raw git exited $rawrc) instead of calling the root clean"
+    _ok "(G2) a consumer REFUSES (rc 2) when git status itself fails (raw git exited $rawrc) instead of calling the root clean"
 else
-    _fail "(G2) check-root-litter.sh when git status fails" "raw-git-rc=$rawrc (non-zero is the negative) rc=$rc" "said: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-240)"
+    _fail "(G2) a consumer when git status fails" "raw-git-rc=$rawrc (non-zero is the negative) rc=$rc" "said: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-240)"
+fi
+nout=$(bash "$CORRUPT/scripts/probe-bare/probe-bare.sh" 2>&1); nrc=$?
+if [ "$nrc" = 0 ] && printf '%s' "$nout" | grep -q 'no loose files'; then
+    _ok "(N2) THE ARM CAN FAIL: the consumer that never reads git's exit status calls the SAME corrupt tree clean (rc 0)"
+else
+    _fail "(N2) the bare consumer did not call the corrupt tree clean, so (G2) proves nothing" "rc=$nrc" "said: $(printf '%s' "$nout" | tr '\n' ' ' | cut -c1-240)"
 fi
 
 # ── U: the owner runs ANY command unsteered, not only git (P66 lane ge) ─────────────────
 # ✔MEASURED 2026-09-15: gh resolves its repository by running git, so under another repository's
-# GIT_DIR `check-ci-legs.sh` asked about THAT repository's CI (see `leg_tree_unsteered`). A child
+# GIT_DIR a CI-reading twin asked about THAT repository's CI (see `leg_tree_unsteered`). A child
 # `sh` stands in for gh here: it prints the three variables it can see and exits 7.
 _seen='printf "%s|%s|%s" "${GIT_DIR-unset}" "${GIT_WORK_TREE-unset}" "${GIT_INDEX_FILE-unset}"; exit 7'
 neg=$(GIT_DIR="$DECOY/.git" GIT_WORK_TREE="$DECOY" GIT_INDEX_FILE="$DECOY/.git/index" sh -c "$_seen" 2>/dev/null)
@@ -355,5 +419,5 @@ if [ "$BAD" != 0 ]; then
     echo "test-leg-tree: FAIL -- $BAD of $RAN arm(s)"
     exit 1
 fi
-echo "test-leg-tree: OK -- $RAN arm(s): empty-argument refusals, a control, git-environment immunity, owning-root rules, a consumer guard (check-root-litter), and the owner running a non-git command unsteered"
+echo "test-leg-tree: OK -- $RAN arm(s): empty-argument refusals, a control, git-environment immunity, owning-root rules, a synthesized consumer guard with its own negative, and the owner running a non-git command unsteered"
 exit 0

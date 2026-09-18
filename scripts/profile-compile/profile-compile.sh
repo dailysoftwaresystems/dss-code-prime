@@ -174,7 +174,7 @@ MAN="$OUT/subject.dss-project.json"
 # ONE run carries both payloads: DSS_OPT_TRACE costs ~1.5% (✔MEASURED on the
 # Windows host: 3m29.7s traced against 3m32.9s clean, i.e. inside the noise), so a
 # second untraced run would buy nothing and cost another full compile.
-# rc comes back from timed-gate, which captured it DIRECTLY from run-gate.sh,
+# rc comes back from timed-gate, which captured it DIRECTLY from the witness gate,
 # which captured it DIRECTLY from the compiler and refuses an exit-0 that produced
 # no `compile time` report of its own.
 say "compile  (target=$TARGET, --config=release)"
@@ -188,7 +188,7 @@ if [[ $rc -ne 0 ]]; then
   # ⚠ NO SUCCESS TOKEN ON THIS PATH, EVER. The first version of this script
   # emitted `PROFILE-LEG-OK vps-arm64 rc=1` over a compile that had died before
   # parsing a single file — a success string the script wrote about itself, which
-  # is what scripts/run-gate/run-gate.sh exists to refuse. The failure token deliberately
+  # is what a witness gate exists to refuse. The failure token deliberately
   # does not contain the success token as a substring, so a grep for one cannot
   # match the other.
   echo "PROFILE-LEG-FAILED $LABEL rc=$rc  (log: $LOG)"

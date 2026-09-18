@@ -141,11 +141,11 @@ target/
 # history into this repo. (See docs/project-config-spec.md §2.6.)
 .dss-deps/
 # ⓘ 2026-08-19: `!scripts/build/` stood here, because the unanchored `build/`
-# rule above matches at ANY depth and swallowed the local-build script's
-# directory. The scripts/ consolidation renamed that directory to
-# `scripts/local-build/`, which no ignore rule matches, so the negation was
-# removed rather than retargeted: a negation that negates nothing reads as
-# protection and provides none.
+# rule above matches at ANY depth and swallowed a build script's own directory.
+# The scripts/ consolidation renamed that directory, which no ignore rule
+# matches, so the negation was removed rather than retargeted: a negation that
+# negates nothing reads as protection and provides none. (The script itself is
+# retired -- `dssharness build` builds each leg in its own keyed directory.)
 
 # CTest leftover when ctest is invoked from the repo root (e.g. inside
 # a CI step that cd's wrong) — these are throwaway run artifacts.
@@ -196,17 +196,23 @@ __pycache__/
 #
 # ⚠ THIS LINE IS WHAT KEEPS LANE CHECKOUTS OFF EVERY GATE HOST, and that is a
 # REQUIREMENT, not a nicety — operator, same day: "worktrees MUST be ignored by
-# ALL host copies to run legs". Since 2026-08-26 the carriages derive their
-# exclude list from git (`scripts/carriage-excludes/`), so this rule — and only
-# this rule — is what stops N full repo copies riding to macOS and the arm64 VPS
-# on every push. ✔MEASURED: the same accident under `.claude/worktrees/` put
+# ALL host copies to run legs". The transport derives what it carries from git —
+# a hand-typed exclude list per carriage first, `dssharness sync` since — so this
+# rule — and only this rule — is what stops N full repo copies riding to macOS and
+# the arm64 VPS on every push. ✔MEASURED: the same accident under `.claude/worktrees/` put
 # 9,638 files on the macOS host, and the examples runner globs `examples/<lang>/*`,
 # so a gate host holding one can run somebody's uncommitted corpus and report the
 # result as the cycle's. `.worktrees/` is therefore ALSO pinned in that script's
-# `MUST_NEVER_TRAVEL` floor, which re-asks git and REFUSES the carriage if this
-# line ever disappears — the rule is asserted on every leg, not trusted.
+# `MUST_NEVER_TRAVEL` floor, which re-asked git and REFUSED the carriage if this
+# line ever disappeared — the rule was asserted on every leg, not trusted.
+# ★ THAT SECOND ASSERTION SURVIVED THE MIGRATION AND STOPPED BEING PER-CARRIAGE.
+# ✔MEASURED: `.harness-config/config.json`'s `sync.neverTransfer` names
+# `.worktrees`, `.claude/worktrees`, `.secrets`, `.temp`, `build`, `scratchpad` and
+# `test-scratch`, once, for every host — so the floor no longer depends on N
+# hand-written scripts agreeing with each other. `dssharness sync --dry-run` lists
+# every path it would write, and is how to check this rather than trust it.
 #
-# ⚠ `git clean -fd` (what `scripts/leg-tree/` restore runs) does NOT delete
+# ⚠ `git clean -fd` (what a tree restore runs) does NOT delete
 # ignored paths, so a live worktree survives a leg restore. `-fdx` WOULD destroy
 # it mid-build; the dss-cycle skill forbids `-fdx` for exactly this reason.
 /.worktrees/
@@ -218,9 +224,9 @@ __pycache__/
 # ✔MEASURED 2026-08-26: the arm64 VPS gate host held `.kilo/` — 3,671 files, 61 MB,
 # 3,667 of them `node_modules` — because every carriage excluded `node_modules`
 # ANCHORED at the top level and `.kilo/node_modules` is not at the top level.
-# ★ Since 2026-08-26 the carriages derive their exclude list from git
-# (`scripts/carriage-excludes/`), so a rule written HERE is what keeps a tree off
-# every gate host, and a rule written only in `.git/info/exclude` protects one.
+# ★ The transport derives what it carries from git, so a rule written HERE is
+# what keeps a tree off every gate host, and a rule written only in
+# `.git/info/exclude` protects one.
 # ⚠ AND A HAND LIST PATCHED AFTER THE FACT DOES NOT UNDO THE DAMAGE: rsync does
 # NOT delete an EXCLUDED path, so a name added late PROTECTS the stale copy
 # instead of removing it. ✔MEASURED 2026-08-26 — `.secrets/` was named by one of

@@ -99,7 +99,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   command in the compound, **became the terminal state**, which is the one thing the
   notification channel carries. ★ **The instinct was right and the placement destroyed the
   signal it existed to make visible.**
-  ⇒ **Never append a command after `run-gate.sh`.** Its last line is already the verdict.
+  ⇒ **Never append a command after the gate command.** Its last line is already the verdict.
   Where a witness line is genuinely wanted, PRESERVE the code across it:
   `…; rc=$?; echo "RUNGATE_EXIT=$rc"; exit "$rc"`.
   ⚠ **This is the standing watcher rule one hop further out.** *"A watcher must observe every
@@ -249,7 +249,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   - ✔**Two concurrent lanes allocated `0xD029`.** One lane was told the slot was free; another had
     already taken it for `D_DependencyBuildFailed`. Nothing mechanical noticed — it was caught only
     because the second lane RE-MEASURED the header instead of trusting its brief. That is diligence,
-    not a mechanism, and it is the same non-mechanism `scripts/run-gate/run-gate.sh` exists to replace.
+    not a mechanism, and it is the same non-mechanism a WITNESSED run replaces.
   - ✔**A code shipped with no test at all.** The row demanding a value pin for every new diagnostic
     code closed on exactly this and **re-opened one cycle later**: `D_LanguageTargetIsaMismatch` (0xD02A) landed
     engine code in `src/` while appearing in ZERO test files.
@@ -273,7 +273,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
     that built its baseline, which had called `P_InvalidEscape` covered on the strength of
     `P_InvalidEscapeSequence` appearing in a test.
   - A collapsed parse (enum block not found, implausibly few enumerators, no test sources) exits **2**
-    rather than reporting "0 duplicates, OK" — the instrument that enforces run-gate's lesson must not
+    rather than reporting "0 duplicates, OK" — the instrument that enforces the witness lesson must not
     embody its inverse.
   - `--self-test` covers the collision shapes a text-compare would miss (`0xd029` vs `0xD029`,
     decimal vs hex), the commented-out-enumerator false positive, the comment-strip property, and the
@@ -289,7 +289,7 @@ Keep the plans honest in the **same commit** as the code:
 - Update the owning sub-plan: flip the §0 status row AND stamp the §3.1 deferred-items row
   (status flip in §0; `✅ CLOSED` stamp in §3.1 — update both, not one).
 - In the registry: **close a row by MOVING it**, never by editing a status in place —
-  `bash scripts/anchors/set-anchor.sh <ANCHOR> --status closed --closing '...' --apply` stamps the
+  `DssHarness set-anchor <ANCHOR> --status closed --closing '...'` stamps the
   `Status` column and lifts the row out of its working registry into
   `_deferred-anchor-registry-done.md`. Add new anchors with `write-anchor.sh ... --insert --apply`.
   **The row is never DELETED** — the audit trail is load-bearing, which is exactly why the archive

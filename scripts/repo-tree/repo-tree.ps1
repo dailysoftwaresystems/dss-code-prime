@@ -7,7 +7,7 @@
 #
 # ★★★ ONE OWNER PER LANGUAGE, AND THIS IS THE THIRD AND LAST OF THEM.
 #   .sh  -> `leg_tree_driver_identity` / `leg_tree_driver_git` in scripts/leg-tree/leg-tree.sh
-#   .py  -> `_git_prefix` / `_git`                              in scripts/carriage-excludes/carriage-excludes.py
+#   .py  -> `owning_tree` / `run_git`                           in scripts/owning-tree/owning-tree.py
 #   .ps1 -> THIS FILE
 # The first two were written for D-SCRIPT-CARRIAGES-CANNOT-IDENTIFY-A-CROSS-NAMESPACE-LANE-WORKTREE.
 # PowerShell had no owner, so a fix applied per guard would have put five copies of
@@ -155,7 +155,8 @@ function Invoke-RepoTreeUnsteered {
     repos/:owner/:repo` run from this repository's root answered
     `dailysoftwaresystems/dss-code-prime`, and HTTP 404 under another repository's GIT_DIR, and
     again under GIT_DIR + GIT_WORK_TREE -- gh had resolved THAT repository's origin -- so
-    `check-ci-legs.ps1` asked about another repository's CI even when it was given the branch.
+    a CI-reading twin asked about another repository's CI even when it was given the branch
+    (that pair is retired -- `dssharness check-ci-legs` reads the verdict now).
 
     ⚠ STDERR IS THE CALLER'S, UNLESS `-DiscardStandardError` IS GIVEN, AND THE SWITCH IS NOT A
     STYLE CHOICE. ✔MEASURED 2026-09-15 (pwsh 7.6.6): a `2>$null` on the native call INSIDE a

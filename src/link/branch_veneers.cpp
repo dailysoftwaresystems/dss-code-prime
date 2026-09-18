@@ -104,6 +104,30 @@ struct Overflow {
         && disp <= link::branchRelocFieldMax(g);
 }
 
+// ── WHETHER THIS TARGET COULD BUILD A LONGER-REACH VENEER AT ALL ─────────
+//
+// ★★ THIS IS ASKED ONLY TO MAKE A REFUSAL ACCURATE, AND IT IS ASKED OF THE
+// CONFIG. A veneer whose body is a single self-contained PC-relative branch
+// word is exactly as long as that word's field; a veneer whose body
+// MATERIALIZES the callee's address into a register and branches THROUGH it
+// has no PC-relative field in its final hop and is therefore bounded by the
+// address-forming instruction instead. Whether the second shape is available
+// at all is a property of the target's own vocabulary — an opcode declared
+// `terminatorKind: indirect-br` — and nothing here reads a CPU name to find
+// out. A target with no such opcode is told a different thing, because for it
+// the reach really is the end of the road.
+//
+// ⚠ IT IS DELIBERATELY NOT USED TO BUILD ANYTHING. Electing a body with a
+// scratch register commits to a register the linker may clobber at a branch
+// site, and that contract is not declared anywhere in the target vocabulary
+// today. Naming the possibility in a refusal is honest; acting on an
+// undeclared contract would be a silent wrong answer.
+[[nodiscard]] bool declaresIndirectBranch(TargetSchema const& target) {
+    for (auto const& info : target.opcodes())
+        if (info.terminatorKind == TargetTerminatorKind::IndirectBr) return true;
+    return false;
+}
+
 }  // namespace
 
 bool branchVeneersNeeded(AssembledModule const& module,
@@ -297,8 +321,37 @@ bool injectBranchVeneers(AssembledModule&    module,
             // draft of this pass answered by placing a veneer four bytes
             // further along, forever — 315 seconds without reaching its own
             // bound. The candidate rule below is what makes that case a LOUD
-            // REFUSAL naming the real cause, which is that the oversized
-            // function is the ASSEMBLER's tier and not this one.
+            // REFUSAL naming the real cause.
+            //
+            // ★★★★ AND THERE ARE **TWO** WAYS TO HAVE NO CANDIDATE, WHICH USED
+            // TO SHARE ONE MESSAGE AND ARE NOT THE SAME DEFECT. ✔MEASURED
+            // 2026-09-17 against `aarch64-linux-gnu-ld` 2.42 (six probes, three
+            // shapes — the transcripts are quoted in the row):
+            //
+            //   * NOTHING WITHIN PLACEMENT REACH OF THE CALL SITE. The call is
+            //     buried further than the field's reach inside one oversized
+            //     function, so no boundary exists that the call could even
+            //     branch to. ✔GNU ld refuses the identical shape
+            //     (*"relocation truncated to fit: R_AARCH64_CALL26"*). This
+            //     refusal MATCHES a working reference and is the end of the
+            //     road for any linker.
+            //
+            //   * A BOUNDARY IS IN REACH, AND THE BODY IS TOO WEAK TO USE IT.
+            //     ✔GNU ld LINKS this shape, by standing an INDIRECT stub
+            //     (`adrp x16 / add x16 / br x16`) at exactly such a boundary:
+            //     its final hop carries no PC-relative field, so the distance
+            //     from the stub to the callee stops mattering. Our veneer body
+            //     is QUOTED from `widestDeclaredIslandBody` — one
+            //     self-contained branch word — so it is never longer than `b`,
+            //     and a boundary beside the call site is useless to it.
+            //
+            // ⚠ THE OLD MESSAGE SENT BOTH CASES TO THE ASSEMBLER, AND THAT WAS
+            // FALSE FOR BOTH. The assembler's islands serve `BlockRelPatch`es —
+            // INTRA-FUNCTION branches to a block of the same function, resolved
+            // at assemble time and never seen by this tier. A cross-function
+            // CALL relocation is not one, and no island the assembler can place
+            // will ever serve it. A refusal that names a tier which structurally
+            // cannot help is worse than one that names nothing.
             //
             // A boundary is admissible when it is no further than one STRIDE
             // from the patch site — half the reach, leaving the other half as
@@ -321,30 +374,72 @@ bool injectBranchVeneers(AssembledModule&    module,
             std::int64_t const ownGap = to > from ? to - from : from - to;
             std::optional<std::uint64_t> site;
             std::int64_t siteGap = ownGap;
+            // ⓘ THE ONE NUMBER THAT SEPARATES THE TWO REFUSALS: how many
+            // boundaries the call could branch to at all. Everything after the
+            // `step > stride` test is about whether such a boundary is USEFUL;
+            // this counts whether one EXISTS.
+            std::uint64_t standable = 0;
             for (auto const boundary : starts) {
                 auto const at = static_cast<std::int64_t>(boundary);
                 std::int64_t const step = at > from ? at - from : from - at;
                 if (step > stride) continue;
+                ++standable;
                 std::int64_t const gap = to > at ? to - at : at - to;
                 if (gap >= siteGap) continue;
                 if (gap > reach && ownGap - gap < minAdvance) continue;
                 site    = boundary;
                 siteGap = gap;
             }
+            if (!site.has_value() && standable == 0) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format(
+                         "branch-veneer: a call in function symbol id {} is {} "
+                         "bytes from its callee, beyond this relocation "
+                         "field's {}-byte reach, and NO FUNCTION BOUNDARY "
+                         "stands within a veneer's placement reach of the CALL "
+                         "SITE ITSELF, so there is nowhere to put a trampoline "
+                         "that this call could even branch to. A veneer is a "
+                         "whole function, so it can only be placed BETWEEN "
+                         "functions; a call buried further than the field's "
+                         "reach inside one oversized function has no such "
+                         "place, and no veneer body of any shape would change "
+                         "that (D-LK-AARCH64-CALL26-BEYOND-RANGE-HAS-NO-VENEER)",
+                         module.functions[ov.funcIndex].symbol.v, ownGap,
+                         reach));
+                return false;
+            }
             if (!site.has_value()) {
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                      std::format(
                          "branch-veneer: a call in function symbol id {} is {} "
                          "bytes from its callee, beyond this relocation "
-                         "field's reach, and there is NO FUNCTION BOUNDARY "
-                         "between them that a veneer could stand at and make "
-                         "progress. A veneer is a whole function, so it can "
-                         "only be placed BETWEEN functions; a caller and "
-                         "callee separated by a single function larger than "
-                         "the field's reach cannot be bridged here. That case "
-                         "belongs to the assembler, whose branch islands go "
-                         "between INSTRUCTIONS (D-CSUBSET-LONG-BRANCH)",
-                         module.functions[ov.funcIndex].symbol.v, ownGap));
+                         "field's {}-byte reach. {} function boundary(ies) "
+                         "stand within a veneer's placement reach of the call "
+                         "site, but a veneer built from this target's widest "
+                         "declared self-contained unconditional-branch word "
+                         "reaches only {} bytes of its own, so none of them "
+                         "carries the call any closer and no chain of them "
+                         "advances. WHAT IS REFUSED AND WHAT IT COSTS: every "
+                         "image whose text spans more than that reach between "
+                         "a call and its callee, with no closer function "
+                         "boundary, is refused here — including the linker's "
+                         "OWN synthetic entry calling its process-exit import "
+                         "across a large image.{} "
+                         "(D-LK-AARCH64-CALL26-BEYOND-RANGE-HAS-NO-VENEER)",
+                         module.functions[ov.funcIndex].symbol.v, ownGap, reach,
+                         standable, reach,
+                         declaresIndirectBranch(target)
+                             ? " This target DOES declare an opcode with "
+                               "`terminatorKind: indirect-br`, from which a "
+                               "veneer with no PC-relative field in its final "
+                               "hop could be built; what is missing is that a "
+                               "link-tier veneer may only be a single quoted "
+                               "WORD, and that no target vocabulary declares "
+                               "which register a linker may clobber at a "
+                               "branch site."
+                             : " This target declares no unconditional "
+                               "INDIRECT branch, so no longer-reach veneer body "
+                               "could be built from it either."));
                 return false;
             }
             requests.push_back(Request{*site, ov.ultimateSymV});

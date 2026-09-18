@@ -10,7 +10,9 @@
 # TRACKED files, so `.worktrees/<lane>/.secrets/` does not exist and cannot exist.
 #
 # ★★★ AND `.worktrees/` IS THE SANCTIONED HOME FOR LANE WORKTREES (operator ruling
-# 2026-08-26, re-stated in `scripts/carriage-excludes/`'s MUST_NEVER_TRAVEL floor), so
+# 2026-08-26, re-stated in the transport's own never-transfer floor -- a hand-written
+# MUST_NEVER_TRAVEL list per carriage then, `sync.neverTransfer` in
+# `.harness-config/config.json` now), so
 # every lane runs from a checkout with no `.secrets/` in it.
 # ✔MEASURED 2026-08-31 (P47), from inside WSL, both remote carriages, first call:
 #     ssh-macos: connection data missing.
@@ -29,15 +31,17 @@
 # the number of places a private key sits on disk by the number of live lanes, and
 # `.worktrees/` is a directory this project deletes without ceremony.
 #
-# ★ NO `.ps1` TWIN OF *THIS FILE*, AND THAT IS THE JUDGEMENT NOT AN OMISSION -- but it
-# is a NARROW judgement and the reason matters. The rule it encodes DOES have to reach
-# the Windows leg, and it does: `ssh-macos.ps1` and `ssh-arm64-vps.ps1` carry the same
-# three-case resolution inline, in PowerShell, as a MIRRORED REGION -- the pattern this
-# harness already uses where the two callers are in two languages. What would be wrong
-# is a `.ps1` here that shells out or re-implements the file: PowerShell cannot SOURCE
-# a POSIX script, so a `.ps1` sibling could only be a second implementation wearing the
-# same name, which is the thing one owner is supposed to prevent. Kept in step BY
-# REVIEW, pinned by the same measurement, and both halves name this file.
+# ★ NO `.ps1` TWIN OF *THIS FILE*, AND THAT IS THE JUDGEMENT NOT AN OMISSION. What would
+# be wrong is a `.ps1` here that shells out or re-implements the file: PowerShell cannot
+# SOURCE a POSIX script, so a `.ps1` sibling could only be a second implementation
+# wearing the same name, which is the thing one owner is supposed to prevent.
+# ⛔ THE TWO POWERSHELL CARRIAGES THAT MIRRORED THIS RESOLUTION INLINE ARE GONE, taken
+# by the DssHarness migration of the gate runners, and with them the last caller of
+# `repo_secrets_dir` outside documentation. ✔MEASURED: nothing under `scripts/`,
+# `tests/`, `cmake/` or `.github/` invokes this file any more. Connection data for a
+# declared host is that host's own `.env` under `.harness-config/` now. ⇒ THIS FILE
+# HAS NO CONSUMER: it is a retirement candidate for the wave that takes `repo-secrets`,
+# not a resolver anybody still asks.
 #
 # USAGE
 #   secrets_dir=$(sh scripts/repo-secrets/repo-secrets.sh <repo-root>)   # as a program

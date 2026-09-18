@@ -3200,7 +3200,7 @@ done
 DSS_CURRENCY_OK=""
 dss_assert_compiler_current python3 "$BENCH_CORE" "$DSS_BIN" "$DSS_BIN_BUILT" \
     "$DSS_BIN_ORIGIN" "$DSS_CONFIG_ROOT_PIN" \
-    "cmake --build '$_dss_bdir' --target dsscp   (or: scripts/local-build/local-build.sh --tree rel)" \
+    "cmake --build '$_dss_bdir' --target dsscp   (or: dssharness build --legs <a release leg>)" \
     "${DSS_CURRENCY_SPECS[@]}"
 # <<< dss:compiler-currency <<<
 # Carried to the Step-9 verdict beside the compiler's path: every figure this run

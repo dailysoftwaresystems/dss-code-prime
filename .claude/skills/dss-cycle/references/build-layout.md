@@ -62,7 +62,7 @@ not folded — finish the fold.
 ## Migration status — NOT yet done, and it is not a `mv`
 
 ⚠ The live tree still uses the flat layout. **✔MEASURED 2026-08-17 (corrected): 19 files carry 33
-reference lines** — `scripts/run-gate/run-gate.{sh,ps1}`, `scripts/check-ninja-deps/check-ninja-deps.py`, `tests/CMakeLists.txt`,
+reference lines** — the witness gate twins (since retired), `scripts/check-ninja-deps/check-ninja-deps.py`, `tests/CMakeLists.txt`,
 `tests/core/native_c_probe.hpp`, `tests/core/test_header_name_matching.cpp`,
 `tests/harness/test_sqlite_harness_legs.cpp`, `real-examples/c/sqlite/build-and-test.ps1` (9 lines,
 `build-rel`), plus narrative mentions in `src/core/types/parse_diagnostic.hpp`, a `.format.json`, a
@@ -88,8 +88,9 @@ at all — they are sentences like *"MEASURED 2026-08-10 (`build-dbg` at `3e86a1
 `parse_diagnostic.hpp`, `entry_shape.hpp`, four `.format.json` files and three `expected.json`
 `$comment`s. **That measurement was taken in a directory called `build-dbg`, and it still was.**
 Renaming it inside the record would falsify the provenance to tidy a path — the opposite of what
-those sentences are for. Change *configuration*; leave *history*. The same applies to the incident
-narration in `scripts/run-gate/run-gate.{sh,ps1}`, which recounts a `cd build-dbg` that actually failed.
+those sentences are for. Change *configuration*; leave *history*. The same applied to the incident
+narration in the witness gate twins, which recounted a `cd build-dbg` that actually failed — that
+narration went with them.
 
 **2. EVERY EDIT MUST BE TRANSITION-SAFE — there is no flag day.** A reference rewritten to the new
 path alone breaks every run made before the physical move; one left on the old path alone silently

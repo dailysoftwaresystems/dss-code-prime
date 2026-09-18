@@ -8,8 +8,9 @@
 # locally it spins until a human stops it, and on CI it holds a parallel slot
 # until the leg's `--stop-time`. ✔MEASURED this cycle, twice: two
 # `integrated_tests` entries spun in the CLI runner's scratch-root prune (one for
-# 896 CPU-seconds before it was stopped by pid), and `run_gate_guard` wedged in
-# its own fixtures for 1840 s on a local MSVC Release gate. A TIMEOUT turns
+# 896 CPU-seconds before it was stopped by pid), and a guard that drove shell
+# fixtures (`run_gate_guard`, since retired with the script it watched) wedged in
+# them for 1840 s on a local MSVC Release gate. A TIMEOUT turns
 # either into a `(Timeout)` verdict under the entry's own name — ✔MEASURED on
 # ctest 4.3.2 for an entry that spins and for one blocked on a child that never
 # exits, each ended at its limit with no process left behind.
@@ -124,7 +125,6 @@ set(_DSS_TB_NAMED
     "analysis/syntactic/test_parser_speculation_ceilings|357|5|55"
     "plan_citations_guard|304|345|107"
     "analysis/semantic/test_fc3_width_semantics_shuffled|186|97|334"
-    "run_gate_guard|102|288|88"
     "core/test_deep_type_layout_costs_heap|280|8|37"
     "mir/test_mir_lowering_c|251|26|49"
     "program/test_runtime_cache_wiring|244|48|57"
